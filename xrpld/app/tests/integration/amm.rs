@@ -274,8 +274,16 @@ fn amm_create_valid() {
     let alice = acct(0x11);
     let gw = acct(0x22);
     let ledger = make_ledger(vec![
-        account_root(alice, 100_000_000_000, 0, 0),
+        account_root(alice, 100_000_000_000, 1, 0),
         account_root(gw, 100_000_000_000, 0, 0),
+        trust_line_local(
+            alice,
+            gw,
+            protocol::currency_from_string("USD"),
+            50000,
+            100000,
+            0,
+        ),
     ]);
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
@@ -380,8 +388,24 @@ fn amm_create_two_different_ious() {
     let alice = acct(0x11);
     let gw = acct(0x22);
     let ledger = make_ledger(vec![
-        account_root(alice, 100_000_000_000, 0, 0),
+        account_root(alice, 100_000_000_000, 2, 0),
         account_root(gw, 100_000_000_000, 0, 0),
+        trust_line_local(
+            alice,
+            gw,
+            protocol::currency_from_string("USD"),
+            50000,
+            100000,
+            0,
+        ),
+        trust_line_local(
+            alice,
+            gw,
+            protocol::currency_from_string("EUR"),
+            50000,
+            100000,
+            0,
+        ),
     ]);
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 

@@ -113,6 +113,23 @@ fn server_config() -> Arc<rustls::ServerConfig> {
     )
 }
 
+fn server_acceptor() -> Arc<openssl::ssl::SslAcceptor> {
+    use basics::net::make_ssl_context::anonymous_tls_identity_der;
+    use openssl::pkey::PKey;
+    use openssl::ssl::{SslAcceptor, SslMethod, SslVerifyMode};
+    use openssl::x509::X509;
+
+    install_test_crypto_provider();
+    let identity = anonymous_tls_identity_der().expect("anonymous identity");
+    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).expect("ssl acceptor");
+    let cert = X509::from_der(identity.certificate_der()).expect("certificate");
+    builder.set_certificate(&cert).expect("set certificate");
+    let key = PKey::private_key_from_pkcs8(identity.private_key_pkcs8_der()).expect("private key");
+    builder.set_private_key(&key).expect("set private key");
+    builder.set_verify(SslVerifyMode::NONE);
+    Arc::new(builder.build())
+}
+
 fn public_key(seed: u8) -> PublicKey {
     let secret = SecretKey::from_bytes([seed; 32]);
     derive_public_key(KeyType::Secp256k1, &secret).expect("public key")
@@ -129,7 +146,7 @@ fn peer(id: u32, seed: u8) -> Arc<PeerImp> {
 
 #[test]
 fn proposal_runtime_matches_slot_and_squelch_flow() {
-    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Duration::from_secs(0)));
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Duration::from_secs(1_000)));
     let overlay = OverlayImpl::with_clock(setup(), Arc::new(TestHandoff), clock).expect("overlay");
     let validator = public_key(99);
 
@@ -150,17 +167,30 @@ fn proposal_runtime_matches_slot_and_squelch_flow() {
         ..Default::default()
     };
 
-    for uid in 1..=25 {
+    // Rippled counts a peer toward a validator slot only when that peer
+    // delivers a message we already relayed (OverlayImpl.cpp:1960-1966,
+    // PeerImp.cpp onPropose). Relay each uid once, then admit it as an
+    // inbound duplicate from every peer so each peer's slot count advances.
+    for uid in 1..=25u64 {
         overlay.relay_proposal(proposal.clone(), Uint256::from_u64(uid), validator);
+        for peer in &peers {
+            overlay.admit_proposal_source(Uint256::from_u64(uid), validator, peer.id());
+        }
     }
 
     assert_eq!(overlay.slot_state(validator), Some(SlotState::Selected));
-    let squelch_messages = peers[3]
-        .queued_messages()
-        .into_iter()
-        .filter(|message| matches!(message.protocol().payload, ProtocolPayload::Squelch(_)))
+    let squelched = peers
+        .iter()
+        .filter(|peer| {
+            peer.queued_messages()
+                .into_iter()
+                .any(|message| matches!(message.protocol().payload, ProtocolPayload::Squelch(_)))
+        })
         .count();
-    assert!(squelch_messages > 0);
+    assert_eq!(
+        squelched, 1,
+        "selection of 3 of 4 peers must squelch exactly one"
+    );
 }
 
 #[test]
@@ -279,7 +309,11 @@ fn activation_enforces_peer_limit_but_allows_reserved_or_cluster_bypass() {
 
     assert!(overlay.activate(Arc::clone(&reserved)));
     assert!(overlay.activate(Arc::clone(&clustered)));
-    assert_eq!(overlay.limit(), 1);
+    // Rippled Config.cpp:112 sets maxPeers = 0 when explicit inbound/outbound
+    // limits are configured; enforcement runs on the directional budgets.
+    assert_eq!(overlay.peer_limits().max_peers, 0);
+    assert_eq!(overlay.peer_limits().inbound_max, 0);
+    assert_eq!(overlay.peer_limits().outbound_max, 1);
     assert_eq!(overlay.size(), 3);
     assert!(overlay.find_peer_by_short_id(second.id()).is_none());
 }
@@ -323,6 +357,7 @@ fn check_tracking_diverged_then_converged_range_behavior() {
     let overlay = OverlayImpl::new(setup(), Arc::new(TestHandoff)).expect("overlay");
     let tracked = peer(10, 43);
     tracked.record_ledger(Uint256::from_u64(10), 200);
+    tracked.set_ledger_range(200, 200);
     overlay.activate(Arc::clone(&tracked));
 
     assert!(tracked.has_range(200, 200));
@@ -392,7 +427,23 @@ fn deactivate_clears_relay_history_and_counts_disconnects() {
     let second_peer = peer(5, 61);
     overlay.activate(Arc::clone(&second_peer));
 
-    assert!(overlay.relay_proposal(proposal, uid, validator).is_empty());
+    // Rippled HashRouter::shouldRelay keeps the original suppression key
+    // silenced for the relay window (HashRouter.cpp:110-120), so a reconnected
+    // peer does not receive the already-relayed proposal.
+    assert!(
+        overlay
+            .relay_proposal(proposal.clone(), uid, validator)
+            .is_empty()
+    );
+    assert_eq!(second_peer.queued_messages().len(), 0);
+
+    // A fresh suppression key reaches the reconnected peer.
+    let next_uid = Uint256::from_u64(100);
+    assert!(
+        overlay
+            .relay_proposal(proposal, next_uid, validator)
+            .is_empty()
+    );
     assert_eq!(second_peer.queued_messages().len(), 1);
 }
 
@@ -401,6 +452,7 @@ async fn listener_runtime_honors_overlay_stop_signal() {
     let overlay = OverlayImpl::new(
         Setup {
             server_config: Some(server_config()),
+            server_ssl_acceptor: Some(server_acceptor()),
             ..setup()
         },
         Arc::new(TestHandoff),
@@ -431,6 +483,7 @@ async fn listener_runtime_honors_overlay_stop_signal_during_tls_handshake() {
     let overlay = OverlayImpl::new(
         Setup {
             server_config: Some(server_config()),
+            server_ssl_acceptor: Some(server_acceptor()),
             ..setup()
         },
         Arc::new(TestHandoff),
@@ -504,6 +557,7 @@ async fn overlay_peer_round_trip_activates_both_sides() {
     let listener_overlay = OverlayImpl::new(
         Setup {
             server_config: Some(server_config()),
+            server_ssl_acceptor: Some(server_acceptor()),
             ..setup()
         },
         Arc::new(TestHandoff),
@@ -558,6 +612,7 @@ async fn outbound_connect_reports_service_unavailable_when_listener_peer_limit_i
     let listener_overlay = OverlayImpl::new(
         Setup {
             server_config: Some(server_config()),
+            server_ssl_acceptor: Some(server_acceptor()),
             peer_limit: 2,
             peer_limit_in: Some(1),
             peer_limit_out: Some(1),
@@ -634,6 +689,10 @@ fn deferred_ledger_data_has_no_global_peer_cap_and_retries_31_32_33_without_loss
     let peers = (1..=33)
         .map(|id| peer(90 + id, 90 + id as u8))
         .collect::<Vec<_>>();
+    // Production derives the aggregate deferred-frame envelope from the
+    // configured active-session count (OverlayImpl::with_clock_and_inbound_handler).
+    // Without this, the fixture-wide default admits a single frame.
+    handler.set_deferred_ledger_data_session_limit(peers.len());
     for peer in &peers {
         assert_eq!(
             handler.on_ledger_data(peer, TmLedgerData::default()),
@@ -653,7 +712,7 @@ fn deferred_ledger_data_has_no_global_peer_cap_and_retries_31_32_33_without_loss
 }
 
 #[test]
-fn duplicate_deferred_ledger_data_disconnects_without_replacing_the_retained_frame() {
+fn duplicate_deferred_ledger_data_is_dropped_without_replacing_the_retained_frame() {
     let handler = QueuedOverlayInboundHandler::default();
     let peer = peer(124, 124);
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -674,17 +733,20 @@ fn duplicate_deferred_ledger_data_disconnects_without_replacing_the_retained_fra
         LedgerDataIngressDisposition::Delivered,
         "a duplicate cannot replace the session-owned frame"
     );
-    assert!(peer.disconnect_requested());
+    assert!(
+        !peer.disconnect_requested(),
+        "the duplicate must be dropped so control traffic remains live"
+    );
     assert_eq!(
         attempts.load(Ordering::Acquire),
         1,
-        "the duplicate is terminally rejected before Worker 2 admission"
+        "the duplicate is dropped before Worker 2 admission"
     );
 
     handler.discard_deferred_ledger_data(peer.id());
     assert!(
         !handler.retry_deferred_ledger_data(peer.id()),
-        "disconnect/stop terminal release leaves no deferred frame or lease"
+        "terminal release leaves no deferred frame or lease"
     );
 }
 

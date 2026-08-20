@@ -10,15 +10,29 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use acquisition::{AcquisitionEvent, OperationRef, TimerKind};
+
 use super::acquisition::AcquisitionState;
+use super::coordinator_adapter::RetainedControlEvents;
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// A coordinator timer wakeup. The record is a fixed-size typed identity plus
+/// the completion channel; the timer thread only posts the typed `TimerFired`
+/// event and never runs session logic.
+struct CoordinatorTimerRecord {
+    operation: OperationRef,
+    timer: TimerKind,
+    completions: RetainedControlEvents,
+}
+
 /// Production timer work is a fixed record: it retains only the acquisition
-/// identity through a weak Arc. Test callbacks remain behind cfg(test) and
-/// never participate in the production ownership boundary.
+/// identity through a weak Arc, or a coordinator operation identity plus the
+/// completion channel. Test callbacks remain behind cfg(test) and never
+/// participate in the production ownership boundary.
 enum TimerWork {
     AcquisitionTimeout(std::sync::Weak<AcquisitionState>),
+    Coordinator(CoordinatorTimerRecord),
     #[cfg(test)]
     Test(Job),
 }
@@ -30,6 +44,12 @@ impl TimerWork {
                 if let Some(state) = state.upgrade() {
                     state.on_acquisition_timer_fired();
                 }
+            }
+            Self::Coordinator(record) => {
+                record.completions.push(AcquisitionEvent::TimerFired {
+                    operation: record.operation,
+                    timer: record.timer,
+                });
             }
             #[cfg(test)]
             Self::Test(callback) => callback(),
@@ -95,7 +115,13 @@ pub struct WorkerPoolSnapshot {
 
 struct TimerTask {
     due: Instant,
+    #[cfg_attr(not(test), allow(dead_code))] // read by test introspection helpers
     delay: Duration,
+    /// Exact operation identity for coordinator timers; `None` for legacy and
+    /// test tasks. Disarm removes only tasks whose key matches, so a stale
+    /// rearm can never be silently dropped while a newer arm of the same
+    /// operation is pending.
+    key: Option<OperationRef>,
     work: TimerWork,
 }
 
@@ -160,11 +186,43 @@ impl TimerService {
         }
     }
 
+    #[cfg(test)]
+    fn new_manual_for_test() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(TimerState { tasks: Vec::new() }), Condvar::new())),
+            stopped: Arc::new(AtomicBool::new(false)),
+            thread: Mutex::new(None),
+        }
+    }
+
     fn schedule_acquisition_timeout(&self, delay: Duration, state: &Arc<AcquisitionState>) {
         self.schedule(delay, TimerWork::AcquisitionTimeout(Arc::downgrade(state)));
     }
 
+    fn schedule_coordinator(&self, delay: Duration, record: CoordinatorTimerRecord) {
+        let key = Some(record.operation);
+        self.schedule_with_key(delay, key, TimerWork::Coordinator(record));
+    }
+
+    /// Remove every pending timer whose exact operation identity matches. A
+    /// disarm race with the thread picking the task either removes it here or
+    /// delivers the typed wakeup; the coordinator validates the operation and
+    /// treats a late delivery for a cancelled/disarmed operation as stale.
+    fn disarm(&self, operation: OperationRef) {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("acquisition timer lock");
+        state.tasks.retain(|task| task.key != Some(operation));
+        drop(state);
+        // The timer thread may be waiting for the removed earliest task. Wake
+        // it so cancellation never leaves it sleeping on a stale deadline.
+        wake.notify_one();
+    }
+
     fn schedule(&self, delay: Duration, work: TimerWork) {
+        self.schedule_with_key(delay, None, work);
+    }
+
+    fn schedule_with_key(&self, delay: Duration, key: Option<OperationRef>, work: TimerWork) {
         let (lock, wake) = &*self.state;
         let mut state = lock.lock().expect("acquisition timer lock");
         // Serialize stopped observation with queue insertion. A caller that
@@ -176,6 +234,7 @@ impl TimerService {
         state.tasks.push(TimerTask {
             due: Instant::now() + delay,
             delay,
+            key,
             work,
         });
         drop(state);
@@ -316,6 +375,17 @@ impl WorkerPool {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_manual_timer_for_test(size: usize) -> Self {
+        let mut pool = Self::new(size);
+        // `TimerService::new` always starts its thread. Replace it only in a
+        // test-only constructor after stopping that isolated service, so a
+        // deterministic timer test can drive queued callbacks explicitly.
+        pool.timers.stop();
+        pool.timers = TimerService::new_manual_for_test();
+        pool
+    }
+
     fn enqueue_ledger_data(&self, job: Job) {
         let (lock, wake) = &*self.queue;
         let mut jobs = lock.lock().expect("acquisition queue lock");
@@ -359,6 +429,33 @@ impl WorkerPool {
         if !self.stop.load(Ordering::Acquire) {
             self.timers.schedule_acquisition_timeout(delay, state);
         }
+    }
+
+    /// Schedule a coordinator timer wakeup. The timer thread posts a typed
+    /// `TimerFired` completion carrying the exact arming operation; it never
+    /// runs session logic.
+    pub(crate) fn schedule_coordinator_timer(
+        &self,
+        operation: OperationRef,
+        timer: TimerKind,
+        delay: Duration,
+        completions: RetainedControlEvents,
+    ) {
+        if !self.stop.load(Ordering::Acquire) {
+            self.timers.schedule_coordinator(
+                delay,
+                CoordinatorTimerRecord {
+                    operation,
+                    timer,
+                    completions,
+                },
+            );
+        }
+    }
+
+    /// Disarm a pending coordinator timer by its exact operation identity.
+    pub(crate) fn disarm_coordinator_timer(&self, operation: OperationRef) {
+        self.timers.disarm(operation);
     }
 
     #[cfg(test)]

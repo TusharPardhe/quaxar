@@ -9,6 +9,7 @@ use basics::base_uint::Uint256;
 use nodestore::{AsyncReadWork, NodeObject};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
@@ -19,30 +20,28 @@ use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 /// global, so coalesced acquisitions never multiply database I/O.
 pub const ACQ_READS_GLOBAL: usize = 512;
 
+/// Bounded retained logical subscriptions for the global Rust broker. An
+/// independent budget from the physical in-flight limit so a small physical
+/// concurrency still permits coalesced waiters and FIFO-deferred promotion.
+pub const ACQ_READS_LOGICAL: usize = 512;
+
 /// Bounded retained logical ownership for the global Rust broker.
 ///
 /// Rippled's 512 limit is call-local to one `getMissingNodes()` pass; it does
 /// not define a global broker queue, a 513th successor, or a cancellation
 /// event on admission pressure. Quaxar has a shared physical-read broker, so
-/// its one retained logical-subscription budget is the already-configured
-/// physical limit itself. One subscription owns one ticket and one waiter, so
-/// it bounds retained tickets, waiters, and queued keys without inventing an
-/// independent successor limit. A cancelled dispatched callback may outlive
-/// its subscriber, but remains within the existing physical in-flight limit.
-/// A request at the retained-subscription bound is returned as non-terminal
-/// `Deferred` with no broker record or sink event, leaving the actor's
-/// retained missing edge available for bounded local-read retry.
+/// the retained logical-subscription budget is configured independently of
+/// the physical in-flight limit: one physical read may fan out to many
+/// logical subscribers and a deferred request may wait in the broker FIFO
+/// behind occupied physical slots without consuming a physical slot of its
+/// own. A cancelled dispatched callback may outlive its subscriber, but
+/// remains within the existing physical in-flight limit. A request at the
+/// retained-subscription bound is returned as non-terminal `Deferred` with no
+/// broker record or sink event, leaving the actor's retained missing edge
+/// available for bounded local-read retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadBrokerLimits {
     pub max_retained_logical_subscriptions: usize,
-}
-
-impl ReadBrokerLimits {
-    const fn from_physical_limit(global_in_flight: usize) -> Self {
-        Self {
-            max_retained_logical_subscriptions: global_in_flight,
-        }
-    }
 }
 
 /// One database identity. The generation makes a rotation boundary explicit:
@@ -156,12 +155,14 @@ pub enum ReadAdmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadBrokerConfig {
     pub global_in_flight: usize,
+    pub max_retained_logical_subscriptions: usize,
 }
 
 impl Default for ReadBrokerConfig {
     fn default() -> Self {
         Self {
             global_in_flight: ACQ_READS_GLOBAL,
+            max_retained_logical_subscriptions: ACQ_READS_LOGICAL,
         }
     }
 }
@@ -171,6 +172,9 @@ impl ReadBrokerConfig {
         if self.global_in_flight == 0 {
             return Err("global inbound read capacity must be nonzero");
         }
+        if self.max_retained_logical_subscriptions == 0 {
+            return Err("retained logical subscription capacity must be nonzero");
+        }
         Ok(self)
     }
 
@@ -178,7 +182,9 @@ impl ReadBrokerConfig {
     /// budget before creating a ticket, and the `ReadKey` generation supplied
     /// by Worker 2 must be the store generation observed at that same point.
     pub const fn logical_limits(self) -> ReadBrokerLimits {
-        ReadBrokerLimits::from_physical_limit(self.global_in_flight)
+        ReadBrokerLimits {
+            max_retained_logical_subscriptions: self.max_retained_logical_subscriptions,
+        }
     }
 }
 
@@ -243,6 +249,9 @@ struct TicketRecord {
     acquisition_id: u64,
     plan_id: u64,
     dispatched: bool,
+    /// When this logical read was first requested; sampled as read queue delay
+    /// when the key's physical read is dispatched.
+    requested_at: Instant,
 }
 
 struct BrokerState {
@@ -366,6 +375,7 @@ impl NodeReadBroker {
                 acquisition_id,
                 plan_id,
                 dispatched,
+                requested_at: Instant::now(),
             },
         );
         let is_new_flight = !state.flights.contains_key(&key);
@@ -439,12 +449,15 @@ impl NodeReadBroker {
                     .remove(&(subscriber.acquisition_id, subscriber.plan_id));
                 (subscriber, flight.state, flight.subscribers.is_empty())
             };
-            if empty && flight_state == Some(FlightState::Queued) {
+            if empty {
                 state.flights.remove(&record.key);
-                state.fifo.retain(|queued| *queued != record.key);
+                if flight_state == Some(FlightState::Queued) {
+                    state.fifo.retain(|queued| *queued != record.key);
+                }
             }
             state.metrics.cancelled += 1;
             Self::admit_queued_locked(&self.inner, &mut state);
+            Self::emit_broker_metrics(&state);
             Some((
                 subscriber.sink,
                 ReadReady {
@@ -487,9 +500,9 @@ impl NodeReadBroker {
             }
             let mut notifications = Vec::with_capacity(flight.subscribers.len());
             for (ticket_id, subscriber) in flight.subscribers {
-                let Some(record) = state.tickets.remove(&ticket_id) else {
+                if state.tickets.remove(&ticket_id).is_none() {
                     continue;
-                };
+                }
                 notifications.push((
                     subscriber.sink,
                     ReadReady {
@@ -504,6 +517,7 @@ impl NodeReadBroker {
                 ));
             }
             Self::admit_queued_locked(&self.inner, &mut state);
+            Self::emit_broker_metrics(&state);
             notifications
         };
         for (sink, ready) in notifications {
@@ -555,6 +569,7 @@ impl NodeReadBroker {
                     ));
                 }
             }
+            Self::emit_broker_metrics(&state);
             notifications
         };
         for (sink, ready) in notifications {
@@ -638,6 +653,10 @@ impl NodeReadBroker {
                 continue;
             }
             let subscriber_ids = flight.subscribers.keys().copied().collect::<Vec<_>>();
+            let queued_since = subscriber_ids
+                .iter()
+                .filter_map(|ticket_id| state.tickets.get(ticket_id).map(|r| r.requested_at))
+                .min();
             state
                 .flights
                 .get_mut(&key)
@@ -658,9 +677,21 @@ impl NodeReadBroker {
                 settled: false,
             });
             state.metrics.physical_dispatched += 1;
+            if let Some(queued_since) = queued_since {
+                xrpld_metrics::acquisition::record_read_queue_delay(
+                    queued_since.elapsed().as_secs_f64(),
+                );
+            }
             let in_flight = Self::in_flight_count(state);
             state.metrics.in_flight_high_water = state.metrics.in_flight_high_water.max(in_flight);
         }
+        Self::emit_broker_metrics(state);
+    }
+
+    /// Record the aggregate physical-read in-flight gauge from broker state.
+    /// The gauge is the broker's resource-local view, never session state.
+    fn emit_broker_metrics(state: &BrokerState) {
+        xrpld_metrics::acquisition::read_in_flight(Self::in_flight_count(state));
     }
 
     fn in_flight_count(state: &BrokerState) -> usize {
@@ -782,6 +813,51 @@ mod tests {
     }
 
     #[test]
+    fn sink_runs_after_the_broker_mutex_is_released() {
+        let broker = broker(ReadBrokerConfig::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let inner_key = key(0xEE, 12);
+        let discard: ReadReadySink = Arc::new(|_ready: ReadReady| {});
+        // The sink re-enters the broker before reporting the completion. If the
+        // broker mutex were still held when the callback ran, this request
+        // would deadlock (the mutex is not reentrant), so a delivered event is
+        // a deterministic proof that the callback ran after lock release.
+        let reenter: ReadReadySink = {
+            let broker = broker.clone();
+            let tx = tx.clone();
+            Arc::new(move |ready: ReadReady| {
+                let admission = broker.request(inner_key, 99, 99, discard.clone());
+                let _ = tx.send((ready, admission));
+            })
+        };
+        let ticket = match broker.request(key(0xDD, 11), 7, 3, reenter) {
+            ReadAdmission::Accepted(ticket) => ticket,
+            other => panic!("expected immediate admission, got {other:?}"),
+        };
+        let mut dispatches = broker.take_ready_dispatches();
+        assert_eq!(dispatches.len(), 1);
+
+        // Settle on a worker thread so a lock-ordering regression surfaces as
+        // a bounded recv timeout instead of a stalled test binary.
+        let settled = broker.clone();
+        std::thread::spawn(move || {
+            for dispatch in dispatches {
+                dispatch.complete(ReadOutcome::Miss);
+            }
+        });
+
+        let (ready, admission) = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the sink must deliver while the broker mutex is free");
+        assert_eq!(ready.ticket, ticket);
+        assert_eq!(ready.outcome, ReadOutcome::Miss);
+        assert!(
+            matches!(admission, ReadAdmission::Accepted(_)),
+            "re-entrant broker access inside the sink must not deadlock"
+        );
+    }
+
+    #[test]
     fn shared_key_fans_out_once_per_acquisition_without_duplicate_io() {
         let broker = broker(ReadBrokerConfig::default());
         let first_events = Arc::new(Mutex::new(Vec::new()));
@@ -826,6 +902,7 @@ mod tests {
     fn deferred_fifo_admission_recovers_after_incremental_completion() {
         let broker = broker(ReadBrokerConfig {
             global_in_flight: 1,
+            ..ReadBrokerConfig::default()
         });
         let events = Arc::new(Mutex::new(Vec::new()));
         let first = broker.request(key(4, 10), 1, 1, sink(Arc::clone(&events)));
@@ -875,6 +952,7 @@ mod tests {
     fn stop_cancels_queued_and_dispatched_subscribers() {
         let broker = broker(ReadBrokerConfig {
             global_in_flight: 1,
+            ..ReadBrokerConfig::default()
         });
         let events = Arc::new(Mutex::new(Vec::new()));
         assert!(matches!(
@@ -903,6 +981,7 @@ mod tests {
     fn shared_key_attaches_without_an_artificial_waiter_limit() {
         let broker = broker(ReadBrokerConfig {
             global_in_flight: 1,
+            ..ReadBrokerConfig::default()
         });
         let events = Arc::new(Mutex::new(Vec::new()));
         assert!(matches!(
@@ -989,6 +1068,7 @@ mod tests {
     fn cancellation_is_the_only_cancelled_actor_event_and_reopens_capacity_after_settlement() {
         let broker = broker(ReadBrokerConfig {
             global_in_flight: 1,
+            max_retained_logical_subscriptions: 1,
         });
         let events = Arc::new(Mutex::new(Vec::new()));
         let ticket = match broker.request(key(12, 10), 1, 1, sink(Arc::clone(&events))) {
@@ -1038,6 +1118,7 @@ mod tests {
     fn pre_and_post_store_generation_settle_independently_without_capacity_cancellation() {
         let broker = broker(ReadBrokerConfig {
             global_in_flight: 1,
+            max_retained_logical_subscriptions: 1,
         });
         let events = Arc::new(Mutex::new(Vec::new()));
         let hash = Uint256::from_array([0xD4; 32]);
@@ -1091,6 +1172,7 @@ mod tests {
     fn late_pre_rotation_completion_cannot_settle_the_replacement_generation_ticket() {
         let broker = broker(ReadBrokerConfig {
             global_in_flight: 2,
+            ..ReadBrokerConfig::default()
         });
         let events = Arc::new(Mutex::new(Vec::new()));
         let hash = Uint256::from_array([0xE1; 32]);

@@ -309,10 +309,7 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
         // method every time a new TRUSTED validation references a ledger not
         // yet available, so a cache-only lookup left the trie unable to pull
         // in persisted ledger ancestry after restart or cache eviction.
-        let runtime = { self.ledger_master_runtime.lock().clone() };
-        let Some(runtime) = runtime else {
-            return None;
-        };
+        let runtime = self.ledger_master_runtime.lock().clone()?;
 
         let hash = basics::sha_map_hash::SHAMapHash::new(*ledger_id);
         let loaded_runtime = { self.loaded_ledger_runtime.lock().clone() };

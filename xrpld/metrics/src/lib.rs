@@ -248,6 +248,174 @@ pub mod rpc {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// ACQUISITION MIGRATION METRICS
+// ═══════════════════════════════════════════════════════════════
+//
+// M0 baseline observability for the single-owner acquisition migration. These
+// record the current inbound-ledger lifecycle boundary: registry lock waits,
+// per-ledger actor mailbox occupancy, ready-scheduler dispatch delay,
+// NodeReadBroker queue/in-flight delay, NodeStore write and durability-fence
+// latency, peer-availability-to-first-request latency, and every operating-mode
+// transition with its reason. They are additive observability only and never
+// change acquisition behavior.
+
+pub mod acquisition {
+    use super::*;
+
+    // ── Registry lock wait ────────────────────────────────────────────────
+    // Time spent blocked on the registry's `inner` mutex before the guard is
+    // granted. High percentiles signal ingress/lifecycle lock contention.
+
+    /// Record how long a caller waited to acquire the registry inner mutex.
+    pub fn record_registry_lock_wait(seconds: f64) {
+        histogram!("xrpld_acq_registry_lock_wait_seconds").record(seconds);
+    }
+
+    // ── Actor mailbox occupancy and age ───────────────────────────────────
+    // Occupancy is sampled into histograms so multiple live sessions aggregate
+    // correctly (a last-writer-wins gauge would only reflect one session). The
+    // age histogram samples how long admitted packets sit in the mailbox before
+    // a bounded turn consumes them.
+
+    /// Sample a session's buffered packet count.
+    pub fn mailbox_packet_count(count: usize) {
+        histogram!("xrpld_acq_mailbox_packet_count").record(count as f64);
+    }
+
+    /// Sample a session's buffered packet bytes.
+    pub fn mailbox_packet_bytes(bytes: usize) {
+        histogram!("xrpld_acq_mailbox_packet_bytes").record(bytes as f64);
+    }
+
+    /// Set the per-session buffered packet count high-water mark.
+    pub fn mailbox_packet_high_water(count: usize) {
+        gauge!("xrpld_acq_mailbox_packet_high_water").set(count as f64);
+    }
+
+    /// Set the per-session buffered packet byte high-water mark.
+    pub fn mailbox_byte_high_water(bytes: usize) {
+        gauge!("xrpld_acq_mailbox_byte_high_water").set(bytes as f64);
+    }
+
+    /// Record how long an admitted packet waited in the mailbox before a turn.
+    pub fn record_mailbox_packet_age(seconds: f64) {
+        histogram!("xrpld_acq_mailbox_packet_age_seconds").record(seconds);
+    }
+
+    // ── Ready-scheduler dispatch delay ────────────────────────────────────
+    // Time from a scheduler wake to the actor turn actually being claimed on a
+    // worker. Includes ready-queue wait plus worker dispatch.
+
+    /// Record the delay between a scheduler wake and its turn being claimed.
+    pub fn record_scheduler_delay(seconds: f64) {
+        histogram!("xrpld_acq_scheduler_delay_seconds").record(seconds);
+    }
+
+    // ── NodeReadBroker queue and in-flight ────────────────────────────────
+    // Queue delay is the time a read key waits between logical request and
+    // physical dispatch. In-flight is the number of dispatched physical reads.
+
+    /// Record how long a read key waited between request and physical dispatch.
+    pub fn record_read_queue_delay(seconds: f64) {
+        histogram!("xrpld_acq_read_queue_delay_seconds").record(seconds);
+    }
+
+    /// Set the number of currently dispatched physical NodeStore reads.
+    pub fn read_in_flight(count: usize) {
+        gauge!("xrpld_acq_read_in_flight").set(count as f64);
+    }
+
+    // ── NodeStore write and durability-fence latency ─────────────────────
+    // Write duration covers one persistence batch; fence duration covers the
+    // final durability barrier (`sync_result`).
+
+    /// Record the duration of a NodeStore persistence write batch.
+    pub fn record_nodestore_write_duration(seconds: f64) {
+        histogram!("xrpld_acq_nodestore_write_duration_seconds").record(seconds);
+    }
+
+    /// Record the payload bytes written by a persistence write batch.
+    pub fn record_nodestore_write_bytes(bytes: u64) {
+        counter!("xrpld_acq_nodestore_write_bytes_total").increment(bytes);
+    }
+
+    /// Record the duration of a durability barrier (fence) completion.
+    pub fn record_nodestore_fence_duration(seconds: f64) {
+        histogram!("xrpld_acq_nodestore_fence_duration_seconds").record(seconds);
+    }
+
+    // ── Peer availability to first request ────────────────────────────────
+    //
+    // M0 stopgap: overlay owns peer availability, the acquisition actor owns
+    // request production. Until the coordinator owns a single `peer_view`
+    // snapshot (M2+), the "peers available since" timestamp lives here in the
+    // observability layer: overlay records the 0→positive transition, and the
+    // acquisition actor reads it back at its first outbound request.
+    //
+    // This is intentionally a narrow port-local lock over one `Instant`; it is
+    // not a backdoor to session lifecycle state.
+
+    static PEERS_AVAILABLE_SINCE: std::sync::Mutex<Option<std::time::Instant>> =
+        std::sync::Mutex::new(None);
+
+    /// Record that usable peer capability is present (0→positive transition).
+    /// Idempotent until peers become unavailable again.
+    pub fn note_peers_available() {
+        let mut guard = PEERS_AVAILABLE_SINCE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_none() {
+            *guard = Some(std::time::Instant::now());
+        }
+        gauge!("xrpld_acq_peers_available").set(1.0);
+    }
+
+    /// Record that no usable peer capability remains.
+    pub fn note_peers_unavailable() {
+        let mut guard = PEERS_AVAILABLE_SINCE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
+        gauge!("xrpld_acq_peers_available").set(0.0);
+    }
+
+    /// Elapsed time since usable peers were last observed, if any.
+    pub fn peers_available_elapsed() -> Option<std::time::Duration> {
+        let guard = PEERS_AVAILABLE_SINCE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.map(|since| since.elapsed())
+    }
+
+    /// Record the latency from usable peer availability to the first outbound
+    /// acquisition request.
+    pub fn record_peer_availability_to_first_request(seconds: f64) {
+        histogram!("xrpld_acq_peer_availability_to_first_request_seconds").record(seconds);
+    }
+
+    // ── Operating-mode transitions ─────────────────────────────────────────
+    // Every transition is a counter labeled by `from`, `to`, and a human
+    // reason supplied by the writer. The current-mode gauge mirrors the latest
+    // transition target.
+
+    /// Record an operating-mode transition together with its reason.
+    pub fn record_operating_mode_transition(from: &str, to: &str, reason: &str) {
+        counter!(
+            "xrpld_operating_mode_transitions_total",
+            "from" => from.to_owned(),
+            "to" => to.to_owned(),
+            "reason" => reason.to_owned(),
+        )
+        .increment(1);
+    }
+
+    /// Set the current operating mode code (0=disconnected … 4=full).
+    pub fn operating_mode(code: u8) {
+        gauge!("xrpld_operating_mode").set(f64::from(code));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // SYSTEM METRICS
 // ═══════════════════════════════════════════════════════════════
 
@@ -296,5 +464,26 @@ mod tests {
         rpc::record_request("server_info", 0.002);
         rpc::increment_error("account_info", "actNotFound");
         system::uptime(3600.0);
+    }
+
+    #[test]
+    fn acquisition_metrics_record_without_exporter() {
+        acquisition::record_registry_lock_wait(0.001);
+        acquisition::mailbox_packet_count(3);
+        acquisition::mailbox_packet_bytes(4096);
+        acquisition::mailbox_packet_high_water(128);
+        acquisition::mailbox_byte_high_water(4 * 1024 * 1024);
+        acquisition::record_mailbox_packet_age(0.0005);
+        acquisition::record_scheduler_delay(0.002);
+        acquisition::record_read_queue_delay(0.003);
+        acquisition::read_in_flight(12);
+        acquisition::record_nodestore_write_duration(0.01);
+        acquisition::record_nodestore_write_bytes(8192);
+        acquisition::record_nodestore_fence_duration(0.02);
+        acquisition::note_peers_available();
+        acquisition::note_peers_unavailable();
+        acquisition::record_peer_availability_to_first_request(0.5);
+        acquisition::record_operating_mode_transition("connected", "syncing", "test");
+        acquisition::operating_mode(2);
     }
 }

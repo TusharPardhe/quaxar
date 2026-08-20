@@ -290,7 +290,7 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
     /// Fees reported by trusted, full validators for `ledger_id`.
     /// Matches `Validations::fees`; delegates to the inner tracker's
     /// `fees()` method.
-    pub fn fees_for_ledger(&self, ledger_id: Uint256, seq: u32, base_fee: u32) -> Vec<u32> {
+    pub fn fees_for_ledger(&self, ledger_id: Uint256, _seq: u32, base_fee: u32) -> Vec<u32> {
         self.inner
             .lock()
             .expect("shared app validations mutex must not be poisoned")

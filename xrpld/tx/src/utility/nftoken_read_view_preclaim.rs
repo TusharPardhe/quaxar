@@ -225,6 +225,16 @@ fn preclaim_create_offer<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
 
 fn preclaim_mint<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account_id = tx.get_account_id(sf("sfAccount"));
+    let destination = if tx.is_field_present(sf("sfDestination")) {
+        Some(tx.get_account_id(sf("sfDestination")))
+    } else {
+        None
+    };
+    let transfer_fee = if tx.is_field_present(sf("sfTransferFee")) {
+        tx.get_field_u16(sf("sfTransferFee"))
+    } else {
+        0
+    };
     let issuer = tx
         .is_field_present(sf("sfIssuer"))
         .then(|| tx.get_account_id(sf("sfIssuer")));
@@ -253,13 +263,9 @@ fn preclaim_mint<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         &account_id,
         &issuer.unwrap_or(account_id),
         &tx.get_field_amount(sf("sfAmount")),
-        tx.is_field_present(sf("sfDestination"))
-            .then(|| tx.get_account_id(sf("sfDestination")))
-            .as_ref(),
+        destination.as_ref(),
         (tx.get_flags() & 0xffff) as u16,
-        tx.is_field_present(sf("sfTransferFee"))
-            .then(|| tx.get_field_u16(sf("sfTransferFee")))
-            .unwrap_or(0),
+        transfer_fee,
         None,
         TF_SELL_NFTOKEN,
     )
@@ -268,10 +274,11 @@ fn preclaim_mint<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
 
 fn preclaim_burn<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account_id = tx.get_account_id(sf("sfAccount"));
-    let owner = tx
-        .is_field_present(sf("sfOwner"))
-        .then(|| tx.get_account_id(sf("sfOwner")))
-        .unwrap_or(account_id);
+    let owner = if tx.is_field_present(sf("sfOwner")) {
+        tx.get_account_id(sf("sfOwner"))
+    } else {
+        account_id
+    };
     let token_id = tx.get_field_h256(sf("sfNFTokenID"));
     if ledger::nftoken_helpers::find_token(view, &owner, &token_id)
         .map_err(|_| read_error())?
@@ -298,10 +305,11 @@ fn preclaim_burn<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
 
 fn preclaim_modify<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account_id = tx.get_account_id(sf("sfAccount"));
-    let owner = tx
-        .is_field_present(sf("sfOwner"))
-        .then(|| tx.get_account_id(sf("sfOwner")))
-        .unwrap_or(account_id);
+    let owner = if tx.is_field_present(sf("sfOwner")) {
+        tx.get_account_id(sf("sfOwner"))
+    } else {
+        account_id
+    };
     let token_id = tx.get_field_h256(sf("sfNFTokenID"));
     if ledger::nftoken_helpers::find_token(view, &owner, &token_id)
         .map_err(|_| read_error())?

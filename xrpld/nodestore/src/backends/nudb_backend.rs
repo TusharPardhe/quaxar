@@ -2416,10 +2416,11 @@ impl Backend for NuDbBackend {
             self.journal.log(JournalLevel::Error, &error);
             error
         })?;
-        let hash_prefix = self.key_hash_prefix(encoded.get_key()).map_err(|error| {
-            self.journal.log(JournalLevel::Error, &error);
-            error
-        })?;
+        let hash_prefix = self
+            .key_hash_prefix(encoded.get_key())
+            .inspect_err(|error| {
+                self.journal.log(JournalLevel::Error, error);
+            })?;
 
         let lock_started = Instant::now();
         let _store_guard = self
@@ -2460,9 +2461,8 @@ impl Backend for NuDbBackend {
             // a split, or any subsequent data/key-file mutation. It records
             // the pre-mutation file sizes and bucket state for recovery.
             self.begin_burst_checkpoint_if_needed(&initial_key_header)
-                .map_err(|error| {
-                    self.journal.log(JournalLevel::Error, &error);
-                    error
+                .inspect_err(|error| {
+                    self.journal.log(JournalLevel::Error, error);
                 })?;
         }
         let key_header = {
@@ -2470,17 +2470,16 @@ impl Backend for NuDbBackend {
                 .runtime
                 .lock()
                 .expect("nudb backend runtime mutex must not be poisoned");
-            self.ensure_primary_bucket(&mut runtime).map_err(|error| {
-                self.journal.log(JournalLevel::Error, &error);
-                error
-            })?;
+            self.ensure_primary_bucket(&mut runtime)
+                .inspect_err(|error| {
+                    self.journal.log(JournalLevel::Error, error);
+                })?;
             if !bulk_importing {
                 runtime.split_fraction = runtime.split_fraction.saturating_add(65_536);
                 if runtime.split_fraction >= runtime.split_threshold {
                     runtime.split_fraction -= runtime.split_threshold;
-                    self.split_one_bucket(&mut runtime).map_err(|error| {
-                        self.journal.log(JournalLevel::Error, &error);
-                        error
+                    self.split_one_bucket(&mut runtime).inspect_err(|error| {
+                        self.journal.log(JournalLevel::Error, error);
                     })?;
                 }
             }
@@ -2499,15 +2498,13 @@ impl Backend for NuDbBackend {
         let mut record = Vec::with_capacity(6 + key_size + compressed.len());
         record.resize(6, 0);
         let mut off = 0usize;
-        write_u48_be(&mut record, &mut off, size_val).map_err(|error| {
-            self.journal.log(JournalLevel::Error, &error);
-            error
+        write_u48_be(&mut record, &mut off, size_val).inspect_err(|error| {
+            self.journal.log(JournalLevel::Error, error);
         })?;
         record.extend_from_slice(encoded.get_key());
         record.extend_from_slice(&compressed);
-        let offset = self.append_data(&record).map_err(|error| {
-            self.journal.log(JournalLevel::Error, &error);
-            error
+        let offset = self.append_data(&record).inspect_err(|error| {
+            self.journal.log(JournalLevel::Error, error);
         })?;
         let entry = NuDbBucketEntry {
             offset,
@@ -2517,17 +2514,15 @@ impl Backend for NuDbBackend {
         let bucket_index =
             nudb_bucket_index(entry.hash_prefix, key_header.buckets, key_header.modulus);
         self.insert_bucket_entry(bucket_index, entry)
-            .map_err(|error| {
+            .inspect_err(|error| {
                 tracing::error!(target: "nodestore", error = %error, "Node store write failed");
-                self.journal.log(JournalLevel::Error, &error);
-                error
+                self.journal.log(JournalLevel::Error, error);
             })?;
         let size_bytes = compressed.len();
         tracing::debug!(target: "nodestore", hash = %object.hash(), size_bytes, "Node object stored");
         if !bulk_importing {
-            self.finish_burst_write().map_err(|error| {
-                self.journal.log(JournalLevel::Error, &error);
-                error
+            self.finish_burst_write().inspect_err(|error| {
+                self.journal.log(JournalLevel::Error, error);
             })?;
         }
         Ok(())

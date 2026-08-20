@@ -47,6 +47,7 @@ fn is_pseudo_account(account: Option<&LedgerSignAccountState>) -> bool {
 /// every generic guard succeeds. A zero account preserves rippled's pseudo
 /// transaction exception by skipping the complete generic block.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))] // shared preclaim shell; dormant until a production preclaim caller lands
 pub(crate) fn invoke_preclaim<V, CalculateBaseFee, MinimumFee, TypedPreclaimTail>(
     view: &V,
     tx: &STTx,
@@ -501,10 +502,11 @@ impl TransactorCheckFeeTx for LedgerPreclaimTx<'_> {
     }
 
     fn fee_paid(&self) -> Self::Amount {
-        self.tx
-            .is_field_present(sf("sfFee"))
-            .then(|| self.tx.get_field_amount(sf("sfFee")).xrp().drops())
-            .unwrap_or(0)
+        if self.tx.is_field_present(sf("sfFee")) {
+            self.tx.get_field_amount(sf("sfFee")).xrp().drops()
+        } else {
+            0
+        }
     }
 
     fn fee_payer(&self) -> Self::AccountId {
@@ -859,7 +861,7 @@ fn check_ledger_signer_authorization<V: ReadView>(
     // Transactor::checkSign(PreclaimContext). `Batch::checkSign` then runs
     // its BatchSigners tail before `invokePreclaim` reaches checkFee.
     let signature = LedgerSignatureObject { tx: tx.tx };
-    let standard_result = run_transactor_preclaim_check_sign(
+    run_transactor_preclaim_check_sign(
         flags,
         parent_batch_id.is_some(),
         view.rules().enabled(&feature_batch()),
@@ -888,9 +890,7 @@ fn check_ledger_signer_authorization<V: ReadView>(
                 .expect("public-key type was checked before account derivation");
             calc_account_id(key.as_bytes())
         },
-    );
-
-    standard_result
+    )
 }
 
 #[cfg(test)]

@@ -625,6 +625,7 @@ pub fn check_mpt_tx_allowed(
     check_mpt_tx_allowed_with_depth(view, tx_type, asset, account_id, 0)
 }
 
+#[allow(clippy::only_used_in_recursion)] // tx_type is threaded for API-shape parity; reserved
 fn check_mpt_tx_allowed_with_depth(
     view: &dyn ReadView,
     tx_type: TxType,

@@ -11,6 +11,7 @@ pub trait BatchHasher {
 }
 
 /// CPU fallback using sha2.
+#[derive(Default)]
 pub struct CpuBatchHasher;
 
 impl BatchHasher for CpuBatchHasher {
@@ -27,16 +28,9 @@ impl BatchHasher for CpuBatchHasher {
 }
 
 /// Stub GPU hasher — delegates to [`CpuBatchHasher`] until wgpu integration.
+#[derive(Default)]
 pub struct GpuBatchHasher {
     fallback: CpuBatchHasher,
-}
-
-impl GpuBatchHasher {
-    pub fn new() -> Self {
-        Self {
-            fallback: CpuBatchHasher,
-        }
-    }
 }
 
 impl BatchHasher for GpuBatchHasher {

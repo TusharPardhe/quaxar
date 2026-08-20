@@ -10,6 +10,21 @@ use std::hash::BuildHasher;
 
 pub const DEFAULT_LEDGER_JSON_API_VERSION: u32 = 2;
 
+/// Failure while rendering a ledger JSON response from untrusted state-map
+/// bytes. In particular, invalid or unsupported `LedgerEntryType` values are
+/// rejected instead of unwinding the caller's worker thread.
+#[derive(Debug)]
+pub enum LedgerJsonError {
+    Traversal(TraversalError),
+    InvalidLedgerEntry { key: basics::base_uint::Uint256 },
+}
+
+impl From<TraversalError> for LedgerJsonError {
+    fn from(error: TraversalError) -> Self {
+        Self::Traversal(error)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LedgerFillOptions(u32);
 
@@ -188,18 +203,27 @@ pub fn fill_json_binary(json: &mut JsonValue, closed: bool, info: &LedgerHeader)
     );
 }
 
-pub fn fill_json_state(json: &mut JsonValue, fill: &LedgerFill<'_>) -> Result<(), TraversalError> {
+pub fn fill_json_state(json: &mut JsonValue, fill: &LedgerFill<'_>) -> Result<(), LedgerJsonError> {
     let object = ensure_object(json);
     let mut state = Vec::new();
+    let mut decode_error = None;
     let expanded = fill.is_expanded();
     let binary = fill.is_binary();
 
     fill.ledger
         .state_map()
         .visit_leaves(&mut |_| None, &mut |item| {
-            state.push(state_leaf_json(item, binary, expanded));
+            if decode_error.is_none() {
+                match state_leaf_json(item, binary, expanded) {
+                    Ok(json) => state.push(json),
+                    Err(error) => decode_error = Some(error),
+                }
+            }
         })?;
 
+    if let Some(error) = decode_error {
+        return Err(error);
+    }
     object.insert("accountState".to_owned(), JsonValue::Array(state));
     Ok(())
 }
@@ -208,7 +232,7 @@ pub fn fill_json_state_with_family<CLOCK, S, C, F, MR, NS>(
     json: &mut JsonValue,
     fill: &LedgerFill<'_>,
     family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-) -> Result<(), TraversalError>
+) -> Result<(), LedgerJsonError>
 where
     CLOCK: basics::tagged_cache::CacheClock,
     S: BuildHasher + Clone,
@@ -218,20 +242,29 @@ where
 {
     let object = ensure_object(json);
     let mut state = Vec::new();
+    let mut decode_error = None;
     let expanded = fill.is_expanded();
     let binary = fill.is_binary();
 
     fill.ledger
         .state_map()
         .visit_leaves_with_family(family, &mut |item| {
-            state.push(state_leaf_json(item, binary, expanded));
+            if decode_error.is_none() {
+                match state_leaf_json(item, binary, expanded) {
+                    Ok(json) => state.push(json),
+                    Err(error) => decode_error = Some(error),
+                }
+            }
         })?;
 
+    if let Some(error) = decode_error {
+        return Err(error);
+    }
     object.insert("accountState".to_owned(), JsonValue::Array(state));
     Ok(())
 }
 
-pub fn fill_json(json: &mut JsonValue, fill: &LedgerFill<'_>) -> Result<(), TraversalError> {
+pub fn fill_json(json: &mut JsonValue, fill: &LedgerFill<'_>) -> Result<(), LedgerJsonError> {
     if fill.is_binary() {
         fill_json_binary(json, fill.closed, &fill.ledger.header());
     } else {
@@ -255,7 +288,7 @@ pub fn fill_json_with_family<CLOCK, S, C, F, MR, NS>(
     json: &mut JsonValue,
     fill: &LedgerFill<'_>,
     family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-) -> Result<(), TraversalError>
+) -> Result<(), LedgerJsonError>
 where
     CLOCK: basics::tagged_cache::CacheClock,
     S: BuildHasher + Clone,
@@ -282,7 +315,7 @@ where
     Ok(())
 }
 
-pub fn add_json(json: &mut JsonValue, fill: &LedgerFill<'_>) -> Result<(), TraversalError> {
+pub fn add_json(json: &mut JsonValue, fill: &LedgerFill<'_>) -> Result<(), LedgerJsonError> {
     let root = ensure_object(json);
     let mut ledger = JsonValue::Object(BTreeMap::new());
     fill_json(&mut ledger, fill)?;
@@ -294,7 +327,7 @@ pub fn add_json_with_family<CLOCK, S, C, F, MR, NS>(
     json: &mut JsonValue,
     fill: &LedgerFill<'_>,
     family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-) -> Result<(), TraversalError>
+) -> Result<(), LedgerJsonError>
 where
     CLOCK: basics::tagged_cache::CacheClock,
     S: BuildHasher + Clone,
@@ -309,7 +342,7 @@ where
     Ok(())
 }
 
-pub fn get_json(fill: &LedgerFill<'_>) -> Result<JsonValue, TraversalError> {
+pub fn get_json(fill: &LedgerFill<'_>) -> Result<JsonValue, LedgerJsonError> {
     let mut json = JsonValue::Null;
     fill_json(&mut json, fill)?;
     Ok(json)
@@ -318,7 +351,7 @@ pub fn get_json(fill: &LedgerFill<'_>) -> Result<JsonValue, TraversalError> {
 pub fn get_json_with_family<CLOCK, S, C, F, MR, NS>(
     fill: &LedgerFill<'_>,
     family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-) -> Result<JsonValue, TraversalError>
+) -> Result<JsonValue, LedgerJsonError>
 where
     CLOCK: basics::tagged_cache::CacheClock,
     S: BuildHasher + Clone,
@@ -365,22 +398,30 @@ fn ensure_object(json: &mut JsonValue) -> &mut BTreeMap<String, JsonValue> {
     object
 }
 
-fn state_leaf_json(item: &SHAMapItem, binary: bool, expanded: bool) -> JsonValue {
+fn state_leaf_json(
+    item: &SHAMapItem,
+    binary: bool,
+    expanded: bool,
+) -> Result<JsonValue, LedgerJsonError> {
     if binary {
-        return JsonValue::Object(BTreeMap::from([
+        return Ok(JsonValue::Object(BTreeMap::from([
             ("hash".to_owned(), JsonValue::String(item.key().to_string())),
             (
                 "tx_blob".to_owned(),
                 JsonValue::String(str_hex(item.data())),
             ),
-        ]));
+        ])));
     }
 
     if expanded {
         let mut serial = SerialIter::new(item.data());
-        let entry = STLedgerEntry::from_serial_iter(&mut serial, item.key());
-        return entry.json(JsonOptions::NONE);
+        let entry = STLedgerEntry::try_from_serial_iter(&mut serial, item.key())
+            .map_err(|_| LedgerJsonError::InvalidLedgerEntry { key: item.key() })?;
+        if !serial.empty() || entry.get_serializer().data() != item.data() {
+            return Err(LedgerJsonError::InvalidLedgerEntry { key: item.key() });
+        }
+        return Ok(entry.json(JsonOptions::NONE));
     }
 
-    JsonValue::String(item.key().to_string())
+    Ok(JsonValue::String(item.key().to_string()))
 }

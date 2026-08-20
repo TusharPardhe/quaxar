@@ -1308,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_item_reports_when_collapse_needs_an_unloaded_descendant() {
+    fn delete_item_keeps_an_unloaded_single_child_subtree_without_error() {
         let keep_key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
@@ -1340,11 +1340,17 @@ mod tests {
         root.set_child(1, Some(parent));
         root.update_hash_deep();
 
-        let error =
-            delete_item(&root, delete_key).expect_err("unloaded collapse path should error");
-        assert_eq!(
-            error,
-            MutationError::Traversal(TraversalError::MissingNode(loaded_leaf.get_hash()))
+        // Deleting the sole loaded sibling must not force loading the
+        // hash-only descendant: the surviving single-child subtree is valid as
+        // an inner node, so the delete completes without a MissingNode error.
+        let deleted = delete_item(&root, delete_key)
+            .expect("unloaded descendants must not block a valid delete");
+        assert!(deleted);
+        assert!(
+            root.get_child(1)
+                .expect("surviving root branch should remain")
+                .is_inner(),
+            "the surviving single-child subtree is retained as an inner node"
         );
     }
 

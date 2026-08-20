@@ -58,6 +58,7 @@ impl SharedLedgerMasterState {
     /// Atomically replace the closed ledger only when `expected` is still the
     /// exact currently installed ledger. This closes the gap between a
     /// consensus accept job checking its parent and publishing its child.
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by state tests; reserved for the LCL-install path
     pub(crate) fn replace_closed_ledger_if_current(
         &self,
         expected: &Arc<Ledger>,

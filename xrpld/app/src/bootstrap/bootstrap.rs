@@ -26,8 +26,8 @@ use nodestore::{FetchType, ManagerImp, NodeObjectType as NodeStoreObjectType};
 use overlay::Overlay;
 use overlay::inbound::LedgerDataIngressDisposition;
 use protocol::{
-    JsonValue, REGISTERED_FEATURES, STLedgerEntry, STParsedJSONObject, STTx, SerialIter, TxMeta,
-    feature_id,
+    JsonValue, REGISTERED_FEATURES, STLedgerEntry, STParsedJSONObject, STTx, SerialIter,
+    Serializer, TxMeta, feature_id,
 };
 use rusqlite::{OptionalExtension, params};
 use shamap::family::{
@@ -378,11 +378,13 @@ where
                 let Some(raw_value) = iter.next() else {
                     return Err("--quorum requires a numeric value".to_owned());
                 };
-                options.quorum = Some(
-                    raw_value
-                        .parse::<usize>()
-                        .map_err(|_| format!("invalid --quorum value: {raw_value}"))?,
-                );
+                let quorum = raw_value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --quorum value: {raw_value}"))?;
+                if quorum == 0 {
+                    return Err("invalid --quorum value: 0".to_owned());
+                }
+                options.quorum = Some(quorum);
             }
             "--silent" => {
                 options.silent = true;
@@ -614,7 +616,9 @@ pub fn build_bootstrap_runtime(
         } else {
             NetworkOpsOperatingMode::Connected
         };
-        runtime.root().set_network_ops_operating_mode(mode);
+        runtime
+            .root()
+            .set_network_ops_operating_mode_with_reason(mode, "startup");
     }
     Ok(AppBootstrapRuntime {
         runtime,
@@ -1172,11 +1176,20 @@ fn route_bootstrap_ledger_data(
         2 => ledger::InboundLedgerDataType::StateNode,
         _ => unreachable!("bootstrap ledger-data helper only accepts non-candidate types"),
     };
-    let nodes = message
-        .nodes
-        .iter()
-        .map(|node| ledger::InboundLedgerNodeData::new(node.nodeid.clone(), node.nodedata.clone()))
-        .collect::<Vec<_>>();
+    let mut nodes = Vec::with_capacity(message.nodes.len());
+    for (packet_index, node) in message.nodes.iter().enumerate() {
+        let Some(node) = crate::ledger::inbound_ledgers::wire_ledger_node::decode_wire_ledger_node(
+            node,
+            packet_type,
+            packet_index,
+        ) else {
+            return BootstrapLedgerDataRouting {
+                disposition: LedgerDataIngressDisposition::Delivered,
+                charge_unsolicited: true,
+            };
+        };
+        nodes.push(node);
+    }
     inbound.note_wire_ledger_data(nodes.len());
     let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
     let stale_packet =
@@ -1409,6 +1422,33 @@ fn run_start_mode_consensus_loop(
         shared_inbound.set_overlay_rt(overlay_rt);
     }
 
+    // M4.2-C3: install the coordinator as the single session lifecycle owner
+    // before any acquisition begins. The coordinator publishes the service
+    // phase into the same SharedNetworkOpsState every other component reads,
+    // and it never reads a mode back. From this point `acquire` delegates to
+    // coordinator sessions and returns None for new starts, exactly like
+    // rippled `InboundLedgers::acquire`.
+    shared_inbound.set_phase_state(runtime.root().network_ops_state());
+    if shared_inbound.install_coordinator() {
+        tracing::info!(
+            target: "inbound_ledger",
+            "coordinator installed as the single acquisition session lifecycle owner"
+        );
+        // M6-D: seed the coordinator's initial phase from the bootstrap startup
+        // intent so it alone owns the mode from install (the legacy startup
+        // write in `build_bootstrap_runtime` remains only as the pre-install
+        // seed and the rollback path). Quaxar preserves its legacy startup
+        // mode seed: networked -> Connected, `start_valid` -> Full from the
+        // hydrated LCL. rippled seeds `DISCONNECTED`/`FULL` in the NetworkOPs
+        // constructor (`rippled/src/xrpld/app/misc/NetworkOPs.cpp:318`).
+        shared_inbound.coordinator_startup(startup_coordinator_phase(runtime.root()));
+    } else {
+        tracing::warn!(
+            target: "inbound_ledger",
+            "coordinator install deferred: NodeStore or phase state unavailable; legacy acquisition remains the lifecycle owner"
+        );
+    }
+
     // Spawn consensus event loop (validation/ledger promotion)
     let event_loop_app = runtime.root().clone();
     let event_loop_stop = Arc::clone(&stop);
@@ -1505,7 +1545,9 @@ fn run_start_mode_consensus_loop(
                             // The event-loop parser performs the signature
                             // check after scheduling, matching checkValidation.
                             let _ = event_tx
-                                .send(crate::consensus::driver::ConsensusEvent::Validation(queued));
+                                .send(crate::consensus::driver::ConsensusEvent::Validation(
+                                    Box::new(queued),
+                                ));
                         },
                     ) {
                         tracing::debug!(target: "consensus", "validation job rejected during shutdown");
@@ -1536,9 +1578,11 @@ fn run_start_mode_consensus_loop(
                         };
                         let validations = overlay_rt.overlay().take_validations();
                         for queued in validations {
-                            match fwd_event_tx
-                                .send(crate::consensus::driver::ConsensusEvent::Validation(queued))
-                            {
+                            match fwd_event_tx.send(
+                                crate::consensus::driver::ConsensusEvent::Validation(Box::new(
+                                    queued,
+                                )),
+                            ) {
                                 Ok(()) => {}
                                 Err(_) => return,
                             }
@@ -1772,7 +1816,55 @@ fn run_start_mode_consensus_loop(
                                 "candidate ledger-data job rejected during shutdown");
                         }
                     }
-                    0 | 1 | 2 => {
+                    0..=2 => {
+                        // M4.2-C3: coordinator-owned sessions admit and route
+                        // through the coordinator first. The coordinator
+                        // enforces the bounded packet/byte budget and enqueues
+                        // an owned PacketAdmitted event; an admitted frame is
+                        // never routed twice. `Unmatched` (no coordinator
+                        // route) falls through to the legacy actor admission
+                        // path so base/transaction unmatched replies keep
+                        // their source-equivalent useless-data charge.
+                        if router_shared_inbound.coordinator_installed() {
+                            use crate::ledger::inbound_ledgers::CoordinatorLedgerDataDisposition;
+                            let disposition = router_shared_inbound
+                                .coordinator_route_ledger_data(peer_id, &message);
+                            match disposition {
+                                // No coordinator route: fall through only to
+                                // the rippled-equivalent unmatched treatment.
+                                // In coordinator mode the registry returns
+                                // `Unmatched` before consulting any legacy
+                                // actor, so state nodes may seed fetch-pack
+                                // while base/transaction replies retain their
+                                // source-equivalent useless-data charge.
+                                CoordinatorLedgerDataDisposition::Unmatched => {}
+                                // Admission capacity exhausted: the overlay
+                                // retains the frame for retry, with no
+                                // actor-side effect and no peer charge.
+                                CoordinatorLedgerDataDisposition::Deferred => {
+                                    return LedgerDataIngressDisposition::Deferred;
+                                }
+                                // Consumed by the coordinator owner loop or a
+                                // terminal session; never routed again.
+                                CoordinatorLedgerDataDisposition::Delivered
+                                | CoordinatorLedgerDataDisposition::Terminal => {
+                                    return LedgerDataIngressDisposition::Delivered;
+                                }
+                                // Malformed coordinator payload: charge the
+                                // source exactly like a legacy invalid reply.
+                                CoordinatorLedgerDataDisposition::Invalid => {
+                                    if let Some(peer) =
+                                        router_overlay.find_peer_by_short_id(peer_id)
+                                    {
+                                        peer.charge(
+                                            (*resource::FEE_INVALID_DATA).clone(),
+                                            "TMLedgerData invalid node payload".to_owned(),
+                                        );
+                                    }
+                                    return LedgerDataIngressDisposition::Delivered;
+                                }
+                            }
+                        }
                         let routing = route_bootstrap_ledger_data(
                             &router_shared_inbound,
                             hash,
@@ -1818,9 +1910,38 @@ fn run_start_mode_consensus_loop(
             }));
     }
 
+    /// The coordinator's initial phase derived from the bootstrap startup
+    /// intent. Quaxar preserves its legacy startup mode seed: networked ->
+    /// `Connected`, `start_valid` -> `Full` from the hydrated LCL and its
+    /// published ledger (the loaded ledger is published during
+    /// `initialize_startup_ledger_state`). rippled seeds the constructor mode
+    /// from `startValid` (`NetworkOPs.cpp:318`) and only later promotes with
+    /// peer heartbeat logic; Quaxar's `Connected` seed is the retained
+    /// divergence documented in the M6-D design note.
+    fn startup_coordinator_phase(root: &ApplicationRoot) -> acquisition::SyncPhase {
+        if root.config().start_valid {
+            if let (Some(lcl), Some(published)) = (root.closed_ledger(), root.published_ledger()) {
+                return acquisition::SyncPhase::Full {
+                    lcl: acquisition::LedgerIdentity::new(
+                        *lcl.header().hash.as_uint256(),
+                        lcl.header().seq,
+                    ),
+                    published: acquisition::LedgerIdentity::new(
+                        *published.header().hash.as_uint256(),
+                        published.header().seq,
+                    ),
+                };
+            }
+        }
+        acquisition::SyncPhase::Connected
+    }
+
     fn recover_deferred_replay_parent(
         root: &ApplicationRoot,
         shared_inbound: &Arc<crate::ledger::inbound_ledgers::InboundLedgers>,
+        shared_completed_rx: &std::sync::mpsc::Receiver<
+            crate::ledger::inbound_ledgers::CompletedInboundLedger,
+        >,
         stop: &AtomicBool,
         sweep_interval_seconds: u64,
     ) -> bool {
@@ -1833,7 +1954,20 @@ fn run_start_mode_consensus_loop(
         // strand against a synthetic or partial parent, and do not block that
         // strand waiting for peer I/O: acquisition workers and the overlay router
         // continue independently while this bootstrap coordinator retries.
-        root.set_network_ops_operating_mode(crate::NetworkOpsOperatingMode::Syncing);
+        //
+        // M6-D: when the coordinator is installed it owns the mode from
+        // `install_coordinator`; the recovery intent is submitted as acquire
+        // demand (a coordinator input fact) instead of this direct Syncing
+        // write. The legacy write remains the rollback path for the
+        // coordinator-less setup. rippled reaches the same Syncing state via
+        // NetworkOPs `setState` from `InboundLedgers::acquire` promotion
+        // (`NetworkOPs.cpp` `beginConsensus`/`setState` paths).
+        if !shared_inbound.coordinator_installed() {
+            root.set_network_ops_operating_mode_with_reason(
+                crate::NetworkOpsOperatingMode::Syncing,
+                "replay_parent_recovery",
+            );
+        }
         tracing::info!(target: "bootstrap",
             parent_seq = initial.parent_seq,
             parent_hash = %initial.parent_hash,
@@ -1851,14 +1985,41 @@ fn run_start_mode_consensus_loop(
             // Its worker-owned AccountStateSF/TransactionStateSF lifecycle writes
             // all accepted nodes and performs the NodeStore sync before exposing a
             // completed ledger here.
-            if shared_inbound
-                .acquire(
-                    pending.parent_hash,
-                    pending.parent_seq,
-                    crate::ledger::inbound_ledgers::AcquireReason::History,
-                )
-                .is_some()
-            {
+            //
+            // M6-D: in coordinator mode acquire() mints a coordinator session and
+            // returns None for a new start, exactly like rippled
+            // `InboundLedgers::acquire`. The durable completion then arrives on
+            // the completed-ledger channel the strand would otherwise drain (it is
+            // not yet spawned while replay is gated). Consume that channel here so
+            // replay can proceed; the coordinator durably persisted the parent
+            // before the handoff, so the skipped strand `storeLedger` is redundant.
+            let coordinator_mode = shared_inbound.coordinator_installed();
+            // The registry's `need_network_ledger` admission gate rejects
+            // `History` acquires whenever the derived atomic is true. Legacy
+            // replay startups never set the atomic (StartUpType::Replay), but
+            // the coordinator derives it true for `Connected`/`Syncing`, so the
+            // replay parent must be requested as `Generic` in coordinator mode:
+            // it is a required startup ledger, not history backfill.
+            let parent_reason = if coordinator_mode {
+                crate::ledger::inbound_ledgers::AcquireReason::Generic
+            } else {
+                crate::ledger::inbound_ledgers::AcquireReason::History
+            };
+            let parent_complete = if coordinator_mode {
+                shared_inbound.acquire(pending.parent_hash, pending.parent_seq, parent_reason);
+                let mut complete = false;
+                while let Ok(completed) = shared_completed_rx.try_recv() {
+                    if completed.ledger.header().hash.as_uint256() == &pending.parent_hash {
+                        complete = true;
+                    }
+                }
+                complete
+            } else {
+                shared_inbound
+                    .acquire(pending.parent_hash, pending.parent_seq, parent_reason)
+                    .is_some()
+            };
+            if parent_complete {
                 match replay_startup_ledger_from_storage(
                     root,
                     pending.start_ledger.as_deref(),
@@ -1908,6 +2069,7 @@ fn run_start_mode_consensus_loop(
     if !recover_deferred_replay_parent(
         runtime.root(),
         &shared_inbound,
+        &shared_completed_rx,
         stop.as_ref(),
         configured_sweep_interval_seconds,
     ) {
@@ -2190,6 +2352,25 @@ fn run_start_mode_consensus_loop(
                                 }
                             }
                         }
+                    } else if should_schedule_coordinator_fetch_pack_wake(
+                        stored,
+                        router_shared_inbound.coordinator_installed(),
+                    ) {
+                        // Coordinator plans request state and transaction nodes
+                        // through TMGetObjectByHash. Those replies populate the
+                        // same fetch-pack cache as rippled's PeerImp reply path,
+                        // but are not `otFETCH_PACK` and therefore do not enter
+                        // LedgerMaster's gotFetchPack single-flight. Wake the
+                        // coordinator through its typed pass on JtLedgerData,
+                        // never from the overlay callback: this makes the newly
+                        // cached nodes visible to the owning plan immediately
+                        // and preserves the no-blocking-ingress boundary.
+                        let ready_inbound = Arc::clone(&router_shared_inbound);
+                        let _ = router_root.job_queue().add_job(
+                            crate::job::job_types::JobType::JtLedgerData,
+                            "CoordinatorGetObjectReply",
+                            move || ready_inbound.finish_fetch_pack_pass(),
+                        );
                     }
                 } else if msg.r#type
                     == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32
@@ -2209,7 +2390,7 @@ fn run_start_mode_consensus_loop(
                             .job_count(crate::job::job_types::JobType::JtPack),
                         msg.ledger_hash.as_deref(),
                     ) {
-                        FetchPackAdmission::Busy => return,
+                        FetchPackAdmission::Busy => (),
                         FetchPackAdmission::Malformed => {
                             peer.charge(
                                 (*resource::FEE_MALFORMED_REQUEST).clone(),
@@ -2494,7 +2675,7 @@ fn run_start_mode_consensus_loop(
                         static IDLE_TICK: std::sync::atomic::AtomicU32 =
                             std::sync::atomic::AtomicU32::new(0);
                         let tick = IDLE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if tick % 4 == 0 {
+                        if tick.is_multiple_of(4) {
                             overlay_rt.overlay().delete_idle_peers();
                         }
 
@@ -2595,7 +2776,6 @@ fn run_start_mode_consensus_loop(
                     // validator ManifestCache, and relay only newly accepted blobs.
                     // This is OverlayImpl::onManifests parity; do not echo a
                     // peer's accepted manifests back to that peer.
-                    let manifests = manifests;
                     for inbound in manifests {
                         let mut relay_list = Vec::new();
                         let mut trusted_manifest_accepted = false;
@@ -2704,8 +2884,8 @@ fn run_start_mode_consensus_loop(
                                 String::new(),
                                 hash,
                             );
-                            synchronize_unl_blocked(&root);
-                            broadcast_validator_list_collection(&root, &stats, hash);
+                            synchronize_unl_blocked(root);
+                            broadcast_validator_list_collection(root, &stats, hash);
                             tracing::trace!(
                                 target: "overlay",
                                 version = tm.version,
@@ -2720,7 +2900,7 @@ fn run_start_mode_consensus_loop(
                     // pending blobs for peers that negotiated the v2 feature.
                     for collection in validator_list_collections {
                         apply_validator_list_collection_from_peer(
-                            &root,
+                            root,
                             collection.peer_id,
                             &collection.message,
                         );
@@ -3286,6 +3466,7 @@ fn serve_one_get_ledger_request(
                     nodes.push(overlay::message::wire::TmLedgerNode {
                         nodeid: Some(nid.get_raw_string()),
                         nodedata: ndata,
+                        reference: None,
                     });
                 }
             }
@@ -3385,6 +3566,7 @@ fn serve_one_get_ledger_request(
             nodes.push(overlay::message::wire::TmLedgerNode {
                 nodeid: None,
                 nodedata: header_data,
+                reference: None,
             });
             // State map root
             if !ledger.header().account_hash.is_zero() {
@@ -3392,6 +3574,7 @@ fn serve_one_get_ledger_request(
                     nodes.push(overlay::message::wire::TmLedgerNode {
                         nodeid: None,
                         nodedata: root_data,
+                        reference: None,
                     });
                 }
             }
@@ -3401,6 +3584,7 @@ fn serve_one_get_ledger_request(
                     nodes.push(overlay::message::wire::TmLedgerNode {
                         nodeid: None,
                         nodedata: root_data,
+                        reference: None,
                     });
                 }
             }
@@ -3450,6 +3634,7 @@ fn serve_one_get_ledger_request(
                         nodes.push(overlay::message::wire::TmLedgerNode {
                             nodeid: Some(nid.get_raw_string()),
                             nodedata: ndata.clone(),
+                            reference: None,
                         });
                         if nodes.len() >= HARD_MAX_REPLY_NODES {
                             break;
@@ -3924,15 +4109,36 @@ fn spawn_shutdown_watcher(
     stop_requested: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        // Docker's `stop` sends SIGTERM before it escalates to SIGKILL. Keep
+        // this aligned with rippled's ApplicationImp::setup, which observes
+        // both SIGINT and SIGTERM and routes either through signalStop.
+        #[cfg(unix)]
+        let mut terminate = runtime.root().basic_app().block_on(async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler must install")
+        });
+
         loop {
             if stop_requested.load(Ordering::Acquire) {
                 return;
             }
 
-            let ctrl_c_seen = runtime.root().basic_app().block_on(async {
-                tokio::select! {
-                    result = tokio::signal::ctrl_c() => result.is_ok(),
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => false,
+            let shutdown_signal_seen = runtime.root().basic_app().block_on(async {
+                #[cfg(unix)]
+                {
+                    tokio::select! {
+                        result = tokio::signal::ctrl_c() => result.is_ok(),
+                        _ = terminate.recv() => true,
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => false,
+                    }
+                }
+
+                #[cfg(not(unix))]
+                {
+                    tokio::select! {
+                        result = tokio::signal::ctrl_c() => result.is_ok(),
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => false,
+                    }
                 }
             });
 
@@ -3940,7 +4146,7 @@ fn spawn_shutdown_watcher(
                 return;
             }
 
-            if ctrl_c_seen {
+            if shutdown_signal_seen {
                 let _ = runtime.signal_stop("received shutdown signal");
                 return;
             }
@@ -4124,7 +4330,7 @@ fn attach_bootstrap_node_family(root: &mut ApplicationRoot, node_size: Option<&s
             time::Duration::seconds(profile.tree_cache_age_seconds),
             MonotonicClock::default(),
         ));
-        let _ = root.attach_shared_tree_cache(Arc::clone(&tree_cache));
+        root.attach_shared_tree_cache(Arc::clone(&tree_cache));
         let family = crate::NodeFamily::new_with_owned_full_below_cache(
             tree_cache,
             1,
@@ -4179,6 +4385,10 @@ fn initialize_startup_ledger_state(
         StartUpType::LoadFile => load_startup_ledger_from_file(root, options),
         StartUpType::Network => {
             if !root.config().standalone {
+                // M6-E: this runs before the coordinator is installed, so it is
+                // a pre-install seed consistent with the coordinator's derived
+                // `Connected -> need_network_ledger = true`; after install the
+                // atomic is the phase port's output only.
                 root.set_need_network_ledger(true);
             }
             seed_startup_ledger_state(root, options, config)
@@ -4200,6 +4410,10 @@ fn initialize_startup_ledger_state(
     }
 }
 
+// Unwired startup history-rehydration helper, retained for the M6-E
+// `need_network_ledger` / history audit; removed in the M7 compatibility sweep
+// if still unused.
+#[allow(dead_code)]
 fn rehydrate_configured_history(root: &ApplicationRoot, history_depth: u32) -> Result<(), String> {
     if history_depth == 0 {
         return Ok(());
@@ -4561,7 +4775,11 @@ fn hydrate_loaded_ledger(
 /// historical transactions: it restores the transaction set that the later
 /// replay build will process cumulatively.
 fn ordered_replay_open_ledger_transactions(replay_data: &LedgerReplay) -> Vec<Arc<STTx>> {
-    replay_data.ordered_txs().values().cloned().collect()
+    replay_data
+        .ordered_txs()
+        .values()
+        .map(|entry| Arc::clone(entry.transaction()))
+        .collect()
 }
 
 fn inject_replay_transactions<CLOCK, S, FB, F, MR, NS>(
@@ -4630,18 +4848,21 @@ where
         let item = node
             .peek_item()
             .ok_or_else(|| "replay tx leaf did not contain an item".to_owned())?;
-        let (tx, meta_index) = decode_replay_tx_item(replay.header().seq, &item)?;
-        ordered_txs.entry(meta_index).or_insert(tx);
+        let (entry, meta_index) = decode_replay_tx_item(replay.header().seq, &item)?;
+        ordered_txs.entry(meta_index).or_insert(entry);
         current = replay
             .tx_map()
             .peek_next_item_with_family(item.key(), &mut stack, family)
             .map_err(|error| format!("replay tx traversal failed: {error:?}"))?;
     }
 
-    Ok(LedgerReplay::new(parent, replay, ordered_txs))
+    Ok(LedgerReplay::new_with_metadata(parent, replay, ordered_txs))
 }
 
-fn decode_replay_tx_item(ledger_seq: u32, item: &SHAMapItem) -> Result<(Arc<STTx>, u32), String> {
+fn decode_replay_tx_item(
+    ledger_seq: u32,
+    item: &SHAMapItem,
+) -> Result<(ledger::ReplayTransaction, u32), String> {
     let (tx_bytes, meta_bytes) = catch_unwind(AssertUnwindSafe(|| {
         let mut serial = SerialIter::new(item.data());
         (serial.get_vl(), serial.get_vl())
@@ -4659,7 +4880,10 @@ fn decode_replay_tx_item(ledger_seq: u32, item: &SHAMapItem) -> Result<(Arc<STTx
     }))
     .map_err(|_| "failed to parse replay TxMeta".to_owned())?;
 
-    Ok((tx, meta.get_index()))
+    Ok((
+        ledger::ReplayTransaction::new(tx, Arc::new(Serializer::from_bytes(meta_bytes))),
+        meta.get_index(),
+    ))
 }
 
 fn load_bootstrap_ledger_from_file(path: &str) -> Result<Ledger, String> {
@@ -4736,7 +4960,8 @@ fn load_bootstrap_ledger_from_file(path: &str) -> Result<Ledger, String> {
             let bytes = str_unhex(&blob_text)
                 .ok_or_else(|| format!("invalid ledger entry blob in {path}"))?;
             let mut iter = SerialIter::new(&bytes);
-            let entry = STLedgerEntry::from_serial_iter(&mut iter, index);
+            let entry = STLedgerEntry::try_from_serial_iter(&mut iter, index)
+                .map_err(|error| format!("invalid ledger entry blob in {path}: {error}"))?;
             if !iter.empty() {
                 return Err(format!(
                     "invalid trailing bytes in ledger entry blob {path}"
@@ -4748,7 +4973,8 @@ fn load_bootstrap_ledger_from_file(path: &str) -> Result<Ledger, String> {
             let st_object = parsed
                 .object
                 .ok_or_else(|| format!("invalid ledger file entry in {path}"))?;
-            STLedgerEntry::from_stobject(st_object, index)
+            STLedgerEntry::try_from_stobject(st_object, index)
+                .map_err(|error| format!("invalid ledger file entry in {path}: {error}"))?
         };
         state_tree
             .add_item(
@@ -4833,7 +5059,6 @@ fn seed_startup_ledger_state(
             let genesis_config = LedgerConfig {
                 fees: ledger::CURRENT_DEFAULT_FEES,
                 features: protocol::FeatureSet::new(preset_features),
-                ..LedgerConfig::default()
             };
             Ledger::create_genesis(backed, &genesis_config, genesis_amendments)
                 .unwrap_or_else(|_| Ledger::from_ledger_seq_and_close_time(1, 0, backed))
@@ -4924,6 +5149,15 @@ fn seed_startup_ledger_state(
     if root.node_store().is_some() {
         next.persist_dirty_nodes_to_store_result(root.shared_tree_cache())
             .map_err(|error| format!("initial next-ledger NuDB persistence failed: {error}"))?;
+        // A start-valid forge is immediately copied and reopened by Pulsar.
+        // Persisting dirty SHAMap nodes schedules backend writes; force the
+        // NodeStore durability barrier before the validated header can be
+        // written, otherwise `--load` finds metadata without its full tree.
+        match root.node_store().as_ref() {
+            Some(crate::SHAMapStoreNodeStore::Single(database)) => database.sync(),
+            Some(crate::SHAMapStoreNodeStore::Rotating(database)) => database.sync(),
+            None => unreachable!("node store presence was checked above"),
+        }
     }
     next.set_immutable(true);
     let next = Arc::new(next);
@@ -4948,6 +5182,21 @@ fn seed_startup_ledger_state(
         );
         true
     });
+    // `--valid` is an explicit operator assertion that the initial LCL is a
+    // valid network ledger. Hydrate it through the same `setFullLedger` /
+    // application bridge as a durable load before installing the acquisition
+    // coordinator; otherwise the coordinator sees a closed-but-unpublished
+    // Fresh LCL and overwrites the requested Full startup mode with Connected.
+    // Ordinary Fresh startup deliberately remains closed-only.
+    if options.start_valid && !options.standalone {
+        let ledger_master = root
+            .ledger_master_runtime()
+            .ok_or_else(|| "missing ledger master while honoring --valid startup".to_owned())?
+            .ledger_master();
+        hydrate_loaded_ledger(root, Arc::clone(&next), ledger_master)?;
+        return Ok(());
+    }
+
     // switchLCL(next) occurs after the open ledger is based on next.
     root.on_closed_ledger(Arc::clone(&next));
 
@@ -5320,17 +5569,32 @@ fn should_schedule_relayed_transaction(
         .0
 }
 
+/// Generic `TMGetObjectByHash` replies are cache updates for coordinator
+/// sessions, but unlike `otFETCH_PACK` replies they do not enter LedgerMaster's
+/// gotFetchPack single-flight. Schedule one coordinator wake only after at
+/// least one valid object was cached and only once coordinator ownership is
+/// active; legacy acquisition retains its established timeout/worker path.
+const fn should_schedule_coordinator_fetch_pack_wake(
+    stored: usize,
+    coordinator_installed: bool,
+) -> bool {
+    stored > 0 && coordinator_installed
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ENDPOINT_HANDOUT_LIMIT, FetchPackAdmission, GenericGetObjectAdmission, MainRuntime,
-        StartUpType, amendments_from_config, build_endpoint_handout,
-        build_validator_list_collection_messages, candidate_ledger_data_charge,
-        classify_fetch_pack_request, classify_generic_get_object_request, configured_feature_ids,
-        configured_sweep_interval, fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
+        BootstrapLedgerDataRouting, ENDPOINT_HANDOUT_LIMIT, FetchPackAdmission,
+        GenericGetObjectAdmission, LedgerDataIngressDisposition, MainRuntime, StartUpType,
+        amendments_from_config, build_endpoint_handout, build_validator_list_collection_messages,
+        candidate_ledger_data_charge, classify_fetch_pack_request,
+        classify_generic_get_object_request, configured_feature_ids, configured_sweep_interval,
+        fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
         get_object_query_send_queue_is_admissible, ledger_data_nodes_are_admissible,
-        ledger_data_sequence_is_admissible, manifest_rate_limit_policy, parse_basic_config_text,
-        relay_accepted_manifest, requested_transaction_envelope, sequence_is_fetchable_at_floor,
+        ledger_data_sequence_is_admissible, load_bootstrap_ledger_from_file,
+        manifest_rate_limit_policy, parse_basic_config_text, relay_accepted_manifest,
+        requested_transaction_envelope, route_bootstrap_ledger_data,
+        sequence_is_fetchable_at_floor, should_schedule_coordinator_fetch_pack_wake,
         should_schedule_relayed_transaction, spawn_shutdown_watcher,
         transaction_object_request_is_admissible, trusted_first_manifest_payloads,
         validator_list_collection_blobs, validator_list_threshold_from_config,
@@ -5340,16 +5604,67 @@ mod tests {
     };
     use crate::{ApplicationRoot, ValidatorListBroadcastBlob, ValidatorListCollectionForBroadcast};
     use basics::base_uint::Uint256;
+    use basics::basic_config::BasicConfig;
     use basics::hardened_hash::HardenedHashBuilder;
     use basics::tagged_cache::MonotonicClock;
     use ledger::FetchPackCache;
+    use nodestore::{DummyScheduler, ManagerImp, NullJournal, Scheduler};
     use shamap::family::FullBelowCacheImpl;
     use shamap::tree_node_cache::TreeNodeCache;
     use std::collections::BTreeSet;
+    use std::fs;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+    use tempfile::TempDir;
     use xrpl_core::HashRouter;
+
+    #[test]
+    fn bootstrap_ledger_file_rejects_unknown_sle_type_without_unwinding() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("invalid-ledger.json");
+        fs::write(
+            &path,
+            r#"{
+                "ledger_index": 1,
+                "accountState": [{
+                    "index": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "blob": "11FFFF"
+                }]
+            }"#,
+        )
+        .expect("invalid ledger fixture");
+
+        let loaded = std::panic::catch_unwind(|| {
+            load_bootstrap_ledger_from_file(path.to_str().expect("UTF-8 temporary path"))
+        });
+
+        assert!(
+            loaded.is_ok(),
+            "invalid ledger input must not unwind bootstrap"
+        );
+        assert!(
+            loaded
+                .expect("caught bootstrap loader")
+                .expect_err("unknown LedgerEntryType must be rejected")
+                .contains("invalid ledger entry blob"),
+            "the bootstrap error must identify the rejected blob"
+        );
+    }
+
+    #[test]
+    fn generic_object_reply_wakes_only_an_installed_coordinator_after_cache_progress() {
+        assert!(should_schedule_coordinator_fetch_pack_wake(1, true));
+        assert!(should_schedule_coordinator_fetch_pack_wake(8, true));
+        assert!(
+            !should_schedule_coordinator_fetch_pack_wake(0, true),
+            "an empty reply must not manufacture a coordinator plan advance"
+        );
+        assert!(
+            !should_schedule_coordinator_fetch_pack_wake(1, false),
+            "legacy acquisition retains its existing fetch-pack wake path"
+        );
+    }
 
     #[test]
     fn relayed_transaction_ingress_suppresses_duplicates_and_skips_source_peer() {
@@ -5937,9 +6252,38 @@ mod tests {
     fn bootstrap_ledger_data_router_maps_all_admission_dispositions_without_deferred_actor_route() {
         use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
 
-        fn registry() -> Arc<InboundLedgers> {
+        /// Build the same real in-memory node store used by the inbound-ledger
+        /// fixtures. `acquire` rejects creation without an attached store, so
+        /// an admitted response can only reach actor routing through a real
+        /// registry entry.
+        fn test_node_store() -> (TempDir, crate::SHAMapStoreNodeStore) {
+            let dir = TempDir::new().expect("tempdir");
+            let mut config = BasicConfig::new();
+            config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+            let node_db = config.section_mut("node_db");
+            node_db.set("type", "Memory");
+            node_db.set("path", dir.path().join("node").to_string_lossy());
+
+            let bootstrap = crate::bootstrap_shamap_store(
+                &config,
+                false,
+                128,
+                1,
+                8,
+                64,
+                2,
+                &ManagerImp::new(),
+                Arc::new(DummyScheduler) as Arc<dyn Scheduler>,
+                Arc::new(NullJournal),
+            )
+            .expect("bootstrap");
+            (dir, bootstrap.node_store)
+        }
+
+        fn registry() -> (TempDir, Arc<InboundLedgers>) {
+            let (dir, node_store) = test_node_store();
             let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
-            Arc::new(InboundLedgers::new(
+            let registry = Arc::new(InboundLedgers::new(
                 Arc::new(TreeNodeCache::new(
                     "bootstrap-ledger-data-router-test",
                     8,
@@ -5959,7 +6303,9 @@ mod tests {
                 )),
                 completed_tx,
                 Arc::new(AtomicBool::new(false)),
-            ))
+            ));
+            registry.set_node_store(node_store);
+            (dir, registry)
         }
 
         fn base_reply(hash: Uint256) -> overlay::TmLedgerData {
@@ -5970,21 +6316,24 @@ mod tests {
                 nodes: vec![overlay::message::wire::TmLedgerNode {
                     nodeid: None,
                     nodedata: vec![0],
+                    reference: None,
                 }],
                 request_cookie: None,
                 error: None,
             }
         }
 
-        let admitted = registry();
+        let (_admitted_dir, admitted) = registry();
         let admitted_hash = Uint256::from_array([0xA1; 32]);
         assert!(
             admitted
                 .acquire(admitted_hash, 1, AcquireReason::Generic)
                 .is_none()
         );
+        let first_routing =
+            route_bootstrap_ledger_data(&admitted, admitted_hash, 7, &base_reply(admitted_hash));
         assert_eq!(
-            route_bootstrap_ledger_data(&admitted, admitted_hash, 7, &base_reply(admitted_hash)),
+            first_routing,
             BootstrapLedgerDataRouting {
                 disposition: LedgerDataIngressDisposition::Delivered,
                 charge_unsolicited: false,
@@ -5996,7 +6345,7 @@ mod tests {
         assert_eq!(admitted_lifecycle.route_accepted, 1);
         admitted.stop();
 
-        let deferred = registry();
+        let (_deferred_dir, deferred) = registry();
         let deferred_hash = Uint256::from_array([0xD2; 32]);
         assert!(
             deferred
@@ -6029,7 +6378,7 @@ mod tests {
         drop(leases);
         deferred.stop();
 
-        let unmatched = registry();
+        let (_unmatched_dir, unmatched) = registry();
         let unmatched_hash = Uint256::from_array([0xC3; 32]);
         assert_eq!(
             route_bootstrap_ledger_data(&unmatched, unmatched_hash, 9, &base_reply(unmatched_hash)),
@@ -6042,7 +6391,7 @@ mod tests {
         assert_eq!(unmatched.lifecycle_snapshot().route_attempts, 0);
         unmatched.stop();
 
-        let terminal = registry();
+        let (_terminal_dir, terminal) = registry();
         let terminal_hash = Uint256::from_array([0xE4; 32]);
         assert!(
             terminal

@@ -1072,7 +1072,7 @@ fn af5_flag_4() {
     });
     assert_eq!(
         full_apply(&mut v, &tx, TxType::ACCOUNT_SET),
-        Ter::TES_SUCCESS
+        Ter::TEC_NO_ALTERNATIVE_KEY
     );
 }
 #[test]
@@ -1409,6 +1409,15 @@ fn af6_set_clear_flag_2() {
         full_apply(&mut v, &tx, TxType::ACCOUNT_SET),
         Ter::TES_SUCCESS
     );
+    let after_set = v
+        .read(protocol::account_keylet(Uint160::from_void(a.data())))
+        .expect("account lookup should succeed")
+        .expect("account root should remain present");
+    assert_ne!(
+        after_set.get_flags() & protocol::lsfRequireAuth,
+        0,
+        "SetFlag 2 must set lsfRequireAuth"
+    );
     let tx2 = STTx::new(TxType::ACCOUNT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfClearFlag"), 2);
@@ -1418,6 +1427,15 @@ fn af6_set_clear_flag_2() {
     assert_eq!(
         full_apply(&mut v, &tx2, TxType::ACCOUNT_SET),
         Ter::TES_SUCCESS
+    );
+    let after_clear = v
+        .read(protocol::account_keylet(Uint160::from_void(a.data())))
+        .expect("account lookup should succeed")
+        .expect("account root should remain present");
+    assert_eq!(
+        after_clear.get_flags() & protocol::lsfRequireAuth,
+        0,
+        "ClearFlag 2 must clear lsfRequireAuth"
     );
 }
 #[test]
@@ -1459,7 +1477,7 @@ fn af6_set_clear_flag_4() {
     });
     assert_eq!(
         full_apply(&mut v, &tx, TxType::ACCOUNT_SET),
-        Ter::TES_SUCCESS
+        Ter::TEC_NO_ALTERNATIVE_KEY
     );
     let tx2 = STTx::new(TxType::ACCOUNT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);

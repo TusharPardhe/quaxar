@@ -18,7 +18,7 @@ use basics::make_ssl_context::{
 use overlay::{Handoff, Overlay, OverlayHandoff, OverlayImpl, Peer, Setup};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +45,13 @@ const PEERFINDER_BOOTCACHE_PRUNE_PERCENT: usize = 10;
 const PEERFINDER_BOOTCACHE_UPDATE_COOLDOWN: Duration = Duration::from_secs(60);
 const PEERFINDER_LIVECACHE_TTL: Duration = Duration::from_secs(30);
 const PEERFINDER_RECENT_ATTEMPT_DURATION: Duration = Duration::from_secs(60);
+// M6-F peerfinder DNS hardening: cache resolved outcomes, bound concurrent
+// lookups with a semaphore, and cap a single lookup with a deadline so a slow
+// resolver can never stall the one-second autoconnect tick.
+const PEERFINDER_DNS_TTL: Duration = Duration::from_secs(60);
+const PEERFINDER_DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+const PEERFINDER_DNS_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+const PEERFINDER_DNS_MAX_CONCURRENT: usize = 4;
 const BOOTCACHE_STATIC_VALENCE: i32 = 32;
 const DEFAULT_PEER_PORT: u16 = 51235;
 const FIXED_CONNECTION_BACKOFF_MINUTES: [u64; 10] = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55];
@@ -377,6 +384,9 @@ fn fixed_retry_state_or_due(
     state.get(&address).copied().unwrap_or((0, now))
 }
 
+// Bootcache valence helpers. Exercised by tests today; production call sites
+// land with the M6-F peerfinder DNS/retry work.
+#[cfg_attr(not(test), allow(dead_code))]
 fn remember_bootcache_endpoint(
     bootcache: &mut HashMap<SocketAddr, BootcacheEntry>,
     endpoint: SocketAddr,
@@ -399,6 +409,7 @@ fn remember_bootcache_endpoint(
         });
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn remember_bootcache_endpoints<I>(
     bootcache: &mut HashMap<SocketAddr, BootcacheEntry>,
     endpoints: I,
@@ -411,6 +422,7 @@ fn remember_bootcache_endpoints<I>(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn bootcache_on_success(bootcache: &mut HashMap<SocketAddr, BootcacheEntry>, endpoint: SocketAddr) {
     let entry = bootcache
         .entry(endpoint)
@@ -418,6 +430,7 @@ fn bootcache_on_success(bootcache: &mut HashMap<SocketAddr, BootcacheEntry>, end
     entry.valence = entry.valence.max(0).saturating_add(1);
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn bootcache_on_failure(bootcache: &mut HashMap<SocketAddr, BootcacheEntry>, endpoint: SocketAddr) {
     let entry = bootcache
         .entry(endpoint)
@@ -792,6 +805,117 @@ enum PeerfinderConnectionEvent {
     },
 }
 
+/// Per-endpoint DNS resolution state owned by the live peerfinder.
+///
+/// Resolution is always performed by a background task; the autoconnect tick
+/// never awaits `lookup_host`. Last-known-good addresses remain dialable while
+/// a re-resolution is in flight or after a failure cooldown, so slow or failing
+/// DNS cannot stall periodic dialing of already-resolved endpoints.
+struct PeerfinderDnsState {
+    addresses: Option<Vec<SocketAddr>>,
+    last_resolved: Option<Instant>,
+    next_attempt: Instant,
+}
+
+struct PeerfinderDnsCache {
+    resolved: HashMap<String, PeerfinderDnsState>,
+    in_flight: HashSet<String>,
+}
+
+impl PeerfinderDnsCache {
+    fn new() -> Self {
+        Self {
+            resolved: HashMap::new(),
+            in_flight: HashSet::new(),
+        }
+    }
+
+    /// Returns `true` when a background resolution should be spawned for
+    /// `endpoint`: it is not already in flight and its cached outcome is stale
+    /// (never resolved, past TTL, or past the failure cooldown).
+    fn refresh(&mut self, endpoint: &str, now: Instant) -> bool {
+        if self.in_flight.contains(endpoint) {
+            return false;
+        }
+        let due = match self.resolved.get(endpoint) {
+            None => true,
+            Some(state) => {
+                let stale = state
+                    .last_resolved
+                    .is_none_or(|resolved| now.duration_since(resolved) >= PEERFINDER_DNS_TTL);
+                stale && now >= state.next_attempt
+            }
+        };
+        if due {
+            self.in_flight.insert(endpoint.to_owned());
+        }
+        due
+    }
+
+    /// Records the outcome of a background resolution. Success refreshes the
+    /// served addresses and the TTL; failure keeps any last-known-good
+    /// addresses and arms the failure cooldown before the next attempt.
+    fn record(&mut self, endpoint: String, outcome: Result<Vec<SocketAddr>, String>, now: Instant) {
+        self.in_flight.remove(&endpoint);
+        let state = self
+            .resolved
+            .entry(endpoint)
+            .or_insert_with(|| PeerfinderDnsState {
+                addresses: None,
+                last_resolved: None,
+                next_attempt: now,
+            });
+        match outcome {
+            Ok(addresses) => {
+                state.addresses = Some(addresses);
+                state.last_resolved = Some(now);
+                state.next_attempt = now + PEERFINDER_DNS_TTL;
+            }
+            Err(error) => {
+                tracing::info!(target: "peerfinder", %error, "PeerFinder DNS resolution failed");
+                state.next_attempt = now + PEERFINDER_DNS_FAILURE_COOLDOWN;
+            }
+        }
+    }
+
+    /// Last-known-good addresses for `endpoint`, if any. A `None` result only
+    /// means the endpoint has never resolved successfully; it does not block
+    /// the tick or other endpoints.
+    fn addresses(&self, endpoint: &str) -> Option<&[SocketAddr]> {
+        self.resolved
+            .get(endpoint)
+            .and_then(|state| state.addresses.as_deref())
+    }
+}
+
+async fn peerfinder_resolve_endpoint(endpoint: &str) -> Result<Vec<SocketAddr>, String> {
+    match tokio::time::timeout(
+        PEERFINDER_DNS_RESOLVE_TIMEOUT,
+        tokio::net::lookup_host(endpoint),
+    )
+    .await
+    {
+        Ok(Ok(addresses)) => Ok(addresses.collect()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("DNS resolution timed out".to_owned()),
+    }
+}
+
+fn spawn_peerfinder_dns_resolve(
+    endpoint: String,
+    results: tokio::sync::mpsc::UnboundedSender<(String, Result<Vec<SocketAddr>, String>)>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+) {
+    tokio::spawn(async move {
+        let _permit = semaphore
+            .acquire_owned()
+            .await
+            .expect("peerfinder DNS semaphore closed");
+        let outcome = peerfinder_resolve_endpoint(&endpoint).await;
+        let _ = results.send((endpoint, outcome));
+    });
+}
+
 async fn load_peerfinder_caches(path: Option<PathBuf>) -> PeerfinderCaches {
     let now = Instant::now();
     let Some(path) = path else {
@@ -900,6 +1024,9 @@ async fn run_live_peerfinder(
     status_rpc_state: Option<Arc<StatusRpcState>>,
 ) {
     let mut caches = load_peerfinder_caches(bootcache_path.clone()).await;
+    let (dns_tx, mut dns_rx) = tokio::sync::mpsc::unbounded_channel();
+    let dns_semaphore = Arc::new(tokio::sync::Semaphore::new(PEERFINDER_DNS_MAX_CONCURRENT));
+    let mut dns_cache = PeerfinderDnsCache::new();
     let mut recent_attempts = HashMap::<IpAddr, Instant>::new();
     let mut fixed_retry_state = HashMap::<SocketAddr, (usize, Instant)>::new();
     let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -937,6 +1064,12 @@ async fn run_live_peerfinder(
             status_rpc_state.as_ref(),
             network_ops_mode_owner.as_ref(),
         );
+
+        // Apply DNS resolution results completed since the last tick before
+        // deciding what to dial; the tick itself never awaits `lookup_host`.
+        while let Ok((endpoint, outcome)) = dns_rx.try_recv() {
+            dns_cache.record(endpoint, outcome, now);
+        }
 
         // `Logic::oncePerSecond`: expire live data, retry squelches, and
         // check the bootcache persistence cooldown on every timer tick.
@@ -1006,14 +1139,18 @@ async fn run_live_peerfinder(
         let mut fixed_attempts_started = 0;
         let mut fixed_addresses = Vec::new();
         for endpoint in &fixed_endpoints {
-            let Ok(addresses) = tokio::net::lookup_host(endpoint).await else {
-                tracing::info!(target: "overlay", %endpoint,
-                    "PeerFinder failed to resolve fixed endpoint");
+            if dns_cache.refresh(endpoint, now) {
+                spawn_peerfinder_dns_resolve(
+                    endpoint.clone(),
+                    dns_tx.clone(),
+                    Arc::clone(&dns_semaphore),
+                );
+            }
+            let Some(addresses) = dns_cache.addresses(endpoint) else {
                 continue;
             };
-            let addresses = addresses.collect::<Vec<_>>();
             overlay.remember_fixed_peer_endpoints(addresses.iter().copied());
-            fixed_addresses.extend(addresses);
+            fixed_addresses.extend(addresses.iter().copied());
         }
         let active_fixed_peers = overlay.active_fixed_peers_count();
         let fixed_peer_slots = overlay.fixed_peer_slot_count();
@@ -1045,13 +1182,17 @@ async fn run_live_peerfinder(
         if !fixed_stage_blocks_automatic {
             if auto_connect {
                 for endpoint in &bootstrap_endpoints {
-                    let Ok(addresses) = tokio::net::lookup_host(endpoint).await else {
-                        tracing::info!(target: "overlay", %endpoint,
-                            "PeerFinder failed to resolve bootstrap endpoint");
-                        continue;
-                    };
-                    for address in addresses {
-                        caches.insert_static_bootcache(address);
+                    if dns_cache.refresh(endpoint, now) {
+                        spawn_peerfinder_dns_resolve(
+                            endpoint.clone(),
+                            dns_tx.clone(),
+                            Arc::clone(&dns_semaphore),
+                        );
+                    }
+                    if let Some(addresses) = dns_cache.addresses(endpoint) {
+                        for address in addresses {
+                            caches.insert_static_bootcache(*address);
+                        }
                     }
                 }
             }
@@ -1129,6 +1270,15 @@ fn refresh_peer_count_and_operating_mode(
         state.set_peer_count(Some(peer_count));
     }
 
+    // Overlay is the peer-availability fact source. A 0→positive peer count
+    // arms the availability timestamp the acquisition actor reads back at its
+    // first outbound request (peer-availability-to-first-request latency).
+    if peer_count > 0 {
+        xrpld_metrics::acquisition::note_peers_available();
+    } else {
+        xrpld_metrics::acquisition::note_peers_unavailable();
+    }
+
     if peer_count > 0
         && let Some(state) = network_ops_mode_owner
         && matches!(
@@ -1136,7 +1286,8 @@ fn refresh_peer_count_and_operating_mode(
             NetworkOpsOperatingMode::Disconnected
         )
     {
-        let _ = state.set_operating_mode(NetworkOpsOperatingMode::Connected);
+        let _ = state
+            .set_operating_mode_with_reason(NetworkOpsOperatingMode::Connected, "peers_available");
     }
 }
 
@@ -1423,10 +1574,10 @@ fn parse_peer_limit_sections(config: &BasicConfig, setup: &mut Setup) -> Result<
     let inbound_max = parse_single_section_usize(config, "peers_in_max")?;
     let outbound_max = parse_single_section_usize(config, "peers_out_max")?;
 
-    if max_peers.is_some() {
+    if let Some(max_peers) = max_peers {
         // rippled gives legacy [peers_max] precedence over paired directional
         // sections, including when its value is zero (the default then applies).
-        setup.peer_limit = max_peers.expect("checked is_some");
+        setup.peer_limit = max_peers;
         setup.peer_limit_in = None;
         setup.peer_limit_out = None;
         return Ok(());
@@ -1695,18 +1846,20 @@ mod tests {
     use super::{
         BOOTCACHE_STATIC_VALENCE, BootcacheEntry, BootstrapOverlayHandoff, CRAWL_OPTION_DISABLED,
         CRAWL_OPTION_OVERLAY, CRAWL_OPTION_SERVER_COUNTS, CRAWL_OPTION_SERVER_INFO,
-        CRAWL_OPTION_UNL, PEERFINDER_AUTOCONNECT_INTERVAL, PeerfinderCaches, bootcache_on_failure,
-        bootcache_on_success, bootstrap_can_dial_bootcache, bootstrap_needs_bootcache_dial,
-        build_overlay_runtime, build_overlay_setup, default_overlay_client_config,
-        fixed_retry_state_or_due, fixed_stage_blocks_automatic_dials, is_public_ip,
-        livecache_stage_blocks_bootcache, load_peerfinder_caches, overlay_server_config,
-        parse_bootstrap_peer_endpoints, parse_fixed_peer_ips, parse_peer_endpoints,
-        peerfinder_attempt_budget, peerfinder_outbound_target, persist_peerfinder_bootcache,
-        remember_bootcache_endpoint, select_bootcache_endpoints,
+        CRAWL_OPTION_UNL, PEERFINDER_AUTOCONNECT_INTERVAL, PEERFINDER_DNS_FAILURE_COOLDOWN,
+        PEERFINDER_DNS_MAX_CONCURRENT, PEERFINDER_DNS_RESOLVE_TIMEOUT, PEERFINDER_DNS_TTL,
+        PeerfinderCaches, PeerfinderDnsCache, bootcache_on_failure, bootcache_on_success,
+        bootstrap_can_dial_bootcache, bootstrap_needs_bootcache_dial, build_overlay_runtime,
+        build_overlay_setup, default_overlay_client_config, fixed_retry_state_or_due,
+        fixed_stage_blocks_automatic_dials, is_public_ip, livecache_stage_blocks_bootcache,
+        load_peerfinder_caches, overlay_server_config, parse_bootstrap_peer_endpoints,
+        parse_fixed_peer_ips, parse_peer_endpoints, peerfinder_attempt_budget,
+        peerfinder_outbound_target, persist_peerfinder_bootcache, remember_bootcache_endpoint,
+        select_bootcache_endpoints, spawn_peerfinder_dns_resolve,
     };
     use crate::runtime::main_runtime::ManagedComponent;
     use basics::basic_config::BasicConfig;
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -2137,6 +2290,81 @@ tx_min_peers = 9
         assert_eq!(retry_state.0, 0);
         assert_eq!(retry_state.1, now);
         assert!(retry_state.1 <= now);
+    }
+
+    #[test]
+    fn peerfinder_dns_cache_spawns_one_resolve_and_holds_in_flight() {
+        let endpoint = "seed.example.com:51235";
+        let now = Instant::now();
+        let mut cache = PeerfinderDnsCache::new();
+
+        assert!(cache.refresh(endpoint, now));
+        assert!(!cache.refresh(endpoint, now));
+        assert!(cache.addresses(endpoint).is_none());
+    }
+
+    #[test]
+    fn peerfinder_dns_success_serves_addresses_and_re_resolves_after_ttl() {
+        let endpoint = "seed.example.com:51235";
+        let addresses = vec!["203.0.113.7:51235".parse().expect("address")];
+        let now = Instant::now();
+        let mut cache = PeerfinderDnsCache::new();
+
+        assert!(cache.refresh(endpoint, now));
+        cache.record(endpoint.to_owned(), Ok(addresses.clone()), now);
+        assert!(!cache.refresh(endpoint, now));
+        assert_eq!(cache.addresses(endpoint), Some(addresses.as_slice()));
+
+        let after_ttl = now + PEERFINDER_DNS_TTL + Duration::from_secs(1);
+        assert!(cache.refresh(endpoint, after_ttl));
+    }
+
+    #[test]
+    fn peerfinder_dns_failure_keeps_last_good_addresses_and_backs_off() {
+        let endpoint = "seed.example.com:51235";
+        let addresses = vec!["203.0.113.7:51235".parse().expect("address")];
+        let now = Instant::now();
+        let mut cache = PeerfinderDnsCache::new();
+
+        cache.record(endpoint.to_owned(), Ok(addresses.clone()), now);
+        assert_eq!(cache.addresses(endpoint), Some(addresses.as_slice()));
+
+        let failed_at = now + PEERFINDER_DNS_TTL;
+        cache.record(
+            endpoint.to_owned(),
+            Err("DNS resolution timed out".to_owned()),
+            failed_at,
+        );
+        assert_eq!(cache.addresses(endpoint), Some(addresses.as_slice()));
+        assert!(!cache.refresh(
+            endpoint,
+            failed_at + PEERFINDER_DNS_FAILURE_COOLDOWN - Duration::from_secs(1)
+        ));
+        assert!(cache.refresh(endpoint, failed_at + PEERFINDER_DNS_FAILURE_COOLDOWN));
+    }
+
+    #[test]
+    fn peerfinder_dns_background_resolve_round_trips_through_the_tick() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (dns_tx, mut dns_rx) = tokio::sync::mpsc::unbounded_channel();
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(PEERFINDER_DNS_MAX_CONCURRENT));
+            let endpoint = "127.0.0.1:51235".to_owned();
+            spawn_peerfinder_dns_resolve(endpoint.clone(), dns_tx, semaphore);
+
+            let (resolved, outcome) = dns_rx.recv().await.expect("resolve result");
+            assert_eq!(resolved, endpoint);
+            let addresses = outcome.expect("IP literal resolves");
+            assert_eq!(addresses, vec!["127.0.0.1:51235".parse().expect("address")]);
+
+            let now = Instant::now();
+            let mut cache = PeerfinderDnsCache::new();
+            cache.record(endpoint.clone(), Ok(addresses.clone()), now);
+            assert_eq!(cache.addresses(&endpoint), Some(addresses.as_slice()));
+        });
     }
 
     #[test]

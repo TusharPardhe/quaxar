@@ -4,6 +4,7 @@
 use crate::{
     InboundLedgerReason, Ledger, LedgerConfig, LedgerHeader, LedgerReplay,
     REPLAY_SUB_TASK_FALLBACK_TIMEOUT, REPLAY_SUB_TASK_MAX_TIMEOUTS, REPLAY_SUB_TASK_TIMEOUT,
+    ReplayTransaction,
     timeout_counter::{
         TimeoutCounter, TimeoutCounterJobConfig, TimeoutCounterJournal, TimeoutCounterRuntime,
     },
@@ -11,7 +12,6 @@ use crate::{
 use basics::base_uint::Uint256;
 use basics::sha_map_hash::SHAMapHash;
 use overlay::{PeerSet, ProtocolFeature, ProtocolMessage, ProtocolPayload, TmReplayDeltaRequest};
-use protocol::STTx;
 use shamap::sync::{SHAMapType, SyncTree};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ pub struct LedgerDeltaAcquire {
     peer_set: Arc<dyn PeerSet>,
     replay_temp: Option<Arc<Ledger>>,
     full_ledger: Option<Arc<Ledger>>,
-    ordered_txs: BTreeMap<u32, Arc<STTx>>,
+    ordered_txs: BTreeMap<u32, ReplayTransaction>,
     reasons: Vec<InboundLedgerReason>,
     ready_reasons: Vec<InboundLedgerReason>,
     no_feature_peer_count: u32,
@@ -183,7 +183,7 @@ impl LedgerDeltaAcquire {
     pub fn process_data(
         &mut self,
         info: LedgerHeader,
-        ordered_txs: BTreeMap<u32, Arc<STTx>>,
+        ordered_txs: BTreeMap<u32, ReplayTransaction>,
         config: &LedgerConfig,
     ) {
         self.process_data_with_rules(info, ordered_txs, crate::Rules::new(config.features.iter()));
@@ -196,7 +196,7 @@ impl LedgerDeltaAcquire {
     pub fn process_data_with_rules(
         &mut self,
         info: LedgerHeader,
-        ordered_txs: BTreeMap<u32, Arc<STTx>>,
+        ordered_txs: BTreeMap<u32, ReplayTransaction>,
         rules: crate::Rules,
     ) {
         if self.is_done() {
@@ -250,7 +250,7 @@ impl LedgerDeltaAcquire {
             "xrpl::LedgerDeltaAcquire::tryBuild : parent hash match"
         );
 
-        let replay = LedgerReplay::new(
+        let replay = LedgerReplay::new_with_metadata(
             Arc::clone(parent),
             Arc::clone(replay_temp),
             self.ordered_txs.clone(),

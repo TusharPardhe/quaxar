@@ -83,7 +83,7 @@ use protocol::{
     calc_node_id, feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure,
     is_tem_malformed, is_tes_success, lsfDisableMaster, tfInnerBatchTxn,
 };
-use shamap::family::{NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
+use shamap::family::{NullMissingNodeReporter, NullNodeFetcher};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
@@ -946,6 +946,7 @@ pub struct ConsensusLedgerAcceptor {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))] // dormant legacy accept machinery; exercised by state tests
 struct AcceptLedgerPendingTransaction {
     transaction: SharedTransaction,
 }
@@ -960,6 +961,7 @@ impl HasTxnType for AcceptLedgerPendingTransaction {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // dormant legacy accept machinery; exercised by state tests
 struct AcceptLedgerPendingRuntime;
 
 /// Concrete ledger-state adapters for the shared Batch signer authorization
@@ -1140,10 +1142,11 @@ fn batch_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
             .collect::<Vec<_>>()
     });
     let ledger_base_fee = view.fees().base;
-    let outer_signer_count = tx
-        .is_field_present(get_field_by_symbol("sfSigners"))
-        .then(|| tx.get_field_array(get_field_by_symbol("sfSigners")).len())
-        .unwrap_or(0);
+    let outer_signer_count = if tx.is_field_present(get_field_by_symbol("sfSigners")) {
+        tx.get_field_array(get_field_by_symbol("sfSigners")).len()
+    } else {
+        0
+    };
     let transactor_base_fee =
         tx::run_transactor_calculate_base_fee(ledger_base_fee, outer_signer_count);
 
@@ -1395,6 +1398,7 @@ struct AppOpenLedgerTxQAcceptRuntime<'a, V> {
     view: &'a mut AppOpenLedgerView,
     rebase_view: &'a mut V,
     applied_ids: &'a mut std::collections::HashSet<Uint256>,
+    #[cfg_attr(not(test), allow(dead_code))] // reserved for accept-pass flag handling in M7
     flags: ApplyFlags,
 }
 
@@ -1452,6 +1456,7 @@ impl<'a, V> AppOpenLedgerTxQApplyRuntime<'a, V>
 where
     V: ledger::ApplyView,
 {
+    #[cfg_attr(not(test), allow(dead_code))] // TxQ apply runtime built by state tests
     fn new(
         view: &'a mut AppOpenLedgerView,
         submit_view: &'a mut V,
@@ -1923,6 +1928,8 @@ pub(crate) struct AcceptedLedgerOutcome {
     /// IDs that must be removed from the previous open ledger because they
     /// were already included, were terminal failures, or were duplicates in
     /// the parent ledger.
+    #[cfg_attr(not(test), allow(dead_code))]
+    // asserted by state tests; not yet consumed by consensus
     pub completed_transaction_ids: std::collections::HashSet<Uint256>,
     /// Retry-class transactions that BuildLedger leaves for the next open
     /// ledger, including entries received from a peer consensus set.
@@ -1976,10 +1983,12 @@ impl crate::BuildLedgerView for StandaloneLedgerBuildView {
 }
 
 impl AcceptLedgerPendingRuntime {
+    #[cfg_attr(not(test), allow(dead_code))] // reachable only from the dormant accept path
     fn is_system_transaction(txn_type: TxType) -> bool {
         tx::run_with_system_transactor_txn_type_key(txn_type, |_| ()).is_ok()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // reachable only from the dormant accept path
     fn read_sttx(tx: &AcceptLedgerPendingTransaction) -> Arc<STTx> {
         tx.transaction
             .lock()
@@ -2136,6 +2145,22 @@ fn transaction_preflight_ter_with_parent_batch_id(
         return semantic;
     }
 
+    if tx.get_txn_type() == TxType::NFTOKEN_CANCEL_OFFER {
+        let offer_ids = tx.get_field_v256(get_field_by_symbol("sfNFTokenOffers"));
+        let ids = offer_ids.value();
+        if ids.is_empty() || ids.len() > protocol::MAX_TOKEN_OFFER_CANCEL_COUNT {
+            return Ter::TEM_MALFORMED;
+        }
+        if rules.enabled(&protocol::fix_cleanup_3_2_0()) && ids.iter().any(Uint256::is_zero) {
+            return Ter::TEM_MALFORMED;
+        }
+        let mut sorted_ids = ids.to_vec();
+        sorted_ids.sort();
+        if sorted_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Ter::TEM_MALFORMED;
+        }
+    }
+
     if tx.get_txn_type() == TxType::LOAN_SET {
         let counterparty_preflight = loan_set_counterparty_preflight_ter(tx, rules);
         if !is_tes_success(counterparty_preflight) {
@@ -2169,10 +2194,11 @@ fn transaction_preflight_ter_with_parent_batch_id(
 }
 
 pub(crate) fn calculate_default_sttx_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
-    let signer_count = tx
-        .is_field_present(get_field_by_symbol("sfSigners"))
-        .then(|| tx.get_field_array(get_field_by_symbol("sfSigners")).len())
-        .unwrap_or(0);
+    let signer_count = if tx.is_field_present(get_field_by_symbol("sfSigners")) {
+        tx.get_field_array(get_field_by_symbol("sfSigners")).len()
+    } else {
+        0
+    };
     tx::run_transactor_calculate_base_fee(view.fees().base, signer_count)
 }
 
@@ -2864,8 +2890,7 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
             applied_batch_inner_transactions.clear();
         }
         let delivered_amount = delivered_amount_capture
-            .map(crate::state::payment::MptDeliveredAmountCapture::finish)
-            .flatten();
+            .and_then(crate::state::payment::MptDeliveredAmountCapture::finish);
         SubmitApplyOutcome {
             result,
             delivered_amount,
@@ -2948,10 +2973,11 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
     // Match Transactor::checkPriorTxAndLastLedger: all ordering and replay
     // guards run against the unmodified view, before fee or sequence handling.
     if tx.is_field_present(account_txn_id_field) {
-        let prior = account_root
-            .is_field_present(account_txn_id_field)
-            .then(|| account_root.get_field_h256(account_txn_id_field))
-            .unwrap_or_else(Uint256::zero);
+        let prior = if account_root.is_field_present(account_txn_id_field) {
+            account_root.get_field_h256(account_txn_id_field)
+        } else {
+            Uint256::zero()
+        };
         if prior != tx.get_field_h256(account_txn_id_field) {
             return Ter::TEF_WRONG_PRIOR;
         }
@@ -3028,7 +3054,7 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             Uint160::from_void(sponsor.data()),
             Uint160::from_void(tx.get_initiator().data()),
         );
-        let sponsorship = view.read(sponsorship_keylet.clone()).ok().flatten();
+        let sponsorship = view.read(sponsorship_keylet).ok().flatten();
         if !tx.is_field_present(sponsor_signature_field) {
             let Some(sponsorship) = sponsorship.as_ref() else {
                 return Ter::TEC_NO_PERMISSION;
@@ -3106,24 +3132,22 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         let Some(sponsorship_sle) = view.peek(sponsorship_keylet).ok().flatten() else {
             return Ter::TEF_INTERNAL;
         };
-        let balance_drops = sponsorship_sle
-            .is_field_present(sponsor_fee_amount_field)
-            .then(|| {
-                sponsorship_sle
-                    .get_field_amount(sponsor_fee_amount_field)
-                    .xrp()
-                    .drops()
-            })
-            .unwrap_or(0);
-        let max_fee_drops = sponsorship_sle
-            .is_field_present(sponsor_max_fee_field)
-            .then(|| {
-                sponsorship_sle
-                    .get_field_amount(sponsor_max_fee_field)
-                    .xrp()
-                    .drops()
-            })
-            .unwrap_or(i64::MAX);
+        let balance_drops = if sponsorship_sle.is_field_present(sponsor_fee_amount_field) {
+            sponsorship_sle
+                .get_field_amount(sponsor_fee_amount_field)
+                .xrp()
+                .drops()
+        } else {
+            0
+        };
+        let max_fee_drops = if sponsorship_sle.is_field_present(sponsor_max_fee_field) {
+            sponsorship_sle
+                .get_field_amount(sponsor_max_fee_field)
+                .xrp()
+                .drops()
+        } else {
+            i64::MAX
+        };
         let fee_drops = tx.get_field_amount(fee_field).xrp().drops();
         let spendable = balance_drops.min(max_fee_drops);
         if spendable < fee_drops {
@@ -3191,7 +3215,7 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             let _ = view.destroy_xrp(XRPAmount::from_drops(fee_drops));
         }
     }
-    let ter = {
+    {
         // that failed to fully cross), discard all transactor state changes but keep the
         // fee deduction and sequence consumption that were already applied above.
         // We achieve this by running handle_real_dispatch in a nested FlowSandbox and
@@ -3438,9 +3462,7 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             }
         }
         result
-    };
-
-    ter
+    }
 }
 
 /// Implements `rippled/src/libxrpl/tx/apply.cpp::applyBatchTransactions`.
@@ -3506,8 +3528,7 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
                     ApplyFlags::BATCH,
                 );
                 let delivered_amount = delivered_amount_capture
-                    .map(crate::state::payment::MptDeliveredAmountCapture::finish)
-                    .flatten();
+                    .and_then(crate::state::payment::MptDeliveredAmountCapture::finish);
                 (result, delivered_amount)
             })) {
                 Ok(result) => result,
@@ -3708,7 +3729,7 @@ impl
         &mut self,
         base: &Option<Arc<Ledger>>,
         tx: &AcceptLedgerPendingTransaction,
-        txn_type: TxType,
+        _txn_type: TxType,
     ) -> Self::Fee {
         let Some(ledger) = base.as_ref() else {
             return 0;
@@ -4098,7 +4119,7 @@ impl ApplicationRoot {
         );
         let transaction_master = Arc::new(TransactionMaster::new());
 
-        let app_root = Ok(Self {
+        Ok(Self {
             basic_app: Arc::new(BasicApp::new(io_threads)?),
             job_queue: Arc::clone(&shared_job_queue),
             ledger_persistence_runtime: Arc::new(std::sync::RwLock::new(Arc::new(
@@ -4169,7 +4190,7 @@ impl ApplicationRoot {
             consensus_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             shared_tree_cache: std::sync::OnceLock::new(),
             max_disallowed_ledger: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        });
+        })
 
         // TODO: Re-enable ConsensusTransSetSF filter once serialization is verified.
         // Currently disabled because the filter's serialized output doesn't match
@@ -4181,8 +4202,6 @@ impl ApplicationRoot {
         // );
         // app_root.as_ref().unwrap().registry.inbound_transactions.lock()
         //     .unwrap().set_filter_factory(factory);
-
-        app_root
     }
 
     pub fn basic_app(&self) -> &BasicApp {
@@ -4667,8 +4686,6 @@ impl ApplicationRoot {
             // the first ingress relay can include it in a later consensus set.
             &mut |_tx_id: &Uint256| true,
             &mut |record: &AppOpenLedgerTxRecord| {
-                use overlay::Overlay;
-
                 let tx = &record.tx;
                 // Inner Batch transactions are never independently relayed.
                 if tx.is_flag(tfInnerBatchTxn) {
@@ -4835,6 +4852,26 @@ impl ApplicationRoot {
         retry_transactions: &[Arc<STTx>],
         retries_first: bool,
     ) {
+        self.rebuild_open_ledger_after_consensus_with_completed(
+            parent,
+            retry_transactions,
+            retries_first,
+            &std::collections::HashSet::new(),
+        );
+    }
+
+    /// Rebuild the open ledger after consensus using the authoritative set of
+    /// transactions that the accepted candidate terminalized. rippled's
+    /// `OpenLedger::accept` begins from the new closed ledger, so completed
+    /// work cannot return to the next proposal even if a backed transaction
+    /// map is temporarily unavailable during rebase.
+    pub(crate) fn rebuild_open_ledger_after_consensus_with_completed(
+        &self,
+        parent: Arc<Ledger>,
+        retry_transactions: &[Arc<STTx>],
+        retries_first: bool,
+        completed_transaction_ids: &std::collections::HashSet<Uint256>,
+    ) {
         // See `rebuild_open_ledger_after_close`: publication of the rebuilt
         // OpenLedger and persistent sandbox must be atomic with respect to
         // server-side signing's current-open TxQ sequence lookup.
@@ -4842,7 +4879,12 @@ impl ApplicationRoot {
         let next_open_index = parent.header().seq.saturating_add(1);
         let base_fee_drops = parent.fees().base;
         let parent_hash = *parent.header().hash.as_uint256();
-        let local_txs = self.local_open_ledger_records();
+        let local_txs = self
+            .local_open_ledger_records()
+            .into_iter()
+            .filter(|record| !completed_transaction_ids.contains(&record.tx.get_transaction_id()))
+            .collect::<Vec<_>>();
+        let completed_transaction_count = completed_transaction_ids.len();
         let local_tx_count = local_txs.len();
         let local_tx_id_sample = local_txs
             .iter()
@@ -4852,6 +4894,7 @@ impl ApplicationRoot {
         let retry_count_in = retry_transactions.len();
         let mut retries = retry_transactions
             .iter()
+            .filter(|tx| !completed_transaction_ids.contains(&tx.get_transaction_id()))
             .cloned()
             .map(AppOpenLedgerTxRecord::new)
             .collect::<Vec<_>>();
@@ -4861,6 +4904,7 @@ impl ApplicationRoot {
             parent_seq = parent.header().seq,
             next_open_index,
             local_tx_count,
+            completed_transaction_count,
             retry_count_in,
             retries_first,
             local_tx_id_sample = ?local_tx_id_sample,
@@ -4930,8 +4974,6 @@ impl ApplicationRoot {
             // the first ingress relay can include it in a later consensus set.
             &mut |_tx_id: &Uint256| true,
             &mut |record: &AppOpenLedgerTxRecord| {
-                use overlay::Overlay;
-
                 let tx = &record.tx;
                 // Inner Batch transactions are never independently relayed.
                 if tx.is_flag(tfInnerBatchTxn) {
@@ -5848,7 +5890,7 @@ impl ApplicationRoot {
             Duration::seconds(profile.tree_cache_age_seconds),
             MonotonicClock::default(),
         ));
-        let _ = self.attach_shared_tree_cache(Arc::clone(&tree_node_cache));
+        self.attach_shared_tree_cache(Arc::clone(&tree_node_cache));
         let family: Arc<dyn NodeFamilyRuntime> =
             Arc::new(NodeFamily::new_with_owned_full_below_cache(
                 tree_node_cache,
@@ -6323,7 +6365,7 @@ impl ApplicationRoot {
                         let _ = runtime.process_transaction(
                             &mut transaction,
                             false,
-                            true,
+                            false,
                             false,
                             || batch_root.enqueue_network_ops_transaction_batch(),
                             || {},
@@ -6492,8 +6534,6 @@ impl ApplicationRoot {
         // the old parent, wait through a jump, and then apply to the new view.
         // The mutex is re-entrant because close/batch callers already hold it.
         let _lcl_transition_guard = self.lcl_transition_gate().lock();
-        let pending = self.network_ops_pending_transaction_count().unwrap_or(0);
-        if pending > 0 {}
         let base_ledger = match self.ledger_master_state.latest_ledger() {
             Some(ledger) => self.ledger_with_node_fetcher(ledger),
             None => {
@@ -6613,8 +6653,7 @@ impl ApplicationRoot {
                     .lock()
                     .expect("transaction mutex must not be poisoned")
                     .get_id();
-                let result = self.registry.hash_router.should_relay(tx_id);
-                result
+                self.registry.hash_router.should_relay(tx_id)
             },
             |tx, deferred, to_skip| {
                 // reference: overlay.relay(txID, tmTransaction, toSkip)
@@ -6903,7 +6942,7 @@ impl ApplicationRoot {
     }
 
     fn broadcast_v1_validator_list(&self, result: &PublisherListStats, hash: Uint256) {
-        use overlay::{Overlay, Peer, ProtocolFeature};
+        use overlay::{Overlay, ProtocolFeature};
 
         let Some(publisher) = result.publisher_key else {
             return;
@@ -7181,13 +7220,25 @@ impl ApplicationRoot {
         &self,
         operating_mode: NetworkOpsOperatingMode,
     ) -> NetworkOpsOperatingMode {
+        self.set_network_ops_operating_mode_with_reason(operating_mode, "unspecified")
+    }
+
+    /// Set the operating mode through validated-ledger-age / blocked
+    /// normalization, recording `reason` on the transition trace and metric.
+    pub fn set_network_ops_operating_mode_with_reason(
+        &self,
+        operating_mode: NetworkOpsOperatingMode,
+        reason: &'static str,
+    ) -> NetworkOpsOperatingMode {
         let previous = self.network_ops_state.operating_mode();
-        self.network_ops_state
-            .set_operating_mode(normalize_operating_mode_for_validated_age(
+        self.network_ops_state.set_operating_mode_with_reason(
+            normalize_operating_mode_for_validated_age(
                 operating_mode,
                 self.validated_ledger_age(),
                 self.network_ops_state.is_blocked(),
-            ));
+            ),
+            reason,
+        );
         let new_mode = self.network_ops_state.operating_mode();
         if previous != new_mode {
             tracing::info!(target: "app", from = %previous.as_str(), to = %new_mode.as_str(), "Operating mode changed");
@@ -7217,10 +7268,7 @@ impl ApplicationRoot {
                         fee_track.cluster_fee(),
                     ))),
                 ),
-                (
-                    "base_fee".to_owned(),
-                    JsonValue::Unsigned(u64::from(base_fee)),
-                ),
+                ("base_fee".to_owned(), JsonValue::Unsigned(base_fee)),
             ]));
             if let Ok(guard) = self.shared_subscription_manager.read()
                 && let Some(publisher) = guard.as_ref()
@@ -7325,7 +7373,7 @@ impl ApplicationRoot {
     /// return it unchanged.
     pub fn ledger_with_node_fetcher(&self, ledger: Arc<Ledger>) -> Arc<Ledger> {
         let has_shared_family = self.node_family().is_some();
-        if (ledger.has_node_fetcher() && ledger.has_node_writer_result() && !has_shared_family)
+        if (ledger.has_node_fetcher() && ledger.has_node_writer_result())
             || (!ledger.state_map().backed() && !ledger.tx_map().backed())
         {
             return ledger;
@@ -7471,6 +7519,12 @@ impl ApplicationRoot {
             .closed_ledger()
             .is_none_or(|previous| previous.header().hash != normalized.header().hash);
         if closed_ledger_changed {
+            tracing::info!(
+                target: "lcl_trace",
+                event = "closed_ledger_promotion_waiting_for_close_gate",
+                seq = normalized.header().seq,
+                "LCL trace: closed-ledger promotion waiting for close gate"
+            );
             // A Sandbox owns its parent view. Reusing one after a LCL switch
             // makes submit preclaim read the old state and can turn an account
             // that is visible through validated RPC into a false terNO_ACCOUNT.
@@ -7480,6 +7534,12 @@ impl ApplicationRoot {
                 .close_gate
                 .lock()
                 .expect("close_gate mutex must not be poisoned");
+            tracing::info!(
+                target: "lcl_trace",
+                event = "closed_ledger_promotion_acquired_close_gate",
+                seq = normalized.header().seq,
+                "LCL trace: closed-ledger promotion acquired close gate"
+            );
             // This legacy per-account cache is not reconstructible from a
             // LocalTx replay, so every LCL transition invalidates it.
             if let Ok(mut seqs) = self.open_ledger_account_seqs.lock() {
@@ -7499,6 +7559,12 @@ impl ApplicationRoot {
                 .open_ledger_sandbox
                 .lock()
                 .expect("sandbox mutex must not be poisoned");
+            tracing::info!(
+                target: "lcl_trace",
+                event = "closed_ledger_promotion_acquired_sandbox",
+                seq = normalized.header().seq,
+                "LCL trace: closed-ledger promotion acquired sandbox"
+            );
             let sandbox_matches_new_lcl = sandbox.as_ref().is_some_and(|sandbox| {
                 let header = sandbox.header();
                 header.parent_hash == normalized_header.hash
@@ -7510,6 +7576,12 @@ impl ApplicationRoot {
         }
         self.ledger_master_state
             .note_closed_ledger(Arc::clone(&normalized));
+        tracing::info!(
+            target: "lcl_trace",
+            event = "closed_ledger_promotion_noted",
+            seq = normalized.header().seq,
+            "LCL trace: closed-ledger promotion installed canonical closed ledger"
+        );
         // A fresh standalone network may not yet advance through the
         // quorum-backed validated-ledger path, but its active closed LCL
         // already supplies the amendment rules used for the next open
@@ -8016,7 +8088,6 @@ impl ApplicationRoot {
                         }
                     }
                 }
-                if !report.published.is_empty() {}
                 // Match rippled findNewLedgersToPublish: start missing
                 // validated-chain ledgers in ascending order with its strict
                 // `++acqCount < ledgerFetchSize_` bound. The planner retains
@@ -9115,7 +9186,7 @@ impl ApplicationRoot {
         }
 
         if next_mode != current_mode {
-            let _ = self.set_network_ops_operating_mode(next_mode);
+            let _ = self.set_network_ops_operating_mode_with_reason(next_mode, "accept_promotion");
         }
     }
 
@@ -9659,11 +9730,17 @@ impl ApplicationRoot {
             let open_txs = std::mem::take(&mut pending_txs);
             for (input_position, sttx) in open_txs.into_iter().enumerate() {
                 let transaction_id = sttx.get_hash(protocol::HashPrefix::TransactionId);
-                if pass == 0
-                    && parent_ledger
-                        .as_ref()
-                        .is_some_and(|parent| parent.tx_exists(transaction_id))
-                {
+                let parent_has_transaction = parent_ledger
+                    .as_ref()
+                    .map(|parent| {
+                        parent.try_tx_exists(transaction_id).map_err(|error| {
+                            crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
+                                "cannot admit consensus transaction {transaction_id}: captured parent transaction map is unreadable: {error:?}"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                if pass == 0 && parent_has_transaction == Some(true) {
                     emit_candidate_admission_diagnostic(
                         CandidateAdmissionDiagnostic::skipped_existing(
                             transaction_id,
@@ -9708,29 +9785,39 @@ impl ApplicationRoot {
                 });
                 let preclaim_admitted =
                     preclaim.is_some_and(|ter| likely_to_claim_fee(ter, retry_flags));
-                let (result, applied_batch_inner_transactions, transaction_meta) =
-                    if preclaim_admitted {
-                        let mut attempt_view =
-                            ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
-                        let SubmitApplyOutcome {
-                            result,
-                            delivered_amount,
-                            applied_batch_inner_transactions,
-                        } = apply_submit_transactor_shell_with_flags_and_batch_outcome(
-                            &mut attempt_view,
-                            &sttx,
-                            txn_type,
-                            retry_flags,
-                        );
-                        let transaction_meta = if protocol::is_tes_success(result)
-                            || protocol::is_tec_claim(result)
-                        {
-                            // rippled's ApplyStateTable::apply builds TxMeta from
-                            // this transaction's state-table delta before it
-                            // serializes rawTxInsert and commits the delta. Do
-                            // not rebuild an empty TxMeta after this consuming
-                            // FlowSandbox commit.
-                            let meta = attempt_view
+                let (
+                    result,
+                    applied_batch_inner_transactions,
+                    transaction_meta,
+                    replayed_threaded_entry,
+                ) = if preclaim_admitted {
+                    let mut attempt_view =
+                        ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
+                    let SubmitApplyOutcome {
+                        result,
+                        delivered_amount,
+                        applied_batch_inner_transactions,
+                    } = apply_submit_transactor_shell_with_flags_and_batch_outcome(
+                        &mut attempt_view,
+                        &sttx,
+                        txn_type,
+                        retry_flags,
+                    );
+                    let replayed_threaded_entry = (protocol::is_tes_success(result)
+                        || protocol::is_tec_claim(result))
+                    .then(|| {
+                        attempt_view.replayed_threaded_entry(transaction_id, closed_seq, &rules)
+                    })
+                    .flatten();
+                    let transaction_meta = if replayed_threaded_entry.is_none()
+                        && (protocol::is_tes_success(result) || protocol::is_tec_claim(result))
+                    {
+                        // rippled's ApplyStateTable::apply builds TxMeta from
+                        // this transaction's state-table delta before it
+                        // serializes rawTxInsert and commits the delta. Do
+                        // not rebuild an empty TxMeta after this consuming
+                        // FlowSandbox commit.
+                        let meta = attempt_view
                                 .to_tx_meta(
                                     transaction_id,
                                     closed_seq,
@@ -9742,24 +9829,50 @@ impl ApplicationRoot {
                                         "failed to build accepted transaction metadata {transaction_id}: {error:?}"
                                     ))
                                 })?;
-                            attempt_view
+                        attempt_view
                                 .apply_with_tx_thread(transaction_id, closed_seq, &rules)
                                 .map_err(|error| {
                                     crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
                                         "failed to thread accepted transaction {transaction_id}: {error:?}"
                                     ))
                                 })?;
-                            Some(meta)
-                        } else {
-                            None
-                        };
-                        (result, applied_batch_inner_transactions, transaction_meta)
+                        Some(meta)
                     } else {
-                        (preclaim.unwrap_or(preflight), Vec::new(), None)
+                        None
                     };
+                    (
+                        result,
+                        applied_batch_inner_transactions,
+                        transaction_meta,
+                        replayed_threaded_entry,
+                    )
+                } else {
+                    (preclaim.unwrap_or(preflight), Vec::new(), None, None)
+                };
                 let apply_ter = preclaim_admitted.then_some(result);
                 let applied = likely_to_claim_fee(result, retry_flags);
                 drop(view);
+                if let Some((entry_key, prior_seq)) = replayed_threaded_entry {
+                    completed_transaction_ids.insert(transaction_id);
+                    emit_candidate_admission_diagnostic(
+                        CandidateAdmissionDiagnostic::skipped_existing(
+                            transaction_id,
+                            closed_seq,
+                            sttx.get_seq_proxy().value(),
+                            pass,
+                        ),
+                    );
+                    tracing::warn!(
+                        target: "ledger",
+                        closed_seq,
+                        pass,
+                        tx_id = %transaction_id,
+                        entry_key = %entry_key,
+                        prior_seq,
+                        "discarded replay whose state entry was already threaded in parent history"
+                    );
+                    continue;
+                }
                 if !applied {
                     let retryable =
                         protocol::is_ter_retry(result) || protocol::is_tec_claim(result);

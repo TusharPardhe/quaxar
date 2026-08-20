@@ -497,9 +497,22 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
             } else {
                 0
             };
-            // Current-ledger rules activate fixRemoveNFTokenAutoTrustLine and
-            // DynamicNFT: tfTrustLine(4) is invalid; tfMutable(16) is valid.
-            let valid_flags: u32 = 0x0000001B;
+            // Mirrors rippled NFTokenMint::getFlagsMask
+            // (src/libxrpl/tx/transactors/nft/NFTokenMint.cpp): tfTrustLine(4)
+            // is invalid once fixRemoveNFTokenAutoTrustLine is enabled, and
+            // tfMutable(16) is valid only with DynamicNFT.
+            let mut valid_flags: u32 = 0x0000000F; // tfBurnable|tfOnlyXRP|tfTrustLine|tfTransferable
+            if view
+                .rules()
+                .enabled(&protocol::feature_id("fixRemoveNFTokenAutoTrustLine"))
+            {
+                valid_flags &= !0x04;
+            }
+            if view.rules().enabled(&protocol::feature_id("DynamicNFT")) {
+                valid_flags |= 0x10; // tfMutable
+            }
+            // Universal flags (tfFullyCanonicalSig|tfInnerBatchTxn) are always valid.
+            let valid_flags = valid_flags | 0xC0000000;
             if flags & !valid_flags != 0 {
                 return Ter::TEM_INVALID_FLAG;
             }

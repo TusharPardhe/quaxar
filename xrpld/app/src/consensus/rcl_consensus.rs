@@ -130,6 +130,41 @@ fn canonicalize_consensus_transaction(
     )
 }
 
+/// Return rippled's `medianCloseOffset`: the lower weighted median of our
+/// close time (weight one) and peer close-time vote bins, minus our own close
+/// time. A rounded mean changes the next proposal time in a two-validator
+/// split and does not match rippled.
+fn median_close_offset_seconds(times: &ConsensusCloseTimes) -> i64 {
+    let total_weight = 1_i64
+        + times
+            .peers
+            .values()
+            .map(|weight| i64::from(*weight))
+            .sum::<i64>();
+    let half_weight = (total_weight + 1) / 2;
+    let self_time = times.self_;
+    let mut tally = 0_i64;
+    let mut self_placed = false;
+
+    for (time, weight) in &times.peers {
+        if !self_placed && self_time <= *time {
+            self_placed = true;
+            tally += 1;
+            if tally >= half_weight {
+                return 0;
+            }
+        }
+        tally += i64::from(*weight);
+        if tally >= half_weight {
+            return i64::from(time.as_seconds()) - i64::from(self_time.as_seconds());
+        }
+    }
+
+    // The self sample is the final ordered bin, so it is the lower median if
+    // no preceding peer bin reached the threshold.
+    0
+}
+
 fn pseudo_transaction_voting_enabled(options: AppRclConsensusOptions, mode: ConsensusMode) -> bool {
     options.standalone || mode == ConsensusMode::Proposing
 }
@@ -143,8 +178,21 @@ fn update_operating_mode_after_accept(
     positions: usize,
 ) {
     if positions == 0 && network_ops_mode_owner.operating_mode() == NetworkOpsOperatingMode::Full {
-        network_ops_mode_owner.set_operating_mode_direct(NetworkOpsOperatingMode::Connected);
+        network_ops_mode_owner.set_operating_mode_direct_with_reason(
+            NetworkOpsOperatingMode::Connected,
+            "no_consensus_positions",
+        );
     }
+}
+
+/// Consensus positions are an observation of the current round, not a
+/// coordinator lifecycle fact. In particular, a start-valid private network
+/// cannot receive a peer proposal until its own validator is allowed to
+/// propose; interpreting that absence as `Blocked` makes `Full -> Connected`
+/// self-fulfilling. The acquisition coordinator must instead receive an
+/// explicit peer-health or blocked-state fact from its owning service.
+fn coordinator_should_report_no_consensus_positions(_positions: usize, _peer_count: usize) -> bool {
+    false
 }
 
 /// The open-ledger view consensus reads current (not-yet-consensus-agreed)
@@ -330,6 +378,8 @@ impl RclConsensusRelay for AppRclConsensusRelay {
     }
 
     fn relay_tx_set(&self, set: &consensus::RclTxSet) {
+        use overlay::Overlay;
+
         let set_id = consensus::ConsensusTxSet::id(set);
         {
             let sync_tree = set.to_sync_tree();
@@ -340,10 +390,24 @@ impl RclConsensusRelay for AppRclConsensusRelay {
             guard.give_set(set_id, std::sync::Arc::new(sync_tree), false);
         }
 
-        // Match rippled `RCLConsensus::Adaptor::share(RCLTxSet)`: retaining
-        // the set is enough here. `InboundTransactions::give_set` notifies the
-        // app-owned map-complete path, which announces TMHaveSet exactly once
-        // after the set is known complete (including acquired sets).
+        // rippled's `InboundTransactions::giveSet` synchronously invokes
+        // NetworkOPs::mapComplete, which broadcasts TMHaveSet before the
+        // matching proposal can make a peer create an acquisition. Our
+        // acquired-set completion crosses an owner-strand channel, so local
+        // consensus sets must announce here instead; otherwise the peer can
+        // snapshot an empty set of serving peers and miss this proposal round.
+        if let Some(overlay) = self.overlay.as_ref() {
+            let message = overlay::ProtocolMessage::new(overlay::ProtocolPayload::HaveSet(
+                overlay::TmHaveTransactionSet {
+                    status: 1, // protocol::tsHAVE
+                    hash: set_id.data().to_vec(),
+                },
+            ));
+            overlay.broadcast(&message);
+        } else {
+            self.journal
+                .trace("relay_tx_set: no overlay attached, skipping availability broadcast");
+        }
     }
 
     fn relay_disputed_tx(&self, tx: &consensus::RclCxTxRef) {
@@ -671,6 +735,20 @@ impl crate::amendments::negative_unl_vote::NegativeUNLVoteValidations
     }
 }
 
+impl AppRclConsensusAdaptor {
+    /// The shared inbound-ledgers registry if the runtime exposes one. The
+    /// acquisition coordinator (when installed) is the single mode writer, so
+    /// consensus mode demotions feed typed facts through this registry instead
+    /// of writing operating mode directly.
+    fn coordinator_inbound(&self) -> Option<Arc<crate::ledger::inbound_ledgers::InboundLedgers>> {
+        self.ledger_master_runtime
+            .inbound_ledgers
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+}
+
 impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
     type Ledger = RclCxLedger;
     type NodeId = PublicKey;
@@ -834,8 +912,25 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                     live_current_ledger_index = ?self.app_root.live_current_ledger_index(),
                     "consensusViewChange: demoting to Connected (preferred ledger differs)"
                 );
-                self.app_root
-                    .set_network_ops_operating_mode(crate::NetworkOpsOperatingMode::Connected);
+                // Coordinator mode: the coordinator is the single mode writer.
+                // Feed the typed divergence fact (demotes Tracking/Full ->
+                // Syncing without minting a session) and let the coordinator
+                // publish; otherwise keep the legacy write.
+                if let Some(coordinator) = self.coordinator_inbound()
+                    && coordinator.coordinator_installed()
+                {
+                    coordinator.coordinator_preferred_lcl_divergence(
+                        acquisition::LedgerTarget::new(
+                            preferred,
+                            preferred_resident.map(|(_, seq)| seq),
+                        ),
+                    );
+                } else {
+                    self.app_root.set_network_ops_operating_mode_with_reason(
+                        crate::NetworkOpsOperatingMode::Connected,
+                        "preferred_lcl_divergence",
+                    );
+                }
             } else {
                 tracing::info!(
                     target: "consensus",
@@ -1015,7 +1110,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                             .validations()
                             .lock()
                             .expect("shared app validations mutex must not be poisoned");
-                        let mut adapter = NegativeUNLValidationsAdapter(&mut *validations_guard);
+                        let mut adapter = NegativeUNLValidationsAdapter(&mut validations_guard);
                         let ledger_ref = prev_ledger.ledger();
                         neg_unl_vote.do_voting(
                             &*ledger_ref,
@@ -1204,7 +1299,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         let rejected_dispute_retries = rejected_dispute_set.drain_ordered();
 
         let pending_validation = (!consensus_fail)
-            .then(|| self.validator_keys.keys.as_ref())
+            .then_some(self.validator_keys.keys.as_ref())
             .flatten()
             .map(|keys| crate::state::application_root::PendingValidation {
                 public_key: keys.public_key,
@@ -1218,16 +1313,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             || mode == ConsensusMode::Observing)
             && !consensus_fail
         {
-            let close_time_val = raw_close_times.self_;
-            let mut close_total: i64 = i64::from(close_time_val.as_seconds());
-            let mut close_count: i64 = 1;
-            for (t, v) in &raw_close_times.peers {
-                close_count += i64::from(*v);
-                close_total += i64::from(t.as_seconds()) * i64::from(*v);
-            }
-            close_total += close_count / 2;
-            close_total /= close_count;
-            Some(close_total - i64::from(close_time_val.as_seconds()))
+            Some(median_close_offset_seconds(raw_close_times))
         } else {
             None
         };
@@ -1351,6 +1437,10 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         // owns a standard HashSet. Preserve rippled's mutating contract by
         // moving all keys into the tracker, then restoring only its remaining
         // (offline) keys to the generic set.
+        // The generic layer's hardened set (Xxh3Builder) must rehash into the
+        // standard tracker set (RandomState); mem::take cannot bridge the two
+        // hashers, so drain-and-recollect is intentional here.
+        #[allow(clippy::drain_collect)]
         let mut validation_keys: StdHashSet<_> = trusted_keys.drain().collect();
         let laggards = self
             .validations
@@ -1371,6 +1461,24 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
     }
 
     fn update_operating_mode(&self, positions: usize) {
+        if positions == 0
+            && self.network_ops_mode_owner.operating_mode() == NetworkOpsOperatingMode::Full
+        {
+            // Coordinator mode: demote `Full -> Connected` through the typed
+            // blocked-state fact; the coordinator publishes. Otherwise the
+            // legacy write remains.
+            if let Some(coordinator) = self.coordinator_inbound()
+                && coordinator.coordinator_installed()
+            {
+                let peer_count = coordinator
+                    .coordinator_snapshot()
+                    .map_or(0, |snapshot| snapshot.peer_count());
+                if coordinator_should_report_no_consensus_positions(positions, peer_count) {
+                    coordinator.coordinator_blocked_with_no_target();
+                }
+                return;
+            }
+        }
         update_operating_mode_after_accept(&self.network_ops_mode_owner, positions);
     }
 }
@@ -1729,10 +1837,11 @@ impl AppConsensus {
                 // rejected disputes to retriableTxs, then passes the combined
                 // canonical retry set to OpenLedger::accept.
                 retriable_transactions.extend(work.rejected_dispute_retries.iter().cloned());
-                root.rebuild_open_ledger_after_consensus(
+                root.rebuild_open_ledger_after_consensus_with_completed(
                     Arc::clone(&closed),
                     &retriable_transactions,
                     !work.rejected_dispute_retries.is_empty(),
+                    &outcome.completed_transaction_ids,
                 );
                 root.set_status_rpc_current_ledger_index(Some(outcome.next_open_index));
                 root.set_status_rpc_queue_report(Some(root.tx_q_rpc_report()));
@@ -1795,8 +1904,8 @@ mod tests {
     use super::{
         AppConsensus, AppRclConsensusAdaptor, AppRclConsensusOptions, AppRclConsensusRelay,
         ConsensusRunner, NullRclConsensusJournal, PendingAcceptWork,
-        decode_consensus_accept_transactions, disputed_relay_envelope,
-        pseudo_transaction_voting_enabled,
+        coordinator_should_report_no_consensus_positions, decode_consensus_accept_transactions,
+        disputed_relay_envelope, median_close_offset_seconds, pseudo_transaction_voting_enabled,
         reset_inbound_transactions_for_resolved_consensus_ledger,
         trusted_validation_quorum_reached, update_operating_mode_after_accept,
     };
@@ -1811,19 +1920,60 @@ mod tests {
     use basics::basic_config::BasicConfig;
     use basics::chrono::NetClockTimePoint;
     use basics::hardened_hash::HardenedHashBuilder;
+    use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::MonotonicClock;
     use consensus::ConsensusParms;
     use consensus::algorithm::ConsensusPhase;
-    use consensus::algorithm::types::ConsensusMode;
-    use ledger::{FetchPackCache, Ledger};
+    use consensus::algorithm::types::{ConsensusCloseTimes, ConsensusMode};
+    use ledger::{FetchPackCache, Ledger, LedgerHeader, calculate_ledger_hash};
     use nodestore::{DummyScheduler, ManagerImp, NullJournal, Scheduler};
     use protocol::{AccountID, STAmount, STTx, TxType, get_field_by_symbol};
     use shamap::family::FullBelowCacheImpl;
+    use shamap::item::SHAMapItem;
+    use shamap::mutation::MutableTree;
+    use shamap::sync::{SHAMapType, SyncState, SyncTree};
+    use shamap::tree_node::SHAMapNodeType;
     use shamap::tree_node_cache::TreeNodeCache;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn median_close_offset_matches_rippled_lower_weighted_median() {
+        let offset = |self_seconds, peer_votes: &[(u32, i32)]| {
+            let mut times = ConsensusCloseTimes {
+                self_: NetClockTimePoint::new(self_seconds),
+                ..ConsensusCloseTimes::default()
+            };
+            for (seconds, votes) in peer_votes {
+                times.peers.insert(NetClockTimePoint::new(*seconds), *votes);
+            }
+            median_close_offset_seconds(&times)
+        };
+
+        assert_eq!(offset(100, &[]), 0, "our sole sample is the median");
+        assert_eq!(
+            offset(100, &[(120, 1)]),
+            0,
+            "two samples use rippled's lower median instead of a mean"
+        );
+        assert_eq!(
+            offset(120, &[(100, 1)]),
+            -20,
+            "the earlier peer sample is the lower median"
+        );
+        assert_eq!(
+            offset(100, &[(90, 2), (110, 1)]),
+            -10,
+            "peer vote weights participate in the ordered median"
+        );
+        assert_eq!(
+            offset(100, &[(110, 2), (130, 1)]),
+            10,
+            "the self sample retains exactly one vote"
+        );
+    }
 
     fn failed_candidate_test_runner(root: &mut ApplicationRoot) -> AppConsensus {
         let ledger_master_runtime = root.attach_default_ledger_master_runtime();
@@ -1854,6 +2004,41 @@ mod tests {
             root.clone(),
         );
         AppConsensus::new(adaptor, ConsensusParms::default())
+    }
+
+    /// Build a finalized ledger with a real (non-empty) state map so
+    /// `LedgerHistory::insert` accepts it. `from_ledger_seq_and_close_time`
+    /// leaves an empty state tree whose zero root hash is rejected by history
+    /// insertion, so it can never be resolver-visible.
+    fn resolvable_immutable_ledger(seq: u32, parent_fill: u8) -> Arc<Ledger> {
+        let mut header = LedgerHeader {
+            seq,
+            parent_hash: SHAMapHash::new(Uint256::from_array([parent_fill; 32])),
+            close_time: seq.saturating_add(100),
+            close_time_resolution: 30,
+            ..LedgerHeader::default()
+        };
+        header.hash = calculate_ledger_hash(&header);
+        let mut state_tree = MutableTree::new(seq);
+        state_tree
+            .add_item(
+                SHAMapNodeType::AccountState,
+                SHAMapItem::new(Uint256::from_u64(u64::from(seq)), vec![parent_fill; 128]),
+            )
+            .expect("state entry should insert");
+        let mut ledger = Ledger::from_maps(
+            header,
+            SyncTree::from_root_with_type(
+                state_tree.root(),
+                SHAMapType::State,
+                false,
+                seq,
+                SyncState::Immutable,
+            ),
+            SyncTree::new_with_type(SHAMapType::Transaction, false, seq),
+        );
+        ledger.set_immutable(true);
+        Arc::new(ledger)
     }
 
     /// Construct an actual resident inbound acquisition and leave it at the
@@ -2051,7 +2236,10 @@ mod tests {
         use consensus::algorithm::ConsensusAdaptor as _;
 
         let mut root = ApplicationRoot::new(0).expect("root should build");
-        let candidate = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 1_000, false));
+        // A resolver-visible provisional candidate must carry a real header hash
+        // and a populated state map: the registry rejects zero-hash acquisition
+        // and `LedgerHistory::insert` drops ledgers with an empty state tree.
+        let candidate = resolvable_immutable_ledger(10, 0x10);
         let target = *candidate.header().hash.as_uint256();
         let (_store_dir, inbound) =
             install_real_provisional_inbound_candidate(&mut root, Arc::clone(&candidate));
@@ -2061,8 +2249,8 @@ mod tests {
                 .inbound_transactions()
                 .lock()
                 .expect("inbound transactions mutex");
+            assert!(transactions.get_set(stale_set, true).is_none());
             assert!(transactions.acquire(stale_set).is_some());
-            assert!(transactions.stored_hashes().contains(&stale_set));
         }
 
         let mut runner = failed_candidate_test_runner(&mut root);
@@ -2083,8 +2271,8 @@ mod tests {
             root.inbound_transactions()
                 .lock()
                 .expect("inbound transactions mutex")
-                .stored_hashes()
-                .contains(&stale_set),
+                .acquire(stale_set)
+                .is_some(),
             "a provisional resolver hit must not reset TxQ/inbound transaction round state"
         );
         assert!(root.closed_ledger().is_none());
@@ -2152,6 +2340,13 @@ mod tests {
         ));
         assert!(trusted_validation_quorum_reached(3, 3));
         assert!(!trusted_validation_quorum_reached(2, 3));
+    }
+
+    #[test]
+    fn coordinator_does_not_treat_missing_round_positions_as_a_blocked_fact() {
+        assert!(!coordinator_should_report_no_consensus_positions(0, 0));
+        assert!(!coordinator_should_report_no_consensus_positions(0, 1));
+        assert!(!coordinator_should_report_no_consensus_positions(1, 1));
     }
 
     #[test]

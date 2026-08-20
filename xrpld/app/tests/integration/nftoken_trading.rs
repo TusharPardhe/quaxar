@@ -31,6 +31,15 @@ fn get_owner_count(view: &impl ReadView, account: AccountID) -> u32 {
         .unwrap_or(0)
 }
 
+fn xrp_balance(view: &impl ReadView, account: AccountID) -> i64 {
+    view.read(account_keylet(acct_id(account)))
+        .expect("account root read must succeed")
+        .expect("account root must exist")
+        .get_field_amount(sf("sfBalance"))
+        .xrp()
+        .drops()
+}
+
 fn mint_tx(from: AccountID, taxon: u32, seq: u32) -> STTx {
     STTx::new(TxType::NFTOKEN_MINT, move |tx| {
         tx.set_account_id(sf("sfAccount"), from);
@@ -544,6 +553,64 @@ fn expired_brokered_nft_offers_cleanup_each_directory_with_fix_cleanup_3_1_3() {
     }
 }
 
+/// rippled NFTokenAcceptOffer::doApply pays a broker before calculating the
+/// seller's remainder.  A brokered acceptance must not give the seller the
+/// full buy-offer amount when sfNFTokenBrokerFee is present.
+#[test]
+fn nftoken_brokered_accept_pays_broker_before_seller() {
+    let seller = acct(0x11);
+    let buyer = acct(0x22);
+    let broker = acct(0x33);
+    let ledger = build_ledger(vec![
+        account_root(seller, 5_000_000_000, 0, 0),
+        account_root(buyer, 5_000_000_000, 0, 0),
+        account_root(broker, 5_000_000_000, 0, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let mint = mint_tx_transferable(seller, 0, 1);
+    assert_eq!(
+        full_apply(&mut view, &mint, TxType::NFTOKEN_MINT),
+        Ter::TES_SUCCESS
+    );
+    let token_id = get_token_id(&view, seller, &mint);
+
+    let sell = create_sell_offer_tx(seller, token_id, 1_000_000, 2);
+    assert_eq!(
+        full_apply(&mut view, &sell, TxType::NFTOKEN_CREATE_OFFER),
+        Ter::TES_SUCCESS
+    );
+    let sell_offer = protocol::nft_offer_keylet_for_owner(acct_id(seller), 2).key;
+
+    let buy = create_buy_offer_tx(buyer, token_id, seller, 1_000_000, 1);
+    assert_eq!(
+        full_apply(&mut view, &buy, TxType::NFTOKEN_CREATE_OFFER),
+        Ter::TES_SUCCESS
+    );
+    let buy_offer = protocol::nft_offer_keylet_for_owner(acct_id(buyer), 1).key;
+
+    let seller_before = xrp_balance(&view, seller);
+    let buyer_before = xrp_balance(&view, buyer);
+    let broker_before = xrp_balance(&view, broker);
+    let accept = STTx::new(TxType::NFTOKEN_ACCEPT_OFFER, |tx| {
+        tx.set_account_id(sf("sfAccount"), broker);
+        tx.set_field_h256(sf("sfNFTokenSellOffer"), sell_offer);
+        tx.set_field_h256(sf("sfNFTokenBuyOffer"), buy_offer);
+        tx.set_field_amount(sf("sfNFTokenBrokerFee"), xrp(100_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &accept, TxType::NFTOKEN_ACCEPT_OFFER),
+        Ter::TES_SUCCESS
+    );
+
+    assert_eq!(xrp_balance(&view, seller) - seller_before, 900_000);
+    assert_eq!(buyer_before - xrp_balance(&view, buyer), 1_000_000);
+    // The broker receives its cut and pays this transaction's 10-drop fee.
+    assert_eq!(xrp_balance(&view, broker) - broker_before, 99_990);
+}
+
 /// C++ NFToken_test — accept sell offer transfers token.
 #[test]
 fn nftoken_accept_sell_offer() {
@@ -703,10 +770,16 @@ fn nftoken_create_and_cancel_offer() {
         full_apply(&mut view, &tx_offer, TxType::NFTOKEN_CREATE_OFFER),
         Ter::TES_SUCCESS
     );
+    let offer_key = protocol::nft_offer_keylet_for_owner(acct_id(alice), 2).key;
+    assert!(
+        view.read(protocol::nft_offer_keylet(offer_key))
+            .expect("offer lookup should succeed")
+            .is_some(),
+        "a successful create must materialize the offer SLE"
+    );
     let before_count = get_owner_count(&view, alice);
 
     // Cancel the offer
-    let offer_key = protocol::nft_offer_keylet_for_owner(acct_id(alice), 2).key;
     let tx_cancel = STTx::new(TxType::NFTOKEN_CANCEL_OFFER, |tx| {
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_field_v256(
@@ -718,6 +791,12 @@ fn nftoken_create_and_cancel_offer() {
     });
     let result = full_apply(&mut view, &tx_cancel, TxType::NFTOKEN_CANCEL_OFFER);
     assert_eq!(result, Ter::TES_SUCCESS);
+    assert!(
+        view.read(protocol::nft_offer_keylet(offer_key))
+            .expect("offer lookup should succeed")
+            .is_none(),
+        "a successful cancel must erase the offer SLE"
+    );
     assert!(get_owner_count(&view, alice) < before_count);
 }
 

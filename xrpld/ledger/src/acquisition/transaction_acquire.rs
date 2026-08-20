@@ -138,7 +138,7 @@ impl TransactionAcquire {
         }
 
         let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
-        let mut full_below = NullFullBelowCache::new(1);
+        let full_below = NullFullBelowCache::new(1);
         let mut fetch = |_| None;
 
         for (node_id, raw_node) in data {
@@ -156,7 +156,7 @@ impl TransactionAcquire {
             } else {
                 let accepted = Self::with_built_filter(self.filter_factory.clone(), |filter| {
                     self.map
-                        .add_known_node(*node_id, raw_node, filter, &mut full_below, &mut fetch)
+                        .add_known_node(*node_id, raw_node, filter, &full_below, &mut fetch)
                 });
                 if !accepted.is_good() {
                     return SHAMapAddNode::invalid();
@@ -238,17 +238,12 @@ impl TransactionAcquire {
             return;
         }
 
-        let mut full_below = NullFullBelowCache::new(1);
+        let full_below = NullFullBelowCache::new(1);
         let mut fetch = |_| None;
         let mut next_first_child = || 0;
         let missing = Self::with_built_filter(self.filter_factory.clone(), |filter| {
-            self.map.get_missing_nodes(
-                256,
-                filter,
-                &mut full_below,
-                &mut fetch,
-                &mut next_first_child,
-            )
+            self.map
+                .get_missing_nodes(256, filter, &full_below, &mut fetch, &mut next_first_child)
         });
 
         if missing.is_empty() {

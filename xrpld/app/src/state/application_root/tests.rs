@@ -5,7 +5,7 @@ use super::{
     batch_base_fee, calculate_default_sttx_base_fee, calculate_sttx_base_fee,
     consensus_status_event, loan_set_counterparty_preflight_ter,
     preferred_lcl_matches_local_or_parent, queue_apply_preclaim_ter, transaction_preflight_ter,
-    typed_preclaim_route, typed_preclaim_ter,
+    transaction_preflight_ter_with_flags, typed_preclaim_route, typed_preclaim_ter,
 };
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
@@ -3887,6 +3887,33 @@ fn open_ledger_batch_preflight_rejects_sponsorship_before_direct_apply() {
     assert_eq!(
         open_ledger_batch_preflight_result(fee_sponsored),
         Ter::TEM_INVALID_FLAG
+    );
+}
+
+#[test]
+fn nftoken_cancel_offer_preflight_rejects_duplicate_offer_ids() {
+    let account = AccountID::from_array([0x91; 20]);
+    let ledger = ledger_view(10, account, 1, &[]);
+    let offer_id = Uint256::from_u64(7);
+    let tx = STTx::new(TxType::NFTOKEN_CANCEL_OFFER, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        tx.set_field_v256(
+            get_field_by_symbol("sfNFTokenOffers"),
+            protocol::STVector256::from_values(
+                get_field_by_symbol("sfNFTokenOffers"),
+                vec![offer_id, offer_id],
+            ),
+        );
+    });
+
+    assert_eq!(
+        transaction_preflight_ter_with_flags(&tx, &ledger.rules(), ApplyFlags::DRY_RUN),
+        Ter::TEM_MALFORMED
     );
 }
 

@@ -82,6 +82,7 @@ pub(super) fn has_deep_freeze_without_freeze(sle: &STLedgerEntry) -> bool {
     low_deep_freeze && !low_freeze || high_deep_freeze && !high_freeze
 }
 
+#[allow(dead_code)] // reserve for M7 invariant sweep
 pub(super) fn validate_ripple_state_entry(sle: &STLedgerEntry) -> bool {
     !is_xrp_trust_line(sle) && !has_deep_freeze_without_freeze(sle)
 }

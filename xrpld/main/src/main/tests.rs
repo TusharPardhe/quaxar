@@ -1,7 +1,7 @@
 use super::{
-    AcqMsg, AcqRegistry, CompletedLedgerAcceptance, LedgerPublishAdvance,
-    PEERFINDER_MAX_CONNECT_ATTEMPTS, PEERFINDER_MAX_HOPS, PEERFINDER_NUMBER_OF_ENDPOINTS,
-    PEERFINDER_RECENT_ATTEMPT_DURATION, bind_server_runtime_into_root, build_endpoint_broadcast,
+    CompletedLedgerAcceptance, LedgerPublishAdvance, PEERFINDER_MAX_CONNECT_ATTEMPTS,
+    PEERFINDER_MAX_HOPS, PEERFINDER_NUMBER_OF_ENDPOINTS, PEERFINDER_RECENT_ATTEMPT_DURATION,
+    STARTUP_VALUE_FLAGS, bind_server_runtime_into_root, build_endpoint_broadcast,
     candidate_ledger_for_seq, candidate_reference_hash_from_reference_ledger,
     classify_completed_ledger_acceptance, classify_publish_advance,
     cold_bootstrap_persisted_validated_target, command_suggestions, current_ledger_is_fresh,
@@ -39,29 +39,6 @@ impl RpcDispatcher for TestDispatcher {
     }
 }
 
-fn config(text: &str) -> basics::basic_config::BasicConfig {
-    let mut config = basics::basic_config::BasicConfig::new();
-    let mut sections = basics::basic_config::IniFileSections::new();
-    let mut current = String::new();
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            current = line[1..line.len() - 1].trim().to_owned();
-            let _ = sections.entry(current.clone()).or_default();
-            continue;
-        }
-        sections
-            .entry(current.clone())
-            .or_default()
-            .push(raw_line.to_owned());
-    }
-    config.build(&sections);
-    config
-}
-
 #[test]
 fn cli_unknown_command_helpers_detect_command_and_suggest_close_matches() {
     let args = vec![
@@ -71,8 +48,21 @@ fn cli_unknown_command_helpers_detect_command_and_suggest_close_matches() {
         "logs".to_owned(),
     ];
     assert_eq!(
-        first_command_like_arg(&args, &["--conf", "-c", "--rpc-url"]),
+        first_command_like_arg(&args, STARTUP_VALUE_FLAGS),
         Some("logs")
+    );
+
+    let startup_args = vec![
+        "xrpld".to_owned(),
+        "--conf".to_owned(),
+        "xrpld.cfg".to_owned(),
+        "--quorum".to_owned(),
+        "2".to_owned(),
+    ];
+    assert_eq!(
+        first_command_like_arg(&startup_args, STARTUP_VALUE_FLAGS),
+        None,
+        "the quorum value belongs to the server startup parser, not the RPC CLI"
     );
 
     let suggestions = command_suggestions(
@@ -167,8 +157,6 @@ path = {}
                 reason: "test handoff".to_owned(),
             }],
         },
-        None,
-        None,
     );
 
     assert!(report.has_server_runtime);

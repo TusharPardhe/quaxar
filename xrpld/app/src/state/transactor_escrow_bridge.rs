@@ -29,15 +29,17 @@ pub fn build_escrow_create_facts<V: ApplyView>(
     finish_after: Option<u32>,
     cancel_after: Option<u32>,
 ) -> Result<EscrowCreateApplyFacts, ViewError> {
-    let mut facts = EscrowCreateApplyFacts::default();
-    facts.amount_is_xrp = amount.native();
-    facts.finish_after_expired =
-        finish_after.is_some_and(|time| view.header().parent_close_time > time);
-    facts.cancel_after_expired =
-        cancel_after.is_some_and(|time| view.header().parent_close_time > time);
-    facts.include_sequence_field = view
-        .rules()
-        .enabled(&protocol::feature_id("fixIncludeKeyletFields"));
+    let mut facts = EscrowCreateApplyFacts {
+        amount_is_xrp: amount.native(),
+        finish_after_expired: finish_after
+            .is_some_and(|time| view.header().parent_close_time > time),
+        cancel_after_expired: cancel_after
+            .is_some_and(|time| view.header().parent_close_time > time),
+        include_sequence_field: view
+            .rules()
+            .enabled(&protocol::feature_id("fixIncludeKeyletFields")),
+        ..EscrowCreateApplyFacts::default()
+    };
 
     if let Some(src_sle) =
         view.peek(protocol::account_keylet(Uint160::from_void(account.data())))?

@@ -33,6 +33,10 @@ fn tx_set_root() -> (Uint256, Vec<u8>) {
     )
     .expect("tx leaf should insert");
 
+    // MutableTree deliberately leaves changed ancestors dirty until ownership
+    // is finalized. The all-zero root is the reserved empty transaction-set
+    // identifier, so materialize the actual root before exercising acquisition.
+    tree.unshare();
     let root = tree.root();
     (
         *root.get_hash().as_uint256(),
@@ -49,6 +53,7 @@ fn tx_data_packet(hash: Uint256, root_bytes: Vec<u8>) -> TmLedgerData {
         nodes: vec![TmLedgerNode {
             nodedata: root_bytes,
             nodeid: Some(SHAMapNodeId::default().get_raw_string()),
+            reference: None,
         }],
         request_cookie: None,
         error: None,
@@ -142,6 +147,26 @@ fn inbound_transactions_retain_completion_when_channel_is_full() {
     let pending = inbound.take_pending_map_completions(1);
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].0, hash);
+    assert!(inbound.take_pending_map_completions(1).is_empty());
+}
+
+#[test]
+fn inbound_transactions_local_sets_do_not_use_acquired_completion_channel() {
+    let mut inbound = InboundTransactions::new(Arc::new(SimplePeerSetBuilder::new(Vec::new())));
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    inbound.set_map_complete_sender(tx);
+
+    let hash = Uint256::from_array([0x45; 32]);
+    let set = Arc::new(SyncTree::new_with_type(
+        shamap::sync::SHAMapType::Transaction,
+        true,
+        0,
+    ));
+    assert!(inbound.give_set(hash, set, false));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
     assert!(inbound.take_pending_map_completions(1).is_empty());
 }
 

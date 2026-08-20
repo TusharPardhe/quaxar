@@ -11,7 +11,7 @@ use std::{
 };
 
 use basics::{base_uint::Uint256, sha_map_hash::SHAMapHash};
-use ledger::LedgerHeader;
+use ledger::{LedgerHeader, ReplayTransaction};
 use overlay::{
     TmProofPathRequest, TmProofPathResponse, TmReplayDeltaRequest, TmReplayDeltaResponse,
 };
@@ -41,7 +41,7 @@ const LM_ACCOUNT_STATE: i32 = 2;
 /// transaction metadata index, and prove the transaction SHAMap root.
 fn decode_replay_delta_response(
     response: &TmReplayDeltaResponse,
-) -> Result<(LedgerHeader, BTreeMap<u32, Arc<STTx>>), &'static str> {
+) -> Result<(LedgerHeader, BTreeMap<u32, ReplayTransaction>), &'static str> {
     if response.error.is_some() {
         return Err("peer returned replay delta error");
     }
@@ -60,14 +60,18 @@ fn decode_replay_delta_response(
     let mut ordered_txs = BTreeMap::new();
     let mut tx_map = MutableTree::new(info.seq.max(1));
     for payload in &response.transaction {
-        let (tx, index) = catch_unwind(AssertUnwindSafe(|| {
+        let (tx, index, metadata) = catch_unwind(AssertUnwindSafe(|| {
             let mut serial = SerialIter::new(payload);
             let tx_bytes = serial.get_vl();
             let meta_bytes = serial.get_vl();
             let mut tx_serial = SerialIter::new(&tx_bytes);
             let tx = Arc::new(STTx::from_serial_iter(&mut tx_serial));
             let meta = TxMeta::from_raw(tx.get_transaction_id(), info.seq, &meta_bytes);
-            (tx, meta.get_index())
+            (
+                tx,
+                meta.get_index(),
+                Arc::new(Serializer::from_bytes(meta_bytes)),
+            )
         }))
         .map_err(|_| "invalid replay TransactionMd payload")?;
 
@@ -82,7 +86,7 @@ fn decode_replay_delta_response(
         }
         match ordered_txs.entry(index) {
             Entry::Vacant(slot) => {
-                slot.insert(tx);
+                slot.insert(ReplayTransaction::new(tx, metadata));
             }
             Entry::Occupied(_) => return Err("duplicate replay transaction index"),
         }

@@ -46,7 +46,7 @@ pub fn calculate_loan_pay_base_fee<V: ReadView>(view: &V, sttx: &STTx, normal_co
 
     let periodic_payment = loan_sle.get_field_number(sf("sfPeriodicPayment")).value();
     let service_fee = if loan_sle.is_field_present(sf("sfLoanServiceFee")) {
-        amount_number(&loan_sle.get_field_amount(sf("sfLoanServiceFee")))
+        loan_sle.get_field_number(sf("sfLoanServiceFee")).value()
     } else {
         RuntimeNumber::zero()
     };

@@ -585,13 +585,12 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         &mut self,
         message: &crate::message::TmManifests,
     ) -> crate::router::RouteAction {
-        // rippled 3.2.1 (OverlayImpl.cpp:667-757): process all trusted manifests,
-        // cap untrusted processing at kMaxManifestsPerMessage=200, charge only
-        // excess untrusted. Drop empty messages with useless-data charge.
-        // Oversized messages (> 200 entries) are still processed up to the cap
-        // rather than dropped entirely, matching rippled's trust-first behavior.
-        const MAX_MANIFESTS_PER_MESSAGE: usize = 200;
-
+        // rippled 3.2.1 (OverlayImpl.cpp:678-762): process every trusted
+        // manifest and cap *untrusted* processing at the configured
+        // maxUntrustedCount, charging the sender once when untrusted entries
+        // are skipped. Trusted manifests are never dropped.
+        // TODO(peer-parity): enforce the untrusted cap here; the manifest batch
+        // is currently handed to the bounded inbound queue unclassified.
         if message.list.is_empty() {
             self.peer.charge(
                 (*resource::FEE_USELESS_DATA).clone(),
@@ -1342,7 +1341,7 @@ fn is_valid_shamap_node_id_wire(data: &[u8]) -> bool {
         return false;
     }
     let full_bytes = depth / 2;
-    if depth % 2 == 0 {
+    if depth.is_multiple_of(2) {
         data[full_bytes..32].iter().all(|byte| *byte == 0)
     } else {
         data[full_bytes] & 0x0f == 0 && data[full_bytes + 1..32].iter().all(|byte| *byte == 0)
@@ -1872,7 +1871,7 @@ impl OverlayImpl {
             tls_stream
                 .write_all(response_str.as_bytes())
                 .await
-                .map_err(|e| OverlayError::Io(e))?;
+                .map_err(OverlayError::Io)?;
             shutdown_inbound_tls(&mut tls_stream, stop_requested.clone()).await;
             return Ok(());
         }
@@ -1979,18 +1978,21 @@ impl OverlayImpl {
                         remote_ip: remote_address.ip(),
                         clock_tolerance: std::time::Duration::from_secs(20),
                     };
-                    if let Err(reason) = crate::transport::handshake::verify_handshake(
+                    let handshake_peer = match crate::transport::handshake::verify_handshake(
                         request.headers(),
                         &verify_ctx,
                     ) {
-                        tracing::warn!(
-                            target: "overlay",
-                            ip = %remote_address,
-                            %reason,
-                            "Inbound handshake verification failed — disconnecting"
-                        );
-                        return Ok(());
-                    }
+                        Ok(peer) => peer,
+                        Err(reason) => {
+                            tracing::warn!(
+                                target: "overlay",
+                                ip = %remote_address,
+                                %reason,
+                                "Inbound handshake verification failed — disconnecting"
+                            );
+                            return Ok(());
+                        }
+                    };
 
                     // Build handshake context with real TLS Session-Signature.
                     let mut handshake_ctx = self.handshake_context();
@@ -2022,6 +2024,11 @@ impl OverlayImpl {
                         ledger_replay_enabled,
                         txrr_enabled,
                         vprr_enabled,
+                    );
+                    peer.apply_status_change(
+                        handshake_peer.closed_ledger,
+                        handshake_peer.previous_ledger,
+                        None,
                     );
                     accepted_peer = Some((peer, request.headers().clone(), inbound_reservation));
                     let response_wire = serialize_response(&response);
@@ -2271,16 +2278,15 @@ impl OverlayImpl {
                 .expect("overlay slots lock")
                 .delete_peer(id, true);
             self.inc_peer_disconnect();
-            if !peer.inbound() {
-                if let Some(handler) = self
+            if !peer.inbound()
+                && let Some(handler) = self
                     .outbound_peer_close_handler
                     .read()
                     .expect("outbound peer close handler lock")
                     .as_ref()
                     .map(Arc::clone)
-                {
-                    handler(peer.remote_address(), peer.fixed());
-                }
+            {
+                handler(peer.remote_address(), peer.fixed());
             }
             let total = self.active_peers.read().expect("overlay peers lock").len();
             tracing::info!(
@@ -2862,22 +2868,21 @@ impl OverlayImpl {
     }
 
     fn send_runtime_message(&self, peer: &Arc<PeerImp>, message: Message, force: bool) -> bool {
-        if !force {
-            if let Some(validator) = message.validator_key()
-                && peer.is_squelched(validator)
-            {
-                tracing::trace!(
-                    target: "overlay",
-                    peer_id = %peer.id(),
-                    "Message squelched for peer"
-                );
-                self.traffic.add_count(
-                    TrafficCategory::SquelchSuppressed,
-                    false,
-                    message.get_buffer_size() as u64,
-                );
-                return false;
-            }
+        if !force
+            && let Some(validator) = message.validator_key()
+            && peer.is_squelched(validator)
+        {
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %peer.id(),
+                "Message squelched for peer"
+            );
+            self.traffic.add_count(
+                TrafficCategory::SquelchSuppressed,
+                false,
+                message.get_buffer_size() as u64,
+            );
+            return false;
         }
 
         let bytes = message.get_buffer_size() as u64;
@@ -3409,13 +3414,19 @@ impl Overlay for OverlayImpl {
                     },
                 )
                 .map_err(ConnectAttemptError::Protocol)?;
-                Ok(PeerImp::new_with_inbound(
+                let peer = PeerImp::new_with_inbound(
                     peer_id,
                     remote,
                     false,
                     handshake_peer.public_key,
                     remote.to_string(),
-                ))
+                );
+                peer.apply_status_change(
+                    handshake_peer.closed_ledger,
+                    handshake_peer.previous_ledger,
+                    None,
+                );
+                Ok(peer)
             },
         );
         let mut handshake_context = self.handshake_context();

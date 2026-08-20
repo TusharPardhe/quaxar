@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 use crate::Compressed;
 use crate::message::{
@@ -387,17 +387,18 @@ impl PeerSession {
         // Reader loop — runs independently from the writer task.
         // Reads from the socket, parses messages, dispatches to handlers.
         let read_result = async {
+            let mut deferred_retry_at = None;
             loop {
                 while let Some(dispatch) = dispatch_available(&buffer, &mut handler)? {
                     buffer.drain(..dispatch.consumed);
                     if dispatch.deferred_ledger_data {
-                        wait_for_deferred_ledger_data(
-                            &self.peer,
-                            self.hooks.as_ref(),
-                            &mut self.stop_requested,
-                            &mut self.session_stop,
-                        )
-                        .await;
+                        // A deferred ledger reply retains the one bounded
+                        // transport frame, but must not block protocol control
+                        // traffic behind it. In particular, PING/PONG remains
+                        // live while the coordinator retries admission.
+                        deferred_retry_at.get_or_insert_with(|| {
+                            Instant::now() + DEFERRED_LEDGER_DATA_RETRY_INTERVAL
+                        });
                     }
                 }
 
@@ -405,11 +406,26 @@ impl PeerSession {
                     break;
                 }
 
+                let retry_deferred = async {
+                    match deferred_retry_at {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 tokio::select! {
                     result = read_message_with_deadline(&mut reader, &mut buffer) => {
                         match result? {
                             ReadOutcome::EndOfStream => break,
                             ReadOutcome::Progress => {}
+                        }
+                    }
+                    _ = retry_deferred => {
+                        if self.hooks.retry_deferred_ledger_data(&self.peer) {
+                            deferred_retry_at = Some(
+                                Instant::now() + DEFERRED_LEDGER_DATA_RETRY_INTERVAL,
+                            );
+                        } else {
+                            deferred_retry_at = None;
                         }
                     }
                     changed = self.stop_requested.changed() => {
@@ -545,6 +561,7 @@ fn dispatch_available(
     }
 }
 
+#[cfg(test)]
 async fn wait_for_deferred_ledger_data(
     peer: &Arc<PeerImp>,
     hooks: &dyn PeerSessionHooks,
@@ -736,6 +753,90 @@ mod tests {
             2,
             "the retained frame is retried once and then released only by admission"
         );
+    }
+
+    struct DeferredLedgerControlHooks {
+        messages: Mutex<Vec<u16>>,
+    }
+
+    impl PeerSessionHooks for DeferredLedgerControlHooks {
+        fn on_message(&self, _peer: &Arc<PeerImp>, message: &ProtocolMessage) {
+            self.messages
+                .lock()
+                .expect("messages lock")
+                .push(message.message_type as u16);
+        }
+
+        fn on_message_end(
+            &self,
+            _peer: &Arc<PeerImp>,
+            _header: &crate::message::MessageHeader,
+            message: &ProtocolMessage,
+        ) -> bool {
+            matches!(message.payload, ProtocolPayload::LedgerData(_))
+        }
+
+        fn retry_deferred_ledger_data(&self, _peer: &Arc<PeerImp>) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_session_dispatches_control_frames_while_ledger_data_is_deferred() {
+        let peer = peer(72);
+        let (local, mut remote) = duplex(4096);
+        let (stop_requested, stop_rx) = watch::channel(false);
+        let hooks = Arc::new(DeferredLedgerControlHooks {
+            messages: Mutex::new(Vec::new()),
+        });
+        let session = PeerSessionStarter::new(Box::new(local), stop_rx);
+        let handle = session.start(
+            Arc::clone(&peer),
+            Arc::clone(&hooks) as Arc<dyn PeerSessionHooks>,
+            Arc::new(move |_peer_id: PeerId| {}),
+        );
+
+        let deferred = Message::new(
+            ProtocolMessage::new(ProtocolPayload::LedgerData(TmLedgerData::default())),
+            None,
+        );
+        let ping = Message::new(
+            ProtocolMessage::new(ProtocolPayload::Ping(TmPing {
+                r#type: 0,
+                seq: Some(9),
+                ping_time: None,
+                net_time: None,
+            })),
+            None,
+        );
+        remote
+            .write_all(&deferred.get_buffer(Compressed::Off))
+            .await
+            .expect("write deferred ledger data");
+        remote
+            .write_all(&ping.get_buffer(Compressed::Off))
+            .await
+            .expect("write ping behind deferred ledger data");
+        remote.flush().await.expect("flush frames");
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if hooks
+                    .messages
+                    .lock()
+                    .expect("messages lock")
+                    .contains(&(ProtocolMessageType::MtPing as u16))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("PING dispatch is not blocked by deferred ledger data");
+
+        let _ = stop_requested.send(true);
+        handle.await.expect("session join").expect("session");
     }
 
     struct StopReleaseHooks {

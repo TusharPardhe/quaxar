@@ -1335,7 +1335,7 @@ fn submit_semantic_preflight_with_ledger(
                 return preflight;
             }
 
-            if let Some(ledger) = ledger {
+            if ledger.is_some() {
                 let pay_channel_field = get_field_by_symbol("sfChannel");
                 if !st_tx.is_field_present(pay_channel_field) {
                     return Ter::TEM_MALFORMED;
@@ -1370,7 +1370,7 @@ fn submit_semantic_preflight_with_ledger(
                 return preflight;
             }
 
-            if let Some(ledger) = ledger {
+            if ledger.is_some() {
                 let pay_channel_field = get_field_by_symbol("sfChannel");
                 if !st_tx.is_field_present(pay_channel_field) {
                     return Ter::TEM_MALFORMED;

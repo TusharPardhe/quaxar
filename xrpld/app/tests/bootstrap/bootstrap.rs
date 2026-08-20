@@ -621,6 +621,23 @@ online_delete = 256
         bootstrap.runtime.root().network_ops_operating_mode_string(),
         "full"
     );
+    let closed = bootstrap
+        .runtime
+        .root()
+        .closed_ledger()
+        .expect("Fresh startup should install an immutable closed LCL");
+    let validated = bootstrap
+        .runtime
+        .root()
+        .validated_ledger()
+        .expect("Fresh --valid startup should mark the initial LCL validated");
+    let published = bootstrap
+        .runtime
+        .root()
+        .published_ledger()
+        .expect("Fresh --valid startup should publish the initial LCL");
+    assert_eq!(validated.header().hash, closed.header().hash);
+    assert_eq!(published.header().hash, closed.header().hash);
     assert!(bootstrap.runtime.root().overlay_runtime().is_some());
     assert!(bootstrap.runtime.root().server_ports_setup().is_some());
     assert!(bootstrap.runtime.root().node_family().is_some());
@@ -636,10 +653,10 @@ online_delete = 256
     let transaction_db =
         DatabaseCon::new_at_path(&database_path, "transaction.db", &[], TRANSACTION_DB_INIT)
             .expect("transaction db");
-    // startGenesisLedger stores genesis/next in LedgerHistory and switches the
-    // LCL, but does not call setFullLedger or save an unvalidated ledger to
-    // relational history. Persistence starts at validated/full promotion.
-    assert_eq!(count_rows(&ledger_db, "Ledgers"), 0);
+    // `--valid` explicitly promotes the initial next LCL through
+    // setFullLedger, so one validated ledger is persisted before runtime
+    // startup. Ordinary Fresh startup remains unvalidated and unchanged.
+    assert_eq!(count_rows(&ledger_db, "Ledgers"), 1);
     assert!(count_rows(&transaction_db, "Transactions") >= 0);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1418,6 +1435,20 @@ protocol = http,ws
             .root()
             .path_search_fast(),
         2
+    );
+    assert!(
+        validator_default_bootstrap
+            .runtime
+            .root()
+            .validated_ledger()
+            .is_none()
+    );
+    assert!(
+        validator_default_bootstrap
+            .runtime
+            .root()
+            .published_ledger()
+            .is_none()
     );
     validator_default_bootstrap.runtime.shutdown();
 

@@ -426,7 +426,7 @@ fn account_set_preclaim_skips_require_auth_owner_dir_check_when_already_enabled_
 }
 
 #[test]
-fn account_set_preclaim_keeps_clawback_gates_disabled_when_feature_is_off() {
+fn account_set_preclaim_enforces_clawback_gates_after_feature_retirement() {
     let set_clawback = run_account_set_preclaim(AccountSetPreclaimFacts {
         set_flag: ASF_ALLOW_TRUST_LINE_CLAWBACK,
         account_exists: true,
@@ -444,8 +444,8 @@ fn account_set_preclaim_keeps_clawback_gates_disabled_when_feature_is_off() {
         ..AccountSetPreclaimFacts::default()
     });
 
-    assert_eq!(set_clawback, Ter::TES_SUCCESS);
-    assert_eq!(set_no_freeze, Ter::TES_SUCCESS);
+    assert_eq!(set_clawback, Ter::TEC_NO_PERMISSION);
+    assert_eq!(set_no_freeze, Ter::TEC_NO_PERMISSION);
 }
 
 #[test]
@@ -749,7 +749,7 @@ fn account_set_do_apply_tail_gates_locking_and_clawback_flags() {
     let clawback_enabled =
         run_account_set_do_apply_tail(AccountSetDoApplyTailFacts::<&'static str> {
             set_flag: ASF_ALLOW_TRUST_LINE_CLAWBACK,
-            feature_clawback_enabled: true,
+            feature_clawback_enabled: false,
             ..AccountSetDoApplyTailFacts::default()
         });
     let clawback_clear =

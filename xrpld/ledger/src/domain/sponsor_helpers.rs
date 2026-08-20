@@ -59,6 +59,8 @@ pub fn is_reserve_sponsor_allowed(tx_type: TxType) -> bool {
 }
 
 /// Extract the sponsor AccountID from an STLedgerEntry, defaulting to `sfSponsor`.
+/// Reserved rippled-parity helper; unused until sponsor-reserve flow work lands.
+#[allow(dead_code)]
 pub fn get_ledger_entry_sponsor(sle: &STLedgerEntry) -> Option<AccountID> {
     let field = get_field_by_symbol("sfSponsor");
     if sle.is_field_present(field) {
@@ -69,6 +71,8 @@ pub fn get_ledger_entry_sponsor(sle: &STLedgerEntry) -> Option<AccountID> {
 }
 
 /// Extract the high-side sponsor from a RippleState entry.
+/// Reserved rippled-parity helper; unused until sponsor-reserve flow work lands.
+#[allow(dead_code)]
 pub fn get_ledger_entry_high_sponsor(sle: &STLedgerEntry) -> Option<AccountID> {
     let field = get_field_by_symbol("sfHighSponsor");
     if sle.is_field_present(field) {
@@ -79,6 +83,8 @@ pub fn get_ledger_entry_high_sponsor(sle: &STLedgerEntry) -> Option<AccountID> {
 }
 
 /// Extract the low-side sponsor from a RippleState entry.
+/// Reserved rippled-parity helper; unused until sponsor-reserve flow work lands.
+#[allow(dead_code)]
 pub fn get_ledger_entry_low_sponsor(sle: &STLedgerEntry) -> Option<AccountID> {
     let field = get_field_by_symbol("sfLowSponsor");
     if sle.is_field_present(field) {

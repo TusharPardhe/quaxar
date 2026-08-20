@@ -646,7 +646,10 @@ fn amm2_vault_usd() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, usd_currency(), 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -669,7 +672,10 @@ fn amm2_vault_eur() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, eur_currency(), 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, eur_currency(), 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -692,7 +698,10 @@ fn amm2_vault_non_transferable() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, usd_currency(), 0).asset()),
+        );
         tx.set_field_u32(sf("sfFlags"), 0x00000002);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -927,7 +936,10 @@ fn amm3_vault_gbp() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, c, 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, c, 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -951,7 +963,10 @@ fn amm3_vault_jpy() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, c, 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, c, 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -975,7 +990,10 @@ fn amm3_vault_chf() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, c, 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, c, 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -999,7 +1017,10 @@ fn amm3_vault_cad() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, c, 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, c, 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1023,7 +1044,10 @@ fn amm3_vault_aud() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, c, 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, c, 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1221,7 +1245,10 @@ fn amm4_vault_2_currencies() {
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, usd_currency(), 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1231,7 +1258,10 @@ fn amm4_vault_2_currencies() {
     );
     let tx2 = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, eur_currency(), 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, eur_currency(), 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 2);
     });
@@ -1673,6 +1703,11 @@ fn amm5_did_with_data() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(full_apply(&mut v, &tx, TxType::DID_SET), Ter::TES_SUCCESS);
+    let did = v
+        .peek(protocol::did_keylet(Uint160::from_void(a.data())))
+        .unwrap()
+        .expect("DIDSet must persist a DID entry");
+    assert_eq!(did.get_field_vl(sf("sfData")), b"attestation_data_here");
 }
 
 // ─── Oracle: Various IDs ────────────────────────────────────────────────────
@@ -1882,7 +1917,13 @@ fn amm6_vault_diff_owners() {
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
             tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
+            tx.set_field_issue(
+                sf("sfAsset"),
+                protocol::STIssue::new_with_asset(
+                    sf("sfAsset"),
+                    iou(gw, usd_currency(), 0).asset(),
+                ),
+            );
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -2139,7 +2180,10 @@ fn amm7_vault_10_currencies() {
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
             tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, cur, 0));
+            tx.set_field_issue(
+                sf("sfAsset"),
+                protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, cur, 0).asset()),
+            );
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -2324,7 +2368,13 @@ fn amm8_vault_10_owners() {
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
             tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
+            tx.set_field_issue(
+                sf("sfAsset"),
+                protocol::STIssue::new_with_asset(
+                    sf("sfAsset"),
+                    iou(gw, usd_currency(), 0).asset(),
+                ),
+            );
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -3059,11 +3109,15 @@ fn amm21_50_pools() {
         let a = acct(i);
         let gw = acct(0x33);
         let cur = protocol::currency_from_string(c);
+        // `trust_line` stores the balance from the low account's perspective;
+        // the pool owner holds the positive balance, so the sign flips when the
+        // owner sorts after the gateway.
+        let owner_holds = if a < gw { 100_000 } else { -100_000 };
         let l = build_ledger_with_features(
             vec![
                 account_root(a, 50_000_000_000, 1, 0),
                 account_root(gw, 50_000_000_000, 0, 0x00800000),
-                trust_line(a, gw, cur, 100000, 1000000, 0),
+                trust_line(a, gw, cur, owner_holds, 1000000, 0),
             ],
             vec!["AMM"],
         );
@@ -3224,7 +3278,10 @@ fn amm24_vault_100_currencies() {
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
             tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, cur, 0));
+            tx.set_field_issue(
+                sf("sfAsset"),
+                protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, cur, 0).asset()),
+            );
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });

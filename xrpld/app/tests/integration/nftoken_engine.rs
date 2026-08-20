@@ -270,7 +270,7 @@ fn nfe_escrow_finish_after() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1500);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -292,8 +292,8 @@ fn nfe_escrow_cancel_after() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
-        tx.set_field_u32(sf("sfCancelAfter"), 1000);
+        tx.set_field_u32(sf("sfFinishAfter"), 1500);
+        tx.set_field_u32(sf("sfCancelAfter"), 2000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -311,7 +311,7 @@ fn nfe_escrow_to_self() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), a);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1500);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -399,7 +399,7 @@ fn nfe_escrow_various_amounts() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(5_000_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1500);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1791,7 +1791,7 @@ fn nfe3_escrow_1m() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 100);
+        tx.set_field_u32(sf("sfFinishAfter"), 1100);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1813,7 +1813,7 @@ fn nfe3_escrow_10m() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(10_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 200);
+        tx.set_field_u32(sf("sfFinishAfter"), 1200);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1835,7 +1835,7 @@ fn nfe3_escrow_100m() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(100_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1500);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -2539,7 +2539,7 @@ fn nfe5_escrow_diff_dest() {
             tx.set_account_id(sf("sfAccount"), a);
             tx.set_account_id(sf("sfDestination"), dest);
             tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-            tx.set_field_u32(sf("sfFinishAfter"), 500);
+            tx.set_field_u32(sf("sfFinishAfter"), 1500);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -2586,7 +2586,7 @@ fn nfe6_escrow_finish_1() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 1);
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -2608,7 +2608,7 @@ fn nfe6_escrow_finish_60() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 60);
+        tx.set_field_u32(sf("sfFinishAfter"), 1060);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -2630,7 +2630,7 @@ fn nfe6_escrow_finish_300() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 300);
+        tx.set_field_u32(sf("sfFinishAfter"), 1300);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -2916,7 +2916,7 @@ fn nfe7_escrow_5_seq() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(5_000_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1500);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -3731,7 +3731,7 @@ fn nfe12_escrow_20_accounts() {
             tx.set_account_id(sf("sfAccount"), a);
             tx.set_account_id(sf("sfDestination"), b);
             tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-            tx.set_field_u32(sf("sfFinishAfter"), 500);
+            tx.set_field_u32(sf("sfFinishAfter"), 1500);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -3756,7 +3756,7 @@ fn nfe12_escrow_to_10_dests() {
             tx.set_account_id(sf("sfAccount"), a);
             tx.set_account_id(sf("sfDestination"), acct(dest));
             tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-            tx.set_field_u32(sf("sfFinishAfter"), 500);
+            tx.set_field_u32(sf("sfFinishAfter"), 1500);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), seq);
         });
@@ -3795,7 +3795,7 @@ fn nfe12_escrow_various_amounts() {
             tx.set_account_id(sf("sfAccount"), a);
             tx.set_account_id(sf("sfDestination"), b);
             tx.set_field_amount(sf("sfAmount"), xrp(*amt));
-            tx.set_field_u32(sf("sfFinishAfter"), 500);
+            tx.set_field_u32(sf("sfFinishAfter"), 1500);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -3824,7 +3824,7 @@ fn nfe12_escrow_with_condition() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1500);
         tx.set_field_vl(sf("sfCondition"), &cond);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -3849,7 +3849,7 @@ fn nfe12_escrow_50_accounts() {
             tx.set_account_id(sf("sfAccount"), a);
             tx.set_account_id(sf("sfDestination"), b);
             tx.set_field_amount(sf("sfAmount"), xrp(100_000));
-            tx.set_field_u32(sf("sfFinishAfter"), 500);
+            tx.set_field_u32(sf("sfFinishAfter"), 1500);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -4081,7 +4081,7 @@ fn nfe15_escrow_100_accounts() {
             tx.set_account_id(sf("sfAccount"), a);
             tx.set_account_id(sf("sfDestination"), b);
             tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-            tx.set_field_u32(sf("sfFinishAfter"), 500);
+            tx.set_field_u32(sf("sfFinishAfter"), 1500);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -4099,7 +4099,7 @@ fn nfe15_escrow_various_times() {
     let b = acct(0x22);
     for (i, time) in (0x41u8..=0x4A).zip(
         [
-            60u32, 300, 600, 3600, 7200, 86400, 172800, 604800, 2592000, 31536000,
+            1060u32, 1300, 1600, 3600, 7200, 86400, 172800, 604800, 2592000, 31536000,
         ]
         .iter(),
     ) {
@@ -4197,7 +4197,7 @@ fn nfe16_escrow_200_accounts() {
             tx.set_account_id(sf("sfAccount"), a);
             tx.set_account_id(sf("sfDestination"), b);
             tx.set_field_amount(sf("sfAmount"), xrp(500_000));
-            tx.set_field_u32(sf("sfFinishAfter"), 500);
+            tx.set_field_u32(sf("sfFinishAfter"), 1500);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -4389,7 +4389,7 @@ fn nfe19_escrow_250_accounts() {
             tx.set_account_id(sf("sfAccount"), a);
             tx.set_account_id(sf("sfDestination"), b);
             tx.set_field_amount(sf("sfAmount"), xrp(500_000));
-            tx.set_field_u32(sf("sfFinishAfter"), 500);
+            tx.set_field_u32(sf("sfFinishAfter"), 1500);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });

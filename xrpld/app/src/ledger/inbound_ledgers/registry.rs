@@ -9,7 +9,7 @@ use basics::hardened_hash::HardenedHashBuilder;
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
 use ledger::{FetchPackCache, InboundLedgerPacket, Ledger};
-use overlay::Peer;
+use overlay::{Overlay, Peer};
 use protocol::JsonValue;
 use shamap::family::FullBelowCacheImpl;
 use shamap::tree_node_cache::TreeNodeCache;
@@ -19,6 +19,13 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use acquisition::{
+    AcquisitionEffect, AcquisitionEvent, BudgetState, CoordinatorRunner,
+    DurableHandoffAcknowledgement, DurableHandoffId, LedgerTarget, RunEpoch, RunnerSnapshot,
+    SessionRef,
+};
+
+use crate::network::network_ops::SharedNetworkOpsState;
 use crate::runtime::overlay_runtime::AppOverlayRuntime;
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
@@ -29,8 +36,13 @@ use super::acquisition::{
     InboundPacketAdmissionLease, PacketAdmissionReservation, PacketEnqueue,
     ProvisionalLedgerIdentity,
 };
-#[cfg(test)]
-use super::acquisition::{SequencePromotionAttempt, SequenceRoutePause};
+use super::coordinator_adapter::{
+    BrokerTicketState, CoordinatorIngress, LedgerDataIngressDisposition,
+};
+use super::coordinator_engine::{CoordinatorPlanSeed, CoordinatorSessionOrigins};
+use super::coordinator_ports::{
+    CoordinatorPortResources, ProductionAdapter, build_coordinator_adapter,
+};
 use super::read_broker::{NodeReadBroker, ReadBrokerConfig};
 use super::scheduler::{AcquisitionKey, AcquisitionReadyScheduler, ReadyCause};
 use super::worker_pool::WorkerPool;
@@ -53,10 +65,34 @@ pub(crate) fn response_sequence_matches_request(expected_seq: u32, response_seq:
     expected_seq == 0 || response_seq == 0 || expected_seq == response_seq
 }
 
+/// The outcome of a coordinator-owned acquisition request: the minted session
+/// identity, the registry acquisition id (for `CompletedInboundLedger` origin
+/// correlation), and the effects the coordinator emitted so callers can trace
+/// peer requests, timer arming, and phase transitions without reading
+/// coordinator internals. The current caller logs the outcome and discards it;
+/// fields feed the M6/M7 trace contract.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct CoordinatorAcquireOutcome {
+    pub(crate) session: SessionRef,
+    pub(crate) acquisition_id: u64,
+    pub(crate) effects: Vec<AcquisitionEffect>,
+}
+
 /// rippled's `JtLedgerData` JobType permits at most three running jobs.
 /// This bounds packet processing while leaving the inbound registry free to
 /// track any number of hash-deduplicated acquisitions.
 const WORKER_COUNT: usize = 3;
+
+/// Acquire the registry `inner` mutex, recording the time spent blocked on the
+/// lock. High percentiles of `xrpld_acq_registry_lock_wait_seconds` signal
+/// ingress/lifecycle lock contention across the registry boundary.
+fn timed_inner_lock(inner: &Arc<Mutex<RegistryInner>>) -> std::sync::MutexGuard<'_, RegistryInner> {
+    let start = Instant::now();
+    let guard = inner.lock().expect("inbound_ledgers lock");
+    xrpld_metrics::acquisition::record_registry_lock_wait(start.elapsed().as_secs_f64());
+    guard
+}
 
 /// Cumulative, process-lifetime counters covering every inbound-ledger
 /// lifecycle boundary. They are sampled by NetworkOPs at most once every five
@@ -95,7 +131,6 @@ pub(crate) struct AcquisitionLifecycleSnapshot {
     pub timeout_jobs: u64,
     pub timeout_no_progress: u64,
     pub timeout_retries: u64,
-    pub timeout_queue_rejected: u64,
     pub terminal_completed: u64,
     pub terminal_failed: u64,
 }
@@ -134,7 +169,6 @@ pub(crate) struct AcquisitionLifecycleCounters {
     pub timeout_jobs: AtomicU64,
     pub timeout_no_progress: AtomicU64,
     pub timeout_retries: AtomicU64,
-    pub timeout_queue_rejected: AtomicU64,
     pub terminal_completed: AtomicU64,
     pub terminal_failed: AtomicU64,
 }
@@ -179,7 +213,6 @@ impl AcquisitionLifecycleCounters {
             timeout_jobs: load!(timeout_jobs),
             timeout_no_progress: load!(timeout_no_progress),
             timeout_retries: load!(timeout_retries),
-            timeout_queue_rejected: load!(timeout_queue_rejected),
             terminal_completed: load!(terminal_completed),
             terminal_failed: load!(terminal_failed),
         }
@@ -202,11 +235,39 @@ pub enum AcquireReason {
 /// A completed acquisition retains its origin until LedgerMaster consumes it.
 /// This distinguishes rippled's non-validating `storeLedger` paths from its
 /// history-only `setFullLedger` path.
+///
+/// `from_coordinator` marks items published by the coordinator durable handoff
+/// (M4.2-C3). The strand consumes those authoritatively because no registry
+/// ready-queue entry exists for a coordinator session; legacy items are merely
+/// wakeups for the registry's authoritative ready queue.
 #[derive(Debug, Clone)]
 pub struct CompletedInboundLedger {
     pub ledger: Arc<Ledger>,
     pub reason: AcquireReason,
     pub acquisition_id: u64,
+    pub from_coordinator: bool,
+    /// Present only for a coordinator durable handoff. Legacy registry wakeups
+    /// retain `None` and follow their existing ready-queue acknowledgement.
+    pub durable_handoff: Option<DurableHandoffId>,
+    /// The complete coordinator session reference paired with
+    /// `durable_handoff`. It prevents a target hash or `SessionId` alone from
+    /// authorizing recipient acknowledgement.
+    pub coordinator_session: Option<SessionRef>,
+}
+
+impl CompletedInboundLedger {
+    /// Returns the exact durable coordinator identity only when this is a
+    /// complete coordinator handoff. Incomplete coordinator-shaped records are
+    /// intentionally not processed or acknowledged by the recipient.
+    pub(crate) const fn coordinator_handoff(&self) -> Option<(DurableHandoffId, SessionRef)> {
+        if !self.from_coordinator {
+            return None;
+        }
+        match (self.durable_handoff, self.coordinator_session) {
+            (Some(handoff), Some(session)) => Some((handoff, session)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -705,6 +766,29 @@ pub struct InboundLedgers {
     /// Shared lifecycle counters incremented at request, wire, worker, retry,
     /// and terminal boundaries. The sampled snapshot never mutates state.
     lifecycle: Arc<AcquisitionLifecycleCounters>,
+    /// Coordinator-owned session lifecycle. Installed once the NodeStore and
+    /// the NetworkOps phase state are configured; when installed it is the
+    /// single session lifecycle owner for every target it creates. `None`
+    /// preserves the legacy `AcquisitionState` path behind the M4.2-C3
+    /// switchover, so the rollback feature flag is "never install". A mutex
+    /// (not `RwLock`) is required because the adapter's event receiver is not
+    /// `Sync`; ingress/owner calls serialize through this short lock.
+    /// Mutable owner for coordinator lifecycle transitions and effect dispatch.
+    /// Overlay ingress intentionally does not use this lock; it holds the
+    /// separately published immutable [`CoordinatorIngress`] capability.
+    coordinator: Mutex<Option<ProductionAdapter>>,
+    /// Immutable route/admission capability for overlay `TmLedgerData` ingress.
+    /// It is published before any request effect can synchronously yield a
+    /// reply, so ingress never re-enters the mutable coordinator lock.
+    coordinator_ingress: RwLock<Option<CoordinatorIngress>>,
+    /// Per-session `(sequence, reason)` origins the coordinator plan seed
+    /// resolves when a Base/header packet arrives. Registered exactly once per
+    /// requested session.
+    coordinator_origins: CoordinatorSessionOrigins,
+    /// The NetworkOps state the coordinator phase port publishes to. Wired by
+    /// ApplicationRoot before coordinator installation; the coordinator is the
+    /// single production mode writer for the sessions it owns.
+    coordinator_phase: RwLock<Option<Arc<SharedNetworkOpsState>>>,
 }
 
 impl InboundLedgers {
@@ -767,6 +851,10 @@ impl InboundLedgers {
             next_acquisition_id: AtomicU64::new(1),
             recovery_lcl_decision: Mutex::new(None),
             lifecycle: Arc::new(AcquisitionLifecycleCounters::default()),
+            coordinator: Mutex::new(None),
+            coordinator_ingress: RwLock::new(None),
+            coordinator_origins: CoordinatorSessionOrigins::default(),
+            coordinator_phase: RwLock::new(None),
         }
     }
 
@@ -787,6 +875,470 @@ impl InboundLedgers {
     pub fn set_node_store(&self, ns: SHAMapStoreNodeStore) {
         let mut guard = self.node_store.write().expect("node_store write");
         *guard = Some(ns);
+    }
+
+    // ─── Coordinator-owned session lifecycle (M4.2-C2/C3) ───────────────
+
+    /// Wire the NetworkOps phase state the coordinator publishes to. The
+    /// coordinator is the single production mode writer for the sessions it
+    /// owns; it never reads a mode back from this state.
+    pub(crate) fn set_phase_state(&self, state: Arc<SharedNetworkOpsState>) {
+        *self
+            .coordinator_phase
+            .write()
+            .expect("coordinator phase write") = Some(state);
+    }
+
+    /// Whether the coordinator owns session lifecycle. When false, `acquire`
+    /// uses the legacy `AcquisitionState` path (M4.2-C3 rollback flag).
+    pub fn coordinator_installed(&self) -> bool {
+        self.coordinator.lock().expect("coordinator lock").is_some()
+    }
+
+    /// The active overlay peers the coordinator request port may deliver to.
+    /// The overlay owns sockets; this only mirrors its availability fact.
+    fn coordinator_peer_snapshot(&self) -> Vec<Arc<dyn Peer>> {
+        let guard = self.overlay_rt.read().expect("overlay_rt read");
+        match guard.as_ref() {
+            Some(rt) => rt.overlay().active_peers(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Build and install the production coordinator adapter. Idempotent: the
+    /// first successful install wins and later calls return `false` without
+    /// replacing the live owner. Installation is rejected while a legacy actor
+    /// is live: those actors retain independent mailbox, scheduler, timer, and
+    /// tree-plan ownership and cannot coexist with coordinator sessions.
+    /// Bootstrap installs before any acquisition can begin; keeping the
+    /// coordinator absent is the explicit compatibility fallback. Requires
+    /// the NodeStore, the phase state, and (optionally) the overlay runtime to
+    /// be configured first.
+    pub fn install_coordinator(&self) -> bool {
+        if self.coordinator_installed() {
+            return true;
+        }
+        let legacy_lifecycle_live = {
+            let inner = timed_inner_lock(&self.inner);
+            inner.entries.values().any(|entry| {
+                let completed = entry.completed_ledger.is_some()
+                    || entry.state.completed.load(Ordering::Acquire);
+                let active_actor = !entry.state.stopped.load(Ordering::Acquire) && !completed;
+                // A completed legacy actor retains ownership until its exact
+                // ready-queue handoff is acknowledged. Installing the
+                // coordinator before that acknowledgement would leave the
+                // NetworkOps registry poll as a second terminal owner.
+                let terminal_handoff_pending = completed && !entry.completion_acknowledged;
+                !entry.failed
+                    && !entry.state.failed.load(Ordering::Acquire)
+                    && (active_actor || terminal_handoff_pending)
+            })
+        };
+        if legacy_lifecycle_live {
+            tracing::warn!(
+                target: "inbound_ledger",
+                "coordinator installation rejected while a legacy acquisition lifecycle is live"
+            );
+            return false;
+        }
+        let node_store = match self.node_store.read().expect("node_store read").clone() {
+            Some(node_store) => node_store,
+            None => return false,
+        };
+        let phase_state = match self
+            .coordinator_phase
+            .read()
+            .expect("coordinator phase read")
+            .clone()
+        {
+            Some(state) => state,
+            None => return false,
+        };
+        let origins = self.coordinator_origins.clone();
+        let seed = CoordinatorPlanSeed::new(
+            origins,
+            Arc::clone(&self.fetch_pack),
+            Arc::clone(&self.tree_cache),
+            Arc::clone(&self.full_below),
+        );
+        let runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            BudgetState::default(),
+            Box::new(seed),
+        );
+        let adapter = build_coordinator_adapter(CoordinatorPortResources {
+            runner,
+            peers: overlay::SimplePeerSet::new(self.coordinator_peer_snapshot()),
+            broker: self.read_broker.clone(),
+            tickets: BrokerTicketState::default(),
+            fetch_pack: Arc::clone(&self.fetch_pack),
+            node_store,
+            completed_ledgers_tx: self.completed_ledgers_tx.clone(),
+            timer_pool: Arc::clone(&self.worker_pool),
+            phase_state,
+        });
+        let ingress = adapter.ingress();
+        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        if guard.is_none() {
+            // Publish before the adapter can dispatch any future peer request.
+            // A local/loopback overlay may reply inline from that dispatch.
+            *self
+                .coordinator_ingress
+                .write()
+                .expect("coordinator ingress write") = Some(ingress);
+            *guard = Some(adapter);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record coordinator-owned terminal failures after releasing the
+    /// coordinator lock. This restores rippled `InboundLedgers::logFailure`
+    /// ownership without letting the registry inspect or mutate a live
+    /// coordinator session.
+    fn record_coordinator_failures(&self, hashes: Vec<Uint256>) {
+        if hashes.is_empty() {
+            return;
+        }
+        {
+            let mut inner = timed_inner_lock(&self.inner);
+            for hash in hashes {
+                record_recent_failure(&mut inner, hash, None);
+            }
+        }
+        self.notify_publication_advance();
+    }
+
+    /// Drain the coordinator owner loop: process every queued event and
+    /// dispatch its effects. Returns the number of events handled.
+    pub fn coordinator_drain(&self) -> usize {
+        let (handled, failures) = {
+            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let Some(coordinator) = guard.as_mut() else {
+                return 0;
+            };
+            let handled = coordinator.drain();
+            let failures = coordinator.take_terminal_failures();
+            (handled, failures)
+        };
+        self.record_coordinator_failures(failures);
+        handled
+    }
+
+    /// Feed the current peer-availability fact to the coordinator owner.
+    /// Empty peers mean no usable peer capability. The coordinator publishes
+    /// `Disconnected`/`Connected` and cancels sessions on peer loss. Returns
+    /// false when the coordinator is not installed (the legacy strand writer
+    /// remains authoritative).
+    pub fn coordinator_report_peer_availability(&self, peers: &[overlay::PeerId]) -> bool {
+        let failures = {
+            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let Some(coordinator) = guard.as_mut() else {
+                return false;
+            };
+            coordinator.refresh_peers(self.coordinator_peer_snapshot());
+            coordinator.connectivity(peers);
+            coordinator.drain();
+            coordinator.take_terminal_failures()
+        };
+        self.record_coordinator_failures(failures);
+        true
+    }
+
+    /// Feed the bootstrap startup-mode fact so the coordinator seeds and
+    /// publishes the initial phase from the moment it installs (M6-D). The
+    /// coordinator owns the mode write from here on; the legacy bootstrap
+    /// startup write remains only as the pre-install seed. Returns false unless
+    /// installed.
+    pub fn coordinator_startup(&self, phase: acquisition::SyncPhase) -> bool {
+        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let Some(coordinator) = guard.as_mut() else {
+            return false;
+        };
+        coordinator.handle_fact(acquisition::AcquisitionEvent::StartupMode { phase });
+        true
+    }
+
+    /// Feed a coordinator heartbeat so the phase port re-applies
+    /// validated-ledger-age normalization on `Connected`/`Syncing` (rippled
+    /// `processHeartbeatTimer` parity). Returns false unless installed.
+    pub fn coordinator_heartbeat(&self) -> bool {
+        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let Some(coordinator) = guard.as_mut() else {
+            return false;
+        };
+        coordinator.handle_fact(acquisition::AcquisitionEvent::Heartbeat);
+        true
+    }
+
+    /// Feed an LCL-install fact so the coordinator can transition
+    /// `Syncing -> Tracking` when the acquired target is installed as the last
+    /// closed ledger. Returns false unless installed.
+    pub fn coordinator_lcl_installed(&self, identity: acquisition::LedgerIdentity) -> bool {
+        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let Some(coordinator) = guard.as_mut() else {
+            return false;
+        };
+        coordinator.handle_fact(acquisition::AcquisitionEvent::LclInstalled(identity));
+        true
+    }
+
+    /// Feed a preferred-LCL divergence fact (rippled `consensusViewChange`
+    /// parity). Demotes `Connected/Tracking/Full -> Syncing { target }` without
+    /// minting a session. Returns false unless installed, so the legacy strand
+    /// writer remains authoritative when the coordinator is absent.
+    pub fn coordinator_preferred_lcl_divergence(&self, target: acquisition::LedgerTarget) -> bool {
+        let failures = {
+            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let Some(coordinator) = guard.as_mut() else {
+                return false;
+            };
+            coordinator.preferred_lcl_divergence(target);
+            coordinator.drain();
+            coordinator.take_terminal_failures()
+        };
+        self.record_coordinator_failures(failures);
+        true
+    }
+
+    /// Feed a no-consensus-positions fact (Quaxar-specific). Demotes
+    /// `Full -> Connected` when consensus accepted a round with no usable peer
+    /// positions. Returns false unless installed.
+    pub fn coordinator_blocked_with_no_target(&self) -> bool {
+        let failures = {
+            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let Some(coordinator) = guard.as_mut() else {
+                return false;
+            };
+            coordinator.blocked_with_no_target();
+            coordinator.drain();
+            coordinator.take_terminal_failures()
+        };
+        self.record_coordinator_failures(failures);
+        true
+    }
+
+    /// Feed a publication-committed fact. `fresh` is the adapter's
+    /// validated-chain freshness observation; the coordinator owns the rule
+    /// that `Tracking -> Full` requires a matching, fresh publication. Returns
+    /// false unless installed.
+    pub fn coordinator_publication_committed(
+        &self,
+        identity: acquisition::LedgerIdentity,
+        fresh: bool,
+    ) -> bool {
+        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let Some(coordinator) = guard.as_mut() else {
+            return false;
+        };
+        coordinator
+            .handle_fact(acquisition::AcquisitionEvent::PublicationCommitted { identity, fresh });
+        true
+    }
+
+    /// Submit a durable-handoff acknowledgement after the NetworkOps recipient
+    /// has processed the exact completed-ledger item. This bridge owns no
+    /// lifecycle decision: it only enqueues the typed acknowledgement for the
+    /// installed coordinator. The strand drains it on its next owner turn, so
+    /// no completed-ledger receiver/resource lock invokes coordinator logic.
+    pub(crate) fn acknowledge_coordinator_durable_handoff(
+        &self,
+        handoff: DurableHandoffId,
+        session: SessionRef,
+    ) -> bool {
+        let guard = self.coordinator.lock().expect("coordinator lock");
+        let Some(coordinator) = guard.as_ref() else {
+            return false;
+        };
+        coordinator.try_push_control(AcquisitionEvent::DurableHandoffAcknowledged(
+            DurableHandoffAcknowledgement::new(handoff, session),
+        ))
+    }
+
+    /// Report that the NetworkOps recipient could not accept an exact durable
+    /// handoff. This only reopens and queues a retry; it does not drain or run
+    /// coordinator state while the completed-ledger receiver may be locked.
+    pub(crate) fn reject_coordinator_durable_handoff(
+        &self,
+        handoff: DurableHandoffId,
+        session: SessionRef,
+    ) -> bool {
+        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let Some(coordinator) = guard.as_mut() else {
+            return false;
+        };
+        coordinator.recipient_rejected_durable_handoff(handoff, session)
+    }
+
+    /// The coordinator's immutable observer snapshot, for status consumers.
+    pub fn coordinator_snapshot(&self) -> Option<RunnerSnapshot> {
+        self.coordinator
+            .lock()
+            .expect("coordinator lock")
+            .as_ref()
+            .map(|adapter| adapter.snapshot())
+    }
+
+    /// True when rippled's recent-failure cache must suppress non-consensus
+    /// re-admission. Consensus remains exempt because an advancing preferred
+    /// LCL must be allowed to retry independently of history backfill.
+    fn should_defer_coordinator_acquire(&self, hash: &Uint256, reason: AcquireReason) -> bool {
+        reason != AcquireReason::Consensus && self.is_failure(hash)
+    }
+
+    /// Request a coordinator-owned acquisition. Mirrors `acquire`'s rejection
+    /// guards; returns the minted session identity, the registry acquisition
+    /// id, and the effects the coordinator emitted so the caller can trace
+    /// peer request, timer, and phase transitions without reading coordinator
+    /// internals.
+    pub(crate) fn coordinator_acquire(
+        &self,
+        hash: Uint256,
+        seq: u32,
+        reason: AcquireReason,
+    ) -> Option<CoordinatorAcquireOutcome> {
+        if hash.is_zero() {
+            tracing::warn!(target: "inbound_ledger", "coordinator_acquire: REJECTED zero hash");
+            return None;
+        }
+        if self.stopping.load(Ordering::Acquire) {
+            tracing::warn!(target: "inbound_ledger", %hash, "coordinator_acquire: REJECTED stopping");
+            return None;
+        }
+        if self.need_network_ledger.load(Ordering::Acquire)
+            && reason != AcquireReason::Generic
+            && reason != AcquireReason::Consensus
+        {
+            tracing::info!(
+                target: "inbound_ledger",
+                %hash,
+                seq,
+                "coordinator_acquire: REJECTED need_network_ledger"
+            );
+            return None;
+        }
+        if self.should_defer_coordinator_acquire(&hash, reason) {
+            tracing::debug!(
+                target: "inbound_ledger",
+                %hash,
+                seq,
+                ?reason,
+                cooldown_secs = FAILURE_COOLDOWN.as_secs(),
+                "coordinator_acquire: suppressed recent failed history target"
+            );
+            return None;
+        }
+        let mut coordinator_guard = self.coordinator.lock().expect("coordinator lock");
+        let coordinator = coordinator_guard.as_mut()?;
+
+        let acquisition_id = self.next_acquisition_id.fetch_add(1, Ordering::Relaxed);
+        let inbound_reason = match reason {
+            AcquireReason::History => ledger::InboundLedgerReason::History,
+            AcquireReason::Generic => ledger::InboundLedgerReason::Generic,
+            AcquireReason::Consensus => ledger::InboundLedgerReason::Consensus,
+        };
+        self.coordinator_origins.register(hash, seq, inbound_reason);
+
+        coordinator.refresh_peers(self.coordinator_peer_snapshot());
+        let peers = self
+            .coordinator_peer_snapshot()
+            .iter()
+            .map(|peer| peer.id())
+            .collect::<Vec<_>>();
+        let peerless = peers.is_empty();
+        // A prior peerless demand may mint its session as this connectivity
+        // fact restores peers; let that existing pending origin bind first.
+        coordinator.connectivity(&peers);
+        // Bind this demand before it reaches the runner. `SessionStarted` is
+        // dispatched before the first peer send, including when replayed later
+        // after a peerless interval. The port retains one such binding only
+        // while peerless, matching the runner's one retained demand.
+        coordinator.register_pending_handoff_origin(hash, reason, acquisition_id);
+        let effects = coordinator.acquire_requested(
+            LedgerTarget::new(hash, (seq != 0).then_some(seq)),
+            match reason {
+                AcquireReason::History => acquisition::AcquireReason::History,
+                AcquireReason::Generic => acquisition::AcquireReason::Generic,
+                AcquireReason::Consensus => acquisition::AcquireReason::Consensus,
+            },
+        );
+        let session = effects.iter().find_map(|effect| match effect {
+            AcquisitionEffect::SessionStarted(session) => Some(*session),
+            _ => None,
+        });
+        if !peerless && session.is_none() {
+            // With usable peers, an empty start effect means coalescing or
+            // rejection, not deferred replay; retaining it could bind a later
+            // unrelated replacement session for the same target.
+            coordinator.clear_pending_handoff_origin(hash);
+        }
+        let Some(session) = session else {
+            // An exact active target is intentionally coalesced by the runner:
+            // it emits no second SendLedgerRequest and retains the original
+            // session/handoff owner. Rejection (for example capacity or an
+            // illegal phase) also emits no request. Neither case means a
+            // session-creation fault, so keep this as a diagnostic rather than
+            // a high-volume false warning during normal consensus polling.
+            tracing::debug!(
+                target: "inbound_ledger",
+                %hash,
+                seq,
+                ?reason,
+                "coordinator_acquire: request emitted no new session effect (coalesced or rejected)"
+            );
+            return None;
+        };
+        let handled = coordinator.drain();
+        let failures = coordinator.take_terminal_failures();
+        drop(coordinator_guard);
+        self.record_coordinator_failures(failures);
+        tracing::info!(
+            target: "inbound_ledger",
+            %hash,
+            seq,
+            ?reason,
+            session_id = session.session_id().get(),
+            acquisition_id,
+            handled,
+            "coordinator_acquire: session requested"
+        );
+        Some(CoordinatorAcquireOutcome {
+            session,
+            acquisition_id,
+            effects,
+        })
+    }
+
+    /// Route a wire `TmLedgerData` reply to a coordinator session through the
+    /// immutable routing snapshot and the per-session admission gate. The
+    /// overlay never mutates coordinator state; a deferred or unmatched reply
+    /// has no session-side effect.
+    pub(crate) fn coordinator_route_ledger_data(
+        &self,
+        peer_id: overlay::PeerId,
+        message: &overlay::TmLedgerData,
+    ) -> LedgerDataIngressDisposition {
+        let ingress = self
+            .coordinator_ingress
+            .read()
+            .expect("coordinator ingress read")
+            .clone();
+        let Some(ingress) = ingress else {
+            return LedgerDataIngressDisposition::Unmatched;
+        };
+        ingress.route_ledger_data(peer_id, message)
+    }
+
+    /// Terminalize every coordinator session, drain its cancellation effects,
+    /// and remove published routes before any dependent broker, timer, worker,
+    /// or NodeStore resource is stopped. Late completions are then stale.
+    pub fn coordinator_shutdown(&self) {
+        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let Some(coordinator) = guard.as_mut() else {
+            return;
+        };
+        coordinator.handle_fact(acquisition::AcquisitionEvent::Shutdown);
     }
 
     /// Install the app-owned `LedgerMaster::storeLedger` equivalent used by
@@ -901,7 +1453,45 @@ impl InboundLedgers {
             return None;
         }
 
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        // M4.2-C3 coordinator switchover. When the coordinator owns session
+        // lifecycle this is the only entry point. Re-acquire resolves only an
+        // already-completed ledger held in the legacy completed index (rippled
+        // `InboundLedgers::acquire` returns null for any ledger the registry
+        // does not already hold). Every new start is delegated to the
+        // coordinator, which notifies exactly once through the completed-ledger
+        // channel after its durability fence; `acquire` therefore returns
+        // `None` for new coordinator sessions, exactly like rippled. A caller
+        // that re-requests a target the coordinator already completed and
+        // consumed may trigger a redundant re-acquisition; this is the same
+        // cost rippled pays and the completed-ledger channel deduplicates the
+        // durable handoff.
+        if self.coordinator_installed() {
+            let inner = timed_inner_lock(&self.inner);
+            let completed = inner.entries.get(&hash).and_then(|entry| {
+                if entry.completed_ledger.is_some() {
+                    entry.completed_ledger.clone()
+                } else if entry.state.completed.load(Ordering::Acquire) {
+                    entry.state.completed_ledger()
+                } else {
+                    None
+                }
+            });
+            drop(inner);
+            if let Some(ledger) = completed {
+                tracing::info!(
+                    target: "inbound_ledger",
+                    %hash,
+                    seq,
+                    ?reason,
+                    "acquire: coordinator mode reused completed ledger"
+                );
+                return Some(ledger);
+            }
+            self.coordinator_acquire(hash, seq, reason);
+            return None;
+        }
+
+        let mut inner = timed_inner_lock(&self.inner);
 
         // Existing acquisition: a failed one returns immediately, exactly as
         // rippled checks `InboundLedger::isFailed()` before `update()`. Do
@@ -957,10 +1547,7 @@ impl InboundLedgers {
             // sequence from another acquisition identity.
             let canonical_seq = state.seq();
             if canonical_seq != 0 {
-                let mut inner = self
-                    .inner
-                    .lock()
-                    .expect("inbound_ledgers sequence update lock");
+                let mut inner = timed_inner_lock(&self.inner);
                 if let Some(entry) = inner.entries.get_mut(&hash)
                     && entry.id == entry_id
                     && entry.seq == 0
@@ -1050,7 +1637,7 @@ impl InboundLedgers {
             let publication_advance_notifier = Arc::clone(&self.publication_advance_notifier);
             Arc::new(move |failed_hash| {
                 let (revoke, transitioned) = {
-                    let mut inner = inner.lock().expect("inbound_ledgers failure recorder lock");
+                    let mut inner = timed_inner_lock(&inner);
                     let (revoke, transitioned) =
                         inner
                             .entries
@@ -1310,8 +1897,16 @@ impl InboundLedgers {
         hash: &Uint256,
         packet: &InboundLedgerPacket,
     ) -> LedgerDataAdmission {
+        // Coordinator-mode packets either carry a coordinator admission lease
+        // or are unmatched. Never probe the legacy actor registry after the
+        // switchover: bootstrap retains the rippled-equivalent unmatched
+        // state-node fetch-pack path and base/transaction peer charge without
+        // granting an actor mailbox any post-install authority.
+        if self.coordinator_installed() {
+            return LedgerDataAdmission::Unmatched;
+        }
         let state = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let inner = timed_inner_lock(&self.inner);
             let Some(entry) = inner.entries.get(hash) else {
                 return LedgerDataAdmission::Unmatched;
             };
@@ -1346,11 +1941,17 @@ impl InboundLedgers {
         response_seq: Option<u32>,
         packet: InboundLedgerPacket,
     ) -> LedgerDataRouteDisposition {
+        // A live legacy lease prevents coordinator installation, but preserve
+        // the invariant defensively for a raced/cancelled caller: no legacy
+        // actor consumes a response after the coordinator becomes owner.
+        if self.coordinator_installed() {
+            return LedgerDataRouteDisposition::Unmatched;
+        }
         self.lifecycle
             .route_attempts
             .fetch_add(1, Ordering::Relaxed);
         let state = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let inner = timed_inner_lock(&self.inner);
             let Some(entry) = inner.entries.get(hash) else {
                 return LedgerDataRouteDisposition::Unmatched;
             };
@@ -1406,11 +2007,16 @@ impl InboundLedgers {
         response_seq: Option<u32>,
         packet: InboundLedgerPacket,
     ) -> LedgerDataRouteDisposition {
+        // Direct callers are also compatibility-only after installation; do
+        // not let them bypass coordinator ingress and advance an actor.
+        if self.coordinator_installed() {
+            return LedgerDataRouteDisposition::Unmatched;
+        }
         self.lifecycle
             .route_attempts
             .fetch_add(1, Ordering::Relaxed);
         let state = {
-            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let mut inner = timed_inner_lock(&self.inner);
             let Some(entry) = inner.entries.get_mut(hash) else {
                 self.lifecycle.route_misses.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
@@ -1524,7 +2130,7 @@ impl InboundLedgers {
         // inbound-ledger cache rather than retaining stale peer data forever.
         self.fetch_pack.sweep();
         let now = Instant::now();
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        let mut inner = timed_inner_lock(&self.inner);
         let mut to_remove = Vec::new();
 
         for (hash, entry) in &inner.entries {
@@ -1660,7 +2266,7 @@ impl InboundLedgers {
     pub fn fetch_info_bounded(&self, limit: usize) -> JsonValue {
         let limit = limit.min(FETCH_INFO_MAX_ACQUISITIONS);
         let (entries, active, completed, failed, recent_failures, decision) = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let inner = timed_inner_lock(&self.inner);
             let mut active = 0u64;
             let mut completed = 0u64;
             let mut failed = 0u64;
@@ -1755,21 +2361,138 @@ impl InboundLedgers {
             JsonValue::String(format!("{lifecycle:?}")),
         );
         result.insert(
+            "coordinator".to_owned(),
+            Self::coordinator_snapshot_json(self.coordinator_snapshot()),
+        );
+        result.insert(
             "last_recovery_lcl_decision".to_owned(),
             recovery_lcl_decision_json(decision),
         );
         JsonValue::Object(result)
     }
 
+    fn coordinator_snapshot_json(snapshot: Option<RunnerSnapshot>) -> JsonValue {
+        let Some(snapshot) = snapshot else {
+            return JsonValue::Null;
+        };
+        let active_by_reason = snapshot
+            .active_by_reason()
+            .iter()
+            .map(|(reason, count)| {
+                (
+                    format!("{reason:?}").to_ascii_lowercase(),
+                    JsonValue::Unsigned(*count as u64),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let cancelled_by_reason = snapshot
+            .cancelled_by_reason()
+            .iter()
+            .map(|(reason, count)| (reason.label().to_owned(), JsonValue::Unsigned(*count)))
+            .collect::<BTreeMap<_, _>>();
+        let failed_by_reason = snapshot
+            .failed_by_reason()
+            .iter()
+            .map(|(reason, count)| (reason.label().to_owned(), JsonValue::Unsigned(*count)))
+            .collect::<BTreeMap<_, _>>();
+        JsonValue::Object(BTreeMap::from([
+            (
+                "run_epoch".to_owned(),
+                JsonValue::Unsigned(snapshot.run_epoch().get()),
+            ),
+            (
+                "phase".to_owned(),
+                JsonValue::String(format!("{:?}", snapshot.phase())),
+            ),
+            (
+                "sessions".to_owned(),
+                JsonValue::Unsigned(snapshot.session_count() as u64),
+            ),
+            (
+                "active_by_reason".to_owned(),
+                JsonValue::Object(active_by_reason),
+            ),
+            (
+                "storage_generation".to_owned(),
+                JsonValue::Unsigned(snapshot.storage_generation().get()),
+            ),
+            (
+                "peers".to_owned(),
+                JsonValue::Unsigned(snapshot.peer_count() as u64),
+            ),
+            (
+                "events_handled".to_owned(),
+                JsonValue::Unsigned(snapshot.events_handled()),
+            ),
+            (
+                "rejected_events".to_owned(),
+                JsonValue::Unsigned(snapshot.rejected_events()),
+            ),
+            (
+                "sessions_started".to_owned(),
+                JsonValue::Unsigned(snapshot.sessions_started()),
+            ),
+            (
+                "sessions_cancelled".to_owned(),
+                JsonValue::Unsigned(snapshot.sessions_cancelled()),
+            ),
+            (
+                "cancelled_by_reason".to_owned(),
+                JsonValue::Object(cancelled_by_reason),
+            ),
+            (
+                "failed_by_reason".to_owned(),
+                JsonValue::Object(failed_by_reason),
+            ),
+            (
+                "sessions_completed".to_owned(),
+                JsonValue::Unsigned(snapshot.sessions_completed()),
+            ),
+            (
+                "handoff_rejections".to_owned(),
+                JsonValue::Unsigned(snapshot.handoff_rejections()),
+            ),
+            (
+                "peer_requests".to_owned(),
+                JsonValue::Unsigned(snapshot.peer_requests()),
+            ),
+            (
+                "timers_armed".to_owned(),
+                JsonValue::Unsigned(snapshot.timers_armed()),
+            ),
+            (
+                "packets_admitted".to_owned(),
+                JsonValue::Unsigned(snapshot.packets_admitted()),
+            ),
+            (
+                "packets_dropped".to_owned(),
+                JsonValue::Unsigned(snapshot.packets_dropped()),
+            ),
+            (
+                "plan_turns".to_owned(),
+                JsonValue::Unsigned(snapshot.plan_turns()),
+            ),
+            (
+                "fetch_pack_advances".to_owned(),
+                JsonValue::Unsigned(snapshot.fetch_pack_advances()),
+            ),
+            ("shutdown".to_owned(), JsonValue::Bool(snapshot.shutdown())),
+            (
+                "stale_events".to_owned(),
+                JsonValue::Unsigned(snapshot.stale_events()),
+            ),
+        ]))
+    }
+
     /// Check if tracking a hash.
     pub fn contains(&self, hash: &Uint256) -> bool {
-        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        let inner = timed_inner_lock(&self.inner);
         inner.entries.contains_key(hash)
     }
 
     /// Number of in-progress acquisitions.
     pub fn active_count(&self) -> usize {
-        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        let inner = timed_inner_lock(&self.inner);
         inner
             .entries
             .values()
@@ -1783,7 +2506,7 @@ impl InboundLedgers {
     #[cfg(test)]
     pub fn on_complete(&self, hash: Uint256, ledger: Arc<Ledger>) {
         let completion_id = {
-            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let mut inner = timed_inner_lock(&self.inner);
             let completion_id = if let Some(entry) = inner.entries.get_mut(&hash) {
                 if entry.completed_ledger.is_none() {
                     entry.completed_ledger = Some(ledger);
@@ -1808,7 +2531,7 @@ impl InboundLedgers {
     /// Notify that a ledger acquisition failed.
     pub fn on_failed(&self, hash: Uint256) {
         let state = {
-            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let mut inner = timed_inner_lock(&self.inner);
             record_recent_failure(&mut inner, hash, None);
             inner
                 .entries
@@ -1824,7 +2547,7 @@ impl InboundLedgers {
     /// Log a failure for the given hash/seq (matches rippled's `logFailure`).
     pub fn log_failure(&self, hash: Uint256, _seq: u32) {
         {
-            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let mut inner = timed_inner_lock(&self.inner);
             record_recent_failure(&mut inner, hash, None);
         }
         self.notify_publication_advance();
@@ -1834,7 +2557,7 @@ impl InboundLedgers {
     /// NodeStore barrier remains provisional. Callers may use it only as a
     /// wait key; it never grants adoption authority outside NetworkOps.
     pub(crate) fn provisional_identity(&self, hash: &Uint256) -> Option<ProvisionalLedgerIdentity> {
-        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        let inner = timed_inner_lock(&self.inner);
         inner.entries.get(hash).and_then(|entry| {
             (!entry.failed
                 && entry.completed_ledger.is_some()
@@ -1848,7 +2571,7 @@ impl InboundLedgers {
     /// NodeStore durability fence has not succeeded. Resolver access remains
     /// available; validation, LCL, and publication owners must not adopt it.
     pub(crate) fn is_provisional(&self, hash: &Uint256) -> bool {
-        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        let inner = timed_inner_lock(&self.inner);
         inner.entries.get(hash).is_some_and(|entry| {
             !entry.failed
                 && entry.completed_ledger.is_some()
@@ -1859,7 +2582,7 @@ impl InboundLedgers {
     /// Check whether a hash is recorded as a recent failure (matches rippled's
     /// `isFailure`). Expires entries older than `FAILURE_COOLDOWN` (5 minutes).
     pub fn is_failure(&self, hash: &Uint256) -> bool {
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        let mut inner = timed_inner_lock(&self.inner);
         inner
             .recent_failures
             .retain(|_, t| t.elapsed() < FAILURE_COOLDOWN);
@@ -1873,7 +2596,7 @@ impl InboundLedgers {
     /// `clearFailures`).
     pub fn clear_failures(&self) {
         let states = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let inner = timed_inner_lock(&self.inner);
             inner
                 .entries
                 .values()
@@ -1886,7 +2609,7 @@ impl InboundLedgers {
             state.cancel();
         }
         let changed = {
-            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let mut inner = timed_inner_lock(&self.inner);
             let changed = !inner.entries.is_empty()
                 || !inner.recent_failures.is_empty()
                 || !inner.completed_ready.is_empty();
@@ -1900,10 +2623,15 @@ impl InboundLedgers {
         }
     }
 
-    /// Send current peers to all active acquisition workers.
+    /// Send current peers to all active legacy acquisition workers. Once the
+    /// coordinator is installed it owns peer availability through typed facts;
+    /// no registry actor is advanced from this compatibility API.
     pub fn send_peers(&self, peers: &[Arc<dyn Peer>]) {
+        if self.coordinator_installed() {
+            return;
+        }
         let states: Vec<Arc<AcquisitionState>> = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let inner = timed_inner_lock(&self.inner);
             inner
                 .entries
                 .values()
@@ -1957,7 +2685,10 @@ impl InboundLedgers {
     /// Complete the one LedgerMaster single-flight fetch-pack pass. It snapshots
     /// active acquisitions and schedules their local checks through the ready
     /// set, matching rippled `InboundLedgers::gotFetchPack()` without N direct
-    /// worker submissions.
+    /// worker submissions. Coordinator-owned sessions live outside the legacy
+    /// registry, so the same pass completion is delivered to the coordinator as
+    /// a typed fact: it re-advances each live session against the refreshed
+    /// fetch-pack cache.
     pub fn finish_fetch_pack_pass(&self) {
         let generation = {
             let mut wakes = self.fetch_pack_wakes.lock().expect("fetch-pack wake lock");
@@ -1969,35 +2700,41 @@ impl InboundLedgers {
             wakes.pending_hashes.clear();
             wakes.next_generation
         };
-        let states: Vec<Arc<AcquisitionState>> = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
-            inner
-                .entries
-                .values()
-                .filter_map(|entry| {
-                    (!entry.failed && entry.completed_ledger.is_none())
-                        .then(|| Arc::clone(&entry.state))
-                })
-                .collect()
-        };
-        for state in states {
-            if state.note_fetch_pack_generation(generation) {
-                self.scheduler.wake(
-                    AcquisitionKey {
-                        hash: *state.hash.as_uint256(),
-                        id: state.acquisition_id,
-                    },
-                    &state,
-                    ReadyCause::FETCH_PACK,
-                );
+        if !self.coordinator_installed() {
+            let states: Vec<Arc<AcquisitionState>> = {
+                let inner = timed_inner_lock(&self.inner);
+                inner
+                    .entries
+                    .values()
+                    .filter(|entry| !entry.failed && entry.completed_ledger.is_none())
+                    .map(|entry| Arc::clone(&entry.state))
+                    .collect()
+            };
+            for state in states {
+                if state.note_fetch_pack_generation(generation) {
+                    self.scheduler.wake(
+                        AcquisitionKey {
+                            hash: *state.hash.as_uint256(),
+                            id: state.acquisition_id,
+                        },
+                        &state,
+                        ReadyCause::FETCH_PACK,
+                    );
+                }
             }
+        }
+        if let Some(coordinator) = self.coordinator.lock().expect("coordinator lock").as_ref() {
+            // Fetch-pack availability is a coalescible wake: cached objects
+            // remain queryable and a later wake/turn rechecks them. Never wait
+            // on the bounded owner queue while holding its adapter mutex.
+            let _ = coordinator.try_push_control(acquisition::AcquisitionEvent::FetchPackAvailable);
         }
     }
 
     /// Remove a specific entry.
     pub fn remove(&self, hash: &Uint256) {
         let state = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let inner = timed_inner_lock(&self.inner);
             inner
                 .entries
                 .get(hash)
@@ -2009,7 +2746,7 @@ impl InboundLedgers {
             let acquisition_id = state.acquisition_id;
             state.cancel();
             let removed = {
-                let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+                let mut inner = timed_inner_lock(&self.inner);
                 let exact_entry = inner.entries.get(hash).is_some_and(|entry| {
                     entry.id == acquisition_id && Arc::ptr_eq(&entry.state, &state)
                 });
@@ -2031,8 +2768,13 @@ impl InboundLedgers {
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
 
+        // Phase 3 ordering: coordinator Shutdown terminalizes sessions, drains
+        // CancelSession effects through the ports, and refreshes routes before
+        // the registry stops the broker, timers, and worker pool.
+        self.coordinator_shutdown();
+
         let states = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let inner = timed_inner_lock(&self.inner);
             inner
                 .entries
                 .values()
@@ -2043,7 +2785,7 @@ impl InboundLedgers {
             state.cancel();
         }
         {
-            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let mut inner = timed_inner_lock(&self.inner);
             inner.entries.clear();
             inner.recent_failures.clear();
             inner.completed_ready.clear();
@@ -2075,7 +2817,7 @@ impl InboundLedgers {
             return Vec::new();
         }
 
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        let mut inner = timed_inner_lock(&self.inner);
         // Examine only the entries that were ready at this poll's start. This
         // avoids returning the same unacknowledged completion repeatedly when
         // the caller's budget exceeds the ready queue length. The budget counts
@@ -2120,7 +2862,7 @@ impl InboundLedgers {
     /// A failed persistence attempt must not call this: the completed state is
     /// retained so the owner can retry on a later bounded poll.
     pub fn acknowledge_completed(&self, hash: &Uint256, acquisition_id: u64) {
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        let mut inner = timed_inner_lock(&self.inner);
         let acknowledged = inner.entries.get_mut(hash).and_then(|entry| {
             let completed = !entry.failed
                 && !entry.state.failed.load(Ordering::Acquire)
@@ -2161,7 +2903,7 @@ impl InboundLedgers {
 
     /// Check if a specific hash is currently in-progress (not completed, not failed).
     pub fn is_in_progress(&self, hash: &Uint256) -> bool {
-        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        let inner = timed_inner_lock(&self.inner);
         inner.entries.get(hash).is_some_and(|e| {
             !e.failed && e.completed_ledger.is_none() && !e.state.completed.load(Ordering::Acquire)
         })
@@ -2174,7 +2916,7 @@ impl InboundLedgers {
             return 0;
         }
         let candidates = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let inner = timed_inner_lock(&self.inner);
             inner
                 .entries
                 .iter()
@@ -2191,7 +2933,7 @@ impl InboundLedgers {
             state.cancel();
         }
         let count = {
-            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let mut inner = timed_inner_lock(&self.inner);
             let mut count = 0;
             for (hash, acquisition_id, state) in &candidates {
                 let exact_entry = inner.entries.get(hash).is_some_and(|entry| {
@@ -2215,7 +2957,7 @@ impl InboundLedgers {
 
     /// Log-visible summary shaped after reference InboundLedgers::getInfo.
     pub fn info_summary(&self) -> String {
-        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        let inner = timed_inner_lock(&self.inner);
         let active = inner
             .entries
             .values()
@@ -2268,7 +3010,7 @@ impl InboundLedgers {
     /// cache/persistence handling, so they must not block the next history
     /// predecessor request.
     pub fn has_entry_for_seq_or_hash(&self, seq: u32, hash: &Uint256) -> bool {
-        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        let inner = timed_inner_lock(&self.inner);
         inner.entries.iter().any(|(entry_hash, entry)| {
             !entry.failed
                 && !entry.state.failed.load(Ordering::Acquire)
@@ -2284,7 +3026,7 @@ impl InboundLedgers {
     pub fn remove_stale_no_progress(&self, idle_timeout: Duration) -> Vec<(Uint256, u32)> {
         let now = Instant::now();
         let removed = {
-            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let mut inner = timed_inner_lock(&self.inner);
             let stale = inner
                 .entries
                 .iter()
@@ -2351,7 +3093,7 @@ impl InboundLedgers {
         // be zero for preferred-LCL recovery; rank by the actual completed
         // ledger header rather than the original request sequence.
         let candidates: Vec<_> = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let inner = timed_inner_lock(&self.inner);
             inner
                 .entries
                 .values()
@@ -2410,7 +3152,7 @@ impl InboundLedgers {
         // learned ledger header so completed hash-only recovery candidates
         // participate even though their initial request sequence was zero.
         let candidates: Vec<_> = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let inner = timed_inner_lock(&self.inner);
             inner
                 .entries
                 .values()
@@ -2463,14 +3205,17 @@ impl std::fmt::Debug for InboundLedgers {
 mod tests {
     use super::super::acquisition::{
         ACQ_MAILBOX_BYTE_CAPACITY, ACQ_MAILBOX_PACKET_CAPACITY, AcquisitionSnapshot,
+        SequencePromotionAttempt, SequenceRoutePause,
     };
     use super::super::worker_pool::WorkerPool;
     use super::{
-        AcquireReason, AcquisitionLifecycleCounters, AcquisitionLifecycleSnapshot, InboundLedgers,
-        RecoveryLclDecision, RegistryInner, SWEEP_IDLE_TIMEOUT, acquisition_snapshot_json,
-        failure_matches_entry, record_recent_failure, record_recent_failure_at,
-        recovery_lcl_decision_json, response_sequence_matches_request,
+        AcquireReason, AcquisitionLifecycleCounters, AcquisitionLifecycleSnapshot,
+        CompletedInboundLedger, InboundLedgers, LedgerDataRouteDisposition, RecoveryLclDecision,
+        RegistryInner, SWEEP_IDLE_TIMEOUT, acquisition_snapshot_json, failure_matches_entry,
+        record_recent_failure, record_recent_failure_at, recovery_lcl_decision_json,
+        response_sequence_matches_request,
     };
+    use acquisition::{DurableHandoffId, IdCounter, SessionRef, StoreGeneration};
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;
     use basics::hardened_hash::HardenedHashBuilder;
@@ -2558,6 +3303,41 @@ mod tests {
     ) -> Arc<super::super::acquisition::AcquisitionState> {
         let inner = registry.inner.lock().expect("registry lock");
         Arc::clone(&inner.entries.get(hash).expect("active acquisition").state)
+    }
+
+    #[test]
+    fn completed_inbound_ledger_requires_complete_coordinator_identity_for_ack() {
+        let mut ids = IdCounter::new();
+        let session = SessionRef::new(
+            ids.next_id(),
+            ids.next_id(),
+            Uint256::from(1),
+            ids.next_id(),
+            StoreGeneration::new(1),
+        );
+        let ledger = Arc::new(Ledger::from_ledger_seq_and_close_time(1, 1, false));
+        let complete = CompletedInboundLedger {
+            ledger: Arc::clone(&ledger),
+            reason: AcquireReason::Consensus,
+            acquisition_id: 1,
+            from_coordinator: true,
+            durable_handoff: Some(DurableHandoffId::new(7)),
+            coordinator_session: Some(session),
+        };
+        assert_eq!(
+            complete.coordinator_handoff(),
+            Some((DurableHandoffId::new(7), session))
+        );
+
+        let legacy = CompletedInboundLedger {
+            ledger,
+            reason: AcquireReason::Consensus,
+            acquisition_id: 1,
+            from_coordinator: false,
+            durable_handoff: None,
+            coordinator_session: None,
+        };
+        assert_eq!(legacy.coordinator_handoff(), None);
     }
 
     #[test]
@@ -2814,6 +3594,478 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_mode_bypasses_legacy_response_admission() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(Arc::clone(&worker_pool));
+        registry.set_phase_state(Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        )));
+        assert!(registry.install_coordinator());
+
+        let packet = InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new());
+        assert!(matches!(
+            registry.reserve_response_admission(&Uint256::from_array([0xC5; 32]), &packet),
+            super::LedgerDataAdmission::Unmatched
+        ));
+        assert_eq!(
+            registry
+                .route_response_with_seq(&Uint256::from_array([0xC5; 32]), 99, Some(1), packet,),
+            super::LedgerDataRouteDisposition::Unmatched
+        );
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(
+            worker_pool.snapshot().queued_jobs,
+            0,
+            "coordinator-mode unmatched traffic must not wake a legacy actor"
+        );
+        registry.stop();
+    }
+
+    #[test]
+    fn coordinator_install_rejects_an_unacknowledged_legacy_completion() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(48, 1_000, false);
+        ledger.set_immutable(true);
+        let ledger = Arc::new(ledger);
+        let hash = *ledger.header().hash.as_uint256();
+        assert!(
+            registry
+                .acquire(hash, 0, AcquireReason::Consensus)
+                .is_none()
+        );
+        registry.on_complete(hash, Arc::clone(&ledger));
+        active_state(&registry, &hash).cancel();
+        registry.set_phase_state(Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        )));
+
+        assert!(
+            !registry.install_coordinator(),
+            "the legacy ready-queue handoff must finish before coordinator ownership starts"
+        );
+        let completed = registry.poll_results_bounded(1);
+        assert_eq!(completed.len(), 1);
+        registry.acknowledge_completed(&hash, completed[0].1);
+        assert!(
+            registry.install_coordinator(),
+            "an acknowledged terminal legacy cache entry no longer owns lifecycle work"
+        );
+        registry.stop();
+    }
+
+    #[test]
+    fn coordinator_install_rejects_a_live_legacy_actor() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let hash = Uint256::from_array([0xC4; 32]);
+        assert!(registry.acquire(hash, 1, AcquireReason::Generic).is_none());
+        let legacy = active_state(&registry, &hash);
+        registry.set_phase_state(Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        )));
+
+        assert!(
+            !registry.install_coordinator(),
+            "a live legacy actor and coordinator must never become concurrent session owners"
+        );
+        assert!(!registry.coordinator_installed());
+        assert!(
+            !legacy.stopped.load(Ordering::Acquire),
+            "a rejected install preserves the explicit coordinator-absent compatibility path"
+        );
+        registry.stop();
+    }
+
+    #[test]
+    fn fetch_pack_pass_notifies_the_coordinator_when_installed() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        registry.set_phase_state(Arc::new(
+            crate::network::network_ops::SharedNetworkOpsState::new(
+                crate::network::network_ops::NetworkOpsOperatingMode::Disconnected,
+            ),
+        ));
+        assert!(
+            registry.install_coordinator(),
+            "node store and phase state enable the coordinator install"
+        );
+        assert_eq!(
+            registry.coordinator_drain(),
+            0,
+            "no events are queued before any pass"
+        );
+        registry.finish_fetch_pack_pass();
+        assert_eq!(
+            registry.coordinator_drain(),
+            1,
+            "the pass completion reaches the coordinator as a typed fact"
+        );
+        registry.stop();
+    }
+
+    #[test]
+    fn peer_availability_fact_and_heartbeat_route_through_the_coordinator() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let state = Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        ));
+        registry.set_phase_state(Arc::clone(&state));
+        assert!(registry.install_coordinator());
+
+        // Without the coordinator installed the bridge reports false.
+        let (_dir2, registry2) = registry_with_manual_worker_pool(Arc::new(WorkerPool::new(0)));
+        assert!(!registry2.coordinator_report_peer_availability(&[]));
+        assert!(!registry2.coordinator_heartbeat());
+
+        // A usable-peer fact motivates Disconnected -> Connected and derives
+        // need_network_ledger through the phase port.
+        assert!(registry.coordinator_report_peer_availability(&[1u32]));
+        assert_eq!(
+            state.operating_mode(),
+            NetworkOpsOperatingMode::Connected,
+            "the coordinator alone publishes the mode from the fact"
+        );
+        assert!(
+            state.need_network_ledger(),
+            "need_network_ledger is derived from the coordinator phase"
+        );
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &acquisition::SyncPhase::Connected
+        );
+
+        // The heartbeat re-publishes the phase for normalization without
+        // changing sessions.
+        assert!(registry.coordinator_heartbeat());
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &acquisition::SyncPhase::Connected
+        );
+
+        // A peer-loss fact demotes Connected -> Disconnected and derives
+        // need_network_ledger false through the phase port.
+        assert!(registry.coordinator_report_peer_availability(&[]));
+        assert_eq!(
+            state.operating_mode(),
+            NetworkOpsOperatingMode::Disconnected
+        );
+        assert!(!state.need_network_ledger());
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &acquisition::SyncPhase::Disconnected
+        );
+        registry.stop();
+    }
+
+    #[test]
+    fn startup_fact_seeds_the_initial_phase_and_never_mints_a_session() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let state = Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        ));
+        registry.set_phase_state(Arc::clone(&state));
+        assert!(registry.install_coordinator());
+
+        // Without the coordinator installed the bridge reports false.
+        let (_dir2, registry2) = registry_with_manual_worker_pool(Arc::new(WorkerPool::new(0)));
+        assert!(!registry2.coordinator_startup(acquisition::SyncPhase::Connected));
+
+        // The startup fact seeds the initial phase (start_valid Full) and
+        // publishes it through the phase port, deriving need_network_ledger.
+        // It never touches sessions: the owner seeds the phase only.
+        let full = acquisition::SyncPhase::Full {
+            lcl: acquisition::LedgerIdentity::new(Uint256::from_array([0x21; 32]), 9),
+            published: acquisition::LedgerIdentity::new(Uint256::from_array([0x22; 32]), 9),
+        };
+        assert!(registry.coordinator_startup(full));
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &full
+        );
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Full);
+        assert!(!state.need_network_ledger());
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .session_count(),
+            0,
+            "a startup seed must not mint an acquisition session"
+        );
+
+        // A networked startup re-seed (Connected) re-publishes the phase;
+        // the seed is idempotent for the owner and still creates no session.
+        assert!(registry.coordinator_startup(acquisition::SyncPhase::Connected));
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
+        assert!(state.need_network_ledger());
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .session_count(),
+            0
+        );
+        registry.stop();
+    }
+
+    #[test]
+    fn need_network_ledger_gate_rejects_history_but_lets_generic_reach_the_coordinator() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+        let state = Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        ));
+        // The production registry shares the phase state's need_network_ledger
+        // atomic (bootstrap passes `network_ops_state().need_network_ledger_arc()`),
+        // so the admission gate reads the coordinator-derived value.
+        let (_dir, node_store) = test_node_store();
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let registry = InboundLedgers::with_worker_pool(
+            Arc::new(TreeNodeCache::new(
+                "registry-need-network-ledger-test",
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            Arc::new(FullBelowCacheImpl::new(
+                1,
+                MonotonicClock::default(),
+                HardenedHashBuilder::default(),
+                8,
+            )),
+            Arc::new(FetchPackCache::new(
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            completed_tx,
+            state.need_network_ledger_arc(),
+            Arc::new(WorkerPool::new(0)),
+        );
+        registry.set_node_store(node_store);
+        registry.set_phase_state(Arc::clone(&state));
+        assert!(registry.install_coordinator());
+        // The derived atomic is true for Connected (M6-E: the phase port owns
+        // the atomic; the M6-D replay-parent recovery relies on this gate).
+        assert!(registry.coordinator_startup(acquisition::SyncPhase::Connected));
+        assert!(state.need_network_ledger());
+
+        // Usable peers make the coordinator's peer view non-empty (the harness
+        // has no overlay runtime, so a later acquire re-feeds Connectivity(empty)
+        // and demotes — that demotion is the observable that the gate was
+        // bypassed and the coordinator was actually consulted).
+        assert!(registry.coordinator_report_peer_availability(&[1u32]));
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &acquisition::SyncPhase::Connected
+        );
+
+        // A History acquire is rejected by the admission gate before the
+        // coordinator is consulted: no Connectivity is fed and no session is
+        // minted (rippled suppresses history work while needNetworkLedger).
+        let hash = Uint256::from_array([0x31; 32]);
+        assert!(
+            registry
+                .coordinator_acquire(hash, 9, AcquireReason::History)
+                .is_none(),
+            "History acquires are gated by the derived need_network_ledger"
+        );
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &acquisition::SyncPhase::Connected,
+            "the gate must fire before any connectivity/acquire fact reaches the coordinator"
+        );
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .session_count(),
+            0
+        );
+
+        // A Generic acquire bypasses the gate and reaches the coordinator: it
+        // feeds Connectivity(empty) (the harness overlay is absent), which
+        // demotes Connected -> Disconnected. This is the M6-D replay-parent
+        // path: the parent is requested as Generic precisely so it is not
+        // rejected by this gate.
+        assert!(
+            registry
+                .coordinator_acquire(hash, 9, AcquireReason::Generic)
+                .is_none(),
+            "no session is minted without overlay peers in the harness"
+        );
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &acquisition::SyncPhase::Disconnected,
+            "the Generic acquire reached the coordinator and fed Connectivity(empty)"
+        );
+        registry.stop();
+    }
+
+    #[test]
+    fn lcl_and_publication_facts_route_through_the_coordinator() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let state = Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        ));
+        registry.set_phase_state(Arc::clone(&state));
+        assert!(registry.install_coordinator());
+
+        // Without the coordinator installed the bridges report false.
+        let (_dir2, registry2) = registry_with_manual_worker_pool(Arc::new(WorkerPool::new(0)));
+        let identity = acquisition::LedgerIdentity::new(Uint256::from_array([0x11; 32]), 7);
+        assert!(!registry2.coordinator_lcl_installed(identity));
+        assert!(!registry2.coordinator_publication_committed(identity, true));
+
+        // Usable peers take the coordinator to Connected.
+        assert!(registry.coordinator_report_peer_availability(&[1u32]));
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &acquisition::SyncPhase::Connected
+        );
+
+        // A locally resident preferred LCL installed while Connected drives
+        // Connected -> Tracking through the phase port (rippled
+        // switchLastClosedLedger clearing needNetworkLedger without a fetch).
+        assert!(registry.coordinator_lcl_installed(identity));
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Tracking);
+        assert!(!state.need_network_ledger());
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &acquisition::SyncPhase::Tracking { lcl: identity }
+        );
+
+        // A non-fresh publication cannot promote Tracking -> Full.
+        assert!(registry.coordinator_publication_committed(identity, false));
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Tracking);
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &acquisition::SyncPhase::Tracking { lcl: identity }
+        );
+
+        // The matching fresh publication drives Tracking -> Full.
+        assert!(registry.coordinator_publication_committed(identity, true));
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Full);
+        assert!(!state.need_network_ledger());
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &acquisition::SyncPhase::Full {
+                lcl: identity,
+                published: identity
+            }
+        );
+        registry.stop();
+    }
+
+    #[test]
+    fn preferred_lcl_divergence_and_blocked_facts_route_through_the_coordinator() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let state = Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        ));
+        registry.set_phase_state(Arc::clone(&state));
+        assert!(registry.install_coordinator());
+
+        // Without the coordinator installed the bridges report false.
+        let (_dir2, registry2) = registry_with_manual_worker_pool(Arc::new(WorkerPool::new(0)));
+        let identity = acquisition::LedgerIdentity::new(Uint256::from_array([0x11; 32]), 7);
+        let target = acquisition::LedgerTarget::new(Uint256::from_array([0x22; 32]), Some(9));
+        assert!(!registry2.coordinator_preferred_lcl_divergence(target));
+        assert!(!registry2.coordinator_blocked_with_no_target());
+
+        // Reach Tracking: usable peers -> Connected, resident LCL -> Tracking.
+        assert!(registry.coordinator_report_peer_availability(&[1u32]));
+        assert!(registry.coordinator_lcl_installed(identity));
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Tracking);
+
+        // A preferred-LCL divergence fact demotes Tracking -> Syncing without
+        // minting a session; the coordinator publishes the mode.
+        assert!(registry.coordinator_preferred_lcl_divergence(target));
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Syncing);
+        assert!(state.need_network_ledger());
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .phase(),
+            &acquisition::SyncPhase::Syncing { target }
+        );
+        assert_eq!(registry.coordinator_snapshot().unwrap().session_count(), 0);
+
+        // A no-consensus-positions fact while Syncing is rejected (legal only
+        // from Full); it must not demote the phase.
+        assert!(registry.coordinator_blocked_with_no_target());
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Syncing);
+
+        // From Full, the blocked-state fact demotes Full -> Connected.
+        let (_dir3, full_registry) = registry_with_manual_worker_pool(Arc::new(WorkerPool::new(0)));
+        let full_state = Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        ));
+        full_registry.set_phase_state(Arc::clone(&full_state));
+        assert!(full_registry.install_coordinator());
+        assert!(full_registry.coordinator_report_peer_availability(&[1u32]));
+        assert!(full_registry.coordinator_lcl_installed(identity));
+        assert!(full_registry.coordinator_publication_committed(identity, true));
+        assert_eq!(full_state.operating_mode(), NetworkOpsOperatingMode::Full);
+        assert!(full_registry.coordinator_blocked_with_no_target());
+        assert_eq!(
+            full_state.operating_mode(),
+            NetworkOpsOperatingMode::Connected
+        );
+        assert!(full_state.need_network_ledger());
+        registry.stop();
+        full_registry.stop();
+    }
+
+    #[test]
     fn registry_ingress_coalesces_and_charges_selected_peer_malformed_packets() {
         let worker_pool = Arc::new(WorkerPool::new(0));
         let (_dir, registry) = registry_with_manual_worker_pool(Arc::clone(&worker_pool));
@@ -2846,6 +4098,18 @@ mod tests {
             "acquire queues its real initialization job"
         );
 
+        // Drain the synchronous initialization setup turn so packet admission
+        // observes an idle mailbox token. Initialization refreshes from the
+        // absent overlay runtime; install the selected live peer after that
+        // setup turn, before the first bounded FIFO packet step runs.
+        assert!(worker_pool.run_next_job_for_test());
+        state
+            .peer_set
+            .refresh_peers(vec![Arc::clone(&peer) as Arc<dyn Peer>]);
+        state.peer_set.add_peers(1, &mut |_| true, &mut |_| {});
+        let queued_before_routes = worker_pool.snapshot().queued_jobs;
+
+        let routed_before = registry.lifecycle_snapshot();
         let malformed = || InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new());
         assert_eq!(
             registry.route_response_with_seq(&hash, 77, Some(1), malformed()),
@@ -2857,28 +4121,24 @@ mod tests {
         );
         assert_eq!(
             worker_pool.snapshot().queued_jobs,
-            queued_before_ingress + 1,
+            queued_before_routes + 1,
             "two production registry routes queue one coalesced packet worker"
         );
         let routed = registry.lifecycle_snapshot();
-        assert_eq!(routed.route_attempts, 2);
-        assert_eq!(routed.route_accepted, 2);
-        assert_eq!(routed.data_jobs_submitted, 1);
-        assert_eq!(routed.data_jobs_coalesced, 1);
-
-        // Initialization refreshes from the absent overlay runtime. Install the
-        // selected live peer after that production setup turn, before the
-        // first bounded FIFO packet step runs.
-        assert!(worker_pool.run_next_job_for_test());
-        state
-            .peer_set
-            .refresh_peers(vec![Arc::clone(&peer) as Arc<dyn Peer>]);
-        state.peer_set.add_peers(1, &mut |_| true, &mut |_| {});
-        assert!(worker_pool.run_next_job_for_test());
-        assert!(
-            worker_pool.run_next_job_for_test(),
-            "the first bounded packet step must schedule one continuation"
+        assert_eq!(routed.route_attempts, routed_before.route_attempts + 2);
+        assert_eq!(routed.route_accepted, routed_before.route_accepted + 2);
+        assert_eq!(
+            routed.data_jobs_submitted,
+            routed_before.data_jobs_submitted + 1
         );
+        assert_eq!(
+            routed.data_jobs_coalesced,
+            routed_before.data_jobs_coalesced + 1
+        );
+
+        // The one coalesced packet worker processes both routed packets in
+        // FIFO order within a single bounded turn.
+        assert!(worker_pool.run_next_job_for_test());
 
         let charges = peer.charges();
         assert_eq!(
@@ -2891,10 +4151,15 @@ mod tests {
             assert_eq!(context, "ledger_data empty header");
         }
         let drained = registry.lifecycle_snapshot();
-        assert_eq!(drained.data_jobs_started, 2);
-        assert_eq!(drained.packet_steps, 2);
-        assert_eq!(drained.packet_steps_completed, 2);
-        assert_eq!(drained.packet_step_errors, 2);
+        assert_eq!(drained.packet_steps, routed_before.packet_steps + 2);
+        assert_eq!(
+            drained.packet_steps_completed,
+            routed_before.packet_steps_completed + 2
+        );
+        assert_eq!(
+            drained.packet_step_errors,
+            routed_before.packet_step_errors + 2
+        );
         registry.stop();
     }
 
@@ -3056,8 +4321,9 @@ mod tests {
         // rippled's acquire() runs InboundLedger::init immediately. Each new
         // incomplete ledger then asks TimeoutCounter to queue recovery work;
         // with a five-job admission limit, the first five are live and only
-        // the sixth is deferred. Deferred initialization would instead fill
-        // the ledger-data queue before any timeout callback could be admitted.
+        // the sixth is deferred. The scheduler FIFO retains that sixth turn
+        // rather than filling the ledger-data queue, so a later timeout
+        // callback can always be admitted once a reserved turn completes.
         for suffix in 1..=6u8 {
             registry.acquire(
                 Uint256::from_array([suffix; 32]),
@@ -3068,8 +4334,22 @@ mod tests {
 
         let lifecycle = registry.lifecycle_snapshot();
         assert_eq!(lifecycle.initialization_jobs, 6);
-        assert_eq!(worker_pool.snapshot().queued_jobs, 5);
-        assert_eq!(lifecycle.timeout_queue_rejected, 1);
+        assert_eq!(
+            worker_pool.snapshot().queued_jobs,
+            5,
+            "deferred initialization must not fill the ledger-data queue"
+        );
+
+        // Draining the reserved turns admits the retained sixth and any rerun
+        // demand; the five-turn boundary is never exceeded and no turn is
+        // rejected or dropped.
+        for _ in 0..5 {
+            assert!(worker_pool.run_next_job_for_test());
+            assert!(
+                worker_pool.snapshot().queued_jobs <= 5,
+                "the six live acquisitions must not exceed the five-slot boundary"
+            );
+        }
         registry.stop();
     }
 
@@ -3362,6 +4642,27 @@ mod tests {
             "consensus must create the hash-only target even after a History cooldown"
         );
         assert!(registry.contains(&hash));
+        registry.stop();
+    }
+
+    #[test]
+    fn coordinator_non_consensus_acquire_respects_recent_failure_cooldown() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let hash = Uint256::from_array([0xF5; 32]);
+        registry
+            .inner
+            .lock()
+            .expect("registry lock")
+            .recent_failures
+            .insert(hash, Instant::now());
+
+        assert!(registry.should_defer_coordinator_acquire(&hash, AcquireReason::Generic));
+        assert!(registry.should_defer_coordinator_acquire(&hash, AcquireReason::History));
+        assert!(
+            !registry.should_defer_coordinator_acquire(&hash, AcquireReason::Consensus),
+            "preferred-LCL consensus recovery must not be blocked by history cooldown"
+        );
         registry.stop();
     }
 

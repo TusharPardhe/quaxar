@@ -3,11 +3,10 @@
 
 use crate::{
     InboundLedgerReason, Ledger, LedgerConfig, LedgerDeltaAcquire, LedgerHeader, LedgerReplayTask,
-    LedgerReplayTaskParameter, SkipListAcquire,
+    LedgerReplayTaskParameter, ReplayTransaction, SkipListAcquire,
 };
 use basics::base_uint::Uint256;
 use overlay::PeerSetBuilder;
-use protocol::STTx;
 use shamap::item::SHAMapItem;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -367,7 +366,7 @@ impl LedgerReplayer {
     pub fn got_replay_delta(
         &mut self,
         info: LedgerHeader,
-        txns: BTreeMap<u32, Arc<STTx>>,
+        txns: BTreeMap<u32, ReplayTransaction>,
         config: &LedgerConfig,
     ) {
         self.got_replay_delta_with_rules(info, txns, crate::Rules::new(config.features.iter()));
@@ -377,7 +376,7 @@ impl LedgerReplayer {
     pub fn got_replay_delta_with_rules(
         &mut self,
         info: LedgerHeader,
-        txns: BTreeMap<u32, Arc<STTx>>,
+        txns: BTreeMap<u32, ReplayTransaction>,
         rules: crate::Rules,
     ) {
         let Some(delta) = self

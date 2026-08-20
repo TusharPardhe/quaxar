@@ -486,10 +486,10 @@ impl SyncTree {
                 continue;
             }
             for branch in 0..BRANCH_FACTOR {
-                if !node.is_empty_branch(branch) {
-                    if let Some(child) = node.get_child(branch) {
-                        work_stack.push(child);
-                    }
+                if !node.is_empty_branch(branch)
+                    && let Some(child) = node.get_child(branch)
+                {
+                    work_stack.push(child);
                 }
             }
             inner_nodes.push(node);
@@ -555,10 +555,10 @@ impl SyncTree {
 
             // Not full below at this depth — descend into loaded children.
             for branch in 0..BRANCH_FACTOR {
-                if !node.is_empty_branch(branch) {
-                    if let Some(child) = node.get_child(branch) {
-                        work_stack.push((child, depth + 1));
-                    }
+                if !node.is_empty_branch(branch)
+                    && let Some(child) = node.get_child(branch)
+                {
+                    work_stack.push((child, depth + 1));
                 }
             }
         }
@@ -626,10 +626,10 @@ impl SyncTree {
 
             // Above keep_depth — descend into loaded children.
             for branch in 0..BRANCH_FACTOR {
-                if !node.is_empty_branch(branch) {
-                    if let Some(child) = node.get_child(branch) {
-                        work_stack.push((child, depth + 1));
-                    }
+                if !node.is_empty_branch(branch)
+                    && let Some(child) = node.get_child(branch)
+                {
+                    work_stack.push((child, depth + 1));
                 }
             }
         }

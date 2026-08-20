@@ -308,14 +308,13 @@ fn concurrent_independent_quorum_candidates_publish_highest_sequence() {
     let _ = root.attach_ledger_master_runtime(std::sync::Arc::clone(&ledger_master_runtime));
     let _ = root.attach_default_network_ops_validation_runtime();
 
-    let parent =
-        ledger::Ledger::create_genesis(false, &ledger::LedgerConfig::default(), Vec::new())
-            .expect("genesis ledger");
-    let mut first = ledger::Ledger::from_previous(&parent, 0);
+    let close_time = root.shared_time_keeper().close_time().as_seconds();
+    let parent = ledger::Ledger::from_ledger_seq_and_close_time(1, close_time, false);
+    let mut first = ledger::Ledger::from_previous(&parent, close_time);
     first.update_skip_list().expect("first skip list");
     first.set_immutable(true);
     let first = std::sync::Arc::new(first);
-    let mut second = ledger::Ledger::from_previous(first.as_ref(), 1);
+    let mut second = ledger::Ledger::from_previous(first.as_ref(), close_time);
     second.update_skip_list().expect("second skip list");
     second.set_immutable(true);
     let second = std::sync::Arc::new(second);

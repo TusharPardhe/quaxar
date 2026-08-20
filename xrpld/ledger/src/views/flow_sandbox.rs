@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use basics::base_uint::Uint256;
 use protocol::{
-    ApplyFlags, Keylet, Rules, SField, STLedgerEntry, STObject, SerializedTypeId, StBase, XRPAmount,
+    ApplyFlags, Keylet, Rules, SField, STLedgerEntry, STObject, SerializedTypeId, StBase,
+    XRPAmount, get_field_by_symbol,
 };
 
 use crate::raw_view::RawView;
@@ -65,6 +66,34 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
 
     pub fn items(&self) -> &BTreeMap<Uint256, Entry> {
         &self.items
+    }
+
+    /// Returns the first entry that proves this transaction was already
+    /// threaded into an earlier ledger. Callers must discard the uncommitted
+    /// sandbox rather than invoke `STLedgerEntry::thread` again with a new
+    /// ledger sequence. This is the state-level backstop for rippled's
+    /// `ReadView::txExists` replay rejection when a historical tx-map branch
+    /// is unavailable.
+    pub fn replayed_threaded_entry(
+        &self,
+        tx_id: Uint256,
+        ledger_seq: u32,
+        rules: &Rules,
+    ) -> Option<(Uint256, u32)> {
+        self.items.iter().find_map(|(key, entry)| {
+            if !matches!(entry.action, Action::Insert | Action::Modify)
+                || !entry.sle.is_threaded_type(rules)
+            {
+                return None;
+            }
+            let prior_id = entry
+                .sle
+                .get_field_h256(get_field_by_symbol("sfPreviousTxnID"));
+            let prior_seq = entry
+                .sle
+                .get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"));
+            (prior_id == tx_id && prior_seq != ledger_seq).then_some((*key, prior_seq))
+        })
     }
 
     /// Build the transaction metadata from this transaction's uncommitted

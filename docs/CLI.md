@@ -8,6 +8,17 @@ Start the server with an explicit config file:
 quaxar --conf /etc/xrpld/xrpld.cfg
 ```
 
+For an isolated lab or explicitly controlled deployment, a minimum validation
+quorum can be overridden at startup:
+
+```bash
+quaxar --conf /etc/xrpld/xrpld.cfg --quorum 2
+```
+
+`--quorum` overrides the quorum derived from the trusted validator list and can
+be unsafe on a public network. Use it only when the validator set and failure
+model are deliberately controlled.
+
 Running `quaxar` without a subcommand prints help. This avoids accidentally
 starting a node with an unintended default configuration.
 

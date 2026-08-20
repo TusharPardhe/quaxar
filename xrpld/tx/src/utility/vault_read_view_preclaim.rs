@@ -414,10 +414,11 @@ fn preclaim_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
 
 fn preclaim_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
-    let destination = tx
-        .is_field_present(sf("sfDestination"))
-        .then(|| tx.get_account_id(sf("sfDestination")))
-        .unwrap_or(account);
+    let destination = if tx.is_field_present(sf("sfDestination")) {
+        tx.get_account_id(sf("sfDestination"))
+    } else {
+        account
+    };
     let Some(vault) = read_vault(view, tx.get_field_h256(sf("sfVaultID")))? else {
         return Ok(run_vault_withdraw_preclaim(
             VaultWithdrawPreclaimFrontFacts::default(),
@@ -466,7 +467,7 @@ fn preclaim_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
                 || amount.asset() == Asset::MPTIssue(share),
             withdrawal_policy_is_first_come_first_serve: vault
                 .get_field_u8(sf("sfWithdrawalPolicy"))
-                == 0,
+                == protocol::VAULT_STRATEGY_FIRST_COME_FIRST_SERVE,
             fix_cleanup_3_1_3_enabled: view
                 .rules()
                 .enabled(&protocol::feature_id("fixCleanup3_1_3")),
@@ -516,12 +517,11 @@ fn preclaim_clawback<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let asset = vault.get_field_issue(sf("sfAsset")).asset();
     let share = MPTIssue::new(vault.get_field_h192(sf("sfShareMPTID")));
     let issuance = read_issuance(view, share.mpt_id())?;
-    let amount = tx
-        .is_field_present(sf("sfAmount"))
-        .then(|| tx.get_field_amount(sf("sfAmount")))
-        .unwrap_or_else(|| {
-            STAmount::new_with_asset(sf("sfAmount"), Asset::MPTIssue(share), 0, 0, false)
-        });
+    let amount = if tx.is_field_present(sf("sfAmount")) {
+        tx.get_field_amount(sf("sfAmount"))
+    } else {
+        STAmount::new_with_asset(sf("sfAmount"), Asset::MPTIssue(share), 0, 0, false)
+    };
     let kind = if amount.asset() == Asset::MPTIssue(share) {
         VaultClawbackSelectedAmountAssetKind::Share
     } else if amount.asset() == asset {

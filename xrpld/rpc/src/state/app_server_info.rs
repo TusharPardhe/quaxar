@@ -373,7 +373,7 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
     fn snapshot_status(&self) -> protocol::JsonValue {
         self.app().map_or_else(
             || protocol::json!({ "status": "success", "state": "unavailable" }),
-            |app| <ApplicationRoot as RpcRuntime>::snapshot_status(app),
+            <ApplicationRoot as RpcRuntime>::snapshot_status,
         )
     }
 
@@ -528,13 +528,10 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
             if let Some(JsonValue::Array(currencies)) = obj.get("source_currencies") {
                 let mut filter = Vec::new();
                 for c in currencies {
-                    match c {
-                        JsonValue::Object(cobj) => {
-                            if let Some(JsonValue::String(cur)) = cobj.get("currency") {
-                                filter.push(cur.clone());
-                            }
+                    if let JsonValue::Object(cobj) = c {
+                        if let Some(JsonValue::String(cur)) = cobj.get("currency") {
+                            filter.push(cur.clone());
                         }
-                        _ => {}
                     }
                 }
                 if filter.is_empty() {

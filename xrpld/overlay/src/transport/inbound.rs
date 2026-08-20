@@ -52,8 +52,8 @@ pub struct PeerMessage<T> {
 
 /// Result of the direct ledger-data transport handoff. `Deferred` means the
 /// matching acquisition has not reserved its bounded mailbox yet; the
-/// transport retains exactly this decoded frame and pauses this peer's reads
-/// until `retry_deferred_ledger_data` admits or terminally classifies it.
+/// transport retains exactly this decoded frame and retries admission while
+/// continuing to dispatch control traffic such as PING/PONG.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerDataIngressDisposition {
     Delivered,
@@ -405,10 +405,10 @@ impl QueuedOverlayInboundHandler {
     /// Retain exactly one decoded matching frame for the peer session which
     /// owns it. There is intentionally no process-global paused-peer cap:
     /// live peer/session admission owns the number of peers, while the wire
-    /// decoder owns the per-frame `MAXIMUM_MESSAGE_SIZE` bound. A second
-    /// deferred frame cannot arise from a paused session; treat it as a
-    /// protocol/session violation, keep the original frame intact, and stop
-    /// that peer so `on_session_closed` performs terminal release.
+    /// decoder owns the per-frame `MAXIMUM_MESSAGE_SIZE` bound. The session
+    /// keeps dispatching control frames while this entry retries, so later
+    /// ledger-data frames must be dropped rather than retained or allowed to
+    /// consume a second bounded slot.
     fn defer_ledger_data(
         &self,
         peer: &Arc<PeerImp>,
@@ -419,8 +419,11 @@ impl QueuedOverlayInboundHandler {
             .lock()
             .expect("ledger_data_deferred lock");
         if deferred.contains_key(&peer.id()) {
-            drop(deferred);
-            peer.request_disconnect();
+            tracing::debug!(
+                target: "overlay",
+                peer_id = %peer.id(),
+                "Dropping ledger data while a bounded deferred frame is retained"
+            );
             return LedgerDataIngressDisposition::Delivered;
         }
         let reserved_bytes = deferred_ledger_data_bytes(&message);
@@ -1033,10 +1036,13 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
                 .expect("ledger_data_deferred lock")
                 .contains_key(&peer.id())
             {
-                // Reads are paused after the first defer, so a second frame is
-                // not a routable reply. Preserve the original frame and make
-                // session close its explicit terminal disposition.
-                peer.request_disconnect();
+                // Keep the one retained frame bounded while allowing control
+                // traffic to continue through the session reader.
+                tracing::debug!(
+                    target: "overlay",
+                    peer_id = %peer.id(),
+                    "Dropping ledger data while a bounded deferred frame is retained"
+                );
                 return LedgerDataIngressDisposition::Delivered;
             }
             let message = message.take().expect("message present");
@@ -1083,7 +1089,11 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
                 .expect("ledger_data_deferred lock")
                 .contains_key(&peer.id())
             {
-                peer.request_disconnect();
+                tracing::debug!(
+                    target: "overlay",
+                    peer_id = %peer.id(),
+                    "Dropping ledger data while a bounded deferred frame is retained"
+                );
                 return LedgerDataIngressDisposition::Delivered;
             }
             let message = message.take().expect("message present");
@@ -1124,10 +1134,10 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
             }
         }
         // Wake the consensus strand loop immediately.
-        if let Ok(notify) = self.proposal_notify.lock() {
-            if let Some(ref f) = *notify {
-                f();
-            }
+        if let Ok(notify) = self.proposal_notify.lock()
+            && let Some(ref f) = *notify
+        {
+            f();
         }
     }
 
@@ -1368,6 +1378,44 @@ mod tests {
         assert_eq!(queue.len(), 1_025);
         extend_bounded(&mut queue, vec![1_025usize], "test");
         assert_eq!(queue.len(), 1_026);
+    }
+
+    #[test]
+    fn additional_ledger_data_is_dropped_while_one_frame_is_deferred() {
+        let handler = QueuedOverlayInboundHandler::default();
+        handler.set_ledger_data_router(Box::new(|_, _| LedgerDataIngressDisposition::Deferred));
+        let public_key = protocol::derive_public_key(
+            protocol::KeyType::Secp256k1,
+            &protocol::SecretKey::from_bytes([73; 32]),
+        )
+        .expect("test public key");
+        let peer = Arc::new(PeerImp::new(
+            73,
+            "127.0.0.1:5073".parse().expect("test socket address"),
+            public_key,
+            "peer-73".to_owned(),
+        ));
+
+        assert_eq!(
+            handler.on_ledger_data(&peer, TmLedgerData::default()),
+            LedgerDataIngressDisposition::Deferred
+        );
+        let reserved_before = handler.deferred_ledger_data_byte_snapshot().0;
+        assert!(reserved_before > 0, "first frame owns the bounded slot");
+
+        assert_eq!(
+            handler.on_ledger_data(&peer, TmLedgerData::default()),
+            LedgerDataIngressDisposition::Delivered
+        );
+        assert_eq!(
+            handler.deferred_ledger_data_byte_snapshot().0,
+            reserved_before,
+            "a later frame is not retained beside the first deferred frame"
+        );
+        assert!(
+            !peer.disconnect_requested(),
+            "bounded backpressure must not tear down PING/PONG control traffic"
+        );
     }
 
     #[test]

@@ -394,16 +394,16 @@ impl PeerImp {
     fn on_timer(&self) {
         // rippled resets largeSendq_ in send() when queue < target, NOT in
         // onTimer. Here we only increment/check.
-        if self.send_queue_size() >= TARGET_SEND_QUEUE {
-            if self.large_sendq.fetch_add(1, Ordering::AcqRel) >= SENDQ_INTERVALS {
-                tracing::warn!(
-                    target: "overlay",
-                    peer_id = %self.id,
-                    "send queue remained large; disconnecting peer"
-                );
-                self.request_disconnect();
-                return;
-            }
+        if self.send_queue_size() >= TARGET_SEND_QUEUE
+            && self.large_sendq.fetch_add(1, Ordering::AcqRel) >= SENDQ_INTERVALS
+        {
+            tracing::warn!(
+                target: "overlay",
+                peer_id = %self.id,
+                "send queue remained large; disconnecting peer"
+            );
+            self.request_disconnect();
+            return;
         }
 
         if !self.inbound {

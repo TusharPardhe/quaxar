@@ -407,20 +407,18 @@ pub fn run_account_set_preclaim(facts: AccountSetPreclaimFacts) -> Ter {
         };
     }
 
-    if facts.feature_clawback_enabled {
-        if facts.set_flag == ASF_ALLOW_TRUST_LINE_CLAWBACK {
-            if facts.account_flags & LSF_NO_FREEZE != 0 {
-                return Ter::TEC_NO_PERMISSION;
-            }
-
-            if !facts.owner_dir_empty {
-                return Ter::TEC_OWNERS;
-            }
-        } else if facts.set_flag == ASF_NO_FREEZE
-            && facts.account_flags & LSF_ALLOW_TRUST_LINE_CLAWBACK != 0
-        {
+    if facts.set_flag == ASF_ALLOW_TRUST_LINE_CLAWBACK {
+        if facts.account_flags & LSF_NO_FREEZE != 0 {
             return Ter::TEC_NO_PERMISSION;
         }
+
+        if !facts.owner_dir_empty {
+            return Ter::TEC_OWNERS;
+        }
+    } else if facts.set_flag == ASF_NO_FREEZE
+        && facts.account_flags & LSF_ALLOW_TRUST_LINE_CLAWBACK != 0
+    {
+        return Ter::TEC_NO_PERMISSION;
     }
 
     Ter::TES_SUCCESS
@@ -633,7 +631,7 @@ pub fn run_account_set_do_apply_tail<AccountId: Clone>(
         }
     }
 
-    if facts.feature_clawback_enabled && facts.set_flag == ASF_ALLOW_TRUST_LINE_CLAWBACK {
+    if facts.set_flag == ASF_ALLOW_TRUST_LINE_CLAWBACK {
         state.account_flags |= LSF_ALLOW_TRUST_LINE_CLAWBACK;
     }
 

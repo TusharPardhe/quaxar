@@ -532,14 +532,16 @@ fn preclaim_credential_accept<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, T
 
 fn preclaim_credential_delete<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
-    let subject = tx
-        .is_field_present(sf("sfSubject"))
-        .then(|| tx.get_account_id(sf("sfSubject")))
-        .unwrap_or(account);
-    let issuer = tx
-        .is_field_present(sf("sfIssuer"))
-        .then(|| tx.get_account_id(sf("sfIssuer")))
-        .unwrap_or(account);
+    let subject = if tx.is_field_present(sf("sfSubject")) {
+        tx.get_account_id(sf("sfSubject"))
+    } else {
+        account
+    };
+    let issuer = if tx.is_field_present(sf("sfIssuer")) {
+        tx.get_account_id(sf("sfIssuer"))
+    } else {
+        account
+    };
     Ok(run_credential_delete_preclaim(
         CredentialDeletePreclaimFacts {
             credential_exists: view

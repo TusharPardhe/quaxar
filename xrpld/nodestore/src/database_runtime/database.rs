@@ -707,7 +707,6 @@ impl DatabaseRuntime {
                 let callbacks = std::mem::take(&mut read_state.queue)
                     .into_values()
                     .flatten()
-                    .map(|request| request)
                     .collect::<Vec<_>>();
                 (first_stop, callbacks)
             } else {

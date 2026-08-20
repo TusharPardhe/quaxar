@@ -328,6 +328,7 @@ fn acq_packet_debug_verbose_enabled() -> bool {
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)] // debug-only request-shape logger
 fn log_acq_request_nodes(
     seq: u32,
     map: &str,
@@ -399,7 +400,7 @@ pub fn make_get_ledger_with_node_ids(
         node_i_ds: node_ids.iter().map(|id| id.get_raw_string()).collect(),
         request_cookie: None,
         query_type,
-        query_depth: Some(query_depth),
+        query_depth: (itype != TM_GET_LEDGER_BASE).then_some(query_depth),
     }))
 }
 
@@ -517,7 +518,21 @@ impl InboundLedgerPacketShape {
             ..Self::default()
         };
 
-        for node in &packet.nodes {
+        for (index, node) in packet.nodes.iter().enumerate() {
+            // rippled `PeerImp::sendLedgerBase` puts a raw LedgerHeader in
+            // slot 0, then optional state/transaction roots from
+            // `SHAMap::serializeRoot`, which calls `serializeForWire`.
+            if packet.packet_type == InboundLedgerDataType::Base {
+                if index == 0 {
+                    continue;
+                }
+                match SHAMapTreeNode::make_from_wire(&node.node_data) {
+                    Ok(Some(decoded)) if decoded.is_inner() => shape.inner_nodes += 1,
+                    Ok(Some(_)) => shape.leaf_nodes += 1,
+                    Ok(None) | Err(_) => shape.malformed_nodes += 1,
+                }
+                continue;
+            }
             if node.node_data.is_empty() {
                 shape.empty_nodes += 1;
                 continue;
@@ -819,6 +834,14 @@ impl InboundLedgerLocal {
         self.ledger.as_mut()
     }
 
+    /// Consumes the materialized ledger, yielding ownership exactly once.
+    /// Returns `None` after the first call or before a ledger is materialized.
+    /// The durable handoff uses this so the completed ledger is moved (not
+    /// cloned) into the coordinator's handoff effect.
+    pub fn take_ledger(&mut self) -> Option<Ledger> {
+        self.ledger.take()
+    }
+
     pub fn planner_state(&self) -> InboundLedgerPlannerState {
         self.planner_state
     }
@@ -932,19 +955,34 @@ impl InboundLedgerLocal {
         }
     }
 
+    /// Materialize a structurally complete inbound ledger for ownership transfer.
+    ///
+    /// Both the legacy completion queue and the coordinator's post-fence
+    /// durable handoff use this exact finalization: an incomplete, failed, or
+    /// still-synchronizing ledger is never made immutable or full.
+    pub fn finalize_completed_ledger(&mut self) -> bool {
+        if self.failed || !self.complete {
+            return false;
+        }
+        let Some(ledger) = self.ledger.as_mut() else {
+            return false;
+        };
+        if ledger.state_map().is_synching() || ledger.tx_map().is_synching() {
+            return false;
+        }
+        if !ledger.is_immutable() {
+            ledger.set_immutable(false);
+        }
+        ledger.set_full();
+        true
+    }
+
     pub fn accept_completed_ledger(&mut self) -> Option<InboundLedgerCompletionDisposition> {
         let disposition = self.completion_disposition()?;
-        if let InboundLedgerCompletionDisposition::Complete(_) = disposition {
-            let ledger = self
-                .ledger
-                .as_mut()
-                .expect("completed inbound ledger must hold a ledger");
-            if !ledger.is_immutable() {
-                // The acquisition worker only observes completion; the owner
-                // performs the final acceptance step.
-                ledger.set_immutable(false);
-            }
-            ledger.set_full();
+        if let InboundLedgerCompletionDisposition::Complete(_) = disposition
+            && !self.finalize_completed_ledger()
+        {
+            return None;
         }
         Some(disposition)
     }
@@ -1808,10 +1846,12 @@ impl InboundLedgerLocal {
         self.planner_state.have_header = true;
         self.planner_state.have_transactions = ledger.header().tx_hash.is_zero();
         self.planner_state.have_state = self.skip_state || ledger.header().account_hash.is_zero();
-        if !self.skip_state {
+        if !self.planner_state.have_state {
             ledger.state_map_mut().set_synching();
         }
-        ledger.tx_map_mut().set_synching();
+        if !self.planner_state.have_transactions {
+            ledger.tx_map_mut().set_synching();
+        }
         self.ledger = Some(ledger);
         true
     }
@@ -2371,7 +2411,9 @@ impl InboundLedgerLocal {
         self.planner_state.have_header = true;
         if let Some(ledger) = self.ledger.as_mut() {
             ledger.state_map_mut().set_synching();
-            ledger.tx_map_mut().set_synching();
+            if !ledger.header().tx_hash.is_zero() {
+                ledger.tx_map_mut().set_synching();
+            }
         }
     }
 
@@ -3138,11 +3180,9 @@ impl InboundLedgerLocal {
                     state_request_pending: false,
                     complete: false,
                 };
-            } else {
-                if self.planner_state.have_header {
-                    self.planner_state.have_state = true;
-                    self.planner_state.have_transactions = true;
-                }
+            } else if self.planner_state.have_header {
+                self.planner_state.have_state = true;
+                self.planner_state.have_transactions = true;
             }
         }
 
@@ -3603,13 +3643,18 @@ mod tree_plan_facade_tests {
 
     #[test]
     fn tree_plan_facade_forwards_retained_edges_and_wait_state_without_ownership() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        child.update_hash();
+        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            shamap::nodes::tree_node::SHAMapNodeType::AccountState,
+            shamap::item::SHAMapItem::new(Uint256::from_array([0x42; 32]), vec![42; 12]),
+            1,
+        ));
         let child_hash = child.get_hash();
+        assert!(child_hash.is_non_zero());
         let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
         root.set_child_hash(1, child_hash);
         root.set_child_hash(2, child_hash);
         root.update_hash();
+        assert!(root.get_hash().is_non_zero());
         let tree = SyncTree::from_root_with_type(
             root.clone(),
             SHAMapType::State,
@@ -3624,14 +3669,17 @@ mod tree_plan_facade_tests {
             &tree,
             root.get_hash(),
             16,
-            0,
+            7,
             &mut first_child,
         );
         let mut resident = NoResident;
 
-        let TreeAdvance::NeedsReads(reads) = plan.advance(32, 4, &mut resident, &mut first_child)
-        else {
-            panic!("expected the continuation's deduplicated read result");
+        let advance = plan.advance(32, 4, &mut resident, &mut first_child);
+        let TreeAdvance::NeedsReads(reads) = advance else {
+            panic!(
+                "expected the continuation's deduplicated read result, got {:?}",
+                advance
+            );
         };
         assert_eq!(reads.len(), 1);
         assert_eq!(reads[0].hash(), child_hash);

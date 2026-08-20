@@ -161,7 +161,7 @@ fn inbound_take_header_sets_cpp_owner_flags_and_synching() {
     let ledger = inbound
         .ledger()
         .expect("accepted header should create a ledger");
-    assert_eq!(ledger.tx_map().state(), SyncState::Synching);
+    assert_eq!(ledger.tx_map().state(), SyncState::Modifying);
     assert_eq!(ledger.state_map().state(), SyncState::Synching);
     assert_eq!(store.stored_headers.borrow().len(), 1);
 }
@@ -193,7 +193,7 @@ fn inbound_try_db_header_load_arms_cpp_owner_flags_and_synching() {
     assert!(inbound.planner_state().have_transactions);
     assert!(!inbound.planner_state().have_state);
     let ledger = inbound.ledger().expect("try_db should load the header");
-    assert_eq!(ledger.tx_map().state(), SyncState::Synching);
+    assert_eq!(ledger.tx_map().state(), SyncState::Modifying);
     assert_eq!(ledger.state_map().state(), SyncState::Synching);
 }
 

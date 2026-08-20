@@ -8,6 +8,7 @@
 pub mod http_client;
 pub mod setup_hash_router;
 pub mod ssl_certs;
+#[allow(clippy::module_inception)]
 pub mod work;
 pub mod work_file;
 pub mod work_plain;

@@ -59,6 +59,15 @@ impl SimplePeerSet {
             return None;
         }
 
+        self.find_available_peer(id)
+    }
+
+    /// Find a currently available peer without consulting legacy PeerSet
+    /// membership. This is for a caller that has already selected an exact
+    /// peer from its own availability snapshot, such as the acquisition
+    /// coordinator. It must not be used for legacy PeerSet fan-out, whose
+    /// tracked-membership semantics remain in [`Self::find_peer`].
+    pub fn find_available_peer(&self, id: PeerId) -> Option<Arc<dyn Peer>> {
         let peers = self.peers.lock().expect("peer set lock");
         peers.iter().find(|peer| peer.id() == id).cloned()
     }
@@ -205,6 +214,26 @@ mod tests {
     }
 
     #[test]
+    fn available_lookup_does_not_grant_legacy_membership() {
+        let available = peer(7, 7);
+        let peer_set = SimplePeerSet::new(vec![Arc::clone(&available)]);
+
+        assert!(
+            peer_set.find_peer(7).is_none(),
+            "legacy lookup requires add_peers membership"
+        );
+        assert_eq!(
+            peer_set
+                .find_available_peer(7)
+                .expect("available peer")
+                .id(),
+            7,
+            "a coordinator-selected peer is deliverable without legacy membership"
+        );
+        assert!(peer_set.peer_ids().is_empty());
+    }
+
+    #[test]
     fn add_peers_sorts_by_score_and_skips_existing_ids() {
         let first = peer(1, 1);
         let second = peer(2, 2);
@@ -286,6 +315,6 @@ impl OverlayPeerSetBuilder {
 impl PeerSetBuilder for OverlayPeerSetBuilder {
     fn build(&self) -> std::sync::Arc<dyn PeerSet> {
         use crate::Overlay;
-        std::sync::Arc::new(SimplePeerSet::new(self.overlay.active_peers().into_iter()))
+        std::sync::Arc::new(SimplePeerSet::new(self.overlay.active_peers()))
     }
 }

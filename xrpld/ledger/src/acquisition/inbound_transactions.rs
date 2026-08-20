@@ -149,13 +149,18 @@ impl InboundTransactions {
         let _was_acquiring = inbound.acquire.is_some();
         inbound.acquire = None;
 
-        // Match rippled giveSet: notify on every new set regardless of
-        // from_acquire or was_acquiring. rippled's condition is simply
-        // `if (isNew) gotSet_(set, fromAcquire)`.
-        if is_new && !self.notify_map_complete(hash, Arc::clone(&set)) {
-            if let Some(inbound) = self.sets.get_mut(&hash) {
-                inbound.completion_pending = true;
-            }
+        // Locally generated sets are announced synchronously by the consensus
+        // relay before it shares the corresponding proposal. Only an acquired
+        // set needs this completion handoff so the consensus owner can call
+        // `got_tx_set` after the asynchronous acquisition completes. This
+        // preserves rippled's effective ordering without making the owner
+        // strand a second lifecycle authority for locally owned sets.
+        if from_acquire
+            && is_new
+            && !self.notify_map_complete(hash, Arc::clone(&set))
+            && let Some(inbound) = self.sets.get_mut(&hash)
+        {
+            inbound.completion_pending = true;
         }
 
         is_new
@@ -273,19 +278,19 @@ impl InboundTransactions {
             .collect();
         let mut completed = Vec::new();
         for hash in hashes {
-            if let Some(inbound) = self.sets.get_mut(&hash) {
-                if let Some(acquire) = inbound.acquire.as_mut() {
-                    acquire.invoke_on_timer();
-                    if acquire.is_complete() {
-                        let set = Arc::new(acquire.map().clone());
-                        inbound.acquire = None;
-                        if inbound.set.is_none() {
-                            inbound.set = Some(Arc::clone(&set));
-                            completed.push((hash, set));
-                        }
-                    } else if acquire.is_failed() {
-                        inbound.acquire = None;
+            if let Some(inbound) = self.sets.get_mut(&hash)
+                && let Some(acquire) = inbound.acquire.as_mut()
+            {
+                acquire.invoke_on_timer();
+                if acquire.is_complete() {
+                    let set = Arc::new(acquire.map().clone());
+                    inbound.acquire = None;
+                    if inbound.set.is_none() {
+                        inbound.set = Some(Arc::clone(&set));
+                        completed.push((hash, set));
                     }
+                } else if acquire.is_failed() {
+                    inbound.acquire = None;
                 }
             }
         }

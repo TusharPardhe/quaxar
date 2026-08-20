@@ -227,10 +227,11 @@ fn asset_funds<V: ReadView>(
             else {
                 return Ok(requested.zeroed());
             };
-            let maximum = issuance
-                .is_field_present(sf("sfMaximumAmount"))
-                .then(|| issuance.get_field_u64(sf("sfMaximumAmount")))
-                .unwrap_or(i64::MAX as u64);
+            let maximum = if issuance.is_field_present(sf("sfMaximumAmount")) {
+                issuance.get_field_u64(sf("sfMaximumAmount"))
+            } else {
+                i64::MAX as u64
+            };
             let available = maximum
                 .saturating_sub(issuance.get_field_u64(sf("sfOutstandingAmount")))
                 .min(i64::MAX as u64) as i64;

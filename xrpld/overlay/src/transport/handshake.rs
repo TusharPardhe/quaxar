@@ -74,8 +74,11 @@ pub struct HandshakeVerificationContext {
 pub struct HandshakePeer {
     pub public_key: PublicKey,
     pub server_domain: Option<String>,
-    pub closed_ledger: Option<String>,
-    pub previous_ledger: Option<String>,
+    /// Verified peer current LCL from the handshake. This must be available
+    /// before protocol activation, matching rippled PeerImp::run.
+    pub closed_ledger: Option<Uint256>,
+    /// Verified parent of `closed_ledger`; it is invalid without a current LCL.
+    pub previous_ledger: Option<Uint256>,
 }
 
 pub fn get_feature_value(headers: &HeaderMap, feature: &str) -> Option<String> {
@@ -322,6 +325,17 @@ pub fn make_shared_value_from_finished_messages(
     Some(sha512_half(mixed))
 }
 
+fn parse_handshake_ledger_hash(value: &str) -> Result<Uint256, String> {
+    // Rippled accepts the canonical hex header form and the legacy base64
+    // wire form. Preserve both, but never silently convert malformed input to
+    // a zero LCL because NetworkOPs relies on this immediately after reconnect.
+    if let Ok(hash) = Uint256::from_hex(value) {
+        return Ok(hash);
+    }
+    Uint256::from_slice(&base64_decode(value))
+        .ok_or_else(|| "Malformed handshake ledger hash".to_owned())
+}
+
 pub fn verify_handshake(
     headers: &HeaderMap,
     context: &HandshakeVerificationContext,
@@ -439,12 +453,23 @@ pub fn verify_handshake(
         }
     }
 
+    let closed_ledger = header_value(headers, "Closed-Ledger")
+        .map(|value| parse_handshake_ledger_hash(&value))
+        .transpose()?;
+    let previous_ledger = header_value(headers, "Previous-Ledger")
+        .map(|value| parse_handshake_ledger_hash(&value))
+        .transpose()?;
+    if previous_ledger.is_some() && closed_ledger.is_none() {
+        tracing::warn!(target: "overlay", reason = "Previous-Ledger without Closed-Ledger", "Handshake failed");
+        return Err("Previous-Ledger without Closed-Ledger".to_owned());
+    }
+
     tracing::info!(target: "overlay", "Handshake complete");
     Ok(HandshakePeer {
         public_key,
         server_domain: header_value(headers, "Server-Domain"),
-        closed_ledger: header_value(headers, "Closed-Ledger"),
-        previous_ledger: header_value(headers, "Previous-Ledger"),
+        closed_ledger,
+        previous_ledger,
     })
 }
 
@@ -652,8 +677,8 @@ mod tests {
         feature_enabled, get_feature_value, is_feature_value, is_public_ip,
         make_features_request_header, make_features_response_header, make_request, make_response,
         make_shared_value_from_finished_messages, negotiate_inbound_peer_upgrade,
-        parse_http_request, parse_http_response, serialize_request, serialize_response,
-        validate_outbound_peer_upgrade, verify_handshake,
+        parse_handshake_ledger_hash, parse_http_request, parse_http_response, serialize_request,
+        serialize_response, validate_outbound_peer_upgrade, verify_handshake,
     };
 
     #[test]
@@ -779,6 +804,23 @@ mod tests {
         };
         let peer = verify_handshake(&headers, &verify_context).expect("handshake should verify");
         assert_eq!(peer.public_key, public);
+        assert_eq!(
+            peer.closed_ledger,
+            Some(Uint256::from_hex(&"A".repeat(64)).expect("closed hash"))
+        );
+        assert_eq!(
+            peer.previous_ledger,
+            Some(Uint256::from_hex(&"B".repeat(64)).expect("previous hash"))
+        );
+    }
+
+    #[test]
+    fn handshake_ledger_hash_parsing_rejects_malformed_input() {
+        assert!(parse_handshake_ledger_hash("not-a-ledger").is_err());
+        assert_eq!(
+            parse_handshake_ledger_hash(&"C".repeat(64)).expect("canonical hash"),
+            Uint256::from_hex(&"C".repeat(64)).expect("expected canonical hash"),
+        );
     }
 
     #[test]

@@ -108,14 +108,24 @@ impl StateAccounting {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // legacy mode writer; exercised by network_ops integration tests
     fn set_operating_mode(&mut self, new_mode: NetworkOpsOperatingMode) {
+        self.set_operating_mode_with_reason(new_mode, "unspecified");
+    }
+
+    fn set_operating_mode_with_reason(
+        &mut self,
+        new_mode: NetworkOpsOperatingMode,
+        reason: &'static str,
+    ) {
         if self.mode == new_mode {
             return;
         }
 
         let now = Instant::now();
         let duration = now.saturating_duration_since(self.last_transition);
-        let old_mode_idx = encode_operating_mode(self.mode) as usize;
+        let old_mode = self.mode;
+        let old_mode_idx = encode_operating_mode(old_mode) as usize;
         self.counters[old_mode_idx].duration_us += duration.as_micros() as u64;
 
         if self.initial_sync_duration_us.is_none() && new_mode == NetworkOpsOperatingMode::Full {
@@ -130,6 +140,20 @@ impl StateAccounting {
         self.mode = new_mode;
         self.last_transition = now;
         self.counters[encode_operating_mode(new_mode) as usize].transitions += 1;
+
+        xrpld_metrics::acquisition::record_operating_mode_transition(
+            old_mode.as_str(),
+            new_mode.as_str(),
+            reason,
+        );
+        xrpld_metrics::acquisition::operating_mode(encode_operating_mode(new_mode));
+        tracing::info!(
+            target: "operating_mode",
+            from = old_mode.as_str(),
+            to = new_mode.as_str(),
+            reason,
+            "Operating mode transition",
+        );
     }
 
     fn json(&self) -> Value {
@@ -223,11 +247,23 @@ impl SharedNetworkOpsState {
     }
 
     pub fn set_operating_mode(&self, operating_mode: NetworkOpsOperatingMode) {
+        self.set_operating_mode_with_reason(operating_mode, "unspecified");
+    }
+
+    /// Set the operating mode, recording the transition reason in the
+    /// mode-transition metric and trace. The reason describes the caller's
+    /// motivation; the effective mode may be normalized by validated-ledger
+    /// age or blocked state before it reaches `StateAccounting`.
+    pub fn set_operating_mode_with_reason(
+        &self,
+        operating_mode: NetworkOpsOperatingMode,
+        reason: &'static str,
+    ) {
         self.operating_mode
             .store(encode_operating_mode(operating_mode), Ordering::Release);
         self.state_accounting
             .lock()
-            .set_operating_mode(operating_mode);
+            .set_operating_mode_with_reason(operating_mode, reason);
     }
 
     pub fn operating_mode(&self) -> NetworkOpsOperatingMode {
@@ -329,13 +365,25 @@ impl AppNetworkOpsModeOwner {
         &self,
         operating_mode: NetworkOpsOperatingMode,
     ) -> NetworkOpsOperatingMode {
+        self.set_operating_mode_with_reason(operating_mode, "unspecified")
+    }
+
+    /// Set the operating mode through the validated-ledger-age / blocked
+    /// normalization, recording `reason` on the transition trace and metric.
+    pub fn set_operating_mode_with_reason(
+        &self,
+        operating_mode: NetworkOpsOperatingMode,
+        reason: &'static str,
+    ) -> NetworkOpsOperatingMode {
         let previous = self.state.operating_mode();
-        self.state
-            .set_operating_mode(normalize_operating_mode_for_validated_age(
+        self.state.set_operating_mode_with_reason(
+            normalize_operating_mode_for_validated_age(
                 operating_mode,
                 (self.validated_ledger_age)(),
                 self.state.is_blocked(),
-            ));
+            ),
+            reason,
+        );
         previous
     }
 
@@ -344,8 +392,19 @@ impl AppNetworkOpsModeOwner {
         &self,
         operating_mode: NetworkOpsOperatingMode,
     ) -> NetworkOpsOperatingMode {
+        self.set_operating_mode_direct_with_reason(operating_mode, "unspecified")
+    }
+
+    /// Set the mode exactly as requested, recording `reason` on the transition
+    /// trace and metric. Used for downgrades that must bypass normalization.
+    pub fn set_operating_mode_direct_with_reason(
+        &self,
+        operating_mode: NetworkOpsOperatingMode,
+        reason: &'static str,
+    ) -> NetworkOpsOperatingMode {
         let previous = self.state.operating_mode();
-        self.state.set_operating_mode(operating_mode);
+        self.state
+            .set_operating_mode_with_reason(operating_mode, reason);
         previous
     }
 
@@ -356,7 +415,7 @@ impl AppNetworkOpsModeOwner {
     pub fn set_unl_blocked(&self, unl_blocked: bool) {
         self.state.set_unl_blocked(unl_blocked);
         if unl_blocked {
-            self.set_operating_mode(NetworkOpsOperatingMode::Connected);
+            self.set_operating_mode_with_reason(NetworkOpsOperatingMode::Connected, "unl_blocked");
         }
     }
 

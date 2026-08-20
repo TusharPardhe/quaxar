@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn real_scheduler_survives_panicking_tasks_and_keeps_running() {
-        let scheduler = RealScheduler::new(1);
+        let scheduler = RealScheduler::with_task_limit(1, 2);
         let counter = Arc::new(AtomicUsize::new(0));
 
         scheduler.schedule_task(Arc::new(CountingTask {

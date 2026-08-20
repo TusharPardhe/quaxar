@@ -7,8 +7,8 @@ use ledger::{
     FetchPackContainer, InboundLedgerCompletionDisposition, InboundLedgerJournal,
     InboundLedgerLocal, InboundLedgerObjectType, InboundLedgerReason, InboundLedgerRequestTrigger,
     InboundLedgerStore, LedgerConfig, LedgerHeader, calculate_ledger_hash,
-    make_inbound_get_ledger_request, make_inbound_needed_by_hash_request,
-    serialize_prefixed_ledger_header,
+    make_get_ledger_with_node_ids, make_inbound_get_ledger_request,
+    make_inbound_needed_by_hash_request, serialize_prefixed_ledger_header,
 };
 use overlay::ProtocolPayload;
 use protocol::JsonValue;
@@ -360,6 +360,20 @@ fn inbound_owner_by_hash_request_uses_first_needed_type_only() {
             );
         }
         payload => panic!("expected get_objects payload, got {payload:?}"),
+    }
+}
+
+#[test]
+fn shared_base_request_omits_query_depth_for_rippled_peer_compatibility() {
+    let request = make_get_ledger_with_node_ids(sample_hash(0x80), 900, 0, &[], 0, None);
+
+    match request.payload {
+        ProtocolPayload::GetLedger(message) => {
+            assert_eq!(message.itype, 0);
+            assert_eq!(message.ledger_seq, Some(900));
+            assert_eq!(message.query_depth, None);
+        }
+        payload => panic!("expected get_ledger payload, got {payload:?}"),
     }
 }
 

@@ -161,9 +161,10 @@ pub use ledger_fetcher::{
 // These will be reimplemented in app::ledger::inbound_ledgers
 pub use inbound_transactions::{InboundTransactions, InboundTransactionsDataStatus};
 pub use ledger_to_json::{
-    DEFAULT_LEDGER_JSON_API_VERSION, LedgerFill, LedgerFillOptions, add_json, add_json_with_family,
-    copy_from, fill_json, fill_json_binary, fill_json_header, fill_json_state,
-    fill_json_state_with_family, fill_json_with_family, get_json, get_json_with_family,
+    DEFAULT_LEDGER_JSON_API_VERSION, LedgerFill, LedgerFillOptions, LedgerJsonError, add_json,
+    add_json_with_family, copy_from, fill_json, fill_json_binary, fill_json_header,
+    fill_json_state, fill_json_state_with_family, fill_json_with_family, get_json,
+    get_json_with_family,
 };
 pub use local_txs::LocalTxs;
 pub use master::{
@@ -208,7 +209,7 @@ pub use read_view::{
     after, are_compatible, compatibility_reason, has_expired, make_rules_given_ledger,
     view_get_enabled_amendments, view_get_majority_amendments, view_hash_of_seq,
 };
-pub use replay::{LedgerReplay, LedgerReplayError};
+pub use replay::{LedgerReplay, LedgerReplayError, ReplayTransaction};
 pub use replay_task::{
     LedgerReplayTask, LedgerReplayTaskParameter, REPLAY_TASK_MAX_TIMEOUTS_MINIMUM,
     REPLAY_TASK_MAX_TIMEOUTS_MULTIPLIER, REPLAY_TASK_TIMEOUT, ReplayTaskError,
@@ -503,6 +504,17 @@ pub enum LedgerNodeObjectType {
     TransactionNode,
 }
 
+/// Node writer for flushing dirty SHAMap nodes to the node store (fallible).
+pub type LedgerNodeWriterResult = Arc<
+    dyn Fn(LedgerNodeObjectType, basics::base_uint::Uint256, Vec<u8>, u32) -> Result<(), String>
+        + Send
+        + Sync,
+>;
+
+/// Node writer used by legacy compatibility callers.
+pub type LedgerNodeWriter =
+    Arc<dyn Fn(LedgerNodeObjectType, basics::base_uint::Uint256, Vec<u8>, u32) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Ledger {
     header: LedgerHeader,
@@ -525,24 +537,11 @@ pub struct Ledger {
         >,
     >,
     /// Optional node writer for flushing dirty nodes to the node store.
-    node_writer: Option<
-        Arc<dyn Fn(LedgerNodeObjectType, basics::base_uint::Uint256, Vec<u8>, u32) + Send + Sync>,
-    >,
+    node_writer: Option<LedgerNodeWriter>,
     /// Fallible node writer used by normal consensus acceptance. The legacy
     /// writer remains for compatibility callers, but this path propagates
     /// backend failures before a ledger can be promoted/released.
-    node_writer_result: Option<
-        Arc<
-            dyn Fn(
-                    LedgerNodeObjectType,
-                    basics::base_uint::Uint256,
-                    Vec<u8>,
-                    u32,
-                ) -> Result<(), String>
-                + Send
-                + Sync,
-        >,
-    >,
+    node_writer_result: Option<LedgerNodeWriterResult>,
     /// Persistent mutable tree for the state map — matches reference where stateMap_
     /// is a single persistent SHAMap that all rawInsert/rawErase/rawReplace
     /// operate on directly. Initialized on first mutation, persists across all
@@ -740,18 +739,7 @@ impl Ledger {
                 close_time_resolution,
                 ..LedgerHeader::default()
             },
-            state_map: {
-                let sm = prev_ledger.state_map.share_root_snapshot();
-                // Inherit the parent's backed flag. When the parent is backed
-                // (nodes persisted to NuDB) and has a node_fetcher, the child
-                // must also be backed so that read operations (e.g.
-                // update_skip_list) can resolve nodes via the fetcher after
-                // release_maps_to_disk has evicted in-memory children.
-                // Mutations go through MutableTree which always passes
-                // backed=true and its own fetch callback independently of
-                // this flag, so COW is not affected.
-                sm
-            },
+            state_map: prev_ledger.state_map.share_root_snapshot(),
             tx_map: SyncTree::new_with_type(SHAMapType::Transaction, true, 0),
             fees: prev_ledger.fees,
             rules: prev_ledger.rules.clone(),
@@ -1312,8 +1300,23 @@ impl Ledger {
         self.state_map.has_item(key, &mut fetch_fn)
     }
 
+    /// Resolves transaction-map membership through backed branches. Callers
+    /// that construct or validate a ledger must propagate traversal failure:
+    /// treating an unreadable parent branch as an absent transaction permits a
+    /// duplicate replay and violates `STLedgerEntry::thread`'s invariant.
+    pub fn try_tx_exists(&self, key: Uint256) -> Result<bool, TraversalError> {
+        let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| {
+            self.node_fetcher.as_ref().and_then(|fetcher| fetcher(hash))
+        };
+        self.tx_map.has_item(key, &mut fetch_fn)
+    }
+
+    /// Returns true when the transaction map contains `key`, resolving backed
+    /// branches through the ledger's node fetcher. This compatibility helper
+    /// preserves the existing best-effort read behavior; consensus ledger
+    /// construction must use [`Self::try_tx_exists`] and fail closed.
     pub fn tx_exists(&self, key: Uint256) -> bool {
-        self.tx_map.has_item(key, &mut |_| None).unwrap_or(false)
+        self.try_tx_exists(key).unwrap_or(false)
     }
 
     pub fn tx_read(&self, key: Uint256) -> Result<Option<LedgerTxRead>, LedgerTxReadError> {
@@ -2038,7 +2041,7 @@ impl Ledger {
             .clone()
             .ok_or_else(|| "missing node writer for backed consensus ledger".to_owned())?;
 
-        let mut flush = |tree: &mut MutableTree, object_type: LedgerNodeObjectType| {
+        let flush = |tree: &mut MutableTree, object_type: LedgerNodeObjectType| {
             tree.try_flush_dirty(&mut |node| {
                 if let Some(cache) = tree_cache {
                     let mut node_ref = node.clone();
@@ -2698,12 +2701,13 @@ impl Ledger {
     }
 }
 
+/// Decode untrusted state-map bytes without permitting a malformed ledger
+/// entry type to unwind a ledger worker. `try_from_serial_iter` is the
+/// fallible counterpart to rippled's `STLedgerEntry` constructor, which throws
+/// for an invalid type (rippled `STLedgerEntry.cpp`).
 fn parse_state_sle(payload: &[u8], keylet: Keylet) -> Option<STLedgerEntry> {
     let mut iter = SerialIter::new(payload);
-    let entry = catch_unwind(AssertUnwindSafe(|| {
-        STLedgerEntry::from_serial_iter(&mut iter, keylet.key)
-    }))
-    .ok()?;
+    let entry = STLedgerEntry::try_from_serial_iter(&mut iter, keylet.key).ok()?;
     if !iter.empty() || !keylet.check_ledger_entry(entry.get_type(), *entry.key()) {
         return None;
     }

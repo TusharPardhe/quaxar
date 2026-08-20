@@ -13,7 +13,7 @@
 
 use basics::math::base_uint::Uint160;
 use protocol::{
-    AccountID, Amounts, Quality, STAmount, STLedgerEntry, STTx, StBase, Ter, XRPAmount,
+    AccountID, Amounts, Quality, STAmount, STLedgerEntry, STTx, Ter, XRPAmount,
     get_field_by_symbol, is_tes_success,
 };
 use std::sync::Arc;
@@ -852,6 +852,7 @@ fn quality_to_rate_amount(quality: u64) -> STAmount {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::StBase;
 
     #[test]
     fn offer_create_amount_error_maps_to_tef_exception_without_unwinding() {

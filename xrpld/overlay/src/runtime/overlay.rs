@@ -106,7 +106,7 @@ impl Setup {
     /// is disabled when the node does not accept inbound peers.
     pub fn peer_limits(&self) -> PeerLimits {
         if let (Some(inbound_max), Some(outbound_max)) = (self.peer_limit_in, self.peer_limit_out) {
-            let inbound_max = self.want_incoming.then_some(inbound_max).unwrap_or(0);
+            let inbound_max = if self.want_incoming { inbound_max } else { 0 };
             return PeerLimits {
                 // rippled Config.cpp:112: config.maxPeers = 0 when explicit limits set
                 max_peers: 0,

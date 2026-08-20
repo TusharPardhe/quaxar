@@ -292,10 +292,11 @@ fn preclaim_mpt_authorize<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
             return Ok(Ter::TEC_OBJECT_NOT_FOUND);
         };
         let balance = token.get_field_u64(sf("sfMPTAmount"));
-        let locked = token
-            .is_field_present(sf("sfLockedAmount"))
-            .then(|| token.get_field_u64(sf("sfLockedAmount")))
-            .unwrap_or(0);
+        let locked = if token.is_field_present(sf("sfLockedAmount")) {
+            token.get_field_u64(sf("sfLockedAmount"))
+        } else {
+            0
+        };
         if balance != 0 || locked != 0 {
             let issuance = mpt_issuance(view, issuance_id)?;
             return Ok(run_mp_token_authorize_preclaim(

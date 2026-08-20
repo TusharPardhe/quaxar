@@ -146,7 +146,7 @@ fn vault_delete_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
         lending_protocol_v1_1_enabled: feature_enabled(view, "LendingProtocolV1_1"),
         memo_data_length_valid: !sttx.is_field_present(sf("sfMemoData"))
             || data_len(sttx, sf("sfMemoData"))
-                .map_or(true, |len| len <= tx::VAULT_DELETE_MAX_DATA_PAYLOAD_LENGTH),
+                .is_none_or(|len| len <= tx::VAULT_DELETE_MAX_DATA_PAYLOAD_LENGTH),
     })
 }
 

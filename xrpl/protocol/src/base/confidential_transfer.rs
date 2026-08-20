@@ -261,10 +261,10 @@ pub fn verify_revealed_amount(
     {
         return Ter::TEC_INTERNAL;
     }
-    if let (Some(apk), Some(ae)) = (auditor_pub_key, auditor_encrypted) {
-        if apk.len() != EC_PUB_KEY_LENGTH || ae.len() != EC_GAMAL_ENCRYPTED_TOTAL_LENGTH {
-            return Ter::TEC_INTERNAL;
-        }
+    if let (Some(apk), Some(ae)) = (auditor_pub_key, auditor_encrypted)
+        && (apk.len() != EC_PUB_KEY_LENGTH || ae.len() != EC_GAMAL_ENCRYPTED_TOTAL_LENGTH)
+    {
+        return Ter::TEC_INTERNAL;
     }
     let _ = amount;
     // NOTE: Full verification requires mpt-crypto Rust bindings (pending).

@@ -1063,9 +1063,7 @@ fn cross_type_scale(
     }
 
     // Clamp to valid IOU range
-    let mantissa = (result_mantissa as u64)
-        .max(1_000_000_000_000_000)
-        .min(9_999_999_999_999_999);
+    let mantissa = (result_mantissa as u64).clamp(1_000_000_000_000_000, 9_999_999_999_999_999);
 
     STAmount::new_with_asset(
         protocol::get_field_by_symbol("sfAmount"),

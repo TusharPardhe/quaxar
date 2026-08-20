@@ -2610,12 +2610,15 @@ fn check_cash_transfers_mpt_without_requiring_dex_trading() {
     );
     let mut issuance = mpt_issuance_entry(issuer, 1, 100, protocol::lsfMPTCanTransfer);
     issuance.set_field_u16(get_field_by_symbol("sfTransferFee"), 10_000);
+    let check_keylet = protocol::check_keylet(raw_account_id(source), 3);
     let ledger = empty_ledger(vec![
         account_root_with_balance(source, 1, 0, 1_000_000_000),
         account_root_with_balance(destination, 0, 0, 1_000_000_000),
         account_root(issuer, 1, 0),
         issuance,
         mptoken_entry(source, mpt_id, 50),
+        owner_dir_root(source, check_keylet.key),
+        owner_dir_root(destination, check_keylet.key),
         check_entry(source, destination, 3, send_max.clone()),
     ]);
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
@@ -3532,9 +3535,9 @@ fn vault_create_tx_with_scale(
 ) -> STTx {
     STTx::new(TxType::VAULT_CREATE, move |object| {
         object.set_account_id(get_field_by_symbol("sfAccount"), account);
-        object.set_field_amount(
+        object.set_field_issue(
             get_field_by_symbol("sfAsset"),
-            asset.amount(RuntimeNumber::zero()).expect("asset zero"),
+            STIssue::new_with_asset(get_field_by_symbol("sfAsset"), asset),
         );
         object.set_field_amount(
             get_field_by_symbol("sfFee"),
@@ -4004,9 +4007,9 @@ fn loan_set_tx(
     STTx::new(TxType::LOAN_SET, move |object| {
         object.set_account_id(get_field_by_symbol("sfAccount"), account);
         object.set_field_h256(get_field_by_symbol("sfLoanBrokerID"), broker_id);
-        object.set_field_amount(
+        object.set_field_number(
             get_field_by_symbol("sfPrincipalRequested"),
-            STAmount::from_xrp_amount(XRPAmount::from_drops(principal_requested_drops)),
+            STNumber::from(RuntimeNumber::from_i64(principal_requested_drops)),
         );
         object.set_field_u32(get_field_by_symbol("sfPaymentInterval"), 60);
         object.set_field_u32(get_field_by_symbol("sfPaymentTotal"), 1);
@@ -4029,13 +4032,13 @@ fn loan_set_tx_with_origination_fee(
     STTx::new(TxType::LOAN_SET, move |object| {
         object.set_account_id(get_field_by_symbol("sfAccount"), account);
         object.set_field_h256(get_field_by_symbol("sfLoanBrokerID"), broker_id);
-        object.set_field_amount(
+        object.set_field_number(
             get_field_by_symbol("sfPrincipalRequested"),
-            STAmount::from_xrp_amount(XRPAmount::from_drops(principal_requested_drops)),
+            STNumber::from(RuntimeNumber::from_i64(principal_requested_drops)),
         );
-        object.set_field_amount(
+        object.set_field_number(
             get_field_by_symbol("sfLoanOriginationFee"),
-            STAmount::from_xrp_amount(XRPAmount::from_drops(origination_fee_drops)),
+            STNumber::from(RuntimeNumber::from_i64(origination_fee_drops)),
         );
         object.set_field_u32(get_field_by_symbol("sfPaymentInterval"), 60);
         object.set_field_u32(get_field_by_symbol("sfPaymentTotal"), 1);
@@ -6177,6 +6180,11 @@ fn loan_broker_set_create_mints_deterministic_pseudo_and_empty_holding() {
         .read(broker_keylet)
         .expect("broker read should succeed")
         .expect("broker should exist");
+    assert_eq!(
+        broker.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+        Uint256::zero(),
+        "LoanBrokerSet do-apply must not pre-thread the new broker with its transaction ID"
+    );
     assert_eq!(
         broker.get_account_id(get_field_by_symbol("sfAccount")),
         expected_pseudo
@@ -8336,10 +8344,10 @@ fn loan_set_dispatch_creates_loan_and_updates_vault_and_broker() {
         },
         vec![
             account_root(owner, 0, 0),
-            account_root_with_balance(borrower, 0, 0, 1_000_000),
-            account_root_with_balance(vault_pseudo, 0, 0, 10_000),
-            account_root_with_balance(broker_pseudo, 0, 0, 10_000),
-            managed_vault_entry(owner, vault_pseudo, 13, asset, 10_000, 10_000, 0),
+            account_root_with_balance(borrower, 0, 0, 200_000_000),
+            account_root_with_balance(vault_pseudo, 0, 0, 200_000_000),
+            account_root_with_balance(broker_pseudo, 0, 0, 200_000_000),
+            managed_vault_entry(owner, vault_pseudo, 13, asset, 200_000_000, 200_000_000, 0),
             loan_broker_entry(
                 broker_id,
                 owner,
@@ -8347,9 +8355,9 @@ fn loan_set_dispatch_creates_loan_and_updates_vault_and_broker() {
                 vault_id,
                 asset,
                 0,
+                200_000_000,
                 10_000,
-                100_000,
-                100_000,
+                10_000,
             ),
         ],
     );
@@ -8358,15 +8366,15 @@ fn loan_set_dispatch_creates_loan_and_updates_vault_and_broker() {
         protocol::feature_id("LendingProtocol"),
         protocol::feature_id("SingleAssetVault"),
         protocol::feature_id("MPTokensV1"),
+        protocol::feature_id("fixCleanup3_2_0"),
     ]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
-    let result = handle_real_dispatch(
-        &mut view,
-        &loan_set_tx(borrower, broker_id, 1_000, 1),
-        TxType::LOAN_SET,
-        Some(1_000_000),
-    );
+    let mut loan_set = loan_set_tx(borrower, broker_id, 10_000_000, 1);
+    loan_set.set_account_id(get_field_by_symbol("sfCounterparty"), owner);
+    loan_set.make_field_absent(get_field_by_symbol("sfInterestRate"));
+    loan_set.set_field_u32(get_field_by_symbol("sfGracePeriod"), 60);
+    let result = handle_real_dispatch(&mut view, &loan_set, TxType::LOAN_SET, Some(1_000_000));
     assert_eq!(result, protocol::Ter::TES_SUCCESS);
 
     let loan = view
@@ -8380,7 +8388,7 @@ fn loan_set_dispatch_creates_loan_and_updates_vault_and_broker() {
     assert_eq!(
         loan.get_field_number(get_field_by_symbol("sfPrincipalOutstanding"))
             .value(),
-        RuntimeNumber::from_i64(1_000)
+        RuntimeNumber::from_i64(10_000_000)
     );
     assert_eq!(
         loan.get_field_u32(get_field_by_symbol("sfPaymentRemaining")),
@@ -8395,7 +8403,7 @@ fn loan_set_dispatch_creates_loan_and_updates_vault_and_broker() {
         vault
             .get_field_number(get_field_by_symbol("sfAssetsAvailable"))
             .value(),
-        RuntimeNumber::from_i64(9_000)
+        RuntimeNumber::from_i64(190_000_000)
     );
 
     let broker = view
@@ -13525,6 +13533,15 @@ fn loan_pay_overpayment_mode_reduces_principal_by_multiple_periods() {
     );
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
+    let loan_key = protocol::loan_keylet_from_key(loan_id);
+    let loan = view
+        .peek(loan_key)
+        .expect("loan read")
+        .expect("loan exists");
+    let mut updated_loan = STLedgerEntry::from_stobject(loan.clone_as_object(), *loan.key());
+    updated_loan.set_field_u32(get_field_by_symbol("sfFlags"), protocol::lsfLoanOverpayment);
+    view.update(Arc::new(updated_loan)).expect("update loan");
+
     // LOAN_OVERPAYMENT_FLAG = 0x0001_0000 — pay 3 periods at once
     let tx = STTx::new(TxType::LOAN_PAY, |tx| {
         tx.set_account_id(get_field_by_symbol("sfAccount"), borrower);
@@ -14102,7 +14119,6 @@ fn amm_clawback_matrix_mpt_exact_thresholds() {
                     holder_owner_children.push(*holder_token.key());
                     entries.push(holder_token);
                 }
-                _ => unreachable!(),
             }
         }
 

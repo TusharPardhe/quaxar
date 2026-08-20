@@ -438,6 +438,7 @@ impl AppLoadedLedgerRuntime {
         let mut nodes = vec![TmLedgerNode {
             nodeid: None,
             nodedata: serialize_ledger_header(&ledger.header(), false),
+            reference: None,
         }];
 
         let state_map = ledger.state_map();
@@ -447,6 +448,7 @@ impl AppLoadedLedgerRuntime {
             nodes.push(TmLedgerNode {
                 nodeid: None,
                 nodedata: root,
+                reference: None,
             });
 
             let tx_map = ledger.tx_map();
@@ -457,6 +459,7 @@ impl AppLoadedLedgerRuntime {
                 nodes.push(TmLedgerNode {
                     nodeid: None,
                     nodedata: root,
+                    reference: None,
                 });
             }
         }
@@ -507,6 +510,7 @@ impl AppLoadedLedgerRuntime {
                 reply_nodes.push(TmLedgerNode {
                     nodeid: Some(node_id.get_raw_string()),
                     nodedata: blob,
+                    reference: None,
                 });
             }
         }

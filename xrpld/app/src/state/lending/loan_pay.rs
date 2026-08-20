@@ -269,17 +269,17 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         RuntimeNumber::zero()
     };
     let service_fee = if loan_sle.is_field_present(sf("sfLoanServiceFee")) {
-        amount_number(&loan_sle.get_field_amount(sf("sfLoanServiceFee")))
+        loan_sle.get_field_number(sf("sfLoanServiceFee")).value()
     } else {
         RuntimeNumber::zero()
     };
     let close_payment_fee = if loan_sle.is_field_present(sf("sfClosePaymentFee")) {
-        amount_number(&loan_sle.get_field_amount(sf("sfClosePaymentFee")))
+        loan_sle.get_field_number(sf("sfClosePaymentFee")).value()
     } else {
         RuntimeNumber::zero()
     };
     let late_payment_fee = if loan_sle.is_field_present(sf("sfLatePaymentFee")) {
-        amount_number(&loan_sle.get_field_amount(sf("sfLatePaymentFee")))
+        loan_sle.get_field_number(sf("sfLatePaymentFee")).value()
     } else {
         RuntimeNumber::zero()
     };

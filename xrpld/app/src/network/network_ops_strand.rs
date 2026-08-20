@@ -14,12 +14,14 @@
 //! accesses the consensus state machine. No mutex protects it because only
 //! this thread touches it.
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use acquisition::{DurableHandoffId, SessionRef};
 use basics::base_uint::Uint256;
 use consensus::algorithm::ConsensusPhase;
 
@@ -52,6 +54,14 @@ const MAX_PROPOSALS_PER_TURN: usize = 64;
 const MAX_TXSET_COMPLETIONS_PER_TURN: usize = 64;
 const MAX_MAP_COMPLETIONS_PER_TURN: usize = 64;
 const MAX_LEDGER_COMPLETIONS_PER_TURN: usize = 64;
+/// Retain enough recent coordinator handoffs to suppress the same item when
+/// both legacy completed-ledger receive paths observe it, without turning this
+/// strand-local optimization into lifecycle ownership.
+const MAX_COORDINATOR_HANDOFF_DEDUP: usize = MAX_LEDGER_COMPLETIONS_PER_TURN * 2;
+/// Exact durable ACK receipts retained by the sole NetworkOps strand while the
+/// coordinator control queue is full. This is delivery retry state only, not
+/// coordinator session lifecycle state.
+const MAX_PENDING_DURABLE_ACKS: usize = MAX_LEDGER_COMPLETIONS_PER_TURN * 2;
 const MAX_STRAND_INGRESS_QUEUE: usize = 1_024;
 const MAX_STRAND_COMMAND_QUEUE: usize = 128;
 /// Bound per-pass LCL diagnostics during persistent WrongLedger recovery.
@@ -60,6 +70,43 @@ const LCL_AUDIT_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 struct LclAuditSampler {
     last_emitted: Instant,
+}
+
+/// Bounded duplicate suppression for coordinator items after they cross the
+/// completed-ledger channel. The coordinator remains the handoff lifecycle
+/// owner; this only prevents the recipient from processing the same exact
+/// `(handoff, session)` twice if both compatibility receivers see it.
+#[derive(Default)]
+struct CoordinatorHandoffDedup {
+    seen: HashSet<(acquisition::DurableHandoffId, acquisition::SessionRef)>,
+    order: VecDeque<(acquisition::DurableHandoffId, acquisition::SessionRef)>,
+}
+
+impl CoordinatorHandoffDedup {
+    fn claim(
+        &mut self,
+        handoff: acquisition::DurableHandoffId,
+        session: acquisition::SessionRef,
+    ) -> bool {
+        if !self.seen.insert((handoff, session)) {
+            return false;
+        }
+        self.order.push_back((handoff, session));
+        if self.order.len() > MAX_COORDINATOR_HANDOFF_DEDUP {
+            let evicted = self.order.pop_front().expect("dedup order is non-empty");
+            self.seen.remove(&evicted);
+        }
+        true
+    }
+    fn release(
+        &mut self,
+        handoff: acquisition::DurableHandoffId,
+        session: acquisition::SessionRef,
+    ) {
+        let key = (handoff, session);
+        self.seen.remove(&key);
+        self.order.retain(|entry| *entry != key);
+    }
 }
 
 /// One NetworkOps-owned wait key for a resolver-visible preferred LCL. It is
@@ -251,13 +298,13 @@ impl ConsensusJobScheduler {
                     accept_queued.store(false, Ordering::Release);
                     return;
                 };
-                match command_tx.try_send(ConsensusCommand::Accept(work)) {
+                match command_tx.try_send(ConsensusCommand::Accept(Box::new(work))) {
                     Ok(()) => {}
                     Err(std::sync::mpsc::TrySendError::Full(ConsensusCommand::Accept(work)))
                     | Err(std::sync::mpsc::TrySendError::Disconnected(ConsensusCommand::Accept(
                         work,
                     ))) => {
-                        *pending_accept.lock().expect("pending accept lock") = Some(work);
+                        *pending_accept.lock().expect("pending accept lock") = Some(*work);
                         accept_queued.store(false, Ordering::Release);
                     }
                     Err(_) => unreachable!("only Accept commands are sent here"),
@@ -459,6 +506,10 @@ fn strand_loop(
     let mut consensus_started = false;
     let mut last_timer_tick = Instant::now();
     let mut last_round_ledger_id: Option<Uint256> = None;
+    // Emit at most one restart-gate diagnostic per closed ledger. Accepted
+    // phase maintenance runs every strand tick, so per-pass INFO events turn
+    // a stalled restart gate into an operator-hostile log flood.
+    let mut last_restart_gate_ledger_id: Option<Uint256> = None;
     let mut last_history_tick = Instant::now();
     let mut history_fetch_pack: Option<(u32, Instant)> = None;
     // Matches LedgerMaster::histLedger_: after a primary history result is
@@ -473,6 +524,8 @@ fn strand_loop(
     // The strand owns this state and observes it only from endConsensus.
     // Callbacks merely wake the strand through the coalesced owner event.
     let mut provisional_lcl_waiter: Option<ProvisionalLclWaiter> = None;
+    let mut coordinator_handoff_dedup = CoordinatorHandoffDedup::default();
+    let mut pending_durable_acks = VecDeque::new();
 
     // Detect startup: always start consensus immediately on the closed
     // ledger, matching rippled's Application::run() which calls
@@ -511,11 +564,28 @@ fn strand_loop(
             let _ = scheduler.schedule_pending_accept();
         }
 
+        // ─── 0. Drive the coordinator owner loop ─────────────────────────
+        // The coordinator is the single session lifecycle owner. Its typed
+        // events (connectivity, acquire requests, packet admissions, read/write/
+        // fence completions, timer wakeups, durable handoff acks, store rotation)
+        // arrive on an unbounded channel and must be drained on this owner
+        // strand so coordinator state never needs its own thread or lock
+        // choreography. Effects are dispatched to the resource ports inside the
+        // registry's coordinator adapter after each event.
+        shared_inbound.coordinator_drain();
+        while let Some(&(handoff, session)) = pending_durable_acks.front() {
+            if !shared_inbound.acknowledge_coordinator_durable_handoff(handoff, session) {
+                break;
+            }
+            pending_durable_acks.pop_front();
+        }
+
         // ─── 1. Process serialized commands ──────────────────────────────
         // Worker jobs and external callers can enqueue commands, but only this
         // thread owns `runner`, so timer, accept, proposal, and round changes
         // cannot mutate consensus concurrently.
-        for _ in 0..MAX_COMMANDS_PER_TURN {
+        let mut accepted_work_executed = false;
+        'commands: for _ in 0..MAX_COMMANDS_PER_TURN {
             let Ok(cmd) = command_rx.try_recv() else {
                 break;
             };
@@ -537,13 +607,18 @@ fn strand_loop(
                 }
                 ConsensusCommand::Accept(work) => {
                     // This command was emitted by a JtAccept job. Execute the
-                    // whole accept/end/start transition on the one owner.
+                    // complete accepted-ledger transition on the sole owner.
+                    // The endConsensus policy below runs before this turn may
+                    // drain another command, proposal, tx-set, completion, or
+                    // coordinator event, matching rippled's JtAccept closure.
                     let now = root.shared_time_keeper().close_time();
-                    runner.execute_accept(now, work);
+                    runner.execute_accept(now, *work);
                     scheduler.accept_consumed();
                     consensus_rt.update_phase(runner.phase());
                     consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
                     last_round_ledger_id = Some(runner.prev_ledger_id());
+                    accepted_work_executed = true;
+                    break 'commands;
                 }
                 ConsensusCommand::StartRound {
                     now,
@@ -555,7 +630,6 @@ fn strand_loop(
                     if runner.phase() != ConsensusPhase::Accepted
                         || scheduler.accept_is_queued()
                         || scheduler.has_pending_accept()
-                        || network_closed != local_prev_id
                         || root.closed_ledger().is_none_or(|current| {
                             *current.header().hash.as_uint256() != local_prev_id
                         })
@@ -570,6 +644,11 @@ fn strand_loop(
                         );
                         continue;
                     }
+                    // `network_closed` is the peer/validation target, while
+                    // `prev_ledger` is the local materialized parent. rippled
+                    // deliberately permits them to differ: beginConsensus then
+                    // enters WrongLedger/acquisition rather than stranding an
+                    // Accepted runner. Only the local parent must match LCL.
                     if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
                         inbound_tx.new_round(prev_ledger.seq());
                     }
@@ -594,109 +673,159 @@ fn strand_loop(
             continue;
         }
 
-        // ─── 1b. Mode demotion on insufficient peers (matching rippled processHeartbeatTimer)
-        if let Some(overlay_rt) = root.overlay_runtime() {
-            use overlay::Overlay;
-            let num_peers = overlay_rt.overlay().size();
-            let min_peers = min_peer_count;
-            let current_mode = root.network_ops_state().operating_mode();
-            if num_peers < min_peers {
-                if current_mode != NetworkOpsOperatingMode::Disconnected {
-                    root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Disconnected);
-                    tracing::warn!(
-                        target: "consensus",
-                        num_peers,
-                        min_peers,
-                        "Peer count below minimum — mode set to DISCONNECTED"
-                    );
-                }
-                // Skip consensus timer when disconnected (matching rippled)
-                root.wait_consensus_or_timeout(Duration::from_millis(500));
-                continue;
-            } else if let Some(mode_to_reassert) =
-                heartbeat_operating_mode_reassertion(current_mode)
-            {
-                // Match NetworkOPsImp::processHeartbeatTimer: reconnecting
-                // first reasserts CONNECTED, and an already CONNECTED or
-                // SYNCING node re-runs setMode so validated-ledger age can
-                // normalize it in either direction.
-                root.set_network_ops_operating_mode(mode_to_reassert);
-                if current_mode == NetworkOpsOperatingMode::Disconnected {
-                    tracing::info!(
-                        target: "consensus",
-                        num_peers,
-                        "Peer count sufficient — mode set to CONNECTED"
-                    );
+        let mut registry_completion_count = 0usize;
+        // A JtAccept closure in rippled performs doAccept then endConsensus
+        // without re-entering ordinary timer, ingress, acquisition, or
+        // completion handling. Preserve that adjacency on the strand after
+        // the owner receives accepted work.
+        if !accepted_work_executed {
+            // ─── 1b. Peer availability → coordinator owner, or legacy mode demotion
+            // (matching rippled processHeartbeatTimer). With the coordinator
+            // installed, the peer-availability fact and a heartbeat are fed to the
+            // coordinator owner, which alone writes the mode: usable peers (>= min)
+            // become a non-empty snapshot motivating Connected, below minimum is
+            // empty motivating Disconnected, and the heartbeat re-runs the phase
+            // port so validated-ledger age can normalize CONNECTED/SYNCING in
+            // either direction. Without it, the legacy writer below preserves the
+            // exact pre-migration behavior.
+            if let Some(overlay_rt) = root.overlay_runtime() {
+                use overlay::Overlay;
+                let num_peers = overlay_rt.overlay().size();
+                // Keep the configured threshold exactly.  In particular, rippled
+                // constructs `NetworkOPsImp` with `minPeerCount_ = 0` for
+                // `startValid` (NetworkOPs.cpp), so a peerless start-valid node
+                // continues driving consensus instead of being manufactured into
+                // DISCONNECTED.  The coordinator has no synthetic-peer concept:
+                // omit the empty availability fact in that one configuration so
+                // its lifecycle state continues to mirror rippled's mode.
+                let min_peers = required_peer_count(min_peer_count);
+                if shared_inbound.coordinator_installed() {
+                    let report_availability = should_report_peer_availability(min_peers, num_peers);
+                    if report_availability {
+                        let peers = if num_peers >= min_peers {
+                            overlay_rt
+                                .overlay()
+                                .active_peers()
+                                .into_iter()
+                                .map(|peer| peer.id())
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        shared_inbound.coordinator_report_peer_availability(&peers);
+                    }
+                    shared_inbound.coordinator_heartbeat();
+                    let current_mode = root.network_ops_state().operating_mode();
+                    if num_peers < min_peers {
+                        if current_mode != NetworkOpsOperatingMode::Disconnected {
+                            tracing::warn!(
+                                target: "consensus",
+                                num_peers,
+                                min_peers,
+                                "Peer count below minimum — coordinator phase set to DISCONNECTED"
+                            );
+                        }
+                        // Skip consensus timer when disconnected (matching rippled)
+                        root.wait_consensus_or_timeout(Duration::from_millis(500));
+                        continue;
+                    }
+                    if current_mode == NetworkOpsOperatingMode::Disconnected {
+                        tracing::info!(
+                            target: "consensus",
+                            num_peers,
+                            "Peer count sufficient — coordinator phase set to CONNECTED"
+                        );
+                    }
+                } else {
+                    let current_mode = root.network_ops_state().operating_mode();
+                    if num_peers < min_peers {
+                        if current_mode != NetworkOpsOperatingMode::Disconnected {
+                            root.set_network_ops_operating_mode_with_reason(
+                                NetworkOpsOperatingMode::Disconnected,
+                                "insufficient_peers",
+                            );
+                            tracing::warn!(
+                                target: "consensus",
+                                num_peers,
+                                min_peers,
+                                "Peer count below minimum — mode set to DISCONNECTED"
+                            );
+                        }
+                        // Skip consensus timer when disconnected (matching rippled)
+                        root.wait_consensus_or_timeout(Duration::from_millis(500));
+                        continue;
+                    } else if let Some(mode_to_reassert) =
+                        heartbeat_operating_mode_reassertion(current_mode)
+                    {
+                        // Match NetworkOPsImp::processHeartbeatTimer: reconnecting
+                        // first reasserts CONNECTED, and an already CONNECTED or
+                        // SYNCING node re-runs setMode so validated-ledger age can
+                        // normalize it in either direction.
+                        root.set_network_ops_operating_mode_with_reason(
+                            mode_to_reassert,
+                            "heartbeat_reassertion",
+                        );
+                        if current_mode == NetworkOpsOperatingMode::Disconnected {
+                            tracing::info!(
+                                target: "consensus",
+                                num_peers,
+                                "Peer count sufficient — mode set to CONNECTED"
+                            );
+                        }
+                    }
                 }
             }
-        }
 
-        // ─── 2. Schedule the 1s heartbeat before processing peer ingress ──
-        // `JtNetopTimer` has the reference priority/limit. The job only
-        // hands off a command; `timer_tick` remains serialized on this strand.
-        if last_timer_tick.elapsed() >= Duration::from_secs(1) {
-            let _ = scheduler.schedule_heartbeat();
-        }
+            // ─── 2. Schedule the 1s heartbeat before processing peer ingress ──
+            // `JtNetopTimer` has the reference priority/limit. The job only
+            // hands off a command; `timer_tick` remains serialized on this strand.
+            if last_timer_tick.elapsed() >= Duration::from_secs(1) {
+                let _ = scheduler.schedule_heartbeat();
+            }
 
-        // ─── 3. Drain a bounded proposal slice → peer_proposal() ─────────
-        drain_bounded(&proposal_rx, MAX_PROPOSALS_PER_TURN, |proposal| {
-            let now = root.shared_time_keeper().close_time();
-            let peer_close_time =
-                basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
-            // Match PeerImp::onMessage: the consensus position is keyed by
-            // the validator's master key, while `RclCxPeerPos::public_key`
-            // retains the signing key used to verify and relay the proposal.
-            let master_key = root.manifest_cache().get_master_key(&proposal.public_key);
-            let prop = consensus::ConsensusProposal::new(
-                proposal.previous_ledger,
-                proposal.message.propose_seq,
-                proposal.current_tx_hash,
-                peer_close_time,
-                now,
-                master_key,
-            );
-            let peer_pos = crate::consensus::rcl_cx_peer_pos::RclCxPeerPos::new(
-                proposal.public_key,
-                proposal.message.signature.clone(),
-                proposal.suppression,
-                prop,
-            );
-            // `PeerImp::checkPropose` relays a trusted proposal only when
-            // `NetworkOPsImp::processTrustedProposal` accepts it. The strand
-            // owns that call in Quaxar, so preserve the same result-gated
-            // relay here rather than treating successful queueing as
-            // acceptance.
-            if runner.peer_proposal(now, &peer_pos)
-                && let Some(overlay_runtime) = root.overlay_runtime()
-            {
-                overlay_runtime.overlay().relay_proposal(
-                    proposal.message,
-                    proposal.suppression,
-                    proposal.public_key,
+            // ─── 3. Drain a bounded proposal slice → peer_proposal() ─────────
+            drain_bounded(&proposal_rx, MAX_PROPOSALS_PER_TURN, |proposal| {
+                let now = root.shared_time_keeper().close_time();
+                let peer_close_time =
+                    basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
+                // Match PeerImp::onMessage: the consensus position is keyed by
+                // the validator's master key, while `RclCxPeerPos::public_key`
+                // retains the signing key used to verify and relay the proposal.
+                let master_key = root.manifest_cache().get_master_key(&proposal.public_key);
+                let prop = consensus::ConsensusProposal::new(
+                    proposal.previous_ledger,
+                    proposal.message.propose_seq,
+                    proposal.current_tx_hash,
+                    peer_close_time,
+                    now,
+                    master_key,
                 );
-            }
-        });
-        consensus_rt.update_phase(runner.phase());
-        consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-
-        // ─── 4. Drain a bounded tx-set completion slice → got_tx_set() ───
-        drain_bounded(&txset_rx, MAX_TXSET_COMPLETIONS_PER_TURN, |(hash, set)| {
-            let now = root.shared_time_keeper().close_time();
-            let tx_set = consensus::RclTxSet::from_parts(
-                set.root(),
-                Arc::clone(runner.adaptor.tx_set_cache()),
-                set.backed(),
-                0,
-            );
-            runner.got_tx_set(now, tx_set);
-            announce_completed_tx_set(&root, hash);
+                let peer_pos = crate::consensus::rcl_cx_peer_pos::RclCxPeerPos::new(
+                    proposal.public_key,
+                    proposal.message.signature.clone(),
+                    proposal.suppression,
+                    prop,
+                );
+                // `PeerImp::checkPropose` relays a trusted proposal only when
+                // `NetworkOPsImp::processTrustedProposal` accepts it. The strand
+                // owns that call in Quaxar, so preserve the same result-gated
+                // relay here rather than treating successful queueing as
+                // acceptance.
+                if runner.peer_proposal(now, &peer_pos)
+                    && let Some(overlay_runtime) = root.overlay_runtime()
+                {
+                    overlay_runtime.overlay().relay_proposal(
+                        proposal.message,
+                        proposal.suppression,
+                        proposal.public_key,
+                    );
+                }
+            });
             consensus_rt.update_phase(runner.phase());
-            tracing::debug!(target: "consensus", %hash, "strand: got_tx_set processed");
-        });
+            consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
 
-        // Also drain a bounded slice from the map-complete receiver.
-        if let Some(ref rx) = map_complete_rx {
-            drain_bounded(rx, MAX_MAP_COMPLETIONS_PER_TURN, |(hash, set)| {
+            // ─── 4. Drain a bounded tx-set completion slice → got_tx_set() ───
+            drain_bounded(&txset_rx, MAX_TXSET_COMPLETIONS_PER_TURN, |(hash, set)| {
                 let now = root.shared_time_keeper().close_time();
                 let tx_set = consensus::RclTxSet::from_parts(
                     set.root(),
@@ -707,112 +836,155 @@ fn strand_loop(
                 runner.got_tx_set(now, tx_set);
                 announce_completed_tx_set(&root, hash);
                 consensus_rt.update_phase(runner.phase());
-                tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (map_complete)");
+                tracing::debug!(target: "consensus", %hash, "strand: got_tx_set processed");
             });
-        }
 
-        // Durable recovery for completion notifications that could not enter
-        // the bounded map-complete channel. These are coalesced by tx-set hash
-        // in InboundTransactions and drained every strand turn.
-        let pending_map_completions = root
-            .inbound_transactions()
-            .lock()
-            .ok()
-            .map(|mut inbound| inbound.take_pending_map_completions(MAX_MAP_COMPLETIONS_PER_TURN))
-            .unwrap_or_default();
-        for (hash, set) in pending_map_completions {
-            let now = root.shared_time_keeper().close_time();
-            let tx_set = consensus::RclTxSet::from_parts(
-                set.root(),
-                Arc::clone(runner.adaptor.tx_set_cache()),
-                set.backed(),
-                0,
-            );
-            runner.got_tx_set(now, tx_set);
-            announce_completed_tx_set(&root, hash);
-            consensus_rt.update_phase(runner.phase());
-            tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (durable map completion)");
-        }
-
-        // ─── 5. Persist inbound completion before LCL reconciliation ────
-        // ─── 6a. completion recovery — registry is authoritative ────────
-        // The sender is only a wakeup optimization. The inbound registry
-        // exposes successful terminal work through a direct ready queue, so
-        // this path follows rippled `AcqDone` ordering without scanning
-        // arbitrary in-progress acquisitions.
-        let mut registry_completion_count = 0usize;
-        if let Some(lm_rt) = root.ledger_master_runtime() {
-            let lm = lm_rt.ledger_master();
-            let registry_completions =
-                shared_inbound.poll_results_bounded(MAX_LEDGER_COMPLETIONS_PER_TURN);
-            registry_completion_count = registry_completions.len();
-            if registry_completion_count != 0 {
-                tracing::info!(
-                    target: "lcl_trace",
-                    event = "completion_batch_polled",
-                    source = "registry_poll",
-                    count = registry_completion_count,
-                    runner_phase = ?runner.phase(),
-                    "LCL trace: completed inbound ledgers are ready for persistence"
-                );
+            // Also drain a bounded slice from the map-complete receiver.
+            if let Some(ref rx) = map_complete_rx {
+                drain_bounded(rx, MAX_MAP_COMPLETIONS_PER_TURN, |(hash, set)| {
+                    let now = root.shared_time_keeper().close_time();
+                    let tx_set = consensus::RclTxSet::from_parts(
+                        set.root(),
+                        Arc::clone(runner.adaptor.tx_set_cache()),
+                        set.backed(),
+                        0,
+                    );
+                    runner.got_tx_set(now, tx_set);
+                    announce_completed_tx_set(&root, hash);
+                    consensus_rt.update_phase(runner.phase());
+                    tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (map_complete)");
+                });
             }
-            for (hash, acquisition_id, ledger, reason) in registry_completions {
-                let ledger = Arc::new(ledger);
-                let persisted = persist_completed_inbound_ledger(&root, &lm, &ledger, reason);
-                // Match rippled's completed-ledger handoff: make the ledger
-                // resolver-visible before evaluating validation quorum. The
-                // adaptor-local map is the canonical fast path for
-                // `check_acquired`; registering after checkAccept could turn
-                // a completed ledger into a redundant Generic acquisition.
-                root.validations().register_ledger(&ledger);
-                root.check_accept_completed_inbound_ledger(Arc::clone(&ledger));
-                trace_completed_inbound_handoff(
-                    "registry_ready",
-                    &lm,
-                    &ledger,
-                    reason,
-                    acquisition_id,
-                    persisted,
+
+            // Durable recovery for completion notifications that could not enter
+            // the bounded map-complete channel. These are coalesced by tx-set hash
+            // in InboundTransactions and drained every strand turn.
+            let pending_map_completions = root
+                .inbound_transactions()
+                .lock()
+                .ok()
+                .map(|mut inbound| {
+                    inbound.take_pending_map_completions(MAX_MAP_COMPLETIONS_PER_TURN)
+                })
+                .unwrap_or_default();
+            for (hash, set) in pending_map_completions {
+                let now = root.shared_time_keeper().close_time();
+                let tx_set = consensus::RclTxSet::from_parts(
+                    set.root(),
+                    Arc::clone(runner.adaptor.tx_set_cache()),
+                    set.backed(),
+                    0,
                 );
-                // The queue item is acknowledged only after persistence,
-                // canonical resolver publication, and acceptance dispatch.
-                // A failed persistence remains ready for a fair later retry.
-                if persisted.acknowledged {
-                    shared_inbound.acknowledge_completed(&hash, acquisition_id);
+                runner.got_tx_set(now, tx_set);
+                announce_completed_tx_set(&root, hash);
+                consensus_rt.update_phase(runner.phase());
+                tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (durable map completion)");
+            }
+
+            // ─── 5. Persist inbound completion before LCL reconciliation ────
+            // ─── 6a. legacy completion recovery — registry is authoritative ──
+            // Coordinator durable handoffs have their own acknowledged channel
+            // below. M7 installation rejects a live or unacknowledged legacy
+            // lifecycle, so coordinator mode must not poll the legacy ready queue.
+            if !shared_inbound.coordinator_installed()
+                && let Some(lm_rt) = root.ledger_master_runtime()
+            {
+                let lm = lm_rt.ledger_master();
+                let registry_completions =
+                    shared_inbound.poll_results_bounded(MAX_LEDGER_COMPLETIONS_PER_TURN);
+                registry_completion_count = registry_completions.len();
+                if registry_completion_count != 0 {
+                    tracing::info!(
+                        target: "lcl_trace",
+                        event = "completion_batch_polled",
+                        source = "registry_poll",
+                        count = registry_completion_count,
+                        runner_phase = ?runner.phase(),
+                        "LCL trace: completed inbound ledgers are ready for persistence"
+                    );
+                }
+                for (hash, acquisition_id, ledger, reason) in registry_completions {
+                    process_completed_inbound_ledger(
+                        &root,
+                        &lm,
+                        &shared_inbound,
+                        "registry_ready",
+                        hash,
+                        acquisition_id,
+                        Arc::new(ledger),
+                        reason,
+                        true,
+                    );
                 }
             }
-        }
 
-        // ─── 6b. completion wakeups ──────────────────────────────────────
-        // Registry polling above is the only persistence/checkAccept/ack owner.
-        // These bounded receivers merely wake this turn; processing them here
-        // would duplicate a completion that is still retained in the registry.
-        if let Some(lm_rt) = root.ledger_master_runtime() {
-            let rx_guard = lm_rt
-                .completed_ledgers_rx
-                .lock()
-                .expect("completed_ledgers_rx");
-            if let Some(rx) = rx_guard.as_ref() {
-                drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |_| {});
+            // ─── 6b. completion wakeups / coordinator durable handoff ────────
+            // Registry polling above is the only persistence/checkAccept/ack owner
+            // for legacy sessions; those bounded receivers merely wake this turn
+            // and never duplicate a completion still retained in the registry.
+            // Coordinator durable handoffs (`from_coordinator`) have no registry
+            // ready-queue entry: the coordinator session terminalized at the
+            // durability fence, so the strand consumes those items authoritatively
+            // (persist + register + checkAccept + trace), exactly once, per the
+            // M5 durable-only handoff protocol.
+            if let Some(lm_rt) = root.ledger_master_runtime() {
+                let lm = lm_rt.ledger_master();
+                let receipt_budget = MAX_PENDING_DURABLE_ACKS
+                    .saturating_sub(pending_durable_acks.len())
+                    .min(MAX_LEDGER_COMPLETIONS_PER_TURN);
+                let completed = {
+                    let rx_guard = lm_rt
+                        .completed_ledgers_rx
+                        .lock()
+                        .expect("completed_ledgers_rx");
+                    rx_guard
+                        .as_ref()
+                        .map(|rx| rx.try_iter().take(receipt_budget).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                };
+                for item in completed {
+                    process_coordinator_completed_inbound_ledger(
+                        &root,
+                        &lm,
+                        &shared_inbound,
+                        &item,
+                        &mut coordinator_handoff_dedup,
+                        &mut pending_durable_acks,
+                    );
+                }
             }
-        }
-        if let Some(ref rx) = shared_completed_rx {
-            drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |_| {});
-        }
+            if let Some(ref rx) = shared_completed_rx {
+                let lm = root
+                    .ledger_master_runtime()
+                    .map(|lm_rt| lm_rt.ledger_master());
+                if let Some(lm) = lm {
+                    drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |item| {
+                        process_coordinator_completed_inbound_ledger(
+                            &root,
+                            &lm,
+                            &shared_inbound,
+                            &item,
+                            &mut coordinator_handoff_dedup,
+                            &mut pending_durable_acks,
+                        );
+                    });
+                }
+            }
 
-        // ─── 6c. pending_consensus_ledger → acquire_async ────────────────
-        if let Some(lm_rt) = root.ledger_master_runtime() {
-            let pending = lm_rt.take_pending_consensus_ledger();
-            if let Some(hash) = pending {
-                tracing::info!(
-                    target: "lcl_trace",
-                    event = "pending_consensus_target_acquire",
-                    %hash,
-                    "LCL trace: pending consensus ledger is being acquired"
-                );
-                // A pending consensus ledger is keyed by hash only. Do not
-                // infer its sequence from a peer's independent history range.
-                shared_inbound.acquire_closed_ledger_async(hash, AcquireReason::Consensus);
+            // ─── 6c. pending_consensus_ledger → acquire_async ────────────────
+            if let Some(lm_rt) = root.ledger_master_runtime() {
+                let pending = lm_rt.take_pending_consensus_ledger();
+                if let Some(hash) = pending {
+                    tracing::info!(
+                        target: "lcl_trace",
+                        event = "pending_consensus_target_acquire",
+                        %hash,
+                        "LCL trace: pending consensus ledger is being acquired"
+                    );
+                    // A pending consensus ledger is keyed by hash only. Do not
+                    // infer its sequence from a peer's independent history range.
+                    shared_inbound.acquire_closed_ledger_async(hash, AcquireReason::Consensus);
+                }
             }
         }
 
@@ -901,10 +1073,33 @@ fn strand_loop(
         // round. A missing preferred target already began generic consensus
         // with that target (WrongLedger); a switch already began exactly one
         // replacement round (normal/SwitchedLedger handling stays generic).
-        if should_begin_ordinary_round(end_consensus_pass, reconciliation)
-            && !scheduler.accept_is_queued()
-            && !scheduler.has_pending_accept()
-        {
+        let ordinary_round_eligible =
+            should_begin_ordinary_round(end_consensus_pass, reconciliation)
+                && !scheduler.accept_is_queued()
+                && !scheduler.has_pending_accept();
+        if let Some(closed) = root.closed_ledger() {
+            let closed_id = *closed.header().hash.as_uint256();
+            let restart_suppressed =
+                !ordinary_round_eligible || last_round_ledger_id == Some(closed_id);
+            if restart_suppressed && last_restart_gate_ledger_id != Some(closed_id) {
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "ordinary_consensus_round_restart_suppressed",
+                    local_lcl_hash = %closed_id,
+                    local_lcl_seq = closed.header().seq,
+                    end_consensus_pass,
+                    reconciliation = ?reconciliation,
+                    last_round_already_closed = last_round_ledger_id == Some(closed_id),
+                    runner_phase = ?runner.phase(),
+                    "LCL trace: ordinary consensus round restart suppressed"
+                );
+                last_restart_gate_ledger_id = Some(closed_id);
+            } else if !restart_suppressed {
+                last_restart_gate_ledger_id = None;
+            }
+        }
+
+        if ordinary_round_eligible {
             let _lcl_transition_guard = root.lcl_transition_gate().lock();
             if let Some(closed) = root.closed_ledger() {
                 let closed_id = *closed.header().hash.as_uint256();
@@ -974,6 +1169,22 @@ fn cycle_obsolete_peer_statuses(root: &ApplicationRoot) {
             }
         }
     }
+}
+
+/// Preserve rippled's configured peer threshold. In particular,
+/// `NetworkOPsImp` forces it to zero for `startValid`, allowing a local
+/// start-valid validator to continue consensus without overlay peers.
+fn required_peer_count(configured_minimum: usize) -> usize {
+    configured_minimum
+}
+
+/// The coordinator's empty snapshot is a concrete peer-loss fact and would
+/// transition it to `Disconnected`. Rippled does not emit that demotion when
+/// its effective peer threshold is zero (`startValid`), so do not fabricate an
+/// empty availability fact in that case. A non-empty snapshot is still fed so
+/// the coordinator learns a real peer connection.
+fn should_report_peer_availability(minimum_peers: usize, num_peers: usize) -> bool {
+    minimum_peers != 0 || num_peers != 0
 }
 
 /// The rippled heartbeat re-applies these modes even when no peer-count
@@ -1395,6 +1606,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
 
         restart_preferred_lcl_recovery(
             root,
+            shared_inbound,
             runner,
             consensus_rt,
             last_round_ledger_id,
@@ -1420,15 +1632,19 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             "check_last_closed_ledger",
             "rejected_hash_mismatch",
         );
-        shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
+        // Demote before the acquire demand so a coordinator-owned session is
+        // minted from `Syncing` (M6-C ordering: `PreferredLclDivergence` drains
+        // before `AcquireRequested`).
         restart_preferred_lcl_recovery(
             root,
+            shared_inbound,
             runner,
             consensus_rt,
             last_round_ledger_id,
             preferred_hash,
             &our_closed,
         );
+        shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
         return PreferredLclReconciliation::Pending;
     }
 
@@ -1525,15 +1741,18 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         // completed inbound ledger. A resolver-visible partial ledger is
         // therefore equivalent to a miss: keep the desired hash as
         // `networkClosed` and let generic WrongLedger recovery acquire it.
-        shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
+        // Demote before the acquire demand so a coordinator-owned session is
+        // minted from `Syncing` (M6-C ordering).
         restart_preferred_lcl_recovery(
             root,
+            shared_inbound,
             runner,
             consensus_rt,
             last_round_ledger_id,
             preferred_hash,
             &our_closed,
         );
+        shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
         return PreferredLclReconciliation::Pending;
     }
     if !can_be_current || !compatible {
@@ -1574,7 +1793,11 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     // Rippled demotes only after the candidate survives canBeCurrent and
     // compatibility admission. In particular, an incompatible resolver hit
     // returns false from checkLastClosedLedger without a FULL→CONNECTED flap.
-    demote_for_preferred_lcl_divergence(root);
+    demote_for_preferred_lcl_divergence(
+        root,
+        shared_inbound,
+        acquisition::LedgerTarget::new(preferred_hash, Some(candidate.header().seq)),
+    );
 
     switch_last_closed_ledger(
         root,
@@ -1594,13 +1817,31 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
 /// Rippled performs this after the `canBeCurrent`/`isCompatible` rejection
 /// path in `checkLastClosedLedger`, not immediately after selecting a different
 /// preferred hash.
-fn demote_for_preferred_lcl_divergence(root: &ApplicationRoot) {
-    if matches!(
+///
+/// When the coordinator owns service phase this feeds the typed
+/// `PreferredLclDivergence` fact (demoting `Tracking/Full -> Syncing` without
+/// minting a session); otherwise the legacy direct write remains. The caller
+/// must run this before any `acquire_closed_ledger_async` demand so the
+/// demotion drains first and the demand is accepted from `Syncing`.
+fn demote_for_preferred_lcl_divergence(
+    root: &ApplicationRoot,
+    shared_inbound: &Arc<InboundLedgers>,
+    target: acquisition::LedgerTarget,
+) {
+    if !matches!(
         root.network_ops_operating_mode(),
         NetworkOpsOperatingMode::Tracking | NetworkOpsOperatingMode::Full
     ) {
-        root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Connected);
+        return;
     }
+    if shared_inbound.coordinator_installed() {
+        shared_inbound.coordinator_preferred_lcl_divergence(target);
+        return;
+    }
+    root.set_network_ops_operating_mode_with_reason(
+        NetworkOpsOperatingMode::Connected,
+        "preferred_lcl_divergence",
+    );
 }
 
 /// Preserve rippled's endConsensus → beginConsensus path when the preferred
@@ -1609,13 +1850,22 @@ fn demote_for_preferred_lcl_divergence(root: &ApplicationRoot) {
 /// WrongLedger/GetConsL1 recovery.
 fn restart_preferred_lcl_recovery(
     root: &ApplicationRoot,
+    shared_inbound: &Arc<InboundLedgers>,
     runner: &mut dyn ConsensusRunner,
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
     target: Uint256,
     our_closed: &Arc<ledger::Ledger>,
 ) {
-    demote_for_preferred_lcl_divergence(root);
+    // The divergence fact drains before the caller's acquire demand so a
+    // coordinator-owned session is minted from `Syncing`. Sequence is unknown
+    // for an absent/incomplete preferred LCL: keep it `None` until the response
+    // header establishes it (rippled `getLedgerByHash` parity).
+    demote_for_preferred_lcl_divergence(
+        root,
+        shared_inbound,
+        acquisition::LedgerTarget::new(target, None),
+    );
     let now = root.shared_time_keeper().close_time();
     let prev_cx = crate::consensus_ledger_from_ledger(our_closed);
     if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
@@ -1679,7 +1929,13 @@ fn switch_last_closed_ledger(
 
     // This matches rippled switchLastClosedLedger: the visible waiting state
     // clears only after a real LCL jump, never on a target replacement.
-    root.set_need_network_ledger(false);
+    // M6-E: with the coordinator installed the atomic is the phase port's
+    // derived output; `coordinator_lcl_installed` (fed below) drives the phase
+    // to Tracking/Full whose derived value is false. The direct write remains
+    // the coordinator-less rollback path.
+    if !shared_inbound.coordinator_installed() {
+        root.set_need_network_ledger(false);
+    }
     root.process_closed_ledger_txq(ledger.as_ref(), true);
     root.rebuild_open_ledger_after_consensus(Arc::clone(&ledger), &[], false);
     root.on_closed_ledger(Arc::clone(&ledger));
@@ -1687,6 +1943,12 @@ fn switch_last_closed_ledger(
     // LedgerMaster::switchLCL, whose non-standalone branch runs
     // checkAccept(lastClosed) after installing the new closed ledger.
     root.check_accept_after_lcl_switch(Arc::clone(&ledger));
+    // Coordinator mode: report the LCL installation as a typed fact so the
+    // coordinator can transition `Syncing -> Tracking` for its own target.
+    if shared_inbound.coordinator_installed() {
+        shared_inbound
+            .coordinator_lcl_installed(acquisition::LedgerIdentity::new(new_hash, new_seq));
+    }
     status_broadcaster(root, ledger.as_ref(), 3, true);
     let proposing = root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full;
     let now = root.shared_time_keeper().close_time();
@@ -1734,11 +1996,36 @@ fn check_accept_and_advance(
     // existing transition gate for validation/publication consistency only.
     let _lcl_transition_guard = root.lcl_transition_gate().lock();
 
-    // Acceptance and `tryAdvance` are driven by validation receipt and the
-    // inbound `AcqDone`-equivalent handoff above. Do not periodically derive
-    // and acquire valid_seq + 1: rippled only starts Consensus work for a
-    // concrete consensus/validation target, and fills publication gaps with
-    // Generic work below.
+    // Normal in-place consensus advancement has already installed the closed
+    // ledger before this serialized pass. Report that fact just as the
+    // preferred-LCL switch path does: otherwise a coordinator that began in
+    // Syncing never learns its matching target became the LCL, even while
+    // validation and publication advance normally. The runner admits it only
+    // for its exact Syncing target (or from Connected), so an unrelated
+    // closed ledger cannot promote the phase.
+    if shared_inbound.coordinator_installed() {
+        if let Some(closed) = root.closed_ledger() {
+            // A restarted node can resume a round on the durable recovered
+            // target and accept its first child before this maintenance turn.
+            // In that case rippled's switch/accept path has already made the
+            // target a real ancestor of the new LCL, but the coordinator is
+            // still `Syncing { target }`. Bridge that source-proven ancestry
+            // first, then refresh Tracking with the actual LCL below. Without
+            // this ordering, the exact-hash Syncing gate rejects the child and
+            // the node remains Observing forever after a successful catch-up.
+            if let Some(snapshot) = shared_inbound.coordinator_snapshot()
+                && let acquisition::SyncPhase::Syncing { target } = snapshot.phase()
+                && let Some(recovered_target) =
+                    recovered_target_is_contiguous_to_lcl(closed.as_ref(), *target)
+            {
+                shared_inbound.coordinator_lcl_installed(recovered_target);
+            }
+            shared_inbound.coordinator_lcl_installed(acquisition::LedgerIdentity::new(
+                *closed.header().hash.as_uint256(),
+                closed.header().seq,
+            ));
+        }
+    }
 
     // ── tryAdvance publication ────────────────────────────────────────────
     let published_before = root
@@ -1756,11 +2043,51 @@ fn check_accept_and_advance(
         (Some(before), Some(after)) => before != after,
         _ => false,
     };
+    // M6-E: with the coordinator installed the atomic is the phase port's
+    // derived output; the `coordinator_publication_committed` fact below drives
+    // `Tracking -> Full` (whose derived value is false) when the advance is
+    // fresh, and leaves it true while a concrete target is still Syncing. The
+    // direct write remains the coordinator-less rollback path.
     if root.need_network_ledger()
         && publication_advanced
         && published_after.is_some_and(|(_, seq)| seq <= lm.valid_ledger_seq())
+        && !shared_inbound.coordinator_installed()
     {
         root.set_need_network_ledger(false);
+    }
+
+    // Coordinator mode: report the current publication as a typed fact on
+    // every serialized non-divergent maintenance pass. Validation acceptance
+    // can publish synchronously before this function snapshots
+    // `published_before`; gating this bridge on `publication_advanced` would
+    // lose the only fact capable of completing `Tracking -> Full`.
+    //
+    // Rippled's `endConsensus` promotes Tracking to Full from current-open
+    // freshness; it does not require publication to equal the newest LCL.
+    // Preserve the coordinator's typed invariant by forwarding an earlier
+    // publication only after proving it is a contiguous ancestor of the local
+    // LCL. A stale, forked, or forward publication never reaches the runner.
+    if shared_inbound.coordinator_installed() {
+        if let (Some((hash, seq)), Some(closed)) = (published_after, root.closed_ledger())
+            && published_anchor_is_contiguous_to_lcl(closed.as_ref(), hash, seq)
+        {
+            let now_close_time = root.current_close_time_seconds();
+            let fresh = root
+                .open_ledger()
+                .current_header_timing()
+                .map(|timing| {
+                    let resolution = u32::from(timing.close_time_resolution);
+                    let freshness_deadline = timing
+                        .parent_close_time
+                        .saturating_add(resolution.saturating_mul(2));
+                    now_close_time < freshness_deadline
+                })
+                .unwrap_or(false);
+            shared_inbound.coordinator_publication_committed(
+                acquisition::LedgerIdentity::new(hash, seq),
+                fresh,
+            );
+        }
     }
 
     // ── Update complete_ledgers display ──────────────────────────────────
@@ -1776,7 +2103,10 @@ fn check_accept_and_advance(
     // pass promote the node, matching NetworkOPsImp::endConsensus.
     // The TRACKING transition alone is guarded by needNetworkLedger. As in
     // NetworkOPsImp::endConsensus, the subsequent FULL freshness check is not.
-    if allow_mode_promotion
+    // Coordinator mode owns the promotion via the typed publication fact above;
+    // the legacy strand writer remains only when the coordinator is absent.
+    if !shared_inbound.coordinator_installed()
+        && allow_mode_promotion
         && root
             .published_ledger()
             .or_else(|| root.closed_ledger())
@@ -1845,7 +2175,7 @@ fn check_accept_and_advance(
                 "LCL trace: operating-mode promotion decision"
             );
             tracing::info!(target: "app", ?current_mode, ?next_mode, "strand: operating mode promoted");
-            root.set_network_ops_operating_mode(next_mode);
+            root.set_network_ops_operating_mode_with_reason(next_mode, "accept_promotion");
         }
     }
 
@@ -2073,6 +2403,7 @@ fn history_fetch_pack_requested(
     is_primary && !recent_failure && !acquire_returned_ledger
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // history-fetch dedup helper; exercised by strand tests, retained for M6-E
 fn same_history_fetch_pack_is_suppressed(in_flight: Option<(u32, Instant)>, missing: u32) -> bool {
     in_flight.is_some_and(|(requested, _)| requested == missing)
 }
@@ -2105,6 +2436,98 @@ fn trace_completed_inbound_handoff(
         acknowledged = persisted.acknowledged,
         "LCL trace: inbound ledger completion persisted before adoption"
     );
+}
+
+/// Process one complete coordinator durable handoff. The acknowledgement is
+/// queued only after the existing persistence, register, and checkAccept path
+/// returns. This means enqueue alone cannot complete a coordinator session.
+fn process_coordinator_completed_inbound_ledger(
+    root: &ApplicationRoot,
+    lm: &ledger::LedgerMaster,
+    shared_inbound: &Arc<crate::ledger::inbound_ledgers::InboundLedgers>,
+    item: &crate::ledger::inbound_ledgers::CompletedInboundLedger,
+    dedup: &mut CoordinatorHandoffDedup,
+    pending_acks: &mut VecDeque<(DurableHandoffId, SessionRef)>,
+) {
+    let Some((handoff, session)) = item.coordinator_handoff() else {
+        return;
+    };
+    if !dedup.claim(handoff, session) {
+        tracing::debug!(
+            target: "lcl_trace",
+            event = "coordinator_durable_handoff_duplicate",
+            handoff = handoff.get(),
+            session_id = session.session_id().get(),
+            "skipping duplicate completed-ledger delivery while recipient acknowledgement is pending"
+        );
+        return;
+    }
+
+    let persisted = process_completed_inbound_ledger(
+        root,
+        lm,
+        shared_inbound,
+        "coordinator_durable",
+        *item.ledger.header().hash.as_uint256(),
+        item.acquisition_id,
+        Arc::clone(&item.ledger),
+        item.reason,
+        false,
+    );
+    // The bridge only enqueues the typed event after the recipient accepted
+    // this exact durable record. It deliberately does not install an LCL or
+    // publish a ledger, and it does not run coordinator work while this
+    // completed-ledger receiver lock is held.
+    if persisted.acknowledged {
+        if !shared_inbound.acknowledge_coordinator_durable_handoff(handoff, session) {
+            // Queue capacity is twice one bounded completed-ledger slice, so
+            // normal receipt processing cannot overflow it. If a producer is
+            // persistently backpressured, leave this exact dedup claim intact
+            // and retry before later consensus work on the next strand turn.
+            if pending_acks.len() < MAX_PENDING_DURABLE_ACKS {
+                pending_acks.push_back((handoff, session));
+            }
+        }
+    } else {
+        dedup.release(handoff, session);
+        let _ = shared_inbound.reject_coordinator_durable_handoff(handoff, session);
+    }
+}
+
+/// Persist, register, accept-check, and trace one completed inbound ledger.
+/// Shared by the registry ready-queue poll (legacy sessions, which then ack
+/// their registry entry) and the coordinator durable handoff channel (which
+/// has no registry entry to ack; the coordinator learns of recipient acceptance
+/// through `DurableHandoffAcknowledged`).
+#[allow(clippy::too_many_arguments)]
+fn process_completed_inbound_ledger(
+    root: &ApplicationRoot,
+    lm: &ledger::LedgerMaster,
+    shared_inbound: &Arc<crate::ledger::inbound_ledgers::InboundLedgers>,
+    source: &'static str,
+    hash: Uint256,
+    acquisition_id: u64,
+    ledger: Arc<ledger::Ledger>,
+    reason: AcquireReason,
+    acknowledge_registry: bool,
+) -> CompletionPersistence {
+    let persisted = persist_completed_inbound_ledger(root, lm, &ledger, reason);
+    // Match rippled's completed-ledger handoff: make the ledger
+    // resolver-visible before evaluating validation quorum. The adaptor-local
+    // map is the canonical fast path for `check_acquired`; registering after
+    // checkAccept could turn a completed ledger into a redundant Generic
+    // acquisition.
+    root.validations().register_ledger(&ledger);
+    root.check_accept_completed_inbound_ledger(Arc::clone(&ledger));
+    trace_completed_inbound_handoff(source, lm, &ledger, reason, acquisition_id, persisted);
+    // The registry queue item is acknowledged only after persistence, canonical
+    // resolver publication, and acceptance dispatch. A failed persistence
+    // remains ready for a fair later retry. Coordinator sessions are not in the
+    // registry queue, so they never acknowledge here.
+    if persisted.acknowledged && acknowledge_registry {
+        shared_inbound.acknowledge_completed(&hash, acquisition_id);
+    }
+    persisted
 }
 
 fn fill_verified_history_range(
@@ -2397,6 +2820,36 @@ fn history_hash_for_seq(
 /// A history fetch may be persisted as trusted full history only if a current
 /// validated anchor names this exact hash at the candidate sequence. This is
 /// the local equivalent of rippled's doAdvance/fetchForHistory chain proof.
+/// Prove a published ledger is the local LCL itself or a known contiguous
+/// ancestor. This is the adapter-side witness required before the coordinator
+/// can interpret a publication fact as `ChainContiguous`.
+fn published_anchor_is_contiguous_to_lcl(
+    lcl: &ledger::Ledger,
+    published_hash: Uint256,
+    published_seq: u32,
+) -> bool {
+    if published_seq > lcl.header().seq {
+        return false;
+    }
+    if published_seq == lcl.header().seq {
+        return *lcl.header().hash.as_uint256() == published_hash;
+    }
+    lcl.hash_of_seq(published_seq, &ledger::NullLedgerJournal)
+        .is_some_and(|hash| *hash.as_uint256() == published_hash)
+}
+
+/// Prove that a recovered coordinator target is the local LCL itself or a
+/// known ancestor. This witnesses the rippled `switchLastClosedLedger` /
+/// first accepted-child ordering before NetworkOps reports the actual LCL.
+fn recovered_target_is_contiguous_to_lcl(
+    lcl: &ledger::Ledger,
+    target: acquisition::LedgerTarget,
+) -> Option<acquisition::LedgerIdentity> {
+    let sequence = target.sequence()?;
+    published_anchor_is_contiguous_to_lcl(lcl, target.hash(), sequence)
+        .then_some(acquisition::LedgerIdentity::new(target.hash(), sequence))
+}
+
 fn is_validated_history_ancestor(lm: &ledger::LedgerMaster, ledger: &ledger::Ledger) -> bool {
     let Some(validated) = lm.validated_ledger() else {
         return false;
@@ -2456,13 +2909,15 @@ fn should_acquire_history(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsensusJobScheduler, LclAuditSampler, MAX_LEDGER_COMPLETIONS_PER_TURN,
-        MAX_PROPOSALS_PER_TURN, PreferredLclReconciliation, drain_bounded,
-        heartbeat_operating_mode_reassertion, history_acquire_allowed,
-        history_fetch_pack_requested, persist_completed_inbound_ledger, reconcile_preferred_lcl,
-        record_completed_inbound_ledger, same_history_fetch_pack_is_suppressed,
+        ConsensusJobScheduler, CoordinatorHandoffDedup, LclAuditSampler,
+        MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, MAX_PROPOSALS_PER_TURN,
+        PreferredLclReconciliation, drain_bounded, heartbeat_operating_mode_reassertion,
+        history_acquire_allowed, history_fetch_pack_requested, persist_completed_inbound_ledger,
+        reconcile_preferred_lcl, reconcile_preferred_lcl_with_status_broadcaster,
+        record_completed_inbound_ledger, recovered_target_is_contiguous_to_lcl,
+        required_peer_count, same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
         should_promote_operating_mode_at_end_consensus, should_reconcile_preferred_lcl,
-        should_run_end_consensus_reconciliation,
+        should_report_peer_availability, should_run_end_consensus_reconciliation,
     };
     use crate::consensus::rcl_consensus::{ConsensusRunner, PendingAcceptWork, RclCxLedger};
     use crate::consensus::rcl_cx_peer_pos::RclCxPeerPos;
@@ -2472,6 +2927,9 @@ mod tests {
     use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
     use crate::runtime::component_runtime::{AppConsensusRuntime, ConsensusCommand};
     use crate::{ApplicationRoot, NetworkOpsOperatingMode};
+    use acquisition::{
+        DurableHandoffId, IdCounter, LedgerIdentity, LedgerTarget, SessionRef, StoreGeneration,
+    };
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;
     use basics::chrono::NetClockTimePoint;
@@ -2480,12 +2938,12 @@ mod tests {
     use basics::tagged_cache::MonotonicClock;
     use consensus::algorithm::ConsensusPhase;
     use ledger::{
-        FetchPackCache, Ledger, LedgerHeader, LedgerMaster, LedgerMasterConfig,
+        Fees, FetchPackCache, Ledger, LedgerConfig, LedgerHeader, LedgerMaster, LedgerMasterConfig,
         calculate_ledger_hash,
     };
     use nodestore::{DummyScheduler, ManagerImp, NullJournal, Scheduler};
     use protocol::{
-        KeyType, STValidation, calc_node_id, derive_public_key, generate_secret_key,
+        FeatureSet, KeyType, STValidation, calc_node_id, derive_public_key, generate_secret_key,
         get_field_by_symbol, random_seed,
     };
     use shamap::family::FullBelowCacheImpl;
@@ -2531,6 +2989,43 @@ mod tests {
         );
         ledger.set_immutable(true);
         Arc::new(ledger)
+    }
+
+    #[test]
+    fn recovered_target_ancestor_bridges_syncing_before_actual_lcl_refresh() {
+        let config = LedgerConfig::new(
+            Fees {
+                base: 10,
+                reserve: 20,
+                increment: 30,
+            },
+            FeatureSet::new([]),
+        );
+        let target =
+            Ledger::create_genesis(false, &config, []).expect("genesis target should build");
+        let target_identity =
+            LedgerIdentity::new(*target.header().hash.as_uint256(), target.header().seq);
+        let mut child = Ledger::from_previous(&target, 10);
+        child
+            .update_skip_list()
+            .expect("first accepted child should retain its parent hash");
+
+        assert_eq!(
+            recovered_target_is_contiguous_to_lcl(
+                &child,
+                LedgerTarget::new(target_identity.hash(), Some(target_identity.sequence())),
+            ),
+            Some(target_identity),
+            "a recovered preferred target used as the accepted child's parent must satisfy the coordinator's exact target gate before the actual LCL refresh",
+        );
+        assert_eq!(
+            recovered_target_is_contiguous_to_lcl(
+                &child,
+                LedgerTarget::new(Uint256::from_u64(0xBAD), Some(target_identity.sequence())),
+            ),
+            None,
+            "a same-sequence fork must not receive the recovered-target bridge",
+        );
     }
 
     fn install_real_provisional_lcl_candidate(
@@ -2604,19 +3099,25 @@ mod tests {
         (dir, inbound)
     }
 
-    fn preferred_validation(hash: Uint256, seq: u32) -> (protocol::NodeID, RclValidation) {
+    fn preferred_validation(
+        hash: Uint256,
+        seq: u32,
+        sign_time: u32,
+    ) -> (protocol::NodeID, RclValidation) {
         let seed = random_seed();
         let secret_key =
             generate_secret_key(KeyType::Secp256k1, &seed).expect("validation signing key");
         let public_key =
             derive_public_key(KeyType::Secp256k1, &secret_key).expect("validation public key");
         let node_id = calc_node_id(&public_key);
-        let validation =
-            STValidation::new_signed(1_000, &public_key, node_id, &secret_key, |value| {
+        let mut validation =
+            STValidation::new_signed(sign_time, &public_key, node_id, &secret_key, |value| {
                 value.set_field_h256(get_field_by_symbol("sfLedgerHash"), hash);
                 value.set_field_u32(get_field_by_symbol("sfLedgerSequence"), seq);
+                value.set_field_u32(get_field_by_symbol("sfFlags"), protocol::VF_FULL_VALIDATION);
             })
             .expect("signed preferred validation");
+        validation.set_trusted();
         (node_id, RclValidation::new(Arc::new(validation)))
     }
 
@@ -2668,6 +3169,32 @@ mod tests {
         fn prev_ledger_id(&self) -> Uint256 {
             self.prev
         }
+    }
+
+    #[test]
+    fn coordinator_handoff_dedup_is_exact_and_bounded() {
+        let mut ids = IdCounter::new();
+        let session = SessionRef::new(
+            ids.next_id(),
+            ids.next_id(),
+            Uint256::from(1),
+            ids.next_id(),
+            StoreGeneration::new(1),
+        );
+        let mut dedup = CoordinatorHandoffDedup::default();
+        assert!(dedup.claim(DurableHandoffId::new(1), session));
+        assert!(
+            !dedup.claim(DurableHandoffId::new(1), session),
+            "the same exact handoff/session pair is processed once"
+        );
+
+        for handoff in 2..=(MAX_COORDINATOR_HANDOFF_DEDUP as u64 + 1) {
+            assert!(dedup.claim(DurableHandoffId::new(handoff), session));
+        }
+        assert!(
+            dedup.claim(DurableHandoffId::new(1), session),
+            "the bounded local cache evicts the oldest completed delivery"
+        );
     }
 
     #[test]
@@ -2724,6 +3251,17 @@ mod tests {
     }
 
     #[test]
+    fn start_valid_preserves_rippled_zero_peer_threshold() {
+        // `NetworkOPsImp` constructs `minPeerCount_` as zero when startValid.
+        assert_eq!(required_peer_count(0), 0);
+        assert_eq!(required_peer_count(1), 1);
+        assert_eq!(required_peer_count(3), 3);
+        assert!(!should_report_peer_availability(0, 0));
+        assert!(should_report_peer_availability(0, 1));
+        assert!(should_report_peer_availability(1, 0));
+    }
+
+    #[test]
     fn heartbeat_reasserts_only_rippled_normalization_modes() {
         assert_eq!(
             heartbeat_operating_mode_reassertion(NetworkOpsOperatingMode::Disconnected),
@@ -2748,7 +3286,7 @@ mod tests {
     }
 
     #[test]
-    fn preferred_lcl_reconciliation_runs_only_at_end_consensus() {
+    fn preferred_lcl_reconciliation_runs_only_after_jtaccept_delivery() {
         assert!(!should_reconcile_preferred_lcl(ConsensusPhase::Open));
         assert!(!should_reconcile_preferred_lcl(ConsensusPhase::Establish));
         assert!(should_reconcile_preferred_lcl(ConsensusPhase::Accepted));
@@ -2806,7 +3344,11 @@ mod tests {
         let (_store_dir, inbound) =
             install_real_provisional_lcl_candidate(&mut root, Arc::clone(&target));
         root.validations().register_ledger(target.as_ref());
-        let (node_id, validation) = preferred_validation(target_hash, target.header().seq);
+        let (node_id, validation) = preferred_validation(
+            target_hash,
+            target.header().seq,
+            root.time_keeper().close_time().as_seconds(),
+        );
         root.validations()
             .validations()
             .lock()
@@ -2834,10 +3376,14 @@ mod tests {
         let mut last_round = None;
         let mut sampler = LclAuditSampler::new();
         let mut provisional_waiter = None;
-        let status_broadcasts = AtomicUsize::new(0);
+        let status_broadcasts = Arc::new(AtomicUsize::new(0));
+        let broadcast_counter = Arc::clone(&status_broadcasts);
         let observe_status_broadcast =
-            |_root: &ApplicationRoot, _ledger: &Ledger, _event: i32, _have_correct_lcl: bool| {
-                status_broadcasts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            move |_root: &ApplicationRoot,
+                  _ledger: &Ledger,
+                  _event: i32,
+                  _have_correct_lcl: bool| {
+                broadcast_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             };
 
         assert_eq!(
@@ -2982,120 +3528,15 @@ mod tests {
     }
 
     #[test]
-    fn accept_handoff_is_jtaccept_and_coalesces_before_strand_mutation() {
-        let queue = JobQueue::new(1);
-        let (command_tx, command_rx) = mpsc::sync_channel(128);
-        let scheduler = ConsensusJobScheduler::new(queue.clone(), command_tx);
-        let (gate_started_tx, gate_started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-
-        assert!(queue.add_job(JobType::JtAdmin, "test-gate", move || {
-            gate_started_tx.send(()).expect("gate start receiver");
-            release_rx.recv().expect("gate release sender");
-        }));
-        gate_started_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("gate should occupy the worker");
-
-        let work = PendingAcceptWork {
-            parent_ledger: immutable_ledger(6, 0x70),
-            closed_seq: 7,
-            close_time: 700,
-            close_resolution: 30,
-            correct_close_time: true,
-            close_time_adjustment_seconds: None,
-            consensus_hash: Uint256::from_u64(70),
-            have_correct_lcl: true,
-            consensus_succeeded: true,
-            base_fee_drops: 10,
-            rejected_dispute_retries: Vec::new(),
-            txns: Vec::new(),
-            validation: None,
-        };
-        assert!(scheduler.schedule_accept(work));
-        assert!(scheduler.accept_is_queued());
-        assert_eq!(queue.job_count(JobType::JtAccept), 1);
-
-        // An accepted consensus phase cannot queue a second mutable accept
-        // transition before the first JtAccept command reaches the strand.
-        assert!(!scheduler.schedule_accept(PendingAcceptWork {
-            parent_ledger: immutable_ledger(7, 0x80),
-            closed_seq: 8,
-            close_time: 800,
-            close_resolution: 30,
-            correct_close_time: true,
-            close_time_adjustment_seconds: None,
-            consensus_hash: Uint256::from_u64(80),
-            have_correct_lcl: true,
-            consensus_succeeded: true,
-            base_fee_drops: 10,
-            rejected_dispute_retries: Vec::new(),
-            txns: Vec::new(),
-            validation: None,
-        }));
-        assert_eq!(queue.job_count(JobType::JtAccept), 1);
-
-        release_tx.send(()).expect("release gate");
-        match command_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("JtAccept command should reach the strand")
-        {
-            ConsensusCommand::Accept(work) => assert_eq!(work.closed_seq, 7),
-            _ => panic!("expected JtAccept handoff"),
-        }
-        // The strand clears this only after it serially executes the complete
-        // accept/endConsensus/startRound transition.
-        scheduler.accept_consumed();
-        assert!(!scheduler.accept_is_queued());
-
-        queue.rendezvous();
-        queue.stop();
-    }
-
-    #[test]
-    fn accept_handoff_retries_after_full_command_queue_without_losing_work() {
-        let queue = JobQueue::new(1);
-        let (command_tx, command_rx) = mpsc::sync_channel(1);
-        command_tx
-            .send(ConsensusCommand::Heartbeat)
-            .expect("test command queue should accept filler");
-        let scheduler = ConsensusJobScheduler::new(queue.clone(), command_tx);
-        let work = PendingAcceptWork {
-            parent_ledger: immutable_ledger(8, 0x90),
-            closed_seq: 9,
-            close_time: 900,
-            close_resolution: 30,
-            correct_close_time: true,
-            close_time_adjustment_seconds: None,
-            consensus_hash: Uint256::from_u64(90),
-            have_correct_lcl: true,
-            consensus_succeeded: true,
-            base_fee_drops: 10,
-            rejected_dispute_retries: Vec::new(),
-            txns: Vec::new(),
-            validation: None,
-        };
-
-        assert!(scheduler.schedule_accept(work));
-        queue.rendezvous();
-        assert!(scheduler.has_pending_accept());
-        assert!(!scheduler.accept_is_queued());
-        assert!(matches!(
-            command_rx.try_recv(),
-            Ok(ConsensusCommand::Heartbeat)
+    fn accepted_phase_can_reconcile_and_start_after_jtaccept_delivery() {
+        // After the JtAccept command is consumed, the strand owns the
+        // contiguous accepted-work/endConsensus progression.
+        assert!(should_reconcile_preferred_lcl(ConsensusPhase::Accepted));
+        assert!(should_begin_ordinary_round(
+            true,
+            PreferredLclReconciliation::NoChange
         ));
-
-        assert!(scheduler.schedule_pending_accept());
-        match command_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("retained accept must reach the strand after capacity returns")
-        {
-            ConsensusCommand::Accept(work) => assert_eq!(work.closed_seq, 9),
-            _ => panic!("expected retained JtAccept handoff"),
-        }
-        assert!(!scheduler.has_pending_accept());
-        scheduler.accept_consumed();
-        queue.stop();
+        assert!(!should_reconcile_preferred_lcl(ConsensusPhase::Open));
     }
 
     #[test]

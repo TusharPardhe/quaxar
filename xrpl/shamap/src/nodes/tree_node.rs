@@ -1020,7 +1020,12 @@ impl SHAMapTreeNode {
             WIRE_TYPE_COMPRESSED_INNER => make_compressed_inner(payload)?,
             WIRE_TYPE_TRANSACTION_WITH_META => make_transaction_with_meta_node(payload, None)?,
             other => {
-                tracing::warn!(target: "shamap", "Failed to decode wire node");
+                tracing::warn!(
+                    target: "shamap",
+                    wire_type = other,
+                    wire_bytes = raw_node.len(),
+                    "Failed to decode wire node"
+                );
                 return Err(SHAMapCodecError::UnknownWireType(other));
             }
         };

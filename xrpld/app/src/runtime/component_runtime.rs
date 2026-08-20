@@ -273,7 +273,7 @@ pub enum ConsensusCommand {
     /// A `JtAccept` job reached the consensus strand. Keeping the ledger build
     /// and its `endConsensus → startRound` tail on the owner strand prevents a
     /// JobQueue worker from racing a timer or peer-proposal mutation.
-    Accept(crate::consensus::rcl_consensus::PendingAcceptWork),
+    Accept(Box<crate::consensus::rcl_consensus::PendingAcceptWork>),
     /// Begin consensus with `network_closed` as the target hash and
     /// `prev_ledger` as the locally loaded previous ledger. These can differ
     /// during rippled-compatible WrongLedger recovery.
@@ -325,6 +325,12 @@ impl std::fmt::Debug for AppConsensusRuntime {
             .field("stopped", &self.stopped.load(Ordering::Acquire))
             .field("phase", &self.phase.load(Ordering::Acquire))
             .finish()
+    }
+}
+
+impl Default for AppConsensusRuntime {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

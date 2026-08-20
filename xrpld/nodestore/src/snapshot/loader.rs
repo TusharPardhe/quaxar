@@ -317,7 +317,7 @@ fn verify_shamap_node(
         shamap_error(
             map,
             hash,
-            &format!("node is missing from imported store ({status:?})"),
+            format!("node is missing from imported store ({status:?})"),
         )
     })?;
     if object.hash() != &hash {
@@ -342,7 +342,7 @@ fn verify_shamap_node(
     }
 
     let node = SHAMapTreeNode::make_from_prefix(object.data(), SHAMapHash::new(hash))
-        .map_err(|error| shamap_error(map, hash, &format!("invalid encoded node: {error:?}")))?;
+        .map_err(|error| shamap_error(map, hash, format!("invalid encoded node: {error:?}")))?;
     // `make_from_prefix` deliberately accepts a known hash for normal trusted
     // fetch paths. Snapshot input is untrusted, so force recomputation before
     // trusting the decoded graph.

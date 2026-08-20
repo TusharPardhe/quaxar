@@ -29,7 +29,7 @@ pub enum ConsensusEvent {
     /// A validation received from a peer, still in wire form (its
     /// suppression id and originating peer are carried alongside the raw
     /// `TMValidation` payload for dedup/relay bookkeeping upstream).
-    Validation(QueuedValidation),
+    Validation(Box<QueuedValidation>),
     /// A ledger has finished acquiring/building and is ready for
     /// `checkAccept`-style promotion to validated, if it has sufficient
     /// validation support.

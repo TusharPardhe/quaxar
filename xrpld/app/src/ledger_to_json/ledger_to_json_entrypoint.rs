@@ -4,7 +4,7 @@ use basics::chrono::NetClockTimePoint;
 use basics::tagged_cache::CacheClock;
 use ledger::{
     DEFAULT_LEDGER_JSON_API_VERSION, Ledger, LedgerFill as LedgerCoreFill, LedgerFillOptions,
-    copy_from as ledger_copy_from, fill_json as fill_ledger_json,
+    LedgerJsonError, copy_from as ledger_copy_from, fill_json as fill_ledger_json,
     fill_json_with_family as fill_ledger_json_with_family,
 };
 use protocol::{AccountID, JsonValue, STTx, TxMeta};
@@ -95,12 +95,19 @@ impl<'a> AppLedgerFill<'a> {
     }
 }
 
+fn map_ledger_json_error(error: LedgerJsonError) -> TraversalError {
+    match error {
+        LedgerJsonError::Traversal(error) => error,
+        LedgerJsonError::InvalidLedgerEntry { .. } => TraversalError::View,
+    }
+}
+
 pub fn fill_json(json: &mut JsonValue, fill: &AppLedgerFill<'_>) -> Result<(), TraversalError> {
     let core_fill = LedgerCoreFill::new(fill.ledger, fill.options)
         .with_closed(fill.ledger.is_immutable())
         .with_api_version(fill.api_version())
         .with_close_time(fill.close_time);
-    fill_ledger_json(json, &core_fill)?;
+    fill_ledger_json(json, &core_fill).map_err(map_ledger_json_error)?;
 
     if fill.is_full() || fill.options.contains(LedgerFillOptions::DUMP_TXRP) {
         fill_json_transactions(json, fill);
@@ -125,7 +132,7 @@ where
         .with_api_version(fill.api_version())
         .with_close_time(fill.close_time);
     let mut json = JsonValue::Null;
-    fill_ledger_json_with_family(&mut json, &core_fill, family)?;
+    fill_ledger_json_with_family(&mut json, &core_fill, family).map_err(map_ledger_json_error)?;
 
     if fill.is_full() || fill.options.contains(LedgerFillOptions::DUMP_TXRP) {
         fill_json_transactions_with_family(&mut json, fill, family)?;

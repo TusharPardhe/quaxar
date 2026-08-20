@@ -7,6 +7,7 @@
 use basics::base_uint::Uint256;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
 
 use super::acquisition::{AcquisitionState, AcquisitionTurnOutcome, TurnBudget};
 use super::worker_pool::WorkerPool;
@@ -62,6 +63,9 @@ struct ReadyEntry {
     state_kind: ReadyState,
     normal_enqueued: bool,
     recovery_enqueued: bool,
+    /// When this entry's pending turn was last demanded; sampled as scheduler
+    /// delay when the worker claims the turn.
+    woke_at: Instant,
 }
 
 struct SchedulerState {
@@ -127,7 +131,13 @@ impl AcquisitionReadyScheduler {
                 state_kind: ReadyState::Waiting,
                 normal_enqueued: false,
                 recovery_enqueued: false,
+                woke_at: Instant::now(),
             });
+            if !matches!(entry.state_kind, ReadyState::Waiting) {
+                // A wake outside Waiting is fresh demand for a subsequent turn;
+                // the next claim measures from this wake.
+                entry.woke_at = Instant::now();
+            }
             entry.causes |= cause;
             if matches!(entry.state_kind, ReadyState::Cancelled) {
                 return;
@@ -243,6 +253,7 @@ impl AcquisitionReadyScheduler {
         let entry = state.entries.get_mut(&key).expect("live scheduler entry");
         entry.causes = ReadyCause::NONE;
         entry.state_kind = ReadyState::Running;
+        xrpld_metrics::acquisition::record_scheduler_delay(entry.woke_at.elapsed().as_secs_f64());
         Some(acquisition)
     }
 
@@ -391,13 +402,14 @@ mod tests {
             state_kind: ReadyState::Waiting,
             normal_enqueued: true,
             recovery_enqueued: true,
+            woke_at: Instant::now(),
         }
     }
 
     #[test]
     fn ready_scheduler_alternates_recovery_and_normal_fifo_classes() {
-        let pool = Arc::new(WorkerPool::new(0));
-        let scheduler = AcquisitionReadyScheduler::new(pool);
+        let pool = Arc::new(WorkerPool::new_with_manual_timer_for_test(0));
+        let scheduler = AcquisitionReadyScheduler::new(Arc::clone(&pool));
         let recovery_one = key(1);
         let normal_one = key(2);
         let recovery_two = key(3);
@@ -416,6 +428,9 @@ mod tests {
         );
         assert_eq!(state.reserved_turns, 4);
         assert_eq!(state.next_class, ReadyClass::Recovery);
+        drop(state);
+        drop(scheduler);
+        pool.stop();
     }
 
     #[test]

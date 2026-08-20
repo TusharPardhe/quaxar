@@ -72,7 +72,10 @@ pub struct AppLedgerMasterReplayRange {
 pub struct AppLedgerMasterAdvanceReport {
     pub decision: AppLedgerMasterPublishAdvance,
     pub published: Vec<Arc<Ledger>>,
-    /// First missing validated-chain ledger. It remains the sole replay proof.
+    /// First missing validated-chain ledger. It drives Generic-acquisition
+    /// candidate scheduling only: `plan_publication_replay` re-proves any gap
+    /// by walking backward from the validated tip (rippled's `ledgerReplay`
+    /// block), so this marker is never a replay admission predicate.
     pub missing: Option<AppLedgerMasterMissingLedger>,
     /// Missing validated-chain ledgers in ascending order. The caller applies
     /// rippled's bounded `ledgerFetchSize_` Generic-acquisition quota.
@@ -623,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_rejects_an_unproven_publication_replay_marker() {
+    fn publication_replay_ignores_an_unproven_forward_marker() {
         let runtime = AppLedgerMasterRuntime::default();
         let first = immutable_ledger(1, 0x10);
         let second = linked_ledger(&first, 600);
@@ -636,14 +639,22 @@ mod tests {
             .expect("validated ledger should update");
 
         let mut report = runtime.plan_advance_publication();
+        // Replay is derived only from the validated-tip backward walk (the
+        // ledgerReplay block of rippled LedgerMaster::findNewLedgersToPublish),
+        // never from the forward publication-hole marker. An unproven marker
+        // must therefore not redirect or widen the genuine replay request.
+        let genuine = Some(super::AppLedgerMasterReplayRange {
+            finish_hash: *third.header().hash.as_uint256(),
+            total_ledgers: 3,
+        });
         report.missing = Some(super::AppLedgerMasterMissingLedger {
             hash: Uint256::from_array([0xEE; 32]),
             seq: 2,
         });
         assert_eq!(
             runtime.plan_publication_replay(&report),
-            None,
-            "a report marker not equal to the absent validated-chain parent must not schedule replay"
+            genuine,
+            "a fabricated forward marker must not redirect the validated-chain replay"
         );
 
         report.missing = Some(super::AppLedgerMasterMissingLedger {
@@ -652,8 +663,8 @@ mod tests {
         });
         assert_eq!(
             runtime.plan_publication_replay(&report),
-            None,
-            "the right hash at the wrong sequence must not widen into replay work"
+            genuine,
+            "a wrong-sequence forward marker must not widen the validated-chain replay"
         );
     }
 

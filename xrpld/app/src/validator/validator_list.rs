@@ -1300,9 +1300,11 @@ pub fn deserialize_manifest_base64_bounded(encoded: &str) -> Option<Manifest> {
 }
 
 fn clamp_stale_lcl_close_time(close_time: u32, now: u32) -> u32 {
-    (now > close_time.saturating_add(30))
-        .then_some(now)
-        .unwrap_or(close_time)
+    if now > close_time.saturating_add(30) {
+        now
+    } else {
+        close_time
+    }
 }
 
 fn decrement_listing(key_listings: &mut HashMap<PublicKey, usize>, public_key: PublicKey) {

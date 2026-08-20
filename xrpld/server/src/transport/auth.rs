@@ -45,9 +45,7 @@ pub fn forwarded_for(headers: &HeaderMap) -> Option<String> {
         let bytes = lower.as_bytes();
         let mut start = 0;
         while start + 4 <= bytes.len() {
-            let Some(offset) = lower[start..].find("for=") else {
-                return None;
-            };
+            let offset = lower[start..].find("for=")?;
             let index = start + offset;
             let at_boundary =
                 index == 0 || matches!(bytes[index.saturating_sub(1)], b';' | b',' | b' ' | b'\t');
@@ -130,10 +128,10 @@ pub fn ip_allowed(remote_ip: IpAddr, nets4: &[IpNet], nets6: &[IpNet]) -> bool {
     }
     // Handle IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) which Docker and
     // some runtimes produce. Extract the inner IPv4 and check the v4 nets.
-    if let IpAddr::V6(v6) = remote_ip {
-        if let Some(v4) = v6.to_ipv4_mapped() {
-            return nets4.iter().any(|net| net.contains(&IpAddr::V4(v4)));
-        }
+    if let IpAddr::V6(v6) = remote_ip
+        && let Some(v4) = v6.to_ipv4_mapped()
+    {
+        return nets4.iter().any(|net| net.contains(&IpAddr::V4(v4)));
     }
     false
 }

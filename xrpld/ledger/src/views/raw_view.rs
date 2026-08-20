@@ -14,21 +14,18 @@ fn decode_batch_sle(payload: &[u8], key: Uint256) -> Result<Arc<STLedgerEntry>, 
             "state batch operation omitted serialized ledger entry".to_owned(),
         ));
     }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut serial = protocol::SerialIter::new(payload);
-        let sle = STLedgerEntry::from_serial_iter(&mut serial, key);
-        if !serial.empty() || sle.get_serializer().data() != payload {
-            return Err(ViewError::Conversion(
-                "state batch ledger entry is not a canonical standalone encoding".to_owned(),
-            ));
-        }
-        Ok(Arc::new(sle))
-    }))
-    .unwrap_or_else(|_| {
-        Err(ViewError::Conversion(
-            "state batch ledger entry could not be decoded".to_owned(),
+    let mut serial = protocol::SerialIter::new(payload);
+    let sle = STLedgerEntry::try_from_serial_iter(&mut serial, key).map_err(|error| {
+        ViewError::Conversion(format!(
+            "state batch ledger entry could not be decoded: {error:?}"
         ))
-    })
+    })?;
+    if !serial.empty() || sle.get_serializer().data() != payload {
+        return Err(ViewError::Conversion(
+            "state batch ledger entry is not a canonical standalone encoding".to_owned(),
+        ));
+    }
+    Ok(Arc::new(sle))
 }
 
 /// A mutable view that can also resolve its current ledger state.
@@ -213,16 +210,27 @@ mod tests {
     #[test]
     fn batch_delete_rejects_empty_or_malformed_payload_without_panicking() {
         let key = Uint256::from_array([0x5A; 32]);
-        let erased = STLedgerEntry::from_type_and_key(LedgerEntryType::Offer, key);
+        let mut erased = STLedgerEntry::from_type_and_key(LedgerEntryType::Offer, key);
+        erased.set_field_h256(
+            protocol::get_field_by_symbol("sfPreviousTxnID"),
+            Uint256::zero(),
+        );
         let mut valid_payload_with_trailing_object_end = erased.get_serializer().data().to_vec();
         // `0xE1` is an STObject end marker. The permissive object decoder consumes
         // it, so canonical round-trip validation must reject it explicitly.
         valid_payload_with_trailing_object_end.push(0xE1);
+        let mut invalid_ledger_entry_type = erased.get_serializer().data().to_vec();
+        assert_eq!(
+            invalid_ledger_entry_type[0], 0x11,
+            "serialized SLE must begin with sfLedgerEntryType"
+        );
+        invalid_ledger_entry_type[1..3].copy_from_slice(&0xFFFFu16.to_be_bytes());
         let mut view = RecordingRawView::default();
 
         for payload in [
             Vec::new(),
             vec![0xFF],
+            invalid_ledger_entry_type,
             valid_payload_with_trailing_object_end,
         ] {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

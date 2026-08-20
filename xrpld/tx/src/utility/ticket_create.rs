@@ -107,13 +107,15 @@ pub fn run_ticket_create_read_view_preclaim<V: ReadView>(
         Err(_) => return Some(Ter::TEF_BAD_LEDGER),
     };
 
+    let ticket_count_field = get_field_by_symbol("sfTicketCount");
     Some(run_ticket_create_preclaim(TicketCreatePreclaimFacts {
         account_exists: true,
-        current_ticket_count: account_root
-            .is_field_present(get_field_by_symbol("sfTicketCount"))
-            .then(|| account_root.get_field_u32(get_field_by_symbol("sfTicketCount")))
-            .unwrap_or(0),
-        requested_ticket_count: tx.get_field_u32(get_field_by_symbol("sfTicketCount")),
+        current_ticket_count: if account_root.is_field_present(ticket_count_field) {
+            account_root.get_field_u32(ticket_count_field)
+        } else {
+            0
+        },
+        requested_ticket_count: tx.get_field_u32(ticket_count_field),
         consumes_ticket_sequence: tx.get_seq_proxy().is_ticket(),
     }))
 }

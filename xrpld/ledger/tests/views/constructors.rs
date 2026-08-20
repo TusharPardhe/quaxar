@@ -2,9 +2,13 @@ use basics::base_uint::Uint256;
 use basics::intrusive_pointer::make_shared_intrusive;
 use basics::sha_map_hash::SHAMapHash;
 use ledger::{
-    Fees, Ledger, LedgerConfig, LedgerHeader, SLCF_NO_CONSENSUS_TIME, calculate_ledger_hash,
+    Fees, Ledger, LedgerConfig, LedgerHeader, RawView, SLCF_NO_CONSENSUS_TIME, StateBatchOp,
+    calculate_ledger_hash,
 };
-use protocol::{FeatureSet, Rules, feature_xrp_fees};
+use protocol::{
+    FeatureSet, Keylet, LedgerEntryType, Rules, STLedgerEntry, feature_xrp_fees,
+    get_field_by_symbol,
+};
 use shamap::item::SHAMapItem;
 use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
@@ -91,6 +95,80 @@ fn ledger_from_previous_matches_current_cpp_follow_ledger_header_and_snapshot_ro
     assert_eq!(next.tx_map().state(), SyncState::Modifying);
     assert!(!next.tx_map().is_full());
     assert!(next.tx_map().root().is_empty());
+}
+
+#[test]
+fn ledger_from_previous_candidate_mutation_preserves_parent_threading_fields() {
+    // rippled BuildLedger.cpp constructs a distinct mutable Ledger from its
+    // immutable parent before ApplyStateTable threads candidate SLEs. A failed
+    // candidate must therefore leave the parent transaction threading intact.
+    let key = sample_uint256(0x71);
+    let keylet = Keylet::new(LedgerEntryType::AccountRoot, key);
+    let parent_tx_id = sample_uint256(0x72);
+    let candidate_tx_id = sample_uint256(0x73);
+    let mut parent_sle = STLedgerEntry::new(keylet);
+    parent_sle.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), parent_tx_id);
+    parent_sle.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), 53);
+
+    let mut state = shamap::mutation::MutableTree::new(1);
+    state
+        .add_item(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(key, parent_sle.get_serializer().data().to_vec()),
+        )
+        .expect("parent state insertion should succeed");
+    let parent = Ledger::from_maps(
+        LedgerHeader {
+            seq: 53,
+            hash: sample_hash(0x70),
+            ..LedgerHeader::default()
+        },
+        SyncTree::from_root_with_type(
+            state.root(),
+            SHAMapType::State,
+            false,
+            53,
+            SyncState::Immutable,
+        ),
+        SyncTree::new_with_type(SHAMapType::Transaction, false, 53),
+    );
+    let mut candidate = Ledger::from_previous(&parent, 100);
+
+    let mut candidate_sle = parent_sle.clone();
+    candidate_sle.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), candidate_tx_id);
+    candidate_sle.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), 54);
+    candidate
+        .raw_apply_batch(&[(
+            StateBatchOp::Update,
+            key,
+            candidate_sle.get_serializer().data().to_vec(),
+        )])
+        .expect("candidate update should succeed");
+
+    let parent_after = parent
+        .read(keylet)
+        .expect("parent lookup should succeed")
+        .expect("parent SLE should remain present");
+    assert_eq!(
+        parent_after.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+        parent_tx_id
+    );
+    assert_eq!(
+        parent_after.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
+        53
+    );
+    let candidate_after = candidate
+        .read(keylet)
+        .expect("candidate lookup should succeed")
+        .expect("candidate SLE should remain present");
+    assert_eq!(
+        candidate_after.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+        candidate_tx_id
+    );
+    assert_eq!(
+        candidate_after.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
+        54
+    );
 }
 
 #[test]

@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "acquisition"
+version = "0.1.0"
+dependencies = [
+ "basics",
+ "bytes",
+ "ledger",
+ "shamap",
+ "tracing",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -98,9 +109,11 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "app"
 version = "0.1.0"
 dependencies = [
+ "acquisition",
  "arc-swap",
  "basics",
  "bs58",
+ "bytes",
  "consensus",
  "http",
  "ipnet",

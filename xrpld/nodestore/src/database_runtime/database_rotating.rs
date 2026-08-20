@@ -108,6 +108,10 @@ impl Backend for RotatingSnapshotBackend {
 struct DatabaseRotatingCore {
     state: Arc<Mutex<RotatingState>>,
     rotation_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    // Shared handle written by copy-forward reads during rotation; the
+    // DatabaseRotatingImp retains its own clone of the same atomic for
+    // take_copy_forward_count(). The field exists to keep the handle alive.
+    #[allow(dead_code)]
     copy_forward_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -185,12 +189,10 @@ impl DatabaseDelegate for DatabaseRotatingCore {
                 writable = Arc::clone(&state.writable_backend);
                 drop(state);
 
-                if duplicate {
-                    if let Err(error) = writable.store(Arc::clone(node_object_ref)) {
-                        tracing::error!(target: "nodestore", %error, hash = %hash, "Failed to copy archive node into writable backend");
-                        journal.log(JournalLevel::Error, &error);
-                        panic!("failed to copy archive node into writable backend: {error}");
-                    }
+                if duplicate && let Err(error) = writable.store(Arc::clone(node_object_ref)) {
+                    tracing::error!(target: "nodestore", %error, hash = %hash, "Failed to copy archive node into writable backend");
+                    journal.log(JournalLevel::Error, &error);
+                    panic!("failed to copy archive node into writable backend: {error}");
                 }
                 // While rotation is in flight, copy archive-served reads
                 // forward into the writable backend. The archive is about

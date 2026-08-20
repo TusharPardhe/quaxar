@@ -432,8 +432,18 @@ fn escrow_cancel_too_early() {
     ]);
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
-    // Create escrow with CancelAfter in the future
-    let tx_create = escrow_create_cancel_tx(alice, bob, 1_000_000_000, 1, 5000); // 5000 > close_time(1000)
+    // Create escrow with FinishAfter and CancelAfter in the future
+    // (rippled rejects an escrow with only a cancel time as temMALFORMED,
+    // EscrowCreate.cpp:162).
+    let tx_create = STTx::new(TxType::ESCROW_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_account_id(sf("sfDestination"), bob);
+        tx.set_field_amount(sf("sfAmount"), xrp(1_000_000_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_u32(sf("sfFinishAfter"), 5000);
+        tx.set_field_u32(sf("sfCancelAfter"), 6000);
+    });
     let r1 = full_apply(&mut view, &tx_create, TxType::ESCROW_CREATE);
     assert_eq!(r1, Ter::TES_SUCCESS);
 

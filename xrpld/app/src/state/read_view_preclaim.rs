@@ -730,14 +730,12 @@ fn preclaim_check_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             });
             if base != Ter::TES_SUCCESS {
                 base
-            } else if source != issue.issuer()
+            } else if (source != issue.issuer()
                 && ledger::mptoken_helpers::is_frozen_mpt(view, &source, &issue)
-                    .map_err(|_| view_error())?
-            {
-                Ter::TEC_LOCKED
-            } else if destination != issue.issuer()
-                && ledger::mptoken_helpers::is_frozen_mpt(view, &destination, &issue)
-                    .map_err(|_| view_error())?
+                    .map_err(|_| view_error())?)
+                || (destination != issue.issuer()
+                    && ledger::mptoken_helpers::is_frozen_mpt(view, &destination, &issue)
+                        .map_err(|_| view_error())?)
             {
                 Ter::TEC_LOCKED
             } else {

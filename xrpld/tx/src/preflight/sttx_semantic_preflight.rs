@@ -9,7 +9,8 @@ use protocol::{
     INNER_BATCH_TRANSACTION_FLAG, NF_TOKEN_BURNABLE_FLAG, NF_TOKEN_MUTABLE_FLAG,
     NF_TOKEN_ONLY_XRP_FLAG, NF_TOKEN_TRANSFERABLE_FLAG, NF_TOKEN_TRUST_LINE_FLAG, NotTec,
     Permission, Rules, STAmount, STTx, Ter, TxType, UNIVERSAL_TRANSACTION_FLAGS, equal_tokens,
-    feature_lending_protocol, get_field_by_symbol, is_bad_asset, is_tes_success,
+    feature_deep_freeze, feature_lending_protocol, get_field_by_symbol, is_bad_asset,
+    is_tes_success, tfClearDeepFreeze, tfSetDeepFreeze,
 };
 
 use crate::{
@@ -208,6 +209,13 @@ fn validate_sttx_typed_semantic_preflight(tx: &STTx, rules: &Rules, txn_type: Tx
         TxType::REGULAR_KEY_SET => validate_set_regular_key_preflight(tx),
         TxType::ESCROW_CREATE => validate_escrow_create_preflight(tx, rules),
         TxType::ACCOUNT_SET => validate_account_set_preflight(tx),
+        TxType::TRUST_SET
+            if !rules.enabled(&feature_deep_freeze())
+                && tx.get_flags() & (tfSetDeepFreeze | tfClearDeepFreeze) != 0 =>
+        {
+            Ter::TEM_INVALID_FLAG
+        }
+        TxType::TRUST_SET => validate_sttx_noop_preflight(txn_type),
         TxType::NFTOKEN_MINT => validate_nftoken_mint_preflight(tx, rules),
         // Types with no additional stateless rule still traverse the standalone
         // dispatcher explicitly; unknown types never silently succeed.

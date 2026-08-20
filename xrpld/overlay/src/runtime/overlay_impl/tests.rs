@@ -786,6 +786,7 @@ fn transaction_get_objects_query_precedes_generic_ledger_hash_validation() {
     let mut router = OverlayInboundRouter {
         overlay: &overlay,
         peer: &peer,
+        ledger_data_deferred: false,
     };
     let request = TmGetObjectByHash {
         r#type: wire::tm_get_object_by_hash::ObjectType::OtTransactions as i32,
@@ -812,6 +813,7 @@ fn disabled_transaction_get_objects_query_is_charged_as_malformed_request() {
     let mut router = OverlayInboundRouter {
         overlay: &overlay,
         peer: &peer,
+        ledger_data_deferred: false,
     };
     let request = TmGetObjectByHash {
         r#type: wire::tm_get_object_by_hash::ObjectType::OtTransactions as i32,
@@ -1153,6 +1155,7 @@ fn check_tracking_updates_active_peer_tracking_state() {
     let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
     let tracked = peer(12, 43);
     tracked.record_ledger(Uint256::from_u64(12), 200);
+    tracked.set_ledger_range(200, 200);
     overlay.activate(Arc::clone(&tracked));
 
     assert!(tracked.has_range(200, 200));
@@ -1655,6 +1658,7 @@ async fn inbound_session_queues_remaining_heavy_families() {
         .expect("connect result should finalize");
 
     peer.record_ledger(Uint256::from_u64(900), 900);
+    peer.set_ledger_range(900, 900);
     peer.check_tracking(900);
     // This fixture uses a synthetic legacy proposal signature. Rippled
     // bypasses proposal signature verification for trusted cluster peers.
@@ -1733,6 +1737,7 @@ async fn inbound_session_queues_remaining_heavy_families() {
             nodes: vec![wire::TmLedgerNode {
                 nodedata: vec![9, 9, 9],
                 nodeid: None,
+                ..wire::TmLedgerNode::default()
             }],
             request_cookie: None,
             error: None,
@@ -1976,11 +1981,13 @@ async fn inbound_endpoints_drop_excess_hops_and_cap_batch_size_peerfinder() {
     ));
     peer.set_listener_check_state(true, true);
     peer.record_ledger(Uint256::from_u64(900), 900);
+    peer.set_ledger_range(900, 900);
     peer.check_tracking(900);
 
     let mut router = OverlayInboundRouter {
         overlay: overlay.as_ref(),
         peer: &peer,
+        ledger_data_deferred: false,
     };
 
     let mut endpoints_v2 = Vec::new();
@@ -2025,11 +2032,13 @@ async fn inbound_endpoints_rate_limit_and_dedupe_peerfinder() {
     ));
     peer.set_listener_check_state(true, true);
     peer.record_ledger(Uint256::from_u64(901), 901);
+    peer.set_ledger_range(901, 901);
     peer.check_tracking(901);
 
     let mut router = OverlayInboundRouter {
         overlay: overlay.as_ref(),
         peer: &peer,
+        ledger_data_deferred: false,
     };
 
     let message = TmEndpoints {
@@ -2119,11 +2128,13 @@ async fn inbound_neighbor_endpoint_requires_listener_check_before_acceptance() {
     ));
     peer.set_listener_check_state(false, false);
     peer.record_ledger(Uint256::from_u64(902), 902);
+    peer.set_ledger_range(902, 902);
     peer.check_tracking(902);
 
     let mut router = OverlayInboundRouter {
         overlay: overlay.as_ref(),
         peer: &peer,
+        ledger_data_deferred: false,
     };
 
     let message = TmEndpoints {
@@ -2145,10 +2156,12 @@ async fn inbound_neighbor_endpoint_requires_listener_check_before_acceptance() {
     ));
     checked_peer.set_listener_check_state(true, true);
     checked_peer.record_ledger(Uint256::from_u64(902), 902);
+    checked_peer.set_ledger_range(902, 902);
     checked_peer.check_tracking(902);
     let mut checked_router = OverlayInboundRouter {
         overlay: overlay.as_ref(),
         peer: &checked_peer,
+        ledger_data_deferred: false,
     };
     let _ = checked_router.on_endpoints(&message);
     let snapshot = overlay.take_queued_inbound_snapshot();

@@ -62,11 +62,9 @@ pub fn run_amm_withdraw_preflight_facts(facts: AMMWithdrawPreflightFacts) -> Not
         if has_lp_tokens || has_amount || has_amount2 || has_e_price {
             return Ter::TEM_MALFORMED;
         }
-    } else if (sub_tx_flags & protocol::AMM_ONE_ASSET_WITHDRAW_ALL_FLAG) != 0 {
-        if !has_amount || has_lp_tokens || has_amount2 || has_e_price {
-            return Ter::TEM_MALFORMED;
-        }
-    } else if (sub_tx_flags & protocol::AMM_SINGLE_ASSET_FLAG) != 0 {
+    } else if (sub_tx_flags & protocol::AMM_ONE_ASSET_WITHDRAW_ALL_FLAG) != 0
+        || (sub_tx_flags & protocol::AMM_SINGLE_ASSET_FLAG) != 0
+    {
         if !has_amount || has_lp_tokens || has_amount2 || has_e_price {
             return Ter::TEM_MALFORMED;
         }

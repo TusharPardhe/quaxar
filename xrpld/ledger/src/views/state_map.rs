@@ -26,7 +26,6 @@ use protocol::{
     get_field_by_symbol,
 };
 use shamap::traversal::TraversalError;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LedgerSetupError {
@@ -171,16 +170,16 @@ pub fn encode_fee_settings_entry(fees: Fees, xrp_fees_enabled: bool) -> Vec<u8> 
     protocol_encode_fee_settings_entry(fees.base, fees.reserve, fees.increment, xrp_fees_enabled)
 }
 
+/// Parse an untrusted singleton state entry. Invalid or unsupported entry
+/// types are rejected by the protocol's fallible SLE decoder and cannot unwind
+/// setup work.
 fn parse_singleton_sle(
     payload: &[u8],
     keylet: protocol::Keylet,
     expected_type: LedgerEntryType,
 ) -> Option<STLedgerEntry> {
     let mut iter = SerialIter::new(payload);
-    let entry = catch_unwind(AssertUnwindSafe(|| {
-        STLedgerEntry::from_serial_iter(&mut iter, keylet.key)
-    }))
-    .ok()?;
+    let entry = STLedgerEntry::try_from_serial_iter(&mut iter, keylet.key).ok()?;
     if !iter.empty() || entry.get_type() != expected_type {
         return None;
     }

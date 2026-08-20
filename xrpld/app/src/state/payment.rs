@@ -30,6 +30,12 @@ pub struct MptDeliveredAmountCapture {
     active: bool,
 }
 
+impl Default for MptDeliveredAmountCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MptDeliveredAmountCapture {
     pub fn new() -> Self {
         MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().push(None));
@@ -158,38 +164,42 @@ pub fn do_payment<V: ledger::ApplyView>(
     // Peek destination account
     let dst_exists = view.peek(dst_keylet).ok().flatten();
 
-    if dst_exists.is_none() {
-        // Destination account does not exist
-        if !dst_amount.native() {
-            // Can't create account with IOU
-            return Ter::TEC_NO_DST;
-        }
-        // Can't create account with partial payment
-        if view.open() && partial_payment_allowed {
-            return Ter::TEL_NO_DST_PARTIAL;
-        }
-        // Check minimum reserve for account creation
-        let reserve = view.fees().reserve;
-        if dst_amount.xrp().drops() < reserve as i64 {
-            static NO_DST_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if NO_DST_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
-                tracing::debug!(target: "tx",
-                    "[payment_debug] NO_DST_INSUF_XRP: amount_drops={} reserve={} partial={}",
-                    dst_amount.xrp().drops(),
-                    reserve,
-                    partial_payment_allowed
-                );
+    match dst_exists.as_ref() {
+        None => {
+            // Destination account does not exist
+            if !dst_amount.native() {
+                // Can't create account with IOU
+                return Ter::TEC_NO_DST;
             }
-            return Ter::TEC_NO_DST_INSUF_XRP;
+            // Can't create account with partial payment
+            if view.open() && partial_payment_allowed {
+                return Ter::TEL_NO_DST_PARTIAL;
+            }
+            // Check minimum reserve for account creation
+            let reserve = view.fees().reserve;
+            if dst_amount.xrp().drops() < reserve as i64 {
+                static NO_DST_LOG: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if NO_DST_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+                    tracing::debug!(target: "tx",
+                        "[payment_debug] NO_DST_INSUF_XRP: amount_drops={} reserve={} partial={}",
+                        dst_amount.xrp().drops(),
+                        reserve,
+                        partial_payment_allowed
+                    );
+                }
+                return Ter::TEC_NO_DST_INSUF_XRP;
+            }
         }
-    } else {
-        let dst_sle = dst_exists.as_ref().unwrap();
-        let dst_flags = dst_sle.get_field_u32(sf("sfFlags"));
+        Some(dst_sle) => {
+            let dst_flags = dst_sle.get_field_u32(sf("sfFlags"));
 
-        // Check DestinationTag requirement
-        if (dst_flags & LSF_REQUIRE_DEST_TAG) != 0 && !sttx.is_field_present(sf("sfDestinationTag"))
-        {
-            return Ter::TEC_DST_TAG_NEEDED;
+            // Check DestinationTag requirement
+            if (dst_flags & LSF_REQUIRE_DEST_TAG) != 0
+                && !sttx.is_field_present(sf("sfDestinationTag"))
+            {
+                return Ter::TEC_DST_TAG_NEEDED;
+            }
         }
     }
 
@@ -418,6 +428,7 @@ fn do_direct_mpt_payment<V: ledger::ApplyView>(
     result
 }
 
+#[allow(dead_code)] // reserve for M7 sweep
 fn is_direct_iou_payment(
     dst_amount: &STAmount,
     send_max: Option<&STAmount>,
@@ -440,6 +451,7 @@ fn is_direct_iou_payment(
         .is_some_and(|send_max| send_max.asset() == dst_amount.asset() && send_max == dst_amount)
 }
 
+#[allow(dead_code)] // reserve for M7 sweep
 fn do_direct_iou_payment<V: ledger::ApplyView>(
     view: &mut V,
     account: &AccountID,

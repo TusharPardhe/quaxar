@@ -438,3 +438,22 @@ fn sandbox_peek_fails_without_node_fetcher() {
         "state map should be backed"
     );
 }
+
+#[test]
+fn application_root_does_not_renormalize_fully_wired_ledger_with_shared_family() {
+    let (_dir, node_store) = nudb_bootstrap();
+    let mut root = ApplicationRoot::new(0).expect("root");
+    root.attach_node_store(Some(node_store));
+    root.attach_default_node_family();
+
+    let mut ledger = Ledger::from_ledger_seq_and_close_time(102, 1_020, true);
+    ledger.set_node_fetcher(Arc::new(|_| None));
+    ledger.set_node_writer_result(Arc::new(|_, _, _, _| Ok(())));
+    let ledger = Arc::new(ledger);
+
+    let normalized = root.ledger_with_node_fetcher(Arc::clone(&ledger));
+    assert!(
+        Arc::ptr_eq(&normalized, &ledger),
+        "a fully wired closed ledger must not be cloned and synchronously re-setup merely because a shared node family exists"
+    );
+}

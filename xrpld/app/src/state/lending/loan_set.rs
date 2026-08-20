@@ -2,13 +2,12 @@ use std::{fmt, sync::Arc};
 
 use basics::{
     base_uint::Uint256,
-    number::{NumberParts as RuntimeNumber, RoundingMode},
+    number::{NumberParts as RuntimeNumber, NumberRoundModeGuard, RoundingMode},
 };
 use ledger::views::apply_view::ApplyView;
-use protocol::StBase;
 use protocol::{
-    AccountID, Asset, LedgerEntryType, STAmount, STLedgerEntry, STTx, TenthBips16, TenthBips32,
-    Ter, XRPAmount, account_keylet, feature_id, loan_key, owner_dir_keylet,
+    AccountID, Asset, LedgerEntryType, STLedgerEntry, STTx, TenthBips16, TenthBips32, Ter,
+    XRPAmount, account_keylet, feature_id, loan_key, owner_dir_keylet,
 };
 
 use super::common::*;
@@ -24,12 +23,12 @@ pub(super) struct LoanSetTxView<'a> {
     account: AccountID,
     counterparty: Option<AccountID>,
     principal_requested: RuntimeNumber,
-    principal_requested_amount: LoanSetAmountValue,
+    principal_requested_amount: LoanSetNumberValue,
     loan_origination_fee: Option<RuntimeNumber>,
-    loan_origination_fee_amount: Option<LoanSetAmountValue>,
-    loan_service_fee_amount: Option<LoanSetAmountValue>,
-    late_payment_fee_amount: Option<LoanSetAmountValue>,
-    close_payment_fee_amount: Option<LoanSetAmountValue>,
+    loan_origination_fee_amount: Option<LoanSetNumberValue>,
+    loan_service_fee_amount: Option<LoanSetNumberValue>,
+    late_payment_fee_amount: Option<LoanSetNumberValue>,
+    close_payment_fee_amount: Option<LoanSetNumberValue>,
     interest_rate: Option<TenthBips32>,
     payment_interval: Option<u32>,
     payment_total: Option<u32>,
@@ -74,13 +73,13 @@ pub(super) struct LoanSetState {
 }
 
 #[derive(Clone)]
-pub(super) struct LoanSetAmountValue {
-    amount: STAmount,
+pub(super) struct LoanSetNumberValue {
+    value: RuntimeNumber,
 }
 
-impl fmt::Display for LoanSetAmountValue {
+impl fmt::Display for LoanSetNumberValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.amount.text())
+        write!(f, "{}", self.value)
     }
 }
 
@@ -102,7 +101,7 @@ impl tx::LoanSetDoApplyLedgerStateTx for LoanSetTxView<'_> {
 }
 
 impl tx::LoanSetDoApplyRepresentabilityTx for LoanSetTxView<'_> {
-    type Value = LoanSetAmountValue;
+    type Value = LoanSetNumberValue;
 
     fn value(&self, field: tx::LoanSetRepresentabilityField) -> Option<&Self::Value> {
         match field {
@@ -287,31 +286,31 @@ pub(super) fn load_loan_set_tx_view(sttx: &STTx) -> LoanSetTxView<'_> {
         counterparty: sttx
             .is_field_present(sf("sfCounterparty"))
             .then(|| sttx.get_account_id(sf("sfCounterparty"))),
-        principal_requested: amount_number(&sttx.get_field_amount(sf("sfPrincipalRequested"))),
-        principal_requested_amount: LoanSetAmountValue {
-            amount: sttx.get_field_amount(sf("sfPrincipalRequested")),
+        principal_requested: sttx.get_field_number(sf("sfPrincipalRequested")).value(),
+        principal_requested_amount: LoanSetNumberValue {
+            value: sttx.get_field_number(sf("sfPrincipalRequested")).value(),
         },
         loan_origination_fee: sttx
             .is_field_present(sf("sfLoanOriginationFee"))
-            .then(|| amount_number(&sttx.get_field_amount(sf("sfLoanOriginationFee")))),
+            .then(|| sttx.get_field_number(sf("sfLoanOriginationFee")).value()),
         loan_origination_fee_amount: sttx.is_field_present(sf("sfLoanOriginationFee")).then(|| {
-            LoanSetAmountValue {
-                amount: sttx.get_field_amount(sf("sfLoanOriginationFee")),
+            LoanSetNumberValue {
+                value: sttx.get_field_number(sf("sfLoanOriginationFee")).value(),
             }
         }),
         loan_service_fee_amount: sttx.is_field_present(sf("sfLoanServiceFee")).then(|| {
-            LoanSetAmountValue {
-                amount: sttx.get_field_amount(sf("sfLoanServiceFee")),
+            LoanSetNumberValue {
+                value: sttx.get_field_number(sf("sfLoanServiceFee")).value(),
             }
         }),
         late_payment_fee_amount: sttx.is_field_present(sf("sfLatePaymentFee")).then(|| {
-            LoanSetAmountValue {
-                amount: sttx.get_field_amount(sf("sfLatePaymentFee")),
+            LoanSetNumberValue {
+                value: sttx.get_field_number(sf("sfLatePaymentFee")).value(),
             }
         }),
         close_payment_fee_amount: sttx.is_field_present(sf("sfClosePaymentFee")).then(|| {
-            LoanSetAmountValue {
-                amount: sttx.get_field_amount(sf("sfClosePaymentFee")),
+            LoanSetNumberValue {
+                value: sttx.get_field_number(sf("sfClosePaymentFee")).value(),
             }
         }),
         interest_rate: sttx
@@ -442,33 +441,33 @@ pub(super) fn set_optional_loan_tx_field(
     match field {
         tx::LoanSetDoApplyLoanTransactionField::LoanOriginationFee => {
             if sttx.is_field_present(sf("sfLoanOriginationFee")) {
-                loan.set_field_amount(
+                loan.set_field_number(
                     sf("sfLoanOriginationFee"),
-                    sttx.get_field_amount(sf("sfLoanOriginationFee")),
+                    sttx.get_field_number(sf("sfLoanOriginationFee")),
                 );
             }
         }
         tx::LoanSetDoApplyLoanTransactionField::LoanServiceFee => {
             if sttx.is_field_present(sf("sfLoanServiceFee")) {
-                loan.set_field_amount(
+                loan.set_field_number(
                     sf("sfLoanServiceFee"),
-                    sttx.get_field_amount(sf("sfLoanServiceFee")),
+                    sttx.get_field_number(sf("sfLoanServiceFee")),
                 );
             }
         }
         tx::LoanSetDoApplyLoanTransactionField::LatePaymentFee => {
             if sttx.is_field_present(sf("sfLatePaymentFee")) {
-                loan.set_field_amount(
+                loan.set_field_number(
                     sf("sfLatePaymentFee"),
-                    sttx.get_field_amount(sf("sfLatePaymentFee")),
+                    sttx.get_field_number(sf("sfLatePaymentFee")),
                 );
             }
         }
         tx::LoanSetDoApplyLoanTransactionField::ClosePaymentFee => {
             if sttx.is_field_present(sf("sfClosePaymentFee")) {
-                loan.set_field_amount(
+                loan.set_field_number(
                     sf("sfClosePaymentFee"),
-                    sttx.get_field_amount(sf("sfClosePaymentFee")),
+                    sttx.get_field_number(sf("sfClosePaymentFee")),
                 );
             }
         }
@@ -539,7 +538,7 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
     }
 
     let tx_view = load_loan_set_tx_view(sttx);
-    let principal_requested_amount = sttx.get_field_amount(sf("sfPrincipalRequested"));
+    let principal_requested = sttx.get_field_number(sf("sfPrincipalRequested")).value();
     let view_ptr: *mut V = view;
     let representability_asset = {
         let broker_id = sttx.get_field_h256(sf("sfLoanBrokerID"));
@@ -613,12 +612,8 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             ),
         },
         |_, value| {
-            runtime_to_amount(
-                representability_asset,
-                amount_number(&value.amount),
-                RoundingMode::ToNearest,
-            )
-            .is_some()
+            runtime_to_amount(representability_asset, value.value, RoundingMode::ToNearest)
+                .is_some()
         },
         |asset, principal_requested, expect_interest, payment_total, properties| {
             let guards = tx::LoanSetLoanGuardProperties {
@@ -635,23 +630,18 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                 &guards,
                 &RuntimeNumber::zero(),
                 |asset, value, scale| {
-                    round_number_to_asset_with_scale(*asset, *value, scale, RoundingMode::ToNearest)
+                    // rippled's checkLoanGuards rounds the periodic payment upward.
+                    round_number_to_asset_with_scale(*asset, *value, scale, RoundingMode::Upward)
                 },
                 |total, rounded| {
                     if *rounded <= RuntimeNumber::zero() {
-                        0
-                    } else {
-                        let mut payments = 0_i64;
-                        let mut remaining = *total;
-                        while remaining > RuntimeNumber::zero() {
-                            remaining -= *rounded;
-                            payments += 1;
-                            if payments > i64::from(u32::MAX) {
-                                break;
-                            }
-                        }
-                        payments
+                        return 0;
                     }
+
+                    // Match rippled's Number::RoundingMode::Upward quotient. Repeated
+                    // subtraction is not equivalent when the periodic payment is rounded.
+                    let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
+                    (*total / *rounded).try_to_i64().unwrap_or(i64::MAX)
                 },
             ) {
                 Ok(()) => Ter::TES_SUCCESS,
@@ -787,9 +777,13 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             let asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
             let Some(origination_fee) = sttx
                 .is_field_present(sf("sfLoanOriginationFee"))
-                .then(|| amount_number(&sttx.get_field_amount(sf("sfLoanOriginationFee"))))
+                .then(|| sttx.get_field_number(sf("sfLoanOriginationFee")).value())
             else {
-                let amount = principal_requested_amount.clone();
+                let Some(amount) =
+                    runtime_to_amount(asset, principal_requested, RoundingMode::ToNearest)
+                else {
+                    return Ter::TEC_INTERNAL;
+                };
                 return account_send(
                     view,
                     &vault_sle.get_account_id(sf("sfAccount")),
@@ -797,8 +791,7 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                     &amount,
                 );
             };
-            let borrower_amount_number =
-                amount_number(&principal_requested_amount) - origination_fee;
+            let borrower_amount_number = principal_requested - origination_fee;
             let Some(borrower_amount) =
                 runtime_to_amount(asset, borrower_amount_number, RoundingMode::ToNearest)
             else {
@@ -813,11 +806,16 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             if borrower_result != Ter::TES_SUCCESS {
                 return borrower_result;
             }
+            let Some(origination_fee_amount) =
+                runtime_to_amount(asset, origination_fee, RoundingMode::ToNearest)
+            else {
+                return Ter::TEC_INTERNAL;
+            };
             account_send(
                 view,
                 &vault_sle.get_account_id(sf("sfAccount")),
                 &broker_owner,
-                &sttx.get_field_amount(sf("sfLoanOriginationFee")),
+                &origination_fee_amount,
             )
         },
         || {
@@ -845,15 +843,16 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             } else {
                 12
             };
-            let interest_rate = sttx
-                .is_field_present(sf("sfInterestRate"))
-                .then(|| TenthBips32::new(sttx.get_field_u32(sf("sfInterestRate"))))
-                .unwrap_or(TenthBips32::new(0));
+            let interest_rate = if sttx.is_field_present(sf("sfInterestRate")) {
+                TenthBips32::new(sttx.get_field_u32(sf("sfInterestRate")))
+            } else {
+                TenthBips32::new(0)
+            };
             let minimum_scale = vault_scale(&vault.entry, vault.asset);
             let properties = tx::compute_loan_set_properties(
                 &rules,
                 vault.asset,
-                amount_number(&principal_requested_amount),
+                principal_requested,
                 interest_rate,
                 payment_interval,
                 payment_total,
@@ -862,7 +861,7 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             );
             let state = tx::construct_loan_set_state(
                 properties.loan_state.value_outstanding,
-                amount_number(&principal_requested_amount),
+                principal_requested,
                 properties.loan_state.management_fee_due,
             );
 
@@ -877,8 +876,6 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             let loan_sequence = broker.entry.get_field_u32(sf("sfLoanSequence"));
             let loan_id = loan_key(broker_id, loan_sequence);
             let mut loan = STLedgerEntry::from_type_and_key(LedgerEntryType::Loan, loan_id);
-            loan.set_field_h256(sf("sfPreviousTxnID"), sttx.get_transaction_id());
-            loan.set_field_u32(sf("sfPreviousTxnLgrSeq"), view.seq());
             loan.set_field_i32(sf("sfLoanScale"), properties.loan_scale);
             loan.set_field_u32(sf("sfStartDate"), start_date);
             loan.set_field_u32(sf("sfPaymentInterval"), payment_interval);
@@ -893,7 +890,7 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             });
             loan.set_field_number(
                 sf("sfPrincipalOutstanding"),
-                with_asset_number(amount_number(&principal_requested_amount), vault.asset),
+                with_asset_number(principal_requested, vault.asset),
             );
             loan.set_field_number(
                 sf("sfPeriodicPayment"),
@@ -944,10 +941,7 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             let mut vault_obj = vault.entry.clone_as_object();
             vault_obj.set_field_number(
                 sf("sfAssetsAvailable"),
-                with_asset_number(
-                    vault.assets_available - amount_number(&principal_requested_amount),
-                    vault.asset,
-                ),
+                with_asset_number(vault.assets_available - principal_requested, vault.asset),
             );
             vault_obj.set_field_number(
                 sf("sfAssetsTotal"),
@@ -967,7 +961,7 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                     loan_set_debt_total_update(
                         vault.asset,
                         broker.debt_total,
-                        amount_number(&principal_requested_amount) + state.interest_due,
+                        principal_requested + state.interest_due,
                         &vault.entry,
                         properties.loan_scale,
                         rules.enabled(&feature_id("fixCleanup3_2_0")),
@@ -1137,8 +1131,6 @@ pub fn apply_loan_broker_set<V: ApplyView>(
 
     let mut broker =
         STLedgerEntry::from_type_and_key(LedgerEntryType::LoanBroker, broker_keylet.key);
-    broker.set_field_h256(sf("sfPreviousTxnID"), sttx.get_transaction_id());
-    broker.set_field_u32(sf("sfPreviousTxnLgrSeq"), view.seq());
     broker.set_field_u32(sf("sfSequence"), sequence);
     broker.set_field_u64(sf("sfOwnerNode"), owner_page);
     broker.set_field_u64(sf("sfVaultNode"), vault_page);

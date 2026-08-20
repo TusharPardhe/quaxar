@@ -808,7 +808,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 30,
         name: "Clawback",
         delegable: "Delegation::delegable",
-        amendment: "featureClawback",
+        amendment: "uint256{}",
         privileges: "noPriv",
         field_specs: &[
             FormatFieldSpec {

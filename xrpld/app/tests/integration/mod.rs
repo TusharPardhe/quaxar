@@ -15,7 +15,6 @@ mod nftoken_trading;
 mod offer;
 mod offer_crossing;
 mod offer_engine;
-mod parity;
 mod paychan;
 mod payment;
 mod payment_engine;

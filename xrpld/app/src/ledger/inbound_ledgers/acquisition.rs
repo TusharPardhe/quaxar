@@ -219,7 +219,7 @@ impl SequencePromotionAttempt {
     }
 }
 
-struct WorkerJournal;
+pub(crate) struct WorkerJournal;
 
 impl InboundLedgerJournal for WorkerJournal {
     fn trace(&self, message: &str) {
@@ -242,6 +242,18 @@ impl InboundLedgerJournal for WorkerJournal {
 #[derive(Clone)]
 pub(crate) struct WorkerFetchPack {
     cache: Arc<FetchPackCache>,
+}
+
+impl WorkerFetchPack {
+    pub(crate) fn new(cache: Arc<FetchPackCache>) -> Self {
+        Self { cache }
+    }
+
+    /// The shared fetch-pack cache, used by the coordinator engine's resident
+    /// lookup to resolve by-hash node data.
+    pub(crate) fn cache(&self) -> &Arc<FetchPackCache> {
+        &self.cache
+    }
 }
 
 impl FetchPackContainer for WorkerFetchPack {
@@ -714,9 +726,12 @@ impl PersistenceWork for AcquisitionPersistenceWork {
                 "inbound durability barrier started by NodeStore scheduler"
             );
         }
+        let is_durability_barrier = command.is_durability_barrier();
+        let write_bytes = Self::payload_bytes(&command) as u64;
         let outcome = if node_store.store_generation() != identity.store_generation {
             PersistenceOutcome::Cancelled
         } else {
+            let started = Instant::now();
             let result = match command {
                 PersistenceCommand::WriteBatch { writes, .. } => {
                     writes.into_iter().try_for_each(|write| match &node_store {
@@ -739,6 +754,13 @@ impl PersistenceWork for AcquisitionPersistenceWork {
                     SHAMapStoreNodeStore::Rotating(database) => database.sync_result(),
                 },
             };
+            let elapsed_seconds = started.elapsed().as_secs_f64();
+            if is_durability_barrier {
+                xrpld_metrics::acquisition::record_nodestore_fence_duration(elapsed_seconds);
+            } else {
+                xrpld_metrics::acquisition::record_nodestore_write_duration(elapsed_seconds);
+                xrpld_metrics::acquisition::record_nodestore_write_bytes(write_bytes);
+            }
             match result {
                 Ok(()) if node_store.store_generation() == identity.store_generation => {
                     PersistenceOutcome::Durable
@@ -865,9 +887,7 @@ impl PersistenceQueue {
     }
 
     fn acknowledge(&mut self, ready: &PersistenceReady) -> Option<PersistenceTiming> {
-        let Some(command) = self.in_flight.take() else {
-            return None;
-        };
+        let command = self.in_flight.take()?;
         if command.identity() != ready.identity
             || command.is_durability_barrier() != ready.durability_barrier
         {
@@ -918,6 +938,7 @@ impl PersistenceQueue {
 /// NodeStore acquisition read belongs to `NodeReadBroker`; packet and planner
 /// code may use only resident cache/fetch-pack data. `WorkerStore` is a pure
 /// command collector: it never calls `Database::store` or `sync_result`.
+#[derive(Default)]
 pub struct WorkerStore {
     pending_writes: Vec<PersistenceWrite>,
     pending_keys: BTreeSet<PersistenceKey>,
@@ -927,6 +948,35 @@ impl WorkerStore {
     fn take_pending_writes(&mut self) -> Vec<PersistenceWrite> {
         self.pending_keys.clear();
         std::mem::take(&mut self.pending_writes)
+    }
+
+    /// Drains accepted node writes as coordinator [`acquisition::PersistNode`]
+    /// records for the M4.2 durable handoff. The worker store keeps its exact
+    /// command semantics; only the transport type changes at the boundary. The
+    /// NodeStore object classification is preserved so the write adapter stores
+    /// the same object types the legacy path stored.
+    pub(crate) fn take_pending_write_nodes(&mut self) -> Vec<acquisition::PersistNode> {
+        self.pending_keys.clear();
+        self.pending_writes
+            .drain(..)
+            .map(|write| {
+                let object_kind = match write.object_type {
+                    nodestore::NodeObjectType::Ledger => acquisition::StoredObjectKind::Ledger,
+                    nodestore::NodeObjectType::AccountNode => {
+                        acquisition::StoredObjectKind::AccountNode
+                    }
+                    nodestore::NodeObjectType::TransactionNode => {
+                        acquisition::StoredObjectKind::TransactionNode
+                    }
+                    _ => acquisition::StoredObjectKind::Unknown,
+                };
+                acquisition::PersistNode::new(
+                    SHAMapHash::new(write.key.hash),
+                    bytes::Bytes::from(write.data),
+                    object_kind,
+                )
+            })
+            .collect()
     }
 
     fn store_object(
@@ -1032,6 +1082,7 @@ pub(crate) enum PacketEnqueue {
     InvalidLease,
 }
 
+#[derive(Debug)]
 pub(crate) enum PacketAdmissionReservation {
     Terminal,
     Deferred,
@@ -1077,6 +1128,8 @@ struct PacketWork {
     peer_id: u64,
     packet: InboundLedgerPacket,
     bytes: usize,
+    /// Admission time; sampled as mailbox age when a bounded turn consumes it.
+    enqueued_at: Instant,
 }
 
 struct ActorTreePlan {
@@ -1122,17 +1175,15 @@ impl ActorTreePlan {
             self.peer = None;
             self.plan.clear_recent_requests();
             let admission_backlog_waiting = !self.read_admission_backlog.is_empty();
-            let retried = (!admission_backlog_waiting)
-                .then(|| {
-                    self.plan
-                        .network_candidates()
-                        .into_iter()
-                        .filter(|(_, hash)| {
-                            self.plan.retry_network_candidate(SHAMapHash::new(*hash))
-                        })
-                        .count()
-                })
-                .unwrap_or_default();
+            let retried = if !admission_backlog_waiting {
+                self.plan
+                    .network_candidates()
+                    .into_iter()
+                    .filter(|(_, hash)| self.plan.retry_network_candidate(SHAMapHash::new(*hash)))
+                    .count()
+            } else {
+                0
+            };
             // A lost peer reply wakes only the retained verified network
             // frontier. No plan is rebuilt and an empty frontier stays idle.
             // A callback-less broker rejection leaves no ticket to wake this
@@ -1159,7 +1210,6 @@ fn ready_turn_can_requeue(plan: &TreePlan, branch_steps_before: u64) -> bool {
     plan.has_runnable_frontier() && plan.branch_steps() > branch_steps_before
 }
 
-const SCAN_OUTCOME_NOT_RUN: u8 = 0;
 const SCAN_OUTCOME_READY: u8 = 1;
 const SCAN_OUTCOME_NEEDS_READS: u8 = 2;
 const SCAN_OUTCOME_NEEDS_NETWORK: u8 = 3;
@@ -1173,7 +1223,7 @@ fn scan_outcome_name(outcome: u8) -> &'static str {
         SCAN_OUTCOME_NEEDS_NETWORK => "needs_network",
         SCAN_OUTCOME_COMPLETE => "complete",
         SCAN_OUTCOME_INVALID => "invalid",
-        SCAN_OUTCOME_NOT_RUN | _ => "not_run",
+        _ => "not_run",
     }
 }
 
@@ -1409,6 +1459,9 @@ pub struct AcquisitionState {
     /// state publication. A request is either sent before terminal wins or is
     /// suppressed after it; there is no check-then-send gap.
     outbound_gate: Mutex<()>,
+    /// Observability only: records peer-availability-to-first-request latency
+    /// once per session. It never gates request production.
+    first_request_metric_recorded: AtomicBool,
     /// Terminal traversal freezes ingress/request generation while ordered
     /// persistence and its one durability barrier drain.
     draining: AtomicBool,
@@ -1609,12 +1662,19 @@ impl AcquisitionState {
                 peer_id,
                 packet,
                 bytes,
+                enqueued_at: Instant::now(),
             });
             mailbox.buffered_packets_high_water = mailbox
                 .buffered_packets_high_water
                 .max(mailbox.buffered_packet_count());
             mailbox.buffered_bytes_high_water =
                 mailbox.buffered_bytes_high_water.max(mailbox.packet_bytes);
+            xrpld_metrics::acquisition::mailbox_packet_count(mailbox.buffered_packet_count());
+            xrpld_metrics::acquisition::mailbox_packet_bytes(mailbox.packet_bytes);
+            xrpld_metrics::acquisition::mailbox_packet_high_water(
+                mailbox.buffered_packets_high_water,
+            );
+            xrpld_metrics::acquisition::mailbox_byte_high_water(mailbox.buffered_bytes_high_water);
             if mailbox.token == AcquisitionWorkToken::Idle {
                 mailbox.token = AcquisitionWorkToken::Queued;
                 true
@@ -1699,12 +1759,19 @@ impl AcquisitionState {
                 peer_id,
                 packet,
                 bytes,
+                enqueued_at: Instant::now(),
             });
             mailbox.buffered_packets_high_water = mailbox
                 .buffered_packets_high_water
                 .max(mailbox.buffered_packet_count());
             mailbox.buffered_bytes_high_water =
                 mailbox.buffered_bytes_high_water.max(mailbox.packet_bytes);
+            xrpld_metrics::acquisition::mailbox_packet_count(mailbox.buffered_packet_count());
+            xrpld_metrics::acquisition::mailbox_packet_bytes(mailbox.packet_bytes);
+            xrpld_metrics::acquisition::mailbox_packet_high_water(
+                mailbox.buffered_packets_high_water,
+            );
+            xrpld_metrics::acquisition::mailbox_byte_high_water(mailbox.buffered_bytes_high_water);
             if mailbox.token == AcquisitionWorkToken::Idle {
                 mailbox.token = AcquisitionWorkToken::Queued;
                 true
@@ -1833,6 +1900,11 @@ impl AcquisitionState {
         let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
         let packet = mailbox.packets.pop_front()?;
         mailbox.packet_bytes = mailbox.packet_bytes.saturating_sub(packet.bytes);
+        xrpld_metrics::acquisition::record_mailbox_packet_age(
+            packet.enqueued_at.elapsed().as_secs_f64(),
+        );
+        xrpld_metrics::acquisition::mailbox_packet_count(mailbox.buffered_packet_count());
+        xrpld_metrics::acquisition::mailbox_packet_bytes(mailbox.packet_bytes);
         Some(packet)
     }
 
@@ -2271,6 +2343,15 @@ impl AcquisitionState {
         self.lifecycle
             .request_messages
             .fetch_add(1, Ordering::Relaxed);
+        if !self
+            .first_request_metric_recorded
+            .swap(true, Ordering::Relaxed)
+            && let Some(elapsed) = xrpld_metrics::acquisition::peers_available_elapsed()
+        {
+            xrpld_metrics::acquisition::record_peer_availability_to_first_request(
+                elapsed.as_secs_f64(),
+            );
+        }
         self.peer_set.send_request(message, target);
         true
     }
@@ -2311,9 +2392,7 @@ impl AcquisitionState {
                 .lock_mutable("timeout tree-plan policy")
                 .is_some_and(|mutable| mutable.inbound.should_use_aggressive_by_hash());
         let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-        let Some(plan) = mailbox.plan.as_mut() else {
-            return None;
-        };
+        let plan = mailbox.plan.as_mut()?;
         plan.retarget(reason, peer, aggressive_by_hash);
         Some(plan.runnable)
     }
@@ -2857,6 +2936,9 @@ impl AcquisitionBuilder {
             finalization_claimed: AtomicBool::new(false),
             fetch_pack_ready: AtomicBool::new(false),
             timer_armed: AtomicBool::new(false),
+            // Observability only: records peer-availability-to-first-request
+            // latency once per session; does not gate any request production.
+            first_request_metric_recorded: AtomicBool::new(false),
             worker_pool: self.worker_pool,
             scheduler_key: AcquisitionKey {
                 hash: *self.hash.as_uint256(),
@@ -2892,7 +2974,7 @@ fn run_acquisition_job(state: &Arc<AcquisitionState>, operation: &'static str, j
     }
 }
 
-struct ActorNodeFetcher;
+pub(crate) struct ActorNodeFetcher;
 
 impl shamap::family::SHAMapNodeFetcher for ActorNodeFetcher {
     fn fetch_node_object(
@@ -3080,7 +3162,11 @@ fn process_init(state: &Arc<AcquisitionState>) {
         (persistence_writes, terminal, mutable.inbound.seq())
     };
     state.sync_header_sequence(canonical_seq);
-    let added = (!terminal).then(|| add_peers(state)).unwrap_or_default();
+    let added = if terminal {
+        Vec::new()
+    } else {
+        add_peers(state)
+    };
     state.submit_persistence_writes(persistence_writes);
     if terminal {
         finalize_terminal(state);
@@ -3109,9 +3195,9 @@ fn process_acquisition_turn(state: &Arc<AcquisitionState>, budget: &TurnBudget) 
     if state.take_admitted_timeout() {
         process_timeout_job(state);
     }
-    if !state.is_done() && state.has_pending_packets() {
-        process_data_job(state, budget);
-    } else if !state.is_done() && state.fetch_pack_ready.load(Ordering::Acquire) {
+    if !state.is_done()
+        && (state.has_pending_packets() || state.fetch_pack_ready.load(Ordering::Acquire))
+    {
         process_data_job(state, budget);
     }
     if !state.is_done() {
@@ -3294,7 +3380,7 @@ fn process_one_data_job(state: &Arc<AcquisitionState>) {
                 Ok(stats) => {
                     packet_stats = stats;
                     packet_complete = true;
-                    if !stats.is_invalid() {
+                    if !matches!(packet_type, InboundLedgerDataType::Base) && !stats.is_invalid() {
                         accepted_nodes.extend(work.packet.nodes[step_start..].iter().filter_map(
                             |node| {
                                 shamap::tree_node::SHAMapTreeNode::make_from_wire(&node.node_data)
@@ -3770,10 +3856,7 @@ fn take_tree_network_request(
         return (outbound, consumed);
     }
 
-    let ids = candidates
-        .iter()
-        .map(|(id, _)| id.clone())
-        .collect::<Vec<_>>();
+    let ids = candidates.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     let depth = match actor_plan.reason {
         InboundLedgerRequestTrigger::Reply => 1,
         InboundLedgerRequestTrigger::ReplyHighLatency => 2,
@@ -4273,6 +4356,9 @@ fn record_resolver_visible_ledger(
         ledger,
         reason,
         acquisition_id,
+        from_coordinator: false,
+        durable_handoff: None,
+        coordinator_session: None,
     });
     true
 }
@@ -4532,6 +4618,7 @@ mod actor_mailbox_tests {
                 )],
             ),
             bytes,
+            enqueued_at: Instant::now(),
         }
     }
 
@@ -4670,6 +4757,7 @@ mod actor_mailbox_tests {
 
         let broker = NodeReadBroker::new(ReadBrokerConfig {
             global_in_flight: 1,
+            ..ReadBrokerConfig::default()
         })
         .expect("valid broker config");
         let delivered = Arc::new(Mutex::new(Vec::<ReadReady>::new()));
@@ -4903,6 +4991,7 @@ mod actor_mailbox_tests {
         }
 
         let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        child.set_child_hash(0, SHAMapHash::new(Uint256::from_array([0x42; 32])));
         child.update_hash();
         let missing = child.get_hash();
         let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
@@ -4922,7 +5011,7 @@ mod actor_mailbox_tests {
             &tree,
             root.get_hash(),
             16,
-            0,
+            7,
             &mut first_child,
         );
         let mut resident = NoResident;
@@ -5037,6 +5126,7 @@ mod actor_mailbox_tests {
 
         let broker = NodeReadBroker::new(ReadBrokerConfig {
             global_in_flight: 1,
+            ..ReadBrokerConfig::default()
         })
         .expect("valid broker config");
         let sink: ReadReadySink = Arc::new(|_| {});
@@ -5161,7 +5251,7 @@ mod actor_mailbox_tests {
             &tree,
             root.get_hash(),
             16,
-            0,
+            7,
             &mut first_child,
         );
         let mut resident = NoResident;
@@ -5391,7 +5481,7 @@ mod actor_mailbox_tests {
             &tree,
             root.get_hash(),
             16,
-            0,
+            7,
             &mut first_child,
         );
         let mut resident = NoResident;
@@ -5463,7 +5553,7 @@ mod actor_mailbox_tests {
             &tree,
             root.get_hash(),
             16,
-            0,
+            7,
             &mut first_child,
         );
         let mut resident = NoResident;
@@ -5622,21 +5712,29 @@ mod actor_mailbox_tests {
         queue.enqueue_barrier(44, 9);
         let first = queue.take_next().expect("write command");
         assert!(matches!(first, PersistenceCommand::WriteBatch { .. }));
-        assert!(queue.acknowledge(&PersistenceReady {
-            identity: first.identity(),
-            outcome: PersistenceOutcome::Durable,
-            durability_barrier: false,
-        }));
+        assert!(
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity: first.identity(),
+                    outcome: PersistenceOutcome::Durable,
+                    durability_barrier: false,
+                })
+                .is_some()
+        );
         let second = queue.take_next().expect("barrier command");
         assert!(matches!(
             second,
             PersistenceCommand::DurabilityBarrier { .. }
         ));
-        assert!(queue.acknowledge(&PersistenceReady {
-            identity: second.identity(),
-            outcome: PersistenceOutcome::Durable,
-            durability_barrier: true,
-        }));
+        assert!(
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity: second.identity(),
+                    outcome: PersistenceOutcome::Durable,
+                    durability_barrier: true,
+                })
+                .is_some()
+        );
         assert!(queue.barrier_acknowledged);
     }
 
@@ -5659,11 +5757,15 @@ mod actor_mailbox_tests {
         queue.enqueue_barrier(45, 10);
         let write = queue.take_next().expect("write command");
         assert!(matches!(write, PersistenceCommand::WriteBatch { .. }));
-        assert!(queue.acknowledge(&PersistenceReady {
-            identity: write.identity(),
-            outcome: PersistenceOutcome::Fault(Arc::from("store fault")),
-            durability_barrier: false,
-        }));
+        assert!(
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity: write.identity(),
+                    outcome: PersistenceOutcome::Fault(Arc::from("store fault")),
+                    durability_barrier: false,
+                })
+                .is_some()
+        );
         assert!(
             queue.failed.is_some(),
             "a write fault is terminal before publication"
@@ -5723,22 +5825,28 @@ mod actor_mailbox_tests {
             ..identity
         };
         assert!(
-            !queue.acknowledge(&PersistenceReady {
-                identity: stale,
-                outcome: PersistenceOutcome::Durable,
-                durability_barrier: false,
-            }),
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity: stale,
+                    outcome: PersistenceOutcome::Durable,
+                    durability_barrier: false,
+                })
+                .is_none(),
             "a rotation-mismatched acknowledgement cannot settle the active command"
         );
         assert_eq!(
             queue.in_flight.as_ref().map(PersistenceCommand::identity),
             Some(identity)
         );
-        assert!(queue.acknowledge(&PersistenceReady {
-            identity,
-            outcome: PersistenceOutcome::Durable,
-            durability_barrier: false,
-        }));
+        assert!(
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity,
+                    outcome: PersistenceOutcome::Durable,
+                    durability_barrier: false,
+                })
+                .is_some()
+        );
     }
 
     #[test]

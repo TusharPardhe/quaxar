@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
 use app::{
     BuildLedgerError, BuildLedgerJournal, BuildLedgerView, LedgerReplay, apply_transactions,
-    build_ledger, build_ledger_replay, decode_acquired_tx_set,
+    build_ledger, build_ledger_from_consensus, build_ledger_replay, decode_acquired_tx_set,
 };
 use basics::{base_uint::Uint256, intrusive_pointer::make_shared_intrusive};
 use ledger::{CanonicalTXSet, Ledger, LedgerHeader};
@@ -210,6 +210,40 @@ fn build_ledger_apply_transactions_skips_existing_tx_on_first_pass() {
     assert_eq!(*apply_calls.borrow(), 0);
     assert!(txns.is_empty());
     assert!(failed.is_empty());
+}
+
+#[test]
+fn consensus_builder_discards_transaction_already_accepted_by_parent() {
+    // ../rippled/src/xrpld/app/ledger/detail/BuildLedger.cpp::
+    // applyTransactions removes parent-present IDs before applying a consensus
+    // tx set. Replaying it would re-thread its state changes at child seq 54.
+    let duplicate = sample_tx(1);
+    let parent = sample_parent_with_tx(53, duplicate.get_transaction_id());
+    let parent_seq = parent.header().seq;
+    let tx_items = vec![(
+        duplicate.get_serializer().data().to_vec(),
+        duplicate.get_transaction_id(),
+    )];
+
+    let built = build_ledger_from_consensus(
+        &parent,
+        LedgerHeader {
+            seq: 54,
+            close_time: 100,
+            ..LedgerHeader::default()
+        },
+        &tx_items,
+        None,
+    )
+    .expect("a parent-accepted transaction must be discarded, not replayed");
+
+    assert_eq!(parent.header().seq, parent_seq);
+    assert!(parent.tx_exists(duplicate.get_transaction_id()));
+    assert_eq!(built.header().seq, 54);
+    assert!(
+        !built.tx_exists(duplicate.get_transaction_id()),
+        "the parent transaction must not be replayed into the child transaction map"
+    );
 }
 
 #[test]

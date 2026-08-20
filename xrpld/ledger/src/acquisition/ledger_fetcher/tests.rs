@@ -142,6 +142,40 @@ fn sample_peer_ids_with_draws_unique_subset() {
 }
 
 #[test]
+fn packet_shape_skips_raw_base_header_and_classifies_bundled_roots() {
+    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    root.set_child_hash(3, sample_hash(0x73));
+    root.update_hash();
+    let root_wire = root
+        .serialize_for_wire()
+        .expect("non-empty root should serialize for wire");
+    assert!(
+        SHAMapTreeNode::make_from_wire(&root_wire)
+            .expect("root wire should decode")
+            .expect("root wire should be non-empty")
+            .is_inner()
+    );
+
+    // Base slot 0 is rippled's raw LedgerHeader serialization. Slots 1 and 2
+    // are `serializeRoot` values, which rippled serializes with
+    // `SHAMapTreeNode::serializeForWire`.
+    let packet = InboundLedgerPacket::new(
+        InboundLedgerDataType::Base,
+        vec![
+            InboundLedgerNodeData::new(None, vec![0xAB; 123]),
+            InboundLedgerNodeData::new(None, root_wire),
+        ],
+    );
+
+    let shape = InboundLedgerPacketShape::classify(&packet);
+    assert_eq!(shape.nodes, 2);
+    assert_eq!(shape.inner_nodes, 1);
+    assert_eq!(shape.leaf_nodes, 0);
+    assert_eq!(shape.empty_nodes, 0);
+    assert_eq!(shape.malformed_nodes, 0);
+}
+
+#[test]
 fn packet_shape_classifies_inner_empty_and_malformed_nodes() {
     let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
     inner.set_child_hash(3, sample_hash(0x33));

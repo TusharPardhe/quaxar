@@ -204,10 +204,11 @@ fn preclaim_loan_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         return Ok(Ter::TEC_NO_ENTRY);
     };
     let broker_owner = broker_sle.get_account_id(sf("sfOwner"));
-    let borrower = tx
-        .is_field_present(sf("sfCounterparty"))
-        .then(|| tx.get_account_id(sf("sfCounterparty")))
-        .unwrap_or(account_id);
+    let borrower = if tx.is_field_present(sf("sfCounterparty")) {
+        tx.get_account_id(sf("sfCounterparty"))
+    } else {
+        account_id
+    };
     if account_id != broker_owner && borrower != broker_owner {
         return Ok(Ter::TEC_NO_PERMISSION);
     }
@@ -441,10 +442,11 @@ fn preclaim_cover_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
 
 fn preclaim_cover_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account_id = tx.get_account_id(sf("sfAccount"));
-    let destination = tx
-        .is_field_present(sf("sfDestination"))
-        .then(|| tx.get_account_id(sf("sfDestination")))
-        .unwrap_or(account_id);
+    let destination = if tx.is_field_present(sf("sfDestination")) {
+        tx.get_account_id(sf("sfDestination"))
+    } else {
+        account_id
+    };
     let amount = tx.get_field_amount(sf("sfAmount"));
     let broker_sle = broker(view, tx.get_field_h256(sf("sfLoanBrokerID")))?;
     let vault_sle = match broker_sle.as_ref() {
