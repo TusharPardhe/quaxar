@@ -1116,6 +1116,8 @@ impl CoordinatorRunner {
         let timeout_before = session_state.plan.timeouts();
         let seeded_before_timeout = session_state.plan.engine().is_some();
         let pending_network_before_timeout = session_state.plan.pending_network().len();
+        let pending_reads_before_timeout = session_state.plan.pending_read_count();
+        let read_backlog_before_timeout = session_state.plan.read_backlog_count();
         match session_state.plan.on_timeout() {
             PlanTimeout::Continue => {
                 tracing::info!(
@@ -1130,6 +1132,8 @@ impl CoordinatorRunner {
                     timeout_after = timeout_before.saturating_add(1),
                     seeded_before_timeout,
                     pending_network_before_timeout,
+                    pending_reads_before_timeout,
+                    read_backlog_before_timeout,
                     "acquisition trace: exact session reached no-progress deadline and will retry"
                 );
                 // rippled `InboundLedger::onTimer` retries its base request when
@@ -1182,6 +1186,8 @@ impl CoordinatorRunner {
                     timeout_before,
                     seeded_before_timeout,
                     pending_network_before_timeout,
+                    pending_reads_before_timeout,
+                    read_backlog_before_timeout,
                     "acquisition trace: exact session exhausted its no-progress timeout budget"
                 );
                 let mut effects = effects;
@@ -1197,7 +1203,7 @@ impl CoordinatorRunner {
             return Vec::new();
         }
         let session = completion.operation().session();
-        let outcome = {
+        let (outcome, pending_reads_after, read_backlog_after) = {
             let Some(session_state) = self.state.sessions.get_mut(&session) else {
                 self.stats.stale_events += 1;
                 return Vec::new();
@@ -1206,8 +1212,27 @@ impl CoordinatorRunner {
                 self.stats.stale_events += 1;
                 return Vec::new();
             }
-            session_state.plan.on_read(&completion)
+            let outcome = session_state.plan.on_read(&completion);
+            (
+                outcome,
+                session_state.plan.pending_read_count(),
+                session_state.plan.read_backlog_count(),
+            )
         };
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "node_store_read_completed",
+            run_epoch = session.run_epoch().get(),
+            session_id = session.session_id().get(),
+            target_hash = %session.target_hash(),
+            plan_epoch = session.plan_epoch().get(),
+            store_generation = session.store_generation().get(),
+            outcome = ?completion.outcome(),
+            plan_outcome = ?outcome,
+            pending_reads_after,
+            read_backlog_after,
+            "acquisition trace: brokered NodeStore read completion returned to session"
+        );
         match outcome {
             PlanReadOutcome::Applied => {
                 let mut effects = Vec::new();
@@ -1227,7 +1252,7 @@ impl CoordinatorRunner {
             return Vec::new();
         }
         let session = completion.operation().session();
-        let outcome = {
+        let (outcome, persistence_after) = {
             let Some(session_state) = self.state.sessions.get_mut(&session) else {
                 self.stats.stale_events += 1;
                 return Vec::new();
@@ -1236,10 +1261,24 @@ impl CoordinatorRunner {
                 self.stats.stale_events += 1;
                 return Vec::new();
             }
-            session_state
+            let outcome = session_state
                 .plan
-                .on_write(completion.operation(), completion.outcome())
+                .on_write(completion.operation(), completion.outcome());
+            (outcome, session_state.plan.persistence().label())
         };
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "node_store_write_completed",
+            run_epoch = session.run_epoch().get(),
+            session_id = session.session_id().get(),
+            target_hash = %session.target_hash(),
+            plan_epoch = session.plan_epoch().get(),
+            store_generation = session.store_generation().get(),
+            outcome = ?completion.outcome(),
+            plan_outcome = ?outcome,
+            persistence_after,
+            "acquisition trace: NodeStore write completion returned to session"
+        );
         let mut effects = Vec::new();
         match outcome {
             PlanWriteOutcome::IncrementalAccepted => {
@@ -1617,6 +1656,17 @@ impl CoordinatorRunner {
         match turn {
             PlanTurn::Continue => {}
             PlanTurn::Reads(requests) => {
+                tracing::info!(
+                    target: "acquisition_trace",
+                    event = "node_store_reads_submitted",
+                    run_epoch = session.run_epoch().get(),
+                    session_id = session.session_id().get(),
+                    target_hash = %session.target_hash(),
+                    plan_epoch = session.plan_epoch().get(),
+                    store_generation = session.store_generation().get(),
+                    reads = requests.len(),
+                    "acquisition trace: session requested brokered NodeStore reads before peer frontier work"
+                );
                 for request in requests {
                     effects.push(AcquisitionEffect::SubmitRead(request));
                 }
@@ -1790,6 +1840,8 @@ impl CoordinatorRunner {
                 plan_runs = session_state.plan.runs(),
                 timeout_count = session_state.plan.timeouts(),
                 pending_network = session_state.plan.pending_network().len(),
+                pending_reads = session_state.plan.pending_read_count(),
+                read_backlog = session_state.plan.read_backlog_count(),
                 persistence = session_state.plan.persistence().label(),
                 "acquisition trace: session terminalized with failure"
             );
@@ -1905,6 +1957,8 @@ impl CoordinatorRunner {
                 plan_runs = session_state.plan.runs(),
                 timeout_count = session_state.plan.timeouts(),
                 pending_network = session_state.plan.pending_network().len(),
+                pending_reads = session_state.plan.pending_read_count(),
+                read_backlog = session_state.plan.read_backlog_count(),
                 persistence = session_state.plan.persistence().label(),
                 "acquisition trace: session cancelled before durable completion"
             );

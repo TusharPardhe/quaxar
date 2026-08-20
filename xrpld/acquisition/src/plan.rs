@@ -660,6 +660,16 @@ impl SessionPlan {
         self.runs
     }
 
+    /// Pending brokered NodeStore reads for this session.
+    pub fn pending_read_count(&self) -> usize {
+        self.pending_reads.len()
+    }
+
+    /// Read needs waiting for bounded broker admission.
+    pub fn read_backlog_count(&self) -> usize {
+        self.read_backlog.len()
+    }
+
     /// Pending network candidates requested from peers (observability).
     pub fn pending_network(&self) -> &BTreeSet<Uint256> {
         &self.pending_network
