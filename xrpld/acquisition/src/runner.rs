@@ -810,21 +810,39 @@ impl CoordinatorRunner {
         } else {
             "replacing_conflicting_session"
         };
-        tracing::info!(
-            target: "acquisition_trace",
-            event = "acquire_demand_disposition",
-            target_hash = %target.hash(),
-            target_seq = ?target.sequence(),
-            ?reason,
-            phase = ?self.state.phase,
-            peer_count = self.state.peer_view.peers().len(),
-            same_hash_sessions = same_hash.len(),
-            replacement_count = replaceable.len(),
-            live_sessions,
-            max_sessions = self.state.budgets.max_sessions,
+        if matches!(
             disposition,
-            "acquisition trace: target demand disposition"
-        );
+            "new_session"
+                | "replacing_conflicting_session"
+                | "promoted_known_sequence"
+                | "rejected_capacity"
+        ) {
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "acquire_demand_disposition",
+                target_hash = %target.hash(),
+                target_seq = ?target.sequence(),
+                ?reason,
+                phase = ?self.state.phase,
+                peer_count = self.state.peer_view.peers().len(),
+                same_hash_sessions = same_hash.len(),
+                replacement_count = replaceable.len(),
+                live_sessions,
+                max_sessions = self.state.budgets.max_sessions,
+                disposition,
+                "acquisition trace: target demand disposition"
+            );
+        } else {
+            tracing::debug!(
+                target: "acquisition_trace",
+                event = "acquire_demand_coalesced",
+                target_hash = %target.hash(),
+                target_seq = ?target.sequence(),
+                ?reason,
+                disposition,
+                "acquisition trace: target demand reused its existing live session"
+            );
+        }
         if would_exceed {
             self.stats.rejected_events += 1;
             return effects;
@@ -904,6 +922,21 @@ impl CoordinatorRunner {
             .take(INITIAL_PEER_REQUEST_FANOUT)
             .collect::<Vec<_>>();
         let peer = initial_peers[0];
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "session_started",
+            run_epoch = session.run_epoch().get(),
+            session_id = session.session_id().get(),
+            target_hash = %session.target_hash(),
+            plan_epoch = session.plan_epoch().get(),
+            store_generation = session.store_generation().get(),
+            target_seq = ?target.sequence(),
+            ?reason,
+            initial_peer_count = initial_peers.len(),
+            initial_peers = ?initial_peers,
+            acquire_timeout_ms = self.state.budgets.acquire_timeout.as_millis(),
+            "acquisition trace: exact target session started with initial Base fanout"
+        );
         let admission = self.state.budgets.admission;
         self.state.sessions.insert(
             session,
@@ -972,6 +1005,7 @@ impl CoordinatorRunner {
         }
         // A header packet seeds the uniquely owned engine once. The seed runs
         // outside state mutation and returns an engine or nothing.
+        let packet_peer = packet.peer_id();
         let header = packet.packet().clone();
         let needs_seed = packet.packet().packet_type == ledger::InboundLedgerDataType::Base
             && session_state.plan.engine().is_none();
@@ -983,13 +1017,38 @@ impl CoordinatorRunner {
         } else {
             false
         };
+        if needs_seed {
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "base_seed_evaluated",
+                run_epoch = session.run_epoch().get(),
+                session_id = session.session_id().get(),
+                target_hash = %session.target_hash(),
+                plan_epoch = session.plan_epoch().get(),
+                store_generation = session.store_generation().get(),
+                peer_id = packet_peer.get(),
+                packet_nodes = header.nodes.len(),
+                seeded,
+                "acquisition trace: Base packet evaluated for header/root plan seed"
+            );
+        }
         // Defensive mailbox bounds: ingress already reserved capacity through
         // the `AdmissionGate`, but a misconfigured or replaying ingress must
         // not overflow coordinator state. The plan's mailbox enforces the same
         // `128`-packet / `4 MiB` semantics.
-        let packet_peer = packet.peer_id();
         if !session_state.plan.push_packet(packet) {
             self.stats.packets_dropped += 1;
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "packet_dropped_mailbox_full",
+                run_epoch = session.run_epoch().get(),
+                session_id = session.session_id().get(),
+                target_hash = %session.target_hash(),
+                peer_id = packet_peer.get(),
+                mailbox_packets = session_state.plan.packet_count(),
+                mailbox_bytes = session_state.plan.packet_bytes(),
+                "acquisition trace: admitted packet could not enter bounded session mailbox"
+            );
             return Vec::new();
         }
         self.stats.packets_admitted += 1;
@@ -1054,9 +1113,26 @@ impl CoordinatorRunner {
             self.stats.stale_events += 1;
             return effects;
         };
+        let timeout_before = session_state.plan.timeouts();
+        let seeded_before_timeout = session_state.plan.engine().is_some();
+        let pending_network_before_timeout = session_state.plan.pending_network().len();
         match session_state.plan.on_timeout() {
             PlanTimeout::Continue => {
-                // rippled InboundLedger::onTimer retries its base request when
+                tracing::info!(
+                    target: "acquisition_trace",
+                    event = "acquisition_timeout_retry",
+                    run_epoch = session.run_epoch().get(),
+                    session_id = session.session_id().get(),
+                    target_hash = %session.target_hash(),
+                    plan_epoch = session.plan_epoch().get(),
+                    store_generation = session.store_generation().get(),
+                    timeout_before,
+                    timeout_after = timeout_before.saturating_add(1),
+                    seeded_before_timeout,
+                    pending_network_before_timeout,
+                    "acquisition trace: exact session reached no-progress deadline and will retry"
+                );
+                // rippled `InboundLedger::onTimer` retries its base request when
                 // the acquisition has made no header progress (and expands the
                 // peer set before later attempts). An unseeded coordinator
                 // plan has no engine that could otherwise re-emit work, so
@@ -1095,6 +1171,19 @@ impl CoordinatorRunner {
                 effects
             }
             PlanTimeout::Fail => {
+                tracing::info!(
+                    target: "acquisition_trace",
+                    event = "acquisition_timeout_exhausted",
+                    run_epoch = session.run_epoch().get(),
+                    session_id = session.session_id().get(),
+                    target_hash = %session.target_hash(),
+                    plan_epoch = session.plan_epoch().get(),
+                    store_generation = session.store_generation().get(),
+                    timeout_before,
+                    seeded_before_timeout,
+                    pending_network_before_timeout,
+                    "acquisition trace: exact session exhausted its no-progress timeout budget"
+                );
                 let mut effects = effects;
                 self.fail_session(session, FailureReason::AcquisitionTimeout, &mut effects);
                 effects
@@ -1582,6 +1671,27 @@ impl CoordinatorRunner {
                 let Some(sequence) = sequence else {
                     return;
                 };
+                let state_node_count = nodes
+                    .iter()
+                    .filter(|node| node.kind() == ledger::TreeKind::State)
+                    .count();
+                let transaction_node_count = nodes.len().saturating_sub(state_node_count);
+                tracing::info!(
+                    target: "acquisition_trace",
+                    event = "network_frontier_requested",
+                    run_epoch = session.run_epoch().get(),
+                    session_id = session.session_id().get(),
+                    target_hash = %session.target_hash(),
+                    plan_epoch = session.plan_epoch().get(),
+                    store_generation = session.store_generation().get(),
+                    ledger_sequence = sequence,
+                    reply_peer = ?reply_peer.map(PeerId::get),
+                    peer_count = peers.len(),
+                    nodes = nodes.len(),
+                    state_nodes = state_node_count,
+                    transaction_nodes = transaction_node_count,
+                    "acquisition trace: requesting current SHAMap frontier from selected peers"
+                );
                 for kind in [ledger::TreeKind::State, ledger::TreeKind::Transaction] {
                     let node_ids = nodes
                         .iter()
@@ -1616,6 +1726,20 @@ impl CoordinatorRunner {
                 }
             }
             PlanTurn::Persist(batch) => {
+                tracing::info!(
+                    target: "acquisition_trace",
+                    event = "persistence_batch_submitted",
+                    run_epoch = session.run_epoch().get(),
+                    session_id = session.session_id().get(),
+                    target_hash = %session.target_hash(),
+                    plan_epoch = session.plan_epoch().get(),
+                    store_generation = session.store_generation().get(),
+                    ledger_sequence = batch.ledger_sequence(),
+                    nodes = batch.nodes().len(),
+                    payload_bytes = batch.payload_bytes(),
+                    final_batch = batch.requires_fence(),
+                    "acquisition trace: accepted SHAMap nodes submitted for persistence"
+                );
                 if batch.requires_fence() {
                     // Active -> Persisting: the tree is structurally complete
                     // and the final batch must pass its durability fence before
@@ -1653,6 +1777,22 @@ impl CoordinatorRunner {
         }
         let failed = SessionPhase::Failed { reason };
         if session_phase_transition(&session_state.phase, &failed) {
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "session_failed",
+                run_epoch = session.run_epoch().get(),
+                session_id = session.session_id().get(),
+                target_hash = %session.target_hash(),
+                plan_epoch = session.plan_epoch().get(),
+                store_generation = session.store_generation().get(),
+                ?reason,
+                phase_before = ?session_state.phase,
+                plan_runs = session_state.plan.runs(),
+                timeout_count = session_state.plan.timeouts(),
+                pending_network = session_state.plan.pending_network().len(),
+                persistence = session_state.plan.persistence().label(),
+                "acquisition trace: session terminalized with failure"
+            );
             session_state.phase = failed;
             session_state.pending_timer = None;
             session_state.plan.cancel();
@@ -1752,6 +1892,22 @@ impl CoordinatorRunner {
         }
         let cancelled = SessionPhase::Cancelled { reason };
         if session_phase_transition(&session_state.phase, &cancelled) {
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "session_cancelled",
+                run_epoch = session.run_epoch().get(),
+                session_id = session.session_id().get(),
+                target_hash = %session.target_hash(),
+                plan_epoch = session.plan_epoch().get(),
+                store_generation = session.store_generation().get(),
+                ?reason,
+                phase_before = ?session_state.phase,
+                plan_runs = session_state.plan.runs(),
+                timeout_count = session_state.plan.timeouts(),
+                pending_network = session_state.plan.pending_network().len(),
+                persistence = session_state.plan.persistence().label(),
+                "acquisition trace: session cancelled before durable completion"
+            );
             session_state.phase = cancelled;
             session_state.pending_timer = None;
             session_state.plan.cancel();

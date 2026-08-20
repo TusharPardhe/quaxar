@@ -526,12 +526,16 @@ pub enum PlanTurn {
 struct PacketFeed {
     attached: bool,
     useful: bool,
+    nodes_seen: u32,
+    malformed_nodes: u32,
 }
 
 impl PacketFeed {
     fn merge(&mut self, other: Self) {
         self.attached |= other.attached;
         self.useful |= other.useful;
+        self.nodes_seen = self.nodes_seen.saturating_add(other.nodes_seen);
+        self.malformed_nodes = self.malformed_nodes.saturating_add(other.malformed_nodes);
     }
 }
 
@@ -764,6 +768,26 @@ impl SessionPlan {
                 )
             };
             self.runs += 1;
+            if fed.nodes_seen != 0 {
+                tracing::info!(
+                    target: "acquisition_trace",
+                    event = "packet_batch_applied",
+                    run_epoch = ctx.session.run_epoch().get(),
+                    session_id = ctx.session.session_id().get(),
+                    target_hash = %ctx.session.target_hash(),
+                    plan_epoch = ctx.session.plan_epoch().get(),
+                    store_generation = ctx.session.store_generation().get(),
+                    plan_run = self.runs,
+                    nodes_seen = fed.nodes_seen,
+                    malformed_nodes = fed.malformed_nodes,
+                    attached = fed.attached,
+                    useful = fed.useful,
+                    mailbox_packets = self.mailbox.packet_count(),
+                    mailbox_bytes = self.mailbox.packet_bytes(),
+                    pending_network = self.pending_network.len(),
+                    "acquisition trace: bounded peer-node batch applied to SHAMap plan"
+                );
+            }
             // Matches rippled `InboundLedger::processData`: only useful peer
             // data resets the no-progress timeout. A duplicate, stale, or
             // unattached but decodable packet may wake the frontier but cannot
@@ -941,9 +965,11 @@ impl SessionPlan {
         };
         let mut fed = PacketFeed::default();
         for node in &packet.packet().nodes {
+            fed.nodes_seen = fed.nodes_seen.saturating_add(1);
             let decoded = match SHAMapTreeNode::make_from_wire(&node.node_data) {
                 Ok(Some(decoded)) => decoded,
                 Ok(None) | Err(_) => {
+                    fed.malformed_nodes = fed.malformed_nodes.saturating_add(1);
                     tracing::warn!(
                         target: "acquisition",
                         packet_type = ?packet.packet().packet_type,
