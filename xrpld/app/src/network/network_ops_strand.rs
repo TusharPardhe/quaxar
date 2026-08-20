@@ -2463,6 +2463,19 @@ fn process_coordinator_completed_inbound_ledger(
         return;
     }
 
+    tracing::info!(
+        target: "acquisition_trace",
+        event = "durable_handoff_received",
+        handoff = handoff.get(),
+        run_epoch = session.run_epoch().get(),
+        session_id = session.session_id().get(),
+        target_hash = %session.target_hash(),
+        plan_epoch = session.plan_epoch().get(),
+        store_generation = session.store_generation().get(),
+        ledger_hash = %item.ledger.header().hash,
+        ledger_seq = item.ledger.header().seq,
+        "acquisition trace: NetworkOps received exact durable coordinator handoff"
+    );
     let persisted = process_completed_inbound_ledger(
         root,
         lm,
@@ -2479,7 +2492,24 @@ fn process_coordinator_completed_inbound_ledger(
     // publish a ledger, and it does not run coordinator work while this
     // completed-ledger receiver lock is held.
     if persisted.acknowledged {
-        if !shared_inbound.acknowledge_coordinator_durable_handoff(handoff, session) {
+        let acknowledgement_enqueued =
+            shared_inbound.acknowledge_coordinator_durable_handoff(handoff, session);
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "durable_handoff_recipient_processed",
+            handoff = handoff.get(),
+            run_epoch = session.run_epoch().get(),
+            session_id = session.session_id().get(),
+            target_hash = %session.target_hash(),
+            plan_epoch = session.plan_epoch().get(),
+            store_generation = session.store_generation().get(),
+            ledger_hash = %item.ledger.header().hash,
+            ledger_seq = item.ledger.header().seq,
+            acknowledged = persisted.acknowledged,
+            acknowledgement_enqueued,
+            "acquisition trace: recipient persisted, registered, and dispatched acceptance for durable handoff"
+        );
+        if !acknowledgement_enqueued {
             // Queue capacity is twice one bounded completed-ledger slice, so
             // normal receipt processing cannot overflow it. If a producer is
             // persistently backpressured, leave this exact dedup claim intact

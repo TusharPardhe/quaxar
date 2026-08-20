@@ -658,6 +658,16 @@ impl CoordinatorRunner {
     fn on_preferred_lcl_divergence(&mut self, target: LedgerTarget) -> Vec<AcquisitionEffect> {
         if !self.state.peer_view.has_usable_peer_capability() {
             self.stats.rejected_events += 1;
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "preferred_lcl_divergence_rejected",
+                target_hash = %target.hash(),
+                target_seq = ?target.sequence(),
+                phase = ?self.state.phase,
+                peer_count = self.state.peer_view.peers().len(),
+                reason = "no_usable_peers",
+                "acquisition trace: preferred-LCL divergence did not enter coordinator"
+            );
             return Vec::new();
         }
         let fact = TransitionFact::PreferredLclDivergence { target };
@@ -705,6 +715,16 @@ impl CoordinatorRunner {
         // the same target.
         if !self.state.peer_view.has_usable_peer_capability() {
             self.state.deferred_acquire = Some((target, reason));
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "acquire_demand_deferred",
+                target_hash = %target.hash(),
+                target_seq = ?target.sequence(),
+                ?reason,
+                phase = ?self.state.phase,
+                peer_count = self.state.peer_view.peers().len(),
+                "acquisition trace: retained target demand until usable peer capability returns"
+            );
             return effects;
         }
 
@@ -777,6 +797,34 @@ impl CoordinatorRunner {
             .count();
         let would_exceed = !continuing_existing
             && live_sessions.saturating_sub(replaceable.len()) >= self.state.budgets.max_sessions;
+        let disposition = if exact.is_some() {
+            "coalesced_exact"
+        } else if promotion.is_some() {
+            "promoted_known_sequence"
+        } else if hash_only_coalesce.is_some() {
+            "coalesced_hash_only"
+        } else if would_exceed {
+            "rejected_capacity"
+        } else if replaceable.is_empty() {
+            "new_session"
+        } else {
+            "replacing_conflicting_session"
+        };
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "acquire_demand_disposition",
+            target_hash = %target.hash(),
+            target_seq = ?target.sequence(),
+            ?reason,
+            phase = ?self.state.phase,
+            peer_count = self.state.peer_view.peers().len(),
+            same_hash_sessions = same_hash.len(),
+            replacement_count = replaceable.len(),
+            live_sessions,
+            max_sessions = self.state.budgets.max_sessions,
+            disposition,
+            "acquisition trace: target demand disposition"
+        );
         if would_exceed {
             self.stats.rejected_events += 1;
             return effects;
@@ -1156,6 +1204,19 @@ impl CoordinatorRunner {
                     return effects;
                 };
                 let handoff = self.state.ids.next_id::<DurableHandoffId>();
+                tracing::info!(
+                    target: "acquisition_trace",
+                    event = "durability_fence_passed",
+                    run_epoch = session.run_epoch().get(),
+                    session_id = session.session_id().get(),
+                    target_hash = %session.target_hash(),
+                    plan_epoch = session.plan_epoch().get(),
+                    store_generation = session.store_generation().get(),
+                    handoff = handoff.get(),
+                    ledger_hash = %ledger.header().hash,
+                    ledger_seq = ledger.header().seq,
+                    "acquisition trace: final durability fence passed; publishing exact durable handoff"
+                );
                 session_state.pending_handoff = Some(handoff);
                 // The acquisition deadline is no longer meaningful once the
                 // fence passed; a later rejected handoff arms its own exact
@@ -1193,6 +1254,17 @@ impl CoordinatorRunner {
         }
         let complete = SessionPhase::Complete;
         if session_phase_transition(&session_state.phase, &complete) {
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "durable_handoff_acknowledged",
+                run_epoch = session.run_epoch().get(),
+                session_id = session.session_id().get(),
+                target_hash = %session.target_hash(),
+                plan_epoch = session.plan_epoch().get(),
+                store_generation = session.store_generation().get(),
+                handoff = ack.handoff().get(),
+                "acquisition trace: durable handoff recipient completed persistence, registration, and acceptance dispatch"
+            );
             session_state.phase = complete;
             session_state.pending_handoff = None;
             session_state.pending_timer = None;
@@ -1245,6 +1317,15 @@ impl CoordinatorRunner {
     }
 
     fn on_lcl_installed(&mut self, identity: LedgerIdentity) -> Vec<AcquisitionEffect> {
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "lcl_installed_fact_received",
+            lcl_hash = %identity.hash(),
+            lcl_seq = identity.sequence(),
+            phase_before = ?self.state.phase,
+            matching_live_sessions = self.live_sessions_for_hash(identity.hash()).len(),
+            "acquisition trace: serialized NetworkOps LCL installation fact received"
+        );
         // This fact is serialized by NetworkOps and is the exact local-LCL
         // counterpart that authorizes a later in-place Full refresh.
         self.state.last_installed_lcl = Some(identity);
@@ -1294,6 +1375,15 @@ impl CoordinatorRunner {
         for session in self.live_sessions_for_hash(identity.hash()) {
             self.cancel_session(session, CancelReason::LclInstalled, &mut effects);
         }
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "lcl_installed_fact_applied",
+            lcl_hash = %identity.hash(),
+            lcl_seq = identity.sequence(),
+            phase_after = ?self.state.phase,
+            emitted_effects = effects.len(),
+            "acquisition trace: LCL installation fact applied to coordinator state"
+        );
         effects
     }
 

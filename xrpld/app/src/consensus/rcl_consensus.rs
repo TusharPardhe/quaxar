@@ -45,6 +45,8 @@ use basics::base_uint::Uint256;
 use basics::chrono::NetClockTimePoint;
 use basics::sha_map_hash::SHAMapHash;
 use consensus::algorithm::types::{ConsensusCloseTimes, ConsensusMode};
+use consensus::model::TrieLedger;
+use consensus::rcl_support::ValidationsLedger;
 use consensus::{Consensus, ConsensusParms};
 use protocol::PublicKey;
 
@@ -257,10 +259,34 @@ impl RclConsensusValidationSource for SharedAppValidations<SystemTimeKeeperClock
         min_seq: u32,
         peer_counts: &std::collections::BTreeMap<Uint256, u32>,
     ) -> Uint256 {
-        self.validations()
+        let decision = self
+            .validations()
             .lock()
             .expect("shared app validations mutex must not be poisoned")
-            .get_preferred_lcl(lcl, min_seq, peer_counts)
+            .get_preferred_lcl_diagnostic(lcl, min_seq, peer_counts);
+        // Bounded causal record for the preferred-LCL boundary. This exposes
+        // whether an unstable target comes from trusted validation support,
+        // pending acquisition support, or peer-status fallback without
+        // changing the reference-compatible selection.
+        tracing::info!(
+            target: "lcl_trace",
+            event = "preferred_lcl_selected",
+            local_lcl_hash = %lcl.id(),
+            local_lcl_seq = lcl.seq(),
+            min_valid_seq = min_seq,
+            selected_hash = %decision.selected,
+            selection_source = ?decision.selection_source,
+            working_source = ?decision.working_source,
+            trie_preferred = ?decision.trie_preferred,
+            acquiring_preferred = ?decision.acquiring_preferred,
+            peer_preferred = ?decision.peer_preferred,
+            peer_lcl_entry_count = decision.peer_lcl_entry_count,
+            trusted_full_validations = decision.current_trusted_full_count,
+            acquiring_entry_count = decision.acquiring_entry_count,
+            acquiring_waiter_count = decision.acquiring_waiter_count,
+            "LCL trace: preferred LCL selected"
+        );
+        decision.selected
     }
 
     fn preferred_min_seq(
