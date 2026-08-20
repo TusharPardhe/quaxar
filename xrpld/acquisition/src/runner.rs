@@ -1317,15 +1317,12 @@ impl CoordinatorRunner {
     }
 
     fn on_lcl_installed(&mut self, identity: LedgerIdentity) -> Vec<AcquisitionEffect> {
-        tracing::info!(
-            target: "acquisition_trace",
-            event = "lcl_installed_fact_received",
-            lcl_hash = %identity.hash(),
-            lcl_seq = identity.sequence(),
-            phase_before = ?self.state.phase,
-            matching_live_sessions = self.live_sessions_for_hash(identity.hash()).len(),
-            "acquisition trace: serialized NetworkOps LCL installation fact received"
-        );
+        // NetworkOps republishes the current LCL during routine maintenance.
+        // It is a meaningful causal fact only when the identity changes or it
+        // changes coordinator state; logging each unchanged, nonmatching fact
+        // at INFO would overwhelm the target-acquisition trace.
+        let lcl_changed = self.state.last_installed_lcl != Some(identity);
+        let phase_before = lcl_changed.then(|| format!("{:?}", self.state.phase));
         // This fact is serialized by NetworkOps and is the exact local-LCL
         // counterpart that authorizes a later in-place Full refresh.
         self.state.last_installed_lcl = Some(identity);
@@ -1375,15 +1372,19 @@ impl CoordinatorRunner {
         for session in self.live_sessions_for_hash(identity.hash()) {
             self.cancel_session(session, CancelReason::LclInstalled, &mut effects);
         }
-        tracing::info!(
-            target: "acquisition_trace",
-            event = "lcl_installed_fact_applied",
-            lcl_hash = %identity.hash(),
-            lcl_seq = identity.sequence(),
-            phase_after = ?self.state.phase,
-            emitted_effects = effects.len(),
-            "acquisition trace: LCL installation fact applied to coordinator state"
-        );
+        if lcl_changed || !effects.is_empty() {
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "lcl_installed_fact_applied",
+                lcl_hash = %identity.hash(),
+                lcl_seq = identity.sequence(),
+                lcl_changed,
+                phase_before = ?phase_before,
+                phase_after = ?self.state.phase,
+                emitted_effects = effects.len(),
+                "acquisition trace: LCL installation fact changed coordinator state"
+            );
+        }
         effects
     }
 
