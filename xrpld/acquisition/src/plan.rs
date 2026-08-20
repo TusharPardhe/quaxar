@@ -552,6 +552,7 @@ pub struct SessionPlan {
     mailbox: SessionMailbox,
     pending_reads: BTreeMap<SHAMapHash, OperationRef>,
     read_backlog: VecDeque<PlanReadNeed>,
+    network_backlog: VecDeque<PlanNetworkNeed>,
     pending_network: BTreeSet<Uint256>,
     persistence: SessionPersistence,
     timeouts: u32,
@@ -569,6 +570,7 @@ impl SessionPlan {
             mailbox: SessionMailbox::new(admission.max_packets(), admission.max_bytes()),
             pending_reads: BTreeMap::new(),
             read_backlog: VecDeque::new(),
+            network_backlog: VecDeque::new(),
             pending_network: BTreeSet::new(),
             persistence: SessionPersistence::None,
             timeouts: 0,
@@ -687,6 +689,7 @@ impl SessionPlan {
         self.mailbox.clear();
         self.pending_reads.clear();
         self.read_backlog.clear();
+        self.network_backlog.clear();
         self.pending_network.clear();
         self.engine = None;
         self.persistence = SessionPersistence::None;
@@ -736,6 +739,14 @@ impl SessionPlan {
                 return PlanTurn::Continue;
             }
             return PlanTurn::Reads(requests);
+        }
+
+        if !self.network_backlog.is_empty() {
+            let nodes = self.network_backlog.drain(..).collect::<Vec<_>>();
+            for node in &nodes {
+                self.pending_network.insert(node.hash());
+            }
+            return PlanTurn::Network(nodes);
         }
 
         let mut turns = 0u32;
@@ -806,6 +817,42 @@ impl SessionPlan {
                 self.note_progress();
             }
             if !pending_writes.is_empty() {
+                // `TreePlan::advance` transfers newly discovered missing hashes
+                // into its returned effect. Incremental persistence must not
+                // discard that effect: retain it until this write settles, then
+                // drain it before another CPU turn. This preserves the async
+                // NodeStore boundary and rippled's `InboundLedger::trigger`
+                // guarantee (src/xrpld/app/ledger/detail/InboundLedger.cpp)
+                // that a scan's missing-node work remains live after storing
+                // accepted data.
+                let deferred_reads = match &outcome {
+                    PlanStepOutcome::NeedsReads(needs) => {
+                        self.defer_reads_after_incremental_write(needs.iter().cloned())
+                    }
+                    _ => 0,
+                };
+                let deferred_network = match &outcome {
+                    PlanStepOutcome::NeedsNetwork(nodes) => {
+                        self.defer_network_after_incremental_write(nodes.iter().copied())
+                    }
+                    _ => 0,
+                };
+                if deferred_reads != 0 || deferred_network != 0 {
+                    tracing::info!(
+                        target: "acquisition_trace",
+                        event = "effects_deferred_for_incremental_write",
+                        run_epoch = ctx.session.run_epoch().get(),
+                        session_id = ctx.session.session_id().get(),
+                        target_hash = %ctx.session.target_hash(),
+                        plan_epoch = ctx.session.plan_epoch().get(),
+                        store_generation = ctx.session.store_generation().get(),
+                        deferred_reads,
+                        deferred_network,
+                        read_backlog = self.read_backlog.len(),
+                        network_backlog = self.network_backlog.len(),
+                        "acquisition trace: retained traversal effects until incremental NodeStore write completes"
+                    );
+                }
                 let Some(ledger_sequence) = ledger_sequence.filter(|sequence| *sequence != 0)
                 else {
                     return PlanTurn::Invalid;
@@ -999,6 +1046,53 @@ impl SessionPlan {
         }
         let _ = packet.settle();
         fed
+    }
+
+    /// Retains a read effect while the incremental write from the same plan
+    /// turn settles. The traversal already transferred these needs out of its
+    /// unannounced set, so losing them would permanently strand its pending
+    /// edges.
+    fn defer_reads_after_incremental_write(
+        &mut self,
+        needs: impl IntoIterator<Item = PlanReadNeed>,
+    ) -> usize {
+        let mut deferred = 0;
+        for need in needs {
+            if self.pending_reads.contains_key(&need.hash)
+                || self
+                    .read_backlog
+                    .iter()
+                    .any(|queued| queued.hash == need.hash)
+            {
+                continue;
+            }
+            self.read_backlog.push_back(need);
+            deferred += 1;
+        }
+        deferred
+    }
+
+    /// Retains a peer effect while the incremental write from the same plan
+    /// turn settles. `TreePlan` emits these candidates once, so queueing them
+    /// preserves the retained traversal frontier across the write boundary.
+    fn defer_network_after_incremental_write(
+        &mut self,
+        nodes: impl IntoIterator<Item = PlanNetworkNeed>,
+    ) -> usize {
+        let mut deferred = 0;
+        for node in nodes {
+            if self.pending_network.contains(&node.hash())
+                || self
+                    .network_backlog
+                    .iter()
+                    .any(|queued| queued.hash() == node.hash())
+            {
+                continue;
+            }
+            self.network_backlog.push_back(node);
+            deferred += 1;
+        }
+        deferred
     }
 
     /// Admits newly announced reads up to the pending cap. Hashes already in
@@ -1667,6 +1761,84 @@ mod tests {
                 reason: FailureReason::DurabilityFenceFailed,
             }
         );
+    }
+
+    #[test]
+    fn incremental_write_retains_discovered_reads_until_write_completion() {
+        let mut ids = IdCounter::new();
+        let s = session();
+        let mut plan = SessionPlan::new(budget());
+        assert!(
+            plan.install_engine(Box::new(
+                ScriptedEngine::new(
+                    TreePlanId::new(1),
+                    vec![ScriptedStep::NeedsReads(vec![need(7)])],
+                    vec![PersistNode::new(
+                        SHAMapHash::new(Uint256::from(99)),
+                        Bytes::from_static(b"accepted-node"),
+                        crate::io::StoredObjectKind::AccountNode,
+                    )],
+                )
+                .with_persistence_sequence(1),
+            ))
+        );
+
+        let PlanTurn::Persist(write) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected the accepted node to persist first");
+        };
+        assert!(write.fence().is_none(), "incremental writes have no fence");
+        assert_eq!(plan.read_backlog_count(), 1, "read effect must be retained");
+        assert_eq!(
+            plan.pending_read_count(),
+            0,
+            "read dispatch waits for write ack"
+        );
+
+        assert_eq!(
+            plan.on_write(write.operation(), WriteOutcome::Accepted),
+            PlanWriteOutcome::IncrementalAccepted
+        );
+        let PlanTurn::Reads(reads) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected retained read after incremental write completion");
+        };
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].key(), SHAMapHash::new(Uint256::from(7)));
+    }
+
+    #[test]
+    fn incremental_write_retains_discovered_network_effect_until_write_completion() {
+        let mut ids = IdCounter::new();
+        let s = session();
+        let network_need =
+            PlanNetworkNeed::new(SHAMapNodeId::default(), Uint256::from(8), TreeKind::State);
+        let mut plan = SessionPlan::new(budget());
+        assert!(
+            plan.install_engine(Box::new(
+                ScriptedEngine::new(
+                    TreePlanId::new(1),
+                    vec![ScriptedStep::NeedsNetworkWithKind(vec![network_need])],
+                    vec![PersistNode::new(
+                        SHAMapHash::new(Uint256::from(100)),
+                        Bytes::from_static(b"accepted-node"),
+                        crate::io::StoredObjectKind::AccountNode,
+                    )],
+                )
+                .with_persistence_sequence(1),
+            ))
+        );
+
+        let PlanTurn::Persist(write) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected the accepted node to persist first");
+        };
+        assert_eq!(
+            plan.on_write(write.operation(), WriteOutcome::Accepted),
+            PlanWriteOutcome::IncrementalAccepted
+        );
+        let PlanTurn::Network(nodes) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected retained network effect after incremental write completion");
+        };
+        assert_eq!(nodes, vec![network_need]);
+        assert!(plan.pending_network().contains(&Uint256::from(8)));
     }
 
     #[test]
