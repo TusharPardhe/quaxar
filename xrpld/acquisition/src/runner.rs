@@ -148,6 +148,10 @@ pub struct CoordinatorSession {
     phase: SessionPhase,
     plan: SessionPlan,
     sent_peers: BTreeSet<PeerId>,
+    /// Hashes recently requested from the network. This is the coordinator
+    /// equivalent of rippled `InboundLedger::recentNodes_`: reply-driven
+    /// turns must not re-request an already outstanding missing node.
+    recent_node_hashes: BTreeSet<Uint256>,
     pending_timer: Option<(TimerKind, OperationRef)>,
     pending_handoff: Option<DurableHandoffId>,
     // The durable ledger is retained for handoff retry: `plan.durable_ledger()`
@@ -171,6 +175,7 @@ impl CoordinatorSession {
             phase: SessionPhase::Active,
             plan: SessionPlan::new(admission),
             sent_peers,
+            recent_node_hashes: BTreeSet::new(),
             pending_timer: None,
             pending_handoff: None,
             durable: None,
@@ -1429,6 +1434,31 @@ impl CoordinatorRunner {
                 }
             }
             PlanTurn::Network(nodes) => {
+                // rippled `InboundLedger::filterNodes` records requested hashes
+                // and suppresses an all-duplicate set on a reply trigger. This
+                // matters after the initial five-peer header fanout: each Base
+                // reply can otherwise discover the same frontier and multiply
+                // requests before the first node reply attaches it. Timeout
+                // work intentionally remains eligible to retry known hashes.
+                let nodes = if reply_peer.is_some() {
+                    let Some(session_state) = self.state.sessions.get_mut(&session) else {
+                        return;
+                    };
+                    nodes
+                        .into_iter()
+                        .filter(|node| session_state.recent_node_hashes.insert(node.hash()))
+                        .collect::<Vec<_>>()
+                } else {
+                    if let Some(session_state) = self.state.sessions.get_mut(&session) {
+                        session_state
+                            .recent_node_hashes
+                            .extend(nodes.iter().map(|node| node.hash()));
+                    }
+                    nodes
+                };
+                if nodes.is_empty() {
+                    return;
+                }
                 let sequence = self
                     .state
                     .sessions
@@ -2505,6 +2535,52 @@ mod tests {
             requests[0].request(),
             LedgerDataRequest::GetLedgerNodes { .. }
         ));
+    }
+
+    #[test]
+    fn reply_driven_duplicate_nodes_are_suppressed_after_header_fanout() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let node = (SHAMapNodeId::default(), Uint256::from(3));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![
+                ScriptedStep::NeedsNetwork(vec![node]),
+                ScriptedStep::NeedsNetwork(vec![node]),
+            ])),
+        );
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(1), PeerId::new(2)]),
+        ));
+        let session = peer_request_session(&acquire_with_effects(&mut runner, 10));
+
+        let first = runner.handle_event(AcquisitionEvent::PacketAdmitted(
+            admitted_packet_from_peer(session, PeerId::new(1), AdmissionBudget::new(1, 256), 8),
+        ));
+        assert_eq!(
+            first
+                .iter()
+                .filter(|effect| matches!(effect, AcquisitionEffect::SendLedgerRequest(_)))
+                .count(),
+            1
+        );
+
+        // A second header reply from another initial-fanout peer discovers the
+        // same missing node. As in rippled `filterNodes(..., Reply)`, it must
+        // not emit a duplicate request or add that peer to the request set.
+        let duplicate = runner.handle_event(AcquisitionEvent::PacketAdmitted(
+            admitted_packet_from_peer(session, PeerId::new(2), AdmissionBudget::new(1, 256), 8),
+        ));
+        assert!(
+            duplicate
+                .iter()
+                .all(|effect| !matches!(effect, AcquisitionEffect::SendLedgerRequest(_)))
+        );
+        assert_eq!(runner.snapshot().peer_requests(), 3); // two Base + one node
+        assert_eq!(
+            runner.session(session).expect("live session").sent_peers(),
+            &BTreeSet::from([PeerId::new(1), PeerId::new(2)])
+        );
     }
 
     #[test]
