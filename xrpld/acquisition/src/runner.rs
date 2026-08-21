@@ -667,7 +667,21 @@ impl CoordinatorRunner {
         let mut effects = Vec::new();
         let fact = if has_peers {
             if had_peers {
-                // Already connected; an unchanged snapshot changes nothing.
+                // A usable-to-usable snapshot can still replace every peer.
+                // Refresh only coordinator-owned selection state; it must not
+                // mint a session, rearm a deadline, or issue duplicate work.
+                let live: Vec<SessionRef> = self
+                    .state
+                    .sessions
+                    .iter()
+                    .filter(|(_, state)| {
+                        !state.phase.is_terminal() && state.phase != SessionPhase::DurablePending
+                    })
+                    .map(|(session, _)| *session)
+                    .collect();
+                for session in live {
+                    self.reconcile_selected_peers(session);
+                }
                 return effects;
             }
             TransitionFact::PeerCapabilityAvailable
@@ -681,12 +695,23 @@ impl CoordinatorRunner {
         if let Ok(next) = self.state.phase.apply(fact) {
             self.state.phase = next;
             effects.push(AcquisitionEffect::SetServicePhase(next));
-            if !has_peers {
-                // A durable handoff has already crossed the final storage
-                // fence. Peer loss may demote service phase, but must not
-                // revoke its exact retry/ack state; all other live sessions
-                // retain the established real-zero-peer cancellation policy.
-                self.cancel_non_durable_for_peer_loss(&mut effects);
+            if has_peers {
+                self.resume_live_sessions_after_peer_recovery(&mut effects);
+            } else {
+                // rippled NetworkOPs' disconnected mode does not destroy an
+                // InboundLedger or its PeerSet. `InboundLedger::onTimer` keeps
+                // the acquisition state, and `InboundLedger::addPeers`
+                // repopulates it when peers are available again
+                // (`rippled/src/xrpld/app/ledger/detail/InboundLedger.cpp`,
+                // `onTimer` and `addPeers`). Preserve every nonterminal
+                // coordinator session and its exact pending operations here.
+                tracing::info!(
+                    target: "acquisition_trace",
+                    event = "peer_capability_lost_sessions_paused",
+                    phase = ?self.state.phase,
+                    active_sessions = self.live_sessions().count(),
+                    "acquisition trace: service phase demoted while live acquisition sessions remain owned and resumable"
+                );
             }
         }
         // A target received while peerless is a concrete consensus/recovery
@@ -1224,6 +1249,59 @@ impl CoordinatorRunner {
             self.stats.stale_events += 1;
             return Vec::new();
         }
+        // Structural completion moves a session into a storage-only boundary.
+        // An earlier Active deadline must never consume retry budget, rearm,
+        // or fail persistence while the exact write/fence is in flight.
+        if session_state.phase != SessionPhase::Active {
+            self.stats.stale_events += 1;
+            return Vec::new();
+        }
+        if !self.state.peer_view.has_usable_peer_capability() {
+            // Consume the exact wakeup, but pause the deadline interval while
+            // no peer capability exists. This deliberately does not inspect or
+            // mutate plan progress, timeout budget, frontier, or storage work:
+            // the next real `PeerCapabilityAvailable` fact resumes the same
+            // session. The fresh operation makes a late old wakeup stale.
+            let timer_operation = OperationRef::new(
+                session,
+                OperationKind::Timer,
+                self.state.ids.next_id(),
+                self.state.ids.next_id(),
+            );
+            let (timeout_budget, seeded, pending_network, pending_reads) = {
+                let Some(session_state) = self.state.sessions.get_mut(&session) else {
+                    self.stats.stale_events += 1;
+                    return Vec::new();
+                };
+                session_state.pending_timer = Some((TimerKind::AcquireTimeout, timer_operation));
+                (
+                    session_state.plan.timeouts(),
+                    session_state.plan.engine().is_some(),
+                    session_state.plan.pending_network().len(),
+                    session_state.plan.pending_read_count(),
+                )
+            };
+            self.stats.timers_armed += 1;
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "acquisition_timeout_paused_peerless",
+                run_epoch = session.run_epoch().get(),
+                session_id = session.session_id().get(),
+                target_hash = %session.target_hash(),
+                plan_epoch = session.plan_epoch().get(),
+                store_generation = session.store_generation().get(),
+                timeout_budget,
+                seeded,
+                pending_network,
+                pending_reads,
+                "acquisition trace: exact deadline consumed and rearmed while peer capability is unavailable"
+            );
+            return vec![AcquisitionEffect::ArmTimer(TimerRequest::new(
+                timer_operation,
+                TimerKind::AcquireTimeout,
+                self.state.budgets.acquire_timeout,
+            ))];
+        }
         let effects = Vec::new();
         let Some(session_state) = self.state.sessions.get_mut(&session) else {
             self.stats.stale_events += 1;
@@ -1446,25 +1524,36 @@ impl CoordinatorRunner {
         let mut effects = Vec::new();
         match outcome {
             PlanDurabilityOutcome::Durable => {
-                // Persisting -> DurablePending: the ledger is durable and is
-                // handed off exactly once. It is never normal-adoptable now.
+                // Validate the durable payload while the session is still
+                // Persisting. A passed fence without a materialized ledger is
+                // a terminal storage failure, never a DurablePending handoff
+                // with no payload to retry or acknowledge.
                 let durable = SessionPhase::DurablePending;
+                let ledger = {
+                    let Some(session_state) = self.state.sessions.get_mut(&session) else {
+                        self.stats.stale_events += 1;
+                        return effects;
+                    };
+                    if !session_phase_transition(&session_state.phase, &durable) {
+                        self.stats.stale_events += 1;
+                        return effects;
+                    }
+                    session_state.plan.durable_ledger()
+                };
+                let Some(ledger) = ledger else {
+                    self.fail_session(session, FailureReason::DurabilityFenceFailed, &mut effects);
+                    return effects;
+                };
+                // Persisting -> DurablePending: the durable payload and unique
+                // handoff are now both present, so delivery may be retried
+                // exactly once by handoff identity. It is never
+                // normal-adoptable before this fence.
+                let handoff = self.state.ids.next_id::<DurableHandoffId>();
                 let Some(session_state) = self.state.sessions.get_mut(&session) else {
                     self.stats.stale_events += 1;
                     return effects;
                 };
-                if !session_phase_transition(&session_state.phase, &durable) {
-                    self.stats.stale_events += 1;
-                    return effects;
-                }
                 session_state.phase = durable;
-                let Some(ledger) = session_state.plan.durable_ledger() else {
-                    // A passed fence without a materialized ledger cannot hand
-                    // off; terminalize so no durable result is lost.
-                    self.fail_session(session, FailureReason::DurabilityFenceFailed, &mut effects);
-                    return effects;
-                };
-                let handoff = self.state.ids.next_id::<DurableHandoffId>();
                 tracing::info!(
                     target: "acquisition_trace",
                     event = "durability_fence_passed",
@@ -1831,6 +1920,11 @@ impl CoordinatorRunner {
                         && session_phase_transition(&session_state.phase, &persisting)
                     {
                         session_state.phase = persisting;
+                        // The acquisition deadline governs only Active peer
+                        // work. Once the final write starts, its exact
+                        // write/fence identities exclusively govern progress.
+                        // A late already-armed timeout is now stale.
+                        session_state.pending_timer = None;
                     }
                 }
                 effects.push(AcquisitionEffect::SubmitWrite(batch));
@@ -1857,11 +1951,24 @@ impl CoordinatorRunner {
         reply_peer: Option<PeerId>,
         effects: &mut Vec<AcquisitionEffect>,
     ) {
+        // Late admitted packets may still advance a retained plan after peer
+        // loss. They may produce storage work, but must not consume the FIFO
+        // frontier or send to peers absent from the current snapshot.
+        if !self.state.peer_view.has_usable_peer_capability() {
+            return;
+        }
+        let available = self.state.peer_view.peers();
         let Some((sequence, peers)) = self.state.sessions.get(&session).and_then(|state| {
             (!state.phase.is_terminal()).then(|| {
                 let peers = match reply_peer {
-                    Some(peer) => vec![peer],
-                    None => state.sent_peers.iter().copied().collect::<Vec<_>>(),
+                    Some(peer) if available.contains(&peer) => vec![peer],
+                    Some(_) => Vec::new(),
+                    None => state
+                        .sent_peers
+                        .iter()
+                        .copied()
+                        .filter(|peer| available.contains(peer))
+                        .collect::<Vec<_>>(),
                 };
                 (state.plan.ledger_sequence(), peers)
             })
@@ -1971,6 +2078,139 @@ impl CoordinatorRunner {
             *self.stats.failed_by_reason.entry(reason).or_insert(0) += 1;
             effects.push(AcquisitionEffect::CancelSession(session));
         }
+    }
+
+    /// Restores exact live acquisition demand after an empty-to-nonempty peer
+    /// capability transition. The coordinator retains the session, plan, and
+    /// all external operation identities through the outage; only its bounded
+    /// selected-peer view is reconciled. This follows rippled
+    /// `InboundLedger::onTimer`/`addPeers` in
+    /// `rippled/src/xrpld/app/ledger/detail/InboundLedger.cpp`: retained work
+    /// is retried against newly available peers without recreating the inbound
+    /// ledger or its traversal.
+    fn resume_live_sessions_after_peer_recovery(&mut self, effects: &mut Vec<AcquisitionEffect>) {
+        let resumable: Vec<SessionRef> = self
+            .state
+            .sessions
+            .iter()
+            .filter(|(_, state)| {
+                !state.phase.is_terminal() && state.phase != SessionPhase::DurablePending
+            })
+            .map(|(session, _)| *session)
+            .collect();
+        let phase_target = resumable
+            .iter()
+            .find_map(|session| self.state.sessions.get(session).map(|state| state.target));
+        if let Some(target) = phase_target {
+            let fact = TransitionFact::TargetRequired { target };
+            if let Ok(next) = self.state.phase.apply(fact)
+                && next != self.state.phase
+            {
+                self.state.phase = next;
+                effects.push(AcquisitionEffect::SetServicePhase(next));
+            }
+        }
+
+        for session in resumable {
+            self.reconcile_selected_peers(session);
+            let Some((phase, seeded, timeout_budget, selected_peers)) =
+                self.state.sessions.get(&session).map(|state| {
+                    (
+                        state.phase.clone(),
+                        state.plan.engine().is_some(),
+                        state.plan.timeouts(),
+                        state.sent_peers.len(),
+                    )
+                })
+            else {
+                continue;
+            };
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "peer_capability_recovered_session_resumed",
+                run_epoch = session.run_epoch().get(),
+                session_id = session.session_id().get(),
+                target_hash = %session.target_hash(),
+                plan_epoch = session.plan_epoch().get(),
+                store_generation = session.store_generation().get(),
+                phase = phase.label(),
+                seeded,
+                timeout_budget,
+                selected_peers,
+                "acquisition trace: retained exact session demand resumed after peer capability recovery"
+            );
+
+            // A persisting plan has already crossed the structural-complete
+            // boundary; its write/fence operation continues independently and
+            // must not be turned back into peer work. DurablePending is
+            // excluded above and remains handoff-only.
+            if phase != SessionPhase::Active {
+                continue;
+            }
+            if seeded {
+                // Reuse the exact bounded retained frontier for both brokered
+                // reprobes and peer sends. This rotates only the recovery
+                // cursor; it does not consume the normal FIFO frontier or a
+                // timeout budget, and performs no synchronous NodeStore I/O.
+                let nodes = self.next_timeout_frontier_batch(session);
+                self.submit_timeout_reprobes(session, &nodes, effects);
+                self.send_timeout_frontier_requests(session, &nodes, timeout_budget, effects);
+            } else {
+                self.send_base_request(session, effects);
+            }
+            self.ensure_acquire_timeout_armed(session, effects);
+        }
+    }
+
+    /// Removes unavailable selected peers and fills the same bounded window
+    /// from the current overlay snapshot. It only changes coordinator-owned
+    /// selection state; no transport or plan work occurs here.
+    fn reconcile_selected_peers(&mut self, session: SessionRef) {
+        let available = self.state.peer_view.peers().to_vec();
+        let Some(state) = self.state.sessions.get_mut(&session) else {
+            return;
+        };
+        if state.phase.is_terminal() || state.phase == SessionPhase::DurablePending {
+            return;
+        }
+        state.sent_peers.retain(|peer| available.contains(peer));
+        for peer in available {
+            if state.sent_peers.len() == MAX_SELECTED_PEERS {
+                break;
+            }
+            state.sent_peers.insert(peer);
+        }
+    }
+
+    /// Keeps one exact acquisition deadline outstanding through recovery. A
+    /// pre-outage timer remains authoritative; a missing timer is armed only
+    /// here by the serialized coordinator, avoiding a timer replacement race.
+    fn ensure_acquire_timeout_armed(
+        &mut self,
+        session: SessionRef,
+        effects: &mut Vec<AcquisitionEffect>,
+    ) {
+        let should_arm = self.state.sessions.get(&session).is_some_and(|state| {
+            state.phase == SessionPhase::Active && state.pending_timer.is_none()
+        });
+        if !should_arm {
+            return;
+        }
+        let timer_operation = OperationRef::new(
+            session,
+            OperationKind::Timer,
+            self.state.ids.next_id(),
+            self.state.ids.next_id(),
+        );
+        if let Some(state) = self.state.sessions.get_mut(&session) {
+            state.pending_timer = Some((TimerKind::AcquireTimeout, timer_operation));
+        }
+        self.stats.timers_armed += 1;
+        effects.push(AcquisitionEffect::ArmTimer(TimerRequest::new(
+            timer_operation,
+            TimerKind::AcquireTimeout,
+            self.state.budgets.acquire_timeout,
+        )));
     }
 
     /// Adds at most `TIMEOUT_PEER_ESCALATION` currently available, previously
@@ -2185,21 +2425,6 @@ impl CoordinatorRunner {
             .filter(|(session, state)| session.target_hash() == hash && !state.phase.is_terminal())
             .map(|(session, _)| *session)
             .collect()
-    }
-
-    fn cancel_non_durable_for_peer_loss(&mut self, effects: &mut Vec<AcquisitionEffect>) {
-        let live: Vec<SessionRef> = self
-            .state
-            .sessions
-            .iter()
-            .filter(|(_, state)| {
-                !state.phase.is_terminal() && state.phase != SessionPhase::DurablePending
-            })
-            .map(|(session, _)| *session)
-            .collect();
-        for session in live {
-            self.cancel_session(session, CancelReason::PeerLoss, effects);
-        }
     }
 
     fn cancel_all(&mut self, reason: CancelReason, effects: &mut Vec<AcquisitionEffect>) {
@@ -2446,25 +2671,317 @@ mod tests {
     }
 
     #[test]
-    fn peer_loss_demotes_to_disconnected_and_cancels_sessions() {
-        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+    fn peer_loss_demotes_but_preserves_active_and_persisting_session_resources() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![ScriptedStep::Complete])),
+        );
         connect(&mut runner);
-        let session = acquire(&mut runner, 10);
-        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(10) });
+        let persisting = acquire(&mut runner, 10);
+        let persist_effects = runner.handle_event(AcquisitionEvent::PacketAdmitted(
+            admitted_packet(persisting, AdmissionBudget::new(1, 256), 8),
+        ));
+        assert!(matches!(
+            runner
+                .session(persisting)
+                .expect("persisting session")
+                .phase(),
+            SessionPhase::Persisting
+        ));
+        assert!(persist_effects.iter().any(|effect| {
+            matches!(effect, AcquisitionEffect::SubmitWrite(batch) if batch.requires_fence())
+        }));
+
+        let active_effects = acquire_with_effects(&mut runner, 11);
+        let active = peer_request_session(&active_effects);
+        let active_timer = timer_operation(&active_effects);
+        let _ = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            active,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        let active_packets = runner
+            .session(active)
+            .expect("active session")
+            .packet_count();
+        let active_plan_runs = runner
+            .session(active)
+            .expect("active session")
+            .plan()
+            .runs();
+        assert!(
+            runner
+                .session(active)
+                .expect("active session")
+                .plan()
+                .engine()
+                .is_some()
+        );
 
         let effects = runner.handle_event(AcquisitionEvent::Connectivity(
             PeerAvailabilitySnapshot::new(vec![]),
         ));
-        assert!(effects.contains(&AcquisitionEffect::SetServicePhase(SyncPhase::Disconnected)));
-        assert!(effects.contains(&AcquisitionEffect::CancelSession(session)));
         assert_eq!(
-            runner.session(session).expect("cancelled session").phase(),
-            &SessionPhase::Cancelled {
-                reason: CancelReason::PeerLoss
-            }
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Disconnected)]
         );
         assert_eq!(runner.phase(), &SyncPhase::Disconnected);
-        assert_eq!(runner.snapshot().sessions_cancelled(), 1);
+        assert!(matches!(
+            runner.session(active).expect("active session").phase(),
+            SessionPhase::Active
+        ));
+        assert_eq!(
+            runner
+                .session(active)
+                .expect("active session")
+                .packet_count(),
+            active_packets
+        );
+        assert_eq!(
+            runner
+                .session(active)
+                .expect("active session")
+                .plan()
+                .runs(),
+            active_plan_runs
+        );
+        assert!(
+            runner
+                .session(active)
+                .expect("active session")
+                .plan()
+                .engine()
+                .is_some()
+        );
+        assert_eq!(
+            runner
+                .session(active)
+                .expect("active session")
+                .pending_timer(),
+            Some((TimerKind::AcquireTimeout, active_timer))
+        );
+        assert!(matches!(
+            runner
+                .session(persisting)
+                .expect("persisting session")
+                .phase(),
+            SessionPhase::Persisting
+        ));
+        assert_eq!(
+            runner
+                .session(persisting)
+                .expect("persisting session")
+                .pending_timer(),
+            None,
+            "the final write/fence boundary invalidates the Active acquisition deadline"
+        );
+        assert_eq!(
+            runner.live_sessions().collect::<Vec<_>>(),
+            vec![persisting, active]
+        );
+        assert_eq!(runner.snapshot().sessions_cancelled(), 0);
+    }
+
+    #[test]
+    fn peerless_acquire_timeout_rearms_without_consuming_plan_budget_or_dispatching_work() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let initial = acquire_with_effects(&mut runner, 10);
+        let session = peer_request_session(&initial);
+        let timer = timer_operation(&initial);
+        let (timeouts, plan_turns, peer_requests) = (
+            runner
+                .session(session)
+                .expect("live session")
+                .plan()
+                .timeouts(),
+            runner.snapshot().plan_turns(),
+            runner.snapshot().peer_requests(),
+        );
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![]),
+        ));
+
+        let effects = runner.handle_event(AcquisitionEvent::TimerFired {
+            operation: timer,
+            timer: TimerKind::AcquireTimeout,
+        });
+        let rearm = timer_operation(&effects);
+        assert_ne!(rearm, timer);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, AcquisitionEffect::ArmTimer(_)))
+                .count(),
+            1
+        );
+        assert!(effects.iter().all(|effect| {
+            !matches!(
+                effect,
+                AcquisitionEffect::SendLedgerRequest(_)
+                    | AcquisitionEffect::SubmitRead(_)
+                    | AcquisitionEffect::SubmitWrite(_)
+                    | AcquisitionEffect::CancelSession(_)
+            )
+        }));
+        assert_eq!(
+            runner
+                .session(session)
+                .expect("live session")
+                .plan()
+                .timeouts(),
+            timeouts
+        );
+        assert_eq!(runner.snapshot().plan_turns(), plan_turns);
+        assert_eq!(runner.snapshot().peer_requests(), peer_requests);
+        assert_eq!(
+            runner
+                .session(session)
+                .expect("live session")
+                .pending_timer(),
+            Some((TimerKind::AcquireTimeout, rearm))
+        );
+    }
+
+    #[test]
+    fn peer_recovery_reconciles_and_resumes_seeded_frontier_on_the_same_session() {
+        let node = PlanNetworkNeed::new(
+            SHAMapNodeId::default(),
+            Uint256::from(0x77),
+            ledger::TreeKind::Transaction,
+        );
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![ScriptedStep::NeedsNetworkWithKind(
+                vec![node],
+            )])),
+        );
+        connect(&mut runner);
+        let initial = acquire_with_effects(&mut runner, 10);
+        let session = peer_request_session(&initial);
+        let initial_timer = timer_operation(&initial);
+        let timeout_budget = runner
+            .session(session)
+            .expect("live session")
+            .plan()
+            .timeouts();
+        let _ = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            session,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![]),
+        ));
+
+        let effects = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(2), PeerId::new(3)]),
+        ));
+        assert!(effects.contains(&AcquisitionEffect::SetServicePhase(SyncPhase::Connected)));
+        assert!(
+            effects.contains(&AcquisitionEffect::SetServicePhase(SyncPhase::Syncing {
+                target: target(10)
+            }))
+        );
+        assert!(effects.iter().all(|effect| {
+            !matches!(
+                effect,
+                AcquisitionEffect::SessionStarted(_)
+                    | AcquisitionEffect::CancelSession(_)
+                    | AcquisitionEffect::ArmTimer(_)
+            )
+        }));
+        let reads = read_effects(&effects);
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].operation().session(), session);
+        let resumed = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                AcquisitionEffect::SendLedgerRequest(request) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(resumed.len(), 2);
+        assert!(resumed.iter().all(|request| {
+            request.session() == session
+                && matches!(request.request(), LedgerDataRequest::GetLedgerNodes { .. })
+                && matches!(request.peer_id(), PeerId::new(2) | PeerId::new(3))
+        }));
+        assert_eq!(
+            runner
+                .session(session)
+                .expect("resumed session")
+                .sent_peers(),
+            &BTreeSet::from([PeerId::new(2), PeerId::new(3)])
+        );
+        assert_eq!(runner.snapshot().session_count(), 1);
+        assert_eq!(runner.snapshot().sessions_started(), 1);
+        assert_eq!(
+            runner
+                .session(session)
+                .expect("resumed session")
+                .pending_timer(),
+            Some((TimerKind::AcquireTimeout, initial_timer))
+        );
+        assert_eq!(
+            runner
+                .session(session)
+                .expect("resumed session")
+                .plan()
+                .timeouts(),
+            timeout_budget
+        );
+    }
+
+    #[test]
+    fn peer_recovery_resumes_unseeded_base_on_the_same_session() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let initial = acquire_with_effects(&mut runner, 10);
+        let session = peer_request_session(&initial);
+        let initial_timer = timer_operation(&initial);
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![]),
+        ));
+
+        let effects = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(2)]),
+        ));
+        let resumed = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                AcquisitionEffect::SendLedgerRequest(request) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].session(), session);
+        assert_eq!(resumed[0].peer_id(), PeerId::new(2));
+        assert_eq!(
+            resumed[0].request(),
+            &LedgerDataRequest::GetLedger { sequence: Some(10) }
+        );
+        assert!(effects.iter().all(|effect| {
+            !matches!(
+                effect,
+                AcquisitionEffect::SessionStarted(_)
+                    | AcquisitionEffect::CancelSession(_)
+                    | AcquisitionEffect::ArmTimer(_)
+            )
+        }));
+        assert_eq!(runner.snapshot().session_count(), 1);
+        assert_eq!(runner.snapshot().sessions_started(), 1);
+        assert_eq!(
+            runner
+                .session(session)
+                .expect("resumed session")
+                .pending_timer(),
+            Some((TimerKind::AcquireTimeout, initial_timer))
+        );
     }
 
     #[test]
@@ -2903,16 +3420,13 @@ mod tests {
         let session = acquire(&mut runner, 10);
         assert_eq!(runner.live_sessions().collect::<Vec<_>>(), vec![session]);
 
-        // Peer loss cancels the session; the terminal session must leave the
-        // routing set while remaining observable as a stale target.
+        // Peer loss demotes service phase but keeps the exact live session in
+        // the routing set so a later capability fact can resume its demand.
         let effects = runner.handle_event(AcquisitionEvent::Connectivity(
             PeerAvailabilitySnapshot::new(vec![]),
         ));
-        assert!(effects.contains(&AcquisitionEffect::CancelSession(session)));
-        assert_eq!(
-            runner.live_sessions().collect::<Vec<_>>(),
-            Vec::<SessionRef>::new()
-        );
+        assert!(effects.contains(&AcquisitionEffect::SetServicePhase(SyncPhase::Disconnected)));
+        assert_eq!(runner.live_sessions().collect::<Vec<_>>(), vec![session]);
         assert!(runner.session(session).is_some());
     }
 
@@ -3434,9 +3948,8 @@ mod tests {
         connect(&mut runner);
         let first = acquire(&mut runner, 1);
 
-        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
-            PeerAvailabilitySnapshot::new(vec![]),
-        ));
+        let effects = runner.handle_event(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
+        assert!(effects.contains(&AcquisitionEffect::CancelSession(first)));
         assert!(
             runner
                 .session(first)
@@ -3444,9 +3957,6 @@ mod tests {
                 .phase()
                 .is_terminal()
         );
-        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
-            PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
-        ));
 
         let effects = acquire_with_effects(&mut runner, 2);
         assert!(effects.iter().any(|effect| {
@@ -3539,10 +4049,9 @@ mod tests {
         assert_eq!(runner.snapshot().stale_events(), 2);
         assert_eq!(runner.snapshot().sessions_completed(), 0);
 
-        // After cancellation the same facts are stale.
-        let effects = runner.handle_event(AcquisitionEvent::Connectivity(
-            PeerAvailabilitySnapshot::new(vec![]),
-        ));
+        // A matching local LCL cancellation makes later fence facts stale;
+        // peer loss alone only demotes service phase and preserves the session.
+        let effects = runner.handle_event(AcquisitionEvent::LclInstalled(identity(10)));
         assert!(effects.contains(&AcquisitionEffect::CancelSession(session)));
         runner.handle_event(AcquisitionEvent::DurabilityFenced(
             DurabilityCompletion::new(fence, crate::io::DurabilityOutcome::Passed),
@@ -4405,6 +4914,47 @@ mod tests {
             SessionPhase::Complete
         ));
         assert_eq!(runner.snapshot().sessions_completed(), 1);
+    }
+
+    #[test]
+    fn passed_fence_without_a_durable_payload_fails_before_handoff() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![ScriptedStep::Complete])),
+        );
+        connect(&mut runner);
+        let session = acquire(&mut runner, 10);
+        let effects = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            session,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        let batch = write_batch(&effects);
+        let _ = runner.handle_event(AcquisitionEvent::WriteCompleted(WriteCompletion::new(
+            batch.operation(),
+            WriteOutcome::Accepted,
+        )));
+
+        let effects = runner.handle_event(AcquisitionEvent::DurabilityFenced(
+            DurabilityCompletion::new(
+                batch.fence().expect("final batch fence"),
+                crate::io::DurabilityOutcome::Passed,
+            ),
+        ));
+        assert!(effects.contains(&AcquisitionEffect::CancelSession(session)));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| { !matches!(effect, AcquisitionEffect::PublishDurable(_)) })
+        );
+        assert!(matches!(
+            runner.session(session).expect("failed session").phase(),
+            SessionPhase::Failed {
+                reason: FailureReason::DurabilityFenceFailed
+            }
+        ));
     }
 
     #[test]

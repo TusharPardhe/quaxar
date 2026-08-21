@@ -97,7 +97,6 @@ impl ShadowOutcome {
             Self::Cancelled { reason } => match reason {
                 CancelReason::Replaced => "cancelled_replaced",
                 CancelReason::StoreRotated => "cancelled_store_rotated",
-                CancelReason::PeerLoss => "cancelled_peer_loss",
                 CancelReason::Shutdown => "cancelled_shutdown",
                 CancelReason::LclInstalled => "cancelled_lcl_installed",
                 CancelReason::Explicit => "cancelled_explicit",

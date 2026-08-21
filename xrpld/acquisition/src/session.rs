@@ -104,8 +104,6 @@ pub enum CancelReason {
     Replaced,
     /// The NodeStore generation rotated under this session.
     StoreRotated,
-    /// Usable peer capability was lost.
-    PeerLoss,
     /// The node is shutting down.
     Shutdown,
     /// The exact target was installed locally as the LCL before this session
@@ -121,7 +119,6 @@ impl CancelReason {
         match self {
             Self::Replaced => "replaced",
             Self::StoreRotated => "store_rotated",
-            Self::PeerLoss => "peer_loss",
             Self::Shutdown => "shutdown",
             Self::LclInstalled => "lcl_installed",
             Self::Explicit => "explicit",
@@ -235,7 +232,7 @@ mod tests {
                     reason: FailureReason::ReadFailure,
                 },
                 Cancelled {
-                    reason: CancelReason::PeerLoss,
+                    reason: CancelReason::Shutdown,
                 },
             ] {
                 if &other != terminal {

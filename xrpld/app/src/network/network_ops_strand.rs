@@ -684,7 +684,7 @@ fn strand_loop(
             // the actual active-peer identity snapshot whenever one is usable;
             // consensus quorum remains a separate gate below. This prevents a
             // below-quorum but connected overlay from manufacturing
-            // `PeerCapabilityLost` and cancelling live acquisition demand.
+            // `PeerCapabilityLost` and pausing live acquisition demand.
             if let Some(overlay_rt) = root.overlay_runtime() {
                 use overlay::Overlay;
                 let num_peers = overlay_rt.overlay().size();
@@ -695,7 +695,7 @@ fn strand_loop(
                 // `on_connectivity` treats an initial unchanged empty snapshot
                 // as a no-op, so it remains safe for rippled start-valid. Do
                 // report every later actual empty snapshot: it is a real peer
-                // loss and must cancel non-durable work.
+                // loss and must pause, but preserve, non-durable work.
                 let min_peers = required_peer_count(min_peer_count);
                 let active_peer_ids = overlay_rt
                     .overlay()
