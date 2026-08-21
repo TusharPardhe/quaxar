@@ -15,7 +15,7 @@
 //! This keeps `xrpld/acquisition` free of app dependencies while preserving the
 //! exact packet-admission path the actor uses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use basics::base_uint::Uint256;
@@ -64,7 +64,8 @@ type AppFamily = SHAMapFamily<
 #[allow(dead_code)] // constructed by `AppLedgerPlanEngine::advance` in M4.2-B
 struct AppResident<'a> {
     cache: &'a TreeNodeCache<MonotonicClock>,
-    full_below: &'a FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>,
+    shared_full_below: &'a FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>,
+    pending_full_below: &'a mut BTreeSet<Uint256>,
     fetch_pack: &'a FetchPackCache,
 }
 
@@ -87,11 +88,16 @@ impl MissingNodeResidentLookup for AppResident<'_> {
     }
 
     fn is_full_below(&mut self, hash: SHAMapHash) -> bool {
-        self.full_below.touch_if_exists(*hash.as_uint256())
+        self.shared_full_below.touch_if_exists(*hash.as_uint256())
     }
 
     fn mark_full_below(&mut self, hash: SHAMapHash) {
-        self.full_below.insert(*hash.as_uint256());
+        // A FullBelow marker is a cross-session assertion: another traversal
+        // may skip the entire subtree before checking the node cache. Rippled
+        // publishes that assertion only after its accepted-node filter stored
+        // the subtree. WorkerStore is asynchronous, so stage the marker until
+        // the corresponding coordinator write completion is Accepted.
+        self.pending_full_below.insert(*hash.as_uint256());
     }
 }
 
@@ -108,6 +114,7 @@ pub(crate) struct AppLedgerPlanEngine {
     full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     active_kind: Option<TreeKind>,
     active_plan: Option<TreePlan>,
+    pending_full_below: BTreeSet<Uint256>,
     cached_root_steps: u64,
     idle_ready_logged: bool,
 }
@@ -146,6 +153,7 @@ impl AppLedgerPlanEngine {
             full_below,
             active_kind: None,
             active_plan: None,
+            pending_full_below: BTreeSet::new(),
             cached_root_steps: 0,
             idle_ready_logged: false,
         }
@@ -217,6 +225,32 @@ impl AppLedgerPlanEngine {
             treenode_cache_entries = self.cache.get_cache_size(),
             full_below_cache_entries = self.full_below.size(),
             "acquisition trace: planner returned Ready without a runnable SHAMap frontier"
+        );
+    }
+
+    /// Moves staged full-below discoveries into the shared cache only after
+    /// their associated NodeStore batch was accepted. This preserves rippled's
+    /// store-before-shared-completion ordering across Quaxar's async write port.
+    fn publish_persisted_full_below(&mut self) {
+        let markers = std::mem::take(&mut self.pending_full_below);
+        if markers.is_empty() {
+            return;
+        }
+        let marker_count = markers.len();
+        for hash in markers {
+            self.full_below.insert(hash);
+        }
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "full_below_published_after_write",
+            run_epoch = self.session.run_epoch().get(),
+            session_id = self.session.session_id().get(),
+            target_hash = %self.session.target_hash(),
+            plan_epoch = self.session.plan_epoch().get(),
+            store_generation = self.session.store_generation().get(),
+            marker_count,
+            shared_full_below_entries = self.full_below.size(),
+            "acquisition trace: persistence-qualified SHAMap full-below markers published"
         );
     }
 
@@ -377,7 +411,8 @@ impl TreeEngine for AppLedgerPlanEngine {
 
             let mut resident = AppResident {
                 cache: &self.cache,
-                full_below: &self.full_below,
+                shared_full_below: &self.full_below,
+                pending_full_below: &mut self.pending_full_below,
                 fetch_pack: self.fetch_pack.cache(),
             };
             let mut first_child = || rand_int_to(255u8);
@@ -529,6 +564,10 @@ impl TreeEngine for AppLedgerPlanEngine {
 
     fn take_persistable_nodes(&mut self) -> Vec<PersistNode> {
         self.take_accepted_writes()
+    }
+
+    fn on_persistence_accepted(&mut self) {
+        self.publish_persisted_full_below();
     }
 
     fn persistence_sequence(&self) -> Option<u32> {
@@ -1290,6 +1329,50 @@ mod tests {
             Arc::clone(&full_below),
         );
         (seed, origins, cache)
+    }
+
+    #[test]
+    fn full_below_mark_stays_session_private_until_persistence_accepts() {
+        let cache = TreeNodeCache::new(
+            "full-below-staging-test",
+            8,
+            Duration::seconds(60),
+            MonotonicClock::default(),
+        );
+        let shared = FullBelowCacheImpl::new(
+            1,
+            MonotonicClock::default(),
+            HardenedHashBuilder::default(),
+            8,
+        );
+        let hash = SHAMapHash::new(Uint256::from(0xAB));
+        let fetch_pack = FetchPackCache::new(8, Duration::seconds(60), MonotonicClock::default());
+        let mut staged = BTreeSet::new();
+        {
+            let mut resident = AppResident {
+                cache: &cache,
+                shared_full_below: &shared,
+                pending_full_below: &mut staged,
+                fetch_pack: &fetch_pack,
+            };
+            resident.mark_full_below(hash);
+            assert!(
+                !resident.is_full_below(hash),
+                "an unpersisted marker must not be visible to another traversal"
+            );
+        }
+        assert_eq!(staged, BTreeSet::from([*hash.as_uint256()]));
+        assert!(
+            !shared.touch_if_exists(*hash.as_uint256()),
+            "the shared cache stays empty before write acceptance"
+        );
+        for marker in staged {
+            shared.insert(marker);
+        }
+        assert!(
+            shared.touch_if_exists(*hash.as_uint256()),
+            "publication after write acceptance makes the marker shared"
+        );
     }
 
     #[test]

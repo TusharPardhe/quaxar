@@ -262,6 +262,11 @@ pub trait TreeEngine: std::fmt::Debug {
     /// final batch is followed by a durability fence and durable handoff.
     fn take_persistable_nodes(&mut self) -> Vec<PersistNode>;
 
+    /// Reports that the exact NodeStore write batch containing the engine's
+    /// previously drained accepted nodes was accepted. Engines may now publish
+    /// shared completion metadata; the default is a no-op for pure/test plans.
+    fn on_persistence_accepted(&mut self) {}
+
     /// The verified ledger-header sequence that scopes persistence. A missing
     /// value makes completion invalid: NodeStore records must never use an
     /// inferred or placeholder sequence.
@@ -920,7 +925,8 @@ impl SessionPlan {
 
     /// Applies one write completion. An incremental accepted-node write
     /// returns the plan to active work; only a final write advances to its
-    /// durability fence.
+    /// durability fence. Shared engine completion metadata is released only
+    /// after the exact write acceptance.
     pub fn on_write(&mut self, operation: OperationRef, outcome: WriteOutcome) -> PlanWriteOutcome {
         if operation.kind() != OperationKind::Write {
             return PlanWriteOutcome::Stale;
@@ -931,6 +937,9 @@ impl SessionPlan {
             } if expected.is_expected_for(&operation) => match outcome {
                 WriteOutcome::Accepted => {
                     self.persistence = SessionPersistence::None;
+                    if let Some(engine) = self.engine.as_mut() {
+                        engine.on_persistence_accepted();
+                    }
                     PlanWriteOutcome::IncrementalAccepted
                 }
                 WriteOutcome::Failed => {
@@ -948,6 +957,9 @@ impl SessionPlan {
                 WriteOutcome::Accepted => {
                     let fence = *fence;
                     self.persistence = SessionPersistence::FencePending { operation: fence };
+                    if let Some(engine) = self.engine.as_mut() {
+                        engine.on_persistence_accepted();
+                    }
                     PlanWriteOutcome::FinalAccepted
                 }
                 WriteOutcome::Failed => {
@@ -1199,6 +1211,7 @@ pub struct ScriptedEngine {
     applied_reads: u64,
     applied_nodes: u64,
     persistable: Vec<PersistNode>,
+    persistence_acceptance_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
     durable_ledger: Option<Arc<Ledger>>,
     persistence_sequence: Option<u32>,
 }
@@ -1220,6 +1233,7 @@ impl ScriptedEngine {
             applied_reads: 0,
             applied_nodes: 0,
             persistable,
+            persistence_acceptance_counter: None,
             durable_ledger: None,
             persistence_sequence: None,
         }
@@ -1229,6 +1243,16 @@ impl ScriptedEngine {
     /// persistence. Tests must opt in rather than silently using a placeholder.
     pub fn with_persistence_sequence(mut self, sequence: u32) -> Self {
         self.persistence_sequence = (sequence != 0).then_some(sequence);
+        self
+    }
+
+    /// Records accepted write acknowledgements for deterministic persistence
+    /// ordering tests.
+    pub fn with_persistence_acceptance_counter(
+        mut self,
+        counter: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.persistence_acceptance_counter = Some(counter);
         self
     }
 
@@ -1313,6 +1337,12 @@ impl TreeEngine for ScriptedEngine {
 
     fn take_persistable_nodes(&mut self) -> Vec<PersistNode> {
         std::mem::take(&mut self.persistable)
+    }
+
+    fn on_persistence_accepted(&mut self) {
+        if let Some(counter) = &self.persistence_acceptance_counter {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn persistence_sequence(&self) -> Option<u32> {
@@ -1536,6 +1566,108 @@ mod tests {
             ))
         );
         plan
+    }
+
+    fn persistence_probe(counter: Arc<std::sync::atomic::AtomicUsize>) -> SessionPlan {
+        let mut plan = SessionPlan::new(budget());
+        assert!(
+            plan.install_engine(Box::new(
+                ScriptedEngine::new(
+                    TreePlanId::new(1),
+                    Vec::new(),
+                    vec![PersistNode::new(
+                        SHAMapHash::new(Uint256::from(99)),
+                        Bytes::from_static(b"accepted-node"),
+                        crate::io::StoredObjectKind::AccountNode,
+                    )],
+                )
+                .with_persistence_sequence(1)
+                .with_persistence_acceptance_counter(counter),
+            ))
+        );
+        plan
+    }
+
+    #[test]
+    fn write_acceptance_hook_ignores_nonaccepted_outcomes() {
+        let mut ids = IdCounter::new();
+        let s = session();
+        let accepted_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut failed = persistence_probe(Arc::clone(&accepted_writes));
+        let PlanTurn::Persist(write) = failed.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected incremental persist");
+        };
+        assert_eq!(
+            failed.on_write(write.operation(), WriteOutcome::Failed),
+            PlanWriteOutcome::Failed(FailureReason::WriteFailure)
+        );
+
+        let mut stale = persistence_probe(Arc::clone(&accepted_writes));
+        let PlanTurn::Persist(write) = stale.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected incremental persist");
+        };
+        assert_eq!(
+            stale.on_write(write.operation(), WriteOutcome::Stale),
+            PlanWriteOutcome::Stale
+        );
+
+        let mut cancelled_outcome = persistence_probe(Arc::clone(&accepted_writes));
+        let PlanTurn::Persist(write) = cancelled_outcome.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected incremental persist");
+        };
+        assert_eq!(
+            cancelled_outcome.on_write(write.operation(), WriteOutcome::Cancelled),
+            PlanWriteOutcome::Stale
+        );
+
+        let mut cancelled = persistence_probe(Arc::clone(&accepted_writes));
+        let PlanTurn::Persist(write) = cancelled.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected incremental persist");
+        };
+        cancelled.cancel();
+        assert_eq!(
+            cancelled.on_write(write.operation(), WriteOutcome::Accepted),
+            PlanWriteOutcome::Stale
+        );
+        assert_eq!(
+            accepted_writes.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "failed, stale, and cancelled writes must not release engine metadata"
+        );
+
+        let mut final_write = SessionPlan::new(budget());
+        assert!(
+            final_write.install_engine(Box::new(
+                ScriptedEngine::new(
+                    TreePlanId::new(2),
+                    vec![ScriptedStep::Complete],
+                    vec![PersistNode::new(
+                        SHAMapHash::new(Uint256::from(100)),
+                        Bytes::from_static(b"final-node"),
+                        crate::io::StoredObjectKind::AccountNode,
+                    )],
+                )
+                .with_persistence_sequence(1)
+                .with_persistence_acceptance_counter(Arc::clone(&accepted_writes)),
+            ))
+        );
+        let PlanTurn::Persist(write) = final_write.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected final persist");
+        };
+        assert!(
+            write.fence().is_some(),
+            "completed plans require a final fence"
+        );
+        assert_eq!(
+            final_write.on_write(write.operation(), WriteOutcome::Accepted),
+            PlanWriteOutcome::FinalAccepted
+        );
+        assert_eq!(
+            accepted_writes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "only exact accepted writes notify the engine"
+        );
     }
 
     #[test]
@@ -1767,6 +1899,7 @@ mod tests {
     fn incremental_write_retains_discovered_reads_until_write_completion() {
         let mut ids = IdCounter::new();
         let s = session();
+        let accepted_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut plan = SessionPlan::new(budget());
         assert!(
             plan.install_engine(Box::new(
@@ -1779,7 +1912,8 @@ mod tests {
                         crate::io::StoredObjectKind::AccountNode,
                     )],
                 )
-                .with_persistence_sequence(1),
+                .with_persistence_sequence(1)
+                .with_persistence_acceptance_counter(Arc::clone(&accepted_writes)),
             ))
         );
 
@@ -1797,6 +1931,11 @@ mod tests {
         assert_eq!(
             plan.on_write(write.operation(), WriteOutcome::Accepted),
             PlanWriteOutcome::IncrementalAccepted
+        );
+        assert_eq!(
+            accepted_writes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the engine is notified only after the exact write accepts"
         );
         let PlanTurn::Reads(reads) = plan.run_turn(&mut ctx(s, &mut ids)) else {
             panic!("expected retained read after incremental write completion");
