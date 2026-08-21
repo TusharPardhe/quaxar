@@ -480,7 +480,15 @@ impl TreeEngine for AppLedgerPlanEngine {
                 // NodeStore objects are prefix-form, unlike overlay TMLedgerData
                 // nodes (which are decoded by `apply_network_node` as wire form).
                 match SHAMapTreeNode::make_from_prefix(bytes, hash) {
-                    Ok(node) => MissingNodeReadOutcome::Found(node),
+                    Ok(mut node) => {
+                        // Match SHAMap::fetchNodeNT: every verified NodeStore
+                        // result is canonicalized through the shared family
+                        // before it is attached to this acquisition. Without
+                        // this, read-heavy partial trees are owned only by the
+                        // current session and cannot seed a replacement plan.
+                        self.family.canonicalize(hash, &mut node);
+                        MissingNodeReadOutcome::Found(node)
+                    }
                     Err(_) => return PlanReadApply::UnknownRead,
                 }
             }
@@ -507,8 +515,12 @@ impl TreeEngine for AppLedgerPlanEngine {
                 // never be sent through the TMLedgerData wire decoder or the
                 // map-level packet path: this exact retained need attaches
                 // directly to the active continuation after hash validation.
-                match SHAMapTreeNode::make_from_prefix(bytes, SHAMapHash::new(need.hash())) {
-                    Ok(node) if *node.get_hash().as_uint256() == need.hash() => node,
+                let hash = SHAMapHash::new(need.hash());
+                match SHAMapTreeNode::make_from_prefix(bytes, hash) {
+                    Ok(mut node) if *node.get_hash().as_uint256() == need.hash() => {
+                        self.family.canonicalize(hash, &mut node);
+                        node
+                    }
                     _ => return PlanReadApply::HashMismatch,
                 }
             }
@@ -563,8 +575,13 @@ impl TreeEngine for AppLedgerPlanEngine {
             return PlanNetworkApply::new(PlanReadApply::UnknownRead, useful);
         };
         let hash = decoded.get_hash();
+        // Packet admission already canonicalized every useful backed node.
+        // Resume the retained continuation with that exact shared object, not
+        // the independent validation decode above. This keeps the map, cache,
+        // and continuation in one object graph like rippled's addKnownNode.
+        let canonical = self.cache.fetch(hash.as_uint256()).unwrap_or(decoded);
         PlanNetworkApply::new(
-            Self::map_apply(plan.apply_network_node(self.plan_id, hash, decoded)),
+            Self::map_apply(plan.apply_network_node(self.plan_id, hash, canonical)),
             useful,
         )
     }
@@ -1101,8 +1118,8 @@ mod tests {
     }
 
     #[test]
-    fn read_resolves_missing_state_child() {
-        let (mut seed, _cache) = seed_with(SEQ);
+    fn read_resolves_missing_state_child_and_canonicalizes_it_for_reuse() {
+        let (mut seed, cache) = seed_with(SEQ);
         let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
         let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
@@ -1149,6 +1166,10 @@ mod tests {
             ),
             "leaf attaches to the root edge"
         );
+        let cached = cache
+            .fetch(leaf_hash.as_uint256())
+            .expect("a verified NodeStore result must enter the shared tree cache");
+        assert_eq!(cached.get_hash(), leaf_hash);
 
         match engine.advance(10) {
             PlanStepOutcome::Complete => {}
