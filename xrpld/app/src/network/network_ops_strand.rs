@@ -680,14 +680,11 @@ fn strand_loop(
         // the owner receives accepted work.
         if !accepted_work_executed {
             // ─── 1b. Peer availability → coordinator owner, or legacy mode demotion
-            // (matching rippled processHeartbeatTimer). With the coordinator
-            // installed, the peer-availability fact and a heartbeat are fed to the
-            // coordinator owner, which alone writes the mode: usable peers (>= min)
-            // become a non-empty snapshot motivating Connected, below minimum is
-            // empty motivating Disconnected, and the heartbeat re-runs the phase
-            // port so validated-ledger age can normalize CONNECTED/SYNCING in
-            // either direction. Without it, the legacy writer below preserves the
-            // exact pre-migration behavior.
+            // (matching rippled processHeartbeatTimer). The coordinator receives
+            // the actual active-peer identity snapshot whenever one is usable;
+            // consensus quorum remains a separate gate below. This prevents a
+            // below-quorum but connected overlay from manufacturing
+            // `PeerCapabilityLost` and cancelling live acquisition demand.
             if let Some(overlay_rt) = root.overlay_runtime() {
                 use overlay::Overlay;
                 let num_peers = overlay_rt.overlay().size();
@@ -695,24 +692,25 @@ fn strand_loop(
                 // constructs `NetworkOPsImp` with `minPeerCount_ = 0` for
                 // `startValid` (NetworkOPs.cpp), so a peerless start-valid node
                 // continues driving consensus instead of being manufactured into
-                // DISCONNECTED.  The coordinator has no synthetic-peer concept:
-                // omit the empty availability fact in that one configuration so
-                // its lifecycle state continues to mirror rippled's mode.
+                // `on_connectivity` treats an initial unchanged empty snapshot
+                // as a no-op, so it remains safe for rippled start-valid. Do
+                // report every later actual empty snapshot: it is a real peer
+                // loss and must cancel non-durable work.
                 let min_peers = required_peer_count(min_peer_count);
+                let active_peer_ids = overlay_rt
+                    .overlay()
+                    .active_peers()
+                    .into_iter()
+                    .map(|peer| peer.id())
+                    .collect::<Vec<_>>();
                 if shared_inbound.coordinator_installed() {
-                    let report_availability = should_report_peer_availability(min_peers, num_peers);
-                    if report_availability {
-                        let peers = if num_peers >= min_peers {
-                            overlay_rt
-                                .overlay()
-                                .active_peers()
-                                .into_iter()
-                                .map(|peer| peer.id())
-                                .collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
-                        };
-                        shared_inbound.coordinator_report_peer_availability(&peers);
+                    // Connectivity is an acquisition transport fact, not a
+                    // consensus quorum decision. Report every actual active-ID
+                    // snapshot, including real zero-peer loss; below-quorum
+                    // non-empty capability is never rewritten as an empty
+                    // `PeerCapabilityLost` snapshot.
+                    if should_report_peer_availability(min_peers, active_peer_ids.len()) {
+                        shared_inbound.coordinator_report_peer_availability(&active_peer_ids);
                     }
                     shared_inbound.coordinator_heartbeat();
                     let current_mode = root.network_ops_state().operating_mode();
@@ -722,7 +720,7 @@ fn strand_loop(
                                 target: "consensus",
                                 num_peers,
                                 min_peers,
-                                "Peer count below minimum — coordinator phase set to DISCONNECTED"
+                                "Peer count below minimum — consensus gated while coordinator retains active-peer connectivity"
                             );
                         }
                         // Skip consensus timer when disconnected (matching rippled)
@@ -1178,13 +1176,12 @@ fn required_peer_count(configured_minimum: usize) -> usize {
     configured_minimum
 }
 
-/// The coordinator's empty snapshot is a concrete peer-loss fact and would
-/// transition it to `Disconnected`. Rippled does not emit that demotion when
-/// its effective peer threshold is zero (`startValid`), so do not fabricate an
-/// empty availability fact in that case. A non-empty snapshot is still fed so
-/// the coordinator learns a real peer connection.
-fn should_report_peer_availability(minimum_peers: usize, num_peers: usize) -> bool {
-    minimum_peers != 0 || num_peers != 0
+/// Report every actual overlay snapshot. An initial empty snapshot is a
+/// coordinator no-op, while an empty snapshot after a usable snapshot is the
+/// required real peer-loss fact. Consensus thresholding is deliberately kept
+/// outside this transport-capability report.
+fn should_report_peer_availability(_minimum_peers: usize, _num_peers: usize) -> bool {
+    true
 }
 
 /// The rippled heartbeat re-applies these modes even when no peer-count
@@ -3286,7 +3283,7 @@ mod tests {
         assert_eq!(required_peer_count(0), 0);
         assert_eq!(required_peer_count(1), 1);
         assert_eq!(required_peer_count(3), 3);
-        assert!(!should_report_peer_availability(0, 0));
+        assert!(should_report_peer_availability(0, 0));
         assert!(should_report_peer_availability(0, 1));
         assert!(should_report_peer_availability(1, 0));
     }

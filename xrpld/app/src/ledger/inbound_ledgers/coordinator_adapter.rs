@@ -1463,7 +1463,9 @@ mod tests {
             })
             .expect("acquisition arms its timeout");
 
-        for _ in 0..5 {
+        // rippled permits six no-progress recovery intervals; only the
+        // seventh exact timeout terminalizes the acquisition.
+        for _ in 0..6 {
             let effects = adapter.handle_fact(AcquisitionEvent::TimerFired {
                 operation: timeout,
                 timer: TimerKind::AcquireTimeout,

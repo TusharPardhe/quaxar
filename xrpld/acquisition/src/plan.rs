@@ -60,17 +60,19 @@ pub const MAX_TURNS_PER_EVENT: u32 = 4;
 pub const MAX_PACKETS_FED_PER_TURN: usize = 4;
 /// Unique pending reads cap (mirrors the broker logical admission ceiling).
 pub const MAX_PENDING_READS: usize = 512;
-/// Maximum exact `PlanNetworkNeed` records retained from one current traversal
-/// frontier. `TreePlan::advance` uses `MAX_NEW_READS_PER_PASS` for all emitted
-/// missing-node work, so this retains the whole bounded frontier rather than
-/// silently discarding a timeout retry tail.
+/// Maximum exact `PlanNetworkNeed` records actively dispatched from the
+/// current traversal frontier. `TreePlan::advance` uses
+/// `MAX_NEW_READS_PER_PASS` for all emitted missing-node work; excess remains
+/// in the coordinator-owned dispatch backlog until an exact attachment frees a
+/// retained slot, never silently disappearing.
 pub const MAX_RETAINED_NETWORK_FRONTIER: usize = MAX_NEW_READS_PER_PASS;
 /// Maximum exact frontier nodes retried during one no-progress timeout. This
 /// matches rippled's blind request cap (`kReqNodes`) while a rotating cursor
 /// gives every retained frontier entry a bounded chance to be retried.
 pub const MAX_TIMEOUT_REPROBES: usize = 12;
-/// Deadline retries before an acquisition attempt fails (mirrors
-/// `INBOUND_LEDGER_TIMEOUT_RETRIES_MAX`).
+/// No-progress recovery intervals permitted before the following seventh
+/// no-progress interval fails the acquisition (mirrors rippled
+/// `kLedgerTimeoutRetriesMax`).
 pub const DEFAULT_MAX_ACQUIRE_TIMEOUTS: u32 = 6;
 
 /// One unique missing node a tree engine discovered.
@@ -584,11 +586,17 @@ pub struct SessionPlan {
     /// retained network need remains recoverable.
     pending_recovery_reads: BTreeMap<OperationRef, PlanNetworkNeed>,
     read_backlog: VecDeque<PlanReadNeed>,
+    /// Exact frontier work waiting for a retained-dispatch slot. This holds at
+    /// most one engine-announced bounded batch because `run_turn` does not
+    /// advance the engine while it is nonempty.
     network_backlog: VecDeque<PlanNetworkNeed>,
+    /// Hash view of the exact current frontier: both dispatched retained work
+    /// and work waiting in `network_backlog`. It is rebuilt on every exact
+    /// retirement, so it never reports historical requests as pending.
     pending_network: BTreeSet<Uint256>,
-    /// Exact currently blocked network frontier. `pending_network` remains an
-    /// observability set only; timeout recovery must retain node id, hash, and
-    /// tree kind so it can resend a protocol-correct request.
+    /// Exact currently dispatched network frontier. Timeout recovery retains
+    /// node id, hash, and tree kind so it can resend a protocol-correct
+    /// request; overflow remains in `network_backlog` until capacity frees.
     retained_network: Vec<PlanNetworkNeed>,
     /// Start index for the next bounded timeout recovery batch. It advances
     /// once per timeout interval, not once per effect, so local reprobes and
@@ -751,12 +759,10 @@ impl SessionPlan {
         self.persistence = SessionPersistence::None;
     }
 
-    /// Records protocol progress for this plan. A later timeout measures a
-    /// consecutive no-progress interval, matching rippled
-    /// `InboundLedger::onTimer(wasProgress, ...)`; it must not exhaust an
-    /// acquisition that is actively receiving or applying ledger data.
+    /// Records protocol progress for this plan. Progress suppresses recovery
+    /// for the just-finished interval, but does not erase earlier no-progress
+    /// timeouts. This matches rippled `InboundLedger::onTimer(wasProgress, ...)`.
     pub fn note_progress(&mut self) {
-        self.timeouts = 0;
         self.progress_since_timeout = true;
     }
 
@@ -764,8 +770,7 @@ impl SessionPlan {
     /// seed or useful node does not trigger rippled-style no-progress recovery
     /// at the immediately following timer; the next quiet interval does.
     pub fn take_no_progress_interval(&mut self) -> bool {
-        let no_progress = !std::mem::replace(&mut self.progress_since_timeout, false);
-        no_progress
+        !std::mem::replace(&mut self.progress_since_timeout, false)
     }
 
     /// Selects the next bounded retry batch from the exact current frontier.
@@ -877,12 +882,17 @@ impl SessionPlan {
         }
 
         if !self.network_backlog.is_empty() {
-            let nodes = self.network_backlog.drain(..).collect::<Vec<_>>();
-            self.retain_network_frontier(&nodes);
-            for node in &nodes {
-                self.pending_network.insert(node.hash());
+            let nodes = self.dispatch_network_backlog();
+            if !nodes.is_empty() {
+                return PlanTurn::Network(nodes);
             }
-            return PlanTurn::Network(nodes);
+            // A full retained frontier must still admit queued peer packets:
+            // an exact attachment can retire a slot and release preserved
+            // backlog work. With no packet to apply, do not advance the tree
+            // beyond undispatched output.
+            if self.mailbox.is_empty() {
+                return PlanTurn::Continue;
+            }
         }
 
         let mut turns = 0u32;
@@ -900,6 +910,23 @@ impl SessionPlan {
                     break;
                 };
                 fed.merge(Self::feed_packet(packet, &mut **engine));
+            }
+            // When a retained frontier is full, packet attachment is allowed
+            // solely to retire exact needs and free one dispatch slot. Do not
+            // advance the tree while older output is backlogged; that would
+            // turn a bounded backlog into an unbounded hidden frontier.
+            if !self.network_backlog.is_empty()
+                && self.retained_network.len() >= MAX_RETAINED_NETWORK_FRONTIER
+            {
+                self.retire_network_resolutions(&fed.resolved_network);
+                if fed.useful {
+                    self.note_progress();
+                }
+                let nodes = self.dispatch_network_backlog();
+                if !nodes.is_empty() {
+                    return PlanTurn::Network(nodes);
+                }
+                return PlanTurn::Continue;
             }
             let (outcome, useful_peer_data, ready_continues, pending_writes, ledger_sequence) = {
                 let Some(engine) = self.engine.as_mut() else {
@@ -1023,9 +1050,10 @@ impl SessionPlan {
                     return PlanTurn::Reads(requests);
                 }
                 PlanStepOutcome::NeedsNetwork(nodes) => {
-                    self.retain_network_frontier(&nodes);
-                    for node in &nodes {
-                        self.pending_network.insert(node.hash());
+                    self.enqueue_network_frontier(nodes);
+                    let nodes = self.dispatch_network_backlog();
+                    if nodes.is_empty() {
+                        return PlanTurn::Continue;
                     }
                     return PlanTurn::Network(nodes);
                 }
@@ -1164,14 +1192,20 @@ impl SessionPlan {
         }
     }
 
-    /// Consumes one deadline timeout. Fails the plan after the retry budget is
-    /// exhausted. A cancelled plan stays terminal: any late timer event fails.
-    pub fn on_timeout(&mut self) -> PlanTimeout {
+    /// Applies one deadline interval. Only a no-progress interval consumes
+    /// timeout budget. rippled permits six no-progress recovery intervals and
+    /// fails on the seventh (`InboundLedger::onTimer` plus TimeoutCounter), so
+    /// the counter is not reset by progress and fails only after exceeding the
+    /// configured recovery budget. A cancelled plan stays terminal.
+    pub fn on_timeout(&mut self, no_progress: bool) -> PlanTimeout {
         if self.cancelled {
             return PlanTimeout::Fail;
         }
-        self.timeouts += 1;
-        if self.timeouts >= self.max_timeouts {
+        if !no_progress {
+            return PlanTimeout::Continue;
+        }
+        self.timeouts = self.timeouts.saturating_add(1);
+        if self.timeouts > self.max_timeouts {
             self.cancel();
             PlanTimeout::Fail
         } else {
@@ -1262,44 +1296,80 @@ impl SessionPlan {
     ) -> usize {
         let mut deferred = 0;
         for node in nodes {
-            if self.network_backlog.iter().any(|queued| *queued == node) {
+            if self.retained_network.contains(&node)
+                || self.network_backlog.iter().any(|queued| *queued == node)
+            {
                 continue;
             }
             self.network_backlog.push_back(node);
             deferred += 1;
         }
+        self.refresh_pending_network();
         deferred
     }
 
-    /// Merges an incremental peer frontier into the retained timed-out
-    /// traversal state. Identity is the complete `(node id, hash, kind)`;
-    /// duplicate announcements are ignored, but a later batch never clears
-    /// still-blocked needs from an earlier batch. Entries retire only after an
-    /// exact verified attachment or cancellation.
-    fn retain_network_frontier(&mut self, nodes: &[PlanNetworkNeed]) {
-        for node in nodes.iter().copied() {
-            if !self.retained_network.contains(&node) {
-                self.retained_network.push(node);
+    /// Queues exact current frontier work without discarding a later batch
+    /// when the retained dispatch window is full. Identity is the complete
+    /// `(node id, hash, kind)`; duplicate announcements are ignored.
+    fn enqueue_network_frontier(&mut self, nodes: impl IntoIterator<Item = PlanNetworkNeed>) {
+        for node in nodes {
+            if self.retained_network.contains(&node)
+                || self.network_backlog.iter().any(|queued| *queued == node)
+            {
+                continue;
             }
+            self.network_backlog.push_back(node);
         }
-        self.normalize_retained_network_cursor();
+        self.refresh_pending_network();
     }
 
-    /// Retires only exact retained needs whose peer packet both attached and
-    /// carried the matching node id, hash, and tree kind. A hash match by
-    /// itself must not erase another still-blocked tree location.
+    /// Moves only the capacity that is currently available into the exact
+    /// retained frontier. The remaining backlog stays intact until an exact
+    /// attachment retires a slot; `run_turn` will not advance the engine while
+    /// it remains, which bounds it to one TreePlan-emitted batch.
+    fn dispatch_network_backlog(&mut self) -> Vec<PlanNetworkNeed> {
+        let capacity = MAX_RETAINED_NETWORK_FRONTIER.saturating_sub(self.retained_network.len());
+        let mut dispatched = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            let Some(node) = self.network_backlog.pop_front() else {
+                break;
+            };
+            self.retained_network.push(node);
+            dispatched.push(node);
+        }
+        self.normalize_retained_network_cursor();
+        self.refresh_pending_network();
+        dispatched
+    }
+
+    /// Retires only exact retained/backlogged needs whose peer packet both
+    /// attached and carried the matching node id, hash, and tree kind. A hash
+    /// match by itself must not erase another still-blocked tree location.
     fn retire_network_resolutions(&mut self, resolutions: &[PlanNetworkNeed]) {
         self.retained_network
             .retain(|need| !resolutions.contains(need));
+        self.network_backlog
+            .retain(|need| !resolutions.contains(need));
         self.normalize_retained_network_cursor();
+        self.refresh_pending_network();
     }
 
-    /// Retires only the exact retained need whose recovery read attached.
-    /// Equal hashes at different node ids or in different trees remain
-    /// eligible until independently verified.
+    /// Retires only the exact retained/backlogged need whose recovery read
+    /// attached. Equal hashes at different node ids or in different trees
+    /// remain eligible until independently verified.
     fn retire_network_need(&mut self, resolved: PlanNetworkNeed) {
         self.retained_network.retain(|need| *need != resolved);
+        self.network_backlog.retain(|need| *need != resolved);
         self.normalize_retained_network_cursor();
+        self.refresh_pending_network();
+    }
+
+    fn refresh_pending_network(&mut self) {
+        self.pending_network.clear();
+        self.pending_network
+            .extend(self.retained_network.iter().map(PlanNetworkNeed::hash));
+        self.pending_network
+            .extend(self.network_backlog.iter().map(PlanNetworkNeed::hash));
     }
 
     fn normalize_retained_network_cursor(&mut self) {
@@ -2268,14 +2338,18 @@ mod tests {
     }
 
     #[test]
-    fn timeout_budget_fails_after_the_bound() {
+    fn timeout_budget_allows_six_no_progress_recoveries_then_fails_on_seventh() {
         let mut ids = IdCounter::new();
         let s = session();
-        let mut plan = SessionPlan::with_max_timeouts(budget(), 3);
-        assert_eq!(plan.on_timeout(), PlanTimeout::Continue);
-        assert_eq!(plan.on_timeout(), PlanTimeout::Continue);
-        assert_eq!(plan.timeouts(), 2);
-        assert_eq!(plan.on_timeout(), PlanTimeout::Fail);
+        let mut plan = SessionPlan::new(budget());
+        assert_eq!(plan.on_timeout(true), PlanTimeout::Continue);
+        assert_eq!(plan.on_timeout(false), PlanTimeout::Continue);
+        assert_eq!(plan.timeouts(), 1, "progress consumes no timeout budget");
+        for expected_timeouts in 2..=DEFAULT_MAX_ACQUIRE_TIMEOUTS {
+            assert_eq!(plan.on_timeout(true), PlanTimeout::Continue);
+            assert_eq!(plan.timeouts(), expected_timeouts);
+        }
+        assert_eq!(plan.on_timeout(true), PlanTimeout::Fail);
         assert!(plan.is_cancelled());
         // A cancelled plan produces no further work.
         let turn = plan.run_turn(&mut ctx(s, &mut ids));
@@ -2311,7 +2385,7 @@ mod tests {
             )),
             PlanReadOutcome::Stale
         );
-        assert_eq!(plan.on_timeout(), PlanTimeout::Fail);
+        assert_eq!(plan.on_timeout(true), PlanTimeout::Fail);
     }
 
     #[test]
@@ -2332,6 +2406,48 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert!(plan.pending_network().contains(&Uint256::from(42)));
         assert_eq!(nodes[0].kind(), TreeKind::State);
+    }
+
+    #[test]
+    fn frontier_overflow_is_backlogged_without_dropping_and_exact_retirement_updates_status() {
+        let mut ids = IdCounter::new();
+        let s = session();
+        let nodes = (1..=u64::try_from(MAX_RETAINED_NETWORK_FRONTIER + 2).expect("cap fits"))
+            .map(|hash| {
+                PlanNetworkNeed::new(
+                    SHAMapNodeId::default(),
+                    Uint256::from(hash),
+                    TreeKind::State,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut plan = SessionPlan::new(budget());
+        plan.enqueue_network_frontier(nodes.clone());
+        let dispatched = plan.dispatch_network_backlog();
+        assert_eq!(dispatched.len(), MAX_RETAINED_NETWORK_FRONTIER);
+        assert_eq!(plan.retained_network().len(), MAX_RETAINED_NETWORK_FRONTIER);
+        assert_eq!(
+            plan.pending_network().len(),
+            MAX_RETAINED_NETWORK_FRONTIER + 2
+        );
+
+        // A matching attachment retires only that exact retained entry and
+        // causes the next turn to dispatch one preserved overflow need.
+        plan.retire_network_resolutions(&[nodes[0]]);
+        assert!(!plan.pending_network().contains(&nodes[0].hash()));
+        assert_eq!(
+            plan.retained_network().len(),
+            MAX_RETAINED_NETWORK_FRONTIER - 1
+        );
+        let PlanTurn::Network(next) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("freed retained capacity must dispatch queued frontier work");
+        };
+        assert_eq!(next, vec![nodes[MAX_RETAINED_NETWORK_FRONTIER]]);
+        assert_eq!(plan.retained_network().len(), MAX_RETAINED_NETWORK_FRONTIER);
+        assert!(
+            plan.pending_network()
+                .contains(&nodes[MAX_RETAINED_NETWORK_FRONTIER].hash())
+        );
     }
 
     #[test]
@@ -2423,9 +2539,14 @@ mod tests {
         let second =
             PlanNetworkNeed::new(SHAMapNodeId::default(), Uint256::from(2), TreeKind::State);
         let mut plan = SessionPlan::new(budget());
-        plan.retain_network_frontier(&[first, same_hash_other_kind]);
+        plan.enqueue_network_frontier([first, same_hash_other_kind]);
+        assert_eq!(
+            plan.dispatch_network_backlog(),
+            vec![first, same_hash_other_kind]
+        );
         let _ = plan.next_timeout_recovery_batch();
-        plan.retain_network_frontier(&[first, second]);
+        plan.enqueue_network_frontier([first, second]);
+        assert_eq!(plan.dispatch_network_backlog(), vec![second]);
 
         assert_eq!(
             plan.retained_network(),
@@ -2501,7 +2622,8 @@ mod tests {
             Uint256::from(0x78),
             TreeKind::State,
         );
-        plan.retain_network_frontier(&[third_need]);
+        plan.enqueue_network_frontier([third_need]);
+        assert_eq!(plan.dispatch_network_backlog(), vec![third_need]);
         let third = plan.reprobe_network_batch(&[third_need], &mut ctx(s, &mut ids));
         plan.cancel();
         assert_eq!(
