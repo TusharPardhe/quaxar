@@ -1216,8 +1216,11 @@ impl SessionPlan {
             if applied.attached()
                 && let Some(node_id) = node.node_id.as_deref().and_then(deserialize_shamap_node_id)
             {
-                fed.resolved_network
-                    .push(PlanNetworkNeed::new(node_id, decoded.get_hash(), kind));
+                fed.resolved_network.push(PlanNetworkNeed::new(
+                    node_id,
+                    *decoded.get_hash().as_uint256(),
+                    kind,
+                ));
             }
             fed.attached |= applied.attached();
             fed.useful |= applied.is_useful();
