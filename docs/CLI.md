@@ -21,6 +21,9 @@ model are deliberately controlled.
 
 Running `quaxar` without arguments prints help and exits. Installed services
 should pass `--conf /etc/quaxar/quaxar.cfg` explicitly to start the node.
+The executable comes from the `quaxar-main` Cargo package and uses the
+`quaxar-cli` library; the retained `xrpld/main` source path is not an installed
+program name.
 
 ## Interactive Mode
 
@@ -195,7 +198,7 @@ Import a snapshot file into the node store. The node must be stopped before
 running this command.
 
 ```bash
-quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/quaxar/quaxar.cfg
+quaxar load-snapshot --input /path/to/snapshot.xrpls --conf /etc/quaxar/quaxar.cfg
 ```
 
 | Flag | Required | Description |

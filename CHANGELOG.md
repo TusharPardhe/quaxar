@@ -10,17 +10,23 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 ### Changed
 
 - Reworked current-ledger recovery around the application-owned NetworkOps
-  strand, preferred-ledger coordination, and LedgerMaster promotion flow.
+  strand, a typed acquisition coordinator, preferred-ledger retargeting,
+  durable exact-identity handoff, an independent startup/recovery latch, and
+  the NetworkOps-to-LedgerMaster promotion boundary.
 - Retain and reuse incomplete SHAMaps through the shared NodeFamily, tree,
   fetch-pack, negative, full-below, and NodeStore caches.
 - Migrated operator-facing packages, binaries, metrics, environment variables,
   configuration paths, containers, and services from `xrpld` branding to
-  Quaxar while retaining `xrpld/` as the source comparison layout.
+  Quaxar while retaining `xrpld/` as the source comparison layout and the
+  legacy Docker volume identity for data-safe upgrades.
 - Validator key generation now emits XRPL node-public/node-private encodings, a
   family validation seed, RFC-1751 words, and a protected non-overwriting
   `validator-keys.json`.
 - Updated operator and contributor documentation for the current architecture,
   synchronization states, validator setup, CLI, RPC, and deployment paths.
+- Made AWS provisioning refuse legacy in-place state before service/data/config
+  mutation and require config plus local RPC readiness before enabling the new
+  service.
 
 ## [0.3.1] - 2026-06-26
 

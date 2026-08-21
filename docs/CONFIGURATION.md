@@ -11,8 +11,19 @@ Run with an explicit config path:
 quaxar --conf /etc/quaxar/quaxar.cfg
 ```
 
-Docker Compose mounts the repository `quaxar.cfg` to `/etc/quaxar/quaxar.cfg`
-inside the container.
+Docker Compose mounts the container-specific `infra/docker/quaxar.cfg` to
+`/etc/quaxar/quaxar.cfg`. The root `quaxar.cfg` is the safe bare-metal example
+and binds administration to host loopback.
+
+The Docker config permits admin requests from its Compose network because host
+port forwarding does not originate at container loopback. Keep that network
+private to trusted Quaxar components; do not attach untrusted containers or
+publish the admin ports on a non-loopback host address.
+
+The runtime does not implicitly load an old `xrpld.cfg`. Upgrade tooling may
+migrate a legacy file, but operators should verify the final
+`/etc/quaxar/quaxar.cfg` path and its protected validator credentials before
+starting the service.
 
 ## Core Sections
 
@@ -86,7 +97,8 @@ Directory for relational metadata databases.
 
 ### `[ledger_history]`
 
-How much validated ledger history to keep available. Use a number or `full`.
+Desired validated-ledger acquisition/history depth. Use a number or `full`;
+actual retained availability is also constrained by `[node_db] online_delete`.
 
 ### `[validation_seed]`
 
@@ -237,16 +249,17 @@ runtime defaults; unknown keys are logged and ignored.
 
 ### `[debug_logfile]`
 
-Compatibility placeholder present in packaged configs. The current runtime
-does not open this path; logs are emitted through `tracing` to stdout/stderr and
-should be collected by systemd, Docker, or the process supervisor.
+Compatibility placeholder accepted by the parser but omitted from packaged
+configs. The current runtime does not open this path; logs are emitted through
+`tracing` to stdout/stderr and should be collected by systemd, Docker, or the
+process supervisor.
 
 ### `[rpc_startup]`
 
-Compatibility placeholder for startup JSON-RPC commands. The current runtime
-parses the section as configuration text but does not execute these commands.
-Set `RUST_LOG` in the service environment or use `quaxar log-level` after
-startup instead.
+Compatibility placeholder for startup JSON-RPC commands, omitted from packaged
+configs. The current runtime parses the section as configuration text but does
+not execute these commands. Set `RUST_LOG` in the service environment or use
+`quaxar log-level` after startup instead.
 
 ```ini
 [rpc_startup]
@@ -255,9 +268,9 @@ startup instead.
 
 ### `[ssl_verify]`
 
-Accepted by configuration validation for compatibility, but it is not wired to
-the runtime HTTP clients. Do not rely on this setting to weaken or strengthen
-certificate verification.
+Accepted by configuration validation for compatibility and omitted from
+packaged configs, but it is not wired to runtime HTTP clients. Do not rely on
+this setting to weaken or strengthen certificate verification.
 
 ### `[features]` and `[amendments]`
 

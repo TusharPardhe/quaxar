@@ -4,15 +4,17 @@ Quaxar is a Rust implementation of an XRP Ledger server. Its runtime follows
 the ownership and sequencing model used by `rippled`, while using Rust crates,
 channels, and explicit shared-state boundaries. The `xrpld/` directory name is
 retained intentionally so source paths remain easy to compare with upstream;
-installed programs, packages, configuration, metrics, and services use the
-Quaxar name.
+operator-facing package prefixes, installed programs, configuration, metrics,
+and services use the Quaxar name. Generic internal crates keep concise domain
+names such as `ledger`, `rpc`, and `server`.
 
 ## Runtime ownership
 
 `ApplicationRoot` owns the application-wide services and long-lived state. It
 wires the overlay, PeerFinder, resource manager, JobQueue, NodeStore, SHAMap
-`NodeFamily`, inbound acquisition registries, LedgerMaster state, validations,
-validator lists, consensus, RPC, and shutdown tree.
+`NodeFamily`, the typed acquisition coordinator and per-hash registries,
+LedgerMaster state, validations, validator lists, consensus, RPC, and shutdown
+tree.
 
 Network and consensus mutations are serialized through the application-owned
 NetworkOps strand. Work that may block or run in parallel is admitted to the
@@ -39,28 +41,42 @@ peer messages and local transactions
           |                 |
           |                 +--> validations and preferred-ledger choice
           v
-    inbound ledger / transaction-set acquisition
+    typed acquisition coordinator
+          |
+          v
+    per-hash ledger / transaction-set acquisition
           |
           +--> shared NodeFamily caches and NodeStore reads
           +--> bounded peer requests and fetch-pack reuse
           v
     complete immutable state and transaction SHAMaps
           v
-    LedgerMaster: closed -> validated -> published
+    durable completion handoff -> NetworkOps LCL reconciliation
+          |
+          v
+    LedgerMaster: validated -> published
           v
     consensus, RPC views, history, relational metadata
 ```
 
-An inbound-ledger registry admits one active acquisition for a ledger hash.
-Acquisition state is retained between rounds, so partial SHAMaps and fetched
-nodes can be reused rather than rebuilding each tree from an empty map. Reads
-consult shared in-memory caches and the NodeStore before requesting missing
-nodes from peers. A ledger is eligible for promotion only after its header and
-required SHAMaps are complete and consistent with their hashes.
+The acquisition coordinator serializes typed events into phase transitions and
+effects. It owns the current recovery target, exact hash/sequence metadata,
+retry policy, durable completion handoff, and the lifecycle of per-hash
+sessions. An inbound-ledger registry admits one active acquisition for a
+ledger hash. A preferred-policy retarget does not erase an older valid session:
+partial SHAMaps and fetched nodes remain reusable rather than rebuilding each
+tree from an empty map. Reads consult shared in-memory caches and the NodeStore
+before requesting missing nodes from peers. A ledger is eligible for handoff
+only after its header and required SHAMaps are complete and consistent with
+their hashes.
 
-LedgerMaster owns advancement of the closed, validated, and published heads.
-Validation arrival invokes its acceptance checks; publication advances in
-sequence and does not silently cross an unresolved gap. During recovery,
+NetworkOps owns the closed-ledger/LCL switch and reconciles it with the latest
+preferred-ledger policy. LedgerMaster owns validation acceptance plus validated
+and published advancement; publication advances in sequence and does not
+silently cross an unresolved gap. The application/NetworkOps
+`need_network_ledger` startup/recovery latch is independent from the
+coordinator's visible phase and clears only on an authoritative LCL switch or
+full-ledger publication. During recovery,
 historical acquisition is subordinate to acquiring and publishing the current
 validated chain.
 
@@ -104,8 +120,9 @@ and quorum decisions.
 | `xrpl/protocol` | Serialized types, protocol fields, messages and amendments |
 | `xrpl/shamap` | SHAMap nodes, traversal, synchronization and caches |
 | `xrpl/resource` | Resource/load accounting |
-| `xrpld/acquisition` | Generic acquisition scheduling primitives |
+| `xrpld/acquisition` | Typed coordinator, phase machine, sessions, retries and durable handoff |
 | `xrpld/app` | Application owner, bootstrap, NetworkOps, jobs and orchestration |
+| `xrpld/core` | Port configuration, RPC status and SQLite state utilities (`quaxar-core`) |
 | `xrpld/consensus` | Consensus algorithm and timing primitives |
 | `xrpld/ledger` | Ledger domain model, history, acquisition and LedgerMaster |
 | `xrpld/overlay` | Peer protocol, PeerFinder and overlay runtime |
@@ -118,6 +135,9 @@ and quorum decisions.
 | `xrpld/metrics` | Prometheus metrics (`quaxar-metrics` package) |
 | `xrpld/cli` | Operator CLI (`quaxar-cli` package) |
 | `xrpld/main` | Bootstrap and `quaxar` executable (`quaxar-main` package) |
+
+`xrpld/rpc-integration-tests` is a test-only workspace member and is not a
+runtime package.
 
 ## Concurrency rules
 

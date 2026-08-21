@@ -7,7 +7,7 @@
 //! handles this automatically.
 //!
 //! This module provides explicit configuration for cases where custom
-//! verify paths or files are specified in the xrpld config.
+//! verify paths or files are specified in the Quaxar config.
 
 use std::fs;
 use std::io::BufReader;
@@ -34,7 +34,7 @@ impl Default for TlsConfig {
     }
 }
 
-/// Initialize TLS configuration from xrpld config values.
+/// Initialize TLS configuration from Quaxar config values.
 ///
 ///
 /// - If `ssl_verify_file` is provided, loads PEM certs from that file.

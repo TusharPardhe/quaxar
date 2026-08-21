@@ -38,7 +38,7 @@
 //!     └── file_sha256:      [u8; 32]  (sha256 of all bytes before the footer)
 //! ```
 
-/// 8-byte magic that identifies an xrpld snapshot file.
+/// 8-byte magic that identifies a Quaxar snapshot file.
 /// ASCII "xrpls\0\x01\x00" — the `\x01` encodes the format family version.
 pub const SNAPSHOT_MAGIC: &[u8; 8] = b"xrpls\x00\x01\x00";
 

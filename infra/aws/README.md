@@ -29,8 +29,18 @@ The provisioned node is non-validating unless the operator separately installs
 a protected `[validation_seed]` and restarts the service. The provisioner does
 not generate, copy, or print validator secrets.
 
-The provisioner is intentionally idempotent for its named security group and
-Elastic IP. It refuses to move an EIP attached to an unknown instance.
+AWS resource discovery is idempotent for the named security group and Elastic
+IP. It refuses to move an EIP attached to an unknown instance. The bootstrap
+script is a fresh/canonical-host installer, not a transactional general-purpose
+upgrader; do not rerun it manually on a custom deployment without a rollback
+plan.
+It owns only fresh hosts and the canonical `/var/lib/quaxar` layout. If it
+detects a legacy service, data/log directory, or config, it refuses before
+changing service state or ownership; follow the reviewed manual cutover in
+[RUNNING.md](../../docs/RUNNING.md) instead. Bootstrap enables the new service
+only after config validation and a successful local `server_info` response.
+The readiness wait defaults to 180 seconds and can be changed, up to 900
+seconds, with `RPC_READY_TIMEOUT_SECONDS` in the rendered bootstrap environment.
 
 ## Provision
 
@@ -54,6 +64,8 @@ only when intentionally changing the deployment design.
 
 The initial Rust build can take several minutes. Do not treat an EC2
 `instance-status-ok` result as proof that application bootstrap has finished.
+The bootstrap RPC check proves local service readiness, not completion of
+ledger synchronization; confirm `server_state` and validated-ledger progress.
 
 ```bash
 ssh -i ~/.ssh/quaxar-testnet-2026.pem ubuntu@<elastic-ip> \

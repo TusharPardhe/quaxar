@@ -7,13 +7,13 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use protocol::PublicKey;
+use quaxar_core::{DatabaseCon, WALLET_DB_INIT};
 use serde_json::json;
 use tempfile::TempDir;
 use xrpl_core::{
     PeerReservation, PeerReservationJournal, PeerReservationStore, PeerReservationTable,
     ServiceRegistry, load_peer_reservations_from_registry,
 };
-use xrpld_core::{DatabaseCon, WALLET_DB_INIT};
 
 fn hash_value<T: Hash>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();

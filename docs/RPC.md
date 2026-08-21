@@ -90,6 +90,10 @@ represent some values differently.
 `fetch_info` is admin-only and reports active acquisition state. Pair it with
 `get_counts` when diagnosing SHAMap cache or NodeStore behavior.
 
+`server_state` is the NetworkOps operating mode exposed to operators. It is
+informed by, but is not identical to, the acquisition coordinator's internal
+phase; validator `proposing` is layered on top of full synchronization.
+
 ### Account lookup
 
 ```json

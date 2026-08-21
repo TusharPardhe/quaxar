@@ -143,7 +143,9 @@ impl NuDbOpenArgs {
         }
     }
 
-    pub const fn xrpld_default(uid: u64, salt: u64) -> Self {
+    /// Use Quaxar's NuDB application number. The value is intentionally kept
+    /// compatible with existing rippled/Quaxar databases.
+    pub const fn quaxar_default(uid: u64, salt: u64) -> Self {
         Self::deterministic(NUDB_APPNUM, uid, salt)
     }
 }
@@ -523,7 +525,7 @@ impl NuDbOpenState {
         if self.header.appnum != expected_appnum {
             return Err("nodestore: unknown appnum".to_owned());
         }
-        self.header.validate_for_xrpld()?;
+        self.header.validate_for_quaxar()?;
         self.is_open = true;
         Ok(())
     }
@@ -554,7 +556,7 @@ impl NuDbMetadataHeader {
         }
     }
 
-    pub fn validate_for_xrpld(&self) -> Result<(), String> {
+    pub fn validate_for_quaxar(&self) -> Result<(), String> {
         if self.appnum != NUDB_APPNUM {
             return Err("nodestore: unknown appnum".to_owned());
         }
@@ -836,7 +838,7 @@ impl NuDbBackend {
         let config =
             NuDbBackendConfig::from_section(key_bytes, parameters, burst_size, journal.as_ref())?;
         let initial_header = config.metadata_header(
-            default_open_args.unwrap_or_else(|| NuDbOpenArgs::xrpld_default(0, 0)),
+            default_open_args.unwrap_or_else(|| NuDbOpenArgs::quaxar_default(0, 0)),
         );
         Ok(Self {
             config,
@@ -990,7 +992,7 @@ impl NuDbBackend {
         let pid = u64::from(std::process::id());
         let uid = now_nanos ^ counter.rotate_left(17) ^ (pid << 32);
         let salt = now_nanos.rotate_left(7) ^ counter.rotate_left(29) ^ pid;
-        NuDbOpenArgs::xrpld_default(uid.max(1), salt.max(1))
+        NuDbOpenArgs::quaxar_default(uid.max(1), salt.max(1))
     }
 
     fn create_file_set(&self, plan: &NuDbOpenPlan) -> Result<NuDbKeyFileHeader, String> {
@@ -3605,16 +3607,16 @@ mod tests {
     }
 
     #[test]
-    fn nudb_open_args_and_metadata_preserve_xrpld_appnum_contract() {
-        let open_args = NuDbOpenArgs::xrpld_default(11, 22);
+    fn nudb_open_args_and_metadata_preserve_rippled_appnum_contract() {
+        let open_args = NuDbOpenArgs::quaxar_default(11, 22);
         assert_eq!(open_args.app_type, NUDB_APPNUM);
 
         let header = NuDbMetadataHeader::new(NUDB_APPNUM, 11, 22, 32, 4096);
-        header.validate_for_xrpld().expect("xrpld header");
+        header.validate_for_quaxar().expect("Quaxar header");
 
         let wrong = NuDbMetadataHeader::new(99, 11, 22, 32, 4096);
         assert_eq!(
-            wrong.validate_for_xrpld().expect_err("wrong appnum"),
+            wrong.validate_for_quaxar().expect_err("wrong appnum"),
             "nodestore: unknown appnum"
         );
     }

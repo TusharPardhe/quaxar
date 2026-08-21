@@ -9,7 +9,7 @@ services:
       - "51235:51235" # Peer protocol
     volumes:
       - quaxar-data:/var/lib/quaxar
-      - ${QUAXAR_CONFIG_FILE:-./quaxar.cfg}:/etc/quaxar/quaxar.cfg:ro
+      - ${QUAXAR_CONFIG_FILE:-./infra/docker/quaxar.cfg}:/etc/quaxar/quaxar.cfg:ro
     deploy:
       resources:
         limits:
@@ -22,6 +22,6 @@ services:
 
 volumes:
   quaxar-data:
-    # Reuse the volume created by the pre-rename Compose project. Override
-    # QUAXAR_DATA_VOLUME when the old project used a different project name.
+    # Preserve the pre-rename volume identity so an ordinary upgrade cannot
+    # silently attach an empty database. Fresh installs may override it.
     name: "${QUAXAR_DATA_VOLUME:-quaxar_xrpld-data}"

@@ -837,7 +837,7 @@ if [ "$INSTALL_SERVICE" = true ] && command -v systemctl &>/dev/null && sudo -n 
 
     sudo tee /etc/systemd/system/quaxar.service > /dev/null << EOF
 [Unit]
-Description=XRP Ledger Node (Rust)
+Description=Quaxar XRP Ledger Node
 After=network-online.target
 Wants=network-online.target
 

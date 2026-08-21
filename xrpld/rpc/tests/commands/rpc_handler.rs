@@ -232,6 +232,10 @@ fn load_cpp_handler_table() -> String {
 }
 
 fn handler_table_path() -> PathBuf {
+    if let Ok(explicit) = std::env::var("RIPPLED_REPO") {
+        return PathBuf::from(explicit).join("src/xrpld/rpc/detail/Handler.cpp");
+    }
+    // Backward-compatible fallback for existing developer/CI environments.
     if let Ok(explicit) = std::env::var("XRPLD_CPP_REPO") {
         return PathBuf::from(explicit).join("src/xrpld/rpc/detail/Handler.cpp");
     }
@@ -248,18 +252,18 @@ fn handler_table_path() -> PathBuf {
     if let Ok(current_dir) = std::env::current_dir() {
         candidates.push(current_dir.join("../xrpld/src/xrpld/rpc/detail/Handler.cpp"));
         candidates.push(current_dir.join("../rippled/src/xrpld/rpc/detail/Handler.cpp"));
-        candidates.extend(sibling_xrpld_candidates(&current_dir));
+        candidates.extend(sibling_rippled_candidates(&current_dir));
     }
-    candidates.extend(sibling_xrpld_candidates(repo_root));
-    candidates.extend(git_worktree_xrpld_candidates(repo_root));
+    candidates.extend(sibling_rippled_candidates(repo_root));
+    candidates.extend(git_worktree_rippled_candidates(repo_root));
 
     candidates
         .into_iter()
         .find(|path| path.is_file())
-        .expect("Handler.cpp should exist via XRPLD_CPP_REPO or ../xrpld")
+        .expect("Handler.cpp should exist via RIPPLED_REPO or a sibling rippled checkout")
 }
 
-fn sibling_xrpld_candidates(start: &Path) -> Vec<PathBuf> {
+fn sibling_rippled_candidates(start: &Path) -> Vec<PathBuf> {
     start
         .ancestors()
         .flat_map(|ancestor| {
@@ -271,7 +275,7 @@ fn sibling_xrpld_candidates(start: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn git_worktree_xrpld_candidates(repo_root: &Path) -> Vec<PathBuf> {
+fn git_worktree_rippled_candidates(repo_root: &Path) -> Vec<PathBuf> {
     let Ok(output) = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(repo_root)

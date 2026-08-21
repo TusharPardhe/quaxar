@@ -24,7 +24,8 @@ pub mod version;
 #[derive(Parser)]
 #[command(name = "quaxar", about = "Quaxar XRPL Node", version)]
 pub struct Cli {
-    /// Subcommand to run. If none, starts the node.
+    /// Subcommand to run. Startup flags without a subcommand start the node;
+    /// a completely bare invocation prints help and exits.
     #[command(subcommand)]
     pub command: Option<Command>,
 

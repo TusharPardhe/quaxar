@@ -1,6 +1,8 @@
-//! Prometheus metrics for the XRPL Rust node.
+//! Prometheus metrics for the Quaxar XRP Ledger node.
 //!
-//! Exposes rich operational metrics via a `/metrics` HTTP endpoint.
+//! Can expose operational metrics via `/metrics` when [`init_prometheus`] is
+//! called; the default node bootstrap currently records metrics without
+//! starting this exporter.
 //! Uses the `metrics` crate facade for zero-cost recording when disabled.
 //!
 //! # Usage

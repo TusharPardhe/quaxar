@@ -41,7 +41,8 @@ The installer will:
 - Let you choose Docker or local build
 - Install all dependencies
 - Build and install `quaxar` to your PATH
-- Generate config files (all fields configurable)
+- Generate config files with guided essential settings; set
+  `QUAXAR_ADVANCED_CONFIG=1` for the additional installer prompts
 - Optionally set up a systemd service
 
 ### Manual Setup
@@ -111,8 +112,8 @@ sudo apt install libssl-dev pkg-config
 
 ## Configuration
 
-Use the repository `quaxar.cfg` as the default starting point. It is intentionally
-small; detailed parameter explanations are kept in
+Use the repository `quaxar.cfg` as the default starting point. The following is
+a smaller bare-metal example; detailed parameter explanations are kept in
 [CONFIGURATION.md](CONFIGURATION.md).
 
 ```ini
@@ -124,6 +125,7 @@ port_peer
 port = 5005
 ip = 127.0.0.1
 protocol = http
+admin = 127.0.0.1
 
 [port_peer]
 port = 51235
@@ -136,11 +138,14 @@ medium
 [node_db]
 type = NuDB
 path = /var/lib/quaxar/db/nudb
-online_delete = 2000
+online_delete = 512
 advisory_delete = 0
 
 [database_path]
 /var/lib/quaxar/db
+
+[ledger_history]
+256
 
 [validator_list_sites]
 https://vl.ripple.com
@@ -179,6 +184,11 @@ ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
 
 See [CONFIGURATION.md](CONFIGURATION.md) for operator-facing config sections
 and compatibility notes.
+
+The root example binds HTTP/WebSocket administration to `127.0.0.1` and is safe
+for the bare-metal service below. Docker Compose uses separate files under
+`infra/docker/` that listen inside the container while publishing admin ports
+only on host loopback. Never expose an admin listener publicly.
 
 ## Starting the Node
 
@@ -229,6 +239,19 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now quaxar
 ```
+
+For an older or custom-layout host, first record the unit's `User`, `Group`,
+`ExecStart`, config path, database paths, and a tested rollback point. Build and
+stage the new binary before the outage; then stop both old and new units before
+moving data or changing ownership. Copy (do not remove) the protected legacy
+config to `/etc/quaxar/quaxar.cfg`, update and validate its paths/listeners, and
+transfer only the directories actually named by that config. Start Quaxar
+without disabling the old unit, require a stable local `server_info` response
+and writable database, and only then enable Quaxar and disable the old unit. On
+failure, stop Quaxar, restore paths/ownership, and restart the old unit. Never
+run both daemons against one NuDB. Deployments that still intentionally run
+`quaxar.service` under an `xrpld` account must keep that ownership in deployment
+commands until this explicit cutover is performed.
 
 ## Monitoring
 
@@ -346,7 +369,7 @@ host I/O.
 **On the new node (stopped):**
 
 ```bash
-quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/quaxar/quaxar.cfg
+quaxar load-snapshot --input /path/to/snapshot.xrpls --conf /etc/quaxar/quaxar.cfg
 ```
 
 The CLI displays a spinner while it imports and verifies all chunk and final

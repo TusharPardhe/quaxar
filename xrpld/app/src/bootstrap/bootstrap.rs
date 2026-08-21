@@ -4204,7 +4204,7 @@ fn attach_relational_database_if_configured(
 
     let setup = build_database_con_setup(
         config,
-        to_xrpld_startup_type(options.start_type),
+        to_core_startup_type(options.start_type),
         options.standalone,
         ledger_history,
     )?;
@@ -5024,7 +5024,7 @@ fn parse_sql_hash(value: String) -> rusqlite::Result<basics::sha_map_hash::SHAMa
         })
 }
 
-fn to_xrpld_startup_type(start_type: StartUpType) -> quaxar_core::StartUpType {
+fn to_core_startup_type(start_type: StartUpType) -> quaxar_core::StartUpType {
     match start_type {
         StartUpType::Fresh => quaxar_core::StartUpType::Fresh,
         StartUpType::Normal => quaxar_core::StartUpType::Normal,

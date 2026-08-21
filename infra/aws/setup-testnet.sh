@@ -7,6 +7,7 @@ QUAXAR_REF="__QUAXAR_REF__"
 PUBLIC_IP="__PUBLIC_IP__"
 QUAXAR_REPOSITORY="https://github.com/TusharPardhe/quaxar.git"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+RPC_READY_TIMEOUT_SECONDS="${RPC_READY_TIMEOUT_SECONDS:-180}"
 
 if [[ ! "$QUAXAR_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
   echo "Invalid Quaxar branch or tag: $QUAXAR_REF" >&2
@@ -18,6 +19,11 @@ if [[ ! "$PUBLIC_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
 fi
 if [[ "$SKIP_BUILD" != "0" && "$SKIP_BUILD" != "1" ]]; then
   echo "SKIP_BUILD must be 0 or 1" >&2
+  exit 64
+fi
+if [[ ! "$RPC_READY_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] \
+  || (( RPC_READY_TIMEOUT_SECONDS > 900 )); then
+  echo "RPC_READY_TIMEOUT_SECONDS must be between 1 and 900" >&2
   exit 64
 fi
 
@@ -43,32 +49,55 @@ retry apt-get install -y --no-install-recommends \
   ca-certificates curl git build-essential pkg-config libssl-dev librocksdb-dev \
   clang cmake lld
 
-LEGACY_DATA_MIGRATED=0
-if [[ -d /var/lib/xrpld ]]; then
-  if [[ -e /var/lib/quaxar ]] && [[ -n "$(find /var/lib/quaxar -mindepth 1 -print -quit)" ]]; then
-    echo "Both /var/lib/xrpld and /var/lib/quaxar contain data; refusing an ambiguous migration" >&2
-    exit 1
-  fi
-  # Moving within /var/lib is atomic on the normal single-filesystem layout.
-  if systemctl is-active --quiet quaxar.service; then
-    systemctl stop quaxar.service
-  fi
-  if [[ -d /var/lib/quaxar ]]; then
-    rmdir /var/lib/quaxar
-  fi
-  mv /var/lib/xrpld /var/lib/quaxar
-  LEGACY_DATA_MIGRATED=1
+# This provisioner owns only fresh hosts and its canonical /var/lib/quaxar
+# layout. Refuse legacy in-place state before changing services, ownership, or
+# validator configuration; use docs/RUNNING.md for a deliberate host cutover.
+XRPLD_LOAD_STATE="$(systemctl show -p LoadState --value xrpld.service 2>/dev/null || true)"
+if systemctl is-active --quiet xrpld.service \
+  || [[ -n "$XRPLD_LOAD_STATE" && "$XRPLD_LOAD_STATE" != "not-found" ]] \
+  || [[ -e /var/lib/xrpld ]] \
+  || [[ -e /var/log/xrpld ]] \
+  || [[ -e /etc/quaxar/xrpld.cfg ]] \
+  || [[ -e /etc/xrpld/xrpld.cfg ]]; then
+  echo "Legacy xrpld state detected; automatic in-place migration is intentionally refused" >&2
+  echo "Follow docs/RUNNING.md and verify database, config, validator identity, service user, and rollback paths" >&2
+  exit 1
 fi
 
-if [[ -d /var/log/xrpld ]] && [[ ! -e /var/log/quaxar ]]; then
-  mv /var/log/xrpld /var/log/quaxar
+# A custom deployment may already use the Quaxar service name while retaining
+# a legacy account or /srv layout. Accept only this provisioner's canonical
+# unit and config; otherwise refuse before replacing binaries or ownership.
+QUAXAR_LOAD_STATE="$(systemctl show -p LoadState --value quaxar.service 2>/dev/null || true)"
+if [[ -n "$QUAXAR_LOAD_STATE" && "$QUAXAR_LOAD_STATE" != "not-found" ]]; then
+  QUAXAR_UNIT_USER="$(systemctl show -p User --value quaxar.service)"
+  QUAXAR_UNIT_GROUP="$(systemctl show -p Group --value quaxar.service)"
+  QUAXAR_UNIT_EXEC="$(systemctl show -p ExecStart --value quaxar.service)"
+  if [[ "$QUAXAR_UNIT_USER" != "quaxar" ]] \
+    || [[ "$QUAXAR_UNIT_GROUP" != "quaxar" ]] \
+    || [[ "$QUAXAR_UNIT_EXEC" != *"/usr/local/bin/quaxar --conf /etc/quaxar/quaxar.cfg"* ]]; then
+    echo "Existing quaxar.service is not owned by the canonical AWS provisioner layout" >&2
+    echo "Refusing to rewrite a custom service; follow docs/RUNNING.md" >&2
+    exit 1
+  fi
+fi
+if [[ -e /srv/quaxar ]]; then
+  echo "Custom /srv/quaxar layout detected; refusing canonical AWS provisioning" >&2
+  exit 1
+fi
+if [[ -e /etc/quaxar/quaxar.cfg ]]; then
+  if ! grep -Fxq 'path = /var/lib/quaxar/db/nudb' /etc/quaxar/quaxar.cfg \
+    || ! grep -Fxq '/var/lib/quaxar/db' /etc/quaxar/quaxar.cfg \
+    || grep -Eq '/srv/|/var/lib/xrpld|/var/log/xrpld' /etc/quaxar/quaxar.cfg; then
+    echo "Existing quaxar.cfg uses a noncanonical data layout; refusing to rewrite its service" >&2
+    exit 1
+  fi
 fi
 
 if ! id -u quaxar >/dev/null 2>&1; then
   useradd --system --create-home --home-dir /home/quaxar --shell /usr/sbin/nologin quaxar
 fi
-install -d -m 0750 /var/lib/quaxar /var/lib/quaxar/db /var/lib/quaxar/db/nudb /var/log/quaxar
-chown -R quaxar:quaxar /var/lib/quaxar /var/log/quaxar
+install -d -o quaxar -g quaxar -m 0750 \
+  /var/lib/quaxar /var/lib/quaxar/db /var/lib/quaxar/db/nudb /var/log/quaxar
 if [[ "$SKIP_BUILD" == "1" ]]; then
   test -d /opt/quaxar/.git
   test -x /usr/local/bin/quaxar
@@ -93,15 +122,6 @@ else
 fi
 install -d -m 0755 /etc/quaxar
 test -r /opt/quaxar/infra/aws/testnet-amendments.txt
-
-# Preserve validator credentials and operator settings from the old filename.
-if [[ -f /etc/quaxar/xrpld.cfg ]] && [[ ! -e /etc/quaxar/quaxar.cfg ]]; then
-  mv /etc/quaxar/xrpld.cfg /etc/quaxar/quaxar.cfg
-  sed -i \
-    -e 's#/var/lib/xrpld#/var/lib/quaxar#g' \
-    -e 's#/var/log/xrpld#/var/log/quaxar#g' \
-    /etc/quaxar/quaxar.cfg
-fi
 
 if [[ ! -e /etc/quaxar/quaxar.cfg ]]; then
   cat >/etc/quaxar/quaxar.cfg <<CONFIG
@@ -143,9 +163,6 @@ advisory_delete = 0
 [ledger_history]
 256
 
-[debug_logfile]
-/var/log/quaxar/debug.log
-
 [network_id]
 1
 
@@ -166,14 +183,14 @@ https://vl.altnet.rippletest.net
 ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860
 CONFIG
 fi
-if [[ "$LEGACY_DATA_MIGRATED" == "1" ]]; then
-  sed -i \
-    -e 's#/var/lib/xrpld#/var/lib/quaxar#g' \
-    -e 's#/var/log/xrpld#/var/log/quaxar#g' \
-    /etc/quaxar/quaxar.cfg
-fi
 chown root:quaxar /etc/quaxar/quaxar.cfg
 chmod 0640 /etc/quaxar/quaxar.cfg
+CONFIG_CHECK_OUTPUT="$(/usr/local/bin/quaxar --conf /etc/quaxar/quaxar.cfg config 2>&1)"
+echo "$CONFIG_CHECK_OUTPUT"
+if ! grep -q 'Config looks good' <<<"$CONFIG_CHECK_OUTPUT"; then
+  echo "Generated Quaxar config failed validation" >&2
+  exit 1
+fi
 
 cat >/etc/systemd/system/quaxar.service <<'UNIT'
 [Unit]
@@ -201,7 +218,7 @@ WantedBy=multi-user.target
 UNIT
 
 cat >/etc/logrotate.d/quaxar <<'ROTATE'
-/var/log/quaxar/*.log /var/log/quaxar-bootstrap.log {
+/var/log/quaxar-bootstrap.log {
     rotate 7
     daily
     missingok
@@ -220,6 +237,28 @@ ROTATE
 } >/etc/quaxar/build-info
 
 systemctl daemon-reload
-systemctl enable quaxar.service
 systemctl restart quaxar.service
+RPC_READY=0
+RPC_READY_ATTEMPTS=$(( (RPC_READY_TIMEOUT_SECONDS + 1) / 2 ))
+for _ in $(seq 1 "$RPC_READY_ATTEMPTS"); do
+  if systemctl is-active --quiet quaxar.service \
+    && curl -fsS --max-time 2 \
+      -H 'Content-Type: application/json' \
+      -d '{"method":"server_info","params":[{}]}' \
+      http://127.0.0.1:5005 \
+      | grep -q '"status"[[:space:]]*:[[:space:]]*"success"'; then
+    RPC_READY=1
+    break
+  fi
+  sleep 2
+done
+QUAXAR_PID="$(systemctl show -p MainPID --value quaxar.service)"
+if [[ "$RPC_READY" != "1" ]] || [[ ! "$QUAXAR_PID" =~ ^[1-9][0-9]*$ ]]; then
+  systemctl --no-pager --full status quaxar.service || true
+  journalctl -u quaxar.service -n 100 --no-pager || true
+  systemctl stop quaxar.service || true
+  echo "Quaxar service failed RPC readiness validation" >&2
+  exit 1
+fi
+systemctl enable quaxar.service
 echo "[$(date -Is)] Quaxar bootstrap completed"

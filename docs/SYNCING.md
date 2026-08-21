@@ -11,7 +11,8 @@ The normal progression is:
 
 ```text
 disconnected -> connected -> syncing -> tracking -> full
-                                                \-> proposing (validator)
+                                                    |
+                                                    +-> proposing (validator gates satisfied)
 ```
 
 - `connected`: enough peer connectivity exists to observe the network, but no
@@ -22,7 +23,8 @@ disconnected -> connected -> syncing -> tracking -> full
   but has not yet satisfied every readiness gate.
 - `full`: a non-validating node is current and ready to serve its complete
   locally available data.
-- `proposing`: a configured validator is current and participating. Whether
+- `proposing`: a configured validator is current and participating after the
+  full-readiness, trust/quorum, clock, and validation gates pass. Whether
   other operators trust it is a separate validator-list decision.
 
 Short transitions or an occasional missing sequence in `complete_ledgers` can
@@ -33,17 +35,26 @@ requires investigation.
 ## Current-ledger acquisition
 
 1. Trusted validations and peer status select a preferred ledger hash.
-2. The inbound-ledger registry reuses an existing acquisition for that hash or
-   creates one bounded acquisition.
+2. The typed coordinator records the exact target identity and reuses an
+   existing per-hash acquisition or creates one bounded acquisition.
 3. The ledger header identifies state-map and transaction-map roots.
 4. Each map consults the shared NodeFamily/tree cache, fetch-pack cache, and
    NodeStore before requesting missing nodes from peers.
 5. Peer replies are validated by hash and inserted into the incomplete tree.
    Partial trees remain reusable across retries.
 6. Once both maps are complete, immutable, and match their roots, the ledger is
-   persisted and handed to LedgerMaster.
-7. LedgerMaster applies validation/quorum gates, installs the validated head,
-   and advances publication in sequence.
+   persisted and handed back through the coordinator's durable completion
+   path.
+7. NetworkOps reconciles the completed identity with current preferred-LCL
+   policy and performs an accepted LCL switch. LedgerMaster then applies
+   validation gates and advances validated/publication state in sequence.
+
+A hash-only target is refined to a sequence-known identity when its durable
+ledger header arrives; later hash-only observations cannot discard that
+metadata. Installing the recovery LCL moves the coordinator to `tracking`, and
+a fresh contiguous publication permits `full`. The independent
+`need_network_ledger` startup/recovery latch clears only after an authoritative
+LCL switch or full-ledger publication, not merely because a fetch completed.
 
 The active-acquisition limit controls concurrent targets, not the number of
 tree nodes retained. `[node_size]` controls tree-cache capacity and age,
@@ -52,11 +63,13 @@ defaults.
 
 ## Preferred-ledger changes
 
-The preferred hash can change while a node catches up. Quaxar serializes the
-selection and promotion decision through NetworkOps. An acquisition for an old
-candidate may stop being current, but valid nodes it placed in shared caches or
-NodeStore remain available to another tree with the same hashes. The node does
-not publish a ledger merely because its header arrived.
+The preferred hash can change while a node catches up. Quaxar serializes policy
+retargeting through NetworkOps and the typed coordinator while keeping per-hash
+session lifetime separate. An older session may finish after policy moves; its
+valid nodes and partial trees remain in shared caches or NodeStore for reuse.
+A reconciliation event can retire an obsolete syncing target when the current
+local LCL is again preferred. The node does not install or publish a ledger
+merely because its header arrived.
 
 ## History acquisition
 

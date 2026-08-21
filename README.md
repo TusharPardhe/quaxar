@@ -126,19 +126,35 @@ quaxar --conf ./quaxar.cfg
 docker compose up -d
 ```
 
-Docker Compose mounts the repository `quaxar.cfg` into the container at
-`/etc/quaxar/quaxar.cfg`. The branded `quaxar-data` mount reuses the legacy
-`quaxar_xrpld-data` Docker volume so upgrades retain the existing ledger
-database. Set `QUAXAR_DATA_VOLUME` if the earlier Compose project used another
-project name. If the old `xrpld.cfg` contains validator credentials or other
-local settings, copy it to an untracked operator file and select it explicitly
-before upgrading:
+Docker Compose mounts `infra/docker/quaxar.cfg` into the container at
+`/etc/quaxar/quaxar.cfg`. That container-only config listens on all container
+interfaces while Compose publishes admin ports only on host loopback. Its
+branded `quaxar-data` mount deliberately retains the common legacy
+`quaxar_xrpld-data` volume identity so ordinary upgrades reuse that database.
+Fresh installations can select a clean name with
+`QUAXAR_DATA_VOLUME=quaxar-data`. Do not mount an old
+`xrpld.cfg` verbatim: its data/log paths and relative validator-file references
+belong to the legacy container layout. Start from the new Docker config, merge
+the protected credentials/settings, and select that reviewed file:
 
 ```bash
-cp xrpld.cfg quaxar.local.cfg
+cp infra/docker/quaxar.cfg quaxar.local.cfg
+# Merge required legacy sections, changing /var/lib/xrpld to /var/lib/quaxar
+# and /var/log/xrpld to /var/log/quaxar.
 export QUAXAR_CONFIG_FILE=./quaxar.local.cfg
 docker compose up -d
 ```
+
+If the legacy config uses a relative `[validators_file]`, either merge those
+public keys into `[validators]` or mount the file separately at an explicit
+container path and update the setting. Validate the final config before the
+upgrade and keep the original config as a protected rollback artifact.
+
+Before an upgrade, use `docker volume ls` to confirm the exact old physical
+volume name and set `QUAXAR_DATA_VOLUME` if it differs from
+`quaxar_xrpld-data`. Admin scope is unrestricted inside the default Compose
+network so Docker's host forwarding can reach it; never attach untrusted
+containers or an externally shared network to this stack.
 
 The container entrypoint performs a one-time ownership migration on an existing
 root-owned data volume, then drops privileges to the `quaxar` user.
@@ -290,9 +306,12 @@ xrpl/                            xrpld/
                                   └── main/metrics
 ```
 
-The `xrpl` crates hold shared protocol and data structure foundations. The
-`quaxar` crates hold the node runtime, peer overlay, ledger acquisition, storage
-integration, RPC server, transaction engine, and operator command line.
+The `xrpl` crates hold shared protocol and data structure foundations. Runtime
+crates remain under the intentionally retained `xrpld/` source layout for
+side-by-side upstream comparison, while Cargo packages, binaries, services,
+configuration, environment variables, and metrics avoid `xrpld` product
+branding. Selected operator packages use `quaxar-*`; generic internal crates
+keep domain names such as `ledger`, `rpc`, and `server`.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 
@@ -301,7 +320,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 | Document | Purpose |
 | --- | --- |
 | [RUNNING.md](docs/RUNNING.md) | Installation, service setup, operations, and troubleshooting. |
-| [CONFIGURATION.md](docs/CONFIGURATION.md) | Complete runtime configuration reference. |
+| [CONFIGURATION.md](docs/CONFIGURATION.md) | Operator configuration reference. |
 | [CLI.md](docs/CLI.md) | Full command line reference. |
 | [SYNCING.md](docs/SYNCING.md) | Sync behavior, acquisition flow, and operator checks. |
 | [VALIDATORS.md](docs/VALIDATORS.md) | Validator identity, configuration, and operational guidance. |
@@ -311,7 +330,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 ## Contributing
 
 Contributions should follow the repository coding standards, test expectations,
-and Commitizen style commit messages. See [CONTRIBUTING.md](CONTRIBUTING.md)
+and Conventional Commits. See [CONTRIBUTING.md](CONTRIBUTING.md)
 before opening a pull request.
 
 ## License

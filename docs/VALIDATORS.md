@@ -57,6 +57,11 @@ Confirm that account with `systemctl show -p User --value quaxar.service` and
 retain config ownership/read permission for that user; do not blindly change
 the group to `quaxar` if it does not exist.
 
+Likewise, an upgraded host may still deliberately run `quaxar.service` under a
+legacy account until ownership is migrated. Check the unit's actual `User` and
+`Group`; never change the config or database owner while the service is
+running.
+
 Verify locally:
 
 ```bash

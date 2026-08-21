@@ -9,11 +9,11 @@ services:
       - "51235:51235"
     volumes:
       - quaxar-testnet-data:/var/lib/quaxar
-      - ${QUAXAR_TESTNET_CONFIG_FILE:-./quaxar-testnet.cfg}:/etc/quaxar/quaxar.cfg:ro
+      - ${QUAXAR_TESTNET_CONFIG_FILE:-./infra/docker/quaxar-testnet.cfg}:/etc/quaxar/quaxar.cfg:ro
     deploy:
       resources:
         limits:
-          memory: 8G
+          memory: 16G
     environment:
       - RUST_LOG=info,consensus=debug,inbound_ledger=debug,bootstrap=debug,overlay=info,app=info
 

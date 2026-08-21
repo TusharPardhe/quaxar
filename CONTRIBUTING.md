@@ -11,8 +11,11 @@ Thank you for your interest in contributing to the Rust XRPL node implementation
 ## Building
 
 ```bash
-# Full workspace build
+# Release node build
 just build
+
+# Full workspace check
+cargo check --workspace
 
 # Release build
 cargo build --release
@@ -46,7 +49,7 @@ cargo fmt --all
 
 ### Linting
 
-All clippy warnings are treated as errors in CI:
+The local command below is stricter than the current CI correctness-lint gate:
 
 ```bash
 cargo clippy --workspace --all-features -- -D warnings
@@ -116,8 +119,9 @@ Understanding which crate owns what helps you find the right place for changes:
 | `xrpl/shamap` | SHAMap trie (state and transaction trees) |
 | `xrpl/core` | Cryptography, key derivation, signing |
 | `xrpl/resource` | Load management and resource tracking |
-| `xrpld/acquisition` | Shared acquisition scheduling and mailbox primitives |
+| `xrpld/acquisition` | Typed coordinator, phase machine, sessions, retries and durable handoff |
 | `xrpld/app` | Application owner, bootstrap, NetworkOps, jobs, validator services |
+| `xrpld/core` | Port configuration, RPC status and SQLite state utilities (`quaxar-core`) |
 | `xrpld/consensus` | XRPL consensus protocol implementation |
 | `xrpld/ledger` | Ledger state, open/closed/validated lifecycle |
 | `xrpld/overlay` | P2P networking, peer message handling |
@@ -130,6 +134,15 @@ Understanding which crate owns what helps you find the right place for changes:
 | `xrpld/metrics` | Prometheus metrics (`quaxar-metrics` package) |
 | `xrpld/cli` | Operator commands (`quaxar-cli` package) |
 | `xrpld/main` | Bootstrap and `quaxar` binary (`quaxar-main` package) |
+
+`xrpld/rpc-integration-tests` is a test-only workspace member, not a runtime
+package.
+
+The `xrpld/` directory is intentionally retained for source comparison with
+upstream. Do not extend that historical name into new package names, binaries,
+services, configuration paths, environment variables, logs, or metrics; use
+the `quaxar` prefix at operator-facing boundaries. Keep `rippled` names in
+parity comments and compatible on-disk/wire contracts explicit.
 
 ## Where to Start
 
