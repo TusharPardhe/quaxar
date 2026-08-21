@@ -1367,9 +1367,9 @@ impl SessionPlan {
     fn refresh_pending_network(&mut self) {
         self.pending_network.clear();
         self.pending_network
-            .extend(self.retained_network.iter().map(PlanNetworkNeed::hash));
+            .extend(self.retained_network.iter().map(|need| need.hash()));
         self.pending_network
-            .extend(self.network_backlog.iter().map(PlanNetworkNeed::hash));
+            .extend(self.network_backlog.iter().map(|need| need.hash()));
     }
 
     fn normalize_retained_network_cursor(&mut self) {
