@@ -2127,8 +2127,9 @@ fn check_accept_and_advance(
         .published_ledger()
         .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
     root.try_advance_publication();
-    let published_after = root
-        .published_ledger()
+    let published_ledger_after = root.published_ledger();
+    let published_after = published_ledger_after
+        .as_ref()
         .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
     // Match rippled LedgerMaster::doAdvance: clear recovery only after this
     // pass actually publishes a newly found ledger, never merely because an
@@ -2159,13 +2160,17 @@ fn check_accept_and_advance(
     //
     // Rippled's `endConsensus` promotes Tracking to Full from current-open
     // freshness; it does not require publication to equal the newest LCL.
-    // Preserve the coordinator's typed invariant by forwarding an earlier
-    // publication only after proving it is a contiguous ancestor of the local
-    // LCL. A stale, forked, or forward publication never reaches the runner.
+    // Preserve the coordinator's typed invariant by forwarding a publication
+    // only after proving that it and the local LCL lie on the same chain. The
+    // publication can legitimately be ahead while the recovered local LCL is
+    // catching up; rejecting that case leaves Tracking unable to regain Full.
     if shared_inbound.coordinator_installed() {
-        if let (Some((hash, seq)), Some(closed)) = (published_after, root.closed_ledger())
-            && published_anchor_is_contiguous_to_lcl(closed.as_ref(), hash, seq)
+        if let (Some(published), Some(closed)) =
+            (published_ledger_after.as_ref(), root.closed_ledger())
+            && published_ledger_is_contiguous_with_lcl(closed.as_ref(), published.as_ref())
         {
+            let hash = *published.header().hash.as_uint256();
+            let seq = published.header().seq;
             let now_close_time = root.current_close_time_seconds();
             let fresh = root
                 .open_ledger()
@@ -2964,6 +2969,25 @@ fn published_anchor_is_contiguous_to_lcl(
         .is_some_and(|hash| *hash.as_uint256() == published_hash)
 }
 
+/// Prove bidirectional chain contiguity for a real published ledger. Unlike a
+/// hash-only recovery target, a publication ahead of the LCL carries enough
+/// ledger history to prove that the LCL is its ancestor.
+fn published_ledger_is_contiguous_with_lcl(
+    lcl: &ledger::Ledger,
+    published: &ledger::Ledger,
+) -> bool {
+    if published.header().seq <= lcl.header().seq {
+        return published_anchor_is_contiguous_to_lcl(
+            lcl,
+            *published.header().hash.as_uint256(),
+            published.header().seq,
+        );
+    }
+    published
+        .hash_of_seq(lcl.header().seq, &ledger::NullLedgerJournal)
+        .is_some_and(|hash| hash == lcl.header().hash)
+}
+
 /// Prove that a recovered coordinator target is the local LCL itself or a
 /// known ancestor. This witnesses the rippled `switchLastClosedLedger` /
 /// first accepted-child ordering before NetworkOps reports the actual LCL.
@@ -3039,10 +3063,10 @@ mod tests {
         MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, MAX_PROPOSALS_PER_TURN,
         PreferredLclReconciliation, drain_bounded, heartbeat_operating_mode_reassertion,
         history_acquire_allowed, history_fetch_pack_requested, persist_completed_inbound_ledger,
-        process_completed_inbound_ledger, reconcile_preferred_lcl,
-        reconcile_preferred_lcl_with_status_broadcaster, record_completed_inbound_ledger,
-        recovered_target_is_contiguous_to_lcl, required_peer_count,
-        same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
+        process_completed_inbound_ledger, published_ledger_is_contiguous_with_lcl,
+        reconcile_preferred_lcl, reconcile_preferred_lcl_with_status_broadcaster,
+        record_completed_inbound_ledger, recovered_target_is_contiguous_to_lcl,
+        required_peer_count, same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
         should_promote_operating_mode_at_end_consensus, should_reconcile_preferred_lcl,
         should_report_peer_availability, should_run_end_consensus_reconciliation,
         stabilized_preferred_recovery_target, switch_last_closed_ledger,
@@ -3086,9 +3110,23 @@ mod tests {
     }
 
     fn immutable_ledger_with_backing(seq: u32, parent_fill: u8, backed: bool) -> Arc<Ledger> {
+        immutable_ledger_with_parent_and_backing(
+            seq,
+            SHAMapHash::new(Uint256::from_array([parent_fill; 32])),
+            parent_fill,
+            backed,
+        )
+    }
+
+    fn immutable_ledger_with_parent_and_backing(
+        seq: u32,
+        parent_hash: SHAMapHash,
+        item_fill: u8,
+        backed: bool,
+    ) -> Arc<Ledger> {
         let mut header = LedgerHeader {
             seq,
-            parent_hash: SHAMapHash::new(Uint256::from_array([parent_fill; 32])),
+            parent_hash,
             close_time: seq.saturating_add(100),
             close_time_resolution: 30,
             ..LedgerHeader::default()
@@ -3100,7 +3138,7 @@ mod tests {
                 shamap::tree_node::SHAMapNodeType::AccountState,
                 shamap::item::SHAMapItem::new(
                     Uint256::from_u64(u64::from(seq)),
-                    vec![parent_fill; 128],
+                    vec![item_fill; 128],
                 ),
             )
             .expect("state entry should insert");
@@ -3121,6 +3159,16 @@ mod tests {
         );
         ledger.set_immutable(true);
         Arc::new(ledger)
+    }
+
+    #[test]
+    fn published_descendant_must_prove_the_lcl_as_its_ancestor() {
+        let lcl = immutable_ledger(10, 0x10);
+        let child = immutable_ledger_with_parent_and_backing(11, lcl.header().hash, 0x11, false);
+        assert!(published_ledger_is_contiguous_with_lcl(&lcl, &child));
+
+        let unrelated = immutable_ledger(11, 0x77);
+        assert!(!published_ledger_is_contiguous_with_lcl(&lcl, &unrelated));
     }
 
     fn install_test_node_store(root: &mut ApplicationRoot) -> TempDir {

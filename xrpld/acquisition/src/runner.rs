@@ -2365,36 +2365,35 @@ impl CoordinatorRunner {
 
     /// A publication advance. `Tracking -> Full` requires a fresh publication
     /// anchor whose contiguity to the tracked LCL has already been proven by
-    /// the NetworkOps adapter. The anchor may be an earlier ledger: rippled
+    /// the NetworkOps adapter. The anchor may be earlier or later: rippled
     /// `NetworkOPsImp::endConsensus` checks open-ledger freshness, not equality
     /// between the publication head and the newly installed LCL. While already
-    /// `Full`, a newer matching fresh publication refreshes the LCL/published
-    /// identities in place: normal local consensus must not emit a redundant
-    /// phase cycle. A non-fresh publication is a no-op in either case.
+    /// `Full`, a newer matching fresh publication refreshes the publication
+    /// head and incorporates any separately installed LCL in place: normal
+    /// local consensus must not emit a redundant phase cycle. A non-fresh
+    /// publication is a no-op in either case.
     fn on_publication(&mut self, identity: LedgerIdentity, fresh: bool) -> Vec<AcquisitionEffect> {
         match self.state.phase {
             SyncPhase::Full { lcl, published }
-                if fresh
-                    && self.state.last_installed_lcl == Some(identity)
-                    && identity.sequence() > lcl.sequence()
-                    && identity.sequence() > published.sequence() =>
+                if fresh && identity.sequence() > published.sequence() =>
             {
-                // This publication proves the next locally installed LCL is
-                // contiguous and fresh. Refresh Full's exact identities
-                // without routing through a visible intermediate mode. The
-                // exact LCL equality is the Rust-owned equivalent of rippled's
-                // endConsensus operating on its current closed ledger.
+                // The adapter proved the publication remains on the local
+                // chain. Advance the publication head without pretending that
+                // the local closed ledger has already caught up to it.
+                let installed_lcl = self
+                    .state
+                    .last_installed_lcl
+                    .filter(|installed| installed.sequence() <= identity.sequence())
+                    .unwrap_or(lcl);
                 self.state.phase = SyncPhase::Full {
-                    lcl: identity,
+                    lcl: installed_lcl,
                     published: identity,
                 };
                 Vec::new()
             }
-            // NetworkOps only emits this fact after proving that `identity`
-            // is the tracked LCL or a contiguous published ancestor. The
-            // sequence guard makes a newer or unrelated publication harmless
-            // even if an adapter regresses.
-            SyncPhase::Tracking { lcl } if fresh && identity.sequence() <= lcl.sequence() => {
+            // NetworkOps only emits this fact after proving bidirectional
+            // contiguity between `identity` and the tracked LCL.
+            SyncPhase::Tracking { lcl } if fresh => {
                 let fact = TransitionFact::ChainContiguous {
                     lcl,
                     published: identity,
@@ -6574,7 +6573,7 @@ mod tests {
     }
 
     #[test]
-    fn full_identity_refresh_requires_the_exact_local_lcl_fact() {
+    fn full_publication_advances_without_claiming_a_new_local_lcl() {
         let mut runner = CoordinatorRunner::with_phase(
             RunEpoch::new(1),
             SyncPhase::Full {
@@ -6583,7 +6582,8 @@ mod tests {
             },
         );
 
-        // A publication by itself never authorizes a Full identity jump.
+        // The adapter has proven ledger 10 is a descendant of the local LCL.
+        // Advance only the publication identity until LclInstalled catches up.
         let effects = runner.handle_event(AcquisitionEvent::PublicationCommitted {
             identity: identity(10),
             fresh: true,
@@ -6593,15 +6593,15 @@ mod tests {
             runner.phase(),
             &SyncPhase::Full {
                 lcl: identity(9),
-                published: identity(9),
+                published: identity(10),
             }
         );
 
-        // The same fresh publication updates Full only after NetworkOps has
-        // supplied the exact serialized local-LCL fact.
+        // A later exact local-LCL fact is retained for the next publication
+        // refresh without causing a visible Full -> Tracking cycle.
         let _ = runner.handle_event(AcquisitionEvent::LclInstalled(identity(10)));
         let effects = runner.handle_event(AcquisitionEvent::PublicationCommitted {
-            identity: identity(10),
+            identity: identity(11),
             fresh: true,
         });
         assert!(effects.is_empty());
@@ -6609,7 +6609,7 @@ mod tests {
             runner.phase(),
             &SyncPhase::Full {
                 lcl: identity(10),
-                published: identity(10),
+                published: identity(11),
             }
         );
     }
@@ -6642,14 +6642,6 @@ mod tests {
                 .get(&CancelReason::LclInstalled),
             Some(&1)
         );
-
-        // A newer chain head cannot be a contiguous published anchor for the
-        // tracked LCL and is ignored.
-        let effects = runner.handle_event(AcquisitionEvent::PublicationCommitted {
-            identity: identity(99),
-            fresh: true,
-        });
-        assert!(effects.is_empty());
 
         // A stale (non-fresh) publication never promotes Tracking -> Full even
         // for the matching chain head; the coordinator owns the freshness gate.
@@ -6694,6 +6686,29 @@ mod tests {
             vec![AcquisitionEffect::SetServicePhase(SyncPhase::Full {
                 lcl: identity(10),
                 published: identity(9),
+            })]
+        );
+    }
+
+    #[test]
+    fn fresh_contiguous_published_descendant_ahead_of_lcl_promotes_full() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        acquire(&mut runner, 10);
+        let _ = runner.handle_event(AcquisitionEvent::LclInstalled(identity(10)));
+
+        // NetworkOps proved that published ledger 12 names local LCL 10 as an
+        // ancestor. Rippled's Full gate is current-open freshness, so the
+        // publication being ahead while the local LCL catches up is valid.
+        let effects = runner.handle_event(AcquisitionEvent::PublicationCommitted {
+            identity: identity(12),
+            fresh: true,
+        });
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Full {
+                lcl: identity(10),
+                published: identity(12),
             })]
         );
     }
