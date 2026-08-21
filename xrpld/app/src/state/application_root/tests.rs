@@ -30,14 +30,14 @@ use protocol::{
     AccountID, BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, KeyType, LedgerEntryType,
     Rules, STAmount, STArray, STLedgerEntry, STObject, STTx, SecretKey, SeqProxy, StBase, Ter,
     TxType, account_keylet, calc_account_id, derive_public_key, fee_settings_keylet,
-    get_field_by_symbol, ticket_keylet_from_seq_proxy,
+    get_field_by_symbol, negative_unl_keylet, ticket_keylet_from_seq_proxy,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
 use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::traversal::TraversalError;
-use shamap::tree_node::SHAMapNodeType;
-use std::collections::BTreeMap;
+use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tx::ApplyResult;
@@ -2781,7 +2781,8 @@ fn refresh_validator_trust_propagates_unl_block_and_clear_to_network_ops() {
     let lcl = Ledger::from_ledger_seq_and_close_time(1, app.current_close_time_seconds(), false);
 
     app.set_unl_blocked(true);
-    app.refresh_validator_trust_for_consensus(&lcl);
+    app.refresh_validator_trust_for_consensus(&lcl)
+        .expect("empty NegativeUNL read should succeed");
     assert!(!app.unl_blocked());
 
     let publisher_secret = SecretKey::from_bytes([0x5A; 32]);
@@ -2790,9 +2791,45 @@ fn refresh_validator_trust_propagates_unl_block_and_clear_to_network_ops() {
         app.validators()
             .load(None, &[], &[publisher.to_hex()], None)
     );
-    app.refresh_validator_trust_for_consensus(&lcl);
+    app.refresh_validator_trust_for_consensus(&lcl)
+        .expect("empty NegativeUNL read should succeed");
     assert!(app.validators().unl_blocked());
     assert!(app.unl_blocked());
+}
+
+#[test]
+fn refresh_validator_trust_retains_negative_unl_when_parent_node_is_missing() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let validator_secret = SecretKey::from_bytes([0x6B; 32]);
+    let validator =
+        derive_public_key(KeyType::Ed25519, &validator_secret).expect("validator public key");
+    app.validators()
+        .set_negative_unl(HashSet::from([validator.clone()]));
+
+    let root = basics::intrusive_pointer::make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let branch = usize::from(negative_unl_keylet().key.data()[0] >> 4);
+    let missing = SHAMapHash::new(Uint256::from_array([0xB6; 32]));
+    root.set_child_hash(branch, missing);
+    root.update_hash();
+    let lcl = Ledger::from_maps(
+        LedgerHeader {
+            seq: 2,
+            close_time: app.current_close_time_seconds(),
+            ..LedgerHeader::default()
+        },
+        SyncTree::from_root_with_type(root, SHAMapType::State, true, 2, SyncState::Immutable),
+        SyncTree::new_with_type(SHAMapType::Transaction, true, 2),
+    );
+
+    assert!(matches!(
+        app.refresh_validator_trust_for_consensus(&lcl),
+        Err(TraversalError::MissingNode(hash)) if hash == missing
+    ));
+    assert_eq!(
+        app.validators().get_negative_unl(),
+        HashSet::from([validator]),
+        "a failed parent read must not install an empty NegativeUNL"
+    );
 }
 
 #[test]

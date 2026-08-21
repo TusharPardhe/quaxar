@@ -2509,9 +2509,23 @@ impl ConsensusRunner for AppConsensus {
         // explicitly designed for `prev_ledger_id` to name an unavailable
         // preferred target and will enter WrongLedger/GetConsL1 as needed.
         let lcl = prev_ledger.ledger();
-        self.adaptor
+        if let Err(error) = self
+            .adaptor
             .app_root
-            .refresh_validator_trust_for_consensus(lcl.as_ref());
+            .refresh_validator_trust_for_consensus(lcl.as_ref())
+        {
+            // rippled lets MissingNode propagate out of Ledger::negativeUNL.
+            // Preserve the prior exclusion set and do not start a round with
+            // quorum inputs that could not be read from the parent ledger.
+            tracing::error!(
+                target: "consensus",
+                ledger_hash = %lcl.header().hash,
+                ledger_seq = lcl.header().seq,
+                ?error,
+                "consensus round not started: failed to read parent ledger NegativeUNL"
+            );
+            return;
+        }
 
         if self.adaptor.validators.count() > 0 && self.adaptor.validators.unl_size() == 0 {
             self.adaptor.network_ops_mode_owner.set_unl_blocked(true);

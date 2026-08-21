@@ -1171,11 +1171,13 @@ impl CoordinatorRunner {
         //
         // Ordinary consensus demand is not authoritative for the global phase
         // target, but it still owns active per-hash acquisition work.
-        let ordinary_consensus_with_preferred = reason == AcquireReason::Consensus
-            && !preferred_target
-            && self.state.sessions.values().any(|state| {
-                state.reason == AcquireReason::Consensus && state.phase == SessionPhase::Active
-            });
+        // `latest_consensus_target` remains authoritative through durable
+        // completion until the matching LCL-install fact arrives. Do not let
+        // any non-authoritative Consensus/Generic/History demand overwrite its
+        // phase merely because the preferred session has already terminalized.
+        // The demand still gets its independent per-hash session below.
+        let ordinary_demand_with_preferred =
+            !preferred_target && self.state.latest_consensus_target.is_some();
         let same_hash = self.live_sessions_for_hash(target.hash());
         let exact = same_hash.iter().copied().find(|session| {
             self.state
@@ -1207,7 +1209,7 @@ impl CoordinatorRunner {
         } else {
             None
         };
-        let replaceable: Vec<SessionRef> = if !ordinary_consensus_with_preferred
+        let replaceable: Vec<SessionRef> = if !ordinary_demand_with_preferred
             && exact.is_none()
             && promotion.is_none()
             && hash_only_coalesce.is_none()
@@ -1328,12 +1330,17 @@ impl CoordinatorRunner {
         if would_exceed {
             if preferred_target {
                 self.state.deferred_consensus_acquire = Some(target);
-                let fact = TransitionFact::TargetRequired { target };
-                if let Ok(next) = self.state.phase.apply(fact)
-                    && next != self.state.phase
-                {
-                    self.state.phase = next;
-                    effects.push(AcquisitionEffect::SetServicePhase(next));
+                if !matches!(
+                    self.state.phase,
+                    SyncPhase::Tracking { .. } | SyncPhase::Full { .. }
+                ) {
+                    let fact = TransitionFact::TargetRequired { target };
+                    if let Ok(next) = self.state.phase.apply(fact)
+                        && next != self.state.phase
+                    {
+                        self.state.phase = next;
+                        effects.push(AcquisitionEffect::SetServicePhase(next));
+                    }
                 }
                 tracing::info!(
                     target: "acquisition_trace",
@@ -1365,13 +1372,26 @@ impl CoordinatorRunner {
             && target.sequence().is_none()
             && matches!(self.state.phase, SyncPhase::Full { .. });
 
-        // Phase transition next: Connected/Syncing/Tracking/Full -> Syncing.
-        // A coalesced promotion updates the phase target without minting a
-        // second session; an exact duplicate is otherwise a phase no-op.
+        // Generic/history demands, and initial Connected recovery, may require
+        // Syncing directly. Once an LCL is installed, consensus target
+        // selection is phase-neutral: it says which hash to fetch, not that
+        // the installed LCL is wrong. NetworkOps emits the separate
+        // `PreferredLclDivergence` fact only after its serialized
+        // checkLastClosedLedger path proves an actionable mismatch. This keeps
+        // ordinary next-ledger acquisition from turning a correct Tracking or
+        // Full node back into `needNetworkLedger`.
         let phase_target = hash_only_coalesce
             .and_then(|session| self.state.sessions.get(&session).map(|state| state.target))
             .unwrap_or(target);
-        if !defer_hash_only_consensus_probe && !ordinary_consensus_with_preferred {
+        let preserve_installed_lcl = preferred_target
+            && matches!(
+                self.state.phase,
+                SyncPhase::Tracking { .. } | SyncPhase::Full { .. }
+            );
+        if !preserve_installed_lcl
+            && !defer_hash_only_consensus_probe
+            && !ordinary_demand_with_preferred
+        {
             let fact = TransitionFact::TargetRequired {
                 target: phase_target,
             };
@@ -4763,6 +4783,52 @@ mod tests {
     }
 
     #[test]
+    fn terminal_preferred_target_keeps_phase_ownership_until_lcl_install() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let preferred = target(10);
+        let session =
+            peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+                ConsensusTarget::new(preferred, AcquireReason::Consensus),
+            )));
+        // Model the post-handoff-ack interval: the acquisition is terminal but
+        // its exact target intentionally remains authoritative until
+        // NetworkOps reports LclInstalled.
+        runner
+            .state
+            .sessions
+            .get_mut(&session)
+            .expect("preferred session")
+            .phase = SessionPhase::Complete;
+        assert_eq!(runner.state.latest_consensus_target, Some(preferred));
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: preferred });
+
+        for (target, reason) in [
+            (target(20), AcquireReason::Consensus),
+            (target(30), AcquireReason::Generic),
+        ] {
+            let effects =
+                runner.handle_event(AcquisitionEvent::AcquireRequested { target, reason });
+            assert!(effects.iter().all(|effect| !matches!(
+                effect,
+                AcquisitionEffect::SetServicePhase(SyncPhase::Syncing { target })
+                    if *target != preferred
+            )));
+            assert_eq!(runner.phase(), &SyncPhase::Syncing { target: preferred });
+        }
+
+        let installed = LedgerIdentity::new(preferred.hash(), 10);
+        let effects = runner.handle_event(AcquisitionEvent::LclInstalled(installed));
+        assert!(
+            effects.contains(&AcquisitionEffect::SetServicePhase(SyncPhase::Tracking {
+                lcl: installed,
+            }))
+        );
+        assert_eq!(runner.state.latest_consensus_target, None);
+        assert_eq!(runner.phase(), &SyncPhase::Tracking { lcl: installed });
+    }
+
+    #[test]
     fn ordinary_consensus_request_cannot_reactivate_an_old_dormant_preferred_target() {
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         connect(&mut runner);
@@ -6365,6 +6431,44 @@ mod tests {
                 published: identity(9)
             })]
         );
+    }
+
+    #[test]
+    fn ordinary_preferred_target_after_lcl_install_does_not_demote_tracking() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let installed = identity(9);
+        let _ = runner.handle_event(AcquisitionEvent::LclInstalled(installed));
+        assert_eq!(runner.phase(), &SyncPhase::Tracking { lcl: installed });
+
+        let next = target(10);
+        let effects = runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+            next,
+            AcquireReason::Consensus,
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            AcquisitionEffect::SessionStarted(session) if session.target_hash() == next.hash()
+        )));
+        assert!(effects.iter().all(|effect| !matches!(
+            effect,
+            AcquisitionEffect::SetServicePhase(SyncPhase::Syncing { .. })
+        )));
+        assert_eq!(
+            runner.phase(),
+            &SyncPhase::Tracking { lcl: installed },
+            "ordinary next-ledger fetch is not a needNetworkLedger fact",
+        );
+
+        let effects =
+            runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: next });
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Syncing {
+                target: next,
+            })],
+        );
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: next });
     }
 
     #[test]

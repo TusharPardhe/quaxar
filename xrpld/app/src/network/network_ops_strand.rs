@@ -1977,6 +1977,14 @@ fn switch_last_closed_ledger(
     ledger: Arc<ledger::Ledger>,
     status_broadcaster: &SwitchedLedgerStatusBroadcaster,
 ) {
+    // A completed inbound ledger may still carry only its acquisition-time
+    // tree graph. Backed immutable SHAMaps are allowed to release weak child
+    // nodes and reload them from NodeStore, so attach the durable fetch seam
+    // before the switch path performs any ledger reads (TxQ/NegativeUNL,
+    // open-ledger rebuild, or checkAccept). `on_closed_ledger` also normalizes
+    // its stored slot, but it runs after those consumers and is therefore too
+    // late for the first read after an LCL jump.
+    let ledger = root.ledger_with_node_fetcher(ledger);
     let new_hash = *ledger.header().hash.as_uint256();
     debug_assert_eq!(new_hash, target);
     let new_seq = ledger.header().seq;
@@ -2628,6 +2636,13 @@ fn process_completed_inbound_ledger(
     reason: AcquireReason,
     acknowledge_registry: bool,
 ) -> CompletionPersistence {
+    // Publish one canonical ledger object through every completion consumer.
+    // If persistence alone inserts a fetcher-normalized clone while
+    // checkAccept/validation paths keep the acquisition Arc, a later cache
+    // canonicalization can replace the durable readable object with a backed
+    // ledger that has no NodeStore fetch seam. That first becomes visible when
+    // switchLastClosedLedger reads NegativeUNL or another weak child.
+    let ledger = root.ledger_with_node_fetcher(ledger);
     let persisted = persist_completed_inbound_ledger(root, lm, &ledger, reason);
     // Match rippled's completed-ledger handoff: make the ledger
     // resolver-visible before evaluating validation quorum. The adaptor-local
@@ -2685,17 +2700,11 @@ fn persist_completed_inbound_ledger(
     ledger: &Arc<ledger::Ledger>,
     reason: AcquireReason,
 ) -> CompletionPersistence {
-    // A structurally complete inbound consensus/generic ledger arrives with
-    // its cache-only fetcher already attached. Keep that in-memory resolver
-    // path intact until the independent NodeStore durability barrier finishes;
-    // replacing it here with a NodeStore fetcher would reintroduce the exact
-    // persistence gate this handoff intentionally removes.
-    let normalized = match reason {
-        AcquireReason::Consensus | AcquireReason::Generic if ledger.has_node_fetcher() => {
-            Arc::clone(ledger)
-        }
-        _ => root.ledger_with_node_fetcher(Arc::clone(ledger)),
-    };
+    // The completion boundary normalized this exact Arc once before any
+    // persistence, validation, or acceptance consumer observed it. Preserve
+    // that identity so later canonicalization cannot reintroduce a no-fetcher
+    // version of the same backed ledger.
+    let normalized = Arc::clone(ledger);
     match reason {
         // `InboundLedger::done` calls `storeLedger` for generic and consensus
         // acquisitions. It preserves the header's existing validated state
@@ -3030,12 +3039,13 @@ mod tests {
         MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, MAX_PROPOSALS_PER_TURN,
         PreferredLclReconciliation, drain_bounded, heartbeat_operating_mode_reassertion,
         history_acquire_allowed, history_fetch_pack_requested, persist_completed_inbound_ledger,
-        reconcile_preferred_lcl, reconcile_preferred_lcl_with_status_broadcaster,
-        record_completed_inbound_ledger, recovered_target_is_contiguous_to_lcl,
-        required_peer_count, same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
+        process_completed_inbound_ledger, reconcile_preferred_lcl,
+        reconcile_preferred_lcl_with_status_broadcaster, record_completed_inbound_ledger,
+        recovered_target_is_contiguous_to_lcl, required_peer_count,
+        same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
         should_promote_operating_mode_at_end_consensus, should_reconcile_preferred_lcl,
         should_report_peer_availability, should_run_end_consensus_reconciliation,
-        stabilized_preferred_recovery_target,
+        stabilized_preferred_recovery_target, switch_last_closed_ledger,
     };
     use crate::consensus::rcl_consensus::{ConsensusRunner, PendingAcceptWork, RclCxLedger};
     use crate::consensus::rcl_cx_peer_pos::RclCxPeerPos;
@@ -3072,6 +3082,10 @@ mod tests {
     use tempfile::TempDir;
 
     fn immutable_ledger(seq: u32, parent_fill: u8) -> Arc<Ledger> {
+        immutable_ledger_with_backing(seq, parent_fill, false)
+    }
+
+    fn immutable_ledger_with_backing(seq: u32, parent_fill: u8, backed: bool) -> Arc<Ledger> {
         let mut header = LedgerHeader {
             seq,
             parent_hash: SHAMapHash::new(Uint256::from_array([parent_fill; 32])),
@@ -3095,7 +3109,7 @@ mod tests {
             shamap::sync::SyncTree::from_root_with_type(
                 state_tree.root(),
                 shamap::sync::SHAMapType::State,
-                false,
+                backed,
                 seq,
                 shamap::sync::SyncState::Immutable,
             ),
@@ -3107,6 +3121,156 @@ mod tests {
         );
         ledger.set_immutable(true);
         Arc::new(ledger)
+    }
+
+    fn install_test_node_store(root: &mut ApplicationRoot) -> TempDir {
+        let dir = TempDir::new().expect("temporary node store");
+        let mut config = BasicConfig::new();
+        config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+        let node_db = config.section_mut("node_db");
+        node_db.set("type", "Memory");
+        node_db.set("path", dir.path().join("node").to_string_lossy());
+        let store = crate::bootstrap_shamap_store(
+            &config,
+            false,
+            128,
+            1,
+            8,
+            64,
+            2,
+            &ManagerImp::new(),
+            Arc::new(DummyScheduler) as Arc<dyn Scheduler>,
+            Arc::new(NullJournal),
+        )
+        .expect("memory node store");
+        root.attach_node_store(Some(store.node_store));
+        dir
+    }
+
+    #[test]
+    fn preferred_lcl_switch_attaches_fetcher_before_first_consumer() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        root.attach_default_ledger_master_runtime();
+        let _store_dir = install_test_node_store(&mut root);
+        let local = immutable_ledger(10, 0x10);
+        let target = immutable_ledger_with_backing(12, 0x20, true);
+        let target_hash = *target.header().hash.as_uint256();
+        assert!(target.state_map().backed());
+        assert!(!target.has_node_fetcher());
+        root.on_closed_ledger(local);
+
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let inbound = Arc::new(InboundLedgers::new(
+            Arc::new(TreeNodeCache::new(
+                "network-ops-switch-fetcher",
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            Arc::new(FullBelowCacheImpl::new(
+                1,
+                MonotonicClock::default(),
+                HardenedHashBuilder::default(),
+                8,
+            )),
+            Arc::new(FetchPackCache::new(
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            completed_tx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let mut runner = RecordingRunner::accepted(*target.header().parent_hash.as_uint256());
+        let consensus_rt = AppConsensusRuntime::new();
+        let mut last_round = None;
+        let observed_fetcher = Arc::new(AtomicBool::new(false));
+        let observed_fetcher_for_callback = Arc::clone(&observed_fetcher);
+        let broadcaster = move |_root: &ApplicationRoot,
+                                ledger: &Ledger,
+                                _event: i32,
+                                _have_correct_lcl: bool| {
+            observed_fetcher_for_callback.store(
+                ledger.has_node_fetcher(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        };
+
+        switch_last_closed_ledger(
+            &root,
+            &inbound,
+            &mut runner,
+            &consensus_rt,
+            &mut last_round,
+            target_hash,
+            target,
+            &broadcaster,
+        );
+
+        assert!(observed_fetcher.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            root.closed_ledger()
+                .expect("switched closed ledger")
+                .has_node_fetcher()
+        );
+        inbound.stop();
+    }
+
+    #[test]
+    fn completed_inbound_ledger_publishes_one_fetcher_normalized_arc() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let runtime = root.attach_default_ledger_master_runtime();
+        let _store_dir = install_test_node_store(&mut root);
+        let completed = immutable_ledger_with_backing(12, 0x20, true);
+        let hash = *completed.header().hash.as_uint256();
+        assert!(completed.state_map().backed());
+        assert!(!completed.has_node_fetcher());
+
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let inbound = Arc::new(InboundLedgers::new(
+            Arc::new(TreeNodeCache::new(
+                "network-ops-completion-fetcher",
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            Arc::new(FullBelowCacheImpl::new(
+                1,
+                MonotonicClock::default(),
+                HardenedHashBuilder::default(),
+                8,
+            )),
+            Arc::new(FetchPackCache::new(
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            completed_tx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let persisted = process_completed_inbound_ledger(
+            &root,
+            runtime.ledger_master().as_ref(),
+            &inbound,
+            "test",
+            hash,
+            1,
+            completed,
+            AcquireReason::Consensus,
+            false,
+        );
+        assert!(persisted.acknowledged);
+        let cached = runtime
+            .ledger_master()
+            .ledger_history()
+            .get_cached_ledger_by_hash(SHAMapHash::new(hash))
+            .expect("completed ledger should be resolver-visible");
+        assert!(
+            cached.has_node_fetcher(),
+            "completion consumers must not replace the canonical readable ledger with the acquisition Arc",
+        );
+        inbound.stop();
     }
 
     #[test]

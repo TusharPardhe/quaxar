@@ -2550,13 +2550,15 @@ impl Ledger {
         Ok(())
     }
 
-    pub fn negative_unl(&self) -> HashSet<[u8; 33]> {
+    /// Read the disabled-validator set without erasing SHAMap traversal errors.
+    /// Consensus callers must use this strict form because a missing node is
+    /// not equivalent to an absent NegativeUNL entry.
+    pub fn try_negative_unl(&self) -> Result<HashSet<[u8; 33]>, TraversalError> {
         let sf_disabled_validators = get_field_by_symbol("sfDisabledValidators");
         let sf_public_key = get_field_by_symbol("sfPublicKey");
 
-        self.read(negative_unl_keylet())
-            .ok()
-            .flatten()
+        Ok(self
+            .read(negative_unl_keylet())?
             .filter(|sle| sle.is_field_present(sf_disabled_validators))
             .map(|sle| {
                 sle.get_field_array(sf_disabled_validators)
@@ -2567,7 +2569,12 @@ impl Ledger {
                     })
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default())
+    }
+
+    /// Best-effort NegativeUNL access for non-consensus display callers.
+    pub fn negative_unl(&self) -> HashSet<[u8; 33]> {
+        self.try_negative_unl().unwrap_or_default()
     }
 
     pub fn validator_to_disable(&self) -> Option<[u8; 33]> {

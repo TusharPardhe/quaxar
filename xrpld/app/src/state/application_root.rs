@@ -6820,9 +6820,12 @@ impl ApplicationRoot {
     /// Refresh NegativeUNL and trusted-validator state before every consensus
     /// round. This is the shared `NetworkOPs::beginConsensus` prelude: the
     /// selected LCL supplies both its NegativeUNL and its close time.
-    pub(crate) fn refresh_validator_trust_for_consensus(&self, lcl: &Ledger) {
+    pub(crate) fn refresh_validator_trust_for_consensus(
+        &self,
+        lcl: &Ledger,
+    ) -> Result<(), shamap::traversal::TraversalError> {
         let negative_unl = lcl
-            .negative_unl()
+            .try_negative_unl()?
             .into_iter()
             .map(PublicKey::from_bytes)
             .collect();
@@ -6848,7 +6851,7 @@ impl ApplicationRoot {
         // trusted key set, so synchronize before this early return.
         self.set_unl_blocked(self.validators.unl_blocked());
         if trust_changes.added.is_empty() && trust_changes.removed.is_empty() {
-            return;
+            return Ok(());
         }
 
         let added = trust_changes
@@ -6874,6 +6877,7 @@ impl ApplicationRoot {
             .trust_changed(&added, &removed);
         self.amendment_status
             .set_trusted_validators(self.validators.get_quorum_keys().1);
+        Ok(())
     }
 
     /// Apply a validator-list collection from an owned site or a peer-facing
