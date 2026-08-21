@@ -52,7 +52,7 @@ configuration may still change as parity work continues.
 | Area | Current support |
 | --- | --- |
 | Protocol | XRP Ledger serialization, field definitions, amendments, transaction models, and SHAMap support. |
-| Ledger sync | Parallel ledger acquisition, shared fetch cache, NuDB persistence, snapshot export/import, and configurable acquisition limits. |
+| Ledger sync | Parallel coalesced per-hash acquisition, one shared NodeFamily cache family, reusable verified SHAMap nodes, NuDB persistence, snapshot export/import, and bounded execution resources. |
 | Storage | NuDB node store with bulk import mode, streaming export, and RocksDB configuration surfaces where implemented. |
 | RPC | HTTP and WebSocket JSON RPC with public and admin command handling. |
 | Transactions | Core payment, account, trust line, NFT, AMM, MPT, vault, lending, queue, and invariant paths under active parity coverage. |
@@ -131,10 +131,17 @@ docker compose up -d
 Docker Compose mounts `infra/docker/quaxar.cfg` into the container at
 `/etc/quaxar/quaxar.cfg`. That container-only config listens on all container
 interfaces while Compose publishes admin ports only on host loopback. Its
-branded `quaxar-data` mount deliberately retains the common legacy
-`quaxar_xrpld-data` volume identity so ordinary upgrades reuse that database.
-Fresh installations can select a clean name with
-`QUAXAR_DATA_VOLUME=quaxar-data`. Do not mount an old
+logical mount is `quaxar-data`, while the default physical volume deliberately
+retains the common legacy `quaxar_xrpld-data` identity so an ordinary upgrade
+does not attach an empty database. A confirmed fresh installation can opt into
+the clean physical name:
+
+```bash
+export QUAXAR_DATA_VOLUME=quaxar-data
+docker compose up -d
+```
+
+Do not mount an old
 `xrpld.cfg` verbatim: its data/log paths and relative validator-file references
 belong to the legacy container layout. Start from the new Docker config, merge
 the protected credentials/settings, and select that reviewed file:
@@ -153,10 +160,12 @@ container path and update the setting. Validate the final config before the
 upgrade and keep the original config as a protected rollback artifact.
 
 Before an upgrade, use `docker volume ls` to confirm the exact old physical
-volume name and set `QUAXAR_DATA_VOLUME` if it differs from
-`quaxar_xrpld-data`. Admin scope is unrestricted inside the default Compose
-network so Docker's host forwarding can reach it; never attach untrusted
-containers or an externally shared network to this stack.
+volume name and set `QUAXAR_DATA_VOLUME` if it differs from the compatibility
+default. Never select `quaxar-data` merely to rename an existing volume; copy
+and verify data through a planned migration instead. Admin scope is
+unrestricted inside the default Compose network so Docker's host forwarding
+can reach it; never attach untrusted containers or an externally shared
+network to this stack.
 
 The container entrypoint performs a one-time ownership migration on an existing
 root-owned data volume, then drops privileges to the `quaxar` user.
@@ -285,6 +294,8 @@ ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
 
 `node_size` is the recommended primary tuning setting. It controls the default
 resource profile for acquisition, cache sizing, and runtime concurrency.
+`ledger_history = full` requires `[node_db] online_delete = 0`; with online
+deletion enabled, numeric history cannot exceed the deletion interval.
 
 The repository includes a small runnable `quaxar.cfg`. See
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the operator configuration
@@ -325,9 +336,16 @@ NetworkOps owns the independently moving preferred-LCL policy. The typed
 coordinator preserves a stable recovery anchor while per-hash acquisitions
 continue, and tracks canonical local and contiguous publication identities
 without coupling ordinary cache acquisition to public operating mode.
+NetworkOps forwards installed, chain-contiguous publication observations
+independently of freshness. A fresh non-divergent observation promotes
+`tracking` to `full`; once full, newer contiguous identities remain observable
+even on a non-promoting pass.
 Payment flow shares one AMM context across reverse/forward strand evaluation so
 only the selected strand advances multipath AMM iteration state; AMM liquidity
-is evaluated before CLOB execution at each book quality.
+is evaluated before CLOB execution at each book quality. Issued-currency
+execution uses spendable `accountHolds` orientation, and direct self-cross
+cancellation follows the reference funding/quality/authorization callback
+order so speculative strand handling cannot change the canonical ledger hash.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 

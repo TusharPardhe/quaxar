@@ -411,11 +411,12 @@ impl<A: ValidationsAdaptor> Inner<A> {
                 self.acquiring.remove(&key);
             }
         }
-        if let Some(last) = self.last_ledger.get(node_id)
-            && last.id() == val.ledger_id()
-        {
+        // `last_ledger` is the signer's newest available support and may be
+        // an older, superseded validation while the current validation is
+        // still acquiring. Staleness or UNL removal retracts all support for
+        // the signer, not only an exact current-validation hash.
+        if let Some(last) = self.last_ledger.remove(node_id) {
             self.trie.remove(last.id(), last.seq(), 1);
-            self.last_ledger.remove(node_id);
         }
     }
 
@@ -543,6 +544,113 @@ impl<A: ValidationsAdaptor> Validations<A> {
 
     pub fn adaptor(&self) -> &A {
         &self.adaptor
+    }
+
+    /// Reconcile a ledger that has just become available to the validation
+    /// tracker.
+    ///
+    /// `check_acquired` normally services the validators still waiting on an
+    /// exact `(sequence, id)` acquisition. A validator can issue its next
+    /// validation before that acquisition completes, however, and
+    /// `update_trie_validation` then removes the superseded waiter. Retain the
+    /// reference behavior of keeping that validator's newest *available*
+    /// ledger in the trie by consulting the historical `by_ledger` set too.
+    /// A late older completion never replaces newer resident support.
+    pub fn on_ledger_acquired(&self, ledger: A::Ledger) {
+        let ledger_id = ledger.id();
+        let ledger_seq = ledger.seq();
+        let key = (ledger_seq, ledger_id.clone());
+        let mut inner = self.inner.lock();
+        let _ = inner.current_live(&self.adaptor, &self.parms);
+
+        let mut nodes = inner.acquiring.remove(&key).unwrap_or_default();
+        if let Some(retained) = inner.by_ledger.get(&ledger_id) {
+            nodes.extend(retained.iter().filter_map(|(node_id, validation)| {
+                let current = inner.current.get(node_id)?;
+                // `add` indexes a message in `by_ledger` before the final
+                // current sign-time comparison. A rejected stale message can
+                // therefore remain historical, but must never become trie
+                // support when its ledger arrives later. Formerly accepted
+                // support is necessarily no newer than the signer's accepted
+                // current validation in both sequence and signing time.
+                (validation.trusted()
+                    && current.trusted()
+                    && validation.seq() <= current.seq()
+                    && validation.sign_time() <= current.sign_time())
+                .then(|| node_id.clone())
+            }));
+        }
+
+        for node_id in nodes {
+            // Historical support is useful only while the signer's latest
+            // validation remains current and trusted. `trust_changed` keeps
+            // both current and retained entries synchronized, but checking
+            // current here also protects against stale retained sets.
+            let current_is_trusted = inner
+                .current
+                .get(&node_id)
+                .is_some_and(|validation| validation.trusted());
+            if !current_is_trusted {
+                continue;
+            }
+
+            let advances_resident = inner
+                .last_ledger
+                .get(&node_id)
+                .is_none_or(|resident| resident.seq() < ledger_seq);
+            if advances_resident {
+                inner.update_trie_ledger(&node_id, ledger.clone());
+            }
+        }
+    }
+
+    /// Retract an acquired ledger that is no longer resolver-visible.
+    ///
+    /// This is the inverse of [`Self::on_ledger_acquired`] for provisional
+    /// completed ledgers whose durability fence later fails. Exact-hash trie
+    /// support is removed and every affected signer's current trusted
+    /// validation is resolved again or returned to `acquiring`.
+    ///
+    /// The adaptor must stop returning `ledger_id` before this method is
+    /// called.
+    pub fn on_ledger_unacquired(&self, ledger_id: &LedgerIdOf<A>) -> usize {
+        let mut inner = self.inner.lock();
+        let _ = inner.current_live(&self.adaptor, &self.parms);
+        let affected: Vec<NodeIdOf<A>> = inner
+            .last_ledger
+            .iter()
+            .filter(|(_, ledger)| ledger.id() == *ledger_id)
+            .map(|(node_id, _)| node_id.clone())
+            .collect();
+
+        for node_id in &affected {
+            if let Some(resident) = inner.last_ledger.remove(node_id) {
+                inner.trie.remove(resident.id(), resident.seq(), 1);
+            }
+
+            let Some(current) = inner
+                .current
+                .get(node_id)
+                .filter(|validation| validation.trusted())
+                .cloned()
+            else {
+                continue;
+            };
+            let current_key = (current.seq(), current.ledger_id());
+            if let Some(waiters) = inner.acquiring.get_mut(&current_key) {
+                waiters.insert(node_id.clone());
+            } else if let Some(replacement) = self.adaptor.acquire(&current.ledger_id()) {
+                inner.update_trie_ledger(node_id, replacement);
+            } else {
+                inner
+                    .acquiring
+                    .entry(current_key)
+                    .or_default()
+                    .insert(node_id.clone());
+            }
+        }
+
+        affected.len()
     }
 
     pub fn parms(&self) -> &ValidationParms {
@@ -1172,6 +1280,9 @@ mod tests {
         fn register_ledger(&self, ledger: MockLedger) {
             self.ledgers.borrow_mut().insert(ledger.id(), ledger);
         }
+        fn unregister_ledger(&self, ledger_id: LedgerId) -> bool {
+            self.ledgers.borrow_mut().remove(&ledger_id).is_some()
+        }
     }
 
     impl ValidationsAdaptor for MockAdaptor {
@@ -1347,6 +1458,146 @@ mod tests {
         let v = val(child.id(), 1, 1000, 1, 100);
         assert_eq!(validations.add(1, v), ValStatus::Current);
         assert_eq!(validations.size_of_current_cache(), 1);
+    }
+
+    #[test]
+    fn acquired_superseded_validation_restores_resident_support_until_newer_arrives() {
+        let adaptor = MockAdaptor::new(1000);
+        let genesis = MockLedger::genesis_();
+        let first = genesis.child(1);
+        let second = first.child(2);
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(first.id(), first.seq(), 1000, 1, 100)),
+            ValStatus::Current
+        );
+        assert_eq!(
+            validations.add(1, val(second.id(), second.seq(), 1001, 1, 100)),
+            ValStatus::Current
+        );
+        assert_eq!(
+            validations.add(2, val(first.id(), first.seq(), 1000, 2, 200)),
+            ValStatus::Current
+        );
+        assert_eq!(
+            validations.add(2, val(second.id(), second.seq(), 1001, 2, 200)),
+            ValStatus::Current
+        );
+        {
+            let inner = validations.inner.lock();
+            assert!(inner.last_ledger.is_empty());
+            assert!(!inner.acquiring.contains_key(&(first.seq(), first.id())));
+            assert!(inner.acquiring.contains_key(&(second.seq(), second.id())));
+        }
+
+        validations.adaptor().register_ledger(first.clone());
+        validations.on_ledger_acquired(first.clone());
+        {
+            let inner = validations.inner.lock();
+            assert_eq!(
+                inner.last_ledger.get(&1).map(ValidationsLedger::id),
+                Some(first.id())
+            );
+            assert_eq!(
+                inner.last_ledger.get(&2).map(ValidationsLedger::id),
+                Some(first.id())
+            );
+            assert!(inner.acquiring.contains_key(&(second.seq(), second.id())));
+        }
+
+        validations.adaptor().register_ledger(second.clone());
+        validations.on_ledger_acquired(second.clone());
+        let inner = validations.inner.lock();
+        assert_eq!(
+            inner.last_ledger.get(&1).map(ValidationsLedger::id),
+            Some(second.id())
+        );
+        assert_eq!(
+            inner.last_ledger.get(&2).map(ValidationsLedger::id),
+            Some(second.id())
+        );
+        assert!(inner.acquiring.is_empty());
+    }
+
+    #[test]
+    fn late_older_acquisition_never_downgrades_newer_resident_support() {
+        let adaptor = MockAdaptor::new(1000);
+        let genesis = MockLedger::genesis_();
+        let first = genesis.child(1);
+        let second = first.child(2);
+        adaptor.register_ledger(first.clone());
+        adaptor.register_ledger(second.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(first.id(), first.seq(), 1000, 1, 100)),
+            ValStatus::Current
+        );
+        assert_eq!(
+            validations.add(1, val(second.id(), second.seq(), 1001, 1, 100)),
+            ValStatus::Current
+        );
+        validations.on_ledger_acquired(first);
+
+        let inner = validations.inner.lock();
+        assert_eq!(
+            inner.last_ledger.get(&1).map(ValidationsLedger::id),
+            Some(second.id())
+        );
+    }
+
+    #[test]
+    fn acquired_rejected_stale_validation_never_enters_resident_support() {
+        let adaptor = MockAdaptor::new(1000);
+        let genesis = MockLedger::genesis_();
+        let current = genesis.child(1);
+        let rejected = current.child(2);
+        adaptor.register_ledger(current.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(current.id(), current.seq(), 1000, 1, 100)),
+            ValStatus::Current
+        );
+        assert_eq!(
+            validations.add(1, val(rejected.id(), rejected.seq(), 999, 1, 100)),
+            ValStatus::Stale
+        );
+
+        validations.adaptor().register_ledger(rejected.clone());
+        validations.on_ledger_acquired(rejected);
+        let inner = validations.inner.lock();
+        assert_eq!(
+            inner.last_ledger.get(&1).map(ValidationsLedger::id),
+            Some(current.id())
+        );
+    }
+
+    #[test]
+    fn unacquired_resident_retracts_support_and_requeues_current_validation() {
+        let adaptor = MockAdaptor::new(1000);
+        let genesis = MockLedger::genesis_();
+        let child = genesis.child(1);
+        adaptor.register_ledger(child.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(child.id(), child.seq(), 1000, 1, 100)),
+            ValStatus::Current
+        );
+        assert!(validations.adaptor().unregister_ledger(child.id()));
+        assert_eq!(validations.on_ledger_unacquired(&child.id()), 1);
+
+        let inner = validations.inner.lock();
+        assert!(inner.last_ledger.is_empty());
+        assert_eq!(
+            inner
+                .acquiring
+                .get(&(child.seq(), child.id()))
+                .map(HashSet::len),
+            Some(1)
+        );
     }
 
     #[test]

@@ -41,6 +41,15 @@ Preferred-LCL and acquisition changes also require focused regressions for a
 stable recovery anchor under a moving tip, same-hash sequence refinement,
 reuse of behind-tip completions, in-place LCL/publication advancement,
 actionable Full demotion, and sustained recovery without mode flapping.
+Test publication forwarding separately from freshness/promotion: Tracking
+records the identity when a fresh observation promotes it to Full, while an
+already-Full phase must accept newer contiguous identities on non-promoting
+passes.
+
+Consensus-critical payment and offer changes require reference-oriented tests,
+including both canonical trust-line account orderings, typed missing-line zero,
+fully and partially funded offers, worse-than-limit self offers, equal-quality
+self cancellation, and the boundary between first and second book qualities.
 
 ## Code Style
 
@@ -155,7 +164,8 @@ Good first contributions:
 
 - **Add missing RPC handlers** — Look at `xrpld/rpc/src/` for the pattern, then implement a missing method
 - **Improve test coverage** — Run `cargo llvm-cov` and find uncovered paths
-- **Documentation** — Add doc comments to public APIs in any crate
+- **Documentation** — Keep operator and architecture references aligned with
+  the implemented ownership and lifecycle boundaries
 - **CLI commands** — Add new diagnostic commands to the interactive CLI
 - **Error messages** — Improve error context with `thiserror` or better `tracing` spans
 
@@ -164,7 +174,6 @@ Look for issues labeled `good first issue` in the issue tracker.
 ## Getting Help
 
 - Open a GitHub Discussion for questions
-- Check [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design context
 - Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before changing runtime ownership or ledger flow
 - Preserve the shared per-flow AMM context across reverse and forward book
   passes; candidate strands must not commit AMM iteration state unless selected

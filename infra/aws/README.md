@@ -3,7 +3,9 @@
 `provision-testnet.sh` creates one persistent Quaxar public testnet node in
 `us-east-1`. It deliberately uses the normal (non-spot) `m7i.xlarge` profile:
 4 vCPUs and 16 GiB RAM are a suitable non-burstable host for Quaxar's
-`[node_size] medium` profile, whose acquisition concurrency defaults to four.
+`[node_size] medium` profile. Acquisition execution is independently bounded
+by its worker pool and ready scheduler; session count is not a four-target
+configuration limit.
 
 ## Design
 
@@ -68,6 +70,9 @@ The bootstrap RPC check proves local service reachability, not completion of
 ledger synchronization. Before enabling validator operation, repeatedly
 confirm local closed/current, validated, published, and coordinator phase
 identities advance together without recurring mode transitions.
+Initial RSS growth reflects reusable shared SHAMap/cache population, not
+readiness by itself; a small bootstrap ledger can advance locally until the
+current network LCL is complete and installed.
 
 ```bash
 ssh -i ~/.ssh/quaxar-testnet-2026.pem ubuntu@<elastic-ip> \

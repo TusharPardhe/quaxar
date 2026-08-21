@@ -2538,8 +2538,8 @@ fn process_coordinator_completed_inbound_ledger(
     );
     // The bridge only enqueues the typed event after the recipient accepted
     // this exact durable record. It deliberately does not install an LCL or
-    // publish a ledger, and it does not run coordinator work while this
-    // completed-ledger receiver lock is held.
+    // publish a ledger: the next accepted-boundary reconciliation recomputes
+    // current preference before applying switch policy.
     if persisted.acknowledged {
         let acknowledgement_enqueued =
             shared_inbound.acknowledge_coordinator_durable_handoff(handoff, session);

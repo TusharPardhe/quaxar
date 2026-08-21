@@ -22,7 +22,7 @@ disconnected -> connected -> syncing -> tracking -> full
 - `tracking`: the node has a recent validated chain and is following closes,
   but has not yet satisfied every readiness gate.
 - `full`: the canonical local closed ledger is current, and validated and
-  published heads are advancing contiguously within the readiness bounds.
+  published heads are advancing coherently within the readiness bounds.
 - `proposing`: a configured validator is current and participating after the
   full-readiness, trust/quorum, clock, and validation gates pass. Whether
   other operators trust it is a separate validator-list decision.
@@ -31,6 +31,13 @@ An actionable branch change can legitimately produce
 `full -> syncing -> tracking -> full`. Repeated flapping, growing local-closed
 versus validated lag, a static coordinator identity, or acquisitions that
 continually reset require investigation.
+
+On an empty database, Quaxar may temporarily close a small bootstrap chain
+while the preferred network ledger's state tree is still being assembled. In
+that interval `server_state` can remain `connected`, local sequence numbers are
+not network progress, and consensus diagnostics report a wrong LCL. Readiness
+starts only after a complete preferred ledger is installed and the canonical
+validated/published chain begins advancing.
 
 ## Current-ledger acquisition
 
@@ -42,33 +49,51 @@ continually reset require investigation.
 4. Each map consults the shared NodeFamily/tree cache, fetch-pack cache, and
    NodeStore before requesting missing nodes from peers.
 5. Peer replies are validated by hash and inserted into the incomplete tree.
-   Partial trees remain reusable across retries.
+   A retained session preserves its exact frontier across retries; after
+   cleanup, verified nodes remain reusable through shared caches and storage.
 6. Once both maps are complete, immutable, and match their roots, the ledger is
-   persisted and handed back through the coordinator's durable completion
-   path.
-7. NetworkOps installs a complete, current-compatible recovery anchor, then
-   re-evaluates the latest preferred policy. LedgerMaster applies validation
+   published by exact hash to history and validation residency, persisted, and
+   handed back through the coordinator's durable completion path. A later
+   trusted validation can supersede the waiter without discarding this newest
+   available resident support; durability failure retracts provisional support.
+7. At the serialized accepted boundary, NetworkOps recomputes current
+   preference and installs only the complete, current-compatible preferred
+   ledger. LedgerMaster then applies validation
    gates and advances validated/publication state in sequence.
 
 A hash-only anchor is refined only by a verified header for that same hash;
 later hash-only observations cannot discard its sequence. Installing it moves
-the coordinator to `tracking`, and a fresh contiguous publication permits
-`full`. Subsequent accepted closes and publications advance the phase's LCL and
-published identities independently. The independent
+the coordinator to `tracking`. A published head may be ahead of or behind the
+installed LCL; proof that both lie on the same chain plus fresh current-open
+timing permits `full`. Subsequent accepted closes and publications advance the
+phase's LCL and published identities independently. The independent
 `need_network_ledger` startup/recovery latch clears only after an authoritative
 LCL switch or full-ledger publication, not merely because a fetch completed.
 
-The active-acquisition limit controls concurrent targets, not the number of
-tree nodes retained. `[node_size]` controls tree-cache capacity and age,
-maintenance cadence, the adjacent history-fetch window, and selected JobQueue
-defaults.
+Publication observations and mode promotion are deliberately separate.
+NetworkOps forwards a chain-contiguous LedgerMaster publication once an LCL is
+installed. In `tracking`, only a non-divergent observation with fresh
+open-ledger timing promotes to `full` and records the published identity. Once
+`full`, newer contiguous publication identities are recorded even on a
+non-promoting pass.
+
+Per-hash demand is coalesced while bounded schedulers, worker pools, read
+brokers, mailboxes, and outbound credits control execution. The number of
+coordinator session identities is not an operator-configured `node_size`
+limit. `[node_size]` controls tree-cache capacity and age, maintenance cadence,
+the adjacent history-fetch window, and selected JobQueue defaults.
+An acquisition session can expire or be replaced without erasing its verified
+nodes: the registry is short-lived ownership, while NodeFamily and NodeStore
+are reusable storage. During an empty-database catch-up, RSS commonly rises as
+these shared caches fill and can later level off or fall after age/size sweeps.
 
 ## Preferred-ledger changes
 
 The preferred hash can change while a node catches up. NetworkOps updates that
 moving policy and acquisition priority while the coordinator preserves the
 active recovery anchor. Older and newer sessions may finish independently;
-their valid nodes and partial trees remain reusable. After the stable anchor is
+retained sessions keep their frontiers and cleaned-up sessions still contribute
+verified nodes through shared caches and storage. After the stable anchor is
 installed, NetworkOps reconciles the current preferred policy again. A header
 or completed tree alone never authorizes installation or publication.
 
@@ -100,6 +125,12 @@ transitions. A single `full` or
 it varies with `[node_size]`, cache occupancy, allocator behavior, history, and
 network activity. Judge progress primarily by completed maps, advancement of
 the validated/published sequence, and stable state transitions.
+
+During initial acquisition, distinguish cache growth from completion. Rising
+RSS and NodeStore writes show useful work but do not prove either root is
+complete. Conversely, a bounded RSS plateau is normal after the cache profile
+reaches steady state. Require a current canonical LCL plus consecutive
+validated and published advances.
 
 For logs, temporarily raise the relevant partition and restore it afterward:
 

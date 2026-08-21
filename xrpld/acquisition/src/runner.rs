@@ -837,15 +837,14 @@ impl CoordinatorRunner {
     }
 
     fn has_viable_target_work(&self, target: LedgerTarget) -> bool {
-        self.state.sessions.values().any(|session| {
-            !matches!(
-                session.phase,
-                SessionPhase::Failed { .. } | SessionPhase::Cancelled { .. }
-            ) && session.target.hash() == target.hash()
-        }) || self
-            .state
-            .deferred_consensus_acquire
-            .is_some_and(|deferred| deferred.hash() == target.hash())
+        self.state
+            .sessions
+            .values()
+            .any(|session| !session.phase.is_terminal() && session.target.hash() == target.hash())
+            || self
+                .state
+                .deferred_consensus_acquire
+                .is_some_and(|deferred| deferred.hash() == target.hash())
             || self
                 .state
                 .deferred_acquires
@@ -8878,6 +8877,11 @@ mod tests {
             runner.session(session).expect("live").phase(),
             SessionPhase::Complete
         ));
+        let completed_target = runner.session(session).expect("retained terminal").target();
+        assert!(
+            !runner.has_viable_target_work(completed_target),
+            "an acknowledged terminal session must not pin a Syncing anchor"
+        );
         assert_eq!(runner.snapshot().sessions_completed(), 1);
     }
 

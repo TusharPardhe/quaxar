@@ -1389,8 +1389,16 @@ fn run_start_mode_consensus_loop(
     // History material follows its separately validated persistence path.
     if let Some(lm_rt) = lm_rt_for_shared_inbound.as_ref() {
         let ledger_master = lm_rt.ledger_master();
+        let root = runtime.root().clone();
         shared_inbound.set_completed_ledger_store(Arc::new(move |ledger| {
-            ledger_master.ledger_history().insert(ledger, false);
+            // Publish one normalized ledger instance to both early exact-hash
+            // consumers. A fast next validation can otherwise supersede the
+            // only waiter before this completion reaches the validation trie.
+            let ledger = root.ledger_with_node_fetcher(ledger);
+            ledger_master
+                .ledger_history()
+                .insert(Arc::clone(&ledger), false);
+            root.validations().register_ledger(&ledger);
         }));
         let root = runtime.root().clone();
         shared_inbound.set_completed_ledger_revoker(Arc::new(move |identity| {

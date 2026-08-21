@@ -100,6 +100,14 @@ current directory. The supported server configuration path uses its
 are not yet documented as production-compatible with `rippled`; see
 [VALIDATORS.md](VALIDATORS.md).
 
+`fetch-info` exposes two related but distinct facts. NetworkOps forwards an
+installed, chain-contiguous publication independently of freshness, but a
+Tracking phase records it only when a fresh, non-divergent observation promotes
+the phase to Full. Once Full, newer contiguous identities are recorded even on
+a non-promoting pass. During initial catch-up, session expiry or replacement
+does not imply its verified SHAMap nodes were discarded; pair this command with
+`get-counts` and repeated ledger-head samples.
+
 ## RPC Port Auto-Discovery
 
 The CLI automatically finds the RPC port by:

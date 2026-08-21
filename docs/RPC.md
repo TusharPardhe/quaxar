@@ -92,11 +92,21 @@ identities, per-hash sessions, completion and cancellation counters, and the
 last recovery-LCL decision. Pair it with `get_counts` when diagnosing SHAMap
 cache or NodeStore behavior.
 
+NetworkOps forwards an installed, chain-contiguous LedgerMaster publication
+independently of freshness. While Tracking, the coordinator records it only
+when the freshness proof permits `Tracking -> Full`; once Full, newer
+contiguous identities are recorded even on a non-promoting pass. Session
+removal is likewise not evidence of cache loss: verified immutable nodes live
+in the shared NodeFamily/NodeStore lifecycle.
+
 `server_state` is the NetworkOps operating mode exposed to operators. It is
 informed by, but is not identical to, the acquisition coordinator's internal
 phase; validator `proposing` is layered on top of full synchronization. Both
 are point-in-time views. Readiness requires repeated evidence that local
 closed, validated, published, and coordinator identities advance coherently.
+An empty database can temporarily report a small bootstrap `closed_ledger`
+while acquiring the network tree; do not compare that sequence to public
+network progress until the current LCL is installed.
 
 ### Account lookup
 

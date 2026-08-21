@@ -110,6 +110,84 @@ sudo apt install libssl-dev pkg-config
 - **Low-memory machines:** Use `CARGO_BUILD_JOBS=2` to limit parallelism
 - **Faster linking:** `.cargo/config.toml` contains commented examples. Install `clang` and `lld` before enabling the stanza for your target.
 
+### Checksum-staged service deployment
+
+For a Linux host that already has `quaxar.service`, build the exact clean
+checkout with all available CPUs and incremental artifacts disabled. Run the
+build as the checkout owner, not as root:
+
+```bash
+set -euo pipefail
+
+cd /srv/quaxar/src/quaxar
+test -z "$(git status --porcelain)"
+jobs=$(nproc)
+CARGO_BUILD_JOBS="$jobs" CARGO_INCREMENTAL=0 \
+  cargo build --release --jobs "$jobs" -p quaxar-main
+test -x target/release/quaxar
+sha256sum target/release/quaxar
+```
+
+Validate the intended configuration with the newly built binary before the
+restart. Then checksum-stage that same binary, atomically replace the live
+symlink, and restart only the existing unit:
+
+```bash
+set -euo pipefail
+
+repo=/srv/quaxar/src/quaxar
+config=/etc/quaxar/quaxar.cfg
+stage_dir=/srv/quaxar/stage
+live_link=/opt/quaxar/bin/quaxar
+binary="$repo/target/release/quaxar"
+commit=$(git -C "$repo" rev-parse --short=12 HEAD)
+stage="$stage_dir/quaxar.$commit"
+previous=$(readlink -f "$live_link")
+
+test -x "$previous"
+systemctl cat quaxar.service >/dev/null
+unit_user=$(systemctl show -p User --value quaxar.service)
+unit_group=$(systemctl show -p Group --value quaxar.service)
+unit_user=${unit_user:-root}
+if test -z "$unit_group"; then
+  unit_group=$(id -gn "$unit_user")
+fi
+sudo -u "$unit_user" -g "$unit_group" -- "$binary" --conf "$config" config
+expected=$(sha256sum "$binary" | awk '{print $1}')
+sudo install -o "$unit_user" -g "$unit_group" -m 0755 "$binary" "$stage"
+actual=$(sha256sum "$stage" | awk '{print $1}')
+test "$actual" = "$expected"
+
+sudo ln -sfn "$stage" "${live_link}.new"
+sudo mv -Tf "${live_link}.new" "$live_link"
+sudo systemctl restart quaxar.service
+
+pid=$(systemctl show -p MainPID --value quaxar.service)
+test "$pid" -gt 0
+test "$(sha256sum "$(readlink -f "$live_link")" | awk '{print $1}')" = "$expected"
+echo "rollback=$previous"
+```
+
+The procedure resolves ownership from the existing unit, including upgraded
+hosts that still run under a legacy account. After restart, sample
+`server_info`, `fetch_info`, local closed hashes, validated/published
+advancement, RSS, and the journal across several closes. Keep the prior staged
+path as the rollback target; do not declare readiness from process liveness or
+memory growth alone.
+If post-restart validation fails, atomically repoint the symlink and restart
+the same unit:
+
+```bash
+set -euo pipefail
+
+live_link=/opt/quaxar/bin/quaxar
+previous='/srv/quaxar/stage/quaxar.REPLACE_WITH_PRINTED_COMMIT'
+test -x "$previous"
+sudo ln -sfn "$previous" "${live_link}.rollback"
+sudo mv -Tf "${live_link}.rollback" "$live_link"
+sudo systemctl restart quaxar.service
+```
+
 ## Configuration
 
 Use the repository `quaxar.cfg` as the default starting point. The following is
@@ -272,6 +350,7 @@ quaxar ledger-closed
 quaxar ledger-current
 quaxar server-info
 quaxar fetch-info
+quaxar get-counts
 ```
 
 Or via RPC:
@@ -281,6 +360,12 @@ curl -s http://127.0.0.1:5005 -d '{"method":"server_info"}' | jq .result.info.se
 ```
 
 A non-validator node normally progresses through `connected`, `syncing`, `tracking`, and `full`; it must not enter `proposing` without validator credentials.
+
+On a fresh database, an early small local ledger sequence is only the bootstrap
+chain. The process can consume substantial RAM while the shared NodeFamily
+fills from partial state trees and still remain unready. Require installation
+of a current network LCL and consecutive canonical validated/published
+advances; neither a target RSS nor one `full` sample is a readiness test.
 
 ### System Time
 
@@ -398,7 +483,7 @@ alternative sync methods.
 | OOM during sync | Cache/workload exceeds available memory | Select a smaller `[node_size]`, reduce competing workloads, or add RAM |
 | RocksDB build segfault | GCC OOM during compilation | `sudo apt install librocksdb-dev` or `CARGO_BUILD_JOBS=1` |
 | OpenSSL build failure | Missing system OpenSSL | `sudo apt install libssl-dev pkg-config` |
-| Node stuck in "connected" | Validator list not loading | Ensure `[validators_file]` points to valid file, or add `[validator_list_sites]` directly to config |
+| Node stuck in "connected" | No suitable current LCL has been installed | Check peers and trust data, preferred target, coordinator sessions/phase, `last_recovery_lcl_decision`, recovery latch, and current-open freshness |
 | Slow sync | Slow storage, limited bandwidth, or unstable peers | Use fast SSD storage and verify sustained network throughput and peer stability |
 | Full/proposing repeatedly returns to syncing | Preferred-LCL reconciliation is not converging | Compare repeated local closed, validated, published, and coordinator phase identities; capture mode-transition logs and `last_recovery_lcl_decision` |
 | Validated advances while local closed/coordinator LCL lags | Local consensus or recovery-anchor state is stale | Capture `server_info`, `ledger-closed`, `fetch-info`, session counters, and a redacted config; do not treat RAM growth as proof of correctness |

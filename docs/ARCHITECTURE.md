@@ -53,12 +53,18 @@ peer messages and local transactions
           v
     complete immutable state and transaction SHAMaps
           v
-    durable completion handoff -> NetworkOps LCL reconciliation
+    structural completion -> history + validation-trie residency
+          v
+    durable completion handoff -> accepted-boundary NetworkOps LCL reconciliation
           |
+          v
+    installed LCL and current open-ledger view
+          v
+    consensus builds child -> NetworkOps accepts close
           v
     LedgerMaster: validated -> published
           v
-    consensus, RPC views, history, relational metadata
+    RPC views, history, relational metadata
 ```
 
 The acquisition coordinator serializes typed events into phase transitions and
@@ -67,13 +73,17 @@ latest preferred-LCL policy is separate moving state and may prioritize another
 per-hash acquisition without replacing that anchor. Only a verified header for
 the same hash may refine a hash-only anchor with its sequence. The coordinator
 also owns retry policy, durable completion handoff, and per-hash session
-lifecycle. Older sessions may finish after policy advances; their partial
-SHAMaps and fetched nodes remain reusable through shared caches and NodeStore.
+lifecycle. A retained session keeps its traversal plan and exact frontier
+across timeouts and deferred I/O. After cancellation or terminal cleanup the
+actor-owned plan may be released, but verified hash-canonical nodes remain
+reusable through the shared tree cache, fetch pack, and NodeStore.
 
 NetworkOps owns the closed-ledger/LCL switch and reconciles it with the latest
 preferred-ledger policy. LedgerMaster owns validation acceptance plus validated
-and published advancement; publication advances in sequence and does not
-silently cross an unresolved gap. The application/NetworkOps
+and published advancement. Ordinary bounded gaps publish sequentially and do
+not skip a missing intermediate; first publication or an excessive gap may
+snap directly to the validated tip, with a large gap logged. The
+application/NetworkOps
 `need_network_ledger` startup/recovery latch is independent from the
 coordinator's visible phase and clears only on an authoritative LCL switch or
 full-ledger publication. Accepted local closes and contiguous publications
@@ -82,6 +92,15 @@ is installed, ordinary Consensus, Generic, and History acquisitions are
 phase-neutral; only a serialized actionable preferred-LCL divergence demotes
 Tracking or Full. During recovery, historical acquisition is subordinate to
 acquiring and publishing the current validated chain.
+
+The published identity is a fact observed from LedgerMaster, not itself a mode
+transition. NetworkOps forwards an installed, chain-contiguous published head
+to the coordinator even when the current open-ledger timing is stale. The
+separate `fresh` bit is true only on a non-divergent end-consensus pass with a
+fresh open-ledger parent. It may promote `tracking` to `full`; it does not gate
+publication identity updates for a node that is already `full`. Keeping these
+meanings separate prevents stale coordinator status without letting background
+maintenance manufacture readiness.
 
 See [SYNCING.md](SYNCING.md) for the operator-visible state transitions.
 
@@ -104,6 +123,22 @@ ordering and ownership rules are consensus-critical: changing them can produce
 a different transaction result and ledger hash even when the same offers and
 pool balances are present.
 
+Issued-currency helpers preserve the reference distinction between
+`creditBalance` and spendable `accountHolds`. `creditBalance` is oriented as
+credit from the queried account and carries that account as issuer;
+`accountHolds` is oriented as the account's spendable balance and carries the
+asset issuer. Payment, DirectStep, BookStep, and AMM execution use the
+spendable form. A missing trust line returns a typed zero in the same asset
+orientation instead of an untyped numeric zero.
+
+Direct OfferCreate crossing follows the reference callback order within a book
+quality: establish funding and same-quality eligibility, cancel an eligible
+self-cross, check authorization, then apply the general quality threshold. A
+self offer is cancelled only when both strand endpoints are its owner and its
+quality meets the taker's limit; a worse self offer remains on the book. The
+cancellation is accumulated outside speculative strand state so it survives a
+later dry-strand result without exposing candidate-state side effects.
+
 ## Storage and caches
 
 - `NodeStore` persists immutable ledger objects, normally in NuDB.
@@ -119,6 +154,12 @@ pool balances are present.
 Cache limits and sweep cadence derive primarily from `[node_size]`. Normal
 closed-ledger advancement does not clear the NodeFamily. Periodic application
 maintenance performs bounded sweeping based on cache age and size.
+Per-hash acquisition expiry removes registry/session ownership only; it does
+not discard valid immutable nodes already admitted to the shared caches or
+NodeStore. A later target can therefore complete from earlier partial work.
+Online-delete rotation freshens tree and transaction cache keys, clears prior
+LedgerMaster caches and then clears FullBelow state. A complete NodeFamily
+reset is reserved for ordered shutdown.
 
 ## Networking and trust
 
@@ -177,6 +218,11 @@ When changing the runtime, preserve these invariants:
    advances independently only on the proven contiguous chain.
 9. Full requires coherent advancing LCL/publication state, not merely a
    completed acquisition.
+10. Tracking records publication when freshness authorizes Full promotion;
+    once Full, newer contiguous identities update independently of freshness.
+11. Consensus-critical balance orientation and self-cross callback ordering
+    must match the reference call sites, not only produce equivalent-looking
+    amounts in isolated tests.
 
 For behavior-parity changes, compare the corresponding `rippled` owner and
 call sequence, not just the shape of an individual function.

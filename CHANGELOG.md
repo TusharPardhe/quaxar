@@ -13,15 +13,28 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
   strand, a typed acquisition coordinator, preferred-ledger retargeting,
   durable exact-identity handoff, an independent startup/recovery latch, and
   the NetworkOps-to-LedgerMaster promotion boundary.
-- Retain and reuse incomplete SHAMaps through the shared NodeFamily, tree,
-  fetch-pack, negative, full-below, and NodeStore caches.
+- Preserve live acquisition traversal plans across deferred work and reuse
+  verified nodes through the shared NodeFamily tree cache, fetch pack, and
+  NodeStore after individual per-hash sessions finish or expire.
+- Decoupled factual coordinator publication identity from the fresh
+  end-consensus proof used for `tracking` to `full` promotion, while preserving
+  contiguous-chain checks and updates for an already-full node.
+- Restored the reference distinction between issued-currency `creditBalance`
+  and spendable `accountHolds`, including canonical account orientation and
+  typed zero amounts for absent trust lines.
+- Matched direct OfferCreate self-cross callback ordering and quality gates so
+  eligible self offers are cancelled without deleting worse-than-limit offers
+  or leaking speculative strand state.
 - Migrated operator-facing packages, binaries, metrics, environment variables,
   configuration paths, containers, and services from `xrpld` branding to
   Quaxar while retaining `xrpld/` as the source comparison layout and the
-  legacy Docker volume identity for data-safe upgrades.
+  legacy Docker physical-volume default as a data-safe upgrade exception.
 - Validator key generation now emits XRPL node-public/node-private encodings, a
   family validation seed, RFC-1751 words, and a protected non-overwriting
   `validator-keys.json`.
+- Validator token, local sign, and revocation helpers remain experimental even
+  though earlier releases exposed those commands; `[validation_seed]` is the
+  currently documented operational path.
 - Updated operator and contributor documentation for the current architecture,
   synchronization states, validator setup, CLI, RPC, and deployment paths.
 - Made AWS provisioning refuse legacy in-place state before service/data/config

@@ -13,6 +13,11 @@ closed-ledger and validated advancement, bounded lag, a coherent coordinator
 phase, and no recurring Full/Syncing cycle. Keep RPC and WebSocket
 administration on a private interface or SSH tunnel.
 
+Do not enable validation merely because initial acquisition filled the expected
+RAM or briefly reported `full`. Confirm several consecutive local closed hashes
+belong to the network's validated chain and that publication continues without
+mode churn.
+
 ## Generate an identity
 
 Run this once in a private directory:
@@ -22,8 +27,8 @@ umask 077
 quaxar validator-keys generate
 ```
 
-The command creates `validator-keys.json` with mode `0600` and refuses to
-overwrite an existing file. It contains:
+On supported Unix platforms, the command creates `validator-keys.json` with
+mode `0600` and refuses to overwrite an existing file. It contains:
 
 - `validation_public_key`: XRPL node-public key beginning with `n`
 - `validation_private_key`: XRPL node-private key beginning with `p`
@@ -43,6 +48,15 @@ Store the generated `validation_seed` in the service config:
 ```ini
 [validation_seed]
 <secret-family-seed>
+```
+
+Record the generated public `n...` identity separately if it is needed for
+operator registration. Never copy the private key, seed, RFC-1751 words, or
+complete JSON file into documentation or logs. Validate the protected config
+before restarting:
+
+```bash
+quaxar --conf /etc/quaxar/quaxar.cfg config
 ```
 
 For the dedicated `User=quaxar` service described in [RUNNING.md](RUNNING.md),

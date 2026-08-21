@@ -243,21 +243,25 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
     /// hook, called wherever the node processes a newly built or acquired
     /// ledger.
     pub fn register_ledger(&self, ledger: &ledger::Ledger) {
-        self.inner
+        let validated_ledger = RclValidatedLedger::from_ledger(ledger);
+        let validations = self
+            .inner
             .lock()
-            .expect("shared app validations mutex must not be poisoned")
-            .adaptor()
-            .register_ledger(ledger);
+            .expect("shared app validations mutex must not be poisoned");
+        validations.adaptor().register_ledger(ledger);
+        validations.on_ledger_acquired(validated_ledger);
     }
 
     /// Retract a provisional resolver ledger after its NodeStore durability
     /// fence failed, so validation ancestry lookup cannot retain it.
     pub fn unregister_ledger(&self, hash: basics::base_uint::Uint256) -> bool {
-        self.inner
+        let validations = self
+            .inner
             .lock()
-            .expect("shared app validations mutex must not be poisoned")
-            .adaptor()
-            .unregister_ledger(hash)
+            .expect("shared app validations mutex must not be poisoned");
+        let removed = validations.adaptor().unregister_ledger(hash);
+        validations.on_ledger_unacquired(&hash);
+        removed
     }
 
     /// Return the preferred-LCL decision together with sampled diagnostic

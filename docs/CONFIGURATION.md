@@ -68,19 +68,27 @@ Selects the resource profile. This is the recommended primary tuning knob.
 medium
 ```
 
-Profiles currently map to history-prefetch and cache defaults:
+Profiles currently map to these NodeFamily and history defaults:
 
-| Size | Adjacent history fetch window | Intended use |
-|------|-----------------------------|--------------|
-| `tiny` | `2` | Small/dev machines. |
-| `small` | `3` | Light nodes. |
-| `medium` | `4` | Default balanced profile. |
-| `large` | `5` | Stronger machines. |
-| `huge` | `8` | High-throughput machines with ample memory and fast disk. |
+| Size | Tree-node target | Node age | Sweep | Adjacent history | Intended use |
+|------|-----------------:|---------:|------:|-----------------:|--------------|
+| `tiny` | 262,144 | 30s | 10s | 2 | Small/dev machines. |
+| `small` | 524,288 | 60s | 30s | 3 | Light nodes. |
+| `medium` | 2,097,152 | 90s | 60s | 4 | Default balanced profile. |
+| `large` | 4,194,304 | 120s | 90s | 5 | Stronger machines. |
+| `huge` | 8,388,608 | 900s | 120s | 8 | High-throughput machines with ample memory and fast disk. |
 
 The profile also influences SHAMap tree-cache size and age, sweep cadence, the
 adjacent history-fetch window, and selected JobQueue defaults. Prefer changing
 `node_size` before using expert overrides.
+
+The tree-node target is an entry target, not a byte or hard-RSS limit. One
+application-owned NodeFamily supplies the same tree-node and FullBelow caches
+to every inbound acquisition. Verified nodes survive per-hash session expiry
+and remain reusable until ordinary cache policy or online deletion removes
+them; execution-scheduler limits do not resize this cache.
+The FullBelow cache target is 524,288 entries with a 600-second expiration for
+all profiles.
 
 Cache profile and RAM use affect retention and performance, not preferred-LCL
 correctness. Do not increase `node_size` to mask repeated mode transitions or
@@ -100,8 +108,16 @@ Configures persistent ledger object storage.
 | `type` | Storage backend, commonly `NuDB` or `RocksDB`. |
 | `path` | Filesystem path for the node database. |
 | `nudb_block_size` | Optional NuDB block size. |
-| `online_delete` | Number of ledgers to retain before online deletion. |
-| `advisory_delete` | Whether deletion requires explicit advisory control. |
+| `online_delete` | Retention interval; `0` disables online deletion. Minimum `256` on a networked node and `8` in standalone mode. |
+| `advisory_delete` | When enabled, deletion waits for the advisory `can_delete` boundary. |
+| `delete_batch` | Relational cleanup batch size; default `100`. |
+| `back_off_milliseconds` | Delay between relational cleanup batches; default `100`. Legacy key `backOff` is also accepted. |
+| `age_threshold_seconds` | Maximum validated-ledger age allowed before a rotation waits; default `60`. |
+| `recovery_wait_seconds` | Retry delay after a rotation health gate blocks; default `5`. |
+
+When nonzero, `online_delete` must be at least the selected numeric
+`ledger_history`. Online-delete rotation freshens cache generations and clears
+prior-ledger and FullBelow state; it is separate from normal age/size sweeps.
 
 ### `[database_path]`
 
@@ -109,8 +125,9 @@ Directory for relational metadata databases.
 
 ### `[ledger_history]`
 
-Desired validated-ledger acquisition/history depth. Use a number or `full`;
-actual retained availability is also constrained by `[node_db] online_delete`.
+Desired validated-ledger acquisition/history depth. Use a number, `none` (`0`),
+or `full` (`u32::MAX`). Full history requires `online_delete = 0`. When online
+deletion is enabled, a numeric history depth cannot exceed its interval.
 
 ### `[validation_seed]`
 
