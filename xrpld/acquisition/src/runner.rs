@@ -1172,9 +1172,17 @@ impl CoordinatorRunner {
         // demand must neither replace its owner nor become a second active
         // network permit. Retain a distinct request as Dormant so a later
         // `ConsensusTarget` for its exact hash can reactivate it.
+        // Normal consensus callers can arrive before NetworkOps has published
+        // its authoritative preferred-LCL fact (especially during startup).
+        // They still must not mint a second active network owner. The first
+        // active consensus acquisition remains the provisional owner; later
+        // demands are retained Dormant until an authoritative target selects
+        // one. Otherwise every moving close starts another full SHAMap scan.
         let ordinary_consensus_with_preferred = reason == AcquireReason::Consensus
             && !preferred_target
-            && self.state.latest_consensus_target.is_some();
+            && self.state.sessions.values().any(|state| {
+                state.reason == AcquireReason::Consensus && state.phase == SessionPhase::Active
+            });
         let same_hash = self.live_sessions_for_hash(target.hash());
         let exact = same_hash.iter().copied().find(|session| {
             self.state
@@ -4164,6 +4172,50 @@ mod tests {
         assert_eq!(
             runner.session(retained).expect("retained session").phase(),
             &SessionPhase::Dormant
+        );
+    }
+
+    #[test]
+    fn startup_consensus_demands_have_only_one_active_network_owner() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let first =
+            peer_request_session(&runner.handle_event(AcquisitionEvent::AcquireRequested {
+                target: target(10),
+                reason: AcquireReason::Consensus,
+            }));
+
+        let effects = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(20),
+            reason: AcquireReason::Consensus,
+        });
+        let second = effects
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("later startup demand is retained");
+
+        assert_eq!(runner.state.latest_consensus_target, None);
+        assert_eq!(
+            runner.session(first).expect("first session").phase(),
+            &SessionPhase::Active
+        );
+        assert_eq!(
+            runner.session(second).expect("second session").phase(),
+            &SessionPhase::Dormant
+        );
+        assert!(effects.iter().all(|effect| !matches!(
+            effect,
+            AcquisitionEffect::SendLedgerRequest(_) | AcquisitionEffect::ArmTimer(_)
+        )));
+        assert_eq!(
+            runner
+                .snapshot()
+                .active_by_reason()
+                .get(&AcquireReason::Consensus),
+            Some(&1)
         );
     }
 
