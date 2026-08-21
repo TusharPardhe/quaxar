@@ -25,6 +25,10 @@
   `/var/log/quaxar-bootstrap.log`. The build records its checked-out commit in
   `/etc/quaxar/build-info`.
 
+The provisioned node is non-validating unless the operator separately installs
+a protected `[validation_seed]` and restarts the service. The provisioner does
+not generate, copy, or print validator secrets.
+
 The provisioner is intentionally idempotent for its named security group and
 Elastic IP. It refuses to move an EIP attached to an unknown instance.
 

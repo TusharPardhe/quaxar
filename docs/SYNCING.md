@@ -1,148 +1,109 @@
-# Syncing
+# Synchronization
 
-How quaxar synchronizes with the XRP Ledger network.
+Quaxar can join an existing XRPL network from an empty database. Synchronizing
+means acquiring a validated ledger header plus its complete state and
+transaction SHAMaps, persisting the required nodes, and advancing LedgerMaster
+onto the network's validated chain.
 
-## Overview
+## Server states
 
-Sync progresses through three phases:
+The normal progression is:
 
-1. **Genesis** — Connect to peers, download the latest validated ledger header
-2. **Parallel Acquisition** — Download the full state tree and recent ledger history
-3. **Tracking Tip** — Follow new validated ledgers in real-time
+```text
+disconnected -> connected -> syncing -> tracking -> full
+                                                \-> proposing (validator)
+```
 
-## Bootstrap Options
+- `connected`: enough peer connectivity exists to observe the network, but no
+  suitable current ledger is installed.
+- `syncing`: the node is acquiring or reconciling the preferred validated
+  ledger and its maps.
+- `tracking`: the node has a recent validated chain and is following closes,
+  but has not yet satisfied every readiness gate.
+- `full`: a non-validating node is current and ready to serve its complete
+  locally available data.
+- `proposing`: a configured validator is current and participating. Whether
+  other operators trust it is a separate validator-list decision.
 
-| Method | Time (NVMe) | Requirements |
-|--------|-------------|--------------|
-| Snapshot import | ~3 minutes | Snapshot file from existing node |
-| Network sync | 4–36 hours | Peers, bandwidth, RAM |
+Short transitions or an occasional missing sequence in `complete_ledgers` can
+occur while metadata is committed. A state that remains `syncing`, a validated
+sequence that does not advance, or acquisition attempts that continually reset
+requires investigation.
 
-**Snapshot import** is the fastest path. Load a snapshot exported from another
-node using `quaxar load-snapshot --input <file> --conf <config>`. The node must
-be stopped during import. See [RUNNING.md](RUNNING.md) for the full workflow.
+## Current-ledger acquisition
 
-If no snapshot is available, the node syncs from the network as described below.
+1. Trusted validations and peer status select a preferred ledger hash.
+2. The inbound-ledger registry reuses an existing acquisition for that hash or
+   creates one bounded acquisition.
+3. The ledger header identifies state-map and transaction-map roots.
+4. Each map consults the shared NodeFamily/tree cache, fetch-pack cache, and
+   NodeStore before requesting missing nodes from peers.
+5. Peer replies are validated by hash and inserted into the incomplete tree.
+   Partial trees remain reusable across retries.
+6. Once both maps are complete, immutable, and match their roots, the ledger is
+   persisted and handed to LedgerMaster.
+7. LedgerMaster applies validation/quorum gates, installs the validated head,
+   and advances publication in sequence.
 
-## Initial Sync
+The active-acquisition limit controls concurrent targets, not the number of
+tree nodes retained. `[node_size]` controls tree-cache capacity and age,
+maintenance cadence, the adjacent history-fetch window, and selected JobQueue
+defaults.
 
-On first start, the node must download the complete state tree (~50 million nodes). This is the most resource-intensive phase.
+## Preferred-ledger changes
 
-What happens:
-1. Node connects to peers and identifies the latest validated ledger
-2. Requests state tree nodes in parallel from multiple peers
-3. Stores nodes in NuDB as they arrive
-4. Simultaneously fetches recent ledger headers and transactions
-5. Once the full state is acquired, transitions to tracking the tip
+The preferred hash can change while a node catches up. Quaxar serializes the
+selection and promotion decision through NetworkOps. An acquisition for an old
+candidate may stop being current, but valid nodes it placed in shared caches or
+NodeStore remain available to another tree with the same hashes. The node does
+not publish a ledger merely because its header arrived.
 
-## Hardware Impact
+## History acquisition
 
-| Resource | During Acquisition | At Steady State |
-|----------|-------------------|-----------------|
-| RAM | 24–32 GB | 8–16 GB |
-| Disk I/O | Very high (sustained writes) | Moderate |
-| Disk Space | Grows ~1 GB/hour initially | ~200 MB/day |
-| Network | 50–100 Mbps sustained | 5–20 Mbps |
-| CPU | Moderate (hashing, decompression) | Low–moderate |
+After the current chain is established, configured history can be filled in
+without blocking live validated-ledger advancement. `[ledger_history]` controls
+the desired history and `[node_db] online_delete` controls retained history.
+During recovery, current-ledger work has priority over backfill.
 
-## Time Estimates
-
-| Hardware | Estimated Sync Time |
-|----------|-------------------|
-| 8-core, 32 GB RAM, NVMe, 1 Gbps | 4–8 hours |
-| 4-core, 32 GB RAM, NVMe, 100 Mbps | 8–16 hours |
-| 4-core, 32 GB RAM, SATA SSD, 100 Mbps | 16–36 hours |
-
-Times vary based on network conditions and peer availability.
-
-## Monitoring Progress
-
-### sync-status command
+## Monitoring
 
 ```bash
+quaxar status
 quaxar sync-status
+quaxar fetch-info
+quaxar get-counts
+quaxar server-info
 ```
 
-Output:
-```
-State: acquiring
-Progress: 34,521,000 / ~50,000,000 nodes (69%)
-Rate: 45,000 nodes/sec
-Peers providing data: 8
-Estimated time remaining: 5h 42m
-Current ledger: 95,000,000
-```
+Useful fields include `server_state`, `validated_ledger`, `complete_ledgers`,
+peer count, fetch-pack status, active inbound ledgers, cache counters, and
+NodeStore read/write counters. Memory use alone is not a correctness signal:
+it varies with `[node_size]`, cache occupancy, allocator behavior, history, and
+network activity. Judge progress primarily by completed maps, advancement of
+the validated/published sequence, and stable state transitions.
 
-### Log lines to watch
+For logs, temporarily raise the relevant partition and restore it afterward:
 
-```
-INFO  sync: State acquisition progress: 69% (34.5M / 50M nodes)
-INFO  sync: Fetching ledger 95000000 state from 8 peers
-INFO  sync: Acquisition complete, transitioning to tracking
-INFO  sync: Fully synced, server_state=full
-```
-
-## Parallel Acquisition
-
-The node downloads state from multiple ledgers simultaneously:
-
-- Requests are distributed across all connected peers
-- Each peer serves different portions of the state tree
-- All data is stored in a shared NuDB instance
-- Deduplication avoids re-downloading nodes shared between ledgers
-- Back-pressure prevents overwhelming slower peers
-
-## Full State
-
-A node has "full" state when:
-- The complete state tree for the latest validated ledger is stored locally
-- The node can answer any `ledger_data` or `ledger_entry` query
-- The node can validate new transactions against current state
-- `server_state` reports `full`, `proposing`, or `validating`
-
-## Troubleshooting
-
-### Node stalls during sync
-
-**Symptoms:** Progress stops, no new nodes downloaded.
-
-**Causes:**
-- All peers disconnected or unresponsive
-- Network connectivity issues
-
-**Fix:**
 ```bash
-# Check peer count
-quaxar peers
-
-# Add fixed peers to config
-# [ips_fixed]
-# s1.ripple.com 51235
+quaxar log-level debug
+journalctl -u quaxar.service -f
+quaxar log-level info
 ```
 
-### Out of memory (OOM)
+## Diagnosing a stuck node
 
-**Symptoms:** Process killed by OS, `dmesg` shows OOM killer.
+Check these in order:
 
-**Causes:**
-- Insufficient RAM for state acquisition cache
-- `[node_size]` set too high for available memory
+1. `quaxar peers` shows stable, protocol-compatible peers.
+2. `quaxar validator-list-sites` and `quaxar unl-list` show usable trust data.
+3. `quaxar fetch-info` shows acquisitions receiving nodes rather than being
+   repeatedly recreated.
+4. `quaxar get-counts` shows SHAMap/NodeStore activity and bounded caches.
+5. The configured database and log directories are writable by the service
+   account and disk space is available.
+6. Host time is synchronized.
+7. `network_id`, validator publishers, and fixed peers belong to the same
+   network.
 
-**Fix:**
-- Ensure at least 32 GB RAM for mainnet
-- Reduce `[node_size]` to `medium` or `large`
-- Ensure no other memory-heavy processes running
-
-### Slow sync
-
-**Symptoms:** Progress rate below 10,000 nodes/sec.
-
-**Causes:**
-- Slow disk (SATA HDD)
-- Limited bandwidth
-- Few peers available
-
-**Fix:**
-- Use NVMe SSD
-- Ensure 100+ Mbps network
-- Add more `[ips_fixed]` entries for reliable peers
-- Check `quaxar peers` — need at least 5–10 connected peers
+Capture `server_info`, `fetch_info`, `get_counts`, recent service logs, the
+commit from `quaxar version`, and a redacted config when reporting a defect.

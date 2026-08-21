@@ -116,16 +116,20 @@ Understanding which crate owns what helps you find the right place for changes:
 | `xrpl/shamap` | SHAMap trie (state and transaction trees) |
 | `xrpl/core` | Cryptography, key derivation, signing |
 | `xrpl/resource` | Load management and resource tracking |
-| `xrpld/app` | Application orchestration, ledger acquisition |
+| `xrpld/acquisition` | Shared acquisition scheduling and mailbox primitives |
+| `xrpld/app` | Application owner, bootstrap, NetworkOps, jobs, validator services |
 | `xrpld/consensus` | XRPL consensus protocol implementation |
 | `xrpld/ledger` | Ledger state, open/closed/validated lifecycle |
 | `xrpld/overlay` | P2P networking, peer message handling |
 | `xrpld/nodestore` | NuDB storage backend, node object persistence |
+| `xrpld/rdb` | Relational ledger and transaction metadata |
 | `xrpld/rpc` | JSON-RPC method handlers |
 | `xrpld/server` | HTTP/WebSocket server, request routing |
+| `xrpld/perflog` | Runtime activity and performance counters |
 | `xrpld/tx` | Transaction processing and application |
-| `xrpld/metrics` | Prometheus metrics collection |
-| `xrpld/main` | Binary entry point, CLI, startup |
+| `xrpld/metrics` | Prometheus metrics (`quaxar-metrics` package) |
+| `xrpld/cli` | Operator commands (`quaxar-cli` package) |
+| `xrpld/main` | Bootstrap and `quaxar` binary (`quaxar-main` package) |
 
 ## Where to Start
 
@@ -143,4 +147,4 @@ Look for issues labeled `good first issue` in the issue tracker.
 
 - Open a GitHub Discussion for questions
 - Check [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design context
-- Read the learning notes in `docs/learning/` for deep dives into specific subsystems
+- Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before changing runtime ownership or ledger flow

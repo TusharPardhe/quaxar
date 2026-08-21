@@ -15,3 +15,11 @@ If you discover a security vulnerability, please report it responsibly:
 |---------|----------|
 | latest  | ✅ |
 | < latest | ❌ |
+
+## Validator Secrets
+
+Never include a validation seed, node-private key, RFC-1751 validation words,
+validator token, or `validator-keys.json` in a report. Redact credentials and
+private endpoints from configuration and logs. If a validator secret may have
+been exposed, stop using that identity and contact the maintainers privately
+before publishing details.

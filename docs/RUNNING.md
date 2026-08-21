@@ -2,24 +2,25 @@
 
 Guide for node operators running the Rust implementation of the XRP Ledger server.
 
-## Hardware Requirements
+## Capacity Planning
 
-| Resource | Minimum (mainnet) | Recommended |
-|----------|-------------------|-------------|
-| CPU | 4 cores | 8+ cores |
-| RAM | 32 GB | 32 GB |
-| Disk | 1 TB NVMe SSD | 1 TB NVMe SSD |
-| Network | 100 Mbps | 1 Gbps |
+| Resource | Starting point | Notes |
+|----------|----------------|-------|
+| CPU | 4 modern cores | More cores help builds, RPC, acquisition, and jobs. |
+| RAM | 16 GiB testnet; 32 GiB public-network evaluation | Size for the chosen cache profile and workload. |
+| Disk | Fast SSD/NVMe | Capacity depends primarily on history and deletion policy. |
+| Network | Stable broadband with public peer ingress | Sustained catch-up and peer relay can be bandwidth intensive. |
 
-For testnet, 16 GB RAM and a 500 GB SSD are sufficient.
-
-Disk usage grows over time with ledger history. NVMe is strongly recommended for NuDB performance.
+These are planning baselines, not guarantees. Measure the actual network,
+history, RPC traffic, and `[node_size]` profile before production use.
 
 ## Supported Platforms
 
 - Linux x86_64 (Ubuntu 22.04+, Debian 12+, RHEL 9+)
 - macOS arm64 (Apple Silicon)
 - macOS x86_64
+- Windows has a build/install script; server-service operation is not yet part
+  of the qualified platform matrix.
 
 ## Building from Source
 
@@ -71,10 +72,15 @@ CC=clang CXX=clang++ cargo install --path xrpld/main
 ```
 
 This builds the release binary and installs it to `~/.cargo/bin/quaxar` (already in PATH).
+For the dedicated system service below, install a root-owned copy:
+
+```bash
+sudo install -o root -g root -m 0755 ~/.cargo/bin/quaxar /usr/local/bin/quaxar
+```
 
 ### Build Troubleshooting
 
-**RocksDB compilation segfault / OOM (common on ≤16GB RAM):**
+**RocksDB compilation segfault / OOM:**
 
 The RocksDB C++ library compiles from source by default and can exhaust memory. Fix by installing the system package:
 
@@ -96,21 +102,12 @@ CARGO_BUILD_JOBS=2 CC=clang CXX=clang++ cargo install --path xrpld/main
 sudo apt install libssl-dev pkg-config
 ```
 
-**`.cargo/config.toml` linker error:**
-
-The repo includes an optional `lld` linker config for faster builds. If `lld` is not installed:
-
-```bash
-rm .cargo/config.toml
-# Or install lld:
-sudo apt install lld clang
-```
-
 ### Build Notes
 
-- **Linux without librocksdb-dev:** Set `ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu` or RocksDB will compile from source (slow, may OOM on 16GB machines)
+- **System RocksDB:** Install `librocksdb-dev` before setting `ROCKSDB_LIB_DIR` to the directory that actually contains the installed library.
+- **Bundled RocksDB:** Without a system library, the crate compiles RocksDB from source; allow additional build time and memory.
 - **Low-memory machines:** Use `CARGO_BUILD_JOBS=2` to limit parallelism
-- **`.cargo/config.toml`:** The repo includes an optional lld linker config for faster builds. If `lld` is not installed, remove this file: `rm .cargo/config.toml`
+- **Faster linking:** `.cargo/config.toml` contains commented examples. Install `clang` and `lld` before enabling the stanza for your target.
 
 ## Configuration
 
@@ -180,7 +177,8 @@ ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
 | `[validator_list_keys]` | Public keys of validator list publishers |
 | `[ips]` | Peer endpoints to connect to on startup |
 
-See [CONFIGURATION.md](CONFIGURATION.md) for every supported config section.
+See [CONFIGURATION.md](CONFIGURATION.md) for operator-facing config sections
+and compatibility notes.
 
 ## Starting the Node
 
@@ -195,7 +193,17 @@ RUST_LOG=info nohup ./target/release/quaxar --conf quaxar.cfg > quaxar.log 2>&1 
 
 ## Systemd Service
 
-Create `/etc/systemd/system/quaxar.service`:
+Create a dedicated account and writable state directories when not using the
+interactive installer:
+
+```bash
+sudo useradd --system --home /var/lib/quaxar --shell /usr/sbin/nologin quaxar
+sudo install -d -o quaxar -g quaxar /var/lib/quaxar /var/log/quaxar
+sudo install -d -o root -g quaxar -m 0750 /etc/quaxar
+sudo install -o root -g quaxar -m 0640 quaxar.cfg /etc/quaxar/quaxar.cfg
+```
+
+Then create `/etc/systemd/system/quaxar.service`:
 
 ```ini
 [Unit]
@@ -309,13 +317,17 @@ Change at runtime:
 
 ```bash
 quaxar log-level debug
-quaxar log-rotate
 ```
 
-## Bootstrapping from Snapshot
+`quaxar log-rotate` is currently a compatibility no-op because the runtime
+does not own a logfile; use the systemd/Docker supervisor's rotation policy.
 
-The fastest way to bring up a new node is to load a snapshot exported from an
-existing synced node. This bypasses the multi-hour network sync entirely.
+## Priming the NodeStore from a Snapshot
+
+A snapshot transfers immutable node objects from an existing node. Importing
+one can reduce later network fetches, but it does not currently install
+relational ledger metadata, select the snapshot ledger as the startup LCL, or
+bypass normal network synchronization by itself.
 
 **On the source node (online):**
 
@@ -327,9 +339,9 @@ The node exports in a background job and remains online. The CLI displays a
 spinner while it polls the admin `snapshot_status` RPC, then reports completion
 or failure and the resulting file size. On an older node without
 `snapshot_status`, the CLI reports that export was started and instructs the
-operator to monitor snapshot logs instead. On NVMe, 26.5M nodes export in ~3
-minutes. The snapshot file uses LZ4 compressed chunks with SHA-256 integrity
-verification.
+operator to monitor snapshot logs instead. The snapshot uses LZ4-compressed
+chunks with SHA-256 integrity verification; duration depends on store size and
+host I/O.
 
 **On the new node (stopped):**
 
@@ -338,8 +350,9 @@ quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/quaxar/quaxar.cfg
 ```
 
 The CLI displays a spinner while it imports and verifies all chunk and final
-file hashes. After it reports completion, start the node normally. It will
-resume from the snapshot state and catch up to the network tip within minutes.
+file hashes. After it reports completion, start the node normally. Network
+acquisition can reuse matching objects from the primed NodeStore while the node
+establishes its current validated chain and relational metadata normally.
 
 See [CLI.md](CLI.md) for command details and [SYNCING.md](SYNCING.md) for
 alternative sync methods.
@@ -348,11 +361,11 @@ alternative sync methods.
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| OOM during sync | Insufficient RAM for state acquisition | Ensure 32 GB RAM for mainnet or use `[node_size] medium` |
+| OOM during sync | Cache/workload exceeds available memory | Select a smaller `[node_size]`, reduce competing workloads, or add RAM |
 | RocksDB build segfault | GCC OOM during compilation | `sudo apt install librocksdb-dev` or `CARGO_BUILD_JOBS=1` |
 | OpenSSL build failure | Missing system OpenSSL | `sudo apt install libssl-dev pkg-config` |
 | Node stuck in "connected" | Validator list not loading | Ensure `[validators_file]` points to valid file, or add `[validator_list_sites]` directly to config |
-| Slow sync | Spinning disk or limited bandwidth | Use NVMe SSD, ensure 100+ Mbps |
+| Slow sync | Slow storage, limited bandwidth, or unstable peers | Use fast SSD storage and verify sustained network throughput and peer stability |
 | Port already in use | Another process on same port | Check with `lsof -i :51235`, change port in config |
 | No peers connecting | Firewall blocking port 51235 | Open TCP 51235 inbound |
-| `.cargo/config.toml` error | lld linker not installed | `rm .cargo/config.toml` or `sudo apt install lld clang` |
+| Linker error after enabling optional config | The selected linker is unavailable | Install the configured linker or comment out only the operator-enabled target stanza |

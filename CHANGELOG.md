@@ -5,12 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
 
+## [Unreleased]
+
+### Changed
+
+- Reworked current-ledger recovery around the application-owned NetworkOps
+  strand, preferred-ledger coordination, and LedgerMaster promotion flow.
+- Retain and reuse incomplete SHAMaps through the shared NodeFamily, tree,
+  fetch-pack, negative, full-below, and NodeStore caches.
+- Migrated operator-facing packages, binaries, metrics, environment variables,
+  configuration paths, containers, and services from `xrpld` branding to
+  Quaxar while retaining `xrpld/` as the source comparison layout.
+- Validator key generation now emits XRPL node-public/node-private encodings, a
+  family validation seed, RFC-1751 words, and a protected non-overwriting
+  `validator-keys.json`.
+- Updated operator and contributor documentation for the current architecture,
+  synchronization states, validator setup, CLI, RPC, and deployment paths.
+
 ## [0.3.1] - 2026-06-26
 
 ### Added
 
 - **Consensus engine redesign** — Complete rewrite of the consensus participation lifecycle matching rippled's architecture. Single 1s heartbeat thread, channel-driven validation processor, immediate ledger promotion, parking_lot::Mutex-based ConsensusDriver
-- **Channel-driven validation processing** — Dedicated thread blocks on mpsc channel, wakes instantly when validations arrive from peers. Zero-latency ledger promotion matching rippled's jtVALIDATION job dispatch
+- **Channel-driven validation processing** — Dedicated thread blocks on an mpsc channel and wakes when validations arrive from peers
 - **ConsensusDriver** — New unified consensus entry point with peer count gate, canValidateSeq monotonicity enforcement, and spawn_heartbeat API
 
 ### Changed
@@ -25,46 +42,14 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 - **Consensus convergence** — Nodes now converge reliably across all configurations (5q, 3r+2q, 4r+1q, 2r+3q)
 - **5x timer speed bug** — tick_fixed(1s) was called every 200ms, causing consensus timers to run at 5x real speed
 - **Validation trie pollution** — Solo-built ledger validations no longer enter the trie, preventing spurious wrong-ledger detection
-- **Ledger promotion lag** — Validated ledger counter now advances in lockstep with rippled (0-1 ledger gap vs previous 20-80)
-
-### Performance
-
-- **RAM**: 27-41 MB vs rippled 503-627 MB (15-23x less memory)
-- **RPC**: 21/24 methods faster, 2.29x geometric mean, 4.0x average speedup
-- **Consensus drift**: Zero under stress test load
-
-### Added
-
-- **Consensus engine redesign** — Complete rewrite of the consensus participation lifecycle matching rippled's architecture. Single 1s heartbeat thread, channel-driven validation processor, immediate ledger promotion, parking_lot::Mutex-based ConsensusDriver
-- **Channel-driven validation processing** — Dedicated thread blocks on mpsc channel, wakes instantly when validations arrive from peers. Zero-latency ledger promotion matching rippled's jtVALIDATION job dispatch
-- **ConsensusDriver** — New unified consensus entry point with peer count gate, canValidateSeq monotonicity enforcement, and spawn_heartbeat API
-
-### Changed
-
-- **Timer architecture** — Replaced 200ms polling timer with single 1s heartbeat thread (ledgerGRANULARITY). Removed maybe_tick_consensus macro and inline ticks that caused 5x speed bug
-- **get_prev_ledger** — Simplified to pure validation trie query (no peer voting). Peer voting moved to endConsensus/checkLastClosedLedger where it belongs
-- **Validation emission** — Added canValidateSeq (strictly increasing), !consensusFail, and proposers>0 guards. Prevents stale fork validations from polluting the trie
-- **acquire_ledger** — Relaxed immutability check, added store_consensus_ledger for immediate LedgerHistory availability
-
-### Fixed
-
-- **Consensus convergence** — Nodes now converge reliably across all configurations (5q, 3r+2q, 4r+1q, 2r+3q)
-- **5x timer speed bug** — tick_fixed(1s) was called every 200ms, causing consensus timers to run at 5x real speed
-- **Validation trie pollution** — Solo-built ledger validations no longer enter the trie, preventing spurious wrong-ledger detection
-- **Ledger promotion lag** — Validated ledger counter now advances in lockstep with rippled (0-1 ledger gap vs previous 20-80)
-
-### Performance
-
-- **RAM**: 27-41 MB vs rippled 503-627 MB (15-23x less memory)
-- **RPC**: 21/24 methods faster, 2.29x geometric mean, 4.0x average speedup
-- **Consensus drift**: Zero under stress test load
+- **Ledger promotion lag** — Validated-ledger advancement was moved closer to the reference acceptance sequence
 
 ## [0.2.0] - 2026-06-08
 
 ### Added
 
-- **Snapshot export** — Live snapshot export via `export_snapshot` admin RPC while the node continues running. Streams 26.5M nodes in ~3 minutes on NVMe (background thread, 16 MB peak memory)
-- **Snapshot import** — Bulk import mode with pre-allocated hash table, skipped existence checks, and deferred bucket splits. Loads 26.5M nodes in ~3 minutes
+- **Snapshot export** — Live background snapshot export via `export_snapshot` while the node continues running
+- **Snapshot import** — Bulk import mode with a pre-allocated hash table, skipped existence checks, and deferred bucket splits
 - **export-snapshot CLI** — Triggers export via RPC to the running node, returns immediately with progress in logs
 - **load-snapshot CLI** — Offline import with sharded NuDB path resolution and crash recovery markers
 - **Dynamic log level** — Runtime log level changes via `log_level` RPC using tracing-subscriber reload handle. Partition-scoped and input-validated
@@ -83,8 +68,8 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Performance
 
-- **Bulk import mode** — NuDB `bulk_import_start/finish` bypasses existence checks, burst checkpoints, and bucket splits during snapshot loading (100x faster)
-- **Streaming for_each** — Eliminates multi-GB memory allocation during export by processing records inline during bucket iteration
+- **Bulk import mode** — NuDB `bulk_import_start/finish` bypasses existence checks, burst checkpoints, and bucket splits during snapshot loading
+- **Streaming for_each** — Avoids collecting every record before export by processing records during bucket iteration
 - **Pre-allocated hash table** — Bulk import pre-creates buckets based on estimated node count, avoiding 26.5M incremental split operations
 
 ### Changed
@@ -97,11 +82,11 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 ### Added
 
 - **Mainnet sync** — Full synchronization with XRPL mainnet, tracking validated ledgers in real-time
-- **Parallel acquisition** — Multi-threaded ledger and state map acquisition for ~2x faster initial sync
+- **Parallel acquisition** — Multi-threaded ledger and state-map acquisition
 - **RPC endpoints** — JSON-RPC API with parity for core methods: `server_info`, `ledger`, `account_info`, `fee`, `tx`, `account_tx`, `ledger_data`, and more
 - **CLI tools** — Interactive CLI with fuzzy-search command completion, gradient logo, and rich formatted output
 - **Validator key management** — Generate, rotate, sign, and revoke validator keys from the CLI
-- **Prometheus metrics** — Built-in `/metrics` endpoint exposing sync progress, peer counts, RPC latency, and storage statistics
+- **Metrics instrumentation** — Recorder hooks for sync, peer, RPC, and storage activity
 - **Structured logging** — `tracing`-based structured logs with runtime-configurable levels via CLI or RPC
 - **NuDB storage** — Pure Rust NuDB implementation for node object persistence
 - **P2P overlay** — TLS-encrypted peer connections with protocol handshake, message routing, and peer management

@@ -31,15 +31,16 @@ JSON RPC requests, and provide an operator focused command line interface.
 
 The project follows `rippled` behavior closely while using Rust ownership,
 typed protocol models, structured errors, and explicit runtime boundaries. The
-current implementation is suitable for development, parity testing, testnet
-operation, and non validator node evaluation.
+current implementation is suitable for development, parity testing, and
+testnet node and validator operation.
 
 ## Current Status
 
 `quaxar` is beta software. It has been validated on XRPL testnet as a synced
-non validator node with live submission tests for XRP payments, issued token
-payments, NFT minting, AMM creation, account queries, and expected rejection
-cases.
+node and as a validator reaching `proposing`, publishing signed validations,
+and advancing with the validated chain. Live submission coverage includes XRP
+payments, issued-token payments, NFT minting, AMM creation, account queries,
+and expected rejection cases.
 
 Production validator operation is not recommended yet. Interfaces and runtime
 configuration may still change as parity work continues.
@@ -71,10 +72,11 @@ bash install.sh
 irm https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.ps1 | iex
 ```
 
-The installer checks host requirements, installs build dependencies, builds
-`quaxar`, generates configuration files, validates user input, and can install a
-systemd service. It asks for available runtime settings interactively and
-applies defaults when non interactive mode is requested.
+On macOS/Linux, `install.sh` checks host requirements, installs build
+dependencies, builds `quaxar`, generates configuration, and can install a
+systemd service on Linux hosts that provide systemd. It asks for runtime
+settings interactively and applies defaults in unattended mode. The Windows script installs and verifies the
+binary; create `quaxar.cfg` separately from the repository example.
 
 For unattended installation with defaults:
 
@@ -84,7 +86,8 @@ bash install.sh -y
 ```
 
 ```powershell
-irm https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.ps1 | iex -y
+irm https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.ps1 -OutFile install.ps1
+.\install.ps1 -y
 ```
 
 ### Manual Build
@@ -168,8 +171,8 @@ Open the interactive shell:
 quaxar cli
 ```
 
-Running `quaxar` without a subcommand prints help instead of starting a node
-implicitly. This avoids accidental launches with an unintended configuration.
+Running `quaxar` without arguments prints help. Start the node with an explicit
+`--conf` path so the intended configuration is unambiguous.
 
 ## Operator CLI
 
@@ -199,8 +202,8 @@ suggestions, clear errors for unknown commands, and direct RPC passthrough.
 | `can-delete [value]` | Get or set the advisory online deletion ledger. |
 | `config` | Validate the configuration file without starting the node. |
 | `connect <address>` | Request a connection to a peer address. |
-| `log-level [level]` | Get or set runtime log level. |
-| `log-rotate` | Request runtime log rotation. |
+| `log-level <level>` | Set runtime log level; the no-argument compatibility query is not yet populated. |
+| `log-rotate` | Compatibility command; currently acknowledges without rotating a file. |
 | `random` | Generate random bytes through RPC. |
 | `validator-info` | Show raw validator node information. |
 | `validator-list-sites` | Show validator list site status. |
@@ -260,7 +263,7 @@ ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
 resource profile for acquisition, cache sizing, and runtime concurrency.
 
 The repository includes a small runnable `quaxar.cfg`. See
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the complete configuration
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the operator configuration
 reference and [docs/RUNNING.md](docs/RUNNING.md) for operational guidance.
 
 ## Runtime Notes
@@ -268,7 +271,7 @@ reference and [docs/RUNNING.md](docs/RUNNING.md) for operational guidance.
 | Topic | Guidance |
 | --- | --- |
 | Testnet operation | A medium node with NuDB has been validated on public testnet. |
-| Full history | Use `ledger_history = full` and provision storage accordingly. Full history requires significantly more disk and time. |
+| Full history | Set `[ledger_history]` to `full` and provision storage accordingly. Full history requires significantly more disk and time. |
 | NuDB | Recommended for node store operation and used by the validated testnet deployment. |
 | RocksDB | Available where the Rust storage path exposes the matching backend. Use only when the target deployment requires it. |
 | Public endpoints | Use `verify_endpoints` for stricter advertised peer endpoint validation. |
@@ -278,15 +281,13 @@ reference and [docs/RUNNING.md](docs/RUNNING.md) for operational guidance.
 
 ```text
 xrpl/                            xrpld/
-├── protocol                      ├── app
-├── basics                        ├── consensus
-├── shamap                        ├── ledger
-├── core                          ├── overlay
-└── resource                      ├── nodestore
-                                  ├── rpc
-                                  ├── server
-                                  ├── tx
-                                  └── main
+├── basics                        ├── acquisition  ├── nodestore
+├── core                          ├── app          ├── overlay
+├── protocol                      ├── cli          ├── perflog
+├── resource                      ├── consensus    ├── rdb
+└── shamap                        ├── core         ├── rpc/server
+                                  ├── ledger       ├── tx
+                                  └── main/metrics
 ```
 
 The `xrpl` crates hold shared protocol and data structure foundations. The
@@ -303,7 +304,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | Complete runtime configuration reference. |
 | [CLI.md](docs/CLI.md) | Full command line reference. |
 | [SYNCING.md](docs/SYNCING.md) | Sync behavior, acquisition flow, and operator checks. |
-| [VALIDATORS.md](docs/VALIDATORS.md) | Validator key and token guidance. |
+| [VALIDATORS.md](docs/VALIDATORS.md) | Validator identity, configuration, and operational guidance. |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout and runtime design. |
 | [RPC.md](docs/RPC.md) | Supported RPC methods and examples. |
 
@@ -315,4 +316,4 @@ before opening a pull request.
 
 ## License
 
-[ISC License](LICENSE)
+[Apache License 2.0](LICENSE)

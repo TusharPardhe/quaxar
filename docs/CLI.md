@@ -19,8 +19,8 @@ quaxar --conf /etc/quaxar/quaxar.cfg --quorum 2
 be unsafe on a public network. Use it only when the validator set and failure
 model are deliberately controlled.
 
-Running `quaxar` without a subcommand prints help. This avoids accidentally
-starting a node with an unintended default configuration.
+Running `quaxar` without arguments prints help and exits. Installed services
+should pass `--conf /etc/quaxar/quaxar.cfg` explicitly to start the node.
 
 ## Interactive Mode
 
@@ -60,7 +60,9 @@ Features:
 | `fetch-info` | Ledger acquisition/fetch state |
 | `get-counts` | Raw cache, ledger, and node-store counters |
 | `can-delete [value]` | Get or set advisory online-delete ledger |
-| `log-rotate` | Request runtime log rotation |
+| `config` | Validate a configuration file without starting the node |
+| `connect <address>` | Request an outbound peer connection |
+| `log-rotate` | Compatibility command; currently a successful no-op |
 | `random` | Generate random bytes through RPC |
 | `validator-info` | Raw validator node information |
 | `validator-list-sites` | Raw validator list site status |
@@ -70,7 +72,7 @@ Features:
 | `validators` | Trusted validator list and agreement |
 | `amendments` | Amendment status and voting |
 | `db-stats` | NuDB disk usage and database statistics |
-| `log-level [level]` | Get or set log level |
+| `log-level <level>` | Set log level; the no-argument query is not yet populated |
 | `benchmark` | Run internal performance benchmarks |
 | `validator-keys` | Key management (see below) |
 | `export-snapshot` | Export node store to snapshot file (admin RPC) |
@@ -84,10 +86,16 @@ Features:
 | Command | Description |
 |---------|-------------|
 | `validator-keys generate` | Generate a new validator key pair |
-| `validator-keys create-token` | Create a validator token from master key |
-| `validator-keys sign` | Sign a message with the validator key |
-| `validator-keys revoke` | Revoke a validator key (publish revocation) |
-| `validator-keys show` | Display public key and manifest |
+| `validator-keys create-token` | Create an experimental token payload |
+| `validator-keys sign` | Experimental local signing helper |
+| `validator-keys revoke` | Create an experimental revocation payload |
+| `validator-keys show` | Display the saved public key and creation time |
+
+`generate` writes a non-overwriting, mode-`0600` `validator-keys.json` in the
+current directory. The supported server configuration path uses its
+`validation_seed` value in `[validation_seed]`. The token/sign/revoke helpers
+are not yet documented as production-compatible with `rippled`; see
+[VALIDATORS.md](VALIDATORS.md).
 
 ## RPC Port Auto-Discovery
 
@@ -132,7 +140,7 @@ quaxar get-counts
 # Show ledger acquisition state
 quaxar fetch-info
 
-# Rotate logs
+# Call the compatibility log-rotation endpoint (currently a no-op)
 quaxar log-rotate
 
 # Change log level to debug
@@ -193,23 +201,21 @@ quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/quaxar/quaxar.cfg
 | Flag | Required | Description |
 |------|----------|-------------|
 | `--input` | Yes | Path to snapshot file |
-| `--conf` | Yes | Path to config file (determines NuDB path) |
+| `--conf` | No | Config path determining the NodeStore; defaults to `/etc/quaxar/quaxar.cfg` |
 
 The import uses bulk loading mode with pre-allocated NuDB hash tables. The CLI
 shows a spinner throughout the synchronous import and reports success only
-after the loader has verified every chunk and the final file hash. On NVMe,
-26.5M nodes load in approximately 3 minutes.
+after the loader has verified every chunk and the final file hash. Runtime
+depends on snapshot size, storage, CPU, and available memory.
 
 ## Exit Codes
 
-| Command | Code | Meaning |
-|---------|------|---------|
-| `health` | 0 | Node is reachable (healthy or syncing) |
-| `health` | 1 | Node is unreachable (down) |
-| RPC-backed commands | 0 | RPC returned `status: success` |
-| RPC-backed commands | 1 | RPC connection failed or returned an error |
-| All others | 0 | Success |
-| All others | 1 | Error |
+`health` exits 0 when the node is reachable (including while syncing) and 1
+when it is unreachable. RPC-backed commands generally return 1 for connection
+or RPC errors, and command-line parse errors return 1. The current `config`,
+`doctor`, `benchmark`, interactive CLI, and `validator-keys` dispatch paths
+return 0 after invocation even when the command printed a diagnostic; do not
+use their exit status as an automation contract yet.
 
 ## Health States
 

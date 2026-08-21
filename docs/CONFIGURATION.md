@@ -49,9 +49,9 @@ Selects the resource profile. This is the recommended primary tuning knob.
 medium
 ```
 
-Profiles currently map to acquisition and cache defaults:
+Profiles currently map to history-prefetch and cache defaults:
 
-| Size | Active ledger fetch default | Intended use |
+| Size | Adjacent history fetch window | Intended use |
 |------|-----------------------------|--------------|
 | `tiny` | `2` | Small/dev machines. |
 | `small` | `3` | Light nodes. |
@@ -59,9 +59,14 @@ Profiles currently map to acquisition and cache defaults:
 | `large` | `5` | Stronger machines. |
 | `huge` | `8` | High-throughput machines with ample memory and fast disk. |
 
-The profile also influences SHAMap tree cache size, cache age, fetch-pack cache
-size, write-dedup size, and run-data concurrency. Prefer changing `node_size`
-before using expert overrides.
+The profile also influences SHAMap tree-cache size and age, sweep cadence, the
+adjacent history-fetch window, and selected JobQueue defaults. Prefer changing
+`node_size` before using expert overrides.
+
+### `[sweep_interval]`
+
+Optional cache-maintenance interval in seconds. Accepted values are 10 through
+600. When omitted, the selected `[node_size]` supplies the interval.
 
 ### `[node_db]`
 
@@ -83,6 +88,22 @@ Directory for relational metadata databases.
 
 How much validated ledger history to keep available. Use a number or `full`.
 
+### `[validation_seed]`
+
+Secret family seed for this server's validator identity. Keep the containing
+file restricted to the service account. See [VALIDATORS.md](VALIDATORS.md).
+
+### `[validator_token]`
+
+Multi-line validator-token input. The section is accepted by bootstrap, but
+Quaxar's token generation and rotation workflow is still experimental. Prefer
+`[validation_seed]` for current operator deployments.
+
+### `[validators]`
+
+Static trusted validator public keys, one per line. Public networks should
+normally use signed validator lists rather than hand-maintaining a large set.
+
 ### `[validators_file]`
 
 Path to a validator-list config file. Relative paths are resolved from the
@@ -96,9 +117,20 @@ Validator list publisher URLs.
 
 Validator list publisher public keys.
 
-### `[ips]`
+### `[validator_list_threshold]`
 
-Fixed peer endpoints to try on startup.
+Optional number of configured publisher lists required. Omitted or `0` selects
+the computed default. A nonzero value must not exceed the number of entries in
+`[validator_list_keys]`.
+
+### `[validator_key_revocation]`
+
+Advanced multi-line base64 revocation-manifest input. Bootstrap rejects a
+payload that is malformed, not a revocation, or invalid for the manifest cache.
+
+### `[ips]` and `[ips_fixed]`
+
+Outbound peer endpoints.
 
 ```ini
 [ips]
@@ -106,10 +138,23 @@ s1.ripple.com 51235
 s2.ripple.com 51235
 ```
 
+`[ips]` seeds ordinary outbound discovery. `[ips_fixed]` configures fixed peer
+relationships that PeerFinder keeps trying to maintain.
+
+### `[peer_private]`
+
+One boolean value. When enabled, the node does not advertise for incoming
+peers and does not automatically dial the ordinary boot cache; configured
+`[ips_fixed]` peers remain active.
+
 ### `[network_id]`
 
-Optional network selector. Common values are `main`, `testnet`, `devnet`, or a
-numeric network ID.
+Optional network selector. Accepted values are `main` (`0`), `testnet` (`1`),
+`devnet` (`2`), or an unsigned numeric network ID.
+
+### `[peers_max]`
+
+Maximum peer slots. An omitted or zero value uses the reference default of 21.
 
 ### `[network_quorum]`
 
@@ -180,13 +225,28 @@ Controls validation and transaction relay reduction.
 | `tx_min_peers` | Minimum peers before transaction reduce relay is active. Must be at least `10`. |
 | `tx_relay_percentage` | Transaction relay percentage. Valid range: `10..100`. |
 
+### `[transaction_queue]`
+
+Optional transaction-queue overrides. Supported keys are
+`ledgers_in_queue`, `minimum_queue_size`, `retry_sequence_percent`,
+`minimum_txn_in_ledger`, `minimum_txn_in_ledger_standalone`,
+`target_txn_in_ledger`, `maximum_txn_in_ledger`,
+`normal_consensus_increase_percent`, `slow_consensus_decrease_percent`,
+`maximum_txn_per_account`, and `minimum_last_ledger_buffer`. Omitted keys use
+runtime defaults; unknown keys are logged and ignored.
+
 ### `[debug_logfile]`
 
-Path for the debug log.
+Compatibility placeholder present in packaged configs. The current runtime
+does not open this path; logs are emitted through `tracing` to stdout/stderr and
+should be collected by systemd, Docker, or the process supervisor.
 
 ### `[rpc_startup]`
 
-JSON RPC commands to run at startup, commonly to set log level.
+Compatibility placeholder for startup JSON-RPC commands. The current runtime
+parses the section as configuration text but does not execute these commands.
+Set `RUST_LOG` in the service environment or use `quaxar log-level` after
+startup instead.
 
 ```ini
 [rpc_startup]
@@ -195,8 +255,15 @@ JSON RPC commands to run at startup, commonly to set log level.
 
 ### `[ssl_verify]`
 
-Set to `1` to validate HTTPS certificates or `0` to allow self-signed/internal
-certificates.
+Accepted by configuration validation for compatibility, but it is not wired to
+the runtime HTTP clients. Do not rely on this setting to weaken or strengthen
+certificate verification.
+
+### `[features]` and `[amendments]`
+
+Feature names or amendment IDs used when creating a fresh private network with
+`--start`. They do not override the amendment set of an existing public
+network.
 
 ## Recommended Examples
 
@@ -214,9 +281,9 @@ High-throughput machine:
 large
 ```
 
-Conservative catchup:
+Validator identity (secret placeholder):
 
 ```ini
-[node_size]
-medium
+[validation_seed]
+<family-seed>
 ```
