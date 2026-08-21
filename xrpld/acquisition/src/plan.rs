@@ -60,12 +60,13 @@ pub const MAX_TURNS_PER_EVENT: u32 = 4;
 pub const MAX_PACKETS_FED_PER_TURN: usize = 4;
 /// Unique pending reads cap (mirrors the broker logical admission ceiling).
 pub const MAX_PENDING_READS: usize = 512;
-/// Maximum exact `PlanNetworkNeed` records actively dispatched from the
-/// current traversal frontier. `TreePlan::advance` uses
-/// `MAX_NEW_READS_PER_PASS` for all emitted missing-node work; excess remains
-/// in the coordinator-owned dispatch backlog until an exact attachment frees a
-/// retained slot, never silently disappearing.
-pub const MAX_RETAINED_NETWORK_FRONTIER: usize = MAX_NEW_READS_PER_PASS;
+/// Maximum exact `PlanNetworkNeed` records actively retained from the current
+/// traversal frontier. The cap is one initial 12-node blind request plus the
+/// six 12-node no-progress retry windows allowed by rippled's timeout policy;
+/// excess exact needs stay in `network_backlog` until an attachment frees a
+/// slot, never silently disappearing.
+pub const MAX_RETAINED_NETWORK_FRONTIER: usize =
+    MAX_TIMEOUT_REPROBES * (DEFAULT_MAX_ACQUIRE_TIMEOUTS as usize + 1);
 /// Maximum exact frontier nodes retried during one no-progress timeout. This
 /// matches rippled's blind request cap (`kReqNodes`) while a rotating cursor
 /// gives every retained frontier entry a bounded chance to be retried.
@@ -2790,6 +2791,40 @@ mod tests {
             Vec::new(),
         ))));
         assert_eq!(plan.engine().expect("engine").plan_id(), TreePlanId::new(1));
+    }
+
+    #[test]
+    fn retained_network_frontier_caps_at_eighty_four_and_preserves_overflow_backlog() {
+        let mut ids = IdCounter::new();
+        let s = session();
+        let needs = (0..(MAX_RETAINED_NETWORK_FRONTIER + 1))
+            .map(|index| {
+                PlanNetworkNeed::new(
+                    SHAMapNodeId::default(),
+                    Uint256::from((index + 1) as u64),
+                    TreeKind::State,
+                )
+            })
+            .collect::<Vec<_>>();
+        let overflow = *needs.last().expect("one exact overflow need");
+        let mut plan = scripted(1, vec![ScriptedStep::NeedsNetworkWithKind(needs)]);
+
+        let PlanTurn::Network(dispatched) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected retained network frontier dispatch");
+        };
+        assert_eq!(MAX_RETAINED_NETWORK_FRONTIER, 84);
+        assert_eq!(dispatched.len(), MAX_RETAINED_NETWORK_FRONTIER);
+        assert_eq!(plan.retained_network().len(), MAX_RETAINED_NETWORK_FRONTIER);
+        assert_eq!(plan.network_backlog.len(), 1);
+        assert_eq!(plan.network_backlog.front(), Some(&overflow));
+        assert_eq!(
+            plan.pending_network().len(),
+            MAX_RETAINED_NETWORK_FRONTIER + 1
+        );
+        assert!(
+            plan.pending_network().contains(&overflow.hash()),
+            "the exact overflow need remains visible and retryable"
+        );
     }
 
     #[test]
