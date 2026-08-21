@@ -118,6 +118,8 @@ pub enum CancelReason {
     LclInstalled,
     /// An explicit cancellation request.
     Explicit,
+    /// The per-hash acquisition received no repeated demand for one minute.
+    IdleExpired,
 }
 
 impl CancelReason {
@@ -129,6 +131,7 @@ impl CancelReason {
             Self::Shutdown => "shutdown",
             Self::LclInstalled => "lcl_installed",
             Self::Explicit => "explicit",
+            Self::IdleExpired => "idle_expired",
         }
     }
 }

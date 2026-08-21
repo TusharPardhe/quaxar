@@ -3482,7 +3482,15 @@ impl MissingNodeContinuation {
             }
             MissingNodeReadOutcome::Cancelled => {
                 self.pending_by_hash.insert(hash, pending);
-                MissingNodeReadApply::Cancelled
+                // The actor-side operation that owned this read is terminal.
+                // Keeping its waiter without re-announcing it leaves the
+                // continuation permanently Ready-without-work: no broker
+                // ticket exists that can ever release the retained edge.
+                // Re-arm the unique hash exactly like rejected admission so a
+                // still-active acquisition can mint a fresh operation. Session
+                // cancellation remains safe because the owner drops the plan.
+                self.unannounced_reads.insert(hash);
+                MissingNodeReadApply::Requeued
             }
             MissingNodeReadOutcome::Found(node) => {
                 if node.get_hash() != hash {
@@ -6509,6 +6517,83 @@ mod native_missing_node_continuation_tests {
         assert_eq!(continuation.stack.len(), 1);
         assert_eq!(continuation.pending_network_by_hash.len(), 1);
         assert!(continuation.has_runnable_frontier());
+    }
+
+    #[test]
+    fn cancelled_read_rearms_the_unique_waiter_instead_of_idling_forever() {
+        let child_hash = hash(0x45);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, child_hash);
+        root.update_hash();
+        let mut continuation = continuation(&root, 45);
+        let mut resident = EmptyResident;
+
+        let MissingNodeAdvance::NeedsReads(first) =
+            continuation.advance(32, 4, &mut resident, &mut || 0)
+        else {
+            panic!("expected the initial broker read");
+        };
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(45),
+                child_hash,
+                MissingNodeReadOutcome::Cancelled,
+            ),
+            MissingNodeReadApply::Requeued
+        );
+        assert!(
+            continuation.has_runnable_frontier(),
+            "a cancelled external operation must leave work that can mint a replacement"
+        );
+        assert_eq!(continuation.pending_hashes(), 1);
+        assert_eq!(continuation.pending_edges(), 1);
+        let replacement = continuation.take_unannounced_reads(4);
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].hash(), child_hash);
+    }
+
+    #[test]
+    fn reply_scan_reuses_network_waiter_without_repeating_db_read_or_edge() {
+        let child_hash = hash(0x46);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, child_hash);
+        root.update_hash();
+        let mut continuation = continuation(&root, 46);
+        let mut resident = EmptyResident;
+
+        let MissingNodeAdvance::NeedsReads(reads) =
+            continuation.advance(32, 4, &mut resident, &mut || 0)
+        else {
+            panic!("expected the initial broker read");
+        };
+        assert_eq!(reads.len(), 1);
+        assert!(matches!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(46),
+                child_hash,
+                MissingNodeReadOutcome::Miss,
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 0,
+                missing_edges: 1
+            }
+        ));
+        assert!(matches!(
+            continuation.advance(32, 4, &mut resident, &mut || 0),
+            MissingNodeAdvance::NeedsNetwork(_)
+        ));
+        assert_eq!(continuation.pending_edges(), 1);
+
+        continuation.begin_reply_scan(&mut || 0);
+        let next = continuation.advance(32, 4, &mut resident, &mut || 0);
+        let MissingNodeAdvance::NeedsNetwork(nodes) = next else {
+            panic!("an extant peer waiter must be re-advertised without another DB read: {next:?}");
+        };
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].1, *child_hash.as_uint256());
+        assert_eq!(continuation.pending_hashes(), 0);
+        assert_eq!(continuation.pending_edges(), 1);
     }
 
     #[test]

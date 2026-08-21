@@ -76,6 +76,9 @@ const MAX_SELECTED_PEERS: usize = INITIAL_PEER_REQUEST_FANOUT
 /// rippled switches to `TMGetObjectByHash` only after more than four
 /// no-progress timeouts (`kLedgerBecomeAggressiveThreshold`).
 const AGGRESSIVE_TIMEOUT_THRESHOLD: u32 = 4;
+/// rippled's `InboundLedgers::sweep` removes a per-hash acquisition one minute
+/// after its constructor/update touch, even if it is still active.
+const SESSION_EXPIRY: Duration = Duration::from_secs(60);
 const TERMINAL_RETENTION: Duration = Duration::from_secs(60);
 /// rippled request batch limits from
 /// `../rippled/src/xrpld/app/ledger/detail/InboundLedger.cpp`:
@@ -226,6 +229,9 @@ pub struct CoordinatorSession {
     /// most one waiting session per currently usable peer.
     network_admitted: bool,
     pending_timer: Option<(TimerKind, OperationRef)>,
+    /// Independent from the three-second acquisition timer: repeated same-hash
+    /// demand replaces this identity just like `InboundLedger::update::touch`.
+    pending_expiry_timer: Option<OperationRef>,
     pending_header_read: Option<OperationRef>,
     pending_handoff: Option<DurableHandoffId>,
     // The durable ledger is retained for handoff retry: `plan.durable_ledger()`
@@ -246,6 +252,7 @@ impl CoordinatorSession {
             // Scarce-peer admission applies only to recovery after a loss.
             network_admitted: true,
             pending_timer: None,
+            pending_expiry_timer: None,
             pending_header_read: None,
             pending_handoff: None,
             durable: None,
@@ -291,6 +298,11 @@ impl CoordinatorSession {
     /// The timer this session has armed and is waiting on, if any.
     pub const fn pending_timer(&self) -> Option<(TimerKind, OperationRef)> {
         self.pending_timer
+    }
+
+    /// The one-minute live-acquisition expiry currently armed for this hash.
+    pub const fn pending_expiry_timer(&self) -> Option<OperationRef> {
+        self.pending_expiry_timer
     }
 
     /// The durable handoff id this session is awaiting acknowledgement for,
@@ -1293,13 +1305,15 @@ impl CoordinatorRunner {
             }
         }
 
-        if exact.or(hash_only_coalesce).is_some() {
+        if let Some(session) = exact.or(hash_only_coalesce) {
+            self.touch_session_expiry(session, &mut effects);
             return effects;
         }
         if let Some(session) = promotion {
             if let Some(session_state) = self.state.sessions.get_mut(&session) {
                 session_state.promote_target(target);
             }
+            self.touch_session_expiry(session, &mut effects);
             return effects;
         }
 
@@ -1397,6 +1411,7 @@ impl CoordinatorRunner {
             TimerKind::AcquireTimeout,
             self.state.budgets.acquire_timeout,
         )));
+        self.touch_session_expiry(session, &mut effects);
         if resident_seeded {
             self.run_plan_turn(session, None, &mut effects);
         }
@@ -1505,6 +1520,19 @@ impl CoordinatorRunner {
 
     fn on_timer(&mut self, operation: OperationRef, timer: TimerKind) -> Vec<AcquisitionEffect> {
         let session = operation.session();
+        if timer == TimerKind::SessionExpiry {
+            let matches = self
+                .state
+                .sessions
+                .get(&session)
+                .and_then(|state| state.pending_expiry_timer)
+                .is_some_and(|expected| expected.is_expected_for(&operation));
+            if !matches {
+                self.stats.stale_events += 1;
+                return Vec::new();
+            }
+            return self.expire_idle_session(session);
+        }
         let Some(session_state) = self.state.sessions.get_mut(&session) else {
             self.stats.stale_events += 1;
             return Vec::new();
@@ -1986,6 +2014,7 @@ impl CoordinatorRunner {
             session_state.phase = complete;
             session_state.pending_handoff = None;
             session_state.pending_timer = None;
+            session_state.pending_expiry_timer = None;
             session_state.durable = None;
             session_state.plan.terminalize_retaining_engine();
             self.stats.sessions_completed += 1;
@@ -2813,6 +2842,7 @@ impl CoordinatorRunner {
             );
             session_state.phase = failed;
             session_state.pending_timer = None;
+            session_state.pending_expiry_timer = None;
             session_state.plan.terminalize_retaining_engine();
             self.release_session_request_credits(session);
             self.discard_session_request_intents(session);
@@ -2846,6 +2876,77 @@ impl CoordinatorRunner {
             TimerKind::TerminalRetention,
             TERMINAL_RETENTION,
         )));
+    }
+
+    /// Replace the independent one-minute inactivity timer. Rippled touches an
+    /// InboundLedger only in its constructor, `update`, and `done`; network
+    /// progress deliberately does not keep a moving-tip acquisition registered.
+    fn touch_session_expiry(&mut self, session: SessionRef, effects: &mut Vec<AcquisitionEffect>) {
+        let operation = OperationRef::new(
+            session,
+            OperationKind::Timer,
+            self.state.ids.next_id(),
+            self.state.ids.next_id(),
+        );
+        let Some(state) = self.state.sessions.get_mut(&session) else {
+            return;
+        };
+        if !matches!(state.phase, SessionPhase::Active | SessionPhase::Dormant) {
+            return;
+        }
+        state.pending_expiry_timer = Some(operation);
+        effects.push(AcquisitionEffect::ArmTimer(TimerRequest::new(
+            operation,
+            TimerKind::SessionExpiry,
+            SESSION_EXPIRY,
+        )));
+    }
+
+    /// Remove an inactive live owner immediately, invalidating all exact async
+    /// identities. Canonical nodes already admitted by its engine remain in the
+    /// shared tree cache/NodeStore and can seed a later same-hash acquisition;
+    /// retaining the private traversal would recreate the leak this sweep fixes.
+    fn expire_idle_session(&mut self, session: SessionRef) -> Vec<AcquisitionEffect> {
+        let Some(mut state) = self.state.sessions.remove(&session) else {
+            self.stats.stale_events += 1;
+            return Vec::new();
+        };
+        if !matches!(state.phase, SessionPhase::Active | SessionPhase::Dormant) {
+            state.pending_expiry_timer = None;
+            self.state.sessions.insert(session, state);
+            self.stats.stale_events += 1;
+            return Vec::new();
+        }
+        let target = state.target;
+        state.plan.cancel();
+        self.release_session_request_credits(session);
+        self.discard_session_request_intents(session);
+        self.plan_seed.session_reaped(session);
+        if !self
+            .state
+            .sessions
+            .values()
+            .any(|candidate| candidate.target == target)
+        {
+            self.state.target_peer_capabilities.remove(&target);
+        }
+        self.stats.sessions_cancelled += 1;
+        *self
+            .stats
+            .cancelled_by_reason
+            .entry(CancelReason::IdleExpired)
+            .or_insert(0) += 1;
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "session_idle_expired",
+            run_epoch = session.run_epoch().get(),
+            session_id = session.session_id().get(),
+            target_hash = %session.target_hash(),
+            plan_epoch = session.plan_epoch().get(),
+            store_generation = session.store_generation().get(),
+            "acquisition trace: swept live per-hash owner after one minute without repeated demand"
+        );
+        vec![AcquisitionEffect::CancelSession(session)]
     }
 
     /// Grants bounded direct recovery work after peer capability returns. A
@@ -3326,6 +3427,7 @@ impl CoordinatorRunner {
             );
             session_state.phase = cancelled;
             session_state.pending_timer = None;
+            session_state.pending_expiry_timer = None;
             if reason == CancelReason::Shutdown {
                 session_state.plan.cancel();
             } else {
@@ -3398,12 +3500,60 @@ mod tests {
             .expect("an arm timer effect must be emitted")
     }
 
+    fn expiry_operation(effects: &[AcquisitionEffect]) -> OperationRef {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::ArmTimer(request)
+                    if request.timer() == TimerKind::SessionExpiry =>
+                {
+                    Some(request.operation())
+                }
+                _ => None,
+            })
+            .expect("a live session expiry must be armed")
+    }
+
     fn target(seq: u32) -> LedgerTarget {
         LedgerTarget::new(Uint256::from(u64::from(seq)), Some(seq))
     }
 
     fn identity(seq: u32) -> LedgerIdentity {
         LedgerIdentity::new(Uint256::from(u64::from(seq)), seq)
+    }
+
+    #[test]
+    fn repeated_same_hash_demand_replaces_idle_expiry_and_live_expiry_reaps_owner() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let started = acquire_with_effects(&mut runner, 10);
+        let session = peer_request_session(&started);
+        let first_expiry = expiry_operation(&started);
+
+        let repeated = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(10),
+            reason: AcquireReason::Consensus,
+        });
+        let replacement_expiry = expiry_operation(&repeated);
+        assert_ne!(first_expiry, replacement_expiry);
+
+        let stale = runner.handle_event(AcquisitionEvent::TimerFired {
+            operation: first_expiry,
+            timer: TimerKind::SessionExpiry,
+        });
+        assert!(stale.is_empty());
+        assert!(runner.session(session).is_some());
+
+        let expired = runner.handle_event(AcquisitionEvent::TimerFired {
+            operation: replacement_expiry,
+            timer: TimerKind::SessionExpiry,
+        });
+        assert_eq!(expired, vec![AcquisitionEffect::CancelSession(session)]);
+        assert!(runner.session(session).is_none());
+        assert_eq!(
+            runner.snapshot().cancelled_by_reason(),
+            &BTreeMap::from([(CancelReason::IdleExpired, 1)])
+        );
     }
 
     fn admitted_packet(

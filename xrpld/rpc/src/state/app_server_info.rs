@@ -2479,6 +2479,17 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
             return;
         };
 
+        let profile =
+            app::NodeSizeResourceProfile::for_node_size(app.status_rpc_node_size().as_deref());
+        json.insert(
+            "treenode_cache_target_size".to_owned(),
+            JsonValue::Unsigned(profile.tree_cache_size as u64),
+        );
+        json.insert(
+            "treenode_cache_target_age_seconds".to_owned(),
+            JsonValue::Signed(profile.tree_cache_age_seconds),
+        );
+
         json.insert(
             "node_store".to_owned(),
             JsonValue::String(node_store.kind().to_owned()),

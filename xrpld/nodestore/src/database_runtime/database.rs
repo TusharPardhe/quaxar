@@ -1096,14 +1096,18 @@ mod tests {
             keys,
             vec![
                 "node_object_cache_capacity_bytes",
+                "node_object_cache_capacity_bytes_is_estimate",
+                "node_object_cache_capacity_entries",
                 "node_object_cache_durable_loads",
                 "node_object_cache_entries",
                 "node_object_cache_hits",
+                "node_object_cache_idle_seconds",
                 "node_object_cache_invalidations",
                 "node_object_cache_misses",
                 "node_object_cache_oversized",
                 "node_object_cache_promotions",
                 "node_object_cache_rejected",
+                "node_object_cache_ttl_seconds",
                 "node_read_bytes",
                 "node_reads_duration_us",
                 "node_reads_hit",
@@ -1117,6 +1121,14 @@ mod tests {
             ]
         );
         assert_eq!(counts.get("read_queue"), Some(&JsonValue::Unsigned(0)));
+        assert_eq!(
+            counts.get("node_object_cache_capacity_entries"),
+            Some(&JsonValue::String("1000000".to_owned()))
+        );
+        assert_eq!(
+            counts.get("node_object_cache_capacity_bytes_is_estimate"),
+            Some(&JsonValue::Bool(true))
+        );
         assert!(matches!(
             counts.get("read_threads_total"),
             Some(JsonValue::Signed(value)) if *value >= 1

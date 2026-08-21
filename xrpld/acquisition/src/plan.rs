@@ -763,11 +763,15 @@ impl SessionPlan {
         if self.network_lanes.pop_front().is_some() {
             self.discard_unrequested_network_tail();
         }
-        // Destroy the temporary scan result after truncation even for the
-        // final lane. The canonical SHAMap remains shared and peer packets
-        // attach through its normal addKnownNode path; only this scan cursor
-        // and its unrequested edge table are replaced.
-        if let Some(engine) = self.engine.as_mut() {
+        // Each queued useful peer gets an independent getMissingNodes-style
+        // scan. After the final lane, however, rippled waits for a peer/timer
+        // trigger; it does not create another scan merely because the prior
+        // request was serialized. Leaving the exhausted result dormant also
+        // prevents unrelated write or stale-packet wakes from churning a fresh
+        // root walk with no peer lane to receive its output.
+        if !self.network_lanes.is_empty()
+            && let Some(engine) = self.engine.as_mut()
+        {
             engine.begin_reply_scan();
         }
     }

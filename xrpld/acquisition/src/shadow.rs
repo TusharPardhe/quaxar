@@ -100,6 +100,7 @@ impl ShadowOutcome {
                 CancelReason::Shutdown => "cancelled_shutdown",
                 CancelReason::LclInstalled => "cancelled_lcl_installed",
                 CancelReason::Explicit => "cancelled_explicit",
+                CancelReason::IdleExpired => "cancelled_idle_expired",
             },
         }
     }

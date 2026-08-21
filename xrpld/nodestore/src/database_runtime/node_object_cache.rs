@@ -43,6 +43,34 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn rippled_cache_size_and_age_control_entry_capacity_and_minutes() {
+        let mut config = Section::new("node_db");
+        config.set("cache_size", "4194304");
+        config.set("cache_age", "120");
+        config.set("cache_ttl_seconds", "0");
+
+        let cache = NodeObjectCache::from_config(&config).expect("large node cache");
+
+        assert_eq!(cache.capacity_entries, 4_194_304);
+        assert_eq!(cache.idle_seconds, 7_200);
+        assert_eq!(cache.ttl_seconds, 0);
+    }
+
+    #[test]
+    fn explicit_node_object_settings_override_legacy_settings() {
+        let mut config = Section::new("node_db");
+        config.set("cache_size", "8");
+        config.set("cache_age", "2");
+        config.set("node_object_cache_target_nodes", "16");
+        config.set("cache_idle_seconds", "30");
+
+        let cache = NodeObjectCache::from_config(&config).expect("explicit node cache");
+
+        assert_eq!(cache.capacity_entries, 16);
+        assert_eq!(cache.idle_seconds, 30);
+    }
+
+    #[test]
     fn invalidation_during_loader_does_not_repopulate_cache() {
         let cache = NodeObjectCache::from_config(&Section::new("node_db")).expect("cache");
         let hash = Uint256::from_array([0xD1; 32]);
@@ -72,6 +100,11 @@ mod tests {
 pub(crate) struct NodeObjectCache {
     cache: Cache<Uint256, Arc<NodeObject>>,
     max_entry_bytes: usize,
+    capacity_entries: u64,
+    idle_seconds: u64,
+    ttl_seconds: u64,
+    /// A sizing estimate only. The rippled-parity admission boundary is the
+    /// entry count above, not a byte weigher.
     capacity_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -171,6 +204,9 @@ impl NodeObjectCache {
         Ok(Self {
             cache,
             max_entry_bytes,
+            capacity_entries: entry_capacity,
+            idle_seconds,
+            ttl_seconds,
             capacity_bytes,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -265,8 +301,26 @@ impl NodeObjectCache {
 
     pub(crate) fn add_counts_json(&self, obj: &mut BTreeMap<String, JsonValue>) {
         obj.insert(
+            "node_object_cache_capacity_entries".to_owned(),
+            JsonValue::String(self.capacity_entries.to_string()),
+        );
+        obj.insert(
+            "node_object_cache_idle_seconds".to_owned(),
+            JsonValue::String(self.idle_seconds.to_string()),
+        );
+        obj.insert(
+            "node_object_cache_ttl_seconds".to_owned(),
+            JsonValue::String(self.ttl_seconds.to_string()),
+        );
+        // Preserve the established key for RPC compatibility, but make its
+        // modeled nature explicit. Moka admission is entry-count bounded.
+        obj.insert(
             "node_object_cache_capacity_bytes".to_owned(),
             JsonValue::String(self.capacity_bytes.to_string()),
+        );
+        obj.insert(
+            "node_object_cache_capacity_bytes_is_estimate".to_owned(),
+            JsonValue::Bool(true),
         );
         obj.insert(
             "node_object_cache_entries".to_owned(),
