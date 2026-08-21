@@ -506,6 +506,10 @@ fn strand_loop(
     let mut consensus_started = false;
     let mut last_timer_tick = Instant::now();
     let mut last_round_ledger_id: Option<Uint256> = None;
+    // Exact NetworkOPs `networkClosed` recovery identity. Unlike
+    // `last_round_ledger_id`, this is not consensus-runner bookkeeping and is
+    // therefore not overwritten when an ordinary round accepts/closes.
+    let mut preferred_recovery_target: Option<Uint256> = None;
     // Emit at most one restart-gate diagnostic per closed ledger. Accepted
     // phase maintenance runs every strand tick, so per-pass INFO events turn
     // a stalled restart gate into an operator-hostile log flood.
@@ -1034,6 +1038,7 @@ fn strand_loop(
                 &mut runner,
                 &consensus_rt,
                 &mut last_round_ledger_id,
+                &mut preferred_recovery_target,
                 &mut lcl_audit_sampler,
                 &mut provisional_lcl_waiter,
             )
@@ -1252,6 +1257,7 @@ fn reconcile_preferred_lcl(
     runner: &mut dyn ConsensusRunner,
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
+    preferred_recovery_target: &mut Option<Uint256>,
     audit_sampler: &mut LclAuditSampler,
     provisional_waiter: &mut Option<ProvisionalLclWaiter>,
 ) -> PreferredLclReconciliation {
@@ -1261,6 +1267,7 @@ fn reconcile_preferred_lcl(
         runner,
         consensus_rt,
         last_round_ledger_id,
+        preferred_recovery_target,
         audit_sampler,
         provisional_waiter,
         &broadcast_switched_ledger_status,
@@ -1287,6 +1294,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     runner: &mut dyn ConsensusRunner,
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
+    preferred_recovery_target: &mut Option<Uint256>,
     audit_sampler: &mut LclAuditSampler,
     provisional_waiter: &mut Option<ProvisionalLclWaiter>,
     status_broadcaster: &SwitchedLedgerStatusBroadcaster,
@@ -1409,7 +1417,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         selected_preferred_hash,
         our_hash,
         parent_hash,
-        *last_round_ledger_id,
+        preferred_recovery_target,
         |hash| shared_inbound.is_failure(&hash),
     );
     if let Some(waiter) = provisional_waiter.as_ref().copied()
@@ -1596,7 +1604,8 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         "LCL trace: preferred target lookup completed"
     );
     let Some(candidate) = candidate else {
-        let disposition = if shared_inbound.is_failure(&preferred_hash) {
+        let target_failed = shared_inbound.is_failure(&preferred_hash);
+        let disposition = if target_failed {
             "failed"
         } else if shared_inbound.contains(&preferred_hash) {
             "registry_active"
@@ -1634,6 +1643,12 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             );
         }
 
+        if target_failed {
+            *preferred_recovery_target = None;
+        } else {
+            *preferred_recovery_target = Some(preferred_hash);
+        }
+
         restart_preferred_lcl_recovery(
             root,
             shared_inbound,
@@ -1648,6 +1663,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
 
     let candidate_hash = *candidate.header().hash.as_uint256();
     if candidate_hash != preferred_hash {
+        *preferred_recovery_target = None;
         tracing::warn!(
             target: "lcl_trace",
             event = "preferred_lcl_hash_mismatch",
@@ -1681,6 +1697,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     }
 
     if shared_inbound.is_provisional(&candidate_hash) {
+        *preferred_recovery_target = Some(preferred_hash);
         // A legacy external completion has no Worker-2 fence identity. Keep
         // its existing non-adoption behavior, but never fabricate an exact
         // waiter key for it.
@@ -1756,6 +1773,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         );
     }
     if !state_complete || !tx_complete {
+        *preferred_recovery_target = Some(preferred_hash);
         tracing::info!(
             target: "lcl_trace",
             event = "preferred_lcl_incomplete",
@@ -1792,6 +1810,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         return PreferredLclReconciliation::Pending;
     }
     if !can_be_current || !compatible {
+        *preferred_recovery_target = None;
         tracing::warn!(
             target: "lcl_trace",
             event = "preferred_lcl_rejected",
@@ -1835,6 +1854,8 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         acquisition::LedgerTarget::new(preferred_hash, Some(candidate.header().seq)),
     );
 
+    *preferred_recovery_target = None;
+
     switch_last_closed_ledger(
         root,
         shared_inbound,
@@ -1856,16 +1877,18 @@ fn stabilized_preferred_recovery_target(
     selected: Uint256,
     local: Uint256,
     parent: Uint256,
-    current_network_closed: Option<Uint256>,
+    pinned_recovery: &mut Option<Uint256>,
     failed: impl FnOnce(Uint256) -> bool,
 ) -> Uint256 {
     if selected.is_zero() || selected == local || selected == parent {
+        *pinned_recovery = None;
         return selected;
     }
-    let Some(stable) = current_network_closed else {
+    let Some(stable) = *pinned_recovery else {
         return selected;
     };
     if stable.is_zero() || stable == local || stable == parent || failed(stable) {
+        *pinned_recovery = None;
         selected
     } else {
         stable
@@ -3465,6 +3488,7 @@ mod tests {
         let mut runner = RecordingRunner::accepted(*local.header().hash.as_uint256());
         let consensus_rt = AppConsensusRuntime::new();
         let mut last_round = None;
+        let mut preferred_recovery_target = None;
         let mut sampler = LclAuditSampler::new();
         let mut provisional_waiter = None;
         let status_broadcasts = Arc::new(AtomicUsize::new(0));
@@ -3484,12 +3508,14 @@ mod tests {
                 &mut runner,
                 &consensus_rt,
                 &mut last_round,
+                &mut preferred_recovery_target,
                 &mut sampler,
                 &mut provisional_waiter,
                 &observe_status_broadcast,
             ),
             PreferredLclReconciliation::Provisional,
         );
+        assert_eq!(preferred_recovery_target, Some(target_hash));
 
         assert!(inbound.is_provisional(&target_hash));
         assert_eq!(
@@ -3665,22 +3691,39 @@ mod tests {
         let parent = Uint256::from(9);
         let inflight = Uint256::from(100);
         let newer = Uint256::from(101);
+        let mut pinned = Some(inflight);
         assert_eq!(
-            stabilized_preferred_recovery_target(newer, local, parent, Some(inflight), |_| false,),
+            stabilized_preferred_recovery_target(newer, local, parent, &mut pinned, |_| false,),
             inflight,
             "a completion for the exact inflight hash must retain a chance to become the LCL",
         );
+        assert_eq!(pinned, Some(inflight));
+
+        // Ordinary consensus Accept/StartRound bookkeeping changes a separate
+        // last-round identity. Repeated Accepted passes therefore keep the
+        // exact recovery target even as the selected tip advances again.
+        let newest = Uint256::from(102);
         assert_eq!(
-            stabilized_preferred_recovery_target(newer, local, parent, Some(inflight), |hash| hash
+            stabilized_preferred_recovery_target(newest, local, parent, &mut pinned, |_| false,),
+            inflight,
+        );
+        assert_eq!(pinned, Some(inflight));
+
+        assert_eq!(
+            stabilized_preferred_recovery_target(newer, local, parent, &mut pinned, |hash| hash
                 == inflight,),
             newer,
             "an explicitly failed recovery target releases the moving tip",
         );
+        assert_eq!(pinned, None);
+
+        pinned = Some(inflight);
         assert_eq!(
-            stabilized_preferred_recovery_target(local, local, parent, Some(inflight), |_| false,),
+            stabilized_preferred_recovery_target(local, local, parent, &mut pinned, |_| false,),
             local,
             "network convergence to the local LCL cancels obsolete recovery",
         );
+        assert_eq!(pinned, None);
     }
 
     #[test]
