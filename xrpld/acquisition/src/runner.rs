@@ -602,6 +602,7 @@ impl CoordinatorRunner {
     fn replay_deferred_consensus(&mut self, effects: &mut Vec<AcquisitionEffect>) {
         if self.shutdown
             || !self.state.peer_view.has_usable_peer_capability()
+            || self.has_rooted_hash_only_consensus_owner()
             || self
                 .state
                 .sessions
@@ -615,7 +616,27 @@ impl CoordinatorRunner {
         let Some(target) = self.state.deferred_consensus_acquire.take() else {
             return;
         };
+        self.state.latest_consensus_target = Some(target);
         effects.extend(self.on_acquire(target, AcquireReason::Consensus, true));
+    }
+
+    fn has_rooted_hash_only_consensus_owner(&self) -> bool {
+        // NetworkOps preferred-LCL reconciliation is hash-only until the Base
+        // packet verifies a sequence. Known-sequence consensus/history work
+        // retains its existing replacement policy.
+        let Some(owner_target) = self.state.latest_consensus_target else {
+            return false;
+        };
+        if owner_target.sequence().is_some() {
+            return false;
+        }
+        self.state.sessions.values().any(|session| {
+            session.reason == AcquireReason::Consensus
+                && session.target.hash() == owner_target.hash()
+                && !matches!(session.phase, SessionPhase::Dormant)
+                && !session.phase.is_terminal()
+                && session.plan.engine().is_some()
+        })
     }
 
     /// The coordinator run epoch.
@@ -793,6 +814,18 @@ impl CoordinatorRunner {
         // Only an authoritative preferred-LCL fact may select the active
         // consensus permit. Generic consensus acquisition requests remain
         // ordinary demand and cannot revive an older dormant session.
+        //
+        // Do not move that permit on every new network close while recovery
+        // is in flight. A moving testnet tip otherwise gives each SHAMap only
+        // a few seconds of ownership, eventually evicting every incomplete
+        // tree before any ledger can finish. Retain just the newest follow-up
+        // target and replay it after the current owner becomes terminal.
+        if self.has_rooted_hash_only_consensus_owner()
+            && self.state.latest_consensus_target != Some(target.target())
+        {
+            self.state.deferred_consensus_acquire = Some(target.target());
+            return Vec::new();
+        }
         self.state.latest_consensus_target = Some(target.target());
         self.state.deferred_consensus_acquire = None;
         self.on_acquire(target.target(), target.reason(), true)
@@ -4021,43 +4054,73 @@ mod tests {
     }
 
     #[test]
-    fn new_consensus_target_moves_the_exact_active_permit_and_p0_priority() {
-        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+    fn new_consensus_targets_defer_behind_the_stable_active_owner() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![ScriptedStep::NeedsNetwork(
+                (100..140)
+                    .map(|hash| (SHAMapNodeId::default(), Uint256::from(hash)))
+                    .collect(),
+            )])),
+        );
         connect(&mut runner);
-        let old = peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
-            ConsensusTarget::new(target(10), AcquireReason::Consensus),
+        let first_target = LedgerTarget::new(Uint256::from(10), None);
+        let second_target = LedgerTarget::new(Uint256::from(20), None);
+        let newest_target = LedgerTarget::new(Uint256::from(30), None);
+        let active = peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(first_target, AcquireReason::Consensus),
         )));
-        let current =
-            peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
-                ConsensusTarget::new(target(20), AcquireReason::Consensus),
-            )));
-        let newest = peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
-            ConsensusTarget::new(target(30), AcquireReason::Consensus),
+        let _ = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            active,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        let second = runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+            second_target,
+            AcquireReason::Consensus,
+        )));
+        let newest = runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+            newest_target,
+            AcquireReason::Consensus,
         )));
 
-        assert_eq!(runner.state.latest_consensus_target, Some(target(30)));
-        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(30) });
+        assert!(second.is_empty());
+        assert!(newest.is_empty());
+        assert_eq!(runner.state.latest_consensus_target, Some(first_target));
+        assert_eq!(runner.state.deferred_consensus_acquire, Some(newest_target));
         assert_eq!(
-            runner.session(old).expect("old session").phase(),
-            &SessionPhase::Dormant
+            runner.phase(),
+            &SyncPhase::Syncing {
+                target: first_target
+            }
         );
         assert_eq!(
-            runner.session(current).expect("current session").phase(),
-            &SessionPhase::Dormant
-        );
-        assert_eq!(
-            runner.session(newest).expect("newest session").phase(),
+            runner.session(active).expect("stable owner").phase(),
             &SessionPhase::Active
         );
+        assert_eq!(runner.snapshot().session_count(), 1);
         assert_eq!(
-            runner.recovery_priority_rank(runner.session(newest).expect("P0 session")),
+            runner.recovery_priority_rank(runner.session(active).expect("P0 session")),
             0,
-            "only the newest authoritative preferred target is P0"
+            "the in-flight recovery remains P0 until it terminates"
         );
+
+        let replay = runner.handle_event(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
+        let follow_up = replay
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("the newest deferred target must start after the owner terminates");
+        assert!(replay.contains(&AcquisitionEffect::CancelSession(active)));
+        assert_eq!(follow_up.target_hash(), newest_target.hash());
+        assert_eq!(runner.state.latest_consensus_target, Some(newest_target));
         assert_eq!(
-            runner.recovery_priority_rank(runner.session(current).expect("retained session")),
-            1,
-            "the previous preferred session remains dormant and cannot retain P0"
+            runner.session(follow_up).expect("replayed owner").phase(),
+            &SessionPhase::Active
         );
     }
 
@@ -4492,85 +4555,48 @@ mod tests {
     }
 
     #[test]
-    fn latest_consensus_target_dorms_old_work_and_reactivates_exact_identity() {
-        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+    fn moving_consensus_tip_preserves_the_active_session_and_timer() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![ScriptedStep::NeedsNetwork(
+                (100..140)
+                    .map(|hash| (SHAMapNodeId::default(), Uint256::from(hash)))
+                    .collect(),
+            )])),
+        );
         connect(&mut runner);
-        let first_effects = acquire_with_effects(&mut runner, 1);
+        let first_target = LedgerTarget::new(Uint256::from(1), None);
+        let second_target = LedgerTarget::new(Uint256::from(2), None);
+        let first_effects = runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(first_target, AcquireReason::Consensus),
+        ));
         let first = peer_request_session(&first_effects);
         let first_timer = timer_operation(&first_effects);
-        let second_effects = acquire_with_effects(&mut runner, 2);
-        let second = peer_request_session(&second_effects);
+        let _ = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            first,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        let second_effects = runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(second_target, AcquireReason::Consensus),
+        ));
 
         assert_eq!(
             runner.session(first).expect("first retained").phase(),
-            &SessionPhase::Dormant
+            &SessionPhase::Active
         );
         assert_eq!(
             runner
                 .session(first)
                 .expect("first retained")
                 .pending_timer(),
-            None
+            Some((TimerKind::AcquireTimeout, first_timer))
         );
-        assert_eq!(
-            runner.session(second).expect("latest active").phase(),
-            &SessionPhase::Active
-        );
-        assert_eq!(runner.live_sessions().collect::<Vec<_>>(), vec![second]);
-        assert!(second_effects.iter().all(|effect| {
-            !matches!(effect, AcquisitionEffect::CancelSession(session) if *session == first)
-        }));
-
-        // Old ingress and timer work cannot mutate a dormant plan or release
-        // credits, and a global fetch-pack fact advances only the active target.
-        let plan_turns = runner.snapshot().plan_turns();
-        assert!(
-            runner
-                .handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
-                    first,
-                    AdmissionBudget::new(1, 64),
-                    8,
-                )))
-                .is_empty()
-        );
-        assert!(
-            runner
-                .handle_event(AcquisitionEvent::TimerFired {
-                    operation: first_timer,
-                    timer: TimerKind::AcquireTimeout,
-                })
-                .is_empty()
-        );
-        assert!(
-            runner
-                .handle_event(AcquisitionEvent::FetchPackAvailable)
-                .is_empty()
-        );
-        assert_eq!(runner.snapshot().plan_turns(), plan_turns);
-
-        // Reselecting the exact dormant target preserves its SessionRef and
-        // plan while minting a fresh request/timer identity and dorming target 2.
-        let reactivated = acquire_with_effects(&mut runner, 1);
-        assert!(reactivated.iter().all(|effect| {
-            !matches!(
-                effect,
-                AcquisitionEffect::SessionStarted(_) | AcquisitionEffect::CancelSession(_)
-            )
-        }));
-        let new_timer = timer_operation(&reactivated);
-        assert_ne!(new_timer, first_timer);
-        assert!(reactivated.iter().any(|effect| {
-            matches!(effect, AcquisitionEffect::SendLedgerRequest(request) if request.session() == first)
-        }));
-        assert_eq!(
-            runner.session(first).expect("reactivated").phase(),
-            &SessionPhase::Active
-        );
-        assert_eq!(
-            runner.session(second).expect("retained second").phase(),
-            &SessionPhase::Dormant
-        );
+        assert!(second_effects.is_empty());
         assert_eq!(runner.live_sessions().collect::<Vec<_>>(), vec![first]);
+        assert_eq!(runner.state.deferred_consensus_acquire, Some(second_target));
     }
 
     #[test]
