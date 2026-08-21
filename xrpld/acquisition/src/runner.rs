@@ -2593,14 +2593,6 @@ impl CoordinatorRunner {
             );
             return;
         }
-        let batch_ready = self
-            .state
-            .sessions
-            .get(&session)
-            .is_some_and(|state| state.plan.normal_network_batch_ready(request_limit));
-        if !batch_ready {
-            return;
-        }
         let nodes = self
             .state
             .sessions
