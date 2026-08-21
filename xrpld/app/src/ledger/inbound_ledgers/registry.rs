@@ -21,8 +21,7 @@ use std::time::{Duration, Instant};
 
 use acquisition::{
     AcquisitionEffect, AcquisitionEvent, BudgetState, CoordinatorRunner,
-    DurableHandoffAcknowledgement, DurableHandoffId, LedgerTarget, RunEpoch, RunnerSnapshot,
-    SessionRef,
+    DurableHandoffAcknowledgement, DurableHandoffId, RunEpoch, RunnerSnapshot, SessionRef,
 };
 
 use crate::network::network_ops::SharedNetworkOpsState;
@@ -222,7 +221,7 @@ impl AcquisitionLifecycleCounters {
 // ─── Reason enum ─────────────────────────────────────────────────────────────
 
 /// Why a ledger is being acquired.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AcquireReason {
     /// Consensus / validation path.
     Consensus,
