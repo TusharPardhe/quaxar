@@ -1390,7 +1390,28 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         min_valid_seq,
         &peer_counts,
     );
-    let preferred_hash = preference_diagnostic.selected;
+    let selected_preferred_hash = preference_diagnostic.selected;
+    // Keep one exact recovery identity stable while its independent
+    // InboundLedger finishes.  Re-selecting the moving validation tip on every
+    // Accepted pass used to overwrite `Syncing { target }` just before the old
+    // target became resolver-visible.  The completed ledger then could not
+    // satisfy the runner's exact LCL-install gate, so a node whose acquisition
+    // latency was close to the ledger-close cadence chased the tip forever.
+    //
+    // This preserves only NetworkOPs' strand-owned `networkClosed` recovery
+    // identity; generic/history acquisitions cannot pin it.  It remains stable
+    // until it resolves (and is installed below), explicitly fails, or an
+    // admission rejection returns NoChange and ordinary-round startup resets
+    // `last_round_ledger_id` to the local LCL.  A local or immediate-parent
+    // preference still wins immediately because recovery is no longer
+    // actionable.
+    let preferred_hash = stabilized_preferred_recovery_target(
+        selected_preferred_hash,
+        our_hash,
+        parent_hash,
+        *last_round_ledger_id,
+        |hash| shared_inbound.is_failure(&hash),
+    );
     if let Some(waiter) = provisional_waiter.as_ref().copied()
         && waiter.identity.target_hash == preferred_hash
         && shared_inbound.provisional_identity(&preferred_hash) == Some(waiter.identity)
@@ -1442,6 +1463,8 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         local_lcl_hash = %our_hash,
         local_lcl_seq = our_closed.header().seq,
         preferred_lcl_hash = %preferred_hash,
+        selected_preferred_lcl_hash = %selected_preferred_hash,
+        recovery_target_stabilized = preferred_hash != selected_preferred_hash,
         peer_count = peers.len(),
         selected_trusted_validation_count = root.validations().num_trusted_for_ledger(preferred_hash),
         selected_peer_lcl_support = peer_counts.get(&preferred_hash).copied().unwrap_or_default(),
@@ -1823,6 +1846,30 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         status_broadcaster,
     );
     PreferredLclReconciliation::Switched
+}
+
+/// Preserve the exact preferred-LCL recovery target until it either becomes
+/// installable or fails.  The selected validation tip may continue moving;
+/// that movement is acquisition demand, not evidence that an already-running
+/// recovery identity should be abandoned before its completion can be used.
+fn stabilized_preferred_recovery_target(
+    selected: Uint256,
+    local: Uint256,
+    parent: Uint256,
+    current_network_closed: Option<Uint256>,
+    failed: impl FnOnce(Uint256) -> bool,
+) -> Uint256 {
+    if selected.is_zero() || selected == local || selected == parent {
+        return selected;
+    }
+    let Some(stable) = current_network_closed else {
+        return selected;
+    };
+    if stable.is_zero() || stable == local || stable == parent || failed(stable) {
+        selected
+    } else {
+        stable
+    }
 }
 
 /// Demote only once a preferred-LCL divergence has become actionable.
@@ -2961,6 +3008,7 @@ mod tests {
         required_peer_count, same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
         should_promote_operating_mode_at_end_consensus, should_reconcile_preferred_lcl,
         should_report_peer_availability, should_run_end_consensus_reconciliation,
+        stabilized_preferred_recovery_target,
     };
     use crate::consensus::rcl_consensus::{ConsensusRunner, PendingAcceptWork, RclCxLedger};
     use crate::consensus::rcl_cx_peer_pos::RclCxPeerPos;
@@ -3608,6 +3656,30 @@ mod tests {
         assert!(
             consensus::rcl_support::ValidationsAdaptor::acquire(validations.adaptor(), &hash,)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn moving_preferred_tip_does_not_replace_inflight_recovery_identity() {
+        let local = Uint256::from(10);
+        let parent = Uint256::from(9);
+        let inflight = Uint256::from(100);
+        let newer = Uint256::from(101);
+        assert_eq!(
+            stabilized_preferred_recovery_target(newer, local, parent, Some(inflight), |_| false,),
+            inflight,
+            "a completion for the exact inflight hash must retain a chance to become the LCL",
+        );
+        assert_eq!(
+            stabilized_preferred_recovery_target(newer, local, parent, Some(inflight), |hash| hash
+                == inflight,),
+            newer,
+            "an explicitly failed recovery target releases the moving tip",
+        );
+        assert_eq!(
+            stabilized_preferred_recovery_target(local, local, parent, Some(inflight), |_| false,),
+            local,
+            "network convergence to the local LCL cancels obsolete recovery",
         );
     }
 
