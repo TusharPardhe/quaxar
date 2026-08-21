@@ -832,7 +832,14 @@ impl CoordinatorRunner {
         self.state
             .sessions
             .iter()
-            .filter(|(_, session)| session.phase == SessionPhase::Active)
+            // A registry sweep removes rippled's hash lookup even while a
+            // queued/running JobQueue lambda retains the object by shared_ptr.
+            // Keep executing the private graph, but stop routing new packets
+            // to that detached registry owner until a fresh demand touches it.
+            .filter(|(session_ref, session)| {
+                session.phase == SessionPhase::Active
+                    && !self.state.swept_local_scan_owners.contains(session_ref)
+            })
             .map(|(session_ref, _)| *session_ref)
     }
 
@@ -2461,6 +2468,9 @@ impl CoordinatorRunner {
         for session in eligible {
             let logical_scan_in_flight = self.state.swept_local_scan_owners.contains(&session)
                 || self.state.local_scan_owners.contains(&session)
+                // A queued JtLedgerData lambda captures shared_ptr<InboundLedger>;
+                // registry erasure cannot destroy that queued scan owner.
+                || self.state.local_scan_waiters.contains(&session)
                 || self.state.sessions.get(&session).is_some_and(|state| {
                     matches!(
                         state.plan.persistence(),
@@ -4030,6 +4040,7 @@ mod tests {
             .iter()
             .any(|effect| matches!(effect, AcquisitionEffect::ArmTimer(request) if request.timer() == TimerKind::SessionExpiry)));
         assert!(!runner.state.swept_local_scan_owners.contains(&session));
+        assert!(runner.live_sessions().any(|candidate| candidate == session));
 
         let mut boundary = Vec::new();
         runner.release_local_scan_at_network_boundary(session, &mut boundary);
@@ -6983,8 +6994,10 @@ mod tests {
             );
         }
 
-        // A queued target is not considered an in-flight scan for registry
-        // retention and remains sweepable at the next application cadence.
+        // A queued target models rippled's queued JtLedgerData lambda, whose
+        // captured shared_ptr keeps the InboundLedger alive until the job
+        // executes. The registry sweep marks it for reap at the eventual scan
+        // boundary but must not cancel it out of the runnable FIFO.
         let swept = sessions[5];
         let eligible = runner.handle_event(AcquisitionEvent::TimerFired {
             operation: expiries[5],
@@ -6992,8 +7005,10 @@ mod tests {
         });
         assert!(eligible.is_empty());
         let effects = runner.handle_event(AcquisitionEvent::RegistrySweep);
-        assert!(effects.contains(&AcquisitionEffect::CancelSession(swept)));
-        assert!(!runner.state.local_scan_waiters.contains(&swept));
+        assert!(effects.is_empty());
+        assert!(runner.state.local_scan_waiters.contains(&swept));
+        assert!(runner.state.swept_local_scan_owners.contains(&swept));
+        assert!(!runner.live_sessions().any(|session| session == swept));
 
         // Existing owners are never preempted. On release, the current
         // preferred target goes first; the older FIFO waiter gets the next
@@ -7014,7 +7029,22 @@ mod tests {
                 .iter()
                 .any(|read| read.operation().session() == sessions[3])
         );
+        let third_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
+            ReadCompletion::new(owner_reads[2].1, ReadOutcome::Settled { node: None }),
+        ));
+        let swept_read = read_effects(&third_release)
+            .iter()
+            .find(|read| read.operation().session() == swept)
+            .expect("the sweep-marked queued job must run before it can be reaped")
+            .operation();
         assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
+
+        let boundary = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            swept_read,
+            ReadOutcome::Settled { node: None },
+        )));
+        assert!(boundary.contains(&AcquisitionEffect::CancelSession(swept)));
+        assert!(runner.session(swept).is_none());
     }
 
     #[test]
@@ -7070,6 +7100,31 @@ mod tests {
             runner.session(reply_waiter).expect("live").packet_count(),
             1
         );
+
+        // The queued JtLedgerData-equivalent work owns a logical shared
+        // reference in rippled. Even if the registry sweep cadence lands
+        // before a run slot opens, the reply and traversal must stay queued.
+        let expiry = runner
+            .session(reply_waiter)
+            .expect("reply waiter")
+            .pending_expiry_timer()
+            .expect("expiry timer");
+        assert!(
+            runner
+                .handle_event(AcquisitionEvent::TimerFired {
+                    operation: expiry,
+                    timer: TimerKind::SessionExpiry,
+                })
+                .is_empty()
+        );
+        assert!(
+            runner
+                .handle_event(AcquisitionEvent::RegistrySweep)
+                .is_empty()
+        );
+        assert!(runner.session(reply_waiter).is_some());
+        assert!(runner.state.local_scan_waiters.contains(&reply_waiter));
+        assert!(runner.state.swept_local_scan_owners.contains(&reply_waiter));
 
         // Releasing a job must apply admitted data before allowing the moving
         // preferred target to jump the queue.  The Base packet is consumed and
