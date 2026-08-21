@@ -1354,6 +1354,8 @@ mod tests {
             Some(Duration::from_secs(60))
         );
         assert_eq!(adapter.drain(), 1, "timer fact reaches the owner queue");
+        assert_eq!(adapter.snapshot().session_count(), 1);
+        adapter.handle_fact(AcquisitionEvent::RegistrySweep);
         assert_eq!(adapter.snapshot().session_count(), 0);
         assert_eq!(adapter.cancellations.cancelled, vec![session]);
         pool.stop();
@@ -1438,6 +1440,9 @@ mod tests {
             expiry_delivered,
             "round-robin completion flush must deliver expiry despite an always-ready read producer"
         );
+        adapter.handle_fact(AcquisitionEvent::RegistrySweep);
+        assert_eq!(adapter.snapshot().session_count(), 0);
+        assert_eq!(adapter.cancellations.cancelled, vec![session]);
         pool.stop();
     }
 

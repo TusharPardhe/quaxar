@@ -78,7 +78,7 @@ const MAX_SELECTED_PEERS: usize = INITIAL_PEER_REQUEST_FANOUT
 const AGGRESSIVE_TIMEOUT_THRESHOLD: u32 = 4;
 /// rippled's `InboundLedgers::sweep` removes a per-hash acquisition one minute
 /// after its constructor/update touch, even if it is still active.
-const SESSION_EXPIRY: Duration = Duration::from_secs(60);
+const SESSION_IDLE_MINIMUM: Duration = Duration::from_secs(60);
 /// `JtLedgerData` runs at most three jobs concurrently in rippled. Quaxar uses
 /// one serialized continuation per session, so one global three-owner pool is
 /// the conservative async analogue for initial and triggered local scans.
@@ -211,6 +211,11 @@ pub struct CoordinatorState {
     last_installed_lcl: Option<LedgerIdentity>,
     local_scan_owners: BTreeSet<SessionRef>,
     local_scan_waiters: VecDeque<SessionRef>,
+    /// Sweep-eligible owners that were executing the async equivalent of a
+    /// synchronous rippled ledger-data job when the registry sweep ran. The
+    /// registry reference may disappear, but its graph survives until that
+    /// scan reaches a network boundary.
+    swept_local_scan_owners: BTreeSet<SessionRef>,
     /// The sole outbound-acquisition admission boundary. Every Base, normal
     /// frontier, timeout, Base retry, and recovery request enters here before
     /// the common emitter can construct a `PeerRequest`.
@@ -238,6 +243,7 @@ pub struct CoordinatorSession {
     /// Independent from the three-second acquisition timer: repeated same-hash
     /// demand replaces this identity just like `InboundLedger::update::touch`.
     pending_expiry_timer: Option<OperationRef>,
+    expiry_sweep_eligible: bool,
     pending_header_read: Option<OperationRef>,
     pending_handoff: Option<DurableHandoffId>,
     // The durable ledger is retained for handoff retry: `plan.durable_ledger()`
@@ -259,6 +265,7 @@ impl CoordinatorSession {
             network_admitted: true,
             pending_timer: None,
             pending_expiry_timer: None,
+            expiry_sweep_eligible: false,
             pending_header_read: None,
             pending_handoff: None,
             durable: None,
@@ -661,6 +668,7 @@ impl CoordinatorRunner {
                 last_installed_lcl: None,
                 local_scan_owners: BTreeSet::new(),
                 local_scan_waiters: VecDeque::new(),
+                swept_local_scan_owners: BTreeSet::new(),
                 outbound: OutboundRequestAdmission::default(),
                 ids: IdCounter::new(),
             },
@@ -706,6 +714,7 @@ impl CoordinatorRunner {
             }
             AcquisitionEvent::StoreRotated(generation) => self.on_store_rotated(generation),
             AcquisitionEvent::FetchPackAvailable => self.on_fetch_pack(),
+            AcquisitionEvent::RegistrySweep => self.on_registry_sweep(),
             AcquisitionEvent::Heartbeat => self.on_heartbeat(),
         };
         self.replay_deferred_consensus(&mut effects);
@@ -1592,34 +1601,11 @@ impl CoordinatorRunner {
                 self.stats.stale_events += 1;
                 return Vec::new();
             }
-            let local_reconstruction_in_flight =
-                self.state.sessions.get(&session).is_some_and(|state| {
-                    // Preserve a private tree only while a rooted traversal is
-                    // actively growing. A lone header probe has no graph to
-                    // retain and must not make an idle registry entry immortal.
-                    state.plan.pending_traversal_read_count() != 0
-                        || state.plan.read_backlog_count() != 0
-                });
-            if local_reconstruction_in_flight {
-                // Removing the registry entry in rippled does not destroy an
-                // InboundLedger whose synchronous JobQueue scan still owns a
-                // strong reference. Preserve the equivalent async owner until
-                // its current local scan reaches a network/wait boundary.
-                if let Some(state) = self.state.sessions.get_mut(&session) {
-                    state.pending_expiry_timer = None;
-                }
-                let mut effects = Vec::new();
-                self.touch_session_expiry(session, &mut effects);
-                tracing::info!(
-                    target: "acquisition_trace",
-                    event = "session_expiry_deferred_for_local_reconstruction",
-                    session_id = session.session_id().get(),
-                    target_hash = %session.target_hash(),
-                    "acquisition trace: live owner retained while brokered local reconstruction mirrors one rippled scan"
-                );
-                return effects;
+            if let Some(state) = self.state.sessions.get_mut(&session) {
+                state.expiry_sweep_eligible = true;
+                state.pending_expiry_timer = None;
             }
-            return self.expire_idle_session(session);
+            return Vec::new();
         }
         let waiting_for_local_scan = self.waiting_for_local_scan(session);
         let Some(session_state) = self.state.sessions.get_mut(&session) else {
@@ -2456,6 +2442,28 @@ impl CoordinatorRunner {
         effects
     }
 
+    fn on_registry_sweep(&mut self) -> Vec<AcquisitionEffect> {
+        let eligible = self
+            .state
+            .sessions
+            .iter()
+            .filter_map(|(session, state)| {
+                (state.expiry_sweep_eligible
+                    && matches!(state.phase, SessionPhase::Active | SessionPhase::Dormant))
+                .then_some(*session)
+            })
+            .collect::<Vec<_>>();
+        let mut effects = Vec::new();
+        for session in eligible {
+            if self.state.local_scan_owners.contains(&session) {
+                self.state.swept_local_scan_owners.insert(session);
+            } else {
+                effects.extend(self.expire_idle_session(session));
+            }
+        }
+        effects
+    }
+
     fn waiting_for_local_scan(&self, session: SessionRef) -> bool {
         self.state.local_scan_waiters.contains(&session)
     }
@@ -2514,6 +2522,7 @@ impl CoordinatorRunner {
         effects: &mut Vec<AcquisitionEffect>,
     ) {
         let was_owner = self.state.local_scan_owners.remove(&session);
+        self.state.swept_local_scan_owners.remove(&session);
         self.state
             .local_scan_waiters
             .retain(|candidate| *candidate != session);
@@ -2521,6 +2530,20 @@ impl CoordinatorRunner {
         if let Some(next) = next {
             self.state.local_scan_owners.insert(next);
             self.run_plan_turn(next, None, effects);
+        }
+    }
+
+    /// End an executing scan at the same boundary where rippled's synchronous
+    /// ledger-data job would release its final shared owner reference.
+    fn release_local_scan_at_network_boundary(
+        &mut self,
+        session: SessionRef,
+        effects: &mut Vec<AcquisitionEffect>,
+    ) {
+        let swept = self.state.swept_local_scan_owners.contains(&session);
+        self.release_local_scan_permit(session, effects);
+        if swept {
+            effects.extend(self.expire_idle_session(session));
         }
     }
 
@@ -2622,7 +2645,7 @@ impl CoordinatorRunner {
                     state.plan.pending_read_count() != 0 || state.plan.read_backlog_count() != 0
                 });
                 if !local_pending {
-                    self.release_local_scan_permit(session, effects);
+                    self.release_local_scan_at_network_boundary(session, effects);
                 }
             }
             PlanTurn::Persist(batch) => {
@@ -3166,6 +3189,11 @@ impl CoordinatorRunner {
     /// InboundLedger only in its constructor, `update`, and `done`; network
     /// progress deliberately does not keep a moving-tip acquisition registered.
     fn touch_session_expiry(&mut self, session: SessionRef, effects: &mut Vec<AcquisitionEffect>) {
+        // A fresh same-hash demand revives a graph whose registry reference
+        // was swept while its local scan was still executing. Quaxar coalesces
+        // that demand into the retained owner, so the old deferred reap must
+        // not cancel it when the scan reaches its boundary.
+        self.state.swept_local_scan_owners.remove(&session);
         let operation = OperationRef::new(
             session,
             OperationKind::Timer,
@@ -3178,11 +3206,12 @@ impl CoordinatorRunner {
         if !matches!(state.phase, SessionPhase::Active | SessionPhase::Dormant) {
             return;
         }
+        state.expiry_sweep_eligible = false;
         state.pending_expiry_timer = Some(operation);
         effects.push(AcquisitionEffect::ArmTimer(TimerRequest::new(
             operation,
             TimerKind::SessionExpiry,
-            SESSION_EXPIRY,
+            SESSION_IDLE_MINIMUM,
         )));
     }
 
@@ -3811,7 +3840,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_same_hash_demand_replaces_idle_expiry_and_live_expiry_reaps_owner() {
+    fn repeated_demand_invalidates_stale_expiry_and_global_sweep_reaps_session() {
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         connect(&mut runner);
         let started = acquire_with_effects(&mut runner, 10);
@@ -3832,16 +3861,117 @@ mod tests {
         assert!(stale.is_empty());
         assert!(runner.session(session).is_some());
 
-        let expired = runner.handle_event(AcquisitionEvent::TimerFired {
+        let eligible = runner.handle_event(AcquisitionEvent::TimerFired {
             operation: replacement_expiry,
             timer: TimerKind::SessionExpiry,
         });
+        assert!(eligible.is_empty());
+        assert!(runner.session(session).is_some());
+
+        // A touch just before the global sweep clears eligibility.
+        let touched = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(10),
+            reason: AcquireReason::Consensus,
+        });
+        let touched_expiry = expiry_operation(&touched);
+        assert!(
+            runner
+                .handle_event(AcquisitionEvent::RegistrySweep)
+                .is_empty()
+        );
+        assert!(runner.session(session).is_some());
+
+        assert!(
+            runner
+                .handle_event(AcquisitionEvent::TimerFired {
+                    operation: touched_expiry,
+                    timer: TimerKind::SessionExpiry,
+                })
+                .is_empty()
+        );
+        let expired = runner.handle_event(AcquisitionEvent::RegistrySweep);
         assert_eq!(expired, vec![AcquisitionEffect::CancelSession(session)]);
         assert!(runner.session(session).is_none());
         assert_eq!(
             runner.snapshot().cancelled_by_reason(),
             &BTreeMap::from([(CancelReason::IdleExpired, 1)])
         );
+    }
+
+    #[test]
+    fn useful_reply_after_idle_eligibility_completes_before_global_sweep() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![
+                ScriptedStep::NeedsNetwork(vec![(SHAMapNodeId::default(), Uint256::from(3))]),
+                ScriptedStep::Complete,
+            ])),
+        );
+        connect(&mut runner);
+        let started = acquire_with_effects(&mut runner, 10);
+        let session = peer_request_session(&started);
+        let expiry = expiry_operation(&started);
+
+        let frontier = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            session,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        assert!(
+            frontier
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SendLedgerRequest(_)))
+        );
+        assert!(
+            runner
+                .handle_event(AcquisitionEvent::TimerFired {
+                    operation: expiry,
+                    timer: TimerKind::SessionExpiry,
+                })
+                .is_empty()
+        );
+
+        let completed = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            session,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        assert!(completed.iter().any(|effect| {
+            matches!(effect, AcquisitionEffect::SubmitWrite(batch) if batch.requires_fence())
+        }));
+        assert!(matches!(
+            runner.session(session).expect("same graph owner").phase(),
+            SessionPhase::Persisting
+        ));
+        let swept = runner.handle_event(AcquisitionEvent::RegistrySweep);
+        assert!(!swept.contains(&AcquisitionEffect::CancelSession(session)));
+        assert!(runner.session(session).is_some());
+    }
+
+    #[test]
+    fn fresh_same_hash_demand_clears_deferred_scan_reap() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let started = acquire_with_effects(&mut runner, 10);
+        let session = peer_request_session(&started);
+        runner.state.local_scan_owners.insert(session);
+        runner.state.swept_local_scan_owners.insert(session);
+
+        let touched = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(10),
+            reason: AcquireReason::Consensus,
+        });
+        assert!(touched
+            .iter()
+            .any(|effect| matches!(effect, AcquisitionEffect::ArmTimer(request) if request.timer() == TimerKind::SessionExpiry)));
+        assert!(!runner.state.swept_local_scan_owners.contains(&session));
+
+        let mut boundary = Vec::new();
+        runner.release_local_scan_at_network_boundary(session, &mut boundary);
+        assert!(!boundary.contains(&AcquisitionEffect::CancelSession(session)));
+        assert!(runner.session(session).is_some());
     }
 
     fn admitted_packet(
@@ -6649,11 +6779,13 @@ mod tests {
             timer: TimerKind::SessionExpiry,
         });
         assert!(runner.session(session).is_some());
-        assert!(expiry_effects.iter().any(|effect| matches!(
-            effect,
-            AcquisitionEffect::ArmTimer(request)
-                if request.timer() == TimerKind::SessionExpiry
-        )));
+        assert!(expiry_effects.is_empty());
+        assert!(
+            runner
+                .handle_event(AcquisitionEvent::RegistrySweep)
+                .is_empty()
+        );
+        assert!(runner.state.swept_local_scan_owners.contains(&session));
 
         // More than rippled's seven network no-progress ticks may pass while
         // the externalized equivalent of one synchronous local scan is still
@@ -6681,19 +6813,8 @@ mod tests {
             read,
             ReadOutcome::Settled { node: None },
         )));
-        assert!(
-            network
-                .iter()
-                .any(|effect| matches!(effect, AcquisitionEffect::SendLedgerRequest(_)))
-        );
-        assert_eq!(
-            runner
-                .session(session)
-                .expect("network phase")
-                .plan()
-                .pending_read_count(),
-            0
-        );
+        assert!(network.contains(&AcquisitionEffect::CancelSession(session)));
+        assert!(runner.session(session).is_none());
     }
 
     #[test]
@@ -6800,12 +6921,14 @@ mod tests {
         }
 
         // A queued target is not considered an in-flight scan for registry
-        // retention and remains sweepable at the ordinary one-minute expiry.
+        // retention and remains sweepable at the next application cadence.
         let swept = sessions[5];
-        let effects = runner.handle_event(AcquisitionEvent::TimerFired {
+        let eligible = runner.handle_event(AcquisitionEvent::TimerFired {
             operation: expiries[5],
             timer: TimerKind::SessionExpiry,
         });
+        assert!(eligible.is_empty());
+        let effects = runner.handle_event(AcquisitionEvent::RegistrySweep);
         assert!(effects.contains(&AcquisitionEffect::CancelSession(swept)));
         assert!(!runner.state.local_scan_waiters.contains(&swept));
 

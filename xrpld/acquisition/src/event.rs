@@ -133,6 +133,11 @@ pub enum AcquisitionEvent {
     /// `Connected`/`Syncing`; it never changes a session or phase.
     Heartbeat,
 
+    /// The application's configured inbound-ledger registry sweep fired.
+    /// Sessions whose one-minute idle minimum elapsed are reaped only on this
+    /// global cadence, matching `InboundLedgersImp::sweep`.
+    RegistrySweep,
+
     /// The node is shutting down.
     Shutdown,
 }

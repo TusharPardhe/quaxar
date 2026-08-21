@@ -180,6 +180,7 @@ pub enum ShadowEventTag {
     StoreRotated,
     FetchPackAvailable,
     Heartbeat,
+    RegistrySweep,
     Shutdown,
 }
 
@@ -205,6 +206,7 @@ impl ShadowEventTag {
             Self::StoreRotated => "store_rotated",
             Self::FetchPackAvailable => "fetch_pack_available",
             Self::Heartbeat => "heartbeat",
+            Self::RegistrySweep => "registry_sweep",
             Self::Shutdown => "shutdown",
         }
     }
@@ -231,6 +233,7 @@ impl From<&AcquisitionEvent> for ShadowEventTag {
             AcquisitionEvent::StoreRotated(_) => Self::StoreRotated,
             AcquisitionEvent::FetchPackAvailable => Self::FetchPackAvailable,
             AcquisitionEvent::Heartbeat => Self::Heartbeat,
+            AcquisitionEvent::RegistrySweep => Self::RegistrySweep,
             AcquisitionEvent::Shutdown => Self::Shutdown,
         }
     }
@@ -542,6 +545,9 @@ impl ShadowRunner {
             }
             AcquisitionEvent::FetchPackAvailable => self.derive_fetch_pack(tag, &mut out),
             AcquisitionEvent::Heartbeat => self.derive_heartbeat(tag, &mut out),
+            // Registry lifetime is deliberately not modeled by the policy
+            // shadow; the owner runner validates exact session identities.
+            AcquisitionEvent::RegistrySweep => {}
             AcquisitionEvent::Shutdown => self.derive_shutdown(tag, &mut out),
         }
         out

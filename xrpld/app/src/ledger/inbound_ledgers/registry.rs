@@ -2310,6 +2310,24 @@ impl InboundLedgers {
         if swept {
             self.notify_publication_advance();
         }
+
+        // Use the application's configured inbound-ledger sweep cadence for
+        // coordinator owners too. Their exact one-minute timer only marks
+        // eligibility; this global pass owns removal, matching rippled.
+        let failures = {
+            let mut guard = self
+                .coordinator
+                .lock()
+                .expect("acquisition coordinator lock");
+            match guard.as_mut() {
+                Some(coordinator) => {
+                    coordinator.handle_fact(acquisition::AcquisitionEvent::RegistrySweep);
+                    coordinator.take_terminal_failures()
+                }
+                None => Vec::new(),
+            }
+        };
+        self.record_coordinator_failures(failures);
     }
 
     /// Record a preferred-LCL request, selection, installation, or rejection
