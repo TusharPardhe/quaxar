@@ -349,6 +349,10 @@ impl CoordinatorSession {
         self.pending_header_read.is_some()
             || self.plan.pending_read_count() != 0
             || self.plan.read_backlog_count() != 0
+            || matches!(
+                self.plan.persistence(),
+                crate::plan::SessionPersistence::IncrementalWritePending { .. }
+            )
     }
 }
 
@@ -2455,7 +2459,15 @@ impl CoordinatorRunner {
             .collect::<Vec<_>>();
         let mut effects = Vec::new();
         for session in eligible {
-            if self.state.local_scan_owners.contains(&session) {
+            let logical_scan_in_flight = self.state.swept_local_scan_owners.contains(&session)
+                || self.state.local_scan_owners.contains(&session)
+                || self.state.sessions.get(&session).is_some_and(|state| {
+                    matches!(
+                        state.plan.persistence(),
+                        crate::plan::SessionPersistence::IncrementalWritePending { .. }
+                    )
+                });
+            if logical_scan_in_flight {
                 self.state.swept_local_scan_owners.insert(session);
             } else {
                 effects.extend(self.expire_idle_session(session));
@@ -2479,6 +2491,19 @@ impl CoordinatorRunner {
         if state.phase != SessionPhase::Active {
             return false;
         }
+        // An incremental write is an externalized store-before-continue
+        // boundary, not a running JtLedgerData-equivalent job. The retained
+        // plan remains the logical scan owner, but it must not enter the
+        // runnable FIFO until its exact WriteCompleted event settles.
+        if matches!(
+            state.plan.persistence(),
+            crate::plan::SessionPersistence::IncrementalWritePending { .. }
+        ) {
+            self.state
+                .local_scan_waiters
+                .retain(|candidate| *candidate != session);
+            return false;
+        }
         let owners = &mut self.state.local_scan_owners;
         let waiters = &mut self.state.local_scan_waiters;
         if owners.contains(&session) {
@@ -2494,9 +2519,15 @@ impl CoordinatorRunner {
         false
     }
 
-    /// Chooses the current preferred consensus target first, otherwise FIFO.
-    /// Existing owners are never preempted, so an older scan always has a path
-    /// to its first peer frontier.
+    /// Chooses an admitted peer reply first, then the current preferred
+    /// consensus target, otherwise FIFO.  A queued ledger-data job in rippled
+    /// owns the inbound ledger until that reply has been applied.  Treating a
+    /// packet-bearing session like a speculative local scan lets continuously
+    /// moving consensus targets jump it forever, leaving the useful packet in
+    /// the mailbox until the registry sweep expires the session.
+    ///
+    /// Existing owners are never preempted.  This only selects which retained
+    /// continuation receives the next released JtLedgerData-equivalent slot.
     fn pop_scan_waiter(&mut self) -> Option<SessionRef> {
         let sessions = &self.state.sessions;
         let latest_consensus_target = self.state.latest_consensus_target;
@@ -2506,6 +2537,11 @@ impl CoordinatorRunner {
                 .get(session)
                 .is_some_and(|state| state.phase == SessionPhase::Active)
         });
+        let admitted_reply = waiters.iter().position(|session| {
+            sessions
+                .get(session)
+                .is_some_and(|state| state.plan.packet_count() != 0)
+        });
         let preferred = latest_consensus_target.and_then(|target| {
             waiters.iter().position(|session| {
                 sessions.get(session).is_some_and(|state| {
@@ -2513,7 +2549,7 @@ impl CoordinatorRunner {
                 })
             })
         });
-        waiters.remove(preferred.unwrap_or(0))
+        waiters.remove(admitted_reply.or(preferred).unwrap_or(0))
     }
 
     fn release_local_scan_permit(
@@ -2523,6 +2559,26 @@ impl CoordinatorRunner {
     ) {
         let was_owner = self.state.local_scan_owners.remove(&session);
         self.state.swept_local_scan_owners.remove(&session);
+        self.state
+            .local_scan_waiters
+            .retain(|candidate| *candidate != session);
+        let next = was_owner.then(|| self.pop_scan_waiter()).flatten();
+        if let Some(next) = next {
+            self.state.local_scan_owners.insert(next);
+            self.run_plan_turn(next, None, effects);
+        }
+    }
+
+    /// Yield only the three-slot runnable job permit while retaining the
+    /// session's logical scan epoch. Incremental persistence is asynchronous
+    /// in Quaxar, so holding a run slot until its acknowledgement would leave
+    /// all three slots idle and starve already-admitted peer replies.
+    fn yield_local_scan_permit(
+        &mut self,
+        session: SessionRef,
+        effects: &mut Vec<AcquisitionEffect>,
+    ) {
+        let was_owner = self.state.local_scan_owners.remove(&session);
         self.state
             .local_scan_waiters
             .retain(|candidate| *candidate != session);
@@ -2687,6 +2743,13 @@ impl CoordinatorRunner {
                     self.discard_session_request_intents(session);
                 }
                 effects.push(AcquisitionEffect::SubmitWrite(batch));
+                if !final_batch {
+                    // Publish the exact write command before waking another
+                    // runnable job. The logical scan is already retained in
+                    // IncrementalWritePending and only its matching completion
+                    // may place it back in the permit FIFO.
+                    self.yield_local_scan_permit(session, effects);
+                }
             }
             PlanTurn::Invalid => {
                 self.release_local_scan_permit(session, effects);
@@ -6952,6 +7015,201 @@ mod tests {
                 .any(|read| read.operation().session() == sessions[3])
         );
         assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
+    }
+
+    #[test]
+    fn admitted_reply_waiter_runs_before_a_new_preferred_scan() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let mut sessions = Vec::new();
+        let mut owner_reads = Vec::new();
+
+        for seq in 40..45 {
+            let started = acquire_with_effects(&mut runner, seq);
+            let session = peer_request_session(&started);
+            sessions.push(session);
+            let state = runner.state.sessions.get_mut(&session).expect("session");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(u64::from(seq)),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(u64::from(seq) + 30_000)),
+                    seq,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+            let mut effects = Vec::new();
+            runner.run_plan_turn(session, None, &mut effects);
+            if let Some(read) = read_effects(&effects).first() {
+                owner_reads.push(read.operation());
+            }
+        }
+
+        assert_eq!(owner_reads.len(), MAX_LOCAL_SCAN_OWNERS);
+        let reply_waiter = sessions[3];
+        let newest_preferred = sessions[4];
+        runner.state.latest_consensus_target = Some(target(44));
+        assert_eq!(runner.state.latest_consensus_target, Some(target(44)));
+
+        // A reply received while all three jobs are occupied remains retained
+        // in its mailbox and queues the session for the next permit.
+        let effects = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            reply_waiter,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        assert!(effects.is_empty());
+        assert_eq!(
+            runner.session(reply_waiter).expect("live").packet_count(),
+            1
+        );
+
+        // Releasing a job must apply admitted data before allowing the moving
+        // preferred target to jump the queue.  The Base packet is consumed and
+        // the retained continuation immediately emits its first local read.
+        let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            owner_reads[0],
+            ReadOutcome::Settled { node: None },
+        )));
+        assert!(
+            read_effects(&effects)
+                .iter()
+                .any(|read| read.operation().session() == reply_waiter)
+        );
+        assert_eq!(
+            runner.session(reply_waiter).expect("live").packet_count(),
+            0
+        );
+        assert!(runner.state.local_scan_waiters.contains(&newest_preferred));
+    }
+
+    #[test]
+    fn incremental_writes_yield_run_slots_and_exact_completion_resumes_old_scan() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let sessions = (70..74)
+            .map(|seq| peer_request_session(&acquire_with_effects(&mut runner, seq)))
+            .collect::<Vec<_>>();
+
+        for (index, session) in sessions[..3].iter().enumerate() {
+            let seq = 70 + index as u32;
+            let state = runner.state.sessions.get_mut(session).expect("session");
+            state.pending_header_read = None;
+            assert!(
+                state.plan.install_engine(Box::new(
+                    ScriptedEngine::new(
+                        TreePlanId::new(u64::from(seq)),
+                        VecDeque::from([ScriptedStep::NeedsNetwork(vec![(
+                            SHAMapNodeId::default(),
+                            Uint256::from(u64::from(seq) + 40_000),
+                        )])]),
+                        vec![crate::io::PersistNode::new(
+                            SHAMapHash::new(Uint256::from(u64::from(seq) + 50_000)),
+                            bytes::Bytes::from_static(b"accepted-node"),
+                            crate::io::StoredObjectKind::AccountNode,
+                        )],
+                    )
+                    .with_persistence_sequence(seq),
+                ))
+            );
+            runner.state.local_scan_owners.insert(*session);
+        }
+
+        let reply_waiter = sessions[3];
+        {
+            let state = runner
+                .state
+                .sessions
+                .get_mut(&reply_waiter)
+                .expect("reply waiter");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(74),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(60_000)),
+                    73,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+        }
+        assert!(
+            runner
+                .handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+                    reply_waiter,
+                    AdmissionBudget::new(1, 256),
+                    8,
+                )))
+                .is_empty()
+        );
+        assert!(runner.state.local_scan_waiters.contains(&reply_waiter));
+
+        // The first incremental write immediately yields its runnable slot;
+        // the admitted reply waiter consumes that slot in the same effect
+        // batch instead of waiting for the write acknowledgement.
+        let mut first = Vec::new();
+        runner.run_plan_turn(sessions[0], None, &mut first);
+        let first_write = write_batch(&first);
+        assert!(first_write.fence().is_none());
+        let write_position = first
+            .iter()
+            .position(|effect| matches!(effect, AcquisitionEffect::SubmitWrite(_)))
+            .expect("incremental write effect");
+        let reply_position = first
+            .iter()
+            .position(|effect| {
+                matches!(effect, AcquisitionEffect::SubmitRead(read) if read.operation().session() == reply_waiter)
+            })
+            .expect("promoted reply read");
+        assert!(write_position < reply_position);
+        assert!(
+            read_effects(&first)
+                .iter()
+                .any(|read| read.operation().session() == reply_waiter)
+        );
+        assert!(!runner.state.local_scan_owners.contains(&sessions[0]));
+
+        let mut writes = vec![first_write];
+        for session in &sessions[1..3] {
+            let mut effects = Vec::new();
+            runner.run_plan_turn(*session, None, &mut effects);
+            let batch = write_batch(&effects);
+            assert!(batch.fence().is_none());
+            writes.push(batch);
+            assert!(!runner.state.local_scan_owners.contains(session));
+        }
+
+        // Only the exact old write completion requeues the retained scan. Its
+        // deferred network frontier survives the yield and is requested; no
+        // replacement engine or parallel owner is created.
+        let resumed = runner.handle_event(AcquisitionEvent::WriteCompleted(WriteCompletion::new(
+            writes[0].operation(),
+            WriteOutcome::Accepted,
+        )));
+        assert!(resumed
+            .iter()
+            .any(|effect| matches!(effect, AcquisitionEffect::SendLedgerRequest(request) if request.session() == sessions[0])));
+        assert!(matches!(
+            runner
+                .session(sessions[0])
+                .expect("retained scan")
+                .plan()
+                .persistence(),
+            crate::plan::SessionPersistence::None
+        ));
     }
 
     #[test]

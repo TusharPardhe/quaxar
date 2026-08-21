@@ -31,6 +31,7 @@ use ledger::{
     TreePlanId,
 };
 use shamap::family::{FullBelowCache, FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
+use shamap::node_id::deserialize_shamap_node_id;
 use shamap::sync::{MissingNodeReadApply, MissingNodeReadOutcome, MissingNodeResidentLookup};
 use shamap::tree_node::SHAMapTreeNode;
 use shamap::tree_node_cache::TreeNodeCache;
@@ -647,6 +648,9 @@ impl TreeEngine for AppLedgerPlanEngine {
         let Ok(Some(decoded)) = SHAMapTreeNode::make_from_wire(&node.node_data) else {
             return PlanNetworkApply::new(PlanReadApply::UnknownRead, useful);
         };
+        let Some(node_id) = node.node_id.as_deref().and_then(deserialize_shamap_node_id) else {
+            return PlanNetworkApply::invalid(PlanReadApply::UnknownRead, useful);
+        };
         let hash = decoded.get_hash();
         // Packet admission already canonicalized every useful backed node.
         // Resume the retained continuation with that exact shared object, not
@@ -654,14 +658,22 @@ impl TreeEngine for AppLedgerPlanEngine {
         // and continuation in one object graph like rippled's addKnownNode.
         let mut canonical = self.cache.fetch(hash.as_uint256()).unwrap_or(decoded);
         self.family.canonicalize(hash, &mut canonical);
-        let applied =
-            Self::map_apply(plan.apply_network_node(self.plan_id, hash, canonical.clone()));
+        let applied = Self::map_apply(plan.apply_known_network_node(
+            self.plan_id,
+            node_id,
+            hash,
+            canonical.clone(),
+        ));
         if matches!(applied, PlanReadApply::Applied { .. }) {
             let _ = self
                 .store
                 .store_resident_shamap_node(kind, &canonical, self.inbound.seq());
         }
-        PlanNetworkApply::new(applied, useful)
+        if matches!(applied, PlanReadApply::HashMismatch) {
+            PlanNetworkApply::invalid(applied, useful)
+        } else {
+            PlanNetworkApply::new(applied, useful)
+        }
     }
 
     fn begin_reply_scan(&mut self) {

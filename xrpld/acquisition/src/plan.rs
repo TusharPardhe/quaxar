@@ -2107,13 +2107,22 @@ impl TreeEngine for LedgerTreePlanEngine {
         let Ok(Some(decoded)) = SHAMapTreeNode::make_from_wire(&node.node_data) else {
             return PlanNetworkApply::new(PlanReadApply::UnknownRead, false);
         };
+        let Some(node_id) = node.node_id.as_deref().and_then(deserialize_shamap_node_id) else {
+            return PlanNetworkApply::invalid(PlanReadApply::UnknownRead, false);
+        };
         let hash = decoded.get_hash();
-        let attachment =
-            Self::map_apply(self.plan.apply_network_node(self.plan.id(), hash, decoded));
-        PlanNetworkApply::new(
-            attachment,
-            matches!(attachment, PlanReadApply::Applied { .. }),
-        )
+        let attachment = Self::map_apply(self.plan.apply_known_network_node(
+            self.plan.id(),
+            node_id,
+            hash,
+            decoded,
+        ));
+        let useful = matches!(attachment, PlanReadApply::Applied { .. });
+        if matches!(attachment, PlanReadApply::HashMismatch) {
+            PlanNetworkApply::invalid(attachment, useful)
+        } else {
+            PlanNetworkApply::new(attachment, useful)
+        }
     }
 
     fn begin_reply_scan(&mut self) {

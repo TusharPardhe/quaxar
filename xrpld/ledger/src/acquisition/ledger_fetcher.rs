@@ -277,6 +277,21 @@ impl TreePlan {
             .apply_network_node(MissingNodePlanId::new(plan_id.get()), hash, node)
     }
 
+    pub fn apply_known_network_node(
+        &mut self,
+        plan_id: TreePlanId,
+        node_id: shamap::node_id::SHAMapNodeId,
+        hash: SHAMapHash,
+        node: basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>,
+    ) -> MissingNodeReadApply {
+        self.continuation.apply_known_network_node(
+            MissingNodePlanId::new(plan_id.get()),
+            node_id,
+            hash,
+            node,
+        )
+    }
+
     /// Give a useful Reply trigger the same fresh missing-node discovery
     /// budget as rippled's new `getMissingNodes(256)` invocation.
     pub fn begin_reply_scan(&mut self) {

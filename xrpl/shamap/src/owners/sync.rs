@@ -3626,6 +3626,92 @@ impl MissingNodeContinuation {
         }
     }
 
+    /// Apply a peer node by its advertised SHAMap position.
+    ///
+    /// Unlike a recovery read, a `TMLedgerData` reply may contain the requested
+    /// node followed by fat descendants which have not yet appeared in this
+    /// continuation's missing-hash table. rippled routes every such entry
+    /// through `SHAMap::addKnownNode(nodeID, ...)`, so walk the already-owned
+    /// graph and attach the first absent child at that exact position. This
+    /// also validates that a requested hash is not attached under a forged
+    /// packet node id.
+    pub fn apply_known_network_node(
+        &mut self,
+        plan_id: MissingNodePlanId,
+        node_id: SHAMapNodeId,
+        hash: SHAMapHash,
+        node: SharedIntrusive<SHAMapTreeNode>,
+    ) -> MissingNodeReadApply {
+        if plan_id != self.plan_id {
+            return MissingNodeReadApply::StalePlan;
+        }
+        if node.get_hash() != hash || node_id.is_root() {
+            self.invalid = node.get_hash() != hash;
+            return MissingNodeReadApply::HashMismatch;
+        }
+
+        let mut current = self.root.clone();
+        let mut current_id = SHAMapNodeId::default();
+        while current_id.get_depth() < node_id.get_depth() {
+            if !current.is_inner() {
+                return MissingNodeReadApply::HashMismatch;
+            }
+            let branch = crate::node_id::select_branch(current_id, node_id.get_node_id());
+            if current.is_empty_branch(branch) {
+                return MissingNodeReadApply::HashMismatch;
+            }
+            let child_id = current_id
+                .get_child_node_id(branch)
+                .expect("peer node position must stay within SHAMap bounds");
+            let child_hash = current.get_child_hash(branch);
+
+            if child_id == node_id {
+                if child_hash != hash {
+                    return MissingNodeReadApply::HashMismatch;
+                }
+                // Exact waiters may include several canonical parents sharing
+                // the same hash. Preserve the existing all-edge attachment.
+                if self.pending_network_by_hash.contains_key(&hash) {
+                    return self.apply_network_node(plan_id, hash, node);
+                }
+                if let Some(existing) = current.get_child(branch) {
+                    return if existing.get_hash() == hash {
+                        MissingNodeReadApply::Applied {
+                            attached_edges: 0,
+                            missing_edges: 0,
+                        }
+                    } else {
+                        MissingNodeReadApply::HashMismatch
+                    };
+                }
+
+                current.canonicalize_child(branch, node);
+                self.deferred_resumes.insert(
+                    &*current as *const SHAMapTreeNode as usize,
+                    DeferredResume {
+                        node: current,
+                        node_id: current_id,
+                    },
+                );
+                self.stats.deferred_resumes += 1;
+                return MissingNodeReadApply::Applied {
+                    attached_edges: 1,
+                    missing_edges: 0,
+                };
+            }
+
+            let Some(child) = current.get_child(branch) else {
+                // Same as rippled's `unable to hook node`: an out-of-order fat
+                // descendant is useful packet data but cannot yet mutate this
+                // graph. A later reply scan can accept it from the shared map.
+                return MissingNodeReadApply::UnknownRead;
+            };
+            current = child;
+            current_id = child_id;
+        }
+        MissingNodeReadApply::UnknownRead
+    }
+
     /// Re-advertise an extant verified candidate after timeout policy decides
     /// to retry it. No traversal state or plan identity changes.
     pub fn retry_network_candidate(&mut self, hash: SHAMapHash) -> bool {
@@ -6459,6 +6545,91 @@ mod native_missing_node_continuation_tests {
             continuation.advance(32, 4, &mut resident, &mut || 0),
             MissingNodeAdvance::Complete
         ));
+    }
+
+    #[test]
+    fn fat_reply_descendant_attaches_by_node_id_before_it_is_requested() {
+        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            crate::tree_node::SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0x12; 32]), vec![0x44; 12]),
+            1,
+        ));
+        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        parent.set_child_hash(2, leaf.get_hash());
+        parent.update_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(1, parent.get_hash());
+        root.update_hash();
+
+        let parent_id = SHAMapNodeId::default()
+            .get_child_node_id(1)
+            .expect("depth-one id");
+        let leaf_id = parent_id.get_child_node_id(2).expect("depth-two id");
+        let mut continuation = continuation(&root, 1);
+
+        // A fat reply is ordered parent-first. The descendant has never been
+        // emitted by this continuation, but rippled's addKnownNode accepts it
+        // by position once its parent is attached.
+        assert_eq!(
+            continuation.apply_known_network_node(
+                MissingNodePlanId::new(1),
+                parent_id,
+                parent.get_hash(),
+                parent.clone(),
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 1,
+                missing_edges: 0,
+            }
+        );
+        assert_eq!(
+            continuation.apply_known_network_node(
+                MissingNodePlanId::new(1),
+                leaf_id,
+                leaf.get_hash(),
+                leaf.clone(),
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 1,
+                missing_edges: 0,
+            }
+        );
+        let attached_parent = root.get_child(1).expect("fat parent attached");
+        assert_eq!(attached_parent.get_hash(), parent.get_hash());
+        assert_eq!(
+            attached_parent
+                .get_child(2)
+                .expect("fat descendant attached")
+                .get_hash(),
+            leaf.get_hash()
+        );
+    }
+
+    #[test]
+    fn peer_node_id_cannot_redirect_a_requested_hash() {
+        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            crate::tree_node::SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0x10; 32]), vec![0x55; 12]),
+            1,
+        ));
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(1, child.get_hash());
+        root.update_hash();
+        let mut continuation = continuation(&root, 1);
+        let forged_id = SHAMapNodeId::default()
+            .get_child_node_id(2)
+            .expect("depth-one id");
+
+        assert_eq!(
+            continuation.apply_known_network_node(
+                MissingNodePlanId::new(1),
+                forged_id,
+                child.get_hash(),
+                child,
+            ),
+            MissingNodeReadApply::HashMismatch
+        );
+        assert!(root.get_child(1).is_none());
     }
 
     #[test]
