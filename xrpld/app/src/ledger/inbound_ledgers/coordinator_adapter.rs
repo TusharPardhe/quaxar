@@ -239,7 +239,10 @@ impl CoordinatorIngress {
             .iter()
             .map(|node| node.node_data.len() as u64)
             .sum::<u64>();
-        match route.gate().try_reserve(packet.nodes.len() as u64, bytes) {
+        // Admission capacity is measured in complete `TMLedgerData` frames,
+        // matching rippled's received-data queue and the legacy 128-packet
+        // bound. The independent byte reservation still measures all nodes.
+        match route.gate().try_reserve(1, bytes) {
             BackpressureOutcome::Admitted(lease) => {
                 let admitted = match AdmittedLedgerPacket::new(
                     lease,
@@ -444,13 +447,11 @@ where
     /// Handle one typed event and dispatch its effects through the ports.
     /// Effects are executed only after the runner has mutated its state, so no
     /// port observes coordinator state mid-mutation.
-    pub(crate) fn handle_fact(&mut self, mut event: AcquisitionEvent) -> Vec<AcquisitionEffect> {
-        if let AcquisitionEvent::PacketAdmitted(packet) = &mut event {
-            // The moved packet holds the exact gate that reserved it. Settle it
-            // before planning so route replacement can never release through a
-            // newer session's gate; Drop is only a defensive no-op fallback.
-            let _ = packet.settle();
-        }
+    pub(crate) fn handle_fact(&mut self, event: AcquisitionEvent) -> Vec<AcquisitionEffect> {
+        // Keep a moved `AdmittedLedgerPacket`'s exact lease charged through
+        // ingress and its session mailbox. It is settled when fed, rejected,
+        // cancelled, or dropped, so the immutable route gate provides real
+        // cross-thread backpressure instead of permitting a late mailbox drop.
         let effects = self.runner.handle_event(event);
         self.note_terminal_failures(&effects);
         // A request can synchronously produce an overlay reply. Publish the
