@@ -3332,12 +3332,7 @@ impl MissingNodeContinuation {
         if !reads.is_empty() {
             return MissingNodeAdvance::NeedsReads(reads);
         }
-        // Match rippled's gmnProcessDeferredReads boundary: one
-        // getMissingNodes pass waits for every local read it admitted before
-        // returning the accumulated peer frontier. Emitting after the first
-        // miss turns the 128-node reply allowance into a stream of one-node
-        // requests and prevents query-depth expansion from doing useful work.
-        if self.pending_by_hash.is_empty() && !self.unannounced_network.is_empty() {
+        if !self.unannounced_network.is_empty() {
             return MissingNodeAdvance::NeedsNetwork(std::mem::take(&mut self.unannounced_network));
         }
         if self.invalid {
@@ -6320,66 +6315,6 @@ mod native_missing_node_continuation_tests {
             continuation.advance(32, 4, &mut resident, &mut || 0),
             MissingNodeAdvance::Complete
         ));
-    }
-
-    #[test]
-    fn peer_frontier_waits_for_the_whole_deferred_read_batch() {
-        let first_hash = hash(0x31);
-        let second_hash = hash(0x32);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        root.set_child_hash(1, first_hash);
-        root.set_child_hash(2, second_hash);
-        root.update_hash();
-        let mut continuation = continuation(&root, 31);
-        let mut resident = EmptyResident;
-
-        let MissingNodeAdvance::NeedsReads(needs) =
-            continuation.advance(32, 4, &mut resident, &mut || 0)
-        else {
-            panic!("expected one deferred-read batch");
-        };
-        assert_eq!(needs.len(), 2);
-
-        assert!(matches!(
-            continuation.apply_read_result(
-                MissingNodePlanId::new(31),
-                first_hash,
-                MissingNodeReadOutcome::Miss,
-            ),
-            MissingNodeReadApply::Applied {
-                attached_edges: 0,
-                missing_edges: 1,
-            }
-        ));
-        assert!(matches!(
-            continuation.advance(32, 4, &mut resident, &mut || 0),
-            MissingNodeAdvance::Ready
-        ));
-
-        assert!(matches!(
-            continuation.apply_read_result(
-                MissingNodePlanId::new(31),
-                second_hash,
-                MissingNodeReadOutcome::Miss,
-            ),
-            MissingNodeReadApply::Applied {
-                attached_edges: 0,
-                missing_edges: 1,
-            }
-        ));
-        let MissingNodeAdvance::NeedsNetwork(missing) =
-            continuation.advance(32, 4, &mut resident, &mut || 0)
-        else {
-            panic!("expected the accumulated peer frontier");
-        };
-        assert_eq!(missing.len(), 2);
-        assert_eq!(
-            missing
-                .iter()
-                .map(|(_, candidate)| *candidate)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([*first_hash.as_uint256(), *second_hash.as_uint256()])
-        );
     }
 
     #[test]

@@ -743,6 +743,32 @@ impl SessionPlan {
         &self.retained_network
     }
 
+    /// Whether the next homogeneous peer frontier is ready to serialize.
+    ///
+    /// Deferred NodeStore misses arrive as independent actor facts. Holding
+    /// their wire emission here lets those facts continue advancing the tree
+    /// while coalescing the same up-to-128-node request that rippled produces
+    /// after `gmnProcessDeferredReads`. A short tail is ready once ordinary
+    /// reads/backlog drain; a kind boundary is also ready because one
+    /// `TMGetLedger` cannot mix state and transaction nodes.
+    pub fn normal_network_batch_ready(&self, max_nodes: usize) -> bool {
+        let Some(first) = self.unemitted_network.front() else {
+            return false;
+        };
+        if max_nodes == 0 {
+            return false;
+        }
+        let same_kind = self
+            .unemitted_network
+            .iter()
+            .take_while(|need| need.kind() == first.kind())
+            .take(max_nodes)
+            .count();
+        same_kind >= max_nodes
+            || same_kind < self.unemitted_network.len()
+            || (self.pending_reads.is_empty() && self.read_backlog.is_empty())
+    }
+
     /// Removes the next normal outbound request batch from the exact retained
     /// frontier. The batch is FIFO and homogeneous by tree kind because one
     /// `TMGetLedger` request carries one node kind. A timeout never consumes
@@ -2454,6 +2480,48 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert!(plan.pending_network().contains(&Uint256::from(42)));
         assert_eq!(nodes[0].kind(), TreeKind::State);
+    }
+
+    #[test]
+    fn normal_peer_frontier_coalesces_to_the_wire_batch_while_reads_are_pending() {
+        let s = session();
+        let mut plan = SessionPlan::new(budget());
+        let pending = OperationRef::new(
+            s,
+            OperationKind::Read,
+            OperationId::new(1),
+            OperationGeneration::new(1),
+        );
+        plan.pending_reads
+            .insert(SHAMapHash::new(Uint256::from(999)), pending);
+
+        let first = (1..128u64)
+            .map(|hash| {
+                PlanNetworkNeed::new(
+                    SHAMapNodeId::default(),
+                    Uint256::from(hash),
+                    TreeKind::State,
+                )
+            })
+            .collect::<Vec<_>>();
+        plan.enqueue_network_frontier(first);
+        assert_eq!(plan.dispatch_network_backlog().len(), 127);
+        assert!(!plan.normal_network_batch_ready(128));
+
+        let last =
+            PlanNetworkNeed::new(SHAMapNodeId::default(), Uint256::from(128), TreeKind::State);
+        plan.enqueue_network_frontier([last]);
+        assert_eq!(plan.dispatch_network_backlog(), vec![last]);
+        assert!(plan.normal_network_batch_ready(128));
+        assert_eq!(plan.take_next_normal_network_batch(128).len(), 128);
+
+        let tail =
+            PlanNetworkNeed::new(SHAMapNodeId::default(), Uint256::from(129), TreeKind::State);
+        plan.enqueue_network_frontier([tail]);
+        assert_eq!(plan.dispatch_network_backlog(), vec![tail]);
+        assert!(!plan.normal_network_batch_ready(128));
+        plan.pending_reads.clear();
+        assert!(plan.normal_network_batch_ready(128));
     }
 
     #[test]
