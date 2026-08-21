@@ -1235,6 +1235,16 @@ fn should_promote_operating_mode_at_end_consensus(
     end_consensus_pass && reconciliation == PreferredLclReconciliation::NoChange
 }
 
+/// The publication fact is the coordinator-owned half of the same rippled
+/// mode-promotion block. It must not bypass the `!ledgerChange` decision.
+fn should_emit_coordinator_publication(
+    coordinator_installed: bool,
+    allow_mode_promotion: bool,
+    chain_contiguous: bool,
+) -> bool {
+    coordinator_installed && allow_mode_promotion && chain_contiguous
+}
+
 /// A provisional candidate is deliberately not a no-change outcome: the
 /// ordinary round would replace the current round even though no durable LCL
 /// target was admitted. Keep the predicate separate so its safety contract is
@@ -2164,11 +2174,15 @@ fn check_accept_and_advance(
     // only after proving that it and the local LCL lie on the same chain. The
     // publication can legitimately be ahead while the recovered local LCL is
     // catching up; rejecting that case leaves Tracking unable to regain Full.
-    if shared_inbound.coordinator_installed() {
-        if let (Some(published), Some(closed)) =
-            (published_ledger_after.as_ref(), root.closed_ledger())
-            && published_ledger_is_contiguous_with_lcl(closed.as_ref(), published.as_ref())
-        {
+    if let (Some(published), Some(closed)) = (published_ledger_after.as_ref(), root.closed_ledger())
+    {
+        let contiguous =
+            published_ledger_is_contiguous_with_lcl(closed.as_ref(), published.as_ref());
+        if should_emit_coordinator_publication(
+            shared_inbound.coordinator_installed(),
+            allow_mode_promotion,
+            contiguous,
+        ) {
             let hash = *published.header().hash.as_uint256();
             let seq = published.header().seq;
             let now_close_time = root.current_close_time_seconds();
@@ -3067,9 +3081,10 @@ mod tests {
         reconcile_preferred_lcl, reconcile_preferred_lcl_with_status_broadcaster,
         record_completed_inbound_ledger, recovered_target_is_contiguous_to_lcl,
         required_peer_count, same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
-        should_promote_operating_mode_at_end_consensus, should_reconcile_preferred_lcl,
-        should_report_peer_availability, should_run_end_consensus_reconciliation,
-        stabilized_preferred_recovery_target, switch_last_closed_ledger,
+        should_emit_coordinator_publication, should_promote_operating_mode_at_end_consensus,
+        should_reconcile_preferred_lcl, should_report_peer_availability,
+        should_run_end_consensus_reconciliation, stabilized_preferred_recovery_target,
+        switch_last_closed_ledger,
     };
     use crate::consensus::rcl_consensus::{ConsensusRunner, PendingAcceptWork, RclCxLedger};
     use crate::consensus::rcl_cx_peer_pos::RclCxPeerPos;
@@ -3659,6 +3674,14 @@ mod tests {
             true,
             PreferredLclReconciliation::NoChange,
         ));
+
+        // A fresh, contiguous publication is not an independent promotion
+        // authority. Pending/switching reconciliation must suppress the typed
+        // coordinator fact exactly as rippled's `!ledgerChange` guard does.
+        assert!(!should_emit_coordinator_publication(true, false, true));
+        assert!(!should_emit_coordinator_publication(true, true, false));
+        assert!(!should_emit_coordinator_publication(false, true, true));
+        assert!(should_emit_coordinator_publication(true, true, true));
     }
 
     #[test]

@@ -1357,41 +1357,20 @@ impl CoordinatorRunner {
             return effects;
         }
 
-        // A hash-only consensus lookup issued while Full is commonly the
-        // consensus adaptor probing the child it is about to install locally.
-        // It is not yet evidence of a *network* acquisition requirement: the
-        // normal locally-produced child may receive a matching peer Base reply
-        // before it is installed as LCL. That reply confirms availability, not
-        // divergence: rippled changes operating mode only from the explicit
-        // preferred-LCL reconciliation path. Keep Full for hash-only consensus
-        // probes; an actual remote divergence arrives separately as
-        // `PreferredLclDivergence` before its acquisition demand. A known
-        // target and a non-consensus demand retain the required immediate
-        // demotion.
-        let defer_hash_only_consensus_probe = reason == AcquireReason::Consensus
-            && target.sequence().is_none()
-            && matches!(self.state.phase, SyncPhase::Full { .. });
-
-        // Generic/history demands, and initial Connected recovery, may require
-        // Syncing directly. Once an LCL is installed, consensus target
-        // selection is phase-neutral: it says which hash to fetch, not that
-        // the installed LCL is wrong. NetworkOps emits the separate
-        // `PreferredLclDivergence` fact only after its serialized
-        // checkLastClosedLedger path proves an actionable mismatch. This keeps
-        // ordinary next-ledger acquisition from turning a correct Tracking or
-        // Full node back into `needNetworkLedger`.
+        // Once an LCL is installed, every ordinary acquisition is phase-neutral:
+        // Consensus, Generic, and History describe per-hash cache work, not an
+        // actionable mismatch with the installed LCL. NetworkOps emits the
+        // separate `PreferredLclDivergence` fact only after its serialized
+        // checkLastClosedLedger path proves that mismatch. Initial
+        // Connected/Syncing recovery still uses TargetRequired below.
         let phase_target = hash_only_coalesce
             .and_then(|session| self.state.sessions.get(&session).map(|state| state.target))
             .unwrap_or(target);
-        let preserve_installed_lcl = preferred_target
-            && matches!(
-                self.state.phase,
-                SyncPhase::Tracking { .. } | SyncPhase::Full { .. }
-            );
-        if !preserve_installed_lcl
-            && !defer_hash_only_consensus_probe
-            && !ordinary_demand_with_preferred
-        {
+        let preserve_installed_lcl = matches!(
+            self.state.phase,
+            SyncPhase::Tracking { .. } | SyncPhase::Full { .. }
+        );
+        if !preserve_installed_lcl && !ordinary_demand_with_preferred {
             let fact = TransitionFact::TargetRequired {
                 target: phase_target,
             };
@@ -6468,6 +6447,53 @@ mod tests {
             })],
         );
         assert_eq!(runner.phase(), &SyncPhase::Syncing { target: next });
+    }
+
+    #[test]
+    fn ordinary_acquisitions_are_phase_neutral_after_lcl_install() {
+        for phase in [
+            SyncPhase::Tracking { lcl: identity(9) },
+            SyncPhase::Full {
+                lcl: identity(9),
+                published: identity(9),
+            },
+        ] {
+            for reason in [
+                AcquireReason::Consensus,
+                AcquireReason::Generic,
+                AcquireReason::History,
+            ] {
+                let mut runner = CoordinatorRunner::with_phase(RunEpoch::new(1), phase);
+                let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+                    PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
+                ));
+                let next = LedgerTarget::new(Uint256::from(10), Some(10));
+                let effects = runner.handle_event(AcquisitionEvent::AcquireRequested {
+                    target: next,
+                    reason,
+                });
+                assert!(effects.iter().any(|effect| matches!(
+                    effect,
+                    AcquisitionEffect::SessionStarted(session)
+                        if session.target_hash() == next.hash()
+                )));
+                assert!(
+                    effects
+                        .iter()
+                        .all(|effect| !matches!(effect, AcquisitionEffect::SetServicePhase(_)))
+                );
+                assert_eq!(runner.phase(), &phase);
+
+                let divergence =
+                    runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: next });
+                assert_eq!(
+                    divergence,
+                    vec![AcquisitionEffect::SetServicePhase(SyncPhase::Syncing {
+                        target: next,
+                    })]
+                );
+            }
+        }
     }
 
     #[test]
