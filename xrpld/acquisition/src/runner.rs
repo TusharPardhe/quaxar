@@ -2532,15 +2532,13 @@ impl CoordinatorRunner {
     /// the NetworkOps adapter. The anchor may be earlier or later: rippled
     /// `NetworkOPsImp::endConsensus` checks open-ledger freshness, not equality
     /// between the publication head and the newly installed LCL. While already
-    /// `Full`, a newer matching fresh publication refreshes only the publication
+    /// `Full`, a newer matching publication refreshes only the publication
     /// head; the independent LCL identity advances on `LclInstalled`. Normal
-    /// local consensus must not emit a redundant phase cycle. A non-fresh
-    /// publication is a no-op in either case.
+    /// local consensus must not emit a redundant phase cycle. Freshness is
+    /// promotion authority, not ownership of the observed publication head.
     fn on_publication(&mut self, identity: LedgerIdentity, fresh: bool) -> Vec<AcquisitionEffect> {
         match self.state.phase {
-            SyncPhase::Full { lcl, published }
-                if fresh && identity.sequence() > published.sequence() =>
-            {
+            SyncPhase::Full { lcl, published } if identity.sequence() > published.sequence() => {
                 // The adapter proved the publication remains on the local
                 // chain. It does not own the independently installed LCL.
                 self.state.phase = SyncPhase::Full {
@@ -7636,6 +7634,21 @@ mod tests {
             &SyncPhase::Full {
                 lcl: identity(10),
                 published: identity(11),
+            }
+        );
+
+        // Freshness gates only Tracking -> Full. Once Full, the coordinator
+        // still mirrors a newer contiguous LedgerMaster publication head.
+        let effects = runner.handle_event(AcquisitionEvent::PublicationCommitted {
+            identity: identity(12),
+            fresh: false,
+        });
+        assert!(effects.is_empty());
+        assert_eq!(
+            runner.phase(),
+            &SyncPhase::Full {
+                lcl: identity(10),
+                published: identity(12),
             }
         );
     }

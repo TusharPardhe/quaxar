@@ -1550,9 +1550,7 @@ impl ShadowRunner {
                     tag, None, kind, derived, None, None, None, reason, None, out,
                 );
             }
-            SyncPhase::Full { lcl, published }
-                if fresh && identity.sequence() > published.sequence() =>
-            {
+            SyncPhase::Full { lcl, published } if identity.sequence() > published.sequence() => {
                 self.phase = SyncPhase::Full {
                     lcl,
                     published: identity,
@@ -2400,6 +2398,19 @@ mod tests {
             &SyncPhase::Full {
                 lcl: identity(10),
                 published: identity(11),
+            }
+        );
+
+        let observations = shadow.record(&AcquisitionEvent::PublicationCommitted {
+            identity: identity(12),
+            fresh: false,
+        });
+        assert_eq!(observations[0].kind(), DisagreementKind::Match);
+        assert_eq!(
+            shadow.snapshot().phase(),
+            &SyncPhase::Full {
+                lcl: identity(10),
+                published: identity(12),
             }
         );
     }

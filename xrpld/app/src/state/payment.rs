@@ -483,7 +483,7 @@ fn do_direct_iou_payment<V: ledger::ApplyView>(
     let available = if *account == issue.account {
         dst_amount.clone()
     } else {
-        let mut balance = ledger::ripple_state_helpers::credit_balance(
+        let mut balance = ledger::ripple_state_helpers::account_holds(
             view,
             account,
             &issue.account,

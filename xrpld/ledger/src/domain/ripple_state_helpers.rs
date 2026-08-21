@@ -852,16 +852,9 @@ pub fn is_frozen<V: ApplyView>(view: &mut V, account: &AccountID, issue: &Issue)
 }
 
 /// Get the credit balance on a trust line from account's perspective.
-/// Returns positive when account HOLDS the IOU (issuer owes account).
-/// Returns negative when account OWES the issuer.
-///
-/// Convention: sfBalance is stored from the low account's perspective
-/// (positive = low account holds). When account is the high account
-/// (account > issuer), negate to convert to account's perspective.
-///
-/// NOTE: This is "hold semantics" — returns the balance the account holds,
-/// NOT debt semantics (opposite sign).
-/// Do NOT change the sign convention.
+/// Matches rippled `creditBalance`: `sfBalance` is negated when `account` is
+/// the low side of the canonical trust-line key and returned with `account` as
+/// issuer. Debt and credit-limit calculations depend on this exact orientation.
 pub fn credit_balance<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
@@ -875,14 +868,45 @@ pub fn credit_balance<V: ApplyView>(
         .flatten()
         .or_else(|| view.read(line_keylet).ok().flatten())
     else {
-        return STAmount::default();
+        return STAmount::new_with_asset(
+            sf("sfAmount"),
+            Asset::Issue(Issue::new(currency, *account)),
+            0,
+            0,
+            false,
+        );
     };
     let mut balance = state.get_field_amount(sf("sfBalance"));
-    // sfBalance is from the low account's perspective.
-    // If account is the high account, negate to get account's perspective.
+    if *account < *issuer {
+        balance.negate();
+    }
+    balance.set_issuer(*account);
+    balance
+}
+
+/// Spendable trust-line balance in the issued asset, matching rippled
+/// `accountHolds`/`getTrustLineBalance` without the optional opposite limit.
+pub fn account_holds<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    issuer: &AccountID,
+    currency: Currency,
+) -> STAmount {
+    let issue = Issue::new(currency, *issuer);
+    let line_keylet = protocol::line(*account, *issuer, currency);
+    let Some(state) = view
+        .peek(line_keylet)
+        .ok()
+        .flatten()
+        .or_else(|| view.read(line_keylet).ok().flatten())
+    else {
+        return STAmount::new_with_asset(sf("sfAmount"), Asset::Issue(issue), 0, 0, false);
+    };
+    let mut balance = state.get_field_amount(sf("sfBalance"));
     if *account > *issuer {
         balance.negate();
     }
+    balance.set_issuer(*issuer);
     balance
 }
 

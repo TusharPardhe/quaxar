@@ -74,12 +74,18 @@ fn amm_target_quality(
 }
 
 fn is_self_crossing_offer(
-    owner_pays_transfer_fee: bool,
     remove_self_crossing: bool,
-    taker: Option<&AccountID>,
+    strand_src: Option<&AccountID>,
+    strand_dst: Option<&AccountID>,
     owner: &AccountID,
+    offer_quality: Quality,
+    quality_threshold: Option<Quality>,
 ) -> bool {
-    owner_pays_transfer_fee && remove_self_crossing && taker.is_some_and(|taker| taker == owner)
+    remove_self_crossing
+        && strand_src.is_some_and(|source| source == owner)
+        && strand_dst.is_some_and(|destination| destination == owner)
+        && quality_threshold
+            .is_some_and(|threshold| quality_satisfies_threshold(offer_quality, Some(threshold)))
 }
 
 fn offer_owner_authorized<V: ApplyView>(view: &V, asset: &Asset, owner: &AccountID) -> bool {
@@ -397,23 +403,44 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 }
             }
 
+            // The first tip was funded during discovery; later tips are checked
+            // only when FlowOfferStream-equivalent iteration reaches them.
+            let owner_funds = get_owner_funds(view, &offer_owner, &book.out);
+            if owner_funds.signum() <= 0 {
+                remove_consumed_offer(view, &offer_sle);
+                if !offer_attempted {
+                    first_quality = None;
+                }
+                offers_consumed += 1;
+                continue;
+            }
+
             // The Book stores offer fields as TakerPays/TakerGets. In this
             // strand direction, `Quality::from_amounts` must receive that raw
             // pair (in=TakerPays, out=TakerGets) so its encoded comparison is
             // on the same scale as OfferCreate's `Quality{takerAmount.out,
             // sendMax}` threshold. Swapping them makes the reciprocal quality
             // and admits offers that are worse than the taker's limit.
-            // Only direct OfferCreate crossing treats the taker's own offer as
-            // self-crossing. BookPaymentStep consumes a taker-owned offer just
-            // like any other offer; its transfer-fee policy is independent. If no
-            // real offer has been attempted yet, deleting the self offer allows
-            // the stream to advance to the next quality directory, matching
-            // BookOfferCrossingStep::limitSelfCrossQuality.
+            let offer_quality =
+                Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
+
+            // `forEachOffer` stops before invoking the derived callback when
+            // the stream advances to a second quality after an offer attempt.
+            if !accepts_step_quality(&mut first_quality, offer_quality) {
+                break;
+            }
+
+            // BookOfferCrossingStep::limitSelfCrossQuality runs after stream
+            // funding and same-quality selection but before authorization and
+            // the general quality-threshold check. It requires both strand
+            // endpoints to be the owner and the self offer to meet the limit.
             if is_self_crossing_offer(
-                owner_pays_transfer_fee,
                 remove_self_crossing,
                 taker,
+                strand_dst,
                 &offer_owner,
+                offer_quality,
+                quality_threshold,
             ) {
                 // Do not remove through this value-flow sandbox. The caller
                 // applies the recorded key with offer_helpers::offer_delete
@@ -428,10 +455,9 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 continue;
             }
 
-            // FlowOfferStream validates the owner against the input asset
-            // before BookStep applies the raw-quality gate. An invalid tip is
-            // permanently cleaned and, if nothing was attempted, permits the
-            // next quality directory to become the tip.
+            // Authorization follows the self-cross callback in rippled. An
+            // invalid non-self tip is permanently cleaned and may expose the
+            // next quality only when nothing has yet been attempted.
             if !offer_owner_authorized(view, &book.r#in, &offer_owner) {
                 remove_consumed_offer(view, &offer_sle);
                 if !offer_attempted {
@@ -439,24 +465,6 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 }
                 offers_consumed += 1;
                 continue;
-            }
-
-            // The first tip was funded during discovery; later tips are checked
-            // only when FlowOfferStream-equivalent iteration reaches them.
-            let owner_funds = get_owner_funds(view, &offer_owner, &book.out);
-            if owner_funds.signum() <= 0 {
-                remove_consumed_offer(view, &offer_sle);
-                if !offer_attempted {
-                    first_quality = None;
-                }
-                offers_consumed += 1;
-                continue;
-            }
-
-            let offer_quality =
-                Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
-            if !accepts_step_quality(&mut first_quality, offer_quality) {
-                break;
             }
             if rejects_step_quality(
                 options.enforce_quality_threshold,
@@ -1419,7 +1427,7 @@ fn amm_account_holds<V: ApplyView>(
             if ripple_state_helpers::is_frozen(view, amm_account, &issue) {
                 return Some(STAmount::new_with_asset(sf("sfAmount"), asset, 0, 0, false));
             }
-            let balance = ripple_state_helpers::credit_balance(
+            let balance = ripple_state_helpers::account_holds(
                 view,
                 amm_account,
                 &issue.account,
@@ -1676,7 +1684,7 @@ fn get_owner_funds<V: ApplyView>(view: &mut V, owner: &AccountID, asset: &Asset)
     if ripple_state_helpers::is_frozen(view, owner, &issue) {
         return STAmount::default();
     }
-    ripple_state_helpers::credit_balance(view, owner, &issue.account, issue.currency)
+    ripple_state_helpers::account_holds(view, owner, &issue.account, issue.currency)
 }
 
 /// Result of offer consumption computation.
@@ -2257,9 +2265,59 @@ mod tests {
     #[test]
     fn payment_consumes_taker_owned_offer_but_default_offer_create_cancels_it() {
         let taker = AccountID::from_array([0x44; 20]);
-        assert!(!is_self_crossing_offer(false, false, Some(&taker), &taker));
-        assert!(!is_self_crossing_offer(true, false, Some(&taker), &taker));
-        assert!(is_self_crossing_offer(true, true, Some(&taker), &taker));
+        let destination = AccountID::from_array([0x55; 20]);
+        let limit = Some(Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(100)),
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(100)),
+        )));
+        let good = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(100)),
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(200)),
+        ));
+        let worse = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(100)),
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(50)),
+        ));
+        assert!(!is_self_crossing_offer(
+            true,
+            Some(&taker),
+            Some(&destination),
+            &taker,
+            good,
+            limit
+        ));
+        assert!(!is_self_crossing_offer(
+            false,
+            Some(&taker),
+            Some(&taker),
+            &taker,
+            good,
+            limit
+        ));
+        assert!(is_self_crossing_offer(
+            true,
+            Some(&taker),
+            Some(&taker),
+            &taker,
+            good,
+            limit
+        ));
+        assert!(!is_self_crossing_offer(
+            true,
+            Some(&taker),
+            Some(&taker),
+            &taker,
+            worse,
+            limit
+        ));
+        assert!(!is_self_crossing_offer(
+            true,
+            Some(&taker),
+            Some(&taker),
+            &taker,
+            good,
+            None
+        ));
     }
 
     #[test]

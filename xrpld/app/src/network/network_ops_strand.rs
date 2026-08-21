@@ -1246,14 +1246,21 @@ fn should_promote_operating_mode_at_end_consensus(
     end_consensus_pass && reconciliation == PreferredLclReconciliation::NoChange
 }
 
-/// The publication fact is the coordinator-owned half of the same rippled
-/// mode-promotion block. It must not bypass the `!ledgerChange` decision.
+/// Publication identity is an observation of the LedgerMaster-owned published
+/// head. Mode promotion remains independently gated by the caller-provided
+/// freshness bit.
 fn should_emit_coordinator_publication(
     coordinator_installed: bool,
-    allow_mode_promotion: bool,
     chain_contiguous: bool,
 ) -> bool {
-    coordinator_installed && allow_mode_promotion && chain_contiguous
+    coordinator_installed && chain_contiguous
+}
+
+fn coordinator_publication_is_fresh(
+    allow_mode_promotion: bool,
+    open_ledger_is_fresh: bool,
+) -> bool {
+    allow_mode_promotion && open_ledger_is_fresh
 }
 
 /// A provisional candidate is deliberately not a no-change outcome: the
@@ -2108,15 +2115,11 @@ fn check_accept_and_advance(
     {
         let contiguous =
             published_ledger_is_contiguous_with_lcl(closed.as_ref(), published.as_ref());
-        if should_emit_coordinator_publication(
-            shared_inbound.coordinator_installed(),
-            allow_mode_promotion,
-            contiguous,
-        ) {
+        if should_emit_coordinator_publication(shared_inbound.coordinator_installed(), contiguous) {
             let hash = *published.header().hash.as_uint256();
             let seq = published.header().seq;
             let now_close_time = root.current_close_time_seconds();
-            let fresh = root
+            let open_ledger_is_fresh = root
                 .open_ledger()
                 .current_header_timing()
                 .map(|timing| {
@@ -2127,6 +2130,8 @@ fn check_accept_and_advance(
                     now_close_time < freshness_deadline
                 })
                 .unwrap_or(false);
+            let fresh =
+                coordinator_publication_is_fresh(allow_mode_promotion, open_ledger_is_fresh);
             shared_inbound.coordinator_publication_committed(
                 acquisition::LedgerIdentity::new(hash, seq),
                 fresh,
@@ -3013,8 +3018,9 @@ mod tests {
     use super::{
         ConsensusJobScheduler, CoordinatorHandoffDedup, LclAuditSampler,
         MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, MAX_PROPOSALS_PER_TURN,
-        PreferredLclReconciliation, drain_bounded, heartbeat_operating_mode_reassertion,
-        history_acquire_allowed, history_fetch_pack_requested, persist_completed_inbound_ledger,
+        PreferredLclReconciliation, coordinator_publication_is_fresh, drain_bounded,
+        heartbeat_operating_mode_reassertion, history_acquire_allowed,
+        history_fetch_pack_requested, persist_completed_inbound_ledger,
         process_completed_inbound_ledger, published_ledger_is_contiguous_with_lcl,
         reconcile_preferred_lcl_with_status_broadcaster, record_completed_inbound_ledger,
         recovered_target_is_contiguous_to_lcl, required_peer_count,
@@ -3620,13 +3626,15 @@ mod tests {
             PreferredLclReconciliation::NoChange,
         ));
 
-        // A fresh, contiguous publication is not an independent promotion
-        // authority. Pending/switching reconciliation must suppress the typed
-        // coordinator fact exactly as rippled's `!ledgerChange` guard does.
-        assert!(!should_emit_coordinator_publication(true, false, true));
-        assert!(!should_emit_coordinator_publication(true, true, false));
-        assert!(!should_emit_coordinator_publication(false, true, true));
-        assert!(should_emit_coordinator_publication(true, true, true));
+        // Publication identity remains observable independently of promotion
+        // authority; the emitted fact's freshness bit carries the
+        // `!ledgerChange` decision instead.
+        assert!(!should_emit_coordinator_publication(true, false));
+        assert!(!should_emit_coordinator_publication(false, true));
+        assert!(should_emit_coordinator_publication(true, true));
+        assert!(!coordinator_publication_is_fresh(false, true));
+        assert!(!coordinator_publication_is_fresh(true, false));
+        assert!(coordinator_publication_is_fresh(true, true));
     }
 
     #[test]

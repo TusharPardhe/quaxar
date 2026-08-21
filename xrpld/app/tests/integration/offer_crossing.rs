@@ -562,6 +562,101 @@ fn offer_self_crossing_removes_old() {
     assert_eq!(get_owner_count(&view, alice), 2); // trust + new offer
 }
 
+#[test]
+fn worse_than_limit_self_offer_remains_on_book() {
+    let alice = acct(0x11);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(alice, 10_000_000_000, 1, 0),
+        account_root(gw, 10_000_000_000, 0, 0),
+        trust_line(alice, gw, usd, 2_000, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let old_offer = protocol::offer_keylet(acct_id(alice), 1);
+    let old = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1_000), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &old, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    // The existing self offer returns only 1,000 USD for the XRP supplied by
+    // this new offer, below its 2,000 USD limit. rippled stops at that book
+    // tip; it neither crosses nor applies the special self-offer deletion.
+    let new = offer_tx(alice, iou(gw, usd, 2_000), xrp(1_000_000_000), 2);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &new, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(old_offer)
+            .expect("read worse-quality self offer")
+            .is_some(),
+        "a self offer below the taker's quality threshold must remain"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(alice), 2))
+            .expect("read new offer")
+            .is_some()
+    );
+    assert_eq!(get_owner_count(&view, alice), 3); // trust + both offers
+}
+
+#[test]
+fn fully_satisfied_better_quality_stops_before_later_self_offer() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(alice, 10_000_000_000, 1, 0),
+        account_root(bob, 10_000_000_000, 1, 0),
+        account_root(gw, 10_000_000_000, 0, 0),
+        trust_line(alice, gw, usd, 2_000, 10_000, 0),
+        trust_line(bob, gw, usd, 100, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    // Bob's small offer is the better-quality Q1 tip.
+    let bob_q1 = offer_tx(bob, xrp(50_000_000), iou(gw, usd, 100), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &bob_q1, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    // Alice's existing Q2 offer is still above the later taker's limit but is
+    // in a different quality directory.
+    let alice_q2_key = protocol::offer_keylet(acct_id(alice), 1);
+    let alice_q2 = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1_000), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &alice_q2, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(alice_q2_key)
+            .expect("read Q2 after placement")
+            .is_some(),
+        "Q2 setup offer must be resting before the crossing transaction"
+    );
+
+    // Bob's Q1 fully satisfies this request. The BookStep then reaches
+    // Alice's self-owned Q2 in the same pass and stops on the quality
+    // transition before running self-cross deletion. No second liquidity pass
+    // is needed, so Q2 remains.
+    let crossing = offer_tx(alice, iou(gw, usd, 100), xrp(1_000_000_000), 2);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &crossing, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(alice_q2_key)
+            .expect("read second-quality self offer")
+            .is_some(),
+        "an attempted Q1 must stop the stream before self-crossing Q2"
+    );
+}
+
 /// A non-self offer that does not meet the crossing quality must not be
 /// deleted or transfer value while a dry OfferCreate is evaluated.
 #[test]
