@@ -1458,10 +1458,10 @@ mod tests {
         effects
             .iter()
             .find_map(|effect| match effect {
-                AcquisitionEffect::SendLedgerRequest(request) => Some(request.session()),
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
                 _ => None,
             })
-            .expect("a peer request must be emitted")
+            .expect("an acquisition session must start")
     }
 
     fn valid_inner_wire() -> Vec<u8> {
@@ -1626,7 +1626,7 @@ mod tests {
         let session = effects
             .iter()
             .find_map(|effect| match effect {
-                AcquisitionEffect::SendLedgerRequest(request) => Some(request.session()),
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
                 _ => None,
             })
             .expect("the recovery demand must mint a session");

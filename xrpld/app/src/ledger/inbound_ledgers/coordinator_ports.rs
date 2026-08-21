@@ -585,8 +585,8 @@ impl TimerPort for CoordinatorTimerPort {
 // ─── Phase port ─────────────────────────────────────────────────────────────
 
 /// Service-phase publication. The coordinator is the only production writer of
-/// the operating mode; `need_network_ledger` is derived from the phase rather
-/// than independently mutable. Other legacy writers are removed in M6.
+/// the operating mode. `need_network_ledger` remains rippled's independent
+/// startup/recovery latch and is cleared by actual LCL/publication work.
 #[derive(Clone)]
 pub(crate) struct CoordinatorPhasePort {
     mode_owner: AppNetworkOpsModeOwner,
@@ -594,8 +594,7 @@ pub(crate) struct CoordinatorPhasePort {
 
 impl CoordinatorPhasePort {
     /// Builds a phase port over the application's normalized NetworkOps mode
-    /// owner. The coordinator still exclusively derives
-    /// `need_network_ledger` from its typed phase.
+    /// owner.
     pub(crate) fn new(mode_owner: AppNetworkOpsModeOwner) -> Self {
         Self { mode_owner }
     }
@@ -614,12 +613,6 @@ fn network_ops_mode(phase: SyncPhase) -> NetworkOpsOperatingMode {
     }
 }
 
-/// `need_network_ledger` is derived: the node still needs a network ledger
-/// whenever it is connected-but-not-full or actively syncing.
-fn derived_need_network_ledger(phase: SyncPhase) -> bool {
-    matches!(phase, SyncPhase::Connected | SyncPhase::Syncing { .. })
-}
-
 impl PhasePort for CoordinatorPhasePort {
     fn set_phase(&mut self, phase: SyncPhase) {
         let reason = match phase {
@@ -630,10 +623,18 @@ impl PhasePort for CoordinatorPhasePort {
             SyncPhase::Full { .. } => "coordinator-full",
             SyncPhase::Stopping => "coordinator-stopping",
         };
+        let requested = network_ops_mode(phase);
+        let requested = if self.mode_owner.need_network_ledger()
+            && requested == NetworkOpsOperatingMode::Tracking
+        {
+            // rippled endConsensus cannot promote CONNECTED/SYNCING to
+            // TRACKING while the independent startup latch remains set.
+            NetworkOpsOperatingMode::Syncing
+        } else {
+            requested
+        };
         self.mode_owner
-            .set_operating_mode_with_reason(network_ops_mode(phase), reason);
-        self.mode_owner
-            .set_need_network_ledger(derived_need_network_ledger(phase));
+            .set_operating_mode_with_reason(requested, reason);
     }
 }
 
@@ -1148,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_port_normalizes_startup_and_stale_heartbeat_but_derives_need_from_phase() {
+    fn phase_port_normalizes_mode_without_mutating_network_ledger_latch() {
         let state = Arc::new(SharedNetworkOpsState::new(
             NetworkOpsOperatingMode::Connected,
         ));
@@ -1159,17 +1160,17 @@ mod tests {
             Arc::new(move || Duration::from_secs(age.load(Ordering::Relaxed))),
         );
         let mut port = CoordinatorPhasePort::new(owner);
+        state.set_need_network_ledger(true);
 
         // A stale validated ledger normalizes a Syncing heartbeat back to
-        // Connected, while the typed coordinator phase still owns the need
-        // bit and therefore keeps acquisition enabled.
+        // Connected without changing the independent startup latch.
         port.set_phase(SyncPhase::Syncing {
             target: LedgerTarget::new(Uint256::from(9), Some(SEQ)),
         });
         assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
         assert!(
             state.need_network_ledger(),
-            "syncing requires a network ledger"
+            "mode publication must preserve the startup latch"
         );
 
         // Conversely, a fresh validated ledger normalizes the networked
@@ -1184,7 +1185,10 @@ mod tests {
             published: acquisition::LedgerIdentity::new(Uint256::from(9), SEQ),
         });
         assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Full);
-        assert!(!state.need_network_ledger());
+        assert!(
+            state.need_network_ledger(),
+            "phase publication must not clear the latch"
+        );
     }
 
     #[test]

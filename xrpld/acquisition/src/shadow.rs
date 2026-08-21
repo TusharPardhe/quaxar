@@ -174,6 +174,7 @@ pub enum ShadowEventTag {
     TimerFired,
     ConsensusTarget,
     PreferredLclDivergence,
+    PreferredLclReconciled,
     BlockedWithNoTarget,
     LclInstalled,
     PublicationCommitted,
@@ -200,6 +201,7 @@ impl ShadowEventTag {
             Self::TimerFired => "timer_fired",
             Self::ConsensusTarget => "consensus_target",
             Self::PreferredLclDivergence => "preferred_lcl_divergence",
+            Self::PreferredLclReconciled => "preferred_lcl_reconciled",
             Self::BlockedWithNoTarget => "blocked_with_no_target",
             Self::LclInstalled => "lcl_installed",
             Self::PublicationCommitted => "publication_committed",
@@ -227,6 +229,7 @@ impl From<&AcquisitionEvent> for ShadowEventTag {
             AcquisitionEvent::TimerFired { .. } => Self::TimerFired,
             AcquisitionEvent::ConsensusTarget(_) => Self::ConsensusTarget,
             AcquisitionEvent::PreferredLclDivergence { .. } => Self::PreferredLclDivergence,
+            AcquisitionEvent::PreferredLclReconciled { .. } => Self::PreferredLclReconciled,
             AcquisitionEvent::BlockedWithNoTarget => Self::BlockedWithNoTarget,
             AcquisitionEvent::LclInstalled(_) => Self::LclInstalled,
             AcquisitionEvent::PublicationCommitted { .. } => Self::PublicationCommitted,
@@ -530,6 +533,14 @@ impl ShadowRunner {
             }
             AcquisitionEvent::PreferredLclDivergence { target } => {
                 self.derive_preferred_lcl_divergence(tag, *target, &mut out);
+            }
+            AcquisitionEvent::PreferredLclReconciled { lcl } => {
+                self.latest_consensus_target = None;
+                let fact = TransitionFact::PreferredLclReconciled { lcl: *lcl };
+                let (derived, reason, kind) = self.apply_fact(Some(fact));
+                self.push(
+                    tag, None, kind, derived, None, None, None, reason, None, &mut out,
+                );
             }
             AcquisitionEvent::BlockedWithNoTarget => {
                 self.derive_blocked_with_no_target(tag, &mut out)
@@ -1766,7 +1777,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_preferred_lcl_divergence_rejects_from_syncing() {
+    fn shadow_preferred_lcl_divergence_retargets_from_syncing() {
         let mut shadow = runner();
         shadow.record(&AcquisitionEvent::Connectivity(
             PeerAvailabilitySnapshot::new(vec![crate::id::PeerId::new(1)]),
@@ -1781,10 +1792,10 @@ mod tests {
             shadow.record(&AcquisitionEvent::PreferredLclDivergence { target: target(9) });
         assert_eq!(
             shadow.snapshot().phase(),
-            &SyncPhase::Syncing { target: target(1) }
+            &SyncPhase::Syncing { target: target(9) }
         );
-        assert_eq!(observations[0].kind(), DisagreementKind::DerivedRejected);
-        assert_eq!(shadow.snapshot().disagreements(), 1);
+        assert_eq!(observations[0].kind(), DisagreementKind::Match);
+        assert_eq!(shadow.snapshot().disagreements(), 0);
     }
 
     #[test]

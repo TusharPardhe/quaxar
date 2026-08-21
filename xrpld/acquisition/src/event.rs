@@ -87,12 +87,18 @@ pub enum AcquisitionEvent {
 
     /// Consensus reports a preferred-LCL divergence with a concrete acquisition
     /// target (rippled `NetworkOPsImp::consensusViewChange` parity). Motivates
-    /// `Connected/Tracking/Full -> Syncing { target }`. It never mints a
-    /// session: the acquisition demand arrives as a separate
+    /// `Connected/Tracking/Full -> Syncing { target }`, or retargets an
+    /// existing Syncing phase to the latest preferred identity. It never mints
+    /// a session: the acquisition demand arrives as a separate
     /// [`AcquisitionEvent::AcquireRequested`] fact, so a resident-and-compatible
     /// preferred LCL that is merely being switched to (no fetch needed) does not
     /// start a wasteful peer fetch.
     PreferredLclDivergence { target: LedgerTarget },
+
+    /// NetworkOps completed an accepted-boundary preferred-LCL check with the
+    /// current local LCL selected. This retires an obsolete syncing target and
+    /// permits normal Tracking/Full promotion, matching rippled endConsensus.
+    PreferredLclReconciled { lcl: LedgerIdentity },
 
     /// Consensus accepted a round with no usable peer positions while the
     /// coordinator was `Full`. Motivates `Full -> Connected` (blocked state or

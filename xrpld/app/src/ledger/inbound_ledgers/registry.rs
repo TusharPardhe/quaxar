@@ -1176,6 +1176,18 @@ impl InboundLedgers {
         true
     }
 
+    /// Report that an accepted-boundary preferred-LCL check selected the
+    /// current local LCL. This retires obsolete Syncing policy without
+    /// loosening the exact target-install gate.
+    pub fn coordinator_preferred_lcl_reconciled(&self, lcl: acquisition::LedgerIdentity) -> bool {
+        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let Some(coordinator) = guard.as_mut() else {
+            return false;
+        };
+        coordinator.handle_fact(acquisition::AcquisitionEvent::PreferredLclReconciled { lcl });
+        true
+    }
+
     /// Feed a no-consensus-positions fact (Quaxar-specific). Demotes
     /// `Full -> Connected` when consensus accepted a round with no usable peer
     /// positions. Returns false unless installed.
@@ -3918,18 +3930,16 @@ mod tests {
         assert!(!registry2.coordinator_report_peer_availability(&[]));
         assert!(!registry2.coordinator_heartbeat());
 
-        // A usable-peer fact motivates Disconnected -> Connected and derives
-        // need_network_ledger through the phase port.
+        state.set_need_network_ledger(false);
+        // A usable-peer fact motivates Disconnected -> Connected without
+        // changing rippled's independent startup-recovery latch.
         assert!(registry.coordinator_report_peer_availability(&[1u32]));
         assert_eq!(
             state.operating_mode(),
             NetworkOpsOperatingMode::Connected,
             "the coordinator alone publishes the mode from the fact"
         );
-        assert!(
-            state.need_network_ledger(),
-            "need_network_ledger is derived from the coordinator phase"
-        );
+        assert!(!state.need_network_ledger());
         assert_eq!(
             registry
                 .coordinator_snapshot()
@@ -3949,8 +3959,8 @@ mod tests {
             &acquisition::SyncPhase::Connected
         );
 
-        // A peer-loss fact demotes Connected -> Disconnected and derives
-        // need_network_ledger false through the phase port.
+        // A peer-loss fact demotes Connected -> Disconnected and preserves the
+        // independent latch.
         assert!(registry.coordinator_report_peer_availability(&[]));
         assert_eq!(
             state.operating_mode(),
@@ -3982,9 +3992,9 @@ mod tests {
         let (_dir2, registry2) = registry_with_manual_worker_pool(Arc::new(WorkerPool::new(0)));
         assert!(!registry2.coordinator_startup(acquisition::SyncPhase::Connected));
 
+        state.set_need_network_ledger(false);
         // The startup fact seeds the initial phase (start_valid Full) and
-        // publishes it through the phase port, deriving need_network_ledger.
-        // It never touches sessions: the owner seeds the phase only.
+        // publishes only its mode. It never touches sessions or the latch.
         let full = acquisition::SyncPhase::Full {
             lcl: acquisition::LedgerIdentity::new(Uint256::from_array([0x21; 32]), 9),
             published: acquisition::LedgerIdentity::new(Uint256::from_array([0x22; 32]), 9),
@@ -4012,7 +4022,7 @@ mod tests {
         // the seed is idempotent for the owner and still creates no session.
         assert!(registry.coordinator_startup(acquisition::SyncPhase::Connected));
         assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
-        assert!(state.need_network_ledger());
+        assert!(!state.need_network_ledger());
         assert_eq!(
             registry
                 .coordinator_snapshot()
@@ -4031,7 +4041,7 @@ mod tests {
         ));
         // The production registry shares the phase state's need_network_ledger
         // atomic (bootstrap passes `network_ops_state().need_network_ledger_arc()`),
-        // so the admission gate reads the coordinator-derived value.
+        // so the admission gate reads the independent startup/recovery latch.
         let (_dir, node_store) = test_node_store();
         let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
         let registry = InboundLedgers::with_worker_pool(
@@ -4059,8 +4069,9 @@ mod tests {
         registry.set_node_store(node_store);
         registry.set_phase_state(Arc::clone(&state));
         assert!(registry.install_coordinator());
-        // The derived atomic is true for Connected (M6-E: the phase port owns
-        // the atomic; the M6-D replay-parent recovery relies on this gate).
+        // Network startup owns the latch independently of the coordinator
+        // phase; emulate bootstrap setting it before the startup fact.
+        state.set_need_network_ledger(true);
         assert!(registry.coordinator_startup(acquisition::SyncPhase::Connected));
         assert!(state.need_network_ledger());
 
@@ -4085,7 +4096,7 @@ mod tests {
             registry
                 .coordinator_acquire(hash, 9, AcquireReason::History)
                 .is_none(),
-            "History acquires are gated by the derived need_network_ledger"
+            "History acquires are gated by need_network_ledger"
         );
         assert_eq!(
             registry
@@ -4218,10 +4229,10 @@ mod tests {
         assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Tracking);
 
         // A preferred-LCL divergence fact demotes Tracking -> Syncing without
-        // minting a session; the coordinator publishes the mode.
+        // minting a session or re-enabling the startup latch.
         assert!(registry.coordinator_preferred_lcl_divergence(target));
         assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Syncing);
-        assert!(state.need_network_ledger());
+        assert!(!state.need_network_ledger());
         assert_eq!(
             registry
                 .coordinator_snapshot()
@@ -4252,9 +4263,43 @@ mod tests {
             full_state.operating_mode(),
             NetworkOpsOperatingMode::Connected
         );
-        assert!(full_state.need_network_ledger());
+        assert!(!full_state.need_network_ledger());
         registry.stop();
         full_registry.stop();
+    }
+
+    #[test]
+    fn preferred_lcl_no_change_retires_syncing_policy_and_restores_full_mode() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+        let (_dir, registry) = registry_with_manual_worker_pool(Arc::new(WorkerPool::new(0)));
+        let state = Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        ));
+        registry.set_phase_state(Arc::clone(&state));
+        assert!(registry.install_coordinator());
+        let local = acquisition::LedgerIdentity::new(Uint256::from_array([0x41; 32]), 41);
+        let stale = acquisition::LedgerTarget::new(Uint256::from_array([0x42; 32]), None);
+
+        assert!(registry.coordinator_report_peer_availability(&[1u32]));
+        assert!(registry.coordinator_lcl_installed(local));
+        assert!(registry.coordinator_publication_committed(local, true));
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Full);
+        assert!(registry.coordinator_preferred_lcl_divergence(stale));
+        assert_eq!(
+            state.operating_mode(),
+            NetworkOpsOperatingMode::Connected,
+            "a hash-only recovery target with stale validated age normalizes publicly to Connected"
+        );
+
+        assert!(registry.coordinator_preferred_lcl_reconciled(local));
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Tracking);
+        assert!(registry.coordinator_publication_committed(local, true));
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Full);
+        assert!(matches!(
+            registry.coordinator_snapshot().expect("snapshot").phase(),
+            acquisition::SyncPhase::Full { .. }
+        ));
+        registry.stop();
     }
 
     #[test]

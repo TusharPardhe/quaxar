@@ -4622,6 +4622,29 @@ fn publication_gap_routes_to_owned_ledger_replayer() {
 }
 
 #[test]
+fn authoritative_publication_clears_network_startup_latch() {
+    let mut app = ApplicationRoot::new(0).expect("application root should build");
+    let runtime = Arc::new(AppLedgerMasterRuntime::default());
+    let _ = app.attach_ledger_master_runtime(Arc::clone(&runtime));
+    let mut ledger = Ledger::from_ledger_seq_and_close_time(1, 1_000, false);
+    ledger.set_immutable(true);
+    let ledger = Arc::new(ledger);
+    runtime
+        .ledger_master()
+        .set_valid_ledger(Arc::clone(&ledger), None, None)
+        .expect("validated ledger should be accepted");
+    app.set_need_network_ledger(true);
+
+    app.try_advance_publication();
+
+    assert!(runtime.ledger_master().published_ledger().is_some());
+    assert!(
+        !app.need_network_ledger(),
+        "the publication commit itself must clear the startup latch"
+    );
+}
+
+#[test]
 fn consensus_status_event_uses_lost_sync_for_a_wrong_lcl() {
     assert_eq!(consensus_status_event(2, true), 2); // neACCEPTED_LEDGER
     assert_eq!(consensus_status_event(1, false), 4); // neLOST_SYNC

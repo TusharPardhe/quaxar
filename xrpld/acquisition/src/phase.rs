@@ -80,6 +80,9 @@ pub enum TransitionFact {
     },
     /// Preferred-LCL divergence with a concrete acquisition target.
     PreferredLclDivergence { target: LedgerTarget },
+    /// Preferred-LCL reconciliation selected the current local LCL, retiring
+    /// an obsolete concrete recovery target.
+    PreferredLclReconciled { lcl: LedgerIdentity },
     /// Blocked state or loss of sufficient freshness with no concrete target.
     BlockedWithNoTarget,
     /// Shutdown requested.
@@ -123,6 +126,10 @@ pub enum TransitionError {
 ///   requires a fresh contiguous publication for `Tracking -> Full`.
 /// * `Syncing -> Syncing` is legal via a retargeting `TargetRequired`; the
 ///   session owner is preserved while the target changes.
+/// * `Syncing -> Syncing` is also legal when the preferred LCL changes while
+///   recovery is in progress. The preferred identity is policy state and must
+///   follow the latest validation view; older per-hash acquisitions may keep
+///   running independently.
 /// * `Tracking -> Syncing` is legal via `PreferredLclDivergence`; tracking is
 ///   retained while the LCL matches, but a divergent preferred LCL with a known
 ///   target resumes acquisition.
@@ -135,8 +142,16 @@ pub fn phase_transition(from: &SyncPhase, fact: &TransitionFact) -> Option<SyncP
         (Connected, TargetRequired { target }) => Syncing { target: *target },
         (Connected, PreferredLclDivergence { target }) => Syncing { target: *target },
         (Connected, TargetInstalledAsLcl { lcl }) => Tracking { lcl: *lcl },
-        (Syncing { .. }, TargetRequired { target }) => Syncing { target: *target },
+        (Syncing { target: current }, TargetRequired { target })
+        | (Syncing { target: current }, PreferredLclDivergence { target }) => Syncing {
+            target: if current.hash() == target.hash() && target.sequence().is_none() {
+                *current
+            } else {
+                *target
+            },
+        },
         (Syncing { .. }, TargetInstalledAsLcl { lcl }) => Tracking { lcl: *lcl },
+        (Syncing { .. }, PreferredLclReconciled { lcl }) => Tracking { lcl: *lcl },
         (Tracking { .. }, PreferredLclDivergence { target }) => Syncing { target: *target },
         (Tracking { .. }, ChainContiguous { lcl, published }) => Full {
             lcl: *lcl,
@@ -187,6 +202,7 @@ mod tests {
                 published: identity(10),
             },
             TransitionFact::PreferredLclDivergence { target: target(11) },
+            TransitionFact::PreferredLclReconciled { lcl: identity(11) },
             TransitionFact::BlockedWithNoTarget,
             TransitionFact::Shutdown,
         ];
@@ -238,9 +254,34 @@ mod tests {
         assert_eq!(
             phase_transition(
                 &SyncPhase::Syncing { target: target(9) },
+                &TransitionFact::PreferredLclDivergence { target: target(12) }
+            ),
+            Some(SyncPhase::Syncing { target: target(12) })
+        );
+        let resolved = target(9);
+        assert_eq!(
+            phase_transition(
+                &SyncPhase::Syncing { target: resolved },
+                &TransitionFact::PreferredLclDivergence {
+                    target: LedgerTarget::new(resolved.hash(), None),
+                }
+            ),
+            Some(SyncPhase::Syncing { target: resolved }),
+            "a repeated hash-only observation must not erase verified sequence metadata"
+        );
+        assert_eq!(
+            phase_transition(
+                &SyncPhase::Syncing { target: target(9) },
                 &TransitionFact::TargetInstalledAsLcl { lcl: identity(9) }
             ),
             Some(SyncPhase::Tracking { lcl: identity(9) })
+        );
+        assert_eq!(
+            phase_transition(
+                &SyncPhase::Syncing { target: target(9) },
+                &TransitionFact::PreferredLclReconciled { lcl: identity(7) }
+            ),
+            Some(SyncPhase::Tracking { lcl: identity(7) })
         );
         assert_eq!(
             phase_transition(

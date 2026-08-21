@@ -506,10 +506,6 @@ fn strand_loop(
     let mut consensus_started = false;
     let mut last_timer_tick = Instant::now();
     let mut last_round_ledger_id: Option<Uint256> = None;
-    // Exact NetworkOPs `networkClosed` recovery identity. Unlike
-    // `last_round_ledger_id`, this is not consensus-runner bookkeeping and is
-    // therefore not overwritten when an ordinary round accepts/closes.
-    let mut preferred_recovery_target: Option<Uint256> = None;
     // Emit at most one restart-gate diagnostic per closed ledger. Accepted
     // phase maintenance runs every strand tick, so per-pass INFO events turn
     // a stalled restart gate into an operator-hostile log flood.
@@ -1038,7 +1034,6 @@ fn strand_loop(
                 &mut runner,
                 &consensus_rt,
                 &mut last_round_ledger_id,
-                &mut preferred_recovery_target,
                 &mut lcl_audit_sampler,
                 &mut provisional_lcl_waiter,
             )
@@ -1055,6 +1050,22 @@ fn strand_loop(
                 need_network_ledger = root.need_network_ledger(),
                 "LCL trace: preferred-LCL reconciliation completed"
             );
+        }
+
+        if end_consensus_pass
+            && reconciliation == PreferredLclReconciliation::NoChange
+            && !root.need_network_ledger()
+            && shared_inbound
+                .coordinator_snapshot()
+                .is_some_and(|snapshot| {
+                    matches!(snapshot.phase(), acquisition::SyncPhase::Syncing { .. })
+                })
+            && let Some(closed) = root.closed_ledger()
+        {
+            shared_inbound.coordinator_preferred_lcl_reconciled(acquisition::LedgerIdentity::new(
+                *closed.header().hash.as_uint256(),
+                closed.header().seq,
+            ));
         }
 
         // `checkAccept`/publication/history do not select, acquire, install,
@@ -1267,7 +1278,6 @@ fn reconcile_preferred_lcl(
     runner: &mut dyn ConsensusRunner,
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
-    preferred_recovery_target: &mut Option<Uint256>,
     audit_sampler: &mut LclAuditSampler,
     provisional_waiter: &mut Option<ProvisionalLclWaiter>,
 ) -> PreferredLclReconciliation {
@@ -1277,7 +1287,6 @@ fn reconcile_preferred_lcl(
         runner,
         consensus_rt,
         last_round_ledger_id,
-        preferred_recovery_target,
         audit_sampler,
         provisional_waiter,
         &broadcast_switched_ledger_status,
@@ -1304,7 +1313,6 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     runner: &mut dyn ConsensusRunner,
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
-    preferred_recovery_target: &mut Option<Uint256>,
     audit_sampler: &mut LclAuditSampler,
     provisional_waiter: &mut Option<ProvisionalLclWaiter>,
     status_broadcaster: &SwitchedLedgerStatusBroadcaster,
@@ -1409,27 +1417,10 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         &peer_counts,
     );
     let selected_preferred_hash = preference_diagnostic.selected;
-    // Keep one exact recovery identity stable while its independent
-    // InboundLedger finishes.  Re-selecting the moving validation tip on every
-    // Accepted pass used to overwrite `Syncing { target }` just before the old
-    // target became resolver-visible.  The completed ledger then could not
-    // satisfy the runner's exact LCL-install gate, so a node whose acquisition
-    // latency was close to the ledger-close cadence chased the tip forever.
-    //
-    // This preserves only NetworkOPs' strand-owned `networkClosed` recovery
-    // identity; generic/history acquisitions cannot pin it.  It remains stable
-    // until it resolves (and is installed below), explicitly fails, or an
-    // admission rejection returns NoChange and ordinary-round startup resets
-    // `last_round_ledger_id` to the local LCL.  A local or immediate-parent
-    // preference still wins immediately because recovery is no longer
-    // actionable.
-    let preferred_hash = stabilized_preferred_recovery_target(
-        selected_preferred_hash,
-        our_hash,
-        parent_hash,
-        preferred_recovery_target,
-        |hash| shared_inbound.is_failure(&hash),
-    );
+    // Match rippled's checkLastClosedLedger: preference is recomputed for
+    // every accepted-boundary pass. Existing per-hash acquisitions may finish
+    // in the background, but an old request never pins policy to a stale LCL.
+    let preferred_hash = selected_preferred_hash;
     if let Some(waiter) = provisional_waiter.as_ref().copied()
         && waiter.identity.target_hash == preferred_hash
         && shared_inbound.provisional_identity(&preferred_hash) == Some(waiter.identity)
@@ -1653,12 +1644,6 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             );
         }
 
-        if target_failed {
-            *preferred_recovery_target = None;
-        } else {
-            *preferred_recovery_target = Some(preferred_hash);
-        }
-
         restart_preferred_lcl_recovery(
             root,
             shared_inbound,
@@ -1673,11 +1658,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
 
     let candidate_hash = *candidate.header().hash.as_uint256();
     if candidate_hash != preferred_hash {
-        // A wrong object from an exact-hash resolver is retryable corruption,
-        // not rejection of the requested recovery identity. Keep the pin so
-        // the explicit reacquire below cannot be displaced by the next moving
-        // validation tip before the correct object arrives.
-        *preferred_recovery_target = Some(preferred_hash);
+        // A wrong object from an exact-hash resolver is retryable corruption.
         tracing::warn!(
             target: "lcl_trace",
             event = "preferred_lcl_hash_mismatch",
@@ -1711,7 +1692,6 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     }
 
     if shared_inbound.is_provisional(&candidate_hash) {
-        *preferred_recovery_target = Some(preferred_hash);
         // A legacy external completion has no Worker-2 fence identity. Keep
         // its existing non-adoption behavior, but never fabricate an exact
         // waiter key for it.
@@ -1787,7 +1767,6 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         );
     }
     if !state_complete || !tx_complete {
-        *preferred_recovery_target = Some(preferred_hash);
         tracing::info!(
             target: "lcl_trace",
             event = "preferred_lcl_incomplete",
@@ -1824,7 +1803,6 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         return PreferredLclReconciliation::Pending;
     }
     if !can_be_current || !compatible {
-        *preferred_recovery_target = None;
         tracing::warn!(
             target: "lcl_trace",
             event = "preferred_lcl_rejected",
@@ -1868,8 +1846,6 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         acquisition::LedgerTarget::new(preferred_hash, Some(candidate.header().seq)),
     );
 
-    *preferred_recovery_target = None;
-
     switch_last_closed_ledger(
         root,
         shared_inbound,
@@ -1881,32 +1857,6 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         status_broadcaster,
     );
     PreferredLclReconciliation::Switched
-}
-
-/// Preserve the exact preferred-LCL recovery target until it either becomes
-/// installable or fails.  The selected validation tip may continue moving;
-/// that movement is acquisition demand, not evidence that an already-running
-/// recovery identity should be abandoned before its completion can be used.
-fn stabilized_preferred_recovery_target(
-    selected: Uint256,
-    local: Uint256,
-    parent: Uint256,
-    pinned_recovery: &mut Option<Uint256>,
-    failed: impl FnOnce(Uint256) -> bool,
-) -> Uint256 {
-    if selected.is_zero() || selected == local || selected == parent {
-        *pinned_recovery = None;
-        return selected;
-    }
-    let Some(stable) = *pinned_recovery else {
-        return selected;
-    };
-    if stable.is_zero() || stable == local || stable == parent || failed(stable) {
-        *pinned_recovery = None;
-        selected
-    } else {
-        stable
-    }
 }
 
 /// Demote only once a preferred-LCL divergence has become actionable.
@@ -2032,15 +1982,10 @@ fn switch_last_closed_ledger(
         "LCL trace: switching to resolver-visible preferred LCL"
     );
 
-    // This matches rippled switchLastClosedLedger: the visible waiting state
-    // clears only after a real LCL jump, never on a target replacement.
-    // M6-E: with the coordinator installed the atomic is the phase port's
-    // derived output; `coordinator_lcl_installed` (fed below) drives the phase
-    // to Tracking/Full whose derived value is false. The direct write remains
-    // the coordinator-less rollback path.
-    if !shared_inbound.coordinator_installed() {
-        root.set_need_network_ledger(false);
-    }
+    // Match rippled: needNetworkLedger is an independent startup/recovery
+    // latch, not a projection of the public operating mode. A real LCL switch
+    // clears it; ordinary Full -> Syncing view changes never set it again.
+    root.set_need_network_ledger(false);
     root.process_closed_ledger_txq(ledger.as_ref(), true);
     root.rebuild_open_ledger_after_consensus(Arc::clone(&ledger), &[], false);
     root.on_closed_ledger(Arc::clone(&ledger));
@@ -2108,7 +2053,7 @@ fn check_accept_and_advance(
     // validation and publication advance normally. The runner admits it only
     // for its exact Syncing target (or from Connected), so an unrelated
     // closed ledger cannot promote the phase.
-    if shared_inbound.coordinator_installed() {
+    if shared_inbound.coordinator_installed() && !root.need_network_ledger() {
         if let Some(closed) = root.closed_ledger() {
             // A restarted node can resume a round on the durable recovered
             // target and accept its first child before this maintenance turn.
@@ -2133,34 +2078,8 @@ fn check_accept_and_advance(
     }
 
     // ── tryAdvance publication ────────────────────────────────────────────
-    let published_before = root
-        .published_ledger()
-        .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
     root.try_advance_publication();
     let published_ledger_after = root.published_ledger();
-    let published_after = published_ledger_after
-        .as_ref()
-        .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
-    // Match rippled LedgerMaster::doAdvance: clear recovery only after this
-    // pass actually publishes a newly found ledger, never merely because an
-    // older published ledger remains behind a provisional/missing frontier.
-    let publication_advanced = match (published_before, published_after) {
-        (None, Some(_)) => true,
-        (Some(before), Some(after)) => before != after,
-        _ => false,
-    };
-    // M6-E: with the coordinator installed the atomic is the phase port's
-    // derived output; the `coordinator_publication_committed` fact below drives
-    // `Tracking -> Full` (whose derived value is false) when the advance is
-    // fresh, and leaves it true while a concrete target is still Syncing. The
-    // direct write remains the coordinator-less rollback path.
-    if root.need_network_ledger()
-        && publication_advanced
-        && published_after.is_some_and(|(_, seq)| seq <= lm.valid_ledger_seq())
-        && !shared_inbound.coordinator_installed()
-    {
-        root.set_need_network_ledger(false);
-    }
 
     // Coordinator mode: report the current publication as a typed fact on
     // every serialized non-divergent maintenance pass. Validation acceptance
@@ -3009,7 +2928,15 @@ fn recovered_target_is_contiguous_to_lcl(
     lcl: &ledger::Ledger,
     target: acquisition::LedgerTarget,
 ) -> Option<acquisition::LedgerIdentity> {
-    let sequence = target.sequence()?;
+    // A preferred hash is often selected before its ledger is resident, so
+    // its sequence is initially unknown. Once consensus accepts the direct
+    // child, the child's verified header proves both the target sequence and
+    // ancestry. Do not leave the coordinator permanently Syncing merely
+    // because the sequence was absent at the instant of demotion.
+    let sequence = target.sequence().or_else(|| {
+        (*lcl.header().parent_hash.as_uint256() == target.hash())
+            .then(|| lcl.header().seq.saturating_sub(1))
+    })?;
     published_anchor_is_contiguous_to_lcl(lcl, target.hash(), sequence)
         .then_some(acquisition::LedgerIdentity::new(target.hash(), sequence))
 }
@@ -3078,13 +3005,12 @@ mod tests {
         PreferredLclReconciliation, drain_bounded, heartbeat_operating_mode_reassertion,
         history_acquire_allowed, history_fetch_pack_requested, persist_completed_inbound_ledger,
         process_completed_inbound_ledger, published_ledger_is_contiguous_with_lcl,
-        reconcile_preferred_lcl, reconcile_preferred_lcl_with_status_broadcaster,
-        record_completed_inbound_ledger, recovered_target_is_contiguous_to_lcl,
-        required_peer_count, same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
+        reconcile_preferred_lcl_with_status_broadcaster, record_completed_inbound_ledger,
+        recovered_target_is_contiguous_to_lcl, required_peer_count,
+        same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
         should_emit_coordinator_publication, should_promote_operating_mode_at_end_consensus,
         should_reconcile_preferred_lcl, should_report_peer_availability,
-        should_run_end_consensus_reconciliation, stabilized_preferred_recovery_target,
-        switch_last_closed_ledger,
+        should_run_end_consensus_reconciliation, switch_last_closed_ledger,
     };
     use crate::consensus::rcl_consensus::{ConsensusRunner, PendingAcceptWork, RclCxLedger};
     use crate::consensus::rcl_cx_peer_pos::RclCxPeerPos;
@@ -3362,6 +3288,14 @@ mod tests {
             ),
             Some(target_identity),
             "a recovered preferred target used as the accepted child's parent must satisfy the coordinator's exact target gate before the actual LCL refresh",
+        );
+        assert_eq!(
+            recovered_target_is_contiguous_to_lcl(
+                &child,
+                LedgerTarget::new(target_identity.hash(), None),
+            ),
+            Some(target_identity),
+            "a verified direct child must resolve a hash-only recovery target",
         );
         assert_eq!(
             recovered_target_is_contiguous_to_lcl(
@@ -3727,7 +3661,6 @@ mod tests {
         let mut runner = RecordingRunner::accepted(*local.header().hash.as_uint256());
         let consensus_rt = AppConsensusRuntime::new();
         let mut last_round = None;
-        let mut preferred_recovery_target = None;
         let mut sampler = LclAuditSampler::new();
         let mut provisional_waiter = None;
         let status_broadcasts = Arc::new(AtomicUsize::new(0));
@@ -3747,15 +3680,12 @@ mod tests {
                 &mut runner,
                 &consensus_rt,
                 &mut last_round,
-                &mut preferred_recovery_target,
                 &mut sampler,
                 &mut provisional_waiter,
                 &observe_status_broadcast,
             ),
             PreferredLclReconciliation::Provisional,
         );
-        assert_eq!(preferred_recovery_target, Some(target_hash));
-
         assert!(inbound.is_provisional(&target_hash));
         assert_eq!(
             status_broadcasts.load(std::sync::atomic::Ordering::Relaxed),
@@ -3922,78 +3852,6 @@ mod tests {
             consensus::rcl_support::ValidationsAdaptor::acquire(validations.adaptor(), &hash,)
                 .is_some()
         );
-    }
-
-    #[test]
-    fn moving_preferred_tip_does_not_replace_inflight_recovery_identity() {
-        let local = Uint256::from(10);
-        let parent = Uint256::from(9);
-        let inflight = Uint256::from(100);
-        let newer = Uint256::from(101);
-        let mut pinned = Some(inflight);
-        assert_eq!(
-            stabilized_preferred_recovery_target(newer, local, parent, &mut pinned, |_| false,),
-            inflight,
-            "a completion for the exact inflight hash must retain a chance to become the LCL",
-        );
-        assert_eq!(pinned, Some(inflight));
-
-        // Ordinary consensus Accept/StartRound bookkeeping changes a separate
-        // last-round identity. Repeated Accepted passes therefore keep the
-        // exact recovery target even as the selected tip advances again.
-        let newest = Uint256::from(102);
-        assert_eq!(
-            stabilized_preferred_recovery_target(newest, local, parent, &mut pinned, |_| false,),
-            inflight,
-        );
-        assert_eq!(pinned, Some(inflight));
-
-        assert_eq!(
-            stabilized_preferred_recovery_target(newer, local, parent, &mut pinned, |hash| hash
-                == inflight,),
-            newer,
-            "an explicitly failed recovery target releases the moving tip",
-        );
-        assert_eq!(pinned, None);
-
-        pinned = Some(inflight);
-        assert_eq!(
-            stabilized_preferred_recovery_target(local, local, parent, &mut pinned, |_| false,),
-            local,
-            "network convergence to the local LCL cancels obsolete recovery",
-        );
-        assert_eq!(pinned, None);
-    }
-
-    #[test]
-    fn exact_hash_mismatch_retry_retains_requested_recovery_identity() {
-        let local = Uint256::from(10);
-        let parent = Uint256::from(9);
-        let requested = Uint256::from(100);
-        let moving_tip = Uint256::from(101);
-
-        // The mismatch branch immediately reissues an exact-hash acquire and
-        // therefore retains the requested hash rather than treating the bad
-        // resolver object as terminal admission rejection.
-        let mut pinned = Some(requested);
-        assert_eq!(
-            stabilized_preferred_recovery_target(moving_tip, local, parent, &mut pinned, |_| false,),
-            requested,
-        );
-        assert_eq!(pinned, Some(requested));
-
-        // In contrast, the explicit failure boundary releases it.
-        assert_eq!(
-            stabilized_preferred_recovery_target(
-                moving_tip,
-                local,
-                parent,
-                &mut pinned,
-                |hash| hash == requested,
-            ),
-            moving_tip,
-        );
-        assert_eq!(pinned, None);
     }
 
     #[test]

@@ -4386,10 +4386,9 @@ fn initialize_startup_ledger_state(
         StartUpType::LoadFile => load_startup_ledger_from_file(root, options),
         StartUpType::Network => {
             if !root.config().standalone {
-                // M6-E: this runs before the coordinator is installed, so it is
-                // a pre-install seed consistent with the coordinator's derived
-                // `Connected -> need_network_ledger = true`; after install the
-                // atomic is the phase port's output only.
+                // Match rippled's independent network-startup latch. Operating
+                // mode changes do not set it; a real LCL switch/publication
+                // clears it later.
                 root.set_need_network_ledger(true);
             }
             seed_startup_ledger_state(root, options, config)

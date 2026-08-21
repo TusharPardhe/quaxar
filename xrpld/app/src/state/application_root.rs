@@ -7954,6 +7954,11 @@ impl ApplicationRoot {
         lm.set_full_ledger(&persistence, Arc::clone(&full), true, true, None, None)
             .map_err(|error| format!("publication setFullLedger failed: {error:?}"))?;
         lm.set_pub_ledger(Arc::clone(&full));
+        // Match rippled LedgerMaster::doAdvance: the authoritative publication
+        // commit clears the independent network-startup recovery latch. A
+        // later maintenance snapshot cannot reliably infer this edge because
+        // checkAccept may publish synchronously before that snapshot.
+        self.set_need_network_ledger(false);
         // Publishing changes the owner-visible plan even when no validation
         // or inbound callback follows immediately.
         self.request_publication_advance();

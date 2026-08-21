@@ -702,6 +702,9 @@ impl CoordinatorRunner {
             AcquisitionEvent::PreferredLclDivergence { target } => {
                 self.on_preferred_lcl_divergence(target)
             }
+            AcquisitionEvent::PreferredLclReconciled { lcl } => {
+                self.on_preferred_lcl_reconciled(lcl)
+            }
             AcquisitionEvent::BlockedWithNoTarget => self.on_blocked_with_no_target(),
             AcquisitionEvent::PacketAdmitted(packet) => self.on_packet(packet),
             AcquisitionEvent::ReadCompleted(completion) => self.on_read(completion),
@@ -1019,18 +1022,30 @@ impl CoordinatorRunner {
         // The authoritative fact selects the preferred target, but it does not
         // suspend an older per-hash acquisition. rippled's one InboundLedgers
         // owner advances multiple InboundLedger hashes concurrently.
-        self.state.latest_consensus_target = Some(target.target());
+        let incoming = target.target();
+        let selected = self
+            .state
+            .latest_consensus_target
+            .filter(|current| {
+                current.hash() == incoming.hash()
+                    && current.sequence().is_some()
+                    && incoming.sequence().is_none()
+            })
+            .unwrap_or(incoming);
+        self.state.latest_consensus_target = Some(selected);
         self.state.deferred_consensus_acquire = None;
-        self.on_acquire(target.target(), target.reason(), true)
+        self.on_acquire(selected, target.reason(), true)
     }
 
     /// A preferred-LCL divergence demotion (rippled `consensusViewChange`).
-    /// Demotes `Connected/Tracking/Full -> Syncing { target }` without minting a
-    /// session: the resident-and-compatible switch path must not start a peer
+    /// Demotes `Connected/Tracking/Full -> Syncing { target }`, or retargets
+    /// an existing Syncing phase, without minting a session: the
+    /// resident-and-compatible switch path must not start a peer
     /// fetch, and the missing/incomplete path feeds its own `AcquireRequested`
     /// demand. Rejected without usable peers (the transition rules require a
-    /// fresh `PeerCapabilityAvailable` fact first) and from phases where the
-    /// divergence fact is illegal (`Syncing`/`Disconnected`/`Stopping`).
+    /// fresh `PeerCapabilityAvailable` fact first). While already `Syncing`, a
+    /// newer preferred identity retargets policy without cancelling older
+    /// per-hash acquisition sessions.
     fn on_preferred_lcl_divergence(&mut self, target: LedgerTarget) -> Vec<AcquisitionEffect> {
         if !self.state.peer_view.has_usable_peer_capability() {
             self.stats.rejected_events += 1;
@@ -1055,6 +1070,21 @@ impl CoordinatorRunner {
             }
         } else {
             self.stats.rejected_events += 1;
+        }
+        effects
+    }
+
+    fn on_preferred_lcl_reconciled(&mut self, lcl: LedgerIdentity) -> Vec<AcquisitionEffect> {
+        self.state.last_installed_lcl = Some(lcl);
+        self.state.latest_consensus_target = None;
+        self.state.deferred_consensus_acquire = None;
+        let fact = TransitionFact::PreferredLclReconciled { lcl };
+        let mut effects = Vec::new();
+        if let Ok(next) = self.state.phase.apply(fact)
+            && next != self.state.phase
+        {
+            self.state.phase = next;
+            effects.push(AcquisitionEffect::SetServicePhase(next));
         }
         effects
     }
@@ -2136,6 +2166,27 @@ impl CoordinatorRunner {
                     self.fail_session(session, FailureReason::DurabilityFenceFailed, &mut effects);
                     return effects;
                 };
+                let durable_hash = *ledger.header().hash.as_uint256();
+                let durable_sequence = ledger.header().seq;
+                let resolved = LedgerTarget::new(durable_hash, Some(durable_sequence));
+                // Preferred-LCL selection can name a nonresident ledger by
+                // hash before its sequence is known. The verified durable
+                // header is the first authoritative identity boundary: refine
+                // coordinator policy here so an accepted child can later
+                // prove the recovered target is its ancestor.
+                if let SyncPhase::Syncing { target } = self.state.phase
+                    && target.hash() == durable_hash
+                    && target.sequence().is_none()
+                {
+                    let next = SyncPhase::Syncing { target: resolved };
+                    self.state.phase = next;
+                    effects.push(AcquisitionEffect::SetServicePhase(next));
+                }
+                if self.state.latest_consensus_target.is_some_and(|target| {
+                    target.hash() == durable_hash && target.sequence().is_none()
+                }) {
+                    self.state.latest_consensus_target = Some(resolved);
+                }
                 // Persisting -> DurablePending: the durable payload and unique
                 // handoff are now both present, so delivery may be retried
                 // exactly once by handoff identity. It is never
@@ -2145,6 +2196,11 @@ impl CoordinatorRunner {
                     self.stats.stale_events += 1;
                     return effects;
                 };
+                if session_state.target.hash() == durable_hash
+                    && session_state.target.sequence().is_none()
+                {
+                    session_state.promote_target(resolved);
+                }
                 session_state.phase = durable;
                 tracing::info!(
                     target: "acquisition_trace",
@@ -5070,19 +5126,83 @@ mod tests {
     }
 
     #[test]
-    fn preferred_lcl_divergence_while_syncing_or_disconnected_is_rejected() {
-        for phase in [
-            SyncPhase::Disconnected,
+    fn preferred_lcl_divergence_while_syncing_retargets_policy() {
+        let mut runner = CoordinatorRunner::with_phase(
+            RunEpoch::new(1),
             SyncPhase::Syncing { target: target(1) },
-        ] {
-            let mut runner = CoordinatorRunner::with_phase(RunEpoch::new(1), phase);
-            let rejected = runner.snapshot().rejected_events();
-            let effects =
-                runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: target(9) });
-            assert!(effects.is_empty(), "phase {:?} must reject the fact", phase);
-            assert_eq!(runner.phase(), &phase, "phase {:?} must not change", phase);
-            assert_eq!(runner.snapshot().rejected_events(), rejected + 1);
-        }
+        );
+        let effects =
+            runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: target(9) });
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(9) });
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Syncing {
+                target: target(9),
+            })]
+        );
+        assert_eq!(runner.snapshot().rejected_events(), 0);
+    }
+
+    #[test]
+    fn preferred_lcl_divergence_while_disconnected_is_rejected() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        let rejected = runner.snapshot().rejected_events();
+        let effects =
+            runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: target(9) });
+        assert!(effects.is_empty());
+        assert_eq!(runner.phase(), &SyncPhase::Disconnected);
+        assert_eq!(runner.snapshot().rejected_events(), rejected + 1);
+    }
+
+    #[test]
+    fn preferred_lcl_reconciliation_retires_stale_target_and_restores_full() {
+        let local = identity(7);
+        let stale = target(9);
+        let mut runner = CoordinatorRunner::with_phase(
+            RunEpoch::new(1),
+            SyncPhase::Full {
+                lcl: local,
+                published: local,
+            },
+        );
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
+        ));
+        let _ = runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: stale });
+        let _ = runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+            stale,
+            AcquireReason::Consensus,
+        )));
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: stale });
+
+        let effects = runner.handle_event(AcquisitionEvent::PreferredLclReconciled { lcl: local });
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Tracking {
+                lcl: local
+            })]
+        );
+        assert_eq!(runner.state.latest_consensus_target, None);
+        assert_eq!(runner.state.deferred_consensus_acquire, None);
+
+        let effects = runner.handle_event(AcquisitionEvent::PublicationCommitted {
+            identity: local,
+            fresh: true,
+        });
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Full {
+                lcl: local,
+                published: local,
+            })]
+        );
+        assert_eq!(
+            runner.phase(),
+            &SyncPhase::Full {
+                lcl: local,
+                published: local,
+            }
+        );
     }
 
     #[test]
@@ -7866,6 +7986,72 @@ mod tests {
             SessionPhase::Complete
         ));
         assert_eq!(runner.snapshot().sessions_completed(), 1);
+    }
+
+    #[test]
+    fn durable_header_refines_hash_only_syncing_target_sequence() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let ledger = immutable_ledger(27);
+        let hash = *ledger.header().hash.as_uint256();
+        let unresolved = LedgerTarget::new(hash, None);
+        let seed = ScriptedSeed::new(vec![ScriptedStep::Complete])
+            .with_durable_ledger(Arc::clone(&ledger));
+        let mut runner =
+            CoordinatorRunner::with_plan_seed(RunEpoch::new(1), budget, Box::new(seed));
+        connect(&mut runner);
+        let _ =
+            runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: unresolved });
+        let effects = runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+            unresolved,
+            AcquireReason::Consensus,
+        )));
+        let session = peer_request_session(&effects);
+        let effects = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            session,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        let batch = write_batch(&effects);
+        let _ = runner.handle_event(AcquisitionEvent::WriteCompleted(WriteCompletion::new(
+            batch.operation(),
+            WriteOutcome::Accepted,
+        )));
+
+        let effects = runner.handle_event(AcquisitionEvent::DurabilityFenced(
+            DurabilityCompletion::new(
+                batch.fence().expect("final batch fence"),
+                crate::io::DurabilityOutcome::Passed,
+            ),
+        ));
+        let resolved = LedgerTarget::new(hash, Some(ledger.header().seq));
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: resolved });
+        assert!(
+            effects.contains(&AcquisitionEffect::SetServicePhase(SyncPhase::Syncing {
+                target: resolved
+            }))
+        );
+        assert_eq!(runner.state.latest_consensus_target, Some(resolved));
+        assert_eq!(
+            runner.session(session).expect("live session").target(),
+            resolved
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::PublishDurable(_)))
+        );
+        let phase_index = effects
+            .iter()
+            .position(|effect| matches!(effect, AcquisitionEffect::SetServicePhase(_)))
+            .expect("resolved phase effect");
+        let handoff_index = effects
+            .iter()
+            .position(|effect| matches!(effect, AcquisitionEffect::PublishDurable(_)))
+            .expect("durable handoff effect");
+        assert!(
+            phase_index < handoff_index,
+            "target identity must be published before the durable ledger handoff"
+        );
     }
 
     #[test]
