@@ -18,12 +18,18 @@ use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 /// Rippled retains up to 512 deferred reads in one `getMissingNodes()` pass.
 /// Quaxar preserves that progression while making the physical-read limit
 /// global, so coalesced acquisitions never multiply database I/O.
-pub const ACQ_READS_GLOBAL: usize = 512;
+pub const ACQ_READS_PER_SCAN: usize = 512;
 
-/// Bounded retained logical subscriptions for the global Rust broker. An
-/// independent budget from the physical in-flight limit so a small physical
-/// concurrency still permits coalesced waiters and FIFO-deferred promotion.
-pub const ACQ_READS_LOGICAL: usize = 512;
+/// Rippled's `InboundLedger` JobQueue category permits five concurrent jobs,
+/// each of which may hold one 512-read `getMissingNodes` batch.
+pub const ACQ_SCAN_JOBS: usize = 5;
+
+pub const ACQ_READS_GLOBAL: usize = ACQ_READS_PER_SCAN * ACQ_SCAN_JOBS;
+
+/// Bounded retained logical subscriptions per acquisition plan. This mirrors
+/// rippled's 512 deferred reads per `getMissingNodes` traversal; applying this
+/// as one process-global cap lets the first session starve every other tree.
+pub const ACQ_READS_LOGICAL: usize = ACQ_READS_PER_SCAN;
 
 /// Bounded retained logical ownership for the global Rust broker.
 ///
@@ -35,12 +41,13 @@ pub const ACQ_READS_LOGICAL: usize = 512;
 /// logical subscribers and a deferred request may wait in the broker FIFO
 /// behind occupied physical slots without consuming a physical slot of its
 /// own. A cancelled dispatched callback may outlive its subscriber, but
-/// remains within the existing physical in-flight limit. A request at the
-/// retained-subscription bound is returned as non-terminal `Deferred` with no
-/// broker record or sink event, leaving the actor's retained missing edge
-/// available for bounded local-read retry.
+/// remains within the existing physical in-flight limit. A request at either
+/// retained-subscription bound is returned as `CapacityDeferred` with no
+/// broker record or sink event; the adapter retains it in a bounded FIFO until
+/// a real settlement reopens a scan lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadBrokerLimits {
+    pub max_global_retained_logical_subscriptions: usize,
     pub max_retained_logical_subscriptions: usize,
 }
 
@@ -137,16 +144,19 @@ pub enum ReadRejectReason {
     Stopped,
 }
 
-/// Result of a submission attempt. `Deferred` can retain a broker ticket
-/// while physical dispatch is occupied. At the retained-subscription bound it
-/// has no broker record and produces no terminal sink event: that admission
-/// signal leaves the caller's missing edge available for bounded local-read retry.
-/// Cancelling an unretained ticket is harmless and returns `false`.
+/// Result of a submission attempt. `Deferred` retains a broker ticket while
+/// physical dispatch is occupied. `CapacityDeferred` retains neither a broker
+/// record nor a completion and requires caller-owned bounded retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadAdmission {
     Accepted(ReadTicket),
     Attached(ReadTicket),
+    /// A broker-owned subscription is retained behind the physical dispatch
+    /// limit and will eventually settle through its sink.
     Deferred(ReadTicket),
+    /// The logical-subscription limit was full, so no ticket or callback was
+    /// retained. The caller must keep the read need eligible for resubmission.
+    CapacityDeferred,
     Rejected(ReadRejectReason),
 }
 
@@ -155,6 +165,7 @@ pub enum ReadAdmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadBrokerConfig {
     pub global_in_flight: usize,
+    pub max_global_retained_logical_subscriptions: usize,
     pub max_retained_logical_subscriptions: usize,
 }
 
@@ -162,6 +173,7 @@ impl Default for ReadBrokerConfig {
     fn default() -> Self {
         Self {
             global_in_flight: ACQ_READS_GLOBAL,
+            max_global_retained_logical_subscriptions: ACQ_READS_GLOBAL,
             max_retained_logical_subscriptions: ACQ_READS_LOGICAL,
         }
     }
@@ -175,6 +187,9 @@ impl ReadBrokerConfig {
         if self.max_retained_logical_subscriptions == 0 {
             return Err("retained logical subscription capacity must be nonzero");
         }
+        if self.max_global_retained_logical_subscriptions == 0 {
+            return Err("global retained logical subscription capacity must be nonzero");
+        }
         Ok(self)
     }
 
@@ -183,6 +198,8 @@ impl ReadBrokerConfig {
     /// by Worker 2 must be the store generation observed at that same point.
     pub const fn logical_limits(self) -> ReadBrokerLimits {
         ReadBrokerLimits {
+            max_global_retained_logical_subscriptions: self
+                .max_global_retained_logical_subscriptions,
             max_retained_logical_subscriptions: self.max_retained_logical_subscriptions,
         }
     }
@@ -333,22 +350,18 @@ impl NodeReadBroker {
         }
 
         let limits = self.inner.config.logical_limits();
-        if state.tickets.len() >= limits.max_retained_logical_subscriptions {
-            let ticket_id = ReadTicketId(state.next_ticket);
-            state.next_ticket = state
-                .next_ticket
-                .checked_add(1)
-                .expect("read ticket id overflow");
-            let ticket = ReadTicket {
-                id: ticket_id,
-                key,
-                acquisition_id,
-                plan_id,
-            };
+        let owner_ticket_count = state
+            .tickets
+            .values()
+            .filter(|record| record.acquisition_id == acquisition_id && record.plan_id == plan_id)
+            .count();
+        if state.tickets.len() >= limits.max_global_retained_logical_subscriptions
+            || owner_ticket_count >= limits.max_retained_logical_subscriptions
+        {
             state.metrics.submitted += 1;
             state.metrics.deferred += 1;
             state.metrics.capacity_deferred += 1;
-            return ReadAdmission::Deferred(ticket);
+            return ReadAdmission::CapacityDeferred;
         }
 
         let dispatched = state
@@ -834,12 +847,11 @@ mod tests {
             ReadAdmission::Accepted(ticket) => ticket,
             other => panic!("expected immediate admission, got {other:?}"),
         };
-        let mut dispatches = broker.take_ready_dispatches();
+        let dispatches = broker.take_ready_dispatches();
         assert_eq!(dispatches.len(), 1);
 
         // Settle on a worker thread so a lock-ordering regression surfaces as
         // a bounded recv timeout instead of a stalled test binary.
-        let settled = broker.clone();
         std::thread::spawn(move || {
             for dispatch in dispatches {
                 dispatch.complete(ReadOutcome::Miss);
@@ -1003,14 +1015,14 @@ mod tests {
     }
 
     #[test]
-    fn request_at_real_512_513_514_boundary_defers_without_actor_completion() {
+    fn request_at_per_plan_512_513_514_boundary_defers_without_actor_completion() {
         let broker = broker(ReadBrokerConfig::default());
         let events = Arc::new(Mutex::new(Vec::new()));
-        let mut tickets = Vec::with_capacity(ACQ_READS_GLOBAL);
-        for sequence in 0..ACQ_READS_GLOBAL as u32 {
+        let mut tickets = Vec::with_capacity(ACQ_READS_LOGICAL);
+        for sequence in 0..ACQ_READS_LOGICAL as u32 {
             let admission = broker.request(
                 key((sequence % u8::MAX as u32) as u8, sequence),
-                u64::from(sequence) + 1,
+                1,
                 1,
                 sink(Arc::clone(&events)),
             );
@@ -1021,21 +1033,21 @@ mod tests {
         }
 
         let deferred_513 = broker.request(
-            key(0xFE, ACQ_READS_GLOBAL as u32),
-            513,
+            key(0xFE, ACQ_READS_LOGICAL as u32),
+            1,
             1,
             sink(Arc::clone(&events)),
         );
         let deferred_514 = broker.request(
-            key(0xFD, ACQ_READS_GLOBAL as u32 + 1),
-            514,
+            key(0xFD, ACQ_READS_LOGICAL as u32 + 1),
+            1,
             1,
             sink(Arc::clone(&events)),
         );
-        let ReadAdmission::Deferred(ticket_513) = deferred_513 else {
+        let ReadAdmission::CapacityDeferred = deferred_513 else {
             panic!("513th distinct request must be capacity deferred");
         };
-        let ReadAdmission::Deferred(ticket_514) = deferred_514 else {
+        let ReadAdmission::CapacityDeferred = deferred_514 else {
             panic!("514th distinct request must be capacity deferred");
         };
 
@@ -1047,8 +1059,6 @@ mod tests {
         assert_eq!(snapshot.metrics.capacity_deferred, 2);
         assert_eq!(snapshot.metrics.cancelled, 0);
         assert!(events.lock().expect("event sink").is_empty());
-        assert!(!broker.cancel(ticket_513));
-        assert!(!broker.cancel(ticket_514));
 
         let dispatches = broker.take_ready_dispatches();
         assert_eq!(dispatches.len(), 512);
@@ -1065,9 +1075,43 @@ mod tests {
     }
 
     #[test]
+    fn five_scan_jobs_fill_global_bound_and_sixth_advances_after_settlement() {
+        let broker = broker(ReadBrokerConfig::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        for plan in 1..=ACQ_SCAN_JOBS as u64 {
+            for offset in 0..ACQ_READS_PER_SCAN as u32 {
+                let sequence = ((plan as u32 - 1) * ACQ_READS_PER_SCAN as u32) + offset;
+                assert!(matches!(
+                    broker.request(
+                        key((sequence % 251) as u8, sequence),
+                        plan,
+                        plan,
+                        sink(Arc::clone(&events)),
+                    ),
+                    ReadAdmission::Accepted(_)
+                ));
+            }
+        }
+        assert_eq!(broker.snapshot().logical_tickets, ACQ_READS_GLOBAL);
+        let sixth_key = key(0xFA, ACQ_READS_GLOBAL as u32 + 1);
+        assert!(matches!(
+            broker.request(sixth_key, 6, 6, sink(Arc::clone(&events))),
+            ReadAdmission::CapacityDeferred
+        ));
+
+        let mut dispatches = broker.take_ready_dispatches();
+        assert_eq!(dispatches.len(), ACQ_READS_GLOBAL);
+        dispatches.remove(0).complete(ReadOutcome::Miss);
+        let sixth = broker.request(sixth_key, 6, 6, sink(Arc::clone(&events)));
+        assert!(matches!(sixth, ReadAdmission::Accepted(_)));
+        assert_eq!(broker.take_ready_dispatches().len(), 1);
+    }
+
+    #[test]
     fn cancellation_is_the_only_cancelled_actor_event_and_reopens_capacity_after_settlement() {
         let broker = broker(ReadBrokerConfig {
             global_in_flight: 1,
+            max_global_retained_logical_subscriptions: 1,
             max_retained_logical_subscriptions: 1,
         });
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1080,11 +1124,10 @@ mod tests {
             .into_iter()
             .next()
             .expect("dispatch");
-        let deferred = match broker.request(key(13, 10), 2, 1, sink(Arc::clone(&events))) {
-            ReadAdmission::Deferred(ticket) => ticket,
-            other => panic!("expected capacity defer, got {other:?}"),
-        };
-        assert!(!broker.cancel(deferred));
+        assert!(matches!(
+            broker.request(key(13, 10), 1, 1, sink(Arc::clone(&events))),
+            ReadAdmission::CapacityDeferred
+        ));
         assert!(broker.cancel(ticket));
         dispatch.complete(ReadOutcome::Miss);
         assert_eq!(
@@ -1118,6 +1161,7 @@ mod tests {
     fn pre_and_post_store_generation_settle_independently_without_capacity_cancellation() {
         let broker = broker(ReadBrokerConfig {
             global_in_flight: 1,
+            max_global_retained_logical_subscriptions: 1,
             max_retained_logical_subscriptions: 1,
         });
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1133,16 +1177,14 @@ mod tests {
             .into_iter()
             .next()
             .expect("pre-rotation dispatch");
-        let deferred_after_rotation =
-            match broker.request(after_rotation, 2, 1, sink(Arc::clone(&events))) {
-                ReadAdmission::Deferred(ticket) => ticket,
-                other => panic!("expected post-rotation capacity defer, got {other:?}"),
-            };
+        assert!(matches!(
+            broker.request(after_rotation, 1, 1, sink(Arc::clone(&events))),
+            ReadAdmission::CapacityDeferred
+        ));
         assert!(events.lock().expect("event sink").is_empty());
-        assert!(!broker.cancel(deferred_after_rotation));
 
         before_dispatch.complete(ReadOutcome::Miss);
-        let after_ticket = match broker.request(after_rotation, 2, 1, sink(Arc::clone(&events))) {
+        let after_ticket = match broker.request(after_rotation, 1, 1, sink(Arc::clone(&events))) {
             ReadAdmission::Accepted(ticket) => ticket,
             other => panic!("expected post-rotation retry admission, got {other:?}"),
         };

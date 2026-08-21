@@ -113,11 +113,18 @@ impl MissingNodeResidentLookup for AppResident<'_> {
     fn mark_full_below(&mut self, node: SharedIntrusive<SHAMapTreeNode>, generation: u32) {
         // A FullBelow marker is a cross-session assertion: another traversal
         // may skip the entire subtree before checking the node cache. Rippled
-        // publishes that assertion only after its accepted-node filter stored
-        // the subtree. WorkerStore is asynchronous, so stage the marker until
-        // the corresponding coordinator write completion is Accepted.
-        self.pending_full_below
-            .insert(*node.get_hash().as_uint256(), (node, generation));
+        // publishes DB-backed discoveries immediately. Only a subtree that
+        // contains newly received/cache-only nodes needs to wait for the
+        // asynchronous WorkerStore durability barrier. Without this split, an
+        // all-NodeStore traversal has no write completion to release its
+        // markers, so cancellation loses every reusable FullBelow discovery.
+        let hash = *node.get_hash().as_uint256();
+        if self.store.has_pending_write_nodes() {
+            self.pending_full_below.insert(hash, (node, generation));
+        } else {
+            node.set_full_below_gen(generation);
+            self.shared_full_below.insert(hash);
+        }
     }
 }
 
@@ -286,6 +293,16 @@ impl AppLedgerPlanEngine {
         );
     }
 
+    /// Record a hash returned by the current NodeStore generation. The read
+    /// itself is the durability proof; unlike a network or fetch-pack node it
+    /// must not be re-written by a replacement session before it can be reused.
+    fn record_durable_read(&self, hash: SHAMapHash) {
+        let mut durable = self.durable_nodes.write().expect("durable node set write");
+        if durable.0 == self.session.store_generation().get() {
+            durable.1.insert(*hash.as_uint256());
+        }
+    }
+
     /// The next tree that still needs acquisition, in rippled order: state
     /// before transactions.
     fn next_tree_kind(&self) -> Option<TreeKind> {
@@ -334,11 +351,21 @@ impl AppLedgerPlanEngine {
         node_id: shamap::node_id::SHAMapNodeId,
         hash: Uint256,
     ) -> bool {
-        let Some(blob) = self.fetch_pack.cache().get_fetch_pack(hash) else {
-            return false;
-        };
-        let Ok(node) = SHAMapTreeNode::make_from_prefix(&blob, SHAMapHash::new(hash)) else {
-            return false;
+        // A replacement session shares the process-wide TreeNodeCache with
+        // its predecessor. Consult it before issuing another root request;
+        // otherwise a cancelled acquisition can leave an almost-complete
+        // durable tree resident while every replacement still starts from a
+        // network root round trip. FetchPack remains the encoded fallback.
+        let node = if let Some(node) = self.cache.fetch(&hash) {
+            node
+        } else {
+            let Some(blob) = self.fetch_pack.cache().get_fetch_pack(hash) else {
+                return false;
+            };
+            let Ok(node) = SHAMapTreeNode::make_from_prefix(&blob, SHAMapHash::new(hash)) else {
+                return false;
+            };
+            node
         };
         if *node.get_hash().as_uint256() != hash {
             return false;
@@ -507,30 +534,35 @@ impl TreeEngine for AppLedgerPlanEngine {
     }
 
     fn apply_read(&mut self, hash: SHAMapHash, outcome: &ReadOutcome) -> PlanReadApply {
-        let Some(plan) = self.active_plan.as_mut() else {
+        if self.active_plan.is_none() {
             return PlanReadApply::StalePlan;
-        };
+        }
         let missing = match outcome {
             ReadOutcome::Settled { node: Some(bytes) } => {
                 // NodeReadBroker returns the NodeStore payload verbatim. SHAMap
                 // NodeStore objects are prefix-form, unlike overlay TMLedgerData
                 // nodes (which are decoded by `apply_network_node` as wire form).
                 match SHAMapTreeNode::make_from_prefix(bytes, hash) {
-                    Ok(mut node) => {
+                    Ok(mut node) if node.get_hash() == hash => {
                         // Match SHAMap::fetchNodeNT: every verified NodeStore
                         // result is canonicalized through the shared family
                         // before it is attached to this acquisition. Without
                         // this, read-heavy partial trees are owned only by the
                         // current session and cannot seed a replacement plan.
+                        self.record_durable_read(hash);
                         self.family.canonicalize(hash, &mut node);
                         MissingNodeReadOutcome::Found(node)
                     }
-                    Err(_) => return PlanReadApply::UnknownRead,
+                    Ok(_) | Err(_) => return PlanReadApply::UnknownRead,
                 }
             }
             ReadOutcome::Settled { node: None } => MissingNodeReadOutcome::Miss,
             ReadOutcome::Stale | ReadOutcome::Cancelled => MissingNodeReadOutcome::Cancelled,
         };
+        let plan = self
+            .active_plan
+            .as_mut()
+            .expect("active plan checked above");
         Self::map_apply(plan.apply_read_result(self.plan_id, hash, missing))
     }
 
@@ -542,9 +574,9 @@ impl TreeEngine for AppLedgerPlanEngine {
         if self.active_kind != Some(need.kind()) {
             return PlanReadApply::StalePlan;
         }
-        let Some(plan) = self.active_plan.as_mut() else {
+        if self.active_plan.is_none() {
             return PlanReadApply::StalePlan;
-        };
+        }
         let node = match outcome {
             ReadOutcome::Settled { node: Some(bytes) } => {
                 // Recovery data comes from NodeStore in prefix form. It must
@@ -554,6 +586,7 @@ impl TreeEngine for AppLedgerPlanEngine {
                 let hash = SHAMapHash::new(need.hash());
                 match SHAMapTreeNode::make_from_prefix(bytes, hash) {
                     Ok(mut node) if *node.get_hash().as_uint256() == need.hash() => {
+                        self.record_durable_read(hash);
                         self.family.canonicalize(hash, &mut node);
                         node
                     }
@@ -563,6 +596,10 @@ impl TreeEngine for AppLedgerPlanEngine {
             ReadOutcome::Settled { node: None } => return PlanReadApply::UnknownRead,
             ReadOutcome::Stale | ReadOutcome::Cancelled => return PlanReadApply::Cancelled,
         };
+        let plan = self
+            .active_plan
+            .as_mut()
+            .expect("active plan checked above");
         Self::map_apply(plan.apply_network_node(self.plan_id, SHAMapHash::new(need.hash()), node))
     }
 
@@ -641,6 +678,12 @@ impl TreeEngine for AppLedgerPlanEngine {
                     .filter(|need| Some(need.kind()) == self.active_kind)
                     .map(|need| SHAMapHash::new(need.hash())),
             );
+        }
+    }
+
+    fn rearm_pending_reads(&mut self) {
+        if let Some(plan) = self.active_plan.as_mut() {
+            plan.rearm_pending_reads();
         }
     }
 
@@ -1325,6 +1368,75 @@ mod tests {
     }
 
     #[test]
+    fn durable_read_full_below_survives_engine_replacement_and_cache_sweep() {
+        let (mut seed, cache) = seed_with(SEQ);
+        let full_below = Arc::clone(&seed.full_below);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0xD4; 32]), vec![0u8; 32]),
+            0,
+        ));
+        let leaf_hash = leaf.get_hash();
+        root.set_child_hash(5, leaf_hash);
+        root.update_hash();
+        let root_hash = root.get_hash();
+        let header = LedgerHeader {
+            seq: SEQ,
+            account_hash: root_hash,
+            ..LedgerHeader::default()
+        };
+        let session = session_for(&header);
+        let mut first = seed
+            .build(session, &base_packet(&header))
+            .expect("first engine");
+        expect_root_request(first.as_mut(), root_hash);
+        first.apply_network_node(TreeKind::State, &root_node_data(&root));
+
+        let PlanStepOutcome::NeedsReads(reads) = first.advance(10) else {
+            panic!("first engine must request its missing durable leaf")
+        };
+        // The Base and network root are not durable until this accepted batch.
+        assert!(!first.take_persistable_nodes().is_empty());
+        first.on_persistence_accepted();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].hash(), leaf_hash);
+        assert!(matches!(
+            first.apply_read(
+                leaf_hash,
+                &ReadOutcome::Settled {
+                    node: Some(Bytes::from(
+                        leaf.serialize_with_prefix().expect("leaf serializes")
+                    )),
+                }
+            ),
+            PlanReadApply::Applied { .. }
+        ));
+        assert!(matches!(first.advance(10), PlanStepOutcome::Complete));
+        assert!(
+            first.take_persistable_nodes().is_empty(),
+            "a verified NodeStore read requires no replacement write"
+        );
+        assert!(
+            full_below.touch_if_exists(*root_hash.as_uint256()),
+            "an all-durable subtree publishes FullBelow without waiting for a nonexistent write"
+        );
+
+        // Dropping the cancelled/replaced engine releases its private plan,
+        // then an ordinary shared-cache sweep runs between sessions.
+        drop(first);
+        cache.sweep();
+
+        let mut replacement = seed
+            .build(session, &base_packet(&header))
+            .expect("replacement engine");
+        assert!(
+            matches!(replacement.advance(10), PlanStepOutcome::Complete),
+            "replacement reuses the cached root plus process-wide FullBelow marker"
+        );
+    }
+
+    #[test]
     fn fetch_pack_installs_missing_state_root_without_a_ledger_data_packet() {
         // Generic TMGetObjectByHash replies populate fetch-pack, not the
         // TMLedgerData router. The engine must consume a cached root before it
@@ -1554,6 +1666,7 @@ mod tests {
         let fetch_pack = FetchPackCache::new(8, Duration::seconds(60), MonotonicClock::default());
         let mut staged = BTreeMap::new();
         let mut store = WorkerStore::default();
+        assert!(store.store_resident_shamap_node(TreeKind::State, &node, SEQ));
         let durable_nodes = RwLock::new((1, BTreeSet::new()));
         {
             let mut resident = AppResident {

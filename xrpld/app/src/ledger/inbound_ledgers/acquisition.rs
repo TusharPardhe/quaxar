@@ -945,6 +945,14 @@ pub struct WorkerStore {
 }
 
 impl WorkerStore {
+    /// True while this session owns NodeStore writes that have not yet crossed
+    /// the coordinator write port. FullBelow publication uses this to
+    /// distinguish already-durable NodeStore reads from newly received nodes
+    /// that still require the asynchronous durability barrier.
+    pub(crate) fn has_pending_write_nodes(&self) -> bool {
+        !self.pending_writes.is_empty()
+    }
+
     fn take_pending_writes(&mut self) -> Vec<PersistenceWrite> {
         self.pending_keys.clear();
         std::mem::take(&mut self.pending_writes)
@@ -2051,8 +2059,8 @@ impl AcquisitionState {
                 true
             }
             ReadAdmission::Deferred(ticket) => {
-                // Preserve the broker subscription, but do not let a capacity
-                // wait suppress the normal request path.
+                // Preserve the broker-owned FIFO subscription, but do not let
+                // a physical-dispatch wait suppress the normal request path.
                 self.mailbox
                     .lock()
                     .expect("acquisition mailbox lock")
@@ -2069,6 +2077,12 @@ impl AcquisitionState {
                     );
                 self.read_broker
                     .submit_ready_to_node_store(&self.node_store);
+                self.lifecycle
+                    .local_probe_deferred_network_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            ReadAdmission::CapacityDeferred => {
                 self.lifecycle
                     .local_probe_deferred_network_fallbacks
                     .fetch_add(1, Ordering::Relaxed);
@@ -3937,7 +3951,14 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
                     .fetch_add(1, Ordering::Relaxed);
                 actor_plan.tickets.insert(need.hash(), ticket);
             }
-            ReadAdmission::Deferred(_) => {
+            ReadAdmission::Deferred(ticket) => {
+                state
+                    .stats
+                    .state_scan_read_admission_deferred
+                    .fetch_add(1, Ordering::Relaxed);
+                actor_plan.tickets.insert(need.hash(), ticket);
+            }
+            ReadAdmission::CapacityDeferred => {
                 // Broker pressure is not a NodeStore miss. Rippled waits for
                 // all locally deferred reads before exposing missing nodes, so
                 // retain this edge for timeout-driven retry without creating a

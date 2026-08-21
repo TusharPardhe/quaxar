@@ -1433,7 +1433,7 @@ fn run_start_mode_consensus_loop(
     // and it never reads a mode back. From this point `acquire` delegates to
     // coordinator sessions and returns None for new starts, exactly like
     // rippled `InboundLedgers::acquire`.
-    shared_inbound.set_phase_state(runtime.root().network_ops_state());
+    shared_inbound.set_phase_mode_owner(runtime.root().network_ops_mode_owner());
     if shared_inbound.install_coordinator() {
         tracing::info!(
             target: "inbound_ledger",

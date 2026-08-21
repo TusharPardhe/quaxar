@@ -3094,6 +3094,19 @@ impl MissingNodeContinuation {
             .retain(|hash, _| hashes.contains(hash));
     }
 
+    /// Re-announce every retained local-read waiter after its actor-side
+    /// operation identities were invalidated (for example while a session is
+    /// dormant). The strong parent edges remain authoritative; only fresh I/O
+    /// operations are required. This is idempotent because the announcement
+    /// queue is a set keyed by the unique child hash.
+    pub fn rearm_pending_reads(&mut self) {
+        self.unannounced_reads
+            .extend(self.pending_by_hash.keys().copied());
+        if !self.unannounced_reads.is_empty() {
+            self.pending_edge_limit_reached = false;
+        }
+    }
+
     pub fn is_complete(&self) -> bool {
         !self.invalid
             && self.stack.is_empty()
@@ -6554,6 +6567,36 @@ mod native_missing_node_continuation_tests {
     }
 
     #[test]
+    fn dormant_operation_reset_rearms_retained_read_edge_idempotently() {
+        let child_hash = hash(0x47);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, child_hash);
+        root.update_hash();
+        let mut continuation = continuation(&root, 47);
+        let mut resident = EmptyResident;
+
+        let MissingNodeAdvance::NeedsReads(first) =
+            continuation.advance(32, 4, &mut resident, &mut || 0)
+        else {
+            panic!("expected the initial broker operation");
+        };
+        assert_eq!(first.len(), 1);
+        assert_eq!(continuation.pending_edges(), 1);
+        assert!(
+            !continuation.has_runnable_frontier(),
+            "the dispatched waiter normally waits on its exact actor operation"
+        );
+
+        continuation.rearm_pending_reads();
+        continuation.rearm_pending_reads();
+        assert!(continuation.has_runnable_frontier());
+        let replacement = continuation.take_unannounced_reads(4);
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].hash(), child_hash);
+        assert_eq!(continuation.pending_edges(), 1);
+    }
+
+    #[test]
     fn reply_scan_reuses_network_waiter_without_repeating_db_read_or_edge() {
         let child_hash = hash(0x46);
         let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
@@ -6721,6 +6764,111 @@ mod native_missing_node_continuation_tests {
         };
         assert_eq!(needs.len(), 1);
         assert_eq!(needs[0].hash(), grandchild_hash);
+    }
+
+    #[test]
+    fn local_read_batches_attach_strongly_publish_full_below_and_survive_next_scan() {
+        fn complete_inner(fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
+            let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+                crate::tree_node::SHAMapNodeType::AccountState,
+                SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 12]),
+                1,
+            ));
+            let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            inner.set_child_hash(0, leaf.get_hash());
+            inner.canonicalize_child(0, leaf);
+            inner.update_hash();
+            inner
+        }
+
+        let first = complete_inner(0x81);
+        let second = complete_inner(0x82);
+        let first_hash = first.get_hash();
+        let second_hash = second.get_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, first_hash);
+        root.set_child_hash(1, second_hash);
+        root.update_hash();
+        let bounds = MissingNodeContinuationBounds {
+            max_pending_hashes: 1,
+            max_pending_edges: 1,
+            max_pending_edge_bytes: std::mem::size_of::<PendingDeferredFetch>(),
+        };
+        let mut continuation = MissingNodeContinuation::new_with_bounds(
+            MissingNodePlanId::new(82),
+            &root,
+            16,
+            true,
+            77,
+            9,
+            bounds,
+            &mut || 0,
+        );
+        let mut resident = EmptyResident;
+        let mut read_batches = 0;
+
+        for _ in 0..16 {
+            match continuation.advance(64, 16, &mut resident, &mut || 0) {
+                MissingNodeAdvance::NeedsReads(needs) => {
+                    read_batches += 1;
+                    assert_eq!(
+                        needs.len(),
+                        1,
+                        "the retained-edge bound forces one read round"
+                    );
+                    let need_hash = needs[0].hash();
+                    let node = if need_hash == first_hash {
+                        first.clone()
+                    } else if need_hash == second_hash {
+                        second.clone()
+                    } else {
+                        panic!("unexpected local read hash {need_hash}");
+                    };
+                    assert!(matches!(
+                        continuation.apply_read_result(
+                            MissingNodePlanId::new(82),
+                            need_hash,
+                            MissingNodeReadOutcome::Found(node),
+                        ),
+                        MissingNodeReadApply::Applied {
+                            attached_edges: 1,
+                            missing_edges: 0
+                        }
+                    ));
+                }
+                MissingNodeAdvance::Ready => {}
+                MissingNodeAdvance::Complete => break,
+                other => panic!("local reconstruction must not need peers: {other:?}"),
+            }
+        }
+
+        assert_eq!(read_batches, 2);
+        assert!(root.is_full_below(9));
+        assert!(first.is_full_below(9));
+        assert!(second.is_full_below(9));
+        assert!(root.get_child(0).is_some());
+        assert!(root.get_child(1).is_some());
+        drop(first);
+        drop(second);
+        assert!(
+            root.get_child(0).is_some() && root.get_child(1).is_some(),
+            "canonicalized DB nodes are strongly owned by the ledger root graph"
+        );
+
+        let mut next = MissingNodeContinuation::new(
+            MissingNodePlanId::new(83),
+            &root,
+            16,
+            true,
+            77,
+            9,
+            &mut || 0,
+        );
+        assert!(matches!(
+            next.advance(64, 16, &mut resident, &mut || 0),
+            MissingNodeAdvance::Complete
+        ));
+        assert_eq!(next.pending_hashes(), 0);
     }
 
     #[test]

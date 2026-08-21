@@ -292,6 +292,10 @@ pub trait TreeEngine: std::fmt::Debug {
     /// were actually serialized, discarding a truncated scan tail.
     fn retain_network_needs(&mut self, _needs: &[PlanNetworkNeed]) {}
 
+    /// Re-announce retained SHAMap read waiters after actor operation
+    /// identities are invalidated without dropping the owned tree graph.
+    fn rearm_pending_reads(&mut self) {}
+
     /// True only while a CPU turn can make progress without a broker completion
     /// or peer response.
     fn has_runnable_frontier(&self) -> bool;
@@ -952,6 +956,9 @@ impl SessionPlan {
     /// session reactivation. Late read completions become stale; reactivation
     /// mints fresh operations before it resumes planning.
     pub fn suspend_for_dormancy(&mut self) {
+        if let Some(engine) = self.engine.as_mut() {
+            engine.rearm_pending_reads();
+        }
         self.pending_reads.clear();
         self.pending_recovery_reads.clear();
     }
@@ -1360,11 +1367,26 @@ impl SessionPlan {
                     return PlanReadOutcome::Stale;
                 };
                 self.pending_reads.remove(&hash);
-                let _ = self
+                let applied = self
                     .engine
                     .as_mut()
                     .expect("checked rooted engine")
                     .apply_read(hash, completion.outcome());
+                // In rippled all 512-read rounds execute synchronously inside
+                // one getMissingNodes trigger, so the acquisition cannot time
+                // out between successful local attachments. Quaxar externalizes
+                // those rounds; count a verified attachment as interval progress
+                // or a large local reconstruction is repeatedly cancelled while
+                // its private root graph is actively growing.
+                if matches!(
+                    applied,
+                    PlanReadApply::Applied {
+                        attached_edges: 1..,
+                        ..
+                    }
+                ) {
+                    self.note_progress();
+                }
                 // An ordinary read is keyed only by hash and may cover several
                 // retained locations. It must not retire a frontier entry
                 // without the exact `PlanNetworkNeed` verification provided by
@@ -1382,6 +1404,15 @@ impl SessionPlan {
                     .apply_recovery_read(need, completion.outcome());
                 if matches!(applied, PlanReadApply::Applied { .. }) {
                     self.retire_network_need(need);
+                }
+                if matches!(
+                    applied,
+                    PlanReadApply::Applied {
+                        attached_edges: 1..,
+                        ..
+                    }
+                ) {
+                    self.note_progress();
                 }
                 PlanReadOutcome::Applied
             }
@@ -2079,6 +2110,10 @@ impl TreeEngine for LedgerTreePlanEngine {
             .retain_network_hashes(needs.iter().map(|need| SHAMapHash::new(need.hash())));
     }
 
+    fn rearm_pending_reads(&mut self) {
+        self.plan.rearm_pending_reads();
+    }
+
     fn has_runnable_frontier(&self) -> bool {
         self.plan.has_runnable_frontier()
     }
@@ -2644,6 +2679,82 @@ mod tests {
         };
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].key(), SHAMapHash::new(Uint256::from(3)));
+    }
+
+    #[test]
+    fn verified_local_read_attachment_counts_as_async_interval_progress() {
+        let mut ids = IdCounter::new();
+        let s = session();
+        let mut plan = scripted(1, vec![ScriptedStep::NeedsReads(vec![need(7)])]);
+        let PlanTurn::Reads(requests) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected a brokered local read");
+        };
+        assert!(
+            plan.take_no_progress_interval(),
+            "announcing a read is not verified data progress"
+        );
+
+        assert_eq!(
+            plan.on_read(&ReadCompletion::new(
+                requests[0].operation(),
+                ReadOutcome::Settled {
+                    node: Some(Bytes::from_static(b"verified-local-node")),
+                },
+            )),
+            PlanReadOutcome::Applied
+        );
+        assert!(
+            !plan.take_no_progress_interval(),
+            "a strongly attached local node must keep the async reconstruction alive"
+        );
+    }
+
+    #[test]
+    fn dormancy_rearms_real_tree_waiter_with_fresh_operation_identity() {
+        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            shamap::tree_node::SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0x91; 32]), vec![0x91; 12]),
+            0,
+        ));
+        let child_hash = child.get_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        root.set_child_hash(0, child_hash);
+        root.update_hash();
+        let tree = SyncTree::from_root_with_type(
+            root,
+            shamap::sync::SHAMapType::State,
+            true,
+            1,
+            SyncState::Synching,
+        );
+        let engine = LedgerTreePlanEngine::new(TreePlan::new(
+            TreePlanId::new(1),
+            TreeKind::State,
+            &tree,
+            tree.root().get_hash(),
+            256,
+            1,
+            &mut || 0,
+        ));
+        let mut plan = SessionPlan::new(budget());
+        assert!(plan.install_engine(Box::new(engine)));
+        let mut ids = IdCounter::new();
+        let s = session();
+
+        let PlanTurn::Reads(first) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected the initial retained-tree read");
+        };
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].key(), child_hash);
+        plan.suspend_for_dormancy();
+        assert_eq!(plan.pending_read_count(), 0);
+
+        let PlanTurn::Reads(replacement) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("reactivation must mint a replacement read for the retained edge");
+        };
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].key(), child_hash);
+        assert_ne!(replacement[0].operation(), first[0].operation());
     }
 
     #[test]

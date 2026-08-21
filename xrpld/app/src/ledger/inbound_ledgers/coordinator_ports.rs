@@ -30,7 +30,7 @@ use acquisition::{
     WriteCompletion, WriteOutcome,
 };
 
-use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+use crate::network::network_ops::{AppNetworkOpsModeOwner, NetworkOpsOperatingMode};
 
 use super::coordinator_adapter::{
     BrokerCancellationDispatcher, BrokerReadPort, BrokerTicketState, CONTROL_EVENT_QUEUE_CAPACITY,
@@ -589,13 +589,15 @@ impl TimerPort for CoordinatorTimerPort {
 /// than independently mutable. Other legacy writers are removed in M6.
 #[derive(Clone)]
 pub(crate) struct CoordinatorPhasePort {
-    state: Arc<SharedNetworkOpsState>,
+    mode_owner: AppNetworkOpsModeOwner,
 }
 
 impl CoordinatorPhasePort {
-    /// Builds a phase port over the shared NetworkOps state.
-    pub(crate) fn new(state: Arc<SharedNetworkOpsState>) -> Self {
-        Self { state }
+    /// Builds a phase port over the application's normalized NetworkOps mode
+    /// owner. The coordinator still exclusively derives
+    /// `need_network_ledger` from its typed phase.
+    pub(crate) fn new(mode_owner: AppNetworkOpsModeOwner) -> Self {
+        Self { mode_owner }
     }
 }
 
@@ -628,9 +630,9 @@ impl PhasePort for CoordinatorPhasePort {
             SyncPhase::Full { .. } => "coordinator-full",
             SyncPhase::Stopping => "coordinator-stopping",
         };
-        self.state
+        self.mode_owner
             .set_operating_mode_with_reason(network_ops_mode(phase), reason);
-        self.state
+        self.mode_owner
             .set_need_network_ledger(derived_need_network_ledger(phase));
     }
 }
@@ -693,8 +695,8 @@ pub(crate) struct CoordinatorPortResources {
     pub(crate) completed_ledgers_tx: mpsc::SyncSender<CompletedInboundLedger>,
     /// The shared timer service.
     pub(crate) timer_pool: Arc<WorkerPool>,
-    /// The NetworkOps state the phase port publishes to.
-    pub(crate) phase_state: Arc<SharedNetworkOpsState>,
+    /// The validated-age-aware NetworkOps owner the phase port publishes to.
+    pub(crate) phase_mode_owner: AppNetworkOpsModeOwner,
 }
 
 /// Builds the fully wired production adapter. The event channel is created
@@ -709,7 +711,7 @@ pub(crate) fn build_coordinator_adapter(resources: CoordinatorPortResources) -> 
         node_store,
         completed_ledgers_tx,
         timer_pool,
-        phase_state,
+        phase_mode_owner,
     } = resources;
     let (tx, rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
     let (packet_tx, packet_rx) = mpsc::sync_channel(PACKET_INGRESS_QUEUE_CAPACITY);
@@ -722,7 +724,7 @@ pub(crate) fn build_coordinator_adapter(resources: CoordinatorPortResources) -> 
     let writes = CoordinatorWritePort::new(node_store, tx.clone());
     let timers = CoordinatorTimerPort::new(timer_pool, tx.clone());
     let handoffs = CoordinatorHandoffPort::new(completed_ledgers_tx, tx.clone());
-    let phase = CoordinatorPhasePort::new(phase_state);
+    let phase = CoordinatorPhasePort::new(phase_mode_owner);
     let cancellations = CoordinatorCancellationDispatcher::new(
         BrokerCancellationDispatcher::new(broker, tickets),
         timers.clone(),
@@ -753,6 +755,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    use crate::network::network_ops::SharedNetworkOpsState;
     use acquisition::{
         LedgerTarget, OperationKind, PersistNode, PlanEpoch, RunEpoch, SessionId, StoreGeneration,
         WritePort,
@@ -1145,20 +1148,36 @@ mod tests {
     }
 
     #[test]
-    fn phase_port_maps_phase_and_derives_need_network_ledger() {
+    fn phase_port_normalizes_startup_and_stale_heartbeat_but_derives_need_from_phase() {
         let state = Arc::new(SharedNetworkOpsState::new(
             NetworkOpsOperatingMode::Connected,
         ));
-        let mut port = CoordinatorPhasePort::new(Arc::clone(&state));
+        let validated_age = Arc::new(AtomicU64::new(120));
+        let age = Arc::clone(&validated_age);
+        let owner = AppNetworkOpsModeOwner::new(
+            Arc::clone(&state),
+            Arc::new(move || Duration::from_secs(age.load(Ordering::Relaxed))),
+        );
+        let mut port = CoordinatorPhasePort::new(owner);
 
+        // A stale validated ledger normalizes a Syncing heartbeat back to
+        // Connected, while the typed coordinator phase still owns the need
+        // bit and therefore keeps acquisition enabled.
         port.set_phase(SyncPhase::Syncing {
             target: LedgerTarget::new(Uint256::from(9), Some(SEQ)),
         });
-        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Syncing);
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
         assert!(
             state.need_network_ledger(),
             "syncing requires a network ledger"
         );
+
+        // Conversely, a fresh validated ledger normalizes the networked
+        // startup phase from Connected to Syncing, matching rippled setMode.
+        validated_age.store(1, Ordering::Relaxed);
+        port.set_phase(SyncPhase::Connected);
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Syncing);
+        assert!(state.need_network_ledger());
 
         port.set_phase(SyncPhase::Full {
             lcl: acquisition::LedgerIdentity::new(Uint256::from(9), SEQ),
@@ -1166,10 +1185,6 @@ mod tests {
         });
         assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Full);
         assert!(!state.need_network_ledger());
-
-        port.set_phase(SyncPhase::Connected);
-        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
-        assert!(state.need_network_ledger());
     }
 
     #[test]
@@ -1183,6 +1198,10 @@ mod tests {
         let phase_state = Arc::new(SharedNetworkOpsState::new(
             NetworkOpsOperatingMode::Disconnected,
         ));
+        let phase_mode_owner = AppNetworkOpsModeOwner::new(
+            Arc::clone(&phase_state),
+            Arc::new(|| Duration::from_secs(60)),
+        );
         let peers = SimplePeerSet::new(Vec::new());
         let fetch_pack = Arc::new(FetchPackCache::new(
             1024,
@@ -1198,7 +1217,7 @@ mod tests {
             node_store,
             completed_ledgers_tx: completed_tx,
             timer_pool: pool,
-            phase_state,
+            phase_mode_owner,
         });
 
         let effects = adapter.connectivity(&[1]);
@@ -1237,6 +1256,10 @@ mod tests {
         let phase_state = Arc::new(SharedNetworkOpsState::new(
             NetworkOpsOperatingMode::Disconnected,
         ));
+        let phase_mode_owner = AppNetworkOpsModeOwner::new(
+            Arc::clone(&phase_state),
+            Arc::new(|| Duration::from_secs(60)),
+        );
         let peers = SimplePeerSet::new(Vec::new());
         let fetch_pack = Arc::new(FetchPackCache::new(
             1024,
@@ -1252,7 +1275,7 @@ mod tests {
             node_store,
             completed_ledgers_tx: completed_tx,
             timer_pool: pool,
-            phase_state,
+            phase_mode_owner,
         });
         adapter.connectivity(&[1]);
 

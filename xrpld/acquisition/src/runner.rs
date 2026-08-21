@@ -326,6 +326,17 @@ impl CoordinatorSession {
     fn promote_target(&mut self, target: LedgerTarget) {
         self.target = target;
     }
+
+    /// Rippled performs all repeated 512-read deferred batches inside one
+    /// synchronous `getMissingNodes` call while holding the InboundLedger
+    /// mutex. Quaxar externalizes those reads, so timer events may interleave;
+    /// this identifies the interval in which they must not consume network
+    /// timeout/registry-expiry semantics or tear down the private tree graph.
+    fn local_reconstruction_in_flight(&self) -> bool {
+        self.pending_header_read.is_some()
+            || self.plan.pending_read_count() != 0
+            || self.plan.read_backlog_count() != 0
+    }
 }
 
 /// An immutable snapshot of runner-owned state for observability.
@@ -1531,6 +1542,30 @@ impl CoordinatorRunner {
                 self.stats.stale_events += 1;
                 return Vec::new();
             }
+            let local_reconstruction_in_flight = self
+                .state
+                .sessions
+                .get(&session)
+                .is_some_and(CoordinatorSession::local_reconstruction_in_flight);
+            if local_reconstruction_in_flight {
+                // Removing the registry entry in rippled does not destroy an
+                // InboundLedger whose synchronous JobQueue scan still owns a
+                // strong reference. Preserve the equivalent async owner until
+                // its current local scan reaches a network/wait boundary.
+                if let Some(state) = self.state.sessions.get_mut(&session) {
+                    state.pending_expiry_timer = None;
+                }
+                let mut effects = Vec::new();
+                self.touch_session_expiry(session, &mut effects);
+                tracing::info!(
+                    target: "acquisition_trace",
+                    event = "session_expiry_deferred_for_local_reconstruction",
+                    session_id = session.session_id().get(),
+                    target_hash = %session.target_hash(),
+                    "acquisition trace: live owner retained while brokered local reconstruction mirrors one rippled scan"
+                );
+                return effects;
+            }
             return self.expire_idle_session(session);
         }
         let Some(session_state) = self.state.sessions.get_mut(&session) else {
@@ -1596,6 +1631,41 @@ impl CoordinatorRunner {
         if timer != TimerKind::AcquireTimeout {
             self.stats.stale_events += 1;
             return Vec::new();
+        }
+        if session_state.local_reconstruction_in_flight() {
+            // `SHAMap::getMissingNodes` waits for and processes successive
+            // 512-read batches before returning to InboundLedger::onTimer.
+            // Our async translation must therefore rearm without releasing
+            // request credits, clearing recentNodes, or consuming the seven
+            // network no-progress intervals while the same scan is active.
+            let pending_header_read = session_state.pending_header_read.is_some();
+            let pending_reads = session_state.plan.pending_read_count();
+            let read_backlog = session_state.plan.read_backlog_count();
+            let timeout_budget = session_state.plan.timeouts();
+            let timer_operation = OperationRef::new(
+                session,
+                OperationKind::Timer,
+                self.state.ids.next_id(),
+                self.state.ids.next_id(),
+            );
+            session_state.pending_timer = Some((TimerKind::AcquireTimeout, timer_operation));
+            self.stats.timers_armed += 1;
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "acquisition_timeout_deferred_for_local_reconstruction",
+                session_id = session.session_id().get(),
+                target_hash = %session.target_hash(),
+                pending_header_read,
+                pending_reads,
+                read_backlog,
+                timeout_budget,
+                "acquisition trace: local scan retained without consuming network timeout budget"
+            );
+            return vec![AcquisitionEffect::ArmTimer(TimerRequest::new(
+                timer_operation,
+                TimerKind::AcquireTimeout,
+                self.state.budgets.acquire_timeout,
+            ))];
         }
         if !session_state.network_admitted {
             // Recovery admission was withdrawn before this wakeup reached the
@@ -1785,6 +1855,15 @@ impl CoordinatorRunner {
                 return Vec::new();
             }
             state.pending_header_read = None;
+            // A peer Base may have won the race with the initial NodeStore
+            // header probe. That probe still settles exactly once, but its
+            // miss must not restart Base fanout or replace the already-rooted
+            // private graph.
+            if state.plan.engine().is_some() {
+                let mut effects = Vec::new();
+                self.run_plan_turn(session, None, &mut effects);
+                return effects;
+            }
             let engine = match completion.outcome() {
                 crate::io::ReadOutcome::Settled { node: Some(data) } => {
                     self.plan_seed.build_stored_header(session, data)
@@ -6319,6 +6398,137 @@ mod tests {
         // The header packet was fed and consumed; no queue remains.
         assert_eq!(runner.session(session).expect("live").packet_count(), 0);
         assert_eq!(runner.snapshot().plan_turns(), 1);
+    }
+
+    #[test]
+    fn local_reconstruction_does_not_consume_network_timeout_or_idle_expiry() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![
+                ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(7)),
+                    10,
+                    SHAMapNodeId::default(),
+                    0,
+                )]),
+                ScriptedStep::NeedsNetwork(vec![(SHAMapNodeId::default(), Uint256::from(8))]),
+            ])),
+        );
+        connect(&mut runner);
+        let started = acquire_with_effects(&mut runner, 10);
+        let session = peer_request_session(&started);
+        let expiry = expiry_operation(&started);
+        let seeded = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            session,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        let read = read_effects(&seeded)[0].operation();
+        // Model the initial header probe losing the race to this Base packet;
+        // production clears it when the exact broker callback settles.
+        runner
+            .state
+            .sessions
+            .get_mut(&session)
+            .expect("live session")
+            .pending_header_read = None;
+
+        let expiry_effects = runner.handle_event(AcquisitionEvent::TimerFired {
+            operation: expiry,
+            timer: TimerKind::SessionExpiry,
+        });
+        assert!(runner.session(session).is_some());
+        assert!(expiry_effects.iter().any(|effect| matches!(
+            effect,
+            AcquisitionEffect::ArmTimer(request)
+                if request.timer() == TimerKind::SessionExpiry
+        )));
+
+        // More than rippled's seven network no-progress ticks may pass while
+        // the externalized equivalent of one synchronous local scan is still
+        // awaiting its read batch. None may consume timeout budget.
+        for _ in 0..9 {
+            let operation = runner
+                .session(session)
+                .expect("local scan remains live")
+                .pending_timer()
+                .expect("deadline remains armed")
+                .1;
+            let effects = runner.handle_event(AcquisitionEvent::TimerFired {
+                operation,
+                timer: TimerKind::AcquireTimeout,
+            });
+            assert_eq!(runner.session(session).expect("live").plan().timeouts(), 0);
+            assert!(effects.iter().all(|effect| matches!(
+                effect,
+                AcquisitionEffect::ArmTimer(request)
+                    if request.timer() == TimerKind::AcquireTimeout
+            )));
+        }
+
+        let network = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            read,
+            ReadOutcome::Settled { node: None },
+        )));
+        assert!(
+            network
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SendLedgerRequest(_)))
+        );
+        assert_eq!(
+            runner
+                .session(session)
+                .expect("network phase")
+                .plan()
+                .pending_read_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn late_header_probe_cannot_restart_base_after_peer_seeded_graph() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![ScriptedStep::NeedsNetwork(vec![(
+                SHAMapNodeId::default(),
+                Uint256::from(8),
+            )])])),
+        );
+        connect(&mut runner);
+        let started = acquire_with_effects(&mut runner, 10);
+        let session = peer_request_session(&started);
+        let header_read = read_effects(&started)
+            .into_iter()
+            .find(|request| request.operation().kind() == OperationKind::HeaderRead)
+            .expect("initial header probe")
+            .operation();
+        let _ = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            session,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+
+        let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            header_read,
+            ReadOutcome::Settled { node: None },
+        )));
+        assert!(effects.iter().all(|effect| !matches!(
+            effect,
+            AcquisitionEffect::SendLedgerRequest(request)
+                if matches!(request.request(), LedgerDataRequest::GetLedger { .. })
+        )));
+        assert!(
+            runner
+                .session(session)
+                .expect("live")
+                .plan()
+                .engine()
+                .is_some()
+        );
     }
 
     #[test]

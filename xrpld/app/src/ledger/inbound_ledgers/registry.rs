@@ -24,7 +24,7 @@ use acquisition::{
     DurableHandoffAcknowledgement, DurableHandoffId, RunEpoch, RunnerSnapshot, SessionRef,
 };
 
-use crate::network::network_ops::SharedNetworkOpsState;
+use crate::network::network_ops::AppNetworkOpsModeOwner;
 use crate::runtime::overlay_runtime::AppOverlayRuntime;
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
@@ -787,7 +787,7 @@ pub struct InboundLedgers {
     /// The NetworkOps state the coordinator phase port publishes to. Wired by
     /// ApplicationRoot before coordinator installation; the coordinator is the
     /// single production mode writer for the sessions it owns.
-    coordinator_phase: RwLock<Option<Arc<SharedNetworkOpsState>>>,
+    coordinator_phase: RwLock<Option<AppNetworkOpsModeOwner>>,
 }
 
 impl InboundLedgers {
@@ -881,11 +881,28 @@ impl InboundLedgers {
     /// Wire the NetworkOps phase state the coordinator publishes to. The
     /// coordinator is the single production mode writer for the sessions it
     /// owns; it never reads a mode back from this state.
-    pub(crate) fn set_phase_state(&self, state: Arc<SharedNetworkOpsState>) {
+    pub(crate) fn set_phase_mode_owner(&self, owner: AppNetworkOpsModeOwner) {
         *self
             .coordinator_phase
             .write()
-            .expect("coordinator phase write") = Some(state);
+            .expect("coordinator phase write") = Some(owner);
+    }
+
+    #[cfg(test)]
+    fn set_phase_state(&self, state: Arc<crate::network::network_ops::SharedNetworkOpsState>) {
+        let age_state = Arc::clone(&state);
+        self.set_phase_mode_owner(AppNetworkOpsModeOwner::new(
+            state,
+            Arc::new(move || {
+                if age_state.operating_mode()
+                    == crate::network::network_ops::NetworkOpsOperatingMode::Tracking
+                {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(60)
+                }
+            }),
+        ));
     }
 
     /// Whether the coordinator owns session lifecycle. When false, `acquire`
@@ -944,7 +961,7 @@ impl InboundLedgers {
             Some(node_store) => node_store,
             None => return false,
         };
-        let phase_state = match self
+        let phase_mode_owner = match self
             .coordinator_phase
             .read()
             .expect("coordinator phase read")
@@ -974,7 +991,7 @@ impl InboundLedgers {
             node_store,
             completed_ledgers_tx: self.completed_ledgers_tx.clone(),
             timer_pool: Arc::clone(&self.worker_pool),
-            phase_state,
+            phase_mode_owner,
         });
         let ingress = adapter.ingress();
         let mut guard = self.coordinator.lock().expect("coordinator lock");

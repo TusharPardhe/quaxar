@@ -430,6 +430,13 @@ impl AppNetworkOpsModeOwner {
     pub fn need_network_ledger(&self) -> bool {
         self.state.need_network_ledger()
     }
+
+    /// Publish the coordinator-owned derived network-ledger requirement.
+    /// Operating-mode normalization must not independently infer this bit:
+    /// the typed acquisition phase remains its sole source of truth.
+    pub(crate) fn set_need_network_ledger(&self, needed: bool) {
+        self.state.set_need_network_ledger(needed);
+    }
 }
 
 const fn encode_operating_mode(mode: NetworkOpsOperatingMode) -> u8 {

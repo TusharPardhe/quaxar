@@ -288,6 +288,10 @@ impl TreePlan {
         self.continuation.retain_network_hashes(hashes);
     }
 
+    pub fn rearm_pending_reads(&mut self) {
+        self.continuation.rearm_pending_reads();
+    }
+
     pub fn network_candidates(&self) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)> {
         self.continuation.network_candidates()
     }
