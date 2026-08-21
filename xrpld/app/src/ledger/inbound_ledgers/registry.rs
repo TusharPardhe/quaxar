@@ -1083,6 +1083,56 @@ impl InboundLedgers {
         true
     }
 
+    /// Feed NetworkOps' authoritative preferred-LCL selection. Register the
+    /// app plan/handoff origin before the fact can mint a session and dispatch
+    /// its first request. Ordinary `acquire(..., Consensus)` then coalesces as
+    /// demand-only work and cannot replace this exact active permit.
+    pub fn coordinator_consensus_target(&self, target: acquisition::LedgerTarget) -> bool {
+        if target.hash().is_zero() || self.stopping.load(Ordering::Acquire) {
+            return false;
+        }
+        let failures = {
+            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let Some(coordinator) = guard.as_mut() else {
+                return false;
+            };
+            let acquisition_id = self.next_acquisition_id.fetch_add(1, Ordering::Relaxed);
+            self.coordinator_origins.register(
+                target.hash(),
+                target.sequence().unwrap_or_default(),
+                ledger::InboundLedgerReason::Consensus,
+            );
+            coordinator.refresh_peers(self.coordinator_peer_snapshot());
+            let peers = self
+                .coordinator_peer_snapshot()
+                .iter()
+                .map(|peer| peer.id())
+                .collect::<Vec<_>>();
+            let peerless = peers.is_empty();
+            coordinator.connectivity(&peers);
+            coordinator.register_pending_handoff_origin(
+                target.hash(),
+                AcquireReason::Consensus,
+                acquisition_id,
+            );
+            let effects = coordinator.consensus_target(target);
+            let started = effects.iter().any(|effect| {
+                matches!(effect, AcquisitionEffect::SessionStarted(session) if session.target_hash() == target.hash())
+            });
+            if !peerless && !started && !coordinator.has_deferred_consensus_target(target) {
+                coordinator.clear_pending_handoff_origin(
+                    target.hash(),
+                    AcquireReason::Consensus,
+                    acquisition_id,
+                );
+            }
+            coordinator.drain();
+            coordinator.take_terminal_failures()
+        };
+        self.record_coordinator_failures(failures);
+        true
+    }
+
     /// Feed a preferred-LCL divergence fact (rippled `consensusViewChange`
     /// parity). Demotes `Connected/Tracking/Full -> Syncing { target }` without
     /// minting a session. Returns false unless installed, so the legacy strand

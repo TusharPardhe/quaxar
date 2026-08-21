@@ -574,6 +574,18 @@ where
         self.handle_fact(AcquisitionEvent::AcquireRequested { target, reason })
     }
 
+    /// Report the authoritative preferred-LCL target selected by NetworkOps
+    /// `checkLastClosedLedger`. This is the sole event that may select the
+    /// active consensus permit; ordinary consensus acquires remain demand-only.
+    pub(crate) fn consensus_target(
+        &mut self,
+        target: acquisition::LedgerTarget,
+    ) -> Vec<AcquisitionEffect> {
+        self.handle_fact(AcquisitionEvent::ConsensusTarget(
+            acquisition::ConsensusTarget::new(target, acquisition::AcquireReason::Consensus),
+        ))
+    }
+
     /// Report a preferred-LCL divergence fact (rippled `consensusViewChange`).
     /// Demotes `Connected/Tracking/Full -> Syncing { target }` without minting a
     /// session; the missing/incomplete path reports its own `acquire_requested`

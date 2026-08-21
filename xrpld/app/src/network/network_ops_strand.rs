@@ -1548,10 +1548,18 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     // distinguish history-residency from a registry-resident completion.
     let (candidate, candidate_source) = match preferred_resident {
         Some(ledger) => (Some(ledger), "resolver"),
-        None => (
-            shared_inbound.acquire(preferred_hash, 0, AcquireReason::Consensus),
-            "inbound_registry",
-        ),
+        None => {
+            // NetworkOPs is the authoritative preferred-LCL selector. Publish
+            // its exact hash before the normal InboundLedgers acquire so only
+            // this fact, never generic consensus polling, owns the active
+            // preferred-target permit.
+            shared_inbound
+                .coordinator_consensus_target(acquisition::LedgerTarget::new(preferred_hash, None));
+            (
+                shared_inbound.acquire(preferred_hash, 0, AcquireReason::Consensus),
+                "inbound_registry",
+            )
+        }
     };
     tracing::info!(
         target: "lcl_trace",
@@ -1641,6 +1649,8 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             preferred_hash,
             &our_closed,
         );
+        shared_inbound
+            .coordinator_consensus_target(acquisition::LedgerTarget::new(preferred_hash, None));
         shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
         return PreferredLclReconciliation::Pending;
     }
@@ -1679,6 +1689,8 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             "check_last_closed_ledger",
             "provisional",
         );
+        shared_inbound
+            .coordinator_consensus_target(acquisition::LedgerTarget::new(preferred_hash, None));
         shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
         tracing::info!(
             target: "lcl_trace",
@@ -1749,6 +1761,8 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             preferred_hash,
             &our_closed,
         );
+        shared_inbound
+            .coordinator_consensus_target(acquisition::LedgerTarget::new(preferred_hash, None));
         shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
         return PreferredLclReconciliation::Pending;
     }

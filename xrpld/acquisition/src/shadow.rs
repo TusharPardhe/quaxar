@@ -419,6 +419,7 @@ pub struct ShadowRunner {
     run_epoch: RunEpoch,
     session_counter: IdCounter,
     store_generation: StoreGeneration,
+    latest_consensus_target: Option<LedgerTarget>,
     mirror: BTreeMap<SessionRef, MirrorSession>,
     queue_depth: usize,
     observations: VecDeque<ShadowObservation>,
@@ -447,6 +448,7 @@ impl ShadowRunner {
             run_epoch,
             session_counter: IdCounter::new(),
             store_generation: StoreGeneration::new(1),
+            latest_consensus_target: None,
             mirror: BTreeMap::new(),
             queue_depth: 0,
             observations: VecDeque::new(),
@@ -479,7 +481,7 @@ impl ShadowRunner {
                 self.derive_connectivity(tag, snapshot, &mut out);
             }
             AcquisitionEvent::AcquireRequested { target, reason } => {
-                self.derive_acquire(tag, *target, *reason, &mut out);
+                self.derive_acquire(tag, *target, *reason, false, &mut out);
             }
             AcquisitionEvent::PacketAdmitted(packet) => {
                 self.derive_packet(tag, packet, &mut out);
@@ -604,8 +606,12 @@ impl ShadowRunner {
         tag: ShadowEventTag,
         target: LedgerTarget,
         reason: AcquireReason,
+        preferred_target: bool,
         out: &mut Vec<ShadowObservation>,
     ) {
+        let ordinary_consensus_with_preferred = reason == AcquireReason::Consensus
+            && !preferred_target
+            && self.latest_consensus_target.is_some();
         if let Some((session, promotion)) = self
             .mirror
             .iter()
@@ -622,11 +628,14 @@ impl ShadowRunner {
             if promotion && let Some(mirror) = self.mirror.get_mut(&session) {
                 mirror.target = target;
             }
-            if reason == AcquireReason::Consensus {
+            if preferred_target {
                 self.activate_latest_consensus(session);
             }
-            let fact = TransitionFact::TargetRequired { target };
-            let (derived, transition_reason, kind) = self.apply_fact(Some(fact));
+            let (derived, transition_reason, kind) = if ordinary_consensus_with_preferred {
+                (Some(self.phase), None, DisagreementKind::Match)
+            } else {
+                self.apply_fact(Some(TransitionFact::TargetRequired { target }))
+            };
             self.push(
                 tag,
                 Some(session),
@@ -647,17 +656,24 @@ impl ShadowRunner {
             MirrorSession {
                 session,
                 target,
-                phase: SessionPhase::Active,
+                phase: if ordinary_consensus_with_preferred {
+                    SessionPhase::Dormant
+                } else {
+                    SessionPhase::Active
+                },
                 reason,
                 queue_depth: 0,
                 terminal: None,
             },
         );
-        if reason == AcquireReason::Consensus {
+        if preferred_target {
             self.activate_latest_consensus(session);
         }
-        let fact = TransitionFact::TargetRequired { target };
-        let (derived, reason, kind) = self.apply_fact(Some(fact));
+        let (derived, reason, kind) = if ordinary_consensus_with_preferred {
+            (Some(self.phase), None, DisagreementKind::Match)
+        } else {
+            self.apply_fact(Some(TransitionFact::TargetRequired { target }))
+        };
         self.push(
             tag,
             Some(session),
@@ -1087,7 +1103,8 @@ impl ShadowRunner {
         target: ConsensusTarget,
         out: &mut Vec<ShadowObservation>,
     ) {
-        self.derive_acquire(tag, target.target(), target.reason(), out);
+        self.latest_consensus_target = Some(target.target());
+        self.derive_acquire(tag, target.target(), target.reason(), true, out);
     }
 
     fn derive_preferred_lcl_divergence(
@@ -1128,6 +1145,12 @@ impl ShadowRunner {
         identity: LedgerIdentity,
         out: &mut Vec<ShadowObservation>,
     ) {
+        if self
+            .latest_consensus_target
+            .is_some_and(|target| target.hash() == identity.hash())
+        {
+            self.latest_consensus_target = None;
+        }
         match self.phase {
             SyncPhase::Syncing { target } if target.hash() == identity.hash() => {
                 let fact = TransitionFact::TargetInstalledAsLcl { lcl: identity };

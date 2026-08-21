@@ -182,7 +182,7 @@ pub struct CoordinatorState {
     /// One bounded exact target demand deferred only because no usable peer
     /// capability existed. It is replayed by this same owner on the next
     /// `PeerCapabilityAvailable` fact; it is never an adapter-side retry.
-    deferred_acquire: Option<(LedgerTarget, AcquireReason)>,
+    deferred_acquire: Option<(LedgerTarget, AcquireReason, bool)>,
     /// Latest preferred-LCL demand observed from consensus. Recovery ranks an
     /// active session for this exact target ahead of older consensus sessions,
     /// even when the latest fact coalesced with an older session identity.
@@ -554,7 +554,7 @@ impl CoordinatorRunner {
             AcquisitionEvent::StartupMode { phase } => self.on_startup_mode(phase),
             AcquisitionEvent::Connectivity(snapshot) => self.on_connectivity(snapshot),
             AcquisitionEvent::AcquireRequested { target, reason } => {
-                self.on_acquire(target, reason)
+                self.on_acquire(target, reason, false)
             }
             AcquisitionEvent::ConsensusTarget(target) => self.on_consensus(target),
             AcquisitionEvent::PreferredLclDivergence { target } => {
@@ -615,7 +615,7 @@ impl CoordinatorRunner {
         let Some(target) = self.state.deferred_consensus_acquire.take() else {
             return;
         };
-        effects.extend(self.on_acquire(target, AcquireReason::Consensus));
+        effects.extend(self.on_acquire(target, AcquireReason::Consensus, true));
     }
 
     /// The coordinator run epoch.
@@ -781,14 +781,21 @@ impl CoordinatorRunner {
         // A target received while peerless is a concrete consensus/recovery
         // fact, not disposable work. It remains separate from the bounded
         // recovery grants so target creation preserves its existing policy.
-        if has_peers && let Some((target, reason)) = self.state.deferred_acquire.take() {
-            effects.extend(self.on_acquire(target, reason));
+        if has_peers
+            && let Some((target, reason, preferred_target)) = self.state.deferred_acquire.take()
+        {
+            effects.extend(self.on_acquire(target, reason, preferred_target));
         }
         effects
     }
 
     fn on_consensus(&mut self, target: ConsensusTarget) -> Vec<AcquisitionEffect> {
-        self.on_acquire(target.target(), target.reason())
+        // Only an authoritative preferred-LCL fact may select the active
+        // consensus permit. Generic consensus acquisition requests remain
+        // ordinary demand and cannot revive an older dormant session.
+        self.state.latest_consensus_target = Some(target.target());
+        self.state.deferred_consensus_acquire = None;
+        self.on_acquire(target.target(), target.reason(), true)
     }
 
     /// A preferred-LCL divergence demotion (rippled `consensusViewChange`).
@@ -976,25 +983,28 @@ impl CoordinatorRunner {
         &mut self,
         target: LedgerTarget,
         reason: AcquireReason,
+        preferred_target: bool,
     ) -> Vec<AcquisitionEffect> {
         let mut effects = Vec::new();
-
-        // A newer consensus fact supersedes any earlier capacity-deferred
-        // preferred-LCL target. Retain the exact latest fact independently of
-        // session creation: a duplicate may coalesce with an older session,
-        // but it must still win scarce-peer recovery priority. If this demand
-        // cannot start below, it is retained again as the latest deferred one.
-        if reason == AcquireReason::Consensus {
-            self.state.latest_consensus_target = Some(target);
-            self.state.deferred_consensus_acquire = None;
-        }
 
         // Retain exactly one concrete demand while peerless. The owner replays
         // it after `PeerCapabilityAvailable`; dropping it would strand recovery
         // until another unrelated validation/consensus event happens to repeat
         // the same target.
         if !self.state.peer_view.has_usable_peer_capability() {
-            self.state.deferred_acquire = Some((target, reason));
+            // NetworkOps emits the authoritative preferred target before its
+            // normal shared acquire. Preserve that preferred flag when the
+            // following ordinary demand coalesces while peerless, otherwise a
+            // later recovery could incorrectly replay it as non-preferred.
+            let retain_existing_preferred = !preferred_target
+                && self
+                    .state
+                    .deferred_acquire
+                    .as_ref()
+                    .is_some_and(|(_, _, deferred_preferred)| *deferred_preferred);
+            if !retain_existing_preferred {
+                self.state.deferred_acquire = Some((target, reason, preferred_target));
+            }
             tracing::info!(
                 target: "acquisition_trace",
                 event = "acquire_demand_deferred",
@@ -1015,6 +1025,16 @@ impl CoordinatorRunner {
         // header seeded a plan; later or conflicting requests retain the
         // existing replacement semantics, except DurablePending is never
         // cancelled because its durable result is committed to delivery.
+        //
+        // An ordinary consensus acquire is still useful demand from the
+        // consensus adaptors, but it is not an authoritative preferred-LCL
+        // selection. Once NetworkOps has supplied such a selection, this
+        // demand must neither replace its owner nor become a second active
+        // network permit. Retain a distinct request as Dormant so a later
+        // `ConsensusTarget` for its exact hash can reactivate it.
+        let ordinary_consensus_with_preferred = reason == AcquireReason::Consensus
+            && !preferred_target
+            && self.state.latest_consensus_target.is_some();
         let same_hash = self.live_sessions_for_hash(target.hash());
         let exact = same_hash.iter().copied().find(|session| {
             self.state
@@ -1048,21 +1068,24 @@ impl CoordinatorRunner {
             } else {
                 None
             };
-        let replaceable: Vec<SessionRef> =
-            if exact.is_none() && promotion.is_none() && hash_only_coalesce.is_none() {
-                same_hash
-                    .iter()
-                    .copied()
-                    .filter(|session| {
-                        self.state
-                            .sessions
-                            .get(session)
-                            .is_some_and(|state| state.phase != SessionPhase::DurablePending)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let replaceable: Vec<SessionRef> = if !ordinary_consensus_with_preferred
+            && exact.is_none()
+            && promotion.is_none()
+            && hash_only_coalesce.is_none()
+        {
+            same_hash
+                .iter()
+                .copied()
+                .filter(|session| {
+                    self.state
+                        .sessions
+                        .get(session)
+                        .is_some_and(|state| state.phase != SessionPhase::DurablePending)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let continuing_existing =
             exact.is_some() || promotion.is_some() || hash_only_coalesce.is_some();
         // Terminal sessions remain observable for stale-event accounting, but
@@ -1080,13 +1103,13 @@ impl CoordinatorRunner {
         // A retained preferred-LCL target reserves the next free slot. Generic
         // or History work may coalesce with an existing owner, but cannot take
         // that slot and permanently strand convergence.
-        if reason != AcquireReason::Consensus
+        if !preferred_target
             && !continuing_existing
             && self.state.deferred_consensus_acquire.is_some()
         {
             would_exceed = true;
         }
-        if would_exceed && reason == AcquireReason::Consensus {
+        if would_exceed && preferred_target {
             // The currently active preferred target becomes retained Dormant
             // before capacity is considered. At the bound this makes it an
             // explicit eviction candidate rather than silently deferring the
@@ -1096,16 +1119,13 @@ impl CoordinatorRunner {
         // A new consensus target evicts retained dormant consensus work before
         // it can be deferred at capacity. Persisting and DurablePending never
         // qualify for dormancy or eviction.
-        if would_exceed
-            && reason == AcquireReason::Consensus
-            && self.evict_oldest_dormant_consensus(&mut effects)
-        {
+        if would_exceed && preferred_target && self.evict_oldest_dormant_consensus(&mut effects) {
             would_exceed = false;
         }
         // Consensus may preempt only a cancellable lower-priority session.
         // DurablePending is intentionally excluded: its completed result and
         // handoff are already committed and must not be revoked.
-        if would_exceed && reason == AcquireReason::Consensus {
+        if would_exceed && preferred_target {
             let preempt = self
                 .state
                 .sessions
@@ -1174,7 +1194,7 @@ impl CoordinatorRunner {
             );
         }
         if would_exceed {
-            if reason == AcquireReason::Consensus {
+            if preferred_target {
                 self.state.deferred_consensus_acquire = Some(target);
                 let fact = TransitionFact::TargetRequired { target };
                 if let Ok(next) = self.state.phase.apply(fact)
@@ -1219,7 +1239,7 @@ impl CoordinatorRunner {
         let phase_target = hash_only_coalesce
             .and_then(|session| self.state.sessions.get(&session).map(|state| state.target))
             .unwrap_or(target);
-        if !defer_hash_only_consensus_probe {
+        if !defer_hash_only_consensus_probe && !ordinary_consensus_with_preferred {
             let fact = TransitionFact::TargetRequired {
                 target: phase_target,
             };
@@ -1235,7 +1255,7 @@ impl CoordinatorRunner {
         }
 
         if let Some(session) = exact.or(hash_only_coalesce) {
-            if reason == AcquireReason::Consensus {
+            if preferred_target {
                 self.reactivate_dormant_consensus(session, &mut effects);
             }
             return effects;
@@ -1244,7 +1264,7 @@ impl CoordinatorRunner {
             if let Some(session_state) = self.state.sessions.get_mut(&session) {
                 session_state.promote_target(target);
             }
-            if reason == AcquireReason::Consensus {
+            if preferred_target {
                 self.reactivate_dormant_consensus(session, &mut effects);
             }
             return effects;
@@ -1298,7 +1318,20 @@ impl CoordinatorRunner {
             session,
             CoordinatorSession::new(target, reason, peer, admission),
         );
-        if reason == AcquireReason::Consensus {
+        if ordinary_consensus_with_preferred {
+            let state = self
+                .state
+                .sessions
+                .get_mut(&session)
+                .expect("newly inserted session");
+            debug_assert!(session_phase_transition(
+                &state.phase,
+                &SessionPhase::Dormant
+            ));
+            state.phase = SessionPhase::Dormant;
+            state.network_admitted = false;
+            state.plan.suspend_for_dormancy();
+        } else if preferred_target {
             self.dormant_active_consensus_except(Some(session));
         }
         self.stats.sessions_started += 1;
@@ -1306,6 +1339,19 @@ impl CoordinatorRunner {
         // request. This preserves durable handoff identity when the session
         // was created by a deferred demand replay.
         effects.push(AcquisitionEffect::SessionStarted(session));
+        if ordinary_consensus_with_preferred {
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "consensus_demand_retained_dormant",
+                run_epoch = session.run_epoch().get(),
+                session_id = session.session_id().get(),
+                target_hash = %session.target_hash(),
+                plan_epoch = session.plan_epoch().get(),
+                store_generation = session.store_generation().get(),
+                "acquisition trace: ordinary consensus demand retained without moving the preferred active permit"
+            );
+            return effects;
+        }
 
         // Request the Base/header ledger packet from each initially acquired
         // peer. An unknown sequence remains a header request with `None`;
@@ -3875,6 +3921,144 @@ mod tests {
             AcquireReason::Consensus
         );
         assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(5) });
+    }
+
+    #[test]
+    fn ordinary_consensus_request_cannot_reactivate_an_old_dormant_preferred_target() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let old = peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(target(10), AcquireReason::Consensus),
+        )));
+        let current =
+            peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+                ConsensusTarget::new(target(20), AcquireReason::Consensus),
+            )));
+        assert_eq!(
+            runner.session(old).expect("old session").phase(),
+            &SessionPhase::Dormant
+        );
+        assert_eq!(
+            runner.session(current).expect("current session").phase(),
+            &SessionPhase::Active
+        );
+
+        let coalesced = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(20),
+            reason: AcquireReason::Consensus,
+        });
+        assert!(
+            coalesced.is_empty(),
+            "normal preferred acquire must coalesce"
+        );
+        assert_eq!(
+            runner.session(current).expect("current session").phase(),
+            &SessionPhase::Active
+        );
+
+        let effects = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(10),
+            reason: AcquireReason::Consensus,
+        });
+        assert!(
+            effects.is_empty(),
+            "ordinary consensus demand only coalesces"
+        );
+        assert_eq!(runner.state.latest_consensus_target, Some(target(20)));
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(20) });
+        assert_eq!(
+            runner.session(old).expect("old session").phase(),
+            &SessionPhase::Dormant
+        );
+        assert_eq!(
+            runner.session(current).expect("current session").phase(),
+            &SessionPhase::Active
+        );
+    }
+
+    #[test]
+    fn ordinary_consensus_demand_is_retained_dormant_while_a_preferred_target_is_active() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let preferred =
+            peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+                ConsensusTarget::new(target(20), AcquireReason::Consensus),
+            )));
+
+        let effects = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(10),
+            reason: AcquireReason::Consensus,
+        });
+        let retained = effects
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("ordinary consensus demand is retained");
+
+        assert!(effects.iter().all(|effect| {
+            !matches!(
+                effect,
+                AcquisitionEffect::SendLedgerRequest(_)
+                    | AcquisitionEffect::ArmTimer(_)
+                    | AcquisitionEffect::CancelSession(_)
+            )
+        }));
+        assert_eq!(runner.state.latest_consensus_target, Some(target(20)));
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(20) });
+        assert_eq!(
+            runner
+                .session(preferred)
+                .expect("preferred session")
+                .phase(),
+            &SessionPhase::Active
+        );
+        assert_eq!(
+            runner.session(retained).expect("retained session").phase(),
+            &SessionPhase::Dormant
+        );
+    }
+
+    #[test]
+    fn new_consensus_target_moves_the_exact_active_permit_and_p0_priority() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let old = peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(target(10), AcquireReason::Consensus),
+        )));
+        let current =
+            peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+                ConsensusTarget::new(target(20), AcquireReason::Consensus),
+            )));
+        let newest = peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(target(30), AcquireReason::Consensus),
+        )));
+
+        assert_eq!(runner.state.latest_consensus_target, Some(target(30)));
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(30) });
+        assert_eq!(
+            runner.session(old).expect("old session").phase(),
+            &SessionPhase::Dormant
+        );
+        assert_eq!(
+            runner.session(current).expect("current session").phase(),
+            &SessionPhase::Dormant
+        );
+        assert_eq!(
+            runner.session(newest).expect("newest session").phase(),
+            &SessionPhase::Active
+        );
+        assert_eq!(
+            runner.recovery_priority_rank(runner.session(newest).expect("P0 session")),
+            0,
+            "only the newest authoritative preferred target is P0"
+        );
+        assert_eq!(
+            runner.recovery_priority_rank(runner.session(current).expect("retained session")),
+            1,
+            "the previous preferred session remains dormant and cannot retain P0"
+        );
     }
 
     #[test]
