@@ -329,6 +329,10 @@ pub(crate) struct CoordinatorAdapter<R, RD, WR, T, H, P, C> {
     routes: BTreeMap<Uint256, RouteEntry>,
     ingress: CoordinatorIngress,
     routing_generation: u64,
+    /// Round-robin producer selected after each freed control-lane slot. Read,
+    /// write, and timer ports retain completions independently, so a fixed flush
+    /// order lets a continuously ready earlier producer starve every later one.
+    completion_flush_cursor: u8,
     fetch_pack: Arc<FetchPackCache>,
     /// Exact target hashes whose coordinator sessions terminally failed. The
     /// registry drains this bounded-per-owner-turn set after releasing the
@@ -392,6 +396,7 @@ where
             routes: BTreeMap::new(),
             ingress,
             routing_generation: 0,
+            completion_flush_cursor: 0,
             fetch_pack,
             terminal_failures: BTreeSet::new(),
         };
@@ -481,23 +486,19 @@ where
     /// Returns the number of facts handled.
     pub(crate) fn drain(&mut self) -> usize {
         let mut handled = 0;
+        // Bootstrap an empty control lane from one producer. Subsequent free
+        // slots rotate producers, preventing continuous read traffic from
+        // indefinitely hiding write/fence and timer lifecycle facts.
+        self.flush_next_completion_source();
         for _ in 0..CONTROL_EVENTS_PER_DRAIN {
-            // A production write port retains exact write/fence completions
-            // when the bounded control lane is full. Flush after each dequeue
-            // so one newly free slot promptly advances that FIFO without ever
-            // blocking a NodeStore worker on the coordinator owner.
-            self.reads.flush_completions();
-            self.writes.flush_completions();
-            self.timers.flush_completions();
             let Ok(event) = self.rx.try_recv() else {
                 break;
             };
             handled += 1;
             self.handle_fact(event);
+            self.flush_next_completion_source();
         }
-        self.reads.flush_completions();
-        self.writes.flush_completions();
-        self.timers.flush_completions();
+        self.flush_next_completion_source();
         for _ in 0..PACKET_EVENTS_PER_DRAIN {
             let Ok(event) = self.packet_rx.try_recv() else {
                 break;
@@ -506,6 +507,15 @@ where
             self.handle_fact(event);
         }
         handled
+    }
+
+    fn flush_next_completion_source(&mut self) {
+        match self.completion_flush_cursor % 3 {
+            0 => self.reads.flush_completions(),
+            1 => self.writes.flush_completions(),
+            _ => self.timers.flush_completions(),
+        }
+        self.completion_flush_cursor = (self.completion_flush_cursor + 1) % 3;
     }
 
     /// Enqueue a fact only for deterministic adapter tests. Production owner
@@ -1039,13 +1049,15 @@ mod tests {
     use super::*;
 
     use crate::ReadBrokerConfig;
+    use crate::ledger::inbound_ledgers::coordinator_ports::CoordinatorTimerPort;
+    use crate::ledger::inbound_ledgers::worker_pool::WorkerPool;
     use acquisition::fake::{
         FakeCancellationPort, FakeHandoffPort, FakeLedgerRequestPort, FakePhasePort, FakeReadPort,
         FakeTimerPort, FakeWritePort,
     };
     use acquisition::{
-        AcquireReason, IdCounter, LedgerTarget, OperationKind, OperationRef, PlanEpoch,
-        ReadPriority, SessionId, StoreGeneration, SyncPhase, TimerKind,
+        AcquireReason, AdmissionBudget, BudgetState, IdCounter, LedgerTarget, OperationKind,
+        OperationRef, PlanEpoch, ReadPriority, SessionId, StoreGeneration, SyncPhase, TimerKind,
     };
     use overlay::TmLedgerData;
     use overlay::message::wire::TmLedgerNode;
@@ -1053,6 +1065,7 @@ mod tests {
     use shamap::tree_node::SHAMapTreeNode;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     const SEQ: u32 = 77;
 
@@ -1129,6 +1142,22 @@ mod tests {
         FakeCancellationPort,
     >;
 
+    #[derive(Clone)]
+    struct SaturatingReadPort {
+        completions: RetainedControlEvents,
+    }
+
+    impl ReadPort for SaturatingReadPort {
+        fn submit_read(&mut self, _request: ReadRequest) {}
+
+        fn flush_completions(&mut self) {
+            // Model a permanently ready read producer. With a fixed
+            // reads-before-timers flush order, this event takes every newly
+            // freed control slot and the expiry can never enter the owner lane.
+            self.completions.push(AcquisitionEvent::Heartbeat);
+        }
+    }
+
     fn adapter() -> (TestAdapter, Arc<FetchPackCache>) {
         let cache = fetch_pack();
         let runner = runner();
@@ -1150,6 +1179,148 @@ mod tests {
             packet_rx,
         );
         (adapter, cache)
+    }
+
+    #[test]
+    fn production_timer_port_delivers_session_expiry_through_adapter_owner_loop() {
+        type TimerAdapter = CoordinatorAdapter<
+            FakeLedgerRequestPort,
+            FakeReadPort,
+            FakeWritePort,
+            CoordinatorTimerPort,
+            FakeHandoffPort,
+            FakePhasePort,
+            FakeCancellationPort,
+        >;
+
+        let cache = fetch_pack();
+        let runner = CoordinatorRunner::with_budget(
+            RunEpoch::new(1),
+            BudgetState::new(
+                usize::MAX,
+                AdmissionBudget::default(),
+                Duration::from_secs(120),
+            ),
+        );
+        let pool = Arc::new(WorkerPool::new_with_manual_timer_for_test(0));
+        let (tx, rx) = std::sync::mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel(PACKET_INGRESS_QUEUE_CAPACITY);
+        let timers = CoordinatorTimerPort::new(Arc::clone(&pool), tx.clone());
+        let mut adapter = TimerAdapter::with_event_channel(
+            runner,
+            FakeLedgerRequestPort::new(),
+            FakeReadPort::new(),
+            FakeWritePort::new(),
+            timers,
+            FakeHandoffPort::new(),
+            FakePhasePort::new(),
+            FakeCancellationPort::new(),
+            Arc::clone(&cache),
+            tx,
+            rx,
+            packet_tx,
+            packet_rx,
+        );
+
+        adapter.connectivity(&[1]);
+        let effects = adapter.acquire_requested(target(9, SEQ), AcquireReason::Consensus);
+        let session = effects
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("acquisition starts a routed session");
+        assert_eq!(
+            pool.scheduled_timer_delays_for_test(),
+            vec![Duration::from_secs(120), Duration::from_secs(60)]
+        );
+
+        assert_eq!(
+            pool.fire_next_timer_for_test(),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(adapter.drain(), 1, "timer fact reaches the owner queue");
+        assert_eq!(adapter.snapshot().session_count(), 0);
+        assert_eq!(adapter.cancellations.cancelled, vec![session]);
+        pool.stop();
+    }
+
+    #[test]
+    fn saturated_read_completions_cannot_starve_session_expiry() {
+        type TimerAdapter = CoordinatorAdapter<
+            FakeLedgerRequestPort,
+            SaturatingReadPort,
+            FakeWritePort,
+            CoordinatorTimerPort,
+            FakeHandoffPort,
+            FakePhasePort,
+            FakeCancellationPort,
+        >;
+
+        let cache = fetch_pack();
+        let runner = CoordinatorRunner::with_budget(
+            RunEpoch::new(1),
+            BudgetState::new(
+                usize::MAX,
+                AdmissionBudget::default(),
+                Duration::from_secs(120),
+            ),
+        );
+        let pool = Arc::new(WorkerPool::new_with_manual_timer_for_test(0));
+        let (tx, rx) = std::sync::mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel(PACKET_INGRESS_QUEUE_CAPACITY);
+        let read_completions = RetainedControlEvents::new(tx.clone());
+        let reads = SaturatingReadPort {
+            completions: read_completions.clone(),
+        };
+        let timers = CoordinatorTimerPort::new(Arc::clone(&pool), tx.clone());
+        let mut adapter = TimerAdapter::with_event_channel(
+            runner,
+            FakeLedgerRequestPort::new(),
+            reads,
+            FakeWritePort::new(),
+            timers,
+            FakeHandoffPort::new(),
+            FakePhasePort::new(),
+            FakeCancellationPort::new(),
+            Arc::clone(&cache),
+            tx,
+            rx,
+            packet_tx,
+            packet_rx,
+        );
+
+        adapter.connectivity(&[1]);
+        let effects = adapter.acquire_requested(target(19, SEQ), AcquireReason::Consensus);
+        let session = effects
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("acquisition starts a routed session");
+        for _ in 0..CONTROL_EVENT_QUEUE_CAPACITY {
+            read_completions.push(AcquisitionEvent::Heartbeat);
+        }
+        assert_eq!(
+            pool.fire_next_timer_for_test(),
+            Some(Duration::from_secs(60))
+        );
+
+        for _ in 0..20 {
+            adapter.drain();
+            if adapter.snapshot().session_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            adapter.snapshot().session_count(),
+            0,
+            "round-robin completion flush must deliver expiry despite an always-ready read producer"
+        );
+        assert_eq!(adapter.cancellations.cancelled, vec![session]);
+        pool.stop();
     }
 
     /// Connect and acquire a session, returning the session the coordinator
