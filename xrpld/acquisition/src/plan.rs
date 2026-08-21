@@ -51,9 +51,9 @@ use crate::io::{
 };
 use crate::session::FailureReason;
 
-/// Upper bound on newly announced read needs accepted from one engine pass.
-/// Mirrors the app `INBOUND_LEDGER_MAX_NEEDED_STATE/TX_HASHES` scaling ceiling.
-pub const MAX_NEW_READS_PER_PASS: usize = 256;
+/// One deferred NodeStore round, matching rippled's `MissingNodes` maxDefer
+/// of 512. The separate missing-node network output maximum remains 256.
+pub const MAX_NEW_READS_PER_PASS: usize = 512;
 /// Bounded tree turns per event; a plan must return to the coordinator owner
 /// between turns so control events are never starved.
 pub const MAX_TURNS_PER_EVENT: u32 = 4;
@@ -902,6 +902,12 @@ impl SessionPlan {
             .saturating_add(self.pending_recovery_reads.len())
     }
 
+    /// Ordinary traversal reads participating in the current deferred-read
+    /// barrier. Recovery reprobes are independent and do not hold this gate.
+    pub fn pending_traversal_read_count(&self) -> usize {
+        self.pending_reads.len()
+    }
+
     /// Read needs waiting for bounded broker admission.
     pub fn read_backlog_count(&self) -> usize {
         self.read_backlog.len()
@@ -1100,6 +1106,15 @@ impl SessionPlan {
     /// the engine up to `MAX_TURNS_PER_EVENT` times.
     pub fn run_turn(&mut self, ctx: &mut TurnContext) -> PlanTurn {
         if self.cancelled || self.persistence != SessionPersistence::None {
+            return PlanTurn::Continue;
+        }
+
+        // Rippled processes one complete gmnProcessDeferredReads round before
+        // activating parent resumes or discovering the next read/frontier
+        // batch. Results may attach immediately, but no event may slide a
+        // replacement read into this round while one ordinary operation is
+        // still outstanding.
+        if !self.pending_reads.is_empty() {
             return PlanTurn::Continue;
         }
 

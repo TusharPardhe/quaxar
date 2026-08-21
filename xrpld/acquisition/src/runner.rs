@@ -719,6 +719,25 @@ impl CoordinatorRunner {
         effects
     }
 
+    /// Applies one drained NodeStore completion wave behind the same barrier
+    /// used by rippled's `gmnProcessDeferredReads`: every exact operation is
+    /// settled first, then each affected session continuation resumes once.
+    pub fn handle_read_batch(
+        &mut self,
+        completions: Vec<ReadCompletion>,
+    ) -> Vec<AcquisitionEffect> {
+        if self.shutdown {
+            self.stats.stale_events += completions.len() as u64;
+            return Vec::new();
+        }
+        let count = completions.len() as u64;
+        let mut effects = self.on_read_batch(completions);
+        self.replay_deferred_consensus(&mut effects);
+        effects.extend(self.emit_admitted_requests());
+        self.stats.events_handled += count;
+        effects
+    }
+
     /// True only when the coordinator retained the latest capacity-deferred
     /// preferred-LCL demand. Adapters use this disposition to retain the
     /// session-origin binding; they never become a second retry owner.
@@ -1573,11 +1592,14 @@ impl CoordinatorRunner {
                 self.stats.stale_events += 1;
                 return Vec::new();
             }
-            let local_reconstruction_in_flight = self
-                .state
-                .sessions
-                .get(&session)
-                .is_some_and(CoordinatorSession::local_reconstruction_in_flight);
+            let local_reconstruction_in_flight =
+                self.state.sessions.get(&session).is_some_and(|state| {
+                    // Preserve a private tree only while a rooted traversal is
+                    // actively growing. A lone header probe has no graph to
+                    // retain and must not make an idle registry entry immortal.
+                    state.plan.pending_traversal_read_count() != 0
+                        || state.plan.read_backlog_count() != 0
+                });
             if local_reconstruction_in_flight {
                 // Removing the registry entry in rippled does not destroy an
                 // InboundLedger whose synchronous JobQueue scan still owns a
@@ -1963,6 +1985,72 @@ impl CoordinatorRunner {
                 Vec::new()
             }
         }
+    }
+
+    fn on_read_batch(&mut self, completions: Vec<ReadCompletion>) -> Vec<AcquisitionEffect> {
+        let mut effects = Vec::new();
+        let mut resume = BTreeSet::new();
+        for completion in completions {
+            if completion.operation().kind() == OperationKind::HeaderRead {
+                effects.extend(self.on_read(completion));
+                continue;
+            }
+            if !matches!(
+                completion.operation().kind(),
+                OperationKind::Read | OperationKind::RecoveryRead
+            ) {
+                self.stats.stale_events += 1;
+                continue;
+            }
+            let session = completion.operation().session();
+            let operation_kind = completion.operation().kind();
+            let (outcome, pending_reads_after, pending_traversal_after, read_backlog_after) = {
+                let Some(session_state) = self.state.sessions.get_mut(&session) else {
+                    self.stats.stale_events += 1;
+                    continue;
+                };
+                if session_state.phase != SessionPhase::Active {
+                    self.stats.stale_events += 1;
+                    continue;
+                }
+                let outcome = session_state.plan.on_read(&completion);
+                (
+                    outcome,
+                    session_state.plan.pending_read_count(),
+                    session_state.plan.pending_traversal_read_count(),
+                    session_state.plan.read_backlog_count(),
+                )
+            };
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "node_store_read_completed",
+                run_epoch = session.run_epoch().get(),
+                session_id = session.session_id().get(),
+                target_hash = %session.target_hash(),
+                plan_epoch = session.plan_epoch().get(),
+                store_generation = session.store_generation().get(),
+                outcome = ?completion.outcome(),
+                plan_outcome = ?outcome,
+                pending_reads_after,
+                pending_traversal_after,
+                read_backlog_after,
+                "acquisition trace: batched brokered NodeStore read completion applied to session"
+            );
+            match outcome {
+                PlanReadOutcome::Applied
+                    if operation_kind == OperationKind::RecoveryRead
+                        || pending_traversal_after == 0 =>
+                {
+                    resume.insert(session);
+                }
+                PlanReadOutcome::Applied => {}
+                PlanReadOutcome::Stale => self.stats.stale_events += 1,
+            }
+        }
+        for session in resume {
+            self.run_plan_turn(session, None, &mut effects);
+        }
+        effects
     }
 
     fn on_write(&mut self, completion: WriteCompletion) -> Vec<AcquisitionEffect> {
@@ -6741,6 +6829,74 @@ mod tests {
                 .any(|read| read.operation().session() == sessions[3])
         );
         assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
+    }
+
+    #[test]
+    fn five_hundred_twelve_read_completions_resume_plan_once_after_barrier() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let started = acquire_with_effects(&mut runner, 30);
+        let session = peer_request_session(&started);
+        let first_batch = (0..512u64)
+            .map(|offset| {
+                PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(10_000 + offset)),
+                    30,
+                    SHAMapNodeId::default(),
+                    0,
+                )
+            })
+            .collect();
+        let state = runner.state.sessions.get_mut(&session).expect("session");
+        state.pending_header_read = None;
+        assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+            TreePlanId::new(30),
+            VecDeque::from([
+                ScriptedStep::NeedsReads(first_batch),
+                ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(20_000)),
+                    30,
+                    SHAMapNodeId::default(),
+                    0,
+                )]),
+            ]),
+            Vec::new(),
+        ))));
+        let mut initial = Vec::new();
+        runner.run_plan_turn(session, None, &mut initial);
+        let reads = read_effects(&initial);
+        assert_eq!(reads.len(), 512);
+        let turns_before = runner.snapshot().plan_turns();
+        let mut completions = reads
+            .into_iter()
+            .map(|read| ReadCompletion::new(read.operation(), ReadOutcome::Settled { node: None }))
+            .collect::<Vec<_>>();
+        let final_completion = completions.pop().expect("512th completion");
+
+        let partial_effects = runner.handle_read_batch(completions);
+        assert_eq!(runner.snapshot().plan_turns() - turns_before, 0);
+        assert!(read_effects(&partial_effects).is_empty());
+        assert_eq!(
+            runner
+                .session(session)
+                .expect("live")
+                .plan()
+                .pending_traversal_read_count(),
+            1
+        );
+
+        let effects = runner.handle_read_batch(vec![final_completion]);
+        assert_eq!(
+            runner.snapshot().plan_turns() - turns_before,
+            1,
+            "one drained deferred-read round must resume the continuation once"
+        );
+        assert_eq!(read_effects(&effects).len(), 1);
     }
 
     #[test]

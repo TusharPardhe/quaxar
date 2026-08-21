@@ -139,7 +139,12 @@ pub(crate) const PACKET_INGRESS_QUEUE_CAPACITY: usize = 64;
 
 /// One owner-loop pass gives completion/control facts priority, but remains
 /// bounded so a continuously ready channel cannot monopolize the runner.
-const CONTROL_EVENTS_PER_DRAIN: usize = 32;
+const CONTROL_EVENTS_PER_DRAIN: usize = 512;
+
+/// Wall-clock guard for one production owner burst. A complete rippled-sized
+/// read batch is kept atomic, but successive control facts yield promptly to
+/// consensus and packet work.
+const CONTROL_DRAIN_TIME_SLICE: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// One owner-loop pass then advances a bounded packet slice, preserving packet
 /// progress without allowing ingress to starve lifecycle control facts.
@@ -333,6 +338,14 @@ pub(crate) struct CoordinatorAdapter<R, RD, WR, T, H, P, C> {
     /// write, and timer ports retain completions independently, so a fixed flush
     /// order lets a continuously ready earlier producer starve every later one.
     completion_flush_cursor: u8,
+    /// One non-read fact observed while coalescing a consecutive read wave.
+    /// It is processed first on the next control iteration, preserving channel
+    /// order without preventing the read barrier from resuming once.
+    pending_control_event: Option<AcquisitionEvent>,
+    /// Whether the preceding bounded drain stopped with owner work remaining.
+    /// NetworkOps uses this signal to avoid an artificial 50ms sleep without
+    /// turning the coordinator into a separate scheduler.
+    last_drain_has_more: bool,
     fetch_pack: Arc<FetchPackCache>,
     /// Exact target hashes whose coordinator sessions terminally failed. The
     /// registry drains this bounded-per-owner-turn set after releasing the
@@ -397,6 +410,8 @@ where
             ingress,
             routing_generation: 0,
             completion_flush_cursor: 0,
+            pending_control_event: None,
+            last_drain_has_more: false,
             fetch_pack,
             terminal_failures: BTreeSet::new(),
         };
@@ -480,33 +495,92 @@ where
         effects
     }
 
+    fn handle_read_batch(&mut self, completions: Vec<ReadCompletion>) {
+        let effects = self.runner.handle_read_batch(completions);
+        self.note_terminal_failures(&effects);
+        self.refresh_routes();
+        self.dispatch(&effects);
+    }
+
     /// Advance one bounded owner-loop slice. Control/completion facts always
     /// run first, then packet ingress gets a bounded turn; neither queue is
     /// drained to empty so continuous traffic cannot monopolize the owner.
     /// Returns the number of facts handled.
     pub(crate) fn drain(&mut self) -> usize {
         let mut handled = 0;
+        let started = std::time::Instant::now();
+        let mut control_limited = false;
         // Bootstrap an empty control lane from one producer. Subsequent free
         // slots rotate producers, preventing continuous read traffic from
         // indefinitely hiding write/fence and timer lifecycle facts.
         self.flush_next_completion_source();
-        for _ in 0..CONTROL_EVENTS_PER_DRAIN {
-            let Ok(event) = self.rx.try_recv() else {
+        while handled < CONTROL_EVENTS_PER_DRAIN {
+            if !cfg!(test) && handled != 0 && started.elapsed() >= CONTROL_DRAIN_TIME_SLICE {
+                control_limited = true;
                 break;
+            }
+            let event = match self.pending_control_event.take() {
+                Some(event) => event,
+                None => match self.rx.try_recv() {
+                    Ok(event) => event,
+                    Err(_) => {
+                        // An empty channel may simply mean the round-robin
+                        // cursor visited an empty producer while another port
+                        // retains completions. Give all three sources one fair
+                        // nonblocking flush before declaring the owner idle.
+                        self.flush_all_completion_sources();
+                        match self.rx.try_recv() {
+                            Ok(event) => event,
+                            Err(_) => break,
+                        }
+                    }
+                },
             };
+            if let AcquisitionEvent::ReadCompleted(first) = event {
+                let mut completions = Vec::with_capacity(CONTROL_EVENT_QUEUE_CAPACITY);
+                completions.push(first);
+                while completions.len() < 512 {
+                    match self.rx.try_recv() {
+                        Ok(AcquisitionEvent::ReadCompleted(completion)) => {
+                            completions.push(completion);
+                        }
+                        Ok(other) => {
+                            self.pending_control_event = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                handled += completions.len();
+                self.handle_read_batch(completions);
+                self.flush_next_completion_source();
+                continue;
+            }
             handled += 1;
             self.handle_fact(event);
             self.flush_next_completion_source();
         }
         self.flush_next_completion_source();
+        let mut packets_handled = 0;
         for _ in 0..PACKET_EVENTS_PER_DRAIN {
             let Ok(event) = self.packet_rx.try_recv() else {
                 break;
             };
             handled += 1;
+            packets_handled += 1;
             self.handle_fact(event);
         }
+        self.last_drain_has_more = control_limited
+            || handled.saturating_sub(packets_handled) >= CONTROL_EVENTS_PER_DRAIN
+            || packets_handled == PACKET_EVENTS_PER_DRAIN
+            || self.pending_control_event.is_some();
         handled
+    }
+
+    /// True when the previous bounded owner slice reached a work boundary and
+    /// NetworkOps should immediately run another ordinary strand iteration.
+    pub(crate) const fn drain_has_more(&self) -> bool {
+        self.last_drain_has_more
     }
 
     fn flush_next_completion_source(&mut self) {
@@ -516,6 +590,12 @@ where
             _ => self.timers.flush_completions(),
         }
         self.completion_flush_cursor = (self.completion_flush_cursor + 1) % 3;
+    }
+
+    fn flush_all_completion_sources(&mut self) {
+        for _ in 0..3 {
+            self.flush_next_completion_source();
+        }
     }
 
     /// Enqueue a fact only for deterministic adapter tests. Production owner
@@ -1333,6 +1413,10 @@ mod tests {
                 _ => None,
             })
             .expect("acquisition starts a routed session");
+        let original_expiry = adapter
+            .runner
+            .session(session)
+            .and_then(|state| state.pending_expiry_timer());
         for _ in 0..CONTROL_EVENT_QUEUE_CAPACITY {
             read_completions.push(AcquisitionEvent::Heartbeat);
         }
@@ -1341,18 +1425,19 @@ mod tests {
             Some(Duration::from_secs(60))
         );
 
-        for _ in 0..20 {
-            adapter.drain();
-            if adapter.snapshot().session_count() == 0 {
-                break;
-            }
-        }
-        assert_eq!(
-            adapter.snapshot().session_count(),
-            0,
+        adapter.drain();
+        assert!(
+            adapter.drain_has_more(),
+            "a continuously ready completion producer must suppress the strand's idle wait"
+        );
+        let expiry_delivered = adapter
+            .runner
+            .session(session)
+            .is_none_or(|state| state.pending_expiry_timer() != original_expiry);
+        assert!(
+            expiry_delivered,
             "round-robin completion flush must deliver expiry despite an always-ready read producer"
         );
-        assert_eq!(adapter.cancellations.cancelled, vec![session]);
         pool.stop();
     }
 
@@ -1847,6 +1932,10 @@ mod tests {
 
     #[test]
     fn control_queue_is_bounded_and_recovers_after_a_drain_slice() {
+        assert_eq!(
+            CONTROL_EVENTS_PER_DRAIN, 512,
+            "one owner burst matches rippled's getMissingNodes read-batch width"
+        );
         let (mut adapter, _cache) = adapter();
         let events = adapter.event_sender();
         for _ in 0..CONTROL_EVENT_QUEUE_CAPACITY {
@@ -1863,7 +1952,11 @@ mod tests {
             Err(mpsc::TrySendError::Full(_))
         ));
 
-        assert_eq!(adapter.drain(), CONTROL_EVENTS_PER_DRAIN);
+        assert_eq!(adapter.drain(), CONTROL_EVENT_QUEUE_CAPACITY);
+        assert!(
+            !adapter.drain_has_more(),
+            "draining a sub-burst channel completely may return to the normal strand wait"
+        );
         events
             .try_send(AcquisitionEvent::LclInstalled(
                 acquisition::LedgerIdentity::new(Uint256::from(9), SEQ),

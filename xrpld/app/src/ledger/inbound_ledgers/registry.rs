@@ -1029,14 +1029,22 @@ impl InboundLedgers {
     /// Drain the coordinator owner loop: process every queued event and
     /// dispatch its effects. Returns the number of events handled.
     pub fn coordinator_drain(&self) -> usize {
+        self.coordinator_drain_with_status().0
+    }
+
+    /// Drain one bounded coordinator burst and report whether the owner hit a
+    /// work boundary. The NetworkOps strand uses the second value solely to
+    /// suppress its idle wait; all lifecycle mutation remains in `drain`.
+    pub fn coordinator_drain_with_status(&self) -> (usize, bool) {
         let (handled, failures) = {
             let mut guard = self.coordinator.lock().expect("coordinator lock");
             let Some(coordinator) = guard.as_mut() else {
-                return 0;
+                return (0, false);
             };
             let handled = coordinator.drain();
+            let has_more = coordinator.drain_has_more();
             let failures = coordinator.take_terminal_failures();
-            (handled, failures)
+            ((handled, has_more), failures)
         };
         self.record_coordinator_failures(failures);
         handled

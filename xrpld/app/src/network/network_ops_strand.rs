@@ -572,7 +572,7 @@ fn strand_loop(
         // strand so coordinator state never needs its own thread or lock
         // choreography. Effects are dispatched to the resource ports inside the
         // registry's coordinator adapter after each event.
-        shared_inbound.coordinator_drain();
+        let (_, coordinator_work_remains) = shared_inbound.coordinator_drain_with_status();
         while let Some(&(handoff, session)) = pending_durable_acks.front() {
             if !shared_inbound.acknowledge_coordinator_durable_handoff(handoff, session) {
                 break;
@@ -1144,7 +1144,9 @@ fn strand_loop(
         }
 
         // ─── 8. Wait for next event (proposal notify or 50ms timeout) ─────
-        root.wait_consensus_or_timeout(Duration::from_millis(50));
+        if !coordinator_work_remains {
+            root.wait_consensus_or_timeout(Duration::from_millis(50));
+        }
     }
 
     tracing::info!(target: "consensus", "NetworkOPs strand stopped");
