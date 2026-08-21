@@ -135,6 +135,10 @@ pub enum OperationKind {
     CpuTurn,
     /// A physical NodeStore read submitted through the broker.
     Read,
+    /// An asynchronous NodeStore reprobe of one retained network frontier
+    /// need. It is distinct from an ordinary traversal read so a late timeout
+    /// completion cannot be mistaken for the original read it retried.
+    RecoveryRead,
     /// A physical NodeStore write submitted through the write adapter.
     Write,
     /// A durability fence (final persistence barrier) completion.
@@ -156,6 +160,7 @@ impl OperationKind {
             Self::TreeTurn => "tree_turn",
             Self::CpuTurn => "cpu_turn",
             Self::Read => "read",
+            Self::RecoveryRead => "recovery_read",
             Self::Write => "write",
             Self::DurabilityFence => "durability_fence",
             Self::PeerRequest => "peer_request",

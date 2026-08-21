@@ -528,7 +528,11 @@ pub struct AppRclConsensusAdaptor {
     ///
     /// This mirrors rippled's `acquiringLedger_`: consensus may ask for the
     /// same unavailable LCL on every timer/proposal pass, but only the first
-    /// miss should begin its potentially expensive inbound acquisition.
+    /// miss should begin its potentially expensive inbound acquisition. When
+    /// coordinator capacity is occupied, its typed disposition retains the
+    /// latest preferred-LCL demand and its exact app origin; this latch remains
+    /// set because the coordinator, not a later consensus callback, owns the
+    /// eventual replay. See `CoordinatorRunner::has_deferred_consensus_target`.
     acquiring_ledger: StdMutex<Option<Uint256>>,
 }
 

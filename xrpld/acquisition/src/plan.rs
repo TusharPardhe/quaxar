@@ -37,7 +37,7 @@ use ledger::{
     InboundLedgerDataType, InboundLedgerNodeData, InboundLedgerPacket, Ledger, TreeAdvance,
     TreeKind, TreePlan, TreePlanId,
 };
-use shamap::node_id::SHAMapNodeId;
+use shamap::node_id::{SHAMapNodeId, deserialize_shamap_node_id};
 use shamap::sync::{MissingNodeReadApply, MissingNodeReadOutcome, MissingNodeResidentLookup};
 use shamap::tree_node::SHAMapTreeNode;
 
@@ -60,6 +60,15 @@ pub const MAX_TURNS_PER_EVENT: u32 = 4;
 pub const MAX_PACKETS_FED_PER_TURN: usize = 4;
 /// Unique pending reads cap (mirrors the broker logical admission ceiling).
 pub const MAX_PENDING_READS: usize = 512;
+/// Maximum exact `PlanNetworkNeed` records retained from one current traversal
+/// frontier. `TreePlan::advance` uses `MAX_NEW_READS_PER_PASS` for all emitted
+/// missing-node work, so this retains the whole bounded frontier rather than
+/// silently discarding a timeout retry tail.
+pub const MAX_RETAINED_NETWORK_FRONTIER: usize = MAX_NEW_READS_PER_PASS;
+/// Maximum exact frontier nodes retried during one no-progress timeout. This
+/// matches rippled's blind request cap (`kReqNodes`) while a rotating cursor
+/// gives every retained frontier entry a bounded chance to be retried.
+pub const MAX_TIMEOUT_REPROBES: usize = 12;
 /// Deadline retries before an acquisition attempt fails (mirrors
 /// `INBOUND_LEDGER_TIMEOUT_RETRIES_MAX`).
 pub const DEFAULT_MAX_ACQUIRE_TIMEOUTS: u32 = 6;
@@ -232,6 +241,16 @@ pub trait TreeEngine: std::fmt::Debug {
     /// Applies one broker read completion. `outcome` carries decoded bytes;
     /// the engine deserializes and attaches the node.
     fn apply_read(&mut self, hash: SHAMapHash, outcome: &ReadOutcome) -> PlanReadApply;
+
+    /// Applies one asynchronous timeout reprobe to the exact retained network
+    /// need that dispatched it. Storage bytes are prefix-form NodeStore data,
+    /// never wire ledger-data bytes. The exact need prevents a late reprobe
+    /// from attaching a different location that merely shares a hash.
+    fn apply_recovery_read(
+        &mut self,
+        need: PlanNetworkNeed,
+        outcome: &ReadOutcome,
+    ) -> PlanReadApply;
 
     /// Applies one decoded network node to the retained frontier. `kind`
     /// distinguishes state from transaction nodes so an app engine can route
@@ -527,20 +546,24 @@ pub enum PlanTurn {
 
 /// Packet-level application summary. Attachment controls whether another
 /// bounded CPU turn is useful; useful data alone controls timeout progress.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PacketFeed {
     attached: bool,
     useful: bool,
     nodes_seen: u32,
     malformed_nodes: u32,
+    /// Exact retained needs attached by this packet. These are the only
+    /// network results allowed to retire retained needs.
+    resolved_network: Vec<PlanNetworkNeed>,
 }
 
 impl PacketFeed {
-    fn merge(&mut self, other: Self) {
+    fn merge(&mut self, mut other: Self) {
         self.attached |= other.attached;
         self.useful |= other.useful;
         self.nodes_seen = self.nodes_seen.saturating_add(other.nodes_seen);
         self.malformed_nodes = self.malformed_nodes.saturating_add(other.malformed_nodes);
+        self.resolved_network.append(&mut other.resolved_network);
     }
 }
 
@@ -556,11 +579,24 @@ pub struct SessionPlan {
     engine: Option<Box<dyn TreeEngine + Send + Sync>>,
     mailbox: SessionMailbox,
     pending_reads: BTreeMap<SHAMapHash, OperationRef>,
+    /// Exact timeout reprobes are intentionally separate from ordinary
+    /// traversal reads: the original read may already have settled while its
+    /// retained network need remains recoverable.
+    pending_recovery_reads: BTreeMap<OperationRef, PlanNetworkNeed>,
     read_backlog: VecDeque<PlanReadNeed>,
     network_backlog: VecDeque<PlanNetworkNeed>,
     pending_network: BTreeSet<Uint256>,
+    /// Exact currently blocked network frontier. `pending_network` remains an
+    /// observability set only; timeout recovery must retain node id, hash, and
+    /// tree kind so it can resend a protocol-correct request.
+    retained_network: Vec<PlanNetworkNeed>,
+    /// Start index for the next bounded timeout recovery batch. It advances
+    /// once per timeout interval, not once per effect, so local reprobes and
+    /// peer resends cover the same exact needs.
+    retained_network_cursor: usize,
     persistence: SessionPersistence,
     timeouts: u32,
+    progress_since_timeout: bool,
     max_timeouts: u32,
     pending_reads_cap: usize,
     cancelled: bool,
@@ -574,11 +610,15 @@ impl SessionPlan {
             engine: None,
             mailbox: SessionMailbox::new(admission.max_packets(), admission.max_bytes()),
             pending_reads: BTreeMap::new(),
+            pending_recovery_reads: BTreeMap::new(),
             read_backlog: VecDeque::new(),
             network_backlog: VecDeque::new(),
             pending_network: BTreeSet::new(),
+            retained_network: Vec::new(),
+            retained_network_cursor: 0,
             persistence: SessionPersistence::None,
             timeouts: 0,
+            progress_since_timeout: false,
             max_timeouts: DEFAULT_MAX_ACQUIRE_TIMEOUTS,
             pending_reads_cap: MAX_PENDING_READS,
             cancelled: false,
@@ -669,7 +709,9 @@ impl SessionPlan {
 
     /// Pending brokered NodeStore reads for this session.
     pub fn pending_read_count(&self) -> usize {
-        self.pending_reads.len()
+        self.pending_reads
+            .len()
+            .saturating_add(self.pending_recovery_reads.len())
     }
 
     /// Read needs waiting for bounded broker admission.
@@ -680,6 +722,12 @@ impl SessionPlan {
     /// Pending network candidates requested from peers (observability).
     pub fn pending_network(&self) -> &BTreeSet<Uint256> {
         &self.pending_network
+    }
+
+    /// Exact current frontier retained for timeout recovery. These records are
+    /// owned by this plan and never authorize work for another session.
+    pub fn retained_network(&self) -> &[PlanNetworkNeed] {
+        &self.retained_network
     }
 
     /// True after cancellation cleared this plan.
@@ -693,9 +741,12 @@ impl SessionPlan {
         self.cancelled = true;
         self.mailbox.clear();
         self.pending_reads.clear();
+        self.pending_recovery_reads.clear();
         self.read_backlog.clear();
         self.network_backlog.clear();
         self.pending_network.clear();
+        self.retained_network.clear();
+        self.retained_network_cursor = 0;
         self.engine = None;
         self.persistence = SessionPersistence::None;
     }
@@ -706,6 +757,85 @@ impl SessionPlan {
     /// acquisition that is actively receiving or applying ledger data.
     pub fn note_progress(&mut self) {
         self.timeouts = 0;
+        self.progress_since_timeout = true;
+    }
+
+    /// Consumes the prior timeout interval's progress bit. A successful Base
+    /// seed or useful node does not trigger rippled-style no-progress recovery
+    /// at the immediately following timer; the next quiet interval does.
+    pub fn take_no_progress_interval(&mut self) -> bool {
+        let no_progress = !std::mem::replace(&mut self.progress_since_timeout, false);
+        no_progress
+    }
+
+    /// Selects the next bounded retry batch from the exact current frontier.
+    /// The cursor rotates before the following no-progress interval, so a
+    /// frontier larger than `MAX_TIMEOUT_REPROBES` cannot be pinned behind its
+    /// first request batch. Only retirement of an attached exact need or
+    /// cancellation can change this retained frontier; incremental plan turns
+    /// merge into it without resetting the cursor.
+    pub fn next_timeout_recovery_batch(&mut self) -> Vec<PlanNetworkNeed> {
+        let len = self.retained_network.len();
+        if self.cancelled || len == 0 {
+            return Vec::new();
+        }
+        self.retained_network_cursor %= len;
+        let count = len.min(MAX_TIMEOUT_REPROBES);
+        let start = self.retained_network_cursor;
+        let batch = (0..count)
+            .map(|offset| self.retained_network[(start + offset) % len])
+            .collect();
+        self.retained_network_cursor = (start + count) % len;
+        batch
+    }
+
+    /// Submit brokered local re-probes for one exact timeout-recovery batch.
+    /// The coordinator owns only logical tickets; NodeStore admission and
+    /// physical I/O remain with the read port. Existing reads/backlog entries
+    /// are never duplicated, and every retry gets a fresh exact operation
+    /// identity. Callers reuse the same batch for peer resends.
+    pub fn reprobe_network_batch(
+        &mut self,
+        retained: &[PlanNetworkNeed],
+        ctx: &mut TurnContext,
+    ) -> Vec<ReadRequest> {
+        if self.cancelled || self.persistence != SessionPersistence::None {
+            return Vec::new();
+        }
+        let Some(ledger_sequence) = self.ledger_sequence() else {
+            return Vec::new();
+        };
+        let mut requests = Vec::new();
+        for need in retained.iter().copied() {
+            let hash = SHAMapHash::new(need.hash());
+            if self
+                .pending_recovery_reads
+                .values()
+                .any(|pending| *pending == need)
+                || requests
+                    .iter()
+                    .any(|request: &ReadRequest| request.key() == hash)
+                || self.pending_read_count().saturating_add(requests.len())
+                    >= self.pending_reads_cap
+            {
+                continue;
+            }
+            let operation = OperationRef::new(
+                ctx.session,
+                OperationKind::RecoveryRead,
+                ctx.ids.next_id(),
+                ctx.ids.next_id(),
+            );
+            self.pending_recovery_reads.insert(operation, need);
+            requests.push(ReadRequest::new(
+                operation,
+                hash,
+                ledger_sequence,
+                ctx.store_generation,
+                ctx.priority,
+            ));
+        }
+        requests
     }
 
     /// Runs one bounded work turn: drains the FIFO read-admission backlog,
@@ -748,6 +878,7 @@ impl SessionPlan {
 
         if !self.network_backlog.is_empty() {
             let nodes = self.network_backlog.drain(..).collect::<Vec<_>>();
+            self.retain_network_frontier(&nodes);
             for node in &nodes {
                 self.pending_network.insert(node.hash());
             }
@@ -794,6 +925,7 @@ impl SessionPlan {
                 )
             };
             self.runs += 1;
+            self.retire_network_resolutions(&fed.resolved_network);
             if fed.nodes_seen != 0 {
                 tracing::info!(
                     target: "acquisition_trace",
@@ -891,6 +1023,7 @@ impl SessionPlan {
                     return PlanTurn::Reads(requests);
                 }
                 PlanStepOutcome::NeedsNetwork(nodes) => {
+                    self.retain_network_frontier(&nodes);
                     for node in &nodes {
                         self.pending_network.insert(node.hash());
                     }
@@ -902,25 +1035,52 @@ impl SessionPlan {
         }
     }
 
-    /// Applies one read completion. Returns `Stale` unless the completion
-    /// matches the exact in-flight operation of a pending read.
+    /// Applies one normal traversal read or exact timeout recovery-read
+    /// completion. A recovery completion is accepted only for its matching
+    /// operation and retained `(node id, hash, kind)` need; ordinary reads
+    /// never forge that association.
     pub fn on_read(&mut self, completion: &ReadCompletion) -> PlanReadOutcome {
-        if completion.operation().kind() != OperationKind::Read {
+        let operation = completion.operation();
+        if self.engine.is_none() {
             return PlanReadOutcome::Stale;
         }
-        let Some((&hash, _)) = self
-            .pending_reads
-            .iter()
-            .find(|(_, operation)| operation.is_expected_for(&completion.operation()))
-        else {
-            return PlanReadOutcome::Stale;
-        };
-        self.pending_reads.remove(&hash);
-        let Some(engine) = self.engine.as_mut() else {
-            return PlanReadOutcome::Stale;
-        };
-        engine.apply_read(hash, completion.outcome());
-        PlanReadOutcome::Applied
+        match operation.kind() {
+            OperationKind::Read => {
+                let Some((&hash, _)) = self
+                    .pending_reads
+                    .iter()
+                    .find(|(_, expected)| expected.is_expected_for(&operation))
+                else {
+                    return PlanReadOutcome::Stale;
+                };
+                self.pending_reads.remove(&hash);
+                let _ = self
+                    .engine
+                    .as_mut()
+                    .expect("checked rooted engine")
+                    .apply_read(hash, completion.outcome());
+                // An ordinary read is keyed only by hash and may cover several
+                // retained locations. It must not retire a frontier entry
+                // without the exact `PlanNetworkNeed` verification provided by
+                // a recovery read or an attached peer node.
+                PlanReadOutcome::Applied
+            }
+            OperationKind::RecoveryRead => {
+                let Some(need) = self.pending_recovery_reads.remove(&operation) else {
+                    return PlanReadOutcome::Stale;
+                };
+                let applied = self
+                    .engine
+                    .as_mut()
+                    .expect("checked rooted engine")
+                    .apply_recovery_read(need, completion.outcome());
+                if matches!(applied, PlanReadApply::Applied { .. }) {
+                    self.retire_network_need(need);
+                }
+                PlanReadOutcome::Applied
+            }
+            _ => PlanReadOutcome::Stale,
+        }
     }
 
     /// Applies one write completion. An incremental accepted-node write
@@ -1053,6 +1213,12 @@ impl SessionPlan {
                 continue;
             }
             let applied = engine.apply_network_node(kind, node);
+            if applied.attached()
+                && let Some(node_id) = node.node_id.as_deref().and_then(deserialize_shamap_node_id)
+            {
+                fed.resolved_network
+                    .push(PlanNetworkNeed::new(node_id, decoded.get_hash(), kind));
+            }
             fed.attached |= applied.attached();
             fed.useful |= applied.is_useful();
         }
@@ -1093,18 +1259,52 @@ impl SessionPlan {
     ) -> usize {
         let mut deferred = 0;
         for node in nodes {
-            if self.pending_network.contains(&node.hash())
-                || self
-                    .network_backlog
-                    .iter()
-                    .any(|queued| queued.hash() == node.hash())
-            {
+            if self.network_backlog.iter().any(|queued| *queued == node) {
                 continue;
             }
             self.network_backlog.push_back(node);
             deferred += 1;
         }
         deferred
+    }
+
+    /// Merges an incremental peer frontier into the retained timed-out
+    /// traversal state. Identity is the complete `(node id, hash, kind)`;
+    /// duplicate announcements are ignored, but a later batch never clears
+    /// still-blocked needs from an earlier batch. Entries retire only after an
+    /// exact verified attachment or cancellation.
+    fn retain_network_frontier(&mut self, nodes: &[PlanNetworkNeed]) {
+        for node in nodes.iter().copied() {
+            if !self.retained_network.contains(&node) {
+                self.retained_network.push(node);
+            }
+        }
+        self.normalize_retained_network_cursor();
+    }
+
+    /// Retires only exact retained needs whose peer packet both attached and
+    /// carried the matching node id, hash, and tree kind. A hash match by
+    /// itself must not erase another still-blocked tree location.
+    fn retire_network_resolutions(&mut self, resolutions: &[PlanNetworkNeed]) {
+        self.retained_network
+            .retain(|need| !resolutions.contains(need));
+        self.normalize_retained_network_cursor();
+    }
+
+    /// Retires only the exact retained need whose recovery read attached.
+    /// Equal hashes at different node ids or in different trees remain
+    /// eligible until independently verified.
+    fn retire_network_need(&mut self, resolved: PlanNetworkNeed) {
+        self.retained_network.retain(|need| *need != resolved);
+        self.normalize_retained_network_cursor();
+    }
+
+    fn normalize_retained_network_cursor(&mut self) {
+        if self.retained_network.is_empty() {
+            self.retained_network_cursor = 0;
+        } else {
+            self.retained_network_cursor %= self.retained_network.len();
+        }
     }
 
     /// Admits newly announced reads up to the pending cap. Hashes already in
@@ -1306,6 +1506,26 @@ impl TreeEngine for ScriptedEngine {
         }
     }
 
+    fn apply_recovery_read(
+        &mut self,
+        _need: PlanNetworkNeed,
+        outcome: &ReadOutcome,
+    ) -> PlanReadApply {
+        match outcome {
+            ReadOutcome::Settled { node: Some(_) } => {
+                self.applied_reads += 1;
+                self.branch_steps += 1;
+                self.runnable_frontier = !self.steps.is_empty();
+                PlanReadApply::Applied {
+                    attached_edges: 1,
+                    missing_edges: 0,
+                }
+            }
+            ReadOutcome::Settled { node: None } => PlanReadApply::UnknownRead,
+            ReadOutcome::Stale | ReadOutcome::Cancelled => PlanReadApply::Cancelled,
+        }
+    }
+
     fn apply_network_node(
         &mut self,
         _kind: TreeKind,
@@ -1430,6 +1650,31 @@ impl TreeEngine for LedgerTreePlanEngine {
             ReadOutcome::Stale | ReadOutcome::Cancelled => MissingNodeReadOutcome::Cancelled,
         };
         Self::map_apply(self.plan.apply_read_result(self.plan.id(), hash, missing))
+    }
+
+    fn apply_recovery_read(
+        &mut self,
+        need: PlanNetworkNeed,
+        outcome: &ReadOutcome,
+    ) -> PlanReadApply {
+        if self.plan.kind() != need.kind() {
+            return PlanReadApply::StalePlan;
+        }
+        let node = match outcome {
+            ReadOutcome::Settled { node: Some(bytes) } => {
+                match SHAMapTreeNode::make_from_prefix(bytes, SHAMapHash::new(need.hash())) {
+                    Ok(node) if *node.get_hash().as_uint256() == need.hash() => node,
+                    _ => return PlanReadApply::HashMismatch,
+                }
+            }
+            ReadOutcome::Settled { node: None } => return PlanReadApply::UnknownRead,
+            ReadOutcome::Stale | ReadOutcome::Cancelled => return PlanReadApply::Cancelled,
+        };
+        Self::map_apply(self.plan.apply_network_node(
+            self.plan.id(),
+            SHAMapHash::new(need.hash()),
+            node,
+        ))
     }
 
     fn apply_network_node(
@@ -2084,6 +2329,188 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert!(plan.pending_network().contains(&Uint256::from(42)));
         assert_eq!(nodes[0].kind(), TreeKind::State);
+    }
+
+    #[test]
+    fn timeout_recovery_retains_and_rotates_the_complete_bounded_frontier() {
+        let mut ids = IdCounter::new();
+        let s = session();
+        let frontier_len = u64::try_from(MAX_RETAINED_NETWORK_FRONTIER - 4)
+            .expect("bounded frontier cap fits in u64");
+        let mut announced = (1..=frontier_len)
+            .map(|hash| {
+                PlanNetworkNeed::new(
+                    SHAMapNodeId::default(),
+                    Uint256::from(hash),
+                    TreeKind::Transaction,
+                )
+            })
+            .collect::<Vec<_>>();
+        // TreePlan normally emits unique needs; retain the same invariant even
+        // if a boundary fake or adapter repeats an exact entry.
+        announced.push(announced[0]);
+        let needs = announced[..MAX_RETAINED_NETWORK_FRONTIER - 4].to_vec();
+        let mut plan = scripted(1, vec![ScriptedStep::NeedsNetworkWithKind(announced)]);
+        let PlanTurn::Network(nodes) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected network turn");
+        };
+        assert_eq!(nodes.len(), MAX_RETAINED_NETWORK_FRONTIER - 3);
+        assert_eq!(plan.retained_network(), needs.as_slice());
+        assert_eq!(
+            plan.retained_network().len(),
+            MAX_RETAINED_NETWORK_FRONTIER - 4
+        );
+
+        // One no-progress timeout selects one exact batch. The coordinator
+        // passes this same batch to both the brokered local reprobe and peer
+        // resend paths, so later retained entries cannot remain unreachable.
+        let first_batch = plan.next_timeout_recovery_batch();
+        assert_eq!(first_batch, needs[..MAX_TIMEOUT_REPROBES].to_vec());
+        let first_reads = plan.reprobe_network_batch(&first_batch, &mut ctx(s, &mut ids));
+        assert_eq!(first_reads.len(), MAX_TIMEOUT_REPROBES);
+        assert_eq!(
+            first_reads.iter().map(ReadRequest::key).collect::<Vec<_>>(),
+            first_batch
+                .iter()
+                .map(|need| SHAMapHash::new(need.hash()))
+                .collect::<Vec<_>>()
+        );
+
+        let second_batch = plan.next_timeout_recovery_batch();
+        assert_eq!(second_batch, needs[MAX_TIMEOUT_REPROBES..24].to_vec());
+        let second_reads = plan.reprobe_network_batch(&second_batch, &mut ctx(s, &mut ids));
+        assert_eq!(second_reads.len(), MAX_TIMEOUT_REPROBES);
+        assert_eq!(
+            second_reads
+                .iter()
+                .map(ReadRequest::key)
+                .collect::<Vec<_>>(),
+            second_batch
+                .iter()
+                .map(|need| SHAMapHash::new(need.hash()))
+                .collect::<Vec<_>>()
+        );
+
+        // The observed 252-entry frontier eventually reaches its final batch,
+        // then wraps to the first; repeated timeouts cannot pin it behind the
+        // initial twelve entries.
+        let final_batch_start = ((needs.len() - 1) / MAX_TIMEOUT_REPROBES) * MAX_TIMEOUT_REPROBES;
+        for _ in 0..(final_batch_start / MAX_TIMEOUT_REPROBES - 2) {
+            let _ = plan.next_timeout_recovery_batch();
+        }
+        assert_eq!(
+            plan.next_timeout_recovery_batch(),
+            needs[final_batch_start..].to_vec()
+        );
+        assert_eq!(
+            plan.next_timeout_recovery_batch(),
+            needs[..MAX_TIMEOUT_REPROBES].to_vec()
+        );
+    }
+
+    #[test]
+    fn retained_network_frontier_merges_incremental_batches_by_exact_need() {
+        let first =
+            PlanNetworkNeed::new(SHAMapNodeId::default(), Uint256::from(1), TreeKind::State);
+        let same_hash_other_kind = PlanNetworkNeed::new(
+            SHAMapNodeId::default(),
+            Uint256::from(1),
+            TreeKind::Transaction,
+        );
+        let second =
+            PlanNetworkNeed::new(SHAMapNodeId::default(), Uint256::from(2), TreeKind::State);
+        let mut plan = SessionPlan::new(budget());
+        plan.retain_network_frontier(&[first, same_hash_other_kind]);
+        let _ = plan.next_timeout_recovery_batch();
+        plan.retain_network_frontier(&[first, second]);
+
+        assert_eq!(
+            plan.retained_network(),
+            &[first, same_hash_other_kind, second],
+            "an incremental batch merges instead of superseding still-blocked needs"
+        );
+        assert_eq!(
+            plan.next_timeout_recovery_batch(),
+            vec![first, same_hash_other_kind, second],
+            "merging does not reset the rotating timeout cursor"
+        );
+    }
+
+    #[test]
+    fn timeout_recovery_read_is_exact_and_retires_only_a_verified_attachment() {
+        let mut ids = IdCounter::new();
+        let s = session();
+        let need = PlanNetworkNeed::new(
+            SHAMapNodeId::default(),
+            Uint256::from(0x77),
+            TreeKind::State,
+        );
+        let mut plan = scripted(1, vec![ScriptedStep::NeedsNetworkWithKind(vec![need])]);
+        let PlanTurn::Network(_) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected retained network need");
+        };
+
+        let first = plan.reprobe_network_batch(&[need], &mut ctx(s, &mut ids));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].operation().kind(), OperationKind::RecoveryRead);
+        assert_eq!(
+            plan.on_read(&ReadCompletion::new(
+                first[0].operation(),
+                ReadOutcome::Settled { node: None },
+            )),
+            PlanReadOutcome::Applied
+        );
+        assert_eq!(
+            plan.retained_network(),
+            &[need],
+            "a miss does not retire recovery state"
+        );
+
+        let second = plan.reprobe_network_batch(&[need], &mut ctx(s, &mut ids));
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0].operation(), first[0].operation());
+        assert_eq!(
+            plan.on_read(&ReadCompletion::new(
+                first[0].operation(),
+                ReadOutcome::Settled {
+                    node: Some(Bytes::from_static(b"late")),
+                },
+            )),
+            PlanReadOutcome::Stale,
+            "a late same-kind recovery completion cannot attach after rearm"
+        );
+        assert_eq!(
+            plan.on_read(&ReadCompletion::new(
+                second[0].operation(),
+                ReadOutcome::Settled {
+                    node: Some(Bytes::from_static(b"prefix-form-node")),
+                },
+            )),
+            PlanReadOutcome::Applied
+        );
+        assert!(
+            plan.retained_network().is_empty(),
+            "only the verified exact hit retires it"
+        );
+
+        let third_need = PlanNetworkNeed::new(
+            SHAMapNodeId::default(),
+            Uint256::from(0x78),
+            TreeKind::State,
+        );
+        plan.retain_network_frontier(&[third_need]);
+        let third = plan.reprobe_network_batch(&[third_need], &mut ctx(s, &mut ids));
+        plan.cancel();
+        assert_eq!(
+            plan.on_read(&ReadCompletion::new(
+                third[0].operation(),
+                ReadOutcome::Settled {
+                    node: Some(Bytes::from_static(b"cancelled")),
+                },
+            )),
+            PlanReadOutcome::Stale,
+            "cancellation invalidates the exact recovery operation immediately"
+        );
     }
 
     #[test]

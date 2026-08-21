@@ -490,6 +490,34 @@ impl TreeEngine for AppLedgerPlanEngine {
         Self::map_apply(plan.apply_read_result(self.plan_id, hash, missing))
     }
 
+    fn apply_recovery_read(
+        &mut self,
+        need: PlanNetworkNeed,
+        outcome: &ReadOutcome,
+    ) -> PlanReadApply {
+        if self.active_kind != Some(need.kind()) {
+            return PlanReadApply::StalePlan;
+        }
+        let Some(plan) = self.active_plan.as_mut() else {
+            return PlanReadApply::StalePlan;
+        };
+        let node = match outcome {
+            ReadOutcome::Settled { node: Some(bytes) } => {
+                // Recovery data comes from NodeStore in prefix form. It must
+                // never be sent through the TMLedgerData wire decoder or the
+                // map-level packet path: this exact retained need attaches
+                // directly to the active continuation after hash validation.
+                match SHAMapTreeNode::make_from_prefix(bytes, SHAMapHash::new(need.hash())) {
+                    Ok(node) if *node.get_hash().as_uint256() == need.hash() => node,
+                    _ => return PlanReadApply::HashMismatch,
+                }
+            }
+            ReadOutcome::Settled { node: None } => return PlanReadApply::UnknownRead,
+            ReadOutcome::Stale | ReadOutcome::Cancelled => return PlanReadApply::Cancelled,
+        };
+        Self::map_apply(plan.apply_network_node(self.plan_id, SHAMapHash::new(need.hash()), node))
+    }
+
     fn apply_network_node(
         &mut self,
         kind: TreeKind,
@@ -706,12 +734,18 @@ pub(crate) struct CoordinatorSessionOrigins {
 }
 
 impl CoordinatorSessionOrigins {
-    /// Registers the origin of one requested session.
+    /// Registers the origin of one requested session. A deferred consensus
+    /// demand remains authoritative for the same target until it binds a
+    /// session; Generic/History polling must not replace its sequence or
+    /// reason before the later Base packet builds the engine.
     pub(crate) fn register(&self, target: Uint256, seq: u32, reason: InboundLedgerReason) {
-        self.map
-            .write()
-            .expect("session origin lock")
-            .insert(target, (seq, reason));
+        let mut origins = self.map.write().expect("session origin lock");
+        if origins.get(&target).is_some_and(|(_, current)| {
+            *current == InboundLedgerReason::Consensus && reason != InboundLedgerReason::Consensus
+        }) {
+            return;
+        }
+        origins.insert(target, (seq, reason));
     }
 
     fn resolve(&self, target: Uint256) -> Option<(u32, InboundLedgerReason)> {
@@ -1426,6 +1460,25 @@ mod tests {
             seed.build(session, &base_packet(&header)).is_none(),
             "a replaced origin drives later builds"
         );
+    }
+
+    #[test]
+    fn coordinator_seed_preserves_consensus_origin_against_same_hash_lower_priority_calls() {
+        let (mut seed, origins, cache) = coordinator_resources();
+        let (root, _leaf) = state_tree(&cache, 7);
+        let header = LedgerHeader {
+            seq: SEQ,
+            account_hash: root.get_hash(),
+            ..LedgerHeader::default()
+        };
+        let session = session_for(&header);
+
+        origins.register(session.target_hash(), SEQ, InboundLedgerReason::Consensus);
+        origins.register(session.target_hash(), SEQ + 1, InboundLedgerReason::Generic);
+        let mut engine = seed
+            .build(session, &base_packet(&header))
+            .expect("the original consensus sequence still builds the engine");
+        expect_root_request(engine.as_mut(), root.get_hash());
     }
 
     #[test]

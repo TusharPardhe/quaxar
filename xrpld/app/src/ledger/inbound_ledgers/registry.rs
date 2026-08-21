@@ -1255,8 +1255,9 @@ impl InboundLedgers {
         // after a peerless interval. The port retains one such binding only
         // while peerless, matching the runner's one retained demand.
         coordinator.register_pending_handoff_origin(hash, reason, acquisition_id);
+        let target = acquisition::LedgerTarget::new(hash, (seq != 0).then_some(seq));
         let effects = coordinator.acquire_requested(
-            LedgerTarget::new(hash, (seq != 0).then_some(seq)),
+            target,
             match reason {
                 AcquireReason::History => acquisition::AcquireReason::History,
                 AcquireReason::Generic => acquisition::AcquireReason::Generic,
@@ -1267,11 +1268,15 @@ impl InboundLedgers {
             AcquisitionEffect::SessionStarted(session) => Some(*session),
             _ => None,
         });
-        if !peerless && session.is_none() {
+        if !peerless
+            && session.is_none()
+            && !(reason == AcquireReason::Consensus
+                && coordinator.has_deferred_consensus_target(target))
+        {
             // With usable peers, an empty start effect means coalescing or
             // rejection, not deferred replay; retaining it could bind a later
             // unrelated replacement session for the same target.
-            coordinator.clear_pending_handoff_origin(hash);
+            coordinator.clear_pending_handoff_origin(hash, reason, acquisition_id);
         }
         let Some(session) = session else {
             // An exact active target is intentionally coalesced by the runner:

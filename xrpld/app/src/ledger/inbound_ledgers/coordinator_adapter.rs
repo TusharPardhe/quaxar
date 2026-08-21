@@ -546,6 +546,13 @@ where
         self.runner.snapshot()
     }
 
+    /// True when the runner retained a latest consensus demand because all
+    /// non-durable capacity was occupied. The adapter uses this only to retain
+    /// origin metadata for the eventual owner replay.
+    pub(crate) fn has_deferred_consensus_target(&self, target: acquisition::LedgerTarget) -> bool {
+        self.runner.has_deferred_consensus_target(target)
+    }
+
     /// Report a usable-peer snapshot (overlay connectivity fact).
     pub(crate) fn connectivity(&mut self, snapshot: &[OverlayPeerId]) -> Vec<AcquisitionEffect> {
         let peers = snapshot

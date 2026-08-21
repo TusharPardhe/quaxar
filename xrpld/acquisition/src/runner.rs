@@ -42,11 +42,11 @@ use crate::ingress::{
     ADMISSION_BYTE_LIMIT, ADMISSION_PACKET_LIMIT, AdmissionBudget, AdmittedLedgerPacket,
 };
 use crate::io::{DurabilityCompletion, ReadCompletion, ReadPriority, WriteCompletion};
-use crate::peer::{LedgerDataRequest, PeerAvailabilitySnapshot, PeerRequest};
+use crate::peer::{LedgerDataRequest, LedgerNodeRequest, PeerAvailabilitySnapshot, PeerRequest};
 use crate::phase::{SyncPhase, TransitionFact};
 use crate::plan::{
-    NullPlanSeed, PlanDurabilityOutcome, PlanReadOutcome, PlanSeed, PlanTimeout, PlanTurn,
-    PlanWriteOutcome, SessionPlan, TurnContext,
+    MAX_TIMEOUT_REPROBES, NullPlanSeed, PlanDurabilityOutcome, PlanNetworkNeed, PlanReadOutcome,
+    PlanSeed, PlanTimeout, PlanTurn, PlanWriteOutcome, SessionPlan, TurnContext,
 };
 use crate::session::{CancelReason, FailureReason, SessionPhase, session_phase_transition};
 use crate::target::{AcquireReason, LedgerIdentity, LedgerTarget};
@@ -62,6 +62,20 @@ pub const HANDOFF_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// coordinator's peer policy at that protocol boundary without reintroducing
 /// a second peer-set lifecycle owner.
 const INITIAL_PEER_REQUEST_FANOUT: usize = 5;
+/// rippled `InboundLedger::addPeers` adds this many scored peers after a
+/// no-progress timeout (`kPeerCountAdd`).
+const TIMEOUT_PEER_ESCALATION: usize = 3;
+/// An acquisition has at most the initial rippled peer fanout plus one
+/// `kPeerCountAdd` window for each bounded no-progress timeout. This is a
+/// selected-peer window, not an unbounded history of every responder.
+const MAX_SELECTED_PEERS: usize = INITIAL_PEER_REQUEST_FANOUT
+    + TIMEOUT_PEER_ESCALATION * crate::plan::DEFAULT_MAX_ACQUIRE_TIMEOUTS as usize;
+/// rippled switches to `TMGetObjectByHash` only after more than four
+/// no-progress timeouts (`kLedgerBecomeAggressiveThreshold`).
+const AGGRESSIVE_TIMEOUT_THRESHOLD: u32 = 4;
+/// Bounded timeout request batch (`kReqNodes`), shared with the plan's local
+/// reprobe batch so one timeout interval covers one exact rotating frontier.
+const TIMEOUT_FRONTIER_REQUEST_LIMIT: usize = MAX_TIMEOUT_REPROBES;
 
 /// Coordinator-owned budgets for the acquisition domain.
 ///
@@ -129,6 +143,10 @@ pub struct CoordinatorState {
     /// capability existed. It is replayed by this same owner on the next
     /// `PeerCapabilityAvailable` fact; it is never an adapter-side retry.
     deferred_acquire: Option<(LedgerTarget, AcquireReason)>,
+    /// Latest preferred-LCL demand that could not obtain capacity after
+    /// cancellable Generic/History work was considered. It is coordinator
+    /// state, not a registry retry or consensus callback latch.
+    deferred_consensus_acquire: Option<LedgerTarget>,
     storage_generation: StoreGeneration,
     /// Latest serialized local LCL fact. A Full identity is refreshed only by
     /// a fresh publication of this exact ledger.
@@ -212,7 +230,8 @@ impl CoordinatorSession {
         self.plan.packet_bytes()
     }
 
-    /// Peers this session has sent a request to.
+    /// Bounded selected peers eligible for timeout resends. Reply-driven
+    /// requests may use a responding peer once without expanding this window.
     pub fn sent_peers(&self) -> &BTreeSet<PeerId> {
         &self.sent_peers
     }
@@ -458,6 +477,7 @@ impl CoordinatorRunner {
                 budgets,
                 peer_view: PeerAvailabilitySnapshot::new(vec![]),
                 deferred_acquire: None,
+                deferred_consensus_acquire: None,
                 storage_generation: StoreGeneration::new(1),
                 last_installed_lcl: None,
                 ids: IdCounter::new(),
@@ -477,7 +497,7 @@ impl CoordinatorRunner {
             self.stats.stale_events += 1;
             return Vec::new();
         }
-        let effects = match event {
+        let mut effects = match event {
             AcquisitionEvent::Shutdown => self.on_shutdown(),
             AcquisitionEvent::StartupMode { phase } => self.on_startup_mode(phase),
             AcquisitionEvent::Connectivity(snapshot) => self.on_connectivity(snapshot),
@@ -506,8 +526,38 @@ impl CoordinatorRunner {
             AcquisitionEvent::FetchPackAvailable => self.on_fetch_pack(),
             AcquisitionEvent::Heartbeat => self.on_heartbeat(),
         };
+        self.replay_deferred_consensus(&mut effects);
         self.stats.events_handled += 1;
         effects
+    }
+
+    /// True only when the coordinator retained the latest capacity-deferred
+    /// preferred-LCL demand. Adapters use this disposition to retain the
+    /// session-origin binding; they never become a second retry owner.
+    pub fn has_deferred_consensus_target(&self, target: LedgerTarget) -> bool {
+        self.state.deferred_consensus_acquire == Some(target)
+    }
+
+    /// Retain and replay the latest consensus target only when a session slot
+    /// is actually free. This is invoked after every fact on the serialized
+    /// owner; no registry, adapter, or consensus callback owns a retry loop.
+    fn replay_deferred_consensus(&mut self, effects: &mut Vec<AcquisitionEffect>) {
+        if self.shutdown
+            || !self.state.peer_view.has_usable_peer_capability()
+            || self
+                .state
+                .sessions
+                .values()
+                .filter(|session| !session.phase.is_terminal())
+                .count()
+                >= self.state.budgets.max_sessions
+        {
+            return;
+        }
+        let Some(target) = self.state.deferred_consensus_acquire.take() else {
+            return;
+        };
+        effects.extend(self.on_acquire(target, AcquireReason::Consensus));
     }
 
     /// The coordinator run epoch.
@@ -709,6 +759,13 @@ impl CoordinatorRunner {
     ) -> Vec<AcquisitionEffect> {
         let mut effects = Vec::new();
 
+        // A newer consensus fact supersedes any earlier capacity-deferred
+        // preferred-LCL target. If this exact demand cannot start below, it is
+        // retained again as the latest one.
+        if reason == AcquireReason::Consensus {
+            self.state.deferred_consensus_acquire = None;
+        }
+
         // Retain exactly one concrete demand while peerless. The owner replays
         // it after `PeerCapabilityAvailable`; dropping it would strand recovery
         // until another unrelated validation/consensus event happens to repeat
@@ -795,8 +852,42 @@ impl CoordinatorRunner {
             .values()
             .filter(|state| !state.phase.is_terminal())
             .count();
-        let would_exceed = !continuing_existing
+        let mut would_exceed = !continuing_existing
             && live_sessions.saturating_sub(replaceable.len()) >= self.state.budgets.max_sessions;
+        // A retained preferred-LCL target reserves the next free slot. Generic
+        // or History work may coalesce with an existing owner, but cannot take
+        // that slot and permanently strand convergence.
+        if reason != AcquireReason::Consensus
+            && !continuing_existing
+            && self.state.deferred_consensus_acquire.is_some()
+        {
+            would_exceed = true;
+        }
+        // Consensus may preempt only a cancellable lower-priority session.
+        // DurablePending is intentionally excluded: its completed result and
+        // handoff are already committed and must not be revoked.
+        if would_exceed && reason == AcquireReason::Consensus {
+            let preempt = self
+                .state
+                .sessions
+                .iter()
+                .filter(|(_, state)| {
+                    matches!(
+                        state.reason,
+                        AcquireReason::History | AcquireReason::Generic
+                    ) && matches!(state.phase, SessionPhase::Active | SessionPhase::Persisting)
+                })
+                .min_by_key(|(_, state)| match state.reason {
+                    AcquireReason::History => 0u8,
+                    AcquireReason::Generic => 1u8,
+                    AcquireReason::Consensus => 2u8,
+                })
+                .map(|(session, _)| *session);
+            if let Some(preempt) = preempt {
+                self.cancel_session(preempt, CancelReason::Explicit, &mut effects);
+                would_exceed = false;
+            }
+        }
         let disposition = if exact.is_some() {
             "coalesced_exact"
         } else if promotion.is_some() {
@@ -844,7 +935,27 @@ impl CoordinatorRunner {
             );
         }
         if would_exceed {
-            self.stats.rejected_events += 1;
+            if reason == AcquireReason::Consensus {
+                self.state.deferred_consensus_acquire = Some(target);
+                let fact = TransitionFact::TargetRequired { target };
+                if let Ok(next) = self.state.phase.apply(fact)
+                    && next != self.state.phase
+                {
+                    self.state.phase = next;
+                    effects.push(AcquisitionEffect::SetServicePhase(next));
+                }
+                tracing::info!(
+                    target: "acquisition_trace",
+                    event = "consensus_demand_deferred_capacity",
+                    target_hash = %target.hash(),
+                    target_seq = ?target.sequence(),
+                    live_sessions,
+                    max_sessions = self.state.budgets.max_sessions,
+                    "acquisition trace: retained latest preferred-LCL demand until capacity is free"
+                );
+            } else {
+                self.stats.rejected_events += 1;
+            }
             return effects;
         }
 
@@ -1114,6 +1225,7 @@ impl CoordinatorRunner {
             return effects;
         };
         let timeout_before = session_state.plan.timeouts();
+        let no_progress_before_timeout = session_state.plan.take_no_progress_interval();
         let seeded_before_timeout = session_state.plan.engine().is_some();
         let pending_network_before_timeout = session_state.plan.pending_network().len();
         let pending_reads_before_timeout = session_state.plan.pending_read_count();
@@ -1130,27 +1242,35 @@ impl CoordinatorRunner {
                     store_generation = session.store_generation().get(),
                     timeout_before,
                     timeout_after = timeout_before.saturating_add(1),
+                    no_progress_before_timeout,
                     seeded_before_timeout,
                     pending_network_before_timeout,
                     pending_reads_before_timeout,
                     read_backlog_before_timeout,
                     "acquisition trace: exact session reached no-progress deadline and will retry"
                 );
-                // rippled `InboundLedger::onTimer` retries its base request when
-                // the acquisition has made no header progress (and expands the
-                // peer set before later attempts). An unseeded coordinator
-                // plan has no engine that could otherwise re-emit work, so
-                // merely rearming its timer makes the original GetLedger a
-                // one-shot request. Reissue it with a fresh operation and
-                // prefer an untried currently available peer.
-                let retry_base = self
-                    .state
-                    .sessions
-                    .get(&session)
-                    .is_some_and(|state| state.plan.engine().is_none());
+                // rippled `InboundLedger::onTimer` only rebuilds demand on a
+                // no-progress interval (`rippled/src/xrpld/app/ledger/detail/
+                // InboundLedger.cpp`, `onTimer`/`trigger`/`addPeers`). It
+                // rechecks local storage, retargets
+                // the retained frontier, and expands peer membership without
+                // rebuilding the active traversal. The coordinator does the
+                // same through brokered reprobes plus fresh exact effects.
                 let mut effects = effects;
-                if retry_base {
-                    self.send_base_request(session, &mut effects);
+                if no_progress_before_timeout {
+                    self.escalate_timeout_peers(session);
+                    if seeded_before_timeout {
+                        let nodes = self.next_timeout_frontier_batch(session);
+                        self.submit_timeout_reprobes(session, &nodes, &mut effects);
+                        self.send_timeout_frontier_requests(
+                            session,
+                            &nodes,
+                            timeout_before.saturating_add(1),
+                            &mut effects,
+                        );
+                    } else {
+                        self.send_base_request(session, &mut effects);
+                    }
                 }
 
                 // Rearm the deadline with a fresh operation identity and let the
@@ -1184,6 +1304,7 @@ impl CoordinatorRunner {
                     plan_epoch = session.plan_epoch().get(),
                     store_generation = session.store_generation().get(),
                     timeout_before,
+                    no_progress_before_timeout,
                     seeded_before_timeout,
                     pending_network_before_timeout,
                     pending_reads_before_timeout,
@@ -1198,7 +1319,10 @@ impl CoordinatorRunner {
     }
 
     fn on_read(&mut self, completion: ReadCompletion) -> Vec<AcquisitionEffect> {
-        if completion.operation().kind() != OperationKind::Read {
+        if !matches!(
+            completion.operation().kind(),
+            OperationKind::Read | OperationKind::RecoveryRead
+        ) {
             self.stats.stale_events += 1;
             return Vec::new();
         }
@@ -1758,9 +1882,9 @@ impl CoordinatorRunner {
                             self.state.ids.next_id(),
                             self.state.ids.next_id(),
                         );
-                        if let Some(session_state) = self.state.sessions.get_mut(&session) {
-                            session_state.sent_peers.insert(*peer);
-                        }
+                        // A reply-driven request is pinned to the responding
+                        // peer, but it must not turn an unbounded history of
+                        // responders into timeout resend recipients.
                         self.stats.peer_requests += 1;
                         effects.push(AcquisitionEffect::SendLedgerRequest(PeerRequest::new(
                             session,
@@ -1854,6 +1978,166 @@ impl CoordinatorRunner {
         }
     }
 
+    /// Adds at most `TIMEOUT_PEER_ESCALATION` currently available, previously
+    /// unselected peers without exceeding the per-session selected-peer
+    /// window. The set is the coordinator's replacement for rippled's PeerSet
+    /// membership; it never owns transport or retains every responder.
+    fn escalate_timeout_peers(&mut self, session: SessionRef) {
+        let additions = self
+            .state
+            .sessions
+            .get(&session)
+            .filter(|state| !state.phase.is_terminal())
+            .map(|state| {
+                let remaining = MAX_SELECTED_PEERS.saturating_sub(state.sent_peers.len());
+                self.state
+                    .peer_view
+                    .peers()
+                    .iter()
+                    .copied()
+                    .filter(|peer| !state.sent_peers.contains(peer))
+                    .take(TIMEOUT_PEER_ESCALATION.min(remaining))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(state) = self.state.sessions.get_mut(&session) {
+            state.sent_peers.extend(additions);
+        }
+    }
+
+    /// Selects one rotating exact frontier batch for one no-progress timeout.
+    /// The resulting records are reused for both local reprobes and peer
+    /// resends, so neither port can repeatedly select only the first batch.
+    fn next_timeout_frontier_batch(&mut self, session: SessionRef) -> Vec<PlanNetworkNeed> {
+        self.state
+            .sessions
+            .get_mut(&session)
+            .filter(|state| !state.phase.is_terminal())
+            .map(|state| state.plan.next_timeout_recovery_batch())
+            .unwrap_or_default()
+    }
+
+    /// Reprobe one exact timeout frontier batch through the asynchronous
+    /// NodeStore port. No plan or coordinator lock performs physical storage
+    /// I/O.
+    fn submit_timeout_reprobes(
+        &mut self,
+        session: SessionRef,
+        nodes: &[PlanNetworkNeed],
+        effects: &mut Vec<AcquisitionEffect>,
+    ) {
+        let requests = {
+            let CoordinatorState { sessions, ids, .. } = &mut self.state;
+            let Some(state) = sessions.get_mut(&session) else {
+                return;
+            };
+            if state.phase.is_terminal() {
+                return;
+            }
+            let mut ctx = TurnContext {
+                session,
+                store_generation: session.store_generation(),
+                priority: Self::read_priority(state.reason),
+                ids,
+            };
+            state.plan.reprobe_network_batch(nodes, &mut ctx)
+        };
+        for request in requests {
+            effects.push(AcquisitionEffect::SubmitRead(request));
+        }
+    }
+
+    /// Resends the retained exact frontier with fresh operation identities.
+    /// Normal retries preserve node ids and tree kind via `GetLedgerNodes`;
+    /// only the rippled `> 4` timeout threshold switches to bounded by-hash
+    /// requests. The session/plan/store identity is unchanged throughout.
+    fn send_timeout_frontier_requests(
+        &mut self,
+        session: SessionRef,
+        nodes: &[PlanNetworkNeed],
+        timeout_count: u32,
+        effects: &mut Vec<AcquisitionEffect>,
+    ) {
+        debug_assert!(nodes.len() <= TIMEOUT_FRONTIER_REQUEST_LIMIT);
+        let Some((sequence, peers)) = self.state.sessions.get(&session).and_then(|state| {
+            (!state.phase.is_terminal()).then(|| {
+                (
+                    state.plan.ledger_sequence(),
+                    state.sent_peers.iter().copied().collect::<Vec<_>>(),
+                )
+            })
+        }) else {
+            return;
+        };
+        let Some(sequence) = sequence else {
+            return;
+        };
+        if nodes.is_empty() || peers.is_empty() {
+            return;
+        }
+        let aggressive = timeout_count > AGGRESSIVE_TIMEOUT_THRESHOLD;
+        if aggressive {
+            for kind in [ledger::TreeKind::State, ledger::TreeKind::Transaction] {
+                let nodes = nodes
+                    .iter()
+                    .filter(|node| node.kind() == kind)
+                    .map(|node| LedgerNodeRequest::new(node.hash(), kind))
+                    .collect::<Vec<_>>();
+                if nodes.is_empty() {
+                    continue;
+                }
+                for peer in &peers {
+                    let operation = OperationRef::new(
+                        session,
+                        OperationKind::PeerRequest,
+                        self.state.ids.next_id(),
+                        self.state.ids.next_id(),
+                    );
+                    self.stats.peer_requests += 1;
+                    effects.push(AcquisitionEffect::SendLedgerRequest(PeerRequest::new(
+                        session,
+                        operation,
+                        *peer,
+                        LedgerDataRequest::GetNodes {
+                            nodes: nodes.clone(),
+                            sequence: Some(sequence),
+                        },
+                    )));
+                }
+            }
+            return;
+        }
+        for kind in [ledger::TreeKind::State, ledger::TreeKind::Transaction] {
+            let node_ids = nodes
+                .iter()
+                .filter(|node| node.kind() == kind)
+                .map(|node| node.node_id())
+                .collect::<Vec<_>>();
+            if node_ids.is_empty() {
+                continue;
+            }
+            for peer in &peers {
+                let operation = OperationRef::new(
+                    session,
+                    OperationKind::PeerRequest,
+                    self.state.ids.next_id(),
+                    self.state.ids.next_id(),
+                );
+                self.stats.peer_requests += 1;
+                effects.push(AcquisitionEffect::SendLedgerRequest(PeerRequest::new(
+                    session,
+                    operation,
+                    *peer,
+                    LedgerDataRequest::GetLedgerNodes {
+                        kind,
+                        node_ids: node_ids.clone(),
+                        sequence,
+                    },
+                )));
+            }
+        }
+    }
+
     /// Reissues an unseeded Base/header request on an exact live session.
     ///
     /// The target and session identity never change across retries. Prefer a
@@ -1868,15 +2152,7 @@ impl CoordinatorRunner {
         }) else {
             return;
         };
-        let Some(peer) = self
-            .state
-            .peer_view
-            .peers()
-            .iter()
-            .copied()
-            .find(|peer| !sent_peers.contains(peer))
-            .or_else(|| self.state.peer_view.peers().first().copied())
-        else {
+        let Some(peer) = sent_peers.iter().next().copied() else {
             return;
         };
         let operation = OperationRef::new(
@@ -1885,9 +2161,9 @@ impl CoordinatorRunner {
             self.state.ids.next_id(),
             self.state.ids.next_id(),
         );
-        if let Some(state) = self.state.sessions.get_mut(&session) {
-            state.sent_peers.insert(peer);
-        }
+        // Timeout escalation selected at most `kPeerCountAdd` peers before
+        // this retry. Reuse that bounded window rather than selecting a fourth
+        // peer here; ordinary retries never expand membership on their own.
         self.stats.peer_requests += 1;
         effects.push(AcquisitionEffect::SendLedgerRequest(PeerRequest::new(
             session,
@@ -1981,7 +2257,7 @@ mod tests {
     use crate::id::{DurableHandoffId, OperationGeneration, OperationId, PlanEpoch, SessionId};
     use crate::ingress::{AdmissionGate, BackpressureOutcome};
     use crate::io::{ReadOutcome, WriteOutcome};
-    use crate::plan::{PlanReadNeed, ScriptedEngine, ScriptedStep};
+    use crate::plan::{PlanNetworkNeed, PlanReadNeed, ScriptedEngine, ScriptedStep};
     use basics::sha_map_hash::SHAMapHash;
     use shamap::node_id::SHAMapNodeId;
     use std::collections::VecDeque;
@@ -2812,6 +3088,238 @@ mod tests {
             runner.session(session).expect("live session").sent_peers(),
             &BTreeSet::from([PeerId::new(1), PeerId::new(2)])
         );
+    }
+
+    #[test]
+    fn repeated_progress_resets_keep_timeout_peer_window_and_recipients_bounded() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new((1..=100).map(PeerId::new).collect()),
+        ));
+        let initial = acquire_with_effects(&mut runner, 10);
+        let session = peer_request_session(&initial);
+        let mut effects = initial;
+
+        // Each pair is one no-progress retry followed by a progress reset. A
+        // long-running session may repeat this pattern indefinitely, so this
+        // proves the selected-peer window is not a historical sent-peer set.
+        for _ in 0..20 {
+            effects = runner.handle_event(AcquisitionEvent::TimerFired {
+                operation: timer_operation(&effects),
+                timer: TimerKind::AcquireTimeout,
+            });
+            assert!(effects.iter().any(|effect| {
+                matches!(effect, AcquisitionEffect::SendLedgerRequest(request)
+                    if request.peer_id().get() <= MAX_SELECTED_PEERS as u64)
+            }));
+            assert!(
+                runner
+                    .session(session)
+                    .expect("live session")
+                    .sent_peers()
+                    .len()
+                    <= MAX_SELECTED_PEERS
+            );
+
+            runner
+                .state
+                .sessions
+                .get_mut(&session)
+                .expect("live session")
+                .plan
+                .note_progress();
+            effects = runner.handle_event(AcquisitionEvent::TimerFired {
+                operation: timer_operation(&effects),
+                timer: TimerKind::AcquireTimeout,
+            });
+        }
+        assert_eq!(
+            runner
+                .session(session)
+                .expect("live session")
+                .sent_peers()
+                .len(),
+            MAX_SELECTED_PEERS
+        );
+    }
+
+    #[test]
+    fn seeded_no_progress_timeout_reprobes_and_resends_exact_frontier() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let node = PlanNetworkNeed::new(
+            SHAMapNodeId::default(),
+            Uint256::from(0x77),
+            ledger::TreeKind::Transaction,
+        );
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![ScriptedStep::NeedsNetworkWithKind(
+                vec![node],
+            )])),
+        );
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new((1..=6).map(PeerId::new).collect()),
+        ));
+        let initial = acquire_with_effects(&mut runner, 10);
+        let session = peer_request_session(&initial);
+        let initial_timer = timer_operation(&initial);
+        let seed = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            session,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        let initial_frontier = seed
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SendLedgerRequest(request)
+                    if matches!(request.request(), LedgerDataRequest::GetLedgerNodes { .. }) =>
+                {
+                    Some(request.clone())
+                }
+                _ => None,
+            })
+            .expect("seeded plan must request its normal frontier");
+
+        // The Base seed was useful, so rippled's `wasProgress` interval only
+        // rearms; it must not manufacture a timeout recovery request yet.
+        let first = runner.handle_event(AcquisitionEvent::TimerFired {
+            operation: initial_timer,
+            timer: TimerKind::AcquireTimeout,
+        });
+        assert!(read_effects(&first).is_empty());
+        assert!(
+            !first
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SendLedgerRequest(_)))
+        );
+
+        // The next quiet interval is a seeded no-progress timeout. It submits
+        // bounded async local reprobes and resends the exact transaction-node
+        // frontier with fresh operation identities, including one bounded peer
+        // escalation from the initial five peers to peer six.
+        let second = runner.handle_event(AcquisitionEvent::TimerFired {
+            operation: timer_operation(&first),
+            timer: TimerKind::AcquireTimeout,
+        });
+        let reads = read_effects(&second);
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].key(), SHAMapHash::new(Uint256::from(0x77)));
+        assert_eq!(reads[0].operation().session(), session);
+        let normal = second
+            .iter()
+            .filter_map(|effect| match effect {
+                AcquisitionEffect::SendLedgerRequest(request)
+                    if matches!(request.request(), LedgerDataRequest::GetLedgerNodes { .. }) =>
+                {
+                    Some(request)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(normal.len(), 6);
+        assert!(normal.iter().all(|request| {
+            request.operation() != initial_frontier.operation()
+                && matches!(
+                    request.request(),
+                    LedgerDataRequest::GetLedgerNodes {
+                        kind: ledger::TreeKind::Transaction,
+                        node_ids,
+                        sequence: 1,
+                    } if node_ids == &vec![SHAMapNodeId::default()]
+                )
+        }));
+
+        // After rippled's `timeouts > 4` threshold the same retained frontier
+        // switches to bounded by-hash requests, still with fresh operations.
+        let mut effects = second;
+        for _ in 0..3 {
+            effects = runner.handle_event(AcquisitionEvent::TimerFired {
+                operation: timer_operation(&effects),
+                timer: TimerKind::AcquireTimeout,
+            });
+        }
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                AcquisitionEffect::SendLedgerRequest(request)
+                    if matches!(request.request(), LedgerDataRequest::GetNodes { nodes, sequence: Some(1) }
+                        if nodes == &vec![crate::peer::LedgerNodeRequest::new(
+                            Uint256::from(0x77),
+                            ledger::TreeKind::Transaction,
+                        )])
+            )
+        }));
+    }
+
+    #[test]
+    fn consensus_capacity_demand_is_retained_replayed_and_preempts_lower_priority_work() {
+        let budget = BudgetState::new(1, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let first = acquire_with_effects(&mut runner, 1);
+        let first_session = peer_request_session(&first);
+
+        // A second consensus target cannot displace a consensus owner, so the
+        // coordinator retains the latest preferred-LCL demand rather than
+        // silently rejecting it.
+        let deferred = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(2),
+            reason: AcquireReason::Consensus,
+        });
+        assert!(
+            !deferred
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+        assert!(runner.has_deferred_consensus_target(target(2)));
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(2) });
+
+        // Generic pressure cannot consume the reserved next slot.
+        let generic = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(3),
+            reason: AcquireReason::Generic,
+        });
+        assert!(
+            !generic
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+        assert!(runner.has_deferred_consensus_target(target(2)));
+
+        // A terminal capacity release replays the retained demand on the same
+        // owner with a new session/store generation; stale old events remain
+        // unable to mutate it.
+        let replay = runner.handle_event(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
+        assert!(replay.contains(&AcquisitionEffect::CancelSession(first_session)));
+        let replayed = replay
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("free capacity must replay the retained consensus target");
+        assert_eq!(replayed.target_hash(), target(2).hash());
+        assert_eq!(replayed.store_generation(), StoreGeneration::new(2));
+        assert!(!runner.has_deferred_consensus_target(target(2)));
+
+        // When lower-priority work is the occupant, consensus starts now by
+        // cancelling only the pre-fence Generic session, never a handoff.
+        let mut priority = CoordinatorRunner::with_budget(RunEpoch::new(2), budget);
+        connect(&mut priority);
+        let generic = priority.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(4),
+            reason: AcquireReason::Generic,
+        });
+        let generic_session = peer_request_session(&generic);
+        let consensus = priority.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(5),
+            reason: AcquireReason::Consensus,
+        });
+        assert!(consensus.contains(&AcquisitionEffect::CancelSession(generic_session)));
+        assert!(consensus.iter().any(|effect| {
+            matches!(effect, AcquisitionEffect::SessionStarted(session) if session.target_hash() == target(5).hash())
+        }));
     }
 
     #[test]

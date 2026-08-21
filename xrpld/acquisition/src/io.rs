@@ -34,7 +34,9 @@ pub struct ReadRequest {
 }
 
 impl ReadRequest {
-    /// Builds a read request. `operation.kind()` must be [`OperationKind::Read`].
+    /// Builds a read request. `operation.kind()` must be [`OperationKind::Read`]
+    /// or [`OperationKind::RecoveryRead`]; the session plan keeps the latter
+    /// bound to its exact retained network need.
     pub fn new(
         operation: OperationRef,
         key: SHAMapHash,
@@ -42,7 +44,10 @@ impl ReadRequest {
         store_generation: StoreGeneration,
         priority: ReadPriority,
     ) -> Self {
-        debug_assert_eq!(operation.kind(), OperationKind::Read);
+        debug_assert!(matches!(
+            operation.kind(),
+            OperationKind::Read | OperationKind::RecoveryRead
+        ));
         Self {
             operation,
             key,

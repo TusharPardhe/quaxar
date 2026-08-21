@@ -79,10 +79,17 @@ impl
             .register_pending_session_origin(target, reason, acquisition_id);
     }
 
-    /// Clear an origin binding when a peer-capable demand did not create a
-    /// session, keeping the handoff port's deferred state bounded.
-    pub(crate) fn clear_pending_handoff_origin(&mut self, target: basics::base_uint::Uint256) {
-        self.handoffs.clear_pending_session_origin(target);
+    /// Clear an exact origin binding when a peer-capable demand did not create
+    /// its session; stale lower-priority calls cannot clear a deferred
+    /// consensus binding for the same target.
+    pub(crate) fn clear_pending_handoff_origin(
+        &mut self,
+        target: basics::base_uint::Uint256,
+        reason: super::registry::AcquireReason,
+        acquisition_id: u64,
+    ) {
+        self.handoffs
+            .clear_pending_session_origin(target, reason, acquisition_id);
     }
 
     /// Reopens an exact handoff after the recipient could not accept it, then

@@ -55,6 +55,22 @@ pub struct HandoffPortStats {
     pub disconnected: u64,
 }
 
+/// Exact identity of app-side provenance retained until the coordinator emits
+/// its corresponding `SessionStarted`. A target hash alone never authorizes a
+/// binding: callers must clear the same target, reason, and acquisition id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DeferredDemandKey {
+    target: basics::base_uint::Uint256,
+    reason: AcquireReason,
+    acquisition_id: u64,
+}
+
+/// The coordinator retains at most two deferred demand classes: the latest
+/// capacity-deferred consensus target and one ordinary peerless target. Keep
+/// the matching app-side origins in the same bounded shape so a lower-priority
+/// demand for another target cannot overwrite the retained consensus origin.
+const MAX_PENDING_SESSION_ORIGINS: usize = 2;
+
 /// The production [`HandoffPort`]: delivers durable ledgers to the
 /// LedgerMaster/NetworkOps completed-ledger channel with id-deduplication.
 /// A successful enqueue only establishes delivery to the recipient queue; the
@@ -69,10 +85,12 @@ pub struct CoordinatorHandoffPort {
     /// `SessionId` from another run, plan, target, or store generation must
     /// never authorize a stale durable handoff.
     sessions: HashMap<SessionRef, (AcquireReason, u64)>,
-    /// One bounded app-origin binding awaiting the coordinator's exact
-    /// `SessionStarted` effect. It never authorizes a handoff by target hash:
-    /// it is consumed into `sessions` before the first peer request dispatch.
-    pending_session_origin: Option<(basics::base_uint::Uint256, AcquireReason, u64)>,
+    /// Bounded app-origin bindings awaiting exact `SessionStarted` effects.
+    /// The key includes target, reason, and acquisition id. This mirrors the
+    /// coordinator's one deferred consensus plus one peerless ordinary demand,
+    /// and preserves consensus provenance across rejected lower-priority work
+    /// even when that work targets a different ledger.
+    pending_session_origins: HashMap<DeferredDemandKey, ()>,
     stats: HandoffPortStats,
 }
 
@@ -90,32 +108,57 @@ impl CoordinatorHandoffPort {
             events,
             published: HashSet::new(),
             sessions: HashMap::new(),
-            pending_session_origin: None,
+            pending_session_origins: HashMap::new(),
             stats: HandoffPortStats::default(),
         }
     }
 
-    /// Records the app-side origin before an acquire demand is submitted. A
-    /// peerless demand remains bounded here until the coordinator later emits
-    /// its exact `SessionStarted` effect on reconnect.
+    /// Records app-side origin before an acquire demand is submitted. The
+    /// coordinator retains only its latest consensus demand and one ordinary
+    /// peerless demand, so this map uses the same two-slot bound. Replacing an
+    /// ordinary origin never touches consensus provenance, including across
+    /// different targets.
     pub(crate) fn register_pending_session_origin(
         &mut self,
         target: basics::base_uint::Uint256,
         reason: AcquireReason,
         acquisition_id: u64,
     ) {
-        self.pending_session_origin = Some((target, reason, acquisition_id));
+        let key = DeferredDemandKey {
+            target,
+            reason,
+            acquisition_id,
+        };
+        match reason {
+            // `CoordinatorRunner::on_acquire` supersedes its previous deferred
+            // consensus target before retaining this latest one.
+            AcquireReason::Consensus => self
+                .pending_session_origins
+                .retain(|pending, ()| pending.reason != AcquireReason::Consensus),
+            // `CoordinatorRunner` retains at most one ordinary peerless target.
+            // Do not evict any capacity-deferred consensus provenance here.
+            AcquireReason::Generic | AcquireReason::History => self
+                .pending_session_origins
+                .retain(|pending, ()| pending.reason == AcquireReason::Consensus),
+        }
+        self.pending_session_origins.insert(key, ());
+        debug_assert!(self.pending_session_origins.len() <= MAX_PENDING_SESSION_ORIGINS);
     }
 
-    /// Clears a pending binding when a peer-capable acquire did not mint a
-    /// session (for example, duplicate coalescing or admission rejection).
-    pub(crate) fn clear_pending_session_origin(&mut self, target: basics::base_uint::Uint256) {
-        if self
-            .pending_session_origin
-            .is_some_and(|(pending_target, _, _)| pending_target == target)
-        {
-            self.pending_session_origin = None;
-        }
+    /// Clears only the exact pending demand that did not create a session.
+    /// A stale lower-priority caller cannot clear consensus provenance awaiting
+    /// replay, even when it targets a different ledger.
+    pub(crate) fn clear_pending_session_origin(
+        &mut self,
+        target: basics::base_uint::Uint256,
+        reason: AcquireReason,
+        acquisition_id: u64,
+    ) {
+        self.pending_session_origins.remove(&DeferredDemandKey {
+            target,
+            reason,
+            acquisition_id,
+        });
     }
 
     /// Records the app-side origin of one live exact session so a later durable
@@ -156,14 +199,27 @@ impl CoordinatorHandoffPort {
 
 impl HandoffPort for CoordinatorHandoffPort {
     fn session_started(&mut self, session: SessionRef) {
-        let Some((target, reason, acquisition_id)) = self.pending_session_origin else {
+        // Consensus wins an otherwise ambiguous same-target binding because a
+        // deferred consensus target owns the coordinator's next free slot.
+        let pending = self
+            .pending_session_origins
+            .keys()
+            .copied()
+            .find(|pending| {
+                pending.target == session.target_hash()
+                    && pending.reason == AcquireReason::Consensus
+            })
+            .or_else(|| {
+                self.pending_session_origins
+                    .keys()
+                    .copied()
+                    .find(|pending| pending.target == session.target_hash())
+            });
+        let Some(pending) = pending else {
             return;
         };
-        if target != session.target_hash() {
-            return;
-        }
-        self.pending_session_origin = None;
-        self.register_session(session, reason, acquisition_id);
+        self.pending_session_origins.remove(&pending);
+        self.register_session(session, pending.reason, pending.acquisition_id);
     }
 
     fn publish_durable(&mut self, ledger: DurableLedger) {
@@ -228,7 +284,14 @@ mod tests {
     use basics::sha_map_hash::SHAMapHash;
     use ledger::{LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader};
 
-    use acquisition::{DurableLedger, IdCounter, SessionRef, StoreGeneration};
+    use std::time::Duration;
+
+    use acquisition::AcquireReason as CoordinatorAcquireReason;
+    use acquisition::{
+        AcquisitionEffect, AcquisitionEvent, AdmissionBudget, BudgetState, CoordinatorRunner,
+        DurableLedger, IdCounter, LedgerTarget, PeerAvailabilitySnapshot, PeerId, RunEpoch,
+        SessionRef, StoreGeneration,
+    };
 
     use super::*;
 
@@ -301,6 +364,105 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].reason, AcquireReason::Consensus);
         assert_eq!(delivered[0].acquisition_id, 99);
+    }
+
+    #[test]
+    fn deferred_consensus_origin_survives_same_hash_lower_priority_replay_and_clear() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (events, _) = mpsc::sync_channel(256);
+        let mut port = CoordinatorHandoffPort::new(tx, events);
+        let mut counter = IdCounter::new();
+        let session = session(&mut counter);
+
+        port.register_pending_session_origin(session.target_hash(), AcquireReason::Consensus, 41);
+        port.register_pending_session_origin(session.target_hash(), AcquireReason::Generic, 42);
+        port.clear_pending_session_origin(session.target_hash(), AcquireReason::Generic, 42);
+        port.session_started(session);
+        port.publish_durable(durable_handoff(
+            &mut counter,
+            session,
+            immutable_ledger(7, 1),
+        ));
+
+        let delivered = drain(&rx);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].reason, AcquireReason::Consensus);
+        assert_eq!(delivered[0].acquisition_id, 41);
+    }
+
+    #[test]
+    fn capacity_deferred_consensus_origin_survives_cross_target_rejection_and_replay() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (events, _) = mpsc::sync_channel(256);
+        let mut port = CoordinatorHandoffPort::new(tx, events);
+        let budget = BudgetState::new(1, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        let consensus_a = LedgerTarget::new(Uint256::from(1), Some(1));
+        let consensus_b = LedgerTarget::new(Uint256::from(2), Some(2));
+        let generic_a = LedgerTarget::new(Uint256::from(3), Some(3));
+
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
+        ));
+        let _ = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: consensus_a,
+            reason: CoordinatorAcquireReason::Consensus,
+        });
+
+        // B is retained by the coordinator because A occupies its only slot.
+        // Preserve B's exact app origin before submitting that deferred demand.
+        port.register_pending_session_origin(consensus_b.hash(), AcquireReason::Consensus, 41);
+        let deferred = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: consensus_b,
+            reason: CoordinatorAcquireReason::Consensus,
+        });
+        assert!(
+            !deferred
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+        assert!(runner.has_deferred_consensus_target(consensus_b));
+
+        // A lower-priority request for a *different* target is rejected while
+        // B reserves the next free slot. Its exact clear must not remove B.
+        port.register_pending_session_origin(generic_a.hash(), AcquireReason::Generic, 42);
+        let rejected = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: generic_a,
+            reason: CoordinatorAcquireReason::Generic,
+        });
+        assert!(
+            !rejected
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+        port.clear_pending_session_origin(generic_a.hash(), AcquireReason::Generic, 42);
+        assert_eq!(port.pending_session_origins.len(), 1);
+
+        // Store rotation terminalizes the occupied session and replays the
+        // coordinator-owned B demand. Its original consensus origin binds the
+        // exact replayed session and recognizes its durable handoff.
+        let replay = runner.handle_event(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
+        let replayed = replay
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("free capacity must replay the retained consensus target");
+        assert_eq!(replayed.target_hash(), consensus_b.hash());
+        port.session_started(replayed);
+
+        let mut counter = IdCounter::new();
+        port.publish_durable(durable_handoff(
+            &mut counter,
+            replayed,
+            immutable_ledger(2, 2),
+        ));
+        let delivered = drain(&rx);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].reason, AcquireReason::Consensus);
+        assert_eq!(delivered[0].acquisition_id, 41);
+        assert_eq!(port.stats().unknown_session, 0);
     }
 
     #[test]
