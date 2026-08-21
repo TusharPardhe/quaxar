@@ -1663,7 +1663,11 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
 
     let candidate_hash = *candidate.header().hash.as_uint256();
     if candidate_hash != preferred_hash {
-        *preferred_recovery_target = None;
+        // A wrong object from an exact-hash resolver is retryable corruption,
+        // not rejection of the requested recovery identity. Keep the pin so
+        // the explicit reacquire below cannot be displaced by the next moving
+        // validation tip before the correct object arrives.
+        *preferred_recovery_target = Some(preferred_hash);
         tracing::warn!(
             target: "lcl_trace",
             event = "preferred_lcl_hash_mismatch",
@@ -3722,6 +3726,37 @@ mod tests {
             stabilized_preferred_recovery_target(local, local, parent, &mut pinned, |_| false,),
             local,
             "network convergence to the local LCL cancels obsolete recovery",
+        );
+        assert_eq!(pinned, None);
+    }
+
+    #[test]
+    fn exact_hash_mismatch_retry_retains_requested_recovery_identity() {
+        let local = Uint256::from(10);
+        let parent = Uint256::from(9);
+        let requested = Uint256::from(100);
+        let moving_tip = Uint256::from(101);
+
+        // The mismatch branch immediately reissues an exact-hash acquire and
+        // therefore retains the requested hash rather than treating the bad
+        // resolver object as terminal admission rejection.
+        let mut pinned = Some(requested);
+        assert_eq!(
+            stabilized_preferred_recovery_target(moving_tip, local, parent, &mut pinned, |_| false,),
+            requested,
+        );
+        assert_eq!(pinned, Some(requested));
+
+        // In contrast, the explicit failure boundary releases it.
+        assert_eq!(
+            stabilized_preferred_recovery_target(
+                moving_tip,
+                local,
+                parent,
+                &mut pinned,
+                |hash| hash == requested,
+            ),
+            moving_tip,
         );
         assert_eq!(pinned, None);
     }
