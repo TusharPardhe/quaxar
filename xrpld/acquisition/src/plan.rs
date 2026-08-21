@@ -774,6 +774,15 @@ impl SessionPlan {
         batch
     }
 
+    /// Suspends only externally dispatched read identities while retaining the
+    /// uniquely owned engine, mailbox, frontier, and backlog for a later exact
+    /// session reactivation. Late read completions become stale; reactivation
+    /// mints fresh operations before it resumes planning.
+    pub fn suspend_for_dormancy(&mut self) {
+        self.pending_reads.clear();
+        self.pending_recovery_reads.clear();
+    }
+
     /// True after cancellation cleared this plan.
     pub const fn is_cancelled(&self) -> bool {
         self.cancelled

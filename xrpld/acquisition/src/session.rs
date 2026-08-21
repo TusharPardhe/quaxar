@@ -13,8 +13,14 @@ use crate::identity::SessionRef;
 /// The mutable lifecycle phase of one acquisition session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionPhase {
-    /// The session is being planned and served (tree plan, reads, network).
+    /// The session owns the current consensus network permit and may advance
+    /// its plan, route packets, issue reads, and request peers.
     Active,
+    /// A retained consensus session whose plan and `SessionRef` remain owned,
+    /// but which has no network permit. It accepts no packets, reads, timers,
+    /// plan turns, frontier work, or retries until the exact target becomes
+    /// current again. `Persisting` and `DurablePending` never enter Dormant.
+    Dormant,
     /// All required nodes are present and the tree is complete; the session is
     /// persisting all required nodes/metadata.
     Persisting,
@@ -48,6 +54,7 @@ impl SessionPhase {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Active => "active",
+            Self::Dormant => "dormant",
             Self::Persisting => "persisting",
             Self::DurablePending => "durable_pending",
             Self::Complete => "complete",
@@ -162,20 +169,25 @@ impl SessionOutcome {
 ///   fence is required before a normal adoptable result exists.
 /// * A terminal phase is final: no transition out of `Complete`, `Failed`, or
 ///   `Cancelled`.
+/// * `Active` and `Dormant` are the only reversible pair. Dormancy retains
+///   the exact plan/session identity but removes its network permit.
 /// * `Failed` is reachable from `Active`/`Persisting` (never from
 ///   `DurablePending`, where the result is already committed to delivery).
-/// * `Cancelled` is reachable from `Active`/`Persisting` (never from
+/// * `Cancelled` is reachable from `Active`/`Dormant`/`Persisting` (never from
 ///   `DurablePending`, so cancellation cannot revoke a committed durable
 ///   result).
 pub fn session_phase_transition(from: &SessionPhase, to: &SessionPhase) -> bool {
     use SessionPhase::*;
     match (from, to) {
         (from, to) if from == to => true,
+        (Active, Dormant) | (Dormant, Active) => true,
         (Active, Persisting) => true,
         (Persisting, DurablePending) => true,
         (DurablePending, Complete) => true,
         (Active, Failed { .. }) | (Persisting, Failed { .. }) => true,
-        (Active, Cancelled { .. }) | (Persisting, Cancelled { .. }) => true,
+        (Active, Cancelled { .. })
+        | (Dormant, Cancelled { .. })
+        | (Persisting, Cancelled { .. }) => true,
         _ => false,
     }
 }
@@ -225,6 +237,7 @@ mod tests {
             // A different phase may never be reached from a terminal phase.
             for other in [
                 Active,
+                Dormant,
                 Persisting,
                 DurablePending,
                 Complete,
@@ -250,10 +263,26 @@ mod tests {
     }
 
     #[test]
+    fn dormant_is_reversible_only_before_persistence() {
+        use SessionPhase::*;
+        assert!(session_phase_transition(&Active, &Dormant));
+        assert!(session_phase_transition(&Dormant, &Active));
+        assert!(!session_phase_transition(&Persisting, &Dormant));
+        assert!(!session_phase_transition(&DurablePending, &Dormant));
+        assert_eq!(Dormant.label(), "dormant");
+    }
+
+    #[test]
     fn cancellation_is_legal_before_the_fence_but_not_after() {
         use SessionPhase::*;
         assert!(session_phase_transition(
             &Active,
+            &Cancelled {
+                reason: CancelReason::Replaced
+            }
+        ));
+        assert!(session_phase_transition(
+            &Dormant,
             &Cancelled {
                 reason: CancelReason::Replaced
             }

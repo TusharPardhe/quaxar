@@ -563,7 +563,7 @@ impl ShadowRunner {
     pub fn snapshot(&self) -> ShadowSnapshot {
         let mut active_by_reason: BTreeMap<AcquireReason, usize> = BTreeMap::new();
         for mirror in self.mirror.values() {
-            if !mirror.phase.is_terminal() {
+            if !mirror.phase.is_terminal() && mirror.phase != SessionPhase::Dormant {
                 *active_by_reason.entry(mirror.reason).or_insert(0) += 1;
             }
         }
@@ -622,6 +622,9 @@ impl ShadowRunner {
             if promotion && let Some(mirror) = self.mirror.get_mut(&session) {
                 mirror.target = target;
             }
+            if reason == AcquireReason::Consensus {
+                self.activate_latest_consensus(session);
+            }
             let fact = TransitionFact::TargetRequired { target };
             let (derived, transition_reason, kind) = self.apply_fact(Some(fact));
             self.push(
@@ -650,6 +653,9 @@ impl ShadowRunner {
                 terminal: None,
             },
         );
+        if reason == AcquireReason::Consensus {
+            self.activate_latest_consensus(session);
+        }
         let fact = TransitionFact::TargetRequired { target };
         let (derived, reason, kind) = self.apply_fact(Some(fact));
         self.push(
@@ -691,7 +697,7 @@ impl ShadowRunner {
             );
             return;
         };
-        if mirror.phase.is_terminal() {
+        if mirror.phase != SessionPhase::Active {
             self.push(
                 tag,
                 Some(session),
@@ -746,7 +752,7 @@ impl ShadowRunner {
             );
             return;
         };
-        if mirror.phase.is_terminal()
+        if mirror.phase != SessionPhase::Active
             || matches!(outcome, ReadOutcome::Stale | ReadOutcome::Cancelled)
         {
             self.push(
@@ -800,6 +806,7 @@ impl ShadowRunner {
             return;
         };
         if mirror.phase.is_terminal()
+            || mirror.phase == SessionPhase::Dormant
             || matches!(outcome, WriteOutcome::Stale | WriteOutcome::Cancelled)
         {
             self.push(
@@ -884,7 +891,10 @@ impl ShadowRunner {
             );
             return;
         };
-        if mirror.phase.is_terminal() || matches!(outcome, DurabilityOutcome::Stale) {
+        if mirror.phase.is_terminal()
+            || mirror.phase == SessionPhase::Dormant
+            || matches!(outcome, DurabilityOutcome::Stale)
+        {
             self.push(
                 tag,
                 Some(session),
@@ -1042,7 +1052,7 @@ impl ShadowRunner {
             );
             return;
         };
-        if mirror.phase.is_terminal() {
+        if mirror.phase != SessionPhase::Active && mirror.phase != SessionPhase::DurablePending {
             self.push(
                 tag,
                 Some(session),
@@ -1077,21 +1087,7 @@ impl ShadowRunner {
         target: ConsensusTarget,
         out: &mut Vec<ShadowObservation>,
     ) {
-        // Consensus remains the preferred-LCL policy owner: a reported
-        // preferred-LCL target with a known target drives Syncing.
-        let fact = if matches!(self.phase, SyncPhase::Syncing { .. }) {
-            Some(TransitionFact::TargetRequired {
-                target: target.target(),
-            })
-        } else {
-            Some(TransitionFact::PreferredLclDivergence {
-                target: target.target(),
-            })
-        };
-        let (derived, reason, kind) = self.apply_fact(fact);
-        self.push(
-            tag, None, kind, derived, None, None, None, reason, None, out,
-        );
+        self.derive_acquire(tag, target.target(), target.reason(), out);
     }
 
     fn derive_preferred_lcl_divergence(
@@ -1276,7 +1272,7 @@ impl ShadowRunner {
         let sessions = self
             .mirror
             .iter()
-            .filter(|(_, mirror)| !mirror.phase.is_terminal())
+            .filter(|(_, mirror)| mirror.phase == SessionPhase::Active)
             .map(|(session, _)| *session)
             .collect::<Vec<_>>();
         if sessions.is_empty() {
@@ -1483,6 +1479,23 @@ impl ShadowRunner {
                 Some(fact),
                 DisagreementKind::DerivedRejected,
             ),
+        }
+    }
+
+    fn activate_latest_consensus(&mut self, session: SessionRef) {
+        for (candidate, mirror) in &mut self.mirror {
+            if *candidate != session
+                && mirror.reason == AcquireReason::Consensus
+                && mirror.phase == SessionPhase::Active
+            {
+                mirror.phase = SessionPhase::Dormant;
+            }
+        }
+        if let Some(mirror) = self.mirror.get_mut(&session)
+            && mirror.reason == AcquireReason::Consensus
+            && mirror.phase == SessionPhase::Dormant
+        {
+            mirror.phase = SessionPhase::Active;
         }
     }
 
