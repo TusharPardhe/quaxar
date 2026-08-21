@@ -293,6 +293,7 @@ fn ripple_calculate_inner<V: ApplyView>(
             input.partial_payment_allowed,
             Some(max_source_amount),
             src_account,
+            dst_account,
             None, // payments have no quality threshold
             None, // payments never cancel self offers
         );

@@ -341,10 +341,7 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
                 // This path has only a ledger hash. A peer's history range is
                 // not an authoritative hash-to-sequence binding, so acquire by
                 // hash and learn the sequence from the response header.
-                shared.acquire_closed_ledger_async(
-                    requested_hash,
-                    crate::ledger::inbound_ledgers::AcquireReason::Consensus,
-                );
+                shared.acquire_validation_ledger_async(requested_hash);
             }
         };
         if let Some(job_queue) = self.job_queue.lock().clone() {

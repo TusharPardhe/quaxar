@@ -23,15 +23,17 @@ use std::collections::{BTreeMap, VecDeque};
 
 use basics::base_uint::Uint256;
 
+use crate::effect::AcquisitionEffect;
 use crate::event::{AcquisitionEvent, ConsensusTarget};
 use crate::id::{IdCounter, PlanEpoch, RunEpoch, StoreGeneration};
-use crate::identity::SessionRef;
+use crate::identity::{OperationKind, OperationRef, SessionRef};
 use crate::ingress::AdmittedLedgerPacket;
 use crate::io::{DurabilityOutcome, ReadOutcome, WriteOutcome};
 use crate::peer::PeerAvailabilitySnapshot;
 use crate::phase::{SyncPhase, TransitionFact, phase_transition};
 use crate::session::{CancelReason, FailureReason, SessionOutcome, SessionPhase};
 use crate::target::{AcquireReason, LedgerIdentity, LedgerTarget};
+use crate::timer::TimerKind;
 
 /// Shadow-mode configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +167,7 @@ pub enum ShadowEventTag {
     StartupMode,
     Connectivity,
     AcquireRequested,
+    ValidationTarget,
     PacketAdmitted,
     ReadCompleted,
     WriteCompleted,
@@ -192,6 +195,7 @@ impl ShadowEventTag {
             Self::StartupMode => "startup_mode",
             Self::Connectivity => "connectivity",
             Self::AcquireRequested => "acquire_requested",
+            Self::ValidationTarget => "validation_target",
             Self::PacketAdmitted => "packet_admitted",
             Self::ReadCompleted => "read_completed",
             Self::WriteCompleted => "write_completed",
@@ -220,6 +224,7 @@ impl From<&AcquisitionEvent> for ShadowEventTag {
             AcquisitionEvent::StartupMode { .. } => Self::StartupMode,
             AcquisitionEvent::Connectivity(_) => Self::Connectivity,
             AcquisitionEvent::AcquireRequested { .. } => Self::AcquireRequested,
+            AcquisitionEvent::ValidationTarget(_) => Self::ValidationTarget,
             AcquisitionEvent::PacketAdmitted(_) => Self::PacketAdmitted,
             AcquisitionEvent::ReadCompleted(_) => Self::ReadCompleted,
             AcquisitionEvent::WriteCompleted(_) => Self::WriteCompleted,
@@ -426,6 +431,7 @@ pub struct ShadowRunner {
     run_epoch: RunEpoch,
     session_counter: IdCounter,
     store_generation: StoreGeneration,
+    has_usable_peers: bool,
     latest_consensus_target: Option<LedgerTarget>,
     mirror: BTreeMap<SessionRef, MirrorSession>,
     queue_depth: usize,
@@ -444,6 +450,16 @@ struct MirrorSession {
     reason: AcquireReason,
     queue_depth: usize,
     terminal: Option<ShadowOutcome>,
+    expiry_sweep_eligible: bool,
+    /// Exact expiry operation most recently observed from the production
+    /// coordinator's `ArmTimer` effect. A touch replaces this identity, so a
+    /// late earlier wakeup cannot make the mirror sweep-eligible.
+    pending_expiry_timer: Option<OperationRef>,
+    /// Conservative mirror of a queued/running JtLedgerData-equivalent local
+    /// traversal. The event stream does not expose individual plan turns, so a
+    /// packet/read retains this ownership until a persistence or terminal
+    /// boundary proves it has ended.
+    local_scan_in_flight: bool,
 }
 
 impl ShadowRunner {
@@ -455,6 +471,7 @@ impl ShadowRunner {
             run_epoch,
             session_counter: IdCounter::new(),
             store_generation: StoreGeneration::new(1),
+            has_usable_peers: false,
             latest_consensus_target: None,
             mirror: BTreeMap::new(),
             queue_depth: 0,
@@ -468,6 +485,58 @@ impl ShadowRunner {
     /// True when shadow mode records and compares.
     pub const fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    /// Observe coordinator effects that carry identities required for exact
+    /// shadow matching. This remains read-only with respect to production: a
+    /// `SessionStarted` effect replaces the mirror's provisional identity with
+    /// the exact production identity, and an expiry arm records only its latest
+    /// operation in that private mirror.
+    pub fn observe_effects(&mut self, effects: &[AcquisitionEffect]) {
+        if !self.config.enabled {
+            return;
+        }
+        for effect in effects {
+            match effect {
+                AcquisitionEffect::SessionStarted(session) => {
+                    self.adopt_production_session(*session);
+                }
+                AcquisitionEffect::ArmTimer(request)
+                    if request.timer() == TimerKind::SessionExpiry =>
+                {
+                    let operation = request.operation();
+                    if let Some(mirror) = self.mirror.get_mut(&operation.session())
+                        && matches!(mirror.phase, SessionPhase::Active | SessionPhase::Dormant)
+                    {
+                        mirror.pending_expiry_timer = Some(operation);
+                        mirror.expiry_sweep_eligible = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn adopt_production_session(&mut self, production: SessionRef) {
+        if self.mirror.contains_key(&production) {
+            return;
+        }
+        let provisional = self
+            .mirror
+            .iter()
+            .rev()
+            .find(|(_, mirror)| {
+                !mirror.phase.is_terminal() && mirror.target.hash() == production.target_hash()
+            })
+            .map(|(session, _)| *session);
+        let Some(provisional) = provisional else {
+            return;
+        };
+        let Some(mut mirror) = self.mirror.remove(&provisional) else {
+            return;
+        };
+        mirror.session = production;
+        self.mirror.insert(production, mirror);
     }
 
     /// Derives what the coordinator rules would do for one event.
@@ -488,7 +557,17 @@ impl ShadowRunner {
                 self.derive_connectivity(tag, snapshot, &mut out);
             }
             AcquisitionEvent::AcquireRequested { target, reason } => {
-                self.derive_acquire(tag, *target, *reason, false, &mut out);
+                self.derive_acquire(tag, *target, *reason, false, false, &mut out);
+            }
+            AcquisitionEvent::ValidationTarget(target) => {
+                self.derive_acquire(
+                    tag,
+                    *target,
+                    AcquireReason::Consensus,
+                    false,
+                    true,
+                    &mut out,
+                );
             }
             AcquisitionEvent::PacketAdmitted(packet) => {
                 self.derive_packet(tag, packet, &mut out);
@@ -497,6 +576,7 @@ impl ShadowRunner {
                 self.derive_read(
                     tag,
                     completion.operation().session(),
+                    completion.operation().kind(),
                     completion.outcome(),
                     &mut out,
                 );
@@ -525,8 +605,8 @@ impl ShadowRunner {
                 session,
                 reason: _,
             } => self.derive_handoff_rejected(tag, *session, &mut out),
-            AcquisitionEvent::TimerFired { operation, .. } => {
-                self.derive_timer(tag, operation.session(), &mut out);
+            AcquisitionEvent::TimerFired { operation, timer } => {
+                self.derive_timer(tag, *operation, *timer, &mut out);
             }
             AcquisitionEvent::ConsensusTarget(target) => {
                 self.derive_consensus(tag, *target, &mut out);
@@ -556,10 +636,22 @@ impl ShadowRunner {
             }
             AcquisitionEvent::FetchPackAvailable => self.derive_fetch_pack(tag, &mut out),
             AcquisitionEvent::Heartbeat => self.derive_heartbeat(tag, &mut out),
-            // Registry lifetime is deliberately not modeled by the policy
-            // shadow; the owner runner validates exact session identities.
-            AcquisitionEvent::RegistrySweep => {}
+            AcquisitionEvent::RegistrySweep => self.derive_registry_sweep(tag, &mut out),
             AcquisitionEvent::Shutdown => self.derive_shutdown(tag, &mut out),
+        }
+        if self.promote_latest_viable_syncing_anchor() {
+            self.push(
+                tag,
+                None,
+                DisagreementKind::Match,
+                Some(self.phase),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut out,
+            );
         }
         out
     }
@@ -607,13 +699,15 @@ impl ShadowRunner {
         snapshot: &PeerAvailabilitySnapshot,
         out: &mut Vec<ShadowObservation>,
     ) {
-        let fact = if snapshot.has_usable_peer_capability() {
+        let has_usable_peers = snapshot.has_usable_peer_capability();
+        let fact = if has_usable_peers {
             (self.phase == SyncPhase::Disconnected)
                 .then_some(TransitionFact::PeerCapabilityAvailable)
         } else {
             (self.phase != SyncPhase::Disconnected).then_some(TransitionFact::PeerCapabilityLost)
         };
         let (derived, reason, kind) = self.apply_fact(fact);
+        self.has_usable_peers = has_usable_peers;
         self.push(
             tag, None, kind, derived, None, None, None, reason, None, out,
         );
@@ -625,11 +719,28 @@ impl ShadowRunner {
         target: LedgerTarget,
         reason: AcquireReason,
         preferred_target: bool,
+        phase_neutral: bool,
         out: &mut Vec<ShadowObservation>,
     ) {
-        let ordinary_consensus_with_preferred = reason == AcquireReason::Consensus
-            && !preferred_target
-            && self.latest_consensus_target.is_some();
+        if !self.has_usable_peers {
+            self.push(
+                tag,
+                None,
+                DisagreementKind::DerivedRejected,
+                Some(self.phase),
+                None,
+                None,
+                None,
+                Some(TransitionFact::TargetRequired { target }),
+                Some(self.queue_depth),
+                out,
+            );
+            return;
+        }
+        let preserve_installed_lcl = matches!(
+            self.phase,
+            SyncPhase::Tracking { .. } | SyncPhase::Full { .. }
+        );
         if let Some((session, promotion)) = self
             .mirror
             .iter()
@@ -649,7 +760,7 @@ impl ShadowRunner {
             if preferred_target {
                 self.activate_latest_consensus(session);
             }
-            let (derived, transition_reason, kind) = if ordinary_consensus_with_preferred {
+            let (derived, transition_reason, kind) = if phase_neutral || preserve_installed_lcl {
                 (Some(self.phase), None, DisagreementKind::Match)
             } else {
                 self.apply_fact(Some(TransitionFact::TargetRequired { target }))
@@ -674,20 +785,21 @@ impl ShadowRunner {
             MirrorSession {
                 session,
                 target,
-                phase: if ordinary_consensus_with_preferred {
-                    SessionPhase::Dormant
-                } else {
-                    SessionPhase::Active
-                },
+                phase: SessionPhase::Active,
                 reason,
                 queue_depth: 0,
                 terminal: None,
+                expiry_sweep_eligible: false,
+                pending_expiry_timer: None,
+                // Every newly admitted production session starts with an
+                // asynchronous local header probe.
+                local_scan_in_flight: true,
             },
         );
         if preferred_target {
             self.activate_latest_consensus(session);
         }
-        let (derived, reason, kind) = if ordinary_consensus_with_preferred {
+        let (derived, reason, kind) = if phase_neutral || preserve_installed_lcl {
             (Some(self.phase), None, DisagreementKind::Match)
         } else {
             self.apply_fact(Some(TransitionFact::TargetRequired { target }))
@@ -747,6 +859,7 @@ impl ShadowRunner {
             return;
         }
         mirror.queue_depth += 1;
+        mirror.local_scan_in_flight = true;
         self.queue_depth += 1;
         let session_queue_depth = mirror.queue_depth;
         let derived_phase = Some(self.phase);
@@ -768,10 +881,11 @@ impl ShadowRunner {
         &mut self,
         tag: ShadowEventTag,
         session: SessionRef,
+        operation_kind: OperationKind,
         outcome: &ReadOutcome,
         out: &mut Vec<ShadowObservation>,
     ) {
-        let Some(mirror) = self.mirror.get(&session) else {
+        let Some(mirror) = self.mirror.get_mut(&session) else {
             self.push(
                 tag,
                 Some(session),
@@ -803,6 +917,15 @@ impl ShadowRunner {
             );
             return;
         }
+        // A header miss returns the session to peer acquisition. Ordinary
+        // traversal reads conservatively retain local-scan ownership because
+        // their completion may synchronously schedule the next 512-read batch.
+        if operation_kind == OperationKind::HeaderRead {
+            mirror.local_scan_in_flight = matches!(outcome, ReadOutcome::Settled { node: Some(_) });
+        } else {
+            mirror.local_scan_in_flight = true;
+        }
+        let queue_depth = mirror.queue_depth;
         self.push(
             tag,
             Some(session),
@@ -812,7 +935,7 @@ impl ShadowRunner {
             None,
             None,
             None,
-            Some(mirror.queue_depth),
+            Some(queue_depth),
             out,
         );
     }
@@ -859,6 +982,7 @@ impl ShadowRunner {
         }
         let terminal = match outcome {
             WriteOutcome::Accepted if mirror.phase == SessionPhase::Active => {
+                mirror.local_scan_in_flight = false;
                 mirror.phase = SessionPhase::Persisting;
                 None
             }
@@ -870,6 +994,7 @@ impl ShadowRunner {
                     reason: FailureReason::WriteFailure,
                 };
                 mirror.terminal = terminal;
+                mirror.local_scan_in_flight = false;
                 terminal
             }
             _ => {
@@ -1068,9 +1193,11 @@ impl ShadowRunner {
     fn derive_timer(
         &mut self,
         tag: ShadowEventTag,
-        session: SessionRef,
+        operation: OperationRef,
+        timer: TimerKind,
         out: &mut Vec<ShadowObservation>,
     ) {
+        let session = operation.session();
         let Some(mirror) = self.mirror.get(&session) else {
             self.push(
                 tag,
@@ -1086,6 +1213,46 @@ impl ShadowRunner {
             );
             return;
         };
+        if timer == TimerKind::SessionExpiry {
+            let exact = mirror
+                .pending_expiry_timer
+                .is_some_and(|expected| expected.is_expected_for(&operation));
+            if !matches!(mirror.phase, SessionPhase::Active | SessionPhase::Dormant) || !exact {
+                self.push(
+                    tag,
+                    Some(session),
+                    DisagreementKind::StaleEvent,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(self.queue_depth),
+                    out,
+                );
+                return;
+            }
+            let mirror = self
+                .mirror
+                .get_mut(&session)
+                .expect("validated live shadow session");
+            mirror.pending_expiry_timer = None;
+            mirror.expiry_sweep_eligible = true;
+            let queue_depth = mirror.queue_depth;
+            self.push(
+                tag,
+                Some(session),
+                DisagreementKind::Match,
+                Some(self.phase),
+                None,
+                None,
+                None,
+                None,
+                Some(queue_depth),
+                out,
+            );
+            return;
+        }
         if mirror.phase != SessionPhase::Active && mirror.phase != SessionPhase::DurablePending {
             self.push(
                 tag,
@@ -1100,6 +1267,13 @@ impl ShadowRunner {
                 out,
             );
         } else {
+            let queue_depth = {
+                let mirror = self
+                    .mirror
+                    .get_mut(&session)
+                    .expect("validated live shadow session");
+                mirror.queue_depth
+            };
             self.push(
                 tag,
                 Some(session),
@@ -1109,10 +1283,73 @@ impl ShadowRunner {
                 None,
                 None,
                 None,
-                Some(mirror.queue_depth),
+                Some(queue_depth),
                 out,
             );
         }
+    }
+
+    fn derive_registry_sweep(&mut self, tag: ShadowEventTag, out: &mut Vec<ShadowObservation>) {
+        let expired = self
+            .mirror
+            .iter()
+            .filter(|(_, mirror)| {
+                mirror.expiry_sweep_eligible
+                    && matches!(mirror.phase, SessionPhase::Active | SessionPhase::Dormant)
+                    && !mirror.local_scan_in_flight
+            })
+            .map(|(session, _)| *session)
+            .collect::<Vec<_>>();
+        for session in expired {
+            let mirror = self
+                .mirror
+                .get_mut(&session)
+                .expect("selected mirror exists");
+            let terminal = Some(ShadowOutcome::Cancelled {
+                reason: CancelReason::IdleExpired,
+            });
+            mirror.phase = SessionPhase::Cancelled {
+                reason: CancelReason::IdleExpired,
+            };
+            mirror.terminal = terminal;
+            self.push(
+                tag,
+                Some(session),
+                DisagreementKind::Match,
+                Some(self.phase),
+                terminal,
+                None,
+                None,
+                None,
+                None,
+                out,
+            );
+        }
+    }
+
+    fn promote_latest_viable_syncing_anchor(&mut self) -> bool {
+        let SyncPhase::Syncing { target: anchor } = self.phase else {
+            return false;
+        };
+        let viable = |target: LedgerTarget, mirror: &BTreeMap<SessionRef, MirrorSession>| {
+            mirror.values().any(|session| {
+                !matches!(
+                    session.phase,
+                    SessionPhase::Failed { .. } | SessionPhase::Cancelled { .. }
+                ) && session.target.hash() == target.hash()
+            })
+        };
+        if viable(anchor, &self.mirror) {
+            return false;
+        }
+        let Some(latest) = self.latest_consensus_target else {
+            return false;
+        };
+        if latest.hash() == anchor.hash() || !viable(latest, &self.mirror) {
+            return false;
+        }
+        self.phase = SyncPhase::Syncing { target: latest };
+        true
     }
 
     fn derive_consensus(
@@ -1122,7 +1359,7 @@ impl ShadowRunner {
         out: &mut Vec<ShadowObservation>,
     ) {
         self.latest_consensus_target = Some(target.target());
-        self.derive_acquire(tag, target.target(), target.reason(), true, out);
+        self.derive_acquire(tag, target.target(), target.reason(), true, false, out);
     }
 
     fn derive_preferred_lcl_divergence(
@@ -1187,6 +1424,53 @@ impl ShadowRunner {
                     tag, None, kind, derived, None, None, None, reason, None, out,
                 );
             }
+            SyncPhase::Tracking { lcl } if identity.sequence() > lcl.sequence() => {
+                self.phase = SyncPhase::Tracking { lcl: identity };
+                self.push(
+                    tag,
+                    None,
+                    DisagreementKind::Match,
+                    Some(self.phase),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    out,
+                );
+            }
+            SyncPhase::Full { lcl, published } if identity.sequence() > lcl.sequence() => {
+                self.phase = SyncPhase::Full {
+                    lcl: identity,
+                    published,
+                };
+                self.push(
+                    tag,
+                    None,
+                    DisagreementKind::Match,
+                    Some(self.phase),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    out,
+                );
+            }
+            SyncPhase::Tracking { .. } | SyncPhase::Full { .. } => {
+                self.push(
+                    tag,
+                    None,
+                    DisagreementKind::Match,
+                    Some(self.phase),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    out,
+                );
+            }
             // Installing an LCL that is not the syncing target violates the
             // rules: the production system accepted a fact the coordinator
             // would reject.
@@ -1206,6 +1490,43 @@ impl ShadowRunner {
                 );
             }
         }
+        let cancelled = self
+            .mirror
+            .iter()
+            .filter(|(_, mirror)| {
+                mirror.target.hash() == identity.hash()
+                    && matches!(
+                        mirror.phase,
+                        SessionPhase::Active | SessionPhase::Dormant | SessionPhase::Persisting
+                    )
+            })
+            .map(|(session, _)| *session)
+            .collect::<Vec<_>>();
+        for session in cancelled {
+            let mirror = self
+                .mirror
+                .get_mut(&session)
+                .expect("selected mirror exists");
+            let terminal = Some(ShadowOutcome::Cancelled {
+                reason: CancelReason::LclInstalled,
+            });
+            mirror.phase = SessionPhase::Cancelled {
+                reason: CancelReason::LclInstalled,
+            };
+            mirror.terminal = terminal;
+            self.push(
+                tag,
+                Some(session),
+                DisagreementKind::Match,
+                Some(self.phase),
+                terminal,
+                None,
+                None,
+                None,
+                None,
+                out,
+            );
+        }
     }
 
     fn derive_publication(
@@ -1219,7 +1540,7 @@ impl ShadowRunner {
             // Production NetworkOps emits a publication fact only after it
             // proved this is the tracked LCL or its contiguous published
             // ancestor. Mirror the runner's defensive sequence guard.
-            SyncPhase::Tracking { lcl } if fresh && identity.sequence() <= lcl.sequence() => {
+            SyncPhase::Tracking { lcl } if fresh => {
                 let fact = TransitionFact::ChainContiguous {
                     lcl,
                     published: identity,
@@ -1227,6 +1548,26 @@ impl ShadowRunner {
                 let (derived, reason, kind) = self.apply_fact(Some(fact));
                 self.push(
                     tag, None, kind, derived, None, None, None, reason, None, out,
+                );
+            }
+            SyncPhase::Full { lcl, published }
+                if fresh && identity.sequence() > published.sequence() =>
+            {
+                self.phase = SyncPhase::Full {
+                    lcl,
+                    published: identity,
+                };
+                self.push(
+                    tag,
+                    None,
+                    DisagreementKind::Match,
+                    Some(self.phase),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    out,
                 );
             }
             _ => {
@@ -1524,14 +1865,9 @@ impl ShadowRunner {
     }
 
     fn activate_latest_consensus(&mut self, session: SessionRef) {
-        for (candidate, mirror) in &mut self.mirror {
-            if *candidate != session
-                && mirror.reason == AcquireReason::Consensus
-                && mirror.phase == SessionPhase::Active
-            {
-                mirror.phase = SessionPhase::Dormant;
-            }
-        }
+        // Preferred-target policy ranks work but does not suspend independent
+        // per-hash acquisitions. rippled retains multiple InboundLedger
+        // instances concurrently under its single registry owner.
         if let Some(mirror) = self.mirror.get_mut(&session)
             && mirror.reason == AcquireReason::Consensus
             && mirror.phase == SessionPhase::Dormant
@@ -1600,8 +1936,8 @@ impl ShadowRunner {
 mod tests {
     use super::*;
     use crate::handoff::DurableHandoffAcknowledgement;
-    use crate::id::{DurableHandoffId, SessionId};
-    use crate::identity::OperationRef;
+    use crate::id::{DurableHandoffId, OperationGeneration, OperationId, SessionId};
+    use crate::identity::{OperationKind, OperationRef};
     use crate::ingress::{AdmissionBudget, AdmissionGate, BackpressureOutcome};
     use crate::io::{DurabilityCompletion, ReadCompletion, WriteCompletion};
 
@@ -1642,6 +1978,27 @@ mod tests {
         )
     }
 
+    fn timer_operation(session: SessionRef, id: u64) -> OperationRef {
+        OperationRef::new(
+            session,
+            OperationKind::Timer,
+            OperationId::new(id),
+            OperationGeneration::new(id),
+        )
+    }
+
+    fn observe_expiry_arm(shadow: &mut ShadowRunner, session: SessionRef, id: u64) -> OperationRef {
+        let operation = timer_operation(session, id);
+        shadow.observe_effects(&[AcquisitionEffect::ArmTimer(
+            crate::timer::TimerRequest::new(
+                operation,
+                TimerKind::SessionExpiry,
+                std::time::Duration::from_secs(60),
+            ),
+        )]);
+        operation
+    }
+
     fn admitted_packet(session: SessionRef) -> AdmittedLedgerPacket {
         let gate = std::sync::Arc::new(AdmissionGate::new(AdmissionBudget::default(), session));
         match gate.try_reserve(1, 1) {
@@ -1665,6 +2022,16 @@ mod tests {
             crate::identity::OperationKind::Read,
             crate::id::OperationId::new(1),
             crate::id::OperationGeneration::new(1),
+        );
+        ReadCompletion::new(operation, ReadOutcome::Settled { node: None })
+    }
+
+    fn header_read_completion(session: SessionRef) -> ReadCompletion {
+        let operation = OperationRef::new(
+            session,
+            OperationKind::HeaderRead,
+            OperationId::new(2),
+            OperationGeneration::new(2),
         );
         ReadCompletion::new(operation, ReadOutcome::Settled { node: None })
     }
@@ -1777,7 +2144,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_preferred_lcl_divergence_retargets_from_syncing() {
+    fn shadow_preferred_lcl_divergence_preserves_recovery_anchor() {
         let mut shadow = runner();
         shadow.record(&AcquisitionEvent::Connectivity(
             PeerAvailabilitySnapshot::new(vec![crate::id::PeerId::new(1)]),
@@ -1792,10 +2159,249 @@ mod tests {
             shadow.record(&AcquisitionEvent::PreferredLclDivergence { target: target(9) });
         assert_eq!(
             shadow.snapshot().phase(),
-            &SyncPhase::Syncing { target: target(9) }
+            &SyncPhase::Syncing { target: target(1) }
         );
         assert_eq!(observations[0].kind(), DisagreementKind::Match);
         assert_eq!(shadow.snapshot().disagreements(), 0);
+    }
+
+    fn shadow_with_anchor_and_latest() -> (ShadowRunner, SessionRef, LedgerTarget) {
+        let mut shadow = runner();
+        shadow.record(&AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![crate::id::PeerId::new(1)]),
+        ));
+        let anchor = target(10);
+        let anchor_session = shadow
+            .record(&AcquisitionEvent::AcquireRequested {
+                target: anchor,
+                reason: AcquireReason::Generic,
+            })
+            .into_iter()
+            .find_map(|observation| observation.session())
+            .expect("anchor mirror session");
+        // The local header probe missed, leaving this session idle at its
+        // network boundary and therefore eligible for registry expiry.
+        shadow.record(&AcquisitionEvent::ReadCompleted(header_read_completion(
+            anchor_session,
+        )));
+        let latest = target(20);
+        shadow.record(&AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+            latest,
+            AcquireReason::Consensus,
+        )));
+        assert_eq!(
+            shadow.snapshot().phase(),
+            &SyncPhase::Syncing { target: anchor }
+        );
+        (shadow, anchor_session, latest)
+    }
+
+    #[test]
+    fn shadow_terminal_failure_promotes_latest_viable_anchor() {
+        let (mut shadow, anchor_session, latest) = shadow_with_anchor_and_latest();
+        let observations = shadow.record(&AcquisitionEvent::WriteCompleted(write_completion(
+            anchor_session,
+            WriteOutcome::Failed,
+        )));
+
+        assert_eq!(
+            shadow.snapshot().phase(),
+            &SyncPhase::Syncing { target: latest }
+        );
+        assert_eq!(
+            observations
+                .last()
+                .and_then(ShadowObservation::derived_phase),
+            Some(&SyncPhase::Syncing { target: latest })
+        );
+    }
+
+    #[test]
+    fn shadow_idle_expiry_promotes_latest_viable_anchor() {
+        let (mut shadow, anchor_session, latest) = shadow_with_anchor_and_latest();
+        let operation = observe_expiry_arm(&mut shadow, anchor_session, 100);
+        shadow.record(&AcquisitionEvent::TimerFired {
+            operation,
+            timer: TimerKind::SessionExpiry,
+        });
+        let observations = shadow.record(&AcquisitionEvent::RegistrySweep);
+
+        assert_eq!(
+            shadow.snapshot().phase(),
+            &SyncPhase::Syncing { target: latest }
+        );
+        assert_eq!(
+            observations
+                .last()
+                .and_then(ShadowObservation::derived_phase),
+            Some(&SyncPhase::Syncing { target: latest })
+        );
+    }
+
+    #[test]
+    fn dormant_shadow_session_accepts_exact_expiry_and_global_sweep() {
+        let mut shadow = runner();
+        shadow.record(&AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![crate::id::PeerId::new(1)]),
+        ));
+        let session = acquire(&mut shadow, 1);
+        shadow.record(&AcquisitionEvent::ReadCompleted(header_read_completion(
+            session,
+        )));
+        shadow
+            .mirror
+            .get_mut(&session)
+            .expect("mirrored session")
+            .phase = SessionPhase::Dormant;
+        let operation = observe_expiry_arm(&mut shadow, session, 100);
+
+        let observations = shadow.record(&AcquisitionEvent::TimerFired {
+            operation,
+            timer: TimerKind::SessionExpiry,
+        });
+        assert_eq!(observations[0].kind(), DisagreementKind::Match);
+
+        shadow.record(&AcquisitionEvent::RegistrySweep);
+        assert_eq!(
+            shadow.mirror.get(&session).expect("swept mirror").phase,
+            SessionPhase::Cancelled {
+                reason: CancelReason::IdleExpired,
+            }
+        );
+    }
+
+    #[test]
+    fn shadow_registry_sweep_preserves_anchor_during_local_scan() {
+        let (mut shadow, anchor_session, _latest) = shadow_with_anchor_and_latest();
+        shadow.record(&AcquisitionEvent::PacketAdmitted(admitted_packet(
+            anchor_session,
+        )));
+        let operation = observe_expiry_arm(&mut shadow, anchor_session, 100);
+        shadow.record(&AcquisitionEvent::TimerFired {
+            operation,
+            timer: TimerKind::SessionExpiry,
+        });
+        let observations = shadow.record(&AcquisitionEvent::RegistrySweep);
+
+        assert_eq!(
+            shadow.snapshot().phase(),
+            &SyncPhase::Syncing { target: target(10) }
+        );
+        assert_eq!(
+            shadow
+                .mirror
+                .get(&anchor_session)
+                .expect("scan owner remains mirrored")
+                .phase,
+            SessionPhase::Active
+        );
+        assert!(observations.iter().all(|observation| {
+            observation.derived_outcome()
+                != Some(ShadowOutcome::Cancelled {
+                    reason: CancelReason::IdleExpired,
+                })
+        }));
+    }
+
+    #[test]
+    fn shadow_keeps_moving_consensus_hashes_concurrently_active() {
+        let mut shadow = runner();
+        shadow.record(&AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![crate::id::PeerId::new(1)]),
+        ));
+        let first = shadow
+            .record(&AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+                target(10),
+                AcquireReason::Consensus,
+            )))
+            .into_iter()
+            .find_map(|observation| observation.session())
+            .expect("first consensus session");
+        let second = shadow
+            .record(&AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+                target(20),
+                AcquireReason::Consensus,
+            )))
+            .into_iter()
+            .find_map(|observation| observation.session())
+            .expect("second consensus session");
+
+        assert_eq!(
+            shadow.mirror.get(&first).expect("first").phase,
+            SessionPhase::Active
+        );
+        assert_eq!(
+            shadow.mirror.get(&second).expect("second").phase,
+            SessionPhase::Active
+        );
+        assert_eq!(
+            shadow
+                .snapshot()
+                .active_by_reason()
+                .get(&AcquireReason::Consensus),
+            Some(&2)
+        );
+        let progress = shadow.record(&AcquisitionEvent::PacketAdmitted(admitted_packet(first)));
+        assert_eq!(progress[0].kind(), DisagreementKind::Match);
+
+        shadow.record(&AcquisitionEvent::WriteCompleted(write_completion(
+            first,
+            WriteOutcome::Failed,
+        )));
+        assert_eq!(
+            shadow.snapshot().phase(),
+            &SyncPhase::Syncing { target: target(20) }
+        );
+    }
+
+    #[test]
+    fn shadow_store_rotation_cancels_all_without_transient_anchor_promotion() {
+        let (mut shadow, _anchor_session, _latest) = shadow_with_anchor_and_latest();
+        let anchor = target(10);
+        shadow.record(&AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
+
+        assert_eq!(
+            shadow.snapshot().phase(),
+            &SyncPhase::Syncing { target: anchor }
+        );
+        assert_eq!(
+            shadow.snapshot().active_by_reason().values().sum::<usize>(),
+            0
+        );
+    }
+
+    #[test]
+    fn shadow_full_lcl_and_publication_advance_independently() {
+        let mut shadow = runner();
+        shadow.record(&AcquisitionEvent::StartupMode {
+            phase: SyncPhase::Full {
+                lcl: identity(9),
+                published: identity(9),
+            },
+        });
+
+        let observations = shadow.record(&AcquisitionEvent::LclInstalled(identity(10)));
+        assert_eq!(observations[0].kind(), DisagreementKind::Match);
+        assert_eq!(
+            shadow.snapshot().phase(),
+            &SyncPhase::Full {
+                lcl: identity(10),
+                published: identity(9),
+            }
+        );
+
+        let observations = shadow.record(&AcquisitionEvent::PublicationCommitted {
+            identity: identity(11),
+            fresh: true,
+        });
+        assert_eq!(observations[0].kind(), DisagreementKind::Match);
+        assert_eq!(
+            shadow.snapshot().phase(),
+            &SyncPhase::Full {
+                lcl: identity(10),
+                published: identity(11),
+            }
+        );
     }
 
     #[test]
@@ -1843,6 +2449,41 @@ mod tests {
     }
 
     #[test]
+    fn session_started_effect_adopts_the_exact_production_identity() {
+        let mut shadow = runner();
+        shadow.record(&AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![crate::id::PeerId::new(1)]),
+        ));
+        let provisional = acquire(&mut shadow, 1);
+        let production = SessionRef::new(
+            provisional.run_epoch(),
+            provisional.session_id(),
+            provisional.target_hash(),
+            PlanEpoch::new(2),
+            provisional.store_generation(),
+        );
+        shadow.observe_effects(&[AcquisitionEffect::SessionStarted(production)]);
+
+        assert!(!shadow.mirror.contains_key(&provisional));
+        assert!(shadow.mirror.contains_key(&production));
+
+        let expiry = timer_operation(production, 7);
+        shadow.observe_effects(&[AcquisitionEffect::ArmTimer(
+            crate::timer::TimerRequest::new(
+                expiry,
+                TimerKind::SessionExpiry,
+                std::time::Duration::from_secs(60),
+            ),
+        )]);
+        let observations = shadow.record(&AcquisitionEvent::TimerFired {
+            operation: expiry,
+            timer: TimerKind::SessionExpiry,
+        });
+        assert_eq!(observations[0].kind(), DisagreementKind::Match);
+        assert_eq!(shadow.snapshot().stale_events(), 0);
+    }
+
+    #[test]
     fn acquisition_from_disconnected_is_derived_rejected() {
         let mut shadow = runner();
         // No usable-peer fact yet; the rules forbid starting acquisition.
@@ -1853,6 +2494,87 @@ mod tests {
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].kind(), DisagreementKind::DerivedRejected);
         assert_eq!(shadow.snapshot().phase(), &SyncPhase::Disconnected);
+        assert_eq!(shadow.snapshot().mirror_sessions(), 0);
+    }
+
+    #[test]
+    fn ordinary_consensus_target_is_phase_neutral_after_lcl_install() {
+        let full = SyncPhase::Full {
+            lcl: identity(10),
+            published: identity(10),
+        };
+        let mut shadow = runner();
+        shadow.record(&AcquisitionEvent::StartupMode { phase: full });
+        shadow.record(&AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![crate::id::PeerId::new(1)]),
+        ));
+
+        let observations = shadow.record(&AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+            target(11),
+            AcquireReason::Consensus,
+        )));
+
+        assert_eq!(shadow.snapshot().phase(), &full);
+        assert_eq!(shadow.snapshot().mirror_sessions(), 1);
+        assert!(observations.iter().all(|observation| {
+            observation.kind() == DisagreementKind::Match
+                && observation.derived_phase() == Some(&full)
+        }));
+    }
+
+    #[test]
+    fn rearmed_expiry_rejects_the_stale_operation_before_global_sweep() {
+        let mut shadow = runner();
+        shadow.record(&AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![crate::id::PeerId::new(1)]),
+        ));
+        let session = acquire(&mut shadow, 1);
+        // A completed header miss proves the local scan reached its network
+        // boundary, so an exact current expiry may be swept.
+        shadow.record(&AcquisitionEvent::ReadCompleted(header_read_completion(
+            session,
+        )));
+
+        let stale = timer_operation(session, 10);
+        let current = timer_operation(session, 11);
+        shadow.observe_effects(&[AcquisitionEffect::ArmTimer(
+            crate::timer::TimerRequest::new(
+                stale,
+                TimerKind::SessionExpiry,
+                std::time::Duration::from_secs(60),
+            ),
+        )]);
+        shadow.observe_effects(&[AcquisitionEffect::ArmTimer(
+            crate::timer::TimerRequest::new(
+                current,
+                TimerKind::SessionExpiry,
+                std::time::Duration::from_secs(60),
+            ),
+        )]);
+
+        let observations = shadow.record(&AcquisitionEvent::TimerFired {
+            operation: stale,
+            timer: TimerKind::SessionExpiry,
+        });
+        assert_eq!(observations[0].kind(), DisagreementKind::StaleEvent);
+        shadow.record(&AcquisitionEvent::RegistrySweep);
+        assert_eq!(
+            shadow.mirror.get(&session).expect("live mirror").phase,
+            SessionPhase::Active
+        );
+
+        let observations = shadow.record(&AcquisitionEvent::TimerFired {
+            operation: current,
+            timer: TimerKind::SessionExpiry,
+        });
+        assert_eq!(observations[0].kind(), DisagreementKind::Match);
+        shadow.record(&AcquisitionEvent::RegistrySweep);
+        assert_eq!(
+            shadow.mirror.get(&session).expect("expired mirror").phase,
+            SessionPhase::Cancelled {
+                reason: CancelReason::IdleExpired
+            }
+        );
     }
 
     #[test]

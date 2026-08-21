@@ -38,12 +38,14 @@ peer messages and local transactions
                 |
                 v
        NetworkOps strand (single owner)
-          |                 |
-          |                 +--> validations and preferred-ledger choice
-          v
-    typed acquisition coordinator
           |
-          v
+          +--> moving preferred-LCL policy
+          |          |
+          |          +--> independent per-hash acquisitions
+          |          v
+          +--> stable recovery anchor / coordinator phase
+                     |
+                     v
     per-hash ledger / transaction-set acquisition
           |
           +--> shared NodeFamily caches and NodeStore reads
@@ -60,15 +62,13 @@ peer messages and local transactions
 ```
 
 The acquisition coordinator serializes typed events into phase transitions and
-effects. It owns the current recovery target, exact hash/sequence metadata,
-retry policy, durable completion handoff, and the lifecycle of per-hash
-sessions. An inbound-ledger registry admits one active acquisition for a
-ledger hash. A preferred-policy retarget does not erase an older valid session:
-partial SHAMaps and fetched nodes remain reusable rather than rebuilding each
-tree from an empty map. Reads consult shared in-memory caches and the NodeStore
-before requesting missing nodes from peers. A ledger is eligible for handoff
-only after its header and required SHAMaps are complete and consistent with
-their hashes.
+effects. While syncing, its phase owns a stable recovery anchor. NetworkOps'
+latest preferred-LCL policy is separate moving state and may prioritize another
+per-hash acquisition without replacing that anchor. Only a verified header for
+the same hash may refine a hash-only anchor with its sequence. The coordinator
+also owns retry policy, durable completion handoff, and per-hash session
+lifecycle. Older sessions may finish after policy advances; their partial
+SHAMaps and fetched nodes remain reusable through shared caches and NodeStore.
 
 NetworkOps owns the closed-ledger/LCL switch and reconciles it with the latest
 preferred-ledger policy. LedgerMaster owns validation acceptance plus validated
@@ -76,11 +76,33 @@ and published advancement; publication advances in sequence and does not
 silently cross an unresolved gap. The application/NetworkOps
 `need_network_ledger` startup/recovery latch is independent from the
 coordinator's visible phase and clears only on an authoritative LCL switch or
-full-ledger publication. During recovery,
-historical acquisition is subordinate to acquiring and publishing the current
-validated chain.
+full-ledger publication. Accepted local closes and contiguous publications
+advance the coordinator's separate LCL and publication identities. Once an LCL
+is installed, ordinary Consensus, Generic, and History acquisitions are
+phase-neutral; only a serialized actionable preferred-LCL divergence demotes
+Tracking or Full. During recovery, historical acquisition is subordinate to
+acquiring and publishing the current validated chain.
 
 See [SYNCING.md](SYNCING.md) for the operator-visible state transitions.
+
+## Payment and offer flow
+
+Path/offer execution creates one shared AMM context for the complete flow, not
+one context per `BookStep`. Reverse and forward book passes receive that same
+context. It records the transaction account, whether more than one strand is
+active, the selected strand's AMM-use/iteration state, and the AMM's initial
+balances in both book directions. Candidate state is cleared before each strand
+is evaluated and committed only for the strand that is selected; discarded
+candidates therefore cannot consume the multipath AMM iteration budget.
+
+Within a book quality, AMM liquidity is considered before the CLOB offer, as in
+`rippled`. Single-path maximum offers use pool spot quality. CLOB-targeted AMM
+offers use their generated amount quality, account-aware auction-slot fees, and
+the active AMM amendments. Multipath execution derives its bounded Fibonacci
+offers from the shared initial balances and selected-iteration state. These
+ordering and ownership rules are consensus-critical: changing them can produce
+a different transaction result and ledger hash even when the same offers and
+pool balances are present.
 
 ## Storage and caches
 
@@ -150,6 +172,11 @@ When changing the runtime, preserve these invariants:
 4. Ledger heads only reference complete, immutable ledgers.
 5. Caches are shared and swept by policy; they are not cleared on every ledger.
 6. Shutdown stops producers before queues, storage, and shared state.
+7. A moving preferred tip never replaces an in-flight stable recovery anchor.
+8. The phase LCL tracks the canonical local closed ledger, while publication
+   advances independently only on the proven contiguous chain.
+9. Full requires coherent advancing LCL/publication state, not merely a
+   completed acquisition.
 
 For behavior-parity changes, compare the corresponding `rippled` owner and
 call sequence, not just the shape of an individual function.

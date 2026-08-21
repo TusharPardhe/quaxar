@@ -1834,6 +1834,17 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             local_lcl_seq = our_closed.header().seq,
             "LCL_AUDIT preferred-LCL candidate rejected"
         );
+        // `rippled::checkLastClosedLedger` restores `networkClosed` to the
+        // current local LCL and returns `false` for this path. Its subsequent
+        // endConsensus pass may therefore leave CONNECTED/SYNCING and resume
+        // TRACKING. Mirror that result in the typed coordinator: a previously
+        // selected recovery anchor that proved stale or incompatible must not
+        // keep the public phase Syncing after policy explicitly retained the
+        // local LCL.
+        shared_inbound.coordinator_preferred_lcl_reconciled(acquisition::LedgerIdentity::new(
+            our_hash,
+            our_closed.header().seq,
+        ));
         return PreferredLclReconciliation::NoChange;
     }
 

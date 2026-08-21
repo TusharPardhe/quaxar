@@ -45,22 +45,22 @@ Features:
 
 | Command | Description |
 |---------|-------------|
-| `status` | Server state, uptime, ledger range |
-| `health` | Health check with semantic states |
+| `status` | Point-in-time server state, uptime, peers, and complete-ledger range |
+| `health` | RPC reachability with a point-in-time state label; not a readiness gate |
 | `peers` | Connected peers with latency and version |
 | `fee` | Current transaction fee |
 | `ledger [seq]` | Ledger info (latest validated or by sequence) |
 | `account <address>` | Account balance and details |
-| `sync-status` | Current sync progress and state |
+| `sync-status` | Current operating mode and validated-ledger progress |
 | `rpc <method> [params]` | Call any JSON-RPC method directly |
 | `ping` | Ping the local RPC server |
 | `server-info` | Raw `server_info` output |
 | `server-state` | Raw `server_state` output |
 | `server-definitions` | Raw `server_definitions` output |
-| `ledger-closed` | Latest closed ledger sequence and hash |
+| `ledger-closed` | Canonical local closed-ledger sequence and hash |
 | `ledger-current` | Current open ledger index |
 | `ledger-header` | Validated ledger header |
-| `fetch-info` | Ledger acquisition/fetch state |
+| `fetch-info` | Coordinator phase/anchors, sessions, counters, and recovery decision |
 | `get-counts` | Raw cache, ledger, and node-store counters |
 | `can-delete [value]` | Get or set advisory online-delete ledger |
 | `config` | Validate a configuration file without starting the node |
@@ -218,12 +218,14 @@ when it is unreachable. RPC-backed commands generally return 1 for connection
 or RPC errors, and command-line parse errors return 1. The current `config`,
 `doctor`, `benchmark`, interactive CLI, and `validator-keys` dispatch paths
 return 0 after invocation even when the command printed a diagnostic; do not
-use their exit status as an automation contract yet.
+use their exit status as an automation contract yet. Readiness automation must
+sample closed, validated, and coordinator phase progress across several ledger
+closes.
 
 ## Health States
 
 | State | Display | Meaning |
 |-------|---------|---------|
-| `full` / `proposing` / `validating` | ● Healthy (green) | Fully synced |
+| `full` / `proposing` / `validating` | ● Reachable (green) | Point-in-time state; verify sustained convergence |
 | `tracking` / `syncing` / `connected` | ◐ Syncing (yellow) | Alive, not yet ready |
 | Unreachable | ● Down (red) | Cannot connect |

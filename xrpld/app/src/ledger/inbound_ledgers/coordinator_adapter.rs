@@ -55,8 +55,9 @@ use acquisition::{
     AcquisitionEffect, AcquisitionEvent, AdmissionBudget, AdmissionGate, AdmittedLedgerPacket,
     BackpressureOutcome, CancellationPort, CoordinatorPorts, CoordinatorRunner, HandoffPort,
     LedgerDataRequest, LedgerRequestPort, PeerAvailabilitySnapshot, PeerId, PeerRequest, PhasePort,
-    ReadCompletion, ReadOutcome, ReadPort, ReadRequest, RouteEntry, RoutingGeneration,
-    RoutingSnapshot, RunEpoch, SessionPhase, SessionRef, TimerPort, WritePort,
+    ReadCompletion, ReadOutcome, ReadPort, ReadRequest, ReferenceDecision, RouteEntry,
+    RoutingGeneration, RoutingSnapshot, RunEpoch, SessionPhase, SessionRef, ShadowConfig,
+    ShadowObservation, ShadowOutcome, ShadowRunner, ShadowSnapshot, TimerPort, WritePort,
 };
 
 use super::read_broker::{
@@ -317,6 +318,11 @@ impl CoordinatorIngress {
 /// `acquisition::fake::*` ports and production instantiates the app ports below.
 pub(crate) struct CoordinatorAdapter<R, RD, WR, T, H, P, C> {
     runner: CoordinatorRunner,
+    /// Read-only mirror driven on this same serialized owner. It receives the
+    /// exact event before production consumes it and observes the resulting
+    /// effects before any port executes them; it can therefore compare state
+    /// without becoming a second lifecycle authority.
+    shadow: ShadowRunner,
     pub(crate) requests: R,
     reads: RD,
     writes: WR,
@@ -370,6 +376,7 @@ where
     /// before the adapter exists.
     pub(crate) fn with_event_channel(
         runner: CoordinatorRunner,
+        shadow_config: ShadowConfig,
         requests: R,
         reads: RD,
         writes: WR,
@@ -385,6 +392,7 @@ where
         packet_tx: PacketEventSender,
         packet_rx: PacketEventReceiver,
     ) -> Self {
+        let shadow = ShadowRunner::new(shadow_config, runner.run_epoch());
         let ingress = CoordinatorIngress {
             routing_snapshot: Arc::new(RwLock::new(Arc::new(RoutingSnapshot::new(
                 RoutingGeneration::new(0),
@@ -395,6 +403,7 @@ where
         };
         let mut adapter = Self {
             runner,
+            shadow,
             requests,
             reads,
             writes,
@@ -465,6 +474,19 @@ where
             .collect()
     }
 
+    /// Immutable shadow state for RPC/metrics consumers. Disabled mode reports
+    /// a zero-work snapshot and never records observations.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn shadow_snapshot(&self) -> ShadowSnapshot {
+        self.shadow.snapshot()
+    }
+
+    /// Drain bounded shadow observations for tracing/metrics publication.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn drain_shadow_observations(&mut self) -> Vec<ShadowObservation> {
+        self.shadow.drain_observations()
+    }
+
     /// Handle one typed event and dispatch its effects through the ports.
     /// Effects are executed only after the runner has mutated its state, so no
     /// port observes coordinator state mid-mutation.
@@ -485,7 +507,10 @@ where
         {
             self.runner.update_target_peer_capabilities(target, peers);
         }
+        let reference_session = event_session(&event);
+        self.shadow.record(&event);
         let effects = self.runner.handle_event(event);
+        self.observe_shadow_result(reference_session, &effects);
         self.note_terminal_failures(&effects);
         // A request can synchronously produce an overlay reply. Publish the
         // route created by this event before dispatching its outbound effects,
@@ -496,7 +521,20 @@ where
     }
 
     fn handle_read_batch(&mut self, completions: Vec<ReadCompletion>) {
+        let reference_sessions = completions
+            .iter()
+            .map(|completion| completion.operation().session())
+            .collect::<BTreeSet<_>>();
+        for completion in &completions {
+            self.shadow
+                .record(&AcquisitionEvent::ReadCompleted(completion.clone()));
+        }
         let effects = self.runner.handle_read_batch(completions);
+        self.shadow.observe_effects(&effects);
+        for session in reference_sessions {
+            self.compare_shadow_session(session);
+        }
+        self.compare_shadow_effect_sessions(&effects);
         self.note_terminal_failures(&effects);
         self.refresh_routes();
         self.dispatch(&effects);
@@ -685,6 +723,19 @@ where
         self.handle_fact(AcquisitionEvent::AcquireRequested { target, reason })
     }
 
+    /// Request the newest trusted-validation ledger needed by `GetConsL2`.
+    /// This starts/reuses consensus-priority cache work without changing the
+    /// coordinator service phase or preferred-LCL target.
+    pub(crate) fn validation_target(
+        &mut self,
+        target: acquisition::LedgerTarget,
+    ) -> Vec<AcquisitionEffect> {
+        if let Some(peers) = self.requests.peer_target_capabilities(target) {
+            self.runner.update_target_peer_capabilities(target, peers);
+        }
+        self.handle_fact(AcquisitionEvent::ValidationTarget(target))
+    }
+
     /// Report the authoritative preferred-LCL target selected by NetworkOps
     /// `checkLastClosedLedger`. This is the sole event that may select the
     /// active consensus permit; ordinary consensus acquires remain demand-only.
@@ -762,6 +813,56 @@ where
         }
     }
 
+    fn observe_shadow_result(
+        &mut self,
+        reference_session: Option<SessionRef>,
+        effects: &[AcquisitionEffect],
+    ) {
+        self.shadow.observe_effects(effects);
+        if let Some(session) = reference_session {
+            self.compare_shadow_session(session);
+        }
+        self.compare_shadow_effect_sessions(effects);
+    }
+
+    fn compare_shadow_effect_sessions(&mut self, effects: &[AcquisitionEffect]) {
+        let sessions = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session)
+                | AcquisitionEffect::CancelSession(session) => Some(*session),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for session in sessions {
+            self.compare_shadow_session(session);
+        }
+    }
+
+    fn compare_shadow_session(&mut self, session: SessionRef) {
+        let Some(production) = self.runner.session(session) else {
+            return;
+        };
+        let outcome = match production.phase() {
+            SessionPhase::Complete => Some(ShadowOutcome::Durable),
+            SessionPhase::Failed { reason } => Some(ShadowOutcome::Failed { reason: *reason }),
+            SessionPhase::Cancelled { reason } => {
+                Some(ShadowOutcome::Cancelled { reason: *reason })
+            }
+            SessionPhase::Active
+            | SessionPhase::Dormant
+            | SessionPhase::Persisting
+            | SessionPhase::DurablePending => None,
+        };
+        self.shadow.compare_reference(&ReferenceDecision::new(
+            session,
+            Some(*self.runner.phase()),
+            outcome,
+            Some(production.target().hash()),
+            production.packet_count() as usize,
+        ));
+    }
+
     /// Publish a fresh immutable routing snapshot reflecting the runner's live
     /// (non-terminal) sessions. Gates are cached per session: rebuilding a gate
     /// while its session still has in-flight leases would double-admit those
@@ -824,6 +925,35 @@ where
         for effect in effects {
             ports.dispatch(effect.clone());
         }
+    }
+}
+
+fn event_session(event: &AcquisitionEvent) -> Option<SessionRef> {
+    match event {
+        AcquisitionEvent::PacketAdmitted(packet) => Some(packet.lease().session()),
+        AcquisitionEvent::ReadCompleted(completion) => Some(completion.operation().session()),
+        AcquisitionEvent::WriteCompleted(completion) => Some(completion.operation().session()),
+        AcquisitionEvent::DurabilityFenced(completion) => Some(completion.operation().session()),
+        AcquisitionEvent::DurableHandoffAcknowledged(acknowledgement) => {
+            Some(acknowledgement.session())
+        }
+        AcquisitionEvent::DurableHandoffRejected { session, .. } => Some(*session),
+        AcquisitionEvent::TimerFired { operation, .. } => Some(operation.session()),
+        AcquisitionEvent::StartupMode { .. }
+        | AcquisitionEvent::Connectivity(_)
+        | AcquisitionEvent::AcquireRequested { .. }
+        | AcquisitionEvent::ValidationTarget(_)
+        | AcquisitionEvent::ConsensusTarget(_)
+        | AcquisitionEvent::PreferredLclDivergence { .. }
+        | AcquisitionEvent::PreferredLclReconciled { .. }
+        | AcquisitionEvent::BlockedWithNoTarget
+        | AcquisitionEvent::LclInstalled(_)
+        | AcquisitionEvent::PublicationCommitted { .. }
+        | AcquisitionEvent::StoreRotated(_)
+        | AcquisitionEvent::FetchPackAvailable
+        | AcquisitionEvent::Heartbeat
+        | AcquisitionEvent::RegistrySweep
+        | AcquisitionEvent::Shutdown => None,
     }
 }
 
@@ -1272,12 +1402,17 @@ mod tests {
     }
 
     fn adapter() -> (TestAdapter, Arc<FetchPackCache>) {
+        adapter_with_shadow(ShadowConfig::disabled())
+    }
+
+    fn adapter_with_shadow(shadow_config: ShadowConfig) -> (TestAdapter, Arc<FetchPackCache>) {
         let cache = fetch_pack();
         let runner = runner();
         let (tx, rx) = std::sync::mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
         let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel(PACKET_INGRESS_QUEUE_CAPACITY);
         let adapter = TestAdapter::with_event_channel(
             runner,
+            shadow_config,
             FakeLedgerRequestPort::new(),
             FakeReadPort::new(),
             FakeWritePort::new(),
@@ -1292,6 +1427,81 @@ mod tests {
             packet_rx,
         );
         (adapter, cache)
+    }
+
+    #[test]
+    fn disabled_shadow_is_a_no_op_on_the_live_owner_path() {
+        let (mut adapter, _) = adapter();
+        adapter.connectivity(&[1]);
+        adapter.acquire_requested(target(9, SEQ), AcquireReason::Consensus);
+
+        let snapshot = adapter.shadow_snapshot();
+        assert!(!snapshot.enabled());
+        assert_eq!(snapshot.mirror_sessions(), 0);
+        assert!(adapter.drain_shadow_observations().is_empty());
+    }
+
+    #[test]
+    fn live_owner_drives_shadow_events_effect_identity_and_reference_comparison() {
+        let (mut adapter, _) = adapter_with_shadow(ShadowConfig::default());
+        adapter.connectivity(&[1]);
+        let started = adapter.acquire_requested(target(9, SEQ), AcquireReason::Consensus);
+        let session = started
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("production session start is visible to the shadow probe");
+        let header_read = started
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SubmitRead(request)
+                    if request.operation().kind() == OperationKind::HeaderRead =>
+                {
+                    Some(request.operation())
+                }
+                _ => None,
+            })
+            .expect("new acquisition probes the local header");
+        let mut expiry = started
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::ArmTimer(request)
+                    if request.timer() == TimerKind::SessionExpiry =>
+                {
+                    Some(request.operation())
+                }
+                _ => None,
+            })
+            .expect("production expiry identity is observed");
+
+        let read_effects = adapter.handle_fact(AcquisitionEvent::ReadCompleted(
+            ReadCompletion::new(header_read, ReadOutcome::Settled { node: None }),
+        ));
+        if let Some(rearmed) = read_effects.iter().find_map(|effect| match effect {
+            AcquisitionEffect::ArmTimer(request) if request.timer() == TimerKind::SessionExpiry => {
+                Some(request.operation())
+            }
+            _ => None,
+        }) {
+            expiry = rearmed;
+        }
+        adapter.handle_fact(AcquisitionEvent::TimerFired {
+            operation: expiry,
+            timer: TimerKind::SessionExpiry,
+        });
+        adapter.handle_fact(AcquisitionEvent::RegistrySweep);
+
+        assert!(adapter.runner.session(session).is_none());
+        assert_eq!(adapter.cancellations.cancelled, vec![session]);
+        let snapshot = adapter.shadow_snapshot();
+        assert!(snapshot.enabled());
+        assert_eq!(snapshot.mirror_sessions(), 1);
+        let observations = adapter.drain_shadow_observations();
+        assert_eq!(snapshot.stale_events(), 0, "{observations:#?}");
+        assert_eq!(snapshot.disagreements(), 0, "{observations:#?}");
+        assert!(snapshot.matches() > 0);
     }
 
     #[test]
@@ -1321,6 +1531,7 @@ mod tests {
         let timers = CoordinatorTimerPort::new(Arc::clone(&pool), tx.clone());
         let mut adapter = TimerAdapter::with_event_channel(
             runner,
+            ShadowConfig::disabled(),
             FakeLedgerRequestPort::new(),
             FakeReadPort::new(),
             FakeWritePort::new(),
@@ -1392,6 +1603,7 @@ mod tests {
         let timers = CoordinatorTimerPort::new(Arc::clone(&pool), tx.clone());
         let mut adapter = TimerAdapter::with_event_channel(
             runner,
+            ShadowConfig::disabled(),
             FakeLedgerRequestPort::new(),
             reads,
             FakeWritePort::new(),
@@ -1464,6 +1676,36 @@ mod tests {
             .expect("an acquisition session must start")
     }
 
+    fn settle_initial_header_miss<R, RD, WR, T, H, P, C>(
+        adapter: &mut CoordinatorAdapter<R, RD, WR, T, H, P, C>,
+        effects: &[AcquisitionEffect],
+    ) -> Vec<AcquisitionEffect>
+    where
+        R: LedgerRequestPort,
+        RD: ReadPort,
+        WR: WritePort,
+        T: TimerPort,
+        H: HandoffPort,
+        P: PhasePort,
+        C: CancellationPort,
+    {
+        let operation = effects
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SubmitRead(request)
+                    if request.operation().kind() == OperationKind::HeaderRead =>
+                {
+                    Some(request.operation())
+                }
+                _ => None,
+            })
+            .expect("new acquisition starts with an exact local header probe");
+        adapter.handle_fact(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            operation,
+            ReadOutcome::Settled { node: None },
+        )))
+    }
+
     fn valid_inner_wire() -> Vec<u8> {
         let mut wire = vec![0; 16 * 32];
         wire.push(shamap::tree_node::WIRE_TYPE_INNER);
@@ -1513,6 +1755,7 @@ mod tests {
         };
         let mut adapter = InlineReplyAdapter::with_event_channel(
             runner(),
+            ShadowConfig::disabled(),
             requests,
             FakeReadPort::new(),
             FakeWritePort::new(),
@@ -1529,7 +1772,8 @@ mod tests {
         *ingress.lock().expect("inline ingress slot lock") = Some(adapter.ingress());
 
         adapter.connectivity(&[1]);
-        let effects = adapter.acquire_requested(target(9, SEQ), AcquireReason::Consensus);
+        let started = adapter.acquire_requested(target(9, SEQ), AcquireReason::Consensus);
+        let effects = settle_initial_header_miss(&mut adapter, &started);
         assert!(effects.iter().any(|effect| matches!(
             effect,
             AcquisitionEffect::SendLedgerRequest(request) if request.session().target_hash() == Uint256::from(9)
@@ -1548,6 +1792,33 @@ mod tests {
             "the owner consumes the queued reply later"
         );
         assert_eq!(adapter.snapshot().packets_admitted(), 1);
+    }
+
+    #[test]
+    fn validation_target_does_not_publish_an_operating_mode_change() {
+        let (mut adapter, _cache) = adapter();
+        let full = SyncPhase::Full {
+            lcl: acquisition::LedgerIdentity::new(Uint256::from(40), 40),
+            published: acquisition::LedgerIdentity::new(Uint256::from(40), 40),
+        };
+        let _ = adapter.handle_fact(AcquisitionEvent::StartupMode { phase: full });
+        let _ = adapter.connectivity(&[1]);
+        adapter.phase.phases.clear();
+
+        let effects = adapter.validation_target(LedgerTarget::new(Uint256::from(99), None));
+
+        assert_eq!(adapter.snapshot().phase(), &full);
+        assert!(adapter.phase.phases.is_empty());
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, AcquisitionEffect::SetServicePhase(_)))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
     }
 
     #[test]
@@ -1697,13 +1968,16 @@ mod tests {
             "wire node ids survive into the admission packet"
         );
 
-        // The owner consumes the admitted packet and returns the ingress
-        // capacity; with the null plan seed the packet is retained by the
-        // session mailbox.
+        // With the null plan seed the packet is retained by the session mailbox,
+        // so its immutable ingress lease remains charged until terminal cleanup.
         adapter.push(AcquisitionEvent::PacketAdmitted(packet));
         assert_eq!(adapter.drain(), 1);
         assert_eq!(adapter.snapshot().packets_admitted(), 1);
-        assert_eq!(gate.current_packets(), 0, "the owner releases admission");
+        assert_eq!(
+            gate.current_packets(),
+            1,
+            "the retained mailbox packet keeps immutable ingress admission charged"
+        );
         assert_eq!(
             adapter
                 .runner
@@ -1712,6 +1986,12 @@ mod tests {
                 .packet_count(),
             1,
             "the packet is retained by the session mailbox (no engine seeded)"
+        );
+        adapter.handle_fact(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
+        assert_eq!(
+            gate.current_packets(),
+            0,
+            "terminal cleanup settles the retained lease"
         );
     }
 
@@ -1796,15 +2076,15 @@ mod tests {
     fn failed_terminal_session_is_reported_once_for_registry_cooldown() {
         let (mut adapter, _cache) = adapter();
         adapter.connectivity(&[1]);
-        let effects = adapter.acquire_requested(target(9, SEQ), AcquireReason::Generic);
-        let session = effects
+        let started = adapter.acquire_requested(target(9, SEQ), AcquireReason::Generic);
+        let session = started
             .iter()
             .find_map(|effect| match effect {
-                AcquisitionEffect::SendLedgerRequest(request) => Some(request.session()),
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
                 _ => None,
             })
             .expect("acquisition starts a session");
-        let mut timeout = effects
+        let mut timeout = started
             .iter()
             .find_map(|effect| match effect {
                 AcquisitionEffect::ArmTimer(request)
@@ -1815,6 +2095,11 @@ mod tests {
                 _ => None,
             })
             .expect("acquisition arms its timeout");
+        let effects = settle_initial_header_miss(&mut adapter, &started);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            AcquisitionEffect::SendLedgerRequest(request) if request.session() == session
+        )));
 
         // rippled permits six no-progress recovery intervals; only the
         // seventh exact timeout terminalizes the acquisition.
@@ -1863,14 +2148,29 @@ mod tests {
             LedgerDataIngressDisposition::Unmatched
         );
 
-        // A replacement cancels the old session and drops its route: the same
-        // target hash now routes to the new session's gate.
-        let effects = adapter.acquire_requested(target(9, SEQ + 1), AcquireReason::Consensus);
+        // Store rotation terminalizes the old exact owner and drops its route.
+        // Sequence metadata alone never replaces a same-hash InboundLedger.
+        let effects = adapter.handle_fact(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
         assert!(
             effects
                 .iter()
                 .any(|effect| matches!(effect, AcquisitionEffect::CancelSession(_)))
         );
+        assert!(
+            adapter
+                .routing_snapshot()
+                .route(&Uint256::from(9))
+                .is_none()
+        );
+        assert_eq!(
+            adapter.route_ledger_data(
+                1,
+                &wire_ledger_data(Uint256::from(9), 0, vec![(None, vec![1, 2, 3])],),
+            ),
+            LedgerDataIngressDisposition::Unmatched
+        );
+
+        let _ = adapter.acquire_requested(target(9, SEQ + 1), AcquireReason::Consensus);
         let snapshot = adapter.routing_snapshot();
         let route = snapshot
             .route(&Uint256::from(9))

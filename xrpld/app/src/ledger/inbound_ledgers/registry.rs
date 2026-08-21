@@ -1139,6 +1139,7 @@ impl InboundLedgers {
                 target.hash(),
                 AcquireReason::Consensus,
                 acquisition_id,
+                true,
             );
             let effects = coordinator.consensus_target(target);
             let started = effects.iter().any(|effect| {
@@ -1149,6 +1150,7 @@ impl InboundLedgers {
                     target.hash(),
                     AcquireReason::Consensus,
                     acquisition_id,
+                    true,
                 );
             }
             coordinator.drain();
@@ -1284,6 +1286,16 @@ impl InboundLedgers {
         seq: u32,
         reason: AcquireReason,
     ) -> Option<CoordinatorAcquireOutcome> {
+        self.coordinator_acquire_inner(hash, seq, reason, false)
+    }
+
+    fn coordinator_acquire_inner(
+        &self,
+        hash: Uint256,
+        seq: u32,
+        reason: AcquireReason,
+        validation_target: bool,
+    ) -> Option<CoordinatorAcquireOutcome> {
         if hash.is_zero() {
             tracing::warn!(target: "inbound_ledger", "coordinator_acquire: REJECTED zero hash");
             return None;
@@ -1338,18 +1350,22 @@ impl InboundLedgers {
         coordinator.connectivity(&peers);
         // Bind this demand before it reaches the runner. `SessionStarted` is
         // dispatched before the first peer send, including when replayed later
-        // after a peerless interval. The port retains one such binding only
-        // while peerless, matching the runner's one retained demand.
-        coordinator.register_pending_handoff_origin(hash, reason, acquisition_id);
+        // after a peerless interval. This is the ordinary class even when its
+        // reason is Consensus, so it cannot evict preferred-LCL provenance.
+        coordinator.register_pending_handoff_origin(hash, reason, acquisition_id, false);
         let target = acquisition::LedgerTarget::new(hash, (seq != 0).then_some(seq));
-        let effects = coordinator.acquire_requested(
-            target,
-            match reason {
-                AcquireReason::History => acquisition::AcquireReason::History,
-                AcquireReason::Generic => acquisition::AcquireReason::Generic,
-                AcquireReason::Consensus => acquisition::AcquireReason::Consensus,
-            },
-        );
+        let effects = if validation_target {
+            coordinator.validation_target(target)
+        } else {
+            coordinator.acquire_requested(
+                target,
+                match reason {
+                    AcquireReason::History => acquisition::AcquireReason::History,
+                    AcquireReason::Generic => acquisition::AcquireReason::Generic,
+                    AcquireReason::Consensus => acquisition::AcquireReason::Consensus,
+                },
+            )
+        };
         let session = effects.iter().find_map(|effect| match effect {
             AcquisitionEffect::SessionStarted(session) => Some(*session),
             _ => None,
@@ -1362,7 +1378,7 @@ impl InboundLedgers {
             // With usable peers, an empty start effect means coalescing or
             // rejection, not deferred replay; retaining it could bind a later
             // unrelated replacement session for the same target.
-            coordinator.clear_pending_handoff_origin(hash, reason, acquisition_id);
+            coordinator.clear_pending_handoff_origin(hash, reason, acquisition_id, false);
         }
         let Some(session) = session else {
             // An exact active target is intentionally coalesced by the runner:
@@ -1978,6 +1994,16 @@ impl InboundLedgers {
     /// acquisition key.
     pub fn acquire_closed_ledger_async(&self, hash: Uint256, reason: AcquireReason) {
         self.acquire_async(hash, 0, reason);
+    }
+
+    /// Start phase-neutral consensus-priority acquisition for the newest
+    /// trusted-validation ledger (`RCLValidationsAdaptor::GetConsL2`).
+    pub fn acquire_validation_ledger_async(&self, hash: Uint256) {
+        if self.coordinator_installed() {
+            let _ = self.coordinator_acquire_inner(hash, 0, AcquireReason::Consensus, true);
+        } else {
+            self.acquire_async(hash, 0, AcquireReason::Consensus);
+        }
     }
 
     /// Reserve exactly one actor-owned packet/byte lease before handing a

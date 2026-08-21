@@ -37,6 +37,11 @@ cargo test -p rpc
 cargo nextest run --workspace
 ```
 
+Preferred-LCL and acquisition changes also require focused regressions for a
+stable recovery anchor under a moving tip, same-hash sequence refinement,
+reuse of behind-tip completions, in-place LCL/publication advancement,
+actionable Full demotion, and sustained recovery without mode flapping.
+
 ## Code Style
 
 ### Formatting
@@ -119,8 +124,8 @@ Understanding which crate owns what helps you find the right place for changes:
 | `xrpl/shamap` | SHAMap trie (state and transaction trees) |
 | `xrpl/core` | Cryptography, key derivation, signing |
 | `xrpl/resource` | Load management and resource tracking |
-| `xrpld/acquisition` | Typed coordinator, phase machine, sessions, retries and durable handoff |
-| `xrpld/app` | Application owner, bootstrap, NetworkOps, jobs, validator services |
+| `xrpld/acquisition` | Stable recovery anchor, typed phase machine, per-hash sessions, retries and durable handoff |
+| `xrpld/app` | Application owner, moving preferred-LCL policy, authoritative LCL switch, NetworkOps, jobs and validator services |
 | `xrpld/core` | Port configuration, RPC status and SQLite state utilities (`quaxar-core`) |
 | `xrpld/consensus` | XRPL consensus protocol implementation |
 | `xrpld/ledger` | Ledger state, open/closed/validated lifecycle |
@@ -161,3 +166,5 @@ Look for issues labeled `good first issue` in the issue tracker.
 - Open a GitHub Discussion for questions
 - Check [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design context
 - Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before changing runtime ownership or ledger flow
+- Preserve the shared per-flow AMM context across reverse and forward book
+  passes; candidate strands must not commit AMM iteration state unless selected

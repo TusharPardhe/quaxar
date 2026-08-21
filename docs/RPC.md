@@ -87,12 +87,16 @@ represent some values differently.
 {"method":"fetch_info","params":[{}]}
 ```
 
-`fetch_info` is admin-only and reports active acquisition state. Pair it with
-`get_counts` when diagnosing SHAMap cache or NodeStore behavior.
+`fetch_info` is admin-only. It reports the coordinator phase and recovery/LCL
+identities, per-hash sessions, completion and cancellation counters, and the
+last recovery-LCL decision. Pair it with `get_counts` when diagnosing SHAMap
+cache or NodeStore behavior.
 
 `server_state` is the NetworkOps operating mode exposed to operators. It is
 informed by, but is not identical to, the acquisition coordinator's internal
-phase; validator `proposing` is layered on top of full synchronization.
+phase; validator `proposing` is layered on top of full synchronization. Both
+are point-in-time views. Readiness requires repeated evidence that local
+closed, validated, published, and coordinator identities advance coherently.
 
 ### Account lookup
 

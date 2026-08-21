@@ -41,6 +41,12 @@ pub enum AcquisitionEvent {
         reason: AcquireReason,
     },
 
+    /// The validations adaptor needs the newest trusted-validation ledger for
+    /// preferred-ledger analysis (`GetConsL2`). This acquisition is consensus
+    /// priority, but it is deliberately phase-neutral: learning ancestry for
+    /// the validation trie is not evidence that the installed LCL diverged.
+    ValidationTarget(LedgerTarget),
+
     /// Overlay ingress admitted a decoded ledger packet with a consumed,
     /// gate-bound lease. The coordinator routes it by exact session identity
     /// and settles only its originating admission gate.

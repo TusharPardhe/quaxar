@@ -10,15 +10,17 @@ use crate::domain::flow_engine::SelfCrossCancellation;
 use crate::domain::ripple_state_helpers;
 use basics;
 use basics::{
-    base_uint::Uint256,
+    base_uint::{Uint160, Uint256},
     number::{NumberParts as RuntimeNumber, NumberRoundModeGuard, RoundingMode},
 };
 use protocol::{
-    AccountID, Amounts, Asset, MPTAmount, Quality, STAmount, STLedgerEntry, Ter,
-    get_field_by_symbol as sf,
+    AccountID, Amounts, Asset, MPTAmount, Quality, QualityFunction, QualityFunctionAmmTag,
+    QualityFunctionClobLikeTag, STAmount, STLedgerEntry, Ter, get_field_by_symbol as sf,
 };
 
-const MAX_OFFERS_TO_CONSUME: u32 = 2000;
+/// `BookStep::kMaxOffersToConsume` in rippled.  Reaching the cap marks the
+/// containing strand inactive; flow has a separate 1500-offer aggregate cap.
+pub(crate) const MAX_OFFERS_TO_CONSUME: u32 = 1000;
 const QUALITY_ONE: u32 = 1_000_000_000;
 
 /// Book: represents an order book (pair of assets to trade)
@@ -36,6 +38,76 @@ pub(crate) fn quality_satisfies_threshold(
     threshold: Option<Quality>,
 ) -> bool {
     threshold.is_none_or(|minimum| offer_quality >= minimum)
+}
+
+fn rejects_step_quality(enforce: bool, offer_quality: Quality, threshold: Option<Quality>) -> bool {
+    enforce && !quality_satisfies_threshold(offer_quality, threshold)
+}
+
+fn effective_strand_dst<'a>(
+    strand_dst: Option<&'a AccountID>,
+    taker: Option<&'a AccountID>,
+) -> Option<&'a AccountID> {
+    strand_dst.or(taker)
+}
+
+fn accepts_step_quality(first: &mut Option<Quality>, candidate: Quality) -> bool {
+    match *first {
+        Some(quality) => quality == candidate,
+        None => {
+            *first = Some(candidate);
+            true
+        }
+    }
+}
+
+fn amm_target_quality(
+    clob: Option<Quality>,
+    threshold: Option<Quality>,
+    fix_ammv1_1: bool,
+    multi_path: bool,
+) -> Option<Quality> {
+    match (clob, threshold) {
+        (Some(tip), Some(limit)) if fix_ammv1_1 && !multi_path && limit > tip => None,
+        (tip, _) => tip,
+    }
+}
+
+fn is_self_crossing_offer(
+    owner_pays_transfer_fee: bool,
+    remove_self_crossing: bool,
+    taker: Option<&AccountID>,
+    owner: &AccountID,
+) -> bool {
+    owner_pays_transfer_fee && remove_self_crossing && taker.is_some_and(|taker| taker == owner)
+}
+
+fn offer_owner_authorized<V: ApplyView>(view: &V, asset: &Asset, owner: &AccountID) -> bool {
+    match asset {
+        Asset::Issue(issue) if issue.native() || issue.issuer() == *owner => true,
+        Asset::Issue(issue) => {
+            let issuer_id =
+                Uint160::from_slice(issue.issuer().data()).expect("account width should match");
+            let Ok(Some(issuer)) = view.read(protocol::account_keylet(issuer_id)) else {
+                return false;
+            };
+            if !issuer.is_flag(protocol::lsfRequireAuth) {
+                return true;
+            }
+            let Ok(Some(line)) = view.read(protocol::line(*owner, issue.issuer(), issue.currency))
+            else {
+                return false;
+            };
+            let flag = if *owner > issue.issuer() {
+                protocol::lsfLowAuth
+            } else {
+                protocol::lsfHighAuth
+            };
+            line.is_flag(flag)
+        }
+        Asset::MPTIssue(issue) => crate::mptoken_helpers::require_auth_mpt(view, issue, owner)
+            .is_ok_and(|ter| ter == Ter::TES_SUCCESS),
+    }
 }
 
 /// Result of consuming offers from a book
@@ -59,6 +131,15 @@ pub struct BookStepOptions<'a> {
     /// Cancellation-only accumulator for eligible direct self-cross offers.
     /// It is intentionally separate from the value-flow sandbox.
     pub self_cross_cancellation: Option<SelfCrossCancellation>,
+    pub amm_context: Option<crate::domain::flow_engine::AmmContext>,
+    /// rippled's debt direction of the preceding strand step.
+    pub previous_redeems: bool,
+    /// Actual strand endpoint used by BookStep::rate. This is distinct from
+    /// the transaction/taker account used for AMM auction fees and self-cross.
+    pub strand_dst: Option<&'a AccountID>,
+    pub strand_deliver: Option<Asset>,
+    /// BookOfferCrossingStep checks its local threshold only on default path.
+    pub enforce_quality_threshold: bool,
 }
 
 /// Execute a book step using the historical call signature. New flow code
@@ -84,6 +165,11 @@ pub fn execute_book_step<V: ApplyView>(
             quality_threshold,
             remove_self_crossing: false,
             self_cross_cancellation: None,
+            amm_context: None,
+            previous_redeems: false,
+            strand_dst: taker,
+            strand_deliver: Some(max_out.asset()),
+            enforce_quality_threshold: true,
         },
     )
 }
@@ -102,6 +188,9 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     let quality_threshold = options.quality_threshold;
     let remove_self_crossing = options.remove_self_crossing;
     let self_cross_cancellation = options.self_cross_cancellation;
+    let amm_context = options.amm_context.unwrap_or_else(|| {
+        crate::domain::flow_engine::AmmContext::new(taker.copied().unwrap_or_default(), false)
+    });
     let mut total_in = max_in.zeroed();
     let mut total_out = max_out.zeroed();
     let mut offers_consumed: u32 = 0;
@@ -134,45 +223,42 @@ pub fn execute_book_step_with_options<V: ApplyView>(
         };
     }
 
-    let strand_deliver = max_out.asset();
-    let tr_in = if owner_pays_transfer_fee {
-        transfer_rate_for_asset(view, book.r#in, taker, strand_deliver)
+    let strand_dst = effective_strand_dst(options.strand_dst, taker);
+    let strand_deliver = options.strand_deliver.unwrap_or_else(|| max_out.asset());
+    let tr_in = if options.previous_redeems {
+        transfer_rate_for_asset(view, book.r#in, strand_dst, strand_deliver)
     } else {
         QUALITY_ONE
     };
     let tr_out = if owner_pays_transfer_fee {
-        transfer_rate_for_asset(view, book.out, taker, strand_deliver)
+        transfer_rate_for_asset(view, book.out, strand_dst, strand_deliver)
     } else {
         QUALITY_ONE
     };
 
     // Iterate offers in the book directory
     // We use get_book_offers which reads from the offer directory.
-    let offers = get_book_offers(view, book, MAX_OFFERS_TO_CONSUME);
+    let raw_offers = get_book_offers(view, book, MAX_OFFERS_TO_CONSUME);
 
-    // A BookStep consumes one quality directory per call, as in rippled's
-    // FlowOfferStream. This applies to payments as well as OfferCreate.
-    let mut first_quality: Option<Quality> = None;
-    let mut offer_attempted = false;
-
-    for offer_sle in offers {
-        if offers_consumed >= MAX_OFFERS_TO_CONSUME || remaining_in.signum() <= 0 {
-            break;
+    // FlowOfferStream removes malformed, unauthorized-domain and unfunded
+    // entries before exposing tip(). Do the same discovery cleanup before
+    // asking AMMLiquidity to compete with that tip. Stop discovery at the
+    // first valid offer: later entries must not be cleaned if AMM execution
+    // ends this step before FlowOfferStream advances to them.
+    let mut offers = Vec::with_capacity(raw_offers.len());
+    let mut found_tip = false;
+    for offer_sle in raw_offers {
+        if found_tip {
+            offers.push(offer_sle);
+            continue;
         }
-
-        let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
         let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
         let taker_gets = offer_sle.get_field_amount(sf("sfTakerGets"));
-
         if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
             remove_consumed_offer(view, &offer_sle);
             offers_consumed += 1;
             continue;
         }
-
-        // Post-fixCleanup3_3_0: only validate domain membership when walking a
-        // domain book. Hybrid offers in the open book are not evicted on
-        // credential expiry. Pre-fix: always validate.
         if offer_sle.is_field_present(sf("sfDomainID"))
             && (!view.rules().enabled(&protocol::fix_cleanup_3_3_0()) || book.domain.is_some())
         {
@@ -189,35 +275,146 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 continue;
             }
         }
+        let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
+        if get_owner_funds(view, &offer_owner, &book.out).signum() <= 0 {
+            remove_consumed_offer(view, &offer_sle);
+            offers_consumed += 1;
+            continue;
+        }
+        found_tip = true;
+        offers.push(offer_sle);
+    }
 
-        // The Book stores offer fields as TakerPays/TakerGets. In this
-        // strand direction, `Quality::from_amounts` must receive that raw
-        // pair (in=TakerPays, out=TakerGets) so its encoded comparison is
-        // on the same scale as OfferCreate's `Quality{takerAmount.out,
-        // sendMax}` threshold. Swapping them makes the reciprocal quality
-        // and admits offers that are worse than the taker's limit.
-        let offer_quality =
-            Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
-        if let Some(first) = first_quality {
-            if offer_quality != first {
+    // A BookStep consumes one quality directory per call, as in rippled's
+    // FlowOfferStream. This applies to payments as well as OfferCreate.
+    let mut first_quality: Option<Quality> = None;
+    let mut offer_attempted = false;
+
+    // rippled tries AMM liquidity before the cleaned CLOB tip. The AMM offer
+    // establishes the one-quality-per-step boundary just like a real offer.
+    // Domain books never use AMM liquidity.
+    let clob_tip = offers.first().map(|offer| {
+        Quality::from_amounts(&Amounts::new(
+            offer.get_field_amount(sf("sfTakerPays")),
+            offer.get_field_amount(sf("sfTakerGets")),
+        ))
+    });
+    let amm_generation_quality = amm_target_quality(
+        clob_tip,
+        quality_threshold,
+        view.rules().enabled(&protocol::fix_ammv1_1()),
+        amm_context.multi_path(),
+    );
+    let mut stop_before_clob = false;
+    if book.domain.is_none()
+        && remaining_in.signum() > 0
+        && total_out < *max_out
+        && let Some(amm_offer) = get_amm_offer(view, book, amm_generation_quality, &amm_context)
+    {
+        first_quality = Some(amm_offer.quality());
+        if rejects_step_quality(
+            options.enforce_quality_threshold,
+            amm_offer.quality(),
+            quality_threshold,
+        ) {
+            stop_before_clob = true;
+        } else {
+            let remaining_out = max_out.clone() - total_out.clone();
+            let raw_in_limit = mul_ratio_amount(&remaining_in, QUALITY_ONE, tr_in, false);
+            if let Some((amm_pays, amm_gets)) = amm_offer.limit(&raw_in_limit, &remaining_out) {
+                let step_in = mul_ratio_amount(&amm_pays, tr_in, QUALITY_ONE, true);
+                if !amm_offer_invariant_holds(&amm_offer, &amm_pays, &amm_gets) {
+                    tracing::warn!(
+                        target: "ledger",
+                        "[book_step] AMM pool product invariant failed"
+                    );
+                    if amm_invariant_failure_is_fatal(
+                        false,
+                        view.rules()
+                            .enabled(&protocol::feature_id("fixAMMOverflowOffer")),
+                    ) {
+                        return BookStepResult {
+                            amount_in: total_in,
+                            amount_out: total_out,
+                            offers_consumed,
+                            ter: Ter::TEC_INVARIANT_FAILED,
+                        };
+                    }
+                }
+                let res = execute_amm_trade(
+                    view,
+                    &amm_offer.account,
+                    &book.r#in,
+                    &book.out,
+                    &amm_pays,
+                    &amm_gets,
+                );
+                if res == Ter::TES_SUCCESS {
+                    amm_context.set_amm_used();
+                    total_in += step_in.clone();
+                    total_out += amm_gets;
+                    remaining_in -= step_in;
+                    offer_attempted = true;
+                } else {
+                    stop_before_clob = true;
+                }
+            } else {
+                stop_before_clob = true;
+            }
+        }
+    }
+
+    if !stop_before_clob {
+        for offer_sle in offers {
+            if offers_consumed >= MAX_OFFERS_TO_CONSUME || remaining_in.signum() <= 0 {
                 break;
             }
-        } else {
-            first_quality = Some(offer_quality);
-        }
-        if !quality_satisfies_threshold(offer_quality, quality_threshold) {
-            break;
-        }
 
-        // A direct OfferCreate crossing deletes the taker's own executable
-        // tip offer. Explicit paths and normal payments merely skip it. If no
-        // real offer has been attempted yet, deleting the self offer allows
-        // the stream to advance to the next quality directory, matching
-        // BookOfferCrossingStep::limitSelfCrossQuality.
-        if let Some(taker_account) = taker
-            && offer_owner == *taker_account
-        {
-            if owner_pays_transfer_fee && remove_self_crossing {
+            let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
+            let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
+            let taker_gets = offer_sle.get_field_amount(sf("sfTakerGets"));
+
+            if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
+                remove_consumed_offer(view, &offer_sle);
+                offers_consumed += 1;
+                continue;
+            }
+
+            if offer_sle.is_field_present(sf("sfDomainID"))
+                && (!view.rules().enabled(&protocol::fix_cleanup_3_3_0()) || book.domain.is_some())
+            {
+                let offer_domain = offer_sle.get_field_h256(sf("sfDomainID"));
+                if !crate::permissioned_dex_helpers::offer_in_domain(
+                    &*view,
+                    offer_sle.key(),
+                    &offer_domain,
+                )
+                .unwrap_or(false)
+                {
+                    remove_consumed_offer(view, &offer_sle);
+                    offers_consumed += 1;
+                    continue;
+                }
+            }
+
+            // The Book stores offer fields as TakerPays/TakerGets. In this
+            // strand direction, `Quality::from_amounts` must receive that raw
+            // pair (in=TakerPays, out=TakerGets) so its encoded comparison is
+            // on the same scale as OfferCreate's `Quality{takerAmount.out,
+            // sendMax}` threshold. Swapping them makes the reciprocal quality
+            // and admits offers that are worse than the taker's limit.
+            // Only direct OfferCreate crossing treats the taker's own offer as
+            // self-crossing. BookPaymentStep consumes a taker-owned offer just
+            // like any other offer; its transfer-fee policy is independent. If no
+            // real offer has been attempted yet, deleting the self offer allows
+            // the stream to advance to the next quality directory, matching
+            // BookOfferCrossingStep::limitSelfCrossQuality.
+            if is_self_crossing_offer(
+                owner_pays_transfer_fee,
+                remove_self_crossing,
+                taker,
+                &offer_owner,
+            ) {
                 // Do not remove through this value-flow sandbox. The caller
                 // applies the recorded key with offer_helpers::offer_delete
                 // even when this strand later proves dry.
@@ -227,128 +424,105 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 if !offer_attempted {
                     first_quality = None;
                 }
+                offers_consumed += 1;
+                continue;
             }
-            offers_consumed += 1;
-            continue;
-        }
 
-        // Check offer owner's funding
-        let owner_funds = get_owner_funds(view, &offer_owner, &book.out);
-        if owner_funds.signum() <= 0 {
-            remove_consumed_offer(view, &offer_sle);
-            offers_consumed += 1;
-            continue;
-        }
-
-        offer_attempted = true;
-
-        // Compute consumption amounts with transfer rates (reference forEachOffer parity).
-        // A reverse BookStep must limit the final offer by the outstanding
-        // requested output before it derives the required input. See
-        // rippled BookStep.cpp `limitStepOut` and `revImp`.
-        let remaining_out = max_out.clone() - total_out.clone();
-        let consumption = compute_offer_consumption(
-            &remaining_in,
-            &remaining_out,
-            &taker_pays,
-            &taker_gets,
-            &owner_funds,
-            tr_in,
-            tr_out,
-        );
-
-        if consumption.step_in.signum() <= 0 || consumption.step_out.signum() <= 0 {
-            break;
-        }
-
-        // Execute trade: transfer assets between offer owner and issuers
-        //   offer.send(sb, book_.in.getIssuer(), offer.owner(), ofrAmt.in) — owner receives offer input
-        //   offer.send(sb, offer.owner(), book_.out.getIssuer(), ownerGives) — owner pays ownerGives
-        let res = execute_offer_trade(
-            view,
-            &offer_owner,
-            &book.r#in,
-            &book.out,
-            &consumption.offer_in,
-            &consumption.owner_gives,
-        );
-        if res != Ter::TES_SUCCESS {
-            remove_consumed_offer(view, &offer_sle);
-            offers_consumed += 1;
-            continue;
-        }
-
-        // Update or remove the offer — reference offer.consume(sb, ofrAmt)
-        let new_pays = taker_pays - consumption.offer_in.clone();
-        let new_gets = taker_gets - consumption.offer_out.clone();
-        if new_pays.signum() <= 0 || new_gets.signum() <= 0 {
-            remove_consumed_offer(view, &offer_sle);
-        } else {
-            let mut obj = offer_sle.clone_as_object();
-            obj.set_field_amount(sf("sfTakerPays"), new_pays);
-            obj.set_field_amount(sf("sfTakerGets"), new_gets);
-            let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
-                obj,
-                *offer_sle.key(),
-            )));
-        }
-
-        total_in += consumption.step_in.clone();
-        total_out += consumption.step_out.clone();
-        remaining_in -= consumption.step_in;
-        offers_consumed += 1;
-    }
-
-    // If an AMM exists for this book and provides liquidity, use it.
-    // The AMM uses the constant product formula (x*y=k).
-    // We check AMM after CLOB: if CLOB already delivered enough, skip AMM.
-    //
-    // reference: rippled's AMMLiquidity/AMMOffer (xrpl/tx/paths/AMMLiquidity.cpp,
-    // AMMOffer.cpp) present the AMM to BookStep as a quality-bound synthetic
-    // offer subject to the SAME qualityUpperBound/threshold enforcement as a
-    // real order-book offer. An OfferCreate's quality_threshold must reject
-    // AMM liquidity whose effective quality is worse than the taker's own
-    // offer, exactly like it rejects a too-poor CLOB offer above. Without
-    // this gate, an OfferCreate that crosses nothing on a real (correctly
-    // rippled-matching) network can still drain funds against a deep AMM
-    // pool that the taker's own quality should have excluded.
-    if remaining_in.signum() > 0 && total_out < *max_out {
-        let remaining_out = max_out.clone() - total_out.clone();
-        if let Some((amm_account, amm_pays, amm_gets, _fee)) =
-            get_amm_offer(view, book, &remaining_in, &remaining_out)
-            && amm_pays.signum() > 0
-            && amm_gets.signum() > 0
-        {
-            let amm_quality_ok = match quality_threshold {
-                Some(threshold) => {
-                    // `amm_pays` is what the taker sends (Book input) and
-                    // `amm_gets` is what the taker receives (Book output).
-                    // This must use the same raw (input, output) orientation
-                    // as the CLOB offer-quality comparison above. Reversing
-                    // these operands takes the reciprocal quality and can
-                    // admit an AMM whose effective rate is far worse than an
-                    // OfferCreate limit; reverse probing then attempts an
-                    // oversized native-asset trade.
-                    Quality::from_amounts(&Amounts::new(amm_pays.clone(), amm_gets.clone()))
-                        >= threshold
+            // FlowOfferStream validates the owner against the input asset
+            // before BookStep applies the raw-quality gate. An invalid tip is
+            // permanently cleaned and, if nothing was attempted, permits the
+            // next quality directory to become the tip.
+            if !offer_owner_authorized(view, &book.r#in, &offer_owner) {
+                remove_consumed_offer(view, &offer_sle);
+                if !offer_attempted {
+                    first_quality = None;
                 }
-                None => true,
-            };
-            if amm_quality_ok {
-                // Execute AMM trade: taker sends amm_pays, receives amm_gets
-                let res = execute_amm_trade(
-                    view,
-                    &amm_account,
-                    &book.r#in,
-                    &book.out,
-                    &amm_pays,
-                    &amm_gets,
-                );
-                if res == Ter::TES_SUCCESS {
-                    total_in += amm_pays;
-                    total_out += amm_gets;
-                }
+                offers_consumed += 1;
+                continue;
             }
+
+            // The first tip was funded during discovery; later tips are checked
+            // only when FlowOfferStream-equivalent iteration reaches them.
+            let owner_funds = get_owner_funds(view, &offer_owner, &book.out);
+            if owner_funds.signum() <= 0 {
+                remove_consumed_offer(view, &offer_sle);
+                if !offer_attempted {
+                    first_quality = None;
+                }
+                offers_consumed += 1;
+                continue;
+            }
+
+            let offer_quality =
+                Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
+            if !accepts_step_quality(&mut first_quality, offer_quality) {
+                break;
+            }
+            if rejects_step_quality(
+                options.enforce_quality_threshold,
+                offer_quality,
+                quality_threshold,
+            ) {
+                break;
+            }
+
+            offer_attempted = true;
+
+            // Compute consumption amounts with transfer rates (reference forEachOffer parity).
+            // A reverse BookStep must limit the final offer by the outstanding
+            // requested output before it derives the required input. See
+            // rippled BookStep.cpp `limitStepOut` and `revImp`.
+            let remaining_out = max_out.clone() - total_out.clone();
+            let consumption = compute_offer_consumption(
+                &remaining_in,
+                &remaining_out,
+                &taker_pays,
+                &taker_gets,
+                &owner_funds,
+                tr_in,
+                tr_out,
+            );
+
+            if consumption.step_in.signum() <= 0 || consumption.step_out.signum() <= 0 {
+                break;
+            }
+
+            // Execute trade: transfer assets between offer owner and issuers
+            //   offer.send(sb, book_.in.getIssuer(), offer.owner(), ofrAmt.in) — owner receives offer input
+            //   offer.send(sb, offer.owner(), book_.out.getIssuer(), ownerGives) — owner pays ownerGives
+            let res = execute_offer_trade(
+                view,
+                &offer_owner,
+                &book.r#in,
+                &book.out,
+                &consumption.offer_in,
+                &consumption.owner_gives,
+            );
+            if res != Ter::TES_SUCCESS {
+                remove_consumed_offer(view, &offer_sle);
+                offers_consumed += 1;
+                continue;
+            }
+
+            // Update or remove the offer — reference offer.consume(sb, ofrAmt)
+            let new_pays = taker_pays - consumption.offer_in.clone();
+            let new_gets = taker_gets - consumption.offer_out.clone();
+            if new_pays.signum() <= 0 || new_gets.signum() <= 0 {
+                remove_consumed_offer(view, &offer_sle);
+            } else {
+                let mut obj = offer_sle.clone_as_object();
+                obj.set_field_amount(sf("sfTakerPays"), new_pays);
+                obj.set_field_amount(sf("sfTakerGets"), new_gets);
+                let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+                    obj,
+                    *offer_sle.key(),
+                )));
+            }
+
+            total_in += consumption.step_in.clone();
+            total_out += consumption.step_out.clone();
+            remaining_in -= consumption.step_in;
+            offers_consumed += 1;
         }
     }
 
@@ -522,112 +696,754 @@ fn amm_swap_asset_out(
     number_to_amount(pool_in_amount.asset(), swap_in, RoundingMode::Upward)
 }
 
-/// Returns (amm_account, amm_taker_pays, amm_taker_gets, trading_fee) or None.
+/// rippled presents AMM liquidity to BookStep as a synthetic `AMMOffer`.
+/// With no CLOB tip, `AMMLiquidity::getOffer` returns `maxOffer`: 99% of the
+/// output pool and the input required to buy it. BookStep checks that
+/// synthetic offer's pool spot quality before `limitStepIn`/`limitStepOut`
+/// reduce it to the caller's requested amounts. A CLOB-targeted offer instead
+/// carries the generated amounts' quality.
+#[derive(Clone)]
+struct SyntheticAmmOffer {
+    account: AccountID,
+    pool_in: STAmount,
+    pool_out: STAmount,
+    amount_in: STAmount,
+    amount_out: STAmount,
+    quality: Quality,
+    trading_fee: u16,
+    amm_rounding_enabled: bool,
+    multi_path: bool,
+    fix_reduced_offers_v2: bool,
+}
+
+impl SyntheticAmmOffer {
+    fn quality(&self) -> Quality {
+        self.quality
+    }
+
+    fn limit(&self, max_in: &STAmount, max_out: &STAmount) -> Option<(STAmount, STAmount)> {
+        let (mut amount_in, mut amount_out) = (self.amount_in.clone(), self.amount_out.clone());
+
+        if amount_out > *max_out {
+            if self.multi_path {
+                let limited = self.quality.ceil_out_strict(
+                    &Amounts::new(amount_in, amount_out),
+                    max_out,
+                    true,
+                );
+                amount_in = limited.r#in;
+                amount_out = limited.out;
+            } else {
+                amount_out = max_out.clone();
+                amount_in = amm_swap_asset_out(
+                    &self.pool_in,
+                    &self.pool_out,
+                    &amount_out,
+                    self.trading_fee,
+                    self.amm_rounding_enabled,
+                )?;
+            }
+        }
+        if amount_in > *max_in {
+            if self.multi_path {
+                let amounts = Amounts::new(amount_in, amount_out);
+                let limited = if self.fix_reduced_offers_v2 {
+                    self.quality.ceil_in_strict(&amounts, max_in, false)
+                } else {
+                    self.quality.ceil_in(&amounts, max_in)
+                };
+                amount_in = limited.r#in;
+                amount_out = limited.out;
+            } else {
+                amount_in = max_in.clone();
+                amount_out = amm_swap_asset_in(
+                    &self.pool_in,
+                    &self.pool_out,
+                    &amount_in,
+                    self.trading_fee,
+                    self.amm_rounding_enabled,
+                )?;
+            }
+        }
+
+        (amount_in.signum() > 0 && amount_out.signum() > 0).then_some((amount_in, amount_out))
+    }
+}
+
+fn amm_offer_invariant_holds(
+    offer: &SyntheticAmmOffer,
+    consumed_in: &STAmount,
+    consumed_out: &STAmount,
+) -> bool {
+    if *consumed_in > offer.amount_in || *consumed_out > offer.amount_out {
+        return false;
+    }
+    let old = crate::domain::amm_helpers::stamount_as_number(&offer.pool_in)
+        * crate::domain::amm_helpers::stamount_as_number(&offer.pool_out);
+    let new = (crate::domain::amm_helpers::stamount_as_number(&offer.pool_in)
+        + crate::domain::amm_helpers::stamount_as_number(consumed_in))
+        * (crate::domain::amm_helpers::stamount_as_number(&offer.pool_out)
+            - crate::domain::amm_helpers::stamount_as_number(consumed_out));
+    new >= old
+        || crate::domain::amm_helpers::within_relative_distance_amount(
+            new,
+            old,
+            RuntimeNumber::from_i64_and_exponent(1, -7),
+        )
+}
+
+fn amm_invariant_failure_is_fatal(invariant_holds: bool, fix_enabled: bool) -> bool {
+    !invariant_holds && fix_enabled
+}
+
+fn amm_max_output(pool_out: &STAmount) -> Option<STAmount> {
+    let max_out = {
+        let _rounding = NumberRoundModeGuard::new(RoundingMode::Downward);
+        crate::domain::amm_helpers::stamount_as_number(pool_out)
+            * RuntimeNumber::from_i64_and_exponent(99, -2)
+    };
+    number_to_amount(pool_out.asset(), max_out, RoundingMode::Downward)
+        .filter(|amount| amount.signum() > 0 && amount < pool_out)
+}
+
+fn amm_max_offer_amounts(
+    pool_in: &STAmount,
+    pool_out: &STAmount,
+    trading_fee: u16,
+    amm_rounding_enabled: bool,
+    fix_overflow_offer: bool,
+) -> Option<(STAmount, STAmount)> {
+    if fix_overflow_offer {
+        let out = amm_max_output(pool_out)?;
+        let input = amm_swap_asset_out(pool_in, pool_out, &out, trading_fee, amm_rounding_enabled)?;
+        Some((input, out))
+    } else {
+        let input = protocol::to_max_amount::<STAmount>(pool_in.asset());
+        let out = amm_swap_asset_in(pool_in, pool_out, &input, trading_fee, amm_rounding_enabled)?;
+        Some((input, out))
+    }
+}
+
+fn amm_trading_fee(
+    parent_close_time: u64,
+    amm_sle: &STLedgerEntry,
+    account: Option<&AccountID>,
+) -> u16 {
+    if let Some(account) = account
+        && amm_sle.is_field_present(sf("sfAuctionSlot"))
+    {
+        let slot = amm_sle.get_field_object(sf("sfAuctionSlot"));
+        let expiration = u64::from(slot.get_field_u32(sf("sfExpiration")));
+        if parent_close_time < expiration {
+            let owns_slot = slot.get_account_id(sf("sfAccount")) == *account;
+            let is_authorized = slot.is_field_present(sf("sfAuthAccounts"))
+                && slot
+                    .get_field_array(sf("sfAuthAccounts"))
+                    .iter()
+                    .any(|entry| entry.get_account_id(sf("sfAccount")) == *account);
+            if owns_slot || is_authorized {
+                return slot.get_field_u16(sf("sfDiscountedFee"));
+            }
+        }
+    }
+    amm_sle.get_field_u16(sf("sfTradingFee"))
+}
+
+fn reduce_amm_offer(amount: RuntimeNumber) -> RuntimeNumber {
+    let _rounding = NumberRoundModeGuard::new(RoundingMode::TowardsZero);
+    amount * RuntimeNumber::from_i64_and_exponent(9_999, -4)
+}
+
+fn amm_offer_starting_with_gets(
+    pool_in: &STAmount,
+    pool_out: &STAmount,
+    target: Quality,
+    trading_fee: u16,
+    amm_rounding_enabled: bool,
+) -> Option<(STAmount, STAmount)> {
+    let q = crate::domain::amm_helpers::stamount_as_number(&target.rate());
+    if q == RuntimeNumber::zero() {
+        return None;
+    }
+    let _rounding = NumberRoundModeGuard::new(RoundingMode::ToNearest);
+    let one = RuntimeNumber::from_i64_and_exponent(1, 0);
+    let two = RuntimeNumber::from_i64_and_exponent(2, 0);
+    let pool_in_n = crate::domain::amm_helpers::stamount_as_number(pool_in);
+    let pool_out_n = crate::domain::amm_helpers::stamount_as_number(pool_out);
+    let fee_mult = protocol::fee_mult(trading_fee);
+    let b = pool_in_n * (one - one / fee_mult) / q - two * pool_out_n;
+    let c = pool_out_n * pool_out_n - (pool_in_n * pool_out_n) / q;
+    let mut proposed = crate::domain::amm_helpers::solve_quadratic_eq_smallest(one, b, c)?;
+    if proposed <= RuntimeNumber::zero() {
+        return None;
+    }
+    let constraint = pool_out_n - pool_in_n / (q * fee_mult);
+    if constraint <= RuntimeNumber::zero() {
+        return None;
+    }
+    if constraint < proposed {
+        proposed = constraint;
+    }
+
+    let amounts = |out_number| {
+        let out = number_to_amount(pool_out.asset(), out_number, RoundingMode::Downward)?;
+        let input = amm_swap_asset_out(pool_in, pool_out, &out, trading_fee, amm_rounding_enabled)?;
+        Some((input, out))
+    };
+    let mut result = amounts(proposed)?;
+    if Quality::from_amounts(&Amounts::new(result.0.clone(), result.1.clone())) < target {
+        result = amounts(reduce_amm_offer(
+            crate::domain::amm_helpers::stamount_as_number(&result.1),
+        ))?;
+    }
+    Some(result)
+}
+
+fn amm_offer_starting_with_pays(
+    pool_in: &STAmount,
+    pool_out: &STAmount,
+    target: Quality,
+    trading_fee: u16,
+    amm_rounding_enabled: bool,
+) -> Option<(STAmount, STAmount)> {
+    let q = crate::domain::amm_helpers::stamount_as_number(&target.rate());
+    if q == RuntimeNumber::zero() {
+        return None;
+    }
+    let _rounding = NumberRoundModeGuard::new(RoundingMode::ToNearest);
+    let one = RuntimeNumber::from_i64_and_exponent(1, 0);
+    let pool_in_n = crate::domain::amm_helpers::stamount_as_number(pool_in);
+    let pool_out_n = crate::domain::amm_helpers::stamount_as_number(pool_out);
+    let fee_mult = protocol::fee_mult(trading_fee);
+    let b = pool_in_n * (one + fee_mult);
+    let c = pool_in_n * pool_in_n - pool_in_n * pool_out_n * q;
+    let mut proposed = crate::domain::amm_helpers::solve_quadratic_eq_smallest(fee_mult, b, c)?;
+    if proposed <= RuntimeNumber::zero() {
+        return None;
+    }
+    let constraint = pool_out_n * q - pool_in_n / fee_mult;
+    if constraint <= RuntimeNumber::zero() {
+        return None;
+    }
+    if constraint < proposed {
+        proposed = constraint;
+    }
+
+    let amounts = |in_number| {
+        let input = number_to_amount(pool_in.asset(), in_number, RoundingMode::Downward)?;
+        let out = amm_swap_asset_in(pool_in, pool_out, &input, trading_fee, amm_rounding_enabled)?;
+        Some((input, out))
+    };
+    let mut result = amounts(proposed)?;
+    if Quality::from_amounts(&Amounts::new(result.0.clone(), result.1.clone())) < target {
+        result = amounts(reduce_amm_offer(
+            crate::domain::amm_helpers::stamount_as_number(&result.0),
+        ))?;
+    }
+    Some(result)
+}
+
+fn amm_offer_for_clob_quality(
+    pool_in: &STAmount,
+    pool_out: &STAmount,
+    target: Quality,
+    trading_fee: u16,
+    amm_rounding_enabled: bool,
+) -> Option<(STAmount, STAmount)> {
+    // Legacy changeSpotPriceQuality calculates takerPays first and permits a
+    // 1e-7 quality-distance rounding tolerance.
+    if !amm_rounding_enabled {
+        let q = crate::domain::amm_helpers::stamount_as_number(&target.rate());
+        if q == RuntimeNumber::zero() {
+            return None;
+        }
+        let _rounding = NumberRoundModeGuard::new(RoundingMode::ToNearest);
+        let one = RuntimeNumber::from_i64_and_exponent(1, 0);
+        let pool_in_n = crate::domain::amm_helpers::stamount_as_number(pool_in);
+        let pool_out_n = crate::domain::amm_helpers::stamount_as_number(pool_out);
+        let fee_mult = protocol::fee_mult(trading_fee);
+        let b = pool_in_n * (one + fee_mult);
+        let c = pool_in_n * pool_in_n - pool_in_n * pool_out_n * q;
+        let mut proposed = crate::domain::amm_helpers::solve_quadratic_eq_smallest(fee_mult, b, c)?;
+        let constraint = pool_out_n * q - pool_in_n / fee_mult;
+        if proposed > constraint {
+            proposed = constraint;
+        }
+        if proposed <= RuntimeNumber::zero() {
+            return None;
+        }
+        let input = number_to_amount(pool_in.asset(), proposed, RoundingMode::Upward)?;
+        let out = amm_swap_asset_in(pool_in, pool_out, &input, trading_fee, false)?;
+        let quality = Quality::from_amounts(&Amounts::new(input.clone(), out.clone()));
+        return (quality >= target
+            || crate::domain::amm_helpers::within_relative_distance_quality(
+                quality,
+                target,
+                RuntimeNumber::from_i64_and_exponent(1, -7),
+            ))
+        .then_some((input, out));
+    }
+
+    let result = if pool_out.asset().integral()
+        && (!pool_in.asset().integral()
+            || crate::domain::amm_helpers::stamount_as_number(&target.rate())
+                >= RuntimeNumber::from_i64_and_exponent(1, 0))
+    {
+        amm_offer_starting_with_gets(pool_in, pool_out, target, trading_fee, amm_rounding_enabled)
+    } else {
+        amm_offer_starting_with_pays(pool_in, pool_out, target, trading_fee, amm_rounding_enabled)
+    }?;
+    (Quality::from_amounts(&Amounts::new(result.0.clone(), result.1.clone())) >= target)
+        .then_some(result)
+}
+
+const AMM_FIBONACCI: [u32; 30] = [
+    1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1_597, 2_584, 4_181, 6_765, 10_946,
+    17_711, 28_657, 46_368, 75_025, 121_393, 196_418, 317_811, 514_229, 832_040, 1_346_269,
+];
+
+fn generate_fibonacci_amm_offer(
+    initial_in: &STAmount,
+    initial_out: &STAmount,
+    current_in: &STAmount,
+    current_out: &STAmount,
+    trading_fee: u16,
+    amm_rounding_enabled: bool,
+    iteration: u16,
+) -> Option<(STAmount, STAmount)> {
+    if iteration as usize >= AMM_FIBONACCI.len() {
+        return None;
+    }
+    let initial_input_number = {
+        let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
+        crate::domain::amm_helpers::stamount_as_number(initial_in)
+            * RuntimeNumber::from_i64_and_exponent(5, 0)
+            / RuntimeNumber::from_i64_and_exponent(20_000, 0)
+    };
+    let initial_input = number_to_amount(
+        initial_in.asset(),
+        initial_input_number,
+        RoundingMode::Upward,
+    )?;
+    let initial_output = amm_swap_asset_in(
+        initial_in,
+        initial_out,
+        &initial_input,
+        trading_fee,
+        amm_rounding_enabled,
+    )?;
+    if iteration == 0 {
+        return Some((initial_input, initial_output));
+    }
+
+    let output_number = {
+        let _rounding = NumberRoundModeGuard::new(RoundingMode::Downward);
+        crate::domain::amm_helpers::stamount_as_number(&initial_output)
+            * RuntimeNumber::from_i64_and_exponent(
+                i64::from(AMM_FIBONACCI[usize::from(iteration - 1)]),
+                0,
+            )
+    };
+    let output = number_to_amount(current_out.asset(), output_number, RoundingMode::Downward)?;
+    if output >= *current_out {
+        return None;
+    }
+    let input = amm_swap_asset_out(
+        current_in,
+        current_out,
+        &output,
+        trading_fee,
+        amm_rounding_enabled,
+    )?;
+    Some((input, output))
+}
+
+/// Returns rippled's unlimited `AMMLiquidity::maxOffer`, before BookStep
+/// applies the transaction's input and output limits.
 fn get_amm_offer<V: ApplyView>(
     view: &mut V,
     book: &Book,
-    max_in: &STAmount,
-    max_out: &STAmount,
-) -> Option<(AccountID, STAmount, STAmount, u16)> {
+    clob_quality: Option<Quality>,
+    amm_context: &crate::domain::flow_engine::AmmContext,
+) -> Option<SyntheticAmmOffer> {
+    if amm_context.max_iterations_reached() {
+        return None;
+    }
     // Find AMM SLE for this book
     let amm_keylet = protocol::amm(book.r#in, book.out);
     let amm_sle = view.read(amm_keylet).ok()??;
+
+    // An empty AMM object is not a source of synthetic liquidity.
+    if amm_sle.get_field_amount(sf("sfLPTokenBalance")).signum() <= 0 {
+        return None;
+    }
 
     // Get AMM account
     let amm_account = amm_sle.get_account_id(sf("sfAccount"));
 
     // Get trading fee
-    let trading_fee = amm_sle.get_field_u16(sf("sfTradingFee"));
+    let fee_account = amm_context.account();
+    let trading_fee = amm_trading_fee(
+        u64::from(view.header().parent_close_time),
+        &amm_sle,
+        Some(&fee_account),
+    );
 
-    // Get pool balances using credit_balance (handles trust line direction correctly)
-    let pool_in_amount = if book.r#in.native() {
-        // XRP: read AMM account balance
-        let acct_kl =
-            protocol::account_keylet(basics::base_uint::Uint160::from_void(amm_account.data()));
-        let acct_sle = view.read(acct_kl).ok()??;
-        acct_sle.get_field_amount(sf("sfBalance"))
-    } else if let Asset::MPTIssue(issue) = book.r#in {
-        let token = view
-            .read(protocol::mptoken_keylet_from_mptid(
-                issue.mpt_id(),
-                basics::base_uint::Uint160::from_void(amm_account.data()),
-            ))
-            .ok()??;
-        STAmount::from_mpt_amount(
-            sf("sfAmount"),
-            MPTAmount::from_value(token.get_field_u64(sf("sfMPTAmount")) as i64),
-            issue,
-        )
-    } else {
-        let Asset::Issue(issue) = book.r#in else {
-            unreachable!("handled above");
-        };
-        // IOU: credit_balance returns what AMM holds (positive = AMM holds)
-        ripple_state_helpers::credit_balance(view, &amm_account, &issue.account, issue.currency)
-    };
-
-    let pool_out_amount = if book.out.native() {
-        let acct_kl =
-            protocol::account_keylet(basics::base_uint::Uint160::from_void(amm_account.data()));
-        let acct_sle = view.read(acct_kl).ok()??;
-        acct_sle.get_field_amount(sf("sfBalance"))
-    } else if let Asset::MPTIssue(issue) = book.out {
-        let token = view
-            .read(protocol::mptoken_keylet_from_mptid(
-                issue.mpt_id(),
-                basics::base_uint::Uint160::from_void(amm_account.data()),
-            ))
-            .ok()??;
-        STAmount::from_mpt_amount(
-            sf("sfAmount"),
-            MPTAmount::from_value(token.get_field_u64(sf("sfMPTAmount")) as i64),
-            issue,
-        )
-    } else {
-        let Asset::Issue(issue) = book.out else {
-            unreachable!("handled above");
-        };
-        ripple_state_helpers::credit_balance(view, &amm_account, &issue.account, issue.currency)
-    };
+    // `ammAccountHolds`: frozen IOU/MPT assets have no AMM liquidity and IOU
+    // balances must carry the book issuer, irrespective of trust-line storage
+    // orientation.
+    let pool_in_amount = amm_account_holds(view, &amm_account, book.r#in)?;
+    let pool_out_amount = amm_account_holds(view, &amm_account, book.out)?;
 
     if pool_in_amount.signum() <= 0 || pool_out_amount.signum() <= 0 {
         return None;
     }
 
-    // First offer the largest amount permitted by the input limit. If the
-    // delivery limit binds, recompute the required input directly from that
-    // requested output (AMMOffer::limitOut / swapAssetOut parity), rather
-    // than scaling a forward result.
     let amm_rounding_enabled = view.rules().enabled(&protocol::fix_ammv1_1());
-    let offered_out = amm_swap_asset_in(
-        &pool_in_amount,
-        &pool_out_amount,
-        max_in,
-        trading_fee,
-        amm_rounding_enabled,
-    )?;
-    if offered_out.signum() <= 0 {
+    let spot_quality = Quality::from_amounts(&Amounts::new(
+        pool_in_amount.clone(),
+        pool_out_amount.clone(),
+    ));
+    if let Some(clob) = clob_quality
+        && (spot_quality <= clob
+            || crate::domain::amm_helpers::within_relative_distance_quality(
+                spot_quality,
+                clob,
+                RuntimeNumber::from_i64_and_exponent(1, -7),
+            ))
+    {
         return None;
     }
 
-    let (amm_taker_pays, amm_taker_gets) = if offered_out > *max_out {
-        let required_in = amm_swap_asset_out(
+    let max_offer = || {
+        amm_max_offer_amounts(
             &pool_in_amount,
             &pool_out_amount,
-            max_out,
             trading_fee,
             amm_rounding_enabled,
+            view.rules()
+                .enabled(&protocol::feature_id("fixAMMOverflowOffer")),
+        )
+    };
+    if amm_context.multi_path() {
+        let (initial_in, initial_out) = amm_context.initial_balances(
+            (book.r#in, book.out),
+            &(pool_in_amount.clone(), pool_out_amount.clone()),
+        );
+        let (offered_in, offered_out) = generate_fibonacci_amm_offer(
+            &initial_in,
+            &initial_out,
+            &pool_in_amount,
+            &pool_out_amount,
+            trading_fee,
+            amm_rounding_enabled,
+            amm_context.iterations(),
         )?;
-        (required_in, max_out.clone())
-    } else {
-        (max_in.clone(), offered_out)
+        let quality = Quality::from_amounts(&Amounts::new(offered_in.clone(), offered_out.clone()));
+        if clob_quality.is_some_and(|clob| quality < clob) {
+            return None;
+        }
+        return Some(SyntheticAmmOffer {
+            account: amm_account,
+            pool_in: pool_in_amount,
+            pool_out: pool_out_amount,
+            amount_in: offered_in,
+            amount_out: offered_out,
+            quality,
+            trading_fee,
+            amm_rounding_enabled,
+            multi_path: true,
+            fix_reduced_offers_v2: view
+                .rules()
+                .enabled(&protocol::feature_id("fixReducedOffersV2")),
+        });
+    }
+    let (offered_in, offered_out, offer_quality) = match clob_quality {
+        None => {
+            let (input, out) = max_offer()?;
+            (input, out, spot_quality)
+        }
+        Some(clob) => amm_offer_for_clob_quality(
+            &pool_in_amount,
+            &pool_out_amount,
+            clob,
+            trading_fee,
+            amm_rounding_enabled,
+        )
+        .map(|(input, out)| {
+            let quality = Quality::from_amounts(&Amounts::new(input.clone(), out.clone()));
+            (input, out, quality)
+        })
+        .or_else(|| {
+            view.rules()
+                .enabled(&protocol::feature_id("fixAMMv1_2"))
+                .then(|| max_offer())
+                .flatten()
+                .filter(|amounts| {
+                    Quality::from_amounts(&Amounts::new(amounts.0.clone(), amounts.1.clone()))
+                        > clob
+                })
+                .map(|(input, out)| (input, out, spot_quality))
+        })?,
     };
 
-    if amm_taker_pays.signum() <= 0 || amm_taker_gets.signum() <= 0 {
-        return None;
+    Some(SyntheticAmmOffer {
+        account: amm_account,
+        pool_in: pool_in_amount,
+        pool_out: pool_out_amount,
+        amount_in: offered_in,
+        amount_out: offered_out,
+        quality: offer_quality,
+        trading_fee,
+        amm_rounding_enabled,
+        multi_path: false,
+        fix_reduced_offers_v2: view
+            .rules()
+            .enabled(&protocol::feature_id("fixReducedOffersV2")),
+    })
+}
+
+/// Non-mutating liquidity ordering key used by flow's ActiveStrands.  This is
+/// the BookStep portion of rippled's `qualityUpperBound`: the best currently
+/// executable CLOB/AMM tip, before amount limiting.
+pub(crate) fn book_quality_upper_bound<V: ApplyView>(
+    view: &mut V,
+    book: &Book,
+    quality_threshold: Option<Quality>,
+    amm_context: &crate::domain::flow_engine::AmmContext,
+    owner_pays_transfer_fee: bool,
+    previous_redeems: bool,
+    strand_dst: &AccountID,
+    strand_deliver: Asset,
+) -> Option<Quality> {
+    let clob = get_book_offers(view, book, 1).first().map(|offer| {
+        Quality::from_amounts(&Amounts::new(
+            offer.get_field_amount(sf("sfTakerPays")),
+            offer.get_field_amount(sf("sfTakerGets")),
+        ))
+    });
+    let generation_quality = amm_target_quality(
+        clob,
+        quality_threshold,
+        view.rules().enabled(&protocol::fix_ammv1_1()),
+        amm_context.multi_path(),
+    );
+    let amm = book
+        .domain
+        .is_none()
+        .then(|| get_amm_offer(view, book, generation_quality, amm_context))
+        .flatten();
+    let (quality, is_amm, amm_multi_path) = match (clob, amm) {
+        (Some(lhs), Some(rhs)) if rhs.quality() > lhs => (rhs.quality(), true, rhs.multi_path),
+        (Some(lhs), _) => (lhs, false, false),
+        (None, Some(rhs)) => (rhs.quality(), true, rhs.multi_path),
+        (None, None) => return None,
+    };
+
+    Some(adjust_quality_with_fees(
+        view,
+        book,
+        quality,
+        is_amm,
+        amm_multi_path,
+        owner_pays_transfer_fee,
+        previous_redeems,
+        strand_dst,
+        strand_deliver,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn book_quality_function<V: ApplyView>(
+    view: &mut V,
+    book: &Book,
+    quality_threshold: Option<Quality>,
+    amm_context: &crate::domain::flow_engine::AmmContext,
+    owner_pays_transfer_fee: bool,
+    previous_redeems: bool,
+    strand_dst: &AccountID,
+    strand_deliver: Asset,
+) -> Option<QualityFunction> {
+    let clob = get_book_offers(view, book, 1).first().map(|offer| {
+        Quality::from_amounts(&Amounts::new(
+            offer.get_field_amount(sf("sfTakerPays")),
+            offer.get_field_amount(sf("sfTakerGets")),
+        ))
+    });
+    let target = amm_target_quality(
+        clob,
+        quality_threshold,
+        view.rules().enabled(&protocol::fix_ammv1_1()),
+        amm_context.multi_path(),
+    );
+    let amm = book
+        .domain
+        .is_none()
+        .then(|| get_amm_offer(view, book, target, amm_context))
+        .flatten();
+    let choose_amm = match (clob, amm.as_ref()) {
+        (Some(lhs), Some(rhs)) => rhs.quality() > lhs,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    if choose_amm {
+        let offer = amm?;
+        if offer.multi_path {
+            return Some(QualityFunction::from_quality(
+                adjust_quality_with_fees(
+                    view,
+                    book,
+                    offer.quality(),
+                    true,
+                    true,
+                    owner_pays_transfer_fee,
+                    previous_redeems,
+                    strand_dst,
+                    strand_deliver,
+                ),
+                QualityFunctionClobLikeTag,
+            ));
+        }
+        let compose_input_rate = should_compose_single_path_input_rate(
+            previous_redeems,
+            owner_pays_transfer_fee,
+            view.rules().enabled(&protocol::fix_ammv1_1()),
+        );
+        let mut qf = if compose_input_rate {
+            let tr = transfer_rate_for_asset(view, book.r#in, Some(strand_dst), strand_deliver);
+            let input = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(i64::from(tr)));
+            let output =
+                STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(i64::from(QUALITY_ONE)));
+            QualityFunction::from_quality(
+                Quality::from_amounts(&Amounts::new(input, output)),
+                QualityFunctionClobLikeTag,
+            )
+        } else {
+            let one = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1));
+            QualityFunction::from_quality(
+                Quality::from_amounts(&Amounts::new(one.clone(), one)),
+                QualityFunctionClobLikeTag,
+            )
+        };
+        qf.combine(&QualityFunction::from_amm(
+            &Amounts::new(offer.pool_in, offer.pool_out),
+            offer.trading_fee,
+            QualityFunctionAmmTag,
+        ));
+        Some(qf)
+    } else {
+        clob.map(|quality| {
+            QualityFunction::from_quality(
+                adjust_quality_with_fees(
+                    view,
+                    book,
+                    quality,
+                    false,
+                    false,
+                    owner_pays_transfer_fee,
+                    previous_redeems,
+                    strand_dst,
+                    strand_deliver,
+                ),
+                QualityFunctionClobLikeTag,
+            )
+        })
+    }
+}
+
+fn should_compose_single_path_input_rate(
+    previous_redeems: bool,
+    offer_crossing: bool,
+    fix_ammv1_1: bool,
+) -> bool {
+    previous_redeems && (!offer_crossing || fix_ammv1_1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adjust_quality_with_fees<V: ApplyView>(
+    view: &mut V,
+    book: &Book,
+    offer_quality: Quality,
+    is_amm: bool,
+    amm_multi_path: bool,
+    owner_pays_transfer_fee: bool,
+    previous_redeems: bool,
+    strand_dst: &AccountID,
+    strand_deliver: Asset,
+) -> Quality {
+    // BookOfferCrossingStep deliberately returns the raw upper bound for CLOB
+    // and multipath AMM liquidity. For a single-path AMM, fixAMMv1_1 makes the
+    // incoming transfer rate part of the nonlinear quality upper bound.
+    if owner_pays_transfer_fee
+        && (!view.rules().enabled(&protocol::fix_ammv1_1()) || !is_amm || amm_multi_path)
+    {
+        return offer_quality;
     }
 
-    Some((amm_account, amm_taker_pays, amm_taker_gets, trading_fee))
+    let tr_in = if previous_redeems {
+        transfer_rate_for_asset(view, book.r#in, Some(strand_dst), strand_deliver)
+    } else {
+        QUALITY_ONE
+    };
+    // AMM synthetic offers waive the output transfer fee. Payments charge it
+    // only when their BookStep policy says the offer owner pays it.
+    let tr_out = if !is_amm && owner_pays_transfer_fee {
+        transfer_rate_for_asset(view, book.out, Some(strand_dst), strand_deliver)
+    } else {
+        QUALITY_ONE
+    };
+    compose_transfer_quality(offer_quality, tr_in, tr_out)
+}
+
+fn compose_transfer_quality(offer_quality: Quality, tr_in: u32, tr_out: u32) -> Quality {
+    let input = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(i64::from(tr_in)));
+    let output = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(i64::from(tr_out)));
+    protocol::composed_quality(
+        Quality::from_amounts(&Amounts::new(input, output)),
+        offer_quality,
+    )
+}
+
+fn amm_account_holds<V: ApplyView>(
+    view: &mut V,
+    amm_account: &AccountID,
+    asset: Asset,
+) -> Option<STAmount> {
+    match asset {
+        Asset::Issue(issue) if issue.native() => {
+            let keylet =
+                protocol::account_keylet(basics::base_uint::Uint160::from_void(amm_account.data()));
+            Some(view.read(keylet).ok()??.get_field_amount(sf("sfBalance")))
+        }
+        Asset::Issue(issue) => {
+            if ripple_state_helpers::is_frozen(view, amm_account, &issue) {
+                return Some(STAmount::new_with_asset(sf("sfAmount"), asset, 0, 0, false));
+            }
+            let balance = ripple_state_helpers::credit_balance(
+                view,
+                amm_account,
+                &issue.account,
+                issue.currency,
+            );
+            Some(normalize_amount_to_asset(&balance, asset))
+        }
+        Asset::MPTIssue(issue) => {
+            if crate::mptoken_helpers::is_frozen_mpt(view, amm_account, &issue).unwrap_or(true) {
+                return Some(STAmount::new_with_asset(sf("sfAmount"), asset, 0, 0, false));
+            }
+            let token = view
+                .read(protocol::mptoken_keylet_from_mptid(
+                    issue.mpt_id(),
+                    basics::base_uint::Uint160::from_void(amm_account.data()),
+                ))
+                .ok()??;
+            Some(STAmount::from_mpt_amount(
+                sf("sfAmount"),
+                MPTAmount::from_value(token.get_field_u64(sf("sfMPTAmount")) as i64),
+                issue,
+            ))
+        }
+    }
 }
 
 /// Execute an AMM swap: update pool balances.
@@ -1213,7 +2029,368 @@ mod success_path_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::StBase;
+    use protocol::{STArray, STObject, StBase};
+
+    #[test]
+    fn amm_target_threshold_is_fix_and_single_path_conditional() {
+        let input = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(2));
+        let output = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1));
+        let tip = Quality::from_amounts(&Amounts::new(input.clone(), output.clone()));
+        let limit = Quality::from_amounts(&Amounts::new(output, input));
+        assert!(limit > tip);
+
+        assert_eq!(
+            amm_target_quality(Some(tip), Some(limit), true, false),
+            None
+        );
+        assert_eq!(
+            amm_target_quality(Some(tip), Some(limit), false, false),
+            Some(tip)
+        );
+        assert_eq!(
+            amm_target_quality(Some(tip), Some(limit), true, true),
+            Some(tip)
+        );
+    }
+
+    fn amm_entry_with_auction_slot(
+        owner: AccountID,
+        authorized: AccountID,
+        expiration: u32,
+    ) -> STLedgerEntry {
+        let mut amm = STLedgerEntry::from_type_and_key(
+            protocol::LedgerEntryType::AMM,
+            Uint256::from_array([0xA1; 32]),
+        );
+        amm.set_field_u16(sf("sfTradingFee"), 500);
+        let mut slot = STObject::make_inner_object(sf("sfAuctionSlot"));
+        slot.set_account_id(sf("sfAccount"), owner);
+        slot.set_field_u16(sf("sfDiscountedFee"), 25);
+        slot.set_field_u32(sf("sfExpiration"), expiration);
+        let mut auth = STArray::new(sf("sfAuthAccounts"));
+        let mut auth_entry = STObject::make_inner_object(sf("sfAuthAccount"));
+        auth_entry.set_account_id(sf("sfAccount"), authorized);
+        auth.push_back(auth_entry);
+        slot.set_field_array(sf("sfAuthAccounts"), auth);
+        amm.set_field_object(sf("sfAuctionSlot"), slot);
+        amm
+    }
+
+    fn canonical_20106714_amm_offer() -> (SyntheticAmmOffer, STAmount, STAmount) {
+        let issuer = protocol::parse_base58_account_id("r4gZcWbPcG2M8zcHmXiMLBtHGu4ZpN9cLS")
+            .expect("canonical UAH issuer");
+        let account = protocol::parse_base58_account_id("rPB6rsP7SjpsbHV6hcEB9imSyr9GBXFerd")
+            .expect("canonical AMM account");
+        let uah = protocol::Issue::new(protocol::currency_from_string("UAH"), issuer);
+        let pool_in = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            protocol::IOUAmount::from_parts(1_888_427_639_376_993, -12)
+                .expect("canonical UAH pool"),
+            uah,
+        );
+        let pool_out = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(42_375_381));
+        let amount_out = amm_max_output(&pool_out).expect("max AMM output");
+        let amount_in =
+            amm_swap_asset_out(&pool_in, &pool_out, &amount_out, 500, true).expect("max AMM input");
+        let offer = SyntheticAmmOffer {
+            account,
+            quality: Quality::from_amounts(&Amounts::new(pool_in.clone(), pool_out.clone())),
+            pool_in,
+            pool_out,
+            amount_in,
+            amount_out,
+            trading_fee: 500,
+            amm_rounding_enabled: true,
+            multi_path: false,
+            fix_reduced_offers_v2: false,
+        };
+
+        let max_in = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            protocol::IOUAmount::from_parts(4_999_970_751_325_331, -13)
+                .expect("tick-rounded UAH limit"),
+            uah,
+        );
+        let max_out = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(8_205_452));
+        (offer, max_in, max_out)
+    }
+
+    #[test]
+    fn overflow_offer_amendment_switches_max_offer_shape() {
+        let (offer, _, _) = canonical_20106714_amm_offer();
+        let legacy = amm_max_offer_amounts(
+            &offer.pool_in,
+            &offer.pool_out,
+            offer.trading_fee,
+            offer.amm_rounding_enabled,
+            false,
+        )
+        .expect("legacy max offer");
+        let fixed = amm_max_offer_amounts(
+            &offer.pool_in,
+            &offer.pool_out,
+            offer.trading_fee,
+            offer.amm_rounding_enabled,
+            true,
+        )
+        .expect("fixed max offer");
+        assert_eq!(
+            legacy.0,
+            protocol::to_max_amount::<STAmount>(offer.pool_in.asset())
+        );
+        assert_eq!(
+            fixed.1,
+            amm_max_output(&offer.pool_out).expect("99% output")
+        );
+        assert_ne!(legacy, fixed);
+    }
+
+    #[test]
+    fn invariant_failure_is_fatal_only_after_overflow_offer_fix() {
+        assert!(!amm_invariant_failure_is_fatal(false, false));
+        assert!(amm_invariant_failure_is_fatal(false, true));
+        assert!(!amm_invariant_failure_is_fatal(true, false));
+        assert!(!amm_invariant_failure_is_fatal(true, true));
+    }
+
+    #[test]
+    fn max_amm_offer_gates_with_pool_spot_quality_before_limits() {
+        // AMMLiquidity::maxOffer carries Quality{balances}, not the effective
+        // quality of buying 99% of the output pool. This distinction changes
+        // the conclusion for Testnet ledger 20,106,714: the pool spot and the
+        // requested slice both satisfy this OfferCreate boundary.
+        let (offer, max_in, max_out) = canonical_20106714_amm_offer();
+        let threshold = Quality::from_amounts(&Amounts::new(max_in.clone(), max_out.clone()));
+
+        assert!(quality_satisfies_threshold(
+            offer.quality(),
+            Some(threshold)
+        ));
+        let max_amount_quality = Quality::from_amounts(&Amounts::new(
+            offer.amount_in.clone(),
+            offer.amount_out.clone(),
+        ));
+        assert!(!quality_satisfies_threshold(
+            max_amount_quality,
+            Some(threshold)
+        ));
+
+        let (limited_in, limited_out) = offer
+            .limit(&max_in, &max_out)
+            .expect("requested AMM slice is arithmetically available");
+        let limited_quality =
+            Quality::from_amounts(&Amounts::new(limited_in.clone(), limited_out.clone()));
+        assert!(quality_satisfies_threshold(
+            limited_quality,
+            Some(threshold)
+        ));
+        assert_eq!(limited_out, max_out);
+        assert!(limited_in < max_in);
+    }
+
+    #[test]
+    fn qualifying_max_amm_offer_is_limited_only_after_quality_gate() {
+        let (offer, max_in, max_out) = canonical_20106714_amm_offer();
+        let permissive = offer.quality();
+
+        assert!(quality_satisfies_threshold(
+            offer.quality(),
+            Some(permissive)
+        ));
+        let (limited_in, limited_out) = offer
+            .limit(&max_in, &max_out)
+            .expect("qualifying AMM offer should execute within request limits");
+        assert_eq!(limited_out, max_out);
+        assert!(limited_in > max_in.zeroed());
+        assert!(limited_in < max_in);
+    }
+
+    #[test]
+    fn amm_invariant_accepts_bounded_swap_and_rejects_overconsumption() {
+        let (offer, max_in, max_out) = canonical_20106714_amm_offer();
+        let (input, output) = offer.limit(&max_in, &max_out).expect("bounded swap");
+        assert!(amm_offer_invariant_holds(&offer, &input, &output));
+        assert!(!amm_offer_invariant_holds(
+            &offer,
+            &(offer.amount_in.clone() + max_in),
+            &output,
+        ));
+    }
+
+    #[test]
+    fn multipath_amm_limit_preserves_generated_quality() {
+        let (mut offer, max_in, max_out) = canonical_20106714_amm_offer();
+        offer.multi_path = true;
+        let original = Amounts::new(offer.amount_in.clone(), offer.amount_out.clone());
+        let expected_out = offer.quality.ceil_out_strict(&original, &max_out, true);
+        let after_out = offer
+            .limit(&offer.amount_in, &max_out)
+            .expect("limited offer");
+        assert_eq!(after_out, (expected_out.r#in, expected_out.out));
+
+        offer.fix_reduced_offers_v2 = true;
+        let expected_in = offer.quality.ceil_in_strict(&original, &max_in, false);
+        let after_in = offer
+            .limit(&max_in, &offer.amount_out)
+            .expect("limited offer");
+        assert_eq!(after_in, (expected_in.r#in, expected_in.out));
+    }
+
+    #[test]
+    fn legacy_multipath_amm_input_limit_uses_non_strict_ceil() {
+        let (mut offer, max_in, _) = canonical_20106714_amm_offer();
+        offer.multi_path = true;
+        offer.fix_reduced_offers_v2 = false;
+        let original = Amounts::new(offer.amount_in.clone(), offer.amount_out.clone());
+        let expected = offer.quality.ceil_in(&original, &max_in);
+        let limited = offer
+            .limit(&max_in, &offer.amount_out)
+            .expect("limited offer");
+        assert_eq!(limited, (expected.r#in, expected.out));
+    }
+
+    #[test]
+    fn book_step_offer_cap_matches_rippled() {
+        assert_eq!(MAX_OFFERS_TO_CONSUME, 1000);
+    }
+
+    #[test]
+    fn payment_consumes_taker_owned_offer_but_default_offer_create_cancels_it() {
+        let taker = AccountID::from_array([0x44; 20]);
+        assert!(!is_self_crossing_offer(false, false, Some(&taker), &taker));
+        assert!(!is_self_crossing_offer(true, false, Some(&taker), &taker));
+        assert!(is_self_crossing_offer(true, true, Some(&taker), &taker));
+    }
+
+    #[test]
+    fn fee_adjusted_theoretical_quality_can_reorder_multistrand_books() {
+        let raw_better = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1)),
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(2)),
+        ));
+        let raw_worse = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(2)),
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(3)),
+        ));
+        assert!(raw_better > raw_worse);
+
+        // A 50% input transfer rate applies when the preceding DirectStep is
+        // redeeming. The raw 2.0 book therefore falls below the fee-free 1.5
+        // book and ActiveStrands must reverse their raw-quality order.
+        let adjusted = compose_transfer_quality(raw_better, 1_500_000_000, QUALITY_ONE);
+        assert!(adjusted < raw_worse);
+    }
+
+    #[test]
+    fn amm_auction_slot_discount_uses_bookstep_taker_context() {
+        let owner = AccountID::from_array([0x11; 20]);
+        let authorized = AccountID::from_array([0x22; 20]);
+        let stranger = AccountID::from_array([0x33; 20]);
+        let amm = amm_entry_with_auction_slot(owner, authorized, 1_000);
+
+        assert_eq!(amm_trading_fee(999, &amm, Some(&owner)), 25);
+        assert_eq!(amm_trading_fee(999, &amm, Some(&authorized)), 25);
+        assert_eq!(amm_trading_fee(999, &amm, Some(&stranger)), 500);
+        assert_eq!(amm_trading_fee(999, &amm, None), 500);
+        assert_eq!(amm_trading_fee(1_000, &amm, Some(&owner)), 500);
+    }
+
+    #[test]
+    fn clob_tip_generates_quality_bounded_amm_offer_before_execution_limits() {
+        let (max_offer, requested_in, requested_out) = canonical_20106714_amm_offer();
+        let clob_tip = Quality::from_amounts(&Amounts::new(requested_in, requested_out));
+        let (amount_in, amount_out) = amm_offer_for_clob_quality(
+            &max_offer.pool_in,
+            &max_offer.pool_out,
+            clob_tip,
+            max_offer.trading_fee,
+            max_offer.amm_rounding_enabled,
+        )
+        .expect("favorable AMM spot should produce a CLOB-tip-bounded offer");
+        let generated = Quality::from_amounts(&Amounts::new(amount_in, amount_out.clone()));
+
+        assert!(generated >= clob_tip);
+        assert!(amount_out < max_offer.amount_out);
+    }
+
+    #[test]
+    fn amm_offer_establishes_quality_directory_before_clob_tip() {
+        let (max_offer, requested_in, requested_out) = canonical_20106714_amm_offer();
+        let clob_tip = Quality::from_amounts(&Amounts::new(requested_in, requested_out));
+        let (amount_in, amount_out) = amm_offer_for_clob_quality(
+            &max_offer.pool_in,
+            &max_offer.pool_out,
+            clob_tip,
+            max_offer.trading_fee,
+            max_offer.amm_rounding_enabled,
+        )
+        .expect("AMM should compete with the CLOB tip");
+        let amm_quality = Quality::from_amounts(&Amounts::new(amount_in, amount_out));
+        let mut step_quality = None;
+
+        assert!(accepts_step_quality(&mut step_quality, amm_quality));
+        assert_eq!(step_quality, Some(amm_quality));
+        assert_eq!(
+            accepts_step_quality(&mut step_quality, clob_tip),
+            amm_quality == clob_tip
+        );
+    }
+
+    #[test]
+    fn multipath_fibonacci_offer_uses_initial_pool_and_shared_iteration() {
+        let (pool, _, _) = canonical_20106714_amm_offer();
+        let first = generate_fibonacci_amm_offer(
+            &pool.pool_in,
+            &pool.pool_out,
+            &pool.pool_in,
+            &pool.pool_out,
+            pool.trading_fee,
+            true,
+            0,
+        )
+        .expect("initial Fibonacci AMM offer");
+        let third = generate_fibonacci_amm_offer(
+            &pool.pool_in,
+            &pool.pool_out,
+            &pool.pool_in,
+            &pool.pool_out,
+            pool.trading_fee,
+            true,
+            2,
+        )
+        .expect("third Fibonacci AMM offer");
+
+        assert!(first.0.signum() > 0 && first.1.signum() > 0);
+        assert!(third.0 > first.0);
+        assert!(third.1 > first.1);
+        assert_eq!(
+            crate::domain::amm_helpers::stamount_as_number(&third.1),
+            crate::domain::amm_helpers::stamount_as_number(&first.1)
+                * RuntimeNumber::from_i64_and_exponent(2, 0)
+        );
+    }
+
+    #[test]
+    fn shared_amm_context_counts_only_selected_used_iterations() {
+        let account = AccountID::from_array([0x44; 20]);
+        let context = crate::domain::flow_engine::AmmContext::new(account, true);
+        assert!(context.multi_path());
+        assert_eq!(context.iterations(), 0);
+
+        context.set_amm_used();
+        context.clear();
+        context.update();
+        assert_eq!(
+            context.iterations(),
+            0,
+            "discarded candidate must not count"
+        );
+
+        context.set_amm_used();
+        context.update();
+        assert_eq!(context.iterations(), 1);
+        assert_eq!(context.account(), account);
+    }
 
     #[test]
     fn amm_swap_asset_out_par_xrp_regression_uses_typed_rounding() {
@@ -1285,6 +2462,38 @@ mod tests {
 
         assert!(quality_satisfies_threshold(better, Some(threshold)));
         assert!(!quality_satisfies_threshold(worse, Some(threshold)));
+    }
+
+    #[test]
+    fn explicit_offer_crossing_does_not_enforce_component_quality() {
+        let threshold = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1)),
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(2)),
+        ));
+        let worse = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1)),
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1)),
+        ));
+        assert!(rejects_step_quality(true, worse, Some(threshold)));
+        assert!(!rejects_step_quality(false, worse, Some(threshold)));
+    }
+
+    #[test]
+    fn transfer_rate_endpoint_prefers_strand_destination_over_taker() {
+        let source = AccountID::from_array([0x11; 20]);
+        let destination = AccountID::from_array([0x22; 20]);
+        assert_eq!(
+            effective_strand_dst(Some(&destination), Some(&source)),
+            Some(&destination)
+        );
+    }
+
+    #[test]
+    fn single_path_amm_fee_function_honors_fix_gate_only_for_offer_crossing() {
+        assert!(should_compose_single_path_input_rate(true, false, false));
+        assert!(!should_compose_single_path_input_rate(true, true, false));
+        assert!(should_compose_single_path_input_rate(true, true, true));
+        assert!(!should_compose_single_path_input_rate(false, false, true));
     }
     #[test]
     fn reverse_xrp_to_iou_output_cap_derives_only_required_3300_xrp_sendmax() {

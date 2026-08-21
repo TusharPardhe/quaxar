@@ -2442,11 +2442,10 @@ mod tests {
     fn complete_after_apply_reaches_persistence_and_fences() {
         let mut ids = IdCounter::new();
         let s = session();
-        // Two read steps keep the plan from completing until the read applies.
+        // The plan cannot complete until its one read applies.
         let mut plan = scripted(
             1,
             vec![
-                ScriptedStep::NeedsReads(vec![need(7)]),
                 ScriptedStep::NeedsReads(vec![need(7)]),
                 ScriptedStep::Complete,
             ],
@@ -2689,14 +2688,17 @@ mod tests {
         let turn = plan.run_turn(&mut ctx(s, &mut ids));
         assert_eq!(turn, PlanTurn::Continue);
 
-        // Completing a read frees capacity; the backlog drains on the next turn.
-        assert_eq!(
-            plan.on_read(&ReadCompletion::new(
-                requests[0].operation(),
-                ReadOutcome::Settled { node: None },
-            )),
-            PlanReadOutcome::Applied
-        );
+        // The deferred-read barrier completes the whole admitted round before
+        // sliding another backlog item into the bounded window.
+        for request in &requests {
+            assert_eq!(
+                plan.on_read(&ReadCompletion::new(
+                    request.operation(),
+                    ReadOutcome::Settled { node: None },
+                )),
+                PlanReadOutcome::Applied
+            );
+        }
         let turn = plan.run_turn(&mut ctx(s, &mut ids));
         let PlanTurn::Reads(requests) = turn else {
             panic!("expected reads");
@@ -3009,14 +3011,15 @@ mod tests {
         for _ in 0..(final_batch_start / MAX_TIMEOUT_REPROBES - 2) {
             let _ = plan.next_timeout_recovery_batch();
         }
-        assert_eq!(
-            plan.next_timeout_recovery_batch(),
-            needs[final_batch_start..].to_vec()
-        );
-        assert_eq!(
-            plan.next_timeout_recovery_batch(),
-            needs[..MAX_TIMEOUT_REPROBES].to_vec()
-        );
+        let expected_wrapped = (0..MAX_TIMEOUT_REPROBES)
+            .map(|offset| needs[(final_batch_start + offset) % needs.len()])
+            .collect::<Vec<_>>();
+        assert_eq!(plan.next_timeout_recovery_batch(), expected_wrapped);
+        let next_start = (final_batch_start + MAX_TIMEOUT_REPROBES) % needs.len();
+        let expected_next = (0..MAX_TIMEOUT_REPROBES)
+            .map(|offset| needs[(next_start + offset) % needs.len()])
+            .collect::<Vec<_>>();
+        assert_eq!(plan.next_timeout_recovery_batch(), expected_next);
     }
 
     #[test]

@@ -37,7 +37,6 @@ struct MismatchCase {
 }
 
 /// All 41 representative mismatch cases (one per distinct root cause instance).
-/// Full txid list is in docs/context/mismatch-report.md.
 const CASES: &[MismatchCase] = &[
     // ── P0: tecDIR_FULL (306 total) ──────────────────────────────────────────
     MismatchCase {

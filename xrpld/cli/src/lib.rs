@@ -42,7 +42,7 @@ pub struct Cli {
 pub enum Command {
     /// Show node status (state, peers, validated ledger, uptime)
     Status,
-    /// Health check — exits 0 if healthy, 1 if not
+    /// Reachability check — exits 0 when server_info succeeds, 1 if it fails
     Health,
     /// List connected peers with details
     Peers,

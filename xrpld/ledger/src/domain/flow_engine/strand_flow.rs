@@ -6,11 +6,13 @@
 //! sandbox.  Only a successful chosen strand is applied to its parent view.
 
 use super::steps::{FlowStep, StepAmount, StepAmounts, StepContext};
-use super::{FlowResult, SelfCrossCancellation, Strand};
+use super::{AmmContext, FlowResult, SelfCrossCancellation, Strand};
 use crate::{ApplyView, FlowSandbox};
 use protocol::{AccountID, Quality, STAmount, Ter};
+use std::{cell::Cell, rc::Rc};
 
 const MAX_TRIES: usize = 1000;
+const MAX_OFFERS_TO_CONSIDER: u32 = 1500;
 
 #[derive(Debug, Clone)]
 struct ReverseProbe {
@@ -22,6 +24,11 @@ struct ReverseProbe {
     limited_by_max_in: bool,
 }
 
+struct SingleStrandResult {
+    amounts: Option<(STAmount, STAmount, bool)>,
+    offers_used: u32,
+}
+
 /// Execute strands to deliver the requested amount.
 pub fn execute_strands<V: ApplyView>(
     view: &mut V,
@@ -30,6 +37,7 @@ pub fn execute_strands<V: ApplyView>(
     partial_payment: bool,
     send_max: Option<&STAmount>,
     strand_src: &AccountID,
+    strand_dst: &AccountID,
     quality_threshold: Option<Quality>,
     self_cross_cancellation: Option<SelfCrossCancellation>,
 ) -> FlowResult {
@@ -54,33 +62,91 @@ pub fn execute_strands<V: ApplyView>(
         .unwrap_or_else(|| deliver.zeroed());
     let mut total_out = deliver.zeroed();
     let mut active: Vec<bool> = vec![true; strands.len()];
+    // Flow.cpp constructs AMMContext with multiPath=false.  Each pass updates
+    // it only after ActiveStrands has estimated and pruned its candidate set.
+    let amm_context = AmmContext::new(*strand_src, false);
+    let mut offers_considered = 0u32;
 
-    for _ in 0..MAX_TRIES {
+    for attempt in 0..MAX_TRIES {
         if remaining_out.signum() <= 0 || remaining_in.as_ref().is_some_and(|v| v.signum() <= 0) {
             break;
         }
+        // StrandFlow increments curTry before processing and fails when it
+        // reaches MAX_TRIES, so the terminal attempt is never executed.
+        if attempt + 1 >= MAX_TRIES {
+            return FlowResult {
+                ter: Ter::TEL_FAILED_PROCESSING,
+                actual_in: total_in.zeroed(),
+                actual_out: total_out.zeroed(),
+            };
+        }
+
+        let ordering_context = StepContext {
+            strand_src,
+            strand_dst,
+            strand_deliver: deliver.asset(),
+            quality_threshold,
+            self_cross_cancellation: self_cross_cancellation.clone(),
+            amm_context: amm_context.clone(),
+            offer_usage: Rc::new(Cell::new(0)),
+            previous_redeems: Rc::new(Cell::new(false)),
+        };
+        let active_indices: Vec<usize> = active
+            .iter()
+            .enumerate()
+            .filter(|(index, enabled)| **enabled && !strands[*index].is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        let mut candidates = activate_candidates(active_indices, |index| {
+            strand_quality_upper_bound(&mut aggregate, &strands[index], &ordering_context)
+                .filter(|quality| quality_threshold.is_none_or(|limit| *quality >= limit))
+        });
+        // `sort_by` is stable: equal-quality strands retain path-set order.
+        sort_candidates(&mut candidates);
+        // `candidates` is the Rust ActiveStrands::cur_ after theoretical
+        // quality/limit pruning. This is the value used by execution and by
+        // the one-active-strand nonlinear limitOut calculation.
+        amm_context.set_multi_path(candidates.len() > 1);
 
         let mut applied = false;
-        for (strand_index, strand) in strands.iter().enumerate() {
-            if !active[strand_index] || strand.is_empty() {
-                active[strand_index] = false;
-                continue;
-            }
+        let mut next_active = vec![false; strands.len()];
+        for (candidate_position, (strand_index, _)) in candidates.iter().copied().enumerate() {
+            let strand = &strands[strand_index];
+            let (strand_out, adjusted_remaining_out) = if candidates.len() == 1 {
+                quality_threshold
+                    .and_then(|limit| {
+                        limit_single_strand_out(
+                            &mut aggregate,
+                            strand,
+                            &remaining_out,
+                            limit,
+                            &ordering_context,
+                        )
+                    })
+                    .unwrap_or_else(|| (remaining_out.clone(), false))
+            } else {
+                (remaining_out.clone(), false)
+            };
 
             // Every candidate, including a dry probe, owns a child sandbox.
             // No mutation reaches `view` unless this candidate produced a
             // valid amount and was selected below.
+            amm_context.clear();
             let result = execute_single_strand(
                 &mut aggregate,
                 strand,
                 remaining_in.as_ref(),
-                &remaining_out,
+                &strand_out,
                 strand_src,
+                strand_dst,
                 quality_threshold,
                 self_cross_cancellation.clone(),
+                amm_context.clone(),
+                adjusted_remaining_out,
             );
 
-            let Some((amount_in, amount_out, inactive)) = result else {
+            offers_considered = offers_considered.saturating_add(result.offers_used);
+            let Some((amount_in, amount_out, inactive)) = result.amounts else {
                 active[strand_index] = false;
                 continue;
             };
@@ -96,13 +162,21 @@ pub fn execute_strands<V: ApplyView>(
                 remaining_in = Some(send_max.clone() - total_in.clone());
             }
             if inactive {
-                active[strand_index] = false;
+                next_active[strand_index] = false;
+            } else {
+                next_active[strand_index] = true;
+            }
+            for (remaining_index, _) in candidates.iter().skip(candidate_position + 1) {
+                next_active[*remaining_index] = true;
             }
             applied = true;
+            amm_context.update();
             break;
         }
 
-        if !applied {
+        active = next_active;
+
+        if !applied || offers_considered >= MAX_OFFERS_TO_CONSIDER {
             break;
         }
     }
@@ -146,46 +220,259 @@ fn execute_single_strand<V: ApplyView>(
     max_in: Option<&STAmount>,
     requested_out: &STAmount,
     strand_src: &AccountID,
+    strand_dst: &AccountID,
     quality_threshold: Option<Quality>,
     self_cross_cancellation: Option<SelfCrossCancellation>,
-) -> Option<(STAmount, STAmount, bool)> {
+    amm_context: AmmContext,
+    adjusted_remaining_out: bool,
+) -> SingleStrandResult {
+    let offer_usage = Rc::new(Cell::new(0));
+    let preceding_redeems = preceding_debt_directions(parent, strand);
     let context = StepContext {
         strand_src,
+        strand_dst,
+        strand_deliver: requested_out.asset(),
         quality_threshold,
         self_cross_cancellation,
+        amm_context,
+        offer_usage: offer_usage.clone(),
+        previous_redeems: Rc::new(Cell::new(false)),
     };
 
-    let probe = {
+    let Some(probe) = ({
         let mut dry_sandbox = FlowSandbox::new(parent);
-        reverse_probe(&mut dry_sandbox, strand, max_in, requested_out, &context)?
+        reverse_probe(
+            &mut dry_sandbox,
+            strand,
+            max_in,
+            requested_out,
+            &context,
+            &preceding_redeems,
+        )
+    }) else {
+        return SingleStrandResult {
+            amounts: None,
+            offers_used: offer_usage.get(),
+        };
     };
     // `dry_sandbox` was deliberately dropped without `apply`.
 
+    offer_usage.set(0);
     let mut final_sandbox = FlowSandbox::new(parent);
-    let final_cache = replay_probe(
+    let Some(final_cache) = replay_probe(
         &mut final_sandbox,
         strand,
         max_in,
         requested_out,
         &context,
         &probe,
-    )?;
+        &preceding_redeems,
+    ) else {
+        return SingleStrandResult {
+            amounts: None,
+            offers_used: offer_usage.get(),
+        };
+    };
 
-    let first = final_cache.first()?.as_ref()?;
-    let last = final_cache.last()?.as_ref()?;
+    let Some(first) = final_cache.first().and_then(Option::as_ref) else {
+        return SingleStrandResult {
+            amounts: None,
+            offers_used: offer_usage.get(),
+        };
+    };
+    let Some(last) = final_cache.last().and_then(Option::as_ref) else {
+        return SingleStrandResult {
+            amounts: None,
+            offers_used: offer_usage.get(),
+        };
+    };
     if first.input.is_zero() || last.output.is_zero() {
-        return None;
+        return SingleStrandResult {
+            amounts: None,
+            offers_used: offer_usage.get(),
+        };
     }
 
+    let amount_in = first.input.amount().clone();
+    let amount_out = last.output.amount().clone();
+    if let Some(limit) = quality_threshold {
+        let realized = Quality::from_amounts(&protocol::Amounts::new(
+            amount_in.clone(),
+            amount_out.clone(),
+        ));
+        if realized < limit
+            && !(adjusted_remaining_out
+                && crate::domain::amm_helpers::within_relative_distance_quality(
+                    realized,
+                    limit,
+                    basics::number::NumberParts::from_i64_and_exponent(1, -7),
+                ))
+        {
+            return SingleStrandResult {
+                amounts: None,
+                offers_used: offer_usage.get(),
+            };
+        }
+    }
+
+    let inactive = final_cache.iter().flatten().any(|amounts| amounts.inactive);
     // A successful strand alone is allowed to affect the accumulated parent.
     // This parent can itself be the transaction-level flow sandbox.
-    final_sandbox.apply().ok()?;
-    let inactive = false; // StepKind currently has no offer-budget inactive state.
-    Some((
-        first.input.amount().clone(),
-        last.output.amount().clone(),
-        inactive,
-    ))
+    if final_sandbox.apply().is_err() {
+        return SingleStrandResult {
+            amounts: None,
+            offers_used: offer_usage.get(),
+        };
+    }
+    SingleStrandResult {
+        amounts: Some((amount_in, amount_out, inactive)),
+        offers_used: offer_usage.get(),
+    }
+}
+
+fn limit_single_strand_out<V: ApplyView>(
+    view: &mut V,
+    strand: &Strand,
+    remaining_out: &STAmount,
+    limit: Quality,
+    context: &StepContext<'_>,
+) -> Option<(STAmount, bool)> {
+    use protocol::{QualityFunction, QualityFunctionClobLikeTag};
+    let mut combined: Option<QualityFunction> = None;
+    let mut previous_redeems = false;
+    for step in strand {
+        let (qf, direction) = match step {
+            super::StepKind::Book {
+                book_in,
+                book_out,
+                owner_pays_transfer_fee,
+                ..
+            } => {
+                let book = crate::domain::ripple_calc::book_step::Book {
+                    r#in: protocol::Asset::Issue(*book_in),
+                    out: protocol::Asset::Issue(*book_out),
+                    domain: None,
+                };
+                (
+                    crate::domain::ripple_calc::book_step::book_quality_function(
+                        view,
+                        &book,
+                        context.quality_threshold,
+                        &context.amm_context,
+                        *owner_pays_transfer_fee,
+                        previous_redeems,
+                        context.strand_dst,
+                        context.strand_deliver,
+                    )?,
+                    false,
+                )
+            }
+            _ => {
+                let (quality, direction) =
+                    step.quality_upper_bound(view, previous_redeems, context)?;
+                (
+                    QualityFunction::from_quality(quality, QualityFunctionClobLikeTag),
+                    direction,
+                )
+            }
+        };
+        if let Some(current) = &mut combined {
+            current.combine(&qf);
+        } else {
+            combined = Some(qf);
+        }
+        previous_redeems = direction;
+    }
+    let qf = combined?;
+    if qf.is_const() {
+        return None;
+    }
+    let continuous = qf.out_from_avg_q(limit)?;
+    let mut out = protocol::to_amount_from_number::<STAmount>(
+        remaining_out.asset(),
+        continuous,
+        basics::number::RoundingMode::ToNearest,
+    )
+    .ok()?;
+    if view.rules().enabled(&protocol::feature_id("MPTokensV2"))
+        && (remaining_out.native() || matches!(remaining_out.asset(), protocol::Asset::MPTIssue(_)))
+        && crate::domain::amm_helpers::stamount_as_number(&out) > continuous
+        && !qf.satisfies_avg_q(limit, crate::domain::amm_helpers::stamount_as_number(&out))
+    {
+        out = protocol::to_amount_from_number::<STAmount>(
+            remaining_out.asset(),
+            continuous,
+            basics::number::RoundingMode::Downward,
+        )
+        .ok()?;
+    }
+    if crate::domain::amm_helpers::within_relative_distance_amount(
+        out.clone(),
+        remaining_out.clone(),
+        basics::number::NumberParts::from_i64_and_exponent(1, -9),
+    ) {
+        return None;
+    }
+    (out < *remaining_out).then_some((out, true))
+}
+
+fn preceding_debt_directions<V: ApplyView>(view: &mut V, strand: &Strand) -> Vec<bool> {
+    use crate::domain::ripple_calc::direct_step::{DebtDirection, max_payment_flow};
+    let mut result = Vec::with_capacity(strand.len());
+    let mut previous_redeems = false;
+    for step in strand {
+        result.push(previous_redeems);
+        previous_redeems = match step {
+            super::StepKind::Direct { src, dst, currency } => {
+                max_payment_flow(view, src, dst, *currency).1 == DebtDirection::Redeems
+            }
+            super::StepKind::Book { .. } | super::StepKind::XrpEndpoint { .. } => false,
+        };
+    }
+    result
+}
+
+fn strand_quality_upper_bound<V: ApplyView>(
+    view: &mut V,
+    strand: &Strand,
+    context: &StepContext<'_>,
+) -> Option<Quality> {
+    let mut quality = {
+        let one = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1));
+        Quality::from_amounts(&protocol::Amounts::new(one.clone(), one))
+    };
+    let mut previous_redeems = false;
+    for step in strand {
+        let (step_quality, direction) =
+            step.quality_upper_bound(view, previous_redeems, context)?;
+        quality = protocol::composed_quality(quality, step_quality);
+        previous_redeems = direction;
+    }
+    Some(quality)
+}
+
+fn sort_candidates(candidates: &mut [(usize, Quality)]) {
+    candidates.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1));
+}
+
+fn quality_estimation_required(active_count: usize) -> bool {
+    active_count > 1
+}
+
+fn activate_candidates(
+    active_indices: Vec<usize>,
+    mut estimate: impl FnMut(usize) -> Option<Quality>,
+) -> Vec<(usize, Quality)> {
+    if !quality_estimation_required(active_indices.len()) {
+        return active_indices
+            .into_iter()
+            .map(|index| (index, Quality::default()))
+            .collect();
+    }
+    active_indices
+        .into_iter()
+        .filter_map(|index| estimate(index).map(|quality| (index, quality)))
+        .collect()
 }
 
 /// Reverse through the strand to discover exact per-step required inputs.
@@ -196,6 +483,7 @@ fn reverse_probe<V: ApplyView>(
     max_in: Option<&STAmount>,
     requested_out: &STAmount,
     context: &StepContext<'_>,
+    preceding_redeems: &[bool],
 ) -> Option<ReverseProbe> {
     let mut cache = vec![None; strand.len()];
     let mut step_out = StepAmount::new(requested_out.clone());
@@ -203,6 +491,7 @@ fn reverse_probe<V: ApplyView>(
     let mut limited_by_max_in = false;
 
     for index in (0..strand.len()).rev() {
+        context.previous_redeems.set(preceding_redeems[index]);
         let amounts = strand[index].rev(sandbox, &step_out, context).ok()?;
         if amounts.output.is_zero() {
             return None;
@@ -255,6 +544,7 @@ fn replay_probe<V: ApplyView>(
     requested_out: &STAmount,
     context: &StepContext<'_>,
     probe: &ReverseProbe,
+    preceding_redeems: &[bool],
 ) -> Option<Vec<Option<StepAmounts>>> {
     let mut cache = vec![None; strand.len()];
 
@@ -262,6 +552,7 @@ fn replay_probe<V: ApplyView>(
     if probe.limited_by_max_in {
         let max_in = max_in?;
         let expected = probe.cache[0].as_ref()?;
+        context.previous_redeems.set(preceding_redeems[0]);
         let actual = strand[0]
             .fwd(sandbox, &StepAmount::new(max_in.clone()), expected, context)
             .ok()?;
@@ -284,6 +575,7 @@ fn replay_probe<V: ApplyView>(
         };
 
         for index in (0..=reverse_start).rev() {
+            context.previous_redeems.set(preceding_redeems[index]);
             let actual = strand[index].rev(sandbox, &step_out, context).ok()?;
             if actual.output.is_zero() || !actual.output.equivalent(&step_out) {
                 return None;
@@ -309,6 +601,7 @@ fn replay_probe<V: ApplyView>(
     };
 
     for index in forward_start..strand.len() {
+        context.previous_redeems.set(preceding_redeems[index]);
         let expected = probe.cache[index].as_ref()?;
         let actual = strand[index]
             .fwd(sandbox, &step_in, expected, context)
@@ -352,5 +645,50 @@ mod tests {
         // A USD requirement cannot be numerically compared with an XRP
         // delivery limit; the tagged amount rejects that operation.
         assert_eq!(required_usd.greater_than(&deliver_xrp), None);
+    }
+
+    fn quality(input: i64, output: i64) -> Quality {
+        Quality::from_amounts(&protocol::Amounts::new(
+            STAmount::from_xrp_amount(XRPAmount::from_drops(input)),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(output)),
+        ))
+    }
+
+    #[test]
+    fn active_strands_are_stably_sorted_best_quality_first() {
+        let equal = quality(2, 3);
+        let best = quality(1, 2);
+        let mut candidates = vec![(7, equal), (4, best), (2, equal)];
+        sort_candidates(&mut candidates);
+        assert_eq!(
+            candidates.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+            vec![4, 7, 2]
+        );
+    }
+
+    #[test]
+    fn resource_caps_match_rippled_flow() {
+        assert_eq!(MAX_TRIES, 1000);
+        assert_eq!(MAX_OFFERS_TO_CONSIDER, 1500);
+    }
+
+    #[test]
+    fn amm_context_starts_single_path_and_changes_after_candidate_pruning() {
+        let context = AmmContext::new(AccountID::from_array([0x31; 20]), false);
+        assert!(!context.multi_path());
+        // This assignment represents the post-quality-prune ActiveStrands set.
+        context.set_multi_path(true);
+        assert!(context.multi_path());
+    }
+
+    #[test]
+    fn single_active_strand_bypasses_quality_estimation_before_cleanup() {
+        assert!(!quality_estimation_required(1));
+        assert!(quality_estimation_required(2));
+        let candidates = activate_candidates(vec![7], |_| {
+            panic!("single-strand activation must not estimate/prune before cleanup")
+        });
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, 7);
     }
 }

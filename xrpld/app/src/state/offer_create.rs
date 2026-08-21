@@ -292,6 +292,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 (tx_flags & TF_FILL_OR_KILL) == 0,
                 Some(&taker_gets), // sendMax = TakerGets
                 &account,
+                &account,
                 Some(quality_threshold),
                 Some(self_cross_cancellations.clone()),
             )
@@ -315,6 +316,11 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                     quality_threshold: Some(quality_threshold),
                     remove_self_crossing: true,
                     self_cross_cancellation: Some(self_cross_cancellations.clone()),
+                    amm_context: None,
+                    previous_redeems: false,
+                    strand_dst: Some(&account),
+                    strand_deliver: Some(taker_pays.asset()),
+                    enforce_quality_threshold: true,
                 },
             );
             ledger::flow_engine::FlowResult {

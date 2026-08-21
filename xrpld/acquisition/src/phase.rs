@@ -1,7 +1,7 @@
 //! The `SyncPhase` service lifecycle and its transition table.
 //!
-//! The transition rules below implement the required table from `AGENTS.md`
-//! ("Service lifecycle authority"). The coordinator owns service phase: it is
+//! The transition rules below implement the service lifecycle documented in
+//! `docs/SYNCING.md`. The coordinator owns service phase: it is
 //! the only production writer, and every transition carries the fact that
 //! motivated it.
 
@@ -101,7 +101,7 @@ pub enum TransitionError {
 
 /// The legal `SyncPhase` transition set.
 ///
-/// Implements the `AGENTS.md` "Required transition rules" table:
+/// Implements the service lifecycle transition table in `docs/SYNCING.md`:
 ///
 /// | From | Required fact/invariant | To |
 /// |---|---|---|
@@ -114,8 +114,7 @@ pub enum TransitionError {
 /// | any active phase | no usable peers | `Disconnected` |
 /// | any nonterminal phase | shutdown | `Stopping` |
 ///
-/// Documented clarifications, consistent with the "avoidance of doubt"
-/// paragraph in `AGENTS.md`:
+/// Clarifications for the transition table:
 ///
 /// * `Connected -> Syncing` is also legal via `PreferredLclDivergence` when a
 ///   concrete target exists.
@@ -124,12 +123,11 @@ pub enum TransitionError {
 ///   `switchLastClosedLedger` clearing `needNetworkLedger` when the preferred
 ///   LCL is already resident (no network ledger needed); the coordinator then
 ///   requires a fresh contiguous publication for `Tracking -> Full`.
-/// * `Syncing -> Syncing` is legal via a retargeting `TargetRequired`; the
-///   session owner is preserved while the target changes.
-/// * `Syncing -> Syncing` is also legal when the preferred LCL changes while
-///   recovery is in progress. The preferred identity is policy state and must
-///   follow the latest validation view; older per-hash acquisitions may keep
-///   running independently.
+/// * `Syncing -> Syncing` preserves the recovery anchor while preferred-LCL
+///   policy moves. The current preferred identity is tracked separately from
+///   this phase; otherwise a moving network tip can replace the only target
+///   whose installation is capable of completing recovery. A same-hash fact
+///   may still refine an anchor whose sequence was initially unknown.
 /// * `Tracking -> Syncing` is legal via `PreferredLclDivergence`; tracking is
 ///   retained while the LCL matches, but a divergent preferred LCL with a known
 ///   target resumes acquisition.
@@ -144,10 +142,13 @@ pub fn phase_transition(from: &SyncPhase, fact: &TransitionFact) -> Option<SyncP
         (Connected, TargetInstalledAsLcl { lcl }) => Tracking { lcl: *lcl },
         (Syncing { target: current }, TargetRequired { target })
         | (Syncing { target: current }, PreferredLclDivergence { target }) => Syncing {
-            target: if current.hash() == target.hash() && target.sequence().is_none() {
-                *current
-            } else {
+            target: if current.hash() == target.hash()
+                && current.sequence().is_none()
+                && target.sequence().is_some()
+            {
                 *target
+            } else {
+                *current
             },
         },
         (Syncing { .. }, TargetInstalledAsLcl { lcl }) => Tracking { lcl: *lcl },
@@ -249,14 +250,25 @@ mod tests {
                 &SyncPhase::Syncing { target: target(9) },
                 &TransitionFact::TargetRequired { target: target(12) }
             ),
-            Some(SyncPhase::Syncing { target: target(12) })
+            Some(SyncPhase::Syncing { target: target(9) }),
+            "a moving policy target must not replace the active recovery anchor"
         );
         assert_eq!(
             phase_transition(
                 &SyncPhase::Syncing { target: target(9) },
                 &TransitionFact::PreferredLclDivergence { target: target(12) }
             ),
-            Some(SyncPhase::Syncing { target: target(12) })
+            Some(SyncPhase::Syncing { target: target(9) }),
+            "a moving preferred LCL must not replace the active recovery anchor"
+        );
+        let unresolved = LedgerTarget::new(target(9).hash(), None);
+        assert_eq!(
+            phase_transition(
+                &SyncPhase::Syncing { target: unresolved },
+                &TransitionFact::TargetRequired { target: target(9) }
+            ),
+            Some(SyncPhase::Syncing { target: target(9) }),
+            "a verified header may refine the stable anchor's sequence"
         );
         let resolved = target(9);
         assert_eq!(

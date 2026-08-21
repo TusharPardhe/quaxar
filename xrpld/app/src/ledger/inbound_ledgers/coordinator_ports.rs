@@ -74,9 +74,14 @@ impl
         target: basics::base_uint::Uint256,
         reason: super::registry::AcquireReason,
         acquisition_id: u64,
+        preferred_target: bool,
     ) {
-        self.handoffs
-            .register_pending_session_origin(target, reason, acquisition_id);
+        self.handoffs.register_pending_session_origin(
+            target,
+            reason,
+            acquisition_id,
+            preferred_target,
+        );
     }
 
     /// Clear an exact origin binding when a peer-capable demand did not create
@@ -87,9 +92,14 @@ impl
         target: basics::base_uint::Uint256,
         reason: super::registry::AcquireReason,
         acquisition_id: u64,
+        preferred_target: bool,
     ) {
-        self.handoffs
-            .clear_pending_session_origin(target, reason, acquisition_id);
+        self.handoffs.clear_pending_session_origin(
+            target,
+            reason,
+            acquisition_id,
+            preferred_target,
+        );
     }
 
     /// Reopens an exact handoff after the recipient could not accept it, then
@@ -733,6 +743,7 @@ pub(crate) fn build_coordinator_adapter(resources: CoordinatorPortResources) -> 
     );
     CoordinatorAdapter::with_event_channel(
         runner,
+        acquisition_shadow_config(),
         OverlayLedgerRequestPort::new(peers),
         reads,
         writes,
@@ -746,6 +757,20 @@ pub(crate) fn build_coordinator_adapter(resources: CoordinatorPortResources) -> 
         packet_tx,
         packet_rx,
     )
+}
+
+/// Shadow comparison is deliberately opt-in in production. The runner remains
+/// the sole authority in either mode; enabling this flag adds only bounded
+/// mirror observations on the coordinator owner thread.
+fn acquisition_shadow_config() -> acquisition::ShadowConfig {
+    let enabled = std::env::var("QUAXAR_ACQUISITION_SHADOW")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"));
+    if enabled {
+        acquisition::ShadowConfig::default()
+    } else {
+        acquisition::ShadowConfig::disabled()
+    }
 }
 
 #[cfg(test)]
@@ -1238,12 +1263,10 @@ mod tests {
             )
             .iter()
             .find_map(|effect| match effect {
-                acquisition::AcquisitionEffect::SendLedgerRequest(request) => {
-                    Some(request.session())
-                }
+                acquisition::AcquisitionEffect::SessionStarted(session) => Some(*session),
                 _ => None,
             })
-            .expect("a peer request must be emitted");
+            .expect("the header-first acquisition session must be admitted");
         assert_eq!(session.target_hash(), Uint256::from(9));
     }
 
@@ -1290,12 +1313,10 @@ mod tests {
             )
             .iter()
             .find_map(|effect| match effect {
-                acquisition::AcquisitionEffect::SendLedgerRequest(request) => {
-                    Some(request.session())
-                }
+                acquisition::AcquisitionEffect::SessionStarted(session) => Some(*session),
                 _ => None,
             })
-            .expect("first peer request");
+            .expect("first header-first session");
         let snapshot_a = adapter.routing_snapshot();
         let route_a = snapshot_a
             .route(&Uint256::from(9))
@@ -1319,10 +1340,14 @@ mod tests {
             adapter.route_ledger_data(1, &message),
             super::super::coordinator_adapter::LedgerDataIngressDisposition::Delivered
         );
-        let held = match adapter.pending_events().into_iter().next() {
-            Some(acquisition::AcquisitionEvent::PacketAdmitted(packet)) => packet,
-            other => panic!("expected one admitted packet, got {other:?}"),
-        };
+        let held = adapter
+            .pending_events()
+            .into_iter()
+            .find_map(|event| match event {
+                acquisition::AcquisitionEvent::PacketAdmitted(packet) => Some(packet),
+                _ => None,
+            })
+            .expect("expected one admitted packet alongside any header completion");
         assert_eq!(held.lease().session(), session_a);
         assert_eq!(route_a.gate().current_packets(), 1);
 
@@ -1332,7 +1357,10 @@ mod tests {
         adapter.push(acquisition::AcquisitionEvent::StoreRotated(
             StoreGeneration::new(2),
         ));
-        assert_eq!(adapter.drain(), 1);
+        assert!(
+            adapter.drain() >= 1,
+            "store rotation is handled alongside any racing header completion"
+        );
         assert_eq!(adapter.snapshot().sessions_cancelled(), 1);
 
         let effects_b = adapter.acquire_requested(
@@ -1342,12 +1370,10 @@ mod tests {
         let session_b = effects_b
             .iter()
             .find_map(|effect| match effect {
-                acquisition::AcquisitionEffect::SendLedgerRequest(request) => {
-                    Some(request.session())
-                }
+                acquisition::AcquisitionEffect::SessionStarted(session) => Some(*session),
                 _ => None,
             })
-            .expect("replacement peer request");
+            .expect("replacement header-first session");
         assert_ne!(session_b, session_a);
         assert_eq!(session_b.target_hash(), Uint256::from(9));
         let snapshot_b = adapter.routing_snapshot();
@@ -1366,9 +1392,14 @@ mod tests {
         // admission through the owner loop must be rejected: it never reaches
         // session B's mailbox, is not credited to any session, and is counted
         // stale.
+        let stale_before_packet = adapter.snapshot().stale_events();
         adapter.push(acquisition::AcquisitionEvent::PacketAdmitted(held));
-        assert_eq!(adapter.drain(), 1);
-        assert_eq!(adapter.snapshot().stale_events(), 1);
+        assert!(
+            adapter.drain() >= 1,
+            "the stale packet is handled alongside any racing replacement header completion"
+        );
+        let stale_after_packet = adapter.snapshot().stale_events();
+        assert!(stale_after_packet > stale_before_packet);
         assert_eq!(
             adapter.snapshot().packets_admitted(),
             0,
@@ -1399,7 +1430,7 @@ mod tests {
             timer: acquisition::TimerKind::AcquireTimeout,
         });
         adapter.drain();
-        assert_eq!(adapter.snapshot().stale_events(), 2);
+        assert_eq!(adapter.snapshot().stale_events(), stale_after_packet + 1);
         let snapshot_after = adapter.routing_snapshot();
         assert_eq!(
             snapshot_after.session_count(),

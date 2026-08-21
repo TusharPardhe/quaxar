@@ -1,9 +1,8 @@
 //! Deterministic, offline acquisition parity harness.
 //!
 //! This is deliberately a producer of Quaxar traces, not a claim that those
-//! traces already match rippled.  A rippled runner can compare its JSONL
-//! output event-for-event using the schema documented in
-//! `docs/PARITY_EXPERIMENTS.md`.
+//! traces already match rippled. A rippled runner can compare its JSONL output
+//! event-for-event; the emitted records are the parity schema.
 
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};

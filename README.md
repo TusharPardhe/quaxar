@@ -36,9 +36,11 @@ testnet node and validator operation.
 
 ## Current Status
 
-`quaxar` is beta software. It has been validated on XRPL testnet as a synced
-node and as a validator reaching `proposing`, publishing signed validations,
-and advancing with the validated chain. Live submission coverage includes XRP
+`quaxar` is beta software. Testnet runs have reached `full` and `proposing`,
+published signed validations, and advanced with the validated chain. Treat
+these as observed capabilities rather than a production-readiness guarantee;
+sustained convergence remains part of active parity validation. Live
+submission coverage includes XRP
 payments, issued-token payments, NFT minting, AMM creation, account queries,
 and expected rejection cases.
 
@@ -171,9 +173,15 @@ Check sync and health:
 
 ```bash
 quaxar sync-status
-quaxar health
+quaxar ledger-closed
+quaxar ledger-current
+quaxar fetch-info
 quaxar server-info
 ```
+
+Sample these across several ledger closes. `health` proves RPC reachability,
+including while syncing; one green `full` or `proposing` response does not prove
+sustained readiness.
 
 Call RPC directly:
 
@@ -198,7 +206,7 @@ suggestions, clear errors for unknown commands, and direct RPC passthrough.
 | Command | Purpose |
 | --- | --- |
 | `status` | Show server state, uptime, peers, and ledger range. |
-| `health` | Return a semantic health result for scripts and operators. |
+| `health` | Check RPC reachability and show a point-in-time state label. |
 | `sync-status` | Show whether the node is connected, syncing, tracking, or full. |
 | `peers` | Show connected peers with latency and protocol details. |
 | `fee` | Show the current transaction fee from RPC. |
@@ -209,10 +217,10 @@ suggestions, clear errors for unknown commands, and direct RPC passthrough.
 | `server-info` | Show raw `server_info` output. |
 | `server-state` | Show raw `server_state` output. |
 | `server-definitions` | Show protocol definitions from the node. |
-| `ledger-closed` | Show the latest closed ledger. |
+| `ledger-closed` | Show the canonical local closed ledger. |
 | `ledger-current` | Show the current open ledger index. |
 | `ledger-header` | Show the validated ledger header. |
-| `fetch-info` | Show ledger acquisition state. |
+| `fetch-info` | Show coordinator phase/anchors, per-hash sessions, and recovery counters. |
 | `get-counts` | Show cache, ledger, and node store counters. |
 | `db-stats` | Show NuDB file sizes and database counters. |
 | `can-delete [value]` | Get or set the advisory online deletion ledger. |
@@ -312,6 +320,14 @@ side-by-side upstream comparison, while Cargo packages, binaries, services,
 configuration, environment variables, and metrics avoid `xrpld` product
 branding. Selected operator packages use `quaxar-*`; generic internal crates
 keep domain names such as `ledger`, `rpc`, and `server`.
+
+NetworkOps owns the independently moving preferred-LCL policy. The typed
+coordinator preserves a stable recovery anchor while per-hash acquisitions
+continue, and tracks canonical local and contiguous publication identities
+without coupling ordinary cache acquisition to public operating mode.
+Payment flow shares one AMM context across reverse/forward strand evaluation so
+only the selected strand advances multipath AMM iteration state; AMM liquidity
+is evaluated before CLOB execution at each book quality.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 

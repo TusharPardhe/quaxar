@@ -5,13 +5,14 @@
 //! ledger asset with the numeric amount: a SendMax in USD must never be
 //! compared with a requested XRP delivery.
 
-use super::{SelfCrossCancellation, StepKind};
+use super::{AmmContext, SelfCrossCancellation, StepKind};
 use crate::ApplyView;
 use crate::domain::ripple_state_helpers;
 use protocol::{
     AccountID, Asset, Issue, Quality, STAmount, Ter, XRPAmount, get_field_by_symbol as sf,
     xrp_account,
 };
+use std::{cell::Cell, rc::Rc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AmountTag {
@@ -108,6 +109,8 @@ impl StepAmount {
 pub struct StepAmounts {
     pub input: StepAmount,
     pub output: StepAmount,
+    pub offers_used: u32,
+    pub inactive: bool,
 }
 
 impl StepAmounts {
@@ -115,6 +118,8 @@ impl StepAmounts {
         Self {
             input: StepAmount::new(input),
             output: StepAmount::new(output),
+            offers_used: 0,
+            inactive: false,
         }
     }
 
@@ -122,6 +127,17 @@ impl StepAmounts {
         Self {
             input: StepAmount::with_currency(input, currency),
             output: StepAmount::with_currency(output, currency),
+            offers_used: 0,
+            inactive: false,
+        }
+    }
+
+    fn book(input: STAmount, output: STAmount, offers_used: u32) -> Self {
+        Self {
+            input: StepAmount::new(input),
+            output: StepAmount::new(output),
+            offers_used,
+            inactive: offers_used >= crate::domain::ripple_calc::book_step::MAX_OFFERS_TO_CONSUME,
         }
     }
 }
@@ -130,10 +146,18 @@ impl StepAmounts {
 #[derive(Debug, Clone)]
 pub struct StepContext<'a> {
     pub strand_src: &'a AccountID,
+    pub strand_dst: &'a AccountID,
+    pub strand_deliver: Asset,
     pub quality_threshold: Option<Quality>,
     /// Present only for direct/default OfferCreate crossings. It is separate
     /// from the flow sandbox so self-offer cancellations survive a dry flow.
     pub self_cross_cancellation: Option<SelfCrossCancellation>,
+    pub amm_context: AmmContext,
+    /// Sum of each BookStep's offers-used value for the current strand run.
+    /// The runner resets this between the discarded reverse probe and replay.
+    pub offer_usage: Rc<Cell<u32>>,
+    /// Debt direction immediately before the currently executing step.
+    pub previous_redeems: Rc<Cell<bool>>,
 }
 
 /// The Rust counterpart to rippled's `Step`.  Both directions mutate only the
@@ -209,12 +233,27 @@ impl FlowStep for StepKind {
                         quality_threshold: context.quality_threshold,
                         remove_self_crossing: *remove_self_crossing,
                         self_cross_cancellation: context.self_cross_cancellation.clone(),
+                        amm_context: Some(context.amm_context.clone()),
+                        previous_redeems: context.previous_redeems.get(),
+                        strand_dst: Some(context.strand_dst),
+                        strand_deliver: Some(context.strand_deliver),
+                        enforce_quality_threshold: *remove_self_crossing,
                     },
+                );
+                context.offer_usage.set(
+                    context
+                        .offer_usage
+                        .get()
+                        .saturating_add(result.offers_consumed),
                 );
                 if result.ter != Ter::TES_SUCCESS {
                     return Err(result.ter);
                 }
-                Ok(StepAmounts::new(result.amount_in, result.amount_out))
+                Ok(StepAmounts::book(
+                    result.amount_in,
+                    result.amount_out,
+                    result.offers_consumed,
+                ))
             }
         }
     }
@@ -273,15 +312,102 @@ impl FlowStep for StepKind {
                         quality_threshold: context.quality_threshold,
                         remove_self_crossing: *remove_self_crossing,
                         self_cross_cancellation: context.self_cross_cancellation.clone(),
+                        amm_context: Some(context.amm_context.clone()),
+                        previous_redeems: context.previous_redeems.get(),
+                        strand_dst: Some(context.strand_dst),
+                        strand_deliver: Some(context.strand_deliver),
+                        enforce_quality_threshold: *remove_self_crossing,
                     },
+                );
+                context.offer_usage.set(
+                    context
+                        .offer_usage
+                        .get()
+                        .saturating_add(result.offers_consumed),
                 );
                 if result.ter != Ter::TES_SUCCESS {
                     return Err(result.ter);
                 }
-                Ok(StepAmounts::new(result.amount_in, result.amount_out))
+                Ok(StepAmounts::book(
+                    result.amount_in,
+                    result.amount_out,
+                    result.offers_consumed,
+                ))
             }
         }
     }
+}
+
+impl StepKind {
+    /// Current theoretical quality used to order ActiveStrands.  The boolean
+    /// carries rippled's previous-step DebtDirection (`true` = Redeems).
+    pub(crate) fn quality_upper_bound<V: ApplyView>(
+        &self,
+        view: &mut V,
+        previous_redeems: bool,
+        context: &StepContext<'_>,
+    ) -> Option<(Quality, bool)> {
+        match self {
+            StepKind::XrpEndpoint { .. } => Some((quality_one(), false)),
+            StepKind::Direct { src, dst, currency } => {
+                use crate::domain::ripple_calc::direct_step::{
+                    DebtDirection, qualities_src_issues, qualities_src_redeems,
+                };
+                let (_, direction) = crate::domain::ripple_calc::direct_step::max_payment_flow(
+                    view, src, dst, *currency,
+                );
+                let redeeming = direction == DebtDirection::Redeems;
+                let (quality_out, quality_in) = if redeeming {
+                    qualities_src_redeems(view, src, dst, *currency)
+                } else {
+                    qualities_src_issues(view, src, dst, *currency, previous_redeems)
+                };
+                let issue = Issue::new(*currency, *src);
+                let input = STAmount::from_iou_amount(
+                    sf("sfAmount"),
+                    protocol::IOUAmount::from_parts(i64::from(quality_out), 0).ok()?,
+                    issue,
+                );
+                let output = STAmount::from_iou_amount(
+                    sf("sfAmount"),
+                    protocol::IOUAmount::from_parts(i64::from(quality_in), 0).ok()?,
+                    issue,
+                );
+                Some((
+                    Quality::from_amounts(&protocol::Amounts::new(input, output)),
+                    redeeming,
+                ))
+            }
+            StepKind::Book {
+                book_in,
+                book_out,
+                owner_pays_transfer_fee,
+                ..
+            } => {
+                let book = crate::domain::ripple_calc::book_step::Book {
+                    r#in: Asset::Issue(*book_in),
+                    out: Asset::Issue(*book_out),
+                    domain: None,
+                };
+                crate::domain::ripple_calc::book_step::book_quality_upper_bound(
+                    view,
+                    &book,
+                    context.quality_threshold,
+                    &context.amm_context,
+                    *owner_pays_transfer_fee,
+                    previous_redeems,
+                    context.strand_dst,
+                    context.strand_deliver,
+                )
+                .map(|quality| (quality, false))
+            }
+        }
+    }
+}
+
+fn quality_one() -> Quality {
+    let one = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+    Quality::from_amounts(&protocol::Amounts::new(one.clone(), one))
 }
 
 fn normalize_amount_asset(amount: &STAmount, asset: Asset) -> STAmount {
@@ -454,5 +580,15 @@ mod tests {
         let xrp_send_max = STAmount::from_xrp_amount(XRPAmount::from_drops(1_000_000));
 
         assert_eq!(required.greater_than(&xrp_send_max), None);
+    }
+
+    #[test]
+    fn book_step_reaching_offer_cap_marks_strand_inactive() {
+        let input = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+        let output = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+        assert!(!StepAmounts::book(input.clone(), output.clone(), 999).inactive);
+        let capped = StepAmounts::book(input, output, 1000);
+        assert!(capped.inactive);
+        assert_eq!(capped.offers_used, 1000);
     }
 }

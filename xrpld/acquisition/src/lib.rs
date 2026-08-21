@@ -1,8 +1,8 @@
 //! Pure protocol surface for the single-owner acquisition migration.
 //!
 //! This crate defines the typed boundary between the acquisition domain and the
-//! application adapters that serve it. The migration contract (see
-//! `AGENTS.md`, milestone M1) requires a Rust-native, single-owner lifecycle:
+//! application adapters that serve it. The architecture documented in
+//! `docs/ARCHITECTURE.md` requires a Rust-native, single-owner lifecycle:
 //! one `AcquisitionCoordinator` owns every mutable acquisition-domain state on a
 //! single serialized owner, receives typed [`AcquisitionEvent`]s, and emits
 //! typed [`AcquisitionEffect`]s.

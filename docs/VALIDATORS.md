@@ -8,8 +8,10 @@ trusted list, and appearing on a public explorer can lag network observation.
 
 Before enabling validation, operate the node reliably in `full` state with a
 stable public peer endpoint, accurate host time, sufficient storage, and
-working validator-list publishers. Keep RPC and WebSocket administration on a
-private interface or SSH tunnel.
+working validator-list publishers. Reliability means sustained canonical
+closed-ledger and validated advancement, bounded lag, a coherent coordinator
+phase, and no recurring Full/Syncing cycle. Keep RPC and WebSocket
+administration on a private interface or SSH tunnel.
 
 ## Generate an identity
 
@@ -71,7 +73,9 @@ quaxar server-info
 
 When synchronized, a validating server normally reports `proposing` and
 `server_info` exposes `pubkey_validator`. `full` is the healthy terminal state
-for a server without an active validation identity.
+for a server without an active validation identity. These labels are
+point-in-time signals; confirm continued ledger advancement before treating the
+validator as operational.
 
 ## Trust and explorer visibility
 

@@ -4,10 +4,88 @@ pub mod steps;
 pub mod strand_builder;
 pub mod strand_flow;
 
-use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{BTreeSet, HashMap},
+    rc::Rc,
+};
 
 use basics::base_uint::Uint256;
 use protocol::{AccountID, Asset, Issue, Keylet, LedgerEntryType, STAmount, Ter};
+
+const MAX_AMM_ITERATIONS: u16 = 30;
+
+#[derive(Debug, Clone)]
+pub struct AmmContext {
+    inner: Rc<RefCell<AmmContextState>>,
+}
+
+#[derive(Debug)]
+struct AmmContextState {
+    account: AccountID,
+    multi_path: bool,
+    amm_used: bool,
+    iterations: u16,
+    initial_balances: HashMap<(Asset, Asset), (STAmount, STAmount)>,
+}
+
+impl AmmContext {
+    pub fn new(account: AccountID, multi_path: bool) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(AmmContextState {
+                account,
+                multi_path,
+                amm_used: false,
+                iterations: 0,
+                initial_balances: HashMap::new(),
+            })),
+        }
+    }
+
+    pub fn account(&self) -> AccountID {
+        self.inner.borrow().account
+    }
+    pub fn multi_path(&self) -> bool {
+        self.inner.borrow().multi_path
+    }
+    pub fn set_multi_path(&self, value: bool) {
+        self.inner.borrow_mut().multi_path = value;
+    }
+    pub fn set_amm_used(&self) {
+        self.inner.borrow_mut().amm_used = true;
+    }
+    pub fn clear(&self) {
+        self.inner.borrow_mut().amm_used = false;
+    }
+    pub fn update(&self) {
+        let mut state = self.inner.borrow_mut();
+        if state.amm_used {
+            state.iterations += 1;
+        }
+        state.amm_used = false;
+    }
+    pub fn iterations(&self) -> u16 {
+        self.inner.borrow().iterations
+    }
+    pub fn max_iterations_reached(&self) -> bool {
+        self.iterations() >= MAX_AMM_ITERATIONS
+    }
+    pub fn initial_balances(
+        &self,
+        book: (Asset, Asset),
+        current: &(STAmount, STAmount),
+    ) -> (STAmount, STAmount) {
+        let mut state = self.inner.borrow_mut();
+        if let Some(initial) = state.initial_balances.get(&book) {
+            return initial.clone();
+        }
+        state.initial_balances.insert(book, current.clone());
+        state
+            .initial_balances
+            .insert((book.1, book.0), (current.1.clone(), current.0.clone()));
+        current.clone()
+    }
+}
 
 /// A Strand is an ordered sequence of StepKind from source to destination.
 pub type Strand = Vec<StepKind>;

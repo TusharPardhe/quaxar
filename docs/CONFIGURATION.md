@@ -25,6 +25,14 @@ migrate a legacy file, but operators should verify the final
 `/etc/quaxar/quaxar.cfg` path and its protected validator credentials before
 starting the service.
 
+### Diagnostic environment
+
+Set `QUAXAR_ACQUISITION_SHADOW=1` to enable the bounded, read-only acquisition
+shadow on the serialized coordinator owner. It compares typed events, exact
+session/timer identities, effects, and derived phase decisions without becoming
+a second lifecycle authority. The shadow is disabled by default and should be
+enabled temporarily when auditing acquisition parity or mode transitions.
+
 ## Core Sections
 
 ### `[server]`
@@ -73,6 +81,10 @@ Profiles currently map to history-prefetch and cache defaults:
 The profile also influences SHAMap tree-cache size and age, sweep cadence, the
 adjacent history-fetch window, and selected JobQueue defaults. Prefer changing
 `node_size` before using expert overrides.
+
+Cache profile and RAM use affect retention and performance, not preferred-LCL
+correctness. Do not increase `node_size` to mask repeated mode transitions or
+growing local-closed versus validated-ledger lag.
 
 ### `[sweep_interval]`
 

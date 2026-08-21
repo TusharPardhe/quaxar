@@ -64,8 +64,10 @@ only when intentionally changing the deployment design.
 
 The initial Rust build can take several minutes. Do not treat an EC2
 `instance-status-ok` result as proof that application bootstrap has finished.
-The bootstrap RPC check proves local service readiness, not completion of
-ledger synchronization; confirm `server_state` and validated-ledger progress.
+The bootstrap RPC check proves local service reachability, not completion of
+ledger synchronization. Before enabling validator operation, repeatedly
+confirm local closed/current, validated, published, and coordinator phase
+identities advance together without recurring mode transitions.
 
 ```bash
 ssh -i ~/.ssh/quaxar-testnet-2026.pem ubuntu@<elastic-ip> \
@@ -76,7 +78,14 @@ ssh -i ~/.ssh/quaxar-testnet-2026.pem ubuntu@<elastic-ip> \
 
 ssh -i ~/.ssh/quaxar-testnet-2026.pem -L 5005:127.0.0.1:5005 ubuntu@<elastic-ip>
 curl -sS http://127.0.0.1:5005 -d '{"method":"server_info","params":[{}]}'
+curl -sS http://127.0.0.1:5005 -d '{"method":"ledger_closed","params":[{}]}'
+curl -sS http://127.0.0.1:5005 -d '{"method":"fetch_info","params":[{}]}'
+curl -sS http://127.0.0.1:5005 -d '{"method":"get_counts","params":[{}]}'
 ```
+
+For deployment evidence, also record the staged binary checksum, build commit,
+unit/config paths, and recent mode-transition journal entries. Redact validator
+seeds and all other credentials.
 
 To stop compute charges without releasing the static endpoint, stop the EC2
 instance. The EIP and retained 200 GiB volume continue to incur AWS charges.

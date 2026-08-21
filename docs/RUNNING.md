@@ -246,8 +246,9 @@ stage the new binary before the outage; then stop both old and new units before
 moving data or changing ownership. Copy (do not remove) the protected legacy
 config to `/etc/quaxar/quaxar.cfg`, update and validate its paths/listeners, and
 transfer only the directories actually named by that config. Start Quaxar
-without disabling the old unit, require a stable local `server_info` response
-and writable database, and only then enable Quaxar and disable the old unit. On
+without disabling the old unit, require sustained `full`/`proposing` operation,
+advancing local-closed and validated ledgers, no recurring mode churn, and a
+writable database before enabling Quaxar and disabling the old unit. On
 failure, stop Quaxar, restore paths/ownership, and restart the old unit. Never
 run both daemons against one NuDB. Deployments that still intentionally run
 `quaxar.service` under an `xrpld` account must keep that ownership in deployment
@@ -255,12 +256,22 @@ commands until this explicit cutover is performed.
 
 ## Monitoring
 
-### Health Check
+### Liveness and readiness
 
 ```bash
 quaxar health
-# Exit code 0 = reachable (healthy or syncing)
+# Exit code 0 = reachable (including while syncing)
 # Exit code 1 = unreachable (down)
+```
+
+`health` is a liveness check, not a readiness gate. Sample these commands over
+multiple ledger closes before declaring a node ready:
+
+```bash
+quaxar ledger-closed
+quaxar ledger-current
+quaxar server-info
+quaxar fetch-info
 ```
 
 Or via RPC:
@@ -389,6 +400,8 @@ alternative sync methods.
 | OpenSSL build failure | Missing system OpenSSL | `sudo apt install libssl-dev pkg-config` |
 | Node stuck in "connected" | Validator list not loading | Ensure `[validators_file]` points to valid file, or add `[validator_list_sites]` directly to config |
 | Slow sync | Slow storage, limited bandwidth, or unstable peers | Use fast SSD storage and verify sustained network throughput and peer stability |
+| Full/proposing repeatedly returns to syncing | Preferred-LCL reconciliation is not converging | Compare repeated local closed, validated, published, and coordinator phase identities; capture mode-transition logs and `last_recovery_lcl_decision` |
+| Validated advances while local closed/coordinator LCL lags | Local consensus or recovery-anchor state is stale | Capture `server_info`, `ledger-closed`, `fetch-info`, session counters, and a redacted config; do not treat RAM growth as proof of correctness |
 | Port already in use | Another process on same port | Check with `lsof -i :51235`, change port in config |
 | No peers connecting | Firewall blocking port 51235 | Open TCP 51235 inbound |
 | Linker error after enabling optional config | The selected linker is unavailable | Install the configured linker or comment out only the operator-enabled target stanza |

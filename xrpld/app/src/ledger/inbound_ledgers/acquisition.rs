@@ -4952,7 +4952,7 @@ mod actor_mailbox_tests {
         ));
         assert!(matches!(
             plan.advance(256, 16, &mut resident, &mut first_child,),
-            TreeAdvance::NeedsNetwork(_)
+            TreeAdvance::Ready
         ));
     }
 
