@@ -79,8 +79,8 @@ pub use crate::port::{
     TimerPort, WritePort,
 };
 pub use crate::runner::{
-    BudgetState, CoordinatorRunner, CoordinatorSession, CoordinatorState, RunnerSnapshot,
-    RunnerStats,
+    BudgetState, CoordinatorRunner, CoordinatorSession, CoordinatorState, RunnerSessionSnapshot,
+    RunnerSnapshot, RunnerStats,
 };
 pub use crate::session::{
     CancelReason, FailureReason, SessionOutcome, SessionPhase, session_phase_transition,

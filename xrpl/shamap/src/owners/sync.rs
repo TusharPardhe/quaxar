@@ -42,11 +42,6 @@ use std::thread;
 pub use crate::family::{FullBelowCache, NullFullBelowCache};
 
 pub const DEFAULT_MAX_DEFERRED_MISSING_NODE_READS: usize = 512;
-/// rippled's response-driven `InboundLedger::filterNodes` wire batch. A
-/// continuation may discover twice this many candidates in one scan, but
-/// releasing each miss independently defeats request coalescing and waiting
-/// for the entire scan serializes the owner behind NodeStore latency.
-pub const DEFAULT_NETWORK_FRONTIER_BATCH: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SHAMapType {
@@ -3337,13 +3332,7 @@ impl MissingNodeContinuation {
         if !reads.is_empty() {
             return MissingNodeAdvance::NeedsReads(reads);
         }
-        // Pipeline rippled-sized peer batches while deferred NodeStore reads
-        // continue settling. A short final tail is released only after the
-        // current read batch drains, matching gmnProcessDeferredReads without
-        // blocking a full 128-node request on all 256 scan candidates.
-        if self.unannounced_network.len() >= DEFAULT_NETWORK_FRONTIER_BATCH
-            || (self.pending_by_hash.is_empty() && !self.unannounced_network.is_empty())
-        {
+        if !self.unannounced_network.is_empty() {
             return MissingNodeAdvance::NeedsNetwork(std::mem::take(&mut self.unannounced_network));
         }
         if self.invalid {
@@ -6326,53 +6315,6 @@ mod native_missing_node_continuation_tests {
             continuation.advance(32, 4, &mut resident, &mut || 0),
             MissingNodeAdvance::Complete
         ));
-    }
-
-    #[test]
-    fn full_peer_batch_is_released_while_deferred_reads_remain_pending() {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        root.set_child_hash(0, hash(0x2f));
-        root.update_hash();
-        let mut continuation = continuation(&root, 32);
-        continuation.stack.clear();
-        let pending_hash = hash(0x30);
-        continuation.pending_by_hash.insert(
-            pending_hash,
-            PendingReadEdges {
-                need: ReadNeed {
-                    hash: pending_hash,
-                    ledger_seq: 77,
-                    node_id: SHAMapNodeId::default(),
-                    branch: 0,
-                },
-                edges: Vec::new(),
-            },
-        );
-        continuation
-            .unannounced_network
-            .extend((0..DEFAULT_NETWORK_FRONTIER_BATCH - 1).map(|index| {
-                (
-                    SHAMapNodeId::default(),
-                    Uint256::from(u64::try_from(index + 1).expect("batch index fits u64")),
-                )
-            }));
-        let mut resident = EmptyResident;
-        assert!(matches!(
-            continuation.advance(0, 0, &mut resident, &mut || 0),
-            MissingNodeAdvance::Ready
-        ));
-
-        continuation.unannounced_network.push((
-            SHAMapNodeId::default(),
-            Uint256::from(DEFAULT_NETWORK_FRONTIER_BATCH as u64),
-        ));
-        let MissingNodeAdvance::NeedsNetwork(batch) =
-            continuation.advance(0, 0, &mut resident, &mut || 0)
-        else {
-            panic!("expected a full peer batch without waiting for the read tail");
-        };
-        assert_eq!(batch.len(), DEFAULT_NETWORK_FRONTIER_BATCH);
-        assert_eq!(continuation.pending_hashes(), 1);
     }
 
     #[test]

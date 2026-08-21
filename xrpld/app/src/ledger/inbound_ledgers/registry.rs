@@ -2449,6 +2449,85 @@ impl InboundLedgers {
             .iter()
             .map(|(reason, count)| (reason.label().to_owned(), JsonValue::Unsigned(*count)))
             .collect::<BTreeMap<_, _>>();
+        let session_details = snapshot
+            .session_details()
+            .iter()
+            .map(|session| {
+                JsonValue::Object(BTreeMap::from([
+                    (
+                        "session_id".to_owned(),
+                        JsonValue::Unsigned(session.session_id()),
+                    ),
+                    (
+                        "target_hash".to_owned(),
+                        JsonValue::String(session.target_hash().to_owned()),
+                    ),
+                    (
+                        "target_sequence".to_owned(),
+                        session
+                            .target_sequence()
+                            .map(|sequence| JsonValue::Unsigned(sequence.into()))
+                            .unwrap_or(JsonValue::Null),
+                    ),
+                    (
+                        "reason".to_owned(),
+                        JsonValue::String(format!("{:?}", session.reason()).to_ascii_lowercase()),
+                    ),
+                    (
+                        "phase".to_owned(),
+                        JsonValue::String(session.phase().to_owned()),
+                    ),
+                    (
+                        "network_admitted".to_owned(),
+                        JsonValue::Bool(session.network_admitted()),
+                    ),
+                    (
+                        "peers".to_owned(),
+                        JsonValue::Unsigned(session.peer_count() as u64),
+                    ),
+                    (
+                        "plan_seeded".to_owned(),
+                        JsonValue::Bool(session.plan_seeded()),
+                    ),
+                    (
+                        "plan_runs".to_owned(),
+                        JsonValue::Unsigned(session.plan_runs()),
+                    ),
+                    (
+                        "timeouts".to_owned(),
+                        JsonValue::Unsigned(session.timeouts().into()),
+                    ),
+                    (
+                        "packet_count".to_owned(),
+                        JsonValue::Unsigned(session.packet_count()),
+                    ),
+                    (
+                        "packet_bytes".to_owned(),
+                        JsonValue::Unsigned(session.packet_bytes()),
+                    ),
+                    (
+                        "pending_reads".to_owned(),
+                        JsonValue::Unsigned(session.pending_reads() as u64),
+                    ),
+                    (
+                        "read_backlog".to_owned(),
+                        JsonValue::Unsigned(session.read_backlog() as u64),
+                    ),
+                    (
+                        "pending_network".to_owned(),
+                        JsonValue::Unsigned(session.pending_network() as u64),
+                    ),
+                    (
+                        "retained_network".to_owned(),
+                        JsonValue::Unsigned(session.retained_network() as u64),
+                    ),
+                    (
+                        "persistence".to_owned(),
+                        JsonValue::String(session.persistence().to_owned()),
+                    ),
+                ]))
+            })
+            .collect::<Vec<_>>();
         JsonValue::Object(BTreeMap::from([
             (
                 "run_epoch".to_owned(),
@@ -2465,6 +2544,10 @@ impl InboundLedgers {
             (
                 "active_by_reason".to_owned(),
                 JsonValue::Object(active_by_reason),
+            ),
+            (
+                "session_details".to_owned(),
+                JsonValue::Array(session_details),
             ),
             (
                 "storage_generation".to_owned(),

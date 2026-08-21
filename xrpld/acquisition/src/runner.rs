@@ -320,11 +320,87 @@ impl CoordinatorSession {
 /// the adapter-level [`crate::CoordinatorSnapshot`]; this snapshot reports what
 /// the runner owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerSessionSnapshot {
+    session_id: u64,
+    target_hash: String,
+    target_sequence: Option<u32>,
+    reason: AcquireReason,
+    phase: &'static str,
+    network_admitted: bool,
+    peer_count: usize,
+    plan_seeded: bool,
+    plan_runs: u64,
+    timeouts: u32,
+    packet_count: u64,
+    packet_bytes: u64,
+    pending_reads: usize,
+    read_backlog: usize,
+    pending_network: usize,
+    retained_network: usize,
+    persistence: &'static str,
+}
+
+impl RunnerSessionSnapshot {
+    pub const fn session_id(&self) -> u64 {
+        self.session_id
+    }
+    pub fn target_hash(&self) -> &str {
+        &self.target_hash
+    }
+    pub const fn target_sequence(&self) -> Option<u32> {
+        self.target_sequence
+    }
+    pub const fn reason(&self) -> AcquireReason {
+        self.reason
+    }
+    pub const fn phase(&self) -> &'static str {
+        self.phase
+    }
+    pub const fn network_admitted(&self) -> bool {
+        self.network_admitted
+    }
+    pub const fn peer_count(&self) -> usize {
+        self.peer_count
+    }
+    pub const fn plan_seeded(&self) -> bool {
+        self.plan_seeded
+    }
+    pub const fn plan_runs(&self) -> u64 {
+        self.plan_runs
+    }
+    pub const fn timeouts(&self) -> u32 {
+        self.timeouts
+    }
+    pub const fn packet_count(&self) -> u64 {
+        self.packet_count
+    }
+    pub const fn packet_bytes(&self) -> u64 {
+        self.packet_bytes
+    }
+    pub const fn pending_reads(&self) -> usize {
+        self.pending_reads
+    }
+    pub const fn read_backlog(&self) -> usize {
+        self.read_backlog
+    }
+    pub const fn pending_network(&self) -> usize {
+        self.pending_network
+    }
+    pub const fn retained_network(&self) -> usize {
+        self.retained_network
+    }
+    pub const fn persistence(&self) -> &'static str {
+        self.persistence
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerSnapshot {
     run_epoch: RunEpoch,
     phase: SyncPhase,
     session_count: usize,
     active_by_reason: BTreeMap<AcquireReason, usize>,
+    session_details: Vec<RunnerSessionSnapshot>,
     storage_generation: StoreGeneration,
     peer_count: usize,
     events_handled: u64,
@@ -364,6 +440,12 @@ impl RunnerSnapshot {
     /// Live sessions grouped by acquisition reason.
     pub fn active_by_reason(&self) -> &BTreeMap<AcquireReason, usize> {
         &self.active_by_reason
+    }
+
+    /// Per-session acquisition state used to distinguish disk, network, and
+    /// lifecycle stalls without enabling high-volume trace logging.
+    pub fn session_details(&self) -> &[RunnerSessionSnapshot] {
+        &self.session_details
     }
 
     /// The current NodeStore generation.
@@ -681,11 +763,36 @@ impl CoordinatorRunner {
                 *active_by_reason.entry(session.reason).or_insert(0usize) += 1;
             }
         }
+        let session_details = self
+            .state
+            .sessions
+            .iter()
+            .map(|(session, state)| RunnerSessionSnapshot {
+                session_id: session.session_id().get(),
+                target_hash: session.target_hash().to_string(),
+                target_sequence: state.target.sequence(),
+                reason: state.reason,
+                phase: state.phase.label(),
+                network_admitted: state.network_admitted,
+                peer_count: state.sent_peers.len(),
+                plan_seeded: state.plan.engine().is_some(),
+                plan_runs: state.plan.runs(),
+                timeouts: state.plan.timeouts(),
+                packet_count: state.plan.packet_count(),
+                packet_bytes: state.plan.packet_bytes(),
+                pending_reads: state.plan.pending_read_count(),
+                read_backlog: state.plan.read_backlog_count(),
+                pending_network: state.plan.pending_network().len(),
+                retained_network: state.plan.retained_network().len(),
+                persistence: state.plan.persistence().label(),
+            })
+            .collect();
         RunnerSnapshot {
             run_epoch: self.state.run_epoch,
             phase: self.state.phase,
             session_count: self.state.sessions.len(),
             active_by_reason,
+            session_details,
             storage_generation: self.state.storage_generation,
             peer_count: self.state.peer_view.peers().len(),
             events_handled: self.stats.events_handled,
