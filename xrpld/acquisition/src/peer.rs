@@ -123,6 +123,11 @@ pub enum LedgerDataRequest {
         kind: TreeKind,
         node_ids: Vec<SHAMapNodeId>,
         sequence: u32,
+        /// Rippled requests descendants one level deep for reply-driven
+        /// continuation and uses depth zero for blind/timeout work.
+        query_depth: u32,
+        /// Set `qtINDIRECT` after the first acquisition timeout.
+        indirect: bool,
     },
     /// Request kind-qualified tree nodes by hash after an aggressive
     /// no-progress retry. `sequence` is the Base-verified header sequence

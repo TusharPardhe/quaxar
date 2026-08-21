@@ -60,13 +60,11 @@ pub const MAX_TURNS_PER_EVENT: u32 = 4;
 pub const MAX_PACKETS_FED_PER_TURN: usize = 4;
 /// Unique pending reads cap (mirrors the broker logical admission ceiling).
 pub const MAX_PENDING_READS: usize = 512;
-/// Maximum exact `PlanNetworkNeed` records actively retained from the current
-/// traversal frontier. The cap is one initial 12-node blind request plus the
-/// six 12-node no-progress retry windows allowed by rippled's timeout policy;
-/// excess exact needs stay in `network_backlog` until an attachment frees a
-/// slot, never silently disappearing.
-pub const MAX_RETAINED_NETWORK_FRONTIER: usize =
-    MAX_TIMEOUT_REPROBES * (DEFAULT_MAX_ACQUIRE_TIMEOUTS as usize + 1);
+/// Maximum exact `PlanNetworkNeed` records actively retained from one missing
+/// node scan. Rippled's `kMissingNodesFind` is 256; retaining that complete
+/// scan is required so a reply-driven request can use its 128-node limit.
+/// Timeout recovery still rotates bounded 12-node batches over this frontier.
+pub const MAX_RETAINED_NETWORK_FRONTIER: usize = 256;
 /// Maximum exact frontier nodes retried during one no-progress timeout. This
 /// matches rippled's blind request cap (`kReqNodes`) while a rotating cursor
 /// gives every retained frontier entry a bounded chance to be retried.
@@ -2803,7 +2801,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_network_frontier_caps_at_eighty_four_and_preserves_overflow_backlog() {
+    fn retained_network_frontier_caps_at_rippled_scan_bound_and_preserves_overflow_backlog() {
         let mut ids = IdCounter::new();
         let s = session();
         let needs = (0..(MAX_RETAINED_NETWORK_FRONTIER + 1))
@@ -2821,7 +2819,7 @@ mod tests {
         let PlanTurn::Network(dispatched) = plan.run_turn(&mut ctx(s, &mut ids)) else {
             panic!("expected retained network frontier dispatch");
         };
-        assert_eq!(MAX_RETAINED_NETWORK_FRONTIER, 84);
+        assert_eq!(MAX_RETAINED_NETWORK_FRONTIER, 256);
         assert_eq!(dispatched.len(), MAX_RETAINED_NETWORK_FRONTIER);
         assert_eq!(plan.retained_network().len(), MAX_RETAINED_NETWORK_FRONTIER);
         assert_eq!(plan.network_backlog.len(), 1);

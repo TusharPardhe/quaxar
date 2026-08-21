@@ -2547,21 +2547,23 @@ impl CoordinatorRunner {
             return;
         }
         let available = self.state.peer_view.peers();
-        let Some((sequence, peers)) = self.state.sessions.get(&session).and_then(|state| {
-            (state.phase == SessionPhase::Active && state.network_admitted).then(|| {
-                let peers = match reply_peer {
-                    Some(peer) if available.contains(&peer) => vec![peer],
-                    Some(_) => Vec::new(),
-                    None => state
-                        .sent_peers
-                        .iter()
-                        .copied()
-                        .filter(|peer| available.contains(peer))
-                        .collect::<Vec<_>>(),
-                };
-                (state.plan.ledger_sequence(), peers)
+        let Some((sequence, timeout_count, peers)) =
+            self.state.sessions.get(&session).and_then(|state| {
+                (state.phase == SessionPhase::Active && state.network_admitted).then(|| {
+                    let peers = match reply_peer {
+                        Some(peer) if available.contains(&peer) => vec![peer],
+                        Some(_) => Vec::new(),
+                        None => state
+                            .sent_peers
+                            .iter()
+                            .copied()
+                            .filter(|peer| available.contains(peer))
+                            .collect::<Vec<_>>(),
+                    };
+                    (state.plan.ledger_sequence(), state.plan.timeouts(), peers)
+                })
             })
-        }) else {
+        else {
             return;
         };
         let Some(sequence) = sequence else {
@@ -2575,6 +2577,7 @@ impl CoordinatorRunner {
         } else {
             BLIND_NODE_REQUEST_BATCH
         };
+        let query_depth = u32::from(reply_peer.is_some());
         // Never remove plan work until this bounded owner queue can retain a
         // request intent for every selected peer. A full queue therefore
         // delays a normal frontier batch instead of silently losing it.
@@ -2627,6 +2630,8 @@ impl CoordinatorRunner {
                     kind,
                     node_ids: node_ids.clone(),
                     sequence,
+                    query_depth,
+                    indirect: timeout_count != 0,
                 },
                 "normal_frontier",
             );
@@ -3055,6 +3060,8 @@ impl CoordinatorRunner {
                         kind,
                         node_ids: node_ids.clone(),
                         sequence,
+                        query_depth: 0,
+                        indirect: true,
                     },
                     "timeout_frontier",
                 );
@@ -5128,6 +5135,8 @@ mod tests {
                         kind: ledger::TreeKind::Transaction,
                         node_ids,
                         sequence: 1,
+                        query_depth: 0,
+                        indirect: true,
                     } if node_ids == &vec![SHAMapNodeId::default()]
                 )
         }));
@@ -5242,7 +5251,11 @@ mod tests {
         assert_eq!(requests[0].peer_id(), PeerId::new(3));
         assert!(matches!(
             requests[0].request(),
-            LedgerDataRequest::GetLedgerNodes { .. }
+            LedgerDataRequest::GetLedgerNodes {
+                query_depth: 1,
+                indirect: false,
+                ..
+            }
         ));
     }
 

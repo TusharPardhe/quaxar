@@ -69,6 +69,7 @@ use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 const LI_BASE: i32 = 0;
 const LI_TX_NODE: i32 = 1;
 const LI_AS_NODE: i32 = 2;
+const QT_INDIRECT: i32 = 0;
 
 /// Lifecycle, cancellation, handoff, write, and timer facts use this bounded
 /// reserved channel. Producers use `send`, applying backpressure instead of
@@ -754,6 +755,8 @@ fn frame_ledger_request(
             kind,
             node_ids,
             sequence,
+            query_depth,
+            indirect,
         } => Some(make_get_ledger_with_node_ids(
             SHAMapHash::new(session.target_hash()),
             *sequence,
@@ -762,8 +765,8 @@ fn frame_ledger_request(
                 ledger::TreeKind::Transaction => LI_TX_NODE,
             },
             node_ids,
-            0,
-            None,
+            *query_depth,
+            indirect.then_some(QT_INDIRECT),
         )),
         LedgerDataRequest::GetNodes { nodes, sequence } => {
             let first = nodes.first()?;
@@ -1708,6 +1711,8 @@ mod tests {
                 kind: ledger::TreeKind::State,
                 node_ids: vec![node_id],
                 sequence: SEQ,
+                query_depth: 1,
+                indirect: true,
             },
         );
         let frame =
@@ -1717,6 +1722,8 @@ mod tests {
                 assert_eq!(tm.itype, LI_AS_NODE);
                 assert_eq!(tm.ledger_seq, Some(SEQ));
                 assert_eq!(tm.node_i_ds, vec![node_id.get_raw_string()]);
+                assert_eq!(tm.query_depth, Some(1));
+                assert_eq!(tm.query_type, Some(QT_INDIRECT));
             }
             other => panic!("expected GetLedger, got {other:?}"),
         }
