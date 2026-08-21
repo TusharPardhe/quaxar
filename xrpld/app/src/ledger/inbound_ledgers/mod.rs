@@ -17,6 +17,8 @@ mod registry;
 mod scheduler;
 mod worker_pool;
 
+#[cfg(test)]
+pub(crate) use self::acquisition::ACQ_MAILBOX_PACKET_CAPACITY;
 pub(crate) use self::acquisition::ProvisionalLedgerIdentity;
 pub use self::acquisition::{AcquisitionState, InboundPacketAdmissionLease, stash_stale_packet};
 pub use self::read_broker::{

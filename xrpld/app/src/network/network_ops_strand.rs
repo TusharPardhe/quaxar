@@ -21,7 +21,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use basics::base_uint::Uint256;
-use consensus::algorithm::ConsensusPhase;
+use consensus::algorithm::{ConsensusMode, ConsensusPhase};
 
 use crate::ApplicationRoot;
 use crate::consensus::rcl_consensus::{ConsensusRunner, PendingAcceptWork};
@@ -800,6 +800,19 @@ fn strand_loop(
             drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |_| {});
         }
 
+        // A WrongLedger round already owns one exact recovery target in
+        // `prev_ledger_id`. Once that target completes, install it before a
+        // timer tick can recompute a newer preferred head. This is the
+        // AcqDone -> switchLastClosedLedger handoff; it uses the consensus
+        // target rather than introducing a second preferred-target state.
+        let recovered_wrong_ledger = install_completed_wrong_ledger_target(
+            &root,
+            &shared_inbound,
+            &mut runner,
+            &consensus_rt,
+            &mut last_round_ledger_id,
+        );
+
         // ─── 6c. pending_consensus_ledger → acquire_async ────────────────
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let pending = lm_rt.take_pending_consensus_ledger();
@@ -825,7 +838,7 @@ fn strand_loop(
             scheduler.accept_is_queued(),
             scheduler.has_pending_accept(),
         );
-        if registry_completion_count != 0 && !end_consensus_pass {
+        if registry_completion_count != 0 && !end_consensus_pass && !recovered_wrong_ledger {
             tracing::info!(
                 target: "lcl_trace",
                 event = "reconcile_deferred_after_completion",
@@ -958,6 +971,81 @@ fn strand_loop(
 }
 
 // ─── checkLastClosedLedger / switchLastClosedLedger ─────────────────────────
+
+/// Complete the strand-owned half of an inbound AcqDone handoff while the
+/// generic consensus engine is waiting on its exact WrongLedger target.
+///
+/// Without this step, the completed ledger is only cached and checkAccepted;
+/// the next consensus timer may select a newer preferred hash before the
+/// completed target reaches the closed-ledger/open-ledger switch path.
+fn install_completed_wrong_ledger_target(
+    root: &ApplicationRoot,
+    shared_inbound: &Arc<InboundLedgers>,
+    runner: &mut dyn ConsensusRunner,
+    consensus_rt: &AppConsensusRuntime,
+    last_round_ledger_id: &mut Option<Uint256>,
+) -> bool {
+    if runner.consensus_mode() != ConsensusMode::WrongLedger {
+        return false;
+    }
+
+    // Preserve the same outer transition boundary as Accepted-phase
+    // reconciliation. The gate is reentrant because switch postconditions
+    // call ApplicationRoot helpers that also defend their public entrypoints.
+    let transition_wait_started = Instant::now();
+    let _lcl_transition_guard = root.lcl_transition_gate().lock();
+    let transition_wait = transition_wait_started.elapsed();
+    let target = runner.prev_ledger_id();
+    let Some(candidate) = root
+        .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(target))
+        .or_else(|| shared_inbound.acquire(target, 0, AcquireReason::Consensus))
+    else {
+        return false;
+    };
+    if shared_inbound.is_provisional(&target) {
+        return false;
+    }
+
+    let Some(lm_rt) = root.ledger_master_runtime() else {
+        return false;
+    };
+    let lm = lm_rt.ledger_master();
+    let candidate_hash = *candidate.header().hash.as_uint256();
+    let state_complete = !candidate.state_map().is_synching();
+    let tx_complete = candidate.header().tx_hash.is_zero() || !candidate.tx_map().is_synching();
+    if candidate_hash != target
+        || !state_complete
+        || !tx_complete
+        || !lm.can_be_current(candidate.as_ref(), root.current_close_time_seconds())
+        || !lm.compatibility_audit(candidate.as_ref()).compatible()
+    {
+        return false;
+    }
+
+    tracing::info!(
+        target: "lcl_trace",
+        event = "wrong_ledger_completion_install",
+        target_hash = %target,
+        target_seq = candidate.header().seq,
+        completion_count = 1_u64,
+        lcl_transition_gate_wait_us = transition_wait.as_micros() as u64,
+        lock_owner = "networkops-strand",
+        state_transition_cause = "completed_exact_consensus_target",
+        "LCL trace: installing completed WrongLedger target before preference can advance"
+    );
+    demote_for_preferred_lcl_divergence(root);
+    switch_last_closed_ledger(
+        root,
+        shared_inbound,
+        runner,
+        consensus_rt,
+        last_round_ledger_id,
+        target,
+        candidate,
+        &broadcast_switched_ledger_status,
+    );
+    true
+}
 
 /// Matches `NetworkOPsImp::endConsensus`: peers that still report our closed
 /// ledger's predecessor must refresh status before policy chooses the next LCL.
@@ -2459,14 +2547,15 @@ mod tests {
         ConsensusJobScheduler, LclAuditSampler, MAX_LEDGER_COMPLETIONS_PER_TURN,
         MAX_PROPOSALS_PER_TURN, PreferredLclReconciliation, drain_bounded,
         heartbeat_operating_mode_reassertion, history_acquire_allowed,
-        history_fetch_pack_requested, persist_completed_inbound_ledger, reconcile_preferred_lcl,
+        history_fetch_pack_requested, install_completed_wrong_ledger_target,
+        persist_completed_inbound_ledger, reconcile_preferred_lcl_with_status_broadcaster,
         record_completed_inbound_ledger, same_history_fetch_pack_is_suppressed,
-        should_promote_operating_mode_at_end_consensus, should_reconcile_preferred_lcl,
-        should_run_end_consensus_reconciliation,
+        should_begin_ordinary_round, should_promote_operating_mode_at_end_consensus,
+        should_reconcile_preferred_lcl, should_run_end_consensus_reconciliation,
     };
     use crate::consensus::rcl_consensus::{ConsensusRunner, PendingAcceptWork, RclCxLedger};
     use crate::consensus::rcl_cx_peer_pos::RclCxPeerPos;
-    use crate::consensus::rcl_validation::RclValidation;
+    use crate::consensus::rcl_validation::{RclValidatedLedger, RclValidation};
     use crate::job::job_queue::JobQueue;
     use crate::job::job_types::JobType;
     use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
@@ -2478,7 +2567,7 @@ mod tests {
     use basics::hardened_hash::HardenedHashBuilder;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::MonotonicClock;
-    use consensus::algorithm::ConsensusPhase;
+    use consensus::algorithm::{ConsensusMode, ConsensusPhase};
     use ledger::{
         FetchPackCache, Ledger, LedgerHeader, LedgerMaster, LedgerMasterConfig,
         calculate_ledger_hash,
@@ -2496,10 +2585,19 @@ mod tests {
     use tempfile::TempDir;
 
     fn immutable_ledger(seq: u32, parent_fill: u8) -> Arc<Ledger> {
+        immutable_ledger_with_parent_close_time(seq, parent_fill, 0)
+    }
+
+    fn immutable_ledger_with_parent_close_time(
+        seq: u32,
+        parent_fill: u8,
+        parent_close_time: u32,
+    ) -> Arc<Ledger> {
         let mut header = LedgerHeader {
             seq,
             parent_hash: SHAMapHash::new(Uint256::from_array([parent_fill; 32])),
             close_time: seq.saturating_add(100),
+            parent_close_time,
             close_time_resolution: 30,
             ..LedgerHeader::default()
         };
@@ -2622,6 +2720,7 @@ mod tests {
 
     struct RecordingRunner {
         phase: ConsensusPhase,
+        mode: ConsensusMode,
         prev: Uint256,
         start_rounds: usize,
     }
@@ -2630,6 +2729,7 @@ mod tests {
         fn accepted(prev: Uint256) -> Self {
             Self {
                 phase: ConsensusPhase::Accepted,
+                mode: ConsensusMode::Observing,
                 prev,
                 start_rounds: 0,
             }
@@ -2649,12 +2749,17 @@ mod tests {
             &mut self,
             _now: NetClockTimePoint,
             prev_ledger_id: Uint256,
-            _prev_ledger: RclCxLedger,
+            prev_ledger: RclCxLedger,
             _proposing: bool,
         ) {
             self.start_rounds += 1;
             self.prev = prev_ledger_id;
             self.phase = ConsensusPhase::Open;
+            self.mode = if prev_ledger_id == prev_ledger.id() {
+                ConsensusMode::Observing
+            } else {
+                ConsensusMode::WrongLedger
+            };
         }
 
         fn got_tx_set(&mut self, _now: NetClockTimePoint, _tx_set: consensus::RclTxSet) {}
@@ -2667,6 +2772,10 @@ mod tests {
 
         fn prev_ledger_id(&self) -> Uint256 {
             self.prev
+        }
+
+        fn consensus_mode(&self) -> ConsensusMode {
+            self.mode
         }
     }
 
@@ -2834,10 +2943,14 @@ mod tests {
         let mut last_round = None;
         let mut sampler = LclAuditSampler::new();
         let mut provisional_waiter = None;
-        let status_broadcasts = AtomicUsize::new(0);
+        let status_broadcasts = Arc::new(AtomicUsize::new(0));
+        let observed_status_broadcasts = Arc::clone(&status_broadcasts);
         let observe_status_broadcast =
-            |_root: &ApplicationRoot, _ledger: &Ledger, _event: i32, _have_correct_lcl: bool| {
-                status_broadcasts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            move |_root: &ApplicationRoot,
+                  _ledger: &Ledger,
+                  _event: i32,
+                  _have_correct_lcl: bool| {
+                observed_status_broadcasts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             };
 
         assert_eq!(
@@ -2901,6 +3014,74 @@ mod tests {
                 .is_some(),
             "the provisional reconciliation retains the exact target recovery"
         );
+        inbound.stop();
+    }
+
+    #[test]
+    fn completed_wrong_ledger_target_is_installed_before_advancing_preference() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let local = immutable_ledger(10, 0x10);
+        let now = root.current_close_time_seconds();
+        let target = immutable_ledger_with_parent_close_time(12, 0x20, now.saturating_sub(1));
+        let target_hash = *target.header().hash.as_uint256();
+        let newer = immutable_ledger_with_parent_close_time(13, 0x30, now);
+        let newer_hash = *newer.header().hash.as_uint256();
+        root.on_closed_ledger(Arc::clone(&local));
+        root.set_need_network_ledger(true);
+
+        // The first canonical target has completed its tree but is delayed at
+        // the durability fence while consensus waits in WrongLedger.
+        let (_store_dir, inbound) =
+            install_real_provisional_lcl_candidate(&mut root, Arc::clone(&target));
+        let mut runner = RecordingRunner {
+            phase: ConsensusPhase::Open,
+            mode: ConsensusMode::WrongLedger,
+            prev: target_hash,
+            start_rounds: 0,
+        };
+
+        // Trusted evidence advances before the first target's durable wake.
+        root.validations().register_ledger(newer.as_ref());
+        let (node_id, validation) = preferred_validation(newer_hash, newer.header().seq);
+        root.validations()
+            .validations()
+            .lock()
+            .expect("validations mutex")
+            .add(node_id, validation);
+        let peer_counts = std::collections::BTreeMap::from([(newer_hash, 5)]);
+        let preference = root.validations().preferred_lcl_diagnostic(
+            &RclValidatedLedger::from_ledger(local.as_ref()),
+            0,
+            &peer_counts,
+        );
+        assert_eq!(preference.selected, newer_hash, "network head advanced");
+
+        inbound.complete_durability_for_test(&target_hash);
+        let consensus_rt = AppConsensusRuntime::new();
+        let mut last_round = Some(target_hash);
+        assert!(install_completed_wrong_ledger_target(
+            &root,
+            &inbound,
+            &mut runner,
+            &consensus_rt,
+            &mut last_round,
+        ));
+
+        assert_eq!(
+            root.closed_ledger()
+                .expect("completed target installed as closed LCL")
+                .header()
+                .hash,
+            target.header().hash,
+        );
+        assert_eq!(
+            root.open_ledger().current().parent_hash,
+            *target.header().hash.as_uint256()
+        );
+        assert!(!root.need_network_ledger());
+        assert_eq!(runner.prev_ledger_id(), target_hash);
+        assert_eq!(runner.consensus_mode(), ConsensusMode::Observing);
+        assert_eq!(runner.start_rounds, 1);
         inbound.stop();
     }
 

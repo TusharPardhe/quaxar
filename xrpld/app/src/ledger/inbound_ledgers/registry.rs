@@ -29,8 +29,6 @@ use super::acquisition::{
     InboundPacketAdmissionLease, PacketAdmissionReservation, PacketEnqueue,
     ProvisionalLedgerIdentity,
 };
-#[cfg(test)]
-use super::acquisition::{SequencePromotionAttempt, SequenceRoutePause};
 use super::read_broker::{NodeReadBroker, ReadBrokerConfig};
 use super::scheduler::{AcquisitionKey, AcquisitionReadyScheduler, ReadyCause};
 use super::worker_pool::WorkerPool;
@@ -1805,6 +1803,18 @@ impl InboundLedgers {
         }
     }
 
+    /// Unit-test-only completion of the production durability fence.
+    #[cfg(test)]
+    pub(crate) fn complete_durability_for_test(&self, hash: &Uint256) {
+        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        let Some(entry) = inner.entries.get_mut(hash) else {
+            panic!("test durability target must be registered");
+        };
+        assert!(entry.completed_ledger.is_some());
+        entry.state.completed.store(true, Ordering::Release);
+        entry.provisional_identity = None;
+    }
+
     /// Notify that a ledger acquisition failed.
     pub fn on_failed(&self, hash: Uint256) {
         let state = {
@@ -2463,13 +2473,14 @@ impl std::fmt::Debug for InboundLedgers {
 mod tests {
     use super::super::acquisition::{
         ACQ_MAILBOX_BYTE_CAPACITY, ACQ_MAILBOX_PACKET_CAPACITY, AcquisitionSnapshot,
+        SequencePromotionAttempt, SequenceRoutePause,
     };
     use super::super::worker_pool::WorkerPool;
     use super::{
         AcquireReason, AcquisitionLifecycleCounters, AcquisitionLifecycleSnapshot, InboundLedgers,
-        RecoveryLclDecision, RegistryInner, SWEEP_IDLE_TIMEOUT, acquisition_snapshot_json,
-        failure_matches_entry, record_recent_failure, record_recent_failure_at,
-        recovery_lcl_decision_json, response_sequence_matches_request,
+        LedgerDataRouteDisposition, RecoveryLclDecision, RegistryInner, SWEEP_IDLE_TIMEOUT,
+        acquisition_snapshot_json, failure_matches_entry, record_recent_failure,
+        record_recent_failure_at, recovery_lcl_decision_json, response_sequence_matches_request,
     };
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;

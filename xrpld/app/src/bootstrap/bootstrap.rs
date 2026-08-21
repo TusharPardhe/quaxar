@@ -5323,18 +5323,21 @@ fn should_schedule_relayed_transaction(
 #[cfg(test)]
 mod tests {
     use super::{
-        ENDPOINT_HANDOUT_LIMIT, FetchPackAdmission, GenericGetObjectAdmission, MainRuntime,
-        StartUpType, amendments_from_config, build_endpoint_handout,
-        build_validator_list_collection_messages, candidate_ledger_data_charge,
-        classify_fetch_pack_request, classify_generic_get_object_request, configured_feature_ids,
-        configured_sweep_interval, fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
+        BootstrapLedgerDataRouting, ENDPOINT_HANDOUT_LIMIT, FetchPackAdmission,
+        GenericGetObjectAdmission, LedgerDataIngressDisposition, MainRuntime, StartUpType,
+        amendments_from_config, build_endpoint_handout, build_validator_list_collection_messages,
+        candidate_ledger_data_charge, classify_fetch_pack_request,
+        classify_generic_get_object_request, configured_feature_ids, configured_sweep_interval,
+        fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
         get_object_query_send_queue_is_admissible, ledger_data_nodes_are_admissible,
         ledger_data_sequence_is_admissible, manifest_rate_limit_policy, parse_basic_config_text,
-        relay_accepted_manifest, requested_transaction_envelope, sequence_is_fetchable_at_floor,
-        should_schedule_relayed_transaction, spawn_shutdown_watcher,
-        transaction_object_request_is_admissible, trusted_first_manifest_payloads,
-        validator_list_collection_blobs, validator_list_threshold_from_config,
+        relay_accepted_manifest, requested_transaction_envelope, route_bootstrap_ledger_data,
+        sequence_is_fetchable_at_floor, should_schedule_relayed_transaction,
+        spawn_shutdown_watcher, transaction_object_request_is_admissible,
+        trusted_first_manifest_payloads, validator_list_collection_blobs,
+        validator_list_threshold_from_config,
     };
+    use crate::ledger::inbound_ledgers::ACQ_MAILBOX_PACKET_CAPACITY;
     use crate::state::manifest::{
         MAX_UNTRUSTED_MANIFESTS, ManifestDisposition, ManifestLimits, ManifestRateLimitCapPolicy,
     };
@@ -6005,9 +6008,8 @@ mod tests {
         );
         let reservation_packet =
             ledger::InboundLedgerPacket::new(ledger::InboundLedgerDataType::Base, Vec::new());
-        let mut leases =
-            Vec::with_capacity(crate::ledger::inbound_ledgers::ACQ_MAILBOX_PACKET_CAPACITY);
-        for _ in 0..crate::ledger::inbound_ledgers::ACQ_MAILBOX_PACKET_CAPACITY {
+        let mut leases = Vec::with_capacity(ACQ_MAILBOX_PACKET_CAPACITY);
+        for _ in 0..ACQ_MAILBOX_PACKET_CAPACITY {
             let crate::ledger::inbound_ledgers::LedgerDataAdmission::Admitted(lease) =
                 deferred.reserve_response_admission(&deferred_hash, &reservation_packet)
             else {

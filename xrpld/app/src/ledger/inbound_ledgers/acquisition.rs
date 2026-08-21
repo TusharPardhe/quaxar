@@ -1032,6 +1032,7 @@ pub(crate) enum PacketEnqueue {
     InvalidLease,
 }
 
+#[derive(Debug)]
 pub(crate) enum PacketAdmissionReservation {
     Terminal,
     Deferred,
@@ -5622,21 +5623,29 @@ mod actor_mailbox_tests {
         queue.enqueue_barrier(44, 9);
         let first = queue.take_next().expect("write command");
         assert!(matches!(first, PersistenceCommand::WriteBatch { .. }));
-        assert!(queue.acknowledge(&PersistenceReady {
-            identity: first.identity(),
-            outcome: PersistenceOutcome::Durable,
-            durability_barrier: false,
-        }));
+        assert!(
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity: first.identity(),
+                    outcome: PersistenceOutcome::Durable,
+                    durability_barrier: false,
+                })
+                .is_some()
+        );
         let second = queue.take_next().expect("barrier command");
         assert!(matches!(
             second,
             PersistenceCommand::DurabilityBarrier { .. }
         ));
-        assert!(queue.acknowledge(&PersistenceReady {
-            identity: second.identity(),
-            outcome: PersistenceOutcome::Durable,
-            durability_barrier: true,
-        }));
+        assert!(
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity: second.identity(),
+                    outcome: PersistenceOutcome::Durable,
+                    durability_barrier: true,
+                })
+                .is_some()
+        );
         assert!(queue.barrier_acknowledged);
     }
 
@@ -5659,11 +5668,15 @@ mod actor_mailbox_tests {
         queue.enqueue_barrier(45, 10);
         let write = queue.take_next().expect("write command");
         assert!(matches!(write, PersistenceCommand::WriteBatch { .. }));
-        assert!(queue.acknowledge(&PersistenceReady {
-            identity: write.identity(),
-            outcome: PersistenceOutcome::Fault(Arc::from("store fault")),
-            durability_barrier: false,
-        }));
+        assert!(
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity: write.identity(),
+                    outcome: PersistenceOutcome::Fault(Arc::from("store fault")),
+                    durability_barrier: false,
+                })
+                .is_some()
+        );
         assert!(
             queue.failed.is_some(),
             "a write fault is terminal before publication"
@@ -5723,22 +5736,28 @@ mod actor_mailbox_tests {
             ..identity
         };
         assert!(
-            !queue.acknowledge(&PersistenceReady {
-                identity: stale,
-                outcome: PersistenceOutcome::Durable,
-                durability_barrier: false,
-            }),
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity: stale,
+                    outcome: PersistenceOutcome::Durable,
+                    durability_barrier: false,
+                })
+                .is_none(),
             "a rotation-mismatched acknowledgement cannot settle the active command"
         );
         assert_eq!(
             queue.in_flight.as_ref().map(PersistenceCommand::identity),
             Some(identity)
         );
-        assert!(queue.acknowledge(&PersistenceReady {
-            identity,
-            outcome: PersistenceOutcome::Durable,
-            durability_barrier: false,
-        }));
+        assert!(
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity,
+                    outcome: PersistenceOutcome::Durable,
+                    durability_barrier: false,
+                })
+                .is_some()
+        );
     }
 
     #[test]

@@ -1412,6 +1412,10 @@ pub trait ConsensusRunner: Send {
 
     /// Prev ledger id accessor.
     fn prev_ledger_id(&self) -> Uint256;
+
+    /// Consensus mode accessor. The NetworkOps owner uses this only to
+    /// complete the post-acquisition LCL handoff before the next timer tick.
+    fn consensus_mode(&self) -> ConsensusMode;
 }
 
 /// Concrete single-strand consensus driver. Owns `Consensus<AppRclConsensusAdaptor>`
@@ -2349,6 +2353,10 @@ impl ConsensusRunner for AppConsensus {
 
     fn prev_ledger_id(&self) -> Uint256 {
         *self.state.prev_ledger_id()
+    }
+
+    fn consensus_mode(&self) -> ConsensusMode {
+        self.state.mode()
     }
 }
 
