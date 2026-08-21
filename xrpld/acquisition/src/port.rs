@@ -9,14 +9,22 @@ use crate::effect::AcquisitionEffect;
 use crate::handoff::DurableLedger;
 use crate::identity::{OperationRef, SessionRef};
 use crate::io::{ReadRequest, WriteBatch};
-use crate::peer::PeerRequest;
+use crate::peer::{PeerRequest, PeerTargetCapability};
 use crate::phase::SyncPhase;
+use crate::target::LedgerTarget;
 use crate::timer::TimerRequest;
 
 /// Overlay-owned delivery of a coordinator-produced peer request.
 pub trait LedgerRequestPort {
     /// Deliver a peer request. Never called after a terminal transition.
     fn send_ledger_request(&mut self, request: PeerRequest);
+
+    /// Sample peers that currently advertise the exact ledger target. `None`
+    /// preserves deterministic/legacy ports that cannot expose overlay
+    /// capability; production returns `Some`, including an empty sample.
+    fn peer_target_capabilities(&self, _target: LedgerTarget) -> Option<Vec<PeerTargetCapability>> {
+        None
+    }
 }
 
 /// Brokered NodeStore read submission. The broker owns read admission,

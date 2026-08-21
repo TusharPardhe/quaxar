@@ -1358,11 +1358,16 @@ fn run_start_mode_consensus_loop(
         None => Arc::new(crate::ledger::inbound_ledgers::InboundLedgers::new(
             Arc::clone(&app_tree_cache),
             Arc::clone(&node_family_full_below_cache),
-            Arc::new(ledger::FetchPackCache::new(
-                256,
-                time::Duration::seconds(120),
-                basics::tagged_cache::MonotonicClock::default(),
-            )),
+            lm_rt_for_shared_inbound
+                .as_ref()
+                .map(|runtime| runtime.ledger_master().fetch_pack_cache_arc())
+                .unwrap_or_else(|| {
+                    Arc::new(ledger::FetchPackCache::new(
+                        65_536,
+                        time::Duration::seconds(45),
+                        basics::tagged_cache::MonotonicClock::default(),
+                    ))
+                }),
             shared_completed_tx.clone(),
             runtime.root().network_ops_state().need_network_ledger_arc(),
         )),
@@ -2308,12 +2313,8 @@ fn run_start_mode_consensus_loop(
                             continue;
                         }
 
-                        // Preserve both established cache owners used by the
-                        // shared acquisition lifecycle. Consumers verify the
-                        // content-addressed hash when retrieving each object.
-                        if let Some(ledger_master) = ledger_master.as_ref() {
-                            ledger_master.add_fetch_pack(hash, data.clone());
-                        }
+                        // InboundLedgers and LedgerMaster share the one
+                        // rippled-parity fetch-pack cache owner.
                         router_shared_inbound.store_fetch_pack(hash, data.clone());
                         stored += 1;
                     }

@@ -453,6 +453,18 @@ where
         // ingress and its session mailbox. It is settled when fed, rejected,
         // cancelled, or dropped, so the immutable route gate provides real
         // cross-thread backpressure instead of permitting a late mailbox drop.
+        if let AcquisitionEvent::TimerFired {
+            operation,
+            timer: acquisition::TimerKind::AcquireTimeout,
+        } = &event
+            && let Some(target) = self
+                .runner
+                .session(operation.session())
+                .map(|session| session.target())
+            && let Some(peers) = self.requests.peer_target_capabilities(target)
+        {
+            self.runner.update_target_peer_capabilities(target, peers);
+        }
         let effects = self.runner.handle_event(event);
         self.note_terminal_failures(&effects);
         // A request can synchronously produce an overlay reply. Publish the
@@ -557,6 +569,11 @@ where
 
     /// Report a usable-peer snapshot (overlay connectivity fact).
     pub(crate) fn connectivity(&mut self, snapshot: &[OverlayPeerId]) -> Vec<AcquisitionEffect> {
+        for target in self.runner.active_targets() {
+            if let Some(peers) = self.requests.peer_target_capabilities(target) {
+                self.runner.update_target_peer_capabilities(target, peers);
+            }
+        }
         let peers = snapshot
             .iter()
             .map(|&id| PeerId::new(u64::from(id)))
@@ -572,6 +589,9 @@ where
         target: acquisition::LedgerTarget,
         reason: acquisition::AcquireReason,
     ) -> Vec<AcquisitionEffect> {
+        if let Some(peers) = self.requests.peer_target_capabilities(target) {
+            self.runner.update_target_peer_capabilities(target, peers);
+        }
         self.handle_fact(AcquisitionEvent::AcquireRequested { target, reason })
     }
 
@@ -582,6 +602,9 @@ where
         &mut self,
         target: acquisition::LedgerTarget,
     ) -> Vec<AcquisitionEffect> {
+        if let Some(peers) = self.requests.peer_target_capabilities(target) {
+            self.runner.update_target_peer_capabilities(target, peers);
+        }
         self.handle_fact(AcquisitionEvent::ConsensusTarget(
             acquisition::ConsensusTarget::new(target, acquisition::AcquireReason::Consensus),
         ))
@@ -818,6 +841,26 @@ impl OverlayLedgerRequestPort {
 }
 
 impl LedgerRequestPort for OverlayLedgerRequestPort {
+    fn peer_target_capabilities(
+        &self,
+        target: acquisition::LedgerTarget,
+    ) -> Option<Vec<acquisition::PeerTargetCapability>> {
+        let sequence = target.sequence().unwrap_or(0);
+        Some(
+            self.peers
+                .available_peers()
+                .into_iter()
+                .filter(|peer| peer.has_ledger(target.hash(), sequence))
+                .map(|peer| {
+                    acquisition::PeerTargetCapability::new(
+                        PeerId::new(u64::from(peer.id())),
+                        peer.is_high_latency(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     fn send_ledger_request(&mut self, request: PeerRequest) {
         {
             let mut sequences = self.sequences.lock().expect("request port sequences lock");

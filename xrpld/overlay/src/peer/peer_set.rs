@@ -72,6 +72,18 @@ impl SimplePeerSet {
         peers.iter().find(|peer| peer.id() == id).cloned()
     }
 
+    /// Snapshot all currently available peers without applying legacy
+    /// PeerSet membership. Acquisition's single owner samples target-specific
+    /// `has_ledger` capability from this list.
+    pub fn available_peers(&self) -> Vec<Arc<dyn Peer>> {
+        self.peers
+            .lock()
+            .expect("peer set lock")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     /// Return tracked peers for parallel fan-out during state acquisition.
     pub fn get_peers(&self) -> Vec<Arc<dyn Peer>> {
         let peer_ids = self.peer_ids.lock().expect("peer ids lock").clone();

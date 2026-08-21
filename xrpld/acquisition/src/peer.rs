@@ -19,6 +19,29 @@ pub struct PeerAvailabilitySnapshot {
     peers: Vec<PeerId>,
 }
 
+/// Target-specific overlay knowledge used by InboundLedger peer membership.
+/// It is sampled by the overlay adapter with `Peer::has_ledger` at the same
+/// acquisition boundary where rippled's `addPeers` evaluates candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTargetCapability {
+    peer: PeerId,
+    high_latency: bool,
+}
+
+impl PeerTargetCapability {
+    pub const fn new(peer: PeerId, high_latency: bool) -> Self {
+        Self { peer, high_latency }
+    }
+
+    pub const fn peer(self) -> PeerId {
+        self.peer
+    }
+
+    pub const fn high_latency(self) -> bool {
+        self.high_latency
+    }
+}
+
 impl PeerAvailabilitySnapshot {
     /// Builds a snapshot from a set of usable peers.
     pub fn new(peers: Vec<PeerId>) -> Self {

@@ -24,6 +24,7 @@ use basics::intrusive_pointer::SharedIntrusive;
 use basics::random::rand_int_to;
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
+use bytes::Bytes;
 use ledger::{
     FetchPackCache, InboundLedgerDataType, InboundLedgerLocal, InboundLedgerNodeData,
     InboundLedgerPacket, InboundLedgerReason, LedgerConfig, TreeAdvance, TreeKind, TreePlan,
@@ -57,6 +58,8 @@ type AppFamily = SHAMapFamily<
     (),
 >;
 
+type DurableNodeSet = RwLock<(u64, BTreeSet<Uint256>)>;
+
 /// Resident lookup over the shared caches and the fetch-pack, matching the
 /// actor's `ActorResident` semantics plus rippled `checkLocal`'s by-hash
 /// fetch-pack resolution. `is_full_below`/`mark_full_below` are retained so an
@@ -65,18 +68,29 @@ type AppFamily = SHAMapFamily<
 struct AppResident<'a> {
     cache: &'a TreeNodeCache<MonotonicClock>,
     shared_full_below: &'a FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>,
-    pending_full_below: &'a mut BTreeSet<Uint256>,
+    pending_full_below: &'a mut BTreeMap<Uint256, (SharedIntrusive<SHAMapTreeNode>, u32)>,
     fetch_pack: &'a FetchPackCache,
+    store: &'a mut WorkerStore,
+    durable_nodes: &'a DurableNodeSet,
+    store_generation: u64,
+    kind: TreeKind,
 }
 
 impl MissingNodeResidentLookup for AppResident<'_> {
     fn load_resident(
         &mut self,
         hash: SHAMapHash,
-        _ledger_seq: u32,
+        ledger_seq: u32,
     ) -> Option<SharedIntrusive<SHAMapTreeNode>> {
         if let Some(node) = self.cache.fetch(hash.as_uint256()) {
-            return Some(node);
+            let durable = self.durable_nodes.read().expect("durable node set read");
+            if durable.0 == self.store_generation && durable.1.contains(hash.as_uint256()) {
+                return Some(node);
+            }
+            return self
+                .store
+                .store_resident_shamap_node(self.kind, &node, ledger_seq)
+                .then_some(node);
         }
         // A fetch-pack entry is by-hash node data stored in the prefixed form
         // rippled's `addFetchPack` produces, the exact resident form the
@@ -84,20 +98,26 @@ impl MissingNodeResidentLookup for AppResident<'_> {
         // (`gotFetchPack` -> `checkLocal` parity). Decode on each lookup:
         // fetch-pack passes are infrequent and the fetch caches stay bounded.
         let blob = self.fetch_pack.get_fetch_pack(*hash.as_uint256())?;
-        SHAMapTreeNode::make_from_prefix(&blob, hash).ok()
+        let mut node = SHAMapTreeNode::make_from_prefix(&blob, hash).ok()?;
+        self.cache
+            .canonicalize_replace_client(hash.as_uint256(), &mut node);
+        self.store
+            .store_resident_shamap_node(self.kind, &node, ledger_seq)
+            .then_some(node)
     }
 
     fn is_full_below(&mut self, hash: SHAMapHash) -> bool {
         self.shared_full_below.touch_if_exists(*hash.as_uint256())
     }
 
-    fn mark_full_below(&mut self, hash: SHAMapHash) {
+    fn mark_full_below(&mut self, node: SharedIntrusive<SHAMapTreeNode>, generation: u32) {
         // A FullBelow marker is a cross-session assertion: another traversal
         // may skip the entire subtree before checking the node cache. Rippled
         // publishes that assertion only after its accepted-node filter stored
         // the subtree. WorkerStore is asynchronous, so stage the marker until
         // the corresponding coordinator write completion is Accepted.
-        self.pending_full_below.insert(*hash.as_uint256());
+        self.pending_full_below
+            .insert(*node.get_hash().as_uint256(), (node, generation));
     }
 }
 
@@ -114,7 +134,9 @@ pub(crate) struct AppLedgerPlanEngine {
     full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     active_kind: Option<TreeKind>,
     active_plan: Option<TreePlan>,
-    pending_full_below: BTreeSet<Uint256>,
+    pending_full_below: BTreeMap<Uint256, (SharedIntrusive<SHAMapTreeNode>, u32)>,
+    durable_nodes: Arc<DurableNodeSet>,
+    pending_durable_nodes: BTreeSet<Uint256>,
     cached_root_steps: u64,
     idle_ready_logged: bool,
 }
@@ -141,7 +163,14 @@ impl AppLedgerPlanEngine {
         family: AppFamily,
         cache: Arc<TreeNodeCache<MonotonicClock>>,
         full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
+        durable_nodes: Arc<DurableNodeSet>,
     ) -> Self {
+        {
+            let mut durable = durable_nodes.write().expect("durable node set write");
+            if durable.0 != session.store_generation().get() {
+                *durable = (session.store_generation().get(), BTreeSet::new());
+            }
+        }
         Self {
             session,
             plan_id,
@@ -153,7 +182,9 @@ impl AppLedgerPlanEngine {
             full_below,
             active_kind: None,
             active_plan: None,
-            pending_full_below: BTreeSet::new(),
+            pending_full_below: BTreeMap::new(),
+            durable_nodes,
+            pending_durable_nodes: BTreeSet::new(),
             cached_root_steps: 0,
             idle_ready_logged: false,
         }
@@ -237,7 +268,8 @@ impl AppLedgerPlanEngine {
             return;
         }
         let marker_count = markers.len();
-        for hash in markers {
+        for (hash, (node, generation)) in markers {
+            node.set_full_below_gen(generation);
             self.full_below.insert(hash);
         }
         tracing::info!(
@@ -414,6 +446,10 @@ impl TreeEngine for AppLedgerPlanEngine {
                 shared_full_below: &self.full_below,
                 pending_full_below: &mut self.pending_full_below,
                 fetch_pack: self.fetch_pack.cache(),
+                store: &mut self.store,
+                durable_nodes: &self.durable_nodes,
+                store_generation: self.session.store_generation().get(),
+                kind: self.active_kind.expect("active tree kind set"),
             };
             let mut first_child = || rand_int_to(255u8);
             let mut yield_now = || false;
@@ -561,7 +597,7 @@ impl TreeEngine for AppLedgerPlanEngine {
         };
         let useful = stats.is_useful();
         if stats.is_invalid() {
-            return PlanNetworkApply::new(PlanReadApply::UnknownRead, useful);
+            return PlanNetworkApply::invalid(PlanReadApply::UnknownRead, useful);
         }
         if self.active_kind != Some(kind) {
             // The node belongs to the other tree; the map cached it and it will
@@ -579,11 +615,33 @@ impl TreeEngine for AppLedgerPlanEngine {
         // Resume the retained continuation with that exact shared object, not
         // the independent validation decode above. This keeps the map, cache,
         // and continuation in one object graph like rippled's addKnownNode.
-        let canonical = self.cache.fetch(hash.as_uint256()).unwrap_or(decoded);
-        PlanNetworkApply::new(
-            Self::map_apply(plan.apply_network_node(self.plan_id, hash, canonical)),
-            useful,
-        )
+        let mut canonical = self.cache.fetch(hash.as_uint256()).unwrap_or(decoded);
+        self.family.canonicalize(hash, &mut canonical);
+        let applied =
+            Self::map_apply(plan.apply_network_node(self.plan_id, hash, canonical.clone()));
+        if matches!(applied, PlanReadApply::Applied { .. }) {
+            let _ = self
+                .store
+                .store_resident_shamap_node(kind, &canonical, self.inbound.seq());
+        }
+        PlanNetworkApply::new(applied, useful)
+    }
+
+    fn begin_reply_scan(&mut self) {
+        if let Some(plan) = self.active_plan.as_mut() {
+            plan.begin_reply_scan();
+        }
+    }
+
+    fn retain_network_needs(&mut self, needs: &[PlanNetworkNeed]) {
+        if let Some(plan) = self.active_plan.as_mut() {
+            plan.retain_network_hashes(
+                needs
+                    .iter()
+                    .filter(|need| Some(need.kind()) == self.active_kind)
+                    .map(|need| SHAMapHash::new(need.hash())),
+            );
+        }
     }
 
     fn has_runnable_frontier(&self) -> bool {
@@ -608,10 +666,22 @@ impl TreeEngine for AppLedgerPlanEngine {
     }
 
     fn take_persistable_nodes(&mut self) -> Vec<PersistNode> {
-        self.take_accepted_writes()
+        let nodes = self.take_accepted_writes();
+        self.pending_durable_nodes
+            .extend(nodes.iter().map(|node| *node.key().as_uint256()));
+        nodes
     }
 
     fn on_persistence_accepted(&mut self) {
+        let mut durable = self.durable_nodes.write().expect("durable node set write");
+        if durable.0 == self.session.store_generation().get() {
+            durable
+                .1
+                .extend(std::mem::take(&mut self.pending_durable_nodes));
+        } else {
+            self.pending_durable_nodes.clear();
+        }
+        drop(durable);
         self.publish_persisted_full_below();
     }
 
@@ -642,6 +712,7 @@ pub(crate) struct AppPlanSeed {
     fetch_pack: Arc<FetchPackCache>,
     cache: Arc<TreeNodeCache<MonotonicClock>>,
     full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
+    durable_nodes: Arc<DurableNodeSet>,
 }
 
 impl std::fmt::Debug for AppPlanSeed {
@@ -668,11 +739,41 @@ impl AppPlanSeed {
             fetch_pack,
             cache,
             full_below,
+            durable_nodes: Arc::new(RwLock::new((0, BTreeSet::new()))),
         }
     }
 }
 
 impl PlanSeed for AppPlanSeed {
+    fn build_resident(&mut self, session: SessionRef) -> Option<Box<dyn TreeEngine + Send + Sync>> {
+        let blob = self.fetch_pack.get_fetch_pack(session.target_hash())?;
+        let header = ledger::deserialize_prefixed_ledger_header(&blob, false).ok()?;
+        let packet = InboundLedgerPacket::new(
+            InboundLedgerDataType::Base,
+            vec![InboundLedgerNodeData::new(
+                None,
+                protocol::serialize_ledger_header(&header, false),
+            )],
+        );
+        self.build(session, &packet)
+    }
+
+    fn build_stored_header(
+        &mut self,
+        session: SessionRef,
+        data: &Bytes,
+    ) -> Option<Box<dyn TreeEngine + Send + Sync>> {
+        let header = ledger::deserialize_prefixed_ledger_header(data, false).ok()?;
+        let packet = InboundLedgerPacket::new(
+            InboundLedgerDataType::Base,
+            vec![InboundLedgerNodeData::new(
+                None,
+                protocol::serialize_ledger_header(&header, false),
+            )],
+        );
+        self.build(session, &packet)
+    }
+
     fn build(
         &mut self,
         session: SessionRef,
@@ -686,6 +787,7 @@ impl PlanSeed for AppPlanSeed {
             &self.fetch_pack,
             &self.cache,
             &self.full_below,
+            &self.durable_nodes,
         )
     }
 }
@@ -701,6 +803,7 @@ fn build_app_engine(
     fetch_pack: &Arc<FetchPackCache>,
     cache: &Arc<TreeNodeCache<MonotonicClock>>,
     full_below: &Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
+    durable_nodes: &Arc<DurableNodeSet>,
 ) -> Option<Box<dyn TreeEngine + Send + Sync>> {
     let mut inbound =
         InboundLedgerLocal::new_with_reason(SHAMapHash::new(session.target_hash()), seq, reason);
@@ -724,7 +827,7 @@ fn build_app_engine(
             &family,
         )
         .is_ok_and(|stats| !stats.is_invalid());
-    if !accepted || inbound.is_failed() || inbound.is_complete() {
+    if !accepted || inbound.is_failed() {
         return None;
     }
     let plan_id = TreePlanId::new(session.session_id().get() + 1);
@@ -737,6 +840,7 @@ fn build_app_engine(
         family,
         Arc::clone(cache),
         Arc::clone(full_below),
+        Arc::clone(durable_nodes),
     )))
 }
 
@@ -772,6 +876,13 @@ impl CoordinatorSessionOrigins {
             .get(&target)
             .copied()
     }
+
+    fn remove(&self, target: Uint256) {
+        self.map
+            .write()
+            .expect("session origin lock")
+            .remove(&target);
+    }
 }
 
 /// Production [`PlanSeed`] for the coordinator adapter: resolves each session's
@@ -782,6 +893,7 @@ pub(crate) struct CoordinatorPlanSeed {
     fetch_pack: Arc<FetchPackCache>,
     cache: Arc<TreeNodeCache<MonotonicClock>>,
     full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
+    durable_nodes: Arc<DurableNodeSet>,
 }
 
 impl std::fmt::Debug for CoordinatorPlanSeed {
@@ -804,11 +916,45 @@ impl CoordinatorPlanSeed {
             fetch_pack,
             cache,
             full_below,
+            durable_nodes: Arc::new(RwLock::new((0, BTreeSet::new()))),
         }
     }
 }
 
 impl PlanSeed for CoordinatorPlanSeed {
+    fn session_reaped(&mut self, session: SessionRef) {
+        self.origins.remove(session.target_hash());
+    }
+
+    fn build_resident(&mut self, session: SessionRef) -> Option<Box<dyn TreeEngine + Send + Sync>> {
+        let blob = self.fetch_pack.get_fetch_pack(session.target_hash())?;
+        let header = ledger::deserialize_prefixed_ledger_header(&blob, false).ok()?;
+        let packet = InboundLedgerPacket::new(
+            InboundLedgerDataType::Base,
+            vec![InboundLedgerNodeData::new(
+                None,
+                protocol::serialize_ledger_header(&header, false),
+            )],
+        );
+        self.build(session, &packet)
+    }
+
+    fn build_stored_header(
+        &mut self,
+        session: SessionRef,
+        data: &Bytes,
+    ) -> Option<Box<dyn TreeEngine + Send + Sync>> {
+        let header = ledger::deserialize_prefixed_ledger_header(data, false).ok()?;
+        let packet = InboundLedgerPacket::new(
+            InboundLedgerDataType::Base,
+            vec![InboundLedgerNodeData::new(
+                None,
+                protocol::serialize_ledger_header(&header, false),
+            )],
+        );
+        self.build(session, &packet)
+    }
+
     fn build(
         &mut self,
         session: SessionRef,
@@ -823,6 +969,7 @@ impl PlanSeed for CoordinatorPlanSeed {
             &self.fetch_pack,
             &self.cache,
             &self.full_below,
+            &self.durable_nodes,
         )
     }
 }
@@ -1400,34 +1547,105 @@ mod tests {
             HardenedHashBuilder::default(),
             8,
         );
-        let hash = SHAMapHash::new(Uint256::from(0xAB));
+        let node = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        node.set_child_hash(0, SHAMapHash::new(Uint256::from(0xAB)));
+        node.update_hash();
+        let hash = node.get_hash();
         let fetch_pack = FetchPackCache::new(8, Duration::seconds(60), MonotonicClock::default());
-        let mut staged = BTreeSet::new();
+        let mut staged = BTreeMap::new();
+        let mut store = WorkerStore::default();
+        let durable_nodes = RwLock::new((1, BTreeSet::new()));
         {
             let mut resident = AppResident {
                 cache: &cache,
                 shared_full_below: &shared,
                 pending_full_below: &mut staged,
                 fetch_pack: &fetch_pack,
+                store: &mut store,
+                durable_nodes: &durable_nodes,
+                store_generation: 1,
+                kind: TreeKind::State,
             };
-            resident.mark_full_below(hash);
+            resident.mark_full_below(node.clone(), 1);
+            assert!(!node.is_full_below(1));
             assert!(
                 !resident.is_full_below(hash),
                 "an unpersisted marker must not be visible to another traversal"
             );
         }
-        assert_eq!(staged, BTreeSet::from([*hash.as_uint256()]));
+        assert!(staged.contains_key(hash.as_uint256()));
         assert!(
             !shared.touch_if_exists(*hash.as_uint256()),
             "the shared cache stays empty before write acceptance"
         );
-        for marker in staged {
+        for (marker, (node, generation)) in staged {
+            node.set_full_below_gen(generation);
             shared.insert(marker);
         }
         assert!(
             shared.touch_if_exists(*hash.as_uint256()),
             "publication after write acceptance makes the marker shared"
         );
+    }
+
+    #[test]
+    fn fetch_pack_resident_is_canonicalized_and_queued_for_persistence() {
+        let cache = TreeNodeCache::new(
+            "fetch-pack-resident-test",
+            8,
+            Duration::seconds(60),
+            MonotonicClock::default(),
+        );
+        let shared = FullBelowCacheImpl::new(
+            1,
+            MonotonicClock::default(),
+            HardenedHashBuilder::default(),
+            8,
+        );
+        let fetch_pack = FetchPackCache::new(8, Duration::seconds(60), MonotonicClock::default());
+        let node = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0xBC; 32]), vec![0xBC; 32]),
+            0,
+        ));
+        let hash = node.get_hash();
+        fetch_pack.add_fetch_pack(
+            *hash.as_uint256(),
+            node.serialize_with_prefix().expect("node serializes"),
+        );
+        let mut staged = BTreeMap::new();
+        let mut store = WorkerStore::default();
+        let durable_nodes = RwLock::new((1, BTreeSet::new()));
+
+        let loaded = {
+            let mut resident = AppResident {
+                cache: &cache,
+                shared_full_below: &shared,
+                pending_full_below: &mut staged,
+                fetch_pack: &fetch_pack,
+                store: &mut store,
+                durable_nodes: &durable_nodes,
+                store_generation: 1,
+                kind: TreeKind::State,
+            };
+            resident
+                .load_resident(hash, SEQ)
+                .expect("fetch-pack node resolves")
+        };
+
+        let cached = cache
+            .fetch(hash.as_uint256())
+            .expect("node is canonicalized");
+        assert_eq!(cached.get_hash(), loaded.get_hash());
+        let writes = store.take_pending_write_nodes();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].key(), hash);
+        assert_eq!(
+            writes[0].object_kind(),
+            acquisition::StoredObjectKind::AccountNode
+        );
+        drop(cached);
+        drop(loaded);
     }
 
     #[test]

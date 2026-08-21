@@ -46,7 +46,7 @@ impl ReadRequest {
     ) -> Self {
         debug_assert!(matches!(
             operation.kind(),
-            OperationKind::Read | OperationKind::RecoveryRead
+            OperationKind::Read | OperationKind::HeaderRead | OperationKind::RecoveryRead
         ));
         Self {
             operation,

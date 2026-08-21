@@ -1267,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn node_object_cache_does_not_negative_cache_misses() {
+    fn node_object_cache_does_not_negative_cache_untyped_misses() {
         let hash = Uint256::from_array([0xC3; 32]);
         let delegate = Arc::new(CountingDelegate {
             object: None,

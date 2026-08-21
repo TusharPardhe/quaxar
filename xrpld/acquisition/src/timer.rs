@@ -21,6 +21,8 @@ pub enum TimerKind {
     HandoffRetry,
     /// Periodic reassertion of the service phase.
     PhaseReassert,
+    /// One-minute rippled-style retention of a terminal acquisition tree.
+    TerminalRetention,
 }
 
 impl TimerKind {
@@ -31,6 +33,7 @@ impl TimerKind {
             Self::ReadRetry => "read_retry",
             Self::HandoffRetry => "handoff_retry",
             Self::PhaseReassert => "phase_reassert",
+            Self::TerminalRetention => "terminal_retention",
         }
     }
 }

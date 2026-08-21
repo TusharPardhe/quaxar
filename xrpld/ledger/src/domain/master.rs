@@ -77,7 +77,7 @@ impl Default for LedgerMasterConfig {
         Self {
             history_cache_size: 256,
             history_cache_age: LEDGER_MASTER_DEFAULT_HISTORY_AGE,
-            fetch_pack_cache_size: 512,
+            fetch_pack_cache_size: 65_536,
             fetch_pack_cache_age: LEDGER_MASTER_DEFAULT_FETCH_PACK_AGE,
             path_find_job_limit: LEDGER_MASTER_DEFAULT_PATH_FIND_JOB_LIMIT,
         }
@@ -138,7 +138,7 @@ pub struct LedgerMaster<C = MonotonicClock, S = HardenedHashBuilder> {
     valid_ledger: LedgerHolder,
     published_ledger: LedgerHolder,
     ledger_history: LedgerHistory<C, S>,
-    fetch_packs: FetchPackCache<C, S>,
+    fetch_packs: Arc<FetchPackCache<C, S>>,
     local_txs: LocalTxs,
     held_transactions: Mutex<CanonicalTXSet>,
     complete_ledgers: Mutex<RangeSet<u32>>,
@@ -198,7 +198,7 @@ where
             valid_ledger: LedgerHolder::new(),
             published_ledger: LedgerHolder::new(),
             ledger_history,
-            fetch_packs,
+            fetch_packs: Arc::new(fetch_packs),
             local_txs,
             held_transactions: Mutex::new(CanonicalTXSet::new(Uint256::zero())),
             complete_ledgers: Mutex::new(RangeSet::new()),
@@ -221,6 +221,13 @@ where
 
     pub fn fetch_pack_cache(&self) -> &FetchPackCache<C, S> {
         &self.fetch_packs
+    }
+
+    /// Shared LedgerMaster fetch-pack owner used by inbound acquisition
+    /// filters. rippled has one 65,536-entry cache, not a second registry-local
+    /// copy with a different lifetime.
+    pub fn fetch_pack_cache_arc(&self) -> Arc<FetchPackCache<C, S>> {
+        Arc::clone(&self.fetch_packs)
     }
 
     pub fn local_txs(&self) -> &LocalTxs {
@@ -1067,7 +1074,7 @@ where
         LedgerHistory<C, S>: LedgerMasterSweepTarget,
         FetchPackCache<C, S>: LedgerMasterSweepTarget,
     {
-        sweep_ledger_master_like(&self.ledger_history, &self.fetch_packs);
+        sweep_ledger_master_like(&self.ledger_history, self.fetch_packs.as_ref());
     }
 
     fn new_pf_work(&self, requests_pending: bool, is_stopping: bool) -> bool {

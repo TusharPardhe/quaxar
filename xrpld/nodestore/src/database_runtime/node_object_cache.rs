@@ -1,4 +1,4 @@
-use crate::NodeObject;
+use crate::{NodeObject, NodeObjectType};
 use basics::base_uint::Uint256;
 use basics::basic_config::{Section, get};
 use moka::sync::Cache;
@@ -21,7 +21,7 @@ const ENTRY_METADATA_BYTES: usize = 128;
 const DEFAULT_CACHE_IDLE_SECONDS: u64 = 90;
 /// Default hard TTL in seconds — entries are evicted after this duration
 /// regardless of access, ensuring post-rotation stale data is flushed.
-const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
+const DEFAULT_CACHE_TTL_SECONDS: u64 = 0;
 
 #[derive(Debug)]
 enum CacheLoadError {
@@ -88,11 +88,27 @@ pub(crate) struct NodeObjectCache {
 
 impl NodeObjectCache {
     pub(crate) fn from_config(config: &Section) -> Result<Self, String> {
-        let target_nodes = get(
-            config,
-            "node_object_cache_target_nodes",
-            DEFAULT_TARGET_NODES,
-        );
+        let cache_size = config
+            .get::<i64>("cache_size")
+            .map_err(|_| "Invalid cache_size".to_owned())?
+            .map(|value| u64::try_from(value).map_err(|_| "Invalid cache_size".to_owned()))
+            .transpose()?;
+        let cache_age = config
+            .get::<i64>("cache_age")
+            .map_err(|_| "Invalid cache_age".to_owned())?
+            .map(|value| u64::try_from(value).map_err(|_| "Invalid cache_age".to_owned()))
+            .transpose()?;
+        let target_nodes = if config.exists("node_object_cache_target_nodes") {
+            get(
+                config,
+                "node_object_cache_target_nodes",
+                DEFAULT_TARGET_NODES,
+            )
+        } else if let Some(cache_size) = cache_size {
+            cache_size
+        } else {
+            DEFAULT_TARGET_NODES
+        };
         let expected_node_bytes = get(
             config,
             "node_object_cache_expected_node_bytes",
@@ -103,7 +119,13 @@ impl NodeObjectCache {
         let configured_capacity_mb: u64 = get(config, "cache_capacity_mb", 0);
         let configured_capacity = get(config, "node_object_cache_capacity_bytes", 0u64);
         let max_entry_bytes = get(config, "cache_max_entry_bytes", DEFAULT_MAX_ENTRY_BYTES);
-        let idle_seconds: u64 = get(config, "cache_idle_seconds", DEFAULT_CACHE_IDLE_SECONDS);
+        let idle_seconds: u64 = if config.exists("cache_idle_seconds") {
+            get(config, "cache_idle_seconds", DEFAULT_CACHE_IDLE_SECONDS)
+        } else if let Some(cache_age) = cache_age {
+            cache_age.saturating_mul(60)
+        } else {
+            DEFAULT_CACHE_IDLE_SECONDS
+        };
         let ttl_seconds: u64 = get(config, "cache_ttl_seconds", DEFAULT_CACHE_TTL_SECONDS);
 
         if max_entry_bytes == 0 {
@@ -122,21 +144,20 @@ impl NodeObjectCache {
                 .checked_mul(expected_entry_bytes)
                 .ok_or_else(|| "NodeObject cache capacity overflows u64".to_owned())?
         };
-        if capacity_bytes == 0 {
-            return Err("Invalid cache capacity".to_owned());
-        }
+        let entry_capacity = if configured_capacity_mb > 0 || configured_capacity > 0 {
+            capacity_bytes
+                / expected_node_bytes
+                    .saturating_add(ENTRY_METADATA_BYTES as u64)
+                    .max(1)
+        } else {
+            target_nodes
+        };
 
+        // rippled's NodeObject TaggedCache is bounded by entry count and
+        // starts empty. Do not byte-weight or preallocate millions of slots.
         let mut builder = Cache::builder()
             .name("node-object-cache")
-            .max_capacity(capacity_bytes)
-            .initial_capacity((capacity_bytes / 800) as usize)
-            .weigher(|_hash: &Uint256, object: &Arc<NodeObject>| {
-                object
-                    .data()
-                    .len()
-                    .saturating_add(ENTRY_METADATA_BYTES)
-                    .min(u32::MAX as usize) as u32
-            });
+            .max_capacity(entry_capacity);
 
         if idle_seconds > 0 {
             builder = builder.time_to_idle(std::time::Duration::from_secs(idle_seconds));
@@ -172,7 +193,7 @@ impl NodeObjectCache {
         if let Some(object) = self.cache.get(&hash) {
             if object.hash() == &hash {
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                return Some(object);
+                return (object.object_type() != NodeObjectType::Dummy).then_some(object);
             }
             self.rejected.fetch_add(1, Ordering::Relaxed);
             self.cache.invalidate(&hash);
@@ -181,9 +202,7 @@ impl NodeObjectCache {
         self.misses.fetch_add(1, Ordering::Relaxed);
         let result = self.cache.try_get_with(hash, || {
             self.durable_loads.fetch_add(1, Ordering::Relaxed);
-            let Some(object) = load() else {
-                return Err(CacheLoadError::NotFound);
-            };
+            let object = load().ok_or(CacheLoadError::NotFound)?;
             if object.hash() != &hash {
                 return Err(CacheLoadError::Invalid(object));
             }
@@ -198,9 +217,10 @@ impl NodeObjectCache {
         });
 
         match result {
-            Ok(object) => Some(object),
+            Ok(object) => (object.object_type() != NodeObjectType::Dummy).then_some(object),
             Err(error) => match error.as_ref() {
-                CacheLoadError::NotFound | CacheLoadError::Stale => None,
+                CacheLoadError::NotFound => None,
+                CacheLoadError::Stale => None,
                 CacheLoadError::Invalid(object) => {
                     self.rejected.fetch_add(1, Ordering::Relaxed);
                     Some(Arc::clone(object))

@@ -979,6 +979,26 @@ impl WorkerStore {
             .collect()
     }
 
+    /// Canonical resident/fetch-pack nodes follow the same durable write path
+    /// as nodes accepted by the packet filter. This mirrors rippled's
+    /// `checkFilter` calling `gotNode(true, ...)` for backed filter hits.
+    pub(crate) fn store_resident_shamap_node(
+        &mut self,
+        kind: TreeKind,
+        node: &shamap::tree_node::SHAMapTreeNode,
+        seq: u32,
+    ) -> bool {
+        let Ok(data) = node.serialize_with_prefix() else {
+            return false;
+        };
+        let object_type = match kind {
+            TreeKind::State => nodestore::NodeObjectType::AccountNode,
+            TreeKind::Transaction => nodestore::NodeObjectType::TransactionNode,
+        };
+        self.store_object(object_type, data, *node.get_hash().as_uint256(), seq);
+        true
+    }
+
     fn store_object(
         &mut self,
         object_type: nodestore::NodeObjectType,
@@ -3532,8 +3552,13 @@ impl MissingNodeResidentLookup for ActorResident<'_> {
         self.full_below.touch_if_exists(*hash.as_uint256())
     }
 
-    fn mark_full_below(&mut self, hash: SHAMapHash) {
-        self.full_below.insert(*hash.as_uint256());
+    fn mark_full_below(
+        &mut self,
+        node: basics::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
+        generation: u32,
+    ) {
+        node.set_full_below_gen(generation);
+        self.full_below.insert(*node.get_hash().as_uint256());
     }
 }
 

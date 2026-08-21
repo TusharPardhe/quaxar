@@ -26,6 +26,7 @@
 //! boundary. Adapters (the app wiring in M4.2) implement it; higher-level
 //! coordinator types stay shamap-free.
 
+use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -34,14 +35,14 @@ use basics::intrusive_pointer::SharedIntrusive;
 use basics::random::rand_int_to;
 use basics::sha_map_hash::SHAMapHash;
 use ledger::{
-    InboundLedgerDataType, InboundLedgerNodeData, InboundLedgerPacket, Ledger, TreeAdvance,
-    TreeKind, TreePlan, TreePlanId,
+    InboundLedgerDataType, InboundLedgerNodeData, InboundLedgerPacket, InboundLedgerPeerScore,
+    Ledger, TreeAdvance, TreeKind, TreePlan, TreePlanId, select_inbound_ledger_reply_peers,
 };
 use shamap::node_id::{SHAMapNodeId, deserialize_shamap_node_id};
 use shamap::sync::{MissingNodeReadApply, MissingNodeReadOutcome, MissingNodeResidentLookup};
 use shamap::tree_node::SHAMapTreeNode;
 
-use crate::id::{IdCounter, StoreGeneration};
+use crate::id::{IdCounter, PeerId, StoreGeneration};
 use crate::identity::{OperationKind, OperationRef, SessionRef};
 use crate::ingress::{AdmissionBudget, AdmittedLedgerPacket};
 use crate::io::{
@@ -60,11 +61,11 @@ pub const MAX_TURNS_PER_EVENT: u32 = 4;
 pub const MAX_PACKETS_FED_PER_TURN: usize = 4;
 /// Unique pending reads cap (mirrors the broker logical admission ceiling).
 pub const MAX_PENDING_READS: usize = 512;
-/// Maximum exact `PlanNetworkNeed` records actively retained from one missing
-/// node scan. Rippled's `kMissingNodesFind` is 256; retaining that complete
-/// scan is required so a reply-driven request can use its 128-node limit.
-/// Timeout recovery still rotates bounded 12-node batches over this frontier.
-pub const MAX_RETAINED_NETWORK_FRONTIER: usize = 256;
+/// Aggregate exact frontier across rippled's six useful reply peers. Each
+/// reply-triggered scan may send 128 distinct node IDs, so the coordinator
+/// retains six independent lanes rather than treating the per-scan 256 search
+/// bound as a global outstanding ceiling.
+pub const MAX_RETAINED_NETWORK_FRONTIER: usize = 6 * 128;
 /// Maximum exact frontier nodes retried during one no-progress timeout. This
 /// matches rippled's blind request cap (`kReqNodes`) while a rotating cursor
 /// gives every retained frontier entry a bounded chance to be retried.
@@ -204,13 +205,28 @@ pub enum PlanReadApply {
 pub struct PlanNetworkApply {
     attachment: PlanReadApply,
     useful: bool,
+    invalid: bool,
 }
 
 impl PlanNetworkApply {
     /// Builds an application result from the retained-frontier outcome and the
     /// map-level useful-data accounting.
     pub const fn new(attachment: PlanReadApply, useful: bool) -> Self {
-        Self { attachment, useful }
+        Self {
+            attachment,
+            useful,
+            invalid: false,
+        }
+    }
+
+    /// Reports a packet-fatal node validation failure. rippled aborts the
+    /// remainder of the packet on the first invalid node/data/id tuple.
+    pub const fn invalid(attachment: PlanReadApply, useful: bool) -> Self {
+        Self {
+            attachment,
+            useful,
+            invalid: true,
+        }
     }
 
     /// The retained-frontier attachment outcome.
@@ -226,6 +242,11 @@ impl PlanNetworkApply {
     /// True when the retained continuation attached at least one edge.
     pub const fn attached(self) -> bool {
         matches!(self.attachment, PlanReadApply::Applied { .. })
+    }
+
+    /// True when later nodes from the same packet must not be processed.
+    pub const fn is_invalid(self) -> bool {
+        self.invalid
     }
 }
 
@@ -262,6 +283,14 @@ pub trait TreeEngine: std::fmt::Debug {
         kind: TreeKind,
         node: &InboundLedgerNodeData,
     ) -> PlanNetworkApply;
+
+    /// Starts a fresh reply-triggered missing-node scan epoch after useful
+    /// peer data, matching rippled's per-Reply `getMissingNodes(256)` call.
+    fn begin_reply_scan(&mut self) {}
+
+    /// Retains canonical peer-attachment waiters only for exact needs that
+    /// were actually serialized, discarding a truncated scan tail.
+    fn retain_network_needs(&mut self, _needs: &[PlanNetworkNeed]) {}
 
     /// True only while a CPU turn can make progress without a broker completion
     /// or peer response.
@@ -306,6 +335,29 @@ pub trait TreeEngine: std::fmt::Debug {
 /// returns a uniquely owned engine or nothing. It never exposes a mutable
 /// session.
 pub trait PlanSeed: std::fmt::Debug {
+    /// Attempts the pre-peer local reconstruction path. Implementations must
+    /// use resident/cache data only; physical I/O remains brokered.
+    fn build_resident(
+        &mut self,
+        _session: SessionRef,
+    ) -> Option<Box<dyn TreeEngine + Send + Sync>> {
+        None
+    }
+
+    /// Builds from prefixed Ledger NodeStore bytes returned by the brokered
+    /// pre-peer header probe.
+    fn build_stored_header(
+        &mut self,
+        _session: SessionRef,
+        _data: &Bytes,
+    ) -> Option<Box<dyn TreeEngine + Send + Sync>> {
+        None
+    }
+
+    /// Releases constructor metadata after the coordinator's terminal
+    /// one-minute retention expires.
+    fn session_reaped(&mut self, _session: SessionRef) {}
+
     /// Builds a rooted tree engine for `session` from `header`, or `None`.
     fn build(
         &mut self,
@@ -545,6 +597,13 @@ pub enum PlanTurn {
     Invalid,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkLane {
+    Reply(PeerId),
+    Added(PeerId),
+    Timeout(Vec<PeerId>),
+}
+
 /// Packet-level application summary. Attachment controls whether another
 /// bounded CPU turn is useful; useful data alone controls timeout progress.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -553,6 +612,7 @@ struct PacketFeed {
     useful: bool,
     nodes_seen: u32,
     malformed_nodes: u32,
+    useful_peer_counts: BTreeMap<PeerId, i32>,
     /// Exact retained needs attached by this packet. These are the only
     /// network results allowed to retire retained needs.
     resolved_network: Vec<PlanNetworkNeed>,
@@ -564,6 +624,12 @@ impl PacketFeed {
         self.useful |= other.useful;
         self.nodes_seen = self.nodes_seen.saturating_add(other.nodes_seen);
         self.malformed_nodes = self.malformed_nodes.saturating_add(other.malformed_nodes);
+        for (peer, count) in other.useful_peer_counts {
+            self.useful_peer_counts
+                .entry(peer)
+                .and_modify(|current| *current = (*current).max(count))
+                .or_insert(count);
+        }
         self.resolved_network.append(&mut other.resolved_network);
     }
 }
@@ -606,6 +672,9 @@ pub struct SessionPlan {
     /// once per timeout interval, not once per effect, so local reprobes and
     /// peer resends cover the same exact needs.
     retained_network_cursor: usize,
+    useful_peer_scores: BTreeMap<PeerId, i32>,
+    network_lanes: VecDeque<NetworkLane>,
+    recent_nodes: BTreeSet<Uint256>,
     persistence: SessionPersistence,
     timeouts: u32,
     progress_since_timeout: bool,
@@ -629,6 +698,9 @@ impl SessionPlan {
             retained_network: Vec::new(),
             unemitted_network: VecDeque::new(),
             retained_network_cursor: 0,
+            useful_peer_scores: BTreeMap::new(),
+            network_lanes: VecDeque::new(),
+            recent_nodes: BTreeSet::new(),
             persistence: SessionPersistence::None,
             timeouts: 0,
             progress_since_timeout: false,
@@ -660,6 +732,12 @@ impl SessionPlan {
         self.engine.as_deref()
     }
 
+    pub fn has_runnable_frontier(&self) -> bool {
+        self.engine
+            .as_deref()
+            .is_some_and(TreeEngine::has_runnable_frontier)
+    }
+
     /// The verified header sequence available for subsequent by-hash node
     /// requests. It deliberately does not depend on tree completion.
     pub fn ledger_sequence(&self) -> Option<u32> {
@@ -667,6 +745,95 @@ impl SessionPlan {
             .as_deref()
             .and_then(TreeEngine::ledger_sequence)
             .filter(|sequence| *sequence != 0)
+    }
+
+    pub fn network_lane(&self) -> Option<NetworkLane> {
+        self.network_lanes.front().cloned()
+    }
+
+    pub fn network_lane_exhausted(&self) -> bool {
+        self.network_lanes.front().is_some()
+            && self.unemitted_network.is_empty()
+            && self.network_backlog.is_empty()
+            && self.pending_read_count() == 0
+            && !self.has_runnable_frontier()
+    }
+
+    pub fn finish_network_lane(&mut self) {
+        if self.network_lanes.pop_front().is_some() {
+            self.discard_unrequested_network_tail();
+        }
+        // Destroy the temporary scan result after truncation even for the
+        // final lane. The canonical SHAMap remains shared and peer packets
+        // attach through its normal addKnownNode path; only this scan cursor
+        // and its unrequested edge table are replaced.
+        if let Some(engine) = self.engine.as_mut() {
+            engine.begin_reply_scan();
+        }
+    }
+
+    fn discard_unrequested_network_tail(&mut self) {
+        let unrequested = self
+            .unemitted_network
+            .iter()
+            .chain(self.network_backlog.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        self.retained_network
+            .retain(|need| !unrequested.contains(need));
+        self.unemitted_network.clear();
+        self.network_backlog.clear();
+        self.normalize_retained_network_cursor();
+        self.refresh_pending_network();
+        if let Some(engine) = self.engine.as_mut() {
+            engine.retain_network_needs(&self.retained_network);
+        }
+    }
+
+    /// Credits a verified Base/header reply to its responder. The header is
+    /// useful acquisition data in rippled and therefore receives Reply
+    /// trigger semantics after any asynchronous local reads finish.
+    pub fn note_useful_peer(&mut self, peer: PeerId, count: i32) {
+        self.useful_peer_scores
+            .entry(peer)
+            .and_modify(|current| *current = (*current).max(count))
+            .or_insert(count);
+    }
+
+    pub fn begin_timeout_scan(
+        &mut self,
+        existing_peers: Vec<PeerId>,
+        added_peers: impl IntoIterator<Item = PeerId>,
+    ) {
+        self.recent_nodes.clear();
+        let was_empty = self.network_lanes.is_empty();
+        self.network_lanes
+            .push_back(NetworkLane::Timeout(existing_peers));
+        self.network_lanes
+            .extend(added_peers.into_iter().map(NetworkLane::Added));
+        if was_empty {
+            self.reset_network_epoch();
+            if !self.network_lanes.is_empty()
+                && let Some(engine) = self.engine.as_mut()
+            {
+                engine.begin_reply_scan();
+            }
+        }
+    }
+
+    /// Mirrors `InboundLedger::onTimer`: recent request suppression is scoped
+    /// to one timer interval and is cleared even when that interval made
+    /// progress. A progress interval does not restart the active traversal.
+    pub fn clear_recent_nodes(&mut self) {
+        self.recent_nodes.clear();
+    }
+
+    fn reset_network_epoch(&mut self) {
+        self.network_backlog.clear();
+        self.pending_network.clear();
+        self.retained_network.clear();
+        self.unemitted_network.clear();
+        self.retained_network_cursor = 0;
     }
 
     /// Yields the durable ledger from the uniquely owned engine exactly once.
@@ -769,6 +936,10 @@ impl SessionPlan {
                     .expect("checked FIFO frontier entry must remain present"),
             );
         }
+        // rippled records only the truncated wire batch in recentNodes_, not
+        // all candidates returned by getMissingNodes.
+        self.recent_nodes
+            .extend(batch.iter().map(|need| need.hash()));
         batch
     }
 
@@ -799,8 +970,34 @@ impl SessionPlan {
         self.retained_network.clear();
         self.unemitted_network.clear();
         self.retained_network_cursor = 0;
+        self.useful_peer_scores.clear();
+        self.network_lanes.clear();
+        self.recent_nodes.clear();
         self.engine = None;
         self.persistence = SessionPersistence::None;
+    }
+
+    /// Clear every external permit while preserving the engine's strong tree
+    /// graph for rippled's one-minute terminal reuse window.
+    pub fn terminalize_retaining_engine(&mut self) {
+        self.cancelled = true;
+        self.mailbox.clear();
+        self.pending_reads.clear();
+        self.pending_recovery_reads.clear();
+        self.read_backlog.clear();
+        self.network_backlog.clear();
+        self.pending_network.clear();
+        self.retained_network.clear();
+        self.unemitted_network.clear();
+        self.retained_network_cursor = 0;
+        self.useful_peer_scores.clear();
+        self.network_lanes.clear();
+        self.recent_nodes.clear();
+        self.persistence = SessionPersistence::None;
+    }
+
+    pub fn release_retained_engine(&mut self) {
+        self.engine = None;
     }
 
     /// Records protocol progress for this plan. Progress suppresses recovery
@@ -954,6 +1151,39 @@ impl SessionPlan {
                     break;
                 };
                 fed.merge(Self::feed_packet(packet, &mut **engine));
+            }
+            for (peer, count) in &fed.useful_peer_counts {
+                self.useful_peer_scores
+                    .entry(*peer)
+                    .and_modify(|current| *current = (*current).max(*count))
+                    .or_insert(*count);
+            }
+            if self.mailbox.is_empty() && !self.useful_peer_scores.is_empty() {
+                let scores = self
+                    .useful_peer_scores
+                    .iter()
+                    .map(|(peer, count)| InboundLedgerPeerScore {
+                        peer_id: peer.get(),
+                        useful_count: *count,
+                    })
+                    .collect::<Vec<_>>();
+                self.useful_peer_scores.clear();
+                let was_empty = self.network_lanes.is_empty();
+                for peer in select_inbound_ledger_reply_peers(&scores) {
+                    let peer = PeerId::new(peer);
+                    self.network_lanes.push_back(NetworkLane::Reply(peer));
+                }
+                if was_empty
+                    && !self.network_lanes.is_empty()
+                    && let Some(engine) = self.engine.as_mut()
+                {
+                    self.network_backlog.clear();
+                    self.pending_network.clear();
+                    self.retained_network.clear();
+                    self.unemitted_network.clear();
+                    self.retained_network_cursor = 0;
+                    engine.begin_reply_scan();
+                }
             }
             // When a retained frontier is full, packet attachment is allowed
             // solely to retire exact needs and free one dispatch slot. Do not
@@ -1250,7 +1480,7 @@ impl SessionPlan {
         }
         self.timeouts = self.timeouts.saturating_add(1);
         if self.timeouts > self.max_timeouts {
-            self.cancel();
+            self.cancelled = true;
             PlanTimeout::Fail
         } else {
             PlanTimeout::Continue
@@ -1261,6 +1491,7 @@ impl SessionPlan {
     /// frontier. Useful-data credit is separate from attachment so only the
     /// former resets the inbound timeout, matching rippled.
     fn feed_packet(mut packet: AdmittedLedgerPacket, engine: &mut dyn TreeEngine) -> PacketFeed {
+        let peer = packet.peer_id();
         let kind = match packet.packet().packet_type {
             InboundLedgerDataType::StateNode => TreeKind::State,
             InboundLedgerDataType::TransactionNode => TreeKind::Transaction,
@@ -1284,13 +1515,18 @@ impl SessionPlan {
                         wire_type = node.node_data.last().copied(),
                         "Rejected malformed ledger tree-node payload"
                     );
-                    continue;
+                    break;
                 }
             };
             if decoded.get_hash().is_zero() {
-                continue;
+                fed.malformed_nodes = fed.malformed_nodes.saturating_add(1);
+                break;
             }
             let applied = engine.apply_network_node(kind, node);
+            if applied.is_invalid() {
+                fed.malformed_nodes = fed.malformed_nodes.saturating_add(1);
+                break;
+            }
             if applied.attached()
                 && let Some(node_id) = node.node_id.as_deref().and_then(deserialize_shamap_node_id)
             {
@@ -1302,6 +1538,12 @@ impl SessionPlan {
             }
             fed.attached |= applied.attached();
             fed.useful |= applied.is_useful();
+            if applied.is_useful() {
+                fed.useful_peer_counts
+                    .entry(peer)
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+            }
         }
         let _ = packet.settle();
         fed
@@ -1340,6 +1582,9 @@ impl SessionPlan {
     ) -> usize {
         let mut deferred = 0;
         for node in nodes {
+            if self.recent_nodes.contains(&node.hash()) {
+                continue;
+            }
             if self.retained_network.contains(&node)
                 || self.network_backlog.iter().any(|queued| *queued == node)
             {
@@ -1357,6 +1602,9 @@ impl SessionPlan {
     /// `(node id, hash, kind)`; duplicate announcements are ignored.
     fn enqueue_network_frontier(&mut self, nodes: impl IntoIterator<Item = PlanNetworkNeed>) {
         for node in nodes {
+            if self.recent_nodes.contains(&node.hash()) {
+                continue;
+            }
             if self.retained_network.contains(&node)
                 || self.network_backlog.iter().any(|queued| *queued == node)
             {
@@ -1816,6 +2064,15 @@ impl TreeEngine for LedgerTreePlanEngine {
             attachment,
             matches!(attachment, PlanReadApply::Applied { .. }),
         )
+    }
+
+    fn begin_reply_scan(&mut self) {
+        self.plan.begin_reply_scan();
+    }
+
+    fn retain_network_needs(&mut self, needs: &[PlanNetworkNeed]) {
+        self.plan
+            .retain_network_hashes(needs.iter().map(|need| SHAMapHash::new(need.hash())));
     }
 
     fn has_runnable_frontier(&self) -> bool {
@@ -2569,7 +2826,7 @@ mod tests {
         let PlanTurn::Network(nodes) = plan.run_turn(&mut ctx(s, &mut ids)) else {
             panic!("expected network turn");
         };
-        assert_eq!(nodes.len(), MAX_RETAINED_NETWORK_FRONTIER - 3);
+        assert_eq!(nodes.len(), MAX_RETAINED_NETWORK_FRONTIER - 4);
         assert_eq!(plan.retained_network(), needs.as_slice());
         assert_eq!(
             plan.retained_network().len(),
@@ -2819,7 +3076,7 @@ mod tests {
         let PlanTurn::Network(dispatched) = plan.run_turn(&mut ctx(s, &mut ids)) else {
             panic!("expected retained network frontier dispatch");
         };
-        assert_eq!(MAX_RETAINED_NETWORK_FRONTIER, 256);
+        assert_eq!(MAX_RETAINED_NETWORK_FRONTIER, 768);
         assert_eq!(dispatched.len(), MAX_RETAINED_NETWORK_FRONTIER);
         assert_eq!(plan.retained_network().len(), MAX_RETAINED_NETWORK_FRONTIER);
         assert_eq!(plan.network_backlog.len(), 1);

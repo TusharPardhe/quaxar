@@ -135,6 +135,8 @@ pub enum OperationKind {
     CpuTurn,
     /// A physical NodeStore read submitted through the broker.
     Read,
+    /// The pre-peer local ledger-header probe.
+    HeaderRead,
     /// An asynchronous NodeStore reprobe of one retained network frontier
     /// need. It is distinct from an ordinary traversal read so a late timeout
     /// completion cannot be mistaken for the original read it retried.
@@ -160,6 +162,7 @@ impl OperationKind {
             Self::TreeTurn => "tree_turn",
             Self::CpuTurn => "cpu_turn",
             Self::Read => "read",
+            Self::HeaderRead => "header_read",
             Self::RecoveryRead => "recovery_read",
             Self::Write => "write",
             Self::DurabilityFence => "durability_fence",

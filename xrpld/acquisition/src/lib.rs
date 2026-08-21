@@ -64,6 +64,7 @@ pub use crate::io::{
 };
 pub use crate::peer::{
     LedgerDataRequest, LedgerNodeRequest, PeerAvailabilitySnapshot, PeerRequest,
+    PeerTargetCapability,
 };
 pub use crate::phase::{SyncPhase, TransitionError, TransitionFact, phase_transition};
 pub use crate::plan::{

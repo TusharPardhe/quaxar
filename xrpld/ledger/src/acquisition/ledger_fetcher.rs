@@ -277,6 +277,17 @@ impl TreePlan {
             .apply_network_node(MissingNodePlanId::new(plan_id.get()), hash, node)
     }
 
+    /// Give a useful Reply trigger the same fresh missing-node discovery
+    /// budget as rippled's new `getMissingNodes(256)` invocation.
+    pub fn begin_reply_scan(&mut self) {
+        self.continuation
+            .begin_reply_scan(&mut next_missing_scan_first_child);
+    }
+
+    pub fn retain_network_hashes(&mut self, hashes: impl IntoIterator<Item = SHAMapHash>) {
+        self.continuation.retain_network_hashes(hashes);
+    }
+
     pub fn network_candidates(&self) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)> {
         self.continuation.network_candidates()
     }
