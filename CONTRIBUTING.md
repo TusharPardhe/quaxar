@@ -1,4 +1,4 @@
-# Contributing to xrpld
+# Contributing to Quaxar
 
 Thank you for your interest in contributing to the Rust XRPL node implementation! This guide will help you get started.
 
@@ -18,7 +18,7 @@ just build
 cargo build --release
 
 # Single crate
-cargo build -p xrpld-app
+cargo build -p app
 ```
 
 ## Testing
@@ -28,7 +28,7 @@ cargo build -p xrpld-app
 just test
 
 # Run tests for a specific crate
-cargo test -p xrpld-rpc
+cargo test -p rpc
 
 # Run with nextest (faster, parallel)
 cargo nextest run --workspace

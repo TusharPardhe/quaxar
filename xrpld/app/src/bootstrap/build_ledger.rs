@@ -32,7 +32,7 @@ use crate::{LEDGER_RETRY_PASSES, LEDGER_TOTAL_PASSES};
 fn full_sync_debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("XRPLD_FULL_SYNC_DEBUG")
+        std::env::var("QUAXAR_FULL_SYNC_DEBUG")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })

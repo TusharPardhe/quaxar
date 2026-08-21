@@ -26,22 +26,30 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+          echo 'CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+          echo 'CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++' >> "$GITHUB_ENV"
+          echo 'AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar' >> "$GITHUB_ENV"
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p xrpld-main
+        run: cargo build --release --target ${{ matrix.target }} -p quaxar-main
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../xrpld-${{ matrix.target }}.tar.gz xrpld
+          tar czf ../../../quaxar-${{ matrix.target }}.tar.gz quaxar
           cd ../../..
-          sha256sum xrpld-${{ matrix.target }}.tar.gz > xrpld-${{ matrix.target }}.tar.gz.sha256
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum quaxar-${{ matrix.target }}.tar.gz > quaxar-${{ matrix.target }}.tar.gz.sha256
+          else
+            shasum -a 256 quaxar-${{ matrix.target }}.tar.gz > quaxar-${{ matrix.target }}.tar.gz.sha256
+          fi
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: xrpld-${{ matrix.target }}
+          name: quaxar-${{ matrix.target }}
           path: |
-            xrpld-${{ matrix.target }}.tar.gz
-            xrpld-${{ matrix.target }}.tar.gz.sha256
+            quaxar-${{ matrix.target }}.tar.gz
+            quaxar-${{ matrix.target }}.tar.gz.sha256
 
   release:
     needs: build
@@ -55,5 +63,5 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            xrpld-*/*.tar.gz
-            xrpld-*/*.sha256
+            quaxar-*/*.tar.gz
+            quaxar-*/*.sha256

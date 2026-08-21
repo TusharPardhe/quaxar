@@ -253,7 +253,7 @@ impl AcquisitionReadyScheduler {
         let entry = state.entries.get_mut(&key).expect("live scheduler entry");
         entry.causes = ReadyCause::NONE;
         entry.state_kind = ReadyState::Running;
-        xrpld_metrics::acquisition::record_scheduler_delay(entry.woke_at.elapsed().as_secs_f64());
+        quaxar_metrics::acquisition::record_scheduler_delay(entry.woke_at.elapsed().as_secs_f64());
         Some(acquisition)
     }
 

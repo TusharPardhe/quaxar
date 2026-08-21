@@ -8,7 +8,7 @@ use protocol::JsonValue;
 
 use super::path_request::PathRequest;
 use super::pathfinder::PathFinderSource;
-use xrpld_core::{RpcErrorCode, Status};
+use quaxar_core::{RpcErrorCode, Status};
 
 pub trait PathFindSession {
     fn session_id(&self) -> u64;

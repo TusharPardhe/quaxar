@@ -1194,7 +1194,7 @@ impl SyncTree {
                         ));
                     }
                     AddKnownNodeEvent::UnableToHook { wanted, stuck } => {
-                        if std::env::var("XRPLD_FULL_SYNC_DEBUG")
+                        if std::env::var("QUAXAR_FULL_SYNC_DEBUG")
                             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
                             .unwrap_or(false)
                         {

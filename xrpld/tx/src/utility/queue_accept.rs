@@ -1445,10 +1445,10 @@ where
         let queued = &mut views
             .accounts
             .get_mut(&key.account)
-            .expect("xrpld::TxQ::accept : account found")
+            .expect("quaxar::TxQ::accept : account found")
             .transactions
             .get_mut(&key.seq_proxy)
-            .expect("xrpld::TxQ::accept : candidate found in account")
+            .expect("quaxar::TxQ::accept : candidate found in account")
             .payload;
         apply(queued)
     };

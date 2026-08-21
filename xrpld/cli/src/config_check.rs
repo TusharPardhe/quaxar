@@ -5,7 +5,7 @@ use basics::basic_config::{BasicConfig, IniFileSections};
 use ipnet::IpNet;
 
 pub fn run(conf_path: Option<&str>) {
-    let path = conf_path.unwrap_or("/etc/xrpld/xrpld.cfg");
+    let path = conf_path.unwrap_or("/etc/quaxar/quaxar.cfg");
     println!("Checking config: {path}");
     println!("───────────────────────────────────");
 
@@ -642,7 +642,7 @@ maybe
     #[test]
     fn config_validation_enforces_manifest_count_bounds() {
         let valid = validate_config_content(
-            "[overlay]\nmax_untrusted_count = 50\nmax_trusted_count = 1000\n",
+            "[node_size]\nmedium\n[node_db]\ntype = NuDB\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_untrusted_count = 50\nmax_trusted_count = 1000\n",
         );
         assert!(
             valid.errors.is_empty(),
@@ -651,7 +651,7 @@ maybe
         );
 
         let invalid = validate_config_content(
-            "[overlay]\nmax_untrusted_count = 49\nmax_trusted_count = 1001\n",
+            "[node_size]\nmedium\n[node_db]\ntype = NuDB\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_untrusted_count = 49\nmax_trusted_count = 1001\n",
         );
         let errors = invalid.errors.join("\n");
         assert!(errors.contains("[overlay] max_untrusted_count"));
@@ -690,13 +690,13 @@ medium
 
 [node_db]
 type = NuDB
-path = /tmp/xrpld/db/nudb
+path = /tmp/quaxar/db/nudb
 nudb_block_size = 4096
 online_delete = 512
 advisory_delete = 0
 
 [database_path]
-/tmp/xrpld/db
+/tmp/quaxar/db
 
 [ledger_history]
 256

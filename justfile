@@ -18,15 +18,15 @@ test:
 
 # Build release binary
 build:
-    cargo build --release -p xrpld-main
+    cargo build --release -p quaxar-main
 
-# Install xrpld to ~/.cargo/bin (automatically in PATH)
+# Install Quaxar to ~/.cargo/bin (automatically in PATH)
 install:
     cargo install --path xrpld/main
 
-# Uninstall xrpld
+# Uninstall Quaxar
 uninstall:
-    cargo uninstall xrpld-main
+    cargo uninstall quaxar-main
 
 # Check compilation
 check:
@@ -42,11 +42,11 @@ audit:
 
 # Run the node
 run *ARGS:
-    cargo run -p xrpld-main -- {{ARGS}}
+    cargo run -p quaxar-main -- {{ARGS}}
 
 # Interactive CLI
 cli:
-    cargo run -p xrpld-main -- cli
+    cargo run -p quaxar-main -- cli
 
 # Clean build artifacts
 clean:

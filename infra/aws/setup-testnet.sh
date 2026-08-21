@@ -43,22 +43,43 @@ retry apt-get install -y --no-install-recommends \
   ca-certificates curl git build-essential pkg-config libssl-dev librocksdb-dev \
   clang cmake lld
 
-if ! id -u xrpld >/dev/null 2>&1; then
-  useradd --system --create-home --home-dir /home/xrpld --shell /usr/sbin/nologin xrpld
+LEGACY_DATA_MIGRATED=0
+if [[ -d /var/lib/xrpld ]]; then
+  if [[ -e /var/lib/quaxar ]] && [[ -n "$(find /var/lib/quaxar -mindepth 1 -print -quit)" ]]; then
+    echo "Both /var/lib/xrpld and /var/lib/quaxar contain data; refusing an ambiguous migration" >&2
+    exit 1
+  fi
+  # Moving within /var/lib is atomic on the normal single-filesystem layout.
+  if systemctl is-active --quiet quaxar.service; then
+    systemctl stop quaxar.service
+  fi
+  if [[ -d /var/lib/quaxar ]]; then
+    rmdir /var/lib/quaxar
+  fi
+  mv /var/lib/xrpld /var/lib/quaxar
+  LEGACY_DATA_MIGRATED=1
 fi
-install -d -m 0750 /var/lib/xrpld /var/lib/xrpld/db /var/lib/xrpld/db/nudb /var/log/xrpld
-chown -R xrpld:xrpld /var/lib/xrpld /var/log/xrpld
+
+if [[ -d /var/log/xrpld ]] && [[ ! -e /var/log/quaxar ]]; then
+  mv /var/log/xrpld /var/log/quaxar
+fi
+
+if ! id -u quaxar >/dev/null 2>&1; then
+  useradd --system --create-home --home-dir /home/quaxar --shell /usr/sbin/nologin quaxar
+fi
+install -d -m 0750 /var/lib/quaxar /var/lib/quaxar/db /var/lib/quaxar/db/nudb /var/log/quaxar
+chown -R quaxar:quaxar /var/lib/quaxar /var/log/quaxar
 if [[ "$SKIP_BUILD" == "1" ]]; then
   test -d /opt/quaxar/.git
   test -x /usr/local/bin/quaxar
   echo "[$(date -Is)] reusing existing Quaxar build"
 else
   rm -rf /opt/quaxar
-  install -d -o xrpld -g xrpld -m 0755 /opt
-  runuser -u xrpld -- git clone --depth 1 --branch "$QUAXAR_REF" --single-branch \
+  install -d -o quaxar -g quaxar -m 0755 /opt/quaxar
+  runuser -u quaxar -- git clone --depth 1 --branch "$QUAXAR_REF" --single-branch \
     "$QUAXAR_REPOSITORY" /opt/quaxar
 
-  runuser -u xrpld -- bash -lc '
+  runuser -u quaxar -- bash -lc '
     set -Eeuo pipefail
     curl --fail --silent --show-error --proto "=https" --tlsv1.2 https://sh.rustup.rs \
       | sh -s -- -y --profile minimal --default-toolchain 1.90.0
@@ -66,21 +87,24 @@ else
     rustup toolchain install 1.90.0 --profile minimal
     cd /opt/quaxar
     ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu CARGO_BUILD_JOBS=2 CC=clang CXX=clang++ \
-      cargo +1.90.0 build --release -p xrpld-main
+      cargo +1.90.0 build --release -p quaxar-main
   '
   install -m 0755 /opt/quaxar/target/release/quaxar /usr/local/bin/quaxar
 fi
 install -d -m 0755 /etc/quaxar
 test -r /opt/quaxar/infra/aws/testnet-amendments.txt
-install -m 0644 /dev/stdin /etc/quaxar-validators-testnet.txt <<'VALIDATORS'
-[validator_list_sites]
-https://vl.altnet.rippletest.net
 
-[validator_list_keys]
-ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860
-VALIDATORS
+# Preserve validator credentials and operator settings from the old filename.
+if [[ -f /etc/quaxar/xrpld.cfg ]] && [[ ! -e /etc/quaxar/quaxar.cfg ]]; then
+  mv /etc/quaxar/xrpld.cfg /etc/quaxar/quaxar.cfg
+  sed -i \
+    -e 's#/var/lib/xrpld#/var/lib/quaxar#g' \
+    -e 's#/var/log/xrpld#/var/log/quaxar#g' \
+    /etc/quaxar/quaxar.cfg
+fi
 
-cat >/etc/quaxar/xrpld.cfg <<CONFIG
+if [[ ! -e /etc/quaxar/quaxar.cfg ]]; then
+  cat >/etc/quaxar/quaxar.cfg <<CONFIG
 [server]
 port_rpc_admin_local
 port_ws_admin_local
@@ -109,18 +133,18 @@ medium
 
 [node_db]
 type = NuDB
-path = /var/lib/xrpld/db/nudb
+path = /var/lib/quaxar/db/nudb
 online_delete = 256
 advisory_delete = 0
 
 [database_path]
-/var/lib/xrpld/db
+/var/lib/quaxar/db
 
 [ledger_history]
 256
 
 [debug_logfile]
-/var/log/xrpld/debug.log
+/var/log/quaxar/debug.log
 
 [network_id]
 1
@@ -135,9 +159,21 @@ verify_endpoints = 1
 [ips]
 s.altnet.rippletest.net 51235
 
-[validators_file]
-/etc/quaxar-validators-testnet.txt
+[validator_list_sites]
+https://vl.altnet.rippletest.net
+
+[validator_list_keys]
+ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860
 CONFIG
+fi
+if [[ "$LEGACY_DATA_MIGRATED" == "1" ]]; then
+  sed -i \
+    -e 's#/var/lib/xrpld#/var/lib/quaxar#g' \
+    -e 's#/var/log/xrpld#/var/log/quaxar#g' \
+    /etc/quaxar/quaxar.cfg
+fi
+chown root:quaxar /etc/quaxar/quaxar.cfg
+chmod 0640 /etc/quaxar/quaxar.cfg
 
 cat >/etc/systemd/system/quaxar.service <<'UNIT'
 [Unit]
@@ -147,9 +183,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=xrpld
-Group=xrpld
-ExecStart=/usr/local/bin/quaxar --conf /etc/quaxar/xrpld.cfg
+User=quaxar
+Group=quaxar
+ExecStart=/usr/local/bin/quaxar --conf /etc/quaxar/quaxar.cfg
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536
@@ -158,14 +194,14 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/xrpld /var/log/xrpld
+ReadWritePaths=/var/lib/quaxar /var/log/quaxar
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
 cat >/etc/logrotate.d/quaxar <<'ROTATE'
-/var/log/xrpld/*.log /var/log/quaxar-bootstrap.log {
+/var/log/quaxar/*.log /var/log/quaxar-bootstrap.log {
     rotate 7
     daily
     missingok
@@ -179,7 +215,7 @@ ROTATE
 {
   echo "repository=$QUAXAR_REPOSITORY"
   echo "requested_ref=$QUAXAR_REF"
-  echo "commit=$(runuser -u xrpld -- git -C /opt/quaxar rev-parse HEAD)"
+  echo "commit=$(runuser -u quaxar -- git -C /opt/quaxar rev-parse HEAD)"
   echo "built_at=$(date -Is)"
 } >/etc/quaxar/build-info
 

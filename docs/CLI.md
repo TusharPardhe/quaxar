@@ -5,14 +5,14 @@
 Start the server with an explicit config file:
 
 ```bash
-quaxar --conf /etc/xrpld/xrpld.cfg
+quaxar --conf /etc/quaxar/quaxar.cfg
 ```
 
 For an isolated lab or explicitly controlled deployment, a minimum validation
 quorum can be overridden at startup:
 
 ```bash
-quaxar --conf /etc/xrpld/xrpld.cfg --quorum 2
+quaxar --conf /etc/quaxar/quaxar.cfg --quorum 2
 ```
 
 `--quorum` overrides the quorum derived from the trusted validator list and can
@@ -93,7 +93,7 @@ Features:
 
 The CLI automatically finds the RPC port by:
 1. Reading `--conf <path>` if provided
-2. Looking for `xrpld.cfg` in the current directory
+2. Looking for `quaxar.cfg` in the current directory
 3. Parsing the first `[port_*]` section with `protocol = http`
 4. Falling back to `http://127.0.0.1:5005`
 
@@ -148,7 +148,7 @@ quaxar ledger 95000000
 quaxar db-stats
 
 # Database statistics using a specific config file
-quaxar db-stats --conf /etc/xrpld.cfg
+quaxar db-stats --conf /etc/quaxar/quaxar.cfg
 
 # Generate validator keys
 quaxar validator-keys generate
@@ -187,7 +187,7 @@ Import a snapshot file into the node store. The node must be stopped before
 running this command.
 
 ```bash
-quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
+quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/quaxar/quaxar.cfg
 ```
 
 | Flag | Required | Description |

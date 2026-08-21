@@ -297,7 +297,7 @@ where
         let state = Arc::clone(&self.state);
         let shutdown = Arc::clone(&self.state);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let thread_name = format!("xrpld-server-{}", listener_name);
+        let thread_name = format!("quaxar-server-{}", listener_name);
         let thread = thread::Builder::new()
             .name(thread_name)
             .spawn(move || {

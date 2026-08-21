@@ -226,7 +226,7 @@ fn validate_protocols(protocols: &[String]) -> Result<(), String> {
 
 fn usage() -> String {
     [
-        "usage: xrpld-server [--bind ADDR] [--protocols CSV] [--elb-support] [--start-valid]",
+        "usage: quaxar-server [--bind ADDR] [--protocols CSV] [--elb-support] [--start-valid]",
         "  --bind ADDR       listen address, default 127.0.0.1:0",
         "  --protocols CSV   comma-separated transport list, default http,ws",
         "  --elb-support     mark the bootstrap app as ELB-capable",
@@ -241,7 +241,7 @@ fn release_bootstrap_app(app: ApplicationRoot) -> Result<(), String> {
     // root is always released on a plain thread before we return the server
     // runtime shell.
     thread::Builder::new()
-        .name("xrpld-bootstrap-app-drop".to_owned())
+        .name("quaxar-bootstrap-app-drop".to_owned())
         .spawn(move || drop(app))
         .map_err(|error| format!("failed to release bootstrap app shell: {error}"))?
         .join()
@@ -257,7 +257,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     #[test]
     fn parse_server_bootstrap_args_defaults_like_the_simple_server_shell() {
-        let config = parse_server_bootstrap_args(["xrpld-server".to_owned()])
+        let config = parse_server_bootstrap_args(["quaxar-server".to_owned()])
             .expect("defaults should parse");
         assert_eq!(
             config.bind,
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn parse_server_bootstrap_args_accepts_deferred_peer_and_secure_modes() {
         let config = parse_server_bootstrap_args([
-            "xrpld-server".to_owned(),
+            "quaxar-server".to_owned(),
             "--protocols".to_owned(),
             "http,peer,https".to_owned(),
         ])

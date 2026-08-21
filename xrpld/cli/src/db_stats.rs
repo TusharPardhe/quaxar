@@ -72,10 +72,11 @@ pub fn run(url: &str, conf: Option<&str>) -> bool {
 }
 
 fn find_nudb_path(conf: Option<&str>) -> Option<String> {
-    let cfg_path = conf.unwrap_or("xrpld.cfg");
-    if !Path::new(cfg_path).exists() {
-        return None;
-    }
+    let cfg_path = conf.map(Path::new).or_else(|| {
+        [Path::new("quaxar.cfg"), Path::new("/etc/quaxar/quaxar.cfg")]
+            .into_iter()
+            .find(|path| path.exists())
+    })?;
     let content = std::fs::read_to_string(cfg_path).ok()?;
     let mut in_node_db = false;
     for line in content.lines() {

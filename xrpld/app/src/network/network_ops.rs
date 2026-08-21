@@ -139,12 +139,12 @@ impl StateAccounting {
         self.last_transition = now;
         self.counters[encode_operating_mode(new_mode) as usize].transitions += 1;
 
-        xrpld_metrics::acquisition::record_operating_mode_transition(
+        quaxar_metrics::acquisition::record_operating_mode_transition(
             old_mode.as_str(),
             new_mode.as_str(),
             reason,
         );
-        xrpld_metrics::acquisition::operating_mode(encode_operating_mode(new_mode));
+        quaxar_metrics::acquisition::operating_mode(encode_operating_mode(new_mode));
         tracing::info!(
             target: "operating_mode",
             from = old_mode.as_str(),

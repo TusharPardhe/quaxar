@@ -144,7 +144,7 @@ impl TimerService {
         let thread_state = Arc::clone(&state);
         let thread_stopped = Arc::clone(&stopped);
         let thread = thread::Builder::new()
-            .name("xrpld-acq-timer".to_owned())
+            .name("quaxar-acq-timer".to_owned())
             .spawn(move || {
                 loop {
                     let callback = {
@@ -326,7 +326,7 @@ impl WorkerPool {
             let stop = Arc::clone(&stop);
             workers.push(
                 thread::Builder::new()
-                    .name(format!("xrpld-acq-pool-{index}"))
+                    .name(format!("quaxar-acq-pool-{index}"))
                     .spawn(move || {
                         loop {
                             let job = {

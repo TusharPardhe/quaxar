@@ -381,9 +381,9 @@ mod tests {
     use protocol::{
         KeyType, SecretKey, calc_node_id, derive_public_key, generate_secret_key, random_seed,
     };
+    use quaxar_core::{DatabaseCon, LEDGER_DB_INIT};
     use std::time::Duration;
     use tempfile::TempDir;
-    use xrpld_core::{DatabaseCon, LEDGER_DB_INIT};
 
     fn memory_node_store() -> (TempDir, crate::SHAMapStoreNodeStore) {
         let temp = TempDir::new().expect("tempdir");

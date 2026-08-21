@@ -111,7 +111,7 @@ impl ReplayTimerRuntime {
         let tick_queued = Arc::clone(&self.tick_queued);
         *worker = Some(
             std::thread::Builder::new()
-                .name("xrpld-ledger-replay-timer".to_owned())
+                .name("quaxar-ledger-replay-timer".to_owned())
                 .spawn(move || {
                     let (lock, wake) = &*stopping;
                     let mut stopped = lock.lock().expect("replay timer stop lock");

@@ -194,7 +194,7 @@ CLAUDE.md
 *.nudb
 db/
 data/
-/var/lib/xrpld/
+/var/lib/quaxar/
 
 # RocksDB database directories
 *.sst
@@ -227,7 +227,7 @@ peerfinder.db
 *.local.yaml
 *.local.yml
 *.local.json
-xrpld.local.cfg
+quaxar.local.cfg
 *.txt
 
 # Secret keys and certificates
@@ -239,7 +239,6 @@ xrpld.local.cfg
 *.pfx
 *.jks
 *.keystore
-!validators.txt
 
 # Validator token files (sensitive)
 validator-token.txt

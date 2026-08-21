@@ -10,7 +10,7 @@ fn main() -> ExitCode {
     };
 
     tracing::info!(target: "app",
-        "bootstrapped xrpld app runtime from {} (overlay_runtime={}, overlay_network_id={:?}, cluster_nodes={}, node_family={}, server_ports={}, shamap_store={}, io_threads={}, job_queue_threads={}, ledger_history={}, path_search_old={}, path_search={}, path_search_fast={}, path_search_max={}, fd_required={})",
+        "bootstrapped Quaxar app runtime from {} (overlay_runtime={}, overlay_network_id={:?}, cluster_nodes={}, node_family={}, server_ports={}, shamap_store={}, io_threads={}, job_queue_threads={}, ledger_history={}, path_search_old={}, path_search={}, path_search_fast={}, path_search_max={}, fd_required={})",
         bootstrap.report.config_path.display(),
         bootstrap.report.has_overlay_runtime,
         bootstrap.report.overlay_network_id,

@@ -167,7 +167,7 @@ impl EntropyTimerRuntime {
         *stopping.0.lock().expect("entropy stop mutex") = false;
         *worker = Some(
             std::thread::Builder::new()
-                .name("xrpld-entropy".to_owned())
+                .name("quaxar-entropy".to_owned())
                 .spawn(move || {
                     let (lock, wake) = &*stopping;
                     let mut stopped = lock.lock().expect("entropy stop mutex");

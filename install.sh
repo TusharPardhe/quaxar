@@ -205,7 +205,7 @@ validate_config_inputs() {
         failed=true
     fi
 
-    for value_name in DATA_DIR DB_PATH SQLITE_PATH LOG_FILE VALIDATORS_FILE; do
+    for value_name in DATA_DIR DB_PATH SQLITE_PATH LOG_FILE VL_SITE VL_KEY; do
         if [ -z "${!value_name}" ]; then
             fail "$value_name cannot be empty."
             failed=true
@@ -394,7 +394,7 @@ if [ "$INSTALL_METHOD" = "docker" ]; then
     fi
     ok "Docker detected: $(docker --version | awk '{print $3}' | tr -d ',')"
     
-    CLONE_DIR="${PREFIX:-$HOME/xrpld}"
+    CLONE_DIR="${PREFIX:-$HOME/quaxar}"
     if [ -d "$CLONE_DIR/.git" ]; then
         cd "$CLONE_DIR" && git pull --ff-only
     else
@@ -499,7 +499,7 @@ header "Build & Install"
 # Ensure cargo is in PATH
 [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 
-CLONE_DIR="${PREFIX:-$HOME/xrpld}"
+CLONE_DIR="${PREFIX:-$HOME/quaxar}"
 
 if [ -d "$CLONE_DIR/.git" ]; then
     info "Repository exists at $CLONE_DIR, pulling latest..."
@@ -537,19 +537,47 @@ ok "quaxar installed to $(which quaxar || echo ~/.cargo/bin/quaxar)"
 # ── Configuration ────────────────────────────────────────────────────────────
 header "Configuration"
 
-CONF_DIR="/etc/xrpld"
-CONF_FILE="$CONF_DIR/xrpld.cfg"
+CONF_DIR="/etc/quaxar"
+CONF_FILE="$CONF_DIR/quaxar.cfg"
 GENERATE_CONF=true
+USE_SYSTEM_CONFIG=true
 
 # Fall back to user-local config if sudo not available
 if ! sudo -n true 2>/dev/null; then
-    CONF_DIR="$HOME/.config/xrpld"
-    CONF_FILE="$CONF_DIR/xrpld.cfg"
+    USE_SYSTEM_CONFIG=false
+    CONF_DIR="$HOME/.config/quaxar"
+    CONF_FILE="$CONF_DIR/quaxar.cfg"
 fi
 
-if [ -f "$CONF_FILE" ] && [ "$AUTO_YES" = false ]; then
+# Copy, rather than regenerate, a legacy config so validator credentials and
+# operator settings survive the rename. Its data paths remain valid in place.
+LEGACY_CONF_FILE=""
+if [ "$USE_SYSTEM_CONFIG" = true ]; then
+    for candidate in /etc/quaxar/xrpld.cfg /etc/xrpld/xrpld.cfg; do
+        [ -f "$candidate" ] && LEGACY_CONF_FILE="$candidate" && break
+    done
+else
+    for candidate in "$HOME/.config/quaxar/xrpld.cfg" "$HOME/.config/xrpld/xrpld.cfg"; do
+        [ -f "$candidate" ] && LEGACY_CONF_FILE="$candidate" && break
+    done
+fi
+
+if [ ! -e "$CONF_FILE" ] && [ -n "$LEGACY_CONF_FILE" ]; then
+    if [ "$USE_SYSTEM_CONFIG" = true ]; then
+        sudo install -d -m 0755 "$CONF_DIR"
+        sudo install -o "$(id -un)" -g "$(id -gn)" -m 0600 "$LEGACY_CONF_FILE" "$CONF_FILE"
+    else
+        install -d -m 0700 "$CONF_DIR"
+        install -m 0600 "$LEGACY_CONF_FILE" "$CONF_FILE"
+    fi
+    ok "Migrated config without changing operator settings: $LEGACY_CONF_FILE → $CONF_FILE"
+    GENERATE_CONF=false
+elif [ -f "$CONF_FILE" ]; then
     warn "Config already exists at $CONF_FILE"
-    ask_yn "Overwrite?" "N" || GENERATE_CONF=false
+    GENERATE_CONF=false
+    if [ "$AUTO_YES" = false ] && ask_yn "Overwrite?" "N"; then
+        GENERATE_CONF=true
+    fi
 fi
 
 if [ "$GENERATE_CONF" = true ]; then
@@ -576,7 +604,6 @@ if [ "$GENERATE_CONF" = true ]; then
     LEDGER_HISTORY="256"
     NETWORK="mainnet"
     NETWORK_ID=""
-    VALIDATORS_FILE="$CONF_DIR/validators.txt"
     SSL_VERIFY="1"
     OVERLAY_PUBLIC_IP=""
     OVERLAY_IP_LIMIT="0"
@@ -682,9 +709,6 @@ if [ "$GENERATE_CONF" = true ]; then
         ask_choice "Log level" "$LOG_LEVEL" LOG_LEVEL "error warn info debug trace"
     fi
 
-    ensure_history_not_above_online_delete
-    validate_config_inputs
-
     # Network-specific settings
     case "$NETWORK" in
         mainnet)
@@ -715,11 +739,13 @@ if [ "$GENERATE_CONF" = true ]; then
     if [ "$AUTO_YES" = false ] && [ "${QUAXAR_ADVANCED_CONFIG:-0}" = "1" ]; then
         echo ""
         echo -e "  ${BOLD}── Validators and Peers ──${RESET}"
-        ask "Validators file" "$VALIDATORS_FILE" VALIDATORS_FILE
         ask "Validator list sites (comma-separated)" "$VL_SITE" VL_SITE
         ask "Validator list keys (comma-separated)" "$VL_KEY" VL_KEY
         ask "Fixed peers (comma-separated host port entries)" "$PEERS" PEERS
     fi
+
+    ensure_history_not_above_online_delete
+    validate_config_inputs
 
     RPC_SECURE_GATEWAY_LINE=""
     [ -n "$RPC_SECURE_GATEWAY" ] && RPC_SECURE_GATEWAY_LINE="secure_gateway = $RPC_SECURE_GATEWAY"
@@ -734,12 +760,20 @@ $NETWORK_ID
     OVERLAY_PUBLIC_IP_LINE=""
     [ -n "$OVERLAY_PUBLIC_IP" ] && OVERLAY_PUBLIC_IP_LINE="public_ip = $OVERLAY_PUBLIC_IP"
 
-    # Create directories
-    mkdir -p "$CONF_DIR" "$DB_PATH" "$SQLITE_PATH" "$(dirname "$LOG_FILE")" "$(dirname "$VALIDATORS_FILE")"
+    # Create directories. System config installation is privileged, while the
+    # generated data and log paths remain owned by the invoking operator.
+    if [ "$USE_SYSTEM_CONFIG" = true ]; then
+        sudo install -d -m 0755 "$CONF_DIR"
+        CONF_OUTPUT="$(mktemp)"
+    else
+        install -d -m 0700 "$CONF_DIR"
+        CONF_OUTPUT="$CONF_FILE"
+    fi
+    mkdir -p "$DB_PATH" "$SQLITE_PATH" "$(dirname "$LOG_FILE")"
     chown -R "$(whoami)" "$DATA_DIR" "$(dirname "$LOG_FILE")"
 
-    # Write xrpld.cfg
-    tee "$CONF_FILE" > /dev/null << EOF
+    # Write quaxar.cfg
+    tee "$CONF_OUTPUT" > /dev/null << EOF
 [server]
 port_rpc_admin_local
 port_peer
@@ -771,25 +805,23 @@ $SQLITE_PATH
 [ledger_history]
 $LEDGER_HISTORY
 
-[validators_file]
-$VALIDATORS_FILE
+[validator_list_sites]
+$(as_lines "$VL_SITE")
+
+[validator_list_keys]
+$(as_lines "$VL_KEY")
 
 $NETWORK_ID_SECTION
 [ips]
 $(as_lines "$PEERS")
 EOF
 
-    # Write validators.txt
-    tee "$VALIDATORS_FILE" > /dev/null << EOF
-[validator_list_sites]
-$(as_lines "$VL_SITE")
-
-[validator_list_keys]
-$(as_lines "$VL_KEY")
-EOF
+    if [ "$USE_SYSTEM_CONFIG" = true ]; then
+        sudo install -o "$(id -un)" -g "$(id -gn)" -m 0600 "$CONF_OUTPUT" "$CONF_FILE"
+        rm -f "$CONF_OUTPUT"
+    fi
 
     ok "Config written to $CONF_FILE"
-    ok "Validators written to $VALIDATORS_FILE"
 fi
 
 # ── Systemd Service ──────────────────────────────────────────────────────────
@@ -801,7 +833,7 @@ if [ "$AUTO_YES" = false ]; then
 fi
 
 if [ "$INSTALL_SERVICE" = true ] && command -v systemctl &>/dev/null && sudo -n true 2>/dev/null; then
-    XRPLD_BIN=$(which quaxar 2>/dev/null || echo "$HOME/.cargo/bin/quaxar")
+    QUAXAR_BIN=$(which quaxar 2>/dev/null || echo "$HOME/.cargo/bin/quaxar")
 
     sudo tee /etc/systemd/system/quaxar.service > /dev/null << EOF
 [Unit]
@@ -812,11 +844,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$(whoami)
-ExecStart=$XRPLD_BIN --conf $CONF_FILE
+ExecStart=$QUAXAR_BIN --conf $CONF_FILE
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536
-Environment=RUST_LOG=$LOG_LEVEL
+Environment=RUST_LOG=${LOG_LEVEL:-info}
 
 [Install]
 WantedBy=multi-user.target
@@ -834,17 +866,17 @@ EOF
     fi
 elif [ "$INSTALL_SERVICE" = true ]; then
     warn "systemd not available — skipping service setup"
-    info "Start manually: RUST_LOG=$LOG_LEVEL quaxar --conf $CONF_FILE"
+    info "Start manually: RUST_LOG=${LOG_LEVEL:-info} quaxar --conf $CONF_FILE"
 fi
 
 # ── Verification ─────────────────────────────────────────────────────────────
 header "Verification"
 
-XRPLD_BIN=$(which quaxar 2>/dev/null || echo "$HOME/.cargo/bin/quaxar")
+QUAXAR_BIN=$(which quaxar 2>/dev/null || echo "$HOME/.cargo/bin/quaxar")
 
-if [ -x "$XRPLD_BIN" ]; then
-    VER=$("$XRPLD_BIN" version 2>/dev/null | grep -i version | head -1 || echo "installed")
-    ok "Binary: $XRPLD_BIN"
+if [ -x "$QUAXAR_BIN" ]; then
+    VER=$("$QUAXAR_BIN" version 2>/dev/null | grep -i version | head -1 || echo "installed")
+    ok "Binary: $QUAXAR_BIN"
     ok "$VER"
 else
     fail "Binary not found"
@@ -852,15 +884,15 @@ fi
 
 if systemctl is-active quaxar &>/dev/null 2>&1; then
     sleep 2
-    "$XRPLD_BIN" health --rpc-url "http://127.0.0.1:${RPC_PORT:-5005}" 2>/dev/null || true
+    "$QUAXAR_BIN" health --rpc-url "http://127.0.0.1:${RPC_PORT:-5005}" 2>/dev/null || true
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 header "Installation Complete"
 
-echo -e "  Binary:     ${BOLD}$XRPLD_BIN${RESET}"
-echo -e "  Config:     ${BOLD}${CONF_FILE:-/etc/xrpld/xrpld.cfg}${RESET}"
-echo -e "  Data:       ${BOLD}${DATA_DIR:-/var/lib/xrpld}${RESET}"
+echo -e "  Binary:     ${BOLD}$QUAXAR_BIN${RESET}"
+echo -e "  Config:     ${BOLD}${CONF_FILE:-/etc/quaxar/quaxar.cfg}${RESET}"
+echo -e "  Data:       ${BOLD}${DATA_DIR:-/var/lib/quaxar}${RESET}"
 echo -e "  Network:    ${BOLD}${NETWORK:-mainnet}${RESET}"
 echo -e "  RPC:        ${BOLD}http://${RPC_IP:-127.0.0.1}:${RPC_PORT:-5005}${RESET}"
 echo -e "  Peer:       ${BOLD}${PEER_IP:-0.0.0.0}:${PEER_PORT:-51235}${RESET}"

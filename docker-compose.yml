@@ -4,14 +4,12 @@ services:
     container_name: quaxar
     restart: unless-stopped
     ports:
-      - "5005:5005"   # RPC
-      - "6006:6006"   # WebSocket
+      - "127.0.0.1:5005:5005"   # Local admin RPC
+      - "127.0.0.1:6006:6006"   # Local admin WebSocket
       - "51235:51235" # Peer protocol
     volumes:
-      - xrpld-data:/var/lib/xrpld
-      - ./xrpld.cfg:/etc/xrpld/xrpld.cfg:ro
-      - ./validators.txt:/etc/xrpld/validators.txt:ro
-    user: "0:0"  # Run as root to avoid permission issues with volume
+      - quaxar-data:/var/lib/quaxar
+      - ${QUAXAR_CONFIG_FILE:-./quaxar.cfg}:/etc/quaxar/quaxar.cfg:ro
     deploy:
       resources:
         limits:
@@ -23,4 +21,7 @@ services:
       retries: 3
 
 volumes:
-  xrpld-data:
+  quaxar-data:
+    # Reuse the volume created by the pre-rename Compose project. Override
+    # QUAXAR_DATA_VOLUME when the old project used a different project name.
+    name: "${QUAXAR_DATA_VOLUME:-quaxar_xrpld-data}"

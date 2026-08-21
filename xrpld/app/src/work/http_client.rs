@@ -78,7 +78,7 @@ pub async fn http_client_get(
         let result = match client
             .get(&url)
             .header("Host", format!("{}:{}", site, port))
-            .header("User-Agent", "xrpld-rust/0.1")
+            .header("User-Agent", "quaxar/0.1")
             .header("Accept", "*/*")
             .header("Connection", "close")
             .send()

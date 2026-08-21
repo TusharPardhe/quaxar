@@ -11,8 +11,8 @@ use protocol::{
     get_field_by_symbol, sf_generic, sign,
 };
 
+use quaxar_core::{DatabaseCon, WALLET_DB_INIT, WALLET_DB_NAME};
 use tempfile::TempDir;
-use xrpld_core::{DatabaseCon, WALLET_DB_INIT, WALLET_DB_NAME};
 
 fn signing_bytes(st: &STObject) -> Vec<u8> {
     let mut serializer = Serializer::default();

@@ -114,7 +114,7 @@ sudo apt install lld clang
 
 ## Configuration
 
-Use the repository `xrpld.cfg` as the default starting point. It is intentionally
+Use the repository `quaxar.cfg` as the default starting point. It is intentionally
 small; detailed parameter explanations are kept in
 [CONFIGURATION.md](CONFIGURATION.md).
 
@@ -138,24 +138,27 @@ medium
 
 [node_db]
 type = NuDB
-path = /var/lib/xrpld/db/nudb
+path = /var/lib/quaxar/db/nudb
 online_delete = 2000
 advisory_delete = 0
 
 [database_path]
-/var/lib/xrpld/db
+/var/lib/quaxar/db
 
-[validators_file]
-validators.txt
+[validator_list_sites]
+https://vl.ripple.com
+
+[validator_list_keys]
+ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
 
 [ips]
 s1.ripple.com 51235
 s2.ripple.com 51235
 ```
 
-### Validator List (validators.txt)
+### Validator List
 
-The `[validators_file]` directive loads a separate file containing trusted validator list sources. Create `validators.txt` alongside your config:
+Configure the trusted validator-list publisher directly in `quaxar.cfg`:
 
 ```ini
 [validator_list_sites]
@@ -165,8 +168,6 @@ https://vl.ripple.com
 ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
 ```
 
-Alternatively, place these sections directly in `xrpld.cfg`.
-
 ### Configuration Sections
 
 | Section | Purpose |
@@ -175,7 +176,6 @@ Alternatively, place these sections directly in `xrpld.cfg`.
 | `[port_*]` | Port binding: port number, IP, protocol (http/ws/peer) |
 | `[node_db]` | Database backend (NuDB), path, deletion policy |
 | `[node_size]` | Memory tuning: tiny, small, medium, large, huge |
-| `[validators_file]` | Path to file with validator list sites and keys |
 | `[validator_list_sites]` | URLs to fetch trusted validator lists |
 | `[validator_list_keys]` | Public keys of validator list publishers |
 | `[ips]` | Peer endpoints to connect to on startup |
@@ -185,12 +185,12 @@ See [CONFIGURATION.md](CONFIGURATION.md) for every supported config section.
 ## Starting the Node
 
 ```bash
-RUST_LOG=info ./target/release/quaxar --conf xrpld.cfg
+RUST_LOG=info ./target/release/quaxar --conf quaxar.cfg
 ```
 
 Background:
 ```bash
-RUST_LOG=info nohup ./target/release/quaxar --conf xrpld.cfg > quaxar.log 2>&1 &
+RUST_LOG=info nohup ./target/release/quaxar --conf quaxar.cfg > quaxar.log 2>&1 &
 ```
 
 ## Systemd Service
@@ -205,9 +205,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=xrpld
-Group=xrpld
-ExecStart=/usr/local/bin/quaxar --conf /etc/xrpld/xrpld.cfg
+User=quaxar
+Group=quaxar
+ExecStart=/usr/local/bin/quaxar --conf /etc/quaxar/quaxar.cfg
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536
@@ -273,7 +273,7 @@ running a production node.
 ### Database Usage
 
 ```bash
-quaxar db-stats --conf /etc/xrpld.cfg
+quaxar db-stats --conf /etc/quaxar/quaxar.cfg
 ```
 
 Shows the configured node-store path, NuDB data/key/log file sizes, total disk
@@ -299,10 +299,10 @@ Control log verbosity with the `RUST_LOG` environment variable:
 
 ```bash
 # Levels: error, warn, info, debug, trace
-RUST_LOG=info ./quaxar --conf xrpld.cfg
+RUST_LOG=info ./quaxar --conf quaxar.cfg
 
 # Per-module control
-RUST_LOG=info,consensus=debug,overlay=warn ./quaxar --conf xrpld.cfg
+RUST_LOG=info,consensus=debug,overlay=warn ./quaxar --conf quaxar.cfg
 ```
 
 Change at runtime:
@@ -334,7 +334,7 @@ verification.
 **On the new node (stopped):**
 
 ```bash
-quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
+quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/quaxar/quaxar.cfg
 ```
 
 The CLI displays a spinner while it imports and verifies all chunk and final

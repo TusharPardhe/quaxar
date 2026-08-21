@@ -47,7 +47,7 @@ pub enum Command {
     Peers,
     /// Show sync progress (useful during initial sync)
     SyncStatus,
-    /// Raw RPC call: xrpld rpc <method> ['{"json":"params"}']
+    /// Raw RPC call: quaxar rpc <method> ['{"json":"params"}']
     Rpc {
         /// RPC method name, for example server_info or can_delete
         method: String,

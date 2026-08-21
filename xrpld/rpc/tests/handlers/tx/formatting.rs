@@ -4,7 +4,7 @@ use super::*;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app::SqliteSHAMapStoreRelational;
-use xrpld_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
+use quaxar_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 
 fn attach_test_relational(app: &mut ApplicationRoot, label: &str) -> Arc<DatabaseCon> {
     let unique = SystemTime::now()
@@ -12,7 +12,7 @@ fn attach_test_relational(app: &mut ApplicationRoot, label: &str) -> Arc<Databas
         .expect("clock should be after epoch")
         .as_nanos();
     let dir = std::env::temp_dir().join(format!(
-        "xrpld-rpc-tx-{label}-{}-{unique}",
+        "quaxar-rpc-tx-{label}-{}-{unique}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("test db dir should be created");

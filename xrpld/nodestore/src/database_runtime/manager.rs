@@ -142,7 +142,7 @@ impl ManagerImp {
     }
 
     pub fn missing_backend() -> String {
-        "Your xrpld.cfg is missing a [node_db] entry, please see the xrpld-example.cfg file!"
+        "Your quaxar.cfg is missing a [node_db] entry; please see the Quaxar example configuration"
             .to_owned()
     }
 }

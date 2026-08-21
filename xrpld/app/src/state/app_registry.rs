@@ -74,6 +74,7 @@ impl PerfLogReportSource for StateAccountingReportSource {
     }
 }
 use protocol::{AccountID, PublicKey, SeqProxy};
+use quaxar_core::{DatabaseCon, WALLET_DB_INIT, WALLET_DB_NAME};
 use resource::ResourceManager;
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::{BTreeMap, HashMap};
@@ -95,7 +96,6 @@ use xrpl_core::{
     FixedNetworkIdService, HashRouter, HashRouterSetup, LoadMonitorJournal,
     LoadMonitorJournalFactory, PeerReservationJournal, PeerReservationTable,
 };
-use xrpld_core::{DatabaseCon, WALLET_DB_INIT, WALLET_DB_NAME};
 
 static WALLET_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1461,7 +1461,7 @@ impl ApplicationRegistryOwners {
 fn unique_wallet_db_dir() -> PathBuf {
     let sequence = WALLET_DB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "xrpld-application-root-wallet-{}-{sequence}",
+        "quaxar-application-root-wallet-{}-{sequence}",
         std::process::id()
     ))
 }

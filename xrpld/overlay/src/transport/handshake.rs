@@ -214,7 +214,7 @@ pub fn make_request(
         .method(Method::GET)
         .uri("/")
         .version(Version::HTTP_11)
-        .header(USER_AGENT, HeaderValue::from_static("xrpld-rust/overlay"))
+        .header(USER_AGENT, HeaderValue::from_static("quaxar/overlay"))
         .header(UPGRADE, supported_protocol_versions())
         .header(CONNECTION, HeaderValue::from_static("Upgrade"))
         .header("Connect-As", HeaderValue::from_static("Peer"))
@@ -251,7 +251,7 @@ pub fn make_response(
         .header(CONNECTION, HeaderValue::from_static("Upgrade"))
         .header(UPGRADE, protocol.to_string())
         .header("Connect-As", HeaderValue::from_static("Peer"))
-        .header(SERVER, HeaderValue::from_static("xrpld-rust/overlay"))
+        .header(SERVER, HeaderValue::from_static("quaxar/overlay"))
         .header("Crawl", if crawl_public { "public" } else { "private" })
         .body(())
         .expect("overlay response builder");

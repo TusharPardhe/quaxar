@@ -341,19 +341,19 @@ impl TreePlan {
 }
 
 fn full_sync_debug_enabled() -> bool {
-    std::env::var("XRPLD_FULL_SYNC_DEBUG")
+    std::env::var("QUAXAR_FULL_SYNC_DEBUG")
         .map(|value| value != "0")
         .unwrap_or(false)
 }
 
 fn acq_packet_debug_enabled() -> bool {
-    std::env::var("XRPLD_ACQ_PACKET_DEBUG")
+    std::env::var("QUAXAR_ACQ_PACKET_DEBUG")
         .map(|value| value != "0")
         .unwrap_or(false)
 }
 
 fn acq_packet_debug_verbose_enabled() -> bool {
-    std::env::var("XRPLD_ACQ_PACKET_DEBUG_VERBOSE")
+    std::env::var("QUAXAR_ACQ_PACKET_DEBUG_VERBOSE")
         .map(|value| value != "0")
         .unwrap_or(false)
 }

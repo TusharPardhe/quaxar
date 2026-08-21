@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This file explains the runtime configuration used by `quaxar`. Keep `xrpld.cfg`
+This file explains the runtime configuration used by `quaxar`. Keep `quaxar.cfg`
 focused on actual values; use this document for operational guidance.
 
 ## Loading A Config
@@ -8,10 +8,10 @@ focused on actual values; use this document for operational guidance.
 Run with an explicit config path:
 
 ```bash
-quaxar --conf /etc/xrpld/xrpld.cfg
+quaxar --conf /etc/quaxar/quaxar.cfg
 ```
 
-Docker Compose mounts the repository `xrpld.cfg` to `/etc/xrpld/xrpld.cfg`
+Docker Compose mounts the repository `quaxar.cfg` to `/etc/quaxar/quaxar.cfg`
 inside the container.
 
 ## Core Sections
@@ -86,7 +86,7 @@ How much validated ledger history to keep available. Use a number or `full`.
 ### `[validators_file]`
 
 Path to a validator-list config file. Relative paths are resolved from the
-directory containing `xrpld.cfg`.
+directory containing `quaxar.cfg`.
 
 ### `[validator_list_sites]`
 

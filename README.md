@@ -114,7 +114,7 @@ CC=clang CXX=clang++ cargo install --path xrpld/main
 Run with an explicit configuration file:
 
 ```bash
-quaxar --conf ./xrpld.cfg
+quaxar --conf ./quaxar.cfg
 ```
 
 ### Docker
@@ -123,15 +123,29 @@ quaxar --conf ./xrpld.cfg
 docker compose up -d
 ```
 
-Docker Compose mounts the repository `xrpld.cfg` into the container at
-`/etc/xrpld/xrpld.cfg`.
+Docker Compose mounts the repository `quaxar.cfg` into the container at
+`/etc/quaxar/quaxar.cfg`. The branded `quaxar-data` mount reuses the legacy
+`quaxar_xrpld-data` Docker volume so upgrades retain the existing ledger
+database. Set `QUAXAR_DATA_VOLUME` if the earlier Compose project used another
+project name. If the old `xrpld.cfg` contains validator credentials or other
+local settings, copy it to an untracked operator file and select it explicitly
+before upgrading:
+
+```bash
+cp xrpld.cfg quaxar.local.cfg
+export QUAXAR_CONFIG_FILE=./quaxar.local.cfg
+docker compose up -d
+```
+
+The container entrypoint performs a one-time ownership migration on an existing
+root-owned data volume, then drops privileges to the `quaxar` user.
 
 ## Quick Start
 
 Start a node:
 
 ```bash
-quaxar --conf xrpld.cfg
+quaxar --conf quaxar.cfg
 ```
 
 Check sync and health:
@@ -230,19 +244,22 @@ medium
 
 [node_db]
 type = NuDB
-path = /var/lib/xrpld/db/nudb
+path = /var/lib/quaxar/db/nudb
 
 [ledger_history]
 256
 
-[validators_file]
-validators.txt
+[validator_list_sites]
+https://vl.ripple.com
+
+[validator_list_keys]
+ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
 ```
 
 `node_size` is the recommended primary tuning setting. It controls the default
 resource profile for acquisition, cache sizing, and runtime concurrency.
 
-The repository includes a small runnable `xrpld.cfg`. See
+The repository includes a small runnable `quaxar.cfg`. See
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the complete configuration
 reference and [docs/RUNNING.md](docs/RUNNING.md) for operational guidance.
 
@@ -288,7 +305,6 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 | [SYNCING.md](docs/SYNCING.md) | Sync behavior, acquisition flow, and operator checks. |
 | [VALIDATORS.md](docs/VALIDATORS.md) | Validator key and token guidance. |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout and runtime design. |
-| [OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) | Performance characteristics and tuning notes. |
 | [RPC.md](docs/RPC.md) | Supported RPC methods and examples. |
 
 ## Contributing

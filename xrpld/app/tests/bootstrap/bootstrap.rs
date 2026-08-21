@@ -10,6 +10,7 @@ use protocol::{
     STObject, STTx, SecretKey, TxType, account_keylet, calc_account_id, derive_public_key,
     get_field_by_symbol, make_mpt_id,
 };
+use quaxar_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 use shamap::{
     item::SHAMapItem,
     mutation::MutableTree,
@@ -21,7 +22,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 use xrpl_core::StartUpType;
-use xrpld_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 
 fn count_rows(db: &DatabaseCon, table: &str) -> i64 {
     let connection = db.get_session();
@@ -486,19 +486,19 @@ fn persist_bootstrap_storage_with_missing_state_children(
             .expect("insert ledger row");
     }
 
-    (database_path, node_db_path, dir.path().join("xrpld.cfg"))
+    (database_path, node_db_path, dir.path().join("quaxar.cfg"))
 }
 
 #[test]
-fn app_bootstrap_defaults_to_the_xrpld_config_filename() {
-    let options = parse_bootstrap_args(["xrpld-app".to_owned()]).expect("defaults");
-    assert_eq!(options.config_path, PathBuf::from("xrpld.cfg"));
+fn app_bootstrap_defaults_to_the_quaxar_config_filename() {
+    let options = parse_bootstrap_args(["quaxar-app".to_owned()]).expect("defaults");
+    assert_eq!(options.config_path, PathBuf::from("quaxar.cfg"));
 }
 
 #[test]
 fn app_bootstrap_loads_config_and_assembles_the_app_owned_runtime_shell() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -670,7 +670,7 @@ online_delete = 256
 #[test]
 fn app_bootstrap_root_reports_app_owned_composition_before_main_binds_server_runtime() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -1253,7 +1253,7 @@ path = {}
 #[test]
 fn app_bootstrap_loads_ledger_file_into_live_state() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let ledger_path = dir.path().join("ledger.json");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
@@ -1342,13 +1342,13 @@ path = {}
 #[test]
 fn app_bootstrap_parses_comments_and_legacy_sections_like_the_config_shell() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     fs::write(
         &config_path,
         r#"
 # comment before any section
 [database_path]
-/var/lib/xrpld
+/var/lib/quaxar
 
 [server]
 port_rpc # comment on a value line
@@ -1364,7 +1364,7 @@ protocol = http
     let config = load_basic_config_file(&config_path).expect("config should parse");
     assert_eq!(
         config.legacy("database_path").expect("legacy"),
-        "/var/lib/xrpld"
+        "/var/lib/quaxar"
     );
     assert_eq!(config.section("server").values(), &["port_rpc"]);
 }
@@ -1540,7 +1540,7 @@ protocol = http,ws
 #[test]
 fn app_bootstrap_network_start_keeps_seeded_genesis_unvalidated() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -1613,7 +1613,7 @@ fn app_bootstrap_fresh_start_keeps_seeded_genesis_unvalidated() {
     // immediately, which triggered premature `tracking` state promotion and
     // blocked real ledger resolution from the network.
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -1686,7 +1686,7 @@ path = {}
 #[test]
 fn app_bootstrap_fast_load_falls_back_to_genesis_when_durable_load_fails() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node");
     fs::write(
@@ -1854,7 +1854,7 @@ path = {}
 #[test]
 fn app_bootstrap_rejects_present_but_malformed_validation_seed_configuration() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     fs::write(
         &config_path,
         r#"

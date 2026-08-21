@@ -15,8 +15,8 @@ use protocol::{
     HashPrefix, PublicKey, SOEStyle, SOElement, SOTemplate, STObject, SecretKey, SerialIter,
     get_field_by_symbol, sf_generic, verify_st_object,
 };
+use quaxar_core::DatabaseCon;
 use serde_json::Value;
-use xrpld_core::DatabaseCon;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {

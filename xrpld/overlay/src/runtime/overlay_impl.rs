@@ -1457,7 +1457,7 @@ impl OverlayImpl {
         let fixed_peer_ips = Arc::new(RwLock::new(setup.fixed_peer_ips.clone()));
         let session_runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
-                .thread_name("xrpld-overlay-session")
+                .thread_name("quaxar-overlay-session")
                 .enable_all()
                 .build()
                 .map_err(OverlayError::Io)?,
@@ -1594,7 +1594,7 @@ impl OverlayImpl {
         let response = Response::builder()
             .version(request.version())
             .status(503)
-            .header("Server", "xrpld-rust/overlay")
+            .header("Server", "quaxar/overlay")
             .header("Remote-Address", remote_address.to_string())
             .header("Content-Type", "application/json")
             .header("Connection", "close")

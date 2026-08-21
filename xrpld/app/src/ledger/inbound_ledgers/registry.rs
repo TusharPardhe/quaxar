@@ -84,12 +84,12 @@ pub(crate) struct CoordinatorAcquireOutcome {
 const WORKER_COUNT: usize = 3;
 
 /// Acquire the registry `inner` mutex, recording the time spent blocked on the
-/// lock. High percentiles of `xrpld_acq_registry_lock_wait_seconds` signal
+/// lock. High percentiles of `quaxar_acq_registry_lock_wait_seconds` signal
 /// ingress/lifecycle lock contention across the registry boundary.
 fn timed_inner_lock(inner: &Arc<Mutex<RegistryInner>>) -> std::sync::MutexGuard<'_, RegistryInner> {
     let start = Instant::now();
     let guard = inner.lock().expect("inbound_ledgers lock");
-    xrpld_metrics::acquisition::record_registry_lock_wait(start.elapsed().as_secs_f64());
+    quaxar_metrics::acquisition::record_registry_lock_wait(start.elapsed().as_secs_f64());
     guard
 }
 

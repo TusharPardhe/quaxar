@@ -1,12 +1,12 @@
 [package]
-name = "xrpld_core"
+name = "quaxar-core"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
 
 [lib]
-name = "xrpld_core"
+name = "quaxar_core"
 path = "src/lib.rs"
 
 [dependencies]

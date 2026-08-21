@@ -16,7 +16,7 @@ const CLUSTER_NODE_PUBLIC: &str = "n94a1u4jAz288pZLtw6yFWVbi89YamiC6JBXPVUj5zmEx
 
 fn config_from_text(text: &str) -> BasicConfig {
     let dir = TempDir::new().expect("tempdir");
-    let path = dir.path().join("xrpld.cfg");
+    let path = dir.path().join("quaxar.cfg");
     fs::write(&path, text).expect("config file");
     app::load_basic_config_file(path).expect("config")
 }
@@ -370,7 +370,7 @@ port_rpc
 #[test]
 fn bootstrap_runtime_automatically_owns_overlay_runtime_and_cluster_sources() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let config = write_config(&config_path, configured_overlay_text());
 
     let bootstrap = build_bootstrap_runtime(
@@ -411,7 +411,7 @@ fn bootstrap_runtime_automatically_owns_overlay_runtime_and_cluster_sources() {
 #[test]
 fn bootstrap_runtime_keeps_overlay_owner_without_a_peer_listener() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let config = write_config(&config_path, rpc_only_overlay_text());
 
     let bootstrap = build_bootstrap_runtime(

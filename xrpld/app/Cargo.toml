@@ -13,7 +13,7 @@ path = "src/lib.rs"
 acquisition = { path = "../acquisition" }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 tracing = "0.1"
-xrpld-metrics = { path = "../metrics" }
+quaxar-metrics = { path = "../metrics" }
 parking_lot = "0.12"
 basics = { path = "../../xrpl/basics" }
 bs58 = "0.5"
@@ -45,7 +45,7 @@ time = "0.3"
 tx = { path = "../tx" }
 webpki-roots = "1"
 xrpl_core = { path = "../../xrpl/core" }
-xrpld_core = { path = "../core" }
+quaxar-core = { path = "../core" }
 arc-swap = "1"
 rayon = "1"
 

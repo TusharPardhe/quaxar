@@ -29,6 +29,10 @@ use protocol::{
     JsonValue, REGISTERED_FEATURES, STLedgerEntry, STParsedJSONObject, STTx, SerialIter,
     Serializer, TxMeta, feature_id,
 };
+use quaxar_core::{
+    DatabaseCon, LEDGER_DB_INIT, LEDGER_DB_NAME, TRANSACTION_DB_INIT, TRANSACTION_DB_NAME,
+    build_database_con_setup,
+};
 use rusqlite::{OptionalExtension, params};
 use shamap::family::{
     NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
@@ -48,10 +52,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use xrpl_core::{HashRouter, ServiceRegistry, StartUpType};
-use xrpld_core::{
-    DatabaseCon, LEDGER_DB_INIT, LEDGER_DB_NAME, TRANSACTION_DB_INIT, TRANSACTION_DB_NAME,
-    build_database_con_setup,
-};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppBootstrapOptions {
@@ -88,7 +88,7 @@ pub struct AppBootstrapOptions {
 impl Default for AppBootstrapOptions {
     fn default() -> Self {
         Self {
-            config_path: PathBuf::from("xrpld.cfg"),
+            config_path: PathBuf::from("quaxar.cfg"),
             standalone: false,
             start_valid: false,
             elb_support: false,
@@ -5025,15 +5025,15 @@ fn parse_sql_hash(value: String) -> rusqlite::Result<basics::sha_map_hash::SHAMa
         })
 }
 
-fn to_xrpld_startup_type(start_type: StartUpType) -> xrpld_core::StartUpType {
+fn to_xrpld_startup_type(start_type: StartUpType) -> quaxar_core::StartUpType {
     match start_type {
-        StartUpType::Fresh => xrpld_core::StartUpType::Fresh,
-        StartUpType::Normal => xrpld_core::StartUpType::Normal,
-        StartUpType::Load => xrpld_core::StartUpType::Load,
-        StartUpType::LoadFile => xrpld_core::StartUpType::LoadFile,
-        StartUpType::Replay => xrpld_core::StartUpType::Replay,
-        StartUpType::Network => xrpld_core::StartUpType::Network,
-        StartUpType::Snapshot => xrpld_core::StartUpType::Snapshot,
+        StartUpType::Fresh => quaxar_core::StartUpType::Fresh,
+        StartUpType::Normal => quaxar_core::StartUpType::Normal,
+        StartUpType::Load => quaxar_core::StartUpType::Load,
+        StartUpType::LoadFile => quaxar_core::StartUpType::LoadFile,
+        StartUpType::Replay => quaxar_core::StartUpType::Replay,
+        StartUpType::Network => quaxar_core::StartUpType::Network,
+        StartUpType::Snapshot => quaxar_core::StartUpType::Snapshot,
     }
 }
 
@@ -5463,7 +5463,7 @@ fn parse_basic_config_text(text: &str) -> Result<BasicConfig, String> {
 
 fn usage() -> String {
     [
-        "usage: xrpld [options] <command> <params>",
+        "usage: quaxar [options] <command> <params>",
         "General Options:",
         "  --conf PATH         Specify the configuration file.",
         "  --debug             Enable normally suppressed debug logging",

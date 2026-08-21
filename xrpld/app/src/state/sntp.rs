@@ -80,7 +80,7 @@ impl SntpClient {
         let client = self.clone();
         let on_offset: OffsetSink = Arc::new(on_offset);
         match std::thread::Builder::new()
-            .name("xrpld-sntp".to_owned())
+            .name("quaxar-sntp".to_owned())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()

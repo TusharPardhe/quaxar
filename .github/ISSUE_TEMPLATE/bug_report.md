@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug in xrpld
+about: Report a bug in Quaxar
 labels: bug
 ---
 
@@ -16,5 +16,5 @@ labels: bug
 ## Environment
 - OS:
 - Rust version:
-- xrpld version:
+- Quaxar version:
 - Config:

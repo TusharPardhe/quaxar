@@ -71,7 +71,7 @@ if (Test-Path $bin) {
     Write-Host "  [OK] quaxar installed to $bin" -ForegroundColor Green
     Write-Host ""
     Write-Host "  Usage:" -ForegroundColor Gray
-    Write-Host "    quaxar --conf xrpld.cfg       Start the node" -ForegroundColor White
+    Write-Host "    quaxar --conf quaxar.cfg       Start the node" -ForegroundColor White
     Write-Host "    quaxar status                 Check node status" -ForegroundColor White
     Write-Host "    quaxar health                 Health check" -ForegroundColor White
     Write-Host "    quaxar export-snapshot -o .   Export snapshot" -ForegroundColor White

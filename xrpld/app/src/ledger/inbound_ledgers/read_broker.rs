@@ -692,7 +692,7 @@ impl NodeReadBroker {
             });
             state.metrics.physical_dispatched += 1;
             if let Some(queued_since) = queued_since {
-                xrpld_metrics::acquisition::record_read_queue_delay(
+                quaxar_metrics::acquisition::record_read_queue_delay(
                     queued_since.elapsed().as_secs_f64(),
                 );
             }
@@ -705,7 +705,7 @@ impl NodeReadBroker {
     /// Record the aggregate physical-read in-flight gauge from broker state.
     /// The gauge is the broker's resource-local view, never session state.
     fn emit_broker_metrics(state: &BrokerState) {
-        xrpld_metrics::acquisition::read_in_flight(Self::in_flight_count(state));
+        quaxar_metrics::acquisition::read_in_flight(Self::in_flight_count(state));
     }
 
     fn in_flight_count(state: &BrokerState) -> usize {

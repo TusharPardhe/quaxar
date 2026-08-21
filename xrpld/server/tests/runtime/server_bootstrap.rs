@@ -9,7 +9,7 @@ use server::bootstrap::{
 
 #[test]
 fn server_bootstrap_defaults_to_loopback_ephemeral_http_ws() {
-    let config = parse_server_bootstrap_args(["xrpld-server".to_owned()])
+    let config = parse_server_bootstrap_args(["quaxar-server".to_owned()])
         .expect("default bootstrap args should parse");
     assert_eq!(
         config.bind,
@@ -23,7 +23,7 @@ fn server_bootstrap_defaults_to_loopback_ephemeral_http_ws() {
 #[test]
 fn server_bootstrap_accepts_peer_and_secure_modes_in_mixed_protocol_sets() {
     let config = parse_server_bootstrap_args([
-        "xrpld-server".to_owned(),
+        "quaxar-server".to_owned(),
         "--protocols".to_owned(),
         "http,peer,https".to_owned(),
     ])

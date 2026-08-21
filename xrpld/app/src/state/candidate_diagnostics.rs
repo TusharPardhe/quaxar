@@ -1,8 +1,8 @@
 //! Compact diagnostics for candidate transactions crossing captured-consensus
 //! admission and inclusion.
 //!
-//! Enable with `XRPLD_CANDIDATE_DIAGNOSTICS=info` (or `1`/`true`) for info
-//! records, or `XRPLD_CANDIDATE_DIAGNOSTICS=debug` for debug records. The
+//! Enable with `QUAXAR_CANDIDATE_DIAGNOSTICS=info` (or `1`/`true`) for info
+//! records, or `QUAXAR_CANDIDATE_DIAGNOSTICS=debug` for debug records. The
 //! record key is the transaction ID, ledger sequence, source transaction
 //! sequence, and captured transaction-set source.
 
@@ -159,7 +159,9 @@ fn candidate_diagnostic_log_level() -> Option<CandidateDiagnosticLogLevel> {
     static LEVEL: OnceLock<Option<CandidateDiagnosticLogLevel>> = OnceLock::new();
     *LEVEL.get_or_init(|| {
         candidate_diagnostic_log_level_from_value(
-            std::env::var("XRPLD_CANDIDATE_DIAGNOSTICS").ok().as_deref(),
+            std::env::var("QUAXAR_CANDIDATE_DIAGNOSTICS")
+                .ok()
+                .as_deref(),
         )
     })
 }

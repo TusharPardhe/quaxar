@@ -66,7 +66,7 @@ impl Work for WorkSSL {
                     let resp = client
                         .get(&url)
                         .header("Host", format!("{}:{}", host, port))
-                        .header("User-Agent", "xrpld-rust/0.1")
+                        .header("User-Agent", "quaxar/0.1")
                         .send()
                         .await
                         .map_err(|e| WorkError::Http(e.to_string()))?;

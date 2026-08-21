@@ -663,7 +663,7 @@ impl ManagedComponent for AppOverlayRuntime {
         let target_outbound_peers = overlay.peer_limits().outbound_max;
         let auto_connect = self.bootstrap_can_dial_bootcache;
         let peerfinder_thread = std::thread::Builder::new()
-            .name("xrpld-peerfinder".to_owned())
+            .name("quaxar-peerfinder".to_owned())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1274,9 +1274,9 @@ fn refresh_peer_count_and_operating_mode(
     // arms the availability timestamp the acquisition actor reads back at its
     // first outbound request (peer-availability-to-first-request latency).
     if peer_count > 0 {
-        xrpld_metrics::acquisition::note_peers_available();
+        quaxar_metrics::acquisition::note_peers_available();
     } else {
-        xrpld_metrics::acquisition::note_peers_unavailable();
+        quaxar_metrics::acquisition::note_peers_unavailable();
     }
 
     if peer_count > 0

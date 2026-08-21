@@ -4,6 +4,7 @@ use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
 use ledger::{Ledger, LedgerHeader, LedgerMasterConfig, calculate_ledger_hash};
 use overlay::TmGetLedger;
+use quaxar_core::{DatabaseCon, LEDGER_DB_INIT};
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
 use shamap::sync::{SHAMapType, SyncState, SyncTree};
@@ -11,7 +12,6 @@ use shamap::tree_node::SHAMapNodeType;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use xrpld_core::{DatabaseCon, LEDGER_DB_INIT};
 
 fn sample_loaded_ledger(seq: u32) -> Ledger {
     let mut state_tree = MutableTree::new(seq);

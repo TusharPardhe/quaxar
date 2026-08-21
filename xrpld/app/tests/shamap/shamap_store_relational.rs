@@ -1,8 +1,8 @@
 use app::{SHAMapStoreRelationalRuntime, SqliteSHAMapStoreRelational};
+use quaxar_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use xrpld_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 
 fn insert_ledger_seq(db: &DatabaseCon, seq: u32) {
     let connection = db.get_session();

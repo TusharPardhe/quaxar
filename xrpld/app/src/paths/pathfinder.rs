@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use protocol::{JsonValue, parse_base58_account_id};
 
-use xrpld_core::{RpcErrorCode, Status};
+use quaxar_core::{RpcErrorCode, Status};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathFinderRequest {

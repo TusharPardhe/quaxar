@@ -19,7 +19,7 @@
   encrypted gp3 root volume (3,000 IOPS/125 MB/s). The volume is tagged for
   NuDB and has `DeleteOnTermination=false`, preserving the database if the
   instance is terminated deliberately.
-- **Ledger:** testnet network ID `1`, NuDB at `/var/lib/xrpld/db/nudb`,
+- **Ledger:** testnet network ID `1`, NuDB at `/var/lib/quaxar/db/nudb`,
   `ledger_history = 256`, `online_delete = 256`, and `node_size = medium`.
 - **Lifecycle:** `systemd` owns `quaxar.service`; bootstrap output is in
   `/var/log/quaxar-bootstrap.log`. The build records its checked-out commit in

@@ -83,6 +83,7 @@ use protocol::{
     calc_node_id, feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure,
     is_tem_malformed, is_tes_success, lsfDisableMaster, tfInnerBatchTxn,
 };
+use quaxar_core::DatabaseCon;
 use shamap::family::{NullMissingNodeReporter, NullNodeFetcher};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::sync::{Arc, Mutex};
@@ -98,7 +99,6 @@ use xrpl_core::{
     FixedNetworkIdService, HashRouter, LoadMonitorJournalFactory, NetworkIDService,
     PeerReservationTable, ServiceRegistry, StartUpType,
 };
-use xrpld_core::DatabaseCon;
 
 #[path = "application_root/replay_callback_impl.rs"]
 mod replay_callback_impl;
@@ -190,7 +190,7 @@ fn preferred_lcl_matches_local_or_parent(
 fn full_sync_debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("XRPLD_FULL_SYNC_DEBUG")
+        std::env::var("QUAXAR_FULL_SYNC_DEBUG")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
@@ -1761,8 +1761,7 @@ where
     }
 
     fn run_try_clear(&mut self) -> ApplyResult {
-        // Graph edge `live TxQ clear-ahead` (RIPPLED_PARITY_FLOW.md §1/§3).
-        // TxQ.cpp:517-609 applies all queued predecessors into an OpenView
+        // rippled TxQ.cpp:517-609 applies all queued predecessors into an OpenView
         // sandbox, then repreclaims the current transaction against that
         // changed view. Do not mutate the persistent submit view or queue
         // until both phases have succeeded.
@@ -4078,7 +4077,7 @@ impl ApplicationRoot {
             Arc::clone(&registry.validator_manifest_cache),
             Arc::clone(&registry.publisher_manifest_cache),
             SystemValidatorListClock,
-            std::env::temp_dir().join("xrpld-application-root-validator-list"),
+            std::env::temp_dir().join("quaxar-application-root-validator-list"),
             quorum,
         ));
         let _ = validators.load(None, &[], &[], None);

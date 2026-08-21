@@ -5,9 +5,9 @@ use protocol::{
     generate_root_secret_key, parse_base58_node_public, parse_base58_seed, parse_base58_with_type,
     parse_generic_seed, random_seed,
 };
+use quaxar_core::DatabaseCon;
 use rusqlite::OptionalExtension;
 use std::fmt;
-use xrpld_core::DatabaseCon;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeIdentityOptions {

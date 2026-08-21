@@ -756,10 +756,10 @@ impl PersistenceWork for AcquisitionPersistenceWork {
             };
             let elapsed_seconds = started.elapsed().as_secs_f64();
             if is_durability_barrier {
-                xrpld_metrics::acquisition::record_nodestore_fence_duration(elapsed_seconds);
+                quaxar_metrics::acquisition::record_nodestore_fence_duration(elapsed_seconds);
             } else {
-                xrpld_metrics::acquisition::record_nodestore_write_duration(elapsed_seconds);
-                xrpld_metrics::acquisition::record_nodestore_write_bytes(write_bytes);
+                quaxar_metrics::acquisition::record_nodestore_write_duration(elapsed_seconds);
+                quaxar_metrics::acquisition::record_nodestore_write_bytes(write_bytes);
             }
             match result {
                 Ok(()) if node_store.store_generation() == identity.store_generation => {
@@ -1697,12 +1697,12 @@ impl AcquisitionState {
                 .max(mailbox.buffered_packet_count());
             mailbox.buffered_bytes_high_water =
                 mailbox.buffered_bytes_high_water.max(mailbox.packet_bytes);
-            xrpld_metrics::acquisition::mailbox_packet_count(mailbox.buffered_packet_count());
-            xrpld_metrics::acquisition::mailbox_packet_bytes(mailbox.packet_bytes);
-            xrpld_metrics::acquisition::mailbox_packet_high_water(
+            quaxar_metrics::acquisition::mailbox_packet_count(mailbox.buffered_packet_count());
+            quaxar_metrics::acquisition::mailbox_packet_bytes(mailbox.packet_bytes);
+            quaxar_metrics::acquisition::mailbox_packet_high_water(
                 mailbox.buffered_packets_high_water,
             );
-            xrpld_metrics::acquisition::mailbox_byte_high_water(mailbox.buffered_bytes_high_water);
+            quaxar_metrics::acquisition::mailbox_byte_high_water(mailbox.buffered_bytes_high_water);
             if mailbox.token == AcquisitionWorkToken::Idle {
                 mailbox.token = AcquisitionWorkToken::Queued;
                 true
@@ -1794,12 +1794,12 @@ impl AcquisitionState {
                 .max(mailbox.buffered_packet_count());
             mailbox.buffered_bytes_high_water =
                 mailbox.buffered_bytes_high_water.max(mailbox.packet_bytes);
-            xrpld_metrics::acquisition::mailbox_packet_count(mailbox.buffered_packet_count());
-            xrpld_metrics::acquisition::mailbox_packet_bytes(mailbox.packet_bytes);
-            xrpld_metrics::acquisition::mailbox_packet_high_water(
+            quaxar_metrics::acquisition::mailbox_packet_count(mailbox.buffered_packet_count());
+            quaxar_metrics::acquisition::mailbox_packet_bytes(mailbox.packet_bytes);
+            quaxar_metrics::acquisition::mailbox_packet_high_water(
                 mailbox.buffered_packets_high_water,
             );
-            xrpld_metrics::acquisition::mailbox_byte_high_water(mailbox.buffered_bytes_high_water);
+            quaxar_metrics::acquisition::mailbox_byte_high_water(mailbox.buffered_bytes_high_water);
             if mailbox.token == AcquisitionWorkToken::Idle {
                 mailbox.token = AcquisitionWorkToken::Queued;
                 true
@@ -1928,11 +1928,11 @@ impl AcquisitionState {
         let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
         let packet = mailbox.packets.pop_front()?;
         mailbox.packet_bytes = mailbox.packet_bytes.saturating_sub(packet.bytes);
-        xrpld_metrics::acquisition::record_mailbox_packet_age(
+        quaxar_metrics::acquisition::record_mailbox_packet_age(
             packet.enqueued_at.elapsed().as_secs_f64(),
         );
-        xrpld_metrics::acquisition::mailbox_packet_count(mailbox.buffered_packet_count());
-        xrpld_metrics::acquisition::mailbox_packet_bytes(mailbox.packet_bytes);
+        quaxar_metrics::acquisition::mailbox_packet_count(mailbox.buffered_packet_count());
+        quaxar_metrics::acquisition::mailbox_packet_bytes(mailbox.packet_bytes);
         Some(packet)
     }
 
@@ -2380,9 +2380,9 @@ impl AcquisitionState {
         if !self
             .first_request_metric_recorded
             .swap(true, Ordering::Relaxed)
-            && let Some(elapsed) = xrpld_metrics::acquisition::peers_available_elapsed()
+            && let Some(elapsed) = quaxar_metrics::acquisition::peers_available_elapsed()
         {
-            xrpld_metrics::acquisition::record_peer_availability_to_first_request(
+            quaxar_metrics::acquisition::record_peer_availability_to_first_request(
                 elapsed.as_secs_f64(),
             );
         }

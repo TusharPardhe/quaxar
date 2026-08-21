@@ -42,9 +42,9 @@ impl RpcDispatcher for TestDispatcher {
 #[test]
 fn cli_unknown_command_helpers_detect_command_and_suggest_close_matches() {
     let args = vec![
-        "xrpld".to_owned(),
+        "quaxar".to_owned(),
         "--conf".to_owned(),
-        "xrpld.cfg".to_owned(),
+        "quaxar.cfg".to_owned(),
         "logs".to_owned(),
     ];
     assert_eq!(
@@ -53,9 +53,9 @@ fn cli_unknown_command_helpers_detect_command_and_suggest_close_matches() {
     );
 
     let startup_args = vec![
-        "xrpld".to_owned(),
+        "quaxar".to_owned(),
         "--conf".to_owned(),
-        "xrpld.cfg".to_owned(),
+        "quaxar.cfg".to_owned(),
         "--quorum".to_owned(),
         "2".to_owned(),
     ];
@@ -73,14 +73,14 @@ fn cli_unknown_command_helpers_detect_command_and_suggest_close_matches() {
 }
 
 #[test]
-fn xrpld_main_binds_server_runtime_into_the_composed_app_graph() {
+fn quaxar_main_binds_server_runtime_into_the_composed_app_graph() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
     let _guard = runtime.enter();
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -188,7 +188,7 @@ fn node_store_usage_path_uses_the_configured_node_db_directory() {
         .expect("tokio runtime");
     let _guard = runtime.enter();
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -230,7 +230,7 @@ fn promote_current_ledger_keeps_runtime_and_app_published_ledgers_aligned() {
         .expect("tokio runtime");
     let _guard = runtime.enter();
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(

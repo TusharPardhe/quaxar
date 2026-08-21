@@ -471,7 +471,7 @@ mod tests {
         );
         sections.insert(
             "database_path".to_owned(),
-            vec!["/var/lib/xrpld".to_owned()],
+            vec!["/var/lib/quaxar".to_owned()],
         );
 
         config.build(&sections);
@@ -482,7 +482,7 @@ mod tests {
             Some(51234)
         );
         assert_eq!(config.section("server").values(), &["admin"]);
-        assert_eq!(config.legacy("database_path").unwrap(), "/var/lib/xrpld");
+        assert_eq!(config.legacy("database_path").unwrap(), "/var/lib/quaxar");
 
         config.overwrite("server", "ip", "127.0.0.1");
         assert_eq!(

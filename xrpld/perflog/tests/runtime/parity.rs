@@ -129,11 +129,11 @@ fn setup_perf_log_resolves_relative_config_dirs_absolute_paths() {
 #[test]
 fn setup_perf_log_keeps_absolute_paths_and_default_interval() {
     let mut section = Section::new("perf");
-    section.set("perf_log", "/var/log/xrpld/perf.json");
+    section.set("perf_log", "/var/log/quaxar/perf.json");
 
     let setup = setup_perf_log(&section, &unique_path("config"));
 
-    assert_eq!(setup.perf_log, PathBuf::from("/var/log/xrpld/perf.json"));
+    assert_eq!(setup.perf_log, PathBuf::from("/var/log/quaxar/perf.json"));
     assert_eq!(setup.log_interval, Duration::from_secs(1));
     assert_eq!(JournalLevel::Trace.to_string(), "trace");
     assert_eq!(JournalLevel::Fatal.to_string(), "fatal");

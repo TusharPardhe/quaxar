@@ -265,7 +265,7 @@ const STARTUP_VALUE_FLAGS: &[&str] = &["--conf", "-c", "--rpc-url", "--quorum"];
 /// handled, None if the node should start normally.
 /// Resolve the RPC URL: if user passed --url explicitly, use it.
 /// Otherwise, try to parse the config file to find the HTTP admin port.
-fn resolve_rpc_url(parsed: &xrpld_cli::Cli) -> String {
+fn resolve_rpc_url(parsed: &quaxar_cli::Cli) -> String {
     // If user explicitly set --rpc-url (not the default), use it as-is
     if parsed.rpc_url != "http://127.0.0.1:5005" {
         return parsed.rpc_url.clone();
@@ -273,8 +273,8 @@ fn resolve_rpc_url(parsed: &xrpld_cli::Cli) -> String {
 
     // Try to find config and extract the RPC port
     let conf_path = parsed.conf.as_deref().unwrap_or_else(|| {
-        if std::path::Path::new("xrpld.cfg").exists() {
-            "xrpld.cfg"
+        if std::path::Path::new("quaxar.cfg").exists() {
+            "quaxar.cfg"
         } else {
             ""
         }
@@ -365,7 +365,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        let _ = xrpld_cli::Cli::command().print_help();
+        let _ = quaxar_cli::Cli::command().print_help();
         println!();
         return Some(ExitCode::SUCCESS);
     }
@@ -416,7 +416,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
         "-V",
     ];
 
-    let parsed = match xrpld_cli::Cli::try_parse() {
+    let parsed = match quaxar_cli::Cli::try_parse() {
         Ok(parsed) => parsed,
         Err(err)
             if matches!(
@@ -460,73 +460,79 @@ fn try_cli_subcommand() -> Option<ExitCode> {
     let cmd = parsed.command?;
 
     let ok = match cmd {
-        xrpld_cli::Command::Status => xrpld_cli::status::run(url),
-        xrpld_cli::Command::Health => {
-            if !xrpld_cli::health::run(url) {
+        quaxar_cli::Command::Status => quaxar_cli::status::run(url),
+        quaxar_cli::Command::Health => {
+            if !quaxar_cli::health::run(url) {
                 return Some(ExitCode::FAILURE);
             }
             true
         }
-        xrpld_cli::Command::Peers => xrpld_cli::peers::run(url),
-        xrpld_cli::Command::SyncStatus => xrpld_cli::sync_status::run(url),
-        xrpld_cli::Command::Rpc {
+        quaxar_cli::Command::Peers => quaxar_cli::peers::run(url),
+        quaxar_cli::Command::SyncStatus => quaxar_cli::sync_status::run(url),
+        quaxar_cli::Command::Rpc {
             method,
             params,
             raw,
-        } => xrpld_cli::rpc_cmd::run(url, &method, params.as_deref(), raw),
-        xrpld_cli::Command::Ping => xrpld_cli::rpc_cmd::run_no_params(url, "ping"),
-        xrpld_cli::Command::ServerInfo => xrpld_cli::rpc_cmd::run_no_params(url, "server_info"),
-        xrpld_cli::Command::ServerState => xrpld_cli::rpc_cmd::run_no_params(url, "server_state"),
-        xrpld_cli::Command::ServerDefinitions => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "server_definitions")
+        } => quaxar_cli::rpc_cmd::run(url, &method, params.as_deref(), raw),
+        quaxar_cli::Command::Ping => quaxar_cli::rpc_cmd::run_no_params(url, "ping"),
+        quaxar_cli::Command::ServerInfo => quaxar_cli::rpc_cmd::run_no_params(url, "server_info"),
+        quaxar_cli::Command::ServerState => quaxar_cli::rpc_cmd::run_no_params(url, "server_state"),
+        quaxar_cli::Command::ServerDefinitions => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "server_definitions")
         }
-        xrpld_cli::Command::LedgerClosed => xrpld_cli::rpc_cmd::run_no_params(url, "ledger_closed"),
-        xrpld_cli::Command::LedgerCurrent => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "ledger_current")
+        quaxar_cli::Command::LedgerClosed => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "ledger_closed")
         }
-        xrpld_cli::Command::LedgerHeader => xrpld_cli::rpc_cmd::run_no_params(url, "ledger_header"),
-        xrpld_cli::Command::FetchInfo => xrpld_cli::rpc_cmd::run_no_params(url, "fetch_info"),
-        xrpld_cli::Command::GetCounts => xrpld_cli::rpc_cmd::run_no_params(url, "get_counts"),
-        xrpld_cli::Command::CanDelete { value } => {
-            xrpld_cli::rpc_cmd::run_can_delete(url, value.as_deref())
+        quaxar_cli::Command::LedgerCurrent => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "ledger_current")
         }
-        xrpld_cli::Command::LogRotate => xrpld_cli::rpc_cmd::run_logrotate(url),
-        xrpld_cli::Command::Random => xrpld_cli::rpc_cmd::run_no_params(url, "random"),
-        xrpld_cli::Command::ValidatorInfo => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "validator_info")
+        quaxar_cli::Command::LedgerHeader => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "ledger_header")
         }
-        xrpld_cli::Command::ValidatorListSites => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "validator_list_sites")
+        quaxar_cli::Command::FetchInfo => quaxar_cli::rpc_cmd::run_no_params(url, "fetch_info"),
+        quaxar_cli::Command::GetCounts => quaxar_cli::rpc_cmd::run_no_params(url, "get_counts"),
+        quaxar_cli::Command::CanDelete { value } => {
+            quaxar_cli::rpc_cmd::run_can_delete(url, value.as_deref())
         }
-        xrpld_cli::Command::UnlList => xrpld_cli::rpc_cmd::run_no_params(url, "unl_list"),
-        xrpld_cli::Command::ConsensusInfo => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "consensus_info")
+        quaxar_cli::Command::LogRotate => quaxar_cli::rpc_cmd::run_logrotate(url),
+        quaxar_cli::Command::Random => quaxar_cli::rpc_cmd::run_no_params(url, "random"),
+        quaxar_cli::Command::ValidatorInfo => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "validator_info")
         }
-        xrpld_cli::Command::TxReduceRelay => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "tx_reduce_relay")
+        quaxar_cli::Command::ValidatorListSites => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "validator_list_sites")
         }
-        xrpld_cli::Command::DbStats => xrpld_cli::db_stats::run(url, parsed.conf.as_deref()),
-        xrpld_cli::Command::LogLevel { level } => xrpld_cli::log_level::run(url, level.as_deref()),
-        xrpld_cli::Command::ConfigCheck => {
-            xrpld_cli::config_check::run(parsed.conf.as_deref());
+        quaxar_cli::Command::UnlList => quaxar_cli::rpc_cmd::run_no_params(url, "unl_list"),
+        quaxar_cli::Command::ConsensusInfo => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "consensus_info")
+        }
+        quaxar_cli::Command::TxReduceRelay => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "tx_reduce_relay")
+        }
+        quaxar_cli::Command::DbStats => quaxar_cli::db_stats::run(url, parsed.conf.as_deref()),
+        quaxar_cli::Command::LogLevel { level } => {
+            quaxar_cli::log_level::run(url, level.as_deref())
+        }
+        quaxar_cli::Command::ConfigCheck => {
+            quaxar_cli::config_check::run(parsed.conf.as_deref());
             true
         }
-        xrpld_cli::Command::Doctor => {
-            xrpld_cli::doctor::run(url, parsed.conf.as_deref());
+        quaxar_cli::Command::Doctor => {
+            quaxar_cli::doctor::run(url, parsed.conf.as_deref());
             true
         }
-        xrpld_cli::Command::Version => {
-            xrpld_cli::version::run();
+        quaxar_cli::Command::Version => {
+            quaxar_cli::version::run();
             true
         }
-        xrpld_cli::Command::Validators => xrpld_cli::validators::run(url),
-        xrpld_cli::Command::Amendments => xrpld_cli::amendments::run(url),
-        xrpld_cli::Command::Fee => xrpld_cli::fee::run(url),
-        xrpld_cli::Command::Ledger { seq } => xrpld_cli::ledger_cmd::run(url, seq),
-        xrpld_cli::Command::Account { address } => xrpld_cli::account::run(url, &address),
-        xrpld_cli::Command::Stop => xrpld_cli::stop::run(url),
-        xrpld_cli::Command::Connect { address } => {
-            let result = xrpld_cli::rpc_call(url, "connect", serde_json::json!({"ip": address}));
+        quaxar_cli::Command::Validators => quaxar_cli::validators::run(url),
+        quaxar_cli::Command::Amendments => quaxar_cli::amendments::run(url),
+        quaxar_cli::Command::Fee => quaxar_cli::fee::run(url),
+        quaxar_cli::Command::Ledger { seq } => quaxar_cli::ledger_cmd::run(url, seq),
+        quaxar_cli::Command::Account { address } => quaxar_cli::account::run(url, &address),
+        quaxar_cli::Command::Stop => quaxar_cli::stop::run(url),
+        quaxar_cli::Command::Connect { address } => {
+            let result = quaxar_cli::rpc_call(url, "connect", serde_json::json!({"ip": address}));
             match result {
                 Ok(_) => {
                     println!(
@@ -542,29 +548,29 @@ fn try_cli_subcommand() -> Option<ExitCode> {
                 }
             }
         }
-        xrpld_cli::Command::Benchmark => {
-            xrpld_cli::benchmark::run();
+        quaxar_cli::Command::Benchmark => {
+            quaxar_cli::benchmark::run();
             true
         }
-        xrpld_cli::Command::Cli => {
-            xrpld_cli::interactive::run(url);
+        quaxar_cli::Command::Cli => {
+            quaxar_cli::interactive::run(url);
             true
         }
-        xrpld_cli::Command::ValidatorKeys { action } => {
-            use xrpld_cli::ValidatorKeysAction;
+        quaxar_cli::Command::ValidatorKeys { action } => {
+            use quaxar_cli::ValidatorKeysAction;
             match action {
-                ValidatorKeysAction::Generate => xrpld_cli::validator_keys::run_generate(),
+                ValidatorKeysAction::Generate => quaxar_cli::validator_keys::run_generate(),
                 ValidatorKeysAction::CreateToken { secret } => {
-                    xrpld_cli::validator_keys::run_create_token(secret.as_deref())
+                    quaxar_cli::validator_keys::run_create_token(secret.as_deref())
                 }
-                ValidatorKeysAction::Sign { data } => xrpld_cli::validator_keys::run_sign(&data),
-                ValidatorKeysAction::Revoke => xrpld_cli::validator_keys::run_revoke(),
-                ValidatorKeysAction::Show => xrpld_cli::validator_keys::run_show(),
+                ValidatorKeysAction::Sign { data } => quaxar_cli::validator_keys::run_sign(&data),
+                ValidatorKeysAction::Revoke => quaxar_cli::validator_keys::run_revoke(),
+                ValidatorKeysAction::Show => quaxar_cli::validator_keys::run_show(),
             }
             true
         }
-        xrpld_cli::Command::ExportSnapshot { output } => run_export_snapshot(url, &output),
-        xrpld_cli::Command::LoadSnapshot { input } => {
+        quaxar_cli::Command::ExportSnapshot { output } => run_export_snapshot(url, &output),
+        quaxar_cli::Command::LoadSnapshot { input } => {
             run_load_snapshot(&input, parsed.conf.as_deref())
         }
     };
@@ -1803,7 +1809,7 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
 }
 
 fn load_config_for_snapshot(conf: Option<&str>) -> Result<BasicConfig, String> {
-    let default_path = "/etc/opt/xrpld/xrpld.cfg";
+    let default_path = "/etc/quaxar/quaxar.cfg";
     let config_path = conf.unwrap_or(default_path);
     load_basic_config_file(Path::new(config_path))
 }

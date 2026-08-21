@@ -1,6 +1,6 @@
 ---
 name: Feature Request
-about: Suggest a feature for xrpld
+about: Suggest a feature for Quaxar
 labels: enhancement
 ---
 
