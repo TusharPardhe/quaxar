@@ -2418,6 +2418,12 @@ pub struct DeferredMissingNodeScanStats {
     pub max_pending_reads: u64,
     pub completed_pending_reads: u64,
     pub completed_pending_misses: u64,
+    /// Broker admission rejected this retained hash and the continuation
+    /// re-announced it. This distinguishes capacity churn from NodeStore I/O.
+    pub requeued_rejected_reads: u64,
+    /// An admitted actor operation was cancelled and had to be re-armed while
+    /// its verified parent edges remained retained by this plan.
+    pub requeued_cancelled_reads: u64,
     pub missing_recorded: u64,
     pub full_below_marked: u64,
     pub deferred_resumes: u64,
@@ -3491,6 +3497,7 @@ impl MissingNodeContinuation {
             MissingNodeReadOutcome::Rejected => {
                 self.pending_by_hash.insert(hash, pending);
                 self.unannounced_reads.insert(hash);
+                self.stats.requeued_rejected_reads += 1;
                 MissingNodeReadApply::Requeued
             }
             MissingNodeReadOutcome::Cancelled => {
@@ -3503,6 +3510,7 @@ impl MissingNodeContinuation {
                 // still-active acquisition can mint a fresh operation. Session
                 // cancellation remains safe because the owner drops the plan.
                 self.unannounced_reads.insert(hash);
+                self.stats.requeued_cancelled_reads += 1;
                 MissingNodeReadApply::Requeued
             }
             MissingNodeReadOutcome::Found(node) => {
@@ -6533,7 +6541,7 @@ mod native_missing_node_continuation_tests {
     }
 
     #[test]
-    fn cancelled_read_rearms_the_unique_waiter_instead_of_idling_forever() {
+    fn rejected_and_cancelled_reads_rearm_the_unique_waiter_with_diagnostics() {
         let child_hash = hash(0x45);
         let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
         root.set_child_hash(0, child_hash);
@@ -6551,6 +6559,15 @@ mod native_missing_node_continuation_tests {
             continuation.apply_read_result(
                 MissingNodePlanId::new(45),
                 child_hash,
+                MissingNodeReadOutcome::Rejected,
+            ),
+            MissingNodeReadApply::Requeued
+        );
+        assert_eq!(continuation.take_unannounced_reads(4).len(), 1);
+        assert_eq!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(45),
+                child_hash,
                 MissingNodeReadOutcome::Cancelled,
             ),
             MissingNodeReadApply::Requeued
@@ -6564,6 +6581,8 @@ mod native_missing_node_continuation_tests {
         let replacement = continuation.take_unannounced_reads(4);
         assert_eq!(replacement.len(), 1);
         assert_eq!(replacement[0].hash(), child_hash);
+        assert_eq!(continuation.stats().requeued_rejected_reads, 1);
+        assert_eq!(continuation.stats().requeued_cancelled_reads, 1);
     }
 
     #[test]
@@ -6869,6 +6888,195 @@ mod native_missing_node_continuation_tests {
             MissingNodeAdvance::Complete
         ));
         assert_eq!(next.pending_hashes(), 0);
+    }
+
+    #[test]
+    fn dense_local_tree_over_two_deferred_rounds_completes_and_publishes_full_below() {
+        let mut next_item = 1u64;
+        let mut local_nodes = BTreeMap::new();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+
+        // Five complete 16x16 subtrees produce 1,365 non-root reads. This is
+        // deliberately larger than two rippled-sized 512-read deferred rounds.
+        for top_branch in 0..5 {
+            let top = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            for middle_branch in 0..BRANCH_FACTOR {
+                let middle = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+                for leaf_branch in 0..BRANCH_FACTOR {
+                    let tag = next_item;
+                    next_item += 1;
+                    let mut payload = vec![0u8; 12];
+                    payload[4..].copy_from_slice(&tag.to_be_bytes());
+                    let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+                        crate::tree_node::SHAMapNodeType::AccountState,
+                        SHAMapItem::new(Uint256::from(tag), payload),
+                        1,
+                    ));
+                    middle.set_child_hash(leaf_branch, leaf.get_hash());
+                    local_nodes.insert(leaf.get_hash(), leaf);
+                }
+                middle.update_hash();
+                top.set_child_hash(middle_branch, middle.get_hash());
+                local_nodes.insert(middle.get_hash(), middle);
+            }
+            top.update_hash();
+            root.set_child_hash(top_branch, top.get_hash());
+            local_nodes.insert(top.get_hash(), top);
+        }
+        root.update_hash();
+        assert_eq!(local_nodes.len(), 1_365);
+
+        let plan_id = MissingNodePlanId::new(1_365);
+        let mut continuation =
+            MissingNodeContinuation::new(plan_id, &root, 256, true, 77, 9, &mut || 0);
+        let mut resident = EmptyResident;
+        let mut emitted_reads = 0usize;
+        let mut completed = false;
+
+        for _ in 0..64 {
+            match continuation.advance_with_yield(256, &mut resident, &mut || 0, &mut || false) {
+                MissingNodeAdvance::NeedsReads(needs) => {
+                    emitted_reads += needs.len();
+                    for need in needs {
+                        let node = local_nodes
+                            .get(&need.hash())
+                            .unwrap_or_else(|| panic!("missing local node {}", need.hash()))
+                            .clone();
+                        assert!(matches!(
+                            continuation.apply_read_result(
+                                plan_id,
+                                need.hash(),
+                                MissingNodeReadOutcome::Found(node),
+                            ),
+                            MissingNodeReadApply::Applied {
+                                attached_edges: 1,
+                                missing_edges: 0
+                            }
+                        ));
+                    }
+                }
+                MissingNodeAdvance::Ready => {}
+                MissingNodeAdvance::Complete => {
+                    completed = true;
+                    break;
+                }
+                other => panic!("dense local reconstruction must not need peers: {other:?}"),
+            }
+        }
+
+        assert!(completed, "dense local reconstruction did not terminate");
+        assert_eq!(emitted_reads, 1_365);
+        let stats = continuation.stats();
+        assert_eq!(stats.completed_pending_reads, 1_365);
+        assert_eq!(stats.completed_pending_misses, 0);
+        assert!(
+            stats.full_below_marked > 0,
+            "completed local subtrees must publish full-below state"
+        );
+        assert!(
+            stats.full_below_marked < 86,
+            "this fixture must exercise deferred ancestors that require the next scan; marked={}",
+            stats.full_below_marked
+        );
+
+        let mut replacement = MissingNodeContinuation::new(
+            MissingNodePlanId::new(1_366),
+            &root,
+            256,
+            true,
+            77,
+            9,
+            &mut || 0,
+        );
+        assert!(matches!(
+            replacement.advance_with_yield(256, &mut resident, &mut || 0, &mut || false),
+            MissingNodeAdvance::Complete
+        ));
+        assert_eq!(replacement.stats().completed_pending_reads, 0);
+        assert!(root.is_full_below(9));
+        assert_eq!(
+            local_nodes
+                .values()
+                .filter(|node| node.is_inner() && !node.is_full_below(9))
+                .count(),
+            0,
+            "the next scan must reuse the strong graph and finish deferred full-below propagation without I/O"
+        );
+    }
+
+    #[test]
+    fn mixed_local_hits_and_256_misses_drain_to_one_network_frontier() {
+        let mut found_nodes = BTreeMap::new();
+        let mut missing_hashes = BTreeSet::new();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+
+        // Every root branch and every middle branch is a local hit, followed
+        // by one distinct miss. The scan must stop at the 256-candidate source
+        // boundary even though local hits continuously expose more traversal.
+        for top_branch in 0..BRANCH_FACTOR {
+            let top = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            for middle_branch in 0..BRANCH_FACTOR {
+                let middle = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+                let ordinal = top_branch * BRANCH_FACTOR + middle_branch + 1;
+                let missing = SHAMapHash::new(Uint256::from(10_000u64 + ordinal as u64));
+                middle.set_child_hash(0, missing);
+                middle.update_hash();
+                top.set_child_hash(middle_branch, middle.get_hash());
+                found_nodes.insert(middle.get_hash(), middle);
+                missing_hashes.insert(missing);
+            }
+            top.update_hash();
+            root.set_child_hash(top_branch, top.get_hash());
+            found_nodes.insert(top.get_hash(), top);
+        }
+        root.update_hash();
+        assert_eq!(found_nodes.len(), 272);
+        assert_eq!(missing_hashes.len(), 256);
+
+        let plan_id = MissingNodePlanId::new(2_560);
+        let mut continuation =
+            MissingNodeContinuation::new(plan_id, &root, 256, true, 77, 9, &mut || 0);
+        let mut resident = EmptyResident;
+        let mut frontier = None;
+
+        for _ in 0..64 {
+            match continuation.advance_with_yield(256, &mut resident, &mut || 0, &mut || false) {
+                MissingNodeAdvance::NeedsReads(needs) => {
+                    for need in needs {
+                        let outcome = found_nodes
+                            .get(&need.hash())
+                            .cloned()
+                            .map(MissingNodeReadOutcome::Found)
+                            .unwrap_or(MissingNodeReadOutcome::Miss);
+                        assert!(matches!(
+                            continuation.apply_read_result(plan_id, need.hash(), outcome),
+                            MissingNodeReadApply::Applied { .. }
+                        ));
+                    }
+                }
+                MissingNodeAdvance::Ready => {}
+                MissingNodeAdvance::NeedsNetwork(nodes) => {
+                    frontier = Some(nodes);
+                    break;
+                }
+                other => panic!("mixed scan must terminate at a peer frontier: {other:?}"),
+            }
+        }
+
+        let frontier = frontier.expect("mixed scan never drained to its network frontier");
+        assert_eq!(frontier.len(), 256);
+        assert_eq!(
+            frontier
+                .iter()
+                .map(|(_, hash)| SHAMapHash::new(*hash))
+                .collect::<BTreeSet<_>>(),
+            missing_hashes
+        );
+        let stats = continuation.stats();
+        assert_eq!(stats.completed_pending_reads, 272);
+        assert_eq!(stats.completed_pending_misses, 256);
+        assert_eq!(stats.missing_recorded, 256);
+        assert_eq!(continuation.pending_hashes(), 0);
     }
 
     #[test]

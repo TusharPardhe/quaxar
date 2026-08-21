@@ -79,6 +79,10 @@ const AGGRESSIVE_TIMEOUT_THRESHOLD: u32 = 4;
 /// rippled's `InboundLedgers::sweep` removes a per-hash acquisition one minute
 /// after its constructor/update touch, even if it is still active.
 const SESSION_EXPIRY: Duration = Duration::from_secs(60);
+/// `JtLedgerData` runs at most three jobs concurrently in rippled. Quaxar uses
+/// one serialized continuation per session, so one global three-owner pool is
+/// the conservative async analogue for initial and triggered local scans.
+const MAX_LOCAL_SCAN_OWNERS: usize = 3;
 const TERMINAL_RETENTION: Duration = Duration::from_secs(60);
 /// rippled request batch limits from
 /// `../rippled/src/xrpld/app/ledger/detail/InboundLedger.cpp`:
@@ -205,6 +209,8 @@ pub struct CoordinatorState {
     /// Latest serialized local LCL fact. A Full identity is refreshed only by
     /// a fresh publication of this exact ledger.
     last_installed_lcl: Option<LedgerIdentity>,
+    local_scan_owners: BTreeSet<SessionRef>,
+    local_scan_waiters: VecDeque<SessionRef>,
     /// The sole outbound-acquisition admission boundary. Every Base, normal
     /// frontier, timeout, Base retry, and recovery request enters here before
     /// the common emitter can construct a `PeerRequest`.
@@ -352,6 +358,7 @@ pub struct RunnerSessionSnapshot {
     reason: AcquireReason,
     phase: &'static str,
     network_admitted: bool,
+    local_scan: &'static str,
     peer_count: usize,
     plan_seeded: bool,
     plan_runs: u64,
@@ -383,6 +390,9 @@ impl RunnerSessionSnapshot {
     }
     pub const fn network_admitted(&self) -> bool {
         self.network_admitted
+    }
+    pub const fn local_scan(&self) -> &'static str {
+        self.local_scan
     }
     pub const fn peer_count(&self) -> usize {
         self.peer_count
@@ -428,6 +438,8 @@ pub struct RunnerSnapshot {
     session_details: Vec<RunnerSessionSnapshot>,
     storage_generation: StoreGeneration,
     peer_count: usize,
+    local_scan_owners: usize,
+    local_scan_waiters: usize,
     events_handled: u64,
     stale_events: u64,
     rejected_events: u64,
@@ -481,6 +493,14 @@ impl RunnerSnapshot {
     /// The number of usable peers in the last connectivity snapshot.
     pub const fn peer_count(&self) -> usize {
         self.peer_count
+    }
+
+    pub const fn local_scan_owners(&self) -> usize {
+        self.local_scan_owners
+    }
+
+    pub const fn local_scan_waiters(&self) -> usize {
+        self.local_scan_waiters
     }
 
     /// Events accepted by the runner (including rejected/stale ones).
@@ -639,6 +659,8 @@ impl CoordinatorRunner {
                 deferred_consensus_acquire: None,
                 storage_generation: StoreGeneration::new(1),
                 last_installed_lcl: None,
+                local_scan_owners: BTreeSet::new(),
+                local_scan_waiters: VecDeque::new(),
                 outbound: OutboundRequestAdmission::default(),
                 ids: IdCounter::new(),
             },
@@ -801,6 +823,13 @@ impl CoordinatorRunner {
                 reason: state.reason,
                 phase: state.phase.label(),
                 network_admitted: state.network_admitted,
+                local_scan: if self.state.local_scan_owners.contains(session) {
+                    "owner"
+                } else if self.state.local_scan_waiters.contains(session) {
+                    "waiting"
+                } else {
+                    "idle"
+                },
                 peer_count: state.sent_peers.len(),
                 plan_seeded: state.plan.engine().is_some(),
                 plan_runs: state.plan.runs(),
@@ -822,6 +851,8 @@ impl CoordinatorRunner {
             session_details,
             storage_generation: self.state.storage_generation,
             peer_count: self.state.peer_view.peers().len(),
+            local_scan_owners: self.state.local_scan_owners.len(),
+            local_scan_waiters: self.state.local_scan_waiters.len(),
             events_handled: self.stats.events_handled,
             stale_events: self.stats.stale_events,
             rejected_events: self.stats.rejected_events,
@@ -1568,6 +1599,7 @@ impl CoordinatorRunner {
             }
             return self.expire_idle_session(session);
         }
+        let waiting_for_local_scan = self.waiting_for_local_scan(session);
         let Some(session_state) = self.state.sessions.get_mut(&session) else {
             self.stats.stale_events += 1;
             return Vec::new();
@@ -1632,7 +1664,7 @@ impl CoordinatorRunner {
             self.stats.stale_events += 1;
             return Vec::new();
         }
-        if session_state.local_reconstruction_in_flight() {
+        if session_state.local_reconstruction_in_flight() || waiting_for_local_scan {
             // `SHAMap::getMissingNodes` waits for and processes successive
             // 512-read batches before returning to InboundLedger::onTimer.
             // Our async translation must therefore rearm without releasing
@@ -1658,6 +1690,7 @@ impl CoordinatorRunner {
                 pending_header_read,
                 pending_reads,
                 read_backlog,
+                waiting_for_local_scan,
                 timeout_budget,
                 "acquisition trace: local scan retained without consuming network timeout budget"
             );
@@ -2099,6 +2132,7 @@ impl CoordinatorRunner {
             self.stats.sessions_completed += 1;
         }
         let mut effects = Vec::new();
+        self.release_local_scan_permit(session, &mut effects);
         self.arm_terminal_retention(session, &mut effects);
         effects
     }
@@ -2334,6 +2368,74 @@ impl CoordinatorRunner {
         effects
     }
 
+    fn waiting_for_local_scan(&self, session: SessionRef) -> bool {
+        self.state.local_scan_waiters.contains(&session)
+    }
+
+    /// Admit a whole local traversal, not individual reads. This preserves the
+    /// reference ownership boundary: at most three JtLedgerData-equivalent
+    /// continuations, each free to execute repeated 512-read batches before
+    /// yielding a network frontier.
+    fn ensure_local_scan_permit(&mut self, session: SessionRef) -> bool {
+        let Some(state) = self.state.sessions.get(&session) else {
+            return false;
+        };
+        if state.phase != SessionPhase::Active {
+            return false;
+        }
+        let owners = &mut self.state.local_scan_owners;
+        let waiters = &mut self.state.local_scan_waiters;
+        if owners.contains(&session) {
+            return true;
+        }
+        if owners.len() < MAX_LOCAL_SCAN_OWNERS && waiters.is_empty() {
+            owners.insert(session);
+            return true;
+        }
+        if !waiters.contains(&session) {
+            waiters.push_back(session);
+        }
+        false
+    }
+
+    /// Chooses the current preferred consensus target first, otherwise FIFO.
+    /// Existing owners are never preempted, so an older scan always has a path
+    /// to its first peer frontier.
+    fn pop_scan_waiter(&mut self) -> Option<SessionRef> {
+        let sessions = &self.state.sessions;
+        let latest_consensus_target = self.state.latest_consensus_target;
+        let waiters = &mut self.state.local_scan_waiters;
+        waiters.retain(|session| {
+            sessions
+                .get(session)
+                .is_some_and(|state| state.phase == SessionPhase::Active)
+        });
+        let preferred = latest_consensus_target.and_then(|target| {
+            waiters.iter().position(|session| {
+                sessions.get(session).is_some_and(|state| {
+                    state.reason == AcquireReason::Consensus && state.target == target
+                })
+            })
+        });
+        waiters.remove(preferred.unwrap_or(0))
+    }
+
+    fn release_local_scan_permit(
+        &mut self,
+        session: SessionRef,
+        effects: &mut Vec<AcquisitionEffect>,
+    ) {
+        let was_owner = self.state.local_scan_owners.remove(&session);
+        self.state
+            .local_scan_waiters
+            .retain(|candidate| *candidate != session);
+        let next = was_owner.then(|| self.pop_scan_waiter()).flatten();
+        if let Some(next) = next {
+            self.state.local_scan_owners.insert(next);
+            self.run_plan_turn(next, None, effects);
+        }
+    }
+
     /// Runs one bounded plan turn for `session` and appends its work effects.
     /// The tree engine is advanced only on this owner task; work commands are
     /// returned after state mutation and executed by adapters.
@@ -2343,6 +2445,9 @@ impl CoordinatorRunner {
         reply_peer: Option<PeerId>,
         effects: &mut Vec<AcquisitionEffect>,
     ) {
+        if !self.ensure_local_scan_permit(session) {
+            return;
+        }
         self.stats.plan_turns += 1;
         let (turn, retained_reply_peer) = {
             let CoordinatorState { sessions, ids, .. } = &mut self.state;
@@ -2425,8 +2530,18 @@ impl CoordinatorRunner {
                         self.run_plan_turn(session, None, effects);
                     }
                 }
+                let local_pending = self.state.sessions.get(&session).is_some_and(|state| {
+                    state.plan.pending_read_count() != 0 || state.plan.read_backlog_count() != 0
+                });
+                if !local_pending {
+                    self.release_local_scan_permit(session, effects);
+                }
             }
             PlanTurn::Persist(batch) => {
+                let final_batch = batch.requires_fence();
+                if final_batch {
+                    self.release_local_scan_permit(session, effects);
+                }
                 tracing::info!(
                     target: "acquisition_trace",
                     event = "persistence_batch_submitted",
@@ -2438,10 +2553,10 @@ impl CoordinatorRunner {
                     ledger_sequence = batch.ledger_sequence(),
                     nodes = batch.nodes().len(),
                     payload_bytes = batch.payload_bytes(),
-                    final_batch = batch.requires_fence(),
+                    final_batch,
                     "acquisition trace: accepted SHAMap nodes submitted for persistence"
                 );
-                if batch.requires_fence() {
+                if final_batch {
                     // Active -> Persisting: the tree is structurally complete
                     // and the final batch must pass its durability fence before
                     // any handoff. Incremental accepted-node batches leave the
@@ -2463,6 +2578,7 @@ impl CoordinatorRunner {
                 effects.push(AcquisitionEffect::SubmitWrite(batch));
             }
             PlanTurn::Invalid => {
+                self.release_local_scan_permit(session, effects);
                 self.fail_session(session, FailureReason::InvalidTreePlan, effects);
             }
         }
@@ -2923,6 +3039,7 @@ impl CoordinatorRunner {
             session_state.pending_timer = None;
             session_state.pending_expiry_timer = None;
             session_state.plan.terminalize_retaining_engine();
+            self.release_local_scan_permit(session, effects);
             self.release_session_request_credits(session);
             self.discard_session_request_intents(session);
             self.stats.sessions_cancelled += 1;
@@ -2998,6 +3115,8 @@ impl CoordinatorRunner {
         }
         let target = state.target;
         state.plan.cancel();
+        let mut effects = Vec::new();
+        self.release_local_scan_permit(session, &mut effects);
         self.release_session_request_credits(session);
         self.discard_session_request_intents(session);
         self.plan_seed.session_reaped(session);
@@ -3025,7 +3144,8 @@ impl CoordinatorRunner {
             store_generation = session.store_generation().get(),
             "acquisition trace: swept live per-hash owner after one minute without repeated demand"
         );
-        vec![AcquisitionEffect::CancelSession(session)]
+        effects.push(AcquisitionEffect::CancelSession(session));
+        effects
     }
 
     /// Grants bounded direct recovery work after peer capability returns. A
@@ -3512,6 +3632,7 @@ impl CoordinatorRunner {
             } else {
                 session_state.plan.terminalize_retaining_engine();
             }
+            self.release_local_scan_permit(session, effects);
             self.release_session_request_credits(session);
             self.discard_session_request_intents(session);
             self.stats.sessions_cancelled += 1;
@@ -6529,6 +6650,97 @@ mod tests {
                 .engine()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn moving_tips_admit_three_whole_scans_and_waiters_hold_no_read_operations() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let mut sessions = Vec::new();
+        let mut expiries = Vec::new();
+        let mut owner_reads = Vec::new();
+
+        for seq in 20..26 {
+            let started = acquire_with_effects(&mut runner, seq);
+            let session = peer_request_session(&started);
+            sessions.push(session);
+            expiries.push(expiry_operation(&started));
+            let state = runner
+                .state
+                .sessions
+                .get_mut(&session)
+                .expect("new session");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(u64::from(seq)),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(u64::from(seq) + 1000)),
+                    seq,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+            if seq == 24 {
+                runner.state.latest_consensus_target = Some(target(seq));
+            }
+            let mut effects = Vec::new();
+            runner.run_plan_turn(session, None, &mut effects);
+            if let Some(read) = read_effects(&effects).first() {
+                owner_reads.push((session, read.operation()));
+            }
+        }
+
+        assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
+        assert_eq!(owner_reads.len(), MAX_LOCAL_SCAN_OWNERS);
+        assert_eq!(runner.state.local_scan_waiters.len(), 3);
+        for session in &sessions[MAX_LOCAL_SCAN_OWNERS..] {
+            assert_eq!(
+                runner
+                    .session(*session)
+                    .expect("waiter")
+                    .plan()
+                    .pending_read_count(),
+                0,
+                "a waiting target must not mint or pin a 512-read operation batch"
+            );
+        }
+
+        // A queued target is not considered an in-flight scan for registry
+        // retention and remains sweepable at the ordinary one-minute expiry.
+        let swept = sessions[5];
+        let effects = runner.handle_event(AcquisitionEvent::TimerFired {
+            operation: expiries[5],
+            timer: TimerKind::SessionExpiry,
+        });
+        assert!(effects.contains(&AcquisitionEffect::CancelSession(swept)));
+        assert!(!runner.state.local_scan_waiters.contains(&swept));
+
+        // Existing owners are never preempted. On release, the current
+        // preferred target goes first; the older FIFO waiter gets the next
+        // permit and both immediately produce their own exact read.
+        let first_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
+            ReadCompletion::new(owner_reads[0].1, ReadOutcome::Settled { node: None }),
+        ));
+        assert!(
+            read_effects(&first_release)
+                .iter()
+                .any(|read| read.operation().session() == sessions[4])
+        );
+        let second_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
+            ReadCompletion::new(owner_reads[1].1, ReadOutcome::Settled { node: None }),
+        ));
+        assert!(
+            read_effects(&second_release)
+                .iter()
+                .any(|read| read.operation().session() == sessions[3])
+        );
+        assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
     }
 
     #[test]

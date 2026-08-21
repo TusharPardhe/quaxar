@@ -2499,6 +2499,10 @@ impl InboundLedgers {
                         JsonValue::Bool(session.network_admitted()),
                     ),
                     (
+                        "local_scan".to_owned(),
+                        JsonValue::String(session.local_scan().to_owned()),
+                    ),
+                    (
                         "peers".to_owned(),
                         JsonValue::Unsigned(session.peer_count() as u64),
                     ),
@@ -2609,6 +2613,14 @@ impl InboundLedgers {
             (
                 "peer_requests".to_owned(),
                 JsonValue::Unsigned(snapshot.peer_requests()),
+            ),
+            (
+                "local_scan_owners".to_owned(),
+                JsonValue::Unsigned(snapshot.local_scan_owners() as u64),
+            ),
+            (
+                "local_scan_waiters".to_owned(),
+                JsonValue::Unsigned(snapshot.local_scan_waiters() as u64),
             ),
             (
                 "timers_armed".to_owned(),

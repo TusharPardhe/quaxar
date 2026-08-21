@@ -20,9 +20,10 @@ use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 /// global, so coalesced acquisitions never multiply database I/O.
 pub const ACQ_READS_PER_SCAN: usize = 512;
 
-/// Rippled's `InboundLedger` JobQueue category permits five concurrent jobs,
-/// each of which may hold one 512-read `getMissingNodes` batch.
-pub const ACQ_SCAN_JOBS: usize = 5;
+/// Rippled's `JtLedgerData` JobQueue category runs three jobs concurrently,
+/// each of which may hold one 512-read `getMissingNodes` batch. TimeoutCounter's
+/// separate jobLimit=5 is an enqueue guard, not a running-job limit.
+pub const ACQ_SCAN_JOBS: usize = 3;
 
 pub const ACQ_READS_GLOBAL: usize = ACQ_READS_PER_SCAN * ACQ_SCAN_JOBS;
 
@@ -1075,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn five_scan_jobs_fill_global_bound_and_sixth_advances_after_settlement() {
+    fn three_scan_jobs_fill_global_bound_and_fourth_advances_after_settlement() {
         let broker = broker(ReadBrokerConfig::default());
         let events = Arc::new(Mutex::new(Vec::new()));
         for plan in 1..=ACQ_SCAN_JOBS as u64 {
@@ -1093,17 +1094,17 @@ mod tests {
             }
         }
         assert_eq!(broker.snapshot().logical_tickets, ACQ_READS_GLOBAL);
-        let sixth_key = key(0xFA, ACQ_READS_GLOBAL as u32 + 1);
+        let next_key = key(0xFA, ACQ_READS_GLOBAL as u32 + 1);
         assert!(matches!(
-            broker.request(sixth_key, 6, 6, sink(Arc::clone(&events))),
+            broker.request(next_key, 4, 4, sink(Arc::clone(&events))),
             ReadAdmission::CapacityDeferred
         ));
 
         let mut dispatches = broker.take_ready_dispatches();
         assert_eq!(dispatches.len(), ACQ_READS_GLOBAL);
         dispatches.remove(0).complete(ReadOutcome::Miss);
-        let sixth = broker.request(sixth_key, 6, 6, sink(Arc::clone(&events)));
-        assert!(matches!(sixth, ReadAdmission::Accepted(_)));
+        let next = broker.request(next_key, 4, 4, sink(Arc::clone(&events)));
+        assert!(matches!(next, ReadAdmission::Accepted(_)));
         assert_eq!(broker.take_ready_dispatches().len(), 1);
     }
 

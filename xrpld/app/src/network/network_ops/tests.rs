@@ -149,6 +149,32 @@ fn app_network_ops_mode_owner_normalizes_mode_setmode() {
 }
 
 #[test]
+fn repeated_stale_syncing_heartbeat_is_an_unchanged_connected_mode() {
+    let state = std::sync::Arc::new(SharedNetworkOpsState::new(NetworkOpsOperatingMode::Syncing));
+    let owner = AppNetworkOpsModeOwner::new(
+        state.clone(),
+        std::sync::Arc::new(|| Duration::from_secs(120)),
+    );
+
+    owner.set_operating_mode_with_reason(NetworkOpsOperatingMode::Syncing, "heartbeat_reassertion");
+    assert_eq!(owner.operating_mode(), NetworkOpsOperatingMode::Connected);
+
+    for _ in 0..100 {
+        owner.set_operating_mode_with_reason(
+            NetworkOpsOperatingMode::Syncing,
+            "heartbeat_reassertion",
+        );
+    }
+
+    assert_eq!(owner.operating_mode(), NetworkOpsOperatingMode::Connected);
+    assert_eq!(
+        state.state_accounting_json()["connected"]["transitions"],
+        serde_json::Value::String("1".to_owned()),
+        "normalized stale heartbeats must follow rippled's unchanged-mode early return",
+    );
+}
+
+#[test]
 fn submit_rejects_inner_batch_before_router_lookup() {
     let calls = RefCell::new(Vec::new());
 

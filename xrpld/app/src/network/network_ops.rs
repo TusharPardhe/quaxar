@@ -67,8 +67,6 @@ pub fn normalize_operating_mode_for_validated_age(
         NetworkOpsOperatingMode::Syncing
             if validated_ledger_age >= SYNCING_VALIDATED_LEDGER_AGE =>
         {
-            let age_seconds = validated_ledger_age.as_secs();
-            tracing::warn!(target: "app", age_seconds, "Validated ledger is stale");
             NetworkOpsOperatingMode::Connected
         }
         mode => mode,
