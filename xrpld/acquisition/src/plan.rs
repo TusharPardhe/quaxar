@@ -598,6 +598,11 @@ pub struct SessionPlan {
     /// node id, hash, and tree kind so it can resend a protocol-correct
     /// request; overflow remains in `network_backlog` until capacity frees.
     retained_network: Vec<PlanNetworkNeed>,
+    /// Exact retained needs that have not yet been serialized into a normal
+    /// peer request. Entries move here exactly once when they enter
+    /// `retained_network`; normal owner events remove one bounded FIFO batch,
+    /// while timeout recovery continues to use `retained_network` directly.
+    unemitted_network: VecDeque<PlanNetworkNeed>,
     /// Start index for the next bounded timeout recovery batch. It advances
     /// once per timeout interval, not once per effect, so local reprobes and
     /// peer resends cover the same exact needs.
@@ -623,6 +628,7 @@ impl SessionPlan {
             network_backlog: VecDeque::new(),
             pending_network: BTreeSet::new(),
             retained_network: Vec::new(),
+            unemitted_network: VecDeque::new(),
             retained_network_cursor: 0,
             persistence: SessionPersistence::None,
             timeouts: 0,
@@ -738,6 +744,35 @@ impl SessionPlan {
         &self.retained_network
     }
 
+    /// Removes the next normal outbound request batch from the exact retained
+    /// frontier. The batch is FIFO and homogeneous by tree kind because one
+    /// `TMGetLedger` request carries one node kind. A timeout never consumes
+    /// this queue, so its existing rotating recovery selection remains eligible
+    /// for every retained need. Passing zero preserves all queued work.
+    pub fn take_next_normal_network_batch(&mut self, max_nodes: usize) -> Vec<PlanNetworkNeed> {
+        if self.cancelled || max_nodes == 0 {
+            return Vec::new();
+        }
+        let Some(first) = self.unemitted_network.pop_front() else {
+            return Vec::new();
+        };
+        let kind = first.kind();
+        let mut batch = vec![first];
+        while batch.len() < max_nodes
+            && self
+                .unemitted_network
+                .front()
+                .is_some_and(|need| need.kind() == kind)
+        {
+            batch.push(
+                self.unemitted_network
+                    .pop_front()
+                    .expect("checked FIFO frontier entry must remain present"),
+            );
+        }
+        batch
+    }
+
     /// True after cancellation cleared this plan.
     pub const fn is_cancelled(&self) -> bool {
         self.cancelled
@@ -754,6 +789,7 @@ impl SessionPlan {
         self.network_backlog.clear();
         self.pending_network.clear();
         self.retained_network.clear();
+        self.unemitted_network.clear();
         self.retained_network_cursor = 0;
         self.engine = None;
         self.persistence = SessionPersistence::None;
@@ -1335,6 +1371,7 @@ impl SessionPlan {
                 break;
             };
             self.retained_network.push(node);
+            self.unemitted_network.push_back(node);
             dispatched.push(node);
         }
         self.normalize_retained_network_cursor();
@@ -1348,6 +1385,8 @@ impl SessionPlan {
     fn retire_network_resolutions(&mut self, resolutions: &[PlanNetworkNeed]) {
         self.retained_network
             .retain(|need| !resolutions.contains(need));
+        self.unemitted_network
+            .retain(|need| !resolutions.contains(need));
         self.network_backlog
             .retain(|need| !resolutions.contains(need));
         self.normalize_retained_network_cursor();
@@ -1359,6 +1398,7 @@ impl SessionPlan {
     /// remain eligible until independently verified.
     fn retire_network_need(&mut self, resolved: PlanNetworkNeed) {
         self.retained_network.retain(|need| *need != resolved);
+        self.unemitted_network.retain(|need| *need != resolved);
         self.network_backlog.retain(|need| *need != resolved);
         self.normalize_retained_network_cursor();
         self.refresh_pending_network();
@@ -2406,6 +2446,54 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert!(plan.pending_network().contains(&Uint256::from(42)));
         assert_eq!(nodes[0].kind(), TreeKind::State);
+    }
+
+    #[test]
+    fn recovery_retirement_removes_an_unemitted_exact_network_need() {
+        let mut ids = IdCounter::new();
+        let s = session();
+        let nodes = [
+            PlanNetworkNeed::new(SHAMapNodeId::default(), Uint256::from(1), TreeKind::State),
+            PlanNetworkNeed::new(SHAMapNodeId::default(), Uint256::from(2), TreeKind::State),
+            PlanNetworkNeed::new(SHAMapNodeId::default(), Uint256::from(3), TreeKind::State),
+        ];
+        let mut plan = SessionPlan::new(budget());
+        assert!(
+            plan.install_engine(Box::new(
+                ScriptedEngine::new(
+                    TreePlanId::new(1),
+                    vec![ScriptedStep::NeedsNetworkWithKind(nodes.to_vec())],
+                    Vec::new(),
+                )
+                .with_persistence_sequence(1),
+            ))
+        );
+
+        let PlanTurn::Network(dispatched) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected retained network frontier");
+        };
+        assert_eq!(dispatched, nodes.to_vec());
+        assert_eq!(plan.take_next_normal_network_batch(1), vec![nodes[0]]);
+
+        // The second record is still retained but has not been serialized. A
+        // matching recovery attachment retires that exact record, including
+        // its normal-emission FIFO entry, without touching the third need.
+        let recovery = plan.reprobe_network_batch(&[nodes[1]], &mut ctx(s, &mut ids));
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(
+            plan.on_read(&ReadCompletion::new(
+                recovery[0].operation(),
+                ReadOutcome::Settled {
+                    node: Some(Bytes::from_static(b"resolved")),
+                },
+            )),
+            PlanReadOutcome::Applied
+        );
+        assert_eq!(plan.take_next_normal_network_batch(12), vec![nodes[2]]);
+        assert!(
+            !plan.pending_network().contains(&nodes[1].hash()),
+            "an exact recovery attachment must retire its unsent normal record"
+        );
     }
 
     #[test]

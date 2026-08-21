@@ -172,10 +172,6 @@ pub struct CoordinatorSession {
     phase: SessionPhase,
     plan: SessionPlan,
     sent_peers: BTreeSet<PeerId>,
-    /// Hashes recently requested from the network. This is the coordinator
-    /// equivalent of rippled `InboundLedger::recentNodes_`: reply-driven
-    /// turns must not re-request an already outstanding missing node.
-    recent_node_hashes: BTreeSet<Uint256>,
     pending_timer: Option<(TimerKind, OperationRef)>,
     pending_handoff: Option<DurableHandoffId>,
     // The durable ledger is retained for handoff retry: `plan.durable_ledger()`
@@ -199,7 +195,6 @@ impl CoordinatorSession {
             phase: SessionPhase::Active,
             plan: SessionPlan::new(admission),
             sent_peers,
-            recent_node_hashes: BTreeSet::new(),
             pending_timer: None,
             pending_handoff: None,
             durable: None,
@@ -1207,13 +1202,6 @@ impl CoordinatorRunner {
         // deadline and may re-publish only while the exact handoff remains
         // pending.
         session_state.pending_timer = None;
-        // `InboundLedger::onTimer` clears `recentNodes_` for every exact
-        // acquisition deadline, including a progress interval. This lets the
-        // next trigger re-request a still-retained frontier while the exact
-        // SessionRef/OperationRef gate still rejects stale events.
-        if timer == TimerKind::AcquireTimeout {
-            session_state.recent_node_hashes.clear();
-        }
         if timer == TimerKind::HandoffRetry {
             if session_state.phase != SessionPhase::DurablePending
                 || session_state.pending_handoff.is_none()
@@ -1799,7 +1787,6 @@ impl CoordinatorRunner {
             session_state.plan.run_turn(&mut ctx)
         };
         match turn {
-            PlanTurn::Continue => {}
             PlanTurn::Reads(requests) => {
                 tracing::info!(
                     target: "acquisition_trace",
@@ -1816,117 +1803,8 @@ impl CoordinatorRunner {
                     effects.push(AcquisitionEffect::SubmitRead(request));
                 }
             }
-            PlanTurn::Network(nodes) => {
-                // rippled `InboundLedger::filterNodes` records requested hashes
-                // and suppresses an all-duplicate set on a reply trigger. This
-                // matters after the initial five-peer header fanout: each Base
-                // reply can otherwise discover the same frontier and multiply
-                // requests before the first node reply attaches it. Timeout
-                // work intentionally remains eligible to retry known hashes.
-                let nodes = if reply_peer.is_some() {
-                    let Some(session_state) = self.state.sessions.get_mut(&session) else {
-                        return;
-                    };
-                    nodes
-                        .into_iter()
-                        .filter(|node| session_state.recent_node_hashes.insert(node.hash()))
-                        .collect::<Vec<_>>()
-                } else {
-                    if let Some(session_state) = self.state.sessions.get_mut(&session) {
-                        session_state
-                            .recent_node_hashes
-                            .extend(nodes.iter().map(|node| node.hash()));
-                    }
-                    nodes
-                };
-                if nodes.is_empty() {
-                    return;
-                }
-                let sequence = self
-                    .state
-                    .sessions
-                    .get(&session)
-                    .and_then(|state| state.plan.ledger_sequence());
-                // Rippled's normal trigger pins reply-driven follow-up work
-                // to the responding peer. A local/read/fetch-pack wake has no
-                // responding peer, so its `PeerSet::sendRequest(..., nullptr)`
-                // equivalent broadcasts only to the session's acquired peers.
-                let peers = match reply_peer {
-                    Some(peer) => vec![peer],
-                    None => self
-                        .state
-                        .sessions
-                        .get(&session)
-                        .map(|state| state.sent_peers.iter().copied().collect::<Vec<_>>())
-                        .unwrap_or_default(),
-                };
-                // Rippled's normal trigger requests the missing SHAMap
-                // locations through TMGetLedger. Generic by-hash requests are
-                // its aggressive timeout fallback, not the default path.
-                let Some(sequence) = sequence else {
-                    return;
-                };
-                let state_node_count = nodes
-                    .iter()
-                    .filter(|node| node.kind() == ledger::TreeKind::State)
-                    .count();
-                let transaction_node_count = nodes.len().saturating_sub(state_node_count);
-                tracing::info!(
-                    target: "acquisition_trace",
-                    event = "network_frontier_requested",
-                    run_epoch = session.run_epoch().get(),
-                    session_id = session.session_id().get(),
-                    target_hash = %session.target_hash(),
-                    plan_epoch = session.plan_epoch().get(),
-                    store_generation = session.store_generation().get(),
-                    ledger_sequence = sequence,
-                    reply_peer = ?reply_peer.map(PeerId::get),
-                    peer_count = peers.len(),
-                    nodes = nodes.len(),
-                    state_nodes = state_node_count,
-                    transaction_nodes = transaction_node_count,
-                    "acquisition trace: requesting current SHAMap frontier from selected peers"
-                );
-                let request_batch = if reply_peer.is_some() {
-                    REPLY_NODE_REQUEST_BATCH
-                } else {
-                    BLIND_NODE_REQUEST_BATCH
-                };
-                // rippled `InboundLedger::filterNodes` limits a response
-                // trigger to `kReqNodesReply` (128) and blind/local work to
-                // `kReqNodes` (12); chunk effects without truncating the exact
-                // retained frontier.
-                for kind in [ledger::TreeKind::State, ledger::TreeKind::Transaction] {
-                    let node_ids = nodes
-                        .iter()
-                        .filter(|node| node.kind() == kind)
-                        .map(|node| node.node_id())
-                        .collect::<Vec<_>>();
-                    for node_ids in node_ids.chunks(request_batch) {
-                        for peer in &peers {
-                            let operation = OperationRef::new(
-                                session,
-                                OperationKind::PeerRequest,
-                                self.state.ids.next_id(),
-                                self.state.ids.next_id(),
-                            );
-                            // A reply-driven request is pinned to the responding
-                            // peer, but it must not turn an unbounded history of
-                            // responders into timeout resend recipients.
-                            self.stats.peer_requests += 1;
-                            effects.push(AcquisitionEffect::SendLedgerRequest(PeerRequest::new(
-                                session,
-                                operation,
-                                *peer,
-                                LedgerDataRequest::GetLedgerNodes {
-                                    kind,
-                                    node_ids: node_ids.to_vec(),
-                                    sequence,
-                                },
-                            )));
-                        }
-                    }
-                }
+            PlanTurn::Network(_) | PlanTurn::Continue => {
+                self.emit_next_normal_network_request(session, reply_peer, effects);
             }
             PlanTurn::Persist(batch) => {
                 tracing::info!(
@@ -1960,6 +1838,94 @@ impl CoordinatorRunner {
             PlanTurn::Invalid => {
                 self.fail_session(session, FailureReason::InvalidTreePlan, effects);
             }
+        }
+    }
+
+    /// Emits at most one normal frontier request per selected peer for this
+    /// owner event. rippled `InboundLedger::filterNodes` (
+    /// `src/xrpld/app/ledger/detail/InboundLedger.cpp:718-745`) truncates to
+    /// one 12-node blind/local or 128-node reply request before PeerSet sends;
+    /// the plan FIFO gives that behavior an owned, exact frontier boundary.
+    ///
+    /// Sequence and peer availability are checked before consuming the FIFO,
+    /// so a temporarily unsendable owner event leaves all exact work queued for
+    /// the next wake. Timeout retries deliberately use `retained_network`
+    /// directly and never consume this normal-emission queue.
+    fn emit_next_normal_network_request(
+        &mut self,
+        session: SessionRef,
+        reply_peer: Option<PeerId>,
+        effects: &mut Vec<AcquisitionEffect>,
+    ) {
+        let Some((sequence, peers)) = self.state.sessions.get(&session).and_then(|state| {
+            (!state.phase.is_terminal()).then(|| {
+                let peers = match reply_peer {
+                    Some(peer) => vec![peer],
+                    None => state.sent_peers.iter().copied().collect::<Vec<_>>(),
+                };
+                (state.plan.ledger_sequence(), peers)
+            })
+        }) else {
+            return;
+        };
+        let Some(sequence) = sequence else {
+            return;
+        };
+        if peers.is_empty() {
+            return;
+        }
+        let request_limit = if reply_peer.is_some() {
+            REPLY_NODE_REQUEST_BATCH
+        } else {
+            BLIND_NODE_REQUEST_BATCH
+        };
+        let nodes = self
+            .state
+            .sessions
+            .get_mut(&session)
+            .filter(|state| !state.phase.is_terminal())
+            .map(|state| state.plan.take_next_normal_network_batch(request_limit))
+            .unwrap_or_default();
+        let Some(first) = nodes.first() else {
+            return;
+        };
+        let kind = first.kind();
+        debug_assert!(nodes.iter().all(|node| node.kind() == kind));
+        let node_ids = nodes.iter().map(|node| node.node_id()).collect::<Vec<_>>();
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "network_frontier_requested",
+            run_epoch = session.run_epoch().get(),
+            session_id = session.session_id().get(),
+            target_hash = %session.target_hash(),
+            plan_epoch = session.plan_epoch().get(),
+            store_generation = session.store_generation().get(),
+            ledger_sequence = sequence,
+            reply_peer = ?reply_peer.map(PeerId::get),
+            peer_count = peers.len(),
+            nodes = node_ids.len(),
+            ?kind,
+            request_limit,
+            "acquisition trace: requesting one FIFO SHAMap frontier batch from selected peers"
+        );
+        for peer in peers {
+            let operation = OperationRef::new(
+                session,
+                OperationKind::PeerRequest,
+                self.state.ids.next_id(),
+                self.state.ids.next_id(),
+            );
+            self.stats.peer_requests += 1;
+            effects.push(AcquisitionEffect::SendLedgerRequest(PeerRequest::new(
+                session,
+                operation,
+                peer,
+                LedgerDataRequest::GetLedgerNodes {
+                    kind,
+                    node_ids: node_ids.clone(),
+                    sequence,
+                },
+            )));
         }
     }
 
@@ -4218,23 +4184,113 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_plan_turn_batches_reply_node_requests_at_rippled_128_limit() {
-        let needs = (1..=129u64)
-            .map(|hash| {
-                PlanNetworkNeed::new(
-                    SHAMapNodeId::default(),
-                    Uint256::from(hash),
-                    ledger::TreeKind::State,
-                )
+    fn state_network_need(hash: u64) -> PlanNetworkNeed {
+        PlanNetworkNeed::new(
+            SHAMapNodeId::new(64, Uint256::from(hash)).expect("valid deterministic node id"),
+            Uint256::from(hash),
+            ledger::TreeKind::State,
+        )
+    }
+
+    fn normal_ledger_node_requests(
+        effects: &[AcquisitionEffect],
+    ) -> Vec<(PeerId, Vec<SHAMapNodeId>)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                AcquisitionEffect::SendLedgerRequest(request) => match request.request() {
+                    LedgerDataRequest::GetLedgerNodes { node_ids, .. } => {
+                        Some((request.peer_id(), node_ids.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
             })
+            .collect()
+    }
+
+    #[test]
+    fn blind_frontier_emits_one_fifo_12_node_request_per_selected_peer() {
+        let needs = (1..=256).map(state_network_need).collect::<Vec<_>>();
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![
+                ScriptedStep::NeedsNetworkWithKind(Vec::new()),
+                ScriptedStep::NeedsNetworkWithKind(needs.clone()),
+            ])),
+        );
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(1), PeerId::new(2)]),
+        ));
+        let session = acquire(&mut runner, 10);
+        let _ = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            session,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+
+        let effects = runner.handle_event(AcquisitionEvent::FetchPackAvailable);
+        let requests = normal_ledger_node_requests(&effects);
+        let first_batch = needs[..12]
+            .iter()
+            .map(|need| need.node_id())
             .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], (PeerId::new(1), first_batch.clone()));
+        assert_eq!(requests[1], (PeerId::new(2), first_batch));
+    }
+
+    #[test]
+    fn later_owner_wake_advances_to_the_next_non_overlapping_blind_fifo_batch() {
+        let needs = (1..=256).map(state_network_need).collect::<Vec<_>>();
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![
+                ScriptedStep::NeedsNetworkWithKind(Vec::new()),
+                ScriptedStep::NeedsNetworkWithKind(needs.clone()),
+            ])),
+        );
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(1), PeerId::new(2)]),
+        ));
+        let session = acquire(&mut runner, 10);
+        let _ = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            session,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        let first =
+            normal_ledger_node_requests(&runner.handle_event(AcquisitionEvent::FetchPackAvailable));
+        let later =
+            normal_ledger_node_requests(&runner.handle_event(AcquisitionEvent::FetchPackAvailable));
+        let first_ids = needs[..12]
+            .iter()
+            .map(|need| need.node_id())
+            .collect::<Vec<_>>();
+        let later_ids = needs[12..24]
+            .iter()
+            .map(|need| need.node_id())
+            .collect::<Vec<_>>();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|(_, ids)| *ids == first_ids));
+        assert_eq!(later.len(), 2);
+        assert!(later.iter().all(|(_, ids)| *ids == later_ids));
+        assert_ne!(first_ids, later_ids);
+    }
+
+    #[test]
+    fn reply_frontier_emits_at_most_128_nodes_only_to_the_responder() {
+        let needs = (1..=256).map(state_network_need).collect::<Vec<_>>();
         let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
         let mut runner = CoordinatorRunner::with_plan_seed(
             RunEpoch::new(1),
             budget,
             Box::new(ScriptedSeed::new(vec![ScriptedStep::NeedsNetworkWithKind(
-                needs,
+                needs.clone(),
             )])),
         );
         connect(&mut runner);
@@ -4244,66 +4300,17 @@ mod tests {
             AdmissionBudget::new(1, 256),
             8,
         )));
-        let batches = effects
-            .iter()
-            .filter_map(|effect| match effect {
-                AcquisitionEffect::SendLedgerRequest(request)
-                    if matches!(request.request(), LedgerDataRequest::GetLedgerNodes { .. }) =>
-                {
-                    match request.request() {
-                        LedgerDataRequest::GetLedgerNodes { node_ids, .. } => Some(node_ids.len()),
-                        _ => unreachable!("matched ledger-node request"),
-                    }
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(batches, vec![128, 1]);
-    }
-
-    #[test]
-    fn run_plan_turn_batches_non_reply_node_requests_at_rippled_12_limit() {
-        let needs = (1..=13u64)
-            .map(|hash| {
-                PlanNetworkNeed::new(
-                    SHAMapNodeId::default(),
-                    Uint256::from(hash),
-                    ledger::TreeKind::State,
-                )
-            })
-            .collect::<Vec<_>>();
-        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
-        let mut runner = CoordinatorRunner::with_plan_seed(
-            RunEpoch::new(1),
-            budget,
-            Box::new(ScriptedSeed::new(vec![
-                ScriptedStep::NeedsNetworkWithKind(vec![]),
-                ScriptedStep::NeedsNetworkWithKind(needs),
-            ])),
+        let requests = normal_ledger_node_requests(&effects);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, PeerId::new(1));
+        assert_eq!(requests[0].1.len(), 128);
+        assert_eq!(
+            requests[0].1,
+            needs[..128]
+                .iter()
+                .map(|need| need.node_id())
+                .collect::<Vec<_>>()
         );
-        connect(&mut runner);
-        let session = acquire(&mut runner, 10);
-        let _ = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
-            session,
-            AdmissionBudget::new(1, 256),
-            8,
-        )));
-        let effects = runner.handle_event(AcquisitionEvent::FetchPackAvailable);
-        let batches = effects
-            .iter()
-            .filter_map(|effect| match effect {
-                AcquisitionEffect::SendLedgerRequest(request)
-                    if matches!(request.request(), LedgerDataRequest::GetLedgerNodes { .. }) =>
-                {
-                    match request.request() {
-                        LedgerDataRequest::GetLedgerNodes { node_ids, .. } => Some(node_ids.len()),
-                        _ => unreachable!("matched ledger-node request"),
-                    }
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(batches, vec![12, 1]);
     }
 
     #[test]
