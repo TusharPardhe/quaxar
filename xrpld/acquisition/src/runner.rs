@@ -1264,6 +1264,15 @@ impl CoordinatorRunner {
         if seeded {
             session_state.plan.note_progress();
         }
+        // XRPL ledger-data replies do not echo our OperationRef. After the
+        // packet has passed exact SessionRef routing and entered this live
+        // session's mailbox, conservatively settle only the oldest emitted
+        // request for this same session and peer. This is resource accounting,
+        // not lifecycle authorization; stale/replacement packets returned
+        // above cannot release any current session credit. It restores
+        // rippled's reply-driven trigger behavior instead of waiting for the
+        // coarse acquire timeout to free the outbound window.
+        self.release_oldest_request_credit_for_response(session, packet_peer);
         self.run_plan_turn(session, Some(packet_peer), &mut effects);
         effects
     }
@@ -2175,6 +2184,25 @@ impl CoordinatorRunner {
             if *count == 0 {
                 self.state.outbound.outstanding_by_session.remove(&session);
             }
+        }
+    }
+
+    /// Ledger-data replies do not carry Quaxar's outbound operation identity.
+    /// Settle at most one deterministic oldest credit for the already-validated
+    /// `(SessionRef, peer)` route. An unsolicited, stale, or replacement
+    /// packet finds no exact matching live operation and cannot affect another
+    /// session's budget.
+    fn release_oldest_request_credit_for_response(&mut self, session: SessionRef, peer: PeerId) {
+        let operation =
+            self.state
+                .outbound
+                .outstanding
+                .iter()
+                .find_map(|(operation, request_peer)| {
+                    (operation.session() == session && *request_peer == peer).then_some(*operation)
+                });
+        if let Some(operation) = operation {
+            self.release_request_credit(operation);
         }
     }
 
