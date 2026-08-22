@@ -538,8 +538,12 @@ pub(crate) fn trust_create<V: ledger::ApplyView>(
     let mut obj = STObject::new(sf("sfLedgerEntry"));
     obj.set_field_u16(sf("sfLedgerEntryType"), 0x0072); // ltRIPPLE_STATE
 
-    // Zero balance in the currency
-    let zero_balance = limit_allow.zeroed();
+    // RippleState balances use the currency's neutral issue. The trust limit
+    // carries the submitting account as issuer, but rippled constructs the
+    // initial balance with `noAccount()`. Preserving the limit issuer here
+    // changes both the stored state leaf and CreatedNode metadata.
+    let mut zero_balance = limit_allow.zeroed();
+    zero_balance.set_issuer(protocol::no_account());
     obj.set_field_amount(sf("sfBalance"), zero_balance);
 
     // LowLimit issuer = low account, HighLimit issuer = high account
@@ -641,39 +645,45 @@ pub(crate) fn trust_create<V: ledger::ApplyView>(
         );
     }
 
-    let new_sle = Arc::new(STLedgerEntry::from_stobject(obj, key));
-
     // Insert into both owner directories
     let low_account = if !b_high { account } else { dst };
     let high_account = if b_high { account } else { dst };
 
     let low_dir = protocol::owner_dir_keylet(Uint160::from_void(low_account.data()));
-    if matches!(
-        ledger::dir_insert(
-            view,
-            &low_dir,
-            key,
-            &ledger::describe_owner_dir(*low_account),
-        ),
-        Ok(None)
+    let low_node = match ledger::dir_insert(
+        view,
+        &low_dir,
+        key,
+        &ledger::describe_owner_dir(*low_account),
     ) {
-        return Ter::TEC_DIR_FULL;
-    }
+        Ok(Some(node)) => node,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
 
     let high_dir = protocol::owner_dir_keylet(Uint160::from_void(high_account.data()));
-    if matches!(
-        ledger::dir_insert(
-            view,
-            &high_dir,
-            key,
-            &ledger::describe_owner_dir(*high_account),
-        ),
-        Ok(None)
+    let high_node = match ledger::dir_insert(
+        view,
+        &high_dir,
+        key,
+        &ledger::describe_owner_dir(*high_account),
     ) {
-        return Ter::TEC_DIR_FULL;
-    }
+        Ok(Some(node)) => node,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
 
-    let _ = view.insert(new_sle);
+    // rippled trustCreate always persists both deletion hints, including the
+    // common root-page value zero. The fields are optional in the ledger
+    // format, but the explicit hints affect the account-state SHAMap even
+    // though zero-valued fields are omitted from CreatedNode metadata.
+    obj.set_field_u64(sf("sfLowNode"), low_node);
+    obj.set_field_u64(sf("sfHighNode"), high_node);
+
+    let new_sle = Arc::new(STLedgerEntry::from_stobject(obj, key));
+    if view.insert(new_sle).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
     Ter::TES_SUCCESS
 }

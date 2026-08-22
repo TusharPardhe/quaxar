@@ -2838,8 +2838,15 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
         // transaction boundary; retain the same atomicity here by dropping the
         // unapplied FlowSandbox and reporting tefEXCEPTION.
         let mut tx_view = ledger::FlowSandbox::new_with_flags(view, flags);
+        let mut invariant_fee_reset = false;
         let mut result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell_impl(&mut tx_view, tx, txn_type, flags)
+            apply_submit_transactor_shell_impl(
+                &mut tx_view,
+                tx,
+                txn_type,
+                flags,
+                &mut invariant_fee_reset,
+            )
         })) {
             Ok(result) => result,
             Err(payload) => {
@@ -2878,9 +2885,23 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
             applied_batch_inner_transactions = followup.applied_inner_transactions;
         }
 
-        if likely_to_claim_fee(result, flags) {
-            // A retry-pass `tec` is intentionally left unapplied so
-            // BuildLedger can retry it after the remaining canonical input.
+        let fail_hard_tec =
+            is_tec_claim(result) && protocol::any_apply_flags(flags & ApplyFlags::FAIL_HARD);
+        let persistent_cleanup_tec = matches!(
+            result,
+            Ter::TEC_OVERSIZE | Ter::TEC_KILLED | Ter::TEC_INCOMPLETE | Ter::TEC_EXPIRED
+        );
+        let invariant_fee_reset_applies =
+            invariant_fee_reset && result == Ter::TEC_INVARIANT_FAILED;
+        if (likely_to_claim_fee(result, flags)
+            || persistent_cleanup_tec
+            || invariant_fee_reset_applies)
+            && (!fail_hard_tec || invariant_fee_reset_applies)
+        {
+            // Ordinary retry-pass `tec` results remain unapplied so
+            // BuildLedger can retry them after the canonical input. rippled
+            // immediately applies the four persistent-cleanup outcomes even
+            // during that pass, preserving their canonical deletions.
             // A commit failure means the parent changed underneath this
             // transaction. Never report an applied result after discarding a
             // `FlowSandbox::apply` error.
@@ -2907,6 +2928,7 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
     tx: &STTx,
     txn_type: TxType,
     flags: ApplyFlags,
+    invariant_fee_reset: &mut bool,
 ) -> Ter {
     let account_field = get_field_by_symbol("sfAccount");
 
@@ -3252,14 +3274,22 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             protocol::XRPAmount::from_drops(0)
         };
 
-        if protocol::is_tes_success(result) || protocol::is_tec_claim(result) {
+        // rippled checks an ordinary tec only after resetting the handler
+        // context to fee/sequence state. At this point `inner` still contains
+        // partial doApply mutations, so only successful state is eligible for
+        // invariant evaluation here.
+        if protocol::is_tes_success(result) {
             result = crate::state::invariants::check_invariants_for_tx(&inner, tx, result, fee_amt);
+            *invariant_fee_reset = result == Ter::TEC_INVARIANT_FAILED;
         }
 
-        let do_offers = result == Ter::TEC_OVERSIZE || result == Ter::TEC_KILLED;
-        let do_lines_or_mpts = result == Ter::TEC_INCOMPLETE;
-        let do_nf_token_offers = result == Ter::TEC_EXPIRED;
-        let do_credentials = result == Ter::TEC_EXPIRED;
+        let fail_hard_tec =
+            is_tec_claim(result) && protocol::any_apply_flags(flags & ApplyFlags::FAIL_HARD);
+        let do_offers =
+            !fail_hard_tec && (result == Ter::TEC_OVERSIZE || result == Ter::TEC_KILLED);
+        let do_lines_or_mpts = !fail_hard_tec && result == Ter::TEC_INCOMPLETE;
+        let do_nf_token_offers = !fail_hard_tec && result == Ter::TEC_EXPIRED;
+        let do_credentials = !fail_hard_tec && result == Ter::TEC_EXPIRED;
 
         if result == Ter::TEC_INVARIANT_FAILED {
             // `inner` is the doApply portion of this transaction context. Its
@@ -3270,12 +3300,24 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             drop(inner);
             result = crate::state::invariants::check_invariants_for_tx(view, tx, result, fee_amt);
         } else if !do_offers && !do_lines_or_mpts && !do_nf_token_offers && !do_credentials {
-            if result != Ter::TEC_KILLED {
-                // Apply inner sandbox changes to outer view (normal path).
-                // A failed commit is an internal application failure, never a
-                // successful transaction with silently lost mutations.
+            if is_tes_success(result) {
+                // Only a successful doApply commits its handler sandbox.
+                // rippled resets every ordinary tec result to fee/sequence
+                // changes; those changes already live in the outer view.
                 if inner.apply().is_err() {
                     result = Ter::TEF_INTERNAL;
+                }
+            } else {
+                // Discard all partial handler mutations for ordinary tec
+                // outcomes. In particular, a second owner-directory insert
+                // may fail after the first insert and owner-count adjustment.
+                drop(inner);
+                if likely_to_claim_fee(result, flags)
+                    && !protocol::any_apply_flags(flags & ApplyFlags::FAIL_HARD)
+                {
+                    result = crate::state::invariants::check_invariants_for_tx(
+                        view, tx, result, fee_amt,
+                    );
                 }
             }
         } else {
@@ -3311,9 +3353,11 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
                     .collect();
 
             drop(inner); // discard transactor state changes
+            let mut cleanup = ledger::FlowSandbox::new(view);
 
             for (index, after) in erased_entries {
-                if let Ok(Some(before)) = view.peek(protocol::Keylet::new(after.get_type(), index))
+                if let Ok(Some(before)) =
+                    cleanup.peek(protocol::Keylet::new(after.get_type(), index))
                 {
                     if do_offers
                         && Some(index) != preserved_offer_sequence_cancel
@@ -3347,13 +3391,17 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             if do_offers && !removed_offers.is_empty() {
                 let mut count = 0;
                 for index in removed_offers {
-                    if let Ok(Some(sle)) = view.peek(protocol::Keylet::new(
+                    if let Ok(Some(sle)) = cleanup.peek(protocol::Keylet::new(
                         protocol::LedgerEntryType::Offer,
                         index,
                     )) {
                         let account =
                             sle.get_account_id(protocol::get_field_by_symbol("sfAccount"));
-                        let _ = crate::state::offer_create::offer_delete_pub(view, &account, sle);
+                        let _ = crate::state::offer_create::offer_delete_pub(
+                            &mut cleanup,
+                            &account,
+                            sle,
+                        );
                         count += 1;
                         if count == 1000 {
                             break;
@@ -3365,13 +3413,15 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             if result == Ter::TEC_EXPIRED && !expired_nft_offers.is_empty() {
                 let mut count = 0;
                 for index in expired_nft_offers {
-                    if let Ok(Some(offer)) = view.peek(protocol::keylet::nft_offer_keylet(index)) {
+                    if let Ok(Some(offer)) = cleanup.peek(protocol::keylet::nft_offer_keylet(index))
+                    {
                         let owner = offer.get_account_id(protocol::get_field_by_symbol("sfOwner"));
                         let owner_node =
                             offer.get_field_u64(protocol::get_field_by_symbol("sfOwnerNode"));
                         let owner_dir =
                             protocol::owner_dir_keylet(Uint160::from_void(owner.data()));
-                        let _ = ledger::dir_remove(view, &owner_dir, owner_node, index, false);
+                        let _ =
+                            ledger::dir_remove(&mut cleanup, &owner_dir, owner_node, index, false);
 
                         let nftoken_id =
                             offer.get_field_h256(protocol::get_field_by_symbol("sfNFTokenID"));
@@ -3384,14 +3434,14 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
                         };
                         let nft_node = offer
                             .get_field_u64(protocol::get_field_by_symbol("sfNFTokenOfferNode"));
-                        let _ = ledger::dir_remove(view, &nft_dir, nft_node, index, false);
+                        let _ = ledger::dir_remove(&mut cleanup, &nft_dir, nft_node, index, false);
 
                         if let Ok(Some(acct)) =
-                            view.peek(protocol::account_keylet(Uint160::from_void(owner.data())))
+                            cleanup.peek(protocol::account_keylet(Uint160::from_void(owner.data())))
                         {
-                            let _ = ledger::adjust_owner_count(view, &acct, -1);
+                            let _ = ledger::adjust_owner_count(&mut cleanup, &acct, -1);
                         }
-                        let _ = view.erase(offer);
+                        let _ = cleanup.erase(offer);
                         count += 1;
                         if count == 1000 {
                             break;
@@ -3403,7 +3453,7 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             if result == Ter::TEC_INCOMPLETE {
                 if !removed_trust_lines.is_empty() && removed_trust_lines.len() <= 500 {
                     for index in removed_trust_lines {
-                        if let Ok(Some(sle)) = view.peek(protocol::Keylet::new(
+                        if let Ok(Some(sle)) = cleanup.peek(protocol::Keylet::new(
                             protocol::LedgerEntryType::RippleState,
                             index,
                         )) {
@@ -3415,13 +3465,18 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
                                 .get_field_amount(protocol::get_field_by_symbol("sfHighLimit"))
                                 .issue()
                                 .account;
-                            let _ = crate::state::trust_set::trust_delete(view, &sle, &low, &high);
+                            let _ = crate::state::trust_set::trust_delete(
+                                &mut cleanup,
+                                &sle,
+                                &low,
+                                &high,
+                            );
                         }
                     }
                 }
                 if !removed_mpts.is_empty() && removed_mpts.len() <= 2 {
                     for index in removed_mpts {
-                        if let Ok(Some(sle)) = view.peek(protocol::Keylet::new(
+                        if let Ok(Some(sle)) = cleanup.peek(protocol::Keylet::new(
                             protocol::LedgerEntryType::MPToken,
                             index,
                         )) {
@@ -3431,13 +3486,13 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
                                 sle.get_field_u64(protocol::get_field_by_symbol("sfOwnerNode"));
                             let dir =
                                 protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-                            let _ = ledger::dir_remove(view, &dir, node, index, false);
-                            if let Ok(Some(acct)) = view
+                            let _ = ledger::dir_remove(&mut cleanup, &dir, node, index, false);
+                            if let Ok(Some(acct)) = cleanup
                                 .peek(protocol::account_keylet(Uint160::from_void(account.data())))
                             {
-                                let _ = ledger::adjust_owner_count(view, &acct, -1);
+                                let _ = ledger::adjust_owner_count(&mut cleanup, &acct, -1);
                             }
-                            let _ = view.erase(sle);
+                            let _ = cleanup.erase(sle);
                         }
                     }
                 }
@@ -3445,23 +3500,44 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
 
             if result == Ter::TEC_EXPIRED && !expired_credentials.is_empty() {
                 for index in expired_credentials {
-                    if let Ok(Some(sle)) = view.peek(protocol::Keylet::new(
+                    if let Ok(Some(sle)) = cleanup.peek(protocol::Keylet::new(
                         protocol::LedgerEntryType::Credential,
                         index,
                     )) {
-                        match ledger::credential_helpers::delete_sle(view, sle) {
+                        match ledger::credential_helpers::delete_sle(&mut cleanup, sle) {
                             Ok(ter) if protocol::is_tes_success(ter) => {}
                             Ok(ter) => {
-                                result = ter;
-                                break;
+                                tracing::error!(
+                                    target: "tx",
+                                    ?ter,
+                                    credential = %index,
+                                    "persistent expired-credential cleanup failed"
+                                );
                             }
                             Err(_) => {
-                                result = Ter::TEF_BAD_LEDGER;
-                                break;
+                                tracing::error!(
+                                    target: "tx",
+                                    credential = %index,
+                                    "persistent expired-credential cleanup hit a bad ledger"
+                                );
                             }
                         }
                     }
                 }
+            }
+
+            if is_tec_claim(result) {
+                result = crate::state::invariants::check_invariants_for_tx(
+                    &cleanup, tx, result, fee_amt,
+                );
+                *invariant_fee_reset = result == Ter::TEC_INVARIANT_FAILED;
+            }
+            if result == Ter::TEC_INVARIANT_FAILED {
+                drop(cleanup);
+                result =
+                    crate::state::invariants::check_invariants_for_tx(view, tx, result, fee_amt);
+            } else if is_tec_claim(result) && cleanup.apply().is_err() {
+                result = Ter::TEF_INTERNAL;
             }
         }
         result
@@ -3527,11 +3603,13 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
                     TxType::PAYMENT | TxType::CHECK_CASH | TxType::ACCOUNT_DELETE
                 )
                 .then(crate::state::payment::DeliveredAmountCapture::new);
+                let mut invariant_fee_reset = false;
                 let result = apply_submit_transactor_shell_impl(
                     &mut per_tx_batch_view,
                     &inner_tx,
                     inner_tx.get_txn_type(),
                     ApplyFlags::BATCH,
+                    &mut invariant_fee_reset,
                 );
                 let delivered_amount = delivered_amount_capture
                     .and_then(crate::state::payment::DeliveredAmountCapture::finish)

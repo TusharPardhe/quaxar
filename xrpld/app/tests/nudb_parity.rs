@@ -94,7 +94,10 @@ fn fetch_tx_items_for_ledger(
     let mut items = Vec::new();
     for tx in txs {
         let tx_blob = tx["tx_blob"].as_str().ok_or("missing tx_blob")?;
-        let meta_blob = tx["meta_blob"].as_str().unwrap_or("");
+        let meta_blob = tx["meta_blob"]
+            .as_str()
+            .or_else(|| tx["meta"].as_str())
+            .ok_or("missing meta_blob/meta")?;
         let tx_bytes = decode_hex(tx_blob);
         let meta_bytes = decode_hex(meta_blob);
 
@@ -223,7 +226,10 @@ fn fetch_tx_items_for_ledger_from(
     let mut items = Vec::new();
     for tx in txs {
         let tx_blob = tx["tx_blob"].as_str().ok_or("missing tx_blob")?;
-        let meta_blob = tx["meta_blob"].as_str().unwrap_or("");
+        let meta_blob = tx["meta_blob"]
+            .as_str()
+            .or_else(|| tx["meta"].as_str())
+            .ok_or("missing meta_blob/meta")?;
         let tx_bytes = decode_hex(tx_blob);
         let meta_bytes = decode_hex(meta_blob);
 
