@@ -358,7 +358,7 @@ impl MutableTree {
                     // no children below this branch
                 }
                 1 => {
-                    let Some(sole_leaf) = only_below_loaded_leaf(&node)? else {
+                    let Some(sole_leaf) = only_below_leaf_with_fetch(&node, fetch)? else {
                         prev_node = Some(node);
                         continue;
                     };
@@ -752,6 +752,43 @@ fn only_below_loaded_leaf(
     Ok(Some(node))
 }
 
+/// Resolve the sole descendant of a backed single-branch subtree.
+///
+/// rippled's `SHAMap::onlyBelow` descends through hash-only children while
+/// deciding whether a one-branch inner node can collapse to a leaf. Leaving
+/// such a subtree uncollapsed preserves its logical items but changes the
+/// SHAMap root, which is consensus-visible.
+fn only_below_leaf_with_fetch<F>(
+    node: &SharedIntrusive<SHAMapTreeNode>,
+    fetch: &mut F,
+) -> Result<Option<SharedIntrusive<SHAMapTreeNode>>, MutationError>
+where
+    F: FnMut(SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>>,
+{
+    let mut node = node.clone();
+    while node.is_inner() {
+        let Some(branch) = select_only_branch(&node) else {
+            return Ok(None);
+        };
+        if node.branch_count() != 1 {
+            return Ok(None);
+        }
+
+        if let Some(child) = node.get_child(branch) {
+            node = child;
+            continue;
+        }
+
+        let hash = node.get_child_hash(branch);
+        let Some(child) = fetch(hash) else {
+            return Err(MutationError::Traversal(TraversalError::MissingNode(hash)));
+        };
+        node = child;
+    }
+
+    Ok(Some(node))
+}
+
 fn select_only_branch(node: &SharedIntrusive<SHAMapTreeNode>) -> Option<usize> {
     (0..BRANCH_FACTOR).find(|&branch| !node.is_empty_branch(branch))
 }
@@ -999,7 +1036,6 @@ mod tests {
     use super::{MutableTree, MutationError, add_item, delete_item, update_item};
     use crate::item::SHAMapItem;
     use crate::search::find_key;
-    use crate::traversal::TraversalError;
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use basics::base_uint::Uint256;
     use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};

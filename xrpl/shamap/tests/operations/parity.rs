@@ -2735,6 +2735,94 @@ fn shamap_loaded_tree_mutation_helpers_accept_minimum_payloads() {
 }
 
 #[test]
+fn fetch_backed_delete_collapses_hash_only_sole_leaf_like_loaded_delete() {
+    let target =
+        Uint256::from_hex("1000000000000000000000000000000000000000000000000000000000000000")
+            .expect("target key should parse");
+    let survivor =
+        Uint256::from_hex("1100000000000000000000000000000000000000000000000000000000000000")
+            .expect("survivor key should parse");
+    let other =
+        Uint256::from_hex("2000000000000000000000000000000000000000000000000000000000000000")
+            .expect("other key should parse");
+
+    let build = |cowid| {
+        let mut tree = MutableTree::new(cowid);
+        for (key, fill) in [(target, 1), (survivor, 2), (other, 3)] {
+            tree.add_item(
+                SHAMapNodeType::AccountState,
+                SHAMapItem::new(key, vec![fill; 12]),
+            )
+            .expect("fixture insert should succeed");
+        }
+        tree
+    };
+
+    let mut loaded = build(1);
+    assert!(
+        loaded
+            .delete_item(target)
+            .expect("loaded delete should succeed")
+    );
+    loaded.root().update_hash_deep();
+    let expected_hash = loaded.root().get_hash();
+
+    let source = build(2);
+    let source_root = source.root();
+    let (target_leaf, target_path) =
+        walk_towards_key_with_path(&source_root, target, false, &mut |_| None)
+            .expect("target path should resolve");
+    let target_leaf = target_leaf.expect("target leaf should exist");
+    let shared_inner = target_path[1].node.clone();
+    shared_inner.update_hash_deep();
+    source_root.update_hash_deep();
+    let survivor_leaf = source
+        .find_key(survivor)
+        .expect("survivor lookup should succeed")
+        .expect("survivor leaf should exist");
+    let other_leaf = source
+        .find_key(other)
+        .expect("other lookup should succeed")
+        .expect("other leaf should exist");
+
+    let shallow_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    shallow_inner.set_child_hash(0, target_leaf.get_hash());
+    shallow_inner.set_child_hash(1, survivor_leaf.get_hash());
+    shallow_inner.update_hash_deep();
+    assert_eq!(shallow_inner.get_hash(), shared_inner.get_hash());
+
+    let shallow_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    shallow_root.set_child_hash(1, shallow_inner.get_hash());
+    shallow_root.set_child_hash(2, other_leaf.get_hash());
+    shallow_root.update_hash_deep();
+    assert_eq!(shallow_root.get_hash(), source_root.get_hash());
+
+    let mut stored = HashMap::new();
+    stored.insert(shallow_inner.get_hash(), shallow_inner);
+    stored.insert(target_leaf.get_hash(), target_leaf);
+    stored.insert(survivor_leaf.get_hash(), survivor_leaf);
+    stored.insert(other_leaf.get_hash(), other_leaf);
+    assert!(shallow_root.get_child(1).is_none());
+    let mut backed = MutableTree::from_loaded_root(shallow_root, 3);
+    let mut fetches = 0usize;
+    let deleted = backed
+        .delete_item_with_fetch(target, &mut |hash| {
+            fetches += 1;
+            stored.get(&hash).cloned()
+        })
+        .expect("fetch-backed delete should succeed");
+    assert!(deleted, "target must remain reachable through stored nodes");
+
+    assert!(fetches >= 2, "path and sole sibling should be fetched");
+    backed.root().update_hash_deep();
+    assert_eq!(
+        backed.root().get_hash(),
+        expected_hash,
+        "hash-only sole descendants must collapse to the canonical SHAMap shape"
+    );
+}
+
+#[test]
 fn shamap_mutable_snapshot_helpers_match_narrow_cpp_roles() {
     let key = Uint256::from_array([0xB1; 32]);
     let mut original = MutableTree::new(1);
