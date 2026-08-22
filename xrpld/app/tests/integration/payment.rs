@@ -313,6 +313,78 @@ fn payment_iou_frozen_destination() {
     );
 }
 
+/// A failing explicit candidate must not poison a valid default strand.
+/// rippled validates each candidate in `toStrand` and retains the default
+/// strand when the explicit account hop has no trust line.
+#[test]
+fn payment_valid_default_survives_invalid_explicit_candidate() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let gw = acct(0x33);
+    let invalid_hop = acct(0x44);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(alice, 5_000_000_000, 1, 0),
+        account_root(bob, 5_000_000_000, 1, 0),
+        account_root(gw, 5_000_000_000, 0, 0),
+        account_root(invalid_hop, 5_000_000_000, 0, 0),
+        trust_line(alice, gw, usd, 1_000, 10_000, 0),
+        trust_line(bob, gw, usd, 0, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let mut explicit = protocol::STPath::new();
+    explicit.push_back(protocol::STPathElement::from_optionals(
+        Some(invalid_hop),
+        None,
+        None,
+    ));
+    let mut paths = protocol::STPathSet::new(sf("sfPaths"));
+    paths.push_back(explicit);
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_account_id(sf("sfDestination"), bob);
+        tx.set_field_amount(sf("sfAmount"), iou(gw, usd, 100));
+        tx.set_field_path_set(sf("sfPaths"), paths);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None),
+        Ter::TES_SUCCESS
+    );
+}
+
+/// Consecutive DirectSteps must enforce the intermediate account's no-ripple
+/// flags on both adjacent trust lines, matching `checkNoRipple`.
+#[test]
+fn payment_direct_strand_honors_intermediate_no_ripple() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    let mut alice_line = trust_line(alice, gw, usd, 1_000, 10_000, 0);
+    let mut bob_line = trust_line(bob, gw, usd, 0, 10_000, 0);
+    // The gateway is the high account on both lines.
+    alice_line.set_field_u32(sf("sfFlags"), protocol::lsfHighNoRipple);
+    bob_line.set_field_u32(sf("sfFlags"), protocol::lsfHighNoRipple);
+    let ledger = build_ledger(vec![
+        account_root(alice, 5_000_000_000, 1, 0),
+        account_root(bob, 5_000_000_000, 1, 0),
+        account_root(gw, 5_000_000_000, 0, 0),
+        alice_line,
+        bob_line,
+    ]);
+    let mut view = new_view(ledger);
+
+    let tx = payment_tx(alice, bob, iou(gw, usd, 100), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None),
+        Ter::TEC_PATH_DRY
+    );
+}
+
 /// C++ Flow_test — IOU payment with globally frozen issuer fails.
 #[test]
 fn payment_iou_globally_frozen() {

@@ -255,6 +255,9 @@ pub fn do_payment<V: ledger::ApplyView>(
             default_paths_allowed,
             limit_quality,
             is_ledger_open: view.open(),
+            domain_id: sttx
+                .is_field_present(sf("sfDomainID"))
+                .then(|| sttx.get_field_h256(sf("sfDomainID"))),
         };
 
         let paths = if has_paths {

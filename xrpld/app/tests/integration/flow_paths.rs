@@ -1164,7 +1164,7 @@ fn fp4_issuer_to_20() {
     let mut entries = vec![account_root(gw, 20_000_000_000, 0, 0)];
     for i in 0x41u8..=0x54 {
         entries.push(account_root(acct(i), 5_000_000_000, 1, 0));
-        entries.push(trust_line(acct(i), gw, usd_currency(), 0, 10000, 0));
+        entries.push(trust_line(gw, acct(i), usd_currency(), 0, 0, 10000));
     }
     let l = build_ledger(entries);
     let mut v = new_view(l);
@@ -1434,7 +1434,7 @@ fn fp5_issuer_to_50() {
     let mut entries = vec![account_root(gw, 50_000_000_000, 0, 0)];
     for i in 0x41u8..=0x72 {
         entries.push(account_root(acct(i), 5_000_000_000, 1, 0));
-        entries.push(trust_line(acct(i), gw, usd_currency(), 0, 10000, 0));
+        entries.push(trust_line(gw, acct(i), usd_currency(), 0, 0, 10000));
     }
     let l = build_ledger(entries);
     let mut v = new_view(l);
@@ -1527,7 +1527,7 @@ fn fp6_issuer_to_100() {
     let mut entries = vec![account_root(gw, 90_000_000_000, 0, 0)];
     for i in 0x41u8..=0x72 {
         entries.push(account_root(acct(i), 5_000_000_000, 1, 0));
-        entries.push(trust_line(acct(i), gw, usd_currency(), 0, 10000, 0));
+        entries.push(trust_line(gw, acct(i), usd_currency(), 0, 0, 10000));
     }
     let l = build_ledger(entries);
     let mut v = new_view(l);
@@ -1672,7 +1672,7 @@ fn fp7_issuer_to_200() {
     let mut entries = vec![account_root(gw, 90_000_000_000, 0, 0)];
     for i in 0x41u8..=0xA4 {
         entries.push(account_root(acct(i), 5_000_000_000, 1, 0));
-        entries.push(trust_line(acct(i), gw, usd_currency(), 0, 10000, 0));
+        entries.push(trust_line(gw, acct(i), usd_currency(), 0, 0, 10000));
     }
     let l = build_ledger(entries);
     let mut v = new_view(l);

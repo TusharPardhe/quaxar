@@ -2402,7 +2402,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         TxType::VAULT_WITHDRAW => crate::state::vault::apply_vault_withdraw(view, sttx),
         TxType::VAULT_CLAWBACK => crate::state::vault::apply_vault_clawback(view, sttx),
         TxType::BATCH => {
-            if !view.rules().enabled(&protocol::feature_id("Batch")) {
+            if !view.rules().enabled(&protocol::feature_id("BatchV1_1")) {
                 return Ter::TEM_DISABLED;
             }
             crate::state::batch::apply_batch(view, sttx)
@@ -4212,7 +4212,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     limit_override = Some((*line.key(), limit_field, saved_limit));
                 }
                 let paths = protocol::STPathSet::new(sf("sfPaths"));
-                let (strand_ter, strands) = ledger::flow_engine::strand_builder::to_strands(
+                let (strand_ter, strands) = ledger::flow_engine::strand_builder::to_strands_checked(
+                    view,
                     &source,
                     &destination,
                     &flow_deliver.asset(),
@@ -5172,59 +5173,6 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 }
                 let lp_total = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
                 let lp_issue = lp_total.issue();
-                if sttx.get_flags() & protocol::WITHDRAW_SUB_TX_FLAGS == 0
-                    && (matches!(asset1, Asset::MPTIssue(_))
-                        || matches!(asset2, Asset::MPTIssue(_)))
-                    && let Some(lp_tokens_in) = lp_token_in.clone()
-                {
-                    let mpt_pool = amm_sle.get_field_amount(sf("sfAmount"));
-                    let asset_out = if lp_total.signum() > 0 {
-                        mpt_pool
-                            .multiply(&lp_tokens_in, mpt_pool.asset())
-                            .divide(&lp_total, mpt_pool.asset())
-                    } else {
-                        mpt_pool.zeroed()
-                    };
-                    if let Asset::MPTIssue(_) = asset_out.asset() {
-                        let withdraw_result =
-                            amm_withdraw_asset(view, &amm_account, &account, &asset_out);
-                        if withdraw_result != Ter::TES_SUCCESS {
-                            return withdraw_result;
-                        }
-                    }
-                    let redeem_result = crate::state::amm_bid_apply::redeem_iou_pub(
-                        view,
-                        &account,
-                        &lp_tokens_in,
-                        &lp_issue,
-                    );
-                    if redeem_result != Ter::TES_SUCCESS {
-                        return redeem_result;
-                    }
-                    let new_lp_token_balance = lp_total - lp_tokens_in;
-                    let pool_is_empty = new_lp_token_balance.signum() == 0;
-                    if pool_is_empty {
-                        let delete_result = delete_amm_account(view, &amm_sle);
-                        if delete_result == Ter::TES_SUCCESS {
-                            return Ter::TES_SUCCESS;
-                        }
-                        if delete_result != Ter::TEC_INCOMPLETE {
-                            return delete_result;
-                        }
-                    }
-                    let mut obj = amm_sle.clone_as_object();
-                    obj.set_field_amount(sf("sfLPTokenBalance"), new_lp_token_balance);
-                    if view
-                        .update(Arc::new(STLedgerEntry::from_stobject(obj, *amm_sle.key())))
-                        .is_err()
-                    {
-                        return Ter::TEF_BAD_LEDGER;
-                    }
-                    // AMMWithdraw::deleteAMMAccountIfEmpty absorbs
-                    // tecINCOMPLETE: the withdrawal succeeds while the
-                    // zero-balance AMM remains for bounded cleanup later.
-                    return Ter::TES_SUCCESS;
-                }
                 let Some(account_lp_tokens) =
                     amm_lp_holds_in_view(view, &amm_sle, account).ok().flatten()
                 else {
@@ -6195,6 +6143,20 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
 
         // --- DID ---
         TxType::DID_SET => {
+            let did_preflight = tx::run_did_set_preflight(tx::DidSetPreflightFacts {
+                uri_len: sttx
+                    .is_field_present(sf("sfURI"))
+                    .then(|| sttx.get_field_vl(sf("sfURI")).len()),
+                did_document_len: sttx
+                    .is_field_present(sf("sfDIDDocument"))
+                    .then(|| sttx.get_field_vl(sf("sfDIDDocument")).len()),
+                data_len: sttx
+                    .is_field_present(sf("sfData"))
+                    .then(|| sttx.get_field_vl(sf("sfData")).len()),
+            });
+            if did_preflight != Ter::TES_SUCCESS {
+                return did_preflight;
+            }
             let account = sttx.get_account_id(sf("sfAccount"));
             let did_keylet = protocol::did_keylet(Uint160::from_void(account.data()));
             let existing = view.peek(did_keylet).ok().flatten();
@@ -6235,6 +6197,15 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 return Ter::TEC_EMPTY_DID;
             }
             if is_new {
+                let account_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
+                let Ok(Some(acct)) = view.peek(account_keylet) else {
+                    return Ter::TEF_INTERNAL;
+                };
+                let balance = acct.get_field_amount(sf("sfBalance")).xrp().drops();
+                let owner_count = acct.get_field_u32(sf("sfOwnerCount"));
+                if balance < view.fees().account_reserve(owner_count as usize + 1) as i64 {
+                    return Ter::TEC_INSUFFICIENT_RESERVE;
+                }
                 let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
                 match ledger::dir_insert(
                     view,
@@ -6249,11 +6220,6 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 if view.insert(Arc::new(sle)).is_err() {
                     return Ter::TEF_BAD_LEDGER;
                 }
-                let Ok(Some(acct)) =
-                    view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
-                else {
-                    return Ter::TEF_BAD_LEDGER;
-                };
                 if ledger::adjust_owner_count(view, &acct, 1).is_err() {
                     return Ter::TEF_BAD_LEDGER;
                 }

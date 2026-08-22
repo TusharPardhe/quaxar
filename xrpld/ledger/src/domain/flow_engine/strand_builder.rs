@@ -1,6 +1,9 @@
 use super::{StepKind, Strand};
+use crate::ApplyView;
 use basics::base_uint::Uint256;
-use protocol::{AccountID, Asset, Issue, STPath, STPathSet, Ter, xrp_issue};
+use protocol::{
+    AccountID, Asset, Issue, STPath, STPathSet, Ter, get_field_by_symbol as sf, xrp_issue,
+};
 
 pub fn to_strand(
     src: &AccountID,
@@ -258,6 +261,101 @@ pub fn to_strands(
     )
 }
 
+/// Ledger-aware counterpart to [`to_strands`].  rippled validates each Step
+/// while constructing its candidate strand; consequently a bad explicit path
+/// is discarded without poisoning other valid paths, while its TER is retained
+/// when no candidate survives.  Keep structural-only construction available
+/// for unit tests, but all transaction paths must use this checked entry point.
+pub fn to_strands_checked<V: ApplyView>(
+    view: &mut V,
+    src: &AccountID,
+    dst: &AccountID,
+    deliver: &Asset,
+    send_max_asset: Option<&Asset>,
+    paths: &STPathSet,
+    default_paths_allowed: bool,
+    owner_pays_transfer_fee: bool,
+    offer_crossing: bool,
+) -> (Ter, Vec<Strand>) {
+    to_strands_checked_with_domain(
+        view,
+        src,
+        dst,
+        deliver,
+        send_max_asset,
+        paths,
+        default_paths_allowed,
+        owner_pays_transfer_fee,
+        offer_crossing,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn to_strands_checked_with_domain<V: ApplyView>(
+    view: &mut V,
+    src: &AccountID,
+    dst: &AccountID,
+    deliver: &Asset,
+    send_max_asset: Option<&Asset>,
+    paths: &STPathSet,
+    default_paths_allowed: bool,
+    owner_pays_transfer_fee: bool,
+    offer_crossing: bool,
+    domain: Option<Uint256>,
+) -> (Ter, Vec<Strand>) {
+    let mut result = Vec::with_capacity(1 + paths.size());
+
+    let mut try_insert = |path: &STPath| -> Ter {
+        let (ter, strand) = to_strand_with_domain(
+            src,
+            dst,
+            deliver,
+            send_max_asset,
+            path,
+            owner_pays_transfer_fee,
+            offer_crossing,
+            domain,
+        );
+        if ter != Ter::TES_SUCCESS {
+            return ter;
+        }
+        if strand.is_empty() {
+            return Ter::TEF_EXCEPTION;
+        }
+        let ter = validate_strand(view, &strand, src, dst, *deliver, offer_crossing);
+        if ter == Ter::TES_SUCCESS && !result.contains(&strand) {
+            result.push(strand);
+        }
+        ter
+    };
+
+    if default_paths_allowed {
+        let ter = try_insert(&STPath::new());
+        if ter != Ter::TES_SUCCESS && (protocol::is_tem_malformed(ter) || paths.size() == 0) {
+            return (ter, Vec::new());
+        }
+    } else if paths.size() == 0 {
+        return (Ter::TEM_RIPPLE_EMPTY, Vec::new());
+    }
+
+    let mut last_fail_ter = Ter::TES_SUCCESS;
+    for path in paths.iter() {
+        let ter = try_insert(path);
+        if ter != Ter::TES_SUCCESS {
+            last_fail_ter = ter;
+            if protocol::is_tem_malformed(ter) {
+                return (ter, Vec::new());
+            }
+        }
+    }
+
+    if result.is_empty() {
+        return (last_fail_ter, result);
+    }
+    (Ter::TES_SUCCESS, result)
+}
+
 pub fn to_strands_with_domain(
     src: &AccountID,
     dst: &AccountID,
@@ -284,12 +382,16 @@ pub fn to_strands_with_domain(
             domain,
         );
         if ter == Ter::TES_SUCCESS && !strand.is_empty() {
-            result.push(strand);
-        } else if ter != Ter::TES_SUCCESS && paths.size() == 0 {
+            if !result.contains(&strand) {
+                result.push(strand);
+            }
+        } else if ter != Ter::TES_SUCCESS && (protocol::is_tem_malformed(ter) || paths.size() == 0)
+        {
             return (ter, Vec::new());
         }
     }
 
+    let mut last_fail_ter = Ter::TES_SUCCESS;
     for path in paths.iter() {
         let (ter, strand) = to_strand_with_domain(
             src,
@@ -302,7 +404,14 @@ pub fn to_strands_with_domain(
             domain,
         );
         if ter == Ter::TES_SUCCESS && !strand.is_empty() {
-            result.push(strand);
+            if !result.contains(&strand) {
+                result.push(strand);
+            }
+        } else if ter != Ter::TES_SUCCESS {
+            last_fail_ter = ter;
+            if protocol::is_tem_malformed(ter) {
+                return (ter, Vec::new());
+            }
         }
     }
 
@@ -310,7 +419,511 @@ pub fn to_strands_with_domain(
         return (Ter::TEM_RIPPLE_EMPTY, Vec::new());
     }
 
+    if result.is_empty() {
+        return (last_fail_ter, result);
+    }
+
     (Ter::TES_SUCCESS, result)
+}
+
+fn read_sle<V: ApplyView>(
+    view: &mut V,
+    keylet: protocol::Keylet,
+) -> Result<Option<std::sync::Arc<protocol::STLedgerEntry>>, Ter> {
+    view.read(keylet).map_err(|_| Ter::TEF_BAD_LEDGER)
+}
+
+fn asset_frozen_for<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    asset: Asset,
+) -> Result<bool, Ter> {
+    match asset {
+        Asset::Issue(issue) => Ok(!issue.native()
+            && crate::domain::ripple_state_helpers::is_frozen(view, account, &issue)),
+        Asset::MPTIssue(issue) => {
+            crate::domain::mptoken_helpers::is_frozen_mpt(view, account, &issue)
+                .map_err(|_| Ter::TEF_BAD_LEDGER)
+        }
+    }
+}
+
+fn check_direct_freeze<V: ApplyView>(
+    view: &mut V,
+    src: &AccountID,
+    dst: &AccountID,
+    currency: protocol::Currency,
+) -> Ter {
+    let dst_root = match read_sle(
+        view,
+        protocol::account_keylet(basics::base_uint::Uint160::from_void(dst.data())),
+    ) {
+        Ok(root) => root,
+        Err(ter) => return ter,
+    };
+    if dst_root
+        .as_ref()
+        .is_some_and(|root| root.is_flag(protocol::lsfGlobalFreeze))
+    {
+        return Ter::TER_NO_LINE;
+    }
+
+    let line = match read_sle(view, protocol::line(*src, *dst, currency)) {
+        Ok(line) => line,
+        Err(ter) => return ter,
+    };
+    if line.as_ref().is_some_and(|line| {
+        let destination_freeze = if dst > src {
+            protocol::lsfHighFreeze
+        } else {
+            protocol::lsfLowFreeze
+        };
+        line.is_flag(destination_freeze)
+            || line.is_flag(protocol::lsfHighDeepFreeze)
+            || line.is_flag(protocol::lsfLowDeepFreeze)
+    }) {
+        return Ter::TER_NO_LINE;
+    }
+
+    check_lp_token_freeze(view, src, dst_root.as_deref())
+}
+
+fn check_lp_token_freeze<V: ApplyView>(
+    view: &mut V,
+    src: &AccountID,
+    dst_root: Option<&protocol::STLedgerEntry>,
+) -> Ter {
+    if view
+        .rules()
+        .enabled(&protocol::feature_id("fixFrozenLPTokenTransfer"))
+        && let Some(dst_root) = dst_root
+        && dst_root.is_field_present(sf("sfAMMID"))
+    {
+        let amm = match read_sle(
+            view,
+            protocol::amm_keylet(dst_root.get_field_h256(sf("sfAMMID"))),
+        ) {
+            Ok(Some(amm)) => amm,
+            Ok(None) => return Ter::TEC_INTERNAL,
+            Err(ter) => return ter,
+        };
+        let asset = amm.get_field_issue(sf("sfAsset")).asset();
+        let asset2 = amm.get_field_issue(sf("sfAsset2")).asset();
+        match (
+            asset_frozen_for(view, src, asset),
+            asset_frozen_for(view, src, asset2),
+        ) {
+            (Ok(true), _) | (_, Ok(true)) => return Ter::TER_NO_LINE,
+            (Err(ter), _) | (_, Err(ter)) => return ter,
+            _ => {}
+        }
+    }
+    Ter::TES_SUCCESS
+}
+
+fn check_xrp_endpoint_freeze<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    is_last: bool,
+) -> Ter {
+    // checkFreeze(xrpAccount -> account) only has a real destination on the
+    // final endpoint.  The XRP trust-line lookup is structurally empty.
+    if !is_last {
+        return Ter::TES_SUCCESS;
+    }
+    let root = match read_sle(
+        view,
+        protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data())),
+    ) {
+        Ok(root) => root,
+        Err(ter) => return ter,
+    };
+    if root
+        .as_ref()
+        .is_some_and(|root| root.is_flag(protocol::lsfGlobalFreeze))
+    {
+        return Ter::TER_NO_LINE;
+    }
+    check_lp_token_freeze(view, &protocol::xrp_account(), root.as_deref())
+}
+
+fn direct_no_ripple_flag(account: &AccountID, other: &AccountID) -> u32 {
+    if account > other {
+        protocol::lsfHighNoRipple
+    } else {
+        protocol::lsfLowNoRipple
+    }
+}
+
+fn check_consecutive_direct_no_ripple<V: ApplyView>(
+    view: &mut V,
+    prev: &AccountID,
+    cur: &AccountID,
+    next: &AccountID,
+    currency: protocol::Currency,
+) -> Ter {
+    let inbound = match read_sle(view, protocol::line(*prev, *cur, currency)) {
+        Ok(Some(line)) => line,
+        Ok(None) => return Ter::TER_NO_LINE,
+        Err(ter) => return ter,
+    };
+    let outbound = match read_sle(view, protocol::line(*cur, *next, currency)) {
+        Ok(Some(line)) => line,
+        Ok(None) => return Ter::TER_NO_LINE,
+        Err(ter) => return ter,
+    };
+    if inbound.is_flag(direct_no_ripple_flag(cur, prev))
+        && outbound.is_flag(direct_no_ripple_flag(cur, next))
+    {
+        Ter::TER_NO_RIPPLE
+    } else {
+        Ter::TES_SUCCESS
+    }
+}
+
+/// Validate the ledger-dependent parts of rippled's Step constructors.
+/// This deliberately runs once per candidate strand, before `toStrands`
+/// decides whether another candidate can survive its TER.
+fn validate_strand<V: ApplyView>(
+    view: &mut V,
+    strand: &Strand,
+    strand_src: &AccountID,
+    strand_dst: &AccountID,
+    strand_deliver: Asset,
+    offer_crossing: bool,
+) -> Ter {
+    let mut seen_direct_src = Vec::<Asset>::new();
+    let mut seen_direct_dst = Vec::<Asset>::new();
+    let mut seen_book_outs = Vec::<Asset>::new();
+
+    for (index, step) in strand.iter().enumerate() {
+        match step {
+            StepKind::Book {
+                book_in, book_out, ..
+            } => {
+                if !protocol::is_consistent_book(protocol::Book::new(*book_in, *book_out, None)) {
+                    return Ter::TEM_BAD_PATH;
+                }
+                if seen_book_outs.contains(book_out)
+                    || seen_direct_src.contains(book_out)
+                    || seen_direct_dst.contains(book_out)
+                {
+                    return Ter::TEM_BAD_PATH_LOOP;
+                }
+
+                for asset in [book_in, book_out] {
+                    let issuer = asset.issuer();
+                    if !issuer.is_zero() {
+                        match read_sle(
+                            view,
+                            protocol::account_keylet(basics::base_uint::Uint160::from_void(
+                                issuer.data(),
+                            )),
+                        ) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => return Ter::TEC_NO_ISSUER,
+                            Err(ter) => return ter,
+                        }
+                    }
+                }
+
+                if let Some(StepKind::Direct {
+                    src: prev_src,
+                    currency: prev_currency,
+                    ..
+                }) = index.checked_sub(1).and_then(|i| strand.get(i))
+                    && let Asset::Issue(in_issue) = book_in
+                    && in_issue.currency == *prev_currency
+                {
+                    let line = match read_sle(
+                        view,
+                        protocol::line(*prev_src, in_issue.account, in_issue.currency),
+                    ) {
+                        Ok(Some(line)) => line,
+                        Ok(None) => return Ter::TER_NO_LINE,
+                        Err(ter) => return ter,
+                    };
+                    if line.is_flag(direct_no_ripple_flag(&in_issue.account, prev_src)) {
+                        return Ter::TER_NO_RIPPLE;
+                    }
+                }
+
+                for asset in [book_in, book_out] {
+                    match crate::domain::mptoken_helpers::can_trade(view, asset) {
+                        Ok(Ter::TES_SUCCESS) => {}
+                        Ok(ter) => return ter,
+                        Err(_) => return Ter::TEF_BAD_LEDGER,
+                    }
+                }
+                seen_book_outs.push(*book_out);
+            }
+            StepKind::Direct { src, dst, currency } => {
+                if src.is_zero() || dst.is_zero() || src == dst {
+                    return Ter::TEM_BAD_PATH;
+                }
+                let src_root = match read_sle(
+                    view,
+                    protocol::account_keylet(basics::base_uint::Uint160::from_void(src.data())),
+                ) {
+                    Ok(Some(root)) => root,
+                    Ok(None) => return Ter::TER_NO_ACCOUNT,
+                    Err(ter) => return ter,
+                };
+
+                if strand.len() != 1 {
+                    let ter = check_direct_freeze(view, src, dst, *currency);
+                    if ter != Ter::TES_SUCCESS {
+                        return ter;
+                    }
+                }
+
+                if let Some(StepKind::Direct {
+                    src: prev_src,
+                    dst: prev_dst,
+                    currency: prev_currency,
+                }) = index.checked_sub(1).and_then(|i| strand.get(i))
+                    && prev_dst == src
+                    && prev_currency == currency
+                {
+                    let ter =
+                        check_consecutive_direct_no_ripple(view, prev_src, src, dst, *currency);
+                    if ter != Ter::TES_SUCCESS {
+                        return ter;
+                    }
+                }
+
+                let src_issue = Asset::Issue(Issue::new(*currency, *src));
+                let dst_issue = Asset::Issue(Issue::new(*currency, *dst));
+                if seen_book_outs.contains(&src_issue)
+                    && !matches!(strand.get(index.wrapping_sub(1)), Some(StepKind::Book { book_out, .. }) if *book_out == src_issue)
+                {
+                    return Ter::TEM_BAD_PATH_LOOP;
+                }
+                if seen_direct_src.contains(&src_issue) || seen_direct_dst.contains(&dst_issue) {
+                    return Ter::TEM_BAD_PATH_LOOP;
+                }
+                seen_direct_src.push(src_issue);
+                seen_direct_dst.push(dst_issue);
+
+                if !offer_crossing {
+                    let line = match read_sle(view, protocol::line(*src, *dst, *currency)) {
+                        Ok(Some(line)) => line,
+                        Ok(None) => return Ter::TER_NO_LINE,
+                        Err(ter) => return ter,
+                    };
+                    let auth_flag = if src > dst {
+                        protocol::lsfHighAuth
+                    } else {
+                        protocol::lsfLowAuth
+                    };
+                    if src_root.is_flag(protocol::lsfRequireAuth)
+                        && !line.is_flag(auth_flag)
+                        && line.get_field_amount(sf("sfBalance")).signum() == 0
+                    {
+                        return Ter::TER_NO_AUTH;
+                    }
+                    if matches!(
+                        index.checked_sub(1).and_then(|i| strand.get(i)),
+                        Some(StepKind::Book { .. })
+                    ) && line.is_flag(direct_no_ripple_flag(src, dst))
+                    {
+                        return Ter::TER_NO_RIPPLE;
+                    }
+
+                    let owed = crate::domain::ripple_state_helpers::credit_balance(
+                        view, dst, src, *currency,
+                    );
+                    let limit_field = if dst < src {
+                        sf("sfLowLimit")
+                    } else {
+                        sf("sfHighLimit")
+                    };
+                    let limit = line.get_field_amount(limit_field);
+                    if owed.signum() <= 0 && -owed.iou() >= limit.iou() {
+                        return Ter::TEC_PATH_DRY;
+                    }
+                }
+            }
+            StepKind::XrpEndpoint { account, is_last } => {
+                if account.is_zero() {
+                    return Ter::TEM_BAD_PATH;
+                }
+                match read_sle(
+                    view,
+                    protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data())),
+                ) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ter::TER_NO_ACCOUNT,
+                    Err(ter) => return ter,
+                }
+                let is_first = index == 0;
+                let is_final = index + 1 == strand.len();
+                if !is_first && !is_final {
+                    return Ter::TEM_BAD_PATH;
+                }
+                let ter = check_xrp_endpoint_freeze(view, account, *is_last);
+                if ter != Ter::TES_SUCCESS {
+                    return ter;
+                }
+                let xrp = Asset::Issue(xrp_issue());
+                let seen = if *is_last {
+                    &mut seen_direct_src
+                } else {
+                    &mut seen_direct_dst
+                };
+                if seen.contains(&xrp) {
+                    return Ter::TEM_BAD_PATH_LOOP;
+                }
+                seen.push(xrp);
+            }
+            StepKind::MptEndpoint {
+                src, dst, issue, ..
+            } => {
+                let actual_first = index == 0;
+                let actual_last = index + 1 == strand.len();
+                if src.is_zero() || dst.is_zero() || src == dst {
+                    return Ter::TEM_BAD_PATH;
+                }
+                match read_sle(
+                    view,
+                    protocol::account_keylet(basics::base_uint::Uint160::from_void(src.data())),
+                ) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ter::TER_NO_ACCOUNT,
+                    Err(ter) => return ter,
+                }
+
+                if !(actual_first && actual_last) {
+                    let account = if actual_first { src } else { dst };
+                    let globally_frozen = if actual_first {
+                        match crate::domain::mptoken_helpers::is_global_frozen_mpt(view, issue) {
+                            Ok(frozen) => frozen,
+                            Err(_) => return Ter::TEF_BAD_LEDGER,
+                        }
+                    } else {
+                        false
+                    };
+                    let individually_frozen =
+                        match crate::domain::mptoken_helpers::is_individual_frozen_mpt(
+                            view, account, issue,
+                        ) {
+                            Ok(frozen) => frozen,
+                            Err(_) => return Ter::TEF_BAD_LEDGER,
+                        };
+                    if globally_frozen || individually_frozen {
+                        return Ter::TER_LOCKED;
+                    }
+                }
+
+                let mpt_asset = Asset::MPTIssue(*issue);
+                if seen_book_outs.contains(&mpt_asset)
+                    && !matches!(index.checked_sub(1).and_then(|i| strand.get(i)), Some(StepKind::Book { book_out, .. }) if *book_out == mpt_asset)
+                {
+                    return Ter::TEM_BAD_PATH_LOOP;
+                }
+                let seen = if actual_first {
+                    &mut seen_direct_src
+                } else {
+                    &mut seen_direct_dst
+                };
+                if seen.contains(&mpt_asset) {
+                    return Ter::TEM_BAD_PATH_LOOP;
+                }
+                seen.push(mpt_asset);
+
+                if !actual_first && !actual_last {
+                    return Ter::TEM_BAD_PATH;
+                }
+                let issuer = issue.issuer();
+                if (*src != issuer) == (*dst != issuer) {
+                    return Ter::TEM_BAD_PATH;
+                }
+
+                if !offer_crossing {
+                    for account in [src, dst] {
+                        if *account != issuer {
+                            // C++ MPTEndpointPaymentStep uses requireAuth's
+                            // default Legacy mode.  For MPTs, Legacy and
+                            // Strong both require an MPToken object; Weak is
+                            // reserved for operations which may create one.
+                            match crate::domain::mptoken_helpers::require_auth_mpt_with_type(
+                                view,
+                                issue,
+                                account,
+                                crate::domain::mptoken_helpers::MPTAuthType::Strong,
+                            ) {
+                                Ok(Ter::TES_SUCCESS) => {}
+                                Ok(ter) => return ter,
+                                Err(_) => return Ter::TEF_BAD_LEDGER,
+                            }
+                        }
+                    }
+
+                    let direct_mpt = mpt_asset == strand_deliver
+                        && (actual_first
+                            || !matches!(
+                                index.checked_sub(1).and_then(|i| strand.get(i)),
+                                Some(StepKind::Book { .. })
+                            ));
+                    if direct_mpt {
+                        let between_holders = *strand_src != issuer && *strand_dst != issuer;
+                        if between_holders {
+                            let holder = if actual_first { src } else { dst };
+                            let frozen = match crate::domain::mptoken_helpers::is_frozen_mpt(
+                                view, holder, issue,
+                            ) {
+                                Ok(frozen) => frozen,
+                                Err(_) => return Ter::TEF_BAD_LEDGER,
+                            };
+                            if frozen {
+                                return Ter::TEC_LOCKED;
+                            }
+                            match crate::domain::mptoken_helpers::can_transfer_mpt(
+                                view, issue, holder, strand_dst,
+                            ) {
+                                Ok(Ter::TES_SUCCESS) => {}
+                                Ok(ter) => return ter,
+                                Err(_) => return Ter::TEF_BAD_LEDGER,
+                            }
+                        }
+                    } else {
+                        match crate::domain::mptoken_helpers::can_trade(view, &mpt_asset) {
+                            Ok(Ter::TES_SUCCESS) => {}
+                            Ok(ter) => return ter,
+                            Err(_) => return Ter::TEF_BAD_LEDGER,
+                        }
+                    }
+
+                    if index == 0 {
+                        let funds = if *src == issuer {
+                            crate::domain::mptoken_helpers::issuer_funds_to_self_issue(view, issue)
+                                .map_err(|_| Ter::TEF_BAD_LEDGER)
+                                .map(|amount| amount.mpt().value())
+                        } else {
+                            read_sle(
+                                view,
+                                protocol::mptoken_keylet_from_mptid(
+                                    issue.mpt_id(),
+                                    basics::base_uint::Uint160::from_void(src.data()),
+                                ),
+                            )
+                            .map(|token| {
+                                token.map_or(0, |token| {
+                                    token.get_field_u64(sf("sfMPTAmount")) as i64
+                                })
+                            })
+                        };
+                        match funds {
+                            Ok(value) if value > 0 => {}
+                            Ok(_) => return Ter::TEC_PATH_DRY,
+                            Err(ter) => return ter,
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ter::TES_SUCCESS
 }
 
 /// Return the protocol's sole canonical issue for XRP while preserving the

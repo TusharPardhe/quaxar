@@ -1889,7 +1889,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         value: 71,
         name: "Batch",
         delegable: "Delegation::notDelegable",
-        amendment: "featureBatch",
+        amendment: "featureBatchV1_1",
         privileges: "noPriv",
         field_specs: &[
             FormatFieldSpec {

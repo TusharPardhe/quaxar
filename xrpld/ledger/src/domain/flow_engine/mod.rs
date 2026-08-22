@@ -139,7 +139,7 @@ impl SelfCrossCancellation {
 }
 
 /// Step types that can appear in a strand.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepKind {
     Direct {
         src: AccountID,

@@ -899,14 +899,12 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
             } else {
                 0
             };
-            // Valid batch flags: tfAllOrNothing(1) | tfOnlyOne(2) | tfUntilFailure(4) | tfIndependent(8)
-            let valid = 0x0F;
+            let valid = protocol::BATCH_FLAGS;
             if flags & !valid != 0 {
                 return Ter::TEM_INVALID_FLAG;
             }
             // Can't have more than one mode flag
-            let mode_count =
-                (flags & 1) + ((flags >> 1) & 1) + ((flags >> 2) & 1) + ((flags >> 3) & 1);
+            let mode_count = (flags & valid).count_ones();
             if mode_count > 1 {
                 return Ter::TEM_INVALID_FLAG;
             }

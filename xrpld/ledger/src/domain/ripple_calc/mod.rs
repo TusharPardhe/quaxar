@@ -2,6 +2,7 @@
 
 mod builder;
 
+#[allow(dead_code)]
 mod selection;
 mod step;
 pub use step::OfferCrossing;
@@ -9,13 +10,13 @@ mod strand;
 
 use crate::read_view::ViewError;
 use crate::views::apply_view::ApplyView;
-use basics::base_uint::Uint160;
+use basics::base_uint::{Uint160, Uint256};
 use protocol::{
-    AccountID, Asset, STAmount, STLedgerEntry, STPathSet, Ter, get_field_by_symbol, is_tes_success,
+    AccountID, Amounts, Asset, Quality, STAmount, STLedgerEntry, STPathSet, Ter,
+    get_field_by_symbol, is_tes_success,
 };
 use std::sync::Arc;
 
-use self::selection::rank_explicit_strands;
 use self::strand::{build_explicit_strand, execute_direct_strand};
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,7 @@ pub struct RippleCalcInput {
     pub default_paths_allowed: bool,
     pub limit_quality: bool,
     pub is_ledger_open: bool,
+    pub domain_id: Option<Uint256>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +171,7 @@ fn handle_xrp_to_xrp_flow<V: ApplyView>(
     })
 }
 
+#[cfg(test)]
 fn preserves_partial_flow_result(ter: Ter, actual_amount_out: &STAmount) -> bool {
     ter == Ter::TEC_PATH_PARTIAL && actual_amount_out.signum() > 0
 }
@@ -220,10 +223,7 @@ pub fn ripple_calculate<V: ApplyView>(
         input,
     )?;
 
-    if is_tes_success(result.result) {
-        flow_sb.apply()?;
-    }
-    // On failure, flow_sb is dropped — all changes discarded
+    flow_sb.apply()?;
 
     Ok(result)
 }
@@ -239,9 +239,6 @@ fn ripple_calculate_inner<V: ApplyView>(
     paths: &STPathSet,
     input: &RippleCalcInput,
 ) -> Result<RippleCalcOutput, ViewError> {
-    let mut total_in = max_source_amount.zeroed();
-    let mut total_out = dst_amount.zeroed();
-
     if frozen_iou_endpoint(view, dst_amount, src_account, dst_account)
         || frozen_iou_endpoint(view, max_source_amount, src_account, dst_account)
     {
@@ -260,16 +257,19 @@ fn ripple_calculate_inner<V: ApplyView>(
         None
     };
 
-    let (strand_ter, strands) = crate::domain::flow_engine::strand_builder::to_strands(
-        src_account,
-        dst_account,
-        &deliver_asset,
-        send_max_asset.as_ref(),
-        paths,
-        input.default_paths_allowed,
-        false, // ownerPaysTransferFee = false for payments
-        false, // offerCrossing = false for payments
-    );
+    let (strand_ter, strands) =
+        crate::domain::flow_engine::strand_builder::to_strands_checked_with_domain(
+            view,
+            src_account,
+            dst_account,
+            &deliver_asset,
+            send_max_asset.as_ref(),
+            paths,
+            input.default_paths_allowed,
+            false, // ownerPaysTransferFee = false for payments
+            false, // offerCrossing = false for payments
+            input.domain_id,
+        );
 
     // `tfNoRippleDirect` with no explicit Paths makes Flow reject the
     // transaction as `temRIPPLE_EMPTY`. Do not fall through to the legacy
@@ -284,9 +284,13 @@ fn ripple_calculate_inner<V: ApplyView>(
     }
 
     if !strands.is_empty() {
-        // Flow engine runs in its own sandbox. If it fails, changes are discarded
-        // and the fallback runs on a clean view.
+        // Flow's aggregate value sandbox is applied only when execute_strands
+        // succeeds; failed Payment flows retain no tentative transfers.
         let mut engine_sb = crate::FlowSandbox::new(view);
+        let quality_threshold =
+            (input.limit_quality && max_source_amount.signum() > 0).then(|| {
+                Quality::from_amounts(&Amounts::new(max_source_amount.clone(), dst_amount.clone()))
+            });
         let flow_result = crate::domain::flow_engine::strand_flow::execute_strands(
             &mut engine_sb,
             &strands,
@@ -296,8 +300,8 @@ fn ripple_calculate_inner<V: ApplyView>(
             Some(max_source_amount),
             src_account,
             dst_account,
-            None, // payments have no quality threshold
-            None, // payments never cancel self offers
+            quality_threshold,
+            None, // Payment ignores Flow's removable-offer collection.
         );
 
         static FLOW_RESULT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -313,212 +317,19 @@ fn ripple_calculate_inner<V: ApplyView>(
             );
         }
 
-        if is_tes_success(flow_result.ter) && flow_result.actual_out.signum() > 0 {
-            // Apply flow engine changes to the view
-            let _ = engine_sb.apply();
-            return Ok(RippleCalcOutput {
-                result: flow_result.ter,
-                actual_amount_in: flow_result.actual_in,
-                actual_amount_out: flow_result.actual_out,
-            });
-        }
-        if preserves_partial_flow_result(flow_result.ter, &flow_result.actual_out) {
-            // A non-partial Payment must return the engine's partial result
-            // while dropping its sandbox. Falling through loses the discovered
-            // liquidity and can incorrectly reclassify it as tecPATH_DRY.
-            return Ok(RippleCalcOutput {
-                result: flow_result.ter,
-                actual_amount_in: flow_result.actual_in,
-                actual_amount_out: flow_result.actual_out,
-            });
-        }
-        // Flow engine found strands but delivered nothing.
-        // When default paths are NOT allowed (tfNoRippleDirect), the fallback
-        // would use the default path which is forbidden — return TEC_PATH_DRY.
-        // When default paths ARE allowed, let the fallback try (it may find
-        // liquidity through a different code path).
-        if !input.default_paths_allowed {
-            return Ok(RippleCalcOutput {
-                result: Ter::TEC_PATH_DRY,
-                actual_amount_in: max_source_amount.zeroed(),
-                actual_amount_out: dst_amount.zeroed(),
-            });
-        }
-        // Flow engine failed — engine_sb is dropped, view unchanged
+        engine_sb.apply()?;
+        return Ok(RippleCalcOutput {
+            result: flow_result.ter,
+            actual_amount_in: flow_result.actual_in,
+            actual_amount_out: flow_result.actual_out,
+        });
     }
 
-    // Fallback to existing simplified paths if flow engine didn't produce results.
-    // WARNING: This fallback may produce different results from reference. It should
-    // only fire for edge cases that to_strand doesn't handle yet.
-    static FALLBACK_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if FALLBACK_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
-        tracing::debug!(target: "ledger",            "[ripple_calc_FALLBACK] flow engine failed, using fallback. src_native={} dst_native={} paths={}",
-            max_source_amount.native(),
-            dst_amount.native(),
-            paths.size(),
-        );
-    }
-
-    // 1. Try default path
-    if input.default_paths_allowed
-        && let Ok(Some(res)) = try_default_path(
-            view,
-            max_source_amount,
-            dst_amount,
-            dst_account,
-            src_account,
-            input,
-        )
-        && res.result == Ter::TES_SUCCESS
-    {
-        total_in += res.actual_amount_in.clone();
-        total_out += res.actual_amount_out.clone();
-        if total_out >= *dst_amount && !input.partial_payment_allowed {
-            return Ok(res);
-        }
-    }
-
-    // 2. Try explicit paths using deterministic strand ranking.
-    let mut explicit_strands = paths
-        .iter()
-        .enumerate()
-        .filter_map(|(path_index, path)| {
-            build_explicit_strand(
-                path_index,
-                src_account,
-                dst_account,
-                max_source_amount,
-                dst_amount,
-                path,
-            )
-        })
-        .collect::<Vec<_>>();
-
-    // BookStep strands. Our build_explicit_strand only handles same-currency IOU paths.
-    // For cross-currency explicit paths, use the cross-currency path functions which
-    // match reference toStrand's BookStep strand building.
-    // Only use the default path if default_paths_allowed (i.e. tfNoRippleDirect is NOT set).
-    if explicit_strands.is_empty()
-        && paths.size() > 0
-        && total_out.signum() <= 0
-        && input.default_paths_allowed
-    {
-        if max_source_amount.native() && !dst_amount.native() {
-            if let Ok(Some(res)) = try_xrp_to_iou_default_path(
-                view,
-                max_source_amount,
-                dst_amount,
-                dst_account,
-                src_account,
-                input,
-            ) && res.result == Ter::TES_SUCCESS
-            {
-                total_in += res.actual_amount_in.clone();
-                total_out += res.actual_amount_out.clone();
-            }
-        } else if !max_source_amount.native()
-            && dst_amount.native()
-            && let Ok(Some(res)) = try_iou_to_xrp_default_path(
-                view,
-                max_source_amount,
-                dst_amount,
-                dst_account,
-                src_account,
-                input,
-            )
-            && res.result == Ter::TES_SUCCESS
-        {
-            total_in += res.actual_amount_in.clone();
-            total_out += res.actual_amount_out.clone();
-        }
-    }
-
-    const MAX_TRIES: usize = 1000;
-    let mut cur_try: usize = 0;
-
-    while !explicit_strands.is_empty() {
-        if total_out >= *dst_amount && !input.partial_payment_allowed {
-            break;
-        }
-        cur_try += 1;
-        if cur_try >= MAX_TRIES {
-            break;
-        }
-
-        let remaining_out = dst_amount.clone() - total_out.clone();
-        let remaining_in = max_source_amount.clone() - total_in.clone();
-        let ranked = rank_explicit_strands(
-            view,
-            &explicit_strands,
-            &remaining_in,
-            &remaining_out,
-            input,
-        )?;
-        if ranked.is_empty() {
-            break;
-        }
-
-        let mut applied = false;
-        for ranked_strand in ranked {
-            let Some(position) = explicit_strands
-                .iter()
-                .position(|strand| strand.path_index == ranked_strand.path_index)
-            else {
-                continue;
-            };
-
-            let path = explicit_strands[position].path.clone();
-
-            // In a real implementation, SnapshotReadView would be used for sandboxing
-            // For now, use the view directly with sub-view if supported
-            if let Some(res) = try_explicit_path(
-                view,
-                &remaining_in,
-                &remaining_out,
-                dst_account,
-                src_account,
-                &path,
-                input,
-            )? && is_tes_success(res.result)
-            {
-                total_in += res.actual_amount_in.clone();
-                total_out += res.actual_amount_out.clone();
-                applied = true;
-            }
-
-            explicit_strands.remove(position);
-            if applied {
-                break;
-            }
-        }
-
-        if !applied {
-            break;
-        }
-    }
-
-    if total_out.signum() > 0 {
-        Ok(RippleCalcOutput {
-            result: Ter::TES_SUCCESS,
-            actual_amount_in: total_in,
-            actual_amount_out: total_out,
-        })
-    } else {
-        // tecPATH_DRY is for when the path is structurally dry (no liquidity at all).
-        // tecPATH_PARTIAL is for when the path has some structure but can't deliver the full amount.
-        // The payment transactor maps terRetry → tecPATH_DRY, so we use PATH_PARTIAL here
-        // to match reference behavior when the flow engine found strands but delivered nothing.
-        let result = if input.partial_payment_allowed {
-            Ter::TEC_PATH_DRY
-        } else {
-            Ter::TEC_PATH_PARTIAL
-        };
-        Ok(RippleCalcOutput {
-            result,
-            actual_amount_in: total_in,
-            actual_amount_out: total_out,
-        })
-    }
+    Ok(RippleCalcOutput {
+        result: Ter::TEC_PATH_DRY,
+        actual_amount_in: max_source_amount.zeroed(),
+        actual_amount_out: dst_amount.zeroed(),
+    })
 }
 
 fn frozen_iou_endpoint<V: ApplyView>(
@@ -539,6 +350,7 @@ fn frozen_iou_endpoint<V: ApplyView>(
         || crate::domain::ripple_state_helpers::is_frozen(view, dst_account, &issue)
 }
 
+#[allow(dead_code)]
 fn try_default_path<V: ApplyView>(
     view: &mut V,
     max_source_amount: &STAmount,
@@ -743,6 +555,7 @@ fn try_default_path<V: ApplyView>(
 }
 
 /// XRP→IOU default path: source sends XRP, crosses XRP/IOU order book, delivers IOU.
+#[allow(dead_code)]
 fn try_xrp_to_iou_default_path<V: ApplyView>(
     view: &mut V,
     max_source_amount: &STAmount,
@@ -817,6 +630,7 @@ fn try_xrp_to_iou_default_path<V: ApplyView>(
 }
 
 /// IOU→XRP default path: source sends IOU, crosses IOU/XRP order book, delivers XRP.
+#[allow(dead_code)]
 fn try_iou_to_xrp_default_path<V: ApplyView>(
     view: &mut V,
     max_source_amount: &STAmount,
@@ -962,6 +776,7 @@ fn credit_trust_line<V: ApplyView>(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn try_explicit_path<V: ApplyView>(
     view: &mut V,
     max_source_amount: &STAmount,

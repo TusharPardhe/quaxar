@@ -282,7 +282,8 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         // Build typed Issue/MPT strands for crossing (rippled toStrands with
         // offerCrossing=true).  Keeping the exact Asset here is consensus
         // critical: treating an MPT as XRP selects a different book key.
-        let (_, strands) = ledger::flow_engine::strand_builder::to_strands_with_domain(
+        let (_, strands) = ledger::flow_engine::strand_builder::to_strands_checked_with_domain(
+            view,
             &account,
             &account, // src == dst for offer crossing
             &deliver_asset,

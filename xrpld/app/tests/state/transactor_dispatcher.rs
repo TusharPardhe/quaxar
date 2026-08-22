@@ -7337,7 +7337,7 @@ fn delegate_set_delete_removes_existing_delegate() {
 fn batch_dispatch_returns_success_when_batch_feature_is_enabled() {
     let account = sample_account(0x61);
     let mut ledger = empty_ledger(vec![account_root(account, 0, 0)]);
-    ledger.set_rules(protocol::Rules::new([protocol::feature_id("Batch")]));
+    ledger.set_rules(protocol::Rules::new([protocol::feature_batch_v1_1()]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let sttx = batch_tx(account);
 
@@ -7354,7 +7354,7 @@ fn batch_submit_shell_applies_all_successful_inner_transactions() {
         account_root_with_balance(account, 0, 0, 1_000_000),
         account_root_with_balance(destination, 0, 0, 1_000_000),
     ]);
-    ledger.set_rules(protocol::Rules::new([protocol::feature_id("Batch")]));
+    ledger.set_rules(protocol::Rules::new([protocol::feature_batch_v1_1()]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let first = inner_batch_payment_tx(account, destination, 2, 100);
     let second = inner_batch_payment_tx(account, destination, 3, 200);
@@ -7399,7 +7399,7 @@ fn batch_submit_shell_rejects_invalid_inner_signature_before_mutating_batch_stat
         account_root_with_balance(account, 0, 0, 1_000_000),
         account_root_with_balance(destination, 0, 0, 1_000_000),
     ]);
-    ledger.set_rules(protocol::Rules::new([protocol::feature_id("Batch")]));
+    ledger.set_rules(protocol::Rules::new([protocol::feature_batch_v1_1()]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let first = inner_batch_payment_tx(account, destination, 2, 100);
     let mut invalid_inner = inner_batch_payment_tx(account, destination, 3, 200);
@@ -7442,7 +7442,7 @@ fn batch_submit_shell_discards_inner_changes_in_all_or_nothing_mode() {
         account_root_with_balance(account, 0, 0, 1_000_000),
         account_root_with_balance(destination, 0, 0, 1_000_000),
     ]);
-    ledger.set_rules(protocol::Rules::new([protocol::feature_id("Batch")]));
+    ledger.set_rules(protocol::Rules::new([protocol::feature_batch_v1_1()]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let first = inner_batch_payment_tx(account, destination, 2, 100);
     let second = inner_batch_payment_tx(account, destination, 3, 2_000_000);
@@ -7483,7 +7483,7 @@ fn batch_submit_shell_stops_after_first_success_in_only_one_mode() {
         account_root_with_balance(account, 0, 0, 1_000_000),
         account_root_with_balance(destination, 0, 0, 1_000_000),
     ]);
-    ledger.set_rules(protocol::Rules::new([protocol::feature_id("Batch")]));
+    ledger.set_rules(protocol::Rules::new([protocol::feature_batch_v1_1()]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let first = inner_batch_payment_tx(account, destination, 2, 100);
     let second = inner_batch_payment_tx(account, destination, 3, 200);
@@ -7524,7 +7524,7 @@ fn batch_submit_shell_applies_successful_prefix_until_failure() {
         account_root_with_balance(account, 0, 0, 1_000_000),
         account_root_with_balance(destination, 0, 0, 1_000_000),
     ]);
-    ledger.set_rules(protocol::Rules::new([protocol::feature_id("Batch")]));
+    ledger.set_rules(protocol::Rules::new([protocol::feature_batch_v1_1()]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let first = inner_batch_payment_tx(account, destination, 2, 100);
     let second = inner_batch_payment_tx(account, destination, 3, 2_000_000);
@@ -13427,6 +13427,7 @@ fn amm_withdraw_allows_nontransferable_mpt_asset_recovery_path() {
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::AMM_WITHDRAW, |tx| {
         tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_u32(sf("sfFlags"), protocol::AMM_LP_TOKEN_FLAG);
         tx.set_field_amount(sf("sfAsset"), mpt_asset);
         tx.set_field_amount(sf("sfAsset2"), xrp_asset);
         tx.set_field_amount(

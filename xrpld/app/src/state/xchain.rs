@@ -420,6 +420,7 @@ fn transfer_helper<V: ApplyView>(
         default_paths_allowed: true,
         limit_quality: false,
         is_ledger_open: false,
+        domain_id: None,
     };
 
     match ledger::ripple_calc::ripple_calculate(
