@@ -2661,24 +2661,15 @@ fn persist_completed_inbound_ledger(
             inserted: !lm.ledger_history().insert(normalized, false),
             acknowledged: true,
         },
-        // History completion is only trusted-chain material when its exact
-        // hash is anchored by the current validated ledger's skip list. A
-        // completed peer response alone is otherwise just cacheable data and
-        // must not reach setFullLedger's validated/complete persistence path.
+        // `fetchForHistory` resolves the exact hash before it starts the
+        // acquisition.  Once that hash completes, rippled passes the ledger
+        // directly to `setFullLedger(ledger, false, false)`; it does not require
+        // the current validated ledger to prove the same ancestry a second
+        // time.  That second proof can be unavailable across a skip-list
+        // boundary even though getLedgerHashForHistory selected the canonical
+        // hash, which would otherwise leave the gap in a permanent reacquire
+        // loop.
         AcquireReason::History => {
-            if !is_validated_history_ancestor(lm, normalized.as_ref()) {
-                tracing::warn!(
-                    target: "history",
-                    seq = normalized.header().seq,
-                    hash = %normalized.header().hash,
-                    "completed history ledger is not anchored to validated chain; caching only"
-                );
-                return CompletionPersistence {
-                    inserted: !lm.ledger_history().insert(normalized, false),
-                    acknowledged: true,
-                };
-            }
-
             let normalized_seq = normalized.header().seq;
             let was_complete = lm.have_ledger(normalized_seq);
             let persistence =
@@ -2892,9 +2883,6 @@ fn history_hash_for_seq(
     history_hash_from_reference_or_candidate(root, shared_inbound, validated.as_ref(), seq)
 }
 
-/// A history fetch may be persisted as trusted full history only if a current
-/// validated anchor names this exact hash at the candidate sequence. This is
-/// the local equivalent of rippled's doAdvance/fetchForHistory chain proof.
 /// Prove a published ledger is the local LCL itself or a known contiguous
 /// ancestor. This is the adapter-side witness required before the coordinator
 /// can interpret a publication fact as `ChainContiguous`.
@@ -2950,22 +2938,6 @@ fn recovered_target_is_contiguous_to_lcl(
     })?;
     published_anchor_is_contiguous_to_lcl(lcl, target.hash(), sequence)
         .then_some(acquisition::LedgerIdentity::new(target.hash(), sequence))
-}
-
-fn is_validated_history_ancestor(lm: &ledger::LedgerMaster, ledger: &ledger::Ledger) -> bool {
-    let Some(validated) = lm.validated_ledger() else {
-        return false;
-    };
-    let candidate_seq = ledger.header().seq;
-    if candidate_seq > validated.header().seq {
-        return false;
-    }
-    if candidate_seq == validated.header().seq {
-        return ledger.header().hash == validated.header().hash;
-    }
-    validated
-        .hash_of_seq(candidate_seq, &ledger::NullLedgerJournal)
-        .is_some_and(|hash| hash == ledger.header().hash)
 }
 
 #[cfg(test)]
@@ -3275,6 +3247,50 @@ mod tests {
             "completion consumers must not replace the canonical readable ledger with the acquisition Arc",
         );
         inbound.stop();
+    }
+
+    #[test]
+    fn trusted_history_completion_persists_without_reproving_validated_skip_list() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let runtime = root.attach_default_ledger_master_runtime();
+        let _store_dir = install_test_node_store(&mut root);
+        let master = runtime.ledger_master();
+
+        // Model a canonical hash already selected by getLedgerHashForHistory,
+        // but outside the currently resident validated ledger's skip-list
+        // proof. rippled does not repeat that proof after acquire() returns.
+        let validated = immutable_ledger(400, 0x40);
+        master.set_valid_ledger_no_sweep(validated.clone(), None, None);
+        let history = immutable_ledger(100, 0x10);
+        assert!(
+            validated
+                .hash_of_seq(history.header().seq, &ledger::NullLedgerJournal)
+                .is_none(),
+            "the regression requires the later local ancestry proof to be unavailable"
+        );
+
+        let persisted = persist_completed_inbound_ledger(
+            &root,
+            master.as_ref(),
+            &history,
+            AcquireReason::History,
+        );
+
+        assert!(persisted.acknowledged);
+        assert!(persisted.inserted);
+        assert!(
+            master.have_ledger(history.header().seq),
+            "setFullLedger must close the history gap selected by the trusted hash lookup"
+        );
+        assert_eq!(
+            master
+                .ledger_history()
+                .get_cached_ledger_by_hash(history.header().hash)
+                .expect("persisted history ledger should remain hash-resolvable")
+                .header()
+                .hash,
+            history.header().hash
+        );
     }
 
     #[test]
