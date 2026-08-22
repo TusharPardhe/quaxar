@@ -33,6 +33,108 @@ fn sample_account(fill: u8) -> AccountID {
     AccountID::from_array([fill; 20])
 }
 
+#[test]
+fn account_set_production_apply_matches_legacy_flag_mutations() {
+    let account = sample_account(0x31);
+    let ledger = empty_ledger(vec![account_root(account, 0, 0)]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let set = STTx::new(TxType::ACCOUNT_SET, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_u32(
+            sf("sfFlags"),
+            protocol::tfRequireDestTag | protocol::tfRequireAuth | protocol::tfDisallowXRP,
+        );
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &set, TxType::ACCOUNT_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let flags = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("read")
+        .expect("account")
+        .get_field_u32(sf("sfFlags"));
+    assert_eq!(
+        flags & (protocol::lsfRequireDestTag | protocol::lsfRequireAuth | protocol::lsfDisallowXRP),
+        protocol::lsfRequireDestTag | protocol::lsfRequireAuth | protocol::lsfDisallowXRP
+    );
+
+    let clear = STTx::new(TxType::ACCOUNT_SET, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_u32(
+            sf("sfFlags"),
+            protocol::tfOptionalDestTag | protocol::tfOptionalAuth | protocol::tfAllowXRP,
+        );
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &clear, TxType::ACCOUNT_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let flags = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("read")
+        .expect("account")
+        .get_field_u32(sf("sfFlags"));
+    assert_eq!(
+        flags & (protocol::lsfRequireDestTag | protocol::lsfRequireAuth | protocol::lsfDisallowXRP),
+        0
+    );
+}
+
+#[test]
+fn account_set_production_apply_matches_canonical_field_and_irreversible_flag_rules() {
+    let account = sample_account(0x32);
+    let minter = sample_account(0x33);
+    let mut root = account_root(
+        account,
+        0,
+        protocol::lsfNoFreeze | protocol::lsfGlobalFreeze,
+    );
+    root.set_field_u8(sf("sfTickSize"), 7);
+    root.set_field_vl(sf("sfDomain"), b"old.example");
+    let ledger = empty_ledger(vec![root]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let clear_canonical_fields = STTx::new(TxType::ACCOUNT_SET, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_u8(sf("sfTickSize"), 15);
+        tx.set_field_vl(sf("sfDomain"), b"");
+        tx.set_field_u32(sf("sfClearFlag"), 7);
+    });
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &clear_canonical_fields,
+            TxType::ACCOUNT_SET,
+            None,
+        ),
+        Ter::TES_SUCCESS
+    );
+    let root = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("read")
+        .expect("account");
+    assert!(!root.is_field_present(sf("sfTickSize")));
+    assert!(!root.is_field_present(sf("sfDomain")));
+    assert!(root.is_flag(protocol::lsfGlobalFreeze));
+
+    let set_minter = STTx::new(TxType::ACCOUNT_SET, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_u32(sf("sfSetFlag"), 10);
+        tx.set_account_id(sf("sfNFTokenMinter"), minter);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &set_minter, TxType::ACCOUNT_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let root = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("read")
+        .expect("account");
+    assert_eq!(root.get_account_id(sf("sfNFTokenMinter")), minter);
+}
+
 fn sample_uint256(fill: u8) -> Uint256 {
     Uint256::from_array([fill; 32])
 }

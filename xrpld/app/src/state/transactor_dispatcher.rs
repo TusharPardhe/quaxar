@@ -2260,104 +2260,212 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         TxType::ACCOUNT_SET => {
             let account = sttx.get_account_id(sf("sfAccount"));
             let keylet = protocol::account_keylet(Uint160::from_void(account.data()));
-            if let Ok(Some(sle)) = view.peek(keylet) {
-                let mut obj = sle.clone_as_object();
-                if sttx.is_field_present(sf("sfDomain")) {
-                    obj.set_stbase(protocol::STBlob::from_buffer(
-                        sf("sfDomain"),
-                        basics::buffer::Buffer::from(&sttx.get_field_vl(sf("sfDomain"))[..]),
-                    ));
-                }
-                if sttx.is_field_present(sf("sfTransferRate")) {
-                    let rate = sttx.get_field_u32(sf("sfTransferRate"));
-                    if rate == 0 || rate == 1_000_000_000 {
-                        obj.make_field_absent(sf("sfTransferRate"));
-                    } else {
-                        obj.set_field_u32(sf("sfTransferRate"), rate);
-                    }
-                }
-                if sttx.is_field_present(sf("sfTickSize")) {
-                    let tick = sttx.get_field_u8(sf("sfTickSize"));
-                    if tick == 0 {
-                        obj.make_field_absent(sf("sfTickSize"));
-                    } else {
-                        obj.set_field_u8(sf("sfTickSize"), tick);
-                    }
-                }
-                if sttx.is_field_present(sf("sfEmailHash")) {
-                    let hash = sttx.get_field_h128(sf("sfEmailHash"));
-                    if hash.is_zero() {
-                        obj.make_field_absent(sf("sfEmailHash"));
-                    } else {
-                        obj.set_field_h128(sf("sfEmailHash"), hash);
-                    }
-                }
-                if sttx.is_field_present(sf("sfWalletLocator")) {
-                    let locator = sttx.get_field_h256(sf("sfWalletLocator"));
-                    if locator.is_zero() {
-                        obj.make_field_absent(sf("sfWalletLocator"));
-                    } else {
-                        obj.set_field_h256(sf("sfWalletLocator"), locator);
-                    }
-                }
-                if sttx.is_field_present(sf("sfMessageKey")) {
-                    let vl = sttx.get_field_vl(sf("sfMessageKey"));
-                    if vl.is_empty() {
-                        obj.make_field_absent(sf("sfMessageKey"));
-                    } else {
-                        obj.set_stbase(protocol::STBlob::from_buffer(
-                            sf("sfMessageKey"),
-                            basics::buffer::Buffer::from(&vl[..]),
-                        ));
-                    }
-                }
-                // sfSetFlag / sfClearFlag — modify account flags
-                let mut flags = obj.get_field_u32(sf("sfFlags"));
-                if sttx.is_field_present(sf("sfSetFlag")) {
-                    let set_flag = sttx.get_field_u32(sf("sfSetFlag"));
-                    let lsf = asf_to_lsf(set_flag);
-                    // asfDisableMaster (4): rippled rejects with tecNO_ALTERNATIVE_KEY
-                    // if the account has no RegularKey and no signer list.
-                    if set_flag == 4 && (flags & asf_to_lsf(4)) == 0 {
-                        let has_regular_key = obj.is_field_present(sf("sfRegularKey"));
-                        let has_signer_list = view
-                            .exists(protocol::signers_keylet(
-                                basics::math::base_uint::Uint160::from_void(
-                                    sttx.get_account_id(sf("sfAccount")).data(),
-                                ),
-                            ))
-                            .unwrap_or(false);
-                        if !has_regular_key && !has_signer_list {
-                            return Ter::TEC_NO_ALTERNATIVE_KEY;
+            match view.peek(keylet) {
+                Ok(Some(sle)) => {
+                    let mut obj = sle.clone_as_object();
+                    if sttx.is_field_present(sf("sfDomain")) {
+                        let domain = sttx.get_field_vl(sf("sfDomain"));
+                        if domain.is_empty() {
+                            obj.make_field_absent(sf("sfDomain"));
+                        } else {
+                            obj.set_stbase(protocol::STBlob::from_buffer(
+                                sf("sfDomain"),
+                                basics::buffer::Buffer::from(&domain[..]),
+                            ));
                         }
                     }
-                    if lsf != 0 {
-                        flags |= lsf;
+                    if sttx.is_field_present(sf("sfTransferRate")) {
+                        let rate = sttx.get_field_u32(sf("sfTransferRate"));
+                        if rate == 0 || rate == 1_000_000_000 {
+                            obj.make_field_absent(sf("sfTransferRate"));
+                        } else {
+                            obj.set_field_u32(sf("sfTransferRate"), rate);
+                        }
                     }
-                    // asfAccountTxnID (5) — add the field if not present
+                    if sttx.is_field_present(sf("sfTickSize")) {
+                        let tick = sttx.get_field_u8(sf("sfTickSize"));
+                        // rippled treats both zero and the maximum precision as
+                        // the canonical absence of a TickSize field.
+                        if tick == 0 || tick == 15 {
+                            obj.make_field_absent(sf("sfTickSize"));
+                        } else {
+                            obj.set_field_u8(sf("sfTickSize"), tick);
+                        }
+                    }
+                    if sttx.is_field_present(sf("sfEmailHash")) {
+                        let hash = sttx.get_field_h128(sf("sfEmailHash"));
+                        if hash.is_zero() {
+                            obj.make_field_absent(sf("sfEmailHash"));
+                        } else {
+                            obj.set_field_h128(sf("sfEmailHash"), hash);
+                        }
+                    }
+                    if sttx.is_field_present(sf("sfWalletLocator")) {
+                        let locator = sttx.get_field_h256(sf("sfWalletLocator"));
+                        if locator.is_zero() {
+                            obj.make_field_absent(sf("sfWalletLocator"));
+                        } else {
+                            obj.set_field_h256(sf("sfWalletLocator"), locator);
+                        }
+                    }
+                    if sttx.is_field_present(sf("sfMessageKey")) {
+                        let vl = sttx.get_field_vl(sf("sfMessageKey"));
+                        if vl.is_empty() {
+                            obj.make_field_absent(sf("sfMessageKey"));
+                        } else {
+                            obj.set_stbase(protocol::STBlob::from_buffer(
+                                sf("sfMessageKey"),
+                                basics::buffer::Buffer::from(&vl[..]),
+                            ));
+                        }
+                    }
+                    // AccountSet::doApply has several deliberately asymmetric
+                    // flags (NoFreeze and Clawback are irreversible), so this is
+                    // kept in the same order as rippled instead of applying a
+                    // generic set/clear mapping.
+                    let flags_in = obj.get_field_u32(sf("sfFlags"));
+                    let mut flags = flags_in;
+                    let tx_flags = sttx.get_flags();
+                    let set_flag = sttx.get_field_u32(sf("sfSetFlag"));
+                    let clear_flag = sttx.get_field_u32(sf("sfClearFlag"));
+
+                    let set_require_dest =
+                        tx_flags & protocol::tfRequireDestTag != 0 || set_flag == 1;
+                    let clear_require_dest =
+                        tx_flags & protocol::tfOptionalDestTag != 0 || clear_flag == 1;
+                    let set_require_auth = tx_flags & protocol::tfRequireAuth != 0 || set_flag == 2;
+                    let clear_require_auth =
+                        tx_flags & protocol::tfOptionalAuth != 0 || clear_flag == 2;
+                    let set_disallow_xrp = tx_flags & protocol::tfDisallowXRP != 0 || set_flag == 3;
+                    let clear_disallow_xrp =
+                        tx_flags & protocol::tfAllowXRP != 0 || clear_flag == 3;
+
+                    if set_require_auth {
+                        flags |= protocol::lsfRequireAuth;
+                    }
+                    if clear_require_auth {
+                        flags &= !protocol::lsfRequireAuth;
+                    }
+                    if set_require_dest {
+                        flags |= protocol::lsfRequireDestTag;
+                    }
+                    if clear_require_dest {
+                        flags &= !protocol::lsfRequireDestTag;
+                    }
+                    if set_disallow_xrp {
+                        flags |= protocol::lsfDisallowXRP;
+                    }
+                    if clear_disallow_xrp {
+                        flags &= !protocol::lsfDisallowXRP;
+                    }
+
+                    let sig_with_master = {
+                        let signing_pub_key = sttx.get_field_vl(sf("sfSigningPubKey"));
+                        if signing_pub_key.is_empty() {
+                            false
+                        } else {
+                            use sha2::Digest;
+                            let sha = sha2::Sha256::digest(&signing_pub_key);
+                            let ripe = ripemd::Ripemd160::digest(sha);
+                            AccountID::from_slice(&ripe).is_some_and(|signer| signer == account)
+                        }
+                    };
+
+                    if set_flag == 4 && flags_in & protocol::lsfDisableMaster == 0 {
+                        if !sig_with_master {
+                            return Ter::TEC_NEED_MASTER_KEY;
+                        }
+                        let has_alternative = obj.is_field_present(sf("sfRegularKey"))
+                            || view
+                                .exists(protocol::signers_keylet(Uint160::from_void(
+                                    account.data(),
+                                )))
+                                .unwrap_or(false);
+                        if !has_alternative {
+                            return Ter::TEC_NO_ALTERNATIVE_KEY;
+                        }
+                        flags |= protocol::lsfDisableMaster;
+                    }
+                    if clear_flag == 4 {
+                        flags &= !protocol::lsfDisableMaster;
+                    }
+
+                    if set_flag == 8 {
+                        flags |= protocol::lsfDefaultRipple;
+                    } else if clear_flag == 8 {
+                        flags &= !protocol::lsfDefaultRipple;
+                    }
+
+                    if set_flag == 6 {
+                        if !sig_with_master && flags_in & protocol::lsfDisableMaster == 0 {
+                            return Ter::TEC_NEED_MASTER_KEY;
+                        }
+                        flags |= protocol::lsfNoFreeze;
+                    }
+
+                    if set_flag == 7 {
+                        flags |= protocol::lsfGlobalFreeze;
+                    }
+                    if set_flag != 7 && clear_flag == 7 && flags & protocol::lsfNoFreeze == 0 {
+                        flags &= !protocol::lsfGlobalFreeze;
+                    }
+
                     if set_flag == 5 && !obj.is_field_present(sf("sfAccountTxnID")) {
                         obj.set_field_h256(sf("sfAccountTxnID"), Uint256::default());
                     }
-                }
-                if sttx.is_field_present(sf("sfClearFlag")) {
-                    let clear_flag = sttx.get_field_u32(sf("sfClearFlag"));
-                    let lsf = asf_to_lsf(clear_flag);
-                    // asfAllowTrustLineClawback (16) is irreversible in
-                    // rippled: clearing it is a successful no-op.
-                    if clear_flag != 16 && lsf != 0 {
-                        flags &= !lsf;
-                    }
-                    // asfAccountTxnID (5) — remove the field
                     if clear_flag == 5 {
                         obj.make_field_absent(sf("sfAccountTxnID"));
                     }
-                    // asfAuthorizedNFTokenMinter (10) — remove sfNFTokenMinter field
+
+                    if set_flag == 9 {
+                        flags |= protocol::lsfDepositAuth;
+                    } else if clear_flag == 9 {
+                        flags &= !protocol::lsfDepositAuth;
+                    }
+
+                    if set_flag == 10 {
+                        obj.set_account_id(
+                            sf("sfNFTokenMinter"),
+                            sttx.get_account_id(sf("sfNFTokenMinter")),
+                        );
+                    }
                     if clear_flag == 10 {
                         obj.make_field_absent(sf("sfNFTokenMinter"));
                     }
+
+                    for (asf, lsf) in [
+                        (12, protocol::lsfDisallowIncomingNFTokenOffer),
+                        (13, protocol::lsfDisallowIncomingCheck),
+                        (14, protocol::lsfDisallowIncomingPayChan),
+                        (15, protocol::lsfDisallowIncomingTrustline),
+                    ] {
+                        if set_flag == asf {
+                            flags |= lsf;
+                        } else if clear_flag == asf {
+                            flags &= !lsf;
+                        }
+                    }
+
+                    if view.rules().enabled(&protocol::feature_id("TokenEscrow")) {
+                        if set_flag == 17 {
+                            flags |= protocol::lsfAllowTrustLineLocking;
+                        } else if clear_flag == 17 {
+                            flags &= !protocol::lsfAllowTrustLineLocking;
+                        }
+                    }
+                    if set_flag == 16 {
+                        flags |= protocol::lsfAllowTrustLineClawback;
+                    }
+                    obj.set_field_u32(sf("sfFlags"), flags);
+                    if view
+                        .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())))
+                        .is_err()
+                    {
+                        return Ter::TEF_BAD_LEDGER;
+                    }
                 }
-                obj.set_field_u32(sf("sfFlags"), flags);
-                let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
+                Ok(None) => return Ter::TEF_INTERNAL,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
             }
             Ter::TES_SUCCESS
         }
@@ -6642,26 +6750,4 @@ fn close_channel<V: ledger::ApplyView>(view: &mut V, chan: &STLedgerEntry, key: 
     // Erase the channel
     let _ = view.erase(Arc::new(chan.clone()));
     Ter::TES_SUCCESS
-}
-
-fn asf_to_lsf(asf: u32) -> u32 {
-    match asf {
-        1 => 0x0002_0000,  // asfRequireDest → lsfRequireDestTag
-        2 => 0x0004_0000,  // asfRequireAuth → lsfRequireAuth
-        3 => 0x0008_0000,  // asfDisallowXRP → lsfDisallowXRP
-        4 => 0x0010_0000,  // asfDisableMaster → lsfDisableMaster
-        5 => 0,            // asfAccountTxnID — handled separately (field, not flag)
-        6 => 0x0020_0000,  // asfNoFreeze → lsfNoFreeze
-        7 => 0x0040_0000,  // asfGlobalFreeze → lsfGlobalFreeze
-        8 => 0x0080_0000,  // asfDefaultRipple → lsfDefaultRipple
-        9 => 0x0100_0000,  // asfDepositAuth → lsfDepositAuth
-        10 => 0,           // asfAuthorizedNFTokenMinter — handled separately (field, not flag)
-        12 => 0x0400_0000, // asfDisallowIncomingNFTokenOffer
-        13 => 0x0800_0000, // asfDisallowIncomingCheck
-        14 => 0x1000_0000, // asfDisallowIncomingPayChan
-        15 => 0x2000_0000, // asfDisallowIncomingTrustline
-        16 => 0x8000_0000, // asfAllowTrustLineClawback → lsfAllowTrustLineClawback
-        17 => 0x4000_0000, // asfAllowTrustLineLocking → lsfAllowTrustLineLocking
-        _ => 0,
-    }
 }
