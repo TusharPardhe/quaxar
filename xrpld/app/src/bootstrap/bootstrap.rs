@@ -252,6 +252,16 @@ impl crate::SHAMapStoreNodeStoreRuntime for BootstrapRotatingNodeStoreRuntime {
 
     fn set_rotation_in_flight(&self, in_flight: bool) {
         self.database.set_rotation_in_flight(in_flight);
+        if in_flight {
+            // DatabaseRotating advances its generation at the beginning of
+            // the exposure window, before the potentially long copy phase.
+            // Publish that identity immediately so no operation minted during
+            // the copy can carry the retired generation and self-cancel.
+            self.ledger_master_runtime.publish_store_rotation(
+                nodestore::Database::store_generation(self.database.as_ref()),
+            );
+            (self.owner_wake)();
+        }
     }
 
     fn rotate_with(&self, new_backend: Box<dyn nodestore::Backend>) -> (String, String) {
