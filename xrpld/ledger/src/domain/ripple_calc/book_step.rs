@@ -326,14 +326,22 @@ pub fn execute_book_step_with_options<V: ApplyView>(
         && total_out < *max_out
         && let Some(amm_offer) = get_amm_offer(view, book, amm_generation_quality, &amm_context)
     {
-        first_quality = Some(amm_offer.quality());
-        if rejects_step_quality(
+        // `BookStep::execOffer` applies the same owner-authorization gate to
+        // real offers and synthetic AMM offers.  An AMM trust line can exist
+        // without the issuer having authorized it after `lsfRequireAuth` is
+        // enabled; in that case the synthetic offer is skipped (there is no
+        // ledger offer to erase) and the CLOB stream remains eligible.
+        if !offer_owner_authorized(view, &book.r#in, &amm_offer.account) {
+            first_quality = None;
+        } else if rejects_step_quality(
             options.enforce_quality_threshold,
             amm_offer.quality(),
             quality_threshold,
         ) {
+            first_quality = Some(amm_offer.quality());
             stop_before_clob = true;
         } else {
+            first_quality = Some(amm_offer.quality());
             let remaining_out = max_out.clone() - total_out.clone();
             let raw_in_limit = mul_ratio_amount(&remaining_in, QUALITY_ONE, tr_in, false);
             if let Some((amm_pays, amm_gets)) = amm_offer.limit(&raw_in_limit, &remaining_out) {

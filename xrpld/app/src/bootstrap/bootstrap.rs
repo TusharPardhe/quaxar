@@ -1320,10 +1320,6 @@ fn run_start_mode_consensus_loop(
         }
     };
 
-    // Take the map-complete receiver before spawning the strand (the strand
-    // will take its own copy if present; we forward completions via txset_tx).
-    let map_complete_rx = consensus_rt.take_map_complete_receiver();
-
     // Consensus event channel for validations and ledger promotions
     let (event_tx, event_rx) = crate::consensus::driver::consensus_event_channel();
     let (shared_completed_tx, shared_completed_rx) = std::sync::mpsc::sync_channel::<
@@ -2116,13 +2112,27 @@ fn run_start_mode_consensus_loop(
         shared_completed_rx: Some(shared_completed_rx),
     });
 
+    // `TransactionAcquire::mapComplete` publishes directly into the sole
+    // consensus FIFO. There is no intermediate receiver/forwarder that a
+    // later heartbeat could overtake. Saturation returns false so
+    // InboundTransactions retains its durable replay marker.
+    {
+        let ingress = strand.ingress.clone();
+        runtime
+            .root()
+            .inbound_transactions()
+            .lock()
+            .expect("inbound_transactions mutex")
+            .set_map_complete_sink(Arc::new(move |hash, set| ingress.publish_tx_set(hash, set)));
+    }
+
     // ===================================================================
-    // NEW: Wire proposal_router → strand.proposal_tx
-    // Proposals arriving from peers are sent directly to the strand's
-    // proposal channel, bypassing the polling loop entirely.
+    // Wire verified trusted proposals into the same FIFO as consensus timers.
+    // Proposals arriving from peers enter the strand command FIFO directly,
+    // bypassing the polling loop without creating another ordering domain.
     // ===================================================================
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
-        let prop_tx = strand.proposal_tx.clone();
+        let consensus_ingress = strand.ingress.clone();
         let proposal_root = runtime.root().clone();
         let proposal_overlay = overlay_rt.overlay();
         overlay_rt
@@ -2152,7 +2162,7 @@ fn run_start_mode_consensus_loop(
                 {
                     return;
                 }
-                let proposal_tx = prop_tx.clone();
+                let ingress = consensus_ingress.clone();
                 let job_root = proposal_root.clone();
                 let job_type = if trusted {
                     crate::job::job_types::JobType::JtProposalT
@@ -2175,7 +2185,7 @@ fn run_start_mode_consensus_loop(
                             // silently discarding a trusted proposal. The
                             // strand is Quaxar's single owner; blocking until
                             // it drains is the equivalent lossless handoff.
-                            if proposal_tx.send(proposal).is_err() {
+                            if !ingress.publish_trusted_proposal(proposal) {
                                 tracing::debug!(
                                     target: "consensus",
                                     "trusted proposal dropped because the consensus strand stopped"
@@ -2549,44 +2559,6 @@ fn run_start_mode_consensus_loop(
                     }
                 })
                 .expect("spawn candidate-acquire-timer thread"),
-        );
-    }
-
-    // Forward map-complete (tx-set acquisition) results to the strand.
-    if let Some(rx) = map_complete_rx {
-        let txset_tx = strand.txset_tx.clone();
-        let fwd_stop = Arc::clone(&stop);
-        worker_handles.push(
-            std::thread::Builder::new()
-                .name("map-complete-fwd".into())
-                .spawn(move || {
-                    let mut pending = None;
-                    loop {
-                        if fwd_stop.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let item = match pending.take() {
-                            Some(item) => item,
-                            None => match rx.recv_timeout(Duration::from_millis(25)) {
-                                Ok(item) => item,
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                            },
-                        };
-                        match txset_tx.try_send(item) {
-                            Ok(()) => {}
-                            Err(std::sync::mpsc::TrySendError::Full(item)) => {
-                                // Keep the one item in hand and retry. Further
-                                // producer-side overflows are retained by
-                                // InboundTransactions' durable completion map.
-                                pending = Some(item);
-                                std::thread::sleep(Duration::from_millis(1));
-                            }
-                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
-                        }
-                    }
-                })
-                .expect("spawn map-complete-fwd thread"),
         );
     }
 

@@ -6333,15 +6333,6 @@ impl ApplicationRoot {
         let runtime = Arc::new(AppConsensusRuntime::new());
         runtime.set_runner(runner);
 
-        // to the consensus thread, which calls got_tx_set (event-driven, not polling).
-        let (map_complete_tx, map_complete_rx) = std::sync::mpsc::sync_channel(1_024);
-        self.registry
-            .inbound_transactions
-            .lock()
-            .expect("inbound_transactions mutex")
-            .set_map_complete_sender(map_complete_tx);
-        runtime.set_map_complete_receiver(map_complete_rx);
-
         let _ = self.bind_consensus(runtime.clone());
         self.consensus_runtime = Some(runtime.clone());
         // Populate shared reference so JtAccept jobs (which hold an

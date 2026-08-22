@@ -266,6 +266,15 @@ impl ManagedComponent for AppLedgerRuntime {
 
 /// Command sent from external code to the consensus strand thread.
 pub enum ConsensusCommand {
+    /// A verified trusted proposal reached the single consensus ingress.
+    /// Sharing this FIFO with Heartbeat prevents timer acceptance from
+    /// overtaking a proposal that the JobQueue completed first.
+    PeerProposal(overlay::inbound::QueuedProposal),
+    /// A completed consensus transaction set reached the same owner FIFO.
+    TxSetComplete {
+        hash: basics::base_uint::Uint256,
+        set: Arc<shamap::sync::SyncTree>,
+    },
     /// A `JtNetopTimer` job reached the consensus strand. The strand, rather
     /// than the worker, executes `timer_tick` because it exclusively owns the
     /// consensus state machine.
@@ -285,12 +294,68 @@ pub enum ConsensusCommand {
     Stop,
 }
 
+/// The sole producer facade for commands entering the consensus owner.
+/// Keeping its sender private prevents callbacks from accidentally creating a
+/// second ordering domain beside the strand FIFO.
+#[derive(Clone)]
+pub struct ConsensusIngress {
+    tx: std::sync::mpsc::SyncSender<ConsensusCommand>,
+}
+
+impl ConsensusIngress {
+    pub(crate) fn bounded(capacity: usize) -> (Self, std::sync::mpsc::Receiver<ConsensusCommand>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+        (Self { tx }, rx)
+    }
+
+    /// Trusted proposals apply backpressure rather than being dropped while
+    /// the consensus owner is busy.
+    pub fn publish_trusted_proposal(&self, proposal: overlay::inbound::QueuedProposal) -> bool {
+        self.tx
+            .send(ConsensusCommand::PeerProposal(proposal))
+            .is_ok()
+    }
+
+    /// A failed non-blocking completion handoff remains durable in
+    /// `InboundTransactions` and is retried through this same facade.
+    pub fn publish_tx_set(
+        &self,
+        hash: basics::base_uint::Uint256,
+        set: Arc<shamap::sync::SyncTree>,
+    ) -> bool {
+        self.try_publish_tx_set(hash, set).is_ok()
+    }
+
+    pub(crate) fn try_publish_tx_set(
+        &self,
+        hash: basics::base_uint::Uint256,
+        set: Arc<shamap::sync::SyncTree>,
+    ) -> Result<(), std::sync::mpsc::TrySendError<ConsensusCommand>> {
+        self.tx
+            .try_send(ConsensusCommand::TxSetComplete { hash, set })
+    }
+
+    pub fn publish_heartbeat(&self) -> bool {
+        self.tx.try_send(ConsensusCommand::Heartbeat).is_ok()
+    }
+
+    pub(crate) fn try_send(
+        &self,
+        command: ConsensusCommand,
+    ) -> Result<(), std::sync::mpsc::TrySendError<ConsensusCommand>> {
+        self.tx.try_send(command)
+    }
+
+    pub(crate) fn sender(&self) -> std::sync::mpsc::SyncSender<ConsensusCommand> {
+        self.tx.clone()
+    }
+}
+
 /// The consensus runtime for the single-strand model. The consensus runner
 /// (`AppConsensus`) lives directly on the strand thread's stack — it is NOT
 /// stored here. This struct only provides:
 /// - External accessors (phase, prev_ledger_id) via atomics/mutex
 /// - A command channel to the strand thread
-/// - The map_complete receiver handoff
 /// - Temporary storage of the runner during construction (before the strand
 ///   thread takes ownership)
 #[derive(Clone)]
@@ -303,17 +368,6 @@ pub struct AppConsensusRuntime {
     prev_ledger_id: Arc<parking_lot::Mutex<basics::base_uint::Uint256>>,
     /// Channel to send commands to the strand thread
     cmd_tx: Arc<Mutex<Option<std::sync::mpsc::SyncSender<ConsensusCommand>>>>,
-    /// Receiver for map-complete events (tx-set acquisitions)
-    map_complete_rx: Arc<
-        Mutex<
-            Option<
-                std::sync::mpsc::Receiver<(
-                    basics::base_uint::Uint256,
-                    Arc<shamap::sync::SyncTree>,
-                )>,
-            >,
-        >,
-    >,
     /// Temporary storage for the runner before the strand thread takes it
     runner_storage: Arc<Mutex<Option<crate::consensus::rcl_consensus::AppConsensus>>>,
 }
@@ -342,7 +396,6 @@ impl AppConsensusRuntime {
             phase: Arc::new(AtomicU8::new(2)), // Accepted initially
             prev_ledger_id: Arc::new(parking_lot::Mutex::new(basics::base_uint::Uint256::zero())),
             cmd_tx: Arc::new(Mutex::new(None)),
-            map_complete_rx: Arc::new(Mutex::new(None)),
             runner_storage: Arc::new(Mutex::new(None)),
         }
     }
@@ -388,25 +441,6 @@ impl AppConsensusRuntime {
         if let Some(tx) = self.cmd_tx.lock().expect("cmd_tx mutex").as_ref() {
             let _ = tx.try_send(ConsensusCommand::Stop);
         }
-    }
-
-    /// Set the map_complete receiver (from InboundTransactions channel).
-    pub fn set_map_complete_receiver(
-        &self,
-        rx: std::sync::mpsc::Receiver<(basics::base_uint::Uint256, Arc<shamap::sync::SyncTree>)>,
-    ) {
-        *self.map_complete_rx.lock().expect("map_complete_rx mutex") = Some(rx);
-    }
-
-    /// Take the map_complete receiver (for the strand thread to own).
-    pub fn take_map_complete_receiver(
-        &self,
-    ) -> Option<std::sync::mpsc::Receiver<(basics::base_uint::Uint256, Arc<shamap::sync::SyncTree>)>>
-    {
-        self.map_complete_rx
-            .lock()
-            .expect("map_complete_rx mutex")
-            .take()
     }
 
     /// The current round's phase, readable from any thread.

@@ -27,8 +27,9 @@ pub struct InboundTransactions {
     stopping: bool,
     peer_set_builder: Arc<dyn PeerSetBuilder>,
     filter_factory: Option<Arc<dyn TransactionAcquireFilterFactory>>,
-    /// Sends (txset_hash, txset_map) to the consensus thread.
-    map_complete_tx: Option<std::sync::mpsc::SyncSender<(Uint256, Arc<SyncTree>)>>,
+    /// Direct reference `mapComplete` callback into the consensus owner's
+    /// single ordered ingress. Returning false retains a durable replay marker.
+    map_complete_sink: Option<Arc<dyn Fn(Uint256, Arc<SyncTree>) -> bool + Send + Sync>>,
 }
 
 impl InboundTransactions {
@@ -54,7 +55,7 @@ impl InboundTransactions {
             stopping: false,
             peer_set_builder,
             filter_factory,
-            map_complete_tx: None,
+            map_complete_sink: None,
         }
     }
 
@@ -170,14 +171,10 @@ impl InboundTransactions {
     /// the completion. The set stays in the capped cache with a replay marker
     /// for the strand's per-turn recovery drain.
     fn notify_map_complete(&mut self, hash: Uint256, set: Arc<SyncTree>) -> bool {
-        let Some(tx) = &self.map_complete_tx else {
-            return true;
+        let Some(sink) = &self.map_complete_sink else {
+            return false;
         };
-        match tx.try_send((hash, set)) {
-            Ok(()) => true,
-            Err(std::sync::mpsc::TrySendError::Full(_))
-            | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
-        }
+        sink(hash, set)
     }
 
     /// Take a bounded, deterministic slice of completed maps whose direct
@@ -206,7 +203,14 @@ impl InboundTransactions {
         &mut self,
         tx: std::sync::mpsc::SyncSender<(Uint256, Arc<SyncTree>)>,
     ) {
-        self.map_complete_tx = Some(tx);
+        self.set_map_complete_sink(Arc::new(move |hash, set| tx.try_send((hash, set)).is_ok()));
+    }
+
+    pub fn set_map_complete_sink(
+        &mut self,
+        sink: Arc<dyn Fn(Uint256, Arc<SyncTree>) -> bool + Send + Sync>,
+    ) {
+        self.map_complete_sink = Some(sink);
     }
 
     pub fn set_peer_set_builder(&mut self, builder: Arc<dyn PeerSetBuilder>) {

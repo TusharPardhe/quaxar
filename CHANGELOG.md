@@ -29,6 +29,10 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 - Matched targetless NetworkOps demotions for zero consensus positions,
   amendment/UNL blocking, and peer counts below the configured network quorum,
   while keeping zero-threshold acquisition transport updates phase-neutral.
+- Restored `ApplyStateTable` owner threading for created and deleted ledger
+  entries, rejected unauthorized synthetic AMM liquidity during offer crossing,
+  and serialized proposals, transaction-set completions, and consensus timers
+  through one ordered owner ingress.
 
 - Reworked current-ledger recovery around the application-owned NetworkOps
   strand, a typed acquisition coordinator, preferred-ledger retargeting,

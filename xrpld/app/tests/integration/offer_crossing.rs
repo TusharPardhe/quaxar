@@ -46,6 +46,245 @@ fn get_owner_count(view: &impl ReadView, account: AccountID) -> u32 {
         .unwrap_or(0)
 }
 
+/// `BookStep::execOffer` applies issuer authorization to synthetic AMM offers
+/// as well as CLOB offers.  The AMM pool may exist before its trust line is
+/// authorized; such a pool must not be crossed by an OfferCreate.
+#[test]
+fn offer_create_skips_unauthorized_synthetic_amm() {
+    let pool_owner = acct(0x11);
+    let taker = acct(0x22);
+    let authorized_taker = acct(0x24);
+    let issuer = acct(0x33);
+    let usd = usd_currency();
+
+    let mut pool_owner_line = trust_line(pool_owner, issuer, usd, 10_000, 20_000, 0);
+    pool_owner_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+    let mut taker_line = trust_line(taker, issuer, usd, 1_000, 10_000, 0);
+    taker_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+    let mut authorized_taker_line = trust_line(authorized_taker, issuer, usd, 1_000, 10_000, 0);
+    authorized_taker_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(pool_owner, 50_000_000_000, 1, 0),
+            account_root(taker, 10_000_000_000, 1, 0),
+            account_root(authorized_taker, 10_000_000_000, 1, 0),
+            account_root(
+                issuer,
+                10_000_000_000,
+                0,
+                protocol::lsfRequireAuth | protocol::lsfDefaultRipple,
+            ),
+            pool_owner_line,
+            taker_line,
+            authorized_taker_line,
+        ],
+        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixAMMOverflowOffer"],
+    );
+    let mut view = new_view(ledger);
+
+    let create = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), pool_owner);
+        tx.set_field_amount(sf("sfAmount"), xrp(5_000_000_000));
+        tx.set_field_amount(sf("sfAmount2"), iou(issuer, usd, 5_000));
+        tx.set_field_u16(sf("sfTradingFee"), 500);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &create, TxType::AMM_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let amm = view
+        .read(protocol::amm(
+            protocol::xrp_issue().into(),
+            Issue::new(usd, issuer).into(),
+        ))
+        .expect("read AMM")
+        .expect("AMM must exist");
+    let amm_account = amm.get_account_id(sf("sfAccount"));
+    let amm_line = view
+        .read(protocol::line(amm_account, issuer, usd))
+        .expect("read AMM trust line")
+        .expect("AMM trust line must exist");
+    let auth_flag = if amm_account > issuer {
+        protocol::lsfLowAuth
+    } else {
+        protocol::lsfHighAuth
+    };
+    assert_eq!(
+        amm_line.get_field_u32(sf("sfFlags")) & auth_flag,
+        0,
+        "the issuer has not authorized the AMM account"
+    );
+
+    // The pool price is deliberately better than the offer limit.  The only
+    // reason not to cross is the missing issuer authorization on the AMM line.
+    let offer = offer_tx(taker, xrp(400_000_000), iou(issuer, usd, 500), 1);
+    assert_eq!(
+        full_apply(&mut view, &offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(taker), 1))
+            .expect("read residual offer")
+            .is_some(),
+        "unauthorized AMM liquidity must be skipped and the offer stored"
+    );
+
+    // Once the issuer authorizes that exact AMM line, the same favorable
+    // shape must cross.  This also proves the first dry result was caused by
+    // the authorization gate rather than absent or unusable pool liquidity.
+    let mut authorized_amm_line = (*amm_line).clone();
+    let authorized_flags = authorized_amm_line.get_field_u32(sf("sfFlags")) | auth_flag;
+    authorized_amm_line.set_field_u32(sf("sfFlags"), authorized_flags);
+    view.update(Arc::new(authorized_amm_line))
+        .expect("authorize AMM trust line");
+
+    let crossing_offer = offer_tx(authorized_taker, xrp(400_000_000), iou(issuer, usd, 500), 1);
+    assert_eq!(
+        full_apply(&mut view, &crossing_offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(authorized_taker), 1))
+            .expect("read fully crossed offer")
+            .is_none(),
+        "authorized AMM liquidity must remain eligible for crossing"
+    );
+}
+
+/// Skipping an unauthorized synthetic AMM is not a dry-book result.  rippled's
+/// `execOffer` returns true for that keyless offer, allowing the real CLOB tip
+/// to execute in the same BookStep.
+#[test]
+fn unauthorized_synthetic_amm_does_not_block_eligible_clob() {
+    let pool_owner = acct(0x11);
+    let taker = acct(0x22);
+    let clob_maker = acct(0x24);
+    let issuer = acct(0x33);
+    let usd = usd_currency();
+
+    let mut pool_owner_line = trust_line(pool_owner, issuer, usd, 10_000, 20_000, 0);
+    pool_owner_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+    let mut taker_line = trust_line(taker, issuer, usd, 1_000, 10_000, 0);
+    taker_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+    let mut clob_maker_line = trust_line(clob_maker, issuer, usd, 0, 10_000, 0);
+    clob_maker_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(pool_owner, 50_000_000_000, 1, 0),
+            account_root(taker, 10_000_000_000, 1, 0),
+            account_root(clob_maker, 10_000_000_000, 1, 0),
+            account_root(
+                issuer,
+                10_000_000_000,
+                0,
+                protocol::lsfRequireAuth | protocol::lsfDefaultRipple,
+            ),
+            pool_owner_line,
+            taker_line,
+            clob_maker_line,
+        ],
+        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixAMMOverflowOffer"],
+    );
+    let mut view = new_view(ledger);
+
+    // Seed the opposing book before the AMM exists, so creating this offer
+    // cannot consume the pool that this test is about to create.
+    let resting_offer = offer_tx(clob_maker, iou(issuer, usd, 500), xrp(450_000_000), 1);
+    assert_eq!(
+        full_apply(&mut view, &resting_offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let resting_key = protocol::offer_keylet(acct_id(clob_maker), 1);
+    let resting_before = view
+        .read(resting_key)
+        .expect("read resting offer")
+        .expect("resting offer must exist");
+
+    let create = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), pool_owner);
+        tx.set_field_amount(sf("sfAmount"), xrp(5_000_000_000));
+        tx.set_field_amount(sf("sfAmount2"), iou(issuer, usd, 5_000));
+        tx.set_field_u16(sf("sfTradingFee"), 500);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &create, TxType::AMM_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let amm = view
+        .read(protocol::amm(
+            protocol::xrp_issue().into(),
+            Issue::new(usd, issuer).into(),
+        ))
+        .expect("read AMM")
+        .expect("AMM must exist");
+    let amm_account = amm.get_account_id(sf("sfAccount"));
+    let amm_account_key = protocol::account_keylet(acct_id(amm_account));
+    let amm_line_key = protocol::line(amm_account, issuer, usd);
+    let amm_xrp_before = view
+        .read(amm_account_key)
+        .expect("read AMM account")
+        .expect("AMM account must exist")
+        .get_field_amount(sf("sfBalance"));
+    let amm_line_before = view
+        .read(amm_line_key)
+        .expect("read AMM line")
+        .expect("AMM line must exist");
+    let auth_flag = if amm_account > issuer {
+        protocol::lsfLowAuth
+    } else {
+        protocol::lsfHighAuth
+    };
+    assert_eq!(amm_line_before.get_field_u32(sf("sfFlags")) & auth_flag, 0);
+    let amm_iou_before = amm_line_before.get_field_amount(sf("sfBalance"));
+
+    // The CLOB offers 450 XRP for 500 USD, better than the incoming 400 XRP
+    // limit.  It must remain reachable after the unauthorized AMM is skipped.
+    let crossing_offer = offer_tx(taker, xrp(400_000_000), iou(issuer, usd, 500), 1);
+    assert_eq!(
+        full_apply(&mut view, &crossing_offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(taker), 1))
+            .expect("read incoming offer")
+            .is_none(),
+        "eligible CLOB liquidity must fully satisfy the incoming offer"
+    );
+    let resting_after = view
+        .read(resting_key)
+        .expect("read changed resting offer")
+        .expect("the better-quality resting offer should be partially consumed");
+    assert_ne!(
+        resting_after.get_field_amount(sf("sfTakerGets")),
+        resting_before.get_field_amount(sf("sfTakerGets")),
+        "the CLOB offer must be consumed after the AMM skip"
+    );
+    assert_eq!(
+        view.read(amm_account_key)
+            .expect("read AMM account after crossing")
+            .expect("AMM account must remain")
+            .get_field_amount(sf("sfBalance")),
+        amm_xrp_before,
+        "unauthorized synthetic AMM must not transfer XRP"
+    );
+    assert_eq!(
+        view.read(amm_line_key)
+            .expect("read AMM line after crossing")
+            .expect("AMM line must remain")
+            .get_field_amount(sf("sfBalance")),
+        amm_iou_before,
+        "unauthorized synthetic AMM must not transfer IOUs"
+    );
+}
+
 // ─── Offer Placement with IOU Funding ─────────────────────────────────────
 
 /// C++ Offer_test — funded IOU offer is placed successfully.

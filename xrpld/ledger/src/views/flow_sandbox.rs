@@ -7,10 +7,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use basics::base_uint::Uint256;
+use basics::base_uint::{Uint160, Uint256};
 use protocol::{
-    ApplyFlags, Keylet, Rules, SField, STLedgerEntry, STObject, SerializedTypeId, StBase,
-    XRPAmount, get_field_by_symbol,
+    ApplyFlags, Keylet, LedgerEntryType, Rules, SField, STLedgerEntry, STObject, SerializedTypeId,
+    StBase, XRPAmount, account_keylet, get_field_by_symbol,
 };
 
 use crate::raw_view::RawView;
@@ -229,7 +229,82 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
             }
         }
 
+        // ApplyStateTable::apply collects `newMod` AccountRoots while it
+        // builds metadata for created/deleted owner-bearing entries. These
+        // thread-only nodes are not part of the transactor's direct delta, so
+        // add them explicitly from the same collection used by commit below.
+        for owner in self.collect_owner_threads()?.into_values() {
+            let current = crate::apply_state_table::thread_sle(
+                owner.as_ref(),
+                transaction_id,
+                ledger_seq,
+                rules,
+            );
+            let node = meta.get_affected_node_for_sle(
+                &current,
+                protocol::get_field_by_symbol("sfModifiedNode"),
+            );
+            add_threading_previous_fields(node, owner.as_ref(), transaction_id, rules);
+        }
+
         Ok(meta)
+    }
+
+    /// Collect rippled ApplyStateTable's supplemental `newMod` AccountRoots.
+    /// Created and deleted owner-bearing SLEs thread their sfAccount and
+    /// sfDestination accounts; RippleState threads both issuers. A material
+    /// mutation of the same AccountRoot wins and is threaded by the ordinary
+    /// delta path.
+    fn collect_owner_threads(&self) -> Result<BTreeMap<Uint256, Arc<STLedgerEntry>>, ViewError> {
+        let mut owner_threads = BTreeMap::new();
+        for (key, entry) in &self.items {
+            let owner_source = match entry.action {
+                Action::Insert => Some(Arc::clone(&entry.sle)),
+                Action::Erase => self.parent.read(Keylet::new(entry.sle.get_type(), *key))?,
+                Action::Modify => None,
+            };
+            let Some(owner_source) = owner_source else {
+                continue;
+            };
+
+            for owner in owner_accounts(owner_source.as_ref()) {
+                let keylet = account_keylet(Uint160::from_void(owner.data()));
+                if owner_threads.contains_key(&keylet.key) {
+                    continue;
+                }
+                let owner_sle = match self.items.get(&keylet.key) {
+                    // A material mutation is threaded by the ordinary delta
+                    // path. An unchanged Modify is different: rippled's main
+                    // metadata loop may already have skipped it, but
+                    // getForMod returns and threadOwners mutates that same
+                    // item later, regardless of map iteration order.
+                    Some(Entry {
+                        action: Action::Modify,
+                        sle,
+                    }) => match self.parent.read(keylet)? {
+                        Some(original) if original.as_ref() == sle.as_ref() => {
+                            Some(Arc::clone(sle))
+                        }
+                        _ => continue,
+                    },
+                    // Inserts are always handled by the ordinary path.
+                    Some(Entry {
+                        action: Action::Insert,
+                        ..
+                    }) => continue,
+                    // Deleted destinations are intentionally not restored.
+                    Some(Entry {
+                        action: Action::Erase,
+                        ..
+                    }) => continue,
+                    None => self.parent.read(keylet)?,
+                };
+                if let Some(owner_sle) = owner_sle {
+                    owner_threads.insert(keylet.key, owner_sle);
+                }
+            }
+        }
+        Ok(owner_threads)
     }
 
     pub fn peek_parent(&self, k: Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
@@ -246,6 +321,7 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         ledger_seq: u32,
         rules: &Rules,
     ) -> Result<(), ViewError> {
+        let owner_threads = self.collect_owner_threads()?;
         self.validate_parent_commit("FlowSandbox::apply_with_tx_thread")?;
         // `TapDryRun` must not burn the immutable ledger's XRP total.
         if self.drops_destroyed.drops() > 0
@@ -286,6 +362,25 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
                     self.parent.erase(entry.sle)?;
                 }
             }
+        }
+        // Rust commits direct changes before supplemental owner threads.
+        // Same-key material mutations are excluded above, so supplemental
+        // copies cannot overwrite them and the resulting state matches
+        // rippled's newMod-before-state-table application order.
+        for (key, owner) in owner_threads {
+            let keylet = Keylet::new(LedgerEntryType::AccountRoot, key);
+            if self.parent.peek(keylet)?.is_none() {
+                return Err(ViewError::Conversion(
+                    "FlowSandbox::apply_with_tx_thread: owner account disappeared".into(),
+                ));
+            }
+            self.parent
+                .update(Arc::new(crate::apply_state_table::thread_sle(
+                    owner.as_ref(),
+                    tx_id,
+                    ledger_seq,
+                    rules,
+                )))?;
         }
         Ok(())
     }
@@ -367,6 +462,31 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         }
         Ok(())
     }
+}
+
+fn owner_accounts(sle: &STLedgerEntry) -> Vec<protocol::AccountID> {
+    if sle.get_type() == LedgerEntryType::AccountRoot {
+        return Vec::new();
+    }
+    if sle.get_type() == LedgerEntryType::RippleState {
+        return vec![
+            sle.get_field_amount(get_field_by_symbol("sfLowLimit"))
+                .issue()
+                .issuer(),
+            sle.get_field_amount(get_field_by_symbol("sfHighLimit"))
+                .issue()
+                .issuer(),
+        ];
+    }
+
+    ["sfAccount", "sfDestination"]
+        .into_iter()
+        .filter_map(|name| {
+            let field = get_field_by_symbol(name);
+            sle.is_field_present(field)
+                .then(|| sle.get_account_id(field))
+        })
+        .collect()
 }
 
 /// Copy the source's `for (auto const& obj : *sle)` metadata selection into a
@@ -825,6 +945,349 @@ mod tests {
                 .any(|bytes| bytes == [0xE6, 0xE1]),
             "affected-node serialization needs canonical empty PreviousFields E6E1"
         );
+    }
+
+    #[test]
+    fn directed_nftoken_create_offer_threads_destination_account_and_metadata() {
+        // A created NFTokenOffer carries sfDestination. rippled threadOwners
+        // therefore adds a thread-only modification for that AccountRoot even
+        // though the transactor does not otherwise mutate the destination.
+        let destination = protocol::AccountID::from_array([0x22; 20]);
+        let destination_keylet = account_keylet(Uint160::from_void(destination.data()));
+        let offer_keylet = Keylet::new(LedgerEntryType::NFTokenOffer, Uint256::from_u64(0x0FFE12));
+        let prior_tx = Uint256::from_u64(0xBEEF);
+        let current_tx = Uint256::from_u64(0xA11CE);
+        let ledger_seq = 20_115_081;
+
+        let mut destination_root = STLedgerEntry::new(destination_keylet);
+        destination_root.set_account_id(get_field_by_symbol("sfAccount"), destination);
+        destination_root.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), prior_tx);
+        destination_root.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), ledger_seq - 1);
+
+        let mut base = Ledger::new(LedgerHeader::default(), false);
+        base.raw_insert(Arc::new(destination_root))
+            .expect("seed directed-offer destination");
+        let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::default());
+        let rules = parent.rules();
+
+        let metadata = {
+            let mut delta = FlowSandbox::new(&mut parent);
+            let mut offer = STLedgerEntry::new(offer_keylet);
+            offer.set_account_id(get_field_by_symbol("sfDestination"), destination);
+            delta.insert(Arc::new(offer)).expect("stage directed offer");
+
+            let metadata = delta
+                .to_tx_meta(current_tx, ledger_seq, None, &rules)
+                .expect("build directed-offer metadata");
+            delta
+                .apply_with_tx_thread(current_tx, ledger_seq, &rules)
+                .expect("commit directed offer with owner threads");
+            metadata
+        };
+
+        let destination_after = parent
+            .read(destination_keylet)
+            .expect("read destination after commit")
+            .expect("destination remains present");
+        assert_eq!(
+            destination_after.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+            current_tx
+        );
+        assert_eq!(
+            destination_after.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
+            ledger_seq
+        );
+
+        let destination_meta = metadata
+            .get_nodes()
+            .iter()
+            .find(|node| {
+                node.fname() == get_field_by_symbol("sfModifiedNode")
+                    && node.get_field_h256(get_field_by_symbol("sfLedgerIndex"))
+                        == destination_keylet.key
+            })
+            .expect("destination needs a supplemental ModifiedNode");
+        assert_eq!(
+            destination_meta.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+            prior_tx
+        );
+        assert_eq!(
+            destination_meta.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
+            ledger_seq - 1
+        );
+    }
+
+    #[test]
+    fn owner_thread_revives_unchanged_modify_in_either_item_order() {
+        // ApplyStateTable::getForMod aliases an existing Modify entry. Even if
+        // the main metadata loop skipped it as equal to the parent, a later
+        // CreatedNode must revive it as a thread-only AccountRoot change. Run
+        // both key orders because rippled's behavior is independent of
+        // whether that unchanged item was visited before or after its owner.
+        let destination = protocol::AccountID::from_array([0x33; 20]);
+        let destination_keylet = account_keylet(Uint160::from_void(destination.data()));
+        for offer_key in [Uint256::zero(), Uint256::from_array([0xFF; 32])] {
+            let offer_keylet = Keylet::new(LedgerEntryType::NFTokenOffer, offer_key);
+            let prior_tx = Uint256::from_u64(0xCAFE);
+            let current_tx = Uint256::from_u64(0xF00D);
+            let ledger_seq = 20_115_082;
+
+            let mut destination_root = STLedgerEntry::new(destination_keylet);
+            destination_root.set_account_id(get_field_by_symbol("sfAccount"), destination);
+            destination_root.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), prior_tx);
+            destination_root
+                .set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), ledger_seq - 1);
+
+            let mut base = Ledger::new(LedgerHeader::default(), false);
+            base.raw_insert(Arc::new(destination_root.clone()))
+                .expect("seed unchanged destination");
+            let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::default());
+            let rules = parent.rules();
+
+            let metadata = {
+                let mut delta = FlowSandbox::new(&mut parent);
+                delta
+                    .raw_replace(Arc::new(destination_root.clone()))
+                    .expect("stage unchanged Modify");
+                let mut offer = STLedgerEntry::new(offer_keylet);
+                offer.set_account_id(get_field_by_symbol("sfDestination"), destination);
+                delta
+                    .insert(Arc::new(offer))
+                    .expect("stage owner-bearing entry");
+
+                let metadata = delta
+                    .to_tx_meta(current_tx, ledger_seq, None, &rules)
+                    .expect("owner threading must revive unchanged Modify metadata");
+                delta
+                    .apply_with_tx_thread(current_tx, ledger_seq, &rules)
+                    .expect("owner threading must commit unchanged Modify");
+                metadata
+            };
+
+            let matching_nodes = metadata
+                .get_nodes()
+                .iter()
+                .filter(|node| {
+                    node.fname() == get_field_by_symbol("sfModifiedNode")
+                        && node.get_field_h256(get_field_by_symbol("sfLedgerIndex"))
+                            == destination_keylet.key
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matching_nodes.len(), 1, "owner thread must be deduplicated");
+            assert_eq!(
+                matching_nodes[0].get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+                prior_tx
+            );
+
+            let destination_after = parent
+                .read(destination_keylet)
+                .expect("read revived destination")
+                .expect("destination remains present");
+            assert_eq!(
+                destination_after.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+                current_tx
+            );
+            assert_eq!(
+                destination_after.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
+                ledger_seq
+            );
+        }
+    }
+
+    #[test]
+    fn deleted_ripple_state_threads_both_issuer_accounts_and_metadata() {
+        let low = protocol::AccountID::from_array([0x41; 20]);
+        let high = protocol::AccountID::from_array([0x42; 20]);
+        let low_keylet = account_keylet(Uint160::from_void(low.data()));
+        let high_keylet = account_keylet(Uint160::from_void(high.data()));
+        let line_keylet = Keylet::new(LedgerEntryType::RippleState, Uint256::from_u64(0x5157));
+        let prior_tx = Uint256::from_u64(0x1111);
+        let current_tx = Uint256::from_u64(0x2222);
+        let ledger_seq = 20_115_083;
+
+        let make_account = |keylet: Keylet, account: protocol::AccountID| {
+            let mut root = STLedgerEntry::new(keylet);
+            root.set_account_id(get_field_by_symbol("sfAccount"), account);
+            root.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), prior_tx);
+            root.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), ledger_seq - 1);
+            root
+        };
+        let currency = protocol::currency_from_string("USD");
+        let mut line = STLedgerEntry::new(line_keylet);
+        line.set_field_amount(
+            get_field_by_symbol("sfLowLimit"),
+            protocol::STAmount::from_iou_amount(
+                get_field_by_symbol("sfLowLimit"),
+                protocol::IOUAmount::new(),
+                protocol::Issue::new(currency, low),
+            ),
+        );
+        line.set_field_amount(
+            get_field_by_symbol("sfHighLimit"),
+            protocol::STAmount::from_iou_amount(
+                get_field_by_symbol("sfHighLimit"),
+                protocol::IOUAmount::new(),
+                protocol::Issue::new(currency, high),
+            ),
+        );
+
+        let mut base = Ledger::new(LedgerHeader::default(), false);
+        base.raw_insert(Arc::new(make_account(low_keylet, low)))
+            .expect("seed low issuer");
+        base.raw_insert(Arc::new(make_account(high_keylet, high)))
+            .expect("seed high issuer");
+        base.raw_insert(Arc::new(line.clone()))
+            .expect("seed trust line");
+        let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::default());
+        let rules = parent.rules();
+
+        let metadata = {
+            let mut delta = FlowSandbox::new(&mut parent);
+            delta.raw_erase(Arc::new(line)).expect("erase trust line");
+            let metadata = delta
+                .to_tx_meta(current_tx, ledger_seq, None, &rules)
+                .expect("build trust-line deletion metadata");
+            delta
+                .apply_with_tx_thread(current_tx, ledger_seq, &rules)
+                .expect("commit trust-line deletion");
+            metadata
+        };
+
+        for owner_keylet in [low_keylet, high_keylet] {
+            let owner = parent
+                .read(owner_keylet)
+                .expect("read threaded issuer")
+                .expect("issuer remains present");
+            assert_eq!(
+                owner.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+                current_tx
+            );
+            assert_eq!(
+                owner.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
+                ledger_seq
+            );
+            let nodes = metadata
+                .get_nodes()
+                .iter()
+                .filter(|node| {
+                    node.fname() == get_field_by_symbol("sfModifiedNode")
+                        && node.get_field_h256(get_field_by_symbol("sfLedgerIndex"))
+                            == owner_keylet.key
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(nodes.len(), 1, "each issuer needs one supplemental node");
+            assert_eq!(
+                nodes[0].get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+                prior_tx
+            );
+            assert_eq!(
+                nodes[0].get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
+                ledger_seq - 1
+            );
+        }
+        assert!(
+            !parent.exists(line_keylet).expect("read erased trust line"),
+            "trust line must remain erased"
+        );
+    }
+
+    #[test]
+    fn erased_generic_entry_threads_account_and_destination_and_skips_absent_owner() {
+        let account = protocol::AccountID::from_array([0x51; 20]);
+        let destination = protocol::AccountID::from_array([0x52; 20]);
+        let account_key = account_keylet(Uint160::from_void(account.data()));
+        let destination_key = account_keylet(Uint160::from_void(destination.data()));
+        let escrow_key = Keylet::new(LedgerEntryType::Escrow, Uint256::from_u64(0xE5C20));
+        let prior_tx = Uint256::from_u64(0x3333);
+        let current_tx = Uint256::from_u64(0x4444);
+        let ledger_seq = 20_115_084;
+
+        let make_account = |keylet: Keylet, id: protocol::AccountID| {
+            let mut root = STLedgerEntry::new(keylet);
+            root.set_account_id(get_field_by_symbol("sfAccount"), id);
+            root.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), prior_tx);
+            root.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), ledger_seq - 1);
+            root
+        };
+        let mut escrow = STLedgerEntry::new(escrow_key);
+        escrow.set_account_id(get_field_by_symbol("sfAccount"), account);
+        escrow.set_account_id(get_field_by_symbol("sfDestination"), destination);
+
+        let mut base = Ledger::new(LedgerHeader::default(), false);
+        base.raw_insert(Arc::new(make_account(account_key, account)))
+            .expect("seed escrow owner");
+        base.raw_insert(Arc::new(make_account(destination_key, destination)))
+            .expect("seed escrow destination");
+        base.raw_insert(Arc::new(escrow.clone()))
+            .expect("seed escrow");
+        let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::default());
+        let rules = parent.rules();
+
+        let metadata = {
+            let mut delta = FlowSandbox::new(&mut parent);
+            delta.raw_erase(Arc::new(escrow)).expect("erase escrow");
+            let metadata = delta
+                .to_tx_meta(current_tx, ledger_seq, None, &rules)
+                .expect("build escrow deletion metadata");
+            delta
+                .apply_with_tx_thread(current_tx, ledger_seq, &rules)
+                .expect("commit escrow deletion");
+            metadata
+        };
+
+        for owner_keylet in [account_key, destination_key] {
+            let owner = parent
+                .read(owner_keylet)
+                .expect("read threaded escrow party")
+                .expect("escrow party remains present");
+            assert_eq!(
+                owner.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+                current_tx
+            );
+            assert_eq!(
+                owner.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
+                ledger_seq
+            );
+            assert!(metadata.get_nodes().iter().any(|node| {
+                node.fname() == get_field_by_symbol("sfModifiedNode")
+                    && node.get_field_h256(get_field_by_symbol("sfLedgerIndex")) == owner_keylet.key
+                    && node.get_field_h256(get_field_by_symbol("sfPreviousTxnID")) == prior_tx
+                    && node.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"))
+                        == ledger_seq - 1
+            }));
+        }
+
+        // A missing referenced account matches getForMod's nullptr path: the
+        // existing party still threads, while no synthetic account or metadata
+        // node is created for the absent destination.
+        let missing = protocol::AccountID::from_array([0x53; 20]);
+        let missing_key = account_keylet(Uint160::from_void(missing.data()));
+        let missing_current_tx = Uint256::from_u64(0x5555);
+        let missing_escrow_key = Keylet::new(LedgerEntryType::Escrow, Uint256::from_u64(0xE5C21));
+        let mut missing_escrow = STLedgerEntry::new(missing_escrow_key);
+        missing_escrow.set_account_id(get_field_by_symbol("sfAccount"), account);
+        missing_escrow.set_account_id(get_field_by_symbol("sfDestination"), missing);
+        parent
+            .insert(Arc::new(missing_escrow.clone()))
+            .expect("seed escrow with missing destination");
+
+        let missing_meta = {
+            let mut delta = FlowSandbox::new(&mut parent);
+            delta
+                .raw_erase(Arc::new(missing_escrow))
+                .expect("erase escrow with missing destination");
+            let metadata = delta
+                .to_tx_meta(missing_current_tx, ledger_seq + 1, None, &rules)
+                .expect("missing destination is non-fatal");
+            delta
+                .apply_with_tx_thread(missing_current_tx, ledger_seq + 1, &rules)
+                .expect("commit with missing destination");
+            metadata
+        };
+        assert!(!parent.exists(missing_key).expect("missing stays absent"));
+        assert!(!missing_meta.get_nodes().iter().any(|node| {
+            node.get_field_h256(get_field_by_symbol("sfLedgerIndex")) == missing_key.key
+        }));
     }
 
     #[test]

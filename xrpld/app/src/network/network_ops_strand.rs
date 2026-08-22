@@ -32,9 +32,7 @@ use crate::job::job_queue::JobQueue;
 use crate::job::job_types::JobType;
 use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers, ProvisionalLedgerIdentity};
 use crate::network::network_ops::NetworkOpsOperatingMode;
-use crate::runtime::component_runtime::{AppConsensusRuntime, ConsensusCommand};
-
-use overlay::inbound::QueuedProposal;
+use crate::runtime::component_runtime::{AppConsensusRuntime, ConsensusCommand, ConsensusIngress};
 
 // Quaxar's strand polls more often than rippled's JtAdvance worker. Keep the
 // history retry cadence to one consensus heartbeat so an existing History
@@ -50,8 +48,6 @@ const PROVISIONAL_LCL_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 // without a budget would otherwise defer the next JtNetopTimer forever.
 // A command burst should not defer a heartbeat indefinitely either.
 const MAX_COMMANDS_PER_TURN: usize = 64;
-const MAX_PROPOSALS_PER_TURN: usize = 64;
-const MAX_TXSET_COMPLETIONS_PER_TURN: usize = 64;
 const MAX_MAP_COMPLETIONS_PER_TURN: usize = 64;
 const MAX_LEDGER_COMPLETIONS_PER_TURN: usize = 64;
 /// Retain enough recent coordinator handoffs to suppress the same item when
@@ -62,8 +58,7 @@ const MAX_COORDINATOR_HANDOFF_DEDUP: usize = MAX_LEDGER_COMPLETIONS_PER_TURN * 2
 /// coordinator control queue is full. This is delivery retry state only, not
 /// coordinator session lifecycle state.
 const MAX_PENDING_DURABLE_ACKS: usize = MAX_LEDGER_COMPLETIONS_PER_TURN * 2;
-const MAX_STRAND_INGRESS_QUEUE: usize = 1_024;
-const MAX_STRAND_COMMAND_QUEUE: usize = 128;
+const MAX_STRAND_COMMAND_QUEUE: usize = 1_024;
 /// Bound per-pass LCL diagnostics during persistent WrongLedger recovery.
 /// State transitions (switches and rejections) remain unsampled.
 const LCL_AUDIT_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
@@ -213,7 +208,7 @@ impl ledger::Stopper for StrandHistoryFillStopper<'_> {
 #[derive(Clone)]
 struct ConsensusJobScheduler {
     job_queue: JobQueue,
-    command_tx: std::sync::mpsc::SyncSender<ConsensusCommand>,
+    ingress: ConsensusIngress,
     heartbeat_queued: Arc<AtomicBool>,
     accept_queued: Arc<AtomicBool>,
     /// Accepted-ledger work remains here until a JtAccept worker has
@@ -223,10 +218,10 @@ struct ConsensusJobScheduler {
 }
 
 impl ConsensusJobScheduler {
-    fn new(job_queue: JobQueue, command_tx: std::sync::mpsc::SyncSender<ConsensusCommand>) -> Self {
+    fn new(job_queue: JobQueue, ingress: ConsensusIngress) -> Self {
         Self {
             job_queue,
-            command_tx,
+            ingress,
             heartbeat_queued: Arc::new(AtomicBool::new(false)),
             accept_queued: Arc::new(AtomicBool::new(false)),
             pending_accept: Arc::new(Mutex::new(None)),
@@ -245,12 +240,12 @@ impl ConsensusJobScheduler {
             return false;
         }
 
-        let command_tx = self.command_tx.clone();
+        let ingress = self.ingress.clone();
         let heartbeat_queued = Arc::clone(&self.heartbeat_queued);
         if self
             .job_queue
             .add_job(JobType::JtNetopTimer, "NetHeart", move || {
-                if command_tx.try_send(ConsensusCommand::Heartbeat).is_err() {
+                if !ingress.publish_heartbeat() {
                     heartbeat_queued.store(false, Ordering::Release);
                 }
             })
@@ -287,7 +282,7 @@ impl ConsensusJobScheduler {
             return false;
         }
 
-        let command_tx = self.command_tx.clone();
+        let ingress = self.ingress.clone();
         let accept_queued = Arc::clone(&self.accept_queued);
         let pending_accept = Arc::clone(&self.pending_accept);
         if self
@@ -298,7 +293,7 @@ impl ConsensusJobScheduler {
                     accept_queued.store(false, Ordering::Release);
                     return;
                 };
-                match command_tx.try_send(ConsensusCommand::Accept(Box::new(work))) {
+                match ingress.try_send(ConsensusCommand::Accept(Box::new(work))) {
                     Ok(()) => {}
                     Err(std::sync::mpsc::TrySendError::Full(ConsensusCommand::Accept(work)))
                     | Err(std::sync::mpsc::TrySendError::Disconnected(ConsensusCommand::Accept(
@@ -374,6 +369,36 @@ fn announce_completed_tx_set(root: &ApplicationRoot, hash: Uint256) {
     overlay_runtime.overlay().broadcast(&message);
 }
 
+/// Insert recovered tx-set completions into the sole consensus FIFO. A full
+/// command queue retains the exact completion locally and retries it before
+/// admitting newer recovered completions; it must never call `got_tx_set`
+/// directly and thereby bypass an older heartbeat already in the FIFO.
+fn enqueue_recovered_txsets(
+    ingress: &ConsensusIngress,
+    retained: &mut VecDeque<(Uint256, Arc<shamap::sync::SyncTree>)>,
+    recovered: impl IntoIterator<Item = (Uint256, Arc<shamap::sync::SyncTree>)>,
+) -> bool {
+    retained.extend(recovered);
+    while let Some((hash, set)) = retained.pop_front() {
+        match ingress.try_publish_tx_set(hash, set) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(ConsensusCommand::TxSetComplete {
+                hash,
+                set,
+            })) => {
+                retained.push_front((hash, set));
+                return true;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                retained.clear();
+                return false;
+            }
+            Err(_) => unreachable!("only TxSetComplete commands are sent here"),
+        }
+    }
+    true
+}
+
 /// Dependencies the strand needs (passed at construction).
 pub struct NetworkOpsStrandDeps {
     pub root: ApplicationRoot,
@@ -394,60 +419,41 @@ pub struct NetworkOpsStrandDeps {
 pub struct NetworkOpsStrand {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    /// Send proposals from the overlay to the strand.
-    pub proposal_tx: std::sync::mpsc::SyncSender<QueuedProposal>,
-    /// Send tx-set completions to the strand.
-    pub txset_tx: std::sync::mpsc::SyncSender<(Uint256, Arc<shamap::sync::SyncTree>)>,
-    /// Send commands (StartRound, Stop) to the strand.
-    pub command_tx: std::sync::mpsc::SyncSender<ConsensusCommand>,
+    /// The sole ordered consensus ingress: proposals, tx-set completions,
+    /// heartbeats, accepts, round changes, and stop all share this FIFO.
+    pub ingress: ConsensusIngress,
 }
 
 impl NetworkOpsStrand {
     /// Spawn the strand thread. Takes ownership of the consensus runner.
     pub fn spawn(deps: NetworkOpsStrandDeps) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let (proposal_tx, proposal_rx) =
-            std::sync::mpsc::sync_channel::<QueuedProposal>(MAX_STRAND_INGRESS_QUEUE);
-        let (txset_tx, txset_rx) = std::sync::mpsc::sync_channel::<(
-            Uint256,
-            Arc<shamap::sync::SyncTree>,
-        )>(MAX_STRAND_INGRESS_QUEUE);
-        let (command_tx, command_rx) =
-            std::sync::mpsc::sync_channel::<ConsensusCommand>(MAX_STRAND_COMMAND_QUEUE);
+        let (ingress, command_rx) = ConsensusIngress::bounded(MAX_STRAND_COMMAND_QUEUE);
 
         // Wire the command sender to the consensus runtime so external code
         // (e.g. validation event loop) can issue StartRound commands.
-        deps.consensus_rt.set_cmd_sender(command_tx.clone());
+        deps.consensus_rt.set_cmd_sender(ingress.sender());
 
         let stop_clone = Arc::clone(&stop);
-        let strand_command_tx = command_tx.clone();
+        let strand_ingress = ingress.clone();
         let thread = thread::Builder::new()
             .name("networkops-strand".into())
             .spawn(move || {
-                strand_loop(
-                    deps,
-                    stop_clone,
-                    proposal_rx,
-                    txset_rx,
-                    command_rx,
-                    strand_command_tx,
-                );
+                strand_loop(deps, stop_clone, command_rx, strand_ingress);
             })
             .expect("failed to spawn networkops-strand thread");
 
         Self {
             stop,
             thread: Some(thread),
-            proposal_tx,
-            txset_tx,
-            command_tx,
+            ingress,
         }
     }
 
     /// Signal the strand to stop and wait for the thread to exit.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        let _ = self.command_tx.try_send(ConsensusCommand::Stop);
+        let _ = self.ingress.try_send(ConsensusCommand::Stop);
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -457,7 +463,7 @@ impl NetworkOpsStrand {
 impl Drop for NetworkOpsStrand {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        let _ = self.command_tx.try_send(ConsensusCommand::Stop);
+        let _ = self.ingress.try_send(ConsensusCommand::Stop);
         // Don't join on drop — just signal.
     }
 }
@@ -467,10 +473,8 @@ impl Drop for NetworkOpsStrand {
 fn strand_loop(
     deps: NetworkOpsStrandDeps,
     stop: Arc<AtomicBool>,
-    proposal_rx: std::sync::mpsc::Receiver<QueuedProposal>,
-    txset_rx: std::sync::mpsc::Receiver<(Uint256, Arc<shamap::sync::SyncTree>)>,
     command_rx: std::sync::mpsc::Receiver<ConsensusCommand>,
-    command_tx: std::sync::mpsc::SyncSender<ConsensusCommand>,
+    ingress: ConsensusIngress,
 ) {
     // Elevate thread priority — consensus must never be starved by RPC load.
     #[cfg(unix)]
@@ -499,10 +503,7 @@ fn strand_loop(
         }
     };
 
-    // Take the map-complete receiver for tx-set acquisitions.
-    let map_complete_rx = consensus_rt.take_map_complete_receiver();
-
-    let scheduler = ConsensusJobScheduler::new(root.job_queue().clone(), command_tx);
+    let scheduler = ConsensusJobScheduler::new(root.job_queue().clone(), ingress.clone());
     let mut consensus_started = false;
     let mut last_timer_tick = Instant::now();
     let mut last_round_ledger_id: Option<Uint256> = None;
@@ -526,6 +527,9 @@ fn strand_loop(
     let mut provisional_lcl_waiter: Option<ProvisionalLclWaiter> = None;
     let mut coordinator_handoff_dedup = CoordinatorHandoffDedup::default();
     let mut pending_durable_acks = VecDeque::new();
+    // Durable overflow recovery crosses the same FIFO as ordinary map
+    // completions. A saturated FIFO retains these exact items here.
+    let mut pending_recovered_txsets = VecDeque::new();
 
     // Detect startup: always start consensus immediately on the closed
     // ledger, matching rippled's Application::run() which calls
@@ -590,6 +594,50 @@ fn strand_loop(
                 break;
             };
             match cmd {
+                ConsensusCommand::PeerProposal(proposal) => {
+                    let now = root.shared_time_keeper().close_time();
+                    let peer_close_time =
+                        basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
+                    let master_key = root.manifest_cache().get_master_key(&proposal.public_key);
+                    let prop = consensus::ConsensusProposal::new(
+                        proposal.previous_ledger,
+                        proposal.message.propose_seq,
+                        proposal.current_tx_hash,
+                        peer_close_time,
+                        now,
+                        master_key,
+                    );
+                    let peer_pos = crate::consensus::rcl_cx_peer_pos::RclCxPeerPos::new(
+                        proposal.public_key,
+                        proposal.message.signature.clone(),
+                        proposal.suppression,
+                        prop,
+                    );
+                    if runner.peer_proposal(now, &peer_pos)
+                        && let Some(overlay_runtime) = root.overlay_runtime()
+                    {
+                        overlay_runtime.overlay().relay_proposal(
+                            proposal.message,
+                            proposal.suppression,
+                            proposal.public_key,
+                        );
+                    }
+                    consensus_rt.update_phase(runner.phase());
+                    consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
+                }
+                ConsensusCommand::TxSetComplete { hash, set } => {
+                    let now = root.shared_time_keeper().close_time();
+                    let tx_set = consensus::RclTxSet::from_parts(
+                        set.root(),
+                        Arc::clone(runner.adaptor.tx_set_cache()),
+                        set.backed(),
+                        0,
+                    );
+                    runner.got_tx_set(now, tx_set);
+                    announce_completed_tx_set(&root, hash);
+                    consensus_rt.update_phase(runner.phase());
+                    tracing::debug!(target: "consensus", %hash, "strand: got_tx_set processed");
+                }
                 ConsensusCommand::Heartbeat => {
                     scheduler.heartbeat_consumed();
                     let now = root.shared_time_keeper().close_time();
@@ -799,109 +847,35 @@ fn strand_loop(
                 }
             }
 
-            // ─── 2. Schedule the 1s heartbeat before processing peer ingress ──
+            // Durable recovery for completion notifications that could not enter
+            // the bounded consensus FIFO. These are coalesced by tx-set hash
+            // in InboundTransactions and drained every strand turn. Recovery is
+            // enqueued before scheduling a new heartbeat because its original
+            // direct-FIFO attempt necessarily happened earlier.
+            let recovered = if pending_recovered_txsets.is_empty() {
+                root.inbound_transactions()
+                    .lock()
+                    .ok()
+                    .map(|mut inbound| {
+                        inbound.take_pending_map_completions(MAX_MAP_COMPLETIONS_PER_TURN)
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if !enqueue_recovered_txsets(
+                &scheduler.ingress,
+                &mut pending_recovered_txsets,
+                recovered,
+            ) {
+                return;
+            }
+
+            // ─── 2. Schedule the 1s heartbeat after older overflow ingress ──
             // `JtNetopTimer` has the reference priority/limit. The job only
             // hands off a command; `timer_tick` remains serialized on this strand.
             if last_timer_tick.elapsed() >= Duration::from_secs(1) {
                 let _ = scheduler.schedule_heartbeat();
-            }
-
-            // ─── 3. Drain a bounded proposal slice → peer_proposal() ─────────
-            drain_bounded(&proposal_rx, MAX_PROPOSALS_PER_TURN, |proposal| {
-                let now = root.shared_time_keeper().close_time();
-                let peer_close_time =
-                    basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
-                // Match PeerImp::onMessage: the consensus position is keyed by
-                // the validator's master key, while `RclCxPeerPos::public_key`
-                // retains the signing key used to verify and relay the proposal.
-                let master_key = root.manifest_cache().get_master_key(&proposal.public_key);
-                let prop = consensus::ConsensusProposal::new(
-                    proposal.previous_ledger,
-                    proposal.message.propose_seq,
-                    proposal.current_tx_hash,
-                    peer_close_time,
-                    now,
-                    master_key,
-                );
-                let peer_pos = crate::consensus::rcl_cx_peer_pos::RclCxPeerPos::new(
-                    proposal.public_key,
-                    proposal.message.signature.clone(),
-                    proposal.suppression,
-                    prop,
-                );
-                // `PeerImp::checkPropose` relays a trusted proposal only when
-                // `NetworkOPsImp::processTrustedProposal` accepts it. The strand
-                // owns that call in Quaxar, so preserve the same result-gated
-                // relay here rather than treating successful queueing as
-                // acceptance.
-                if runner.peer_proposal(now, &peer_pos)
-                    && let Some(overlay_runtime) = root.overlay_runtime()
-                {
-                    overlay_runtime.overlay().relay_proposal(
-                        proposal.message,
-                        proposal.suppression,
-                        proposal.public_key,
-                    );
-                }
-            });
-            consensus_rt.update_phase(runner.phase());
-            consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-
-            // ─── 4. Drain a bounded tx-set completion slice → got_tx_set() ───
-            drain_bounded(&txset_rx, MAX_TXSET_COMPLETIONS_PER_TURN, |(hash, set)| {
-                let now = root.shared_time_keeper().close_time();
-                let tx_set = consensus::RclTxSet::from_parts(
-                    set.root(),
-                    Arc::clone(runner.adaptor.tx_set_cache()),
-                    set.backed(),
-                    0,
-                );
-                runner.got_tx_set(now, tx_set);
-                announce_completed_tx_set(&root, hash);
-                consensus_rt.update_phase(runner.phase());
-                tracing::debug!(target: "consensus", %hash, "strand: got_tx_set processed");
-            });
-
-            // Also drain a bounded slice from the map-complete receiver.
-            if let Some(ref rx) = map_complete_rx {
-                drain_bounded(rx, MAX_MAP_COMPLETIONS_PER_TURN, |(hash, set)| {
-                    let now = root.shared_time_keeper().close_time();
-                    let tx_set = consensus::RclTxSet::from_parts(
-                        set.root(),
-                        Arc::clone(runner.adaptor.tx_set_cache()),
-                        set.backed(),
-                        0,
-                    );
-                    runner.got_tx_set(now, tx_set);
-                    announce_completed_tx_set(&root, hash);
-                    consensus_rt.update_phase(runner.phase());
-                    tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (map_complete)");
-                });
-            }
-
-            // Durable recovery for completion notifications that could not enter
-            // the bounded map-complete channel. These are coalesced by tx-set hash
-            // in InboundTransactions and drained every strand turn.
-            let pending_map_completions = root
-                .inbound_transactions()
-                .lock()
-                .ok()
-                .map(|mut inbound| {
-                    inbound.take_pending_map_completions(MAX_MAP_COMPLETIONS_PER_TURN)
-                })
-                .unwrap_or_default();
-            for (hash, set) in pending_map_completions {
-                let now = root.shared_time_keeper().close_time();
-                let tx_set = consensus::RclTxSet::from_parts(
-                    set.root(),
-                    Arc::clone(runner.adaptor.tx_set_cache()),
-                    set.backed(),
-                    0,
-                );
-                runner.got_tx_set(now, tx_set);
-                announce_completed_tx_set(&root, hash);
-                consensus_rt.update_phase(runner.phase());
-                tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (durable map completion)");
             }
 
             // ─── 5. Persist inbound completion before LCL reconciliation ────
@@ -3033,9 +3007,9 @@ fn should_acquire_history(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsensusJobScheduler, CoordinatorHandoffDedup, LclAuditSampler,
-        MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, MAX_PROPOSALS_PER_TURN,
-        PreferredLclReconciliation, coordinator_publication_is_fresh, drain_bounded,
+        ConsensusJobScheduler, CoordinatorHandoffDedup, LclAuditSampler, MAX_COMMANDS_PER_TURN,
+        MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, PreferredLclReconciliation,
+        coordinator_publication_is_fresh, drain_bounded, enqueue_recovered_txsets,
         heartbeat_operating_mode_reassertion, history_acquire_allowed,
         history_fetch_pack_requested, persist_completed_inbound_ledger,
         process_completed_inbound_ledger, published_ledger_is_contiguous_with_lcl,
@@ -3052,7 +3026,9 @@ mod tests {
     use crate::job::job_queue::JobQueue;
     use crate::job::job_types::JobType;
     use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
-    use crate::runtime::component_runtime::{AppConsensusRuntime, ConsensusCommand};
+    use crate::runtime::component_runtime::{
+        AppConsensusRuntime, ConsensusCommand, ConsensusIngress,
+    };
     use crate::{ApplicationRoot, NetworkOpsOperatingMode};
     use acquisition::{
         DurableHandoffId, IdCounter, LedgerIdentity, LedgerTarget, SessionRef, StoreGeneration,
@@ -3075,6 +3051,7 @@ mod tests {
     };
     use shamap::family::FullBelowCacheImpl;
     use shamap::tree_node_cache::TreeNodeCache;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
@@ -3799,8 +3776,8 @@ mod tests {
     #[test]
     fn heartbeat_job_runs_under_ingress_flood_and_ingress_drain_is_bounded() {
         let queue = JobQueue::new(1);
-        let (command_tx, command_rx) = mpsc::sync_channel(128);
-        let scheduler = ConsensusJobScheduler::new(queue.clone(), command_tx);
+        let (ingress, command_rx) = ConsensusIngress::bounded(128);
+        let scheduler = ConsensusJobScheduler::new(queue.clone(), ingress);
         let (gate_started_tx, gate_started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
 
@@ -3814,7 +3791,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("gate should occupy the worker");
 
-        for _ in 0..MAX_PROPOSALS_PER_TURN * 4 {
+        for _ in 0..MAX_COMMANDS_PER_TURN * 4 {
             assert!(queue.add_job(JobType::JtTransaction, "ingress", || {}));
         }
         assert!(scheduler.schedule_heartbeat());
@@ -3829,15 +3806,15 @@ mod tests {
         ));
 
         let (ingress_tx, ingress_rx) = mpsc::channel();
-        for value in 0..=MAX_PROPOSALS_PER_TURN {
+        for value in 0..=MAX_COMMANDS_PER_TURN {
             ingress_tx.send(value).expect("ingress receiver");
         }
         let mut processed = Vec::new();
-        drain_bounded(&ingress_rx, MAX_PROPOSALS_PER_TURN, |value| {
+        drain_bounded(&ingress_rx, MAX_COMMANDS_PER_TURN, |value| {
             processed.push(value);
         });
-        assert_eq!(processed.len(), MAX_PROPOSALS_PER_TURN);
-        assert_eq!(ingress_rx.try_recv(), Ok(MAX_PROPOSALS_PER_TURN));
+        assert_eq!(processed.len(), MAX_COMMANDS_PER_TURN);
+        assert_eq!(ingress_rx.try_recv(), Ok(MAX_COMMANDS_PER_TURN));
 
         let (completion_tx, completion_rx) = mpsc::channel();
         for value in 0..=MAX_LEDGER_COMPLETIONS_PER_TURN {
@@ -3855,6 +3832,119 @@ mod tests {
 
         queue.rendezvous();
         queue.stop();
+    }
+
+    #[test]
+    fn production_ingress_wiring_orders_proposal_txset_and_heartbeat() {
+        let root = ApplicationRoot::new(0).expect("root should build");
+        let (ingress, rx) = ConsensusIngress::bounded(3);
+        let completion_ingress = ingress.clone();
+        root.inbound_transactions()
+            .lock()
+            .expect("inbound transactions")
+            .set_map_complete_sink(Arc::new(move |hash, set| {
+                completion_ingress.publish_tx_set(hash, set)
+            }));
+
+        let seed = random_seed();
+        let secret = generate_secret_key(KeyType::Secp256k1, &seed).expect("secret key");
+        let public_key = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let proposal = overlay::inbound::QueuedProposal {
+            peer_id: 7,
+            suppression: Uint256::from_u64(1),
+            public_key,
+            current_tx_hash: Uint256::from_u64(2),
+            previous_ledger: Uint256::from_u64(3),
+            message: overlay::TmProposeSet::default(),
+        };
+        let txset_hash = Uint256::from_u64(4);
+        let txset = Arc::new(shamap::sync::SyncTree::new_with_type(
+            shamap::sync::SHAMapType::Transaction,
+            false,
+            1,
+        ));
+
+        assert!(ingress.publish_trusted_proposal(proposal));
+        assert!(
+            root.inbound_transactions()
+                .lock()
+                .expect("inbound transactions")
+                .give_set(txset_hash, txset, true),
+            "map-complete producer must publish through the production facade"
+        );
+        assert!(ingress.publish_heartbeat());
+
+        let mut saw_disagreeing_proposal = false;
+        let mut saw_disagreeing_txset = false;
+        let mut accepted_stale_position = false;
+        for _ in 0..3 {
+            match rx.recv().expect("ordered consensus command") {
+                ConsensusCommand::PeerProposal(_) => saw_disagreeing_proposal = true,
+                ConsensusCommand::TxSetComplete { .. } => saw_disagreeing_txset = true,
+                ConsensusCommand::Heartbeat => {
+                    // This models the timer's `have_consensus` decision: the
+                    // stale position is acceptable only if neither earlier
+                    // disagreeing ingress item has reached the owner.
+                    accepted_stale_position = !saw_disagreeing_proposal && !saw_disagreeing_txset;
+                }
+                _ => panic!("unexpected command in ordering regression"),
+            }
+        }
+
+        assert!(saw_disagreeing_proposal);
+        assert!(saw_disagreeing_txset);
+        assert!(!accepted_stale_position);
+    }
+
+    #[test]
+    fn durable_txset_overflow_retries_behind_older_heartbeat() {
+        let root = ApplicationRoot::new(0).expect("root should build");
+        let (ingress, rx) = ConsensusIngress::bounded(2);
+        assert!(ingress.publish_heartbeat());
+        assert!(ingress.publish_heartbeat());
+
+        let completion_ingress = ingress.clone();
+        root.inbound_transactions()
+            .lock()
+            .expect("inbound transactions")
+            .set_map_complete_sink(Arc::new(move |hash, set| {
+                completion_ingress.publish_tx_set(hash, set)
+            }));
+
+        let hash = Uint256::from_u64(0xA11CE);
+        let set = Arc::new(shamap::sync::SyncTree::new_with_type(
+            shamap::sync::SHAMapType::Transaction,
+            false,
+            1,
+        ));
+        assert!(
+            root.inbound_transactions()
+                .lock()
+                .expect("inbound transactions")
+                .give_set(hash, set, true),
+            "producer must admit the completed set"
+        );
+        let recovered = root
+            .inbound_transactions()
+            .lock()
+            .expect("inbound transactions")
+            .take_pending_map_completions(1);
+        assert_eq!(recovered.len(), 1, "saturated direct FIFO marks replay");
+        let mut retained = VecDeque::new();
+        assert!(enqueue_recovered_txsets(&ingress, &mut retained, recovered));
+        assert_eq!(retained.len(), 1, "full FIFO must retain completion");
+
+        assert!(matches!(rx.recv().unwrap(), ConsensusCommand::Heartbeat));
+        assert!(enqueue_recovered_txsets(&ingress, &mut retained, []));
+        assert!(retained.is_empty());
+
+        // The recovered completion is appended after the heartbeat that was
+        // already queued; it cannot call got_tx_set out of band.
+        assert!(matches!(rx.recv().unwrap(), ConsensusCommand::Heartbeat));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            ConsensusCommand::TxSetComplete { hash: actual, .. } if actual == hash
+        ));
     }
 
     #[test]
