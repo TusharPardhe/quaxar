@@ -172,14 +172,131 @@ struct CoordinatorPersistence {
 struct CoordinatorPersistenceWork {
     node_store: SHAMapStoreNodeStore,
     batch: WriteBatch,
-    pending: Arc<Mutex<CoordinatorPersistence>>,
-    tx: EventSender,
+    completion: CoordinatorPersistenceCompletionGuard,
 }
 
 impl CoordinatorPersistenceWork {
     fn payload_bytes(batch: &WriteBatch) -> usize {
         batch.nodes().iter().map(|node| node.data().len()).sum()
     }
+}
+
+/// Owns the terminal completion obligation for one scheduler submission.
+/// Rejection, scheduler shutdown, or unwind drops the task without calling
+/// `run`; this guard still releases the coordinator's exact pending write.
+struct CoordinatorPersistenceCompletionGuard {
+    operation: OperationRef,
+    fence: Option<OperationRef>,
+    pending: Arc<Mutex<CoordinatorPersistence>>,
+    tx: EventSender,
+    armed: bool,
+}
+
+impl CoordinatorPersistenceCompletionGuard {
+    fn new(
+        batch: &WriteBatch,
+        pending: Arc<Mutex<CoordinatorPersistence>>,
+        tx: EventSender,
+    ) -> Self {
+        Self {
+            operation: batch.operation(),
+            fence: batch.fence(),
+            pending,
+            tx,
+            armed: true,
+        }
+    }
+
+    fn settle(
+        &mut self,
+        write_outcome: WriteOutcome,
+        fence_outcome: Option<DurabilityOutcome>,
+        advance_fifo: bool,
+    ) -> Option<WriteBatch> {
+        if !self.armed {
+            return None;
+        }
+        self.armed = false;
+        settle_coordinator_persistence(
+            self.operation,
+            self.fence,
+            write_outcome,
+            fence_outcome,
+            &self.pending,
+            &self.tx,
+            advance_fifo,
+        )
+    }
+}
+
+impl Drop for CoordinatorPersistenceCompletionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Do not dispatch the queued successor from a drop path. A full or
+            // stopping scheduler would reject it synchronously too, recursively
+            // draining the FIFO on this stack. The failed completion makes the
+            // coordinator terminalize the session and cancellation clears the
+            // retained successor queue.
+            let _ = self.settle(
+                WriteOutcome::Failed,
+                self.fence.map(|_| DurabilityOutcome::Failed),
+                false,
+            );
+        }
+    }
+}
+
+fn settle_coordinator_persistence(
+    operation: OperationRef,
+    fence: Option<OperationRef>,
+    write_outcome: WriteOutcome,
+    fence_outcome: Option<DurabilityOutcome>,
+    pending: &Arc<Mutex<CoordinatorPersistence>>,
+    tx: &EventSender,
+    advance_fifo: bool,
+) -> Option<WriteBatch> {
+    let session = operation.session();
+    let next = {
+        let mut state = pending.lock().expect("coordinator persistence lock");
+        let was_empty = {
+            let entry = state.by_session.entry(session).or_default();
+            let was_empty = entry.completions.is_empty();
+            entry
+                .completions
+                .push_back(acquisition::AcquisitionEvent::WriteCompleted(
+                    WriteCompletion::new(operation, write_outcome),
+                ));
+            if let (Some(fence), Some(fence_outcome)) = (fence, fence_outcome) {
+                entry
+                    .completions
+                    .push_back(acquisition::AcquisitionEvent::DurabilityFenced(
+                        DurabilityCompletion::new(fence, fence_outcome),
+                    ));
+            }
+            was_empty
+        };
+        if was_empty {
+            state.ready_completion_sessions.push_back(session);
+        }
+
+        // Cancellation may already have cleared this exact slot. Retain the
+        // late completion for stale-event accounting, but never release or
+        // dispatch a successor on behalf of a different operation.
+        let entry = state
+            .by_session
+            .get_mut(&session)
+            .expect("persistence entry was inserted above");
+        if entry.in_flight != Some(operation) {
+            None
+        } else {
+            entry.in_flight = None;
+            advance_fifo
+                .then(|| entry.queued.pop_front().map(|command| command.batch))
+                .flatten()
+        }
+    };
+    flush_persistence_completions(pending, tx);
+    next
 }
 
 fn nodestore_object_type(kind: StoredObjectKind) -> NodeObjectType {
@@ -200,10 +317,8 @@ impl PersistenceWork for CoordinatorPersistenceWork {
         let Self {
             node_store,
             batch,
-            pending,
-            tx,
+            mut completion,
         } = *self;
-        let session = batch.operation().session();
         let (write_outcome, fence_outcome): (WriteOutcome, Option<DurabilityOutcome>) =
             if node_store.store_generation() != batch.store_generation().get() {
                 // A store rotation between admission and execution invalidates
@@ -249,50 +364,9 @@ impl PersistenceWork for CoordinatorPersistenceWork {
                     (None, None) => (WriteOutcome::Accepted, None),
                 }
             };
-        // Retain the exact ordered pair before releasing the FIFO. `try_send`
-        // cannot block a NodeStore worker behind the coordinator that drains
-        // its own control lane; an owner turn later flushes any retained pair.
-        let next = {
-            let mut state = pending.lock().expect("coordinator persistence lock");
-            let was_empty = {
-                let entry = state.by_session.entry(session).or_default();
-                let was_empty = entry.completions.is_empty();
-                entry
-                    .completions
-                    .push_back(acquisition::AcquisitionEvent::WriteCompleted(
-                        WriteCompletion::new(batch.operation(), write_outcome),
-                    ));
-                if let (Some(fence), Some(fence_outcome)) = (batch.fence(), fence_outcome) {
-                    entry
-                        .completions
-                        .push_back(acquisition::AcquisitionEvent::DurabilityFenced(
-                            DurabilityCompletion::new(fence, fence_outcome),
-                        ));
-                }
-                was_empty
-            };
-            if was_empty {
-                state.ready_completion_sessions.push_back(session);
-            }
-
-            // Advance the session FIFO only if this exact operation is still
-            // in flight. A cancelled session has no slot; its late completion
-            // is still replayed and rejected as stale by the coordinator, but
-            // it must not dispatch a successor.
-            let entry = state
-                .by_session
-                .get_mut(&session)
-                .expect("persistence entry was inserted above");
-            if entry.in_flight != Some(batch.operation()) {
-                None
-            } else {
-                entry.in_flight = None;
-                entry.queued.pop_front().map(|command| command.batch)
-            }
-        };
-        flush_persistence_completions(&pending, &tx);
+        let next = completion.settle(write_outcome, fence_outcome, true);
         if let Some(next) = next {
-            dispatch_persistence(&node_store, &pending, &tx, next);
+            dispatch_persistence(&node_store, &completion.pending, &completion.tx, next);
         }
     }
 }
@@ -353,11 +427,12 @@ fn dispatch_persistence(
     tx: &EventSender,
     batch: WriteBatch,
 ) {
+    let completion =
+        CoordinatorPersistenceCompletionGuard::new(&batch, Arc::clone(pending), tx.clone());
     node_store.schedule_write(Box::new(CoordinatorPersistenceWork {
         node_store: node_store.clone(),
         batch,
-        pending: Arc::clone(pending),
-        tx: tx.clone(),
+        completion,
     }));
 }
 
@@ -846,6 +921,14 @@ mod tests {
                 false
             }
         }
+
+        fn drop_next(&self) -> bool {
+            self.queued
+                .lock()
+                .expect("captured task lock")
+                .pop_front()
+                .is_some()
+        }
     }
 
     impl Scheduler for CaptureScheduler {
@@ -995,6 +1078,90 @@ mod tests {
                 (other, _) => panic!("expected a completion, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn dropped_write_reports_failure_without_recursively_dispatching_successor() {
+        let scheduler = Arc::new(CaptureScheduler::new());
+        let node_store = memory_node_store_with("coord-write-port-dropped", scheduler.clone());
+        let (tx, rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let mut port = CoordinatorWritePort::new(node_store.clone(), tx);
+        let session = session(20);
+        let first_write = operation(session, OperationKind::Write);
+        let first_fence = operation(session, OperationKind::DurabilityFence);
+        let second_write = operation(session, OperationKind::Write);
+
+        port.submit_write(WriteBatch::new(
+            first_write,
+            first_fence,
+            StoreGeneration::new(node_store.store_generation()),
+            777,
+            vec![PersistNode::new(
+                SHAMapHash::new(Uint256::from(0x20)),
+                bytes::Bytes::from(vec![0; 4096]),
+                StoredObjectKind::AccountNode,
+            )],
+        ));
+        port.submit_write(WriteBatch::incremental(
+            second_write,
+            StoreGeneration::new(node_store.store_generation()),
+            777,
+            vec![PersistNode::new(
+                SHAMapHash::new(Uint256::from(0x21)),
+                bytes::Bytes::from_static(&[2]),
+                StoredObjectKind::AccountNode,
+            )],
+        ));
+        assert_eq!(scheduler.pending(), 1);
+
+        // Models RealScheduler rejecting an oversized batch: dropping the
+        // scheduled task must settle the exact operation, but must not submit
+        // the queued successor into the same rejecting scheduler call stack.
+        assert!(scheduler.drop_next());
+        assert_eq!(scheduler.pending(), 0);
+
+        match rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("failed write")
+        {
+            acquisition::AcquisitionEvent::WriteCompleted(completion) => {
+                assert_eq!(completion.operation(), first_write);
+                assert_eq!(completion.outcome(), WriteOutcome::Failed);
+            }
+            other => panic!("expected failed write completion, got {other:?}"),
+        }
+        match rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("failed fence")
+        {
+            acquisition::AcquisitionEvent::DurabilityFenced(completion) => {
+                assert_eq!(completion.operation(), first_fence);
+                assert_eq!(completion.outcome(), DurabilityOutcome::Failed);
+            }
+            other => panic!("expected failed fence completion, got {other:?}"),
+        }
+        assert!(
+            port.pending
+                .lock()
+                .expect("coordinator persistence lock")
+                .by_session
+                .get(&session)
+                .is_some_and(|entry| {
+                    entry.in_flight.is_none()
+                        && entry.queued.len() == 1
+                        && entry.queued[0].batch.operation() == second_write
+                })
+        );
+
+        port.cancel_session(session);
+        assert!(
+            !port
+                .pending
+                .lock()
+                .expect("coordinator persistence lock")
+                .by_session
+                .contains_key(&session)
+        );
     }
 
     #[test]

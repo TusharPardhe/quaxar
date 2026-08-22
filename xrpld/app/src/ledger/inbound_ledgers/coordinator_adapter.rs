@@ -102,9 +102,37 @@ impl RetainedControlEvents {
         Self::flush_locked(&self.tx, &mut pending);
     }
 
+    /// Retain an exact completion without competing for the shared control
+    /// lane from its producer thread. High-volume read callbacks use this and
+    /// let the coordinator owner admit a bounded wave, leaving capacity for
+    /// write/fence and timer lifecycle completions.
+    pub(crate) fn retain(&self, event: AcquisitionEvent) {
+        self.pending
+            .lock()
+            .expect("retained control events lock")
+            .push_back(event);
+    }
+
     pub(crate) fn flush(&self) {
         let mut pending = self.pending.lock().expect("retained control events lock");
         Self::flush_locked(&self.tx, &mut pending);
+    }
+
+    pub(crate) fn flush_bounded(&self, limit: usize) {
+        let mut pending = self.pending.lock().expect("retained control events lock");
+        for _ in 0..limit {
+            let Some(event) = pending.pop_front() else {
+                break;
+            };
+            match self.tx.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(event))
+                | Err(mpsc::TrySendError::Disconnected(event)) => {
+                    pending.push_front(event);
+                    break;
+                }
+            }
+        }
     }
 
     fn flush_locked(tx: &EventSender, pending: &mut VecDeque<AcquisitionEvent>) {
@@ -1218,7 +1246,7 @@ impl BrokerReadPort {
                 BrokerReadOutcome::Cancelled => ReadOutcome::Cancelled,
                 BrokerReadOutcome::Fault(_) => ReadOutcome::Settled { node: None },
             };
-            sink_completions.push(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            sink_completions.retain(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
                 operation, outcome,
             )));
         });
@@ -1239,7 +1267,7 @@ impl BrokerReadPort {
             ReadAdmission::CapacityDeferred => false,
             ReadAdmission::Rejected(_) => {
                 self.completions
-                    .push(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+                    .retain(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
                         operation,
                         ReadOutcome::Stale,
                     )));
@@ -1282,7 +1310,11 @@ impl ReadPort for BrokerReadPort {
                 break;
             }
         }
-        self.completions.flush();
+        // Reads are the high-volume producer. Never let one flush occupy the
+        // whole shared lifecycle lane: the other half remains available for
+        // write/fence and timer completions which unblock session state.
+        self.completions
+            .flush_bounded(CONTROL_EVENT_QUEUE_CAPACITY / 2);
     }
 }
 
@@ -1339,7 +1371,9 @@ mod tests {
     };
     use acquisition::{
         AcquireReason, AdmissionBudget, BudgetState, IdCounter, LedgerTarget, OperationKind,
-        OperationRef, PlanEpoch, ReadPriority, SessionId, StoreGeneration, SyncPhase, TimerKind,
+        OperationRef, PersistNode, PlanEpoch, PlanSeed, ReadPriority, ScriptedEngine, ScriptedStep,
+        SessionId, SessionPersistence, StoreGeneration, StoredObjectKind, SyncPhase, TimerKind,
+        TreeEngine, TreePlanId, WriteCompletion, WriteOutcome,
     };
     use overlay::TmLedgerData;
     use overlay::message::wire::TmLedgerNode;
@@ -1466,6 +1500,161 @@ mod tests {
             packet_rx,
         );
         (adapter, cache)
+    }
+
+    #[test]
+    fn bounded_read_flush_reserves_control_lane_for_retained_write_completion() {
+        let (tx, rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let reads = RetainedControlEvents::new(tx.clone());
+        let writes = RetainedControlEvents::new(tx);
+
+        for _ in 0..CONTROL_EVENT_QUEUE_CAPACITY * 2 {
+            reads.retain(AcquisitionEvent::Heartbeat);
+        }
+        writes.retain(AcquisitionEvent::Shutdown);
+
+        reads.flush_bounded(CONTROL_EVENT_QUEUE_CAPACITY / 2);
+        writes.flush();
+
+        for index in 0..CONTROL_EVENT_QUEUE_CAPACITY / 2 {
+            assert!(
+                matches!(rx.try_recv(), Ok(AcquisitionEvent::Heartbeat)),
+                "read completion #{index} preserves FIFO order"
+            );
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(AcquisitionEvent::Shutdown)),
+            "a retained write/fence lifecycle fact must enter the reserved lane"
+        );
+        assert_eq!(
+            reads
+                .pending
+                .lock()
+                .expect("retained read completions")
+                .len(),
+            CONTROL_EVENT_QUEUE_CAPACITY * 3 / 2,
+            "excess reads remain owned for the next bounded owner turn"
+        );
+    }
+
+    #[derive(Debug)]
+    struct IncrementalPersistenceSeed;
+
+    impl PlanSeed for IncrementalPersistenceSeed {
+        fn build(
+            &mut self,
+            _session: SessionRef,
+            _header: &ledger::InboundLedgerPacket,
+        ) -> Option<Box<dyn TreeEngine + Send + Sync>> {
+            Some(Box::new(
+                ScriptedEngine::new(
+                    TreePlanId::new(1),
+                    [ScriptedStep::NeedsNetwork(vec![(
+                        SHAMapNodeId::default(),
+                        Uint256::from(0x9001),
+                    )])],
+                    vec![PersistNode::new(
+                        SHAMapHash::new(Uint256::from(0x9002)),
+                        bytes::Bytes::from_static(b"accepted-node"),
+                        StoredObjectKind::AccountNode,
+                    )],
+                )
+                .with_persistence_sequence(SEQ),
+            ))
+        }
+    }
+
+    #[test]
+    fn write_completion_reaches_incremental_plan_before_retained_reads_drain() {
+        let cache = fetch_pack();
+        let runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            BudgetState::default(),
+            Box::new(IncrementalPersistenceSeed),
+        );
+        let (tx, rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let (packet_tx, packet_rx) = mpsc::sync_channel(PACKET_INGRESS_QUEUE_CAPACITY);
+        let mut adapter = TestAdapter::with_event_channel(
+            runner,
+            ShadowConfig::disabled(),
+            FakeLedgerRequestPort::new(),
+            FakeReadPort::new(),
+            FakeWritePort::new(),
+            FakeTimerPort::new(),
+            FakeHandoffPort::new(),
+            FakePhasePort::new(),
+            FakeCancellationPort::new(),
+            Arc::clone(&cache),
+            tx.clone(),
+            rx,
+            packet_tx,
+            packet_rx,
+        );
+
+        adapter.connectivity(&[1]);
+        let live_session = adapter
+            .acquire_requested(target(9, SEQ), AcquireReason::Consensus)
+            .into_iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(session),
+                _ => None,
+            })
+            .expect("session");
+        assert_eq!(
+            adapter.route_ledger_data(
+                1,
+                &wire_ledger_data(Uint256::from(9), 0, vec![(None, base_root_wire())]),
+            ),
+            LedgerDataIngressDisposition::Delivered
+        );
+        assert_eq!(adapter.drain(), 1);
+        let write = adapter.writes.submitted[0].operation();
+        assert!(matches!(
+            adapter
+                .runner
+                .session(live_session)
+                .expect("session")
+                .plan()
+                .persistence(),
+            SessionPersistence::IncrementalWritePending { .. }
+        ));
+
+        let reads = RetainedControlEvents::new(tx.clone());
+        let writes = RetainedControlEvents::new(tx);
+        let stale_read = OperationRef::new(
+            session(999),
+            OperationKind::Read,
+            acquisition::OperationId::new(1),
+            acquisition::OperationGeneration::new(1),
+        );
+        for _ in 0..CONTROL_EVENT_QUEUE_CAPACITY * 2 {
+            reads.retain(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+                stale_read,
+                ReadOutcome::Stale,
+            )));
+        }
+        writes.retain(AcquisitionEvent::WriteCompleted(WriteCompletion::new(
+            write,
+            WriteOutcome::Accepted,
+        )));
+        reads.flush_bounded(CONTROL_EVENT_QUEUE_CAPACITY / 2);
+        writes.flush();
+
+        adapter.drain();
+        assert!(matches!(
+            adapter
+                .runner
+                .session(live_session)
+                .expect("session")
+                .plan()
+                .persistence(),
+            SessionPersistence::None
+        ));
+        assert_eq!(
+            reads.pending.lock().expect("retained reads").len(),
+            CONTROL_EVENT_QUEUE_CAPACITY * 3 / 2,
+            "write acknowledgement resumes the plan before the read backlog drains"
+        );
     }
 
     #[test]
@@ -2715,6 +2904,7 @@ mod tests {
             tickets.tickets.lock().unwrap().get(&session).is_none(),
             "cancellation releases every ticket for the session"
         );
+        port.flush_completions();
         let event = rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("completion");
@@ -2766,10 +2956,18 @@ mod tests {
             1,
             "ready dispatch reaches the NodeStore asynchronous read queue"
         );
-        match rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("typed NodeStore completion")
-        {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let event = loop {
+            port.flush_completions();
+            match rx.try_recv() {
+                Ok(event) => break event,
+                Err(mpsc::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("typed NodeStore completion: {error:?}"),
+            }
+        };
+        match event {
             AcquisitionEvent::ReadCompleted(completion) => {
                 assert_eq!(completion.operation(), operation);
                 assert_eq!(completion.outcome(), &ReadOutcome::Settled { node: None });
@@ -2871,6 +3069,7 @@ mod tests {
             ReadPriority::Consensus,
         );
         port.submit_read(request);
+        port.flush_completions();
         let event = rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("terminal completion");
