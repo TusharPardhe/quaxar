@@ -16,6 +16,8 @@ pub mod node_store_scheduler;
 pub mod offer_create;
 pub mod overlay_status;
 pub mod payment;
+#[cfg(test)]
+mod pseudo_transaction_tests;
 pub mod read_view_preclaim;
 pub mod snapshot_export_state;
 pub mod sntp;

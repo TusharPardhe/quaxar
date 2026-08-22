@@ -189,6 +189,52 @@ pub fn decrease_owner_count_for_object(
     Ok(())
 }
 
+/// Remove one reserve unit from a RippleState side. RippleState stores the
+/// reserve sponsor in `sfLowSponsor`/`sfHighSponsor`, rather than `sfSponsor`.
+pub fn decrease_owner_count_for_trust_line(
+    view: &mut dyn ApplyView,
+    account_sle: &Arc<STLedgerEntry>,
+    sponsor: Option<AccountID>,
+) -> Result<(), ViewError> {
+    let owner_field = get_field_by_symbol("sfOwnerCount");
+    let sponsored_field = get_field_by_symbol("sfSponsoredOwnerCount");
+    let sponsoring_field = get_field_by_symbol("sfSponsoringOwnerCount");
+    let account = account_sle.get_account_id(get_field_by_symbol("sfAccount"));
+    let current = account_sle.get_field_u32(owner_field);
+    let next = current.saturating_sub(1);
+    let mut account_obj = account_sle.clone_as_object();
+    account_obj.set_field_u32(owner_field, next);
+
+    if let Some(sponsor) = sponsor {
+        let sponsor_sle = view
+            .peek(protocol::account_keylet(
+                basics::base_uint::Uint160::from_void(sponsor.data()),
+            ))?
+            .ok_or_else(|| ViewError::Conversion("reserve sponsor account missing".into()))?;
+        account_obj.set_field_u32(
+            sponsored_field,
+            account_sle.get_field_u32(sponsored_field).saturating_sub(1),
+        );
+        let mut sponsor_obj = sponsor_sle.clone_as_object();
+        sponsor_obj.set_field_u32(
+            sponsoring_field,
+            sponsor_sle
+                .get_field_u32(sponsoring_field)
+                .saturating_sub(1),
+        );
+        view.update(Arc::new(STLedgerEntry::from_stobject(
+            sponsor_obj,
+            *sponsor_sle.key(),
+        )))?;
+    }
+
+    view.adjust_owner_count_hook(account, current, next);
+    view.update(Arc::new(STLedgerEntry::from_stobject(
+        account_obj,
+        *account_sle.key(),
+    )))
+}
+
 /// Extract the sponsor AccountID from an STLedgerEntry, defaulting to `sfSponsor`.
 /// Reserved rippled-parity helper; unused until sponsor-reserve flow work lands.
 #[allow(dead_code)]

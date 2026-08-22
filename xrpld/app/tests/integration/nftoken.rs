@@ -219,10 +219,7 @@ fn nftoken_mint_then_burn() {
     assert_eq!(get_owner_count(&view, alice), 1);
 
     // Get the token ID from the NFT page
-    let page_keylet = protocol::nft_page_keylet(
-        protocol::nft_page_min_keylet(acct_id(alice)),
-        Uint256::from(tx_mint.get_transaction_id()),
-    );
+    let page_keylet = protocol::nft_page_max_keylet(acct_id(alice));
     let token_id = if let Ok(Some(page)) = view.read(page_keylet) {
         let tokens = page.get_field_array(sf("sfNFTokens"));
         if let Some(token) = tokens.get(0) {

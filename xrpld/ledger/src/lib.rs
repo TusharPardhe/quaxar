@@ -44,8 +44,8 @@ pub use domain::ripple_calc;
 pub use domain::setup;
 pub use domain::sponsor_helpers::{
     SPF_SPONSOR_FEE, SPF_SPONSOR_FLAG_MASK, SPF_SPONSOR_RESERVE, decrease_owner_count_for_object,
-    increase_owner_count_for_object, is_fee_sponsored, is_reserve_sponsor_allowed,
-    is_reserve_sponsored, reserve_owner_count,
+    decrease_owner_count_for_trust_line, increase_owner_count_for_object, is_fee_sponsored,
+    is_reserve_sponsor_allowed, is_reserve_sponsored, reserve_owner_count,
 };
 pub use domain::timeout_counter;
 pub use domain::token_helpers;

@@ -3508,7 +3508,10 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             }
 
             if result == Ter::TEC_INCOMPLETE {
-                if !removed_trust_lines.is_empty() && removed_trust_lines.len() <= 500 {
+                if !removed_trust_lines.is_empty()
+                    && removed_trust_lines.len()
+                        <= usize::from(protocol::MAX_DELETABLE_AMM_TRUST_LINES)
+                {
                     for index in removed_trust_lines {
                         if let Ok(Some(sle)) = cleanup.peek(protocol::Keylet::new(
                             protocol::LedgerEntryType::RippleState,

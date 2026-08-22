@@ -599,20 +599,28 @@ fn preclaim_payment_channel_create<V: ReadView>(view: &V, tx: &STTx) -> Result<T
     let amount = tx.get_field_amount(sf("sfAmount"));
     let source = read_account(view, account)?;
     let destination_sle = read_account(view, destination)?;
-    let (covers_reserve, covers_amount) = source
-        .as_ref()
-        .map(|source| {
-            let balance = source.get_field_amount(sf("sfBalance")).xrp().drops();
-            let reserve = view
-                .fees()
-                .account_reserve(source.get_field_u32(sf("sfOwnerCount")) as usize + 1)
-                as i64;
-            (
-                balance >= reserve,
-                balance >= reserve.saturating_add(amount.xrp().drops()),
-            )
-        })
-        .unwrap_or((false, false));
+    let (covers_reserve, covers_amount) =
+        if source.is_some() && view.rules().enabled(&protocol::feature_id("Sponsor")) {
+            // rippled defers both reserve checks to doApply under Sponsor, where
+            // the transaction reserve bearer and the source's post-lock reserve
+            // can be evaluated independently.
+            (true, true)
+        } else {
+            source
+                .as_ref()
+                .map(|source| {
+                    let balance = source.get_field_amount(sf("sfBalance")).xrp().drops();
+                    let reserve = view
+                        .fees()
+                        .account_reserve(source.get_field_u32(sf("sfOwnerCount")) as usize + 1)
+                        as i64;
+                    (
+                        balance >= reserve,
+                        balance >= reserve.saturating_add(amount.xrp().drops()),
+                    )
+                })
+                .unwrap_or((false, false))
+        };
     Ok(run_payment_channel_create_preclaim(
         PaymentChannelCreatePreclaimFacts {
             source_account_exists: source.is_some(),

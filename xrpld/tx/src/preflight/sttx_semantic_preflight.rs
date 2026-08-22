@@ -40,6 +40,13 @@ pub fn validate_sttx_transaction_preflight_with_rules(tx: &STTx, rules: &Rules) 
         return Ter::TEM_DISABLED;
     }
 
+    // Transactor::invokePreflight calls checkExtraFeatures before preflight1
+    // and the universal/common checks. Preserve that TER precedence.
+    let extra_features = validate_sttx_extra_features(tx, rules);
+    if !is_tes_success(extra_features) {
+        return extra_features;
+    }
+
     let common = validate_sttx_common_transactor_preflight(tx);
     if !is_tes_success(common) {
         return common;
@@ -73,6 +80,52 @@ pub fn validate_sttx_transaction_preflight_with_rules(tx: &STTx, rules: &Rules) 
         return Ter::TEM_BAD_SIGNER;
     }
 
+    Ter::TES_SUCCESS
+}
+
+fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
+    match tx.get_txn_type() {
+        TxType::OFFER_CREATE => {
+            if tx.is_field_present(get_field_by_symbol("sfDomainID"))
+                && !rules.enabled(&protocol::feature_id("PermissionedDEX"))
+            {
+                return Ter::TEM_DISABLED;
+            }
+            let pays = get_field_by_symbol("sfTakerPays");
+            let gets = get_field_by_symbol("sfTakerGets");
+            if tx.is_field_present(pays)
+                && tx.is_field_present(gets)
+                && !rules.enabled(&protocol::feature_id("MPTokensV2"))
+                && (tx.get_field_amount(pays).holds_mpt_issue()
+                    || tx.get_field_amount(gets).holds_mpt_issue())
+            {
+                return Ter::TEM_DISABLED;
+            }
+        }
+        TxType::PAYCHAN_CLAIM => {
+            if tx.is_field_present(get_field_by_symbol("sfCredentialIDs"))
+                && !rules.enabled(&protocol::feature_id("Credentials"))
+            {
+                return Ter::TEM_DISABLED;
+            }
+        }
+        TxType::AMM_CREATE => {
+            if !protocol::amm_enabled(rules) {
+                return Ter::TEM_DISABLED;
+            }
+            let amount = get_field_by_symbol("sfAmount");
+            let amount2 = get_field_by_symbol("sfAmount2");
+            if tx.is_field_present(amount)
+                && tx.is_field_present(amount2)
+                && !rules.enabled(&protocol::feature_id("MPTokensV2"))
+                && (tx.get_field_amount(amount).holds_mpt_issue()
+                    || tx.get_field_amount(amount2).holds_mpt_issue())
+            {
+                return Ter::TEM_DISABLED;
+            }
+        }
+        _ => {}
+    }
     Ter::TES_SUCCESS
 }
 
@@ -291,7 +344,9 @@ fn validate_nftoken_accept_offer_preflight(tx: &STTx) -> NotTec {
             return Ter::TEM_MALFORMED;
         }
         let broker_fee = tx.get_field_amount(broker_fee_field);
-        if !broker_fee.is_legal_net() || broker_fee.signum() <= 0 {
+        // NFTokenAcceptOffer.cpp checks only the strict-positive condition.
+        // Unlike OfferCreate, it does not apply isLegalNet to BrokerFee.
+        if broker_fee.signum() <= 0 {
             return Ter::TEM_MALFORMED;
         }
     }
@@ -1041,6 +1096,30 @@ mod tests {
     }
 
     #[test]
+    fn typed_extra_feature_gates_precede_common_preflight() {
+        let mut permissioned_offer = offer_create(0);
+        permissioned_offer.set_account_id(sf("sfAccount"), AccountID::default());
+        permissioned_offer.set_field_h256(sf("sfDomainID"), Uint256::from_u64(1));
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &permissioned_offer,
+                &Rules::new(std::iter::empty()),
+            ),
+            Ter::TEM_DISABLED,
+        );
+
+        let mut disabled_amm = amm_create(0);
+        disabled_amm.set_account_id(sf("sfAccount"), AccountID::default());
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &disabled_amm,
+                &Rules::new([protocol::feature_amm()]),
+            ),
+            Ter::TEM_DISABLED,
+        );
+    }
+
+    #[test]
     fn nftoken_accept_offer_preflight_is_not_a_success_noop() {
         let rules = Rules::new(std::iter::empty());
         assert_eq!(
@@ -1063,6 +1142,13 @@ mod tests {
                 &rules,
             ),
             Ter::TEM_MALFORMED,
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &nftoken_accept_offer(true, true, Some(1)),
+                &rules,
+            ),
+            Ter::TES_SUCCESS,
         );
     }
 

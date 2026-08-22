@@ -591,3 +591,59 @@ fn amm_delete_nonexistent() {
         result
     );
 }
+
+#[test]
+fn amm_withdraw_all_deletes_empty_pool_and_pseudo_account() {
+    let alice = acct(0x31);
+    let gw = acct(0x32);
+    let usd = Issue::new(protocol::currency_from_string("USD"), gw);
+    let mut ledger = make_ledger(vec![
+        account_root(alice, 100_000_000_000, 0, 0),
+        account_root(gw, 100_000_000_000, 0, 0),
+        trust_line_local(alice, gw, usd.currency, 50_000, 100_000, 0),
+    ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("AMM")]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let create = amm_create_tx(alice, xrp(10_000_000), iou(gw, "USD", 10_000), 0, 1);
+    assert_eq!(
+        full_apply(&mut view, &create, TxType::AMM_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let amm_keylet = protocol::keylet::amm(Asset::Issue(protocol::xrp_issue()), Asset::Issue(usd));
+    let amm = view
+        .read(amm_keylet)
+        .expect("AMM read after create")
+        .expect("AMM should exist after create");
+    let amm_account = amm.get_account_id(sf("sfAccount"));
+
+    let withdraw = STTx::new(TxType::AMM_WITHDRAW, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), Asset::Issue(protocol::xrp_issue())),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(usd)),
+        );
+        tx.set_field_u32(sf("sfFlags"), protocol::AMM_WITHDRAW_ALL_FLAG);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 2);
+    });
+
+    assert_eq!(
+        full_apply(&mut view, &withdraw, TxType::AMM_WITHDRAW),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(amm_keylet)
+            .expect("AMM read after withdraw-all")
+            .is_none()
+    );
+    assert!(
+        view.read(account_keylet(acct_id(amm_account)))
+            .expect("AMM pseudo-account read after withdraw-all")
+            .is_none()
+    );
+}

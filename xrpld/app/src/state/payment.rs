@@ -83,7 +83,6 @@ const TF_NO_RIPPLE_DIRECT: u32 = 0x0001_0000;
 const TF_LIMIT_QUALITY: u32 = 0x0004_0000;
 
 const LSF_REQUIRE_DEST_TAG: u32 = 0x0002_0000;
-const LSF_DEPOSIT_AUTH: u32 = 0x0100_0000;
 const LSF_PASSWORD_SPENT: u32 = 0x0001_0000;
 // Kept for compatibility with the reference source flag checks; the current Rust path does
 // not yet consume the trustline-auth branch directly.
@@ -244,7 +243,9 @@ pub fn do_payment<V: ledger::ApplyView>(
 
         // Deposit preauth check for IOU payments
         if let Some(ref dst_sle) = dst_exists {
-            if let Some(ter) = check_deposit_preauth(view, &account, &dst_account_id, dst_sle) {
+            if let Some(ter) =
+                verify_deposit_preauth(view, sttx, &account, &dst_account_id, dst_sle)
+            {
                 return ter;
             }
         }
@@ -312,7 +313,9 @@ pub fn do_payment<V: ledger::ApplyView>(
         }
     } else if is_dst_mpt {
         if let Some(ref dst_sle) = dst_exists {
-            if let Some(ter) = check_deposit_preauth(view, &account, &dst_account_id, dst_sle) {
+            if let Some(ter) =
+                verify_deposit_preauth(view, sttx, &account, &dst_account_id, dst_sle)
+            {
                 return ter;
             }
         }
@@ -335,6 +338,7 @@ pub fn do_payment<V: ledger::ApplyView>(
             &dst_amount,
             dst_exists,
             pre_fee_balance_drops,
+            sttx,
         )
     }
 }
@@ -547,6 +551,7 @@ fn do_direct_xrp_payment<V: ledger::ApplyView>(
     dst_amount: &STAmount,
     dst_sle_opt: Option<Arc<STLedgerEntry>>,
     pre_fee_balance_drops: Option<i64>,
+    sttx: &STTx,
 ) -> Ter {
     let xrp_drops = dst_amount.xrp().drops();
     if xrp_drops <= 0 {
@@ -615,7 +620,7 @@ fn do_direct_xrp_payment<V: ledger::ApplyView>(
     let dst_reserve = view.fees().reserve as i64;
     let dst_balance = dst_sle.get_field_amount(sf("sfBalance")).xrp().drops();
     if xrp_drops > dst_reserve || dst_balance > dst_reserve {
-        if let Some(ter) = check_deposit_preauth(view, account, dst_account_id, &dst_sle) {
+        if let Some(ter) = verify_deposit_preauth(view, sttx, account, dst_account_id, &dst_sle) {
             return ter;
         }
     }
@@ -653,35 +658,18 @@ fn do_direct_xrp_payment<V: ledger::ApplyView>(
 
 ///
 /// Returns `None` if deposit is allowed, `Some(Ter)` if rejected.
-fn check_deposit_preauth<V: ledger::ApplyView>(
-    view: &V,
+fn verify_deposit_preauth<V: ledger::ApplyView>(
+    view: &mut V,
+    sttx: &STTx,
     src: &AccountID,
     dst: &AccountID,
     dst_sle: &STLedgerEntry,
 ) -> Option<Ter> {
-    // If source == destination, always allowed
-    if src == dst {
-        return None;
+    match ledger::credential_helpers::verify_deposit_preauth(sttx, view, src, dst, Some(dst_sle)) {
+        Ok(Ter::TES_SUCCESS) => None,
+        Ok(ter) => Some(ter),
+        Err(_) => Some(Ter::TEF_BAD_LEDGER),
     }
-
-    let dst_flags = dst_sle.get_field_u32(sf("sfFlags"));
-
-    // If destination doesn't have deposit auth, always allowed
-    if (dst_flags & LSF_DEPOSIT_AUTH) == 0 {
-        return None;
-    }
-
-    // Check if source is deposit-preauthorized by destination
-    let preauth_keylet = protocol::deposit_preauth_keylet(
-        Uint160::from_void(dst.data()),
-        Uint160::from_void(src.data()),
-    );
-    if view.exists(preauth_keylet).unwrap_or(false) {
-        return None;
-    }
-
-    // Not authorized
-    Some(Ter::TEC_NO_PERMISSION)
 }
 
 #[cfg(test)]

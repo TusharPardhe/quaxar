@@ -724,6 +724,71 @@ fn offer_full_xrp_iou_crossing() {
     );
 }
 
+#[test]
+fn fully_consumed_offer_metadata_zeros_amounts_and_deletes_book_directory() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    let mut built = build_ledger_with_features(
+        vec![
+            account_root(alice, 10_000_000_000, 1, 0),
+            account_root(bob, 10_000_000_000, 1, 0),
+            account_root(gw, 10_000_000_000, 0, 0),
+            trust_line(alice, gw, usd, 1_000, 10_000, 0),
+            trust_line(bob, gw, usd, 0, 10_000, 0),
+        ],
+        vec!["fixPreviousTxnID"],
+    );
+    built.set_total_drops(100_000_000_000);
+    let ledger_seq = built.header().seq;
+    let rules = built.rules().clone();
+
+    let resting = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1_000), 1);
+    {
+        let mut tx_view = Sandbox::new(Arc::new(built.clone()), ApplyFlags::NONE);
+        assert_eq!(
+            apply_submit_transactor_shell(&mut tx_view, &resting, TxType::OFFER_CREATE),
+            Ter::TES_SUCCESS
+        );
+        tx_view
+            .apply_with_tx_thread(&mut built, resting.get_transaction_id(), ledger_seq, &rules)
+            .expect("commit resting offer");
+    }
+
+    let offer_key = protocol::offer_keylet(acct_id(alice), 1);
+    let book_directory = built
+        .read(offer_key)
+        .expect("read resting offer")
+        .expect("resting offer exists")
+        .get_field_h256(sf("sfBookDirectory"));
+    let crossing = offer_tx(bob, iou(gw, usd, 1_000), xrp(1_000_000_000), 1);
+    let mut tx_view = Sandbox::new(Arc::new(built), ApplyFlags::NONE);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut tx_view, &crossing, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let meta = tx_view
+        .table()
+        .to_tx_meta(crossing.get_transaction_id(), ledger_seq, None);
+
+    let offer_node = meta
+        .get_nodes()
+        .iter()
+        .find(|node| node.get_field_h256(sf("sfLedgerIndex")) == offer_key.key)
+        .expect("consumed offer affected node");
+    assert_eq!(offer_node.fname(), sf("sfDeletedNode"));
+    let final_fields = offer_node.get_field_object(sf("sfFinalFields"));
+    assert_eq!(final_fields.get_field_amount(sf("sfTakerPays")).signum(), 0);
+    assert_eq!(final_fields.get_field_amount(sf("sfTakerGets")).signum(), 0);
+    let directory_node = meta
+        .get_nodes()
+        .iter()
+        .find(|node| node.get_field_h256(sf("sfLedgerIndex")) == book_directory)
+        .expect("consumed offer book directory affected node");
+    assert_eq!(directory_node.fname(), sf("sfDeletedNode"));
+}
+
 /// C++ Offer_test — partial crossing: bob's offer is smaller than alice's.
 #[test]
 fn offer_partial_crossing_bob_smaller() {

@@ -428,13 +428,18 @@ fn amm_deposit_apply_math_single_asset_deposit_uses_amm_formula() {
         flags: AMM_SINGLE_ASSET_FLAG,
     })
     .expect("single asset deposit should calculate");
-    let expected_lp = ledger::amm_helpers::adjust_lp_tokens(
+    let formula_lp = ledger::amm_helpers::lp_tokens_out(&pool, &deposit, &lp_balance, 0);
+    let (expected_amount, _, expected_lp) = ledger::amm_helpers::adjust_amounts_by_lp_tokens(
+        &pool,
+        &deposit,
+        None,
         &lp_balance,
-        &ledger::amm_helpers::lp_tokens_out(&pool, &deposit, &lp_balance, 0),
+        &formula_lp,
+        0,
         ledger::amm_helpers::IsDeposit::Yes,
     );
 
-    assert_eq!(result.amount1, Some(deposit));
+    assert_eq!(result.amount1, Some(expected_amount));
     assert_eq!(result.amount2, None);
     assert_eq!(result.lp_tokens, expected_lp.clone());
     assert_eq!(result.new_lp_token_balance, lp_balance + expected_lp);
@@ -538,9 +543,10 @@ fn amm_deposit_apply_math_limit_lp_token_accepts_effective_price() {
     let pool = iou(1_000, asset1);
     let deposit = iou(100, asset1);
     let lp_balance = lp(500, lpt);
+    let formula_tokens = ledger::amm_helpers::lp_tokens_out(&pool, &deposit, &lp_balance, 0);
     let tokens = ledger::amm_helpers::adjust_lp_tokens(
         &lp_balance,
-        &ledger::amm_helpers::lp_tokens_out(&pool, &deposit, &lp_balance, 0),
+        &formula_tokens,
         ledger::amm_helpers::IsDeposit::Yes,
     );
     let e_price = deposit.divide(&tokens, Asset::from(asset1));
@@ -550,7 +556,7 @@ fn amm_deposit_apply_math_limit_lp_token_accepts_effective_price() {
         amount2: None,
         e_price: Some(e_price),
         lp_token_out: None,
-        pool_amount1: pool,
+        pool_amount1: pool.clone(),
         pool_amount2: iou(2_000, asset2),
         lp_token_balance: lp_balance.clone(),
         trading_fee: 0,
@@ -558,11 +564,20 @@ fn amm_deposit_apply_math_limit_lp_token_accepts_effective_price() {
         flags: AMM_LIMIT_LP_TOKEN_FLAG,
     })
     .expect("limit LP token mode should accept effective price");
+    let (expected_amount, _, expected_tokens) = ledger::amm_helpers::adjust_amounts_by_lp_tokens(
+        &pool,
+        &deposit,
+        None,
+        &lp_balance,
+        &formula_tokens,
+        0,
+        ledger::amm_helpers::IsDeposit::Yes,
+    );
 
-    assert_eq!(result.amount1, Some(deposit));
+    assert_eq!(result.amount1, Some(expected_amount));
     assert_eq!(result.amount2, None);
-    assert_eq!(result.lp_tokens, tokens.clone());
-    assert_eq!(result.new_lp_token_balance, lp_balance + tokens);
+    assert_eq!(result.lp_tokens, expected_tokens.clone());
+    assert_eq!(result.new_lp_token_balance, lp_balance + expected_tokens);
 }
 
 #[test]

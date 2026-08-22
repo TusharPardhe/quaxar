@@ -353,6 +353,44 @@ fn escrow_create_and_finish() {
     );
 }
 
+#[test]
+fn escrow_finish_obeys_destination_deposit_auth_before_mutation() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let carol = acct(0x33);
+    let lsf_deposit_auth = 0x0100_0000;
+    let mut ledger = make_ledger(vec![
+        account_root(alice, 5_000_000_000, 0, 0),
+        account_root(bob, 5_000_000_000, 0, lsf_deposit_auth),
+        account_root(carol, 5_000_000_000, 0, 0),
+    ]);
+    let create = escrow_create_tx(alice, bob, 1_000_000_000, 1, 1_001);
+    let mut create_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut create_view, &create, TxType::ESCROW_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    create_view.apply(&mut ledger).expect("create apply");
+    let mut header = ledger.header();
+    header.parent_close_time = 1_002;
+    ledger.set_ledger_info(header);
+    let balance_before = get_balance(&ledger, bob);
+    let finish = escrow_finish_tx(carol, alice, 1, 1);
+    let mut finish_view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    assert_eq!(
+        handle_real_dispatch(&mut finish_view, &finish, TxType::ESCROW_FINISH, None),
+        Ter::TEC_NO_PERMISSION
+    );
+    assert_eq!(get_balance(&finish_view, bob), balance_before);
+    assert!(
+        finish_view
+            .read(protocol::escrow_keylet(acct_id(alice), 1))
+            .expect("escrow read")
+            .is_some()
+    );
+}
+
 /// C++ Escrow_test — full lifecycle: create then cancel.
 #[test]
 fn escrow_create_and_cancel() {

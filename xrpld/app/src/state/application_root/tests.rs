@@ -14,6 +14,7 @@ use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
 use crate::runtime::main_runtime::{GrpcRuntime, ManagedComponent};
 use crate::shamap::shamap_store_service::SHAMapStoreService;
 use crate::state::accept_ledger_pending_apply::AcceptLedgerPendingApplyRuntime;
+use crate::state::transactor_dispatcher::handle_real_dispatch;
 use crate::tx_queue::transaction::Transaction;
 use crate::{
     AppOpenLedgerView, AppQueueApplyTxSource, AppTxQ, NetworkOpsConsensusMode,
@@ -325,6 +326,32 @@ fn signed_ticket_create_tx(
     tx.sign(&public, &secret, None)
         .expect("signature should succeed");
     (source, Arc::new(tx))
+}
+
+fn signed_set_regular_key_tx(
+    source: AccountID,
+    signer_seed: u8,
+    sequence: u32,
+    fee_drops: u64,
+    regular_key: Option<AccountID>,
+) -> Arc<STTx> {
+    let secret = SecretKey::from_bytes([signer_seed; 32]);
+    let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+    let mut tx = STTx::new(TxType::REGULAR_KEY_SET, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(fee_drops, false),
+        );
+        tx.set_field_vl(get_field_by_symbol("sfSigningPubKey"), public.as_bytes());
+        if let Some(regular_key) = regular_key {
+            tx.set_account_id(get_field_by_symbol("sfRegularKey"), regular_key);
+        }
+    });
+    tx.sign(&public, &secret, None)
+        .expect("signature should succeed");
+    Arc::new(tx)
 }
 
 fn ledger_view(seq: u32, account: AccountID, account_sequence: u32, tx_ids: &[Uint256]) -> Ledger {
@@ -1371,6 +1398,132 @@ fn submit_direct_apply_ticket_create_updates_ticket_tracking() {
         submit_view
             .exists(protocol::ticket_keylet(raw_account_id(source), 3))
             .expect("ticket 3 lookup should succeed")
+    );
+}
+
+#[test]
+fn set_regular_key_zero_minimum_fee_arms_password_spent() {
+    let master_secret = SecretKey::from_bytes([0x61; 32]);
+    let master_public =
+        derive_public_key(KeyType::Secp256k1, &master_secret).expect("master public key");
+    let source = calc_account_id(master_public.as_bytes());
+    let regular_key = AccountID::from_array([0x62; 20]);
+    let tx = signed_set_regular_key_tx(source, 0x61, 1, 0, Some(regular_key));
+    let parent = Arc::new(ledger_view(1, source, 1, &[]));
+    let mut view = Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE);
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &tx, TxType::REGULAR_KEY_SET),
+        Ter::TES_SUCCESS
+    );
+
+    let account_root = view
+        .read(account_keylet(raw_account_id(source)))
+        .expect("account read should succeed")
+        .expect("account should exist");
+    assert_eq!(
+        account_root.get_account_id(get_field_by_symbol("sfRegularKey")),
+        regular_key
+    );
+    assert_ne!(
+        account_root.get_field_u32(get_field_by_symbol("sfFlags")) & protocol::lsfPasswordSpent,
+        0,
+        "the master-signed zero-minimum-fee transaction must spend the password privilege"
+    );
+    assert_eq!(
+        account_root.get_field_u32(get_field_by_symbol("sfSequence")),
+        2
+    );
+    assert_eq!(
+        account_root
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        1_000_000_000,
+        "a zero-fee SetRegularKey must not burn XRP"
+    );
+}
+
+#[test]
+fn set_regular_key_cannot_remove_the_last_alternative_key() {
+    let master_secret = SecretKey::from_bytes([0x63; 32]);
+    let master_public =
+        derive_public_key(KeyType::Secp256k1, &master_secret).expect("master public key");
+    let source = calc_account_id(master_public.as_bytes());
+    let regular_secret = SecretKey::from_bytes([0x64; 32]);
+    let regular_public =
+        derive_public_key(KeyType::Secp256k1, &regular_secret).expect("regular public key");
+    let regular_key = calc_account_id(regular_public.as_bytes());
+    let parent = Arc::new(ledger_view(1, source, 1, &[]));
+    let mut view = Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE);
+    let account_key = account_keylet(raw_account_id(source));
+    let account_root = view
+        .peek(account_key)
+        .expect("account peek should succeed")
+        .expect("account should exist");
+    let mut account_object = account_root.clone_as_object();
+    account_object.set_field_u32(get_field_by_symbol("sfFlags"), protocol::lsfDisableMaster);
+    account_object.set_account_id(get_field_by_symbol("sfRegularKey"), regular_key);
+    view.update(Arc::new(STLedgerEntry::from_stobject(
+        account_object,
+        *account_root.key(),
+    )))
+    .expect("account seed update should succeed");
+
+    let tx = signed_set_regular_key_tx(source, 0x64, 1, 10, None);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &tx, TxType::REGULAR_KEY_SET),
+        Ter::TEC_NO_ALTERNATIVE_KEY
+    );
+
+    let account_root = view
+        .read(account_key)
+        .expect("account read should succeed")
+        .expect("account should exist");
+    assert_eq!(
+        account_root.get_account_id(get_field_by_symbol("sfRegularKey")),
+        regular_key,
+        "the ordinary tec reset must preserve the existing regular key"
+    );
+    assert_eq!(
+        account_root.get_field_u32(get_field_by_symbol("sfFlags")),
+        protocol::lsfDisableMaster,
+        "failed removal must not arm password-spent or change account flags"
+    );
+    assert_eq!(
+        account_root.get_field_u32(get_field_by_symbol("sfSequence")),
+        2,
+        "the claimed tec consumes sequence"
+    );
+    assert_eq!(
+        account_root
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        999_999_990,
+        "the claimed tec retains only the fee and sequence preamble"
+    );
+}
+
+#[test]
+fn set_regular_key_missing_account_uses_transactor_and_do_apply_error_codes() {
+    let source = AccountID::from_array([0x65; 20]);
+    let other = AccountID::from_array([0x66; 20]);
+    let tx = signed_set_regular_key_tx(source, 0x67, 1, 10, Some(other));
+    let parent = Arc::new(ledger_view(1, other, 1, &[]));
+
+    let mut shell_view = Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut shell_view, &tx, TxType::REGULAR_KEY_SET),
+        Ter::TER_NO_ACCOUNT,
+        "the generic transactor preamble owns the public missing-account result"
+    );
+
+    let mut dispatch_view = Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut dispatch_view, &tx, TxType::REGULAR_KEY_SET, None),
+        Ter::TEF_INTERNAL,
+        "SetRegularKey::doApply treats a vanished source as an internal ledger error"
     );
 }
 

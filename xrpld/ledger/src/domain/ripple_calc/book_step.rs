@@ -533,7 +533,17 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             let new_pays = taker_pays - consumption.offer_in.clone();
             let new_gets = taker_gets - consumption.offer_out.clone();
             if new_pays.signum() <= 0 || new_gets.signum() <= 0 {
-                remove_consumed_offer(view, &offer_sle);
+                // rippled's TOffer::consume writes the remaining amounts to
+                // the sandbox before BookTip advances and offerDelete erases
+                // the fully-consumed offer.  That intermediate write is
+                // consensus-visible in DeletedNode FinalFields/PreviousFields
+                // even though the final state no longer contains the offer.
+                let mut obj = offer_sle.clone_as_object();
+                obj.set_field_amount(sf("sfTakerPays"), new_pays);
+                obj.set_field_amount(sf("sfTakerGets"), new_gets);
+                let consumed_offer = STLedgerEntry::from_stobject(obj, *offer_sle.key());
+                let _ = view.update(Arc::new(consumed_offer.clone()));
+                remove_consumed_offer(view, &consumed_offer);
             } else {
                 let mut obj = offer_sle.clone_as_object();
                 obj.set_field_amount(sf("sfTakerPays"), new_pays);
@@ -1526,7 +1536,7 @@ fn remove_consumed_offer<V: ApplyView>(view: &mut V, offer_sle: &STLedgerEntry) 
             &book_dir,
             book_node,
             *offer_sle.key(),
-            true,
+            false,
         );
     }
 

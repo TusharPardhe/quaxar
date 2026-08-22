@@ -1,9 +1,9 @@
 //! the reference implementation parity — credential validation, expiration, and
 //! deposit preauth checks.
 
+use crate::dir_remove;
 use crate::views::apply_view::ApplyView;
 use crate::views::read_view::{ReadView, ViewError};
-use crate::{adjust_owner_count, dir_remove};
 use basics::base_uint::{Uint160, Uint256};
 use protocol::{
     AccountID, STArray, STLedgerEntry, STTx, STVector256, Ter, account_keylet, credential_keylet,
@@ -153,7 +153,7 @@ pub fn delete_sle(
     }
 
     if !accepted || subject == issuer {
-        adjust_owner_count(view, &issuer_sle, -1)?;
+        crate::decrease_owner_count_for_object(view, &issuer_sle, &sle_credential, 1)?;
     }
 
     // rippled processes the accepted-subject leg only after completing the
@@ -174,7 +174,7 @@ pub fn delete_sle(
         }
 
         if accepted {
-            adjust_owner_count(view, &subject_sle, -1)?;
+            crate::decrease_owner_count_for_object(view, &subject_sle, &sle_credential, 1)?;
         }
     }
 

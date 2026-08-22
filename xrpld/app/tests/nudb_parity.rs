@@ -245,6 +245,41 @@ fn fetch_tx_items_for_ledger_from(
     Ok(items)
 }
 
+#[test]
+#[ignore = "requires testnet NuDB and testnet RPC access"]
+fn testnet_ledger_20126307_offer_create_replay_matches_validated_roots() {
+    let nudb_path = std::env::var("XRPL_TESTNET_NUDB_PATH")
+        .unwrap_or_else(|_| DEFAULT_TESTNET_NUDB_PATH.to_string());
+    if !Path::new(&nudb_path).exists() {
+        eprintln!("skipping live OfferCreate replay: NuDB path does not exist: {nudb_path}");
+        return;
+    }
+
+    let parent_seq = 20_126_306;
+    let child_seq = 20_126_307;
+    let parent = load_testnet_parent_ledger(parent_seq, &nudb_path)
+        .unwrap_or_else(|error| panic!("failed to load OfferCreate parent: {error}"));
+    let expected_parent = fetch_ledger_header_from(XRPL_TESTNET_RPC_URL, parent_seq)
+        .expect("fetch canonical parent header");
+    assert_eq!(parent.header().hash, expected_parent.hash);
+    assert_eq!(parent.header().account_hash, expected_parent.account_hash);
+
+    let header = fetch_ledger_header_from(XRPL_TESTNET_RPC_URL, child_seq)
+        .expect("fetch canonical child header");
+    let tx_items = fetch_tx_items_for_ledger_from(XRPL_TESTNET_RPC_URL, child_seq)
+        .expect("fetch canonical child transaction");
+    let (built, ters) = replay_child_ledger_unverified(&parent, header.clone(), &tx_items)
+        .expect("replay single OfferCreate child");
+
+    assert_eq!(ters, vec![Ter::TES_SUCCESS]);
+    assert_eq!(built.header().tx_hash, header.tx_hash);
+    assert_eq!(built.header().account_hash, header.account_hash);
+    assert_eq!(
+        protocol::calculate_ledger_hash(&built.header()),
+        header.hash
+    );
+}
+
 /// Encode a variable-length field using the real XRPL VL length-prefix
 /// scheme (see `Serializer::decode_length_length`/`decode_vl_length_1/2/3`):
 /// lengths 0..=192 use a single byte equal to the length; lengths

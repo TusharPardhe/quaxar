@@ -28,14 +28,14 @@ fn update_trust_line<V: ApplyView>(
     sender: &AccountID,
     before: &STAmount,
     after: &STAmount,
-) -> (bool, Option<u32>) {
+) -> Result<(bool, Option<u32>), Ter> {
     // Returns (should_delete, new_flags_if_reserve_cleared)
     let flags = state.get_field_u32(sf("sfFlags"));
 
     let sender_keylet =
         protocol::account_keylet(basics::base_uint::Uint160::from_void(sender.data()));
     let Some(sle) = view.peek(sender_keylet).ok().flatten() else {
-        return (false, None);
+        return Err(Ter::TEF_BAD_LEDGER);
     };
 
     // Determine which side's flags to check based on sender position
@@ -86,7 +86,16 @@ fn update_trust_line<V: ApplyView>(
         && state.get_field_u32(quality_out_field) == 0
     {
         // Release reserve
-        adjust_owner_count(view, &sle, -1);
+        let sponsor_field = if b_sender_high {
+            sf("sfHighSponsor")
+        } else {
+            sf("sfLowSponsor")
+        };
+        let sponsor = state
+            .is_field_present(sponsor_field)
+            .then(|| state.get_account_id(sponsor_field));
+        crate::decrease_owner_count_for_trust_line(view, &sle, sponsor)
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?;
 
         // Clear reserve flag
         let new_flags = flags & !reserve_flag;
@@ -99,11 +108,11 @@ fn update_trust_line<V: ApplyView>(
             LSF_HIGH_RESERVE
         };
         if after.signum() == 0 && (new_flags & other_reserve) == 0 {
-            return (true, Some(new_flags));
+            return Ok((true, Some(new_flags)));
         }
-        return (false, Some(new_flags));
+        return Ok((false, Some(new_flags)));
     }
-    (false, None)
+    Ok((false, None))
 }
 
 fn adjust_owner_count<V: ApplyView>(view: &mut V, account_sle: &STLedgerEntry, adjustment: i32) {
@@ -169,7 +178,11 @@ pub fn issue_iou<V: ApplyView>(
     let b_sender_high = issue.account > *account;
     let line_keylet = protocol::line(issue.account, *account, issue.currency);
 
-    if let Some(state) = view.peek(line_keylet).ok().flatten() {
+    let state = match view.peek(line_keylet) {
+        Ok(state) => state,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if let Some(state) = state {
         let mut final_balance = state.get_field_amount(sf("sfBalance"));
         if b_sender_high {
             final_balance.negate();
@@ -177,14 +190,17 @@ pub fn issue_iou<V: ApplyView>(
         let start_balance = final_balance.clone();
         final_balance -= amount.clone();
 
-        let (must_delete, new_flags) = update_trust_line(
+        let (must_delete, new_flags) = match update_trust_line(
             view,
             &state,
             b_sender_high,
             &issue.account,
             &start_balance,
             &final_balance,
-        );
+        ) {
+            Ok(result) => result,
+            Err(ter) => return ter,
+        };
 
         if b_sender_high {
             final_balance.negate();
@@ -194,7 +210,13 @@ pub fn issue_iou<V: ApplyView>(
         obj.set_field_amount(sf("sfBalance"), final_balance);
         if let Some(nf) = new_flags {
             obj.set_field_u32(sf("sfFlags"), nf);
+            obj.make_field_absent(if b_sender_high {
+                sf("sfHighSponsor")
+            } else {
+                sf("sfLowSponsor")
+            });
         }
+        let updated = STLedgerEntry::from_stobject(obj, *state.key());
 
         if must_delete {
             let low = if b_sender_high {
@@ -207,11 +229,11 @@ pub fn issue_iou<V: ApplyView>(
             } else {
                 account
             };
-            return trust_delete(view, &state, low, high);
+            return trust_delete(view, &updated, low, high);
         }
 
-        let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *state.key())));
-        Ter::TES_SUCCESS
+        view.update(Arc::new(updated))
+            .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
     } else {
         // Trust line doesn't exist — create it
         // For the payment engine, this means the receiver gets a new trust line
@@ -335,8 +357,10 @@ pub fn redeem_iou<V: ApplyView>(
     let b_sender_high = *account > issue.account;
     let line_keylet = protocol::line(*account, issue.account, issue.currency);
 
-    let Some(state) = view.peek(line_keylet).ok().flatten() else {
-        return Ter::TEF_INTERNAL;
+    let state = match view.peek(line_keylet) {
+        Ok(Some(state)) => state,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     let mut final_balance = state.get_field_amount(sf("sfBalance"));
@@ -346,14 +370,17 @@ pub fn redeem_iou<V: ApplyView>(
     let start_balance = final_balance.clone();
     final_balance -= amount.clone();
 
-    let (must_delete, new_flags) = update_trust_line(
+    let (must_delete, new_flags) = match update_trust_line(
         view,
         &state,
         b_sender_high,
         account,
         &start_balance,
         &final_balance,
-    );
+    ) {
+        Ok(result) => result,
+        Err(ter) => return ter,
+    };
 
     if b_sender_high {
         final_balance.negate();
@@ -363,7 +390,13 @@ pub fn redeem_iou<V: ApplyView>(
     obj.set_field_amount(sf("sfBalance"), final_balance);
     if let Some(nf) = new_flags {
         obj.set_field_u32(sf("sfFlags"), nf);
+        obj.make_field_absent(if b_sender_high {
+            sf("sfHighSponsor")
+        } else {
+            sf("sfLowSponsor")
+        });
     }
+    let updated = STLedgerEntry::from_stobject(obj, *state.key());
 
     if must_delete {
         let low = if b_sender_high {
@@ -376,11 +409,11 @@ pub fn redeem_iou<V: ApplyView>(
         } else {
             &issue.account
         };
-        return trust_delete(view, &state, low, high);
+        return trust_delete(view, &updated, low, high);
     }
 
-    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *state.key())));
-    Ter::TES_SUCCESS
+    view.update(Arc::new(updated))
+        .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
 }
 
 pub fn transfer_xrp<V: ApplyView>(
@@ -678,7 +711,11 @@ fn direct_send_no_fee_iou<V: ApplyView>(
     let b_sender_high = *sender > *receiver;
     let line_keylet = protocol::line(*sender, *receiver, issue.currency);
 
-    if let Some(state) = view.peek(line_keylet).ok().flatten() {
+    let state = match view.peek(line_keylet) {
+        Ok(state) => state,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if let Some(state) = state {
         let mut balance = state.get_field_amount(sf("sfBalance"));
         if b_sender_high {
             balance.negate();
@@ -688,7 +725,10 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         balance -= amount.clone();
 
         let (must_delete, new_flags) =
-            update_trust_line(view, &state, b_sender_high, sender, &before, &balance);
+            match update_trust_line(view, &state, b_sender_high, sender, &before, &balance) {
+                Ok(result) => result,
+                Err(ter) => return ter,
+            };
 
         if b_sender_high {
             balance.negate();
@@ -698,16 +738,22 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         obj.set_field_amount(sf("sfBalance"), balance);
         if let Some(nf) = new_flags {
             obj.set_field_u32(sf("sfFlags"), nf);
+            obj.make_field_absent(if b_sender_high {
+                sf("sfHighSponsor")
+            } else {
+                sf("sfLowSponsor")
+            });
         }
+        let updated = STLedgerEntry::from_stobject(obj, *state.key());
 
         if must_delete {
             let low = if b_sender_high { receiver } else { sender };
             let high = if b_sender_high { sender } else { receiver };
-            return trust_delete(view, &state, low, high);
+            return trust_delete(view, &updated, low, high);
         }
 
-        let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *state.key())));
-        Ter::TES_SUCCESS
+        view.update(Arc::new(updated))
+            .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
     } else {
         // Trust line doesn't exist — create it (receiver gets balance)
         let b_high = *sender > *receiver;
