@@ -2788,10 +2788,11 @@ impl CoordinatorRunner {
         if state.phase != SessionPhase::Active {
             return false;
         }
-        // An incremental write is an externalized store-before-continue
-        // boundary, not a running JtLedgerData-equivalent job. The retained
-        // plan remains the logical scan owner, but it must not enter the
-        // runnable FIFO until its exact WriteCompleted event settles.
+        // An incremental write externalizes one synchronous store step from
+        // rippled's JtLedgerData job. Keep the existing owner permit while the
+        // write is pending, but do not run it again until its exact
+        // WriteCompleted event settles. Retaining this permit is what bounds
+        // physical persistence to the same three acquisition jobs.
         if matches!(
             state.plan.persistence(),
             crate::plan::SessionPersistence::IncrementalWritePending { .. }
@@ -2856,26 +2857,6 @@ impl CoordinatorRunner {
     ) {
         let was_owner = self.state.local_scan_owners.remove(&session);
         self.state.swept_local_scan_owners.remove(&session);
-        self.state
-            .local_scan_waiters
-            .retain(|candidate| *candidate != session);
-        let next = was_owner.then(|| self.pop_scan_waiter()).flatten();
-        if let Some(next) = next {
-            self.state.local_scan_owners.insert(next);
-            self.run_plan_turn(next, None, effects);
-        }
-    }
-
-    /// Yield only the three-slot runnable job permit while retaining the
-    /// session's logical scan epoch. Incremental persistence is asynchronous
-    /// in Quaxar, so holding a run slot until its acknowledgement would leave
-    /// all three slots idle and starve already-admitted peer replies.
-    fn yield_local_scan_permit(
-        &mut self,
-        session: SessionRef,
-        effects: &mut Vec<AcquisitionEffect>,
-    ) {
-        let was_owner = self.state.local_scan_owners.remove(&session);
         self.state
             .local_scan_waiters
             .retain(|candidate| *candidate != session);
@@ -3040,13 +3021,10 @@ impl CoordinatorRunner {
                     self.discard_session_request_intents(session);
                 }
                 effects.push(AcquisitionEffect::SubmitWrite(batch));
-                if !final_batch {
-                    // Publish the exact write command before waking another
-                    // runnable job. The logical scan is already retained in
-                    // IncrementalWritePending and only its matching completion
-                    // may place it back in the permit FIFO.
-                    self.yield_local_scan_permit(session, effects);
-                }
+                // A non-final batch retains this scan's existing permit until
+                // its exact completion resumes the same owner. The owner is
+                // released only by the ensuing natural network/final/terminal
+                // boundary, matching one synchronous rippled JtLedgerData job.
             }
             PlanTurn::Invalid => {
                 self.release_local_scan_permit(session, effects);
@@ -8907,7 +8885,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_writes_yield_run_slots_and_exact_completion_resumes_old_scan() {
+    fn incremental_writes_retain_three_owner_slots_until_natural_boundary() {
         let budget = BudgetState::new(
             8,
             AdmissionBudget::new(600, 1 << 20),
@@ -8973,30 +8951,18 @@ mod tests {
         );
         assert!(runner.state.local_scan_waiters.contains(&reply_waiter));
 
-        // The first incremental write immediately yields its runnable slot;
-        // the admitted reply waiter consumes that slot in the same effect
-        // batch instead of waiting for the write acknowledgement.
+        // Incremental persistence externalizes a step of the same logical
+        // JtLedgerData job. It must retain its owner slot while pending, so the
+        // fourth moving-tip session cannot create a fourth physical write.
         let mut first = Vec::new();
         runner.run_plan_turn(sessions[0], None, &mut first);
         let first_write = write_batch(&first);
         assert!(first_write.fence().is_none());
-        let write_position = first
-            .iter()
-            .position(|effect| matches!(effect, AcquisitionEffect::SubmitWrite(_)))
-            .expect("incremental write effect");
-        let reply_position = first
-            .iter()
-            .position(|effect| {
-                matches!(effect, AcquisitionEffect::SubmitRead(read) if read.operation().session() == reply_waiter)
-            })
-            .expect("promoted reply read");
-        assert!(write_position < reply_position);
         assert!(
-            read_effects(&first)
-                .iter()
-                .any(|read| read.operation().session() == reply_waiter)
+            read_effects(&first).is_empty(),
+            "a pending incremental write must not admit the waiter"
         );
-        assert!(!runner.state.local_scan_owners.contains(&sessions[0]));
+        assert!(runner.state.local_scan_owners.contains(&sessions[0]));
 
         let mut writes = vec![first_write];
         for session in &sessions[1..3] {
@@ -9005,12 +8971,15 @@ mod tests {
             let batch = write_batch(&effects);
             assert!(batch.fence().is_none());
             writes.push(batch);
-            assert!(!runner.state.local_scan_owners.contains(session));
+            assert!(runner.state.local_scan_owners.contains(session));
         }
+        assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
+        assert!(runner.state.local_scan_waiters.contains(&reply_waiter));
+        assert!(writes.iter().all(|batch| batch.fence().is_none()));
 
-        // Only the exact old write completion requeues the retained scan. Its
-        // deferred network frontier survives the yield and is requested; no
-        // replacement engine or parallel owner is created.
+        // Only the exact old write completion resumes that same owner. Its
+        // deferred network frontier is requested first; reaching that natural
+        // boundary then releases the permit and admits the queued reply scan.
         let resumed = runner.handle_event(AcquisitionEvent::WriteCompleted(WriteCompletion::new(
             writes[0].operation(),
             WriteOutcome::Accepted,
@@ -9018,6 +8987,15 @@ mod tests {
         assert!(resumed
             .iter()
             .any(|effect| matches!(effect, AcquisitionEffect::SendLedgerRequest(request) if request.session() == sessions[0])));
+        assert!(
+            read_effects(&resumed)
+                .iter()
+                .any(|read| read.operation().session() == reply_waiter),
+            "the waiter is admitted only after the old owner reaches its network boundary"
+        );
+        assert!(!runner.state.local_scan_owners.contains(&sessions[0]));
+        assert!(runner.state.local_scan_owners.contains(&reply_waiter));
+        assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
         assert!(matches!(
             runner
                 .session(sessions[0])
