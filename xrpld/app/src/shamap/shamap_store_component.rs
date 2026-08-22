@@ -3,10 +3,10 @@ use crate::shamap::shamap_store_app_runtime::SHAMapStoreRotationWindow;
 use crate::{
     SHAMapStore, SHAMapStoreCopyDisposition, SHAMapStoreHealthPolicy, SHAMapStoreHealthRuntime,
     SHAMapStoreRuntime, SHAMapStoreSavedState, SHAMapStoreSavedStateDb, SHAMapStoreWorkerStep,
-    run_shamap_store_worker_step_with_policy_refresh,
+    run_shamap_store_worker_step_with_policy_refresh_and_stop,
 };
 use ledger::Ledger;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -65,6 +65,10 @@ struct SHAMapStoreComponentInner {
     /// policy at its next destructive boundary without taking the producer
     /// store mutex.
     can_delete: AtomicU32,
+    /// Cancellation observed by the detached worker's health wait. This must
+    /// be published before joining because the worker owns the runtime mutex
+    /// for the duration of a maintenance step.
+    stopping: AtomicBool,
     /// Serializes worker snapshots from the managed worker and direct test or
     /// operator drains. Producers never take this lease, so a health-blocked
     /// online-delete worker cannot delay validation notification.
@@ -107,6 +111,7 @@ impl SHAMapStoreComponent {
                 wake_mutex: Mutex::new(false),
                 wake_condvar: Condvar::new(),
                 can_delete: AtomicU32::new(can_delete),
+                stopping: AtomicBool::new(false),
                 worker_execution: Mutex::new(()),
             }),
             worker: Mutex::new(None),
@@ -220,7 +225,7 @@ fn run_detached_worker_step(
             .runtime
             .lock()
             .expect("shamap store runtime mutex must not be poisoned");
-        run_shamap_store_worker_step_with_policy_refresh(
+        run_shamap_store_worker_step_with_policy_refresh_and_stop(
             &mut worker_store,
             runtime.as_mut(),
             inner.state_db.as_ref(),
@@ -231,6 +236,7 @@ fn run_detached_worker_step(
                 // runtime maintenance is active.
                 worker_store.set_can_delete(inner.can_delete.load(Ordering::Acquire));
             },
+            || inner.stopping.load(Ordering::Acquire),
         )
     };
     inner
@@ -243,6 +249,7 @@ fn run_detached_worker_step(
 
 impl ManagedComponent for SHAMapStoreComponent {
     fn start(&self) -> Result<(), String> {
+        self.inner.stopping.store(false, Ordering::Release);
         let mut store = self
             .store()
             .lock()
@@ -323,6 +330,11 @@ impl ManagedComponent for SHAMapStoreComponent {
     }
 
     fn stop(&self) {
+        // Match rippled SHAMapStoreImp::stop(): make the exact predicate used
+        // by healthWait observe shutdown before waiting for the worker join.
+        // Calling runtime.stop_background_work() here would deadlock because
+        // the detached worker holds the runtime mutex while health-waiting.
+        self.inner.stopping.store(true, Ordering::Release);
         let mut store = self
             .store()
             .lock()
@@ -378,7 +390,7 @@ mod tests {
     use basics::basic_config::BasicConfig;
     use ledger::Ledger;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -582,6 +594,88 @@ mod tests {
             self.clear_prior_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+    }
+
+    struct StuckHealthRuntime {
+        entered_health_wait: Arc<AtomicBool>,
+        stops: Arc<AtomicUsize>,
+    }
+
+    impl SHAMapStoreRuntime for StuckHealthRuntime {
+        fn start_background_work(&mut self) {}
+
+        fn stop_background_work(&mut self) {
+            self.stops.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn minimum_sql_seq(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    impl SHAMapStoreHealthRuntime for StuckHealthRuntime {
+        fn is_stopping(&self) -> bool {
+            false
+        }
+
+        fn operating_mode(&self) -> SHAMapStoreOperatingMode {
+            SHAMapStoreOperatingMode::Other
+        }
+
+        fn validated_ledger_age(&self) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    impl super::SHAMapStoreComponentRuntime for StuckHealthRuntime {
+        fn sleep(&mut self, _duration: Duration) {
+            self.entered_health_wait.store(true, Ordering::Release);
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn stop_cancels_worker_blocked_in_health_wait_before_joining() {
+        let mut config = BasicConfig::new();
+        config.section_mut("node_db").set("online_delete", "8");
+        config
+            .section_mut("node_db")
+            .set("recovery_wait_seconds", "0");
+        let store = SHAMapStore::from_config(&config, true, 8, 0).expect("store config");
+        let entered_health_wait = Arc::new(AtomicBool::new(false));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let component = Arc::new(SHAMapStoreComponent::new(
+            store,
+            Box::new(StuckHealthRuntime {
+                entered_health_wait: Arc::clone(&entered_health_wait),
+                stops: Arc::clone(&stops),
+            }),
+            None,
+        ));
+        component.start().expect("component start");
+
+        component.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
+            100, 0, false,
+        )));
+        wait_for(|| component.rendezvous());
+        component.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
+            108, 0, false,
+        )));
+        wait_for(|| entered_health_wait.load(Ordering::Acquire));
+
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let stopping_component = Arc::clone(&component);
+        let stop_thread = thread::spawn(move || {
+            stopping_component.stop();
+            stopped_tx.send(()).expect("stop completion");
+        });
+        stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("health-waiting worker must observe cancellation before join");
+        stop_thread.join().expect("stop thread");
+
+        assert_eq!(stops.load(Ordering::Relaxed), 1);
+        assert!(component.rendezvous());
     }
 
     #[test]

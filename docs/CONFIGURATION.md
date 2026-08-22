@@ -110,6 +110,12 @@ Optional cache-maintenance interval in seconds. Accepted values are 10 through
 
 ### `[node_db]`
 
+Persistent network nodes should set `fast_load = 1`. On restart, this selects
+the rippled-compatible `Load` startup path and restores the newest complete
+ledger from SQL and NodeStore. If local durable state is absent or incomplete,
+`fast_load` falls back to genesis/network bootstrap; omit it only when that
+genesis startup is intentional.
+
 Configures persistent ledger object storage.
 
 | Key | Meaning |

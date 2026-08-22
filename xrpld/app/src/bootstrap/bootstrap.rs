@@ -19,7 +19,7 @@ use basics::chrono::NetClockTimePoint;
 use basics::string_utilities::str_unhex;
 use basics::tagged_cache::MonotonicClock;
 use ledger::{
-    Ledger, LedgerConfig, LedgerHeader, LedgerInfoProvider, LedgerReplay, NullLedgerJournal,
+    Ledger, LedgerConfig, LedgerHeader, LedgerInfoProvider, LedgerJournal, LedgerReplay,
     NullOrderBookDBJournal, NullOrderBookDBRuntime, load_by_hash, load_by_index,
 };
 use nodestore::{FetchType, ManagerImp, NodeObjectType as NodeStoreObjectType};
@@ -35,7 +35,7 @@ use quaxar_core::{
 };
 use rusqlite::{OptionalExtension, params};
 use shamap::family::{
-    NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
+    FullBelowCache, NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -203,9 +203,81 @@ impl SHAMapStoreHealthRuntime for BootstrapSHAMapStoreRuntime {
 
 impl SHAMapStoreComponentRuntime for BootstrapSHAMapStoreRuntime {}
 
+struct PendingProductionSHAMapStore {
+    bootstrap: crate::SHAMapStoreBootstrap,
+    backend_factory: Arc<dyn crate::SHAMapStoreRotatingBackendFactory>,
+}
+
+struct BootstrapNodeFamilyCacheRuntime {
+    node_family: Arc<dyn crate::NodeFamilyRuntime>,
+    tree_cache: Arc<TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>>,
+    full_below: crate::NodeFamilyFullBelowCache,
+}
+
+impl crate::SHAMapStoreNodeFamilyCacheRuntime for BootstrapNodeFamilyCacheRuntime {
+    fn tree_node_cache_keys(&self) -> Vec<Uint256> {
+        self.tree_cache.get_keys()
+    }
+
+    fn clear_full_below_cache(&self) {
+        self.full_below.clear();
+    }
+
+    fn visit_state_map_hashes(
+        &self,
+        ledger: &Ledger,
+        visit: &mut dyn FnMut(Uint256) -> bool,
+    ) -> Result<(), shamap::traversal::TraversalError> {
+        self.node_family.visit_state_map_hashes(ledger, visit)
+    }
+}
+
+struct BootstrapRotatingNodeStoreRuntime {
+    database: Arc<dyn nodestore::DatabaseRotating>,
+}
+
+impl crate::SHAMapStoreNodeStoreRuntime for BootstrapRotatingNodeStoreRuntime {
+    fn fetch_node_object(&self, hash: &Uint256, ledger_seq: u32) -> bool {
+        nodestore::Database::fetch_node_object(
+            self.database.as_ref(),
+            hash,
+            ledger_seq,
+            FetchType::Synchronous,
+            true,
+        )
+        .is_some()
+    }
+
+    fn set_rotation_in_flight(&self, in_flight: bool) {
+        self.database.set_rotation_in_flight(in_flight);
+    }
+
+    fn rotate_with(&self, new_backend: Box<dyn nodestore::Backend>) -> (String, String) {
+        let mut names = None;
+        self.database
+            .rotate(new_backend, &mut |writable_name, archive_name| {
+                names = Some((writable_name.to_owned(), archive_name.to_owned()));
+            });
+        names.expect("rotating NodeStore callback must publish backend names")
+    }
+}
+
 #[derive(Clone)]
 struct BootstrapLedgerDbProvider {
     relational: Arc<crate::SqliteSHAMapStoreRelational>,
+}
+
+#[derive(Debug, Default)]
+struct BootstrapLedgerJournal;
+
+impl LedgerJournal for BootstrapLedgerJournal {
+    fn info(&self, message: &str) {
+        tracing::info!(target: "bootstrap", %message, "durable ledger load");
+    }
+
+    fn warn(&self, message: &str) {
+        tracing::warn!(target: "bootstrap", %message, "durable ledger load");
+    }
 }
 
 impl BootstrapLedgerDbProvider {
@@ -216,7 +288,7 @@ impl BootstrapLedgerDbProvider {
     fn query_one(&self, sql: &str, bind: impl rusqlite::Params) -> Option<LedgerHeader> {
         let ledger_db = self.relational.ledger_db();
         let connection = ledger_db.get_session();
-        connection
+        match connection
             .query_row(sql, bind, |row| {
                 let close_time_resolution = row.get::<_, u32>(6)?;
                 let close_flags = row.get::<_, u32>(7)?;
@@ -247,8 +319,14 @@ impl BootstrapLedgerDbProvider {
                 })
             })
             .optional()
-            .ok()
-            .flatten()
+        {
+            Ok(header) => header,
+            Err(error) => {
+                tracing::warn!(target: "bootstrap", %error,
+                    "durable ledger header query failed");
+                None
+            }
+        }
     }
 }
 
@@ -772,13 +850,16 @@ pub fn build_bootstrap_root(
 
     let _ = root.attach_default_consensus_runtime();
 
-    let node_store_kind = attach_shamap_store_if_configured(
+    let pending_shamap_store = bootstrap_shamap_store_if_configured(
         &mut root,
         config,
         options.standalone,
         ledger_history,
         io_threads,
     )?;
+    let node_store_kind = pending_shamap_store
+        .as_ref()
+        .map(|pending| pending.bootstrap.node_store_kind().to_owned());
     let configured_node_size = configured_node_size_from_config(config);
     let sweep_interval_seconds = configured_sweep_interval(
         config,
@@ -787,6 +868,7 @@ pub fn build_bootstrap_root(
     )?;
     root.set_status_rpc_node_size(configured_node_size.clone());
     attach_bootstrap_node_family(&mut root, configured_node_size.as_deref());
+    attach_production_shamap_store_runtime(&mut root, pending_shamap_store)?;
     initialize_startup_ledger_state(&root, options, config)?;
     root.bind_default_component_runtimes();
 
@@ -4135,20 +4217,20 @@ fn spawn_shutdown_watcher(
     })
 }
 
-fn attach_shamap_store_if_configured(
+fn bootstrap_shamap_store_if_configured(
     root: &mut ApplicationRoot,
     config: &BasicConfig,
     standalone: bool,
     ledger_history: u32,
     io_threads: usize,
-) -> Result<Option<String>, String> {
+) -> Result<Option<PendingProductionSHAMapStore>, String> {
     if !config.exists("node_db") {
         return Ok(None);
     }
 
-    let manager = ManagerImp::new();
-    let scheduler = Arc::new(root.node_store_scheduler().clone());
-    let journal = root.get_journal("NodeStore");
+    let manager: Arc<dyn nodestore::Manager> = Arc::new(ManagerImp::new());
+    let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(root.node_store_scheduler().clone());
+    let journal: Arc<dyn nodestore::NodeStoreJournal> = root.get_journal("NodeStore");
     let bootstrap = bootstrap_shamap_store(
         config,
         standalone,
@@ -4157,19 +4239,99 @@ fn attach_shamap_store_if_configured(
         40_000,
         64,
         2,
-        &manager,
+        manager.as_ref(),
+        Arc::clone(&scheduler),
+        Arc::clone(&journal),
+    )?;
+    let _ = bootstrap.attach_node_store(root);
+    let backend_factory = Arc::new(crate::ConfiguredSHAMapStoreBackendFactory::new(
+        manager,
+        bootstrap.effective_node_db_config.clone(),
+        40_000,
         scheduler,
         journal,
-    )?;
-    let node_store_kind = bootstrap.node_store_kind().to_owned();
-    let _ = bootstrap.attach_node_store(root);
+    ));
+    Ok(Some(PendingProductionSHAMapStore {
+        bootstrap,
+        backend_factory,
+    }))
+}
+
+fn attach_production_shamap_store_runtime(
+    root: &mut ApplicationRoot,
+    pending: Option<PendingProductionSHAMapStore>,
+) -> Result<(), String> {
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    let PendingProductionSHAMapStore {
+        bootstrap,
+        backend_factory,
+    } = pending;
+
+    // A single-backend store has no online-delete worker. Retain the small
+    // inert runtime for that configuration rather than inventing rotation
+    // capabilities which the backend cannot provide.
+    if bootstrap.store.delete_interval() == 0 {
+        let component = Arc::new(SHAMapStoreComponent::new(
+            bootstrap.store,
+            Box::new(BootstrapSHAMapStoreRuntime::default()),
+            bootstrap.state_db,
+        ));
+        let _ = root.attach_shamap_store_component(component);
+        return Ok(());
+    }
+
+    let crate::SHAMapStoreNodeStore::Rotating(database) = bootstrap.node_store else {
+        return Err("online_delete requires a rotating NodeStore backend".to_owned());
+    };
+    let ledger_master = root
+        .ledger_master_runtime()
+        .ok_or_else(|| "online_delete requires LedgerMaster runtime".to_owned())?
+        .ledger_master();
+    let node_family = root
+        .node_family()
+        .ok_or_else(|| "online_delete requires the application NodeFamily".to_owned())?;
+    let tree_cache = root
+        .shared_tree_cache_arc()
+        .map(Arc::clone)
+        .ok_or_else(|| "online_delete requires the shared TreeNode cache".to_owned())?;
+    let full_below = root
+        .node_family_full_below_cache()
+        .ok_or_else(|| "online_delete requires the NodeFamily FullBelow cache".to_owned())?;
+    let node_family_runtime = Arc::new(BootstrapNodeFamilyCacheRuntime {
+        node_family,
+        tree_cache,
+        full_below,
+    });
+    let node_store_runtime = Arc::new(BootstrapRotatingNodeStoreRuntime { database });
+    let relational = root
+        .relational_database()
+        .as_ref()
+        .map(|database| Arc::clone(database) as Arc<dyn crate::SHAMapStoreRelationalRuntime>);
+    let health = Arc::new(crate::SharedSHAMapStoreHealthState::new_with_app_state(
+        root.shared_time_keeper(),
+        root.network_ops_state(),
+        root.ledger_master_state(),
+    ));
+    let runtime = crate::SHAMapStoreAppRuntime::new_with_health_state(
+        ledger_master,
+        node_family_runtime,
+        root.transaction_master(),
+        node_store_runtime,
+        backend_factory,
+        relational,
+        Arc::new(crate::ValidatedLedgerCopyRuntime),
+        Arc::clone(&health),
+    );
     let component = Arc::new(SHAMapStoreComponent::new(
-        bootstrap.store.clone(),
-        Box::new(BootstrapSHAMapStoreRuntime::default()),
+        bootstrap.store,
+        Box::new(runtime),
         bootstrap.state_db,
     ));
-    let _ = root.attach_shamap_store_component(component);
-    Ok(Some(node_store_kind))
+    let service = Arc::new(crate::SHAMapStoreService::new(component, health));
+    let _ = root.attach_shamap_store_service(service);
+    Ok(())
 }
 
 fn attach_relational_database_if_configured(
@@ -4339,7 +4501,15 @@ fn initialize_startup_ledger_state(
             Err(error) if node_db_fast_load(config) => {
                 tracing::warn!(target: "bootstrap", %error,
                     "fast_load durable ledger unavailable; falling back to genesis startup");
-                seed_startup_ledger_state(root, options, config)
+                // `fast_load` changes the effective startup type to `Load`, but
+                // rippled's failure branch calls startGenesisLedger(), not the
+                // synthetic Load placeholder. Select Normal only for the seed
+                // operation so genesis receives its master AccountRoot and
+                // setup entries while the application retains Load's original
+                // need-network-ledger semantics.
+                let mut genesis_options = options.clone();
+                genesis_options.start_type = StartUpType::Normal;
+                seed_startup_ledger_state(root, &genesis_options, config)
             }
             Err(error) => Err(error),
         },
@@ -4428,7 +4598,7 @@ fn rehydrate_configured_history(root: &ApplicationRoot, history_depth: u32) -> R
         BootstrapNodeStoreFetcher::new(node_store),
         NullMissingNodeReporter,
     );
-    let journal = NullLedgerJournal;
+    let journal = BootstrapLedgerJournal;
     let config = LedgerConfig::default();
     let earliest = if history_depth == u32::MAX {
         1
@@ -4516,7 +4686,7 @@ fn load_complete_ledger_from_storage(
         BootstrapNodeStoreFetcher::new(node_store),
         NullMissingNodeReporter,
     );
-    let journal = NullLedgerJournal;
+    let journal = BootstrapLedgerJournal;
     let config = LedgerConfig::default();
 
     let mut loaded = load_bootstrap_ledger(requested, &journal, &config, &family, &provider)?;
@@ -4583,7 +4753,7 @@ fn replay_startup_ledger_from_storage(
         BootstrapNodeStoreFetcher::new(node_store),
         NullMissingNodeReporter,
     );
-    let journal = NullLedgerJournal;
+    let journal = BootstrapLedgerJournal;
     let config = LedgerConfig::default();
 
     let mut replay_ledger =
@@ -4660,9 +4830,9 @@ fn load_startup_ledger_from_file(
     Ok(())
 }
 
-fn load_bootstrap_ledger<P, CLOCK, S, FB, F, MR, NS>(
+fn load_bootstrap_ledger<P, CLOCK, S, FB, F, MR, NS, J>(
     requested: Option<&str>,
-    journal: &NullLedgerJournal,
+    journal: &J,
     config: &LedgerConfig,
     family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
     provider: &P,
@@ -4674,6 +4844,7 @@ where
     FB: shamap::family::FullBelowCache,
     F: SHAMapNodeFetcher,
     MR: shamap::family::MissingNodeReporter,
+    J: LedgerJournal,
 {
     let requested = requested.map(str::trim).filter(|value| !value.is_empty());
     if requested.is_none() || requested == Some("latest") {

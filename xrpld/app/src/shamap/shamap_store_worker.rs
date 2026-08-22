@@ -1,5 +1,4 @@
 use crate::shamap::shamap_store_component::SHAMapStoreComponentRuntime;
-use crate::shamap::shamap_store_health::wait_for_health;
 use crate::{
     SHAMapStore, SHAMapStoreCopyDisposition, SHAMapStoreHealthPolicy, SHAMapStoreHealthStatus,
     SHAMapStoreRunLoopStep, SHAMapStoreSavedState, SHAMapStoreSavedStateDb, runloop_step,
@@ -30,10 +29,30 @@ pub fn run_shamap_store_worker_step_with_policy_refresh<F>(
     store: &mut SHAMapStore,
     runtime: &mut dyn SHAMapStoreComponentRuntime,
     state_db: Option<&Arc<SHAMapStoreSavedStateDb>>,
-    mut refresh_policy: F,
+    refresh_policy: F,
 ) -> Result<Option<SHAMapStoreWorkerStep>, String>
 where
     F: FnMut(&mut SHAMapStore),
+{
+    run_shamap_store_worker_step_with_policy_refresh_and_stop(
+        store,
+        runtime,
+        state_db,
+        refresh_policy,
+        || false,
+    )
+}
+
+pub(crate) fn run_shamap_store_worker_step_with_policy_refresh_and_stop<F, S>(
+    store: &mut SHAMapStore,
+    runtime: &mut dyn SHAMapStoreComponentRuntime,
+    state_db: Option<&Arc<SHAMapStoreSavedStateDb>>,
+    mut refresh_policy: F,
+    should_stop: S,
+) -> Result<Option<SHAMapStoreWorkerStep>, String>
+where
+    F: FnMut(&mut SHAMapStore),
+    S: Fn() -> bool,
 {
     let Some(validated_ledger) = store.take_queued_ledger() else {
         return Ok(None);
@@ -76,9 +95,8 @@ where
         }));
     }
 
-    if wait_for_health(&health_policy, runtime, |runtime, duration| {
-        runtime.sleep(duration)
-    }) == SHAMapStoreHealthStatus::Stopping
+    if wait_for_health_or_stop(&health_policy, runtime, &should_stop)
+        == SHAMapStoreHealthStatus::Stopping
     {
         store.finish_rendezvous();
         return Ok(Some(SHAMapStoreWorkerStep {
@@ -105,9 +123,8 @@ where
 
     store.note_rotation_boundary(previous_last_rotated);
     runtime.clear_prior(previous_last_rotated)?;
-    if wait_for_health(&health_policy, runtime, |runtime, duration| {
-        runtime.sleep(duration)
-    }) == SHAMapStoreHealthStatus::Stopping
+    if wait_for_health_or_stop(&health_policy, runtime, &should_stop)
+        == SHAMapStoreHealthStatus::Stopping
     {
         store.finish_rendezvous();
         return Ok(Some(SHAMapStoreWorkerStep {
@@ -139,9 +156,8 @@ where
             }));
         }
     }
-    if wait_for_health(&health_policy, runtime, |runtime, duration| {
-        runtime.sleep(duration)
-    }) == SHAMapStoreHealthStatus::Stopping
+    if wait_for_health_or_stop(&health_policy, runtime, &should_stop)
+        == SHAMapStoreHealthStatus::Stopping
     {
         store.finish_rendezvous();
         return Ok(Some(SHAMapStoreWorkerStep {
@@ -154,9 +170,8 @@ where
 
     let _rotation_window = runtime.begin_rotation_window()?;
     runtime.freshen_caches()?;
-    if wait_for_health(&health_policy, runtime, |runtime, duration| {
-        runtime.sleep(duration)
-    }) == SHAMapStoreHealthStatus::Stopping
+    if wait_for_health_or_stop(&health_policy, runtime, &should_stop)
+        == SHAMapStoreHealthStatus::Stopping
     {
         store.finish_rendezvous();
         return Ok(Some(SHAMapStoreWorkerStep {
@@ -169,9 +184,8 @@ where
 
     runtime.prepare_rotation()?;
     runtime.clear_caches(validated_seq)?;
-    if wait_for_health(&health_policy, runtime, |runtime, duration| {
-        runtime.sleep(duration)
-    }) == SHAMapStoreHealthStatus::Stopping
+    if wait_for_health_or_stop(&health_policy, runtime, &should_stop)
+        == SHAMapStoreHealthStatus::Stopping
     {
         store.finish_rendezvous();
         return Ok(Some(SHAMapStoreWorkerStep {
@@ -207,6 +221,25 @@ where
         stopped: false,
         minimum_online: store.minimum_online(runtime),
     }))
+}
+
+fn wait_for_health_or_stop<S>(
+    policy: &SHAMapStoreHealthPolicy,
+    runtime: &mut dyn SHAMapStoreComponentRuntime,
+    should_stop: &S,
+) -> SHAMapStoreHealthStatus
+where
+    S: Fn() -> bool,
+{
+    loop {
+        if should_stop() {
+            return SHAMapStoreHealthStatus::Stopping;
+        }
+        match policy.evaluate(runtime) {
+            SHAMapStoreHealthStatus::Waiting(duration) => runtime.sleep(duration),
+            status => return status,
+        }
+    }
 }
 
 fn persist_last_rotated(

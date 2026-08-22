@@ -2681,6 +2681,10 @@ impl InboundLedgers {
                 JsonValue::Unsigned(snapshot.session_count() as u64),
             ),
             (
+                "detached_sessions".to_owned(),
+                JsonValue::Unsigned(snapshot.detached_sessions() as u64),
+            ),
+            (
                 "active_by_reason".to_owned(),
                 JsonValue::Object(active_by_reason),
             ),

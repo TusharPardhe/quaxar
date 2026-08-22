@@ -1,6 +1,6 @@
 use app::{
-    AppBootstrapOptions, build_bootstrap_root, build_bootstrap_runtime, load_basic_config_file,
-    parse_bootstrap_args,
+    AppBootstrapOptions, SHAMapStoreOperatingMode, build_bootstrap_root, build_bootstrap_runtime,
+    load_basic_config_file, parse_bootstrap_args,
 };
 use basics::{base_uint::Uint256, intrusive_pointer::make_shared_intrusive, str_hex::str_hex};
 use ledger::{Ledger, LedgerHeader, calculate_ledger_hash};
@@ -755,6 +755,81 @@ path = {}
     assert!(bootstrap.root.ledger_master_runtime().is_some());
     assert!(bootstrap.root.network_ops_runtime().is_some());
     assert!(bootstrap.root.network_ops_validation_runtime().is_some());
+}
+
+#[test]
+fn app_bootstrap_online_delete_uses_production_rotation_runtime() {
+    let dir = TempDir::new().expect("tempdir");
+    let config_path = dir.path().join("quaxar.cfg");
+    let database_path = dir.path().join("sql");
+    let node_db_path = dir.path().join("node-db");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[ledger_history]
+8
+
+[database_path]
+{}
+
+[node_db]
+type = RocksDB
+path = {}
+online_delete = 8
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            standalone: true,
+            start_type: StartUpType::Fresh,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("online-delete bootstrap");
+    let service = bootstrap
+        .root
+        .shamap_store_service()
+        .expect("online-delete service");
+    let component = service.component();
+    assert!(
+        bootstrap
+            .root
+            .set_shamap_store_operating_mode(SHAMapStoreOperatingMode::Full)
+    );
+
+    let close_time = bootstrap.root.current_close_time_seconds();
+    service.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
+        100, close_time, false,
+    )));
+    let initialized = component
+        .process_queued_ledger()
+        .expect("initial worker step")
+        .expect("initial queued ledger");
+    assert!(!initialized.rotated);
+    assert_eq!(component.get_last_rotated(), 100);
+
+    service.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
+        108, close_time, false,
+    )));
+    let rotated = component
+        .process_queued_ledger()
+        .expect("rotation worker step")
+        .expect("rotation queued ledger");
+    assert!(rotated.rotated);
+    let saved = component.saved_state();
+    assert_eq!(saved.last_rotated, 108);
+    assert!(!saved.writable_db.is_empty());
+    assert!(!saved.archive_db.is_empty());
+    assert_ne!(saved.writable_db, saved.archive_db);
 }
 
 #[test]
@@ -1708,6 +1783,9 @@ protocol = http
 type = Memory
 path = {}
 fast_load = 1
+
+[features]
+MultiSign
 "#,
             database_path.display(),
             node_db_path.display(),
@@ -1729,6 +1807,38 @@ fast_load = 1
     assert_eq!(bootstrap.root.closed_ledger_seq(), Some(2));
     assert_eq!(bootstrap.root.validated_ledger_seq(), None);
     assert_eq!(bootstrap.root.published_ledger_seq(), None);
+
+    let closed = bootstrap.root.closed_ledger().expect("fallback LCL");
+    assert!(closed.header().account_hash.is_non_zero());
+    assert!(
+        closed
+            .read(protocol::Keylet::new(
+                LedgerEntryType::AccountRoot,
+                ledger::genesis_master_account_key(),
+            ))
+            .expect("genesis master AccountRoot lookup")
+            .is_some(),
+        "fast_load fallback must preserve the genesis master account",
+    );
+    assert!(
+        closed
+            .read(protocol::fee_settings_keylet())
+            .expect("genesis FeeSettings lookup")
+            .is_some(),
+        "fast_load fallback must preserve genesis fee settings",
+    );
+    assert!(
+        closed.rules().enabled(&protocol::feature_id("MultiSign")),
+        "configured feature rules remain active after fallback",
+    );
+    assert!(
+        closed.get_enabled_amendments().is_empty(),
+        "Load-mode fallback matches rippled and does not inject Fresh-only genesis amendments",
+    );
+    assert!(
+        !bootstrap.root.need_network_ledger(),
+        "fast_load fallback preserves Load-mode need-network-ledger semantics",
+    );
 }
 
 #[test]

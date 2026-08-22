@@ -153,6 +153,7 @@ medium
 [node_db]
 type = NuDB
 path = /var/lib/quaxar/db/nudb
+fast_load = 1
 online_delete = 256
 advisory_delete = 0
 

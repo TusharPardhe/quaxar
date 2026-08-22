@@ -132,6 +132,13 @@ Validate the intended configuration with the newly built binary before the
 restart. Then checksum-stage that same binary, atomically replace the live
 symlink, and restart only the existing unit:
 
+For a persistent network node, set `fast_load = 1` in `[node_db]`. This makes
+normal service restarts hydrate the newest complete ledger from the relational
+database and NodeStore. Without `fast_load` (or an explicit `--load` startup
+flag), both Quaxar and rippled intentionally start from genesis and reacquire a
+network ledger. `fast_load` retains the safe first-install fallback to network
+bootstrap when no complete local ledger exists.
+
 ```bash
 set -euo pipefail
 
@@ -153,6 +160,8 @@ if test -z "$unit_group"; then
   unit_group=$(id -gn "$unit_user")
 fi
 sudo -u "$unit_user" -g "$unit_group" -- "$binary" --conf "$config" config
+sudo -u "$unit_user" -g "$unit_group" -- \
+  grep -Eq '^[[:space:]]*fast_load[[:space:]]*=[[:space:]]*(1|true)[[:space:]]*$' "$config"
 expected=$(sha256sum "$binary" | awk '{print $1}')
 sudo install -o "$unit_user" -g "$unit_group" -m 0755 "$binary" "$stage"
 actual=$(sha256sum "$stage" | awk '{print $1}')
