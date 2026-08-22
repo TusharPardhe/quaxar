@@ -218,11 +218,36 @@ fn validate_sttx_typed_semantic_preflight(tx: &STTx, rules: &Rules, txn_type: Tx
         }
         TxType::TRUST_SET => validate_sttx_noop_preflight(txn_type),
         TxType::NFTOKEN_MINT => validate_nftoken_mint_preflight(tx, rules),
+        TxType::NFTOKEN_ACCEPT_OFFER => validate_nftoken_accept_offer_preflight(tx),
         // Types with no additional stateless rule still traverse the standalone
         // dispatcher explicitly; unknown types never silently succeed.
         _ if txn_type.is_dispatchable() => validate_sttx_noop_preflight(txn_type),
         _ => Ter::TEM_UNKNOWN,
     }
+}
+
+fn validate_nftoken_accept_offer_preflight(tx: &STTx) -> NotTec {
+    if tx.get_flags() & !UNIVERSAL_TRANSACTION_FLAGS != 0 {
+        return Ter::TEM_INVALID_FLAG;
+    }
+    let buy_field = get_field_by_symbol("sfNFTokenBuyOffer");
+    let sell_field = get_field_by_symbol("sfNFTokenSellOffer");
+    let broker_fee_field = get_field_by_symbol("sfNFTokenBrokerFee");
+    let buy_present = tx.is_field_present(buy_field);
+    let sell_present = tx.is_field_present(sell_field);
+    if !buy_present && !sell_present {
+        return Ter::TEM_MALFORMED;
+    }
+    if tx.is_field_present(broker_fee_field) {
+        if !buy_present || !sell_present {
+            return Ter::TEM_MALFORMED;
+        }
+        let broker_fee = tx.get_field_amount(broker_fee_field);
+        if !broker_fee.is_legal_net() || broker_fee.signum() <= 0 {
+            return Ter::TEM_MALFORMED;
+        }
+    }
+    Ter::TES_SUCCESS
 }
 
 fn validate_offer_create_preflight(tx: &STTx, rules: &Rules) -> NotTec {
@@ -732,6 +757,33 @@ mod tests {
         })
     }
 
+    fn nftoken_accept_offer(
+        include_buy: bool,
+        include_sell: bool,
+        broker_fee: Option<i64>,
+    ) -> STTx {
+        STTx::new(TxType::NFTOKEN_ACCEPT_OFFER, |tx| {
+            tx.set_account_id(sf("sfAccount"), AccountID::from_array([0xE1; 20]));
+            tx.set_field_amount(
+                sf("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+            );
+            tx.set_field_u32(sf("sfSequence"), 1);
+            if include_buy {
+                tx.set_field_h256(sf("sfNFTokenBuyOffer"), Uint256::from_u64(1));
+            }
+            if include_sell {
+                tx.set_field_h256(sf("sfNFTokenSellOffer"), Uint256::from_u64(2));
+            }
+            if let Some(broker_fee) = broker_fee {
+                tx.set_field_amount(
+                    sf("sfNFTokenBrokerFee"),
+                    STAmount::from_xrp_amount(XRPAmount::from_drops(broker_fee)),
+                );
+            }
+        })
+    }
+
     fn current_nft_rules() -> Rules {
         Rules::new([
             protocol::feature_id("fixRemoveNFTokenAutoTrustLine"),
@@ -800,6 +852,32 @@ mod tests {
         assert_eq!(
             validate_sttx_transaction_preflight_with_rules(&zero_cancel_sequence, &rules),
             Ter::TEM_BAD_SEQUENCE,
+        );
+    }
+
+    #[test]
+    fn nftoken_accept_offer_preflight_is_not_a_success_noop() {
+        let rules = Rules::new(std::iter::empty());
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &nftoken_accept_offer(false, false, None),
+                &rules,
+            ),
+            Ter::TEM_MALFORMED,
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &nftoken_accept_offer(true, false, Some(1)),
+                &rules,
+            ),
+            Ter::TEM_MALFORMED,
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &nftoken_accept_offer(true, true, Some(0)),
+                &rules,
+            ),
+            Ter::TEM_MALFORMED,
         );
     }
 
