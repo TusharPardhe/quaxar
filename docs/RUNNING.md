@@ -69,7 +69,7 @@ brew install openssl rocksdb cmake
 ```bash
 git clone https://github.com/TusharPardhe/quaxar.git
 cd quaxar
-CC=clang CXX=clang++ cargo install --path xrpld/main
+CC=clang CXX=clang++ cargo install --path xrpld/main --locked
 ```
 
 This builds the release binary and installs it to `~/.cargo/bin/quaxar` (already in PATH).
@@ -88,13 +88,13 @@ The RocksDB C++ library compiles from source by default and can exhaust memory. 
 ```bash
 # Linux
 sudo apt install librocksdb-dev
-ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu CC=clang CXX=clang++ cargo install --path xrpld/main
+ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu CC=clang CXX=clang++ cargo install --path xrpld/main --locked
 ```
 
 **Rustc segfault during build (too many parallel jobs):**
 
 ```bash
-CARGO_BUILD_JOBS=2 CC=clang CXX=clang++ cargo install --path xrpld/main
+CARGO_BUILD_JOBS=2 CC=clang CXX=clang++ cargo install --path xrpld/main --locked
 ```
 
 **OpenSSL build failure:**
@@ -419,6 +419,17 @@ quaxar server-info
 quaxar server-state
 quaxar rpc ledger '{"ledger_index":"validated"}'
 ```
+
+### Prometheus metrics
+
+The `quaxar-metrics` package defines `quaxar_*` Prometheus instruments and the
+runtime currently records acquisition queue/latency and operating-mode events.
+Normal `quaxar` bootstrap does not initialize the package's HTTP exporter, so
+the standard binary and Docker Compose files do not expose a `/metrics`
+endpoint. Use `server_info`, `fetch_info`, `get_counts`, the process supervisor,
+and host monitoring for packaged deployments. A custom embedding may call the
+metrics package's `init_prometheus` API, but that is an application integration
+surface rather than a supported `quaxar.cfg` setting.
 
 ## Log Management
 

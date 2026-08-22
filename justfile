@@ -1,7 +1,7 @@
 default:
     @just --list
 
-# Run all checks (what CI does)
+# Run the local quality suite
 ci: fmt clippy test doc
 
 # Format code
@@ -22,7 +22,7 @@ build:
 
 # Install Quaxar to ~/.cargo/bin (automatically in PATH)
 install:
-    cargo install --path xrpld/main
+    cargo install --path xrpld/main --locked
 
 # Uninstall Quaxar
 uninstall:
@@ -34,6 +34,10 @@ check:
 
 # Generate docs
 doc:
+    cargo doc --workspace --no-deps
+
+# Generate and open docs locally
+doc-open:
     cargo doc --workspace --no-deps --open
 
 # Audit dependencies

@@ -371,6 +371,18 @@ fn signer_list_set_tx(account: AccountID, quorum: u32, signers: &[(AccountID, u1
     })
 }
 
+fn ticket_create_tx(account: AccountID, sequence: u32, ticket_count: u32) -> STTx {
+    STTx::new(TxType::TICKET_CREATE, move |object| {
+        object.set_account_id(sf("sfAccount"), account);
+        object.set_field_u32(sf("sfSequence"), sequence);
+        object.set_field_u32(sf("sfTicketCount"), ticket_count);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+    })
+}
+
 fn escrow_create_tx(account: AccountID, destination: AccountID, sequence: u32) -> STTx {
     STTx::new(TxType::ESCROW_CREATE, move |object| {
         object.set_account_id(sf("sfAccount"), account);
@@ -2557,6 +2569,87 @@ fn offer_create_allows_tradable_nontransferable_mpt_sell_offer() {
 }
 
 #[test]
+fn offer_create_tick_rounding_preserves_mpt_side_in_both_orientations() {
+    let iou_issuer = sample_account(0xC7);
+    let holder = sample_account(0xC8);
+    let mpt_issuer = sample_account(0xC9);
+    let mpt_id = share_id_for(mpt_issuer, 1);
+    let mpt_issue = MPTIssue::new(mpt_id);
+    let usd = Issue::new(currency_from_string("USD"), iou_issuer);
+    let mut iou_issuer_root = account_root_with_balance(iou_issuer, 1, 0, 1_000_000_000);
+    iou_issuer_root.set_field_u8(sf("sfTickSize"), 3);
+    let ledger = empty_ledger(vec![
+        iou_issuer_root,
+        account_root_with_balance(holder, 1, 0, 1_000_000_000),
+        account_root(mpt_issuer, 1, 0),
+        mpt_issuance_entry(
+            mpt_issuer,
+            1,
+            2_000_000,
+            protocol::lsfMPTCanTransfer | protocol::lsfMPTCanTrade,
+        ),
+        mptoken_entry(holder, mpt_id, 1_000_000),
+        mptoken_entry(iou_issuer, mpt_id, 0),
+        trust_line_entry(holder, iou_issuer, usd.currency, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    // Non-sell rounds TakerGets in rippled, except when that side is MPT.
+    let non_sell_mpt =
+        STAmount::from_mpt_amount(sf("sfTakerGets"), MPTAmount::from_value(123_457), mpt_issue);
+    let tx = offer_create_tx(
+        holder,
+        2,
+        STAmount::from_iou_amount(
+            sf("sfTakerPays"),
+            IOUAmount::from_parts(765_439, 0).expect("IOU amount"),
+            usd,
+        ),
+        non_sell_mpt.clone(),
+        0,
+        None,
+    );
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        view.read(protocol::offer_keylet(raw_account_id(holder), 2))
+            .expect("offer read")
+            .expect("offer exists")
+            .get_field_amount(sf("sfTakerGets")),
+        non_sell_mpt
+    );
+
+    // tfSell rounds TakerPays, except when that side is MPT.
+    let sell_mpt =
+        STAmount::from_mpt_amount(sf("sfTakerPays"), MPTAmount::from_value(234_569), mpt_issue);
+    let tx = offer_create_tx(
+        iou_issuer,
+        2,
+        sell_mpt.clone(),
+        STAmount::from_iou_amount(
+            sf("sfTakerGets"),
+            IOUAmount::from_parts(876_541, 0).expect("IOU amount"),
+            usd,
+        ),
+        0x0008_0000,
+        None,
+    );
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        view.read(protocol::offer_keylet(raw_account_id(iou_issuer), 2))
+            .expect("offer read")
+            .expect("offer exists")
+            .get_field_amount(sf("sfTakerPays")),
+        sell_mpt
+    );
+}
+
+#[test]
 fn check_create_rejects_mpt_when_transfer_is_disabled() {
     let source = sample_account(0xD1);
     let destination = sample_account(0xD2);
@@ -2605,7 +2698,7 @@ fn check_cash_transfers_mpt_without_requiring_dex_trading() {
     let mpt_id = share_id_for(issuer, 1);
     let send_max = STAmount::from_mpt_amount(
         get_field_by_symbol("sfSendMax"),
-        protocol::MPTAmount::from_value(10),
+        protocol::MPTAmount::from_value(11),
         protocol::MPTIssue::new(mpt_id),
     );
     let mut issuance = mpt_issuance_entry(issuer, 1, 100, protocol::lsfMPTCanTransfer);
@@ -2626,7 +2719,14 @@ fn check_cash_transfers_mpt_without_requiring_dex_trading() {
     let tx = STTx::new(TxType::CHECK_CASH, |object| {
         object.set_account_id(get_field_by_symbol("sfAccount"), destination);
         object.set_field_h256(get_field_by_symbol("sfCheckID"), check_id);
-        object.set_field_amount(get_field_by_symbol("sfAmount"), send_max);
+        object.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::from_mpt_amount(
+                get_field_by_symbol("sfAmount"),
+                protocol::MPTAmount::from_value(10),
+                protocol::MPTIssue::new(mpt_id),
+            ),
+        );
         object.set_field_amount(
             get_field_by_symbol("sfFee"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
@@ -2634,9 +2734,12 @@ fn check_cash_transfers_mpt_without_requiring_dex_trading() {
         object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::CHECK_CASH, None);
+    let expected_delivered = tx.get_field_amount(sf("sfAmount"));
+    let (result, delivered_amount) =
+        apply_submit_transactor_shell_with_delivered_amount(&mut view, &tx, TxType::CHECK_CASH);
 
     assert_eq!(result, Ter::TES_SUCCESS);
+    assert_eq!(delivered_amount, Some(expected_delivered));
     let source_token = view
         .read(protocol::mptoken_keylet_from_mptid(
             mpt_id,
@@ -2667,6 +2770,276 @@ fn check_cash_transfers_mpt_without_requiring_dex_trading() {
         issuance.get_field_u64(get_field_by_symbol("sfOutstandingAmount")),
         99
     );
+}
+
+#[test]
+fn check_cash_enforces_new_holding_reserve_and_accepts_reserve_sponsor() {
+    let fees = Fees {
+        base: 10,
+        reserve: 200,
+        increment: 50,
+    };
+
+    // Missing IOU trust lines use tecNO_LINE_INSUF_RESERVE.
+    let issuer = sample_account(0xE1);
+    let destination = sample_account(0xE2);
+    let usd = Issue::new(currency_from_string("USD"), issuer);
+    let iou_send_max = STAmount::from_iou_amount(
+        sf("sfSendMax"),
+        IOUAmount::from_parts(10, 0).expect("IOU amount"),
+        usd,
+    );
+    let iou_check = protocol::check_keylet(raw_account_id(issuer), 3);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(issuer, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 200),
+        owner_dir_root(issuer, iou_check.key),
+        owner_dir_root(destination, iou_check.key),
+        check_entry(issuer, destination, 3, iou_send_max.clone()),
+    ]);
+    ledger.set_fees(fees);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::CHECK_CASH, |object| {
+        object.set_account_id(sf("sfAccount"), destination);
+        object.set_field_h256(sf("sfCheckID"), iou_check.key);
+        object.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_iou_amount(
+                sf("sfAmount"),
+                IOUAmount::from_parts(10, 0).expect("IOU amount"),
+                usd,
+            ),
+        );
+        object.set_field_amount(sf("sfFee"), test_xrp(10));
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::CHECK_CASH, Some(200)),
+        Ter::TEC_NO_LINE_INSUF_RESERVE
+    );
+    assert!(
+        view.read(line(destination, issuer, usd.currency))
+            .expect("line read")
+            .is_none()
+    );
+
+    let iou_sponsor = sample_account(0xEF);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(issuer, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 200),
+        account_root_with_balance(iou_sponsor, 0, 0, 1_000),
+        owner_dir_root(issuer, iou_check.key),
+        owner_dir_root(destination, iou_check.key),
+        check_entry(issuer, destination, 3, iou_send_max),
+    ]);
+    ledger.set_fees(fees);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let mut sponsored_iou_tx = tx.clone();
+    sponsored_iou_tx.set_account_id(sf("sfSponsor"), iou_sponsor);
+    sponsored_iou_tx.set_field_u32(sf("sfSponsorFlags"), ledger::SPF_SPONSOR_RESERVE);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &sponsored_iou_tx, TxType::CHECK_CASH, Some(200)),
+        Ter::TES_SUCCESS
+    );
+    let line = view
+        .read(line(destination, issuer, usd.currency))
+        .expect("line read")
+        .expect("sponsored line");
+    assert_eq!(line.get_account_id(sf("sfHighSponsor")), iou_sponsor);
+    assert_eq!(
+        view.read(account_keylet(raw_account_id(destination)))
+            .expect("destination read")
+            .expect("destination")
+            .get_field_u32(sf("sfSponsoredOwnerCount")),
+        1
+    );
+    assert_eq!(
+        view.read(account_keylet(raw_account_id(iou_sponsor)))
+            .expect("sponsor read")
+            .expect("sponsor")
+            .get_field_u32(sf("sfSponsoringOwnerCount")),
+        1
+    );
+
+    // Missing MPT holdings use tecINSUFFICIENT_RESERVE.
+    let source = sample_account(0xE3);
+    let destination = sample_account(0xE4);
+    let mpt_issuer = sample_account(0xE5);
+    let mpt_id = share_id_for(mpt_issuer, 1);
+    let mpt_issue = MPTIssue::new(mpt_id);
+    let mpt_send_max =
+        STAmount::from_mpt_amount(sf("sfSendMax"), MPTAmount::from_value(10), mpt_issue);
+    let mpt_check = protocol::check_keylet(raw_account_id(source), 3);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 200),
+        account_root(mpt_issuer, 1, 0),
+        mpt_issuance_entry(mpt_issuer, 1, 100, protocol::lsfMPTCanTransfer),
+        mptoken_entry(source, mpt_id, 50),
+        owner_dir_root(source, mpt_check.key),
+        owner_dir_root(destination, mpt_check.key),
+        check_entry(source, destination, 3, mpt_send_max.clone()),
+    ]);
+    ledger.set_fees(fees);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let make_mpt_cash = |sponsor: Option<AccountID>| {
+        STTx::new(TxType::CHECK_CASH, |object| {
+            object.set_account_id(sf("sfAccount"), destination);
+            object.set_field_h256(sf("sfCheckID"), mpt_check.key);
+            object.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(10), mpt_issue),
+            );
+            object.set_field_amount(sf("sfFee"), test_xrp(10));
+            object.set_field_u32(sf("sfSequence"), 1);
+            if let Some(sponsor) = sponsor {
+                object.set_account_id(sf("sfSponsor"), sponsor);
+                object.set_field_u32(sf("sfSponsorFlags"), ledger::SPF_SPONSOR_RESERVE);
+            }
+        })
+    };
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &make_mpt_cash(None),
+            TxType::CHECK_CASH,
+            Some(200)
+        ),
+        Ter::TEC_INSUFFICIENT_RESERVE
+    );
+    assert!(
+        view.read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(destination)
+        ))
+        .expect("token read")
+        .is_none()
+    );
+
+    // The same low-reserve destination succeeds when a reserve sponsor can
+    // carry the extra owner reserve, and all sponsorship metadata is updated.
+    let sponsor = sample_account(0xE6);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 200),
+        account_root_with_balance(sponsor, 0, 0, 1_000),
+        account_root(mpt_issuer, 1, 0),
+        mpt_issuance_entry(mpt_issuer, 1, 100, protocol::lsfMPTCanTransfer),
+        mptoken_entry(source, mpt_id, 50),
+        owner_dir_root(source, mpt_check.key),
+        owner_dir_root(destination, mpt_check.key),
+        check_entry(source, destination, 3, mpt_send_max),
+    ]);
+    ledger.set_fees(fees);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let result = handle_real_dispatch(
+        &mut view,
+        &make_mpt_cash(Some(sponsor)),
+        TxType::CHECK_CASH,
+        Some(200),
+    );
+    assert_eq!(
+        result,
+        Ter::TES_SUCCESS,
+        "{}",
+        protocol::trans_token(result)
+    );
+    let destination_root = view
+        .read(account_keylet(raw_account_id(destination)))
+        .expect("destination read")
+        .expect("destination root");
+    let sponsor_root = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .expect("sponsor read")
+        .expect("sponsor root");
+    let token = view
+        .read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(destination),
+        ))
+        .expect("token read")
+        .expect("token exists");
+    assert_eq!(token.get_account_id(sf("sfSponsor")), sponsor);
+    assert_eq!(
+        (
+            destination_root.get_field_u32(sf("sfOwnerCount")),
+            destination_root.get_field_u32(sf("sfSponsoredOwnerCount")),
+            sponsor_root.get_field_u32(sf("sfSponsoringOwnerCount")),
+        ),
+        (1, 1, 1)
+    );
+}
+
+#[test]
+fn check_cash_delivered_amount_matches_xrp_amount_and_deliver_min_rules() {
+    let source = sample_account(0xD7);
+    let destination = sample_account(0xD8);
+    let check_keylet = protocol::check_keylet(raw_account_id(source), 3);
+    let send_max = test_xrp(500);
+
+    for deliver_min in [false, true] {
+        let ledger = empty_ledger(vec![
+            account_root_with_balance(source, 1, 0, 1_000),
+            account_root_with_balance(destination, 0, 0, 1_000),
+            owner_dir_root(source, check_keylet.key),
+            owner_dir_root(destination, check_keylet.key),
+            check_entry(source, destination, 3, send_max.clone()),
+        ]);
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let tx = STTx::new(TxType::CHECK_CASH, |object| {
+            object.set_account_id(sf("sfAccount"), destination);
+            object.set_field_h256(sf("sfCheckID"), check_keylet.key);
+            object.set_field_amount(
+                if deliver_min {
+                    sf("sfDeliverMin")
+                } else {
+                    sf("sfAmount")
+                },
+                test_xrp(200),
+            );
+            object.set_field_amount(sf("sfFee"), test_xrp(10));
+            object.set_field_u32(sf("sfSequence"), 1);
+        });
+
+        let (result, delivered_amount) =
+            apply_submit_transactor_shell_with_delivered_amount(&mut view, &tx, TxType::CHECK_CASH);
+
+        assert_eq!(result, Ter::TES_SUCCESS);
+        assert_eq!(
+            delivered_amount,
+            deliver_min.then(|| test_xrp(500)),
+            "XRP Amount has no delivered metadata; XRP DeliverMin records the actual maximum"
+        );
+    }
+}
+
+#[test]
+fn account_delete_records_remaining_balance_as_delivered_amount() {
+    let source = sample_account(0xD9);
+    let destination = sample_account(0xDA);
+    let ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 300,
+            ..LedgerHeader::default()
+        },
+        vec![
+            account_root_with_balance(source, 0, 0, 1_000),
+            account_root_with_balance(destination, 0, 0, 2_000),
+        ],
+    );
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::ACCOUNT_DELETE, |object| {
+        object.set_account_id(sf("sfAccount"), source);
+        object.set_account_id(sf("sfDestination"), destination);
+        object.set_field_amount(sf("sfFee"), test_xrp(10));
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    let (result, delivered_amount) =
+        apply_submit_transactor_shell_with_delivered_amount(&mut view, &tx, TxType::ACCOUNT_DELETE);
+
+    assert_eq!(result, Ter::TES_SUCCESS);
+    assert_eq!(delivered_amount, Some(test_xrp(990)));
 }
 
 #[test]
@@ -3520,6 +3893,67 @@ fn payment_transfers_mpt_without_rewriting_issue() {
     assert_eq!(
         destination_token.get_field_u64(get_field_by_symbol("sfMPTAmount")),
         10
+    );
+}
+
+#[test]
+fn payment_recycles_max_issued_mpt_between_holders() {
+    let source = sample_account(0xDA);
+    let destination = sample_account(0xDB);
+    let issuer = sample_account(0xDC);
+    let mpt_id = share_id_for(issuer, 1);
+    let mpt_issue = MPTIssue::new(mpt_id);
+    let mut issuance = mpt_issuance_entry(issuer, 1, 100, protocol::lsfMPTCanTransfer);
+    issuance.set_field_u64(sf("sfMaximumAmount"), 100);
+    let ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 1_000_000_000),
+        account_root(issuer, 1, 0),
+        issuance,
+        mptoken_entry(source, mpt_id, 50),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::PAYMENT, |object| {
+        object.set_account_id(sf("sfAccount"), source);
+        object.set_account_id(sf("sfDestination"), destination);
+        object.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(10), mpt_issue),
+        );
+        object.set_field_amount(sf("sfFee"), test_xrp(10));
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        view.read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(source)
+        ))
+        .expect("source read")
+        .expect("source token")
+        .get_field_u64(sf("sfMPTAmount")),
+        40
+    );
+    assert_eq!(
+        view.read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(destination)
+        ))
+        .expect("destination read")
+        .expect("destination token")
+        .get_field_u64(sf("sfMPTAmount")),
+        10
+    );
+    assert_eq!(
+        view.read(protocol::mpt_issuance_keylet_from_mptid(mpt_id))
+            .expect("issuance read")
+            .expect("issuance")
+            .get_field_u64(sf("sfOutstandingAmount")),
+        100
     );
 }
 
@@ -4893,10 +5327,82 @@ fn signer_list_set_create_populates_signer_sle_and_owner_dir() {
         .expect("owner dir read should succeed")
         .expect("owner dir should exist");
     assert_eq!(
+        owner_dir.get_account_id(get_field_by_symbol("sfOwner")),
+        account
+    );
+    assert_eq!(
         owner_dir
             .get_field_v256(get_field_by_symbol("sfIndexes"))
             .value(),
         &[signer_list.key().to_owned()]
+    );
+}
+
+#[test]
+fn ticket_create_populates_owner_directory_description() {
+    let account = sample_account(0x19);
+    let ledger = empty_ledger(vec![account_root(account, 0, 0)]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = ticket_create_tx(account, 1, 1);
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::TICKET_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    let ticket = protocol::ticket_keylet(raw_account_id(account), 2);
+    let owner_dir = view
+        .read(owner_dir_keylet(raw_account_id(account)))
+        .expect("owner directory read")
+        .expect("owner directory exists");
+    assert_eq!(owner_dir.get_account_id(sf("sfOwner")), account);
+    assert_eq!(
+        owner_dir.get_field_v256(sf("sfIndexes")).value(),
+        &[ticket.key]
+    );
+    assert_eq!(
+        view.read(ticket)
+            .expect("ticket read")
+            .expect("ticket exists")
+            .get_field_u64(sf("sfOwnerNode")),
+        0
+    );
+}
+
+#[test]
+fn ticket_create_returns_tec_dir_full_at_legacy_page_limit() {
+    let account = sample_account(0x1A);
+    let owner_dir_keylet = owner_dir_keylet(raw_account_id(account));
+    let last_page = protocol::DIR_NODE_MAX_PAGES - 1;
+    let full_indexes = (0..protocol::DIR_NODE_MAX_ENTRIES)
+        .map(|index| sample_uint256(index as u8 + 1))
+        .collect::<Vec<_>>();
+
+    let mut root = STLedgerEntry::new(owner_dir_keylet);
+    root.set_account_id(sf("sfOwner"), account);
+    root.set_field_h256(sf("sfRootIndex"), owner_dir_keylet.key);
+    root.set_field_v256(
+        sf("sfIndexes"),
+        protocol::STVector256::from_values(sf("sfIndexes"), full_indexes.clone()),
+    );
+    root.set_field_u64(sf("sfIndexPrevious"), last_page);
+    root.set_field_u64(sf("sfIndexNext"), last_page);
+
+    let mut tail = STLedgerEntry::new(protocol::page_keylet(owner_dir_keylet, last_page));
+    tail.set_account_id(sf("sfOwner"), account);
+    tail.set_field_h256(sf("sfRootIndex"), owner_dir_keylet.key);
+    tail.set_field_v256(
+        sf("sfIndexes"),
+        protocol::STVector256::from_values(sf("sfIndexes"), full_indexes),
+    );
+
+    let ledger = empty_ledger(vec![account_root(account, 0, 0), root, tail]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = ticket_create_tx(account, 1, 1);
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::TICKET_CREATE, None),
+        Ter::TEC_DIR_FULL
     );
 }
 
@@ -5869,6 +6375,14 @@ fn delegate_set_create_inserts_delegate_and_dual_owner_dirs() {
         .read(owner_dir_keylet(raw_account_id(authorize)))
         .expect("authorize dir read should succeed")
         .expect("authorize dir should exist");
+    assert_eq!(
+        owner_dir.get_account_id(get_field_by_symbol("sfOwner")),
+        account
+    );
+    assert_eq!(
+        dest_dir.get_account_id(get_field_by_symbol("sfOwner")),
+        authorize
+    );
     assert_eq!(
         owner_dir
             .get_field_v256(get_field_by_symbol("sfIndexes"))
@@ -8491,6 +9005,10 @@ fn loan_set_dispatch_links_borrower_and_broker_pseudo_owner_dirs() {
         .read(owner_dir_keylet(raw_account_id(broker_pseudo)))
         .expect("broker dir read should succeed")
         .expect("broker dir should exist");
+    assert_eq!(
+        broker_dir.get_account_id(get_field_by_symbol("sfOwner")),
+        broker_pseudo
+    );
     assert!(
         broker_dir
             .get_field_v256(get_field_by_symbol("sfIndexes"))
@@ -8502,6 +9020,10 @@ fn loan_set_dispatch_links_borrower_and_broker_pseudo_owner_dirs() {
         .read(owner_dir_keylet(raw_account_id(borrower)))
         .expect("borrower dir read should succeed")
         .expect("borrower dir should exist");
+    assert_eq!(
+        borrower_dir.get_account_id(get_field_by_symbol("sfOwner")),
+        borrower
+    );
     assert!(
         borrower_dir
             .get_field_v256(get_field_by_symbol("sfIndexes"))

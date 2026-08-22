@@ -11,7 +11,7 @@ use std::{
 };
 
 use basics::base_uint::Uint256;
-use protocol::{AccountID, Asset, Issue, Keylet, LedgerEntryType, STAmount, Ter};
+use protocol::{AccountID, Asset, Keylet, LedgerEntryType, MPTIssue, STAmount, Ter};
 
 const MAX_AMM_ITERATIONS: u16 = 30;
 
@@ -92,7 +92,8 @@ pub type Strand = Vec<StepKind>;
 
 /// Cancellation-only counterpart to rippled's `psbCancel`.
 ///
-/// A direct OfferCreate crossing records only eligible self-offer keys here.
+/// A direct OfferCreate crossing records offers that must be removed even when
+/// the tentative flow sandbox is discarded (self-crossed, malformed, or unfunded).
 /// Flow sandboxes remain disposable and therefore never own these deletions:
 /// after the flow outcome is known, the caller applies this accumulator to the
 /// transaction view with the canonical offer deletion helper. This deliberately
@@ -149,9 +150,20 @@ pub enum StepKind {
         account: AccountID,
         is_last: bool,
     },
+    /// An MPT may only ripple at a strand endpoint.  The issuer is therefore
+    /// always one side of this step (holder->issuer or issuer->holder).
+    MptEndpoint {
+        src: AccountID,
+        dst: AccountID,
+        issue: MPTIssue,
+        is_first: bool,
+        is_last: bool,
+        offer_crossing: bool,
+    },
     Book {
-        book_in: Issue,
-        book_out: Issue,
+        book_in: Asset,
+        book_out: Asset,
+        domain: Option<Uint256>,
         /// Offer crossing charges the offer owner; payments charge the path
         /// sender according to the surrounding step rules.
         owner_pays_transfer_fee: bool,

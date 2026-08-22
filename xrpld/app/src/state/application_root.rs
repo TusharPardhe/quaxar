@@ -2750,8 +2750,8 @@ pub fn apply_submit_transactor_shell_with_flags<V: ledger::ApplyView>(
     apply_submit_transactor_shell_with_flags_and_delivered_amount(view, tx, txn_type, flags).0
 }
 
-/// Applies a transaction and returns the actual MPT payment delivery recorded
-/// by the payment transactor for canonical metadata construction.
+/// Applies a transaction and returns any `ApplyContext::deliver` value recorded
+/// by Payment, CheckCash, or AccountDelete for canonical metadata construction.
 pub fn apply_submit_transactor_shell_with_delivered_amount<V: ledger::ApplyView>(
     view: &mut V,
     tx: &STTx,
@@ -2823,10 +2823,13 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
 
     tx::with_transaction_apply_runtime(&rules, || {
         // ApplyContext owns DeliveredAmount in rippled. Scope its Rust
-        // equivalent to this outer Payment only so batch inner payments cannot
-        // populate their parent Batch metadata.
-        let delivered_amount_capture = (txn_type == TxType::PAYMENT)
-            .then(crate::state::payment::MptDeliveredAmountCapture::new);
+        // equivalent to this transaction so a Batch inner delivery cannot
+        // populate its parent Batch metadata.
+        let delivered_amount_capture = matches!(
+            txn_type,
+            TxType::PAYMENT | TxType::CHECK_CASH | TxType::ACCOUNT_DELETE
+        )
+        .then(crate::state::payment::DeliveredAmountCapture::new);
 
         // Match rippled's ApplyContext: every mutation, including the common
         // sequence/ticket and fee preamble, stays in a per-transaction view
@@ -2889,7 +2892,8 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
             applied_batch_inner_transactions.clear();
         }
         let delivered_amount = delivered_amount_capture
-            .and_then(crate::state::payment::MptDeliveredAmountCapture::finish);
+            .and_then(crate::state::payment::DeliveredAmountCapture::finish)
+            .filter(|_| is_tes_success(result));
         SubmitApplyOutcome {
             result,
             delivered_amount,
@@ -3518,8 +3522,11 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
             // at that boundary so a panic cannot unwind and partially expose
             // the whole Batch view.
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let delivered_amount_capture = (inner_tx.get_txn_type() == TxType::PAYMENT)
-                    .then(crate::state::payment::MptDeliveredAmountCapture::new);
+                let delivered_amount_capture = matches!(
+                    inner_tx.get_txn_type(),
+                    TxType::PAYMENT | TxType::CHECK_CASH | TxType::ACCOUNT_DELETE
+                )
+                .then(crate::state::payment::DeliveredAmountCapture::new);
                 let result = apply_submit_transactor_shell_impl(
                     &mut per_tx_batch_view,
                     &inner_tx,
@@ -3527,7 +3534,8 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
                     ApplyFlags::BATCH,
                 );
                 let delivered_amount = delivered_amount_capture
-                    .and_then(crate::state::payment::MptDeliveredAmountCapture::finish);
+                    .and_then(crate::state::payment::DeliveredAmountCapture::finish)
+                    .filter(|_| is_tes_success(result));
                 (result, delivered_amount)
             })) {
                 Ok(result) => result,
@@ -9291,9 +9299,16 @@ impl ApplicationRoot {
         // this node out of active consensus) on a stale `closed_seq`.
         let closed_seq = parent.header().seq.saturating_add(1);
 
-        // Apply transactions to a mutable view of the parent ledger
-        let mut state_view =
-            ledger::ApplyViewImpl::new(Arc::clone(&parent), protocol::ApplyFlags::NONE);
+        // Apply against the parent's state while exposing the child ledger
+        // header. rippled's closed OpenView has this split: SLE reads come
+        // from the parent, but transaction code observes the ledger currently
+        // being built.
+        let application_header = Ledger::from_previous(&parent, close_time).header();
+        let mut state_view = ledger::ApplyViewImpl::new_with_header(
+            Arc::clone(&parent),
+            application_header,
+            protocol::ApplyFlags::NONE,
+        );
 
         let mut accepted_entries = Vec::new();
         for st_tx in &open_txs {
@@ -9700,8 +9715,15 @@ impl ApplicationRoot {
         let state_view_base = parent_ledger
             .clone()
             .unwrap_or_else(|| Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false)));
-        let state_view = std::sync::Mutex::new(ledger::ApplyViewImpl::new(
+        let application_header = parent_ledger
+            .as_ref()
+            .map(|parent| Ledger::from_previous(parent, close_time).header())
+            .unwrap_or_else(|| {
+                Ledger::from_ledger_seq_and_close_time(closed_seq, close_time, false).header()
+            });
+        let state_view = std::sync::Mutex::new(ledger::ApplyViewImpl::new_with_header(
             Arc::clone(&state_view_base),
+            application_header,
             protocol::ApplyFlags::NONE,
         ));
 

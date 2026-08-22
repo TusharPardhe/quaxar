@@ -1,8 +1,6 @@
 # install.ps1 — Quaxar installer for Windows
 # Usage: irm https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.ps1 | iex
-# Unattended: powershell -c "& { irm https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.ps1 | iex } -y"
-
-param([switch]$y)
+# The Windows installer is non-interactive.
 
 $ErrorActionPreference = "Stop"
 
@@ -50,19 +48,34 @@ $cloneDir = "$env:USERPROFILE\quaxar"
 if (Test-Path "$cloneDir\.git") {
     Write-Host "  Updating existing clone at $cloneDir..." -ForegroundColor Gray
     Push-Location $cloneDir
-    git pull --ff-only 2>$null
+    git pull --ff-only
+    $gitExitCode = $LASTEXITCODE
     Pop-Location
+    if ($gitExitCode -ne 0) {
+        Write-Host "  [X] Repository update failed with exit code $gitExitCode." -ForegroundColor Red
+        exit $gitExitCode
+    }
 } else {
     Write-Host "  Cloning repository..." -ForegroundColor Gray
     git clone https://github.com/TusharPardhe/quaxar.git $cloneDir
+    $gitExitCode = $LASTEXITCODE
+    if ($gitExitCode -ne 0) {
+        Write-Host "  [X] Repository clone failed." -ForegroundColor Red
+        exit $gitExitCode
+    }
 }
 
 # Build
 Write-Host ""
 Write-Host "  Building quaxar (this may take a few minutes)..." -ForegroundColor Cyan
 Push-Location $cloneDir
-cargo install --path xrpld/main --force 2>&1 | Select-Object -Last 1
+cargo install --path xrpld/main --locked --force
+$cargoExitCode = $LASTEXITCODE
 Pop-Location
+if ($cargoExitCode -ne 0) {
+    Write-Host "  [X] Build failed with exit code $cargoExitCode." -ForegroundColor Red
+    exit $cargoExitCode
+}
 
 # Verify
 $bin = "$env:USERPROFILE\.cargo\bin\quaxar.exe"
@@ -74,7 +87,7 @@ if (Test-Path $bin) {
     Write-Host "    quaxar --conf quaxar.cfg       Start the node" -ForegroundColor White
     Write-Host "    quaxar status                 Check node status" -ForegroundColor White
     Write-Host "    quaxar health                 Health check" -ForegroundColor White
-    Write-Host "    quaxar export-snapshot -o .   Export snapshot" -ForegroundColor White
+    Write-Host "    quaxar export-snapshot -o snapshot.xrpls  Export snapshot" -ForegroundColor White
     Write-Host ""
 } else {
     Write-Host "  [X] Build failed. Check output above for errors." -ForegroundColor Red

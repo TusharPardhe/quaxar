@@ -53,7 +53,7 @@ peer messages and local transactions
           v
     complete immutable state and transaction SHAMaps
           v
-    structural completion -> history + validation-trie residency
+    structural completion -> history + eligible validation waiters
           v
     durable completion handoff -> accepted-boundary NetworkOps LCL reconciliation
           |
@@ -90,8 +90,17 @@ full-ledger publication. Accepted local closes and contiguous publications
 advance the coordinator's separate LCL and publication identities. Once an LCL
 is installed, ordinary Consensus, Generic, and History acquisitions are
 phase-neutral; only a serialized actionable preferred-LCL divergence demotes
-Tracking or Full. During recovery, historical acquisition is subordinate to
-acquiring and publishing the current validated chain.
+Tracking or Full into target-bearing recovery. A timer-time consensus view
+change is mode-only: it may demote Tracking or Full to Connected, but target
+selection and acquisition remain owned by serialized
+`checkLastClosedLedger`. During recovery, historical acquisition is
+subordinate to acquiring and publishing the current validated chain.
+
+Validation-trie residency follows the current trusted validation, not the
+historical ledger index. If validator N is waiting for ledger A and then sends
+a newer validation for ledger B, the B waiter replaces A. A late completion of
+A remains reusable in history and storage, but cannot resurrect that
+validator's old trie support or steer a stale consensus round.
 
 The published identity is a fact observed from LedgerMaster, not itself a mode
 transition. NetworkOps forwards an installed, chain-contiguous published head
@@ -105,6 +114,32 @@ maintenance manufacture readiness.
 See [SYNCING.md](SYNCING.md) for the operator-visible state transitions.
 
 ## Payment and offer flow
+
+Consensus builds a child through an apply view that separates state ancestry
+from ledger context. Reads begin at the immutable parent state tree, while
+transaction code observes the prospective child's sequence, parent hash, and
+close-time fields. This is consensus-critical for account creation,
+expiration, offer, and metadata rules; exposing the parent header while
+building the child changes the resulting ledger hash.
+
+Transaction metadata is part of the transaction SHAMap. `DeliveredAmount` is
+recorded only at the same `ApplyContext::deliver` call sites as `rippled`:
+partial path payments whose actual output differs from `Amount`, the applicable
+CheckCash deliveries, and AccountDelete's remaining XRP. Exact path payments
+must not serialize an extra delivered field. Owner directories likewise use
+the shared owner describer and sorted `dirInsert` capacity semantics across
+every transaction family so `sfOwner`, ordering, and `tecDIR_FULL` behavior are
+canonical; book-quality directories remain append-ordered.
+
+Flow strands carry the complete `Asset` identity. XRP, IOU, and MPT endpoints
+retain their native amount type through reverse and forward passes, and book
+steps do not normalize MPT assets into XRP/IOU placeholders. MPT endpoint
+funding, authorization, lock state, issuance capacity, and transfer-rate
+rounding are checked before state is committed. `CheckCash` uses the same flow
+path for issued assets, including temporary destination-limit handling and the
+actual delivered amount for `DeliverMin`. Fill-or-kill completion switches
+between its historical input rule and corrected output rule only when the
+`fixFillOrKill` amendment is enabled.
 
 Path/offer execution creates one shared AMM context for the complete flow, not
 one context per `BookStep`. Reverse and forward book passes receive that same
@@ -195,7 +230,7 @@ and quorum decisions.
 | `xrpld/rpc` | RPC handlers, request roles and subscriptions |
 | `xrpld/server` | HTTP/WebSocket transport and RPC dispatch |
 | `xrpld/perflog` | Runtime activity and performance counters |
-| `xrpld/metrics` | Prometheus metrics (`quaxar-metrics` package) |
+| `xrpld/metrics` | Metrics recording and optional Prometheus exporter integration (`quaxar-metrics` package); normal bootstrap does not start the exporter |
 | `xrpld/cli` | Operator CLI (`quaxar-cli` package) |
 | `xrpld/main` | Bootstrap and `quaxar` executable (`quaxar-main` package) |
 
@@ -223,6 +258,11 @@ When changing the runtime, preserve these invariants:
 11. Consensus-critical balance orientation and self-cross callback ordering
     must match the reference call sites, not only produce equivalent-looking
     amounts in isolated tests.
+12. Child-ledger transaction views read parent state but expose the child
+    header; metadata fields and owner-directory describers are ledger-hash
+    inputs.
+13. Validation acquisition completion updates only exact current waiters; it
+    never revives a superseded validation from historical indexes.
 
 For behavior-parity changes, compare the corresponding `rippled` owner and
 call sequence, not just the shape of an individual function.

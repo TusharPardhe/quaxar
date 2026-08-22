@@ -7,6 +7,7 @@
 
 use super::steps::{FlowStep, StepAmount, StepAmounts, StepContext};
 use super::{AmmContext, FlowResult, SelfCrossCancellation, Strand};
+use crate::domain::ripple_calc::OfferCrossing;
 use crate::{ApplyView, FlowSandbox};
 use protocol::{AccountID, Quality, STAmount, Ter};
 use std::{cell::Cell, rc::Rc};
@@ -35,12 +36,14 @@ pub fn execute_strands<V: ApplyView>(
     strands: &[Strand],
     deliver: &STAmount,
     partial_payment: bool,
+    offer_crossing: OfferCrossing,
     send_max: Option<&STAmount>,
     strand_src: &AccountID,
     strand_dst: &AccountID,
     quality_threshold: Option<Quality>,
     self_cross_cancellation: Option<SelfCrossCancellation>,
 ) -> FlowResult {
+    let fill_or_kill_enabled = view.rules().enabled(&protocol::feature_id("fixFillOrKill"));
     if strands.is_empty() {
         return FlowResult {
             ter: Ter::TEC_PATH_DRY,
@@ -181,15 +184,16 @@ pub fn execute_strands<V: ApplyView>(
         }
     }
 
-    let result = if total_out.signum() <= 0 {
+    let result = if let Some(ter) = incomplete_offer_crossing_result(
+        &total_out,
+        deliver,
+        partial_payment,
+        offer_crossing,
+        remaining_in.as_ref(),
+        fill_or_kill_enabled,
+    ) {
         FlowResult {
-            ter: Ter::TEC_PATH_DRY,
-            actual_in: total_in,
-            actual_out: total_out,
-        }
-    } else if total_out < *deliver && !partial_payment {
-        FlowResult {
-            ter: Ter::TEC_PATH_PARTIAL,
+            ter,
             actual_in: total_in,
             actual_out: total_out,
         }
@@ -209,6 +213,40 @@ pub fn execute_strands<V: ApplyView>(
         };
     }
     result
+}
+
+fn incomplete_offer_crossing_result(
+    total_out: &STAmount,
+    deliver: &STAmount,
+    partial_payment: bool,
+    offer_crossing: OfferCrossing,
+    remaining_in: Option<&STAmount>,
+    fill_or_kill_enabled: bool,
+) -> Option<Ter> {
+    if total_out != deliver {
+        if total_out > deliver {
+            return Some(Ter::TEF_EXCEPTION);
+        }
+        if !partial_payment {
+            if offer_crossing == OfferCrossing::No
+                || (fill_or_kill_enabled && offer_crossing != OfferCrossing::Sell)
+            {
+                return Some(Ter::TEC_PATH_PARTIAL);
+            }
+        } else if total_out.signum() == 0 {
+            return Some(Ter::TEC_PATH_DRY);
+        }
+    }
+
+    if offer_crossing != OfferCrossing::No
+        && !partial_payment
+        && (!fill_or_kill_enabled || offer_crossing == OfferCrossing::Sell)
+    {
+        return remaining_in
+            .is_some_and(|amount| amount.signum() > 0)
+            .then_some(Ter::TEC_PATH_PARTIAL);
+    }
+    None
 }
 
 /// Run one strand against two nested sandboxes: a discarded reverse probe and
@@ -345,13 +383,14 @@ fn limit_single_strand_out<V: ApplyView>(
             super::StepKind::Book {
                 book_in,
                 book_out,
+                domain,
                 owner_pays_transfer_fee,
                 ..
             } => {
                 let book = crate::domain::ripple_calc::book_step::Book {
-                    r#in: protocol::Asset::Issue(*book_in),
-                    out: protocol::Asset::Issue(*book_out),
-                    domain: None,
+                    r#in: *book_in,
+                    out: *book_out,
+                    domain: *domain,
                 };
                 (
                     crate::domain::ripple_calc::book_step::book_quality_function(
@@ -426,6 +465,7 @@ fn preceding_debt_directions<V: ApplyView>(view: &mut V, strand: &Strand) -> Vec
             super::StepKind::Direct { src, dst, currency } => {
                 max_payment_flow(view, src, dst, *currency).1 == DebtDirection::Redeems
             }
+            super::StepKind::MptEndpoint { src, issue, .. } => *src != issue.issuer(),
             super::StepKind::Book { .. } | super::StepKind::XrpEndpoint { .. } => false,
         };
     }
@@ -670,6 +710,67 @@ mod tests {
     fn resource_caps_match_rippled_flow() {
         assert_eq!(MAX_TRIES, 1000);
         assert_eq!(MAX_OFFERS_TO_CONSIDER, 1500);
+    }
+
+    #[test]
+    fn sell_fill_or_kill_completes_when_all_input_is_consumed() {
+        let delivered = STAmount::from_xrp_amount(XRPAmount::from_drops(50));
+        let unlimited = STAmount::from_xrp_amount(XRPAmount::from_drops(100));
+        let zero_in = STAmount::from_xrp_amount(XRPAmount::new());
+        let remaining_in = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+
+        assert_eq!(
+            incomplete_offer_crossing_result(
+                &delivered,
+                &unlimited,
+                false,
+                OfferCrossing::Sell,
+                Some(&zero_in),
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            incomplete_offer_crossing_result(
+                &delivered,
+                &unlimited,
+                false,
+                OfferCrossing::Sell,
+                Some(&remaining_in),
+                true,
+            ),
+            Some(Ter::TEC_PATH_PARTIAL)
+        );
+    }
+
+    #[test]
+    fn buy_fill_or_kill_switches_from_input_to_output_completion_at_amendment() {
+        let delivered = STAmount::from_xrp_amount(XRPAmount::from_drops(50));
+        let requested = STAmount::from_xrp_amount(XRPAmount::from_drops(100));
+        let zero_in = STAmount::from_xrp_amount(XRPAmount::new());
+
+        assert_eq!(
+            incomplete_offer_crossing_result(
+                &delivered,
+                &requested,
+                false,
+                OfferCrossing::Yes,
+                Some(&zero_in),
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            incomplete_offer_crossing_result(
+                &delivered,
+                &requested,
+                false,
+                OfferCrossing::Yes,
+                Some(&zero_in),
+                true,
+            ),
+            Some(Ter::TEC_PATH_PARTIAL)
+        );
     }
 
     #[test]

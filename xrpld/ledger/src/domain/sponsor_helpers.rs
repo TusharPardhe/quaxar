@@ -3,7 +3,9 @@
 //! These utilities determine whether a transaction has fee/reserve sponsorship,
 //! retrieve the sponsor SLE, and manage the sponsor field on ledger objects.
 
+use crate::{ApplyView, ViewError};
 use protocol::{AccountID, STLedgerEntry, TxType, get_field_by_symbol};
+use std::sync::Arc;
 
 /// Sponsor flags on the transaction `sfSponsorFlags` field.
 pub const SPF_SPONSOR_FEE: u32 = 1;
@@ -56,6 +58,57 @@ pub fn reserve_sponsor_allowed_tx_types() -> &'static [TxType] {
 /// `spfSponsorReserve` in `sfSponsorFlags`.
 pub fn is_reserve_sponsor_allowed(tx_type: TxType) -> bool {
     reserve_sponsor_allowed_tx_types().contains(&tx_type)
+}
+
+/// Return the reserve-bearing owner count after sponsor accounting.
+pub fn reserve_owner_count(sle: &STLedgerEntry, adjustment: i32) -> u32 {
+    let owner = sle.get_field_u32(get_field_by_symbol("sfOwnerCount")) as i64;
+    let sponsored = sle.get_field_u32(get_field_by_symbol("sfSponsoredOwnerCount")) as i64;
+    let sponsoring = sle.get_field_u32(get_field_by_symbol("sfSponsoringOwnerCount")) as i64;
+    (owner + adjustment as i64 - sponsored + sponsoring).clamp(0, u32::MAX as i64) as u32
+}
+
+/// Add one owned object, assigning its reserve to `sponsor_sle` when present.
+pub fn increase_owner_count_for_object(
+    view: &mut dyn ApplyView,
+    account_sle: &Arc<STLedgerEntry>,
+    sponsor_sle: Option<&Arc<STLedgerEntry>>,
+) -> Result<(), ViewError> {
+    let owner_field = get_field_by_symbol("sfOwnerCount");
+    let sponsored_field = get_field_by_symbol("sfSponsoredOwnerCount");
+    let sponsoring_field = get_field_by_symbol("sfSponsoringOwnerCount");
+    let account = account_sle.get_account_id(get_field_by_symbol("sfAccount"));
+    let current = account_sle.get_field_u32(owner_field);
+    let next = current.saturating_add(1);
+    view.adjust_owner_count_hook(account, current, next);
+
+    let mut account_obj = account_sle.clone_as_object();
+    account_obj.set_field_u32(owner_field, next);
+    if sponsor_sle.is_some() {
+        account_obj.set_field_u32(
+            sponsored_field,
+            account_sle.get_field_u32(sponsored_field).saturating_add(1),
+        );
+    }
+    view.update(Arc::new(STLedgerEntry::from_stobject(
+        account_obj,
+        *account_sle.key(),
+    )))?;
+
+    if let Some(sponsor_sle) = sponsor_sle {
+        let mut sponsor_obj = sponsor_sle.clone_as_object();
+        sponsor_obj.set_field_u32(
+            sponsoring_field,
+            sponsor_sle
+                .get_field_u32(sponsoring_field)
+                .saturating_add(1),
+        );
+        view.update(Arc::new(STLedgerEntry::from_stobject(
+            sponsor_obj,
+            *sponsor_sle.key(),
+        )))?;
+    }
+    Ok(())
 }
 
 /// Extract the sponsor AccountID from an STLedgerEntry, defaulting to `sfSponsor`.

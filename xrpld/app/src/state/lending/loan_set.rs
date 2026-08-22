@@ -914,7 +914,7 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                 view,
                 &owner_dir_keylet(to_160(&broker.pseudo_account)),
                 loan_id,
-                &|_| {},
+                &ledger::describe_owner_dir(broker.pseudo_account),
             ) {
                 Ok(Some(page)) => page,
                 Ok(None) => return Ter::TEC_DIR_FULL,
@@ -924,7 +924,7 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                 view,
                 &owner_dir_keylet(to_160(&borrower)),
                 loan_id,
-                &|_| {},
+                &ledger::describe_owner_dir(borrower),
             ) {
                 Ok(Some(page)) => page,
                 Ok(None) => return Ter::TEC_DIR_FULL,
@@ -1084,7 +1084,7 @@ pub fn apply_loan_broker_set<V: ApplyView>(
         view,
         &owner_dir_keylet(to_160(&account)),
         broker_keylet.key,
-        &|_| {},
+        &ledger::describe_owner_dir(account),
     ) {
         Ok(Some(page)) => page,
         Ok(None) => return Ter::TEC_DIR_FULL,
@@ -1094,7 +1094,7 @@ pub fn apply_loan_broker_set<V: ApplyView>(
         view,
         &owner_dir_keylet(to_160(&vault_pseudo_id)),
         broker_keylet.key,
-        &|_| {},
+        &ledger::describe_owner_dir(vault_pseudo_id),
     ) {
         Ok(Some(page)) => page,
         Ok(None) => return Ter::TEC_DIR_FULL,

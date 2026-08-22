@@ -25,6 +25,28 @@ The executable comes from the `quaxar-main` Cargo package and uses the
 `quaxar-cli` library; the retained `xrpld/main` source path is not an installed
 program name.
 
+The top-level `--help` output describes operator subcommands and the global
+`--conf` and `--rpc-url` options. Server startup also accepts these operational
+modes, which are parsed by the bootstrap path rather than Clap:
+
+| Option | Purpose |
+|--------|---------|
+| `--standalone`, `-a` | Run without the peer network. |
+| `--start` | Create a fresh ledger for a private network. |
+| `--net` | Acquire the initial ledger from the network. |
+| `--load` | Load the current ledger from the local database. |
+| `--import` | Run the node-database import startup path. |
+| `--valid` | Assert that the initial ledger is a valid network ledger. |
+| `--quorum <n>` | Override the minimum validation quorum. |
+
+The data-recovery and fresh-ledger modes can change the selected startup state.
+Use them only with an understood database and network plan; ordinary service
+operation needs only an explicit `--conf`. The bootstrap parser contains
+additional value-taking recovery/test flags, but the combined executable's
+current command pre-dispatch does not pass them through reliably (for example,
+`--ledger <id>` is treated as an operator command). They are intentionally not
+documented here as supported CLI options.
+
 ## Interactive Mode
 
 Launch an interactive shell with fuzzy search and inline suggestions:

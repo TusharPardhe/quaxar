@@ -751,7 +751,14 @@ where
         ))
     }
 
-    /// Report a preferred-LCL divergence fact (rippled `consensusViewChange`).
+    /// Report rippled's mode-only `consensusViewChange`. This demotes
+    /// `Tracking/Full -> Connected` without selecting an acquisition target.
+    pub(crate) fn consensus_view_change(&mut self) -> Vec<AcquisitionEffect> {
+        self.handle_fact(AcquisitionEvent::ConsensusViewChange)
+    }
+
+    /// Report a target-bearing preferred-LCL divergence fact from the
+    /// serialized `checkLastClosedLedger` path.
     /// Demotes `Connected/Tracking/Full -> Syncing { target }` without minting a
     /// session; the missing/incomplete path reports its own `acquire_requested`
     /// demand, and a resident-and-compatible switch performs no peer fetch.
@@ -944,6 +951,7 @@ fn event_session(event: &AcquisitionEvent) -> Option<SessionRef> {
         | AcquisitionEvent::AcquireRequested { .. }
         | AcquisitionEvent::ValidationTarget(_)
         | AcquisitionEvent::ConsensusTarget(_)
+        | AcquisitionEvent::ConsensusViewChange
         | AcquisitionEvent::PreferredLclDivergence { .. }
         | AcquisitionEvent::PreferredLclReconciled { .. }
         | AcquisitionEvent::BlockedWithNoTarget
@@ -1875,6 +1883,25 @@ mod tests {
                 target: target(11, 11)
             }
         );
+    }
+
+    #[test]
+    fn consensus_view_change_demotes_tracking_without_a_target_or_session() {
+        let (mut adapter, _cache) = adapter();
+        let _session = acquired(&mut adapter);
+        adapter.push(AcquisitionEvent::LclInstalled(
+            acquisition::LedgerIdentity::new(Uint256::from(9), SEQ),
+        ));
+        assert_eq!(adapter.drain(), 1);
+
+        let sessions_before = adapter.snapshot().session_count();
+        let effects = adapter.consensus_view_change();
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Connected)]
+        );
+        assert_eq!(adapter.snapshot().phase(), &SyncPhase::Connected);
+        assert_eq!(adapter.snapshot().session_count(), sessions_before);
     }
 
     #[test]

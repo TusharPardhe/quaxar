@@ -50,7 +50,7 @@ impl<'a, V: ApplyView> CheckCreateApplySink for ViewBackedCheckCreateSink<'a, V>
             self.view,
             &protocol::owner_dir_keylet(Uint160::from_void(self.dst_account.data())),
             self.check_key,
-            &|_| {},
+            &ledger::describe_owner_dir(self.dst_account),
         )
         .ok()
         .flatten()
@@ -60,7 +60,7 @@ impl<'a, V: ApplyView> CheckCreateApplySink for ViewBackedCheckCreateSink<'a, V>
             self.view,
             &protocol::owner_dir_keylet(Uint160::from_void(self.account.data())),
             self.check_key,
-            &|_| {},
+            &ledger::describe_owner_dir(self.account),
         )
         .ok()
         .flatten()
@@ -328,13 +328,23 @@ impl<'a, V: ApplyView> CheckCashApplySink for ViewBackedCheckCashSink<'a, V> {
         };
 
         let low_dir = protocol::owner_dir_keylet(Uint160::from_void(low_account.data()));
-        let low_node = match dir_insert(self.view, &low_dir, line_keylet.key, &|_| {}) {
+        let low_node = match dir_insert(
+            self.view,
+            &low_dir,
+            line_keylet.key,
+            &ledger::describe_owner_dir(low_account),
+        ) {
             Ok(Some(page)) => page,
             Ok(None) => return Ter::TEC_DIR_FULL,
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let high_dir = protocol::owner_dir_keylet(Uint160::from_void(high_account.data()));
-        let high_node = match dir_insert(self.view, &high_dir, line_keylet.key, &|_| {}) {
+        let high_node = match dir_insert(
+            self.view,
+            &high_dir,
+            line_keylet.key,
+            &ledger::describe_owner_dir(high_account),
+        ) {
             Ok(Some(page)) => page,
             Ok(None) => {
                 let _ = dir_remove(self.view, &low_dir, low_node, line_keylet.key, false);
@@ -577,7 +587,7 @@ impl<'a, V: ApplyView> PaymentChannelCreateApplySink for ViewBackedPaymentChanne
             self.view,
             &protocol::owner_dir_keylet(Uint160::from_void(self.account.data())),
             self.channel_key,
-            &|_| {},
+            &ledger::describe_owner_dir(self.account),
         )
         .ok()
         .flatten()
@@ -596,7 +606,7 @@ impl<'a, V: ApplyView> PaymentChannelCreateApplySink for ViewBackedPaymentChanne
             self.view,
             &protocol::owner_dir_keylet(Uint160::from_void(self.dst_account.data())),
             self.channel_key,
-            &|_| {},
+            &ledger::describe_owner_dir(self.dst_account),
         )
         .ok()
         .flatten()

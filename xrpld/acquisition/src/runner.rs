@@ -713,6 +713,7 @@ impl CoordinatorRunner {
             }
             AcquisitionEvent::ValidationTarget(target) => self.on_validation_target(target),
             AcquisitionEvent::ConsensusTarget(target) => self.on_consensus(target),
+            AcquisitionEvent::ConsensusViewChange => self.on_consensus_view_change(),
             AcquisitionEvent::PreferredLclDivergence { target } => {
                 self.on_preferred_lcl_divergence(target)
             }
@@ -1136,7 +1137,25 @@ impl CoordinatorRunner {
         self.on_acquire(target, AcquireReason::Consensus, false, true)
     }
 
-    /// A preferred-LCL divergence demotion (rippled `consensusViewChange`).
+    /// Rippled `consensusViewChange` changes only the operating mode. The
+    /// serialized `checkLastClosedLedger` path is responsible for selecting a
+    /// concrete preferred-LCL recovery target later.
+    fn on_consensus_view_change(&mut self) -> Vec<AcquisitionEffect> {
+        let fact = TransitionFact::ConsensusViewChange;
+        let mut effects = Vec::new();
+        if let Ok(next) = self.state.phase.apply(fact) {
+            if next != self.state.phase {
+                self.state.phase = next;
+                effects.push(AcquisitionEffect::SetServicePhase(next));
+            }
+        } else {
+            self.stats.rejected_events += 1;
+        }
+        effects
+    }
+
+    /// A target-bearing preferred-LCL divergence from the serialized
+    /// `checkLastClosedLedger` path.
     /// Demotes `Connected/Tracking/Full -> Syncing { target }` without minting
     /// a session. While already Syncing, the fact updates preferred policy
     /// outside the phase but preserves the recovery anchor whose installation
@@ -5349,6 +5368,27 @@ mod tests {
             // The divergence fact never mints a session: the acquisition demand
             // arrives as a separate AcquireRequested fact.
             assert_eq!(runner.snapshot().session_count(), 0);
+        }
+    }
+
+    #[test]
+    fn consensus_view_change_demotes_full_and_tracking_without_pinning_a_target() {
+        for phase in [
+            SyncPhase::Full {
+                lcl: identity(1),
+                published: identity(1),
+            },
+            SyncPhase::Tracking { lcl: identity(1) },
+        ] {
+            let mut runner = CoordinatorRunner::with_phase(RunEpoch::new(1), phase);
+            let effects = runner.handle_event(AcquisitionEvent::ConsensusViewChange);
+            assert_eq!(runner.phase(), &SyncPhase::Connected);
+            assert_eq!(
+                effects,
+                vec![AcquisitionEffect::SetServicePhase(SyncPhase::Connected)]
+            );
+            assert_eq!(runner.snapshot().session_count(), 0);
+            assert_eq!(runner.state.latest_consensus_target, None);
         }
     }
 

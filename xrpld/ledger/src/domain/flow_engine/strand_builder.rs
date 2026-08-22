@@ -1,8 +1,6 @@
 use super::{StepKind, Strand};
-use protocol::{
-    AccountID, Asset, Currency, Issue, STPath, STPathSet, Ter, is_xrp_currency, xrp_account,
-    xrp_issue,
-};
+use basics::base_uint::Uint256;
+use protocol::{AccountID, Asset, Issue, STPath, STPathSet, Ter, xrp_issue};
 
 pub fn to_strand(
     src: &AccountID,
@@ -13,20 +11,36 @@ pub fn to_strand(
     owner_pays_transfer_fee: bool,
     offer_crossing: bool,
 ) -> (Ter, Strand) {
+    to_strand_with_domain(
+        src,
+        dst,
+        deliver,
+        send_max_asset,
+        path,
+        owner_pays_transfer_fee,
+        offer_crossing,
+        None,
+    )
+}
+
+fn to_strand_with_domain(
+    src: &AccountID,
+    dst: &AccountID,
+    deliver: &Asset,
+    send_max_asset: Option<&Asset>,
+    path: &STPath,
+    owner_pays_transfer_fee: bool,
+    offer_crossing: bool,
+    domain: Option<Uint256>,
+) -> (Ter, Strand) {
     if src.is_zero() || dst.is_zero() {
         return (Ter::TEM_BAD_PATH, Vec::new());
     }
 
-    // Compute initial curAsset (reference lines 239-249)
-    let (initial_currency, initial_issuer) = match send_max_asset.unwrap_or(deliver) {
-        Asset::Issue(issue) => {
-            if is_xrp_currency(issue.currency) {
-                (protocol::xrp_currency(), xrp_account())
-            } else {
-                (issue.currency, *src)
-            }
-        }
-        _ => (protocol::xrp_currency(), xrp_account()),
+    let initial_asset = match *send_max_asset.unwrap_or(deliver) {
+        Asset::Issue(issue) if issue.native() => Asset::Issue(xrp_issue()),
+        Asset::Issue(issue) => Asset::Issue(Issue::new(issue.currency, *src)),
+        Asset::MPTIssue(issue) => Asset::MPTIssue(issue),
     };
 
     // Build normalized path elements
@@ -36,17 +50,17 @@ pub fn to_strand(
     norm.push(NormElem::Acct(*src));
 
     // 2. SendMax issuer if != src
-    if let Some(Asset::Issue(sma)) = send_max_asset
-        && !is_xrp_currency(sma.currency)
-        && sma.account != *src
+    if let Some(sma) = send_max_asset
+        && !sma.native()
+        && sma.issuer() != *src
     {
         let first_is_issuer = path
             .iter()
             .next()
-            .map(|e| e.is_account() && e.account_id() == sma.account)
+            .map(|e| e.is_account() && e.account_id() == sma.issuer())
             .unwrap_or(false);
         if !first_is_issuer {
-            norm.push(NormElem::Acct(sma.account));
+            norm.push(NormElem::Acct(sma.issuer()));
         }
     }
 
@@ -55,38 +69,32 @@ pub fn to_strand(
         if elem.is_account() {
             norm.push(NormElem::Acct(elem.account_id()));
         } else {
-            let cur = if elem.has_currency() {
-                elem.currency()
+            let asset = if elem.has_mpt() {
+                Asset::from(elem.mpt_id())
             } else {
-                Currency::default()
+                let issuer = if elem.has_issuer() {
+                    elem.issuer_id()
+                } else {
+                    initial_asset.issuer()
+                };
+                Asset::Issue(Issue::new(elem.currency(), issuer))
             };
-            let iss = if elem.has_issuer() {
-                elem.issuer_id()
-            } else {
-                AccountID::default()
-            };
-            norm.push(NormElem::Offer(cur, iss));
+            norm.push(NormElem::Offer(asset));
         }
     }
 
     // 4. Deliver asset if last asset != deliver
-    let deliver_issue = match deliver {
-        Asset::Issue(i) => *i,
-        _ => Issue::default(),
-    };
     let needs_deliver_book = {
-        let last_currency = last_currency_in_norm(&norm, initial_currency);
-        last_currency != deliver_issue.currency
+        let last_asset = last_asset_in_norm(&norm, initial_asset);
+        !same_path_asset(last_asset, *deliver)
+            || (offer_crossing && last_asset.issuer() != deliver.issuer())
     };
     if needs_deliver_book {
-        norm.push(NormElem::Offer(
-            deliver_issue.currency,
-            deliver_issue.account,
-        ));
+        norm.push(NormElem::Offer(*deliver));
     }
 
     // 5. Deliver issuer if != dst
-    let deliver_issuer = deliver_issue.account;
+    let deliver_issuer = deliver.issuer();
     let last_is_deliver_issuer =
         matches!(norm.last(), Some(NormElem::Acct(a)) if *a == deliver_issuer);
     if !last_is_deliver_issuer && *dst != deliver_issuer && !deliver_issuer.is_zero() {
@@ -105,8 +113,7 @@ pub fn to_strand(
 
     // Create steps from normalized path pairs
     let mut strand: Strand = Vec::new();
-    let mut cur_currency = initial_currency;
-    let mut cur_issuer = initial_issuer;
+    let mut cur_asset = initial_asset;
 
     for i in 0..norm.len() - 1 {
         let cur = &norm[i];
@@ -115,42 +122,44 @@ pub fn to_strand(
         // Update curAsset from current element
         match cur {
             NormElem::Acct(acct) => {
-                if !is_xrp_currency(cur_currency) {
-                    cur_issuer = *acct;
+                if let Asset::Issue(issue) = &mut cur_asset
+                    && !issue.native()
+                {
+                    issue.account = *acct;
                 }
             }
-            NormElem::Offer(c, iss) => {
-                if *c != Currency::default() {
-                    cur_currency = *c;
-                    if is_xrp_currency(*c) {
-                        cur_issuer = xrp_account();
-                    } else if *iss != AccountID::default() {
-                        cur_issuer = *iss;
-                    }
-                }
-            }
+            NormElem::Offer(asset) => cur_asset = *asset,
         }
 
         match (cur, next) {
             (NormElem::Acct(s), NormElem::Acct(d)) => {
-                if is_xrp_currency(cur_currency) {
+                if cur_asset.native() {
                     // XRP endpoint
                     let is_first = i == 0;
                     strand.push(StepKind::XrpEndpoint {
                         account: if is_first { *s } else { *d },
                         is_last: !is_first,
                     });
-                } else {
+                } else if let Asset::MPTIssue(issue) = cur_asset {
+                    strand.push(StepKind::MptEndpoint {
+                        src: *s,
+                        dst: *d,
+                        issue,
+                        is_first: i == 0,
+                        is_last: i == norm.len() - 2,
+                        offer_crossing,
+                    });
+                } else if let Asset::Issue(issue) = cur_asset {
                     // DirectStep
                     strand.push(StepKind::Direct {
                         src: *s,
                         dst: *d,
-                        currency: cur_currency,
+                        currency: issue.currency,
                     });
                 }
             }
-            (NormElem::Acct(s), NormElem::Offer(out_c, out_iss)) => {
-                if i == 0 && is_xrp_currency(cur_currency) {
+            (NormElem::Acct(s), NormElem::Offer(out_asset)) => {
+                if i == 0 && cur_asset.native() {
                     strand.push(StepKind::XrpEndpoint {
                         account: *s,
                         is_last: false,
@@ -160,48 +169,53 @@ pub fn to_strand(
                 // changing its currency and before it calls `toStep`: XRP
                 // always carries `xrpAccount()`, never a path issuer.  Keep
                 // both sides canonical before storing the typed BookStep.
-                let in_issue = canonical_book_issue(cur_currency, cur_issuer);
-                let out_issue = canonical_book_issue(*out_c, *out_iss);
                 strand.push(StepKind::Book {
-                    book_in: in_issue,
-                    book_out: out_issue,
+                    book_in: canonical_book_asset(cur_asset),
+                    book_out: canonical_book_asset(*out_asset),
+                    domain,
                     owner_pays_transfer_fee,
                     remove_self_crossing: offer_crossing && path.size() == 0,
                 });
-                cur_currency = out_issue.currency;
-                cur_issuer = out_issue.account;
+                cur_asset = canonical_book_asset(*out_asset);
             }
-            (NormElem::Offer(_, _), NormElem::Acct(d)) => {
+            (NormElem::Offer(_), NormElem::Acct(d)) => {
                 // Offer→Account: implied step if cur_issuer != dst
-                if cur_issuer != *d && !d.is_zero() {
-                    if is_xrp_currency(cur_currency) {
+                if cur_asset.issuer() != *d && !d.is_zero() {
+                    if cur_asset.native() {
                         strand.push(StepKind::XrpEndpoint {
                             account: *d,
                             is_last: true,
                         });
-                    } else {
-                        strand.push(StepKind::Direct {
-                            src: cur_issuer,
+                    } else if let Asset::MPTIssue(issue) = cur_asset {
+                        strand.push(StepKind::MptEndpoint {
+                            src: issue.issuer(),
                             dst: *d,
-                            currency: cur_currency,
+                            issue,
+                            is_first: false,
+                            is_last: true,
+                            offer_crossing,
+                        });
+                    } else if let Asset::Issue(issue) = cur_asset {
+                        strand.push(StepKind::Direct {
+                            src: issue.issuer(),
+                            dst: *d,
+                            currency: issue.currency,
                         });
                     }
                 }
                 continue;
             }
-            (NormElem::Offer(_, _), NormElem::Offer(out_c, out_iss)) => {
+            (NormElem::Offer(_), NormElem::Offer(out_asset)) => {
                 // Match the same `PaySteps.cpp::toStrand` normalization used by
                 // the account-to-offer BookStep above.
-                let in_issue = canonical_book_issue(cur_currency, cur_issuer);
-                let out_issue = canonical_book_issue(*out_c, *out_iss);
                 strand.push(StepKind::Book {
-                    book_in: in_issue,
-                    book_out: out_issue,
+                    book_in: canonical_book_asset(cur_asset),
+                    book_out: canonical_book_asset(*out_asset),
+                    domain,
                     owner_pays_transfer_fee,
                     remove_self_crossing: offer_crossing && path.size() == 0,
                 });
-                cur_currency = out_issue.currency;
-                cur_issuer = out_issue.account;
+                cur_asset = canonical_book_asset(*out_asset);
             }
         }
     }
@@ -231,11 +245,35 @@ pub fn to_strands(
     owner_pays_transfer_fee: bool,
     offer_crossing: bool,
 ) -> (Ter, Vec<Strand>) {
+    to_strands_with_domain(
+        src,
+        dst,
+        deliver,
+        send_max_asset,
+        paths,
+        default_paths_allowed,
+        owner_pays_transfer_fee,
+        offer_crossing,
+        None,
+    )
+}
+
+pub fn to_strands_with_domain(
+    src: &AccountID,
+    dst: &AccountID,
+    deliver: &Asset,
+    send_max_asset: Option<&Asset>,
+    paths: &STPathSet,
+    default_paths_allowed: bool,
+    owner_pays_transfer_fee: bool,
+    offer_crossing: bool,
+    domain: Option<Uint256>,
+) -> (Ter, Vec<Strand>) {
     let mut result: Vec<Strand> = Vec::new();
 
     if default_paths_allowed {
         let empty_path = protocol::STPath::new();
-        let (ter, strand) = to_strand(
+        let (ter, strand) = to_strand_with_domain(
             src,
             dst,
             deliver,
@@ -243,6 +281,7 @@ pub fn to_strands(
             &empty_path,
             owner_pays_transfer_fee,
             offer_crossing,
+            domain,
         );
         if ter == Ter::TES_SUCCESS && !strand.is_empty() {
             result.push(strand);
@@ -252,7 +291,7 @@ pub fn to_strands(
     }
 
     for path in paths.iter() {
-        let (ter, strand) = to_strand(
+        let (ter, strand) = to_strand_with_domain(
             src,
             dst,
             deliver,
@@ -260,6 +299,7 @@ pub fn to_strands(
             path,
             owner_pays_transfer_fee,
             offer_crossing,
+            domain,
         );
         if ter == Ter::TES_SUCCESS && !strand.is_empty() {
             result.push(strand);
@@ -278,26 +318,31 @@ pub fn to_strands(
 /// ignores an XRP account, but `keylet::get_book_base` must receive the
 /// canonical zero XRP account (rippled `PaySteps.cpp::toStrand`, immediately
 /// before its `toStep` call).
-fn canonical_book_issue(currency: Currency, issuer: AccountID) -> Issue {
-    if is_xrp_currency(currency) {
-        xrp_issue()
-    } else {
-        Issue::new(currency, issuer)
+fn canonical_book_asset(asset: Asset) -> Asset {
+    match asset {
+        Asset::Issue(issue) if issue.native() => Asset::Issue(xrp_issue()),
+        _ => asset,
+    }
+}
+
+fn same_path_asset(lhs: Asset, rhs: Asset) -> bool {
+    match (lhs, rhs) {
+        (Asset::Issue(lhs), Asset::Issue(rhs)) => lhs.currency == rhs.currency,
+        (Asset::MPTIssue(lhs), Asset::MPTIssue(rhs)) => lhs == rhs,
+        _ => false,
     }
 }
 
 #[derive(Debug, Clone)]
 enum NormElem {
     Acct(AccountID),
-    Offer(Currency, AccountID),
+    Offer(Asset),
 }
 
-fn last_currency_in_norm(norm: &[NormElem], initial: Currency) -> Currency {
+fn last_asset_in_norm(norm: &[NormElem], initial: Asset) -> Asset {
     for elem in norm.iter().rev() {
-        if let NormElem::Offer(c, _) = elem
-            && *c != Currency::default()
-        {
-            return *c;
+        if let NormElem::Offer(asset) = elem {
+            return *asset;
         }
     }
     initial
@@ -320,6 +365,36 @@ mod tests {
             data[12 + i] = b;
         }
         Currency::from(data)
+    }
+
+    #[test]
+    fn offer_crossing_domain_is_attached_to_every_book_step() {
+        let src = make_account(1);
+        let issuer = make_account(3);
+        let deliver = Asset::Issue(Issue::new(make_currency("USD"), issuer));
+        let send_max = Asset::Issue(xrp_issue());
+        let domain = Uint256::from_array([0xD0; 32]);
+        let (_, strands) = to_strands_with_domain(
+            &src,
+            &src,
+            &deliver,
+            Some(&send_max),
+            &STPathSet::new(protocol::get_field_by_symbol("sfPaths")),
+            true,
+            true,
+            true,
+            Some(domain),
+        );
+        let books: Vec<_> = strands
+            .iter()
+            .flatten()
+            .filter_map(|step| match step {
+                StepKind::Book { domain, .. } => Some(*domain),
+                _ => None,
+            })
+            .collect();
+        assert!(!books.is_empty());
+        assert!(books.iter().all(|actual| *actual == Some(domain)));
     }
 
     #[test]
@@ -438,9 +513,12 @@ mod tests {
             "the protocol keylet must reject XRP with an issuer"
         );
 
-        let normalized = canonical_book_issue(raw.currency, raw.account);
-        assert_eq!(normalized, xrp_issue());
-        assert!(protocol::is_consistent(normalized));
+        let normalized = canonical_book_asset(Asset::Issue(raw));
+        assert_eq!(normalized, Asset::Issue(xrp_issue()));
+        let Asset::Issue(normalized_issue) = normalized else {
+            unreachable!()
+        };
+        assert!(protocol::is_consistent(normalized_issue));
     }
 
     #[test]
@@ -489,8 +567,8 @@ mod tests {
                 _ => None,
             })
             .expect("XAH-to-XRP payment must include a BookStep");
-        assert_eq!(book_in, Issue::new(xah, issuer));
-        assert_eq!(book_out, xrp_issue());
+        assert_eq!(book_in, Asset::Issue(Issue::new(xah, issuer)));
+        assert_eq!(book_out, Asset::Issue(xrp_issue()));
 
         let book = protocol::Book::new(book_in, book_out, None);
         assert!(protocol::is_consistent_book(book));
@@ -610,5 +688,81 @@ mod tests {
                 assert_eq!(*d, dst);
             }
         }
+    }
+
+    #[test]
+    fn same_asset_mpt_payment_uses_issuer_endpoint_pair() {
+        let src = make_account(1);
+        let dst = make_account(2);
+        let issuer = make_account(3);
+        let issue = protocol::MPTIssue::new(protocol::make_mpt_id(7, issuer));
+        let asset = Asset::MPTIssue(issue);
+
+        let (ter, strand) = to_strand(
+            &src,
+            &dst,
+            &asset,
+            None,
+            &protocol::STPath::new(),
+            false,
+            false,
+        );
+
+        assert_eq!(ter, Ter::TES_SUCCESS);
+        assert_eq!(strand.len(), 2);
+        assert!(matches!(
+            strand[0],
+            StepKind::MptEndpoint {
+                src: actual_src,
+                dst: actual_dst,
+                issue: actual_issue,
+                is_first: true,
+                is_last: false,
+                offer_crossing: false,
+            } if actual_src == src && actual_dst == issuer && actual_issue == issue
+        ));
+        assert!(matches!(
+            strand[1],
+            StepKind::MptEndpoint {
+                src: actual_src,
+                dst: actual_dst,
+                issue: actual_issue,
+                is_first: false,
+                is_last: true,
+                offer_crossing: false,
+            } if actual_src == issuer && actual_dst == dst && actual_issue == issue
+        ));
+    }
+
+    #[test]
+    fn mpt_to_iou_crossing_preserves_exact_book_assets() {
+        let taker = make_account(1);
+        let mpt_issuer = make_account(2);
+        let iou_issuer = make_account(3);
+        let mpt = Asset::MPTIssue(protocol::MPTIssue::new(protocol::make_mpt_id(
+            9, mpt_issuer,
+        )));
+        let usd = Asset::Issue(Issue::new(make_currency("USD"), iou_issuer));
+
+        let (ter, strand) = to_strand(
+            &taker,
+            &taker,
+            &usd,
+            Some(&mpt),
+            &protocol::STPath::new(),
+            true,
+            true,
+        );
+
+        assert_eq!(ter, Ter::TES_SUCCESS);
+        assert!(strand.iter().any(|step| matches!(
+            step,
+            StepKind::Book { book_in, book_out, .. }
+                if *book_in == mpt && *book_out == usd
+        )));
+        assert!(!strand.iter().any(|step| matches!(
+            step,
+            StepKind::Book { book_in, .. } if book_in.native()
+        )));
     }
 }

@@ -20,50 +20,58 @@ use protocol::{
     equal_tokens, get_field_by_symbol, is_ter_retry, is_tes_success, multiply_rate,
 };
 thread_local! {
-    static MPT_DELIVERED_AMOUNT_CAPTURES: RefCell<Vec<Option<STAmount>>> = const { RefCell::new(Vec::new()) };
+    static DELIVERED_AMOUNT_CAPTURES: RefCell<Vec<Option<STAmount>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Scoped equivalent of rippled's `ApplyContext::deliver` handoff for Payment
-/// metadata. Transaction-shell callers that do not construct metadata safely
-/// discard the capture when their application returns.
-pub struct MptDeliveredAmountCapture {
+/// Scoped equivalent of rippled's `ApplyContext::deliver` metadata handoff.
+/// Transaction-shell callers that do not construct metadata safely discard the
+/// capture when their application returns.
+pub struct DeliveredAmountCapture {
     active: bool,
 }
 
-impl Default for MptDeliveredAmountCapture {
+impl Default for DeliveredAmountCapture {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MptDeliveredAmountCapture {
+impl DeliveredAmountCapture {
     pub fn new() -> Self {
-        MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().push(None));
+        DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().push(None));
         Self { active: true }
     }
 
     pub fn finish(mut self) -> Option<STAmount> {
         self.active = false;
-        MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().pop().flatten())
+        DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().pop().flatten())
     }
 }
 
-impl Drop for MptDeliveredAmountCapture {
+impl Drop for DeliveredAmountCapture {
     fn drop(&mut self) {
         if self.active {
-            MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| {
+            DELIVERED_AMOUNT_CAPTURES.with(|captures| {
                 let _ = captures.borrow_mut().pop();
             });
         }
     }
 }
 
-fn record_delivered_amount(amount: STAmount) {
-    MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| {
+pub(crate) fn record_delivered_amount(amount: STAmount) {
+    DELIVERED_AMOUNT_CAPTURES.with(|captures| {
         if let Some(delivered_amount) = captures.borrow_mut().last_mut() {
             *delivered_amount = Some(amount);
         }
     });
+}
+
+fn should_record_path_delivered_amount(
+    result: Ter,
+    actual_amount_out: &STAmount,
+    destination_amount: &STAmount,
+) -> bool {
+    is_tes_success(result) && actual_amount_out != destination_amount
 }
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -286,10 +294,15 @@ pub fn do_payment<V: ledger::ApplyView>(
                 if is_ter_retry(result) {
                     result = Ter::TEC_PATH_DRY;
                 }
-                if is_tes_success(result) {
+                if should_record_path_delivered_amount(
+                    result,
+                    &output.actual_amount_out,
+                    &dst_amount,
+                ) {
                     // `Payment::doApply` hands Flow's actual output to
-                    // ApplyContext so TxMeta records DeliveredAmount, which
-                    // differs from Amount for successful partial payments.
+                    // ApplyContext only when it differs from Amount, so
+                    // TxMeta records DeliveredAmount for successful partial
+                    // payments without changing exact-payment metadata.
                     record_delivered_amount(output.actual_amount_out);
                 }
 
@@ -673,8 +686,30 @@ fn check_deposit_preauth<V: ledger::ApplyView>(
 
 #[cfg(test)]
 mod tests {
-    use super::is_redundant_self_payment;
-    use protocol::{AccountID, Issue, STAmount, XRPAmount, get_field_by_symbol};
+    use super::{is_redundant_self_payment, should_record_path_delivered_amount};
+    use protocol::{AccountID, Issue, STAmount, Ter, XRPAmount, get_field_by_symbol};
+
+    #[test]
+    fn exact_path_payment_does_not_record_delivered_amount() {
+        let requested = STAmount::from_xrp_amount(XRPAmount::from_drops(20));
+        let partial = STAmount::from_xrp_amount(XRPAmount::from_drops(19));
+
+        assert!(!should_record_path_delivered_amount(
+            Ter::TES_SUCCESS,
+            &requested,
+            &requested,
+        ));
+        assert!(should_record_path_delivered_amount(
+            Ter::TES_SUCCESS,
+            &partial,
+            &requested,
+        ));
+        assert!(!should_record_path_delivered_amount(
+            Ter::TEC_PATH_PARTIAL,
+            &partial,
+            &requested,
+        ));
+    }
 
     #[test]
     fn cross_currency_self_payment_is_not_redundant() {

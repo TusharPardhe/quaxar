@@ -164,7 +164,7 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
             self.view,
             &protocol::owner_dir_keylet(Uint160::from_void(self.account.data())),
             escrow_kl.key,
-            &|_| {},
+            &ledger::describe_owner_dir(self.account),
         )
         .ok()
         .flatten()
@@ -189,7 +189,7 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
             self.view,
             &protocol::owner_dir_keylet(Uint160::from_void(self.dst_account.data())),
             escrow_kl.key,
-            &|_| {},
+            &ledger::describe_owner_dir(self.dst_account),
         )
         .ok()
         .flatten()
@@ -217,7 +217,7 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
             self.view,
             &protocol::owner_dir_keylet(Uint160::from_void(issue.issuer().data())),
             escrow_kl.key,
-            &|_| {},
+            &ledger::describe_owner_dir(issue.issuer()),
         )
         .ok()
         .flatten()

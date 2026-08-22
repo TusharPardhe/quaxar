@@ -52,10 +52,12 @@ validated/published chain begins advancing.
    A retained session preserves its exact frontier across retries; after
    cleanup, verified nodes remain reusable through shared caches and storage.
 6. Once both maps are complete, immutable, and match their roots, the ledger is
-   published by exact hash to history and validation residency, persisted, and
-   handed back through the coordinator's durable completion path. A later
-   trusted validation can supersede the waiter without discarding this newest
-   available resident support; durability failure retracts provisional support.
+   published by exact hash to history, persisted, and handed back through the
+   coordinator's durable completion path. Validation-trie residency is updated
+   only for validators still waiting on that exact sequence and hash. If a
+   newer validation already replaced the waiter, a late older completion stays
+   reusable in history/storage but does not revive superseded trie support;
+   durability failure retracts provisional support.
 7. At the serialized accepted boundary, NetworkOps recomputes current
    preference and installs only the complete, current-compatible preferred
    ledger. LedgerMaster then applies validation
@@ -96,6 +98,12 @@ retained sessions keep their frontiers and cleaned-up sessions still contribute
 verified nodes through shared caches and storage. After the stable anchor is
 installed, NetworkOps reconciles the current preferred policy again. A header
 or completed tree alone never authorizes installation or publication.
+
+Consensus timer view changes do not pin their sampled preferred hash as a
+recovery target. They only request the reference mode demotion; the serialized
+`checkLastClosedLedger` path selects, verifies, and acquires an actionable
+target. This prevents a transient timer observation from becoming a durable
+recovery anchor.
 
 ## History acquisition
 

@@ -78,6 +78,10 @@ pub enum TransitionFact {
         lcl: LedgerIdentity,
         published: LedgerIdentity,
     },
+    /// Consensus's preferred previous ledger differs from its current view.
+    /// Rippled changes only the operating mode here; target selection remains
+    /// owned by the later serialized `checkLastClosedLedger` path.
+    ConsensusViewChange,
     /// Preferred-LCL divergence with a concrete acquisition target.
     PreferredLclDivergence { target: LedgerTarget },
     /// Preferred-LCL reconciliation selected the current local LCL, retiring
@@ -110,6 +114,7 @@ pub enum TransitionError {
 /// | `Syncing` | target complete, durable, accepted, installed as LCL | `Tracking` |
 /// | `Tracking` | validated/published chain contiguous and fresh | `Full` |
 /// | `Full` | preferred-LCL divergence / stale validation / required target | `Syncing { target }` |
+/// | `Tracking`/`Full` | consensus view changed (mode-only) | `Connected` |
 /// | `Full` | blocked state / freshness loss with no concrete target | `Connected` |
 /// | any active phase | no usable peers | `Disconnected` |
 /// | any nonterminal phase | shutdown | `Stopping` |
@@ -131,6 +136,9 @@ pub enum TransitionError {
 /// * `Tracking -> Syncing` is legal via `PreferredLclDivergence`; tracking is
 ///   retained while the LCL matches, but a divergent preferred LCL with a known
 ///   target resumes acquisition.
+/// * `ConsensusViewChange` is deliberately targetless: rippled only changes
+///   `FULL`/`TRACKING` to `CONNECTED` in `getPrevLedger`; the serialized
+///   `checkLastClosedLedger` path may later report a concrete divergence.
 pub fn phase_transition(from: &SyncPhase, fact: &TransitionFact) -> Option<SyncPhase> {
     use SyncPhase::*;
     use TransitionFact::*;
@@ -154,12 +162,14 @@ pub fn phase_transition(from: &SyncPhase, fact: &TransitionFact) -> Option<SyncP
         (Syncing { .. }, TargetInstalledAsLcl { lcl }) => Tracking { lcl: *lcl },
         (Syncing { .. }, PreferredLclReconciled { lcl }) => Tracking { lcl: *lcl },
         (Tracking { .. }, PreferredLclDivergence { target }) => Syncing { target: *target },
+        (Tracking { .. }, ConsensusViewChange) => Connected,
         (Tracking { .. }, ChainContiguous { lcl, published }) => Full {
             lcl: *lcl,
             published: *published,
         },
         (Full { .. }, TargetRequired { target }) => Syncing { target: *target },
         (Full { .. }, PreferredLclDivergence { target }) => Syncing { target: *target },
+        (Full { .. }, ConsensusViewChange) => Connected,
         (Full { .. }, BlockedWithNoTarget) => Connected,
         (Connected, PeerCapabilityLost) => Disconnected,
         (Syncing { .. }, PeerCapabilityLost) => Disconnected,
@@ -202,6 +212,7 @@ mod tests {
                 lcl: identity(10),
                 published: identity(10),
             },
+            TransitionFact::ConsensusViewChange,
             TransitionFact::PreferredLclDivergence { target: target(11) },
             TransitionFact::PreferredLclReconciled { lcl: identity(11) },
             TransitionFact::BlockedWithNoTarget,
@@ -311,6 +322,14 @@ mod tests {
         assert_eq!(
             phase_transition(
                 &SyncPhase::Tracking { lcl: identity(9) },
+                &TransitionFact::ConsensusViewChange,
+            ),
+            Some(SyncPhase::Connected),
+            "consensusViewChange must demote mode without choosing a target"
+        );
+        assert_eq!(
+            phase_transition(
+                &SyncPhase::Tracking { lcl: identity(9) },
                 &TransitionFact::PreferredLclDivergence { target: target(12) },
             ),
             Some(SyncPhase::Syncing { target: target(12) })
@@ -324,6 +343,17 @@ mod tests {
                 &TransitionFact::TargetRequired { target: target(12) }
             ),
             Some(SyncPhase::Syncing { target: target(12) })
+        );
+        assert_eq!(
+            phase_transition(
+                &SyncPhase::Full {
+                    lcl: identity(9),
+                    published: identity(9)
+                },
+                &TransitionFact::ConsensusViewChange
+            ),
+            Some(SyncPhase::Connected),
+            "consensusViewChange must not pin the preferred target"
         );
         assert_eq!(
             phase_transition(

@@ -6,7 +6,7 @@ use basics::{
 };
 use ledger::{
     ApplyView, account_root_helpers::create_pseudo_account, adjust_owner_count,
-    amm_helpers::stamount_as_number, dir_append, dir_remove,
+    amm_helpers::stamount_as_number, describe_owner_dir, dir_insert, dir_remove,
 };
 use protocol::{
     AccountID, Asset, LedgerEntryType, MPTIssue, STAmount, STLedgerEntry, STNumber, STTx,
@@ -849,11 +849,11 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
 
     let share_id = mpt_id_for(&pseudo, 1);
     let issuance_keylet = mpt_issuance_keylet(1, to_160(&pseudo));
-    let issuance_page = match dir_append(
+    let issuance_page = match dir_insert(
         view,
         &owner_dir_keylet(to_160(&pseudo)),
         issuance_keylet.key,
-        &|_| {},
+        &describe_owner_dir(pseudo),
     ) {
         Ok(Some(page)) => page,
         Ok(None) => return Ter::TEC_DIR_FULL,
@@ -908,8 +908,12 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return ter;
     }
 
-    let owner_page = match dir_append(view, &owner_dir_keylet(to_160(&owner)), keylet.key, &|_| {})
-    {
+    let owner_page = match dir_insert(
+        view,
+        &owner_dir_keylet(to_160(&owner)),
+        keylet.key,
+        &describe_owner_dir(owner),
+    ) {
         Ok(Some(page)) => page,
         Ok(None) => return Ter::TEC_DIR_FULL,
         Err(_) => return Ter::TEF_BAD_LEDGER,

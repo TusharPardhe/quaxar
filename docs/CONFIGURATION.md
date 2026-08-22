@@ -55,9 +55,18 @@ Configures one listening port.
 | `port` | TCP port to bind. |
 | `ip` | Bind address, for example `127.0.0.1` or `0.0.0.0`. |
 | `protocol` | Comma-separated protocols, commonly `http`, `ws`, or `peer`. |
+| `limit` | Optional connection limit; values below `256` still reserve at least 256 file descriptors for the listener. |
 | `admin` | Admin access scope, typically `127.0.0.1` for local-only admin RPC. |
 | `secure_gateway` | Trusted proxy/gateway IP for forwarded client metadata. |
-| `send_queue_limit` | Optional websocket send queue limit. |
+| `user`, `password` | Optional basic-auth credentials for ordinary requests. |
+| `admin_user`, `admin_password` | Optional basic-auth credentials for admin requests. |
+| `ssl_key`, `ssl_cert`, `ssl_chain`, `ssl_ciphers` | TLS listener material and cipher configuration. |
+
+Port defaults may be placed in `[server]` and are inherited by each named port
+section. `admin` and `secure_gateway` accept IPv4 or IPv6 addresses and CIDR
+ranges. The runtime does not apply the parsed `send_queue_limit`; it has therefore
+been removed from the packaged examples rather than presented as an effective
+WebSocket control.
 
 ### `[node_size]`
 

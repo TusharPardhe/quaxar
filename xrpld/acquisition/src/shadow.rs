@@ -176,6 +176,7 @@ pub enum ShadowEventTag {
     DurableHandoffRejected,
     TimerFired,
     ConsensusTarget,
+    ConsensusViewChange,
     PreferredLclDivergence,
     PreferredLclReconciled,
     BlockedWithNoTarget,
@@ -204,6 +205,7 @@ impl ShadowEventTag {
             Self::DurableHandoffRejected => "durable_handoff_rejected",
             Self::TimerFired => "timer_fired",
             Self::ConsensusTarget => "consensus_target",
+            Self::ConsensusViewChange => "consensus_view_change",
             Self::PreferredLclDivergence => "preferred_lcl_divergence",
             Self::PreferredLclReconciled => "preferred_lcl_reconciled",
             Self::BlockedWithNoTarget => "blocked_with_no_target",
@@ -233,6 +235,7 @@ impl From<&AcquisitionEvent> for ShadowEventTag {
             AcquisitionEvent::DurableHandoffRejected { .. } => Self::DurableHandoffRejected,
             AcquisitionEvent::TimerFired { .. } => Self::TimerFired,
             AcquisitionEvent::ConsensusTarget(_) => Self::ConsensusTarget,
+            AcquisitionEvent::ConsensusViewChange => Self::ConsensusViewChange,
             AcquisitionEvent::PreferredLclDivergence { .. } => Self::PreferredLclDivergence,
             AcquisitionEvent::PreferredLclReconciled { .. } => Self::PreferredLclReconciled,
             AcquisitionEvent::BlockedWithNoTarget => Self::BlockedWithNoTarget,
@@ -610,6 +613,13 @@ impl ShadowRunner {
             }
             AcquisitionEvent::ConsensusTarget(target) => {
                 self.derive_consensus(tag, *target, &mut out);
+            }
+            AcquisitionEvent::ConsensusViewChange => {
+                let (derived, reason, kind) =
+                    self.apply_fact(Some(TransitionFact::ConsensusViewChange));
+                self.push(
+                    tag, None, kind, derived, None, None, None, reason, None, &mut out,
+                );
             }
             AcquisitionEvent::PreferredLclDivergence { target } => {
                 self.derive_preferred_lcl_divergence(tag, *target, &mut out);
@@ -1368,8 +1378,8 @@ impl ShadowRunner {
         target: LedgerTarget,
         out: &mut Vec<ShadowObservation>,
     ) {
-        // Rippled consensusViewChange parity: a preferred-LCL divergence with a
-        // concrete target demotes Connected/Tracking/Full -> Syncing without
+        // The serialized checkLastClosedLedger path's preferred-LCL divergence
+        // with a concrete target demotes Connected/Tracking/Full -> Syncing without
         // minting a session. Acquisition demand arrives as a separate
         // AcquireRequested fact, so a resident-and-compatible switch (no fetch
         // needed) does not start a wasteful peer fetch.

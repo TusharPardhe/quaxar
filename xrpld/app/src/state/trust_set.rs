@@ -476,6 +476,7 @@ pub fn do_trust_set<V: ledger::ApplyView>(
             &limit_allow,
             quality_in,
             quality_out,
+            None,
         )
     }
 }
@@ -518,7 +519,7 @@ fn compute_freeze_flags(
     flags
 }
 
-fn trust_create<V: ledger::ApplyView>(
+pub(crate) fn trust_create<V: ledger::ApplyView>(
     view: &mut V,
     b_high: bool,
     account: &AccountID,
@@ -532,6 +533,7 @@ fn trust_create<V: ledger::ApplyView>(
     limit_allow: &STAmount,
     quality_in: u32,
     quality_out: u32,
+    sponsor_sle: Option<&Arc<STLedgerEntry>>,
 ) -> Ter {
     let mut obj = STObject::new(sf("sfLedgerEntry"));
     obj.set_field_u16(sf("sfLedgerEntryType"), 0x0072); // ltRIPPLE_STATE
@@ -620,10 +622,23 @@ fn trust_create<V: ledger::ApplyView>(
         }
     }
 
-    let _ = ledger::adjust_owner_count(view, account_sle, 1);
+    if ledger::increase_owner_count_for_object(view, account_sle, sponsor_sle).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
     if flags != 0 {
         obj.set_field_u32(sf("sfFlags"), flags);
+    }
+
+    if let Some(sponsor_sle) = sponsor_sle {
+        obj.set_account_id(
+            if b_high {
+                sf("sfHighSponsor")
+            } else {
+                sf("sfLowSponsor")
+            },
+            sponsor_sle.get_account_id(sf("sfAccount")),
+        );
     }
 
     let new_sle = Arc::new(STLedgerEntry::from_stobject(obj, key));
@@ -633,12 +648,28 @@ fn trust_create<V: ledger::ApplyView>(
     let high_account = if b_high { account } else { dst };
 
     let low_dir = protocol::owner_dir_keylet(Uint160::from_void(low_account.data()));
-    if matches!(ledger::dir_append(view, &low_dir, key, &|_| {}), Ok(None)) {
+    if matches!(
+        ledger::dir_insert(
+            view,
+            &low_dir,
+            key,
+            &ledger::describe_owner_dir(*low_account),
+        ),
+        Ok(None)
+    ) {
         return Ter::TEC_DIR_FULL;
     }
 
     let high_dir = protocol::owner_dir_keylet(Uint160::from_void(high_account.data()));
-    if matches!(ledger::dir_append(view, &high_dir, key, &|_| {}), Ok(None)) {
+    if matches!(
+        ledger::dir_insert(
+            view,
+            &high_dir,
+            key,
+            &ledger::describe_owner_dir(*high_account),
+        ),
+        Ok(None)
+    ) {
         return Ter::TEC_DIR_FULL;
     }
 

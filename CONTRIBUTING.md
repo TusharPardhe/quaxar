@@ -145,7 +145,7 @@ Understanding which crate owns what helps you find the right place for changes:
 | `xrpld/server` | HTTP/WebSocket server, request routing |
 | `xrpld/perflog` | Runtime activity and performance counters |
 | `xrpld/tx` | Transaction processing and application |
-| `xrpld/metrics` | Prometheus metrics (`quaxar-metrics` package) |
+| `xrpld/metrics` | Metrics recording and optional Prometheus exporter integration (`quaxar-metrics` package) |
 | `xrpld/cli` | Operator commands (`quaxar-cli` package) |
 | `xrpld/main` | Bootstrap and `quaxar` binary (`quaxar-main` package) |
 

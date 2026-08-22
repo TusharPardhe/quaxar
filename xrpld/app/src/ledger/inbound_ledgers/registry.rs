@@ -1160,8 +1160,25 @@ impl InboundLedgers {
         true
     }
 
-    /// Feed a preferred-LCL divergence fact (rippled `consensusViewChange`
-    /// parity). Demotes `Connected/Tracking/Full -> Syncing { target }` without
+    /// Feed rippled's mode-only `consensusViewChange` fact. Demotes
+    /// `Tracking/Full -> Connected` without selecting or pinning an acquisition
+    /// target. Returns false unless the coordinator is installed.
+    pub fn coordinator_consensus_view_change(&self) -> bool {
+        let failures = {
+            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let Some(coordinator) = guard.as_mut() else {
+                return false;
+            };
+            coordinator.consensus_view_change();
+            coordinator.drain();
+            coordinator.take_terminal_failures()
+        };
+        self.record_coordinator_failures(failures);
+        true
+    }
+
+    /// Feed a target-bearing preferred-LCL divergence fact from the serialized
+    /// `checkLastClosedLedger` path. Demotes `Connected/Tracking/Full -> Syncing { target }` without
     /// minting a session. Returns false unless installed, so the legacy strand
     /// writer remains authoritative when the coordinator is absent.
     pub fn coordinator_preferred_lcl_divergence(&self, target: acquisition::LedgerTarget) -> bool {

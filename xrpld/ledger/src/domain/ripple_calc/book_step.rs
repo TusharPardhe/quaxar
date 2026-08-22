@@ -261,6 +261,9 @@ pub fn execute_book_step_with_options<V: ApplyView>(
         let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
         let taker_gets = offer_sle.get_field_amount(sf("sfTakerGets"));
         if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
+            if let Some(removable) = &self_cross_cancellation {
+                removable.record(*offer_sle.key());
+            }
             remove_consumed_offer(view, &offer_sle);
             offers_consumed += 1;
             continue;
@@ -276,13 +279,19 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             )
             .unwrap_or(false)
             {
+                if let Some(removable) = &self_cross_cancellation {
+                    removable.record(*offer_sle.key());
+                }
                 remove_consumed_offer(view, &offer_sle);
                 offers_consumed += 1;
                 continue;
             }
         }
         let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
-        if get_owner_funds(view, &offer_owner, &book.out).signum() <= 0 {
+        if get_owner_funds(view, &offer_owner, &taker_gets).signum() <= 0 {
+            if let Some(removable) = &self_cross_cancellation {
+                removable.record(*offer_sle.key());
+            }
             remove_consumed_offer(view, &offer_sle);
             offers_consumed += 1;
             continue;
@@ -405,7 +414,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
 
             // The first tip was funded during discovery; later tips are checked
             // only when FlowOfferStream-equivalent iteration reaches them.
-            let owner_funds = get_owner_funds(view, &offer_owner, &book.out);
+            let owner_funds = get_owner_funds(view, &offer_owner, &taker_gets);
             if owner_funds.signum() <= 0 {
                 remove_consumed_offer(view, &offer_sle);
                 if !offer_attempted {
@@ -1627,11 +1636,12 @@ fn get_book_offers<V: ApplyView>(view: &mut V, book: &Book, max: u32) -> Vec<STL
 }
 
 /// Get the funds available for an offer owner to deliver.
-fn get_owner_funds<V: ApplyView>(view: &mut V, owner: &AccountID, asset: &Asset) -> STAmount {
-    if *owner == asset.issuer() {
-        // Owner is issuer — unlimited funds
-        return STAmount::new_with_asset(sf("sfAmount"), *asset, u64::MAX / 2, 0, false);
-    }
+fn get_owner_funds<V: ApplyView>(
+    view: &mut V,
+    owner: &AccountID,
+    default_amount: &STAmount,
+) -> STAmount {
+    let asset = default_amount.asset();
     if asset.native() {
         // XRP: balance minus reserve
         let acct_keylet =
@@ -1653,7 +1663,22 @@ fn get_owner_funds<V: ApplyView>(view: &mut V, owner: &AccountID, asset: &Asset)
         }
         return STAmount::default();
     }
-    if let Asset::MPTIssue(issue) = *asset {
+    if let Asset::MPTIssue(issue) = asset {
+        if *owner == issue.issuer() {
+            let issuance = view
+                .read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
+                .ok()
+                .flatten();
+            let available = issuance
+                .as_deref()
+                .map(crate::mptoken_helpers::available_mpt_amount)
+                .unwrap_or(0);
+            return STAmount::from_mpt_amount(
+                sf("sfAmount"),
+                MPTAmount::from_value(available),
+                issue,
+            );
+        }
         let token_keylet = protocol::mptoken_keylet_from_mptid(
             issue.mpt_id(),
             basics::base_uint::Uint160::from_void(owner.data()),
@@ -1666,8 +1691,15 @@ fn get_owner_funds<V: ApplyView>(view: &mut V, owner: &AccountID, asset: &Asset)
         else {
             return STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::new(), issue);
         };
-        if token.is_flag(protocol::lsfMPTLocked)
-            || crate::mptoken_helpers::is_global_frozen_mpt(view, &issue).unwrap_or(true)
+        if crate::mptoken_helpers::is_frozen_mpt(view, owner, &issue).unwrap_or(true)
+            || crate::mptoken_helpers::require_auth_mpt_with_type(
+                view,
+                &issue,
+                owner,
+                crate::mptoken_helpers::MPTAuthType::Strong,
+            )
+            .unwrap_or(Ter::TEC_NO_AUTH)
+                != Ter::TES_SUCCESS
         {
             return STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::new(), issue);
         }
@@ -1677,9 +1709,14 @@ fn get_owner_funds<V: ApplyView>(view: &mut V, owner: &AccountID, asset: &Asset)
             issue,
         );
     }
-    let Asset::Issue(issue) = *asset else {
+    let Asset::Issue(issue) = asset else {
         unreachable!("handled above");
     };
+    if *owner == issue.issuer() {
+        // IOU issuers self-fund precisely the offer's output amount. Using a
+        // synthetic fixed-exponent maximum can underfund valid large offers.
+        return default_amount.clone();
+    }
     // IOU: check freeze status first (reference FreezeHandling::ZeroIfFrozen)
     if ripple_state_helpers::is_frozen(view, owner, &issue) {
         return STAmount::default();

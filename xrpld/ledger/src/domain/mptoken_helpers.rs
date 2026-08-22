@@ -814,7 +814,7 @@ pub fn create_mp_token(
         view,
         &owner_dir_keylet(to_uint160(*account)),
         mptoken_key.key,
-        &|_| {},
+        &crate::describe_owner_dir(*account),
     )?;
     let Some(node) = owner_node else {
         return Ok(Ter::TEC_DIR_FULL);
@@ -868,7 +868,7 @@ fn authorize_mp_token(
         view,
         &owner_dir_keylet(to_uint160(*account)),
         mptoken_key.key,
-        &|_| {},
+        &crate::describe_owner_dir(*account),
     )?;
     let Some(node) = owner_node else {
         return Ok(Ter::TEC_DIR_FULL);
@@ -894,6 +894,16 @@ pub fn check_create_mpt(
     mpt_issue: &MPTIssue,
     holder: &AccountID,
 ) -> Result<Ter, ViewError> {
+    check_create_mpt_with_sponsor(view, mpt_issue, holder, None)
+}
+
+/// Check and create an MPToken, assigning its owner reserve to `sponsor_sle`.
+pub fn check_create_mpt_with_sponsor(
+    view: &mut dyn ApplyView,
+    mpt_issue: &MPTIssue,
+    holder: &AccountID,
+    sponsor_sle: Option<&Arc<STLedgerEntry>>,
+) -> Result<Ter, ViewError> {
     if mpt_issue.issuer() == *holder {
         return Ok(Ter::TES_SUCCESS);
     }
@@ -910,8 +920,19 @@ pub fn check_create_mpt(
         return Ok(result);
     }
 
+    if let Some(sponsor_sle) = sponsor_sle
+        && let Some(token) = view.peek(mptoken_key)?
+    {
+        let mut token_obj = token.clone_as_object();
+        token_obj.set_account_id(sf("sfSponsor"), sponsor_sle.get_account_id(sf("sfAccount")));
+        view.update(Arc::new(STLedgerEntry::from_stobject(
+            token_obj,
+            *token.key(),
+        )))?;
+    }
+
     if let Some(acct) = view.peek(account_keylet(to_uint160(*holder)))? {
-        adjust_owner_count(view, &acct, 1)?;
+        crate::increase_owner_count_for_object(view, &acct, sponsor_sle)?;
     }
 
     Ok(Ter::TES_SUCCESS)

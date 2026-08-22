@@ -43,8 +43,8 @@ pub use domain::persistence;
 pub use domain::ripple_calc;
 pub use domain::setup;
 pub use domain::sponsor_helpers::{
-    SPF_SPONSOR_FEE, SPF_SPONSOR_FLAG_MASK, SPF_SPONSOR_RESERVE, is_fee_sponsored,
-    is_reserve_sponsor_allowed, is_reserve_sponsored,
+    SPF_SPONSOR_FEE, SPF_SPONSOR_FLAG_MASK, SPF_SPONSOR_RESERVE, increase_owner_count_for_object,
+    is_fee_sponsored, is_reserve_sponsor_allowed, is_reserve_sponsored, reserve_owner_count,
 };
 pub use domain::timeout_counter;
 pub use domain::token_helpers;
@@ -93,7 +93,7 @@ pub use amm_utils::{
     amm_account_holds, amm_holds, amm_lp_holds, amm_lp_holds_from_sle, amm_pool_holds,
     get_trading_fee, is_only_liquidity_provider,
 };
-pub use apply_directory::{dir_append, dir_insert, dir_remove};
+pub use apply_directory::{describe_owner_dir, dir_append, dir_insert, dir_remove};
 pub use apply_state_table::ApplyStateTable;
 pub use apply_view::{ApplyView, ApplyViewImpl, adjust_owner_count};
 pub use basics::base_uint::Uint256;

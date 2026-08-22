@@ -80,17 +80,15 @@ systemd service on Linux hosts that provide systemd. It asks for runtime
 settings interactively and applies defaults in unattended mode. The Windows script installs and verifies the
 binary; create `quaxar.cfg` separately from the repository example.
 
-For unattended installation with defaults:
+For unattended macOS/Linux installation with defaults:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.sh -o install.sh
 bash install.sh -y
 ```
 
-```powershell
-irm https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.ps1 -OutFile install.ps1
-.\install.ps1 -y
-```
+The Windows installer is already non-interactive. To save and inspect it before
+execution, use `irm https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.ps1 -OutFile install.ps1`, then run `.\install.ps1`.
 
 ### Manual Build
 
@@ -113,7 +111,7 @@ Build and install from source:
 ```bash
 git clone https://github.com/TusharPardhe/quaxar.git
 cd quaxar
-CC=clang CXX=clang++ cargo install --path xrpld/main
+CC=clang CXX=clang++ cargo install --path xrpld/main --locked
 ```
 
 Run with an explicit configuration file:
@@ -311,6 +309,7 @@ reference and [docs/RUNNING.md](docs/RUNNING.md) for operational guidance.
 | RocksDB | Available where the Rust storage path exposes the matching backend. Use only when the target deployment requires it. |
 | Public endpoints | Use `verify_endpoints` for stricter advertised peer endpoint validation. |
 | RPC parameters | Pass JSON params as a single quoted JSON object, for example `quaxar rpc account_info '{"account":"...","ledger_index":"validated"}'`. |
+| Prometheus | The metrics package records selected acquisition/mode instruments, but normal bootstrap does not start its HTTP exporter; packaged deployments have no `/metrics` endpoint. |
 
 ## Architecture
 

@@ -122,7 +122,7 @@ impl<V: ApplyView> OracleSetApplySink for ViewBackedOracleSetSink<'_, V> {
             self.view,
             &protocol::owner_dir_keylet(Uint160::from_void(self.account.data())),
             oracle_keylet.key,
-            &|_| {},
+            &ledger::describe_owner_dir(self.account),
         )
         .map_err(|_| protocol::Ter::TEF_INTERNAL)
     }

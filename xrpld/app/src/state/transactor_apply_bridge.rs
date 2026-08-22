@@ -698,7 +698,7 @@ impl<'a, V: ApplyView>
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.account)),
             *staged_domain.key(),
-            &|_| {},
+            &ledger::describe_owner_dir(self.account),
         )
         .ok()
         .flatten()
@@ -951,7 +951,7 @@ impl<'a, V: ApplyView> DelegateSetApplySink<u32> for ViewBackedDelegateSetSink<'
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.account)),
             *staged_delegate.key(),
-            &|_| {},
+            &ledger::describe_owner_dir(self.account),
         )
         .ok()
         .flatten()
@@ -969,7 +969,7 @@ impl<'a, V: ApplyView> DelegateSetApplySink<u32> for ViewBackedDelegateSetSink<'
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.authorize)),
             *staged_delegate.key(),
-            &|_| {},
+            &ledger::describe_owner_dir(self.authorize),
         )
         .ok()
         .flatten()
@@ -1110,7 +1110,7 @@ impl<'a, V: ApplyView> AMMCreateApplySink for ViewBackedAMMCreateSink<'a, V> {
             self.view,
             &protocol::owner_dir_keylet(to_160(&amm_account)),
             amm_keylet.key,
-            &|_| {},
+            &ledger::describe_owner_dir(amm_account),
         ) {
             Ok(Some(node)) => node,
             Ok(None) => return Ter::TEC_DIR_FULL,

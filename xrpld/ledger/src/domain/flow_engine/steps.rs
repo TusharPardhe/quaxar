@@ -202,21 +202,50 @@ impl FlowStep for StepKind {
                     execute_xrp_endpoint_fwd(view, account, *is_last, requested_out.amount())?;
                 Ok(StepAmounts::new(input, output))
             }
+            StepKind::MptEndpoint {
+                src,
+                dst,
+                issue,
+                is_first,
+                is_last,
+                offer_crossing,
+            } => {
+                if requested_out.asset() != Asset::MPTIssue(*issue) {
+                    return Err(Ter::TEF_INTERNAL);
+                }
+                let (input, output) = execute_mpt_endpoint(
+                    view,
+                    src,
+                    dst,
+                    issue,
+                    requested_out.amount(),
+                    *is_first,
+                    *is_last,
+                    *offer_crossing,
+                    context.previous_redeems.get(),
+                    context.strand_src,
+                    context.strand_dst,
+                    context.strand_deliver,
+                    true,
+                )?;
+                Ok(StepAmounts::new(input, output))
+            }
             StepKind::Book {
                 book_in,
                 book_out,
+                domain,
                 owner_pays_transfer_fee,
                 remove_self_crossing,
             } => {
-                let in_asset = Asset::Issue(*book_in);
-                let out_asset = Asset::Issue(*book_out);
+                let in_asset = *book_in;
+                let out_asset = *book_out;
                 if !requested_out.matches_book_asset(out_asset) {
                     return Err(Ter::TEF_INTERNAL);
                 }
                 let book = crate::domain::ripple_calc::book_step::Book {
                     r#in: in_asset,
                     out: out_asset,
-                    domain: None,
+                    domain: *domain,
                 };
                 // Reverse book execution asks for output and supplies an
                 // effectively unbounded input.  The book consumes only the
@@ -281,14 +310,43 @@ impl FlowStep for StepKind {
                     execute_xrp_endpoint_fwd(view, account, *is_last, requested_in.amount())?;
                 Ok(StepAmounts::new(input, output))
             }
+            StepKind::MptEndpoint {
+                src,
+                dst,
+                issue,
+                is_first,
+                is_last,
+                offer_crossing,
+            } => {
+                if requested_in.asset() != Asset::MPTIssue(*issue) {
+                    return Err(Ter::TEF_INTERNAL);
+                }
+                let (input, output) = execute_mpt_endpoint(
+                    view,
+                    src,
+                    dst,
+                    issue,
+                    requested_in.amount(),
+                    *is_first,
+                    *is_last,
+                    *offer_crossing,
+                    context.previous_redeems.get(),
+                    context.strand_src,
+                    context.strand_dst,
+                    context.strand_deliver,
+                    false,
+                )?;
+                Ok(StepAmounts::new(input, output))
+            }
             StepKind::Book {
                 book_in,
                 book_out,
+                domain,
                 owner_pays_transfer_fee,
                 remove_self_crossing,
             } => {
-                let in_asset = Asset::Issue(*book_in);
-                let out_asset = Asset::Issue(*book_out);
+                let in_asset = *book_in;
+                let out_asset = *book_out;
                 if !requested_in.matches_book_asset(in_asset)
                     || !reverse_cache.output.matches_book_asset(out_asset)
                 {
@@ -297,7 +355,7 @@ impl FlowStep for StepKind {
                 let book = crate::domain::ripple_calc::book_step::Book {
                     r#in: in_asset,
                     out: out_asset,
-                    domain: None,
+                    domain: *domain,
                 };
                 let requested_in = normalize_amount_asset(requested_in.amount(), in_asset);
                 let reverse_out = normalize_amount_asset(reverse_cache.output.amount(), out_asset);
@@ -349,6 +407,30 @@ impl StepKind {
     ) -> Option<(Quality, bool)> {
         match self {
             StepKind::XrpEndpoint { .. } => Some((quality_one(), false)),
+            StepKind::MptEndpoint { src, issue, .. } => {
+                let issuing = *src == issue.issuer();
+                let rate = if issuing && previous_redeems {
+                    crate::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
+                        .ok()
+                        .map_or(protocol::PARITY_RATE.value, |rate| rate.value)
+                } else {
+                    protocol::PARITY_RATE.value
+                };
+                let input = STAmount::from_mpt_amount(
+                    sf("sfAmount"),
+                    protocol::MPTAmount::from_value(i64::from(rate)),
+                    *issue,
+                );
+                let output = STAmount::from_mpt_amount(
+                    sf("sfAmount"),
+                    protocol::MPTAmount::from_value(i64::from(protocol::PARITY_RATE.value)),
+                    *issue,
+                );
+                Some((
+                    Quality::from_amounts(&protocol::Amounts::new(input, output)),
+                    !issuing,
+                ))
+            }
             StepKind::Direct { src, dst, currency } => {
                 use crate::domain::ripple_calc::direct_step::{
                     DebtDirection, qualities_src_issues, qualities_src_redeems,
@@ -381,13 +463,14 @@ impl StepKind {
             StepKind::Book {
                 book_in,
                 book_out,
+                domain,
                 owner_pays_transfer_fee,
                 ..
             } => {
                 let book = crate::domain::ripple_calc::book_step::Book {
-                    r#in: Asset::Issue(*book_in),
-                    out: Asset::Issue(*book_out),
-                    domain: None,
+                    r#in: *book_in,
+                    out: *book_out,
+                    domain: *domain,
                 };
                 crate::domain::ripple_calc::book_step::book_quality_upper_bound(
                     view,
@@ -439,6 +522,186 @@ fn unlimited_amount(asset: Asset) -> STAmount {
     } else {
         STAmount::new_with_asset(sf("sfAmount"), asset, u64::MAX / 2, 0, false)
     }
+}
+
+/// Execute the issuer boundary used by MPT payment strands.  MPTs do not
+/// ripple through arbitrary accounts: every endpoint is holder<->issuer and
+/// holder-to-holder delivery is represented by two endpoint steps.  When the
+/// second step follows a redeem, its input includes the issuance transfer fee
+/// while its output is the amount credited to the destination.
+#[allow(clippy::too_many_arguments)]
+fn execute_mpt_endpoint<V: ApplyView>(
+    view: &mut V,
+    src: &AccountID,
+    dst: &AccountID,
+    issue: &protocol::MPTIssue,
+    requested: &STAmount,
+    is_first: bool,
+    is_last: bool,
+    offer_crossing: bool,
+    previous_redeems: bool,
+    strand_src: &AccountID,
+    strand_dst: &AccountID,
+    strand_deliver: Asset,
+    reverse: bool,
+) -> Result<(STAmount, STAmount), Ter> {
+    let issuer = issue.issuer();
+    if src == dst || ((*src != issuer) == (*dst != issuer)) {
+        return Err(Ter::TEM_BAD_PATH);
+    }
+    if view
+        .read(protocol::account_keylet(
+            basics::base_uint::Uint160::from_void(src.data()),
+        ))
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?
+        .is_none()
+    {
+        return Err(Ter::TER_NO_ACCOUNT);
+    }
+
+    // A one-step pure issue/redeem is allowed through a global lock.  On a
+    // multi-step path the source endpoint observes global+individual lock,
+    // while the destination endpoint observes only its individual lock.
+    if !(is_first && is_last) {
+        let locked = if is_first {
+            crate::mptoken_helpers::is_global_frozen_mpt(view, issue).unwrap_or(true)
+                || crate::mptoken_helpers::is_individual_frozen_mpt(view, src, issue)
+                    .unwrap_or(true)
+        } else {
+            crate::mptoken_helpers::is_individual_frozen_mpt(view, dst, issue).unwrap_or(true)
+        };
+        if locked {
+            return Err(Ter::TEC_LOCKED);
+        }
+    }
+
+    if !offer_crossing
+        && strand_deliver == Asset::MPTIssue(*issue)
+        && *strand_src != issuer
+        && *strand_dst != issuer
+    {
+        let transfer =
+            crate::mptoken_helpers::can_transfer_mpt(view, issue, strand_src, strand_dst)
+                .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+        if transfer != Ter::TES_SUCCESS {
+            return Err(transfer);
+        }
+    }
+
+    if offer_crossing && *dst != issuer {
+        let key = protocol::mptoken_keylet_from_mptid(
+            issue.mpt_id(),
+            basics::base_uint::Uint160::from_void(dst.data()),
+        );
+        if view.read(key).map_err(|_| Ter::TEF_BAD_LEDGER)?.is_none() {
+            let created = crate::mptoken_helpers::check_create_mpt(view, issue, dst)
+                .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+            if created != Ter::TES_SUCCESS && created != Ter::TEC_DUPLICATE {
+                return Err(created);
+            }
+        }
+    }
+
+    for account in [src, dst] {
+        if *account != issuer {
+            let auth = crate::mptoken_helpers::require_auth_mpt_with_type(
+                view,
+                issue,
+                account,
+                crate::mptoken_helpers::MPTAuthType::Strong,
+            )
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+            if auth != Ter::TES_SUCCESS {
+                return Err(auth);
+            }
+        }
+    }
+
+    let requested_value = requested.mpt().value().max(0);
+    let issuing_with_fee = *src == issuer && previous_redeems;
+    let rate = if issuing_with_fee {
+        crate::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
+            .unwrap_or(protocol::PARITY_RATE)
+    } else {
+        protocol::PARITY_RATE
+    };
+
+    let (mut input_value, mut output_value) = if reverse {
+        let input = if issuing_with_fee {
+            protocol::multiply_round(requested, rate, true)
+                .mpt()
+                .value()
+        } else {
+            requested_value
+        };
+        (input, requested_value)
+    } else {
+        let output = if issuing_with_fee {
+            protocol::divide_round(requested, rate, false).mpt().value()
+        } else {
+            requested_value
+        };
+        (requested_value, output)
+    };
+
+    let issuance = view
+        .read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?
+        .ok_or(Ter::TEC_OBJECT_NOT_FOUND)?;
+    let available = if *src == issuer {
+        // During reverse evaluation a preceding holder -> issuer endpoint will
+        // redeem supply before this endpoint issues it again.  rippled quotes
+        // that non-initial issuer endpoint against MaximumAmount rather than
+        // today's issuance headroom, preventing a maxed-out issuance from
+        // incorrectly making holder -> issuer -> holder strands dry.
+        if is_first {
+            crate::mptoken_helpers::available_mpt_amount(&issuance)
+        } else {
+            crate::mptoken_helpers::max_mpt_amount(&issuance)
+        }
+    } else {
+        view.read(protocol::mptoken_keylet_from_mptid(
+            issue.mpt_id(),
+            basics::base_uint::Uint160::from_void(src.data()),
+        ))
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?
+        .map_or(0, |token| token.get_field_u64(sf("sfMPTAmount")) as i64)
+    };
+    if output_value > available && *src == issuer {
+        output_value = available.max(0);
+        input_value = if issuing_with_fee {
+            let limited = STAmount::from_mpt_amount(
+                sf("sfAmount"),
+                protocol::MPTAmount::from_value(output_value),
+                *issue,
+            );
+            protocol::multiply_round(&limited, rate, true).mpt().value()
+        } else {
+            output_value
+        };
+    } else if input_value > available && *src != issuer {
+        input_value = available.max(0);
+        output_value = input_value;
+    }
+    if input_value <= 0 || output_value <= 0 {
+        return Ok((requested.zeroed(), requested.zeroed()));
+    }
+
+    let input = STAmount::from_mpt_amount(
+        sf("sfAmount"),
+        protocol::MPTAmount::from_value(input_value),
+        *issue,
+    );
+    let output = STAmount::from_mpt_amount(
+        sf("sfAmount"),
+        protocol::MPTAmount::from_value(output_value),
+        *issue,
+    );
+    let sent = ripple_state_helpers::account_send(view, src, dst, &output);
+    if sent != Ter::TES_SUCCESS {
+        return Err(sent);
+    }
+    Ok((input, output))
 }
 
 /// Limits delivery to trust-line capacity.  It is used by both directions;

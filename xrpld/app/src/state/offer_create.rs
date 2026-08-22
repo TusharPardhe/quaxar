@@ -13,7 +13,7 @@
 
 use basics::math::base_uint::Uint160;
 use protocol::{
-    AccountID, Amounts, Quality, STAmount, STLedgerEntry, STTx, Ter, XRPAmount,
+    AccountID, Amounts, Asset, Quality, STAmount, STLedgerEntry, STTx, Ter, XRPAmount,
     get_field_by_symbol, is_tes_success,
 };
 use std::sync::Arc;
@@ -191,7 +191,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         // Convert rounded quality back to a rate STAmount for multiply/divide
         let rate_amount = quality_to_rate_amount(rounded_quality);
 
-        if is_sell {
+        if is_sell && !matches!(taker_pays.asset(), Asset::MPTIssue(_)) {
             // reference: saTakerPays = multiply(saTakerGets, rate, saTakerPays.asset())
             taker_pays = match amount_or_exception(
                 taker_gets.try_multiply(&rate_amount, taker_pays.asset()),
@@ -199,7 +199,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 Ok(amount) => amount,
                 Err(ter) => return ter,
             };
-        } else {
+        } else if !is_sell && !matches!(taker_gets.asset(), Asset::MPTIssue(_)) {
             // rippled invokes divide here; its zero-rate exception is mapped by
             // doApply to tefEXCEPTION. Preserve that result without emitting a
             // Rust unwind from the consensus strand.
@@ -239,8 +239,20 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     // (TakerPays / TakerGets), comparing against candidate offer qualities
     // on the wrong scale and letting through offers that should have been
     // rejected as worse than this offer's own quality.
+    // OfferCreate::flowCross includes the input issuer's transfer rate in
+    // sendMax *before* deriving the crossing threshold.  This is consensus
+    // significant for AMM liquidity: using the unadjusted TakerGets admits
+    // pools whose effective quality (including the gateway fee) is worse than
+    // the offer's limit.
+    let gateway_rate = match taker_gets.asset() {
+        protocol::Asset::Issue(issue) if !issue.native() && account != issue.issuer() => {
+            ledger::ripple_state_helpers::transfer_rate(view, &issue.issuer())
+        }
+        _ => 1_000_000_000u32,
+    };
+    let send_max = gateway_adjusted_send_max(&taker_gets, gateway_rate);
     let mut quality_threshold =
-        Quality::from_amounts(&Amounts::new(taker_gets.clone(), taker_pays.clone()));
+        Quality::from_amounts(&Amounts::new(send_max.clone(), taker_pays.clone()));
     if is_passive {
         // offers do not cross. Quality::increment preserves stored XRPL
         // quality ordering instead of approximating with floating point.
@@ -248,7 +260,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     }
 
     let mut crossed = false;
-    let (remaining_gets, remaining_pays) = if !is_passive {
+    let (remaining_gets, remaining_pays) = {
         // Cross as a payment from the offer creator back to themselves.
         // rippled's takerAmount.in is TakerGets (what the creator supplies)
         // and takerAmount.out is TakerPays (what the creator receives).
@@ -267,8 +279,10 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             cross_paths.push_back(xrp_path);
         }
 
-        // Build strands for crossing (reference toStrands with offerCrossing=true)
-        let (_, strands) = ledger::flow_engine::strand_builder::to_strands(
+        // Build typed Issue/MPT strands for crossing (rippled toStrands with
+        // offerCrossing=true).  Keeping the exact Asset here is consensus
+        // critical: treating an MPT as XRP selects a different book key.
+        let (_, strands) = ledger::flow_engine::strand_builder::to_strands_with_domain(
             &account,
             &account, // src == dst for offer crossing
             &deliver_asset,
@@ -277,10 +291,30 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             true, // default paths allowed
             true, // owner pays transfer fee
             true, // offer crossing
+            domain_id,
         );
 
-        let cross_book = Some((taker_gets.asset(), taker_pays.asset()));
+        let cross_book = Some((taker_gets.asset(), taker_pays.asset(), domain_id));
         let self_cross_cancellations = ledger::flow_engine::SelfCrossCancellation::default();
+
+        let (in_start_balance, disallow_unfunded) =
+            match crossing_account_funds(view, &account, &taker_gets) {
+                Ok(value) => value,
+                Err(ter) => return ter,
+            };
+        if disallow_unfunded && in_start_balance.signum() <= 0 {
+            return Ter::TEC_UNFUNDED_OFFER;
+        }
+        let effective_send_max = if send_max > in_start_balance {
+            in_start_balance
+        } else {
+            send_max.clone()
+        };
+        let cross_deliver = if is_sell {
+            sell_cross_deliver_limit(&taker_pays)
+        } else {
+            taker_pays.clone()
+        };
 
         // Execute strands
         // reference: flow(deliver=takerAmount.out, sendMax=takerAmount.in)
@@ -288,19 +322,24 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             ledger::flow_engine::strand_flow::execute_strands(
                 view,
                 &strands,
-                &taker_pays, // deliver = TakerPays
+                &cross_deliver,
                 (tx_flags & TF_FILL_OR_KILL) == 0,
-                Some(&taker_gets), // sendMax = TakerGets
+                if is_sell {
+                    ledger::ripple_calc::OfferCrossing::Sell
+                } else {
+                    ledger::ripple_calc::OfferCrossing::Yes
+                },
+                Some(&effective_send_max),
                 &account,
                 &account,
                 Some(quality_threshold),
                 Some(self_cross_cancellations.clone()),
             )
-        } else if let Some((book_in, book_out)) = cross_book {
+        } else if let Some((book_in, book_out, domain)) = cross_book {
             let cross_book = ledger::ripple_calc::book_step::Book {
                 r#in: book_in,
                 out: book_out,
-                domain: None,
+                domain,
             };
             // Fallback to direct book step if strand building fails. It is
             // still the default OfferCreate stream, so it receives the same
@@ -308,8 +347,8 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             let result = ledger::ripple_calc::book_step::execute_book_step_with_options(
                 view,
                 &cross_book,
-                &taker_gets,
-                &taker_pays,
+                &effective_send_max,
+                &cross_deliver,
                 ledger::ripple_calc::book_step::BookStepOptions {
                     owner_pays_transfer_fee: true,
                     taker: Some(&account),
@@ -379,13 +418,13 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                                 .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
                         }
                     } else {
-                        let issue = actual_in.issue();
-                        ledger::ripple_state_helpers::direct_send_no_fee_iou_pub(
-                            view,
-                            &account,
-                            &issue.account,
-                            &actual_in,
+                        let issuer = actual_in.asset().issuer();
+                        let send = ledger::ripple_state_helpers::account_send(
+                            view, &account, &issuer, &actual_in,
                         );
+                        if send != Ter::TES_SUCCESS {
+                            return send;
+                        }
                     }
                 }
                 if actual_out.signum() > 0 {
@@ -404,13 +443,16 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                                 .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
                         }
                     } else {
-                        let issue = actual_out.issue();
-                        ledger::ripple_state_helpers::direct_send_no_fee_iou_pub(
+                        let issuer = actual_out.asset().issuer();
+                        let send = ledger::ripple_state_helpers::account_send(
                             view,
-                            &issue.account,
+                            &issuer,
                             &account,
                             &actual_out,
                         );
+                        if send != Ter::TES_SUCCESS {
+                            return send;
+                        }
                     }
                 }
             }
@@ -421,19 +463,20 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         // A dry flow leaves the offer unchanged. Besides matching rippled's
         // post-cross result, this avoids converting an otherwise unused
         // encoded rate back into an amount.
-        let (rem_gets, rem_pays) = if actual_in.signum() <= 0 && actual_out.signum() <= 0 {
+        let (post_cross_balance, _) = match crossing_account_funds(view, &account, &taker_gets) {
+            Ok(value) => value,
+            Err(ter) => return ter,
+        };
+        let (rem_gets, rem_pays) = if disallow_unfunded && post_cross_balance.signum() <= 0 {
+            (taker_gets.zeroed(), taker_pays.zeroed())
+        } else if actual_in.signum() <= 0 && actual_out.signum() <= 0 {
             (taker_gets.clone(), taker_pays.clone())
         } else if is_sell {
             // tfSell reduces the input side, TakerGets.
-            let gateway_rate = if !taker_gets.native() && account != taker_gets.issue().account {
-                ledger::ripple_state_helpers::transfer_rate(view, &taker_gets.issue().account)
-            } else {
-                1_000_000_000u32
-            };
             let non_gateway_in = if gateway_rate != 1_000_000_000 {
                 let rate = STAmount::new_with_asset(
                     sf("sfAmount"),
-                    protocol::Asset::Issue(protocol::Issue::default()),
+                    protocol::no_issue(),
                     gateway_rate as u64,
                     -9,
                     false,
@@ -452,15 +495,12 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             let rem_pays = if rem_gets.signum() <= 0 {
                 taker_pays.zeroed()
             } else {
-                // get_rate is TakerPays / TakerGets, so recover the output
-                // side by multiplying the remaining input side.
-                let rate_amount = match amount_or_exception(
-                    taker_pays.try_divide(&taker_gets, protocol::no_issue()),
-                ) {
-                    Ok(rate) => rate,
-                    Err(ter) => return ter,
-                };
-                rem_gets.mul_round(&rate_amount, taker_pays.asset(), true)
+                // C++: divRoundStrict(afterCross.in,
+                // Quality{takerAmount.out, takerAmount.in}.rate(), out, false)
+                let rate =
+                    Quality::from_amounts(&Amounts::new(taker_gets.clone(), taker_pays.clone()))
+                        .rate();
+                protocol::div_round_strict(&rem_gets, &rate, taker_pays.asset(), false)
             };
             (rem_gets, rem_pays)
         } else {
@@ -473,22 +513,16 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             let rem_gets = if rem_pays.signum() <= 0 {
                 taker_gets.zeroed()
             } else {
-                // get_rate is TakerPays / TakerGets, so recover the input
-                // side by dividing the remaining output side.
-                let rate_amount = match amount_or_exception(
-                    taker_pays.try_divide(&taker_gets, protocol::no_issue()),
-                ) {
-                    Ok(rate) => rate,
-                    Err(ter) => return ter,
-                };
-                protocol::div_round_strict(&rem_pays, &rate_amount, taker_gets.asset(), false)
+                // C++: mulRound(afterCross.out,
+                // Quality{takerAmount.out, takerAmount.in}.rate(), in, true)
+                let rate =
+                    Quality::from_amounts(&Amounts::new(taker_gets.clone(), taker_pays.clone()))
+                        .rate();
+                rem_pays.mul_round(&rate, taker_gets.asset(), true)
             };
             (rem_gets, rem_pays)
         };
         (rem_gets, rem_pays)
-    } else {
-        // Passive offer — no crossing
-        (taker_gets.clone(), taker_pays.clone())
     };
 
     // --- Fully crossed check ---
@@ -532,7 +566,11 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     // Add to owner directory. reference the reference source: owner directory uses dirInsert,
     // while the book directory below uses dirAppend.
     let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-    let owner_node = match ledger::dir_insert(view, &owner_dir, offer_keylet.key, &|_| {}) {
+    let owner_node = match ledger::dir_insert(view, &owner_dir, offer_keylet.key, &|sle| {
+        // describeOwnerDir(accountID_) in rippled.  The descriptor runs when
+        // the directory root is first created and is part of the ledger hash.
+        sle.set_account_id(sf("sfOwner"), account);
+    }) {
         Ok(Some(page)) => page,
         other => {
             static DIR_FULL_LOG: std::sync::atomic::AtomicU32 =
@@ -855,6 +893,145 @@ fn quality_to_rate_amount(quality: u64) -> STAmount {
     protocol::amount_from_quality(quality)
 }
 
+/// Expand the offer input limit by the issuer transfer fee exactly as
+/// `OfferCreate::flowCross` does before constructing its quality threshold.
+fn gateway_adjusted_send_max(taker_gets: &STAmount, gateway_rate: u32) -> STAmount {
+    if gateway_rate == 1_000_000_000 || taker_gets.native() {
+        return taker_gets.clone();
+    }
+
+    let rate = STAmount::new_with_asset(
+        sf("sfAmount"),
+        protocol::no_issue(),
+        gateway_rate as u64,
+        -9,
+        false,
+    );
+    taker_gets.mul_round(&rate, taker_gets.asset(), true)
+}
+
+/// `tfSell` lets flow deliver as much output as the input can buy.  rippled
+/// uses deliberately bounded maxima so transfer-rate multiplication remains
+/// representable.
+fn sell_cross_deliver_limit(taker_pays: &STAmount) -> STAmount {
+    match taker_pays.asset() {
+        protocol::Asset::Issue(issue) if issue.native() => STAmount::from_xrp_amount(
+            XRPAmount::from_drops(protocol::ST_AMOUNT_MAX_NATIVE_NETWORK as i64),
+        ),
+        protocol::Asset::Issue(issue) => STAmount::new_with_asset(
+            sf("sfAmount"),
+            issue,
+            protocol::ST_AMOUNT_MAX_MANTISSA / 2,
+            protocol::ST_AMOUNT_MAX_OFFSET,
+            false,
+        ),
+        protocol::Asset::MPTIssue(issue) => STAmount::from_mpt_amount(
+            sf("sfAmount"),
+            protocol::MPTAmount::from_value(protocol::MAX_MP_TOKEN_AMOUNT / 2),
+            issue,
+        ),
+    }
+}
+
+/// Post-fee funding lookup used by OfferCreate::flowCross.  The boolean is
+/// false only for an MPT issuer, which rippled permits to trade without a
+/// pre-existing holder balance.
+fn crossing_account_funds<V: ledger::ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    amount: &STAmount,
+) -> Result<(STAmount, bool), Ter> {
+    match amount.asset() {
+        protocol::Asset::Issue(issue) if issue.native() => {
+            let liquid = ledger::apply_view::xrp_liquid(view, account, 0)
+                .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+            Ok((STAmount::from_xrp_amount(liquid), true))
+        }
+        protocol::Asset::Issue(issue) if issue.issuer() == *account => Ok((amount.clone(), true)),
+        protocol::Asset::Issue(issue) => {
+            let issuer_key = protocol::account_keylet(Uint160::from_void(issue.issuer().data()));
+            let issuer = view.read(issuer_key).map_err(|_| Ter::TEF_BAD_LEDGER)?;
+            let line_key = protocol::line(*account, issue.issuer(), issue.currency);
+            let line = view.read(line_key).map_err(|_| Ter::TEF_BAD_LEDGER)?;
+
+            let globally_frozen = issuer
+                .as_ref()
+                .is_some_and(|sle| sle.is_flag(protocol::lsfGlobalFreeze));
+            // A holder's own freeze bit does not freeze its funds. Only the
+            // issuer-side bit does (RippleStateHelpers::isFrozen parity).
+            let issuer_frozen = line.as_ref().is_some_and(|line| {
+                line.is_flag(if issue.issuer() > *account {
+                    protocol::lsfHighFreeze
+                } else {
+                    protocol::lsfLowFreeze
+                })
+            });
+            let deep_frozen = line.as_ref().is_some_and(|line| {
+                line.is_flag(protocol::lsfLowDeepFreeze)
+                    || line.is_flag(protocol::lsfHighDeepFreeze)
+            });
+            if globally_frozen || issuer_frozen || deep_frozen {
+                return Ok((amount.zeroed(), true));
+            }
+            Ok((
+                ledger::ripple_state_helpers::account_holds(
+                    view,
+                    account,
+                    &issue.issuer(),
+                    issue.currency,
+                ),
+                true,
+            ))
+        }
+        protocol::Asset::MPTIssue(issue) => {
+            let issuance_key = protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id());
+            let Some(issuance) = view.read(issuance_key).map_err(|_| Ter::TEF_BAD_LEDGER)? else {
+                return Ok((amount.zeroed(), true));
+            };
+            let issuer = issuance.get_account_id(sf("sfIssuer"));
+            if issuer == *account {
+                let available = ledger::mptoken_helpers::available_mpt_amount(&issuance);
+                return Ok((
+                    STAmount::from_mpt_amount(
+                        sf("sfAmount"),
+                        protocol::MPTAmount::from_value(available),
+                        issue,
+                    ),
+                    false,
+                ));
+            }
+            if ledger::mptoken_helpers::is_frozen_mpt(view, account, &issue)
+                .map_err(|_| Ter::TEF_BAD_LEDGER)?
+                || ledger::mptoken_helpers::require_auth_mpt_with_type(
+                    view,
+                    &issue,
+                    account,
+                    ledger::mptoken_helpers::MPTAuthType::Strong,
+                )
+                .map_err(|_| Ter::TEF_BAD_LEDGER)?
+                    != Ter::TES_SUCCESS
+            {
+                return Ok((amount.zeroed(), true));
+            }
+            let token_key = protocol::mptoken_keylet_from_mptid(
+                issue.mpt_id(),
+                Uint160::from_void(account.data()),
+            );
+            let Some(token) = view.read(token_key).map_err(|_| Ter::TEF_BAD_LEDGER)? else {
+                return Ok((amount.zeroed(), true));
+            };
+            Ok((
+                STAmount::from_mpt_amount(
+                    sf("sfAmount"),
+                    protocol::MPTAmount::from_value(token.get_field_u64(sf("sfMPTAmount")) as i64),
+                    issue,
+                ),
+                true,
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,6 +1053,80 @@ mod tests {
         // below the representable IOU range and therefore canonicalizes to zero.
         let rate = quality_to_rate_amount(1_000_000_000_000_000);
         assert_eq!(rate.signum(), 0);
+    }
+
+    #[test]
+    fn gateway_transfer_rate_is_included_in_offer_cross_send_max_and_threshold() {
+        // Ledger 20,109,795 transaction A0DA77... uses a 1.005 transfer-rate
+        // UAH issuer.  The fee-adjusted threshold rejects the AMM that the
+        // unadjusted threshold incorrectly crossed.
+        let issue = protocol::Issue::new(
+            protocol::currency_from_string("UAH"),
+            protocol::AccountID::from_array([0x44; 20]),
+        );
+        let taker_gets = STAmount::from_iou_amount(
+            sf("sfTakerGets"),
+            protocol::IOUAmount::from_parts(5_000_000_000_000_000, -13)
+                .expect("500 UAH is canonical"),
+            issue,
+        );
+        let taker_pays = STAmount::from_xrp_amount(XRPAmount::from_drops(7_721_222));
+
+        let send_max = gateway_adjusted_send_max(&taker_gets, 1_005_000_000);
+        assert_eq!(send_max.text(), "502.5");
+
+        let adjusted = Quality::from_amounts(&Amounts::new(send_max, taker_pays.clone()));
+        let unadjusted = Quality::from_amounts(&Amounts::new(taker_gets, taker_pays));
+        assert_ne!(adjusted, unadjusted);
+    }
+
+    #[test]
+    fn sell_crossing_uses_asset_specific_bounded_maximum_delivery() {
+        let xrp = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+        assert_eq!(
+            sell_cross_deliver_limit(&xrp).xrp().drops(),
+            protocol::ST_AMOUNT_MAX_NATIVE_NETWORK as i64
+        );
+
+        let issue = protocol::Issue::new(
+            protocol::currency_from_string("USD"),
+            protocol::AccountID::from_array([0x66; 20]),
+        );
+        let iou = STAmount::new_with_asset(sf("sfAmount"), issue, 1, 0, false);
+        let iou_limit = sell_cross_deliver_limit(&iou);
+        assert_eq!(iou_limit.mantissa(), protocol::ST_AMOUNT_MAX_MANTISSA / 2);
+        assert_eq!(iou_limit.exponent(), protocol::ST_AMOUNT_MAX_OFFSET);
+
+        let mpt_issue = protocol::MPTIssue::new(protocol::MPTID::from_array([0x77; 24]));
+        let mpt = STAmount::from_mpt_amount(
+            sf("sfAmount"),
+            protocol::MPTAmount::from_value(1),
+            mpt_issue,
+        );
+        assert_eq!(
+            sell_cross_deliver_limit(&mpt).mpt().value(),
+            protocol::MAX_MP_TOKEN_AMOUNT / 2
+        );
+    }
+
+    #[test]
+    fn residual_rounding_matches_flow_cross_operations() {
+        let issue = protocol::Issue::new(
+            protocol::currency_from_string("USD"),
+            protocol::AccountID::from_array([0x88; 20]),
+        );
+        let original_in =
+            STAmount::new_with_asset(sf("sfAmount"), issue, 5_000_000_000_000_000, -13, false);
+        let original_out = STAmount::from_xrp_amount(XRPAmount::from_drops(7_721_222));
+        let rate =
+            Quality::from_amounts(&Amounts::new(original_in.clone(), original_out.clone())).rate();
+
+        let remaining_out = STAmount::from_xrp_amount(XRPAmount::from_drops(7_000_000));
+        let remaining_in = remaining_out.mul_round(&rate, original_in.asset(), true);
+        let reconstructed_out =
+            protocol::div_round_strict(&remaining_in, &rate, original_out.asset(), false);
+        assert!(remaining_in.signum() > 0);
+        assert!(reconstructed_out <= remaining_out);
     }
 
     #[test]

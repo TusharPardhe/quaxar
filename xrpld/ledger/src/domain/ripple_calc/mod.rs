@@ -4,6 +4,7 @@ mod builder;
 
 mod selection;
 mod step;
+pub use step::OfferCrossing;
 mod strand;
 
 use crate::read_view::ViewError;
@@ -291,6 +292,7 @@ fn ripple_calculate_inner<V: ApplyView>(
             &strands,
             dst_amount,
             input.partial_payment_allowed,
+            crate::domain::ripple_calc::OfferCrossing::No,
             Some(max_source_amount),
             src_account,
             dst_account,

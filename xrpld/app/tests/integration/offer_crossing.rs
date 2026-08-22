@@ -68,6 +68,15 @@ fn offer_funded_iou_placed() {
     assert_eq!(result, Ter::TES_SUCCESS);
     // Offer placed — owner count increased
     assert_eq!(get_owner_count(&view, alice), 2); // trust line + offer
+    let owner_dir = view
+        .read(protocol::owner_dir_keylet(acct_id(alice)))
+        .expect("read owner directory")
+        .expect("owner directory must exist");
+    assert_eq!(
+        owner_dir.get_account_id(sf("sfOwner")),
+        alice,
+        "new owner-directory roots must carry describeOwnerDir's sfOwner"
+    );
 }
 
 /// C++ Offer_test — unfunded IOU offer rejected.
@@ -843,9 +852,9 @@ fn offer_crossing_frozen_trust_line() {
     let gw = acct(0x33);
     let usd = usd_currency();
 
-    // Alice's trust line is frozen (lsfLowFreeze = 0x00400000)
+    // The issuer (high side for gw=0x33 > alice=0x11) froze Alice's line.
     let mut tl = trust_line(alice, gw, usd, 1000, 10000, 0);
-    tl.set_field_u32(sf("sfFlags"), 0x00400000); // lsfLowFreeze
+    tl.set_field_u32(sf("sfFlags"), protocol::lsfHighFreeze);
 
     let ledger = build_ledger(vec![
         account_root(alice, 10_000_000_000, 1, 0),

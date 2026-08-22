@@ -141,7 +141,6 @@ port = 6006
 ip = 127.0.0.1
 admin = 127.0.0.1
 protocol = ws
-send_queue_limit = 500
 
 [port_peer]
 port = 51235

@@ -158,7 +158,12 @@ pub fn check_create_mpt<V: ApplyView>(
 
     // Link into owner directory and adjust owner count
     let owner_dir = protocol::owner_dir_keylet(account_to_uint160(holder));
-    match ledger::apply_directory::dir_append(view, &owner_dir, token_keylet.key, &|_| {}) {
+    match ledger::apply_directory::dir_insert(
+        view,
+        &owner_dir,
+        token_keylet.key,
+        &ledger::describe_owner_dir(*holder),
+    ) {
         Ok(Some(owner_node)) => {
             mptoken.set_field_u64(sf("sfOwnerNode"), owner_node);
         }

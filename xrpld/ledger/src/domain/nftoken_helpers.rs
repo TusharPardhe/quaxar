@@ -565,7 +565,7 @@ pub fn token_offer_create_apply(
         view,
         &owner_dir_keylet(to_uint160(*acct_id)),
         offer_id.key,
-        &|_| {},
+        &crate::describe_owner_dir(*acct_id),
     )?;
     let Some(owner_node_val) = owner_node else {
         return Ok(Ter::TEC_DIR_FULL);

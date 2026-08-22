@@ -3030,6 +3030,35 @@ fn switched_ledger_consensus_child_can_replace_older_global_lcl() {
 }
 
 #[test]
+fn consensus_child_payment_creates_account_at_child_sequence() {
+    let destination = AccountID::from_array([0xA7; 20]);
+    let (source, payment) = signed_payment_tx(0xA6, destination, 1, 10);
+    let mut parent = ledger_view(10, source, 1, &[]);
+    parent.set_total_drops(1_000_000_000);
+    let parent = Arc::new(parent);
+    let app = ApplicationRoot::new(0).expect("application root should build");
+
+    let outcome = app
+        .accept_ledger_with_txns_outcome_from_consensus_parent(
+            Arc::clone(&parent),
+            11,
+            1_010,
+            LEDGER_DEFAULT_TIME_RESOLUTION,
+            true,
+            parent.fees().base,
+            vec![payment],
+        )
+        .expect("consensus child should build");
+
+    let created = outcome
+        .closed
+        .read(account_keylet(raw_account_id(destination)))
+        .expect("destination read should succeed")
+        .expect("payment should create destination account");
+    assert_eq!(created.get_field_u32(get_field_by_symbol("sfSequence")), 11);
+}
+
+#[test]
 fn lcl_transition_gate_serializes_authoritative_promotions() {
     let app = Arc::new(ApplicationRoot::new(0).expect("root shell should build"));
     let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 1_000, false));

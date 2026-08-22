@@ -91,8 +91,14 @@ pub enum AcquisitionEvent {
     /// merely because a tree completed.
     ConsensusTarget(ConsensusTarget),
 
-    /// Consensus reports a preferred-LCL divergence with a concrete acquisition
-    /// target (rippled `NetworkOPsImp::consensusViewChange` parity). Motivates
+    /// Consensus observed that its preferred previous ledger differs from the
+    /// current view (rippled `NetworkOPsImp::consensusViewChange` parity).
+    /// This is a mode-only signal: it demotes `Tracking/Full -> Connected`
+    /// without selecting or pinning an acquisition target.
+    ConsensusViewChange,
+
+    /// The serialized `checkLastClosedLedger` path reports a preferred-LCL
+    /// divergence with a concrete acquisition target. Motivates
     /// `Connected/Tracking/Full -> Syncing { target }`, or retargets an
     /// existing Syncing phase to the latest preferred identity. It never mints
     /// a session: the acquisition demand arrives as a separate

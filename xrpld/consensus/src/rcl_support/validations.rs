@@ -549,13 +549,9 @@ impl<A: ValidationsAdaptor> Validations<A> {
     /// Reconcile a ledger that has just become available to the validation
     /// tracker.
     ///
-    /// `check_acquired` normally services the validators still waiting on an
-    /// exact `(sequence, id)` acquisition. A validator can issue its next
-    /// validation before that acquisition completes, however, and
-    /// `update_trie_validation` then removes the superseded waiter. Retain the
-    /// reference behavior of keeping that validator's newest *available*
-    /// ledger in the trie by consulting the historical `by_ledger` set too.
-    /// A late older completion never replaces newer resident support.
+    /// Only validators still waiting on this exact `(sequence, id)` may enter
+    /// the trie. A newer validation removes the older waiter; a late completion
+    /// of that superseded ledger must not resurrect historical support.
     pub fn on_ledger_acquired(&self, ledger: A::Ledger) {
         let ledger_id = ledger.id();
         let ledger_seq = ledger.seq();
@@ -563,29 +559,9 @@ impl<A: ValidationsAdaptor> Validations<A> {
         let mut inner = self.inner.lock();
         let _ = inner.current_live(&self.adaptor, &self.parms);
 
-        let mut nodes = inner.acquiring.remove(&key).unwrap_or_default();
-        if let Some(retained) = inner.by_ledger.get(&ledger_id) {
-            nodes.extend(retained.iter().filter_map(|(node_id, validation)| {
-                let current = inner.current.get(node_id)?;
-                // `add` indexes a message in `by_ledger` before the final
-                // current sign-time comparison. A rejected stale message can
-                // therefore remain historical, but must never become trie
-                // support when its ledger arrives later. Formerly accepted
-                // support is necessarily no newer than the signer's accepted
-                // current validation in both sequence and signing time.
-                (validation.trusted()
-                    && current.trusted()
-                    && validation.seq() <= current.seq()
-                    && validation.sign_time() <= current.sign_time())
-                .then(|| node_id.clone())
-            }));
-        }
+        let nodes = inner.acquiring.remove(&key).unwrap_or_default();
 
         for node_id in nodes {
-            // Historical support is useful only while the signer's latest
-            // validation remains current and trusted. `trust_changed` keeps
-            // both current and retained entries synchronized, but checking
-            // current here also protects against stale retained sets.
             let current_is_trusted = inner
                 .current
                 .get(&node_id)
@@ -594,13 +570,11 @@ impl<A: ValidationsAdaptor> Validations<A> {
                 continue;
             }
 
-            let advances_resident = inner
-                .last_ledger
-                .get(&node_id)
-                .is_none_or(|resident| resident.seq() < ledger_seq);
-            if advances_resident {
-                inner.update_trie_ledger(&node_id, ledger.clone());
-            }
+            // SeqEnforcer expiry permits a validator to resume at a lower
+            // sequence. While that ledger is acquired, its prior (higher)
+            // resident remains in the trie. Completion must therefore replace
+            // residency unconditionally, exactly like checkAcquired/updateTrie.
+            inner.update_trie_ledger(&node_id, ledger.clone());
         }
     }
 
@@ -1461,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn acquired_superseded_validation_restores_resident_support_until_newer_arrives() {
+    fn late_acquisition_does_not_restore_superseded_validation() {
         let adaptor = MockAdaptor::new(1000);
         let genesis = MockLedger::genesis_();
         let first = genesis.child(1);
@@ -1495,16 +1469,14 @@ mod tests {
         validations.on_ledger_acquired(first.clone());
         {
             let inner = validations.inner.lock();
-            assert_eq!(
-                inner.last_ledger.get(&1).map(ValidationsLedger::id),
-                Some(first.id())
-            );
-            assert_eq!(
-                inner.last_ledger.get(&2).map(ValidationsLedger::id),
-                Some(first.id())
-            );
+            assert!(inner.last_ledger.is_empty());
             assert!(inner.acquiring.contains_key(&(second.seq(), second.id())));
         }
+
+        assert_eq!(
+            validations.get_preferred(&genesis),
+            Some((second.seq(), second.id()))
+        );
 
         validations.adaptor().register_ledger(second.clone());
         validations.on_ledger_acquired(second.clone());
@@ -1545,6 +1517,58 @@ mod tests {
             inner.last_ledger.get(&1).map(ValidationsLedger::id),
             Some(second.id())
         );
+    }
+
+    #[test]
+    fn acquired_lower_validation_replaces_stale_higher_resident_after_enforcer_expiry() {
+        let adaptor = MockAdaptor::new(1001);
+        let genesis = MockLedger::genesis_();
+        let mut chain = genesis.clone();
+        for seq in 1..=10 {
+            chain = chain.child(seq);
+        }
+        let high = chain;
+        let mut lower = genesis;
+        for seq in 1..=5 {
+            lower = lower.child(seq);
+        }
+        adaptor.register_ledger(high.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(high.id(), high.seq(), 1000, 1, 100)),
+            ValStatus::Current
+        );
+        {
+            let mut inner = validations.inner.lock();
+            inner.seq_enforcers.get_mut(&1).unwrap().when = Some(
+                Instant::now()
+                    - validations.parms().validation_set_expires
+                    - Duration::from_secs(1),
+            );
+        }
+
+        assert_eq!(
+            validations.add(1, val(lower.id(), lower.seq(), 1001, 1, 100)),
+            ValStatus::Current
+        );
+        {
+            let inner = validations.inner.lock();
+            assert_eq!(
+                inner.last_ledger.get(&1).map(ValidationsLedger::id),
+                Some(high.id())
+            );
+            assert!(inner.acquiring.contains_key(&(lower.seq(), lower.id())));
+        }
+
+        validations.adaptor().register_ledger(lower.clone());
+        validations.on_ledger_acquired(lower.clone());
+        let inner = validations.inner.lock();
+        assert_eq!(
+            inner.last_ledger.get(&1).map(ValidationsLedger::id),
+            Some(lower.id())
+        );
+        assert!(!inner.acquiring.contains_key(&(lower.seq(), lower.id())));
     }
 
     #[test]

@@ -9,6 +9,21 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Changed
 
+- Matched consensus child-ledger application semantics: transaction state is
+  based on the parent tree while sequence and close-time reads use the child
+  header being built.
+- Matched `rippled` transaction-map construction for Payment delivered
+  metadata, CheckCash and AccountDelete delivery handoff, owner-directory
+  descriptors and capacity, TicketCreate insertion, and OfferCreate
+  transfer-rate quality thresholds.
+- Made payment and offer strands asset-aware for MPT endpoints and books,
+  including issuer capacity, authorization, freeze/lock, transfer-rate and
+  owner-funding rules; restored issued/MPT CheckCash flow and amendment-gated
+  FillOrKill completion semantics.
+- Prevented late acquisition of a superseded validation from resurrecting
+  historical trie support, and kept timer-time consensus view changes
+  mode-only until serialized preferred-LCL reconciliation selects a target.
+
 - Reworked current-ledger recovery around the application-owned NetworkOps
   strand, a typed acquisition coordinator, preferred-ledger retargeting,
   durable exact-identity handoff, an independent startup/recovery latch, and

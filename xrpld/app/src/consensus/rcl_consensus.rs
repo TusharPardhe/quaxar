@@ -943,18 +943,14 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                     "consensusViewChange: demoting to Connected (preferred ledger differs)"
                 );
                 // Coordinator mode: the coordinator is the single mode writer.
-                // Feed the typed divergence fact (demotes Tracking/Full ->
-                // Syncing without minting a session) and let the coordinator
-                // publish; otherwise keep the legacy write.
+                // Feed rippled's mode-only consensusViewChange fact (demotes
+                // Tracking/Full -> Connected without selecting an acquisition
+                // target) and let the coordinator publish. The serialized
+                // checkLastClosedLedger path owns target-bearing divergence.
                 if let Some(coordinator) = self.coordinator_inbound()
                     && coordinator.coordinator_installed()
                 {
-                    coordinator.coordinator_preferred_lcl_divergence(
-                        acquisition::LedgerTarget::new(
-                            preferred,
-                            preferred_resident.map(|(_, seq)| seq),
-                        ),
-                    );
+                    coordinator.coordinator_consensus_view_change();
                 } else {
                     self.app_root.set_network_ops_operating_mode_with_reason(
                         crate::NetworkOpsOperatingMode::Connected,

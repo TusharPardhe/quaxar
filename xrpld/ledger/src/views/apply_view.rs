@@ -66,6 +66,7 @@ pub trait ApplyView: ReadView + RawView {
 #[derive(Debug)]
 pub struct ApplyViewImpl<B> {
     base: Arc<B>,
+    header: crate::LedgerHeader,
     table: ApplyStateTable,
     flags: ApplyFlags,
 }
@@ -75,8 +76,26 @@ where
     B: ReadView,
 {
     pub fn new(base: Arc<B>, flags: ApplyFlags) -> Self {
+        let header = base.header();
         Self {
             base,
+            header,
+            table: ApplyStateTable::new(),
+            flags,
+        }
+    }
+
+    /// Construct an apply view whose state is based on `base`, but whose
+    /// ledger context is the ledger being built.
+    ///
+    /// Consensus applies transactions to a child ledger while reading the
+    /// parent's state tree. Keeping those two facts separate matches
+    /// rippled's closed `OpenView`: transaction code must observe the child
+    /// sequence and close-time header, not the parent header.
+    pub fn new_with_header(base: Arc<B>, header: crate::LedgerHeader, flags: ApplyFlags) -> Self {
+        Self {
+            base,
+            header,
             table: ApplyStateTable::new(),
             flags,
         }
@@ -100,7 +119,7 @@ where
     }
 
     fn header(&self) -> crate::LedgerHeader {
-        self.base.header()
+        self.header
     }
 
     fn fees(&self) -> Fees {
@@ -209,6 +228,29 @@ where
 
     fn destroy_xrp(&mut self, fee: XRPAmount) -> Result<(), ViewError> {
         self.raw_destroy_xrp(fee)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use protocol::ApplyFlags;
+
+    use super::ApplyViewImpl;
+    use crate::{Ledger, ReadView};
+
+    #[test]
+    fn build_view_reads_parent_state_with_child_header() {
+        let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 100, false));
+        let child_header = Ledger::from_previous(&parent, 110).header();
+        let view =
+            ApplyViewImpl::new_with_header(Arc::clone(&parent), child_header, ApplyFlags::NONE);
+
+        assert_eq!(parent.header().seq, 10);
+        assert_eq!(view.seq(), 11);
+        assert_eq!(view.header().parent_hash, parent.header().hash);
+        assert_eq!(view.header().parent_close_time, parent.header().close_time);
     }
 }
 

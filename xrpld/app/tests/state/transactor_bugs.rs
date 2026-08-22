@@ -370,8 +370,8 @@ fn offer_create_native_funding_uses_pre_fee_balance() {
 
     assert_eq!(
         run(&ledger, tx),
-        Ter::TEC_INSUF_RESERVE_OFFER,
-        "pre-fee XRP liquidity must pass OfferCreate funding before the later reserve claim"
+        Ter::TEC_UNFUNDED_OFFER,
+        "flowCross must recheck post-fee XRP liquidity before the later reserve claim"
     );
 }
 

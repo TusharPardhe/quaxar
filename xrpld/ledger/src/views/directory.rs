@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use basics::base_uint::Uint256;
-use protocol::{Keylet, STLedgerEntry, STObject, STVector256};
+use protocol::{AccountID, Keylet, STLedgerEntry, STObject, STVector256};
 
 use crate::read_view::ViewError;
 use crate::views::apply_view::ApplyView;
@@ -15,6 +15,13 @@ pub const DIR_NODE_MAX_ENTRIES: usize = 32;
 /// the number of pages a directory chain may grow to; made obsolete by the
 /// `fixDirectoryLimit` amendment.
 pub const DIR_NODE_MAX_PAGES: u64 = 262_144;
+
+/// Describe an owner-directory page exactly as rippled's
+/// `describeOwnerDir`: every page created for the directory carries the
+/// account in `sfOwner`.
+pub fn describe_owner_dir(account: AccountID) -> impl Fn(&mut STObject) {
+    move |directory| directory.set_account_id(sf("sfOwner"), account)
+}
 
 fn sf(name: &str) -> &'static protocol::SField {
     protocol::get_field_by_symbol(name)
@@ -428,6 +435,16 @@ pub fn dir_remove(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_directory_description_sets_canonical_owner_field() {
+        let account = AccountID::from_slice(&[0xA5; 20]).expect("account width");
+        let mut directory = STObject::new(sf("sfGeneric"));
+
+        describe_owner_dir(account)(&mut directory);
+
+        assert_eq!(directory.get_account_id(sf("sfOwner")), account);
+    }
 
     // reference: `ApplyView::dirAdd` -> `directory::insertPage` in
     // `xrpl/ledger/ApplyView.cpp`, guarded by

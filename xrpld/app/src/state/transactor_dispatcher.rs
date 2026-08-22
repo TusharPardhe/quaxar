@@ -17,6 +17,10 @@ fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
 }
 
+fn describe_owner_dir(account: AccountID) -> impl Fn(&mut STObject) {
+    move |directory| directory.set_account_id(sf("sfOwner"), account)
+}
+
 #[allow(dead_code)] // reserve for M7 sweep
 fn oracle_pair_key(entry: &STObject) -> (protocol::Currency, protocol::Currency) {
     (
@@ -767,8 +771,94 @@ fn check_mpt_check_cash_allowed<V: ledger::ApplyView>(
     if transfer != Ter::TES_SUCCESS {
         return transfer;
     }
-    ledger::mptoken_helpers::check_create_mpt(view, &issue, destination)
-        .unwrap_or(Ter::TEF_INTERNAL)
+    Ter::TES_SUCCESS
+}
+
+fn check_cash_reserve_sponsor<V: ledger::ApplyView>(
+    view: &mut V,
+    sttx: &STTx,
+) -> Result<Option<Arc<STLedgerEntry>>, Ter> {
+    if !sttx.is_field_present(sf("sfSponsor"))
+        || !sttx.is_field_present(sf("sfSponsorFlags"))
+        || !ledger::is_reserve_sponsored(sttx.get_field_u32(sf("sfSponsorFlags")))
+    {
+        return Ok(None);
+    }
+    let sponsor = sttx.get_account_id(sf("sfSponsor"));
+    view.peek(protocol::account_keylet(Uint160::from_void(sponsor.data())))
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?
+        .ok_or(Ter::TEC_INTERNAL)
+        .map(Some)
+}
+
+fn check_cash_has_object_reserve<V: ledger::ApplyView>(
+    view: &V,
+    destination_sle: &STLedgerEntry,
+    destination_pre_fee_balance: Option<i64>,
+    sponsor_sle: Option<&Arc<STLedgerEntry>>,
+) -> Result<bool, Ter> {
+    let reserve_sle = sponsor_sle.map_or(destination_sle, |sle| sle.as_ref());
+    let balance = sponsor_sle.map_or_else(
+        || {
+            destination_pre_fee_balance.unwrap_or_else(|| {
+                destination_sle
+                    .get_field_amount(sf("sfBalance"))
+                    .xrp()
+                    .drops()
+            })
+        },
+        |sle| sle.get_field_amount(sf("sfBalance")).xrp().drops(),
+    );
+    let reserve_count = ledger::reserve_owner_count(reserve_sle, 1) as usize;
+    if balance < view.fees().account_reserve(reserve_count) as i64 {
+        return Ok(false);
+    }
+
+    if let Some(sponsor_sle) = sponsor_sle {
+        let sponsor = sponsor_sle.get_account_id(sf("sfAccount"));
+        let destination = destination_sle.get_account_id(sf("sfAccount"));
+        if let Some(sponsorship) = view
+            .read(protocol::sponsorship_keylet(
+                Uint160::from_void(sponsor.data()),
+                Uint160::from_void(destination.data()),
+            ))
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?
+            && sponsorship.get_field_u32(sf("sfRemainingOwnerCount")) < 1
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn consume_check_cash_sponsorship<V: ledger::ApplyView>(
+    view: &mut V,
+    destination: &AccountID,
+    sponsor_sle: Option<&Arc<STLedgerEntry>>,
+) -> Result<(), Ter> {
+    let Some(sponsor_sle) = sponsor_sle else {
+        return Ok(());
+    };
+    let sponsor = sponsor_sle.get_account_id(sf("sfAccount"));
+    let keylet = protocol::sponsorship_keylet(
+        Uint160::from_void(sponsor.data()),
+        Uint160::from_void(destination.data()),
+    );
+    let Some(sponsorship) = view.peek(keylet).map_err(|_| Ter::TEF_BAD_LEDGER)? else {
+        return Ok(());
+    };
+    let mut updated = sponsorship.clone_as_object();
+    updated.set_field_u32(
+        sf("sfRemainingOwnerCount"),
+        sponsorship
+            .get_field_u32(sf("sfRemainingOwnerCount"))
+            .saturating_sub(1),
+    );
+    view.update(Arc::new(STLedgerEntry::from_stobject(
+        updated,
+        *sponsorship.key(),
+    )))
+    .map_err(|_| Ter::TEF_BAD_LEDGER)
 }
 
 fn check_mpt_amm_asset_allowed<V: ledger::ApplyView>(
@@ -1416,11 +1506,11 @@ impl<V: ledger::ApplyView> TicketCreateDoApplySink for DispatcherTicketCreateSin
     fn dir_insert_ticket(&mut self, ticket_sequence: u32) -> Option<Self::OwnerNode> {
         let ticket_keylet =
             protocol::ticket_keylet(Uint160::from_void(self.account.data()), ticket_sequence);
-        ledger::dir_append(
+        ledger::dir_insert(
             self.view,
             &owner_dir_keylet(Uint160::from_void(self.account.data())),
             ticket_keylet.key,
-            &|_| {},
+            &describe_owner_dir(self.account),
         )
         .ok()
         .flatten()
@@ -1664,7 +1754,12 @@ fn replace_signer_list<V: ledger::ApplyView>(
         signers,
     );
 
-    let owner_page = match ledger::dir_insert(view, &owner_dir, signer_keylet.key, &|_| {}) {
+    let owner_page = match ledger::dir_insert(
+        view,
+        &owner_dir,
+        signer_keylet.key,
+        &describe_owner_dir(account),
+    ) {
         Ok(Some(page)) => page,
         Ok(None) => return Ter::TEC_DIR_FULL,
         Err(_) => return Ter::TEF_INTERNAL,
@@ -2472,9 +2567,11 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             {
                 return Ter::TEF_BAD_LEDGER;
             }
-            view.erase(src)
-                .map(|_| Ter::TES_SUCCESS)
-                .unwrap_or(Ter::TEF_BAD_LEDGER)
+            if view.erase(src).is_err() {
+                return Ter::TEF_BAD_LEDGER;
+            }
+            crate::state::payment::record_delivered_amount(STAmount::from_xrp_amount(balance));
+            Ter::TES_SUCCESS
         }
 
         TxType::LEDGER_STATE_FIX => apply_ledger_state_fix(view, sttx),
@@ -2619,7 +2716,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 if !has_deposit_preauth_reserve(view, owner.as_ref(), pre_fee_balance_drops) {
                     return Ter::TEC_INSUFFICIENT_RESERVE;
                 }
-                let owner_node = match ledger::dir_insert(view, &owner_dir, keylet.key, &|_| {}) {
+                let owner_node = match ledger::dir_insert(
+                    view,
+                    &owner_dir,
+                    keylet.key,
+                    &describe_owner_dir(account),
+                ) {
                     Ok(Some(page)) => page,
                     Ok(None) => return Ter::TEC_DIR_FULL,
                     Err(_) => return Ter::TEF_BAD_LEDGER,
@@ -2674,7 +2776,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 if !has_deposit_preauth_reserve(view, owner.as_ref(), pre_fee_balance_drops) {
                     return Ter::TEC_INSUFFICIENT_RESERVE;
                 }
-                let owner_node = match ledger::dir_insert(view, &owner_dir, keylet.key, &|_| {}) {
+                let owner_node = match ledger::dir_insert(
+                    view,
+                    &owner_dir,
+                    keylet.key,
+                    &describe_owner_dir(account),
+                ) {
                     Ok(Some(page)) => page,
                     Ok(None) => return Ter::TEC_DIR_FULL,
                     Err(_) => return Ter::TEF_BAD_LEDGER,
@@ -3147,7 +3254,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             // on any following TER, so a failed link cannot leave partial state.
             if dst != account {
                 let dst_dir = owner_dir_keylet(Uint160::from_void(dst.data()));
-                match ledger::dir_append(view, &dst_dir, check_keylet.key, &|_| {}) {
+                match ledger::dir_insert(view, &dst_dir, check_keylet.key, &describe_owner_dir(dst))
+                {
                     Ok(Some(page)) => sle.set_field_u64(sf("sfDestinationNode"), page),
                     Ok(None) => return Ter::TEC_DIR_FULL,
                     Err(_) => return Ter::TEF_BAD_LEDGER,
@@ -3155,7 +3263,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
             // Add to owner directory.
             let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
-            match ledger::dir_append(view, &owner_dir, check_keylet.key, &|_| {}) {
+            match ledger::dir_insert(
+                view,
+                &owner_dir,
+                check_keylet.key,
+                &describe_owner_dir(account),
+            ) {
                 Ok(Some(page)) => sle.set_field_u64(sf("sfOwnerNode"), page),
                 Ok(None) => return Ter::TEC_DIR_FULL,
                 Err(_) => return Ter::TEF_BAD_LEDGER,
@@ -3271,7 +3384,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             if mpt_result != Ter::TES_SUCCESS {
                 return mpt_result;
             }
+            let reserve_sponsor = match check_cash_reserve_sponsor(view, sttx) {
+                Ok(sponsor) => sponsor,
+                Err(ter) => return ter,
+            };
 
+            let mut delivered_amount = None;
             if requested.native() {
                 // The Check will be removed below, so release one owner-reserve
                 // increment before calculating what its source can send.
@@ -3301,20 +3419,261 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 if !is_tes_success(result) {
                     return result;
                 }
+                if source != destination && deliver_min_present {
+                    delivered_amount = Some(STAmount::from_xrp_amount(xrp_deliver));
+                }
+            } else if matches!(requested.asset(), Asset::Issue(_)) {
+                // CheckCash.cpp runs ordinary default-path flow for IOUs. For
+                // DeliverMin it requests a deliberately unreachable maximum,
+                // allowing flow to deliver everything affordable under
+                // SendMax, then verifies the minimum afterward.
+                let flow_deliver = if deliver_min_present {
+                    STAmount::new_with_asset(
+                        sf("sfAmount"),
+                        requested.asset(),
+                        protocol::ST_AMOUNT_MAX_MANTISSA / 2,
+                        protocol::ST_AMOUNT_MAX_OFFSET,
+                        false,
+                    )
+                } else {
+                    requested.clone()
+                };
+                let Asset::Issue(issue) = requested.asset() else {
+                    unreachable!("IOU branch")
+                };
+                let mut limit_override = None;
+                if destination != issue.issuer() {
+                    let line_keylet = protocol::line(destination, issue.issuer(), issue.currency);
+                    if view.read(line_keylet).ok().flatten().is_none() {
+                        let Ok(Some(destination_sle)) = view.peek(protocol::account_keylet(
+                            Uint160::from_void(destination.data()),
+                        )) else {
+                            return Ter::TEF_BAD_LEDGER;
+                        };
+                        match check_cash_has_object_reserve(
+                            view,
+                            &destination_sle,
+                            pre_fee_balance_drops,
+                            reserve_sponsor.as_ref(),
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => return Ter::TEC_NO_LINE_INSUF_RESERVE,
+                            Err(ter) => return ter,
+                        }
+                        let limit = STAmount::new_with_asset(
+                            sf("sfLimitAmount"),
+                            protocol::Asset::Issue(protocol::Issue::new(
+                                issue.currency,
+                                destination,
+                            )),
+                            0,
+                            0,
+                            false,
+                        );
+                        let create = crate::state::trust_set::trust_create(
+                            view,
+                            destination > issue.issuer(),
+                            &destination,
+                            &issue.issuer(),
+                            line_keylet.key,
+                            &destination_sle,
+                            false,
+                            !destination_sle.is_flag(protocol::lsfDefaultRipple),
+                            false,
+                            false,
+                            &limit,
+                            0,
+                            0,
+                            reserve_sponsor.as_ref(),
+                        );
+                        if create != Ter::TES_SUCCESS {
+                            return create;
+                        }
+                        if let Err(ter) = consume_check_cash_sponsorship(
+                            view,
+                            &destination,
+                            reserve_sponsor.as_ref(),
+                        ) {
+                            return ter;
+                        }
+                    }
+                    let Ok(Some(line)) = view.peek(line_keylet) else {
+                        return Ter::TEC_NO_LINE;
+                    };
+                    let limit_field = if destination < issue.issuer() {
+                        sf("sfLowLimit")
+                    } else {
+                        sf("sfHighLimit")
+                    };
+                    let saved_limit = line.get_field_amount(limit_field);
+                    let mut updated = line.clone_as_object();
+                    updated.set_field_amount(
+                        limit_field,
+                        STAmount::new_with_asset(
+                            limit_field,
+                            saved_limit.asset(),
+                            protocol::ST_AMOUNT_MAX_MANTISSA,
+                            protocol::ST_AMOUNT_MAX_OFFSET,
+                            false,
+                        ),
+                    );
+                    if view
+                        .update(Arc::new(STLedgerEntry::from_stobject(updated, *line.key())))
+                        .is_err()
+                    {
+                        return Ter::TEF_BAD_LEDGER;
+                    }
+                    limit_override = Some((*line.key(), limit_field, saved_limit));
+                }
+                let paths = protocol::STPathSet::new(sf("sfPaths"));
+                let (strand_ter, strands) = ledger::flow_engine::strand_builder::to_strands(
+                    &source,
+                    &destination,
+                    &flow_deliver.asset(),
+                    Some(&send_max.asset()),
+                    &paths,
+                    true,
+                    true,
+                    false,
+                );
+                if strand_ter != Ter::TES_SUCCESS {
+                    return strand_ter;
+                }
+                let flow = ledger::flow_engine::strand_flow::execute_strands(
+                    view,
+                    &strands,
+                    &flow_deliver,
+                    deliver_min_present,
+                    ledger::ripple_calc::OfferCrossing::No,
+                    Some(&send_max),
+                    &source,
+                    &destination,
+                    None,
+                    None,
+                );
+                if let Some((line_key, limit_field, saved_limit)) = limit_override
+                    && let Ok(Some(line)) = view.peek(protocol::unchecked_keylet(line_key))
+                {
+                    let mut restored = line.clone_as_object();
+                    restored.set_field_amount(limit_field, saved_limit);
+                    if view
+                        .update(Arc::new(STLedgerEntry::from_stobject(restored, line_key)))
+                        .is_err()
+                    {
+                        return Ter::TEF_BAD_LEDGER;
+                    }
+                }
+                if flow.ter != Ter::TES_SUCCESS {
+                    return flow.ter;
+                }
+                if flow.actual_out < requested {
+                    return Ter::TEC_PATH_PARTIAL;
+                }
+                delivered_amount = Some(flow.actual_out);
             } else {
-                // The complete CheckCash flow() integration remains separate
-                // infrastructure. This direct ledger path preserves the
-                // existing IOU/MPT transfer behavior; cleanup below is shared
-                // with XRP and is strict in both cases.
+                // MPT CheckCash is a single-asset endpoint transfer. Compute
+                // the maximum output whose rounded transfer-fee input remains
+                // within both SendMax and the source's current funds.
+                let Asset::MPTIssue(issue) = requested.asset() else {
+                    unreachable!("native and IOU handled above")
+                };
+                if destination != issue.issuer() {
+                    let token_keylet = protocol::mptoken_keylet_from_mptid(
+                        issue.mpt_id(),
+                        Uint160::from_void(destination.data()),
+                    );
+                    if view.read(token_keylet).ok().flatten().is_none() {
+                        let Ok(Some(destination_sle)) = view.peek(protocol::account_keylet(
+                            Uint160::from_void(destination.data()),
+                        )) else {
+                            return Ter::TEF_BAD_LEDGER;
+                        };
+                        match check_cash_has_object_reserve(
+                            view,
+                            &destination_sle,
+                            pre_fee_balance_drops,
+                            reserve_sponsor.as_ref(),
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => return Ter::TEC_INSUFFICIENT_RESERVE,
+                            Err(ter) => return ter,
+                        }
+                        let create = ledger::mptoken_helpers::check_create_mpt_with_sponsor(
+                            view,
+                            &issue,
+                            &destination,
+                            reserve_sponsor.as_ref(),
+                        )
+                        .unwrap_or(Ter::TEF_INTERNAL);
+                        if create != Ter::TES_SUCCESS {
+                            return create;
+                        }
+                        if let Err(ter) = consume_check_cash_sponsorship(
+                            view,
+                            &destination,
+                            reserve_sponsor.as_ref(),
+                        ) {
+                            return ter;
+                        }
+                    }
+                }
+                let source_funds = if source == issue.issuer() {
+                    view.read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
+                        .ok()
+                        .flatten()
+                        .map(|sle| ledger::mptoken_helpers::available_mpt_amount(&sle))
+                        .unwrap_or(0)
+                } else {
+                    view.read(protocol::mptoken_keylet_from_mptid(
+                        issue.mpt_id(),
+                        Uint160::from_void(source.data()),
+                    ))
+                    .ok()
+                    .flatten()
+                    .map(|sle| sle.get_field_u64(sf("sfMPTAmount")) as i64)
+                    .unwrap_or(0)
+                };
+                let input_cap = send_max.mpt().value().min(source_funds).max(0);
+                let third_party = source != issue.issuer() && destination != issue.issuer();
+                let rate = ledger::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
+                    .unwrap_or(protocol::PARITY_RATE);
+                let maximum_output = if third_party {
+                    ((input_cap as u128) * (protocol::QUALITY_ONE as u128) / (rate.value as u128))
+                        as i64
+                } else {
+                    input_cap
+                };
+                let output_value = if deliver_min_present {
+                    maximum_output
+                } else {
+                    requested.mpt().value()
+                };
+                if output_value < requested.mpt().value() {
+                    return Ter::TEC_PATH_PARTIAL;
+                }
+                let output = STAmount::from_mpt_amount(
+                    sf("sfAmount"),
+                    MPTAmount::from_value(output_value),
+                    issue,
+                );
+                let required_input = if third_party {
+                    protocol::multiply_round(&output, rate, true).mpt().value()
+                } else {
+                    output_value
+                };
+                if required_input > input_cap {
+                    return Ter::TEC_PATH_PARTIAL;
+                }
                 let result = ledger::ripple_state_helpers::account_send_with_fee(
                     view,
                     &source,
                     &destination,
-                    &requested,
+                    &output,
                 );
                 if !is_tes_success(result) {
                     return result;
                 }
+                delivered_amount = Some(output);
             }
 
             // CheckCash.cpp removes the destination directory first, then the
@@ -3356,6 +3715,9 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
             if view.erase(check_sle).is_err() {
                 return Ter::TEF_BAD_LEDGER;
+            }
+            if let Some(delivered_amount) = delivered_amount {
+                crate::state::payment::record_delivered_amount(delivered_amount);
             }
             Ter::TES_SUCCESS
         }
@@ -3419,14 +3781,19 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
             // Add to owner directory
             let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
-            match ledger::dir_append(view, &owner_dir, chan_keylet.key, &|_| {}) {
+            match ledger::dir_insert(
+                view,
+                &owner_dir,
+                chan_keylet.key,
+                &describe_owner_dir(account),
+            ) {
                 Ok(Some(page)) => sle.set_field_u64(sf("sfOwnerNode"), page),
                 Ok(None) => return Ter::TEC_DIR_FULL,
                 Err(_) => {}
             }
             // Add to destination's owner directory
             let dst_dir = owner_dir_keylet(Uint160::from_void(dst.data()));
-            match ledger::dir_append(view, &dst_dir, chan_keylet.key, &|_| {}) {
+            match ledger::dir_insert(view, &dst_dir, chan_keylet.key, &describe_owner_dir(dst)) {
                 Ok(Some(page)) => sle.set_field_u64(sf("sfDestinationNode"), page),
                 Ok(None) => return Ter::TEC_DIR_FULL,
                 Err(_) => {}
@@ -4833,7 +5200,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
             if is_new {
                 let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-                match ledger::dir_append(view, &owner_dir, did_keylet.key, &|_| {}) {
+                match ledger::dir_insert(
+                    view,
+                    &owner_dir,
+                    did_keylet.key,
+                    &describe_owner_dir(account),
+                ) {
                     Ok(Some(page)) => sle.set_field_u64(sf("sfOwnerNode"), page),
                     Ok(None) => return Ter::TEC_DIR_FULL,
                     Err(_) => return Ter::TEF_BAD_LEDGER,
@@ -5037,12 +5409,16 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
             sle.set_field_u32(sf("sfFlags"), tx_flags & !protocol::tfUniversal);
             let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-            let owner_node =
-                match ledger::dir_append(view, &owner_dir, issuance_keylet.key, &|_| {}) {
-                    Ok(Some(page)) => page,
-                    Ok(None) => return Ter::TEC_DIR_FULL,
-                    Err(_) => return Ter::TEF_INTERNAL,
-                };
+            let owner_node = match ledger::dir_insert(
+                view,
+                &owner_dir,
+                issuance_keylet.key,
+                &describe_owner_dir(account),
+            ) {
+                Ok(Some(page)) => page,
+                Ok(None) => return Ter::TEC_DIR_FULL,
+                Err(_) => return Ter::TEF_INTERNAL,
+            };
             sle.set_field_u64(sf("sfOwnerNode"), owner_node);
             if view.insert(Arc::new(sle)).is_err() {
                 return Ter::TEF_INTERNAL;
@@ -5425,8 +5801,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             sle.set_field_u64(sf("sfMPTAmount"), 0);
             sle.set_field_u32(sf("sfFlags"), 0);
             let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-            let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, token_keylet.key, &|_| {})
-            else {
+            let Ok(Some(page)) = ledger::dir_insert(
+                view,
+                &owner_dir,
+                token_keylet.key,
+                &describe_owner_dir(account),
+            ) else {
                 return Ter::TEC_DIR_FULL;
             };
             sle.set_field_u64(sf("sfOwnerNode"), page);
@@ -5571,9 +5951,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 ));
             }
             let issuer_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-            let Ok(Some(issuer_page)) =
-                ledger::dir_append(view, &issuer_dir, cred_keylet.key, &|_| {})
-            else {
+            let Ok(Some(issuer_page)) = ledger::dir_insert(
+                view,
+                &issuer_dir,
+                cred_keylet.key,
+                &describe_owner_dir(account),
+            ) else {
                 return Ter::TEC_DIR_FULL;
             };
             sle.set_field_u64(sf("sfIssuerNode"), issuer_page);
@@ -5585,9 +5968,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 sle.set_field_u32(sf("sfFlags"), protocol::lsfAccepted);
             } else {
                 let subject_dir = protocol::owner_dir_keylet(Uint160::from_void(subject.data()));
-                let Ok(Some(subject_page)) =
-                    ledger::dir_append(view, &subject_dir, cred_keylet.key, &|_| {})
-                else {
+                let Ok(Some(subject_page)) = ledger::dir_insert(
+                    view,
+                    &subject_dir,
+                    cred_keylet.key,
+                    &describe_owner_dir(subject),
+                ) else {
                     return Ter::TEC_DIR_FULL;
                 };
                 sle.set_field_u64(sf("sfSubjectNode"), subject_page);

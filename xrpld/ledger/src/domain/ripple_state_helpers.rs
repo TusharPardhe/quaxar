@@ -289,13 +289,23 @@ pub fn issue_iou<V: ApplyView>(
         let high_dir =
             protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(high_account.data()));
         if matches!(
-            crate::views::directory::dir_insert(view, &low_dir, line_keylet.key, &|_obj| {}),
+            crate::views::directory::dir_insert(
+                view,
+                &low_dir,
+                line_keylet.key,
+                &crate::describe_owner_dir(low_account),
+            ),
             Ok(None)
         ) {
             return Ter::TEC_DIR_FULL;
         }
         if matches!(
-            crate::views::directory::dir_insert(view, &high_dir, line_keylet.key, &|_obj| {}),
+            crate::views::directory::dir_insert(
+                view,
+                &high_dir,
+                line_keylet.key,
+                &crate::describe_owner_dir(high_account),
+            ),
             Ok(None)
         ) {
             return Ter::TEC_DIR_FULL;
@@ -753,29 +763,29 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         let new_sle = Arc::new(STLedgerEntry::from_stobject(new_obj, line_keylet.key));
 
         // Add to both owner directories
-        let low_dir = protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(
-            (if b_sender_high { receiver } else { sender }).data(),
-        ));
+        let low_account = if b_sender_high { *receiver } else { *sender };
+        let low_dir =
+            protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(low_account.data()));
         if matches!(
-            crate::dir_append(
+            crate::dir_insert(
                 view as &mut dyn ApplyView,
                 &low_dir,
                 line_keylet.key,
-                &|_| {},
+                &crate::describe_owner_dir(low_account),
             ),
             Ok(None)
         ) {
             return Ter::TEC_DIR_FULL;
         }
-        let high_dir = protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(
-            (if b_sender_high { sender } else { receiver }).data(),
-        ));
+        let high_account = if b_sender_high { *sender } else { *receiver };
+        let high_dir =
+            protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(high_account.data()));
         if matches!(
-            crate::dir_append(
+            crate::dir_insert(
                 view as &mut dyn ApplyView,
                 &high_dir,
                 line_keylet.key,
-                &|_| {},
+                &crate::describe_owner_dir(high_account),
             ),
             Ok(None)
         ) {
@@ -846,9 +856,14 @@ pub fn is_frozen<V: ApplyView>(view: &mut V, account: &AccountID, issue: &Issue)
         return false;
     };
     let flags = state.get_field_u32(sf("sfFlags"));
-    // lsfLowFreeze means the low account froze it, lsfHighFreeze means the high account froze it.
-    // Either way, the line is frozen for both parties.
-    (flags & LSF_LOW_FREEZE) != 0 || (flags & LSF_HIGH_FREEZE) != 0
+    // Only the issuer's side can freeze this holder's funds. A holder setting
+    // its own freeze flag affects the counterparty, not itself.
+    let issuer_freeze = if issue.account > *account {
+        LSF_HIGH_FREEZE
+    } else {
+        LSF_LOW_FREEZE
+    };
+    (flags & issuer_freeze) != 0
 }
 
 /// Get the credit balance on a trust line from account's perspective.
