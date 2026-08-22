@@ -27,7 +27,7 @@
 //!   `std::mutex` in practice. This port uses `parking_lot::Mutex`
 //!   directly, matching the JobQueue rewrite's established convention.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use basics::chrono::NetClockTimePoint;
@@ -383,6 +383,15 @@ struct Inner<A: ValidationsAdaptor> {
     /// Ledgers being acquired from the network, keyed by `(seq, id)`, with
     /// the set of nodes waiting on that acquisition. Matches `acquiring_`.
     acquiring: BTreeMap<(SeqOf<A>, LedgerIdOf<A>), HashSet<NodeIdOf<A>>>,
+    /// Exact trusted acquisition waiters displaced by a newer trusted
+    /// validation before their ledger completed. This makes the latest
+    /// acquired support independent of completion/validation lock ordering
+    /// without reconstructing trust provenance from historical indexes.
+    superseded_acquiring: BTreeMap<(SeqOf<A>, LedgerIdOf<A>), HashSet<NodeIdOf<A>>>,
+    /// Insertion order of superseded waiters per node. Sequence order cannot
+    /// provide this bound because `SeqEnforcer` expiry permits a later waiter
+    /// to have a lower sequence.
+    superseded_acquiring_order: HashMap<NodeIdOf<A>, VecDeque<(SeqOf<A>, LedgerIdOf<A>)>>,
 }
 
 impl<A: ValidationsAdaptor> Inner<A> {
@@ -398,12 +407,75 @@ impl<A: ValidationsAdaptor> Inner<A> {
             trie: LedgerTrie::new(),
             last_ledger: HashMap::new(),
             acquiring: BTreeMap::new(),
+            superseded_acquiring: BTreeMap::new(),
+            superseded_acquiring_order: HashMap::new(),
+        }
+    }
+
+    fn remove_superseded_for_node(&mut self, node_id: &NodeIdOf<A>) {
+        self.superseded_acquiring.retain(|_, nodes| {
+            nodes.remove(node_id);
+            !nodes.is_empty()
+        });
+        self.superseded_acquiring_order.remove(node_id);
+    }
+
+    fn record_superseded(&mut self, node_id: &NodeIdOf<A>, key: (SeqOf<A>, LedgerIdOf<A>)) {
+        const MAX_SUPERSEDED_ACQUIRING_PER_NODE: usize = 8;
+        let inserted = self
+            .superseded_acquiring
+            .entry(key.clone())
+            .or_default()
+            .insert(node_id.clone());
+        if !inserted {
+            return;
+        }
+
+        let evicted = {
+            let order = self
+                .superseded_acquiring_order
+                .entry(node_id.clone())
+                .or_default();
+            order.push_back(key);
+            let mut evicted = Vec::new();
+            while order.len() > MAX_SUPERSEDED_ACQUIRING_PER_NODE {
+                if let Some(oldest) = order.pop_front() {
+                    evicted.push(oldest);
+                }
+            }
+            evicted
+        };
+        for oldest in evicted {
+            if let Some(nodes) = self.superseded_acquiring.get_mut(&oldest) {
+                nodes.remove(node_id);
+                if nodes.is_empty() {
+                    self.superseded_acquiring.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    fn consume_superseded_key_for_node(
+        &mut self,
+        node_id: &NodeIdOf<A>,
+        key: &(SeqOf<A>, LedgerIdOf<A>),
+    ) {
+        let remove_order = self
+            .superseded_acquiring_order
+            .get_mut(node_id)
+            .is_some_and(|order| {
+                order.retain(|candidate| candidate != key);
+                order.is_empty()
+            });
+        if remove_order {
+            self.superseded_acquiring_order.remove(node_id);
         }
     }
 
     /// Remove support of a validated ledger from the trie. Matches
     /// `removeTrie`.
     fn remove_trie(&mut self, node_id: &NodeIdOf<A>, val: &A::Validation) {
+        self.remove_superseded_for_node(node_id);
         let key = (val.seq(), val.ledger_id());
         if let Some(set) = self.acquiring.get_mut(&key) {
             set.remove(node_id);
@@ -469,12 +541,20 @@ impl<A: ValidationsAdaptor> Inner<A> {
             "update_trie_validation: input validation must be trusted"
         );
 
-        if let Some(prior_key) = prior
-            && let Some(set) = self.acquiring.get_mut(&prior_key)
-        {
-            set.remove(node_id);
-            if set.is_empty() {
+        if let Some(prior_key) = prior {
+            let removed_exact_trusted_waiter = self
+                .acquiring
+                .get_mut(&prior_key)
+                .is_some_and(|set| set.remove(node_id));
+            if self
+                .acquiring
+                .get(&prior_key)
+                .is_some_and(HashSet::is_empty)
+            {
                 self.acquiring.remove(&prior_key);
+            }
+            if removed_exact_trusted_waiter {
+                self.record_superseded(node_id, prior_key);
             }
         }
 
@@ -553,9 +633,15 @@ impl<A: ValidationsAdaptor> Validations<A> {
     /// Reconcile a ledger that has just become available to the validation
     /// tracker.
     ///
-    /// Only validators still waiting on this exact `(sequence, id)` may enter
-    /// the trie. A newer validation removes the older waiter; a late completion
-    /// of that superseded ledger must not resurrect historical support.
+    /// A live exact waiter may install its ledger whenever that validator's
+    /// current validation remains trusted; membership in `acquiring` is the
+    /// exact trusted provenance. A late completion may also advance support for
+    /// an explicitly retained exact trusted waiter that a newer trusted
+    /// validation displaced. That provenance is insertion-order bounded,
+    /// consumed once, and never reconstructed from historical validation
+    /// indexes; the newer current waiter remains pending. Superseded
+    /// completions cannot downgrade resident support or cross a same-sequence
+    /// hash conflict.
     pub fn on_ledger_acquired(&self, ledger: A::Ledger) {
         let ledger_id = ledger.id();
         let ledger_seq = ledger.seq();
@@ -563,21 +649,39 @@ impl<A: ValidationsAdaptor> Validations<A> {
         let mut inner = self.inner.lock();
         let _ = inner.current_live(&self.adaptor, &self.parms);
 
-        let nodes = inner.acquiring.remove(&key).unwrap_or_default();
-
-        for node_id in nodes {
+        let exact_nodes = inner.acquiring.remove(&key).unwrap_or_default();
+        for node_id in exact_nodes {
             let current_is_trusted = inner
                 .current
                 .get(&node_id)
-                .is_some_and(|validation| validation.trusted());
-            if !current_is_trusted {
+                .is_some_and(|current| current.trusted());
+            if current_is_trusted {
+                // The live acquiring membership already proves this was an
+                // exact trusted waiter. Preserve the reference behavior when
+                // its current validation has since changed but remains trusted.
+                inner.update_trie_ledger(&node_id, ledger.clone());
+            }
+        }
+
+        let superseded_nodes = inner.superseded_acquiring.remove(&key).unwrap_or_default();
+        for node_id in superseded_nodes {
+            inner.consume_superseded_key_for_node(&node_id, &key);
+            let eligible = inner.current.get(&node_id).is_some_and(|current| {
+                current.trusted()
+                    && (current.seq() > ledger_seq
+                        || (current.seq() == ledger_seq && current.ledger_id() == ledger_id))
+            });
+            let advances_resident = inner
+                .last_ledger
+                .get(&node_id)
+                .is_none_or(|resident| resident.seq() < ledger_seq);
+            if !eligible || !advances_resident {
                 continue;
             }
 
-            // SeqEnforcer expiry permits a validator to resume at a lower
-            // sequence. While that ledger is acquired, its prior (higher)
-            // resident remains in the trie. Completion must therefore replace
-            // residency unconditionally, exactly like checkAcquired/updateTrie.
+            // This exact trusted waiter was displaced before acquisition
+            // completed. Advance the latest acquired support without consuming
+            // the validator's newer current waiter.
             inner.update_trie_ledger(&node_id, ledger.clone());
         }
     }
@@ -1086,7 +1190,10 @@ impl<A: ValidationsAdaptor> Validations<A> {
 
     /// Clear all current validations. Matches `flush`.
     pub fn flush(&self) {
-        self.inner.lock().current.clear();
+        let mut inner = self.inner.lock();
+        inner.current.clear();
+        inner.superseded_acquiring.clear();
+        inner.superseded_acquiring_order.clear();
     }
 
     /// Count lagging trusted proposers, removing seen-online proposers
@@ -1439,11 +1546,11 @@ mod tests {
     }
 
     #[test]
-    fn late_acquisition_does_not_restore_superseded_validation() {
+    fn late_acquisition_retains_latest_acquired_support_after_current_validation_advances() {
         let adaptor = MockAdaptor::new(1000);
         let genesis = MockLedger::genesis_();
         let first = genesis.child(1);
-        let second = first.child(2);
+        let second = ledger_at(2, 99);
         let validations = Validations::new(ValidationParms::default(), adaptor);
 
         assert_eq!(
@@ -1473,13 +1580,41 @@ mod tests {
         validations.on_ledger_acquired(first.clone());
         {
             let inner = validations.inner.lock();
-            assert!(inner.last_ledger.is_empty());
+            assert_eq!(
+                inner.last_ledger.get(&1).map(ValidationsLedger::id),
+                Some(first.id())
+            );
+            assert_eq!(
+                inner.last_ledger.get(&2).map(ValidationsLedger::id),
+                Some(first.id())
+            );
+            assert!(inner.acquiring.contains_key(&(second.seq(), second.id())));
+            assert!(
+                !inner
+                    .superseded_acquiring
+                    .contains_key(&(first.seq(), first.id()))
+            );
+        }
+
+        // Superseded provenance is one-shot. A duplicate completion neither
+        // re-adds support nor consumes the newer exact waiter.
+        validations.on_ledger_acquired(first.clone());
+        {
+            let inner = validations.inner.lock();
+            assert_eq!(
+                inner.last_ledger.get(&1).map(ValidationsLedger::id),
+                Some(first.id())
+            );
+            assert_eq!(
+                inner.last_ledger.get(&2).map(ValidationsLedger::id),
+                Some(first.id())
+            );
             assert!(inner.acquiring.contains_key(&(second.seq(), second.id())));
         }
 
         assert_eq!(
             validations.get_preferred(&genesis),
-            Some((second.seq(), second.id()))
+            Some((genesis.seq(), genesis.id()))
         );
 
         validations.adaptor().register_ledger(second.clone());
@@ -1494,6 +1629,234 @@ mod tests {
             Some(second.id())
         );
         assert!(inner.acquiring.is_empty());
+    }
+
+    #[test]
+    fn live_trusted_waiter_completes_after_untrusted_current_becomes_trusted() {
+        let adaptor = MockAdaptor::new(1000);
+        let first = ledger_at(1, 10);
+        let second = ledger_at(2, 20);
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(first.id(), first.seq(), 1000, 1, 100)),
+            ValStatus::Current
+        );
+        let mut untrusted_second = val(second.id(), second.seq(), 1001, 1, 100);
+        untrusted_second.trusted = false;
+        assert_eq!(validations.add(1, untrusted_second), ValStatus::Current);
+        {
+            let inner = validations.inner.lock();
+            assert!(inner.acquiring.contains_key(&(first.seq(), first.id())));
+            assert!(!inner.acquiring.contains_key(&(second.seq(), second.id())));
+        }
+
+        validations.trust_changed(&HashSet::from([1]), &HashSet::new());
+        {
+            let inner = validations.inner.lock();
+            assert!(inner.acquiring.contains_key(&(first.seq(), first.id())));
+            assert!(inner.acquiring.contains_key(&(second.seq(), second.id())));
+        }
+
+        validations.adaptor().register_ledger(first.clone());
+        validations.on_ledger_acquired(first.clone());
+        let inner = validations.inner.lock();
+        assert_eq!(
+            inner.last_ledger.get(&1).map(ValidationsLedger::id),
+            Some(first.id())
+        );
+        assert!(inner.acquiring.contains_key(&(second.seq(), second.id())));
+    }
+
+    #[test]
+    fn superseded_waiter_bound_uses_insertion_order_across_sequence_reset() {
+        let validations = Validations::new(ValidationParms::default(), MockAdaptor::new(1000));
+        let node_id = 1;
+        let oldest = (100, 10);
+        {
+            let mut inner = validations.inner.lock();
+            for offset in 0..8 {
+                inner.record_superseded(&node_id, (100 + offset, 10 + offset as u8));
+            }
+
+            // A post-expiry SeqEnforcer reset may produce a newer insertion
+            // whose sequence sorts before all existing records.
+            let after_reset = (1, 99);
+            inner.record_superseded(&node_id, after_reset);
+
+            assert!(
+                !inner
+                    .superseded_acquiring
+                    .get(&oldest)
+                    .is_some_and(|nodes| nodes.contains(&node_id))
+            );
+            assert!(
+                inner
+                    .superseded_acquiring
+                    .get(&after_reset)
+                    .is_some_and(|nodes| nodes.contains(&node_id))
+            );
+            assert_eq!(
+                inner
+                    .superseded_acquiring_order
+                    .get(&node_id)
+                    .map(VecDeque::len),
+                Some(8)
+            );
+        }
+
+        validations.flush();
+        let inner = validations.inner.lock();
+        assert!(inner.superseded_acquiring.is_empty());
+        assert!(inner.superseded_acquiring_order.is_empty());
+    }
+
+    #[test]
+    fn untrusted_history_cannot_become_delayed_acquisition_provenance() {
+        let adaptor = MockAdaptor::new(1000);
+        let genesis = MockLedger::genesis_();
+        let untrusted_ledger = genesis.child(1);
+        let trusted_current = ledger_at(2, 99);
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        let mut untrusted = val(untrusted_ledger.id(), untrusted_ledger.seq(), 1000, 1, 100);
+        untrusted.trusted = false;
+        assert_eq!(validations.add(1, untrusted), ValStatus::Current);
+        assert_eq!(
+            validations.add(
+                1,
+                val(trusted_current.id(), trusted_current.seq(), 1001, 1, 100,),
+            ),
+            ValStatus::Current
+        );
+
+        validations
+            .adaptor()
+            .register_ledger(untrusted_ledger.clone());
+        validations.on_ledger_acquired(untrusted_ledger);
+        let inner = validations.inner.lock();
+        assert!(inner.last_ledger.is_empty());
+        assert!(
+            inner
+                .acquiring
+                .contains_key(&(trusted_current.seq(), trusted_current.id()))
+        );
+    }
+
+    #[test]
+    fn same_sequence_conflict_after_enforcer_expiry_cannot_backfill_old_hash() {
+        let adaptor = MockAdaptor::new(1000);
+        let first = ledger_at(1, 10);
+        let conflicting = ledger_at(1, 20);
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(first.id(), first.seq(), 1000, 1, 100)),
+            ValStatus::Current
+        );
+        {
+            let mut inner = validations.inner.lock();
+            inner.seq_enforcers.get_mut(&1).unwrap().when = Some(
+                Instant::now()
+                    - validations.parms().validation_set_expires
+                    - Duration::from_secs(1),
+            );
+        }
+        validations.adaptor().set_now(1301);
+        assert_eq!(
+            validations.add(1, val(conflicting.id(), conflicting.seq(), 1301, 1, 100),),
+            ValStatus::Current
+        );
+
+        validations.adaptor().register_ledger(first.clone());
+        validations.on_ledger_acquired(first);
+        {
+            let inner = validations.inner.lock();
+            assert!(inner.last_ledger.is_empty());
+            assert!(
+                inner
+                    .acquiring
+                    .contains_key(&(conflicting.seq(), conflicting.id()))
+            );
+        }
+
+        validations.adaptor().register_ledger(conflicting.clone());
+        validations.on_ledger_acquired(conflicting.clone());
+        assert_eq!(
+            validations
+                .inner
+                .lock()
+                .last_ledger
+                .get(&1)
+                .map(ValidationsLedger::id),
+            Some(conflicting.id())
+        );
+    }
+
+    #[test]
+    fn delayed_validated_completion_advances_stale_trie_without_overriding_current_waiter() {
+        let adaptor = MockAdaptor::new(1000);
+        let genesis = MockLedger::genesis_();
+        let stale = genesis.child(1);
+        let completed = stale.child(2);
+        let current = completed.child(3);
+        adaptor.register_ledger(stale.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        for node_id in 1..=3 {
+            assert_eq!(
+                validations.add(
+                    node_id,
+                    val(stale.id(), stale.seq(), 1000, node_id, node_id)
+                ),
+                ValStatus::Current
+            );
+            assert_eq!(
+                validations.add(
+                    node_id,
+                    val(completed.id(), completed.seq(), 1001, node_id, node_id)
+                ),
+                ValStatus::Current
+            );
+            assert_eq!(
+                validations.add(
+                    node_id,
+                    val(current.id(), current.seq(), 1002, node_id, node_id)
+                ),
+                ValStatus::Current
+            );
+        }
+
+        let before =
+            validations.get_preferred_lcl_diagnostic(&genesis, completed.seq(), &BTreeMap::new());
+        assert_eq!(before.trie_preferred, Some((stale.seq(), stale.id())));
+        assert_eq!(
+            before.selection_source,
+            PreferredLclSelectionSource::LocalBelowMinSeq
+        );
+        assert_eq!(
+            before.acquiring_preferred,
+            Some((current.seq(), current.id()))
+        );
+
+        validations.adaptor().register_ledger(completed.clone());
+        validations.on_ledger_acquired(completed.clone());
+
+        let after =
+            validations.get_preferred_lcl_diagnostic(&genesis, completed.seq(), &BTreeMap::new());
+        assert_eq!(
+            after.trie_preferred,
+            Some((completed.seq(), completed.id()))
+        );
+        assert_eq!(after.selected, completed.id());
+        assert_eq!(
+            after.selection_source,
+            PreferredLclSelectionSource::WorkingPreferred
+        );
+        assert_eq!(
+            after.acquiring_preferred,
+            Some((current.seq(), current.id()))
+        );
     }
 
     #[test]
