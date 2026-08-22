@@ -331,25 +331,35 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         }
         for (key, entry) in self.items {
             match entry.action {
-                Action::Insert | Action::Modify => {
+                Action::Insert => {
                     let threaded = Arc::new(crate::apply_state_table::thread_sle(
                         entry.sle.as_ref(),
                         tx_id,
                         ledger_seq,
                         rules,
                     ));
-                    if entry.action == Action::Insert {
-                        self.parent.insert(threaded)?;
-                    } else {
-                        let keylet = Keylet::new(threaded.get_type(), key);
-                        if self.parent.peek(keylet)?.is_none() {
-                            return Err(ViewError::Conversion(
-                                "FlowSandbox::apply_with_tx_thread: modified parent entry disappeared"
-                                    .into(),
-                            ));
-                        }
-                        self.parent.update(threaded)?;
+                    self.parent.insert(threaded)?;
+                }
+                Action::Modify => {
+                    let keylet = Keylet::new(entry.sle.get_type(), key);
+                    let original = self.parent.peek(keylet)?.ok_or_else(|| {
+                        ViewError::Conversion(
+                            "FlowSandbox::apply_with_tx_thread: modified parent entry disappeared"
+                                .into(),
+                        )
+                    })?;
+                    // rippled skips a no-op ModifiedNode before threadItem.
+                    // Keep state commit aligned with to_tx_meta's same check.
+                    if entry.sle.as_ref() == original.as_ref() {
+                        continue;
                     }
+                    self.parent
+                        .update(Arc::new(crate::apply_state_table::thread_sle(
+                            entry.sle.as_ref(),
+                            tx_id,
+                            ledger_seq,
+                            rules,
+                        )))?;
                 }
                 Action::Erase => {
                     let keylet = Keylet::new(entry.sle.get_type(), key);
@@ -888,6 +898,46 @@ mod tests {
                 && node.get_field_h256(protocol::get_field_by_symbol("sfLedgerIndex"))
                     == insert_keylet.key
         }));
+    }
+
+    #[test]
+    fn no_op_modify_is_neither_threaded_nor_reported() {
+        let keylet = Keylet::new(LedgerEntryType::RippleState, Uint256::from_u64(0xB6E1));
+        let mut original = STLedgerEntry::new(keylet);
+        let prior_tx = Uint256::from_u64(0x347A);
+        original.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), prior_tx);
+        original.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), 41);
+
+        let mut base = Ledger::new(LedgerHeader::default(), false);
+        base.raw_insert(Arc::new(original.clone()))
+            .expect("seed trust line");
+        let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::default());
+        let rules = parent.rules();
+        let current_tx = Uint256::from_u64(0xA5EA);
+
+        let metadata = {
+            let mut delta = FlowSandbox::new(&mut parent);
+            delta
+                .raw_replace(Arc::new(original.clone()))
+                .expect("stage redundant TrustSet result");
+            let metadata = delta
+                .to_tx_meta(current_tx, 42, None, &rules)
+                .expect("metadata");
+            delta
+                .apply_with_tx_thread(current_tx, 42, &rules)
+                .expect("commit");
+            metadata
+        };
+
+        assert!(metadata.get_nodes().is_empty());
+        let retained = ReadView::read(&parent, keylet)
+            .expect("read trust line")
+            .expect("trust line remains");
+        assert_eq!(
+            retained.as_ref(),
+            &original,
+            "redundant TrustSet must retain the existing transaction thread"
+        );
     }
 
     #[test]

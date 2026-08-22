@@ -2539,7 +2539,7 @@ impl Ledger {
                 err = peek_result.is_err(),
                 "[skip_list] per-256 skip list peek"
             );
-            if let Ok(Some(sle)) = peek_result {
+            if let Some(sle) = peek_result? {
                 let mut hashes = sle.get_field_v256(get_field_by_symbol("sfHashes"));
                 assert!(hashes.value().len() <= 256);
                 hashes.push_back(*self.header.parent_hash.as_uint256());
@@ -2575,7 +2575,7 @@ impl Ledger {
             err = peek_result.is_err(),
             "[skip_list] global skip list peek"
         );
-        if let Ok(Some(sle)) = peek_result {
+        if let Some(sle) = peek_result? {
             let old_hashes = sle.get_field_v256(get_field_by_symbol("sfHashes"));
             let mut new_values: Vec<Uint256> = old_hashes.value().to_vec();
             assert!(new_values.len() <= 256);

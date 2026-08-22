@@ -438,16 +438,12 @@ impl ApplyStateTable {
                         &mut owner_threads,
                     )?;
                 }
-                Action::Insert | Action::Modify => {
+                Action::Insert => {
                     let threaded =
                         Arc::new(thread_sle(entry.sle.as_ref(), tx_id, ledger_seq, rules));
                     let serializer = threaded.get_serializer();
                     let payload = serializer.data();
-                    let op = if entry.action == Action::Insert {
-                        crate::StateBatchOp::Insert
-                    } else {
-                        crate::StateBatchOp::Update
-                    };
+                    let op = crate::StateBatchOp::Insert;
                     if crate::full_sync_debug_enabled() {
                         tracing::debug!(target: "ledger",                            "[full_debug][tx_thread_payload] ledger_seq={} txid={} op={:?} key={} type={:?} bytes={} first16={} hex={}",
                             ledger_seq,
@@ -470,6 +466,24 @@ impl ApplyStateTable {
                         );
                     }
                     batch_ops.push((op, threaded));
+                }
+                Action::Modify => {
+                    let original = to
+                        .read(Keylet::new(entry.sle.get_type(), *key))?
+                        .ok_or_else(|| {
+                            invariant_error(
+                                "ApplyStateTable::apply_with_tx_thread: modified entry disappeared",
+                            )
+                        })?;
+                    // ApplyStateTable.cpp skips unchanged ModifiedNodes before
+                    // threadItem. Threading a no-op would mutate only the
+                    // PreviousTxn fields and create a deterministic fork.
+                    if entry.sle.as_ref() == original.as_ref() {
+                        continue;
+                    }
+                    let threaded =
+                        Arc::new(thread_sle(entry.sle.as_ref(), tx_id, ledger_seq, rules));
+                    batch_ops.push((crate::StateBatchOp::Update, threaded));
                 }
                 Action::Cache => {}
             }
@@ -520,12 +534,21 @@ impl ApplyStateTable {
             }
 
             let owner_sle = match self.items.get(&keylet.key) {
-                // The transaction's own material AccountRoot update is
-                // threaded by the regular Insert/Modify path.
+                // Inserts and material AccountRoot modifications are threaded
+                // by the regular path. An unchanged Modify is skipped there,
+                // but rippled's later threadOwners/getForMod pass still
+                // threads that same owner entry.
                 Some(StateEntry {
-                    action: Action::Insert | Action::Modify,
+                    action: Action::Insert,
                     ..
                 }) => continue,
+                Some(StateEntry {
+                    action: Action::Modify,
+                    sle,
+                }) => match to.read(keylet)? {
+                    Some(original) if original.as_ref() == sle.as_ref() => Some(sle.clone()),
+                    _ => continue,
+                },
                 // A deleted owner cannot be threaded.
                 Some(StateEntry {
                     action: Action::Erase,
@@ -627,6 +650,7 @@ mod tests {
     use protocol::{Keylet, LedgerEntryType, STLedgerEntry, XRPAmount};
 
     use super::{Action, ApplyStateTable, StateEntry};
+    use crate::Ledger;
     use crate::raw_view::RawView;
     use crate::read_view::ViewError;
     use crate::{Fees, LedgerHeader, ReadView, ReadViewTx, Rules};
@@ -749,5 +773,43 @@ mod tests {
             .expect("threaded erase batch should apply through generic RawView");
 
         assert_eq!(view.erased_types, vec![LedgerEntryType::Offer]);
+    }
+
+    #[test]
+    fn threaded_apply_skips_unchanged_modify() {
+        let keylet = Keylet::new(LedgerEntryType::RippleState, Uint256::from_u64(0x51));
+        let mut original = STLedgerEntry::new(keylet);
+        original.set_field_h256(
+            protocol::get_field_by_symbol("sfPreviousTxnID"),
+            Uint256::from_u64(0x347A),
+        );
+        original.set_field_u32(protocol::get_field_by_symbol("sfPreviousTxnLgrSeq"), 41);
+
+        let mut target = Ledger::new(LedgerHeader::default(), false);
+        target
+            .raw_insert(Arc::new(original.clone()))
+            .expect("seed unchanged trust line");
+        let mut table = ApplyStateTable::new();
+        table
+            .replace(&target, Arc::new(original.clone()))
+            .expect("stage redundant modification");
+
+        table
+            .apply_with_tx_thread(
+                &mut target,
+                Uint256::from_u64(0xA5EA),
+                42,
+                &Rules::default(),
+            )
+            .expect("unchanged modification should be ignored");
+
+        let retained = ReadView::read(&target, keylet)
+            .expect("read trust line")
+            .expect("trust line remains");
+        assert_eq!(
+            retained.as_ref(),
+            &original,
+            "a no-op modification must retain its prior transaction thread"
+        );
     }
 }
