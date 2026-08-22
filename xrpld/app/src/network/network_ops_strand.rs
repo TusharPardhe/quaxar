@@ -2341,6 +2341,7 @@ fn check_accept_and_advance(
                     // not merely cache-and-skip it, or the missing range can
                     // remain incomplete forever.
                     if let Some(ledger) = root.resolve_ledger_by_hash(sha_hash) {
+                        let ledger = root.ledger_with_node_fetcher(ledger);
                         let _ = persist_completed_inbound_ledger(
                             root,
                             &lm,
@@ -2378,6 +2379,7 @@ fn check_accept_and_advance(
                     let already_in_progress = shared_inbound.has_entry_for_seq_or_hash(seq, &hash);
                     if let Some(ledger) = shared_inbound.acquire(hash, seq, AcquireReason::History)
                     {
+                        let ledger = root.ledger_with_node_fetcher(ledger);
                         let _ = persist_completed_inbound_ledger(
                             root,
                             &lm,
@@ -2835,13 +2837,15 @@ fn history_hash_from_reference_or_candidate(
         return None;
     }
     let candidate_hash = history_hash_from_reference(reference, candidate_seq)?;
-    let candidate = root.resolve_ledger_by_hash(candidate_hash).or_else(|| {
-        shared_inbound.acquire(
-            *candidate_hash.as_uint256(),
-            candidate_seq,
-            AcquireReason::History,
-        )
-    })?;
+    let candidate = root.ledger_with_node_fetcher(
+        root.resolve_ledger_by_hash(candidate_hash).or_else(|| {
+            shared_inbound.acquire(
+                *candidate_hash.as_uint256(),
+                candidate_seq,
+                AcquireReason::History,
+            )
+        })?,
+    );
     if candidate.header().seq != candidate_seq {
         tracing::warn!(
             target: "history",
@@ -3271,6 +3275,109 @@ mod tests {
             "completion consumers must not replace the canonical readable ledger with the acquisition Arc",
         );
         inbound.stop();
+    }
+
+    #[test]
+    fn history_resolution_repairs_same_hash_cache_replacement_before_weak_child_read() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let runtime = root.attach_default_ledger_master_runtime();
+        let _store_dir = install_test_node_store(&mut root);
+
+        let key =
+            Uint256::from_hex("2200000000000000000000000000000000000000000000000000000000000000")
+                .expect("state key should parse");
+        let leaf = basics::intrusive_pointer::make_shared_intrusive(
+            shamap::tree_node::SHAMapTreeNode::new_leaf(
+                shamap::tree_node::SHAMapNodeType::AccountState,
+                shamap::item::SHAMapItem::new(key, vec![0x24; 12]),
+                0,
+            ),
+        );
+        root.node_writer_result_from_store()
+            .expect("test node store writer")(
+            ledger::LedgerNodeObjectType::AccountNode,
+            *leaf.get_hash().as_uint256(),
+            leaf.serialize_with_prefix()
+                .expect("leaf should serialize for node store"),
+            12,
+        )
+        .expect("leaf should persist");
+
+        // Model an acquisition ledger after its strong child was released:
+        // the backed root retains only the child's hash and the Ledger object
+        // itself carries no NodeStore fetch seam.
+        let weak_root = basics::intrusive_pointer::make_shared_intrusive(
+            shamap::tree_node::SHAMapTreeNode::new_inner(1),
+        );
+        weak_root.set_child_hash(2, leaf.get_hash());
+        weak_root.update_hash();
+        let mut header = LedgerHeader {
+            seq: 12,
+            account_hash: weak_root.get_hash(),
+            close_time: 112,
+            close_time_resolution: 30,
+            ..LedgerHeader::default()
+        };
+        header.hash = calculate_ledger_hash(&header);
+        let mut raw = Ledger::from_maps(
+            header,
+            shamap::sync::SyncTree::from_root_with_type(
+                weak_root,
+                shamap::sync::SHAMapType::State,
+                true,
+                12,
+                shamap::sync::SyncState::Immutable,
+            ),
+            shamap::sync::SyncTree::new_with_type(shamap::sync::SHAMapType::Transaction, true, 12),
+        );
+        raw.set_immutable(true);
+        let raw = Arc::new(raw);
+        let hash = raw.header().hash;
+
+        let readable = root.ledger_with_node_fetcher(Arc::clone(&raw));
+        runtime
+            .ledger_master()
+            .ledger_history()
+            .insert(readable, false);
+        runtime
+            .ledger_master()
+            .ledger_history()
+            .insert(Arc::clone(&raw), false);
+        assert!(
+            !runtime
+                .ledger_master()
+                .ledger_history()
+                .get_cached_ledger_by_hash(hash)
+                .expect("raw replacement should be cached")
+                .has_node_fetcher(),
+            "the regression requires a same-hash no-fetcher replacement",
+        );
+
+        let resolved = root
+            .resolve_ledger_by_hash(hash)
+            .expect("same-hash history ledger should resolve");
+        assert!(resolved.has_node_fetcher());
+        let _ = persist_completed_inbound_ledger(
+            &root,
+            runtime.ledger_master().as_ref(),
+            &resolved,
+            AcquireReason::Generic,
+        );
+        let retained = runtime
+            .ledger_master()
+            .ledger_history()
+            .get_cached_ledger_by_hash(hash)
+            .expect("normalized history ledger should replace the raw cache entry");
+        assert!(retained.has_node_fetcher());
+        let fetcher = retained
+            .node_fetcher_closure()
+            .expect("normalized history reference should retain its fetcher");
+        let item = retained
+            .state_map()
+            .peek_item(key, &mut |child_hash| fetcher(child_hash))
+            .expect("weak child should reload through the durable fetch seam")
+            .expect("stored weak child should contain the requested item");
+        assert_eq!(item.key(), key);
     }
 
     #[test]

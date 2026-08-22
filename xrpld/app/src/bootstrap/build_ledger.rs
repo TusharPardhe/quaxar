@@ -523,7 +523,10 @@ fn build_ledger_from_acquired_tx_with_order(
     tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
     replay_order: Option<Vec<ledger::ReplayTransaction>>,
 ) -> Option<ledger::Ledger> {
-    use crate::state::application_root::{apply_submit_transactor_shell, queue_apply_preclaim_ter};
+    use crate::state::application_root::{
+        apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim,
+        queue_apply_preclaim_ter,
+    };
     use std::sync::Arc;
 
     let build_num = BUILD_DETAIL_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -702,11 +705,18 @@ fn build_ledger_from_acquired_tx_with_order(
             built.header().drops
         );
         let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell(&mut view, sttx, txn_type)
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+                &mut view,
+                sttx,
+                txn_type,
+                protocol::ApplyFlags::NONE,
+                preclaim,
+            )
         }));
 
         match apply_result {
-            Ok(ter) if protocol::is_tes_success(ter) || protocol::is_tec_claim(ter) => {
+            Ok(outcome) if outcome.applied => {
+                let ter = outcome.result;
                 // === DEBUG: Log sandbox modifications before apply ===
                 let mods = view.modification_summary();
                 tracing::debug!(target: "ledger",
@@ -795,7 +805,8 @@ fn build_ledger_from_acquired_tx_with_order(
                     );
                 }
             }
-            Ok(ter) => {
+            Ok(outcome) => {
+                let ter = outcome.result;
                 tracing::debug!(target: "ledger",
                     "[build] SKIP unapplied tx_index={}/{} type={} ter={:?}",
                     tx_index, tx_count, tx_type_name, ter
@@ -1036,7 +1047,8 @@ pub fn build_ledger_from_consensus(
     >,
 ) -> Option<ledger::Ledger> {
     use crate::state::application_root::{
-        apply_submit_transactor_shell_with_delivered_amount, queue_apply_preclaim_ter,
+        apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim,
+        queue_apply_preclaim_ter,
     };
     use std::sync::Arc;
 
@@ -1117,13 +1129,19 @@ pub fn build_ledger_from_consensus(
         let base = Arc::new(accum.clone());
         let mut view = ledger::Sandbox::new(base, protocol::ApplyFlags::default());
         let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell_with_delivered_amount(&mut view, &sttx, txn_type)
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+                &mut view,
+                &sttx,
+                txn_type,
+                protocol::ApplyFlags::NONE,
+                preclaim,
+            )
         }));
 
         match apply_result {
-            Ok((ter, delivered_amount))
-                if protocol::is_tes_success(ter) || protocol::is_tec_claim(ter) =>
-            {
+            Ok(outcome) if outcome.applied => {
+                let ter = outcome.result;
+                let delivered_amount = outcome.delivered_amount;
                 // Match rippled ApplyStateTable::apply ordering: derive the
                 // TransactionMd payload from the uncommitted delta, thread and
                 // commit its state, then record the accepted transaction in
@@ -1152,8 +1170,8 @@ pub fn build_ledger_from_consensus(
                     return None;
                 }
             }
-            Ok(ter) => {
-                tracing::debug!(target: "consensus", "SKIP unapplied replay tx={} ter={:?}", tx_id, ter);
+            Ok(outcome) => {
+                tracing::debug!(target: "consensus", "SKIP unapplied replay tx={} ter={:?}", tx_id, outcome.result);
             }
             Err(_) => {
                 // Skip panicking transactions (reference catches exceptions)

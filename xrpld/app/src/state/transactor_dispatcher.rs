@@ -2428,25 +2428,15 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 Err(_) => return Ter::TEF_BAD_LEDGER,
             }
 
-            const SEQUENCE_DELTA: u32 = 255;
-            if src
-                .get_field_u32(sf("sfSequence"))
-                .saturating_add(SEQUENCE_DELTA)
-                > view.header().seq
+            if src.is_field_present(sf("sfSponsor"))
+                && src.get_account_id(sf("sfSponsor")) != destination
             {
-                return Ter::TEC_TOO_SOON;
+                return Ter::TEC_NO_SPONSOR_PERMISSION;
             }
-            let first_nftoken_sequence = if src.is_field_present(sf("sfFirstNFTokenSequence")) {
-                src.get_field_u32(sf("sfFirstNFTokenSequence"))
-            } else {
-                0
-            };
-            if first_nftoken_sequence
-                .saturating_add(src.get_field_u32(sf("sfMintedNFTokens")))
-                .saturating_add(SEQUENCE_DELTA)
-                > view.header().seq
+            if src.is_field_present(sf("sfSponsoringOwnerCount"))
+                || src.is_field_present(sf("sfSponsoringAccountCount"))
             {
-                return Ter::TEC_TOO_SOON;
+                return Ter::TEC_HAS_OBLIGATIONS;
             }
 
             let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
@@ -2553,6 +2543,11 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
 
             let balance = src.get_field_amount(sf("sfBalance")).xrp();
+            let mut src_obj = src.clone_as_object();
+            src_obj.set_field_amount(
+                sf("sfBalance"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(0)),
+            );
             let mut dst_obj = dst.clone_as_object();
             let dst_balance = dst.get_field_amount(sf("sfBalance")).xrp();
             dst_obj.set_field_amount(
@@ -2561,6 +2556,26 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     dst_balance.drops().saturating_add(balance.drops()),
                 )),
             );
+            if src.is_field_present(sf("sfSponsor")) {
+                // AccountDelete preclaim requires the destination to be the
+                // account's sponsor, so `dst_obj` is also rippled's
+                // `sponsorSle`. Keep both mutations on this one object.
+                let sponsoring_account_count = dst.get_field_u32(sf("sfSponsoringAccountCount"));
+                if sponsoring_account_count == 0 {
+                    return Ter::TEF_INTERNAL;
+                }
+                if sponsoring_account_count == 1 {
+                    dst_obj.make_field_absent(sf("sfSponsoringAccountCount"));
+                } else {
+                    dst_obj.set_field_u32(
+                        sf("sfSponsoringAccountCount"),
+                        sponsoring_account_count - 1,
+                    );
+                }
+                // sfSponsor must not survive in the DeletedNode FinalFields;
+                // the sponsorship invariant also requires it absent after.
+                src_obj.make_field_absent(sf("sfSponsor"));
+            }
             let destination_flags = dst.get_field_u32(sf("sfFlags"));
             if balance.drops() > 0 && destination_flags & protocol::lsfPasswordSpent != 0 {
                 dst_obj.set_field_u32(
@@ -2574,7 +2589,10 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             {
                 return Ter::TEF_BAD_LEDGER;
             }
-            if view.erase(src).is_err() {
+            if view
+                .erase(Arc::new(STLedgerEntry::from_stobject(src_obj, *src.key())))
+                .is_err()
+            {
                 return Ter::TEF_BAD_LEDGER;
             }
             crate::state::payment::record_delivered_amount(STAmount::from_xrp_amount(balance));

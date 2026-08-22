@@ -366,17 +366,30 @@ fn preclaim_account_delete<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter>
         minted_nftokens: source.get_field_u32(sf("sfMintedNFTokens")),
         burned_nftokens: source.get_field_u32(sf("sfBurnedNFTokens")),
         owned_nft_page_present,
+        sponsor_mismatch: source.is_field_present(sf("sfSponsor"))
+            && source.get_account_id(sf("sfSponsor")) != destination,
+        sponsoring_dependents: source.is_field_present(sf("sfSponsoringOwnerCount"))
+            || source.is_field_present(sf("sfSponsoringAccountCount")),
         account_sequence: source.get_field_u32(sf("sfSequence")),
         ledger_sequence: view.seq(),
         first_nftoken_sequence: source
             .is_field_present(sf("sfFirstNFTokenSequence"))
             .then(|| source.get_field_u32(sf("sfFirstNFTokenSequence"))),
-        owner_dir_empty: directory_entries(view, account)?.is_empty(),
+        // rippled does not inspect the owner directory until every NFT,
+        // sponsorship, and sequence-age check above has passed.  Force the
+        // helper through those earlier checks first, then evaluate the
+        // directory lazily below so a malformed page cannot override their
+        // canonical TER precedence.
+        owner_dir_empty: false,
     }) {
         AccountDeletePreclaimScanState::Return(ter) => Ok(ter),
         AccountDeletePreclaimScanState::ContinueToDirectoryScan => {
+            let directory_keys = directory_entries(view, account)?;
+            if directory_keys.is_empty() {
+                return Ok(Ter::TES_SUCCESS);
+            }
             let mut entries = Vec::new();
-            for key in directory_entries(view, account)? {
+            for key in directory_keys {
                 let disposition = match view
                     .read(protocol::child_keylet(key))
                     .map_err(|_| view_error())?

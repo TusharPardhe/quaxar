@@ -95,6 +95,7 @@ use tx::{
     QueueTxQMetrics, QueueTxQRpcReport, TxConsequences, TxDetails, evaluate_fee_level_paid,
     likely_to_claim_fee, snapshot_queue_apply_app_view_with_metrics,
 };
+
 use xrpl_core::{
     FixedNetworkIdService, HashRouter, LoadMonitorJournalFactory, NetworkIDService,
     PeerReservationTable, ServiceRegistry, StartUpType,
@@ -1604,15 +1605,17 @@ where
         if !is_tes_success(preclaim) && !is_tec_claim(preclaim) {
             return (ApplyResult::new(preclaim, false, false), None);
         }
-        let (ter, delivered) = apply_submit_transactor_shell_with_flags_and_delivered_amount(
+        let outcome = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
             view,
             tx.as_ref(),
             tx.get_txn_type(),
             flags,
+            preclaim,
         );
-        let applied = (is_tes_success(ter) || is_tec_claim(ter))
-            && !protocol::any_apply_flags(flags & ApplyFlags::DRY_RUN);
-        (ApplyResult::new(ter, applied, false), delivered)
+        (
+            ApplyResult::new(outcome.result, outcome.applied, false),
+            outcome.delivered_amount,
+        )
     }
 
     fn record_clear_ahead_open_ledger_tx(&self, tx: &Arc<STTx>) {
@@ -1642,28 +1645,31 @@ where
     fn direct_apply(&mut self) -> ApplyResult {
         let txn_type = self.tx.get_txn_type();
         let preclaim = self.preclaim_result.ter;
-        // `doApply` runs for fee-claiming `tec` results too. This is
-        // essential for delegated transactions: the selected delegate pays
-        // the fee and the source sequence is consumed even when the typed
-        // apply result is a claimable failure.
-        let (ter, delivered_amount) = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
-            apply_submit_transactor_shell_with_flags_and_delivered_amount(
+        // A claimable preclaim `tec` enters Transactor for the generic
+        // fee/sequence lifecycle, but Transactor::operator() never invokes
+        // the type-specific doApply unless preclaimResult is tesSUCCESS.
+        let outcome = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
                 self.submit_view,
                 self.tx.as_ref(),
                 txn_type,
                 self.preflight_result.flags,
+                preclaim,
             )
         } else {
-            (preclaim, None)
+            SubmitApplyOutcome {
+                result: preclaim,
+                applied: false,
+                delivered_amount: None,
+                applied_batch_inner_transactions: Vec::new(),
+            }
         };
-        self.delivered_amount = delivered_amount;
-        let applied = (is_tes_success(ter) || is_tec_claim(ter))
-            && !protocol::any_apply_flags(self.preflight_result.flags & ApplyFlags::DRY_RUN);
-        if applied {
+        self.delivered_amount = outcome.delivered_amount;
+        if outcome.applied {
             self.view.push_transaction(Arc::clone(&self.tx));
             tracing::debug!(
                 target: "rpc",
-                ter = ?ter,
+                ter = ?outcome.result,
                 "direct_apply: pushed transaction into open ledger view"
             );
             // Track the account's next expected sequence
@@ -1678,7 +1684,7 @@ where
             }
         }
 
-        ApplyResult::new(ter, applied, false)
+        ApplyResult::new(outcome.result, outcome.applied, false)
     }
 
     fn prepare_multitxn(&mut self, adjustment: tx::QueueApplyViewAdjustment) -> bool {
@@ -1887,9 +1893,10 @@ struct AppliedBatchInnerTransaction {
     parent_batch_id: Uint256,
 }
 
-struct SubmitApplyOutcome {
-    result: Ter,
-    delivered_amount: Option<STAmount>,
+pub(crate) struct SubmitApplyOutcome {
+    pub(crate) result: Ter,
+    pub(crate) applied: bool,
+    pub(crate) delivered_amount: Option<STAmount>,
     applied_batch_inner_transactions: Vec<AppliedBatchInnerTransaction>,
 }
 
@@ -2722,11 +2729,12 @@ pub fn apply_simulated_transaction<V: ledger::ApplyView>(
     };
 
     if is_tes_success(preclaim) || is_tec_claim(preclaim) {
-        apply_submit_transactor_shell_with_flags_and_delivered_amount(
+        apply_submit_transactor_shell_with_preclaim_and_delivered_amount(
             view,
             tx,
             tx.get_txn_type(),
             flags,
+            preclaim,
         )
     } else {
         (preclaim, None)
@@ -2771,16 +2779,42 @@ fn apply_submit_transactor_shell_with_flags_and_delivered_amount<V: ledger::Appl
     txn_type: TxType,
     flags: ApplyFlags,
 ) -> (Ter, Option<STAmount>) {
-    let outcome =
-        apply_submit_transactor_shell_with_flags_and_batch_outcome(view, tx, txn_type, flags);
-    (outcome.result, outcome.delivered_amount)
+    apply_submit_transactor_shell_with_preclaim_and_delivered_amount(
+        view,
+        tx,
+        txn_type,
+        flags,
+        Ter::TES_SUCCESS,
+    )
 }
 
-fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyView>(
+pub(crate) fn apply_submit_transactor_shell_with_preclaim_and_delivered_amount<
+    V: ledger::ApplyView,
+>(
     view: &mut V,
     tx: &STTx,
     txn_type: TxType,
     flags: ApplyFlags,
+    preclaim_result: Ter,
+) -> (Ter, Option<STAmount>) {
+    let outcome = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+        view,
+        tx,
+        txn_type,
+        flags,
+        preclaim_result,
+    );
+    (outcome.result, outcome.delivered_amount)
+}
+
+pub(crate) fn apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim<
+    V: ledger::ApplyView,
+>(
+    view: &mut V,
+    tx: &STTx,
+    txn_type: TxType,
+    flags: ApplyFlags,
+    mut preclaim_result: Ter,
 ) -> SubmitApplyOutcome {
     // An inner Batch transaction is valid only while its parent Batch applies
     // it through apply_submit_batch_followup. Never allow one through the
@@ -2788,6 +2822,7 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
     if txn_type != TxType::BATCH && tx.is_flag(tfInnerBatchTxn) {
         return SubmitApplyOutcome {
             result: Ter::TEM_INVALID_INNER_BATCH,
+            applied: false,
             delivered_amount: None,
             applied_batch_inner_transactions: Vec::new(),
         };
@@ -2807,17 +2842,22 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
         if !is_tes_success(preflight) {
             return SubmitApplyOutcome {
                 result: preflight,
+                applied: false,
                 delivered_amount: None,
                 applied_batch_inner_transactions: Vec::new(),
             };
         }
-        let preclaim = batch_preclaim_ter(view, tx, flags);
-        if !is_tes_success(preclaim) {
-            return SubmitApplyOutcome {
-                result: preclaim,
-                delivered_amount: None,
-                applied_batch_inner_transactions: Vec::new(),
-            };
+        if is_tes_success(preclaim_result) {
+            let batch_preclaim = batch_preclaim_ter(view, tx, flags);
+            if !is_tes_success(batch_preclaim) && !is_tec_claim(batch_preclaim) {
+                return SubmitApplyOutcome {
+                    result: batch_preclaim,
+                    applied: false,
+                    delivered_amount: None,
+                    applied_batch_inner_transactions: Vec::new(),
+                };
+            }
+            preclaim_result = batch_preclaim;
         }
     }
 
@@ -2845,6 +2885,7 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
                 tx,
                 txn_type,
                 flags,
+                preclaim_result,
                 &mut invariant_fee_reset,
             )
         })) {
@@ -2868,6 +2909,7 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
                 );
                 return SubmitApplyOutcome {
                     result: Ter::TEF_EXCEPTION,
+                    applied: false,
                     delivered_amount: None,
                     applied_batch_inner_transactions: Vec::new(),
                 };
@@ -2893,6 +2935,7 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
         );
         let invariant_fee_reset_applies =
             invariant_fee_reset && result == Ter::TEC_INVARIANT_FAILED;
+        let mut applied = false;
         if (likely_to_claim_fee(result, flags)
             || persistent_cleanup_tec
             || invariant_fee_reset_applies)
@@ -2908,6 +2951,8 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
             if tx_view.apply().is_err() {
                 result = Ter::TEF_INTERNAL;
                 applied_batch_inner_transactions.clear();
+            } else {
+                applied = !protocol::any_apply_flags(flags & ApplyFlags::DRY_RUN);
             }
         } else {
             applied_batch_inner_transactions.clear();
@@ -2917,6 +2962,7 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
             .filter(|_| is_tes_success(result));
         SubmitApplyOutcome {
             result,
+            applied,
             delivered_amount,
             applied_batch_inner_transactions,
         }
@@ -2928,6 +2974,7 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
     tx: &STTx,
     txn_type: TxType,
     flags: ApplyFlags,
+    preclaim_result: Ter,
     invariant_fee_reset: &mut bool,
 ) -> Ter {
     let account_field = get_field_by_symbol("sfAccount");
@@ -2938,7 +2985,11 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         if !is_tes_success(preflight) {
             return preflight;
         }
-        return handle_real_dispatch(view, tx, txn_type, None);
+        return if is_tes_success(preclaim_result) {
+            handle_real_dispatch(view, tx, txn_type, None)
+        } else {
+            preclaim_result
+        };
     }
 
     // --- reference preflight1 checks ---
@@ -2973,7 +3024,11 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
     }
 
     if !tx.is_field_present(account_field) {
-        return handle_real_dispatch(view, tx, txn_type, None);
+        return if is_tes_success(preclaim_result) {
+            handle_real_dispatch(view, tx, txn_type, None)
+        } else {
+            preclaim_result
+        };
     }
 
     // Change pseudo-transactions were dispatched above after their typed
@@ -3246,7 +3301,9 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         // We achieve this by running handle_real_dispatch in a nested FlowSandbox and
         // only applying it to the outer view when the result is NOT tecKILLED.
         let mut inner = ledger::FlowSandbox::new(view);
-        let mut result = if is_tec_claim(offer_preclaim) {
+        let mut result = if is_tec_claim(preclaim_result) {
+            preclaim_result
+        } else if is_tec_claim(offer_preclaim) {
             offer_preclaim
         } else if is_tes_success(oracle_preclaim) {
             handle_real_dispatch(&mut inner, tx, txn_type, pre_fee_balance_drops)
@@ -3609,6 +3666,7 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
                     &inner_tx,
                     inner_tx.get_txn_type(),
                     ApplyFlags::BATCH,
+                    preclaim,
                     &mut invariant_fee_reset,
                 );
                 let delivered_amount = delivered_amount_capture
@@ -4841,22 +4899,27 @@ impl ApplicationRoot {
         } else {
             preflight
         };
-        let ter = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
-            apply_submit_transactor_shell_with_flags(
+        let outcome = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
                 rebase_view,
                 tx.as_ref(),
                 tx.get_txn_type(),
                 flags,
+                preclaim,
             )
         } else {
-            preclaim
+            SubmitApplyOutcome {
+                result: preclaim,
+                applied: false,
+                delivered_amount: None,
+                applied_batch_inner_transactions: Vec::new(),
+            }
         };
-        let applied = is_tes_success(ter) || is_tec_claim(ter);
-        if applied {
+        if outcome.applied {
             applied_ids.insert(tx_id);
             open_ledger.push_transaction(tx);
         }
-        ApplyResult::new(ter, applied, false)
+        ApplyResult::new(outcome.result, outcome.applied, false)
     }
 
     /// Apply a LocalTx during `OpenLedger::accept` through the full TxQ
@@ -8616,6 +8679,12 @@ impl ApplicationRoot {
                 None
             }
         };
+        // LedgerHistory canonicalizes by hash, but unlike rippled's Ledger,
+        // Quaxar's Ledger carries its durable fetch seam on the object.  Never
+        // return a cache/provider object without restoring that seam: history
+        // may retain it as `histLedger_`-equivalent or insert it back into the
+        // same-hash cache after its weak SHAMap children have been released.
+        let resolved = resolved.map(|ledger| self.ledger_with_node_fetcher(ledger));
         tracing::debug!(
             target: "lcl_trace",
             event = "resolver_lookup",
@@ -9411,15 +9480,16 @@ impl ApplicationRoot {
                 ledger::FlowSandbox::new_with_flags(&mut state_view, ApplyFlags::NONE);
             let SubmitApplyOutcome {
                 result,
+                applied,
                 delivered_amount,
                 applied_batch_inner_transactions,
-            } = apply_submit_transactor_shell_with_flags_and_batch_outcome(
+            } = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
                 &mut attempt_view,
                 st_tx,
                 txn_type,
                 ApplyFlags::NONE,
+                preclaim,
             );
-            let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
             if applied {
                 // Keep replay's metadata boundary identical to consensus:
                 // build from this transaction's FlowSandbox before its delta
@@ -9882,10 +9952,14 @@ impl ApplicationRoot {
                         self.load_fee_track.as_ref(),
                     )
                 });
+                // `doApply` admits every tes/tec PreclaimResult. Ordinary tec
+                // remains unapplied under TapRetry, while persistent cleanup
+                // tec values may still commit their reset/deletion state.
                 let preclaim_admitted =
-                    preclaim.is_some_and(|ter| likely_to_claim_fee(ter, retry_flags));
+                    preclaim.is_some_and(|ter| is_tes_success(ter) || is_tec_claim(ter));
                 let (
                     result,
+                    applied,
                     applied_batch_inner_transactions,
                     transaction_meta,
                     replayed_threaded_entry,
@@ -9894,23 +9968,22 @@ impl ApplicationRoot {
                         ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
                     let SubmitApplyOutcome {
                         result,
+                        applied,
                         delivered_amount,
                         applied_batch_inner_transactions,
-                    } = apply_submit_transactor_shell_with_flags_and_batch_outcome(
+                    } = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
                         &mut attempt_view,
                         &sttx,
                         txn_type,
                         retry_flags,
+                        preclaim.expect("preclaim-admitted transaction has a preclaim result"),
                     );
-                    let replayed_threaded_entry = (protocol::is_tes_success(result)
-                        || protocol::is_tec_claim(result))
-                    .then(|| {
-                        attempt_view.replayed_threaded_entry(transaction_id, closed_seq, &rules)
-                    })
-                    .flatten();
-                    let transaction_meta = if replayed_threaded_entry.is_none()
-                        && (protocol::is_tes_success(result) || protocol::is_tec_claim(result))
-                    {
+                    let replayed_threaded_entry = applied
+                        .then(|| {
+                            attempt_view.replayed_threaded_entry(transaction_id, closed_seq, &rules)
+                        })
+                        .flatten();
+                    let transaction_meta = if replayed_threaded_entry.is_none() && applied {
                         // rippled's ApplyStateTable::apply builds TxMeta from
                         // this transaction's state-table delta before it
                         // serializes rawTxInsert and commits the delta. Do
@@ -9941,15 +10014,15 @@ impl ApplicationRoot {
                     };
                     (
                         result,
+                        applied,
                         applied_batch_inner_transactions,
                         transaction_meta,
                         replayed_threaded_entry,
                     )
                 } else {
-                    (preclaim.unwrap_or(preflight), Vec::new(), None, None)
+                    (preclaim.unwrap_or(preflight), false, Vec::new(), None, None)
                 };
                 let apply_ter = preclaim_admitted.then_some(result);
-                let applied = likely_to_claim_fee(result, retry_flags);
                 drop(view);
                 if let Some((entry_key, prior_seq)) = replayed_threaded_entry {
                     completed_transaction_ids.insert(transaction_id);

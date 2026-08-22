@@ -2,10 +2,12 @@ use super::{
     AcceptLedgerPendingRuntime, AcceptLedgerPendingTransaction, AppOpenLedgerTxQApplyRuntime,
     ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, PersistentSubmitSandbox,
     TypedPreclaimRoute, apply_submit_transactor_shell, apply_submit_transactor_shell_with_flags,
-    batch_base_fee, calculate_default_sttx_base_fee, calculate_sttx_base_fee,
-    consensus_status_event, loan_set_counterparty_preflight_ter,
-    preferred_lcl_matches_local_or_parent, queue_apply_preclaim_ter, transaction_preflight_ter,
-    transaction_preflight_ter_with_flags, typed_preclaim_route, typed_preclaim_ter,
+    apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim,
+    apply_submit_transactor_shell_with_preclaim_and_delivered_amount, batch_base_fee,
+    calculate_default_sttx_base_fee, calculate_sttx_base_fee, consensus_status_event,
+    loan_set_counterparty_preflight_ter, preferred_lcl_matches_local_or_parent,
+    queue_apply_preclaim_ter, transaction_preflight_ter, transaction_preflight_ter_with_flags,
+    typed_preclaim_route, typed_preclaim_ter,
 };
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
@@ -23,8 +25,8 @@ use crate::{
 use basics::base_uint::{Uint160, Uint256};
 use basics::sha_map_hash::SHAMapHash;
 use ledger::{
-    ApplyView, Fees, LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader, OpenView, ReadView,
-    Sandbox, TxsRawView, calculate_ledger_hash, encode_fee_settings_entry,
+    ApplyView, Fees, FlowSandbox, LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader, OpenView,
+    ReadView, Sandbox, TxsRawView, calculate_ledger_hash, encode_fee_settings_entry,
 };
 use protocol::{
     AccountID, BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, KeyType, LedgerEntryType,
@@ -592,12 +594,28 @@ fn apply_submit_tx_for_test<V: ApplyView>(
     tx: Arc<STTx>,
     current_ledger_index: u32,
 ) -> ApplyResult {
+    apply_submit_tx_for_test_with_flags(
+        open_ledger,
+        submit_view,
+        tx,
+        current_ledger_index,
+        ApplyFlags::NONE,
+    )
+}
+
+fn apply_submit_tx_for_test_with_flags<V: ApplyView>(
+    open_ledger: &mut AppOpenLedgerView,
+    submit_view: &mut V,
+    tx: Arc<STTx>,
+    current_ledger_index: u32,
+    flags: ApplyFlags,
+) -> ApplyResult {
     let fee_track = crate::load::load_fee_track::SharedLoadFeeTrack::new();
     let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
         open_ledger,
         submit_view,
         tx,
-        ApplyFlags::NONE,
+        flags,
         current_ledger_index,
         &fee_track,
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -853,6 +871,109 @@ fn retry_pass_tec_does_not_commit_until_final_pass() {
         final_source.get_field_u32(get_field_by_symbol("sfSequence")),
         2,
         "the final pass must claim the fee and consume the sequence"
+    );
+}
+
+#[test]
+fn retry_outcome_distinguishes_ordinary_and_persistent_cleanup_tec() {
+    let source = account("ABABABABABABABABABABABABABABABABABABABAB");
+    let destination = account("CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCD");
+    let tx = payment_tx(source, destination, 1, None, 10);
+    let account_key = account_keylet(raw_account_id(source));
+
+    // An ordinary handler tec under TapRetry is returned but not committed.
+    // Consensus must therefore neither construct metadata/thread the tx nor
+    // remove it from the retry set.
+    let mut ordinary_parent =
+        Sandbox::new(Arc::new(ledger_view(10, source, 1, &[])), ApplyFlags::NONE);
+    let mut destination_root = STLedgerEntry::from_type_and_key(
+        LedgerEntryType::AccountRoot,
+        account_keylet(raw_account_id(destination)).key,
+    );
+    destination_root.set_account_id(get_field_by_symbol("sfAccount"), destination);
+    destination_root.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+    destination_root.set_field_u32(get_field_by_symbol("sfFlags"), protocol::lsfDepositAuth);
+    destination_root.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::new_native(1_000_000, false),
+    );
+    ordinary_parent
+        .insert(Arc::new(destination_root))
+        .expect("destination insert should succeed");
+    let ordinary_rules = ordinary_parent.rules();
+    let mut ordinary_attempt = FlowSandbox::new_with_flags(&mut ordinary_parent, ApplyFlags::RETRY);
+    let ordinary = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+        &mut ordinary_attempt,
+        &tx,
+        TxType::PAYMENT,
+        ApplyFlags::RETRY,
+        Ter::TES_SUCCESS,
+    );
+    assert_eq!(ordinary.result, Ter::TEC_NO_PERMISSION);
+    assert!(!ordinary.applied);
+    assert_eq!(ordinary_attempt.item_count(), 0);
+    let ordinary_meta = ordinary_attempt
+        .to_tx_meta(tx.get_transaction_id(), 11, None, &ordinary_rules)
+        .expect("empty retry metadata should be representable");
+    assert_eq!(ordinary_meta.get_nodes().len(), 0);
+    drop(ordinary_attempt);
+    assert_eq!(
+        ordinary_parent
+            .read(account_key)
+            .expect("source read should succeed")
+            .expect("source should exist")
+            .get_field_u32(get_field_by_symbol("sfSequence")),
+        1
+    );
+    assert!(!ordinary_parent.tx_exists(tx.get_transaction_id()).unwrap());
+
+    // Persistent cleanup results are the exception to TapRetry's ordinary
+    // tec rule. Even when supplied by preclaim they run reset, commit exactly
+    // once, and must be accepted/threaded rather than retried.
+    let mut persistent_parent =
+        Sandbox::new(Arc::new(ledger_view(10, source, 1, &[])), ApplyFlags::NONE);
+    let persistent_rules = persistent_parent.rules();
+    let mut persistent_attempt =
+        FlowSandbox::new_with_flags(&mut persistent_parent, ApplyFlags::RETRY);
+    let persistent = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+        &mut persistent_attempt,
+        &tx,
+        TxType::PAYMENT,
+        ApplyFlags::RETRY,
+        Ter::TEC_KILLED,
+    );
+    assert_eq!(persistent.result, Ter::TEC_KILLED);
+    assert!(persistent.applied);
+    let persistent_meta = persistent_attempt
+        .to_tx_meta(tx.get_transaction_id(), 11, None, &persistent_rules)
+        .expect("persistent retry metadata should build");
+    assert_eq!(persistent_meta.get_nodes().len(), 1);
+    persistent_attempt
+        .apply_with_tx_thread(tx.get_transaction_id(), 11, &persistent_rules)
+        .expect("persistent retry state should commit once");
+    let persistent_source = persistent_parent
+        .read(account_key)
+        .expect("source read should succeed")
+        .expect("source should exist");
+    assert_eq!(
+        persistent_source.get_field_u32(get_field_by_symbol("sfSequence")),
+        2
+    );
+    assert_eq!(
+        persistent_source
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        999_999_990,
+        "persistent retry outcome must charge the fee exactly once"
+    );
+    assert_eq!(
+        persistent_source.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+        tx.get_transaction_id()
+    );
+    assert_eq!(
+        persistent_source.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
+        11
     );
 }
 
@@ -1251,6 +1372,119 @@ fn submit_direct_apply_ticket_create_updates_ticket_tracking() {
             .exists(protocol::ticket_keylet(raw_account_id(source), 3))
             .expect("ticket 3 lookup should succeed")
     );
+}
+
+#[test]
+fn ticket_create_preclaim_tec_never_dispatches_do_apply() {
+    // Testnet ledger 20124169, tx 8F96C9A5...: the account already owns
+    // 250 tickets, so rippled preserves preclaim's tecDIR_FULL and applies
+    // only the generic fee/sequence state. The old path discarded that TER,
+    // ran TicketCreate::doApply, and incorrectly created ticket 18895321.
+    let (source, ticket_create) = signed_ticket_create_tx(0x52, 1, 1, 10);
+
+    for (flags, should_claim_fee) in [
+        (ApplyFlags::NONE, true),
+        (ApplyFlags::RETRY, false),
+        (ApplyFlags::FAIL_HARD, false),
+    ] {
+        let base = Arc::new(ledger_view_with_balance_and_owner_count(
+            1,
+            source,
+            1,
+            1_000_000_000,
+            251,
+            &[],
+        ));
+        let mut parent = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
+        let account_key = account_keylet(raw_account_id(source));
+        let account_root = parent
+            .peek(account_key)
+            .expect("account read should succeed")
+            .expect("account should exist");
+        let mut account_object = account_root.clone_as_object();
+        account_object.set_field_u32(get_field_by_symbol("sfTicketCount"), 250);
+        parent
+            .update(Arc::new(STLedgerEntry::from_stobject(
+                account_object,
+                *account_root.key(),
+            )))
+            .expect("ticket count should seed");
+
+        let preclaim = queue_apply_preclaim_ter(&parent, &ticket_create, 2, flags);
+        assert_eq!(preclaim, Ter::TEC_DIR_FULL);
+        let rules = parent.rules();
+        let mut attempt = FlowSandbox::new_with_flags(&mut parent, flags);
+        let (result, delivered_amount) =
+            apply_submit_transactor_shell_with_preclaim_and_delivered_amount(
+                &mut attempt,
+                &ticket_create,
+                TxType::TICKET_CREATE,
+                flags,
+                preclaim,
+            );
+        assert_eq!(result, Ter::TEC_DIR_FULL);
+        assert_eq!(delivered_amount, None);
+
+        let account_root = attempt
+            .read(account_key)
+            .expect("account read should succeed")
+            .expect("account should remain");
+        assert_eq!(
+            account_root.get_field_u32(get_field_by_symbol("sfTicketCount")),
+            250,
+            "preclaim tec must never enter TicketCreate::doApply"
+        );
+        assert_eq!(
+            account_root.get_field_u32(get_field_by_symbol("sfOwnerCount")),
+            251
+        );
+        assert!(
+            !attempt
+                .exists(protocol::ticket_keylet(raw_account_id(source), 2))
+                .expect("ticket lookup should succeed")
+        );
+
+        if should_claim_fee {
+            assert_eq!(
+                account_root.get_field_u32(get_field_by_symbol("sfSequence")),
+                2
+            );
+            assert_eq!(
+                account_root
+                    .get_field_amount(get_field_by_symbol("sfBalance"))
+                    .xrp()
+                    .drops(),
+                999_999_990
+            );
+            let meta = attempt
+                .to_tx_meta(ticket_create.get_transaction_id(), 2, None, &rules)
+                .expect("fee-only metadata should build");
+            assert_eq!(meta.get_nodes().len(), 1);
+            let node = meta
+                .get_nodes()
+                .iter()
+                .next()
+                .expect("fee-only metadata should contain its AccountRoot");
+            assert_eq!(node.fname(), get_field_by_symbol("sfModifiedNode"));
+            assert_eq!(
+                node.get_field_h256(get_field_by_symbol("sfLedgerIndex")),
+                account_key.key
+            );
+        } else {
+            assert_eq!(
+                account_root.get_field_u32(get_field_by_symbol("sfSequence")),
+                1
+            );
+            assert_eq!(
+                account_root
+                    .get_field_amount(get_field_by_symbol("sfBalance"))
+                    .xrp()
+                    .drops(),
+                1_000_000_000
+            );
+            assert_eq!(attempt.item_count(), 0);
+        }
+    }
 }
 
 #[test]
