@@ -204,7 +204,8 @@ fn validate_sttx_typed_semantic_preflight(tx: &STTx, rules: &Rules, txn_type: Tx
             tx.get_field_u32(get_field_by_symbol("sfOfferSequence")),
         ),
         TxType::PAYCHAN_CREATE => validate_payment_channel_create_preflight(tx),
-        TxType::PAYCHAN_FUND => validate_payment_channel_fund_preflight(tx),
+        TxType::PAYCHAN_FUND => validate_payment_channel_fund_preflight(tx, rules),
+        TxType::PAYCHAN_CLAIM => validate_payment_channel_claim_preflight(tx, rules),
         TxType::CHECK_CREATE => validate_check_create_preflight(tx),
         TxType::CHECK_CASH => validate_check_cash_preflight(tx),
         TxType::REGULAR_KEY_SET => validate_set_regular_key_preflight(tx),
@@ -219,11 +220,58 @@ fn validate_sttx_typed_semantic_preflight(tx: &STTx, rules: &Rules, txn_type: Tx
         TxType::TRUST_SET => validate_sttx_noop_preflight(txn_type),
         TxType::NFTOKEN_MINT => validate_nftoken_mint_preflight(tx, rules),
         TxType::NFTOKEN_ACCEPT_OFFER => validate_nftoken_accept_offer_preflight(tx),
+        TxType::AMM_CREATE => validate_amm_create_preflight(tx, rules),
         // Types with no additional stateless rule still traverse the standalone
         // dispatcher explicitly; unknown types never silently succeed.
         _ if txn_type.is_dispatchable() => validate_sttx_noop_preflight(txn_type),
         _ => Ter::TEM_UNKNOWN,
     }
+}
+
+fn validate_amm_create_preflight(tx: &STTx, rules: &Rules) -> NotTec {
+    let amount_field = get_field_by_symbol("sfAmount");
+    let amount2_field = get_field_by_symbol("sfAmount2");
+    if !tx.is_field_present(amount_field) || !tx.is_field_present(amount2_field) {
+        return Ter::TEM_MALFORMED;
+    }
+    if tx.get_flags() & !UNIVERSAL_TRANSACTION_FLAGS != 0 {
+        return Ter::TEM_INVALID_FLAG;
+    }
+
+    let amount = tx.get_field_amount(amount_field);
+    let amount2 = tx.get_field_amount(amount2_field);
+    if !crate::amm_create_check_extra_features(
+        protocol::amm_enabled(rules),
+        rules.enabled(&protocol::feature_id("MPTokensV2")),
+        amount.holds_mpt_issue(),
+        amount2.holds_mpt_issue(),
+    ) {
+        return Ter::TEM_DISABLED;
+    }
+
+    // `invalidAMMAmount` validates classic Issue assets. MPT assets have no
+    // issuer/currency pair to validate, but retain the same positive-amount
+    // requirement.
+    let invalid_amount = if amount.holds_mpt_issue() {
+        (amount.signum() <= 0).then_some(Ter::TEM_BAD_AMOUNT)
+    } else {
+        let result = protocol::invalid_amm_amount(&amount, None, false);
+        (!is_tes_success(result)).then_some(result)
+    };
+    let invalid_amount2 = if amount2.holds_mpt_issue() {
+        (amount2.signum() <= 0).then_some(Ter::TEM_BAD_AMOUNT)
+    } else {
+        let result = protocol::invalid_amm_amount(&amount2, None, false);
+        (!is_tes_success(result)).then_some(result)
+    };
+
+    crate::run_amm_create_preflight_facts(crate::AMMCreatePreflightFacts {
+        amount_asset: amount.asset(),
+        amount_invalid: invalid_amount,
+        amount2_asset: amount2.asset(),
+        amount2_invalid: invalid_amount2,
+        trading_fee: tx.get_field_u16(get_field_by_symbol("sfTradingFee")),
+    })
 }
 
 fn validate_nftoken_accept_offer_preflight(tx: &STTx) -> NotTec {
@@ -532,14 +580,110 @@ fn validate_payment_channel_create_preflight(tx: &STTx) -> NotTec {
     })
 }
 
-fn validate_payment_channel_fund_preflight(tx: &STTx) -> NotTec {
+fn validate_payment_channel_fund_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     let amount_field = get_field_by_symbol("sfAmount");
-    if !tx.is_field_present(amount_field) {
+    let channel_field = get_field_by_symbol("sfChannel");
+    if !tx.is_field_present(amount_field) || !tx.is_field_present(channel_field) {
+        return Ter::TEM_MALFORMED;
+    }
+    if tx.get_flags() & !UNIVERSAL_TRANSACTION_FLAGS != 0 {
+        return Ter::TEM_INVALID_FLAG;
+    }
+    if rules.enabled(&protocol::feature_id("fixCleanup3_2_0"))
+        && tx.get_field_h256(channel_field).is_zero()
+    {
         return Ter::TEM_MALFORMED;
     }
 
     let amount = tx.get_field_amount(amount_field);
     crate::run_payment_channel_fund_preflight(amount.native(), amount.signum() > 0)
+}
+
+fn validate_payment_channel_claim_preflight(tx: &STTx, rules: &Rules) -> NotTec {
+    let channel_field = get_field_by_symbol("sfChannel");
+    if !tx.is_field_present(channel_field) {
+        return Ter::TEM_MALFORMED;
+    }
+    if rules.enabled(&protocol::feature_id("fixCleanup3_2_0"))
+        && tx.get_field_h256(channel_field).is_zero()
+    {
+        return Ter::TEM_MALFORMED;
+    }
+    if !crate::run_payment_channel_claim_check_extra_features(
+        tx.is_field_present(get_field_by_symbol("sfCredentialIDs")),
+        rules.enabled(&protocol::feature_id("Credentials")),
+    ) {
+        return Ter::TEM_DISABLED;
+    }
+    if tx.get_flags() & crate::get_payment_channel_claim_flags_mask() != 0 {
+        return Ter::TEM_INVALID_FLAG;
+    }
+
+    let balance_field = get_field_by_symbol("sfBalance");
+    let amount_field = get_field_by_symbol("sfAmount");
+    let signature_field = get_field_by_symbol("sfSignature");
+    let public_key_field = get_field_by_symbol("sfPublicKey");
+    let balance = tx
+        .is_field_present(balance_field)
+        .then(|| tx.get_field_amount(balance_field));
+    let amount = tx
+        .is_field_present(amount_field)
+        .then(|| tx.get_field_amount(amount_field));
+    let public_key = tx
+        .is_field_present(public_key_field)
+        .then(|| protocol::PublicKey::from_slice(&tx.get_field_vl(public_key_field)))
+        .transpose()
+        .ok()
+        .flatten();
+    let signature = tx
+        .is_field_present(signature_field)
+        .then(|| tx.get_field_vl(signature_field));
+    let requested_balance = balance
+        .as_ref()
+        .filter(|value| value.native())
+        .map_or(0, |value| value.xrp().drops().max(0) as u64);
+    let authorized_amount = amount
+        .as_ref()
+        .filter(|value| value.native())
+        .map_or(requested_balance, |value| value.xrp().drops().max(0) as u64);
+    let signature_facts =
+        signature
+            .as_ref()
+            .map(|_| crate::PaymentChannelClaimSignaturePreflightFacts {
+                public_key_present: tx.is_field_present(public_key_field),
+                requested_balance_drops: requested_balance,
+                authorization_message: crate::PaymentChannelClaimAuthorizationMessageFacts {
+                    channel_key: tx.get_field_h256(channel_field),
+                    authorized_amount_drops: authorized_amount,
+                },
+                public_key_type_valid: public_key.is_some(),
+            });
+
+    crate::run_payment_channel_claim_preflight(
+        crate::PaymentChannelClaimPreflightFacts {
+            balance_present: balance.is_some(),
+            balance_is_xrp: balance.as_ref().is_none_or(STAmount::native),
+            balance_positive: balance.as_ref().is_none_or(|value| value.signum() > 0),
+            amount_present: amount.is_some(),
+            amount_is_xrp: amount.as_ref().is_none_or(STAmount::native),
+            amount_positive: amount.as_ref().is_none_or(|value| value.signum() > 0),
+            balance_exceeds_amount: balance
+                .as_ref()
+                .zip(amount.as_ref())
+                .is_some_and(|(balance, amount)| balance > amount),
+            tx_flags: tx.get_flags(),
+            signature: signature_facts,
+        },
+        |message| {
+            public_key
+                .as_ref()
+                .zip(signature.as_ref())
+                .is_some_and(|(public_key, signature)| {
+                    protocol::sign::verify(public_key, message, signature)
+                })
+        },
+        || ledger::credential_helpers::check_fields(tx),
+    )
 }
 
 fn validate_check_create_preflight(tx: &STTx) -> NotTec {
@@ -685,8 +829,8 @@ fn validate_account_set_preflight(tx: &STTx) -> NotTec {
 mod tests {
     use basics::base_uint::Uint256;
     use protocol::{
-        AccountID, Currency, IOUAmount, Issue, Rules, STAmount, STPathSet, STTx, Ter, TxType,
-        XRPAmount, get_field_by_symbol,
+        AccountID, Currency, IOUAmount, Issue, KeyType, Rules, STAmount, STPathSet, STTx,
+        SecretKey, Ter, TxType, XRPAmount, derive_public_key, get_field_by_symbol,
     };
 
     use super::{validate_payment_preflight, validate_sttx_transaction_preflight_with_rules};
@@ -754,6 +898,47 @@ mod tests {
                 STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
             );
             tx.set_field_u32(sf("sfSequence"), 1);
+        })
+    }
+
+    fn amm_create(trading_fee: u16) -> STTx {
+        let issuer = AccountID::from_array([0xF2; 20]);
+        STTx::new(TxType::AMM_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), AccountID::from_array([0xF1; 20]));
+            tx.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(100)),
+            );
+            tx.set_field_amount(sf("sfAmount2"), iou(sf("sfAmount2"), issuer, 0x66));
+            tx.set_field_u16(sf("sfTradingFee"), trading_fee);
+            tx.set_field_amount(
+                sf("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+            );
+            tx.set_field_u32(sf("sfSequence"), 1);
+        })
+    }
+
+    fn paychan_claim(flags: u32, with_signature: bool) -> STTx {
+        STTx::new(TxType::PAYCHAN_CLAIM, |tx| {
+            tx.set_account_id(sf("sfAccount"), AccountID::from_array([0xA7; 20]));
+            tx.set_field_h256(sf("sfChannel"), Uint256::from_u64(7));
+            tx.set_field_amount(
+                sf("sfBalance"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(100)),
+            );
+            tx.set_field_u32(sf("sfFlags"), flags);
+            tx.set_field_amount(
+                sf("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+            );
+            tx.set_field_u32(sf("sfSequence"), 1);
+            if with_signature {
+                let secret = SecretKey::from_bytes([0x71; 32]);
+                let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+                tx.set_field_vl(sf("sfPublicKey"), public.as_bytes());
+                tx.set_field_vl(sf("sfSignature"), &[1]);
+            }
         })
     }
 
@@ -878,6 +1063,62 @@ mod tests {
                 &rules,
             ),
             Ter::TEM_MALFORMED,
+        );
+    }
+
+    #[test]
+    fn amm_create_preflight_is_not_a_success_noop() {
+        let rules = Rules::new([
+            protocol::feature_amm(),
+            protocol::feature_universal_number(),
+        ]);
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(&amm_create(1_001), &rules),
+            Ter::TEM_BAD_FEE,
+        );
+
+        let mut invalid_flags = amm_create(0);
+        invalid_flags.set_field_u32(sf("sfFlags"), protocol::tfSell);
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(&invalid_flags, &rules),
+            Ter::TEM_INVALID_FLAG,
+        );
+
+        let mut duplicate_assets = amm_create(0);
+        duplicate_assets.set_field_amount(
+            sf("sfAmount2"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(100)),
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(&duplicate_assets, &rules),
+            Ter::TEM_BAD_AMM_TOKENS,
+        );
+    }
+
+    #[test]
+    fn payment_channel_claim_preflight_is_not_a_success_noop() {
+        let rules = Rules::new([protocol::feature_id("fixCleanup3_2_0")]);
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &paychan_claim(
+                    crate::PAYMENT_CHANNEL_CLAIM_CLOSE_FLAG
+                        | crate::PAYMENT_CHANNEL_CLAIM_RENEW_FLAG,
+                    false,
+                ),
+                &rules,
+            ),
+            Ter::TEM_MALFORMED,
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &paychan_claim(protocol::tfSell, false),
+                &rules,
+            ),
+            Ter::TEM_INVALID_FLAG,
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(&paychan_claim(0, true), &rules),
+            Ter::TEM_BAD_SIGNATURE,
         );
     }
 
