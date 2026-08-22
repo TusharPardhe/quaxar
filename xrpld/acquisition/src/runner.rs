@@ -1665,11 +1665,32 @@ impl CoordinatorRunner {
     fn eligible_peers_for_target(&self, target: LedgerTarget) -> Vec<PeerId> {
         let available = self.state.peer_view.peers();
         match self.state.target_peer_capabilities.get(&target) {
-            Some(capabilities) => capabilities
-                .iter()
-                .map(|capability| capability.peer())
-                .filter(|peer| available.contains(peer))
-                .collect(),
+            Some(capabilities) => {
+                // `Peer::hasLedger` is a score in rippled's PeerSet, not an
+                // eligibility fence: PeerSetImpl sorts peers that advertise
+                // the exact ledger first, then still admits other connected
+                // peers up to the requested limit. In particular, a retained
+                // InboundLedger must be able to replay after reconnect before
+                // fresh status messages repopulate the peers' ledger ranges.
+                //
+                // Preserve that ordering while keeping the transport snapshot
+                // authoritative for membership. Treating `Some([])` as no
+                // eligible peers strands a paused session forever even though
+                // the coordinator has usable peers again.
+                let mut peers = capabilities
+                    .iter()
+                    .map(|capability| capability.peer())
+                    .filter(|peer| available.contains(peer))
+                    .collect::<Vec<_>>();
+                let preferred = peers.iter().copied().collect::<BTreeSet<_>>();
+                peers.extend(
+                    available
+                        .iter()
+                        .copied()
+                        .filter(|peer| !preferred.contains(peer)),
+                );
+                peers
+            }
             None => available.to_vec(),
         }
     }
@@ -7977,6 +7998,65 @@ mod tests {
                 if request.session() == session && request.peer_id() == PeerId::new(9))
         }));
         assert_eq!(runner.state.outbound.outstanding.len(), 1);
+    }
+
+    #[test]
+    fn validation_recovery_replays_after_reconnect_before_peer_ledger_ranges_refresh() {
+        let full = SyncPhase::Full {
+            lcl: identity(40),
+            published: identity(40),
+        };
+        let mut runner = CoordinatorRunner::with_phase(RunEpoch::new(1), full);
+        let recovery = target(90);
+        runner.update_target_peer_capabilities(
+            recovery,
+            vec![PeerTargetCapability::new(PeerId::new(1), false)],
+        );
+        let _ = runner.handle_event(AcquisitionEvent::TransportConnectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
+        ));
+        let started =
+            runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(recovery)));
+        let session = peer_request_session(&started);
+
+        let lost = runner.handle_event(AcquisitionEvent::TransportConnectivity(
+            PeerAvailabilitySnapshot::new(vec![]),
+        ));
+        assert!(lost.is_empty(), "transport loss remains phase-neutral");
+        assert_eq!(runner.phase(), &full);
+        assert!(runner.state.outbound.outstanding.is_empty());
+        assert!(
+            !runner
+                .session(session)
+                .expect("retained recovery owner")
+                .network_admitted
+        );
+
+        // A newly connected peer may not have published a fresh status/range
+        // yet. rippled still scores and admits that peer; exact `hasLedger`
+        // knowledge only puts a peer first.
+        runner.update_target_peer_capabilities(recovery, vec![]);
+        let recovered = runner.handle_event(AcquisitionEvent::TransportConnectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(9)]),
+        ));
+        assert_eq!(runner.phase(), &full);
+        assert!(
+            recovered
+                .iter()
+                .all(|effect| { !matches!(effect, AcquisitionEffect::SetServicePhase(_)) })
+        );
+        assert!(recovered.iter().any(|effect| {
+            matches!(effect, AcquisitionEffect::SendLedgerRequest(request)
+                if request.session() == session && request.peer_id() == PeerId::new(9))
+        }));
+        assert!(recovered.iter().any(|effect| {
+            matches!(effect, AcquisitionEffect::ArmTimer(timer)
+                if timer.operation().session() == session
+                    && timer.timer() == TimerKind::AcquireTimeout)
+        }));
+        let retained = runner.session(session).expect("rearmed recovery owner");
+        assert!(retained.network_admitted);
+        assert!(retained.sent_peers().contains(&PeerId::new(9)));
     }
 
     #[test]
