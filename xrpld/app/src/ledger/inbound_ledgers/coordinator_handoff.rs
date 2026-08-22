@@ -64,13 +64,15 @@ struct DeferredDemandKey {
     reason: AcquireReason,
     acquisition_id: u64,
     preferred_target: bool,
+    validation_recovery: bool,
+    validation_recovery_anchor: bool,
 }
 
-/// The coordinator retains at most two peerless demand classes: the latest
-/// preferred target and one ordinary/cache target. Keep
-/// the matching app-side origins in the same bounded shape so a lower-priority
-/// demand for another target cannot overwrite the retained preferred origin.
-const MAX_PENDING_SESSION_ORIGINS: usize = 2;
+/// The coordinator retains the preferred and ordinary peerless classes plus
+/// one stable validation-recovery anchor and its latest candidate. Keep the
+/// matching app-side origins in the same bounded shape so moving observations
+/// cannot overwrite either authoritative origin.
+const MAX_PENDING_SESSION_ORIGINS: usize = 4;
 
 /// The production [`HandoffPort`]: delivers durable ledgers to the
 /// LedgerMaster/NetworkOps completed-ledger channel with id-deduplication.
@@ -88,9 +90,8 @@ pub struct CoordinatorHandoffPort {
     sessions: HashMap<SessionRef, (AcquireReason, u64)>,
     /// Bounded app-origin bindings awaiting exact `SessionStarted` effects.
     /// The key includes target, reason, and acquisition id. This mirrors the
-    /// coordinator's one preferred plus one peerless ordinary demand,
-    /// and preserves preferred provenance across rejected lower-priority work
-    /// even when that work targets a different ledger.
+    /// coordinator's preferred, ordinary, validation-anchor, and
+    /// validation-candidate classes.
     pending_session_origins: HashMap<DeferredDemandKey, ()>,
     stats: HandoffPortStats,
 }
@@ -141,16 +142,20 @@ impl CoordinatorHandoffPort {
             reason,
             acquisition_id,
             preferred_target,
+            validation_recovery: false,
+            validation_recovery_anchor: false,
         };
         if preferred_target {
             // Promotion of an exact ordinary target consumes that ordinary
             // class just as `retain_peerless_acquire` removes it before
             // inserting the preferred entry.
-            self.pending_session_origins
-                .retain(|pending, ()| !pending.preferred_target && pending.target != target);
+            self.pending_session_origins.retain(|pending, ()| {
+                pending.validation_recovery
+                    || (!pending.preferred_target && pending.target != target)
+            });
         } else {
             self.pending_session_origins
-                .retain(|pending, ()| pending.preferred_target);
+                .retain(|pending, ()| pending.preferred_target || pending.validation_recovery);
         }
         self.pending_session_origins.insert(key, ());
         debug_assert!(self.pending_session_origins.len() <= MAX_PENDING_SESSION_ORIGINS);
@@ -171,6 +176,58 @@ impl CoordinatorHandoffPort {
             reason,
             acquisition_id,
             preferred_target,
+            validation_recovery: false,
+            validation_recovery_anchor: false,
+        });
+    }
+
+    /// Retain the exact provenance for the phase-neutral validation-recovery
+    /// latch. This is a third bounded class so a moving candidate cannot
+    /// overwrite an unbound anchor's ordinary provenance.
+    pub(crate) fn register_pending_validation_recovery_origin(
+        &mut self,
+        target: basics::base_uint::Uint256,
+        reason: AcquireReason,
+        acquisition_id: u64,
+        anchor: bool,
+    ) {
+        self.pending_session_origins.retain(|pending, ()| {
+            !pending.validation_recovery || (!anchor && pending.validation_recovery_anchor)
+        });
+        self.pending_session_origins.insert(
+            DeferredDemandKey {
+                target,
+                reason,
+                acquisition_id,
+                preferred_target: false,
+                validation_recovery: true,
+                validation_recovery_anchor: anchor,
+            },
+            (),
+        );
+        debug_assert!(self.pending_session_origins.len() <= MAX_PENDING_SESSION_ORIGINS);
+    }
+
+    pub(crate) fn clear_pending_validation_recovery_origin(
+        &mut self,
+        target: basics::base_uint::Uint256,
+        reason: AcquireReason,
+        acquisition_id: u64,
+        anchor: bool,
+    ) {
+        self.pending_session_origins.remove(&DeferredDemandKey {
+            target,
+            reason,
+            acquisition_id,
+            preferred_target: false,
+            validation_recovery: true,
+            validation_recovery_anchor: anchor,
+        });
+    }
+
+    pub(crate) fn clear_pending_validation_recovery_candidates(&mut self) {
+        self.pending_session_origins.retain(|pending, ()| {
+            !pending.validation_recovery || pending.validation_recovery_anchor
         });
     }
 
@@ -219,6 +276,24 @@ impl HandoffPort for CoordinatorHandoffPort {
             .keys()
             .copied()
             .find(|pending| pending.target == session.target_hash() && pending.preferred_target)
+            .or_else(|| {
+                self.pending_session_origins
+                    .keys()
+                    .copied()
+                    .find(|pending| {
+                        pending.target == session.target_hash()
+                            && pending.validation_recovery
+                            && pending.validation_recovery_anchor
+                    })
+            })
+            .or_else(|| {
+                self.pending_session_origins
+                    .keys()
+                    .copied()
+                    .find(|pending| {
+                        pending.target == session.target_hash() && pending.validation_recovery
+                    })
+            })
             .or_else(|| {
                 self.pending_session_origins
                     .keys()
@@ -413,6 +488,145 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].reason, AcquireReason::Consensus);
         assert_eq!(delivered[0].acquisition_id, 41);
+    }
+
+    #[test]
+    fn validation_recovery_candidate_cannot_overwrite_unbound_anchor_origin() {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let (events, _) = mpsc::sync_channel(256);
+        let mut port = CoordinatorHandoffPort::new(tx, events);
+        let mut counter = IdCounter::new();
+        let anchor = session(&mut counter);
+        let candidate = SessionRef::new(
+            RunEpoch::new(1),
+            counter.next_id(),
+            Uint256::from(2),
+            counter.next_id(),
+            StoreGeneration::new(1),
+        );
+
+        port.register_pending_validation_recovery_origin(
+            anchor.target_hash(),
+            AcquireReason::Consensus,
+            41,
+            true,
+        );
+        port.register_pending_validation_recovery_origin(
+            candidate.target_hash(),
+            AcquireReason::Consensus,
+            42,
+            false,
+        );
+        assert_eq!(port.pending_session_origins.len(), 2);
+
+        port.session_started(anchor);
+        port.session_started(candidate);
+        port.publish_durable(durable_handoff(
+            &mut counter,
+            anchor,
+            immutable_ledger(7, 1),
+        ));
+        port.publish_durable(durable_handoff(
+            &mut counter,
+            candidate,
+            immutable_ledger(8, 2),
+        ));
+        let mut delivered = drain(&rx);
+        delivered.sort_by_key(|ledger| ledger.acquisition_id);
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].acquisition_id, 41);
+        assert_eq!(delivered[1].acquisition_id, 42);
+    }
+
+    #[test]
+    fn bound_validation_anchor_promotes_candidate_with_origin_and_none_withdraws_future_origin() {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let (events, _) = mpsc::sync_channel(256);
+        let mut port = CoordinatorHandoffPort::new(tx, events);
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        let anchor = LedgerTarget::new(Uint256::from(10), Some(10));
+        let candidate = LedgerTarget::new(Uint256::from(11), Some(11));
+        runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
+        ));
+
+        port.register_pending_validation_recovery_origin(
+            anchor.hash(),
+            AcquireReason::Consensus,
+            51,
+            true,
+        );
+        let anchor_started = runner
+            .handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(anchor)))
+            .into_iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(session),
+                _ => None,
+            })
+            .expect("anchor starts");
+        port.session_started(anchor_started);
+
+        port.register_pending_validation_recovery_origin(
+            candidate.hash(),
+            AcquireReason::Consensus,
+            52,
+            false,
+        );
+        let queued =
+            runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(candidate)));
+        assert!(
+            queued
+                .iter()
+                .all(|effect| !matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+        assert!(runner.has_validation_recovery_candidate(candidate));
+
+        let candidate_started = runner
+            .handle_event(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)))
+            .into_iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session)
+                    if session.target_hash() == candidate.hash() =>
+                {
+                    Some(session)
+                }
+                _ => None,
+            })
+            .expect("candidate starts at anchor terminal boundary");
+        port.session_started(candidate_started);
+        let mut counter = IdCounter::new();
+        port.publish_durable(durable_handoff(
+            &mut counter,
+            candidate_started,
+            immutable_ledger(11, 2),
+        ));
+        let delivered = drain(&rx);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].acquisition_id, 52);
+
+        let withdrawn = Uint256::from(12);
+        port.register_pending_validation_recovery_origin(
+            withdrawn,
+            AcquireReason::Consensus,
+            53,
+            false,
+        );
+        port.clear_pending_validation_recovery_candidates();
+        let withdrawn_session = SessionRef::new(
+            RunEpoch::new(1),
+            counter.next_id(),
+            withdrawn,
+            counter.next_id(),
+            StoreGeneration::new(2),
+        );
+        port.session_started(withdrawn_session);
+        port.publish_durable(durable_handoff(
+            &mut counter,
+            withdrawn_session,
+            immutable_ledger(12, 2),
+        ));
+        assert!(drain(&rx).is_empty());
+        assert_eq!(port.stats().unknown_session, 1);
     }
 
     #[test]

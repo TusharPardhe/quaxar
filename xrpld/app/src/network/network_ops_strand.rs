@@ -1414,6 +1414,10 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         min_valid_seq,
         &peer_counts,
     );
+    let validation_recovery_target = preference_diagnostic
+        .validation_recovery_candidate
+        .map(|(seq, hash)| (hash, seq));
+    shared_inbound.coordinator_validation_recovery_target(validation_recovery_target);
     let selected_preferred_hash = preference_diagnostic.selected;
     // Match rippled's checkLastClosedLedger: preference is recomputed for
     // every accepted-boundary pass. Existing per-hash acquisitions may finish
@@ -1478,6 +1482,9 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         validation_selection_source = ?preference_diagnostic.selection_source,
         validation_acquired_recovery_candidate = ?preference_diagnostic.acquired_recovery_candidate,
         validation_acquired_recovery_peer_support = ?preference_diagnostic.acquired_recovery_peer_support,
+        validation_recovery_candidate = ?preference_diagnostic.validation_recovery_candidate,
+        validation_recovery_support = ?preference_diagnostic.validation_recovery_support,
+        validation_recovery_peer_support = ?preference_diagnostic.validation_recovery_peer_support,
         validation_working_source = ?preference_diagnostic.working_source,
         "LCL trace: preferred-LCL selection evaluated"
     );
@@ -1513,6 +1520,9 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             validation_selection_source = ?preference_diagnostic.selection_source,
             validation_acquired_recovery_candidate = ?preference_diagnostic.acquired_recovery_candidate,
             validation_acquired_recovery_peer_support = ?preference_diagnostic.acquired_recovery_peer_support,
+            validation_recovery_candidate = ?preference_diagnostic.validation_recovery_candidate,
+            validation_recovery_support = ?preference_diagnostic.validation_recovery_support,
+            validation_recovery_peer_support = ?preference_diagnostic.validation_recovery_peer_support,
             validation_trie_preferred = ?preference_diagnostic.trie_preferred,
             validation_acquiring_preferred = ?preference_diagnostic.acquiring_preferred,
             validation_working_preferred = ?preference_diagnostic.working_preferred,

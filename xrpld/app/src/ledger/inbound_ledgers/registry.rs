@@ -1221,6 +1221,98 @@ impl InboundLedgers {
         true
     }
 
+    /// Feed the accepted-boundary validation-recovery candidate. The first
+    /// exact target remains the phase-neutral acquisition owner until its
+    /// terminal boundary; `None` withdraws only a candidate waiting behind it.
+    pub fn coordinator_validation_recovery_target(&self, target: Option<(Uint256, u32)>) -> bool {
+        if self.stopping.load(Ordering::Acquire) {
+            return false;
+        }
+        let failures = {
+            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let Some(coordinator) = guard.as_mut() else {
+                return false;
+            };
+            coordinator.refresh_peers(self.coordinator_peer_snapshot());
+            let peers = self
+                .coordinator_peer_snapshot()
+                .iter()
+                .map(|peer| peer.id())
+                .collect::<Vec<_>>();
+            coordinator.transport_connectivity(&peers);
+
+            let target = target.and_then(|(hash, seq)| {
+                (!hash.is_zero()).then_some(acquisition::LedgerTarget::new(
+                    hash,
+                    (seq != 0).then_some(seq),
+                ))
+            });
+            if target.is_none() {
+                coordinator.clear_pending_validation_recovery_candidates();
+            }
+            let prior_candidate = coordinator.current_validation_recovery_candidate();
+            let origin = target.map(|target| {
+                let anchor = coordinator
+                    .current_validation_recovery_target()
+                    .is_none_or(|current| current.hash() == target.hash());
+                let acquisition_id = self.next_acquisition_id.fetch_add(1, Ordering::Relaxed);
+                let seq = target.sequence().unwrap_or_default();
+                self.coordinator_origins.register(
+                    target.hash(),
+                    seq,
+                    ledger::InboundLedgerReason::Consensus,
+                );
+                coordinator.register_pending_validation_recovery_origin(
+                    target.hash(),
+                    AcquireReason::Consensus,
+                    acquisition_id,
+                    anchor,
+                );
+                (target, acquisition_id, anchor)
+            });
+            let effects = coordinator.validation_recovery_target(target);
+            if let Some(prior) = prior_candidate {
+                let retained_as_anchor = coordinator
+                    .current_validation_recovery_target()
+                    .is_some_and(|current| current.hash() == prior.hash());
+                let retained_as_candidate = coordinator
+                    .current_validation_recovery_candidate()
+                    .is_some_and(|current| current.hash() == prior.hash());
+                if !retained_as_anchor
+                    && !retained_as_candidate
+                    && !coordinator.retains_session_origin_for_hash(prior.hash())
+                {
+                    self.coordinator_origins.remove(prior.hash());
+                }
+            }
+            if let Some((target, acquisition_id, anchor)) = origin {
+                let started = effects.iter().any(|effect| {
+                    matches!(effect, AcquisitionEffect::SessionStarted(session) if session.target_hash() == target.hash())
+                });
+                let retained = if anchor {
+                    coordinator.has_unbound_validation_recovery_target(target)
+                } else {
+                    coordinator.has_validation_recovery_candidate(target)
+                };
+                if !started && !retained {
+                    coordinator.clear_pending_validation_recovery_origin(
+                        target.hash(),
+                        AcquireReason::Consensus,
+                        acquisition_id,
+                        anchor,
+                    );
+                }
+                if !started && !coordinator.retains_session_origin_for_hash(target.hash()) {
+                    self.coordinator_origins.remove(target.hash());
+                }
+            }
+            coordinator.drain();
+            coordinator.take_terminal_failures()
+        };
+        self.record_coordinator_failures(failures);
+        true
+    }
+
     /// Feed rippled's mode-only `consensusViewChange` fact. Demotes
     /// `Tracking/Full -> Connected` without selecting or pinning an acquisition
     /// target. Returns false unless the coordinator is installed.
@@ -2691,6 +2783,24 @@ impl InboundLedgers {
                 ]))
             })
             .collect::<Vec<_>>();
+        let validation_recovery_target = snapshot
+            .validation_recovery_target()
+            .map(|target| {
+                JsonValue::Object(BTreeMap::from([
+                    (
+                        "hash".to_owned(),
+                        JsonValue::String(target.hash().to_string()),
+                    ),
+                    (
+                        "sequence".to_owned(),
+                        target
+                            .sequence()
+                            .map(|sequence| JsonValue::Unsigned(sequence.into()))
+                            .unwrap_or(JsonValue::Null),
+                    ),
+                ]))
+            })
+            .unwrap_or(JsonValue::Null);
         JsonValue::Object(BTreeMap::from([
             (
                 "run_epoch".to_owned(),
@@ -2767,6 +2877,17 @@ impl InboundLedgers {
             (
                 "local_scan_waiters".to_owned(),
                 JsonValue::Unsigned(snapshot.local_scan_waiters() as u64),
+            ),
+            (
+                "validation_recovery_target".to_owned(),
+                validation_recovery_target,
+            ),
+            (
+                "validation_recovery_session".to_owned(),
+                snapshot
+                    .validation_recovery_session()
+                    .map(|session| JsonValue::Unsigned(session.session_id().get()))
+                    .unwrap_or(JsonValue::Null),
             ),
             (
                 "timers_armed".to_owned(),
@@ -3933,6 +4054,27 @@ mod tests {
             "coordinator-mode unmatched traffic must not wake a legacy actor"
         );
         registry.stop();
+    }
+
+    #[test]
+    fn moving_validation_candidates_keep_session_origins_bounded_and_none_withdraws() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        registry.set_phase_state(Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Full,
+        )));
+        assert!(registry.install_coordinator());
+
+        assert!(registry.coordinator_validation_recovery_target(Some((Uint256::from(70), 70))));
+        assert_eq!(registry.coordinator_origins.len(), 1);
+        assert!(registry.coordinator_validation_recovery_target(Some((Uint256::from(71), 71))));
+        assert_eq!(registry.coordinator_origins.len(), 2);
+        assert!(registry.coordinator_validation_recovery_target(Some((Uint256::from(72), 72))));
+        assert_eq!(registry.coordinator_origins.len(), 2);
+        assert!(registry.coordinator_validation_recovery_target(None));
+        assert_eq!(registry.coordinator_origins.len(), 1);
     }
 
     #[test]

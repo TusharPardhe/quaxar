@@ -171,6 +171,7 @@ pub enum ShadowEventTag {
     ConsensusQuorumAvailable,
     AcquireRequested,
     ValidationTarget,
+    ValidationRecoveryTarget,
     PacketAdmitted,
     ReadCompleted,
     WriteCompleted,
@@ -203,6 +204,7 @@ impl ShadowEventTag {
             Self::ConsensusQuorumAvailable => "consensus_quorum_available",
             Self::AcquireRequested => "acquire_requested",
             Self::ValidationTarget => "validation_target",
+            Self::ValidationRecoveryTarget => "validation_recovery_target",
             Self::PacketAdmitted => "packet_admitted",
             Self::ReadCompleted => "read_completed",
             Self::WriteCompleted => "write_completed",
@@ -236,6 +238,7 @@ impl From<&AcquisitionEvent> for ShadowEventTag {
             AcquisitionEvent::ConsensusQuorumAvailable => Self::ConsensusQuorumAvailable,
             AcquisitionEvent::AcquireRequested { .. } => Self::AcquireRequested,
             AcquisitionEvent::ValidationTarget(_) => Self::ValidationTarget,
+            AcquisitionEvent::ValidationRecoveryTarget(_) => Self::ValidationRecoveryTarget,
             AcquisitionEvent::PacketAdmitted(_) => Self::PacketAdmitted,
             AcquisitionEvent::ReadCompleted(_) => Self::ReadCompleted,
             AcquisitionEvent::WriteCompleted(_) => Self::WriteCompleted,
@@ -445,6 +448,9 @@ pub struct ShadowRunner {
     store_generation: StoreGeneration,
     has_usable_peers: bool,
     latest_consensus_target: Option<LedgerTarget>,
+    validation_recovery_target: Option<LedgerTarget>,
+    validation_recovery_session: Option<SessionRef>,
+    validation_recovery_candidate: Option<LedgerTarget>,
     mirror: BTreeMap<SessionRef, MirrorSession>,
     queue_depth: usize,
     observations: VecDeque<ShadowObservation>,
@@ -485,6 +491,9 @@ impl ShadowRunner {
             store_generation: StoreGeneration::new(1),
             has_usable_peers: false,
             latest_consensus_target: None,
+            validation_recovery_target: None,
+            validation_recovery_session: None,
+            validation_recovery_candidate: None,
             mirror: BTreeMap::new(),
             queue_depth: 0,
             observations: VecDeque::new(),
@@ -598,6 +607,12 @@ impl ShadowRunner {
                     &mut out,
                 );
             }
+            AcquisitionEvent::ValidationRecoveryTarget(Some(target)) => {
+                self.derive_validation_recovery_target(tag, Some(*target), &mut out);
+            }
+            AcquisitionEvent::ValidationRecoveryTarget(None) => {
+                self.derive_validation_recovery_target(tag, None, &mut out);
+            }
             AcquisitionEvent::PacketAdmitted(packet) => {
                 self.derive_packet(tag, packet, &mut out);
             }
@@ -675,6 +690,7 @@ impl ShadowRunner {
             AcquisitionEvent::RegistrySweep => self.derive_registry_sweep(tag, &mut out),
             AcquisitionEvent::Shutdown => self.derive_shutdown(tag, &mut out),
         }
+        self.reconcile_validation_recovery_owner(tag, &mut out);
         if self.promote_latest_viable_syncing_anchor() {
             self.push(
                 tag,
@@ -865,6 +881,100 @@ impl ShadowRunner {
             Some(0),
             out,
         );
+    }
+
+    fn derive_validation_recovery_target(
+        &mut self,
+        tag: ShadowEventTag,
+        target: Option<LedgerTarget>,
+        out: &mut Vec<ShadowObservation>,
+    ) {
+        let Some(target) = target else {
+            self.validation_recovery_candidate = None;
+            self.push(
+                tag,
+                None,
+                DisagreementKind::Match,
+                Some(self.phase),
+                None,
+                None,
+                None,
+                None,
+                None,
+                out,
+            );
+            return;
+        };
+
+        if let Some(anchor) = self.validation_recovery_target {
+            if anchor.hash() != target.hash() {
+                self.validation_recovery_candidate = Some(target);
+                self.push(
+                    tag,
+                    self.validation_recovery_session,
+                    DisagreementKind::Match,
+                    Some(self.phase),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(self.queue_depth),
+                    out,
+                );
+                return;
+            }
+            self.validation_recovery_candidate = None;
+        } else {
+            self.validation_recovery_target = Some(target);
+            self.validation_recovery_candidate = None;
+        }
+        self.derive_acquire(tag, target, AcquireReason::Consensus, false, true, out);
+    }
+
+    fn reconcile_validation_recovery_owner(
+        &mut self,
+        tag: ShadowEventTag,
+        out: &mut Vec<ShadowObservation>,
+    ) {
+        if let Some(owner) = self.validation_recovery_session {
+            if self
+                .mirror
+                .get(&owner)
+                .is_some_and(|mirror| !mirror.phase.is_terminal())
+            {
+                return;
+            }
+            self.validation_recovery_session = None;
+            self.validation_recovery_target = None;
+            self.validation_recovery_target = self.validation_recovery_candidate.take();
+        }
+
+        let Some(target) = self.validation_recovery_target else {
+            return;
+        };
+        if let Some(owner) = self
+            .mirror
+            .iter()
+            .filter(|(_, mirror)| {
+                !mirror.phase.is_terminal() && mirror.target.hash() == target.hash()
+            })
+            .min_by_key(|(session, _)| session.session_id())
+            .map(|(session, _)| *session)
+        {
+            self.validation_recovery_session = Some(owner);
+            return;
+        }
+        if self.has_usable_peers {
+            self.derive_acquire(tag, target, AcquireReason::Consensus, false, true, out);
+            self.validation_recovery_session = self
+                .mirror
+                .iter()
+                .filter(|(_, mirror)| {
+                    !mirror.phase.is_terminal() && mirror.target.hash() == target.hash()
+                })
+                .min_by_key(|(session, _)| session.session_id())
+                .map(|(session, _)| *session);
+        }
     }
 
     fn derive_packet(
@@ -2500,6 +2610,47 @@ mod tests {
         assert_eq!(observations[0].event(), ShadowEventTag::BlockedWithNoTarget);
         assert_eq!(observations[0].derived_phase(), Some(&SyncPhase::Connected));
         assert_eq!(shadow.snapshot().disagreements(), 0);
+    }
+
+    #[test]
+    fn shadow_validation_recovery_keeps_one_phase_neutral_exact_owner() {
+        let mut shadow = runner();
+        let full = SyncPhase::Full {
+            lcl: identity(40),
+            published: identity(40),
+        };
+        shadow.record(&AcquisitionEvent::StartupMode { phase: full });
+        shadow.record(&AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![crate::id::PeerId::new(1)]),
+        ));
+
+        shadow.record(&AcquisitionEvent::ValidationRecoveryTarget(Some(target(
+            90,
+        ))));
+        assert_eq!(shadow.snapshot().phase(), &full);
+        assert_eq!(
+            shadow
+                .mirror
+                .values()
+                .filter(|session| !session.phase.is_terminal())
+                .count(),
+            1
+        );
+
+        shadow.record(&AcquisitionEvent::ValidationRecoveryTarget(Some(target(
+            91,
+        ))));
+        assert_eq!(shadow.snapshot().phase(), &full);
+        assert_eq!(shadow.validation_recovery_target, Some(target(90)));
+        assert_eq!(shadow.validation_recovery_candidate, Some(target(91)));
+        assert_eq!(
+            shadow
+                .mirror
+                .values()
+                .filter(|session| !session.phase.is_terminal())
+                .count(),
+            1
+        );
     }
 
     #[test]

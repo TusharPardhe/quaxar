@@ -932,11 +932,16 @@ impl CoordinatorSessionOrigins {
             .copied()
     }
 
-    fn remove(&self, target: Uint256) {
+    pub(crate) fn remove(&self, target: Uint256) {
         self.map
             .write()
             .expect("session origin lock")
             .remove(&target);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.read().expect("session origin lock").len()
     }
 }
 
@@ -1876,6 +1881,23 @@ mod tests {
         assert!(
             seed.build(second_session, &base_packet(&second)).is_none(),
             "an unregistered distinct target still builds nothing"
+        );
+    }
+
+    #[test]
+    fn withdrawn_validation_candidates_do_not_grow_session_origins() {
+        let origins = CoordinatorSessionOrigins::default();
+        let anchor = Uint256::from(1);
+        origins.register(anchor, 1, InboundLedgerReason::Consensus);
+        for sequence in 2..=128 {
+            let candidate = Uint256::from(sequence);
+            origins.register(candidate, sequence as u32, InboundLedgerReason::Consensus);
+            origins.remove(candidate);
+        }
+        assert_eq!(origins.len(), 1);
+        assert_eq!(
+            origins.resolve(anchor),
+            Some((1, InboundLedgerReason::Consensus))
         );
     }
 }

@@ -62,6 +62,13 @@ pub enum AcquisitionEvent {
     /// the validation trie is not evidence that the installed LCL diverged.
     ValidationTarget(LedgerTarget),
 
+    /// The validations adaptor's accepted-boundary recovery candidate. `Some`
+    /// latches one exact, phase-neutral acquisition owner; later candidates
+    /// remain policy metadata until that owner completes, fails, or is
+    /// cancelled. `None` clears only the future candidate and never cancels
+    /// the live exact owner.
+    ValidationRecoveryTarget(Option<LedgerTarget>),
+
     /// Overlay ingress admitted a decoded ledger packet with a consumed,
     /// gate-bound lease. The coordinator routes it by exact session identity
     /// and settles only its originating admission gate.

@@ -102,6 +102,40 @@ impl
         );
     }
 
+    pub(crate) fn register_pending_validation_recovery_origin(
+        &mut self,
+        target: basics::base_uint::Uint256,
+        reason: super::registry::AcquireReason,
+        acquisition_id: u64,
+        anchor: bool,
+    ) {
+        self.handoffs.register_pending_validation_recovery_origin(
+            target,
+            reason,
+            acquisition_id,
+            anchor,
+        );
+    }
+
+    pub(crate) fn clear_pending_validation_recovery_origin(
+        &mut self,
+        target: basics::base_uint::Uint256,
+        reason: super::registry::AcquireReason,
+        acquisition_id: u64,
+        anchor: bool,
+    ) {
+        self.handoffs.clear_pending_validation_recovery_origin(
+            target,
+            reason,
+            acquisition_id,
+            anchor,
+        );
+    }
+
+    pub(crate) fn clear_pending_validation_recovery_candidates(&mut self) {
+        self.handoffs.clear_pending_validation_recovery_candidates();
+    }
+
     /// Reopens an exact handoff after the recipient could not accept it, then
     /// queues a typed retry fact without running the owner under a receiver
     /// lock. A stale session or already-consumed handoff is ignored.

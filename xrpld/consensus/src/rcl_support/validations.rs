@@ -27,7 +27,7 @@
 //!   `std::mutex` in practice. This port uses `parking_lot::Mutex`
 //!   directly, matching the JobQueue rewrite's established convention.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use basics::chrono::NetClockTimePoint;
@@ -102,6 +102,13 @@ pub struct PreferredLclDiagnostic<Seq, Id> {
     /// Retained for diagnostic-schema compatibility; always `None` with the
     /// source-equivalent selector above.
     pub acquired_recovery_peer_support: Option<u32>,
+    /// Exact unacquired ledger whose current trusted-full waiters form a
+    /// strict majority and whose hash is also the strict-majority peer LCL.
+    /// This is acquisition advice only: it never changes `selected` or the
+    /// rippled-compatible preferred-ledger ordering.
+    pub validation_recovery_candidate: Option<(Seq, Id)>,
+    pub validation_recovery_support: Option<usize>,
+    pub validation_recovery_peer_support: Option<u32>,
     pub working_source: PreferredLclWorkingSource,
     pub selection_source: PreferredLclSelectionSource,
     pub selected: Id,
@@ -383,15 +390,6 @@ struct Inner<A: ValidationsAdaptor> {
     /// Ledgers being acquired from the network, keyed by `(seq, id)`, with
     /// the set of nodes waiting on that acquisition. Matches `acquiring_`.
     acquiring: BTreeMap<(SeqOf<A>, LedgerIdOf<A>), HashSet<NodeIdOf<A>>>,
-    /// Exact trusted acquisition waiters displaced by a newer trusted
-    /// validation before their ledger completed. This makes the latest
-    /// acquired support independent of completion/validation lock ordering
-    /// without reconstructing trust provenance from historical indexes.
-    superseded_acquiring: BTreeMap<(SeqOf<A>, LedgerIdOf<A>), HashSet<NodeIdOf<A>>>,
-    /// Insertion order of superseded waiters per node. Sequence order cannot
-    /// provide this bound because `SeqEnforcer` expiry permits a later waiter
-    /// to have a lower sequence.
-    superseded_acquiring_order: HashMap<NodeIdOf<A>, VecDeque<(SeqOf<A>, LedgerIdOf<A>)>>,
 }
 
 impl<A: ValidationsAdaptor> Inner<A> {
@@ -407,75 +405,12 @@ impl<A: ValidationsAdaptor> Inner<A> {
             trie: LedgerTrie::new(),
             last_ledger: HashMap::new(),
             acquiring: BTreeMap::new(),
-            superseded_acquiring: BTreeMap::new(),
-            superseded_acquiring_order: HashMap::new(),
-        }
-    }
-
-    fn remove_superseded_for_node(&mut self, node_id: &NodeIdOf<A>) {
-        self.superseded_acquiring.retain(|_, nodes| {
-            nodes.remove(node_id);
-            !nodes.is_empty()
-        });
-        self.superseded_acquiring_order.remove(node_id);
-    }
-
-    fn record_superseded(&mut self, node_id: &NodeIdOf<A>, key: (SeqOf<A>, LedgerIdOf<A>)) {
-        const MAX_SUPERSEDED_ACQUIRING_PER_NODE: usize = 8;
-        let inserted = self
-            .superseded_acquiring
-            .entry(key.clone())
-            .or_default()
-            .insert(node_id.clone());
-        if !inserted {
-            return;
-        }
-
-        let evicted = {
-            let order = self
-                .superseded_acquiring_order
-                .entry(node_id.clone())
-                .or_default();
-            order.push_back(key);
-            let mut evicted = Vec::new();
-            while order.len() > MAX_SUPERSEDED_ACQUIRING_PER_NODE {
-                if let Some(oldest) = order.pop_front() {
-                    evicted.push(oldest);
-                }
-            }
-            evicted
-        };
-        for oldest in evicted {
-            if let Some(nodes) = self.superseded_acquiring.get_mut(&oldest) {
-                nodes.remove(node_id);
-                if nodes.is_empty() {
-                    self.superseded_acquiring.remove(&oldest);
-                }
-            }
-        }
-    }
-
-    fn consume_superseded_key_for_node(
-        &mut self,
-        node_id: &NodeIdOf<A>,
-        key: &(SeqOf<A>, LedgerIdOf<A>),
-    ) {
-        let remove_order = self
-            .superseded_acquiring_order
-            .get_mut(node_id)
-            .is_some_and(|order| {
-                order.retain(|candidate| candidate != key);
-                order.is_empty()
-            });
-        if remove_order {
-            self.superseded_acquiring_order.remove(node_id);
         }
     }
 
     /// Remove support of a validated ledger from the trie. Matches
     /// `removeTrie`.
     fn remove_trie(&mut self, node_id: &NodeIdOf<A>, val: &A::Validation) {
-        self.remove_superseded_for_node(node_id);
         let key = (val.seq(), val.ledger_id());
         if let Some(set) = self.acquiring.get_mut(&key) {
             set.remove(node_id);
@@ -542,19 +477,15 @@ impl<A: ValidationsAdaptor> Inner<A> {
         );
 
         if let Some(prior_key) = prior {
-            let removed_exact_trusted_waiter = self
-                .acquiring
-                .get_mut(&prior_key)
-                .is_some_and(|set| set.remove(node_id));
+            if let Some(set) = self.acquiring.get_mut(&prior_key) {
+                set.remove(node_id);
+            }
             if self
                 .acquiring
                 .get(&prior_key)
                 .is_some_and(HashSet::is_empty)
             {
                 self.acquiring.remove(&prior_key);
-            }
-            if removed_exact_trusted_waiter {
-                self.record_superseded(node_id, prior_key);
             }
         }
 
@@ -633,15 +564,11 @@ impl<A: ValidationsAdaptor> Validations<A> {
     /// Reconcile a ledger that has just become available to the validation
     /// tracker.
     ///
-    /// A live exact waiter may install its ledger whenever that validator's
-    /// current validation remains trusted; membership in `acquiring` is the
-    /// exact trusted provenance. A late completion may also advance support for
-    /// an explicitly retained exact trusted waiter that a newer trusted
-    /// validation displaced. That provenance is insertion-order bounded,
-    /// consumed once, and never reconstructed from historical validation
-    /// indexes; the newer current waiter remains pending. Superseded
-    /// completions cannot downgrade resident support or cross a same-sequence
-    /// hash conflict.
+    /// Only live exact waiters may install support. A newer validation removes
+    /// its node from the older acquiring entry before a late completion can be
+    /// observed, exactly matching rippled's `updateTrie`/`checkAcquired`
+    /// ordering. Historical validation indexes are never reconstructed into
+    /// trie provenance.
     pub fn on_ledger_acquired(&self, ledger: A::Ledger) {
         let ledger_id = ledger.id();
         let ledger_seq = ledger.seq();
@@ -661,28 +588,6 @@ impl<A: ValidationsAdaptor> Validations<A> {
                 // its current validation has since changed but remains trusted.
                 inner.update_trie_ledger(&node_id, ledger.clone());
             }
-        }
-
-        let superseded_nodes = inner.superseded_acquiring.remove(&key).unwrap_or_default();
-        for node_id in superseded_nodes {
-            inner.consume_superseded_key_for_node(&node_id, &key);
-            let eligible = inner.current.get(&node_id).is_some_and(|current| {
-                current.trusted()
-                    && (current.seq() > ledger_seq
-                        || (current.seq() == ledger_seq && current.ledger_id() == ledger_id))
-            });
-            let advances_resident = inner
-                .last_ledger
-                .get(&node_id)
-                .is_none_or(|resident| resident.seq() < ledger_seq);
-            if !eligible || !advances_resident {
-                continue;
-            }
-
-            // This exact trusted waiter was displaced before acquisition
-            // completed. Advance the latest acquired support without consuming
-            // the validator's newer current waiter.
-            inner.update_trie_ledger(&node_id, ledger.clone());
         }
     }
 
@@ -1058,6 +963,50 @@ impl<A: ValidationsAdaptor> Validations<A> {
             .max_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)))
             .map(|(id, count)| (*id, *count));
 
+        // Rippled can normally complete GetConsL2 before the next validation
+        // displaces its waiter.  A bounded asynchronous coordinator can have
+        // several moving validation acquisitions in flight, so expose one
+        // exact quorum-backed target for a stable, phase-neutral acquisition
+        // owner.  Compute support from CURRENT trusted full validations, not
+        // from historical indexes or raw acquiring membership.
+        let current_trusted_full_count = inner
+            .current
+            .values()
+            .filter(|validation| validation.trusted() && validation.full())
+            .count();
+        let acquiring_quorum_candidate = inner
+            .acquiring
+            .iter()
+            .filter_map(|(key, waiters)| {
+                let support = waiters
+                    .iter()
+                    .filter(|node_id| {
+                        inner.current.get(*node_id).is_some_and(|validation| {
+                            validation.trusted()
+                                && validation.full()
+                                && validation.seq() == key.0
+                                && validation.ledger_id() == key.1
+                        })
+                    })
+                    .count();
+                (support > current_trusted_full_count / 2).then_some((key.0, key.1, support))
+            })
+            .max_by(|left, right| (left.2, left.0, left.1).cmp(&(right.2, right.0, right.1)));
+        let peer_total = peer_counts
+            .values()
+            .fold(0_u32, |total, count| total.saturating_add(*count));
+        let validation_recovery_advice = acquiring_quorum_candidate.and_then(|candidate| {
+            let peer_support = peer_counts.get(&candidate.1).copied().unwrap_or_default();
+            let dominates_peers = peer_preferred
+                .is_some_and(|(peer_hash, _)| peer_hash == candidate.1)
+                && peer_support > peer_total / 2;
+            (candidate.0 >= min_seq
+                && candidate.0 > lcl.seq()
+                && candidate.1 != lcl.id()
+                && dominates_peers)
+                .then_some((candidate.0, candidate.1, candidate.2, peer_support))
+        });
+
         // Match rippled `Validations::getPreferredLCL`: a trusted preference
         // below `minSeq` keeps the local LCL. Peer counts are considered only
         // when there is no trusted preference at all; an independently
@@ -1072,6 +1021,14 @@ impl<A: ValidationsAdaptor> Validations<A> {
                 None => (lcl.id(), PreferredLclSelectionSource::LocalNoPreference),
             },
         };
+        // This owner exists only to break the observed circular liveness case:
+        // a resident trie vote keeps the ordinary selector on the local LCL,
+        // so the moving acquiring majority never becomes resident. If normal
+        // rippled selection already points elsewhere (including directly at
+        // the acquiring fallback), its authoritative recovery path must run
+        // without a competing advisory owner.
+        let validation_recovery = validation_recovery_advice
+            .filter(|_| working_source == PreferredLclWorkingSource::Trie && selected == lcl.id());
 
         PreferredLclDiagnostic {
             trie_preferred: trie_preferred_info,
@@ -1079,6 +1036,10 @@ impl<A: ValidationsAdaptor> Validations<A> {
             working_preferred,
             acquired_recovery_candidate: None,
             acquired_recovery_peer_support: None,
+            validation_recovery_candidate: validation_recovery.map(|(seq, id, _, _)| (seq, id)),
+            validation_recovery_support: validation_recovery.map(|(_, _, support, _)| support),
+            validation_recovery_peer_support: validation_recovery
+                .map(|(_, _, _, peer_support)| peer_support),
             working_source,
             selection_source,
             selected,
@@ -1086,11 +1047,7 @@ impl<A: ValidationsAdaptor> Validations<A> {
             peer_lcl_entry_count: peer_counts.len(),
             current_validation_count: inner.current.len(),
             current_trusted_count: inner.current.values().filter(|v| v.trusted()).count(),
-            current_trusted_full_count: inner
-                .current
-                .values()
-                .filter(|v| v.trusted() && v.full())
-                .count(),
+            current_trusted_full_count,
             trie_ledger_count: inner.last_ledger.len(),
             acquiring_entry_count: inner.acquiring.len(),
             acquiring_waiter_count: inner.acquiring.values().map(HashSet::len).sum(),
@@ -1192,8 +1149,6 @@ impl<A: ValidationsAdaptor> Validations<A> {
     pub fn flush(&self) {
         let mut inner = self.inner.lock();
         inner.current.clear();
-        inner.superseded_acquiring.clear();
-        inner.superseded_acquiring_order.clear();
     }
 
     /// Count lagging trusted proposers, removing seen-online proposers
@@ -1482,6 +1437,147 @@ mod tests {
     }
 
     #[test]
+    fn validation_recovery_exposes_quorum_without_overriding_stale_trie_preference() {
+        let adaptor = MockAdaptor::new(1000);
+        let local_lcl = ledger_at(10, 10);
+        let network_lcl = ledger_at(20, 42);
+        adaptor.register_ledger(local_lcl.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(local_lcl.id(), local_lcl.seq(), 1000, 1, 1)),
+            ValStatus::Current
+        );
+        for node_id in 2..=7 {
+            assert_eq!(
+                validations.add(
+                    node_id,
+                    val(network_lcl.id(), network_lcl.seq(), 1000, node_id, node_id),
+                ),
+                ValStatus::Current
+            );
+        }
+
+        let peer_counts = BTreeMap::from([(local_lcl.id(), 1), (network_lcl.id(), 9)]);
+        let diagnostic =
+            validations.get_preferred_lcl_diagnostic(&local_lcl, local_lcl.seq(), &peer_counts);
+
+        // Preserve rippled's selector: the resident trie vote still wins.
+        assert_eq!(diagnostic.trie_preferred, Some((10, 10)));
+        assert_eq!(diagnostic.selected, local_lcl.id());
+        // Separately expose exact phase-neutral acquisition advice.
+        assert_eq!(
+            diagnostic.validation_recovery_candidate,
+            Some((network_lcl.seq(), network_lcl.id()))
+        );
+        assert_eq!(diagnostic.validation_recovery_support, Some(6));
+        assert_eq!(diagnostic.validation_recovery_peer_support, Some(9));
+    }
+
+    #[test]
+    fn validation_recovery_requires_strict_validation_and_peer_majorities() {
+        let adaptor = MockAdaptor::new(1000);
+        let local_lcl = ledger_at(10, 10);
+        let network_lcl = ledger_at(20, 42);
+        adaptor.register_ledger(local_lcl.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        for node_id in 1..=3 {
+            assert_eq!(
+                validations.add(
+                    node_id,
+                    val(network_lcl.id(), network_lcl.seq(), 1000, node_id, node_id),
+                ),
+                ValStatus::Current
+            );
+        }
+        for node_id in 4..=6 {
+            assert_eq!(
+                validations.add(
+                    node_id,
+                    val(
+                        (50 + node_id) as u8,
+                        network_lcl.seq(),
+                        1000,
+                        node_id,
+                        node_id
+                    ),
+                ),
+                ValStatus::Current
+            );
+        }
+
+        let tied_validations = BTreeMap::from([(network_lcl.id(), 9), (local_lcl.id(), 1)]);
+        let diagnostic = validations.get_preferred_lcl_diagnostic(
+            &local_lcl,
+            local_lcl.seq(),
+            &tied_validations,
+        );
+        assert_eq!(diagnostic.validation_recovery_candidate, None);
+
+        // A validation majority without a peer majority is likewise not
+        // sufficient acquisition policy.
+        assert_eq!(
+            validations.add(4, val(network_lcl.id(), network_lcl.seq() + 1, 1001, 4, 4)),
+            ValStatus::Current
+        );
+        let no_peer_majority = BTreeMap::from([(network_lcl.id(), 5), (local_lcl.id(), 5)]);
+        let diagnostic = validations.get_preferred_lcl_diagnostic(
+            &local_lcl,
+            local_lcl.seq(),
+            &no_peer_majority,
+        );
+        assert_eq!(diagnostic.validation_recovery_candidate, None);
+    }
+
+    #[test]
+    fn validation_recovery_stays_idle_when_normal_trie_selection_is_already_forward() {
+        let adaptor = MockAdaptor::new(1000);
+        let local_lcl = ledger_at(10, 10);
+        let selected_forward = ledger_at(15, 15);
+        let acquiring_majority = ledger_at(20, 42);
+        adaptor.register_ledger(selected_forward.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        for node_id in 1..=3 {
+            assert_eq!(
+                validations.add(
+                    node_id,
+                    val(
+                        selected_forward.id(),
+                        selected_forward.seq(),
+                        1000,
+                        node_id,
+                        node_id,
+                    ),
+                ),
+                ValStatus::Current
+            );
+        }
+        for node_id in 4..=7 {
+            assert_eq!(
+                validations.add(
+                    node_id,
+                    val(
+                        acquiring_majority.id(),
+                        acquiring_majority.seq(),
+                        1000,
+                        node_id,
+                        node_id,
+                    ),
+                ),
+                ValStatus::Current
+            );
+        }
+
+        let peer_counts = BTreeMap::from([(acquiring_majority.id(), 9), (local_lcl.id(), 1)]);
+        let diagnostic =
+            validations.get_preferred_lcl_diagnostic(&local_lcl, local_lcl.seq(), &peer_counts);
+        assert_eq!(diagnostic.selected, selected_forward.id());
+        assert_eq!(diagnostic.validation_recovery_candidate, None);
+    }
+
+    #[test]
     fn is_current_accepts_fresh_validation() {
         let p = ValidationParms::default();
         let now = NetClockTimePoint::new(1000);
@@ -1546,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn late_acquisition_retains_latest_acquired_support_after_current_validation_advances() {
+    fn late_superseded_acquisition_cannot_create_trie_support() {
         let adaptor = MockAdaptor::new(1000);
         let genesis = MockLedger::genesis_();
         let first = genesis.child(1);
@@ -1576,45 +1672,20 @@ mod tests {
             assert!(inner.acquiring.contains_key(&(second.seq(), second.id())));
         }
 
+        // Rippled removes each node from acquiring[first] as soon as its
+        // current validation advances. A later completion of first therefore
+        // has no provenance and cannot manufacture stale trie support.
         validations.adaptor().register_ledger(first.clone());
         validations.on_ledger_acquired(first.clone());
         {
             let inner = validations.inner.lock();
-            assert_eq!(
-                inner.last_ledger.get(&1).map(ValidationsLedger::id),
-                Some(first.id())
-            );
-            assert_eq!(
-                inner.last_ledger.get(&2).map(ValidationsLedger::id),
-                Some(first.id())
-            );
-            assert!(inner.acquiring.contains_key(&(second.seq(), second.id())));
-            assert!(
-                !inner
-                    .superseded_acquiring
-                    .contains_key(&(first.seq(), first.id()))
-            );
-        }
-
-        // Superseded provenance is one-shot. A duplicate completion neither
-        // re-adds support nor consumes the newer exact waiter.
-        validations.on_ledger_acquired(first.clone());
-        {
-            let inner = validations.inner.lock();
-            assert_eq!(
-                inner.last_ledger.get(&1).map(ValidationsLedger::id),
-                Some(first.id())
-            );
-            assert_eq!(
-                inner.last_ledger.get(&2).map(ValidationsLedger::id),
-                Some(first.id())
-            );
+            assert!(inner.last_ledger.is_empty());
             assert!(inner.acquiring.contains_key(&(second.seq(), second.id())));
         }
 
         assert_eq!(
             validations.get_preferred(&genesis),
-            Some((genesis.seq(), genesis.id()))
+            Some((second.seq(), second.id()))
         );
 
         validations.adaptor().register_ledger(second.clone());
@@ -1666,49 +1737,6 @@ mod tests {
             Some(first.id())
         );
         assert!(inner.acquiring.contains_key(&(second.seq(), second.id())));
-    }
-
-    #[test]
-    fn superseded_waiter_bound_uses_insertion_order_across_sequence_reset() {
-        let validations = Validations::new(ValidationParms::default(), MockAdaptor::new(1000));
-        let node_id = 1;
-        let oldest = (100, 10);
-        {
-            let mut inner = validations.inner.lock();
-            for offset in 0..8 {
-                inner.record_superseded(&node_id, (100 + offset, 10 + offset as u8));
-            }
-
-            // A post-expiry SeqEnforcer reset may produce a newer insertion
-            // whose sequence sorts before all existing records.
-            let after_reset = (1, 99);
-            inner.record_superseded(&node_id, after_reset);
-
-            assert!(
-                !inner
-                    .superseded_acquiring
-                    .get(&oldest)
-                    .is_some_and(|nodes| nodes.contains(&node_id))
-            );
-            assert!(
-                inner
-                    .superseded_acquiring
-                    .get(&after_reset)
-                    .is_some_and(|nodes| nodes.contains(&node_id))
-            );
-            assert_eq!(
-                inner
-                    .superseded_acquiring_order
-                    .get(&node_id)
-                    .map(VecDeque::len),
-                Some(8)
-            );
-        }
-
-        validations.flush();
-        let inner = validations.inner.lock();
-        assert!(inner.superseded_acquiring.is_empty());
-        assert!(inner.superseded_acquiring_order.is_empty());
     }
 
     #[test]
@@ -1794,7 +1822,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_validated_completion_advances_stale_trie_without_overriding_current_waiter() {
+    fn delayed_superseded_completion_does_not_advance_stale_trie() {
         let adaptor = MockAdaptor::new(1000);
         let genesis = MockLedger::genesis_();
         let stale = genesis.child(1);
@@ -1844,14 +1872,11 @@ mod tests {
 
         let after =
             validations.get_preferred_lcl_diagnostic(&genesis, completed.seq(), &BTreeMap::new());
-        assert_eq!(
-            after.trie_preferred,
-            Some((completed.seq(), completed.id()))
-        );
-        assert_eq!(after.selected, completed.id());
+        assert_eq!(after.trie_preferred, Some((stale.seq(), stale.id())));
+        assert_eq!(after.selected, genesis.id());
         assert_eq!(
             after.selection_source,
-            PreferredLclSelectionSource::WorkingPreferred
+            PreferredLclSelectionSource::LocalBelowMinSeq
         );
         assert_eq!(
             after.acquiring_preferred,

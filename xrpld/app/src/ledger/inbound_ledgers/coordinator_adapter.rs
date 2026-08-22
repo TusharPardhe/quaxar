@@ -723,6 +723,34 @@ where
         self.runner.has_deferred_consensus_target(target)
     }
 
+    pub(crate) fn has_unbound_validation_recovery_target(
+        &self,
+        target: acquisition::LedgerTarget,
+    ) -> bool {
+        self.runner.has_unbound_validation_recovery_target(target)
+    }
+
+    pub(crate) fn has_validation_recovery_candidate(
+        &self,
+        target: acquisition::LedgerTarget,
+    ) -> bool {
+        self.runner.has_validation_recovery_candidate(target)
+    }
+
+    pub(crate) fn current_validation_recovery_target(&self) -> Option<acquisition::LedgerTarget> {
+        self.runner.validation_recovery_target()
+    }
+
+    pub(crate) fn current_validation_recovery_candidate(
+        &self,
+    ) -> Option<acquisition::LedgerTarget> {
+        self.runner.validation_recovery_candidate()
+    }
+
+    pub(crate) fn retains_session_origin_for_hash(&self, hash: Uint256) -> bool {
+        self.runner.retains_session_origin_for_hash(hash)
+    }
+
     /// Report a usable-peer snapshot (overlay connectivity fact).
     pub(crate) fn connectivity(&mut self, snapshot: &[OverlayPeerId]) -> Vec<AcquisitionEffect> {
         for target in self.runner.active_targets() {
@@ -790,6 +818,21 @@ where
             self.runner.update_target_peer_capabilities(target, peers);
         }
         self.handle_fact(AcquisitionEvent::ValidationTarget(target))
+    }
+
+    /// Observe the accepted-boundary validation-recovery candidate. The
+    /// runner latches the first exact target phase-neutrally; `None` withdraws
+    /// only a future candidate.
+    pub(crate) fn validation_recovery_target(
+        &mut self,
+        target: Option<acquisition::LedgerTarget>,
+    ) -> Vec<AcquisitionEffect> {
+        if let Some(target) = target
+            && let Some(peers) = self.requests.peer_target_capabilities(target)
+        {
+            self.runner.update_target_peer_capabilities(target, peers);
+        }
+        self.handle_fact(AcquisitionEvent::ValidationRecoveryTarget(target))
     }
 
     /// Report the authoritative preferred-LCL target selected by NetworkOps
@@ -1009,6 +1052,7 @@ fn event_session(event: &AcquisitionEvent) -> Option<SessionRef> {
         | AcquisitionEvent::ConsensusQuorumAvailable
         | AcquisitionEvent::AcquireRequested { .. }
         | AcquisitionEvent::ValidationTarget(_)
+        | AcquisitionEvent::ValidationRecoveryTarget(_)
         | AcquisitionEvent::ConsensusTarget(_)
         | AcquisitionEvent::ConsensusViewChange
         | AcquisitionEvent::PreferredLclDivergence { .. }
