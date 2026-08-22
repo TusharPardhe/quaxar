@@ -96,6 +96,7 @@ pub fn increase_owner_count_for_object(
     )))?;
 
     if let Some(sponsor_sle) = sponsor_sle {
+        let sponsor = sponsor_sle.get_account_id(get_field_by_symbol("sfAccount"));
         let mut sponsor_obj = sponsor_sle.clone_as_object();
         sponsor_obj.set_field_u32(
             sponsoring_field,
@@ -107,7 +108,84 @@ pub fn increase_owner_count_for_object(
             sponsor_obj,
             *sponsor_sle.key(),
         )))?;
+
+        // A prefunded Sponsorship consumes one remaining reserve assignment
+        // when a new object is assigned to the sponsor. Directly authorized
+        // sponsorship has no Sponsorship SLE and therefore no counter here.
+        let sponsorship_keylet = protocol::sponsorship_keylet(
+            basics::base_uint::Uint160::from_void(sponsor.data()),
+            basics::base_uint::Uint160::from_void(account.data()),
+        );
+        if let Some(sponsorship_sle) = view.peek(sponsorship_keylet)? {
+            let remaining_field = get_field_by_symbol("sfRemainingOwnerCount");
+            let mut sponsorship_obj = sponsorship_sle.clone_as_object();
+            sponsorship_obj.set_field_u32(
+                remaining_field,
+                sponsorship_sle
+                    .get_field_u32(remaining_field)
+                    .saturating_sub(1),
+            );
+            view.update(Arc::new(STLedgerEntry::from_stobject(
+                sponsorship_obj,
+                *sponsorship_sle.key(),
+            )))?;
+        }
     }
+    Ok(())
+}
+
+/// Remove reserve units for an existing owned object, deriving any reserve
+/// sponsor from the object's `sfSponsor` field. This is the Rust equivalent
+/// of rippled's `decreaseOwnerCountForObject`.
+pub fn decrease_owner_count_for_object(
+    view: &mut dyn ApplyView,
+    account_sle: &Arc<STLedgerEntry>,
+    object_sle: &Arc<STLedgerEntry>,
+    count: u32,
+) -> Result<(), ViewError> {
+    let owner_field = get_field_by_symbol("sfOwnerCount");
+    let sponsored_field = get_field_by_symbol("sfSponsoredOwnerCount");
+    let sponsoring_field = get_field_by_symbol("sfSponsoringOwnerCount");
+    let sponsor_field = get_field_by_symbol("sfSponsor");
+    let account = account_sle.get_account_id(get_field_by_symbol("sfAccount"));
+
+    let current = account_sle.get_field_u32(owner_field);
+    let next = current.saturating_sub(count);
+    let mut account_obj = account_sle.clone_as_object();
+    account_obj.set_field_u32(owner_field, next);
+
+    if object_sle.is_field_present(sponsor_field) {
+        let sponsor = object_sle.get_account_id(sponsor_field);
+        let sponsor_sle = view
+            .peek(protocol::account_keylet(
+                basics::base_uint::Uint160::from_void(sponsor.data()),
+            ))?
+            .ok_or_else(|| ViewError::Conversion("reserve sponsor account missing".into()))?;
+
+        account_obj.set_field_u32(
+            sponsored_field,
+            account_sle
+                .get_field_u32(sponsored_field)
+                .saturating_sub(count),
+        );
+        let mut sponsor_obj = sponsor_sle.clone_as_object();
+        sponsor_obj.set_field_u32(
+            sponsoring_field,
+            sponsor_sle
+                .get_field_u32(sponsoring_field)
+                .saturating_sub(count),
+        );
+        view.update(Arc::new(STLedgerEntry::from_stobject(
+            sponsor_obj,
+            *sponsor_sle.key(),
+        )))?;
+    }
+
+    view.adjust_owner_count_hook(account, current, next);
+    view.update(Arc::new(STLedgerEntry::from_stobject(
+        account_obj,
+        *account_sle.key(),
+    )))?;
     Ok(())
 }
 

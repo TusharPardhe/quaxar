@@ -1579,27 +1579,6 @@ impl<V: ledger::ApplyView> TicketCreateDoApplySink for DispatcherTicketCreateSin
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LedgerSignerList {
-    flags: u32,
-    signer_entries_len: usize,
-    owner_node: u64,
-}
-
-impl SignerListSetLedgerEntry for LedgerSignerList {
-    fn flags(&self) -> u32 {
-        self.flags
-    }
-
-    fn signer_entries_len(&self) -> usize {
-        self.signer_entries_len
-    }
-
-    fn owner_node(&self) -> u64 {
-        self.owner_node
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DispatcherSignerEntry {
     account: AccountID,
@@ -1668,25 +1647,40 @@ fn remove_signer_list<V: ledger::ApplyView>(view: &mut V, account: AccountID) ->
     let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
     let signer_keylet = signers_keylet(Uint160::from_void(account.data()));
     let signer_list = match view.peek(signer_keylet) {
-        Ok(Some(sle)) => Some(LedgerSignerList {
-            flags: sle.get_field_u32(sf("sfFlags")),
-            signer_entries_len: sle.get_field_array(sf("sfSignerEntries")).len(),
-            owner_node: sle.get_field_u64(sf("sfOwnerNode")),
-        }),
-        Ok(None) => None,
+        Ok(sle) => sle,
         Err(_) => return Ter::TEF_INTERNAL,
     };
 
     // Inline removal logic to avoid multiple mutable borrows
-    if let Some(ref sl) = signer_list {
-        let owner_node = sl.owner_node;
-        let _ = ledger::dir_remove(view, &owner_dir, owner_node, signer_keylet.key, false);
-        let delta = -(sl.signer_entries_len as i32 + 2);
-        if let Ok(Some(account_sle)) = view.peek(account_keylet) {
-            let _ = ledger::adjust_owner_count(view, &account_sle, delta);
+    if let Some(signer_sle) = signer_list {
+        let flags = signer_sle.get_field_u32(sf("sfFlags"));
+        let signer_entries_len = signer_sle.get_field_array(sf("sfSignerEntries")).len();
+        let owner_node = signer_sle.get_field_u64(sf("sfOwnerNode"));
+        match ledger::dir_remove(view, &owner_dir, owner_node, signer_keylet.key, false) {
+            Ok(true) => {}
+            Ok(false) => return Ter::TEF_BAD_LEDGER,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         }
-        if let Ok(Some(signer_sle)) = view.peek(signer_keylet) {
-            let _ = view.erase(signer_sle);
+        // Modern signer lists carry lsfOneOwnerCount and consume exactly one
+        // reserve unit.  Only legacy pre-MultiSignReserve lists use the old
+        // `2 + signer_count` accounting.  This distinction is consensus
+        // critical when destroying or replacing a signer list.
+        let count = if flags & LSF_ONE_OWNER_COUNT != 0 {
+            1
+        } else {
+            signer_entries_len as u32 + 2
+        };
+        let account_sle = match view.peek(account_keylet) {
+            Ok(Some(sle)) => sle,
+            Ok(None) => return Ter::TEF_BAD_LEDGER,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        if ledger::decrease_owner_count_for_object(view, &account_sle, &signer_sle, count).is_err()
+        {
+            return Ter::TEF_BAD_LEDGER;
+        }
+        if view.erase(signer_sle).is_err() {
+            return Ter::TEF_BAD_LEDGER;
         }
     }
     Ter::TES_SUCCESS
@@ -1716,6 +1710,7 @@ fn destroy_signer_list<V: ledger::ApplyView>(view: &mut V, account: AccountID) -
 
 fn replace_signer_list<V: ledger::ApplyView>(
     view: &mut V,
+    sttx: &STTx,
     account: AccountID,
     quorum: u32,
     signers: &[DispatcherSignerEntry],
@@ -1735,13 +1730,21 @@ fn replace_signer_list<V: ledger::ApplyView>(
         Err(_) => return Ter::TEF_INTERNAL,
     };
 
-    let pre_fee_balance = pre_fee_balance_drops
-        .map(XRPAmount::from_drops)
-        .unwrap_or_else(|| account_sle.get_field_amount(sf("sfBalance")).xrp());
-    let old_owner_count = account_sle.get_field_u32(sf("sfOwnerCount"));
-    let new_reserve =
-        XRPAmount::from_drops(view.fees().account_reserve(old_owner_count as usize + 1) as i64);
-    if pre_fee_balance < new_reserve {
+    let sponsor_sle = match check_cash_reserve_sponsor(view, sttx) {
+        Ok(sponsor) => sponsor,
+        Err(ter) => return ter,
+    };
+
+    let has_reserve = match check_cash_has_object_reserve(
+        view,
+        &account_sle,
+        pre_fee_balance_drops,
+        sponsor_sle.as_ref(),
+    ) {
+        Ok(has_reserve) => has_reserve,
+        Err(ter) => return ter,
+    };
+    if !has_reserve {
         return Ter::TEC_INSUFFICIENT_RESERVE;
     }
 
@@ -1789,10 +1792,14 @@ fn replace_signer_list<V: ledger::ApplyView>(
     }
     signer_list.set_field_array(sf("sfSignerEntries"), signer_array);
 
+    if let Some(sponsor_sle) = sponsor_sle.as_ref() {
+        signer_list.set_account_id(sf("sfSponsor"), sponsor_sle.get_account_id(sf("sfAccount")));
+    }
+
     if view.insert(Arc::new(signer_list)).is_err() {
         return Ter::TEF_INTERNAL;
     }
-    if ledger::adjust_owner_count(view, &account_sle, 1).is_err() {
+    if ledger::increase_owner_count_for_object(view, &account_sle, sponsor_sle.as_ref()).is_err() {
         return Ter::TEF_INTERNAL;
     }
 
@@ -2633,6 +2640,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             match operation.operation {
                 SignerListSetOperation::Set => replace_signer_list(
                     view,
+                    sttx,
                     account,
                     operation.quorum,
                     &write_entries,

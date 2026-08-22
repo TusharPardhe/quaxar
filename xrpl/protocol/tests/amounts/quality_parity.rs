@@ -158,6 +158,24 @@ fn number_multiply_matches_live_offer_tick_size_rounding() {
 }
 
 #[test]
+fn number_multiply_matches_live_20121154_offer_tick_size_rounding() {
+    // Testnet ledger 20,121,154, transaction C795CFBD... is the next
+    // same-orientation tfPassive|tfSell offer observed after the original
+    // multiplication fix.  Keep the exact vector so any remaining ledger
+    // divergence cannot be mistaken for the already-correct tick rounding.
+    let taker_gets = native_amount(1_250_000_000);
+    let taker_pays = issue_amount(2_011_765_800_000_000, -14);
+    let rounded_quality = Quality::from_value(get_rate(&taker_gets, &taker_pays)).round(6);
+    assert_eq!(rounded_quality.value(), 0x4d05_b7c2_4b64_f800);
+
+    let rounded_pays = multiply(&taker_gets, &rounded_quality.rate(), no_issue());
+    assert_eq!(rounded_pays.text(), "20.11775");
+    assert_eq!(rounded_pays.mantissa(), 2_011_775_000_000_000);
+    assert_eq!(rounded_pays.exponent(), -14);
+    assert_eq!(get_rate(&taker_gets, &rounded_pays), 0x4d05_b7c2_4b64_f800);
+}
+
+#[test]
 fn number_multiply_matches_live_offer_tick_size_native_output() {
     // Testnet ledger 20,120,246, transaction 4F741FC8... is the reverse
     // tfSell orientation: issued input rounded at TickSize=6 into XRP output.

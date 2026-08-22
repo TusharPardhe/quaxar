@@ -5437,6 +5437,187 @@ fn signer_list_set_destroy_removes_existing_signer_list() {
 }
 
 #[test]
+fn signer_list_set_destroy_modern_list_removes_one_owner_count() {
+    // Testnet ledger 20,121,340, transaction A1C0DBCB... destroyed a
+    // one-signer list carrying lsfOneOwnerCount.  rippled changes OwnerCount
+    // from 2 to 1; applying the legacy `2 + signer_count` cost here forks the
+    // account-state root even though the transaction returns tesSUCCESS.
+    let account = sample_account(0x22);
+    let signer_list = signer_list_entry(account, 0, LSF_ONE_OWNER_COUNT);
+    let ledger = empty_ledger(vec![
+        account_root(account, 2, 0),
+        owner_dir_root(account, signer_list.key().to_owned()),
+        signer_list,
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let sttx = signer_list_set_tx(account, 0, &[]);
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &sttx, TxType::SIGNER_LIST_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let account_sle = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("account read")
+        .expect("account remains");
+    assert_eq!(account_sle.get_field_u32(sf("sfOwnerCount")), 1);
+}
+
+#[test]
+fn signer_list_set_destroy_legacy_list_uses_signer_count_cost() {
+    let account = sample_account(0x23);
+    let signer_list = signer_list_entry(account, 0, 0);
+    let ledger = empty_ledger(vec![
+        account_root(account, 3, 0),
+        owner_dir_root(account, signer_list.key().to_owned()),
+        signer_list,
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &signer_list_set_tx(account, 0, &[]),
+            TxType::SIGNER_LIST_SET,
+            None,
+        ),
+        Ter::TES_SUCCESS
+    );
+    let account_sle = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("account read")
+        .expect("account remains");
+    assert_eq!(account_sle.get_field_u32(sf("sfOwnerCount")), 0);
+}
+
+#[test]
+fn signer_list_set_destroy_updates_reserve_sponsor_counts() {
+    let account = sample_account(0x24);
+    let sponsor = sample_account(0x25);
+    let mut signer_list = signer_list_entry(account, 0, LSF_ONE_OWNER_COUNT);
+    signer_list.set_account_id(sf("sfSponsor"), sponsor);
+    let mut account_sle = account_root(account, 2, 0);
+    account_sle.set_field_u32(sf("sfSponsoredOwnerCount"), 1);
+    let mut sponsor_sle = account_root(sponsor, 1, 0);
+    sponsor_sle.set_field_u32(sf("sfSponsoringOwnerCount"), 1);
+    let ledger = empty_ledger(vec![
+        account_sle,
+        sponsor_sle,
+        owner_dir_root(account, signer_list.key().to_owned()),
+        signer_list,
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &signer_list_set_tx(account, 0, &[]),
+            TxType::SIGNER_LIST_SET,
+            None,
+        ),
+        Ter::TES_SUCCESS
+    );
+    let account_sle = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("account read")
+        .expect("account remains");
+    let sponsor_sle = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .expect("sponsor read")
+        .expect("sponsor remains");
+    assert_eq!(account_sle.get_field_u32(sf("sfOwnerCount")), 1);
+    assert_eq!(account_sle.get_field_u32(sf("sfSponsoredOwnerCount")), 0);
+    assert_eq!(sponsor_sle.get_field_u32(sf("sfSponsoringOwnerCount")), 0);
+}
+
+#[test]
+fn signer_list_set_create_assigns_reserve_sponsor() {
+    let account = sample_account(0x26);
+    let sponsor = sample_account(0x27);
+    let signer = sample_account(0x28);
+    let ledger = empty_ledger(vec![
+        account_root(account, 0, 0),
+        account_root(sponsor, 0, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let mut sttx = signer_list_set_tx(account, 1, &[(signer, 1)]);
+    sttx.set_account_id(sf("sfSponsor"), sponsor);
+    sttx.set_field_u32(sf("sfSponsorFlags"), ledger::SPF_SPONSOR_RESERVE);
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &sttx, TxType::SIGNER_LIST_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let signer_list = view
+        .read(signers_keylet(raw_account_id(account)))
+        .expect("signer list read")
+        .expect("signer list exists");
+    let account_sle = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("account read")
+        .expect("account remains");
+    let sponsor_sle = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .expect("sponsor read")
+        .expect("sponsor remains");
+    assert_eq!(signer_list.get_account_id(sf("sfSponsor")), sponsor);
+    assert_eq!(account_sle.get_field_u32(sf("sfOwnerCount")), 1);
+    assert_eq!(account_sle.get_field_u32(sf("sfSponsoredOwnerCount")), 1);
+    assert_eq!(sponsor_sle.get_field_u32(sf("sfSponsoringOwnerCount")), 1);
+}
+
+#[test]
+fn signer_list_set_replace_reassigns_reserve_to_new_sponsor() {
+    let account = sample_account(0x29);
+    let old_sponsor = sample_account(0x2A);
+    let new_sponsor = sample_account(0x2B);
+    let signer = sample_account(0x2C);
+    let mut old_list = signer_list_entry(account, 0, LSF_ONE_OWNER_COUNT);
+    old_list.set_account_id(sf("sfSponsor"), old_sponsor);
+    let mut account_sle = account_root(account, 1, 0);
+    account_sle.set_field_u32(sf("sfSponsoredOwnerCount"), 1);
+    let mut old_sponsor_sle = account_root(old_sponsor, 0, 0);
+    old_sponsor_sle.set_field_u32(sf("sfSponsoringOwnerCount"), 1);
+    let ledger = empty_ledger(vec![
+        account_sle,
+        old_sponsor_sle,
+        account_root(new_sponsor, 0, 0),
+        owner_dir_root(account, old_list.key().to_owned()),
+        old_list,
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let mut sttx = signer_list_set_tx(account, 1, &[(signer, 1)]);
+    sttx.set_account_id(sf("sfSponsor"), new_sponsor);
+    sttx.set_field_u32(sf("sfSponsorFlags"), ledger::SPF_SPONSOR_RESERVE);
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &sttx, TxType::SIGNER_LIST_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let signer_list = view
+        .read(signers_keylet(raw_account_id(account)))
+        .expect("signer list read")
+        .expect("replacement exists");
+    let old_sponsor_sle = view
+        .read(account_keylet(raw_account_id(old_sponsor)))
+        .expect("old sponsor read")
+        .expect("old sponsor remains");
+    let new_sponsor_sle = view
+        .read(account_keylet(raw_account_id(new_sponsor)))
+        .expect("new sponsor read")
+        .expect("new sponsor remains");
+    assert_eq!(signer_list.get_account_id(sf("sfSponsor")), new_sponsor);
+    assert_eq!(
+        old_sponsor_sle.get_field_u32(sf("sfSponsoringOwnerCount")),
+        0
+    );
+    assert_eq!(
+        new_sponsor_sle.get_field_u32(sf("sfSponsoringOwnerCount")),
+        1
+    );
+}
+
+#[test]
 fn signer_list_set_destroy_requires_alternative_key_when_master_disabled() {
     let account = sample_account(0x31);
     let signer_list = signer_list_entry(account, 0, LSF_ONE_OWNER_COUNT);
