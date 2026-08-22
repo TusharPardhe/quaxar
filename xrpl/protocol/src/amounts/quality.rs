@@ -8,7 +8,7 @@ use std::{
 
 use basics::number::{
     NumberParts as RuntimeNumber, NumberRoundModeGuard, RoundingMode, current_number_one,
-    get_mantissa_scale,
+    get_mantissa_scale, get_rounding_mode,
 };
 
 use crate::st_amount::AmountError;
@@ -396,35 +396,29 @@ pub fn try_multiply(
         );
     }
 
-    let mut value1 = v1.mantissa();
-    let mut value2 = v2.mantissa();
-    let mut offset1 = v1.exponent();
-    let mut offset2 = v2.exponent();
+    // Current rippled performs the generic `multiply` path through Number,
+    // then materializes that Number as the requested STAmount asset.  The old
+    // scaled-mantissa implementation added a fixed `+7` before
+    // canonicalization.  That is not equivalent: at a tick-size boundary it
+    // can leave an issued result one wire unit too high, which also places an
+    // Offer in the adjacent quality directory.
+    let product = stamount_as_number(v1)
+        .try_mul(stamount_as_number(v2))
+        .map_err(|_| AmountError::ArithmeticOverflow)?;
 
-    if is_native_or_mpt_amount(v1) {
-        while value1 < ST_AMOUNT_MIN_VALUE {
-            value1 *= 10;
-            offset1 -= 1;
-        }
+    catch_unwind(AssertUnwindSafe(|| {
+        crate::to_amount_from_number::<STAmount>(asset, product, get_rounding_mode())
+    }))
+    .map_err(|_| amount_range_error(asset))?
+    .map_err(|_| amount_range_error(asset))
+}
+
+fn amount_range_error(asset: Asset) -> AmountError {
+    match asset {
+        Asset::Issue(issue) if issue.native() => AmountError::NativeOutOfRange,
+        Asset::MPTIssue(_) => AmountError::MptOutOfRange,
+        Asset::Issue(_) => AmountError::IssuedOutOfRange,
     }
-
-    if is_native_or_mpt_amount(v2) {
-        while value2 < ST_AMOUNT_MIN_VALUE {
-            value2 *= 10;
-            offset2 -= 1;
-        }
-    }
-
-    let amount =
-        muldiv(value1, value2, TEN_TO_14).map_err(|_| AmountError::ArithmeticOverflow)? + 7;
-
-    STAmount::try_new_with_asset(
-        sf_generic(),
-        asset,
-        amount,
-        offset1 + offset2 + 14,
-        v1.negative() != v2.negative(),
-    )
 }
 
 pub fn mul_round(v1: &STAmount, v2: &STAmount, asset: Asset, round_up: bool) -> STAmount {

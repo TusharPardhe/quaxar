@@ -137,6 +137,25 @@ fn quality_ceil_and_round_examples_match_cpp() {
     assert_eq!(q.round(16).rate().text(), "57719.63525051682");
 }
 
+#[test]
+fn number_multiply_matches_live_offer_tick_size_rounding() {
+    // Testnet ledger 20,119,713, transaction B77F6E16...: a TickSize=6
+    // tfSell OfferCreate rounds its XRP/2RY rate before placing the residual.
+    // rippled stores exactly 20.440625.  The legacy scaled-mantissa `+7`
+    // multiply produced 20.44062500000001 and the adjacent BookDirectory.
+    let taker_gets = native_amount(1_250_000_000);
+    let taker_pays = issue_amount(2_044_059_100_000_000, -14);
+    let rounded_quality = Quality::from_value(get_rate(&taker_gets, &taker_pays)).round(6);
+    assert_eq!(rounded_quality.value(), 0x4d05_cf40_4f5e_7400);
+    let rounded_rate = rounded_quality.rate();
+
+    let rounded_pays = multiply(&taker_gets, &rounded_rate, no_issue());
+    assert_eq!(rounded_pays.text(), "20.440625");
+    assert_eq!(rounded_pays.mantissa(), 2_044_062_500_000_000);
+    assert_eq!(rounded_pays.exponent(), -14);
+    assert_eq!(get_rate(&taker_gets, &rounded_pays), 0x4d05_cf40_4f5e_7400);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Direct ports from C++ Quality_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
