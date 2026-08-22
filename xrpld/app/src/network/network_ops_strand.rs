@@ -1409,6 +1409,16 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     }
 
     let min_valid_seq = lm.valid_ledger_seq();
+    // Reconcile proof ownership from the runner's pre-observation latch. The
+    // diagnostic below may snapshot a new moving tip as the sole successor;
+    // feeding the event afterward preserves first-anchor/latest-candidate
+    // ordering across failure, promotion, and authoritative preemption.
+    let (recovery_anchor, recovery_candidate) =
+        shared_inbound.coordinator_validation_recovery_latch();
+    root.validations().reconcile_validation_recovery_latch(
+        recovery_anchor.map(|(hash, seq)| (seq, hash)),
+        recovery_candidate.map(|(hash, seq)| (seq, hash)),
+    );
     let preference_diagnostic = root.validations().preferred_lcl_diagnostic(
         &RclValidatedLedger::from_ledger(&our_closed),
         min_valid_seq,

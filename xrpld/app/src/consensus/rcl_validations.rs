@@ -280,6 +280,19 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
             .get_preferred_lcl_diagnostic(lcl, min_seq, peer_counts)
     }
 
+    /// Align validation-recovery proof ownership with the coordinator's
+    /// actual stable anchor and latest successor before observing a new tip.
+    pub fn reconcile_validation_recovery_latch(
+        &self,
+        actual_anchor: Option<(u32, Uint256)>,
+        actual_candidate: Option<(u32, Uint256)>,
+    ) {
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .reconcile_validation_recovery_latch(actual_anchor, actual_candidate);
+    }
+
     /// Number of trusted, full validations tracked for `ledger_hash`.
     /// Matches `Validations::numTrustedForLedger`, exposed directly since
     /// `bootstrap.rs`'s catch-up loop calls this without needing the full

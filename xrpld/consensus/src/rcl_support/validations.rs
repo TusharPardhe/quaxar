@@ -364,6 +364,14 @@ pub struct Validations<A: ValidationsAdaptor> {
     inner: Mutex<Inner<A>>,
 }
 
+/// Exact acquisition-time proof for the phase-neutral recovery owner. It is
+/// deliberately separate from rippled's moving `acquiring` membership and is
+/// bounded to the runner's stable anchor plus latest successor.
+struct ValidationRecoveryProvenance<A: ValidationsAdaptor> {
+    key: (SeqOf<A>, LedgerIdOf<A>),
+    nodes: HashSet<NodeIdOf<A>>,
+}
+
 struct Inner<A: ValidationsAdaptor> {
     /// Current validations from listed/trusted nodes. Matches `current_`.
     current: HashMap<NodeIdOf<A>, A::Validation>,
@@ -390,6 +398,8 @@ struct Inner<A: ValidationsAdaptor> {
     /// Ledgers being acquired from the network, keyed by `(seq, id)`, with
     /// the set of nodes waiting on that acquisition. Matches `acquiring_`.
     acquiring: BTreeMap<(SeqOf<A>, LedgerIdOf<A>), HashSet<NodeIdOf<A>>>,
+    validation_recovery_anchor: Option<ValidationRecoveryProvenance<A>>,
+    validation_recovery_candidate: Option<ValidationRecoveryProvenance<A>>,
 }
 
 impl<A: ValidationsAdaptor> Inner<A> {
@@ -405,13 +415,123 @@ impl<A: ValidationsAdaptor> Inner<A> {
             trie: LedgerTrie::new(),
             last_ledger: HashMap::new(),
             acquiring: BTreeMap::new(),
+            validation_recovery_anchor: None,
+            validation_recovery_candidate: None,
         }
+    }
+
+    /// Mirror `ValidationRecoveryTarget(Some/None)`: first exact target stays
+    /// latched, repeated observations merge only live exact signers, a moving
+    /// tip replaces the sole successor, and withdrawal clears only that future
+    /// successor without cancelling the live anchor.
+    fn observe_validation_recovery(&mut self, observed: Option<ValidationRecoveryProvenance<A>>) {
+        let Some(observed) = observed else {
+            self.validation_recovery_candidate = None;
+            return;
+        };
+        if let Some(anchor) = self.validation_recovery_anchor.as_mut() {
+            if anchor.key == observed.key {
+                anchor.nodes.extend(observed.nodes);
+                return;
+            }
+        } else {
+            self.validation_recovery_anchor = Some(observed);
+            return;
+        }
+        if let Some(candidate) = self.validation_recovery_candidate.as_mut()
+            && candidate.key == observed.key
+        {
+            candidate.nodes.extend(observed.nodes);
+        } else {
+            self.validation_recovery_candidate = Some(observed);
+        }
+    }
+
+    fn take_validation_recovery_nodes(
+        &mut self,
+        key: &(SeqOf<A>, LedgerIdOf<A>),
+    ) -> HashSet<NodeIdOf<A>> {
+        if self
+            .validation_recovery_anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.key == *key)
+        {
+            let nodes = self
+                .validation_recovery_anchor
+                .take()
+                .expect("matched recovery anchor must exist")
+                .nodes;
+            self.validation_recovery_anchor = self.validation_recovery_candidate.take();
+            return nodes;
+        }
+        if self
+            .validation_recovery_candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.key == *key)
+        {
+            return self
+                .validation_recovery_candidate
+                .take()
+                .expect("matched recovery candidate must exist")
+                .nodes;
+        }
+        HashSet::new()
+    }
+
+    fn prune_validation_recovery_signer(
+        &mut self,
+        key: &(SeqOf<A>, LedgerIdOf<A>),
+        node_id: &NodeIdOf<A>,
+    ) {
+        // Keep an empty proof's exact key: signer removal changes support, not
+        // runner latch ownership. Only explicit reconciliation or exact
+        // terminal completion may promote/clear a slot.
+        if let Some(anchor) = self.validation_recovery_anchor.as_mut()
+            && anchor.key == *key
+        {
+            anchor.nodes.remove(node_id);
+            return;
+        }
+        if let Some(candidate) = self.validation_recovery_candidate.as_mut()
+            && candidate.key == *key
+        {
+            candidate.nodes.remove(node_id);
+        }
+    }
+
+    fn reconcile_validation_recovery_latch(
+        &mut self,
+        actual_anchor: Option<(SeqOf<A>, LedgerIdOf<A>)>,
+        actual_candidate: Option<(SeqOf<A>, LedgerIdOf<A>)>,
+    ) {
+        let mut proofs = Vec::with_capacity(2);
+        if let Some(proof) = self.validation_recovery_anchor.take() {
+            proofs.push(proof);
+        }
+        if let Some(proof) = self.validation_recovery_candidate.take() {
+            proofs.push(proof);
+        }
+        let mut take_exact = |key: &(SeqOf<A>, LedgerIdOf<A>)| {
+            proofs
+                .iter()
+                .position(|proof| proof.key == *key)
+                .map(|index| proofs.swap_remove(index))
+        };
+        self.validation_recovery_anchor = actual_anchor.as_ref().and_then(&mut take_exact);
+        let distinct_candidate = actual_candidate.filter(|key| Some(*key) != actual_anchor);
+        self.validation_recovery_candidate = distinct_candidate.as_ref().and_then(&mut take_exact);
+        // Unknown/cancelled keys and any superseded successor are discarded.
+        // An acknowledged successful terminal cannot race this cleanup: the
+        // app registers the durable handoff (consuming exact proof) before it
+        // sends the acknowledgement that terminalizes and clears the runner
+        // latch. Rejected handoffs remain DurablePending with the latch live.
     }
 
     /// Remove support of a validated ledger from the trie. Matches
     /// `removeTrie`.
     fn remove_trie(&mut self, node_id: &NodeIdOf<A>, val: &A::Validation) {
         let key = (val.seq(), val.ledger_id());
+        self.prune_validation_recovery_signer(&key, node_id);
         if let Some(set) = self.acquiring.get_mut(&key) {
             set.remove(node_id);
             if set.is_empty() {
@@ -561,14 +681,28 @@ impl<A: ValidationsAdaptor> Validations<A> {
         &self.adaptor
     }
 
+    /// Align bounded recovery proof ownership to the acquisition runner's
+    /// exact pre-observation latch. This remaps a promoted successor and drops
+    /// failed, cancelled, or authoritatively preempted ownership without ever
+    /// creating provenance for an unknown key.
+    pub fn reconcile_validation_recovery_latch(
+        &self,
+        actual_anchor: Option<(SeqOf<A>, LedgerIdOf<A>)>,
+        actual_candidate: Option<(SeqOf<A>, LedgerIdOf<A>)>,
+    ) {
+        self.inner
+            .lock()
+            .reconcile_validation_recovery_latch(actual_anchor, actual_candidate);
+    }
+
     /// Reconcile a ledger that has just become available to the validation
     /// tracker.
     ///
-    /// Only live exact waiters may install support. A newer validation removes
-    /// its node from the older acquiring entry before a late completion can be
-    /// observed, exactly matching rippled's `updateTrie`/`checkAcquired`
-    /// ordering. Historical validation indexes are never reconstructed into
-    /// trie provenance.
+    /// Live exact waiters install support as in rippled. In addition, an exact
+    /// phase-neutral recovery completion may consume its bounded
+    /// acquisition-time trusted-full proof after rechecking that each signer
+    /// remains current trusted-full. Historical validation indexes are never
+    /// reconstructed into trie provenance.
     pub fn on_ledger_acquired(&self, ledger: A::Ledger) {
         let ledger_id = ledger.id();
         let ledger_seq = ledger.seq();
@@ -576,16 +710,24 @@ impl<A: ValidationsAdaptor> Validations<A> {
         let mut inner = self.inner.lock();
         let _ = inner.current_live(&self.adaptor, &self.parms);
 
-        let exact_nodes = inner.acquiring.remove(&key).unwrap_or_default();
+        let mut exact_nodes = inner.acquiring.remove(&key).unwrap_or_default();
+        let recovery_nodes = inner.take_validation_recovery_nodes(&key);
+        exact_nodes.extend(recovery_nodes.iter().cloned());
         for node_id in exact_nodes {
-            let current_is_trusted = inner
-                .current
-                .get(&node_id)
-                .is_some_and(|current| current.trusted());
-            if current_is_trusted {
-                // The live acquiring membership already proves this was an
-                // exact trusted waiter. Preserve the reference behavior when
-                // its current validation has since changed but remains trusted.
+            let current_is_eligible = inner.current.get(&node_id).is_some_and(|current| {
+                current.trusted()
+                    && (!recovery_nodes.contains(&node_id)
+                        || (current.full() && current.seq() >= ledger_seq))
+            });
+            let recovery_does_not_downgrade = !recovery_nodes.contains(&node_id)
+                || inner
+                    .last_ledger
+                    .get(&node_id)
+                    .is_none_or(|resident| resident.seq() < ledger_seq);
+            if current_is_eligible && recovery_does_not_downgrade {
+                // Ordinary membership follows rippled. Recovery provenance is
+                // the exact trusted-full acquisition-time proof; its signer
+                // may advance meanwhile but must remain current trusted-full.
                 inner.update_trie_ledger(&node_id, ledger.clone());
             }
         }
@@ -1009,8 +1151,7 @@ impl<A: ValidationsAdaptor> Validations<A> {
 
         // Match rippled `Validations::getPreferredLCL`: a trusted preference
         // below `minSeq` keeps the local LCL. Peer counts are considered only
-        // when there is no trusted preference at all; an independently
-        // acquired ledger must not override this selector.
+        // when there is no trusted preference at all.
         let (selected, selection_source) = match working_preferred {
             Some((seq, id)) if seq >= min_seq => {
                 (id, PreferredLclSelectionSource::WorkingPreferred)
@@ -1021,6 +1162,7 @@ impl<A: ValidationsAdaptor> Validations<A> {
                 None => (lcl.id(), PreferredLclSelectionSource::LocalNoPreference),
             },
         };
+
         // This owner exists only to break the observed circular liveness case:
         // a resident trie vote keeps the ordinary selector on the local LCL,
         // so the moving acquiring majority never becomes resident. If normal
@@ -1029,6 +1171,28 @@ impl<A: ValidationsAdaptor> Validations<A> {
         // without a competing advisory owner.
         let validation_recovery = validation_recovery_advice
             .filter(|_| working_source == PreferredLclWorkingSource::Trie && selected == lcl.id());
+        let recovery_provenance = validation_recovery.map(|(seq, id, _, _)| {
+            let nodes = inner
+                .acquiring
+                .get(&(seq, id))
+                .into_iter()
+                .flatten()
+                .filter(|node_id| {
+                    inner.current.get(*node_id).is_some_and(|validation| {
+                        validation.trusted()
+                            && validation.full()
+                            && validation.seq() == seq
+                            && validation.ledger_id() == id
+                    })
+                })
+                .cloned()
+                .collect();
+            ValidationRecoveryProvenance {
+                key: (seq, id),
+                nodes,
+            }
+        });
+        inner.observe_validation_recovery(recovery_provenance);
 
         PreferredLclDiagnostic {
             trie_preferred: trie_preferred_info,
@@ -1149,6 +1313,8 @@ impl<A: ValidationsAdaptor> Validations<A> {
     pub fn flush(&self) {
         let mut inner = self.inner.lock();
         inner.current.clear();
+        inner.validation_recovery_anchor = None;
+        inner.validation_recovery_candidate = None;
     }
 
     /// Count lagging trusted proposers, removing seen-online proposers
@@ -1472,6 +1638,230 @@ mod tests {
         );
         assert_eq!(diagnostic.validation_recovery_support, Some(6));
         assert_eq!(diagnostic.validation_recovery_peer_support, Some(9));
+    }
+
+    #[test]
+    fn validation_recovery_provenance_survives_supersession_and_stays_bounded() {
+        let adaptor = MockAdaptor::new(1000);
+        let local_lcl = ledger_at(10, 10);
+        let anchor = ledger_at(20, 42);
+        let successor = ledger_at(21, 43);
+        let latest = ledger_at(22, 44);
+        adaptor.register_ledger(local_lcl.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(local_lcl.id(), local_lcl.seq(), 1000, 1, 1)),
+            ValStatus::Current
+        );
+        for node_id in 2..=7 {
+            assert_eq!(
+                validations.add(
+                    node_id,
+                    val(anchor.id(), anchor.seq(), 1000, node_id, node_id),
+                ),
+                ValStatus::Current
+            );
+        }
+        let anchor_peers = BTreeMap::from([(local_lcl.id(), 1), (anchor.id(), 9)]);
+        assert_eq!(
+            validations
+                .get_preferred_lcl_diagnostic(&local_lcl, local_lcl.seq(), &anchor_peers)
+                .validation_recovery_candidate,
+            Some((anchor.seq(), anchor.id()))
+        );
+
+        // Moving validations remove every ordinary exact waiter for the
+        // stable anchor, while two further observations exercise latest-only
+        // successor replacement.
+        for (ledger, seen) in [(&successor, 1001), (&latest, 1002)] {
+            for node_id in 2..=7 {
+                assert_eq!(
+                    validations.add(
+                        node_id,
+                        val(ledger.id(), ledger.seq(), seen, node_id, node_id),
+                    ),
+                    ValStatus::Current
+                );
+            }
+            let peers = BTreeMap::from([(local_lcl.id(), 1), (ledger.id(), 9)]);
+            assert_eq!(
+                validations
+                    .get_preferred_lcl_diagnostic(&local_lcl, local_lcl.seq(), &peers)
+                    .validation_recovery_candidate,
+                Some((ledger.seq(), ledger.id()))
+            );
+        }
+        {
+            let inner = validations.inner.lock();
+            assert!(!inner.acquiring.contains_key(&(anchor.seq(), anchor.id())));
+            assert_eq!(
+                inner
+                    .validation_recovery_anchor
+                    .as_ref()
+                    .map(|proof| proof.key),
+                Some((anchor.seq(), anchor.id()))
+            );
+            assert_eq!(
+                inner
+                    .validation_recovery_candidate
+                    .as_ref()
+                    .map(|proof| proof.key),
+                Some((latest.seq(), latest.id()))
+            );
+        }
+
+        // Exact unrelated completion cannot consume or apply either proof.
+        let unrelated = ledger_at(19, 99);
+        validations.adaptor().register_ledger(unrelated.clone());
+        validations.on_ledger_acquired(unrelated);
+        assert!(validations.inner.lock().last_ledger.get(&2).is_none());
+
+        // Snapshot signers must still be CURRENT trusted AND full. Remove one
+        // from trust and advance another to a trusted partial validation.
+        validations.trust_changed(&HashSet::new(), &HashSet::from([2]));
+        let mut partial = val(55, latest.seq() + 1, 1003, 3, 3);
+        partial.full = false;
+        assert_eq!(validations.add(3, partial), ValStatus::Current);
+        // A newer resident result may win an out-of-order completion race;
+        // the older recovery anchor must never downgrade that signer.
+        validations
+            .inner
+            .lock()
+            .update_trie_ledger(&6, latest.clone());
+
+        validations.adaptor().register_ledger(anchor.clone());
+        validations.on_ledger_acquired(anchor.clone());
+        let inner = validations.inner.lock();
+        assert!(!inner.last_ledger.contains_key(&2));
+        assert!(!inner.last_ledger.contains_key(&3));
+        for node_id in [4, 5, 7] {
+            assert_eq!(
+                inner.last_ledger.get(&node_id).map(ValidationsLedger::id),
+                Some(anchor.id())
+            );
+        }
+        assert_eq!(
+            inner.last_ledger.get(&6).map(ValidationsLedger::id),
+            Some(latest.id())
+        );
+        assert_eq!(
+            inner
+                .validation_recovery_anchor
+                .as_ref()
+                .map(|proof| proof.key),
+            Some((latest.seq(), latest.id()))
+        );
+        assert!(inner.validation_recovery_candidate.is_none());
+        drop(inner);
+
+        // Durable registration consumes A before its acknowledgement lets the
+        // runner clear a no-successor latch. A subsequent empty reconciliation
+        // may discard only unconsumed proof; installed trie support remains.
+        validations.reconcile_validation_recovery_latch(None, None);
+        assert_eq!(
+            validations
+                .inner
+                .lock()
+                .last_ledger
+                .get(&4)
+                .map(ValidationsLedger::id),
+            Some(anchor.id())
+        );
+    }
+
+    #[test]
+    fn validation_recovery_latch_reconciliation_handles_preemption_and_failure() {
+        let mut inner = Inner::<MockAdaptor>::new();
+        let anchor = (20, 42);
+        let successor = (21, 43);
+        inner.observe_validation_recovery(Some(ValidationRecoveryProvenance {
+            key: anchor,
+            nodes: HashSet::from([2, 3]),
+        }));
+        inner.observe_validation_recovery(Some(ValidationRecoveryProvenance {
+            key: successor,
+            nodes: HashSet::from([2, 3]),
+        }));
+
+        // Authoritative preemption canceled A and the runner promoted its
+        // already-observed successor. Reconciliation promotes only the exact
+        // matching proof and discards canceled A.
+        inner.reconcile_validation_recovery_latch(Some(successor), None);
+        assert_eq!(
+            inner
+                .validation_recovery_anchor
+                .as_ref()
+                .map(|proof| proof.key),
+            Some(successor)
+        );
+        assert!(inner.validation_recovery_candidate.is_none());
+
+        // Signer pruning cannot itself move latch identity, even at zero.
+        for node_id in [2, 3] {
+            inner.prune_validation_recovery_signer(&successor, &node_id);
+        }
+        assert_eq!(
+            inner
+                .validation_recovery_anchor
+                .as_ref()
+                .map(|proof| (proof.key, proof.nodes.len())),
+            Some((successor, 0))
+        );
+
+        // A failed/cancelled runner owner has no durable registration; the
+        // empty actual latch authoritatively discards its proof.
+        inner.reconcile_validation_recovery_latch(None, None);
+        assert!(inner.validation_recovery_anchor.is_none());
+        assert!(inner.validation_recovery_candidate.is_none());
+    }
+
+    #[test]
+    fn validation_recovery_reverse_completion_never_downgrades_resident_support() {
+        let adaptor = MockAdaptor::new(1000);
+        let local_lcl = ledger_at(10, 10);
+        let anchor = ledger_at(20, 42);
+        let successor = ledger_at(21, 43);
+        adaptor.register_ledger(local_lcl.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(local_lcl.id(), local_lcl.seq(), 1000, 1, 1)),
+            ValStatus::Current
+        );
+        for (ledger, seen) in [(&anchor, 1000), (&successor, 1001)] {
+            for node_id in 2..=7 {
+                assert_eq!(
+                    validations.add(
+                        node_id,
+                        val(ledger.id(), ledger.seq(), seen, node_id, node_id),
+                    ),
+                    ValStatus::Current
+                );
+            }
+            let peers = BTreeMap::from([(local_lcl.id(), 1), (ledger.id(), 9)]);
+            assert_eq!(
+                validations
+                    .get_preferred_lcl_diagnostic(&local_lcl, local_lcl.seq(), &peers)
+                    .validation_recovery_candidate,
+                Some((ledger.seq(), ledger.id()))
+            );
+        }
+
+        // The latest successor can complete through an independent same-hash
+        // owner before the slow stable anchor.
+        validations.adaptor().register_ledger(successor.clone());
+        validations.on_ledger_acquired(successor.clone());
+        validations.adaptor().register_ledger(anchor.clone());
+        validations.on_ledger_acquired(anchor);
+
+        let inner = validations.inner.lock();
+        for node_id in 2..=7 {
+            assert_eq!(
+                inner.last_ledger.get(&node_id).map(ValidationsLedger::id),
+                Some(successor.id())
+            );
+        }
     }
 
     #[test]
@@ -2241,9 +2631,19 @@ mod tests {
         let validations = Validations::new(ValidationParms::default(), adaptor);
 
         validations.add(1, val(child.id(), 1, 1000, 1, 100));
+        validations
+            .inner
+            .lock()
+            .observe_validation_recovery(Some(ValidationRecoveryProvenance {
+                key: (child.seq(), child.id()),
+                nodes: HashSet::from([1]),
+            }));
         assert_eq!(validations.size_of_current_cache(), 1);
         validations.flush();
         assert_eq!(validations.size_of_current_cache(), 0);
+        let inner = validations.inner.lock();
+        assert!(inner.validation_recovery_anchor.is_none());
+        assert!(inner.validation_recovery_candidate.is_none());
     }
 
     #[test]

@@ -1438,6 +1438,25 @@ impl InboundLedgers {
             .map(|adapter| adapter.snapshot())
     }
 
+    /// Read the coordinator's exact validation-recovery latch without driving
+    /// events. Sequences are required because validation provenance is keyed
+    /// by the verified `(seq, hash)` identity, never by hash alone.
+    pub fn coordinator_validation_recovery_latch(
+        &self,
+    ) -> (Option<(Uint256, u32)>, Option<(Uint256, u32)>) {
+        let guard = self.coordinator.lock().expect("coordinator lock");
+        let Some(coordinator) = guard.as_ref() else {
+            return (None, None);
+        };
+        let exact = |target: Option<acquisition::LedgerTarget>| {
+            target.and_then(|target| target.sequence().map(|seq| (target.hash(), seq)))
+        };
+        (
+            exact(coordinator.current_validation_recovery_target()),
+            exact(coordinator.current_validation_recovery_candidate()),
+        )
+    }
+
     /// True when rippled's recent-failure cache must suppress non-consensus
     /// re-admission. Consensus remains exempt because an advancing preferred
     /// LCL must be allowed to retry independently of history backfill.
@@ -4069,12 +4088,28 @@ mod tests {
 
         assert!(registry.coordinator_validation_recovery_target(Some((Uint256::from(70), 70))));
         assert_eq!(registry.coordinator_origins.len(), 1);
+        assert_eq!(
+            registry.coordinator_validation_recovery_latch(),
+            (Some((Uint256::from(70), 70)), None)
+        );
         assert!(registry.coordinator_validation_recovery_target(Some((Uint256::from(71), 71))));
         assert_eq!(registry.coordinator_origins.len(), 2);
+        assert_eq!(
+            registry.coordinator_validation_recovery_latch(),
+            (Some((Uint256::from(70), 70)), Some((Uint256::from(71), 71)))
+        );
         assert!(registry.coordinator_validation_recovery_target(Some((Uint256::from(72), 72))));
         assert_eq!(registry.coordinator_origins.len(), 2);
+        assert_eq!(
+            registry.coordinator_validation_recovery_latch(),
+            (Some((Uint256::from(70), 70)), Some((Uint256::from(72), 72)))
+        );
         assert!(registry.coordinator_validation_recovery_target(None));
         assert_eq!(registry.coordinator_origins.len(), 1);
+        assert_eq!(
+            registry.coordinator_validation_recovery_latch(),
+            (Some((Uint256::from(70), 70)), None)
+        );
     }
 
     #[test]
