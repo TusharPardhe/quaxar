@@ -69,6 +69,11 @@ pub enum TransitionFact {
     PeerCapabilityAvailable,
     /// No usable peers remain.
     PeerCapabilityLost,
+    /// Too few active peers remain to drive consensus, even though some may
+    /// still be usable for acquisition.
+    ConsensusQuorumLost,
+    /// The configured consensus peer threshold is satisfied again.
+    ConsensusQuorumAvailable,
     /// Consensus, validation, recovery, or startup needs a target acquired.
     TargetRequired { target: LedgerTarget },
     /// The syncing target is complete, durable, accepted, and installed as LCL.
@@ -145,6 +150,7 @@ pub fn phase_transition(from: &SyncPhase, fact: &TransitionFact) -> Option<SyncP
 
     let to = match (from, fact) {
         (Disconnected, PeerCapabilityAvailable) => Connected,
+        (Disconnected, ConsensusQuorumAvailable) => Connected,
         (Connected, TargetRequired { target }) => Syncing { target: *target },
         (Connected, PreferredLclDivergence { target }) => Syncing { target: *target },
         (Connected, TargetInstalledAsLcl { lcl }) => Tracking { lcl: *lcl },
@@ -171,6 +177,10 @@ pub fn phase_transition(from: &SyncPhase, fact: &TransitionFact) -> Option<SyncP
         (Full { .. }, PreferredLclDivergence { target }) => Syncing { target: *target },
         (Full { .. }, ConsensusViewChange) => Connected,
         (Full { .. }, BlockedWithNoTarget) => Connected,
+        (Connected, ConsensusQuorumLost) => Disconnected,
+        (Syncing { .. }, ConsensusQuorumLost) => Disconnected,
+        (Tracking { .. }, ConsensusQuorumLost) => Disconnected,
+        (Full { .. }, ConsensusQuorumLost) => Disconnected,
         (Connected, PeerCapabilityLost) => Disconnected,
         (Syncing { .. }, PeerCapabilityLost) => Disconnected,
         (Tracking { .. }, PeerCapabilityLost) => Disconnected,
@@ -206,6 +216,8 @@ mod tests {
         let facts = [
             TransitionFact::PeerCapabilityAvailable,
             TransitionFact::PeerCapabilityLost,
+            TransitionFact::ConsensusQuorumLost,
+            TransitionFact::ConsensusQuorumAvailable,
             TransitionFact::TargetRequired { target: target(10) },
             TransitionFact::TargetInstalledAsLcl { lcl: identity(10) },
             TransitionFact::ChainContiguous {
@@ -404,6 +416,25 @@ mod tests {
                 Some(SyncPhase::Stopping)
             );
         }
+    }
+
+    #[test]
+    fn consensus_quorum_transitions_are_distinct_from_transport_loss() {
+        let full = SyncPhase::Full {
+            lcl: identity(9),
+            published: identity(9),
+        };
+        assert_eq!(
+            phase_transition(&full, &TransitionFact::ConsensusQuorumLost),
+            Some(SyncPhase::Disconnected)
+        );
+        assert_eq!(
+            phase_transition(
+                &SyncPhase::Disconnected,
+                &TransitionFact::ConsensusQuorumAvailable,
+            ),
+            Some(SyncPhase::Connected)
+        );
     }
 
     #[test]

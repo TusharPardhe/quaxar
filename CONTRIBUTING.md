@@ -158,6 +158,13 @@ services, configuration paths, environment variables, logs, or metrics; use
 the `quaxar` prefix at operator-facing boundaries. Keep `rippled` names in
 parity comments and compatible on-disk/wire contracts explicit.
 
+Documentation follows the same boundary: command examples must use the
+installed `quaxar` executable and Quaxar service/config/data paths, while crate
+maps may show the real retained `xrpld/` source paths and parity notes should
+name the upstream `rippled` implementation. When changing CLI or config
+surfaces, compare the rendered `quaxar --help`, packaged config files, and all
+operator guides in the same pull request.
+
 ## Where to Start
 
 Good first contributions:

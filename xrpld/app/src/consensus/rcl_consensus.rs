@@ -179,8 +179,8 @@ fn update_operating_mode_after_accept(
     network_ops_mode_owner: &AppNetworkOpsModeOwner,
     positions: usize,
 ) {
-    if positions == 0 && network_ops_mode_owner.operating_mode() == NetworkOpsOperatingMode::Full {
-        network_ops_mode_owner.set_operating_mode_direct_with_reason(
+    if positions == 0 && network_ops_mode_owner.is_full() {
+        network_ops_mode_owner.set_operating_mode_with_reason(
             NetworkOpsOperatingMode::Connected,
             "no_consensus_positions",
         );
@@ -193,8 +193,8 @@ fn update_operating_mode_after_accept(
 /// propose; interpreting that absence as `Blocked` makes `Full -> Connected`
 /// self-fulfilling. The acquisition coordinator must instead receive an
 /// explicit peer-health or blocked-state fact from its owning service.
-fn coordinator_should_report_no_consensus_positions(_positions: usize, _peer_count: usize) -> bool {
-    false
+fn coordinator_should_report_no_consensus_positions(positions: usize, _peer_count: usize) -> bool {
+    positions == 0
 }
 
 /// The open-ledger view consensus reads current (not-yet-consensus-agreed)
@@ -1487,9 +1487,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
     }
 
     fn update_operating_mode(&self, positions: usize) {
-        if positions == 0
-            && self.network_ops_mode_owner.operating_mode() == NetworkOpsOperatingMode::Full
-        {
+        if positions == 0 && self.network_ops_mode_owner.is_full() {
             // Coordinator mode: demote `Full -> Connected` through the typed
             // blocked-state fact; the coordinator publishes. Otherwise the
             // legacy write remains.
@@ -2369,9 +2367,9 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_does_not_treat_missing_round_positions_as_a_blocked_fact() {
-        assert!(!coordinator_should_report_no_consensus_positions(0, 0));
-        assert!(!coordinator_should_report_no_consensus_positions(0, 1));
+    fn coordinator_reports_rippled_zero_position_mode_demotion() {
+        assert!(coordinator_should_report_no_consensus_positions(0, 0));
+        assert!(coordinator_should_report_no_consensus_positions(0, 1));
         assert!(!coordinator_should_report_no_consensus_positions(1, 1));
     }
 
@@ -2382,7 +2380,20 @@ mod tests {
 
         update_operating_mode_after_accept(&owner, 0);
 
-        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
+        assert_eq!(
+            state.operating_mode(),
+            NetworkOpsOperatingMode::Syncing,
+            "the legacy fallback must pass through rippled's validated-age normalization"
+        );
+
+        state.set_operating_mode(NetworkOpsOperatingMode::Full);
+        state.set_need_network_ledger(true);
+        update_operating_mode_after_accept(&owner, 0);
+        assert_eq!(
+            state.operating_mode(),
+            NetworkOpsOperatingMode::Full,
+            "rippled isFull excludes a node waiting for a network ledger"
+        );
     }
 
     #[test]

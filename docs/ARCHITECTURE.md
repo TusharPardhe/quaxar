@@ -22,6 +22,12 @@ JobQueue or a bounded subsystem worker; completion is handed back to the owner
 that is allowed to publish the result. This avoids competing owners for the
 closed, validated, and published ledger heads.
 
+Consensus quorum and acquisition transport are separate facts. Falling below
+the configured peer threshold changes the operating phase without discarding
+still-usable peer sessions. Conversely, a zero-threshold `start_valid` runtime
+continues consensus without peers while phase-neutral transport updates still
+remove departed peer IDs and pause or resume acquisition work.
+
 The main runtime also owns HTTP/WebSocket listeners, the peer overlay runtime,
 periodic maintenance, and ordered shutdown. Instrumentation records through
 the metrics crate, but the current bootstrap does not initialize a Prometheus
@@ -101,6 +107,9 @@ historical ledger index. If validator N is waiting for ledger A and then sends
 a newer validation for ledger B, the B waiter replaces A. A late completion of
 A remains reusable in history and storage, but cannot resurrect that
 validator's old trie support or steer a stale consensus round.
+Removing B's still-unacquired waiter does not remove A when A is the signer's
+last acquired resident support; resident trie support is retracted only for an
+exact matching ledger hash.
 
 The published identity is a fact observed from LedgerMaster, not itself a mode
 transition. NetworkOps forwards an installed, chain-contiguous published head
@@ -126,7 +135,12 @@ Transaction metadata is part of the transaction SHAMap. `DeliveredAmount` is
 recorded only at the same `ApplyContext::deliver` call sites as `rippled`:
 partial path payments whose actual output differs from `Amount`, the applicable
 CheckCash deliveries, and AccountDelete's remaining XRP. Exact path payments
-must not serialize an extra delivered field. Owner directories likewise use
+must not serialize an extra delivered field. Metadata selection also follows
+the typed SLE slots, not merely the fields that serialize to bytes: when a
+selected original slot is `NotPresent`, the affected node retains the canonical
+empty `PreviousFields: {}` object. Omitting that empty object changes the
+transaction-map root even though the resulting account state is identical.
+Owner directories likewise use
 the shared owner describer and sorted `dirInsert` capacity semantics across
 every transaction family so `sfOwner`, ordering, and `tecDIR_FULL` behavior are
 canonical; book-quality directories remain append-ordered.

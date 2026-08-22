@@ -711,6 +711,34 @@ where
         ))
     }
 
+    /// Report an acquisition-transport snapshot without changing the public
+    /// or coordinator operating phase.
+    pub(crate) fn transport_connectivity(
+        &mut self,
+        snapshot: &[OverlayPeerId],
+    ) -> Vec<AcquisitionEffect> {
+        for target in self.runner.active_targets() {
+            if let Some(peers) = self.requests.peer_target_capabilities(target) {
+                self.runner.update_target_peer_capabilities(target, peers);
+            }
+        }
+        let peers = snapshot
+            .iter()
+            .map(|&id| PeerId::new(u64::from(id)))
+            .collect::<Vec<_>>();
+        self.handle_fact(AcquisitionEvent::TransportConnectivity(
+            PeerAvailabilitySnapshot::new(peers),
+        ))
+    }
+
+    pub(crate) fn consensus_quorum_lost(&mut self) -> Vec<AcquisitionEffect> {
+        self.handle_fact(AcquisitionEvent::ConsensusQuorumLost)
+    }
+
+    pub(crate) fn consensus_quorum_available(&mut self) -> Vec<AcquisitionEffect> {
+        self.handle_fact(AcquisitionEvent::ConsensusQuorumAvailable)
+    }
+
     /// Report an acquisition demand fact.
     pub(crate) fn acquire_requested(
         &mut self,
@@ -948,6 +976,9 @@ fn event_session(event: &AcquisitionEvent) -> Option<SessionRef> {
         AcquisitionEvent::TimerFired { operation, .. } => Some(operation.session()),
         AcquisitionEvent::StartupMode { .. }
         | AcquisitionEvent::Connectivity(_)
+        | AcquisitionEvent::TransportConnectivity(_)
+        | AcquisitionEvent::ConsensusQuorumLost
+        | AcquisitionEvent::ConsensusQuorumAvailable
         | AcquisitionEvent::AcquireRequested { .. }
         | AcquisitionEvent::ValidationTarget(_)
         | AcquisitionEvent::ConsensusTarget(_)

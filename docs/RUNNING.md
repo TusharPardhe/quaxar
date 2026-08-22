@@ -123,7 +123,7 @@ cd /srv/quaxar/src/quaxar
 test -z "$(git status --porcelain)"
 jobs=$(nproc)
 CARGO_BUILD_JOBS="$jobs" CARGO_INCREMENTAL=0 \
-  cargo build --release --jobs "$jobs" -p quaxar-main
+  cargo build --release --locked --jobs "$jobs" -p quaxar-main
 test -x target/release/quaxar
 sha256sum target/release/quaxar
 ```
@@ -286,7 +286,7 @@ interactive installer:
 
 ```bash
 sudo useradd --system --home /var/lib/quaxar --shell /usr/sbin/nologin quaxar
-sudo install -d -o quaxar -g quaxar /var/lib/quaxar /var/log/quaxar
+sudo install -d -o quaxar -g quaxar /var/lib/quaxar
 sudo install -d -o root -g quaxar -m 0750 /etc/quaxar
 sudo install -o root -g quaxar -m 0640 quaxar.cfg /etc/quaxar/quaxar.cfg
 ```
@@ -437,10 +437,10 @@ Control log verbosity with the `RUST_LOG` environment variable:
 
 ```bash
 # Levels: error, warn, info, debug, trace
-RUST_LOG=info ./quaxar --conf quaxar.cfg
+RUST_LOG=info quaxar --conf quaxar.cfg
 
 # Per-module control
-RUST_LOG=info,consensus=debug,overlay=warn ./quaxar --conf quaxar.cfg
+RUST_LOG=info,consensus=debug,overlay=warn quaxar --conf quaxar.cfg
 ```
 
 Change at runtime:
@@ -495,6 +495,7 @@ alternative sync methods.
 | RocksDB build segfault | GCC OOM during compilation | `sudo apt install librocksdb-dev` or `CARGO_BUILD_JOBS=1` |
 | OpenSSL build failure | Missing system OpenSSL | `sudo apt install libssl-dev pkg-config` |
 | Node stuck in "connected" | No suitable current LCL has been installed | Check peers and trust data, preferred target, coordinator sessions/phase, `last_recovery_lcl_decision`, recovery latch, and current-open freshness |
+| Node reports "disconnected" with peers listed | Active peer count is below `[network_quorum]` | Compare the configured threshold with repeated peer counts; retained peers may still serve acquisition while consensus is paused |
 | Slow sync | Slow storage, limited bandwidth, or unstable peers | Use fast SSD storage and verify sustained network throughput and peer stability |
 | Full/proposing repeatedly returns to syncing | Preferred-LCL reconciliation is not converging | Compare repeated local closed, validated, published, and coordinator phase identities; capture mode-transition logs and `last_recovery_lcl_decision` |
 | Validated advances while local closed/coordinator LCL lags | Local consensus or recovery-anchor state is stale | Capture `server_info`, `ledger-closed`, `fetch-info`, session counters, and a redacted config; do not treat RAM growth as proof of correctness |

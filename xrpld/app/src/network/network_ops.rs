@@ -257,11 +257,21 @@ impl SharedNetworkOpsState {
         operating_mode: NetworkOpsOperatingMode,
         reason: &'static str,
     ) {
+        // Serialize the public atomic and StateAccounting update. Without a
+        // common writer lock, two concurrent writers can commit the atomic in
+        // one order and the accounting mode in the opposite order.
+        let mut accounting = self.state_accounting.lock();
+        let operating_mode = if operating_mode > NetworkOpsOperatingMode::Connected
+            && (self.amendment_blocked.load(Ordering::Acquire)
+                || self.unl_blocked.load(Ordering::Acquire))
+        {
+            NetworkOpsOperatingMode::Connected
+        } else {
+            operating_mode
+        };
+        accounting.set_operating_mode_with_reason(operating_mode, reason);
         self.operating_mode
             .store(encode_operating_mode(operating_mode), Ordering::Release);
-        self.state_accounting
-            .lock()
-            .set_operating_mode_with_reason(operating_mode, reason);
     }
 
     pub fn operating_mode(&self) -> NetworkOpsOperatingMode {
@@ -299,8 +309,21 @@ impl SharedNetworkOpsState {
     }
 
     pub fn set_amendment_blocked(&self, amendment_blocked: bool) {
+        let mut accounting = self.state_accounting.lock();
         self.amendment_blocked
             .store(amendment_blocked, Ordering::Release);
+        if amendment_blocked {
+            // rippled setAmendmentBlocked immediately requests CONNECTED; the
+            // blocked normalization makes that exact rather than SYNCING.
+            accounting.set_operating_mode_with_reason(
+                NetworkOpsOperatingMode::Connected,
+                "amendment_blocked",
+            );
+            self.operating_mode.store(
+                encode_operating_mode(NetworkOpsOperatingMode::Connected),
+                Ordering::Release,
+            );
+        }
     }
 
     pub fn amendment_blocked(&self) -> bool {
@@ -308,7 +331,16 @@ impl SharedNetworkOpsState {
     }
 
     pub fn set_unl_blocked(&self, unl_blocked: bool) {
+        let mut accounting = self.state_accounting.lock();
         self.unl_blocked.store(unl_blocked, Ordering::Release);
+        if unl_blocked {
+            accounting
+                .set_operating_mode_with_reason(NetworkOpsOperatingMode::Connected, "unl_blocked");
+            self.operating_mode.store(
+                encode_operating_mode(NetworkOpsOperatingMode::Connected),
+                Ordering::Release,
+            );
+        }
     }
 
     pub fn unl_blocked(&self) -> bool {
@@ -325,6 +357,11 @@ impl SharedNetworkOpsState {
 
     pub fn initial_sync_duration_us(&self) -> Option<String> {
         self.state_accounting.lock().initial_sync_duration_us()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accounting_operating_mode(&self) -> NetworkOpsOperatingMode {
+        self.state_accounting.lock().mode
     }
 }
 
@@ -357,6 +394,10 @@ impl AppNetworkOpsModeOwner {
 
     pub fn operating_mode(&self) -> NetworkOpsOperatingMode {
         self.state.operating_mode()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.state.is_full()
     }
 
     pub fn set_operating_mode(
@@ -412,9 +453,6 @@ impl AppNetworkOpsModeOwner {
 
     pub fn set_unl_blocked(&self, unl_blocked: bool) {
         self.state.set_unl_blocked(unl_blocked);
-        if unl_blocked {
-            self.set_operating_mode_with_reason(NetworkOpsOperatingMode::Connected, "unl_blocked");
-        }
     }
 
     pub fn unl_blocked(&self) -> bool {

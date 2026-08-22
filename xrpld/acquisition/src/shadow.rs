@@ -166,6 +166,9 @@ impl DisagreementKind {
 pub enum ShadowEventTag {
     StartupMode,
     Connectivity,
+    TransportConnectivity,
+    ConsensusQuorumLost,
+    ConsensusQuorumAvailable,
     AcquireRequested,
     ValidationTarget,
     PacketAdmitted,
@@ -195,6 +198,9 @@ impl ShadowEventTag {
         match self {
             Self::StartupMode => "startup_mode",
             Self::Connectivity => "connectivity",
+            Self::TransportConnectivity => "transport_connectivity",
+            Self::ConsensusQuorumLost => "consensus_quorum_lost",
+            Self::ConsensusQuorumAvailable => "consensus_quorum_available",
             Self::AcquireRequested => "acquire_requested",
             Self::ValidationTarget => "validation_target",
             Self::PacketAdmitted => "packet_admitted",
@@ -225,6 +231,9 @@ impl From<&AcquisitionEvent> for ShadowEventTag {
         match event {
             AcquisitionEvent::StartupMode { .. } => Self::StartupMode,
             AcquisitionEvent::Connectivity(_) => Self::Connectivity,
+            AcquisitionEvent::TransportConnectivity(_) => Self::TransportConnectivity,
+            AcquisitionEvent::ConsensusQuorumLost => Self::ConsensusQuorumLost,
+            AcquisitionEvent::ConsensusQuorumAvailable => Self::ConsensusQuorumAvailable,
             AcquisitionEvent::AcquireRequested { .. } => Self::AcquireRequested,
             AcquisitionEvent::ValidationTarget(_) => Self::ValidationTarget,
             AcquisitionEvent::PacketAdmitted(_) => Self::PacketAdmitted,
@@ -559,6 +568,23 @@ impl ShadowRunner {
             AcquisitionEvent::Connectivity(snapshot) => {
                 self.derive_connectivity(tag, snapshot, &mut out);
             }
+            AcquisitionEvent::TransportConnectivity(snapshot) => {
+                self.derive_transport_connectivity(tag, snapshot, &mut out);
+            }
+            AcquisitionEvent::ConsensusQuorumLost => {
+                let (derived, reason, kind) =
+                    self.apply_fact(Some(TransitionFact::ConsensusQuorumLost));
+                self.push(
+                    tag, None, kind, derived, None, None, None, reason, None, &mut out,
+                );
+            }
+            AcquisitionEvent::ConsensusQuorumAvailable => {
+                let (derived, reason, kind) =
+                    self.apply_fact(Some(TransitionFact::ConsensusQuorumAvailable));
+                self.push(
+                    tag, None, kind, derived, None, None, None, reason, None, &mut out,
+                );
+            }
             AcquisitionEvent::AcquireRequested { target, reason } => {
                 self.derive_acquire(tag, *target, *reason, false, false, &mut out);
             }
@@ -718,6 +744,19 @@ impl ShadowRunner {
         };
         let (derived, reason, kind) = self.apply_fact(fact);
         self.has_usable_peers = has_usable_peers;
+        self.push(
+            tag, None, kind, derived, None, None, None, reason, None, out,
+        );
+    }
+
+    fn derive_transport_connectivity(
+        &mut self,
+        tag: ShadowEventTag,
+        snapshot: &PeerAvailabilitySnapshot,
+        out: &mut Vec<ShadowObservation>,
+    ) {
+        self.has_usable_peers = snapshot.has_usable_peer_capability();
+        let (derived, reason, kind) = self.apply_fact(None);
         self.push(
             tag, None, kind, derived, None, None, None, reason, None, out,
         );

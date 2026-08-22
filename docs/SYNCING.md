@@ -15,6 +15,9 @@ disconnected -> connected -> syncing -> tracking -> full
                               +-----------------+     +-> proposing (validator gates satisfied)
 ```
 
+- `disconnected`: the configured consensus-peer threshold is not satisfied.
+  Some connected peers and active acquisition sessions may remain usable; this
+  state describes consensus availability, not forced transport teardown.
 - `connected`: enough peer connectivity exists to observe the network, but no
   suitable current ledger is installed.
 - `syncing`: the node is acquiring or reconciling the preferred validated
@@ -31,6 +34,17 @@ An actionable branch change can legitimately produce
 `full -> syncing -> tracking -> full`. Repeated flapping, growing local-closed
 versus validated lag, a static coordinator identity, or acquisitions that
 continually reset require investigation.
+
+Targetless readiness loss follows the reference mode rules. A Full node with
+no usable consensus positions, an amendment/UNL block, or insufficient peers
+demotes immediately without discarding reusable SHAMap nodes. Blocking and
+zero-position cases request the reference Connected mode (the public label may
+normalize to `syncing` for a fresh validated ledger), while a blocked node is
+held at `connected`. Falling below `[network_quorum]` enters `disconnected`
+until the threshold is restored.
+When `start_valid` deliberately sets the threshold to zero, losing all peers
+does not change the operating phase, but the coordinator still removes those
+peer IDs and parks acquisition work until transport returns.
 
 On an empty database, Quaxar may temporarily close a small bootstrap chain
 while the preferred network ledger's state tree is still being assembled. In
@@ -57,7 +71,9 @@ validated/published chain begins advancing.
    only for validators still waiting on that exact sequence and hash. If a
    newer validation already replaced the waiter, a late older completion stays
    reusable in history/storage but does not revive superseded trie support;
-   durability failure retracts provisional support.
+   durability failure retracts provisional support. Removing a newer
+   unacquired validation does not erase an older acquired ledger that still
+   represents that validator in the trie; removal is hash-exact.
 7. At the serialized accepted boundary, NetworkOps recomputes current
    preference and installs only the complete, current-compatible preferred
    ledger. LedgerMaster then applies validation

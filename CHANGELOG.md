@@ -23,12 +23,18 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 - Prevented late acquisition of a superseded validation from resurrecting
   historical trie support, and kept timer-time consensus view changes
   mode-only until serialized preferred-LCL reconciliation selects a target.
+- Preserved canonical empty affected-node metadata objects selected from typed
+  `NotPresent` SLE slots, and retained a signer's older acquired validation-trie
+  support when removing a different, newer unacquired validation.
+- Matched targetless NetworkOps demotions for zero consensus positions,
+  amendment/UNL blocking, and peer counts below the configured network quorum,
+  while keeping zero-threshold acquisition transport updates phase-neutral.
 
 - Reworked current-ledger recovery around the application-owned NetworkOps
   strand, a typed acquisition coordinator, preferred-ledger retargeting,
   durable exact-identity handoff, an independent startup/recovery latch, and
   the NetworkOps-to-LedgerMaster promotion boundary.
-- Preserve live acquisition traversal plans across deferred work and reuse
+- Preserved live acquisition traversal plans across deferred work and reuse
   verified nodes through the shared NodeFamily tree cache, fetch pack, and
   NodeStore after individual per-hash sessions finish or expire.
 - Decoupled factual coordinator publication identity from the fresh

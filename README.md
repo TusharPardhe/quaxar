@@ -146,8 +146,8 @@ the protected credentials/settings, and select that reviewed file:
 
 ```bash
 cp infra/docker/quaxar.cfg quaxar.local.cfg
-# Merge required legacy sections, changing /var/lib/xrpld to /var/lib/quaxar
-# and /var/log/xrpld to /var/log/quaxar.
+# Merge required legacy sections and change /var/lib/xrpld to /var/lib/quaxar.
+# Omit legacy debug_logfile paths; the container writes logs to stdout/stderr.
 export QUAXAR_CONFIG_FILE=./quaxar.local.cfg
 docker compose up -d
 ```
@@ -179,6 +179,7 @@ quaxar --conf quaxar.cfg
 Check sync and health:
 
 ```bash
+quaxar health
 quaxar sync-status
 quaxar ledger-closed
 quaxar ledger-current
@@ -245,6 +246,7 @@ suggestions, clear errors for unknown commands, and direct RPC passthrough.
 | `amendments` | Show amendment voting status. |
 | `validator-keys` | Generate, inspect, sign, and revoke validator keys. |
 | `benchmark` | Run internal performance benchmarks. |
+| `cli` | Open the interactive operator shell. |
 | `export-snapshot` | Export node store to a snapshot file while the node stays online; waits visibly for the job outcome. |
 | `load-snapshot` | Import and integrity-verify a snapshot file into the node store (offline). |
 | `doctor` | Diagnose common configuration and runtime issues. |

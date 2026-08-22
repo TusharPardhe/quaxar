@@ -1070,6 +1070,43 @@ impl InboundLedgers {
         true
     }
 
+    /// Feed acquisition transport membership without changing the coordinator
+    /// operating phase (rippled start-valid zero-threshold behavior).
+    pub fn coordinator_report_transport_availability(&self, peers: &[overlay::PeerId]) -> bool {
+        let failures = {
+            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let Some(coordinator) = guard.as_mut() else {
+                return false;
+            };
+            coordinator.refresh_peers(self.coordinator_peer_snapshot());
+            coordinator.transport_connectivity(peers);
+            coordinator.drain();
+            coordinator.take_terminal_failures()
+        };
+        self.record_coordinator_failures(failures);
+        true
+    }
+
+    /// Report the configured consensus-peer threshold independently of ledger
+    /// acquisition transport availability.
+    pub fn coordinator_report_consensus_quorum(&self, available: bool) -> bool {
+        let failures = {
+            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let Some(coordinator) = guard.as_mut() else {
+                return false;
+            };
+            if available {
+                coordinator.consensus_quorum_available();
+            } else {
+                coordinator.consensus_quorum_lost();
+            }
+            coordinator.drain();
+            coordinator.take_terminal_failures()
+        };
+        self.record_coordinator_failures(failures);
+        true
+    }
+
     /// Feed the bootstrap startup-mode fact so the coordinator seeds and
     /// publishes the initial phase from the moment it installs (M6-D). The
     /// coordinator owns the mode write from here on; the legacy bootstrap
@@ -4301,6 +4338,27 @@ mod tests {
         assert!(full_registry.coordinator_lcl_installed(identity));
         assert!(full_registry.coordinator_publication_committed(identity, true));
         assert_eq!(full_state.operating_mode(), NetworkOpsOperatingMode::Full);
+
+        // Consensus quorum is independent from acquisition transport: the peer
+        // remains retained while the public/coordinator mode disconnects.
+        assert!(full_registry.coordinator_report_consensus_quorum(false));
+        assert_eq!(
+            full_state.operating_mode(),
+            NetworkOpsOperatingMode::Disconnected
+        );
+        assert_eq!(
+            full_registry.coordinator_snapshot().unwrap().peer_count(),
+            1
+        );
+        assert!(full_registry.coordinator_report_consensus_quorum(true));
+        assert_eq!(
+            full_state.operating_mode(),
+            NetworkOpsOperatingMode::Connected
+        );
+        assert!(full_registry.coordinator_lcl_installed(identity));
+        assert!(full_registry.coordinator_publication_committed(identity, true));
+        assert_eq!(full_state.operating_mode(), NetworkOpsOperatingMode::Full);
+
         assert!(full_registry.coordinator_blocked_with_no_target());
         assert_eq!(
             full_state.operating_mode(),

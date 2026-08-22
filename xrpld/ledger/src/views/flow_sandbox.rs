@@ -128,13 +128,13 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
                         protocol::get_field_by_symbol("sfCreatedNode"),
                     );
                     add_threading_previous_fields(node, entry.sle.as_ref(), transaction_id, rules);
-                    let fields = metadata_fields(&current, |field| {
+                    let (fields, selected) = metadata_fields(&current, |field| {
                         !field.is_default()
                             && field
                                 .fname()
                                 .should_meta(SField::S_MD_CREATE | SField::S_MD_ALWAYS)
                     });
-                    if has_present_fields(&fields) {
+                    if selected {
                         node.set_field_object(protocol::get_field_by_symbol("sfNewFields"), fields);
                     }
                 }
@@ -164,22 +164,24 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
                         protocol::get_field_by_symbol("sfModifiedNode"),
                     );
                     add_threading_previous_fields(node, entry.sle.as_ref(), transaction_id, rules);
-                    let previous = metadata_fields(original.as_ref(), |field| {
-                        field.fname().should_meta(SField::S_MD_CHANGE_ORIG)
-                            && !field_matches(&current, field)
-                    });
-                    if has_present_fields(&previous) {
+                    let (previous, previous_selected) =
+                        metadata_fields(original.as_ref(), |field| {
+                            field.fname().should_meta(SField::S_MD_CHANGE_ORIG)
+                                && !field_matches(&current, field)
+                        });
+                    if previous_selected {
                         node.set_field_object(
                             protocol::get_field_by_symbol("sfPreviousFields"),
                             previous,
                         );
                     }
-                    let final_fields = metadata_fields(&current, |field| {
-                        field
-                            .fname()
-                            .should_meta(SField::S_MD_ALWAYS | SField::S_MD_CHANGE_NEW)
-                    });
-                    if has_present_fields(&final_fields) {
+                    let (final_fields, final_fields_selected) =
+                        metadata_fields(&current, |field| {
+                            field
+                                .fname()
+                                .should_meta(SField::S_MD_ALWAYS | SField::S_MD_CHANGE_NEW)
+                        });
+                    if final_fields_selected {
                         node.set_field_object(
                             protocol::get_field_by_symbol("sfFinalFields"),
                             final_fields,
@@ -200,22 +202,24 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
                         entry.sle.as_ref(),
                         protocol::get_field_by_symbol("sfDeletedNode"),
                     );
-                    let previous = metadata_fields(original.as_ref(), |field| {
-                        field.fname().should_meta(SField::S_MD_CHANGE_ORIG)
-                            && !field_matches(entry.sle.as_ref(), field)
-                    });
-                    if has_present_fields(&previous) {
+                    let (previous, previous_selected) =
+                        metadata_fields(original.as_ref(), |field| {
+                            field.fname().should_meta(SField::S_MD_CHANGE_ORIG)
+                                && !field_matches(entry.sle.as_ref(), field)
+                        });
+                    if previous_selected {
                         node.set_field_object(
                             protocol::get_field_by_symbol("sfPreviousFields"),
                             previous,
                         );
                     }
-                    let final_fields = metadata_fields(entry.sle.as_ref(), |field| {
-                        field
-                            .fname()
-                            .should_meta(SField::S_MD_ALWAYS | SField::S_MD_DELETE_FINAL)
-                    });
-                    if has_present_fields(&final_fields) {
+                    let (final_fields, final_fields_selected) =
+                        metadata_fields(entry.sle.as_ref(), |field| {
+                            field
+                                .fname()
+                                .should_meta(SField::S_MD_ALWAYS | SField::S_MD_DELETE_FINAL)
+                        });
+                    if final_fields_selected {
                         node.set_field_object(
                             protocol::get_field_by_symbol("sfFinalFields"),
                             final_fields,
@@ -366,13 +370,23 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
 }
 
 /// Copy the source's `for (auto const& obj : *sle)` metadata selection into a
-/// serializable inner object. Starting from the typed SLE preserves exact field
-/// encodings while absenting every field the SField metadata mask excludes.
-fn metadata_fields(sle: &STLedgerEntry, mut include: impl FnMut(&dyn StBase) -> bool) -> STObject {
+/// serializable inner object. The boolean records whether rippled's typed-slot
+/// loop selected anything. It deliberately differs from whether the result has
+/// a serializable field: selecting a `NotPresent` template slot produces a
+/// canonical empty object (`E6E1`) rather than no object at all.
+fn metadata_fields(
+    sle: &STLedgerEntry,
+    mut include: impl FnMut(&dyn StBase) -> bool,
+) -> (STObject, bool) {
     let mut fields = sle.clone_as_object();
+    let mut selected = false;
     let absent = fields
         .iter()
-        .filter(|field| field.stype() == SerializedTypeId::NotPresent || !include(*field))
+        .filter(|field| {
+            let keep = include(*field);
+            selected |= keep;
+            !keep || field.stype() == SerializedTypeId::NotPresent
+        })
         .map(|field| field.fname())
         .collect::<Vec<_>>();
     for field in absent {
@@ -381,13 +395,7 @@ fn metadata_fields(sle: &STLedgerEntry, mut include: impl FnMut(&dyn StBase) -> 
     // `sfLedgerEntryType` identifies the outer affected-node object and is
     // never present inside NewFields, FinalFields, or PreviousFields.
     fields.make_field_absent(protocol::get_field_by_symbol("sfLedgerEntryType"));
-    fields
-}
-
-fn has_present_fields(fields: &STObject) -> bool {
-    fields
-        .iter()
-        .any(|field| field.stype() != SerializedTypeId::NotPresent)
+    (fields, selected)
 }
 
 /// Preserve the outer fields that rippled's `ApplyStateTable::threadItem`
@@ -425,7 +433,7 @@ fn field_matches(current: &STLedgerEntry, original_field: &dyn StBase) -> bool {
     current
         .peek_at_pfield(original_field.fname())
         .is_some_and(|field| {
-            field.stype() != SerializedTypeId::NotPresent && field.is_equivalent(original_field)
+            field.stype() == original_field.stype() && field.is_equivalent(original_field)
         })
 }
 
@@ -760,6 +768,63 @@ mod tests {
                 && node.get_field_h256(protocol::get_field_by_symbol("sfLedgerIndex"))
                     == insert_keylet.key
         }));
+    }
+
+    #[test]
+    fn ticket_count_creation_emits_canonical_empty_previous_fields() {
+        // TicketCreate materializes an optional sfTicketCount slot. rippled's
+        // typed SLE loop selects the original NotPresent slot, so metadata
+        // contains an empty PreviousFields object rather than omitting it.
+        let account_keylet = Keylet::new(LedgerEntryType::AccountRoot, Uint256::from_u64(0xD4E087));
+        let original = STLedgerEntry::new(account_keylet);
+        let mut base = Ledger::new(LedgerHeader::default(), false);
+        base.raw_insert(Arc::new(original.clone()))
+            .expect("seed account root without TicketCount");
+        let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::default());
+        let rules = parent.rules();
+
+        let metadata = {
+            let mut delta = FlowSandbox::new(&mut parent);
+            let mut updated = original.clone_as_object();
+            updated.set_field_u32(protocol::get_field_by_symbol("sfTicketCount"), 140);
+            delta
+                .raw_replace(Arc::new(STLedgerEntry::from_stobject(
+                    updated,
+                    account_keylet.key,
+                )))
+                .expect("stage TicketCount creation");
+            delta
+                .to_tx_meta(Uint256::from_u64(0xB61E52), 20_111_099, None, &rules)
+                .expect("build TicketCreate metadata")
+        };
+
+        let modified = metadata
+            .get_nodes()
+            .iter()
+            .find(|node| {
+                node.fname() == protocol::get_field_by_symbol("sfModifiedNode")
+                    && node.get_field_h256(protocol::get_field_by_symbol("sfLedgerIndex"))
+                        == account_keylet.key
+            })
+            .expect("account root needs a ModifiedNode");
+        let previous_field = protocol::get_field_by_symbol("sfPreviousFields");
+        assert!(
+            modified.is_field_present(previous_field),
+            "selected NotPresent slot must still materialize PreviousFields"
+        );
+        let previous = modified.get_field_object(previous_field);
+        assert!(
+            previous
+                .iter()
+                .all(|field| field.stype() == SerializedTypeId::NotPresent),
+            "the selected absent TicketCount slot must serialize as an empty object"
+        );
+        assert!(
+            protocol::serialize_blob(modified)
+                .windows(2)
+                .any(|bytes| bytes == [0xE6, 0xE1]),
+            "affected-node serialization needs canonical empty PreviousFields E6E1"
+        );
     }
 
     #[test]

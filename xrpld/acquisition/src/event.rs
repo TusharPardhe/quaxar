@@ -32,6 +32,21 @@ pub enum AcquisitionEvent {
     /// active phase `-> Disconnected`.
     Connectivity(PeerAvailabilitySnapshot),
 
+    /// Overlay reports the current usable-peer snapshot for acquisition
+    /// transport only. Sessions pause, resume, and retarget exactly as for
+    /// [`AcquisitionEvent::Connectivity`], but the service phase is unchanged.
+    /// This is used by rippled's `start_valid` zero-peer-threshold heartbeat,
+    /// where peerless consensus remains operational.
+    TransportConnectivity(PeerAvailabilitySnapshot),
+
+    /// The active overlay peer count fell below NetworkOPs' configured
+    /// consensus threshold. Connected peers remain usable for acquisition.
+    ConsensusQuorumLost,
+
+    /// The active overlay peer count again satisfies NetworkOPs' configured
+    /// consensus threshold.
+    ConsensusQuorumAvailable,
+
     /// LedgerMaster, validation, recovery, or startup requests acquisition of a
     /// target. Motivates `Connected/Syncing -> Syncing`.
     AcquireRequested {
@@ -112,11 +127,10 @@ pub enum AcquisitionEvent {
     /// permits normal Tracking/Full promotion, matching rippled endConsensus.
     PreferredLclReconciled { lcl: LedgerIdentity },
 
-    /// Consensus accepted a round with no usable peer positions while the
-    /// coordinator was `Full`. Motivates `Full -> Connected` (blocked state or
-    /// loss of sufficient freshness with no concrete target). Quaxar-specific:
-    /// rippled's `Consensus` algorithm has no equivalent demotion, so this fact
-    /// names no session and no target.
+    /// Consensus accepted a round with no usable peer positions, or NetworkOPs
+    /// became amendment/UNL blocked, while the coordinator was `Full`.
+    /// Motivates `Full -> Connected` and names no session or target, matching
+    /// rippled's targetless operating-mode demotions.
     BlockedWithNoTarget,
 
     /// A ledger was installed as the last closed ledger.

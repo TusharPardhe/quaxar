@@ -8595,7 +8595,7 @@ impl ApplicationRoot {
         self.amendment_status.do_validated_ledger(ledger.as_ref());
         if !self.network_ops_state.is_blocked() {
             if self.amendment_status.has_unsupported_enabled() {
-                self.network_ops_state.set_amendment_blocked(true);
+                self.set_amendment_blocked(true);
             } else {
                 self.amendment_status
                     .sync_warning_state_for_validated_ledger(ledger.as_ref());

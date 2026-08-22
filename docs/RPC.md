@@ -104,6 +104,10 @@ informed by, but is not identical to, the acquisition coordinator's internal
 phase; validator `proposing` is layered on top of full synchronization. Both
 are point-in-time views. Readiness requires repeated evidence that local
 closed, validated, published, and coordinator identities advance coherently.
+`disconnected` may coexist with retained peer transport and acquisition
+sessions when the active peer count is below `[network_quorum]`; inspect both
+`server_info` and `fetch_info` rather than interpreting the label as a forced
+socket teardown.
 An empty database can temporarily report a small bootstrap `closed_ledger`
 while acquiring the network tree; do not compare that sequence to public
 network progress until the current LCL is installed.

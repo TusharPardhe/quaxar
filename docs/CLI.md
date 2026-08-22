@@ -100,6 +100,7 @@ Features:
 | `log-level <level>` | Set log level; the no-argument query is not yet populated |
 | `benchmark` | Run internal performance benchmarks |
 | `validator-keys` | Key management (see below) |
+| `cli` | Open the interactive operator shell |
 | `export-snapshot` | Export node store to snapshot file (admin RPC) |
 | `load-snapshot` | Import snapshot into node store (offline) |
 | `doctor` | Diagnose common configuration issues |

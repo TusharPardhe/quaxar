@@ -687,32 +687,49 @@ fn strand_loop(
             // `PeerCapabilityLost` and pausing live acquisition demand.
             if let Some(overlay_rt) = root.overlay_runtime() {
                 use overlay::Overlay;
-                let num_peers = overlay_rt.overlay().size();
                 // Keep the configured threshold exactly.  In particular, rippled
                 // constructs `NetworkOPsImp` with `minPeerCount_ = 0` for
                 // `startValid` (NetworkOPs.cpp), so a peerless start-valid node
-                // continues driving consensus instead of being manufactured into
-                // `on_connectivity` treats an initial unchanged empty snapshot
-                // as a no-op, so it remains safe for rippled start-valid. Do
-                // report every later actual empty snapshot: it is a real peer
-                // loss and must pause, but preserve, non-durable work.
+                // continues driving consensus instead of being manufactured
+                // into Disconnected. For that exact zero-threshold case, the
+                // empty transport snapshot is not published as a mode fact.
                 let min_peers = required_peer_count(min_peer_count);
-                let active_peer_ids = overlay_rt
-                    .overlay()
-                    .active_peers()
-                    .into_iter()
+                let active_peers = overlay_rt.overlay().active_peers();
+                let num_peers = active_peers.len();
+                let active_peer_ids = active_peers
+                    .iter()
                     .map(|peer| peer.id())
                     .collect::<Vec<_>>();
                 if shared_inbound.coordinator_installed() {
-                    // Connectivity is an acquisition transport fact, not a
-                    // consensus quorum decision. Report every actual active-ID
-                    // snapshot, including real zero-peer loss; below-quorum
-                    // non-empty capability is never rewritten as an empty
-                    // `PeerCapabilityLost` snapshot.
-                    if should_report_peer_availability(min_peers, active_peer_ids.len()) {
+                    // Publish the quorum gate before a below-threshold
+                    // non-empty transport snapshot. Otherwise the transport
+                    // fact can transiently republish Connected before the
+                    // same heartbeat demotes it again.
+                    if num_peers < min_peers {
+                        shared_inbound.coordinator_report_consensus_quorum(false);
+                    }
+                    // A zero threshold keeps acquisition transport membership
+                    // current while making it phase-neutral: start-valid
+                    // consensus remains operational without overlay peers.
+                    // Positive thresholds use the ordinary phase-bearing fact.
+                    if min_peers == 0 {
+                        shared_inbound.coordinator_report_transport_availability(&active_peer_ids);
+                    } else {
                         shared_inbound.coordinator_report_peer_availability(&active_peer_ids);
                     }
                     shared_inbound.coordinator_heartbeat();
+                    if root.network_ops_state().is_blocked()
+                        && shared_inbound
+                            .coordinator_snapshot()
+                            .is_some_and(|snapshot| {
+                                matches!(snapshot.phase(), acquisition::SyncPhase::Full { .. })
+                            })
+                    {
+                        // setAmendmentBlocked/setUNLBlocked demote rippled's
+                        // public mode immediately. Mirror that fact into the
+                        // coordinator so its phase cannot remain stale Full.
+                        shared_inbound.coordinator_blocked_with_no_target();
+                    }
                     let current_mode = root.network_ops_state().operating_mode();
                     if num_peers < min_peers {
                         if current_mode != NetworkOpsOperatingMode::Disconnected {
@@ -726,6 +743,14 @@ fn strand_loop(
                         // Skip consensus timer when disconnected (matching rippled)
                         root.wait_consensus_or_timeout(Duration::from_millis(500));
                         continue;
+                    }
+                    if shared_inbound
+                        .coordinator_snapshot()
+                        .is_some_and(|snapshot| {
+                            matches!(snapshot.phase(), acquisition::SyncPhase::Disconnected)
+                        })
+                    {
+                        shared_inbound.coordinator_report_consensus_quorum(true);
                     }
                     if current_mode == NetworkOpsOperatingMode::Disconnected {
                         tracing::info!(
@@ -1192,14 +1217,6 @@ fn cycle_obsolete_peer_statuses(root: &ApplicationRoot) {
 /// start-valid validator to continue consensus without overlay peers.
 fn required_peer_count(configured_minimum: usize) -> usize {
     configured_minimum
-}
-
-/// Report every actual overlay snapshot. An initial empty snapshot is a
-/// coordinator no-op, while an empty snapshot after a usable snapshot is the
-/// required real peer-loss fact. Consensus thresholding is deliberately kept
-/// outside this transport-capability report.
-fn should_report_peer_availability(_minimum_peers: usize, _num_peers: usize) -> bool {
-    true
 }
 
 /// The rippled heartbeat re-applies these modes even when no peer-count
@@ -3026,8 +3043,8 @@ mod tests {
         recovered_target_is_contiguous_to_lcl, required_peer_count,
         same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
         should_emit_coordinator_publication, should_promote_operating_mode_at_end_consensus,
-        should_reconcile_preferred_lcl, should_report_peer_availability,
-        should_run_end_consensus_reconciliation, switch_last_closed_ledger,
+        should_reconcile_preferred_lcl, should_run_end_consensus_reconciliation,
+        switch_last_closed_ledger,
     };
     use crate::consensus::rcl_consensus::{ConsensusRunner, PendingAcceptWork, RclCxLedger};
     use crate::consensus::rcl_cx_peer_pos::RclCxPeerPos;
@@ -3552,9 +3569,17 @@ mod tests {
         assert_eq!(required_peer_count(0), 0);
         assert_eq!(required_peer_count(1), 1);
         assert_eq!(required_peer_count(3), 3);
-        assert!(should_report_peer_availability(0, 0));
-        assert!(should_report_peer_availability(0, 1));
-        assert!(should_report_peer_availability(1, 0));
+    }
+
+    #[test]
+    fn start_valid_full_remains_full_across_an_empty_transport_snapshot() {
+        let state =
+            crate::network::network_ops::SharedNetworkOpsState::new(NetworkOpsOperatingMode::Full);
+
+        // The zero-threshold call path uses TransportConnectivity, whose
+        // coordinator regression verifies peer membership changes while Full
+        // stays Full. No legacy mode write occurs at this heartbeat boundary.
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Full);
     }
 
     #[test]

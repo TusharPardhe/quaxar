@@ -411,11 +411,15 @@ impl<A: ValidationsAdaptor> Inner<A> {
                 self.acquiring.remove(&key);
             }
         }
-        // `last_ledger` is the signer's newest available support and may be
-        // an older, superseded validation while the current validation is
-        // still acquiring. Staleness or UNL removal retracts all support for
-        // the signer, not only an exact current-validation hash.
-        if let Some(last) = self.last_ledger.remove(node_id) {
+        // The resident support may be an older acquired ledger while this
+        // validation's newer ledger is still acquiring. rippled removes it
+        // only when it is support for the exact validation being removed.
+        if self
+            .last_ledger
+            .get(node_id)
+            .is_some_and(|last| last.id() == val.ledger_id())
+            && let Some(last) = self.last_ledger.remove(node_id)
+        {
             self.trie.remove(last.id(), last.seq(), 1);
         }
     }
@@ -1516,6 +1520,55 @@ mod tests {
         assert_eq!(
             inner.last_ledger.get(&1).map(ValidationsLedger::id),
             Some(second.id())
+        );
+    }
+
+    #[test]
+    fn removing_newer_unacquired_validation_retains_older_resident_support() {
+        let adaptor = MockAdaptor::new(1000);
+        let genesis = MockLedger::genesis_();
+        let acquired = genesis.child(1);
+        let unacquired = acquired.child(2);
+        adaptor.register_ledger(acquired.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(acquired.id(), acquired.seq(), 1000, 1, 100)),
+            ValStatus::Current
+        );
+        assert_eq!(
+            validations.add(1, val(unacquired.id(), unacquired.seq(), 1001, 1, 100)),
+            ValStatus::Current
+        );
+
+        let mut inner = validations.inner.lock();
+        let current = inner
+            .current
+            .get(&1)
+            .cloned()
+            .expect("newer validation is current");
+        assert_eq!(
+            inner.last_ledger.get(&1).map(ValidationsLedger::id),
+            Some(acquired.id())
+        );
+        assert!(
+            inner
+                .acquiring
+                .contains_key(&(unacquired.seq(), unacquired.id()))
+        );
+
+        inner.remove_trie(&1, &current);
+
+        assert_eq!(
+            inner.last_ledger.get(&1).map(ValidationsLedger::id),
+            Some(acquired.id()),
+            "removing a different current validation must retain resident trie support"
+        );
+        assert!(
+            !inner
+                .acquiring
+                .contains_key(&(unacquired.seq(), unacquired.id())),
+            "the exact in-flight validation waiter is still removed"
         );
     }
 

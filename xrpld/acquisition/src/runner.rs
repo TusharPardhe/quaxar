@@ -191,6 +191,10 @@ impl Default for BudgetState {
 #[derive(Debug)]
 pub struct CoordinatorState {
     phase: SyncPhase,
+    /// Whether the configured consensus peer threshold is currently met.
+    /// Transport connectivity remains independently usable for acquisition
+    /// while this gate prevents it from publishing Connected.
+    consensus_quorum_available: bool,
     run_epoch: RunEpoch,
     sessions: BTreeMap<SessionRef, CoordinatorSession>,
     budgets: BudgetState,
@@ -671,6 +675,7 @@ impl CoordinatorRunner {
         Self {
             state: CoordinatorState {
                 phase: SyncPhase::Disconnected,
+                consensus_quorum_available: true,
                 run_epoch,
                 sessions: BTreeMap::new(),
                 budgets,
@@ -707,7 +712,12 @@ impl CoordinatorRunner {
         let mut effects = match event {
             AcquisitionEvent::Shutdown => self.on_shutdown(),
             AcquisitionEvent::StartupMode { phase } => self.on_startup_mode(phase),
-            AcquisitionEvent::Connectivity(snapshot) => self.on_connectivity(snapshot),
+            AcquisitionEvent::Connectivity(snapshot) => self.on_connectivity(snapshot, false),
+            AcquisitionEvent::TransportConnectivity(snapshot) => {
+                self.on_transport_connectivity(snapshot)
+            }
+            AcquisitionEvent::ConsensusQuorumLost => self.on_consensus_quorum_lost(),
+            AcquisitionEvent::ConsensusQuorumAvailable => self.on_consensus_quorum_available(),
             AcquisitionEvent::AcquireRequested { target, reason } => {
                 self.on_acquire(target, reason, false, false)
             }
@@ -1034,7 +1044,11 @@ impl CoordinatorRunner {
         effects
     }
 
-    fn on_connectivity(&mut self, snapshot: PeerAvailabilitySnapshot) -> Vec<AcquisitionEffect> {
+    fn on_connectivity(
+        &mut self,
+        snapshot: PeerAvailabilitySnapshot,
+        phase_neutral: bool,
+    ) -> Vec<AcquisitionEffect> {
         let had_peers = self.state.peer_view.has_usable_peer_capability();
         let has_peers = snapshot.has_usable_peer_capability();
         let departed_peers = self
@@ -1064,9 +1078,11 @@ impl CoordinatorRunner {
                 return effects;
             }
             (true, false) => {
-                if let Ok(next) = self.state.phase.apply(TransitionFact::PeerCapabilityLost) {
-                    self.state.phase = next;
-                    effects.push(AcquisitionEffect::SetServicePhase(next));
+                if !phase_neutral {
+                    if let Ok(next) = self.state.phase.apply(TransitionFact::PeerCapabilityLost) {
+                        self.state.phase = next;
+                        effects.push(AcquisitionEffect::SetServicePhase(next));
+                    }
                 }
                 // Retain every session and all non-timer operations exactly as
                 // before. Clearing only the expected acquisition timer pauses
@@ -1082,13 +1098,15 @@ impl CoordinatorRunner {
                 );
             }
             (false, true) => {
-                if let Ok(next) = self
-                    .state
-                    .phase
-                    .apply(TransitionFact::PeerCapabilityAvailable)
-                {
-                    self.state.phase = next;
-                    effects.push(AcquisitionEffect::SetServicePhase(next));
+                if !phase_neutral && self.state.consensus_quorum_available {
+                    if let Ok(next) = self
+                        .state
+                        .phase
+                        .apply(TransitionFact::PeerCapabilityAvailable)
+                    {
+                        self.state.phase = next;
+                        effects.push(AcquisitionEffect::SetServicePhase(next));
+                    }
                 }
                 self.resume_live_sessions_after_peer_recovery(&mut effects);
             }
@@ -1108,6 +1126,54 @@ impl CoordinatorRunner {
             for (target, (reason, preferred_target, phase_neutral)) in deferred {
                 effects.extend(self.on_acquire(target, reason, preferred_target, phase_neutral));
             }
+        }
+        effects
+    }
+
+    fn on_transport_connectivity(
+        &mut self,
+        snapshot: PeerAvailabilitySnapshot,
+    ) -> Vec<AcquisitionEffect> {
+        let phase = self.state.phase;
+        let mut effects = self.on_connectivity(snapshot, true);
+        // Recovery may replay retained demand through on_acquire. This fact is
+        // deliberately transport-only, so neither that replay nor direct peer
+        // membership handling may publish or retain a phase transition.
+        self.state.phase = phase;
+        effects.retain(|effect| !matches!(effect, AcquisitionEffect::SetServicePhase(_)));
+        effects
+    }
+
+    fn on_consensus_quorum_lost(&mut self) -> Vec<AcquisitionEffect> {
+        if !self.state.consensus_quorum_available {
+            return Vec::new();
+        }
+        self.state.consensus_quorum_available = false;
+        if matches!(self.state.phase, SyncPhase::Disconnected) {
+            return Vec::new();
+        }
+        self.apply_mode_only_fact(TransitionFact::ConsensusQuorumLost)
+    }
+
+    fn on_consensus_quorum_available(&mut self) -> Vec<AcquisitionEffect> {
+        if self.state.consensus_quorum_available
+            && !matches!(self.state.phase, SyncPhase::Disconnected)
+        {
+            return Vec::new();
+        }
+        self.state.consensus_quorum_available = true;
+        self.apply_mode_only_fact(TransitionFact::ConsensusQuorumAvailable)
+    }
+
+    fn apply_mode_only_fact(&mut self, fact: TransitionFact) -> Vec<AcquisitionEffect> {
+        let mut effects = Vec::new();
+        if let Ok(next) = self.state.phase.apply(fact) {
+            if next != self.state.phase {
+                self.state.phase = next;
+                effects.push(AcquisitionEffect::SetServicePhase(next));
+            }
+        } else {
+            self.stats.rejected_events += 1;
         }
         effects
     }
@@ -1141,17 +1207,7 @@ impl CoordinatorRunner {
     /// serialized `checkLastClosedLedger` path is responsible for selecting a
     /// concrete preferred-LCL recovery target later.
     fn on_consensus_view_change(&mut self) -> Vec<AcquisitionEffect> {
-        let fact = TransitionFact::ConsensusViewChange;
-        let mut effects = Vec::new();
-        if let Ok(next) = self.state.phase.apply(fact) {
-            if next != self.state.phase {
-                self.state.phase = next;
-                effects.push(AcquisitionEffect::SetServicePhase(next));
-            }
-        } else {
-            self.stats.rejected_events += 1;
-        }
-        effects
+        self.apply_mode_only_fact(TransitionFact::ConsensusViewChange)
     }
 
     /// A target-bearing preferred-LCL divergence from the serialized
@@ -1208,9 +1264,9 @@ impl CoordinatorRunner {
         effects
     }
 
-    /// Consensus accepted a round with no usable peer positions while `Full`
-    /// (Quaxar-specific `no_consensus_positions` demotion). Demotes
-    /// `Full -> Connected` with no concrete target; a later
+    /// Consensus accepted a round with no usable peer positions, or NetworkOPs
+    /// became amendment/UNL blocked, while `Full`. Demotes `Full -> Connected`
+    /// with no concrete target; a later
     /// [`AcquisitionEvent::PreferredLclDivergence`] or
     /// [`AcquisitionEvent::ConsensusTarget`] fact motivates `Connected -> Syncing`.
     fn on_blocked_with_no_target(&mut self) -> Vec<AcquisitionEffect> {
@@ -5390,6 +5446,174 @@ mod tests {
             assert_eq!(runner.snapshot().session_count(), 0);
             assert_eq!(runner.state.latest_consensus_target, None);
         }
+    }
+
+    #[test]
+    fn consensus_quorum_loss_changes_mode_without_discarding_transport_or_sessions() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let _ = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(9),
+            reason: AcquireReason::Consensus,
+        });
+        let sessions = runner.snapshot().session_count();
+        let peers = runner.snapshot().peer_count();
+
+        let effects = runner.handle_event(AcquisitionEvent::ConsensusQuorumLost);
+        assert_eq!(runner.phase(), &SyncPhase::Disconnected);
+        assert_eq!(runner.snapshot().peer_count(), peers);
+        assert_eq!(runner.snapshot().session_count(), sessions);
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Disconnected)]
+        );
+
+        let effects = runner.handle_event(AcquisitionEvent::ConsensusQuorumAvailable);
+        assert_eq!(runner.phase(), &SyncPhase::Connected);
+        assert_eq!(runner.snapshot().peer_count(), peers);
+        assert_eq!(runner.snapshot().session_count(), sessions);
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Connected)]
+        );
+    }
+
+    #[test]
+    fn below_quorum_connectivity_heartbeats_do_not_republish_connected() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+
+        assert!(
+            runner
+                .handle_event(AcquisitionEvent::ConsensusQuorumLost)
+                .is_empty()
+        );
+        for _ in 0..2 {
+            assert!(
+                runner
+                    .handle_event(AcquisitionEvent::Connectivity(
+                        PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
+                    ))
+                    .is_empty()
+            );
+            assert_eq!(runner.phase(), &SyncPhase::Disconnected);
+            assert_eq!(runner.snapshot().peer_count(), 1);
+        }
+
+        let effects = runner.handle_event(AcquisitionEvent::ConsensusQuorumAvailable);
+        assert_eq!(runner.phase(), &SyncPhase::Connected);
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Connected)]
+        );
+    }
+
+    #[test]
+    fn quorum_available_defensively_recovers_after_transport_disconnect() {
+        let lcl = identity(9);
+        let mut runner = CoordinatorRunner::with_phase(
+            RunEpoch::new(1),
+            SyncPhase::Full {
+                lcl,
+                published: lcl,
+            },
+        );
+
+        let effects = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(Vec::new()),
+        ));
+        assert_eq!(runner.phase(), &SyncPhase::Disconnected);
+        assert_eq!(runner.snapshot().peer_count(), 0);
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Disconnected)]
+        );
+
+        // Keep recovery defensive if adapters ever deliver phase-bearing
+        // transport loss and quorum availability out of order. The normal
+        // start-valid heartbeat uses phase-neutral TransportConnectivity.
+        let effects = runner.handle_event(AcquisitionEvent::ConsensusQuorumAvailable);
+        assert_eq!(runner.phase(), &SyncPhase::Connected);
+        assert_eq!(runner.snapshot().peer_count(), 0);
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Connected)]
+        );
+
+        assert!(
+            runner
+                .handle_event(AcquisitionEvent::Connectivity(
+                    PeerAvailabilitySnapshot::new(Vec::new()),
+                ))
+                .is_empty()
+        );
+        assert_eq!(runner.phase(), &SyncPhase::Connected);
+    }
+
+    #[test]
+    fn phase_neutral_transport_loss_pauses_and_recovers_full_session() {
+        let lcl = identity(9);
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let _ = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(10),
+            reason: AcquireReason::Generic,
+        });
+        // Model a session that remains active when later publication promotes
+        // the service. Transport membership must not undo that Full phase.
+        runner.state.phase = SyncPhase::Full {
+            lcl,
+            published: lcl,
+        };
+        let sessions = runner.snapshot().session_count();
+        assert_eq!(sessions, 1);
+        assert_eq!(
+            runner.phase(),
+            &SyncPhase::Full {
+                lcl,
+                published: lcl
+            }
+        );
+
+        let lost = runner.handle_event(AcquisitionEvent::TransportConnectivity(
+            PeerAvailabilitySnapshot::new(Vec::new()),
+        ));
+        assert_eq!(
+            runner.phase(),
+            &SyncPhase::Full {
+                lcl,
+                published: lcl
+            }
+        );
+        assert_eq!(runner.snapshot().peer_count(), 0);
+        assert_eq!(runner.snapshot().session_count(), sessions);
+        assert!(
+            !lost
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SendLedgerRequest(_)))
+        );
+
+        let recovered = runner.handle_event(AcquisitionEvent::TransportConnectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
+        ));
+        assert_eq!(
+            runner.phase(),
+            &SyncPhase::Full {
+                lcl,
+                published: lcl
+            }
+        );
+        assert_eq!(runner.snapshot().peer_count(), 1);
+        assert_eq!(runner.snapshot().session_count(), sessions);
+        assert!(
+            recovered
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SendLedgerRequest(_)))
+        );
+        assert!(
+            !recovered
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SetServicePhase(_)))
+        );
     }
 
     #[test]

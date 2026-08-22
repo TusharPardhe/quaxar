@@ -115,6 +115,67 @@ fn shared_network_ops_state_tracks_blocking_flags() {
 }
 
 #[test]
+fn blocking_flags_immediately_demote_full_mode() {
+    for set_blocked in [
+        SharedNetworkOpsState::set_amendment_blocked,
+        SharedNetworkOpsState::set_unl_blocked,
+    ] {
+        let state = SharedNetworkOpsState::new(NetworkOpsOperatingMode::Full);
+        set_blocked(&state, true);
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
+        assert!(!state.is_full());
+    }
+}
+
+#[test]
+fn concurrent_mode_and_blocker_writes_keep_accounting_consistent() {
+    let state = std::sync::Arc::new(SharedNetworkOpsState::new(NetworkOpsOperatingMode::Full));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+    let mut threads = Vec::new();
+
+    for worker in 0..7 {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            for turn in 0..1_000 {
+                let mode = if (worker + turn) % 2 == 0 {
+                    NetworkOpsOperatingMode::Full
+                } else {
+                    NetworkOpsOperatingMode::Tracking
+                };
+                state.set_operating_mode(mode);
+            }
+        }));
+    }
+
+    {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..1_000 {
+                state.set_amendment_blocked(false);
+                state.set_amendment_blocked(true);
+            }
+        }));
+    }
+
+    barrier.wait();
+    for thread in threads {
+        thread.join().expect("concurrent mode writer");
+    }
+
+    assert!(state.amendment_blocked());
+    assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
+    assert_eq!(
+        state.accounting_operating_mode(),
+        state.operating_mode(),
+        "the public atomic and StateAccounting mode must commit as one serialized write"
+    );
+}
+
+#[test]
 fn shared_network_ops_state_is_full_requires_mode_and_no_network_ledger_gap() {
     let state = SharedNetworkOpsState::new(NetworkOpsOperatingMode::Full);
     assert!(state.is_full());
