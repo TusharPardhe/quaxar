@@ -1159,6 +1159,150 @@ fn offer_tick_size_rounding() {
 }
 
 #[test]
+fn live_reverse_sell_tick_size_places_native_output_without_overflow() {
+    // Testnet ledger 20,120,246, transaction 4F741FC8...: this reverse
+    // orientation reached the tick-size multiply successfully, then panicked
+    // in the dry OfferCreate crossing path with "Native currency amount out of
+    // range" instead of placing the canonical residual.
+    let creator = acct(0x11);
+    let issuer = acct(0x33);
+    let currency = protocol::currency_from_string("2RY");
+    let mut issuer_root = account_root(issuer, 100_000_000, 0, 0);
+    issuer_root.set_field_u8(sf("sfTickSize"), 6);
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(creator, 13_527_058_947, 1, 0),
+            issuer_root,
+            trust_line(creator, issuer, currency, 1_000, 10_000, 0),
+        ],
+        vec!["SingleAssetVault", "LendingProtocol"],
+    );
+    let mut view = new_view(ledger);
+    let resting = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), creator);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1_250_000_620));
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            STAmount::from_iou_amount(
+                sf("sfTakerGets"),
+                IOUAmount::from_parts(1_947_026_300_000_000, -14).expect("19.470263"),
+                Issue::new(currency, issuer),
+            ),
+        );
+        tx.set_field_amount(sf("sfFee"), xrp(30));
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_u32(sf("sfFlags"), 589_824); // tfPassive | tfSell
+    });
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let cancelled = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), creator);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1_250_001_058));
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            STAmount::from_iou_amount(
+                sf("sfTakerGets"),
+                IOUAmount::from_parts(2_003_322_400_000_000, -14).expect("20.033224"),
+                Issue::new(currency, issuer),
+            ),
+        );
+        tx.set_field_amount(sf("sfFee"), xrp(30));
+        tx.set_field_u32(sf("sfSequence"), 2);
+        tx.set_field_u32(sf("sfFlags"), 589_824); // tfPassive | tfSell
+    });
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &cancelled, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    for (sequence, pays) in [(3, "20.07675"), (4, "20.674625")] {
+        let (mantissa, exponent) = match pays {
+            "20.07675" => (2_007_675_000_000_000, -14),
+            _ => (2_067_462_500_000_000, -14),
+        };
+        let opposite = STTx::new(TxType::OFFER_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), creator);
+            tx.set_field_amount(
+                sf("sfTakerPays"),
+                STAmount::from_iou_amount(
+                    sf("sfTakerPays"),
+                    IOUAmount::from_parts(mantissa, exponent).expect(pays),
+                    Issue::new(currency, issuer),
+                ),
+            );
+            tx.set_field_amount(sf("sfTakerGets"), xrp(1_250_000_000));
+            tx.set_field_amount(sf("sfFee"), xrp(30));
+            tx.set_field_u32(sf("sfSequence"), sequence);
+            tx.set_field_u32(sf("sfFlags"), 589_824); // tfPassive | tfSell
+        });
+        assert_eq!(
+            apply_submit_transactor_shell(&mut view, &opposite, TxType::OFFER_CREATE),
+            Ter::TES_SUCCESS
+        );
+    }
+    let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), creator);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1_250_000_000));
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            STAmount::from_iou_amount(
+                sf("sfTakerGets"),
+                IOUAmount::from_parts(2_004_744_700_000_000, -14).expect("20.047447"),
+                Issue::new(currency, issuer),
+            ),
+        );
+        tx.set_field_amount(sf("sfFee"), xrp(30));
+        tx.set_field_u32(sf("sfSequence"), 5);
+        tx.set_field_u32(sf("sfOfferSequence"), 2);
+        tx.set_field_u32(sf("sfFlags"), 589_824); // tfPassive | tfSell
+    });
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &tx, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let offer = view
+        .read(protocol::offer_keylet(acct_id(creator), 5))
+        .expect("offer read")
+        .expect("offer must be placed");
+    assert_eq!(
+        offer.get_field_amount(sf("sfTakerPays")).xrp().drops(),
+        1_250_000_420
+    );
+    assert!(
+        offer.get_field_amount(sf("sfTakerPays")).is_legal_net(),
+        "the internal tfSell sentinel must not escape into the stored offer"
+    );
+    assert!(
+        view.read(account_keylet(acct_id(creator)))
+            .expect("creator account read")
+            .expect("creator account")
+            .get_field_amount(sf("sfBalance"))
+            .is_legal_net(),
+        "the reverse-probe sentinel must not escape into the account balance"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(creator), 1))
+            .expect("resting same-side offer read")
+            .is_some()
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(creator), 2))
+            .expect("explicitly cancelled offer read")
+            .is_none()
+    );
+    for sequence in [3, 4] {
+        assert!(
+            view.read(protocol::offer_keylet(acct_id(creator), sequence))
+                .expect("reverse-book offer read")
+                .is_some(),
+            "worse passive reverse-book offer {sequence} must remain"
+        );
+    }
+}
+
+#[test]
 fn canonical_3e8efc65_tick_size_offer_places_rounded_residual() {
     // Canonical evidence is retained in
     // ledger/tests/fixtures/offer_create_106132761_3e8efc65. rippled

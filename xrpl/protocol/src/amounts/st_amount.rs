@@ -60,6 +60,23 @@ pub struct STAmount {
 }
 
 impl STAmount {
+    /// Construct a native amount for internal arithmetic without applying the
+    /// stricter network serialization limit.
+    ///
+    /// rippled's native `STAmount` add/subtract operators use the unchecked
+    /// `(SField, int64)` constructor.  Flow relies on that distinction for its
+    /// `kMaxNative` reverse-pass sentinel; `is_legal_net`/`check` still reject
+    /// the value if it ever reaches a wire or ledger validation boundary.
+    fn from_native_i64_unchecked(field: &'static SField, drops: i64) -> Self {
+        Self {
+            core: StBaseCore::with_field(field),
+            asset: Asset::Issue(xrp_issue()),
+            value: drops.unsigned_abs(),
+            offset: 0,
+            is_negative: drops < 0,
+        }
+    }
+
     pub fn with_field(field: &'static SField) -> Self {
         Self {
             core: StBaseCore::with_field(field),
@@ -646,7 +663,8 @@ impl AddAssign for STAmount {
         }
 
         if self.native() {
-            *self = Self::from_xrp_amount(self.xrp() + rhs.xrp());
+            let drops = (self.xrp() + rhs.xrp()).drops();
+            *self = Self::from_native_i64_unchecked(self.fname(), drops);
         } else if self.holds_mpt_issue() {
             *self = Self::from_mpt_amount(
                 self.fname(),
@@ -679,7 +697,8 @@ impl SubAssign for STAmount {
         }
 
         if self.native() {
-            *self = Self::from_xrp_amount(self.xrp() - rhs.xrp());
+            let drops = (self.xrp() - rhs.xrp()).drops();
+            *self = Self::from_native_i64_unchecked(self.fname(), drops);
         } else if self.holds_mpt_issue() {
             *self = Self::from_mpt_amount(
                 self.fname(),
@@ -927,6 +946,7 @@ mod tests {
         AmountError, ST_AMOUNT_MAX_NATIVE_NETWORK, ST_AMOUNT_MIN_MANTISSA, STAmount,
         ValidationError, has_invalid_amount,
     };
+    use crate::ST_AMOUNT_MAX_NATIVE;
     use crate::sf_generic;
     use crate::stbase::StBase;
     use crate::{AccountID, MPTAmount, MPTIssue, STArray, STObject, get_field_by_symbol};
@@ -971,6 +991,29 @@ mod tests {
         let two = STAmount::new_native(2, false);
         let one = three - two;
         assert_eq!(one.xrp().drops(), 1);
+    }
+
+    #[test]
+    fn native_arithmetic_preserves_internal_flow_sentinel_without_making_it_network_legal() {
+        let sentinel = STAmount::new_native(ST_AMOUNT_MAX_NATIVE, false);
+        let remaining = sentinel - STAmount::new_native(420, false);
+
+        assert_eq!(remaining.xrp().drops(), ST_AMOUNT_MAX_NATIVE as i64 - 420);
+        assert!(!remaining.is_legal_net());
+        assert!(matches!(
+            remaining.check(),
+            Err(ValidationError::Custom(ref message)) if message == "Native amount out of range"
+        ));
+    }
+
+    #[test]
+    fn native_arithmetic_result_at_network_boundary_remains_legal() {
+        let internal = STAmount::new_native(ST_AMOUNT_MAX_NATIVE_NETWORK + 1, false);
+        let legal = internal - STAmount::new_native(1, false);
+
+        assert_eq!(legal.xrp().drops(), ST_AMOUNT_MAX_NATIVE_NETWORK as i64);
+        assert!(legal.is_legal_net());
+        assert!(legal.check().is_ok());
     }
 
     #[test]

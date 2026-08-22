@@ -811,7 +811,11 @@ fn execute_xrp_endpoint_fwd<V: ApplyView>(
     if ter != Ter::TES_SUCCESS {
         return Err(ter);
     }
-    let amount = STAmount::from_xrp_amount(XRPAmount::from_drops(actual_drops));
+    // XRPEndpointStep is typed as XRPAmount in rippled.  Its reverse pass may
+    // carry OfferCreate's internal kMaxNative sentinel, which is intentionally
+    // larger than the network-serializable STAmount limit.  Keep that probe
+    // value raw; the limiting forward pass constrains it before commit.
+    let amount = STAmount::new_native(actual_drops.unsigned_abs(), actual_drops < 0);
     Ok((amount.clone(), amount))
 }
 

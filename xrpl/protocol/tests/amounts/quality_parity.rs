@@ -1,3 +1,4 @@
+use basics::number::{MantissaScale, NumberMantissaScaleGuard};
 use protocol::{
     Amounts, Quality, STAmount, StBase, amount_from_quality, composed_quality, divide, get_rate,
     multiply, no_issue, sf_generic,
@@ -154,6 +155,22 @@ fn number_multiply_matches_live_offer_tick_size_rounding() {
     assert_eq!(rounded_pays.mantissa(), 2_044_062_500_000_000);
     assert_eq!(rounded_pays.exponent(), -14);
     assert_eq!(get_rate(&taker_gets, &rounded_pays), 0x4d05_cf40_4f5e_7400);
+}
+
+#[test]
+fn number_multiply_matches_live_offer_tick_size_native_output() {
+    // Testnet ledger 20,120,246, transaction 4F741FC8... is the reverse
+    // tfSell orientation: issued input rounded at TickSize=6 into XRP output.
+    let taker_gets = issue_amount(2_004_744_700_000_000, -14);
+    let taker_pays = native_amount(1_250_000_000);
+    let rounded_quality = Quality::from_value(get_rate(&taker_gets, &taker_pays)).round(6);
+    assert_eq!(rounded_quality.value(), 0x5c16_26e3_f526_6400);
+
+    for scale in [MantissaScale::Small, MantissaScale::Large] {
+        let _scale = NumberMantissaScaleGuard::new(scale);
+        let rounded_pays = multiply(&taker_gets, &rounded_quality.rate(), taker_pays.asset());
+        assert_eq!(rounded_pays.xrp().drops(), 1_250_000_420, "{scale:?}");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

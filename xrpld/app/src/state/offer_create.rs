@@ -915,9 +915,13 @@ fn gateway_adjusted_send_max(taker_gets: &STAmount, gateway_rate: u32) -> STAmou
 /// representable.
 fn sell_cross_deliver_limit(taker_pays: &STAmount) -> STAmount {
     match taker_pays.asset() {
-        protocol::Asset::Issue(issue) if issue.native() => STAmount::from_xrp_amount(
-            XRPAmount::from_drops(protocol::ST_AMOUNT_MAX_NATIVE_NETWORK as i64),
-        ),
+        // rippled intentionally uses its internal native maximum here, not
+        // the lower network-legal maximum.  Since this exceeds all possible
+        // XRP liquidity, reverse Flow must discover a limiting step and the
+        // forward pass can never commit this probe-only sentinel.
+        protocol::Asset::Issue(issue) if issue.native() => {
+            STAmount::new_native(protocol::ST_AMOUNT_MAX_NATIVE, false)
+        }
         protocol::Asset::Issue(issue) => STAmount::new_with_asset(
             sf("sfAmount"),
             issue,
@@ -1085,8 +1089,9 @@ mod tests {
         let xrp = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
         assert_eq!(
             sell_cross_deliver_limit(&xrp).xrp().drops(),
-            protocol::ST_AMOUNT_MAX_NATIVE_NETWORK as i64
+            protocol::ST_AMOUNT_MAX_NATIVE as i64
         );
+        assert!(!sell_cross_deliver_limit(&xrp).is_legal_net());
 
         let issue = protocol::Issue::new(
             protocol::currency_from_string("USD"),

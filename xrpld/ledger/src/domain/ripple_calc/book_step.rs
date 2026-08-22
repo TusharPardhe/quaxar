@@ -1667,7 +1667,13 @@ fn get_owner_funds<V: ApplyView>(
             if available <= 0 {
                 return STAmount::default();
             }
-            return STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(available));
+            // The reverse XRP endpoint may have credited this disposable
+            // sandbox with Flow's native delivery sentinel.  rippled keeps
+            // owner funds as a typed XRPAmount here, so extracting the
+            // balance-minus-reserve does not run STAmount's network-amount
+            // canonicalizer a second time.  Preserve that internal value;
+            // the forward pass constrains it before any ledger commit.
+            return STAmount::new_native(available as u64, false);
         }
         return STAmount::default();
     }
