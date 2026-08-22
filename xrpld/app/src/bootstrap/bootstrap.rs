@@ -234,6 +234,8 @@ impl crate::SHAMapStoreNodeFamilyCacheRuntime for BootstrapNodeFamilyCacheRuntim
 
 struct BootstrapRotatingNodeStoreRuntime {
     database: Arc<dyn nodestore::DatabaseRotating>,
+    ledger_master_runtime: Arc<crate::AppLedgerMasterRuntime>,
+    owner_wake: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl crate::SHAMapStoreNodeStoreRuntime for BootstrapRotatingNodeStoreRuntime {
@@ -258,6 +260,11 @@ impl crate::SHAMapStoreNodeStoreRuntime for BootstrapRotatingNodeStoreRuntime {
             .rotate(new_backend, &mut |writable_name, archive_name| {
                 names = Some((writable_name.to_owned(), archive_name.to_owned()));
             });
+        self.ledger_master_runtime
+            .publish_store_rotation(nodestore::Database::store_generation(
+                self.database.as_ref(),
+            ));
+        (self.owner_wake)();
         names.expect("rotating NodeStore callback must publish backend names")
     }
 }
@@ -1454,11 +1461,8 @@ fn run_start_mode_consensus_loop(
     // Tree and FullBelow cache ownership was established by NodeFamily before
     // this loop. Do not attach registry-owned aliases on ApplicationRoot.
 
-    if let Some(lm_rt) = lm_rt_for_shared_inbound.as_ref()
-        && let Ok(mut guard) = lm_rt.inbound_ledgers.lock()
-        && guard.is_none()
-    {
-        *guard = Some(Arc::clone(&shared_inbound));
+    if let Some(lm_rt) = lm_rt_for_shared_inbound.as_ref() {
+        lm_rt.install_inbound_ledgers(Arc::clone(&shared_inbound));
     }
 
     // Match rippled InboundLedger::done: a structurally complete Consensus or
@@ -4285,10 +4289,10 @@ fn attach_production_shamap_store_runtime(
     let crate::SHAMapStoreNodeStore::Rotating(database) = bootstrap.node_store else {
         return Err("online_delete requires a rotating NodeStore backend".to_owned());
     };
-    let ledger_master = root
+    let ledger_master_runtime = root
         .ledger_master_runtime()
-        .ok_or_else(|| "online_delete requires LedgerMaster runtime".to_owned())?
-        .ledger_master();
+        .ok_or_else(|| "online_delete requires LedgerMaster runtime".to_owned())?;
+    let ledger_master = ledger_master_runtime.ledger_master();
     let node_family = root
         .node_family()
         .ok_or_else(|| "online_delete requires the application NodeFamily".to_owned())?;
@@ -4304,7 +4308,11 @@ fn attach_production_shamap_store_runtime(
         tree_cache,
         full_below,
     });
-    let node_store_runtime = Arc::new(BootstrapRotatingNodeStoreRuntime { database });
+    let node_store_runtime = Arc::new(BootstrapRotatingNodeStoreRuntime {
+        database,
+        ledger_master_runtime,
+        owner_wake: root.consensus_wake_callback(),
+    });
     let relational = root
         .relational_database()
         .as_ref()

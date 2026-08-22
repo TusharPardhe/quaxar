@@ -22,7 +22,7 @@ use ledger::{
 };
 use protocol::STTx;
 use shamap::traversal::TraversalError;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub type AppLedgerMaster = LedgerMaster<MonotonicClock, HardenedHashBuilder>;
@@ -39,6 +39,7 @@ pub struct AppLedgerMasterRuntime {
         >,
     >,
     pub inbound_ledgers: Arc<Mutex<Option<Arc<crate::ledger::inbound_ledgers::InboundLedgers>>>>,
+    pending_store_generation: Arc<AtomicU64>,
     /// Sequence of the ledger currently being built by consensus. This lets
     /// acquisition avoid racing the close path for the same next ledger.
     building_ledger_seq: Arc<AtomicU32>,
@@ -102,12 +103,49 @@ impl AppLedgerMasterRuntime {
             pending_consensus_ledger: Arc::new(Mutex::new(None)),
             completed_ledgers_rx: Arc::new(Mutex::new(None)),
             inbound_ledgers: Arc::new(Mutex::new(None)),
+            pending_store_generation: Arc::new(AtomicU64::new(0)),
             building_ledger_seq: Arc::new(AtomicU32::new(0)),
         }
     }
 
     pub fn ledger_master(&self) -> Arc<AppLedgerMaster> {
         Arc::clone(&self.ledger_master)
+    }
+
+    pub(crate) fn publish_store_rotation(&self, generation: u64) {
+        if generation == 0 {
+            return;
+        }
+        let guard = self
+            .inbound_ledgers
+            .lock()
+            .expect("inbound_ledgers mutex must not be poisoned");
+        if let Some(inbound) = guard.as_ref() {
+            inbound.note_store_rotated(generation);
+        } else {
+            self.pending_store_generation
+                .fetch_max(generation, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn install_inbound_ledgers(
+        &self,
+        inbound: Arc<crate::ledger::inbound_ledgers::InboundLedgers>,
+    ) {
+        let mut guard = self
+            .inbound_ledgers
+            .lock()
+            .expect("inbound_ledgers mutex must not be poisoned");
+        if guard.is_none() {
+            *guard = Some(inbound);
+        }
+        let generation = self.pending_store_generation.swap(0, Ordering::AcqRel);
+        if generation != 0 {
+            guard
+                .as_ref()
+                .expect("inbound owner was just installed")
+                .note_store_rotated(generation);
+        }
     }
 
     /// Returns the hash of the consensus ledger currently being requested,

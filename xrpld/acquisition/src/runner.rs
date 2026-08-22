@@ -2358,6 +2358,9 @@ impl CoordinatorRunner {
             }
             PlanWriteOutcome::FinalAccepted => {}
             PlanWriteOutcome::Failed(reason) => self.fail_session(session, reason, &mut effects),
+            PlanWriteOutcome::Cancelled(reason) => {
+                self.cancel_session(session, reason, &mut effects)
+            }
             PlanWriteOutcome::Stale => self.stats.stale_events += 1,
         }
         effects
@@ -9023,6 +9026,68 @@ mod tests {
                 .persistence(),
             crate::plan::SessionPersistence::None
         ));
+    }
+
+    #[test]
+    fn cancelled_incremental_write_cancels_store_generation_session() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let session = peer_request_session(&acquire_with_effects(&mut runner, 70));
+        {
+            let state = runner.state.sessions.get_mut(&session).expect("session");
+            state.pending_header_read = None;
+            assert!(
+                state.plan.install_engine(Box::new(
+                    ScriptedEngine::new(
+                        TreePlanId::new(70),
+                        VecDeque::from([ScriptedStep::NeedsNetwork(vec![(
+                            SHAMapNodeId::default(),
+                            Uint256::from(40_070),
+                        )])]),
+                        vec![crate::io::PersistNode::new(
+                            SHAMapHash::new(Uint256::from(50_070)),
+                            bytes::Bytes::from_static(b"accepted-node"),
+                            crate::io::StoredObjectKind::AccountNode,
+                        )],
+                    )
+                    .with_persistence_sequence(70),
+                ))
+            );
+        }
+
+        let mut started = Vec::new();
+        runner.run_plan_turn(session, None, &mut started);
+        let batch = write_batch(&started);
+        assert!(batch.fence().is_none());
+        assert!(matches!(
+            runner.session(session).expect("live").plan().persistence(),
+            crate::plan::SessionPersistence::IncrementalWritePending { .. }
+        ));
+
+        let effects = runner.handle_event(AcquisitionEvent::WriteCompleted(WriteCompletion::new(
+            batch.operation(),
+            WriteOutcome::Cancelled,
+        )));
+        assert!(effects.contains(&AcquisitionEffect::CancelSession(session)));
+        assert!(matches!(
+            runner
+                .session(session)
+                .expect("retained terminal session")
+                .phase(),
+            SessionPhase::Cancelled {
+                reason: CancelReason::StoreRotated
+            }
+        ));
+        assert_eq!(
+            runner.snapshot().cancelled_by_reason(),
+            &BTreeMap::from([(CancelReason::StoreRotated, 1)])
+        );
+        assert_eq!(runner.snapshot().stale_events(), 0);
     }
 
     #[test]

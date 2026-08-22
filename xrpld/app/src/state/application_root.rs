@@ -4480,6 +4480,19 @@ impl ApplicationRoot {
         cvar.notify_one();
     }
 
+    /// Narrow wake capability for background producers which must notify the
+    /// serialized NetworkOps owner without retaining an ApplicationRoot clone
+    /// (and therefore without forming a component ownership cycle).
+    pub(crate) fn consensus_wake_callback(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let notify = Arc::clone(&self.consensus_notify);
+        Arc::new(move || {
+            let (lock, cvar) = &*notify;
+            let mut pending = lock.lock().expect("consensus_notify lock");
+            *pending = true;
+            cvar.notify_one();
+        })
+    }
+
     /// Wait for a consensus event notification or timeout. Returns true if
     /// notified (proposals arrived), false on timeout.
     pub fn wait_consensus_or_timeout(&self, timeout: std::time::Duration) -> bool {

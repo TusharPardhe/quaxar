@@ -49,7 +49,7 @@ use crate::io::{
     DurabilityOutcome, PersistNode, ReadCompletion, ReadOutcome, ReadPriority, ReadRequest,
     WriteBatch, WriteOutcome,
 };
-use crate::session::FailureReason;
+use crate::session::{CancelReason, FailureReason};
 
 /// One deferred NodeStore round, matching rippled's `MissingNodes` maxDefer
 /// of 512. The separate missing-node network output maximum remains 256.
@@ -549,6 +549,9 @@ pub enum PlanWriteOutcome {
     FinalAccepted,
     /// The write failed; the session must terminalize.
     Failed(FailureReason),
+    /// The exact write was cancelled because its NodeStore generation is no
+    /// longer valid; the session must be cancelled rather than left pending.
+    Cancelled(CancelReason),
     /// No in-flight write matches the operation; stale.
     Stale,
 }
@@ -1460,7 +1463,11 @@ impl SessionPlan {
                     };
                     PlanWriteOutcome::Failed(FailureReason::WriteFailure)
                 }
-                WriteOutcome::Stale | WriteOutcome::Cancelled => PlanWriteOutcome::Stale,
+                WriteOutcome::Cancelled => {
+                    self.persistence = SessionPersistence::None;
+                    PlanWriteOutcome::Cancelled(CancelReason::StoreRotated)
+                }
+                WriteOutcome::Stale => PlanWriteOutcome::Stale,
             },
             SessionPersistence::FinalWritePending {
                 operation: expected,
@@ -1480,7 +1487,11 @@ impl SessionPlan {
                     };
                     PlanWriteOutcome::Failed(FailureReason::WriteFailure)
                 }
-                WriteOutcome::Stale | WriteOutcome::Cancelled => PlanWriteOutcome::Stale,
+                WriteOutcome::Cancelled => {
+                    self.persistence = SessionPersistence::None;
+                    PlanWriteOutcome::Cancelled(CancelReason::StoreRotated)
+                }
+                WriteOutcome::Stale => PlanWriteOutcome::Stale,
             },
             _ => PlanWriteOutcome::Stale,
         }
@@ -2304,8 +2315,12 @@ mod tests {
         };
         assert_eq!(
             cancelled_outcome.on_write(write.operation(), WriteOutcome::Cancelled),
-            PlanWriteOutcome::Stale
+            PlanWriteOutcome::Cancelled(CancelReason::StoreRotated)
         );
+        assert!(matches!(
+            cancelled_outcome.persistence(),
+            SessionPersistence::None
+        ));
 
         let mut cancelled = persistence_probe(Arc::clone(&accepted_writes));
         let PlanTurn::Persist(write) = cancelled.run_turn(&mut ctx(s, &mut ids)) else {

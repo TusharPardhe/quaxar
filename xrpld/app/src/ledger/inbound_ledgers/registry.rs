@@ -784,6 +784,9 @@ pub struct InboundLedgers {
     /// resolves when a Base/header packet arrives. Registered exactly once per
     /// requested session.
     coordinator_origins: CoordinatorSessionOrigins,
+    /// Newest NodeStore generation published by the online-delete worker.
+    /// Only the serialized coordinator owner consumes and applies this fact.
+    pending_store_generation: AtomicU64,
     /// The NetworkOps state the coordinator phase port publishes to. Wired by
     /// ApplicationRoot before coordinator installation; the coordinator is the
     /// single production mode writer for the sessions it owns.
@@ -853,6 +856,7 @@ impl InboundLedgers {
             coordinator: Mutex::new(None),
             coordinator_ingress: RwLock::new(None),
             coordinator_origins: CoordinatorSessionOrigins::default(),
+            pending_store_generation: AtomicU64::new(0),
             coordinator_phase: RwLock::new(None),
         }
     }
@@ -1041,13 +1045,33 @@ impl InboundLedgers {
             let Some(coordinator) = guard.as_mut() else {
                 return (0, false);
             };
-            let handled = coordinator.drain();
+            // Apply rotation before queued completions or acquires can observe
+            // a generation which the rotating backend has already retired.
+            let generation = self.pending_store_generation.swap(0, Ordering::AcqRel);
+            let mut handled = 0;
+            if generation != 0 {
+                coordinator.handle_fact(acquisition::AcquisitionEvent::StoreRotated(
+                    acquisition::StoreGeneration::new(generation),
+                ));
+                handled += 1;
+            }
+            handled += coordinator.drain();
             let has_more = coordinator.drain_has_more();
             let failures = coordinator.take_terminal_failures();
             ((handled, has_more), failures)
         };
         self.record_coordinator_failures(failures);
         handled
+    }
+
+    /// Publish a completed NodeStore rotation without mutating acquisition
+    /// state from the online-delete worker. Bursts coalesce to the newest
+    /// generation and remain retained until the owner drains them.
+    pub(crate) fn note_store_rotated(&self, generation: u64) {
+        if generation != 0 {
+            self.pending_store_generation
+                .fetch_max(generation, Ordering::Release);
+        }
     }
 
     /// Feed the current peer-availability fact to the coordinator owner.
@@ -4113,6 +4137,70 @@ mod tests {
                 .expect("coordinator snapshot")
                 .session_count(),
             0
+        );
+        registry.stop();
+    }
+
+    #[test]
+    fn production_rotation_is_retained_coalesced_and_applied_before_owner_drain() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let registry = Arc::new(registry);
+        let ledger_master_runtime = crate::AppLedgerMasterRuntime::default();
+
+        // Exercise the production bootstrap ordering: online delete may
+        // complete before the shared acquisition registry is installed.
+        ledger_master_runtime.publish_store_rotation(2);
+        ledger_master_runtime.publish_store_rotation(4);
+        ledger_master_runtime.publish_store_rotation(3);
+        ledger_master_runtime.install_inbound_ledgers(Arc::clone(&registry));
+        registry.set_phase_state(Arc::new(
+            crate::network::network_ops::SharedNetworkOpsState::new(
+                crate::network::network_ops::NetworkOpsOperatingMode::Disconnected,
+            ),
+        ));
+        assert!(registry.install_coordinator());
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .storage_generation()
+                .get(),
+            1,
+            "the rotation worker must not mutate coordinator state"
+        );
+
+        let (handled, _) = registry.coordinator_drain_with_status();
+        assert_eq!(handled, 1, "coalesced rotation is one owner fact");
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .storage_generation()
+                .get(),
+            4,
+            "the newest retained generation becomes authoritative"
+        );
+
+        // Once installed, the same production publisher still leaves the
+        // mutation pending until the serialized owner pass.
+        ledger_master_runtime.publish_store_rotation(5);
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .storage_generation()
+                .get(),
+            4
+        );
+        assert_eq!(registry.coordinator_drain_with_status().0, 1);
+        assert_eq!(
+            registry
+                .coordinator_snapshot()
+                .expect("coordinator snapshot")
+                .storage_generation()
+                .get(),
+            5
         );
         registry.stop();
     }

@@ -1013,7 +1013,7 @@ impl ShadowRunner {
         };
         if mirror.phase.is_terminal()
             || mirror.phase == SessionPhase::Dormant
-            || matches!(outcome, WriteOutcome::Stale | WriteOutcome::Cancelled)
+            || matches!(outcome, WriteOutcome::Stale)
         {
             self.push(
                 tag,
@@ -1041,6 +1041,17 @@ impl ShadowRunner {
                 });
                 mirror.phase = SessionPhase::Failed {
                     reason: FailureReason::WriteFailure,
+                };
+                mirror.terminal = terminal;
+                mirror.local_scan_in_flight = false;
+                terminal
+            }
+            WriteOutcome::Cancelled if !mirror.phase.is_terminal() => {
+                let terminal = Some(ShadowOutcome::Cancelled {
+                    reason: CancelReason::StoreRotated,
+                });
+                mirror.phase = SessionPhase::Cancelled {
+                    reason: CancelReason::StoreRotated,
                 };
                 mirror.terminal = terminal;
                 mirror.local_scan_in_flight = false;
