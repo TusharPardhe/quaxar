@@ -2278,6 +2278,8 @@ impl CoordinatorRunner {
             }
             return Vec::new();
         }
+        let local_scan_scheduled = self.state.local_scan_owners.contains(&session)
+            || self.state.local_scan_waiters.contains(&session);
         let Some(session_state) = self.state.sessions.get_mut(&session) else {
             self.stats.stale_events += 1;
             return Vec::new();
@@ -2342,12 +2344,15 @@ impl CoordinatorRunner {
             self.stats.stale_events += 1;
             return Vec::new();
         }
-        if session_state.local_reconstruction_in_flight() {
+        if session_state.local_reconstruction_in_flight() || local_scan_scheduled {
             // `SHAMap::getMissingNodes` waits for and processes successive
             // 512-read batches before returning to InboundLedger::onTimer.
-            // Our async translation must therefore rearm without releasing
-            // request credits, clearing recentNodes, or consuming the seven
-            // network no-progress intervals while the same scan is active.
+            // A queued/running local-scan permit is the corresponding bounded
+            // JtLedgerData job; rippled's TimeoutCounter::onDeadline defers its
+            // timer job while that job class is at its limit. Our async
+            // translation must therefore rearm without releasing request
+            // credits, clearing recentNodes, or consuming the seven network
+            // no-progress intervals while the same scan is active or queued.
             let pending_header_read = session_state.pending_header_read.is_some();
             let pending_reads = session_state.plan.pending_read_count();
             let read_backlog = session_state.plan.read_backlog_count();
@@ -2368,6 +2373,7 @@ impl CoordinatorRunner {
                 pending_header_read,
                 pending_reads,
                 read_backlog,
+                local_scan_scheduled,
                 timeout_budget,
                 "acquisition trace: local scan retained without consuming network timeout budget"
             );
@@ -9454,7 +9460,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_scan_waiter_consumes_network_timeout_budget() {
+    fn queued_scan_waiter_defers_network_timeout_budget_until_job_runs() {
         let budget = BudgetState::new(
             8,
             AdmissionBudget::new(600, 1 << 20),
@@ -9463,6 +9469,7 @@ mod tests {
         let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
         connect(&mut runner);
         let mut waiter = None;
+        let mut first_owner_read = None;
 
         for seq in 20..24 {
             let started = acquire_with_effects(&mut runner, seq);
@@ -9481,6 +9488,9 @@ mod tests {
             ))));
             let mut effects = Vec::new();
             runner.run_plan_turn(session, None, &mut effects);
+            if seq == 20 {
+                first_owner_read = read_effects(&effects).first().map(|read| read.operation());
+            }
             if seq == 23 {
                 waiter = Some(session);
             }
@@ -9490,20 +9500,40 @@ mod tests {
         assert!(runner.state.local_scan_waiters.contains(&waiter));
         assert!(!runner.state.local_scan_owners.contains(&waiter));
         assert_eq!(runner.session(waiter).expect("waiter").plan().timeouts(), 0);
-        let operation = runner
-            .session(waiter)
-            .expect("waiter")
-            .pending_timer()
-            .expect("acquisition timer")
-            .1;
+        // More than the seven true network no-progress intervals may elapse
+        // while this logical JtLedgerData job is queued. Every wake rearms one
+        // exact timer without consuming budget or disturbing FIFO priority.
+        for _ in 0..9 {
+            let operation = runner
+                .session(waiter)
+                .expect("waiter remains live")
+                .pending_timer()
+                .expect("acquisition timer remains armed")
+                .1;
+            let effects = runner.handle_event(AcquisitionEvent::TimerFired {
+                operation,
+                timer: TimerKind::AcquireTimeout,
+            });
+            assert_eq!(runner.session(waiter).expect("waiter").plan().timeouts(), 0);
+            assert!(runner.state.local_scan_waiters.contains(&waiter));
+            assert!(effects.iter().all(|effect| matches!(
+                effect,
+                AcquisitionEffect::ArmTimer(request)
+                    if request.timer() == TimerKind::AcquireTimeout
+            )));
+        }
 
-        let _ = runner.handle_event(AcquisitionEvent::TimerFired {
-            operation,
-            timer: TimerKind::AcquireTimeout,
-        });
-
-        assert_eq!(runner.session(waiter).expect("waiter").plan().timeouts(), 1);
-        assert!(runner.state.local_scan_waiters.contains(&waiter));
+        // The deferred timer did not steal or cancel the job: releasing the
+        // oldest owner resumes this sole waiter with its first read batch.
+        let resumed = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            first_owner_read.expect("first owner read"),
+            ReadOutcome::Settled { node: None },
+        )));
+        assert!(
+            read_effects(&resumed)
+                .iter()
+                .any(|read| read.operation().session() == waiter)
+        );
     }
 
     #[test]
