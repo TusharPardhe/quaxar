@@ -205,17 +205,30 @@ pub struct CoordinatorState {
     /// are replayed by this same owner on the next `PeerCapabilityAvailable`
     /// fact; there is never an adapter-side retry queue.
     deferred_acquires: BTreeMap<LedgerTarget, (AcquireReason, bool, bool)>,
-    /// Latest preferred-LCL demand observed from consensus. Recovery ranks an
-    /// active session for this exact target ahead of older consensus sessions,
-    /// even when the latest fact coalesced with an older session identity.
+    /// Latest preferred-LCL demand observed from consensus. This is a policy
+    /// and promotion candidate only; scheduling remains bound to the exact
+    /// latched recovery owner until its natural reconciliation boundary.
     latest_consensus_target: Option<LedgerTarget>,
     /// Latest hash requested by `RCLValidationsAdaptor::acquire`. It receives
     /// outbound priority without becoming preferred-LCL or operating-mode
     /// policy state.
     latest_validation_target: Option<LedgerTarget>,
-    /// Exact live owner satisfying `latest_validation_target`. Priority is
-    /// bound to this identity, never to the hash after that owner terminalizes.
+    /// Exact live owner satisfying `latest_validation_target`, retained only
+    /// for validation-demand lifecycle accounting. It is deliberately not an
+    /// outbound or recovery scheduling priority.
     latest_validation_session: Option<SessionRef>,
+    /// Stable preferred-LCL target currently being recovered. It is latched
+    /// before a matching session necessarily exists, so a divergence fact and
+    /// the later missing-ledger acquisition cannot be separated by a moving
+    /// consensus or validation observation.
+    recovery_anchor_target: Option<LedgerTarget>,
+    /// Exact owner of the consensus LCL currently being recovered. This is
+    /// the coordinator equivalent of rippled's `acquiringLedger_`: newer
+    /// consensus and validation observations may update policy candidates,
+    /// but cannot preempt this owner while it remains viable. Operating-mode
+    /// transitions are deliberately independent, so a transient
+    /// Full/Tracking/Connected publication does not lose the recovery latch.
+    recovery_anchor_session: Option<SessionRef>,
     /// Latest preferred-LCL demand that could not obtain capacity after
     /// cancellable Generic/History work was considered. It is coordinator
     /// state, not a registry retry or consensus callback latch.
@@ -692,6 +705,8 @@ impl CoordinatorRunner {
                 latest_consensus_target: None,
                 latest_validation_target: None,
                 latest_validation_session: None,
+                recovery_anchor_target: None,
+                recovery_anchor_session: None,
                 deferred_consensus_acquire: None,
                 storage_generation: StoreGeneration::new(1),
                 last_installed_lcl: None,
@@ -757,7 +772,9 @@ impl CoordinatorRunner {
             AcquisitionEvent::Heartbeat => self.on_heartbeat(),
         };
         self.replay_deferred_consensus(&mut effects);
-        self.reconcile_validation_priority();
+        self.reconcile_validation_owner();
+        self.reconcile_recovery_anchor();
+        self.enforce_recovery_anchor_phase(&mut effects);
         self.promote_latest_viable_syncing_anchor(&mut effects);
         // All peer sends leave through one post-mutation emitter. This ensures
         // an adapter never sees a request before the owner recorded its
@@ -783,7 +800,9 @@ impl CoordinatorRunner {
         let count = completions.len() as u64;
         let mut effects = self.on_read_batch(completions);
         self.replay_deferred_consensus(&mut effects);
-        self.reconcile_validation_priority();
+        self.reconcile_validation_owner();
+        self.reconcile_recovery_anchor();
+        self.enforce_recovery_anchor_phase(&mut effects);
         self.promote_latest_viable_syncing_anchor(&mut effects);
         effects.extend(self.emit_admitted_requests());
         self.stats.events_handled += count;
@@ -828,6 +847,13 @@ impl CoordinatorRunner {
     /// before a replacement is selected, so they cannot publish a transient
     /// anchor whose session is about to be cancelled in the same event.
     fn promote_latest_viable_syncing_anchor(&mut self, effects: &mut Vec<AcquisitionEffect>) {
+        // The explicit recovery latch owns promotion whenever present. Its
+        // exact session reconciliation above advances the target only at a
+        // terminal/invalidation boundary; the moving latest candidate must
+        // not bypass that policy through phase-only viability checks.
+        if self.state.recovery_anchor_target.is_some() {
+            return;
+        }
         let SyncPhase::Syncing { target: anchor } = self.state.phase else {
             return;
         };
@@ -870,7 +896,7 @@ impl CoordinatorRunner {
                 .any(|deferred| deferred.hash() == target.hash())
     }
 
-    fn reconcile_validation_priority(&mut self) {
+    fn reconcile_validation_owner(&mut self) {
         let Some(target) = self.state.latest_validation_target else {
             self.state.latest_validation_session = None;
             return;
@@ -893,6 +919,116 @@ impl CoordinatorRunner {
         {
             self.state.latest_validation_target = None;
         }
+    }
+
+    /// Latch one exact consensus recovery owner until it naturally finishes
+    /// or is invalidated. `latest_consensus_target` is only the candidate to
+    /// use after that boundary; it is never itself scheduling authority.
+    /// This mirrors rippled's `RCLConsensus::Adaptor::acquiringLedger_`, whose
+    /// hash remains the active acquisition until the requested ledger changes
+    /// at a real reconciliation boundary.
+    fn reconcile_recovery_anchor(&mut self) {
+        if let Some(anchor) = self.state.recovery_anchor_session {
+            let anchor_state = self.state.sessions.get(&anchor);
+            let live_target = anchor_state.and_then(|session| {
+                (!session.phase.is_terminal()
+                    && self
+                        .state
+                        .recovery_anchor_target
+                        .is_some_and(|target| target.hash() == session.target.hash()))
+                .then_some(session.target)
+            });
+            if let Some(live_target) = live_target {
+                if self.state.recovery_anchor_target.is_some_and(|target| {
+                    target.sequence().is_none() && live_target.sequence().is_some()
+                }) {
+                    self.state.recovery_anchor_target = Some(live_target);
+                }
+                return;
+            }
+            if anchor_state.is_some_and(|session| session.phase == SessionPhase::Complete) {
+                // Durable handoff completion is not LCL adoption. Keep the
+                // stable target authoritative until NetworkOps reports the
+                // exact LclInstalled/PreferredLclReconciled boundary, but the
+                // terminal session no longer participates in scheduling.
+                self.state.recovery_anchor_session = None;
+                return;
+            }
+            // An exact owner existed and reached a terminal/invalidation
+            // boundary. Only now may the latest viable policy candidate be
+            // promoted into the recovery latch.
+            self.state.recovery_anchor_session = None;
+            self.state.recovery_anchor_target = None;
+            if let Some((target, session)) = self.state.latest_consensus_target.and_then(|target| {
+                self.viable_session_for_target(target)
+                    .map(|session| (target, session))
+            }) {
+                self.state.recovery_anchor_target = Some(target);
+                self.state.recovery_anchor_session = Some(session);
+            }
+            return;
+        }
+
+        if let Some(target) = self.state.recovery_anchor_target {
+            // PreferredLclDivergence can precede the matching acquisition.
+            // Keep the target stable while waiting; absence is not failure.
+            self.state.recovery_anchor_session = self.viable_session_for_target(target);
+            return;
+        }
+
+        // With no existing or pending latch, latest consensus remains policy
+        // metadata only. `observe_consensus_target(..., true)` or an explicit
+        // divergence is the sole authority that starts recovery.
+    }
+
+    fn observe_consensus_target(&mut self, target: LedgerTarget, latch_if_empty: bool) {
+        let selected = self
+            .state
+            .latest_consensus_target
+            .filter(|current| {
+                current.hash() == target.hash()
+                    && current.sequence().is_some()
+                    && target.sequence().is_none()
+            })
+            .unwrap_or(target);
+        self.state.latest_consensus_target = Some(selected);
+        if latch_if_empty && self.state.recovery_anchor_target.is_none() {
+            self.state.recovery_anchor_target = Some(selected);
+        }
+    }
+
+    fn enforce_recovery_anchor_phase(&mut self, effects: &mut Vec<AcquisitionEffect>) {
+        let Some(target) = self.state.recovery_anchor_target else {
+            return;
+        };
+        if self.shutdown
+            || !self.state.peer_view.has_usable_peer_capability()
+            || matches!(
+                self.state.phase,
+                SyncPhase::Disconnected | SyncPhase::Stopping
+            )
+        {
+            return;
+        }
+        let next = SyncPhase::Syncing { target };
+        if self.state.phase != next {
+            self.state.phase = next;
+            effects.push(AcquisitionEffect::SetServicePhase(next));
+        }
+    }
+
+    fn viable_session_for_target(&self, target: LedgerTarget) -> Option<SessionRef> {
+        self.state
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                !session.phase.is_terminal() && session.target.hash() == target.hash()
+            })
+            // InboundLedgers has one owner per hash. If retained test state
+            // contains more than one, preserve the oldest exact owner rather
+            // than letting a moving observation win.
+            .min_by_key(|(session, _)| session.session_id())
+            .map(|(session, _)| *session)
     }
 
     /// The coordinator run epoch.
@@ -1070,6 +1206,11 @@ impl CoordinatorRunner {
             return effects;
         }
         self.state.phase = phase;
+        if let SyncPhase::Syncing { target } = phase
+            && self.state.recovery_anchor_target.is_none()
+        {
+            self.state.recovery_anchor_target = Some(target);
+        }
         effects.push(AcquisitionEffect::SetServicePhase(phase));
         effects
     }
@@ -1213,17 +1354,24 @@ impl CoordinatorRunner {
         // suspend an older per-hash acquisition. rippled's one InboundLedgers
         // owner advances multiple InboundLedger hashes concurrently.
         let incoming = target.target();
+        let latch_if_empty = matches!(self.state.phase, SyncPhase::Syncing { .. })
+            || (self.state.last_installed_lcl.is_none()
+                && !matches!(
+                    self.state.phase,
+                    SyncPhase::Tracking { .. } | SyncPhase::Full { .. }
+                ));
+        self.observe_consensus_target(incoming, latch_if_empty);
         let selected = self
             .state
             .latest_consensus_target
-            .filter(|current| {
-                current.hash() == incoming.hash()
-                    && current.sequence().is_some()
-                    && incoming.sequence().is_none()
-            })
-            .unwrap_or(incoming);
-        self.state.latest_consensus_target = Some(selected);
-        self.state.deferred_consensus_acquire = None;
+            .expect("observed consensus target");
+        if self
+            .state
+            .deferred_consensus_acquire
+            .is_some_and(|deferred| deferred.hash() == selected.hash())
+        {
+            self.state.deferred_consensus_acquire = None;
+        }
         self.on_acquire(selected, target.reason(), true, false)
     }
 
@@ -1266,6 +1414,7 @@ impl CoordinatorRunner {
             );
             return Vec::new();
         }
+        self.observe_consensus_target(target, true);
         let fact = TransitionFact::PreferredLclDivergence { target };
         let mut effects = Vec::new();
         if let Ok(next) = self.state.phase.apply(fact) {
@@ -1281,6 +1430,11 @@ impl CoordinatorRunner {
 
     fn on_preferred_lcl_reconciled(&mut self, lcl: LedgerIdentity) -> Vec<AcquisitionEffect> {
         self.state.last_installed_lcl = Some(lcl);
+        // This explicit NetworkOps fact proves there is no longer a preferred
+        // LCL mismatch, even when the retained recovery hash differs from the
+        // local ledger that won reconciliation.
+        self.state.recovery_anchor_target = None;
+        self.state.recovery_anchor_session = None;
         self.state.latest_consensus_target = None;
         self.state.deferred_consensus_acquire = None;
         let fact = TransitionFact::PreferredLclReconciled { lcl };
@@ -1366,13 +1520,31 @@ impl CoordinatorRunner {
         phase_neutral: bool,
     ) -> Vec<AcquisitionEffect> {
         let mut effects = Vec::new();
+        let authoritative_recovery_demand = reason == AcquireReason::Consensus
+            && !phase_neutral
+            && self
+                .state
+                .recovery_anchor_target
+                .is_some_and(|anchor| anchor.hash() == target.hash());
+        let moving_preferred_observation = preferred_target
+            && self
+                .state
+                .recovery_anchor_target
+                .is_some_and(|anchor| anchor.hash() != target.hash());
 
         // Retain one latest preferred target and one latest ordinary/cache
         // target while peerless. The owner replays them after
         // `PeerCapabilityAvailable`; an unbounded moving-tip map would turn a
         // temporary disconnection into a reconnect request storm.
         if !self.state.peer_view.has_usable_peer_capability() {
-            self.retain_peerless_acquire(target, reason, preferred_target, phase_neutral);
+            if !moving_preferred_observation {
+                self.retain_peerless_acquire(
+                    target,
+                    reason,
+                    authoritative_recovery_demand,
+                    phase_neutral,
+                );
+            }
             tracing::info!(
                 target: "acquisition_trace",
                 event = "acquire_demand_deferred",
@@ -1402,7 +1574,7 @@ impl CoordinatorRunner {
         // phase merely because the preferred session has already terminalized.
         // The demand still gets its independent per-hash session below.
         let ordinary_demand_with_preferred =
-            !preferred_target && self.state.latest_consensus_target.is_some();
+            !authoritative_recovery_demand && self.state.latest_consensus_target.is_some();
         let same_hash = self.live_sessions_for_hash(target.hash());
         let exact = same_hash.iter().copied().find(|session| {
             self.state
@@ -1469,7 +1641,7 @@ impl CoordinatorRunner {
         // A retained preferred-LCL target reserves the next free slot. Generic
         // or History work may coalesce with an existing owner, but cannot take
         // that slot and permanently strand convergence.
-        if !preferred_target
+        if !authoritative_recovery_demand
             && !continuing_existing
             && self.state.deferred_consensus_acquire.is_some()
         {
@@ -1478,13 +1650,16 @@ impl CoordinatorRunner {
         // A new consensus target evicts retained dormant consensus work before
         // it can be deferred at capacity. Persisting and DurablePending never
         // qualify for dormancy or eviction.
-        if would_exceed && preferred_target && self.evict_oldest_dormant_consensus(&mut effects) {
+        if would_exceed
+            && authoritative_recovery_demand
+            && self.evict_oldest_dormant_consensus(&mut effects)
+        {
             would_exceed = false;
         }
         // Consensus may preempt only a cancellable lower-priority session.
         // DurablePending is intentionally excluded: its completed result and
         // handoff are already committed and must not be revoked.
-        if would_exceed && preferred_target {
+        if would_exceed && authoritative_recovery_demand {
             let preempt = self
                 .state
                 .sessions
@@ -1555,7 +1730,7 @@ impl CoordinatorRunner {
             );
         }
         if would_exceed {
-            if preferred_target {
+            if authoritative_recovery_demand {
                 self.state.deferred_consensus_acquire = Some(target);
                 if !matches!(
                     self.state.phase,
@@ -1578,7 +1753,7 @@ impl CoordinatorRunner {
                     max_sessions = self.state.budgets.max_sessions,
                     "acquisition trace: retained latest preferred-LCL demand until capacity is free"
                 );
-            } else {
+            } else if !moving_preferred_observation {
                 self.stats.rejected_events += 1;
             }
             return effects;
@@ -1725,10 +1900,11 @@ impl CoordinatorRunner {
         effects
     }
 
-    /// Coalesce peerless demand into two bounded priority classes. A normal
-    /// acquire following NetworkOps' preferred-target fact for the same hash
-    /// strengthens that retained preferred entry rather than replacing it.
-    /// Within either class, the newest distinct target replaces the older one.
+    /// Coalesce peerless demand into two bounded priority classes. The exact
+    /// unbound recovery anchor retains the preferred slot until replay; moving
+    /// preferred observations remain `latest_consensus_target` metadata and
+    /// cannot delete the only demand capable of binding that anchor. Ordinary
+    /// cache demand continues to coalesce to its newest distinct target.
     fn retain_peerless_acquire(
         &mut self,
         target: LedgerTarget,
@@ -1875,6 +2051,16 @@ impl CoordinatorRunner {
             if !matches {
                 self.stats.stale_events += 1;
                 return Vec::new();
+            }
+            if self.state.recovery_anchor_session == Some(session) {
+                // The preferred LCL is deliberately stable while validation
+                // and consensus tips move, so it may receive no repeated
+                // registry demand. Keep its registry ownership alive; the
+                // independent no-progress AcquireTimeout remains the bounded
+                // authority that can fail and promote this recovery.
+                let mut effects = Vec::new();
+                self.touch_session_expiry(session, &mut effects);
+                return effects;
             }
             if let Some(state) = self.state.sessions.get_mut(&session) {
                 state.expiry_sweep_eligible = true;
@@ -2429,6 +2615,11 @@ impl CoordinatorRunner {
                 }) {
                     self.state.latest_consensus_target = Some(resolved);
                 }
+                if self.state.recovery_anchor_target.is_some_and(|target| {
+                    target.hash() == durable_hash && target.sequence().is_none()
+                }) {
+                    self.state.recovery_anchor_target = Some(resolved);
+                }
                 // Persisting -> DurablePending: the durable payload and unique
                 // handoff are now both present, so delivery may be retried
                 // exactly once by handoff identity. It is never
@@ -2571,6 +2762,14 @@ impl CoordinatorRunner {
         // This fact is serialized by NetworkOps and is the exact local-LCL
         // counterpart that authorizes a later in-place Full refresh.
         self.state.last_installed_lcl = Some(identity);
+        if self
+            .state
+            .recovery_anchor_target
+            .is_some_and(|target| target.hash() == identity.hash())
+        {
+            self.state.recovery_anchor_target = None;
+            self.state.recovery_anchor_session = None;
+        }
         if self
             .state
             .latest_consensus_target
@@ -2817,8 +3016,8 @@ impl CoordinatorRunner {
         false
     }
 
-    /// Chooses an admitted peer reply first, then the current preferred
-    /// consensus target, otherwise FIFO.  A queued ledger-data job in rippled
+    /// Chooses an admitted peer reply first, then the exact latched recovery
+    /// owner, otherwise FIFO. A queued ledger-data job in rippled
     /// owns the inbound ledger until that reply has been applied.  Treating a
     /// packet-bearing session like a speculative local scan lets continuously
     /// moving consensus targets jump it forever, leaving the useful packet in
@@ -2828,7 +3027,7 @@ impl CoordinatorRunner {
     /// continuation receives the next released JtLedgerData-equivalent slot.
     fn pop_scan_waiter(&mut self) -> Option<SessionRef> {
         let sessions = &self.state.sessions;
-        let latest_consensus_target = self.state.latest_consensus_target;
+        let recovery_anchor = self.state.recovery_anchor_session;
         let waiters = &mut self.state.local_scan_waiters;
         waiters.retain(|session| {
             sessions
@@ -2840,13 +3039,8 @@ impl CoordinatorRunner {
                 .get(session)
                 .is_some_and(|state| state.plan.packet_count() != 0)
         });
-        let preferred = latest_consensus_target.and_then(|target| {
-            waiters.iter().position(|session| {
-                sessions
-                    .get(session)
-                    .is_some_and(|state| state.target.hash() == target.hash())
-            })
-        });
+        let preferred = recovery_anchor
+            .and_then(|anchor| waiters.iter().position(|session| *session == anchor));
         waiters.remove(admitted_reply.or(preferred).unwrap_or(0))
     }
 
@@ -3199,14 +3393,7 @@ impl CoordinatorRunner {
     }
 
     fn request_intent_is_p0(&self, intent: &RequestIntent) -> bool {
-        self.state
-            .sessions
-            .get(&intent.session)
-            .is_some_and(|session| {
-                self.state.latest_validation_session == Some(intent.session)
-                    || (session.reason == AcquireReason::Consensus
-                        && self.state.latest_consensus_target == Some(session.target))
-            })
+        self.state.recovery_anchor_session == Some(intent.session)
     }
 
     /// Recovery may grant a new peer after the previous overlay snapshot was
@@ -3655,27 +3842,27 @@ impl CoordinatorRunner {
     /// that remains paused until a future connectivity fact assigns it a peer.
     ///
     /// The ordering is deterministic and avoids the `BTreeMap<SessionRef>`
-    /// target-hash order: the session matching the latest consensus fact wins,
-    /// followed by other consensus sessions, Generic, then History. Within a
-    /// priority class the newest owner-minted session id wins. Only paused
-    /// Active sessions participate: persisting work needs no peer grant and
-    /// cannot displace a recoverable preferred target.
+    /// target-hash order: the exact recovery anchor wins, followed by other
+    /// consensus sessions, Generic, then History. Each non-anchor class is
+    /// FIFO, so moving tip observations cannot create a second priority lane.
+    /// Only paused Active sessions participate: persisting work needs no peer
+    /// grant and cannot displace a recoverable preferred target.
     fn resume_live_sessions_after_peer_recovery(&mut self, effects: &mut Vec<AcquisitionEffect>) {
         let priority = self.recovery_priority_sessions();
-        let Some(phase_target) = priority
-            .first()
-            .and_then(|session| self.state.sessions.get(session).map(|state| state.target))
-        else {
-            return;
-        };
-        let fact = TransitionFact::TargetRequired {
-            target: phase_target,
-        };
-        if let Ok(next) = self.state.phase.apply(fact)
-            && next != self.state.phase
+        if let Some(phase_target) = self
+            .state
+            .recovery_anchor_session
+            .and_then(|anchor| self.state.sessions.get(&anchor).map(|state| state.target))
         {
-            self.state.phase = next;
-            effects.push(AcquisitionEffect::SetServicePhase(next));
+            let fact = TransitionFact::TargetRequired {
+                target: phase_target,
+            };
+            if let Ok(next) = self.state.phase.apply(fact)
+                && next != self.state.phase
+            {
+                self.state.phase = next;
+                effects.push(AcquisitionEffect::SetServicePhase(next));
+            }
         }
 
         // Overlay peers are reusable across every per-hash InboundLedger.
@@ -3712,9 +3899,10 @@ impl CoordinatorRunner {
                 .expect("recovery priority session must remain live");
             self.recovery_priority_rank(*left, left_state)
                 .cmp(&self.recovery_priority_rank(*right, right_state))
-                // Session ids are minted by the single owner and give a
-                // deterministic fallback when the latest fact is the same.
-                .then_with(|| right.session_id().cmp(&left.session_id()))
+                // Preserve FIFO within each non-anchor class. A moving
+                // validation or consensus observation must not become an
+                // implicit second priority channel.
+                .then_with(|| left.session_id().cmp(&right.session_id()))
                 .then_with(|| left.cmp(right))
         });
         sessions
@@ -3722,12 +3910,7 @@ impl CoordinatorRunner {
 
     fn recovery_priority_rank(&self, session_ref: SessionRef, session: &CoordinatorSession) -> u8 {
         match session.reason {
-            _ if self.state.latest_validation_session == Some(session_ref) => 0,
-            AcquireReason::Consensus
-                if self.state.latest_consensus_target == Some(session.target) =>
-            {
-                0
-            }
+            _ if self.state.recovery_anchor_session == Some(session_ref) => 0,
             AcquireReason::Consensus => 1,
             AcquireReason::Generic => 2,
             AcquireReason::History => 3,
@@ -4604,7 +4787,7 @@ mod tests {
     fn peerless_acquire_timeout_is_paused_without_consuming_plan_budget_or_dispatching_work() {
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         connect(&mut runner);
-        let initial = acquire_with_effects(&mut runner, 10);
+        let initial = preferred_with_effects(&mut runner, 10);
         let session = peer_request_session(&initial);
         let timer = timer_operation(&initial);
         let (timeouts, plan_turns, peer_requests) = (
@@ -4663,7 +4846,7 @@ mod tests {
             )])),
         );
         connect(&mut runner);
-        let initial = acquire_with_effects(&mut runner, 10);
+        let initial = preferred_with_effects(&mut runner, 10);
         let session = peer_request_session(&initial);
         let initial_timer = timer_operation(&initial);
         let timeout_budget = runner
@@ -4791,7 +4974,7 @@ mod tests {
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         connect(&mut runner);
         let sessions = (1..=16)
-            .map(|sequence| peer_request_session(&acquire_with_effects(&mut runner, sequence)))
+            .map(|sequence| peer_request_session(&preferred_with_effects(&mut runner, sequence)))
             .collect::<Vec<_>>();
         let _ = runner.handle_event(AcquisitionEvent::Connectivity(
             PeerAvailabilitySnapshot::new(vec![]),
@@ -4821,7 +5004,7 @@ mod tests {
             sessions.iter().copied().collect::<BTreeSet<_>>()
         );
         assert_eq!(runner.snapshot().session_count(), 16);
-        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(16) });
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(1) });
         for session in sessions {
             let state = runner.session(session).expect("retained session");
             assert_eq!(state.phase(), &SessionPhase::Active);
@@ -4839,7 +5022,7 @@ mod tests {
             reason: AcquireReason::Generic,
         });
         let generic_session = peer_request_session(&generic);
-        let consensus_session = peer_request_session(&acquire_with_effects(&mut runner, 2));
+        let consensus_session = peer_request_session(&preferred_with_effects(&mut runner, 2));
         let _ = runner.handle_event(AcquisitionEvent::Connectivity(
             PeerAvailabilitySnapshot::new(vec![]),
         ));
@@ -4860,15 +5043,15 @@ mod tests {
     }
 
     #[test]
-    fn peer_recovery_prefers_the_latest_consensus_target_over_btreemap_order() {
+    fn peer_recovery_keeps_the_latched_consensus_anchor_over_moving_targets() {
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         connect(&mut runner);
-        let earliest_session = peer_request_session(&acquire_with_effects(&mut runner, 1));
+        let earliest_session = peer_request_session(&preferred_with_effects(&mut runner, 1));
         let _ = runner.handle_event(AcquisitionEvent::AcquireRequested {
             target: target(100),
             reason: AcquireReason::Generic,
         });
-        let latest_session = peer_request_session(&acquire_with_effects(&mut runner, 2));
+        let latest_session = peer_request_session(&preferred_with_effects(&mut runner, 2));
         let _ = runner.handle_event(AcquisitionEvent::Connectivity(
             PeerAvailabilitySnapshot::new(vec![]),
         ));
@@ -4883,9 +5066,9 @@ mod tests {
                 _ => None,
             })
             .expect("one recovery grant");
-        assert_eq!(request.session(), latest_session);
-        assert_ne!(request.session(), earliest_session);
-        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(2) });
+        assert_eq!(request.session(), earliest_session);
+        assert_ne!(request.session(), latest_session);
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(1) });
     }
 
     #[test]
@@ -5075,7 +5258,7 @@ mod tests {
     }
 
     #[test]
-    fn peerless_demands_keep_only_latest_preferred_and_latest_ordinary_target() {
+    fn peerless_moving_preferred_keeps_exact_unbound_anchor_replayable() {
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         let old_ordinary = target(40);
         let latest_ordinary = target(41);
@@ -5104,15 +5287,23 @@ mod tests {
             MAX_DEFERRED_PEERLESS_ACQUIRES
         );
         assert!(!runner.state.deferred_acquires.contains_key(&old_ordinary));
-        assert!(!runner.state.deferred_acquires.contains_key(&old_preferred));
+        assert!(runner.state.deferred_acquires.contains_key(&old_preferred));
         assert_eq!(
             runner.state.deferred_acquires.get(&latest_ordinary),
             Some(&(AcquireReason::Generic, false, false))
         );
         assert_eq!(
-            runner.state.deferred_acquires.get(&latest_preferred),
+            runner.state.deferred_acquires.get(&old_preferred),
             Some(&(AcquireReason::Consensus, true, false))
         );
+        assert!(
+            !runner
+                .state
+                .deferred_acquires
+                .contains_key(&latest_preferred)
+        );
+        assert_eq!(runner.state.recovery_anchor_target, Some(old_preferred));
+        assert_eq!(runner.state.latest_consensus_target, Some(latest_preferred));
 
         let resumed = runner.handle_event(AcquisitionEvent::Connectivity(
             PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
@@ -5126,13 +5317,13 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             started,
-            BTreeSet::from([latest_ordinary.hash(), latest_preferred.hash()])
+            BTreeSet::from([latest_ordinary.hash(), old_preferred.hash()])
         );
         assert!(runner.state.deferred_acquires.is_empty());
         assert_eq!(
             runner.phase(),
             &SyncPhase::Syncing {
-                target: latest_preferred
+                target: old_preferred
             }
         );
     }
@@ -5404,12 +5595,195 @@ mod tests {
         );
         assert_eq!(
             runner.recovery_priority_rank(
-                newest_session,
-                runner.session(newest_session).expect("P0 session"),
+                active,
+                runner.session(active).expect("latched P0 session"),
             ),
             0,
-            "the newest policy target receives request priority"
+            "the exact recovery anchor receives request priority"
         );
+        assert_eq!(
+            runner.recovery_priority_rank(
+                newest_session,
+                runner
+                    .session(newest_session)
+                    .expect("moving policy session"),
+            ),
+            1,
+            "a moving policy target cannot preempt the latched owner"
+        );
+    }
+
+    #[test]
+    fn recovery_anchor_survives_mode_oscillation_until_exact_installation() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let anchor_target = target(10);
+        let next_target = target(11);
+        let validation_target = target(12);
+        let anchor = peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(anchor_target, AcquireReason::Consensus),
+        )));
+        let next = peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(next_target, AcquireReason::Consensus),
+        )));
+        let validation = peer_request_session(
+            &runner.handle_event(AcquisitionEvent::ValidationTarget(validation_target)),
+        );
+        let next_expiry = runner
+            .session(next)
+            .expect("moving consensus session")
+            .pending_expiry_timer();
+        let validation_expiry = runner
+            .session(validation)
+            .expect("validation session")
+            .pending_expiry_timer();
+
+        for phase in [
+            SyncPhase::Full {
+                lcl: identity(9),
+                published: identity(9),
+            },
+            SyncPhase::Tracking { lcl: identity(9) },
+            SyncPhase::Connected,
+        ] {
+            runner.state.phase = phase;
+            let effects = runner.handle_event(AcquisitionEvent::Heartbeat);
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| !matches!(effect, AcquisitionEffect::CancelSession(_)))
+            );
+            assert_eq!(
+                runner.phase(),
+                &SyncPhase::Syncing {
+                    target: anchor_target
+                }
+            );
+            assert_eq!(runner.state.recovery_anchor_session, Some(anchor));
+            assert!(runner.request_intent_is_p0(&RequestIntent {
+                session: anchor,
+                peer: PeerId::new(1),
+                request: LedgerDataRequest::GetLedger { sequence: Some(10) },
+            }));
+            assert!(!runner.request_intent_is_p0(&RequestIntent {
+                session: next,
+                peer: PeerId::new(1),
+                request: LedgerDataRequest::GetLedger { sequence: Some(11) },
+            }));
+            assert!(!runner.request_intent_is_p0(&RequestIntent {
+                session: validation,
+                peer: PeerId::new(1),
+                request: LedgerDataRequest::GetLedger { sequence: Some(12) },
+            }));
+        }
+        assert_eq!(
+            runner
+                .session(next)
+                .expect("moving consensus survives")
+                .pending_expiry_timer(),
+            next_expiry
+        );
+        assert_eq!(
+            runner
+                .session(validation)
+                .expect("validation survives")
+                .pending_expiry_timer(),
+            validation_expiry
+        );
+
+        let effects = runner.handle_event(AcquisitionEvent::LclInstalled(identity(10)));
+        assert!(effects.contains(&AcquisitionEffect::CancelSession(anchor)));
+        assert_eq!(runner.state.recovery_anchor_target, None);
+        assert_eq!(runner.state.recovery_anchor_session, None);
+        assert_eq!(runner.phase(), &SyncPhase::Tracking { lcl: identity(10) });
+        assert!(runner.session(validation).is_some());
+    }
+
+    #[test]
+    fn pending_divergence_anchor_binds_only_its_matching_session() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let anchor_target = target(9);
+        let _ = runner.handle_event(AcquisitionEvent::PreferredLclDivergence {
+            target: anchor_target,
+        });
+        assert_eq!(runner.state.recovery_anchor_target, Some(anchor_target));
+        assert_eq!(runner.state.recovery_anchor_session, None);
+
+        let validation = peer_request_session(
+            &runner.handle_event(AcquisitionEvent::ValidationTarget(target(99))),
+        );
+        let moving = peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(target(10), AcquireReason::Consensus),
+        )));
+        assert_eq!(runner.state.recovery_anchor_target, Some(anchor_target));
+        assert_eq!(runner.state.recovery_anchor_session, None);
+
+        let anchor =
+            peer_request_session(&runner.handle_event(AcquisitionEvent::AcquireRequested {
+                target: anchor_target,
+                reason: AcquireReason::Consensus,
+            }));
+        assert_eq!(runner.state.recovery_anchor_session, Some(anchor));
+        assert_eq!(
+            runner.phase(),
+            &SyncPhase::Syncing {
+                target: anchor_target
+            }
+        );
+        assert!(runner.session(validation).is_some());
+        assert!(runner.session(moving).is_some());
+    }
+
+    #[test]
+    fn nonmatching_lcl_and_publication_cannot_escape_live_anchor_syncing() {
+        let full = SyncPhase::Full {
+            lcl: identity(1),
+            published: identity(1),
+        };
+        let mut runner = CoordinatorRunner::with_phase(RunEpoch::new(1), full);
+        let anchor_target = target(10);
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
+        ));
+        let _ = runner.handle_event(AcquisitionEvent::PreferredLclDivergence {
+            target: anchor_target,
+        });
+        let anchor = peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(anchor_target, AcquireReason::Consensus),
+        )));
+        assert_eq!(
+            runner.phase(),
+            &SyncPhase::Syncing {
+                target: anchor_target
+            }
+        );
+
+        let lcl_effects = runner.handle_event(AcquisitionEvent::LclInstalled(identity(2)));
+        assert!(lcl_effects
+            .iter()
+            .all(|effect| !matches!(effect, AcquisitionEffect::CancelSession(session) if *session == anchor)));
+        assert_eq!(
+            runner.phase(),
+            &SyncPhase::Syncing {
+                target: anchor_target
+            }
+        );
+        let publication_effects = runner.handle_event(AcquisitionEvent::PublicationCommitted {
+            identity: identity(2),
+            fresh: true,
+        });
+        assert!(publication_effects.iter().all(|effect| !matches!(
+            effect,
+            AcquisitionEffect::SetServicePhase(SyncPhase::Full { .. })
+        )));
+        assert_eq!(
+            runner.phase(),
+            &SyncPhase::Syncing {
+                target: anchor_target
+            }
+        );
+        assert_eq!(runner.state.recovery_anchor_session, Some(anchor));
     }
 
     #[test]
@@ -5649,15 +6023,21 @@ mod tests {
     }
 
     #[test]
-    fn preferred_lcl_divergence_while_syncing_preserves_recovery_anchor() {
+    fn preferred_lcl_divergence_without_latch_uses_explicit_target() {
         let mut runner = CoordinatorRunner::with_phase(
             RunEpoch::new(1),
             SyncPhase::Syncing { target: target(1) },
         );
         let effects =
             runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: target(9) });
-        assert!(effects.is_empty());
-        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(1) });
+        assert_eq!(
+            effects,
+            vec![AcquisitionEffect::SetServicePhase(SyncPhase::Syncing {
+                target: target(9),
+            })]
+        );
+        assert_eq!(runner.state.recovery_anchor_target, Some(target(9)));
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(9) });
         assert_eq!(runner.snapshot().rejected_events(), 0);
     }
 
@@ -5692,6 +6072,9 @@ mod tests {
                 lcl: installed
             }))
         );
+        assert_eq!(runner.state.recovery_anchor_target, None);
+        assert_eq!(runner.state.recovery_anchor_session, None);
+        assert_eq!(runner.phase(), &SyncPhase::Tracking { lcl: installed });
         let effects = runner.handle_event(AcquisitionEvent::PublicationCommitted {
             identity: installed,
             fresh: true,
@@ -5773,7 +6156,47 @@ mod tests {
     }
 
     #[test]
-    fn idle_expiry_of_anchor_promotes_latest_viable_consensus_target() {
+    fn next_consensus_target_relatches_unresolved_syncing_after_anchor_invalidation() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let installed = identity(9);
+        runner.handle_event(AcquisitionEvent::LclInstalled(installed));
+
+        let old_anchor = target(10);
+        runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: old_anchor });
+        let old_session =
+            peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+                ConsensusTarget::new(old_anchor, AcquireReason::Consensus),
+            )));
+        runner.handle_event(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
+        assert!(matches!(
+            runner
+                .session(old_session)
+                .expect("invalidated anchor retained")
+                .phase(),
+            SessionPhase::Cancelled {
+                reason: CancelReason::StoreRotated
+            }
+        ));
+        assert_eq!(runner.state.recovery_anchor_target, None);
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: old_anchor });
+
+        let next = target(20);
+        let next_session = peer_request_session(&runner.handle_event(
+            AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(next, AcquireReason::Consensus)),
+        ));
+        assert_eq!(runner.state.recovery_anchor_target, Some(next));
+        assert_eq!(runner.state.recovery_anchor_session, Some(next_session));
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: next });
+        assert!(runner.request_intent_is_p0(&RequestIntent {
+            session: next_session,
+            peer: PeerId::new(1),
+            request: LedgerDataRequest::GetLedger { sequence: Some(20) },
+        }));
+    }
+
+    #[test]
+    fn idle_expiry_rearms_live_anchor_and_leaves_failure_to_acquire_timeout() {
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         connect(&mut runner);
         let anchor = target(10);
@@ -5789,24 +6212,28 @@ mod tests {
             AcquireReason::Consensus,
         )));
 
-        assert!(
-            runner
-                .handle_event(AcquisitionEvent::TimerFired {
-                    operation: expiry,
-                    timer: TimerKind::SessionExpiry,
-                })
-                .is_empty()
-        );
+        let rearmed = runner.handle_event(AcquisitionEvent::TimerFired {
+            operation: expiry,
+            timer: TimerKind::SessionExpiry,
+        });
+        let next_expiry = rearmed
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::ArmTimer(request)
+                    if request.timer() == TimerKind::SessionExpiry =>
+                {
+                    Some(request.operation())
+                }
+                _ => None,
+            })
+            .expect("live recovery anchor rearms its registry lifetime");
+        assert_ne!(next_expiry, expiry);
         let effects = runner.handle_event(AcquisitionEvent::RegistrySweep);
 
-        assert!(runner.session(anchor_session).is_none());
-        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: latest });
-        assert!(effects.contains(&AcquisitionEffect::CancelSession(anchor_session)));
-        assert!(
-            effects.contains(&AcquisitionEffect::SetServicePhase(SyncPhase::Syncing {
-                target: latest
-            }))
-        );
+        assert!(effects.is_empty());
+        assert!(runner.session(anchor_session).is_some());
+        assert_eq!(runner.state.recovery_anchor_session, Some(anchor_session));
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: anchor });
     }
 
     #[test]
@@ -5846,29 +6273,65 @@ mod tests {
     }
 
     #[test]
-    fn inadmissible_anchor_promotes_latest_retained_consensus_target() {
+    fn pending_divergence_anchor_is_not_replaced_by_inadmissible_latest_target() {
         let budget = BudgetState::new(1, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
         let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
         connect(&mut runner);
         // Validation acquisition is phase-neutral but consumes the only slot.
-        runner.handle_event(AcquisitionEvent::ValidationTarget(target(5)));
+        let validation = peer_request_session(
+            &runner.handle_event(AcquisitionEvent::ValidationTarget(target(5))),
+        );
         let anchor = target(10);
         let latest = target(20);
         runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: anchor });
         assert_eq!(runner.phase(), &SyncPhase::Syncing { target: anchor });
+        let deferred_anchor = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: anchor,
+            reason: AcquireReason::Consensus,
+        });
+        assert!(
+            deferred_anchor
+                .iter()
+                .all(|effect| !matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+        assert_eq!(runner.state.deferred_consensus_acquire, Some(anchor));
 
         let effects = runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
             latest,
             AcquireReason::Consensus,
         )));
 
-        assert_eq!(runner.state.deferred_consensus_acquire, Some(latest));
-        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: latest });
-        assert!(
-            effects.contains(&AcquisitionEffect::SetServicePhase(SyncPhase::Syncing {
-                target: latest
-            }))
-        );
+        assert_eq!(runner.state.deferred_consensus_acquire, Some(anchor));
+        assert_eq!(runner.state.recovery_anchor_target, Some(anchor));
+        assert_eq!(runner.state.recovery_anchor_session, None);
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: anchor });
+        assert!(effects.iter().all(|effect| !matches!(
+            effect,
+            AcquisitionEffect::SetServicePhase(SyncPhase::Syncing { target }) if *target == latest
+        )));
+
+        let mut cancellation = Vec::new();
+        runner.cancel_session(validation, CancelReason::Explicit, &mut cancellation);
+        let resumed = runner.handle_event(AcquisitionEvent::Heartbeat);
+        let anchor_session = resumed
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session)
+                    if session.target_hash() == anchor.hash() =>
+                {
+                    Some(*session)
+                }
+                _ => None,
+            })
+            .expect("capacity release admits the exact pending anchor");
+        assert_eq!(runner.state.recovery_anchor_session, Some(anchor_session));
+        assert!(runner.request_intent_is_p0(&RequestIntent {
+            session: anchor_session,
+            peer: PeerId::new(1),
+            request: LedgerDataRequest::GetLedger {
+                sequence: anchor.sequence(),
+            },
+        }));
     }
 
     #[test]
@@ -6432,7 +6895,7 @@ mod tests {
             &SessionPhase::Active
         );
         assert_eq!(runner.state.latest_consensus_target, Some(target(3)));
-        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(1) });
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(3) });
     }
 
     #[test]
@@ -6485,8 +6948,27 @@ mod tests {
         effects
     }
 
+    fn preferred_with_effects(runner: &mut CoordinatorRunner, seq: u32) -> Vec<AcquisitionEffect> {
+        let mut effects = runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(target(seq), AcquireReason::Consensus),
+        ));
+        if let Some(operation) = effects.iter().find_map(|effect| match effect {
+            AcquisitionEffect::SubmitRead(request)
+                if request.operation().kind() == OperationKind::HeaderRead =>
+            {
+                Some(request.operation())
+            }
+            _ => None,
+        }) {
+            effects.extend(runner.handle_event(AcquisitionEvent::ReadCompleted(
+                ReadCompletion::new(operation, ReadOutcome::Settled { node: None }),
+            )));
+        }
+        effects
+    }
+
     #[test]
-    fn outbound_admission_bounds_global_credits_and_prioritizes_latest_consensus() {
+    fn outbound_admission_bounds_global_credits_and_prioritizes_latched_anchor() {
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         let peers = (1..=5).map(PeerId::new).collect::<Vec<_>>();
         let _ = runner.handle_event(AcquisitionEvent::Connectivity(
@@ -6495,8 +6977,9 @@ mod tests {
 
         // Fifty-two Generic sessions fill the global 256-credit pool (fifty-one
         // full five-peer Base fanouts plus one request from the last), leaving
-        // its remaining Base intents queued. Generic work must not claim the
-        // next released credits ahead of the latest consensus target.
+        // its remaining Base intents queued. Generic cache work cannot mint a
+        // recovery anchor; the authoritative consensus target claims the next
+        // released credits.
         let mut first_timer = None;
         for sequence in 1..=52 {
             let mut effects = runner.handle_event(AcquisitionEvent::AcquireRequested {
@@ -6556,7 +7039,7 @@ mod tests {
         );
 
         // Expiring one Generic deadline is the conservative release point.
-        // The P0 latest-consensus intents consume all five released slots.
+        // The exact consensus recovery anchor consumes all five released slots.
         let released = runner.handle_event(AcquisitionEvent::TimerFired {
             operation: first_timer.expect("first Generic timer"),
             timer: TimerKind::AcquireTimeout,
@@ -6648,7 +7131,7 @@ mod tests {
                 .reason(),
             AcquireReason::Generic
         );
-        assert!(runner.request_intent_is_p0(&RequestIntent {
+        assert!(!runner.request_intent_is_p0(&RequestIntent {
             session: generic_session,
             peer: PeerId::new(1),
             request: LedgerDataRequest::GetLedger { sequence: Some(99) },
@@ -6704,7 +7187,7 @@ mod tests {
     }
 
     #[test]
-    fn newest_validation_target_beats_fifo_when_outbound_credits_are_saturated() {
+    fn newest_validation_target_does_not_beat_fifo_when_outbound_credits_are_saturated() {
         let full = SyncPhase::Full {
             lcl: identity(40),
             published: identity(40),
@@ -6873,17 +7356,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(requests.len() >= 5);
-        assert!(
-            requests
-                .iter()
-                .take(5)
-                .all(|request| request.session() == validation_session)
+        assert_eq!(
+            requests.first().map(|request| request.session()),
+            Some(first_session)
         );
         assert!(
             requests
                 .iter()
-                .skip(5)
-                .any(|request| request.session() == first_session)
+                .any(|request| request.session() == validation_session)
         );
         assert_eq!(runner.phase(), &full);
     }
@@ -7332,7 +7812,7 @@ mod tests {
     }
 
     #[test]
-    fn consensus_capacity_defers_behind_active_consensus_and_preempts_lower_priority_work() {
+    fn consensus_capacity_preserves_anchor_and_preempts_only_lower_priority_work() {
         let budget = BudgetState::new(1, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
         let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
         connect(&mut runner);
@@ -7342,8 +7822,8 @@ mod tests {
         )));
         let first_session = peer_request_session(&first);
 
-        // A newer preferred target is retained without cancelling an active
-        // per-hash acquisition. It starts when the bounded slot is free.
+        // A moving preferred observation remains policy metadata without
+        // cancelling or displacing the exact active recovery owner.
         let deferred = runner.handle_event(AcquisitionEvent::ConsensusTarget(
             ConsensusTarget::new(target(2), AcquireReason::Consensus),
         ));
@@ -7355,7 +7835,8 @@ mod tests {
             runner.session(first_session).expect("first").phase(),
             &SessionPhase::Active
         );
-        assert!(runner.has_deferred_consensus_target(target(2)));
+        assert!(!runner.has_deferred_consensus_target(target(2)));
+        assert_eq!(runner.state.latest_consensus_target, Some(target(2)));
         assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(1) });
 
         // Generic pressure still cannot consume the only retained slot.
@@ -7619,7 +8100,7 @@ mod tests {
     }
 
     #[test]
-    fn max_sessions_defers_preferred_consensus_without_cancelling_active_work() {
+    fn max_sessions_keeps_moving_consensus_as_metadata_without_cancelling_anchor() {
         let budget = BudgetState::new(1, AdmissionBudget::default(), Duration::from_secs(1));
         let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
         connect(&mut runner);
@@ -7639,7 +8120,8 @@ mod tests {
             runner.session(first).expect("first").phase(),
             &SessionPhase::Active
         );
-        assert!(runner.has_deferred_consensus_target(target(2)));
+        assert!(!runner.has_deferred_consensus_target(target(2)));
+        assert_eq!(runner.state.latest_consensus_target, Some(target(2)));
         assert_eq!(runner.snapshot().session_count(), 1);
         assert_eq!(runner.snapshot().rejected_events(), 0);
     }
@@ -8447,16 +8929,15 @@ mod tests {
         assert!(runner.state.swept_local_scan_owners.contains(&swept));
         assert!(!runner.live_sessions().any(|session| session == swept));
 
-        // At a completed read-batch boundary, the current preferred target
-        // goes first; the older FIFO waiter gets the next permit and both
-        // immediately produce their own exact read.
+        // At completed read-batch boundaries, a moving policy observation
+        // cannot displace the latched owner. Non-anchor waiters remain FIFO.
         let first_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
             ReadCompletion::new(owner_reads[0].1, ReadOutcome::Settled { node: None }),
         ));
         assert!(
             read_effects(&first_release)
                 .iter()
-                .any(|read| read.operation().session() == sessions[4])
+                .any(|read| read.operation().session() == sessions[3])
         );
         let second_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
             ReadCompletion::new(owner_reads[1].1, ReadOutcome::Settled { node: None }),
@@ -8464,7 +8945,7 @@ mod tests {
         assert!(
             read_effects(&second_release)
                 .iter()
-                .any(|read| read.operation().session() == sessions[3])
+                .any(|read| read.operation().session() == sessions[4])
         );
         let third_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
             ReadCompletion::new(owner_reads[2].1, ReadOutcome::Settled { node: None }),
@@ -9527,6 +10008,68 @@ mod tests {
             "an acknowledged terminal session must not pin a Syncing anchor"
         );
         assert_eq!(runner.snapshot().sessions_completed(), 1);
+    }
+
+    #[test]
+    fn handoff_ack_keeps_recovery_target_until_exact_lcl_install() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let ledger = immutable_ledger(10);
+        let anchor_target = LedgerTarget::new(*ledger.header().hash.as_uint256(), Some(10));
+        let seed = ScriptedSeed::new(vec![ScriptedStep::Complete])
+            .with_durable_ledger(Arc::clone(&ledger));
+        let mut runner =
+            CoordinatorRunner::with_plan_seed(RunEpoch::new(1), budget, Box::new(seed));
+        connect(&mut runner);
+        let started = runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+            anchor_target,
+            AcquireReason::Consensus,
+        )));
+        let session = peer_request_session(&started);
+        let effects = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+            session,
+            AdmissionBudget::new(1, 256),
+            8,
+        )));
+        let batch = write_batch(&effects);
+        let _ = runner.handle_event(AcquisitionEvent::WriteCompleted(WriteCompletion::new(
+            batch.operation(),
+            WriteOutcome::Accepted,
+        )));
+        let fenced = runner.handle_event(AcquisitionEvent::DurabilityFenced(
+            DurabilityCompletion::new(
+                batch.fence().expect("final fence"),
+                crate::io::DurabilityOutcome::Passed,
+            ),
+        ));
+        let handoff = durable_handoff(&fenced).handoff();
+
+        let moving = target(20);
+        let _ = runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+            moving,
+            AcquireReason::Consensus,
+        )));
+        let _ = runner.handle_event(AcquisitionEvent::DurableHandoffAcknowledged(
+            DurableHandoffAcknowledgement::new(handoff, session),
+        ));
+
+        assert_eq!(
+            runner.session(session).expect("terminal owner").phase(),
+            &SessionPhase::Complete
+        );
+        assert_eq!(runner.state.recovery_anchor_target, Some(anchor_target));
+        assert_eq!(runner.state.recovery_anchor_session, None);
+        assert_eq!(
+            runner.phase(),
+            &SyncPhase::Syncing {
+                target: anchor_target
+            }
+        );
+        assert_eq!(runner.state.latest_consensus_target, Some(moving));
+
+        let installed = LedgerIdentity::new(anchor_target.hash(), 10);
+        let _ = runner.handle_event(AcquisitionEvent::LclInstalled(installed));
+        assert_eq!(runner.state.recovery_anchor_target, None);
+        assert_eq!(runner.phase(), &SyncPhase::Tracking { lcl: installed });
     }
 
     #[test]

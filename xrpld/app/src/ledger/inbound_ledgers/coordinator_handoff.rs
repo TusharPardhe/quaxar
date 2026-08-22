@@ -489,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_deferred_consensus_origin_survives_cross_target_rejection_and_replay() {
+    fn capacity_rejected_moving_consensus_origin_does_not_displace_recovery_anchor() {
         let (tx, rx) = mpsc::sync_channel(1);
         let (events, _) = mpsc::sync_channel(256);
         let mut port = CoordinatorHandoffPort::new(tx, events);
@@ -506,8 +506,9 @@ mod tests {
             acquisition::ConsensusTarget::new(consensus_a, CoordinatorAcquireReason::Consensus),
         ));
 
-        // B is retained by the coordinator because A occupies its only slot.
-        // Preserve B's exact app origin before submitting that deferred demand.
+        // A is the exact recovery anchor. A newer moving consensus observation
+        // must not reserve the only slot behind it; the registry clears B's
+        // unbound app origin when the coordinator reports no retained demand.
         port.register_pending_session_origin(
             consensus_b.hash(),
             AcquireReason::Consensus,
@@ -522,10 +523,12 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, AcquisitionEffect::SessionStarted(_)))
         );
-        assert!(runner.has_deferred_consensus_target(consensus_b));
+        assert!(!runner.has_deferred_consensus_target(consensus_b));
+        port.clear_pending_session_origin(consensus_b.hash(), AcquireReason::Consensus, 41, true);
+        assert!(port.pending_session_origins.is_empty());
 
-        // A lower-priority request for a *different* target is rejected while
-        // B reserves the next free slot. Its exact clear must not remove B.
+        // A lower-priority request for a different target is independently
+        // rejected and cleared; neither observation can displace A.
         port.register_pending_session_origin(generic_a.hash(), AcquireReason::Generic, 42, false);
         let rejected = runner.handle_event(AcquisitionEvent::AcquireRequested {
             target: generic_a,
@@ -537,32 +540,18 @@ mod tests {
                 .any(|effect| matches!(effect, AcquisitionEffect::SessionStarted(_)))
         );
         port.clear_pending_session_origin(generic_a.hash(), AcquireReason::Generic, 42, false);
-        assert_eq!(port.pending_session_origins.len(), 1);
+        assert!(port.pending_session_origins.is_empty());
 
-        // Store rotation terminalizes the occupied session and replays the
-        // coordinator-owned B demand. Its original consensus origin binds the
-        // exact replayed session and recognizes its durable handoff.
+        // Store rotation invalidates A's exact NodeStore generation. B was
+        // policy metadata only, so it cannot replay without a fresh
+        // authoritative recovery demand or inherit A's ownership.
         let replay = runner.handle_event(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
-        let replayed = replay
-            .iter()
-            .find_map(|effect| match effect {
-                AcquisitionEffect::SessionStarted(session) => Some(*session),
-                _ => None,
-            })
-            .expect("free capacity must replay the retained consensus target");
-        assert_eq!(replayed.target_hash(), consensus_b.hash());
-        port.session_started(replayed);
-
-        let mut counter = IdCounter::new();
-        port.publish_durable(durable_handoff(
-            &mut counter,
-            replayed,
-            immutable_ledger(2, 2),
-        ));
-        let delivered = drain(&rx);
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].reason, AcquireReason::Consensus);
-        assert_eq!(delivered[0].acquisition_id, 41);
+        assert!(
+            !replay
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+        assert!(rx.try_recv().is_err());
         assert_eq!(port.stats().unknown_session, 0);
     }
 
