@@ -194,6 +194,7 @@ fn validate_sttx_common_transactor_preflight(tx: &STTx) -> NotTec {
 fn validate_sttx_typed_semantic_preflight(tx: &STTx, rules: &Rules, txn_type: TxType) -> NotTec {
     match txn_type {
         TxType::PAYMENT => validate_payment_preflight_with_rules(tx, rules),
+        TxType::OFFER_CREATE => validate_offer_create_preflight(tx, rules),
         TxType::DEPOSIT_PREAUTH => validate_deposit_preauth_preflight(tx, rules),
         TxType::ACCOUNT_DELETE => validate_account_delete_preflight(tx, rules),
         TxType::TICKET_CREATE => crate::run_ticket_create_preflight(
@@ -222,6 +223,88 @@ fn validate_sttx_typed_semantic_preflight(tx: &STTx, rules: &Rules, txn_type: Tx
         _ if txn_type.is_dispatchable() => validate_sttx_noop_preflight(txn_type),
         _ => Ter::TEM_UNKNOWN,
     }
+}
+
+fn validate_offer_create_preflight(tx: &STTx, rules: &Rules) -> NotTec {
+    let taker_pays_field = get_field_by_symbol("sfTakerPays");
+    let taker_gets_field = get_field_by_symbol("sfTakerGets");
+    if !tx.is_field_present(taker_pays_field) || !tx.is_field_present(taker_gets_field) {
+        return Ter::TEM_MALFORMED;
+    }
+
+    let permissioned_dex = rules.enabled(&protocol::feature_id("PermissionedDEX"));
+    let domain_field = get_field_by_symbol("sfDomainID");
+    let domain_present = tx.is_field_present(domain_field);
+    if domain_present && !permissioned_dex {
+        return Ter::TEM_DISABLED;
+    }
+
+    let taker_pays = tx.get_field_amount(taker_pays_field);
+    let taker_gets = tx.get_field_amount(taker_gets_field);
+    if (!rules.enabled(&protocol::feature_id("MPTokensV2")))
+        && (taker_pays.holds_mpt_issue() || taker_gets.holds_mpt_issue())
+    {
+        return Ter::TEM_DISABLED;
+    }
+
+    let flags = tx.get_flags();
+    let mut allowed_flags = UNIVERSAL_TRANSACTION_FLAGS
+        | protocol::tfPassive
+        | protocol::tfImmediateOrCancel
+        | protocol::tfFillOrKill
+        | protocol::tfSell;
+    if permissioned_dex {
+        allowed_flags |= protocol::tfHybrid;
+    }
+    if flags & !allowed_flags != 0 {
+        return Ter::TEM_INVALID_FLAG;
+    }
+    if flags & protocol::tfHybrid != 0 && !domain_present {
+        return Ter::TEM_INVALID_FLAG;
+    }
+    if rules.enabled(&protocol::feature_id("fixCleanup3_2_0"))
+        && domain_present
+        && tx.get_field_h256(domain_field).is_zero()
+    {
+        return Ter::TEM_MALFORMED;
+    }
+    if flags & protocol::tfImmediateOrCancel != 0 && flags & protocol::tfFillOrKill != 0 {
+        return Ter::TEM_INVALID_FLAG;
+    }
+
+    let expiration_field = get_field_by_symbol("sfExpiration");
+    if tx.is_field_present(expiration_field) && tx.get_field_u32(expiration_field) == 0 {
+        return Ter::TEM_BAD_EXPIRATION;
+    }
+    let offer_sequence_field = get_field_by_symbol("sfOfferSequence");
+    if tx.is_field_present(offer_sequence_field) && tx.get_field_u32(offer_sequence_field) == 0 {
+        return Ter::TEM_BAD_SEQUENCE;
+    }
+
+    if !taker_pays.is_legal_net() || !taker_gets.is_legal_net() {
+        return Ter::TEM_BAD_AMOUNT;
+    }
+    if taker_pays.native() && taker_gets.native() {
+        return Ter::TEM_BAD_OFFER;
+    }
+    if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
+        return Ter::TEM_BAD_OFFER;
+    }
+    if taker_pays.asset() == taker_gets.asset() {
+        return Ter::TEM_REDUNDANT;
+    }
+    if is_bad_asset(taker_pays.asset()) || is_bad_asset(taker_gets.asset()) {
+        return Ter::TEM_BAD_CURRENCY;
+    }
+
+    for amount in [&taker_pays, &taker_gets] {
+        if let protocol::Asset::Issue(issue) = amount.asset()
+            && amount.native() != issue.account.is_zero()
+        {
+            return Ter::TEM_BAD_ISSUER;
+        }
+    }
+    Ter::TES_SUCCESS
 }
 
 fn validate_sttx_noop_preflight(_txn_type: TxType) -> NotTec {
@@ -630,6 +713,25 @@ mod tests {
         })
     }
 
+    fn offer_create(flags: u32) -> STTx {
+        let account = AccountID::from_array([0xD1; 20]);
+        let issuer = AccountID::from_array([0xD2; 20]);
+        STTx::new(TxType::OFFER_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_field_amount(
+                sf("sfTakerPays"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(100)),
+            );
+            tx.set_field_amount(sf("sfTakerGets"), iou(sf("sfTakerGets"), issuer, 0x44));
+            tx.set_field_u32(sf("sfFlags"), flags);
+            tx.set_field_amount(
+                sf("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+            );
+            tx.set_field_u32(sf("sfSequence"), 1);
+        })
+    }
+
     fn current_nft_rules() -> Rules {
         Rules::new([
             protocol::feature_id("fixRemoveNFTokenAutoTrustLine"),
@@ -672,6 +774,32 @@ mod tests {
         assert_eq!(
             validate_sttx_transaction_preflight_with_rules(&nftoken_mint(8, Some(60_000)), &rules),
             Ter::TEM_BAD_NFTOKEN_TRANSFER_FEE,
+        );
+    }
+
+    #[test]
+    fn offer_create_preflight_is_not_a_success_noop() {
+        let rules = Rules::new(std::iter::empty());
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &offer_create(protocol::tfImmediateOrCancel | protocol::tfFillOrKill),
+                &rules,
+            ),
+            Ter::TEM_INVALID_FLAG,
+        );
+
+        let mut zero_expiration = offer_create(0);
+        zero_expiration.set_field_u32(sf("sfExpiration"), 0);
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(&zero_expiration, &rules),
+            Ter::TEM_BAD_EXPIRATION,
+        );
+
+        let mut zero_cancel_sequence = offer_create(0);
+        zero_cancel_sequence.set_field_u32(sf("sfOfferSequence"), 0);
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(&zero_cancel_sequence, &rules),
+            Ter::TEM_BAD_SEQUENCE,
         );
     }
 
