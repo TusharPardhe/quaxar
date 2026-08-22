@@ -2169,8 +2169,9 @@ impl CoordinatorRunner {
             self.stats.stale_events += 1;
             return Vec::new();
         }
+        let operation_kind = completion.operation().kind();
         let session = completion.operation().session();
-        let (outcome, pending_reads_after, read_backlog_after) = {
+        let (outcome, pending_reads_after, pending_traversal_after, read_backlog_after) = {
             let Some(session_state) = self.state.sessions.get_mut(&session) else {
                 self.stats.stale_events += 1;
                 return Vec::new();
@@ -2183,6 +2184,7 @@ impl CoordinatorRunner {
             (
                 outcome,
                 session_state.plan.pending_read_count(),
+                session_state.plan.pending_traversal_read_count(),
                 session_state.plan.read_backlog_count(),
             )
         };
@@ -2197,13 +2199,19 @@ impl CoordinatorRunner {
             outcome = ?completion.outcome(),
             plan_outcome = ?outcome,
             pending_reads_after,
+            pending_traversal_after,
             read_backlog_after,
             "acquisition trace: brokered NodeStore read completion returned to session"
         );
         match outcome {
             PlanReadOutcome::Applied => {
                 let mut effects = Vec::new();
-                self.run_plan_turn(session, None, &mut effects);
+                if operation_kind != OperationKind::Read
+                    || pending_traversal_after != 0
+                    || !self.rotate_local_scan_permit(session, &mut effects)
+                {
+                    self.run_plan_turn(session, None, &mut effects);
+                }
                 effects
             }
             PlanReadOutcome::Stale => {
@@ -2274,7 +2282,16 @@ impl CoordinatorRunner {
             }
         }
         for session in resume {
-            self.run_plan_turn(session, None, &mut effects);
+            let pending_traversal_reads = self
+                .state
+                .sessions
+                .get(&session)
+                .map(|state| state.plan.pending_traversal_read_count())
+                .unwrap_or_default();
+            if pending_traversal_reads != 0 || !self.rotate_local_scan_permit(session, &mut effects)
+            {
+                self.run_plan_turn(session, None, &mut effects);
+            }
         }
         effects
     }
@@ -2739,10 +2756,11 @@ impl CoordinatorRunner {
         self.state.local_scan_waiters.contains(&session)
     }
 
-    /// Admit a whole local traversal, not individual reads. This preserves the
-    /// reference ownership boundary: at most three JtLedgerData-equivalent
-    /// continuations, each free to execute repeated 512-read batches before
-    /// yielding a network frontier.
+    /// Admit bounded local traversal work, not individual reads. At most three
+    /// JtLedgerData-equivalent continuations may own an in-flight read batch.
+    /// An owner normally keeps its logical traversal, but a completed batch
+    /// may rotate the runnable permit so a peer reply or newer preferred LCL
+    /// cannot wait behind an unbounded sequence of 512-read batches.
     fn ensure_local_scan_permit(&mut self, session: SessionRef) -> bool {
         let Some(state) = self.state.sessions.get(&session) else {
             return false;
@@ -2803,9 +2821,9 @@ impl CoordinatorRunner {
         });
         let preferred = latest_consensus_target.and_then(|target| {
             waiters.iter().position(|session| {
-                sessions.get(session).is_some_and(|state| {
-                    state.reason == AcquireReason::Consensus && state.target == target
-                })
+                sessions
+                    .get(session)
+                    .is_some_and(|state| state.target.hash() == target.hash())
             })
         });
         waiters.remove(admitted_reply.or(preferred).unwrap_or(0))
@@ -2826,6 +2844,56 @@ impl CoordinatorRunner {
             self.state.local_scan_owners.insert(next);
             self.run_plan_turn(next, None, effects);
         }
+    }
+
+    /// Rotate an old traversal owner at a completed read-batch boundary when
+    /// another active traversal is waiting. The session keeps all of its
+    /// per-hash plan state and is requeued; only the bounded runnable permit
+    /// moves. This bounded asynchronous fairness seam preserves rippled's
+    /// three-job cap while ensuring an admitted reply or the newest preferred
+    /// LCL can run before an old owner submits an unbounded chain of deferred
+    /// 512-read batches.
+    fn rotate_local_scan_permit(
+        &mut self,
+        session: SessionRef,
+        effects: &mut Vec<AcquisitionEffect>,
+    ) -> bool {
+        if !self.state.local_scan_owners.contains(&session) {
+            return false;
+        }
+
+        let has_other_waiter = self.state.local_scan_waiters.iter().any(|candidate| {
+            *candidate != session
+                && self
+                    .state
+                    .sessions
+                    .get(candidate)
+                    .is_some_and(|state| state.phase == SessionPhase::Active)
+        });
+        if !has_other_waiter {
+            return false;
+        }
+
+        self.state.local_scan_owners.remove(&session);
+        self.state
+            .local_scan_waiters
+            .retain(|candidate| *candidate != session);
+        if self
+            .state
+            .sessions
+            .get(&session)
+            .is_some_and(|state| state.phase == SessionPhase::Active)
+        {
+            self.state.local_scan_waiters.push_back(session);
+        }
+
+        let Some(next) = self.pop_scan_waiter() else {
+            self.state.local_scan_owners.insert(session);
+            return false;
+        };
+        self.state.local_scan_owners.insert(next);
+        self.run_plan_turn(next, None, effects);
+        true
     }
 
     /// Yield only the three-slot runnable job permit while retaining the
@@ -8357,7 +8425,7 @@ mod tests {
     }
 
     #[test]
-    fn moving_tips_admit_three_whole_scans_and_waiters_hold_no_read_operations() {
+    fn moving_tips_admit_three_bounded_scans_and_waiters_hold_no_read_operations() {
         let budget = BudgetState::new(
             8,
             AdmissionBudget::new(600, 1 << 20),
@@ -8431,9 +8499,9 @@ mod tests {
         assert!(runner.state.swept_local_scan_owners.contains(&swept));
         assert!(!runner.live_sessions().any(|session| session == swept));
 
-        // Existing owners are never preempted. On release, the current
-        // preferred target goes first; the older FIFO waiter gets the next
-        // permit and both immediately produce their own exact read.
+        // At a completed read-batch boundary, the current preferred target
+        // goes first; the older FIFO waiter gets the next permit and both
+        // immediately produce their own exact read.
         let first_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
             ReadCompletion::new(owner_reads[0].1, ReadOutcome::Settled { node: None }),
         ));
@@ -8466,6 +8534,120 @@ mod tests {
         )));
         assert!(boundary.contains(&AcquisitionEffect::CancelSession(swept)));
         assert!(runner.session(swept).is_none());
+    }
+
+    #[test]
+    fn completed_read_batch_rotates_old_owner_to_newest_preferred_waiter() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let mut sessions = Vec::new();
+        let mut owner_reads = Vec::new();
+        let mut first_batch_reads = Vec::new();
+
+        for seq in 30..34 {
+            let started = acquire_with_effects(&mut runner, seq);
+            let session = peer_request_session(&started);
+            sessions.push(session);
+            let state = runner.state.sessions.get_mut(&session).expect("session");
+            state.pending_header_read = None;
+            let first_needs = if seq == 30 {
+                vec![
+                    PlanReadNeed::new(
+                        SHAMapHash::new(Uint256::from(10_030)),
+                        seq,
+                        SHAMapNodeId::default(),
+                        0,
+                    ),
+                    PlanReadNeed::new(
+                        SHAMapHash::new(Uint256::from(10_031)),
+                        seq,
+                        SHAMapNodeId::default(),
+                        0,
+                    ),
+                ]
+            } else {
+                vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(u64::from(seq) + 10_000)),
+                    seq,
+                    SHAMapNodeId::default(),
+                    0,
+                )]
+            };
+            let steps = if seq < 33 {
+                VecDeque::from([
+                    ScriptedStep::NeedsReads(first_needs),
+                    ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                        SHAMapHash::new(Uint256::from(u64::from(seq) + 20_000)),
+                        seq,
+                        SHAMapNodeId::default(),
+                        0,
+                    )]),
+                ])
+            } else {
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(40_000)),
+                    seq,
+                    SHAMapNodeId::default(),
+                    0,
+                )])])
+            };
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(u64::from(seq)),
+                steps,
+                Vec::new(),
+            ))));
+            let mut effects = Vec::new();
+            runner.run_plan_turn(session, None, &mut effects);
+            if seq == 30 {
+                first_batch_reads = read_effects(&effects)
+                    .iter()
+                    .map(|read| read.operation())
+                    .collect();
+            }
+            if let Some(read) = read_effects(&effects).first() {
+                owner_reads.push(read.operation());
+            }
+        }
+
+        assert_eq!(owner_reads.len(), MAX_LOCAL_SCAN_OWNERS);
+        assert_eq!(first_batch_reads.len(), 2);
+        let preferred = sessions[3];
+        runner.state.latest_consensus_target = Some(LedgerTarget::new(target(33).hash(), None));
+        assert!(runner.state.local_scan_waiters.contains(&preferred));
+
+        let partial = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            first_batch_reads[0],
+            ReadOutcome::Settled { node: None },
+        )));
+        assert!(
+            read_effects(&partial)
+                .iter()
+                .all(|read| read.operation().session() != preferred)
+        );
+        assert!(runner.state.local_scan_owners.contains(&sessions[0]));
+
+        let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            first_batch_reads[1],
+            ReadOutcome::Settled { node: None },
+        )));
+        assert!(
+            read_effects(&effects)
+                .iter()
+                .any(|read| read.operation().session() == preferred)
+        );
+        assert!(runner.state.local_scan_owners.contains(&preferred));
+        assert!(runner.state.local_scan_waiters.contains(&sessions[0]));
+        assert!(
+            read_effects(&effects)
+                .iter()
+                .all(|read| read.operation().session() != sessions[0])
+        );
+        assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
     }
 
     #[test]
