@@ -1490,9 +1490,10 @@ impl CoordinatorRunner {
     }
 
     fn on_consensus(&mut self, target: ConsensusTarget) -> Vec<AcquisitionEffect> {
-        // The authoritative fact selects the preferred target, but it does not
-        // suspend an older per-hash acquisition. rippled's one InboundLedgers
-        // owner advances multiple InboundLedger hashes concurrently.
+        // Consensus observations always update preferred-policy metadata.
+        // Session admission is centralized in on_acquire, where a Full or
+        // Tracking node with an exact validation-recovery owner coalesces a
+        // different moving tip instead of competing with that recovery tree.
         let incoming = target.target();
         let latch_if_empty = matches!(self.state.phase, SyncPhase::Syncing { .. })
             || (self.state.last_installed_lcl.is_none()
@@ -1715,6 +1716,25 @@ impl CoordinatorRunner {
         phase_neutral: bool,
     ) -> Vec<AcquisitionEffect> {
         let mut effects = Vec::new();
+        // NetworkOps reports a moving preferred ledger through both
+        // ConsensusTarget and AcquireRequested, while trusted validation has
+        // its own ValidationTarget path. Centralize the recovery gate here so
+        // none of those production paths can mint competing sessions while a
+        // phase-neutral exact recovery tree is restoring a Full/Tracking node.
+        // The exact anchor hash remains admissible, and Syncing LCL recovery
+        // is deliberately unaffected.
+        if reason == AcquireReason::Consensus
+            && matches!(
+                self.state.phase,
+                SyncPhase::Tracking { .. } | SyncPhase::Full { .. }
+            )
+            && self
+                .state
+                .validation_recovery_target
+                .is_some_and(|anchor| anchor.hash() != target.hash())
+        {
+            return effects;
+        }
         let authoritative_recovery_demand = reason == AcquireReason::Consensus
             && !phase_neutral
             && self
@@ -3253,15 +3273,11 @@ impl CoordinatorRunner {
         false
     }
 
-    /// Chooses an admitted peer reply first, then the exact latched recovery
-    /// owner, otherwise FIFO. A queued ledger-data job in rippled
-    /// owns the inbound ledger until that reply has been applied.  Treating a
-    /// packet-bearing session like a speculative local scan lets continuously
-    /// moving consensus targets jump it forever, leaving the useful packet in
-    /// the mailbox until the registry sweep expires the session.
-    ///
-    /// Existing owners are never preempted.  This only selects which retained
-    /// continuation receives the next released JtLedgerData-equivalent slot.
+    /// Select an exact recovery owner first, then retain admission order for
+    /// every other JtLedgerData-equivalent continuation. rippled orders jobs
+    /// of the same type by their monotonic job index, so a later peer reply
+    /// cannot overtake an older ordinary waiter. Existing owners remain
+    /// non-preemptive.
     fn pop_scan_waiter(&mut self) -> Option<SessionRef> {
         let sessions = &self.state.sessions;
         let recovery_anchor = self.state.recovery_anchor_session;
@@ -3272,18 +3288,15 @@ impl CoordinatorRunner {
                 .get(session)
                 .is_some_and(|state| state.phase == SessionPhase::Active)
         });
-        let admitted_reply = waiters.iter().position(|session| {
-            sessions
-                .get(session)
-                .is_some_and(|state| state.plan.packet_count() != 0)
-        });
         let preferred = recovery_anchor
             .and_then(|anchor| waiters.iter().position(|session| *session == anchor))
             .or_else(|| {
                 validation_recovery
                     .and_then(|anchor| waiters.iter().position(|session| *session == anchor))
             });
-        waiters.remove(admitted_reply.or(preferred).unwrap_or(0))
+        preferred
+            .and_then(|index| waiters.remove(index))
+            .or_else(|| waiters.pop_front())
     }
 
     fn release_local_scan_permit(
@@ -7076,6 +7089,50 @@ mod tests {
     }
 
     #[test]
+    fn validation_recovery_latch_coalesces_moving_consensus_observations() {
+        let full = SyncPhase::Full {
+            lcl: identity(40),
+            published: identity(40),
+        };
+        let mut runner = CoordinatorRunner::with_phase(RunEpoch::new(1), full);
+        let recovery = target(90);
+        let started =
+            runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(recovery)));
+        let owner = peer_request_session(&started);
+
+        for seq in 91..191 {
+            let moving = target(seq);
+            let effects = runner.handle_event(AcquisitionEvent::ConsensusTarget(
+                ConsensusTarget::new(moving, AcquireReason::Consensus),
+            ));
+            assert!(effects.iter().all(|effect| !matches!(
+                effect,
+                AcquisitionEffect::SessionStarted(_) | AcquisitionEffect::SendLedgerRequest(_)
+            )));
+            assert_eq!(runner.state.latest_consensus_target, Some(moving));
+
+            let direct = runner.handle_event(AcquisitionEvent::AcquireRequested {
+                target: moving,
+                reason: AcquireReason::Consensus,
+            });
+            assert!(direct.iter().all(|effect| !matches!(
+                effect,
+                AcquisitionEffect::SessionStarted(_) | AcquisitionEffect::SendLedgerRequest(_)
+            )));
+
+            let validation = runner.handle_event(AcquisitionEvent::ValidationTarget(moving));
+            assert!(validation.iter().all(|effect| !matches!(
+                effect,
+                AcquisitionEffect::SessionStarted(_) | AcquisitionEffect::SendLedgerRequest(_)
+            )));
+        }
+
+        assert_eq!(runner.live_sessions().collect::<Vec<_>>(), vec![owner]);
+        assert_eq!(runner.state.validation_recovery_target, Some(recovery));
+        assert_eq!(runner.state.validation_recovery_session, Some(owner));
+    }
+
+    #[test]
     fn concurrent_consensus_sessions_accept_independent_read_and_plan_work() {
         let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
         let mut runner = CoordinatorRunner::with_plan_seed(
@@ -9961,6 +10018,65 @@ mod tests {
             0
         );
         assert!(runner.state.local_scan_waiters.contains(&newest_preferred));
+    }
+
+    #[test]
+    fn newer_packet_waiter_cannot_overtake_older_ordinary_scan() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let mut sessions = Vec::new();
+        let mut owner_reads = Vec::new();
+
+        for seq in 50..55 {
+            let started = acquire_with_effects(&mut runner, seq);
+            let session = peer_request_session(&started);
+            sessions.push(session);
+            let state = runner.state.sessions.get_mut(&session).expect("session");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(u64::from(seq)),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(u64::from(seq) + 35_000)),
+                    seq,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+            let mut effects = Vec::new();
+            runner.run_plan_turn(session, None, &mut effects);
+            if let Some(read) = read_effects(&effects).first() {
+                owner_reads.push(read.operation());
+            }
+        }
+
+        let older_waiter = sessions[3];
+        let newer_reply = sessions[4];
+        assert!(
+            runner
+                .handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
+                    newer_reply,
+                    AdmissionBudget::new(1, 256),
+                    8,
+                )))
+                .is_empty()
+        );
+
+        let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            owner_reads[0],
+            ReadOutcome::Settled { node: None },
+        )));
+        assert!(
+            read_effects(&effects)
+                .iter()
+                .any(|read| read.operation().session() == older_waiter)
+        );
+        assert!(runner.state.local_scan_waiters.contains(&newer_reply));
     }
 
     #[test]
