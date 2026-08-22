@@ -9,7 +9,7 @@ use nodestore::{
 };
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::Ordering};
 use tempfile::TempDir;
 use xxhash_rust::xxh64::xxh64;
 
@@ -761,4 +761,86 @@ fn nudb_backend_grows_key_buckets_and_preserves_entries_after_reopen() {
         assert_eq!(fetched.expect("reopened object").data(), object.data());
     }
     reopened.verify();
+}
+
+#[test]
+fn nudb_checked_batches_preserve_burst_threshold_without_per_node_cycles() {
+    let temp = TempDir::new().expect("tempdir");
+    let backend = NuDbBackend::new(
+        nodestore::NodeObject::KEY_BYTES,
+        &nudb_section(temp.path()),
+        4,
+        Arc::new(RecordingJournal::default()),
+    )
+    .expect("nudb backend");
+    backend
+        .open_deterministic(true, NUDB_APPNUM, 9001, 9002)
+        .expect("open");
+
+    let below = (1u8..=2)
+        .map(|fill| object(fill, &[fill; 8]))
+        .collect::<nodestore::Batch>();
+    backend
+        .store_batch_result(&below)
+        .expect("checked batch persistence");
+    assert_eq!(
+        backend.metrics.burst_commit_count.load(Ordering::Relaxed),
+        0,
+        "a below-threshold batch must remain in the active burst"
+    );
+
+    let crossing = (3u8..=5)
+        .map(|fill| object(fill, &[fill; 8]))
+        .collect::<nodestore::Batch>();
+    backend
+        .store_batch_result(&crossing)
+        .expect("threshold-crossing batch persistence");
+
+    assert_eq!(
+        backend.metrics.burst_commit_count.load(Ordering::Relaxed),
+        1,
+        "one ledger batch must cross the burst threshold in one durability cycle"
+    );
+    let above = (6u8..=11)
+        .map(|fill| object(fill, &[fill; 8]))
+        .collect::<nodestore::Batch>();
+    backend
+        .store_batch_result(&above)
+        .expect("above-threshold batch persistence");
+    assert_eq!(
+        backend.metrics.burst_commit_count.load(Ordering::Relaxed),
+        2,
+        "an above-threshold batch must still use only one durability cycle"
+    );
+
+    for expected in below.into_iter().chain(crossing).chain(above) {
+        let (fetched, status) = backend.fetch(expected.hash());
+        assert_eq!(status, Status::Ok);
+        assert_eq!(
+            fetched.expect("persisted batch object").data(),
+            expected.data()
+        );
+    }
+}
+
+#[test]
+fn nudb_checked_batch_propagates_backend_state_errors() {
+    let temp = TempDir::new().expect("tempdir");
+    let backend = NuDbBackend::new(
+        nodestore::NodeObject::KEY_BYTES,
+        &nudb_section(temp.path()),
+        4,
+        Arc::new(RecordingJournal::default()),
+    )
+    .expect("nudb backend");
+    let batch = vec![object(0xA1, &[1, 2, 3])];
+
+    assert_eq!(
+        backend.store_batch_result(&batch),
+        Err("NuDB backend is not open".to_owned())
+    );
+    assert_eq!(
+        backend.metrics.burst_commit_count.load(Ordering::Relaxed),
+        0
+    );
 }

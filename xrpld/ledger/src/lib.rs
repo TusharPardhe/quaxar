@@ -512,6 +512,20 @@ pub type LedgerNodeWriterResult = Arc<
         + Sync,
 >;
 
+/// One dirty SHAMap node prepared for durable NodeStore persistence.
+#[derive(Debug)]
+pub struct LedgerNodeWrite {
+    pub object_type: LedgerNodeObjectType,
+    pub hash: basics::base_uint::Uint256,
+    pub data: Vec<u8>,
+    pub ledger_seq: u32,
+}
+
+/// Checked batch writer used by consensus ledger persistence. A successful
+/// return means the complete batch was accepted by the backing store.
+pub type LedgerNodeBatchWriterResult =
+    Arc<dyn Fn(Vec<LedgerNodeWrite>) -> Result<(), String> + Send + Sync>;
+
 /// Node writer used by legacy compatibility callers.
 pub type LedgerNodeWriter =
     Arc<dyn Fn(LedgerNodeObjectType, basics::base_uint::Uint256, Vec<u8>, u32) + Send + Sync>;
@@ -543,6 +557,7 @@ pub struct Ledger {
     /// writer remains for compatibility callers, but this path propagates
     /// backend failures before a ledger can be promoted/released.
     node_writer_result: Option<LedgerNodeWriterResult>,
+    node_batch_writer_result: Option<LedgerNodeBatchWriterResult>,
     /// Persistent mutable tree for the state map — matches reference where stateMap_
     /// is a single persistent SHAMap that all rawInsert/rawErase/rawReplace
     /// operate on directly. Initialized on first mutation, persists across all
@@ -571,6 +586,7 @@ impl Ledger {
             node_fetcher: None,
             node_writer: None,
             node_writer_result: None,
+            node_batch_writer_result: None,
             mutable_state: None,
         }
     }
@@ -712,6 +728,7 @@ impl Ledger {
             node_fetcher: None,
             node_writer: None,
             node_writer_result: None,
+            node_batch_writer_result: None,
             mutable_state: None,
         }
     }
@@ -748,6 +765,7 @@ impl Ledger {
             node_fetcher: prev_ledger.node_fetcher.clone(),
             node_writer: prev_ledger.node_writer.clone(),
             node_writer_result: prev_ledger.node_writer_result.clone(),
+            node_batch_writer_result: prev_ledger.node_batch_writer_result.clone(),
             mutable_state: None,
         }
     }
@@ -765,6 +783,7 @@ impl Ledger {
             node_fetcher: None,
             node_writer: None,
             node_writer_result: None,
+            node_batch_writer_result: None,
             mutable_state: None,
         }
     }
@@ -799,6 +818,7 @@ impl Ledger {
             node_fetcher: None,
             node_writer: None,
             node_writer_result: None,
+            node_batch_writer_result: None,
             mutable_state: None,
         };
         let mut loaded = true;
@@ -2007,26 +2027,27 @@ impl Ledger {
         self.tx_map = next;
     }
 
-    /// Persist dirty SHAMap nodes to the node store WITHOUT rebuilding
-    /// the in-memory tree. Matches rippled's `BuildLedger.cpp` lines 69-73:
+    /// Persist dirty SHAMap nodes as one checked state-then-transaction batch,
+    /// then rebuild both in-memory roots with canonical cache pointers. The
+    /// ordering matches rippled's `BuildLedger.cpp` lines 69-73:
     ///   built->stateMap().flushDirty(AccountNode)
     ///   built->txMap().flushDirty(TransactionNode)
     ///
-    /// For each flushed node this performs the two-step write that rippled's
-    /// `SHAMap::writeNode` (SHAMap.cpp:935-947) performs:
-    ///   1. **Canonicalize into the shared tree-node cache** — matches
+    /// The detached traversal serializes dirty nodes without changing the
+    /// candidate. Only after the entire checked batch is durable does it:
+    ///   1. **Canonicalize into the shared tree-node cache** — matching
     ///      `canonicalize(node->getHash(), node)` which calls
     ///      `f_.getTreeNodeCache()->canonicalizeReplaceClient()`. This ensures
     ///      subsequent `cacheLookup()` calls return a hit instead of falling
     ///      through to a NuDB round-trip (fixes Issue B: tree cache = 0).
-    ///   2. **Persist to NuDB** — matches `f_.db().store(t, data, hash, seq)`.
+    ///   2. **Install canonical pointers into the live trees**. A write error
+    ///      leaves the original dirty ownership and cache visibility intact.
     ///
     /// # Parameters
     /// - `tree_cache`: Shared tree-node cache (the single `TreeNodeCache`
     ///   instance shared across all SHAMaps via `SHAMapFamily`). When `Some`,
-    ///   each flushed node is canonicalized into the cache before NuDB
-    ///   persistence. When `None`, only NuDB persistence occurs (backward
-    ///   compatible with callers that don't have a cache reference).
+    ///   nodes are canonicalized only after durable batch success. When
+    ///   `None`, the same ownership transition occurs without cache reuse.
     pub fn persist_dirty_nodes_to_store_result(
         &mut self,
         tree_cache: Option<
@@ -2036,24 +2057,27 @@ impl Ledger {
             >,
         >,
     ) -> Result<(), String> {
+        let persistence_started = std::time::Instant::now();
         let ledger_seq = self.header.seq;
-        let writer = self
-            .node_writer_result
-            .clone()
-            .ok_or_else(|| "missing node writer for backed consensus ledger".to_owned())?;
+        let batch_writer = self.node_batch_writer_result.clone();
+        let writer = self.node_writer_result.clone();
+        if batch_writer.is_none() && writer.is_none() {
+            return Err("missing node writer for backed consensus ledger".to_owned());
+        }
 
-        let flush = |tree: &mut MutableTree, object_type: LedgerNodeObjectType| {
-            tree.try_flush_dirty(&mut |node| {
-                if let Some(cache) = tree_cache {
-                    let mut node_ref = node.clone();
-                    let key = *node.get_hash().as_uint256();
-                    cache.canonicalize_replace_client(&key, &mut node_ref);
-                }
-                let hash = node.get_hash();
+        let mut writes = Vec::new();
+        let mut collect = |tree: &MutableTree, object_type: LedgerNodeObjectType| {
+            tree.try_flush_dirty_detached(&mut |node| {
+                let hash = *node.get_hash().as_uint256();
                 let data = node
                     .serialize_with_prefix()
                     .map_err(|error| format!("serialize dirty SHAMap node failed: {error:?}"))?;
-                writer(object_type, *hash.as_uint256(), data, ledger_seq)?;
+                writes.push(LedgerNodeWrite {
+                    object_type,
+                    hash,
+                    data,
+                    ledger_seq,
+                });
                 Ok::<_, String>(node)
             })
             .map(|_| ())
@@ -2062,11 +2086,93 @@ impl Ledger {
         let mut state_tree = self.mutable_state.take().unwrap_or_else(|| {
             MutableTree::from_loaded_root(self.state_map.root(), ledger_seq.max(1))
         });
-        flush(&mut state_tree, LedgerNodeObjectType::AccountNode)?;
-        self.mutable_state = Some(state_tree);
+        if let Err(error) = collect(&state_tree, LedgerNodeObjectType::AccountNode) {
+            self.mutable_state = Some(state_tree);
+            return Err(error);
+        }
 
         let mut tx_tree = MutableTree::from_loaded_root(self.tx_map.root(), ledger_seq.max(1));
-        flush(&mut tx_tree, LedgerNodeObjectType::TransactionNode)?;
+        if let Err(error) = collect(&tx_tree, LedgerNodeObjectType::TransactionNode) {
+            self.mutable_state = Some(state_tree);
+            return Err(error);
+        }
+
+        let write_count = writes.len();
+        let persistence_result = if let Some(batch_writer) = batch_writer {
+            batch_writer(writes)
+        } else if let Some(writer) = writer {
+            let mut result = Ok(());
+            for write in writes {
+                if let Err(error) =
+                    writer(write.object_type, write.hash, write.data, write.ledger_seq)
+                {
+                    result = Err(error);
+                    break;
+                }
+            }
+            result
+        } else {
+            unreachable!("writer presence checked above")
+        };
+        if let Err(error) = persistence_result {
+            self.mutable_state = Some(state_tree);
+            return Err(error);
+        }
+
+        // Only after the complete checked batch succeeds, flush the original
+        // dirty trees and return the shared cache's canonical pointers into
+        // their parent paths. A failed batch leaves both tree ownership and
+        // cache visibility untouched.
+        let mut canonicalize = |mut node: basics::memory::intrusive_pointer::SharedIntrusive<
+            shamap::nodes::tree_node::SHAMapTreeNode,
+        >| {
+            if let Some(cache) = tree_cache {
+                let key = *node.get_hash().as_uint256();
+                cache.canonicalize_replace_client(&key, &mut node);
+            }
+            node
+        };
+        state_tree.flush_dirty(&mut canonicalize);
+        tx_tree.flush_dirty(&mut canonicalize);
+        let state_was_full = self.state_map.is_full();
+        let next_state = SyncTree::from_root_with_type(
+            state_tree.root(),
+            self.state_map.map_type(),
+            self.state_map.backed(),
+            ledger_seq,
+            self.state_map.state(),
+        );
+        if state_was_full {
+            next_state.set_full();
+        }
+        self.state_map = next_state;
+        let tx_was_full = self.tx_map.is_full();
+        let next_tx = SyncTree::from_root_with_type(
+            tx_tree.root(),
+            self.tx_map.map_type(),
+            self.tx_map.backed(),
+            ledger_seq,
+            self.tx_map.state(),
+        );
+        if tx_was_full {
+            next_tx.set_full();
+        }
+        self.tx_map = next_tx;
+        self.mutable_state = Some(state_tree);
+        tracing::debug!(
+            target: "ledger",
+            ledger_seq,
+            write_count,
+            batched = self.node_batch_writer_result.is_some(),
+            "Persisted dirty SHAMap node batch"
+        );
+        tracing::info!(
+            target: "ledger_persistence",
+            ledger_seq,
+            write_count,
+            elapsed_us = persistence_started.elapsed().as_micros() as u64,
+            "Consensus dirty-node persistence completed"
+        );
         Ok(())
     }
 
@@ -2188,8 +2294,16 @@ impl Ledger {
         self.node_writer_result = Some(writer);
     }
 
+    pub fn set_node_batch_writer_result(&mut self, writer: LedgerNodeBatchWriterResult) {
+        self.node_batch_writer_result = Some(writer);
+    }
+
     pub fn has_node_writer_result(&self) -> bool {
         self.node_writer_result.is_some()
+    }
+
+    pub fn has_node_batch_writer_result(&self) -> bool {
+        self.node_batch_writer_result.is_some()
     }
 
     pub fn set_accepted(
@@ -3100,6 +3214,126 @@ mod tests {
             .persist_dirty_nodes_to_store_result(None)
             .expect_err("backed consensus ledger cannot silently skip persistence");
         assert!(error.contains("missing node writer"));
+    }
+
+    #[test]
+    fn checked_dirty_batch_is_single_postorder_state_then_transaction_write() {
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(10, 1_000, true);
+        let mut state_tree = MutableTree::new(10);
+        state_tree
+            .add_item(
+                SHAMapNodeType::AccountState,
+                SHAMapItem::new(Uint256::from_array([0x11; 32]), vec![1; 12]),
+            )
+            .expect("state insert");
+        ledger.state_map = SyncTree::from_root_with_type(
+            state_tree.root(),
+            SHAMapType::State,
+            true,
+            10,
+            SyncState::Modifying,
+        );
+        ledger.mutable_state = Some(state_tree);
+
+        let mut tx_tree = MutableTree::new(10);
+        tx_tree
+            .add_item(
+                SHAMapNodeType::TransactionNm,
+                SHAMapItem::new(Uint256::from_array([0x22; 32]), vec![2; 12]),
+            )
+            .expect("transaction insert");
+        ledger.tx_map = SyncTree::from_root_with_type(
+            tx_tree.root(),
+            SHAMapType::Transaction,
+            true,
+            10,
+            SyncState::Modifying,
+        );
+
+        let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&batches);
+        ledger.set_node_batch_writer_result(Arc::new(move |writes| {
+            observed.lock().expect("batch mutex").push(
+                writes
+                    .iter()
+                    .map(|write| write.object_type)
+                    .collect::<Vec<_>>(),
+            );
+            Ok(())
+        }));
+        ledger
+            .persist_dirty_nodes_to_store_result(None)
+            .expect("checked batch");
+
+        let batches = batches.lock().expect("batch mutex");
+        assert_eq!(batches.len(), 1, "one ledger flush must issue one batch");
+        let types = &batches[0];
+        let first_tx = types
+            .iter()
+            .position(|kind| *kind == LedgerNodeObjectType::TransactionNode)
+            .expect("transaction nodes");
+        assert!(
+            types[..first_tx]
+                .iter()
+                .all(|kind| *kind == LedgerNodeObjectType::AccountNode)
+        );
+        assert!(
+            types[first_tx..]
+                .iter()
+                .all(|kind| *kind == LedgerNodeObjectType::TransactionNode)
+        );
+        assert_eq!(ledger.state_map.root().cowid(), 0);
+        assert_eq!(ledger.tx_map.root().cowid(), 0);
+    }
+
+    #[test]
+    fn failed_dirty_batch_leaves_candidate_trees_dirty() {
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(10, 1_000, true);
+        let mut state_tree = MutableTree::new(10);
+        state_tree
+            .add_item(
+                SHAMapNodeType::AccountState,
+                SHAMapItem::new(Uint256::from_array([0x33; 32]), vec![3; 12]),
+            )
+            .expect("state insert");
+        let original_root = state_tree.root();
+        ledger.state_map = SyncTree::from_root_with_type(
+            original_root.clone(),
+            SHAMapType::State,
+            true,
+            10,
+            SyncState::Modifying,
+        );
+        ledger.mutable_state = Some(state_tree);
+        ledger.set_node_batch_writer_result(Arc::new(|_| Err("injected failure".to_owned())));
+        let tree_cache = shamap::tree_node_cache::TreeNodeCache::new(
+            "failed-batch",
+            64,
+            time::Duration::seconds(60),
+            basics::tagged_cache::MonotonicClock::default(),
+        );
+
+        assert_eq!(
+            ledger.persist_dirty_nodes_to_store_result(Some(&tree_cache)),
+            Err("injected failure".to_owned())
+        );
+        assert_eq!(ledger.state_map.root().cowid(), 10);
+        assert!(
+            ledger
+                .mutable_state
+                .as_ref()
+                .is_some_and(|tree| tree.root().cowid() == 10)
+        );
+        assert_eq!(ledger.state_map.root().get_hash(), original_root.get_hash());
+        assert!(
+            std::ptr::eq(&*ledger.state_map.root(), &*original_root),
+            "failed persistence must retain the candidate's exact dirty root"
+        );
+        assert_eq!(
+            tree_cache.size(),
+            0,
+            "failed persistence must not publish unpersisted nodes to the shared cache"
+        );
     }
 
     #[derive(Debug, Default)]

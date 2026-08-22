@@ -5652,6 +5652,38 @@ impl ApplicationRoot {
         ))
     }
 
+    pub fn node_batch_writer_result_from_store(
+        &self,
+    ) -> Option<ledger::LedgerNodeBatchWriterResult> {
+        let ns = self.node_store().as_ref().cloned().or_else(|| {
+            self.shared_consensus_node_store
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone())
+        })?;
+        Some(std::sync::Arc::new(move |writes| {
+            let objects = writes
+                .into_iter()
+                .map(|write| {
+                    (
+                        to_nodestore_type(write.object_type),
+                        write.data,
+                        write.hash,
+                        write.ledger_seq,
+                    )
+                })
+                .collect();
+            match &ns {
+                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => {
+                    db.store_batch(objects)
+                }
+                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => {
+                    db.store_batch(objects)
+                }
+            }
+        }))
+    }
+
     pub fn node_writer_from_store(
         &self,
     ) -> Option<
@@ -7519,7 +7551,9 @@ impl ApplicationRoot {
     /// return it unchanged.
     pub fn ledger_with_node_fetcher(&self, ledger: Arc<Ledger>) -> Arc<Ledger> {
         let has_shared_family = self.node_family().is_some();
-        if (ledger.has_node_fetcher() && ledger.has_node_writer_result())
+        if (ledger.has_node_fetcher()
+            && ledger.has_node_writer_result()
+            && ledger.has_node_batch_writer_result())
             || (!ledger.state_map().backed() && !ledger.tx_map().backed())
         {
             return ledger;
@@ -7528,7 +7562,12 @@ impl ApplicationRoot {
         let fetcher = self.node_fetcher_from_store();
         let writer = self.node_writer_from_store();
         let writer_result = self.node_writer_result_from_store();
-        if fetcher.is_none() && writer.is_none() && writer_result.is_none() {
+        let batch_writer_result = self.node_batch_writer_result_from_store();
+        if fetcher.is_none()
+            && writer.is_none()
+            && writer_result.is_none()
+            && batch_writer_result.is_none()
+        {
             tracing::warn!(target: "ledger",
                 "[ledger_fetcher] WARNING: backed ledger seq={} stored without node fetcher/writer \
                  (node store not yet attached) — reads/writes will fail with MissingNode",
@@ -7562,6 +7601,11 @@ impl ApplicationRoot {
             && !ledger_with_fetcher.has_node_writer_result()
         {
             ledger_with_fetcher.set_node_writer_result(writer);
+        }
+        if let Some(writer) = batch_writer_result
+            && !ledger_with_fetcher.has_node_batch_writer_result()
+        {
+            ledger_with_fetcher.set_node_batch_writer_result(writer);
         }
         match ledger_with_fetcher.setup_from_state_map(&feature_xrp_fees()) {
             Ok(true) => {
@@ -10225,6 +10269,16 @@ impl ApplicationRoot {
                                 )
                             })?;
                             ledger.set_node_writer_result(writer);
+                        }
+                        if !ledger.has_node_batch_writer_result() {
+                            let writer =
+                                self.node_batch_writer_result_from_store().ok_or_else(|| {
+                                    crate::bootstrap::build_ledger::BuildLedgerError::Persist(
+                                        "missing fallible node batch writer for consensus ledger"
+                                            .to_owned(),
+                                    )
+                                })?;
+                            ledger.set_node_batch_writer_result(writer);
                         }
                         ledger.state_map_mut().set_backed();
                         ledger.tx_map_mut().set_backed();

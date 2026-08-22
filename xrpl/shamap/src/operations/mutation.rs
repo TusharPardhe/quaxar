@@ -107,6 +107,27 @@ impl MutableTree {
         Ok(count)
     }
 
+    /// Build a flushed, shareable view of only this tree's dirty paths while
+    /// leaving the original dirty ownership untouched. Clean subtrees remain
+    /// shared. This supports checked persistence: callers can serialize a
+    /// complete postorder batch, commit it, and only then flush/canonicalize
+    /// the original tree.
+    pub fn try_flush_dirty_detached<F, E>(&self, writer: &mut F) -> Result<(Self, usize), E>
+    where
+        F: FnMut(SharedIntrusive<SHAMapTreeNode>) -> Result<SharedIntrusive<SHAMapTreeNode>, E>,
+    {
+        let mut writer: &mut TryWriteNodeCallback<'_, E> = writer;
+        let (root, count) =
+            try_walk_subtree_detached_impl(self.root.clone(), self.cowid, Some(&mut writer))?;
+        Ok((
+            Self {
+                root,
+                cowid: self.cowid,
+            },
+            count,
+        ))
+    }
+
     pub fn walk_subtree<F>(&mut self, writer: Option<&mut F>) -> usize
     where
         F: FnMut(SharedIntrusive<SHAMapTreeNode>) -> SharedIntrusive<SHAMapTreeNode>,
@@ -1009,6 +1030,73 @@ fn try_walk_subtree_impl<E>(
     Ok((node, flushed))
 }
 
+fn try_walk_subtree_detached_impl<E>(
+    root: SharedIntrusive<SHAMapTreeNode>,
+    owner_cowid: u32,
+    mut writer: Option<&mut TryWriteNodeCallback<'_, E>>,
+) -> Result<(SharedIntrusive<SHAMapTreeNode>, usize), E> {
+    debug_assert_ne!(owner_cowid, 0);
+    if root.cowid() == 0 {
+        return Ok((root, 0));
+    }
+
+    let mut root = root.clone_with_cowid(owner_cowid);
+    if root.is_leaf() {
+        root.update_hash();
+        root.unshare();
+        root = try_maybe_write_node(root, &mut writer)?;
+        return Ok((root, 1));
+    }
+    if root.is_inner() && root.is_empty() {
+        return Ok((make_shared_intrusive(SHAMapTreeNode::new_inner(0)), 1));
+    }
+
+    let mut flushed = 0;
+    let mut node = root;
+    let mut stack = Vec::new();
+    let mut pos = 0;
+    loop {
+        while pos < BRANCH_FACTOR {
+            if node.is_empty_branch(pos) {
+                pos += 1;
+                continue;
+            }
+            let branch = pos;
+            pos += 1;
+            let Some(child) = node.get_child(branch) else {
+                continue;
+            };
+            if child.cowid() == 0 {
+                continue;
+            }
+            let mut child = child.clone_with_cowid(owner_cowid);
+            if child.is_inner() {
+                stack.push((node, branch));
+                node = child;
+                pos = 0;
+                continue;
+            }
+            flushed += 1;
+            child.update_hash();
+            child.unshare();
+            child = try_maybe_write_node(child, &mut writer)?;
+            node.share_child(branch, &child);
+        }
+
+        node.update_hash_deep();
+        node.unshare();
+        node = try_maybe_write_node(node, &mut writer)?;
+        flushed += 1;
+        let Some((parent, branch)) = stack.pop() else {
+            break;
+        };
+        parent.share_child(branch, &node);
+        node = parent;
+        pos = branch + 1;
+    }
+    Ok((node, flushed))
+}
+
 fn require_owned_inner(
     node: &SharedIntrusive<SHAMapTreeNode>,
     node_id: SHAMapNodeId,
@@ -1572,6 +1660,57 @@ mod tests {
         assert_eq!(replaced_leaf.cowid(), 0);
         assert_eq!(replaced_leaf.get_hash(), original_leaf_hash);
         assert!(!same_node(&original_leaf, &replaced_leaf));
+    }
+
+    #[test]
+    fn detached_flush_preserves_dirty_owner_until_canonical_commit() {
+        let key = Uint256::from_array([0xD8; 32]);
+        let mut tree = MutableTree::new(9);
+        tree.add_item(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(key, vec![22; 12]),
+        )
+        .expect("insert should succeed");
+        let original_root = tree.root();
+        let original_leaf = tree.find_key(key).expect("lookup").expect("dirty leaf");
+        let mut order = Vec::new();
+        let (detached, count) = tree
+            .try_flush_dirty_detached(&mut |node| {
+                order.push(node.is_leaf());
+                Ok::<_, ()>(node)
+            })
+            .expect("detached flush plan");
+
+        assert_eq!(count, 2);
+        assert_eq!(order, vec![true, false]);
+        assert!(same_node(&tree.root(), &original_root));
+        assert!(same_node(
+            &tree.find_key(key).expect("lookup").expect("dirty leaf"),
+            &original_leaf
+        ));
+        assert_eq!(
+            tree.root().cowid(),
+            9,
+            "dry run must retain dirty ownership"
+        );
+
+        let canonical_root = detached.root();
+        let canonical_leaf = detached
+            .find_key(key)
+            .expect("lookup")
+            .expect("canonical leaf");
+        tree.flush_dirty(&mut |node| {
+            if node.is_leaf() {
+                canonical_leaf.clone()
+            } else {
+                canonical_root.clone()
+            }
+        });
+        assert!(same_node(&tree.root(), &canonical_root));
+        assert!(same_node(
+            &tree.find_key(key).expect("lookup").expect("canonical leaf"),
+            &canonical_leaf
+        ));
     }
 
     #[test]

@@ -5089,6 +5089,10 @@ fn seed_startup_ledger_state(
                 "missing fallible node writer while persisting genesis ledger".to_owned()
             })?;
             genesis_for_persist.set_node_writer_result(writer);
+            let batch_writer = root.node_batch_writer_result_from_store().ok_or_else(|| {
+                "missing fallible node batch writer while persisting genesis ledger".to_owned()
+            })?;
+            genesis_for_persist.set_node_batch_writer_result(batch_writer);
             genesis_for_persist.state_map_mut().set_backed();
             genesis_for_persist.tx_map_mut().set_backed();
             // Persist dirty nodes to NuDB + tree cache. Propagate failure:
@@ -5118,6 +5122,10 @@ fn seed_startup_ledger_state(
             "missing fallible node writer while constructing initial next ledger".to_owned()
         })?;
         next.set_node_writer_result(writer);
+        let batch_writer = root.node_batch_writer_result_from_store().ok_or_else(|| {
+            "missing fallible node batch writer while constructing initial next ledger".to_owned()
+        })?;
+        next.set_node_batch_writer_result(batch_writer);
         if let Some(fetcher) = root.node_fetcher_from_store() {
             next.set_node_fetcher(fetcher);
         }

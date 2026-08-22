@@ -161,6 +161,9 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
         ledger_seq: u32,
     ) -> Result<(), String>;
 
+    fn store_batch(&self, objects: Vec<(NodeObjectType, Blob, Uint256, u32)>)
+    -> Result<(), String>;
+
     fn is_same_db(&self, first: u32, second: u32) -> bool;
 
     fn sync(&self);

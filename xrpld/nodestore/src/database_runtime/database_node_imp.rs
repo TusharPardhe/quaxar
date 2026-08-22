@@ -11,7 +11,7 @@ use basics::blob::Blob;
 use basics::str_hex::str_hex;
 use protocol::JsonValue;
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 
@@ -136,6 +136,37 @@ impl DatabaseNodeImp {
         // counters nor cache state can imply a write that the backend rejected.
         self.database.store_stats(1, object.data().len() as u64);
         self.database.promote_node_object(object);
+        Ok(())
+    }
+
+    /// Persist a complete NodeStore batch and publish cache/stat bookkeeping
+    /// only after the backend reports success for the whole batch.
+    pub fn store_batch(
+        &self,
+        objects: Vec<(NodeObjectType, Blob, Uint256, u32)>,
+    ) -> Result<(), String> {
+        let mut seen_hashes = BTreeSet::new();
+        let batch = objects
+            .into_iter()
+            .filter_map(|(object_type, data, hash, _ledger_seq)| {
+                seen_hashes
+                    .insert(hash)
+                    .then(|| NodeObject::create_object(object_type, data, hash))
+            })
+            .collect::<crate::Batch>();
+        self.backend.store_batch_result(&batch).map_err(|error| {
+            tracing::error!(
+                target: "nodestore",
+                %error,
+                object_count = batch.len(),
+                "NodeStore backend batch write failed"
+            );
+            error
+        })?;
+        for object in batch {
+            self.database.store_stats(1, object.data().len() as u64);
+            self.database.promote_node_object(object);
+        }
         Ok(())
     }
 
@@ -273,6 +304,13 @@ impl DatabaseTrait for DatabaseNodeImp {
         DatabaseNodeImp::store(self, object_type, data, hash, ledger_seq)
     }
 
+    fn store_batch(
+        &self,
+        objects: Vec<(NodeObjectType, Blob, Uint256, u32)>,
+    ) -> Result<(), String> {
+        DatabaseNodeImp::store_batch(self, objects)
+    }
+
     fn is_same_db(&self, first: u32, second: u32) -> bool {
         let _ = (first, second);
         true
@@ -371,13 +409,13 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 mod tests {
     use super::DatabaseNodeImp;
     use crate::{
-        Backend, BatchWriteReport, Database as DatabaseTrait, FetchReport, NodeObject, NullJournal,
-        PersistenceWork, Scheduler, Status, Task,
+        Backend, BatchWriteReport, Database as DatabaseTrait, FetchReport, NodeObject,
+        NodeObjectType, NullJournal, PersistenceWork, Scheduler, Status, Task,
     };
     use basics::base_uint::Uint256;
     use basics::basic_config::Section;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     struct RejectingScheduler {
         attempts: Arc<AtomicUsize>,
@@ -439,6 +477,87 @@ mod tests {
 
         fn set_delete_path(&self) {}
 
+        fn fd_required(&self) -> i32 {
+            0
+        }
+    }
+
+    struct FailingBatchBackend;
+
+    impl Backend for FailingBatchBackend {
+        fn get_name(&self) -> String {
+            "failing-batch".to_owned()
+        }
+        fn open(&self, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn close(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn fetch(&self, _: &Uint256) -> (Option<Arc<NodeObject>>, Status) {
+            (None, Status::NotFound)
+        }
+        fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status) {
+            (vec![None; hashes.len()], Status::NotFound)
+        }
+        fn store(&self, _: Arc<NodeObject>) -> Result<(), String> {
+            Ok(())
+        }
+        fn store_batch(&self, _: &crate::Batch) {}
+        fn store_batch_result(&self, _: &crate::Batch) -> Result<(), String> {
+            Err("injected batch failure".to_owned())
+        }
+        fn sync(&self) {}
+        fn for_each(&self, _: &mut dyn FnMut(Arc<NodeObject>)) {}
+        fn get_write_load(&self) -> i32 {
+            0
+        }
+        fn set_delete_path(&self) {}
+        fn fd_required(&self) -> i32 {
+            0
+        }
+    }
+
+    struct CapturingBatchBackend {
+        batch: Arc<Mutex<crate::Batch>>,
+    }
+
+    impl Backend for CapturingBatchBackend {
+        fn get_name(&self) -> String {
+            "capturing-batch".to_owned()
+        }
+        fn open(&self, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn close(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn fetch(&self, _: &Uint256) -> (Option<Arc<NodeObject>>, Status) {
+            (None, Status::NotFound)
+        }
+        fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status) {
+            (vec![None; hashes.len()], Status::NotFound)
+        }
+        fn store(&self, _: Arc<NodeObject>) -> Result<(), String> {
+            Ok(())
+        }
+        fn store_batch(&self, _: &crate::Batch) {}
+        fn store_batch_result(&self, batch: &crate::Batch) -> Result<(), String> {
+            *self.batch.lock().expect("captured batch mutex") = batch.clone();
+            Ok(())
+        }
+        fn sync(&self) {}
+        fn for_each(&self, _: &mut dyn FnMut(Arc<NodeObject>)) {}
+        fn get_write_load(&self) -> i32 {
+            0
+        }
+        fn set_delete_path(&self) {}
         fn fd_required(&self) -> i32 {
             0
         }
@@ -509,5 +628,71 @@ mod tests {
             1,
             "stop must not redeliver an already rejected write owner"
         );
+    }
+
+    #[test]
+    fn failed_checked_batch_does_not_publish_store_bookkeeping() {
+        let database = DatabaseNodeImp::new(
+            Arc::new(RejectingScheduler {
+                attempts: Arc::new(AtomicUsize::new(0)),
+            }),
+            1,
+            Arc::new(FailingBatchBackend),
+            &Section::new("node_db"),
+            Arc::new(NullJournal),
+        )
+        .expect("database node adapter");
+        let objects = vec![
+            (
+                NodeObjectType::AccountNode,
+                vec![1, 2],
+                Uint256::from_array([1; 32]),
+                1,
+            ),
+            (
+                NodeObjectType::TransactionNode,
+                vec![3, 4],
+                Uint256::from_array([2; 32]),
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            database.store_batch(objects),
+            Err("injected batch failure".to_owned())
+        );
+        assert_eq!(database.get_store_count(), 0);
+        assert_eq!(database.get_store_size(), 0);
+    }
+
+    #[test]
+    fn checked_batch_deduplicates_conflicting_hashes_first_wins() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let database = DatabaseNodeImp::new(
+            Arc::new(RejectingScheduler {
+                attempts: Arc::new(AtomicUsize::new(0)),
+            }),
+            1,
+            Arc::new(CapturingBatchBackend {
+                batch: Arc::clone(&captured),
+            }),
+            &Section::new("node_db"),
+            Arc::new(NullJournal),
+        )
+        .expect("database node adapter");
+        let hash = Uint256::from_array([0x51; 32]);
+        database
+            .store_batch(vec![
+                (NodeObjectType::AccountNode, vec![1, 2], hash, 10),
+                (NodeObjectType::TransactionNode, vec![9, 9, 9], hash, 11),
+            ])
+            .expect("deduplicated batch");
+
+        let batch = captured.lock().expect("captured batch mutex");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].object_type(), NodeObjectType::AccountNode);
+        assert_eq!(batch[0].data(), &[1, 2]);
+        assert_eq!(database.get_store_count(), 1);
+        assert_eq!(database.get_store_size(), 2);
     }
 }

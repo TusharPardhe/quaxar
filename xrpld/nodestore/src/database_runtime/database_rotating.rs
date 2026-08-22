@@ -12,7 +12,7 @@ use basics::blob::Blob;
 use basics::str_hex::str_hex;
 use protocol::JsonValue;
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Arc, Mutex};
 
@@ -420,6 +420,47 @@ impl DatabaseRotatingImp {
         Ok(())
     }
 
+    pub fn store_batch(
+        &self,
+        objects: Vec<(NodeObjectType, Blob, Uint256, u32)>,
+    ) -> Result<(), String> {
+        let mut seen_hashes = BTreeSet::new();
+        let batch = objects
+            .into_iter()
+            .filter_map(|(object_type, data, hash, _ledger_seq)| {
+                seen_hashes
+                    .insert(hash)
+                    .then(|| NodeObject::create_object(object_type, data, hash))
+            })
+            .collect::<crate::Batch>();
+        // Hold the rotating generation fence until the checked write and all
+        // post-store bookkeeping complete. Online deletion must not swap and
+        // retire this writable backend between durable success and cache
+        // publication.
+        let state = self
+            .state
+            .lock()
+            .expect("rotating backend mutex must not be poisoned");
+        state
+            .writable_backend
+            .store_batch_result(&batch)
+            .map_err(|error| {
+                tracing::error!(
+                    target: "nodestore",
+                    %error,
+                    object_count = batch.len(),
+                    "Rotating NodeStore backend batch write failed"
+                );
+                error
+            })?;
+        for object in batch {
+            self.database.store_stats(1, object.data().len() as u64);
+            self.database.promote_node_object(object);
+        }
+        drop(state);
+        Ok(())
+    }
+
     pub fn fetch_node_object(
         &self,
         hash: &Uint256,
@@ -542,6 +583,13 @@ impl DatabaseTrait for DatabaseRotatingImp {
         DatabaseRotatingImp::store(self, object_type, data, hash, ledger_seq)
     }
 
+    fn store_batch(
+        &self,
+        objects: Vec<(NodeObjectType, Blob, Uint256, u32)>,
+    ) -> Result<(), String> {
+        DatabaseRotatingImp::store_batch(self, objects)
+    }
+
     fn is_same_db(&self, first: u32, second: u32) -> bool {
         let _ = (first, second);
         true
@@ -662,13 +710,44 @@ mod tests {
     };
     use basics::{base_uint::Uint256, basic_config::Section};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    #[derive(Default)]
+    struct BatchGate {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl BatchGate {
+        fn block_batch(&self) {
+            let mut state = self.state.lock().expect("batch gate mutex");
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).expect("batch gate wait");
+            }
+        }
+
+        fn wait_until_entered(&self) {
+            let mut state = self.state.lock().expect("batch gate mutex");
+            while !state.0 {
+                state = self.changed.wait(state).expect("batch gate wait");
+            }
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().expect("batch gate mutex");
+            state.1 = true;
+            self.changed.notify_all();
+        }
+    }
 
     struct TestBackend {
         name: String,
         delete_path_called: AtomicBool,
         store_count: AtomicUsize,
         objects: Mutex<BTreeMap<Uint256, Arc<NodeObject>>>,
+        batch_gate: Option<Arc<BatchGate>>,
     }
 
     use std::collections::BTreeMap;
@@ -680,6 +759,14 @@ mod tests {
                 delete_path_called: AtomicBool::new(false),
                 store_count: AtomicUsize::new(0),
                 objects: Mutex::new(BTreeMap::new()),
+                batch_gate: None,
+            }
+        }
+
+        fn new_with_batch_gate(name: &str, batch_gate: Arc<BatchGate>) -> Self {
+            Self {
+                batch_gate: Some(batch_gate),
+                ..Self::new(name)
             }
         }
     }
@@ -735,6 +822,16 @@ mod tests {
                 self.store(Arc::clone(object))
                     .expect("test backend store must succeed");
             }
+        }
+
+        fn store_batch_result(&self, batch: &crate::Batch) -> Result<(), String> {
+            if let Some(gate) = &self.batch_gate {
+                gate.block_batch();
+            }
+            for object in batch {
+                self.store(Arc::clone(object))?;
+            }
+            Ok(())
         }
 
         fn sync(&self) {}
@@ -993,6 +1090,94 @@ mod tests {
             Some(("new".to_owned(), "writable".to_owned()))
         );
 
+        database.stop();
+    }
+
+    #[test]
+    fn checked_batch_fences_writable_generation_until_bookkeeping_finishes() {
+        let batch_gate = Arc::new(BatchGate::default());
+        let writable = Arc::new(TestBackend::new_with_batch_gate(
+            "writable",
+            Arc::clone(&batch_gate),
+        ));
+        let archive = Arc::new(TestBackend::new("archive"));
+        let database = DatabaseRotatingImp::new(
+            Arc::new(DummyScheduler),
+            1,
+            Arc::clone(&writable) as Arc<dyn Backend>,
+            Arc::clone(&archive) as Arc<dyn Backend>,
+            &config(),
+            Arc::new(NullJournal),
+        )
+        .expect("rotating database");
+
+        let stored = sample_object(0x61);
+        let store_database = Arc::clone(&database);
+        let store_hash = *stored.hash();
+        let store_thread = std::thread::spawn(move || {
+            store_database.store_batch(vec![(
+                NodeObjectType::Ledger,
+                stored.data().to_vec(),
+                store_hash,
+                10,
+            )])
+        });
+        batch_gate.wait_until_entered();
+
+        assert!(
+            database.state.try_lock().is_err(),
+            "the checked backend write must retain the rotating generation fence"
+        );
+        let rotate_database = Arc::clone(&database);
+        let rotate_thread = std::thread::spawn(move || {
+            rotate_database.rotate(Box::new(TestBackend::new("next")), |_, _| {});
+        });
+
+        batch_gate.release();
+        store_thread
+            .join()
+            .expect("store thread")
+            .expect("checked batch");
+        rotate_thread.join().expect("rotate thread");
+
+        assert!(
+            writable.fetch(&store_hash).0.is_some(),
+            "the complete batch must remain in the generation selected before rotation"
+        );
+        assert_eq!(database.get_store_count(), 1);
+        assert_eq!(database.get_store_size(), 2);
+        assert_eq!(database.get_name(), "next");
+        database.stop();
+    }
+
+    #[test]
+    fn rotating_checked_batch_deduplicates_conflicting_hashes_first_wins() {
+        let writable = Arc::new(TestBackend::new("writable"));
+        let archive = Arc::new(TestBackend::new("archive"));
+        let database = DatabaseRotatingImp::new(
+            Arc::new(DummyScheduler),
+            1,
+            Arc::clone(&writable) as Arc<dyn Backend>,
+            Arc::clone(&archive) as Arc<dyn Backend>,
+            &config(),
+            Arc::new(NullJournal),
+        )
+        .expect("rotating database");
+        let hash = Uint256::from_array([0x62; 32]);
+
+        database
+            .store_batch(vec![
+                (NodeObjectType::AccountNode, vec![1, 2], hash, 10),
+                (NodeObjectType::TransactionNode, vec![9, 9, 9], hash, 11),
+            ])
+            .expect("deduplicated rotating batch");
+
+        let stored = writable.fetch(&hash).0.expect("first object persisted");
+        assert_eq!(stored.object_type(), NodeObjectType::AccountNode);
+        assert_eq!(stored.data(), &[1, 2]);
+        assert_eq!(writable.store_count.load(Ordering::Relaxed), 1);
+        assert_eq!(database.get_store_count(), 1);
+        assert_eq!(database.get_store_size(), 2);
         database.stop();
     }
 }
