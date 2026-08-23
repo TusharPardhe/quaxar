@@ -508,7 +508,8 @@ pub enum SessionPersistence {
         /// The in-flight fence operation.
         operation: OperationRef,
     },
-    /// The fence passed; the ledger is durable and safe to hand off.
+    /// The ordered NodeStore acceptance fence passed; the reconstructible
+    /// ledger is safe to hand off. This does not imply a per-ledger fsync.
     Durable,
     /// Persistence or the fence failed; no normal adoptable ledger exists.
     Failed {
@@ -1499,8 +1500,9 @@ impl SessionPlan {
         }
     }
 
-    /// Applies one durability-fence completion. `FencePending` moves to
-    /// `Durable` only on a passed barrier; a failure terminalizes intent.
+    /// Applies one ordered NodeStore-acceptance completion. `FencePending`
+    /// moves to `Durable` only after the final batch was accepted; a failure
+    /// terminalizes intent. Physical sync remains backend lifecycle policy.
     pub fn on_durability(
         &mut self,
         operation: OperationRef,

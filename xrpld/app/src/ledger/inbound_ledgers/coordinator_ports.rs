@@ -169,15 +169,15 @@ impl
 // ─── Write port ─────────────────────────────────────────────────────────────
 
 /// One submitted coordinator write batch retained by a session's persistence
-/// FIFO. A batch carries both its write operation and its durability fence
-/// operation, so one NodeStore submission settles both completions.
+/// FIFO. A batch carries both its write operation and ordered NodeStore
+/// acceptance operation, so one submission settles both completions.
 #[derive(Debug, Clone)]
 struct PersistenceBatch {
     batch: WriteBatch,
 }
 
 /// Per-session persistence FIFO. Exactly one batch is in flight, so a passed
-/// durability fence is ordered after every accepted write of the same session.
+/// acceptance fence is ordered after every accepted write of the same session.
 #[derive(Debug, Default)]
 struct SessionPersistence {
     queued: VecDeque<PersistenceBatch>,
@@ -365,8 +365,8 @@ impl PersistenceWork for CoordinatorPersistenceWork {
                 // One coordinator WriteBatch is one physical NodeStore batch.
                 // Preserve each node's object classification and the verified
                 // ledger sequence while avoiding one backend lock/key-table
-                // transaction per PersistNode. The final durability fence is
-                // still issued only after this whole batch succeeds.
+                // transaction per PersistNode. The final logical acceptance
+                // fence is issued only after this whole batch succeeds.
                 let objects = batch
                     .nodes()
                     .iter()
@@ -387,16 +387,16 @@ impl PersistenceWork for CoordinatorPersistenceWork {
                 match (write_failed, batch.fence()) {
                     (Some(_), Some(_)) => (WriteOutcome::Failed, Some(DurabilityOutcome::Failed)),
                     (Some(_), None) => (WriteOutcome::Failed, None),
-                    (None, Some(_)) => {
-                        let fence = match &node_store {
-                            SHAMapStoreNodeStore::Single(database) => database.sync_result(),
-                            SHAMapStoreNodeStore::Rotating(database) => database.sync_result(),
-                        };
-                        match fence {
-                            Ok(()) => (WriteOutcome::Accepted, Some(DurabilityOutcome::Passed)),
-                            Err(_) => (WriteOutcome::Failed, Some(DurabilityOutcome::Failed)),
-                        }
-                    }
+                    // Rippled's NuDB `sync()` is intentionally a no-op for
+                    // inbound-ledger completion. NodeStore owns checkpoint and
+                    // burst-commit cadence; forcing an fdatasync here serialized
+                    // every acquired ledger behind the global NuDB write lock
+                    // and made warm catch-up slower than ledger close cadence.
+                    // The coordinator fence therefore means the complete batch
+                    // was accepted by NodeStore, matching rippled. Explicit
+                    // snapshot/import/close paths retain their checked physical
+                    // sync barriers.
+                    (None, Some(_)) => (WriteOutcome::Accepted, Some(DurabilityOutcome::Passed)),
                     (None, None) => (WriteOutcome::Accepted, None),
                 }
             };

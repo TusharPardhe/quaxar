@@ -1,12 +1,13 @@
-//! Durable handoff protocol.
+//! NodeStore-accepted handoff protocol.
 //!
 //! A ledger must not be adoptable by validation, LCL installation, publication,
-//! or the normal resolver before the durability fence passes. Once it passes,
-//! the coordinator hands the durable ledger to the LedgerMaster/NetworkOps
-//! adapter as a [`DurableLedger`] with a unique [`DurableHandoffId`]; the
-//! adapter deduplicates by that id so retries cannot duplicate adoption or
-//! publication, and returns a [`DurableHandoffAcknowledgement`] when durable
-//! adoption is confirmed.
+//! or the normal resolver before its final batch is accepted by NodeStore in
+//! order. Once accepted, the coordinator hands the reconstructible ledger to
+//! the LedgerMaster/NetworkOps adapter as a [`DurableLedger`] with a unique
+//! [`DurableHandoffId`]. This is deliberately not a per-ledger fsync guarantee:
+//! rippled treats NodeStore as a cache and reacquires data rolled back after a
+//! crash. The adapter deduplicates by handoff id so retries cannot duplicate
+//! adoption or publication, and acknowledges when adoption is confirmed.
 
 use std::sync::Arc;
 
@@ -15,9 +16,9 @@ use ledger::Ledger;
 use crate::id::DurableHandoffId;
 use crate::identity::SessionRef;
 
-/// A durable, fencing-complete ledger handed from the coordinator to the
-/// LedgerMaster/NetworkOps adapter. The handoff id is unique per session and
-/// deduplicated by the recipient.
+/// An ordered, NodeStore-accepted ledger handed to LedgerMaster/NetworkOps.
+/// Physical sync follows backend lifecycle policy. The handoff id is unique
+/// per session and deduplicated by the recipient.
 #[derive(Debug, Clone)]
 pub struct DurableLedger {
     handoff: DurableHandoffId,

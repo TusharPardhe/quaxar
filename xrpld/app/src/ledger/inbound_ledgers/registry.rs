@@ -1766,9 +1766,8 @@ impl InboundLedgers {
         // channel after its durability fence; `acquire` therefore returns
         // `None` for new coordinator sessions, exactly like rippled. A caller
         // that re-requests a target the coordinator already completed and
-        // consumed may trigger a redundant re-acquisition; this is the same
-        // cost rippled pays and the completed-ledger channel deduplicates the
-        // durable handoff.
+        // consumed is suppressed by the coordinator's retained Complete
+        // tombstone, matching rippled's completed-actor reuse window.
         if self.coordinator_installed() {
             let inner = timed_inner_lock(&self.inner);
             let completed = inner.entries.get(&hash).and_then(|entry| {

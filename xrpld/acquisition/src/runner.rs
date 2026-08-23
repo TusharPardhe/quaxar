@@ -1076,6 +1076,15 @@ impl CoordinatorRunner {
             {
                 self.state.validation_recovery_target = Some(state.target);
             }
+            // Binding an already-existing session changes its scheduler rank.
+            // If every scan slot is occupied (especially by owners waiting on
+            // incremental write completion), no unrelated event is guaranteed
+            // to call `ensure_local_scan_permit` for this newly-exact waiter.
+            // Kick it now so the normal strict-rank boundary logic can reclaim
+            // an idle lower-ranked slot without overlapping physical writes.
+            if self.state.local_scan_waiters.contains(&owner) {
+                self.run_plan_turn(owner, None, effects);
+            }
             return;
         }
 
@@ -1790,26 +1799,45 @@ impl CoordinatorRunner {
             return effects;
         }
 
-        // Rippled retains a failed InboundLedger in its hash registry for one
-        // minute; repeated acquire() calls return that failed actor until the
-        // sweep removes it. Our terminal session retains the same graph for
-        // the same interval, so do not mint a same-hash replacement around it.
+        // Rippled retains completed and failed InboundLedgers in its hash
+        // registry for one minute. Repeated acquire() calls reuse the completed
+        // ledger or return the failed actor until the sweep removes it; neither
+        // path starts a duplicate acquisition. Our terminal session retains
+        // the same graph for that interval, so do not mint a same-hash
+        // replacement around it.
         // An authoritative unbound demand remains latched and is replayed by
         // the TerminalRetention event immediately after the tombstone is reaped.
-        if self.state.sessions.iter().any(|(session, state)| {
-            session.target_hash() == target.hash()
-                && matches!(state.phase, SessionPhase::Failed { .. })
-        }) {
-            if preferred_target || authoritative_recovery_demand {
+        let terminal_same_hash = self.state.sessions.iter().find_map(|(session, state)| {
+            (session.target_hash() == target.hash()
+                && matches!(
+                    state.phase,
+                    SessionPhase::Complete | SessionPhase::Failed { .. }
+                ))
+            .then_some(state.phase.clone())
+        });
+        if let Some(terminal_phase) = terminal_same_hash {
+            // A failed actor did not satisfy the request, so an authoritative
+            // policy demand must retry after its tombstone is swept. A
+            // completed actor already satisfied every same-hash caller;
+            // retaining that call as deferred work would manufacture a stale
+            // duplicate one minute later, unlike rippled's completed reuse.
+            if matches!(terminal_phase, SessionPhase::Failed { .. })
+                && (preferred_target || authoritative_recovery_demand)
+            {
                 self.state.deferred_consensus_acquire = Some(target);
+            }
+            if terminal_phase == SessionPhase::Complete && authoritative_validation_recovery_demand
+            {
+                self.state.validation_recovery_target = None;
+                self.state.validation_recovery_session = None;
             }
             tracing::info!(
                 target: "acquisition_trace",
-                event = "acquire_suppressed_by_failed_tombstone",
+                event = "acquire_suppressed_by_terminal_tombstone",
                 target_hash = %target.hash(),
                 target_seq = ?target.sequence(),
                 ?reason,
-                "acquisition trace: failed same-hash owner retained until terminal sweep"
+                "acquisition trace: terminal same-hash owner retained until terminal sweep"
             );
             return effects;
         }
@@ -2863,7 +2891,15 @@ impl CoordinatorRunner {
         let mut effects = Vec::new();
         match outcome {
             PlanWriteOutcome::IncrementalAccepted => {
-                self.run_plan_turn(session, None, &mut effects)
+                // The physical write is settled, so this is a safe scheduler
+                // boundary equivalent to the end of rippled's JtLedgerData
+                // continuation. Re-run strict priority selection before the
+                // old owner resumes: an exact recovery session may have bound
+                // while this write was in flight. Requeueing preserves the old
+                // graph; only its now-idle scan permit changes hands.
+                if !self.yield_ordinary_scan_to_recovery(session, true, &mut effects) {
+                    self.run_plan_turn(session, None, &mut effects);
+                }
             }
             PlanWriteOutcome::FinalAccepted => {}
             PlanWriteOutcome::Failed(reason) => self.fail_session(session, reason, &mut effects),
@@ -2943,10 +2979,11 @@ impl CoordinatorRunner {
                 }) {
                     self.state.recovery_anchor_target = Some(resolved);
                 }
-                // Persisting -> DurablePending: the durable payload and unique
-                // handoff are now both present, so delivery may be retried
-                // exactly once by handoff identity. It is never
-                // normal-adoptable before this fence.
+                // Persisting -> DurablePending: NodeStore accepted the final
+                // reconstructible payload and the unique handoff is now
+                // present, so delivery may be retried exactly once by handoff
+                // identity. It is never normal-adoptable before this ordered
+                // acceptance fence; physical sync follows backend policy.
                 let handoff = self.state.ids.next_id::<DurableHandoffId>();
                 let Some(session_state) = self.state.sessions.get_mut(&session) else {
                     self.stats.stale_events += 1;
@@ -2969,7 +3006,7 @@ impl CoordinatorRunner {
                     handoff = handoff.get(),
                     ledger_hash = %ledger.header().hash,
                     ledger_seq = ledger.header().seq,
-                    "acquisition trace: final durability fence passed; publishing exact durable handoff"
+                    "acquisition trace: final NodeStore acceptance fence passed; publishing exact handoff"
                 );
                 session_state.pending_handoff = Some(handoff);
                 // The acquisition deadline is no longer meaningful once the
@@ -5919,6 +5956,74 @@ mod tests {
             AcquireReason::Consensus
         );
         assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(5) });
+    }
+
+    #[test]
+    fn completed_hash_is_reused_until_terminal_retention_expires() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let completed = target(6);
+        let session =
+            peer_request_session(&runner.handle_event(AcquisitionEvent::AcquireRequested {
+                target: completed,
+                reason: AcquireReason::Generic,
+            }));
+        runner
+            .state
+            .sessions
+            .get_mut(&session)
+            .expect("completed session")
+            .phase = SessionPhase::Complete;
+        let mut retention_effects = Vec::new();
+        runner.arm_terminal_retention(session, &mut retention_effects);
+        let retention = runner
+            .session(session)
+            .expect("completed tombstone")
+            .pending_timer()
+            .expect("terminal retention timer")
+            .1;
+        let sessions_before = runner.state.sessions.len();
+
+        for event in [
+            AcquisitionEvent::AcquireRequested {
+                target: completed,
+                reason: AcquireReason::Generic,
+            },
+            AcquisitionEvent::ValidationTarget(completed),
+            AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+                completed,
+                AcquireReason::Consensus,
+            )),
+        ] {
+            let effects = runner.handle_event(event);
+            assert!(effects.iter().all(|effect| !matches!(
+                effect,
+                AcquisitionEffect::SessionStarted(_) | AcquisitionEffect::SendLedgerRequest(_)
+            )));
+            assert_eq!(runner.state.sessions.len(), sessions_before);
+        }
+
+        let retained_retry = runner.handle_event(AcquisitionEvent::TimerFired {
+            operation: retention,
+            timer: TimerKind::TerminalRetention,
+        });
+        assert!(runner.session(session).is_none());
+        assert!(
+            retained_retry
+                .iter()
+                .all(|effect| !matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+        assert_eq!(runner.state.validation_recovery_target, None);
+
+        let fresh = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: completed,
+            reason: AcquireReason::Generic,
+        });
+        assert!(
+            fresh
+                .iter()
+                .any(|effect| matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
     }
 
     #[test]
@@ -10801,6 +10906,197 @@ mod tests {
                 .persistence(),
             crate::plan::SessionPersistence::None
         ));
+    }
+
+    #[test]
+    fn incremental_write_completion_reselects_strict_higher_recovery_at_full_capacity() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let sessions = (170..174)
+            .map(|seq| peer_request_session(&acquire_with_effects(&mut runner, seq)))
+            .collect::<Vec<_>>();
+        let lower = &sessions[..3];
+        let recovery = sessions[3];
+        let mut writes = Vec::new();
+
+        for (index, session) in lower.iter().enumerate() {
+            let seq = 170 + index as u32;
+            let state = runner.state.sessions.get_mut(session).expect("lower owner");
+            state.pending_header_read = None;
+            assert!(
+                state.plan.install_engine(Box::new(
+                    ScriptedEngine::new(
+                        TreePlanId::new(u64::from(seq)),
+                        VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                            SHAMapHash::new(Uint256::from(u64::from(seq) + 70_000)),
+                            seq,
+                            SHAMapNodeId::default(),
+                            0,
+                        )])]),
+                        vec![crate::io::PersistNode::new(
+                            SHAMapHash::new(Uint256::from(u64::from(seq) + 80_000)),
+                            bytes::Bytes::from_static(b"accepted-node"),
+                            crate::io::StoredObjectKind::AccountNode,
+                        )],
+                    )
+                    .with_persistence_sequence(seq),
+                ))
+            );
+            runner.state.local_scan_owners.insert(*session);
+            let mut effects = Vec::new();
+            runner.run_plan_turn(*session, None, &mut effects);
+            writes.push(write_batch(&effects));
+        }
+
+        {
+            let state = runner
+                .state
+                .sessions
+                .get_mut(&recovery)
+                .expect("recovery waiter");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(173),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(90_173)),
+                    173,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+        }
+        runner.state.validation_recovery_session = Some(recovery);
+        runner.state.local_scan_waiters.push_back(recovery);
+        assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
+
+        let effects = runner.handle_event(AcquisitionEvent::WriteCompleted(WriteCompletion::new(
+            writes[0].operation(),
+            WriteOutcome::Accepted,
+        )));
+
+        assert!(runner.state.local_scan_owners.contains(&recovery));
+        assert!(!runner.state.local_scan_owners.contains(&lower[0]));
+        assert!(runner.state.local_scan_waiters.contains(&lower[0]));
+        assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
+        assert!(read_effects(&effects).iter().any(|read| {
+            read.operation().session() == recovery && read.priority() == ReadPriority::Consensus
+        }));
+        assert!(
+            read_effects(&effects)
+                .iter()
+                .all(|read| read.operation().session() != lower[0])
+        );
+        assert!(writes[1..].iter().all(|write| matches!(
+            runner
+                .session(write.operation().session())
+                .expect("unrelated lower owner")
+                .plan()
+                .persistence(),
+            crate::plan::SessionPersistence::IncrementalWritePending { .. }
+        )));
+    }
+
+    #[test]
+    fn binding_existing_validation_recovery_waiter_reclaims_pending_lower_writer() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let sessions = (180..184)
+            .map(|seq| peer_request_session(&acquire_with_effects(&mut runner, seq)))
+            .collect::<Vec<_>>();
+        let lower = &sessions[..3];
+        let recovery = sessions[3];
+
+        for (index, session) in lower.iter().enumerate() {
+            let seq = 180 + index as u32;
+            let state = runner.state.sessions.get_mut(session).expect("lower owner");
+            state.pending_header_read = None;
+            assert!(
+                state.plan.install_engine(Box::new(
+                    ScriptedEngine::new(
+                        TreePlanId::new(u64::from(seq)),
+                        VecDeque::from([ScriptedStep::NeedsNetwork(vec![(
+                            SHAMapNodeId::default(),
+                            Uint256::from(u64::from(seq) + 100_000),
+                        )])]),
+                        vec![crate::io::PersistNode::new(
+                            SHAMapHash::new(Uint256::from(u64::from(seq) + 110_000)),
+                            bytes::Bytes::from_static(b"accepted-node"),
+                            crate::io::StoredObjectKind::AccountNode,
+                        )],
+                    )
+                    .with_persistence_sequence(seq),
+                ))
+            );
+            runner.state.local_scan_owners.insert(*session);
+            let mut effects = Vec::new();
+            runner.run_plan_turn(*session, None, &mut effects);
+            assert!(effects.iter().any(|effect| matches!(
+                effect,
+                AcquisitionEffect::SubmitWrite(write)
+                    if write.operation().session() == *session
+            )));
+        }
+
+        {
+            let state = runner
+                .state
+                .sessions
+                .get_mut(&recovery)
+                .expect("existing waiter");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(183),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(120_183)),
+                    183,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+        }
+        runner.state.local_scan_waiters.push_back(recovery);
+        assert_eq!(runner.state.validation_recovery_session, None);
+        assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
+
+        let effects = runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(
+            target(183),
+        )));
+
+        assert_eq!(runner.state.validation_recovery_session, Some(recovery));
+        assert!(runner.state.local_scan_owners.contains(&recovery));
+        assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
+        assert_eq!(
+            lower
+                .iter()
+                .filter(|session| runner.state.local_scan_owners.contains(session))
+                .count(),
+            MAX_LOCAL_SCAN_OWNERS - 1
+        );
+        assert!(read_effects(&effects).iter().any(|read| {
+            read.operation().session() == recovery && read.priority() == ReadPriority::Consensus
+        }));
+        for session in lower {
+            assert!(matches!(
+                runner
+                    .session(*session)
+                    .expect("lower writer")
+                    .plan()
+                    .persistence(),
+                crate::plan::SessionPersistence::IncrementalWritePending { .. }
+            ));
+        }
     }
 
     #[test]
