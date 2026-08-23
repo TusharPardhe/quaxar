@@ -32,6 +32,11 @@ pub const NUDB_DATA_FILE_HEADER_SIZE: usize = 92;
 /// Max buckets to keep in the in-memory bucket cache.
 /// Each bucket is ~4KB; 4096 entries = ~16MB. Prevents OOM on large NuDB.
 const MAX_BUCKET_CACHE_ENTRIES: usize = 4096;
+/// Bound synchronous c0/c1 commits until the native NuDB asynchronous writer
+/// pool is implemented. The configured 40,000 burst is a rate/burst hint in
+/// reference NuDB, not permission to hold the foreground mutation fence while
+/// logging and flushing 40,000 objects at once.
+const MAX_SYNCHRONOUS_BURST_WRITES: usize = 1024;
 
 #[cfg(test)]
 fn evict_one_cached_bucket<V>(bucket_cache: &DashMap<u32, V>) {
@@ -1374,7 +1379,10 @@ impl NuDbBackend {
     }
 
     fn burst_commit_limit(&self) -> usize {
-        self.config.burst_size.max(1)
+        self.config
+            .burst_size
+            .max(1)
+            .min(MAX_SYNCHRONOUS_BURST_WRITES)
     }
 
     fn fail_stop_error(&self) -> Option<String> {
@@ -3608,6 +3616,32 @@ mod tests {
             format!("object-{sequence}").into_bytes(),
             Uint256::from_array(hash),
         ))
+    }
+
+    #[test]
+    fn nudb_synchronous_burst_commit_limit_is_bounded_without_raising_small_configs() {
+        let large = TempDir::new().expect("large tempdir");
+        let large_backend = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(large.path()),
+            40_000,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("large backend");
+        assert_eq!(
+            large_backend.burst_commit_limit(),
+            super::MAX_SYNCHRONOUS_BURST_WRITES
+        );
+
+        let small = TempDir::new().expect("small tempdir");
+        let small_backend = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(small.path()),
+            64,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("small backend");
+        assert_eq!(small_backend.burst_commit_limit(), 64);
     }
 
     #[test]
