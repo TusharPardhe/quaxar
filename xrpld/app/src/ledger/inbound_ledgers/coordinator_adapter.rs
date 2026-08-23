@@ -568,20 +568,26 @@ where
         self.dispatch(&effects);
     }
 
-    /// Advance one bounded owner-loop slice. Control/completion facts always
-    /// run first, then packet ingress gets a bounded turn; neither queue is
-    /// drained to empty so continuous traffic cannot monopolize the owner.
+    /// Advance one bounded owner-loop slice. Control/completion facts run
+    /// first except that an acquisition deadline gives already-admitted
+    /// packets their bounded turn before evaluating progress. Neither queue
+    /// is drained without a fixed bound, so continuous traffic cannot
+    /// monopolize the owner.
     /// Returns the number of facts handled.
     pub(crate) fn drain(&mut self) -> usize {
         let mut handled = 0;
+        let mut control_handled = 0;
+        let mut packets_handled = 0;
+        let mut packet_limited = false;
         let started = std::time::Instant::now();
         let mut control_limited = false;
         // Bootstrap an empty control lane from one producer. Subsequent free
         // slots rotate producers, preventing continuous read traffic from
         // indefinitely hiding write/fence and timer lifecycle facts.
         self.flush_next_completion_source();
-        while handled < CONTROL_EVENTS_PER_DRAIN {
-            if !cfg!(test) && handled != 0 && started.elapsed() >= CONTROL_DRAIN_TIME_SLICE {
+        while control_handled < CONTROL_EVENTS_PER_DRAIN {
+            if !cfg!(test) && control_handled != 0 && started.elapsed() >= CONTROL_DRAIN_TIME_SLICE
+            {
                 control_limited = true;
                 break;
             }
@@ -618,28 +624,56 @@ where
                     }
                 }
                 handled += completions.len();
+                control_handled += completions.len();
                 self.handle_read_batch(completions);
                 self.flush_next_completion_source();
                 continue;
             }
+            if matches!(
+                &event,
+                AcquisitionEvent::TimerFired {
+                    timer: acquisition::TimerKind::AcquireTimeout,
+                    ..
+                }
+            ) {
+                // Ledger-data jobs admitted before this deadline must have an
+                // opportunity to publish useful-node progress before the
+                // timeout consumes a no-progress interval. The two bounded
+                // channels cannot otherwise preserve rippled's serialized
+                // ledger-data/timer ordering. Keep every other control fact
+                // ahead of packet ingress.
+                let drained = self.drain_packet_events(PACKET_INGRESS_QUEUE_CAPACITY);
+                handled += drained;
+                packets_handled += drained;
+                packet_limited |= drained == PACKET_INGRESS_QUEUE_CAPACITY;
+            }
             handled += 1;
+            control_handled += 1;
             self.handle_fact(event);
             self.flush_next_completion_source();
         }
         self.flush_next_completion_source();
-        let mut packets_handled = 0;
-        for _ in 0..PACKET_EVENTS_PER_DRAIN {
+        let packet_tail = PACKET_EVENTS_PER_DRAIN
+            .min(PACKET_INGRESS_QUEUE_CAPACITY.saturating_sub(packets_handled));
+        let drained = self.drain_packet_events(packet_tail);
+        handled += drained;
+        packet_limited |= packet_tail != 0 && drained == packet_tail;
+        self.last_drain_has_more = control_limited
+            || control_handled >= CONTROL_EVENTS_PER_DRAIN
+            || packet_limited
+            || self.pending_control_event.is_some();
+        handled
+    }
+
+    fn drain_packet_events(&mut self, limit: usize) -> usize {
+        let mut handled = 0;
+        for _ in 0..limit {
             let Ok(event) = self.packet_rx.try_recv() else {
                 break;
             };
             handled += 1;
-            packets_handled += 1;
             self.handle_fact(event);
         }
-        self.last_drain_has_more = control_limited
-            || handled.saturating_sub(packets_handled) >= CONTROL_EVENTS_PER_DRAIN
-            || packets_handled == PACKET_EVENTS_PER_DRAIN
-            || self.pending_control_event.is_some();
         handled
     }
 
@@ -1608,6 +1642,56 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct UsefulPacketSeed;
+
+    impl PlanSeed for UsefulPacketSeed {
+        fn build(
+            &mut self,
+            _session: SessionRef,
+            _header: &ledger::InboundLedgerPacket,
+        ) -> Option<Box<dyn TreeEngine + Send + Sync>> {
+            Some(Box::new(ScriptedEngine::new(
+                TreePlanId::new(1),
+                [ScriptedStep::NeedsNetwork(vec![(
+                    SHAMapNodeId::default(),
+                    Uint256::from(0x9001),
+                )])],
+                Vec::new(),
+            )))
+        }
+    }
+
+    fn adapter_with_useful_packet_seed() -> (TestAdapter, Arc<FetchPackCache>) {
+        let cache = fetch_pack();
+        let runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            BudgetState::default(),
+            Box::new(UsefulPacketSeed),
+        );
+        let (tx, rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let (packet_tx, packet_rx) = mpsc::sync_channel(PACKET_INGRESS_QUEUE_CAPACITY);
+        (
+            TestAdapter::with_event_channel(
+                runner,
+                ShadowConfig::disabled(),
+                FakeLedgerRequestPort::new(),
+                FakeReadPort::new(),
+                FakeWritePort::new(),
+                FakeTimerPort::new(),
+                FakeHandoffPort::new(),
+                FakePhasePort::new(),
+                FakeCancellationPort::new(),
+                Arc::clone(&cache),
+                tx,
+                rx,
+                packet_tx,
+                packet_rx,
+            ),
+            cache,
+        )
+    }
+
     #[test]
     fn write_completion_reaches_incremental_plan_before_retained_reads_drain() {
         let cache = fetch_pack();
@@ -2426,6 +2510,210 @@ mod tests {
             adapter.take_terminal_failures().is_empty(),
             "draining terminal failures must not repeatedly extend the cooldown"
         );
+    }
+
+    fn advance_to_seventh_timeout(adapter: &mut TestAdapter) -> (SessionRef, OperationRef) {
+        adapter.connectivity(&[1]);
+        let started = adapter.acquire_requested(target(9, SEQ), AcquireReason::Generic);
+        let session = started
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("acquisition starts a session");
+        let mut timeout = started
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::ArmTimer(request)
+                    if request.timer() == TimerKind::AcquireTimeout =>
+                {
+                    Some(request.operation())
+                }
+                _ => None,
+            })
+            .expect("acquisition arms its timeout");
+        settle_initial_header_miss(adapter, &started);
+        for _ in 0..6 {
+            timeout = adapter
+                .handle_fact(AcquisitionEvent::TimerFired {
+                    operation: timeout,
+                    timer: TimerKind::AcquireTimeout,
+                })
+                .iter()
+                .find_map(|effect| match effect {
+                    AcquisitionEffect::ArmTimer(request)
+                        if request.timer() == TimerKind::AcquireTimeout =>
+                    {
+                        Some(request.operation())
+                    }
+                    _ => None,
+                })
+                .expect("sixth no-progress timeout still rearms");
+        }
+        assert_eq!(
+            adapter.runner.session(session).unwrap().plan().timeouts(),
+            6
+        );
+        (session, timeout)
+    }
+
+    #[test]
+    fn acquire_timeout_drains_all_admitted_packets_before_consuming_interval() {
+        let (mut adapter, _cache) = adapter_with_useful_packet_seed();
+        let (session, timeout) = advance_to_seventh_timeout(&mut adapter);
+        let node_id = SHAMapNodeId::default().get_raw_string().to_vec();
+        let ordinary = wire_ledger_data(
+            Uint256::from(9),
+            2,
+            vec![(Some(node_id), valid_inner_wire())],
+        );
+        for _ in 0..PACKET_EVENTS_PER_DRAIN {
+            assert_eq!(
+                adapter.route_ledger_data(1, &ordinary),
+                LedgerDataIngressDisposition::Delivered
+            );
+        }
+        assert_eq!(
+            adapter.route_ledger_data(
+                1,
+                &wire_ledger_data(Uint256::from(9), 0, vec![(None, base_root_wire())]),
+            ),
+            LedgerDataIngressDisposition::Delivered
+        );
+        adapter.push(AcquisitionEvent::TimerFired {
+            operation: timeout,
+            timer: TimerKind::AcquireTimeout,
+        });
+
+        assert_eq!(adapter.drain(), PACKET_EVENTS_PER_DRAIN + 2);
+        let live = adapter
+            .runner
+            .session(session)
+            .expect("useful packet keeps session live");
+        assert_eq!(
+            live.plan().timeouts(),
+            6,
+            "the useful packet beyond the ordinary packet slice resets deadline progress"
+        );
+    }
+
+    #[test]
+    fn acquire_timeout_after_only_non_useful_packets_still_terminalizes() {
+        let (mut adapter, _cache) = adapter_with_useful_packet_seed();
+        adapter.connectivity(&[1]);
+        let started = adapter.acquire_requested(target(9, SEQ), AcquireReason::Generic);
+        let session = started
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("acquisition starts a session");
+        let mut timeout = started
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::ArmTimer(request)
+                    if request.timer() == TimerKind::AcquireTimeout =>
+                {
+                    Some(request.operation())
+                }
+                _ => None,
+            })
+            .expect("acquisition arms its timeout");
+        settle_initial_header_miss(&mut adapter, &started);
+        let base = wire_ledger_data(Uint256::from(9), 0, vec![(None, base_root_wire())]);
+        assert_eq!(
+            adapter.route_ledger_data(1, &base),
+            LedgerDataIngressDisposition::Delivered
+        );
+        assert_eq!(adapter.drain(), 1, "the first Base packet seeds the plan");
+        timeout = adapter
+            .handle_fact(AcquisitionEvent::TimerFired {
+                operation: timeout,
+                timer: TimerKind::AcquireTimeout,
+            })
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::ArmTimer(request)
+                    if request.timer() == TimerKind::AcquireTimeout =>
+                {
+                    Some(request.operation())
+                }
+                _ => None,
+            })
+            .expect("seed progress rearms without consuming timeout budget");
+        assert_eq!(
+            adapter.runner.session(session).unwrap().plan().timeouts(),
+            0
+        );
+        for expected in 1..=6 {
+            let effects = adapter.handle_fact(AcquisitionEvent::TimerFired {
+                operation: timeout,
+                timer: TimerKind::AcquireTimeout,
+            });
+            timeout = effects
+                .iter()
+                .find_map(|effect| match effect {
+                    AcquisitionEffect::ArmTimer(request)
+                        if request.timer() == TimerKind::AcquireTimeout =>
+                    {
+                        Some(request.operation())
+                    }
+                    _ => None,
+                })
+                .expect("six no-progress intervals remain recoverable");
+            let recovery_reads = effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    AcquisitionEffect::SubmitRead(request) => Some(request.operation()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for operation in recovery_reads {
+                adapter.handle_fact(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+                    operation,
+                    ReadOutcome::Settled { node: None },
+                )));
+            }
+            assert_eq!(
+                adapter.runner.session(session).unwrap().plan().timeouts(),
+                expected
+            );
+        }
+
+        let node_id = SHAMapNodeId::default().get_raw_string().to_vec();
+        let non_useful = wire_ledger_data(
+            Uint256::from(9),
+            2,
+            vec![(Some(node_id), valid_inner_wire())],
+        );
+        // The valid wire node does not match the retained 0x9001 hash, so it
+        // is admitted but does not earn useful-node progress.
+        for _ in 0..=PACKET_EVENTS_PER_DRAIN {
+            assert_eq!(
+                adapter.route_ledger_data(1, &non_useful),
+                LedgerDataIngressDisposition::Delivered
+            );
+        }
+        adapter.push(AcquisitionEvent::TimerFired {
+            operation: timeout,
+            timer: TimerKind::AcquireTimeout,
+        });
+
+        assert_eq!(adapter.drain(), PACKET_EVENTS_PER_DRAIN + 2);
+        let failed = adapter
+            .runner
+            .session(session)
+            .expect("failed session retained");
+        assert_eq!(failed.plan().timeouts(), 7);
+        assert!(matches!(
+            failed.phase(),
+            SessionPhase::Failed {
+                reason: acquisition::FailureReason::AcquisitionTimeout
+            }
+        ));
+        assert_eq!(adapter.cancellations.cancelled, vec![session]);
     }
 
     #[test]
