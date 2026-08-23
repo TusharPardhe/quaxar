@@ -40,6 +40,13 @@ pub trait SHAMapStoreTransactionCacheRuntime: Send + Sync {
 pub trait SHAMapStoreNodeStoreRuntime: Send + Sync {
     fn fetch_node_object(&self, hash: &Uint256, ledger_seq: u32) -> bool;
 
+    fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
+        Ok(hashes
+            .iter()
+            .filter(|hash| self.fetch_node_object(hash, 0))
+            .count())
+    }
+
     /// Enable archive-read copy-forward for the rotation exposure window.
     fn set_rotation_in_flight(&self, _in_flight: bool) {}
 
@@ -265,13 +272,15 @@ impl SHAMapStoreAppRuntime {
         (self.background_starts, self.background_stops)
     }
 
-    fn freshen_keys(&self, keys: impl IntoIterator<Item = Uint256>) {
-        for hash in keys {
-            let _ = self.node_store.fetch_node_object(&hash, 0);
+    fn freshen_keys(&self, keys: impl IntoIterator<Item = Uint256>) -> Result<(), String> {
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        for batch in keys.chunks(crate::shamap::shamap_store_copy::SHAMAP_STORE_COPY_BATCH_SIZE) {
+            self.node_store.copy_to_writable_batch(batch)?;
             if self.stopping {
-                return;
+                return Ok(());
             }
         }
+        Ok(())
     }
 }
 
@@ -354,11 +363,11 @@ impl SHAMapStoreComponentRuntime for SHAMapStoreAppRuntime {
     }
 
     fn freshen_caches(&mut self) -> Result<(), String> {
-        self.freshen_keys(self.node_family.tree_node_cache_keys());
+        self.freshen_keys(self.node_family.tree_node_cache_keys())?;
         if self.stopping {
             return Ok(());
         }
-        self.freshen_keys(self.transaction_master.cache_keys());
+        self.freshen_keys(self.transaction_master.cache_keys())?;
         Ok(())
     }
 
@@ -446,6 +455,10 @@ where
 
     fn set_rotation_in_flight(&self, in_flight: bool) {
         nodestore::DatabaseRotating::set_rotation_in_flight(self, in_flight);
+    }
+
+    fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
+        nodestore::DatabaseRotating::copy_to_writable_batch(self, hashes)
     }
 
     fn rotate_with(&self, new_backend: Box<dyn Backend>) -> (String, String) {
@@ -541,6 +554,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingNodeStoreRuntime {
         fetches: Mutex<Vec<Uint256>>,
+        batches: Mutex<Vec<usize>>,
         rotations: Mutex<Vec<String>>,
     }
 
@@ -551,6 +565,17 @@ mod tests {
                 .expect("fetches mutex must not be poisoned")
                 .push(*hash);
             true
+        }
+
+        fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
+            self.batches
+                .lock()
+                .expect("batches mutex must not be poisoned")
+                .push(hashes.len());
+            for hash in hashes {
+                self.fetch_node_object(hash, 0);
+            }
+            Ok(hashes.len())
         }
 
         fn set_rotation_in_flight(&self, in_flight: bool) {
@@ -704,6 +729,13 @@ mod tests {
                 Uint256::from_array([0x22; 32]),
                 Uint256::from_array([0x33; 32]),
             ]
+        );
+        assert_eq!(
+            *node_store
+                .batches
+                .lock()
+                .expect("batches mutex must not be poisoned"),
+            vec![2, 1]
         );
         assert_eq!(
             *ledger

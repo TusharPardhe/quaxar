@@ -594,18 +594,6 @@ fn nudb_crash_recovery_matrix_truncates_key_buckets_created_after_checkpoint_spl
             > checkpoint_key_size,
         "workload should create key buckets after the checkpoint"
     );
-    let current_key_size = std::fs::metadata(path.join("nudb.key"))
-        .expect("key metadata after split")
-        .len();
-    let mut log = OpenOptions::new()
-        .write(true)
-        .open(path.join("nudb.log"))
-        .expect("open log for legacy key size mutation");
-    log.seek(SeekFrom::Start(46))
-        .expect("seek log key_file_size");
-    log.write_all(&current_key_size.to_be_bytes())
-        .expect("write legacy enlarged key_file_size");
-    log.sync_all().expect("sync mutated log");
     drop(backend);
 
     let reopened = NuDbBackend::new(

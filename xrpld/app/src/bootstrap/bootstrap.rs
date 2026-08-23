@@ -250,6 +250,10 @@ impl crate::SHAMapStoreNodeStoreRuntime for BootstrapRotatingNodeStoreRuntime {
         .is_some()
     }
 
+    fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
+        self.database.copy_to_writable_batch(hashes)
+    }
+
     fn set_rotation_in_flight(&self, in_flight: bool) {
         self.database.set_rotation_in_flight(in_flight);
         if in_flight {

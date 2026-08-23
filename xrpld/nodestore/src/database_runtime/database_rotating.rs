@@ -14,7 +14,75 @@ use protocol::JsonValue;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+
+#[derive(Default)]
+struct WritePriorityState {
+    foreground_waiting: usize,
+    foreground_active: usize,
+    maintenance_active: bool,
+}
+
+#[derive(Default)]
+struct WritePriorityGate {
+    state: Mutex<WritePriorityState>,
+    changed: Condvar,
+}
+
+enum WritePriorityKind {
+    Foreground,
+    Maintenance,
+}
+
+struct WritePriorityGuard<'a> {
+    gate: &'a WritePriorityGate,
+    kind: WritePriorityKind,
+}
+
+impl WritePriorityGate {
+    fn foreground(&self) -> WritePriorityGuard<'_> {
+        let mut state = self.state.lock().expect("write priority mutex");
+        state.foreground_waiting += 1;
+        self.changed.notify_all();
+        while state.maintenance_active {
+            state = self.changed.wait(state).expect("write priority wait");
+        }
+        state.foreground_waiting -= 1;
+        state.foreground_active += 1;
+        WritePriorityGuard {
+            gate: self,
+            kind: WritePriorityKind::Foreground,
+        }
+    }
+
+    fn maintenance(&self) -> WritePriorityGuard<'_> {
+        let mut state = self.state.lock().expect("write priority mutex");
+        while state.maintenance_active
+            || state.foreground_active != 0
+            || state.foreground_waiting != 0
+        {
+            state = self.changed.wait(state).expect("write priority wait");
+        }
+        state.maintenance_active = true;
+        WritePriorityGuard {
+            gate: self,
+            kind: WritePriorityKind::Maintenance,
+        }
+    }
+}
+
+impl Drop for WritePriorityGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().expect("write priority mutex");
+        match self.kind {
+            WritePriorityKind::Foreground => {
+                state.foreground_active = state.foreground_active.saturating_sub(1);
+            }
+            WritePriorityKind::Maintenance => state.maintenance_active = false,
+        }
+        self.gate.changed.notify_all();
+    }
+}
 
 struct RotatingState {
     writable_backend: Arc<dyn Backend>,
@@ -113,6 +181,7 @@ struct DatabaseRotatingCore {
     // take_copy_forward_count(). The field exists to keep the handle alive.
     #[allow(dead_code)]
     copy_forward_count: Arc<std::sync::atomic::AtomicU64>,
+    write_priority: Arc<WritePriorityGate>,
 }
 
 impl DatabaseRotatingCore {
@@ -182,6 +251,18 @@ impl DatabaseDelegate for DatabaseRotatingCore {
         if node_object.is_none() {
             node_object = fetch(&archive);
             if let Some(node_object_ref) = &node_object {
+                let copy_forward = !duplicate
+                    && self
+                        .rotation_in_flight
+                        .load(std::sync::atomic::Ordering::Acquire);
+                if !(duplicate || copy_forward) {
+                    fetch_report.was_found = true;
+                    return node_object;
+                }
+                // Archive copy-forward is maintenance traffic. Once a
+                // foreground consensus writer queues, allow at most this one
+                // already-admitted object before yielding the write path.
+                let _maintenance = self.write_priority.maintenance();
                 let state = self
                     .state
                     .lock()
@@ -189,26 +270,17 @@ impl DatabaseDelegate for DatabaseRotatingCore {
                 writable = Arc::clone(&state.writable_backend);
                 drop(state);
 
-                if duplicate && let Err(error) = writable.store(Arc::clone(node_object_ref)) {
-                    tracing::error!(target: "nodestore", %error, hash = %hash, "Failed to copy archive node into writable backend");
-                    journal.log(JournalLevel::Error, &error);
-                    panic!("failed to copy archive node into writable backend: {error}");
-                }
                 // While rotation is in flight, copy archive-served reads
                 // forward into the writable backend. The archive is about
                 // to be deleted; without this, a node canonicalized into
                 // the cache after the freshen snapshot would survive only
                 // in RAM once the archive is dropped.
-                if !duplicate
-                    && self
-                        .rotation_in_flight
-                        .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    if let Err(error) = writable.store(Arc::clone(node_object_ref)) {
-                        tracing::error!(target: "nodestore", %error, hash = %hash, "Failed to copy archive node into writable backend");
-                        journal.log(JournalLevel::Error, &error);
-                        panic!("failed to copy archive node into writable backend: {error}");
-                    }
+                if let Err(error) = writable.store(Arc::clone(node_object_ref)) {
+                    tracing::error!(target: "nodestore", %error, hash = %hash, "Failed to copy archive node into writable backend");
+                    journal.log(JournalLevel::Error, &error);
+                    panic!("failed to copy archive node into writable backend: {error}");
+                }
+                if copy_forward {
                     self.copy_forward_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -229,6 +301,7 @@ pub struct DatabaseRotatingImp {
     fd_required: i32,
     rotation_in_flight: Arc<std::sync::atomic::AtomicBool>,
     copy_forward_count: Arc<std::sync::atomic::AtomicU64>,
+    write_priority: Arc<WritePriorityGate>,
 }
 
 impl Drop for DatabaseRotatingImp {
@@ -253,11 +326,13 @@ impl DatabaseRotatingImp {
         }));
         let rotation_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let copy_forward_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let write_priority = Arc::new(WritePriorityGate::default());
         let database = DatabaseRuntime::new(
             Arc::new(DatabaseRotatingCore {
                 state: Arc::clone(&state),
                 rotation_in_flight: Arc::clone(&rotation_in_flight),
                 copy_forward_count: Arc::clone(&copy_forward_count),
+                write_priority: Arc::clone(&write_priority),
             }),
             scheduler,
             read_threads,
@@ -272,6 +347,7 @@ impl DatabaseRotatingImp {
             fd_required,
             rotation_in_flight,
             copy_forward_count,
+            write_priority,
         }))
     }
 
@@ -402,6 +478,7 @@ impl DatabaseRotatingImp {
         _ledger_seq: u32,
     ) -> Result<(), String> {
         let node_object = NodeObject::create_object(object_type, data, hash);
+        let _foreground = self.write_priority.foreground();
         let backend = {
             let state = self
                 .state
@@ -433,6 +510,7 @@ impl DatabaseRotatingImp {
                     .then(|| NodeObject::create_object(object_type, data, hash))
             })
             .collect::<crate::Batch>();
+        let _foreground = self.write_priority.foreground();
         // Hold the rotating generation fence until the checked write and all
         // post-store bookkeeping complete. Online deletion must not swap and
         // retire this writable backend between durable success and cache
@@ -459,6 +537,73 @@ impl DatabaseRotatingImp {
         }
         drop(state);
         Ok(())
+    }
+
+    /// Copy archive-only objects into the current writable backend using one
+    /// checked, generation-fenced maintenance batch. Reads happen outside the
+    /// priority gate so a slow archive lookup cannot delay consensus writes;
+    /// only the bounded durable mutation is ordered behind foreground work.
+    pub fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+
+        let mut unique = BTreeSet::new();
+        let hashes = hashes
+            .iter()
+            .copied()
+            .filter(|hash| unique.insert(*hash))
+            .collect::<Vec<_>>();
+        let (writable, archive) = {
+            let state = self
+                .state
+                .lock()
+                .expect("rotating backend mutex must not be poisoned");
+            (
+                Arc::clone(&state.writable_backend),
+                Arc::clone(&state.archive_backend),
+            )
+        };
+
+        let (writable_objects, writable_status) = writable.fetch_batch(&hashes);
+        check_copy_fetch_status("writable", writable_status)?;
+        if writable_objects.len() != hashes.len() {
+            return Err("writable backend returned a malformed copy batch".to_owned());
+        }
+        let missing = hashes
+            .iter()
+            .zip(writable_objects.iter())
+            .filter_map(|(hash, object)| object.is_none().then_some(*hash))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+
+        let (archive_objects, archive_status) = archive.fetch_batch(&missing);
+        check_copy_fetch_status("archive", archive_status)?;
+        if archive_objects.len() != missing.len() {
+            return Err("archive backend returned a malformed copy batch".to_owned());
+        }
+        let batch = archive_objects
+            .into_iter()
+            .flatten()
+            .collect::<crate::Batch>();
+        if batch.is_empty() {
+            return Ok(0);
+        }
+
+        let copied = batch.len();
+        let _maintenance = self.write_priority.maintenance();
+        // Refresh the writable pointer after archive reads and retain the
+        // rotating generation fence through durable completion. A concurrent
+        // direct rotate may have changed the pairing while reads were active.
+        let state = self
+            .state
+            .lock()
+            .expect("rotating backend mutex must not be poisoned");
+        state.writable_backend.store_batch_result(&batch)?;
+        drop(state);
+        Ok(copied)
     }
 
     pub fn fetch_node_object(
@@ -686,8 +831,21 @@ impl DatabaseRotatingTrait for DatabaseRotatingImp {
         DatabaseRotatingImp::set_rotation_in_flight(self, in_flight);
     }
 
+    fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
+        DatabaseRotatingImp::copy_to_writable_batch(self, hashes)
+    }
+
     fn rotate(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str)) {
         self.rotate_impl(new_backend, callback);
+    }
+}
+
+fn check_copy_fetch_status(role: &str, status: Status) -> Result<(), String> {
+    match status {
+        Status::Ok | Status::NotFound => Ok(()),
+        other => Err(format!(
+            "{role} backend failed archive-copy batch fetch: {other:?}"
+        )),
     }
 }
 
@@ -703,7 +861,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::DatabaseRotatingImp;
+    use super::{DatabaseRotatingImp, WritePriorityGate};
     use crate::{
         Backend, Database, DummyScheduler, FetchType, NodeObject, NodeObjectType, NullJournal,
         Status,
@@ -746,6 +904,7 @@ mod tests {
         name: String,
         delete_path_called: AtomicBool,
         store_count: AtomicUsize,
+        batch_count: AtomicUsize,
         objects: Mutex<BTreeMap<Uint256, Arc<NodeObject>>>,
         batch_gate: Option<Arc<BatchGate>>,
     }
@@ -758,6 +917,7 @@ mod tests {
                 name: name.to_owned(),
                 delete_path_called: AtomicBool::new(false),
                 store_count: AtomicUsize::new(0),
+                batch_count: AtomicUsize::new(0),
                 objects: Mutex::new(BTreeMap::new()),
                 batch_gate: None,
             }
@@ -825,6 +985,7 @@ mod tests {
         }
 
         fn store_batch_result(&self, batch: &crate::Batch) -> Result<(), String> {
+            self.batch_count.fetch_add(1, Ordering::Relaxed);
             if let Some(gate) = &self.batch_gate {
                 gate.block_batch();
             }
@@ -1179,5 +1340,87 @@ mod tests {
         assert_eq!(database.get_store_count(), 1);
         assert_eq!(database.get_store_size(), 2);
         database.stop();
+    }
+
+    #[test]
+    fn archive_copy_batch_is_checked_bounded_and_skips_writable_hits() {
+        let writable = Arc::new(TestBackend::new("writable"));
+        let archive = Arc::new(TestBackend::new("archive"));
+        let already_writable = sample_object(0x71);
+        let archive_only = sample_object(0x72);
+        writable
+            .store(Arc::clone(&already_writable))
+            .expect("seed writable");
+        archive
+            .store(Arc::clone(&archive_only))
+            .expect("seed archive");
+        let database = DatabaseRotatingImp::new(
+            Arc::new(DummyScheduler),
+            1,
+            Arc::clone(&writable) as Arc<dyn Backend>,
+            Arc::clone(&archive) as Arc<dyn Backend>,
+            &config(),
+            Arc::new(NullJournal),
+        )
+        .expect("rotating database");
+
+        let missing = Uint256::from_array([0x73; 32]);
+        let copied = database
+            .copy_to_writable_batch(&[
+                *already_writable.hash(),
+                *archive_only.hash(),
+                *archive_only.hash(),
+                missing,
+            ])
+            .expect("checked archive copy");
+
+        assert_eq!(copied, 1);
+        assert_eq!(writable.batch_count.load(Ordering::Relaxed), 1);
+        assert!(writable.fetch(archive_only.hash()).0.is_some());
+        database.stop();
+    }
+
+    #[test]
+    fn queued_foreground_writer_precedes_next_maintenance_batch() {
+        let gate = Arc::new(WritePriorityGate::default());
+        let first_maintenance = gate.maintenance();
+
+        let (foreground_acquired_tx, foreground_acquired_rx) = std::sync::mpsc::channel();
+        let (release_foreground_tx, release_foreground_rx) = std::sync::mpsc::channel();
+        let foreground_gate = Arc::clone(&gate);
+        let foreground = std::thread::spawn(move || {
+            let _guard = foreground_gate.foreground();
+            foreground_acquired_tx.send(()).expect("signal foreground");
+            release_foreground_rx.recv().expect("release foreground");
+        });
+
+        {
+            let mut state = gate.state.lock().expect("priority state");
+            while state.foreground_waiting == 0 {
+                state = gate.changed.wait(state).expect("priority wait");
+            }
+        }
+
+        let (maintenance_acquired_tx, maintenance_acquired_rx) = std::sync::mpsc::channel();
+        let maintenance_gate = Arc::clone(&gate);
+        let maintenance = std::thread::spawn(move || {
+            let _guard = maintenance_gate.maintenance();
+            maintenance_acquired_tx
+                .send(())
+                .expect("signal maintenance");
+        });
+
+        drop(first_maintenance);
+        foreground_acquired_rx.recv().expect("foreground admitted");
+        assert!(
+            maintenance_acquired_rx.try_recv().is_err(),
+            "maintenance must yield while a foreground writer is queued or active"
+        );
+        release_foreground_tx.send(()).expect("release foreground");
+        foreground.join().expect("foreground thread");
+        maintenance_acquired_rx
+            .recv()
+            .expect("maintenance admitted");
+        maintenance.join().expect("maintenance thread");
     }
 }

@@ -233,6 +233,14 @@ pub trait DatabaseRotating: Database {
     /// window, from cache freshening until `rotate` returns.
     fn set_rotation_in_flight(&self, in_flight: bool);
 
+    /// Copy archive-resident objects into the current writable generation as
+    /// one bounded maintenance batch. Implementations must complete the write
+    /// synchronously before returning so online deletion can safely rotate the
+    /// archive afterward. The return value is the number of archive objects
+    /// submitted to the writable backend; hashes already present there and
+    /// hashes missing from both backends are not counted.
+    fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String>;
+
     fn rotate(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str));
 }
 
