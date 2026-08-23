@@ -1137,8 +1137,18 @@ impl<A: ValidationsAdaptor> Validations<A> {
             .max_by(|left, right| (left.2, left.0, left.1).cmp(&(right.2, right.0, right.1)));
         let validation_recovery_advice = acquiring_quorum_candidate.and_then(|candidate| {
             let peer_support = peer_counts.get(&candidate.1).copied().unwrap_or_default();
-            (candidate.0 >= min_seq && candidate.0 > lcl.seq() && candidate.1 != lcl.id())
-                .then_some((candidate.0, candidate.1, candidate.2, peer_support))
+            // checkAccept has already requested every missing validation hash
+            // as ordinary Generic work.  Do not additionally turn N+1 into a
+            // phase-owning recovery anchor: once that Generic ledger becomes
+            // resident, the normal trie can prove whether it is our child or
+            // a fork and getPreferredLCL applies rippled's ancestry rule.  The
+            // subtraction form preserves the generic Seq API without an N+1
+            // overflow at the sequence limit.
+            (candidate.0 >= min_seq
+                && candidate.0 > lcl.seq()
+                && candidate.0 - 1 > lcl.seq()
+                && candidate.1 != lcl.id())
+            .then_some((candidate.0, candidate.1, candidate.2, peer_support))
         });
 
         // Match rippled `Validations::getPreferredLCL`: a trusted preference
@@ -1630,6 +1640,44 @@ mod tests {
         );
         assert_eq!(diagnostic.validation_recovery_support, Some(6));
         assert_eq!(diagnostic.validation_recovery_peer_support, Some(9));
+    }
+
+    #[test]
+    fn validation_recovery_does_not_make_n_plus_one_a_phase_owner() {
+        let adaptor = MockAdaptor::new(1000);
+        let local_lcl = ledger_at(10, 10);
+        let unavailable_n_plus_one = ledger_at(11, 42);
+        adaptor.register_ledger(local_lcl.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(local_lcl.id(), local_lcl.seq(), 1000, 1, 1)),
+            ValStatus::Current
+        );
+        for node_id in 2..=7 {
+            assert_eq!(
+                validations.add(
+                    node_id,
+                    val(
+                        unavailable_n_plus_one.id(),
+                        unavailable_n_plus_one.seq(),
+                        1000,
+                        node_id,
+                        node_id,
+                    ),
+                ),
+                ValStatus::Current
+            );
+        }
+
+        let diagnostic = validations.get_preferred_lcl_diagnostic(
+            &local_lcl,
+            local_lcl.seq(),
+            &BTreeMap::from([(unavailable_n_plus_one.id(), 9)]),
+        );
+        assert_eq!(diagnostic.selected, local_lcl.id());
+        assert_eq!(diagnostic.validation_recovery_candidate, None);
+        assert_eq!(diagnostic.validation_recovery_support, None);
     }
 
     #[test]

@@ -147,11 +147,33 @@ fn effective_validation_recovery_target(
     ordinary_selected: Uint256,
     local_lcl: Uint256,
     stable_anchor: Option<(Uint256, u32)>,
+    ordinary_selected_is_resident: bool,
 ) -> acquisition::LedgerTarget {
+    // A stable acquisition owner prevents a moving, unresolved network tip
+    // from starving recovery.  It must not mask an ordinary getPreferredLCL
+    // result that is already locally available: rippled immediately hands
+    // that ledger to switchLastClosedLedger instead of waiting for an older
+    // asynchronous acquisition.
+    if ordinary_selected_is_resident && ordinary_selected != local_lcl {
+        return acquisition::LedgerTarget::new(ordinary_selected, None);
+    }
     stable_anchor
         .map(|(hash, seq)| acquisition::LedgerTarget::new(hash, Some(seq)))
         .filter(|target| target.hash() != local_lcl)
         .unwrap_or_else(|| acquisition::LedgerTarget::new(ordinary_selected, None))
+}
+
+fn preferred_candidate_passes_switch_admission(
+    lm: &ledger::LedgerMaster,
+    expected_hash: Uint256,
+    candidate: &ledger::Ledger,
+    now_close_time: u32,
+) -> bool {
+    *candidate.header().hash.as_uint256() == expected_hash
+        && !candidate.state_map().is_synching()
+        && (candidate.header().tx_hash.is_zero() || !candidate.tx_map().is_synching())
+        && lm.can_be_current(candidate, now_close_time)
+        && lm.compatibility_audit(candidate).compatible()
 }
 
 /// Result of the strand-owned second phase of inbound completion. A result is
@@ -1440,6 +1462,31 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         .map(|(seq, hash)| (hash, seq));
     shared_inbound.coordinator_validation_recovery_target(validation_recovery_target);
     let ordinary_selected_preferred_hash = preference_diagnostic.selected;
+    // Resolve the ordinary rippled preference before applying Quaxar's
+    // phase-neutral stable acquisition owner.  The owner is only a liveness
+    // fallback for an unresolved moving tip; once the ordinary preferred LCL
+    // is durable, complete, current, and compatible, checkLastClosedLedger
+    // must be allowed to switch to it immediately.
+    let ordinary_selected_preferred_resident = (ordinary_selected_preferred_hash != our_hash
+        && ordinary_selected_preferred_hash != parent_hash
+        && !ordinary_selected_preferred_hash.is_zero())
+    .then(|| {
+        root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(
+            ordinary_selected_preferred_hash,
+        ))
+    })
+    .flatten()
+    .filter(|_| !root.inbound_ledger_is_provisional(ordinary_selected_preferred_hash));
+    let ordinary_selected_preferred_is_admissible = ordinary_selected_preferred_resident
+        .as_ref()
+        .is_some_and(|candidate| {
+            preferred_candidate_passes_switch_admission(
+                lm.as_ref(),
+                ordinary_selected_preferred_hash,
+                candidate.as_ref(),
+                root.current_close_time_seconds(),
+            )
+        });
     // The diagnostic candidate is moving advice. Only the coordinator's
     // provenance-backed stable anchor may override a trie-local preference.
     // Once bound, retain that exact networkClosed target until its lifecycle
@@ -1449,6 +1496,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         ordinary_selected_preferred_hash,
         our_hash,
         shared_inbound.coordinator_validation_recovery_latch().0,
+        ordinary_selected_preferred_is_admissible,
     );
     let selected_preferred_hash = selected_preferred_target.hash();
     // Match rippled's checkLastClosedLedger: ordinary preference is recomputed
@@ -1497,10 +1545,14 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             "LCL trace: exact provisional wait released after heartbeat selected another target"
         );
     }
-    // Do not resolve before rippled's no-switch predicates below. Keep this
-    // pre-check diagnostic provider-free so an already-local/parent preference
-    // cannot create serialized-strand lookup work.
-    let selected_preferred_resident: Option<(Uint256, u32)> = None;
+    // The only early resolution above was for a nonlocal ordinary preference;
+    // local/parent no-switch paths remain provider-free.  Surface that lookup
+    // here so live diagnostics can prove when a resident B superseded fallback
+    // anchor A.
+    let selected_preferred_resident = ordinary_selected_preferred_is_admissible
+        .then_some(ordinary_selected_preferred_resident.as_ref())
+        .flatten()
+        .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
     tracing::info!(
         target: "lcl_trace",
         event = "preferred_lcl_selected",
@@ -1615,8 +1667,11 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
 
     // Rippled resolves a preferred ledger only after proving this is an
     // actionable switch candidate.
-    let preferred_resident =
-        root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash));
+    let preferred_resident = if preferred_hash == ordinary_selected_preferred_hash {
+        ordinary_selected_preferred_resident
+    } else {
+        root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash))
+    };
 
     // `checkLastClosedLedger` immediately asks InboundLedgers for a resolver
     // miss. Preserve the source of a successful candidate so a live trace can
@@ -2049,8 +2104,14 @@ fn switch_last_closed_ledger(
     // Coordinator mode: report the LCL installation as a typed fact so the
     // coordinator can transition `Syncing -> Tracking` for its own target.
     if shared_inbound.coordinator_installed() {
-        shared_inbound
-            .coordinator_lcl_installed(acquisition::LedgerIdentity::new(new_hash, new_seq));
+        let installed = acquisition::LedgerIdentity::new(new_hash, new_seq);
+        shared_inbound.coordinator_lcl_installed(installed);
+        // A successful serialized switch is also authoritative reconciliation
+        // when an older stable validation-recovery target had owned Syncing.
+        // The exact install fact intentionally cannot satisfy a different
+        // target; this follow-up retires that fallback only after B is the real
+        // local LCL, allowing the coordinator to track B immediately.
+        shared_inbound.coordinator_preferred_lcl_reconciled(installed);
     }
     status_broadcaster(root, ledger.as_ref(), 3, true);
     let proposing = root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full;
@@ -3032,10 +3093,10 @@ mod tests {
         coordinator_publication_is_fresh, drain_bounded, effective_validation_recovery_target,
         enqueue_recovered_txsets, heartbeat_operating_mode_reassertion, history_acquire_allowed,
         history_fetch_pack_requested, persist_completed_inbound_ledger,
-        process_completed_inbound_ledger, published_ledger_is_contiguous_with_lcl,
-        reconcile_preferred_lcl_with_status_broadcaster, record_completed_inbound_ledger,
-        recovered_target_is_contiguous_to_lcl, required_peer_count,
-        same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
+        preferred_candidate_passes_switch_admission, process_completed_inbound_ledger,
+        published_ledger_is_contiguous_with_lcl, reconcile_preferred_lcl_with_status_broadcaster,
+        record_completed_inbound_ledger, recovered_target_is_contiguous_to_lcl,
+        required_peer_count, same_history_fetch_pack_is_suppressed, should_begin_ordinary_round,
         should_emit_coordinator_publication, should_promote_operating_mode_at_end_consensus,
         should_reconcile_preferred_lcl, should_run_end_consensus_reconciliation,
         switch_last_closed_ledger,
@@ -3062,22 +3123,77 @@ mod tests {
         let stable = Some((anchor, 20));
 
         assert_eq!(
-            effective_validation_recovery_target(local, local, stable),
+            effective_validation_recovery_target(local, local, stable, false),
             acquisition::LedgerTarget::new(anchor, Some(20))
         );
         assert_eq!(
-            effective_validation_recovery_target(moving, local, stable),
+            effective_validation_recovery_target(moving, local, stable, false),
             acquisition::LedgerTarget::new(anchor, Some(20)),
             "moving candidate B must not replace stable anchor A"
         );
         assert_eq!(
-            effective_validation_recovery_target(moving, local, None),
+            effective_validation_recovery_target(moving, local, stable, true),
+            acquisition::LedgerTarget::new(moving, None),
+            "a resident ordinary preference must supersede the fallback anchor"
+        );
+        assert_eq!(
+            effective_validation_recovery_target(moving, local, None, false),
             acquisition::LedgerTarget::new(moving, None)
         );
         assert_eq!(
-            effective_validation_recovery_target(moving, local, Some((local, 10))),
+            effective_validation_recovery_target(moving, local, Some((local, 10)), false),
             acquisition::LedgerTarget::new(moving, None),
             "an anchor equal to the installed LCL is not a divergence"
+        );
+    }
+
+    #[test]
+    fn partial_resident_preference_cannot_supersede_stable_anchor() {
+        let root_node = basics::intrusive_pointer::make_shared_intrusive(
+            shamap::tree_node::SHAMapTreeNode::new_inner(1),
+        );
+        root_node.set_child_hash(0, SHAMapHash::new(Uint256::from_array([0x22; 32])));
+        root_node.update_hash();
+        let mut header = LedgerHeader {
+            seq: 11,
+            parent_hash: SHAMapHash::new(Uint256::from_array([0x10; 32])),
+            account_hash: root_node.get_hash(),
+            parent_close_time: 1_000,
+            close_time: 1_001,
+            close_time_resolution: 30,
+            ..LedgerHeader::default()
+        };
+        header.hash = calculate_ledger_hash(&header);
+        let partial = Ledger::from_maps(
+            header,
+            shamap::sync::SyncTree::from_root_with_type(
+                root_node,
+                shamap::sync::SHAMapType::State,
+                false,
+                header.seq,
+                shamap::sync::SyncState::Synching,
+            ),
+            shamap::sync::SyncTree::new_with_type(
+                shamap::sync::SHAMapType::Transaction,
+                false,
+                header.seq,
+            ),
+        );
+        let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+        let hash = *partial.header().hash.as_uint256();
+
+        assert!(partial.state_map().is_synching());
+        assert!(!preferred_candidate_passes_switch_admission(
+            &master, hash, &partial, 1_000,
+        ));
+        assert_eq!(
+            effective_validation_recovery_target(
+                hash,
+                Uint256::from_u64(10),
+                Some((Uint256::from_u64(20), 20)),
+                false,
+            ),
+            LedgerTarget::new(Uint256::from_u64(20), Some(20)),
         );
     }
     use basics::base_uint::Uint256;
@@ -3114,6 +3230,7 @@ mod tests {
             SHAMapHash::new(Uint256::from_array([parent_fill; 32])),
             parent_fill,
             backed,
+            seq.saturating_add(99),
         )
     }
 
@@ -3122,10 +3239,12 @@ mod tests {
         parent_hash: SHAMapHash,
         item_fill: u8,
         backed: bool,
+        parent_close_time: u32,
     ) -> Arc<Ledger> {
         let mut header = LedgerHeader {
             seq,
             parent_hash,
+            parent_close_time,
             close_time: seq.saturating_add(100),
             close_time_resolution: 30,
             ..LedgerHeader::default()
@@ -3163,7 +3282,8 @@ mod tests {
     #[test]
     fn published_descendant_must_prove_the_lcl_as_its_ancestor() {
         let lcl = immutable_ledger(10, 0x10);
-        let child = immutable_ledger_with_parent_and_backing(11, lcl.header().hash, 0x11, false);
+        let child =
+            immutable_ledger_with_parent_and_backing(11, lcl.header().hash, 0x11, false, 110);
         assert!(published_ledger_is_contiguous_with_lcl(&lcl, &child));
 
         let unrelated = immutable_ledger(11, 0x77);
@@ -3780,6 +3900,248 @@ mod tests {
         let after = root.closed_ledger().expect("local LCL remains installed");
         assert_eq!(after.header().hash, before.header().hash);
         assert_eq!(after.header().seq, before.header().seq);
+    }
+
+    #[test]
+    fn real_reconciliation_switches_admissible_resident_preference_over_stable_anchor() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let local = immutable_ledger(10, 0x10);
+        let local_identity =
+            LedgerIdentity::new(*local.header().hash.as_uint256(), local.header().seq);
+        let ordinary = immutable_ledger_with_parent_and_backing(
+            11,
+            SHAMapHash::new(Uint256::from_array([0x77; 32])),
+            0x20,
+            false,
+            root.current_close_time_seconds(),
+        );
+        let ordinary_hash = *ordinary.header().hash.as_uint256();
+        let ordinary_identity = LedgerIdentity::new(ordinary_hash, ordinary.header().seq);
+        let runtime = root.attach_default_ledger_master_runtime();
+        root.on_closed_ledger(Arc::clone(&local));
+        runtime
+            .ledger_master()
+            .ledger_history()
+            .insert(Arc::clone(&ordinary), false);
+        root.validations().register_ledger(ordinary.as_ref());
+        let (node_id, validation) = preferred_validation(
+            ordinary_hash,
+            ordinary.header().seq,
+            root.time_keeper().close_time().as_seconds(),
+        );
+        assert_eq!(
+            root.validations()
+                .validations()
+                .lock()
+                .expect("validations mutex")
+                .add(node_id, validation),
+            consensus::rcl_support::ValStatus::Current,
+        );
+
+        let (_store_dir, inbound) = install_empty_reconciliation_coordinator(&mut root);
+        assert!(inbound.coordinator_report_peer_availability(&[1]));
+        assert!(inbound.coordinator_lcl_installed(local_identity));
+        let anchor = LedgerTarget::new(Uint256::from_u64(0xA11CE), Some(20));
+        assert!(inbound.coordinator_validation_recovery_target(Some((
+            anchor.hash(),
+            anchor.sequence().expect("known anchor sequence"),
+        ))));
+        assert!(inbound.coordinator_preferred_lcl_divergence(anchor));
+        assert_eq!(
+            inbound.coordinator_validation_recovery_latch().0,
+            Some((anchor.hash(), 20)),
+        );
+
+        let mut runner = RecordingRunner::accepted(local_identity.hash());
+        let consensus_rt = AppConsensusRuntime::new();
+        let mut last_round = None;
+        let mut sampler = LclAuditSampler::new();
+        let mut provisional_waiter = None;
+        assert_eq!(
+            reconcile_preferred_lcl_with_status_broadcaster(
+                &root,
+                &inbound,
+                &mut runner,
+                &consensus_rt,
+                &mut last_round,
+                &mut sampler,
+                &mut provisional_waiter,
+                &|_, _, _, _| {},
+            ),
+            PreferredLclReconciliation::Switched,
+        );
+
+        assert_eq!(
+            root.closed_ledger().expect("switched LCL").header().hash,
+            ordinary.header().hash,
+        );
+        assert_eq!(runner.prev, ordinary_hash);
+        assert_eq!(last_round, Some(ordinary_hash));
+        assert_eq!(
+            inbound.coordinator_validation_recovery_latch(),
+            (None, None)
+        );
+        assert!(matches!(
+            inbound.coordinator_snapshot().expect("snapshot").phase(),
+            acquisition::SyncPhase::Tracking { lcl } if *lcl == ordinary_identity
+        ));
+        inbound.stop();
+    }
+
+    #[test]
+    fn real_reconciliation_retains_stable_anchor_for_incompatible_resident_preference() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let local = immutable_ledger(10, 0x10);
+        let local_hash = *local.header().hash.as_uint256();
+        let incompatible = immutable_ledger_with_parent_and_backing(
+            11,
+            SHAMapHash::new(Uint256::from_array([0x77; 32])),
+            0x20,
+            false,
+            root.current_close_time_seconds(),
+        );
+        let incompatible_hash = *incompatible.header().hash.as_uint256();
+        let runtime = root.attach_default_ledger_master_runtime();
+        root.on_closed_ledger(Arc::clone(&local));
+        runtime
+            .ledger_master()
+            .set_valid_ledger_no_sweep(Arc::clone(&local), None, None);
+        runtime
+            .ledger_master()
+            .ledger_history()
+            .insert(Arc::clone(&incompatible), false);
+        root.validations().register_ledger(incompatible.as_ref());
+        let (node_id, validation) = preferred_validation(
+            incompatible_hash,
+            incompatible.header().seq,
+            root.time_keeper().close_time().as_seconds(),
+        );
+        assert_eq!(
+            root.validations()
+                .validations()
+                .lock()
+                .expect("validations mutex")
+                .add(node_id, validation),
+            consensus::rcl_support::ValStatus::Current,
+        );
+
+        let (_store_dir, inbound) = install_empty_reconciliation_coordinator(&mut root);
+        assert!(inbound.coordinator_report_peer_availability(&[1]));
+        let anchor = LedgerTarget::new(Uint256::from_u64(0xA11CE), Some(20));
+        assert!(inbound.coordinator_validation_recovery_target(Some((anchor.hash(), 20))));
+
+        let mut runner = RecordingRunner::accepted(local_hash);
+        let consensus_rt = AppConsensusRuntime::new();
+        let mut last_round = None;
+        let mut sampler = LclAuditSampler::new();
+        let mut provisional_waiter = None;
+        assert_eq!(
+            reconcile_preferred_lcl_with_status_broadcaster(
+                &root,
+                &inbound,
+                &mut runner,
+                &consensus_rt,
+                &mut last_round,
+                &mut sampler,
+                &mut provisional_waiter,
+                &|_, _, _, _| panic!("incompatible B must not switch"),
+            ),
+            PreferredLclReconciliation::Pending,
+        );
+
+        assert_eq!(runner.prev, anchor.hash());
+        assert_eq!(last_round, Some(anchor.hash()));
+        assert_eq!(
+            root.closed_ledger()
+                .expect("local LCL retained")
+                .header()
+                .hash,
+            local.header().hash,
+        );
+        assert_eq!(
+            inbound.coordinator_validation_recovery_latch().0,
+            Some((anchor.hash(), 20)),
+        );
+        inbound.stop();
+    }
+
+    #[test]
+    fn real_reconciliation_does_not_let_resident_parent_clear_stable_anchor() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let parent = immutable_ledger_with_parent_and_backing(
+            9,
+            SHAMapHash::new(Uint256::from_array([0x08; 32])),
+            0x09,
+            false,
+            root.current_close_time_seconds(),
+        );
+        let local = immutable_ledger_with_parent_and_backing(
+            10,
+            parent.header().hash,
+            0x10,
+            false,
+            root.current_close_time_seconds(),
+        );
+        let local_hash = *local.header().hash.as_uint256();
+        let parent_hash = *parent.header().hash.as_uint256();
+        let runtime = root.attach_default_ledger_master_runtime();
+        root.on_closed_ledger(Arc::clone(&local));
+        runtime
+            .ledger_master()
+            .ledger_history()
+            .insert(Arc::clone(&parent), false);
+        root.validations().register_ledger(parent.as_ref());
+        let (node_id, validation) = preferred_validation(
+            parent_hash,
+            parent.header().seq,
+            root.time_keeper().close_time().as_seconds(),
+        );
+        assert_eq!(
+            root.validations()
+                .validations()
+                .lock()
+                .expect("validations mutex")
+                .add(node_id, validation),
+            consensus::rcl_support::ValStatus::Current,
+        );
+
+        let (_store_dir, inbound) = install_empty_reconciliation_coordinator(&mut root);
+        assert!(inbound.coordinator_report_peer_availability(&[1]));
+        let anchor = LedgerTarget::new(Uint256::from_u64(0xA11CE), Some(20));
+        assert!(inbound.coordinator_validation_recovery_target(Some((anchor.hash(), 20))));
+
+        let mut runner = RecordingRunner::accepted(local_hash);
+        let consensus_rt = AppConsensusRuntime::new();
+        let mut last_round = None;
+        let mut sampler = LclAuditSampler::new();
+        let mut provisional_waiter = None;
+        assert_eq!(
+            reconcile_preferred_lcl_with_status_broadcaster(
+                &root,
+                &inbound,
+                &mut runner,
+                &consensus_rt,
+                &mut last_round,
+                &mut sampler,
+                &mut provisional_waiter,
+                &|_, _, _, _| panic!("parent preference must not switch"),
+            ),
+            PreferredLclReconciliation::Pending,
+        );
+        assert_eq!(runner.prev, anchor.hash());
+        assert_eq!(last_round, Some(anchor.hash()));
+        assert_eq!(
+            inbound.coordinator_validation_recovery_latch().0,
+            Some((anchor.hash(), 20)),
+        );
+        assert_eq!(
+            root.closed_ledger()
+                .expect("local LCL retained")
+                .header()
+                .hash,
+            local.header().hash,
+        );
+        inbound.stop();
     }
 
     #[test]

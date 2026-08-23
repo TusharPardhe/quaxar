@@ -1620,6 +1620,13 @@ impl CoordinatorRunner {
         // local ledger that won reconciliation.
         self.state.recovery_anchor_target = None;
         self.state.recovery_anchor_session = None;
+        // The validation-recovery owner is likewise only fallback acquisition
+        // advice.  A serialized NetworkOps reconciliation is stronger proof:
+        // it must retire that older owner so it cannot mask the newly resident
+        // ordinary preferred LCL on the next accepted-boundary pass.
+        self.state.validation_recovery_target = None;
+        self.state.validation_recovery_session = None;
+        self.state.validation_recovery_candidate = None;
         self.state.latest_consensus_target = None;
         self.state.deferred_consensus_acquire = None;
         let fact = TransitionFact::PreferredLclReconciled { lcl };
@@ -6666,6 +6673,14 @@ mod tests {
         let _ = runner.handle_event(AcquisitionEvent::Connectivity(
             PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
         ));
+        let validation_recovery = target(8);
+        let _ = runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(
+            validation_recovery,
+        )));
+        assert_eq!(
+            runner.state.validation_recovery_target,
+            Some(validation_recovery)
+        );
         let _ = runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: stale });
         let _ = runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
             stale,
@@ -6682,6 +6697,9 @@ mod tests {
         );
         assert_eq!(runner.state.latest_consensus_target, None);
         assert_eq!(runner.state.deferred_consensus_acquire, None);
+        assert_eq!(runner.state.validation_recovery_target, None);
+        assert_eq!(runner.state.validation_recovery_session, None);
+        assert_eq!(runner.state.validation_recovery_candidate, None);
 
         let effects = runner.handle_event(AcquisitionEvent::PublicationCommitted {
             identity: local,
