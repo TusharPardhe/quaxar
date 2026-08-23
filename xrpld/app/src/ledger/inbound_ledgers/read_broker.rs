@@ -5,6 +5,7 @@
 //! actor submits [`ReadDispatch`] after releasing its own mutable state and
 //! receives [`ReadReady`] through a mailbox sink after the broker settles.
 
+use acquisition::ReadPriority;
 use basics::base_uint::Uint256;
 use nodestore::{AsyncReadWork, NodeObject};
 use std::collections::{BTreeMap, VecDeque};
@@ -45,7 +46,8 @@ pub const ACQ_READS_LOGICAL: usize = ACQ_READS_PER_SCAN;
 /// remains within the existing physical in-flight limit. A request at either
 /// retained-subscription bound is returned as `CapacityDeferred` with no
 /// broker record or sink event; the adapter retains it in a bounded FIFO until
-/// a real settlement reopens a scan lane.
+/// a real settlement reopens a scan lane. One 512-read lane is reserved for
+/// consensus/recovery work in production-sized configurations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadBrokerLimits {
     pub max_global_retained_logical_subscriptions: usize,
@@ -87,6 +89,7 @@ pub struct ReadTicket {
     key: ReadKey,
     acquisition_id: u64,
     plan_id: u64,
+    priority: ReadPriority,
 }
 
 impl ReadTicket {
@@ -104,6 +107,10 @@ impl ReadTicket {
 
     pub const fn plan_id(self) -> u64 {
         self.plan_id
+    }
+
+    pub const fn priority(self) -> ReadPriority {
+        self.priority
     }
 }
 
@@ -252,12 +259,15 @@ enum FlightState {
 struct Subscriber {
     acquisition_id: u64,
     plan_id: u64,
+    ticket_priority: ReadPriority,
+    priority: ReadPriority,
     sink: ReadReadySink,
 }
 
 #[derive(Default)]
 struct Flight {
     state: Option<FlightState>,
+    priority: Option<ReadPriority>,
     subscribers: BTreeMap<ReadTicketId, Subscriber>,
     by_owner: BTreeMap<(u64, u64), ReadTicketId>,
 }
@@ -266,6 +276,8 @@ struct TicketRecord {
     key: ReadKey,
     acquisition_id: u64,
     plan_id: u64,
+    ticket_priority: ReadPriority,
+    priority: ReadPriority,
     dispatched: bool,
     /// When this logical read was first requested; sampled as read queue delay
     /// when the key's physical read is dispatched.
@@ -276,7 +288,8 @@ struct BrokerState {
     stopped: bool,
     next_ticket: u64,
     flights: BTreeMap<ReadKey, Flight>,
-    fifo: VecDeque<ReadKey>,
+    consensus_fifo: VecDeque<ReadKey>,
+    history_fifo: VecDeque<ReadKey>,
     ready_dispatches: VecDeque<ReadDispatch>,
     tickets: BTreeMap<ReadTicketId, TicketRecord>,
     metrics: ReadBrokerMetrics,
@@ -288,7 +301,8 @@ impl Default for BrokerState {
             stopped: false,
             next_ticket: 1,
             flights: BTreeMap::new(),
-            fifo: VecDeque::new(),
+            consensus_fifo: VecDeque::new(),
+            history_fifo: VecDeque::new(),
             ready_dispatches: VecDeque::new(),
             tickets: BTreeMap::new(),
             metrics: ReadBrokerMetrics::default(),
@@ -325,6 +339,22 @@ impl NodeReadBroker {
         plan_id: u64,
         sink: ReadReadySink,
     ) -> ReadAdmission {
+        // Compatibility callers predate history classification and therefore
+        // retain the former unrestricted admission semantics.
+        self.request_with_priority(key, acquisition_id, plan_id, ReadPriority::Consensus, sink)
+    }
+
+    /// Submit one logical read with the coordinator's priority classification.
+    /// FIFO is preserved within each class; Consensus is admitted ahead of
+    /// History and may use the reserved 512-read lane.
+    pub fn request_with_priority(
+        &self,
+        key: ReadKey,
+        acquisition_id: u64,
+        plan_id: u64,
+        priority: ReadPriority,
+        sink: ReadReadySink,
+    ) -> ReadAdmission {
         let mut state = self.inner.state.lock().expect("read broker state lock");
         if state.stopped {
             state.metrics.rejected += 1;
@@ -334,19 +364,40 @@ impl NodeReadBroker {
         let owner = (acquisition_id, plan_id);
         let existing_ticket = state.flights.get(&key).and_then(|flight| {
             flight.by_owner.get(&owner).and_then(|ticket_id| {
-                state
-                    .tickets
-                    .get(ticket_id)
-                    .map(|record| (*ticket_id, record.acquisition_id, record.plan_id))
+                state.tickets.get(ticket_id).map(|record| {
+                    (
+                        *ticket_id,
+                        record.acquisition_id,
+                        record.plan_id,
+                        record.ticket_priority,
+                    )
+                })
             })
         });
-        if let Some((ticket_id, ticket_acquisition_id, ticket_plan_id)) = existing_ticket {
+        if let Some((ticket_id, ticket_acquisition_id, ticket_plan_id, ticket_priority)) =
+            existing_ticket
+        {
+            if priority == ReadPriority::Consensus {
+                if let Some(record) = state.tickets.get_mut(&ticket_id) {
+                    record.priority = ReadPriority::Consensus;
+                }
+                if let Some(subscriber) = state
+                    .flights
+                    .get_mut(&key)
+                    .and_then(|flight| flight.subscribers.get_mut(&ticket_id))
+                {
+                    subscriber.priority = ReadPriority::Consensus;
+                }
+            }
+            self.promote_queued_flight_locked(&mut state, key, priority);
+            Self::admit_queued_locked(&self.inner, &mut state);
             state.metrics.attached += 1;
             return ReadAdmission::Attached(ReadTicket {
                 id: ticket_id,
                 key,
                 acquisition_id: ticket_acquisition_id,
                 plan_id: ticket_plan_id,
+                priority: ticket_priority,
             });
         }
 
@@ -356,7 +407,18 @@ impl NodeReadBroker {
             .values()
             .filter(|record| record.acquisition_id == acquisition_id && record.plan_id == plan_id)
             .count();
+        let history_ticket_limit = limits
+            .max_global_retained_logical_subscriptions
+            .saturating_sub(Self::consensus_reserve(
+                limits.max_global_retained_logical_subscriptions,
+            ));
+        let history_ticket_count = state
+            .tickets
+            .values()
+            .filter(|record| record.priority == ReadPriority::History)
+            .count();
         if state.tickets.len() >= limits.max_global_retained_logical_subscriptions
+            || (priority == ReadPriority::History && history_ticket_count >= history_ticket_limit)
             || owner_ticket_count >= limits.max_retained_logical_subscriptions
         {
             state.metrics.submitted += 1;
@@ -380,6 +442,7 @@ impl NodeReadBroker {
             key,
             acquisition_id,
             plan_id,
+            priority,
         };
         state.metrics.submitted += 1;
         state.tickets.insert(
@@ -388,6 +451,8 @@ impl NodeReadBroker {
                 key,
                 acquisition_id,
                 plan_id,
+                ticket_priority: priority,
+                priority,
                 dispatched,
                 requested_at: Instant::now(),
             },
@@ -400,12 +465,15 @@ impl NodeReadBroker {
                 Subscriber {
                     acquisition_id,
                     plan_id,
+                    ticket_priority: priority,
+                    priority,
                     sink,
                 },
             );
             flight.by_owner.insert(owner, ticket_id);
             if is_new_flight {
                 flight.state = Some(FlightState::Queued);
+                flight.priority = Some(priority);
             }
             flight.subscribers.len()
         };
@@ -415,9 +483,11 @@ impl NodeReadBroker {
             .logical_ticket_high_water
             .max(state.tickets.len());
         if is_new_flight {
-            state.fifo.push_back(key);
-            let queued_keys = state.fifo.len();
+            Self::queue_for_priority(&mut state, priority).push_back(key);
+            let queued_keys = state.consensus_fifo.len() + state.history_fifo.len();
             state.metrics.queue_high_water = state.metrics.queue_high_water.max(queued_keys);
+        } else {
+            self.promote_queued_flight_locked(&mut state, key, priority);
         }
 
         Self::admit_queued_locked(&self.inner, &mut state);
@@ -444,6 +514,7 @@ impl NodeReadBroker {
             if existing.key != ticket.key
                 || existing.acquisition_id != ticket.acquisition_id
                 || existing.plan_id != ticket.plan_id
+                || existing.ticket_priority != ticket.priority
             {
                 return false;
             }
@@ -464,10 +535,16 @@ impl NodeReadBroker {
                 (subscriber, flight.state, flight.subscribers.is_empty())
             };
             if empty {
-                state.flights.remove(&record.key);
                 if flight_state == Some(FlightState::Queued) {
-                    state.fifo.retain(|queued| *queued != record.key);
+                    state.flights.remove(&record.key);
+                    Self::remove_queued_key(&mut state, record.key);
                 }
+                // A dispatched physical read is not cancellable. Retain its
+                // empty flight as a capacity tombstone until the NodeStore
+                // callback (or callback Drop) settles it; admitting a
+                // successor here would exceed the physical global bound.
+            } else if flight_state == Some(FlightState::Queued) {
+                Self::recompute_queued_flight_priority(&mut state, record.key);
             }
             state.metrics.cancelled += 1;
             Self::admit_queued_locked(&self.inner, &mut state);
@@ -484,6 +561,43 @@ impl NodeReadBroker {
             sink(ready);
         }
         true
+    }
+
+    /// Upgrade retained queued work for a session that became an exact
+    /// consensus/recovery owner after its Generic acquisition was admitted.
+    /// Dispatched reads are already consuming capacity and are left in place;
+    /// queued flights are reclassified from their aggregate subscribers.
+    pub fn promote_session_priority(&self, acquisition_id: u64, plan_id: u64) -> usize {
+        let mut state = self.inner.state.lock().expect("read broker state lock");
+        let ticket_ids = state
+            .tickets
+            .iter()
+            .filter_map(|(ticket_id, record)| {
+                (record.acquisition_id == acquisition_id && record.plan_id == plan_id)
+                    .then_some(*ticket_id)
+            })
+            .collect::<Vec<_>>();
+        let mut queued_keys = BTreeMap::<ReadKey, ()>::new();
+        for ticket_id in &ticket_ids {
+            let Some(record) = state.tickets.get_mut(ticket_id) else {
+                continue;
+            };
+            record.priority = ReadPriority::Consensus;
+            let key = record.key;
+            if let Some(flight) = state.flights.get_mut(&key) {
+                if let Some(subscriber) = flight.subscribers.get_mut(ticket_id) {
+                    subscriber.priority = ReadPriority::Consensus;
+                }
+                if flight.state == Some(FlightState::Queued) {
+                    queued_keys.insert(key, ());
+                }
+            }
+        }
+        for key in queued_keys.keys().copied() {
+            Self::recompute_queued_flight_priority(&mut state, key);
+        }
+        Self::admit_queued_locked(&self.inner, &mut state);
+        ticket_ids.len()
     }
 
     /// Settle a physical read. It is safe for a NodeStore callback to call this
@@ -525,6 +639,7 @@ impl NodeReadBroker {
                             key,
                             acquisition_id: subscriber.acquisition_id,
                             plan_id: subscriber.plan_id,
+                            priority: subscriber.ticket_priority,
                         },
                         outcome: outcome.clone(),
                     },
@@ -558,7 +673,8 @@ impl NodeReadBroker {
             }
             state.stopped = true;
             let flights = std::mem::take(&mut state.flights);
-            state.fifo.clear();
+            state.consensus_fifo.clear();
+            state.history_fifo.clear();
             for mut dispatch in state.ready_dispatches.drain(..) {
                 // Stop settles every ticket below. Suppress the dispatch Drop
                 // fallback because it would otherwise re-enter this mutex.
@@ -577,6 +693,7 @@ impl NodeReadBroker {
                                 key,
                                 acquisition_id: subscriber.acquisition_id,
                                 plan_id: subscriber.plan_id,
+                                priority: subscriber.ticket_priority,
                             },
                             outcome: ReadOutcome::Cancelled,
                         },
@@ -597,6 +714,16 @@ impl NodeReadBroker {
     pub fn take_ready_dispatches(&self) -> Vec<ReadDispatch> {
         let mut state = self.inner.state.lock().expect("read broker state lock");
         state.ready_dispatches.drain(..).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready_dispatch_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .expect("read broker state lock")
+            .ready_dispatches
+            .len()
     }
 
     /// Submit all already-admitted physical reads. The callback captures only
@@ -624,10 +751,11 @@ impl NodeReadBroker {
         let state = self.inner.state.lock().expect("read broker state lock");
         ReadBrokerSnapshot {
             stopped: state.stopped,
-            queued_keys: state.fifo.len(),
+            queued_keys: state.consensus_fifo.len() + state.history_fifo.len(),
             queued_key_bytes: state
-                .fifo
+                .consensus_fifo
                 .len()
+                .saturating_add(state.history_fifo.len())
                 .saturating_mul(std::mem::size_of::<ReadKey>()),
             in_flight_keys: state
                 .flights
@@ -657,7 +785,16 @@ impl NodeReadBroker {
 
     fn admit_queued_locked(inner: &Arc<NodeReadBrokerInner>, state: &mut BrokerState) {
         while Self::in_flight_count(state) < inner.config.global_in_flight {
-            let Some(key) = state.fifo.pop_front() else {
+            let history_limit = inner
+                .config
+                .global_in_flight
+                .saturating_sub(Self::consensus_reserve(inner.config.global_in_flight));
+            let key = state.consensus_fifo.pop_front().or_else(|| {
+                (Self::history_in_flight_count(state) < history_limit)
+                    .then(|| state.history_fifo.pop_front())
+                    .flatten()
+            });
+            let Some(key) = key else {
                 break;
             };
             let Some(flight) = state.flights.get(&key) else {
@@ -702,6 +839,83 @@ impl NodeReadBroker {
         Self::emit_broker_metrics(state);
     }
 
+    /// Production reserves one rippled-sized scan lane for consensus and
+    /// recovery reads. Tiny test/custom configurations smaller than one lane
+    /// retain their full capacity so lower-priority work cannot deadlock.
+    const fn consensus_reserve(capacity: usize) -> usize {
+        if capacity > ACQ_READS_PER_SCAN {
+            ACQ_READS_PER_SCAN
+        } else {
+            0
+        }
+    }
+
+    fn queue_for_priority(
+        state: &mut BrokerState,
+        priority: ReadPriority,
+    ) -> &mut VecDeque<ReadKey> {
+        match priority {
+            ReadPriority::Consensus => &mut state.consensus_fifo,
+            ReadPriority::History => &mut state.history_fifo,
+        }
+    }
+
+    fn remove_queued_key(state: &mut BrokerState, key: ReadKey) {
+        state.consensus_fifo.retain(|queued| *queued != key);
+        state.history_fifo.retain(|queued| *queued != key);
+    }
+
+    fn promote_queued_flight_locked(
+        &self,
+        state: &mut BrokerState,
+        key: ReadKey,
+        priority: ReadPriority,
+    ) {
+        if priority != ReadPriority::Consensus
+            || !state.flights.get(&key).is_some_and(|flight| {
+                flight.state == Some(FlightState::Queued)
+                    && flight.priority == Some(ReadPriority::History)
+            })
+        {
+            return;
+        }
+        state.history_fifo.retain(|queued| *queued != key);
+        state.consensus_fifo.push_back(key);
+        state
+            .flights
+            .get_mut(&key)
+            .expect("promoted queued flight must exist")
+            .priority = Some(ReadPriority::Consensus);
+    }
+
+    fn recompute_queued_flight_priority(state: &mut BrokerState, key: ReadKey) {
+        let Some(flight) = state.flights.get(&key) else {
+            return;
+        };
+        if flight.state != Some(FlightState::Queued) {
+            return;
+        }
+        let priority = if flight
+            .subscribers
+            .values()
+            .any(|subscriber| subscriber.priority == ReadPriority::Consensus)
+        {
+            ReadPriority::Consensus
+        } else {
+            ReadPriority::History
+        };
+        if flight.priority == Some(priority) {
+            return;
+        }
+        Self::remove_queued_key(state, key);
+        Self::queue_for_priority(state, priority).push_back(key);
+        state
+            .flights
+            .get_mut(&key)
+            .expect("reclassified queued flight must exist")
+            .priority = Some(priority);
+    }
+
     /// Record the aggregate physical-read in-flight gauge from broker state.
     /// The gauge is the broker's resource-local view, never session state.
     fn emit_broker_metrics(state: &BrokerState) {
@@ -713,6 +927,17 @@ impl NodeReadBroker {
             .flights
             .values()
             .filter(|flight| flight.state == Some(FlightState::Dispatched))
+            .count()
+    }
+
+    fn history_in_flight_count(state: &BrokerState) -> usize {
+        state
+            .flights
+            .values()
+            .filter(|flight| {
+                flight.state == Some(FlightState::Dispatched)
+                    && flight.priority == Some(ReadPriority::History)
+            })
             .count()
     }
 }
@@ -941,7 +1166,302 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_settles_once_and_late_completion_cannot_resurrect() {
+    fn consensus_retains_a_logical_lane_when_history_reaches_its_allowance() {
+        let broker = broker(ReadBrokerConfig {
+            global_in_flight: ACQ_READS_PER_SCAN + 1,
+            max_global_retained_logical_subscriptions: ACQ_READS_PER_SCAN + 1,
+            max_retained_logical_subscriptions: ACQ_READS_PER_SCAN + 1,
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        assert!(matches!(
+            broker.request_with_priority(
+                key(0x31, 1),
+                1,
+                1,
+                ReadPriority::History,
+                sink(Arc::clone(&events)),
+            ),
+            ReadAdmission::Accepted(_)
+        ));
+        assert_eq!(
+            broker.request_with_priority(
+                key(0x32, 1),
+                2,
+                1,
+                ReadPriority::History,
+                sink(Arc::clone(&events)),
+            ),
+            ReadAdmission::CapacityDeferred
+        );
+        assert!(matches!(
+            broker
+                .request_with_priority(key(0x33, 1), 3, 1, ReadPriority::Consensus, sink(events),),
+            ReadAdmission::Accepted(_)
+        ));
+        assert_eq!(broker.snapshot().logical_tickets, 2);
+        assert!(broker.snapshot().in_flight_keys <= ACQ_READS_PER_SCAN + 1);
+    }
+
+    #[test]
+    fn consensus_uses_reserved_physical_lane_ahead_of_history_backlog() {
+        let broker = broker(ReadBrokerConfig {
+            max_global_retained_logical_subscriptions: ACQ_READS_GLOBAL + ACQ_READS_PER_SCAN + 1,
+            ..ReadBrokerConfig::default()
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        for index in 0..(ACQ_READS_GLOBAL - ACQ_READS_PER_SCAN) {
+            let mut hash = [0_u8; 32];
+            hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            assert!(matches!(
+                broker.request_with_priority(
+                    ReadKey::new(Uint256::from_array(hash), 1, 1),
+                    index as u64 + 1,
+                    1,
+                    ReadPriority::History,
+                    sink(Arc::clone(&events)),
+                ),
+                ReadAdmission::Accepted(_)
+            ));
+        }
+        let history_backlog = key(0x41, 2);
+        assert!(matches!(
+            broker.request_with_priority(
+                history_backlog,
+                20_000,
+                1,
+                ReadPriority::History,
+                sink(Arc::clone(&events)),
+            ),
+            ReadAdmission::Deferred(_)
+        ));
+        let consensus = key(0x42, 2);
+        assert!(matches!(
+            broker.request_with_priority(
+                consensus,
+                20_001,
+                1,
+                ReadPriority::Consensus,
+                sink(events),
+            ),
+            ReadAdmission::Accepted(_)
+        ));
+        let dispatches = broker.take_ready_dispatches();
+        assert!(
+            dispatches
+                .iter()
+                .any(|dispatch| dispatch.key() == consensus)
+        );
+        assert!(
+            !dispatches
+                .iter()
+                .any(|dispatch| dispatch.key() == history_backlog)
+        );
+        assert!(broker.snapshot().in_flight_keys <= ACQ_READS_GLOBAL);
+    }
+
+    #[test]
+    fn consensus_attachment_promotes_a_queued_history_flight() {
+        let broker = broker(ReadBrokerConfig {
+            global_in_flight: 1,
+            ..ReadBrokerConfig::default()
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let blocker = key(0x51, 1);
+        let promoted = key(0x52, 1);
+        assert!(matches!(
+            broker.request_with_priority(
+                blocker,
+                1,
+                1,
+                ReadPriority::History,
+                sink(Arc::clone(&events)),
+            ),
+            ReadAdmission::Accepted(_)
+        ));
+        assert!(matches!(
+            broker.request_with_priority(
+                promoted,
+                2,
+                1,
+                ReadPriority::History,
+                sink(Arc::clone(&events)),
+            ),
+            ReadAdmission::Deferred(_)
+        ));
+        assert!(matches!(
+            broker.request_with_priority(promoted, 3, 1, ReadPriority::Consensus, sink(events),),
+            ReadAdmission::Deferred(_)
+        ));
+        broker
+            .take_ready_dispatches()
+            .pop()
+            .expect("blocker dispatch")
+            .complete(ReadOutcome::Miss);
+        assert_eq!(
+            broker
+                .take_ready_dispatches()
+                .pop()
+                .expect("promoted dispatch")
+                .key(),
+            promoted
+        );
+    }
+
+    #[test]
+    fn cancelling_consensus_subscriber_demotes_shared_queued_flight() {
+        let broker = broker(ReadBrokerConfig {
+            global_in_flight: 1,
+            ..ReadBrokerConfig::default()
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let blocker = key(0x61, 1);
+        let shared = key(0x62, 1);
+        let later_consensus = key(0x63, 1);
+        let _ = broker.request(blocker, 1, 1, sink(Arc::clone(&events)));
+        let _ = broker.request_with_priority(
+            shared,
+            2,
+            1,
+            ReadPriority::History,
+            sink(Arc::clone(&events)),
+        );
+        let consensus_ticket = match broker.request_with_priority(
+            shared,
+            3,
+            1,
+            ReadPriority::Consensus,
+            sink(Arc::clone(&events)),
+        ) {
+            ReadAdmission::Deferred(ticket) => ticket,
+            other => panic!("expected queued consensus attachment, got {other:?}"),
+        };
+        let _ = broker.request_with_priority(
+            later_consensus,
+            4,
+            1,
+            ReadPriority::Consensus,
+            sink(events),
+        );
+        assert!(broker.cancel(consensus_ticket));
+        broker
+            .take_ready_dispatches()
+            .pop()
+            .expect("blocker dispatch")
+            .complete(ReadOutcome::Miss);
+        assert_eq!(
+            broker
+                .take_ready_dispatches()
+                .pop()
+                .expect("next consensus dispatch")
+                .key(),
+            later_consensus,
+            "a shared flight with only History subscribers must leave the Consensus FIFO"
+        );
+    }
+
+    #[test]
+    fn same_owner_priority_retry_updates_effective_priority_not_ticket_identity() {
+        let broker = broker(ReadBrokerConfig {
+            global_in_flight: 1,
+            ..ReadBrokerConfig::default()
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let blocker = key(0x64, 1);
+        let retried = key(0x65, 1);
+        let later_consensus = key(0x66, 1);
+        let _ = broker.request(blocker, 1, 1, sink(Arc::clone(&events)));
+        let original = match broker.request_with_priority(
+            retried,
+            2,
+            1,
+            ReadPriority::History,
+            sink(Arc::clone(&events)),
+        ) {
+            ReadAdmission::Deferred(ticket) => ticket,
+            other => panic!("expected retained History ticket, got {other:?}"),
+        };
+        assert_eq!(
+            broker.request_with_priority(
+                retried,
+                2,
+                1,
+                ReadPriority::Consensus,
+                sink(Arc::clone(&events)),
+            ),
+            ReadAdmission::Attached(original),
+            "the immutable cancellation handle must retain its original identity"
+        );
+        let attached = match broker.request_with_priority(
+            retried,
+            3,
+            1,
+            ReadPriority::Consensus,
+            sink(Arc::clone(&events)),
+        ) {
+            ReadAdmission::Deferred(ticket) => ticket,
+            other => panic!("expected second Consensus subscriber, got {other:?}"),
+        };
+        let _ = broker.request_with_priority(
+            later_consensus,
+            4,
+            1,
+            ReadPriority::Consensus,
+            sink(events),
+        );
+        assert!(broker.cancel(attached));
+        broker
+            .take_ready_dispatches()
+            .pop()
+            .expect("blocker dispatch")
+            .complete(ReadOutcome::Miss);
+        assert_eq!(
+            broker
+                .take_ready_dispatches()
+                .pop()
+                .expect("retried Consensus dispatch")
+                .key(),
+            retried,
+            "same-owner H->C retry must remain Consensus after another subscriber cancels"
+        );
+    }
+
+    #[test]
+    fn exact_owner_promotion_reclassifies_retained_generic_reads() {
+        let broker = broker(ReadBrokerConfig {
+            global_in_flight: 1,
+            ..ReadBrokerConfig::default()
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let blocker = key(0x71, 1);
+        let generic = key(0x72, 1);
+        let history = key(0x73, 1);
+        let _ = broker.request(blocker, 1, 1, sink(Arc::clone(&events)));
+        let _ = broker.request_with_priority(
+            history,
+            2,
+            1,
+            ReadPriority::History,
+            sink(Arc::clone(&events)),
+        );
+        let _ = broker.request_with_priority(generic, 3, 7, ReadPriority::History, sink(events));
+        assert_eq!(broker.promote_session_priority(3, 7), 1);
+        broker
+            .take_ready_dispatches()
+            .pop()
+            .expect("blocker dispatch")
+            .complete(ReadOutcome::Miss);
+        assert_eq!(
+            broker
+                .take_ready_dispatches()
+                .pop()
+                .expect("promoted exact dispatch")
+                .key(),
+            generic
+        );
+    }
+
+    #[test]
+    fn cancelled_dispatched_ticket_retains_tombstone_until_physical_completion() {
         let broker = broker(ReadBrokerConfig::default());
         let events = Arc::new(Mutex::new(Vec::new()));
         let ticket = match broker.request(key(6, 10), 1, 1, sink(Arc::clone(&events))) {
@@ -958,7 +1478,8 @@ mod tests {
         let events = events.lock().expect("event sink");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].outcome, ReadOutcome::Cancelled);
-        assert_eq!(broker.snapshot().metrics.stale_completions, 1);
+        assert_eq!(broker.snapshot().metrics.stale_completions, 0);
+        assert_eq!(broker.snapshot().in_flight_keys, 0);
     }
 
     #[test]

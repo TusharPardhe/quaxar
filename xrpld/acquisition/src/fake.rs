@@ -38,6 +38,8 @@ impl LedgerRequestPort for FakeLedgerRequestPort {
 pub struct FakeReadPort {
     /// Reads in submission order.
     pub submitted: Vec<ReadRequest>,
+    /// Sessions whose retained reads were upgraded after exact-owner binding.
+    pub promoted_sessions: Vec<SessionRef>,
 }
 
 impl FakeReadPort {
@@ -50,6 +52,11 @@ impl FakeReadPort {
 impl ReadPort for FakeReadPort {
     fn submit_read(&mut self, request: ReadRequest) {
         self.submitted.push(request);
+    }
+
+    fn promote_session_priority(&mut self, session: SessionRef) -> usize {
+        self.promoted_sessions.push(session);
+        0
     }
 }
 

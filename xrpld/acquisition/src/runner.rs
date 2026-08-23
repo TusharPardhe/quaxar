@@ -83,6 +83,7 @@ const SESSION_IDLE_MINIMUM: Duration = Duration::from_secs(60);
 /// one serialized continuation per session, so one global three-owner pool is
 /// the conservative async analogue for initial and triggered local scans.
 const MAX_LOCAL_SCAN_OWNERS: usize = 3;
+const MAX_PLAIN_CONSENSUS_SCAN_BURST: usize = 2;
 const TERMINAL_RETENTION: Duration = Duration::from_secs(60);
 /// rippled request batch limits from
 /// `../rippled/src/xrpld/app/ledger/detail/InboundLedger.cpp`:
@@ -250,6 +251,7 @@ pub struct CoordinatorState {
     last_installed_lcl: Option<LedgerIdentity>,
     local_scan_owners: BTreeSet<SessionRef>,
     local_scan_waiters: VecDeque<SessionRef>,
+    plain_consensus_scan_burst: usize,
     /// Sweep-eligible owners that were executing the async equivalent of a
     /// synchronous rippled ledger-data job when the registry sweep ran. The
     /// registry reference may disappear, but its graph survives until that
@@ -491,6 +493,7 @@ pub struct RunnerSnapshot {
     peer_count: usize,
     local_scan_owners: usize,
     local_scan_waiters: usize,
+    recovery_anchor_session: Option<SessionRef>,
     validation_recovery_target: Option<LedgerTarget>,
     validation_recovery_session: Option<SessionRef>,
     events_handled: u64,
@@ -560,6 +563,11 @@ impl RunnerSnapshot {
 
     pub const fn local_scan_waiters(&self) -> usize {
         self.local_scan_waiters
+    }
+
+    /// Exact live session bound to the stable preferred-LCL recovery anchor.
+    pub const fn recovery_anchor_session(&self) -> Option<SessionRef> {
+        self.recovery_anchor_session
     }
 
     /// Exact phase-neutral validation-recovery target, including while it is
@@ -739,6 +747,7 @@ impl CoordinatorRunner {
                 last_installed_lcl: None,
                 local_scan_owners: BTreeSet::new(),
                 local_scan_waiters: VecDeque::new(),
+                plain_consensus_scan_burst: 0,
                 swept_local_scan_owners: BTreeSet::new(),
                 outbound: OutboundRequestAdmission::default(),
                 ids: IdCounter::new(),
@@ -868,6 +877,14 @@ impl CoordinatorRunner {
 
     pub const fn validation_recovery_target(&self) -> Option<LedgerTarget> {
         self.state.validation_recovery_target
+    }
+
+    pub const fn recovery_anchor_session(&self) -> Option<SessionRef> {
+        self.state.recovery_anchor_session
+    }
+
+    pub const fn validation_recovery_session(&self) -> Option<SessionRef> {
+        self.state.validation_recovery_session
     }
 
     /// True only when the exact validation-recovery latch has not yet bound a
@@ -1313,6 +1330,7 @@ impl CoordinatorRunner {
             peer_count: self.state.peer_view.peers().len(),
             local_scan_owners: self.state.local_scan_owners.len(),
             local_scan_waiters: self.state.local_scan_waiters.len(),
+            recovery_anchor_session: self.state.recovery_anchor_session,
             validation_recovery_target: self.state.validation_recovery_target,
             validation_recovery_session: self.state.validation_recovery_session,
             events_handled: self.stats.events_handled,
@@ -3285,8 +3303,8 @@ impl CoordinatorRunner {
     /// JtLedgerData-equivalent continuations may own a local scan. As in
     /// rippled, an owner retains its slot across successive 512-read batches
     /// until the synchronous-scan analogue reaches a natural boundary, except
-    /// that the exact recovery owner may take the slot at an externalized
-    /// read/write boundary.
+    /// that consensus work may take the slot at an externalized read/write
+    /// boundary.
     fn ensure_local_scan_permit(
         &mut self,
         session: SessionRef,
@@ -3302,9 +3320,9 @@ impl CoordinatorRunner {
         // rippled's JtLedgerData job. Keep the existing owner permit while the
         // write is pending, but do not run it again until its exact
         // WriteCompleted event settles. The permit normally remains part of
-        // the three-job bound, but an exact recovery owner may reclaim it
-        // below because this session cannot submit another physical write
-        // before that exact completion wakes it.
+        // the three-job bound, but consensus work may reclaim it below because
+        // this session cannot submit another physical write before that exact
+        // completion wakes it.
         if matches!(
             state.plan.persistence(),
             crate::plan::SessionPersistence::IncrementalWritePending { .. }
@@ -3317,53 +3335,60 @@ impl CoordinatorRunner {
         if self.state.local_scan_owners.contains(&session) {
             return true;
         }
-        let authoritative_caller = self.state.recovery_anchor_session == Some(session)
-            || self.state.validation_recovery_session == Some(session);
-        let preferred_recovery = [
-            self.state.recovery_anchor_session,
-            self.state.validation_recovery_session,
-        ]
-        .into_iter()
-        .flatten()
-        .find(|candidate| {
-            self.state
-                .sessions
-                .get(candidate)
-                .is_some_and(|state| state.phase == SessionPhase::Active)
-                && (*candidate == session || self.state.local_scan_waiters.contains(candidate))
-        });
-        let recovery_to_admit = authoritative_caller.then_some(preferred_recovery).flatten();
-        let blocked_ordinary = (recovery_to_admit.is_some()
-            && self.state.local_scan_owners.len() >= MAX_LOCAL_SCAN_OWNERS)
-            .then(|| {
+        let consensus_caller = self
+            .state
+            .sessions
+            .get(&session)
+            .is_some_and(|state| self.scan_priority_rank(session, state) < 3);
+        let recovery_to_admit = consensus_caller
+            .then(|| self.best_consensus_scan_candidate(Some(session)))
+            .flatten();
+        let blocked_lower_priority = recovery_to_admit
+            .filter(|_| self.state.local_scan_owners.len() >= MAX_LOCAL_SCAN_OWNERS)
+            .and_then(|recovery| {
+                let recovery_state = self.state.sessions.get(&recovery)?;
+                let recovery_rank = self.scan_priority_rank(recovery, recovery_state);
+                if recovery_rank == 2
+                    && self.state.plain_consensus_scan_burst >= MAX_PLAIN_CONSENSUS_SCAN_BURST
+                {
+                    return None;
+                }
                 self.state
                     .local_scan_owners
                     .iter()
                     .copied()
-                    .find(|candidate| {
-                        self.state.recovery_anchor_session != Some(*candidate)
-                            && self.state.validation_recovery_session != Some(*candidate)
-                            && self.state.sessions.get(candidate).is_some_and(
-                                |candidate_state| {
-                                    matches!(
-                                        candidate_state.reason,
-                                        AcquireReason::Generic | AcquireReason::History
-                                    ) && matches!(
-                                        candidate_state.plan.persistence(),
-                                        crate::plan::SessionPersistence::IncrementalWritePending { .. }
-                                    )
-                                },
-                            )
+                    .filter_map(|candidate| {
+                        let candidate_state = self.state.sessions.get(&candidate)?;
+                        let candidate_rank = self.scan_priority_rank(candidate, candidate_state);
+                        (candidate_rank > recovery_rank
+                            && matches!(
+                                candidate_state.plan.persistence(),
+                                crate::plan::SessionPersistence::IncrementalWritePending { .. }
+                            ))
+                        .then_some((candidate_rank, candidate))
                     })
-            })
-            .flatten();
-        if let Some(blocked) = blocked_ordinary {
+                    .max_by_key(|(rank, _)| *rank)
+                    .map(|(_, candidate)| candidate)
+            });
+        if let Some(blocked) = blocked_lower_priority {
             // A rippled JtLedgerData worker never remains occupied while an
             // external durability acknowledgement is pending. Quaxar splits
             // that synchronous job at the NodeStore boundary, so reclaim only
-            // an ordinary owner that cannot currently execute. Its exact
+            // a lower-ranked owner that cannot currently execute. Its exact
             // WriteCompleted event is already the wake that will requeue it.
             self.state.local_scan_owners.remove(&blocked);
+            let recovery_rank = recovery_to_admit
+                .and_then(|recovery| {
+                    self.state
+                        .sessions
+                        .get(&recovery)
+                        .map(|state| self.scan_priority_rank(recovery, state))
+                })
+                .expect("admitted consensus recovery must remain live");
+            if recovery_rank == 2 {
+                self.state.plain_consensus_scan_burst =
+                    self.state.plain_consensus_scan_burst.saturating_add(1);
+            }
         }
         let owners = &mut self.state.local_scan_owners;
         let waiters = &mut self.state.local_scan_waiters;
@@ -3397,8 +3422,8 @@ impl CoordinatorRunner {
         false
     }
 
-    /// At an async boundary, transfer one ordinary scan slot to the exact
-    /// stable recovery waiter. rippled reaches the same boundary inside one
+    /// At an async boundary, transfer one ordinary scan slot to the highest
+    /// priority consensus waiter. rippled reaches the same boundary inside one
     /// synchronous JtLedgerData job; without this handoff, Quaxar can let a
     /// moving Generic scan repeatedly renew its 512-read/write continuation
     /// while the phase owner waits with useful peer data already retained.
@@ -3413,36 +3438,42 @@ impl CoordinatorRunner {
         effects: &mut Vec<AcquisitionEffect>,
     ) -> bool {
         if !self.state.local_scan_owners.contains(&session)
-            || self.state.recovery_anchor_session == Some(session)
-            || self.state.validation_recovery_session == Some(session)
             || self.state.sessions.get(&session).is_none_or(|state| {
-                !matches!(
-                    state.reason,
-                    AcquireReason::Generic | AcquireReason::History
-                ) || state.phase != SessionPhase::Active
-                    || state.plan.pending_read_count() != 0
+                state.phase != SessionPhase::Active || state.plan.pending_read_count() != 0
             })
         {
             return false;
         }
-        let recovery = [
-            self.state.recovery_anchor_session,
-            self.state.validation_recovery_session,
-        ]
-        .into_iter()
-        .flatten()
-        .find(|candidate| {
-            *candidate != session
-                && self.state.local_scan_waiters.contains(candidate)
-                && self
-                    .state
-                    .sessions
-                    .get(candidate)
-                    .is_some_and(|state| state.phase == SessionPhase::Active)
-        });
+        let recovery = self.best_consensus_scan_candidate(None);
         let Some(recovery) = recovery else {
             return false;
         };
+        let owner_rank = self
+            .state
+            .sessions
+            .get(&session)
+            .map(|state| self.scan_priority_rank(session, state))
+            .expect("scan owner must remain live");
+        let recovery_rank = self
+            .state
+            .sessions
+            .get(&recovery)
+            .map(|state| self.scan_priority_rank(recovery, state))
+            .expect("scan waiter must remain live");
+        if recovery_rank >= owner_rank {
+            return false;
+        }
+        if recovery_rank == 2
+            && owner_rank == 3
+            && self.state.plain_consensus_scan_burst >= MAX_PLAIN_CONSENSUS_SCAN_BURST
+        {
+            // Two plain-consensus grants have bypassed this ordinary waiter.
+            // Keep the owner for one bounded continuation; its caller will run
+            // the turn after this refusal. The next completed boundary may
+            // yield again from a fresh burst.
+            self.state.plain_consensus_scan_burst = 0;
+            return false;
+        }
 
         self.state.local_scan_owners.remove(&session);
         self.state
@@ -3451,16 +3482,49 @@ impl CoordinatorRunner {
         if requeue {
             self.state.local_scan_waiters.push_back(session);
         }
+        if recovery_rank == 2 && owner_rank == 3 {
+            self.state.plain_consensus_scan_burst =
+                self.state.plain_consensus_scan_burst.saturating_add(1);
+        }
         self.state.local_scan_owners.insert(recovery);
         self.run_plan_turn(recovery, None, effects);
         true
     }
 
-    /// Select an exact recovery owner first, then retain admission order for
-    /// every other JtLedgerData-equivalent continuation. rippled orders jobs
-    /// of the same type by their monotonic job index, so a later peer reply
-    /// cannot overtake an older ordinary waiter. Existing owners remain
-    /// non-preemptive.
+    fn scan_priority_rank(&self, session_ref: SessionRef, session: &CoordinatorSession) -> u8 {
+        if self.state.recovery_anchor_session == Some(session_ref) {
+            0
+        } else if self.state.validation_recovery_session == Some(session_ref) {
+            1
+        } else if session.reason == AcquireReason::Consensus {
+            2
+        } else {
+            3
+        }
+    }
+
+    fn best_consensus_scan_candidate(&self, caller: Option<SessionRef>) -> Option<SessionRef> {
+        self.state
+            .local_scan_waiters
+            .iter()
+            .copied()
+            .chain(caller)
+            .enumerate()
+            .filter_map(|(index, candidate)| {
+                let state = self.state.sessions.get(&candidate)?;
+                (state.phase == SessionPhase::Active
+                    && self.scan_priority_rank(candidate, state) < 3)
+                    .then_some((self.scan_priority_rank(candidate, state), index, candidate))
+            })
+            .min_by_key(|(rank, index, _)| (*rank, *index))
+            .map(|(_, _, candidate)| candidate)
+    }
+
+    /// Select the stable anchor, validation recovery, then other consensus
+    /// continuations before ordinary work, retaining FIFO within each class.
+    /// rippled orders jobs of the same type by their monotonic job index.
+    /// Existing executing owners remain non-preemptive until a safe async
+    /// boundary.
     fn pop_scan_waiter(&mut self) -> Option<SessionRef> {
         let sessions = &self.state.sessions;
         let recovery_anchor = self.state.recovery_anchor_session;
@@ -3471,14 +3535,52 @@ impl CoordinatorRunner {
                 .get(session)
                 .is_some_and(|state| state.phase == SessionPhase::Active)
         });
-        let preferred = recovery_anchor
-            .and_then(|anchor| waiters.iter().position(|session| *session == anchor))
-            .or_else(|| {
-                validation_recovery
-                    .and_then(|anchor| waiters.iter().position(|session| *session == anchor))
-            });
-        preferred
-            .and_then(|index| waiters.remove(index))
+        let ranked = waiters
+            .iter()
+            .enumerate()
+            .filter_map(|(index, session)| {
+                let state = sessions.get(session)?;
+                let rank = if recovery_anchor == Some(*session) {
+                    0
+                } else if validation_recovery == Some(*session) {
+                    1
+                } else if state.reason == AcquireReason::Consensus {
+                    2
+                } else {
+                    3
+                };
+                Some((rank, index))
+            })
+            .collect::<Vec<_>>();
+        let absolute = ranked
+            .iter()
+            .copied()
+            .filter(|(rank, _)| *rank < 2)
+            .min_by_key(|(rank, index)| (*rank, *index));
+        let plain = ranked.iter().copied().find(|(rank, _)| *rank == 2);
+        let ordinary = ranked.iter().copied().find(|(rank, _)| *rank == 3);
+        let selected = absolute.or_else(|| match (plain, ordinary) {
+            (Some(_), Some(ordinary))
+                if self.state.plain_consensus_scan_burst >= MAX_PLAIN_CONSENSUS_SCAN_BURST =>
+            {
+                self.state.plain_consensus_scan_burst = 0;
+                Some(ordinary)
+            }
+            (Some(plain), ordinary) => {
+                if ordinary.is_some() {
+                    self.state.plain_consensus_scan_burst =
+                        self.state.plain_consensus_scan_burst.saturating_add(1);
+                }
+                Some(plain)
+            }
+            (None, Some(ordinary)) => {
+                self.state.plain_consensus_scan_burst = 0;
+                Some(ordinary)
+            }
+            (None, None) => None,
+        });
+        selected
+            .and_then(|(_, index)| waiters.remove(index))
             .or_else(|| waiters.pop_front())
     }
 
@@ -3526,6 +3628,10 @@ impl CoordinatorRunner {
             return;
         }
         self.stats.plan_turns += 1;
+        let Some(reason) = self.state.sessions.get(&session).map(|state| state.reason) else {
+            return;
+        };
+        let priority = self.effective_read_priority(session, reason);
         let (turn, retained_reply_peer) = {
             let CoordinatorState { sessions, ids, .. } = &mut self.state;
             let Some(session_state) = sessions.get_mut(&session) else {
@@ -3537,7 +3643,7 @@ impl CoordinatorRunner {
             let mut ctx = TurnContext {
                 session,
                 store_generation: session.store_generation(),
-                priority: Self::read_priority(session_state.reason),
+                priority,
                 ids,
             };
             (
@@ -4544,6 +4650,10 @@ impl CoordinatorRunner {
         nodes: &[PlanNetworkNeed],
         effects: &mut Vec<AcquisitionEffect>,
     ) {
+        let Some(reason) = self.state.sessions.get(&session).map(|state| state.reason) else {
+            return;
+        };
+        let priority = self.effective_read_priority(session, reason);
         let requests = {
             let CoordinatorState { sessions, ids, .. } = &mut self.state;
             let Some(state) = sessions.get_mut(&session) else {
@@ -4555,7 +4665,7 @@ impl CoordinatorRunner {
             let mut ctx = TurnContext {
                 session,
                 store_generation: session.store_generation(),
-                priority: Self::read_priority(state.reason),
+                priority,
                 ids,
             };
             state.plan.reprobe_network_batch(nodes, &mut ctx)
@@ -4710,6 +4820,16 @@ impl CoordinatorRunner {
         match reason {
             AcquireReason::Consensus => ReadPriority::Consensus,
             AcquireReason::Generic | AcquireReason::History => ReadPriority::History,
+        }
+    }
+
+    fn effective_read_priority(&self, session: SessionRef, reason: AcquireReason) -> ReadPriority {
+        if self.state.recovery_anchor_session == Some(session)
+            || self.state.validation_recovery_session == Some(session)
+        {
+            ReadPriority::Consensus
+        } else {
+            Self::read_priority(reason)
         }
     }
 
@@ -10767,6 +10887,215 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_async_boundary_yields_to_plain_consensus_waiter() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let ordinary = peer_request_session(&acquire_with_effects(&mut runner, 82));
+        let consensus = peer_request_session(&acquire_with_effects(&mut runner, 83));
+        runner
+            .state
+            .sessions
+            .get_mut(&ordinary)
+            .expect("ordinary")
+            .reason = AcquireReason::Generic;
+        runner
+            .state
+            .sessions
+            .get_mut(&consensus)
+            .expect("consensus")
+            .reason = AcquireReason::Consensus;
+        {
+            let state = runner
+                .state
+                .sessions
+                .get_mut(&consensus)
+                .expect("consensus");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(83),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(83_010)),
+                    83,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+        }
+        runner.state.local_scan_owners.insert(ordinary);
+        runner.state.local_scan_waiters.push_back(consensus);
+
+        let mut effects = Vec::new();
+        assert!(runner.yield_ordinary_scan_to_recovery(ordinary, true, &mut effects));
+        assert!(runner.state.local_scan_owners.contains(&consensus));
+        assert!(runner.state.local_scan_waiters.contains(&ordinary));
+    }
+
+    #[test]
+    fn scan_waiters_rank_exact_then_validation_then_plain_consensus() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let sessions = (84..88)
+            .map(|seq| peer_request_session(&acquire_with_effects(&mut runner, seq)))
+            .collect::<Vec<_>>();
+        let ordinary = sessions[0];
+        let consensus = sessions[1];
+        let validation = sessions[2];
+        let anchor = sessions[3];
+        runner
+            .state
+            .sessions
+            .get_mut(&ordinary)
+            .expect("ordinary")
+            .reason = AcquireReason::Generic;
+        runner.state.recovery_anchor_session = Some(anchor);
+        runner.state.validation_recovery_session = Some(validation);
+        runner.state.local_scan_waiters = VecDeque::from([ordinary, consensus, validation, anchor]);
+
+        assert_eq!(runner.pop_scan_waiter(), Some(anchor));
+        assert_eq!(runner.pop_scan_waiter(), Some(validation));
+        assert_eq!(runner.pop_scan_waiter(), Some(consensus));
+        assert_eq!(runner.pop_scan_waiter(), Some(ordinary));
+    }
+
+    #[test]
+    fn safe_boundary_preempts_only_for_strictly_higher_recovery_rank() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let sessions = (88..91)
+            .map(|seq| peer_request_session(&acquire_with_effects(&mut runner, seq)))
+            .collect::<Vec<_>>();
+        let plain = sessions[0];
+        let validation = sessions[1];
+        let anchor = sessions[2];
+        for (session, seq) in [(validation, 89_u32), (anchor, 90_u32)] {
+            let state = runner.state.sessions.get_mut(&session).expect("candidate");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(u64::from(seq)),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(u64::from(seq) * 1_000 + 10)),
+                    seq,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+        }
+        runner.state.recovery_anchor_session = Some(anchor);
+        runner.state.validation_recovery_session = Some(validation);
+        runner.state.local_scan_owners.insert(validation);
+        runner.state.local_scan_waiters = VecDeque::from([plain, anchor]);
+
+        let mut effects = Vec::new();
+        assert!(runner.yield_ordinary_scan_to_recovery(validation, true, &mut effects));
+        assert!(runner.state.local_scan_owners.contains(&anchor));
+        assert!(runner.state.local_scan_waiters.contains(&validation));
+        assert!(runner.state.local_scan_waiters.contains(&plain));
+
+        runner.state.local_scan_owners.clear();
+        runner.state.local_scan_waiters = VecDeque::from([validation]);
+        runner.state.recovery_anchor_session = None;
+        runner.state.local_scan_owners.insert(plain);
+        let mut validation_effects = Vec::new();
+        assert!(runner.yield_ordinary_scan_to_recovery(plain, true, &mut validation_effects));
+        assert!(runner.state.local_scan_owners.contains(&validation));
+    }
+
+    #[test]
+    fn plain_consensus_burst_grants_oldest_ordinary_every_third_slot() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let sessions = (91..95)
+            .map(|seq| peer_request_session(&acquire_with_effects(&mut runner, seq)))
+            .collect::<Vec<_>>();
+        let ordinary = sessions[0];
+        runner
+            .state
+            .sessions
+            .get_mut(&ordinary)
+            .expect("ordinary")
+            .reason = AcquireReason::Generic;
+        runner.state.local_scan_waiters =
+            VecDeque::from([ordinary, sessions[1], sessions[2], sessions[3]]);
+
+        assert_eq!(runner.pop_scan_waiter(), Some(sessions[1]));
+        assert_eq!(runner.pop_scan_waiter(), Some(sessions[2]));
+        assert_eq!(runner.pop_scan_waiter(), Some(ordinary));
+        assert_eq!(runner.pop_scan_waiter(), Some(sessions[3]));
+    }
+
+    #[test]
+    fn completed_boundary_forces_ordinary_after_plain_consensus_burst() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let ordinary = peer_request_session(&acquire_with_effects(&mut runner, 95));
+        let consensus = peer_request_session(&acquire_with_effects(&mut runner, 96));
+        runner
+            .state
+            .sessions
+            .get_mut(&ordinary)
+            .expect("ordinary")
+            .reason = AcquireReason::Generic;
+        {
+            let state = runner
+                .state
+                .sessions
+                .get_mut(&consensus)
+                .expect("consensus");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(96),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(96_010)),
+                    96,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+        }
+        runner.state.local_scan_owners.insert(ordinary);
+        runner.state.local_scan_waiters.push_back(consensus);
+        runner.state.plain_consensus_scan_burst = MAX_PLAIN_CONSENSUS_SCAN_BURST;
+
+        let mut forced_ordinary = Vec::new();
+        assert!(!runner.yield_ordinary_scan_to_recovery(ordinary, true, &mut forced_ordinary));
+        assert!(runner.state.local_scan_owners.contains(&ordinary));
+        assert_eq!(runner.state.plain_consensus_scan_burst, 0);
+
+        let mut next_boundary = Vec::new();
+        assert!(runner.yield_ordinary_scan_to_recovery(ordinary, true, &mut next_boundary));
+        assert!(runner.state.local_scan_owners.contains(&consensus));
+        assert_eq!(runner.state.plain_consensus_scan_burst, 1);
+    }
+
+    #[test]
     fn arriving_recovery_reclaims_only_an_ordinary_pending_writer() {
         let budget = BudgetState::new(
             8,
@@ -10876,6 +11205,94 @@ mod tests {
     }
 
     #[test]
+    fn arriving_plain_consensus_reclaims_an_ordinary_pending_writer() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let sessions = (95..99)
+            .map(|seq| peer_request_session(&acquire_with_effects(&mut runner, seq)))
+            .collect::<Vec<_>>();
+        let blocked = sessions[0];
+        let consensus = sessions[3];
+
+        for session in &sessions[..3] {
+            runner
+                .state
+                .sessions
+                .get_mut(session)
+                .expect("ordinary")
+                .reason = AcquireReason::Generic;
+            runner.state.local_scan_owners.insert(*session);
+        }
+        {
+            let state = runner.state.sessions.get_mut(&blocked).expect("blocked");
+            state.pending_header_read = None;
+            assert!(
+                state.plan.install_engine(Box::new(
+                    ScriptedEngine::new(
+                        TreePlanId::new(95),
+                        VecDeque::from([ScriptedStep::NeedsNetwork(vec![(
+                            SHAMapNodeId::default(),
+                            Uint256::from(95_040),
+                        )])]),
+                        vec![crate::io::PersistNode::new(
+                            SHAMapHash::new(Uint256::from(95_050)),
+                            bytes::Bytes::from_static(b"accepted-node"),
+                            crate::io::StoredObjectKind::AccountNode,
+                        )],
+                    )
+                    .with_persistence_sequence(95),
+                ))
+            );
+        }
+        let mut write_effects = Vec::new();
+        runner.run_plan_turn(blocked, None, &mut write_effects);
+        assert!(matches!(
+            runner
+                .state
+                .sessions
+                .get(&blocked)
+                .expect("blocked")
+                .plan
+                .persistence(),
+            crate::plan::SessionPersistence::IncrementalWritePending { .. }
+        ));
+        {
+            let state = runner
+                .state
+                .sessions
+                .get_mut(&consensus)
+                .expect("consensus");
+            state.reason = AcquireReason::Consensus;
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(98),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(98_060)),
+                    98,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+        }
+
+        let mut effects = Vec::new();
+        runner.run_plan_turn(consensus, None, &mut effects);
+        assert!(!runner.state.local_scan_owners.contains(&blocked));
+        assert!(runner.state.local_scan_owners.contains(&consensus));
+        assert!(
+            read_effects(&effects)
+                .iter()
+                .any(|read| read.operation().session() == consensus)
+        );
+    }
+
+    #[test]
     fn generic_provenance_exact_recovery_owner_is_never_displaced() {
         let budget = BudgetState::new(
             8,
@@ -10930,6 +11347,44 @@ mod tests {
             effect,
             AcquisitionEffect::SubmitRead(read) if read.operation().session() == validation
         )));
+    }
+
+    #[test]
+    fn generic_provenance_exact_recovery_emits_consensus_reads() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let exact = peer_request_session(&acquire_with_effects(&mut runner, 99));
+        {
+            let state = runner
+                .state
+                .sessions
+                .get_mut(&exact)
+                .expect("exact recovery");
+            state.reason = AcquireReason::Generic;
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(99),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(99_010)),
+                    99,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+        }
+        runner.state.recovery_anchor_session = Some(exact);
+
+        let mut effects = Vec::new();
+        runner.run_plan_turn(exact, None, &mut effects);
+        let reads = read_effects(&effects);
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].priority(), ReadPriority::Consensus);
     }
 
     #[test]

@@ -33,6 +33,13 @@ pub trait ReadPort {
     /// Submit a physical read. The broker reports a typed `ReadCompletion`.
     fn submit_read(&mut self, request: ReadRequest);
 
+    /// Upgrade retained reads when an existing Generic session becomes an
+    /// exact consensus/recovery owner after admission. Fakes and ports without
+    /// a retained priority queue have nothing to reclassify.
+    fn promote_session_priority(&mut self, _session: SessionRef) -> usize {
+        0
+    }
+
     /// Retry retained exact read completions from the coordinator owner turn.
     /// Deterministic fakes have no cross-thread completion queue.
     fn flush_completions(&mut self) {}

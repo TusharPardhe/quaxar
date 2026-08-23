@@ -55,9 +55,10 @@ use acquisition::{
     AcquisitionEffect, AcquisitionEvent, AdmissionBudget, AdmissionGate, AdmittedLedgerPacket,
     BackpressureOutcome, CancellationPort, CoordinatorPorts, CoordinatorRunner, HandoffPort,
     LedgerDataRequest, LedgerRequestPort, PeerAvailabilitySnapshot, PeerId, PeerRequest, PhasePort,
-    ReadCompletion, ReadOutcome, ReadPort, ReadRequest, ReferenceDecision, RouteEntry,
-    RoutingGeneration, RoutingSnapshot, RunEpoch, SessionPhase, SessionRef, ShadowConfig,
-    ShadowObservation, ShadowOutcome, ShadowRunner, ShadowSnapshot, TimerPort, WritePort,
+    ReadCompletion, ReadOutcome, ReadPort, ReadPriority, ReadRequest, ReferenceDecision,
+    RouteEntry, RoutingGeneration, RoutingSnapshot, RunEpoch, SessionPhase, SessionRef,
+    ShadowConfig, ShadowObservation, ShadowOutcome, ShadowRunner, ShadowSnapshot, TimerPort,
+    WritePort,
 };
 
 use super::read_broker::{
@@ -387,6 +388,12 @@ pub(crate) struct CoordinatorAdapter<R, RD, WR, T, H, P, C> {
     /// Cancellations remain excluded: only `SessionPhase::Failed` represents
     /// an acquisition failure eligible for history re-admission suppression.
     terminal_failures: BTreeSet<Uint256>,
+    /// Last exact owners whose already-retained Generic reads were upgraded.
+    /// These mirrors carry no lifecycle authority; the runner remains the
+    /// source of truth and each transition is applied idempotently to the
+    /// resource-local broker queues.
+    promoted_recovery_read_owner: Option<SessionRef>,
+    promoted_validation_read_owner: Option<SessionRef>,
 }
 
 impl<R, RD, WR, T, H, P, C> CoordinatorAdapter<R, RD, WR, T, H, P, C>
@@ -451,6 +458,8 @@ where
             last_drain_has_more: false,
             fetch_pack,
             terminal_failures: BTreeSet::new(),
+            promoted_recovery_read_owner: None,
+            promoted_validation_read_owner: None,
         };
         adapter.publish_routing();
         adapter
@@ -538,6 +547,7 @@ where
         let reference_session = event_session(&event);
         self.shadow.record(&event);
         let effects = self.runner.handle_event(event);
+        self.reconcile_exact_read_priorities();
         self.observe_shadow_result(reference_session, &effects);
         self.note_terminal_failures(&effects);
         // A request can synchronously produce an overlay reply. Publish the
@@ -558,6 +568,7 @@ where
                 .record(&AcquisitionEvent::ReadCompleted(completion.clone()));
         }
         let effects = self.runner.handle_read_batch(completions);
+        self.reconcile_exact_read_priorities();
         self.shadow.observe_effects(&effects);
         for session in reference_sessions {
             self.compare_shadow_session(session);
@@ -970,6 +981,23 @@ where
         self.compare_shadow_effect_sessions(effects);
     }
 
+    fn reconcile_exact_read_priorities(&mut self) {
+        let recovery = self.runner.recovery_anchor_session();
+        if recovery != self.promoted_recovery_read_owner {
+            if let Some(session) = recovery {
+                self.reads.promote_session_priority(session);
+            }
+            self.promoted_recovery_read_owner = recovery;
+        }
+        let validation = self.runner.validation_recovery_session();
+        if validation != self.promoted_validation_read_owner {
+            if let Some(session) = validation {
+                self.reads.promote_session_priority(session);
+            }
+            self.promoted_validation_read_owner = validation;
+        }
+    }
+
     fn compare_shadow_effect_sessions(&mut self, effects: &[AcquisitionEffect]) {
         let sessions = effects
             .iter()
@@ -1266,7 +1294,71 @@ impl LedgerRequestPort for OverlayLedgerRequestPort {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BrokerTicketState {
     tickets: Arc<Mutex<BTreeMap<SessionRef, Vec<ReadTicket>>>>,
-    capacity_backlog: Arc<Mutex<VecDeque<ReadRequest>>>,
+    capacity_backlog: Arc<Mutex<PriorityReadBacklog>>,
+}
+
+#[derive(Debug, Default)]
+struct PriorityReadBacklog {
+    consensus: VecDeque<ReadRequest>,
+    history: VecDeque<ReadRequest>,
+}
+
+impl PriorityReadBacklog {
+    fn push_back(&mut self, request: ReadRequest) {
+        match request.priority() {
+            ReadPriority::Consensus => self.consensus.push_back(request),
+            ReadPriority::History => self.history.push_back(request),
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<ReadRequest> {
+        self.consensus
+            .pop_front()
+            .or_else(|| self.history.pop_front())
+    }
+
+    fn push_front(&mut self, request: ReadRequest) {
+        match request.priority() {
+            ReadPriority::Consensus => self.consensus.push_front(request),
+            ReadPriority::History => self.history.push_front(request),
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&ReadRequest) -> bool) {
+        self.consensus.retain(&mut keep);
+        self.history.retain(keep);
+    }
+
+    fn promote_session(&mut self, session: SessionRef) -> usize {
+        let mut retained = VecDeque::with_capacity(self.history.len());
+        let mut promoted = 0;
+        while let Some(request) = self.history.pop_front() {
+            if request.operation().session() == session {
+                self.consensus.push_back(ReadRequest::new(
+                    request.operation(),
+                    request.key(),
+                    request.ledger_sequence(),
+                    request.store_generation(),
+                    ReadPriority::Consensus,
+                ));
+                promoted += 1;
+            } else {
+                retained.push_back(request);
+            }
+        }
+        self.history = retained;
+        promoted
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.consensus.len() + self.history.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.consensus.is_empty() && self.history.is_empty()
+    }
 }
 
 /// Brokered NodeStore read submission backed by the shared [`NodeReadBroker`].
@@ -1299,7 +1391,8 @@ impl BrokerReadPort {
 
     /// Attempts one exact coordinator read. A `false` result means the broker
     /// retained neither a ticket nor a callback; callers keep the request in
-    /// the port FIFO until a real broker completion reopens capacity.
+    /// the port's per-priority FIFO until a real broker completion reopens
+    /// capacity.
     fn try_submit(&mut self, request: ReadRequest) -> bool {
         let operation = request.operation();
         let session = operation.session();
@@ -1333,7 +1426,13 @@ impl BrokerReadPort {
                 operation, outcome,
             )));
         });
-        match self.broker.request(key, acquisition_id, plan_id, sink) {
+        match self.broker.request_with_priority(
+            key,
+            acquisition_id,
+            plan_id,
+            request.priority(),
+            sink,
+        ) {
             ReadAdmission::Accepted(ticket)
             | ReadAdmission::Attached(ticket)
             | ReadAdmission::Deferred(ticket) => {
@@ -1358,6 +1457,20 @@ impl BrokerReadPort {
             }
         }
     }
+
+    fn promote_session_priority(&mut self, session: SessionRef) -> usize {
+        let retained = self
+            .broker
+            .promote_session_priority(session.session_id().get(), session.plan_epoch().get());
+        let backlog = self
+            .tickets
+            .capacity_backlog
+            .lock()
+            .expect("broker capacity backlog lock")
+            .promote_session(session);
+        self.broker.submit_ready_to_node_store(&self.node_store);
+        retained + backlog
+    }
 }
 
 impl ReadPort for BrokerReadPort {
@@ -1371,8 +1484,16 @@ impl ReadPort for BrokerReadPort {
         }
     }
 
+    fn promote_session_priority(&mut self, session: SessionRef) -> usize {
+        BrokerReadPort::promote_session_priority(self, session)
+    }
+
     fn flush_completions(&mut self) {
-        // Retry at most the currently retained FIFO once per adapter drain.
+        // A physical completion may admit a broker-retained successor from
+        // inside the NodeStore callback. Hand that ready dispatch back to the
+        // store before retrying port-owned capacity backlog.
+        self.broker.submit_ready_to_node_store(&self.node_store);
+        // Retry Consensus before History, preserving FIFO inside each class.
         // A still-full broker leaves the first request queued and stops; no
         // synthetic completion is generated, so capacity pressure cannot form
         // a self-waking owner loop.
@@ -1410,12 +1531,21 @@ impl ReadPort for BrokerReadPort {
 pub(crate) struct BrokerCancellationDispatcher {
     broker: NodeReadBroker,
     tickets: BrokerTicketState,
+    node_store: SHAMapStoreNodeStore,
 }
 
 impl BrokerCancellationDispatcher {
     /// Builds a cancellation dispatcher sharing the broker and ticket state.
-    pub(crate) fn new(broker: NodeReadBroker, tickets: BrokerTicketState) -> Self {
-        Self { broker, tickets }
+    pub(crate) fn new(
+        broker: NodeReadBroker,
+        tickets: BrokerTicketState,
+        node_store: SHAMapStoreNodeStore,
+    ) -> Self {
+        Self {
+            broker,
+            tickets,
+            node_store,
+        }
     }
 }
 
@@ -1438,6 +1568,7 @@ impl CancellationPort for BrokerCancellationDispatcher {
         for ticket in tickets {
             let _ = self.broker.cancel(ticket);
         }
+        self.broker.submit_ready_to_node_store(&self.node_store);
     }
 }
 
@@ -1447,6 +1578,7 @@ mod tests {
 
     use crate::ReadBrokerConfig;
     use crate::ledger::inbound_ledgers::coordinator_ports::CoordinatorTimerPort;
+    use crate::ledger::inbound_ledgers::read_broker::ACQ_READS_PER_SCAN;
     use crate::ledger::inbound_ledgers::worker_pool::WorkerPool;
     use acquisition::fake::{
         FakeCancellationPort, FakeHandoffPort, FakeLedgerRequestPort, FakePhasePort, FakeReadPort,
@@ -3215,7 +3347,11 @@ mod tests {
             ReadPriority::Consensus,
         );
 
-        let mut dispatcher = BrokerCancellationDispatcher::new(broker.clone(), tickets.clone());
+        let mut dispatcher = BrokerCancellationDispatcher::new(
+            broker.clone(),
+            tickets.clone(),
+            port.node_store.clone(),
+        );
         port.submit_read(request);
         assert_eq!(
             broker.snapshot().in_flight_keys,
@@ -3363,7 +3499,11 @@ mod tests {
             "capacity pressure must not synthesize a self-waking stale event"
         );
 
-        let mut dispatcher = BrokerCancellationDispatcher::new(broker.clone(), tickets.clone());
+        let mut dispatcher = BrokerCancellationDispatcher::new(
+            broker.clone(),
+            tickets.clone(),
+            port.node_store.clone(),
+        );
         dispatcher.session_cancelled(first_session);
         port.flush_completions();
         assert!(
@@ -3375,6 +3515,303 @@ mod tests {
             "a real settlement reopens capacity for the retained FIFO"
         );
         assert_eq!(broker.snapshot().logical_tickets, 1);
+    }
+
+    #[test]
+    fn broker_port_consensus_bypasses_retained_history_capacity_backlog() {
+        let broker = NodeReadBroker::new(ReadBrokerConfig {
+            global_in_flight: ACQ_READS_PER_SCAN + 1,
+            max_global_retained_logical_subscriptions: ACQ_READS_PER_SCAN + 1,
+            max_retained_logical_subscriptions: ACQ_READS_PER_SCAN + 1,
+        })
+        .expect("broker");
+        let tickets = BrokerTicketState::default();
+        let (tx, _rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let scheduler = Arc::new(BrokerCaptureScheduler::default());
+        let mut port = BrokerReadPort::new(
+            broker.clone(),
+            tickets.clone(),
+            broker_test_node_store_with("broker-priority-backlog", scheduler),
+            tx,
+        );
+        let mut counter = IdCounter::new();
+        let request = |session, hash, priority, counter: &mut IdCounter| {
+            ReadRequest::new(
+                OperationRef::new(
+                    session,
+                    OperationKind::Read,
+                    counter.next_id(),
+                    counter.next_id(),
+                ),
+                SHAMapHash::new(Uint256::from(hash)),
+                1,
+                StoreGeneration::new(1),
+                priority,
+            )
+        };
+        let first_history = session(50);
+        let queued_history = session(51);
+        let consensus = session(52);
+        port.submit_read(request(
+            first_history,
+            0x50,
+            ReadPriority::History,
+            &mut counter,
+        ));
+        port.submit_read(request(
+            queued_history,
+            0x51,
+            ReadPriority::History,
+            &mut counter,
+        ));
+        port.submit_read(request(
+            consensus,
+            0x52,
+            ReadPriority::Consensus,
+            &mut counter,
+        ));
+
+        let backlog = tickets.capacity_backlog.lock().expect("capacity backlog");
+        assert_eq!(backlog.history.len(), 1);
+        assert!(backlog.consensus.is_empty());
+        drop(backlog);
+        assert_eq!(
+            tickets
+                .tickets
+                .lock()
+                .expect("broker tickets")
+                .get(&consensus)
+                .map(Vec::len),
+            Some(1),
+            "Consensus must use its reserved broker lane instead of queueing behind History"
+        );
+        assert!(broker.snapshot().in_flight_keys <= ACQ_READS_PER_SCAN + 1);
+    }
+
+    #[test]
+    fn exact_binding_promotes_generic_capacity_backlog_before_retry() {
+        let broker = NodeReadBroker::new(ReadBrokerConfig {
+            global_in_flight: 1,
+            max_global_retained_logical_subscriptions: 1,
+            max_retained_logical_subscriptions: 1,
+        })
+        .expect("broker");
+        let tickets = BrokerTicketState::default();
+        let (tx, _rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let scheduler = Arc::new(BrokerCaptureScheduler::default());
+        let mut port = BrokerReadPort::new(
+            broker.clone(),
+            tickets.clone(),
+            broker_test_node_store_with("broker-exact-promotion", scheduler),
+            tx,
+        );
+        let mut counter = IdCounter::new();
+        let request = |session, hash, priority, counter: &mut IdCounter| {
+            ReadRequest::new(
+                OperationRef::new(
+                    session,
+                    OperationKind::Read,
+                    counter.next_id(),
+                    counter.next_id(),
+                ),
+                SHAMapHash::new(Uint256::from(hash)),
+                1,
+                StoreGeneration::new(1),
+                priority,
+            )
+        };
+        let blocker = session(60);
+        let exact = session(61);
+        port.submit_read(request(
+            blocker,
+            0x60,
+            ReadPriority::Consensus,
+            &mut counter,
+        ));
+        port.submit_read(request(exact, 0x61, ReadPriority::History, &mut counter));
+        assert_eq!(
+            tickets
+                .capacity_backlog
+                .lock()
+                .expect("capacity backlog")
+                .history
+                .len(),
+            1
+        );
+        assert_eq!(port.promote_session_priority(exact), 1);
+        let backlog = tickets.capacity_backlog.lock().expect("capacity backlog");
+        assert!(backlog.history.is_empty());
+        assert_eq!(backlog.consensus.len(), 1);
+        drop(backlog);
+
+        let mut dispatcher = BrokerCancellationDispatcher::new(
+            broker.clone(),
+            tickets.clone(),
+            port.node_store.clone(),
+        );
+        dispatcher.session_cancelled(blocker);
+        port.flush_completions();
+        assert!(
+            tickets
+                .capacity_backlog
+                .lock()
+                .expect("capacity backlog")
+                .is_empty()
+        );
+        assert!(
+            broker.snapshot().logical_tickets <= 1,
+            "the promoted retry must remain within the physical/logical bound"
+        );
+    }
+
+    #[test]
+    fn retained_generic_promotion_submits_newly_admitted_physical_read() {
+        let broker = NodeReadBroker::new(ReadBrokerConfig {
+            global_in_flight: ACQ_READS_PER_SCAN + 1,
+            max_global_retained_logical_subscriptions: ACQ_READS_PER_SCAN * 2 + 1,
+            max_retained_logical_subscriptions: ACQ_READS_PER_SCAN + 1,
+        })
+        .expect("broker");
+        let tickets = BrokerTicketState::default();
+        let (tx, _rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let scheduler = Arc::new(BrokerCaptureScheduler::default());
+        let mut port = BrokerReadPort::new(
+            broker.clone(),
+            tickets.clone(),
+            broker_test_node_store_with("broker-promote-submit", scheduler.clone()),
+            tx,
+        );
+        let mut counter = IdCounter::new();
+        let request = |session, hash, counter: &mut IdCounter| {
+            ReadRequest::new(
+                OperationRef::new(
+                    session,
+                    OperationKind::Read,
+                    counter.next_id(),
+                    counter.next_id(),
+                ),
+                SHAMapHash::new(Uint256::from(hash)),
+                1,
+                StoreGeneration::new(1),
+                ReadPriority::History,
+            )
+        };
+        let blocker = session(70);
+        let exact = session(71);
+        port.submit_read(request(blocker, 0x70, &mut counter));
+        port.submit_read(request(exact, 0x71, &mut counter));
+        assert_eq!(broker.snapshot().in_flight_keys, 1);
+        assert_eq!(broker.snapshot().queued_keys, 1);
+        assert!(
+            tickets
+                .capacity_backlog
+                .lock()
+                .expect("capacity backlog")
+                .is_empty(),
+            "the Generic read must be retained inside the broker, not the port backlog"
+        );
+
+        assert_eq!(port.promote_session_priority(exact), 1);
+        assert_eq!(broker.snapshot().queued_keys, 0);
+        assert_eq!(broker.snapshot().metrics.physical_dispatched, 2);
+        assert_eq!(
+            broker.ready_dispatch_count(),
+            0,
+            "the production port must hand the newly admitted dispatch to NodeStore"
+        );
+    }
+
+    #[test]
+    fn cancellation_submits_next_broker_retained_physical_read() {
+        let broker = NodeReadBroker::new(ReadBrokerConfig {
+            global_in_flight: 1,
+            max_global_retained_logical_subscriptions: 2,
+            max_retained_logical_subscriptions: 2,
+        })
+        .expect("broker");
+        let tickets = BrokerTicketState::default();
+        let (tx, _rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let scheduler = Arc::new(BrokerCaptureScheduler::default());
+        let mut port = BrokerReadPort::new(
+            broker.clone(),
+            tickets.clone(),
+            broker_test_node_store_with("broker-cancel-submit", scheduler.clone()),
+            tx,
+        );
+        let mut counter = IdCounter::new();
+        let request = |session, hash, counter: &mut IdCounter| {
+            ReadRequest::new(
+                OperationRef::new(
+                    session,
+                    OperationKind::Read,
+                    counter.next_id(),
+                    counter.next_id(),
+                ),
+                SHAMapHash::new(Uint256::from(hash)),
+                1,
+                StoreGeneration::new(1),
+                ReadPriority::Consensus,
+            )
+        };
+        let first = session(72);
+        let next = session(73);
+        port.submit_read(request(first, 0x72, &mut counter));
+        port.submit_read(request(next, 0x73, &mut counter));
+        assert_eq!(broker.snapshot().in_flight_keys, 1);
+        assert_eq!(broker.snapshot().queued_keys, 1);
+
+        let mut dispatcher =
+            BrokerCancellationDispatcher::new(broker.clone(), tickets, port.node_store.clone());
+        dispatcher.session_cancelled(first);
+        assert_eq!(
+            broker.snapshot().in_flight_keys,
+            1,
+            "the uncancellable physical read must retain its capacity tombstone"
+        );
+        assert_eq!(broker.snapshot().queued_keys, 1);
+        assert_eq!(
+            broker.ready_dispatch_count(),
+            0,
+            "cancellation must not over-admit while the physical callback is outstanding"
+        );
+        assert!(broker.complete(
+            ReadKey::new(Uint256::from(0x72), 1, 1),
+            BrokerReadOutcome::Miss,
+        ));
+        assert_eq!(broker.ready_dispatch_count(), 1);
+        port.flush_completions();
+        assert_eq!(
+            broker.ready_dispatch_count(),
+            0,
+            "settling the tombstone must admit and submit the retained successor"
+        );
+    }
+
+    #[test]
+    fn validation_recovery_binding_promotes_existing_generic_session_once() {
+        let (mut adapter, _) = adapter();
+        adapter.connectivity(&[1]);
+        let ledger = target(0x81, 81);
+        let effects = adapter.acquire_requested(ledger, AcquireReason::Generic);
+        let session = effects
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("Generic session");
+        assert!(adapter.reads.promoted_sessions.is_empty());
+
+        adapter.validation_recovery_target(Some(ledger));
+        assert_eq!(adapter.runner.validation_recovery_session(), Some(session));
+        assert_eq!(adapter.reads.promoted_sessions, vec![session]);
+
+        adapter.validation_recovery_target(Some(ledger));
+        assert_eq!(
+            adapter.reads.promoted_sessions,
+            vec![session],
+            "a stable exact owner must not repeatedly rescan broker tickets"
+        );
     }
 
     #[test]

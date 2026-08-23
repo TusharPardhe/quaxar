@@ -362,26 +362,28 @@ impl PersistenceWork for CoordinatorPersistenceWork {
                     batch.fence().map(|_| DurabilityOutcome::Stale),
                 )
             } else {
-                let mut write_failed = None;
-                for node in batch.nodes() {
-                    if let Err(error) = match &node_store {
-                        SHAMapStoreNodeStore::Single(database) => database.store(
+                // One coordinator WriteBatch is one physical NodeStore batch.
+                // Preserve each node's object classification and the verified
+                // ledger sequence while avoiding one backend lock/key-table
+                // transaction per PersistNode. The final durability fence is
+                // still issued only after this whole batch succeeds.
+                let objects = batch
+                    .nodes()
+                    .iter()
+                    .map(|node| {
+                        (
                             nodestore_object_type(node.object_kind()),
                             node.data().to_vec(),
                             *node.key().as_uint256(),
                             batch.ledger_sequence(),
-                        ),
-                        SHAMapStoreNodeStore::Rotating(database) => database.store(
-                            nodestore_object_type(node.object_kind()),
-                            node.data().to_vec(),
-                            *node.key().as_uint256(),
-                            batch.ledger_sequence(),
-                        ),
-                    } {
-                        write_failed = Some(error);
-                        break;
-                    }
+                        )
+                    })
+                    .collect();
+                let write_failed = match &node_store {
+                    SHAMapStoreNodeStore::Single(database) => database.store_batch(objects),
+                    SHAMapStoreNodeStore::Rotating(database) => database.store_batch(objects),
                 }
+                .err();
                 match (write_failed, batch.fence()) {
                     (Some(_), Some(_)) => (WriteOutcome::Failed, Some(DurabilityOutcome::Failed)),
                     (Some(_), None) => (WriteOutcome::Failed, None),
@@ -841,12 +843,12 @@ pub(crate) fn build_coordinator_adapter(resources: CoordinatorPortResources) -> 
         node_store.clone(),
         tx.clone(),
     );
-    let writes = CoordinatorWritePort::new(node_store, tx.clone());
+    let writes = CoordinatorWritePort::new(node_store.clone(), tx.clone());
     let timers = CoordinatorTimerPort::new(timer_pool, tx.clone());
     let handoffs = CoordinatorHandoffPort::new(completed_ledgers_tx, tx.clone());
     let phase = CoordinatorPhasePort::new(phase_mode_owner);
     let cancellations = CoordinatorCancellationDispatcher::new(
-        BrokerCancellationDispatcher::new(broker, tickets),
+        BrokerCancellationDispatcher::new(broker, tickets, node_store),
         timers.clone(),
         writes.clone(),
     );
@@ -1041,6 +1043,68 @@ mod tests {
         let (object, status) = backend.fetch(&Uint256::from(0xAA));
         assert_eq!(status, nodestore::Status::Ok);
         assert_eq!(object.expect("stored node").data().as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn write_port_batch_preserves_every_node_and_object_type() {
+        let node_store = memory_node_store("coord-write-port-batch-types");
+        let (tx, rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let mut port = CoordinatorWritePort::new(node_store.clone(), tx);
+
+        let session = session(40);
+        let write = operation(session, OperationKind::Write);
+        let nodes = [
+            (
+                0xA1,
+                StoredObjectKind::AccountNode,
+                NodeObjectType::AccountNode,
+            ),
+            (
+                0xA2,
+                StoredObjectKind::TransactionNode,
+                NodeObjectType::TransactionNode,
+            ),
+            (0xA3, StoredObjectKind::Ledger, NodeObjectType::Ledger),
+        ];
+        port.submit_write(WriteBatch::incremental(
+            write,
+            StoreGeneration::new(node_store.store_generation()),
+            778,
+            nodes
+                .iter()
+                .map(|(key, kind, _)| {
+                    PersistNode::new(
+                        SHAMapHash::new(Uint256::from(*key)),
+                        bytes::Bytes::from(vec![*key as u8]),
+                        *kind,
+                    )
+                })
+                .collect(),
+        ));
+
+        match rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("batched write completion")
+        {
+            acquisition::AcquisitionEvent::WriteCompleted(completion) => {
+                assert_eq!(completion.operation(), write);
+                assert_eq!(completion.outcome(), WriteOutcome::Accepted);
+            }
+            other => panic!("expected a write completion, got {other:?}"),
+        }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        let backend = node_store.export_backend().expect("backend");
+        for (key, _, expected_type) in nodes {
+            let (object, status) = backend.fetch(&Uint256::from(key));
+            assert_eq!(status, nodestore::Status::Ok);
+            let object = object.expect("batched node");
+            assert_eq!(object.object_type(), expected_type);
+            assert_eq!(object.data().as_slice(), &[key as u8]);
+        }
     }
 
     #[test]
