@@ -5,6 +5,10 @@ means acquiring a validated ledger header plus its complete state and
 transaction SHAMaps, persisting the required nodes, and advancing LedgerMaster
 onto the network's validated chain.
 
+For the coordinator's internal ownership, typed event/effect loop, per-hash
+session lifecycle, backpressure, cache lookup order, and durability sequence,
+see [ACQUISITION.md](ACQUISITION.md).
+
 ## Server states
 
 The normal progression is:

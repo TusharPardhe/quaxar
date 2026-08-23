@@ -34,43 +34,55 @@ the metrics crate, but the current bootstrap does not initialize a Prometheus
 exporter. Components register with the stop tree so producers stop before the
 consumers and storage they use.
 
+```mermaid
+flowchart TB
+    MAIN[quaxar-main<br/>configuration and ordered lifecycle] --> APP[ApplicationRoot]
+    APP --> NET[NetworkOps strand<br/>LCL policy and consensus lifecycle]
+    APP --> LEDGER[LedgerMaster<br/>validated and published heads]
+    APP --> ACQ[Acquisition coordinator<br/>hash sessions and sync phase]
+    APP --> OVERLAY[Overlay and PeerFinder]
+    APP --> TX[Open ledger, transaction queue,<br/>and consensus application]
+    APP --> RPC[RPC and subscriptions]
+    APP --> STORE[NodeStore, SHAMapStore,<br/>history and relational databases]
+
+    OVERLAY -->|peer status, validations,<br/>ledger and tx-set messages| NET
+    NET -->|typed targets and lifecycle facts| ACQ
+    ACQ -->|durable complete ledgers| LEDGER
+    LEDGER -->|publication and LCL facts| NET
+    NET -->|accepted parent and round result| TX
+    TX -->|closed child| LEDGER
+    LEDGER --> RPC
+    STORE --> ACQ
+    STORE --> LEDGER
+```
+
+The acquisition coordinator deserves its own detailed design because it is the
+orchestrator across policy, peer transport, SHAMap traversal, persistence, and
+durable handoff while remaining independent of their concrete implementations.
+See [ACQUISITION.md](ACQUISITION.md) for its ownership model, event/effect
+loop, state machines, backpressure lanes, and end-to-end sequence diagrams.
+
 ## Ledger flow
 
-```text
-peer messages and local transactions
-                |
-                v
-       overlay dispatch / JobQueue
-                |
-                v
-       NetworkOps strand (single owner)
-          |
-          +--> moving preferred-LCL policy
-          |          |
-          |          +--> independent per-hash acquisitions
-          |          v
-          +--> stable recovery anchor / coordinator phase
-                     |
-                     v
-    per-hash ledger / transaction-set acquisition
-          |
-          +--> shared NodeFamily caches and NodeStore reads
-          +--> bounded peer requests and fetch-pack reuse
-          v
-    complete immutable state and transaction SHAMaps
-          v
-    structural completion -> history + eligible validation waiters
-          v
-    durable completion handoff -> accepted-boundary NetworkOps LCL reconciliation
-          |
-          v
-    installed LCL and current open-ledger view
-          v
-    consensus builds child -> NetworkOps accepts close
-          v
-    LedgerMaster: validated -> published
-          v
-    RPC views, history, relational metadata
+```mermaid
+flowchart TD
+    INPUT[Peer messages and local transactions] --> DISPATCH[Overlay dispatch and JobQueue]
+    DISPATCH --> STRAND[NetworkOps strand<br/>single policy owner]
+    STRAND --> PREF[Moving preferred-LCL policy]
+    STRAND --> ANCHOR[Stable recovery anchor<br/>and coordinator phase]
+    PREF --> SESSIONS[Independent per-hash acquisitions]
+    ANCHOR --> SESSIONS
+    SESSIONS --> RESIDENT[Shared NodeFamily caches,<br/>fetch pack, and NodeStore]
+    SESSIONS --> PEERS[Bounded peer requests]
+    RESIDENT --> MAPS[Complete immutable state<br/>and transaction SHAMaps]
+    PEERS --> MAPS
+    MAPS --> DURABLE[Writes, durability fence,<br/>and exact handoff]
+    DURABLE --> RECHECK[Accepted-boundary preferred-LCL recheck]
+    RECHECK --> LCL[Installed canonical LCL<br/>and current open-ledger view]
+    LCL --> CONSENSUS[Consensus builds child]
+    CONSENSUS --> ACCEPT[NetworkOps accepts close]
+    ACCEPT --> HEADS[LedgerMaster validated<br/>then published]
+    HEADS --> OUTPUT[RPC views, history,<br/>and relational metadata]
 ```
 
 The acquisition coordinator serializes typed events into phase transitions and
@@ -190,6 +202,21 @@ later dry-strand result without exposing candidate-state side effects.
 
 ## Storage and caches
 
+```mermaid
+flowchart LR
+    PLAN[SHAMap traversal] --> TC[Tree-node cache]
+    PLAN --> FB[FullBelow cache]
+    PLAN --> FP[Fetch-pack cache]
+    PLAN --> NS[NodeStore abstraction]
+    NS --> NUDB[NuDB]
+    NS --> OTHER[Other configured backend]
+    NUDB --> DATA[nudb.dat<br/>immutable values and spills]
+    NUDB --> KEY[nudb.key<br/>hash buckets]
+    NUDB --> LOG[nudb.log<br/>crash recovery preimages]
+    HEAD[LedgerMaster] --> HIST[Ledger history indexes]
+    HEAD --> RDB[Relational ledger and tx metadata]
+```
+
 - `NodeStore` persists immutable ledger objects, normally in NuDB.
 - `NodeFamily` supplies the shared tree-node and full-below caches used by
   ledger acquisition and SHAMap reads.
@@ -209,6 +236,42 @@ NodeStore. A later target can therefore complete from earlier partial work.
 Online-delete rotation freshens tree and transaction cache keys, clears prior
 LedgerMaster caches and then clears FullBelow state. A complete NodeFamily
 reset is reserved for ordered shutdown.
+
+Online deletion uses two physical backend generations. It copies archive-only
+objects needed by the validated state tree into the writable generation before
+atomically rotating. Copies are bounded into 64-hash durable batches. A
+foreground-writer gate gives consensus writes priority between maintenance
+batches, so maintenance cannot monopolize the writable generation.
+
+```mermaid
+sequenceDiagram
+    participant S as SHAMapStore worker
+    participant R as DatabaseRotating
+    participant A as Archive backend
+    participant W as Writable backend
+    participant C as Consensus writer
+
+    S->>R: copy validated-state hashes (bounded batch)
+    R->>W: batch-fetch existing hashes
+    R->>A: batch-fetch writable misses
+    C->>R: queue foreground checked batch
+    Note over R: foreground has priority before<br/>the next maintenance batch
+    R->>W: durable archive-copy batch
+    R->>W: foreground consensus batch
+    S->>R: rotate new writable generation
+    R->>R: old writable becomes archive<br/>and old archive is retired
+```
+
+The current Rust NuDB backend uses transactional burst overlays. It writes a
+small durable checkpoint header before file growth, keeps modified key buckets
+dirty and fetch-visible in memory, records only first-touch preimages of
+modified original buckets (`c0`), fsyncs those preimages before overwriting any
+bucket, writes each final dirty bucket once (`c1`), syncs data/key files, and
+atomically clears the log. Recovery replays selective preimages and truncates
+both files to the exact checkpoint extents. Because this implementation still
+commits synchronously, each burst is capped at 1,024 admitted objects to bound
+the mutation-fence latency; native NuDB-style asynchronous byte-budgeted
+admission remains a future backend evolution, not a property claimed here.
 
 ## Networking and trust
 

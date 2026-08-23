@@ -358,6 +358,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | Operator configuration reference. |
 | [CLI.md](docs/CLI.md) | Full command line reference. |
 | [SYNCING.md](docs/SYNCING.md) | Sync behavior, acquisition flow, and operator checks. |
+| [ACQUISITION.md](docs/ACQUISITION.md) | Coordinator ownership, per-hash sessions, data flow, backpressure, and durability architecture. |
 | [VALIDATORS.md](docs/VALIDATORS.md) | Validator identity, configuration, and operational guidance. |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout and runtime design. |
 | [RPC.md](docs/RPC.md) | Supported RPC methods and examples. |
