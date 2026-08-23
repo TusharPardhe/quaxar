@@ -143,6 +143,17 @@ enum PreferredLclReconciliation {
     Switched,
 }
 
+fn effective_validation_recovery_target(
+    ordinary_selected: Uint256,
+    local_lcl: Uint256,
+    stable_anchor: Option<(Uint256, u32)>,
+) -> acquisition::LedgerTarget {
+    stable_anchor
+        .map(|(hash, seq)| acquisition::LedgerTarget::new(hash, Some(seq)))
+        .filter(|target| target.hash() != local_lcl)
+        .unwrap_or_else(|| acquisition::LedgerTarget::new(ordinary_selected, None))
+}
+
 /// Result of the strand-owned second phase of inbound completion. A result is
 /// acknowledged only after its intended lifecycle transition is durable or
 /// intentionally cache-only; retry retains the acquisition in the registry.
@@ -1428,10 +1439,22 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         .validation_recovery_candidate
         .map(|(seq, hash)| (hash, seq));
     shared_inbound.coordinator_validation_recovery_target(validation_recovery_target);
-    let selected_preferred_hash = preference_diagnostic.selected;
-    // Match rippled's checkLastClosedLedger: preference is recomputed for
-    // every accepted-boundary pass. Existing per-hash acquisitions may finish
-    // in the background, but an old request never pins policy to a stale LCL.
+    let ordinary_selected_preferred_hash = preference_diagnostic.selected;
+    // The diagnostic candidate is moving advice. Only the coordinator's
+    // provenance-backed stable anchor may override a trie-local preference.
+    // Once bound, retain that exact networkClosed target until its lifecycle
+    // clears it so successive timer checks cannot redirect consensus to the
+    // stale local branch while the asynchronous acquisition is active.
+    let selected_preferred_target = effective_validation_recovery_target(
+        ordinary_selected_preferred_hash,
+        our_hash,
+        shared_inbound.coordinator_validation_recovery_latch().0,
+    );
+    let selected_preferred_hash = selected_preferred_target.hash();
+    // Match rippled's checkLastClosedLedger: ordinary preference is recomputed
+    // for every accepted-boundary pass. The one exception is the bounded,
+    // provenance-backed recovery anchor above: while its exact acquisition is
+    // live it remains networkClosed, matching acquiringLedger_ ownership.
     let preferred_hash = selected_preferred_hash;
     if let Some(waiter) = provisional_waiter.as_ref().copied()
         && waiter.identity.target_hash == preferred_hash
@@ -1485,7 +1508,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         local_lcl_seq = our_closed.header().seq,
         preferred_lcl_hash = %preferred_hash,
         selected_preferred_lcl_hash = %selected_preferred_hash,
-        recovery_target_stabilized = preferred_hash != selected_preferred_hash,
+        recovery_target_stabilized = preferred_hash != ordinary_selected_preferred_hash,
         peer_count = peers.len(),
         selected_trusted_validation_count = root.validations().num_trusted_for_ledger(preferred_hash),
         selected_peer_lcl_support = peer_counts.get(&preferred_hash).copied().unwrap_or_default(),
@@ -1668,7 +1691,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             runner,
             consensus_rt,
             last_round_ledger_id,
-            preferred_hash,
+            selected_preferred_target,
             &our_closed,
         );
         return PreferredLclReconciliation::Pending;
@@ -1700,7 +1723,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             runner,
             consensus_rt,
             last_round_ledger_id,
-            preferred_hash,
+            acquisition::LedgerTarget::new(preferred_hash, None),
             &our_closed,
         );
         shared_inbound
@@ -1812,7 +1835,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
             runner,
             consensus_rt,
             last_round_ledger_id,
-            preferred_hash,
+            acquisition::LedgerTarget::new(preferred_hash, Some(candidate.header().seq)),
             &our_closed,
         );
         shared_inbound
@@ -1935,27 +1958,23 @@ fn restart_preferred_lcl_recovery(
     runner: &mut dyn ConsensusRunner,
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
-    target: Uint256,
+    target: acquisition::LedgerTarget,
     our_closed: &Arc<ledger::Ledger>,
 ) {
     // The divergence fact drains before the caller's acquire demand so a
-    // coordinator-owned session is minted from `Syncing`. Sequence is unknown
-    // for an absent/incomplete preferred LCL: keep it `None` until the response
-    // header establishes it (rippled `getLedgerByHash` parity).
-    demote_for_preferred_lcl_divergence(
-        root,
-        shared_inbound,
-        acquisition::LedgerTarget::new(target, None),
-    );
+    // coordinator-owned session is minted from `Syncing`. A stable validation
+    // recovery anchor already carries a verified sequence; ordinary resolver
+    // misses remain hash-only until their Base reply establishes it.
+    demote_for_preferred_lcl_divergence(root, shared_inbound, target);
     let now = root.shared_time_keeper().close_time();
     let prev_cx = crate::consensus_ledger_from_ledger(our_closed);
     if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
         inbound_tx.new_round(our_closed.header().seq);
     }
-    runner.start_round(now, target, prev_cx, false);
+    runner.start_round(now, target.hash(), prev_cx, false);
     consensus_rt.update_phase(runner.phase());
     consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-    *last_round_ledger_id = Some(target);
+    *last_round_ledger_id = Some(target.hash());
 }
 
 /// Commit the resident, currently preferred LCL. Inbound completion only
@@ -3010,8 +3029,8 @@ mod tests {
     use super::{
         ConsensusJobScheduler, CoordinatorHandoffDedup, LclAuditSampler, MAX_COMMANDS_PER_TURN,
         MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, PreferredLclReconciliation,
-        coordinator_publication_is_fresh, drain_bounded, enqueue_recovered_txsets,
-        heartbeat_operating_mode_reassertion, history_acquire_allowed,
+        coordinator_publication_is_fresh, drain_bounded, effective_validation_recovery_target,
+        enqueue_recovered_txsets, heartbeat_operating_mode_reassertion, history_acquire_allowed,
         history_fetch_pack_requested, persist_completed_inbound_ledger,
         process_completed_inbound_ledger, published_ledger_is_contiguous_with_lcl,
         reconcile_preferred_lcl_with_status_broadcaster, record_completed_inbound_ledger,
@@ -3034,6 +3053,33 @@ mod tests {
     use acquisition::{
         DurableHandoffId, IdCounter, LedgerIdentity, LedgerTarget, SessionRef, StoreGeneration,
     };
+
+    #[test]
+    fn stable_validation_recovery_anchor_overrides_local_and_moving_preferences() {
+        let local = Uint256::from(10);
+        let anchor = Uint256::from(20);
+        let moving = Uint256::from(30);
+        let stable = Some((anchor, 20));
+
+        assert_eq!(
+            effective_validation_recovery_target(local, local, stable),
+            acquisition::LedgerTarget::new(anchor, Some(20))
+        );
+        assert_eq!(
+            effective_validation_recovery_target(moving, local, stable),
+            acquisition::LedgerTarget::new(anchor, Some(20)),
+            "moving candidate B must not replace stable anchor A"
+        );
+        assert_eq!(
+            effective_validation_recovery_target(moving, local, None),
+            acquisition::LedgerTarget::new(moving, None)
+        );
+        assert_eq!(
+            effective_validation_recovery_target(moving, local, Some((local, 10))),
+            acquisition::LedgerTarget::new(moving, None),
+            "an anchor equal to the installed LCL is not a divergence"
+        );
+    }
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;
     use basics::chrono::NetClockTimePoint;
@@ -3559,10 +3605,66 @@ mod tests {
         (node_id, RclValidation::new(Arc::new(validation)))
     }
 
+    fn install_empty_reconciliation_coordinator(
+        root: &mut ApplicationRoot,
+    ) -> (TempDir, Arc<InboundLedgers>) {
+        let runtime = root.attach_default_ledger_master_runtime();
+        let dir = TempDir::new().expect("temporary inbound store");
+        let mut config = BasicConfig::new();
+        config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+        let node_db = config.section_mut("node_db");
+        node_db.set("type", "Memory");
+        node_db.set("path", dir.path().join("node").to_string_lossy());
+        let store = crate::bootstrap_shamap_store(
+            &config,
+            false,
+            128,
+            1,
+            8,
+            64,
+            2,
+            &ManagerImp::new(),
+            Arc::new(DummyScheduler) as Arc<dyn Scheduler>,
+            Arc::new(NullJournal),
+        )
+        .expect("memory node store");
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let inbound = Arc::new(InboundLedgers::new(
+            Arc::new(TreeNodeCache::new(
+                "network-ops-stable-recovery",
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            Arc::new(FullBelowCacheImpl::new(
+                1,
+                MonotonicClock::default(),
+                HardenedHashBuilder::default(),
+                8,
+            )),
+            Arc::new(FetchPackCache::new(
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            completed_tx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        inbound.set_node_store(store.node_store);
+        inbound.set_phase_mode_owner(root.network_ops_mode_owner());
+        assert!(inbound.install_coordinator());
+        *runtime
+            .inbound_ledgers
+            .lock()
+            .expect("inbound registry slot") = Some(Arc::clone(&inbound));
+        (dir, inbound)
+    }
+
     struct RecordingRunner {
         phase: ConsensusPhase,
         prev: Uint256,
         start_rounds: usize,
+        last_proposing: Option<bool>,
     }
 
     impl RecordingRunner {
@@ -3571,6 +3673,7 @@ mod tests {
                 phase: ConsensusPhase::Accepted,
                 prev,
                 start_rounds: 0,
+                last_proposing: None,
             }
         }
     }
@@ -3589,11 +3692,12 @@ mod tests {
             _now: NetClockTimePoint,
             prev_ledger_id: Uint256,
             _prev_ledger: RclCxLedger,
-            _proposing: bool,
+            proposing: bool,
         ) {
             self.start_rounds += 1;
             self.prev = prev_ledger_id;
             self.phase = ConsensusPhase::Open;
+            self.last_proposing = Some(proposing);
         }
 
         fn got_tx_set(&mut self, _now: NetClockTimePoint, _tx_set: consensus::RclTxSet) {}
@@ -3607,6 +3711,75 @@ mod tests {
         fn prev_ledger_id(&self) -> Uint256 {
             self.prev
         }
+    }
+
+    #[test]
+    fn real_reconciliation_retains_stable_anchor_and_restarts_wrong_ledger() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let local = immutable_ledger(10, 0x10);
+        let local_hash = *local.header().hash.as_uint256();
+        root.attach_default_ledger_master_runtime();
+        root.on_closed_ledger(Arc::clone(&local));
+        root.network_ops_mode_owner()
+            .set_operating_mode_direct(NetworkOpsOperatingMode::Full);
+        let (_store_dir, inbound) = install_empty_reconciliation_coordinator(&mut root);
+
+        let anchor = Uint256::from_u64(0xA11CE);
+        assert_ne!(anchor, local_hash);
+        assert!(inbound.coordinator_validation_recovery_target(Some((anchor, 20))));
+        assert!(inbound.coordinator_report_peer_availability(&[1]));
+        assert_eq!(
+            inbound.coordinator_validation_recovery_latch().0,
+            Some((anchor, 20))
+        );
+
+        let before = root.closed_ledger().expect("local LCL installed");
+        let mut runner = RecordingRunner::accepted(local_hash);
+        let consensus_rt = AppConsensusRuntime::new();
+        let mut last_round = None;
+        let mut sampler = LclAuditSampler::new();
+        let mut provisional_waiter = None;
+        assert_eq!(
+            reconcile_preferred_lcl_with_status_broadcaster(
+                &root,
+                &inbound,
+                &mut runner,
+                &consensus_rt,
+                &mut last_round,
+                &mut sampler,
+                &mut provisional_waiter,
+                &|_, _, _, _| panic!("pending recovery must not broadcast a switch"),
+            ),
+            PreferredLclReconciliation::Pending
+        );
+
+        assert_eq!(runner.prev, anchor);
+        assert_eq!(runner.start_rounds, 1, "only the WrongLedger round starts");
+        assert_eq!(runner.last_proposing, Some(false));
+        assert_eq!(last_round, Some(anchor));
+        // This harness has no OverlayRuntime, so the accepted-boundary target
+        // refresh inside reconciliation intentionally leaves the transport
+        // snapshot empty and the typed divergence is rejected. Re-feed the
+        // same live-peer fact used by production, then prove the exact target
+        // transition that reconciliation requested.
+        assert!(inbound.coordinator_report_peer_availability(&[1]));
+        assert!(inbound.coordinator_preferred_lcl_divergence(LedgerTarget::new(anchor, Some(20),)));
+        let phase = *inbound.coordinator_snapshot().expect("snapshot").phase();
+        assert!(
+            matches!(
+                phase,
+                acquisition::SyncPhase::Syncing { target }
+                    if target == LedgerTarget::new(anchor, Some(20))
+            ),
+            "unexpected coordinator phase: {phase:?}"
+        );
+        assert_ne!(
+            root.network_ops_operating_mode(),
+            NetworkOpsOperatingMode::Full
+        );
+        let after = root.closed_ledger().expect("local LCL remains installed");
+        assert_eq!(after.header().hash, before.header().hash);
+        assert_eq!(after.header().seq, before.header().seq);
     }
 
     #[test]

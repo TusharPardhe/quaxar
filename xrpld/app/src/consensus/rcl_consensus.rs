@@ -204,6 +204,17 @@ fn validation_recovery_conflicts_with_parent(
     recovery.is_some_and(|(hash, _)| hash != parent)
 }
 
+fn retain_stable_recovery_preference(
+    ordinary_preferred: Uint256,
+    local_parent: Uint256,
+    stable_recovery: Option<(Uint256, u32)>,
+) -> Uint256 {
+    stable_recovery
+        .map(|(hash, _)| hash)
+        .filter(|hash| *hash != local_parent)
+        .unwrap_or(ordinary_preferred)
+}
+
 /// The open-ledger view consensus reads current (not-yet-consensus-agreed)
 /// transactions from, and resets once a round is accepted.
 pub trait RclConsensusOpenLedgerSource {
@@ -894,10 +905,23 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             .ledger_master()
             .valid_ledger_seq();
         let wrapped = self.validated_view(prev_ledger);
-        let preferred = RclConsensusValidationSource::preferred_min_seq(
+        let ordinary_preferred = RclConsensusValidationSource::preferred_min_seq(
             &self.validations,
             &wrapped,
             min_valid_seq,
+        );
+        // A validation-recovery candidate is moving advice, but once the
+        // coordinator binds its provenance-backed anchor it is the exact
+        // GetConsL1 target. Retain it across timer checks until lifecycle
+        // reconciliation clears it; otherwise the trie-local preference can
+        // redirect generic consensus back onto the stale local branch.
+        let stable_recovery_anchor = self
+            .coordinator_inbound()
+            .and_then(|inbound| inbound.coordinator_validation_recovery_latch().0);
+        let preferred = retain_stable_recovery_preference(
+            ordinary_preferred,
+            prev_ledger.id(),
+            stable_recovery_anchor,
         );
         if mode != ConsensusMode::WrongLedger && preferred != *prev_ledger_id {
             // rippled RCLConsensus.cpp:313-316: consensusViewChange() demotes
@@ -1783,6 +1807,33 @@ impl AppConsensus {
     fn do_accept_and_start_next_round(&mut self, now: NetClockTimePoint, work: PendingAcceptWork) {
         let closed_seq = work.closed_seq;
         let root = self.adaptor.app_root.clone();
+        let parent_hash = *work.parent_ledger.header().hash.as_uint256();
+        let stable_recovery_anchor = self
+            .adaptor
+            .coordinator_inbound()
+            .and_then(|inbound| inbound.coordinator_validation_recovery_latch().0);
+        if validation_recovery_conflicts_with_parent(stable_recovery_anchor, parent_hash) {
+            let (target_hash, target_seq) =
+                stable_recovery_anchor.expect("conflict requires a stable recovery anchor");
+            // The round may have entered Accepted before the asynchronous
+            // validation recovery became stable. Discard the captured child
+            // before any build, store, broadcast, validation, open-ledger
+            // rebuild, or LCL mutation can extend the stale branch. Keep the
+            // runner Accepted: the NetworkOps strand consumes this handoff and
+            // immediately runs its sole endConsensus reconciliation owner,
+            // which demotes on the exact target and starts WrongLedger.
+            root.notify_consensus_event();
+            tracing::warn!(
+                target: "lcl_audit",
+                work_parent_hash = %parent_hash,
+                work_parent_seq = work.parent_ledger.header().seq,
+                recovery_target_hash = %target_hash,
+                recovery_target_seq = target_seq,
+                closed_seq,
+                "LCL_AUDIT stale accepted child vetoed pending exact endConsensus recovery"
+            );
+            return;
+        }
         // Quaxar's on_closed_ledger schedules a JtBatch that can otherwise
         // race the newly rebased OpenLedger before this accept finishes.
         // This reentrant gate is the local analogue of rippled's master/ledger
@@ -1941,8 +1992,8 @@ mod tests {
         coordinator_should_report_no_consensus_positions, decode_consensus_accept_transactions,
         disputed_relay_envelope, median_close_offset_seconds, pseudo_transaction_voting_enabled,
         reset_inbound_transactions_for_resolved_consensus_ledger,
-        trusted_validation_quorum_reached, update_operating_mode_after_accept,
-        validation_recovery_conflicts_with_parent,
+        retain_stable_recovery_preference, trusted_validation_quorum_reached,
+        update_operating_mode_after_accept, validation_recovery_conflicts_with_parent,
     };
     use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
     use crate::network::network_ops::{
@@ -2022,6 +2073,29 @@ mod tests {
             Some((Uint256::from(11), 11)),
             parent
         ));
+    }
+
+    #[test]
+    fn get_prev_retains_stable_anchor_over_local_or_moving_preference() {
+        let local = Uint256::from(10);
+        let anchor = Uint256::from(20);
+        let moving = Uint256::from(30);
+        assert_eq!(
+            retain_stable_recovery_preference(local, local, Some((anchor, 20))),
+            anchor
+        );
+        assert_eq!(
+            retain_stable_recovery_preference(moving, local, Some((anchor, 20))),
+            anchor
+        );
+        assert_eq!(
+            retain_stable_recovery_preference(moving, local, None),
+            moving
+        );
+        assert_eq!(
+            retain_stable_recovery_preference(moving, local, Some((local, 10))),
+            moving
+        );
     }
 
     fn failed_candidate_test_runner(root: &mut ApplicationRoot) -> AppConsensus {
@@ -2190,6 +2264,61 @@ mod tests {
         }
     }
 
+    fn install_empty_test_coordinator(
+        root: &mut ApplicationRoot,
+    ) -> (TempDir, Arc<InboundLedgers>) {
+        let runtime = root.attach_default_ledger_master_runtime();
+        let dir = TempDir::new().expect("temporary inbound store");
+        let mut config = BasicConfig::new();
+        config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+        let node_db = config.section_mut("node_db");
+        node_db.set("type", "Memory");
+        node_db.set("path", dir.path().join("node").to_string_lossy());
+        let store = crate::bootstrap_shamap_store(
+            &config,
+            false,
+            128,
+            1,
+            8,
+            64,
+            2,
+            &ManagerImp::new(),
+            Arc::new(DummyScheduler) as Arc<dyn Scheduler>,
+            Arc::new(NullJournal),
+        )
+        .expect("memory node store");
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let inbound = Arc::new(InboundLedgers::new(
+            Arc::new(TreeNodeCache::new(
+                "rcl-accept-veto",
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            Arc::new(FullBelowCacheImpl::new(
+                1,
+                MonotonicClock::default(),
+                HardenedHashBuilder::default(),
+                8,
+            )),
+            Arc::new(FetchPackCache::new(
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            completed_tx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        inbound.set_node_store(store.node_store);
+        inbound.set_phase_mode_owner(root.network_ops_mode_owner());
+        assert!(inbound.install_coordinator());
+        *runtime
+            .inbound_ledgers
+            .lock()
+            .expect("inbound registry slot") = Some(Arc::clone(&inbound));
+        (dir, inbound)
+    }
+
     #[test]
     fn failed_candidate_build_keeps_parent_and_restarts_from_accepted() {
         let mut root = ApplicationRoot::new(0).expect("root should build");
@@ -2228,6 +2357,40 @@ mod tests {
                 .expect("pending accept lock")
                 .is_none(),
             "failed candidate must not leave accept work scheduled"
+        );
+    }
+
+    #[test]
+    fn stable_recovery_anchor_vetoes_captured_accept_before_child_install() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 1_000, false));
+        let parent_hash = *parent.header().hash.as_uint256();
+        root.on_closed_ledger(Arc::clone(&parent));
+        let (_store_dir, inbound) = install_empty_test_coordinator(&mut root);
+        let recovery = Uint256::from_u64(0xA11CE);
+        assert_ne!(recovery, parent_hash);
+        assert!(inbound.coordinator_validation_recovery_target(Some((recovery, 20))));
+        assert_eq!(
+            inbound.coordinator_validation_recovery_latch().0,
+            Some((recovery, 20))
+        );
+
+        let mut runner = failed_candidate_test_runner(&mut root);
+        assert_eq!(runner.phase(), ConsensusPhase::Accepted);
+        runner.execute_accept(
+            NetClockTimePoint::new(1_020),
+            failed_candidate_work(Arc::clone(&parent)),
+        );
+
+        let closed = root.closed_ledger().expect("parent remains installed");
+        assert_eq!(*closed.header().hash.as_uint256(), parent_hash);
+        assert_eq!(closed.header().seq, 10, "no stale child may be installed");
+        assert_eq!(runner.prev_ledger_id(), parent_hash);
+        assert_eq!(runner.phase(), ConsensusPhase::Accepted);
+        assert_eq!(
+            root.status_rpc_state().current_ledger_index(),
+            None,
+            "accept veto runs before open-ledger/status mutation"
         );
     }
 
