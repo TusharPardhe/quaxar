@@ -5980,6 +5980,12 @@ impl ApplicationRoot {
         let overlay = overlay_runtime.overlay();
         let manifest_limits = self.manifest_limits;
         overlay.set_max_manifests_message_size(manifest_limits.maximum_message_size());
+        let ledger_master_state = Arc::clone(&self.ledger_master_state);
+        overlay.set_validated_ledger_status_provider(move || {
+            ledger_master_state
+                .validated_ledger_seq()
+                .map(|sequence| (sequence, ledger_master_state.validated_ledger_age()))
+        });
         let manifests = Arc::clone(&self.registry.validator_manifest_cache);
         let validators = self.validators();
         overlay.set_manifests_message_provider(move || {

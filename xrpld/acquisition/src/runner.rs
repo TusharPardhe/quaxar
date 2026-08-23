@@ -1642,17 +1642,22 @@ impl CoordinatorRunner {
         effects
     }
 
-    /// The bounded retained-session policy evicts the oldest dormant consensus
-    /// session before deferring a newer preferred target at capacity. Eviction
-    /// is terminal cancellation only for a pre-fence dormant session; active
-    /// supersession itself never cancels the retained plan.
+    /// The bounded retained-session policy may evict the oldest unowned dormant
+    /// consensus session before deferring a newer preferred target at capacity.
+    /// Exact preferred and validation recovery owners remain non-evictable;
+    /// rippled retains those per-hash InboundLedgers until a natural terminal
+    /// boundary.
     fn evict_oldest_dormant_consensus(&mut self, effects: &mut Vec<AcquisitionEffect>) -> bool {
+        let recovery_anchor = self.state.recovery_anchor_session;
+        let validation_recovery = self.state.validation_recovery_session;
         let oldest = self
             .state
             .sessions
             .iter()
-            .filter(|(_, state)| {
+            .filter(|(session, state)| {
                 state.reason == AcquireReason::Consensus && state.phase == SessionPhase::Dormant
+                    && recovery_anchor != Some(**session)
+                    && validation_recovery != Some(**session)
             })
             .min_by_key(|(session, _)| session.session_id())
             .map(|(session, _)| *session);
@@ -1880,28 +1885,10 @@ impl CoordinatorRunner {
         {
             would_exceed = false;
         }
-        // Authoritative preferred-LCL recovery outranks the advisory
-        // validation-recovery owner. Preempt only work that has not crossed
-        // the durable handoff boundary, and retain the advisory target as an
-        // unbound exact demand for later capacity.
-        if would_exceed && authoritative_recovery_demand {
-            let advisory = self.state.validation_recovery_session.filter(|session| {
-                self.state.sessions.get(session).is_some_and(|state| {
-                    state.target.hash() != target.hash()
-                        && matches!(state.phase, SessionPhase::Active | SessionPhase::Persisting)
-                })
-            });
-            if let Some(advisory) = advisory {
-                self.cancel_session(advisory, CancelReason::Explicit, &mut effects);
-                // Session and app provenance are one-shot. Retaining this
-                // target unbound would let internal reconciliation restart it
-                // without a fresh accepted-boundary observation to register
-                // new plan/handoff origins.
-                self.state.validation_recovery_session = None;
-                self.state.validation_recovery_target = None;
-                would_exceed = false;
-            }
-        }
+        // A later preferred-LCL observation does not cancel an existing
+        // per-hash InboundLedger in rippled. Preserve the exact validation
+        // recovery tree through its natural terminal boundary and retain the
+        // latest preferred demand below when capacity is exhausted.
         // Consensus may preempt only a cancellable lower-priority session.
         // DurablePending is intentionally excluded: its completed result and
         // handoff are already committed and must not be revoked.
@@ -7608,56 +7595,160 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_lcl_recovery_preempts_advisory_validation_at_capacity() {
+    fn preferred_lcl_recovery_defers_behind_active_validation_recovery_owner() {
         let budget = BudgetState::new(1, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
         let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
         connect(&mut runner);
-        let advisory = target(200);
-        let advisory_effects =
-            runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(advisory)));
-        let advisory_session = advisory_effects
+        let validation = target(200);
+        let validation_effects =
+            runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(validation)));
+        let validation_session = validation_effects
             .iter()
             .find_map(|effect| match effect {
                 AcquisitionEffect::SessionStarted(session) => Some(*session),
                 _ => None,
             })
-            .expect("advisory starts");
+            .expect("validation recovery starts");
 
-        let authoritative = target(201);
-        let effects = runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
-            authoritative,
-            AcquireReason::Consensus,
-        )));
-        assert!(effects.iter().any(
-            |effect| matches!(effect, AcquisitionEffect::CancelSession(session) if *session == advisory_session)
-        ));
-        let authoritative_session = effects
+        let header_read = validation_effects
             .iter()
             .find_map(|effect| match effect {
-                AcquisitionEffect::SessionStarted(session)
-                    if session.target_hash() == authoritative.hash() =>
+                AcquisitionEffect::SubmitRead(request)
+                    if request.operation().kind() == OperationKind::HeaderRead =>
                 {
-                    Some(*session)
+                    Some(request.operation())
                 }
                 _ => None,
             })
-            .expect("authoritative recovery starts");
+            .expect("validation recovery starts with a header probe");
+        runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            header_read,
+            ReadOutcome::Settled { node: None },
+        )));
+
+        let preferred = target(201);
+        runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: preferred });
+        let deferred = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: preferred,
+            reason: AcquireReason::Consensus,
+        });
+        assert!(deferred.iter().all(|effect| !matches!(
+            effect,
+            AcquisitionEffect::CancelSession(_) | AcquisitionEffect::SessionStarted(_)
+        )));
         assert_eq!(
-            runner.state.recovery_anchor_session,
-            Some(authoritative_session)
+            runner.state.validation_recovery_target,
+            Some(validation)
         );
-        assert_eq!(runner.state.validation_recovery_target, None);
-        assert_eq!(runner.state.validation_recovery_session, None);
+        assert_eq!(
+            runner.state.validation_recovery_session,
+            Some(validation_session)
+        );
+        assert_eq!(runner.state.deferred_consensus_acquire, Some(preferred));
+        assert_eq!(runner.snapshot().sessions_cancelled(), 0);
 
-        let terminal = runner.handle_event(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
-        assert!(terminal.iter().all(|effect| {
-            !matches!(effect, AcquisitionEffect::SessionStarted(session) if session.target_hash() == advisory.hash())
+        let mut terminal = Vec::new();
+        for _ in 0..8 {
+            let operation = runner
+                .session(validation_session)
+                .expect("validation owner retained until timeout")
+                .pending_timer()
+                .expect("validation owner keeps its acquisition timer")
+                .1;
+            terminal = runner.handle_event(AcquisitionEvent::TimerFired {
+                operation,
+                timer: TimerKind::AcquireTimeout,
+            });
+            if runner
+                .session(validation_session)
+                .is_some_and(|state| state.phase().is_terminal())
+            {
+                break;
+            }
+        }
+        assert!(terminal.iter().any(|effect| {
+            matches!(effect, AcquisitionEffect::SessionStarted(session) if session.target_hash() == preferred.hash())
+        }));
+        assert_eq!(runner.state.deferred_consensus_acquire, None);
+        assert_eq!(runner.state.recovery_anchor_target, Some(preferred));
+    }
+
+    #[test]
+    fn dormant_recovery_owners_are_not_evicted_by_new_preferred_demand() {
+        let budget = BudgetState::new(1, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let validation = target(220);
+        let validation_session = peer_request_session(&runner.handle_event(
+            AcquisitionEvent::ValidationRecoveryTarget(Some(validation)),
+        ));
+        runner
+            .state
+            .sessions
+            .get_mut(&validation_session)
+            .expect("validation owner")
+            .phase = SessionPhase::Dormant;
+
+        let preferred = target(221);
+        runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: preferred });
+        let deferred = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: preferred,
+            reason: AcquireReason::Consensus,
+        });
+        assert!(deferred.iter().all(|effect| !matches!(
+            effect,
+            AcquisitionEffect::CancelSession(_) | AcquisitionEffect::SessionStarted(_)
+        )));
+        assert_eq!(runner.state.validation_recovery_target, Some(validation));
+        assert_eq!(
+            runner.state.validation_recovery_session,
+            Some(validation_session)
+        );
+        assert_eq!(
+            runner
+                .session(validation_session)
+                .expect("dormant owner remains live")
+                .phase(),
+            &SessionPhase::Dormant
+        );
+        assert_eq!(runner.state.deferred_consensus_acquire, Some(preferred));
+        assert_eq!(runner.snapshot().sessions_cancelled(), 0);
+
+        let terminal = runner.handle_event(AcquisitionEvent::StoreRotated(
+            StoreGeneration::new(2),
+        ));
+        assert!(terminal.iter().any(|effect| {
+            matches!(effect, AcquisitionEffect::CancelSession(session) if *session == validation_session)
+        }));
+        assert!(terminal.iter().any(|effect| {
+            matches!(effect, AcquisitionEffect::SessionStarted(session) if session.target_hash() == preferred.hash())
         }));
 
-        let fresh = runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(advisory)));
-        assert!(fresh.iter().any(|effect| {
-            matches!(effect, AcquisitionEffect::SessionStarted(session) if session.target_hash() == advisory.hash())
-        }));
+        let mut anchor_runner = CoordinatorRunner::with_budget(
+            RunEpoch::new(2),
+            BudgetState::new(1, AdmissionBudget::new(4, 1024), Duration::from_secs(1)),
+        );
+        connect(&mut anchor_runner);
+        let anchor = target(230);
+        let anchor_session = peer_request_session(&anchor_runner.handle_event(
+            AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
+                anchor,
+                AcquireReason::Consensus,
+            )),
+        ));
+        anchor_runner
+            .state
+            .sessions
+            .get_mut(&anchor_session)
+            .expect("recovery anchor")
+            .phase = SessionPhase::Dormant;
+        let mut eviction = Vec::new();
+        assert!(!anchor_runner.evict_oldest_dormant_consensus(&mut eviction));
+        assert!(eviction.is_empty());
+        assert_eq!(
+            anchor_runner.state.recovery_anchor_session,
+            Some(anchor_session)
+        );
     }
 
     #[test]

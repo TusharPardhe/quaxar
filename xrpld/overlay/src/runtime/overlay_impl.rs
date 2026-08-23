@@ -193,6 +193,11 @@ pub trait OverlayHandoff: Send + Sync {
 }
 
 type PeerStatusPublisher = Arc<dyn Fn(JsonValue) + Send + Sync>;
+type ValidatedLedgerStatusProvider = Arc<dyn Fn() -> Option<(u32, Duration)> + Send + Sync>;
+
+fn validated_ledger_is_recent_for_peer_tracking(age: Duration) -> bool {
+    age < Duration::from_secs(120)
+}
 
 #[derive(Debug)]
 pub enum OverlayError {
@@ -977,6 +982,28 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         };
         self.peer.apply_status_change(current, previous, range);
 
+        // PeerImp.cpp checks the status message's current ledger, not the
+        // peer's advertised history-range maximum, and only while the local
+        // validated ledger is younger than two minutes.  Comparing against a
+        // stale startup ledger incorrectly marks healthy recovery peers
+        // Diverged and eventually evicts them as Not Useful.
+        if let Some(peer_ledger_seq) = message.ledger_seq {
+            let provider = self
+                .overlay
+                .validated_ledger_status_provider
+                .read()
+                .expect("validated ledger status provider lock")
+                .as_ref()
+                .map(Arc::clone);
+            let validated = provider.and_then(|provider| provider());
+            if let Some((valid_ledger_seq, validated_age)) = validated
+                && validated_ledger_is_recent_for_peer_tracking(validated_age)
+            {
+                self.peer
+                    .check_tracking_pair(peer_ledger_seq, valid_ledger_seq);
+            }
+        }
+
         self.overlay.publish_peer_status(build_peer_status_event(
             effective_status,
             message,
@@ -1381,6 +1408,9 @@ pub struct OverlayImpl {
     pending_outbound_ips: Arc<Mutex<HashSet<IpAddr>>>,
     inbound_reservations: Arc<Mutex<InboundReservations>>,
     peer_status_publisher: Arc<RwLock<Option<PeerStatusPublisher>>>,
+    /// App-owned current validated-ledger sequence and age, sampled only when
+    /// processing TMStatusChange like rippled PeerImp::onMessage.
+    validated_ledger_status_provider: Arc<RwLock<Option<ValidatedLedgerStatusProvider>>>,
     /// Hashes from the current local closed ledger and its parent, included in
     /// every outbound HTTP upgrade request like rippled's makeHandshake.
     handshake_ledgers: Arc<RwLock<Option<(Uint256, Uint256)>>>,
@@ -1494,6 +1524,7 @@ impl OverlayImpl {
             pending_outbound_ips: Arc::new(Mutex::new(HashSet::new())),
             inbound_reservations: Arc::new(Mutex::new(InboundReservations::default())),
             peer_status_publisher: Arc::new(RwLock::new(None)),
+            validated_ledger_status_provider: Arc::new(RwLock::new(None)),
             handshake_ledgers: Arc::new(RwLock::new(None)),
             manifests_message_provider: Arc::new(RwLock::new(None)),
             max_manifests_message_size: Arc::new(AtomicUsize::new(MAXIMUM_MANIFESTS_MESSAGE_SIZE)),
@@ -1563,6 +1594,16 @@ impl OverlayImpl {
             .peer_status_publisher
             .write()
             .expect("peer status publisher lock") = Some(Arc::new(publisher));
+    }
+
+    pub fn set_validated_ledger_status_provider<F>(&self, provider: F)
+    where
+        F: Fn() -> Option<(u32, Duration)> + Send + Sync + 'static,
+    {
+        *self
+            .validated_ledger_status_provider
+            .write()
+            .expect("validated ledger status provider lock") = Some(Arc::new(provider));
     }
 
     pub fn clear_peer_status_publisher(&self) {
@@ -2129,6 +2170,7 @@ impl OverlayImpl {
             pending_outbound_ips: Arc::clone(&self.pending_outbound_ips),
             inbound_reservations: Arc::clone(&self.inbound_reservations),
             peer_status_publisher: Arc::clone(&self.peer_status_publisher),
+            validated_ledger_status_provider: Arc::clone(&self.validated_ledger_status_provider),
             handshake_ledgers: Arc::clone(&self.handshake_ledgers),
             manifests_message_provider: Arc::clone(&self.manifests_message_provider),
             max_manifests_message_size: Arc::clone(&self.max_manifests_message_size),

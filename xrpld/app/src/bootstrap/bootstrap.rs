@@ -2737,16 +2737,9 @@ fn run_start_mode_consensus_loop(
                     };
 
                     // ─── Overlay timer duties (matching rippled OverlayImpl::Timer) ───
-                    // Ping peers every 60s, check_tracking every 1s, delete_idle_peers every 4s
+                    // Ping peers every 60s and delete_idle_peers every 4s.
                     {
                         use overlay::Overlay;
-
-                        // check_tracking every tick (1s) — updates peer convergence state
-                        let valid_seq = root
-                            .ledger_master_runtime()
-                            .map(|lm_rt| lm_rt.ledger_master().valid_ledger_seq())
-                            .unwrap_or(0);
-                        overlay_rt.overlay().check_tracking(valid_seq);
 
                         // delete_idle_peers every 4 ticks (matching CHECK_IDLE_PEERS = 4)
                         static IDLE_TICK: std::sync::atomic::AtomicU32 =

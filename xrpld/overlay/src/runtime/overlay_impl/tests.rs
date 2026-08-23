@@ -27,7 +27,7 @@ use super::{
     OverlayAcceptor, OverlayHandoff, OverlayImpl, OverlayInboundRouter, PEERFINDER_LIVE_CACHE_TTL,
     PEERFINDER_MAX_ACCEPTED_ENDPOINTS, PEERFINDER_MAX_HOPS, PEERFINDER_REDIRECT_ENDPOINT_COUNT,
     PeerReservation, PeerReservationSource, PeerReservationTable, RelayKind,
-    is_valid_peer_endpoint, read_http_request,
+    is_valid_peer_endpoint, read_http_request, validated_ledger_is_recent_for_peer_tracking,
 };
 use crate::message::{
     Message, ProtocolMessage, ProtocolPayload, TmEndpoints, TmGetLedger, TmGetObjectByHash,
@@ -39,7 +39,7 @@ use crate::message::{
 use crate::overlay::Overlay;
 use crate::overlay::{Handoff, Setup};
 use crate::peer::{Peer, ProtocolFeature};
-use crate::peer_imp::PeerImp;
+use crate::peer_imp::{PeerImp, Tracking};
 use crate::router::MessageRouter;
 use crate::session::PeerSessionStarter;
 use crate::slot::{Clock, ManualClock, SlotState};
@@ -1482,6 +1482,7 @@ async fn inbound_status_change_preserves_status_publishes_and_skips_lost_sync() 
         Arc::clone(&clock) as Arc<dyn Clock>,
     )
     .expect("overlay");
+    overlay.set_validated_ledger_status_provider(|| Some((301, Duration::from_secs(119))));
     let published = Arc::new(Mutex::new(Vec::<JsonValue>::new()));
     overlay.set_peer_status_publisher({
         let published = Arc::clone(&published);
@@ -1560,6 +1561,7 @@ async fn inbound_status_change_preserves_status_publishes_and_skips_lost_sync() 
 
     assert!(peer.has_ledger(Uint256::from_u64(301), 0));
     assert!(peer.has_ledger(Uint256::from_u64(300), 0));
+    assert_eq!(peer.tracking(), Tracking::Converged);
 
     let published_events = published.lock().expect("published peer status lock");
     let JsonValue::Object(first) = &published_events[0] else {
@@ -1631,6 +1633,16 @@ async fn inbound_status_change_preserves_status_publishes_and_skips_lost_sync() 
     );
 
     let _ = stop_requested.send(true);
+}
+
+#[test]
+fn peer_status_tracking_requires_strictly_recent_validated_ledger() {
+    assert!(validated_ledger_is_recent_for_peer_tracking(
+        Duration::from_secs(119)
+    ));
+    assert!(!validated_ledger_is_recent_for_peer_tracking(
+        Duration::from_secs(120)
+    ));
 }
 
 #[tokio::test]
