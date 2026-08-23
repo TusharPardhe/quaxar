@@ -1,7 +1,8 @@
 use super::{
     AcceptLedgerPendingRuntime, AcceptLedgerPendingTransaction, AppOpenLedgerTxQApplyRuntime,
     ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, PersistentSubmitSandbox,
-    TypedPreclaimRoute, apply_submit_transactor_shell, apply_submit_transactor_shell_with_flags,
+    TypedPreclaimRoute, advertised_ledger_range, apply_submit_transactor_shell,
+    apply_submit_transactor_shell_with_flags,
     apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim,
     apply_submit_transactor_shell_with_preclaim_and_delivered_amount, batch_base_fee,
     calculate_default_sttx_base_fee, calculate_sttx_base_fee, consensus_status_event,
@@ -2550,6 +2551,8 @@ fn application_root_tracks_validated_and_published_ledgers_without_service() {
         .set_published_close_time(now_close_time.saturating_sub(21));
 
     assert_eq!(app.closed_ledger_seq(), Some(1_154));
+    assert_eq!(app.earliest_ledger_fetch(256), 898);
+    assert_eq!(app.earliest_ledger_fetch(u32::MAX), 0);
     assert_eq!(app.validated_ledger_seq(), Some(1_156));
     assert_eq!(app.published_ledger_seq(), Some(1_155));
     assert_eq!(
@@ -2562,6 +2565,29 @@ fn application_root_tracks_validated_and_published_ledgers_without_service() {
             .header()
             .seq,
         1_156
+    );
+}
+
+#[test]
+fn earliest_fetch_follows_canonical_lcl_not_legacy_master_slot() {
+    let mut app = ApplicationRoot::new(0).expect("root shell should build");
+    let runtime = Arc::new(AppLedgerMasterRuntime::default());
+    let mut legacy_closed = Ledger::from_ledger_seq_and_close_time(1_000, 90, false);
+    legacy_closed.set_immutable(true);
+    runtime
+        .ledger_master()
+        .set_closed_ledger(Arc::new(legacy_closed));
+    let _ = app.attach_ledger_master_runtime(Arc::clone(&runtime));
+
+    let mut canonical_closed = Ledger::from_ledger_seq_and_close_time(2_000, 100, false);
+    canonical_closed.set_immutable(true);
+    app.on_closed_ledger(Arc::new(canonical_closed));
+
+    assert_eq!(runtime.ledger_master().earliest_fetch(256), 744);
+    assert_eq!(app.earliest_ledger_fetch(256), 1_744);
+    assert_eq!(
+        advertised_ledger_range((1_500, 2_000), Some(1_600), app.earliest_ledger_fetch(256)),
+        (1_744, 2_000)
     );
 }
 

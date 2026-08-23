@@ -115,6 +115,20 @@ fn consensus_status_event(event: i32, have_correct_lcl: bool) -> i32 {
     if have_correct_lcl { event } else { 4 } // neLOST_SYNC
 }
 
+fn advertised_ledger_range(
+    full_range: (u32, u32),
+    minimum_online: Option<u32>,
+    earliest_fetch: u32,
+) -> (u32, u32) {
+    let (first, last) = full_range;
+    (
+        first
+            .max(minimum_online.unwrap_or_default())
+            .max(earliest_fetch),
+        last,
+    )
+}
+
 /// Reference `LedgerMaster::setValidLedger` uses the median signing time of
 /// trusted validations. For an even sample, average the two middle elements
 /// without overflow; if quorum has not been reached, retain the ledger close
@@ -237,6 +251,8 @@ pub struct ApplicationRootOptions {
     pub quorum: Option<usize>,
     /// rippled Config::networkQuorum, passed to NetworkOPs at construction.
     pub network_quorum: usize,
+    /// Maximum ledger depth this node advertises and serves to peers.
+    pub ledger_fetch_depth: u32,
     /// Target fee schedule advertised by this validator on voting ledgers.
     /// The reference reads this from the configured `[voting]` section.
     pub fee_setup: FeeSetup,
@@ -257,6 +273,7 @@ impl Default for ApplicationRootOptions {
             import: false,
             quorum: None,
             network_quorum: 1,
+            ledger_fetch_depth: u32::MAX,
             fee_setup: FeeSetup::default(),
             collector_params: CollectorParams::default(),
             load_manager_timing: LoadManagerTiming::default(),
@@ -518,6 +535,7 @@ pub struct ApplicationRoot {
     load_fee_track: Arc<SharedLoadFeeTrack>,
     /// Configured `[voting]` fee targets supplied to the consensus adaptor.
     fee_vote_setup: FeeSetup,
+    ledger_fetch_depth: u32,
     /// Lifecycle-safe server fee reporter shared with LoadManager and the
     /// normal NetworkOps/consensus paths.
     fee_change_reporter: Arc<FeeChangeReporter>,
@@ -4212,6 +4230,7 @@ impl ApplicationRoot {
             import,
             quorum,
             network_quorum,
+            ledger_fetch_depth,
             fee_setup,
             collector_params,
             load_manager_timing,
@@ -4311,6 +4330,7 @@ impl ApplicationRoot {
             load_manager: Arc::new(load_manager),
             load_fee_track,
             fee_vote_setup: fee_setup,
+            ledger_fetch_depth,
             fee_change_reporter,
             registry,
             manifest_limits: ManifestLimits::default(),
@@ -6648,15 +6668,9 @@ impl ApplicationRoot {
         let (first_seq, last_seq) = self
             .ledger_master_runtime()
             .and_then(|runtime| runtime.ledger_master().full_validated_range())
-            .map(|(first, last)| {
-                // The current model exposes an online-deletion floor when
-                // available. Until a distinct fetch-depth setting is wired,
-                // this is the strongest servability bound we can prove.
-                (
-                    self.minimum_online_seq()
-                        .map_or(first, |floor| first.max(floor)),
-                    last,
-                )
+            .map(|full_range| {
+                let fetch_floor = self.earliest_ledger_fetch(self.ledger_fetch_depth);
+                advertised_ledger_range(full_range, self.minimum_online_seq(), fetch_floor)
             })
             .unwrap_or((0, 0));
         let header = ledger.header();
@@ -7890,6 +7904,17 @@ impl ApplicationRoot {
 
     pub fn closed_ledger_seq(&self) -> Option<u32> {
         self.ledger_master_state.closed_ledger_seq()
+    }
+
+    /// Match `LedgerMaster::getEarliestFetch` using the canonical closed-LCL
+    /// owner. The wrapped `ledger::LedgerMaster` retains a compatibility
+    /// closed-ledger slot for standalone/legacy callers, but live consensus
+    /// deliberately does not write that second slot. Retention and serving
+    /// floors must therefore advance with this application's single LCL.
+    pub fn earliest_ledger_fetch(&self, fetch_depth: u32) -> u32 {
+        self.closed_ledger_seq()
+            .map(|seq| seq.saturating_sub(fetch_depth))
+            .unwrap_or_default()
     }
 
     /// Return the next sequence that the current open ledger can accept for

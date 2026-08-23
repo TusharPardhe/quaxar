@@ -2381,7 +2381,7 @@ fn check_accept_and_advance(
         let earliest_seq = root
             .minimum_online_seq()
             .unwrap_or(2)
-            .max(lm.earliest_fetch(configured_ledger_history));
+            .max(root.earliest_ledger_fetch(configured_ledger_history));
         // Find the first missing ledger scanning backward from valid_seq
         let mut missing_seq = None;
         for seq in (earliest_seq..valid_seq).rev() {
@@ -2859,7 +2859,7 @@ fn request_history_fetch_pack(
     let earliest = crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime::from_root(root)
         .map(|loaded| loaded.earliest_ledger_seq())
         .unwrap_or(1)
-        .max(lm.earliest_fetch(fetch_depth));
+        .max(root.earliest_ledger_fetch(fetch_depth));
     if missing <= earliest {
         return;
     }

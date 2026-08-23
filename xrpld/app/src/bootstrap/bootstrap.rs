@@ -781,6 +781,7 @@ pub fn build_bootstrap_root(
         import: options.import,
         quorum: options.quorum,
         network_quorum,
+        ledger_fetch_depth: ledger_history,
         ..ApplicationRootOptions::default()
     })
     .map_err(|error| error.to_string())?;
@@ -3443,7 +3444,7 @@ fn serve_one_get_ledger_request(
         // rippled rejects sequences below getEarliestFetch() (PeerImp.cpp:3336).
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let lm = lm_rt.ledger_master();
-            if !sequence_is_fetchable_at_floor(seq, lm.earliest_fetch(fetch_depth)) {
+            if !sequence_is_fetchable_at_floor(seq, root.earliest_ledger_fetch(fetch_depth)) {
                 return;
             }
             match lm.get_ledger_by_seq(seq, &ledger::NullLedgerJournal) {
@@ -3577,7 +3578,7 @@ fn serve_one_get_ledger_request(
         return;
     };
     let lm = lm_rt.ledger_master();
-    let earliest_fetch = lm.earliest_fetch(fetch_depth);
+    let earliest_fetch = root.earliest_ledger_fetch(fetch_depth);
 
     let ledger = lm
         .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash))
@@ -3830,7 +3831,7 @@ fn serve_fetch_pack_request(
     let deadline = issued_at + FETCH_PACK_REQUEST_STALE_AFTER;
     let objects = match lm.make_fetch_pack_with_fetcher(
         have_hash,
-        lm.earliest_fetch(fetch_depth),
+        root.earliest_ledger_fetch(fetch_depth),
         deadline,
         node_fetcher.as_ref(),
     ) {
