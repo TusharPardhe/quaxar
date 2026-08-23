@@ -245,6 +245,18 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
                 protocol::get_field_by_symbol("sfModifiedNode"),
             );
             add_threading_previous_fields(node, owner.as_ref(), transaction_id, rules);
+            // rippled applies each supplemental `newMod` AccountRoot as a
+            // complete ModifiedNode after threadItem. Although no business
+            // field changed, kSmdAlways fields still belong in FinalFields.
+            // Omitting them changes TransactionMd
+            let (final_fields, final_fields_selected) = metadata_fields(&current, |field| {
+                field
+                    .fname()
+                    .should_meta(SField::S_MD_ALWAYS | SField::S_MD_CHANGE_NEW)
+            });
+            if final_fields_selected {
+                node.set_field_object(protocol::get_field_by_symbol("sfFinalFields"), final_fields);
+            }
         }
 
         Ok(meta)
@@ -1064,6 +1076,10 @@ mod tests {
         assert_eq!(
             destination_meta.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
             ledger_seq - 1
+        );
+        assert!(
+            destination_meta.is_field_present(get_field_by_symbol("sfFinalFields")),
+            "rippled newMod owner threads include the AccountRoot's kSmdAlways FinalFields"
         );
     }
 
