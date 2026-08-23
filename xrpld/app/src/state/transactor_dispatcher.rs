@@ -3651,6 +3651,21 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         return Ter::TEF_BAD_LEDGER;
                     }
                 }
+
+                // rippled unconditionally updates the destination AccountRoot
+                // after delivering an escrow.  For an IOU delivery this is not
+                // a no-op: transaction threading records PreviousTxnID and
+                // PreviousTxnLgrSeq on the destination account even when no
+                // XRP balance field changed. Re-read the entry because the IOU
+                // helper may have changed its owner count while creating a
+                // destination trust line.
+                let destination_sle = match view.peek(destination_keylet) {
+                    Ok(Some(destination_sle)) => destination_sle,
+                    _ => return Ter::TEF_BAD_LEDGER,
+                };
+                if view.update(destination_sle).is_err() {
+                    return Ter::TEF_BAD_LEDGER;
+                }
             }
 
             if !sponsor_enabled {
