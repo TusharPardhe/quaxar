@@ -8,7 +8,7 @@ use protocol::{
     AUCTION_SLOT_DISCOUNTED_FEE_FRACTION, AccountID, Asset, IOUAmount, Keylet, LedgerEntryType,
     MPTAmount, STAmount, STArray, STIssue, STLedgerEntry, STObject, STTx, STVector256, Ter, TxType,
     VOTE_MAX_SLOTS, VOTE_WEIGHT_SCALE_FACTOR, XRPAmount, get_field_by_symbol, is_tes_success,
-    lsfDisableMaster, lsfHighAuth, lsfLowAuth, lsfRequireAuth, owner_dir_keylet, signers_keylet,
+    lsfDisableMaster, owner_dir_keylet, signers_keylet,
 };
 use std::sync::Arc;
 use tx::*;
@@ -208,52 +208,6 @@ fn zero_amount_for_asset(field: &'static protocol::SField, asset: Asset) -> STAm
         Asset::Issue(issue) if issue.native() => STAmount::from_xrp_amount(XRPAmount::new()),
         Asset::Issue(issue) => STAmount::from_iou_amount(field, IOUAmount::new(), issue),
         Asset::MPTIssue(issue) => STAmount::from_mpt_amount(field, MPTAmount::from_value(0), issue),
-    }
-}
-
-fn check_amm_issue_auth<V: ledger::ApplyView>(
-    view: &mut V,
-    account: AccountID,
-    asset: Asset,
-) -> Ter {
-    let Asset::Issue(issue) = asset else {
-        return Ter::TES_SUCCESS;
-    };
-    if issue.native() || issue.account == account {
-        return Ter::TES_SUCCESS;
-    }
-
-    let Some(issuer) = view
-        .peek(protocol::account_keylet(Uint160::from_void(
-            issue.account.data(),
-        )))
-        .ok()
-        .flatten()
-    else {
-        // Match rippled requireAuth: a missing issuer does not add an
-        // authorization failure at this point.
-        return Ter::TES_SUCCESS;
-    };
-    if issuer.get_field_u32(sf("sfFlags")) & lsfRequireAuth == 0 {
-        return Ter::TES_SUCCESS;
-    }
-
-    let Some(line) = view
-        .peek(protocol::line(account, issue.account, issue.currency))
-        .ok()
-        .flatten()
-    else {
-        return Ter::TEC_NO_LINE;
-    };
-    let auth_flag = if account > issue.account {
-        lsfLowAuth
-    } else {
-        lsfHighAuth
-    };
-    if line.get_field_u32(sf("sfFlags")) & auth_flag != 0 {
-        Ter::TES_SUCCESS
-    } else {
-        Ter::TEC_NO_AUTH
     }
 }
 
@@ -4870,81 +4824,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let account = sttx.get_account_id(sf("sfAccount"));
             let amount1 = sttx.get_field_amount(sf("sfAmount"));
             let amount2 = sttx.get_field_amount(sf("sfAmount2"));
-            // Reject same-asset AMM creation
-            if amount1.asset() == amount2.asset() {
-                return Ter::TEM_BAD_AMM_TOKENS;
-            }
-            // Reject zero or negative amounts
-            if amount1.signum() <= 0 || amount2.signum() <= 0 {
-                return Ter::TEM_BAD_AMOUNT;
-            }
-            let auth_result = check_amm_issue_auth(view, account, amount1.asset());
-            if auth_result != Ter::TES_SUCCESS {
-                return auth_result;
-            }
-            let auth_result = check_amm_issue_auth(view, account, amount2.asset());
-            if auth_result != Ter::TES_SUCCESS {
-                return auth_result;
-            }
-            // Match AMMCreate preclaim for issued currencies. Issuers can
-            // create their own IOUs, but every other account must actually
-            // hold the requested amount before AMM state is created.
-            for amount in [&amount1, &amount2] {
-                let Asset::Issue(issue) = amount.asset() else {
-                    continue;
-                };
-                if issue.native() || issue.account == account {
-                    continue;
-                }
-                let Some(holdings) =
-                    account_holds_amm_asset(view, &account, amount.asset(), sf("sfAmount"))
-                else {
-                    return Ter::TEF_BAD_LEDGER;
-                };
-                if holdings < amount.clone() {
-                    return Ter::TEC_UNFUNDED_AMM;
-                }
-            }
-            // Preclaim balance check: verify account has enough XRP
-            // before creating AMM structures (prevents partial state corruption)
-            if amount2.native() {
-                let acct_k = protocol::account_keylet(Uint160::from_void(account.data()));
-                if let Ok(Some(acct_sle)) = view.peek(acct_k) {
-                    let balance = acct_sle.get_field_amount(sf("sfBalance")).xrp().drops();
-                    let reserve = view
-                        .fees()
-                        .account_reserve(acct_sle.get_field_u32(sf("sfOwnerCount")) as usize + 1);
-                    let required = amount2.xrp().drops().saturating_add(reserve as i64);
-                    if balance < required {
-                        return Ter::TEC_UNFUNDED_AMM;
-                    }
-                }
-            }
-            if amount1.native() {
-                let acct_k = protocol::account_keylet(Uint160::from_void(account.data()));
-                if let Ok(Some(acct_sle)) = view.peek(acct_k) {
-                    let balance = acct_sle.get_field_amount(sf("sfBalance")).xrp().drops();
-                    let reserve = view
-                        .fees()
-                        .account_reserve(acct_sle.get_field_u32(sf("sfOwnerCount")) as usize + 1);
-                    let required = amount1.xrp().drops().saturating_add(reserve as i64);
-                    if balance < required {
-                        return Ter::TEC_UNFUNDED_AMM;
-                    }
-                }
-            }
-            let mpt_gate = check_amm_mptokens_v2_gate(view, &[amount1.asset(), amount2.asset()]);
-            if mpt_gate != Ter::TES_SUCCESS {
-                return mpt_gate;
-            }
-            let mpt_result = check_mpt_amm_asset_allowed(view, &account, amount1.asset(), true);
-            if mpt_result != Ter::TES_SUCCESS {
-                return mpt_result;
-            }
-            let mpt_result = check_mpt_amm_asset_allowed(view, &account, amount2.asset(), true);
-            if mpt_result != Ter::TES_SUCCESS {
-                return mpt_result;
-            }
+            // AMMCreate::preflight and AMMCreate::preclaim have already run
+            // against the immutable, pre-fee ledger.  rippled's doApply does
+            // not repeat those decisions: it enters applyCreate directly.
+            // In particular, rechecking XRP liquidity here observes the
+            // post-fee balance and can turn a canonical tesSUCCESS into
+            // tecUNFUNDED_AMM at the exact reserve boundary.
             let facts = AMMCreateApplyFacts {
                 amount1: amount1.clone(),
                 amount2: amount2.clone(),
@@ -5031,6 +4916,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     }
                 }
                 let lp_tokens = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
+                let lp_issue = lp_tokens.issue();
                 let pool_asset1 = amount.as_ref().map(STAmount::asset).unwrap_or(asset1);
                 let pool_asset2 = amount2.as_ref().map(STAmount::asset).unwrap_or(asset2);
                 let pool1 =
@@ -5064,6 +4950,34 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         Ok(math) => math,
                         Err(ter) => return ter,
                     };
+
+                // AMMDeposit is intentionally different from AMMCreate here.
+                // rippled recalculates the actual deposit in doApply and then
+                // checks native liquidity on the post-fee view, adjusting for
+                // the LP trust line that this deposit may create.
+                let has_lp_line =
+                    match view.read(protocol::line(account, amm_account, lp_issue.currency)) {
+                        Ok(line) => line.is_some(),
+                        Err(_) => return Ter::TEF_BAD_LEDGER,
+                    };
+                for deposit in [math.amount1.as_ref(), math.amount2.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if deposit.native() {
+                        let liquid = match ledger::apply_view::xrp_liquid(
+                            view,
+                            &account,
+                            i32::from(!has_lp_line),
+                        ) {
+                            Ok(liquid) => liquid,
+                            Err(_) => return Ter::TEF_BAD_LEDGER,
+                        };
+                        if liquid < deposit.xrp() {
+                            return Ter::TEC_UNFUNDED_AMM;
+                        }
+                    }
+                }
 
                 if let Some(amount) = &math.amount1 {
                     let mpt_result =

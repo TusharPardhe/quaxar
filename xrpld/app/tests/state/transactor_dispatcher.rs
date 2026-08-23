@@ -12649,7 +12649,7 @@ fn amm_create_rejects_locked_mpt_asset_before_creating_pool() {
         mptoken_entry(account, mpt_id, 50),
     ]);
     ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV2")]));
-    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::AMM_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), account);
         tx.set_field_amount(sf("sfAmount"), mpt_amount);
@@ -12662,7 +12662,8 @@ fn amm_create_rejects_locked_mpt_asset_before_creating_pool() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_CREATE, None);
+    let result = tx::run_dex_read_view_preclaim(&view, &tx, TxType::AMM_CREATE)
+        .expect("AMMCreate must have a typed preclaim");
 
     assert_eq!(result, Ter::TEC_LOCKED);
 }
@@ -12675,11 +12676,11 @@ fn amm_create_rejects_non_holder_of_requested_iou() {
     let issue = Issue::new(currency, issuer);
     let mut ledger = empty_ledger(vec![
         account_root_with_balance(account, 0, 0, 1_000_000_000),
-        account_root(issuer, 0, 0),
+        account_root(issuer, 0, lsfDefaultRipple),
         trust_line_entry(account, issuer, currency, 0),
     ]);
     ledger.set_rules(protocol::Rules::new([protocol::feature_id("AMM")]));
-    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::AMM_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), account);
         tx.set_field_amount(
@@ -12695,7 +12696,8 @@ fn amm_create_rejects_non_holder_of_requested_iou() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_CREATE, None);
+    let result = tx::run_dex_read_view_preclaim(&view, &tx, TxType::AMM_CREATE)
+        .expect("AMMCreate must have a typed preclaim");
 
     assert_eq!(result, Ter::TEC_UNFUNDED_AMM);
     assert!(
@@ -12786,6 +12788,74 @@ fn amm_create_allows_mpt_issuer_without_holder_token() {
     let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_CREATE, None);
 
     assert_eq!(result, Ter::TES_SUCCESS);
+}
+
+#[test]
+fn amm_create_uses_pre_fee_reserve_decision_at_exact_boundary() {
+    let account = sample_account(0x3C);
+    let issuer = sample_account(0x3D);
+    let issue = Issue::new(currency_from_string("USD"), issuer);
+    let xrp_amount = test_xrp(53_599_956);
+    let iou_amount = iou_amount(sf("sfAmount2"), issue, 500_000_000);
+
+    // Regression for ledger 20,151,057 transaction 62B46F...F99B8C.
+    // AMMCreate preclaim evaluates xrpLiquid(view, account, 1) before the
+    // transaction fee is deducted.  The account's 55,099,976-drop balance
+    // minus its 1,500,020-drop next-owner reserve is exactly the requested
+    // 53,599,956 drops. doApply must not repeat that decision after the
+    // 200,000-drop fee has reduced the balance to 54,899,976.
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(account, 1, 0, 55_099_976),
+        account_root(issuer, 0, lsfDefaultRipple),
+        trust_line_entry(account, issuer, issue.currency, 1_000_000_000),
+    ]);
+    ledger.set_fees(Fees {
+        base: 200_000,
+        reserve: 1_000_000,
+        increment: 250_010,
+    });
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("AMM")]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_amount(sf("sfAmount"), xrp_amount.clone());
+        tx.set_field_amount(sf("sfAmount2"), iou_amount.clone());
+        tx.set_field_u16(sf("sfTradingFee"), 500);
+        tx.set_field_amount(sf("sfFee"), test_xrp(200_000));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        tx::run_dex_read_view_preclaim(&view, &tx, TxType::AMM_CREATE),
+        Some(Ter::TES_SUCCESS),
+        "the immutable pre-fee view has exactly enough liquid XRP"
+    );
+
+    // Model the common Transactor preamble before doApply: the fee is burned
+    // after preclaim succeeds. AMMCreate doApply must trust that saved result.
+    let account_keylet = account_keylet(raw_account_id(account));
+    let account_root = view
+        .peek(account_keylet)
+        .expect("account read")
+        .expect("account exists");
+    let mut post_fee =
+        STLedgerEntry::from_stobject(account_root.clone_as_object(), account_keylet.key);
+    post_fee.set_field_amount(sf("sfBalance"), test_xrp(54_899_976));
+    view.update(Arc::new(post_fee))
+        .expect("post-fee balance update");
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::AMM_CREATE, Some(55_099_976)),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(protocol::keylet::amm(
+            xrp_amount.asset(),
+            iou_amount.asset()
+        ))
+        .expect("AMM read")
+        .is_some()
+    );
 }
 
 #[test]
@@ -12943,6 +13013,61 @@ fn amm_deposit_rejects_locked_mpt_asset_before_pool_mutation() {
     let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_DEPOSIT, None);
 
     assert_eq!(result, Ter::TEC_LOCKED);
+}
+
+#[test]
+fn amm_deposit_rechecks_calculated_xrp_liquidity_on_post_fee_view() {
+    let account = sample_account(0x17);
+    let issuer = sample_account(0x18);
+    let amm_account = sample_account(0x19);
+    let mpt_id = share_id_for(issuer, 1);
+    let mpt_issue = protocol::MPTIssue::new(mpt_id);
+    let mpt_asset = Asset::MPTIssue(mpt_issue);
+    let xrp_asset = Asset::Issue(xrp_issue());
+
+    let mut ledger = empty_ledger(vec![
+        // This is already the post-fee balance. With no LP line, the next
+        // owner reserve is 250 drops and only 99 drops are liquid.
+        account_root_with_balance(account, 0, 0, 349),
+        account_root(issuer, 1, 0),
+        account_root_with_balance(amm_account, 0, 0, 100),
+        mpt_issuance_entry(
+            issuer,
+            1,
+            1_000,
+            protocol::lsfMPTCanTransfer | protocol::lsfMPTCanTrade,
+        ),
+        mptoken_entry(account, mpt_id, 1),
+        mptoken_entry(amm_account, mpt_id, 100),
+        amm_mpt_xrp_entry(amm_account, mpt_issue, 100, 100),
+    ]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 200,
+        increment: 50,
+    });
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV2")]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::AMM_DEPOSIT, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), mpt_asset),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), xrp_asset),
+        );
+        tx.set_field_amount(sf("sfAmount"), test_xrp(100));
+        tx.set_field_amount(sf("sfFee"), test_xrp(10));
+        tx.set_field_u32(sf("sfFlags"), protocol::AMM_SINGLE_ASSET_FLAG);
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::AMM_DEPOSIT, None),
+        Ter::TEC_UNFUNDED_AMM
+    );
 }
 
 #[test]

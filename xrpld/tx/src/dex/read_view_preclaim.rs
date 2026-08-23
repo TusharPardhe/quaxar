@@ -373,6 +373,21 @@ fn is_lp_token<V: ReadView>(view: &V, asset: Asset) -> Result<bool, Ter> {
         .is_some_and(|account| account.is_field_present(sf("sfAMMID"))))
 }
 
+fn is_pseudo_account<V: ReadView>(view: &V, account: AccountID) -> Result<bool, Ter> {
+    Ok(read_account(view, account)?.is_some_and(|account| {
+        [sf("sfAMMID"), sf("sfVaultID"), sf("sfLoanBrokerID")]
+            .into_iter()
+            .any(|field| account.is_field_present(field))
+    }))
+}
+
+fn is_mpt_issuer_pseudo<V: ReadView>(view: &V, asset: Asset) -> Result<bool, Ter> {
+    match asset {
+        Asset::MPTIssue(issue) => is_pseudo_account(view, issue.issuer()),
+        Asset::Issue(_) => Ok(false),
+    }
+}
+
 fn no_default_ripple<V: ReadView>(view: &V, asset: Asset) -> Result<bool, Ter> {
     match asset {
         Asset::Issue(issue) if !issue.native() => Ok(read_account(view, issue.account)?
@@ -774,11 +789,10 @@ fn preclaim_amm_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         amm_clawback_enabled: view.rules().enabled(&protocol::feature_id("AMMClawback")),
         amount_clawback_disabled_result: clawback_disabled(view, amount.asset())?,
         amount2_clawback_disabled_result: clawback_disabled(view, amount2.asset())?,
-        // Current `AMMCreate::preclaim` has no vault-share exclusion. Keep
-        // that explicitly false so the fact adapter cannot invent a rejection
-        // absent from the matched rippled source.
-        amount_is_vault_share: false,
-        amount2_is_vault_share: false,
+        amount_is_vault_share: single_asset_vault_enabled
+            && is_mpt_issuer_pseudo(view, amount.asset())?,
+        amount2_is_vault_share: single_asset_vault_enabled
+            && is_mpt_issuer_pseudo(view, amount2.asset())?,
         single_asset_vault_enabled,
     }))
 }
@@ -1248,7 +1262,7 @@ mod tests {
     };
 
     use super::{
-        run_dex_read_view_preclaim, run_dex_read_view_preclaim_with_flags,
+        is_mpt_issuer_pseudo, run_dex_read_view_preclaim, run_dex_read_view_preclaim_with_flags,
         run_offer_create_direct_dispatch_preclaim,
     };
 
@@ -1329,6 +1343,22 @@ mod tests {
 
     fn issue(fill: u8, issuer: AccountID) -> Issue {
         Issue::new(Currency::from_array([fill; 20]), issuer)
+    }
+
+    #[test]
+    fn amm_create_identifies_mpt_assets_issued_by_pseudo_accounts() {
+        let issuer = account(3);
+        let mut pseudo = account_entry(issuer, 1);
+        pseudo.set_field_h256(sf("sfVaultID"), Uint256::from_array([9; 32]));
+        let mut view = View::default();
+        view.insert(pseudo);
+
+        let mpt = Asset::MPTIssue(protocol::MPTIssue::new(protocol::make_mpt_id(1, issuer)));
+        assert_eq!(is_mpt_issuer_pseudo(&view, mpt), Ok(true));
+        assert_eq!(
+            is_mpt_issuer_pseudo(&view, Asset::Issue(issue(4, issuer))),
+            Ok(false)
+        );
     }
 
     fn amm_entry(amm_account: AccountID, asset: Asset, asset2: Asset, lp: i64) -> STLedgerEntry {
