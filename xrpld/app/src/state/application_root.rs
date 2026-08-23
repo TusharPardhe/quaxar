@@ -3336,7 +3336,13 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         // partial doApply mutations, so only successful state is eligible for
         // invariant evaluation here.
         if protocol::is_tes_success(result) {
-            result = crate::state::invariants::check_invariants_for_tx(&inner, tx, result, fee_amt);
+            result = crate::state::invariants::check_invariants_for_tx_with_expected_xrp_delta(
+                &inner,
+                tx,
+                result,
+                fee_amt,
+                Some(0),
+            );
             *invariant_fee_reset = result == Ter::TEC_INVARIANT_FAILED;
         }
 
@@ -3355,7 +3361,13 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             // sequence/ticket changes. Recheck that real fee-claim context:
             // a repeated failure maps to tefINVARIANT_FAILED in the checker.
             drop(inner);
-            result = crate::state::invariants::check_invariants_for_tx(view, tx, result, fee_amt);
+            result = crate::state::invariants::check_invariants_for_tx_with_expected_xrp_delta(
+                view,
+                tx,
+                result,
+                fee_amt,
+                Some(-fee_amt.drops()),
+            );
         } else if !do_offers && !do_lines_or_mpts && !do_nf_token_offers && !do_credentials {
             if is_tes_success(result) {
                 // Only a successful doApply commits its handler sandbox.
@@ -3372,9 +3384,14 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
                 if likely_to_claim_fee(result, flags)
                     && !protocol::any_apply_flags(flags & ApplyFlags::FAIL_HARD)
                 {
-                    result = crate::state::invariants::check_invariants_for_tx(
-                        view, tx, result, fee_amt,
-                    );
+                    result =
+                        crate::state::invariants::check_invariants_for_tx_with_expected_xrp_delta(
+                            view,
+                            tx,
+                            result,
+                            fee_amt,
+                            Some(-fee_amt.drops()),
+                        );
                 }
             }
         } else {
@@ -3587,15 +3604,24 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             }
 
             if is_tec_claim(result) {
-                result = crate::state::invariants::check_invariants_for_tx(
-                    &cleanup, tx, result, fee_amt,
+                result = crate::state::invariants::check_invariants_for_tx_with_expected_xrp_delta(
+                    &cleanup,
+                    tx,
+                    result,
+                    fee_amt,
+                    Some(0),
                 );
                 *invariant_fee_reset = result == Ter::TEC_INVARIANT_FAILED;
             }
             if result == Ter::TEC_INVARIANT_FAILED {
                 drop(cleanup);
-                result =
-                    crate::state::invariants::check_invariants_for_tx(view, tx, result, fee_amt);
+                result = crate::state::invariants::check_invariants_for_tx_with_expected_xrp_delta(
+                    view,
+                    tx,
+                    result,
+                    fee_amt,
+                    Some(-fee_amt.drops()),
+                );
             } else if is_tec_claim(result) && cleanup.apply().is_err() {
                 result = Ter::TEF_INTERNAL;
             }

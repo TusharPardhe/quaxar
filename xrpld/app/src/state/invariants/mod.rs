@@ -55,6 +55,26 @@ pub fn check_invariants_for_tx<V: ApplyView + ?Sized>(
     result: Ter,
     fee: XRPAmount,
 ) -> Ter {
+    check_invariants_for_tx_with_expected_xrp_delta(sandbox, tx, result, fee, None)
+}
+
+/// Production invariant entry point. `expected_xrp_delta` describes the
+/// mutation scope being checked: handler/cleanup sandboxes exclude the fee and
+/// therefore expect zero; the outer transaction sandbox includes the charged
+/// fee and expects its negative. The public compatibility wrapper above keeps
+/// synthetic invariant tests able to exercise one invariant in isolation.
+pub(crate) fn check_invariants_for_tx_with_expected_xrp_delta<V: ApplyView + ?Sized>(
+    sandbox: &FlowSandbox<V>,
+    tx: &STTx,
+    result: Ter,
+    fee: XRPAmount,
+    expected_xrp_delta: Option<i64>,
+) -> Ter {
+    let fee_field = sf("sfFee");
+    if tx.is_field_present(fee_field) && fee.drops() > tx.get_field_amount(fee_field).xrp().drops()
+    {
+        return invariant_failure_result(result);
+    }
     let txn_type = tx.get_txn_type();
     let tx_domain = tx
         .is_field_present(sf("sfDomainID"))
@@ -87,6 +107,7 @@ pub fn check_invariants_for_tx<V: ApplyView + ?Sized>(
             cross_currency_payment,
             result,
             fee,
+            expected_xrp_delta,
         ),
     )
 }
@@ -100,7 +121,7 @@ pub fn check_invariants<V: ApplyView + ?Sized>(
     map_invariant_result(
         result,
         check_invariants_inner(
-            sandbox, txn_type, None, None, None, None, None, false, false, result, fee,
+            sandbox, txn_type, None, None, None, None, None, false, false, result, fee, None,
         ),
     )
 }
@@ -119,6 +140,10 @@ fn payment_is_cross_currency(tx: &STTx) -> bool {
     send_max.asset() != amount.asset()
 }
 
+fn pay_channel_held_drops(amount: STAmount, balance: STAmount) -> i64 {
+    amount.xrp().drops() - balance.xrp().drops()
+}
+
 fn check_invariants_inner<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
@@ -131,6 +156,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     cross_currency_payment: bool,
     result: Ter,
     fee: XRPAmount,
+    expected_xrp_delta: Option<i64>,
 ) -> Result<Ter, ()> {
     let mut xrp_balance_change: i64 = 0;
     let mut has_xrp_trust_line = false;
@@ -340,20 +366,49 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
                 xrp_balance_change += bal_after - bal_before;
             }
             LedgerEntryType::PayChannel => {
-                // 1. XRPNotCreated (PayChannel)
+                // 1. XRPNotCreated (PayChannel).  A channel's XRP still held
+                // in escrow is `sfAmount - sfBalance`, not `sfAmount`.
+                // PaymentChannelClaim advances sfBalance while crediting the
+                // destination by the same delta; counting sfAmount alone
+                // therefore reports that credit as newly-created XRP and
+                // incorrectly converts a valid claim to tecINVARIANT_FAILED.
+                // This mirrors rippled XRPNotCreated::visitEntry exactly,
+                // including ignoring the after-value for a deleted channel
+                // (closeChannel refunds the remaining held balance).
                 let bal_before = before_sle
                     .map(|b| {
-                        b.get_field_amount(get_field_by_symbol("sfAmount"))
-                            .xrp()
-                            .drops() as i64
+                        pay_channel_held_drops(
+                            b.get_field_amount(get_field_by_symbol("sfAmount")),
+                            b.get_field_amount(get_field_by_symbol("sfBalance")),
+                        )
                     })
                     .unwrap_or(0);
-                let bal_after = after_sle
+                let bal_after = (!is_delete)
+                    .then_some(after_sle)
+                    .flatten()
                     .map(|a| {
-                        a.get_field_amount(get_field_by_symbol("sfAmount"))
-                            .xrp()
-                            .drops() as i64
+                        pay_channel_held_drops(
+                            a.get_field_amount(get_field_by_symbol("sfAmount")),
+                            a.get_field_amount(get_field_by_symbol("sfBalance")),
+                        )
                     })
+                    .unwrap_or(0);
+                xrp_balance_change += bal_after - bal_before;
+            }
+            LedgerEntryType::Sponsorship => {
+                // A prefunded sponsorship escrows XRP in sfFeeAmount. Match
+                // rippled XRPNotCreated accounting so creating, consuming, or
+                // deleting that object cannot appear to mint or lose XRP.
+                let fee_amount = get_field_by_symbol("sfFeeAmount");
+                let bal_before = before_sle
+                    .filter(|sle| sle.is_field_present(fee_amount))
+                    .map(|sle| sle.get_field_amount(fee_amount).xrp().drops())
+                    .unwrap_or(0);
+                let bal_after = (!is_delete)
+                    .then_some(after_sle)
+                    .flatten()
+                    .filter(|sle| sle.is_field_present(fee_amount))
+                    .map(|sle| sle.get_field_amount(fee_amount).xrp().drops())
                     .unwrap_or(0);
                 xrp_balance_change += bal_after - bal_before;
             }
@@ -558,15 +613,20 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         }
     }
 
-    // 1. XRPNotCreated (finalize)
-    // Since our sandbox does not contain the fee deduction (it's applied to the parent view),
-    // the net XRP change inside the sandbox MUST be <= 0.
-    if xrp_balance_change > 0 {
+    // 1. XRPNotCreated (finalize). Production callers supply the exact delta
+    // appropriate to the sandbox scope. This is the two-sandbox equivalent of
+    // rippled's `-drops_ == fee`: handler/cleanup state must conserve XRP,
+    // while the outer transaction delta must destroy exactly the charged fee.
+    if let Some(expected) = expected_xrp_delta {
+        if xrp_balance_change != expected {
+            return Err(());
+        }
+    } else if xrp_balance_change > 0 {
         return Err(());
     }
 
     // 3. TransactionFeeCheck
-    if fee.drops() < 0 || fee.drops() > protocol::INITIAL_XRP.drops() {
+    if fee.drops() < 0 || fee.drops() >= protocol::INITIAL_XRP.drops() {
         return Err(());
     }
 
@@ -579,11 +639,17 @@ mod tests {
         VaultAssetDelta, VaultSnapshot, VaultState, add_vault_asset_delta, compute_vault_min_scale,
         rounded_vault_delta, vault_transaction_account_asset_delta,
     };
+    use super::{check_invariants_for_tx_with_expected_xrp_delta, pay_channel_held_drops};
     use basics::{
         base_uint::Uint256,
         number::{NumberParts as RuntimeNumber, get_mantissa_scale},
     };
-    use protocol::{AccountID, Asset, Issue};
+    use ledger::{ApplyView, FlowSandbox, Ledger, LedgerHeader, Sandbox};
+    use protocol::{
+        AccountID, ApplyFlags, Asset, Issue, STAmount, STLedgerEntry, Ter, TxType, XRPAmount,
+        account_keylet, get_field_by_symbol, pay_channel_keylet_from_key,
+    };
+    use std::sync::Arc;
 
     fn account(byte: u8) -> AccountID {
         AccountID::from_array([byte; 20])
@@ -625,6 +691,175 @@ mod tests {
         let delta = vault_transaction_account_asset_delta(&state, depositor, asset)
             .expect("the XRP deposit transfer must retain its nonzero delta");
         assert_eq!(delta.delta, RuntimeNumber::from_i64(-1_000_000));
+    }
+
+    #[test]
+    fn pay_channel_invariant_counts_only_unpaid_xrp() {
+        let amount = STAmount::from_xrp_amount(XRPAmount::from_drops(500_000));
+        let before_balance = STAmount::from_xrp_amount(XRPAmount::from_drops(0));
+        let after_balance = STAmount::from_xrp_amount(XRPAmount::from_drops(25_000));
+
+        let before = pay_channel_held_drops(amount.clone(), before_balance);
+        let after = pay_channel_held_drops(amount, after_balance);
+
+        assert_eq!(before, 500_000);
+        assert_eq!(after, 475_000);
+        assert_eq!(after - before, -25_000);
+    }
+
+    fn insert_account<V: ApplyView>(view: &mut V, id: AccountID, balance: i64) {
+        let keylet = account_keylet(
+            basics::base_uint::Uint160::from_slice(id.data()).expect("account width"),
+        );
+        let mut sle = STLedgerEntry::new(keylet);
+        sle.set_account_id(get_field_by_symbol("sfAccount"), id);
+        sle.set_field_amount(
+            get_field_by_symbol("sfBalance"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(balance)),
+        );
+        sle.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        sle.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
+        view.insert(Arc::new(sle)).expect("insert account");
+    }
+
+    fn insert_pay_channel<V: ApplyView>(
+        view: &mut V,
+        key: Uint256,
+        source: AccountID,
+        destination: AccountID,
+        amount: i64,
+        balance: i64,
+    ) {
+        let mut sle = STLedgerEntry::new(pay_channel_keylet_from_key(key));
+        sle.set_account_id(get_field_by_symbol("sfAccount"), source);
+        sle.set_account_id(get_field_by_symbol("sfDestination"), destination);
+        sle.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(amount)),
+        );
+        sle.set_field_amount(
+            get_field_by_symbol("sfBalance"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(balance)),
+        );
+        view.insert(Arc::new(sle)).expect("insert payment channel");
+    }
+
+    #[test]
+    fn pay_channel_claim_destination_credit_preserves_xrp_invariant() {
+        let source = account(0xC1);
+        let destination = account(0xC2);
+        let channel = Uint256::from_u64(0xCAFE);
+        let base = Arc::new(Ledger::new(LedgerHeader::default(), false));
+        let mut parent = Sandbox::new(base, ApplyFlags::NONE);
+        insert_account(&mut parent, destination, 100_000_000);
+        insert_pay_channel(&mut parent, channel, source, destination, 500_000, 0);
+
+        let mut claim = FlowSandbox::new(&mut parent);
+        let destination_keylet = account_keylet(
+            basics::base_uint::Uint160::from_slice(destination.data()).expect("account width"),
+        );
+        let destination_sle = claim
+            .peek(destination_keylet)
+            .expect("read destination")
+            .expect("destination exists");
+        let mut destination_object = destination_sle.clone_as_object();
+        destination_object.set_field_amount(
+            get_field_by_symbol("sfBalance"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(100_025_000)),
+        );
+        claim
+            .update(Arc::new(STLedgerEntry::from_stobject(
+                destination_object,
+                destination_keylet.key,
+            )))
+            .expect("credit destination");
+
+        let channel_keylet = pay_channel_keylet_from_key(channel);
+        let channel_sle = claim
+            .peek(channel_keylet)
+            .expect("read channel")
+            .expect("channel exists");
+        let mut channel_object = channel_sle.clone_as_object();
+        channel_object.set_field_amount(
+            get_field_by_symbol("sfBalance"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(25_000)),
+        );
+        claim
+            .update(Arc::new(STLedgerEntry::from_stobject(
+                channel_object,
+                channel_keylet.key,
+            )))
+            .expect("advance channel balance");
+
+        let tx = protocol::STTx::new(TxType::PAYCHAN_CLAIM, |tx| {
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(0)),
+            );
+        });
+        assert_eq!(
+            check_invariants_for_tx_with_expected_xrp_delta(
+                &claim,
+                &tx,
+                Ter::TES_SUCCESS,
+                XRPAmount::from_drops(0),
+                Some(0),
+            ),
+            Ter::TES_SUCCESS
+        );
+    }
+
+    #[test]
+    fn pay_channel_close_refund_preserves_xrp_invariant() {
+        let source = account(0xD1);
+        let destination = account(0xD2);
+        let channel = Uint256::from_u64(0xD00D);
+        let base = Arc::new(Ledger::new(LedgerHeader::default(), false));
+        let mut parent = Sandbox::new(base, ApplyFlags::NONE);
+        insert_account(&mut parent, source, 1_000_000);
+        insert_pay_channel(&mut parent, channel, source, destination, 500_000, 25_000);
+
+        let mut close = FlowSandbox::new(&mut parent);
+        let source_keylet = account_keylet(
+            basics::base_uint::Uint160::from_slice(source.data()).expect("account width"),
+        );
+        let source_sle = close
+            .peek(source_keylet)
+            .expect("read source")
+            .expect("source exists");
+        let mut source_object = source_sle.clone_as_object();
+        source_object.set_field_amount(
+            get_field_by_symbol("sfBalance"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(1_475_000)),
+        );
+        close
+            .update(Arc::new(STLedgerEntry::from_stobject(
+                source_object,
+                source_keylet.key,
+            )))
+            .expect("refund source");
+        let channel_sle = close
+            .peek(pay_channel_keylet_from_key(channel))
+            .expect("read channel")
+            .expect("channel exists");
+        close.erase(channel_sle).expect("erase channel");
+
+        let tx = protocol::STTx::new(TxType::PAYCHAN_CLAIM, |tx| {
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(0)),
+            );
+        });
+        assert_eq!(
+            check_invariants_for_tx_with_expected_xrp_delta(
+                &close,
+                &tx,
+                Ter::TES_SUCCESS,
+                XRPAmount::from_drops(0),
+                Some(0),
+            ),
+            Ter::TES_SUCCESS
+        );
     }
 
     #[test]
