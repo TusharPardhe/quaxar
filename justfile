@@ -1,7 +1,7 @@
 default:
     @just --list
 
-# Run all checks (what CI does)
+# Run the local quality suite
 ci: fmt clippy test doc
 
 # Format code
@@ -18,15 +18,15 @@ test:
 
 # Build release binary
 build:
-    cargo build --release -p xrpld-main
+    cargo build --release -p quaxar-main
 
-# Install xrpld to ~/.cargo/bin (automatically in PATH)
+# Install Quaxar to ~/.cargo/bin (automatically in PATH)
 install:
-    cargo install --path xrpld/main
+    cargo install --path xrpld/main --locked
 
-# Uninstall xrpld
+# Uninstall Quaxar
 uninstall:
-    cargo uninstall xrpld-main
+    cargo uninstall quaxar-main
 
 # Check compilation
 check:
@@ -34,6 +34,10 @@ check:
 
 # Generate docs
 doc:
+    cargo doc --workspace --no-deps
+
+# Generate and open docs locally
+doc-open:
     cargo doc --workspace --no-deps --open
 
 # Audit dependencies
@@ -42,11 +46,11 @@ audit:
 
 # Run the node
 run *ARGS:
-    cargo run -p xrpld-main -- {{ARGS}}
+    cargo run -p quaxar-main -- {{ARGS}}
 
 # Interactive CLI
 cli:
-    cargo run -p xrpld-main -- cli
+    cargo run -p quaxar-main -- cli
 
 # Clean build artifacts
 clean:

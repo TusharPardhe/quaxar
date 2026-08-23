@@ -209,7 +209,7 @@ pub fn do_account_objects<S: AccountObjectsSource>(
 
     let account_index =
         account_keylet(Uint160::from_slice(account_id.data()).expect("account width"));
-    let account_exists = match source.exists_entry(account_index) {
+    let account_exists = match source.exists_entry_at(&ledger, account_index) {
         Ok(exists) => exists,
         Err(_) => return rpc_error(RpcErrorCode::DbDeserialization),
     };
@@ -240,6 +240,7 @@ pub fn do_account_objects<S: AccountObjectsSource>(
 
     let traversal = match collect_account_objects(
         source,
+        &ledger,
         account_id,
         type_filter.as_deref(),
         dir_index,
@@ -270,11 +271,6 @@ pub fn do_account_objects<S: AccountObjectsSource>(
             JsonValue::String(format_marker(&marker)),
         );
     }
-
-    // The lookup result is the shape the current RPC layer already returns for
-    // ledger selection. We keep the traversal layer isolated from any runtime
-    // load accounting until that seam is explicitly ported.
-    let _ = ledger;
 
     result
 }

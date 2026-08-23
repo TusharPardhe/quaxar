@@ -67,8 +67,6 @@ pub fn normalize_operating_mode_for_validated_age(
         NetworkOpsOperatingMode::Syncing
             if validated_ledger_age >= SYNCING_VALIDATED_LEDGER_AGE =>
         {
-            let age_seconds = validated_ledger_age.as_secs();
-            tracing::warn!(target: "app", age_seconds, "Validated ledger is stale");
             NetworkOpsOperatingMode::Connected
         }
         mode => mode,
@@ -108,14 +106,24 @@ impl StateAccounting {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // legacy mode writer; exercised by network_ops integration tests
     fn set_operating_mode(&mut self, new_mode: NetworkOpsOperatingMode) {
+        self.set_operating_mode_with_reason(new_mode, "unspecified");
+    }
+
+    fn set_operating_mode_with_reason(
+        &mut self,
+        new_mode: NetworkOpsOperatingMode,
+        reason: &'static str,
+    ) {
         if self.mode == new_mode {
             return;
         }
 
         let now = Instant::now();
         let duration = now.saturating_duration_since(self.last_transition);
-        let old_mode_idx = encode_operating_mode(self.mode) as usize;
+        let old_mode = self.mode;
+        let old_mode_idx = encode_operating_mode(old_mode) as usize;
         self.counters[old_mode_idx].duration_us += duration.as_micros() as u64;
 
         if self.initial_sync_duration_us.is_none() && new_mode == NetworkOpsOperatingMode::Full {
@@ -130,6 +138,20 @@ impl StateAccounting {
         self.mode = new_mode;
         self.last_transition = now;
         self.counters[encode_operating_mode(new_mode) as usize].transitions += 1;
+
+        quaxar_metrics::acquisition::record_operating_mode_transition(
+            old_mode.as_str(),
+            new_mode.as_str(),
+            reason,
+        );
+        quaxar_metrics::acquisition::operating_mode(encode_operating_mode(new_mode));
+        tracing::info!(
+            target: "operating_mode",
+            from = old_mode.as_str(),
+            to = new_mode.as_str(),
+            reason,
+            "Operating mode transition",
+        );
     }
 
     fn json(&self) -> Value {
@@ -223,11 +245,33 @@ impl SharedNetworkOpsState {
     }
 
     pub fn set_operating_mode(&self, operating_mode: NetworkOpsOperatingMode) {
+        self.set_operating_mode_with_reason(operating_mode, "unspecified");
+    }
+
+    /// Set the operating mode, recording the transition reason in the
+    /// mode-transition metric and trace. The reason describes the caller's
+    /// motivation; the effective mode may be normalized by validated-ledger
+    /// age or blocked state before it reaches `StateAccounting`.
+    pub fn set_operating_mode_with_reason(
+        &self,
+        operating_mode: NetworkOpsOperatingMode,
+        reason: &'static str,
+    ) {
+        // Serialize the public atomic and StateAccounting update. Without a
+        // common writer lock, two concurrent writers can commit the atomic in
+        // one order and the accounting mode in the opposite order.
+        let mut accounting = self.state_accounting.lock();
+        let operating_mode = if operating_mode > NetworkOpsOperatingMode::Connected
+            && (self.amendment_blocked.load(Ordering::Acquire)
+                || self.unl_blocked.load(Ordering::Acquire))
+        {
+            NetworkOpsOperatingMode::Connected
+        } else {
+            operating_mode
+        };
+        accounting.set_operating_mode_with_reason(operating_mode, reason);
         self.operating_mode
             .store(encode_operating_mode(operating_mode), Ordering::Release);
-        self.state_accounting
-            .lock()
-            .set_operating_mode(operating_mode);
     }
 
     pub fn operating_mode(&self) -> NetworkOpsOperatingMode {
@@ -265,8 +309,21 @@ impl SharedNetworkOpsState {
     }
 
     pub fn set_amendment_blocked(&self, amendment_blocked: bool) {
+        let mut accounting = self.state_accounting.lock();
         self.amendment_blocked
             .store(amendment_blocked, Ordering::Release);
+        if amendment_blocked {
+            // rippled setAmendmentBlocked immediately requests CONNECTED; the
+            // blocked normalization makes that exact rather than SYNCING.
+            accounting.set_operating_mode_with_reason(
+                NetworkOpsOperatingMode::Connected,
+                "amendment_blocked",
+            );
+            self.operating_mode.store(
+                encode_operating_mode(NetworkOpsOperatingMode::Connected),
+                Ordering::Release,
+            );
+        }
     }
 
     pub fn amendment_blocked(&self) -> bool {
@@ -274,7 +331,16 @@ impl SharedNetworkOpsState {
     }
 
     pub fn set_unl_blocked(&self, unl_blocked: bool) {
+        let mut accounting = self.state_accounting.lock();
         self.unl_blocked.store(unl_blocked, Ordering::Release);
+        if unl_blocked {
+            accounting
+                .set_operating_mode_with_reason(NetworkOpsOperatingMode::Connected, "unl_blocked");
+            self.operating_mode.store(
+                encode_operating_mode(NetworkOpsOperatingMode::Connected),
+                Ordering::Release,
+            );
+        }
     }
 
     pub fn unl_blocked(&self) -> bool {
@@ -291,6 +357,11 @@ impl SharedNetworkOpsState {
 
     pub fn initial_sync_duration_us(&self) -> Option<String> {
         self.state_accounting.lock().initial_sync_duration_us()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accounting_operating_mode(&self) -> NetworkOpsOperatingMode {
+        self.state_accounting.lock().mode
     }
 }
 
@@ -325,17 +396,33 @@ impl AppNetworkOpsModeOwner {
         self.state.operating_mode()
     }
 
+    pub fn is_full(&self) -> bool {
+        self.state.is_full()
+    }
+
     pub fn set_operating_mode(
         &self,
         operating_mode: NetworkOpsOperatingMode,
     ) -> NetworkOpsOperatingMode {
+        self.set_operating_mode_with_reason(operating_mode, "unspecified")
+    }
+
+    /// Set the operating mode through the validated-ledger-age / blocked
+    /// normalization, recording `reason` on the transition trace and metric.
+    pub fn set_operating_mode_with_reason(
+        &self,
+        operating_mode: NetworkOpsOperatingMode,
+        reason: &'static str,
+    ) -> NetworkOpsOperatingMode {
         let previous = self.state.operating_mode();
-        self.state
-            .set_operating_mode(normalize_operating_mode_for_validated_age(
+        self.state.set_operating_mode_with_reason(
+            normalize_operating_mode_for_validated_age(
                 operating_mode,
                 (self.validated_ledger_age)(),
                 self.state.is_blocked(),
-            ));
+            ),
+            reason,
+        );
         previous
     }
 
@@ -344,8 +431,19 @@ impl AppNetworkOpsModeOwner {
         &self,
         operating_mode: NetworkOpsOperatingMode,
     ) -> NetworkOpsOperatingMode {
+        self.set_operating_mode_direct_with_reason(operating_mode, "unspecified")
+    }
+
+    /// Set the mode exactly as requested, recording `reason` on the transition
+    /// trace and metric. Used for downgrades that must bypass normalization.
+    pub fn set_operating_mode_direct_with_reason(
+        &self,
+        operating_mode: NetworkOpsOperatingMode,
+        reason: &'static str,
+    ) -> NetworkOpsOperatingMode {
         let previous = self.state.operating_mode();
-        self.state.set_operating_mode(operating_mode);
+        self.state
+            .set_operating_mode_with_reason(operating_mode, reason);
         previous
     }
 
@@ -355,9 +453,6 @@ impl AppNetworkOpsModeOwner {
 
     pub fn set_unl_blocked(&self, unl_blocked: bool) {
         self.state.set_unl_blocked(unl_blocked);
-        if unl_blocked {
-            self.set_operating_mode(NetworkOpsOperatingMode::Connected);
-        }
     }
 
     pub fn unl_blocked(&self) -> bool {
@@ -637,6 +732,37 @@ impl<Pending, Held> NetworkOpsRuntimeState<Pending, Held> {
         );
         self.dispatch_state = next_state;
         dispatch
+    }
+
+    pub fn schedule_pending_transaction_batch(
+        &mut self,
+        add_batch_job: impl FnOnce() -> bool,
+    ) -> bool {
+        if self.pending_transactions.is_empty()
+            || self.dispatch_state != NetworkOpsDispatchState::None
+        {
+            return false;
+        }
+
+        if add_batch_job() {
+            self.dispatch_state = NetworkOpsDispatchState::Scheduled;
+            return true;
+        }
+
+        false
+    }
+
+    /// Release a scheduled async batch that could not begin because there was
+    /// no base ledger. The queue and each transaction's applying flag stay
+    /// intact; the next ingress or ledger transition can schedule one fresh
+    /// JtBatch from `None`.
+    pub fn release_scheduled_transaction_batch_for_retry(&mut self) -> bool {
+        if self.dispatch_state != NetworkOpsDispatchState::Scheduled {
+            return false;
+        }
+
+        self.dispatch_state = NetworkOpsDispatchState::None;
+        true
     }
 
     pub fn transaction_batch(
@@ -1343,19 +1469,11 @@ pub fn run_networkops_begin_apply_batch<T>(
         "xrpl::NetworkOPsImp::apply : is not running"
     );
 
+    // rippled swaps the complete pending vector into the running batch. Do not
+    // impose a Rust-only cap here: `transactionBatch` drains until the queue
+    // is empty, and a split batch changes observable application ordering.
     let mut transactions = Vec::new();
     std::mem::swap(&mut transactions, pending_transactions);
-    // Cap the batch to prevent the consensus strand from blocking indefinitely
-    // when peers flood transactions faster than they can be processed. Excess
-    // transactions remain in pending_transactions for the next batch cycle.
-    // This ensures the consensus timer tick fires within a bounded interval,
-    // which is critical for switchLastClosedLedger recovery after a chain fork
-    // or when transactions consistently fail (e.g., amount overflow panics).
-    const MAX_BATCH_SIZE: usize = 256;
-    if transactions.len() > MAX_BATCH_SIZE {
-        let excess = transactions.split_off(MAX_BATCH_SIZE);
-        *pending_transactions = excess;
-    }
     let taken_transactions = transactions.len();
     unlock();
 
@@ -1468,10 +1586,22 @@ pub fn run_networkops_apply_batch_tail<Tx, Held>(
     let pending_transactions = run_networkops_merge_submit_held(pending_transactions, submit_held);
     notify_all();
 
+    // Matches rippled's `while (!transactions_.empty()) { apply(lock); }`
+    // in NetworkOPsImp::transactionBatch: if more transactions arrived during
+    // this batch's processing (from concurrent JtTransaction jobs completing),
+    // immediately re-schedule rather than waiting for the next external trigger.
+    // Without this, relayed transactions accumulate in pending and miss the
+    // current consensus round's open-ledger capture.
+    let dispatch_state = if pending_transactions > 0 {
+        NetworkOpsDispatchState::Scheduled
+    } else {
+        NetworkOpsDispatchState::None
+    };
+
     NetworkOpsApplyBatchTail {
         cleared: transactions.len(),
         pending_transactions,
-        dispatch_state: NetworkOpsDispatchState::None,
+        dispatch_state,
     }
 }
 

@@ -1,7 +1,7 @@
 use super::{
-    AcqMsg, AcqRegistry, CompletedLedgerAcceptance, LedgerPublishAdvance,
-    PEERFINDER_MAX_CONNECT_ATTEMPTS, PEERFINDER_MAX_HOPS, PEERFINDER_NUMBER_OF_ENDPOINTS,
-    PEERFINDER_RECENT_ATTEMPT_DURATION, bind_server_runtime_into_root, build_endpoint_broadcast,
+    CompletedLedgerAcceptance, LedgerPublishAdvance, PEERFINDER_MAX_CONNECT_ATTEMPTS,
+    PEERFINDER_MAX_HOPS, PEERFINDER_NUMBER_OF_ENDPOINTS, PEERFINDER_RECENT_ATTEMPT_DURATION,
+    STARTUP_VALUE_FLAGS, bind_server_runtime_into_root, build_endpoint_broadcast,
     candidate_ledger_for_seq, candidate_reference_hash_from_reference_ledger,
     classify_completed_ledger_acceptance, classify_publish_advance,
     cold_bootstrap_persisted_validated_target, command_suggestions, current_ledger_is_fresh,
@@ -39,40 +39,30 @@ impl RpcDispatcher for TestDispatcher {
     }
 }
 
-fn config(text: &str) -> basics::basic_config::BasicConfig {
-    let mut config = basics::basic_config::BasicConfig::new();
-    let mut sections = basics::basic_config::IniFileSections::new();
-    let mut current = String::new();
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            current = line[1..line.len() - 1].trim().to_owned();
-            let _ = sections.entry(current.clone()).or_default();
-            continue;
-        }
-        sections
-            .entry(current.clone())
-            .or_default()
-            .push(raw_line.to_owned());
-    }
-    config.build(&sections);
-    config
-}
-
 #[test]
 fn cli_unknown_command_helpers_detect_command_and_suggest_close_matches() {
     let args = vec![
-        "xrpld".to_owned(),
+        "quaxar".to_owned(),
         "--conf".to_owned(),
-        "xrpld.cfg".to_owned(),
+        "quaxar.cfg".to_owned(),
         "logs".to_owned(),
     ];
     assert_eq!(
-        first_command_like_arg(&args, &["--conf", "-c", "--rpc-url"]),
+        first_command_like_arg(&args, STARTUP_VALUE_FLAGS),
         Some("logs")
+    );
+
+    let startup_args = vec![
+        "quaxar".to_owned(),
+        "--conf".to_owned(),
+        "quaxar.cfg".to_owned(),
+        "--quorum".to_owned(),
+        "2".to_owned(),
+    ];
+    assert_eq!(
+        first_command_like_arg(&startup_args, STARTUP_VALUE_FLAGS),
+        None,
+        "the quorum value belongs to the server startup parser, not the RPC CLI"
     );
 
     let suggestions = command_suggestions(
@@ -83,14 +73,14 @@ fn cli_unknown_command_helpers_detect_command_and_suggest_close_matches() {
 }
 
 #[test]
-fn xrpld_main_binds_server_runtime_into_the_composed_app_graph() {
+fn quaxar_main_binds_server_runtime_into_the_composed_app_graph() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
     let _guard = runtime.enter();
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -167,8 +157,6 @@ path = {}
                 reason: "test handoff".to_owned(),
             }],
         },
-        None,
-        None,
     );
 
     assert!(report.has_server_runtime);
@@ -200,7 +188,7 @@ fn node_store_usage_path_uses_the_configured_node_db_directory() {
         .expect("tokio runtime");
     let _guard = runtime.enter();
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -242,7 +230,7 @@ fn promote_current_ledger_keeps_runtime_and_app_published_ledgers_aligned() {
         .expect("tokio runtime");
     let _guard = runtime.enter();
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(

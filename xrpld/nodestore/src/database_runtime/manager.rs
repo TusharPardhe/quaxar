@@ -142,7 +142,7 @@ impl ManagerImp {
     }
 
     pub fn missing_backend() -> String {
-        "Your xrpld.cfg is missing a [node_db] entry, please see the xrpld-example.cfg file!"
+        "Your quaxar.cfg is missing a [node_db] entry; please see the Quaxar example configuration"
             .to_owned()
     }
 }
@@ -464,7 +464,9 @@ mod tests {
             (Vec::new(), Status::Ok)
         }
 
-        fn store(&self, _object: Arc<NodeObject>) {}
+        fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
+            Ok(())
+        }
 
         fn store_batch(&self, _batch: &crate::Batch) {}
 
@@ -531,7 +533,9 @@ mod tests {
             (Vec::new(), Status::Ok)
         }
 
-        fn store(&self, _object: Arc<NodeObject>) {}
+        fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
+            Ok(())
+        }
 
         fn store_batch(&self, _batch: &crate::Batch) {}
 

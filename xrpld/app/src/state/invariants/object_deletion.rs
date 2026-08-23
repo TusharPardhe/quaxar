@@ -33,7 +33,7 @@ pub(super) fn record_object_deletion_state(
     }
 }
 
-pub(super) fn validates_object_deletion<V: ApplyView>(
+pub(super) fn validates_object_deletion<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &ObjectDeletionState,
 ) -> bool {

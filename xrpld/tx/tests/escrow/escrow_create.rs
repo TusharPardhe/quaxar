@@ -121,6 +121,7 @@ fn escrow_create_preflight_and_preclaim_match_cpp_guards() {
         amount_positive: true,
         feature_token_escrow_enabled: false,
         feature_mptokens_enabled: false,
+        fix_cleanup_3_2_0_enabled: false,
         issue_has_bad_currency: false,
         mpt_amount_within_limit: true,
         cancel_after_present: false,
@@ -134,6 +135,7 @@ fn escrow_create_preflight_and_preclaim_match_cpp_guards() {
         amount_positive: true,
         feature_token_escrow_enabled: true,
         feature_mptokens_enabled: false,
+        fix_cleanup_3_2_0_enabled: false,
         issue_has_bad_currency: true,
         mpt_amount_within_limit: true,
         cancel_after_present: true,
@@ -285,4 +287,74 @@ fn escrow_create_do_apply_maps_cpp_failures() {
     );
     assert_eq!(dir_full, Ter::TEC_DIR_FULL);
     assert_eq!(trans_token(dir_full), "tecDIR_FULL");
+}
+
+#[test]
+fn escrow_create_sttx_preflight_parses_conditions_and_enforces_finish_or_condition() {
+    use protocol::{Rules, STAmount, STTx, TxType, XRPAmount, get_field_by_symbol};
+    use tx::run_escrow_create_sttx_preflight;
+
+    let sf = get_field_by_symbol;
+    let account = protocol::AccountID::from_array([0x11; 20]);
+    let destination = protocol::AccountID::from_array([0x12; 20]);
+    let build = |finish_after: bool, condition: Option<&[u8]>| {
+        STTx::new(TxType::ESCROW_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_account_id(sf("sfDestination"), destination);
+            tx.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+            );
+            tx.set_field_u32(sf("sfCancelAfter"), 20);
+            if finish_after {
+                tx.set_field_u32(sf("sfFinishAfter"), 10);
+            }
+            if let Some(condition) = condition {
+                tx.set_field_vl(sf("sfCondition"), condition);
+            }
+        })
+    };
+
+    let rules = Rules::default();
+    assert_eq!(
+        run_escrow_create_sttx_preflight(&build(false, None), &rules),
+        Ter::TEM_MALFORMED,
+        "a cancel-only escrow needs either FinishAfter or a condition"
+    );
+    assert_eq!(
+        run_escrow_create_sttx_preflight(&build(true, Some(&[0xA0, 0x00])), &rules),
+        Ter::TEM_MALFORMED,
+        "condition bytes must deserialize as a crypto-condition, not merely be nonempty"
+    );
+}
+
+#[test]
+fn escrow_create_mpt_gate_obeys_fix_cleanup_3_2_0_precedence() {
+    let facts = EscrowCreatePreflightFacts {
+        amount_kind: EscrowCreateAmountKind::Mpt,
+        amount_positive: true,
+        feature_token_escrow_enabled: false,
+        feature_mptokens_enabled: false,
+        fix_cleanup_3_2_0_enabled: false,
+        issue_has_bad_currency: false,
+        mpt_amount_within_limit: true,
+        cancel_after_present: true,
+        finish_after_present: true,
+        cancel_after_strictly_after_finish_after: true,
+        condition_present: false,
+        condition_valid: true,
+    };
+    assert_eq!(
+        run_escrow_create_preflight(facts),
+        Ter::TEM_BAD_AMOUNT,
+        "legacy preflight reaches the TokenEscrow gate before MPTokensV1"
+    );
+    assert_eq!(
+        run_escrow_create_preflight(EscrowCreatePreflightFacts {
+            fix_cleanup_3_2_0_enabled: true,
+            ..facts
+        }),
+        Ter::TEM_DISABLED,
+        "fixCleanup3_2_0 moves the MPTokensV1 gate ahead of TokenEscrow"
+    );
 }

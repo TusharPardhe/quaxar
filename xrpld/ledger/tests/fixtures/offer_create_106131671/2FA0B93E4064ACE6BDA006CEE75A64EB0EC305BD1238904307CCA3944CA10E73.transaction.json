@@ -1,0 +1,111 @@
+{
+  "result": {
+    "Account": "rw7nJtEN2YuLt57AfAKdfyFMMLHhTMJKdu",
+    "Fee": "12",
+    "Flags": 0,
+    "LastLedgerSequence": 106131689,
+    "Sequence": 99419514,
+    "SigningPubKey": "ED4B3956D85D8C8ED3ADE3CEB9CA030A0AF9A4BD08E950479335AE68E88115986C",
+    "TakerGets": {
+      "currency": "4242524C00000000000000000000000000000000",
+      "issuer": "rH5CJsqvNqZGxrMyGaqLEoMWRYcVTAPZMt",
+      "value": "255960"
+    },
+    "TakerPays": {
+      "currency": "524C555344000000000000000000000000000000",
+      "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+      "value": "50000"
+    },
+    "TransactionType": "OfferCreate",
+    "TxnSignature": "FD18E881FA6458F702D6E9540B1CDA0B2F707EAA54536226E2BF97464B659300A14A07392203C10E35DE3792A90D60822B8BA87665529D110D7F5DFADCBD8C00",
+    "ctid": "C65370D700640000",
+    "date": 839419540,
+    "hash": "2FA0B93E4064ACE6BDA006CEE75A64EB0EC305BD1238904307CCA3944CA10E73",
+    "inLedger": 106131671,
+    "ledger_index": 106131671,
+    "meta": {
+      "AffectedNodes": [
+        {
+          "CreatedNode": {
+            "LedgerEntryType": "Offer",
+            "LedgerIndex": "00BFCC57E3F7D5D7C9CB09C94CD8F62423E72226F66F88477CA3804B53145BFD",
+            "NewFields": {
+              "Account": "rw7nJtEN2YuLt57AfAKdfyFMMLHhTMJKdu",
+              "BookDirectory": "EB6E2F22D46F3DA7D3F429EE845BF345AD624C51390AC0435406F0B2A9919800",
+              "Sequence": 99419514,
+              "TakerGets": {
+                "currency": "4242524C00000000000000000000000000000000",
+                "issuer": "rH5CJsqvNqZGxrMyGaqLEoMWRYcVTAPZMt",
+                "value": "255950.8574353724"
+              },
+              "TakerPays": {
+                "currency": "524C555344000000000000000000000000000000",
+                "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+                "value": "50000"
+              }
+            }
+          }
+        },
+        {
+          "ModifiedNode": {
+            "FinalFields": {
+              "Account": "rw7nJtEN2YuLt57AfAKdfyFMMLHhTMJKdu",
+              "Balance": "66092396472",
+              "Flags": 0,
+              "OwnerCount": 8,
+              "Sequence": 99419515
+            },
+            "LedgerEntryType": "AccountRoot",
+            "LedgerIndex": "280D8E8AFC030FE855600CF5071897BD0277CDE2300FC09BD74C5645B6C372AA",
+            "PreviousFields": {
+              "Balance": "66092396484",
+              "OwnerCount": 7,
+              "Sequence": 99419514
+            },
+            "PreviousTxnID": "A2CCD5DE94D3E38515D248B7E45934B733E30552469BF01E99DCB17C19E6980E",
+            "PreviousTxnLgrSeq": 106131669
+          }
+        },
+        {
+          "ModifiedNode": {
+            "FinalFields": {
+              "Flags": 0,
+              "IndexNext": "0",
+              "IndexPrevious": "0",
+              "Owner": "rw7nJtEN2YuLt57AfAKdfyFMMLHhTMJKdu",
+              "RootIndex": "B335DFD177CC70D255251F782E8EDCB72267CD1D892D4478301BD1E4A01D67C0"
+            },
+            "LedgerEntryType": "DirectoryNode",
+            "LedgerIndex": "B335DFD177CC70D255251F782E8EDCB72267CD1D892D4478301BD1E4A01D67C0",
+            "PreviousTxnID": "A2CCD5DE94D3E38515D248B7E45934B733E30552469BF01E99DCB17C19E6980E",
+            "PreviousTxnLgrSeq": 106131669
+          }
+        },
+        {
+          "CreatedNode": {
+            "LedgerEntryType": "DirectoryNode",
+            "LedgerIndex": "EB6E2F22D46F3DA7D3F429EE845BF345AD624C51390AC0435406F0B2A9919800",
+            "NewFields": {
+              "ExchangeRate": "5406f0b2a9919800",
+              "RootIndex": "EB6E2F22D46F3DA7D3F429EE845BF345AD624C51390AC0435406F0B2A9919800",
+              "TakerGetsCurrency": "4242524C00000000000000000000000000000000",
+              "TakerGetsIssuer": "B763087CAC6EB2D5254F94BDF934B946DBD1938A",
+              "TakerPaysCurrency": "524C555344000000000000000000000000000000",
+              "TakerPaysIssuer": "E5E961C6A025C9404AA7B662DD1DF975BE75D13E"
+            }
+          }
+        }
+      ],
+      "TransactionIndex": 100,
+      "TransactionResult": "tesSUCCESS"
+    },
+    "status": "success",
+    "validated": true
+  },
+  "warnings": [
+    {
+      "id": 2001,
+      "message": "This is a clio server. clio only serves validated data. If you want to talk to rippled, include 'ledger_index':'current' in your request"
+    }
+  ]
+}

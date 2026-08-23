@@ -152,7 +152,7 @@ fn app_network_ops_runtime_process_async_stages_valid_transaction() {
 }
 
 #[test]
-fn application_root_submit_transaction_queues_process_job_and_stages_pending_transaction() {
+fn application_root_submit_transaction_queues_and_drains_async_batch() {
     let mut root = ApplicationRoot::new(0).expect("root shell should build");
     let runtime = root.attach_default_network_ops_runtime();
     let tx = payment_tx(
@@ -185,15 +185,16 @@ fn application_root_submit_transaction_queues_process_job_and_stages_pending_tra
 
     root.job_queue().run_until_idle();
 
-    assert_eq!(root.network_ops_pending_transaction_count(), Some(1));
+    assert_eq!(root.network_ops_pending_transaction_count(), Some(0));
     let cached = root
         .fetch_cached_transaction(&txid)
         .expect("submitted transaction should be canonicalized into the root cache");
     assert!(
-        cached
+        !cached
             .lock()
             .expect("transaction mutex must not be poisoned")
-            .get_applying()
+            .get_applying(),
+        "the scheduled batch must settle the submitted transaction instead of leaving it applying"
     );
 }
 
@@ -404,7 +405,7 @@ fn app_network_ops_runtime_apply_pending_keeps_cpp_owner_side_effect_order() {
             tail: NetworkOpsApplyBatchTail {
                 cleared: 1,
                 pending_transactions: 2,
-                dispatch_state: NetworkOpsDispatchState::None,
+                dispatch_state: NetworkOpsDispatchState::Scheduled,
             },
         }
     );

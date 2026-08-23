@@ -10,18 +10,21 @@ name = "app"
 path = "src/lib.rs"
 
 [dependencies]
+acquisition = { path = "../acquisition" }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 tracing = "0.1"
-xrpld-metrics = { path = "../metrics" }
+quaxar-metrics = { path = "../metrics" }
 parking_lot = "0.12"
 basics = { path = "../../xrpl/basics" }
 bs58 = "0.5"
+bytes = "1"
 consensus = { path = "../consensus" }
 http = "1"
 libc = "0.2"
 ipnet = "2"
 ledger = { path = "../ledger" }
 nodestore = { path = "../nodestore" }
+openssl = { version = "0.10", features = ["vendored"] }
 rdb = { path = "../rdb" }
 overlay = { path = "../overlay" }
 perflog = { path = "../perflog" }
@@ -36,13 +39,13 @@ serde_json = "1"
 shamap = { path = "../../xrpl/shamap" }
 sha2 = { version = "0.10", features = ["asm"] }
 ripemd = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "signal", "time", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "time", "fs", "sync"] }
 tokio-util = "0.7"
 time = "0.3"
 tx = { path = "../tx" }
 webpki-roots = "1"
 xrpl_core = { path = "../../xrpl/core" }
-xrpld_core = { path = "../core" }
+quaxar-core = { path = "../core" }
 arc-swap = "1"
 rayon = "1"
 

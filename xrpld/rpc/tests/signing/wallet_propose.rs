@@ -89,6 +89,10 @@ fn wallet_propose_from_seed_secp256k1() {
             "snMwVWs2hZzfDUF3p2tHZ3EgmyhFs".to_owned()
         ))
     );
+    assert_eq!(
+        result.get("key_type"),
+        Some(&JsonValue::String("secp256k1".to_owned()))
+    );
     assert!(!result.contains_key("warning"));
 
     // Same seed should produce same result

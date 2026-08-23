@@ -30,7 +30,7 @@ use time::Duration;
 fn full_sync_fetch_debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("XRPLD_FULL_SYNC_DEBUG_FETCH")
+        std::env::var("QUAXAR_FULL_SYNC_DEBUG_FETCH")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
@@ -88,6 +88,23 @@ where
 {
     generation: std::sync::atomic::AtomicU32,
     cache: TaggedCache<Uint256, (), C, S, SharedWeakCachePointer<()>, Arc<()>>,
+}
+
+impl<C, S> std::fmt::Debug for FullBelowCacheImpl<C, S>
+where
+    C: CacheClock,
+    S: BuildHasher + Clone,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FullBelowCacheImpl")
+            .field(
+                "generation",
+                &self.generation.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field("entries", &self.size())
+            .finish()
+    }
 }
 
 impl<C, S> FullBelowCacheImpl<C, S>

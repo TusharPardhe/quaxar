@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    panic::{AssertUnwindSafe, catch_unwind},
+};
 
 use app::TxQ;
 use basics::base_uint::Uint256;
@@ -173,6 +176,7 @@ struct TestApplyApp {
     preclaim_calls: usize,
     try_clear_calls: usize,
     apply_sandbox_calls: usize,
+    panic_direct_apply: bool,
     trace_messages: Vec<String>,
 }
 
@@ -190,6 +194,9 @@ impl QueueApplyExecutionRuntime<&'static str, &'static str, &'static str> for Te
 
     fn direct_apply(&mut self) -> ApplyResult {
         self.direct_apply_calls += 1;
+        if self.panic_direct_apply {
+            panic!("TxQ direct apply panic");
+        }
         self.apply_result.clone()
     }
 
@@ -516,6 +523,7 @@ fn build_apply_runtime() -> TestApplyApp {
         preclaim_calls: 0,
         try_clear_calls: 0,
         apply_sandbox_calls: 0,
+        panic_direct_apply: false,
         trace_messages: Vec::new(),
     }
 }
@@ -543,6 +551,39 @@ fn txq_owner_accept_matches_landed_txq_facade() {
     assert_eq!(app_result, tx_result);
     assert_eq!(app_runtime.apply_calls, 1);
     assert_eq!(tx_runtime.apply_calls, 1);
+}
+
+#[test]
+fn txq_owner_restores_canonical_views_after_apply_panics() {
+    let tx_source = TestApplyTxSource {
+        account: "acct",
+        transaction_id: "tx-panic",
+        tx_id: Uint256::from_u64(78),
+        tx_seq_proxy: SeqProxy::sequence(5),
+    };
+    let view = build_apply_view();
+    let mut app_runtime = build_apply_runtime();
+    app_runtime.panic_direct_apply = true;
+    let mut app_txq = build_app_txq();
+    let before = app_txq.views().clone();
+    let mut lock = TestApplyLock;
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _ = app_txq.apply_with_app_view(
+            &mut lock,
+            &mut app_runtime,
+            &view,
+            &tx_source,
+            QueueHoldPreflight::new(false, false, ApplyFlags::FAIL_HARD, Some(250)),
+            ApplyFlags::FAIL_HARD,
+            TxConsequences::new(1, SeqProxy::sequence(5)),
+            Ter::TES_SUCCESS,
+        );
+    }));
+
+    assert!(panic.is_err());
+    assert_eq!(app_txq.views(), &before);
+    assert_eq!(app_runtime.direct_apply_calls, 1);
 }
 
 #[test]

@@ -148,20 +148,12 @@ pub fn to_strand<V: ReadView>(
             cur_asset = Asset::from(cur.mpt_id());
         }
 
-        if cur.is_account()
+        if (cur.is_account()
             && next.is_account()
-            && should_insert_implied_account(&cur, &next, cur_asset)
-        {
-            let issuer = cur_asset.issuer();
-            strand.push(StrandStep::AccountTransfer(AccountTransferStep {
-                source: cur.account_id(),
-                destination: issuer,
-                asset: cur_asset,
-            }));
-            cur = account_path_element(issuer);
-        } else if cur.is_account()
-            && next.is_offer()
-            && needs_implied_account_before_offer(&cur, cur_asset)
+            && should_insert_implied_account(&cur, &next, cur_asset))
+            || (cur.is_account()
+                && next.is_offer()
+                && needs_implied_account_before_offer(&cur, cur_asset))
         {
             let issuer = cur_asset.issuer();
             strand.push(StrandStep::AccountTransfer(AccountTransferStep {

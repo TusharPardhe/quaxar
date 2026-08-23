@@ -38,7 +38,7 @@
 //!     └── file_sha256:      [u8; 32]  (sha256 of all bytes before the footer)
 //! ```
 
-/// 8-byte magic that identifies an xrpld snapshot file.
+/// 8-byte magic that identifies a Quaxar snapshot file.
 /// ASCII "xrpls\0\x01\x00" — the `\x01` encodes the format family version.
 pub const SNAPSHOT_MAGIC: &[u8; 8] = b"xrpls\x00\x01\x00";
 
@@ -209,14 +209,13 @@ impl SnapshotManifest {
     pub fn deserialize_header(buf: &[u8]) -> Result<Self, crate::snapshot::SnapshotError> {
         use crate::snapshot::SnapshotError;
 
-        if buf.len() < SNAPSHOT_HEADER_SIZE {
-            return Err(SnapshotError::io(
-                "header too short",
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "snapshot header is truncated",
+        if buf.len() != SNAPSHOT_HEADER_SIZE {
+            return Err(SnapshotError::MalformedHeader {
+                reason: format!(
+                    "header size is {}, expected {SNAPSHOT_HEADER_SIZE}",
+                    buf.len()
                 ),
-            ));
+            });
         }
 
         let mut pos = 0;
@@ -232,7 +231,7 @@ impl SnapshotManifest {
 
         // Version
         let version = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
-        if version > SNAPSHOT_MAX_VERSION {
+        if version != SNAPSHOT_VERSION {
             return Err(SnapshotError::UnsupportedVersion {
                 found: version,
                 max_supported: SNAPSHOT_MAX_VERSION,
@@ -242,6 +241,11 @@ impl SnapshotManifest {
 
         // ledger_seq
         let ledger_seq = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        if ledger_seq == 0 {
+            return Err(SnapshotError::MalformedHeader {
+                reason: "ledger sequence must be nonzero".to_owned(),
+            });
+        }
         pos += 4;
 
         // ledger_hash
@@ -282,7 +286,13 @@ impl SnapshotManifest {
 
         // chunk_count
         let _chunk_count = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        let _ = pos;
+        pos += 4;
+
+        if buf[pos..].iter().any(|byte| *byte != 0) {
+            return Err(SnapshotError::MalformedHeader {
+                reason: "reserved header bytes must be zero".to_owned(),
+            });
+        }
 
         Ok(Self {
             version,
@@ -373,9 +383,10 @@ pub fn decode_node_record(
     let hash: [u8; 32] = buf[pos..pos + 32].try_into().unwrap();
     pos += 32;
 
-    // decode varint
-    let mut data_len: usize = 0;
-    let mut shift = 0usize;
+    // Decode a base-127 little-endian varint. Reject overlong encodings so
+    // each node record has exactly one wire representation.
+    let mut data_len = 0u64;
+    let mut encoded_len = 0usize;
     loop {
         if pos >= buf.len() {
             return Err(SnapshotError::MalformedNodeRecord {
@@ -384,14 +395,23 @@ pub fn decode_node_record(
                 reason: "buffer truncated inside data_len varint".to_owned(),
             });
         }
-        let byte = buf[pos] as usize;
+        let byte = buf[pos];
         pos += 1;
-        data_len |= (byte & 0x7F) << shift;
-        shift += 7;
+        let payload = u64::from(byte & 0x7F);
+        let shift = encoded_len * 7;
+        if encoded_len == 9 && (byte & 0x80 != 0 || payload > 1) {
+            return Err(SnapshotError::MalformedNodeRecord {
+                chunk_index,
+                offset: pos,
+                reason: "data_len varint overflow".to_owned(),
+            });
+        }
+        data_len |= payload << shift;
+        encoded_len += 1;
         if byte & 0x80 == 0 {
             break;
         }
-        if shift >= 64 {
+        if encoded_len == 10 {
             return Err(SnapshotError::MalformedNodeRecord {
                 chunk_index,
                 offset: pos,
@@ -399,8 +419,20 @@ pub fn decode_node_record(
             });
         }
     }
+    if encoded_len > 1 && data_len < (1_u64 << (7 * (encoded_len - 1))) {
+        return Err(SnapshotError::MalformedNodeRecord {
+            chunk_index,
+            offset: start,
+            reason: "data_len varint is not canonical".to_owned(),
+        });
+    }
+    let data_len = usize::try_from(data_len).map_err(|_| SnapshotError::MalformedNodeRecord {
+        chunk_index,
+        offset: start,
+        reason: "data_len does not fit platform usize".to_owned(),
+    })?;
 
-    if pos + data_len > buf.len() {
+    if pos.checked_add(data_len).is_none_or(|end| end > buf.len()) {
         return Err(SnapshotError::MalformedNodeRecord {
             chunk_index,
             offset: pos,

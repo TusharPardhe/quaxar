@@ -100,6 +100,76 @@ fn ledger_with(entries: impl IntoIterator<Item = STLedgerEntry>) -> Ledger {
 }
 
 #[test]
+fn credential_read_view_preclaims_preserve_ter_order_and_defaulting() {
+    use ledger::credential_helpers::{
+        credential_accept_preclaim, credential_create_preclaim, credential_delete_preclaim,
+    };
+
+    let issuer = account(0x41);
+    let subject = account(0x42);
+    let credential_type = b"kyc";
+    let credential = credential_entry(subject, issuer, credential_type, false);
+
+    let missing_subject = ledger_with([credential.clone()]);
+    assert_eq!(
+        credential_create_preclaim(&missing_subject, subject, issuer, credential_type),
+        Ok(Ter::TEC_NO_TARGET),
+        "CredentialCreate returns tecNO_TARGET before considering a duplicate"
+    );
+
+    let missing_issuer = ledger_with([account_entry(subject, 0), credential.clone()]);
+    assert_eq!(
+        credential_accept_preclaim(&missing_issuer, subject, issuer, credential_type),
+        Ok(Ter::TEC_NO_ISSUER),
+        "CredentialAccept returns tecNO_ISSUER before considering its credential"
+    );
+
+    let no_credential = ledger_with([account_entry(subject, 0), account_entry(issuer, 0)]);
+    assert_eq!(
+        credential_create_preclaim(&no_credential, subject, issuer, credential_type),
+        Ok(Ter::TES_SUCCESS)
+    );
+    assert_eq!(
+        credential_accept_preclaim(&no_credential, subject, issuer, credential_type),
+        Ok(Ter::TEC_NO_ENTRY)
+    );
+    assert_eq!(
+        credential_delete_preclaim(&no_credential, issuer, Some(subject), None, credential_type,),
+        Ok(Ter::TEC_NO_ENTRY),
+        "CredentialDelete defaults an omitted issuer to the transaction account"
+    );
+
+    let accepted = ledger_with([
+        account_entry(subject, 0),
+        account_entry(issuer, 0),
+        credential.clone(),
+    ]);
+    assert_eq!(
+        credential_create_preclaim(&accepted, subject, issuer, credential_type),
+        Ok(Ter::TEC_DUPLICATE)
+    );
+    assert_eq!(
+        credential_accept_preclaim(&accepted, subject, issuer, credential_type),
+        Ok(Ter::TES_SUCCESS)
+    );
+    assert_eq!(
+        credential_delete_preclaim(&accepted, issuer, Some(subject), None, credential_type,),
+        Ok(Ter::TES_SUCCESS)
+    );
+
+    let accepted_credential = credential_entry(subject, issuer, credential_type, true);
+    let already_accepted = ledger_with([
+        account_entry(subject, 0),
+        account_entry(issuer, 0),
+        accepted_credential,
+    ]);
+    assert_eq!(
+        credential_accept_preclaim(&already_accepted, subject, issuer, credential_type),
+        Ok(Ter::TEC_DUPLICATE)
+    );
+}
+
+#[test]
 fn expired_credential_deletion_failure_tracks_fix_cleanup_3_1_3() {
     let issuer = account(0x31);
     let subject = account(0x32);

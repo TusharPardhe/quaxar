@@ -213,6 +213,7 @@ fn nudb_verify_detects_inconsistent_key_metadata_size() {
         .expect("open");
 
     backend.store(object(0x41, b"verify-size-mismatch"));
+    backend.sync();
 
     let header = read_nudb_key_file_header(&temp.path().join("nudb.key")).expect("key header");
     let mut bucket = read_bucket_block(temp.path(), header.block_size, 0);
@@ -247,6 +248,7 @@ fn nudb_verify_detects_spill_chain_cycles() {
         .expect("open");
 
     backend.store(object(0x51, b"verify-cycle"));
+    backend.sync();
 
     let spill_offset = append_empty_spill_bucket(temp.path());
     write_spill_compact_next_pointer(temp.path(), spill_offset, spill_offset);

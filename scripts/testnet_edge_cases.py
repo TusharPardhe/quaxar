@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Real testnet integration tests for xrpld.
+Real testnet integration tests for Quaxar.
 Submits actual transactions to the XRP Testnet with complex flag combinations.
 
 Usage:

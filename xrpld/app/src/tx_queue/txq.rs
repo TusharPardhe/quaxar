@@ -14,7 +14,12 @@
 //! this owner keeps one canonical state and reconstructs the narrower tx-layer
 //! facades only for the duration of each call.
 
-use std::{collections::BTreeMap, fmt::Display, mem};
+use std::{
+    collections::BTreeMap,
+    fmt::Display,
+    mem,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+};
 
 use basics::mul_div::mul_div;
 use protocol::Ter;
@@ -172,9 +177,12 @@ impl<Account, Tx, Journal, ParentBatchId> TxQ<Account, Tx, Journal, ParentBatchI
         run: impl FnOnce(&mut QueueAcceptTxQ<Account, Tx, Journal, ParentBatchId, NullTxQJournal>) -> R,
     ) -> R {
         let mut txq = self.take_accept_txq();
-        let result = run(&mut txq);
+        let result = catch_unwind(AssertUnwindSafe(|| run(&mut txq)));
         self.restore_from_accept_txq(&mut txq);
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        }
     }
 
     fn take_apply_txq(&mut self) -> QueueApplyTxQ<Account, Tx, Journal, ParentBatchId> {
@@ -210,9 +218,12 @@ impl<Account, Tx, Journal, ParentBatchId> TxQ<Account, Tx, Journal, ParentBatchI
         run: impl FnOnce(&mut QueueApplyTxQ<Account, Tx, Journal, ParentBatchId>) -> R,
     ) -> R {
         let mut txq = self.take_apply_txq();
-        let result = run(&mut txq);
+        let result = catch_unwind(AssertUnwindSafe(|| run(&mut txq)));
         self.restore_from_apply_txq(&mut txq);
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        }
     }
 
     fn take_apply_journal_txq(
@@ -242,9 +253,12 @@ impl<Account, Tx, Journal, ParentBatchId> TxQ<Account, Tx, Journal, ParentBatchI
         ) -> R,
     ) -> R {
         let mut txq = self.take_apply_journal_txq();
-        let result = run(&mut txq);
+        let result = catch_unwind(AssertUnwindSafe(|| run(&mut txq)));
         self.restore_from_apply_journal_txq(&mut txq);
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        }
     }
 }
 

@@ -4,7 +4,7 @@ pub struct PathRanker;
 
 impl PathRanker {
     /// Port of reference Pathfinder::rankPaths
-    pub fn rank_paths(paths: &mut Vec<Path>) {
+    pub fn rank_paths(paths: &mut [Path]) {
         // Sort by quality (descending) then liquidity (descending)
         paths.sort_by(|a, b| {
             b.quality

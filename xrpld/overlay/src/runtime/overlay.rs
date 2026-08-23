@@ -8,12 +8,28 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use basics::base_uint::Uint256;
 use protocol::{JsonValue, PublicKey};
 use rustls::{ClientConfig, ServerConfig};
 
 use crate::connect_attempt::{ConnectAttemptError, ConnectAttemptResult};
 use crate::message::ProtocolMessage;
 use crate::peer::{Peer, PeerId};
+
+/// rippled `PeerFinder::Tuning` peer-budget defaults.
+pub const PEERFINDER_DEFAULT_MAX_PEERS: usize = 21;
+pub const PEERFINDER_MIN_OUTBOUND_PEERS: usize = 10;
+pub const PEERFINDER_OUTBOUND_PERCENT: usize = 15;
+
+/// Directional active-peer budgets derived with rippled's `Config::makeConfig`
+/// rules. Fixed, reserved, and cluster peers are intentionally excluded by the
+/// admission counter, not by these maxima.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerLimits {
+    pub max_peers: usize,
+    pub inbound_max: usize,
+    pub outbound_max: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Promote {
@@ -26,10 +42,23 @@ pub enum Promote {
 pub struct Setup {
     pub client_config: Option<Arc<ClientConfig>>,
     pub server_config: Option<Arc<ServerConfig>>,
+    /// OpenSSL-based server acceptor for inbound TLS connections.
+    /// Required for TLS Finished message extraction (Session-Signature derivation).
+    pub server_ssl_acceptor: Option<Arc<openssl::ssl::SslAcceptor>>,
     pub public_ip: Option<IpAddr>,
     pub fixed_peer_ips: HashSet<IpAddr>,
     pub ip_limit: usize,
+    /// Legacy `peers_max` budget. A zero value uses rippled's default of 21.
     pub peer_limit: usize,
+    /// Explicit `peers_in_max`; it must be supplied together with
+    /// `peer_limit_out` by configuration parsing.
+    pub peer_limit_in: Option<usize>,
+    /// Explicit `peers_out_max`; it must be supplied together with
+    /// `peer_limit_in` by configuration parsing.
+    pub peer_limit_out: Option<usize>,
+    /// Mirrors `PeerFinder::Config::wantIncoming`. Runtime setup derives this
+    /// from an enabled peer listener and peer privacy.
+    pub want_incoming: bool,
     pub verify_endpoints: bool,
     pub crawl_options: u32,
     pub network_id: Option<u32>,
@@ -47,10 +76,14 @@ impl Default for Setup {
         Self {
             client_config: None,
             server_config: None,
+            server_ssl_acceptor: None,
             public_ip: None,
             fixed_peer_ips: HashSet::new(),
             ip_limit: 0,
             peer_limit: 0,
+            peer_limit_in: None,
+            peer_limit_out: None,
+            want_incoming: true,
             verify_endpoints: true,
             crawl_options: 0,
             network_id: None,
@@ -61,6 +94,42 @@ impl Default for Setup {
             vp_reduce_relay_base_squelch_enabled: true,
             vp_reduce_relay_max_selected_peers: crate::slot::MAX_SELECTED_PEERS,
             reduce_relay_wait: crate::slot::WAIT_ON_BOOTUP,
+        }
+    }
+}
+
+impl Setup {
+    /// Match rippled `PeerFinder::Config::makeConfig` exactly for peer maxima:
+    /// legacy `peers_max` is raised to the minimum outbound count, receives a
+    /// rounded 15% outbound target, and gives the remainder to inbound peers.
+    /// Paired explicit limits bypass the legacy calculation; inbound capacity
+    /// is disabled when the node does not accept inbound peers.
+    pub fn peer_limits(&self) -> PeerLimits {
+        if let (Some(inbound_max), Some(outbound_max)) = (self.peer_limit_in, self.peer_limit_out) {
+            let inbound_max = if self.want_incoming { inbound_max } else { 0 };
+            return PeerLimits {
+                // rippled Config.cpp:112: config.maxPeers = 0 when explicit limits set
+                max_peers: 0,
+                inbound_max,
+                outbound_max,
+            };
+        }
+
+        let max_peers = if self.peer_limit == 0 {
+            PEERFINDER_DEFAULT_MAX_PEERS
+        } else {
+            self.peer_limit.max(PEERFINDER_MIN_OUTBOUND_PEERS)
+        };
+        let outbound_max = if self.want_incoming {
+            (((max_peers * PEERFINDER_OUTBOUND_PERCENT) + 50) / 100)
+                .max(PEERFINDER_MIN_OUTBOUND_PEERS)
+        } else {
+            max_peers
+        };
+        PeerLimits {
+            max_peers,
+            inbound_max: max_peers.saturating_sub(outbound_max),
+            outbound_max,
         }
     }
 }
@@ -106,6 +175,18 @@ pub trait Overlay: Send + Sync {
     fn network_id(&self) -> Option<u32>;
     fn verify_endpoints(&self) -> bool;
     fn tx_metrics(&self) -> JsonValue;
+    /// Admit a proposal source into relay history, including duplicate
+    /// source-slot accounting. Returns false for an existing suppression key.
+    fn admit_proposal_source(&self, uid: Uint256, validator: PublicKey, peer_id: PeerId) -> bool;
+    /// Admit a validation source into relay history, including duplicate
+    /// source-slot accounting. Returns false for an existing suppression key.
+    fn admit_validation_source(&self, uid: Uint256, validator: PublicKey, peer_id: PeerId) -> bool;
+    /// Whether the peer has diverged far enough to reject untrusted consensus
+    /// traffic before scheduling expensive verification work.
+    fn peer_is_diverged(&self, peer_id: PeerId) -> bool;
+    /// Add a local validation suppression entry without recording an ingress
+    /// source or a relay timestamp, matching HashRouter::addSuppression.
+    fn suppress_validation(&self, uid: Uint256);
     fn sweep_relay_history(&self, max_entries: u64);
     fn stats(&self) -> OverlayStats {
         OverlayStats {

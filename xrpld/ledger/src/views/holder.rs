@@ -41,6 +41,22 @@ impl LedgerHolder {
             .clone()
     }
 
+    pub fn clear_if_hash(&self, hash: basics::sha_map_hash::SHAMapHash) -> bool {
+        let mut held_ledger = self
+            .held_ledger
+            .lock()
+            .expect("LedgerHolder mutex must not be poisoned");
+        if held_ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.header().hash == hash)
+        {
+            *held_ledger = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn empty(&self) -> bool {
         self.held_ledger
             .lock()

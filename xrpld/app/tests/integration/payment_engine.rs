@@ -3134,7 +3134,7 @@ fn pe17_iou_50_dests() {
     ];
     for i in 0x41u8..=0x72 {
         entries.push(account_root(acct(i), 5_000_000_000, 1, 0));
-        entries.push(trust_line(acct(i), gw, usd_currency(), 0, 100000, 0));
+        entries.push(trust_line(gw, acct(i), usd_currency(), 0, 0, 100000));
     }
     let l = build_ledger(entries);
     let mut v = new_view(l);
@@ -22037,11 +22037,14 @@ fn cpp_trust_set_to_self() {
 #[test]
 fn cpp_batch_invalid_flags() {
     let a = acct(0x41);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x00080000); // tfDisallowXRP - invalid for Batch
+        tx.set_field_u32(sf("sfFlags"), 0x00000010); // not a Batch mode flag
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -22057,24 +22060,20 @@ fn cpp_batch_invalid_flags() {
 #[test]
 fn cpp_batch_empty_array() {
     let a = acct(0x41);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x00000001); // tfAllOrNothing
+        tx.set_field_u32(sf("sfFlags"), protocol::BATCH_ALL_OR_NOTHING_FLAG);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
         // No RawTransactions array
     });
     let r = full_apply(&mut v, &tx, TxType::BATCH);
-    assert!(
-        r == Ter::TEM_MALFORMED
-            || r == Ter::TEM_DISABLED
-            || r == Ter::from_int(-285)
-            || r == Ter::TES_SUCCESS,
-        "{:?}",
-        r
-    );
+    assert_eq!(r, Ter::TEM_ARRAY_EMPTY);
 }
 
 /// C++: SignerListSet with empty signers -> temMALFORMED
@@ -22360,7 +22359,10 @@ fn cpp_amm_clawback_holder_is_issuer() {
 #[test]
 fn cpp_batch_multiple_mode_flags() {
     let a = acct(0x41);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -22495,11 +22497,14 @@ fn cpp_regular_key_set_different() {
 #[test]
 fn cpp_batch_single_mode_flag() {
     let a = acct(0x41);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x01); // tfAllOrNothing only
+        tx.set_field_u32(sf("sfFlags"), protocol::BATCH_ALL_OR_NOTHING_FLAG);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -23178,7 +23183,7 @@ fn cpp_step2_oracle_set_empty_series() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     let r = full_apply(&mut v, &tx, TxType::ORACLE_SET);
-    assert!(r == Ter::from_int(-285) || r == Ter::TES_SUCCESS, "{:?}", r); // temARRAY_EMPTY
+    assert_eq!(r, Ter::TEM_ARRAY_EMPTY, "{r:?}"); // temARRAY_EMPTY
 }
 
 /// C++: MPTokenIssuanceSet invalid flags → temINVALID_FLAG
@@ -23917,7 +23922,10 @@ fn cpp_step3_vault_delete_zero_id() {
 #[test]
 fn cpp_step3_batch_invalid_non_mode_flag() {
     let a = acct(0x41);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -23935,11 +23943,14 @@ fn cpp_step3_batch_invalid_non_mode_flag() {
 #[test]
 fn cpp_step3_batch_valid_independent() {
     let a = acct(0x41);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x08);
+        tx.set_field_u32(sf("sfFlags"), protocol::BATCH_INDEPENDENT_FLAG);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -24016,8 +24027,8 @@ fn cpp_step3_escrow_create_both_times_valid() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
-        tx.set_field_u32(sf("sfCancelAfter"), 1000);
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
+        tx.set_field_u32(sf("sfCancelAfter"), 1002);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });

@@ -114,16 +114,24 @@ impl STObject {
     }
 
     pub fn apply_template(&mut self, template: &SOTemplate) {
-        self.template = Some(template.clone());
+        // Reorder against a scratch copy of self.fields first. self.template
+        // must never be set to Some(template) unless self.fields is actually
+        // replaced with the reordered vector in the same step — leaving them
+        // out of sync (rippled's type_/v_ invariant) is what causes
+        // get_field_index to return a template-slot index that is out of
+        // bounds for a stale, un-reordered self.fields (matches rippled
+        // STObject::applyTemplate, where type_ and v_ are only ever updated
+        // together via the final v_.swap(v), and any rejection path throws
+        // before either is touched).
+        let mut remaining = self.fields.clone();
         let mut reordered = Vec::with_capacity(template.size());
 
         for element in template.iter() {
-            if let Some(index) = self
-                .fields
+            if let Some(index) = remaining
                 .iter()
                 .position(|field| field.get().fname() == element.sfield())
             {
-                let field = self.fields.remove(index);
+                let field = remaining.remove(index);
                 if element.style() == SOEStyle::Default && field.get().is_default() {
                     // them from wire serialization. Include in reordered.
                 }
@@ -137,13 +145,16 @@ impl STObject {
             }
         }
 
-        for field in &self.fields {
+        for field in &remaining {
             if !field.get().fname().is_discardable() {
-                // In Rust, we silently discard the invalid field to avoid crashing.
+                // In Rust, we silently discard the invalid field to avoid
+                // crashing. self.template/self.fields are left completely
+                // untouched so they remain mutually consistent.
                 return;
             }
         }
 
+        self.template = Some(template.clone());
         self.fields = reordered;
     }
 
@@ -175,9 +186,20 @@ impl STObject {
                 break;
             }
 
-            let field = crate::get_field(crate::field_code_raw(type_id, field_id));
+            let raw_field_code = crate::field_code_raw(type_id, field_id);
+            let field = crate::get_field(raw_field_code);
             if field.is_invalid() {
-                tracing::warn!(target: "protocol", "Unknown field in serialized object");
+                // Match rippled's STObject diagnostic while retaining enough
+                // context to identify an unsupported public-network SField.
+                tracing::warn!(
+                    target: "protocol",
+                    serialized_type_id = type_id,
+                    field_id,
+                    raw_field_code,
+                    object_field = self.fname().name(),
+                    depth,
+                    "Unknown field in serialized object"
+                );
                 error = true;
                 break;
             }
@@ -465,7 +487,7 @@ impl STObject {
         value.set_fname(field);
 
         let index = self.get_field_index(field);
-        if index >= 0 {
+        if index >= 0 && (index as usize) < self.fields.len() {
             self.fields[index as usize] = STVar::new(value);
             return;
         }
@@ -516,7 +538,7 @@ impl STObject {
 
     pub fn make_field_present(&mut self, field: &'static SField) -> &mut dyn StBase {
         let index = self.get_field_index(field);
-        if index == -1 {
+        if index < 0 || (index as usize) >= self.fields.len() {
             // Field not in template — add it anyway (reference would throw for
             // templated objects, but our transactor may need it)
             self.fields.push(STVar::default_object(field));
@@ -532,7 +554,7 @@ impl STObject {
 
     pub fn make_field_absent(&mut self, field: &'static SField) {
         let index = self.get_field_index(field);
-        if index == -1 {
+        if index < 0 || (index as usize) >= self.fields.len() {
             panic!("Field not found: {}", field.name());
         }
         if self.fields[index as usize].get().stype() != SerializedTypeId::NotPresent {
@@ -668,7 +690,7 @@ impl STObject {
         create_okay: bool,
     ) -> Option<&mut dyn StBase> {
         let index = self.get_field_index(field);
-        if index == -1 {
+        if index < 0 || (index as usize) >= self.fields.len() {
             if create_okay && self.is_free() {
                 self.fields.push(STVar::default_object(field));
                 return self.fields.last_mut().map(STVar::get_mut);
@@ -684,7 +706,7 @@ impl STObject {
         create_okay: bool,
     ) -> Option<&mut dyn StBase> {
         let index = self.get_field_index(field);
-        if index == -1 {
+        if index < 0 || (index as usize) >= self.fields.len() {
             if create_okay && self.is_free() {
                 self.fields.push(STVar::default_object(field));
                 return self.fields.last_mut().map(STVar::get_mut);

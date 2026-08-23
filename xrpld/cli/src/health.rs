@@ -1,7 +1,7 @@
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
-/// Returns true if node is reachable (healthy or syncing), false if down.
+/// Returns true if the node answers `server_info`, false if unreachable.
 pub fn run(url: &str) -> bool {
     let sp = ProgressBar::new_spinner();
     sp.set_style(
@@ -9,7 +9,7 @@ pub fn run(url: &str) -> bool {
             .template("{spinner} {msg}")
             .unwrap(),
     );
-    sp.set_message("Checking health...");
+    sp.set_message("Checking reachability...");
     sp.enable_steady_tick(std::time::Duration::from_millis(80));
 
     let result = super::rpc_call(url, "server_info", serde_json::json!({}));
@@ -23,8 +23,10 @@ pub fn run(url: &str) -> bool {
                     println!(
                         "    {} {}  {}",
                         Style::new().green().apply_to("●"),
-                        Style::new().green().bold().apply_to("Healthy"),
-                        Style::new().dim().apply_to("fully synced"),
+                        Style::new().green().bold().apply_to("Reachable"),
+                        Style::new()
+                            .dim()
+                            .apply_to(format!("point-in-time state: {state}")),
                     );
                 }
                 "tracking" | "syncing" | "connected" => {

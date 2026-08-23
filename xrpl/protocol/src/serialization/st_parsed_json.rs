@@ -342,7 +342,14 @@ fn parse_amount_field(
         JsonValue::String(text) => {
             let runtime = normalized_parts_from_string(text).map_err(|_| field_invalid(field))?;
             let xrp = crate::XRPAmount::from_number(runtime).map_err(|_| field_invalid(field))?;
-            Ok(STAmount::from_xrp_amount(xrp))
+            STAmount::try_new_with_asset(
+                field,
+                crate::xrp_issue(),
+                xrp.drops().unsigned_abs(),
+                0,
+                xrp.drops() < 0,
+            )
+            .map_err(|_| field_invalid(field))
         }
         JsonValue::Object(object) => {
             let Some(JsonValue::String(text)) = object.get("value") else {
@@ -354,7 +361,14 @@ fn parse_amount_field(
                 crate::Asset::Issue(issue) if issue.native() => {
                     let xrp =
                         crate::XRPAmount::from_number(runtime).map_err(|_| field_invalid(field))?;
-                    Ok(STAmount::from_xrp_amount(xrp))
+                    STAmount::try_new_with_asset(
+                        field,
+                        issue,
+                        xrp.drops().unsigned_abs(),
+                        0,
+                        xrp.drops() < 0,
+                    )
+                    .map_err(|_| field_invalid(field))
                 }
                 crate::Asset::Issue(issue) => {
                     let amount =

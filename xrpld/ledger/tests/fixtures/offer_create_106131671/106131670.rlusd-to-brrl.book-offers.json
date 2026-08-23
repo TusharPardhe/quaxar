@@ -1,0 +1,14 @@
+{
+  "result": {
+    "ledger_hash": "716FDCF61A3D926FD5D9F098C5DFC97FA2CD0CDA093DB298E3699B9135744F4C",
+    "ledger_index": 106131670,
+    "offers": [],
+    "status": "success"
+  },
+  "warnings": [
+    {
+      "id": 2001,
+      "message": "This is a clio server. clio only serves validated data. If you want to talk to rippled, include 'ledger_index':'current' in your request"
+    }
+  ]
+}

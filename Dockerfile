@@ -28,28 +28,28 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --release -p xrpld-main && \
+    cargo build --release -p quaxar-main && \
     strip target/release/quaxar
 
 # ─── Stage 3: Runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 \
+    ca-certificates gosu libssl3 \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -s /bin/false xrpld \
-    && mkdir -p /var/lib/rippled/db /etc/xrpld \
-    && chown -R xrpld:xrpld /var/lib/rippled /etc/xrpld
+    && useradd -r -s /bin/false quaxar \
+    && mkdir -p /var/lib/quaxar/db /etc/quaxar \
+    && chown -R quaxar:quaxar /var/lib/quaxar /etc/quaxar
 
 COPY --from=builder /src/target/release/quaxar /usr/local/bin/quaxar
+COPY --chmod=0755 infra/docker/entrypoint.sh /usr/local/bin/quaxar-entrypoint
 
-USER xrpld
-WORKDIR /var/lib/rippled
+WORKDIR /var/lib/quaxar
 
 EXPOSE 5005 6006 51235
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD /usr/local/bin/quaxar health --rpc-url http://127.0.0.1:5005 || exit 1
 
-ENTRYPOINT ["quaxar"]
-CMD ["--conf", "/etc/xrpld/xrpld.cfg"]
+ENTRYPOINT ["/usr/local/bin/quaxar-entrypoint"]
+CMD ["quaxar", "--conf", "/etc/quaxar/quaxar.cfg"]

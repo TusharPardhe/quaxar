@@ -698,7 +698,7 @@ impl<'a, V: ApplyView>
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.account)),
             *staged_domain.key(),
-            &|_| {},
+            &ledger::describe_owner_dir(self.account),
         )
         .ok()
         .flatten()
@@ -951,7 +951,7 @@ impl<'a, V: ApplyView> DelegateSetApplySink<u32> for ViewBackedDelegateSetSink<'
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.account)),
             *staged_delegate.key(),
-            &|_| {},
+            &ledger::describe_owner_dir(self.account),
         )
         .ok()
         .flatten()
@@ -969,7 +969,7 @@ impl<'a, V: ApplyView> DelegateSetApplySink<u32> for ViewBackedDelegateSetSink<'
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.authorize)),
             *staged_delegate.key(),
-            &|_| {},
+            &ledger::describe_owner_dir(self.authorize),
         )
         .ok()
         .flatten()
@@ -984,77 +984,6 @@ impl<'a, V: ApplyView> DelegateSetApplySink<u32> for ViewBackedDelegateSetSink<'
     fn insert_new_delegate(&mut self) {
         if let Some(staged_delegate) = self.staged_delegate.take() {
             let _ = self.view.insert(Arc::new(staged_delegate));
-        }
-    }
-}
-
-pub struct ViewBackedNFTokenMintSink<'a, V> {
-    pub view: &'a mut V,
-    pub account: AccountID,
-}
-
-impl<'a, V: ApplyView> NFTokenMintApplySink for ViewBackedNFTokenMintSink<'a, V> {
-    fn mint_nftoken(&mut self, facts: &NFTokenMintApplyFacts) {
-        // Build the NFToken object
-        let mut token = STObject::new(get_field_by_symbol("sfNFToken"));
-        token.set_field_h256(get_field_by_symbol("sfNFTokenID"), facts.nftoken_id);
-        if let Some(uri) = &facts.uri {
-            token.set_stbase(uri.clone());
-        }
-
-        // Use succ-based page lookup matching rippled's nft::insertToken.
-        // Find the correct page for this token using the successor search.
-        let owner_160 = to_160(&facts.owner);
-        let base = protocol::nft_page_min_keylet(owner_160);
-        let first = protocol::nft_page_keylet(base, facts.nftoken_id);
-        let last = protocol::nft_page_max_keylet(owner_160);
-
-        let page_key = self
-            .view
-            .succ(first.key, Some(last.key.next()))
-            .ok()
-            .flatten()
-            .unwrap_or(last.key);
-
-        let page_kl = protocol::Keylet::new(protocol::LedgerEntryType::NFTokenPage, page_key);
-
-        if let Ok(Some(page)) = self.view.peek(page_kl) {
-            // Page exists — add token to it in sorted order
-            let mut tokens: Vec<_> = page
-                .get_field_array(get_field_by_symbol("sfNFTokens"))
-                .iter()
-                .cloned()
-                .collect();
-            tokens.push(token);
-            tokens.sort_by(|a, b| {
-                let a_id = a.get_field_h256(get_field_by_symbol("sfNFTokenID"));
-                let b_id = b.get_field_h256(get_field_by_symbol("sfNFTokenID"));
-                a_id.cmp(&b_id)
-            });
-            let mut arr = protocol::STArray::new(get_field_by_symbol("sfNFTokens"));
-            for t in tokens {
-                arr.push_back(t);
-            }
-            let mut obj = page.clone_as_object();
-            obj.set_field_array(get_field_by_symbol("sfNFTokens"), arr);
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *page.key())));
-        } else {
-            // No page exists — create the MAX page (matching rippled's initial page creation)
-            let mut arr = protocol::STArray::new(get_field_by_symbol("sfNFTokens"));
-            arr.push_back(token);
-            let mut page_sle = STLedgerEntry::new(last);
-            page_sle.set_field_array(get_field_by_symbol("sfNFTokens"), arr);
-            let _ = self.view.insert(Arc::new(page_sle));
-        }
-    }
-    fn adjust_owner_count(&mut self, delta: i32) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let _ = adjust_owner_count(self.view, &sle, delta);
         }
     }
 }
@@ -1110,7 +1039,7 @@ impl<'a, V: ApplyView> AMMCreateApplySink for ViewBackedAMMCreateSink<'a, V> {
             self.view,
             &protocol::owner_dir_keylet(to_160(&amm_account)),
             amm_keylet.key,
-            &|_| {},
+            &ledger::describe_owner_dir(amm_account),
         ) {
             Ok(Some(node)) => node,
             Ok(None) => return Ter::TEC_DIR_FULL,
@@ -1119,7 +1048,9 @@ impl<'a, V: ApplyView> AMMCreateApplySink for ViewBackedAMMCreateSink<'a, V> {
 
         let mut amm = STLedgerEntry::new(amm_keylet);
         amm.set_account_id(sf("sfAccount"), amm_account);
-        amm.set_field_u16(sf("sfTradingFee"), self.trading_fee);
+        if self.trading_fee != 0 {
+            amm.set_field_u16(sf("sfTradingFee"), self.trading_fee);
+        }
         amm.set_field_amount(sf("sfLPTokenBalance"), lp_tokens.clone());
         amm.set_field_issue(sf("sfAsset"), STIssue::new_with_asset(sf("sfAsset"), asset));
         amm.set_field_issue(
@@ -1127,6 +1058,34 @@ impl<'a, V: ApplyView> AMMCreateApplySink for ViewBackedAMMCreateSink<'a, V> {
             STIssue::new_with_asset(sf("sfAsset2"), asset2),
         );
         amm.set_field_u64(sf("sfOwnerNode"), owner_node);
+
+        let mut vote_slots = protocol::STArray::new(sf("sfVoteSlots"));
+        let mut vote = STObject::make_inner_object(sf("sfVoteEntry"));
+        vote.set_account_id(sf("sfAccount"), self.account);
+        vote.set_field_u32(sf("sfVoteWeight"), protocol::VOTE_WEIGHT_SCALE_FACTOR);
+        if self.trading_fee != 0 {
+            vote.set_field_u16(sf("sfTradingFee"), self.trading_fee);
+        }
+        vote_slots.push_back(vote);
+        amm.set_field_array(sf("sfVoteSlots"), vote_slots);
+
+        let mut auction_slot = STObject::make_inner_object(sf("sfAuctionSlot"));
+        auction_slot.set_account_id(sf("sfAccount"), self.account);
+        auction_slot.set_field_u32(
+            sf("sfExpiration"),
+            self.view
+                .header()
+                .parent_close_time
+                .saturating_add(protocol::TOTAL_TIME_SLOT_SECS),
+        );
+        auction_slot.set_field_amount(sf("sfPrice"), lp_tokens.zeroed());
+        let discounted_fee =
+            self.trading_fee / protocol::AUCTION_SLOT_DISCOUNTED_FEE_FRACTION as u16;
+        if discounted_fee != 0 {
+            auction_slot.set_field_u16(sf("sfDiscountedFee"), discounted_fee);
+        }
+        amm.set_field_object(sf("sfAuctionSlot"), auction_slot);
+
         if self.view.insert(Arc::new(amm)).is_err() {
             return Ter::TEF_BAD_LEDGER;
         }
@@ -1160,18 +1119,6 @@ impl<'a, V: ApplyView> AMMCreateApplySink for ViewBackedAMMCreateSink<'a, V> {
             &self.account,
             &lp_tokens,
         )
-    }
-
-    fn adjust_owner_count(&mut self, delta: i32) -> Ter {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            return adjust_owner_count(self.view, &sle, delta)
-                .map(|_| Ter::TES_SUCCESS)
-                .unwrap_or(Ter::TEF_BAD_LEDGER);
-        }
-        Ter::TER_NO_ACCOUNT
     }
 }
 
@@ -1389,13 +1336,27 @@ pub struct ViewBackedOfferCancelSink<'a, V> {
 
 impl<'a, V: ApplyView> OfferCancelApplySink for ViewBackedOfferCancelSink<'a, V> {
     fn account_exists(&mut self) -> bool {
-        true
+        self.view
+            .exists(protocol::account_keylet(Uint160::from_void(
+                self.account.data(),
+            )))
+            .unwrap_or(false)
     }
     fn offer_exists(&mut self) -> bool {
-        true
+        let keylet =
+            protocol::offer_keylet(Uint160::from_void(self.account.data()), self.offer_sequence);
+        self.view.exists(keylet).unwrap_or(false)
     }
     fn delete_offer(&mut self) -> Ter {
-        Ter::TES_SUCCESS
+        let keylet =
+            protocol::offer_keylet(Uint160::from_void(self.account.data()), self.offer_sequence);
+        let Ok(Some(sle)) = self.view.peek(keylet) else {
+            return Ter::TES_SUCCESS;
+        };
+        match ledger::offer_helpers::offer_delete(self.view, sle) {
+            Ok(ter) => ter,
+            Err(_) => Ter::TEF_BAD_LEDGER,
+        }
     }
 }
 
@@ -1521,17 +1482,22 @@ pub(crate) fn delete_empty_amm_owner_entries<V: ApplyView>(
         return Ter::TEC_INTERNAL;
     };
 
-    let mut trust_lines_deleted = 0_u16;
+    // cleanupOnAccountDelete applies its bound to every owner-directory
+    // entry visited, including entries which the AMM cleanup deliberately
+    // skips.  Keep that exact accounting so repeated AMMDelete transactions
+    // make the same bounded progress as rippled.
+    let mut entries_visited = 0_u16;
     for key in entries.iter().copied() {
+        entries_visited = entries_visited.saturating_add(1);
+        if entries_visited > protocol::MAX_DELETABLE_AMM_TRUST_LINES {
+            return Ter::TEC_INCOMPLETE;
+        }
         let Some(sle) = view.peek(protocol::child_keylet(key)).ok().flatten() else {
-            return Ter::TEC_INTERNAL;
+            return Ter::TEF_BAD_LEDGER;
         };
         match sle.get_type() {
             LedgerEntryType::AMM | LedgerEntryType::MPToken => {}
             LedgerEntryType::RippleState => {
-                if trust_lines_deleted >= protocol::MAX_DELETABLE_AMM_TRUST_LINES {
-                    return Ter::TEF_TOO_BIG;
-                }
                 if sle.get_field_amount(sf("sfBalance")).signum() != 0 {
                     return Ter::TEC_INTERNAL;
                 }
@@ -1541,7 +1507,6 @@ pub(crate) fn delete_empty_amm_owner_entries<V: ApplyView>(
                 if res != Ter::TES_SUCCESS {
                     return res;
                 }
-                trust_lines_deleted = trust_lines_deleted.saturating_add(1);
             }
             _ => return Ter::TEC_INTERNAL,
         }
@@ -1584,6 +1549,39 @@ pub(crate) fn delete_empty_amm_owner_entries<V: ApplyView>(
         }
     }
 
+    Ter::TES_SUCCESS
+}
+
+/// Delete an empty AMM pseudo-account after its bounded owner cleanup.
+///
+/// `tecINCOMPLETE` deliberately leaves the AMM object and account root in
+/// place. The outer transactor persistence path retains only the deleted
+/// trust lines, allowing a later AMMDelete/AMMWithdraw to continue safely.
+pub(crate) fn delete_amm_account<V: ApplyView>(
+    view: &mut V,
+    amm_sle: &Arc<protocol::STLedgerEntry>,
+) -> Ter {
+    let amm_account = amm_sle.get_account_id(sf("sfAccount"));
+    let cleanup = delete_empty_amm_owner_entries(view, &amm_account);
+    if cleanup != Ter::TES_SUCCESS {
+        return cleanup;
+    }
+
+    let owner_dir = protocol::owner_dir_keylet(to_160(&amm_account));
+    let owner_node = amm_sle.get_field_u64(sf("sfOwnerNode"));
+    match ledger::dir_remove(view, &owner_dir, owner_node, *amm_sle.key(), false) {
+        Ok(true) => {}
+        Ok(false) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    }
+
+    let account_keylet = protocol::account_keylet(to_160(&amm_account));
+    let Some(account) = view.peek(account_keylet).ok().flatten() else {
+        return Ter::TEC_INTERNAL;
+    };
+    if view.erase(amm_sle.clone()).is_err() || view.erase(account).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
     Ter::TES_SUCCESS
 }
 

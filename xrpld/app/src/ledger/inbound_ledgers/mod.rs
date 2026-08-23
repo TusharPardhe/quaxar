@@ -8,15 +8,35 @@
 //! - Touch-on-access keeps entries alive
 //! - 60s sweep removes idle entries
 //! - 5-minute failure cooldown prevents retry storms
-//! - Fixed worker pool (8 threads) processes short ticks
+//! - Fixed three-worker pool matches rippled's JtLedgerData running limit and processes bounded acquisition turns
 //! - Each acquisition wraps InboundLedgerLocal (the per-ledger state machine)
 
 mod acquisition;
+mod coordinator_adapter;
+mod coordinator_engine;
+mod coordinator_handoff;
+mod coordinator_ports;
+mod read_broker;
 mod registry;
+mod scheduler;
+pub(crate) mod wire_ledger_node;
 mod worker_pool;
 
-pub use self::acquisition::{AcquisitionState, stash_stale_packet};
-pub use self::registry::{AcquireReason, InboundLedgers};
+pub(crate) use self::acquisition::ProvisionalLedgerIdentity;
+pub use self::acquisition::{
+    ACQ_MAILBOX_BYTE_CAPACITY, ACQ_MAILBOX_PACKET_CAPACITY, AcquisitionState,
+    InboundPacketAdmissionLease, stash_stale_packet,
+};
+pub(crate) use self::coordinator_adapter::LedgerDataIngressDisposition as CoordinatorLedgerDataDisposition;
+pub use self::read_broker::{
+    ACQ_READS_GLOBAL, NodeReadBroker, ReadAdmission, ReadBrokerConfig, ReadBrokerMetrics,
+    ReadBrokerSnapshot, ReadDispatch, ReadKey, ReadOutcome, ReadReady, ReadRejectReason,
+    ReadTicket, ReadTicketId,
+};
+pub use self::registry::{
+    AcquireReason, CompletedInboundLedger, InboundLedgers, LedgerDataAdmission,
+    LedgerDataRouteDisposition,
+};
 pub use self::worker_pool::WorkerPool;
 
 // ─── Backward-compatible stub ────────────────────────────────────────────────

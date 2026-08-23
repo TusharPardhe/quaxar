@@ -58,7 +58,7 @@ pub(super) fn validate_loan_entry(before: Option<&STLedgerEntry>, after: &STLedg
     number_field_value(after, sf("sfPeriodicPayment")) > zero
 }
 
-pub(super) fn maybe_record_loan_broker_account<V: ApplyView>(
+pub(super) fn maybe_record_loan_broker_account<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &mut LendingState,
     account: AccountID,
@@ -72,7 +72,7 @@ pub(super) fn maybe_record_loan_broker_account<V: ApplyView>(
     }
 }
 
-pub(super) fn record_lending_state<V: ApplyView>(
+pub(super) fn record_lending_state<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &mut LendingState,
     after: Option<&STLedgerEntry>,
@@ -111,7 +111,7 @@ pub(super) fn record_lending_state<V: ApplyView>(
     }
 }
 
-pub(super) fn validate_zero_owner_count_broker_directory<V: ApplyView>(
+pub(super) fn validate_zero_owner_count_broker_directory<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     broker: &STLedgerEntry,
 ) -> bool {
@@ -151,7 +151,7 @@ pub(super) fn validate_zero_owner_count_broker_directory<V: ApplyView>(
     }
 }
 
-pub(super) fn validate_loan_broker_entry<V: ApplyView>(
+pub(super) fn validate_loan_broker_entry<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
     fix_cleanup_3_1_3: bool,

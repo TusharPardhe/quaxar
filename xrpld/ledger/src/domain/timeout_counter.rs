@@ -123,6 +123,18 @@ impl TimeoutCounter {
         }
     }
 
+    pub fn set_timer_interval(&self, timer_interval: Duration) {
+        assert!(
+            timer_interval > Duration::milliseconds(10) && timer_interval < Duration::seconds(30),
+            "xrpl::TimeoutCounter::set_timer_interval : interval input inside range"
+        );
+        self.inner
+            .state
+            .lock()
+            .expect("timeout-counter mutex must not be poisoned")
+            .timer_interval = timer_interval;
+    }
+
     pub fn set_timer(&self) {
         if self.is_done() {
             return;

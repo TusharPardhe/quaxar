@@ -1,121 +1,119 @@
-# RPC API Reference
+# RPC API
 
-## Connection
+Quaxar serves XRPL JSON-RPC over configured HTTP and WebSocket ports. Method
+names and result shapes follow the `rippled` API where implemented. Because
+parity work is active, clients should feature-detect the fields they require
+and pin the Quaxar version they validate against.
 
-Send JSON-RPC requests via HTTP POST to the configured admin or public port:
+## Calling RPC
 
 ```bash
-curl -s http://127.0.0.1:5005 \
-  -H "Content-Type: application/json" \
-  -d '{"method": "server_info", "params": [{}]}'
+curl -fsS http://127.0.0.1:5005 \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"server_info","params":[{}]}'
+
+quaxar rpc server_info --raw
+quaxar rpc ledger '{"ledger_index":"validated"}'
 ```
 
-## Supported Methods
+The CLI accepts a JSON object or array for parameters. HTTP requests normally
+use `params: [{}]`. WebSocket also supports `subscribe` and `unsubscribe`.
 
-### Server
+## Access roles
 
-| Method | Description |
+Each request is assigned a user or admin role from its listener configuration,
+source address, and gateway settings. Admin methods must not be exposed to
+untrusted clients. Restrict admin scope to `127.0.0.1` and also bind or firewall
+the host port appropriately; use an SSH tunnel for remote administration.
+
+The following methods are wired into the current server dispatcher.
+
+### Server and operations
+
+| User methods | Admin methods |
+|--------------|---------------|
+| `ping`, `server_info`, `server_state`, `server_definitions`, `version`, `random`, `fee` | `connect`, `peers`, `stop`, `get_counts`, `print`, `consensus_info` |
+| `manifest` | `log_level`, `logrotate`, `can_delete`, `ledger_cleaner`, `export_snapshot`, `snapshot_status` |
+| `wallet_propose` | `fetch_info`, `blacklist` |
+| `subscribe`, `unsubscribe` | `peer_reservations_add`, `peer_reservations_del`, `peer_reservations_list` |
+
+`logrotate` is the currently dispatched RPC spelling; the compatibility
+registry also reserves `log_rotate`. The dispatched method currently returns
+success without rotating a file because the runtime does not own one. The CLI
+command is `quaxar log-rotate`.
+
+### Ledgers and transactions
+
+| Ledger | Transaction |
 |--------|-------------|
-| `server_info` | Server status, version, ledger range, peer count |
-| `server_state` | Detailed server state for monitoring |
-| `fee` | Current transaction fee estimates |
-| `peers` | Connected peer list with latency and version |
-| `log_level` | Get or set log verbosity at runtime |
-| `get_counts` | Internal object counts and memory usage |
-| `export_snapshot` | Export node store to LZ4 snapshot file (admin only) |
-| `stop` | Graceful server shutdown (admin only) |
-| `connect` | Connect to a specific peer (admin only) |
+| `ledger`, `ledger_closed`, `ledger_current`, `ledger_entry`, `ledger_data`, `ledger_header` | `tx`, `transaction_entry`, `tx_history` |
+| `ledger_accept` (admin/standalone), `ledger_request` (admin) | `submit`, `submit_multisigned`, `simulate`, `sign`, `sign_for` |
 
-### Ledger
+### Accounts, paths, books, and objects
 
-| Method | Description |
-|--------|-------------|
-| `ledger` | Fetch a ledger header by index or hash |
-| `ledger_data` | Paginated state tree entries for a ledger |
-| `ledger_entry` | Fetch a specific ledger object by ID |
+`account_info`, `account_lines`, `account_tx`, `account_channels`,
+`account_currencies`, `account_nfts`, `account_objects`, `account_offers`,
+`owner_info`, `gateway_balances`, `deposit_authorized`, `book_offers`,
+`book_changes`, `path_find`, `ripple_path_find`, `no_ripple_check`,
+`noripple_check`, `nft_buy_offers`, `nft_sell_offers`, `amm_info`,
+`vault_info`, and `get_aggregate_price`.
 
-### Account
+### Validators, amendments, and relay
 
-| Method | Description |
-|--------|-------------|
-| `account_info` | Account root object (balance, sequence, flags) |
-| `account_lines` | Trust lines for an account |
-| `account_offers` | Open offers for an account |
-| `account_objects` | All objects owned by an account |
-| `account_tx` | Transaction history for an account |
+| User methods | Admin methods |
+|--------------|---------------|
+| `channel_authorize`, `channel_verify` | `validator_info`, `validators`, `validator_list_sites`, `unl_list` |
+| `tx_reduce_relay` | `feature`, `validation_create` |
 
-### Transactions
+The compile-time RPC registry can contain compatibility names before every
+behavioral edge has parity. A registered name is not by itself a production
+compatibility guarantee; integration tests and the server dispatcher are the
+authoritative implementation boundary.
 
-| Method | Description |
-|--------|-------------|
-| `tx` | Look up a transaction by hash |
-| `submit` | Submit a signed transaction |
-| `sign` | Sign a transaction (admin only) |
+## Common requests
 
-### Order Book
+### Server and synchronization state
 
-| Method | Description |
-|--------|-------------|
-| `book_offers` | Offers in an order book |
-| `gateway_balances` | Obligations and assets for a gateway |
-
-### Peer Management
-
-| Method | Description |
-|--------|-------------|
-| `peer_reservations_add` | Reserve a peer slot (admin only) |
-| `peer_reservations_del` | Remove a peer reservation (admin only) |
-| `peer_reservations_list` | List peer reservations (admin only) |
-
-### Validators & Amendments
-
-| Method | Description |
-|--------|-------------|
-| `validator_info` | This node's validator identity and status |
-| `feature` | List or vote on amendments |
-
-### Simulation
-
-| Method | Description |
-|--------|-------------|
-| `simulate` | Simulate a transaction without submitting |
-
-## Examples
-
-### server_info
-
-**Request:**
 ```json
-{
-  "method": "server_info",
-  "params": [{}]
-}
+{"method":"server_info","params":[{}]}
 ```
 
-**Response:**
+Important fields include `server_state`, `validated_ledger`,
+`complete_ledgers`, `peers`, `pubkey_validator`, `validator_list`, `load`,
+`fetch_pack`, and runtime counters. Human and non-human response modes can
+represent some values differently.
+
 ```json
-{
-  "result": {
-    "info": {
-      "build_version": "2.0.0-rust",
-      "server_state": "full",
-      "complete_ledgers": "32570-95000000",
-      "peers": 21,
-      "uptime": 86400,
-      "validated_ledger": {
-        "seq": 95000000,
-        "hash": "ABC123...",
-        "close_time": 780000000
-      }
-    },
-    "status": "success"
-  }
-}
+{"method":"fetch_info","params":[{}]}
 ```
 
-### account_info
+`fetch_info` is admin-only. It reports the coordinator phase and recovery/LCL
+identities, per-hash sessions, completion and cancellation counters, and the
+last recovery-LCL decision. Pair it with `get_counts` when diagnosing SHAMap
+cache or NodeStore behavior.
 
-**Request:**
+NetworkOps forwards an installed, chain-contiguous LedgerMaster publication
+independently of freshness. While Tracking, the coordinator records it only
+when the freshness proof permits `Tracking -> Full`; once Full, newer
+contiguous identities are recorded even on a non-promoting pass. Session
+removal is likewise not evidence of cache loss: verified immutable nodes live
+in the shared NodeFamily/NodeStore lifecycle.
+
+`server_state` is the NetworkOps operating mode exposed to operators. It is
+informed by, but is not identical to, the acquisition coordinator's internal
+phase; validator `proposing` is layered on top of full synchronization. Both
+are point-in-time views. Readiness requires repeated evidence that local
+closed, validated, published, and coordinator identities advance coherently.
+`disconnected` may coexist with retained peer transport and acquisition
+sessions when the active peer count is below `[network_quorum]`; inspect both
+`server_info` and `fetch_info` rather than interpreting the label as a forced
+socket teardown.
+An empty database can temporarily report a small bootstrap `closed_ledger`
+while acquiring the network tree; do not compare that sequence to public
+network progress until the current LCL is installed.
+
+### Account lookup
+
 ```json
 {
   "method": "account_info",
@@ -126,59 +124,10 @@ curl -s http://127.0.0.1:5005 \
 }
 ```
 
-**Response:**
-```json
-{
-  "result": {
-    "account_data": {
-      "Account": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
-      "Balance": "100000000000",
-      "Sequence": 1,
-      "Flags": 0
-    },
-    "ledger_index": 95000000,
-    "status": "success"
-  }
-}
-```
+### Snapshot export
 
-### fee
+Snapshot export is asynchronous and admin-only:
 
-**Request:**
-```json
-{
-  "method": "fee",
-  "params": [{}]
-}
-```
-
-**Response:**
-```json
-{
-  "result": {
-    "current_ledger_size": "42",
-    "current_queue_size": "0",
-    "drops": {
-      "base_fee": "10",
-      "median_fee": "5000",
-      "minimum_fee": "10",
-      "open_ledger_fee": "10"
-    },
-    "expected_ledger_size": "200",
-    "ledger_current_index": 95000001,
-    "status": "success"
-  }
-}
-```
-
-### export_snapshot
-
-Start a snapshot export as a background job. The node stays online. Output is
-an LZ4 compressed file with SHA-256 chunk integrity. Admin only. Supply an
-explicit `output` file path, then use `snapshot_status` to observe the final
-outcome.
-
-**Request:**
 ```json
 {
   "method": "export_snapshot",
@@ -186,94 +135,52 @@ outcome.
 }
 ```
 
-**Response:**
+Only one export can run at a time. Poll its in-memory job state:
+
 ```json
-{
-  "result": {
-    "ledger_seq": 123456,
-    "status": "started"
-  }
-}
+{"method":"snapshot_status","params":[{}]}
 ```
 
-### snapshot_status
+The state is `idle`, `running`, `completed`, or `failed`. A completed result
+includes the output path, ledger sequence, and file size; a failed result
+includes an error. Restarting the node resets this status to `idle`.
 
-Return the most recent snapshot-export job state. Admin only. A node accepts
-one active export at a time. `state` is `idle`, `running`, `completed`, or
-`failed`; completed responses include `file_size`, while failed responses
-include `error`. The status is in-memory, so a node restart resets it to
-`idle`.
+### Runtime log level
 
-**Request:**
 ```json
-{
-  "method": "snapshot_status",
-  "params": [{}]
-}
+{"method":"log_level","params":[{"severity":"debug"}]}
 ```
 
-**Completed response:**
-```json
-{
-  "result": {
-    "status": "success",
-    "state": "completed",
-    "output": "/var/lib/quaxar/snapshots/bootstrap.xrpls",
-    "ledger_seq": 123456,
-    "file_size": 4563487682
-  }
-}
-```
+For one partition:
 
-### log_level
-
-Get or set log verbosity at runtime. Supports global level or per-partition.
-
-**Set global level:**
 ```json
 {
   "method": "log_level",
-  "params": [{"severity": "debug"}]
+  "params": [{"severity":"debug","partition":"consensus"}]
 }
 ```
 
-**Set partition level:**
-```json
-{
-  "method": "log_level",
-  "params": [{"severity": "debug", "partition": "consensus"}]
-}
-```
+Restore the previous level after diagnostics to avoid excess log volume.
+Supplying a severity updates the runtime filter. The no-parameter get path
+currently returns an empty compatibility `levels` object rather than the live
+filter state.
 
-**Response:**
-```json
-{
-  "result": {
-    "status": "success"
-  }
-}
-```
+## Errors
 
-## Error Format
-
-Errors return a `status` of `"error"` with an error code and message:
+RPC errors are returned inside `result` with `status: "error"`, a symbolic
+`error`, numeric `error_code` where applicable, and `error_message`. HTTP
+success therefore does not necessarily mean the RPC operation succeeded.
 
 ```json
 {
   "result": {
-    "error": "actNotFound",
-    "error_code": 19,
-    "error_message": "Account not found.",
+    "error": "noPermission",
+    "error_code": 69,
+    "error_message": "You don't have permission for this command.",
     "status": "error"
   }
 }
 ```
 
-Common error codes:
-
-| Code | Name | Meaning |
-|------|------|---------|
-| 19 | `actNotFound` | Account does not exist |
-| 27 | `lgrNotFound` | Ledger not available |
-| 29 | `invalidParams` | Malformed request parameters |
-| 69 | `noPermission` | Admin-only method called on public port |
+Clients should branch on `result.status` and symbolic error names rather than
+matching human-readable messages.

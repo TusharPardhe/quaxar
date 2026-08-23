@@ -221,7 +221,6 @@ pub trait AMMCreateApplySink {
     fn create_amm_entry(&mut self) -> Ter;
     fn deposit_initial_liquidity(&mut self) -> Ter;
     fn mint_lp_tokens(&mut self) -> Ter;
-    fn adjust_owner_count(&mut self, delta: i32) -> Ter;
 }
 
 pub fn run_amm_create_do_apply<S: AMMCreateApplySink>(
@@ -241,10 +240,6 @@ pub fn run_amm_create_do_apply<S: AMMCreateApplySink>(
         return result;
     }
     let result = sink.mint_lp_tokens();
-    if result != Ter::TES_SUCCESS {
-        return result;
-    }
-    let result = sink.adjust_owner_count(1);
     if result != Ter::TES_SUCCESS {
         return result;
     }

@@ -13,6 +13,7 @@ use shamap::mutation::MutableTree;
 use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::SHAMapNodeType;
 
+use app::state::transactor_dispatcher::handle_real_dispatch;
 use app::state::trust_set::do_trust_set;
 
 fn sample_account(fill: u8) -> AccountID {
@@ -237,6 +238,7 @@ fn trust_set_create_line_populates_flags_limits_and_owner_dirs() {
 fn trust_set_delete_existing_line_clears_owner_counts_and_owner_dirs() {
     let source = sample_account(0x33);
     let destination = sample_account(0x44);
+    let sponsor = sample_account(0x55);
     let currency = currency_from_string("EUR");
     let line_keylet = line(source, destination, currency);
     let mut line_entry = trust_line_entry(
@@ -249,10 +251,17 @@ fn trust_set_delete_existing_line_clears_owner_counts_and_owner_dirs() {
     );
     line_entry.set_field_u64(get_field_by_symbol("sfLowNode"), 0);
     line_entry.set_field_u64(get_field_by_symbol("sfHighNode"), 0);
+    line_entry.set_account_id(get_field_by_symbol("sfLowSponsor"), sponsor);
+
+    let mut source_root = account_root(source, 2, 0);
+    source_root.set_field_u32(get_field_by_symbol("sfSponsoredOwnerCount"), 1);
+    let mut sponsor_root = account_root(sponsor, 0, 0);
+    sponsor_root.set_field_u32(get_field_by_symbol("sfSponsoringOwnerCount"), 1);
 
     let ledger = empty_ledger(vec![
-        account_root(source, 1, 0),
-        account_root(destination, 1, 0),
+        source_root,
+        account_root(destination, 2, 0),
+        sponsor_root,
         line_entry,
         owner_dir_root(source, line_keylet.key),
         owner_dir_root(destination, line_keylet.key),
@@ -274,6 +283,20 @@ fn trust_set_delete_existing_line_clears_owner_counts_and_owner_dirs() {
             .expect("source root read should succeed")
             .expect("source root should exist")
             .get_field_u32(get_field_by_symbol("sfOwnerCount")),
+        1
+    );
+    assert_eq!(
+        view.read(account_keylet(raw_account_id(source)))
+            .expect("source root read should succeed")
+            .expect("source root should exist")
+            .get_field_u32(get_field_by_symbol("sfSponsoredOwnerCount")),
+        0
+    );
+    assert_eq!(
+        view.read(account_keylet(raw_account_id(sponsor)))
+            .expect("sponsor root read should succeed")
+            .expect("sponsor root should exist")
+            .get_field_u32(get_field_by_symbol("sfSponsoringOwnerCount")),
         0
     );
     assert_eq!(
@@ -281,7 +304,7 @@ fn trust_set_delete_existing_line_clears_owner_counts_and_owner_dirs() {
             .expect("destination root read should succeed")
             .expect("destination root should exist")
             .get_field_u32(get_field_by_symbol("sfOwnerCount")),
-        0
+        1
     );
     assert!(
         view.read(page_keylet(owner_dir_keylet(raw_account_id(source)), 0))
@@ -295,5 +318,100 @@ fn trust_set_delete_existing_line_clears_owner_counts_and_owner_dirs() {
         ))
         .expect("destination dir read should succeed")
         .is_none()
+    );
+}
+
+#[test]
+fn trust_set_clearing_quality_removes_serialized_field() {
+    let source = sample_account(0x35);
+    let destination = sample_account(0x46);
+    let currency = currency_from_string("USD");
+    let mut line_entry = trust_line_entry(
+        source,
+        destination,
+        currency,
+        25,
+        0,
+        lsfLowReserve | lsfHighNoRipple,
+    );
+    line_entry.set_field_u32(get_field_by_symbol("sfLowQualityIn"), 7);
+    let ledger = empty_ledger(vec![
+        account_root(source, 1, 0),
+        account_root(destination, 0, 0),
+        line_entry,
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = trust_set_tx(
+        source,
+        trust_limit(currency, destination, 25),
+        0,
+        Some(0),
+        None,
+    );
+
+    assert_eq!(
+        do_trust_set(&mut view, &tx, Some(1_000_000)),
+        protocol::Ter::TES_SUCCESS
+    );
+    let line_sle = view
+        .read(line(source, destination, currency))
+        .expect("line read should succeed")
+        .expect("line should remain");
+    assert!(!line_sle.is_field_present(get_field_by_symbol("sfLowQualityIn")));
+}
+
+#[test]
+fn clawback_uses_credit_path_and_deletes_default_zero_line() {
+    let issuer = sample_account(0x51);
+    let holder = sample_account(0x62);
+    let currency = currency_from_string("USD");
+    let line_keylet = line(issuer, holder, currency);
+    let mut issuer_root = account_root(issuer, 0, protocol::lsfAllowTrustLineClawback);
+    issuer_root.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
+    let mut line_entry = trust_line_entry(
+        issuer,
+        holder,
+        currency,
+        0,
+        0,
+        lsfHighReserve | lsfHighNoRipple,
+    );
+    let mut holder_balance = trust_limit(currency, protocol::no_account(), 10);
+    holder_balance.negate();
+    line_entry.set_field_amount(get_field_by_symbol("sfBalance"), holder_balance);
+    line_entry.set_field_u64(get_field_by_symbol("sfLowNode"), 0);
+    line_entry.set_field_u64(get_field_by_symbol("sfHighNode"), 0);
+    let ledger = empty_ledger(vec![
+        issuer_root,
+        account_root(holder, 1, 0),
+        line_entry,
+        owner_dir_root(issuer, line_keylet.key),
+        owner_dir_root(holder, line_keylet.key),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(protocol::TxType::CLAWBACK, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), issuer);
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            trust_limit(currency, holder, 10),
+        );
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, protocol::TxType::CLAWBACK, None),
+        protocol::Ter::TES_SUCCESS
+    );
+    assert!(view.read(line_keylet).expect("line read").is_none());
+    assert_eq!(
+        view.read(account_keylet(raw_account_id(holder)))
+            .expect("holder read")
+            .expect("holder exists")
+            .get_field_u32(get_field_by_symbol("sfOwnerCount")),
+        0
     );
 }

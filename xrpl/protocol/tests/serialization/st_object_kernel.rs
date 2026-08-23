@@ -138,7 +138,7 @@ fn object_serialization_sorts_fields_and_appends_nested_terminators() {
 }
 
 #[test]
-fn object_parse_rejects_duplicate_fields_and_array_terminators() {
+fn object_parse_rejects_duplicate_fields_array_terminators_and_unknown_fields() {
     // Duplicate fields: deserializer returns false (failure) instead of panicking
     let mut duplicate = Serializer::default();
     duplicate.add_field_id(2, 4);
@@ -157,6 +157,18 @@ fn object_parse_rejects_duplicate_fields_and_array_terminators() {
     illegal.add_field_id(15, 1);
 
     let mut iter = protocol::SerialIter::new(illegal.data());
+    let obj = STObject::from_serial_iter(&mut iter, sf_generic(), 0);
+    assert!(obj.empty());
+
+    // Public testnet peers currently send this unassigned wire field:
+    // UInt128 (type 4), field 10. Rippled's registry only assigns UInt128
+    // field 1 (EmailHash), so consensus parsing must reject it rather than
+    // treating it as a forward-compatible field.
+    assert!(protocol::get_field(protocol::field_code_raw(4, 10)).is_invalid());
+    let mut unknown = Serializer::default();
+    unknown.add_field_id(4, 10);
+
+    let mut iter = protocol::SerialIter::new(unknown.data());
     let obj = STObject::from_serial_iter(&mut iter, sf_generic(), 0);
     assert!(obj.empty());
 }

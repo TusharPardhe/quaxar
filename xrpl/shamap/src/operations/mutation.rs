@@ -107,6 +107,27 @@ impl MutableTree {
         Ok(count)
     }
 
+    /// Build a flushed, shareable view of only this tree's dirty paths while
+    /// leaving the original dirty ownership untouched. Clean subtrees remain
+    /// shared. This supports checked persistence: callers can serialize a
+    /// complete postorder batch, commit it, and only then flush/canonicalize
+    /// the original tree.
+    pub fn try_flush_dirty_detached<F, E>(&self, writer: &mut F) -> Result<(Self, usize), E>
+    where
+        F: FnMut(SharedIntrusive<SHAMapTreeNode>) -> Result<SharedIntrusive<SHAMapTreeNode>, E>,
+    {
+        let mut writer: &mut TryWriteNodeCallback<'_, E> = writer;
+        let (root, count) =
+            try_walk_subtree_detached_impl(self.root.clone(), self.cowid, Some(&mut writer))?;
+        Ok((
+            Self {
+                root,
+                cowid: self.cowid,
+            },
+            count,
+        ))
+    }
+
     pub fn walk_subtree<F>(&mut self, writer: Option<&mut F>) -> usize
     where
         F: FnMut(SharedIntrusive<SHAMapTreeNode>) -> SharedIntrusive<SHAMapTreeNode>,
@@ -358,7 +379,7 @@ impl MutableTree {
                     // no children below this branch
                 }
                 1 => {
-                    let Some(sole_leaf) = only_below_loaded_leaf(&node)? else {
+                    let Some(sole_leaf) = only_below_leaf_with_fetch(&node, fetch)? else {
                         prev_node = Some(node);
                         continue;
                     };
@@ -395,7 +416,6 @@ impl MutableTree {
 
         let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(node_type, item, self.cowid));
         parent.set_child(branch, Some(leaf));
-        parent.update_hash_deep();
         self.root = self.dirty_up(&path[..path.len() - 1], target, parent)?;
         Ok(true)
     }
@@ -753,6 +773,43 @@ fn only_below_loaded_leaf(
     Ok(Some(node))
 }
 
+/// Resolve the sole descendant of a backed single-branch subtree.
+///
+/// rippled's `SHAMap::onlyBelow` descends through hash-only children while
+/// deciding whether a one-branch inner node can collapse to a leaf. Leaving
+/// such a subtree uncollapsed preserves its logical items but changes the
+/// SHAMap root, which is consensus-visible.
+fn only_below_leaf_with_fetch<F>(
+    node: &SharedIntrusive<SHAMapTreeNode>,
+    fetch: &mut F,
+) -> Result<Option<SharedIntrusive<SHAMapTreeNode>>, MutationError>
+where
+    F: FnMut(SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>>,
+{
+    let mut node = node.clone();
+    while node.is_inner() {
+        let Some(branch) = select_only_branch(&node) else {
+            return Ok(None);
+        };
+        if node.branch_count() != 1 {
+            return Ok(None);
+        }
+
+        if let Some(child) = node.get_child(branch) {
+            node = child;
+            continue;
+        }
+
+        let hash = node.get_child_hash(branch);
+        let Some(child) = fetch(hash) else {
+            return Err(MutationError::Traversal(TraversalError::MissingNode(hash)));
+        };
+        node = child;
+    }
+
+    Ok(Some(node))
+}
+
 fn select_only_branch(node: &SharedIntrusive<SHAMapTreeNode>) -> Option<usize> {
     (0..BRANCH_FACTOR).find(|&branch| !node.is_empty_branch(branch))
 }
@@ -973,6 +1030,73 @@ fn try_walk_subtree_impl<E>(
     Ok((node, flushed))
 }
 
+fn try_walk_subtree_detached_impl<E>(
+    root: SharedIntrusive<SHAMapTreeNode>,
+    owner_cowid: u32,
+    mut writer: Option<&mut TryWriteNodeCallback<'_, E>>,
+) -> Result<(SharedIntrusive<SHAMapTreeNode>, usize), E> {
+    debug_assert_ne!(owner_cowid, 0);
+    if root.cowid() == 0 {
+        return Ok((root, 0));
+    }
+
+    let mut root = root.clone_with_cowid(owner_cowid);
+    if root.is_leaf() {
+        root.update_hash();
+        root.unshare();
+        root = try_maybe_write_node(root, &mut writer)?;
+        return Ok((root, 1));
+    }
+    if root.is_inner() && root.is_empty() {
+        return Ok((make_shared_intrusive(SHAMapTreeNode::new_inner(0)), 1));
+    }
+
+    let mut flushed = 0;
+    let mut node = root;
+    let mut stack = Vec::new();
+    let mut pos = 0;
+    loop {
+        while pos < BRANCH_FACTOR {
+            if node.is_empty_branch(pos) {
+                pos += 1;
+                continue;
+            }
+            let branch = pos;
+            pos += 1;
+            let Some(child) = node.get_child(branch) else {
+                continue;
+            };
+            if child.cowid() == 0 {
+                continue;
+            }
+            let mut child = child.clone_with_cowid(owner_cowid);
+            if child.is_inner() {
+                stack.push((node, branch));
+                node = child;
+                pos = 0;
+                continue;
+            }
+            flushed += 1;
+            child.update_hash();
+            child.unshare();
+            child = try_maybe_write_node(child, &mut writer)?;
+            node.share_child(branch, &child);
+        }
+
+        node.update_hash_deep();
+        node.unshare();
+        node = try_maybe_write_node(node, &mut writer)?;
+        flushed += 1;
+        let Some((parent, branch)) = stack.pop() else {
+            break;
+        };
+        parent.share_child(branch, &node);
+        node = parent;
+        pos = branch + 1;
+    }
+    Ok((node, flushed))
+}
+
 fn require_owned_inner(
     node: &SharedIntrusive<SHAMapTreeNode>,
     node_id: SHAMapNodeId,
@@ -1000,7 +1124,6 @@ mod tests {
     use super::{MutableTree, MutationError, add_item, delete_item, update_item};
     use crate::item::SHAMapItem;
     use crate::search::find_key;
-    use crate::traversal::TraversalError;
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use basics::base_uint::Uint256;
     use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
@@ -1084,6 +1207,37 @@ mod tests {
                 .key(),
             inserted_key
         );
+    }
+
+    #[test]
+    fn add_into_empty_branch_keeps_ancestors_dirty_when_a_sibling_split_is_dirty() {
+        let first =
+            Uint256::from_hex("1000000000000000000000000000000000000000000000000000000000000000")
+                .expect("hex should parse");
+        let colliding =
+            Uint256::from_hex("1100000000000000000000000000000000000000000000000000000000000000")
+                .expect("hex should parse");
+        let unrelated =
+            Uint256::from_hex("2000000000000000000000000000000000000000000000000000000000000000")
+                .expect("hex should parse");
+        let mut tree = MutableTree::new(1);
+
+        for key in [first, colliding, unrelated] {
+            assert!(
+                tree.add_item(
+                    SHAMapNodeType::AccountState,
+                    SHAMapItem::new(key, vec![0xA5; 12]),
+                )
+                .expect("insert should succeed")
+            );
+        }
+
+        assert!(
+            tree.root().get_hash().is_zero(),
+            "an ancestor cannot be considered hashed while its split child remains dirty"
+        );
+        tree.unshare();
+        assert!(tree.root().get_hash().is_non_zero());
     }
 
     #[test]
@@ -1278,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_item_reports_when_collapse_needs_an_unloaded_descendant() {
+    fn delete_item_keeps_an_unloaded_single_child_subtree_without_error() {
         let keep_key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
@@ -1310,11 +1464,17 @@ mod tests {
         root.set_child(1, Some(parent));
         root.update_hash_deep();
 
-        let error =
-            delete_item(&root, delete_key).expect_err("unloaded collapse path should error");
-        assert_eq!(
-            error,
-            MutationError::Traversal(TraversalError::MissingNode(loaded_leaf.get_hash()))
+        // Deleting the sole loaded sibling must not force loading the
+        // hash-only descendant: the surviving single-child subtree is valid as
+        // an inner node, so the delete completes without a MissingNode error.
+        let deleted = delete_item(&root, delete_key)
+            .expect("unloaded descendants must not block a valid delete");
+        assert!(deleted);
+        assert!(
+            root.get_child(1)
+                .expect("surviving root branch should remain")
+                .is_inner(),
+            "the surviving single-child subtree is retained as an inner node"
         );
     }
 
@@ -1500,6 +1660,57 @@ mod tests {
         assert_eq!(replaced_leaf.cowid(), 0);
         assert_eq!(replaced_leaf.get_hash(), original_leaf_hash);
         assert!(!same_node(&original_leaf, &replaced_leaf));
+    }
+
+    #[test]
+    fn detached_flush_preserves_dirty_owner_until_canonical_commit() {
+        let key = Uint256::from_array([0xD8; 32]);
+        let mut tree = MutableTree::new(9);
+        tree.add_item(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(key, vec![22; 12]),
+        )
+        .expect("insert should succeed");
+        let original_root = tree.root();
+        let original_leaf = tree.find_key(key).expect("lookup").expect("dirty leaf");
+        let mut order = Vec::new();
+        let (detached, count) = tree
+            .try_flush_dirty_detached(&mut |node| {
+                order.push(node.is_leaf());
+                Ok::<_, ()>(node)
+            })
+            .expect("detached flush plan");
+
+        assert_eq!(count, 2);
+        assert_eq!(order, vec![true, false]);
+        assert!(same_node(&tree.root(), &original_root));
+        assert!(same_node(
+            &tree.find_key(key).expect("lookup").expect("dirty leaf"),
+            &original_leaf
+        ));
+        assert_eq!(
+            tree.root().cowid(),
+            9,
+            "dry run must retain dirty ownership"
+        );
+
+        let canonical_root = detached.root();
+        let canonical_leaf = detached
+            .find_key(key)
+            .expect("lookup")
+            .expect("canonical leaf");
+        tree.flush_dirty(&mut |node| {
+            if node.is_leaf() {
+                canonical_leaf.clone()
+            } else {
+                canonical_root.clone()
+            }
+        });
+        assert!(same_node(&tree.root(), &canonical_root));
+        assert!(same_node(
+            &tree.find_key(key).expect("lookup").expect("canonical leaf"),
+            &canonical_leaf
+        ));
     }
 
     #[test]

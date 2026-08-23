@@ -497,8 +497,22 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
             } else {
                 0
             };
-            // Valid flags: tfBurnable(1) | tfOnlyXRP(2) | tfTrustLine(4) | tfTransferable(8)
-            let valid_flags: u32 = 0x0000000F;
+            // Mirrors rippled NFTokenMint::getFlagsMask
+            // (src/libxrpl/tx/transactors/nft/NFTokenMint.cpp): tfTrustLine(4)
+            // is invalid once fixRemoveNFTokenAutoTrustLine is enabled, and
+            // tfMutable(16) is valid only with DynamicNFT.
+            let mut valid_flags: u32 = 0x0000000F; // tfBurnable|tfOnlyXRP|tfTrustLine|tfTransferable
+            if view
+                .rules()
+                .enabled(&protocol::feature_id("fixRemoveNFTokenAutoTrustLine"))
+            {
+                valid_flags &= !0x04;
+            }
+            if view.rules().enabled(&protocol::feature_id("DynamicNFT")) {
+                valid_flags |= 0x10; // tfMutable
+            }
+            // Universal flags (tfFullyCanonicalSig|tfInnerBatchTxn) are always valid.
+            let valid_flags = valid_flags | 0xC0000000;
             if flags & !valid_flags != 0 {
                 return Ter::TEM_INVALID_FLAG;
             }
@@ -739,22 +753,32 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
                 0
             };
             let has_send_max = tx.is_field_present(sf("sfSendMax"));
+            let send_max = has_send_max.then(|| tx.get_field_amount(sf("sfSendMax")));
             let has_paths = tx.is_field_present(sf("sfPaths"));
+            let max_source_amount =
+                tx::payment_max_source_amount(account, &amount, send_max.as_ref());
             let xrp_direct =
-                amount.native() && (!has_send_max || tx.get_field_amount(sf("sfSendMax")).native());
+                amount.native() && send_max.as_ref().is_none_or(protocol::STAmount::native);
             let partial = (flags & 0x00020000) != 0;
             let limit_quality = (flags & 0x00040000) != 0;
             let no_ripple_direct = (flags & 0x00010000) != 0;
-            // Self-payment
-            if account == dst {
-                return Ter::TEM_REDUNDANT;
-            }
             if amount.signum() <= 0 {
                 return Ter::TEM_BAD_AMOUNT;
             }
             // C++ Payment::preflight: SendMax <= 0 -> temBAD_AMOUNT
             if has_send_max && tx.get_field_amount(sf("sfSendMax")).signum() <= 0 {
                 return Ter::TEM_BAD_AMOUNT;
+            }
+            // Mirrors Payment::preflight: cross-asset and explicitly-pathed
+            // self-payments may be conversion/arbitrage attempts.
+            if tx::payment_is_redundant_to_self(
+                account,
+                dst,
+                &max_source_amount,
+                &amount,
+                has_paths,
+            ) {
+                return Ter::TEM_REDUNDANT;
             }
             // XRP-to-XRP specific checks
             if xrp_direct && amount.native() {
@@ -777,15 +801,16 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
             Ter::TES_SUCCESS
         }
         TxType::VAULT_CREATE => {
-            let asset = tx.get_field_amount(sf("sfAsset"));
+            if tx.peek_at_pfield(sf("sfAsset")).map(|value| value.stype())
+                != Some(protocol::SerializedTypeId::Issue)
+            {
+                return Ter::TEM_MALFORMED;
+            }
             let flags = if tx.is_field_present(sf("sfFlags")) {
                 tx.get_field_u32(sf("sfFlags"))
             } else {
                 0
             };
-            if asset.native() {
-                return Ter::TEM_MALFORMED;
-            }
             // Valid vault flags: tfPrivate(1) | tfShareNonTransferable(2)
             let valid_flags: u32 = 0x03;
             if flags & !valid_flags != 0 {
@@ -874,14 +899,12 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
             } else {
                 0
             };
-            // Valid batch flags: tfAllOrNothing(1) | tfOnlyOne(2) | tfUntilFailure(4) | tfIndependent(8)
-            let valid = 0x0F;
+            let valid = protocol::BATCH_FLAGS;
             if flags & !valid != 0 {
                 return Ter::TEM_INVALID_FLAG;
             }
             // Can't have more than one mode flag
-            let mode_count =
-                (flags & 1) + ((flags >> 1) & 1) + ((flags >> 2) & 1) + ((flags >> 3) & 1);
+            let mode_count = (flags & valid).count_ones();
             if mode_count > 1 {
                 return Ter::TEM_INVALID_FLAG;
             }

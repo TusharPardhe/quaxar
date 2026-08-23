@@ -1,4 +1,4 @@
-use tx::{CheckValidityResult, Validity};
+use tx::{CheckValidityResult, Validity, payment_is_redundant_to_self, payment_max_source_amount};
 
 pub const INVALID_TRANSACTION_ERROR: &str = "invalidTransaction";
 pub const FAILS_LOCAL_CHECKS_PREFIX: &str = "fails local checks: ";
@@ -115,6 +115,34 @@ mod tests {
         assert_eq!(
             submit_semantic_preflight(&payment, &Rules::default()),
             Ter::TEM_REDUNDANT
+        );
+    }
+
+    #[test]
+    fn nftoken_modify_taxon_maps_to_tem_malformed_before_ledger_lookup() {
+        let account = account(0xBB);
+        let mut object = STObject::new(get_field_by_symbol("sfTransaction"));
+        object.set_field_u16(
+            get_field_by_symbol("sfTransactionType"),
+            TxType::NFTOKEN_MODIFY.into(),
+        );
+        object.set_account_id(get_field_by_symbol("sfAccount"), account);
+        object.set_field_h256(
+            get_field_by_symbol("sfNFTokenID"),
+            basics::base_uint::Uint256::zero(),
+        );
+        object.set_field_u32(get_field_by_symbol("sfNFTokenTaxon"), 10);
+        object.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        let tx = STTx::from_stobject(object);
+
+        assert!(tx.is_field_present(get_field_by_symbol("sfNFTokenTaxon")));
+        assert_eq!(
+            submit_semantic_preflight(&tx, &rules_with_tx_enabled(TxType::NFTOKEN_MODIFY),),
+            Ter::TEM_MALFORMED
         );
     }
 
@@ -724,10 +752,9 @@ use protocol::{
     AccountID, Asset, CurrentTransactionRulesGuard, JsonOptions, JsonValue, Keylet,
     LedgerEntryType, Permission, Rules, STLedgerEntry, STTx, STXChainBridge, Ter, TxType,
     XRPAmount, account_keylet, bridge_keylet_from_door_issue, check_keylet_from_key,
-    credential_keylet, deposit_preauth_keylet, did_keylet, escrow_keylet, feature_amm, feature_id,
+    deposit_preauth_keylet, did_keylet, escrow_keylet, feature_amm, feature_id,
     feature_single_asset_vault, get_field_by_symbol, is_tec_claim, is_tes_success, jss, line,
-    mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, nft_offer_keylet_from_key,
-    nft_page_keylet, nft_page_max_keylet, nft_page_min_keylet, oracle_keylet,
+    mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, oracle_keylet,
     pay_channel_keylet_from_key, permissioned_domain_keylet_from_id, trans_token,
     vault_keylet_from_key, xchain_owned_claim_id_keylet_from_bridge,
 };
@@ -752,30 +779,7 @@ impl tx::OracleSetReserveSink for OracleSetReserveSink {
 }
 
 fn oracle_set_series(st_object: &protocol::STObject) -> Vec<tx::OracleSetSeriesEntry> {
-    st_object
-        .get_field_array(get_field_by_symbol("sfPriceDataSeries"))
-        .iter()
-        .map(|entry| tx::OracleSetSeriesEntry {
-            pair: tx::OracleTokenPair {
-                base_asset: protocol::currency_to_string(
-                    entry
-                        .get_field_currency(get_field_by_symbol("sfBaseAsset"))
-                        .currency(),
-                ),
-                quote_asset: protocol::currency_to_string(
-                    entry
-                        .get_field_currency(get_field_by_symbol("sfQuoteAsset"))
-                        .currency(),
-                ),
-            },
-            asset_price: entry
-                .is_field_present(get_field_by_symbol("sfAssetPrice"))
-                .then(|| entry.get_field_u64(get_field_by_symbol("sfAssetPrice"))),
-            scale: entry
-                .is_field_present(get_field_by_symbol("sfScale"))
-                .then(|| u16::from(entry.get_field_u8(get_field_by_symbol("sfScale")))),
-        })
-        .collect()
+    tx::oracle_set_series_from_stobject(st_object)
 }
 
 fn run_oracle_set_preclaim_with_ledger(st_tx: &STTx, ledger: &Ledger) -> Ter {
@@ -854,10 +858,7 @@ fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
 }
 
 fn submit_ledger(runtime: &app::AppNetworkOpsRuntime) -> Option<Arc<Ledger>> {
-    let ledger_state = runtime.ledger_master_state();
-    ledger_state
-        .closed_ledger()
-        .or_else(|| ledger_state.validated_ledger())
+    runtime.ledger_master_state().latest_ledger()
 }
 
 fn ledger_keylet_exists(ledger: &Ledger, keylet: Keylet) -> bool {
@@ -935,34 +936,6 @@ fn ledger_bridge_entry(ledger: &Ledger, bridge: &tx::XChainBridgeSpec) -> Option
 
 fn tx_required_feature(tx_type: TxType) -> Option<basics::base_uint::Uint256> {
     Permission::get_instance().get_tx_feature(tx_type)
-}
-
-fn ledger_nft_present_for_owner(
-    ledger: &Ledger,
-    owner: AccountID,
-    nft_id: basics::base_uint::Uint256,
-) -> bool {
-    // NFT pages are stored at the max key for the owner, not at the
-    // token-derived key. Use succ to find the correct page.
-    let first = nft_page_keylet(nft_page_min_keylet(account_to_uint160(owner)), nft_id);
-    let last = nft_page_max_keylet(account_to_uint160(owner));
-    let page_key = match ledger.succ(first.key, Some(last.key.next())) {
-        Ok(Some(k)) => k,
-        _ => last.key,
-    };
-    let page_kl = protocol::Keylet::new(protocol::LedgerEntryType::NFTokenPage, page_key);
-    let Some(page) = ledger_read_keylet(ledger, page_kl) else {
-        return false;
-    };
-    let nftokens_field = get_field_by_symbol("sfNFTokens");
-    if !page.is_field_present(nftokens_field) {
-        return false;
-    }
-
-    let nftoken_id_field = get_field_by_symbol("sfNFTokenID");
-    page.get_field_array(nftokens_field).iter().any(|entry| {
-        entry.is_field_present(nftoken_id_field) && entry.get_field_h256(nftoken_id_field) == nft_id
-    })
 }
 
 fn vault_create_can_add_holding(ledger: &Ledger, account: AccountID, asset: Asset) -> Ter {
@@ -1172,6 +1145,10 @@ fn submit_semantic_preflight_with_ledger(
 
     match st_tx.get_txn_type() {
         TxType::PAYMENT => {
+            if st_tx.get_flags() & tx::PAYMENT_FLAGS_MASK != 0 {
+                return Ter::TEM_INVALID_FLAG;
+            }
+
             let account_field = get_field_by_symbol("sfAccount");
             let amount_field = get_field_by_symbol("sfAmount");
             let destination_field = get_field_by_symbol("sfDestination");
@@ -1181,9 +1158,20 @@ fn submit_semantic_preflight_with_ledger(
                 return Ter::TEM_MALFORMED;
             }
 
+            let account = st_tx.get_account_id(account_field);
             let amount = st_tx.get_field_amount(amount_field);
-            if amount.negative() || !amount.is_legal_net() {
+            let send_max_field = get_field_by_symbol("sfSendMax");
+            let send_max = st_tx
+                .is_field_present(send_max_field)
+                .then(|| st_tx.get_field_amount(send_max_field));
+            let max_source_amount = payment_max_source_amount(account, &amount, send_max.as_ref());
+            if !amount.is_legal_net() || !max_source_amount.is_legal_net() {
                 return Ter::TEM_BAD_AMOUNT;
+            }
+            if protocol::is_bad_asset(max_source_amount.asset())
+                || protocol::is_bad_asset(amount.asset())
+            {
+                return Ter::TEM_BAD_CURRENCY;
             }
 
             if let Some(deliver_min) = st_tx
@@ -1198,11 +1186,21 @@ fn submit_semantic_preflight_with_ledger(
                 }
             }
 
-            if st_tx.get_account_id(destination_field).is_zero() {
+            let destination = st_tx.get_account_id(destination_field);
+            if destination.is_zero() {
                 return Ter::TEM_DST_IS_SRC;
             }
-
-            if st_tx.get_account_id(destination_field) == st_tx.get_account_id(account_field) {
+            if send_max.as_ref().is_some_and(|amount| amount.signum() <= 0) || amount.signum() <= 0
+            {
+                return Ter::TEM_BAD_AMOUNT;
+            }
+            if payment_is_redundant_to_self(
+                account,
+                destination,
+                &max_source_amount,
+                &amount,
+                st_tx.is_field_present(get_field_by_symbol("sfPaths")),
+            ) {
                 return Ter::TEM_REDUNDANT;
             }
 
@@ -1247,6 +1245,7 @@ fn submit_semantic_preflight_with_ledger(
                 amount_positive: amount.signum() > 0 && amount.is_legal_net(),
                 feature_token_escrow_enabled: true,
                 feature_mptokens_enabled: true,
+                fix_cleanup_3_2_0_enabled: rules.enabled(&protocol::feature_id("fixCleanup3_2_0")),
                 issue_has_bad_currency: amount.holds_issue()
                     && amount.issue().currency == protocol::bad_currency(),
                 mpt_amount_within_limit: !amount.holds_mpt_issue()
@@ -1336,7 +1335,7 @@ fn submit_semantic_preflight_with_ledger(
                 return preflight;
             }
 
-            if let Some(ledger) = ledger {
+            if ledger.is_some() {
                 let pay_channel_field = get_field_by_symbol("sfChannel");
                 if !st_tx.is_field_present(pay_channel_field) {
                     return Ter::TEM_MALFORMED;
@@ -1371,7 +1370,7 @@ fn submit_semantic_preflight_with_ledger(
                 return preflight;
             }
 
-            if let Some(ledger) = ledger {
+            if ledger.is_some() {
                 let pay_channel_field = get_field_by_symbol("sfChannel");
                 if !st_tx.is_field_present(pay_channel_field) {
                     return Ter::TEM_MALFORMED;
@@ -1425,17 +1424,15 @@ fn submit_semantic_preflight_with_ledger(
                 return preflight;
             }
 
-            if let Some(ledger) = ledger {
-                let check_id_field = get_field_by_symbol("sfCheckID");
-                if !st_tx.is_field_present(check_id_field) {
-                    return Ter::TEM_MALFORMED;
-                }
-                let check_id = st_tx.get_field_h256(check_id_field);
-                if !ledger_keylet_exists(ledger, check_keylet_from_key(check_id)) {
-                    return Ter::TEC_NO_ENTRY;
-                }
+            let check_id_field = get_field_by_symbol("sfCheckID");
+            if !st_tx.is_field_present(check_id_field) {
+                return Ter::TEM_MALFORMED;
             }
 
+            // Check existence is a preclaim concern. `submit_ledger` is the
+            // validated parent and may not yet contain a Check admitted to the
+            // current open ledger by a peer. Let the canonical transactor read
+            // the persistent open view, as rippled's CheckCash::preclaim does.
             Ter::TES_SUCCESS
         }
         TxType::CHECK_CANCEL => {
@@ -1444,17 +1441,13 @@ fn submit_semantic_preflight_with_ledger(
                 return preflight;
             }
 
-            if let Some(ledger) = ledger {
-                let check_id_field = get_field_by_symbol("sfCheckID");
-                if !st_tx.is_field_present(check_id_field) {
-                    return Ter::TEM_MALFORMED;
-                }
-                let check_id = st_tx.get_field_h256(check_id_field);
-                if !ledger_keylet_exists(ledger, check_keylet_from_key(check_id)) {
-                    return Ter::TEC_NO_ENTRY;
-                }
+            let check_id_field = get_field_by_symbol("sfCheckID");
+            if !st_tx.is_field_present(check_id_field) {
+                return Ter::TEM_MALFORMED;
             }
 
+            // See CheckCash above: use the transactor's current-open preclaim
+            // for stateful existence and authorization checks.
             Ter::TES_SUCCESS
         }
         TxType::DEPOSIT_PREAUTH => {
@@ -1488,43 +1481,10 @@ fn submit_semantic_preflight_with_ledger(
                 return preflight;
             }
 
-            if let Some(ledger) = ledger {
-                let preclaim = tx::run_deposit_preauth_preclaim(tx::DepositPreauthPreclaimFacts {
-                    authorize,
-                    unauthorize,
-                    authorize_target_exists: authorize
-                        .is_some_and(|target| ledger_account_exists(ledger, target)),
-                    authorize_preauth_exists: authorize.is_some_and(|target| {
-                        ledger_keylet_exists(
-                            ledger,
-                            deposit_preauth_keylet(
-                                account_to_uint160(account),
-                                account_to_uint160(target),
-                            ),
-                        )
-                    }),
-                    unauthorize_preauth_exists: unauthorize.is_some_and(|target| {
-                        ledger_keylet_exists(
-                            ledger,
-                            deposit_preauth_keylet(
-                                account_to_uint160(account),
-                                account_to_uint160(target),
-                            ),
-                        )
-                    }),
-                    authorize_credentials_present: false,
-                    authorize_credentials: Vec::<
-                        tx::DepositPreauthCredentialPreclaimFact<AccountID, Vec<u8>>,
-                    >::new(),
-                    authorize_credentials_preauth_exists: false,
-                    unauthorize_credentials_present: false,
-                    unauthorize_credentials_preauth_exists: false,
-                });
-                if preclaim != Ter::TES_SUCCESS {
-                    return preclaim;
-                }
-            }
-
+            // Account and DepositPreauth entry state is checked by the
+            // dispatcher against the persistent current OpenView. A
+            // latest-closed RPC preclaim can incorrectly reject a just-created
+            // authorization before an unauthorize is applied.
             Ter::TES_SUCCESS
         }
         TxType::ACCOUNT_DELETE => {
@@ -1616,16 +1576,9 @@ fn submit_semantic_preflight_with_ledger(
                     .then(|| st_tx.get_field_vl(data_field).len()),
             })
         }
-        TxType::DID_DELETE => {
-            if let Some(ledger) = ledger {
-                let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                if !ledger_keylet_exists(ledger, did_keylet(account_to_uint160(account))) {
-                    return Ter::TEC_NO_ENTRY;
-                }
-            }
-
-            Ter::TES_SUCCESS
-        }
+        // DIDDelete state is resolved by the application current OpenView.
+        // The closed submit parent may not contain a peer-admitted DIDSet.
+        TxType::DID_DELETE => Ter::TES_SUCCESS,
         TxType::CREDENTIAL_CREATE => {
             let subject_field = get_field_by_symbol("sfSubject");
             let credential_type_field = get_field_by_symbol("sfCredentialType");
@@ -1642,25 +1595,9 @@ fn submit_semantic_preflight_with_ledger(
                 return preflight;
             }
 
-            if let Some(ledger) = ledger {
-                let subject = st_tx.get_account_id(subject_field);
-                let issuer = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                let subject_u160 = account_to_uint160(subject);
-                let issuer_u160 = account_to_uint160(issuer);
-                let credential_type = st_tx.get_field_vl(credential_type_field);
-                let preclaim =
-                    tx::run_credential_create_preclaim(tx::CredentialCreatePreclaimFacts {
-                        subject_exists: ledger_account_exists(ledger, subject),
-                        credential_exists: ledger_keylet_exists(
-                            ledger,
-                            credential_keylet(subject_u160, issuer_u160, &credential_type),
-                        ),
-                    });
-                if preclaim != Ter::TES_SUCCESS {
-                    return preclaim;
-                }
-            }
-
+            // Subject existence and duplicate state are current-open
+            // preclaim checks. A closed parent can retain a deleted
+            // credential or miss a peer-admitted one.
             Ter::TES_SUCCESS
         }
         TxType::CREDENTIAL_ACCEPT => {
@@ -1675,59 +1612,39 @@ fn submit_semantic_preflight_with_ledger(
                 return preflight;
             }
 
-            if let Some(ledger) = ledger {
-                let subject = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                let issuer = st_tx.get_account_id(issuer_field);
-                let subject_u160 = account_to_uint160(subject);
-                let issuer_u160 = account_to_uint160(issuer);
-                let credential_type = st_tx.get_field_vl(credential_type_field);
-                let credential = ledger_read_keylet(
-                    ledger,
-                    credential_keylet(subject_u160, issuer_u160, &credential_type),
-                );
-                let accepted_flag_field = get_field_by_symbol("sfFlags");
-                let preclaim =
-                    tx::run_credential_accept_preclaim(tx::CredentialAcceptPreclaimFacts {
-                        issuer_exists: ledger_account_exists(ledger, issuer),
-                        credential_exists: credential.is_some(),
-                        credential_accepted: credential
-                            .as_ref()
-                            .map(|sle| {
-                                sle.is_field_present(accepted_flag_field)
-                                    && (sle.get_field_u32(accepted_flag_field)
-                                        & tx::CREDENTIAL_ACCEPTED_FLAG)
-                                        != 0
-                            })
-                            .unwrap_or(false),
-                    });
-                if preclaim != Ter::TES_SUCCESS {
-                    return preclaim;
-                }
-            }
-
+            // Credential state and accepted status are read by the
+            // application current-open preclaim.
             Ter::TES_SUCCESS
         }
         TxType::CREDENTIAL_DELETE => {
             let subject_field = get_field_by_symbol("sfSubject");
             let issuer_field = get_field_by_symbol("sfIssuer");
             let credential_type_field = get_field_by_symbol("sfCredentialType");
-            tx::run_credential_delete_preflight(tx::CredentialDeletePreflightFacts {
-                subject: if !st_tx.is_field_present(subject_field) {
-                    tx::CredentialOptionalAccountField::Missing
-                } else if st_tx.get_account_id(subject_field).is_zero() {
-                    tx::CredentialOptionalAccountField::Zero
-                } else {
-                    tx::CredentialOptionalAccountField::Present
-                },
-                issuer: if !st_tx.is_field_present(issuer_field) {
-                    tx::CredentialOptionalAccountField::Missing
-                } else if st_tx.get_account_id(issuer_field).is_zero() {
-                    tx::CredentialOptionalAccountField::Zero
-                } else {
-                    tx::CredentialOptionalAccountField::Present
-                },
-                credential_type_len: st_tx.get_field_vl(credential_type_field).len(),
-            })
+            let preflight =
+                tx::run_credential_delete_preflight(tx::CredentialDeletePreflightFacts {
+                    subject: if !st_tx.is_field_present(subject_field) {
+                        tx::CredentialOptionalAccountField::Missing
+                    } else if st_tx.get_account_id(subject_field).is_zero() {
+                        tx::CredentialOptionalAccountField::Zero
+                    } else {
+                        tx::CredentialOptionalAccountField::Present
+                    },
+                    issuer: if !st_tx.is_field_present(issuer_field) {
+                        tx::CredentialOptionalAccountField::Missing
+                    } else if st_tx.get_account_id(issuer_field).is_zero() {
+                        tx::CredentialOptionalAccountField::Zero
+                    } else {
+                        tx::CredentialOptionalAccountField::Present
+                    },
+                    credential_type_len: st_tx.get_field_vl(credential_type_field).len(),
+                });
+            if preflight != Ter::TES_SUCCESS {
+                return preflight;
+            }
+
+            // Missing-credential state belongs to the current-open bridge
+            // preclaim, so a prior delete is observed on every node.
+            Ter::TES_SUCCESS
         }
         TxType::NFTOKEN_CREATE_OFFER => {
             let amount_field = get_field_by_symbol("sfAmount");
@@ -1764,65 +1681,23 @@ fn submit_semantic_preflight_with_ledger(
             if !st_tx.is_field_present(nft_id_field) {
                 return Ter::TEM_MALFORMED;
             }
-            if let Some(ledger) = ledger {
-                let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                let nft_id = st_tx.get_field_h256(nft_id_field);
-                // Use sfOwner if present (issuer burning someone else's NFT)
-                let owner = if st_tx.is_field_present(get_field_by_symbol("sfOwner")) {
-                    st_tx.get_account_id(get_field_by_symbol("sfOwner"))
-                } else {
-                    account
-                };
-                if !ledger_nft_present_for_owner(ledger, owner, nft_id) {
-                    return Ter::TEC_NO_ENTRY;
-                }
-                // If account != owner, check burnable flag (bit 0x0001 in NFTokenID)
-                if account != owner {
-                    let id_bytes = nft_id.data();
-                    let nft_flags = ((id_bytes[0] as u16) << 8) | (id_bytes[1] as u16);
-                    if (nft_flags & 0x0001) == 0 {
-                        return Ter::TEC_NO_PERMISSION;
-                    }
-                }
-            }
-
+            // Ownership, page membership, and burnability are stateful
+            // preclaim checks. Evaluate them in the current OpenView rather
+            // than against the closed submit parent.
             Ter::TES_SUCCESS
         }
         TxType::NFTOKEN_ACCEPT_OFFER => {
-            if let Some(ledger) = ledger {
-                let sell_offer_field = get_field_by_symbol("sfNFTokenSellOffer");
-                if st_tx.is_field_present(sell_offer_field)
-                    && !ledger_keylet_exists(
-                        ledger,
-                        nft_offer_keylet_from_key(st_tx.get_field_h256(sell_offer_field)),
-                    )
-                {
-                    return Ter::TEC_OBJECT_NOT_FOUND;
-                }
-                let buy_offer_field = get_field_by_symbol("sfNFTokenBuyOffer");
-                if st_tx.is_field_present(buy_offer_field)
-                    && !ledger_keylet_exists(
-                        ledger,
-                        nft_offer_keylet_from_key(st_tx.get_field_h256(buy_offer_field)),
-                    )
-                {
-                    return Ter::TEC_OBJECT_NOT_FOUND;
-                }
-            }
-
+            // Offer existence and compatibility are current-open preclaim
+            // checks. A peer-admitted offer need not be in the closed parent.
             Ter::TES_SUCCESS
         }
         TxType::NFTOKEN_MODIFY => {
+            if st_tx.is_field_present(get_field_by_symbol("sfNFTokenTaxon")) {
+                return Ter::TEM_MALFORMED;
+            }
             let nft_id_field = get_field_by_symbol("sfNFTokenID");
             if !st_tx.is_field_present(nft_id_field) {
                 return Ter::TEM_MALFORMED;
-            }
-            if let Some(ledger) = ledger {
-                let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                let nft_id = st_tx.get_field_h256(nft_id_field);
-                if !ledger_nft_present_for_owner(ledger, account, nft_id) {
-                    return Ter::TEC_NO_ENTRY;
-                }
             }
 
             Ter::TES_SUCCESS
@@ -2115,84 +1990,19 @@ fn submit_semantic_preflight_with_ledger(
 
             Ter::TES_SUCCESS
         }
-        TxType::ORACLE_DELETE => {
-            if let Some(ledger) = ledger {
-                let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                let document_id_field = get_field_by_symbol("sfOracleDocumentID");
-                if !st_tx.is_field_present(document_id_field) {
-                    return Ter::TEM_MALFORMED;
-                }
-                let oracle = ledger_read_keylet(
-                    ledger,
-                    oracle_keylet(
-                        account_to_uint160(account),
-                        st_tx.get_field_u32(document_id_field),
-                    ),
-                );
-                let owner_field = get_field_by_symbol("sfOwner");
-                let preclaim = tx::run_oracle_delete_preclaim(tx::OracleDeletePreclaimFacts {
-                    account_exists: ledger_account_exists(ledger, account),
-                    oracle_exists: oracle.is_some(),
-                    tx_account_matches_owner: oracle
-                        .as_ref()
-                        .map(|sle| {
-                            sle.is_field_present(owner_field)
-                                && sle.get_account_id(owner_field) == account
-                        })
-                        .unwrap_or(false),
-                });
-                if preclaim != Ter::TES_SUCCESS {
-                    return preclaim;
-                }
-            }
-
-            Ter::TES_SUCCESS
-        }
+        // OracleDelete::preflight is a no-op. The canonical application
+        // preclaim reads the persistent current OpenView; do not duplicate it
+        // here against `submit_ledger`, which is only the closed parent.
+        TxType::ORACLE_DELETE => Ter::TES_SUCCESS,
         TxType::MPTOKEN_ISSUANCE_DESTROY => {
-            if let Some(ledger) = ledger {
-                let issuance_id_field = get_field_by_symbol("sfMPTokenIssuanceID");
-                if !st_tx.is_field_present(issuance_id_field) {
-                    return Ter::TEM_MALFORMED;
-                }
-                let issuance = ledger_read_keylet(
-                    ledger,
-                    mpt_issuance_keylet_from_mptid(st_tx.get_field_h192(issuance_id_field)),
-                );
-                let issuer_field = get_field_by_symbol("sfIssuer");
-                let outstanding_amount_field = get_field_by_symbol("sfOutstandingAmount");
-                let locked_amount_field = get_field_by_symbol("sfLockedAmount");
-                let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                let preclaim = tx::run_mp_token_issuance_destroy_preclaim(
-                    tx::MPTokenIssuanceDestroyPreclaimFacts {
-                        issuance_exists: issuance.is_some(),
-                        issuer_matches: issuance
-                            .as_ref()
-                            .map(|sle| {
-                                sle.is_field_present(issuer_field)
-                                    && sle.get_account_id(issuer_field) == account
-                            })
-                            .unwrap_or(false),
-                        outstanding_amount_is_zero: issuance
-                            .as_ref()
-                            .map(|sle| {
-                                !sle.is_field_present(outstanding_amount_field)
-                                    || sle.get_field_amount(outstanding_amount_field).signum() == 0
-                            })
-                            .unwrap_or(true),
-                        locked_amount_is_zero: issuance
-                            .as_ref()
-                            .map(|sle| {
-                                !sle.is_field_present(locked_amount_field)
-                                    || sle.get_field_amount(locked_amount_field).signum() == 0
-                            })
-                            .unwrap_or(true),
-                    },
-                );
-                if preclaim != Ter::TES_SUCCESS {
-                    return preclaim;
-                }
+            let issuance_id_field = get_field_by_symbol("sfMPTokenIssuanceID");
+            if !st_tx.is_field_present(issuance_id_field) {
+                return Ter::TEM_MALFORMED;
             }
 
+            // MPTokenIssuanceDestroy::preclaim must read the current OpenView.
+            // `submit_ledger` is the closed parent and can miss an issuance
+            // admitted by a peer before the next validation.
             Ter::TES_SUCCESS
         }
         TxType::MPTOKEN_AUTHORIZE => {
@@ -2277,28 +2087,9 @@ fn submit_semantic_preflight_with_ledger(
                 return preflight;
             }
 
-            if let Some(ledger) = ledger {
-                let domain =
-                    ledger_read_keylet(ledger, permissioned_domain_keylet_from_id(domain_id));
-                let owner_field = get_field_by_symbol("sfOwner");
-                let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                let preclaim = tx::run_permissioned_domain_delete_preclaim(
-                    tx::PermissionedDomainDeletePreclaimFacts {
-                        domain_exists: domain.is_some(),
-                        tx_account_matches_owner: domain
-                            .as_ref()
-                            .map(|sle| {
-                                sle.is_field_present(owner_field)
-                                    && sle.get_account_id(owner_field) == account
-                            })
-                            .unwrap_or(false),
-                    },
-                );
-                if preclaim != Ter::TES_SUCCESS {
-                    return preclaim;
-                }
-            }
-
+            // Domain existence and ownership are preclaim concerns. The
+            // application helper evaluates them against the persistent current
+            // OpenView, whereas `submit_ledger` is only the closed parent.
             Ter::TES_SUCCESS
         }
         TxType::MPTOKEN_ISSUANCE_SET => {
@@ -2306,8 +2097,11 @@ fn submit_semantic_preflight_with_ledger(
             let domain_id_field = get_field_by_symbol("sfDomainID");
             let metadata_field = get_field_by_symbol("sfMPTokenMetadata");
             let transfer_fee_field = get_field_by_symbol("sfTransferFee");
+            let mutable_flags_field = get_field_by_symbol("sfMutableFlags");
             let tx_flags = st_tx.get_flags();
-            let mutable_flags = tx_flags & protocol::tmfMPTokenIssuanceSetMutableMask;
+            let mutable_flags = st_tx
+                .is_field_present(mutable_flags_field)
+                .then(|| st_tx.get_field_u32(mutable_flags_field));
             tx::run_mp_token_issuance_set_preflight(tx::MPTokenIssuanceSetPreflightFacts {
                 dynamic_mpt_enabled: true,
                 single_asset_vault_enabled: rules.enabled(&feature_single_asset_vault()),
@@ -2317,7 +2111,7 @@ fn submit_semantic_preflight_with_ledger(
                     && st_tx.get_account_id(holder_field)
                         == st_tx.get_account_id(get_field_by_symbol("sfAccount")),
                 tx_flags,
-                mutable_flags: (mutable_flags != 0).then_some(mutable_flags),
+                mutable_flags,
                 metadata_len: st_tx
                     .is_field_present(metadata_field)
                     .then(|| st_tx.get_field_vl(metadata_field).len()),
@@ -2686,6 +2480,10 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
         || false,
         || {
             if let Some(app) = ctx.runtime.app() {
+                // Keep the global ordering consistent with consensus and batch
+                // paths: a preferred-LCL transition gate always precedes the
+                // close gate used for direct open-ledger application.
+                let _lcl_transition_guard = app.lcl_transition_gate().lock();
                 let _close_guard = app
                     .close_gate()
                     .lock()
@@ -2711,6 +2509,24 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
             "internalSubmit",
             "submit did not reach a concrete open-ledger apply result",
         );
+    }
+
+    // Legacy submit-with-secret signs the next request from the open ledger.
+    // Keep that sequence source in lockstep only after this transaction was
+    // admitted to the local open ledger. Without this update every rapid
+    // submit from an account is signed with the same Sequence, leaving only
+    // one candidate transaction to reach consensus. This is the equivalent
+    // of rippled TxQ::nextQueuableSeq used by TransactionSign.
+    let admitted = transaction
+        .lock()
+        .expect("transaction mutex must not be poisoned")
+        .get_submit_result()
+        .any();
+    if admitted && is_tes_success(result) {
+        if let Some(app) = ctx.runtime.app() {
+            let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
+            app.note_open_ledger_tx(&account, st_tx.get_seq_value());
+        }
     }
 
     tracing::info!(target: "rpc", tx_hash = %st_tx.get_transaction_id(), "Transaction submitted via RPC");
@@ -2771,6 +2587,18 @@ fn submit_with_sign<Runtime: RpcRuntime>(
     ctx: &RpcRequestContext<'_, SubmitSource, Runtime>,
 ) -> Result<JsonValue, Status> {
     use crate::commands::rpc_helpers::transaction_sign;
+
+    // `submit` with a server-side secret leaves Sequence unspecified. Match
+    // rippled's synchronous NetworkOPs admission contract by holding the LCL
+    // transition gate from open-ledger sequence autofill through signing and
+    // direct open-ledger admission. `submit_sttx` re-enters this gate while it
+    // takes close_gate and drains its synchronous batch. Without this outer
+    // scope, concurrent legacy handlers can sign distinct transactions with
+    // the same open-ledger sequence; TxQ only detects the conflict later and
+    // one otherwise accepted transaction is discarded at consensus as
+    // tefPAST_SEQ.
+    let app = ctx.runtime.app();
+    let _legacy_sign_submit_guard = app.map(|app| app.lcl_transition_gate().lock());
 
     // Reinterpret the context with a temporary SignSource for the sign call
     let sign_ctx = RpcRequestContext {

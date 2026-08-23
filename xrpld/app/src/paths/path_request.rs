@@ -7,7 +7,7 @@ use protocol::JsonValue;
 use super::pathfinder::{
     PathFindTuning, PathFinderSource, make_path_find_status, parse_path_finder_request,
 };
-use xrpld_core::Status;
+use quaxar_core::Status;
 
 #[derive(Debug, Clone)]
 pub struct PathRequest {

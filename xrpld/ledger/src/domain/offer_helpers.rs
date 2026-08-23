@@ -29,25 +29,42 @@ pub fn offer_delete(view: &mut dyn ApplyView, sle: Arc<STLedgerEntry>) -> Result
 
     // Remove from owner directory
     let owner_node = sle.get_field_u64(sf("sfOwnerNode"));
-    if !dir_remove(
+    let trace_offer_sequence = std::env::var("XRPL_TRACE_OFFER_SEQUENCE")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    let owner_removed = dir_remove(
         view,
         &owner_dir_keylet(to_uint160(owner)),
         owner_node,
         offer_index,
         false,
-    )? {
+    )?;
+    if trace_offer_sequence {
+        eprintln!(
+            "TRACE offer_delete: offer={} owner={:?} owner_node={} owner_removed={}",
+            offer_index, owner, owner_node, owner_removed
+        );
+    }
+    if !owner_removed {
         return Ok(Ter::TEF_BAD_LEDGER);
     }
 
     // Remove from book directory
     let book_node = sle.get_field_u64(sf("sfBookNode"));
-    if !dir_remove(
+    let book_removed = dir_remove(
         view,
         &directory_node_keylet(book_directory),
         book_node,
         offer_index,
         false,
-    )? {
+    )?;
+    if trace_offer_sequence {
+        eprintln!(
+            "TRACE offer_delete: offer={} book_dir={} book_node={} book_removed={}",
+            offer_index, book_directory, book_node, book_removed
+        );
+    }
+    if !book_removed {
         return Ok(Ter::TEF_BAD_LEDGER);
     }
 

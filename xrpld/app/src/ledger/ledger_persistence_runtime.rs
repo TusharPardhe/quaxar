@@ -29,6 +29,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use time::Duration;
 
+type FailedSaveHandler = Arc<dyn Fn(u32, SHAMapHash) + Send + Sync + 'static>;
+
 #[derive(Clone)]
 struct PersistenceNodeStoreFetcher {
     node_store: crate::SHAMapStoreNodeStore,
@@ -108,6 +110,12 @@ pub struct AppLedgerPersistenceRuntime {
     ledger_db: Option<Arc<rdb::LedgerDb>>,
     saved_hashes: Mutex<HashSet<SHAMapHash>>,
     pending: Mutex<HashSet<u32>>,
+    /// Background dispatch target for `enqueue_job`. `None` only in
+    /// isolated/test construction; production wiring always attaches this
+    /// via `ApplicationRoot`'s shared job queue, matching the reference's
+    /// `app_.getJobQueue()` access from `pendSaveValidated`.
+    job_queue: Option<Arc<crate::job::job_queue::JobQueue>>,
+    failed_save_handler: Option<FailedSaveHandler>,
 }
 
 impl AppLedgerPersistenceRuntime {
@@ -118,6 +126,44 @@ impl AppLedgerPersistenceRuntime {
         network_id: u32,
         ledger_db: Option<Arc<rdb::LedgerDb>>,
     ) -> Self {
+        Self::with_job_queue(
+            relational_database,
+            node_store,
+            transaction_master,
+            network_id,
+            ledger_db,
+            None,
+        )
+    }
+
+    pub fn with_job_queue(
+        relational_database: Option<Arc<SqliteSHAMapStoreRelational>>,
+        node_store: Option<crate::SHAMapStoreNodeStore>,
+        transaction_master: Arc<TransactionMaster>,
+        network_id: u32,
+        ledger_db: Option<Arc<rdb::LedgerDb>>,
+        job_queue: Option<Arc<crate::job::job_queue::JobQueue>>,
+    ) -> Self {
+        Self::with_job_queue_and_failed_save_handler(
+            relational_database,
+            node_store,
+            transaction_master,
+            network_id,
+            ledger_db,
+            job_queue,
+            None,
+        )
+    }
+
+    pub fn with_job_queue_and_failed_save_handler(
+        relational_database: Option<Arc<SqliteSHAMapStoreRelational>>,
+        node_store: Option<crate::SHAMapStoreNodeStore>,
+        transaction_master: Arc<TransactionMaster>,
+        network_id: u32,
+        ledger_db: Option<Arc<rdb::LedgerDb>>,
+        job_queue: Option<Arc<crate::job::job_queue::JobQueue>>,
+        failed_save_handler: Option<FailedSaveHandler>,
+    ) -> Self {
         Self {
             relational_database,
             node_store,
@@ -126,6 +172,8 @@ impl AppLedgerPersistenceRuntime {
             ledger_db,
             saved_hashes: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashSet::new()),
+            job_queue,
+            failed_save_handler,
         }
     }
 }
@@ -166,13 +214,21 @@ impl LedgerPersistenceRuntime for AppLedgerPersistenceRuntime {
     fn save_validated_ledger(&self, ledger: Arc<Ledger>, _is_current: bool) -> bool {
         // Write header to SQLite Ledgers table (compatibility: the reference source kADD_LEDGER).
         // This is the primary bootstrap source on restart — mirrors reference getLastFullLedger().
-        if let Some(db) = self.ledger_db.as_ref() {
-            if let Err(e) = db.insert_ledger(&ledger.header()) {
-                tracing::info!(target: "ledger",
-                    "[ledger_persistence] rdb insert failed seq={} error={e}",
-                    ledger.header().seq
-                );
-            }
+        if let Some(db) = self.ledger_db.as_ref()
+            && let Err(error) = db.insert_ledger(&ledger.header())
+        {
+            self.saved_hashes
+                .lock()
+                .expect("saved_hashes mutex must not be poisoned")
+                .remove(&ledger.header().hash);
+            tracing::warn!(
+                target: "ledger",
+                seq = ledger.header().seq,
+                hash = %ledger.header().hash,
+                %error,
+                "required ledger-header persistence failed"
+            );
+            return false;
         }
 
         let Some(relational) = self.relational_database.as_ref() else {
@@ -203,13 +259,124 @@ impl LedgerPersistenceRuntime for AppLedgerPersistenceRuntime {
         }
     }
 
+    fn failed_save(&self, seq: u32, hash: SHAMapHash) {
+        if let Some(handler) = self.failed_save_handler.as_ref() {
+            handler(seq, hash);
+        }
+    }
+
     fn enqueue_job(
         &self,
-        _job_type: LedgerPersistenceJobType,
-        _job_name: String,
+        job_type: LedgerPersistenceJobType,
+        job_name: String,
         job: LedgerPersistenceJob,
     ) -> bool {
-        job();
-        true
+        let Some(job_queue) = self.job_queue.as_ref() else {
+            // Isolated/test construction with no queue attached. Run inline
+            // so callers still observe deterministic completion.
+            job();
+            return true;
+        };
+        let queue_job_type = match job_type {
+            LedgerPersistenceJobType::PubLedger => crate::job::job_types::JobType::JtPubledger,
+            LedgerPersistenceJobType::PubOldLedger => {
+                crate::job::job_types::JobType::JtPuboldledger
+            }
+        };
+        let mut job_slot = Some(job);
+        job_queue.add_job(queue_job_type, job_name, move || {
+            if let Some(job) = job_slot.take() {
+                job();
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::job_queue::JobQueue;
+
+    #[test]
+    fn enqueue_job_with_no_queue_runs_inline() {
+        let runtime = AppLedgerPersistenceRuntime::new(
+            None,
+            None,
+            Arc::new(TransactionMaster::new()),
+            0,
+            None,
+        );
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_clone = Arc::clone(&ran);
+        let dispatched = runtime.enqueue_job(
+            LedgerPersistenceJobType::PubLedger,
+            "test".to_owned(),
+            Box::new(move || {
+                ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+        assert!(dispatched);
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "inline fallback must run the job synchronously before returning"
+        );
+    }
+
+    #[test]
+    fn enqueue_job_with_queue_dispatches_to_jtpubledger_off_thread() {
+        let queue = Arc::new(JobQueue::new(1));
+        let runtime = AppLedgerPersistenceRuntime::with_job_queue(
+            None,
+            None,
+            Arc::new(TransactionMaster::new()),
+            0,
+            None,
+            Some(Arc::clone(&queue)),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dispatched = runtime.enqueue_job(
+            LedgerPersistenceJobType::PubLedger,
+            "test".to_owned(),
+            Box::new(move || {
+                tx.send(std::thread::current().id())
+                    .expect("send job thread id");
+            }),
+        );
+        assert!(dispatched);
+        let job_thread = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("job must run on a JobQueue worker thread, not inline");
+        assert_ne!(
+            job_thread,
+            std::thread::current().id(),
+            "pendSaveValidated-equivalent dispatch must run off the calling thread"
+        );
+        queue.rendezvous();
+        queue.stop();
+    }
+
+    #[test]
+    fn enqueue_job_dispatches_puboldledger_for_non_current_history_saves() {
+        let queue = Arc::new(JobQueue::new(1));
+        let runtime = AppLedgerPersistenceRuntime::with_job_queue(
+            None,
+            None,
+            Arc::new(TransactionMaster::new()),
+            0,
+            None,
+            Some(Arc::clone(&queue)),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(runtime.enqueue_job(
+            LedgerPersistenceJobType::PubOldLedger,
+            "test-old".to_owned(),
+            Box::new(move || {
+                tx.send(()).expect("send completion");
+            }),
+        ));
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("JtPuboldledger job must complete");
+        queue.rendezvous();
+        queue.stop();
     }
 }

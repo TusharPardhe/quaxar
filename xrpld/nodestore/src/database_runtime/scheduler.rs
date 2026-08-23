@@ -37,27 +37,57 @@ pub struct BatchWriteReport {
 
 pub trait Scheduler: Send + Sync + 'static {
     fn schedule_task(&self, task: Arc<dyn Task>);
+
+    /// Bounded schedulers return false without retaining `task`; dropping that
+    /// task is the caller's explicit cancellation handoff. Existing adapters
+    /// retain the legacy method and conservatively report accepted work.
+    fn try_schedule_task(&self, task: Arc<dyn Task>) -> bool {
+        self.schedule_task(task);
+        true
+    }
+
     fn on_fetch(&self, report: FetchReport);
     fn on_batch_write(&self, report: BatchWriteReport);
 }
 
+struct QueuedTask {
+    task: Arc<dyn Task>,
+    bytes: usize,
+}
+
 #[derive(Default)]
 struct RealSchedulerQueue {
-    tasks: VecDeque<Arc<dyn Task>>,
+    tasks: VecDeque<QueuedTask>,
+    retained_bytes: usize,
 }
 
 struct RealSchedulerInner {
     queue: Mutex<RealSchedulerQueue>,
     wakeup: Condvar,
     stopping: AtomicBool,
+    max_scheduled_tasks: usize,
+    max_scheduled_bytes: usize,
+    rejected_tasks: std::sync::atomic::AtomicUsize,
+    high_water_tasks: std::sync::atomic::AtomicUsize,
 }
 
 impl RealSchedulerInner {
-    fn new() -> Self {
+    fn new(max_scheduled_tasks: usize) -> Self {
+        assert!(
+            max_scheduled_tasks > 0,
+            "xrpl::NodeStore::RealScheduler queue capacity must be nonzero"
+        );
+        let max_scheduled_bytes = max_scheduled_tasks
+            .checked_mul(512)
+            .expect("NodeStore scheduler byte capacity overflow");
         Self {
             queue: Mutex::new(RealSchedulerQueue::default()),
             wakeup: Condvar::new(),
             stopping: AtomicBool::new(false),
+            max_scheduled_tasks,
+            max_scheduled_bytes,
+            rejected_tasks: std::sync::atomic::AtomicUsize::new(0),
+            high_water_tasks: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -74,7 +104,11 @@ impl RealScheduler {
             "xrpl::NodeStore::RealScheduler::new requires at least one worker"
         );
 
-        let inner = Arc::new(RealSchedulerInner::new());
+        // This queue budget is a bounded Rust adaptation derived from the
+        // constructor's worker-count resource contract: each worker may have
+        // one additional task retained while it is executing another. It is
+        // not a rippled numeric-parity value.
+        let inner = Arc::new(RealSchedulerInner::new(worker_count));
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let worker_inner = Arc::clone(&inner);
@@ -89,6 +123,44 @@ impl RealScheduler {
             inner,
             workers: Mutex::new(workers),
         }
+    }
+
+    /// Test and embedding constructor for an explicit finite queue budget.
+    pub fn with_task_limit(worker_count: usize, max_scheduled_tasks: usize) -> Self {
+        assert!(
+            worker_count > 0,
+            "xrpl::NodeStore::RealScheduler::with_task_limit requires at least one worker"
+        );
+        let inner = Arc::new(RealSchedulerInner::new(max_scheduled_tasks));
+        let mut workers = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let worker_inner = Arc::clone(&inner);
+            let handle = thread::Builder::new()
+                .name(format!("nodestore scheduler #{}", index + 1))
+                .spawn(move || worker_loop(worker_inner))
+                .expect("failed to spawn nodestore scheduler worker");
+            workers.push(handle);
+        }
+        Self {
+            inner,
+            workers: Mutex::new(workers),
+        }
+    }
+
+    pub fn pending_task_count(&self) -> usize {
+        self.inner
+            .queue
+            .lock()
+            .expect("nodestore scheduler queue mutex must not be poisoned")
+            .tasks
+            .len()
+    }
+
+    pub fn task_metrics(&self) -> (usize, usize) {
+        (
+            self.inner.rejected_tasks.load(Ordering::Relaxed),
+            self.inner.high_water_tasks.load(Ordering::Relaxed),
+        )
     }
 
     pub fn with_available_parallelism() -> Self {
@@ -114,17 +186,37 @@ impl Scheduler for DummyScheduler {
 
 impl Scheduler for RealScheduler {
     fn schedule_task(&self, task: Arc<dyn Task>) {
+        let _ = self.try_schedule_task(task);
+    }
+
+    fn try_schedule_task(&self, task: Arc<dyn Task>) -> bool {
         let mut queue = self
             .inner
             .queue
             .lock()
             .expect("nodestore scheduler queue mutex must not be poisoned");
-        if self.inner.stopping.load(Ordering::Acquire) {
-            return;
+        let task_bytes = std::mem::size_of_val(task.as_ref()).saturating_add(task.retained_bytes());
+        if self.inner.stopping.load(Ordering::Acquire)
+            || queue.tasks.len() >= self.inner.max_scheduled_tasks
+            || queue
+                .retained_bytes
+                .checked_add(task_bytes)
+                .is_none_or(|total| total > self.inner.max_scheduled_bytes)
+        {
+            self.inner.rejected_tasks.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
 
-        queue.tasks.push_back(task);
+        queue.retained_bytes += task_bytes;
+        queue.tasks.push_back(QueuedTask {
+            task,
+            bytes: task_bytes,
+        });
+        self.inner
+            .high_water_tasks
+            .fetch_max(queue.tasks.len(), Ordering::Relaxed);
         self.inner.wakeup.notify_one();
+        true
     }
 
     fn on_fetch(&self, _report: FetchReport) {}
@@ -157,6 +249,7 @@ fn worker_loop(inner: Arc<RealSchedulerInner>) {
 
             loop {
                 if let Some(task) = queue.tasks.pop_front() {
+                    queue.retained_bytes = queue.retained_bytes.saturating_sub(task.bytes);
                     break Some(task);
                 }
 
@@ -175,7 +268,7 @@ fn worker_loop(inner: Arc<RealSchedulerInner>) {
             return;
         };
 
-        let _ = catch_unwind(AssertUnwindSafe(|| task.perform_scheduled_task()));
+        let _ = catch_unwind(AssertUnwindSafe(|| task.task.perform_scheduled_task()));
     }
 }
 
@@ -205,6 +298,22 @@ mod tests {
     struct CountingTask {
         counter: Arc<AtomicUsize>,
         should_panic: bool,
+    }
+
+    struct GateTask {
+        entered: mpsc::Sender<()>,
+        release: std::sync::Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Task for GateTask {
+        fn perform_scheduled_task(&self) {
+            self.entered.send(()).expect("gate task should start");
+            self.release
+                .lock()
+                .expect("gate release mutex")
+                .recv()
+                .expect("gate task should be released");
+        }
     }
 
     impl Task for CountingTask {
@@ -256,7 +365,7 @@ mod tests {
 
     #[test]
     fn real_scheduler_survives_panicking_tasks_and_keeps_running() {
-        let scheduler = RealScheduler::new(1);
+        let scheduler = RealScheduler::with_task_limit(1, 2);
         let counter = Arc::new(AtomicUsize::new(0));
 
         scheduler.schedule_task(Arc::new(CountingTask {
@@ -274,6 +383,43 @@ mod tests {
         }
 
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn real_scheduler_default_worker_bound_accepts_one_queued_task_then_rejects() {
+        let scheduler = RealScheduler::new(1);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        assert!(scheduler.try_schedule_task(Arc::new(GateTask {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        })));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker must hold the active task");
+
+        assert!(scheduler.try_schedule_task(Arc::new(CountingTask {
+            counter: Arc::clone(&counter),
+            should_panic: false,
+        })));
+        assert!(
+            !scheduler.try_schedule_task(Arc::new(CountingTask {
+                counter: Arc::clone(&counter),
+                should_panic: false,
+            })),
+            "with one active worker, the one-worker derived queue admits exactly one waiting task"
+        );
+        assert_eq!(scheduler.pending_task_count(), 1);
+        assert_eq!(scheduler.task_metrics(), (1, 1));
+
+        release_tx.send(()).expect("release active task");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while counter.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(counter.load(Ordering::Acquire), 1);
     }
 
     #[test]

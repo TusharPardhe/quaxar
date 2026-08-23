@@ -1,9 +1,10 @@
 [package]
-name = "xrpld-metrics"
+name = "quaxar-metrics"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Prometheus metrics for the XRPL Rust node"
+description = "Prometheus metrics for the Quaxar XRP Ledger node"
+publish = false
 
 [dependencies]
 metrics = "0.24"

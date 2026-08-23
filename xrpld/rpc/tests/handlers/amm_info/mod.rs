@@ -160,6 +160,7 @@ pub(super) fn make_trust_line(
     account: AccountID,
     peer: AccountID,
     currency: Currency,
+    balance: i64,
     freeze_flag: u32,
 ) -> STLedgerEntry {
     let (low, high) = if account < peer {
@@ -168,16 +169,17 @@ pub(super) fn make_trust_line(
         (peer, account)
     };
     let mut sle = STLedgerEntry::new(line(low, high, currency));
-    sle.set_field_amount(
+    let mut line_balance = STAmount::new_with_asset(
         get_field_by_symbol("sfBalance"),
-        STAmount::new_with_asset(
-            get_field_by_symbol("sfBalance"),
-            Issue::new(currency, low),
-            500,
-            0,
-            false,
-        ),
+        Issue::new(currency, low),
+        balance.unsigned_abs(),
+        0,
+        false,
     );
+    if balance < 0 {
+        line_balance.negate();
+    }
+    sle.set_field_amount(get_field_by_symbol("sfBalance"), line_balance);
     sle.set_field_amount(
         get_field_by_symbol("sfLowLimit"),
         STAmount::new_with_asset(

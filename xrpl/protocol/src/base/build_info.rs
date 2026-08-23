@@ -60,6 +60,9 @@ pub fn get_encoded_version() -> u64 {
     encode_software_version(get_version_string())
 }
 
+/// Return whether an encoded software version carries XRPL's `xrpld`
+/// implementation-family marker (`0x183B`). This name is a wire-compatibility
+/// term from `rippled::BuildInfo`, not Quaxar's product identity.
 pub fn is_xrpld_version(version: u64) -> bool {
     (version & IMPLEMENTATION_VERSION_IDENTIFIER_MASK) == IMPLEMENTATION_VERSION_IDENTIFIER
 }

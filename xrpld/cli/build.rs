@@ -8,7 +8,7 @@ fn main() {
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=XRPLD_GIT_COMMIT={}", commit.trim());
+    println!("cargo:rustc-env=QUAXAR_GIT_COMMIT={}", commit.trim());
 
     // Rustc version
     let rustc = Command::new("rustc")
@@ -17,7 +17,7 @@ fn main() {
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=XRPLD_RUSTC_VERSION={}", rustc.trim());
+    println!("cargo:rustc-env=QUAXAR_RUSTC_VERSION={}", rustc.trim());
 
     // Build date
     let date = Command::new("date")
@@ -26,7 +26,7 @@ fn main() {
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=XRPLD_BUILD_DATE={}", date.trim());
+    println!("cargo:rustc-env=QUAXAR_BUILD_DATE={}", date.trim());
 
     // Target triple
     println!(

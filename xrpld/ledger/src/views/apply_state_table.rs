@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use basics::base_uint::Uint256;
-use protocol::{Keylet, Rules, STLedgerEntry, XRPAmount};
+use basics::base_uint::{Uint160, Uint256};
+use protocol::{
+    Keylet, LedgerEntryType, Rules, STLedgerEntry, XRPAmount, account_keylet, get_field_by_symbol,
+};
 
-use crate::raw_view::RawView;
+use crate::raw_view::{RawView, ReadRawView};
 use crate::read_view::{ReadView, ViewError};
 
 fn invariant_error(message: &str) -> ViewError {
@@ -27,7 +29,7 @@ pub struct StateEntry {
     pub sle: Arc<STLedgerEntry>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApplyStateTable {
     items: BTreeMap<Uint256, StateEntry>,
     drops_destroyed: XRPAmount,
@@ -356,8 +358,7 @@ impl ApplyStateTable {
         // Collect all state map operations into a batch to apply using a single
         // MutableTree. This prevents MissingNode errors when sequential mutations
         // create new inner nodes that subsequent mutations can't find in NuDB.
-        let mut batch_ops: Vec<(crate::StateBatchOp, basics::base_uint::Uint256, Vec<u8>)> =
-            Vec::new();
+        let mut batch_ops: Vec<(crate::StateBatchOp, Arc<STLedgerEntry>)> = Vec::new();
 
         for (key, entry) in &self.items {
             match entry.action {
@@ -369,7 +370,7 @@ impl ApplyStateTable {
                         key.data()[3],
                         entry.sle.get_type(),
                     );
-                    batch_ops.push((crate::StateBatchOp::Delete, *key, Vec::new()));
+                    batch_ops.push((crate::StateBatchOp::Delete, Arc::clone(&entry.sle)));
                 }
                 Action::Insert => {
                     tracing::debug!(target: "ledger",                        "[sandbox_apply] INSERT key={:02x}{:02x}{:02x}{:02x} sle_type={:?}",
@@ -379,8 +380,7 @@ impl ApplyStateTable {
                         key.data()[3],
                         entry.sle.get_type(),
                     );
-                    let payload = entry.sle.get_serializer().data().to_vec();
-                    batch_ops.push((crate::StateBatchOp::Insert, *key, payload));
+                    batch_ops.push((crate::StateBatchOp::Insert, Arc::clone(&entry.sle)));
                 }
                 Action::Modify => {
                     tracing::debug!(target: "ledger",                        "[sandbox_apply] MODIFY key={:02x}{:02x}{:02x}{:02x} sle_type={:?}",
@@ -390,15 +390,14 @@ impl ApplyStateTable {
                         key.data()[3],
                         entry.sle.get_type(),
                     );
-                    let payload = entry.sle.get_serializer().data().to_vec();
-                    batch_ops.push((crate::StateBatchOp::Update, *key, payload));
+                    batch_ops.push((crate::StateBatchOp::Update, Arc::clone(&entry.sle)));
                 }
                 Action::Cache => {}
             }
         }
 
         // Apply all state map operations in a single MutableTree session
-        to.raw_apply_batch(&batch_ops)?;
+        to.raw_apply_sle_batch(&batch_ops)?;
 
         if self.drops_destroyed.drops() != 0 {
             tracing::debug!(target: "ledger",                "[sandbox_apply] DESTROY_XRP drops={}",
@@ -417,26 +416,34 @@ impl ApplyStateTable {
     /// `sfPreviousTxnLgrSeq` into the SLE that is later raw-applied.
     pub fn apply_with_tx_thread(
         &self,
-        to: &mut dyn RawView,
+        to: &mut dyn ReadRawView,
         tx_id: basics::base_uint::Uint256,
         ledger_seq: u32,
         rules: &Rules,
     ) -> Result<(), ViewError> {
-        let mut batch_ops: Vec<(crate::StateBatchOp, basics::base_uint::Uint256, Vec<u8>)> =
-            Vec::new();
+        let mut batch_ops: Vec<(crate::StateBatchOp, Arc<STLedgerEntry>)> = Vec::new();
+        // Matches rippled's `threadOwners` / `getForMod` path for deleted
+        // RippleState SLEs. AccountRoots already Inserted or Modified by the
+        // transaction are threaded through their normal payload, while cached
+        // or untouched owners receive a supplemental Modify below.
+        let mut owner_threads: BTreeMap<Uint256, Arc<STLedgerEntry>> = BTreeMap::new();
 
         for (key, entry) in &self.items {
             match entry.action {
                 Action::Erase => {
-                    batch_ops.push((crate::StateBatchOp::Delete, *key, Vec::new()));
+                    batch_ops.push((crate::StateBatchOp::Delete, Arc::clone(&entry.sle)));
+                    self.collect_erased_ripple_state_owner_threads(
+                        to,
+                        entry.sle.as_ref(),
+                        &mut owner_threads,
+                    )?;
                 }
-                Action::Insert | Action::Modify => {
-                    let payload = threaded_payload(entry.sle.as_ref(), tx_id, ledger_seq, rules);
-                    let op = if entry.action == Action::Insert {
-                        crate::StateBatchOp::Insert
-                    } else {
-                        crate::StateBatchOp::Update
-                    };
+                Action::Insert => {
+                    let threaded =
+                        Arc::new(thread_sle(entry.sle.as_ref(), tx_id, ledger_seq, rules));
+                    let serializer = threaded.get_serializer();
+                    let payload = serializer.data();
+                    let op = crate::StateBatchOp::Insert;
                     if crate::full_sync_debug_enabled() {
                         tracing::debug!(target: "ledger",                            "[full_debug][tx_thread_payload] ledger_seq={} txid={} op={:?} key={} type={:?} bytes={} first16={} hex={}",
                             ledger_seq,
@@ -458,16 +465,112 @@ impl ApplyStateTable {
                                 .join("")
                         );
                     }
-                    batch_ops.push((op, *key, payload));
+                    batch_ops.push((op, threaded));
+                }
+                Action::Modify => {
+                    let original = to
+                        .read(Keylet::new(entry.sle.get_type(), *key))?
+                        .ok_or_else(|| {
+                            invariant_error(
+                                "ApplyStateTable::apply_with_tx_thread: modified entry disappeared",
+                            )
+                        })?;
+                    // ApplyStateTable.cpp skips unchanged ModifiedNodes before
+                    // threadItem. Threading a no-op would mutate only the
+                    // PreviousTxn fields and create a deterministic fork.
+                    if entry.sle.as_ref() == original.as_ref() {
+                        continue;
+                    }
+                    let threaded =
+                        Arc::new(thread_sle(entry.sle.as_ref(), tx_id, ledger_seq, rules));
+                    batch_ops.push((crate::StateBatchOp::Update, threaded));
                 }
                 Action::Cache => {}
             }
         }
 
-        to.raw_apply_batch(&batch_ops)?;
+        to.raw_apply_sle_batch(&batch_ops)?;
+
+        // rippled applies `newMod` after the transaction's regular state
+        // changes. Keep the same ordering so these thread-only AccountRoot
+        // updates cannot overwrite material modifications.
+        let owner_thread_ops = owner_threads
+            .into_values()
+            .map(|sle| {
+                (
+                    crate::StateBatchOp::Update,
+                    Arc::new(thread_sle(sle.as_ref(), tx_id, ledger_seq, rules)),
+                )
+            })
+            .collect::<Vec<_>>();
+        to.raw_apply_sle_batch(&owner_thread_ops)?;
         to.raw_destroy_xrp(self.drops_destroyed)?;
         Ok(())
     }
+
+    fn collect_erased_ripple_state_owner_threads(
+        &self,
+        to: &dyn ReadRawView,
+        erased: &STLedgerEntry,
+        owner_threads: &mut BTreeMap<Uint256, Arc<STLedgerEntry>>,
+    ) -> Result<(), ViewError> {
+        if erased.get_type() != LedgerEntryType::RippleState {
+            return Ok(());
+        }
+
+        for owner in [
+            erased
+                .get_field_amount(get_field_by_symbol("sfLowLimit"))
+                .issue()
+                .issuer(),
+            erased
+                .get_field_amount(get_field_by_symbol("sfHighLimit"))
+                .issue()
+                .issuer(),
+        ] {
+            let keylet = account_keylet(Uint160::from_void(owner.data()));
+            if owner_threads.contains_key(&keylet.key) {
+                continue;
+            }
+
+            let owner_sle = match self.items.get(&keylet.key) {
+                // Inserts and material AccountRoot modifications are threaded
+                // by the regular path. An unchanged Modify is skipped there,
+                // but rippled's later threadOwners/getForMod pass still
+                // threads that same owner entry.
+                Some(StateEntry {
+                    action: Action::Insert,
+                    ..
+                }) => continue,
+                Some(StateEntry {
+                    action: Action::Modify,
+                    sle,
+                }) => match to.read(keylet)? {
+                    Some(original) if original.as_ref() == sle.as_ref() => Some(sle.clone()),
+                    _ => continue,
+                },
+                // A deleted owner cannot be threaded.
+                Some(StateEntry {
+                    action: Action::Erase,
+                    ..
+                }) => continue,
+                // A cache is a read-only checkout; thread a supplemental copy.
+                Some(StateEntry {
+                    action: Action::Cache,
+                    sle,
+                }) => Some(sle.clone()),
+                // The untouched current destination view is the equivalent of
+                // rippled's `getForMod(base, ...)` lookup.
+                None => to.read(keylet)?,
+            };
+
+            if let Some(owner_sle) = owner_sle {
+                owner_threads.insert(keylet.key, owner_sle);
+            }
+        }
+        Ok(())
+    }
+
     /// Construct canonical transaction metadata from the state changes captured
     /// while applying a transaction to this view. The payload is intentionally
     /// derived from the same typed SLEs used for the dry run so JSON and binary
@@ -508,24 +611,205 @@ impl ApplyStateTable {
     }
 }
 
-fn threaded_payload(
+pub(crate) fn thread_sle(
     sle: &STLedgerEntry,
     tx_id: basics::base_uint::Uint256,
     ledger_seq: u32,
     rules: &Rules,
-) -> Vec<u8> {
-    if !sle.is_threaded_type(rules) {
-        return sle.get_serializer().data().to_vec();
+) -> STLedgerEntry {
+    let mut threaded = sle.clone();
+    if threaded.get_type() == LedgerEntryType::AccountRoot
+        && !threaded.is_field_present(get_field_by_symbol("sfOwnerCount"))
+    {
+        // rippled serializes AccountRoot's required owner count even when it
+        // is zero. This is a serialization invariant, independent of whether
+        // the entry is threaded by the current transaction.
+        let mut object = threaded.clone_as_object();
+        object.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
+        threaded = STLedgerEntry::from_stobject(object, *threaded.key());
     }
 
-    let mut threaded = sle.clone();
-    let mut previous_txn_id = basics::base_uint::Uint256::zero();
-    let mut previous_ledger_seq = 0;
-    let _ = threaded.thread(
-        tx_id,
-        ledger_seq,
-        &mut previous_txn_id,
-        &mut previous_ledger_seq,
-    );
-    threaded.get_serializer().data().to_vec()
+    if threaded.is_threaded_type(rules) {
+        let mut previous_txn_id = basics::base_uint::Uint256::zero();
+        let mut previous_ledger_seq = 0;
+        let _ = threaded.thread(
+            tx_id,
+            ledger_seq,
+            &mut previous_txn_id,
+            &mut previous_ledger_seq,
+        );
+    }
+    threaded
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use basics::base_uint::Uint256;
+    use protocol::{Keylet, LedgerEntryType, STLedgerEntry, XRPAmount};
+
+    use super::{Action, ApplyStateTable, StateEntry};
+    use crate::Ledger;
+    use crate::raw_view::RawView;
+    use crate::read_view::ViewError;
+    use crate::{Fees, LedgerHeader, ReadView, ReadViewTx, Rules};
+
+    #[derive(Debug, Default)]
+    struct RecordingRawView {
+        erased_types: Vec<LedgerEntryType>,
+    }
+
+    impl ReadView for RecordingRawView {
+        fn open(&self) -> bool {
+            false
+        }
+
+        fn header(&self) -> LedgerHeader {
+            LedgerHeader::default()
+        }
+
+        fn fees(&self) -> Fees {
+            Fees::default()
+        }
+
+        fn rules(&self) -> Rules {
+            Rules::default()
+        }
+
+        fn exists(&self, _keylet: Keylet) -> Result<bool, ViewError> {
+            Ok(false)
+        }
+
+        fn succ(
+            &self,
+            _key: Uint256,
+            _last: Option<Uint256>,
+        ) -> Result<Option<Uint256>, ViewError> {
+            Ok(None)
+        }
+
+        fn read(&self, _keylet: Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
+            Ok(None)
+        }
+
+        fn sles(&self) -> Result<Vec<Arc<STLedgerEntry>>, ViewError> {
+            Ok(Vec::new())
+        }
+
+        fn tx_exists(&self, _key: Uint256) -> Result<bool, ViewError> {
+            Ok(false)
+        }
+
+        fn tx_read(&self, _key: Uint256) -> Result<Option<ReadViewTx>, ViewError> {
+            Ok(None)
+        }
+
+        fn txs(&self) -> Result<Vec<ReadViewTx>, ViewError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl RawView for RecordingRawView {
+        fn raw_erase(&mut self, sle: Arc<STLedgerEntry>) -> Result<(), ViewError> {
+            self.erased_types.push(sle.get_type());
+            Ok(())
+        }
+
+        fn raw_insert(&mut self, _sle: Arc<STLedgerEntry>) -> Result<(), ViewError> {
+            unreachable!("erase-only regression")
+        }
+
+        fn raw_replace(&mut self, _sle: Arc<STLedgerEntry>) -> Result<(), ViewError> {
+            unreachable!("erase-only regression")
+        }
+
+        fn raw_destroy_xrp(&mut self, _fee: XRPAmount) -> Result<(), ViewError> {
+            Ok(())
+        }
+    }
+
+    fn table_with_erased_offer(key: Uint256) -> ApplyStateTable {
+        let mut table = ApplyStateTable::new();
+        table.items.insert(
+            key,
+            StateEntry {
+                action: Action::Erase,
+                sle: Arc::new(STLedgerEntry::from_type_and_key(
+                    LedgerEntryType::Offer,
+                    key,
+                )),
+            },
+        );
+        table
+    }
+
+    #[test]
+    fn erase_batch_preserves_sle_type_through_generic_raw_view() {
+        let key = Uint256::from_array([0xA5; 32]);
+        let table = table_with_erased_offer(key);
+        let mut view = RecordingRawView::default();
+
+        table
+            .apply(&mut view)
+            .expect("normal erase batch should apply through generic RawView");
+
+        assert_eq!(view.erased_types, vec![LedgerEntryType::Offer]);
+    }
+
+    #[test]
+    fn threaded_erase_batch_preserves_sle_type_through_generic_raw_view() {
+        let key = Uint256::from_array([0x5A; 32]);
+        let table = table_with_erased_offer(key);
+        let mut view = RecordingRawView::default();
+
+        table
+            .apply_with_tx_thread(
+                &mut view,
+                Uint256::from_array([0x3C; 32]),
+                1,
+                &Rules::default(),
+            )
+            .expect("threaded erase batch should apply through generic RawView");
+
+        assert_eq!(view.erased_types, vec![LedgerEntryType::Offer]);
+    }
+
+    #[test]
+    fn threaded_apply_skips_unchanged_modify() {
+        let keylet = Keylet::new(LedgerEntryType::RippleState, Uint256::from_u64(0x51));
+        let mut original = STLedgerEntry::new(keylet);
+        original.set_field_h256(
+            protocol::get_field_by_symbol("sfPreviousTxnID"),
+            Uint256::from_u64(0x347A),
+        );
+        original.set_field_u32(protocol::get_field_by_symbol("sfPreviousTxnLgrSeq"), 41);
+
+        let mut target = Ledger::new(LedgerHeader::default(), false);
+        target
+            .raw_insert(Arc::new(original.clone()))
+            .expect("seed unchanged trust line");
+        let mut table = ApplyStateTable::new();
+        table
+            .replace(&target, Arc::new(original.clone()))
+            .expect("stage redundant modification");
+
+        table
+            .apply_with_tx_thread(
+                &mut target,
+                Uint256::from_u64(0xA5EA),
+                42,
+                &Rules::default(),
+            )
+            .expect("unchanged modification should be ignored");
+
+        let retained = ReadView::read(&target, keylet)
+            .expect("read trust line")
+            .expect("trust line remains");
+        assert_eq!(
+            retained.as_ref(),
+            &original,
+            "a no-op modification must retain its prior transaction thread"
+        );
+    }
 }

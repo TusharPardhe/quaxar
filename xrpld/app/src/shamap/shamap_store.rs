@@ -168,6 +168,30 @@ impl SHAMapStore {
         self.runtime.note_rotation_boundary(last_rotated);
     }
 
+    /// Detach the current queued ledger into a private worker snapshot.
+    ///
+    /// The component's producer path only needs to replace the newest queued
+    /// ledger and wake its worker. It must not wait behind an online-delete
+    /// copy or health wait running for an older ledger. The returned snapshot
+    /// owns the dequeued work; the shared store remains available for a newer
+    /// notification while that work runs.
+    pub fn take_worker_snapshot(&mut self) -> Option<Self> {
+        let ledger = self.runtime.queued_ledger.take()?;
+        let mut worker = self.clone();
+        worker.runtime.queued_ledger = Some(ledger);
+        Some(worker)
+    }
+
+    /// Merge maintenance metadata from a completed worker snapshot without
+    /// overwriting a ledger queued while that snapshot was in flight.
+    pub fn merge_worker_state(&mut self, worker: &Self) {
+        self.runtime.minimum_online = worker.runtime.minimum_online;
+        self.runtime.saved_state = worker.runtime.saved_state.clone();
+        if self.runtime.queued_ledger.is_none() {
+            self.runtime.working = worker.runtime.working;
+        }
+    }
+
     pub fn minimum_online<R>(&self, runtime: &R) -> Option<u32>
     where
         R: SHAMapStoreRuntime + ?Sized,
@@ -296,6 +320,28 @@ mod tests {
 
         store.finish_rendezvous();
         assert!(store.rendezvous());
+    }
+
+    #[test]
+    fn worker_snapshot_preserves_a_newer_queued_ledger() {
+        let mut store = SHAMapStore::new(256, false, 0);
+        let first = Arc::new(Ledger::from_ledger_seq_and_close_time(900, 0, false));
+        let second = Arc::new(Ledger::from_ledger_seq_and_close_time(901, 0, false));
+
+        store.on_ledger_closed(first);
+        let mut worker = store
+            .take_worker_snapshot()
+            .expect("first ledger should become worker-owned");
+        assert_eq!(store.queued_ledger_seq(), None);
+        assert!(!store.rendezvous(), "worker is still in flight");
+
+        store.on_ledger_closed(Arc::clone(&second));
+        worker.finish_rendezvous();
+        worker.note_rotation_boundary(900);
+        store.merge_worker_state(&worker);
+
+        assert_eq!(store.queued_ledger_seq(), Some(second.header().seq));
+        assert!(!store.rendezvous(), "newer queued ledger remains in flight");
     }
 
     #[test]

@@ -155,6 +155,74 @@ fn replay_task_parameter_update_and_merge_match_cpp() {
 }
 
 #[test]
+fn replayer_initializes_new_skip_list_without_bypassing_no_feature_fallback() {
+    // `LedgerReplayer.cpp::replay` initializes the new SkipListAcquire, but
+    // `SkipListAcquire.cpp::trigger` owns normal inbound fallback. A local
+    // miss alone must not bypass its replay-peer/no-feature timer policy.
+    let finish_hash = Uint256::from_array([0xE1; 32]);
+    let mut replayer = LedgerReplayer::new(Arc::new(SimplePeerSetBuilder::new(Vec::new())));
+    let fallback = std::cell::RefCell::new(Vec::new());
+
+    let task = replayer
+        .replay_and_init(
+            InboundLedgerReason::Generic,
+            finish_hash,
+            1,
+            1,
+            |_| None,
+            |hash, seq, reason| fallback.borrow_mut().push((hash, seq, reason)),
+        )
+        .expect("new replay task should be accepted and initialized");
+
+    assert_eq!(replayer.tasks_len(), 1);
+    assert_eq!(replayer.skip_lists_len(), 1);
+    assert!(!task.lock().expect("task lock").parameter().full);
+    assert!(
+        fallback.into_inner().is_empty(),
+        "the initial skip-list trigger must leave fallback to SkipListAcquire's no-feature timer path"
+    );
+}
+
+#[test]
+fn replayer_consumes_locally_available_skip_list_before_waiting_for_overlay() {
+    // Parity: ../rippled/src/xrpld/app/ledger/detail/LedgerReplayer.cpp::
+    // replay calls skipList->init(1), then LedgerReplayTask::init consumes a
+    // synchronous completion through its data callback before timer-driven
+    // overlay work begins.
+    let cfg = config();
+    let parent = Arc::new(Ledger::create_genesis(false, &cfg, []).expect("genesis should build"));
+    let mut finish = Ledger::from_previous(parent.as_ref(), 10);
+    finish.update_skip_list().expect("skip list should update");
+    let finish = Arc::new(finish);
+    let finish_hash = *finish.header().hash.as_uint256();
+
+    let mut replayer = LedgerReplayer::new(Arc::new(SimplePeerSetBuilder::new(Vec::new())));
+    let fallback = std::cell::RefCell::new(Vec::new());
+    let task = replayer
+        .replay_and_init(
+            InboundLedgerReason::Generic,
+            finish_hash,
+            2,
+            1,
+            |hash| {
+                if hash == finish_hash {
+                    Some(Arc::clone(&finish))
+                } else if hash == *parent.header().hash.as_uint256() {
+                    Some(Arc::clone(&parent))
+                } else {
+                    None
+                }
+            },
+            |hash, seq, reason| fallback.borrow_mut().push((hash, seq, reason)),
+        )
+        .expect("local replay task should initialize");
+
+    assert!(task.lock().expect("task lock").parameter().full);
+    assert_eq!(replayer.deltas_len(), 1);
+    assert!(fallback.into_inner().is_empty());
+}
+
+#[test]
 fn replayer_reuses_skip_lists_and_creates_delta_slots() {
     let cfg = config();
     let genesis = Ledger::create_genesis(false, &cfg, []).expect("genesis should build");
@@ -173,7 +241,26 @@ fn replayer_reuses_skip_lists_and_creates_delta_slots() {
         .replay(InboundLedgerReason::Generic, finish_hash, 2)
         .expect("new replay task should be accepted");
 
-    replayer.got_skip_list(finish.header(), &skip_item);
+    let lookup_hashes = std::cell::RefCell::new(Vec::new());
+    // `LedgerReplayer::createDeltas` in
+    // ../rippled/src/xrpld/app/ledger/detail/LedgerReplayer.cpp initializes
+    // each new delta immediately. The async skip-list callback must trigger
+    // the same parent and delta acquire paths, not a no-op placeholder.
+    replayer.got_skip_list(
+        finish.header(),
+        &skip_item,
+        1,
+        |hash| {
+            lookup_hashes.borrow_mut().push(hash);
+            None
+        },
+        |_, _, _| {},
+    );
+
+    assert!(
+        lookup_hashes.borrow().contains(&finish_hash),
+        "the newly created delta must run its init trigger immediately"
+    );
 
     assert_eq!(replayer.tasks_len(), 1);
     assert_eq!(replayer.skip_lists_len(), 1);
@@ -183,6 +270,42 @@ fn replayer_reuses_skip_lists_and_creates_delta_slots() {
         replayer
             .replay(InboundLedgerReason::Generic, finish_hash, 1)
             .is_none()
+    );
+}
+
+#[test]
+fn replayer_routes_a_publication_gap_once_and_rejects_it_after_shutdown() {
+    // Parity: ../rippled/src/xrpld/app/ledger/detail/LedgerMaster.cpp::
+    // findNewLedgersToPublish routes an unrecoverable publication gap to
+    // LedgerReplayer::replay(InboundLedger::Reason::GENERIC, finishHash, count).
+    // LedgerReplayer.cpp::LedgerReplayer::replay then merges a nested request
+    // and rejects new work while the application is stopping.
+    let cfg = config();
+    let genesis = Ledger::create_genesis(false, &cfg, []).expect("genesis should build");
+    let mut finish = Ledger::from_previous(&genesis, 10);
+    finish.update_skip_list().expect("skip list should update");
+    let finish_hash = *finish.header().hash.as_uint256();
+    let mut replayer = LedgerReplayer::new(Arc::new(SimplePeerSetBuilder::new(Vec::new())));
+
+    let first = replayer
+        .replay(InboundLedgerReason::Generic, finish_hash, 2)
+        .expect("the publication gap should create one replay task");
+    assert_eq!(replayer.tasks_len(), 1);
+    assert!(
+        replayer
+            .replay(InboundLedgerReason::Generic, finish_hash, 1)
+            .is_none(),
+        "a nested gap must merge into the active task instead of duplicating acquisition"
+    );
+
+    replayer.stop();
+
+    assert!(first.lock().expect("task lock").is_stopped());
+    assert!(
+        replayer
+            .replay(InboundLedgerReason::Generic, finish_hash, 2)
+            .is_none(),
+        "publication advancement must not create replay work after shutdown begins"
     );
 }
 

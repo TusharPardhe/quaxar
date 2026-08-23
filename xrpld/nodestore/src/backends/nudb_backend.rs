@@ -8,6 +8,8 @@ use basics::basic_config::Section;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use std::any::Any;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -30,9 +32,24 @@ pub const NUDB_DATA_FILE_HEADER_SIZE: usize = 92;
 /// Max buckets to keep in the in-memory bucket cache.
 /// Each bucket is ~4KB; 4096 entries = ~16MB. Prevents OOM on large NuDB.
 const MAX_BUCKET_CACHE_ENTRIES: usize = 4096;
+/// Bound synchronous c0/c1 commits until the native NuDB asynchronous writer
+/// pool is implemented. The configured 40,000 burst is a rate/burst hint in
+/// reference NuDB, not permission to hold the foreground mutation fence while
+/// logging and flushing 40,000 objects at once.
+const MAX_SYNCHRONOUS_BURST_WRITES: usize = 1024;
 
+#[cfg(test)]
 fn evict_one_cached_bucket<V>(bucket_cache: &DashMap<u32, V>) {
     let evict_key = bucket_cache.iter().next().map(|entry| *entry.key());
+    if let Some(evict_key) = evict_key {
+        bucket_cache.remove(&evict_key);
+    }
+}
+
+fn evict_one_clean_cached_bucket(bucket_cache: &DashMap<u32, CachedBucket>) {
+    let evict_key = bucket_cache
+        .iter()
+        .find_map(|entry| (!entry.value().dirty).then(|| *entry.key()));
     if let Some(evict_key) = evict_key {
         bucket_cache.remove(&evict_key);
     }
@@ -45,6 +62,87 @@ const NUDB_BUCKET_SPILL_SIZE: usize = 6;
 const NUDB_BUCKET_ENTRY_SIZE: usize = 18;
 const NUDB_SPILL_RECORD_HEADER_SIZE: usize = 8;
 const NUDB_U48_MAX: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum NuDbTestCrashPoint {
+    PrimaryBucket,
+    Split,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum NuDbTestBatchErrorPoint {
+    AfterAppend,
+    IndexInsert(usize),
+}
+
+#[cfg(test)]
+thread_local! {
+    static NUDB_TEST_CRASH_AFTER_PRIMARY_BUCKET: Cell<bool> = const { Cell::new(false) };
+    static NUDB_TEST_CRASH_AFTER_SPLIT: Cell<bool> = const { Cell::new(false) };
+    static NUDB_TEST_BATCH_ERROR_AFTER_APPEND: Cell<bool> = const { Cell::new(false) };
+    static NUDB_TEST_BATCH_ERROR_INDEX_INSERT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_nudb_test_batch_error(point: NuDbTestBatchErrorPoint) {
+    match point {
+        NuDbTestBatchErrorPoint::AfterAppend => {
+            NUDB_TEST_BATCH_ERROR_AFTER_APPEND.with(|flag| flag.set(true));
+        }
+        NuDbTestBatchErrorPoint::IndexInsert(index) => {
+            NUDB_TEST_BATCH_ERROR_INDEX_INSERT.with(|value| value.set(Some(index)));
+        }
+    }
+}
+
+#[cfg(test)]
+fn nudb_test_batch_error_after_append() -> Result<(), String> {
+    if NUDB_TEST_BATCH_ERROR_AFTER_APPEND.with(|flag| flag.replace(false)) {
+        Err("injected checked-batch failure after coalesced append".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn nudb_test_batch_error_before_index_insert(index: usize) -> Result<(), String> {
+    let requested = NUDB_TEST_BATCH_ERROR_INDEX_INSERT.with(|value| value.get());
+    if requested == Some(index) {
+        NUDB_TEST_BATCH_ERROR_INDEX_INSERT.with(|value| value.set(None));
+        Err(format!(
+            "injected checked-batch failure during index insert {index}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn set_nudb_test_crash(point: NuDbTestCrashPoint) {
+    match point {
+        NuDbTestCrashPoint::PrimaryBucket => {
+            NUDB_TEST_CRASH_AFTER_PRIMARY_BUCKET.with(|flag| flag.set(true));
+        }
+        NuDbTestCrashPoint::Split => {
+            NUDB_TEST_CRASH_AFTER_SPLIT.with(|flag| flag.set(true));
+        }
+    }
+}
+
+#[cfg(test)]
+fn nudb_test_crash_if_requested(point: NuDbTestCrashPoint, description: &str) {
+    let requested = match point {
+        NuDbTestCrashPoint::PrimaryBucket => {
+            NUDB_TEST_CRASH_AFTER_PRIMARY_BUCKET.with(|flag| flag.replace(false))
+        }
+        NuDbTestCrashPoint::Split => NUDB_TEST_CRASH_AFTER_SPLIT.with(|flag| flag.replace(false)),
+    };
+    if requested {
+        panic!("NuDB test crash after {description}");
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NuDbFileSetState {
@@ -103,7 +201,9 @@ impl NuDbOpenArgs {
         }
     }
 
-    pub const fn xrpld_default(uid: u64, salt: u64) -> Self {
+    /// Use Quaxar's NuDB application number. The value is intentionally kept
+    /// compatible with existing rippled/Quaxar databases.
+    pub const fn quaxar_default(uid: u64, salt: u64) -> Self {
         Self::deterministic(NUDB_APPNUM, uid, salt)
     }
 }
@@ -483,7 +583,7 @@ impl NuDbOpenState {
         if self.header.appnum != expected_appnum {
             return Err("nodestore: unknown appnum".to_owned());
         }
-        self.header.validate_for_xrpld()?;
+        self.header.validate_for_quaxar()?;
         self.is_open = true;
         Ok(())
     }
@@ -514,7 +614,7 @@ impl NuDbMetadataHeader {
         }
     }
 
-    pub fn validate_for_xrpld(&self) -> Result<(), String> {
+    pub fn validate_for_quaxar(&self) -> Result<(), String> {
         if self.appnum != NUDB_APPNUM {
             return Err("nodestore: unknown appnum".to_owned());
         }
@@ -655,6 +755,21 @@ struct NuDbBackendRuntime {
     split_threshold: u64,
     burst_pending_writes: usize,
     burst_checkpoint_active: bool,
+    fail_stop_error: Option<String>,
+}
+
+/// Original key buckets touched by the active burst.
+///
+/// NuDB's recovery log contains the pre-mutation version of only the buckets
+/// changed by a commit (its `c0` cache), not a snapshot of the complete key
+/// file. `store_mutex` serializes all mutation of this map; the separate mutex
+/// exists because split processing already holds `runtime` while updating key
+/// buckets.
+#[derive(Default)]
+struct NuDbBurstOriginals {
+    active: bool,
+    original_bucket_count: u32,
+    buckets: BTreeMap<u32, NuDbBucket>,
 }
 
 impl NuDbBackendRuntime {
@@ -666,6 +781,7 @@ impl NuDbBackendRuntime {
             split_threshold: 0,
             burst_pending_writes: 0,
             burst_checkpoint_active: false,
+            fail_stop_error: None,
         }
     }
 }
@@ -685,6 +801,7 @@ pub struct NuDbMetrics {
     pub burst_checkpoint_ns: AtomicU64,
     pub burst_flush_ns: AtomicU64,
     pub burst_sync_ns: AtomicU64,
+    pub burst_commit_count: AtomicUsize,
 }
 
 struct StoreLockTiming<'a> {
@@ -728,6 +845,7 @@ pub struct NuDbBackend {
     /// avoid pread calls; only bulk-import entries remain dirty for a later
     /// write-back flush.
     bucket_cache: DashMap<u32, CachedBucket>,
+    burst_originals: Mutex<NuDbBurstOriginals>,
     /// Track data/key file sizes in memory to avoid fstat() syscalls.
     data_file_size: AtomicU64,
     key_file_size: AtomicU64,
@@ -796,7 +914,7 @@ impl NuDbBackend {
         let config =
             NuDbBackendConfig::from_section(key_bytes, parameters, burst_size, journal.as_ref())?;
         let initial_header = config.metadata_header(
-            default_open_args.unwrap_or_else(|| NuDbOpenArgs::xrpld_default(0, 0)),
+            default_open_args.unwrap_or_else(|| NuDbOpenArgs::quaxar_default(0, 0)),
         );
         Ok(Self {
             config,
@@ -807,6 +925,7 @@ impl NuDbBackend {
             default_open_args,
             persistent_fds: ArcSwapOption::empty(),
             bucket_cache: DashMap::new(),
+            burst_originals: Mutex::new(NuDbBurstOriginals::default()),
             data_file_size: AtomicU64::new(0),
             key_file_size: AtomicU64::new(0),
             bulk_importing: AtomicBool::new(false),
@@ -950,7 +1069,7 @@ impl NuDbBackend {
         let pid = u64::from(std::process::id());
         let uid = now_nanos ^ counter.rotate_left(17) ^ (pid << 32);
         let salt = now_nanos.rotate_left(7) ^ counter.rotate_left(29) ^ pid;
-        NuDbOpenArgs::xrpld_default(uid.max(1), salt.max(1))
+        NuDbOpenArgs::quaxar_default(uid.max(1), salt.max(1))
     }
 
     fn create_file_set(&self, plan: &NuDbOpenPlan) -> Result<NuDbKeyFileHeader, String> {
@@ -965,9 +1084,6 @@ impl NuDbBackend {
             fs::File::create(&plan.layout.key_path).map_err(|error| error.to_string())?;
         key_file
             .write_all(&key_bytes)
-            .map_err(|error| error.to_string())?;
-        key_file
-            .write_all(&vec![0u8; usize::from(key_header.block_size)])
             .map_err(|error| error.to_string())?;
         key_file.flush().map_err(|error| error.to_string())?;
         fs::File::create(&plan.layout.log_path).map_err(|error| error.to_string())?;
@@ -1028,12 +1144,30 @@ impl NuDbBackend {
             .map_err(|error| error.to_string())?;
         file.write_all(&header_bytes)
             .map_err(|error| error.to_string())?;
-        for bucket_index in 0..key_header.buckets {
-            let bucket = self.read_key_bucket(bucket_index)?;
-            let compact = bucket.encode_compact()?;
-            file.write_all(&u64::from(bucket_index).to_be_bytes())
+        file.flush().map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())
+    }
+
+    /// Append the pre-burst versions of the buckets that will be overwritten.
+    /// The header checkpoint is already durable before any data/key-file
+    /// growth. These records are made durable immediately before dirty buckets
+    /// are flushed, preserving NuDB's c0 -> log -> c1 ordering.
+    fn append_burst_originals_to_log(&self) -> Result<(), String> {
+        let originals = self
+            .burst_originals
+            .lock()
+            .expect("nudb burst originals mutex must not be poisoned");
+        if originals.buckets.is_empty() {
+            return Ok(());
+        }
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&self.config.layout.log_path)
+            .map_err(|error| error.to_string())?;
+        for (bucket_index, bucket) in &originals.buckets {
+            file.write_all(&u64::from(*bucket_index).to_be_bytes())
                 .map_err(|error| error.to_string())?;
-            file.write_all(&compact)
+            file.write_all(&bucket.encode_compact()?)
                 .map_err(|error| error.to_string())?;
         }
         file.flush().map_err(|error| error.to_string())?;
@@ -1067,12 +1201,9 @@ impl NuDbBackend {
             .map_err(|error| error.to_string())?;
 
         let mut offset = NUDB_LOG_FILE_HEADER_SIZE as u64;
-        let mut max_replayed_bucket_index = None::<u32>;
-        let mut replay_complete = true;
         while offset < log_size {
             let remaining = log_size - offset;
             if remaining < 8 {
-                replay_complete = false;
                 break;
             }
             let bucket_index = read_u64_be_from_reader(&mut log_file, "NuDB log bucket index")?;
@@ -1087,7 +1218,6 @@ impl NuDbBackend {
             match log_file.read_exact(&mut bucket_prefix) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    replay_complete = false;
                     break;
                 }
                 Err(error) => return Err(error.to_string()),
@@ -1106,7 +1236,6 @@ impl NuDbBackend {
             match log_file.read_exact(&mut compact) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    replay_complete = false;
                     break;
                 }
                 Err(error) => return Err(error.to_string()),
@@ -1125,25 +1254,16 @@ impl NuDbBackend {
             key_file
                 .write_all(&bucket.encode_key_block()?)
                 .map_err(|error| error.to_string())?;
-            max_replayed_bucket_index = Some(
-                max_replayed_bucket_index.map_or(bucket_index, |current| current.max(bucket_index)),
-            );
         }
 
         key_file.flush().map_err(|error| error.to_string())?;
         key_file.sync_all().map_err(|error| error.to_string())?;
 
-        let recovered_key_file_size = if replay_complete {
-            max_replayed_bucket_index
-                .map(|bucket_index| {
-                    u64::from(bucket_index + 2).saturating_mul(u64::from(log_header.block_size))
-                })
-                .map_or(log_header.key_file_size, |replayed_size| {
-                    log_header.key_file_size.min(replayed_size)
-                })
-        } else {
-            log_header.key_file_size
-        };
+        // Bucket records are selective c0 preimages, not a dense snapshot of
+        // the key file. Their highest index therefore says nothing about the
+        // saved file extent. Always restore the exact checkpoint size; this
+        // also discards buckets appended by an interrupted split.
+        let recovered_key_file_size = log_header.key_file_size;
 
         let key_file = fs::OpenOptions::new()
             .read(true)
@@ -1224,13 +1344,6 @@ impl NuDbBackend {
         }
         open_state.open(open_args.app_type)?;
 
-        runtime.open_state = open_state;
-        runtime.key_header = Some(header);
-        runtime.split_threshold = nudb_split_threshold(&header);
-        runtime.split_fraction = runtime.split_threshold / 2;
-        runtime.burst_pending_writes = 0;
-        runtime.burst_checkpoint_active = false;
-
         // Open persistent file descriptors for pread/pwrite I/O.
         let fds = NuDbPersistentFds::open(&plan.layout)?;
         // Initialize file size tracking from actual file sizes
@@ -1240,13 +1353,77 @@ impl NuDbBackend {
         self.key_file_size.store(key_size, Ordering::Relaxed);
         self.persistent_fds.store(Some(Arc::new(fds)));
 
+        // Publish the recovered/open runtime only after fresh descriptors are
+        // installed. Until this point concurrent callers still observe the
+        // closed, fail-stopped generation.
+        runtime.open_state = open_state;
+        runtime.key_header = Some(header);
+        runtime.split_threshold = nudb_split_threshold(&header);
+        runtime.split_fraction = runtime.split_threshold / 2;
+        runtime.burst_pending_writes = 0;
+        runtime.burst_checkpoint_active = false;
+        runtime.fail_stop_error = None;
+        {
+            let mut originals = self
+                .burst_originals
+                .lock()
+                .expect("nudb burst originals mutex must not be poisoned");
+            originals.active = false;
+            originals.original_bucket_count = 0;
+            originals.buckets.clear();
+        }
+
         tracing::info!(target: "nodestore", path = %self.config.path, "Database opened");
 
         Ok(())
     }
 
     fn burst_commit_limit(&self) -> usize {
-        self.config.burst_size.max(1)
+        self.config
+            .burst_size
+            .max(1)
+            .min(MAX_SYNCHRONOUS_BURST_WRITES)
+    }
+
+    fn fail_stop_error(&self) -> Option<String> {
+        self.runtime
+            .lock()
+            .expect("nudb backend runtime mutex must not be poisoned")
+            .fail_stop_error
+            .clone()
+    }
+
+    fn ensure_not_fail_stopped(&self) -> Result<(), String> {
+        match self.fail_stop_error() {
+            Some(error) => Err(format!("NuDB backend is fail-stopped: {error}")),
+            None => Ok(()),
+        }
+    }
+
+    fn fail_stop_write_if_checkpointed(&self, error: String) -> String {
+        let fail_stop = {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .expect("nudb backend runtime mutex must not be poisoned");
+            if runtime.burst_checkpoint_active {
+                let fail_stop = runtime
+                    .fail_stop_error
+                    .get_or_insert_with(|| error.clone())
+                    .clone();
+                Some(fail_stop)
+            } else {
+                None
+            }
+        };
+        if let Some(fail_stop) = fail_stop {
+            let message = format!(
+                "NuDB checked batch failed after recovery checkpoint; backend is fail-stopped: {fail_stop}"
+            );
+            self.journal.log(JournalLevel::Fatal, &message);
+            tracing::error!(target: "nodestore", error = %fail_stop, "NuDB backend entered fail-stop state");
+        }
+        error
     }
 
     /// Flush only buckets that bulk import intentionally kept in memory.
@@ -1306,6 +1483,15 @@ impl NuDbBackend {
                 .burst_checkpoint_active = false;
             return Err(error);
         }
+        {
+            let mut originals = self
+                .burst_originals
+                .lock()
+                .expect("nudb burst originals mutex must not be poisoned");
+            originals.original_bucket_count = key_header.buckets;
+            originals.active = true;
+            originals.buckets.clear();
+        }
         self.metrics.burst_checkpoint_ns.fetch_add(
             checkpoint_started.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
@@ -1326,7 +1512,8 @@ impl NuDbBackend {
             .map_err(|error| format!("NuDB sync key file: {error}"))
     }
 
-    fn finish_burst_write(&self) -> Result<(), String> {
+    fn finish_burst_writes(&self, write_count: usize) -> Result<(), String> {
+        self.ensure_not_fail_stopped()?;
         let should_commit = {
             let mut runtime = self
                 .runtime
@@ -1335,11 +1522,12 @@ impl NuDbBackend {
             if !runtime.open_state.is_open() {
                 return Err("NuDB backend is not open".to_owned());
             }
-            runtime.burst_pending_writes = runtime.burst_pending_writes.saturating_add(1);
+            runtime.burst_pending_writes = runtime.burst_pending_writes.saturating_add(write_count);
             runtime.burst_pending_writes >= self.burst_commit_limit()
         };
 
         if should_commit {
+            self.append_burst_originals_to_log()?;
             let flush_started = Instant::now();
             self.flush_bucket_cache()?;
             self.metrics
@@ -1351,17 +1539,31 @@ impl NuDbBackend {
                 .burst_sync_ns
                 .fetch_add(sync_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             self.clear_log_file()?;
+            self.metrics
+                .burst_commit_count
+                .fetch_add(1, Ordering::Relaxed);
             let mut runtime = self
                 .runtime
                 .lock()
                 .expect("nudb backend runtime mutex must not be poisoned");
             runtime.burst_pending_writes = 0;
             runtime.burst_checkpoint_active = false;
+            let mut originals = self
+                .burst_originals
+                .lock()
+                .expect("nudb burst originals mutex must not be poisoned");
+            originals.active = false;
+            originals.buckets.clear();
         }
         Ok(())
     }
 
+    fn finish_burst_write(&self) -> Result<(), String> {
+        self.finish_burst_writes(1)
+    }
+
     fn commit_active_burst_if_needed(&self) -> Result<(), String> {
+        self.ensure_not_fail_stopped()?;
         let should_commit = {
             let runtime = self
                 .runtime
@@ -1370,26 +1572,56 @@ impl NuDbBackend {
             runtime.open_state.is_open() && runtime.burst_checkpoint_active
         };
 
-        if should_commit {
-            let flush_started = Instant::now();
-            self.flush_bucket_cache()?;
-            self.metrics
-                .burst_flush_ns
-                .fetch_add(flush_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            let sync_started = Instant::now();
-            self.sync_data_files()?;
-            self.metrics
-                .burst_sync_ns
-                .fetch_add(sync_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            self.clear_log_file()?;
-            let mut runtime = self
-                .runtime
-                .lock()
-                .expect("nudb backend runtime mutex must not be poisoned");
-            runtime.burst_pending_writes = 0;
-            runtime.burst_checkpoint_active = false;
-        }
-        Ok(())
+        let result = (|| {
+            if should_commit {
+                self.append_burst_originals_to_log()?;
+                let flush_started = Instant::now();
+                self.flush_bucket_cache()?;
+                self.metrics
+                    .burst_flush_ns
+                    .fetch_add(flush_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let sync_started = Instant::now();
+                self.sync_data_files()?;
+                self.metrics
+                    .burst_sync_ns
+                    .fetch_add(sync_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                self.clear_log_file()?;
+                self.metrics
+                    .burst_commit_count
+                    .fetch_add(1, Ordering::Relaxed);
+                let mut runtime = self
+                    .runtime
+                    .lock()
+                    .expect("nudb backend runtime mutex must not be poisoned");
+                runtime.burst_pending_writes = 0;
+                runtime.burst_checkpoint_active = false;
+                let mut originals = self
+                    .burst_originals
+                    .lock()
+                    .expect("nudb burst originals mutex must not be poisoned");
+                originals.active = false;
+                originals.buckets.clear();
+            }
+            Ok(())
+        })();
+        result.map_err(|error| self.fail_stop_write_if_checkpointed(error))
+    }
+
+    fn close_fail_stopped_generation(&self, error: &str) -> String {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .expect("nudb backend runtime mutex must not be poisoned");
+        runtime.open_state.close();
+        runtime.key_header = None;
+        runtime.split_fraction = 0;
+        runtime.split_threshold = 0;
+        runtime.burst_pending_writes = 0;
+        runtime.burst_checkpoint_active = false;
+        drop(runtime);
+        self.persistent_fds.store(None);
+        self.bucket_cache.clear();
+        format!("NuDB backend is fail-stopped: {error}")
     }
 
     pub fn open_state(&self) -> NuDbOpenState {
@@ -1469,7 +1701,7 @@ impl NuDbBackend {
         )?;
         if self.bucket_cache.len() >= MAX_BUCKET_CACHE_ENTRIES {
             // Drop both the DashMap iterator and its shard guard before remove.
-            evict_one_cached_bucket(&self.bucket_cache);
+            evict_one_clean_cached_bucket(&self.bucket_cache);
         }
         self.bucket_cache.insert(
             bucket_index,
@@ -1498,18 +1730,42 @@ impl NuDbBackend {
                 key_header.buckets
             ));
         }
-        // Write-through: update cache AND disk. Cache accelerates reads,
-        // disk ensures correctness for verification and crash recovery.
         let bulk_importing = self.bulk_importing.load(Ordering::Acquire);
-        // Cap cache size to prevent unbounded RAM growth (each bucket ~4KB).
-        // During bulk import, keep all buckets in memory — flush handles persistence.
-        if !bulk_importing && self.bucket_cache.len() >= MAX_BUCKET_CACHE_ENTRIES {
-            // Drop both the DashMap iterator and its shard guard before remove.
-            evict_one_cached_bucket(&self.bucket_cache);
+        let mut originals = self
+            .burst_originals
+            .lock()
+            .expect("nudb burst originals mutex must not be poisoned");
+        let burst_active = originals.active;
+        if burst_active
+            && bucket_index < originals.original_bucket_count
+            && !originals.buckets.contains_key(&bucket_index)
+        {
+            let original = if let Some(cached) = self.bucket_cache.get(&bucket_index) {
+                cached.value().bucket.clone()
+            } else {
+                let offset = u64::from(bucket_index + 1) * u64::from(key_header.block_size);
+                let mut bytes = vec![0u8; usize::from(key_header.block_size)];
+                let _read_guard = self
+                    .key_bucket_io
+                    .read()
+                    .expect("nudb key bucket read lock");
+                self.pread_key(offset, &mut bytes)?;
+                NuDbBucket::read_full_block(
+                    usize::from(key_header.block_size),
+                    usize::from(key_header.capacity),
+                    &bytes,
+                )?
+            };
+            originals.buckets.insert(bucket_index, original);
         }
-        // Write-through keeps normal acquisition data immediately visible and
-        // leaves the cache clean. Bulk import intentionally defers the write.
-        if bulk_importing {
+        drop(originals);
+        // Cap cache size to prevent unbounded RAM growth (each bucket ~4KB).
+        // Dirty burst/bulk-import entries remain pinned until commit.
+        if !bulk_importing && !burst_active && self.bucket_cache.len() >= MAX_BUCKET_CACHE_ENTRIES {
+            // Drop both the DashMap iterator and its shard guard before remove.
+            evict_one_clean_cached_bucket(&self.bucket_cache);
+        }
+        if bulk_importing || burst_active {
             self.bucket_cache.insert(
                 bucket_index,
                 CachedBucket {
@@ -1602,6 +1858,8 @@ impl NuDbBackend {
         header.modulus = 1;
         runtime.split_threshold = nudb_split_threshold(header);
         runtime.split_fraction = runtime.split_threshold / 2;
+        #[cfg(test)]
+        nudb_test_crash_if_requested(NuDbTestCrashPoint::PrimaryBucket, "primary bucket creation");
         Ok(())
     }
 
@@ -1699,6 +1957,8 @@ impl NuDbBackend {
         header.modulus = new_modulus;
         self.write_key_bucket_with_header(left_index, &left, header)?;
         self.write_key_bucket_with_header(right_index, &right, header)?;
+        #[cfg(test)]
+        nudb_test_crash_if_requested(NuDbTestCrashPoint::Split, "bucket split");
 
         Ok(())
     }
@@ -1915,10 +2175,15 @@ impl NuDbBackend {
     }
 
     pub fn verify_backend(&self) -> Result<(), String> {
-        // Clear bucket cache WITHOUT flushing — verification must read
-        // the actual disk state, not our cached (possibly stale) version.
-        self.bucket_cache.clear();
+        let _store_guard = self
+            .store_mutex
+            .lock()
+            .expect("nudb backend store mutex must not be poisoned");
+        self.ensure_not_fail_stopped()?;
+        // Commit the active c0/c1 transaction before dropping its dirty view;
+        // verification then reads only the durable key file.
         self.commit_active_burst_if_needed()?;
+        self.bucket_cache.clear();
         // Read key header from DISK (not memory cache) to detect corruption
         let key_header = read_nudb_key_file_header(&self.config.layout.key_path)?;
         let key_size = usize::from(key_header.key_size);
@@ -1971,6 +2236,122 @@ impl NuDbBackend {
 
         if indexed.len() != seen_offsets.len() {
             return Err("NuDB key/data entry counts do not match".to_owned());
+        }
+
+        Ok(())
+    }
+
+    fn traverse_objects(
+        &self,
+        callback: &mut dyn FnMut(Arc<NodeObject>),
+        fail_fast: bool,
+    ) -> Result<(), String> {
+        let _store_guard = self
+            .store_mutex
+            .lock()
+            .expect("nudb backend store mutex must not be poisoned");
+        if let Err(error) = self.ensure_not_fail_stopped() {
+            if fail_fast {
+                return Err(error);
+            }
+            self.journal.log(JournalLevel::Error, &error);
+            return Ok(());
+        }
+        if let Err(error) = self.commit_active_burst_if_needed() {
+            if fail_fast {
+                return Err(error);
+            }
+            self.journal.log(JournalLevel::Error, &error);
+            return Ok(());
+        }
+        let key_header = match self.current_key_header() {
+            Ok(header) => header,
+            Err(error) => {
+                if fail_fast {
+                    return Err(error);
+                }
+                self.journal.log(JournalLevel::Error, &error);
+                return Ok(());
+            }
+        };
+        let key_size = usize::from(key_header.key_size);
+
+        for bucket_index in 0..key_header.buckets {
+            let bucket = match self.read_key_bucket_with_header(bucket_index, &key_header) {
+                Ok(bucket) => bucket,
+                Err(error) => {
+                    if fail_fast {
+                        return Err(error);
+                    }
+                    self.journal.log(JournalLevel::Error, &error);
+                    continue;
+                }
+            };
+            let entries = match self.collect_bucket_chain_entries_with_header(&bucket, &key_header)
+            {
+                Ok(entries) => entries,
+                Err(error) => {
+                    if fail_fast {
+                        return Err(error);
+                    }
+                    self.journal.log(JournalLevel::Error, &error);
+                    continue;
+                }
+            };
+            for entry in entries {
+                let key_bytes =
+                    match self.read_data_record_key_with_key_size(entry.offset, key_size) {
+                        Ok(key) => key,
+                        Err(error) => {
+                            if fail_fast {
+                                return Err(error);
+                            }
+                            self.journal.log(JournalLevel::Error, &error);
+                            continue;
+                        }
+                    };
+                let value = match self.read_data_record_value_with_key_size(entry, key_size) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if fail_fast {
+                            return Err(error);
+                        }
+                        self.journal.log(JournalLevel::Error, &error);
+                        continue;
+                    }
+                };
+                let decompressed = match nodeobject_decompress(&value) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        if fail_fast {
+                            return Err(error);
+                        }
+                        self.journal.log(JournalLevel::Error, &error);
+                        continue;
+                    }
+                };
+                let key = match Uint256::from_slice(&key_bytes) {
+                    Some(key) => key,
+                    None => {
+                        let error = "NuDB data record key is not a Uint256".to_owned();
+                        if fail_fast {
+                            return Err(error);
+                        }
+                        self.journal.log(JournalLevel::Error, &error);
+                        continue;
+                    }
+                };
+                let decoded = DecodedBlob::new(key.data(), &decompressed);
+                if decoded.was_ok() {
+                    callback(decoded.create_object());
+                } else {
+                    let error = "NuDB data record failed to decode".to_owned();
+                    if fail_fast {
+                        return Err(error);
+                    }
+                    self.journal.log(JournalLevel::Error, &error);
+                }
+            }
         }
 
         Ok(())
@@ -2039,9 +2420,17 @@ impl Backend for NuDbBackend {
             return Ok(());
         }
 
+        if let Some(error) = self.fail_stop_error() {
+            // Do not commit or clear the recovery log. Drop all live views of
+            // the partially mutated generation so a later reopen is forced
+            // through normal NuDB log recovery.
+            return Err(self.close_fail_stopped_generation(&error));
+        }
+
         if let Err(error) = self.commit_active_burst_if_needed() {
             self.journal.log(JournalLevel::Error, &error);
-            return Err(error);
+            let fail_stop = self.fail_stop_error().unwrap_or(error);
+            return Err(self.close_fail_stopped_generation(&fail_stop));
         }
 
         let mut runtime = self
@@ -2058,6 +2447,16 @@ impl Backend for NuDbBackend {
         runtime.split_threshold = 0;
         runtime.burst_pending_writes = 0;
         runtime.burst_checkpoint_active = false;
+        runtime.fail_stop_error = None;
+        {
+            let mut originals = self
+                .burst_originals
+                .lock()
+                .expect("nudb burst originals mutex must not be poisoned");
+            originals.active = false;
+            originals.original_bucket_count = 0;
+            originals.buckets.clear();
+        }
         drop(runtime);
 
         // Close persistent file descriptors before potential file deletion.
@@ -2260,27 +2659,21 @@ impl Backend for NuDbBackend {
         (results, overall)
     }
 
-    fn store(&self, object: Arc<NodeObject>) {
-        // Pre-compute the encoded+compressed record outside the lock. The
-        // bucket lookup below remains under the lock so duplicate detection and
-        // insertion are one serialized operation.
+    fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
+        self.ensure_not_fail_stopped()?;
+        // Pure encoding/compression stays outside the serialized mutation
+        // section. A second poison check follows after acquiring the fence.
         let encoded = EncodedBlob::new(&object);
-        let compressed = match nodeobject_compress(encoded.get_data()) {
-            Ok(c) => c,
-            Err(error) => {
-                tracing::error!(target: "nodestore", error = %error, "Node store write failed");
-                self.journal.log(JournalLevel::Error, &error);
-                return;
-            }
-        };
-        let hash_prefix = match self.key_hash_prefix(encoded.get_key()) {
-            Ok(p) => p,
-            Err(error) => {
-                self.journal.log(JournalLevel::Error, &error);
-                return;
-            }
-        };
-
+        let compressed = nodeobject_compress(encoded.get_data()).map_err(|error| {
+            tracing::error!(target: "nodestore", error = %error, "Node store write failed");
+            self.journal.log(JournalLevel::Error, &error);
+            error
+        })?;
+        let hash_prefix = self
+            .key_hash_prefix(encoded.get_key())
+            .inspect_err(|error| {
+                self.journal.log(JournalLevel::Error, error);
+            })?;
         let lock_started = Instant::now();
         let _store_guard = self
             .store_mutex
@@ -2290,161 +2683,135 @@ impl Backend for NuDbBackend {
             .store_lock_wait_ns
             .fetch_add(lock_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let _store_timing = StoreLockTiming::new(self.metrics.as_ref());
+        self.ensure_not_fail_stopped()?;
+        let result = (|| {
+            let bulk_importing = self.bulk_importing.load(Ordering::Acquire);
 
-        let bulk_importing = self.bulk_importing.load(Ordering::Acquire);
-
-        let key_header = {
-            let mut runtime = self
-                .runtime
-                .lock()
-                .expect("nudb backend runtime mutex must not be poisoned");
-            if !runtime.open_state.is_open() {
-                self.journal
-                    .log(JournalLevel::Error, "NuDB backend is not open");
-                return;
-            }
-            if let Err(error) = self.ensure_primary_bucket(&mut runtime) {
-                self.journal.log(JournalLevel::Error, &error);
-                return;
-            }
-            runtime
-                .key_header
-                .expect("nudb runtime header must exist after ensure_primary_bucket")
-        };
-        match self.find_bucket_entry(encoded.get_key()) {
-            Ok(Some(_)) => return,
-            Ok(None) => {}
-            Err(error) => {
-                self.journal.log(JournalLevel::Error, &error);
-                return;
-            }
-        }
-        let key_header = if bulk_importing {
-            key_header
-        } else {
-            let mut runtime = self
-                .runtime
-                .lock()
-                .expect("nudb backend runtime mutex must not be poisoned");
-            runtime.split_fraction = runtime.split_fraction.saturating_add(65_536);
-            if runtime.split_fraction >= runtime.split_threshold {
-                runtime.split_fraction -= runtime.split_threshold;
-                if let Err(error) = self.split_one_bucket(&mut runtime) {
+            let initial_key_header = {
+                let runtime = self
+                    .runtime
+                    .lock()
+                    .expect("nudb backend runtime mutex must not be poisoned");
+                if !runtime.open_state.is_open() {
+                    let error = "NuDB backend is not open".to_owned();
                     self.journal.log(JournalLevel::Error, &error);
-                    return;
+                    return Err(error);
+                }
+                runtime
+                    .key_header
+                    .expect("nudb runtime header must exist while open")
+            };
+            match self.find_bucket_entry(encoded.get_key()) {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {}
+                Err(error) => {
+                    self.journal.log(JournalLevel::Error, &error);
+                    return Err(error);
                 }
             }
-            runtime
-                .key_header
-                .expect("nudb runtime header must exist after split")
-        };
-        if !bulk_importing && let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
-            self.journal.log(JournalLevel::Error, &error);
-            return;
-        }
-        // Use pre-computed compressed data — no re-encoding under the lock.
-        let key_size = usize::from(key_header.key_size);
-        if encoded.get_key().len() != key_size {
-            self.journal
-                .log(JournalLevel::Error, "NuDB record key size mismatch");
-            return;
-        }
-        let size_val = u64::try_from(compressed.len()).expect("record size must fit u64");
-        let mut record = Vec::with_capacity(6 + key_size + compressed.len());
-        record.resize(6, 0);
-        let mut off = 0usize;
-        if let Err(error) = write_u48_be(&mut record, &mut off, size_val) {
-            self.journal.log(JournalLevel::Error, &error);
-            return;
-        }
-        record.extend_from_slice(encoded.get_key());
-        record.extend_from_slice(&compressed);
-        let offset = match self.append_data(&record) {
-            Ok(o) => o,
-            Err(error) => {
-                self.journal.log(JournalLevel::Error, &error);
-                return;
+            if !bulk_importing {
+                // The checkpoint must be durable before primary-bucket creation,
+                // a split, or any subsequent data/key-file mutation. It records
+                // the pre-mutation file sizes and bucket state for recovery.
+                self.begin_burst_checkpoint_if_needed(&initial_key_header)
+                    .inspect_err(|error| {
+                        self.journal.log(JournalLevel::Error, error);
+                    })?;
             }
-        };
-        let entry = NuDbBucketEntry {
-            offset,
-            size: size_val,
-            hash_prefix,
-        };
-        let bucket_index =
-            nudb_bucket_index(entry.hash_prefix, key_header.buckets, key_header.modulus);
-        if let Err(error) = self.insert_bucket_entry(bucket_index, entry) {
-            tracing::error!(target: "nodestore", error = %error, "Node store write failed");
-            self.journal.log(JournalLevel::Error, &error);
-            return;
-        }
-        let size_bytes = compressed.len();
-        tracing::debug!(target: "nodestore", hash = %object.hash(), size_bytes, "Node object stored");
-        if !bulk_importing && let Err(error) = self.finish_burst_write() {
-            self.journal.log(JournalLevel::Error, &error);
-        }
+            let key_header = {
+                let mut runtime = self
+                    .runtime
+                    .lock()
+                    .expect("nudb backend runtime mutex must not be poisoned");
+                self.ensure_primary_bucket(&mut runtime)
+                    .inspect_err(|error| {
+                        self.journal.log(JournalLevel::Error, error);
+                    })?;
+                if !bulk_importing {
+                    runtime.split_fraction = runtime.split_fraction.saturating_add(65_536);
+                    if runtime.split_fraction >= runtime.split_threshold {
+                        runtime.split_fraction -= runtime.split_threshold;
+                        self.split_one_bucket(&mut runtime).inspect_err(|error| {
+                            self.journal.log(JournalLevel::Error, error);
+                        })?;
+                    }
+                }
+                runtime
+                    .key_header
+                    .expect("nudb runtime header must exist after primary bucket and split")
+            };
+            // Use pre-computed compressed data — no re-encoding under the lock.
+            let key_size = usize::from(key_header.key_size);
+            if encoded.get_key().len() != key_size {
+                let error = "NuDB record key size mismatch".to_owned();
+                self.journal.log(JournalLevel::Error, &error);
+                return Err(error);
+            }
+            let size_val = u64::try_from(compressed.len()).expect("record size must fit u64");
+            let mut record = Vec::with_capacity(6 + key_size + compressed.len());
+            record.resize(6, 0);
+            let mut off = 0usize;
+            write_u48_be(&mut record, &mut off, size_val).inspect_err(|error| {
+                self.journal.log(JournalLevel::Error, error);
+            })?;
+            record.extend_from_slice(encoded.get_key());
+            record.extend_from_slice(&compressed);
+            let offset = self.append_data(&record).inspect_err(|error| {
+                self.journal.log(JournalLevel::Error, error);
+            })?;
+            let entry = NuDbBucketEntry {
+                offset,
+                size: size_val,
+                hash_prefix,
+            };
+            let bucket_index =
+                nudb_bucket_index(entry.hash_prefix, key_header.buckets, key_header.modulus);
+            self.insert_bucket_entry(bucket_index, entry)
+                .inspect_err(|error| {
+                    tracing::error!(target: "nodestore", error = %error, "Node store write failed");
+                    self.journal.log(JournalLevel::Error, error);
+                })?;
+            let size_bytes = compressed.len();
+            tracing::debug!(target: "nodestore", hash = %object.hash(), size_bytes, "Node object stored");
+            if !bulk_importing {
+                self.finish_burst_write().inspect_err(|error| {
+                    self.journal.log(JournalLevel::Error, error);
+                })?;
+            }
+            Ok(())
+        })();
+        result.map_err(|error| self.fail_stop_write_if_checkpointed(error))
     }
 
     fn store_batch(&self, batch: &Batch) {
-        let mut batch_size_bytes: usize = 0;
-        let mut to_write = Vec::with_capacity(batch.len());
-        let bulk_importing = self.bulk_importing.load(Ordering::Acquire);
+        if let Err(error) = self.store_batch_result(batch) {
+            tracing::error!(target: "nodestore", %error, "NuDB batch write failed");
+            self.journal.log(JournalLevel::Error, &error);
+        }
+    }
 
+    fn store_batch_result(&self, batch: &Batch) -> Result<(), String> {
+        self.ensure_not_fail_stopped()?;
+        // Stable first-wins encoding and compression are CPU-only and happen
+        // before the mutation fence. The checked mutation below rechecks
+        // fail-stop state after acquiring the fence.
+        let mut batch_size_bytes = 0usize;
+        let mut seen_batch_keys = BTreeSet::new();
+        let mut to_write = Vec::with_capacity(batch.len());
         for object in batch {
             batch_size_bytes += object.data().len();
-            // NOTE: find_bucket_entry pre-check removed — same reason as store().
             let encoded = EncodedBlob::new(object);
-            let compressed = match nodeobject_compress(encoded.get_data()) {
-                Ok(c) => c,
-                Err(error) => {
-                    tracing::error!(target: "nodestore", error = %error, "Node store write failed");
-                    self.journal.log(JournalLevel::Error, &error);
-                    continue;
-                }
-            };
-            let hash_prefix = match self.key_hash_prefix(encoded.get_key()) {
-                Ok(p) => p,
-                Err(error) => {
-                    self.journal.log(JournalLevel::Error, &error);
-                    continue;
-                }
-            };
-            let key_size = encoded.get_key().len() as u16;
-            to_write.push((hash_prefix, key_size, encoded, compressed));
+            let key = encoded.get_key().to_vec();
+            if !seen_batch_keys.insert(key.clone()) {
+                continue;
+            }
+            let compressed = nodeobject_compress(encoded.get_data())?;
+            let hash_prefix = self.key_hash_prefix(&key)?;
+            to_write.push((key, hash_prefix, compressed));
         }
-
         if to_write.is_empty() {
-            return;
+            return Ok(());
         }
-
-        let mut coalesced_buffer = Vec::new();
-        let mut total_bytes = 0;
-        for (_, key_size, _, compressed) in &to_write {
-            total_bytes += 6 + *key_size as usize + compressed.len();
-        }
-        coalesced_buffer.reserve_exact(total_bytes);
-
-        let mut entries = Vec::with_capacity(to_write.len());
-        let mut current_offset = 0;
-
-        for (hash_prefix, key_size, encoded, compressed) in to_write {
-            let record_size = compressed.len() as u64;
-            let mut header = [0u8; 6];
-            let mut off = 0usize;
-            write_u48_be(&mut header, &mut off, record_size).unwrap();
-
-            coalesced_buffer.extend_from_slice(&header);
-            coalesced_buffer.extend_from_slice(encoded.get_key());
-            coalesced_buffer.extend_from_slice(&compressed);
-
-            entries.push((hash_prefix, record_size, current_offset as u64));
-            current_offset += 6 + key_size as usize + compressed.len();
-        }
-
-        self.metrics
-            .store_batch_coalesced_bytes
-            .fetch_add(coalesced_buffer.len(), Ordering::Relaxed);
-
         let lock_started = Instant::now();
         let _store_guard = self
             .store_mutex
@@ -2454,72 +2821,136 @@ impl Backend for NuDbBackend {
             .store_lock_wait_ns
             .fetch_add(lock_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let _store_timing = StoreLockTiming::new(self.metrics.as_ref());
+        self.ensure_not_fail_stopped()?;
+        let result = (|| {
+            let bulk_importing = self.bulk_importing.load(Ordering::Acquire);
 
-        let base_offset = match self.append_data(&coalesced_buffer) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::error!(target: "nodestore", error = %e, "Batch data append failed");
-                return;
-            }
-        };
+            let initial_key_header = {
+                let runtime = self
+                    .runtime
+                    .lock()
+                    .expect("nudb backend runtime mutex must not be poisoned");
+                if !runtime.open_state.is_open() {
+                    return Err("NuDB backend is not open".to_owned());
+                }
+                runtime.key_header.expect("header must be present")
+            };
 
-        let key_header = {
-            let mut runtime = self
-                .runtime
-                .lock()
-                .expect("nudb backend runtime mutex must not be poisoned");
-            if !runtime.open_state.is_open() {
-                self.journal
-                    .log(JournalLevel::Error, "NuDB backend is not open");
-                return;
-            }
-            if let Err(error) = self.ensure_primary_bucket(&mut runtime) {
-                self.journal.log(JournalLevel::Error, &error);
-                return;
-            }
-            if !bulk_importing {
-                runtime.split_fraction = runtime
-                    .split_fraction
-                    .saturating_add(65_536 * entries.len() as u64);
-                while runtime.split_fraction >= runtime.split_threshold {
-                    runtime.split_fraction -= runtime.split_threshold;
-                    if let Err(error) = self.split_one_bucket(&mut runtime) {
-                        self.journal.log(JournalLevel::Error, &error);
-                    }
+            // Check the persisted index while holding the store lock. Existing
+            // keys are no-ops, precisely matching NuDBFactory::doInsert's
+            // key_exists handling, and are excluded before any data append.
+            let mut pending = Vec::with_capacity(to_write.len());
+            for (key, hash_prefix, compressed) in to_write {
+                match self.find_bucket_entry(&key) {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => pending.push((key, hash_prefix, compressed)),
+                    Err(error) => return Err(error),
                 }
             }
-            runtime.key_header.expect("header must be present")
-        };
-
-        if !bulk_importing && let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
-            self.journal.log(JournalLevel::Error, &error);
-            return;
-        }
-
-        for (hash_prefix, size, relative_offset) in entries {
-            let entry = NuDbBucketEntry {
-                offset: base_offset + relative_offset,
-                size,
-                hash_prefix,
-            };
-            let bucket_index = self.bucket_index(hash_prefix, &key_header);
-            if let Err(error) = self.insert_bucket_entry(bucket_index, entry) {
-                tracing::error!(target: "nodestore", error = %error, "Node store write failed (key)");
-                self.journal.log(JournalLevel::Error, &error);
+            if pending.is_empty() {
+                return Ok(());
             }
-        }
 
-        let objects_written = batch.len();
-        tracing::info!(target: "nodestore", objects_written, batch_size_bytes, "Batch flush complete");
+            // NuDB saves the pre-write key/data sizes before it can append data.
+            // Recovery restores this checkpoint if a later append or index update
+            // is interrupted.
+            if !bulk_importing {
+                self.begin_burst_checkpoint_if_needed(&initial_key_header)?;
+            }
+
+            let key_header = {
+                let mut runtime = self
+                    .runtime
+                    .lock()
+                    .expect("nudb backend runtime mutex must not be poisoned");
+                self.ensure_primary_bucket(&mut runtime)?;
+                if !bulk_importing {
+                    runtime.split_fraction = runtime
+                        .split_fraction
+                        .saturating_add(65_536 * pending.len() as u64);
+                    while runtime.split_fraction >= runtime.split_threshold {
+                        runtime.split_fraction -= runtime.split_threshold;
+                        self.split_one_bucket(&mut runtime)?;
+                    }
+                }
+                runtime.key_header.expect("header must be present")
+            };
+
+            let mut coalesced_buffer = Vec::new();
+            let total_bytes = pending
+                .iter()
+                .map(|(key, _, compressed)| 6 + key.len() + compressed.len())
+                .sum();
+            coalesced_buffer.reserve_exact(total_bytes);
+            let mut entries = Vec::with_capacity(pending.len());
+            let mut relative_offset = 0u64;
+            for (key, hash_prefix, compressed) in pending {
+                if key.len() != usize::from(key_header.key_size) {
+                    return Err("NuDB record key size mismatch".to_owned());
+                }
+                let record_size = match u64::try_from(compressed.len()) {
+                    Ok(record_size) if record_size <= NUDB_U48_MAX => record_size,
+                    _ => return Err("NuDB data record exceeds 48-bit size field".to_owned()),
+                };
+                let mut record_header = [0u8; 6];
+                let mut record_header_offset = 0usize;
+                write_u48_be(&mut record_header, &mut record_header_offset, record_size)?;
+                coalesced_buffer.extend_from_slice(&record_header);
+                coalesced_buffer.extend_from_slice(&key);
+                coalesced_buffer.extend_from_slice(&compressed);
+                entries.push((hash_prefix, record_size, relative_offset));
+                relative_offset += u64::try_from(6 + key.len() + compressed.len())
+                    .expect("NuDB record length must fit u64");
+            }
+
+            let base_offset = self.append_data(&coalesced_buffer)?;
+            #[cfg(test)]
+            nudb_test_batch_error_after_append()?;
+            self.metrics
+                .store_batch_coalesced_bytes
+                .fetch_add(coalesced_buffer.len(), Ordering::Relaxed);
+
+            for (_index, (hash_prefix, size, relative_offset)) in
+                entries.iter().copied().enumerate()
+            {
+                #[cfg(test)]
+                nudb_test_batch_error_before_index_insert(_index + 1)?;
+                let entry = NuDbBucketEntry {
+                    offset: base_offset + relative_offset,
+                    size,
+                    hash_prefix,
+                };
+                let bucket_index = self.bucket_index(hash_prefix, &key_header);
+                self.insert_bucket_entry(bucket_index, entry)?;
+            }
+
+            if !bulk_importing {
+                self.finish_burst_writes(entries.len())?;
+            }
+            let objects_written = entries.len();
+            tracing::info!(target: "nodestore", objects_written, batch_size_bytes, "Batch flush complete");
+            Ok(())
+        })();
+        result.map_err(|error| self.fail_stop_write_if_checkpointed(error))
     }
 
     fn sync(&self) {
-        if let Err(error) = self
-            .commit_active_burst_if_needed()
-            .and_then(|()| self.sync_data_files())
-        {
+        if let Err(error) = self.sync_result() {
             self.journal.log(JournalLevel::Error, &error);
         }
+    }
+
+    fn sync_result(&self) -> Result<(), String> {
+        // A batch holds `store_mutex` from its recovery checkpoint through
+        // the final bucket insertion.  Synchronizing without the same fence
+        // could flush and clear that checkpoint halfway through the batch,
+        // leaving later index mutations unprotected after a crash.
+        let _store_guard = self
+            .store_mutex
+            .lock()
+            .expect("nudb backend store mutex must not be poisoned");
+        self.commit_active_burst_if_needed()
+            .and_then(|()| self.sync_data_files())
     }
 
     fn bulk_import_start(&self, estimated_nodes: u64) -> Result<(), String> {
@@ -2581,7 +3012,7 @@ impl Backend for NuDbBackend {
         tracing::info!(target: "nodestore", "NuDB bulk import finishing — flushing bucket cache");
         self.bulk_importing.store(false, Ordering::Release);
         self.flush_bucket_cache()?;
-        self.sync();
+        self.sync_result()?;
 
         // Remove crash recovery marker
         let marker_path = self
@@ -2612,68 +3043,11 @@ impl Backend for NuDbBackend {
     }
 
     fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) {
-        if let Err(error) = self.commit_active_burst_if_needed() {
-            self.journal.log(JournalLevel::Error, &error);
-            return;
-        }
-        let key_header = match self.current_key_header() {
-            Ok(h) => h,
-            Err(error) => {
-                self.journal.log(JournalLevel::Error, &error);
-                return;
-            }
-        };
-        let key_size = usize::from(key_header.key_size);
+        let _ = self.traverse_objects(callback, false);
+    }
 
-        for bucket_index in 0..key_header.buckets {
-            let bucket = match self.read_key_bucket_with_header(bucket_index, &key_header) {
-                Ok(b) => b,
-                Err(error) => {
-                    self.journal.log(JournalLevel::Error, &error);
-                    continue;
-                }
-            };
-            let entries = match self.collect_bucket_chain_entries_with_header(&bucket, &key_header)
-            {
-                Ok(e) => e,
-                Err(error) => {
-                    self.journal.log(JournalLevel::Error, &error);
-                    continue;
-                }
-            };
-            for entry in entries {
-                let key_bytes =
-                    match self.read_data_record_key_with_key_size(entry.offset, key_size) {
-                        Ok(k) => k,
-                        Err(error) => {
-                            self.journal.log(JournalLevel::Error, &error);
-                            continue;
-                        }
-                    };
-                let value = match self.read_data_record_value_with_key_size(entry, key_size) {
-                    Ok(v) => v,
-                    Err(error) => {
-                        self.journal.log(JournalLevel::Error, &error);
-                        continue;
-                    }
-                };
-                let decompressed = match nodeobject_decompress(&value) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        self.journal.log(JournalLevel::Error, &error);
-                        continue;
-                    }
-                };
-                let key = match Uint256::from_slice(&key_bytes) {
-                    Some(k) => k,
-                    None => continue,
-                };
-                let decoded = DecodedBlob::new(key.data(), &decompressed);
-                if decoded.was_ok() {
-                    callback(decoded.create_object());
-                }
-            }
-        }
+    fn for_each_result(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) -> Result<(), String> {
+        self.traverse_objects(callback, true)
     }
 
     fn get_write_load(&self) -> i32 {
@@ -3176,18 +3550,24 @@ fn read_u48_be_from_reader(reader: &mut dyn Read, field_name: &str) -> Result<u6
 #[cfg(test)]
 mod tests {
     use super::{
-        NUDB_APPNUM, NUDB_CURRENT_VERSION, NUDB_DEFAULT_BLOCK_SIZE, NUDB_KEY_FILE_HEADER_SIZE,
-        NUDB_KEY_FILE_TYPE, NUDB_TARGET_LOAD_FACTOR, NuDbBackendConfig, NuDbFileSetState,
-        NuDbKeyFileHeader, NuDbLayout, NuDbMetadataHeader, NuDbOpenAction, NuDbOpenArgs,
-        NuDbOpenState, encode_nudb_key_file_header, nudb_bucket_capacity, nudb_decode_load_factor,
+        NUDB_APPNUM, NUDB_CURRENT_VERSION, NUDB_DATA_FILE_HEADER_SIZE, NUDB_DEFAULT_BLOCK_SIZE,
+        NUDB_KEY_FILE_HEADER_SIZE, NUDB_KEY_FILE_TYPE, NUDB_TARGET_LOAD_FACTOR, NuDbBackendConfig,
+        NuDbFileSetState, NuDbKeyFileHeader, NuDbLayout, NuDbMetadataHeader, NuDbOpenAction,
+        NuDbOpenArgs, NuDbOpenState, NuDbTestBatchErrorPoint, NuDbTestCrashPoint,
+        encode_nudb_key_file_header, nudb_bucket_capacity, nudb_decode_load_factor,
         nudb_encode_load_factor, nudb_pepper, parse_nudb_block_size, read_nudb_key_file_header,
+        read_nudb_log_file_header, set_nudb_test_batch_error, set_nudb_test_crash,
         validate_nudb_block_size,
     };
-    use crate::{JournalLevel, NodeStoreJournal};
+    use crate::{
+        Backend, JournalLevel, NodeObject, NodeObjectType, NodeStoreJournal, NuDbBackend, Status,
+    };
+    use basics::base_uint::Uint256;
     use basics::basic_config::Section;
     use dashmap::DashMap;
     use std::fs;
-    use std::sync::Mutex;
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     #[derive(Default)]
@@ -3211,6 +3591,401 @@ mod tests {
                 .expect("recording journal mutex must not be poisoned")
                 .push((level, message.to_owned()));
         }
+    }
+
+    fn test_nudb_section(path: &std::path::Path) -> Section {
+        let mut section = Section::new("node_db");
+        section.set("path", path.to_string_lossy().into_owned());
+        section
+    }
+
+    fn test_object(fill: u8, payload: &[u8]) -> Arc<NodeObject> {
+        Arc::new(NodeObject::new(
+            NodeObjectType::Ledger,
+            payload.to_vec(),
+            Uint256::from_array([fill; 32]),
+        ))
+    }
+
+    fn test_object_seq(sequence: u32) -> Arc<NodeObject> {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&sequence.to_be_bytes());
+        hash[4..8].copy_from_slice(&sequence.wrapping_mul(0x9E37_79B9).to_be_bytes());
+        Arc::new(NodeObject::new(
+            NodeObjectType::Ledger,
+            format!("object-{sequence}").into_bytes(),
+            Uint256::from_array(hash),
+        ))
+    }
+
+    #[test]
+    fn nudb_synchronous_burst_commit_limit_is_bounded_without_raising_small_configs() {
+        let large = TempDir::new().expect("large tempdir");
+        let large_backend = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(large.path()),
+            40_000,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("large backend");
+        assert_eq!(
+            large_backend.burst_commit_limit(),
+            super::MAX_SYNCHRONOUS_BURST_WRITES
+        );
+
+        let small = TempDir::new().expect("small tempdir");
+        let small_backend = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(small.path()),
+            64,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("small backend");
+        assert_eq!(small_backend.burst_commit_limit(), 64);
+    }
+
+    #[test]
+    fn nudb_active_burst_defers_key_writes_and_logs_only_modified_buckets() {
+        let temp = TempDir::new().expect("tempdir");
+        let backend = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(temp.path()),
+            10_000,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("backend");
+        backend
+            .open_deterministic(true, NUDB_APPNUM, 90_001, 90_002)
+            .expect("open");
+
+        for sequence in 0..700 {
+            backend
+                .store(test_object_seq(sequence))
+                .expect("seed store");
+        }
+        backend.sync_result().expect("seed commit");
+        let key_path = temp.path().join("nudb.key");
+        let log_path = temp.path().join("nudb.log");
+        let committed_key = fs::read(&key_path).expect("committed key file");
+        assert!(committed_key.len() > 3 * NUDB_DEFAULT_BLOCK_SIZE);
+
+        // Keep this insertion away from a split so it changes one existing
+        // primary bucket and gives the amplification assertion a tight bound.
+        {
+            let mut runtime = backend.runtime.lock().expect("runtime");
+            runtime.split_fraction = 0;
+            runtime.split_threshold = u64::MAX;
+        }
+        let pending = test_object_seq(10_000);
+        backend.store(Arc::clone(&pending)).expect("pending store");
+        assert_eq!(backend.fetch(pending.hash()).1, Status::Ok);
+        assert_eq!(
+            fs::read(&key_path).expect("key file before commit"),
+            committed_key,
+            "active burst must expose c1 through memory without rewriting key buckets"
+        );
+        assert_eq!(
+            fs::metadata(&log_path).expect("log metadata").len(),
+            super::NUDB_LOG_FILE_HEADER_SIZE as u64,
+            "initial checkpoint contains only the recovery header"
+        );
+
+        backend
+            .append_burst_originals_to_log()
+            .expect("append selective c0");
+        let selective_log_size = fs::metadata(&log_path).expect("log metadata").len();
+        assert!(
+            selective_log_size
+                <= (super::NUDB_LOG_FILE_HEADER_SIZE + 8 + NUDB_DEFAULT_BLOCK_SIZE) as u64,
+            "one modified bucket must not snapshot the complete key database"
+        );
+        assert!(selective_log_size < committed_key.len() as u64);
+        backend.sync_result().expect("commit pending burst");
+        assert_eq!(fs::metadata(&log_path).expect("log metadata").len(), 0);
+    }
+
+    #[test]
+    fn nudb_selective_log_recovery_preserves_exact_key_extent_and_untouched_buckets() {
+        let temp = TempDir::new().expect("tempdir");
+        let backend = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(temp.path()),
+            10_000,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("backend");
+        backend
+            .open_deterministic(true, NUDB_APPNUM, 90_101, 90_102)
+            .expect("open");
+        let preserved: Vec<_> = (0..700).map(test_object_seq).collect();
+        for object in &preserved {
+            backend.store(Arc::clone(object)).expect("seed store");
+        }
+        backend.sync_result().expect("seed commit");
+        let key_path = temp.path().join("nudb.key");
+        let original_key_size = fs::metadata(&key_path).expect("key metadata").len();
+
+        {
+            let mut runtime = backend.runtime.lock().expect("runtime");
+            runtime.split_fraction = 0;
+            runtime.split_threshold = u64::MAX;
+        }
+        let interrupted = test_object_seq(20_000);
+        backend
+            .store(Arc::clone(&interrupted))
+            .expect("interrupted store");
+        backend
+            .append_burst_originals_to_log()
+            .expect("durable selective c0");
+        backend
+            .flush_bucket_cache()
+            .expect("simulate partial c1 flush");
+        {
+            let mut runtime = backend.runtime.lock().expect("runtime");
+            runtime.fail_stop_error = Some("simulated crash during c1 flush".to_owned());
+        }
+        assert!(backend.close().is_err());
+        drop(backend);
+
+        let reopened = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(temp.path()),
+            10_000,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("reopened backend");
+        reopened
+            .open_deterministic(false, NUDB_APPNUM, 90_101, 90_102)
+            .expect("selective recovery");
+        assert_eq!(
+            fs::metadata(&key_path)
+                .expect("recovered key metadata")
+                .len(),
+            original_key_size,
+            "selective records must not shrink the key file to their highest index"
+        );
+        for object in preserved.iter().step_by(37) {
+            assert_eq!(reopened.fetch(object.hash()).1, Status::Ok);
+        }
+        assert_eq!(reopened.fetch(interrupted.hash()).1, Status::NotFound);
+        reopened
+            .verify_backend()
+            .expect("recovered backend verifies");
+    }
+
+    #[test]
+    fn nudb_primary_bucket_creation_has_durable_pre_mutation_checkpoint() {
+        let temp = TempDir::new().expect("tempdir");
+        let backend = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(temp.path()),
+            64,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("backend");
+        backend
+            .open_deterministic(true, NUDB_APPNUM, 91_001, 92_001)
+            .expect("open");
+
+        let initial_header = backend
+            .key_file_header()
+            .expect("initial zero-bucket header");
+        assert_eq!(initial_header.buckets, 0);
+        let block_size = usize::from(initial_header.block_size);
+        assert_eq!(
+            fs::metadata(temp.path().join("nudb.key"))
+                .expect("initial key metadata")
+                .len(),
+            block_size as u64,
+            "an empty NuDB key file contains only its header block"
+        );
+
+        set_nudb_test_crash(NuDbTestCrashPoint::PrimaryBucket);
+        let crash = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = backend.store(test_object(0x91, b"primary-ordering"));
+        }));
+        assert!(
+            crash.is_err(),
+            "test failpoint must stop after primary mutation"
+        );
+        drop(backend);
+
+        let checkpoint = read_nudb_log_file_header(&temp.path().join("nudb.log"))
+            .expect("durable checkpoint must precede primary creation");
+        assert_eq!(checkpoint.key_file_size, block_size as u64);
+        assert_eq!(checkpoint.dat_file_size, NUDB_DATA_FILE_HEADER_SIZE as u64);
+        assert!(
+            fs::metadata(temp.path().join("nudb.key"))
+                .expect("key metadata")
+                .len()
+                > checkpoint.key_file_size,
+            "the primary bucket mutation must occur after the checkpoint"
+        );
+    }
+
+    #[test]
+    fn nudb_split_crash_recovers_to_pre_split_checkpoint() {
+        let temp = TempDir::new().expect("tempdir");
+        let backend = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(temp.path()),
+            64,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("backend");
+        backend
+            .open_deterministic(true, NUDB_APPNUM, 93_001, 94_001)
+            .expect("open");
+        let committed = test_object(0x93, b"committed-before-split");
+        let interrupted = test_object(0x94, b"interrupted-during-split");
+        backend
+            .store(Arc::clone(&committed))
+            .expect("initial store");
+        backend.sync_result().expect("commit initial store");
+
+        {
+            let mut runtime = backend.runtime.lock().expect("runtime");
+            runtime.split_fraction = runtime.split_threshold - 65_536;
+        }
+        set_nudb_test_crash(NuDbTestCrashPoint::Split);
+        let crash = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = backend.store(Arc::clone(&interrupted));
+        }));
+        assert!(
+            crash.is_err(),
+            "test failpoint must stop after split mutation"
+        );
+        drop(backend);
+
+        let checkpoint = read_nudb_log_file_header(&temp.path().join("nudb.log"))
+            .expect("durable checkpoint must precede split");
+        assert_eq!(
+            fs::metadata(temp.path().join("nudb.key"))
+                .expect("key metadata")
+                .len(),
+            checkpoint.key_file_size + u64::from(checkpoint.block_size),
+            "the split adds one key bucket after the checkpoint"
+        );
+
+        let reopened = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(temp.path()),
+            64,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("reopened backend");
+        reopened
+            .open_deterministic(false, NUDB_APPNUM, 93_001, 94_001)
+            .expect("recovery must reopen the pre-split checkpoint");
+        assert_eq!(reopened.fetch(committed.hash()).1, Status::Ok);
+        assert_eq!(reopened.fetch(interrupted.hash()).1, Status::NotFound);
+        reopened.verify_backend().expect("recovered store verifies");
+        assert_eq!(
+            fs::metadata(temp.path().join("nudb.key"))
+                .expect("recovered key metadata")
+                .len(),
+            checkpoint.key_file_size
+        );
+        assert_eq!(
+            fs::metadata(temp.path().join("nudb.dat"))
+                .expect("recovered data metadata")
+                .len(),
+            checkpoint.dat_file_size
+        );
+    }
+
+    fn assert_checked_batch_fail_stop_recovers(point: NuDbTestBatchErrorPoint, uid: u64) {
+        let temp = TempDir::new().expect("tempdir");
+        let backend = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(temp.path()),
+            64,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("backend");
+        backend
+            .open_deterministic(true, NUDB_APPNUM, uid, uid + 1)
+            .expect("open");
+        let committed = test_object(0xA0, b"committed-before-failed-batch");
+        backend
+            .store(Arc::clone(&committed))
+            .expect("initial store");
+        backend.sync_result().expect("commit initial object");
+
+        let interrupted = vec![
+            test_object(0xA1, b"failed-batch-one"),
+            test_object(0xA2, b"failed-batch-two"),
+            test_object(0xA3, b"failed-batch-three"),
+        ];
+        set_nudb_test_batch_error(point);
+        let error = backend
+            .store_batch_result(&interrupted)
+            .expect_err("failpoint must reject checked batch");
+        assert!(error.contains("injected checked-batch failure"));
+        assert!(
+            fs::metadata(temp.path().join("nudb.log"))
+                .expect("recovery log metadata")
+                .len()
+                > 0,
+            "fail-stop must preserve the active recovery checkpoint"
+        );
+        assert!(backend.sync_result().unwrap_err().contains("fail-stopped"));
+        assert!(
+            backend
+                .store(test_object(0xA4, b"write-after-fail-stop"))
+                .unwrap_err()
+                .contains("fail-stopped")
+        );
+        assert!(
+            backend
+                .verify_backend()
+                .unwrap_err()
+                .contains("fail-stopped")
+        );
+        let mut visited = Vec::new();
+        assert!(
+            backend
+                .for_each_result(&mut |object| visited.push(object))
+                .unwrap_err()
+                .contains("fail-stopped")
+        );
+        assert!(backend.close().unwrap_err().contains("fail-stopped"));
+        assert!(!backend.is_open());
+        assert!(
+            fs::metadata(temp.path().join("nudb.log"))
+                .expect("preserved recovery log metadata")
+                .len()
+                > 0
+        );
+        drop(backend);
+
+        let reopened = NuDbBackend::new(
+            NodeObject::KEY_BYTES,
+            &test_nudb_section(temp.path()),
+            64,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("reopened backend");
+        reopened
+            .open_deterministic(false, NUDB_APPNUM, uid, uid + 1)
+            .expect("log recovery reopen");
+        assert_eq!(reopened.fetch(committed.hash()).1, Status::Ok);
+        for object in interrupted {
+            assert_eq!(reopened.fetch(object.hash()).1, Status::NotFound);
+        }
+        reopened
+            .verify_backend()
+            .expect("recovered backend verifies");
+    }
+
+    #[test]
+    fn checked_batch_failure_after_append_fail_stops_and_recovers() {
+        assert_checked_batch_fail_stop_recovers(NuDbTestBatchErrorPoint::AfterAppend, 95_001);
+    }
+
+    #[test]
+    fn checked_batch_failure_during_index_insert_fail_stops_and_recovers() {
+        assert_checked_batch_fail_stop_recovers(NuDbTestBatchErrorPoint::IndexInsert(2), 96_001);
     }
 
     #[test]
@@ -3319,16 +4094,16 @@ mod tests {
     }
 
     #[test]
-    fn nudb_open_args_and_metadata_preserve_xrpld_appnum_contract() {
-        let open_args = NuDbOpenArgs::xrpld_default(11, 22);
+    fn nudb_open_args_and_metadata_preserve_rippled_appnum_contract() {
+        let open_args = NuDbOpenArgs::quaxar_default(11, 22);
         assert_eq!(open_args.app_type, NUDB_APPNUM);
 
         let header = NuDbMetadataHeader::new(NUDB_APPNUM, 11, 22, 32, 4096);
-        header.validate_for_xrpld().expect("xrpld header");
+        header.validate_for_quaxar().expect("Quaxar header");
 
         let wrong = NuDbMetadataHeader::new(99, 11, 22, 32, 4096);
         assert_eq!(
-            wrong.validate_for_xrpld().expect_err("wrong appnum"),
+            wrong.validate_for_quaxar().expect_err("wrong appnum"),
             "nodestore: unknown appnum"
         );
     }
@@ -3474,9 +4249,9 @@ mod tests {
             config.metadata_header(NuDbOpenArgs::deterministic(NUDB_APPNUM, 55, 66)),
         )
         .expect("disk header");
-        config
-            .write_key_file_header_for_tests(&disk_header)
-            .expect("write key header");
+        let mut key_file = encode_nudb_key_file_header(&disk_header).expect("encode key header");
+        key_file.extend_from_slice(&vec![0u8; usize::from(disk_header.block_size)]);
+        fs::write(&config.layout.key_path, key_file).expect("write key header and bucket");
 
         let read = read_nudb_key_file_header(&config.layout.key_path).expect("read key header");
         assert_eq!(read.version, NUDB_CURRENT_VERSION);
@@ -3488,6 +4263,31 @@ mod tests {
         assert_eq!(read.block_size, 4096);
         assert_eq!(read.capacity, nudb_bucket_capacity(4096));
         assert_eq!(nudb_decode_load_factor(read.load_factor), 0.5);
+    }
+
+    #[test]
+    fn nudb_key_header_accepts_zero_bucket_initial_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("nudb.key");
+        let header = NuDbKeyFileHeader {
+            version: NUDB_CURRENT_VERSION,
+            uid: 1,
+            appnum: NUDB_APPNUM,
+            key_size: 32,
+            salt: 2,
+            pepper: nudb_pepper(2),
+            block_size: 4096,
+            load_factor: nudb_encode_load_factor(0.5).expect("load factor"),
+            capacity: nudb_bucket_capacity(4096),
+            buckets: 0,
+            modulus: 1,
+        };
+        fs::write(&path, encode_nudb_key_file_header(&header).expect("encode"))
+            .expect("write zero-bucket header");
+
+        let read = read_nudb_key_file_header(&path).expect("zero-bucket initial header");
+        assert_eq!(read.buckets, 0);
+        assert_eq!(read.modulus, 1);
     }
 
     #[test]

@@ -17,47 +17,61 @@ use std::{cell::RefCell, sync::Arc};
 use basics::math::base_uint::Uint160;
 use protocol::{
     AccountID, Asset, PARITY_RATE, STAmount, STLedgerEntry, STTx, Ter, XRPAmount, divide_rate,
-    get_field_by_symbol, is_ter_retry, is_tes_success, multiply_rate,
+    equal_tokens, get_field_by_symbol, is_ter_retry, is_tes_success, multiply_rate,
 };
 thread_local! {
-    static MPT_DELIVERED_AMOUNT_CAPTURES: RefCell<Vec<Option<STAmount>>> = const { RefCell::new(Vec::new()) };
+    static DELIVERED_AMOUNT_CAPTURES: RefCell<Vec<Option<STAmount>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Scoped equivalent of rippled's `ApplyContext::deliver` handoff for direct
-/// MPT payment metadata. Transaction-shell callers that do not construct
-/// metadata safely discard the capture when their application returns.
-pub struct MptDeliveredAmountCapture {
+/// Scoped equivalent of rippled's `ApplyContext::deliver` metadata handoff.
+/// Transaction-shell callers that do not construct metadata safely discard the
+/// capture when their application returns.
+pub struct DeliveredAmountCapture {
     active: bool,
 }
 
-impl MptDeliveredAmountCapture {
+impl Default for DeliveredAmountCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeliveredAmountCapture {
     pub fn new() -> Self {
-        MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().push(None));
+        DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().push(None));
         Self { active: true }
     }
 
     pub fn finish(mut self) -> Option<STAmount> {
         self.active = false;
-        MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().pop().flatten())
+        DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().pop().flatten())
     }
 }
 
-impl Drop for MptDeliveredAmountCapture {
+impl Drop for DeliveredAmountCapture {
     fn drop(&mut self) {
         if self.active {
-            MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| {
+            DELIVERED_AMOUNT_CAPTURES.with(|captures| {
                 let _ = captures.borrow_mut().pop();
             });
         }
     }
 }
 
-fn record_mpt_delivered_amount(amount: STAmount) {
-    MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| {
+pub(crate) fn record_delivered_amount(amount: STAmount) {
+    DELIVERED_AMOUNT_CAPTURES.with(|captures| {
         if let Some(delivered_amount) = captures.borrow_mut().last_mut() {
             *delivered_amount = Some(amount);
         }
     });
+}
+
+fn should_record_path_delivered_amount(
+    result: Ter,
+    actual_amount_out: &STAmount,
+    destination_amount: &STAmount,
+) -> bool {
+    is_tes_success(result) && actual_amount_out != destination_amount
 }
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -69,12 +83,23 @@ const TF_NO_RIPPLE_DIRECT: u32 = 0x0001_0000;
 const TF_LIMIT_QUALITY: u32 = 0x0004_0000;
 
 const LSF_REQUIRE_DEST_TAG: u32 = 0x0002_0000;
-const LSF_DEPOSIT_AUTH: u32 = 0x0100_0000;
 const LSF_PASSWORD_SPENT: u32 = 0x0001_0000;
 // Kept for compatibility with the reference source flag checks; the current Rust path does
 // not yet consume the trustline-auth branch directly.
 #[allow(dead_code)]
 const LSF_REQUIRE_AUTH: u32 = 0x0004_0000;
+
+fn is_redundant_self_payment(
+    account: AccountID,
+    destination: AccountID,
+    source_amount: &STAmount,
+    destination_amount: &STAmount,
+    has_paths: bool,
+) -> bool {
+    account == destination
+        && equal_tokens(source_amount.asset(), destination_amount.asset())
+        && !has_paths
+}
 
 /// Full reference Payment::doApply parity.
 ///
@@ -128,50 +153,60 @@ pub fn do_payment<V: ledger::ApplyView>(
 
     let dst_keylet = protocol::account_keylet(Uint160::from_void(dst_account_id.data()));
 
-    // A ripple payment is one that uses paths, SendMax, or delivers IOU.
-    let is_ripple = has_paths || send_max.is_some() || !dst_amount.native();
-    if account == dst_account_id && is_ripple {
-        return Ter::TEC_PATH_DRY;
-    }
-    if account == dst_account_id {
+    // Match rippled Payment::preflight: a payment to self is redundant only
+    // when source and destination assets are identical and no explicit path
+    // can perform an arbitrage/conversion. Cross-currency self-payments must
+    // continue into Flow; rejecting them here as tecPATH_DRY forks valid
+    // mainnet ledger state.
+    if is_redundant_self_payment(
+        account,
+        dst_account_id,
+        &max_source_amount,
+        &dst_amount,
+        has_paths,
+    ) {
         return Ter::TEM_REDUNDANT;
     }
 
     // Peek destination account
     let dst_exists = view.peek(dst_keylet).ok().flatten();
 
-    if dst_exists.is_none() {
-        // Destination account does not exist
-        if !dst_amount.native() {
-            // Can't create account with IOU
-            return Ter::TEC_NO_DST;
-        }
-        // Can't create account with partial payment
-        if view.open() && partial_payment_allowed {
-            return Ter::TEL_NO_DST_PARTIAL;
-        }
-        // Check minimum reserve for account creation
-        let reserve = view.fees().reserve;
-        if dst_amount.xrp().drops() < reserve as i64 {
-            static NO_DST_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if NO_DST_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
-                tracing::debug!(target: "tx",
-                    "[payment_debug] NO_DST_INSUF_XRP: amount_drops={} reserve={} partial={}",
-                    dst_amount.xrp().drops(),
-                    reserve,
-                    partial_payment_allowed
-                );
+    match dst_exists.as_ref() {
+        None => {
+            // Destination account does not exist
+            if !dst_amount.native() {
+                // Can't create account with IOU
+                return Ter::TEC_NO_DST;
             }
-            return Ter::TEC_NO_DST_INSUF_XRP;
+            // Can't create account with partial payment
+            if view.open() && partial_payment_allowed {
+                return Ter::TEL_NO_DST_PARTIAL;
+            }
+            // Check minimum reserve for account creation
+            let reserve = view.fees().reserve;
+            if dst_amount.xrp().drops() < reserve as i64 {
+                static NO_DST_LOG: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if NO_DST_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+                    tracing::debug!(target: "tx",
+                        "[payment_debug] NO_DST_INSUF_XRP: amount_drops={} reserve={} partial={}",
+                        dst_amount.xrp().drops(),
+                        reserve,
+                        partial_payment_allowed
+                    );
+                }
+                return Ter::TEC_NO_DST_INSUF_XRP;
+            }
         }
-    } else {
-        let dst_sle = dst_exists.as_ref().unwrap();
-        let dst_flags = dst_sle.get_field_u32(sf("sfFlags"));
+        Some(dst_sle) => {
+            let dst_flags = dst_sle.get_field_u32(sf("sfFlags"));
 
-        // Check DestinationTag requirement
-        if (dst_flags & LSF_REQUIRE_DEST_TAG) != 0 && !sttx.is_field_present(sf("sfDestinationTag"))
-        {
-            return Ter::TEC_DST_TAG_NEEDED;
+            // Check DestinationTag requirement
+            if (dst_flags & LSF_REQUIRE_DEST_TAG) != 0
+                && !sttx.is_field_present(sf("sfDestinationTag"))
+            {
+                return Ter::TEC_DST_TAG_NEEDED;
+            }
         }
     }
 
@@ -208,7 +243,9 @@ pub fn do_payment<V: ledger::ApplyView>(
 
         // Deposit preauth check for IOU payments
         if let Some(ref dst_sle) = dst_exists {
-            if let Some(ter) = check_deposit_preauth(view, &account, &dst_account_id, dst_sle) {
+            if let Some(ter) =
+                verify_deposit_preauth(view, sttx, &account, &dst_account_id, dst_sle)
+            {
                 return ter;
             }
         }
@@ -218,6 +255,9 @@ pub fn do_payment<V: ledger::ApplyView>(
             default_paths_allowed,
             limit_quality,
             is_ledger_open: view.open(),
+            domain_id: sttx
+                .is_field_present(sf("sfDomainID"))
+                .then(|| sttx.get_field_h256(sf("sfDomainID"))),
         };
 
         let paths = if has_paths {
@@ -258,6 +298,17 @@ pub fn do_payment<V: ledger::ApplyView>(
                 if is_ter_retry(result) {
                     result = Ter::TEC_PATH_DRY;
                 }
+                if should_record_path_delivered_amount(
+                    result,
+                    &output.actual_amount_out,
+                    &dst_amount,
+                ) {
+                    // `Payment::doApply` hands Flow's actual output to
+                    // ApplyContext only when it differs from Amount, so
+                    // TxMeta records DeliveredAmount for successful partial
+                    // payments without changing exact-payment metadata.
+                    record_delivered_amount(output.actual_amount_out);
+                }
 
                 result
             }
@@ -265,7 +316,9 @@ pub fn do_payment<V: ledger::ApplyView>(
         }
     } else if is_dst_mpt {
         if let Some(ref dst_sle) = dst_exists {
-            if let Some(ter) = check_deposit_preauth(view, &account, &dst_account_id, dst_sle) {
+            if let Some(ter) =
+                verify_deposit_preauth(view, sttx, &account, &dst_account_id, dst_sle)
+            {
                 return ter;
             }
         }
@@ -288,6 +341,7 @@ pub fn do_payment<V: ledger::ApplyView>(
             &dst_amount,
             dst_exists,
             pre_fee_balance_drops,
+            sttx,
         )
     }
 }
@@ -389,11 +443,12 @@ fn do_direct_mpt_payment<V: ledger::ApplyView>(
     {
         // Matches Payment.cpp: direct MPT payments use the actual net amount,
         // not the requested destination amount, when the amendment is active.
-        record_mpt_delivered_amount(amount_deliver);
+        record_delivered_amount(amount_deliver);
     }
     result
 }
 
+#[allow(dead_code)] // reserve for M7 sweep
 fn is_direct_iou_payment(
     dst_amount: &STAmount,
     send_max: Option<&STAmount>,
@@ -416,6 +471,7 @@ fn is_direct_iou_payment(
         .is_some_and(|send_max| send_max.asset() == dst_amount.asset() && send_max == dst_amount)
 }
 
+#[allow(dead_code)] // reserve for M7 sweep
 fn do_direct_iou_payment<V: ledger::ApplyView>(
     view: &mut V,
     account: &AccountID,
@@ -447,7 +503,7 @@ fn do_direct_iou_payment<V: ledger::ApplyView>(
     let available = if *account == issue.account {
         dst_amount.clone()
     } else {
-        let mut balance = ledger::ripple_state_helpers::credit_balance(
+        let mut balance = ledger::ripple_state_helpers::account_holds(
             view,
             account,
             &issue.account,
@@ -498,6 +554,7 @@ fn do_direct_xrp_payment<V: ledger::ApplyView>(
     dst_amount: &STAmount,
     dst_sle_opt: Option<Arc<STLedgerEntry>>,
     pre_fee_balance_drops: Option<i64>,
+    sttx: &STTx,
 ) -> Ter {
     let xrp_drops = dst_amount.xrp().drops();
     if xrp_drops <= 0 {
@@ -566,7 +623,7 @@ fn do_direct_xrp_payment<V: ledger::ApplyView>(
     let dst_reserve = view.fees().reserve as i64;
     let dst_balance = dst_sle.get_field_amount(sf("sfBalance")).xrp().drops();
     if xrp_drops > dst_reserve || dst_balance > dst_reserve {
-        if let Some(ter) = check_deposit_preauth(view, account, dst_account_id, &dst_sle) {
+        if let Some(ter) = verify_deposit_preauth(view, sttx, account, dst_account_id, &dst_sle) {
             return ter;
         }
     }
@@ -604,33 +661,115 @@ fn do_direct_xrp_payment<V: ledger::ApplyView>(
 
 ///
 /// Returns `None` if deposit is allowed, `Some(Ter)` if rejected.
-fn check_deposit_preauth<V: ledger::ApplyView>(
-    view: &V,
+fn verify_deposit_preauth<V: ledger::ApplyView>(
+    view: &mut V,
+    sttx: &STTx,
     src: &AccountID,
     dst: &AccountID,
     dst_sle: &STLedgerEntry,
 ) -> Option<Ter> {
-    // If source == destination, always allowed
-    if src == dst {
-        return None;
+    match ledger::credential_helpers::verify_deposit_preauth(sttx, view, src, dst, Some(dst_sle)) {
+        Ok(Ter::TES_SUCCESS) => None,
+        Ok(ter) => Some(ter),
+        Err(_) => Some(Ter::TEF_BAD_LEDGER),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_redundant_self_payment, should_record_path_delivered_amount};
+    use protocol::{AccountID, Issue, STAmount, Ter, XRPAmount, get_field_by_symbol};
+
+    #[test]
+    fn exact_path_payment_does_not_record_delivered_amount() {
+        let requested = STAmount::from_xrp_amount(XRPAmount::from_drops(20));
+        let partial = STAmount::from_xrp_amount(XRPAmount::from_drops(19));
+
+        assert!(!should_record_path_delivered_amount(
+            Ter::TES_SUCCESS,
+            &requested,
+            &requested,
+        ));
+        assert!(should_record_path_delivered_amount(
+            Ter::TES_SUCCESS,
+            &partial,
+            &requested,
+        ));
+        assert!(!should_record_path_delivered_amount(
+            Ter::TEC_PATH_PARTIAL,
+            &partial,
+            &requested,
+        ));
     }
 
-    let dst_flags = dst_sle.get_field_u32(sf("sfFlags"));
+    #[test]
+    fn cross_currency_self_payment_is_not_redundant() {
+        let account = AccountID::from_array([0x11; 20]);
+        let source_issue = Issue {
+            currency: protocol::Currency::from_array([0x22; 20]),
+            account: AccountID::from_array([0x33; 20]),
+        };
+        let destination_issue = Issue {
+            currency: protocol::Currency::from_array([0x44; 20]),
+            account: AccountID::from_array([0x55; 20]),
+        };
+        let source = STAmount::from_iou_amount(
+            get_field_by_symbol("sfSendMax"),
+            protocol::IOUAmount::from_parts(1, 0).expect("valid positive IOU amount"),
+            source_issue,
+        );
+        let destination = STAmount::from_iou_amount(
+            get_field_by_symbol("sfAmount"),
+            protocol::IOUAmount::from_parts(1, 0).expect("valid positive IOU amount"),
+            destination_issue,
+        );
+        assert!(!is_redundant_self_payment(
+            account,
+            account,
+            &source,
+            &destination,
+            false,
+        ));
 
-    // If destination doesn't have deposit auth, always allowed
-    if (dst_flags & LSF_DEPOSIT_AUTH) == 0 {
-        return None;
+        let xrp = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+        assert!(is_redundant_self_payment(
+            account, account, &xrp, &xrp, false,
+        ));
     }
 
-    // Check if source is deposit-preauthorized by destination
-    let preauth_keylet = protocol::deposit_preauth_keylet(
-        Uint160::from_void(dst.data()),
-        Uint160::from_void(src.data()),
-    );
-    if view.exists(preauth_keylet).unwrap_or(false) {
-        return None;
-    }
+    #[test]
+    fn same_currency_iou_self_payment_is_redundant_despite_issuer_change() {
+        let account = AccountID::from_array([0x11; 20]);
+        let source = STAmount::from_iou_amount(
+            get_field_by_symbol("sfSendMax"),
+            protocol::IOUAmount::from_parts(1, 0).expect("valid positive IOU amount"),
+            Issue {
+                currency: protocol::Currency::from_array([0x22; 20]),
+                account: AccountID::from_array([0x33; 20]),
+            },
+        );
+        let destination = STAmount::from_iou_amount(
+            get_field_by_symbol("sfAmount"),
+            protocol::IOUAmount::from_parts(1, 0).expect("valid positive IOU amount"),
+            Issue {
+                currency: protocol::Currency::from_array([0x22; 20]),
+                account: AccountID::from_array([0x55; 20]),
+            },
+        );
 
-    // Not authorized
-    Some(Ter::TEC_NO_PERMISSION)
+        assert!(is_redundant_self_payment(
+            account,
+            account,
+            &source,
+            &destination,
+            false,
+        ));
+        assert!(!is_redundant_self_payment(
+            account,
+            account,
+            &source,
+            &destination,
+            true,
+        ));
+    }
 }

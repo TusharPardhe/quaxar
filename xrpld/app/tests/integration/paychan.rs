@@ -12,8 +12,9 @@ use std::sync::Arc;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ApplyViewImpl, Ledger, LedgerHeader, ReadView};
 use protocol::{
-    AccountID, ApplyFlags, LedgerEntryType, STAmount, STLedgerEntry, STTx, Ter, TxType, XRPAmount,
-    account_keylet, get_field_by_symbol, owner_dir_keylet,
+    AccountID, ApplyFlags, KeyType, LedgerEntryType, STAmount, STLedgerEntry, STTx, SecretKey, Ter,
+    TxType, XRPAmount, account_keylet, derive_public_key, get_field_by_symbol, owner_dir_keylet,
+    serialize_pay_chan_authorization,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -109,6 +110,36 @@ fn paychan_claim_tx(from: AccountID, channel: Uint256, seq: u32) -> STTx {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), seq);
         tx.set_field_u32(sf("sfFlags"), 0x00020000); // tfClose
+    })
+}
+
+fn payment_channel(
+    key: Uint256,
+    source: AccountID,
+    destination: AccountID,
+    amount: i64,
+    balance: i64,
+) -> STLedgerEntry {
+    let mut channel = STLedgerEntry::new(protocol::pay_channel_keylet_from_key(key));
+    channel.set_account_id(sf("sfAccount"), source);
+    channel.set_account_id(sf("sfDestination"), destination);
+    channel.set_field_amount(sf("sfAmount"), xrp(amount));
+    channel.set_field_amount(sf("sfBalance"), xrp(balance));
+    channel.set_field_u32(sf("sfSettleDelay"), 60);
+    channel.set_field_vl(sf("sfPublicKey"), &[2; 33]);
+    channel.set_field_u64(sf("sfOwnerNode"), 0);
+    channel.set_field_u64(sf("sfDestinationNode"), 0);
+    channel
+}
+
+fn paychan_balance_claim_tx(from: AccountID, channel: Uint256, balance: i64, seq: u32) -> STTx {
+    STTx::new(TxType::PAYCHAN_CLAIM, move |tx| {
+        tx.set_account_id(sf("sfAccount"), from);
+        tx.set_field_h256(sf("sfChannel"), channel);
+        tx.set_field_amount(sf("sfBalance"), xrp(balance));
+        tx.set_field_amount(sf("sfAmount"), xrp(balance));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), seq);
     })
 }
 
@@ -303,6 +334,85 @@ fn paychan_claim_nonexistent() {
     let tx = paychan_claim_tx(alice, fake_chan, 1);
     let result = full_apply(&mut view, &tx, TxType::PAYCHAN_CLAIM);
     assert_eq!(result, Ter::TEC_NO_TARGET);
+}
+
+#[test]
+fn paychan_destination_balance_claim_requires_signature() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let channel = Uint256::from_array([0xCC; 32]);
+    let ledger = make_ledger(vec![
+        account_root(alice, 5_000_000_000, 1, 0),
+        account_root(bob, 5_000_000_000, 0, 0),
+        payment_channel(channel, alice, bob, 1_000_000, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let tx = paychan_balance_claim_tx(bob, channel, 500_000, 1);
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::PAYCHAN_CLAIM),
+        Ter::TEM_BAD_SIGNATURE
+    );
+    assert_eq!(get_balance(&view, bob), 5_000_000_000);
+}
+
+#[test]
+fn paychan_source_claim_obeys_destination_deposit_auth() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let channel = Uint256::from_array([0xCD; 32]);
+    let lsf_deposit_auth = 0x0100_0000;
+    let ledger = make_ledger(vec![
+        account_root(alice, 5_000_000_000, 1, 0),
+        account_root(bob, 5_000_000_000, 0, lsf_deposit_auth),
+        payment_channel(channel, alice, bob, 1_000_000, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let tx = paychan_balance_claim_tx(alice, channel, 500_000, 1);
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::PAYCHAN_CLAIM),
+        Ter::TEC_NO_PERMISSION
+    );
+    assert_eq!(get_balance(&view, bob), 5_000_000_000);
+    let stored = view
+        .read(protocol::pay_channel_keylet_from_key(channel))
+        .expect("read")
+        .expect("channel retained");
+    assert_eq!(stored.get_field_amount(sf("sfBalance")).xrp().drops(), 0);
+}
+
+#[test]
+fn paychan_claim_signature_key_must_match_channel_key() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let channel = Uint256::from_array([0xCE; 32]);
+    let secret = SecretKey::from_bytes([7; 32]);
+    let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+    let authorization = serialize_pay_chan_authorization(&channel, 500_000);
+    let signature = protocol::sign::sign(&public, &secret, &authorization).expect("signature");
+    let ledger = make_ledger(vec![
+        account_root(alice, 5_000_000_000, 1, 0),
+        account_root(bob, 5_000_000_000, 0, 0),
+        payment_channel(channel, alice, bob, 1_000_000, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::PAYCHAN_CLAIM, |tx| {
+        tx.set_account_id(sf("sfAccount"), bob);
+        tx.set_field_h256(sf("sfChannel"), channel);
+        tx.set_field_amount(sf("sfBalance"), xrp(500_000));
+        tx.set_field_amount(sf("sfAmount"), xrp(500_000));
+        tx.set_field_vl(sf("sfPublicKey"), public.as_bytes());
+        tx.set_field_vl(sf("sfSignature"), &signature);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::PAYCHAN_CLAIM),
+        Ter::TEM_BAD_SIGNER
+    );
+    assert_eq!(get_balance(&view, bob), 5_000_000_000);
 }
 
 /// C++ PayChan_test — destination requires tag.

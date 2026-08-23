@@ -1,8 +1,8 @@
 use basics::base_uint::Uint256;
 use basics::basic_config::Section;
 use nodestore::{
-    Backend, EncodedBlob, JournalLevel, NUDB_APPNUM, NodeObject, NodeObjectType, NodeStoreJournal,
-    NuDbBackend, Status, nodeobject_compress,
+    Backend, EncodedBlob, JournalLevel, NUDB_APPNUM, NUDB_DATA_FILE_HEADER_SIZE, NodeObject,
+    NodeObjectType, NodeStoreJournal, NuDbBackend, Status, nodeobject_compress,
 };
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
@@ -86,6 +86,46 @@ fn nudb_for_each_visits_indexed_records_and_skips_orphan_data_file_rows() {
     let expected_set: BTreeSet<_> = [*first.hash(), *second.hash()].into_iter().collect();
     assert_eq!(seen_set, expected_set);
     assert!(!seen_set.contains(orphan.hash()));
+}
+
+#[test]
+fn nudb_for_each_result_reports_injected_record_decompression_failure() {
+    let temp = TempDir::new().expect("tempdir");
+    let backend = NuDbBackend::new(
+        nodestore::NodeObject::KEY_BYTES,
+        &nudb_section(temp.path()),
+        8,
+        Arc::new(QuietJournal),
+    )
+    .expect("nudb backend");
+    backend
+        .open_deterministic(true, NUDB_APPNUM, 7002, 8002)
+        .expect("open");
+    backend
+        .store(object(0x12, b"corrupt-traversal-record"))
+        .expect("store");
+    backend.sync_result().expect("commit before corruption");
+
+    let value_offset =
+        u64::try_from(NUDB_DATA_FILE_HEADER_SIZE + 6 + nodestore::NodeObject::KEY_BYTES)
+            .expect("data offset fits u64");
+    let mut data_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(temp.path().join("nudb.dat"))
+        .expect("open data file");
+    data_file
+        .seek(SeekFrom::Start(value_offset))
+        .expect("seek compressed value");
+    data_file
+        .write_all(&[0x7f])
+        .expect("inject invalid compression type");
+    data_file.sync_all().expect("sync injected corruption");
+
+    let error = backend
+        .for_each_result(&mut |_| {})
+        .expect_err("fallible traversal must reject corrupt record");
+    assert_eq!(error, "nodeobject codec: bad type=127");
 }
 
 #[test]

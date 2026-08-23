@@ -5,11 +5,47 @@
 Start the server with an explicit config file:
 
 ```bash
-quaxar --conf /etc/xrpld/xrpld.cfg
+quaxar --conf /etc/quaxar/quaxar.cfg
 ```
 
-Running `quaxar` without a subcommand prints help. This avoids accidentally
-starting a node with an unintended default configuration.
+For an isolated lab or explicitly controlled deployment, a minimum validation
+quorum can be overridden at startup:
+
+```bash
+quaxar --conf /etc/quaxar/quaxar.cfg --quorum 2
+```
+
+`--quorum` overrides the quorum derived from the trusted validator list and can
+be unsafe on a public network. Use it only when the validator set and failure
+model are deliberately controlled.
+
+Running `quaxar` without arguments prints help and exits. Installed services
+should pass `--conf /etc/quaxar/quaxar.cfg` explicitly to start the node.
+The executable comes from the `quaxar-main` Cargo package and uses the
+`quaxar-cli` library; the retained `xrpld/main` source path is not an installed
+program name.
+
+The top-level `--help` output describes operator subcommands and the global
+`--conf` and `--rpc-url` options. Server startup also accepts these operational
+modes, which are parsed by the bootstrap path rather than Clap:
+
+| Option | Purpose |
+|--------|---------|
+| `--standalone`, `-a` | Run without the peer network. |
+| `--start` | Create a fresh ledger for a private network. |
+| `--net` | Acquire the initial ledger from the network. |
+| `--load` | Load the current ledger from the local database. |
+| `--import` | Run the node-database import startup path. |
+| `--valid` | Assert that the initial ledger is a valid network ledger. |
+| `--quorum <n>` | Override the minimum validation quorum. |
+
+The data-recovery and fresh-ledger modes can change the selected startup state.
+Use them only with an understood database and network plan; ordinary service
+operation needs only an explicit `--conf`. The bootstrap parser contains
+additional value-taking recovery/test flags, but the combined executable's
+current command pre-dispatch does not pass them through reliably (for example,
+`--ledger <id>` is treated as an operator command). They are intentionally not
+documented here as supported CLI options.
 
 ## Interactive Mode
 
@@ -31,25 +67,27 @@ Features:
 
 | Command | Description |
 |---------|-------------|
-| `status` | Server state, uptime, ledger range |
-| `health` | Health check with semantic states |
+| `status` | Point-in-time server state, uptime, peers, and complete-ledger range |
+| `health` | RPC reachability with a point-in-time state label; not a readiness gate |
 | `peers` | Connected peers with latency and version |
 | `fee` | Current transaction fee |
 | `ledger [seq]` | Ledger info (latest validated or by sequence) |
 | `account <address>` | Account balance and details |
-| `sync-status` | Current sync progress and state |
+| `sync-status` | Current operating mode and validated-ledger progress |
 | `rpc <method> [params]` | Call any JSON-RPC method directly |
 | `ping` | Ping the local RPC server |
 | `server-info` | Raw `server_info` output |
 | `server-state` | Raw `server_state` output |
 | `server-definitions` | Raw `server_definitions` output |
-| `ledger-closed` | Latest closed ledger sequence and hash |
+| `ledger-closed` | Canonical local closed-ledger sequence and hash |
 | `ledger-current` | Current open ledger index |
 | `ledger-header` | Validated ledger header |
-| `fetch-info` | Ledger acquisition/fetch state |
+| `fetch-info` | Coordinator phase/anchors, sessions, counters, and recovery decision |
 | `get-counts` | Raw cache, ledger, and node-store counters |
 | `can-delete [value]` | Get or set advisory online-delete ledger |
-| `log-rotate` | Request runtime log rotation |
+| `config` | Validate a configuration file without starting the node |
+| `connect <address>` | Request an outbound peer connection |
+| `log-rotate` | Compatibility command; currently a successful no-op |
 | `random` | Generate random bytes through RPC |
 | `validator-info` | Raw validator node information |
 | `validator-list-sites` | Raw validator list site status |
@@ -59,9 +97,10 @@ Features:
 | `validators` | Trusted validator list and agreement |
 | `amendments` | Amendment status and voting |
 | `db-stats` | NuDB disk usage and database statistics |
-| `log-level [level]` | Get or set log level |
+| `log-level <level>` | Set log level; the no-argument query is not yet populated |
 | `benchmark` | Run internal performance benchmarks |
 | `validator-keys` | Key management (see below) |
+| `cli` | Open the interactive operator shell |
 | `export-snapshot` | Export node store to snapshot file (admin RPC) |
 | `load-snapshot` | Import snapshot into node store (offline) |
 | `doctor` | Diagnose common configuration issues |
@@ -73,16 +112,30 @@ Features:
 | Command | Description |
 |---------|-------------|
 | `validator-keys generate` | Generate a new validator key pair |
-| `validator-keys create-token` | Create a validator token from master key |
-| `validator-keys sign` | Sign a message with the validator key |
-| `validator-keys revoke` | Revoke a validator key (publish revocation) |
-| `validator-keys show` | Display public key and manifest |
+| `validator-keys create-token` | Create an experimental token payload |
+| `validator-keys sign` | Experimental local signing helper |
+| `validator-keys revoke` | Create an experimental revocation payload |
+| `validator-keys show` | Display the saved public key and creation time |
+
+`generate` writes a non-overwriting, mode-`0600` `validator-keys.json` in the
+current directory. The supported server configuration path uses its
+`validation_seed` value in `[validation_seed]`. The token/sign/revoke helpers
+are not yet documented as production-compatible with `rippled`; see
+[VALIDATORS.md](VALIDATORS.md).
+
+`fetch-info` exposes two related but distinct facts. NetworkOps forwards an
+installed, chain-contiguous publication independently of freshness, but a
+Tracking phase records it only when a fresh, non-divergent observation promotes
+the phase to Full. Once Full, newer contiguous identities are recorded even on
+a non-promoting pass. During initial catch-up, session expiry or replacement
+does not imply its verified SHAMap nodes were discarded; pair this command with
+`get-counts` and repeated ledger-head samples.
 
 ## RPC Port Auto-Discovery
 
 The CLI automatically finds the RPC port by:
 1. Reading `--conf <path>` if provided
-2. Looking for `xrpld.cfg` in the current directory
+2. Looking for `quaxar.cfg` in the current directory
 3. Parsing the first `[port_*]` section with `protocol = http`
 4. Falling back to `http://127.0.0.1:5005`
 
@@ -121,7 +174,7 @@ quaxar get-counts
 # Show ledger acquisition state
 quaxar fetch-info
 
-# Rotate logs
+# Call the compatibility log-rotation endpoint (currently a no-op)
 quaxar log-rotate
 
 # Change log level to debug
@@ -137,7 +190,7 @@ quaxar ledger 95000000
 quaxar db-stats
 
 # Database statistics using a specific config file
-quaxar db-stats --conf /etc/xrpld.cfg
+quaxar db-stats --conf /etc/quaxar/quaxar.cfg
 
 # Generate validator keys
 quaxar validator-keys generate
@@ -176,34 +229,34 @@ Import a snapshot file into the node store. The node must be stopped before
 running this command.
 
 ```bash
-quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
+quaxar load-snapshot --input /path/to/snapshot.xrpls --conf /etc/quaxar/quaxar.cfg
 ```
 
 | Flag | Required | Description |
 |------|----------|-------------|
 | `--input` | Yes | Path to snapshot file |
-| `--conf` | Yes | Path to config file (determines NuDB path) |
+| `--conf` | No | Config path determining the NodeStore; defaults to `/etc/quaxar/quaxar.cfg` |
 
 The import uses bulk loading mode with pre-allocated NuDB hash tables. The CLI
 shows a spinner throughout the synchronous import and reports success only
-after the loader has verified every chunk and the final file hash. On NVMe,
-26.5M nodes load in approximately 3 minutes.
+after the loader has verified every chunk and the final file hash. Runtime
+depends on snapshot size, storage, CPU, and available memory.
 
 ## Exit Codes
 
-| Command | Code | Meaning |
-|---------|------|---------|
-| `health` | 0 | Node is reachable (healthy or syncing) |
-| `health` | 1 | Node is unreachable (down) |
-| RPC-backed commands | 0 | RPC returned `status: success` |
-| RPC-backed commands | 1 | RPC connection failed or returned an error |
-| All others | 0 | Success |
-| All others | 1 | Error |
+`health` exits 0 when the node is reachable (including while syncing) and 1
+when it is unreachable. RPC-backed commands generally return 1 for connection
+or RPC errors, and command-line parse errors return 1. The current `config`,
+`doctor`, `benchmark`, interactive CLI, and `validator-keys` dispatch paths
+return 0 after invocation even when the command printed a diagnostic; do not
+use their exit status as an automation contract yet. Readiness automation must
+sample closed, validated, and coordinator phase progress across several ledger
+closes.
 
 ## Health States
 
 | State | Display | Meaning |
 |-------|---------|---------|
-| `full` / `proposing` / `validating` | ● Healthy (green) | Fully synced |
+| `full` / `proposing` / `validating` | ● Reachable (green) | Point-in-time state; verify sustained convergence |
 | `tracking` / `syncing` / `connected` | ◐ Syncing (yellow) | Alive, not yet ready |
 | Unreachable | ● Down (red) | Cannot connect |

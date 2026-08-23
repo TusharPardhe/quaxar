@@ -16,6 +16,9 @@ struct InboundTransactionSet {
     seq: u32,
     acquire: Option<TransactionAcquire>,
     set: Option<Arc<SyncTree>>,
+    /// The direct completion channel was saturated. The completed map remains
+    /// in this bounded cache until the strand drains this replay marker.
+    completion_pending: bool,
 }
 
 pub struct InboundTransactions {
@@ -24,8 +27,9 @@ pub struct InboundTransactions {
     stopping: bool,
     peer_set_builder: Arc<dyn PeerSetBuilder>,
     filter_factory: Option<Arc<dyn TransactionAcquireFilterFactory>>,
-    /// Sends (txset_hash, txset_map) to the consensus thread.
-    map_complete_tx: Option<std::sync::mpsc::Sender<(Uint256, Arc<SyncTree>)>>,
+    /// Direct reference `mapComplete` callback into the consensus owner's
+    /// single ordered ingress. Returning false retains a durable replay marker.
+    map_complete_sink: Option<Arc<dyn Fn(Uint256, Arc<SyncTree>) -> bool + Send + Sync>>,
 }
 
 impl InboundTransactions {
@@ -51,7 +55,7 @@ impl InboundTransactions {
             stopping: false,
             peer_set_builder,
             filter_factory,
-            map_complete_tx: None,
+            map_complete_sink: None,
         }
     }
 
@@ -74,6 +78,9 @@ impl InboundTransactions {
             return None;
         }
 
+        // rippled creates an acquisition for every missing requested hash and
+        // bounds this map by `newRound`'s sequence window, not a fixed count.
+
         let mut tx_acquire = TransactionAcquire::with_filter_factory(
             hash,
             self.peer_set_builder.build(),
@@ -87,6 +94,7 @@ impl InboundTransactions {
                 seq: self.seq,
                 acquire: Some(tx_acquire),
                 set: None,
+                completion_pending: false,
             },
         );
 
@@ -129,6 +137,9 @@ impl InboundTransactions {
             return false;
         }
 
+        // rippled `giveSet` admits a completed map regardless of the number
+        // of neighboring round-window entries; `newRound` expires stale work.
+
         let inbound = self.sets.entry(hash).or_default();
         inbound.seq = inbound.seq.max(self.seq);
 
@@ -136,27 +147,70 @@ impl InboundTransactions {
         if is_new {
             inbound.set = Some(Arc::clone(&set));
         }
-        let was_acquiring = inbound.acquire.is_some();
+        let _was_acquiring = inbound.acquire.is_some();
         inbound.acquire = None;
 
-        // Only fire for sets that were being acquired (from_acquire=true or had
-        // an active TransactionAcquire), matching reference NetworkOPs::mapComplete.
-        if is_new
-            && (from_acquire || was_acquiring)
-            && let Some(tx) = &self.map_complete_tx
+        // Locally generated sets are announced synchronously by the consensus
+        // relay before it shares the corresponding proposal. Only an acquired
+        // set needs this completion handoff so the consensus owner can call
+        // `got_tx_set` after the asynchronous acquisition completes. This
+        // preserves rippled's effective ordering without making the owner
+        // strand a second lifecycle authority for locally owned sets.
+        if from_acquire
+            && is_new
+            && !self.notify_map_complete(hash, Arc::clone(&set))
+            && let Some(inbound) = self.sets.get_mut(&hash)
         {
-            let _ = tx.send((hash, set));
+            inbound.completion_pending = true;
         }
 
         is_new
     }
 
+    /// Returns `false` only when the direct bounded handoff could not accept
+    /// the completion. The set stays in the capped cache with a replay marker
+    /// for the strand's per-turn recovery drain.
+    fn notify_map_complete(&mut self, hash: Uint256, set: Arc<SyncTree>) -> bool {
+        let Some(sink) = &self.map_complete_sink else {
+            return false;
+        };
+        sink(hash, set)
+    }
+
+    /// Take a bounded, deterministic slice of completed maps whose direct
+    /// notification was rejected. The replay markers live in `sets`, whose
+    /// admission is capped, so overload cannot create another unbounded queue.
+    pub fn take_pending_map_completions(&mut self, budget: usize) -> Vec<(Uint256, Arc<SyncTree>)> {
+        let hashes: Vec<_> = self
+            .sets
+            .iter()
+            .filter(|(_, inbound)| inbound.completion_pending && inbound.set.is_some())
+            .map(|(hash, _)| *hash)
+            .take(budget)
+            .collect();
+        hashes
+            .into_iter()
+            .filter_map(|hash| {
+                let inbound = self.sets.get_mut(&hash)?;
+                inbound.completion_pending = false;
+                inbound.set.as_ref().map(|set| (hash, Arc::clone(set)))
+            })
+            .collect()
+    }
+
     /// Set the map_complete channel sender (reference mapComplete callback).
     pub fn set_map_complete_sender(
         &mut self,
-        tx: std::sync::mpsc::Sender<(Uint256, Arc<SyncTree>)>,
+        tx: std::sync::mpsc::SyncSender<(Uint256, Arc<SyncTree>)>,
     ) {
-        self.map_complete_tx = Some(tx);
+        self.set_map_complete_sink(Arc::new(move |hash, set| tx.try_send((hash, set)).is_ok()));
+    }
+
+    pub fn set_map_complete_sink(
+        &mut self,
+        sink: Arc<dyn Fn(Uint256, Arc<SyncTree>) -> bool + Send + Sync>,
+    ) {
+        self.map_complete_sink = Some(sink);
     }
 
     pub fn set_peer_set_builder(&mut self, builder: Arc<dyn PeerSetBuilder>) {
@@ -226,24 +280,29 @@ impl InboundTransactions {
             .filter(|(_, v)| v.acquire.is_some())
             .map(|(h, _)| *h)
             .collect();
+        let mut completed = Vec::new();
         for hash in hashes {
-            if let Some(inbound) = self.sets.get_mut(&hash) {
-                if let Some(acquire) = inbound.acquire.as_mut() {
-                    acquire.invoke_on_timer();
-                    if acquire.is_complete() {
-                        let set = Arc::new(acquire.map().clone());
-                        inbound.acquire = None;
-                        let is_new = inbound.set.is_none();
-                        if is_new {
-                            inbound.set = Some(Arc::clone(&set));
-                            if let Some(tx) = &self.map_complete_tx {
-                                let _ = tx.send((hash, set));
-                            }
-                        }
-                    } else if acquire.is_failed() {
-                        inbound.acquire = None;
+            if let Some(inbound) = self.sets.get_mut(&hash)
+                && let Some(acquire) = inbound.acquire.as_mut()
+            {
+                acquire.invoke_on_timer();
+                if acquire.is_complete() {
+                    let set = Arc::new(acquire.map().clone());
+                    inbound.acquire = None;
+                    if inbound.set.is_none() {
+                        inbound.set = Some(Arc::clone(&set));
+                        completed.push((hash, set));
                     }
+                } else if acquire.is_failed() {
+                    inbound.acquire = None;
                 }
+            }
+        }
+        for (hash, set) in completed {
+            if !self.notify_map_complete(hash, set)
+                && let Some(inbound) = self.sets.get_mut(&hash)
+            {
+                inbound.completion_pending = true;
             }
         }
     }

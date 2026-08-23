@@ -13,18 +13,15 @@
 //! explicit through a view trait plus flush/unshare callbacks while preserving
 //! the build ordering literally.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Display,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, fmt::Display, sync::Arc};
 
 use basics::base_uint::Uint256;
 use basics::str_hex::str_hex;
-use ledger::{CanonicalTXSet, Ledger, LedgerTxReadError, OpenView, XRP_LEDGER_EARLIEST_FEES};
+pub use ledger::LedgerReplay;
+use ledger::{CanonicalTXSet, Ledger, OpenView, TxsRawView, XRP_LEDGER_EARLIEST_FEES};
 use protocol::{
-    JsonOptions, Keylet, LedgerEntryType, STTx, Serializer, StBase, fee_settings_keylet,
-    skip_keylet,
+    JsonOptions, Keylet, LedgerEntryType, STTx, Serializer, StBase, Ter, fee_settings_keylet,
+    is_tes_success, skip_keylet,
 };
 use rayon::prelude::*;
 use shamap::{mutation::MutationError, traversal::TraversalError};
@@ -35,7 +32,7 @@ use crate::{LEDGER_RETRY_PASSES, LEDGER_TOTAL_PASSES};
 fn full_sync_debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("XRPLD_FULL_SYNC_DEBUG")
+        std::env::var("QUAXAR_FULL_SYNC_DEBUG")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
@@ -66,7 +63,7 @@ impl BuildLedgerJournal for NullBuildLedgerJournal {
 pub trait BuildLedgerView {
     fn open(&self) -> bool;
     fn tx_count(&self) -> usize;
-    fn apply_to_ledger(self, ledger: &mut Ledger);
+    fn apply_to_ledger(self, ledger: &mut Ledger) -> Result<(), BuildLedgerError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,67 +72,12 @@ pub struct BuildLedgerFlushReport {
     pub transaction_nodes: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct LedgerReplay {
-    parent: Arc<Ledger>,
-    replay: Arc<Ledger>,
-    ordered_txs: BTreeMap<u32, Arc<STTx>>,
-}
-
-impl LedgerReplay {
-    pub fn new(
-        parent: Arc<Ledger>,
-        replay: Arc<Ledger>,
-        ordered_txs: BTreeMap<u32, Arc<STTx>>,
-    ) -> Self {
-        Self {
-            parent,
-            replay,
-            ordered_txs,
-        }
-    }
-
-    pub fn parent(&self) -> &Arc<Ledger> {
-        &self.parent
-    }
-
-    pub fn replay(&self) -> &Arc<Ledger> {
-        &self.replay
-    }
-
-    pub fn ordered_txs(&self) -> &BTreeMap<u32, Arc<STTx>> {
-        &self.ordered_txs
-    }
-
-    pub fn from_replay_ledger(
-        parent: Arc<Ledger>,
-        replay: Arc<Ledger>,
-    ) -> Result<Self, LedgerReplayError> {
-        let mut ordered_txs = BTreeMap::new();
-
-        for (tx, meta) in replay.tx_snapshot()? {
-            ordered_txs.entry(meta.get_index()).or_insert(tx);
-        }
-
-        Ok(Self::new(parent, replay, ordered_txs))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LedgerReplayError {
-    TxRead(LedgerTxReadError),
-}
-
-impl From<LedgerTxReadError> for LedgerReplayError {
-    fn from(value: LedgerTxReadError) -> Self {
-        Self::TxRead(value)
-    }
-}
-
 #[derive(Debug)]
 pub enum BuildLedgerError {
     Mutation(MutationError),
     Traversal(TraversalError),
+    Persist(String),
+    View(String),
 }
 
 impl From<MutationError> for BuildLedgerError {
@@ -247,8 +189,8 @@ where
     J: BuildLedgerJournal,
     CreateView: FnOnce(&Ledger) -> V,
     Apply: FnMut(&mut V, &Arc<STTx>, bool, ApplyFlags) -> Result<ApplyTransactionResult, String>,
-    FlushState: FnMut(&mut Ledger) -> usize,
-    FlushTx: FnMut(&mut Ledger) -> usize,
+    FlushState: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
+    FlushTx: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
     Unshare: FnMut(&mut Ledger),
 {
     journal.debug(&format!(
@@ -316,8 +258,8 @@ where
     V: BuildLedgerView,
     J: BuildLedgerJournal,
     CreateView: FnOnce(&Ledger) -> V,
-    FlushState: FnMut(&mut Ledger) -> usize,
-    FlushTx: FnMut(&mut Ledger) -> usize,
+    FlushState: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
+    FlushTx: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
     Unshare: FnMut(&mut Ledger),
 {
     build_ledger_impl(
@@ -334,11 +276,12 @@ where
     )
 }
 
-pub fn build_ledger_replay<V, J, CreateView, Apply, FlushState, FlushTx, Unshare>(
+pub fn build_ledger_replay<V, J, CreateView, Preflight, Apply, FlushState, FlushTx, Unshare>(
     replay_data: &LedgerReplay,
     apply_flags: ApplyFlags,
     journal: &J,
     create_view: CreateView,
+    mut preflight_and_preclaim: Preflight,
     mut apply_transaction: Apply,
     flush_state: FlushState,
     flush_tx: FlushTx,
@@ -348,9 +291,10 @@ where
     V: BuildLedgerView,
     J: BuildLedgerJournal,
     CreateView: FnOnce(&Ledger) -> V,
+    Preflight: FnMut(&V, &Arc<STTx>, ApplyFlags) -> Ter,
     Apply: FnMut(&mut V, &Arc<STTx>, ApplyFlags),
-    FlushState: FnMut(&mut Ledger) -> usize,
-    FlushTx: FnMut(&mut Ledger) -> usize,
+    FlushState: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
+    FlushTx: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
     Unshare: FnMut(&mut Ledger),
 {
     let replay_ledger = replay_data.replay();
@@ -370,8 +314,15 @@ where
         flush_tx,
         unshare,
         |view, _built, _ledger_journal| {
-            for tx in replay_data.ordered_txs().values() {
-                apply_transaction(view, tx, apply_flags);
+            for entry in replay_data.ordered_txs().values() {
+                let tx = entry.transaction();
+                // Replay may only enter the mutation callback after the same
+                // semantic-preflight-plus-ledger-preclaim gate used by the
+                // consensus and acquired-ledger builders.
+                let admission = preflight_and_preclaim(view, tx, apply_flags);
+                if is_tes_success(admission) || protocol::is_tec_claim(admission) {
+                    apply_transaction(view, tx, apply_flags);
+                }
             }
         },
     )
@@ -393,8 +344,8 @@ where
     V: BuildLedgerView,
     J: BuildLedgerJournal,
     CreateView: FnOnce(&Ledger) -> V,
-    FlushState: FnMut(&mut Ledger) -> usize,
-    FlushTx: FnMut(&mut Ledger) -> usize,
+    FlushState: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
+    FlushTx: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
     Unshare: FnMut(&mut Ledger),
     ApplyTxs: FnOnce(&mut V, &Ledger, &J),
 {
@@ -407,12 +358,12 @@ where
     let mut accum = create_view(&built);
     assert!(!accum.open(), "xrpl::buildLedgerImpl : valid ledger state");
     apply_txs(&mut accum, &built, journal);
-    accum.apply_to_ledger(&mut built);
+    accum.apply_to_ledger(&mut built)?;
 
     built.update_skip_list()?;
     let flush_report = BuildLedgerFlushReport {
-        account_state_nodes: flush_state(&mut built),
-        transaction_nodes: flush_tx(&mut built),
+        account_state_nodes: flush_state(&mut built)?,
+        transaction_nodes: flush_tx(&mut built)?,
     };
     journal.debug(&format!(
         "Flushed {} accounts and {} transaction nodes",
@@ -440,7 +391,7 @@ where
 /// Returns None if the resulting account_hash doesn't match the acquired
 /// header (transactor produced different state — likely an unimplemented
 /// transaction type).
-
+///
 /// Global counter: only log detailed state_map/sandbox mutations for first 2 builds
 static BUILD_DETAIL_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -493,22 +444,69 @@ pub fn decode_acquired_tx_set(
     txns.drain_ordered()
 }
 
-/// Parallel signature pre-validation using rayon.
-/// Returns the set of transaction IDs with invalid signatures so the
-/// sequential apply loop can skip them without calling check_sign again.
-fn parallel_sig_precheck(
+/// Parallel canonical preflight validates the same semantic and signature
+/// conditions as the sequential application path. It intentionally does not
+/// treat raw signature validity as admission: Change pseudo-transactions have
+/// no signature and all transaction families require typed semantic preflight.
+fn parallel_preflight_precheck(
     txs: &[Arc<STTx>],
     rules: &protocol::Rules,
 ) -> std::collections::HashSet<Uint256> {
     txs.par_iter()
         .filter_map(|tx| {
-            if tx.check_sign(rules).is_err() {
-                Some(tx.get_transaction_id())
-            } else {
-                None
-            }
+            (!protocol::is_tes_success(crate::state::application_root::transaction_preflight_ter(
+                tx, rules,
+            )))
+            .then(|| tx.get_transaction_id())
         })
         .collect()
+}
+
+fn replay_transactions_for_reconstruction(replay: &LedgerReplay) -> Vec<ledger::ReplayTransaction> {
+    // LedgerReplayMsgHandler.cpp::processReplayDeltaResponse builds this map
+    // from sfTransactionIndex, and BuildLedger.cpp iterates it directly.
+    replay.ordered_txs().values().cloned().collect()
+}
+
+fn decode_acquired_transaction_metadata(
+    tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
+) -> Option<std::collections::BTreeMap<basics::base_uint::Uint256, Arc<Serializer>>> {
+    let mut metadata = std::collections::BTreeMap::new();
+    for (payload, expected_id) in tx_items {
+        let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut outer = protocol::SerialIter::new(payload);
+            let tx_bytes = outer.get_vl();
+            let metadata_bytes = outer.get_vl();
+            let mut tx_serial = protocol::SerialIter::new(&tx_bytes);
+            let tx = STTx::from_serial_iter(&mut tx_serial);
+            (tx.get_transaction_id(), metadata_bytes)
+        }))
+        .ok()?;
+        if parsed.0 != *expected_id
+            || metadata
+                .insert(parsed.0, Arc::new(Serializer::from_bytes(parsed.1)))
+                .is_some()
+        {
+            return None;
+        }
+    }
+    Some(metadata)
+}
+
+pub fn build_ledger_from_replay_delta(
+    replay: &LedgerReplay,
+) -> Result<Arc<ledger::Ledger>, String> {
+    // Do not send verified replay transactions through CanonicalTXSet:
+    // dependent transactions require their TransactionMd ordering.
+    let ordered = replay_transactions_for_reconstruction(replay);
+    build_ledger_from_acquired_tx_with_order(
+        replay.parent().as_ref(),
+        replay.replay().header(),
+        &[],
+        Some(ordered),
+    )
+    .map(Arc::new)
+    .ok_or_else(|| "replay ledger build did not match its verified header".to_owned())
 }
 
 pub fn build_ledger_from_acquired_tx(
@@ -516,7 +514,19 @@ pub fn build_ledger_from_acquired_tx(
     acquired_header: protocol::LedgerHeader,
     tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
 ) -> Option<ledger::Ledger> {
-    use crate::state::application_root::apply_submit_transactor_shell;
+    build_ledger_from_acquired_tx_with_order(parent, acquired_header, tx_items, None)
+}
+
+fn build_ledger_from_acquired_tx_with_order(
+    parent: &ledger::Ledger,
+    acquired_header: protocol::LedgerHeader,
+    tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
+    replay_order: Option<Vec<ledger::ReplayTransaction>>,
+) -> Option<ledger::Ledger> {
+    use crate::state::application_root::{
+        apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim,
+        queue_apply_preclaim_ter,
+    };
     use std::sync::Arc;
 
     let build_num = BUILD_DETAIL_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -556,21 +566,41 @@ pub fn build_ledger_from_acquired_tx(
     header.tx_hash = acquired_header.tx_hash;
     built.set_ledger_info(header);
 
-    // Apply transactions from the acquired TX map in the reference CanonicalTXSet order.
-    // The acquired ledger's tx_map stores TransactionMd (tx + metadata) leaves.
-    let ordered_txs = decode_acquired_tx_set(
-        tx_items,
-        *acquired_header.tx_hash.as_uint256(),
-        shamap::tree_node::SHAMapNodeType::TransactionMd,
-    );
+    // Acquisition builds use CanonicalTXSet ordering. Replay builds are
+    // different: their verified TransactionMd metadata explicitly defines the
+    // order (BuildLedger.cpp::buildLedger(LedgerReplay const&)).
+    let (ordered_txs, transaction_metadata) = if let Some(replay_order) = replay_order {
+        let mut transaction_metadata = std::collections::BTreeMap::new();
+        let ordered_txs = replay_order
+            .into_iter()
+            .map(|entry| {
+                transaction_metadata.insert(
+                    entry.transaction().get_transaction_id(),
+                    Arc::clone(entry.metadata()),
+                );
+                Arc::clone(entry.transaction())
+            })
+            .collect();
+        (ordered_txs, transaction_metadata)
+    } else {
+        (
+            decode_acquired_tx_set(
+                tx_items,
+                *acquired_header.tx_hash.as_uint256(),
+                shamap::tree_node::SHAMapNodeType::TransactionMd,
+            ),
+            decode_acquired_transaction_metadata(tx_items)?,
+        )
+    };
     let tx_count = ordered_txs.len();
 
-    // Parallel signature pre-validation: reject bad sigs early using rayon
-    let bad_sigs = parallel_sig_precheck(&ordered_txs, built.rules());
-    if !bad_sigs.is_empty() {
+    // Parallel semantic + signature preflight: reject invalid transactions
+    // before the sequential immutable preclaim and sandbox stages.
+    let bad_preflights = parallel_preflight_precheck(&ordered_txs, built.rules());
+    if !bad_preflights.is_empty() {
         tracing::debug!(target: "ledger",
             "[build] parallel sig precheck rejected {} of {} txs in seq={}",
-            bad_sigs.len(), tx_count, acquired_header.seq
+            bad_preflights.len(), tx_count, acquired_header.seq
         );
     }
 
@@ -587,7 +617,11 @@ pub fn build_ledger_from_acquired_tx(
             "[build] FLAG_LEDGER seq={} — calling update_negative_unl",
             acquired_header.seq
         );
-        let _ = built.update_negative_unl();
+        if let Err(error) = built.update_negative_unl() {
+            tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+                "[build] negative-UNL commit failed; refusing to publish acquired ledger");
+            return None;
+        }
     }
 
     // Each tx gets a Sandbox wrapping a snapshot of the accumulator (cheap:
@@ -599,8 +633,25 @@ pub fn build_ledger_from_acquired_tx(
         let txn_type = sttx.get_txn_type();
         let tx_id = sttx.get_transaction_id();
 
+        match parent.try_tx_exists(tx_id) {
+            Ok(true) => {
+                tracing::debug!(target: "ledger",
+                    "[build] SKIP parent-accepted replay tx_index={} txid={} seq={}",
+                    tx_index, tx_id, acquired_header.seq
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+                    tx = %tx_id,
+                    "[build] parent transaction lookup failed; refusing acquired ledger");
+                return None;
+            }
+        }
+
         // Skip transactions with bad signatures (already rejected in parallel)
-        if bad_sigs.contains(&tx_id) {
+        if bad_preflights.contains(&tx_id) {
             tracing::debug!(target: "ledger",
                 "[build] SKIP bad sig tx_index={} txid={} seq={}",
                 tx_index, tx_id, acquired_header.seq
@@ -616,6 +667,20 @@ pub fn build_ledger_from_acquired_tx(
         } else {
             0
         };
+
+        let preclaim = queue_apply_preclaim_ter(
+            &accum,
+            sttx,
+            acquired_header.seq,
+            protocol::ApplyFlags::NONE,
+        );
+        if !protocol::is_tes_success(preclaim) && !protocol::is_tec_claim(preclaim) {
+            tracing::debug!(target: "ledger",
+                "[build] SKIP preclaim tx_index={}/{} type={} ter={:?}",
+                tx_index, tx_count, txn_type, preclaim
+            );
+            continue;
+        }
 
         // Sandbox wraps a snapshot of the accumulator — reads see all prior
         // tx changes via the accumulator's delta table, then fall through to
@@ -640,11 +705,18 @@ pub fn build_ledger_from_acquired_tx(
             built.header().drops
         );
         let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell(&mut view, sttx, txn_type)
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+                &mut view,
+                sttx,
+                txn_type,
+                protocol::ApplyFlags::NONE,
+                preclaim,
+            )
         }));
 
         match apply_result {
-            Ok(ter) if protocol::is_tes_success(ter) || protocol::is_tec_claim(ter) => {
+            Ok(outcome) if outcome.applied => {
+                let ter = outcome.result;
                 // === DEBUG: Log sandbox modifications before apply ===
                 let mods = view.modification_summary();
                 tracing::debug!(target: "ledger",
@@ -676,13 +748,30 @@ pub fn build_ledger_from_acquired_tx(
                 }
 
                 let rules = built.rules().clone();
-                if let Err(e) =
+                if let Err(error) =
                     view.apply_with_tx_thread(&mut accum, tx_id, acquired_header.seq, &rules)
                 {
-                    tracing::debug!(target: "ledger",
-                        "[build] APPLY ERROR seq={} tx={}/{} type={} error={:?}",
-                        acquired_header.seq, tx_index, tx_count, tx_type_name, e
-                    );
+                    tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+                        tx = %tx_id,
+                        "[build] transaction commit failed; refusing to publish acquired ledger");
+                    return None;
+                }
+
+                let Some(metadata) = transaction_metadata.get(&tx_id) else {
+                    tracing::error!(target: "ledger", seq = acquired_header.seq,
+                        tx = %tx_id,
+                        "[build] verified transaction metadata missing; refusing acquired ledger");
+                    return None;
+                };
+                if let Err(error) = accum.raw_tx_insert(
+                    tx_id,
+                    Arc::new(Serializer::from_bytes(sttx.get_serializer().data())),
+                    Some(Arc::clone(metadata)),
+                ) {
+                    tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+                        tx = %tx_id,
+                        "[build] transaction-map commit failed; refusing acquired ledger");
+                    return None;
                 }
 
                 // Log TX result (without computing state hash — that's destructive
@@ -716,7 +805,8 @@ pub fn build_ledger_from_acquired_tx(
                     );
                 }
             }
-            Ok(ter) => {
+            Ok(outcome) => {
+                let ter = outcome.result;
                 tracing::debug!(target: "ledger",
                     "[build] SKIP unapplied tx_index={}/{} type={} ter={:?}",
                     tx_index, tx_count, tx_type_name, ter
@@ -756,16 +846,21 @@ pub fn build_ledger_from_acquired_tx(
         }
     }
 
-    // tx changes from the OpenView into the built ledger's SHAMap at once.
-    if let Err(e) = accum.apply_state_only(&mut built) {
-        tracing::debug!(target: "ledger",
-            "[build] ACCUM APPLY ERROR seq={} error={:?}",
-            acquired_header.seq, e
-        );
+    // Commit state and transaction-map changes together. A reconstructed
+    // ledger with threaded SLE state but no TransactionMd leaves causes the
+    // next candidate's parent txExists admission to miss accepted replays.
+    if let Err(error) = accum.apply(&mut built) {
+        tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+            "[build] accumulator commit failed; refusing to publish acquired ledger");
+        return None;
     }
 
     // Update skip list (reference does this after applying all txs)
-    let _ = built.update_skip_list();
+    if let Err(error) = built.update_skip_list() {
+        tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+            "[build] skip-list commit failed; refusing to publish acquired ledger");
+        return None;
+    }
 
     // Must flush BEFORE set_immutable so state_map.hash() reflects all mutations.
     // apply_state_batch writes to mutable_state; flush_state_map_to_store
@@ -951,7 +1046,10 @@ pub fn build_ledger_from_consensus(
         >,
     >,
 ) -> Option<ledger::Ledger> {
-    use crate::state::application_root::apply_submit_transactor_shell;
+    use crate::state::application_root::{
+        apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim,
+        queue_apply_preclaim_ter,
+    };
     use std::sync::Arc;
 
     let mut built = ledger::Ledger::from_previous(parent, header.close_time);
@@ -971,8 +1069,12 @@ pub fn build_ledger_from_consensus(
     built.set_ledger_info(h);
 
     // reference: updateNegativeUNL on flag ledgers
-    if ledger::is_flag_ledger(header.seq) {
-        let _ = built.update_negative_unl();
+    if ledger::is_flag_ledger(header.seq)
+        && let Err(error) = built.update_negative_unl()
+    {
+        tracing::error!(target: "consensus", ?error, seq = header.seq,
+            "[build] negative-UNL commit failed; refusing consensus ledger");
+        return None;
     }
 
     // Apply transactions using OpenView accumulator (reference buildLedgerImpl parity)
@@ -985,35 +1087,91 @@ pub fn build_ledger_from_consensus(
         shamap::tree_node::SHAMapNodeType::TransactionNm,
     );
 
-    // Parallel signature pre-validation: reject bad sigs early using rayon
-    let bad_sigs = parallel_sig_precheck(&ordered_txs, built.rules());
+    // Parallel semantic + signature preflight; this is not a raw-signature
+    // admission shortcut.
+    let bad_preflights = parallel_preflight_precheck(&ordered_txs, built.rules());
 
     for sttx in ordered_txs {
         let tx_id = sttx.get_transaction_id();
 
+        // `BuildLedger.cpp::applyTransactions` removes a transaction already
+        // accepted by the captured parent on its first pass. This must use the
+        // fallible lookup: treating an unreadable backed branch as absent can
+        // replay a parent transaction into this child and re-thread an SLE
+        // with the same ID at a different ledger sequence.
+        match parent.try_tx_exists(tx_id) {
+            Ok(true) => {
+                tracing::debug!(target: "consensus", "SKIP parent-accepted replay tx={}", tx_id);
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(target: "consensus", ?error, tx = %tx_id,
+                    "[build] parent transaction lookup failed; refusing consensus ledger");
+                return None;
+            }
+        }
+
         // Skip transactions with bad signatures (already rejected in parallel)
-        if bad_sigs.contains(&tx_id) {
+        if bad_preflights.contains(&tx_id) {
             continue;
         }
 
         let txn_type = sttx.get_txn_type();
 
+        let preclaim =
+            queue_apply_preclaim_ter(&accum, &sttx, header.seq, protocol::ApplyFlags::NONE);
+        if !protocol::is_tes_success(preclaim) && !protocol::is_tec_claim(preclaim) {
+            tracing::debug!(target: "consensus", "SKIP preclaim replay tx={} ter={:?}", tx_id, preclaim);
+            continue;
+        }
+
         let base = Arc::new(accum.clone());
         let mut view = ledger::Sandbox::new(base, protocol::ApplyFlags::default());
-
         let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell(&mut view, &sttx, txn_type)
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+                &mut view,
+                &sttx,
+                txn_type,
+                protocol::ApplyFlags::NONE,
+                preclaim,
+            )
         }));
 
         match apply_result {
-            Ok(ter) if protocol::is_tes_success(ter) || protocol::is_tec_claim(ter) => {
+            Ok(outcome) if outcome.applied => {
+                let ter = outcome.result;
+                let delivered_amount = outcome.delivered_amount;
+                // Match rippled ApplyStateTable::apply ordering: derive the
+                // TransactionMd payload from the uncommitted delta, thread and
+                // commit its state, then record the accepted transaction in
+                // the same cumulative OpenView. Without this insertion a
+                // later child cannot recognize a parent-accepted transaction
+                // and replays it into already-threaded state.
+                let mut meta = view.table().to_tx_meta(tx_id, header.seq, delivered_amount);
                 let rules = built.rules().clone();
-                if let Err(e) = view.apply_with_tx_thread(&mut accum, tx_id, header.seq, &rules) {
-                    tracing::info!(target: "consensus", "APPLY ERROR tx={} error={:?}", tx_id, e);
+                if let Err(error) = view.apply_with_tx_thread(&mut accum, tx_id, header.seq, &rules)
+                {
+                    tracing::error!(target: "consensus", ?error, tx = %tx_id,
+                        "[build] transaction commit failed; refusing consensus ledger");
+                    return None;
+                }
+                let mut metadata = protocol::Serializer::default();
+                meta.add_raw(&mut metadata, ter, accum.tx_count() as u32);
+                if let Err(error) = accum.raw_tx_insert(
+                    tx_id,
+                    Arc::new(protocol::Serializer::from_bytes(
+                        sttx.get_serializer().data(),
+                    )),
+                    Some(Arc::new(metadata)),
+                ) {
+                    tracing::error!(target: "consensus", ?error, tx = %tx_id,
+                        "[build] transaction-map commit failed; refusing consensus ledger");
+                    return None;
                 }
             }
-            Ok(ter) => {
-                tracing::debug!(target: "consensus", "SKIP unapplied replay tx={} ter={:?}", tx_id, ter);
+            Ok(outcome) => {
+                tracing::debug!(target: "consensus", "SKIP unapplied replay tx={} ter={:?}", tx_id, outcome.result);
             }
             Err(_) => {
                 // Skip panicking transactions (reference catches exceptions)
@@ -1021,15 +1179,67 @@ pub fn build_ledger_from_consensus(
         }
     }
 
-    if let Err(e) = accum.apply_state_only(&mut built) {
-        tracing::info!(target: "consensus", "ACCUM APPLY ERROR error={:?}", e);
+    if let Err(error) = accum.apply(&mut built) {
+        tracing::error!(target: "consensus", ?error,
+            "[build] accumulator commit failed; refusing consensus ledger");
+        return None;
     }
 
     // Update skip list and finalize
-    let _ = built.update_skip_list();
+    if let Err(error) = built.update_skip_list() {
+        tracing::error!(target: "consensus", ?error,
+            "[build] skip-list commit failed; refusing consensus ledger");
+        return None;
+    }
     built.flush_state_map_to_store();
     built.flush_tx_map_to_store();
     built.set_immutable(true);
 
     Some(built)
+}
+
+#[cfg(test)]
+mod replay_reconstruction_tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use basics::base_uint::Uint256;
+    use ledger::Ledger;
+    use protocol::{AccountID, STTx, TxType, get_field_by_symbol};
+
+    use super::{LedgerReplay, replay_transactions_for_reconstruction};
+
+    fn transaction(sequence: u32) -> Arc<STTx> {
+        Arc::new(STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(
+                get_field_by_symbol("sfAccount"),
+                AccountID::from_array([1; 20]),
+            );
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+        }))
+    }
+
+    #[test]
+    fn reconstructed_replay_keeps_transaction_md_dependency_order() {
+        // ../rippled/src/xrpld/app/ledger/detail/LedgerReplayMsgHandler.cpp::
+        // processReplayDeltaResponse keys orderedTxns by sfTransactionIndex;
+        // BuildLedger.cpp::buildLedger(LedgerReplay const&) applies that map
+        // directly. Sequence 2 must therefore remain after sequence 1 even
+        // when their transaction IDs would sort differently canonically.
+        let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 100, false));
+        let replay = Arc::new(Ledger::from_previous(&parent, 110));
+        let first = transaction(1);
+        let dependent = transaction(2);
+        let replay = LedgerReplay::new(
+            parent,
+            replay,
+            BTreeMap::from([(9, Arc::clone(&dependent)), (4, Arc::clone(&first))]),
+        );
+
+        let sequences = replay_transactions_for_reconstruction(&replay)
+            .into_iter()
+            .map(|tx| tx.get_field_u32(get_field_by_symbol("sfSequence")))
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2]);
+        assert_ne!(first.get_transaction_id(), Uint256::zero());
+    }
 }

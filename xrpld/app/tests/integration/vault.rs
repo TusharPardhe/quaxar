@@ -88,6 +88,11 @@ fn make_ledger(entries: Vec<STLedgerEntry>) -> Ledger {
         protocol::feature_id("SingleAssetVault"),
         protocol::feature_id("MPTokensV1"),
         protocol::feature_id("PermissionedDomains"),
+        // Pulsar force-enables all amendments. Cover the final-withdrawal
+        // cleanup path that is otherwise absent from this lifecycle fixture.
+        protocol::feature_id("fixCleanup3_1_3"),
+        protocol::feature_id("fixCleanup3_2_0"),
+        protocol::feature_id("fixCleanup3_3_0"),
     ];
     ledger.set_rules(protocol::Rules::new(features.into_iter()));
     ledger
@@ -104,7 +109,10 @@ fn get_owner_count(view: &impl ReadView, account: AccountID) -> u32 {
 fn vault_create_tx(from: AccountID, asset: STAmount, seq: u32) -> STTx {
     STTx::new(TxType::VAULT_CREATE, move |tx| {
         tx.set_account_id(sf("sfAccount"), from);
-        tx.set_field_amount(sf("sfAsset"), asset);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), asset.asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), seq);
     })
@@ -113,7 +121,10 @@ fn vault_create_tx(from: AccountID, asset: STAmount, seq: u32) -> STTx {
 fn vault_create_tx_with_flags(from: AccountID, asset: STAmount, seq: u32, flags: u32) -> STTx {
     STTx::new(TxType::VAULT_CREATE, move |tx| {
         tx.set_account_id(sf("sfAccount"), from);
-        tx.set_field_amount(sf("sfAsset"), asset);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), asset.asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), seq);
         tx.set_field_u32(sf("sfFlags"), flags);
@@ -178,14 +189,89 @@ fn vault_create_basic() {
 
 /// C++ Vault_test — vault with XRP asset rejected (native not allowed).
 #[test]
+fn vault_create_native_issue_asset_matches_rpc_setup() {
+    let alice = acct(0x31);
+    let ledger = make_ledger(vec![account_root(alice, 10_000_000_000, 0, 0)]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(
+                sf("sfAsset"),
+                protocol::Asset::Issue(protocol::xrp_issue()),
+            ),
+        );
+        tx.set_field_vl(sf("sfData"), b"test");
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::VAULT_CREATE),
+        Ter::TES_SUCCESS,
+    );
+}
+
+#[test]
+fn vault_create_deposit_then_full_withdraw_xrp_matches_txcompat_delete_setup() {
+    // Mirrors Pulsar's vault_delete_basic setup: create an XRP vault, deposit
+    // 10,000,000 drops, then redeem that exact amount before VaultDelete.
+    let alice = acct(0x32);
+    let ledger = make_ledger(vec![account_root(alice, 10_000_000_000, 0, 0)]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let create = STTx::new(TxType::VAULT_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(
+                sf("sfAsset"),
+                protocol::Asset::Issue(protocol::xrp_issue()),
+            ),
+        );
+        tx.set_field_vl(sf("sfData"), b"test");
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &create, TxType::VAULT_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let vault_id = protocol::vault_keylet(acct_id(alice), 1).key;
+    let deposit = vault_deposit_tx(alice, vault_id, xrp(10_000_000), 2);
+    assert_eq!(
+        full_apply(&mut view, &deposit, TxType::VAULT_DEPOSIT),
+        Ter::TES_SUCCESS
+    );
+
+    let withdraw = vault_withdraw_tx(alice, vault_id, xrp(10_000_000), 3);
+    assert_eq!(
+        full_apply(&mut view, &withdraw, TxType::VAULT_WITHDRAW),
+        Ter::TES_SUCCESS,
+        "a sole shareholder must be able to redeem the exact XRP deposit"
+    );
+}
+
+#[test]
 fn vault_create_xrp_asset_rejected() {
     let alice = acct(0x11);
     let ledger = make_ledger(vec![account_root(alice, 10_000_000_000, 0, 0)]);
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        // sfAsset must be serialized as an Issue. An Amount-form XRP asset is
+        // malformed even though native Issue-form XRP is valid.
+        tx.set_field_amount(sf("sfAsset"), xrp(0));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
 
-    let tx = vault_create_tx(alice, xrp(0), 1);
-    let result = full_apply(&mut view, &tx, TxType::VAULT_CREATE);
-    assert_eq!(result, Ter::TEM_MALFORMED);
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::VAULT_CREATE),
+        Ter::TEM_MALFORMED
+    );
 }
 
 /// C++ Vault_test — invalid flags rejected.

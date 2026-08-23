@@ -168,6 +168,9 @@ impl SHAMapNodeFetcher for LoadedLedgerNodeFetcher {
 #[derive(Clone)]
 pub struct AppLoadedLedgerRuntime {
     ledger_master: Arc<AppLedgerMaster>,
+    /// ApplicationRoot owns the live LCL in this shared state. The wrapped
+    /// `AppLedgerMaster` cache is not the authoritative closed-ledger slot.
+    ledger_master_state: Option<Arc<crate::ledger::ledger_master_state::SharedLedgerMasterState>>,
     config: LedgerConfig,
     provider: LoadedLedgerDbProvider,
     family: Arc<LoadedLedgerFamily>,
@@ -198,9 +201,21 @@ impl AppLoadedLedgerRuntime {
         relational: Option<Arc<SqliteSHAMapStoreRelational>>,
         node_store: Option<SHAMapStoreNodeStore>,
     ) -> Self {
+        Self::with_sources_and_ledger_master_state(ledger_master, relational, node_store, None)
+    }
+
+    pub fn with_sources_and_ledger_master_state(
+        ledger_master: Arc<AppLedgerMaster>,
+        relational: Option<Arc<SqliteSHAMapStoreRelational>>,
+        node_store: Option<SHAMapStoreNodeStore>,
+        ledger_master_state: Option<
+            Arc<crate::ledger::ledger_master_state::SharedLedgerMasterState>,
+        >,
+    ) -> Self {
         let storage_enabled = relational.is_some() && node_store.is_some();
         Self {
             ledger_master,
+            ledger_master_state,
             config: LedgerConfig::default(),
             provider: LoadedLedgerDbProvider::new(relational.clone()),
             family: Arc::new(SHAMapFamily::new(
@@ -222,11 +237,23 @@ impl AppLoadedLedgerRuntime {
 
     pub fn from_root(root: &ApplicationRoot) -> Option<Self> {
         let ledger_master_runtime = root.ledger_master_runtime()?;
-        Some(Self::with_runtime_and_sources(
-            ledger_master_runtime,
+        Some(Self::with_sources_and_ledger_master_state(
+            ledger_master_runtime.ledger_master(),
             root.relational_database().clone(),
             root.node_store().clone(),
+            Some(root.ledger_master_state()),
         ))
+    }
+
+    fn current_closed_ledger(&self) -> Option<Arc<Ledger>> {
+        if let Some(state) = self.ledger_master_state.as_ref() {
+            // Rippled falls back to its current closed ledger. Quaxar keeps a
+            // separately owned validated slot during bootstrap/recovery, so
+            // use it only after the exact closed-ledger fast path misses.
+            state.closed_ledger().or_else(|| state.validated_ledger())
+        } else {
+            self.ledger_master.closed_ledger()
+        }
     }
 
     pub fn resolve_request_ledger(
@@ -241,17 +268,10 @@ impl AppLoadedLedgerRuntime {
             .and_then(Uint256::from_slice)
             .map(SHAMapHash::new)
         {
-            let mut ledger = self.ledger_master.get_ledger_by_hash(hash);
-            if ledger.is_none() && self.storage_enabled {
-                ledger = self.ledger_master.ledger_history().get_ledger_by_hash(
-                    hash,
-                    &journal,
-                    &self.config,
-                    self.family.as_ref(),
-                    &self.provider,
-                )?;
-            }
-            return Ok(filter_requested_ledger_seq(request, ledger));
+            return Ok(filter_requested_ledger_seq(
+                request,
+                self.get_history_ledger_by_hash(hash)?,
+            ));
         }
 
         if let Some(seq) = request.ledger_seq {
@@ -271,7 +291,7 @@ impl AppLoadedLedgerRuntime {
         if request.ltype == Some(LT_CLOSED) {
             return Ok(filter_requested_ledger_seq(
                 request,
-                self.ledger_master.closed_ledger(),
+                self.current_closed_ledger(),
             ));
         }
 
@@ -284,18 +304,31 @@ impl AppLoadedLedgerRuntime {
     ) -> Result<Option<Arc<Ledger>>, LedgerSetupError> {
         let journal = NullLedgerJournal;
 
-        let mut ledger = self.ledger_master.get_ledger_by_hash(hash);
-        if ledger.is_none() && self.storage_enabled {
-            ledger = self.ledger_master.ledger_history().get_ledger_by_hash(
+        // Keep this ordering identical to rippled LedgerMaster::getLedgerByHash:
+        // LedgerHistory first handles cache and provider reload/canonicalization;
+        // only after it misses may the current closed-ledger slot satisfy the hash.
+        if let Some(ledger) = self
+            .ledger_master
+            .ledger_history()
+            .get_cached_ledger_by_hash(hash)
+        {
+            return Ok(Some(ledger));
+        }
+        if self.storage_enabled
+            && let Some(ledger) = self.ledger_master.ledger_history().get_ledger_by_hash(
                 hash,
                 &journal,
                 &self.config,
                 self.family.as_ref(),
                 &self.provider,
-            )?;
+            )?
+        {
+            return Ok(Some(ledger));
         }
 
-        Ok(ledger)
+        Ok(self
+            .current_closed_ledger()
+            .filter(|ledger| ledger.header().hash == hash))
     }
 
     pub fn get_history_ledger_by_seq(
@@ -405,6 +438,7 @@ impl AppLoadedLedgerRuntime {
         let mut nodes = vec![TmLedgerNode {
             nodeid: None,
             nodedata: serialize_ledger_header(&ledger.header(), false),
+            reference: None,
         }];
 
         let state_map = ledger.state_map();
@@ -414,6 +448,7 @@ impl AppLoadedLedgerRuntime {
             nodes.push(TmLedgerNode {
                 nodeid: None,
                 nodedata: root,
+                reference: None,
             });
 
             let tx_map = ledger.tx_map();
@@ -424,6 +459,7 @@ impl AppLoadedLedgerRuntime {
                 nodes.push(TmLedgerNode {
                     nodeid: None,
                     nodedata: root,
+                    reference: None,
                 });
             }
         }
@@ -474,6 +510,7 @@ impl AppLoadedLedgerRuntime {
                 reply_nodes.push(TmLedgerNode {
                     nodeid: Some(node_id.get_raw_string()),
                     nodedata: blob,
+                    reference: None,
                 });
             }
         }

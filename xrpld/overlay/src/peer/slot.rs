@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use basics::base_uint::Uint256;
 use protocol::PublicKey;
+use rand::{Rng, seq::SliceRandom};
 
 use crate::message::ProtocolMessageType;
 
@@ -289,17 +290,23 @@ impl Slot {
     }
 
     fn select_peers(&mut self, validator: PublicKey, now: Duration) {
+        // Match rippled Slot.h: randomly remove candidates from the considered
+        // pool, ignoring peers that became idle while we were counting.
         let mut considered = self.considered.iter().copied().collect::<Vec<_>>();
-        considered.sort_unstable();
-        let selected = considered
-            .into_iter()
-            .filter(|id| {
-                self.peers
-                    .get(id)
-                    .is_some_and(|peer| now.saturating_sub(peer.last_message) < IDLED)
-            })
-            .take(self.max_selected_peers as usize)
-            .collect::<BTreeSet<_>>();
+        considered.shuffle(&mut rand::thread_rng());
+        let mut selected = BTreeSet::new();
+        while selected.len() < self.max_selected_peers as usize {
+            let Some(id) = considered.pop() else {
+                break;
+            };
+            if self
+                .peers
+                .get(&id)
+                .is_some_and(|peer| now.saturating_sub(peer.last_message) < IDLED)
+            {
+                selected.insert(id);
+            }
+        }
 
         if selected.len() != self.max_selected_peers as usize {
             self.init_counting();
@@ -339,10 +346,9 @@ impl Slot {
         if max_duration > MAX_UNSQUELCH_EXPIRE_PEERS {
             max_duration = MAX_UNSQUELCH_EXPIRE_PEERS;
         }
-        let span = max_duration
-            .as_secs()
-            .saturating_sub(MIN_UNSQUELCH_EXPIRE.as_secs());
-        Duration::from_secs(MIN_UNSQUELCH_EXPIRE.as_secs() + (span / 2))
+        let min = MIN_UNSQUELCH_EXPIRE.as_secs();
+        let max = max_duration.as_secs();
+        Duration::from_secs(rand::thread_rng().gen_range(min..=max))
     }
 
     fn init_counting(&mut self) {

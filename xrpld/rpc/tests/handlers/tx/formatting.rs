@@ -4,7 +4,7 @@ use super::*;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app::SqliteSHAMapStoreRelational;
-use xrpld_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
+use quaxar_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 
 fn attach_test_relational(app: &mut ApplicationRoot, label: &str) -> Arc<DatabaseCon> {
     let unique = SystemTime::now()
@@ -12,7 +12,7 @@ fn attach_test_relational(app: &mut ApplicationRoot, label: &str) -> Arc<Databas
         .expect("clock should be after epoch")
         .as_nanos();
     let dir = std::env::temp_dir().join(format!(
-        "xrpld-rpc-tx-{label}-{}-{unique}",
+        "quaxar-rpc-tx-{label}-{}-{unique}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("test db dir should be created");
@@ -113,6 +113,16 @@ fn tx_reads_committed_live_transactions_from_application_server_info() {
         object.get("hash"),
         Some(&JsonValue::String(tx_id.to_string()))
     );
+    let JsonValue::Object(meta) = object
+        .get("meta")
+        .expect("validated ledger metadata must be returned before SQL persistence")
+    else {
+        panic!("metadata must be an object");
+    };
+    assert_eq!(
+        meta.get("TransactionResult"),
+        Some(&JsonValue::String("tesSUCCESS".to_owned()))
+    );
 }
 
 #[test]
@@ -148,6 +158,37 @@ fn tx_reads_unvalidated_cached_transactions_as_proposed() {
     assert!(!object.contains_key("ledger_hash"));
     assert!(!object.contains_key("meta"));
     assert!(!object.contains_key("ctid"));
+}
+
+#[test]
+fn tx_does_not_mark_cache_only_committed_transaction_as_validated() {
+    let app = ApplicationRoot::with_options(app::ApplicationRootOptions {
+        standalone: true,
+        ..app::ApplicationRootOptions::default()
+    })
+    .expect("standalone root should build");
+    let (_, tx) = signed_payment_tx(0x23, account(2), 5, 10);
+    let tx_id = tx.get_transaction_id();
+    let mut cached = Arc::new(std::sync::Mutex::new(Transaction::new(Arc::clone(&tx))));
+    app.canonicalize_transaction(&mut cached);
+    cached
+        .lock()
+        .expect("cached transaction mutex must not be poisoned")
+        .set_status_with_ledger(app::TransStatus::COMMITTED, 2, Some(3), Some(0));
+
+    let response = do_tx(
+        &TxRequest {
+            params: &object([("transaction", JsonValue::String(tx_id.to_string()))]),
+            api_version: 2,
+        },
+        &rpc::ApplicationServerInfo::new(&app),
+    );
+    let JsonValue::Object(object) = response else {
+        panic!("response must be an object");
+    };
+
+    assert_eq!(object.get("validated"), Some(&JsonValue::Bool(false)));
+    assert!(!object.contains_key("meta"));
 }
 
 #[test]

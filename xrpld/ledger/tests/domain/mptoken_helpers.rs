@@ -3,6 +3,7 @@ use std::sync::Arc;
 use basics::base_uint::{Uint160, Uint192, Uint256};
 use ledger::{
     ApplyViewImpl, Ledger, LedgerHeader,
+    flow_engine::strand_builder::to_strands_checked,
     mptoken_helpers::{
         can_trade, can_transfer_mpt, check_mpt_tx_allowed, is_any_frozen_mpt, is_frozen_mpt,
         remove_empty_holding_mpt, require_auth_mpt,
@@ -11,7 +12,7 @@ use ledger::{
 };
 use protocol::{
     AccountID, ApplyFlags, Asset, LedgerEntryType, MPTAmount, MPTIssue, Rules, STAmount,
-    STLedgerEntry, XRPAmount, account_keylet, feature_id, get_field_by_symbol,
+    STLedgerEntry, STPathSet, XRPAmount, account_keylet, feature_id, get_field_by_symbol,
     mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid,
 };
 use shamap::item::SHAMapItem;
@@ -246,6 +247,37 @@ fn book_step_rejects_mpt_book_without_can_trade_instead_of_panicking() {
     );
 
     assert_eq!(result.ter, protocol::Ter::TEC_NO_PERMISSION);
+}
+
+#[test]
+fn mpt_payment_strand_rejects_holder_without_mptoken() {
+    let issuer = account(0x5B);
+    let holder = account(0x5C);
+    let issue = MPTIssue::new(mpt_id(issuer, 10));
+    let ledger = ledger_with(
+        [
+            account_entry(issuer),
+            account_entry(holder),
+            issuance_entry_with_flags(issuer, 10, protocol::lsfMPTCanTransfer),
+        ],
+        &[feature_id("MPTokensV2")],
+    );
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let (ter, strands) = to_strands_checked(
+        &mut view,
+        &holder,
+        &issuer,
+        &Asset::MPTIssue(issue),
+        None,
+        &STPathSet::new(sf("sfPaths")),
+        true,
+        false,
+        false,
+    );
+
+    assert_eq!(ter, protocol::Ter::TEC_NO_AUTH);
+    assert!(strands.is_empty());
 }
 
 #[test]

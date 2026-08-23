@@ -15,10 +15,10 @@ use std::sync::Arc;
 use app::state::application_root::apply_submit_transactor_shell;
 use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
-use ledger::{ApplyView, ReadView};
+use ledger::{ApplyView, ReadView, Sandbox};
 use protocol::{
-    AccountID, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry, STTx, Ter,
-    TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
+    AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry,
+    STTx, StBase, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
 };
 
 use super::fixtures::*;
@@ -46,6 +46,245 @@ fn get_owner_count(view: &impl ReadView, account: AccountID) -> u32 {
         .unwrap_or(0)
 }
 
+/// `BookStep::execOffer` applies issuer authorization to synthetic AMM offers
+/// as well as CLOB offers.  The AMM pool may exist before its trust line is
+/// authorized; such a pool must not be crossed by an OfferCreate.
+#[test]
+fn offer_create_skips_unauthorized_synthetic_amm() {
+    let pool_owner = acct(0x11);
+    let taker = acct(0x22);
+    let authorized_taker = acct(0x24);
+    let issuer = acct(0x33);
+    let usd = usd_currency();
+
+    let mut pool_owner_line = trust_line(pool_owner, issuer, usd, 10_000, 20_000, 0);
+    pool_owner_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+    let mut taker_line = trust_line(taker, issuer, usd, 1_000, 10_000, 0);
+    taker_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+    let mut authorized_taker_line = trust_line(authorized_taker, issuer, usd, 1_000, 10_000, 0);
+    authorized_taker_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(pool_owner, 50_000_000_000, 1, 0),
+            account_root(taker, 10_000_000_000, 1, 0),
+            account_root(authorized_taker, 10_000_000_000, 1, 0),
+            account_root(
+                issuer,
+                10_000_000_000,
+                0,
+                protocol::lsfRequireAuth | protocol::lsfDefaultRipple,
+            ),
+            pool_owner_line,
+            taker_line,
+            authorized_taker_line,
+        ],
+        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixAMMOverflowOffer"],
+    );
+    let mut view = new_view(ledger);
+
+    let create = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), pool_owner);
+        tx.set_field_amount(sf("sfAmount"), xrp(5_000_000_000));
+        tx.set_field_amount(sf("sfAmount2"), iou(issuer, usd, 5_000));
+        tx.set_field_u16(sf("sfTradingFee"), 500);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &create, TxType::AMM_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let amm = view
+        .read(protocol::amm(
+            protocol::xrp_issue().into(),
+            Issue::new(usd, issuer).into(),
+        ))
+        .expect("read AMM")
+        .expect("AMM must exist");
+    let amm_account = amm.get_account_id(sf("sfAccount"));
+    let amm_line = view
+        .read(protocol::line(amm_account, issuer, usd))
+        .expect("read AMM trust line")
+        .expect("AMM trust line must exist");
+    let auth_flag = if amm_account > issuer {
+        protocol::lsfLowAuth
+    } else {
+        protocol::lsfHighAuth
+    };
+    assert_eq!(
+        amm_line.get_field_u32(sf("sfFlags")) & auth_flag,
+        0,
+        "the issuer has not authorized the AMM account"
+    );
+
+    // The pool price is deliberately better than the offer limit.  The only
+    // reason not to cross is the missing issuer authorization on the AMM line.
+    let offer = offer_tx(taker, xrp(400_000_000), iou(issuer, usd, 500), 1);
+    assert_eq!(
+        full_apply(&mut view, &offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(taker), 1))
+            .expect("read residual offer")
+            .is_some(),
+        "unauthorized AMM liquidity must be skipped and the offer stored"
+    );
+
+    // Once the issuer authorizes that exact AMM line, the same favorable
+    // shape must cross.  This also proves the first dry result was caused by
+    // the authorization gate rather than absent or unusable pool liquidity.
+    let mut authorized_amm_line = (*amm_line).clone();
+    let authorized_flags = authorized_amm_line.get_field_u32(sf("sfFlags")) | auth_flag;
+    authorized_amm_line.set_field_u32(sf("sfFlags"), authorized_flags);
+    view.update(Arc::new(authorized_amm_line))
+        .expect("authorize AMM trust line");
+
+    let crossing_offer = offer_tx(authorized_taker, xrp(400_000_000), iou(issuer, usd, 500), 1);
+    assert_eq!(
+        full_apply(&mut view, &crossing_offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(authorized_taker), 1))
+            .expect("read fully crossed offer")
+            .is_none(),
+        "authorized AMM liquidity must remain eligible for crossing"
+    );
+}
+
+/// Skipping an unauthorized synthetic AMM is not a dry-book result.  rippled's
+/// `execOffer` returns true for that keyless offer, allowing the real CLOB tip
+/// to execute in the same BookStep.
+#[test]
+fn unauthorized_synthetic_amm_does_not_block_eligible_clob() {
+    let pool_owner = acct(0x11);
+    let taker = acct(0x22);
+    let clob_maker = acct(0x24);
+    let issuer = acct(0x33);
+    let usd = usd_currency();
+
+    let mut pool_owner_line = trust_line(pool_owner, issuer, usd, 10_000, 20_000, 0);
+    pool_owner_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+    let mut taker_line = trust_line(taker, issuer, usd, 1_000, 10_000, 0);
+    taker_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+    let mut clob_maker_line = trust_line(clob_maker, issuer, usd, 0, 10_000, 0);
+    clob_maker_line.set_field_u32(sf("sfFlags"), protocol::lsfHighAuth);
+
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(pool_owner, 50_000_000_000, 1, 0),
+            account_root(taker, 10_000_000_000, 1, 0),
+            account_root(clob_maker, 10_000_000_000, 1, 0),
+            account_root(
+                issuer,
+                10_000_000_000,
+                0,
+                protocol::lsfRequireAuth | protocol::lsfDefaultRipple,
+            ),
+            pool_owner_line,
+            taker_line,
+            clob_maker_line,
+        ],
+        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixAMMOverflowOffer"],
+    );
+    let mut view = new_view(ledger);
+
+    // Seed the opposing book before the AMM exists, so creating this offer
+    // cannot consume the pool that this test is about to create.
+    let resting_offer = offer_tx(clob_maker, iou(issuer, usd, 500), xrp(450_000_000), 1);
+    assert_eq!(
+        full_apply(&mut view, &resting_offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let resting_key = protocol::offer_keylet(acct_id(clob_maker), 1);
+    let resting_before = view
+        .read(resting_key)
+        .expect("read resting offer")
+        .expect("resting offer must exist");
+
+    let create = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), pool_owner);
+        tx.set_field_amount(sf("sfAmount"), xrp(5_000_000_000));
+        tx.set_field_amount(sf("sfAmount2"), iou(issuer, usd, 5_000));
+        tx.set_field_u16(sf("sfTradingFee"), 500);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &create, TxType::AMM_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let amm = view
+        .read(protocol::amm(
+            protocol::xrp_issue().into(),
+            Issue::new(usd, issuer).into(),
+        ))
+        .expect("read AMM")
+        .expect("AMM must exist");
+    let amm_account = amm.get_account_id(sf("sfAccount"));
+    let amm_account_key = protocol::account_keylet(acct_id(amm_account));
+    let amm_line_key = protocol::line(amm_account, issuer, usd);
+    let amm_xrp_before = view
+        .read(amm_account_key)
+        .expect("read AMM account")
+        .expect("AMM account must exist")
+        .get_field_amount(sf("sfBalance"));
+    let amm_line_before = view
+        .read(amm_line_key)
+        .expect("read AMM line")
+        .expect("AMM line must exist");
+    let auth_flag = if amm_account > issuer {
+        protocol::lsfLowAuth
+    } else {
+        protocol::lsfHighAuth
+    };
+    assert_eq!(amm_line_before.get_field_u32(sf("sfFlags")) & auth_flag, 0);
+    let amm_iou_before = amm_line_before.get_field_amount(sf("sfBalance"));
+
+    // The CLOB offers 450 XRP for 500 USD, better than the incoming 400 XRP
+    // limit.  It must remain reachable after the unauthorized AMM is skipped.
+    let crossing_offer = offer_tx(taker, xrp(400_000_000), iou(issuer, usd, 500), 1);
+    assert_eq!(
+        full_apply(&mut view, &crossing_offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(taker), 1))
+            .expect("read incoming offer")
+            .is_none(),
+        "eligible CLOB liquidity must fully satisfy the incoming offer"
+    );
+    let resting_after = view
+        .read(resting_key)
+        .expect("read changed resting offer")
+        .expect("the better-quality resting offer should be partially consumed");
+    assert_ne!(
+        resting_after.get_field_amount(sf("sfTakerGets")),
+        resting_before.get_field_amount(sf("sfTakerGets")),
+        "the CLOB offer must be consumed after the AMM skip"
+    );
+    assert_eq!(
+        view.read(amm_account_key)
+            .expect("read AMM account after crossing")
+            .expect("AMM account must remain")
+            .get_field_amount(sf("sfBalance")),
+        amm_xrp_before,
+        "unauthorized synthetic AMM must not transfer XRP"
+    );
+    assert_eq!(
+        view.read(amm_line_key)
+            .expect("read AMM line after crossing")
+            .expect("AMM line must remain")
+            .get_field_amount(sf("sfBalance")),
+        amm_iou_before,
+        "unauthorized synthetic AMM must not transfer IOUs"
+    );
+}
+
 // ─── Offer Placement with IOU Funding ─────────────────────────────────────
 
 /// C++ Offer_test — funded IOU offer is placed successfully.
@@ -68,6 +307,15 @@ fn offer_funded_iou_placed() {
     assert_eq!(result, Ter::TES_SUCCESS);
     // Offer placed — owner count increased
     assert_eq!(get_owner_count(&view, alice), 2); // trust line + offer
+    let owner_dir = view
+        .read(protocol::owner_dir_keylet(acct_id(alice)))
+        .expect("read owner directory")
+        .expect("owner directory must exist");
+    assert_eq!(
+        owner_dir.get_account_id(sf("sfOwner")),
+        alice,
+        "new owner-directory roots must carry describeOwnerDir's sfOwner"
+    );
 }
 
 /// C++ Offer_test — unfunded IOU offer rejected.
@@ -237,6 +485,196 @@ fn offer_replacement() {
     assert_eq!(get_owner_count(&view, alice), 2);
 }
 
+/// Regression for mainnet ledger 106134615 transaction
+/// 010A5050D712F5816FC6E7A3E1CE6AE0098DEE19DFC5D1CB76077309A02B5191.
+///
+/// The live transaction is an OfferSequence replacement. Replay applies each
+/// transaction from a fresh outer Sandbox, so the replacement must resolve its
+/// target from the previous state tree, remove its old owner/book membership,
+/// and transaction-thread the surviving mutable SLEs. This fixture deliberately
+/// commits the original offer before creating the replacement.
+///
+/// This is intentionally a **state-root** regression, not a byte-for-byte
+/// `TransactionMeta`/`AffectedNodes` golden test. The canonical mainnet
+/// metadata establishes that the reported empty affected-node list is a
+/// distinct transaction-root failure; its serialization is verified at the
+/// transaction-delta boundary. Here, the assertions prove the OfferCreate
+/// state transitions that must exist before metadata can describe them.
+#[test]
+fn offer_sequence_replacement_replays_parent_state_mutations() {
+    let alice = acct(0x11);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    // Contemporary mainnet has fixPreviousTxnID enabled. It is required for
+    // DirectoryNode transaction threading, which contributes to the state root.
+    let mut built = build_ledger_with_features(
+        vec![
+            account_root(alice, 10_000_000_000, 1, 0),
+            account_root(gw, 10_000_000_000, 0, 0),
+            trust_line(alice, gw, usd, 1_000, 10_000, 0),
+        ],
+        vec!["fixPreviousTxnID"],
+    );
+    // The fixture ledger constructor intentionally leaves total XRP at zero.
+    // A consensus-style commit destroys each transaction fee, so provide a
+    // realistic positive supply before replaying the two fee-bearing offers.
+    built.set_total_drops(100_000_000_000);
+    let ledger_seq = built.header().seq;
+    let rules = built.rules().clone();
+
+    let original = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1_000), 1);
+    {
+        let mut tx_view = Sandbox::new(Arc::new(built.clone()), ApplyFlags::NONE);
+        assert_eq!(
+            apply_submit_transactor_shell(&mut tx_view, &original, TxType::OFFER_CREATE),
+            Ter::TES_SUCCESS
+        );
+        tx_view
+            .apply_with_tx_thread(
+                &mut built,
+                original.get_transaction_id(),
+                ledger_seq,
+                &rules,
+            )
+            .expect("commit original offer into parent state");
+    }
+
+    let original_key = protocol::offer_keylet(acct_id(alice), 1);
+    let original_offer = built
+        .read(original_key)
+        .expect("read committed original offer")
+        .expect("original offer must exist in parent state");
+    let old_book_directory = original_offer.get_field_h256(sf("sfBookDirectory"));
+    assert_eq!(
+        original_offer.get_field_h256(sf("sfPreviousTxnID")),
+        original.get_transaction_id(),
+        "the cancelled parent offer must already carry its creating transaction thread"
+    );
+    assert_eq!(
+        original_offer.get_field_u32(sf("sfPreviousTxnLgrSeq")),
+        ledger_seq
+    );
+
+    // Keep the same supplied IOU amount so OfferCreate preclaim remains
+    // funded, but alter the price to exercise both old-book deletion and
+    // successor-book creation.
+    let replacement = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(2_000_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(gw, usd, 1_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 2);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+    });
+    {
+        // This is the production sibling-ledger replay shape: a fresh outer
+        // sandbox reads the already-committed offer from its parent ledger.
+        let mut tx_view = Sandbox::new(Arc::new(built.clone()), ApplyFlags::NONE);
+        assert_eq!(
+            apply_submit_transactor_shell(&mut tx_view, &replacement, TxType::OFFER_CREATE),
+            Ter::TES_SUCCESS
+        );
+        tx_view
+            .apply_with_tx_thread(
+                &mut built,
+                replacement.get_transaction_id(),
+                ledger_seq,
+                &rules,
+            )
+            .expect("commit OfferSequence replacement into parent state");
+    }
+
+    let replacement_key = protocol::offer_keylet(acct_id(alice), 2);
+    assert!(
+        built
+            .read(original_key)
+            .expect("read cancelled offer")
+            .is_none(),
+        "OfferSequence must erase the parent-state target"
+    );
+    let replacement_offer = built
+        .read(replacement_key)
+        .expect("read replacement offer")
+        .expect("replacement offer must be inserted");
+    assert_eq!(
+        replacement_offer.get_field_h256(sf("sfPreviousTxnID")),
+        replacement.get_transaction_id(),
+        "new offer must be transaction-threaded during replay"
+    );
+    assert_eq!(
+        replacement_offer.get_field_u32(sf("sfPreviousTxnLgrSeq")),
+        ledger_seq
+    );
+
+    assert!(
+        built
+            .read(protocol::Keylet::new(
+                LedgerEntryType::DirectoryNode,
+                old_book_directory,
+            ))
+            .expect("read old book directory")
+            .is_none(),
+        "removing the final old offer must remove its empty book directory"
+    );
+    let replacement_book_directory = replacement_offer.get_field_h256(sf("sfBookDirectory"));
+    let replacement_book = built
+        .read(protocol::Keylet::new(
+            LedgerEntryType::DirectoryNode,
+            replacement_book_directory,
+        ))
+        .expect("read replacement book directory")
+        .expect("replacement book directory must exist");
+    assert_eq!(
+        replacement_book.get_field_v256(sf("sfIndexes")).value(),
+        &[replacement_key.key],
+        "replacement book directory must contain only the successor"
+    );
+    assert_eq!(
+        replacement_book.get_field_h256(sf("sfPreviousTxnID")),
+        replacement.get_transaction_id(),
+        "the successor book directory must be threaded into committed state"
+    );
+    assert_eq!(
+        replacement_book.get_field_u32(sf("sfPreviousTxnLgrSeq")),
+        ledger_seq
+    );
+
+    let owner_directory = built
+        .read(protocol::owner_dir_keylet(acct_id(alice)))
+        .expect("read owner directory")
+        .expect("owner directory must exist");
+    assert_eq!(
+        owner_directory.get_field_v256(sf("sfIndexes")).value(),
+        &[replacement_key.key],
+        "owner directory must replace, not retain, the cancelled offer"
+    );
+    assert_eq!(
+        owner_directory.get_field_h256(sf("sfPreviousTxnID")),
+        replacement.get_transaction_id(),
+        "the surviving owner directory must be threaded into committed state"
+    );
+    assert_eq!(
+        owner_directory.get_field_u32(sf("sfPreviousTxnLgrSeq")),
+        ledger_seq
+    );
+    let account = built
+        .read(account_keylet(acct_id(alice)))
+        .expect("read offer owner")
+        .expect("offer owner must exist");
+    assert_eq!(account.get_field_u32(sf("sfSequence")), 3);
+    assert_eq!(account.get_field_u32(sf("sfOwnerCount")), 2);
+    assert_eq!(
+        account.get_field_amount(sf("sfBalance")).xrp().drops(),
+        9_999_999_980,
+        "the replay must retain both fee claims while owner count remains net unchanged"
+    );
+    assert_eq!(
+        account.get_field_h256(sf("sfPreviousTxnID")),
+        replacement.get_transaction_id(),
+        "owner mutation must be threaded by the replacement transaction"
+    );
+}
+
 // ─── Full Crossing Tests ──────────────────────────────────────────────────
 
 /// C++ Offer_test::testXRPDirectCrossing — two offers fully cross.
@@ -284,6 +722,71 @@ fn offer_full_xrp_iou_crossing() {
         "[crossing_test] alice_owners: {} -> {}, bob_owners: {} -> {}, crossed: {}",
         2, alice_owners_after, 1, bob_owners_after, crossing_happened
     );
+}
+
+#[test]
+fn fully_consumed_offer_metadata_zeros_amounts_and_deletes_book_directory() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    let mut built = build_ledger_with_features(
+        vec![
+            account_root(alice, 10_000_000_000, 1, 0),
+            account_root(bob, 10_000_000_000, 1, 0),
+            account_root(gw, 10_000_000_000, 0, 0),
+            trust_line(alice, gw, usd, 1_000, 10_000, 0),
+            trust_line(bob, gw, usd, 0, 10_000, 0),
+        ],
+        vec!["fixPreviousTxnID"],
+    );
+    built.set_total_drops(100_000_000_000);
+    let ledger_seq = built.header().seq;
+    let rules = built.rules().clone();
+
+    let resting = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1_000), 1);
+    {
+        let mut tx_view = Sandbox::new(Arc::new(built.clone()), ApplyFlags::NONE);
+        assert_eq!(
+            apply_submit_transactor_shell(&mut tx_view, &resting, TxType::OFFER_CREATE),
+            Ter::TES_SUCCESS
+        );
+        tx_view
+            .apply_with_tx_thread(&mut built, resting.get_transaction_id(), ledger_seq, &rules)
+            .expect("commit resting offer");
+    }
+
+    let offer_key = protocol::offer_keylet(acct_id(alice), 1);
+    let book_directory = built
+        .read(offer_key)
+        .expect("read resting offer")
+        .expect("resting offer exists")
+        .get_field_h256(sf("sfBookDirectory"));
+    let crossing = offer_tx(bob, iou(gw, usd, 1_000), xrp(1_000_000_000), 1);
+    let mut tx_view = Sandbox::new(Arc::new(built), ApplyFlags::NONE);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut tx_view, &crossing, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let meta = tx_view
+        .table()
+        .to_tx_meta(crossing.get_transaction_id(), ledger_seq, None);
+
+    let offer_node = meta
+        .get_nodes()
+        .iter()
+        .find(|node| node.get_field_h256(sf("sfLedgerIndex")) == offer_key.key)
+        .expect("consumed offer affected node");
+    assert_eq!(offer_node.fname(), sf("sfDeletedNode"));
+    let final_fields = offer_node.get_field_object(sf("sfFinalFields"));
+    assert_eq!(final_fields.get_field_amount(sf("sfTakerPays")).signum(), 0);
+    assert_eq!(final_fields.get_field_amount(sf("sfTakerGets")).signum(), 0);
+    let directory_node = meta
+        .get_nodes()
+        .iter()
+        .find(|node| node.get_field_h256(sf("sfLedgerIndex")) == book_directory)
+        .expect("consumed offer book directory affected node");
+    assert_eq!(directory_node.fname(), sf("sfDeletedNode"));
 }
 
 /// C++ Offer_test — partial crossing: bob's offer is smaller than alice's.
@@ -338,13 +841,185 @@ fn offer_self_crossing_removes_old() {
         Ter::TES_SUCCESS
     );
     assert_eq!(get_owner_count(&view, alice), 2);
+    let old_offer = protocol::offer_keylet(acct_id(alice), 1);
+    let trust_line_before = view
+        .read(protocol::line(alice, gw, usd))
+        .expect("read alice trust line")
+        .expect("alice trust line")
+        .get_field_amount(sf("sfBalance"));
 
-    // Alice: opposite offer (sell XRP for USD) — should remove old offer
+    // Alice: opposite offer (sell XRP for USD). There is no third-party
+    // liquidity, so the value flow is dry, but the direct self-cross rule
+    // must still cancel offer #1 before offer #2 is placed.
     let tx2 = offer_tx(alice, iou(gw, usd, 1000), xrp(1_000_000_000), 2);
     let r2 = handle_real_dispatch(&mut view, &tx2, TxType::OFFER_CREATE, None);
     assert_eq!(r2, Ter::TES_SUCCESS);
-    // Old offer removed by self-crossing, new one placed
+    assert!(
+        view.read(old_offer).expect("read old self offer").is_none(),
+        "dry self-cross must remove the old offer"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(alice), 2))
+            .expect("read replacement offer")
+            .is_some(),
+        "replacement offer must be placed"
+    );
+    assert_eq!(
+        view.read(protocol::line(alice, gw, usd))
+            .expect("read alice trust line after dry self-cross")
+            .expect("alice trust line after dry self-cross")
+            .get_field_amount(sf("sfBalance")),
+        trust_line_before,
+        "dry self-cross must not apply value transfer mutations"
+    );
     assert_eq!(get_owner_count(&view, alice), 2); // trust + new offer
+}
+
+#[test]
+fn worse_than_limit_self_offer_remains_on_book() {
+    let alice = acct(0x11);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(alice, 10_000_000_000, 1, 0),
+        account_root(gw, 10_000_000_000, 0, 0),
+        trust_line(alice, gw, usd, 2_000, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let old_offer = protocol::offer_keylet(acct_id(alice), 1);
+    let old = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1_000), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &old, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    // The existing self offer returns only 1,000 USD for the XRP supplied by
+    // this new offer, below its 2,000 USD limit. rippled stops at that book
+    // tip; it neither crosses nor applies the special self-offer deletion.
+    let new = offer_tx(alice, iou(gw, usd, 2_000), xrp(1_000_000_000), 2);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &new, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(old_offer)
+            .expect("read worse-quality self offer")
+            .is_some(),
+        "a self offer below the taker's quality threshold must remain"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(alice), 2))
+            .expect("read new offer")
+            .is_some()
+    );
+    assert_eq!(get_owner_count(&view, alice), 3); // trust + both offers
+}
+
+#[test]
+fn fully_satisfied_better_quality_stops_before_later_self_offer() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(alice, 10_000_000_000, 1, 0),
+        account_root(bob, 10_000_000_000, 1, 0),
+        account_root(gw, 10_000_000_000, 0, 0),
+        trust_line(alice, gw, usd, 2_000, 10_000, 0),
+        trust_line(bob, gw, usd, 100, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    // Bob's small offer is the better-quality Q1 tip.
+    let bob_q1 = offer_tx(bob, xrp(50_000_000), iou(gw, usd, 100), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &bob_q1, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    // Alice's existing Q2 offer is still above the later taker's limit but is
+    // in a different quality directory.
+    let alice_q2_key = protocol::offer_keylet(acct_id(alice), 1);
+    let alice_q2 = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1_000), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &alice_q2, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(alice_q2_key)
+            .expect("read Q2 after placement")
+            .is_some(),
+        "Q2 setup offer must be resting before the crossing transaction"
+    );
+
+    // Bob's Q1 fully satisfies this request. The BookStep then reaches
+    // Alice's self-owned Q2 in the same pass and stops on the quality
+    // transition before running self-cross deletion. No second liquidity pass
+    // is needed, so Q2 remains.
+    let crossing = offer_tx(alice, iou(gw, usd, 100), xrp(1_000_000_000), 2);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &crossing, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(alice_q2_key)
+            .expect("read second-quality self offer")
+            .is_some(),
+        "an attempted Q1 must stop the stream before self-crossing Q2"
+    );
+}
+
+/// A non-self offer that does not meet the crossing quality must not be
+/// deleted or transfer value while a dry OfferCreate is evaluated.
+#[test]
+fn offer_non_self_dry_cross_leaves_existing_offer_untouched() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(alice, 10_000_000_000, 1, 0),
+        account_root(bob, 10_000_000_000, 1, 0),
+        account_root(gw, 10_000_000_000, 0, 0),
+        trust_line(alice, gw, usd, 1000, 10_000, 0),
+        trust_line(bob, gw, usd, 2000, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let old_offer = protocol::offer_keylet(acct_id(alice), 1);
+    let old = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &old, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    let alice_trust_before = view
+        .read(protocol::line(alice, gw, usd))
+        .expect("read alice trust line")
+        .expect("alice trust line")
+        .get_field_amount(sf("sfBalance"));
+
+    // Bob asks for twice as much USD at the same XRP input. Alice's offer is
+    // below this quality threshold, so the crossing stream is dry.
+    let dry = offer_tx(bob, iou(gw, usd, 2000), xrp(1_000_000_000), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &dry, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    assert!(
+        view.read(old_offer).expect("read non-self offer").is_some(),
+        "a dry non-self candidate must remain on the book"
+    );
+    assert_eq!(
+        view.read(protocol::line(alice, gw, usd))
+            .expect("read alice trust line after dry non-self crossing")
+            .expect("alice trust line after dry non-self crossing")
+            .get_field_amount(sf("sfBalance")),
+        alice_trust_before,
+        "a dry non-self candidate must not transfer value"
+    );
+    assert_eq!(get_owner_count(&view, alice), 2); // trust + original offer
 }
 
 /// C++ Offer_test — three-way crossing: alice and carol both have offers, bob crosses both.
@@ -481,9 +1156,9 @@ fn offer_crossing_frozen_trust_line() {
     let gw = acct(0x33);
     let usd = usd_currency();
 
-    // Alice's trust line is frozen (lsfLowFreeze = 0x00400000)
+    // The issuer (high side for gw=0x33 > alice=0x11) froze Alice's line.
     let mut tl = trust_line(alice, gw, usd, 1000, 10000, 0);
-    tl.set_field_u32(sf("sfFlags"), 0x00400000); // lsfLowFreeze
+    tl.set_field_u32(sf("sfFlags"), protocol::lsfHighFreeze);
 
     let ledger = build_ledger(vec![
         account_root(alice, 10_000_000_000, 1, 0),
@@ -516,11 +1191,12 @@ fn offer_globally_frozen_issuer() {
     ]);
     let mut view = new_view(ledger);
 
-    // Alice tries to sell USD from globally frozen issuer
+    // Upstream authority: rippled/src/libxrpl/tx/transactors/dex/
+    // OfferCreate.cpp:190-212 rejects GlobalFreeze before accountFunds;
+    // Freeze_test.cpp:480-489 expects tecFROZEN in both offer directions.
     let tx = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
     let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
-    // Should be unfunded due to global freeze
-    assert_eq!(result, Ter::TEC_UNFUNDED_OFFER);
+    assert_eq!(result, Ter::TEC_FROZEN);
 }
 
 /// C++ Offer_test — offer with tick size rounding.
@@ -545,6 +1221,218 @@ fn offer_tick_size_rounding() {
     let tx = offer_tx(alice, xrp(1_234_567_890), iou(gw, usd, 999), 1);
     let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
     assert_eq!(result, Ter::TES_SUCCESS);
+}
+
+#[test]
+fn live_reverse_sell_tick_size_places_native_output_without_overflow() {
+    // Testnet ledger 20,120,246, transaction 4F741FC8...: this reverse
+    // orientation reached the tick-size multiply successfully, then panicked
+    // in the dry OfferCreate crossing path with "Native currency amount out of
+    // range" instead of placing the canonical residual.
+    let creator = acct(0x11);
+    let issuer = acct(0x33);
+    let currency = protocol::currency_from_string("2RY");
+    let mut issuer_root = account_root(issuer, 100_000_000, 0, 0);
+    issuer_root.set_field_u8(sf("sfTickSize"), 6);
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(creator, 13_527_058_947, 1, 0),
+            issuer_root,
+            trust_line(creator, issuer, currency, 1_000, 10_000, 0),
+        ],
+        vec!["SingleAssetVault", "LendingProtocol"],
+    );
+    let mut view = new_view(ledger);
+    let resting = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), creator);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1_250_000_620));
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            STAmount::from_iou_amount(
+                sf("sfTakerGets"),
+                IOUAmount::from_parts(1_947_026_300_000_000, -14).expect("19.470263"),
+                Issue::new(currency, issuer),
+            ),
+        );
+        tx.set_field_amount(sf("sfFee"), xrp(30));
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_u32(sf("sfFlags"), 589_824); // tfPassive | tfSell
+    });
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let cancelled = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), creator);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1_250_001_058));
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            STAmount::from_iou_amount(
+                sf("sfTakerGets"),
+                IOUAmount::from_parts(2_003_322_400_000_000, -14).expect("20.033224"),
+                Issue::new(currency, issuer),
+            ),
+        );
+        tx.set_field_amount(sf("sfFee"), xrp(30));
+        tx.set_field_u32(sf("sfSequence"), 2);
+        tx.set_field_u32(sf("sfFlags"), 589_824); // tfPassive | tfSell
+    });
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &cancelled, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    for (sequence, pays) in [(3, "20.07675"), (4, "20.674625")] {
+        let (mantissa, exponent) = match pays {
+            "20.07675" => (2_007_675_000_000_000, -14),
+            _ => (2_067_462_500_000_000, -14),
+        };
+        let opposite = STTx::new(TxType::OFFER_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), creator);
+            tx.set_field_amount(
+                sf("sfTakerPays"),
+                STAmount::from_iou_amount(
+                    sf("sfTakerPays"),
+                    IOUAmount::from_parts(mantissa, exponent).expect(pays),
+                    Issue::new(currency, issuer),
+                ),
+            );
+            tx.set_field_amount(sf("sfTakerGets"), xrp(1_250_000_000));
+            tx.set_field_amount(sf("sfFee"), xrp(30));
+            tx.set_field_u32(sf("sfSequence"), sequence);
+            tx.set_field_u32(sf("sfFlags"), 589_824); // tfPassive | tfSell
+        });
+        assert_eq!(
+            apply_submit_transactor_shell(&mut view, &opposite, TxType::OFFER_CREATE),
+            Ter::TES_SUCCESS
+        );
+    }
+    let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), creator);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1_250_000_000));
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            STAmount::from_iou_amount(
+                sf("sfTakerGets"),
+                IOUAmount::from_parts(2_004_744_700_000_000, -14).expect("20.047447"),
+                Issue::new(currency, issuer),
+            ),
+        );
+        tx.set_field_amount(sf("sfFee"), xrp(30));
+        tx.set_field_u32(sf("sfSequence"), 5);
+        tx.set_field_u32(sf("sfOfferSequence"), 2);
+        tx.set_field_u32(sf("sfFlags"), 589_824); // tfPassive | tfSell
+    });
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &tx, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let offer = view
+        .read(protocol::offer_keylet(acct_id(creator), 5))
+        .expect("offer read")
+        .expect("offer must be placed");
+    assert_eq!(
+        offer.get_field_amount(sf("sfTakerPays")).xrp().drops(),
+        1_250_000_420
+    );
+    assert!(
+        offer.get_field_amount(sf("sfTakerPays")).is_legal_net(),
+        "the internal tfSell sentinel must not escape into the stored offer"
+    );
+    assert!(
+        view.read(account_keylet(acct_id(creator)))
+            .expect("creator account read")
+            .expect("creator account")
+            .get_field_amount(sf("sfBalance"))
+            .is_legal_net(),
+        "the reverse-probe sentinel must not escape into the account balance"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(creator), 1))
+            .expect("resting same-side offer read")
+            .is_some()
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(creator), 2))
+            .expect("explicitly cancelled offer read")
+            .is_none()
+    );
+    for sequence in [3, 4] {
+        assert!(
+            view.read(protocol::offer_keylet(acct_id(creator), sequence))
+                .expect("reverse-book offer read")
+                .is_some(),
+            "worse passive reverse-book offer {sequence} must remain"
+        );
+    }
+}
+
+#[test]
+fn canonical_3e8efc65_tick_size_offer_places_rounded_residual() {
+    // Canonical evidence is retained in
+    // ledger/tests/fixtures/offer_create_106132761_3e8efc65. rippled
+    // OfferCreate.cpp:679-703 rounds the BRRL side at issuer TickSize=5,
+    // then uses the resulting noIssue rate to calculate TakerGets.
+    let creator = acct(0x11);
+    let brrl_issuer = acct(0x22);
+    let rlusd_issuer = acct(0x33);
+    let brrl = protocol::currency_from_string("BRRL");
+    let rlusd = protocol::currency_from_string("RLUSD");
+    let sequence = 99_420_541;
+
+    let mut creator_root = account_root(creator, 66_092_365_866, 2, 0);
+    creator_root.set_field_u32(sf("sfSequence"), sequence);
+    let mut brrl_root = account_root(brrl_issuer, 487_796_030, 0, 0);
+    brrl_root.set_field_u8(sf("sfTickSize"), 5);
+    let ledger = build_ledger(vec![
+        creator_root,
+        brrl_root,
+        account_root(rlusd_issuer, 99_881_635, 0, 0),
+        trust_line(creator, brrl_issuer, brrl, 638_391, 1_000_000, 0),
+        trust_line(creator, rlusd_issuer, rlusd, 50_048, 1_000_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+    let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), creator);
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            STAmount::from_iou_amount(
+                sf("sfTakerGets"),
+                IOUAmount::from_parts(255_395, 0).expect("canonical BRRL"),
+                Issue::new(brrl, brrl_issuer),
+            ),
+        );
+        tx.set_field_amount(
+            sf("sfTakerPays"),
+            STAmount::from_iou_amount(
+                sf("sfTakerPays"),
+                IOUAmount::from_parts(50_000, 0).expect("canonical RLUSD"),
+                Issue::new(rlusd, rlusd_issuer),
+            ),
+        );
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfSequence"), sequence);
+        tx.set_field_u32(sf("sfLastLedgerSequence"), 106_132_779);
+    });
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &tx, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let offer = view
+        .read(protocol::offer_keylet(acct_id(creator), sequence))
+        .expect("read created offer")
+        .expect("canonical offer must be placed");
+    assert_eq!(
+        offer.get_field_amount(sf("sfTakerGets")).text(),
+        "255388.7016038411"
+    );
+    assert_eq!(offer.get_field_amount(sf("sfTakerPays")).text(), "50000");
+    assert_eq!(
+        offer.get_field_h256(sf("sfBookDirectory")).data()[24..],
+        [0x54, 0x06, 0xF4, 0x9B, 0xD5, 0x8A, 0x90, 0x00]
+    );
 }
 
 #[test]

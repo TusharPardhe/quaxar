@@ -13,7 +13,10 @@ use protocol::{
     KeyType, PublicKey, parse_base58_node_public, sha512_digest, sha512_half, verify_digest,
 };
 
-use crate::protocol_version::{ProtocolVersion, supported_protocol_versions};
+use crate::protocol_version::{
+    ProtocolVersion, is_protocol_supported, negotiate_protocol_version, parse_protocol_versions,
+    supported_protocol_versions,
+};
 
 pub const FEATURE_COMPR: &str = "compr";
 pub const FEATURE_VPRR: &str = "vprr";
@@ -71,8 +74,11 @@ pub struct HandshakeVerificationContext {
 pub struct HandshakePeer {
     pub public_key: PublicKey,
     pub server_domain: Option<String>,
-    pub closed_ledger: Option<String>,
-    pub previous_ledger: Option<String>,
+    /// Verified peer current LCL from the handshake. This must be available
+    /// before protocol activation, matching rippled PeerImp::run.
+    pub closed_ledger: Option<Uint256>,
+    /// Verified parent of `closed_ledger`; it is invalid without a current LCL.
+    pub previous_ledger: Option<Uint256>,
 }
 
 pub fn get_feature_value(headers: &HeaderMap, feature: &str) -> Option<String> {
@@ -116,7 +122,7 @@ pub fn make_features_request_header(
         header.push_str("txrr=1;");
     }
     if vp_reduce_relay_enabled {
-        header.push_str("compr=lz4;ledgerreplay=1;txrr=1;");
+        header.push_str("vprr=1;");
     }
     header
 }
@@ -140,9 +146,61 @@ pub fn make_features_response_header(
         header.push_str("txrr=1;");
     }
     if vp_reduce_relay_enabled && feature_enabled(headers, FEATURE_VPRR) {
-        header.push_str("compr=lz4;ledgerreplay=1;txrr=1;");
+        header.push_str("vprr=1;");
     }
     header
+}
+
+fn has_header_token(headers: &HeaderMap, name: &str, expected: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case(expected))
+        })
+}
+
+/// Validate an inbound peer Upgrade request before allocating an active peer.
+/// This mirrors `OverlayImpl::onHandoff`: an Upgrade request must identify
+/// itself as a peer and offer at least one mutually supported XRPL version.
+pub fn negotiate_inbound_peer_upgrade(request: &Request<()>) -> Option<ProtocolVersion> {
+    if request.method() != Method::GET
+        || request.version() < Version::HTTP_11
+        || !has_header_token(request.headers(), "Connection", "Upgrade")
+        || !has_header_token(request.headers(), "Connect-As", "Peer")
+    {
+        return None;
+    }
+    let offered = request.headers().get(UPGRADE)?.to_str().ok()?;
+    negotiate_protocol_version(parse_protocol_versions(offered))
+}
+
+/// Validate the peer Upgrade response selected by an outbound connection.
+/// A response selects one (not a list of) supported protocol version.
+pub fn validate_outbound_peer_upgrade(response: &Response<()>) -> Result<ProtocolVersion, String> {
+    if response.version() < Version::HTTP_11
+        || !has_header_token(response.headers(), "Connection", "Upgrade")
+    {
+        return Err("missing HTTP Upgrade connection token".to_owned());
+    }
+    let offered = response
+        .headers()
+        .get(UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "missing peer Upgrade protocol".to_owned())?;
+    if offered.split(',').count() != 1 {
+        return Err("peer Upgrade response selected multiple protocols".to_owned());
+    }
+    let versions = parse_protocol_versions(offered);
+    let [version] = versions.as_slice() else {
+        return Err("peer Upgrade response selected an invalid protocol".to_owned());
+    };
+    if !is_protocol_supported(*version) {
+        return Err("peer Upgrade response selected an unsupported protocol".to_owned());
+    }
+    Ok(*version)
 }
 
 pub fn make_request(
@@ -156,7 +214,7 @@ pub fn make_request(
         .method(Method::GET)
         .uri("/")
         .version(Version::HTTP_11)
-        .header(USER_AGENT, HeaderValue::from_static("xrpld-rust/overlay"))
+        .header(USER_AGENT, HeaderValue::from_static("quaxar/overlay"))
         .header(UPGRADE, supported_protocol_versions())
         .header(CONNECTION, HeaderValue::from_static("Upgrade"))
         .header("Connect-As", HeaderValue::from_static("Peer"))
@@ -193,7 +251,7 @@ pub fn make_response(
         .header(CONNECTION, HeaderValue::from_static("Upgrade"))
         .header(UPGRADE, protocol.to_string())
         .header("Connect-As", HeaderValue::from_static("Peer"))
-        .header(SERVER, HeaderValue::from_static("xrpld-rust/overlay"))
+        .header(SERVER, HeaderValue::from_static("quaxar/overlay"))
         .header("Crawl", if crawl_public { "public" } else { "private" })
         .body(())
         .expect("overlay response builder");
@@ -265,6 +323,17 @@ pub fn make_shared_value_from_finished_messages(
     }
 
     Some(sha512_half(mixed))
+}
+
+fn parse_handshake_ledger_hash(value: &str) -> Result<Uint256, String> {
+    // Rippled accepts the canonical hex header form and the legacy base64
+    // wire form. Preserve both, but never silently convert malformed input to
+    // a zero LCL because NetworkOPs relies on this immediately after reconnect.
+    if let Ok(hash) = Uint256::from_hex(value) {
+        return Ok(hash);
+    }
+    Uint256::from_slice(&base64_decode(value))
+        .ok_or_else(|| "Malformed handshake ledger hash".to_owned())
 }
 
 pub fn verify_handshake(
@@ -384,12 +453,23 @@ pub fn verify_handshake(
         }
     }
 
+    let closed_ledger = header_value(headers, "Closed-Ledger")
+        .map(|value| parse_handshake_ledger_hash(&value))
+        .transpose()?;
+    let previous_ledger = header_value(headers, "Previous-Ledger")
+        .map(|value| parse_handshake_ledger_hash(&value))
+        .transpose()?;
+    if previous_ledger.is_some() && closed_ledger.is_none() {
+        tracing::warn!(target: "overlay", reason = "Previous-Ledger without Closed-Ledger", "Handshake failed");
+        return Err("Previous-Ledger without Closed-Ledger".to_owned());
+    }
+
     tracing::info!(target: "overlay", "Handshake complete");
     Ok(HandshakePeer {
         public_key,
         server_domain: header_value(headers, "Server-Domain"),
-        closed_ledger: header_value(headers, "Closed-Ledger"),
-        previous_ledger: header_value(headers, "Previous-Ledger"),
+        closed_ledger,
+        previous_ledger,
     })
 }
 
@@ -588,7 +668,7 @@ mod tests {
 
     use basics::base_uint::Uint256;
     use basics::base64::base64_encode;
-    use http::{HeaderMap, HeaderValue, StatusCode};
+    use http::{HeaderMap, HeaderValue, Response, StatusCode};
     use protocol::{KeyType, SecretKey, derive_public_key, sign_digest};
 
     use super::{
@@ -596,8 +676,9 @@ mod tests {
         HandshakeContext, HandshakeVerificationContext, X_PROTOCOL_CTL, build_handshake,
         feature_enabled, get_feature_value, is_feature_value, is_public_ip,
         make_features_request_header, make_features_response_header, make_request, make_response,
-        make_shared_value_from_finished_messages, parse_http_request, parse_http_response,
-        serialize_request, serialize_response, verify_handshake,
+        make_shared_value_from_finished_messages, negotiate_inbound_peer_upgrade,
+        parse_handshake_ledger_hash, parse_http_request, parse_http_response, serialize_request,
+        serialize_response, validate_outbound_peer_upgrade, verify_handshake,
     };
 
     #[test]
@@ -654,6 +735,39 @@ mod tests {
     }
 
     #[test]
+    fn peer_upgrade_negotiation_requires_connect_as_and_a_single_response_version() {
+        let mut request = make_request(false, false, false, false, false);
+        assert_eq!(
+            negotiate_inbound_peer_upgrade(&request),
+            Some(crate::protocol_version::ProtocolVersion::new(2, 2))
+        );
+
+        request
+            .headers_mut()
+            .insert("Connect-As", HeaderValue::from_static("Client"));
+        assert_eq!(negotiate_inbound_peer_upgrade(&request), None);
+
+        let response = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "XRPL/2.2")
+            .body(())
+            .expect("response");
+        assert_eq!(
+            validate_outbound_peer_upgrade(&response),
+            Ok(crate::protocol_version::ProtocolVersion::new(2, 2))
+        );
+
+        let multi = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "XRPL/2.1, XRPL/2.2")
+            .body(())
+            .expect("response");
+        assert!(validate_outbound_peer_upgrade(&multi).is_err());
+    }
+
+    #[test]
     fn verify_handshake_checks_signature_and_ip() {
         let secret = SecretKey::from_bytes([9u8; 32]);
         let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
@@ -690,6 +804,23 @@ mod tests {
         };
         let peer = verify_handshake(&headers, &verify_context).expect("handshake should verify");
         assert_eq!(peer.public_key, public);
+        assert_eq!(
+            peer.closed_ledger,
+            Some(Uint256::from_hex(&"A".repeat(64)).expect("closed hash"))
+        );
+        assert_eq!(
+            peer.previous_ledger,
+            Some(Uint256::from_hex(&"B".repeat(64)).expect("previous hash"))
+        );
+    }
+
+    #[test]
+    fn handshake_ledger_hash_parsing_rejects_malformed_input() {
+        assert!(parse_handshake_ledger_hash("not-a-ledger").is_err());
+        assert_eq!(
+            parse_handshake_ledger_hash(&"C".repeat(64)).expect("canonical hash"),
+            Uint256::from_hex(&"C".repeat(64)).expect("expected canonical hash"),
+        );
     }
 
     #[test]
@@ -830,7 +961,7 @@ mod tests {
     fn feature_header_builders_match_cpp_shape() {
         assert_eq!(
             make_features_request_header(true, true, true, true),
-            "compr=lz4;ledgerreplay=1;txrr=1;"
+            "compr=lz4;ledgerreplay=1;txrr=1;vprr=1;"
         );
         let request = make_request(true, true, true, true, true);
         assert_eq!(

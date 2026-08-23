@@ -14,7 +14,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[allow(non_upper_case_globals)]
 #[unsafe(no_mangle)]
 pub static _rjem_malloc_conf: Option<&'static libc::c_char> = Some(unsafe {
-    &*b"dirty_decay_ms:0,muzzy_decay_ms:0\0"
+    &*c"dirty_decay_ms:0,muzzy_decay_ms:0"
         .as_ptr()
         .cast::<libc::c_char>()
 });
@@ -23,77 +23,47 @@ use app::{
     AppBootstrapOptions, AppBootstrapRuntime, MainRuntime, ManagedComponent, build_bootstrap_root,
     load_basic_config_file, parse_bootstrap_args, run_bootstrap_runtime,
 };
+#[cfg(test)]
 use basics::base_uint::Uint256;
 use basics::basic_config::BasicConfig;
+use basics::uptime_clock::UptimeClock;
 use indicatif::{ProgressBar, ProgressStyle};
-use overlay::Overlay;
-use overlay::Peer as _;
-// Import PeerSet trait for method access on SimplePeerSet
 use rpc::rpc_cmd_to_json;
 use server::{ServerRuntime, ServerRuntimeBuildReport};
+#[cfg(test)]
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread::{self, JoinHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 const PEERFINDER_LIVE_CACHE_TTL: Duration = Duration::from_secs(30);
+#[cfg(test)]
 const PEERFINDER_RECENT_ATTEMPT_DURATION: Duration = Duration::from_secs(60);
-const PEERFINDER_SECONDS_PER_MESSAGE: Duration = Duration::from_secs(151);
-const PEERFINDER_SECONDS_PER_CONNECT: Duration = Duration::from_secs(10);
+#[cfg(test)]
 const PEERFINDER_MAX_HOPS: u32 = 6;
+#[cfg(test)]
 const PEERFINDER_NUMBER_OF_ENDPOINTS: usize = (2 * PEERFINDER_MAX_HOPS) as usize;
+#[cfg(test)]
 const PEERFINDER_MAX_CONNECT_ATTEMPTS: usize = 20;
-const PEERFINDER_MAX_REDIRECTS: usize = 30;
+#[cfg(test)]
 const PEERFINDER_OUT_PERCENT: usize = 15;
+#[cfg(test)]
 const PEERFINDER_MIN_OUTBOUND: usize = 10;
-const PEERFINDER_BOOTCACHE_SIZE: usize = 1000;
-const PEERFINDER_BOOTCACHE_PRUNE_PERCENT: usize = 10;
-const PEERFINDER_BOOTCACHE_UPDATE_COOLDOWN: Duration = Duration::from_secs(60);
-const MAX_DIRECT_LEDGER_DATA_PER_TICK: usize = 4096;
 
-fn full_sync_debug_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("XRPLD_FULL_SYNC_DEBUG")
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
-fn debug_hash8(hash: &Uint256) -> String {
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}",
-        hash.data()[0],
-        hash.data()[1],
-        hash.data()[2],
-        hash.data()[3]
-    )
-}
-
-macro_rules! full_sync_debug {
-    ($($arg:tt)*) => {
-        if crate::full_sync_debug_enabled() {
-            tracing::debug!(target: "full_sync", $($arg)*);
-        }
-    };
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct KnownEndpoint {
     hops: u32,
     last_seen: Instant,
 }
 
-enum PeerfinderBootcacheEvent {
-    Redirects(Vec<std::net::SocketAddr>),
-    Success(std::net::SocketAddr),
-    Failure(std::net::SocketAddr),
-}
-
+#[cfg(test)]
 fn remember_known_endpoint(
     known_endpoints: &mut HashMap<std::net::SocketAddr, KnownEndpoint>,
     endpoint: std::net::SocketAddr,
@@ -112,6 +82,7 @@ fn remember_known_endpoint(
         });
 }
 
+#[cfg(test)]
 fn prune_known_endpoints(
     known_endpoints: &mut HashMap<std::net::SocketAddr, KnownEndpoint>,
     now: Instant,
@@ -121,6 +92,7 @@ fn prune_known_endpoints(
     });
 }
 
+#[cfg(test)]
 fn prune_recent_connect_attempts(
     recent_attempts: &mut HashMap<std::net::IpAddr, Instant>,
     now: Instant,
@@ -128,460 +100,7 @@ fn prune_recent_connect_attempts(
     recent_attempts.retain(|_, until| *until > now);
 }
 
-/// Shared PeerFinder bookkeeping state, matching reference PeerFinder::Logic's
-/// internal livecache/bootcache/recent-attempts state. Wrapped in a single
-/// mutex so both the dedicated overlay-timer thread (sendEndpoints/autoConnect)
-/// and anything else that needs to inspect it can share ownership safely,
-/// without pinning this state to a specific thread's stack.
-struct PeerfinderState {
-    known_endpoints: HashMap<std::net::SocketAddr, KnownEndpoint>,
-    redirect_bootcache: std::collections::BTreeMap<std::net::SocketAddr, i32>,
-    bootcache_dirty: bool,
-    recent_autoconnect_attempts: HashMap<std::net::IpAddr, Instant>,
-    last_bootcache_save_at: Instant,
-}
-
-impl PeerfinderState {
-    fn new(peerfinder_bootcache_path: Option<&std::path::Path>) -> Self {
-        Self {
-            known_endpoints: HashMap::new(),
-            redirect_bootcache: peerfinder_bootcache_path
-                .map(load_peerfinder_bootcache)
-                .unwrap_or_default(),
-            bootcache_dirty: false,
-            recent_autoconnect_attempts: HashMap::new(),
-            last_bootcache_save_at: Instant::now(),
-        }
-    }
-}
-
-/// Dependencies for the dedicated overlay-timer thread. All fields are
-/// cheaply cloneable (Arc-backed), so this can be constructed once and moved
-/// into the spawned thread.
-struct OverlayTimerDeps {
-    app: app::ApplicationRoot,
-    ledger_data_rx:
-        Arc<Mutex<Option<std::sync::mpsc::Receiver<overlay::PeerMessage<overlay::TmLedgerData>>>>>,
-    acq_registry: AcqRegistry,
-    shared_fetch_pack: Arc<ledger::FetchPackCache>,
-    loaded_ledger_runtime: Option<app::AppLoadedLedgerRuntime>,
-    peerfinder_bootcache_path: Option<PathBuf>,
-    peerfinder_state: Arc<Mutex<PeerfinderState>>,
-    stop: Arc<CatchUpState>,
-}
-
-/// Spawn the dedicated overlay-timer thread, matching reference
-/// OverlayImpl::Timer's fixed 1-second boost::asio::steady_timer cadence.
-///
-/// This replaces the previous approach of checking `elapsed() >= 1s` inside
-/// the main catchup loop's ~1ms busy-poll body: that coupled a 1Hz duty to a
-/// thread spinning at ~1000Hz, which churned the queued_inbound mutex and
-/// starved the consensus-driver thread badly enough that peer proposals
-/// looked stale by the propose_freshness cutoff, causing nodes to silently
-/// diverge. A dedicated thread that sleeps exactly 1 second per iteration —
-/// the same pattern already used by `consensus::driver::spawn_heartbeat` —
-/// runs these duties at the correct cadence independent of any other loop's
-/// polling rate.
-///
-/// Handles, in order, matching reference OverlayImpl::onTimer:
-/// sendEndpoints (PeerFinder::Logic::buildEndpointsForPeers), autoConnect
-/// (PeerFinder::Logic::autoconnect), ping (PeerImp::onTimer), and the
-/// inbound message-queue duties (ledger_data routing, get_objects routing,
-/// get_ledgers serving, and NetworkOPs::processTransaction for peer-relayed
-/// transactions).
-fn spawn_overlay_timer(deps: OverlayTimerDeps) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name("xrpld-overlay-timer".to_owned())
-        .spawn(move || {
-            tracing::info!(target: "overlay", "Overlay timer thread started (1s)");
-            let (bootcache_tx, bootcache_rx) =
-                std::sync::mpsc::channel::<PeerfinderBootcacheEvent>();
-            let mut last_endpoints_at = Instant::now()
-                .checked_sub(PEERFINDER_SECONDS_PER_MESSAGE)
-                .unwrap_or_else(Instant::now);
-            let mut last_auto_connect_at = Instant::now()
-                .checked_sub(PEERFINDER_SECONDS_PER_CONNECT)
-                .unwrap_or_else(Instant::now);
-
-            while !deps.stop.stop.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_secs(1));
-                if deps.stop.stop.load(Ordering::Acquire) {
-                    break;
-                }
-
-                let Some(overlay_runtime) = deps.app.overlay_runtime() else {
-                    continue;
-                };
-                use overlay::Overlay as _;
-                let peers = overlay_runtime.overlay().active_peers();
-
-                // sendEndpoints (reference PeerFinder::Logic::buildEndpointsForPeers)
-                if last_endpoints_at.elapsed() >= PEERFINDER_SECONDS_PER_MESSAGE {
-                    last_endpoints_at = Instant::now();
-                    let mut state = deps.peerfinder_state.lock().expect("peerfinder state");
-                    prune_known_endpoints(&mut state.known_endpoints, Instant::now());
-                    let listening_port = overlay_runtime.listener_setup().map(|setup| setup.port);
-                    for peer in &peers {
-                        let endpoints_v2 = build_endpoint_broadcast(
-                            listening_port,
-                            &state.known_endpoints,
-                            peer,
-                            Instant::now(),
-                        );
-                        if endpoints_v2.is_empty() {
-                            continue;
-                        }
-                        let msg = overlay::ProtocolMessage::new(
-                            overlay::ProtocolPayload::Endpoints(overlay::TmEndpoints {
-                                version: 2,
-                                endpoints_v2,
-                            }),
-                        );
-                        peer.send(overlay::Message::new(msg, None));
-                    }
-                }
-
-                // autoConnect (reference PeerFinder::Logic::autoconnect)
-                if last_auto_connect_at.elapsed() >= PEERFINDER_SECONDS_PER_CONNECT {
-                    last_auto_connect_at = Instant::now();
-                    let now = Instant::now();
-                    let mut state = deps.peerfinder_state.lock().expect("peerfinder state");
-                    prune_known_endpoints(&mut state.known_endpoints, now);
-                    prune_recent_connect_attempts(&mut state.recent_autoconnect_attempts, now);
-                    while let Ok(event) = bootcache_rx.try_recv() {
-                        match event {
-                            PeerfinderBootcacheEvent::Redirects(redirect_peers) => {
-                                let mut added = 0usize;
-                                for addr in redirect_peers.into_iter().take(PEERFINDER_MAX_REDIRECTS) {
-                                    if insert_peerfinder_bootcache(&mut state.redirect_bootcache, addr) {
-                                        state.bootcache_dirty = true;
-                                        added += 1;
-                                    }
-                                }
-                                if added > 0 {
-                                    tracing::debug!(target: "peerfinder", added, total = state.redirect_bootcache.len(), "Redirect bootcache updated");
-                                }
-                            }
-                            PeerfinderBootcacheEvent::Success(addr) => {
-                                peerfinder_bootcache_success(&mut state.redirect_bootcache, addr);
-                                state.bootcache_dirty = true;
-                            }
-                            PeerfinderBootcacheEvent::Failure(addr) => {
-                                peerfinder_bootcache_failure(&mut state.redirect_bootcache, addr);
-                                state.bootcache_dirty = true;
-                            }
-                        }
-                    }
-                    if state.bootcache_dirty
-                        && state.last_bootcache_save_at.elapsed()
-                            >= PEERFINDER_BOOTCACHE_UPDATE_COOLDOWN
-                    {
-                        if let Some(path) = deps.peerfinder_bootcache_path.as_deref() {
-                            save_peerfinder_bootcache(path, &state.redirect_bootcache);
-                        }
-                        state.bootcache_dirty = false;
-                        state.last_bootcache_save_at = Instant::now();
-                    }
-                    let target_outbound_peers = peerfinder_outbound_target(
-                        overlay_runtime.overlay().limit(),
-                        overlay_runtime.listener_setup().is_some(),
-                    );
-                    let active_outbound_peers =
-                        overlay_runtime.overlay().active_outbound_peers_count();
-                    if peers.len() < target_outbound_peers {
-                        tracing::debug!(target: "peerfinder", peers = peers.len(), outbound = active_outbound_peers, target_outbound = target_outbound_peers, pending = overlay_runtime.overlay().pending_outbound_attempts(), known_endpoints = state.known_endpoints.len(), "Peer count below target");
-                    }
-                    if active_outbound_peers < target_outbound_peers
-                        && overlay_runtime.overlay().pending_outbound_attempts() == 0
-                    {
-                        let mut connected_addrs: std::collections::HashSet<std::net::IpAddr> =
-                            peers
-                                .iter()
-                                .map(|p| peerfinder_canonical_ip(p.remote_address().ip()))
-                                .collect();
-                        let mut scheduled_attempts = 0usize;
-                        let selected = select_autoconnect_endpoints(
-                            &connected_addrs,
-                            &state.known_endpoints,
-                            &state.recent_autoconnect_attempts,
-                            now,
-                        );
-                        let selected = if selected.is_empty() {
-                            select_bootcache_endpoints(
-                                &connected_addrs,
-                                &state.redirect_bootcache,
-                                &state.recent_autoconnect_attempts,
-                                now,
-                            )
-                        } else {
-                            selected
-                        };
-                        if !selected.is_empty() {
-                            tracing::debug!(target: "peerfinder", selected = selected.len(), active_outbound = active_outbound_peers, target_outbound = target_outbound_peers, known_endpoints = state.known_endpoints.len(), bootcache = state.redirect_bootcache.len(), "Autoconnect selected");
-                        }
-                        for addr in selected {
-                            if active_outbound_peers + scheduled_attempts >= target_outbound_peers {
-                                break;
-                            }
-                            connected_addrs.insert(peerfinder_canonical_ip(addr.ip()));
-                            state.recent_autoconnect_attempts.insert(
-                                peerfinder_canonical_ip(addr.ip()),
-                                now + PEERFINDER_RECENT_ATTEMPT_DURATION,
-                            );
-                            scheduled_attempts += 1;
-                            let overlay = Arc::clone(&overlay_runtime.overlay());
-                            let bootcache_tx = bootcache_tx.clone();
-                            let _ = std::thread::Builder::new()
-                                .name("xrpld-auto-connect".to_owned())
-                                .spawn(move || {
-                                    let rt = tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build();
-                                    if let Ok(rt) = rt {
-                                        match rt.block_on(overlay.connect(addr)) {
-                                            Ok(mut result) => {
-                                                tracing::info!(target: "peerfinder", %addr, peer_id = result.peer.id(), "Autoconnect connected");
-                                                if let Some(session) = result.session.take() {
-                                                    overlay.spawn_peer_session(std::sync::Arc::clone(&result.peer), session);
-                                                }
-                                                let _ = bootcache_tx.send(PeerfinderBootcacheEvent::Success(addr));
-                                            }
-                                            Err(overlay::ConnectAttemptError::Redirect(redirect_peers)) => {
-                                                tracing::debug!(target: "peerfinder", %addr, redirect_count = redirect_peers.len(), "Autoconnect redirected");
-                                                let _ = bootcache_tx.send(PeerfinderBootcacheEvent::Redirects(redirect_peers));
-                                            }
-                                            Err(error) => {
-                                                tracing::debug!(target: "peerfinder", %addr, %error, "Autoconnect failed");
-                                                let _ = bootcache_tx.send(PeerfinderBootcacheEvent::Failure(addr));
-                                            }
-                                        }
-                                    }
-                                });
-                        }
-                    }
-                }
-
-                // === reference PeerImp::onTimer (every 60 seconds): send ping ===
-                // Folded into this 1s timer's own cadence tracking below.
-                {
-                    static_ping_tick(&overlay_runtime, &peers);
-                }
-
-                if peers.is_empty() {
-                    continue;
-                }
-
-                // === OVERLAY DUTIES (reference OverlayImpl::Timer message-queue duties) ===
-                let snapshot = overlay_runtime.overlay().take_queued_inbound_snapshot();
-                overlay_runtime.overlay().requeue_validations(snapshot.validations);
-
-                // Accumulate discovered endpoints for auto-connect
-                {
-                    let mut state = deps.peerfinder_state.lock().expect("peerfinder state");
-                    let now = Instant::now();
-                    for batch in &snapshot.endpoints {
-                        for ep in &batch.endpoints {
-                            if insert_peerfinder_bootcache(&mut state.redirect_bootcache, ep.endpoint) {
-                                state.bootcache_dirty = true;
-                            }
-                            remember_known_endpoint(&mut state.known_endpoints, ep.endpoint, ep.hops, now);
-                        }
-                    }
-                }
-
-                // --- Route TmLedgerData to acquisitions ---
-                let mut direct_messages = Vec::new();
-                let mut direct_channel_capped = false;
-                for _ in 0..MAX_DIRECT_LEDGER_DATA_PER_TICK {
-                    match deps.ledger_data_rx
-                        .lock()
-                        .expect("ledger_data_rx lock")
-                        .as_ref()
-                        .map(|rx| rx.try_recv())
-                        .unwrap_or(Err(std::sync::mpsc::TryRecvError::Disconnected))
-                    {
-                        Ok(msg) => direct_messages.push(msg),
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                    }
-                }
-                if direct_messages.len() == MAX_DIRECT_LEDGER_DATA_PER_TICK {
-                    direct_channel_capped = true;
-                }
-                let total_ledger_data = snapshot.ledger_data.len() + direct_messages.len();
-                let mut routed = 0usize;
-                let mut unrouted = 0usize;
-
-                for message in &direct_messages {
-                    if let Some(cookie) = message.message.request_cookie {
-                        if let Some(target) = peers.iter().find(|p| p.id() == cookie) {
-                            let mut fwd = message.message.clone();
-                            fwd.request_cookie = None;
-                            let reply = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(fwd));
-                            target.send(overlay::Message::new(reply, None));
-                        }
-                        continue;
-                    }
-                    if let Some((hash, packet)) = parse_ledger_data_packet(&message.message) {
-                        let hash = *hash.as_uint256();
-                        if route_ledger_data_to_acq(&deps.acq_registry, &hash, message.peer_id as u64, packet.clone()) {
-                            routed += 1;
-                        } else {
-                            unrouted += 1;
-                            if message.message.r#type == 2
-                                && let Some((_, packet)) = parse_ledger_data_packet(&message.message) {
-                                    let mut fp_store = SharedFetchPack::new(Arc::clone(&deps.shared_fetch_pack));
-                                    let _ = app::stash_stale_packet(&packet, &mut fp_store);
-                                }
-                        }
-                    }
-                }
-
-                for message in &snapshot.ledger_data {
-                    if let Some(cookie) = message.message.request_cookie {
-                        if let Some(target) = peers.iter().find(|p| p.id() == cookie) {
-                            let mut fwd = message.message.clone();
-                            fwd.request_cookie = None;
-                            let reply = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(fwd));
-                            target.send(overlay::Message::new(reply, None));
-                        }
-                        continue;
-                    }
-                    if let Some((hash, packet)) = parse_ledger_data_packet(&message.message) {
-                        let hash = *hash.as_uint256();
-                        if route_ledger_data_to_acq(&deps.acq_registry, &hash, message.peer_id as u64, packet.clone()) {
-                            routed += 1;
-                        } else {
-                            unrouted += 1;
-                            if message.message.r#type == 2
-                                && let Some((_, packet)) = parse_ledger_data_packet(&message.message) {
-                                    let mut fp_store = SharedFetchPack::new(Arc::clone(&deps.shared_fetch_pack));
-                                    let _ = app::stash_stale_packet(&packet, &mut fp_store);
-                                }
-                        }
-                    }
-                }
-
-                // --- Route TMGetObjectByHash responses ---
-                for message in &snapshot.get_objects {
-                    if message.message.query { continue; }
-                    let ledger_hash = match message.message.ledger_hash.as_deref().and_then(Uint256::from_slice) {
-                        Some(h) => h,
-                        None => continue,
-                    };
-                    let packet_type = match message.message.r#type {
-                        3 => ledger::InboundLedgerDataType::TransactionNode,
-                        4 => ledger::InboundLedgerDataType::StateNode,
-                        6 => {
-                            for obj in &message.message.objects {
-                                let Some(hash_bytes) = obj.hash.as_deref() else { continue };
-                                let Some(hash) = Uint256::from_slice(hash_bytes) else { continue };
-                                let Some(data) = obj.data.as_ref() else { continue };
-                                deps.shared_fetch_pack.add_fetch_pack(hash, data.clone());
-                            }
-                            for tx in deps.acq_registry.lock().expect("acq registry").values() {
-                                let _ = tx.send(AcqMsg::FetchPackReady);
-                            }
-                            tracing::debug!(target: "inbound_ledger", objects = message.message.objects.len(), "Fetch-pack ingested");
-                            continue;
-                        }
-                        _ => continue,
-                    };
-                    let nodes: Vec<_> = message.message.objects.iter()
-                        .filter_map(|obj| {
-                            let data = obj.data.as_ref()?;
-                            Some(ledger::InboundLedgerNodeData::new(obj.node_id.clone(), data.clone()))
-                        })
-                        .collect();
-                    if nodes.is_empty() { continue; }
-                    let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
-                    route_ledger_data_to_acq(&deps.acq_registry, &ledger_hash, message.peer_id as u64, packet);
-                }
-
-                // --- Serve GetLedger requests (reference processLedgerRequest) ---
-                if let Some(loaded_ledger_runtime) = deps.loaded_ledger_runtime.as_ref() {
-                    for gl in &snapshot.get_ledgers {
-                        if let Some(peer) = peers.iter().find(|p| p.id() == gl.peer_id) {
-                            serve_get_ledger(loaded_ledger_runtime, &gl.message, peer.as_ref(), &peers);
-                        }
-                    }
-                }
-
-                if total_ledger_data > 0 || !snapshot.get_objects.is_empty() || !snapshot.get_ledgers.is_empty() {
-                    tracing::debug!(target: "overlay", total_ledger_data, direct_channel_capped, routed, unrouted, get_ledgers = snapshot.get_ledgers.len(), get_objects = snapshot.get_objects.len(), "Route summary");
-                }
-            }
-            tracing::info!(target: "overlay", "Overlay timer thread stopped");
-        })
-        .expect("spawn xrpld-overlay-timer")
-}
-
-/// Process a single inbound peer transaction, matching reference
-/// PeerImp::checkTransaction (called from a JobQueue JtTransaction worker).
-/// Applies the transaction to the open ledger via NetworkOPs::processTransaction.
-fn process_inbound_transaction(app: &app::ApplicationRoot, raw_transaction: &[u8]) {
-    let mut serial = protocol::SerialIter::new(raw_transaction);
-    let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        protocol::STTx::from_serial_iter(&mut serial)
-    })) {
-        Ok(tx) => tx,
-        Err(_) => return,
-    };
-    let st_tx = std::sync::Arc::new(st_tx);
-    let mut transaction: app::SharedTransaction = std::sync::Arc::new(std::sync::Mutex::new(
-        app::tx_queue::transaction::Transaction::new(std::sync::Arc::clone(&st_tx)),
-    ));
-    if let Some(network_ops_runtime) = app.network_ops_runtime() {
-        let _ = network_ops_runtime.process_transaction(
-            &mut transaction,
-            false,
-            false,
-            false,
-            || false,
-            || {},
-        );
-        let _ = app.apply_network_ops_pending_to_open_ledger();
-    }
-}
-
-/// Per-60s ping tick tracked via a thread-local-style static using an atomic
-/// timestamp, since the overlay-timer thread owns its own 1s loop and has no
-/// access to the main loop's `last_ping_at` local variable.
-fn static_ping_tick(
-    overlay_runtime: &Arc<app::runtime::overlay_runtime::AppOverlayRuntime>,
-    peers: &[Arc<dyn overlay::Peer>],
-) {
-    use std::sync::atomic::AtomicU64;
-    static LAST_PING_SECS: AtomicU64 = AtomicU64::new(0);
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let last = LAST_PING_SECS.load(Ordering::Relaxed);
-    if now_secs.saturating_sub(last) < 60 {
-        return;
-    }
-    LAST_PING_SECS.store(now_secs, Ordering::Relaxed);
-    let ping_msg = overlay::ProtocolMessage::new(overlay::ProtocolPayload::Ping(
-        overlay::message::wire::TmPing {
-            r#type: 0,
-            seq: Some(basics::random::rand_int_to(u32::MAX)),
-            ping_time: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
-            ),
-            net_time: None,
-        },
-    ));
-    let wire = overlay::Message::new(ping_msg, None);
-    for p in peers {
-        p.send(wire.clone());
-    }
-    overlay_runtime.overlay().delete_idle_peers();
-}
-
+#[cfg(test)]
 fn peerfinder_canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip {
         std::net::IpAddr::V6(ipv6) => ipv6
@@ -592,92 +111,7 @@ fn peerfinder_canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
-fn peerfinder_bootcache_path(config: &BasicConfig) -> Option<PathBuf> {
-    config
-        .legacy("database_path")
-        .ok()
-        .map(|path| PathBuf::from(path).join("peerfinder.db"))
-}
-
-fn prune_peerfinder_bootcache(bootcache: &mut BTreeMap<std::net::SocketAddr, i32>) {
-    if bootcache.len() <= PEERFINDER_BOOTCACHE_SIZE {
-        return;
-    }
-    let prune_count = (bootcache.len() * PEERFINDER_BOOTCACHE_PRUNE_PERCENT) / 100;
-    let mut by_worst_valence = bootcache
-        .iter()
-        .map(|(addr, valence)| (*addr, *valence))
-        .collect::<Vec<_>>();
-    by_worst_valence.sort_by(|(left_addr, left), (right_addr, right)| {
-        left.cmp(right).then_with(|| left_addr.cmp(right_addr))
-    });
-    for (addr, _) in by_worst_valence.into_iter().take(prune_count) {
-        bootcache.remove(&addr);
-    }
-}
-
-fn insert_peerfinder_bootcache(
-    bootcache: &mut BTreeMap<std::net::SocketAddr, i32>,
-    addr: std::net::SocketAddr,
-) -> bool {
-    let inserted = bootcache
-        .insert(addr, *bootcache.get(&addr).unwrap_or(&0))
-        .is_none();
-    if inserted {
-        prune_peerfinder_bootcache(bootcache);
-    }
-    inserted
-}
-
-fn peerfinder_bootcache_success(
-    bootcache: &mut BTreeMap<std::net::SocketAddr, i32>,
-    addr: std::net::SocketAddr,
-) {
-    let valence = bootcache.entry(addr).or_insert(0);
-    *valence = (*valence).max(0).saturating_add(1);
-    prune_peerfinder_bootcache(bootcache);
-}
-
-fn peerfinder_bootcache_failure(
-    bootcache: &mut BTreeMap<std::net::SocketAddr, i32>,
-    addr: std::net::SocketAddr,
-) {
-    let valence = bootcache.entry(addr).or_insert(0);
-    *valence = (*valence).min(0).saturating_sub(1);
-    prune_peerfinder_bootcache(bootcache);
-}
-
-fn load_peerfinder_bootcache(path: &Path) -> BTreeMap<std::net::SocketAddr, i32> {
-    let mut bootcache = BTreeMap::new();
-    match rdb::PeerFinderDb::open(path).and_then(|db| db.load_bootcache()) {
-        Ok(entries) => {
-            for entry in entries {
-                if let Ok(addr) = entry.address.parse::<std::net::SocketAddr>() {
-                    bootcache.insert(addr, entry.valence);
-                }
-            }
-            tracing::info!(target: "peerfinder", count = bootcache.len(), path = %path.display(), "Bootcache loaded");
-        }
-        Err(error) => {
-            tracing::debug!(target: "peerfinder", path = %path.display(), %error, "Bootcache load skipped");
-        }
-    }
-    bootcache
-}
-
-fn save_peerfinder_bootcache(path: &Path, bootcache: &BTreeMap<std::net::SocketAddr, i32>) {
-    let entries = bootcache
-        .iter()
-        .map(|(addr, valence)| rdb::PeerFinderBootcacheEntry {
-            address: addr.to_string(),
-            valence: *valence,
-        })
-        .collect::<Vec<_>>();
-    if let Err(error) = rdb::PeerFinderDb::open(path).and_then(|db| db.save_bootcache(&entries)) {
-        tracing::warn!(target: "peerfinder", path = %path.display(), %error, "Bootcache save failed");
-    }
-}
-
+#[cfg(test)]
 fn build_endpoint_broadcast(
     listening_port: Option<u16>,
     known_endpoints: &HashMap<std::net::SocketAddr, KnownEndpoint>,
@@ -736,6 +170,7 @@ fn build_endpoint_broadcast(
     endpoints
 }
 
+#[cfg(test)]
 fn select_autoconnect_endpoints(
     connected_ips: &std::collections::HashSet<std::net::IpAddr>,
     known_endpoints: &HashMap<std::net::SocketAddr, KnownEndpoint>,
@@ -772,6 +207,7 @@ fn select_autoconnect_endpoints(
     selected
 }
 
+#[cfg(test)]
 fn select_bootcache_endpoints(
     connected_ips: &std::collections::HashSet<std::net::IpAddr>,
     bootcache: &BTreeMap<std::net::SocketAddr, i32>,
@@ -808,6 +244,7 @@ fn select_bootcache_endpoints(
     selected
 }
 
+#[cfg(test)]
 fn peerfinder_outbound_target(peer_limit: usize, want_incoming: bool) -> usize {
     if peer_limit == 0 {
         return 0;
@@ -819,11 +256,16 @@ fn peerfinder_outbound_target(peer_limit: usize, want_incoming: bool) -> usize {
     peer_limit.min(computed.max(PEERFINDER_MIN_OUTBOUND))
 }
 
+/// Server-startup flags that consume the following argument. Keep this list
+/// aligned with `parse_bootstrap_args`: top-level CLI parsing uses it only to
+/// avoid treating a startup flag's value as an RPC subcommand.
+const STARTUP_VALUE_FLAGS: &[&str] = &["--conf", "-c", "--rpc-url", "--quorum"];
+
 /// Try to parse CLI subcommands. Returns Some(ExitCode) if a subcommand was
 /// handled, None if the node should start normally.
 /// Resolve the RPC URL: if user passed --url explicitly, use it.
 /// Otherwise, try to parse the config file to find the HTTP admin port.
-fn resolve_rpc_url(parsed: &xrpld_cli::Cli) -> String {
+fn resolve_rpc_url(parsed: &quaxar_cli::Cli) -> String {
     // If user explicitly set --rpc-url (not the default), use it as-is
     if parsed.rpc_url != "http://127.0.0.1:5005" {
         return parsed.rpc_url.clone();
@@ -831,8 +273,8 @@ fn resolve_rpc_url(parsed: &xrpld_cli::Cli) -> String {
 
     // Try to find config and extract the RPC port
     let conf_path = parsed.conf.as_deref().unwrap_or_else(|| {
-        if std::path::Path::new("xrpld.cfg").exists() {
-            "xrpld.cfg"
+        if std::path::Path::new("quaxar.cfg").exists() {
+            "quaxar.cfg"
         } else {
             ""
         }
@@ -923,12 +365,11 @@ fn try_cli_subcommand() -> Option<ExitCode> {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        let _ = xrpld_cli::Cli::command().print_help();
+        let _ = quaxar_cli::Cli::command().print_help();
         println!();
         return Some(ExitCode::SUCCESS);
     }
 
-    const VALUE_FLAGS: &[&str] = &["--conf", "-c", "--rpc-url"];
     // Known subcommands
     let subcommands = [
         "status",
@@ -975,7 +416,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
         "-V",
     ];
 
-    let parsed = match xrpld_cli::Cli::try_parse() {
+    let parsed = match quaxar_cli::Cli::try_parse() {
         Ok(parsed) => parsed,
         Err(err)
             if matches!(
@@ -1001,7 +442,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
                 ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand
             ) =>
         {
-            if let Some(command) = first_command_like_arg(&args, VALUE_FLAGS) {
+            if let Some(command) = first_command_like_arg(&args, STARTUP_VALUE_FLAGS) {
                 print_unknown_command(command, &subcommands);
                 return Some(ExitCode::FAILURE);
             }
@@ -1019,73 +460,79 @@ fn try_cli_subcommand() -> Option<ExitCode> {
     let cmd = parsed.command?;
 
     let ok = match cmd {
-        xrpld_cli::Command::Status => xrpld_cli::status::run(url),
-        xrpld_cli::Command::Health => {
-            if !xrpld_cli::health::run(url) {
+        quaxar_cli::Command::Status => quaxar_cli::status::run(url),
+        quaxar_cli::Command::Health => {
+            if !quaxar_cli::health::run(url) {
                 return Some(ExitCode::FAILURE);
             }
             true
         }
-        xrpld_cli::Command::Peers => xrpld_cli::peers::run(url),
-        xrpld_cli::Command::SyncStatus => xrpld_cli::sync_status::run(url),
-        xrpld_cli::Command::Rpc {
+        quaxar_cli::Command::Peers => quaxar_cli::peers::run(url),
+        quaxar_cli::Command::SyncStatus => quaxar_cli::sync_status::run(url),
+        quaxar_cli::Command::Rpc {
             method,
             params,
             raw,
-        } => xrpld_cli::rpc_cmd::run(url, &method, params.as_deref(), raw),
-        xrpld_cli::Command::Ping => xrpld_cli::rpc_cmd::run_no_params(url, "ping"),
-        xrpld_cli::Command::ServerInfo => xrpld_cli::rpc_cmd::run_no_params(url, "server_info"),
-        xrpld_cli::Command::ServerState => xrpld_cli::rpc_cmd::run_no_params(url, "server_state"),
-        xrpld_cli::Command::ServerDefinitions => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "server_definitions")
+        } => quaxar_cli::rpc_cmd::run(url, &method, params.as_deref(), raw),
+        quaxar_cli::Command::Ping => quaxar_cli::rpc_cmd::run_no_params(url, "ping"),
+        quaxar_cli::Command::ServerInfo => quaxar_cli::rpc_cmd::run_no_params(url, "server_info"),
+        quaxar_cli::Command::ServerState => quaxar_cli::rpc_cmd::run_no_params(url, "server_state"),
+        quaxar_cli::Command::ServerDefinitions => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "server_definitions")
         }
-        xrpld_cli::Command::LedgerClosed => xrpld_cli::rpc_cmd::run_no_params(url, "ledger_closed"),
-        xrpld_cli::Command::LedgerCurrent => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "ledger_current")
+        quaxar_cli::Command::LedgerClosed => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "ledger_closed")
         }
-        xrpld_cli::Command::LedgerHeader => xrpld_cli::rpc_cmd::run_no_params(url, "ledger_header"),
-        xrpld_cli::Command::FetchInfo => xrpld_cli::rpc_cmd::run_no_params(url, "fetch_info"),
-        xrpld_cli::Command::GetCounts => xrpld_cli::rpc_cmd::run_no_params(url, "get_counts"),
-        xrpld_cli::Command::CanDelete { value } => {
-            xrpld_cli::rpc_cmd::run_can_delete(url, value.as_deref())
+        quaxar_cli::Command::LedgerCurrent => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "ledger_current")
         }
-        xrpld_cli::Command::LogRotate => xrpld_cli::rpc_cmd::run_logrotate(url),
-        xrpld_cli::Command::Random => xrpld_cli::rpc_cmd::run_no_params(url, "random"),
-        xrpld_cli::Command::ValidatorInfo => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "validator_info")
+        quaxar_cli::Command::LedgerHeader => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "ledger_header")
         }
-        xrpld_cli::Command::ValidatorListSites => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "validator_list_sites")
+        quaxar_cli::Command::FetchInfo => quaxar_cli::rpc_cmd::run_no_params(url, "fetch_info"),
+        quaxar_cli::Command::GetCounts => quaxar_cli::rpc_cmd::run_no_params(url, "get_counts"),
+        quaxar_cli::Command::CanDelete { value } => {
+            quaxar_cli::rpc_cmd::run_can_delete(url, value.as_deref())
         }
-        xrpld_cli::Command::UnlList => xrpld_cli::rpc_cmd::run_no_params(url, "unl_list"),
-        xrpld_cli::Command::ConsensusInfo => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "consensus_info")
+        quaxar_cli::Command::LogRotate => quaxar_cli::rpc_cmd::run_logrotate(url),
+        quaxar_cli::Command::Random => quaxar_cli::rpc_cmd::run_no_params(url, "random"),
+        quaxar_cli::Command::ValidatorInfo => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "validator_info")
         }
-        xrpld_cli::Command::TxReduceRelay => {
-            xrpld_cli::rpc_cmd::run_no_params(url, "tx_reduce_relay")
+        quaxar_cli::Command::ValidatorListSites => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "validator_list_sites")
         }
-        xrpld_cli::Command::DbStats => xrpld_cli::db_stats::run(url, parsed.conf.as_deref()),
-        xrpld_cli::Command::LogLevel { level } => xrpld_cli::log_level::run(url, level.as_deref()),
-        xrpld_cli::Command::ConfigCheck => {
-            xrpld_cli::config_check::run(parsed.conf.as_deref());
+        quaxar_cli::Command::UnlList => quaxar_cli::rpc_cmd::run_no_params(url, "unl_list"),
+        quaxar_cli::Command::ConsensusInfo => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "consensus_info")
+        }
+        quaxar_cli::Command::TxReduceRelay => {
+            quaxar_cli::rpc_cmd::run_no_params(url, "tx_reduce_relay")
+        }
+        quaxar_cli::Command::DbStats => quaxar_cli::db_stats::run(url, parsed.conf.as_deref()),
+        quaxar_cli::Command::LogLevel { level } => {
+            quaxar_cli::log_level::run(url, level.as_deref())
+        }
+        quaxar_cli::Command::ConfigCheck => {
+            quaxar_cli::config_check::run(parsed.conf.as_deref());
             true
         }
-        xrpld_cli::Command::Doctor => {
-            xrpld_cli::doctor::run(url, parsed.conf.as_deref());
+        quaxar_cli::Command::Doctor => {
+            quaxar_cli::doctor::run(url, parsed.conf.as_deref());
             true
         }
-        xrpld_cli::Command::Version => {
-            xrpld_cli::version::run();
+        quaxar_cli::Command::Version => {
+            quaxar_cli::version::run();
             true
         }
-        xrpld_cli::Command::Validators => xrpld_cli::validators::run(url),
-        xrpld_cli::Command::Amendments => xrpld_cli::amendments::run(url),
-        xrpld_cli::Command::Fee => xrpld_cli::fee::run(url),
-        xrpld_cli::Command::Ledger { seq } => xrpld_cli::ledger_cmd::run(url, seq),
-        xrpld_cli::Command::Account { address } => xrpld_cli::account::run(url, &address),
-        xrpld_cli::Command::Stop => xrpld_cli::stop::run(url),
-        xrpld_cli::Command::Connect { address } => {
-            let result = xrpld_cli::rpc_call(url, "connect", serde_json::json!({"ip": address}));
+        quaxar_cli::Command::Validators => quaxar_cli::validators::run(url),
+        quaxar_cli::Command::Amendments => quaxar_cli::amendments::run(url),
+        quaxar_cli::Command::Fee => quaxar_cli::fee::run(url),
+        quaxar_cli::Command::Ledger { seq } => quaxar_cli::ledger_cmd::run(url, seq),
+        quaxar_cli::Command::Account { address } => quaxar_cli::account::run(url, &address),
+        quaxar_cli::Command::Stop => quaxar_cli::stop::run(url),
+        quaxar_cli::Command::Connect { address } => {
+            let result = quaxar_cli::rpc_call(url, "connect", serde_json::json!({"ip": address}));
             match result {
                 Ok(_) => {
                     println!(
@@ -1101,29 +548,29 @@ fn try_cli_subcommand() -> Option<ExitCode> {
                 }
             }
         }
-        xrpld_cli::Command::Benchmark => {
-            xrpld_cli::benchmark::run();
+        quaxar_cli::Command::Benchmark => {
+            quaxar_cli::benchmark::run();
             true
         }
-        xrpld_cli::Command::Cli => {
-            xrpld_cli::interactive::run(url);
+        quaxar_cli::Command::Cli => {
+            quaxar_cli::interactive::run(url);
             true
         }
-        xrpld_cli::Command::ValidatorKeys { action } => {
-            use xrpld_cli::ValidatorKeysAction;
+        quaxar_cli::Command::ValidatorKeys { action } => {
+            use quaxar_cli::ValidatorKeysAction;
             match action {
-                ValidatorKeysAction::Generate => xrpld_cli::validator_keys::run_generate(),
+                ValidatorKeysAction::Generate => quaxar_cli::validator_keys::run_generate(),
                 ValidatorKeysAction::CreateToken { secret } => {
-                    xrpld_cli::validator_keys::run_create_token(secret.as_deref())
+                    quaxar_cli::validator_keys::run_create_token(secret.as_deref())
                 }
-                ValidatorKeysAction::Sign { data } => xrpld_cli::validator_keys::run_sign(&data),
-                ValidatorKeysAction::Revoke => xrpld_cli::validator_keys::run_revoke(),
-                ValidatorKeysAction::Show => xrpld_cli::validator_keys::run_show(),
+                ValidatorKeysAction::Sign { data } => quaxar_cli::validator_keys::run_sign(&data),
+                ValidatorKeysAction::Revoke => quaxar_cli::validator_keys::run_revoke(),
+                ValidatorKeysAction::Show => quaxar_cli::validator_keys::run_show(),
             }
             true
         }
-        xrpld_cli::Command::ExportSnapshot { output } => run_export_snapshot(url, &output),
-        xrpld_cli::Command::LoadSnapshot { input } => {
+        quaxar_cli::Command::ExportSnapshot { output } => run_export_snapshot(url, &output),
+        quaxar_cli::Command::LoadSnapshot { input } => {
             run_load_snapshot(&input, parsed.conf.as_deref())
         }
     };
@@ -1244,6 +691,10 @@ fn main() -> ExitCode {
 
     tracing::info!(target: "main", version = env!("CARGO_PKG_VERSION"), "QUAXAR starting");
 
+    // rippled starts its cached uptime clock on first use during normal app
+    // initialization. Prime it before potentially long bootstrap work so RPC
+    // uptime is the node process lifetime, not time since the first RPC call.
+    let _ = UptimeClock::now();
     let start_time = Instant::now();
 
     let args: Vec<String> = std::env::args().collect();
@@ -1304,10 +755,9 @@ struct BoundServerRuntime<D> {
     handler: Arc<app::AppServerHandler>,
     app: app::ApplicationRoot,
     catch_up_state: Arc<CatchUpState>,
-    node_store_usage_path: Option<PathBuf>,
-    peerfinder_bootcache_path: Option<PathBuf>,
 }
 
+#[cfg(test)]
 fn select_target_seq(
     validated: u32,
     has_shared_range: bool,
@@ -1353,6 +803,7 @@ fn select_target_seq(
     next_seq
 }
 
+#[cfg(test)]
 fn select_consensus_acquisition_target(
     validated: u32,
     validated_hash_targets: &[(Uint256, u32)],
@@ -1387,6 +838,7 @@ fn select_consensus_acquisition_target(
     }
 }
 
+#[cfg(test)]
 fn cold_bootstrap_persisted_validated_target(
     validated: u32,
     last_validated_target: Option<(Uint256, u32)>,
@@ -1395,6 +847,7 @@ fn cold_bootstrap_persisted_validated_target(
     None
 }
 
+#[cfg(test)]
 fn hash_for_seq_from_reference_ledger(
     reference_ledger: &ledger::Ledger,
     target_seq: u32,
@@ -1412,10 +865,12 @@ fn hash_for_seq_from_reference_ledger(
         .filter(|hash| !hash.is_zero())
 }
 
+#[cfg(test)]
 fn candidate_ledger_for_seq(target_seq: u32) -> u32 {
     target_seq.saturating_add(255) & !255
 }
 
+#[cfg(test)]
 fn candidate_reference_hash_from_reference_ledger(
     reference_ledger: &ledger::Ledger,
     target_seq: u32,
@@ -1439,6 +894,7 @@ fn candidate_reference_hash_from_reference_ledger(
         .map(|hash| (candidate_seq, hash))
 }
 
+#[cfg(test)]
 fn promote_current_ledger(
     app: &app::ApplicationRoot,
     peers: &[Arc<dyn overlay::Peer>],
@@ -1479,7 +935,13 @@ fn promote_current_ledger(
     }
     let parent_hash = *ledger.header().hash.as_uint256();
     let _ = app.open_ledger().modify(|view| {
-        *view = app::AppOpenLedgerView::with_parent_hash(next_seq, base_fee, parent_hash);
+        *view = app::AppOpenLedgerView::with_parent_timing(
+            next_seq,
+            base_fee,
+            parent_hash,
+            ledger.header().close_time,
+            ledger.header().close_time_resolution,
+        );
         true
     });
 
@@ -1556,16 +1018,15 @@ fn should_retry_publish_after_completed_history(
     acquired_seq > published_seq && acquired_seq <= valid_seq
 }
 
-///
-/// After inserting acquired ledgers into history, walk pub_seq+1 → val_seq
-/// sequentially. For each seq, look up the ledger in history by hash (using
-/// the validated ledger's skip list), then build it using the previous ledger
-/// as parent. This guarantees the parent is always available before the child
-/// is built — exactly how reference processes ledgers.
-///
-/// Pure acquire-and-trust path was here (try_advance_catchup and
-/// try_promote_ledger_with_validations) — deleted: these were remnants of the
-/// legacy catchup loop and are not used by the NetworkOpsStrand runtime.
+// After inserting acquired ledgers into history, walk pub_seq+1 → val_seq
+// sequentially. For each seq, look up the ledger in history by hash (using
+// the validated ledger's skip list), then build it using the previous ledger
+// as parent. This guarantees the parent is always available before the child
+// is built — exactly how reference processes ledgers.
+//
+// Pure acquire-and-trust path was here (try_advance_catchup and
+// try_promote_ledger_with_validations) — deleted: these were remnants of the
+// legacy catchup loop and are not used by the NetworkOpsStrand runtime.
 
 #[cfg(test)]
 fn should_attempt_completed_ledger_promotion(
@@ -1585,6 +1046,7 @@ enum CompletedLedgerAcceptance {
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // exercised by M7 sweep; kept for lifecycle/promotion tests
 impl CompletedLedgerAcceptance {
     fn log_label(self) -> &'static str {
         match self {
@@ -1616,6 +1078,7 @@ fn classify_completed_ledger_acceptance(
     CompletedLedgerAcceptance::HeldForQuorum
 }
 
+#[cfg(test)]
 fn preferred_closed_ledger_hash_from_hashes(
     peer_hashes: impl IntoIterator<Item = Uint256>,
     our_closed_hash: Uint256,
@@ -1640,6 +1103,7 @@ fn preferred_closed_ledger_hash_from_hashes(
         .map(|(hash, _)| hash)
 }
 
+#[cfg(test)]
 fn preferred_closed_ledger_hash(
     trusted_preferred: Option<(u32, Uint256)>,
     min_valid_seq: u32,
@@ -1668,6 +1132,7 @@ fn preferred_closed_ledger_hash(
     preferred
 }
 
+#[cfg(test)]
 fn peer_prefers_different_closed_ledger(
     app: &app::ApplicationRoot,
     peers: &[Arc<dyn overlay::Peer>],
@@ -1697,6 +1162,7 @@ fn peer_prefers_different_closed_ledger(
     preferred != our_closed_hash
 }
 
+#[cfg(test)]
 fn current_ledger_is_fresh(
     now_close_time: u32,
     last_closed_close_time: u32,
@@ -1705,6 +1171,7 @@ fn current_ledger_is_fresh(
     now_close_time < last_closed_close_time.saturating_add(close_time_resolution.saturating_mul(2))
 }
 
+#[cfg(test)]
 fn select_post_acquisition_operating_mode(
     current_mode: app::NetworkOpsOperatingMode,
     need_network_ledger: bool,
@@ -1735,6 +1202,7 @@ fn select_post_acquisition_operating_mode(
     next_mode
 }
 
+#[cfg(test)]
 fn update_operating_mode_after_accepted_ledger(
     app: &app::ApplicationRoot,
     peers: &[Arc<dyn overlay::Peer>],
@@ -1855,6 +1323,7 @@ fn update_operating_mode_after_accepted_ledger(
     }
 }
 
+#[cfg(test)]
 fn node_store_usage_path(config: &BasicConfig) -> Option<PathBuf> {
     let path = config
         .section("node_db")
@@ -1864,6 +1333,7 @@ fn node_store_usage_path(config: &BasicConfig) -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
+#[cfg(test)]
 fn path_size_bytes(path: &Path) -> u64 {
     let mut total = 0_u64;
     let mut stack = vec![path.to_path_buf()];
@@ -1889,244 +1359,17 @@ fn path_size_bytes(path: &Path) -> u64 {
     total
 }
 
-/// Implements the reference `LedgerMaster::checkAccept(hash, seq)` path.
-/// When enough trusted validations arrive for a ledger hash, acquire it
-/// and mark it as validated.
-///
-/// This ports the `checkAccept(hash, seq)` acquisition trigger. Completed
-/// inbound ledgers are then routed through the Rust `checkAccept(ledger)`
-/// gate before promotion, matching reference's `canBeCurrent` and quorum checks.
-///
-/// The RPC acquisition
-/// Sends validated ledger (hash, seq) to the catchup loop via a channel,
-/// matching reference `LedgerMaster::checkAccept` → `InboundLedgers::acquire`
-/// which is non-blocking. Called from inside the validations mutex so it
-/// must not block or re-acquire that lock.
-/// Elevate the current thread to high scheduling priority.
-/// Consensus threads must never be starved by RPC workload — if validators
-/// can't emit validations on time, the network stalls. This mirrors rippled
-/// where the JobQueue consensus thread runs at elevated priority.
-fn set_consensus_thread_priority() {
-    #[cfg(unix)]
-    {
-        // Set highest nice value for non-root (-20 requires root, but we can try)
-        unsafe {
-            // PRIO_PROCESS = 0, current thread = 0
-            libc::setpriority(0, 0, -15);
-        }
-        // On Linux, also try SCHED_RR (real-time round-robin) with low priority
-        #[cfg(target_os = "linux")]
-        unsafe {
-            let param = libc::sched_param { sched_priority: 10 };
-            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_RR, &param);
-        }
-        // On macOS, use QOS_CLASS_USER_INTERACTIVE (highest non-real-time)
-        #[cfg(target_os = "macos")]
-        unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-        }
-        tracing::info!(target: "consensus", "Consensus thread elevated to high priority");
-    }
-}
-
-// Helper types for persistent ledger acquisition
-struct NodeStoreFetcher {
-    node_store: app::SHAMapStoreNodeStore,
-}
-
-impl shamap::family::SHAMapNodeFetcher for NodeStoreFetcher {
-    fn fetch_node_object(
-        &self,
-        hash: basics::sha_map_hash::SHAMapHash,
-        ledger_seq: u32,
-    ) -> Option<shamap::node_object::NodeObject> {
-        let fetched = match &self.node_store {
-            app::SHAMapStoreNodeStore::Single(db) => db.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                nodestore::FetchType::Synchronous,
-                false,
-            ),
-            app::SHAMapStoreNodeStore::Rotating(db) => db.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                nodestore::FetchType::Synchronous,
-                false,
-            ),
-        }?;
-        Some(shamap::node_object::NodeObject::new(
-            match fetched.object_type() {
-                nodestore::NodeObjectType::AccountNode => {
-                    shamap::storage::NodeObjectType::AccountNode
-                }
-                nodestore::NodeObjectType::TransactionNode => {
-                    shamap::storage::NodeObjectType::TransactionNode
-                }
-                nodestore::NodeObjectType::Ledger => shamap::storage::NodeObjectType::Ledger,
-                _ => shamap::storage::NodeObjectType::Unknown,
-            },
-            fetched.data().to_vec(),
-            *fetched.hash(),
-        ))
-    }
-}
-
-struct SharedFetchPack {
-    cache: Arc<ledger::FetchPackCache>,
-}
-impl SharedFetchPack {
-    fn new(cache: Arc<ledger::FetchPackCache>) -> Self {
-        Self { cache }
-    }
-}
-impl ledger::FetchPackContainer for SharedFetchPack {
-    fn get_fetch_pack(&mut self, hash: Uint256) -> Option<Vec<u8>> {
-        self.cache.get_fetch_pack(hash)
-    }
-}
-impl ledger::FetchPackStore for SharedFetchPack {
-    fn add_fetch_pack(&mut self, hash: Uint256, data: Vec<u8>) {
-        self.cache.add_fetch_pack(hash, data);
-    }
-}
-
-/// Messages sent from the main catchup loop to the acquisition processing thread.
-/// Matches reference architecture where gotData queues on the network thread and
-/// runData processes on a job thread.
-enum AcqMsg {
-    /// Raw TmLedgerData packet from a peer (reference gotData)
-    LedgerData {
-        peer_id: u64,
-        packet: ledger::InboundLedgerPacket,
-    },
-    /// Shared fetch-pack cache was populated; re-check local missing nodes now.
-    FetchPackReady,
-    /// Update the peer list for sending requests
-    Peers(Vec<std::sync::Arc<dyn overlay::Peer>>),
-    /// Shutdown
-    Stop,
-}
-
-/// Shared registry of active acquisition channels, keyed by ledger hash.
-/// The overlay direct-channel router thread uses this to route TmLedgerData
-/// immediately to the right acquisition thread, bypassing the slow catchup loop.
-/// This matches reference where gotLedgerData() dispatches directly from the network thread.
-type AcqRegistry = Arc<Mutex<HashMap<Uint256, std::sync::mpsc::Sender<AcqMsg>>>>;
-
-fn route_ledger_data_to_acq(
-    registry: &AcqRegistry,
-    hash: &Uint256,
-    peer_id: u64,
-    packet: ledger::InboundLedgerPacket,
-) -> bool {
-    let guard = registry.lock().expect("acq registry lock");
-    if let Some(tx) = guard.get(hash) {
-        tx.send(AcqMsg::LedgerData { peer_id, packet }).is_ok()
-    } else {
-        false
-    }
-}
-fn serve_get_ledger(
-    runtime: &app::AppLoadedLedgerRuntime,
-    request: &overlay::TmGetLedger,
-    peer: &dyn overlay::Peer,
-    all_peers: &[std::sync::Arc<dyn overlay::Peer>],
-) {
-    let ledger = match runtime.resolve_request_ledger(request) {
-        Ok(Some(ledger)) => ledger,
-        Ok(None) => {
-            if request.query_type.is_some()
-                && request.request_cookie.is_none()
-                && request
-                    .ledger_hash
-                    .as_deref()
-                    .and_then(Uint256::from_slice)
-                    .is_some()
-                && let Some(relay_peer) = all_peers.iter().find(|p| p.id() != peer.id())
-            {
-                let mut fwd = request.clone();
-                fwd.request_cookie = Some(peer.id() as u64);
-                let msg = overlay::ProtocolMessage::new(overlay::ProtocolPayload::GetLedger(fwd));
-                relay_peer.send(overlay::Message::new(msg, None));
-            }
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(target: "overlay", ?error, "GetLedger resolve failed");
-            return;
-        }
-    };
-
-    let nodes = match request.itype {
-        0 => runtime.build_base_reply_nodes(ledger.as_ref()),
-        1 | 2 => {
-            match runtime.build_shamap_reply_nodes(ledger.as_ref(), request, peer.is_high_latency())
-            {
-                Ok(nodes) => nodes,
-                Err(error) => {
-                    tracing::warn!(target: "overlay", seq = ledger.header().seq, hash = %ledger.header().hash, itype = request.itype, ?error, "GetLedger node reply failed");
-                    return;
-                }
-            }
-        }
-        _ => return,
-    };
-
-    if !nodes.is_empty() {
-        let reply = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(
-            overlay::TmLedgerData {
-                ledger_hash: ledger.header().hash.as_uint256().data().to_vec(),
-                ledger_seq: ledger.header().seq,
-                r#type: request.itype,
-                nodes,
-                request_cookie: request.request_cookie.map(|c| c as u32),
-                error: None,
-            },
-        ));
-        peer.send(overlay::Message::new(reply, None));
-    }
-}
-
-fn parse_ledger_data_packet(
-    message: &overlay::message::wire::TmLedgerData,
-) -> Option<(
-    basics::sha_map_hash::SHAMapHash,
-    ledger::InboundLedgerPacket,
-)> {
-    let hash_bytes = &message.ledger_hash;
-    let hash = Uint256::from_slice(hash_bytes)?;
-    let packet_type = match message.r#type {
-        0 => ledger::InboundLedgerDataType::Base,
-        1 => ledger::InboundLedgerDataType::TransactionNode,
-        2 => ledger::InboundLedgerDataType::StateNode,
-        _ => return None,
-    };
-    let nodes = message
-        .nodes
-        .iter()
-        .map(|n| ledger::InboundLedgerNodeData::new(n.nodeid.clone(), n.nodedata.clone()))
-        .collect();
-    Some((
-        basics::sha_map_hash::SHAMapHash::new(hash),
-        ledger::InboundLedgerPacket::new(packet_type, nodes),
-    ))
-}
-
 impl<D> BoundServerRuntime<D> {
     fn new(
         runtime: ServerRuntime<D>,
         handler: Arc<app::AppServerHandler>,
         app: app::ApplicationRoot,
-        node_store_usage_path: Option<PathBuf>,
-        peerfinder_bootcache_path: Option<PathBuf>,
     ) -> Self {
         Self {
             runtime,
             handler,
             app,
             catch_up_state: Arc::new(CatchUpState::default()),
-            node_store_usage_path,
-            peerfinder_bootcache_path,
         }
     }
 
@@ -2178,8 +1421,6 @@ fn build_composed_runtime_from_path(
 ) -> Result<AppBootstrapRuntime, String> {
     options.config_path = path.as_ref().to_path_buf();
     let config = load_basic_config_file(&options.config_path)?;
-    let node_store_usage_path = node_store_usage_path(&config);
-    let peerfinder_bootcache_path = peerfinder_bootcache_path(&config);
     let bootstrap = build_bootstrap_root(&config, &options)?;
     let mut report = bootstrap.report;
     let mut root = bootstrap.root;
@@ -2224,17 +1465,12 @@ fn build_composed_runtime_from_path(
             .map(|s| s.as_str())
             .unwrap_or("none");
         tracing::info!(target: "main", peer_port, rpc_port, ws_port, "Ports configured");
-        bind_server_runtime_into_root(
-            &mut root,
-            &mut report,
-            server_build,
-            node_store_usage_path,
-            peerfinder_bootcache_path,
-        );
+        bind_server_runtime_into_root(&mut root, &mut report, server_build);
     }
 
     Ok(AppBootstrapRuntime {
         runtime: Arc::new(MainRuntime::new(root)),
+        sweep_interval_seconds: report.sweep_interval_seconds,
         report,
     })
 }
@@ -2243,8 +1479,6 @@ fn bind_server_runtime_into_root<D>(
     root: &mut app::ApplicationRoot,
     report: &mut app::AppBootstrapReport,
     server_build: ServerRuntimeBuildReport<D>,
-    node_store_usage_path: Option<PathBuf>,
-    peerfinder_bootcache_path: Option<PathBuf>,
 ) where
     D: server::RpcDispatcher + Clone + Send + Sync + 'static,
 {
@@ -2264,8 +1498,6 @@ fn bind_server_runtime_into_root<D>(
         server_build.runtime,
         handler,
         app_for_runtime,
-        node_store_usage_path,
-        peerfinder_bootcache_path,
     ));
     let _ = root.bind_server(runtime);
     report.has_server_runtime = true;
@@ -2577,7 +1809,7 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
 }
 
 fn load_config_for_snapshot(conf: Option<&str>) -> Result<BasicConfig, String> {
-    let default_path = "/etc/opt/xrpld/xrpld.cfg";
+    let default_path = "/etc/quaxar/quaxar.cfg";
     let config_path = conf.unwrap_or(default_path);
     load_basic_config_file(Path::new(config_path))
 }

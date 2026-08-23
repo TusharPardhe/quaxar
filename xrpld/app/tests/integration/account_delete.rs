@@ -9,11 +9,12 @@
 
 use std::sync::Arc;
 
+use app::state::application_root::apply_submit_transactor_shell;
 use basics::base_uint::{Uint160, Uint256};
-use ledger::{ApplyView, ApplyViewImpl, Ledger, LedgerHeader, ReadView};
+use ledger::{ApplyView, ApplyViewImpl, FlowSandbox, Ledger, LedgerHeader, ReadView};
 use protocol::{
-    AccountID, ApplyFlags, LedgerEntryType, STAmount, STLedgerEntry, STTx, Ter, TxType, XRPAmount,
-    account_keylet, get_field_by_symbol,
+    AccountID, ApplyFlags, LedgerEntryType, STAmount, STLedgerEntry, STTx, StBase, Ter, TxType,
+    XRPAmount, account_keylet, get_field_by_symbol,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -210,10 +211,39 @@ fn account_delete_success() {
 
     let tx = account_delete_tx(alice, bob, 1, 2_000_000);
     let result = full_apply(&mut view, &tx, TxType::ACCOUNT_DELETE);
-    // May succeed or fail with tecTOO_SOON depending on ledger seq vs account seq
-    if result == Ter::TES_SUCCESS {
-        assert!(!acct_exists(&view, alice));
-    }
+    assert_eq!(result, Ter::TES_SUCCESS);
+    assert!(!acct_exists(&view, alice));
+}
+
+#[test]
+fn account_delete_exact_sequence_age_boundary_uses_pre_preamble_account_sequence() {
+    let alice = acct(0x19);
+    let bob = acct(0x29);
+    let mut source = account_root(alice, 10_000_000_000, 0, 0);
+    // Ledger sequence is 300. Both replay-protection expressions are exactly
+    // on rippled's permitted boundary before Transactor charges the fee and
+    // advances sfSequence:
+    //   Sequence(45) + 255 == 300
+    //   FirstNFTokenSequence(44) + Minted(1) + 255 == 300
+    source.set_field_u32(sf("sfSequence"), 45);
+    source.set_field_u32(sf("sfFirstNFTokenSequence"), 44);
+    source.set_field_u32(sf("sfMintedNFTokens"), 1);
+    source.set_field_u32(sf("sfBurnedNFTokens"), 1);
+    let ledger = make_ledger(vec![source, account_root(bob, 10_000_000_000, 0, 0)]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let result = full_apply(
+        &mut view,
+        &account_delete_tx(alice, bob, 45, 2_000_000),
+        TxType::ACCOUNT_DELETE,
+    );
+
+    assert_eq!(
+        result,
+        Ter::TES_SUCCESS,
+        "AccountDelete preclaim must evaluate the old account sequence; doApply must not repeat the check after the generic preamble increments it",
+    );
+    assert!(!acct_exists(&view, alice));
 }
 
 /// C++ AccountDelete_test — destination requires tag.
@@ -234,5 +264,164 @@ fn account_delete_dst_tag_needed() {
         result == Ter::TEC_DST_TAG_NEEDED || result == Ter::TES_SUCCESS,
         "Got {:?}",
         result
+    );
+}
+
+#[test]
+fn account_delete_deleted_node_has_zero_final_balance() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let ledger = make_ledger(vec![
+        // The fee preamble leaves 800,000 drops, matching testnet ledger
+        // 20123954's AccountDelete transaction.
+        account_root(alice, 2_800_000, 0, 0),
+        account_root(bob, 5_999_900, 0, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let rules = view.rules();
+    let tx = account_delete_tx(alice, bob, 1, 2_000_000);
+    let tx_id = tx.get_transaction_id();
+    let mut attempt = FlowSandbox::new(&mut view);
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut attempt, &tx, TxType::ACCOUNT_DELETE),
+        Ter::TES_SUCCESS
+    );
+
+    let meta = attempt
+        .to_tx_meta(
+            tx_id,
+            300,
+            Some(STAmount::from_xrp_amount(XRPAmount::from_drops(800_000))),
+            &rules,
+        )
+        .expect("AccountDelete metadata should build");
+    let deleted_source = meta
+        .get_nodes()
+        .iter()
+        .find(|node| {
+            node.fname() == sf("sfDeletedNode")
+                && node.get_field_h256(sf("sfLedgerIndex")) == account_keylet(acct_id(alice)).key
+        })
+        .expect("source AccountRoot should be a DeletedNode");
+    let final_fields = deleted_source.get_field_object(sf("sfFinalFields"));
+    assert_eq!(
+        final_fields.get_field_amount(sf("sfBalance")).xrp().drops(),
+        0,
+        "rippled transfers and subtracts the complete remaining source balance before erase"
+    );
+}
+
+#[test]
+fn sponsored_account_delete_clears_sponsorship_and_decrements_sponsor_count() {
+    let alice = acct(0x31);
+    let sponsor = acct(0x32);
+    let mut source = account_root(alice, 10_000_000_000, 0, 0);
+    source.set_account_id(sf("sfSponsor"), sponsor);
+    let mut destination = account_root(sponsor, 10_000_000_000, 0, 0);
+    destination.set_field_u32(sf("sfSponsoringAccountCount"), 1);
+    let ledger = make_ledger(vec![source, destination]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let rules = view.rules();
+    let tx = account_delete_tx(alice, sponsor, 1, 2_000_000);
+    let tx_id = tx.get_transaction_id();
+    let mut attempt = FlowSandbox::new(&mut view);
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut attempt, &tx, TxType::ACCOUNT_DELETE),
+        Ter::TES_SUCCESS
+    );
+
+    let updated_sponsor = attempt
+        .read(account_keylet(acct_id(sponsor)))
+        .expect("sponsor read should succeed")
+        .expect("sponsor should remain");
+    assert!(
+        !updated_sponsor.is_field_present(sf("sfSponsoringAccountCount")),
+        "soeDEFAULT sponsoring count must become absent when decremented to zero"
+    );
+
+    let meta = attempt
+        .to_tx_meta(tx_id, 300, None, &rules)
+        .expect("sponsored AccountDelete metadata should build");
+    let deleted_source = meta
+        .get_nodes()
+        .iter()
+        .find(|node| {
+            node.fname() == sf("sfDeletedNode")
+                && node.get_field_h256(sf("sfLedgerIndex")) == account_keylet(acct_id(alice)).key
+        })
+        .expect("source AccountRoot should be a DeletedNode");
+    let final_fields = deleted_source.get_field_object(sf("sfFinalFields"));
+    assert_eq!(
+        final_fields.get_field_amount(sf("sfBalance")).xrp().drops(),
+        0
+    );
+    assert!(
+        !final_fields.is_field_present(sf("sfSponsor")),
+        "DeletedNode FinalFields must not retain sfSponsor"
+    );
+}
+
+#[test]
+fn sponsored_account_delete_requires_destination_sponsor_and_no_sponsored_dependents() {
+    let alice = acct(0x41);
+    let sponsor = acct(0x42);
+    let other = acct(0x43);
+
+    let mut sponsored = account_root(alice, 10_000_000_000, 0, 0);
+    sponsored.set_account_id(sf("sfSponsor"), sponsor);
+    let ledger = make_ledger(vec![
+        sponsored,
+        account_root(sponsor, 10_000_000_000, 0, 0),
+        account_root(other, 10_000_000_000, 0, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    assert_eq!(
+        full_apply(
+            &mut view,
+            &account_delete_tx(alice, other, 1, 2_000_000),
+            TxType::ACCOUNT_DELETE,
+        ),
+        Ter::TEC_NO_SPONSOR_PERMISSION
+    );
+
+    let mut sponsoring = account_root(alice, 10_000_000_000, 0, 0);
+    sponsoring.set_field_u32(sf("sfSponsoringAccountCount"), 1);
+    let ledger = make_ledger(vec![sponsoring, account_root(other, 10_000_000_000, 0, 0)]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    assert_eq!(
+        full_apply(
+            &mut view,
+            &account_delete_tx(alice, other, 1, 2_000_000),
+            TxType::ACCOUNT_DELETE,
+        ),
+        Ter::TEC_HAS_OBLIGATIONS
+    );
+}
+
+#[test]
+fn account_delete_nft_obligation_precedes_sponsor_permission() {
+    let alice = acct(0x51);
+    let sponsor = acct(0x52);
+    let other = acct(0x53);
+    let mut source = account_root(alice, 10_000_000_000, 0, 0);
+    source.set_account_id(sf("sfSponsor"), sponsor);
+    source.set_field_u32(sf("sfMintedNFTokens"), 1);
+    let ledger = make_ledger(vec![
+        source,
+        account_root(sponsor, 10_000_000_000, 0, 0),
+        account_root(other, 10_000_000_000, 0, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    assert_eq!(
+        full_apply(
+            &mut view,
+            &account_delete_tx(alice, other, 1, 2_000_000),
+            TxType::ACCOUNT_DELETE,
+        ),
+        Ter::TEC_HAS_OBLIGATIONS,
+        "rippled checks issued-NFT obligations before sponsor permission"
     );
 }

@@ -9,9 +9,12 @@
 //!   creation, owner-directory link, owner-count, ticket-count, and sequence
 //!   update ordering.
 
+use basics::base_uint::Uint160;
+use ledger::ReadView;
+use protocol::{AccountID, NotTec, STTx, SeqProxy, Ter, TxType, get_field_by_symbol};
+
 use crate::TxConsequences;
 use crate::consequences::{TxConsequencesShape, build_tx_consequences};
-use protocol::{NotTec, SeqProxy, Ter};
 
 pub const TICKET_CREATE_MIN_VALID_COUNT: u32 = 1;
 pub const TICKET_CREATE_MAX_VALID_COUNT: u32 = 250;
@@ -77,6 +80,44 @@ pub fn run_ticket_create_preclaim(facts: TicketCreatePreclaimFacts) -> Ter {
     }
 
     Ter::TES_SUCCESS
+}
+
+fn ticket_create_account_keylet(account: AccountID) -> protocol::Keylet {
+    protocol::account_keylet(Uint160::from_void(account.data()))
+}
+
+/// Runs TicketCreate's immutable, transaction-type-owned `preclaim(...)` tail.
+///
+/// `None` deliberately leaves unowned transaction types for their own family;
+/// no default success or apply path is used here.
+pub fn run_ticket_create_read_view_preclaim<V: ReadView>(
+    view: &V,
+    tx: &STTx,
+    txn_type: TxType,
+) -> Option<Ter> {
+    if txn_type != TxType::TICKET_CREATE {
+        return None;
+    }
+
+    // rippled reads the account before inspecting either ticket-count input.
+    let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
+    let account_root = match view.read(ticket_create_account_keylet(account)) {
+        Ok(Some(account_root)) => account_root,
+        Ok(None) => return Some(Ter::TER_NO_ACCOUNT),
+        Err(_) => return Some(Ter::TEF_BAD_LEDGER),
+    };
+
+    let ticket_count_field = get_field_by_symbol("sfTicketCount");
+    Some(run_ticket_create_preclaim(TicketCreatePreclaimFacts {
+        account_exists: true,
+        current_ticket_count: if account_root.is_field_present(ticket_count_field) {
+            account_root.get_field_u32(ticket_count_field)
+        } else {
+            0
+        },
+        requested_ticket_count: tx.get_field_u32(ticket_count_field),
+        consumes_ticket_sequence: tx.get_seq_proxy().is_ticket(),
+    }))
 }
 
 pub fn run_ticket_create_do_apply<S: TicketCreateDoApplySink>(

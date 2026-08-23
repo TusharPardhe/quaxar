@@ -9,12 +9,12 @@ use basics::base_uint::Uint256;
 use basics::basic_config::BasicConfig;
 use ledger::Ledger;
 use nodestore::{Backend, Batch, NodeObject, Status};
+use quaxar_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 use shamap::traversal::TraversalError;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
-use xrpld_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 
 #[derive(Default)]
 struct RecordingLedgerRuntime {
@@ -197,7 +197,9 @@ impl Backend for NamedBackend {
         (Vec::new(), Status::NotFound)
     }
 
-    fn store(&self, _object: Arc<NodeObject>) {}
+    fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
+        Ok(())
+    }
 
     fn store_batch(&self, _batch: &Batch) {}
 

@@ -385,9 +385,10 @@ macro_rules! ter_catalog {
             "temINVALID_INNER_BATCH",
             "Malformed: Invalid inner batch transaction."
         );
+        $macro!(TEM_BAD_MPT, -249, "temBAD_MPT", "Malformed: Bad MPT.");
         $macro!(
             TEM_BAD_CIPHERTEXT,
-            -249,
+            -248,
             "temBAD_CIPHERTEXT",
             "Malformed: Invalid ciphertext format."
         );
@@ -592,11 +593,12 @@ macro_rules! ter_catalog {
             "terNO_DELEGATE_PERMISSION",
             "Delegated account lacks permission to perform this transaction."
         );
+        $macro!(TER_LOCKED, -84, "terLOCKED", "MPT is locked.");
         $macro!(
-            TER_NO_SPONSORSHIP,
-            -84,
-            "terNO_SPONSORSHIP",
-            "No sponsorship found."
+            TER_NO_PERMISSION,
+            -83,
+            "terNO_PERMISSION",
+            "No permission but retry."
         );
 
         $macro!(
@@ -1239,6 +1241,11 @@ mod tests {
             trans_code("temBAD_TRANSFER_FEE"),
             Some(Ter::TEM_BAD_TRANSFER_FEE)
         );
+        assert_eq!(Ter::TEM_BAD_MPT.to_int(), -249);
+        assert_eq!(trans_token(Ter::TEM_BAD_MPT), "temBAD_MPT");
+        assert_eq!(trans_human(Ter::TEM_BAD_MPT), "Malformed: Bad MPT.");
+        assert_eq!(trans_code("temBAD_MPT"), Some(Ter::TEM_BAD_MPT));
+        assert_eq!(Ter::TEM_BAD_CIPHERTEXT.to_int(), -248);
 
         assert_eq!(trans_token(Ter::TEF_BAD_ADD_AUTH), "tefBAD_ADD_AUTH");
         assert_eq!(

@@ -373,7 +373,7 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
     fn snapshot_status(&self) -> protocol::JsonValue {
         self.app().map_or_else(
             || protocol::json!({ "status": "success", "state": "unavailable" }),
-            |app| <ApplicationRoot as RpcRuntime>::snapshot_status(app),
+            <ApplicationRoot as RpcRuntime>::snapshot_status,
         )
     }
 
@@ -528,13 +528,10 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
             if let Some(JsonValue::Array(currencies)) = obj.get("source_currencies") {
                 let mut filter = Vec::new();
                 for c in currencies {
-                    match c {
-                        JsonValue::Object(cobj) => {
-                            if let Some(JsonValue::String(cur)) = cobj.get("currency") {
-                                filter.push(cur.clone());
-                            }
+                    if let JsonValue::Object(cobj) = c {
+                        if let Some(JsonValue::String(cur)) = cobj.get("currency") {
+                            filter.push(cur.clone());
                         }
-                        _ => {}
                     }
                 }
                 if filter.is_empty() {
@@ -1072,6 +1069,19 @@ fn read_lookup_ledger_entry<V: AppServerInfoView>(
     ledger: &LedgerLookupLedger,
     keylet: Keylet,
 ) -> Option<STLedgerEntry> {
+    // `ledger_index: current` is the mutable OpenLedger state, not its last
+    // closed parent.  The persistent submit sandbox is Quaxar's OpenView;
+    // using the parent here made every current-ledger RPC lag one close and
+    // hid newly created or deleted objects from account_objects, account_info,
+    // and the other sources routed through this helper.
+    if ledger.open
+        && let Some(current) = view
+            .app()
+            .and_then(|app| app.current_open_ledger_entry(keylet))
+    {
+        return current.ok().flatten();
+    }
+
     let resolved = resolve_lookup_ledger(view, ledger)?;
     match resolved.read(keylet) {
         Ok(Some(entry)) => Some(entry),
@@ -1087,6 +1097,14 @@ fn succ_lookup_ledger_key<V: AppServerInfoView>(
     key: Uint256,
     last: Option<Uint256>,
 ) -> Option<Uint256> {
+    if ledger.open
+        && let Some(current) = view
+            .app()
+            .and_then(|app| app.current_open_ledger_successor(key, last))
+    {
+        return current.ok().flatten();
+    }
+
     let resolved = resolve_lookup_ledger(view, ledger)?;
     match resolved.succ(key, last) {
         Ok(Some(entry)) => Some(entry),
@@ -1164,6 +1182,31 @@ fn lookup_sql_tx_record<V: AppServerInfoView>(
         txn_index: txn_seq,
         network_id: Some(view.network_id()),
     }))
+}
+
+/// Return the current validated transaction directly from its `TransactionMd`
+/// SHAMap leaf. SQL is the durable transaction-history index, but ledger
+/// validation becomes RPC-visible before its relational save can be observed
+/// by a concurrent `tx` request. Falling through to TransactionMaster in that
+/// window loses the metadata and therefore `meta.TransactionResult`.
+fn lookup_validated_ledger_tx_record<V: AppServerInfoView>(
+    view: &V,
+    hash: Uint256,
+) -> Option<TxRecord> {
+    let ledger = view.validated_ledger()?;
+    let (txn, meta) = ledger.tx_read(hash).ok().flatten()?;
+    let ledger_index = ledger.header().seq;
+
+    Some(TxRecord {
+        txn,
+        txn_index: Some(meta.get_index()),
+        meta: Some(meta),
+        ledger_index,
+        close_time: Some(NetClockTimePoint::new(ledger.header().close_time)),
+        ledger_hash: Some(*ledger.header().hash.as_uint256()),
+        validated: true,
+        network_id: Some(view.network_id()),
+    })
 }
 
 impl<V: AppServerInfoView> LedgerLookupSource for ApplicationServerInfo<V> {
@@ -1648,17 +1691,36 @@ impl<V: AppServerInfoView> TxSource for ApplicationServerInfo<V> {
             return Ok(TxLookupOutcome::Found(record));
         }
 
-        // TransactionMaster::fetch only returns cache hits directly while
-        // they are unvalidated. Once validated, SQL history is authoritative so
-        // metadata and TxnSeq are present. Keep this fallback for standalone
-        // harnesses or tx-table-disabled runtimes where no SQL row exists.
-        if let Some(record) = cached {
+        // The validated ledger is authoritative during the short interval
+        // between validation visibility and SQL history persistence. Read its
+        // TransactionMd leaf so `tx` retains the result metadata instead of
+        // returning a cache-only record with no `meta.TransactionResult`.
+        if let Some(record) = lookup_validated_ledger_tx_record(&self.view, hash) {
             if let Some((min, max)) = ledger_range
                 && (record.ledger_index < min || record.ledger_index > max)
             {
                 return Ok(TxLookupOutcome::NotFound(TxSearched::Some));
             }
 
+            return Ok(TxLookupOutcome::Found(record));
+        }
+
+        // A TransactionMaster entry can be marked COMMITTED while its ledger
+        // is still only a local consensus candidate. It has neither the
+        // authoritative ledger validation proof nor TxMeta. Rippled therefore
+        // reports it as unvalidated until the ledger lookup or transaction
+        // history supplies both. Do not expose a metadata-less cache entry as
+        // `validated: true`: callers use that flag to consume
+        // `meta.TransactionResult` and would otherwise observe a false final
+        // result during the persistence/validation handoff.
+        if let Some(mut record) = cached {
+            if let Some((min, max)) = ledger_range
+                && (record.ledger_index < min || record.ledger_index > max)
+            {
+                return Ok(TxLookupOutcome::NotFound(TxSearched::Some));
+            }
+
+            record.validated = false;
             return Ok(TxLookupOutcome::Found(record));
         }
 
@@ -2286,6 +2348,23 @@ impl<V: AppServerInfoView> crate::handlers::account_objects_support::AccountObje
         };
         Ok(succ_lookup_ledger_key(&self.view, &lookup, key, last))
     }
+
+    fn read_entry_at(
+        &self,
+        ledger: &LedgerLookupLedger,
+        keylet: Keylet,
+    ) -> Result<Option<STLedgerEntry>, shamap::traversal::TraversalError> {
+        Ok(read_lookup_ledger_entry(&self.view, ledger, keylet))
+    }
+
+    fn succ_key_at(
+        &self,
+        ledger: &LedgerLookupLedger,
+        key: Uint256,
+        last: Option<Uint256>,
+    ) -> Result<Option<Uint256>, shamap::traversal::TraversalError> {
+        Ok(succ_lookup_ledger_key(&self.view, ledger, key, last))
+    }
 }
 
 impl<V: AppServerInfoView> crate::handlers::book_changes::BookChangesSource
@@ -2399,6 +2478,17 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
         let Some(node_store) = app.node_store().as_ref() else {
             return;
         };
+
+        let profile =
+            app::NodeSizeResourceProfile::for_node_size(app.status_rpc_node_size().as_deref());
+        json.insert(
+            "treenode_cache_target_size".to_owned(),
+            JsonValue::Unsigned(profile.tree_cache_size as u64),
+        );
+        json.insert(
+            "treenode_cache_target_age_seconds".to_owned(),
+            JsonValue::Signed(profile.tree_cache_age_seconds),
+        );
 
         json.insert(
             "node_store".to_owned(),
@@ -2798,9 +2888,24 @@ impl<V: AppServerInfoView> crate::state::feature::FeatureSource for ApplicationS
 impl<V: AppServerInfoView> crate::commands::fetch_info::FetchInfoSource
     for ApplicationServerInfo<V>
 {
-    fn clear_ledger_fetch(&self) {}
+    fn clear_ledger_fetch(&self) {
+        if let Some(inbound) = self
+            .view
+            .app()
+            .and_then(|app| app.ledger_master_runtime())
+            .and_then(|runtime| runtime.inbound_ledgers.lock().ok()?.clone())
+        {
+            inbound.clear_failures();
+        }
+    }
+
     fn get_ledger_fetch_info(&self) -> JsonValue {
-        JsonValue::Object(BTreeMap::new())
+        self.view
+            .app()
+            .and_then(|app| app.ledger_master_runtime())
+            .and_then(|runtime| runtime.inbound_ledgers.lock().ok()?.clone())
+            .map(|inbound| inbound.fetch_info_bounded(16))
+            .unwrap_or_else(|| JsonValue::Object(BTreeMap::new()))
     }
 }
 

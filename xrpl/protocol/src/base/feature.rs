@@ -89,7 +89,7 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("fixBatchInnerSigs", false, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("LendingProtocol", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("LendingProtocol", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "LendingProtocolV1_1",
         false,
@@ -131,8 +131,7 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     RegisteredFeature::new("fixAMMv1_3", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("PermissionedDEX", true, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("Batch", true, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("SingleAssetVault", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("SingleAssetVault", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixPayChanCancelAfter",
         true,
@@ -332,7 +331,10 @@ pub fn feature_xrp_fees() -> Uint256 {
 }
 
 pub fn feature_batch() -> Uint256 {
-    feature_id(FEATURE_BATCH_NAME)
+    // The original Batch amendment was superseded before activation. Keep
+    // this compatibility accessor pointed at the current transaction feature
+    // so every shared preflight/preclaim path agrees with TxFormats.
+    feature_id(FEATURE_BATCH_V1_1_NAME)
 }
 
 pub fn feature_batch_v1_1() -> Uint256 {
@@ -507,16 +509,16 @@ impl IntoIterator for FeatureSet {
 #[cfg(test)]
 mod tests {
     use super::{
-        FEATURE_AMM_NAME, FEATURE_BATCH_NAME, FEATURE_CLAWBACK_NAME, FEATURE_LENDING_PROTOCOL_NAME,
-        FEATURE_SINGLE_ASSET_VAULT_NAME, FEATURE_TOKEN_ESCROW_NAME, FEATURE_UNIVERSAL_NUMBER_NAME,
-        FEATURE_XCHAIN_BRIDGE_NAME, FEATURE_XRP_FEES_NAME, FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME,
-        FIX_BATCH_INNER_SIGS_NAME, FIX_INNER_OBJ_TEMPLATE_NAME, FIX_INNER_OBJ_TEMPLATE2_NAME,
-        FIX_MPT_DELIVERED_AMOUNT_NAME, FIX_PREVIOUS_TXN_ID_NAME, FeatureSet, REGISTERED_FEATURES,
-        feature_amm, feature_batch, feature_clawback, feature_id, feature_lending_protocol,
-        feature_name, feature_single_asset_vault, feature_token_escrow, feature_universal_number,
-        feature_xchain_bridge, feature_xrp_fees, fix_ammv1_1, fix_ammv1_3, fix_batch_inner_sigs,
-        fix_inner_obj_template, fix_inner_obj_template2, fix_mpt_delivered_amount,
-        fix_previous_txn_id,
+        FEATURE_AMM_NAME, FEATURE_BATCH_V1_1_NAME, FEATURE_CLAWBACK_NAME,
+        FEATURE_LENDING_PROTOCOL_NAME, FEATURE_SINGLE_ASSET_VAULT_NAME, FEATURE_TOKEN_ESCROW_NAME,
+        FEATURE_UNIVERSAL_NUMBER_NAME, FEATURE_XCHAIN_BRIDGE_NAME, FEATURE_XRP_FEES_NAME,
+        FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME, FIX_BATCH_INNER_SIGS_NAME, FIX_INNER_OBJ_TEMPLATE_NAME,
+        FIX_INNER_OBJ_TEMPLATE2_NAME, FIX_MPT_DELIVERED_AMOUNT_NAME, FIX_PREVIOUS_TXN_ID_NAME,
+        FeatureSet, REGISTERED_FEATURES, feature_amm, feature_batch, feature_clawback, feature_id,
+        feature_lending_protocol, feature_name, feature_single_asset_vault, feature_token_escrow,
+        feature_universal_number, feature_xchain_bridge, feature_xrp_fees, fix_ammv1_1,
+        fix_ammv1_3, fix_batch_inner_sigs, fix_inner_obj_template, fix_inner_obj_template2,
+        fix_mpt_delivered_amount, fix_previous_txn_id,
     };
     use basics::base_uint::Uint256;
 
@@ -532,7 +534,7 @@ mod tests {
 
     #[test]
     fn feature_id_sha512_half_registration_rule() {
-        assert_eq!(feature_id(FEATURE_BATCH_NAME), feature_batch());
+        assert_eq!(feature_id(FEATURE_BATCH_V1_1_NAME), feature_batch());
         assert_eq!(feature_id(FEATURE_CLAWBACK_NAME), feature_clawback());
         assert_eq!(
             feature_id(FIX_BATCH_INNER_SIGS_NAME),
@@ -565,12 +567,12 @@ mod tests {
     }
 
     #[test]
-    fn fix_mpt_delivered_amount_is_registered_as_unsupported() {
+    fn fix_mpt_delivered_amount_is_registered_as_supported() {
         let registered = REGISTERED_FEATURES
             .iter()
             .find(|registered| registered.name == FIX_MPT_DELIVERED_AMOUNT_NAME)
             .expect("fixMPTDeliveredAmount must be registered");
-        assert!(!registered.supported);
+        assert!(registered.supported);
     }
 
     #[test]
@@ -589,7 +591,7 @@ mod tests {
     #[test]
     fn batch_features_match_current_cpp_identifiers() {
         let batch =
-            Uint256::from_hex("894646DD5284E97DECFE6674A6D6152686791C4A95F8C132CCA9BAF9E5812FB6")
+            Uint256::from_hex("9F287AED3CDB50A7BD1ACEC24296A30C9B5230CCD136219317AC790E3B884377")
                 .expect("expected batch hex should parse");
         let amm =
             Uint256::from_hex("8CC0774A3BF66D1D22E76BBDA8E8A232E6B6313834301B3B23E8601196AE6455")
@@ -617,7 +619,7 @@ mod tests {
                 .expect("expected previous txn fix hex should parse");
 
         assert_eq!(feature_batch(), batch);
-        assert_eq!(feature_name(&batch), Some(FEATURE_BATCH_NAME));
+        assert_eq!(feature_name(&batch), Some(FEATURE_BATCH_V1_1_NAME));
         assert_eq!(feature_amm(), amm);
         assert_eq!(feature_name(&amm), Some(FEATURE_AMM_NAME));
         assert_eq!(feature_xchain_bridge(), xchain_bridge);

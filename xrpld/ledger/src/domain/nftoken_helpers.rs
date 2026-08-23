@@ -541,8 +541,23 @@ pub fn token_offer_create_apply(
     expiration: Option<u32>,
     seq: u32,
     nftoken_id: &Uint256,
+    pre_fee_balance_drops: Option<i64>,
     tx_flags: u32,
 ) -> Result<Ter, ViewError> {
+    // Match rippled's tokenOfferCreateApply: assess the next owner-reserve
+    // requirement against the account balance before the transaction fee is
+    // charged and before either directory can be mutated.
+    let account = view.read(account_keylet(to_uint160(*acct_id)))?;
+    let Some(account) = account else {
+        return Ok(Ter::TEF_BAD_LEDGER);
+    };
+    let prior_balance = pre_fee_balance_drops
+        .unwrap_or_else(|| account.get_field_amount(sf("sfBalance")).xrp().drops());
+    let owner_count = account.get_field_u32(sf("sfOwnerCount")) as usize;
+    if prior_balance < view.fees().account_reserve(owner_count + 1) as i64 {
+        return Ok(Ter::TEC_INSUFFICIENT_RESERVE);
+    }
+
     let offer_id = nft_offer_keylet_for_owner(to_uint160(*acct_id), seq);
 
     // Add to owner directory
@@ -550,7 +565,7 @@ pub fn token_offer_create_apply(
         view,
         &owner_dir_keylet(to_uint160(*acct_id)),
         offer_id.key,
-        &|_| {},
+        &crate::describe_owner_dir(*acct_id),
     )?;
     let Some(owner_node_val) = owner_node else {
         return Ok(Ter::TEC_DIR_FULL);

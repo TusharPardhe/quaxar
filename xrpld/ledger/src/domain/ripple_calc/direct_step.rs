@@ -51,9 +51,9 @@ pub fn max_payment_flow<V: ApplyView>(
     //   if srcOwed > 0: return (srcOwed, Redeems)
     //   else: return (creditLimit2(sb, dst_, src_, currency_) + srcOwed, Issues)
     //
-    // credit_balance(view, src, dst, currency) returns how much src holds
+    // account_holds(view, src, dst, currency) returns how much src holds
     // (from src's perspective). Positive = dst owes src (src can redeem).
-    let balance = ripple_state_helpers::credit_balance(view, src, dst, currency);
+    let balance = ripple_state_helpers::account_holds(view, src, dst, currency);
 
     if balance.signum() > 0 {
         // Source is redeeming (has positive balance = dst owes src)

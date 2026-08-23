@@ -6,9 +6,11 @@ use crate::{
     TransactorPreflight1Facts, TransactorPreflight2Facts, TxConsequences, Validity,
     run_transactor_preflight0, run_transactor_preflight1, run_transactor_preflight2,
 };
+use basics::base_uint::Uint160;
+use ledger::{ReadView, ViewError};
 use protocol::{
-    AccountID, INNER_BATCH_TRANSACTION_FLAG, NotTec, STAmount, SeqProxy, Ter, feature_batch,
-    is_tes_success,
+    AccountID, INNER_BATCH_TRANSACTION_FLAG, NotTec, STAmount, STTx, SeqProxy, Ter, account_keylet,
+    feature_batch, get_field_by_symbol, is_tes_success, lsfRequireDestTag, tfInnerBatchTxn,
 };
 
 pub const MAX_PATH_SIZE: usize = 6;
@@ -434,6 +436,75 @@ pub fn run_payment_preclaim_with_facts(facts: PaymentPreclaimFacts) -> Ter {
     }
 
     Ter::TES_SUCCESS
+}
+
+/// Build `PaymentPreclaimFacts` from immutable ledger state and run the
+/// existing Payment preclaim decision table. This adapter owns no mutation;
+/// callers retain transaction-shape/preflight validation.
+pub fn run_payment_preclaim_with_read_view(
+    view: &impl ReadView,
+    tx: &STTx,
+) -> Result<Ter, ViewError> {
+    let account_field = get_field_by_symbol("sfAccount");
+    let destination_field = get_field_by_symbol("sfDestination");
+    let amount_field = get_field_by_symbol("sfAmount");
+    let paths_field = get_field_by_symbol("sfPaths");
+    let send_max_field = get_field_by_symbol("sfSendMax");
+    let destination_tag_field = get_field_by_symbol("sfDestinationTag");
+    let domain_id_field = get_field_by_symbol("sfDomainID");
+    let account = tx.get_account_id(account_field);
+    let destination = tx.get_account_id(destination_field);
+    let amount = tx.get_field_amount(amount_field);
+    let destination_sle = view.read(account_keylet(Uint160::from_void(destination.data())))?;
+    let paths = tx
+        .is_field_present(paths_field)
+        .then(|| tx.get_field_path_set(paths_field));
+    let domain_id = tx
+        .is_field_present(domain_id_field)
+        .then(|| tx.get_field_h256(domain_id_field));
+
+    let credentials_valid_result = ledger::credential_helpers::valid(view, tx, &account)?;
+    let (source_in_domain, destination_in_domain) = match domain_id {
+        Some(domain_id) => (
+            is_tes_success(ledger::credential_helpers::valid_domain(
+                view, domain_id, &account,
+            )?),
+            is_tes_success(ledger::credential_helpers::valid_domain(
+                view,
+                domain_id,
+                &destination,
+            )?),
+        ),
+        None => (true, true),
+    };
+
+    let destination_can_create_with_amount = amount.native()
+        && amount.xrp().drops() >= i64::try_from(view.fees().reserve).unwrap_or(i64::MAX);
+    let destination_requires_tag = destination_sle
+        .as_ref()
+        .is_some_and(|sle| sle.is_flag(lsfRequireDestTag));
+
+    Ok(run_payment_preclaim_with_facts(PaymentPreclaimFacts {
+        tx_flags: tx.get_flags(),
+        has_paths: paths.is_some(),
+        send_max_present: tx.is_field_present(send_max_field),
+        dst_amount_native: amount.native(),
+        destination_exists: destination_sle.is_some(),
+        view_open: view.open(),
+        destination_requires_tag,
+        destination_tag_present: tx.is_field_present(destination_tag_field),
+        destination_can_create_with_amount,
+        path_count: paths.as_ref().map_or(0, protocol::STPathSet::size),
+        path_has_too_long_segment: paths
+            .as_ref()
+            .is_some_and(|paths| paths.iter().any(|path| path.size() > MAX_PATH_LENGTH)),
+        credentials_valid_result,
+        domain_id_present: domain_id.is_some(),
+        source_in_domain,
+        destination_in_domain,
+        is_batch_inner: tx.is_flag(tfInnerBatchTxn),
+        batch_v1_1_enabled: view.rules().enabled(&protocol::feature_id("BatchV1_1")),
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

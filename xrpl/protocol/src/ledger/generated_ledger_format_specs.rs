@@ -295,7 +295,7 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             },
             LedgerFormatFieldSpec {
                 field_symbol: "sfOwnerCount",
-                style: SOEStyle::Default,
+                style: SOEStyle::Required,
             },
             LedgerFormatFieldSpec {
                 field_symbol: "sfPreviousTxnID",
@@ -360,6 +360,18 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             LedgerFormatFieldSpec {
                 field_symbol: "sfFirstNFTokenSequence",
                 style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfSponsoredOwnerCount",
+                style: SOEStyle::Default,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfSponsoringOwnerCount",
+                style: SOEStyle::Default,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfSponsoringAccountCount",
+                style: SOEStyle::Default,
             },
             LedgerFormatFieldSpec {
                 field_symbol: "sfAMMID",
@@ -719,6 +731,14 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             },
             LedgerFormatFieldSpec {
                 field_symbol: "sfHighQualityOut",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfHighSponsor",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfLowSponsor",
                 style: SOEStyle::Optional,
             },
         ],

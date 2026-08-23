@@ -38,6 +38,8 @@ pub struct AccountDeletePreclaimNftAndSequenceFacts {
     pub minted_nftokens: u32,
     pub burned_nftokens: u32,
     pub owned_nft_page_present: bool,
+    pub sponsor_mismatch: bool,
+    pub sponsoring_dependents: bool,
     pub account_sequence: u32,
     pub ledger_sequence: u32,
     pub first_nftoken_sequence: Option<u32>,
@@ -155,6 +157,14 @@ pub fn run_account_delete_preclaim_nft_and_sequence(
     }
 
     if facts.owned_nft_page_present {
+        return AccountDeletePreclaimScanState::Return(Ter::TEC_HAS_OBLIGATIONS);
+    }
+
+    if facts.sponsor_mismatch {
+        return AccountDeletePreclaimScanState::Return(Ter::TEC_NO_SPONSOR_PERMISSION);
+    }
+
+    if facts.sponsoring_dependents {
         return AccountDeletePreclaimScanState::Return(Ter::TEC_HAS_OBLIGATIONS);
     }
 

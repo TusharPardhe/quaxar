@@ -16,9 +16,8 @@ use basics::tagged_cache::MonotonicClock;
 use ledger::{
     AccountStateSF, FetchPackCache, FetchPackContainer, InboundLedgerDataType, InboundLedgerLocal,
     InboundLedgerNodeData, InboundLedgerObjectType, InboundLedgerPacket, InboundLedgerPlannerState,
-    InboundLedgerReason, InboundLedgerStore, LedgerConfig, LedgerPersistence,
-    LedgerSyncFilterStore, LedgerTxReadError, TransactionStateSF,
-    make_inbound_needed_by_hash_request,
+    InboundLedgerReason, InboundLedgerStore, LedgerConfig, LedgerSyncFilterStore,
+    LedgerTxReadError, TransactionStateSF, make_inbound_needed_by_hash_request,
 };
 use nodestore::{FetchType, NodeObjectType as NodeStoreObjectType};
 use overlay::{
@@ -379,13 +378,16 @@ impl RpcInboundLedgerStore {
         hash: Uint256,
         ledger_seq: u32,
     ) {
-        match &self.node_store {
+        let result = match &self.node_store {
             app::SHAMapStoreNodeStore::Single(database) => {
                 database.store(object_type, data, hash, ledger_seq)
             }
             app::SHAMapStoreNodeStore::Rotating(database) => {
                 database.store(object_type, data, hash, ledger_seq)
             }
+        };
+        if let Err(error) = result {
+            tracing::error!(target: "nodestore", %error, "Failed to persist RPC inbound-ledger node");
         }
     }
 }
@@ -2602,41 +2604,16 @@ impl RpcRuntime for ApplicationRoot {
             );
         };
 
-        let persistence = LedgerPersistence::new(Arc::new(self.build_ledger_persistence_runtime()));
-        let is_current = self
-            .validated_ledger_seq()
-            .is_none_or(|validated| acquired_ledger.header().seq >= validated);
-
-        if ledger_master_runtime
+        // Match rippled doLedgerRequest -> getOrAcquireLedger: acquiring a
+        // ledger for an RPC response must not change the node's closed,
+        // validated, or published ledger. Cache it by exact hash only; LCL
+        // installation remains exclusively in the consensus/endConsensus and
+        // checkAccept flows.
+        ledger_master_runtime
             .ledger_master()
-            .set_full_ledger(
-                &persistence,
-                Arc::clone(&acquired_ledger),
-                true,
-                is_current,
-                None,
-                None,
-            )
-            .is_err()
-        {
-            return Status::new(RpcErrorCode::Internal);
-        }
-
-        if is_current {
-            self.on_closed_ledger(Arc::clone(&acquired_ledger));
-            self.on_published_ledger(Arc::clone(&acquired_ledger));
-            let _ = self.on_validated_ledger(Arc::clone(&acquired_ledger));
-            self.set_status_rpc_current_ledger_index(Some(
-                acquired_ledger.header().seq.saturating_add(1),
-            ));
-            self.set_need_network_ledger(false);
-            if matches!(
-                self.network_ops_operating_mode(),
-                NetworkOpsOperatingMode::Disconnected | NetworkOpsOperatingMode::Connected
-            ) {
-                let _ = self.set_network_ops_operating_mode(NetworkOpsOperatingMode::Tracking);
-            }
-        }
+            .ledger_history()
+            .insert(Arc::clone(&acquired_ledger), false);
+        self.validations().register_ledger(acquired_ledger.as_ref());
 
         Status::OK
     }
@@ -2661,41 +2638,16 @@ impl RpcRuntime for ApplicationRoot {
             );
         };
 
-        let persistence = LedgerPersistence::new(Arc::new(self.build_ledger_persistence_runtime()));
-        let is_current = self
-            .validated_ledger_seq()
-            .is_none_or(|validated| acquired_ledger.header().seq >= validated);
-
-        if ledger_master_runtime
+        // Match rippled doLedgerRequest -> getOrAcquireLedger: acquiring a
+        // ledger for an RPC response must not change the node's closed,
+        // validated, or published ledger. Cache it by exact hash only; LCL
+        // installation remains exclusively in the consensus/endConsensus and
+        // checkAccept flows.
+        ledger_master_runtime
             .ledger_master()
-            .set_full_ledger(
-                &persistence,
-                Arc::clone(&acquired_ledger),
-                true,
-                is_current,
-                None,
-                None,
-            )
-            .is_err()
-        {
-            return Status::new(RpcErrorCode::Internal);
-        }
-
-        if is_current {
-            self.on_closed_ledger(Arc::clone(&acquired_ledger));
-            self.on_published_ledger(Arc::clone(&acquired_ledger));
-            let _ = self.on_validated_ledger(Arc::clone(&acquired_ledger));
-            self.set_status_rpc_current_ledger_index(Some(
-                acquired_ledger.header().seq.saturating_add(1),
-            ));
-            self.set_need_network_ledger(false);
-            if matches!(
-                self.network_ops_operating_mode(),
-                NetworkOpsOperatingMode::Disconnected | NetworkOpsOperatingMode::Connected
-            ) {
-                let _ = self.set_network_ops_operating_mode(NetworkOpsOperatingMode::Tracking);
-            }
-        }
+            .ledger_history()
+            .insert(Arc::clone(&acquired_ledger), false);
+        self.validations().register_ledger(acquired_ledger.as_ref());
 
         Status::OK
     }
@@ -2766,7 +2718,9 @@ impl RpcRuntime for ApplicationRoot {
     }
 
     fn export_snapshot(&self, output_path: &str) -> Result<JsonValue, String> {
-        use nodestore::snapshot::{SnapshotManifest, export_snapshot, manifest::SNAPSHOT_VERSION};
+        use nodestore::snapshot::{
+            SnapshotManifest, export_snapshot_with_cancellation, manifest::SNAPSHOT_VERSION,
+        };
         use std::path::Path;
 
         let validated = self
@@ -2801,51 +2755,53 @@ impl RpcRuntime for ApplicationRoot {
         let ledger_hash = header.hash.to_string();
         let account_hash = header.account_hash.to_string();
         let output_owned = output_path.to_owned();
-        let export_state = self.begin_snapshot_export(output_owned.clone(), ledger_seq)?;
-        let export_state_for_thread = std::sync::Arc::clone(&export_state);
-
-        // Spawn export on a background thread to avoid blocking the RPC handler
-        // and to prevent memory pressure on the main thread pool.
-        std::thread::Builder::new()
-            .name(format!("snapshot-export-{}", ledger_seq))
-            .spawn(move || {
-                let path = Path::new(&output_owned);
-                tracing::info!(
-                    target: "snapshot",
-                    ledger_seq,
-                    path = %path.display(),
-                    "Background snapshot export started"
-                );
-                match export_snapshot(backend.as_ref(), &manifest, path) {
-                    Ok(()) => {
-                        let file_size = std::fs::metadata(path)
-                            .map(|metadata| metadata.len())
-                            .unwrap_or(0);
-                        export_state_for_thread.complete(file_size);
+        self.start_snapshot_export(
+            output_owned.clone(),
+            ledger_seq,
+            move |export_state, cancellation| {
+                std::thread::Builder::new()
+                    .name(format!("snapshot-export-{ledger_seq}"))
+                    .spawn(move || {
+                        let path = Path::new(&output_owned);
                         tracing::info!(
                             target: "snapshot",
                             ledger_seq,
                             path = %path.display(),
-                            file_size,
-                            "Snapshot export completed successfully"
+                            "Background snapshot export started"
                         );
-                    }
-                    Err(e) => {
-                        export_state_for_thread.fail(e.to_string());
-                        tracing::error!(
-                            target: "snapshot",
-                            error = %e,
-                            ledger_seq,
-                            "Snapshot export failed"
-                        );
-                    }
-                }
-            })
-            .map_err(|e| {
-                let message = format!("Failed to spawn export thread: {e}");
-                export_state.fail(message.clone());
-                message
-            })?;
+                        match export_snapshot_with_cancellation(
+                            backend.as_ref(),
+                            &manifest,
+                            path,
+                            &cancellation,
+                        ) {
+                            Ok(()) => {
+                                let file_size = std::fs::metadata(path)
+                                    .map(|metadata| metadata.len())
+                                    .unwrap_or(0);
+                                export_state.complete(file_size);
+                                tracing::info!(
+                                    target: "snapshot",
+                                    ledger_seq,
+                                    path = %path.display(),
+                                    file_size,
+                                    "Snapshot export completed successfully"
+                                );
+                            }
+                            Err(e) => {
+                                export_state.fail(e.to_string());
+                                tracing::error!(
+                                    target: "snapshot",
+                                    error = %e,
+                                    ledger_seq,
+                                    "Snapshot export failed"
+                                );
+                            }
+                        }
+                    })
+                    .map_err(|error| format!("Failed to spawn export thread: {error}"))
+            },
+        )?;
 
         Ok(protocol::json!({
             "status": "started",

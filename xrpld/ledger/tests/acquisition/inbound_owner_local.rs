@@ -7,8 +7,8 @@ use ledger::{
     FetchPackContainer, InboundLedgerCompletionDisposition, InboundLedgerJournal,
     InboundLedgerLocal, InboundLedgerObjectType, InboundLedgerReason, InboundLedgerRequestTrigger,
     InboundLedgerStore, LedgerConfig, LedgerHeader, calculate_ledger_hash,
-    make_inbound_get_ledger_request, make_inbound_needed_by_hash_request,
-    serialize_prefixed_ledger_header,
+    make_get_ledger_with_node_ids, make_inbound_get_ledger_request,
+    make_inbound_needed_by_hash_request, serialize_prefixed_ledger_header,
 };
 use overlay::ProtocolPayload;
 use protocol::JsonValue;
@@ -364,6 +364,20 @@ fn inbound_owner_by_hash_request_uses_first_needed_type_only() {
 }
 
 #[test]
+fn shared_base_request_omits_query_depth_for_rippled_peer_compatibility() {
+    let request = make_get_ledger_with_node_ids(sample_hash(0x80), 900, 0, &[], 0, None);
+
+    match request.payload {
+        ProtocolPayload::GetLedger(message) => {
+            assert_eq!(message.itype, 0);
+            assert_eq!(message.ledger_seq, Some(900));
+            assert_eq!(message.query_depth, None);
+        }
+        payload => panic!("expected get_ledger payload, got {payload:?}"),
+    }
+}
+
+#[test]
 fn inbound_owner_header_request_keeps_base_query_depth_unset() {
     let request = make_inbound_get_ledger_request(
         sample_hash(0x82),
@@ -407,6 +421,45 @@ fn inbound_owner_live_header_request_asks_by_sequence() {
             assert_eq!(message.query_depth, None);
         }
         payload => panic!("expected get_ledger payload, got {payload:?}"),
+    }
+}
+
+#[test]
+fn inbound_owner_state_root_request_precedes_transaction_work() {
+    let account_hash = sample_hash(0x84);
+    let tx_hash = sample_hash(0x85);
+    let header = sample_header(903, account_hash, tx_hash);
+    let wanted_hash = calculate_ledger_hash(&header);
+    let mut store = RecordingInboundStore::default();
+    store.headers.borrow_mut().insert(
+        *wanted_hash.as_uint256(),
+        serialize_prefixed_ledger_header(&header, false),
+    );
+    let mut fetch_pack = RecordingFetchPack::default();
+    let family = family("inbound-owner-state-first");
+    let journal = RecordingJournal;
+    let mut inbound = InboundLedgerLocal::new(wanted_hash, 0);
+
+    let setup = inbound.prepare_trigger(
+        InboundLedgerRequestTrigger::Reply,
+        &journal,
+        &LedgerConfig::default(),
+        &mut store,
+        &mut fetch_pack,
+        &family,
+    );
+
+    assert!(setup.state_request_pending);
+    assert!(!setup.state_plan);
+    assert!(!setup.tx_plan);
+    assert_eq!(setup.messages_to_send.len(), 1);
+    match &setup.messages_to_send[0].payload {
+        ProtocolPayload::GetLedger(message) => {
+            assert_eq!(message.itype, 2, "state root must be requested first");
+            assert_eq!(message.query_depth, Some(1));
+            assert_eq!(message.ledger_seq, Some(903));
+        }
+        payload => panic!("expected state-node GetLedger request, got {payload:?}"),
     }
 }
 

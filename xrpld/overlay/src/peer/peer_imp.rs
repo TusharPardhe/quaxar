@@ -1,22 +1,37 @@
 //! First concrete peer owner aligned with the current `PeerImp` role.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use basics::base_uint::Uint256;
 use protocol::{JsonValue, PublicKey};
-use resource::Charge;
+use resource::{Charge, Consumer, Disposition};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::message::{Message, ProtocolMessage, ProtocolPayload, TmHaveTransactions};
 use crate::peer::{Peer, PeerId, ProtocolFeature};
 use crate::protocol_version::ProtocolVersion;
 use crate::slot::{MAX_TX_QUEUE_SIZE, SystemClock};
 use crate::squelch::Squelch;
-use crate::tuning::{CONVERGED_LEDGER_LIMIT, DIVERGED_LEDGER_LIMIT};
+use crate::tuning::{
+    CONVERGED_LEDGER_LIMIT, DIVERGED_LEDGER_LIMIT, MAX_DIVERGED_TIME, MAX_UNKNOWN_TIME,
+    PEER_TIMER_INTERVAL, SENDQ_INTERVALS, TARGET_SEND_QUEUE,
+};
+
+const RECENT_PEER_KNOWLEDGE_CAPACITY: usize = 128;
+/// Matches rippled's `Tuning::kDropSendQueue` item admission boundary.
+pub(crate) const SEND_QUEUE_CAPACITY: usize = 192;
+/// Byte accounting is bounded by a Rust transport adaptation, not a rippled
+/// byte-parity claim: the source-backed item budget above multiplied by the
+/// decoder-owned maximum wire frame (payload/decompressed limit plus the
+/// 10-byte header retained by `SESSION_RAW_BUFFER_CAPACITY`).
+const MAXIMUM_OUTBOUND_WIRE_FRAME_SIZE: usize = crate::MAXIMUM_MESSAGE_SIZE + 10;
+pub(crate) const SEND_QUEUE_BYTE_CAPACITY: usize =
+    SEND_QUEUE_CAPACITY * MAXIMUM_OUTBOUND_WIRE_FRAME_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tracking {
@@ -43,7 +58,37 @@ impl Tracking {
     }
 }
 
-#[derive(Debug)]
+#[derive(Default)]
+struct PeerLedgerStatus {
+    recent_ledgers: VecDeque<Uint256>,
+    closed_ledger_hash: Uint256,
+    previous_ledger_hash: Uint256,
+    min_ledger: u32,
+    max_ledger: u32,
+}
+
+impl PeerLedgerStatus {
+    fn remember(&mut self, hash: Uint256) {
+        // Match rippled PeerImp::addLedger: every valid uint256, including
+        // zero, participates in duplicate detection and the bounded ring.
+        if self.recent_ledgers.iter().any(|known| *known == hash) {
+            return;
+        }
+        if self.recent_ledgers.len() == RECENT_PEER_KNOWLEDGE_CAPACITY {
+            self.recent_ledgers.pop_front();
+        }
+        self.recent_ledgers.push_back(hash);
+    }
+
+    fn normalized_range(min: u32, max: u32) -> (u32, u32) {
+        if min == 0 || max == 0 || max < min {
+            (0, 0)
+        } else {
+            (min, max)
+        }
+    }
+}
+
 pub struct PeerImp {
     id: PeerId,
     remote_address: SocketAddr,
@@ -67,21 +112,34 @@ pub struct PeerImp {
     publisher_list_sequences: Mutex<HashMap<PublicKey, usize>>,
     outbound_state: Mutex<PeerOutboundState>,
     tx_queue: Mutex<HashSet<Uint256>>,
-    known_ledgers: Mutex<HashSet<(Uint256, u32)>>,
-    known_tx_sets: Mutex<HashSet<Uint256>>,
+    ledger_status: Mutex<PeerLedgerStatus>,
+    known_tx_sets: Mutex<VecDeque<Uint256>>,
     features: RwLock<HashSet<ProtocolFeature>>,
     protocol_version: RwLock<ProtocolVersion>,
     last_status: Mutex<Option<i32>>,
-    closed_ledger_hash: Mutex<Uint256>,
-    previous_ledger_hash: Mutex<Uint256>,
-    min_ledger: Mutex<u32>,
-    max_ledger: Mutex<u32>,
     tracking: AtomicU8,
+    /// When the peer entered its current tracking state. `onTimer` uses this
+    /// for the outbound Not Useful deadlines.
+    tracking_since: Mutex<Instant>,
+    /// One active timer is owned by an activated peer and cancelled during
+    /// overlay deactivation.
+    lifecycle_timer: Mutex<Option<JoinHandle<()>>>,
+    /// Consecutive timer intervals with a large send queue.
+    large_sendq: AtomicUsize,
+    outstanding_ping: Mutex<Option<OutstandingPing>>,
+    resource: Mutex<PeerResourceState>,
+    resource_drop_requested: AtomicBool,
     endpoint_accept_after: Mutex<Option<Instant>>,
     recent_endpoints: Mutex<HashMap<SocketAddr, RecentEndpoint>>,
     listener_check: Mutex<ListenerCheckState>,
     charges: Mutex<Vec<(Charge, String)>>,
     squelch: Mutex<Squelch>,
+    /// Set when a non-droppable message cannot enter the bounded send queue.
+    /// The session stop signal then tears down the non-reading peer.
+    disconnect_requested: AtomicBool,
+    /// Installed by OverlayImpl for outbound peers. Mirrors
+    /// PeerImp::onTimer calling peerFinder().onFailure(slot_) before close.
+    outbound_failure_notifier: Mutex<Option<Arc<dyn Fn(SocketAddr, bool) + Send + Sync>>>,
     created_at: Instant,
 }
 
@@ -89,6 +147,30 @@ pub struct PeerImp {
 struct RecentEndpoint {
     hops: u32,
     last_seen: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutstandingPing {
+    sequence: u32,
+    sent_at: Instant,
+}
+
+#[derive(Default)]
+struct PeerResourceState {
+    consumer: Option<Consumer>,
+    disconnect_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl std::fmt::Debug for PeerImp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PeerImp")
+            .field("id", &self.id)
+            .field("remote_address", &self.remote_address)
+            .field("inbound", &self.inbound)
+            .field("tracking", &self.tracking())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,7 +183,13 @@ struct ListenerCheckState {
 #[derive(Default)]
 struct PeerOutboundState {
     queued_messages: Vec<Message>,
-    session_tx: Option<mpsc::UnboundedSender<Message>>,
+    queued_bytes: usize,
+    session_tx: Option<mpsc::Sender<Message>>,
+    /// Shared with the session writer, which decrements it only after each
+    /// async socket write completes. This restores the active-session depth
+    /// used by PeerImp's lifecycle admission timer.
+    session_queue_depth: Option<Arc<AtomicUsize>>,
+    session_queue_bytes: Option<Arc<AtomicUsize>>,
     session_stop: Option<watch::Sender<bool>>,
 }
 
@@ -110,7 +198,22 @@ impl std::fmt::Debug for PeerOutboundState {
         formatter
             .debug_struct("PeerOutboundState")
             .field("queued_messages", &self.queued_messages.len())
+            .field("queued_bytes", &self.queued_bytes)
             .field("session_attached", &self.session_tx.is_some())
+            .field(
+                "session_queue_depth",
+                &self
+                    .session_queue_depth
+                    .as_ref()
+                    .map(|depth| depth.load(Ordering::Relaxed)),
+            )
+            .field(
+                "session_queue_bytes",
+                &self
+                    .session_queue_bytes
+                    .as_ref()
+                    .map(|bytes| bytes.load(Ordering::Relaxed)),
+            )
             .finish()
     }
 }
@@ -150,16 +253,18 @@ impl PeerImp {
             publisher_list_sequences: Mutex::new(HashMap::new()),
             outbound_state: Mutex::new(PeerOutboundState::default()),
             tx_queue: Mutex::new(HashSet::new()),
-            known_ledgers: Mutex::new(HashSet::new()),
-            known_tx_sets: Mutex::new(HashSet::new()),
+            ledger_status: Mutex::new(PeerLedgerStatus::default()),
+            known_tx_sets: Mutex::new(VecDeque::with_capacity(RECENT_PEER_KNOWLEDGE_CAPACITY)),
             features: RwLock::new(HashSet::new()),
             protocol_version: RwLock::new(ProtocolVersion::new(2, 2)),
             last_status: Mutex::new(None),
-            closed_ledger_hash: Mutex::new(Uint256::default()),
-            previous_ledger_hash: Mutex::new(Uint256::default()),
-            min_ledger: Mutex::new(0),
-            max_ledger: Mutex::new(0),
             tracking: AtomicU8::new(Tracking::Unknown.as_u8()),
+            tracking_since: Mutex::new(Instant::now()),
+            lifecycle_timer: Mutex::new(None),
+            large_sendq: AtomicUsize::new(0),
+            outstanding_ping: Mutex::new(None),
+            resource: Mutex::new(PeerResourceState::default()),
+            resource_drop_requested: AtomicBool::new(false),
             endpoint_accept_after: Mutex::new(None),
             recent_endpoints: Mutex::new(HashMap::new()),
             listener_check: Mutex::new(ListenerCheckState {
@@ -169,12 +274,191 @@ impl PeerImp {
             }),
             charges: Mutex::new(Vec::new()),
             squelch: Mutex::new(Squelch::new(Arc::new(SystemClock))),
+            disconnect_requested: AtomicBool::new(false),
+            outbound_failure_notifier: Mutex::new(None),
             created_at: Instant::now(),
         })
     }
 
     pub fn inbound(&self) -> bool {
         self.inbound
+    }
+
+    /// Attach the Resource::Consumer selected by OverlayImpl for this peer.
+    /// The separate counter lets PeerImp mirror rippled's charge-disconnect
+    /// metric without coupling it to OverlayImpl's lifetime.
+    pub fn install_resource_consumer(
+        &self,
+        consumer: Consumer,
+        disconnect_counter: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let mut resource = self.resource.lock().expect("peer resource lock");
+        resource.consumer = Some(consumer);
+        resource.disconnect_counter = Some(disconnect_counter);
+        self.resource_drop_requested.store(false, Ordering::Release);
+    }
+
+    /// Start exactly one 60-second PeerImp lifecycle timer after activation.
+    pub fn start_lifecycle_timer(self: &Arc<Self>, handle: &tokio::runtime::Handle) {
+        let mut timer = self.lifecycle_timer.lock().expect("peer timer lock");
+        if timer.is_some() {
+            return;
+        }
+        let peer = Arc::downgrade(self);
+        *timer = Some(handle.spawn(async move {
+            loop {
+                tokio::time::sleep(PEER_TIMER_INTERVAL).await;
+                let Some(peer) = peer.upgrade() else {
+                    return;
+                };
+                peer.on_timer();
+                if peer.disconnect_requested() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Cancel the lifecycle timer during deactivation. Aborting is safe here:
+    /// the timer owns no socket state and all session teardown is separately
+    /// idempotent through the session stop watch channel.
+    pub fn stop_lifecycle_timer(&self) {
+        if let Some(timer) = self.lifecycle_timer.lock().expect("peer timer lock").take() {
+            timer.abort();
+        }
+    }
+
+    pub fn lifecycle_timer_active(&self) -> bool {
+        self.lifecycle_timer
+            .lock()
+            .expect("peer timer lock")
+            .as_ref()
+            .is_some_and(|timer| !timer.is_finished())
+    }
+
+    /// Record and validate a PONG against the locally generated outstanding
+    /// ping cookie. Peer-provided timestamps are never used for RTT.
+    pub fn acknowledge_ping(&self, sequence: Option<u32>) -> Option<u32> {
+        let sequence = sequence?;
+        let sent_at = {
+            let mut outstanding = self.outstanding_ping.lock().expect("peer ping lock");
+            let ping = (*outstanding)?;
+            if ping.sequence != sequence {
+                return None;
+            }
+            *outstanding = None;
+            ping.sent_at
+        };
+        let rtt_ms = sent_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        self.update_latency(rtt_ms);
+        Some(rtt_ms)
+    }
+
+    pub fn disconnect_requested(&self) -> bool {
+        self.disconnect_requested.load(Ordering::Acquire)
+    }
+
+    pub fn set_outbound_failure_notifier(
+        &self,
+        notifier: Arc<dyn Fn(SocketAddr, bool) + Send + Sync>,
+    ) {
+        *self
+            .outbound_failure_notifier
+            .lock()
+            .expect("peer outbound failure notifier lock") = Some(notifier);
+    }
+
+    fn set_tracking(&self, tracking: Tracking) {
+        let previous = Tracking::from_u8(self.tracking.swap(tracking.as_u8(), Ordering::AcqRel));
+        if previous != tracking {
+            *self
+                .tracking_since
+                .lock()
+                .expect("peer tracking timer lock") = Instant::now();
+        }
+    }
+
+    /// Return a safe snapshot of accepted outbound messages. A live
+    /// session retains a message in this count until its socket write finishes.
+    pub fn send_queue_size(&self) -> usize {
+        let outbound = self.outbound_state.lock().expect("peer outbound lock");
+        outbound.session_queue_depth.as_ref().map_or_else(
+            || outbound.queued_messages.len(),
+            |depth| depth.load(Ordering::Acquire),
+        )
+    }
+
+    /// Port of PeerImp::onTimer: enforce sustained send-queue pressure and
+    /// Not Useful deadlines, reject a missed prior ping, then send a newly
+    /// cookie-bound PING.
+    fn on_timer(&self) {
+        // rippled resets largeSendq_ in send() when queue < target, NOT in
+        // onTimer. Here we only increment/check.
+        if self.send_queue_size() >= TARGET_SEND_QUEUE
+            && self.large_sendq.fetch_add(1, Ordering::AcqRel) >= SENDQ_INTERVALS
+        {
+            tracing::warn!(
+                target: "overlay",
+                peer_id = %self.id,
+                "send queue remained large; disconnecting peer"
+            );
+            self.request_disconnect();
+            return;
+        }
+
+        if !self.inbound {
+            let state = self.tracking();
+            let state_age = self
+                .tracking_since
+                .lock()
+                .expect("peer tracking timer lock")
+                .elapsed();
+            // rippled uses strict > (duration > maxDivergedTime/maxUnknownTime)
+            let expired = matches!(state, Tracking::Diverged) && state_age > MAX_DIVERGED_TIME
+                || matches!(state, Tracking::Unknown) && state_age > MAX_UNKNOWN_TIME;
+            if expired {
+                tracing::warn!(
+                    target: "overlay",
+                    peer_id = %self.id,
+                    ?state,
+                    "peer remained Not Useful; disconnecting"
+                );
+                // rippled calls peerFinder().onFailure(slot_) before fail()
+                // to lower bootcache valence for this endpoint.
+                self.notify_outbound_failure();
+                self.request_disconnect();
+                return;
+            }
+        }
+
+        let sequence = basics::random::rand_int_to(u32::MAX);
+        {
+            let mut outstanding = self.outstanding_ping.lock().expect("peer ping lock");
+            if outstanding.is_some() {
+                tracing::warn!(target: "overlay", peer_id = %self.id, "Ping Timeout");
+                drop(outstanding);
+                self.request_disconnect();
+                return;
+            }
+            *outstanding = Some(OutstandingPing {
+                sequence,
+                sent_at: Instant::now(),
+            });
+        }
+        self.send(Message::new(
+            ProtocolMessage::new(ProtocolPayload::Ping(crate::message::TmPing {
+                r#type: 0,
+                seq: Some(sequence),
+                ping_time: None,
+                net_time: None,
+            })),
+            None,
+        ));
+    }
+
+    #[cfg(test)]
+    fn on_timer_for_test(&self) {
+        self.on_timer();
     }
 
     pub fn set_fixed(&self, fixed: bool) {
@@ -261,37 +545,64 @@ impl PeerImp {
             .expect("peer protocol version lock") = version;
     }
 
-    pub fn record_ledger(&self, hash: Uint256, sequence: u32) {
-        self.known_ledgers
+    pub fn record_ledger(&self, hash: Uint256, _sequence: u32) {
+        // Match rippled `addLedger`: this is recent-hash knowledge only.
+        self.ledger_status
             .lock()
-            .expect("peer known ledgers lock")
-            .insert((hash, sequence));
-        *self
-            .closed_ledger_hash
-            .lock()
-            .expect("peer closed ledger lock") = hash;
-        let mut min = self.min_ledger.lock().expect("peer min ledger lock");
-        let mut max = self.max_ledger.lock().expect("peer max ledger lock");
-        if *min == 0 || sequence < *min {
-            *min = sequence;
+            .expect("peer ledger status lock")
+            .remember(hash);
+    }
+
+    /// Atomically apply the status fields protected by rippled's
+    /// `recentLock_`: current/prior hashes, recent-hash knowledge, and an
+    /// optionally advertised validated range.
+    pub fn apply_status_change(
+        &self,
+        current: Option<Uint256>,
+        previous: Option<Uint256>,
+        range: Option<(u32, u32)>,
+    ) {
+        let mut status = self.ledger_status.lock().expect("peer ledger status lock");
+        match current {
+            Some(hash) => {
+                status.closed_ledger_hash = hash;
+                status.remember(hash);
+            }
+            None => status.closed_ledger_hash = Uint256::zero(),
         }
-        if sequence > *max {
-            *max = sequence;
+        match previous {
+            Some(hash) => {
+                status.previous_ledger_hash = hash;
+                status.remember(hash);
+            }
+            None => status.previous_ledger_hash = Uint256::zero(),
         }
+        if let Some((min, max)) = range {
+            (status.min_ledger, status.max_ledger) = PeerLedgerStatus::normalized_range(min, max);
+        }
+    }
+
+    pub fn clear_status_ledgers(&self) {
+        let mut status = self.ledger_status.lock().expect("peer ledger status lock");
+        status.closed_ledger_hash = Uint256::zero();
+        status.previous_ledger_hash = Uint256::zero();
     }
 
     pub fn record_tx_set(&self, hash: Uint256) {
-        self.known_tx_sets
-            .lock()
-            .expect("peer known tx sets lock")
-            .insert(hash);
+        let mut known_tx_sets = self.known_tx_sets.lock().expect("peer known tx sets lock");
+        if !known_tx_sets.contains(&hash) {
+            if known_tx_sets.len() == RECENT_PEER_KNOWLEDGE_CAPACITY {
+                known_tx_sets.pop_front();
+            }
+            known_tx_sets.push_back(hash);
+        }
     }
 
     pub fn set_closed_ledger_hash(&self, hash: Uint256) {
-        *self
-            .closed_ledger_hash
+        self.ledger_status
             .lock()
-            .expect("peer closed ledger lock") = hash;
+            .expect("peer ledger status lock")
+            .closed_ledger_hash = hash;
     }
 
     pub fn clear_closed_ledger_hash(&self) {
@@ -299,10 +610,10 @@ impl PeerImp {
     }
 
     pub fn set_previous_ledger_hash(&self, hash: Uint256) {
-        *self
-            .previous_ledger_hash
+        self.ledger_status
             .lock()
-            .expect("peer previous ledger lock") = hash;
+            .expect("peer ledger status lock")
+            .previous_ledger_hash = hash;
     }
 
     pub fn clear_previous_ledger_hash(&self) {
@@ -310,21 +621,16 @@ impl PeerImp {
     }
 
     pub fn previous_ledger_hash(&self) -> Uint256 {
-        *self
-            .previous_ledger_hash
+        self.ledger_status
             .lock()
-            .expect("peer previous ledger lock")
+            .expect("peer ledger status lock")
+            .previous_ledger_hash
     }
 
     pub fn set_ledger_range(&self, min_sequence: u32, max_sequence: u32) {
-        let (min_sequence, max_sequence) =
-            if max_sequence < min_sequence || min_sequence == 0 || max_sequence == 0 {
-                (0, 0)
-            } else {
-                (min_sequence, max_sequence)
-            };
-        *self.min_ledger.lock().expect("peer min ledger lock") = min_sequence;
-        *self.max_ledger.lock().expect("peer max ledger lock") = max_sequence;
+        let mut status = self.ledger_status.lock().expect("peer ledger status lock");
+        (status.min_ledger, status.max_ledger) =
+            PeerLedgerStatus::normalized_range(min_sequence, max_sequence);
     }
 
     pub fn remember_status(&self, incoming_status: Option<i32>) -> Option<i32> {
@@ -346,22 +652,34 @@ impl PeerImp {
     }
 
     pub fn clear_queued_messages(&self) {
-        self.outbound_state
+        let mut outbound = self
+            .outbound_state
             .lock()
-            .expect("peer queued messages lock")
-            .queued_messages
-            .clear();
+            .expect("peer queued messages lock");
+        outbound.queued_messages.clear();
+        outbound.queued_bytes = 0;
+    }
+
+    /// Returns a snapshot of resource charges applied through `Peer::charge`.
+    pub fn charges(&self) -> Vec<(Charge, String)> {
+        self.charges.lock().expect("peer charges lock").clone()
     }
 
     pub fn attach_session(
         &self,
-        session_tx: mpsc::UnboundedSender<Message>,
+        session_tx: mpsc::Sender<Message>,
         session_stop: watch::Sender<bool>,
-    ) -> Vec<Message> {
+    ) -> (Vec<Message>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let mut outbound_state = self.outbound_state.lock().expect("peer outbound lock");
+        let pending = std::mem::take(&mut outbound_state.queued_messages);
+        let pending_bytes = std::mem::take(&mut outbound_state.queued_bytes);
+        let queue_depth = Arc::new(AtomicUsize::new(pending.len()));
+        let queue_bytes = Arc::new(AtomicUsize::new(pending_bytes));
         outbound_state.session_tx = Some(session_tx);
+        outbound_state.session_queue_depth = Some(Arc::clone(&queue_depth));
+        outbound_state.session_queue_bytes = Some(Arc::clone(&queue_bytes));
         outbound_state.session_stop = Some(session_stop);
-        std::mem::take(&mut outbound_state.queued_messages)
+        (pending, queue_depth, queue_bytes)
     }
 
     pub fn detach_session(&self) {
@@ -370,6 +688,8 @@ impl PeerImp {
             let _ = session_stop.send(true);
         }
         outbound_state.session_tx = None;
+        outbound_state.session_queue_depth = None;
+        outbound_state.session_queue_bytes = None;
     }
 
     pub fn has_dead_session_channel(&self) -> bool {
@@ -433,7 +753,11 @@ impl PeerImp {
     }
 
     pub fn check_tracking(&self, validation_seq: u32) {
-        let server_seq = *self.max_ledger.lock().expect("peer max ledger lock");
+        let server_seq = self
+            .ledger_status
+            .lock()
+            .expect("peer ledger status lock")
+            .max_ledger;
         if server_seq != 0 {
             self.check_tracking_pair(server_seq, validation_seq);
         }
@@ -443,13 +767,11 @@ impl PeerImp {
         let diff = seq1.abs_diff(seq2) as usize;
 
         if diff < CONVERGED_LEDGER_LIMIT {
-            self.tracking
-                .store(Tracking::Converged.as_u8(), Ordering::Relaxed);
+            self.set_tracking(Tracking::Converged);
         }
 
-        if diff > DIVERGED_LEDGER_LIMIT && self.tracking() != Tracking::Diverged {
-            self.tracking
-                .store(Tracking::Diverged.as_u8(), Ordering::Relaxed);
+        if diff > DIVERGED_LEDGER_LIMIT {
+            self.set_tracking(Tracking::Diverged);
         }
     }
 
@@ -522,18 +844,175 @@ impl PeerImp {
     }
 }
 
+impl PeerImp {
+    fn is_droppable_send(&self, message: &Message) -> bool {
+        match &message.protocol().payload {
+            ProtocolPayload::LedgerData(_) => true,
+            ProtocolPayload::GetObjects(reply) => !reply.query,
+            _ => false,
+        }
+    }
+
+    /// Notify the bootcache/peerfinder that an outbound peer was not useful,
+    /// lowering its valence for future selection (rippled: peerFinder().onFailure(slot_)).
+    fn notify_outbound_failure(&self) {
+        // The bootcache valence decrement happens via the overlay runtime's
+        // deactivation handler which already records failure for outbound peers.
+        // This explicit marker ensures the "Not Useful" reason is logged.
+        tracing::debug!(
+            target: "overlay",
+            peer_id = %self.id,
+            remote = %self.remote_address,
+            "PeerFinder outbound failure notification (Not Useful)"
+        );
+        if let Some(notifier) = self
+            .outbound_failure_notifier
+            .lock()
+            .expect("peer outbound failure notifier lock")
+            .as_ref()
+            .map(Arc::clone)
+        {
+            notifier(self.remote_address, self.fixed());
+        }
+    }
+
+    pub fn request_disconnect(&self) {
+        if self.disconnect_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let session_stop = self
+            .outbound_state
+            .lock()
+            .expect("peer outbound lock")
+            .session_stop
+            .clone();
+        if let Some(session_stop) = session_stop {
+            let _ = session_stop.send(true);
+        }
+    }
+}
+
+fn reserve_active_send(
+    depth: &AtomicUsize,
+    bytes: &AtomicUsize,
+    message_bytes: usize,
+) -> Option<usize> {
+    let depth_before = loop {
+        let current = depth.load(Ordering::Acquire);
+        if current >= SEND_QUEUE_CAPACITY {
+            return None;
+        }
+        if depth
+            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break current;
+        }
+    };
+    loop {
+        let current = bytes.load(Ordering::Acquire);
+        if current.saturating_add(message_bytes) > SEND_QUEUE_BYTE_CAPACITY {
+            depth.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        if bytes
+            .compare_exchange(
+                current,
+                current + message_bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Some(depth_before);
+        }
+    }
+}
+
 impl Peer for PeerImp {
     fn send(&self, message: Message) {
-        let session_tx = {
-            let mut outbound_state = self.outbound_state.lock().expect("peer outbound lock");
-            if outbound_state.session_tx.is_none() {
-                outbound_state.queued_messages.push(message.clone());
-            }
-            outbound_state.session_tx.clone()
-        };
-        if let Some(session_tx) = session_tx {
-            let _ = session_tx.send(message);
+        if self.disconnect_requested.load(Ordering::Acquire) {
+            return;
         }
+
+        let droppable = self.is_droppable_send(&message);
+        let message_bytes = message.get_buffer_size();
+        if message_bytes > MAXIMUM_OUTBOUND_WIRE_FRAME_SIZE {
+            // The transport framing owner rejects any single item outside the
+            // decoder's existing wire-frame maximum before it can invalidate
+            // the derived queue byte envelope.
+            if !droppable {
+                self.request_disconnect();
+            }
+            return;
+        }
+        let session = {
+            let mut outbound_state = self.outbound_state.lock().expect("peer outbound lock");
+            let Some(session_tx) = outbound_state.session_tx.clone() else {
+                let queue_depth_before_push = outbound_state.queued_messages.len();
+                if queue_depth_before_push < SEND_QUEUE_CAPACITY
+                    && outbound_state.queued_bytes.saturating_add(message_bytes)
+                        <= SEND_QUEUE_BYTE_CAPACITY
+                {
+                    outbound_state.queued_messages.push(message);
+                    outbound_state.queued_bytes += message_bytes;
+                    // rippled tests sendQueue_.size() before pushing the new
+                    // message when deciding whether to reset largeSendq_.
+                    if queue_depth_before_push < TARGET_SEND_QUEUE {
+                        self.large_sendq.store(0, Ordering::Release);
+                    }
+                    return;
+                }
+                if droppable {
+                    return;
+                }
+                drop(outbound_state);
+                self.request_disconnect();
+                return;
+            };
+            let queue_depth = outbound_state
+                .session_queue_depth
+                .as_ref()
+                .expect("active session must have queue depth")
+                .clone();
+            let queue_bytes = outbound_state
+                .session_queue_bytes
+                .as_ref()
+                .expect("active session must have queue bytes")
+                .clone();
+            (session_tx, queue_depth, queue_bytes)
+        };
+
+        let Some(queue_depth_before_push) =
+            reserve_active_send(session.1.as_ref(), session.2.as_ref(), message_bytes)
+        else {
+            // Quaxar's finite queue policy drops reply-like traffic but
+            // disconnects when control/request traffic cannot be retained.
+            if !droppable {
+                self.request_disconnect();
+            }
+            return;
+        };
+        match session.0.try_send(message) {
+            Ok(()) => {
+                // The reset decision is based on the queue depth before this
+                // message was pushed, exactly as in rippled.
+                if queue_depth_before_push < TARGET_SEND_QUEUE {
+                    self.large_sendq.store(0, Ordering::Release);
+                }
+            }
+            Err(_) => {
+                session.1.fetch_sub(1, Ordering::AcqRel);
+                session.2.fetch_sub(message_bytes, Ordering::AcqRel);
+                if !droppable {
+                    self.request_disconnect();
+                }
+            }
+        }
+    }
+
+    fn send_queue_size(&self) -> usize {
+        PeerImp::send_queue_size(self)
     }
 
     fn remote_address(&self) -> SocketAddr {
@@ -564,10 +1043,35 @@ impl Peer for PeerImp {
     }
 
     fn charge(&self, fee: Charge, context: String) {
+        // Retain the local diagnostic snapshot used by existing callers and
+        // tests, but make the Resource Manager disposition authoritative.
         self.charges
             .lock()
             .expect("peer charges lock")
-            .push((fee, context));
+            .push((fee.clone(), context.clone()));
+
+        let (consumer, disconnect_counter) = {
+            let resource = self.resource.lock().expect("peer resource lock");
+            (
+                resource.consumer.clone(),
+                resource.disconnect_counter.clone(),
+            )
+        };
+        let Some(consumer) = consumer else {
+            return;
+        };
+        if consumer.charge_with_context(fee, context) != Disposition::Drop
+            || self.resource_drop_requested.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        if consumer.disconnect_with_manager_journal() {
+            if let Some(counter) = disconnect_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::warn!(target: "overlay", peer_id = %self.id, "charge: Resources");
+            self.request_disconnect();
+        }
     }
 
     fn id(&self) -> PeerId {
@@ -682,73 +1186,58 @@ impl Peer for PeerImp {
     }
 
     fn closed_ledger_hash(&self) -> Uint256 {
-        *self
-            .closed_ledger_hash
+        self.ledger_status
             .lock()
-            .expect("peer closed ledger lock")
+            .expect("peer ledger status lock")
+            .closed_ledger_hash
     }
 
     fn previous_ledger_hash(&self) -> Uint256 {
-        *self
-            .previous_ledger_hash
+        self.ledger_status
             .lock()
-            .expect("peer previous ledger lock")
+            .expect("peer ledger status lock")
+            .previous_ledger_hash
     }
 
     fn has_ledger(&self, hash: Uint256, sequence: u32) -> bool {
-        if sequence != 0 {
-            let (min, max) = self.ledger_range();
-            if min != 0
-                && sequence >= min
-                && sequence <= max
-                && self.tracking() == Tracking::Converged
-            {
-                return true;
-            }
+        let status = self.ledger_status.lock().expect("peer ledger status lock");
+        if sequence != 0
+            && sequence >= status.min_ledger
+            && sequence <= status.max_ledger
+            && self.tracking() == Tracking::Converged
+        {
+            return true;
         }
-
-        self.known_ledgers
-            .lock()
-            .expect("peer known ledgers lock")
+        status
+            .recent_ledgers
             .iter()
-            .any(|(known_hash, _)| *known_hash == hash)
+            .any(|known_hash| *known_hash == hash)
     }
 
     fn ledger_range(&self) -> (u32, u32) {
-        (
-            *self.min_ledger.lock().expect("peer min ledger lock"),
-            *self.max_ledger.lock().expect("peer max ledger lock"),
-        )
+        let status = self.ledger_status.lock().expect("peer ledger status lock");
+        (status.min_ledger, status.max_ledger)
     }
 
     fn has_tx_set(&self, hash: Uint256) -> bool {
         self.known_tx_sets
             .lock()
             .expect("peer known tx sets lock")
-            .contains(&hash)
+            .iter()
+            .any(|known_hash| *known_hash == hash)
     }
 
     fn cycle_status(&self) {
-        let closed = *self
-            .closed_ledger_hash
-            .lock()
-            .expect("peer closed ledger lock");
-        *self
-            .previous_ledger_hash
-            .lock()
-            .expect("peer previous ledger lock") = closed;
-        *self
-            .closed_ledger_hash
-            .lock()
-            .expect("peer closed ledger lock") = Uint256::zero();
+        let mut status = self.ledger_status.lock().expect("peer ledger status lock");
+        status.previous_ledger_hash = status.closed_ledger_hash;
+        status.closed_ledger_hash = Uint256::zero();
     }
 
     fn has_range(&self, min_sequence: u32, max_sequence: u32) -> bool {
-        let (min, max) = self.ledger_range();
-        min != 0
-            && self.tracking() != Tracking::Diverged
-            && min <= min_sequence
-            && max >= max_sequence
+        let status = self.ledger_status.lock().expect("peer ledger status lock");
+        self.tracking() != Tracking::Diverged
+            && status.min_ledger <= min_sequence
+            && status.max_ledger >= max_sequence
     }
 
     fn compression_enabled(&self) -> bool {
@@ -815,9 +1304,110 @@ mod tests {
     use basics::base_uint::Uint256;
     use protocol::{KeyType, SecretKey, derive_public_key};
 
-    use super::{PeerImp, Tracking};
+    use super::{PeerImp, SEND_QUEUE_CAPACITY, Tracking};
+    use crate::message::ProtocolPayload;
     use crate::peer::{Peer, ProtocolFeature};
     use crate::protocol_version::ProtocolVersion;
+
+    #[test]
+    fn outbound_failure_notifies_peerfinder_callback() {
+        let secret = SecretKey::from_bytes([0x41; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let endpoint: SocketAddr = "198.51.100.41:51235".parse().expect("endpoint");
+        let peer = PeerImp::new(41, endpoint, public, "failure-peer");
+        peer.set_fixed(true);
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_callback = std::sync::Arc::clone(&observed);
+        peer.set_outbound_failure_notifier(std::sync::Arc::new(move |address, fixed| {
+            observed_callback
+                .lock()
+                .expect("observed failure callback")
+                .push((address, fixed));
+        }));
+
+        peer.notify_outbound_failure();
+        assert_eq!(
+            observed
+                .lock()
+                .expect("observed failure callback")
+                .as_slice(),
+            &[(endpoint, true)]
+        );
+    }
+
+    #[test]
+    fn attached_session_queue_depth_tracks_enqueued_messages() {
+        let secret = SecretKey::from_bytes([2u8; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let peer = PeerImp::new(
+            6,
+            "127.0.0.1:51234".parse().expect("endpoint"),
+            public,
+            "queue-depth",
+        );
+        let (sender, _receiver) = tokio::sync::mpsc::channel(SEND_QUEUE_CAPACITY);
+        let (stop, _stop_rx) = tokio::sync::watch::channel(false);
+        let (_pending, _depth, _bytes) = peer.attach_session(sender, stop);
+
+        peer.send(crate::Message::new(
+            crate::ProtocolMessage::new(ProtocolPayload::Ping(crate::TmPing {
+                r#type: 0,
+                seq: Some(1),
+                ping_time: None,
+                net_time: None,
+            })),
+            None,
+        ));
+        assert_eq!(peer.send_queue_size(), 1);
+        let peer_view: std::sync::Arc<dyn Peer> =
+            std::sync::Arc::clone(&peer) as std::sync::Arc<dyn Peer>;
+        assert_eq!(peer_view.send_queue_size(), 1);
+    }
+
+    #[test]
+    fn large_sendq_reset_uses_queue_depth_before_push() {
+        let secret = SecretKey::from_bytes([0x16; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let peer = PeerImp::new(
+            16,
+            "127.0.0.1:51244".parse().expect("endpoint"),
+            public,
+            "sendq-reset",
+        );
+        let (sender, _receiver) = tokio::sync::mpsc::channel(SEND_QUEUE_CAPACITY);
+        let (stop, _stop_rx) = tokio::sync::watch::channel(false);
+        let (_pending, _depth, _bytes) = peer.attach_session(sender, stop);
+
+        for sequence in 0..crate::tuning::TARGET_SEND_QUEUE - 1 {
+            peer.send(crate::Message::new(
+                crate::ProtocolMessage::new(ProtocolPayload::Ping(crate::TmPing {
+                    r#type: 0,
+                    seq: Some(sequence as u32),
+                    ping_time: None,
+                    net_time: None,
+                })),
+                None,
+            ));
+        }
+        peer.large_sendq
+            .store(3, std::sync::atomic::Ordering::Release);
+        peer.send(crate::Message::new(
+            crate::ProtocolMessage::new(ProtocolPayload::Ping(crate::TmPing {
+                r#type: 0,
+                seq: Some(crate::tuning::TARGET_SEND_QUEUE as u32),
+                ping_time: None,
+                net_time: None,
+            })),
+            None,
+        ));
+
+        assert_eq!(peer.send_queue_size(), crate::tuning::TARGET_SEND_QUEUE);
+        assert_eq!(
+            peer.large_sendq.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a pre-push depth below the target must reset largeSendq"
+        );
+    }
 
     #[test]
     fn tx_queue_builds_have_transactions_message_and_clears_queue() {
@@ -878,6 +1468,7 @@ mod tests {
 
         let hash = Uint256::from_u64(55);
         peer.record_ledger(hash, 200);
+        peer.set_ledger_range(200, 200);
         assert!(peer.has_range(200, 200));
 
         peer.check_tracking(400);
@@ -887,6 +1478,77 @@ mod tests {
         peer.check_tracking(210);
         assert_eq!(peer.tracking(), Tracking::Converged);
         assert!(peer.has_range(200, 200));
+    }
+
+    #[test]
+    fn peer_recent_ledger_and_txset_knowledge_is_capped_at_rippled_capacity() {
+        let secret = SecretKey::from_bytes([9u8; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let peer = PeerImp::new(
+            9,
+            "127.0.0.1:51235".parse().expect("endpoint"),
+            public,
+            "recent-cap",
+        );
+        peer.apply_status_change(Some(Uint256::zero()), None, None);
+        assert!(
+            peer.has_ledger(Uint256::zero(), 0),
+            "an explicit zero status hash is retained in recent ledger knowledge"
+        );
+        for value in 1..=128u64 {
+            peer.record_ledger(Uint256::from_u64(value), value as u32 + 1);
+            peer.record_tx_set(Uint256::from_u64(value));
+        }
+        assert!(
+            !peer.has_ledger(Uint256::zero(), 0),
+            "the zero hash is evicted first once the same 128-entry capacity is exceeded"
+        );
+        assert!(peer.has_ledger(Uint256::from_u64(128), 0));
+        assert!(!peer.has_tx_set(Uint256::from_u64(0)));
+        assert!(peer.has_tx_set(Uint256::from_u64(128)));
+    }
+
+    #[test]
+    fn status_change_missing_or_malformed_hashes_clear_without_remembering_zero() {
+        let secret = SecretKey::from_bytes([0x0au8; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let peer = PeerImp::new(
+            10,
+            "127.0.0.1:51236".parse().expect("endpoint"),
+            public,
+            "status-missing-hash",
+        );
+
+        // The status-change decoder maps both absent and non-32-byte hashes to None.
+        peer.apply_status_change(None, None, None);
+
+        assert_eq!(peer.closed_ledger_hash(), Uint256::zero());
+        assert_eq!(peer.previous_ledger_hash(), Uint256::zero());
+        assert!(
+            !peer.has_ledger(Uint256::zero(), 0),
+            "absent or malformed status hashes must not create zero-hash knowledge"
+        );
+    }
+
+    #[test]
+    fn status_change_explicit_zero_hash_is_remembered() {
+        let secret = SecretKey::from_bytes([0x0bu8; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let peer = PeerImp::new(
+            11,
+            "127.0.0.1:51237".parse().expect("endpoint"),
+            public,
+            "status-zero-hash",
+        );
+
+        peer.apply_status_change(Some(Uint256::zero()), None, None);
+
+        assert_eq!(peer.closed_ledger_hash(), Uint256::zero());
+        assert_eq!(peer.previous_ledger_hash(), Uint256::zero());
+        assert!(
+            peer.has_ledger(Uint256::zero(), 0),
+            "an explicit zero status hash must create zero-hash knowledge"
+        );
     }
 
     #[test]
@@ -902,6 +1564,7 @@ mod tests {
 
         let hash = Uint256::from_u64(77);
         peer.record_ledger(hash, 300);
+        peer.set_ledger_range(300, 300);
         peer.check_tracking(300);
 
         assert!(peer.has_ledger(Uint256::zero(), 300));
@@ -953,6 +1616,45 @@ mod tests {
         assert_eq!(peer.remember_status(None), Some(2));
         assert_eq!(peer.remember_status(Some(4)), Some(4));
         assert_eq!(peer.remember_status(None), Some(4));
+    }
+
+    #[test]
+    fn matching_pong_uses_local_cookie_and_ignores_peer_timestamp() {
+        let secret = SecretKey::from_bytes([14u8; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let peer = PeerImp::new(
+            16,
+            "127.0.0.1:51241".parse().expect("endpoint"),
+            public,
+            "ping-cookie",
+        );
+
+        peer.on_timer_for_test();
+        let ping = peer.queued_messages().pop().expect("timer ping");
+        let ProtocolPayload::Ping(ping) = ping.protocol().payload.clone() else {
+            panic!("timer must send TMPing");
+        };
+        let rtt = peer
+            .acknowledge_ping(Some(ping.seq.expect("ping sequence")))
+            .expect("matching local cookie");
+        assert_eq!(peer.latency_ms(), rtt);
+
+        peer.on_timer_for_test();
+        let second_ping = peer.queued_messages().pop().expect("second timer ping");
+        let ProtocolPayload::Ping(second_ping) = second_ping.protocol().payload.clone() else {
+            panic!("timer must send TMPing");
+        };
+        assert!(
+            peer.acknowledge_ping(Some(
+                second_ping
+                    .seq
+                    .expect("second ping sequence")
+                    .wrapping_add(1)
+            ))
+            .is_none()
+        );
+        assert!(peer.acknowledge_ping(None).is_none());
+        assert!(!peer.disconnect_requested());
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use basics::base_uint::Uint256;
 use consensus::rcl_support::Validations;
+use consensus::rcl_support::validations::PreferredLclDiagnostic;
 use protocol::{PublicKey, STValidation, calc_node_id};
 
 use crate::consensus::rcl_validation::{RclValidatedLedger, RclValidation, RclValidationsAdaptor};
@@ -242,11 +243,54 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
     /// hook, called wherever the node processes a newly built or acquired
     /// ledger.
     pub fn register_ledger(&self, ledger: &ledger::Ledger) {
+        let validated_ledger = RclValidatedLedger::from_ledger(ledger);
+        let validations = self
+            .inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned");
+        validations.adaptor().register_ledger(ledger);
+        validations.on_ledger_acquired(validated_ledger);
+    }
+
+    /// Retract a provisional resolver ledger after its NodeStore durability
+    /// fence failed, so validation ancestry lookup cannot retain it.
+    pub fn unregister_ledger(&self, hash: basics::base_uint::Uint256) -> bool {
+        let validations = self
+            .inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned");
+        let removed = validations.adaptor().unregister_ledger(hash);
+        validations.on_ledger_unacquired(&hash);
+        removed
+    }
+
+    /// Return the preferred-LCL decision together with sampled diagnostic
+    /// state identifying whether it came from the validation trie, pending
+    /// acquisition fallback, or peer fallback. This preserves the selection
+    /// behavior of `Validations::getPreferredLCL`.
+    pub fn preferred_lcl_diagnostic(
+        &self,
+        lcl: &RclValidatedLedger,
+        min_seq: u32,
+        peer_counts: &std::collections::BTreeMap<Uint256, u32>,
+    ) -> PreferredLclDiagnostic<u32, Uint256> {
         self.inner
             .lock()
             .expect("shared app validations mutex must not be poisoned")
-            .adaptor()
-            .register_ledger(ledger);
+            .get_preferred_lcl_diagnostic(lcl, min_seq, peer_counts)
+    }
+
+    /// Align validation-recovery proof ownership with the coordinator's
+    /// actual stable anchor and latest successor before observing a new tip.
+    pub fn reconcile_validation_recovery_latch(
+        &self,
+        actual_anchor: Option<(u32, Uint256)>,
+        actual_candidate: Option<(u32, Uint256)>,
+    ) {
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .reconcile_validation_recovery_latch(actual_anchor, actual_candidate);
     }
 
     /// Number of trusted, full validations tracked for `ledger_hash`.
@@ -263,7 +307,7 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
     /// Fees reported by trusted, full validators for `ledger_id`.
     /// Matches `Validations::fees`; delegates to the inner tracker's
     /// `fees()` method.
-    pub fn fees_for_ledger(&self, ledger_id: Uint256, seq: u32, base_fee: u32) -> Vec<u32> {
+    pub fn fees_for_ledger(&self, ledger_id: Uint256, _seq: u32, base_fee: u32) -> Vec<u32> {
         self.inner
             .lock()
             .expect("shared app validations mutex must not be poisoned")
@@ -296,6 +340,21 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
         previous
     }
 
+    /// Provide the application-owned cache/provider/current-closed-LCL
+    /// exact-hash lookup path to the validation adaptor. This is wired independently of
+    /// inbound acquisition because it must complete before `GetConsL2` is
+    /// scheduled, matching rippled's `LedgerMaster::getLedgerByHash` call.
+    pub fn set_loaded_ledger_runtime(
+        &self,
+        runtime: Option<Arc<crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime>>,
+    ) {
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .adaptor()
+            .set_loaded_ledger_runtime(runtime);
+    }
+
     /// Provide the overlay to the inner validation adaptor so it can resolve
     /// ledger sequence numbers from peers when the local cache misses.
     pub fn set_overlay(&self, overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>) {
@@ -304,6 +363,16 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
             .expect("shared app validations mutex must not be poisoned")
             .adaptor()
             .set_overlay(overlay);
+    }
+
+    /// Provide the application job queue for reference-equivalent deferred
+    /// consensus-ledger cache-miss acquisition work.
+    pub fn set_job_queue(&self, job_queue: Option<Arc<crate::job::job_queue::JobQueue>>) {
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .adaptor()
+            .set_job_queue(job_queue);
     }
 }
 
@@ -314,11 +383,9 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
 /// persist it via `store` regardless of trust (matching the reference's
 /// unconditional store-on-accept behavior).
 ///
-/// `bypass_accept` mirrors the reference's `NetworkOPsImp::recvValidation`
-/// dedup rule: when a validation for the same ledger hash is already
-/// mid-flight, later arrivals are still added to the tracker but skip the
-/// acceptance-sink notification (since the first arrival already
-/// triggered it).
+/// Every current trusted validation returns acceptance work. The caller must
+/// run that work after releasing the validations mutex so each arrival can
+/// re-evaluate quorum without self-deadlocking.
 pub fn handle_new_validation_with_store(
     trust_source: &dyn RclValidationTrustSource,
     validations: &mut RclValidationsInner,
@@ -360,7 +427,7 @@ pub fn handle_new_validation_with_store(
 
     let mut check_accept_args = None;
     if status == consensus::ValidationStatus::Current {
-        if !bypass_accept && validation.is_trusted() {
+        if validation.is_trusted() && !bypass_accept {
             // Matches the reference (RCLValidations.cpp:193):
             // `if (outcome == ValStatus::current && isTrusted)`
             //     `app.getLedgerMaster().checkAccept(...)`.

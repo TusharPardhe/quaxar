@@ -1,4 +1,6 @@
 use basics::base_uint::Uint256;
+use basics::intrusive_pointer::make_shared_intrusive;
+use basics::sha_map_hash::SHAMapHash;
 use ledger::{Ledger, LedgerHeader};
 use protocol::{
     DecodedDisabledValidator, DecodedNegativeUnlEntry, STArray, STLedgerEntry, STObject,
@@ -7,7 +9,8 @@ use protocol::{
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
 use shamap::sync::{SHAMapType, SyncState, SyncTree};
-use shamap::tree_node::SHAMapNodeType;
+use shamap::traversal::TraversalError;
+use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
 use std::collections::HashSet;
 
 fn build_state_map_with_items(items: &[(Uint256, Vec<u8>)], ledger_seq: u32) -> SyncTree {
@@ -247,6 +250,28 @@ fn negative_unl_read_helpers_match_current_cpp_field_filtering_rules() {
     assert_eq!(ledger.negative_unl(), HashSet::from([valid_validator]));
     assert_eq!(ledger.validator_to_disable(), Some(disable_validator));
     assert_eq!(ledger.validator_to_re_enable(), Some(re_enable_validator));
+}
+
+#[test]
+fn strict_negative_unl_read_preserves_missing_node_error() {
+    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let branch = usize::from(negative_unl_keylet().key.data()[0] >> 4);
+    let missing = SHAMapHash::new(Uint256::from_array([0xA5; 32]));
+    root.set_child_hash(branch, missing);
+    root.update_hash();
+    let ledger = Ledger::from_maps(
+        LedgerHeader {
+            seq: 904,
+            ..LedgerHeader::default()
+        },
+        SyncTree::from_root_with_type(root, SHAMapType::State, true, 904, SyncState::Immutable),
+        SyncTree::new_with_type(SHAMapType::Transaction, true, 904),
+    );
+
+    assert!(matches!(
+        ledger.try_negative_unl(),
+        Err(TraversalError::MissingNode(hash)) if hash == missing
+    ));
 }
 
 #[test]

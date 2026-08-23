@@ -1,7 +1,7 @@
 use crate::database_runtime::node_object_cache::NodeObjectCache;
 use crate::{
     Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType, NodeStoreJournal,
-    Scheduler, batch_write_preallocation_size,
+    Scheduler, Task, batch_write_preallocation_size,
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::{Section, get};
@@ -16,8 +16,128 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const XRP_LEDGER_EARLIEST_SEQ: u32 = 32_570;
+/// Rust adaptation envelope for one fixed-size `AsyncReadWork` owner. This is
+/// deliberately separate from the queue record so the default byte budget can
+/// admit the configured callback count without accepting arbitrary closures.
+const DEFAULT_ASYNC_READ_WORK_BYTES: usize = 256;
+/// Derive one default asynchronous-read ownership budget from the existing
+/// NodeStore worker and `rq_bundle` resource contracts. Rippled batches by
+/// hash (`Database::asyncFetch`) but does not publish an admission number, so
+/// this is a bounded Rust adaptation rather than numeric parity.
+fn default_read_queue_budget(read_threads: usize, request_bundle: usize) -> Result<usize, String> {
+    read_threads
+        .checked_mul(request_bundle)
+        .ok_or_else(|| "NodeStore async read queue budget overflow".to_owned())
+}
 
-pub type AsyncFetchCallback = Box<dyn FnOnce(Option<Arc<NodeObject>>) + Send + 'static>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadQueueSnapshot {
+    pub queued_keys: usize,
+    pub outstanding_callbacks: usize,
+    pub outstanding_bytes: usize,
+    pub key_limit: usize,
+    pub callback_limit: usize,
+    pub byte_limit: usize,
+    pub rejected: u64,
+    pub cancelled: u64,
+}
+
+/// Typed terminal work retained by the NodeStore async-read queue.
+///
+/// This intentionally replaces an erased callback closure. The runtime measures
+/// the concrete boxed work object with `size_of_val` at admission and mints the
+/// accompanying [`ReadWorkPermit`] itself; callers cannot declare an arbitrary
+/// closure size. Implementations must keep all retained ownership in their
+/// concrete fixed-size fields. Indirect `Arc` ownership is allowed only for a
+/// separately bounded owner, never for an unbounded callback capture.
+pub trait AsyncReadWork: Send + 'static {
+    fn complete(&mut self, result: Option<Arc<NodeObject>>);
+}
+
+/// Runtime-owned byte reservation for one accepted async-read work item.
+/// It has no public constructor and releases exactly once when the queued,
+/// faulted, stopped, rejected, or completed request is consumed.
+struct ReadWorkPermit {
+    inner: Arc<DatabaseInner>,
+    bytes: usize,
+}
+
+impl Drop for ReadWorkPermit {
+    fn drop(&mut self) {
+        self.inner
+            .outstanding_read_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// Immutable storage-side identity carried across scheduler ownership. The
+/// acquisition actor supplies its ID; storage supplies the observed monotonic
+/// store generation. No actor state is retained by this handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PersistenceIdentity {
+    pub acquisition_id: u64,
+    pub persistence_generation: u64,
+    pub store_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistenceOutcome {
+    Durable,
+    Fault(Arc<str>),
+    Cancelled,
+}
+
+/// Concrete persistence work admitted by the NodeStore scheduler.
+///
+/// This replaces the erased `FnOnce` write callback boundary. Implementors
+/// retain only named, inspectable fields and report the capacity of their
+/// actual write payload (vectors and byte buffers), never a trait-object or
+/// closure shell. The scheduler owns the resulting reservation until this
+/// item runs, panics, is rejected, or is dropped during stop.
+pub trait PersistenceWork: Send + 'static {
+    /// Exact retained write-payload capacity, including every vector record
+    /// and byte buffer owned by this item. Fixed identity/state fields are
+    /// accounted by the concrete task record itself.
+    fn retained_payload_bytes(&self) -> usize;
+
+    /// Consume the one admitted work record.
+    fn run(self: Box<Self>);
+}
+
+/// Backward-compatible name for the typed NodeStore persistence handoff.
+pub type ScheduledWrite = Box<dyn PersistenceWork>;
+
+struct ScheduledWriteTask {
+    work: Mutex<Option<ScheduledWrite>>,
+    payload_bytes: usize,
+}
+
+impl ScheduledWriteTask {
+    fn new(work: ScheduledWrite) -> Self {
+        let payload_bytes = work.retained_payload_bytes();
+        Self {
+            work: Mutex::new(Some(work)),
+            payload_bytes,
+        }
+    }
+}
+
+impl Task for ScheduledWriteTask {
+    fn perform_scheduled_task(&self) {
+        if let Some(work) = self
+            .work
+            .lock()
+            .expect("scheduled NodeStore write task mutex must not be poisoned")
+            .take()
+        {
+            work.run();
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+}
 
 pub trait DatabaseSource: Send + Sync + 'static {
     fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>));
@@ -33,11 +153,41 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
 
     fn get_write_load(&self) -> i32;
 
-    fn store(&self, object_type: NodeObjectType, data: Blob, hash: Uint256, ledger_seq: u32);
+    fn store(
+        &self,
+        object_type: NodeObjectType,
+        data: Blob,
+        hash: Uint256,
+        ledger_seq: u32,
+    ) -> Result<(), String>;
+
+    fn store_batch(&self, objects: Vec<(NodeObjectType, Blob, Uint256, u32)>)
+    -> Result<(), String>;
 
     fn is_same_db(&self, first: u32, second: u32) -> bool;
 
     fn sync(&self);
+
+    /// Checked durability barrier. The default preserves legacy databases;
+    /// concrete fallible backends override through their database adapter.
+    fn sync_result(&self) -> Result<(), String> {
+        self.sync();
+        Ok(())
+    }
+
+    /// Queue one write-owner task on the NodeStore scheduler. Callers use this
+    /// for bounded write batches; it deliberately does not expose an
+    /// acquisition-worker execution path.
+    fn schedule_write(&self, write: ScheduledWrite) {
+        write.run();
+    }
+
+    /// Stable nonzero identity for cache/read ownership. Rotating stores
+    /// advance it before exposing a new writable/archive pairing; consumers
+    /// must key asynchronous work by the value observed at admission.
+    fn store_generation(&self) -> u64 {
+        1
+    }
 
     fn fetch_node_object(
         &self,
@@ -47,7 +197,7 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
         duplicate: bool,
     ) -> Option<Arc<NodeObject>>;
 
-    fn async_fetch(&self, hash: Uint256, ledger_seq: u32, callback: AsyncFetchCallback);
+    fn async_fetch(&self, hash: Uint256, ledger_seq: u32, work: Box<dyn AsyncReadWork>);
 
     fn stop(&self);
 
@@ -83,6 +233,14 @@ pub trait DatabaseRotating: Database {
     /// window, from cache freshening until `rotate` returns.
     fn set_rotation_in_flight(&self, in_flight: bool);
 
+    /// Copy archive-resident objects into the current writable generation as
+    /// one bounded maintenance batch. Implementations must complete the write
+    /// synchronously before returning so online deletion can safely rotate the
+    /// archive afterward. The return value is the number of archive objects
+    /// submitted to the writable backend; hashes already present there and
+    /// hashes missing from both backends are not counted.
+    fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String>;
+
     fn rotate(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str));
 }
 
@@ -114,12 +272,31 @@ pub trait DatabaseDelegate: Send + Sync + 'static {
 
 struct AsyncReadRequest {
     ledger_seq: u32,
-    callback: AsyncFetchCallback,
+    work: Box<dyn AsyncReadWork>,
+    _permit: ReadWorkPermit,
 }
+
+/// Fixed queue-record bytes charged in addition to the concrete typed work
+/// object. This is a measured Rust-layout handoff, not a caller estimate.
+pub const ASYNC_READ_WORK_QUEUE_OVERHEAD_BYTES: usize = std::mem::size_of::<AsyncReadRequest>();
 
 #[derive(Default)]
 struct ReadState {
     queue: BTreeMap<Uint256, Vec<AsyncReadRequest>>,
+}
+
+/// Decrements the one logical callback slot exactly once, including when a
+/// callback panics. The callback itself is invoked outside every queue lock.
+struct AsyncCallbackGuard {
+    inner: Arc<DatabaseInner>,
+}
+
+impl Drop for AsyncCallbackGuard {
+    fn drop(&mut self) {
+        self.inner
+            .outstanding_read_callbacks
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct DatabaseInner {
@@ -128,8 +305,21 @@ struct DatabaseInner {
     journal: Arc<dyn NodeStoreJournal>,
     earliest_ledger_seq: u32,
     request_bundle: usize,
+    read_queue_key_limit: usize,
+    read_queue_callback_limit: usize,
+    read_queue_byte_limit: usize,
     node_object_cache: NodeObjectCache,
     read_state: Mutex<ReadState>,
+    /// Queued plus worker-owned logical work items. It is reserved before a
+    /// request enters the BTreeMap and released only after terminal delivery.
+    outstanding_read_callbacks: AtomicUsize,
+    /// Reservation for the concrete work-object allocation plus its queue
+    /// record. It is paired one-for-one with `ReadWorkPermit`, not inferred
+    /// from the callback count.
+    outstanding_read_bytes: AtomicUsize,
+    read_queue_rejected: AtomicU64,
+    read_callbacks_cancelled: AtomicU64,
+    store_generation: AtomicU64,
     read_condvar: Condvar,
     read_stopping: AtomicBool,
     live_threads: AtomicUsize,
@@ -287,6 +477,29 @@ impl DatabaseRuntime {
         }
 
         let node_object_cache = NodeObjectCache::from_config(config)?;
+        let default_read_queue_budget =
+            default_read_queue_budget(read_threads, request_bundle as usize)?;
+        // Explicit operator settings may narrow or expand this shared logical
+        // budget. Without them, queued keys and logical callbacks are both
+        // bounded by worker concurrency times the configured request bundle.
+        let read_queue_key_limit = get(config, "read_queue_max_keys", default_read_queue_budget);
+        let read_queue_callback_limit = get(
+            config,
+            "read_queue_max_callbacks",
+            default_read_queue_budget,
+        );
+        let default_read_queue_byte_limit = read_queue_callback_limit
+            .checked_mul(std::mem::size_of::<AsyncReadRequest>() + DEFAULT_ASYNC_READ_WORK_BYTES)
+            .ok_or_else(|| "NodeStore async read queue byte budget overflow".to_owned())?;
+        let read_queue_byte_limit = get(
+            config,
+            "read_queue_max_bytes",
+            default_read_queue_byte_limit,
+        );
+        if read_queue_key_limit == 0 || read_queue_callback_limit == 0 || read_queue_byte_limit == 0
+        {
+            return Err("NodeStore async read queue limits must be nonzero".to_owned());
+        }
 
         let inner = Arc::new(DatabaseInner {
             delegate,
@@ -294,8 +507,18 @@ impl DatabaseRuntime {
             journal,
             earliest_ledger_seq,
             request_bundle: request_bundle as usize,
+            read_queue_key_limit,
+            read_queue_callback_limit,
+            read_queue_byte_limit,
             node_object_cache,
             read_state: Mutex::new(ReadState::default()),
+            outstanding_read_callbacks: AtomicUsize::new(0),
+            outstanding_read_bytes: AtomicUsize::new(0),
+            read_queue_rejected: AtomicU64::new(0),
+            read_callbacks_cancelled: AtomicU64::new(0),
+            // Generation zero remains reserved for legacy/unwired callers;
+            // all storage handoff consumers observe a real nonzero value.
+            store_generation: AtomicU64::new(1),
             read_condvar: Condvar::new(),
             read_stopping: AtomicBool::new(false),
             live_threads: AtomicUsize::new(read_threads.max(1)),
@@ -346,22 +569,79 @@ impl DatabaseRuntime {
             .fetch_node_object(hash, ledger_seq, fetch_type, duplicate)
     }
 
-    pub fn async_fetch(&self, hash: Uint256, ledger_seq: u32, callback: AsyncFetchCallback) {
-        let mut read_state = self
-            .inner
-            .read_state
-            .lock()
-            .expect("nodestore read queue mutex must not be poisoned");
-        if !self.inner.is_stopping() {
-            read_state
-                .queue
-                .entry(hash)
-                .or_default()
-                .push(AsyncReadRequest {
-                    ledger_seq,
-                    callback,
-                });
-            self.inner.read_condvar.notify_one();
+    pub fn schedule_write(&self, write: ScheduledWrite) {
+        // Reject after stop instead of leaving an accepted persistence ticket
+        // in an executor that can no longer run it. Dropping `write` invokes
+        // the caller's completion guard exactly once.
+        if self.inner.is_stopping() {
+            return;
+        }
+        let task: Arc<dyn Task> = Arc::new(ScheduledWriteTask::new(write));
+        if !self.inner.scheduler.try_schedule_task(Arc::clone(&task)) {
+            // Dropping the sole task Arc settles its write closure/guard.
+            drop(task);
+        }
+    }
+
+    pub fn async_fetch(&self, hash: Uint256, ledger_seq: u32, work: Box<dyn AsyncReadWork>) {
+        // This is measured from the concrete erased object, rather than a
+        // caller-supplied estimate. `AsyncReadWork` is the stable agent-facing
+        // handoff: the only retained completion payload must be its fixed-size
+        // typed owner plus a NodeStore-issued permit.
+        let work_bytes = std::mem::size_of_val(work.as_ref())
+            .saturating_add(std::mem::size_of::<AsyncReadRequest>());
+        let rejected = {
+            let mut read_state = self
+                .inner
+                .read_state
+                .lock()
+                .expect("nodestore read queue mutex must not be poisoned");
+            let new_hash = !read_state.queue.contains_key(&hash);
+            let full = new_hash && read_state.queue.len() >= self.inner.read_queue_key_limit;
+            let callbacks_full = self
+                .inner
+                .outstanding_read_callbacks
+                .load(Ordering::Acquire)
+                >= self.inner.read_queue_callback_limit;
+            let bytes_full = self
+                .inner
+                .outstanding_read_bytes
+                .load(Ordering::Acquire)
+                .checked_add(work_bytes)
+                .is_none_or(|total| total > self.inner.read_queue_byte_limit);
+            if self.inner.is_stopping() || full || callbacks_full || bytes_full {
+                self.inner
+                    .read_queue_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(work)
+            } else {
+                self.inner
+                    .outstanding_read_callbacks
+                    .fetch_add(1, Ordering::AcqRel);
+                self.inner
+                    .outstanding_read_bytes
+                    .fetch_add(work_bytes, Ordering::AcqRel);
+                read_state
+                    .queue
+                    .entry(hash)
+                    .or_default()
+                    .push(AsyncReadRequest {
+                        ledger_seq,
+                        work,
+                        _permit: ReadWorkPermit {
+                            inner: Arc::clone(&self.inner),
+                            bytes: work_bytes,
+                        },
+                    });
+                self.inner.read_condvar.notify_one();
+                None
+            }
+        };
+        if let Some(work) = rejected {
+            self.inner
+                .read_callbacks_cancelled
+                .fetch_add(1, Ordering::Relaxed);
+            deliver_rejected_async_work(&self.inner, work);
         }
     }
 
@@ -369,9 +649,9 @@ impl DatabaseRuntime {
         let mut batch = Vec::with_capacity(batch_write_preallocation_size);
         let store_batch = |batch: &mut Vec<Arc<NodeObject>>| {
             let begin = Instant::now();
-            let result = catch_unwind(AssertUnwindSafe(|| dst_backend.store_batch(batch)));
+            let result = catch_unwind(AssertUnwindSafe(|| dst_backend.store_batch_result(batch)));
             match result {
-                Ok(()) => {
+                Ok(Ok(())) => {
                     let size = batch
                         .iter()
                         .map(|node_object| node_object.data().len() as u64)
@@ -386,6 +666,14 @@ impl DatabaseRuntime {
                         .store_duration_us
                         .fetch_add(begin.elapsed().as_micros() as u64, Ordering::Relaxed);
                     batch.clear();
+                }
+                Ok(Err(error)) => {
+                    // Preserve the batch so callers that retry the import do
+                    // not silently skip objects rejected by the destination.
+                    self.inner.journal.log(
+                        JournalLevel::Error,
+                        &format!("import_internal batch write failed: {error}"),
+                    );
                 }
                 Err(payload) => {
                     // Mirror reference importInternal: keep the batch intact when the
@@ -427,13 +715,24 @@ impl DatabaseRuntime {
                     JournalLevel::Debug,
                     "Clearing read queue because of stop request",
                 );
-                read_state.queue.clear();
+                let callbacks = std::mem::take(&mut read_state.queue)
+                    .into_values()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                (first_stop, callbacks)
+            } else {
+                (first_stop, Vec::new())
             }
-            first_stop
         };
 
-        if first_stop {
+        if first_stop.0 {
             self.inner.read_condvar.notify_all();
+            for request in first_stop.1 {
+                self.inner
+                    .read_callbacks_cancelled
+                    .fetch_add(1, Ordering::Relaxed);
+                deliver_async_work(&self.inner, request, None);
+            }
         }
 
         self.inner.journal.log(
@@ -555,6 +854,29 @@ impl DatabaseRuntime {
         JsonValue::Object(obj)
     }
 
+    pub fn read_queue_snapshot(&self) -> ReadQueueSnapshot {
+        let queued_keys = self
+            .inner
+            .read_state
+            .lock()
+            .expect("nodestore read queue mutex must not be poisoned")
+            .queue
+            .len();
+        ReadQueueSnapshot {
+            queued_keys,
+            outstanding_callbacks: self
+                .inner
+                .outstanding_read_callbacks
+                .load(Ordering::Acquire),
+            outstanding_bytes: self.inner.outstanding_read_bytes.load(Ordering::Acquire),
+            key_limit: self.inner.read_queue_key_limit,
+            callback_limit: self.inner.read_queue_callback_limit,
+            byte_limit: self.inner.read_queue_byte_limit,
+            rejected: self.inner.read_queue_rejected.load(Ordering::Relaxed),
+            cancelled: self.inner.read_callbacks_cancelled.load(Ordering::Relaxed),
+        }
+    }
+
     pub(crate) fn store_stats(&self, count: u64, size: u64) {
         self.inner.store_stats(count, size);
     }
@@ -565,6 +887,31 @@ impl DatabaseRuntime {
 
     pub(crate) fn invalidate_node_object_cache(&self) {
         self.inner.node_object_cache.invalidate_all();
+    }
+
+    /// Advance before a rotation changes which durable backend pairing owns a
+    /// read. The returned value is never zero and is safe to retain in a
+    /// `ReadKey` or persistence acknowledgement identity.
+    pub(crate) fn advance_store_generation(&self) -> u64 {
+        let mut observed = self.inner.store_generation.load(Ordering::Acquire);
+        loop {
+            let next = observed
+                .checked_add(1)
+                .expect("NodeStore storage generation overflow");
+            match self.inner.store_generation.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return next,
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    pub fn store_generation(&self) -> u64 {
+        self.inner.store_generation.load(Ordering::Acquire)
     }
 
     pub fn journal(&self) -> Arc<dyn NodeStoreJournal> {
@@ -623,21 +970,69 @@ fn worker_loop(inner: Arc<DatabaseInner>) {
             }
 
             let seqn = requests[0].ledger_seq;
-            let first = inner.fetch_node_object(&hash, seqn, FetchType::Async, false);
+            let first = if inner.is_stopping() {
+                None
+            } else {
+                catch_unwind(AssertUnwindSafe(|| {
+                    inner.fetch_node_object(&hash, seqn, FetchType::Async, false)
+                }))
+                .unwrap_or_else(|_| {
+                    inner.journal.log(
+                        JournalLevel::Error,
+                        "NodeStore async read fault; cancelling logical callbacks",
+                    );
+                    None
+                })
+            };
             for request in requests {
-                let result = if request.ledger_seq == seqn
+                let result = if inner.is_stopping() {
+                    None
+                } else if request.ledger_seq == seqn
                     || inner.delegate.is_same_db(request.ledger_seq, seqn)
                 {
                     first.clone()
                 } else {
-                    inner.fetch_node_object(&hash, request.ledger_seq, FetchType::Async, false)
+                    catch_unwind(AssertUnwindSafe(|| {
+                        inner.fetch_node_object(&hash, request.ledger_seq, FetchType::Async, false)
+                    }))
+                    .unwrap_or(None)
                 };
-                (request.callback)(result);
+                if result.is_none() && inner.is_stopping() {
+                    inner
+                        .read_callbacks_cancelled
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                deliver_async_work(&inner, request, result);
             }
         }
     }
 
     inner.running_threads.fetch_sub(1, Ordering::Relaxed);
+}
+
+fn deliver_rejected_async_work(inner: &Arc<DatabaseInner>, mut work: Box<dyn AsyncReadWork>) {
+    if catch_unwind(AssertUnwindSafe(|| work.complete(None))).is_err() {
+        inner.journal.log(
+            JournalLevel::Error,
+            "NodeStore rejected async read work panicked after terminal delivery",
+        );
+    }
+}
+
+fn deliver_async_work(
+    inner: &Arc<DatabaseInner>,
+    mut request: AsyncReadRequest,
+    result: Option<Arc<NodeObject>>,
+) {
+    let _guard = AsyncCallbackGuard {
+        inner: Arc::clone(inner),
+    };
+    if catch_unwind(AssertUnwindSafe(|| request.work.complete(result))).is_err() {
+        inner.journal.log(
+            JournalLevel::Error,
+            "NodeStore async read work panicked after terminal delivery",
+        );
+    }
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> String {
@@ -712,14 +1107,18 @@ mod tests {
             keys,
             vec![
                 "node_object_cache_capacity_bytes",
+                "node_object_cache_capacity_bytes_is_estimate",
+                "node_object_cache_capacity_entries",
                 "node_object_cache_durable_loads",
                 "node_object_cache_entries",
                 "node_object_cache_hits",
+                "node_object_cache_idle_seconds",
                 "node_object_cache_invalidations",
                 "node_object_cache_misses",
                 "node_object_cache_oversized",
                 "node_object_cache_promotions",
                 "node_object_cache_rejected",
+                "node_object_cache_ttl_seconds",
                 "node_read_bytes",
                 "node_reads_duration_us",
                 "node_reads_hit",
@@ -733,6 +1132,14 @@ mod tests {
             ]
         );
         assert_eq!(counts.get("read_queue"), Some(&JsonValue::Unsigned(0)));
+        assert_eq!(
+            counts.get("node_object_cache_capacity_entries"),
+            Some(&JsonValue::String("1000000".to_owned()))
+        );
+        assert_eq!(
+            counts.get("node_object_cache_capacity_bytes_is_estimate"),
+            Some(&JsonValue::Bool(true))
+        );
         assert!(matches!(
             counts.get("read_threads_total"),
             Some(JsonValue::Signed(value)) if *value >= 1
@@ -883,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn node_object_cache_does_not_negative_cache_misses() {
+    fn node_object_cache_does_not_negative_cache_untyped_misses() {
         let hash = Uint256::from_array([0xC3; 32]);
         let delegate = Arc::new(CountingDelegate {
             object: None,
@@ -1020,11 +1427,12 @@ mod tests {
                 (Vec::new(), Status::Ok)
             }
 
-            fn store(&self, object: Arc<NodeObject>) {
+            fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
                 self.imported
                     .lock()
                     .expect("recording backend mutex must not be poisoned")
                     .push(object);
+                Ok(())
             }
 
             fn store_batch(&self, batch: &crate::Batch) {

@@ -66,6 +66,7 @@ fn queue_entry() -> TxDetails<Arc<STTx>, AccountID> {
         seq_proxy: SeqProxy::sequence(11),
         tx: Arc::new(payment_tx(11)),
         retries_remaining: 4,
+        flags: protocol::ApplyFlags::NONE,
         preflight_result: Ter::TES_SUCCESS,
         last_result: Some(Ter::TER_RETRY),
     }

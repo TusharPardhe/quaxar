@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use app::{
-    ListDisposition, ManifestCache, ManifestDisposition, PublisherStatus, TrustChanges,
-    ValidatorBlobInfo, ValidatorList, ValidatorListClock, validator_list_collection_hash,
+    ListDisposition, ManifestCache, ManifestDisposition, ManifestRateLimitCapPolicy,
+    PublisherStatus, TrustChanges, ValidatorBlobInfo, ValidatorList, ValidatorListClock,
+    deserialize_manifest, validator_list_collection_hash,
 };
 use basics::base_uint::Uint256;
 use basics::base64::base64_encode;
@@ -111,6 +113,190 @@ fn build_validator_list_blob(
         .to_string()
         .as_bytes(),
     )
+}
+
+#[test]
+fn accepted_collection_is_persisted_and_discoverable_as_a_cached_site() {
+    let clock = FixedClock { now_ripple: 40_000 };
+    let data_path = temp_data_path("cache-persistence");
+    let _ = std::fs::remove_dir_all(&data_path);
+    std::fs::create_dir_all(&data_path).expect("cache directory");
+    let list = ValidatorList::new(
+        ManifestCache::new(),
+        ManifestCache::new(),
+        clock,
+        &data_path,
+        None,
+    );
+
+    let publisher_master_secret = SecretKey::from_bytes([41u8; 32]);
+    let publisher_signing_secret = SecretKey::from_bytes([42u8; 32]);
+    let (publisher_manifest, publisher_master, publisher_signing) = manifest_blob(
+        &publisher_master_secret,
+        KeyType::Ed25519,
+        &publisher_signing_secret,
+        KeyType::Secp256k1,
+        1,
+    );
+    assert!(list.load(None, &[], &[publisher_master.to_hex()], None));
+
+    let validator_master_secret = SecretKey::from_bytes([43u8; 32]);
+    let validator_signing_secret = SecretKey::from_bytes([44u8; 32]);
+    let (validator_manifest, validator_master, _) = manifest_blob(
+        &validator_master_secret,
+        KeyType::Ed25519,
+        &validator_signing_secret,
+        KeyType::Secp256k1,
+        1,
+    );
+    let blob = build_validator_list_blob(
+        1,
+        u64::from(clock.now_ripple()) + 3600,
+        validator_master,
+        &validator_manifest,
+    );
+    let signature = sign_list(&blob, &publisher_signing, &publisher_signing_secret);
+    let blobs = vec![ValidatorBlobInfo {
+        blob,
+        signature,
+        manifest: None,
+    }];
+    assert_eq!(
+        list.apply_lists(
+            &publisher_manifest,
+            1,
+            &blobs,
+            "https://vl.example/list".to_owned(),
+            Some(validator_list_collection_hash(
+                &publisher_manifest,
+                1,
+                &blobs
+            )),
+        )
+        .best_disposition(),
+        ListDisposition::Accepted
+    );
+
+    let cache_file = data_path.join(format!("cache.{}", publisher_master.to_hex()));
+    let cached_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cache_file).expect("cached list file"))
+            .expect("cached list json");
+    assert_eq!(cached_json["refresh_interval"], serde_json::json!(24 * 60));
+    assert_eq!(cached_json["version"], serde_json::json!(1));
+    assert_eq!(
+        cached_json["manifest"],
+        serde_json::json!(publisher_manifest)
+    );
+
+    let restored = ValidatorList::new(
+        ManifestCache::new(),
+        ManifestCache::new(),
+        clock,
+        &data_path,
+        None,
+    );
+    assert!(restored.load(None, &[], &[publisher_master.to_hex()], None));
+    let cached = restored.load_lists();
+    assert_eq!(cached.len(), 1);
+    assert!(cached[0].starts_with("file://"));
+    let _ = std::fs::remove_dir_all(&data_path);
+}
+
+#[test]
+fn listing_a_capped_manifest_releases_its_untrusted_capacity_slot() {
+    let clock = FixedClock { now_ripple: 50_000 };
+    let validator_manifests = Arc::new(ManifestCache::new());
+    let list = ValidatorList::new_with_shared_caches(
+        Arc::clone(&validator_manifests),
+        Arc::new(ManifestCache::new()),
+        clock,
+        temp_data_path("promote-capacity"),
+        None,
+    );
+
+    let publisher_master_secret = SecretKey::from_bytes([151u8; 32]);
+    let publisher_signing_secret = SecretKey::from_bytes([152u8; 32]);
+    let (publisher_manifest, publisher_master, publisher_signing) = manifest_blob(
+        &publisher_master_secret,
+        KeyType::Ed25519,
+        &publisher_signing_secret,
+        KeyType::Secp256k1,
+        1,
+    );
+    assert!(list.load(None, &[], &[publisher_master.to_hex()], None));
+
+    let mut promoted = None;
+    let mut promoted_manifest = None;
+    for fill in 1u8..=100 {
+        let master_secret = SecretKey::from_bytes([fill; 32]);
+        let signing_secret = SecretKey::from_bytes([fill.saturating_add(100); 32]);
+        let (encoded, master, _) = manifest_blob(
+            &master_secret,
+            KeyType::Ed25519,
+            &signing_secret,
+            KeyType::Secp256k1,
+            1,
+        );
+        let manifest = deserialize_manifest(&basics::base64::base64_decode(&encoded))
+            .expect("capped manifest should deserialize");
+        assert_eq!(
+            validator_manifests
+                .apply_manifest_with_policy(manifest, ManifestRateLimitCapPolicy::Capped,),
+            ManifestDisposition::Accepted
+        );
+        if fill == 1 {
+            promoted = Some(master);
+            promoted_manifest = Some(encoded);
+        }
+    }
+
+    let overflow_master_secret = SecretKey::from_bytes([201u8; 32]);
+    let overflow_signing_secret = SecretKey::from_bytes([202u8; 32]);
+    let (overflow_encoded, _, _) = manifest_blob(
+        &overflow_master_secret,
+        KeyType::Ed25519,
+        &overflow_signing_secret,
+        KeyType::Secp256k1,
+        1,
+    );
+    let overflow = deserialize_manifest(&basics::base64::base64_decode(&overflow_encoded))
+        .expect("overflow manifest should deserialize");
+    assert_eq!(
+        validator_manifests
+            .apply_manifest_with_policy(overflow.clone(), ManifestRateLimitCapPolicy::Capped,),
+        ManifestDisposition::UntrustedCapacity
+    );
+
+    let promoted = promoted.expect("first capped manifest");
+    let blob = build_validator_list_blob(
+        1,
+        u64::from(clock.now_ripple()) + 3600,
+        promoted,
+        &promoted_manifest.expect("first capped manifest encoding"),
+    );
+    let signature = sign_list(&blob, &publisher_signing, &publisher_signing_secret);
+    let blobs = vec![ValidatorBlobInfo {
+        blob,
+        signature,
+        manifest: None,
+    }];
+    assert_eq!(
+        list.apply_lists(
+            &publisher_manifest,
+            1,
+            &blobs,
+            "https://vl.example/list".to_owned(),
+            None,
+        )
+        .best_disposition(),
+        ListDisposition::Accepted
+    );
+    assert_eq!(
+        validator_manifests
+            .apply_manifest_with_policy(overflow, ManifestRateLimitCapPolicy::Capped),
+        ManifestDisposition::Accepted,
+        "a listed master key must no longer consume an untrusted capacity slot"
+    );
 }
 
 #[test]

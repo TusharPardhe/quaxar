@@ -23,7 +23,11 @@ use overlay::{ProtocolMessage, ProtocolPayload, TmGetLedger, TmGetObjectByHash};
 use protocol::JsonValue;
 use shamap::family::{FullBelowCache, MissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
 use shamap::fetch::SHAMapSyncFilter;
-use shamap::sync::{MissingNodeRef, SHAMapAddNode, SHAMapMissingNode, SHAMapType, SyncTree};
+use shamap::sync::{
+    DeferredMissingNodeScanStats, MissingNodeAdvance, MissingNodeContinuation, MissingNodePlanId,
+    MissingNodeReadApply, MissingNodeReadOutcome, MissingNodeRef, MissingNodeResidentLookup,
+    ReadNeed, SHAMapAddNode, SHAMapMissingNode, SHAMapType, SyncTree,
+};
 use std::collections::BTreeMap;
 use std::hash::BuildHasher;
 use time::Duration;
@@ -57,29 +61,304 @@ fn next_missing_scan_first_child() -> u8 {
 
 // Acquisition constants
 const INBOUND_LEDGER_TIMEOUT_RETRIES_MAX: u32 = 6;
-const INBOUND_LEDGER_BECOME_AGGRESSIVE: u32 = 4;
+/// Match rippled's `InboundLedger::trigger` switch to `TMGetObjectByHash`.
+/// Retained actor plans use this same threshold when they re-advertise an
+/// already verified network frontier after a timeout.
+pub const INBOUND_LEDGER_BECOME_AGGRESSIVE: u32 = 4;
+
+/// The protocol deliberately becomes aggressive only *after* the fourth
+/// no-progress timeout, not at it.
+pub const fn uses_aggressive_by_hash_timeout(timeouts: u32) -> bool {
+    timeouts > INBOUND_LEDGER_BECOME_AGGRESSIVE
+}
 const MISSING_NODES_FIND: i32 = 256;
 const REQ_NODES_REPLY: usize = 128;
 const REQ_NODES: usize = 12;
 
+/// Stable identity of one tree traversal. A replacement header/root gets a
+/// new ID; ordinary yields, packets, and timer events retain the same ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TreePlanId(u64);
+
+impl TreePlanId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeKind {
+    State,
+    Transaction,
+}
+
+/// Actor-neutral result from one bounded tree-plan CPU turn. It deliberately
+/// contains work commands, never a NodeStore callback or peer send.
+#[derive(Debug, Clone)]
+pub enum TreeAdvance {
+    Ready,
+    NeedsReads(Vec<ReadNeed>),
+    NeedsNetwork(Vec<(shamap::node_id::SHAMapNodeId, Uint256)>),
+    Complete,
+    Invalid,
+}
+
+/// Retained plan state used by the inbound actor. It owns no database or
+/// network reference, so callers must submit its returned work only after
+/// releasing actor/planner mutation.
+#[derive(Debug, Clone)]
+pub struct TreePlan {
+    id: TreePlanId,
+    kind: TreeKind,
+    root_hash: SHAMapHash,
+    continuation: MissingNodeContinuation,
+    requested_recent: std::collections::BTreeSet<Uint256>,
+}
+
+impl TreePlan {
+    pub fn new<R>(
+        id: TreePlanId,
+        kind: TreeKind,
+        tree: &SyncTree,
+        root_hash: SHAMapHash,
+        max_missing: i32,
+        full_below_generation: u32,
+        next_first_child: &mut R,
+    ) -> Self
+    where
+        R: FnMut() -> u8,
+    {
+        Self {
+            id,
+            kind,
+            root_hash,
+            continuation: tree.start_missing_node_continuation(
+                MissingNodePlanId::new(id.get()),
+                max_missing,
+                full_below_generation,
+                next_first_child,
+            ),
+            requested_recent: std::collections::BTreeSet::new(),
+        }
+    }
+
+    pub const fn id(&self) -> TreePlanId {
+        self.id
+    }
+
+    pub const fn kind(&self) -> TreeKind {
+        self.kind
+    }
+
+    pub fn root_hash(&self) -> SHAMapHash {
+        self.root_hash
+    }
+
+    pub fn pending_hashes(&self) -> usize {
+        self.continuation.pending_hashes()
+    }
+
+    pub fn pending_edges(&self) -> usize {
+        self.continuation.pending_edges()
+    }
+
+    /// Fixed-size retained edge payload still owned by this plan. This is
+    /// intentionally separate from broker ticket accounting.
+    pub fn pending_edge_bytes(&self) -> usize {
+        self.continuation.pending_edge_bytes()
+    }
+
+    /// True when the continuation reached its retained-edge owner bound and
+    /// must wait for a read or peer result rather than another CPU turn.
+    pub fn is_pending_edge_limited(&self) -> bool {
+        self.continuation.is_pending_edge_limited()
+    }
+
+    /// True only while an actor CPU turn can make progress without a broker
+    /// completion or peer response. Pending read/network edges intentionally
+    /// do not make a plan runnable.
+    pub fn has_runnable_frontier(&self) -> bool {
+        self.continuation.has_runnable_frontier()
+    }
+
+    /// Total branch selections consumed by the retained continuation. Actor
+    /// scheduling uses this to reject a `Ready` result that made no CPU
+    /// progress instead of manufacturing another worker turn.
+    pub fn branch_steps(&self) -> u64 {
+        self.continuation.stats().branch_steps
+    }
+
+    /// Immutable cumulative diagnostics for the retained continuation. The
+    /// acquisition actor samples this around every bounded turn and publishes
+    /// deltas through `fetch_info` without walking the tree.
+    pub fn scan_stats(&self) -> DeferredMissingNodeScanStats {
+        self.continuation.stats()
+    }
+
+    pub fn advance<L, R>(
+        &mut self,
+        max_branch_steps: usize,
+        max_new_reads: usize,
+        resident: &mut L,
+        next_first_child: &mut R,
+    ) -> TreeAdvance
+    where
+        L: MissingNodeResidentLookup,
+        R: FnMut() -> u8,
+    {
+        match self
+            .continuation
+            .advance(max_branch_steps, max_new_reads, resident, next_first_child)
+        {
+            MissingNodeAdvance::Ready => TreeAdvance::Ready,
+            MissingNodeAdvance::NeedsReads(reads) => TreeAdvance::NeedsReads(reads),
+            MissingNodeAdvance::NeedsNetwork(nodes) => TreeAdvance::NeedsNetwork(nodes),
+            MissingNodeAdvance::Complete => TreeAdvance::Complete,
+            MissingNodeAdvance::Invalid => TreeAdvance::Invalid,
+        }
+    }
+
+    /// Advance until a natural local-read/network boundary or a contested
+    /// scheduler yield. This retains traversal state across async NodeStore
+    /// completion without reintroducing an actor-local branch budget.
+    pub fn advance_with_yield<L, R, Y>(
+        &mut self,
+        max_new_reads: usize,
+        resident: &mut L,
+        next_first_child: &mut R,
+        should_yield: &mut Y,
+    ) -> TreeAdvance
+    where
+        L: MissingNodeResidentLookup,
+        R: FnMut() -> u8,
+        Y: FnMut() -> bool,
+    {
+        match self.continuation.advance_with_yield(
+            max_new_reads,
+            resident,
+            next_first_child,
+            should_yield,
+        ) {
+            MissingNodeAdvance::Ready => TreeAdvance::Ready,
+            MissingNodeAdvance::NeedsReads(reads) => TreeAdvance::NeedsReads(reads),
+            MissingNodeAdvance::NeedsNetwork(nodes) => TreeAdvance::NeedsNetwork(nodes),
+            MissingNodeAdvance::Complete => TreeAdvance::Complete,
+            MissingNodeAdvance::Invalid => TreeAdvance::Invalid,
+        }
+    }
+
+    /// Take a bounded batch of read needs previously discovered by an earlier
+    /// scan without consuming another branch-selection turn.
+    pub fn take_read_admission_batch(&mut self, max_new_reads: usize) -> Vec<ReadNeed> {
+        self.continuation.take_unannounced_reads(max_new_reads)
+    }
+
+    pub fn apply_read_result(
+        &mut self,
+        plan_id: TreePlanId,
+        hash: SHAMapHash,
+        outcome: MissingNodeReadOutcome,
+    ) -> MissingNodeReadApply {
+        self.continuation
+            .apply_read_result(MissingNodePlanId::new(plan_id.get()), hash, outcome)
+    }
+
+    pub fn apply_network_node(
+        &mut self,
+        plan_id: TreePlanId,
+        hash: SHAMapHash,
+        node: basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>,
+    ) -> MissingNodeReadApply {
+        self.continuation
+            .apply_network_node(MissingNodePlanId::new(plan_id.get()), hash, node)
+    }
+
+    pub fn apply_known_network_node(
+        &mut self,
+        plan_id: TreePlanId,
+        node_id: shamap::node_id::SHAMapNodeId,
+        hash: SHAMapHash,
+        node: basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>,
+    ) -> MissingNodeReadApply {
+        self.continuation.apply_known_network_node(
+            MissingNodePlanId::new(plan_id.get()),
+            node_id,
+            hash,
+            node,
+        )
+    }
+
+    /// Give a useful Reply trigger the same fresh missing-node discovery
+    /// budget as rippled's new `getMissingNodes(256)` invocation.
+    pub fn begin_reply_scan(&mut self) {
+        self.continuation
+            .begin_reply_scan(&mut next_missing_scan_first_child);
+    }
+
+    pub fn retain_network_hashes(&mut self, hashes: impl IntoIterator<Item = SHAMapHash>) {
+        self.continuation.retain_network_hashes(hashes);
+    }
+
+    pub fn rearm_pending_reads(&mut self) {
+        self.continuation.rearm_pending_reads();
+    }
+
+    pub fn network_candidates(&self) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)> {
+        self.continuation.network_candidates()
+    }
+
+    /// Drain newly announced candidates created by local misses without a
+    /// second traversal pass.
+    pub fn take_network_candidates(&mut self) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)> {
+        self.continuation.take_unannounced_network()
+    }
+
+    /// Return candidates excluded by an outbound serialization limit to the
+    /// plan's immediate continuation frontier.
+    pub fn restore_network_candidates(
+        &mut self,
+        candidates: Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
+    ) {
+        self.continuation.restore_unannounced_network(candidates);
+    }
+
+    pub fn retry_network_candidate(&mut self, hash: SHAMapHash) -> bool {
+        self.continuation.retry_network_candidate(hash)
+    }
+
+    /// Recent-request suppression belongs to the plan, not a global scan epoch.
+    pub fn mark_request_candidate(&mut self, hash: Uint256) -> bool {
+        self.requested_recent.insert(hash)
+    }
+
+    pub fn clear_recent_requests(&mut self) {
+        self.requested_recent.clear();
+    }
+}
+
 fn full_sync_debug_enabled() -> bool {
-    std::env::var("XRPLD_FULL_SYNC_DEBUG")
+    std::env::var("QUAXAR_FULL_SYNC_DEBUG")
         .map(|value| value != "0")
         .unwrap_or(false)
 }
 
 fn acq_packet_debug_enabled() -> bool {
-    std::env::var("XRPLD_ACQ_PACKET_DEBUG")
+    std::env::var("QUAXAR_ACQ_PACKET_DEBUG")
         .map(|value| value != "0")
         .unwrap_or(false)
 }
 
 fn acq_packet_debug_verbose_enabled() -> bool {
-    std::env::var("XRPLD_ACQ_PACKET_DEBUG_VERBOSE")
+    std::env::var("QUAXAR_ACQ_PACKET_DEBUG_VERBOSE")
         .map(|value| value != "0")
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)] // debug-only request-shape logger
 fn log_acq_request_nodes(
     seq: u32,
     map: &str,
@@ -151,7 +430,7 @@ pub fn make_get_ledger_with_node_ids(
         node_i_ds: node_ids.iter().map(|id| id.get_raw_string()).collect(),
         request_cookie: None,
         query_type,
-        query_depth: Some(query_depth),
+        query_depth: (itype != TM_GET_LEDGER_BASE).then_some(query_depth),
     }))
 }
 
@@ -225,8 +504,12 @@ impl InboundLedgerPacket {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundLedgerPacketError {
     EmptyNodes,
+    EmptyNodeData,
     InvalidHeader,
     MissingNodeId,
+    InvalidNodeId,
+    InvalidNodeData,
+    InvalidData,
 }
 
 /// Result of processing a bounded contiguous range of an inbound packet.
@@ -265,7 +548,21 @@ impl InboundLedgerPacketShape {
             ..Self::default()
         };
 
-        for node in &packet.nodes {
+        for (index, node) in packet.nodes.iter().enumerate() {
+            // rippled `PeerImp::sendLedgerBase` puts a raw LedgerHeader in
+            // slot 0, then optional state/transaction roots from
+            // `SHAMap::serializeRoot`, which calls `serializeForWire`.
+            if packet.packet_type == InboundLedgerDataType::Base {
+                if index == 0 {
+                    continue;
+                }
+                match SHAMapTreeNode::make_from_wire(&node.node_data) {
+                    Ok(Some(decoded)) if decoded.is_inner() => shape.inner_nodes += 1,
+                    Ok(Some(_)) => shape.leaf_nodes += 1,
+                    Ok(None) | Err(_) => shape.malformed_nodes += 1,
+                }
+                continue;
+            }
             if node.node_data.is_empty() {
                 shape.empty_nodes += 1;
                 continue;
@@ -318,10 +615,19 @@ pub struct InboundLedgerPeerScore {
 pub struct InboundLedgerRunDataResult {
     pub triggered_peer_ids: Vec<u64>,
     pub processed_packets: usize,
+    pub useful_packets: usize,
+    pub useful_nodes: u64,
+    pub state_packets: usize,
+    pub state_useful_nodes: u64,
+    pub state_duplicate_nodes: u64,
     pub max_useful_count: i32,
     pub packet_stats: Vec<InboundLedgerPacketDebugStats>,
     /// Packets that rippled charges as malformed, with their source peer.
     pub malformed_packets: Vec<(u64, InboundLedgerDataType, InboundLedgerPacketError)>,
+    /// Packets containing data that decoded structurally but failed SHAMap
+    /// validation, with their source peer. This is charged separately from
+    /// malformed input as rippled `kFeeInvalidData`.
+    pub invalid_packets: Vec<(u64, InboundLedgerDataType, InboundLedgerPacketError)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -450,34 +756,17 @@ where
     }
 }
 
-/// Parameters captured before releasing the acquisition lock for the state map
-/// walk, mirroring rippled's `InboundLedger.cpp:620-622` unlock pattern.
-pub struct StateScanParams {
-    pub missing_limit: i32,
-    pub map_hash: SHAMapHash,
-    pub reason: InboundLedgerRequestTrigger,
-    pub query_depth: u32,
-    pub query_type: Option<i32>,
-    pub have_state: bool,
-}
-
-/// Parameters captured before releasing the acquisition lock for the tx map
-/// walk, mirroring rippled's `InboundLedger.cpp:620-622` unlock pattern.
-pub struct TxScanParams {
-    pub missing_limit: i32,
-    pub map_hash: SHAMapHash,
-    pub reason: InboundLedgerRequestTrigger,
-    pub query_depth: u32,
-    pub query_type: Option<i32>,
-    pub have_transactions: bool,
-}
-
-/// Result of `prepare_trigger` — bundles everything the caller needs to
-/// orchestrate the lock-release pattern around the expensive map walks.
+/// Result of `prepare_trigger` — it emits peer commands and identifies which
+/// retained actor-owned tree plan may begin after local probe resolution.
 pub struct TriggerSetup {
-    pub state_scan: Option<StateScanParams>,
-    pub tx_scan: Option<TxScanParams>,
+    /// The state tree has a locally installed root and must start one actor
+    /// owned `TreePlan`; it is never a detached synchronous scan.
+    pub state_plan: bool,
+    pub tx_plan: bool,
     pub messages_to_send: Vec<ProtocolMessage>,
+    /// True when setup already emitted a state-root or by-hash request and
+    /// rippled would return before considering transaction work.
+    pub state_request_pending: bool,
     pub complete: bool,
 }
 
@@ -575,8 +864,92 @@ impl InboundLedgerLocal {
         self.ledger.as_mut()
     }
 
+    /// Consumes the materialized ledger, yielding ownership exactly once.
+    /// Returns `None` after the first call or before a ledger is materialized.
+    /// The durable handoff uses this so the completed ledger is moved (not
+    /// cloned) into the coordinator's handoff effect.
+    pub fn take_ledger(&mut self) -> Option<Ledger> {
+        self.ledger.take()
+    }
+
     pub fn planner_state(&self) -> InboundLedgerPlannerState {
         self.planner_state
+    }
+
+    /// Create one retained, actor-owned traversal for a tree that is already
+    /// rooted locally. The plan owns only traversal state; NodeStore reads and
+    /// peer requests are deliberately emitted by the application actor after
+    /// it has released its ledger mutation borrow.
+    pub fn start_tree_plan(
+        &self,
+        kind: TreeKind,
+        id: TreePlanId,
+        full_below_generation: u32,
+    ) -> Option<TreePlan> {
+        if self.failed || self.complete {
+            return None;
+        }
+        let ledger = self.ledger.as_ref()?;
+        let (tree, root_hash, already_complete) = match kind {
+            TreeKind::State => (
+                ledger.state_map(),
+                ledger.header().account_hash,
+                self.planner_state.have_state,
+            ),
+            TreeKind::Transaction => (
+                ledger.tx_map(),
+                ledger.header().tx_hash,
+                self.planner_state.have_transactions,
+            ),
+        };
+        (!already_complete && !root_hash.is_zero()).then(|| {
+            TreePlan::new(
+                id,
+                kind,
+                tree,
+                root_hash,
+                MISSING_NODES_FIND,
+                full_below_generation,
+                &mut next_missing_scan_first_child,
+            )
+        })
+    }
+
+    /// Commit a completed actor plan only after its retained traversal has
+    /// verified that there are no missing descendants. This is intentionally
+    /// independent of ordinary packet receipt, so an old plan cannot make a
+    /// newer root look complete.
+    pub fn complete_tree_plan(&mut self, kind: TreeKind) -> bool {
+        let Some(ledger) = self.ledger.as_mut() else {
+            self.failed = true;
+            return false;
+        };
+        let valid = match kind {
+            TreeKind::State => ledger.state_map().is_valid(),
+            TreeKind::Transaction => ledger.tx_map().is_valid(),
+        };
+        if !valid {
+            self.failed = true;
+            self.complete = false;
+            return false;
+        }
+        match kind {
+            TreeKind::State => {
+                ledger.state_map_mut().clear_synching();
+                self.planner_state.have_state = true;
+            }
+            TreeKind::Transaction => {
+                ledger.tx_map_mut().clear_synching();
+                self.planner_state.have_transactions = true;
+            }
+        }
+        if self.planner_state.have_header
+            && self.planner_state.have_state
+            && self.planner_state.have_transactions
+        {
+            self.complete = true;
+        }
+        true
     }
 
     pub fn is_failed(&self) -> bool {
@@ -585,6 +958,11 @@ impl InboundLedgerLocal {
 
     pub fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    /// Current no-progress timeout count, for bounded acquisition diagnostics.
+    pub fn timeout_count(&self) -> u32 {
+        self.timeouts
     }
 
     pub fn set_complete(&mut self) {
@@ -607,19 +985,34 @@ impl InboundLedgerLocal {
         }
     }
 
+    /// Materialize a structurally complete inbound ledger for ownership transfer.
+    ///
+    /// Both the legacy completion queue and the coordinator's post-fence
+    /// durable handoff use this exact finalization: an incomplete, failed, or
+    /// still-synchronizing ledger is never made immutable or full.
+    pub fn finalize_completed_ledger(&mut self) -> bool {
+        if self.failed || !self.complete {
+            return false;
+        }
+        let Some(ledger) = self.ledger.as_mut() else {
+            return false;
+        };
+        if ledger.state_map().is_synching() || ledger.tx_map().is_synching() {
+            return false;
+        }
+        if !ledger.is_immutable() {
+            ledger.set_immutable(false);
+        }
+        ledger.set_full();
+        true
+    }
+
     pub fn accept_completed_ledger(&mut self) -> Option<InboundLedgerCompletionDisposition> {
         let disposition = self.completion_disposition()?;
-        if let InboundLedgerCompletionDisposition::Complete(_) = disposition {
-            let ledger = self
-                .ledger
-                .as_mut()
-                .expect("completed inbound ledger must hold a ledger");
-            if !ledger.is_immutable() {
-                // The acquisition worker only observes completion; the owner
-                // performs the final acceptance step.
-                ledger.set_immutable(false);
-            }
-            ledger.set_full();
+        if let InboundLedgerCompletionDisposition::Complete(_) = disposition
+            && !self.finalize_completed_ledger()
+        {
+            return None;
         }
         Some(disposition)
     }
@@ -642,6 +1035,16 @@ impl InboundLedgerLocal {
     /// Enter the by-hash fallback mode used after a no-progress timeout.
     pub fn set_by_hash(&mut self, by_hash: bool) {
         self.by_hash = by_hash;
+    }
+
+    /// Whether this timeout cycle must use the aggressive by-hash protocol.
+    /// This is intentionally the one predicate shared by ordinary trigger
+    /// setup and the retained TreePlan timeout path.
+    pub fn should_use_aggressive_by_hash(&self) -> bool {
+        self.timeouts > 0
+            && !self.progress
+            && self.by_hash
+            && uses_aggressive_by_hash_timeout(self.timeouts)
     }
 
     /// Clear recent_nodes filter — matches reference onTimer which always clears
@@ -785,12 +1188,15 @@ impl InboundLedgerLocal {
 
         if self.planner_state.have_state && !ledger.header().account_hash.is_zero() {
             let mut missing = Vec::new();
-            ledger.state_map().walk_map_with_family(
-                SHAMapType::State,
-                &mut missing,
-                MISSING_NODES_FIND,
-                family,
-            );
+            {
+                let state_map = ledger.state_map();
+                state_map.walk_map_with_family(
+                    SHAMapType::State,
+                    &mut missing,
+                    MISSING_NODES_FIND,
+                    family,
+                );
+            }
             if !missing.is_empty() {
                 needed.extend(missing_hashes_from_walk(
                     missing,
@@ -803,12 +1209,15 @@ impl InboundLedgerLocal {
 
         if self.planner_state.have_transactions && !ledger.header().tx_hash.is_zero() {
             let mut missing = Vec::new();
-            ledger.tx_map().walk_map_with_family(
-                SHAMapType::Transaction,
-                &mut missing,
-                MISSING_NODES_FIND,
-                family,
-            );
+            {
+                let tx_map = ledger.tx_map();
+                tx_map.walk_map_with_family(
+                    SHAMapType::Transaction,
+                    &mut missing,
+                    MISSING_NODES_FIND,
+                    family,
+                );
+            }
             if !missing.is_empty() {
                 needed.extend(missing_hashes_from_walk(
                     missing,
@@ -1033,6 +1442,13 @@ impl InboundLedgerLocal {
         }
     }
 
+    /// Mark verified non-packet work, such as a matching brokered local read,
+    /// as timeout progress. Callers must invoke this only after the result has
+    /// been hash-validated and attached to the retained plan.
+    pub fn record_verified_progress(&mut self) {
+        self.progress = true;
+    }
+
     pub fn record_packet_stats_with_family_and_config<CLOCK, S, C, F, MR, NS, J>(
         &mut self,
         stats: SHAMapAddNode,
@@ -1112,7 +1528,27 @@ impl InboundLedgerLocal {
                 if let (Some(peer_id), Some(error)) = (entry.peer_id, error) {
                     result.malformed_packets.push((peer_id, packet_type, error));
                 }
+                if let (Some(peer_id), Some(stats)) = (entry.peer_id, san)
+                    && stats.is_invalid()
+                {
+                    result.invalid_packets.push((
+                        peer_id,
+                        packet_type,
+                        InboundLedgerPacketError::InvalidData,
+                    ));
+                }
                 let count = san.map(|san| san.get_good()).unwrap_or(-1);
+                if count > 0 {
+                    result.useful_packets += 1;
+                    result.useful_nodes += count as u64;
+                }
+                if packet_type == InboundLedgerDataType::StateNode {
+                    result.state_packets += 1;
+                    result.state_useful_nodes += count.max(0) as u64;
+                    result.state_duplicate_nodes += san
+                        .map(|stats| stats.get_duplicate().max(0) as u64)
+                        .unwrap_or(0);
+                }
                 {
                     let peer_id = entry.peer_id.unwrap_or(0);
                     let nodes_received = count.max(0) as u32;
@@ -1311,7 +1747,27 @@ impl InboundLedgerLocal {
                 if let (Some(peer_id), Some(error)) = (entry.peer_id, error) {
                     result.malformed_packets.push((peer_id, packet_type, error));
                 }
+                if let (Some(peer_id), Some(stats)) = (entry.peer_id, san)
+                    && stats.is_invalid()
+                {
+                    result.invalid_packets.push((
+                        peer_id,
+                        packet_type,
+                        InboundLedgerPacketError::InvalidData,
+                    ));
+                }
                 let count = san.map(|san| san.get_good()).unwrap_or(-1);
+                if count > 0 {
+                    result.useful_packets += 1;
+                    result.useful_nodes += count as u64;
+                }
+                if packet_type == InboundLedgerDataType::StateNode {
+                    result.state_packets += 1;
+                    result.state_useful_nodes += count.max(0) as u64;
+                    result.state_duplicate_nodes += san
+                        .map(|stats| stats.get_duplicate().max(0) as u64)
+                        .unwrap_or(0);
+                }
                 {
                     let peer_id = entry.peer_id.unwrap_or(0);
                     let nodes_received = count.max(0) as u32;
@@ -1420,10 +1876,12 @@ impl InboundLedgerLocal {
         self.planner_state.have_header = true;
         self.planner_state.have_transactions = ledger.header().tx_hash.is_zero();
         self.planner_state.have_state = self.skip_state || ledger.header().account_hash.is_zero();
-        if !self.skip_state {
+        if !self.planner_state.have_state {
             ledger.state_map_mut().set_synching();
         }
-        ledger.tx_map_mut().set_synching();
+        if !self.planner_state.have_transactions {
+            ledger.tx_map_mut().set_synching();
+        }
         self.ledger = Some(ledger);
         true
     }
@@ -1618,9 +2076,35 @@ impl InboundLedgerLocal {
         if packet.nodes.is_empty() {
             return Err(InboundLedgerPacketError::EmptyNodes);
         }
-        if next_node == 0 && packet.nodes.iter().any(|node| node.node_id.is_none()) {
-            journal.warn("Got bad node");
-            return Err(InboundLedgerPacketError::MissingNodeId);
+        if next_node == 0 {
+            // A resumable packet must reject any malformed later node before
+            // its first chunk mutates a SHAMap. Subsequent chunks re-use this
+            // admission result and retain the same error semantics as the
+            // former whole-packet path.
+            if packet.nodes.iter().any(|node| node.node_id.is_none()) {
+                journal.warn("Got bad node");
+                return Err(InboundLedgerPacketError::MissingNodeId);
+            }
+            if packet.nodes.iter().any(|node| node.node_data.is_empty()) {
+                journal.warn("Got empty node data");
+                return Err(InboundLedgerPacketError::EmptyNodeData);
+            }
+            if packet.nodes.iter().any(|node| {
+                node.node_id.as_deref().is_none_or(|node_id| {
+                    shamap::node_id::deserialize_shamap_node_id(node_id).is_none()
+                })
+            }) {
+                journal.warn("Got invalid node id");
+                return Err(InboundLedgerPacketError::InvalidNodeId);
+            }
+            if packet
+                .nodes
+                .iter()
+                .any(|node| SHAMapTreeNode::make_from_wire(&node.node_data).is_err())
+            {
+                journal.warn("Got invalid node data");
+                return Err(InboundLedgerPacketError::InvalidNodeData);
+            }
         }
         if next_node >= packet.nodes.len() {
             return Ok(InboundLedgerPacketStep {
@@ -1638,7 +2122,7 @@ impl InboundLedgerLocal {
         )?;
         Ok(InboundLedgerPacketStep {
             next_node: end,
-            complete: end == packet.nodes.len() || !stats.is_good(),
+            complete: end == packet.nodes.len() || stats.is_invalid(),
             stats,
         })
     }
@@ -1719,6 +2203,26 @@ impl InboundLedgerLocal {
                 if packet.nodes.iter().any(|node| node.node_id.is_none()) {
                     journal.warn("Got bad node");
                     return Err(InboundLedgerPacketError::MissingNodeId);
+                }
+                if packet.nodes.iter().any(|node| node.node_data.is_empty()) {
+                    journal.warn("Got empty node data");
+                    return Err(InboundLedgerPacketError::EmptyNodeData);
+                }
+                if packet.nodes.iter().any(|node| {
+                    node.node_id.as_deref().is_none_or(|node_id| {
+                        shamap::node_id::deserialize_shamap_node_id(node_id).is_none()
+                    })
+                }) {
+                    journal.warn("Got invalid node id");
+                    return Err(InboundLedgerPacketError::InvalidNodeId);
+                }
+                if packet
+                    .nodes
+                    .iter()
+                    .any(|node| SHAMapTreeNode::make_from_wire(&node.node_data).is_err())
+                {
+                    journal.warn("Got invalid node data");
+                    return Err(InboundLedgerPacketError::InvalidNodeData);
                 }
 
                 let mut san = SHAMapAddNode::default();
@@ -1869,6 +2373,26 @@ impl InboundLedgerLocal {
         }
     }
 
+    /// Apply a header returned by the acquisition read broker. The caller owns
+    /// hash/plan identity and invokes this before any peer header request.
+    pub fn apply_brokered_header<DB, J>(
+        &mut self,
+        data: Blob,
+        config: &LedgerConfig,
+        store: &mut DB,
+        journal: &J,
+    ) -> bool
+    where
+        DB: InboundLedgerStore,
+        J: InboundLedgerJournal,
+    {
+        if self.planner_state.have_header || self.failed || self.complete {
+            return false;
+        }
+        self.try_load_header_from_bytes(data, config, store, false, journal);
+        self.planner_state.have_header && !self.failed
+    }
+
     fn try_load_header_from_bytes<DB, J>(
         &mut self,
         data: Blob,
@@ -1917,7 +2441,9 @@ impl InboundLedgerLocal {
         self.planner_state.have_header = true;
         if let Some(ledger) = self.ledger.as_mut() {
             ledger.state_map_mut().set_synching();
-            ledger.tx_map_mut().set_synching();
+            if !ledger.header().tx_hash.is_zero() {
+                ledger.tx_map_mut().set_synching();
+            }
         }
     }
 
@@ -1981,7 +2507,7 @@ impl InboundLedgerLocal {
                 )
             };
             *san += added;
-            if !san.is_good() {
+            if added.is_invalid() {
                 journal.warn("Received bad node data");
                 return;
             }
@@ -2078,7 +2604,7 @@ impl InboundLedgerLocal {
             }
             node_count += 1;
             *san += added;
-            if !san.is_good() {
+            if added.is_invalid() {
                 journal.warn("Received bad node data");
                 return;
             }
@@ -2242,11 +2768,7 @@ impl InboundLedgerLocal {
         }
 
         // By-hash fallback after threshold timeouts
-        if self.timeouts > 0
-            && !self.progress
-            && self.by_hash
-            && self.timeouts > INBOUND_LEDGER_BECOME_AGGRESSIVE
-        {
+        if self.should_use_aggressive_by_hash() {
             let mut state_filter = None;
             let mut tx_filter = None;
             if let Some(request) =
@@ -2623,16 +3145,10 @@ impl InboundLedgerLocal {
         }
     }
 
-    /// Prepare the trigger scan by doing all non-scan setup and computing the
-    /// parameters for the expensive state/tx map walks.
+    /// Prepare the trigger and emit any immediate header or root-node requests.
     ///
-    /// Returns a `TriggerSetup` containing scan parameters, messages to send,
-    /// and a completion flag. The caller should:
-    /// 1. Send any `messages_to_send` (header request, root node requests).
-    /// 2. Release the acquisition lock.
-    /// 3. Call `do_state_map_scan` / `apply_state_scan_results` for each scan.
-    /// 4. Call `do_tx_map_scan` / `apply_tx_scan_results` for each scan.
-    /// 5. Re-acquire the lock and check `complete`.
+    /// The caller starts the actor-native tree plans indicated by `TriggerSetup`
+    /// and then sends `messages_to_send`.
     pub fn prepare_trigger<CLOCK, S, C, F, MR, NS, DB, FP, J>(
         &mut self,
         reason: InboundLedgerRequestTrigger,
@@ -2654,9 +3170,10 @@ impl InboundLedgerLocal {
     {
         if self.is_done() {
             return TriggerSetup {
-                state_scan: None,
-                tx_scan: None,
+                state_plan: false,
+                tx_plan: false,
                 messages_to_send: Vec::new(),
+                state_request_pending: false,
                 complete: false,
             };
         }
@@ -2666,9 +3183,10 @@ impl InboundLedgerLocal {
             self.try_db_with_family_and_config(journal, config, store, fetch_pack, family);
             if self.failed || self.is_done() {
                 return TriggerSetup {
-                    state_scan: None,
-                    tx_scan: None,
+                    state_plan: false,
+                    tx_plan: false,
                     messages_to_send: Vec::new(),
+                    state_request_pending: false,
                     complete: false,
                 };
             }
@@ -2677,11 +3195,7 @@ impl InboundLedgerLocal {
         let mut messages_to_send = Vec::new();
 
         // By-hash fallback after threshold timeouts
-        if self.timeouts > 0
-            && !self.progress
-            && self.by_hash
-            && self.timeouts > INBOUND_LEDGER_BECOME_AGGRESSIVE
-        {
+        if self.should_use_aggressive_by_hash() {
             let mut state_filter = None;
             let mut tx_filter = None;
             if let Some(request) =
@@ -2690,16 +3204,15 @@ impl InboundLedgerLocal {
                 self.by_hash = false;
                 messages_to_send.push(request);
                 return TriggerSetup {
-                    state_scan: None,
-                    tx_scan: None,
+                    state_plan: false,
+                    tx_plan: false,
                     messages_to_send,
+                    state_request_pending: false,
                     complete: false,
                 };
-            } else {
-                if self.planner_state.have_header {
-                    self.planner_state.have_state = true;
-                    self.planner_state.have_transactions = true;
-                }
+            } else if self.planner_state.have_header {
+                self.planner_state.have_state = true;
+                self.planner_state.have_transactions = true;
             }
         }
 
@@ -2720,15 +3233,16 @@ impl InboundLedgerLocal {
         if !self.planner_state.have_header && !self.failed {
             messages_to_send.push(self.make_header_request());
             return TriggerSetup {
-                state_scan: None,
-                tx_scan: None,
+                state_plan: false,
+                tx_plan: false,
                 messages_to_send,
+                state_request_pending: false,
                 complete: false,
             };
         }
 
         // Compute state scan parameters and handle root node request
-        let state_scan = if !self.planner_state.have_state && !self.failed {
+        let state_plan = if !self.planner_state.have_state && !self.failed {
             if let Some(ledger) = self.ledger.as_mut() {
                 let map_hash = ledger.state_map_mut().hash();
                 if map_hash.is_zero() {
@@ -2737,9 +3251,10 @@ impl InboundLedgerLocal {
                     if account_hash.is_zero() {
                         self.failed = true;
                         return TriggerSetup {
-                            state_scan: None,
-                            tx_scan: None,
+                            state_plan: false,
+                            tx_plan: false,
                             messages_to_send,
+                            state_request_pending: false,
                             complete: false,
                         };
                     }
@@ -2765,32 +3280,36 @@ impl InboundLedgerLocal {
                         query_depth,
                         query_type,
                     ));
-                    None
+                    return TriggerSetup {
+                        state_plan: false,
+                        tx_plan: false,
+                        messages_to_send,
+                        state_request_pending: true,
+                        complete: false,
+                    };
                 } else {
-                    Some(StateScanParams {
-                        missing_limit: MISSING_NODES_FIND,
-                        map_hash,
-                        reason,
-                        query_depth,
-                        query_type,
-                        have_state: self.planner_state.have_state,
-                    })
+                    true
                 }
             } else {
-                None
+                false
             }
         } else {
-            None
+            false
         };
 
-        // Compute tx scan parameters and handle root node request
-        let tx_scan = if !self.planner_state.have_transactions && !self.failed {
+        // Rippled prioritizes the account-state tree and only considers
+        // transaction work after state completes. Do not pre-queue TX root or
+        // node requests while state remains incomplete.
+        let tx_plan = if self.planner_state.have_state
+            && !self.planner_state.have_transactions
+            && !self.failed
+        {
             if let Some(ledger) = self.ledger.as_mut() {
                 let map_hash = ledger.tx_map_mut().hash();
                 let tx_hash = ledger.header().tx_hash;
                 if tx_hash.is_zero() {
                     self.planner_state.have_transactions = true;
-                    None
+                    false
                 } else if map_hash.is_zero() {
                     let node_ids = [shamap::node_id::SHAMapNodeId::default()];
                     log_acq_request_nodes(
@@ -2814,22 +3333,15 @@ impl InboundLedgerLocal {
                         query_depth,
                         query_type,
                     ));
-                    None
+                    false
                 } else {
-                    Some(TxScanParams {
-                        missing_limit: MISSING_NODES_FIND,
-                        map_hash,
-                        reason,
-                        query_depth,
-                        query_type,
-                        have_transactions: self.planner_state.have_transactions,
-                    })
+                    true
                 }
             } else {
-                None
+                false
             }
         } else {
-            None
+            false
         };
 
         let complete = self.planner_state.have_header
@@ -2837,287 +3349,11 @@ impl InboundLedgerLocal {
             && self.planner_state.have_transactions;
 
         TriggerSetup {
-            state_scan,
-            tx_scan,
+            state_plan,
+            tx_plan,
             messages_to_send,
+            state_request_pending: false,
             complete,
-        }
-    }
-
-    /// Perform the expensive state map walk.
-    ///
-    /// NOTE: In rippled, the acquisition lock is released during this walk
-    /// (`InboundLedger.cpp:620-622`). In our Rust architecture, the Ledger is
-    /// owned by `InboundLedgerLocal` (not Arc'd), and `get_missing_nodes_with_family`
-    /// requires `&mut SyncTree`, so the caller's lock cannot be released.
-    /// When the Ledger is refactored to `Arc<Ledger>`, the caller can release
-    /// its lock around this call.
-    pub fn do_state_map_scan<CLOCK, S, C, F, MR, NS, DB, FP>(
-        &mut self,
-        params: &StateScanParams,
-        store: &mut DB,
-        fetch_pack: &mut FP,
-        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-    ) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)>
-    where
-        CLOCK: basics::tagged_cache::CacheClock,
-        S: std::hash::BuildHasher + Clone,
-        C: shamap::family::FullBelowCache,
-        F: shamap::family::SHAMapNodeFetcher,
-        MR: shamap::family::MissingNodeReporter,
-        DB: InboundLedgerStore,
-        FP: FetchPackContainer,
-    {
-        let Some(ledger) = self.ledger.as_mut() else {
-            return Vec::new();
-        };
-        if params.have_state || self.failed {
-            return Vec::new();
-        }
-        if params.map_hash.is_zero() {
-            return Vec::new();
-        }
-
-        let mut filter = AccountStateSF::new(InboundLedgerSyncStore(&mut *store), &mut *fetch_pack);
-        let mut filter_ref: Option<&mut dyn shamap::fetch::SHAMapSyncFilter> = Some(&mut filter);
-        ledger.state_map_mut().get_missing_nodes_with_family(
-            params.missing_limit,
-            &mut filter_ref,
-            family,
-            &mut next_missing_scan_first_child,
-        )
-    }
-
-    /// Apply state-map scan results and build the corresponding peer requests.
-    ///
-    /// Called after `do_state_map_scan` returns, once the acquisition lock
-    /// has been re-acquired.
-    pub fn apply_state_scan_results<CLOCK, S, C, F, MR, NS>(
-        &mut self,
-        missing: Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
-        params: &StateScanParams,
-        _family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-        send_fn: &mut dyn FnMut(ProtocolMessage),
-    ) where
-        CLOCK: basics::tagged_cache::CacheClock,
-        S: std::hash::BuildHasher + Clone,
-        C: shamap::family::FullBelowCache,
-        F: shamap::family::SHAMapNodeFetcher,
-        MR: shamap::family::MissingNodeReporter,
-    {
-        let Some(ledger) = self.ledger.as_mut() else {
-            return;
-        };
-        if params.have_state || self.failed {
-            return;
-        }
-
-        if missing.is_empty() {
-            if !ledger.state_map().is_valid() {
-                self.failed = true;
-                return;
-            }
-            if ledger.state_map().is_valid() {
-                self.planner_state.have_state = true;
-                if full_sync_debug_enabled() {
-                    tracing::debug!(target: "ledger",
-                        "[full_debug][acq_have_map] seq={} map=state root={} valid=true",
-                        self.seq, params.map_hash
-                    );
-                }
-            }
-        } else {
-            let limit = match params.reason {
-                InboundLedgerRequestTrigger::Reply
-                | InboundLedgerRequestTrigger::ReplyHighLatency => REQ_NODES_REPLY,
-                _ => REQ_NODES,
-            };
-            let mut fresh: Vec<_> = missing
-                .iter()
-                .filter(|(_, h)| !self.recent_nodes.contains(h))
-                .collect();
-            if fresh.is_empty() {
-                if params.reason == InboundLedgerRequestTrigger::Timeout {
-                    fresh = missing.iter().collect();
-                }
-            }
-            if full_sync_debug_enabled() {
-                tracing::debug!(target: "ledger",
-                    "[full_debug][acq_request_nodes] seq={} map=state root={} missing={} fresh={} limit={} reason={:?} recent_nodes={}",
-                    self.seq,
-                    params.map_hash,
-                    missing.len(),
-                    fresh.len(),
-                    limit,
-                    params.reason,
-                    self.recent_nodes.len()
-                );
-            }
-            if !fresh.is_empty() {
-                let node_ids: Vec<_> = fresh.iter().take(limit).map(|(id, _)| *id).collect();
-                log_acq_request_nodes(
-                    self.seq,
-                    "state",
-                    params.map_hash,
-                    missing.len(),
-                    fresh.len(),
-                    limit,
-                    params.reason,
-                    self.recent_nodes.len(),
-                    params.query_depth,
-                    params.query_type,
-                    &node_ids,
-                );
-                for (_, h) in fresh.iter().take(limit) {
-                    self.recent_nodes.insert(*h);
-                }
-                let request = make_get_ledger_with_node_ids(
-                    self.hash,
-                    self.seq,
-                    TM_GET_LEDGER_AS_NODE,
-                    &node_ids,
-                    params.query_depth,
-                    params.query_type,
-                );
-                send_fn(request);
-            }
-        }
-    }
-
-    /// Perform the expensive transaction map walk.
-    ///
-    /// NOTE: Same architectural constraint as `do_state_map_scan` — the caller's
-    /// lock cannot be released until the Ledger is refactored to `Arc<Ledger>`.
-    pub fn do_tx_map_scan<CLOCK, S, C, F, MR, NS, DB, FP>(
-        &mut self,
-        params: &TxScanParams,
-        store: &mut DB,
-        fetch_pack: &mut FP,
-        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-    ) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)>
-    where
-        CLOCK: basics::tagged_cache::CacheClock,
-        S: std::hash::BuildHasher + Clone,
-        C: shamap::family::FullBelowCache,
-        F: shamap::family::SHAMapNodeFetcher,
-        MR: shamap::family::MissingNodeReporter,
-        DB: InboundLedgerStore,
-        FP: FetchPackContainer,
-    {
-        let Some(ledger) = self.ledger.as_mut() else {
-            return Vec::new();
-        };
-        if params.have_transactions || self.failed {
-            return Vec::new();
-        }
-        if params.map_hash.is_zero() {
-            return Vec::new();
-        }
-
-        let mut filter =
-            TransactionStateSF::new(InboundLedgerSyncStore(&mut *store), &mut *fetch_pack);
-        let mut filter_ref: Option<&mut dyn shamap::fetch::SHAMapSyncFilter> = Some(&mut filter);
-        ledger.tx_map_mut().get_missing_nodes_with_family(
-            params.missing_limit,
-            &mut filter_ref,
-            family,
-            &mut next_missing_scan_first_child,
-        )
-    }
-
-    /// Apply transaction-map scan results and build the corresponding peer requests.
-    ///
-    /// Called after `do_tx_map_scan` returns, once the acquisition lock
-    /// has been re-acquired.
-    pub fn apply_tx_scan_results<CLOCK, S, C, F, MR, NS>(
-        &mut self,
-        missing: Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
-        params: &TxScanParams,
-        _family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-        send_fn: &mut dyn FnMut(ProtocolMessage),
-    ) where
-        CLOCK: basics::tagged_cache::CacheClock,
-        S: std::hash::BuildHasher + Clone,
-        C: shamap::family::FullBelowCache,
-        F: shamap::family::SHAMapNodeFetcher,
-        MR: shamap::family::MissingNodeReporter,
-    {
-        let Some(ledger) = self.ledger.as_mut() else {
-            return;
-        };
-        if params.have_transactions || self.failed {
-            return;
-        }
-
-        if missing.is_empty() {
-            if !ledger.tx_map().is_valid() {
-                self.failed = true;
-                return;
-            }
-            if ledger.tx_map().is_valid() {
-                self.planner_state.have_transactions = true;
-                if full_sync_debug_enabled() {
-                    tracing::debug!(target: "ledger",
-                        "[full_debug][acq_have_map] seq={} map=tx root={} valid=true",
-                        self.seq, params.map_hash
-                    );
-                }
-            }
-        } else {
-            let limit = match params.reason {
-                InboundLedgerRequestTrigger::Reply
-                | InboundLedgerRequestTrigger::ReplyHighLatency => REQ_NODES_REPLY,
-                _ => REQ_NODES,
-            };
-            let mut fresh: Vec<_> = missing
-                .iter()
-                .filter(|(_, h)| !self.recent_nodes.contains(h))
-                .collect();
-            if fresh.is_empty() {
-                if params.reason == InboundLedgerRequestTrigger::Timeout {
-                    fresh = missing.iter().collect();
-                }
-            }
-            if full_sync_debug_enabled() {
-                tracing::debug!(target: "ledger",
-                    "[full_debug][acq_request_nodes] seq={} map=tx root={} missing={} fresh={} limit={} reason={:?} recent_nodes={}",
-                    self.seq,
-                    params.map_hash,
-                    missing.len(),
-                    fresh.len(),
-                    limit,
-                    params.reason,
-                    self.recent_nodes.len()
-                );
-            }
-            if !fresh.is_empty() {
-                let node_ids: Vec<_> = fresh.iter().take(limit).map(|(id, _)| *id).collect();
-                log_acq_request_nodes(
-                    self.seq,
-                    "tx",
-                    params.map_hash,
-                    missing.len(),
-                    fresh.len(),
-                    limit,
-                    params.reason,
-                    self.recent_nodes.len(),
-                    params.query_depth,
-                    params.query_type,
-                    &node_ids,
-                );
-                for (_, h) in fresh.iter().take(limit) {
-                    self.recent_nodes.insert(*h);
-                }
-                let request = make_get_ledger_with_node_ids(
-                    self.hash,
-                    self.seq,
-                    TM_GET_LEDGER_TX_NODE,
-                    &node_ids,
-                    params.query_depth,
-                    params.query_type,
-                );
-                send_fn(request);
-            }
         }
     }
 
@@ -3259,6 +3495,26 @@ fn sample_peer_ids(scores: &[InboundLedgerPeerScore], max: usize) -> Vec<u64> {
     sample_peer_ids_with(scores, max, &mut |len| rand_int_to(len - 1))
 }
 
+/// Apply the same useful-peer pruning and bounded sampling used by
+/// `InboundLedger::runData`: retain scores at least half the batch maximum,
+/// then choose no more than the reference useful-peer limit. The mailbox
+/// acquisition path calls this only after it has observed its FIFO batch
+/// empty, rather than once per bounded packet step.
+pub fn select_inbound_ledger_reply_peers(scores: &[InboundLedgerPeerScore]) -> Vec<u64> {
+    let max_useful_count = scores
+        .iter()
+        .map(|score| score.useful_count)
+        .max()
+        .unwrap_or_default();
+    let threshold = max_useful_count / 2;
+    let pruned: Vec<_> = scores
+        .iter()
+        .copied()
+        .filter(|score| score.useful_count >= threshold)
+        .collect();
+    sample_peer_ids(&pruned, INBOUND_LEDGER_MAX_USEFUL_PEERS)
+}
+
 fn sample_peer_ids_with<PICK>(
     scores: &[InboundLedgerPeerScore],
     max: usize,
@@ -3396,3 +3652,122 @@ where
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tree_plan_facade_tests {
+    use super::*;
+    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use shamap::sync::{MissingNodeResidentLookup, SyncState};
+
+    struct NoResident;
+
+    impl MissingNodeResidentLookup for NoResident {
+        fn load_resident(
+            &mut self,
+            _hash: SHAMapHash,
+            _ledger_seq: u32,
+        ) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            None
+        }
+    }
+
+    #[test]
+    fn tree_plan_facade_forwards_retained_edges_and_wait_state_without_ownership() {
+        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            shamap::nodes::tree_node::SHAMapNodeType::AccountState,
+            shamap::item::SHAMapItem::new(Uint256::from_array([0x42; 32]), vec![42; 12]),
+            1,
+        ));
+        let child_hash = child.get_hash();
+        assert!(child_hash.is_non_zero());
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(1, child_hash);
+        root.set_child_hash(2, child_hash);
+        root.update_hash();
+        assert!(root.get_hash().is_non_zero());
+        let tree = SyncTree::from_root_with_type(
+            root.clone(),
+            SHAMapType::State,
+            true,
+            77,
+            SyncState::Synching,
+        );
+        let mut first_child = || 0;
+        let mut plan = TreePlan::new(
+            TreePlanId::new(93),
+            TreeKind::State,
+            &tree,
+            root.get_hash(),
+            16,
+            7,
+            &mut first_child,
+        );
+        let mut resident = NoResident;
+
+        let advance = plan.advance(32, 4, &mut resident, &mut first_child);
+        let TreeAdvance::NeedsReads(reads) = advance else {
+            panic!(
+                "expected the continuation's deduplicated read result, got {:?}",
+                advance
+            );
+        };
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].hash(), child_hash);
+        assert_eq!(plan.pending_hashes(), 1);
+        assert_eq!(plan.pending_edges(), 2);
+        assert!(plan.pending_edge_bytes() > 0);
+        assert!(!plan.is_pending_edge_limited());
+        assert!(
+            !plan.has_runnable_frontier(),
+            "after forwarding the bounded read result, only the retained broker edge remains"
+        );
+        assert!(
+            plan.take_read_admission_batch(1).is_empty(),
+            "the facade retains no second admission queue after forwarding NeedsReads"
+        );
+
+        assert_eq!(
+            plan.apply_read_result(
+                TreePlanId::new(94),
+                child_hash,
+                MissingNodeReadOutcome::Miss,
+            ),
+            MissingNodeReadApply::StalePlan
+        );
+        assert_eq!(plan.pending_hashes(), 1);
+        assert_eq!(plan.pending_edges(), 2);
+        assert_eq!(
+            plan.apply_read_result(plan.id(), child_hash, MissingNodeReadOutcome::Miss),
+            MissingNodeReadApply::Applied {
+                attached_edges: 0,
+                missing_edges: 1,
+            }
+        );
+        let candidates = plan.take_network_candidates();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].1, *child_hash.as_uint256());
+        assert_eq!(plan.pending_hashes(), 0);
+        assert_eq!(plan.pending_edges(), 2);
+        assert!(
+            !plan.has_runnable_frontier(),
+            "after forwarding the bounded peer candidate, only continuation-owned edges wait"
+        );
+
+        assert_eq!(
+            plan.apply_network_node(plan.id(), child_hash, child.clone()),
+            MissingNodeReadApply::Applied {
+                attached_edges: 2,
+                missing_edges: 0,
+            }
+        );
+        assert!(matches!(
+            plan.advance(32, 4, &mut resident, &mut first_child),
+            TreeAdvance::Complete
+        ));
+        assert_eq!(
+            plan.apply_network_node(plan.id(), child_hash, child,),
+            MissingNodeReadApply::UnknownRead,
+            "the facade has no second terminal settlement after continuation completion"
+        );
+    }
+}

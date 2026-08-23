@@ -4,12 +4,24 @@
 use std::sync::Arc;
 
 use basics::base_uint::Uint256;
-use protocol::{Keylet, STLedgerEntry, STObject, STVector256};
+use protocol::{AccountID, Keylet, STLedgerEntry, STObject, STVector256};
 
 use crate::read_view::ViewError;
 use crate::views::apply_view::ApplyView;
 
 pub const DIR_NODE_MAX_ENTRIES: usize = 32;
+
+/// reference: `kDirNodeMaxPages` in `xrpl/protocol/Protocol.h`. Legacy cap on
+/// the number of pages a directory chain may grow to; made obsolete by the
+/// `fixDirectoryLimit` amendment.
+pub const DIR_NODE_MAX_PAGES: u64 = 262_144;
+
+/// Describe an owner-directory page exactly as rippled's
+/// `describeOwnerDir`: every page created for the directory carries the
+/// account in `sfOwner`.
+pub fn describe_owner_dir(account: AccountID) -> impl Fn(&mut STObject) {
+    move |directory| directory.set_account_id(sf("sfOwner"), account)
+}
 
 fn sf(name: &str) -> &'static protocol::SField {
     protocol::get_field_by_symbol(name)
@@ -122,6 +134,14 @@ fn insert_key(
     Ok(page)
 }
 
+/// reference: `ApplyView::dirAdd` -> `directory::insertPage` in
+/// `xrpl/ledger/ApplyView.cpp` -- before the `fixDirectoryLimit` amendment,
+/// directory chains were capped at `kDirNodeMaxPages` pages. Pure predicate
+/// so the boundary condition is unit-testable without an `ApplyView`.
+fn directory_page_limit_exceeded(new_page: u64, fix_directory_limit_enabled: bool) -> bool {
+    !fix_directory_limit_enabled && new_page >= DIR_NODE_MAX_PAGES
+}
+
 fn insert_page(
     view: &mut dyn ApplyView,
     page: u64,
@@ -136,14 +156,31 @@ fn insert_page(
     if new_page == 0 {
         return Ok(None);
     }
+    let fix_directory_limit_enabled = view
+        .rules()
+        .enabled(&protocol::feature_id("fixDirectoryLimit"));
+    if directory_page_limit_exceeded(new_page, fix_directory_limit_enabled) {
+        return Ok(None);
+    }
 
-    view.raw_replace(sle_update(node, |obj| {
-        obj.set_field_u64(sf("sfIndexNext"), new_page);
-    }))?;
+    if node.key() == next.key() {
+        // The first overflow page links the root to itself. Both link fields
+        // must be written from one SLE snapshot: issuing two replacements from
+        // the same original root drops whichever field the second write does
+        // not set.
+        view.raw_replace(sle_update(node, |obj| {
+            obj.set_field_u64(sf("sfIndexNext"), new_page);
+            obj.set_field_u64(sf("sfIndexPrevious"), new_page);
+        }))?;
+    } else {
+        view.raw_replace(sle_update(node, |obj| {
+            obj.set_field_u64(sf("sfIndexNext"), new_page);
+        }))?;
 
-    view.raw_replace(sle_update(next, |obj| {
-        obj.set_field_u64(sf("sfIndexPrevious"), new_page);
-    }))?;
+        view.raw_replace(sle_update(next, |obj| {
+            obj.set_field_u64(sf("sfIndexPrevious"), new_page);
+        }))?;
+    }
 
     let pk = page_kl(directory, new_page);
     let mut new_node = STLedgerEntry::new(pk);
@@ -231,17 +268,38 @@ pub fn dir_remove(
     key: Uint256,
     keep_root: bool,
 ) -> Result<bool, ViewError> {
-    // Use read fallback so NuDB-backed pages are found even if not yet in sandbox cache.
+    let trace_offer_sequence = std::env::var("XRPL_TRACE_OFFER_SEQUENCE")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    let page_keylet = page_kl(directory, page);
     let Some(node) = view
-        .peek(page_kl(directory, page))?
-        .or_else(|| view.read(page_kl(directory, page)).ok().flatten())
+        .peek(page_keylet)?
+        .or_else(|| view.read(page_keylet).ok().flatten())
     else {
+        if trace_offer_sequence {
+            eprintln!(
+                "TRACE dir_remove: directory={} page={} key={} page_missing=true",
+                directory.key, page, key
+            );
+        }
         return Ok(false);
     };
 
     let root_page: u64 = 0;
     let mut entries = v256_to_vec(&node.get_field_v256(sf("sfIndexes")));
+    if trace_offer_sequence {
+        eprintln!(
+            "TRACE dir_remove: directory={} page={} key={} entries={:?}",
+            directory.key, page, key, entries
+        );
+    }
     let Some(pos) = entries.iter().position(|k| *k == key) else {
+        if trace_offer_sequence {
+            eprintln!(
+                "TRACE dir_remove: directory={} page={} key={} key_absent=true",
+                directory.key, page, key
+            );
+        }
         return Ok(false);
     };
     entries.remove(pos);
@@ -372,4 +430,40 @@ pub fn dir_remove(
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_directory_description_sets_canonical_owner_field() {
+        let account = AccountID::from_slice(&[0xA5; 20]).expect("account width");
+        let mut directory = STObject::new(sf("sfGeneric"));
+
+        describe_owner_dir(account)(&mut directory);
+
+        assert_eq!(directory.get_account_id(sf("sfOwner")), account);
+    }
+
+    // reference: `ApplyView::dirAdd` -> `directory::insertPage` in
+    // `xrpl/ledger/ApplyView.cpp`, guarded by
+    // `!view.rules().enabled(fixDirectoryLimit) && page >= kDirNodeMaxPages`.
+
+    #[test]
+    fn page_limit_enforced_when_fix_directory_limit_disabled() {
+        assert!(!directory_page_limit_exceeded(
+            DIR_NODE_MAX_PAGES - 1,
+            false
+        ));
+        assert!(directory_page_limit_exceeded(DIR_NODE_MAX_PAGES, false));
+        assert!(directory_page_limit_exceeded(DIR_NODE_MAX_PAGES + 1, false));
+    }
+
+    #[test]
+    fn page_limit_bypassed_when_fix_directory_limit_enabled() {
+        assert!(!directory_page_limit_exceeded(DIR_NODE_MAX_PAGES, true));
+        assert!(!directory_page_limit_exceeded(DIR_NODE_MAX_PAGES + 1, true));
+        assert!(!directory_page_limit_exceeded(u64::MAX - 1, true));
+    }
 }

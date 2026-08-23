@@ -2,14 +2,15 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use basics::{base_uint::Uint256, str_hex::str_hex, string_utilities::to_uint64};
+use protocol::tokens::decode_base58_token_multibyte;
 use protocol::{
     JsonOptions, JsonValue, KeyType, LedgerEntryType, LedgerFormats, PublicKey, STArray, STObject,
     STParsedJSONObject, STTx, SecretKey, Seed, SerialIter, Serializer, StBase,
     build_multi_signing_data, derive_public_key, generate_secret_key, get_field_by_name,
-    get_field_by_symbol, is_tes_success, jss, parse_base58_account_id,
+    get_field_by_symbol, is_tec_claim, is_tes_success, jss, parse_base58_account_id,
     serialize_pay_chan_authorization, sf_generic, sign,
 };
 
@@ -26,13 +27,21 @@ use rpc::context::{RpcRequestContext, RpcRuntime};
 #[cfg(test)]
 use rpc::simulate::SimulateSource;
 
+fn log_rpc_error(code: &RpcErrorCode) {
+    if matches!(code, RpcErrorCode::ActNotFound) {
+        tracing::debug!(target: "rpc", error = ?code, "RPC request returned expected not-found error");
+    } else {
+        tracing::warn!(target: "rpc", error = ?code, "RPC request failed");
+    }
+}
+
 pub fn inject_error(code: RpcErrorCode, json: &mut JsonValue) {
-    tracing::warn!(target: "rpc", error = ?code, "RPC request failed");
+    log_rpc_error(&code);
     Status::new(code).inject(json);
 }
 
 pub fn inject_error_message(code: RpcErrorCode, message: impl Into<String>, json: &mut JsonValue) {
-    tracing::warn!(target: "rpc", error = ?code, "RPC request failed");
+    log_rpc_error(&code);
     Status::with_message(code, message).inject(json);
 }
 
@@ -111,25 +120,15 @@ pub fn transaction_sign<Runtime: RpcRuntime, Source>(
     if app_network_id > 1024 && !st_tx.is_field_present(get_field_by_symbol("sfNetworkID")) {
         st_tx.set_field_u32(get_field_by_symbol("sfNetworkID"), app_network_id);
     }
-    // Auto-fill Sequence from the current account state (matching rippled).
-    // If Sequence is 0 (default/missing), look up the account's current sequence.
-    // Use the open ledger state (which reflects submitted-but-not-yet-closed txs)
-    // so that multiple transactions in the same ledger get correct sequences.
+    // TransactionSign.cpp reads the account root from OpenLedger::current()
+    // then calls TxQ::nextQueuableSeq. Keep that exact ordering: the persistent
+    // submit sandbox includes rebuilt LocalTx effects, while TxQ fills any
+    // contiguous queued sequence gap. The legacy sequence cache is not an
+    // authoritative signing source because it is intentionally cleared at an
+    // LCL transition and is not reconstructed during LocalTx replay.
     if st_tx.get_seq_value() == 0 {
         if let Some(app) = ctx.runtime.app() {
-            let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-            let account_keylet =
-                protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
-            // Try open ledger first (has latest state including pending txs)
-            let seq = app
-                .network_ops_current_account_seq(&account)
-                .or_else(|| {
-                    app.closed_ledger()
-                        .or_else(|| app.validated_ledger())
-                        .and_then(|ledger| ledger.read(account_keylet).ok().flatten())
-                        .map(|sle| sle.get_field_u32(get_field_by_symbol("sfSequence")))
-                })
-                .unwrap_or(1);
+            let seq = app.network_ops_next_account_seq_for_tx(&st_tx).unwrap_or(1);
             st_tx.set_field_u32(get_field_by_symbol("sfSequence"), seq);
         }
     }
@@ -474,29 +473,26 @@ pub fn autofill_tx<Runtime: RpcRuntime>(
         return Ok(());
     };
     if !map.contains_key(jss::Fee) {
-        map.insert(jss::Fee.to_string(), JsonValue::String("10".to_string()));
+        // Parity: ../rippled/src/xrpld/rpc/handlers/transaction/Simulate.cpp::
+        // simulateTxn copies OpenLedger and uses TxQ's live fee context.
+        let fee = _ctx
+            .runtime
+            .app()
+            .map(|app| app.open_ledger().current().base_fee_drops)
+            .unwrap_or(10);
+        map.insert(jss::Fee.to_string(), JsonValue::String(fee.to_string()));
     }
     if !map.contains_key(jss::Sequence) {
-        // Try to auto-fill from the account's current sequence.
-        let seq = if let Some(app) = _ctx.runtime.app() {
-            if let Some(JsonValue::String(acct_str)) = map.get("Account") {
-                let base_ledger = app.closed_ledger().or_else(|| app.validated_ledger());
-                base_ledger
-                    .and_then(|ledger| {
-                        let account_id = protocol::parse_base58_account_id(acct_str)?;
-                        let keylet = protocol::account_keylet(
-                            basics::base_uint::Uint160::from_void(account_id.data()),
-                        );
-                        ledger.read(keylet).ok().flatten()
-                    })
-                    .map(|sle| sle.get_field_u32(get_field_by_symbol("sfSequence")) as u64)
-                    .unwrap_or(1)
-            } else {
-                1
-            }
-        } else {
-            1
-        };
+        let seq = _ctx
+            .runtime
+            .app()
+            .and_then(|app| match map.get("Account") {
+                Some(JsonValue::String(account)) => protocol::parse_base58_account_id(account)
+                    .and_then(|account| app.network_ops_current_account_seq(&account))
+                    .map(u64::from),
+                _ => None,
+            })
+            .unwrap_or(1);
         map.insert(jss::Sequence.to_string(), JsonValue::Unsigned(seq));
     }
     Ok(())
@@ -519,29 +515,110 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
     let mut simulation_meta_blob = None;
     ret.insert(jss::applied.to_string(), JsonValue::Bool(false));
 
-    // If a ledger is available, run the real transactor and capture metadata
+    // The real application owns TxQ and its open-ledger/fee state. Route
+    // simulation through that canonical admission boundary instead of calling
+    // the transactor shell directly. Parity: ../rippled/src/xrpld/rpc/handlers/
+    // transaction/Simulate.cpp::simulateTxn invokes TxQ::apply(TapDryRun).
+    if let Some(app) = ctx.runtime.app() {
+        // ApplicationRoot::simulate_transaction clones its persistent OpenView
+        // sandbox. The runtime ledger is only the immutable fallback for a
+        // node that has not accepted any open-ledger mutations yet; rebuilding
+        // `Ledger::from_previous` here would discard sequence/balance changes.
+        // Parity: ../rippled/src/xrpld/rpc/handlers/transaction/Simulate.cpp::
+        // simulateTxn copies OpenLedger::current() before TxQ::apply(TapDryRun).
+        let ledger = ctx
+            .runtime
+            .current_ledger_for_simulation()
+            .ok_or_else(|| Status::new(RpcErrorCode::NotSynced))?;
+        let outcome = app.simulate_transaction(ledger, Arc::new(tx.clone()));
+        ret.insert(
+            jss::applied.to_string(),
+            JsonValue::Bool(outcome.result.applied),
+        );
+        ret.insert(
+            jss::engine_result.to_string(),
+            JsonValue::String(protocol::trans_token(outcome.result.ter).to_owned()),
+        );
+        ret.insert(
+            jss::engine_result_code.to_string(),
+            JsonValue::Signed(outcome.result.ter.to_int() as i64),
+        );
+        ret.insert(
+            "engine_result_message".to_string(),
+            JsonValue::String(protocol::trans_human(outcome.result.ter).to_owned()),
+        );
+        ret.insert(
+            jss::ledger_index.to_string(),
+            JsonValue::Unsigned(u64::from(outcome.ledger_seq)),
+        );
+
+        if let Some(mut metadata) = outcome.metadata {
+            if binary {
+                let mut serializer = Serializer::default();
+                metadata.add_raw(&mut serializer, outcome.result.ter, 0);
+                ret.insert(
+                    "meta_blob".to_string(),
+                    JsonValue::String(hex::encode(serializer.data())),
+                );
+            } else {
+                let mut meta = metadata.get_json(JsonOptions::new(0));
+                if is_tes_success(outcome.result.ter) {
+                    crate::handlers::delivered_amount::insert_delivered_amount(
+                        &mut meta,
+                        outcome.ledger_seq,
+                        Some(outcome.close_time),
+                        tx,
+                        &metadata,
+                    );
+                }
+                ret.insert("meta".to_string(), meta);
+            }
+        } else {
+            ret.insert(
+                "meta".to_string(),
+                JsonValue::Object(BTreeMap::from([
+                    ("AffectedNodes".to_owned(), JsonValue::Array(Vec::new())),
+                    (
+                        "TransactionResult".to_owned(),
+                        JsonValue::String(protocol::trans_token(outcome.result.ter).to_owned()),
+                    ),
+                ])),
+            );
+        }
+
+        if binary {
+            ret.insert(
+                jss::tx_blob.to_string(),
+                JsonValue::String(hex::encode(tx.get_serializer().data())),
+            );
+        } else {
+            ret.insert(jss::tx_json.to_string(), tx.json(JsonOptions::new(0)));
+        }
+        return Ok(JsonValue::Object(ret));
+    }
+
+    // Keep the generic fallback for lightweight RPC runtimes that do not own
+    // an ApplicationRoot/TxQ (unit harnesses and isolated handler tests).
     if let Some(ledger) = ctx.runtime.current_ledger_for_simulation() {
         let ledger_seq = ledger.header().seq;
         let close_time = ledger.header().close_time;
-        let mut view = ledger::ApplyViewImpl::new(ledger, tx::ApplyFlags::NONE);
-        let txn_type = tx.get_txn_type();
-        // C++ catches std::runtime_error from transactor apply and returns
-        // an RPC error. Match this by catching panics (e.g., STAmount overflow)
-        // to prevent mutex poisoning and server crash.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            app::apply_submit_transactor_shell_with_delivered_amount(&mut view, tx, txn_type)
-        }));
-        let (result, delivered_amount) = match result {
-            Ok((ter, delivered_amount)) => (ter, delivered_amount),
-            Err(_) => {
-                ret.insert(
-                    jss::engine_result.to_string(),
-                    JsonValue::String("telLOCAL_ERROR".to_string()),
-                );
-                ret.insert(jss::engine_result_code.to_string(), JsonValue::Signed(-399));
-                return Ok(JsonValue::Object(ret));
-            }
-        };
+        let mut view = ledger::ApplyViewImpl::new(Arc::clone(&ledger), tx::ApplyFlags::NONE);
+        // Minimal RPC runtimes have no ApplicationRoot/TxQ owner. Keep their
+        // fallback on the app-level canonical dry-run boundary.
+        let (result, delivered_amount) =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                app::apply_simulated_transaction(&mut view, tx)
+            })) {
+                Ok((result, delivered_amount)) => (result, delivered_amount),
+                Err(_) => {
+                    ret.insert(
+                        jss::engine_result.to_string(),
+                        JsonValue::String("telLOCAL_ERROR".to_string()),
+                    );
+                    ret.insert(jss::engine_result_code.to_string(), JsonValue::Signed(-399));
+                    return Ok(JsonValue::Object(ret));
+                }
+            };
 
         ret.insert(
             jss::engine_result.to_string(),
@@ -619,8 +696,16 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
     Ok(JsonValue::Object(ret))
 }
 
+/// Decode only xrpl.js's legacy Ed25519 seed encoding.
+///
+/// rippled's `parseXrplLibSeed` accepts the raw Base58 payload prefix E1 4B,
+/// followed by exactly 16 seed bytes. A normal XRPL family seed must not be
+/// accepted here: it falls through to normal seed handling and therefore
+/// retains the default Secp256k1 key type.
 pub fn parse_xrpl_lib_seed(s: &str) -> Option<Seed> {
-    protocol::parse_base58_seed(s)
+    decode_base58_token_multibyte(s, &[0xE1, 0x4B])
+        .filter(|bytes| bytes.len() == 16)
+        .and_then(|bytes| Seed::from_slice(&bytes).ok())
 }
 
 pub fn get_seed_from_rpc(params: &JsonValue) -> Result<Seed, Status> {

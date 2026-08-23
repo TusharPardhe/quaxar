@@ -1,0 +1,17 @@
+[package]
+name = "acquisition"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "acquisition"
+path = "src/lib.rs"
+
+[dependencies]
+basics = { path = "../../xrpl/basics" }
+bytes = "1.11.1"
+ledger = { path = "../ledger" }
+shamap = { path = "../../xrpl/shamap" }
+tracing = "=0.1.44"

@@ -1,22 +1,27 @@
 use app::{SHAMapStoreNodeStore, SHAMapStoreSavedStateDb, apply_submit_transactor_shell};
 use basics::base_uint::Uint256;
 use basics::basic_config::BasicConfig;
-use basics::intrusive_pointer::SharedIntrusive;
+use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
 use basics::str_hex::str_hex;
+use basics::tagged_cache::MonotonicClock;
 use ledger::{Ledger, LedgerHeader, Sandbox};
 use nodestore::{
     Backend, DatabaseRotatingImp, DummyScheduler, FetchType, Manager, ManagerImp, NullJournal,
     Scheduler,
 };
+use protocol::keylet::ledger_entry_type_from_name;
 use protocol::{
     ApplyFlags, JsonOptions, Keylet, LedgerEntryType, STTx, SerialIter, Serializer, StBase, Ter,
     skip_keylet,
 };
-use shamap::sync::{SHAMapType, SyncState, SyncTree};
+use shamap::family::{
+    NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
+};
 use shamap::tree_node::SHAMapTreeNode;
+use shamap::tree_node_cache::TreeNodeCache;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const DEFAULT_NUDB_PATH: &str = "/mnt/xrpl-data/mainnet/nudb";
@@ -55,10 +60,12 @@ fn make_node_writer(
     Arc::new(
         move |object_type, hash, data, ledger_seq| match &node_store {
             app::SHAMapStoreNodeStore::Single(db) => {
-                db.store(test_node_type(object_type), data, hash, ledger_seq);
+                db.store(test_node_type(object_type), data, hash, ledger_seq)
+                    .expect("test node store write should succeed");
             }
             app::SHAMapStoreNodeStore::Rotating(db) => {
-                db.store(test_node_type(object_type), data, hash, ledger_seq);
+                db.store(test_node_type(object_type), data, hash, ledger_seq)
+                    .expect("test node store write should succeed");
             }
         },
     )
@@ -87,28 +94,17 @@ fn fetch_tx_items_for_ledger(
     let mut items = Vec::new();
     for tx in txs {
         let tx_blob = tx["tx_blob"].as_str().ok_or("missing tx_blob")?;
-        let meta_blob = tx["meta_blob"].as_str().unwrap_or("");
+        let meta_blob = tx["meta_blob"]
+            .as_str()
+            .or_else(|| tx["meta"].as_str())
+            .ok_or("missing meta_blob/meta")?;
         let tx_bytes = decode_hex(tx_blob);
         let meta_bytes = decode_hex(meta_blob);
 
         // Build the VL-encoded item: [vl(tx_bytes)][vl(meta_bytes)]
         let mut item = Vec::new();
-        let tx_len = tx_bytes.len();
-        if tx_len < 128 {
-            item.push(tx_len as u8);
-        } else {
-            item.push(0x80 | ((tx_len >> 8) as u8));
-            item.push((tx_len & 0xff) as u8);
-        }
-        item.extend_from_slice(&tx_bytes);
-        let meta_len = meta_bytes.len();
-        if meta_len < 128 {
-            item.push(meta_len as u8);
-        } else {
-            item.push(0x80 | ((meta_len >> 8) as u8));
-            item.push((meta_len & 0xff) as u8);
-        }
-        item.extend_from_slice(&meta_bytes);
+        encode_vl(&mut item, &tx_bytes);
+        encode_vl(&mut item, &meta_bytes);
 
         // Parse tx to get its hash
         let mut sit = SerialIter::new(&tx_bytes);
@@ -150,7 +146,8 @@ fn decode_hex(value: &str) -> Vec<u8> {
 }
 
 fn http_post(body: &str) -> Result<serde_json::Value, String> {
-    http_post_to(XRPL_RPC_URL, body)
+    let rpc_url = std::env::var("XRPL_RPC_URL").unwrap_or_else(|_| XRPL_RPC_URL.to_string());
+    http_post_to(&rpc_url, body)
 }
 
 fn http_post_to(url: &str, body: &str) -> Result<serde_json::Value, String> {
@@ -171,7 +168,8 @@ fn http_post_to(url: &str, body: &str) -> Result<serde_json::Value, String> {
 }
 
 fn fetch_ledger_header(seq: u32) -> Result<LedgerHeader, String> {
-    fetch_ledger_header_from(XRPL_RPC_URL, seq)
+    let rpc_url = std::env::var("XRPL_RPC_URL").unwrap_or_else(|_| XRPL_RPC_URL.to_string());
+    fetch_ledger_header_from(&rpc_url, seq)
 }
 
 fn fetch_ledger_header_from(url: &str, seq: u32) -> Result<LedgerHeader, String> {
@@ -228,7 +226,10 @@ fn fetch_tx_items_for_ledger_from(
     let mut items = Vec::new();
     for tx in txs {
         let tx_blob = tx["tx_blob"].as_str().ok_or("missing tx_blob")?;
-        let meta_blob = tx["meta_blob"].as_str().unwrap_or("");
+        let meta_blob = tx["meta_blob"]
+            .as_str()
+            .or_else(|| tx["meta"].as_str())
+            .ok_or("missing meta_blob/meta")?;
         let tx_bytes = decode_hex(tx_blob);
         let meta_bytes = decode_hex(meta_blob);
 
@@ -244,13 +245,63 @@ fn fetch_tx_items_for_ledger_from(
     Ok(items)
 }
 
+#[test]
+#[ignore = "requires testnet NuDB and testnet RPC access"]
+fn testnet_ledger_20126307_offer_create_replay_matches_validated_roots() {
+    let nudb_path = std::env::var("XRPL_TESTNET_NUDB_PATH")
+        .unwrap_or_else(|_| DEFAULT_TESTNET_NUDB_PATH.to_string());
+    if !Path::new(&nudb_path).exists() {
+        eprintln!("skipping live OfferCreate replay: NuDB path does not exist: {nudb_path}");
+        return;
+    }
+
+    let parent_seq = 20_126_306;
+    let child_seq = 20_126_307;
+    let parent = load_testnet_parent_ledger(parent_seq, &nudb_path)
+        .unwrap_or_else(|error| panic!("failed to load OfferCreate parent: {error}"));
+    let expected_parent = fetch_ledger_header_from(XRPL_TESTNET_RPC_URL, parent_seq)
+        .expect("fetch canonical parent header");
+    assert_eq!(parent.header().hash, expected_parent.hash);
+    assert_eq!(parent.header().account_hash, expected_parent.account_hash);
+
+    let header = fetch_ledger_header_from(XRPL_TESTNET_RPC_URL, child_seq)
+        .expect("fetch canonical child header");
+    let tx_items = fetch_tx_items_for_ledger_from(XRPL_TESTNET_RPC_URL, child_seq)
+        .expect("fetch canonical child transaction");
+    let (built, ters) = replay_child_ledger_unverified(&parent, header.clone(), &tx_items)
+        .expect("replay single OfferCreate child");
+
+    assert_eq!(ters, vec![Ter::TES_SUCCESS]);
+    assert_eq!(built.header().tx_hash, header.tx_hash);
+    assert_eq!(built.header().account_hash, header.account_hash);
+    assert_eq!(
+        protocol::calculate_ledger_hash(&built.header()),
+        header.hash
+    );
+}
+
+/// Encode a variable-length field using the real XRPL VL length-prefix
+/// scheme (see `Serializer::decode_length_length`/`decode_vl_length_1/2/3`):
+/// lengths 0..=192 use a single byte equal to the length; lengths
+/// 193..=12480 use two bytes where `b1 = 193 + ((len-193) >> 8)` and
+/// `b2 = (len-193) & 0xff`; lengths 12481..=918744 use three bytes where
+/// `b1 = 241 + ((len-12481) >> 16)`, `b2 = ((len-12481) >> 8) & 0xff`, and
+/// `b3 = (len-12481) & 0xff`.
 fn encode_vl(out: &mut Vec<u8>, bytes: &[u8]) {
     let len = bytes.len();
-    if len < 128 {
+    if len <= 192 {
         out.push(len as u8);
+    } else if len <= 12480 {
+        let adjusted = len - 193;
+        out.push(193 + (adjusted >> 8) as u8);
+        out.push((adjusted & 0xff) as u8);
+    } else if len <= 918_744 {
+        let adjusted = len - 12481;
+        out.push(241 + (adjusted >> 16) as u8);
+        out.push(((adjusted >> 8) & 0xff) as u8);
+        out.push((adjusted & 0xff) as u8);
     } else {
-        out.push(0x80 | ((len >> 8) as u8));
-        out.push((len & 0xff) as u8);
+        panic!("encode_vl: length {len} exceeds maximum VL field size");
     }
     out.extend_from_slice(bytes);
 }
@@ -417,38 +468,135 @@ fn load_testnet_parent_ledger(parent_seq: u32, nudb_path: &str) -> Result<Ledger
     load_parent_ledger_with_header(parent_seq, header, fetcher)
 }
 
+struct LocalParentNodeFetcher {
+    fetcher: Arc<dyn Fn(SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> + Send + Sync>,
+    first_missing: Arc<Mutex<Option<SHAMapHash>>>,
+}
+
+impl SHAMapNodeFetcher for LocalParentNodeFetcher {
+    fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        let node = (self.fetcher)(hash);
+        if node.is_none() {
+            let mut missing = self
+                .first_missing
+                .lock()
+                .expect("parent completeness missing-hash lock");
+            if missing.is_none() {
+                *missing = Some(hash);
+            }
+        }
+        node
+    }
+}
+
+fn incomplete_parent_error(
+    parent_seq: u32,
+    fallback_hash: SHAMapHash,
+    first_missing: &Arc<Mutex<Option<SHAMapHash>>>,
+) -> String {
+    let missing_hash = first_missing
+        .lock()
+        .expect("parent completeness missing-hash lock")
+        .unwrap_or(fallback_hash);
+    format!(
+        "parent incomplete: ledger {} missing hash {} in local NuDB",
+        parent_seq, missing_hash
+    )
+}
+
 fn load_parent_ledger_with_header(
     parent_seq: u32,
     header: LedgerHeader,
     fetcher: Arc<dyn Fn(SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> + Send + Sync>,
 ) -> Result<Ledger, String> {
-    let mut ledger = Ledger::from_header_hashes(header);
-    ledger.set_node_fetcher(fetcher.clone());
-
-    let Some(state_root) = fetcher(header.account_hash) else {
-        return Err(format!(
-            "missing state root for parent ledger {}",
-            parent_seq
+    // This offline harness deliberately has no ApplicationRoot or inbound-ledger
+    // runtime. It may only use its local NuDB fetcher, so a missing node is a
+    // deterministic incomplete-parent error rather than a peer-acquisition request.
+    let first_missing = Arc::new(Mutex::new(None));
+    let family = SHAMapFamily::new(
+        Arc::new(TreeNodeCache::new(
+            "nudb-parity-parent-loader",
+            8,
+            time::Duration::seconds(1),
+            MonotonicClock::default(),
+        )),
+        NullFullBelowCache::new(0),
+        LocalParentNodeFetcher {
+            fetcher: fetcher.clone(),
+            first_missing: Arc::clone(&first_missing),
+        },
+        NullMissingNodeReporter,
+    );
+    let journal = ledger::NullLedgerJournal;
+    let (mut ledger, roots_loaded) =
+        Ledger::load_immutable_with_family(header, false, &journal, &family);
+    if !roots_loaded {
+        return Err(incomplete_parent_error(
+            parent_seq,
+            ledger.header().account_hash,
+            &first_missing,
         ));
+    }
+
+    // Match replay_startup_ledger_from_storage: a parent becomes full only
+    // after every reachable state and transaction node is locally available.
+    if !ledger.walk_ledger_with_family(&journal, false, &family) {
+        return Err(incomplete_parent_error(
+            parent_seq,
+            ledger.header().account_hash,
+            &first_missing,
+        ));
+    }
+
+    ledger.set_node_fetcher(fetcher);
+    ledger
+        .finish_load_by_index_or_hash(&journal)
+        .map_err(|error| format!("parent ledger {} setup failed: {error:?}", parent_seq))?;
+    ledger.assert_sensible();
+    Ok(ledger)
+}
+
+fn is_incomplete_parent(error: &str) -> bool {
+    error.starts_with("parent incomplete:")
+}
+
+fn load_mainnet_parent_or_skip(fixture: &str, parent_seq: u32, nudb_path: &str) -> Option<Ledger> {
+    match load_parent_ledger(parent_seq, nudb_path) {
+        Ok(parent) => Some(parent),
+        Err(error) if is_incomplete_parent(&error) => {
+            eprintln!(
+                "{fixture}: SKIP — local historical parent is incomplete; {error}. \
+                 The offline NuDB fixture does not acquire missing nodes from peers."
+            );
+            None
+        }
+        Err(error) => panic!("{fixture}: failed to load parent ledger: {error}"),
+    }
+}
+
+#[test]
+fn root_only_parent_is_reported_incomplete() {
+    let missing_child = SHAMapHash::new(Uint256::from_array([0xA5; 32]));
+    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    state_root.set_child_hash(7, missing_child);
+    state_root.update_hash();
+    let root_hash = state_root.get_hash();
+    let fetcher = Arc::new(move |hash| {
+        if hash == root_hash {
+            Some(state_root.clone())
+        } else {
+            None
+        }
+    });
+    let header = LedgerHeader {
+        seq: 1,
+        account_hash: root_hash,
+        ..LedgerHeader::default()
     };
 
-    let state_map = SyncTree::from_root_with_type(
-        state_root,
-        SHAMapType::State,
-        true,
-        parent_seq,
-        SyncState::Immutable,
-    );
-    state_map.set_full();
-
-    let mut ledger = Ledger::from_maps(
-        header,
-        state_map,
-        SyncTree::new_with_type(SHAMapType::Transaction, true, parent_seq),
-    );
-    ledger.set_node_fetcher(fetcher);
-    ledger.set_immutable(true);
-    Ok(ledger)
+    let error = load_parent_ledger_with_header(1, header, fetcher).unwrap_err();
+    assert!(error.contains("parent incomplete"), "{error}");
+    assert!(error.contains(&missing_child.to_string()), "{error}");
 }
 
 fn replay_child_ledger_unverified(
@@ -471,19 +619,39 @@ fn replay_child_ledger_unverified(
             .map_err(|error| format!("update_negative_unl failed: {:?}", error))?;
     }
 
-    let mut ters = Vec::new();
+    // Decode every transaction first, then hand the whole set to a
+    // CanonicalTXSet — matching the production accept path's
+    // `decode_consensus_accept_transactions` (xrpld/app/src/consensus/
+    // rcl_consensus.rs), which canonicalizes on (account, seq_proxy, tx_id)
+    // BEFORE the apply loop ever runs. The raw `ledger` RPC `transactions`
+    // array is in SHAMap/consensus order, not account+sequence order, so
+    // applying it directly (as this harness previously did) can process one
+    // account's chained transactions out of order within a single pass.
+    let mut canonical = ledger::CanonicalTXSet::new(*acquired_header.tx_hash.as_uint256());
+    let mut tx_id_by_hash = std::collections::HashMap::new();
     for (tx_data, tx_id) in tx_items {
         let mut outer = SerialIter::new(tx_data);
         let tx_bytes = outer.get_vl();
         let mut sit = SerialIter::new(&tx_bytes);
         let sttx = STTx::from_serial_iter(&mut sit);
+        tx_id_by_hash.insert(sttx.get_transaction_id(), *tx_id);
+        canonical.insert(Arc::new(sttx));
+    }
+    let ordered_txs = canonical.drain_ordered();
+
+    let mut ters = Vec::new();
+    for sttx in &ordered_txs {
+        let tx_id = tx_id_by_hash
+            .get(&sttx.get_transaction_id())
+            .copied()
+            .unwrap_or_else(|| sttx.get_transaction_id());
         let txn_type = sttx.get_txn_type();
         let base = Arc::new(built.clone());
         let mut view = Sandbox::new(base, ApplyFlags::default());
-        let ter = apply_submit_transactor_shell(&mut view, &sttx, txn_type);
+        let ter = apply_submit_transactor_shell(&mut view, sttx, txn_type);
         ters.push(ter);
         let rules = built.rules().clone();
-        view.apply_with_tx_thread(&mut built, *tx_id, acquired_header.seq, &rules)
+        view.apply_with_tx_thread(&mut built, tx_id, acquired_header.seq, &rules)
             .map_err(|error| format!("apply_with_tx_thread failed: {:?}", error))?;
     }
 
@@ -533,11 +701,176 @@ fn diff_state_key(
     Ok(())
 }
 
+/// Collect the final-state keys touched by a canonical expanded ledger response.
+///
+/// AffectedNodes reports the entry type and index even when a transaction deletes
+/// the entry. This lets the replay diagnostic distinguish an expected final-state
+/// absence from a missing or byte-different built entry.
+fn fetch_canonical_affected_state_keys(
+    url: &str,
+    seq: u32,
+) -> Result<Vec<(LedgerEntryType, Uint256)>, String> {
+    let body = format!(
+        r#"{{"method":"ledger","params":[{{"ledger_index":{},"transactions":true,"expand":true}}]}}"#,
+        seq
+    );
+    let response = http_post_to(url, &body)?;
+    let transactions = response["result"]["ledger"]["transactions"]
+        .as_array()
+        .ok_or_else(|| format!("canonical ledger {} is missing expanded transactions", seq))?;
+
+    let mut affected = Vec::new();
+    for (tx_index, transaction) in transactions.iter().enumerate() {
+        let nodes = transaction["metaData"]["AffectedNodes"]
+            .as_array()
+            .ok_or_else(|| {
+                format!(
+                    "canonical ledger {} transaction {} is missing metaData.AffectedNodes",
+                    seq, tx_index
+                )
+            })?;
+
+        for (node_index, node) in nodes.iter().enumerate() {
+            for node_kind in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                let Some(details) = node[node_kind].as_object() else {
+                    continue;
+                };
+                let ledger_index = details["LedgerIndex"].as_str().ok_or_else(|| {
+                    format!(
+                        "canonical ledger {} transaction {} affected node {} {} is missing LedgerIndex",
+                        seq, tx_index, node_index, node_kind
+                    )
+                })?;
+                let entry_type_name = details["LedgerEntryType"].as_str().ok_or_else(|| {
+                    format!(
+                        "canonical ledger {} transaction {} affected node {} {} is missing LedgerEntryType",
+                        seq, tx_index, node_index, node_kind
+                    )
+                })?;
+                let entry_type = ledger_entry_type_from_name(entry_type_name).ok_or_else(|| {
+                    format!(
+                        "canonical ledger {} transaction {} affected node {} has unsupported LedgerEntryType {}",
+                        seq, tx_index, node_index, entry_type_name
+                    )
+                })?;
+                let key = Uint256::from_hex(ledger_index).map_err(|error| {
+                    format!(
+                        "canonical ledger {} transaction {} affected node {} has invalid LedgerIndex {}: {:?}",
+                        seq, tx_index, node_index, ledger_index, error
+                    )
+                })?;
+
+                if !affected
+                    .iter()
+                    .any(|(seen_type, seen_key)| *seen_type == entry_type && *seen_key == key)
+                {
+                    affected.push((entry_type, key));
+                }
+            }
+        }
+    }
+
+    Ok(affected)
+}
+
+fn canonical_ledger_entry_is_absent(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("entrynotfound") || error.contains("objectnotfound")
+}
+
+/// Print every byte-level final-state mismatch among the entries touched by a
+/// canonical ledger. This is intentionally diagnostic-only: callers retain
+/// their existing assertions and can inspect concrete SLE deltas first.
+fn diff_canonical_affected_state_sles(
+    built: &Ledger,
+    seq: u32,
+    rpc_url: &str,
+) -> Result<(), String> {
+    let affected = fetch_canonical_affected_state_keys(rpc_url, seq)?;
+    eprintln!(
+        "mainnet_{}: diffing {} unique canonical affected state entries",
+        seq,
+        affected.len()
+    );
+
+    let mut fetch_errors = Vec::new();
+    for (entry_type, key) in affected {
+        let (built_present, built_hex, built_json, built_read_failed) =
+            match built.read(Keylet::new(entry_type, key)) {
+                Ok(Some(sle)) => (
+                    true,
+                    serialize_sle_hex(&sle),
+                    format!("{:?}", sle.json(JsonOptions::NONE)),
+                    false,
+                ),
+                Ok(None) => (false, "<absent>".to_string(), "null".to_string(), false),
+                Err(error) => (
+                    false,
+                    "<read-error>".to_string(),
+                    format!("{{\"read_error\":{:?}}}", error),
+                    true,
+                ),
+            };
+
+        let (canonical_present, canonical_hex, canonical_json, canonical_fetch_failed) =
+            match fetch_ledger_entry_binary(rpc_url, seq, key) {
+                Ok(hex) => {
+                    let json = fetch_ledger_entry_json(rpc_url, seq, key)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|error| format!("{{\"fetch_error\":{:?}}}", error));
+                    (true, hex, json, false)
+                }
+                Err(error) if canonical_ledger_entry_is_absent(&error) => {
+                    (false, "<absent>".to_string(), "null".to_string(), false)
+                }
+                Err(error) => {
+                    fetch_errors.push(format!("{} {}: {}", key, entry_type.as_str(), error));
+                    (
+                        false,
+                        "<fetch-error>".to_string(),
+                        format!("{{\"fetch_error\":{:?}}}", error),
+                        true,
+                    )
+                }
+            };
+
+        if built_read_failed
+            || canonical_fetch_failed
+            || built_present != canonical_present
+            || (built_present && canonical_present && built_hex != canonical_hex)
+        {
+            eprintln!(
+                "mainnet_{}: state_diff index={} entry_type={} built_present={} built_hex={} built_json={} canonical_present={} canonical_hex={} canonical_json={}",
+                seq,
+                key,
+                entry_type.as_str(),
+                built_present,
+                built_hex,
+                built_json,
+                canonical_present,
+                canonical_hex,
+                canonical_json,
+            );
+        }
+    }
+
+    if fetch_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not fetch {} canonical affected ledger entries: {}",
+            fetch_errors.len(),
+            fetch_errors.join("; ")
+        ))
+    }
+}
+
 fn run_case(case: TxReplayCase) {
     let nudb_path =
         std::env::var("XRPL_NUDB_PATH").unwrap_or_else(|_| DEFAULT_NUDB_PATH.to_string());
-    let parent = load_parent_ledger(case.parent_seq, &nudb_path)
-        .unwrap_or_else(|error| panic!("{}: failed to load parent ledger: {}", case.name, error));
+    let Some(parent) = load_mainnet_parent_or_skip(case.name, case.parent_seq, &nudb_path) else {
+        return;
+    };
     let tx_bytes = fetch_tx_bytes_from_ledger(case.parent_seq + 1, case.tx_prefix)
         .unwrap_or_else(|error| panic!("{}: failed to fetch tx bytes: {}", case.name, error));
     let mut serial = SerialIter::new(&tx_bytes);
@@ -1012,12 +1345,14 @@ fn nudb_flush_fix_enables_state_reads_across_builds() {
     // Load parent — state must be in NuDB (written by flush fix)
     let parent = match load_parent_ledger(parent_seq, &nudb_path) {
         Ok(p) => p,
-        Err(e) if e.contains("missing state root") => {
+        Err(e) if is_incomplete_parent(&e) => {
             eprintln!(
-                "flush-fix: SKIP — state root for seq={} not in NuDB yet.",
+                "flush-fix: SKIP — local historical parent for seq={} is incomplete.",
                 parent_seq
             );
-            eprintln!("flush-fix: Run the node with flush fix deployed to populate NuDB.");
+            eprintln!(
+                "flush-fix: The offline NuDB fixture does not acquire missing nodes from peers."
+            );
             eprintln!("flush-fix: Error: {}", e);
             return; // Skip test gracefully
         }
@@ -1058,4 +1393,239 @@ fn nudb_flush_fix_enables_state_reads_across_builds() {
         }
     }
     // Reaching here without panic proves flush fix works
+}
+
+#[test]
+#[ignore = "requires mainnet NuDB (NUDB_PATH env or default) and mainnet RPC access"]
+fn mainnet_ledger_106053457_replay_reproduces_offer_create_divergence() {
+    let nudb_path = std::env::var("NUDB_PATH").unwrap_or_else(|_| DEFAULT_NUDB_PATH.to_string());
+    if !Path::new(&nudb_path).exists() {
+        eprintln!(
+            "skipping mainnet replay: NuDB path does not exist: {}",
+            nudb_path
+        );
+        return;
+    }
+
+    let parent_seq = 106_053_456;
+    let child_seq = 106_053_457;
+
+    let Some(parent) = load_mainnet_parent_or_skip("mainnet_106053457", parent_seq, &nudb_path)
+    else {
+        return;
+    };
+    let expected_parent_header =
+        fetch_ledger_header(parent_seq).expect("fetch expected parent header");
+    assert_eq!(
+        parent.header().account_hash,
+        expected_parent_header.account_hash,
+        "parent account hash must match canonical chain before child replay"
+    );
+
+    let acquired_header = fetch_ledger_header(child_seq).expect("fetch canonical child header");
+    let tx_items = fetch_tx_items_for_ledger(child_seq).expect("fetch canonical child tx items");
+
+    eprintln!(
+        "mainnet_106053457: parent_seq={} child_seq={} tx_count={}",
+        parent_seq,
+        child_seq,
+        tx_items.len()
+    );
+
+    let (built, ters) = replay_child_ledger_unverified(&parent, acquired_header.clone(), &tx_items)
+        .expect("replay child ledger");
+
+    // `replay_child_ledger_unverified` applies CanonicalTXSet order, while
+    // `ledger` RPC returns raw SHAMap order. Reconstruct the same canonical
+    // order before pairing TERs with transactions; zipping `tx_items` here
+    // misattributes failures to unrelated transactions.
+    let mut canonical = ledger::CanonicalTXSet::new(*acquired_header.tx_hash.as_uint256());
+    for (tx_data, _) in &tx_items {
+        let mut outer = SerialIter::new(tx_data);
+        let tx_bytes = outer.get_vl();
+        let mut sit = SerialIter::new(&tx_bytes);
+        canonical.insert(Arc::new(STTx::from_serial_iter(&mut sit)));
+    }
+    let ordered_txs = canonical.drain_ordered();
+    assert_eq!(ordered_txs.len(), ters.len());
+
+    // Print every non-tesSUCCESS/non-tecCLAIM result with its account+sequence
+    // so the exact failing transaction(s) and TER codes are visible without
+    // grepping production logs.
+    for (sttx, ter) in ordered_txs.iter().zip(ters.iter()) {
+        let account = sttx.get_account_id(protocol::get_field_by_symbol("sfAccount"));
+        let seq = sttx.get_field_u32(protocol::get_field_by_symbol("sfSequence"));
+        let is_success = matches!(*ter, Ter::TES_SUCCESS) || protocol::is_tec_claim(*ter);
+        eprintln!(
+            "mainnet_106053457: tx_id={} account={} seq={} ter={:?} ok={}",
+            sttx.get_transaction_id(),
+            account,
+            seq,
+            ter,
+            is_success
+        );
+    }
+
+    let failing: Vec<_> = ters
+        .iter()
+        .enumerate()
+        .filter(|(_, ter)| !matches!(**ter, Ter::TES_SUCCESS) && !protocol::is_tec_claim(**ter))
+        .collect();
+    eprintln!(
+        "mainnet_106053457: {} of {} transactions did not apply",
+        failing.len(),
+        ters.len()
+    );
+
+    eprintln!(
+        "mainnet_106053457: built account_hash={} expected={}",
+        built.header().account_hash,
+        acquired_header.account_hash
+    );
+    eprintln!(
+        "mainnet_106053457: built ledger_hash={} expected={}",
+        protocol::calculate_ledger_hash(&built.header()),
+        acquired_header.hash
+    );
+
+    if built.header().account_hash != acquired_header.account_hash {
+        eprintln!(
+            "mainnet_106053457: account hash mismatch; diffing canonical affected state SLEs"
+        );
+        let state_diff_rpc_url =
+            std::env::var("XRPL_STATE_DIFF_RPC_URL").unwrap_or_else(|_| XRPL_RPC_URL.to_string());
+        if let Err(error) =
+            diff_canonical_affected_state_sles(&built, child_seq, &state_diff_rpc_url)
+        {
+            eprintln!(
+                "mainnet_106053457: affected-state diagnostic failed: {}",
+                error
+            );
+        }
+    }
+
+    // Targeted diagnostic: compare the target account's built AccountRoot
+    // against the canonical public state to narrow down any remaining
+    // discrepancy once all transactions apply successfully.
+    if let Ok(target_uint160) =
+        basics::base_uint::Uint160::from_hex("72A3DE6B0973062D5F2FE77383EF02F0C17901AB")
+    {
+        let keylet = protocol::account_keylet(target_uint160);
+        if let Ok(Some(sle)) = built.read(keylet) {
+            eprintln!(
+                "mainnet_106053457: built target AccountRoot json={:?}",
+                sle.json(JsonOptions::NONE)
+            );
+        } else {
+            eprintln!("mainnet_106053457: built target AccountRoot MISSING");
+        }
+        if let Ok(public_entry) = fetch_ledger_entry_json(XRPL_RPC_URL, child_seq, keylet.key) {
+            eprintln!(
+                "mainnet_106053457: public target AccountRoot json={}",
+                public_entry
+            );
+        }
+    }
+
+    // Intentionally not asserting equality yet — this test exists to
+    // reproduce and observe the divergence deterministically. Once the root
+    // cause is fixed, promote these to hard assertions.
+}
+
+#[test]
+#[ignore = "requires mainnet NuDB (NUDB_PATH env or default) and mainnet RPC access"]
+fn mainnet_ledger_106066101_replay_live_offer_sequence_regression() {
+    let nudb_path = std::env::var("NUDB_PATH").unwrap_or_else(|_| DEFAULT_NUDB_PATH.to_string());
+    if !Path::new(&nudb_path).exists() {
+        eprintln!("skipping live OfferSequence replay: NuDB path does not exist: {nudb_path}");
+        return;
+    }
+
+    let parent_seq = 106_066_100;
+    let child_seq = 106_066_101;
+    let target_tx = "2A6F59107625E39518F871240944F1965143C607BE284F5DDF7F16E2208B3649";
+
+    let Some(parent) = load_mainnet_parent_or_skip("mainnet_106066101", parent_seq, &nudb_path)
+    else {
+        return;
+    };
+    let expected_parent = fetch_ledger_header(parent_seq).expect("fetch canonical parent header");
+    assert_eq!(parent.header().hash, expected_parent.hash);
+    assert_eq!(
+        parent.header().account_hash,
+        expected_parent.account_hash,
+        "parent state must be canonical before replay"
+    );
+
+    let header = fetch_ledger_header(child_seq).expect("fetch canonical child header");
+    let tx_items = fetch_tx_items_for_ledger(child_seq).expect("fetch canonical child tx set");
+    let (built, ters) = replay_child_ledger_unverified(&parent, header.clone(), &tx_items)
+        .expect("replay live-failure child ledger");
+
+    let mut canonical = ledger::CanonicalTXSet::new(*header.tx_hash.as_uint256());
+    for (tx_data, _) in &tx_items {
+        let mut outer = SerialIter::new(tx_data);
+        let tx_bytes = outer.get_vl();
+        let mut serial = SerialIter::new(&tx_bytes);
+        canonical.insert(Arc::new(STTx::from_serial_iter(&mut serial)));
+    }
+    let ordered = canonical.drain_ordered();
+    let target_pos = ordered
+        .iter()
+        .position(|tx| tx.get_transaction_id().to_string() == target_tx)
+        .expect("live OfferSequence transaction must be in canonical tx set");
+    assert!(
+        matches!(ters[target_pos], Ter::TES_SUCCESS) || protocol::is_tec_claim(ters[target_pos]),
+        "live OfferSequence tx {target_tx} must not regress to tef/tel/tem: {:?}",
+        ters[target_pos]
+    );
+
+    assert_eq!(built.header().account_hash, header.account_hash);
+    assert_eq!(
+        protocol::calculate_ledger_hash(&built.header()),
+        header.hash
+    );
+}
+
+#[test]
+#[ignore = "requires mainnet NuDB (NUDB_PATH env or default) and mainnet RPC access"]
+fn mainnet_ledger_106066664_replay_live_xrp_payment_regression() {
+    let nudb_path = std::env::var("NUDB_PATH").unwrap_or_else(|_| DEFAULT_NUDB_PATH.to_string());
+    if !Path::new(&nudb_path).exists() {
+        eprintln!("skipping live XRP payment replay: NuDB path does not exist: {nudb_path}");
+        return;
+    }
+    let parent_seq = 106_066_663;
+    let child_seq = 106_066_664;
+    let target_tx = "5DB51F7BF4F701013481B482A46A3D0A18EB367582FF313EB8C55A5593F7ECA1";
+    let parent = load_parent_ledger(parent_seq, &nudb_path)
+        .unwrap_or_else(|error| panic!("failed to load live Payment parent: {error}"));
+    let expected_parent = fetch_ledger_header(parent_seq).expect("fetch parent header");
+    assert_eq!(parent.header().account_hash, expected_parent.account_hash);
+    let header = fetch_ledger_header(child_seq).expect("fetch child header");
+    let tx_items = fetch_tx_items_for_ledger(child_seq).expect("fetch child tx set");
+    let (built, ters) = replay_child_ledger_unverified(&parent, header.clone(), &tx_items)
+        .expect("replay live Payment child ledger");
+    let mut canonical = ledger::CanonicalTXSet::new(*header.tx_hash.as_uint256());
+    for (tx_data, _) in &tx_items {
+        let mut outer = SerialIter::new(tx_data);
+        let tx_bytes = outer.get_vl();
+        let mut serial = SerialIter::new(&tx_bytes);
+        canonical.insert(Arc::new(STTx::from_serial_iter(&mut serial)));
+    }
+    let ordered = canonical.drain_ordered();
+    let pos = ordered
+        .iter()
+        .position(|tx| tx.get_transaction_id().to_string() == target_tx)
+        .expect("live XRP Payment must be in canonical tx set");
+    assert!(
+        matches!(ters[pos], Ter::TES_SUCCESS) || protocol::is_tec_claim(ters[pos]),
+        "live XRP Payment {target_tx} regressed: {:?}",
+        ters[pos]
+    );
+    assert_eq!(built.header().account_hash, header.account_hash);
+    assert_eq!(
+        protocol::calculate_ledger_hash(&built.header()),
+        header.hash
+    );
 }

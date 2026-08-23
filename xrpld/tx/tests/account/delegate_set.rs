@@ -207,35 +207,31 @@ fn delegate_set_preclaim_account_target_and_delete_checks() {
     let missing_account = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
         account_exists: false,
         authorize_exists: true,
-        authorize_is_pseudo_account: false,
         permissions_empty: false,
         delegate_exists: true,
     });
     let missing_target = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
         account_exists: true,
         authorize_exists: false,
-        authorize_is_pseudo_account: false,
         permissions_empty: false,
         delegate_exists: true,
     });
-    let pseudo_target = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
+    let existing_target = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
         account_exists: true,
         authorize_exists: true,
-        authorize_is_pseudo_account: true,
         permissions_empty: false,
-        delegate_exists: true,
+        delegate_exists: false,
     });
     let missing_delete_entry = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
         account_exists: true,
         authorize_exists: true,
-        authorize_is_pseudo_account: false,
         permissions_empty: true,
         delegate_exists: false,
     });
 
     assert_eq!(missing_account, Ter::TER_NO_ACCOUNT);
     assert_eq!(missing_target, Ter::TEC_NO_TARGET);
-    assert_eq!(pseudo_target, Ter::TEC_NO_PERMISSION);
+    assert_eq!(existing_target, Ter::TES_SUCCESS);
     assert_eq!(missing_delete_entry, Ter::TEC_NO_ENTRY);
 }
 

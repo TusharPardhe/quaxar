@@ -8,11 +8,11 @@ use protocol::{
 };
 
 use crate::apply_state_table::ApplyStateTable;
-use crate::raw_view::RawView;
+use crate::raw_view::{RawView, ReadRawView};
 use crate::read_view::{ReadView, ReadViewTx, ViewError};
 use crate::{ApplyView, Fees, LedgerHeader};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Sandbox<B> {
     base: Arc<B>,
     table: ApplyStateTable,
@@ -35,9 +35,15 @@ where
         self.table.apply(to)
     }
 
+    /// Exposes the isolated state delta for dry-run metadata generation. The
+    /// caller still owns whether this sandbox is ever committed.
+    pub fn table(&self) -> &ApplyStateTable {
+        &self.table
+    }
+
     pub fn apply_with_tx_thread(
         &self,
-        to: &mut dyn RawView,
+        to: &mut dyn ReadRawView,
         tx_id: Uint256,
         ledger_seq: u32,
         rules: &Rules,

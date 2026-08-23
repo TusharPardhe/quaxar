@@ -73,7 +73,8 @@ impl PerfLogReportSource for StateAccountingReportSource {
         }
     }
 }
-use protocol::{AccountID, PublicKey};
+use protocol::{AccountID, PublicKey, SeqProxy};
+use quaxar_core::{DatabaseCon, WALLET_DB_INIT, WALLET_DB_NAME};
 use resource::ResourceManager;
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::{BTreeMap, HashMap};
@@ -85,16 +86,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::Duration as TimeDuration;
 use tx::{
-    QueueAcceptLockScope, QueueAcceptOwnerState, QueueApplyHoldPreflightTxSource,
+    ApplyResult, QueueAcceptLockScope, QueueAcceptOwnerState, QueueApplyHoldPreflightTxSource,
     QueueApplyLockScope, QueueApplyObservedAccountLookup, QueueApplyObservedTicketLookup,
     QueueApplyObservedTxSource, QueueApplyObservedViewSource, QueueFeeMetricsSnapshot,
-    QueueTxQMetricsView, QueueTxQRpcView, QueueViews, TxQSetup,
+    QueueTxQMetricsView, QueueTxQRequiredFeeTxSource, QueueTxQRequiredFeeViewSource,
+    QueueTxQRpcView, QueueViews, TxQSetup,
 };
 use xrpl_core::{
     FixedNetworkIdService, HashRouter, HashRouterSetup, LoadMonitorJournal,
     LoadMonitorJournalFactory, PeerReservationJournal, PeerReservationTable,
 };
-use xrpld_core::{DatabaseCon, WALLET_DB_INIT, WALLET_DB_NAME};
 
 static WALLET_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -230,6 +231,15 @@ impl QueueApplyObservedTxSource for AppQueueApplyTxSource<'_> {
     }
 }
 
+/// `QueueTxQRequiredFeeTxSource` lets the production TxQ call
+/// `get_tx_required_fee_and_seq` with a real `AppQueueApplyTxSource`, matching
+/// rippled's `getTxRequiredFeeAndSeq` which also keys on `sfAccount`.
+impl QueueTxQRequiredFeeTxSource<AccountID> for AppQueueApplyTxSource<'_> {
+    fn account(&self) -> &AccountID {
+        &self.account
+    }
+}
+
 impl QueueApplyHoldPreflightTxSource for AppQueueApplyTxSource<'_> {
     fn has_previous_txn_id(&self) -> bool {
         self.tx
@@ -254,7 +264,17 @@ pub struct AppOpenLedgerView {
     pub ledger_current_index: u32,
     pub base_fee_drops: u64,
     pub parent_hash: Uint256,
+    /// Header timing copied from the current open ledger's parent.  This is
+    /// deliberately not reconstructed from a later closed ledger.
+    pub parent_close_time: u32,
+    pub close_time_resolution: u8,
     txs: Vec<AppOpenLedgerTxRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppOpenLedgerTiming {
+    pub parent_close_time: u32,
+    pub close_time_resolution: u8,
 }
 
 impl Default for AppOpenLedgerView {
@@ -273,10 +293,22 @@ impl AppOpenLedgerView {
         base_fee_drops: u64,
         parent_hash: Uint256,
     ) -> Self {
+        Self::with_parent_timing(ledger_current_index, base_fee_drops, parent_hash, 0, 0)
+    }
+
+    pub fn with_parent_timing(
+        ledger_current_index: u32,
+        base_fee_drops: u64,
+        parent_hash: Uint256,
+        parent_close_time: u32,
+        close_time_resolution: u8,
+    ) -> Self {
         Self {
             ledger_current_index,
             base_fee_drops,
             parent_hash,
+            parent_close_time,
+            close_time_resolution,
             txs: Vec::new(),
         }
     }
@@ -291,6 +323,8 @@ impl AppOpenLedgerView {
             ledger_current_index,
             base_fee_drops,
             parent_hash,
+            parent_close_time: 0,
+            close_time_resolution: 0,
             txs,
         }
     }
@@ -336,6 +370,57 @@ impl tx::QueueAcceptLedgerViewSource for AppOpenLedgerView {
     }
 }
 
+/// A thin view wrapper used exclusively by
+/// `apply_network_ops_pending_to_open_ledger` to compute the queue-aware
+/// `available_seq` for the submit response, matching rippled's
+/// `TxQ::getTxRequiredFeeAndSeq(OpenView const& view, ...)` which reads the
+/// account SLE from the *open ledger view* and walks the TxQ.
+///
+/// Fields:
+/// - `ledger`        — the current open or closed ledger view (read-only)
+/// - `open_tx_count` — tx count from the open ledger for fee scaling
+pub struct AppRequiredFeeView<'a, V: ReadView> {
+    ledger: &'a V,
+    open_tx_count: usize,
+}
+
+impl<'a, V: ReadView> AppRequiredFeeView<'a, V> {
+    pub fn new(ledger: &'a V, open_tx_count: usize) -> Self {
+        Self {
+            ledger,
+            open_tx_count,
+        }
+    }
+}
+
+impl<V: ReadView> QueueTxQRequiredFeeViewSource<AccountID, AppQueueApplyTxSource<'_>>
+    for AppRequiredFeeView<'_, V>
+{
+    fn open_ledger_tx_count(&self) -> usize {
+        self.open_tx_count
+    }
+
+    /// Mirrors rippled `TxQ::getTxRequiredFeeAndSeq` which calls
+    /// `calculateBaseFee(view, *tx)` on the open-ledger view.
+    fn calculate_base_fee_drops(&self, tx: &AppQueueApplyTxSource<'_>) -> u64 {
+        crate::state::application_root::calculate_sttx_base_fee(self.ledger, tx.tx())
+    }
+
+    /// Reads `sfSequence` from the account SLE in the base ledger,
+    /// returning `None` for unknown accounts (TxQ treats this as seq=0).
+    fn account_sequence(&self, account: &AccountID) -> Option<u32> {
+        let keylet = protocol::account_keylet(
+            basics::base_uint::Uint160::from_slice(account.data())
+                .expect("AccountID width should match Uint160"),
+        );
+        self.ledger
+            .read(keylet)
+            .ok()
+            .flatten()
+            .map(|sle| sle.get_field_u32(protocol::get_field_by_symbol("sfSequence")))
+    }
+}
+
 impl QueueTxQRpcView for AppOpenLedgerView {
     fn ledger_current_index(&self) -> u32 {
         self.ledger_current_index
@@ -373,7 +458,9 @@ where
         tx: &'a protocol::STTx,
         metrics_snapshot: QueueFeeMetricsSnapshot,
     ) -> Self {
-        let base_fee_drops = read_view.fees().base;
+        let base_fee_drops = crate::state::application_root::calculate_sttx_base_fee(read_view, tx);
+        let default_base_fee_drops =
+            crate::state::application_root::calculate_default_sttx_base_fee(read_view, tx);
         let fee_field = protocol::get_field_by_symbol("sfFee");
         let fee_paid_drops = if tx.is_field_present(fee_field) {
             tx.get_field_amount(fee_field).xrp().drops()
@@ -385,9 +472,13 @@ where
             open_ledger,
             read_view,
             rules: read_view.rules(),
-            calculated_base_fee_drops: i64::try_from(base_fee_drops).unwrap_or(i64::MAX),
+            calculated_base_fee_drops: crate::state::application_root::fee_drops_as_i64(
+                base_fee_drops,
+            ),
             fee_paid_drops,
-            default_base_fee_drops: i64::try_from(base_fee_drops).unwrap_or(i64::MAX),
+            default_base_fee_drops: crate::state::application_root::fee_drops_as_i64(
+                default_base_fee_drops,
+            ),
             metrics_snapshot,
             reserve_drops: read_view.fees().account_reserve(0),
             base_fee_drops,
@@ -494,6 +585,17 @@ impl SharedAppOpenLedger {
         let current_index = self.current().ledger_current_index;
         (current_index != 0).then_some(current_index)
     }
+
+    /// Snapshot only the current-open header fields used by NetworkOPs mode
+    /// promotion. A zero resolution is the synthetic/uninitialized state and
+    /// intentionally cannot satisfy the Full freshness predicate.
+    pub fn current_header_timing(&self) -> Option<AppOpenLedgerTiming> {
+        let current = self.current();
+        (current.close_time_resolution != 0).then_some(AppOpenLedgerTiming {
+            parent_close_time: current.parent_close_time,
+            close_time_resolution: current.close_time_resolution,
+        })
+    }
 }
 
 impl crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource for SharedAppOpenLedger {
@@ -514,32 +616,71 @@ impl crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource for SharedApp
         next_seq: u32,
         base_fee: u64,
         parent_hash: &basics::base_uint::Uint256,
+        parent_close_time: u32,
+        close_time_resolution: u8,
         completed_transaction_ids: &std::collections::HashSet<basics::base_uint::Uint256>,
         retry_transactions: &[std::sync::Arc<protocol::STTx>],
+        retries_first: bool,
     ) {
         // Snapshot, filter, and replace under one OpenLedger modification
         // lock. A separate current_open_transactions() call followed by a
         // later modify() would lose a local submission that arrived between
         // those two critical sections.
         self.modify(|view| {
-            let mut leftover: Vec<std::sync::Arc<protocol::STTx>> = view
+            let leftover: Vec<std::sync::Arc<protocol::STTx>> = view
                 .ordered_txs()
                 .into_iter()
                 .map(|record| record.tx.clone())
                 .filter(|tx| !completed_transaction_ids.contains(&tx.get_transaction_id()))
                 .collect();
-            for tx in retry_transactions {
-                if !completed_transaction_ids.contains(&tx.get_transaction_id())
-                    && !leftover
-                        .iter()
-                        .any(|existing| existing.get_transaction_id() == tx.get_transaction_id())
+            let mut next_transactions = Vec::new();
+            // Matches rippled OpenLedger::accept(retriesFirst=true): rejected
+            // disputes/retries are applied before current-open/local work.
+            if retries_first {
+                for tx in retry_transactions {
+                    if !completed_transaction_ids.contains(&tx.get_transaction_id())
+                        && !next_transactions.iter().any(
+                            |existing: &std::sync::Arc<protocol::STTx>| {
+                                existing.get_transaction_id() == tx.get_transaction_id()
+                            },
+                        )
+                    {
+                        next_transactions.push(std::sync::Arc::clone(tx));
+                    }
+                }
+            }
+            for tx in leftover {
+                if !next_transactions
+                    .iter()
+                    .any(|existing: &std::sync::Arc<protocol::STTx>| {
+                        existing.get_transaction_id() == tx.get_transaction_id()
+                    })
                 {
-                    leftover.push(std::sync::Arc::clone(tx));
+                    next_transactions.push(tx);
+                }
+            }
+            if !retries_first {
+                for tx in retry_transactions {
+                    if !completed_transaction_ids.contains(&tx.get_transaction_id())
+                        && !next_transactions.iter().any(
+                            |existing: &std::sync::Arc<protocol::STTx>| {
+                                existing.get_transaction_id() == tx.get_transaction_id()
+                            },
+                        )
+                    {
+                        next_transactions.push(std::sync::Arc::clone(tx));
+                    }
                 }
             }
 
-            *view = AppOpenLedgerView::with_parent_hash(next_seq, base_fee, *parent_hash);
-            for tx in leftover {
+            *view = AppOpenLedgerView::with_parent_timing(
+                next_seq,
+                base_fee,
+                *parent_hash,
+                parent_close_time,
+                close_time_resolution,
+            );
+            for tx in next_transactions {
                 view.push_transaction(tx);
             }
             true
@@ -578,12 +719,15 @@ mod open_ledger_tests {
             11,
             12,
             &Uint256::from_u64(10),
+            100,
+            10,
             &completed_ids,
             &[
                 Arc::clone(&local_retry),
                 Arc::clone(&peer_retry),
                 Arc::clone(&peer_retry),
             ],
+            true,
         );
 
         let retained = open_ledger.current_open_transactions();
@@ -600,6 +744,19 @@ mod open_ledger_tests {
             ])
         );
         assert_eq!(open_ledger.current().ledger_current_index, 11);
+        assert_eq!(open_ledger.current().parent_close_time, 100);
+        assert_eq!(open_ledger.current().close_time_resolution, 10);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|transaction| transaction.get_transaction_id())
+                .collect::<Vec<_>>(),
+            vec![
+                local_retry.get_transaction_id(),
+                peer_retry.get_transaction_id()
+            ],
+            "retry/dispute transactions must precede leftover local work"
+        );
     }
 }
 
@@ -647,6 +804,48 @@ impl SharedAppTxQ {
         self.lock().metrics_snapshot()
     }
 
+    /// Applies the queue-side outcome of a completed clear-ahead attempt.
+    /// The transaction mutations themselves are committed by the caller's
+    /// sandbox first; this method then mirrors TxQ.cpp's retry bookkeeping and
+    /// `erase(account, begin, end)` cleanup under the queue owner lock.
+    pub fn apply_try_clear_effects(
+        &self,
+        account: AccountID,
+        attempts: &[(SeqProxy, ApplyResult)],
+        removed: &[SeqProxy],
+    ) {
+        if attempts.is_empty() && removed.is_empty() {
+            return;
+        }
+
+        let mut tx_q = self.lock();
+        let views = tx_q.views_mut();
+        if let Some(queued_account) = views.accounts.get_mut(&account) {
+            for (seq_proxy, result) in attempts {
+                if let Some(queued) = queued_account.transactions.get_mut(seq_proxy) {
+                    queued.payload.record_apply_attempt_result(result);
+                }
+            }
+            for seq_proxy in removed {
+                let _ = queued_account.remove(*seq_proxy);
+            }
+        }
+        if !removed.is_empty() {
+            views.fee_order.retain(|entry| {
+                entry.key.account != account || !removed.contains(&entry.key.seq_proxy)
+            });
+        }
+    }
+
+    /// Execute an admission attempt against a cloned TxQ. `simulate` must use
+    /// the canonical queue rules but must not enqueue, evict, or consume retry
+    /// state in the live owner. Parity: ../rippled/src/xrpld/rpc/handlers/
+    /// transaction/Simulate.cpp copies the current OpenView before TxQ::apply.
+    pub fn simulate_with<R>(&self, run: impl FnOnce(&mut AppTxQ) -> R) -> R {
+        let mut isolated = self.lock().clone();
+        run(&mut isolated)
+    }
+
     pub fn get_account_txs<Lock>(
         &self,
         lock: &mut Lock,
@@ -676,6 +875,24 @@ impl SharedAppTxQ {
         View: QueueTxQRpcView,
     {
         self.lock().get_rpc_fee_report(lock, view)
+    }
+
+    /// Mirrors `TxQ::getTxRequiredFeeAndSeq` from rippled: returns the open
+    /// ledger fee, the raw account sequence from the ledger SLE
+    /// (`account_seq_next`), and the queue-aware next available sequence
+    /// (`account_seq_avail`) by calling `nextQueuableSeqImpl` internally.
+    pub fn get_tx_required_fee_and_seq<Lock, View, TxSource>(
+        &self,
+        lock: &mut Lock,
+        view: &View,
+        tx: &TxSource,
+    ) -> tx::QueueTxQRequiredFeeAndSeq
+    where
+        Lock: QueueAcceptLockScope,
+        View: tx::QueueTxQRequiredFeeViewSource<AppTxQAccount, TxSource>,
+        TxSource: tx::QueueTxQRequiredFeeTxSource<AppTxQAccount>,
+    {
+        self.lock().get_tx_required_fee_and_seq(lock, view, tx)
     }
 
     pub fn process_closed_ledger<Lock, App, View>(
@@ -787,6 +1004,45 @@ fn default_app_tx_q() -> SharedAppTxQ {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i8)]
+pub enum RelayUntrustedPolicy {
+    DropUntrusted = -1,
+    Trusted = 0,
+    All = 1,
+}
+
+impl RelayUntrustedPolicy {
+    pub const fn should_drop(self) -> bool {
+        matches!(self, Self::DropUntrusted)
+    }
+
+    pub const fn should_relay(self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    pub fn from_i8(value: i8) -> Self {
+        match value {
+            -1 => Self::DropUntrusted,
+            0 => Self::Trusted,
+            1 => Self::All,
+            _ => Self::Trusted,
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if value.eq_ignore_ascii_case("all") {
+            Ok(Self::All)
+        } else if value.eq_ignore_ascii_case("trusted") {
+            Ok(Self::Trusted)
+        } else if value.eq_ignore_ascii_case("drop_untrusted") {
+            Ok(Self::DropUntrusted)
+        } else {
+            Err(format!("invalid untrusted relay policy: {value}"))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub wallet_db_path: PathBuf,
@@ -794,12 +1050,17 @@ pub struct AppConfig {
     pub path_search: u32,
     pub path_search_fast: u32,
     pub path_search_max: u32,
-    pub relay_untrusted_validations: bool,
+    pub relay_untrusted_validations: RelayUntrustedPolicy,
+    pub relay_untrusted_proposals: RelayUntrustedPolicy,
     pub standalone: bool,
+    pub start_valid: bool,
     pub start_up: xrpl_core::StartUpType,
     pub start_ledger: Option<String>,
     pub do_import: bool,
     pub validation_quorum: usize,
+    /// rippled Config::networkQuorum; network presence threshold, unrelated
+    /// to validator quorum.
+    pub network_quorum: usize,
     pub validation_seed: Option<String>,
     pub validator_token: Option<Vec<String>>,
 }
@@ -812,12 +1073,15 @@ impl Default for AppConfig {
             path_search: 2,
             path_search_fast: 2,
             path_search_max: 2,
-            relay_untrusted_validations: false,
+            relay_untrusted_validations: RelayUntrustedPolicy::All,
+            relay_untrusted_proposals: RelayUntrustedPolicy::Trusted,
             standalone: false,
+            start_valid: false,
             start_up: xrpl_core::StartUpType::Fresh,
             start_ledger: None,
             do_import: false,
             validation_quorum: 1,
+            network_quorum: 1,
             validation_seed: None,
             validator_token: None,
         }
@@ -1007,7 +1271,8 @@ pub struct ApplicationRegistryOwners {
     pub network_id_service: FixedNetworkIdService,
     pub hash_router: Arc<HashRouter>,
     pub validator_sites: Arc<ValidatorSite>,
-    pub manifest_cache: Arc<ManifestCache>,
+    pub validator_manifest_cache: Arc<ManifestCache>,
+    pub publisher_manifest_cache: Arc<ManifestCache>,
     pub cluster: Arc<Cluster>,
     pub resource_manager: Arc<ResourceManager>,
     pub inbound_ledgers: AppInboundLedgers,
@@ -1138,7 +1403,8 @@ impl ApplicationRegistryOwners {
             network_id_service: FixedNetworkIdService::new(0),
             hash_router: Arc::new(HashRouter::new(HashRouterSetup::default())),
             validator_sites: Arc::new(ValidatorSite::new(Duration::from_secs(30))),
-            manifest_cache: Arc::new(ManifestCache::new()),
+            validator_manifest_cache: Arc::new(ManifestCache::new()),
+            publisher_manifest_cache: Arc::new(ManifestCache::new()),
             cluster: Arc::new(Cluster::new()),
             resource_manager,
             inbound_ledgers,
@@ -1168,12 +1434,15 @@ impl ApplicationRegistryOwners {
                 path_search: 2,
                 path_search_fast: 2,
                 path_search_max: 3,
-                relay_untrusted_validations: false,
+                relay_untrusted_validations: RelayUntrustedPolicy::All,
+                relay_untrusted_proposals: RelayUntrustedPolicy::Trusted,
                 standalone: false,
+                start_valid: false,
                 start_up: xrpl_core::StartUpType::Fresh,
                 start_ledger: None,
                 do_import: false,
                 validation_quorum: 1,
+                network_quorum: 1,
                 validation_seed: None,
                 validator_token: None,
             },
@@ -1192,7 +1461,7 @@ impl ApplicationRegistryOwners {
 fn unique_wallet_db_dir() -> PathBuf {
     let sequence = WALLET_DB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "xrpld-application-root-wallet-{}-{sequence}",
+        "quaxar-application-root-wallet-{}-{sequence}",
         std::process::id()
     ))
 }
@@ -1200,14 +1469,35 @@ fn unique_wallet_db_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_OPEN_LEDGER_DEFAULT_BASE_FEE_DROPS, AppLogs, AppOpenLedgerTxRecord, AppPlaceholder,
-        unique_wallet_db_dir,
+        APP_OPEN_LEDGER_DEFAULT_BASE_FEE_DROPS, AppConfig, AppLogs, AppOpenLedgerTxRecord,
+        AppPlaceholder, RelayUntrustedPolicy, unique_wallet_db_dir,
     };
     use crate::load::load_manager::LoadManagerJournal;
     use basics::base_uint::Uint256;
     use protocol::JsonValue;
     use std::sync::Arc;
     use xrpl_core::{HashRouterFlags, LoadMonitorJournalFactory, NetworkIDService};
+
+    #[test]
+    fn relay_untrusted_policy_defaults_and_parser_match_rippled() {
+        let config = AppConfig::default();
+        assert_eq!(
+            config.relay_untrusted_validations,
+            RelayUntrustedPolicy::All
+        );
+        assert_eq!(
+            config.relay_untrusted_proposals,
+            RelayUntrustedPolicy::Trusted
+        );
+        for (name, policy) in [
+            ("ALL", RelayUntrustedPolicy::All),
+            ("TrUsTeD", RelayUntrustedPolicy::Trusted),
+            ("DROP_UNTRUSTED", RelayUntrustedPolicy::DropUntrusted),
+        ] {
+            assert_eq!(RelayUntrustedPolicy::parse(name), Ok(policy));
+        }
+        assert!(RelayUntrustedPolicy::parse("relay").is_err());
+    }
 
     #[test]
     fn app_logs_reuse_named_journals_and_keep_entries() {
@@ -1249,7 +1539,8 @@ mod tests {
             owners.hash_router.get_flags(Uint256::default()),
             HashRouterFlags::UNDEFINED
         );
-        assert_eq!(owners.manifest_cache.sequence(), 0);
+        assert_eq!(owners.validator_manifest_cache.sequence(), 0);
+        assert_eq!(owners.publisher_manifest_cache.sequence(), 0);
         assert!(matches!(
             owners.validator_sites.get_json(),
             JsonValue::Object(json) if json.contains_key("validator_sites")

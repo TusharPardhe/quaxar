@@ -11,8 +11,9 @@ path = "src/lib.rs"
 
 [dependencies]
 tracing = "0.1"
-xrpld-metrics = { path = "../metrics" }
+quaxar-metrics = { path = "../metrics" }
 app = { path = "../app" }
+overlay = { path = "../overlay" }
 axum = { version = "0.8", features = ["json", "ws"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 basics = { path = "../../xrpl/basics" }

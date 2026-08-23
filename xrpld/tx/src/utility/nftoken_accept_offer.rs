@@ -48,10 +48,12 @@ pub fn run_nftoken_accept_offer_preflight<Registry, Tx, Journal, ParentBatchId>(
     }
 
     if let Some(broker_fee) = facts.nftoken_broker_fee {
-        if broker_fee.negative() || !broker_fee.is_legal_net() {
-            return Ter::TEM_BAD_AMOUNT;
-        }
         if facts.nftoken_sell_offer.is_none() || facts.nftoken_buy_offer.is_none() {
+            return Ter::TEM_MALFORMED;
+        }
+        // NFTokenAcceptOffer.cpp deliberately checks only strict positivity;
+        // it does not apply OfferCreate's isLegalNet rule to BrokerFee.
+        if broker_fee.signum() <= 0 {
             return Ter::TEM_MALFORMED;
         }
     }

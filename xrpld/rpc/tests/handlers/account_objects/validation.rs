@@ -34,6 +34,53 @@ fn account_objects_requires_a_real_account_root() {
 }
 
 #[test]
+fn account_objects_current_scopes_reads_to_the_resolved_open_ledger() {
+    let account = sample_account(0x12);
+    let check_key = sample_hash(0x22);
+    let open_ledger = LedgerLookupLedger {
+        hash: sample_hash(0xAC),
+        seq: 92,
+        open: true,
+    };
+    let mut source = FakeSource {
+        ledger: Some(open_ledger),
+        ..Default::default()
+    };
+    source
+        .entries
+        .insert(account_root_key(account), make_account_root(account));
+    source.entries.insert(
+        owner_root_key(account),
+        make_owner_dir_page(account, &[check_key], None),
+    );
+    source
+        .entries
+        .insert(child_keylet(check_key), make_check_entry(check_key));
+
+    let response = do_account_objects(
+        &AccountObjectsRequest {
+            params: &object([
+                ("account", JsonValue::String(to_base58(account))),
+                ("ledger_index", JsonValue::String("current".to_owned())),
+                ("type", JsonValue::String("check".to_owned())),
+            ]),
+            api_version: 1,
+            role: Role::Admin,
+        },
+        &source,
+    );
+
+    let JsonValue::Object(response) = response else {
+        panic!("account_objects response must be an object");
+    };
+    let JsonValue::Array(items) = response.get("account_objects").expect("account_objects") else {
+        panic!("account_objects must be an array");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(*source.scoped_ledger.borrow(), Some(open_ledger));
+}
+
+#[test]
 fn account_objects_honors_type_filter_without_deletion_blockers_flag() {
     let account = sample_account(0x22);
     let offer_key = sample_hash(0x31);

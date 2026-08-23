@@ -180,6 +180,11 @@ fn inbound_run_data_tracks_useful_peer_counts_and_resets_dispatch_latch() {
         InboundLedgerRunDataResult {
             triggered_peer_ids: vec![1],
             processed_packets: 2,
+            useful_packets: 1,
+            useful_nodes: 1,
+            state_packets: 0,
+            state_useful_nodes: 0,
+            state_duplicate_nodes: 0,
             max_useful_count: 1,
             packet_stats: Vec::new(),
             malformed_packets: vec![(
@@ -187,6 +192,7 @@ fn inbound_run_data_tracks_useful_peer_counts_and_resets_dispatch_latch() {
                 InboundLedgerDataType::TransactionNode,
                 InboundLedgerPacketError::EmptyNodes
             ),],
+            invalid_packets: Vec::new(),
         }
     );
     assert!(!inbound.receive_dispatched());

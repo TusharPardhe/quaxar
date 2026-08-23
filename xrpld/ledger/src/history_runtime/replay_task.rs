@@ -2,10 +2,15 @@
 
 use crate::{
     InboundLedgerReason, Ledger, LedgerDeltaAcquire, LedgerDeltaBuildError, SkipListAcquire,
+    timeout_counter::{
+        TimeoutCounter, TimeoutCounterJobConfig, TimeoutCounterJournal, TimeoutCounterRuntime,
+    },
 };
 use basics::base_uint::Uint256;
 use std::sync::{Arc, Mutex};
+use time::Duration;
 
+pub const REPLAY_TASK_TIMEOUT: Duration = Duration::milliseconds(500);
 pub const REPLAY_TASK_MAX_TIMEOUTS_MULTIPLIER: u32 = 2;
 pub const REPLAY_TASK_MAX_TIMEOUTS_MINIMUM: u32 = 10;
 
@@ -96,6 +101,8 @@ pub struct LedgerReplayTask {
     stopping: bool,
     progress: bool,
     timeouts: u32,
+    timer_interval: Duration,
+    timeout_counter: Option<TimeoutCounter>,
 }
 
 impl LedgerReplayTask {
@@ -120,6 +127,8 @@ impl LedgerReplayTask {
             stopping: false,
             progress: false,
             timeouts: 0,
+            timer_interval: REPLAY_TASK_TIMEOUT,
+            timeout_counter: None,
         }
     }
 
@@ -143,10 +152,48 @@ impl LedgerReplayTask {
         self.stopping
     }
 
+    pub fn timer_interval(&self) -> Duration {
+        self.timer_interval
+    }
+
+    /// Construct and retain the 500 ms TimeoutCounter used to drive this
+    /// parent replay task.
+    pub fn create_timeout_counter(
+        &mut self,
+        runtime: Arc<dyn TimeoutCounterRuntime>,
+        journal: Arc<dyn TimeoutCounterJournal>,
+        job: TimeoutCounterJobConfig,
+        on_timer: impl Fn(bool, TimeoutCounter) + Send + Sync + 'static,
+    ) -> TimeoutCounter {
+        let counter = TimeoutCounter::new(
+            runtime,
+            journal,
+            self.parameter.finish_hash,
+            self.timer_interval,
+            job,
+            on_timer,
+        );
+        self.timeout_counter = Some(counter.clone());
+        counter
+    }
+
     pub fn add_delta(&mut self, delta: Arc<Mutex<LedgerDeltaAcquire>>) {
         if self.finished() {
             return;
         }
+
+        if self
+            .deltas
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &delta))
+        {
+            return;
+        }
+
+        delta
+            .lock()
+            .expect("delta lock")
+            .add_data_reason(self.parameter.reason);
 
         if let Some(last) = self.deltas.last() {
             let last_seq = last.lock().expect("last delta lock").ledger_seq();
@@ -180,10 +227,11 @@ impl LedgerReplayTask {
         }
     }
 
-    pub fn invoke_on_timer<LOOKUP, BUILD, E>(
+    pub fn invoke_on_timer<LOOKUP, BUILD, FALLBACK, E>(
         &mut self,
         lookup_parent: &mut LOOKUP,
         build_replay: &mut BUILD,
+        fallback_acquire: &mut FALLBACK,
     ) -> Result<(), ReplayTaskError<E>>
     where
         LOOKUP: FnMut(Uint256, u32) -> Option<Arc<Ledger>>,
@@ -191,6 +239,7 @@ impl LedgerReplayTask {
             &mut LedgerDeltaAcquire,
             &Arc<Ledger>,
         ) -> Result<Option<Arc<Ledger>>, LedgerDeltaBuildError<E>>,
+        FALLBACK: FnMut(Uint256, u32, InboundLedgerReason),
     {
         if self.finished() {
             return Ok(());
@@ -206,13 +255,14 @@ impl LedgerReplayTask {
             self.progress = false;
         }
 
-        self.trigger(lookup_parent, build_replay)
+        self.trigger(lookup_parent, build_replay, fallback_acquire)
     }
 
-    pub fn trigger<LOOKUP, BUILD, E>(
+    pub fn trigger<LOOKUP, BUILD, FALLBACK, E>(
         &mut self,
         lookup_parent: &mut LOOKUP,
         build_replay: &mut BUILD,
+        fallback_acquire: &mut FALLBACK,
     ) -> Result<(), ReplayTaskError<E>>
     where
         LOOKUP: FnMut(Uint256, u32) -> Option<Arc<Ledger>>,
@@ -220,6 +270,7 @@ impl LedgerReplayTask {
             &mut LedgerDeltaAcquire,
             &Arc<Ledger>,
         ) -> Result<Option<Arc<Ledger>>, LedgerDeltaBuildError<E>>,
+        FALLBACK: FnMut(Uint256, u32, InboundLedgerReason),
     {
         if !self.parameter.full {
             return Ok(());
@@ -227,6 +278,15 @@ impl LedgerReplayTask {
 
         if self.parent.is_none() {
             self.parent = lookup_parent(self.parameter.start_hash, self.parameter.start_seq);
+            if self.parent.is_none() {
+                // LedgerReplayTask.cpp::trigger requests the missing parent
+                // as a normal inbound ledger on every timer retry.
+                fallback_acquire(
+                    self.parameter.start_hash,
+                    self.parameter.start_seq,
+                    InboundLedgerReason::Generic,
+                );
+            }
         }
 
         self.try_advance(build_replay)

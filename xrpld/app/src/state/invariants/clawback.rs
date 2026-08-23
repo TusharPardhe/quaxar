@@ -19,7 +19,7 @@ pub(super) fn record_clawback_state(state: &mut ClawbackState, before: Option<&S
     }
 }
 
-pub(super) fn validates_clawback<V: ApplyView>(
+pub(super) fn validates_clawback<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
     result: Ter,

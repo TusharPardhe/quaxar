@@ -66,8 +66,11 @@ impl Default for FeeSetup {
     fn default() -> Self {
         Self {
             reference_fee: XRPAmount::from_drops(10),
-            account_reserve: XRPAmount::from_drops(1_000_000), // 1 XRP — default fee setup
-            owner_reserve: XRPAmount::from_drops(200_000),     // 0.2 XRP — default fee setup
+            // Keep the automatic vote aligned with the genesis/default
+            // FeeSettings schedule. Otherwise the first flag ledger lowers
+            // the account-creation reserve after bootstrap.
+            account_reserve: XRPAmount::from_drops(10_000_000), // 10 XRP
+            owner_reserve: XRPAmount::from_drops(2_000_000),    // 2 XRP
         }
     }
 }
@@ -216,11 +219,6 @@ where
         L: FeeVoteLedgerView,
         S: VoteTxSet,
     {
-        assert!(
-            last_closed_ledger.is_flag_ledger(),
-            "xrpl::FeeVote::doVoting : has a flag ledger"
-        );
-
         let (current_base, current_reserve, current_increment) =
             current_fee_schedule(last_closed_ledger.fees());
         let mut base_fee_vote = VotableValue::new(current_base, self.target.reference_fee);
@@ -480,12 +478,13 @@ mod tests {
     use protocol::XRPAmount;
 
     #[test]
-    fn fee_setup_defaults_match_current_cpp_recommendations() {
+    fn fee_setup_defaults_match_genesis_fee_schedule() {
         let setup = FeeSetup::default();
 
         assert_eq!(setup.reference_fee, XRPAmount::from_drops(10));
-        assert_eq!(setup.account_reserve, XRPAmount::from_drops(1_000_000));
-        assert_eq!(setup.owner_reserve, XRPAmount::from_drops(200_000));
+        assert_eq!(setup.account_reserve, XRPAmount::from_drops(10_000_000));
+        assert_eq!(setup.owner_reserve, XRPAmount::from_drops(2_000_000));
+        assert_eq!(setup.to_fees(), ledger::CURRENT_DEFAULT_FEES);
     }
 
     #[test]

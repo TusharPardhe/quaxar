@@ -6,12 +6,18 @@ use crate::network::network_ops_runtime::AppNetworkOpsRuntime;
 use crate::runtime::main_runtime::ManagedComponent;
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 use crate::state::app_registry::{AppInboundLedgers, AppInboundTransactions};
+use crate::state::application_root::ApplicationRoot;
+use crate::validator::validator_list::{PublisherListStats, ValidatorBlobInfo};
+use crate::validator::validator_site::{
+    ReqwestValidatorSiteTransport, ValidatorSite, ValidatorSiteSink,
+};
 use basics;
 use consensus;
 use ledger::LedgerCleaner;
 use perflog::{PerfLog, PerfLogImp};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // AppNodeStoreRuntime (unchanged)
@@ -69,7 +75,97 @@ impl ManagedComponent for AppNodeStoreRuntime {
 }
 
 // ---------------------------------------------------------------------------
-// AppLedgerRuntime (unchanged)
+// ReplayTimerRuntime
+// ---------------------------------------------------------------------------
+
+/// Schedules replay timeout work without running ledger logic on the timer
+/// thread. The queued operation owns the `JtReplayTask` context used by
+/// rippled's `TimeoutCounter` callbacks.
+struct ReplayTimerRuntime {
+    root: ApplicationRoot,
+    stopping: Arc<(Mutex<bool>, Condvar)>,
+    tick_queued: Arc<AtomicBool>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl ReplayTimerRuntime {
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+    fn new(root: ApplicationRoot) -> Self {
+        Self {
+            root,
+            stopping: Arc::new((Mutex::new(false), Condvar::new())),
+            tick_queued: Arc::new(AtomicBool::new(false)),
+            worker: Mutex::new(None),
+        }
+    }
+
+    fn start(&self) -> Result<(), String> {
+        let mut worker = self.worker.lock().expect("replay timer worker lock");
+        if worker.is_some() {
+            return Ok(());
+        }
+        *self.stopping.0.lock().expect("replay timer stop lock") = false;
+        let root = self.root.clone();
+        let stopping = Arc::clone(&self.stopping);
+        let tick_queued = Arc::clone(&self.tick_queued);
+        *worker = Some(
+            std::thread::Builder::new()
+                .name("quaxar-ledger-replay-timer".to_owned())
+                .spawn(move || {
+                    let (lock, wake) = &*stopping;
+                    let mut stopped = lock.lock().expect("replay timer stop lock");
+                    while !*stopped {
+                        let (next, _) = wake
+                            .wait_timeout(stopped, Self::POLL_INTERVAL)
+                            .expect("replay timer wait");
+                        stopped = next;
+                        if *stopped {
+                            break;
+                        }
+                        if !root.has_active_ledger_replay_timers() {
+                            continue;
+                        }
+                        if tick_queued
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        let job_root = root.clone();
+                        let job_queued = Arc::clone(&tick_queued);
+                        let queued = root.job_queue().add_job(
+                            crate::job::job_types::JobType::JtReplayTask,
+                            "LedgerReplayTimer",
+                            move || {
+                                job_queued.store(false, Ordering::Release);
+                                job_root.drive_ledger_replay_timers();
+                            },
+                        );
+                        if !queued {
+                            tick_queued.store(false, Ordering::Release);
+                        }
+                    }
+                })
+                .map_err(|error| format!("failed to spawn replay timer runtime: {error}"))?,
+        );
+        Ok(())
+    }
+
+    fn stop(&self) {
+        {
+            let (lock, wake) = &*self.stopping;
+            *lock.lock().expect("replay timer stop lock") = true;
+            wake.notify_all();
+        }
+        if let Some(worker) = self.worker.lock().expect("replay timer worker lock").take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AppLedgerRuntime
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -78,6 +174,7 @@ pub struct AppLedgerRuntime {
     inbound_ledgers: AppInboundLedgers,
     inbound_transactions: AppInboundTransactions,
     ledger_replayer: Arc<Mutex<ledger::LedgerReplayer>>,
+    replay_timer: Arc<ReplayTimerRuntime>,
     ledger_master_runtime: Arc<AppLedgerMasterRuntime>,
     network_ops_runtime: Option<Arc<AppNetworkOpsRuntime>>,
     started: Arc<AtomicBool>,
@@ -107,6 +204,7 @@ impl AppLedgerRuntime {
         inbound_ledgers: AppInboundLedgers,
         inbound_transactions: AppInboundTransactions,
         ledger_replayer: Arc<Mutex<ledger::LedgerReplayer>>,
+        root: ApplicationRoot,
         ledger_master_runtime: Arc<AppLedgerMasterRuntime>,
         network_ops_runtime: Option<Arc<AppNetworkOpsRuntime>>,
     ) -> Self {
@@ -115,6 +213,7 @@ impl AppLedgerRuntime {
             inbound_ledgers,
             inbound_transactions,
             ledger_replayer,
+            replay_timer: Arc::new(ReplayTimerRuntime::new(root)),
             ledger_master_runtime,
             network_ops_runtime,
             started: Arc::new(AtomicBool::new(false)),
@@ -132,6 +231,11 @@ impl ManagedComponent for AppLedgerRuntime {
             return Ok(());
         }
         self.ledger_cleaner.start();
+        if let Err(error) = self.replay_timer.start() {
+            self.ledger_cleaner.stop();
+            self.started.store(false, Ordering::Release);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -139,6 +243,7 @@ impl ManagedComponent for AppLedgerRuntime {
         if self.stopped.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.replay_timer.stop();
         self.ledger_cleaner.stop();
         self.inbound_ledgers
             .lock()
@@ -161,12 +266,89 @@ impl ManagedComponent for AppLedgerRuntime {
 
 /// Command sent from external code to the consensus strand thread.
 pub enum ConsensusCommand {
+    /// A verified trusted proposal reached the single consensus ingress.
+    /// Sharing this FIFO with Heartbeat prevents timer acceptance from
+    /// overtaking a proposal that the JobQueue completed first.
+    PeerProposal(overlay::inbound::QueuedProposal),
+    /// A completed consensus transaction set reached the same owner FIFO.
+    TxSetComplete {
+        hash: basics::base_uint::Uint256,
+        set: Arc<shamap::sync::SyncTree>,
+    },
+    /// A `JtNetopTimer` job reached the consensus strand. The strand, rather
+    /// than the worker, executes `timer_tick` because it exclusively owns the
+    /// consensus state machine.
+    Heartbeat,
+    /// A `JtAccept` job reached the consensus strand. Keeping the ledger build
+    /// and its `endConsensus → startRound` tail on the owner strand prevents a
+    /// JobQueue worker from racing a timer or peer-proposal mutation.
+    Accept(Box<crate::consensus::rcl_consensus::PendingAcceptWork>),
+    /// Begin consensus with `network_closed` as the target hash and
+    /// `prev_ledger` as the locally loaded previous ledger. These can differ
+    /// during rippled-compatible WrongLedger recovery.
     StartRound {
         now: basics::chrono::NetClockTimePoint,
-        prev_ledger_id: basics::base_uint::Uint256,
+        network_closed: basics::base_uint::Uint256,
         prev_ledger: consensus::RclCxLedger,
     },
     Stop,
+}
+
+/// The sole producer facade for commands entering the consensus owner.
+/// Keeping its sender private prevents callbacks from accidentally creating a
+/// second ordering domain beside the strand FIFO.
+#[derive(Clone)]
+pub struct ConsensusIngress {
+    tx: std::sync::mpsc::SyncSender<ConsensusCommand>,
+}
+
+impl ConsensusIngress {
+    pub(crate) fn bounded(capacity: usize) -> (Self, std::sync::mpsc::Receiver<ConsensusCommand>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+        (Self { tx }, rx)
+    }
+
+    /// Trusted proposals apply backpressure rather than being dropped while
+    /// the consensus owner is busy.
+    pub fn publish_trusted_proposal(&self, proposal: overlay::inbound::QueuedProposal) -> bool {
+        self.tx
+            .send(ConsensusCommand::PeerProposal(proposal))
+            .is_ok()
+    }
+
+    /// A failed non-blocking completion handoff remains durable in
+    /// `InboundTransactions` and is retried through this same facade.
+    pub fn publish_tx_set(
+        &self,
+        hash: basics::base_uint::Uint256,
+        set: Arc<shamap::sync::SyncTree>,
+    ) -> bool {
+        self.try_publish_tx_set(hash, set).is_ok()
+    }
+
+    pub(crate) fn try_publish_tx_set(
+        &self,
+        hash: basics::base_uint::Uint256,
+        set: Arc<shamap::sync::SyncTree>,
+    ) -> Result<(), std::sync::mpsc::TrySendError<ConsensusCommand>> {
+        self.tx
+            .try_send(ConsensusCommand::TxSetComplete { hash, set })
+    }
+
+    pub fn publish_heartbeat(&self) -> bool {
+        self.tx.try_send(ConsensusCommand::Heartbeat).is_ok()
+    }
+
+    pub(crate) fn try_send(
+        &self,
+        command: ConsensusCommand,
+    ) -> Result<(), std::sync::mpsc::TrySendError<ConsensusCommand>> {
+        self.tx.try_send(command)
+    }
+
+    pub(crate) fn sender(&self) -> std::sync::mpsc::SyncSender<ConsensusCommand> {
+        self.tx.clone()
+    }
 }
 
 /// The consensus runtime for the single-strand model. The consensus runner
@@ -174,7 +356,6 @@ pub enum ConsensusCommand {
 /// stored here. This struct only provides:
 /// - External accessors (phase, prev_ledger_id) via atomics/mutex
 /// - A command channel to the strand thread
-/// - The map_complete receiver handoff
 /// - Temporary storage of the runner during construction (before the strand
 ///   thread takes ownership)
 #[derive(Clone)]
@@ -186,18 +367,7 @@ pub struct AppConsensusRuntime {
     /// Updated by the strand thread after each state transition
     prev_ledger_id: Arc<parking_lot::Mutex<basics::base_uint::Uint256>>,
     /// Channel to send commands to the strand thread
-    cmd_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<ConsensusCommand>>>>,
-    /// Receiver for map-complete events (tx-set acquisitions)
-    map_complete_rx: Arc<
-        Mutex<
-            Option<
-                std::sync::mpsc::Receiver<(
-                    basics::base_uint::Uint256,
-                    Arc<shamap::sync::SyncTree>,
-                )>,
-            >,
-        >,
-    >,
+    cmd_tx: Arc<Mutex<Option<std::sync::mpsc::SyncSender<ConsensusCommand>>>>,
     /// Temporary storage for the runner before the strand thread takes it
     runner_storage: Arc<Mutex<Option<crate::consensus::rcl_consensus::AppConsensus>>>,
 }
@@ -212,6 +382,12 @@ impl std::fmt::Debug for AppConsensusRuntime {
     }
 }
 
+impl Default for AppConsensusRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppConsensusRuntime {
     pub fn new() -> Self {
         Self {
@@ -220,7 +396,6 @@ impl AppConsensusRuntime {
             phase: Arc::new(AtomicU8::new(2)), // Accepted initially
             prev_ledger_id: Arc::new(parking_lot::Mutex::new(basics::base_uint::Uint256::zero())),
             cmd_tx: Arc::new(Mutex::new(None)),
-            map_complete_rx: Arc::new(Mutex::new(None)),
             runner_storage: Arc::new(Mutex::new(None)),
         }
     }
@@ -239,21 +414,23 @@ impl AppConsensusRuntime {
     }
 
     /// Set the command sender (strand thread provides this after starting).
-    pub fn set_cmd_sender(&self, tx: std::sync::mpsc::Sender<ConsensusCommand>) {
+    pub fn set_cmd_sender(&self, tx: std::sync::mpsc::SyncSender<ConsensusCommand>) {
         *self.cmd_tx.lock().expect("cmd_tx mutex") = Some(tx);
     }
 
-    /// Send a start-round command to the strand thread.
+    /// Send a start-round command to the strand thread. `network_closed` may
+    /// differ from `prev_ledger.id()` while generic consensus acquires the
+    /// preferred network LCL.
     pub fn send_start_round(
         &self,
         now: basics::chrono::NetClockTimePoint,
-        prev_ledger_id: basics::base_uint::Uint256,
+        network_closed: basics::base_uint::Uint256,
         prev_ledger: consensus::RclCxLedger,
     ) {
         if let Some(tx) = self.cmd_tx.lock().expect("cmd_tx mutex").as_ref() {
-            let _ = tx.send(ConsensusCommand::StartRound {
+            let _ = tx.try_send(ConsensusCommand::StartRound {
                 now,
-                prev_ledger_id,
+                network_closed,
                 prev_ledger,
             });
         }
@@ -262,27 +439,8 @@ impl AppConsensusRuntime {
     /// Send a stop command to the strand thread.
     pub fn send_stop(&self) {
         if let Some(tx) = self.cmd_tx.lock().expect("cmd_tx mutex").as_ref() {
-            let _ = tx.send(ConsensusCommand::Stop);
+            let _ = tx.try_send(ConsensusCommand::Stop);
         }
-    }
-
-    /// Set the map_complete receiver (from InboundTransactions channel).
-    pub fn set_map_complete_receiver(
-        &self,
-        rx: std::sync::mpsc::Receiver<(basics::base_uint::Uint256, Arc<shamap::sync::SyncTree>)>,
-    ) {
-        *self.map_complete_rx.lock().expect("map_complete_rx mutex") = Some(rx);
-    }
-
-    /// Take the map_complete receiver (for the strand thread to own).
-    pub fn take_map_complete_receiver(
-        &self,
-    ) -> Option<std::sync::mpsc::Receiver<(basics::base_uint::Uint256, Arc<shamap::sync::SyncTree>)>>
-    {
-        self.map_complete_rx
-            .lock()
-            .expect("map_complete_rx mutex")
-            .take()
     }
 
     /// The current round's phase, readable from any thread.
@@ -331,13 +489,60 @@ impl ManagedComponent for AppConsensusRuntime {
 }
 
 // ---------------------------------------------------------------------------
-// AppValidatorSiteRuntime (unchanged)
+// AppValidatorSiteRuntime
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct AppValidatorSiteRuntime {
+    root: ApplicationRoot,
+    site: Arc<ValidatorSite>,
     started: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+
+impl std::fmt::Debug for AppValidatorSiteRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppValidatorSiteRuntime")
+            .field("started", &self.started.load(Ordering::Acquire))
+            .field("stopped", &self.stopped.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+struct RuntimeValidatorSiteSink {
+    root: ApplicationRoot,
+}
+
+impl ValidatorSiteSink for RuntimeValidatorSiteSink {
+    fn apply_lists(
+        &mut self,
+        manifest: &str,
+        version: u32,
+        blobs: &[ValidatorBlobInfo],
+        site_uri: String,
+        hash: basics::base_uint::Uint256,
+    ) -> PublisherListStats {
+        self.root
+            .apply_validator_lists(manifest, version, blobs, site_uri, hash)
+    }
+
+    fn load_lists(&self) -> Vec<String> {
+        self.root.validators().load_lists()
+    }
+}
+
+impl AppValidatorSiteRuntime {
+    pub fn new(root: ApplicationRoot) -> Self {
+        let site = root.validator_sites();
+        Self {
+            root,
+            site,
+            started: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            worker: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 impl ManagedComponent for AppValidatorSiteRuntime {
@@ -345,12 +550,48 @@ impl ManagedComponent for AppValidatorSiteRuntime {
         if self.stopped.load(Ordering::Acquire) {
             return Err("validator site runtime has already been stopped".to_owned());
         }
-        self.started.store(true, Ordering::Release);
+        if self.started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        let root = self.root.clone();
+        let site = Arc::clone(&self.site);
+        let stopped = Arc::clone(&self.stopped);
+        let worker = std::thread::Builder::new()
+            .name("validator-site-refresh".to_owned())
+            .spawn(move || {
+                let transport = ReqwestValidatorSiteTransport;
+                let mut sink = RuntimeValidatorSiteSink { root };
+                while !stopped.load(Ordering::Acquire) {
+                    site.refresh_due(&mut sink, &transport, std::time::SystemTime::now());
+                    // One-second polling only schedules due work; each site
+                    // retains its own 5-minute, server-provided, or retry
+                    // interval. Stop is checked frequently for bounded join.
+                    for _ in 0..10 {
+                        if stopped.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            })
+            .map_err(|error| format!("failed to spawn validator site runtime: {error}"))?;
+        *self.worker.lock().expect("validator site worker lock") = Some(worker);
         Ok(())
     }
 
     fn stop(&self) {
-        self.stopped.store(true, Ordering::Release);
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .expect("validator site worker lock")
+            .take()
+        {
+            let _ = worker.join();
+        }
     }
 }
 

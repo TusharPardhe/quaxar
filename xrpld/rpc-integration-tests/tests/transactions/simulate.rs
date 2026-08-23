@@ -8,8 +8,8 @@ use basics::{
     string_utilities::str_unhex,
 };
 use protocol::{
-    get_field_by_symbol, to_base58, AccountID, JsonValue, MPTAmount, MPTIssue, STAmount,
-    STLedgerEntry, STTx, Ter, TxMeta, TxType,
+    get_field_by_symbol, to_base58, AccountID, JsonValue, MPTAmount, MPTIssue, STAmount, STArray,
+    STLedgerEntry, STObject, STTx, Ter, TxMeta, TxType,
 };
 use rpc_integration_tests::env::*;
 
@@ -150,6 +150,47 @@ fn submit_missing_tx_blob_returns_invalid_params() {
     let result = submit_request(&json([]), &source);
 
     assert!(result.is_err(), "missing tx_blob should error");
+}
+
+#[test]
+fn simulate_rejects_batch_before_txq_processing() {
+    // ../rippled/src/xrpld/rpc/handlers/transaction/Simulate.cpp::doSimulate
+    // returns RpcNotImpl for ttBATCH before constructing Transaction or
+    // invoking TxQ::apply.
+    let account = TestAccount::new("simulate_batch");
+    let env = RpcTestEnv::new(&[(&account, 1_000_000_000)]);
+    let mut raw_transactions = STArray::new(get_field_by_symbol("sfRawTransactions"));
+    let mut inner = STObject::make_inner_object(get_field_by_symbol("sfRawTransaction"));
+    inner.set_field_u16(get_field_by_symbol("sfTransactionType"), 0);
+    inner.set_account_id(get_field_by_symbol("sfAccount"), account.id);
+    inner.set_account_id(get_field_by_symbol("sfDestination"), account.id);
+    inner.set_field_amount(
+        get_field_by_symbol("sfAmount"),
+        STAmount::new_native(1, false),
+    );
+    inner.set_field_u32(get_field_by_symbol("sfSequence"), 0);
+    raw_transactions.push_back(inner);
+    let batch = STTx::new(TxType::BATCH, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), account.id);
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        tx.set_field_u32(get_field_by_symbol("sfFlags"), 1);
+        tx.set_field_array(get_field_by_symbol("sfRawTransactions"), raw_transactions);
+    });
+    let source = env.rpc_source();
+    let status = simulate_request(
+        &json([(
+            "tx_blob",
+            JsonValue::String(str_hex(batch.get_serializer().data())),
+        )]),
+        &source,
+    )
+    .expect_err("simulate must reject Batch");
+
+    assert!(status.code_string().starts_with("notSupported"));
 }
 
 #[test]

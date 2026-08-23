@@ -8,9 +8,10 @@ use std::{
 
 use basics::number::{
     NumberParts as RuntimeNumber, NumberRoundModeGuard, RoundingMode, current_number_one,
-    get_mantissa_scale,
+    get_mantissa_scale, get_rounding_mode,
 };
 
+use crate::st_amount::AmountError;
 use crate::{Asset, STAmount, no_issue, sf_generic};
 
 pub const QUALITY_ONE: u32 = 1_000_000_000;
@@ -285,14 +286,22 @@ pub fn get_rate(offer_out: &STAmount, offer_in: &STAmount) -> u64 {
 }
 
 pub fn divide(num: &STAmount, den: &STAmount, asset: impl Into<Asset>) -> STAmount {
+    try_divide(num, den, asset).unwrap_or_else(|error| panic!("{error}"))
+}
+
+pub fn try_divide(
+    num: &STAmount,
+    den: &STAmount,
+    asset: impl Into<Asset>,
+) -> Result<STAmount, AmountError> {
     let asset = asset.into();
 
     if den.signum() == 0 {
-        panic!("division by zero");
+        return Err(AmountError::DivisionByZero);
     }
 
     if num.signum() == 0 {
-        return STAmount::new_with_asset(sf_generic(), asset, 0, 0, false);
+        return STAmount::try_new_with_asset(sf_generic(), asset, 0, 0, false);
     }
 
     let mut num_val = num.mantissa();
@@ -314,11 +323,10 @@ pub fn divide(num: &STAmount, den: &STAmount, asset: impl Into<Asset>) -> STAmou
         }
     }
 
-    let amount = muldiv(num_val, TEN_TO_17, den_val)
-        .expect("divide should preserve the reference implementation overflow behavior")
-        + 5;
+    let amount =
+        muldiv(num_val, TEN_TO_17, den_val).map_err(|_| AmountError::ArithmeticOverflow)? + 5;
 
-    STAmount::new_with_asset(
+    STAmount::try_new_with_asset(
         sf_generic(),
         asset,
         amount,
@@ -328,10 +336,18 @@ pub fn divide(num: &STAmount, den: &STAmount, asset: impl Into<Asset>) -> STAmou
 }
 
 pub fn multiply(v1: &STAmount, v2: &STAmount, asset: impl Into<Asset>) -> STAmount {
+    try_multiply(v1, v2, asset).unwrap_or_else(|error| panic!("{error}"))
+}
+
+pub fn try_multiply(
+    v1: &STAmount,
+    v2: &STAmount,
+    asset: impl Into<Asset>,
+) -> Result<STAmount, AmountError> {
     let asset = asset.into();
 
     if v1.signum() == 0 || v2.signum() == 0 {
-        return STAmount::new_with_asset(sf_generic(), asset, 0, 0, false);
+        return STAmount::try_new_with_asset(sf_generic(), asset, 0, 0, false);
     }
 
     if v1.native() && v2.native() && asset.native() {
@@ -339,15 +355,17 @@ pub fn multiply(v1: &STAmount, v2: &STAmount, asset: impl Into<Asset>) -> STAmou
         let max_v = signed_native_value(v1).max(signed_native_value(v2));
 
         if min_v > 3_000_000_000 {
-            panic!("Native value overflow");
+            return Err(AmountError::NativeOutOfRange);
         }
 
         if ((max_v >> 32) * min_v) > 2_095_475_792 {
-            panic!("Native value overflow");
+            return Err(AmountError::NativeOutOfRange);
         }
 
-        let product = min_v * max_v;
-        return STAmount::new_with_asset(
+        let product = min_v
+            .checked_mul(max_v)
+            .ok_or(AmountError::NativeOutOfRange)?;
+        return STAmount::try_new_with_asset(
             sf_generic(),
             asset,
             product.unsigned_abs(),
@@ -361,15 +379,15 @@ pub fn multiply(v1: &STAmount, v2: &STAmount, asset: impl Into<Asset>) -> STAmou
         let max_v = signed_mpt_value(v1).max(signed_mpt_value(v2));
 
         if min_v > 3_037_000_499 {
-            panic!("MPT value overflow");
+            return Err(AmountError::MptOutOfRange);
         }
 
         if ((max_v >> 32) * min_v) > 2_147_483_648 {
-            panic!("MPT value overflow");
+            return Err(AmountError::MptOutOfRange);
         }
 
-        let product = min_v * max_v;
-        return STAmount::new_with_asset(
+        let product = min_v.checked_mul(max_v).ok_or(AmountError::MptOutOfRange)?;
+        return STAmount::try_new_with_asset(
             sf_generic(),
             asset,
             product.unsigned_abs(),
@@ -378,36 +396,29 @@ pub fn multiply(v1: &STAmount, v2: &STAmount, asset: impl Into<Asset>) -> STAmou
         );
     }
 
-    let mut value1 = v1.mantissa();
-    let mut value2 = v2.mantissa();
-    let mut offset1 = v1.exponent();
-    let mut offset2 = v2.exponent();
+    // Current rippled performs the generic `multiply` path through Number,
+    // then materializes that Number as the requested STAmount asset.  The old
+    // scaled-mantissa implementation added a fixed `+7` before
+    // canonicalization.  That is not equivalent: at a tick-size boundary it
+    // can leave an issued result one wire unit too high, which also places an
+    // Offer in the adjacent quality directory.
+    let product = stamount_as_number(v1)
+        .try_mul(stamount_as_number(v2))
+        .map_err(|_| AmountError::ArithmeticOverflow)?;
 
-    if is_native_or_mpt_amount(v1) {
-        while value1 < ST_AMOUNT_MIN_VALUE {
-            value1 *= 10;
-            offset1 -= 1;
-        }
+    catch_unwind(AssertUnwindSafe(|| {
+        crate::to_amount_from_number::<STAmount>(asset, product, get_rounding_mode())
+    }))
+    .map_err(|_| amount_range_error(asset))?
+    .map_err(|_| amount_range_error(asset))
+}
+
+fn amount_range_error(asset: Asset) -> AmountError {
+    match asset {
+        Asset::Issue(issue) if issue.native() => AmountError::NativeOutOfRange,
+        Asset::MPTIssue(_) => AmountError::MptOutOfRange,
+        Asset::Issue(_) => AmountError::IssuedOutOfRange,
     }
-
-    if is_native_or_mpt_amount(v2) {
-        while value2 < ST_AMOUNT_MIN_VALUE {
-            value2 *= 10;
-            offset2 -= 1;
-        }
-    }
-
-    let amount = muldiv(value1, value2, TEN_TO_14)
-        .expect("multiply should preserve the reference implementation overflow behavior")
-        + 7;
-
-    STAmount::new_with_asset(
-        sf_generic(),
-        asset,
-        amount,
-        offset1 + offset2 + 14,
-        v1.negative() != v2.negative(),
-    )
 }
 
 pub fn mul_round(v1: &STAmount, v2: &STAmount, asset: Asset, round_up: bool) -> STAmount {

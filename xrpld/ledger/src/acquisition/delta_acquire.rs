@@ -1,14 +1,21 @@
 //! `LedgerDeltaAcquire` owner port above the landed replay-data and overlay
 //! seams.
 
-use crate::{InboundLedgerReason, Ledger, LedgerConfig, LedgerHeader, LedgerReplay};
+use crate::{
+    InboundLedgerReason, Ledger, LedgerConfig, LedgerHeader, LedgerReplay,
+    REPLAY_SUB_TASK_FALLBACK_TIMEOUT, REPLAY_SUB_TASK_MAX_TIMEOUTS, REPLAY_SUB_TASK_TIMEOUT,
+    ReplayTransaction,
+    timeout_counter::{
+        TimeoutCounter, TimeoutCounterJobConfig, TimeoutCounterJournal, TimeoutCounterRuntime,
+    },
+};
 use basics::base_uint::Uint256;
 use basics::sha_map_hash::SHAMapHash;
 use overlay::{PeerSet, ProtocolFeature, ProtocolMessage, ProtocolPayload, TmReplayDeltaRequest};
-use protocol::STTx;
 use shamap::sync::{SHAMapType, SyncTree};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use time::Duration;
 
 pub struct LedgerDeltaAcquire {
     hash: Uint256,
@@ -16,7 +23,7 @@ pub struct LedgerDeltaAcquire {
     peer_set: Arc<dyn PeerSet>,
     replay_temp: Option<Arc<Ledger>>,
     full_ledger: Option<Arc<Ledger>>,
-    ordered_txs: BTreeMap<u32, Arc<STTx>>,
+    ordered_txs: BTreeMap<u32, ReplayTransaction>,
     reasons: Vec<InboundLedgerReason>,
     ready_reasons: Vec<InboundLedgerReason>,
     no_feature_peer_count: u32,
@@ -26,6 +33,8 @@ pub struct LedgerDeltaAcquire {
     stopping: bool,
     progress: bool,
     timeouts: i32,
+    timer_interval: Duration,
+    timeout_counter: Option<TimeoutCounter>,
 }
 
 impl LedgerDeltaAcquire {
@@ -46,6 +55,8 @@ impl LedgerDeltaAcquire {
             stopping: false,
             progress: false,
             timeouts: 0,
+            timer_interval: REPLAY_SUB_TASK_TIMEOUT,
+            timeout_counter: None,
         }
     }
 
@@ -101,6 +112,35 @@ impl LedgerDeltaAcquire {
         self.ready_reasons.clear();
     }
 
+    pub fn is_fallback(&self) -> bool {
+        self.fall_back
+    }
+
+    pub fn timer_interval(&self) -> Duration {
+        self.timer_interval
+    }
+
+    /// Construct and retain the TimeoutCounter that drives this replay
+    /// subtask. It starts at 250 ms and changes to one second on fallback.
+    pub fn create_timeout_counter(
+        &mut self,
+        runtime: Arc<dyn TimeoutCounterRuntime>,
+        journal: Arc<dyn TimeoutCounterJournal>,
+        job: TimeoutCounterJobConfig,
+        on_timer: impl Fn(bool, TimeoutCounter) + Send + Sync + 'static,
+    ) -> TimeoutCounter {
+        let counter = TimeoutCounter::new(
+            runtime,
+            journal,
+            self.hash,
+            self.timer_interval,
+            job,
+            on_timer,
+        );
+        self.timeout_counter = Some(counter.clone());
+        counter
+    }
+
     pub fn init<LOOKUP, FALLBACK>(
         &mut self,
         num_peers: usize,
@@ -129,7 +169,7 @@ impl LedgerDeltaAcquire {
 
         if !self.progress {
             self.timeouts += 1;
-            if self.timeouts > crate::REPLAY_SUB_TASK_MAX_TIMEOUTS {
+            if self.timeouts > REPLAY_SUB_TASK_MAX_TIMEOUTS {
                 self.failed = true;
                 return;
             }
@@ -143,8 +183,21 @@ impl LedgerDeltaAcquire {
     pub fn process_data(
         &mut self,
         info: LedgerHeader,
-        ordered_txs: BTreeMap<u32, Arc<STTx>>,
+        ordered_txs: BTreeMap<u32, ReplayTransaction>,
         config: &LedgerConfig,
+    ) {
+        self.process_data_with_rules(info, ordered_txs, crate::Rules::new(config.features.iter()));
+    }
+
+    /// Records a verified replay delta using the rules of the active ledger.
+    /// The overlay callback has no independent configuration authority: like
+    /// rippled's `LedgerDeltaAcquire::processData`, it only materializes the
+    /// temporary replay ledger after the response has been verified.
+    pub fn process_data_with_rules(
+        &mut self,
+        info: LedgerHeader,
+        ordered_txs: BTreeMap<u32, ReplayTransaction>,
+        rules: crate::Rules,
     ) {
         if self.is_done() {
             return;
@@ -156,7 +209,7 @@ impl LedgerDeltaAcquire {
                 SyncTree::new_synching_with_type(SHAMapType::State, true, info.seq),
                 SyncTree::new_synching_with_type(SHAMapType::Transaction, true, info.seq),
             );
-            replay_temp.set_rules(crate::Rules::new(config.features.iter()));
+            replay_temp.set_rules(rules);
             self.replay_temp = Some(Arc::new(replay_temp));
             self.ordered_txs = ordered_txs;
             self.complete = true;
@@ -197,7 +250,7 @@ impl LedgerDeltaAcquire {
             "xrpl::LedgerDeltaAcquire::tryBuild : parent hash match"
         );
 
-        let replay = LedgerReplay::new(
+        let replay = LedgerReplay::new_with_metadata(
             Arc::clone(parent),
             Arc::clone(replay_temp),
             self.ordered_txs.clone(),
@@ -251,10 +304,7 @@ impl LedgerDeltaAcquire {
 
             self.peer_set.add_peers(
                 limit,
-                &mut |peer| {
-                    peer.supports_feature(ProtocolFeature::LedgerReplay)
-                        && peer.has_ledger(self.hash, self.ledger_seq)
-                },
+                &mut |peer| peer.has_ledger(self.hash, self.ledger_seq),
                 &mut |peer| {
                     if peer.supports_feature(ProtocolFeature::LedgerReplay) {
                         self.peer_set.send_request(&request, Some(peer));
@@ -262,6 +312,10 @@ impl LedgerDeltaAcquire {
                         self.no_feature_peer_count += 1;
                         if self.no_feature_peer_count >= crate::REPLAY_MAX_NO_FEATURE_PEER_COUNT {
                             self.fall_back = true;
+                            self.timer_interval = REPLAY_SUB_TASK_FALLBACK_TIMEOUT;
+                            if let Some(counter) = self.timeout_counter.as_ref() {
+                                counter.set_timer_interval(self.timer_interval);
+                            }
                         }
                     }
                 },

@@ -5,6 +5,7 @@ pub mod json;
 pub mod router;
 pub mod session;
 pub mod subscriptions;
+#[allow(clippy::module_inception)]
 pub mod transport;
 pub mod vacuum;
 pub mod wallet;

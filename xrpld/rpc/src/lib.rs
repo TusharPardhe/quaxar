@@ -37,7 +37,7 @@ pub mod subscriptions;
 pub mod validation;
 
 pub mod status {
-    pub use xrpld_core::{RpcErrorCode, RpcStatus, Status};
+    pub use quaxar_core::{RpcErrorCode, RpcStatus, Status};
 }
 pub use status::{RpcErrorCode, RpcStatus, Status};
 

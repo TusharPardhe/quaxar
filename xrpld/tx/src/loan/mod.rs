@@ -86,6 +86,7 @@ pub mod loan_set_preclaim_vault_limit;
 pub mod loan_set_preflight;
 pub mod loan_set_properties;
 pub mod loan_set_sign;
+pub mod read_view_preclaim;
 
 // Re-export all from submodules
 pub use loan_broker_cover_clawback::*;
@@ -174,3 +175,4 @@ pub use loan_set_preclaim_vault_limit::*;
 pub use loan_set_preflight::*;
 pub use loan_set_properties::*;
 pub use loan_set_sign::*;
+pub use read_view_preclaim::*;

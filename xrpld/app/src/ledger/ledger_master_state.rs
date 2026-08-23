@@ -51,8 +51,21 @@ impl SharedLedgerMasterState {
         }
     }
 
-    pub fn note_closed_ledger(&self, ledger: Arc<Ledger>) {
+    pub(crate) fn note_closed_ledger(&self, ledger: Arc<Ledger>) {
         self.closed_ledger.store(Some(ledger));
+    }
+
+    /// Atomically replace the closed ledger only when `expected` is still the
+    /// exact currently installed ledger. This closes the gap between a
+    /// consensus accept job checking its parent and publishing its child.
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by state tests; reserved for the LCL-install path
+    pub(crate) fn replace_closed_ledger_if_current(
+        &self,
+        expected: &Arc<Ledger>,
+        ledger: Arc<Ledger>,
+    ) -> bool {
+        let previous = self.closed_ledger.compare_and_swap(expected, Some(ledger));
+        matches!(&*previous, Some(current) if Arc::ptr_eq(current, expected))
     }
 
     pub fn note_validated_ledger(&self, ledger: Arc<Ledger>) {
@@ -82,12 +95,57 @@ impl SharedLedgerMasterState {
         self.validated_close_time.store(0, Ordering::Release);
     }
 
+    /// Retract a failed provisional ledger only from slots that still point to
+    /// the exact hash and sequence. Later durable progress always wins.
+    pub fn revoke_ledger(&self, hash: basics::sha_map_hash::SHAMapHash, seq: u32) {
+        for slot in [
+            &self.closed_ledger,
+            &self.validated_ledger,
+            &self.published_ledger,
+        ] {
+            if let Some(current) = slot.load_full()
+                && current.header().hash == hash
+                && current.header().seq == seq
+            {
+                slot.compare_and_swap(&current, None);
+            }
+        }
+        if self
+            .validated_ledger
+            .load_full()
+            .is_none_or(|ledger| ledger.header().hash == hash && ledger.header().seq == seq)
+        {
+            self.validated_close_time.store(0, Ordering::Release);
+        }
+        if self
+            .published_ledger
+            .load_full()
+            .is_none_or(|ledger| ledger.header().hash == hash && ledger.header().seq == seq)
+        {
+            self.published_close_time.store(0, Ordering::Release);
+        }
+    }
+
     pub fn closed_ledger(&self) -> Option<Arc<Ledger>> {
         self.closed_ledger.load_full()
     }
 
     pub fn validated_ledger(&self) -> Option<Arc<Ledger>> {
         self.validated_ledger.load_full()
+    }
+
+    /// Return the newest locally available immutable ledger view. Submission
+    /// must not use an older closed slot when validation has already advanced:
+    /// the OpenLedger sandbox and signing flow need one current account-state
+    /// base, matching rippled's OpenLedger/TxQ view.
+    pub fn latest_ledger(&self) -> Option<Arc<Ledger>> {
+        match (self.closed_ledger(), self.validated_ledger()) {
+            (Some(closed), Some(validated)) if validated.header().seq > closed.header().seq => {
+                Some(validated)
+            }
+            (Some(closed), _) => Some(closed),
+            (None, validated) => validated,
+        }
     }
 
     pub fn published_ledger(&self) -> Option<Arc<Ledger>> {
@@ -232,6 +290,48 @@ mod tests {
 
         state.set_published_close_time(520);
         assert_eq!(state.is_caught_up(), LedgerMasterCaughtUp::Yes);
+    }
+
+    #[test]
+    fn consensus_child_cannot_replace_a_newer_closed_ledger() {
+        let state = SharedLedgerMasterState::new(Arc::new(FixedCloseTimeProvider::new(200)));
+        let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(100, 100, false));
+        let authoritative = Arc::new(Ledger::from_ledger_seq_and_close_time(101, 101, false));
+        let stale_child = Arc::new(Ledger::from_ledger_seq_and_close_time(101, 102, false));
+
+        state.note_closed_ledger(Arc::clone(&parent));
+        // This simulates a validation/acquisition update arriving while the
+        // consensus child is being built on `parent`.
+        state.note_closed_ledger(Arc::clone(&authoritative));
+
+        assert!(!state.replace_closed_ledger_if_current(&parent, stale_child));
+        let current = state
+            .closed_ledger()
+            .expect("authoritative LCL remains installed");
+        assert!(Arc::ptr_eq(&current, &authoritative));
+    }
+
+    #[test]
+    fn latest_ledger_uses_newer_validated_state_but_preserves_newer_closed_state() {
+        let state = SharedLedgerMasterState::new(Arc::new(FixedCloseTimeProvider::new(200)));
+        let closed = Arc::new(Ledger::from_ledger_seq_and_close_time(100, 100, false));
+        let validated = Arc::new(Ledger::from_ledger_seq_and_close_time(101, 101, false));
+
+        state.note_closed_ledger(Arc::clone(&closed));
+        state.note_validated_ledger(Arc::clone(&validated));
+        assert!(Arc::ptr_eq(
+            &state
+                .latest_ledger()
+                .expect("newer validated ledger selected"),
+            &validated,
+        ));
+
+        let newer_closed = Arc::new(Ledger::from_ledger_seq_and_close_time(102, 102, false));
+        state.note_closed_ledger(Arc::clone(&newer_closed));
+        assert!(Arc::ptr_eq(
+            &state.latest_ledger().expect("newer closed ledger selected"),
+            &newer_closed,
+        ));
     }
 
     #[test]

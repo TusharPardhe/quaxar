@@ -1,4 +1,5 @@
-use http::{HeaderMap, HeaderValue};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Version};
+use overlay::handshake::{negotiate_inbound_peer_upgrade, validate_outbound_peer_upgrade};
 use overlay::{
     feature_enabled, get_feature_value, is_feature_value, make_features_request_header,
     make_request,
@@ -28,6 +29,41 @@ fn handshake_feature_header_cases() {
         get_feature_value(&headers, "feature5"),
         Some("v6".to_owned())
     );
+}
+
+#[test]
+fn handshake_upgrade_requires_reference_http_method_and_version() {
+    let request = make_request(true, false, false, false, false);
+    assert!(negotiate_inbound_peer_upgrade(&request).is_some());
+
+    let http_ten_request = Request::builder()
+        .method(Method::GET)
+        .version(Version::HTTP_10)
+        .header("Connection", "Upgrade")
+        .header("Connect-As", "Peer")
+        .header("Upgrade", "XRPL/2.2")
+        .body(())
+        .expect("http/1.0 request");
+    assert!(negotiate_inbound_peer_upgrade(&http_ten_request).is_none());
+
+    let post_request = Request::builder()
+        .method(Method::POST)
+        .version(Version::HTTP_11)
+        .header("Connection", "Upgrade")
+        .header("Connect-As", "Peer")
+        .header("Upgrade", "XRPL/2.2")
+        .body(())
+        .expect("post request");
+    assert!(negotiate_inbound_peer_upgrade(&post_request).is_none());
+
+    let http_ten_response = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .version(Version::HTTP_10)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "XRPL/2.2")
+        .body(())
+        .expect("http/1.0 response");
+    assert!(validate_outbound_peer_upgrade(&http_ten_response).is_err());
 }
 
 #[test]

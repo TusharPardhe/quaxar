@@ -121,6 +121,16 @@ fn app_ledger_master_runtime_updates_local_tx_count_like_networkops_update_local
 }
 
 #[test]
+fn app_ledger_master_runtime_tracks_building_ledger_for_consensus_close() {
+    let runtime = AppLedgerMasterRuntime::default();
+    assert_eq!(runtime.building_ledger(), None);
+
+    runtime.set_building_ledger(61);
+
+    assert_eq!(runtime.building_ledger(), Some(61));
+}
+
+#[test]
 fn app_ledger_master_runtime_applies_held_transactions_through_callback() {
     let runtime = AppLedgerMasterRuntime::default();
     let source = account("2222222222222222222222222222222222222222");

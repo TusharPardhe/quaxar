@@ -9,6 +9,7 @@ mod ledger_to_json;
 mod load;
 mod network;
 mod node_family;
+mod persistence_contract;
 mod runtime;
 mod server;
 mod shamap;

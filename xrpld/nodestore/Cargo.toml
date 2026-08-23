@@ -10,7 +10,7 @@ name = "nodestore"
 path = "src/lib.rs"
 
 [dependencies]
-xrpld-metrics = { path = "../metrics" }
+quaxar-metrics = { path = "../metrics" }
 basics = { path = "../../xrpl/basics" }
 protocol = { path = "../../xrpl/protocol" }
 librocksdb-sys = "0.16.0"

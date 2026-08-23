@@ -41,7 +41,7 @@ fn nudb_foundation_uses_cpp_file_names_and_default_appnum() {
     assert!(layout.key_path.ends_with("nudb.key"));
     assert!(layout.log_path.ends_with("nudb.log"));
 
-    let open_args = NuDbOpenArgs::xrpld_default(123, 456);
+    let open_args = NuDbOpenArgs::quaxar_default(123, 456);
     assert_eq!(open_args.app_type, NUDB_APPNUM);
     assert_eq!(open_args.uid, 123);
     assert_eq!(open_args.salt, 456);
@@ -132,6 +132,8 @@ fn nudb_foundation_reads_exact_cpp_shaped_key_header_bytes() {
     assert_eq!(read.salt, 20);
     assert_eq!(read.pepper, nudb_pepper(20));
     assert_eq!(read.block_size, 4096);
+    assert_eq!(read.buckets, 0);
+    assert_eq!(read.modulus, 1);
 }
 
 #[test]

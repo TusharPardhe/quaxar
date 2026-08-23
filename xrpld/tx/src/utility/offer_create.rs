@@ -223,11 +223,17 @@ where
 
     // Insert into owner directory and record the page
     let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-    match dir_append(ctx.view_mut(), &owner_dir, offer_index, &|_| {}) {
+    match dir_insert(
+        ctx.view_mut(),
+        &owner_dir,
+        offer_index,
+        &ledger::describe_owner_dir(account),
+    ) {
         Ok(Some(owner_page)) => {
             offer_sle.set_field_u64(sf("sfOwnerNode"), owner_page);
         }
-        _ => return ApplyResult::new(Ter::TEF_FAILURE, false, false),
+        Ok(None) => return ApplyResult::new(Ter::TEC_DIR_FULL, false, false),
+        Err(_) => return ApplyResult::new(Ter::TEF_FAILURE, false, false),
     }
 
     // Insert into book directory and record the page
@@ -236,11 +242,12 @@ where
         entry_type: LedgerEntryType::DirectoryNode,
         key: book_keylet.key,
     };
-    match dir_insert(ctx.view_mut(), &book_dir, offer_index, &|_| {}) {
+    match dir_append(ctx.view_mut(), &book_dir, offer_index, &|_| {}) {
         Ok(Some(book_page)) => {
             offer_sle.set_field_u64(sf("sfBookNode"), book_page);
         }
-        _ => return ApplyResult::new(Ter::TEF_FAILURE, false, false),
+        Ok(None) => return ApplyResult::new(Ter::TEC_DIR_FULL, false, false),
+        Err(_) => return ApplyResult::new(Ter::TEF_FAILURE, false, false),
     }
 
     // Adjust owner count

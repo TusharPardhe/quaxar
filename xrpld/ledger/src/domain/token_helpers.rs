@@ -298,15 +298,29 @@ fn add_empty_iou_holding<V: ApplyView>(
     flags |= if high { 0x0010_0000 } else { 0x0020_0000 };
     obj.set_field_u32(sf("sfFlags"), flags);
 
-    let low_dir = owner_dir_keylet(to_uint160(if high { dst } else { src }));
-    let low_node = match crate::dir_insert(view, &low_dir, line_keylet.key, &|_| {}) {
+    let low_account = if high { dst } else { src };
+    let low_dir = owner_dir_keylet(to_uint160(low_account));
+    let low_node = match crate::dir_insert(
+        view,
+        &low_dir,
+        line_keylet.key,
+        &crate::describe_owner_dir(low_account),
+    ) {
         Ok(Some(page)) => page,
-        _ => return protocol::Ter::TEF_BAD_LEDGER,
+        Ok(None) => return protocol::Ter::TEC_DIR_FULL,
+        Err(_) => return protocol::Ter::TEF_BAD_LEDGER,
     };
-    let high_dir = owner_dir_keylet(to_uint160(if high { src } else { dst }));
-    let high_node = match crate::dir_insert(view, &high_dir, line_keylet.key, &|_| {}) {
+    let high_account = if high { src } else { dst };
+    let high_dir = owner_dir_keylet(to_uint160(high_account));
+    let high_node = match crate::dir_insert(
+        view,
+        &high_dir,
+        line_keylet.key,
+        &crate::describe_owner_dir(high_account),
+    ) {
         Ok(Some(page)) => page,
-        _ => return protocol::Ter::TEF_BAD_LEDGER,
+        Ok(None) => return protocol::Ter::TEC_DIR_FULL,
+        Err(_) => return protocol::Ter::TEF_BAD_LEDGER,
     };
     obj.set_field_u64(sf("sfLowNode"), low_node);
     obj.set_field_u64(sf("sfHighNode"), high_node);
@@ -428,9 +442,15 @@ fn add_empty_mpt_holding<V: ApplyView>(
 
     let token_keylet = protocol::mptoken_keylet_from_mptid(mpt_id, to_uint160(*account));
     let owner_dir = owner_dir_keylet(to_uint160(*account));
-    let owner_node = match crate::dir_append(view, &owner_dir, token_keylet.key, &|_| {}) {
+    let owner_node = match crate::dir_insert(
+        view,
+        &owner_dir,
+        token_keylet.key,
+        &crate::describe_owner_dir(*account),
+    ) {
         Ok(Some(page)) => page,
-        _ => return protocol::Ter::TEF_BAD_LEDGER,
+        Ok(None) => return protocol::Ter::TEC_DIR_FULL,
+        Err(_) => return protocol::Ter::TEF_BAD_LEDGER,
     };
 
     let mut token = STLedgerEntry::new(token_keylet);

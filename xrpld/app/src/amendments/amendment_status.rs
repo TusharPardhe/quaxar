@@ -274,7 +274,13 @@ impl AmendmentStatus {
 
     pub fn need_validated_ledger(&self, ledger_seq: u32) -> bool {
         let inner = self.inner.lock().expect("amendment status lock");
-        ((ledger_seq.saturating_sub(1)) / 256) != ((inner.last_update_seq.saturating_sub(1)) / 256)
+        // Matches rippled's `AmendmentTableImpl::needValidatedLedger`, which
+        // relies on unsigned `std::uint32_t` wraparound: `lastUpdateSeq_`
+        // starts at 0, so `lastUpdateSeq_ - 1` underflows to `UINT32_MAX` on
+        // the very first call. That makes ledger 1's sync fire immediately
+        // rather than only from ledger 257 onward. `wrapping_sub` reproduces
+        // the same underflow instead of saturating to 0.
+        (ledger_seq.wrapping_sub(1) / 256) != (inner.last_update_seq.wrapping_sub(1) / 256)
     }
 
     pub fn do_validated_ledger_with_sets(

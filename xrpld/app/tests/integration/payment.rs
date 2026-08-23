@@ -92,6 +92,66 @@ fn payment_xrp_to_self() {
     assert_eq!(result, Ter::TEM_REDUNDANT); // C++ parity
 }
 
+/// rippled BookStep::revImp clips an offer to the requested output before
+/// consuming it (src/libxrpl/tx/paths/BookStep.cpp:894-919). A valid
+/// cross-currency payment to self is therefore not redundant and must retain
+/// its 3,300-XRP SendMax while clipping a 1,000-IOU offer to 500 IOU.
+#[test]
+fn payment_xrp_to_iou_partial_self_payment_with_3300_xrp_sendmax() {
+    let checkles = acct(0x11);
+    let maker = acct(0x22);
+    let issuer = acct(0x33);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(checkles, 10_000_000_000, 1, 0),
+        account_root(maker, 10_000_000_000, 1, 0),
+        account_root(issuer, 10_000_000_000, 0, 0),
+        trust_line(checkles, issuer, usd, 0, 10_000, 10_000),
+        trust_line(maker, issuer, usd, 1_000, 10_000, 10_000),
+    ]);
+    let mut view = new_view(ledger);
+
+    let offer = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), maker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(3_300_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(issuer, usd, 1_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &offer, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    let payment = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), checkles);
+        tx.set_account_id(sf("sfDestination"), checkles);
+        tx.set_field_amount(sf("sfAmount"), iou(issuer, usd, 500));
+        tx.set_field_amount(sf("sfSendMax"), xrp(3_300_000_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfFlags"), 0x0002_0000); // tfPartialPayment
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        full_apply(&mut view, &payment, TxType::PAYMENT),
+        Ter::TES_SUCCESS
+    );
+
+    let offer = view
+        .read(protocol::offer_keylet(acct_id(maker), 1))
+        .expect("offer read")
+        .expect("partially consumed offer");
+    assert_eq!(
+        offer.get_field_amount(sf("sfTakerPays")),
+        xrp(1_650_000_000)
+    );
+    assert_eq!(
+        offer.get_field_amount(sf("sfTakerGets")),
+        iou(issuer, usd, 500)
+    );
+}
+
 /// C++ Payment — XRP payment to nonexistent creates account.
 #[test]
 fn payment_xrp_creates_account() {
@@ -250,6 +310,78 @@ fn payment_iou_frozen_destination() {
         result == Ter::TEC_PATH_DRY || result == Ter::TEC_FROZEN || result == Ter::TEC_PATH_PARTIAL,
         "Expected frozen/dry error, got {:?}",
         result
+    );
+}
+
+/// A failing explicit candidate must not poison a valid default strand.
+/// rippled validates each candidate in `toStrand` and retains the default
+/// strand when the explicit account hop has no trust line.
+#[test]
+fn payment_valid_default_survives_invalid_explicit_candidate() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let gw = acct(0x33);
+    let invalid_hop = acct(0x44);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(alice, 5_000_000_000, 1, 0),
+        account_root(bob, 5_000_000_000, 1, 0),
+        account_root(gw, 5_000_000_000, 0, 0),
+        account_root(invalid_hop, 5_000_000_000, 0, 0),
+        trust_line(alice, gw, usd, 1_000, 10_000, 0),
+        trust_line(bob, gw, usd, 0, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let mut explicit = protocol::STPath::new();
+    explicit.push_back(protocol::STPathElement::from_optionals(
+        Some(invalid_hop),
+        None,
+        None,
+    ));
+    let mut paths = protocol::STPathSet::new(sf("sfPaths"));
+    paths.push_back(explicit);
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_account_id(sf("sfDestination"), bob);
+        tx.set_field_amount(sf("sfAmount"), iou(gw, usd, 100));
+        tx.set_field_path_set(sf("sfPaths"), paths);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None),
+        Ter::TES_SUCCESS
+    );
+}
+
+/// Consecutive DirectSteps must enforce the intermediate account's no-ripple
+/// flags on both adjacent trust lines, matching `checkNoRipple`.
+#[test]
+fn payment_direct_strand_honors_intermediate_no_ripple() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    let mut alice_line = trust_line(alice, gw, usd, 1_000, 10_000, 0);
+    let mut bob_line = trust_line(bob, gw, usd, 0, 10_000, 0);
+    // The gateway is the high account on both lines.
+    alice_line.set_field_u32(sf("sfFlags"), protocol::lsfHighNoRipple);
+    bob_line.set_field_u32(sf("sfFlags"), protocol::lsfHighNoRipple);
+    let ledger = build_ledger(vec![
+        account_root(alice, 5_000_000_000, 1, 0),
+        account_root(bob, 5_000_000_000, 1, 0),
+        account_root(gw, 5_000_000_000, 0, 0),
+        alice_line,
+        bob_line,
+    ]);
+    let mut view = new_view(ledger);
+
+    let tx = payment_tx(alice, bob, iou(gw, usd, 100), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None),
+        Ter::TEC_PATH_DRY
     );
 }
 

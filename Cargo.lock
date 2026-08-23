@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "acquisition"
+version = "0.1.0"
+dependencies = [
+ "basics",
+ "bytes",
+ "ledger",
+ "shamap",
+ "tracing",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -98,19 +109,24 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "app"
 version = "0.1.0"
 dependencies = [
+ "acquisition",
  "arc-swap",
  "basics",
  "bs58",
+ "bytes",
  "consensus",
  "http",
  "ipnet",
  "ledger",
  "libc",
  "nodestore",
+ "openssl",
  "overlay",
  "parking_lot",
  "perflog",
  "protocol",
+ "quaxar-core",
+ "quaxar-metrics",
  "rayon",
  "rdb",
  "reqwest",
@@ -132,8 +148,6 @@ dependencies = [
  "tx",
  "webpki-roots 1.0.6",
  "xrpl_core",
- "xrpld-metrics",
- "xrpld_core",
 ]
 
 [[package]]
@@ -1865,6 +1879,7 @@ dependencies = [
  "memmap2",
  "moka",
  "protocol",
+ "quaxar-metrics",
  "rayon",
  "rocksdb",
  "serde",
@@ -1873,7 +1888,6 @@ dependencies = [
  "shamap",
  "tempfile",
  "tracing",
- "xrpld-metrics",
  "xxhash-rust",
 ]
 
@@ -1995,6 +2009,7 @@ dependencies = [
  "prost-build",
  "protoc-bin-vendored",
  "protocol",
+ "quaxar-metrics",
  "rand 0.8.5",
  "rcgen",
  "resource",
@@ -2005,7 +2020,6 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "xrpl_core",
- "xrpld-metrics",
 ]
 
 [[package]]
@@ -2362,6 +2376,84 @@ dependencies = [
  "wasi",
  "web-sys",
  "winapi",
+]
+
+[[package]]
+name = "quaxar-cli"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "basics",
+ "chrono",
+ "clap",
+ "comfy-table",
+ "console",
+ "crossterm 0.27.0",
+ "hex",
+ "indicatif",
+ "ipnet",
+ "protocol",
+ "reqwest",
+ "serde_json",
+ "terminal_size",
+ "ureq",
+]
+
+[[package]]
+name = "quaxar-core"
+version = "0.1.0"
+dependencies = [
+ "basics",
+ "ipnet",
+ "protocol",
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
+name = "quaxar-main"
+version = "0.1.0"
+dependencies = [
+ "app",
+ "base64",
+ "basics",
+ "chrono",
+ "clap",
+ "consensus",
+ "console",
+ "futures",
+ "hex",
+ "indicatif",
+ "ledger",
+ "libc",
+ "nodestore",
+ "overlay",
+ "parking_lot",
+ "protocol",
+ "quaxar-cli",
+ "rdb",
+ "reqwest",
+ "rpc",
+ "serde_json",
+ "server",
+ "shamap",
+ "tempfile",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "xrpl_core",
+]
+
+[[package]]
+name = "quaxar-metrics"
+version = "0.1.0"
+dependencies = [
+ "metrics",
+ "metrics-exporter-prometheus",
+ "once_cell",
 ]
 
 [[package]]
@@ -2789,6 +2881,8 @@ dependencies = [
  "perflog",
  "phf",
  "protocol",
+ "quaxar-core",
+ "quaxar-metrics",
  "rand 0.8.5",
  "rayon",
  "resource",
@@ -2801,8 +2895,6 @@ dependencies = [
  "tracing",
  "tx",
  "xrpl_core",
- "xrpld-metrics",
- "xrpld_core",
 ]
 
 [[package]]
@@ -3088,7 +3180,9 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "ledger",
+ "overlay",
  "protocol",
+ "quaxar-metrics",
  "rpc",
  "rustls",
  "rustls-pemfile",
@@ -3101,7 +3195,6 @@ dependencies = [
  "tower",
  "tracing",
  "tx",
- "xrpld-metrics",
 ]
 
 [[package]]
@@ -4357,86 +4450,8 @@ dependencies = [
  "basics",
  "generator",
  "protocol",
+ "quaxar-core",
  "serde_json",
- "tempfile",
- "xrpld_core",
-]
-
-[[package]]
-name = "xrpld-cli"
-version = "0.1.0"
-dependencies = [
- "base64",
- "basics",
- "chrono",
- "clap",
- "comfy-table",
- "console",
- "crossterm 0.27.0",
- "hex",
- "indicatif",
- "ipnet",
- "protocol",
- "reqwest",
- "serde_json",
- "terminal_size",
- "ureq",
-]
-
-[[package]]
-name = "xrpld-main"
-version = "0.1.0"
-dependencies = [
- "app",
- "base64",
- "basics",
- "chrono",
- "clap",
- "consensus",
- "console",
- "futures",
- "hex",
- "indicatif",
- "ledger",
- "libc",
- "nodestore",
- "overlay",
- "parking_lot",
- "protocol",
- "rdb",
- "reqwest",
- "rpc",
- "serde_json",
- "server",
- "shamap",
- "tempfile",
- "tikv-jemalloc-ctl",
- "tikv-jemallocator",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "xrpl_core",
- "xrpld-cli",
-]
-
-[[package]]
-name = "xrpld-metrics"
-version = "0.1.0"
-dependencies = [
- "metrics",
- "metrics-exporter-prometheus",
- "once_cell",
-]
-
-[[package]]
-name = "xrpld_core"
-version = "0.1.0"
-dependencies = [
- "basics",
- "ipnet",
- "protocol",
- "rusqlite",
  "tempfile",
 ]
 

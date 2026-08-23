@@ -40,11 +40,40 @@ pub fn bootstrap_shamap_store(
     scheduler: Arc<dyn Scheduler>,
     journal: Arc<dyn NodeStoreJournal>,
 ) -> Result<SHAMapStoreBootstrap, String> {
-    let node_db = apply_rocksdb_online_delete_defaults(
+    let mut node_db = apply_rocksdb_online_delete_defaults(
         node_db_section(config)?,
         hash_node_db_cache_mb,
         node_size,
     );
+    let configured_node_size = config
+        .exists("node_size")
+        .then(|| config.section("node_size").values().first().cloned())
+        .flatten();
+    let profile = crate::NodeSizeResourceProfile::for_node_size(configured_node_size.as_deref());
+    if !node_db.exists("node_object_cache_target_nodes")
+        && !node_db.exists("cache_size")
+        && !node_db.exists("cache_capacity_mb")
+        && !node_db.exists("node_object_cache_capacity_bytes")
+    {
+        node_db.set(
+            "node_object_cache_target_nodes",
+            profile.tree_cache_size.to_string(),
+        );
+    }
+    if !node_db.exists("cache_idle_seconds") && !node_db.exists("cache_age") {
+        // rippled injects TreeCacheAge into NodeStore, whose cache interprets
+        // the value in minutes (decoded TreeNodeCache uses seconds).
+        node_db.set(
+            "cache_idle_seconds",
+            profile
+                .tree_cache_age_seconds
+                .saturating_mul(60)
+                .to_string(),
+        );
+    }
+    if !node_db.exists("cache_ttl_seconds") {
+        node_db.set("cache_ttl_seconds", "0");
+    }
     let mut store = SHAMapStore::from_config(config, standalone, ledger_history, 0)?;
 
     let saved_state = if store.delete_interval() != 0 {

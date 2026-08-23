@@ -1,14 +1,16 @@
 use app::{
-    AppBootstrapOptions, build_bootstrap_root, build_bootstrap_runtime, load_basic_config_file,
-    parse_bootstrap_args,
+    AppBootstrapOptions, SHAMapStoreOperatingMode, build_bootstrap_root, build_bootstrap_runtime,
+    load_basic_config_file, parse_bootstrap_args,
 };
 use basics::{base_uint::Uint256, intrusive_pointer::make_shared_intrusive, str_hex::str_hex};
 use ledger::{Ledger, LedgerHeader, calculate_ledger_hash};
 use nodestore::{DummyScheduler, Manager, ManagerImp, NodeObjectType, NullJournal, Scheduler};
 use protocol::{
-    AccountID, LedgerEntryType, MPTAmount, MPTIssue, STAmount, STArray, STLedgerEntry, STObject,
-    STTx, TxType, account_keylet, get_field_by_symbol, make_mpt_id,
+    AccountID, KeyType, LedgerEntryType, MPTAmount, MPTIssue, STAmount, STArray, STLedgerEntry,
+    STObject, STTx, SecretKey, TxType, account_keylet, calc_account_id, derive_public_key,
+    get_field_by_symbol, make_mpt_id,
 };
+use quaxar_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 use shamap::{
     item::SHAMapItem,
     mutation::MutableTree,
@@ -20,7 +22,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 use xrpl_core::StartUpType;
-use xrpld_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 
 fn count_rows(db: &DatabaseCon, table: &str) -> i64 {
     let connection = db.get_session();
@@ -59,6 +60,33 @@ fn payment_tx(sequence: u32, account_fill: u8, destination_fill: u8) -> Arc<STTx
     }))
 }
 
+fn signed_payment_tx(
+    sequence: u32,
+    secret_fill: u8,
+    destination: AccountID,
+) -> (Arc<STTx>, AccountID) {
+    let secret = SecretKey::from_bytes([secret_fill; 32]);
+    let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+    let source = calc_account_id(public.as_bytes());
+    let mut tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+        tx.set_account_id(get_field_by_symbol("sfDestination"), destination);
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::new_native(1_000_000, false),
+        );
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+        tx.set_field_vl(get_field_by_symbol("sfSigningPubKey"), public.as_bytes());
+    });
+    tx.sign(&public, &secret, None)
+        .expect("payment signature should succeed");
+    (Arc::new(tx), source)
+}
+
 fn metadata(index: u32, fill: u8) -> STObject {
     let mut final_fields = STObject::new(get_field_by_symbol("sfFinalFields"));
     final_fields.set_account_id(get_field_by_symbol("sfAccount"), account(fill));
@@ -88,6 +116,22 @@ fn tx_md_payload(tx: &STTx, meta: &STObject) -> Vec<u8> {
     serializer.add_vl(&tx_bytes);
     serializer.add_vl(&meta_bytes);
     serializer.data().to_vec()
+}
+
+fn persisted_bootstrap_account_root_for(account: AccountID, sequence: u32) -> SHAMapItem {
+    let key = account_keylet(raw_account_id(account)).key;
+    let mut entry = STLedgerEntry::from_type_and_key(LedgerEntryType::AccountRoot, key);
+    entry.set_account_id(get_field_by_symbol("sfAccount"), account);
+    entry.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::new_native(1_000_000_000, false),
+    );
+    entry.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+    entry.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
+    entry.set_field_u32(get_field_by_symbol("sfFlags"), 0);
+    entry.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), Uint256::zero());
+    entry.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), 0);
+    SHAMapItem::new(key, entry.get_serializer().data().to_vec())
 }
 
 fn persisted_bootstrap_account_root(fill: u8) -> SHAMapItem {
@@ -151,11 +195,26 @@ fn persisted_bootstrap_ledger(seq: u32) -> Arc<Ledger> {
 }
 
 fn persisted_bootstrap_state_only_ledger(seq: u32) -> Arc<Ledger> {
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
-        SHAMapNodeType::AccountState,
-        persisted_bootstrap_account_root(0x10 + seq as u8),
-        0,
-    ));
+    persisted_bootstrap_state_only_ledger_with_accounts(
+        seq,
+        &[(account(0x10 + seq as u8), u32::from(0x10 + seq as u8))],
+    )
+}
+
+fn persisted_bootstrap_state_only_ledger_with_accounts(
+    seq: u32,
+    accounts: &[(AccountID, u32)],
+) -> Arc<Ledger> {
+    let mut state_tree = MutableTree::new(seq);
+    for (account, account_sequence) in accounts {
+        state_tree
+            .add_item(
+                SHAMapNodeType::AccountState,
+                persisted_bootstrap_account_root_for(*account, *account_sequence),
+            )
+            .expect("account-state item should insert");
+    }
+    let state_root = state_tree.root();
     let mut header = LedgerHeader {
         seq,
         account_hash: state_root.get_hash(),
@@ -244,7 +303,7 @@ fn persist_tree_subtree(
     if node.get_hash().is_zero() {
         return;
     }
-    database.store(
+    let _ = database.store(
         object_type,
         node.serialize_with_prefix()
             .expect("tree node should serialize"),
@@ -264,10 +323,54 @@ fn persist_tree_subtree(
     }
 }
 
+fn persisted_bootstrap_incomplete_state_only_ledger(seq: u32) -> Arc<Ledger> {
+    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        SHAMapNodeType::AccountState,
+        persisted_bootstrap_account_root(0x10 + seq as u8),
+        0,
+    ));
+    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    state_root.set_child_hash(3, state_leaf.get_hash());
+    state_root.update_hash();
+
+    let mut header = LedgerHeader {
+        seq,
+        account_hash: state_root.get_hash(),
+        close_time: 500 + seq,
+        parent_close_time: 499 + seq,
+        close_time_resolution: ledger::LEDGER_DEFAULT_TIME_RESOLUTION,
+        ..LedgerHeader::default()
+    };
+    header.hash = calculate_ledger_hash(&header);
+
+    let mut ledger = Ledger::from_maps(
+        header,
+        SyncTree::from_root_with_type(
+            state_root,
+            SHAMapType::State,
+            false,
+            seq,
+            SyncState::Immutable,
+        ),
+        SyncTree::new_with_type(SHAMapType::Transaction, false, seq),
+    );
+    ledger.set_immutable(true);
+    Arc::new(ledger)
+}
+
 fn persist_bootstrap_storage(
     dir: &TempDir,
     ledgers: &[Arc<Ledger>],
     node_type: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    persist_bootstrap_storage_with_missing_state_children(dir, ledgers, node_type, None)
+}
+
+fn persist_bootstrap_storage_with_missing_state_children(
+    dir: &TempDir,
+    ledgers: &[Arc<Ledger>],
+    node_type: &str,
+    missing_state_children_for: Option<u32>,
 ) -> (PathBuf, PathBuf, PathBuf) {
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
@@ -297,12 +400,26 @@ fn persist_bootstrap_storage(
     let mut persisted_roots = Vec::new();
     for ledger in ledgers {
         let state_root = ledger.state_map().root();
-        persist_tree_subtree(
-            database.as_ref(),
-            state_root.clone(),
-            NodeObjectType::AccountNode,
-            ledger.header().seq,
-        );
+        if missing_state_children_for == Some(ledger.header().seq) {
+            // Persist only the parent root. This is the production failure
+            // shape: the SQL header and root are present, but walk_ledger
+            // discovers that a reachable account-state node is absent.
+            let _ = database.store(
+                NodeObjectType::AccountNode,
+                state_root
+                    .serialize_with_prefix()
+                    .expect("state root should serialize"),
+                *state_root.get_hash().as_uint256(),
+                ledger.header().seq,
+            );
+        } else {
+            persist_tree_subtree(
+                database.as_ref(),
+                state_root.clone(),
+                NodeObjectType::AccountNode,
+                ledger.header().seq,
+            );
+        }
 
         let tx_root = ledger.tx_map().root();
         persist_tree_subtree(
@@ -369,19 +486,19 @@ fn persist_bootstrap_storage(
             .expect("insert ledger row");
     }
 
-    (database_path, node_db_path, dir.path().join("xrpld.cfg"))
+    (database_path, node_db_path, dir.path().join("quaxar.cfg"))
 }
 
 #[test]
-fn app_bootstrap_defaults_to_the_xrpld_config_filename() {
-    let options = parse_bootstrap_args(["xrpld-app".to_owned()]).expect("defaults");
-    assert_eq!(options.config_path, PathBuf::from("xrpld.cfg"));
+fn app_bootstrap_defaults_to_the_quaxar_config_filename() {
+    let options = parse_bootstrap_args(["quaxar-app".to_owned()]).expect("defaults");
+    assert_eq!(options.config_path, PathBuf::from("quaxar.cfg"));
 }
 
 #[test]
 fn app_bootstrap_loads_config_and_assembles_the_app_owned_runtime_shell() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -504,6 +621,23 @@ online_delete = 256
         bootstrap.runtime.root().network_ops_operating_mode_string(),
         "full"
     );
+    let closed = bootstrap
+        .runtime
+        .root()
+        .closed_ledger()
+        .expect("Fresh startup should install an immutable closed LCL");
+    let validated = bootstrap
+        .runtime
+        .root()
+        .validated_ledger()
+        .expect("Fresh --valid startup should mark the initial LCL validated");
+    let published = bootstrap
+        .runtime
+        .root()
+        .published_ledger()
+        .expect("Fresh --valid startup should publish the initial LCL");
+    assert_eq!(validated.header().hash, closed.header().hash);
+    assert_eq!(published.header().hash, closed.header().hash);
     assert!(bootstrap.runtime.root().overlay_runtime().is_some());
     assert!(bootstrap.runtime.root().server_ports_setup().is_some());
     assert!(bootstrap.runtime.root().node_family().is_some());
@@ -519,7 +653,10 @@ online_delete = 256
     let transaction_db =
         DatabaseCon::new_at_path(&database_path, "transaction.db", &[], TRANSACTION_DB_INIT)
             .expect("transaction db");
-    assert!(count_rows(&ledger_db, "Ledgers") >= 1);
+    // `--valid` explicitly promotes the initial next LCL through
+    // setFullLedger, so one validated ledger is persisted before runtime
+    // startup. Ordinary Fresh startup remains unvalidated and unchanged.
+    assert_eq!(count_rows(&ledger_db, "Ledgers"), 1);
     assert!(count_rows(&transaction_db, "Transactions") >= 0);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -533,7 +670,7 @@ online_delete = 256
 #[test]
 fn app_bootstrap_root_reports_app_owned_composition_before_main_binds_server_runtime() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -618,6 +755,81 @@ path = {}
     assert!(bootstrap.root.ledger_master_runtime().is_some());
     assert!(bootstrap.root.network_ops_runtime().is_some());
     assert!(bootstrap.root.network_ops_validation_runtime().is_some());
+}
+
+#[test]
+fn app_bootstrap_online_delete_uses_production_rotation_runtime() {
+    let dir = TempDir::new().expect("tempdir");
+    let config_path = dir.path().join("quaxar.cfg");
+    let database_path = dir.path().join("sql");
+    let node_db_path = dir.path().join("node-db");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[ledger_history]
+8
+
+[database_path]
+{}
+
+[node_db]
+type = RocksDB
+path = {}
+online_delete = 8
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            standalone: true,
+            start_type: StartUpType::Fresh,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("online-delete bootstrap");
+    let service = bootstrap
+        .root
+        .shamap_store_service()
+        .expect("online-delete service");
+    let component = service.component();
+    assert!(
+        bootstrap
+            .root
+            .set_shamap_store_operating_mode(SHAMapStoreOperatingMode::Full)
+    );
+
+    let close_time = bootstrap.root.current_close_time_seconds();
+    service.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
+        100, close_time, false,
+    )));
+    let initialized = component
+        .process_queued_ledger()
+        .expect("initial worker step")
+        .expect("initial queued ledger");
+    assert!(!initialized.rotated);
+    assert_eq!(component.get_last_rotated(), 100);
+
+    service.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
+        108, close_time, false,
+    )));
+    let rotated = component
+        .process_queued_ledger()
+        .expect("rotation worker step")
+        .expect("rotation queued ledger");
+    assert!(rotated.rotated);
+    let saved = component.saved_state();
+    assert_eq!(saved.last_rotated, 108);
+    assert!(!saved.writable_db.is_empty());
+    assert!(!saved.archive_db.is_empty());
+    assert_ne!(saved.writable_db, saved.archive_db);
 }
 
 #[test]
@@ -777,8 +989,17 @@ path = {}
 #[test]
 fn app_bootstrap_loads_replay_parent_and_injects_replay_transactions() {
     let dir = TempDir::new().expect("tempdir");
-    let parent = persisted_bootstrap_state_only_ledger(20);
-    let replay_tx = payment_tx(1, 0x11, 0x21);
+    let destination = account(0x21);
+    let (replay_tx, source) = signed_payment_tx(1, 0x11, destination);
+    let parent =
+        persisted_bootstrap_state_only_ledger_with_accounts(20, &[(source, 1), (destination, 1)]);
+    assert!(
+        parent
+            .read(account_keylet(raw_account_id(source)))
+            .expect("fixture source account read")
+            .is_some(),
+        "strict replay fixture must contain the transaction source account"
+    );
     let delivered_amount = STAmount::from_mpt_amount(
         get_field_by_symbol("sfDeliveredAmount"),
         MPTAmount::from_value(800),
@@ -858,9 +1079,256 @@ path = {}
 }
 
 #[test]
+fn app_bootstrap_replay_raw_inserts_historical_transactions_before_later_replay() {
+    // ../rippled/src/xrpld/app/main/Application.cpp::
+    // ApplicationImp::loadOldLedger calls OpenView::rawTxInsert for replay
+    // data before the later cumulative replay build applies it.
+    let dir = TempDir::new().expect("tempdir");
+    let parent = persisted_bootstrap_state_only_ledger(20);
+    let rejected = payment_tx(1, 0x11, 0x21);
+    let replay = persisted_bootstrap_replay_ledger(
+        21,
+        *parent.header().hash.as_uint256(),
+        &[(Arc::clone(&rejected), metadata(0, 0x92))],
+    );
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let error = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Replay,
+            start_ledger: Some(replay.header().hash.as_uint256().to_string()),
+            start_valid: true,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("raw replay transaction must reach the open-ledger shell");
+
+    assert_eq!(
+        error.root.open_ledger().current().tx_ids(),
+        vec![rejected.get_transaction_id()]
+    );
+}
+
+#[test]
+fn app_bootstrap_replay_raw_inserts_future_sequence_for_cumulative_build() {
+    // ../rippled/src/xrpld/app/main/Application.cpp::
+    // ApplicationImp::loadOldLedger performs rawTxInsert instead of applying
+    // immutable-parent preclaim to each historical transaction.
+    let dir = TempDir::new().expect("tempdir");
+    let destination = account(0x21);
+    let (rejected, source) = signed_payment_tx(2, 0x11, destination);
+    let parent =
+        persisted_bootstrap_state_only_ledger_with_accounts(20, &[(source, 1), (destination, 1)]);
+    let replay = persisted_bootstrap_replay_ledger(
+        21,
+        *parent.header().hash.as_uint256(),
+        &[(Arc::clone(&rejected), metadata(0, 0x92))],
+    );
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let error = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Replay,
+            start_ledger: Some(replay.header().hash.as_uint256().to_string()),
+            start_valid: true,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("raw replay transaction must not be rejected by immutable-parent preclaim");
+
+    assert_eq!(
+        error.root.open_ledger().current().tx_ids(),
+        vec![rejected.get_transaction_id()]
+    );
+}
+
+#[test]
+fn app_bootstrap_replay_raw_inserts_stale_sequence_for_cumulative_build() {
+    // ../rippled/src/xrpld/app/main/Application.cpp::
+    // ApplicationImp::loadOldLedger restores the ordered transaction map with
+    // rawTxInsert and does not run applySteps.cpp::preclaim at startup.
+    let dir = TempDir::new().expect("tempdir");
+    let destination = account(0x31);
+    let (stale, source) = signed_payment_tx(2, 0x12, destination);
+    let parent =
+        persisted_bootstrap_state_only_ledger_with_accounts(20, &[(source, 1), (destination, 1)]);
+    let replay = persisted_bootstrap_replay_ledger(
+        21,
+        *parent.header().hash.as_uint256(),
+        &[(Arc::clone(&stale), metadata(0, 0x93))],
+    );
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let error = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Replay,
+            start_ledger: Some(replay.header().hash.as_uint256().to_string()),
+            start_valid: true,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("raw replay transaction must not be rejected by immutable-parent preclaim");
+
+    assert_eq!(
+        error.root.open_ledger().current().tx_ids(),
+        vec![stale.get_transaction_id()]
+    );
+}
+
+#[test]
+fn app_bootstrap_defers_replay_until_the_exact_incomplete_parent_is_acquired() {
+    let dir = TempDir::new().expect("tempdir");
+    let parent = persisted_bootstrap_incomplete_state_only_ledger(20);
+    let replay = persisted_bootstrap_replay_ledger(21, *parent.header().hash.as_uint256(), &[]);
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage_with_missing_state_children(
+            &dir,
+            &[Arc::clone(&parent), Arc::clone(&replay)],
+            "RocksDB",
+            Some(parent.header().seq),
+        );
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Replay,
+            start_ledger: Some(replay.header().hash.as_uint256().to_string()),
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("incomplete replay parent should be deferred for inbound history");
+
+    assert!(bootstrap.report.replay_startup_pending);
+    assert_eq!(bootstrap.root.closed_ledger_seq(), None);
+    assert_eq!(
+        bootstrap.root.pending_replay_startup(),
+        Some(app::PendingReplayStartup {
+            parent_hash: *parent.header().hash.as_uint256(),
+            parent_seq: parent.header().seq,
+            start_ledger: Some(replay.header().hash.as_uint256().to_string()),
+            trap_tx_hash: None,
+        })
+    );
+}
+
+#[test]
 fn app_bootstrap_loads_ledger_file_into_live_state() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let ledger_path = dir.path().join("ledger.json");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
@@ -949,13 +1417,13 @@ path = {}
 #[test]
 fn app_bootstrap_parses_comments_and_legacy_sections_like_the_config_shell() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     fs::write(
         &config_path,
         r#"
 # comment before any section
 [database_path]
-/var/lib/xrpld
+/var/lib/quaxar
 
 [server]
 port_rpc # comment on a value line
@@ -971,7 +1439,7 @@ protocol = http
     let config = load_basic_config_file(&config_path).expect("config should parse");
     assert_eq!(
         config.legacy("database_path").expect("legacy"),
-        "/var/lib/xrpld"
+        "/var/lib/quaxar"
     );
     assert_eq!(config.section("server").values(), &["port_rpc"]);
 }
@@ -984,7 +1452,7 @@ fn app_bootstrap_applies_path_search_max_defaults_and_explicit_override() {
         &validator_default_path,
         r#"
 [validation_seed]
-sEd7nQwT6zqW6nNw4j6wYf3qvFGYQmQ
+shUwVw52ofnCUX5m7kPTKzJdr4HEH
 
 [server]
 port_rpc
@@ -1043,6 +1511,20 @@ protocol = http,ws
             .path_search_fast(),
         2
     );
+    assert!(
+        validator_default_bootstrap
+            .runtime
+            .root()
+            .validated_ledger()
+            .is_none()
+    );
+    assert!(
+        validator_default_bootstrap
+            .runtime
+            .root()
+            .published_ledger()
+            .is_none()
+    );
     validator_default_bootstrap.runtime.shutdown();
 
     let validator_override_path = dir.path().join("validator-override.cfg");
@@ -1050,7 +1532,7 @@ protocol = http,ws
         &validator_override_path,
         r#"
 [validation_seed]
-sEd7nQwT6zqW6nNw4j6wYf3qvFGYQmQ
+shUwVw52ofnCUX5m7kPTKzJdr4HEH
 
 [path_search_max]
 9
@@ -1133,7 +1615,7 @@ protocol = http,ws
 #[test]
 fn app_bootstrap_network_start_keeps_seeded_genesis_unvalidated() {
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -1185,8 +1667,8 @@ path = {}
     .expect("network bootstrap should build");
 
     assert!(bootstrap.runtime.root().need_network_ledger());
-    assert_eq!(bootstrap.runtime.root().closed_ledger_seq(), Some(1));
-    assert_eq!(bootstrap.runtime.root().published_ledger_seq(), Some(1));
+    assert_eq!(bootstrap.runtime.root().closed_ledger_seq(), Some(2));
+    assert_eq!(bootstrap.runtime.root().published_ledger_seq(), None);
     assert_eq!(bootstrap.runtime.root().validated_ledger_seq(), None);
     assert_eq!(
         bootstrap.runtime.root().network_ops_operating_mode_string(),
@@ -1206,7 +1688,7 @@ fn app_bootstrap_fresh_start_keeps_seeded_genesis_unvalidated() {
     // immediately, which triggered premature `tracking` state promotion and
     // blocked real ledger resolution from the network.
     let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("xrpld.cfg");
+    let config_path = dir.path().join("quaxar.cfg");
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
     fs::write(
@@ -1258,9 +1740,10 @@ path = {}
     )
     .expect("fresh bootstrap should build");
 
-    // Genesis ledger is seeded as closed/published but must NOT be validated.
-    assert_eq!(bootstrap.runtime.root().closed_ledger_seq(), Some(1));
-    assert_eq!(bootstrap.runtime.root().published_ledger_seq(), Some(1));
+    // Genesis plus its immutable successor are stored; the successor is the
+    // closed LCL but must not be published/validated on a network startup.
+    assert_eq!(bootstrap.runtime.root().closed_ledger_seq(), Some(2));
+    assert_eq!(bootstrap.runtime.root().published_ledger_seq(), None);
     assert_eq!(
         bootstrap.runtime.root().validated_ledger_seq(),
         None,
@@ -1276,7 +1759,149 @@ path = {}
 }
 
 #[test]
-fn app_bootstrap_normal_restores_latest_and_configured_history() {
+fn app_bootstrap_fast_load_falls_back_to_genesis_when_durable_load_fails() {
+    let dir = TempDir::new().expect("tempdir");
+    let config_path = dir.path().join("quaxar.cfg");
+    let database_path = dir.path().join("sql");
+    let node_db_path = dir.path().join("node");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = Memory
+path = {}
+fast_load = 1
+
+[features]
+MultiSign
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Normal,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("fast_load fallback should seed genesis successor");
+
+    assert_eq!(bootstrap.root.closed_ledger_seq(), Some(2));
+    assert_eq!(bootstrap.root.validated_ledger_seq(), None);
+    assert_eq!(bootstrap.root.published_ledger_seq(), None);
+
+    let closed = bootstrap.root.closed_ledger().expect("fallback LCL");
+    assert!(closed.header().account_hash.is_non_zero());
+    assert!(
+        closed
+            .read(protocol::Keylet::new(
+                LedgerEntryType::AccountRoot,
+                ledger::genesis_master_account_key(),
+            ))
+            .expect("genesis master AccountRoot lookup")
+            .is_some(),
+        "fast_load fallback must preserve the genesis master account",
+    );
+    assert!(
+        closed
+            .read(protocol::fee_settings_keylet())
+            .expect("genesis FeeSettings lookup")
+            .is_some(),
+        "fast_load fallback must preserve genesis fee settings",
+    );
+    assert!(
+        closed.rules().enabled(&protocol::feature_id("MultiSign")),
+        "configured feature rules remain active after fallback",
+    );
+    assert!(
+        closed.get_enabled_amendments().is_empty(),
+        "Load-mode fallback matches rippled and does not inject Fresh-only genesis amendments",
+    );
+    assert!(
+        !bootstrap.root.need_network_ledger(),
+        "fast_load fallback preserves Load-mode need-network-ledger semantics",
+    );
+}
+
+#[test]
+fn app_bootstrap_normal_starts_genesis_next_lcl_even_with_durable_history() {
+    let dir = TempDir::new().expect("tempdir");
+    let parent = persisted_bootstrap_state_only_ledger(20);
+    let latest = persisted_bootstrap_replay_ledger(21, *parent.header().hash.as_uint256(), &[]);
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage(&dir, &[parent, latest], "RocksDB");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Normal,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("Normal startup should seed rippled-style genesis successor");
+
+    assert_eq!(bootstrap.root.closed_ledger_seq(), Some(2));
+    assert_eq!(bootstrap.root.validated_ledger_seq(), None);
+    assert_eq!(bootstrap.root.published_ledger_seq(), None);
+    assert_eq!(
+        bootstrap.root.open_ledger().current().parent_hash,
+        *bootstrap
+            .root
+            .closed_ledger()
+            .expect("next LCL")
+            .header()
+            .hash
+            .as_uint256()
+    );
+}
+
+#[test]
+fn app_bootstrap_load_restores_latest_and_configured_history() {
     let dir = TempDir::new().expect("tempdir");
     let parent = persisted_bootstrap_state_only_ledger(20);
     let latest = persisted_bootstrap_replay_ledger(21, *parent.header().hash.as_uint256(), &[]);
@@ -1316,11 +1941,11 @@ path = {}
         &config,
         &AppBootstrapOptions {
             config_path,
-            start_type: StartUpType::Normal,
+            start_type: StartUpType::Load,
             ..AppBootstrapOptions::default()
         },
     )
-    .expect("Normal startup should restore durable storage");
+    .expect("Load startup should restore durable storage");
 
     assert_eq!(bootstrap.root.closed_ledger_seq(), Some(21));
     assert_eq!(bootstrap.root.validated_ledger_seq(), Some(21));
@@ -1330,7 +1955,42 @@ path = {}
         .ledger_master_runtime()
         .expect("ledger master runtime")
         .ledger_master();
-    assert!(master.have_ledger(20));
     assert!(master.have_ledger(21));
-    assert_eq!(master.complete_ledgers().to_string(), "20-21");
+    // Explicit Load registers the selected durable LCL; older configured
+    // history is hydrated lazily through provider/NuDB recovery.
+    assert_eq!(master.complete_ledgers().to_string(), "21");
+}
+
+#[test]
+fn app_bootstrap_rejects_present_but_malformed_validation_seed_configuration() {
+    let dir = TempDir::new().expect("tempdir");
+    let config_path = dir.path().join("quaxar.cfg");
+    fs::write(
+        &config_path,
+        r#"
+[validation_seed]
+first-seed
+second-seed
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+"#,
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config should parse");
+    let error = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect_err("multi-line validation seed must not be silently ignored");
+    assert!(error.contains("[validation_seed]"));
 }

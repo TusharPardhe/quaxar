@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use basics::base_uint::Uint256;
 use ledger::{
-    Fees, InboundLedgerReason, Ledger, LedgerConfig, LedgerDeltaAcquire, SkipListAcquire,
-    TransactionAcquire,
+    Fees, InboundLedgerReason, Ledger, LedgerConfig, LedgerDeltaAcquire, LedgerReplayTask,
+    LedgerReplayTaskParameter, REPLAY_SUB_TASK_FALLBACK_TIMEOUT, REPLAY_SUB_TASK_TIMEOUT,
+    REPLAY_TASK_TIMEOUT, SkipListAcquire, TransactionAcquire,
 };
 use overlay::{Peer, PeerImp, PeerSet, ProtocolPayload, SimplePeerSet};
 use protocol::{FeatureSet, PublicKey};
@@ -162,6 +163,52 @@ fn replay_acquires_ignore_featureless_peers() {
     assert!(!delta_acquire.is_complete());
     assert!(!delta_acquire.is_failed());
     assert!(peer.queued_messages().is_empty());
+}
+
+#[test]
+fn replay_acquires_use_rippled_timer_cadence_and_fallback() {
+    let ledger_hash = Uint256::from_array([0xCD; 32]);
+    let ledger_seq = 12;
+    let first = test_peer(30);
+    let second = test_peer(31);
+    for peer in [&first, &second] {
+        peer.record_ledger(ledger_hash, 0);
+        peer.record_ledger(ledger_hash, ledger_seq);
+    }
+    let peer_set: Arc<dyn PeerSet> = Arc::new(SimplePeerSet::new(vec![
+        first.clone() as Arc<dyn Peer>,
+        second.clone() as Arc<dyn Peer>,
+    ]));
+    let mut lookup_ledger = |_| None;
+
+    let mut skip = SkipListAcquire::new(ledger_hash, Arc::clone(&peer_set));
+    assert_eq!(skip.timer_interval(), REPLAY_SUB_TASK_TIMEOUT);
+    let mut fallback_calls = 0;
+    skip.init(2, &mut lookup_ledger, &mut |_, _, _| fallback_calls += 1);
+    assert!(skip.is_fallback());
+    assert_eq!(skip.timer_interval(), REPLAY_SUB_TASK_FALLBACK_TIMEOUT);
+    assert_eq!(fallback_calls, 1);
+
+    let delta_peer_set: Arc<dyn PeerSet> = Arc::new(SimplePeerSet::new(vec![
+        first.clone() as Arc<dyn Peer>,
+        second.clone() as Arc<dyn Peer>,
+    ]));
+    let mut delta = LedgerDeltaAcquire::new(ledger_hash, ledger_seq, delta_peer_set);
+    assert_eq!(delta.timer_interval(), REPLAY_SUB_TASK_TIMEOUT);
+    delta.init(2, &mut lookup_ledger, &mut |_, _, _| fallback_calls += 1);
+    assert!(delta.is_fallback());
+    assert_eq!(delta.timer_interval(), REPLAY_SUB_TASK_FALLBACK_TIMEOUT);
+    assert_eq!(fallback_calls, 2);
+
+    let task_skip = Arc::new(std::sync::Mutex::new(SkipListAcquire::new(
+        ledger_hash,
+        peer_set,
+    )));
+    let task = LedgerReplayTask::new(
+        LedgerReplayTaskParameter::new(InboundLedgerReason::Generic, ledger_hash, 1),
+        task_skip,
+    );
+    assert_eq!(task.timer_interval(), REPLAY_TASK_TIMEOUT);
 }
 
 #[test]

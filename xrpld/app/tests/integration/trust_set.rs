@@ -9,11 +9,14 @@
 
 use std::sync::Arc;
 
+use app::state::application_root::{
+    apply_submit_transactor_shell, apply_submit_transactor_shell_with_flags,
+};
 use basics::base_uint::{Uint160, Uint256};
-use ledger::{ApplyView, ApplyViewImpl, Ledger, LedgerHeader, ReadView};
+use ledger::{ApplyView, ApplyViewImpl, FlowSandbox, Ledger, LedgerHeader, ReadView};
 use protocol::{
     AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry,
-    STTx, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, owner_dir_keylet,
+    STTx, StBase, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, owner_dir_keylet,
     sf_generic,
 };
 use shamap::item::SHAMapItem;
@@ -145,6 +148,157 @@ fn trust_set_basic_creation() {
     let result = full_apply(&mut view, &tx, TxType::TRUST_SET);
     assert_eq!(result, Ter::TES_SUCCESS);
     assert_eq!(get_owner_count(&view, alice), 1);
+
+    let line = view
+        .read(protocol::line(
+            alice,
+            gw,
+            protocol::currency_from_string("USD"),
+        ))
+        .expect("trust-line lookup should succeed")
+        .expect("TrustSet should create the line");
+    assert!(line.is_field_present(sf("sfLowNode")));
+    assert!(line.is_field_present(sf("sfHighNode")));
+    assert_eq!(line.get_field_u64(sf("sfLowNode")), 0);
+    assert_eq!(line.get_field_u64(sf("sfHighNode")), 0);
+    assert_eq!(
+        line.get_field_amount(sf("sfBalance")).issue().account,
+        protocol::no_account(),
+        "a newly-created RippleState balance must use rippled's neutral issuer"
+    );
+}
+
+#[test]
+fn trust_set_created_node_metadata_uses_neutral_balance_issuer() {
+    let alice = acct(0x11);
+    let gw = acct(0x22);
+    let ledger = make_ledger(vec![
+        account_root(alice, 1_000_000_000, 0, 0),
+        account_root(gw, 1_000_000_000, 0, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let rules = view.rules();
+    let tx = trust_set_tx(alice, gw, "USD", 1000, 1);
+    let tx_id = tx.get_transaction_id();
+    let mut attempt = FlowSandbox::new(&mut view);
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut attempt, &tx, TxType::TRUST_SET),
+        Ter::TES_SUCCESS
+    );
+    let meta = attempt
+        .to_tx_meta(tx_id, 4, None, &rules)
+        .expect("TrustSet metadata should build");
+    let ripple_state = meta
+        .get_nodes()
+        .iter()
+        .find(|node| {
+            node.fname() == sf("sfCreatedNode")
+                && node.get_field_u16(sf("sfLedgerEntryType"))
+                    == LedgerEntryType::RippleState as u16
+        })
+        .expect("TrustSet should create RippleState metadata");
+    let new_fields = ripple_state.get_field_object(sf("sfNewFields"));
+    assert_eq!(
+        new_fields.get_field_amount(sf("sfBalance")).issue().account,
+        protocol::no_account(),
+        "CreatedNode metadata must serialize rippled's neutral balance issuer"
+    );
+}
+
+#[test]
+fn trust_set_second_owner_directory_full_has_rippled_tec_lifecycle() {
+    let alice = acct(0x11);
+    let gw = acct(0x22);
+    let high_dir = owner_dir_keylet(acct_id(gw));
+    let last_page = protocol::DIR_NODE_MAX_PAGES - 1;
+    let full_indexes = (0..protocol::DIR_NODE_MAX_ENTRIES)
+        .map(|index| Uint256::from_array([index as u8 + 1; 32]))
+        .collect::<Vec<_>>();
+
+    let mut root = STLedgerEntry::new(high_dir);
+    root.set_account_id(sf("sfOwner"), gw);
+    root.set_field_h256(sf("sfRootIndex"), high_dir.key);
+    root.set_field_v256(
+        sf("sfIndexes"),
+        protocol::STVector256::from_values(sf("sfIndexes"), full_indexes.clone()),
+    );
+    root.set_field_u64(sf("sfIndexPrevious"), last_page);
+    root.set_field_u64(sf("sfIndexNext"), last_page);
+
+    let mut tail = STLedgerEntry::new(protocol::page_keylet(high_dir, last_page));
+    tail.set_account_id(sf("sfOwner"), gw);
+    tail.set_field_h256(sf("sfRootIndex"), high_dir.key);
+    tail.set_field_v256(
+        sf("sfIndexes"),
+        protocol::STVector256::from_values(sf("sfIndexes"), full_indexes),
+    );
+
+    for (flags, claims_fee) in [
+        (ApplyFlags::NONE, true),
+        (ApplyFlags::FAIL_HARD, false),
+        (ApplyFlags::RETRY, false),
+    ] {
+        let ledger = make_ledger(vec![
+            account_root(alice, 1_000_000_000, 0, 0),
+            account_root(gw, 1_000_000_000, 0, 0),
+            root.clone(),
+            tail.clone(),
+        ]);
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), flags);
+        let tx = trust_set_tx(alice, gw, "USD", 1000, 1);
+
+        assert_eq!(
+            apply_submit_transactor_shell_with_flags(&mut view, &tx, TxType::TRUST_SET, flags),
+            Ter::TEC_DIR_FULL,
+            "unexpected result for {flags:?}"
+        );
+
+        let alice_root = view
+            .read(account_keylet(acct_id(alice)))
+            .expect("account read")
+            .expect("account exists");
+        assert_eq!(
+            alice_root.get_field_u32(sf("sfSequence")),
+            if claims_fee { 2 } else { 1 },
+            "sequence lifecycle differs for {flags:?}"
+        );
+        assert_eq!(
+            alice_root.get_field_amount(sf("sfBalance")).xrp().drops(),
+            if claims_fee {
+                1_000_000_000 - 10
+            } else {
+                1_000_000_000
+            },
+            "fee lifecycle differs for {flags:?}"
+        );
+        assert_eq!(alice_root.get_field_u32(sf("sfOwnerCount")), 0);
+        assert!(
+            view.read(owner_dir_keylet(acct_id(alice)))
+                .expect("low owner directory read")
+                .is_none(),
+            "partial low-directory insertion leaked for {flags:?}"
+        );
+        assert!(
+            view.read(protocol::line(
+                alice,
+                gw,
+                protocol::currency_from_string("USD"),
+            ))
+            .expect("trust-line read")
+            .is_none(),
+            "partial RippleState creation leaked for {flags:?}"
+        );
+        assert_eq!(
+            view.read(high_dir)
+                .expect("high owner directory read")
+                .expect("high owner directory exists")
+                .get_serializer()
+                .data(),
+            root.get_serializer().data(),
+            "full high owner directory changed for {flags:?}"
+        );
+    }
 }
 
 /// C++ TrustSet_test — trust to self rejected.

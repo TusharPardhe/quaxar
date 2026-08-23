@@ -1,7 +1,7 @@
 use basics::base_uint::Uint256;
 use protocol::{
     JsonValue, LedgerEntryType, Rules, STLedgerEntry, SerializedTypeId, StBase,
-    fix_previous_txn_id, get_field_by_symbol, make_mpt_id,
+    fix_previous_txn_id, get_field_by_symbol, make_mpt_id, st_ledger_entry::STLedgerEntryError,
 };
 
 #[test]
@@ -100,7 +100,8 @@ fn serial_round_trip_preserves_key_and_thread_fields() {
 
     let serializer = entry.get_serializer();
     let mut iter = protocol::SerialIter::new(serializer.data());
-    let parsed = STLedgerEntry::from_serial_iter(&mut iter, key);
+    let parsed = STLedgerEntry::try_from_serial_iter(&mut iter, key)
+        .expect("serialized known ledger entry type should parse");
 
     assert_eq!(parsed.key(), &key);
     assert_eq!(parsed.get_type(), LedgerEntryType::AccountRoot);
@@ -111,5 +112,34 @@ fn serial_round_trip_preserves_key_and_thread_fields() {
     assert_eq!(
         parsed.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
         Uint256::from_array([0x62; 32])
+    );
+}
+
+#[test]
+fn serialized_unknown_ledger_entry_type_is_a_typed_error() {
+    let key = Uint256::from_array([0x71; 32]);
+    let entry = STLedgerEntry::from_type_and_key(LedgerEntryType::AccountRoot, key);
+    let mut bytes = entry.get_serializer().data().to_vec();
+    assert_eq!(&bytes[..3], &[0x11, 0x00, 0x61]);
+    bytes[1..3].copy_from_slice(&u16::MAX.to_be_bytes());
+
+    let mut iter = protocol::SerialIter::new(&bytes);
+    assert_eq!(
+        STLedgerEntry::try_from_serial_iter(&mut iter, key),
+        Err(STLedgerEntryError::InvalidLedgerEntryType {
+            type_code: u16::MAX,
+        })
+    );
+}
+
+#[test]
+fn serialized_ledger_entry_without_type_is_a_typed_error() {
+    let key = Uint256::from_array([0x72; 32]);
+    let bytes = [0x22, 0x00, 0x00, 0x00, 0x00]; // sfFlags only
+
+    let mut iter = protocol::SerialIter::new(&bytes);
+    assert_eq!(
+        STLedgerEntry::try_from_serial_iter(&mut iter, key),
+        Err(STLedgerEntryError::MissingLedgerEntryType)
     );
 }

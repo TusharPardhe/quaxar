@@ -31,8 +31,9 @@ pub use codec::{
     read_varint, size_varint, write_varint,
 };
 pub use database::{
-    AsyncFetchCallback, Database, DatabaseDelegate, DatabaseImporter, DatabaseRotating,
-    DatabaseRuntime, DatabaseSource, DatabaseSurface,
+    ASYNC_READ_WORK_QUEUE_OVERHEAD_BYTES, AsyncReadWork, Database, DatabaseDelegate,
+    DatabaseImporter, DatabaseRotating, DatabaseRuntime, DatabaseSource, DatabaseSurface,
+    PersistenceWork, ScheduledWrite,
 };
 pub use database_node_imp::DatabaseNodeImp;
 pub use database_rotating::DatabaseRotatingImp;

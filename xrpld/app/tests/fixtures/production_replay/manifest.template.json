@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "parent_seq": 0,
+  "parent_hash": "REPLACE_WITH_64_HEX_PARENT_HASH",
+  "child_seq": 1,
+  "child_hash": "REPLACE_WITH_64_HEX_CHILD_HASH",
+  "transaction_hash": "REPLACE_WITH_64_HEX_TRANSACTION_HASH",
+  "account_hash": "REPLACE_WITH_64_HEX_ACCOUNT_HASH",
+  "max_fixture_bytes": 8589934592,
+  "max_replay_seconds": 120
+}

@@ -93,6 +93,53 @@ fn shamap_store_bootstrap_can_attach_node_store_to_application_root() {
 }
 
 #[test]
+fn shamap_store_bootstrap_injects_large_profile_into_node_object_cache() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut config = BasicConfig::new();
+    config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+    config.section_mut("node_size").append("large");
+    let node_db = config.section_mut("node_db");
+    node_db.set("type", "Memory");
+    node_db.set("path", dir.path().join("node").to_string_lossy());
+
+    let bootstrap = bootstrap_shamap_store(
+        &config,
+        false,
+        128,
+        1,
+        8,
+        64,
+        2,
+        &ManagerImp::new(),
+        Arc::new(DummyScheduler) as Arc<dyn Scheduler>,
+        Arc::new(NullJournal),
+    )
+    .expect("bootstrap");
+
+    assert_eq!(
+        bootstrap
+            .effective_node_db_config
+            .get::<u64>("node_object_cache_target_nodes")
+            .expect("valid target"),
+        Some(4_194_304)
+    );
+    assert_eq!(
+        bootstrap
+            .effective_node_db_config
+            .get::<u64>("cache_idle_seconds")
+            .expect("valid age"),
+        Some(7_200)
+    );
+    assert_eq!(
+        bootstrap
+            .effective_node_db_config
+            .get::<u64>("cache_ttl_seconds")
+            .expect("valid ttl"),
+        Some(0)
+    );
+}
+
+#[test]
 fn shamap_store_bootstrap_deletes_stale_rotating_backend_paths_like_dbpaths() {
     let dir = TempDir::new().expect("tempdir");
     let database_path = dir.path().join("sql");

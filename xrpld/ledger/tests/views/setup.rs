@@ -137,6 +137,44 @@ fn mixed_fee_settings_entry_bytes() -> Vec<u8> {
 }
 
 #[test]
+fn invalid_state_entry_type_is_rejected_without_unwinding() {
+    // sfLedgerEntryType is UInt16 field 1 (`0x11`); `0xFFFF` is not a
+    // supported LedgerEntryType. rippled throws for this input rather than
+    // constructing a valid SLE.
+    let keylet = protocol::amendments_keylet();
+    let mut invalid_sle = STLedgerEntry::from_type_and_key(LedgerEntryType::Amendments, keylet.key);
+    invalid_sle.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), Uint256::zero());
+    let mut invalid_ledger_entry_type = invalid_sle.get_serializer().data().to_vec();
+    assert_eq!(
+        invalid_ledger_entry_type[0], 0x11,
+        "serialized SLE must begin with sfLedgerEntryType"
+    );
+    invalid_ledger_entry_type[1..3].copy_from_slice(&0xFFFFu16.to_be_bytes());
+
+    let mut ledger = Ledger::new(Default::default(), false);
+    *ledger.state_map_mut() =
+        build_state_map_with_items(&[(keylet.key, invalid_ledger_entry_type)]);
+
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ledger.read(keylet)));
+    assert!(read.is_ok(), "invalid state must not unwind ledger read");
+    assert_eq!(
+        read.expect("caught ledger read")
+            .expect("state lookup should succeed"),
+        None,
+        "unknown LedgerEntryType must be rejected"
+    );
+
+    let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ledger.setup_from_state_map(&feature_xrp_fees())
+    }));
+    assert!(setup.is_ok(), "invalid singleton must not unwind setup");
+    assert!(
+        setup.expect("caught setup").is_err(),
+        "invalid singleton must surface through the fallible setup path"
+    );
+}
+
+#[test]
 fn setup_from_state_map_with_config_applies_legacy_fees_without_xrp_amendment() {
     let config = sample_ledger_config([sample_uint256(0xA1)]);
     let items = vec![

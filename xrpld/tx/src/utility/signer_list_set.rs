@@ -127,7 +127,10 @@ pub fn run_signer_list_set_validate_quorum_and_signer_entries<AccountId: Eq>(
         return Ter::TEM_MALFORMED;
     }
 
-    if signers.windows(2).any(|pair| pair[0] == pair[1]) {
+    if signers
+        .windows(2)
+        .any(|pair| pair[0].account == pair[1].account)
+    {
         return Ter::TEM_BAD_SIGNER;
     }
 

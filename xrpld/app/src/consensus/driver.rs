@@ -16,9 +16,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
-use overlay::QueuedValidation;
+use overlay::{Overlay, QueuedValidation};
 use protocol::STValidation;
 
 use crate::ledger::inbound_ledgers::InboundLedgers;
@@ -29,17 +29,21 @@ pub enum ConsensusEvent {
     /// A validation received from a peer, still in wire form (its
     /// suppression id and originating peer are carried alongside the raw
     /// `TMValidation` payload for dedup/relay bookkeeping upstream).
-    Validation(QueuedValidation),
+    Validation(Box<QueuedValidation>),
     /// A ledger has finished acquiring/building and is ready for
     /// `checkAccept`-style promotion to validated, if it has sufficient
     /// validation support.
     LedgerDone(Arc<ledger::Ledger>),
 }
 
-/// Construct the channel used to feed [`ConsensusEvent`]s into
-/// [`spawn_event_loop`]'s background thread.
-pub fn consensus_event_channel() -> (Sender<ConsensusEvent>, Receiver<ConsensusEvent>) {
-    channel()
+const CONSENSUS_EVENT_QUEUE_CAPACITY: usize = 1_024;
+
+/// Construct the bounded channel used to feed [`ConsensusEvent`]s into
+/// [`spawn_event_loop`]'s background thread. Validation arrivals are
+/// retransmitted by peers and ledger completions remain recoverable through
+/// the inbound registry, so overload can safely coalesce at this wake-up edge.
+pub fn consensus_event_channel() -> (SyncSender<ConsensusEvent>, Receiver<ConsensusEvent>) {
+    sync_channel(CONSENSUS_EVENT_QUEUE_CAPACITY)
 }
 
 /// Parse a wire-format validation payload (`TMValidation.validation`) into
@@ -68,7 +72,7 @@ pub fn spawn_event_loop(
     shared_inbound: Arc<InboundLedgers>,
     event_rx: Receiver<ConsensusEvent>,
     stop: Arc<AtomicBool>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("consensus-event-loop".into())
         .spawn(move || {
@@ -81,11 +85,30 @@ pub fn spawn_event_loop(
                 };
 
                 match event {
-                    ConsensusEvent::Validation(queued) => {
-                        let Some(mut validation) = parse_validation(&queued.message.validation) else {
+                    ConsensusEvent::Validation(mut queued) => {
+                        let Some(mut validation) = queued
+                            .validation
+                            .take()
+                            .or_else(|| parse_validation(&queued.message.validation))
+                        else {
                             tracing::warn!(target: "consensus", peer = ?queued.peer_id, "dropped malformed validation");
                             continue;
                         };
+                        if !validation.is_valid() {
+                            // Match rippled PeerImp::checkValidation:
+                            // charge(Resource::kFeeInvalidSignature, desc)
+                            if let Some(overlay_rt) = app.overlay_runtime() {
+                                use overlay::Overlay;
+                                if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(queued.peer_id) {
+                                    peer.charge(
+                                        (*resource::FEE_INVALID_SIGNATURE).clone(),
+                                        "validation invalid signature".to_owned(),
+                                    );
+                                }
+                            }
+                            tracing::warn!(target: "consensus", peer = ?queued.peer_id, "dropped invalid validation signature");
+                            continue;
+                        }
                         let report = app.receive_validation_to_network_ops_with_accept(&mut validation, "peer", &app);
                         // Matches the reference's relay decision: after
                         // processing, relay the validation to other peers
@@ -94,7 +117,13 @@ pub fn spawn_event_loop(
                         // untrusted only when relay_untrusted_validations
                         // is configured).
                         if let Some(report) = report {
-                            if report.relay {
+                            let relay_from_cluster = app.overlay_runtime().is_some_and(|overlay_rt| {
+                                overlay_rt
+                                    .overlay()
+                                    .find_peer_by_short_id(queued.peer_id)
+                                    .is_some_and(|peer| peer.cluster())
+                            });
+                            if report.relay || relay_from_cluster {
                                 if let Some(overlay_rt) = app.overlay_runtime() {
                                     overlay_rt.overlay().relay_validation(
                                         queued.message.clone(),
@@ -107,7 +136,14 @@ pub fn spawn_event_loop(
                     }
                     ConsensusEvent::LedgerDone(ledger) => {
                         if let Some(runtime) = app.ledger_master_runtime() {
-                            runtime.ledger_master().ledger_history().insert(Arc::clone(&ledger), true);
+                            // Completion persistence has already followed the acquisition
+                            // reason path. Preserve rippled's storeLedger invariant here:
+                            // sequence indexing is controlled by the ledger header's
+                            // validated bit, never by receipt of a wake-up event.
+                            runtime
+                                .ledger_master()
+                                .ledger_history()
+                                .insert(Arc::clone(&ledger), ledger.header().validated);
                             // Matches rippled's storeLedger() → checkAccept(ledger):
                             // once a newly-acquired ledger is stored in history,
                             // immediately check whether it has reached quorum.
@@ -131,5 +167,5 @@ pub fn spawn_event_loop(
                 }
             }
         })
-        .expect("spawn consensus-event-loop thread");
+        .expect("spawn consensus-event-loop thread")
 }

@@ -497,6 +497,65 @@ fn offer_create_fok_no_crossing_killed() {
     assert_eq!(get_owner_count(&view, alice), 0);
 }
 
+// ─── Test: Killed Replacement Rollback ───────────────────────────────────
+
+/// A killed FOK replacement must discard its explicit OfferSequence deletion.
+#[test]
+fn offer_create_fok_replacement_preserves_cancel_target() {
+    let alice = acct(0x11);
+    let gw = acct(0x22);
+    let ledger = make_ledger(vec![
+        account_root(alice, 1_000_000_000_000, 0, 0),
+        account_root(gw, 1_000_000_000_000, 0, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let usd = iou_amount(gw, "USD", 1000);
+    let original = offer_create_tx(alice, usd.clone(), xrp(1_000_000_000), 1);
+    assert_eq!(
+        full_apply(&mut view, &original, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let original_key = protocol::offer_keylet(acct_id(alice), 1);
+    assert!(
+        view.read(original_key)
+            .expect("read original offer")
+            .is_some()
+    );
+
+    // No counterpart exists, so FOK discards the main OfferCreate sandbox.
+    // rippled's cleanup sandbox must not include this explicit cancellation.
+    let replacement = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_field_amount(sf("sfTakerPays"), usd);
+        tx.set_field_amount(sf("sfTakerGets"), xrp(2_000_000_000));
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+        tx.set_field_u32(sf("sfFlags"), 0x0004_0000); // tfFillOrKill
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 2);
+    });
+    assert_eq!(
+        full_apply(&mut view, &replacement, TxType::OFFER_CREATE),
+        Ter::TEC_KILLED
+    );
+    assert!(
+        view.read(original_key)
+            .expect("read original offer after FOK")
+            .is_some(),
+        "killed replacement must not commit sfOfferSequence cancellation"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(alice), 2))
+            .expect("read killed replacement")
+            .is_none(),
+        "killed replacement must not be placed"
+    );
+    assert_eq!(get_owner_count(&view, alice), 1);
+}
+
 // ─── Test: Offer Expiration ───────────────────────────────────────────────
 
 /// C++ Offer_test::testExpiration — expired offer is killed.

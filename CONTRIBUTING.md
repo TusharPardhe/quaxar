@@ -1,4 +1,4 @@
-# Contributing to xrpld
+# Contributing to Quaxar
 
 Thank you for your interest in contributing to the Rust XRPL node implementation! This guide will help you get started.
 
@@ -11,14 +11,17 @@ Thank you for your interest in contributing to the Rust XRPL node implementation
 ## Building
 
 ```bash
-# Full workspace build
+# Release node build
 just build
+
+# Full workspace check
+cargo check --workspace
 
 # Release build
 cargo build --release
 
 # Single crate
-cargo build -p xrpld-app
+cargo build -p app
 ```
 
 ## Testing
@@ -28,11 +31,25 @@ cargo build -p xrpld-app
 just test
 
 # Run tests for a specific crate
-cargo test -p xrpld-rpc
+cargo test -p rpc
 
 # Run with nextest (faster, parallel)
 cargo nextest run --workspace
 ```
+
+Preferred-LCL and acquisition changes also require focused regressions for a
+stable recovery anchor under a moving tip, same-hash sequence refinement,
+reuse of behind-tip completions, in-place LCL/publication advancement,
+actionable Full demotion, and sustained recovery without mode flapping.
+Test publication forwarding separately from freshness/promotion: Tracking
+records the identity when a fresh observation promotes it to Full, while an
+already-Full phase must accept newer contiguous identities on non-promoting
+passes.
+
+Consensus-critical payment and offer changes require reference-oriented tests,
+including both canonical trust-line account orderings, typed missing-line zero,
+fully and partially funded offers, worse-than-limit self offers, equal-quality
+self cancellation, and the boundary between first and second book qualities.
 
 ## Code Style
 
@@ -46,7 +63,7 @@ cargo fmt --all
 
 ### Linting
 
-All clippy warnings are treated as errors in CI:
+The local command below is stricter than the current CI correctness-lint gate:
 
 ```bash
 cargo clippy --workspace --all-features -- -D warnings
@@ -116,16 +133,37 @@ Understanding which crate owns what helps you find the right place for changes:
 | `xrpl/shamap` | SHAMap trie (state and transaction trees) |
 | `xrpl/core` | Cryptography, key derivation, signing |
 | `xrpl/resource` | Load management and resource tracking |
-| `xrpld/app` | Application orchestration, ledger acquisition |
+| `xrpld/acquisition` | Stable recovery anchor, typed phase machine, per-hash sessions, retries and durable handoff |
+| `xrpld/app` | Application owner, moving preferred-LCL policy, authoritative LCL switch, NetworkOps, jobs and validator services |
+| `xrpld/core` | Port configuration, RPC status and SQLite state utilities (`quaxar-core`) |
 | `xrpld/consensus` | XRPL consensus protocol implementation |
 | `xrpld/ledger` | Ledger state, open/closed/validated lifecycle |
 | `xrpld/overlay` | P2P networking, peer message handling |
 | `xrpld/nodestore` | NuDB storage backend, node object persistence |
+| `xrpld/rdb` | Relational ledger and transaction metadata |
 | `xrpld/rpc` | JSON-RPC method handlers |
 | `xrpld/server` | HTTP/WebSocket server, request routing |
+| `xrpld/perflog` | Runtime activity and performance counters |
 | `xrpld/tx` | Transaction processing and application |
-| `xrpld/metrics` | Prometheus metrics collection |
-| `xrpld/main` | Binary entry point, CLI, startup |
+| `xrpld/metrics` | Metrics recording and optional Prometheus exporter integration (`quaxar-metrics` package) |
+| `xrpld/cli` | Operator commands (`quaxar-cli` package) |
+| `xrpld/main` | Bootstrap and `quaxar` binary (`quaxar-main` package) |
+
+`xrpld/rpc-integration-tests` is a test-only workspace member, not a runtime
+package.
+
+The `xrpld/` directory is intentionally retained for source comparison with
+upstream. Do not extend that historical name into new package names, binaries,
+services, configuration paths, environment variables, logs, or metrics; use
+the `quaxar` prefix at operator-facing boundaries. Keep `rippled` names in
+parity comments and compatible on-disk/wire contracts explicit.
+
+Documentation follows the same boundary: command examples must use the
+installed `quaxar` executable and Quaxar service/config/data paths, while crate
+maps may show the real retained `xrpld/` source paths and parity notes should
+name the upstream `rippled` implementation. When changing CLI or config
+surfaces, compare the rendered `quaxar --help`, packaged config files, and all
+operator guides in the same pull request.
 
 ## Where to Start
 
@@ -133,7 +171,8 @@ Good first contributions:
 
 - **Add missing RPC handlers** — Look at `xrpld/rpc/src/` for the pattern, then implement a missing method
 - **Improve test coverage** — Run `cargo llvm-cov` and find uncovered paths
-- **Documentation** — Add doc comments to public APIs in any crate
+- **Documentation** — Keep operator and architecture references aligned with
+  the implemented ownership and lifecycle boundaries
 - **CLI commands** — Add new diagnostic commands to the interactive CLI
 - **Error messages** — Improve error context with `thiserror` or better `tracing` spans
 
@@ -142,5 +181,6 @@ Look for issues labeled `good first issue` in the issue tracker.
 ## Getting Help
 
 - Open a GitHub Discussion for questions
-- Check [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design context
-- Read the learning notes in `docs/learning/` for deep dives into specific subsystems
+- Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before changing runtime ownership or ledger flow
+- Preserve the shared per-flow AMM context across reverse and forward book
+  passes; candidate strands must not commit AMM iteration state unless selected

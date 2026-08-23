@@ -151,12 +151,12 @@ fn parent_with_account_in_nudb(
               hash: Uint256,
               data: Vec<u8>,
               ledger_seq: u32| match &ns_write {
-            app::SHAMapStoreNodeStore::Single(db) => {
-                db.store(test_node_type(object_type), data, hash, ledger_seq)
-            }
-            app::SHAMapStoreNodeStore::Rotating(db) => {
-                db.store(test_node_type(object_type), data, hash, ledger_seq)
-            }
+            app::SHAMapStoreNodeStore::Single(db) => db
+                .store(test_node_type(object_type), data, hash, ledger_seq)
+                .expect("test node store write should succeed"),
+            app::SHAMapStoreNodeStore::Rotating(db) => db
+                .store(test_node_type(object_type), data, hash, ledger_seq)
+                .expect("test node store write should succeed"),
         },
     ));
 
@@ -204,12 +204,12 @@ fn backed_fee_ledger_without_fetcher(
               hash: Uint256,
               data: Vec<u8>,
               ledger_seq: u32| match &ns_write {
-            app::SHAMapStoreNodeStore::Single(db) => {
-                db.store(test_node_type(object_type), data, hash, ledger_seq)
-            }
-            app::SHAMapStoreNodeStore::Rotating(db) => {
-                db.store(test_node_type(object_type), data, hash, ledger_seq)
-            }
+            app::SHAMapStoreNodeStore::Single(db) => db
+                .store(test_node_type(object_type), data, hash, ledger_seq)
+                .expect("test node store write should succeed"),
+            app::SHAMapStoreNodeStore::Rotating(db) => db
+                .store(test_node_type(object_type), data, hash, ledger_seq)
+                .expect("test node store write should succeed"),
         },
     ));
     ledger.flush_state_map_to_store();
@@ -436,5 +436,24 @@ fn sandbox_peek_fails_without_node_fetcher() {
     assert!(
         parent_no_fetcher.state_map().backed(),
         "state map should be backed"
+    );
+}
+
+#[test]
+fn application_root_does_not_renormalize_fully_wired_ledger_with_shared_family() {
+    let (_dir, node_store) = nudb_bootstrap();
+    let mut root = ApplicationRoot::new(0).expect("root");
+    root.attach_node_store(Some(node_store));
+    root.attach_default_node_family();
+
+    let mut ledger = Ledger::from_ledger_seq_and_close_time(102, 1_020, true);
+    ledger.set_node_fetcher(Arc::new(|_| None));
+    ledger.set_node_writer_result(Arc::new(|_, _, _, _| Ok(())));
+    let ledger = Arc::new(ledger);
+
+    let normalized = root.ledger_with_node_fetcher(Arc::clone(&ledger));
+    assert!(
+        Arc::ptr_eq(&normalized, &ledger),
+        "a fully wired closed ledger must not be cloned and synchronously re-setup merely because a shared node family exists"
     );
 }

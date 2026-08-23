@@ -3,8 +3,9 @@ use basics::chrono::{NetClockTimePoint, to_string, to_string_iso};
 use basics::sha_map_hash::SHAMapHash;
 use basics::str_hex::str_hex;
 use ledger::{
-    Ledger, LedgerConfig, LedgerFill, LedgerFillOptions, LedgerHeader, SLCF_NO_CONSENSUS_TIME,
-    add_json, amendments_key, copy_from, fees_key, get_json, serialize_ledger_header,
+    Ledger, LedgerConfig, LedgerFill, LedgerFillOptions, LedgerHeader, LedgerJsonError,
+    SLCF_NO_CONSENSUS_TIME, add_json, amendments_key, copy_from, fees_key, get_json,
+    serialize_ledger_header,
 };
 use protocol::{
     ConstructorLedgerEntry, JsonOptions, JsonValue, LedgerEntryType, STAmount, STLedgerEntry,
@@ -379,6 +380,41 @@ fn state_dump_modes_match_cpp_keys_expanded_and_binary_shapes() {
             Some(&str_hex(payload))
         );
     }
+}
+
+#[test]
+fn expanded_state_json_rejects_unknown_ledger_entry_type_without_unwinding() {
+    // sfLedgerEntryType is UInt16 field 1 (`0x11`); `0xFFFF` is unsupported.
+    let key = sample_uint256(0xD1);
+    let mut invalid_ledger_entry_type = typed_amendments_entry_bytes(&[]);
+    assert_eq!(
+        invalid_ledger_entry_type[0], 0x11,
+        "serialized SLE must begin with sfLedgerEntryType"
+    );
+    invalid_ledger_entry_type[1..3].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    let ledger = build_ledger(
+        LedgerHeader {
+            seq: 91,
+            ..LedgerHeader::default()
+        },
+        &[(key, invalid_ledger_entry_type)],
+    );
+
+    let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        get_json(&LedgerFill::new(
+            &ledger,
+            LedgerFillOptions::DUMP_STATE | LedgerFillOptions::EXPAND,
+        ))
+    }));
+
+    assert!(
+        rendered.is_ok(),
+        "invalid state must not unwind JSON rendering"
+    );
+    assert!(matches!(
+        rendered.expect("caught JSON rendering"),
+        Err(LedgerJsonError::InvalidLedgerEntry { key: rejected }) if rejected == key
+    ));
 }
 
 #[test]

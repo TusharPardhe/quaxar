@@ -616,7 +616,9 @@ where
                 ));
             }
 
-            let mut all_removals = 0usize;
+            let track_before = state.cache.len();
+            let strong_cache_before = state.cache_count;
+            let mut all_counts = SweepCounts::default();
             for partition in state.cache.map_mut() {
                 let (counts, mut removed, _keys) = sweep_value_partition(partition, when_expire);
                 if counts.cache_removals != 0 || counts.map_removals != 0 {
@@ -628,11 +630,30 @@ where
                         counts.map_removals
                     ));
                 }
-                all_removals += counts.cache_removals;
+                all_counts.cache_removals += counts.cache_removals;
+                all_counts.map_removals += counts.map_removals;
+                all_counts.strong_removals += counts.strong_removals;
+                all_counts.strong_demotions += counts.strong_demotions;
+                all_counts.expired_weak_removals += counts.expired_weak_removals;
                 swept_pointers.append(&mut removed);
             }
 
-            state.cache_count = state.cache_count.saturating_sub(all_removals);
+            state.cache_count = state.cache_count.saturating_sub(all_counts.cache_removals);
+            tracing::info!(
+                target: "cache_retention",
+                event = "tagged_cache_sweep",
+                cache_name = self.name.as_str(),
+                target_size = self.target_size,
+                target_age_seconds = self.target_age.whole_seconds(),
+                track_before,
+                track_after = state.cache.len(),
+                strong_cache_before,
+                strong_cache_after = state.cache_count,
+                aged_strong_removals = all_counts.strong_removals,
+                aged_strong_demotions_to_weak = all_counts.strong_demotions,
+                expired_weak_removals = all_counts.expired_weak_removals,
+                "TaggedCache retention sweep completed"
+            );
         }
         // Match the reference `stuffToSweep` lifetime: removed values are destroyed
         // after the cache lock is released, but before the final duration log.
@@ -689,12 +710,13 @@ where
         K: Borrow<Q>,
         Q: Eq + Hash + PartitionKey + ?Sized,
     {
-        // Fast path: lock-free DashMap lookup
-        if let Some(entry) = self.fast_map.get(key) {
-            self.fast_hits.fetch_add(1, Ordering::Relaxed);
-            return Some(entry.value().clone());
-        }
-        // Slow path: fall through to locked state
+        // rippled's TaggedCache::initialFetch always refreshes lastAccess on
+        // every hit (TaggedCache.ipp:724). The lock-free fast_map path was
+        // skipping this refresh, causing actively-used nodes to be swept
+        // after their original insertion TTL expired. This broke cross-
+        // acquisition cache reuse during ledger sync.
+        //
+        // Always take the slow path which properly touches last_access.
         let mut state = self
             .state
             .lock()
@@ -707,18 +729,14 @@ where
     }
 
     pub fn fetch_with(&self, key: &K, handler: impl FnOnce() -> Option<SP>) -> Option<SP> {
-        // Fast path: lock-free DashMap lookup
-        if let Some(entry) = self.fast_map.get(key) {
-            self.fast_hits.fetch_add(1, Ordering::Relaxed);
-            return Some(entry.value().clone());
-        }
+        // Same fix as fetch(): always go through the slow path that refreshes
+        // last_access, matching rippled TaggedCache behavior.
         {
             let mut state = self
                 .state
                 .lock()
                 .expect("TaggedCache mutex must not be poisoned");
             if let Some(found) = state.initial_fetch(key, self.clock.now()) {
-                self.fast_map.insert(key.clone(), found.clone());
                 return Some(found);
             }
         }
@@ -1036,6 +1054,12 @@ where
 struct SweepCounts {
     cache_removals: usize,
     map_removals: usize,
+    /// Aged strong entries whose cache reference was the final strong owner.
+    strong_removals: usize,
+    /// Aged strong entries converted to weak because another owner remains.
+    strong_demotions: usize,
+    /// Weak tracking entries removed after their final external owner released.
+    expired_weak_removals: usize,
 }
 
 fn sweep_value_partition<K, T, P, SP, S>(
@@ -1055,14 +1079,17 @@ where
         if entry.ptr.is_weak() {
             if entry.ptr.expired() {
                 counts.map_removals += 1;
+                counts.expired_weak_removals += 1;
                 keys_to_remove.push(key.clone());
             }
         } else if entry.last_access <= when_expire {
             counts.cache_removals += 1;
             if entry.ptr.use_count() == 1 {
                 counts.map_removals += 1;
+                counts.strong_removals += 1;
                 keys_to_remove.push(key.clone());
             } else {
+                counts.strong_demotions += 1;
                 entry.ptr.convert_to_weak();
             }
         }

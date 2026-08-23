@@ -11,6 +11,7 @@ use shamap::traversal::TraversalError;
 use std::sync::Arc;
 
 pub const SHAMAP_STORE_COPY_CHECK_HEALTH_INTERVAL: u64 = 1000;
+pub const SHAMAP_STORE_COPY_BATCH_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SHAMapStoreCopyDisposition {
@@ -50,9 +51,21 @@ pub fn copy_validated_state_map(
 ) -> Result<SHAMapStoreCopyDisposition, String> {
     let mut node_count = 0u64;
     let mut stopped = false;
+    let mut copy_error = None;
+    let mut pending = Vec::with_capacity(SHAMAP_STORE_COPY_BATCH_SIZE);
     let visit_result = node_family.visit_state_map_hashes(validated_ledger.as_ref(), &mut |hash| {
-        let _ = node_store.fetch_node_object(&hash, 0);
+        pending.push(hash);
         node_count += 1;
+
+        if pending.len() == SHAMAP_STORE_COPY_BATCH_SIZE
+            && let Err(error) = node_store.copy_to_writable_batch(&pending)
+        {
+            copy_error = Some(error);
+            return false;
+        }
+        if pending.len() == SHAMAP_STORE_COPY_BATCH_SIZE {
+            pending.clear();
+        }
 
         if !node_count.is_multiple_of(SHAMAP_STORE_COPY_CHECK_HEALTH_INTERVAL) {
             return true;
@@ -64,6 +77,13 @@ pub fn copy_validated_state_map(
         stopped = !keep_going;
         keep_going
     });
+
+    if let Some(error) = copy_error {
+        return Err(error);
+    }
+    if !pending.is_empty() {
+        node_store.copy_to_writable_batch(&pending)?;
+    }
 
     match visit_result {
         Ok(()) if stopped => Ok(SHAMapStoreCopyDisposition::Stopped { node_count }),

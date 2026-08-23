@@ -30,7 +30,7 @@ pub(super) fn amount_to_number(amount: &STAmount) -> RuntimeNumber {
     }
 }
 
-pub(super) fn account_holds_asset_amount<V: ApplyView>(
+pub(super) fn account_holds_asset_amount<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     account: AccountID,
     asset: Asset,
@@ -81,7 +81,7 @@ pub(super) fn account_holds_asset_amount<V: ApplyView>(
     }
 }
 
-pub(super) fn account_holds_asset_number<V: ApplyView>(
+pub(super) fn account_holds_asset_number<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     account: AccountID,
     asset: Asset,

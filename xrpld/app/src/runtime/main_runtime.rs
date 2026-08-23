@@ -6,6 +6,8 @@ use crate::tx_queue::transaction_master::{SharedTransaction, TransactionMaster};
 use protocol::{JsonOptions, JsonValue};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 pub trait ManagedComponent: Send + Sync + 'static {
     fn start(&self) -> Result<(), String>;
@@ -137,9 +139,72 @@ pub fn adjust_descriptor_limit(required: u64, provider: &dyn DescriptorLimitProv
     required <= available
 }
 
+/// Application-owned equivalent of rippled's five-minute entropy timer.
+/// Rust's OS-backed random source owns the cryptographic pool, so each tick
+/// obtains fresh CSPRNG material rather than trying to mutate process-global
+/// OpenSSL state. The worker remains explicitly cancellable and joinable.
+struct EntropyTimerRuntime {
+    stopping: Arc<(Mutex<bool>, Condvar)>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl EntropyTimerRuntime {
+    const INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+    fn new() -> Self {
+        Self {
+            stopping: Arc::new((Mutex::new(false), Condvar::new())),
+            worker: Mutex::new(None),
+        }
+    }
+
+    fn start(&self) -> Result<(), String> {
+        let mut worker = self.worker.lock().expect("entropy worker mutex");
+        if worker.is_some() {
+            return Ok(());
+        }
+        let stopping = Arc::clone(&self.stopping);
+        *stopping.0.lock().expect("entropy stop mutex") = false;
+        *worker = Some(
+            std::thread::Builder::new()
+                .name("quaxar-entropy".to_owned())
+                .spawn(move || {
+                    let (lock, wake) = &*stopping;
+                    let mut stopped = lock.lock().expect("entropy stop mutex");
+                    while !*stopped {
+                        let (next, _) = wake
+                            .wait_timeout(stopped, Self::INTERVAL)
+                            .expect("entropy stop condvar");
+                        stopped = next;
+                        if *stopped {
+                            break;
+                        }
+                        drop(stopped);
+                        let _: u64 = basics::random::rand_int_full();
+                        stopped = lock.lock().expect("entropy stop mutex");
+                    }
+                })
+                .map_err(|error| format!("entropy timer start failed: {error}"))?,
+        );
+        Ok(())
+    }
+
+    fn stop(&self) {
+        {
+            let (lock, wake) = &*self.stopping;
+            *lock.lock().expect("entropy stop mutex") = true;
+            wake.notify_all();
+        }
+        if let Some(worker) = self.worker.lock().expect("entropy worker mutex").take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 pub struct MainRuntime {
     root: ApplicationRoot,
     stop_signal: Arc<(Mutex<bool>, Condvar)>,
+    entropy_timer: EntropyTimerRuntime,
     started: AtomicBool,
     shutdown_started: AtomicBool,
 }
@@ -162,6 +227,7 @@ impl MainRuntime {
         Self {
             root,
             stop_signal: Arc::new((Mutex::new(false), Condvar::new())),
+            entropy_timer: EntropyTimerRuntime::new(),
             started: AtomicBool::new(false),
             shutdown_started: AtomicBool::new(false),
         }
@@ -201,6 +267,10 @@ impl MainRuntime {
         }
 
         let mut started_components = Vec::new();
+        if let Err(error) = self.entropy_timer.start() {
+            self.started.store(false, Ordering::Release);
+            return Err(error);
+        }
         self.root.load_manager().start();
 
         if let Some(component) = self.root.runtime_bindings().nodestore.as_ref() {
@@ -288,6 +358,14 @@ impl MainRuntime {
     }
 
     pub fn run(&self) {
+        self.wait_for_stop();
+        self.shutdown();
+    }
+
+    /// Wait for a stop signal without stopping managed components. Bootstrap
+    /// owns additional consensus/acquisition threads, which must be quiesced
+    /// and joined before NodeStore teardown begins.
+    pub fn wait_for_stop(&self) {
         let (lock, condvar) = &*self.stop_signal;
         let mut stop = lock.lock().expect("stop signal mutex must not be poisoned");
         while !*stop {
@@ -296,13 +374,24 @@ impl MainRuntime {
                 .expect("stop signal condvar must not be poisoned");
         }
         drop(stop);
-        self.shutdown();
     }
 
     pub fn shutdown(&self) {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
         }
+
+        // Keep direct shutdown on the same one-shot lifecycle as the normal
+        // signal-and-wait path. This runs stop-tree callbacks, including the
+        // NodeFamily reset, before any owned worker or component is torn down.
+        let _ = self.signal_stop("runtime shutdown");
+
+        // RPC snapshot exports borrow a NodeStore backend on a dedicated
+        // worker. Quiesce and join that owned worker before any managed
+        // storage service is stopped.
+        self.root.quiesce_snapshot_export();
+        self.root.stop_sntp_client();
+        self.entropy_timer.stop();
 
         if let Some(component) = self.root.runtime_bindings().validator_site.as_ref() {
             component.stop();
@@ -354,6 +443,8 @@ impl MainRuntime {
             component.stop();
         }
         self.root.load_manager().stop();
+        self.root.stop_sntp_client();
+        self.entropy_timer.stop();
     }
 }
 
@@ -550,6 +641,14 @@ mod tests {
         let runtime = MainRuntime::new(root);
         runtime.start().expect("runtime should start");
         runtime.shutdown();
+        assert!(
+            runtime
+                .entropy_timer
+                .worker
+                .lock()
+                .expect("entropy worker mutex")
+                .is_none()
+        );
 
         assert_eq!(
             events.lock().expect("events mutex").as_slice(),
@@ -632,6 +731,64 @@ mod tests {
                 updated: Some(48),
             }
         ));
+    }
+
+    #[test]
+    fn runtime_shutdown_cancels_snapshot_export_before_nodestore_teardown() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut root = ApplicationRoot::new(0).expect("root");
+        root.set_runtime_bindings(RuntimeBindings {
+            nodestore: Some(Arc::new(RecordingComponent::new(
+                "nodestore",
+                Arc::clone(&events),
+            ))),
+            ..RuntimeBindings::default()
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let export_events = Arc::clone(&events);
+        root.start_snapshot_export(
+            "/tmp/runtime-shutdown.xrpls".to_owned(),
+            1,
+            move |state, cancellation| {
+                std::thread::Builder::new()
+                    .name("runtime-shutdown-snapshot-test".to_owned())
+                    .spawn(move || {
+                        started_tx.send(()).expect("signal export start");
+                        while !cancellation.is_cancelled() {
+                            std::thread::yield_now();
+                        }
+                        export_events
+                            .lock()
+                            .expect("events mutex")
+                            .push("snapshot:cancelled".to_owned());
+                        cancelled_tx.send(()).expect("signal export cancellation");
+                        state.fail("snapshot export cancelled".to_owned());
+                    })
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .expect("snapshot export should start");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot worker should start");
+
+        let runtime = Arc::new(MainRuntime::new(root));
+        let shutdown_runtime = Arc::clone(&runtime);
+        let shutdown = std::thread::spawn(move || shutdown_runtime.shutdown());
+        cancelled_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown must cancel the snapshot worker before joining");
+        // The cancellation notification proves the export worker observed the
+        // request. Shutdown is free to proceed to NodeStore teardown before
+        // this test thread observes the notification, so assert ordering only
+        // after joining shutdown below.
+
+        shutdown.join().expect("shutdown should complete");
+        assert_eq!(
+            events.lock().expect("events mutex").as_slice(),
+            &["snapshot:cancelled".to_owned(), "nodestore:stop".to_owned()]
+        );
     }
 
     #[test]

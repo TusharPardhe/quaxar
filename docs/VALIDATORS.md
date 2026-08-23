@@ -1,105 +1,126 @@
-# Validator Setup
+# Running a Validator
 
-## What is a Validator
+A validator is a fully synchronized Quaxar server that signs and publishes
+validations. Generating a key does not add the validator to another server's
+trusted list, and appearing on a public explorer can lag network observation.
 
-A validator on the XRP Ledger participates in the consensus process by proposing transaction sets and voting on ledger closings. Validators that are trusted by other nodes (included in their UNL) directly influence which transactions are confirmed.
+## Prerequisites
 
-Running a validator requires:
-- A reliable, well-connected node that stays synced
-- A validator key pair (master + ephemeral)
-- Uptime commitment (validators that go offline lose trust)
+Before enabling validation, operate the node reliably in `full` state with a
+stable public peer endpoint, accurate host time, sufficient storage, and
+working validator-list publishers. Reliability means sustained canonical
+closed-ledger and validated advancement, bounded lag, a coherent coordinator
+phase, and no recurring Full/Syncing cycle. Keep RPC and WebSocket
+administration on a private interface or SSH tunnel.
 
-## Key Generation
+Do not enable validation merely because initial acquisition filled the expected
+RAM or briefly reported `full`. Confirm several consecutive local closed hashes
+belong to the network's validated chain and that publication continues without
+mode churn.
 
-Generate a new validator master key pair:
+## Generate an identity
+
+Run this once in a private directory:
 
 ```bash
+umask 077
 quaxar validator-keys generate
 ```
 
-Output:
-```
-Master Public Key:  nHUFE9prPXPrHcG3SkwP1UzAQbSphqyQkQK9ATXLZsfkezRda2Hm
-Master Secret Key:  paQmjZ37pKKPMrgadBLsuf9ab7Y7EUNzh27LQrZqoexpAs31nJi
+On supported Unix platforms, the command creates `validator-keys.json` with
+mode `0600` and refuses to overwrite an existing file. It contains:
 
-Store the master secret key securely. It cannot be recovered.
-```
+- `validation_public_key`: XRPL node-public key beginning with `n`
+- `validation_private_key`: XRPL node-private key beginning with `p`
+- `validation_seed`: family seed beginning with `s`
+- `validation_key`: RFC-1751 words representing the seed material
+- key type, format version, and creation time
 
-**Important:** Store the master secret key offline in a secure location. It is used only to create tokens and for key rotation.
+The generated root identity uses secp256k1, matching the accepted XRPL
+validator seed/public-key encoding. Treat the seed, private key, RFC-1751
+words, and the JSON file as secrets. Never paste them into logs, issues, chat,
+or source control.
 
-## Creating a Token
+## Configure validation
 
-Generate a validator token from the master key. The token contains an ephemeral key pair that the running node uses for signing:
-
-```bash
-quaxar validator-keys create-token
-```
-
-You will be prompted for the master secret key. Output:
-
-```
-[validator_token]
-eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9...
-```
-
-## Adding Token to Config
-
-Add the token to your node's configuration file:
+Store the generated `validation_seed` in the service config:
 
 ```ini
-[validator_token]
-eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9...
+[validation_seed]
+<secret-family-seed>
 ```
 
-Restart the node to activate. Verify with:
+Record the generated public `n...` identity separately if it is needed for
+operator registration. Never copy the private key, seed, RFC-1751 words, or
+complete JSON file into documentation or logs. Validate the protected config
+before restarting:
 
 ```bash
-quaxar validator-keys show
+quaxar --conf /etc/quaxar/quaxar.cfg config
 ```
 
-## Key Rotation
-
-Validators use a two-level key scheme:
-
-- **Master key** — Long-lived identity. Used offline to sign manifests.
-- **Ephemeral key** — Short-lived signing key embedded in the token. Used by the running node.
-
-To rotate keys:
-1. Generate a new token with `validator-keys create-token` (increments the manifest sequence)
-2. Replace the `[validator_token]` in config
-3. Restart the node
-4. The new manifest propagates to peers automatically
-5. The old ephemeral key is invalidated
-
-The master public key remains your validator's identity across rotations.
-
-## Revoking Keys
-
-If your master key is compromised, revoke it permanently:
+For the dedicated `User=quaxar` service described in [RUNNING.md](RUNNING.md),
+ensure only the service account can read the file:
 
 ```bash
-quaxar validator-keys revoke
+sudo chown root:quaxar /etc/quaxar/quaxar.cfg
+sudo chmod 0640 /etc/quaxar/quaxar.cfg
+sudo systemctl restart quaxar.service
 ```
 
-This publishes a maximum-sequence manifest that permanently disables the validator identity. **This action is irreversible.** You will need to generate a new master key and establish trust from scratch.
+The interactive Linux installer runs the service as the invoking user instead.
+Confirm that account with `systemctl show -p User --value quaxar.service` and
+retain config ownership/read permission for that user; do not blindly change
+the group to `quaxar` if it does not exist.
 
-## Getting on the UNL
+Likewise, an upgraded host may still deliberately run `quaxar.service` under a
+legacy account until ownership is migrated. Check the unit's actual `User` and
+`Group`; never change the config or database owner while the service is
+running.
 
-The default UNL is published by the XRP Ledger Foundation. To be considered:
+Verify locally:
 
-1. Run a reliable validator with 99%+ uptime for several months
-2. Demonstrate operational competence and security practices
-3. Apply through the XRPLF validator application process
-4. Maintain geographic and jurisdictional diversity
+```bash
+quaxar validator-info
+quaxar server-info
+```
 
-Operators can also add your validator to their own `[validators]` section independently of the default UNL.
+When synchronized, a validating server normally reports `proposing` and
+`server_info` exposes `pubkey_validator`. `full` is the healthy terminal state
+for a server without an active validation identity. These labels are
+point-in-time signals; confirm continued ledger advancement before treating the
+validator as operational.
 
-## Security Best Practices
+## Trust and explorer visibility
 
-- **Air-gapped key generation** — Generate master keys on an offline machine. Never expose the master secret to a networked system.
-- **Separate signing server** — If possible, run the validator on a dedicated machine with no other services.
-- **Token-only on server** — Only the token (ephemeral key) should exist on the running node. The master secret stays offline.
-- **Regular rotation** — Rotate ephemeral keys periodically (every 3–6 months).
-- **Monitor manifests** — Watch for unexpected manifest publications that could indicate compromise.
-- **Firewall** — Restrict admin RPC port to localhost. Only expose the peer port (51235) publicly.
-- **Revocation plan** — Have a documented procedure to revoke keys quickly if compromise is suspected.
+The public key identifies the validator; it is safe to publish. Other servers
+only count its validations when their configured validator lists trust it.
+Explorer visibility generally requires the explorer to observe validations and
+may take several ledgers. UNL membership is separate and normally requires an
+established operating history plus inclusion by a validator-list publisher.
+
+Check:
+
+```bash
+quaxar peers
+quaxar validator-info
+quaxar unl-list
+quaxar rpc server_info --raw
+```
+
+If `pubkey_validator` is absent, confirm the service is reading the intended
+config and that `[validation_seed]` contains the family seed, not the public or
+private key. If the server never reaches `proposing`, resolve synchronization,
+quorum, validator-list, and clock issues before changing keys.
+
+## Key files and backups
+
+Keep at least one encrypted offline backup of `validator-keys.json`. A lost
+root seed cannot be recovered. Do not reuse an identity across simultaneously
+running validators, because they can issue conflicting validations.
+
+The `validator-keys create-token`, `sign`, and `revoke` commands are currently
+experimental developer tooling. Their token/manifest serialization and
+rotation workflow are not documented as `rippled`-compatible for production.
+Use `[validation_seed]` for the supported operational path until that
+compatibility is independently audited.

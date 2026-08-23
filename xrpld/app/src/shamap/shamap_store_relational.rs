@@ -3,10 +3,10 @@ use crate::tx_queue::transaction::Transaction;
 use crate::tx_queue::transaction_master::TransactionMaster;
 use ledger::AcceptedLedger;
 use protocol::{STTx, to_base58};
+use quaxar_core::DatabaseCon;
 use rusqlite::params;
 use std::sync::Arc;
 use std::time::Duration;
-use xrpld_core::DatabaseCon;
 
 pub trait SHAMapStoreRelationalRuntime: Send + Sync {
     fn minimum_sql_seq(&self) -> Option<u32>;
@@ -420,10 +420,10 @@ mod tests {
     use super::{
         SHAMapStoreRelationalRuntime, SqliteSHAMapStoreRelational, clear_relational_prior,
     };
+    use quaxar_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::TempDir;
-    use xrpld_core::{DatabaseCon, LEDGER_DB_INIT, TRANSACTION_DB_INIT};
 
     #[derive(Default)]
     struct RecordingStore {

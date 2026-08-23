@@ -24,7 +24,8 @@ pub mod version;
 #[derive(Parser)]
 #[command(name = "quaxar", about = "Quaxar XRPL Node", version)]
 pub struct Cli {
-    /// Subcommand to run. If none, starts the node.
+    /// Subcommand to run. Startup flags without a subcommand start the node;
+    /// a completely bare invocation prints help and exits.
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -41,13 +42,13 @@ pub struct Cli {
 pub enum Command {
     /// Show node status (state, peers, validated ledger, uptime)
     Status,
-    /// Health check — exits 0 if healthy, 1 if not
+    /// Reachability check — exits 0 when server_info succeeds, 1 if it fails
     Health,
     /// List connected peers with details
     Peers,
     /// Show sync progress (useful during initial sync)
     SyncStatus,
-    /// Raw RPC call: xrpld rpc <method> ['{"json":"params"}']
+    /// Raw RPC call: quaxar rpc <method> ['{"json":"params"}']
     Rpc {
         /// RPC method name, for example server_info or can_delete
         method: String,

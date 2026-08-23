@@ -115,6 +115,67 @@ fn shared_network_ops_state_tracks_blocking_flags() {
 }
 
 #[test]
+fn blocking_flags_immediately_demote_full_mode() {
+    for set_blocked in [
+        SharedNetworkOpsState::set_amendment_blocked,
+        SharedNetworkOpsState::set_unl_blocked,
+    ] {
+        let state = SharedNetworkOpsState::new(NetworkOpsOperatingMode::Full);
+        set_blocked(&state, true);
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
+        assert!(!state.is_full());
+    }
+}
+
+#[test]
+fn concurrent_mode_and_blocker_writes_keep_accounting_consistent() {
+    let state = std::sync::Arc::new(SharedNetworkOpsState::new(NetworkOpsOperatingMode::Full));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+    let mut threads = Vec::new();
+
+    for worker in 0..7 {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            for turn in 0..1_000 {
+                let mode = if (worker + turn) % 2 == 0 {
+                    NetworkOpsOperatingMode::Full
+                } else {
+                    NetworkOpsOperatingMode::Tracking
+                };
+                state.set_operating_mode(mode);
+            }
+        }));
+    }
+
+    {
+        let state = std::sync::Arc::clone(&state);
+        let barrier = std::sync::Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..1_000 {
+                state.set_amendment_blocked(false);
+                state.set_amendment_blocked(true);
+            }
+        }));
+    }
+
+    barrier.wait();
+    for thread in threads {
+        thread.join().expect("concurrent mode writer");
+    }
+
+    assert!(state.amendment_blocked());
+    assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
+    assert_eq!(
+        state.accounting_operating_mode(),
+        state.operating_mode(),
+        "the public atomic and StateAccounting mode must commit as one serialized write"
+    );
+}
+
+#[test]
 fn shared_network_ops_state_is_full_requires_mode_and_no_network_ledger_gap() {
     let state = SharedNetworkOpsState::new(NetworkOpsOperatingMode::Full);
     assert!(state.is_full());
@@ -146,6 +207,32 @@ fn app_network_ops_mode_owner_normalizes_mode_setmode() {
     state.set_amendment_blocked(true);
     owner.set_operating_mode(NetworkOpsOperatingMode::Full);
     assert_eq!(owner.operating_mode(), NetworkOpsOperatingMode::Connected);
+}
+
+#[test]
+fn repeated_stale_syncing_heartbeat_is_an_unchanged_connected_mode() {
+    let state = std::sync::Arc::new(SharedNetworkOpsState::new(NetworkOpsOperatingMode::Syncing));
+    let owner = AppNetworkOpsModeOwner::new(
+        state.clone(),
+        std::sync::Arc::new(|| Duration::from_secs(120)),
+    );
+
+    owner.set_operating_mode_with_reason(NetworkOpsOperatingMode::Syncing, "heartbeat_reassertion");
+    assert_eq!(owner.operating_mode(), NetworkOpsOperatingMode::Connected);
+
+    for _ in 0..100 {
+        owner.set_operating_mode_with_reason(
+            NetworkOpsOperatingMode::Syncing,
+            "heartbeat_reassertion",
+        );
+    }
+
+    assert_eq!(owner.operating_mode(), NetworkOpsOperatingMode::Connected);
+    assert_eq!(
+        state.state_accounting_json()["connected"]["transitions"],
+        serde_json::Value::String("1".to_owned()),
+        "normalized stale heartbeats must follow rippled's unchanged-mode early return",
+    );
 }
 
 #[test]
@@ -769,6 +856,18 @@ fn begin_apply_batch_swaps_sets_running_and_unlocks() {
 }
 
 #[test]
+fn begin_apply_batch_swaps_the_entire_pending_vector() {
+    let mut pending = (0u16..=256).collect::<Vec<_>>();
+
+    let (transactions, start) =
+        run_networkops_begin_apply_batch(&mut pending, NetworkOpsDispatchState::Scheduled, || {});
+
+    assert_eq!(start.taken_transactions, 257);
+    assert_eq!(transactions, (0u16..=256).collect::<Vec<_>>());
+    assert!(pending.is_empty());
+}
+
+#[test]
 fn finish_apply_batch_relocks_before_tail() {
     let calls = RefCell::new(Vec::new());
     let transactions = vec![
@@ -792,7 +891,7 @@ fn finish_apply_batch_relocks_before_tail() {
         NetworkOpsApplyBatchTail {
             cleared: 2,
             pending_transactions: 2,
-            dispatch_state: NetworkOpsDispatchState::None,
+            dispatch_state: NetworkOpsDispatchState::Scheduled,
         }
     );
     assert_eq!(pending, vec![1, 2]);
@@ -1086,7 +1185,7 @@ fn apply_batch_tail_clears_then_merges_then_notifies() {
         NetworkOpsApplyBatchTail {
             cleared: 2,
             pending_transactions: 3,
-            dispatch_state: NetworkOpsDispatchState::None,
+            dispatch_state: NetworkOpsDispatchState::Scheduled,
         }
     );
     assert_eq!(pending, vec![1, 2, 3]);
@@ -1121,7 +1220,7 @@ fn apply_batch_tail_notifies_even_without_submit_held() {
         NetworkOpsApplyBatchTail {
             cleared: 1,
             pending_transactions: 1,
-            dispatch_state: NetworkOpsDispatchState::None,
+            dispatch_state: NetworkOpsDispatchState::Scheduled,
         }
     );
     assert_eq!(pending, vec![5]);
@@ -1237,6 +1336,32 @@ fn transaction_async_schedules_batch_only_from_none_state() {
     assert_eq!(dispatch, NetworkOpsAsyncDispatch::Scheduled);
     assert_eq!(state, NetworkOpsDispatchState::Scheduled);
     assert_eq!(calls.into_inner(), vec!["push", "set", "job"]);
+}
+
+#[test]
+fn scheduled_batch_retry_returns_to_none_and_reenqueues_once() {
+    let mut state = NetworkOpsRuntimeState::new(
+        vec![7u8],
+        Vec::<u8>::new(),
+        NetworkOpsDispatchState::Scheduled,
+    );
+
+    assert!(state.release_scheduled_transaction_batch_for_retry());
+    assert_eq!(state.dispatch_state(), NetworkOpsDispatchState::None);
+
+    let jobs = RefCell::new(0usize);
+    assert!(state.schedule_pending_transaction_batch(|| {
+        *jobs.borrow_mut() += 1;
+        true
+    }));
+    assert_eq!(*jobs.borrow(), 1);
+    assert_eq!(state.dispatch_state(), NetworkOpsDispatchState::Scheduled);
+
+    assert!(!state.schedule_pending_transaction_batch(|| {
+        *jobs.borrow_mut() += 1;
+        true
+    }));
+    assert_eq!(*jobs.borrow(), 1);
 }
 
 #[test]
@@ -1540,12 +1665,12 @@ fn runtime_state_finish_apply_batch_clears_merges_and_resets_dispatch_owner() {
         NetworkOpsApplyBatchTail {
             cleared: 1,
             pending_transactions: 3,
-            dispatch_state: NetworkOpsDispatchState::None,
+            dispatch_state: NetworkOpsDispatchState::Scheduled,
         }
     );
     assert_eq!(owner.pending_transactions(), &[1, 2, 3]);
     assert!(owner.submit_held().is_empty());
-    assert_eq!(owner.dispatch_state(), NetworkOpsDispatchState::None);
+    assert_eq!(owner.dispatch_state(), NetworkOpsDispatchState::Scheduled);
     assert_eq!(
         calls.into_inner(),
         vec![

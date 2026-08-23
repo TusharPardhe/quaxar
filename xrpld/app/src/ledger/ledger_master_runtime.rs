@@ -16,9 +16,13 @@ use basics::base_uint::Uint256;
 use basics::hardened_hash::HardenedHashBuilder;
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
-use ledger::{CanonicalTXSet, Ledger, LedgerMaster, LedgerMasterConfig, NullLedgerJournal};
+use ledger::{
+    CanonicalTXSet, Ledger, LedgerMaster, LedgerMasterConfig, NullLedgerJournal,
+    REPLAY_MAX_TASK_SIZE,
+};
 use protocol::STTx;
 use shamap::traversal::TraversalError;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub type AppLedgerMaster = LedgerMaster<MonotonicClock, HardenedHashBuilder>;
@@ -27,9 +31,18 @@ pub type AppLedgerMaster = LedgerMaster<MonotonicClock, HardenedHashBuilder>;
 pub struct AppLedgerMasterRuntime {
     ledger_master: Arc<AppLedgerMaster>,
     pub(crate) pending_consensus_ledger: Arc<Mutex<Option<Uint256>>>,
-    pub(crate) completed_ledgers_rx:
-        Arc<Mutex<Option<std::sync::mpsc::Receiver<Arc<ledger::Ledger>>>>>,
+    pub(crate) completed_ledgers_rx: Arc<
+        Mutex<
+            Option<
+                std::sync::mpsc::Receiver<crate::ledger::inbound_ledgers::CompletedInboundLedger>,
+            >,
+        >,
+    >,
     pub inbound_ledgers: Arc<Mutex<Option<Arc<crate::ledger::inbound_ledgers::InboundLedgers>>>>,
+    pending_store_generation: Arc<AtomicU64>,
+    /// Sequence of the ledger currently being built by consensus. This lets
+    /// acquisition avoid racing the close path for the same next ledger.
+    building_ledger_seq: Arc<AtomicU32>,
 }
 
 const APP_LEDGER_MASTER_MAX_PUBLISH_GAP: u32 = 100;
@@ -48,11 +61,26 @@ pub struct AppLedgerMasterMissingLedger {
     pub seq: u32,
 }
 
+/// A bounded, inclusive replay request derived only from a verified publication
+/// gap. `finish_hash` is the last unavailable ledger on the validated chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppLedgerMasterReplayRange {
+    pub finish_hash: Uint256,
+    pub total_ledgers: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppLedgerMasterAdvanceReport {
     pub decision: AppLedgerMasterPublishAdvance,
     pub published: Vec<Arc<Ledger>>,
+    /// First missing validated-chain ledger. It drives Generic-acquisition
+    /// candidate scheduling only: `plan_publication_replay` re-proves any gap
+    /// by walking backward from the validated tip (rippled's `ledgerReplay`
+    /// block), so this marker is never a replay admission predicate.
     pub missing: Option<AppLedgerMasterMissingLedger>,
+    /// Missing validated-chain ledgers in ascending order. The caller applies
+    /// rippled's bounded `ledgerFetchSize_` Generic-acquisition quota.
+    pub generic_acquire_candidates: Vec<AppLedgerMasterMissingLedger>,
 }
 
 impl Default for AppLedgerMasterRuntime {
@@ -75,11 +103,49 @@ impl AppLedgerMasterRuntime {
             pending_consensus_ledger: Arc::new(Mutex::new(None)),
             completed_ledgers_rx: Arc::new(Mutex::new(None)),
             inbound_ledgers: Arc::new(Mutex::new(None)),
+            pending_store_generation: Arc::new(AtomicU64::new(0)),
+            building_ledger_seq: Arc::new(AtomicU32::new(0)),
         }
     }
 
     pub fn ledger_master(&self) -> Arc<AppLedgerMaster> {
         Arc::clone(&self.ledger_master)
+    }
+
+    pub(crate) fn publish_store_rotation(&self, generation: u64) {
+        if generation == 0 {
+            return;
+        }
+        let guard = self
+            .inbound_ledgers
+            .lock()
+            .expect("inbound_ledgers mutex must not be poisoned");
+        if let Some(inbound) = guard.as_ref() {
+            inbound.note_store_rotated(generation);
+        } else {
+            self.pending_store_generation
+                .fetch_max(generation, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn install_inbound_ledgers(
+        &self,
+        inbound: Arc<crate::ledger::inbound_ledgers::InboundLedgers>,
+    ) {
+        let mut guard = self
+            .inbound_ledgers
+            .lock()
+            .expect("inbound_ledgers mutex must not be poisoned");
+        if guard.is_none() {
+            *guard = Some(inbound);
+        }
+        let generation = self.pending_store_generation.swap(0, Ordering::AcqRel);
+        if generation != 0 {
+            guard
+                .as_ref()
+                .expect("inbound owner was just installed")
+                .note_store_rotated(generation);
+        }
     }
 
     /// Returns the hash of the consensus ledger currently being requested,
@@ -158,6 +224,19 @@ impl AppLedgerMasterRuntime {
         )
     }
 
+    /// Mark the next ledger sequence that consensus is about to build.
+    /// Mirrors `LedgerMaster::setBuildingLedger` in rippled.
+    pub fn set_building_ledger(&self, seq: u32) {
+        self.building_ledger_seq.store(seq, Ordering::Release);
+    }
+
+    pub fn building_ledger(&self) -> Option<u32> {
+        match self.building_ledger_seq.load(Ordering::Acquire) {
+            0 => None,
+            seq => Some(seq),
+        }
+    }
+
     pub fn check_accept(&self, hash: Uint256, seq: u32) -> bool {
         if seq <= self.ledger_master.valid_ledger_seq() {
             return false;
@@ -173,6 +252,7 @@ impl AppLedgerMasterRuntime {
                 decision: AppLedgerMasterPublishAdvance::NothingToPublish,
                 published: Vec::new(),
                 missing: None,
+                generic_acquire_candidates: Vec::new(),
             };
         };
 
@@ -196,22 +276,29 @@ impl AppLedgerMasterRuntime {
                 decision,
                 published: Vec::new(),
                 missing: None,
+                generic_acquire_candidates: Vec::new(),
             },
             AppLedgerMasterPublishAdvance::FirstPublished
             | AppLedgerMasterPublishAdvance::GapTooLarge => AppLedgerMasterAdvanceReport {
                 decision,
                 published: vec![validated],
                 missing: None,
+                generic_acquire_candidates: Vec::new(),
             },
             AppLedgerMasterPublishAdvance::Sequential => {
                 let mut to_publish = Vec::new();
                 let mut missing = None;
+                let mut generic_acquire_candidates = Vec::new();
+                let mut publication_contiguous = true;
                 let mut next_seq = published
                     .as_ref()
                     .map(|ledger| ledger.header().seq)
                     .unwrap_or(0)
                     .saturating_add(1);
 
+                // Match rippled findNewLedgersToPublish: continue scanning the
+                // validated chain after the first publication hole so a bounded
+                // ascending set of Generic acquisitions can begin in parallel.
                 while next_seq <= valid_seq {
                     let next_ledger = if next_seq == valid_seq {
                         Some(Arc::clone(&validated))
@@ -222,33 +309,42 @@ impl AppLedgerMasterRuntime {
                         if hash.is_zero() {
                             break;
                         }
-                        self.ledger_master.get_ledger_by_hash(hash).or_else(|| {
-                            missing = Some(AppLedgerMasterMissingLedger {
-                                hash: *hash.as_uint256(),
-                                seq: next_seq,
-                            });
-                            None
-                        })
+                        match self.ledger_master.get_ledger_by_hash(hash) {
+                            Some(ledger) => Some(ledger),
+                            None => {
+                                let candidate = AppLedgerMasterMissingLedger {
+                                    hash: *hash.as_uint256(),
+                                    seq: next_seq,
+                                };
+                                missing.get_or_insert(candidate);
+                                generic_acquire_candidates.push(candidate);
+                                publication_contiguous = false;
+                                next_seq = next_seq.saturating_add(1);
+                                continue;
+                            }
+                        }
                     };
 
                     let Some(next_ledger) = next_ledger else {
                         break;
                     };
-
                     if next_ledger.header().seq != next_seq {
                         break;
                     }
 
-                    if let Some(previous) = to_publish
-                        .last()
-                        .cloned()
-                        .or_else(|| self.ledger_master.published_ledger())
-                        && previous.header().hash != next_ledger.header().parent_hash
-                    {
-                        break;
+                    if publication_contiguous {
+                        if let Some(previous) = to_publish
+                            .last()
+                            .cloned()
+                            .or_else(|| self.ledger_master.published_ledger())
+                            && previous.header().hash != next_ledger.header().parent_hash
+                        {
+                            publication_contiguous = false;
+                            next_seq = next_seq.saturating_add(1);
+                            continue;
+                        }
+                        to_publish.push(next_ledger);
                     }
-
-                    to_publish.push(next_ledger);
                     next_seq = next_seq.saturating_add(1);
                 }
 
@@ -256,9 +352,80 @@ impl AppLedgerMasterRuntime {
                     decision,
                     published: to_publish,
                     missing,
+                    generic_acquire_candidates,
                 }
             }
         }
+    }
+
+    /// Mirrors `../rippled/src/xrpld/app/ledger/detail/LedgerMaster.cpp::
+    /// LedgerMaster::findNewLedgersToPublish`: begin at the last contiguous
+    /// ledger ready for publication, walk backward through locally available
+    /// validated-chain parents, and replay the first unavailable inclusive
+    /// suffix. Invalid ancestry, an absent publication gap, or an over-limit
+    /// request is rejected rather than widened into a permissive replay.
+    pub fn plan_publication_replay(
+        &self,
+        report: &AppLedgerMasterAdvanceReport,
+    ) -> Option<AppLedgerMasterReplayRange> {
+        if report.decision != AppLedgerMasterPublishAdvance::Sequential {
+            return None;
+        }
+
+        // `findNewLedgersToPublish` derives both its contiguous prefix and
+        // replay suffix under LedgerMaster's lock. This Rust bridge receives a
+        // report across an owner boundary, so re-prove that its prefix extends
+        // the actual publication head before using it as replay's start.
+        let mut start = self.ledger_master.published_ledger()?;
+        for published in &report.published {
+            if published.header().seq != start.header().seq.checked_add(1)?
+                || published.header().parent_hash != start.header().hash
+            {
+                return None;
+            }
+            start = Arc::clone(published);
+        }
+
+        let mut finish = self.ledger_master.validated_ledger()?;
+        if finish.header().seq <= start.header().seq {
+            return None;
+        }
+        while start.header().seq.checked_add(1)? < finish.header().seq {
+            let parent_hash = finish.header().parent_hash;
+            let parent_seq = finish.header().seq.checked_sub(1)?;
+            let Some(parent) = self.ledger_master.get_ledger_by_hash(parent_hash) else {
+                // Match LedgerMaster::findNewLedgersToPublish: the backward
+                // validated-tip walk chooses its first unavailable parent.
+                // The forward publication-hole marker is useful for Generic
+                // acquisition, but is not a replay admission predicate.
+                if parent_hash.is_zero() {
+                    return None;
+                }
+
+                let total_ledgers = finish
+                    .header()
+                    .seq
+                    .checked_sub(start.header().seq)?
+                    .checked_add(1)?;
+                if !(2..=REPLAY_MAX_TASK_SIZE).contains(&total_ledgers) {
+                    return None;
+                }
+                return Some(AppLedgerMasterReplayRange {
+                    finish_hash: *finish.header().hash.as_uint256(),
+                    total_ledgers,
+                });
+            };
+
+            // `LedgerMaster.cpp` follows a locally held parent. Do not treat a
+            // stale cache entry or a forked/non-consecutive candidate as that
+            // parent: no safe replay range can be proven from it.
+            if parent.header().seq != parent_seq || parent.header().hash != parent_hash {
+                return None;
+            }
+            finish = parent;
+        }
+
+        None
     }
 }
 
@@ -497,6 +664,49 @@ mod tests {
     }
 
     #[test]
+    fn publication_replay_ignores_an_unproven_forward_marker() {
+        let runtime = AppLedgerMasterRuntime::default();
+        let first = immutable_ledger(1, 0x10);
+        let second = linked_ledger(&first, 600);
+        let third = linked_ledger(&second, 700);
+
+        runtime.ledger_master().set_pub_ledger(Arc::clone(&first));
+        runtime
+            .ledger_master()
+            .set_valid_ledger(Arc::clone(&third), None, None)
+            .expect("validated ledger should update");
+
+        let mut report = runtime.plan_advance_publication();
+        // Replay is derived only from the validated-tip backward walk (the
+        // ledgerReplay block of rippled LedgerMaster::findNewLedgersToPublish),
+        // never from the forward publication-hole marker. An unproven marker
+        // must therefore not redirect or widen the genuine replay request.
+        let genuine = Some(super::AppLedgerMasterReplayRange {
+            finish_hash: *third.header().hash.as_uint256(),
+            total_ledgers: 3,
+        });
+        report.missing = Some(super::AppLedgerMasterMissingLedger {
+            hash: Uint256::from_array([0xEE; 32]),
+            seq: 2,
+        });
+        assert_eq!(
+            runtime.plan_publication_replay(&report),
+            genuine,
+            "a fabricated forward marker must not redirect the validated-chain replay"
+        );
+
+        report.missing = Some(super::AppLedgerMasterMissingLedger {
+            hash: *second.header().hash.as_uint256(),
+            seq: 3,
+        });
+        assert_eq!(
+            runtime.plan_publication_replay(&report),
+            genuine,
+            "a wrong-sequence forward marker must not widen the validated-chain replay"
+        );
+    }
+
+    #[test]
     fn runtime_plans_exact_missing_publish_gap() {
         let runtime = AppLedgerMasterRuntime::default();
         let first = immutable_ledger(1, 0x10);
@@ -517,5 +727,13 @@ mod tests {
             .expect("seq=2 should be the first publish gap");
         assert_eq!(missing.seq, 2);
         assert_eq!(missing.hash, *second.header().hash.as_uint256());
+        assert_eq!(
+            runtime.plan_publication_replay(&report),
+            Some(super::AppLedgerMasterReplayRange {
+                finish_hash: *third.header().hash.as_uint256(),
+                total_ledgers: 3,
+            }),
+            "the replay request must start at the published ledger and end at the first unavailable validated suffix"
+        );
     }
 }

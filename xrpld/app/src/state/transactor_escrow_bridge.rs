@@ -8,6 +8,19 @@ use tx::escrow::escrow_cancel::EscrowCancelApplySink;
 use tx::escrow::escrow_create::{EscrowCreateApplyFacts, EscrowCreateApplySink};
 use tx::escrow::escrow_finish::EscrowFinishApplySink;
 
+/// Check the source account's reserve after XRP is locked without relying on
+/// signed subtraction. rippled's STAmount arithmetic permits an intermediate
+/// negative value, whereas a Rust `i64` subtraction would panic in debug mode.
+fn xrp_post_lock_reserve_sufficient(
+    balance_drops: i64,
+    escrow_drops: i64,
+    reserve_drops: i64,
+) -> bool {
+    balance_drops
+        .checked_sub(escrow_drops)
+        .is_some_and(|remaining| remaining >= reserve_drops)
+}
+
 pub fn build_escrow_create_facts<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
@@ -16,37 +29,54 @@ pub fn build_escrow_create_facts<V: ApplyView>(
     finish_after: Option<u32>,
     cancel_after: Option<u32>,
 ) -> Result<EscrowCreateApplyFacts, ViewError> {
-    let mut facts = EscrowCreateApplyFacts::default();
-    facts.amount_is_xrp = amount.native();
-    facts.finish_after_expired =
-        finish_after.is_some_and(|time| view.header().parent_close_time > time);
-    facts.cancel_after_expired =
-        cancel_after.is_some_and(|time| view.header().parent_close_time > time);
-    facts.include_sequence_field = view
-        .rules()
-        .enabled(&protocol::feature_id("fixIncludeKeyletFields"));
+    let mut facts = EscrowCreateApplyFacts {
+        amount_is_xrp: amount.native(),
+        finish_after_expired: finish_after
+            .is_some_and(|time| view.header().parent_close_time > time),
+        cancel_after_expired: cancel_after
+            .is_some_and(|time| view.header().parent_close_time > time),
+        include_sequence_field: view
+            .rules()
+            .enabled(&protocol::feature_id("fixIncludeKeyletFields")),
+        ..EscrowCreateApplyFacts::default()
+    };
 
     if let Some(src_sle) =
         view.peek(protocol::account_keylet(Uint160::from_void(account.data())))?
     {
         facts.owner_exists = true;
         let owner_count = src_sle.get_field_u32(get_field_by_symbol("sfOwnerCount"));
-        facts.reserve_sufficient = view.fees().account_reserve(owner_count as usize + 1) as i64
-            <= src_sle
-                .get_field_amount(get_field_by_symbol("sfBalance"))
-                .xrp()
-                .drops();
+        let reserve_drops = view.fees().account_reserve(owner_count as usize + 1) as i64;
+        let balance_drops = src_sle
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops();
+        facts.reserve_sufficient = reserve_drops <= balance_drops;
         facts.xrp_balance_covers_amount = !amount.native()
-            || src_sle
-                .get_field_amount(get_field_by_symbol("sfBalance"))
-                .xrp()
-                .drops()
-                >= amount.xrp().drops();
+            || xrp_post_lock_reserve_sufficient(balance_drops, amount.xrp().drops(), reserve_drops);
+        facts.should_set_transfer_rate = !amount.native()
+            && view.rules().enabled(&protocol::feature_token_escrow())
+            && match amount.asset() {
+                Asset::Issue(issue) => {
+                    ledger::ripple_state_helpers::transfer_rate(view, &issue.issuer())
+                        != protocol::PARITY_RATE.value
+                }
+                Asset::MPTIssue(issue) => {
+                    ledger::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
+                        .map(|rate| rate.value)
+                        .unwrap_or(protocol::PARITY_RATE.value)
+                        != protocol::PARITY_RATE.value
+                }
+            };
     }
 
-    facts.destination_exists = view.exists(protocol::account_keylet(Uint160::from_void(
+    let destination = view.read(protocol::account_keylet(Uint160::from_void(
         dst_account.data(),
     )))?;
+    facts.destination_exists = destination.is_some();
+    facts.destination_requires_tag = destination
+        .as_ref()
+        .is_some_and(|sle| sle.is_flag(protocol::lsfRequireDestTag));
     facts.destination_is_sender = account == dst_account;
     facts.issuer_owner_dir_required = match amount.asset() {
         Asset::Issue(issue) if !issue.native() => {
@@ -70,6 +100,8 @@ pub struct ViewBackedEscrowCreateSink<'a, V> {
     pub condition: Option<Vec<u8>>,
     pub source_tag: Option<u32>,
     pub destination_tag: Option<u32>,
+    pub reserve_sponsor: Option<Arc<STLedgerEntry>>,
+    pub failure: Option<Ter>,
 }
 
 impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, V> {
@@ -95,22 +127,15 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
         if let Some(destination_tag) = self.destination_tag {
             sle.set_field_u32(get_field_by_symbol("sfDestinationTag"), destination_tag);
         }
-        if !self.amount.native() {
-            let rate = match self.amount.asset() {
-                Asset::Issue(issue) => {
-                    ledger::ripple_state_helpers::transfer_rate(self.view, &issue.issuer())
-                }
-                Asset::MPTIssue(issue) => {
-                    ledger::mptoken_helpers::transfer_rate_mpt(self.view, issue.mpt_id())
-                        .map(|rate| rate.value)
-                        .unwrap_or(protocol::PARITY_RATE.value)
-                }
-            };
-            if rate != protocol::PARITY_RATE.value {
-                sle.set_field_u32(get_field_by_symbol("sfTransferRate"), rate);
-            }
+        if let Some(sponsor) = self.reserve_sponsor.as_ref() {
+            sle.set_account_id(
+                get_field_by_symbol("sfSponsor"),
+                sponsor.get_account_id(get_field_by_symbol("sfAccount")),
+            );
         }
-        let _ = self.view.insert(Arc::new(sle));
+        if self.view.insert(Arc::new(sle)).is_err() {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
+        }
     }
     fn set_sequence_field(&mut self) {
         if let Ok(Some(sle)) = self.view.peek(protocol::escrow_keylet(
@@ -119,23 +144,60 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
         )) {
             let mut obj = sle.clone_as_object();
             obj.set_field_u32(get_field_by_symbol("sfSequence"), self.escrow_seq);
-            let _ = self
+            if self
                 .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
+                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())))
+                .is_err()
+            {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+            }
+        } else {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
         }
     }
-    fn set_transfer_rate(&mut self) {}
+    fn set_transfer_rate(&mut self) {
+        let rate = match self.amount.asset() {
+            Asset::Issue(issue) => {
+                ledger::ripple_state_helpers::transfer_rate(self.view, &issue.issuer())
+            }
+            Asset::MPTIssue(issue) => {
+                ledger::mptoken_helpers::transfer_rate_mpt(self.view, issue.mpt_id())
+                    .map(|rate| rate.value)
+                    .unwrap_or(protocol::PARITY_RATE.value)
+            }
+        };
+        if let Ok(Some(sle)) = self.view.peek(protocol::escrow_keylet(
+            Uint160::from_void(self.account.data()),
+            self.escrow_seq,
+        )) {
+            let mut object = sle.clone_as_object();
+            object.set_field_u32(get_field_by_symbol("sfTransferRate"), rate);
+            if self
+                .view
+                .update(Arc::new(STLedgerEntry::from_stobject(object, *sle.key())))
+                .is_err()
+            {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+            }
+        } else {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
+        }
+    }
     fn insert_sender_owner_dir(&mut self) -> Option<u64> {
         let escrow_kl =
             protocol::escrow_keylet(Uint160::from_void(self.account.data()), self.escrow_seq);
-        dir_insert(
+        match dir_insert(
             self.view,
             &protocol::owner_dir_keylet(Uint160::from_void(self.account.data())),
             escrow_kl.key,
-            &|_| {},
-        )
-        .ok()
-        .flatten()
+            &ledger::describe_owner_dir(self.account),
+        ) {
+            Ok(page) => page,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                None
+            }
+        }
     }
     fn set_sender_owner_node(&mut self, page: u64) {
         if let Ok(Some(sle)) = self.view.peek(protocol::escrow_keylet(
@@ -145,22 +207,32 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
             // Simplified
             let mut obj = sle.clone_as_object();
             obj.set_field_u64(get_field_by_symbol("sfOwnerNode"), page);
-            let _ = self
+            if self
                 .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
+                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())))
+                .is_err()
+            {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+            }
+        } else {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
         }
     }
     fn insert_destination_owner_dir(&mut self) -> Option<u64> {
         let escrow_kl =
             protocol::escrow_keylet(Uint160::from_void(self.account.data()), self.escrow_seq);
-        dir_insert(
+        match dir_insert(
             self.view,
             &protocol::owner_dir_keylet(Uint160::from_void(self.dst_account.data())),
             escrow_kl.key,
-            &|_| {},
-        )
-        .ok()
-        .flatten()
+            &ledger::describe_owner_dir(self.dst_account),
+        ) {
+            Ok(page) => page,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                None
+            }
+        }
     }
     fn set_destination_owner_node(&mut self, page: u64) {
         if let Ok(Some(sle)) = self.view.peek(protocol::escrow_keylet(
@@ -170,9 +242,15 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
             // Simplified
             let mut obj = sle.clone_as_object();
             obj.set_field_u64(get_field_by_symbol("sfDestinationNode"), page);
-            let _ = self
+            if self
                 .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
+                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())))
+                .is_err()
+            {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+            }
+        } else {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
         }
     }
     fn insert_issuer_owner_dir(&mut self) -> Option<u64> {
@@ -181,14 +259,18 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
         };
         let escrow_kl =
             protocol::escrow_keylet(Uint160::from_void(self.account.data()), self.escrow_seq);
-        dir_insert(
+        match dir_insert(
             self.view,
             &protocol::owner_dir_keylet(Uint160::from_void(issue.issuer().data())),
             escrow_kl.key,
-            &|_| {},
-        )
-        .ok()
-        .flatten()
+            &ledger::describe_owner_dir(issue.issuer()),
+        ) {
+            Ok(page) => page,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                None
+            }
+        }
     }
     fn set_issuer_owner_node(&mut self, page: u64) {
         if let Ok(Some(sle)) = self.view.peek(protocol::escrow_keylet(
@@ -197,9 +279,15 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
         )) {
             let mut obj = sle.clone_as_object();
             obj.set_field_u64(get_field_by_symbol("sfIssuerNode"), page);
-            let _ = self
+            if self
                 .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
+                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())))
+                .is_err()
+            {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+            }
+        } else {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
         }
     }
     fn deduct_xrp_owner_balance(&mut self) {
@@ -207,14 +295,23 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
             self.account.data(),
         ))) {
             let balance = src_sle.get_field_amount(get_field_by_symbol("sfBalance"));
-            let new_balance = STAmount::from_xrp_amount(XRPAmount::from_drops(
-                balance.xrp().drops() - self.amount.xrp().drops(),
-            ));
+            let Some(new_balance) = balance.xrp().drops().checked_sub(self.amount.xrp().drops())
+            else {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                return;
+            };
+            let new_balance = STAmount::from_xrp_amount(XRPAmount::from_drops(new_balance));
             let mut obj = src_sle.clone_as_object();
             obj.set_field_amount(get_field_by_symbol("sfBalance"), new_balance);
-            let _ = self
+            if self
                 .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *src_sle.key())));
+                .update(Arc::new(STLedgerEntry::from_stobject(obj, *src_sle.key())))
+                .is_err()
+            {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+            }
+        } else {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
         }
     }
     fn lock_non_xrp_amount(&mut self) -> Ter {
@@ -235,15 +332,47 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
         if let Ok(Some(src_sle)) = self.view.peek(protocol::account_keylet(Uint160::from_void(
             self.account.data(),
         ))) {
-            let _ = adjust_owner_count(self.view, &src_sle, delta);
+            let result = if delta == 1 {
+                ledger::increase_owner_count_for_object(
+                    self.view,
+                    &src_sle,
+                    self.reserve_sponsor.as_ref(),
+                )
+            } else {
+                adjust_owner_count(self.view, &src_sle, delta)
+            };
+            if result.is_err() {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+            }
+        } else {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
         }
     }
     fn update_owner(&mut self) {
         if let Ok(Some(src_sle)) = self.view.peek(protocol::account_keylet(Uint160::from_void(
             self.account.data(),
         ))) {
-            let _ = self.view.update(src_sle);
+            if self.view.update(src_sle).is_err() {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+            }
+        } else {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::xrp_post_lock_reserve_sufficient;
+
+    #[test]
+    fn xrp_post_lock_reserve_rejects_an_escrow_larger_than_the_source_balance() {
+        assert!(!xrp_post_lock_reserve_sufficient(10, 11, 0));
+    }
+
+    #[test]
+    fn xrp_post_lock_reserve_accepts_an_exact_reserve_remainder() {
+        assert!(xrp_post_lock_reserve_sufficient(100, 60, 40));
     }
 }
 

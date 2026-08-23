@@ -131,6 +131,23 @@ pub trait TransactionCloseTimeSource {
     fn close_time_for_ledger_seq(&self, ledger_seq: u32) -> Option<i64>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionRelayMetadata {
+    pub status: i32,
+    pub receive_timestamp: Option<u64>,
+    pub deferred: Option<bool>,
+}
+
+impl TransactionRelayMetadata {
+    pub const fn new(status: i32, receive_timestamp: Option<u64>, deferred: Option<bool>) -> Self {
+        Self {
+            status,
+            receive_timestamp,
+            deferred,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Transaction {
     transaction: Arc<STTx>,
@@ -143,6 +160,10 @@ pub struct Transaction {
     applying: bool,
     submit_result: SubmitResult,
     current_ledger_state: Option<CurrentLedgerState>,
+    /// Wire envelope fields received with an inbound TMTransaction. They are
+    /// retained on the canonical transaction so consensus dispute retries and
+    /// later relay work do not silently discard source metadata.
+    relay_metadata: Option<TransactionRelayMetadata>,
 }
 
 impl Transaction {
@@ -164,7 +185,17 @@ impl Transaction {
                 kept: false,
             },
             current_ledger_state: None,
+            relay_metadata: None,
         }
+    }
+
+    pub fn new_with_relay_metadata(
+        transaction: Arc<STTx>,
+        relay_metadata: TransactionRelayMetadata,
+    ) -> Self {
+        let mut transaction = Self::new(transaction);
+        transaction.relay_metadata = Some(relay_metadata);
+        transaction
     }
 
     pub fn transaction_from_sql(
@@ -338,6 +369,23 @@ impl Transaction {
         ));
     }
 
+    pub fn relay_metadata(&self) -> Option<TransactionRelayMetadata> {
+        self.relay_metadata
+    }
+
+    /// Keep the first inbound envelope's concrete fields while filling any
+    /// omitted values from a duplicate that is canonicalized later.
+    pub fn merge_relay_metadata(&mut self, metadata: TransactionRelayMetadata) {
+        match self.relay_metadata.as_mut() {
+            Some(current) => {
+                current.receive_timestamp =
+                    current.receive_timestamp.or(metadata.receive_timestamp);
+                current.deferred = current.deferred.or(metadata.deferred);
+            }
+            None => self.relay_metadata = Some(metadata),
+        }
+    }
+
     pub fn get_json(&self, options: JsonOptions, binary: bool) -> JsonValue {
         self.get_json_with_close_time(options, binary, None)
     }
@@ -432,5 +480,39 @@ fn unwind_message(payload: Box<dyn std::any::Any + Send>) -> Option<String> {
             Ok(message) => Some((*message).to_string()),
             Err(_) => None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Transaction, TransactionRelayMetadata};
+    use crate::tx_queue::transaction_master::TransactionMaster;
+    use protocol::{STTx, TxType, get_field_by_symbol};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn canonicalization_keeps_inbound_relay_metadata_for_duplicate_transaction() {
+        let tx = Arc::new(STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        }));
+        let master = TransactionMaster::new();
+        let mut first = Arc::new(Mutex::new(Transaction::new(Arc::clone(&tx))));
+        master.canonicalize(&mut first);
+
+        let metadata = TransactionRelayMetadata::new(1, Some(123_456), Some(true));
+        let mut duplicate = Arc::new(Mutex::new(Transaction::new_with_relay_metadata(
+            Arc::clone(&tx),
+            metadata,
+        )));
+        master.canonicalize(&mut duplicate);
+
+        assert!(Arc::ptr_eq(&first, &duplicate));
+        assert_eq!(
+            duplicate
+                .lock()
+                .expect("canonical transaction mutex")
+                .relay_metadata(),
+            Some(metadata)
+        );
     }
 }

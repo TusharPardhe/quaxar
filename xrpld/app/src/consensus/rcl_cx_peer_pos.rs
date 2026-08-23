@@ -58,7 +58,12 @@ impl RclCxPeerPos {
     }
 
     pub fn check_sign(&self) -> bool {
-        verify_digest(&self.public_key, self.signing_hash(), &self.signature, true)
+        verify_digest(
+            &self.public_key,
+            self.signing_hash(),
+            &self.signature,
+            false,
+        )
     }
 
     fn signing_hash(&self) -> Uint256 {

@@ -24,7 +24,7 @@ use super::{
     InboundLedgerDataType, InboundLedgerLocal, InboundLedgerNodeData, InboundLedgerPacket,
     InboundLedgerPacketShape, InboundLedgerPeerScore, InboundLedgerPlannerState, Ledger,
     NullInboundLedgerJournal, ProtocolPayload, SyncTree, TM_GET_OBJECT_BY_HASH_STATE_NODE,
-    sample_peer_ids, sample_peer_ids_with,
+    TreeKind, sample_peer_ids, sample_peer_ids_with,
 };
 use crate::LedgerHeader;
 use protocol::XRP_LEDGER_EARLIEST_FEES;
@@ -142,6 +142,40 @@ fn sample_peer_ids_with_draws_unique_subset() {
 }
 
 #[test]
+fn packet_shape_skips_raw_base_header_and_classifies_bundled_roots() {
+    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    root.set_child_hash(3, sample_hash(0x73));
+    root.update_hash();
+    let root_wire = root
+        .serialize_for_wire()
+        .expect("non-empty root should serialize for wire");
+    assert!(
+        SHAMapTreeNode::make_from_wire(&root_wire)
+            .expect("root wire should decode")
+            .expect("root wire should be non-empty")
+            .is_inner()
+    );
+
+    // Base slot 0 is rippled's raw LedgerHeader serialization. Slots 1 and 2
+    // are `serializeRoot` values, which rippled serializes with
+    // `SHAMapTreeNode::serializeForWire`.
+    let packet = InboundLedgerPacket::new(
+        InboundLedgerDataType::Base,
+        vec![
+            InboundLedgerNodeData::new(None, vec![0xAB; 123]),
+            InboundLedgerNodeData::new(None, root_wire),
+        ],
+    );
+
+    let shape = InboundLedgerPacketShape::classify(&packet);
+    assert_eq!(shape.nodes, 2);
+    assert_eq!(shape.inner_nodes, 1);
+    assert_eq!(shape.leaf_nodes, 0);
+    assert_eq!(shape.empty_nodes, 0);
+    assert_eq!(shape.malformed_nodes, 0);
+}
+
+#[test]
 fn packet_shape_classifies_inner_empty_and_malformed_nodes() {
     let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
     inner.set_child_hash(3, sample_hash(0x33));
@@ -166,6 +200,47 @@ fn packet_shape_classifies_inner_empty_and_malformed_nodes() {
     assert_eq!(shape.leaf_nodes, 0);
     assert_eq!(shape.empty_nodes, 1);
     assert_eq!(shape.malformed_nodes, 1);
+}
+
+#[test]
+fn complete_tree_plan_clears_only_the_completed_map_synching_state() {
+    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    state_root.update_hash();
+    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    tx_root.update_hash();
+    let mut inbound = InboundLedgerLocal::new(sample_hash(0x43), 77);
+    inbound.ledger = Some(Ledger::from_maps(
+        LedgerHeader {
+            seq: 77,
+            account_hash: state_root.get_hash(),
+            tx_hash: tx_root.get_hash(),
+            ..LedgerHeader::default()
+        },
+        SyncTree::from_root_with_type(state_root, SHAMapType::State, true, 77, SyncState::Synching),
+        SyncTree::from_root_with_type(
+            tx_root,
+            SHAMapType::Transaction,
+            true,
+            77,
+            SyncState::Synching,
+        ),
+    ));
+    inbound.planner_state = InboundLedgerPlannerState {
+        have_header: true,
+        have_state: false,
+        have_transactions: false,
+    };
+
+    assert!(inbound.complete_tree_plan(TreeKind::State));
+    let ledger = inbound.ledger.as_ref().expect("ledger remains attached");
+    assert!(!ledger.state_map().is_synching());
+    assert!(ledger.tx_map().is_synching());
+    assert!(!inbound.is_complete());
+
+    assert!(inbound.complete_tree_plan(TreeKind::Transaction));
+    let ledger = inbound.ledger.as_ref().expect("ledger remains attached");
+    assert!(!ledger.tx_map().is_synching());
+    assert!(inbound.is_complete());
 }
 
 #[test]

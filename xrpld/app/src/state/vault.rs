@@ -6,7 +6,7 @@ use basics::{
 };
 use ledger::{
     ApplyView, account_root_helpers::create_pseudo_account, adjust_owner_count,
-    amm_helpers::stamount_as_number, dir_append, dir_remove,
+    amm_helpers::stamount_as_number, describe_owner_dir, dir_insert, dir_remove,
 };
 use protocol::{
     AccountID, Asset, LedgerEntryType, MPTIssue, STAmount, STLedgerEntry, STNumber, STTx,
@@ -16,11 +16,11 @@ use protocol::{
 };
 use tx::{
     MPT_CAN_ESCROW_FLAG, MPT_CAN_TRADE_FLAG, MPT_CAN_TRANSFER_FLAG, MPT_REQUIRE_AUTH_FLAG,
-    VAULT_PRIVATE_FLAG, VAULT_SHARE_NON_TRANSFERABLE_FLAG, VaultClawbackPreflightFacts,
-    VaultCreatePreflightFacts, VaultDeletePreflightFacts, VaultDepositPreflightFacts,
-    VaultSetPreflightFacts, VaultWithdrawPreflightFacts, run_vault_clawback_preflight,
-    run_vault_create_preflight, run_vault_delete_preflight, run_vault_deposit_preflight,
-    run_vault_set_preflight, run_vault_withdraw_preflight,
+    VAULT_PRIVATE_FLAG, VAULT_SHARE_NON_TRANSFERABLE_FLAG, VAULT_STRATEGY_FIRST_COME_FIRST_SERVE,
+    VaultClawbackPreflightFacts, VaultCreatePreflightFacts, VaultDeletePreflightFacts,
+    VaultDepositPreflightFacts, VaultSetPreflightFacts, VaultWithdrawPreflightFacts,
+    run_vault_clawback_preflight, run_vault_create_preflight, run_vault_delete_preflight,
+    run_vault_deposit_preflight, run_vault_set_preflight, run_vault_withdraw_preflight,
 };
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -85,7 +85,15 @@ fn vault_create_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
         return Ter::TEM_DISABLED;
     }
 
-    let asset = tx_asset_field(sttx, sf("sfAsset"));
+    if sttx
+        .peek_at_pfield(sf("sfAsset"))
+        .map(|value| value.stype())
+        != Some(SerializedTypeId::Issue)
+    {
+        return Ter::TEM_MALFORMED;
+    }
+
+    let asset = sttx.get_field_issue(sf("sfAsset")).asset();
     let facts = VaultCreatePreflightFacts {
         data_len: data_len(sttx, sf("sfData")),
         withdrawal_policy: sttx
@@ -138,7 +146,7 @@ fn vault_delete_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
         lending_protocol_v1_1_enabled: feature_enabled(view, "LendingProtocolV1_1"),
         memo_data_length_valid: !sttx.is_field_present(sf("sfMemoData"))
             || data_len(sttx, sf("sfMemoData"))
-                .map_or(true, |len| len <= tx::VAULT_DELETE_MAX_DATA_PAYLOAD_LENGTH),
+                .is_none_or(|len| len <= tx::VAULT_DELETE_MAX_DATA_PAYLOAD_LENGTH),
     })
 }
 
@@ -841,14 +849,15 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
 
     let share_id = mpt_id_for(&pseudo, 1);
     let issuance_keylet = mpt_issuance_keylet(1, to_160(&pseudo));
-    let issuance_page = match dir_append(
+    let issuance_page = match dir_insert(
         view,
         &owner_dir_keylet(to_160(&pseudo)),
         issuance_keylet.key,
-        &|_| {},
+        &describe_owner_dir(pseudo),
     ) {
         Ok(Some(page)) => page,
-        _ => return Ter::TEF_BAD_LEDGER,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let mut issuance = STLedgerEntry::new(issuance_keylet);
     issuance.set_account_id(sf("sfIssuer"), pseudo);
@@ -899,10 +908,15 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return ter;
     }
 
-    let owner_page = match dir_append(view, &owner_dir_keylet(to_160(&owner)), keylet.key, &|_| {})
-    {
+    let owner_page = match dir_insert(
+        view,
+        &owner_dir_keylet(to_160(&owner)),
+        keylet.key,
+        &describe_owner_dir(owner),
+    ) {
         Ok(Some(page)) => page,
-        _ => return Ter::TEF_BAD_LEDGER,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     let mut vault = STLedgerEntry::from_type_and_key(LedgerEntryType::Vault, keylet.key);
@@ -945,7 +959,7 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         if sttx.is_field_present(sf("sfWithdrawalPolicy")) {
             sttx.get_field_u8(sf("sfWithdrawalPolicy"))
         } else {
-            0
+            VAULT_STRATEGY_FIRST_COME_FIRST_SERVE
         },
     );
     if share_asset_scale != 0 {

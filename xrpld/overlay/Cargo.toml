@@ -10,7 +10,7 @@ name = "overlay"
 path = "src/lib.rs"
 
 [dependencies]
-xrpld-metrics = { path = "../metrics" }
+quaxar-metrics = { path = "../metrics" }
 basics = { path = "../../xrpl/basics" }
 protocol = { path = "../../xrpl/protocol" }
 resource = { path = "../../xrpl/resource" }

@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug in xrpld
+about: Report a bug in Quaxar
 labels: bug
 ---
 
@@ -16,5 +16,8 @@ labels: bug
 ## Environment
 - OS:
 - Rust version:
-- xrpld version:
-- Config:
+- Quaxar version:
+- Commit (`quaxar version`):
+- Redacted config (remove seeds, private keys, tokens, and private endpoints):
+- `server_info`, `fetch_info`, and `get_counts` output:
+- Relevant recent logs (redacted):

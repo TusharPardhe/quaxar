@@ -59,6 +59,10 @@ fn account_root(
 }
 
 fn make_ledger(entries: Vec<STLedgerEntry>) -> Ledger {
+    make_ledger_at_parent_close(entries, 0)
+}
+
+fn make_ledger_at_parent_close(entries: Vec<STLedgerEntry>, parent_close_time: u32) -> Ledger {
     let mut tree = MutableTree::new(1);
     for entry in entries {
         tree.add_item(
@@ -70,6 +74,7 @@ fn make_ledger(entries: Vec<STLedgerEntry>) -> Ledger {
     Ledger::from_maps(
         LedgerHeader {
             seq: 3,
+            parent_close_time,
             ..LedgerHeader::default()
         },
         SyncTree::from_root_with_type(
@@ -224,7 +229,42 @@ fn check_create_xrp_succeeds() {
     // Check was created — owner count increased
     assert_eq!(get_owner_count(&view, alice), 1);
     assert_eq!(get_owner_count(&view, bob), 0);
+
     assert!(check_exists(&view, alice, 1));
+}
+
+/// A Check created in an open apply view must survive the state-table commit
+/// that consensus performs before the resulting ledger becomes the next LCL.
+#[test]
+fn check_create_survives_closed_ledger_commit() {
+    let alice = acct(0x31);
+    let bob = acct(0x32);
+    let mut ledger = make_ledger(vec![
+        account_root(alice, 1_000_000_000, 0, 0),
+        account_root(bob, 1_000_000_000, 0, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    let tx = check_create_tx(alice, bob, xrp(100_000_000), 1);
+
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::CHECK_CREATE),
+        Ter::TES_SUCCESS
+    );
+    ledger.set_total_drops(100_000_000_000_000_000);
+    let commit_seq = ledger.header().seq.saturating_add(1);
+    let rules = ledger.rules().clone();
+    view.table()
+        .apply_with_tx_thread(&mut ledger, tx.get_transaction_id(), commit_seq, &rules)
+        .expect("Check state must commit into the closed ledger");
+
+    let check = ledger
+        .read(check_keylet(acct_id(alice), 1))
+        .expect("Check state-map read should succeed")
+        .expect("committed Check should exist");
+    assert_eq!(check.get_type(), LedgerEntryType::Check);
+    assert_eq!(check.get_account_id(sf("sfAccount")), alice);
+    assert_eq!(check.get_account_id(sf("sfDestination")), bob);
+    assert_eq!(check.get_field_amount(sf("sfSendMax")), xrp(100_000_000));
 }
 
 /// C++ Check_test::testCreateValid — check to self is rejected.
@@ -351,6 +391,29 @@ fn check_create_expired_expiration_rejected() {
     let tx = check_create_tx_with_expiration(alice, bob, xrp(100_000_000), 1, 0);
     let result = full_apply(&mut view, &tx, TxType::CHECK_CREATE);
     assert_eq!(result, Ter::TEM_BAD_EXPIRATION);
+}
+
+/// rippled CheckCreate::preclaim rejects an otherwise valid check when its
+/// expiration is at or before the parent close time.
+#[test]
+fn check_create_past_expiration_rejected() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let ledger = make_ledger_at_parent_close(
+        vec![
+            account_root(alice, 1_000_000_000, 0, 0),
+            account_root(bob, 1_000_000_000, 0, 0),
+        ],
+        10,
+    );
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let tx = check_create_tx_with_expiration(alice, bob, xrp(100_000_000), 1, 10);
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::CHECK_CREATE),
+        Ter::TEC_EXPIRED
+    );
+    assert!(!check_exists(&view, alice, 1));
 }
 
 // ─── Test: Cash XRP ───────────────────────────────────────────────────────

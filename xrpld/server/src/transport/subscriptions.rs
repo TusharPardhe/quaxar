@@ -7,7 +7,11 @@ use tokio::sync::broadcast;
 pub enum StreamKind {
     Ledger,
     LedgerDelta,
+    /// Validated/accepted transaction events only.
     Transactions,
+    /// Real-time transaction events: proposed application events and the
+    /// terminal validated publication for the same transaction.
+    TransactionsProposed,
     BookChanges,
     Server,
     Manifests,
@@ -21,9 +25,8 @@ impl StreamKind {
         match name {
             "ledger" => Some(Self::Ledger),
             "ledger_delta" => Some(Self::LedgerDelta),
-            "transactions" | "rt_transactions" | "transactions_proposed" => {
-                Some(Self::Transactions)
-            }
+            "transactions" => Some(Self::Transactions),
+            "rt_transactions" | "transactions_proposed" => Some(Self::TransactionsProposed),
             "book_changes" => Some(Self::BookChanges),
             "server" => Some(Self::Server),
             "manifests" => Some(Self::Manifests),
@@ -39,6 +42,7 @@ impl StreamKind {
             Self::Ledger => "ledger",
             Self::LedgerDelta => "ledger_delta",
             Self::Transactions => "transactions",
+            Self::TransactionsProposed => "transactions_proposed",
             Self::BookChanges => "book_changes",
             Self::Server => "server",
             Self::Manifests => "manifests",
@@ -60,6 +64,7 @@ pub struct SubscriptionManager {
     ledger: Arc<broadcast::Sender<SubscriptionEvent>>,
     ledger_delta: Arc<broadcast::Sender<SubscriptionEvent>>,
     transactions: Arc<broadcast::Sender<SubscriptionEvent>>,
+    transactions_proposed: Arc<broadcast::Sender<SubscriptionEvent>>,
     book_changes: Arc<broadcast::Sender<SubscriptionEvent>>,
     server: Arc<broadcast::Sender<SubscriptionEvent>>,
     manifests: Arc<broadcast::Sender<SubscriptionEvent>>,
@@ -84,6 +89,7 @@ impl SubscriptionManager {
             ledger: channel(capacity),
             ledger_delta: channel(capacity),
             transactions: channel(capacity),
+            transactions_proposed: channel(capacity),
             book_changes: channel(capacity),
             server: channel(capacity),
             manifests: channel(capacity),
@@ -99,6 +105,7 @@ impl SubscriptionManager {
             StreamKind::Ledger => self.ledger.subscribe(),
             StreamKind::LedgerDelta => self.ledger_delta.subscribe(),
             StreamKind::Transactions => self.transactions.subscribe(),
+            StreamKind::TransactionsProposed => self.transactions_proposed.subscribe(),
             StreamKind::BookChanges => self.book_changes.subscribe(),
             StreamKind::Server => self.server.subscribe(),
             StreamKind::Manifests => self.manifests.subscribe(),
@@ -114,6 +121,7 @@ impl SubscriptionManager {
             StreamKind::Ledger => self.ledger.send(event),
             StreamKind::LedgerDelta => self.ledger_delta.send(event),
             StreamKind::Transactions => self.transactions.send(event),
+            StreamKind::TransactionsProposed => self.transactions_proposed.send(event),
             StreamKind::BookChanges => self.book_changes.send(event),
             StreamKind::Server => self.server.send(event),
             StreamKind::Manifests => self.manifests.send(event),
@@ -137,5 +145,31 @@ impl SubscriptionManager {
 
     pub fn unsubscribe(&self, stream: StreamKind) {
         tracing::debug!(target: "server", stream = stream.as_name(), "Client unsubscribed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamKind;
+
+    #[test]
+    fn accepted_and_real_time_transaction_streams_are_distinct() {
+        assert_eq!(
+            StreamKind::from_name("transactions"),
+            Some(StreamKind::Transactions)
+        );
+        assert_eq!(
+            StreamKind::from_name("transactions_proposed"),
+            Some(StreamKind::TransactionsProposed)
+        );
+        assert_eq!(
+            StreamKind::from_name("rt_transactions"),
+            Some(StreamKind::TransactionsProposed)
+        );
+        assert_ne!(
+            StreamKind::Transactions,
+            StreamKind::TransactionsProposed,
+            "proposed events must not be multiplexed into accepted-only subscriptions"
+        );
     }
 }

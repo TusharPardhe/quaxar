@@ -3,12 +3,16 @@ mod manifest;
 
 use basics::base64::base64_encode;
 use manifest::{
-    Manifest, ManifestCache, ManifestDisposition, deserialize_manifest, load_validator_token,
+    MAX_UNTRUSTED_MANIFESTS, Manifest, ManifestCache, ManifestDisposition,
+    ManifestRateLimitCapPolicy, deserialize_manifest, load_validator_token,
 };
 use protocol::{
     HashPrefix, KeyType, PublicKey, SField, STObject, SecretKey, Serializer, derive_public_key,
     get_field_by_symbol, sf_generic, sign,
 };
+
+use quaxar_core::{DatabaseCon, WALLET_DB_INIT, WALLET_DB_NAME};
+use tempfile::TempDir;
 
 fn signing_bytes(st: &STObject) -> Vec<u8> {
     let mut serializer = Serializer::default();
@@ -232,6 +236,54 @@ fn deserialize_manifest_rejects_invalid_domain_and_revocation_shapes() {
 }
 
 #[test]
+fn manifest_cache_wallet_round_trip_preserves_validator_and_publisher_entries() {
+    let dir = TempDir::new().expect("wallet tempdir");
+    let wallet = DatabaseCon::new_at_path(dir.path(), WALLET_DB_NAME, &[], WALLET_DB_INIT)
+        .expect("wallet database");
+    let validator = build_manifest(KeyType::Ed25519, 71, KeyType::Secp256k1, 81, 1, None);
+    let publisher = build_manifest(KeyType::Secp256k1, 72, KeyType::Ed25519, 82, 2, None);
+
+    let cache = ManifestCache::new();
+    assert_eq!(
+        cache.apply_manifest(validator.clone()),
+        ManifestDisposition::Accepted
+    );
+    assert_eq!(
+        cache.apply_manifest(publisher.clone()),
+        ManifestDisposition::Accepted
+    );
+    cache
+        .save_to_wallet(&wallet, "ValidatorManifests", |public_key| {
+            *public_key == validator.master_key
+        })
+        .expect("save validator manifests");
+    cache
+        .save_to_wallet(&wallet, "PublisherManifests", |public_key| {
+            *public_key == publisher.master_key
+        })
+        .expect("save publisher manifests");
+
+    let restored = ManifestCache::new();
+    restored
+        .load_from_wallet(&wallet, "ValidatorManifests")
+        .expect("load validator manifests");
+    restored
+        .load_from_wallet(&wallet, "PublisherManifests")
+        .expect("load publisher manifests");
+
+    for manifest in [&validator, &publisher] {
+        assert_eq!(
+            restored.get_sequence(&manifest.master_key),
+            Some(manifest.sequence)
+        );
+        assert_eq!(
+            restored.get_master_key(&manifest.signing_key.expect("signing key")),
+            manifest.master_key
+        );
+    }
+}
+
+#[test]
 fn manifest_cache_accepts_updates_and_rejects_alias_conflicts() {
     let cache = ManifestCache::new();
 
@@ -335,6 +387,73 @@ fn manifest_cache_accepts_updates_and_rejects_alias_conflicts() {
 
     let c0 = build_manifest(KeyType::Ed25519, 83, KeyType::Ed25519, 84, 47, None);
     assert_eq!(cache.apply_manifest(c0), ManifestDisposition::BadMasterKey);
+}
+
+#[test]
+fn manifest_cache_known_master_snapshot_excludes_a_key_first_admitted_in_message() {
+    let cache = ManifestCache::new();
+    let known = build_manifest(KeyType::Ed25519, 70, KeyType::Secp256k1, 80, 1, None);
+    let first_seen = build_manifest(KeyType::Ed25519, 71, KeyType::Secp256k1, 81, 1, None);
+
+    assert_eq!(
+        cache.apply_manifest(known.clone()),
+        ManifestDisposition::Accepted
+    );
+    let before_message = cache.known_master_keys();
+    assert!(before_message.contains(&known.master_key));
+    assert!(!before_message.contains(&first_seen.master_key));
+
+    assert_eq!(
+        cache.apply_manifest_with_policy(first_seen.clone(), ManifestRateLimitCapPolicy::Capped),
+        ManifestDisposition::Accepted
+    );
+    assert!(
+        !before_message.contains(&first_seen.master_key),
+        "relay eligibility must retain the pre-message cache state"
+    );
+}
+
+#[test]
+fn capped_manifest_gossip_limits_new_untrusted_keys_and_releases_promoted_slots() {
+    let cache = ManifestCache::new();
+    let mut first_master = None;
+
+    for fill in 1..=MAX_UNTRUSTED_MANIFESTS {
+        let manifest = build_manifest(
+            KeyType::Ed25519,
+            fill as u8,
+            KeyType::Secp256k1,
+            (fill + MAX_UNTRUSTED_MANIFESTS) as u8,
+            1,
+            None,
+        );
+        if fill == 1 {
+            first_master = Some(manifest.master_key);
+        }
+        assert_eq!(
+            cache.apply_manifest_with_policy(manifest, ManifestRateLimitCapPolicy::Capped),
+            ManifestDisposition::Accepted
+        );
+    }
+
+    let overflow = build_manifest(KeyType::Ed25519, 101, KeyType::Secp256k1, 201, 1, None);
+    assert_eq!(
+        cache.apply_manifest_with_policy(overflow.clone(), ManifestRateLimitCapPolicy::Capped),
+        ManifestDisposition::UntrustedCapacity
+    );
+
+    cache.promote_to_trusted(&first_master.expect("first manifest master key"));
+    assert_eq!(
+        cache.apply_manifest_with_policy(overflow, ManifestRateLimitCapPolicy::Capped),
+        ManifestDisposition::Accepted
+    );
+
+    // Configured, wallet, and listed manifests are deliberately uncapped.
+    let uncapped = build_manifest(KeyType::Ed25519, 102, KeyType::Secp256k1, 202, 1, None);
+    assert_eq!(
+        cache.apply_manifest_with_policy(uncapped, ManifestRateLimitCapPolicy::Uncapped),
+        ManifestDisposition::Accepted
+    );
 }
 
 #[test]

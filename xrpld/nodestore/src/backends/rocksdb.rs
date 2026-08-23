@@ -790,7 +790,12 @@ impl RocksDbBackend {
             {
                 let database = Arc::clone(&database);
                 let journal = Arc::clone(&journal);
-                move |batch| write_batch_to_database(&database, key_bytes, batch, &journal)
+                move |batch| {
+                    if let Err(error) = write_batch_to_database(&database, key_bytes, batch) {
+                        journal.log(JournalLevel::Error, &error);
+                        panic!("storeBatch failed: {error}");
+                    }
+                }
             },
             Arc::clone(&scheduler),
         );
@@ -1055,12 +1060,19 @@ impl Backend for RocksDbBackend {
         (results, Status::Ok)
     }
 
-    fn store(&self, object: Arc<NodeObject>) {
+    fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
         self.batch_writer.store(object);
+        Ok(())
     }
 
     fn store_batch(&self, batch: &crate::Batch) {
-        write_batch_to_database(&self.database, self.key_bytes, batch, &self.journal);
+        if let Err(error) = self.store_batch_result(batch) {
+            self.journal.log(JournalLevel::Error, &error);
+        }
+    }
+
+    fn store_batch_result(&self, batch: &crate::Batch) -> Result<(), String> {
+        write_batch_to_database(&self.database, self.key_bytes, batch)
     }
 
     fn sync(&self) {}
@@ -1108,6 +1120,39 @@ impl Backend for RocksDbBackend {
         }
     }
 
+    fn for_each_result(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) -> Result<(), String> {
+        let database = self.open_database();
+        let db = database
+            .as_ref()
+            .ok_or_else(|| "RocksDB backend is not open".to_owned())?;
+
+        for entry in db.iterator(IteratorMode::Start) {
+            let (key, value) =
+                entry.map_err(|error| format!("RocksDB iterator traversal failed: {error}"))?;
+            if key.len() != self.key_bytes {
+                return Err(format!(
+                    "RocksDB traversal: bad key size = {}, expected {}",
+                    key.len(),
+                    self.key_bytes
+                ));
+            }
+
+            let hash = Uint256::from_slice(&key)
+                .ok_or_else(|| "RocksDB traversal: key is not a Uint256".to_owned())?;
+            let (object, status) = self.decode_object(&hash, &value);
+            if status != Status::Ok {
+                return Err(format!(
+                    "RocksDB traversal: failed to decode NodeObject #{hash}: {status:?}"
+                ));
+            }
+            callback(object.ok_or_else(|| {
+                format!("RocksDB traversal: decoded NodeObject #{hash} was unexpectedly absent")
+            })?);
+        }
+
+        Ok(())
+    }
+
     fn get_write_load(&self) -> i32 {
         self.batch_writer.get_write_load()
     }
@@ -1131,14 +1176,13 @@ fn write_batch_to_database(
     database: &Arc<Mutex<Option<DBWithThreadMode<MultiThreaded>>>>,
     key_bytes: usize,
     batch: &crate::Batch,
-    journal: &Arc<dyn NodeStoreJournal>,
-) {
+) -> Result<(), String> {
     let database = database
         .lock()
-        .expect("rocksdb database mutex must not be poisoned");
+        .map_err(|_| "RocksDB database mutex poisoned".to_owned())?;
     let db = database
         .as_ref()
-        .expect("xrpl::NodeStore::RocksDBBackend::storeBatch : non-null database");
+        .ok_or_else(|| "RocksDB backend is not open".to_owned())?;
 
     let mut write_batch = WriteBatch::default();
     for object in batch {
@@ -1146,10 +1190,8 @@ fn write_batch_to_database(
         write_batch.put(&encoded.get_key()[..key_bytes], encoded.get_data());
     }
 
-    if let Err(error) = db.write(write_batch) {
-        journal.log(JournalLevel::Error, error.as_ref());
-        panic!("storeBatch failed: {error}");
-    }
+    db.write(write_batch)
+        .map_err(|error| format!("RocksDB batch write failed: {error}"))
 }
 
 pub struct RocksDbFactory;

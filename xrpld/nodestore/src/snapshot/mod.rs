@@ -10,4 +10,4 @@ pub use error::SnapshotError;
 pub use loader::load_snapshot;
 pub use manifest::SnapshotManifest;
 pub use scheduler::{SnapshotScheduler, SnapshotSchedulerConfig};
-pub use writer::export_snapshot;
+pub use writer::{SnapshotExportCancellation, export_snapshot, export_snapshot_with_cancellation};

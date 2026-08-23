@@ -1,14 +1,14 @@
 use std::{cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
 use app::{
-    BuildLedgerJournal, BuildLedgerView, LedgerReplay, apply_transactions, build_ledger,
-    build_ledger_replay, decode_acquired_tx_set,
+    BuildLedgerError, BuildLedgerJournal, BuildLedgerView, LedgerReplay, apply_transactions,
+    build_ledger, build_ledger_from_consensus, build_ledger_replay, decode_acquired_tx_set,
 };
 use basics::{base_uint::Uint256, intrusive_pointer::make_shared_intrusive};
 use ledger::{CanonicalTXSet, Ledger, LedgerHeader};
 use protocol::{
-    STAmount, STArray, STObject, STTx, TxType, decode_ledger_hashes_entry, get_field_by_symbol,
-    skip_keylet,
+    STAmount, STArray, STObject, STTx, Ter, TxType, decode_ledger_hashes_entry,
+    get_field_by_symbol, skip_keylet,
 };
 use shamap::{
     item::SHAMapItem,
@@ -70,8 +70,9 @@ impl BuildLedgerView for StubBuildView {
         self.applied.len()
     }
 
-    fn apply_to_ledger(self, _ledger: &mut Ledger) {
+    fn apply_to_ledger(self, _ledger: &mut Ledger) -> Result<(), BuildLedgerError> {
         self.events.borrow_mut().push("view.apply");
+        Ok(())
     }
 }
 
@@ -212,6 +213,40 @@ fn build_ledger_apply_transactions_skips_existing_tx_on_first_pass() {
 }
 
 #[test]
+fn consensus_builder_discards_transaction_already_accepted_by_parent() {
+    // ../rippled/src/xrpld/app/ledger/detail/BuildLedger.cpp::
+    // applyTransactions removes parent-present IDs before applying a consensus
+    // tx set. Replaying it would re-thread its state changes at child seq 54.
+    let duplicate = sample_tx(1);
+    let parent = sample_parent_with_tx(53, duplicate.get_transaction_id());
+    let parent_seq = parent.header().seq;
+    let tx_items = vec![(
+        duplicate.get_serializer().data().to_vec(),
+        duplicate.get_transaction_id(),
+    )];
+
+    let built = build_ledger_from_consensus(
+        &parent,
+        LedgerHeader {
+            seq: 54,
+            close_time: 100,
+            ..LedgerHeader::default()
+        },
+        &tx_items,
+        None,
+    )
+    .expect("a parent-accepted transaction must be discarded, not replayed");
+
+    assert_eq!(parent.header().seq, parent_seq);
+    assert!(parent.tx_exists(duplicate.get_transaction_id()));
+    assert_eq!(built.header().seq, 54);
+    assert!(
+        !built.tx_exists(duplicate.get_transaction_id()),
+        "the parent transaction must not be replayed into the child transaction map"
+    );
+}
+
+#[test]
 fn build_ledger_apply_transactions_routes_success_fail_retry_and_throw() {
     let success = sample_tx(1);
     let hard_fail = sample_tx(2);
@@ -320,14 +355,14 @@ fn build_ledger_finalizes_skiplist_flush_unshare_and_accept_in() {
             let events = Rc::clone(&events);
             move |_ledger| {
                 events.borrow_mut().push("flush_state");
-                7
+                Ok::<_, BuildLedgerError>(7)
             }
         },
         {
             let events = Rc::clone(&events);
             move |_ledger| {
                 events.borrow_mut().push("flush_tx");
-                11
+                Ok::<_, BuildLedgerError>(11)
             }
         },
         {
@@ -369,7 +404,7 @@ fn build_ledger_finalizes_skiplist_flush_unshare_and_accept_in() {
 }
 
 #[test]
-fn build_ledger_replay_applies_ordered_txns_in_input_order_with_replay_flags() {
+fn build_ledger_replay_preserves_transaction_index_order_for_dependent_transactions() {
     let parent = Arc::new(sample_parent_ledger(40));
     let mut replay_ledger = Ledger::from_previous(&parent, 100);
     replay_ledger.set_accepted(111, 20, true);
@@ -395,13 +430,21 @@ fn build_ledger_replay_applies_ordered_txns_in_input_order_with_replay_flags() {
         ApplyFlags::FAIL_HARD | ApplyFlags::RETRY,
         &journal,
         |_built| StubBuildView::closed(Rc::new(RefCell::new(Vec::new()))),
+        |_, _, _| Ter::TES_SUCCESS,
         |view, tx, flags| {
+            // `BuildLedger.cpp::buildLedger(LedgerReplay const&)` iterates
+            // `orderedTxns()` (TransactionMd::TransactionIndex order). Treat
+            // the second transaction as sequence-dependent on the first: a
+            // canonical-TX-set or SHAMap-leaf reorder would fail here.
+            if tx.get_transaction_id() == second.get_transaction_id() {
+                assert_eq!(view.applied, vec![first.get_transaction_id()]);
+            }
             view.applied.push(tx.get_transaction_id());
             seen.borrow_mut()
                 .push((tx.get_transaction_id(), flags.bits()));
         },
-        |_ledger| 0,
-        |_ledger| 0,
+        |_ledger| Ok::<_, BuildLedgerError>(0),
+        |_ledger| Ok::<_, BuildLedgerError>(0),
         |_ledger| {},
     )
     .expect("replay build should succeed");
@@ -431,6 +474,53 @@ fn build_ledger_replay_applies_ordered_txns_in_input_order_with_replay_flags() {
     assert_eq!(
         built.header().close_flags,
         replay_ledger.header().close_flags
+    );
+}
+
+#[test]
+fn build_ledger_replay_applies_fee_claiming_tec_in_order() {
+    // ../rippled/src/xrpld/app/ledger/detail/BuildLedger.cpp applies every
+    // tes or fee-claiming tec replay result to the cumulative accumulator.
+    // A later replay transaction must observe that committed prefix.
+    let parent = Arc::new(sample_parent_ledger(41));
+    let mut replay_ledger = Ledger::from_previous(&parent, 101);
+    replay_ledger.set_accepted(112, 20, true);
+    let replay_ledger = Arc::new(replay_ledger);
+    let claimed = sample_tx(1);
+    let next = sample_tx(2);
+    let replay = LedgerReplay::new(
+        parent,
+        replay_ledger,
+        std::collections::BTreeMap::from([(1, Arc::clone(&claimed)), (2, Arc::clone(&next))]),
+    );
+    let seen = RefCell::new(Vec::new());
+
+    build_ledger_replay(
+        &replay,
+        ApplyFlags::NONE,
+        &RecordingJournal::default(),
+        |_built| StubBuildView::closed(Rc::new(RefCell::new(Vec::new()))),
+        |_, tx, _| {
+            if tx.get_transaction_id() == claimed.get_transaction_id() {
+                Ter::TEC_CLAIM
+            } else {
+                Ter::TES_SUCCESS
+            }
+        },
+        |view, tx, _| {
+            assert_eq!(view.applied.len(), seen.borrow().len());
+            view.applied.push(tx.get_transaction_id());
+            seen.borrow_mut().push(tx.get_transaction_id());
+        },
+        |_ledger| Ok::<_, BuildLedgerError>(0),
+        |_ledger| Ok::<_, BuildLedgerError>(0),
+        |_ledger| {},
+    )
+    .expect("fee-claiming replay should build");
+
+    assert_eq!(
+        seen.into_inner(),
+        vec![claimed.get_transaction_id(), next.get_transaction_id()]
     );
 }
 
@@ -506,13 +596,14 @@ fn ledger_replay_from_replay_ledger_sorts_by_metadata_index() {
         ApplyFlags::FAIL_HARD,
         &RecordingJournal::default(),
         |_built| StubBuildView::closed(Rc::new(RefCell::new(Vec::new()))),
+        |_, _, _| Ter::TES_SUCCESS,
         |view, tx, flags| {
             view.applied.push(tx.get_transaction_id());
             seen.borrow_mut()
                 .push((tx.get_transaction_id(), flags.bits()));
         },
-        |_ledger| 0,
-        |_ledger| 0,
+        |_ledger| Ok::<_, BuildLedgerError>(0),
+        |_ledger| Ok::<_, BuildLedgerError>(0),
         |_ledger| {},
     )
     .expect("replay build should succeed");

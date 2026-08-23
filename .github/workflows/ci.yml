@@ -27,7 +27,7 @@ jobs:
           df -h /
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p protocol -p consensus -p xrpld-main -p nodestore -p shamap
+      - run: cargo test -p protocol -p consensus -p quaxar-main -p nodestore -p shamap
 
   clippy:
     runs-on: ubuntu-latest

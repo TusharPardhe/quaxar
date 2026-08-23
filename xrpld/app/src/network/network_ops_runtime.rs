@@ -35,6 +35,7 @@ use ledger::CanonicalTXSet;
 use protocol::{
     Rules, STTx, Ter, XRPAmount, get_field_by_symbol, passes_local_checks, tfInnerBatchTxn,
 };
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tx::{
@@ -113,12 +114,21 @@ pub struct AppNetworkOpsApplyReport {
 
 pub struct AppNetworkOpsRuntime {
     state: Mutex<NetworkOpsRuntimeState<AppNetworkOpsPendingTransaction>>,
+    /// Mirrors rippled NetworkOPsImp::cond_: local synchronous submission
+    /// waits while an async or prior local batch owns `Running`, then stages
+    /// and applies against a stable owner state.
+    batch_complete: std::sync::Condvar,
     network_ops_state: Arc<SharedNetworkOpsState>,
     ledger_master_runtime: Mutex<Arc<AppLedgerMasterRuntime>>,
     hash_router: Arc<HashRouter>,
     transaction_master: Arc<TransactionMaster>,
     ledger_master_state: Arc<SharedLedgerMasterState>,
     consensus_bootstrap_started: AtomicBool,
+    /// Set after a caught batch panic has restored in-flight work to pending.
+    /// The application consumes this one-shot request to enqueue a fresh
+    /// guarded batch instead of leaving recovered work dormant.
+    pending_batch_panic_recovery: AtomicBool,
+    #[cfg_attr(not(test), allow(dead_code))] // read only by the dormant current_net_time helper
     time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
 }
 
@@ -174,12 +184,14 @@ impl AppNetworkOpsRuntime {
     ) -> Self {
         Self {
             state: Mutex::new(state),
+            batch_complete: std::sync::Condvar::new(),
             network_ops_state,
             ledger_master_runtime: Mutex::new(ledger_master_runtime),
             hash_router,
             transaction_master,
             ledger_master_state,
             consensus_bootstrap_started: AtomicBool::new(false),
+            pending_batch_panic_recovery: AtomicBool::new(false),
             time_keeper,
         }
     }
@@ -197,6 +209,10 @@ impl AppNetworkOpsRuntime {
     /// actually benefit from that convergence feedback loop. Before this,
     /// the offset was computed and stored but never read back anywhere,
     /// making the adjustment a no-op in practice.
+    ///
+    /// Note: consensus currently reads close time via the ledger-master
+    /// `TimeKeeper`; this helper is retained for the M6 freshness audit.
+    #[allow(dead_code)]
     fn current_net_time(&self) -> basics::chrono::NetClockTimePoint {
         self.time_keeper.close_time()
     }
@@ -269,6 +285,30 @@ impl AppNetworkOpsRuntime {
 
     pub fn dispatch_state(&self) -> NetworkOpsDispatchState {
         self.snapshot().dispatch_state
+    }
+
+    pub fn schedule_pending_transaction_batch(&self, add_batch_job: impl FnOnce() -> bool) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("network ops runtime state mutex must not be poisoned");
+        state.schedule_pending_transaction_batch(add_batch_job)
+    }
+
+    pub fn release_scheduled_transaction_batch_for_retry(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("network ops runtime state mutex must not be poisoned");
+        state.release_scheduled_transaction_batch_for_retry()
+    }
+
+    /// Returns whether a caught batch panic restored pending work that needs
+    /// a fresh guarded scheduling attempt. The request is one-shot so polling
+    /// callers cannot enqueue duplicate recovery jobs.
+    pub fn take_pending_batch_panic_recovery(&self) -> bool {
+        self.pending_batch_panic_recovery
+            .swap(false, Ordering::AcqRel)
     }
 
     pub fn reset_consensus_bootstrap(&self) {
@@ -624,7 +664,7 @@ impl AppNetworkOpsRuntime {
             .state
             .lock()
             .expect("network ops runtime state mutex must not be poisoned");
-        state.finish_apply_batch(
+        let tail = state.finish_apply_batch(
             transactions,
             || {},
             |tx| {
@@ -633,7 +673,41 @@ impl AppNetworkOpsRuntime {
                     .clear_applying()
             },
             || {},
-        )
+        );
+        drop(state);
+        self.batch_complete.notify_all();
+        tail
+    }
+
+    fn abort_apply_batch_after_panic(
+        &self,
+        transactions: &[NetworkOpsApplyBatchEntry<SharedTransaction>],
+    ) {
+        // ../rippled/src/xrpld/app/misc/NetworkOPs.cpp::NetworkOPsImp::transactionBatch (lines 1514-1524) retains batch work until the queue drain completes.
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut requeued = transactions.to_vec();
+        for entry in &mut requeued {
+            entry.applied = false;
+            entry.result = None;
+            let mut transaction = entry
+                .transaction
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            transaction.clear_applying();
+            drop(transaction);
+            entry.transaction.clear_poison();
+        }
+        let empty: &[NetworkOpsApplyBatchEntry<SharedTransaction>] = &[];
+        let _ = state.finish_apply_batch(empty, || {}, |_tx| {}, || {});
+        let mut pending = std::mem::take(state.pending_transactions_mut());
+        requeued.append(&mut pending);
+        *state.pending_transactions_mut() = requeued;
+        drop(state);
+        self.batch_complete.notify_all();
+        self.state.clear_poison();
     }
 
     pub fn apply_pending_with<RelaySkip>(
@@ -686,32 +760,52 @@ impl AppNetworkOpsRuntime {
         }
 
         let (mut transactions, start) = self.begin_apply_batch();
-        let changed = apply_batch(&mut transactions);
-        let fee_change_reported = if changed {
-            report_fee_change();
-            true
-        } else {
-            false
-        };
-        Some(self.finish_applied_pending_batch(
-            transactions,
-            start,
-            changed,
-            fee_change_reported,
-            current_ledger_index,
-            validated_ledger_index,
-            publish_proposed,
-            set_bad_flag,
-            set_held_flag,
-            should_relay,
-            relay,
-            current_ledger_state,
-        ))
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let changed = apply_batch(&mut transactions);
+            let fee_change_reported = if changed {
+                report_fee_change();
+                true
+            } else {
+                false
+            };
+            self.finish_applied_pending_batch(
+                &mut transactions,
+                start,
+                changed,
+                fee_change_reported,
+                current_ledger_index,
+                validated_ledger_index,
+                publish_proposed,
+                set_bad_flag,
+                set_held_flag,
+                should_relay,
+                relay,
+                current_ledger_state,
+            )
+        }));
+
+        match outcome {
+            Ok(report) => Some(report),
+            Err(payload) => {
+                let message = panic_message(payload.as_ref());
+                tracing::error!(
+                    target: "network",
+                    %message,
+                    batch_size = transactions.len(),
+                    "NetworkOps batch panicked; requeued in-flight transactions and reset dispatch state"
+                );
+                // ../rippled/src/xrpld/app/misc/NetworkOPs.cpp::NetworkOPsImp::transactionBatch (lines 1514-1524): preserve the drained batch and schedule another guarded drain after recovery.
+                self.abort_apply_batch_after_panic(&transactions);
+                self.pending_batch_panic_recovery
+                    .store(true, Ordering::Release);
+                None
+            }
+        }
     }
 
     fn finish_applied_pending_batch<RelaySkip>(
         &self,
-        mut transactions: Vec<AppNetworkOpsPendingTransaction>,
+        transactions: &mut [AppNetworkOpsPendingTransaction],
         start: NetworkOpsApplyBatchStart,
         changed: bool,
         fee_change_reported: bool,
@@ -847,7 +941,7 @@ impl AppNetworkOpsRuntime {
             }));
         }
 
-        let tail = self.finish_apply_batch(&transactions);
+        let tail = self.finish_apply_batch(transactions);
         AppNetworkOpsApplyReport {
             start,
             changed,
@@ -902,15 +996,23 @@ impl AppNetworkOpsRuntime {
         local: bool,
         fail_hard: bool,
     ) -> NetworkOpsSyncDispatch {
-        if transaction_applying(&transaction) {
-            return NetworkOpsSyncDispatch::ExistingApplying;
-        }
-
-        set_transaction_applying(&transaction);
         let mut state = self
             .state
             .lock()
             .expect("network ops runtime state mutex must not be poisoned");
+        // rippled NetworkOPsImp::doTransactionSyncBatch waits on cond_ while
+        // an async or earlier local `transactionBatch` owns the running
+        // vector. Do not stage a second local owner against that vector.
+        while state.dispatch_state() == NetworkOpsDispatchState::Running {
+            state = self
+                .batch_complete
+                .wait(state)
+                .expect("network ops runtime state mutex must not be poisoned");
+        }
+        if transaction_applying(&transaction) {
+            return NetworkOpsSyncDispatch::ExistingApplying;
+        }
+        set_transaction_applying(&transaction);
         state.pending_transactions_mut().push(pending_transaction(
             transaction,
             admin,
@@ -919,6 +1021,18 @@ impl AppNetworkOpsRuntime {
         ));
         NetworkOpsSyncDispatch::Staged
     }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 fn shared_transaction(transaction: Arc<STTx>) -> SharedTransaction {
@@ -1025,8 +1139,8 @@ mod tests {
         NetworkOpsApplyBatchStart, NetworkOpsApplyBatchTail, NetworkOpsApplyResultPreamble,
         NetworkOpsApplyStatusBranch, NetworkOpsCurrentLedgerState, NetworkOpsDispatchState,
         NetworkOpsOperatingMode, NetworkOpsProcessSetOwnerSync, NetworkOpsRelayBranch,
-        NetworkOpsRetryHoldBranch, NetworkOpsRuntimeState, NetworkOpsTransactionSetOutcome,
-        SharedNetworkOpsState,
+        NetworkOpsRetryHoldBranch, NetworkOpsRuntimeState, NetworkOpsSyncDispatch,
+        NetworkOpsTransactionSetOutcome, SharedNetworkOpsState,
     };
     use crate::state::time_keeper::TimeKeeper;
     use crate::tx_queue::transaction::{
@@ -1036,7 +1150,8 @@ mod tests {
     use basics::sha_map_hash::SHAMapHash;
     use protocol::{AccountID, STAmount, STTx, Ter, TxType, XRPAmount, get_field_by_symbol};
     use std::cell::RefCell;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
     use tx::{ApplyFlags, ApplyResult};
     use xrpl_core::{HashRouter, HashRouterSetup};
 
@@ -1081,6 +1196,58 @@ mod tests {
             Arc::new(SharedLedgerMasterState::new(Arc::new(TimeKeeper::new()))),
             Arc::new(TimeKeeper::new()),
         )
+    }
+
+    #[test]
+    fn local_sync_staging_waits_for_running_batch_tail() {
+        let runtime = Arc::new(runtime(
+            NetworkOpsOperatingMode::Full,
+            Arc::new(AppLedgerMasterRuntime::default()),
+        ));
+        let source = account("7777777777777777777777777777777777777777");
+        let first = shared_transaction(payment_tx(
+            source,
+            account("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            1,
+            None,
+            10,
+        ));
+        assert_eq!(
+            runtime.stage_transaction_sync(Arc::clone(&first), false, true, false),
+            NetworkOpsSyncDispatch::Staged
+        );
+        let (running, start) = runtime.begin_apply_batch();
+        assert_eq!(start.dispatch_state, NetworkOpsDispatchState::Running);
+
+        let second = shared_transaction(payment_tx(
+            source,
+            account("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+            2,
+            None,
+            10,
+        ));
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiting_runtime = Arc::clone(&runtime);
+        let waiter = std::thread::spawn(move || {
+            result_tx
+                .send(waiting_runtime.stage_transaction_sync(second, false, true, false))
+                .expect("waiting submit result receiver");
+        });
+
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+            "a local submit must wait while the existing batch owns Running"
+        );
+        let tail = runtime.finish_apply_batch(&running);
+        assert_eq!(tail.dispatch_state, NetworkOpsDispatchState::None);
+        assert_eq!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("batch completion must wake local submit"),
+            NetworkOpsSyncDispatch::Staged
+        );
+        waiter.join().expect("waiting submit thread");
+        assert_eq!(runtime.pending_transaction_count(), 1);
     }
 
     #[test]
@@ -1374,7 +1541,7 @@ mod tests {
                 tail: NetworkOpsApplyBatchTail {
                     cleared: 1,
                     pending_transactions: 2,
-                    dispatch_state: NetworkOpsDispatchState::None,
+                    dispatch_state: NetworkOpsDispatchState::Scheduled,
                 },
             }
         );
@@ -1494,6 +1661,125 @@ mod tests {
         assert_eq!(report.entries[1].final_status, TransStatus::HELD);
         assert_eq!(runtime.pending_transaction_count(), 0);
         assert_eq!(ledger_master_runtime.held_transaction_count(), 1);
+    }
+
+    #[test]
+    fn runtime_panic_cleanup_requeues_inflight_work_and_merges_submit_held() {
+        // ../rippled/src/xrpld/app/misc/NetworkOPs.cpp::NetworkOPsImp::doTransactionAsync (lines 1378-1398) and NetworkOPsImp::transactionBatch (lines 1514-1524): applying work remains queued for a batch drain.
+        let ledger_master_runtime = Arc::new(AppLedgerMasterRuntime::default());
+        let runtime = runtime(
+            NetworkOpsOperatingMode::Full,
+            Arc::clone(&ledger_master_runtime),
+        );
+        let source = account("ABABABABABABABABABABABABABABABABABABABAB");
+        let included = shared_transaction(payment_tx(
+            source,
+            account("ACACACACACACACACACACACACACACACACACACACAC"),
+            1,
+            None,
+            10,
+        ));
+        let promoted = payment_tx(
+            source,
+            account("ADADADADADADADADADADADADADADADADADADADAD"),
+            2,
+            None,
+            11,
+        );
+        let failing = shared_transaction(payment_tx(
+            source,
+            account("AEAEAEAEAEAEAEAEAEAEAEAEAEAEAEAEAEAEAEAE"),
+            3,
+            None,
+            12,
+        ));
+
+        ledger_master_runtime.add_held_sttx(Arc::clone(&promoted));
+        assert_eq!(runtime.promote_included_transaction(&included), 1);
+        assert!(runtime.stage_transaction(Arc::clone(&failing), false, false, false));
+
+        let report = runtime.apply_pending_with(
+            700,
+            Some(701),
+            |tx, _flags| -> ApplyResult {
+                let _transaction = tx
+                    .lock()
+                    .expect("test transaction mutex should be available");
+                panic!("apply failure")
+            },
+            || {},
+            |_tx, _result| {},
+            |_tx| {},
+            |_tx| false,
+            |_tx| None::<u8>,
+            |_tx, _deferred, _skip| {},
+            |_tx| NetworkOpsCurrentLedgerState {
+                fee: XRPAmount::from_drops(10),
+                account_seq: 2,
+                available_seq: 2,
+            },
+        );
+
+        assert!(
+            report.is_none(),
+            "a panicking batch must not publish a report"
+        );
+        assert_eq!(
+            runtime.snapshot(),
+            AppNetworkOpsRuntimeSnapshot {
+                pending_transactions: 2,
+                submit_held: 0,
+                dispatch_state: NetworkOpsDispatchState::Scheduled,
+            }
+        );
+        assert!(
+            !read_transaction(&failing, |transaction| transaction.get_applying()),
+            "the in-flight transaction must be released after panic"
+        );
+
+        assert!(
+            !read_transaction(&included, |transaction| transaction.get_applying()),
+            "all restored entries must clear their in-flight applying bit"
+        );
+        assert!(
+            runtime.take_pending_batch_panic_recovery(),
+            "a caught batch panic must request a fresh guarded recovery batch"
+        );
+        let scheduled = std::cell::Cell::new(0usize);
+        assert!(
+            !runtime.schedule_pending_transaction_batch(|| {
+                scheduled.set(scheduled.get() + 1);
+                true
+            }),
+            "the panic abort already re-schedules the requeued batch, so a second job is rejected"
+        );
+        assert_eq!(
+            scheduled.get(),
+            0,
+            "recovered work is already scheduled after the panic abort"
+        );
+        assert_eq!(runtime.dispatch_state(), NetworkOpsDispatchState::Scheduled);
+        assert!(runtime.release_scheduled_transaction_batch_for_retry());
+        assert!(
+            !runtime.take_pending_batch_panic_recovery(),
+            "the recovery request must be consumed exactly once"
+        );
+
+        let (pending, start) = runtime.begin_apply_batch();
+        assert_eq!(start.dispatch_state, NetworkOpsDispatchState::Running);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            read_transaction(&pending[0].transaction, |transaction| transaction.get_id()),
+            read_transaction(&failing, |transaction| transaction.get_id()),
+            "the interrupted in-flight transaction must be restored first"
+        );
+        assert_eq!(
+            read_transaction(&pending[1].transaction, |transaction| transaction.get_id()),
+            promoted.get_transaction_id(),
+            "submit-held work must follow the restored in-flight transaction"
+        );
+        let tail = runtime.finish_apply_batch(&pending);
+        assert_eq!(tail.dispatch_state, NetworkOpsDispatchState::None);
     }
 
     #[test]

@@ -32,11 +32,33 @@ pub trait Backend: Send + Sync + 'static {
 
     fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status);
 
-    fn store(&self, object: Arc<NodeObject>);
+    /// Stores one object, reporting backend failures to the caller so it does
+    /// not treat an unpersisted object as cacheable.
+    fn store(&self, object: Arc<NodeObject>) -> Result<(), String>;
 
     fn store_batch(&self, batch: &Batch);
 
+    /// Write a complete batch and report backend failures to the caller.
+    ///
+    /// `store_batch` remains for asynchronous legacy paths that cannot return
+    /// a result. Snapshot and import paths must use this checked form so they
+    /// never report a successful import after a failed durable write.
+    fn store_batch_result(&self, batch: &Batch) -> Result<(), String> {
+        for object in batch {
+            self.store(Arc::clone(object))?;
+        }
+        Ok(())
+    }
+
     fn sync(&self);
+
+    /// Checked durability barrier. Backends without a fallible checkpoint keep
+    /// the historical no-op/default behavior; NuDB overrides this to expose
+    /// its active-burst commit and fsync failures to lifecycle owners.
+    fn sync_result(&self) -> Result<(), String> {
+        self.sync();
+        Ok(())
+    }
 
     /// Begin bulk import mode. Optimized for loading millions of nodes sequentially.
     /// Skips existence checks, disables burst checkpoints, pre-allocates structures.
@@ -55,6 +77,14 @@ pub trait Backend: Send + Sync + 'static {
     fn bulk_import_abort(&self) {}
 
     fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>));
+
+    /// Traverse all objects, reporting backend traversal failures to callers
+    /// that need a complete view. The default preserves historical behavior
+    /// for existing backends that only implement `for_each`.
+    fn for_each_result(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) -> Result<(), String> {
+        self.for_each(callback);
+        Ok(())
+    }
 
     fn get_write_load(&self) -> i32;
 

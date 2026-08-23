@@ -54,12 +54,19 @@ where
     B: ReadView,
 {
     pub fn new_open(base: Arc<B>, rules: Rules) -> Self {
+        // Match rippled OpenView(kOpenLedger,...): construct the entire
+        // open-ledger header from one LCL header snapshot. In particular,
+        // transaction preclaim compares Expiration to parent_close_time, so
+        // this must be the parent's close_time rather than the inherited
+        // parent_close_time (or the default zero value).
         let mut header = base.header();
+        let parent_close_time = header.close_time;
+        let parent_hash = header.hash;
         header.validated = false;
         header.accepted = false;
         header.seq = header.seq.wrapping_add(1);
-        header.parent_close_time = base.header().close_time;
-        header.parent_hash = base.header().hash;
+        header.parent_close_time = parent_close_time;
+        header.parent_hash = parent_hash;
 
         Self {
             base,
@@ -272,5 +279,27 @@ where
             return Err(ViewError::DuplicateTx(key));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenView;
+    use crate::{Ledger, ReadView};
+    use std::sync::Arc;
+
+    #[test]
+    fn new_open_uses_lcl_close_time_as_parent_close_time() {
+        let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(
+            1_234,
+            839_586_542,
+            false,
+        ));
+        let view = OpenView::new_open(Arc::clone(&parent), parent.rules().clone());
+        let header = view.header();
+
+        assert_eq!(header.seq, parent.header().seq + 1);
+        assert_eq!(header.parent_hash, parent.header().hash);
+        assert_eq!(header.parent_close_time, parent.header().close_time);
     }
 }

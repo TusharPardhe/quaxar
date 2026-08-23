@@ -646,7 +646,10 @@ fn amm2_vault_usd() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, usd_currency(), 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -669,7 +672,10 @@ fn amm2_vault_eur() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, eur_currency(), 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, eur_currency(), 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -692,7 +698,10 @@ fn amm2_vault_non_transferable() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, usd_currency(), 0).asset()),
+        );
         tx.set_field_u32(sf("sfFlags"), 0x00000002);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -927,7 +936,10 @@ fn amm3_vault_gbp() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, c, 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, c, 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -951,7 +963,10 @@ fn amm3_vault_jpy() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, c, 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, c, 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -975,7 +990,10 @@ fn amm3_vault_chf() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, c, 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, c, 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -999,7 +1017,10 @@ fn amm3_vault_cad() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, c, 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, c, 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1023,7 +1044,10 @@ fn amm3_vault_aud() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, c, 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, c, 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1221,7 +1245,10 @@ fn amm4_vault_2_currencies() {
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, usd_currency(), 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1231,7 +1258,10 @@ fn amm4_vault_2_currencies() {
     );
     let tx2 = STTx::new(TxType::VAULT_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, eur_currency(), 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, eur_currency(), 0).asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 2);
     });
@@ -1673,6 +1703,11 @@ fn amm5_did_with_data() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(full_apply(&mut v, &tx, TxType::DID_SET), Ter::TES_SUCCESS);
+    let did = v
+        .peek(protocol::did_keylet(Uint160::from_void(a.data())))
+        .unwrap()
+        .expect("DIDSet must persist a DID entry");
+    assert_eq!(did.get_field_vl(sf("sfData")), b"attestation_data_here");
 }
 
 // ─── Oracle: Various IDs ────────────────────────────────────────────────────
@@ -1882,7 +1917,13 @@ fn amm6_vault_diff_owners() {
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
             tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
+            tx.set_field_issue(
+                sf("sfAsset"),
+                protocol::STIssue::new_with_asset(
+                    sf("sfAsset"),
+                    iou(gw, usd_currency(), 0).asset(),
+                ),
+            );
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -2139,7 +2180,10 @@ fn amm7_vault_10_currencies() {
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
             tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, cur, 0));
+            tx.set_field_issue(
+                sf("sfAsset"),
+                protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, cur, 0).asset()),
+            );
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -2324,7 +2368,13 @@ fn amm8_vault_10_owners() {
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
             tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
+            tx.set_field_issue(
+                sf("sfAsset"),
+                protocol::STIssue::new_with_asset(
+                    sf("sfAsset"),
+                    iou(gw, usd_currency(), 0).asset(),
+                ),
+            );
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -3059,11 +3109,15 @@ fn amm21_50_pools() {
         let a = acct(i);
         let gw = acct(0x33);
         let cur = protocol::currency_from_string(c);
+        // `trust_line` stores the balance from the low account's perspective;
+        // the pool owner holds the positive balance, so the sign flips when the
+        // owner sorts after the gateway.
+        let owner_holds = if a < gw { 100_000 } else { -100_000 };
         let l = build_ledger_with_features(
             vec![
                 account_root(a, 50_000_000_000, 1, 0),
                 account_root(gw, 50_000_000_000, 0, 0x00800000),
-                trust_line(a, gw, cur, 100000, 1000000, 0),
+                trust_line(a, gw, cur, owner_holds, 1000000, 0),
             ],
             vec!["AMM"],
         );
@@ -3224,7 +3278,10 @@ fn amm24_vault_100_currencies() {
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
             tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, cur, 0));
+            tx.set_field_issue(
+                sf("sfAsset"),
+                protocol::STIssue::new_with_asset(sf("sfAsset"), iou(gw, cur, 0).asset()),
+            );
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
         });
@@ -3520,7 +3577,10 @@ fn amm41_xchain_create_claim_enabled() {
 #[test]
 fn amm41_batch_enabled() {
     let a = acct(0x11);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -27898,7 +27958,10 @@ fn amm_ag35_or() {
 #[test]
 fn batch_en1() {
     let a = acct(0x0b);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -27913,7 +27976,10 @@ fn batch_en1() {
 #[test]
 fn batch_en2() {
     let a = acct(0x0c);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -27928,7 +27994,10 @@ fn batch_en2() {
 #[test]
 fn batch_en3() {
     let a = acct(0x0d);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -27943,7 +28012,10 @@ fn batch_en3() {
 #[test]
 fn batch_en4() {
     let a = acct(0x0e);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -27958,7 +28030,10 @@ fn batch_en4() {
 #[test]
 fn batch_en5() {
     let a = acct(0x0f);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -27973,7 +28048,10 @@ fn batch_en5() {
 #[test]
 fn batch_en6() {
     let a = acct(0x10);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -27988,7 +28066,10 @@ fn batch_en6() {
 #[test]
 fn batch_en7() {
     let a = acct(0x11);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28003,7 +28084,10 @@ fn batch_en7() {
 #[test]
 fn batch_en8() {
     let a = acct(0x12);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28018,7 +28102,10 @@ fn batch_en8() {
 #[test]
 fn batch_en9() {
     let a = acct(0x13);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28033,7 +28120,10 @@ fn batch_en9() {
 #[test]
 fn batch_en10() {
     let a = acct(0x14);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28048,7 +28138,10 @@ fn batch_en10() {
 #[test]
 fn batch_en11() {
     let a = acct(0x15);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28063,7 +28156,10 @@ fn batch_en11() {
 #[test]
 fn batch_en12() {
     let a = acct(0x16);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28078,7 +28174,10 @@ fn batch_en12() {
 #[test]
 fn batch_en13() {
     let a = acct(0x17);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28093,7 +28192,10 @@ fn batch_en13() {
 #[test]
 fn batch_en14() {
     let a = acct(0x18);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28108,7 +28210,10 @@ fn batch_en14() {
 #[test]
 fn batch_en15() {
     let a = acct(0x19);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28123,7 +28228,10 @@ fn batch_en15() {
 #[test]
 fn batch_en16() {
     let a = acct(0x1a);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28138,7 +28246,10 @@ fn batch_en16() {
 #[test]
 fn batch_en17() {
     let a = acct(0x1b);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28153,7 +28264,10 @@ fn batch_en17() {
 #[test]
 fn batch_en18() {
     let a = acct(0x1c);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28168,7 +28282,10 @@ fn batch_en18() {
 #[test]
 fn batch_en19() {
     let a = acct(0x1d);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28183,7 +28300,10 @@ fn batch_en19() {
 #[test]
 fn batch_en20() {
     let a = acct(0x1e);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28198,7 +28318,10 @@ fn batch_en20() {
 #[test]
 fn batch_en21() {
     let a = acct(0x1f);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28213,7 +28336,10 @@ fn batch_en21() {
 #[test]
 fn batch_en22() {
     let a = acct(0x20);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28228,7 +28354,10 @@ fn batch_en22() {
 #[test]
 fn batch_en23() {
     let a = acct(0x21);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28243,7 +28372,10 @@ fn batch_en23() {
 #[test]
 fn batch_en24() {
     let a = acct(0x22);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28258,7 +28390,10 @@ fn batch_en24() {
 #[test]
 fn batch_en25() {
     let a = acct(0x23);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28273,7 +28408,10 @@ fn batch_en25() {
 #[test]
 fn batch_en26() {
     let a = acct(0x24);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28288,7 +28426,10 @@ fn batch_en26() {
 #[test]
 fn batch_en27() {
     let a = acct(0x25);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28303,7 +28444,10 @@ fn batch_en27() {
 #[test]
 fn batch_en28() {
     let a = acct(0x26);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28318,7 +28462,10 @@ fn batch_en28() {
 #[test]
 fn batch_en29() {
     let a = acct(0x27);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28333,7 +28480,10 @@ fn batch_en29() {
 #[test]
 fn batch_en30() {
     let a = acct(0x28);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28348,7 +28498,10 @@ fn batch_en30() {
 #[test]
 fn batch_en31() {
     let a = acct(0x29);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28363,7 +28516,10 @@ fn batch_en31() {
 #[test]
 fn batch_en32() {
     let a = acct(0x2a);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28378,7 +28534,10 @@ fn batch_en32() {
 #[test]
 fn batch_en33() {
     let a = acct(0x2b);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28393,7 +28552,10 @@ fn batch_en33() {
 #[test]
 fn batch_en34() {
     let a = acct(0x2c);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28408,7 +28570,10 @@ fn batch_en34() {
 #[test]
 fn batch_en35() {
     let a = acct(0x2d);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28423,7 +28588,10 @@ fn batch_en35() {
 #[test]
 fn batch_en36() {
     let a = acct(0x2e);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28438,7 +28606,10 @@ fn batch_en36() {
 #[test]
 fn batch_en37() {
     let a = acct(0x2f);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28453,7 +28624,10 @@ fn batch_en37() {
 #[test]
 fn batch_en38() {
     let a = acct(0x30);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28468,7 +28642,10 @@ fn batch_en38() {
 #[test]
 fn batch_en39() {
     let a = acct(0x31);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28483,7 +28660,10 @@ fn batch_en39() {
 #[test]
 fn batch_en40() {
     let a = acct(0x32);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28498,7 +28678,10 @@ fn batch_en40() {
 #[test]
 fn batch_en41() {
     let a = acct(0x33);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28513,7 +28696,10 @@ fn batch_en41() {
 #[test]
 fn batch_en42() {
     let a = acct(0x34);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28528,7 +28714,10 @@ fn batch_en42() {
 #[test]
 fn batch_en43() {
     let a = acct(0x35);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28543,7 +28732,10 @@ fn batch_en43() {
 #[test]
 fn batch_en44() {
     let a = acct(0x36);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28558,7 +28750,10 @@ fn batch_en44() {
 #[test]
 fn batch_en45() {
     let a = acct(0x37);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28573,7 +28768,10 @@ fn batch_en45() {
 #[test]
 fn batch_en46() {
     let a = acct(0x38);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28588,7 +28786,10 @@ fn batch_en46() {
 #[test]
 fn batch_en47() {
     let a = acct(0x39);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28603,7 +28804,10 @@ fn batch_en47() {
 #[test]
 fn batch_en48() {
     let a = acct(0x3a);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28618,7 +28822,10 @@ fn batch_en48() {
 #[test]
 fn batch_en49() {
     let a = acct(0x3b);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -28633,7 +28840,10 @@ fn batch_en49() {
 #[test]
 fn batch_en50() {
     let a = acct(0x3c);
-    let l = build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
+    let l = build_ledger_with_features(
+        vec![account_root(a, 10_000_000_000, 0, 0)],
+        vec!["BatchV1_1"],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::BATCH, |tx| {
         tx.set_account_id(sf("sfAccount"), a);

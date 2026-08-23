@@ -4,7 +4,7 @@ use basics::make_ssl_context::{
 };
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use axum::Router;
 use axum::body::Body;
@@ -110,7 +110,19 @@ impl TryFrom<&ServerPortSetup> for RpcServerPortPolicy {
     }
 }
 
+fn install_rustls_crypto_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 fn build_tls_config(port: &ServerPortSetup) -> Result<Arc<ServerConfig>, String> {
+    // The server crate enables Rustls' `ring` provider explicitly. Install it
+    // before using the builder so secure listeners do not depend on Rustls'
+    // feature-based default-provider inference.
+    install_rustls_crypto_provider();
+
     let (certs, key) = if port.ssl_key.is_empty()
         && port.ssl_cert.is_empty()
         && port.ssl_chain.is_empty()
@@ -219,7 +231,6 @@ pub struct RpcServer<D> {
 }
 
 pub struct RpcServerState {
-    pub in_flight: dashmap::DashMap<String, tokio::sync::watch::Receiver<Option<RpcReply>>>,
     pub p0_pool: tokio::sync::Semaphore,
     pub p1_pool: tokio::sync::Semaphore,
     pub p2_pool: tokio::sync::Semaphore,
@@ -228,7 +239,6 @@ pub struct RpcServerState {
 impl Default for RpcServerState {
     fn default() -> Self {
         Self {
-            in_flight: dashmap::DashMap::new(),
             p0_pool: tokio::sync::Semaphore::new(128),
             p1_pool: tokio::sync::Semaphore::new(64),
             p2_pool: tokio::sync::Semaphore::new(16),
@@ -299,12 +309,32 @@ where
     }
 
     pub fn with_port_policy(dispatcher: D, policy: RpcServerPortPolicy) -> Self {
+        Self::with_port_policy_and_subscriptions(
+            dispatcher,
+            policy,
+            Arc::new(SubscriptionManager::default()),
+            None,
+        )
+    }
+
+    /// Build a live listener with the exact per-port transport, authorization,
+    /// and status policy parsed from `[server]`. ServerRuntime must use this
+    /// constructor rather than the generic auth/subscription constructor: the
+    /// latter intentionally has no port policy and therefore cannot enforce a
+    /// HTTP-only or WebSocket-only configured listener.
+    pub fn with_port_policy_and_subscriptions(
+        dispatcher: D,
+        policy: RpcServerPortPolicy,
+        subscriptions: Arc<SubscriptionManager>,
+        status_source: Option<Arc<dyn ServerStatusSource>>,
+    ) -> Self {
         Self {
             dispatcher: Arc::new(dispatcher),
-            subscriptions: Arc::new(SubscriptionManager::default()),
+            subscriptions,
             auth: ServerAuth::new(policy.auth.clone()),
             config: RpcServerConfig {
                 port_policy: Some(policy),
+                status_source,
                 ..RpcServerConfig::default()
             },
             state: Arc::new(RpcServerState::default()),
@@ -316,9 +346,12 @@ where
         policy: RpcServerPortPolicy,
         status_source: Arc<dyn ServerStatusSource>,
     ) -> Self {
-        let mut server = Self::with_port_policy(dispatcher, policy);
-        server.config.status_source = Some(status_source);
-        server
+        Self::with_port_policy_and_subscriptions(
+            dispatcher,
+            policy,
+            Arc::new(SubscriptionManager::default()),
+            Some(status_source),
+        )
     }
 
     pub fn with_server_port(dispatcher: D, port: &ServerPortSetup) -> Result<Self, String> {
@@ -349,29 +382,12 @@ where
         params: JsonValue,
         metadata: RequestMetadata,
     ) -> RpcReply {
-        let hash_key = format!(
-            "{}:{}",
-            method,
-            sonic_rs::to_string(&params).unwrap_or_default()
-        );
-
-        // Atomically check-or-insert to prevent the race where two threads
-        // both see an empty slot and both start computing.
-        use dashmap::mapref::entry::Entry;
-        let rx_opt = match self.state.in_flight.entry(hash_key.clone()) {
-            Entry::Occupied(e) => Some(e.get().clone()),
-            Entry::Vacant(_) => None,
-        };
-
-        if let Some(mut rx) = rx_opt
-            && rx.changed().await.is_ok()
-            && let Some(reply) = rx.borrow().clone()
-        {
-            return reply;
-        }
-
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        self.state.in_flight.insert(hash_key.clone(), rx);
+        // Do not share replies between identical requests. Some RPCs are
+        // intentionally non-deterministic (for example, parameterless
+        // wallet_propose), and others mutate server state. rippled dispatches
+        // each request independently, even when method and parameters match.
+        // Request coalescing here replayed the first wallet response to every
+        // concurrent caller and therefore produced duplicate account seeds.
 
         // rippled: ALL requests are rejected with tooBusy when the server is
         // overloaded AND the client is not unlimited (admin). This prevents
@@ -393,8 +409,6 @@ where
                     rpc::RpcErrorCode::TooBusy,
                     "Server is too busy. Try again later.",
                 );
-                let _ = tx.send(Some(reply.clone()));
-                self.state.in_flight.remove(&hash_key);
                 return reply;
             }
         }
@@ -419,9 +433,6 @@ where
         .expect("dispatcher::dispatch panicked");
 
         drop(permit);
-
-        let _ = tx.send(Some(reply.clone()));
-        self.state.in_flight.remove(&hash_key);
 
         reply
     }
@@ -1205,22 +1216,19 @@ fn websocket_response(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Once;
-    fn install_crypto() {
-        static INSTALL: Once = Once::new();
-        INSTALL.call_once(|| {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        });
-    }
     use super::{
         JsonRpcEnvelope, RpcServer, RpcServerPortBuild, RpcServerPortPolicy,
         sanitize_request_value, websocket_response,
     };
     use crate::transport::{RpcDispatcher, RpcReply, RpcRequest};
     use app::ServerPortSetup;
+    use axum::body::Body;
+    use axum::http::Request;
     use protocol::JsonValue;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct NoopDispatcher;
 
@@ -1230,9 +1238,50 @@ mod tests {
         }
     }
 
+    struct CountingDispatcher(AtomicU64);
+
+    impl RpcDispatcher for CountingDispatcher {
+        fn dispatch(&self, _request: RpcRequest<'_>) -> RpcReply {
+            RpcReply::result(JsonValue::Unsigned(self.0.fetch_add(1, Ordering::SeqCst)))
+        }
+    }
+
+    fn test_metadata() -> crate::session::RequestMetadata {
+        crate::session::RequestMetadata::new(
+            "127.0.0.1:50000".parse().unwrap(),
+            &Request::new(Body::empty()),
+        )
+    }
+
+    #[tokio::test]
+    async fn identical_concurrent_requests_are_dispatched_independently() {
+        let server = Arc::new(RpcServer::new(CountingDispatcher(AtomicU64::new(0))));
+        let params = JsonValue::Object(BTreeMap::new());
+        let mut tasks = Vec::new();
+
+        for _ in 0..32 {
+            let server = Arc::clone(&server);
+            let params = params.clone();
+            tasks.push(tokio::spawn(async move {
+                server
+                    .dispatch_async("wallet_propose".to_owned(), params, test_metadata())
+                    .await
+            }));
+        }
+
+        let mut values = Vec::new();
+        for task in tasks {
+            match task.await.unwrap() {
+                RpcReply::Result(JsonValue::Unsigned(value)) => values.push(value),
+                reply => panic!("unexpected reply: {reply:?}"),
+            }
+        }
+        values.sort_unstable();
+        assert_eq!(values, (0..32).collect::<Vec<_>>());
+    }
+
     #[test]
     fn server_port_policy_rejects_unsupported_transport_modes() {
-        install_crypto();
         let secure_port = ServerPortSetup {
             name: "port_secure".to_owned(),
             ip: "127.0.0.1".to_owned(),
@@ -1281,7 +1330,6 @@ mod tests {
 
     #[test]
     fn server_port_build_reports_deferred_modes_for_mixed_listener_ports() {
-        install_crypto();
         let mixed_port = ServerPortSetup {
             name: "port_mixed".to_owned(),
             ip: "127.0.0.1".to_owned(),

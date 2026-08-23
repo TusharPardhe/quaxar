@@ -42,6 +42,9 @@ use std::thread;
 pub use crate::family::{FullBelowCache, NullFullBelowCache};
 
 pub const DEFAULT_MAX_DEFERRED_MISSING_NODE_READS: usize = 512;
+/// Reply-triggered frontier size. rippled discovers up to 256 candidates per
+/// scan and sends up to 128 of them back to a useful replying peer.
+pub const DEFAULT_NETWORK_FRONTIER_BATCH: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SHAMapType {
@@ -486,10 +489,10 @@ impl SyncTree {
                 continue;
             }
             for branch in 0..BRANCH_FACTOR {
-                if !node.is_empty_branch(branch) {
-                    if let Some(child) = node.get_child(branch) {
-                        work_stack.push(child);
-                    }
+                if !node.is_empty_branch(branch)
+                    && let Some(child) = node.get_child(branch)
+                {
+                    work_stack.push(child);
                 }
             }
             inner_nodes.push(node);
@@ -555,10 +558,10 @@ impl SyncTree {
 
             // Not full below at this depth — descend into loaded children.
             for branch in 0..BRANCH_FACTOR {
-                if !node.is_empty_branch(branch) {
-                    if let Some(child) = node.get_child(branch) {
-                        work_stack.push((child, depth + 1));
-                    }
+                if !node.is_empty_branch(branch)
+                    && let Some(child) = node.get_child(branch)
+                {
+                    work_stack.push((child, depth + 1));
                 }
             }
         }
@@ -626,10 +629,10 @@ impl SyncTree {
 
             // Above keep_depth — descend into loaded children.
             for branch in 0..BRANCH_FACTOR {
-                if !node.is_empty_branch(branch) {
-                    if let Some(child) = node.get_child(branch) {
-                        work_stack.push((child, depth + 1));
-                    }
+                if !node.is_empty_branch(branch)
+                    && let Some(child) = node.get_child(branch)
+                {
+                    work_stack.push((child, depth + 1));
                 }
             }
         }
@@ -1079,7 +1082,11 @@ impl SyncTree {
                 return SHAMapAddNode::invalid();
             };
             if child_hash != new_node.get_hash() {
-                tracing::warn!(target: "shamap", expected = %child_hash, "Node hash mismatch — corrupt data");
+                tracing::warn!(
+                    target: "shamap",
+                    expected = %child_hash,
+                    "Node hash mismatch — corrupt data"
+                );
                 report_event(AddKnownNodeEvent::CorruptNode);
                 return SHAMapAddNode::invalid();
             }
@@ -1187,7 +1194,7 @@ impl SyncTree {
                         ));
                     }
                     AddKnownNodeEvent::UnableToHook { wanted, stuck } => {
-                        if std::env::var("XRPLD_FULL_SYNC_DEBUG")
+                        if std::env::var("QUAXAR_FULL_SYNC_DEBUG")
                             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
                             .unwrap_or(false)
                         {
@@ -1281,9 +1288,20 @@ impl SyncTree {
                 continue;
             }
 
+            let mut completions_by_hash = BTreeMap::new();
+            for request in &pending {
+                completions_by_hash
+                    .entry(request.hash())
+                    .or_insert_with(|| self.load_node_with_owner_family(request.hash(), family));
+            }
             let completions = pending
-                .into_iter()
-                .map(|request| self.load_node_with_owner_family(request.hash(), family))
+                .iter()
+                .map(|request| {
+                    completions_by_hash
+                        .get(&request.hash())
+                        .expect("every deferred request hash must have a completion")
+                        .clone()
+                })
                 .collect::<Vec<_>>();
             scan.complete_pending_reads(completions);
         }
@@ -1327,9 +1345,20 @@ impl SyncTree {
                 continue;
             }
 
+            let mut completions_by_hash = BTreeMap::new();
+            for request in &pending {
+                completions_by_hash
+                    .entry(request.hash())
+                    .or_insert_with(|| self.load_node_with_owner_family(request.hash(), family));
+            }
             let completions = pending
-                .into_iter()
-                .map(|request| self.load_node_with_owner_family(request.hash(), family))
+                .iter()
+                .map(|request| {
+                    completions_by_hash
+                        .get(&request.hash())
+                        .expect("every deferred request hash must have a completion")
+                        .clone()
+                })
                 .collect::<Vec<_>>();
             scan.complete_pending_reads(completions);
         }
@@ -1339,6 +1368,27 @@ impl SyncTree {
             self.clear_synching();
         }
         (missing, stats)
+    }
+
+    pub fn start_missing_node_continuation<R>(
+        &self,
+        plan_id: MissingNodePlanId,
+        max_missing: i32,
+        full_below_generation: u32,
+        next_first_child: &mut R,
+    ) -> MissingNodeContinuation
+    where
+        R: FnMut() -> u8,
+    {
+        MissingNodeContinuation::new(
+            plan_id,
+            &self.root,
+            max_missing,
+            self.backed,
+            self.ledger_seq,
+            full_below_generation,
+            next_first_child,
+        )
     }
 
     pub fn start_deferred_missing_node_scan<R, C>(
@@ -1359,6 +1409,80 @@ impl SyncTree {
             full_below_cache,
             next_first_child,
         )
+    }
+
+    /// Advance a resumable scan through its local deferred-read batches.
+    ///
+    /// Each bounded pass admits and synchronously completes no more than
+    /// `max_deferred` NodeStore reads, then this helper resumes the retained
+    /// traversal in the same call. This mirrors rippled `getMissingNodes()`:
+    /// only a missing-node result boundary or true traversal completion ends
+    /// the call. A zero-work bounded pass returns `false` rather than spinning.
+    pub fn advance_deferred_missing_node_scan_with_family<CLOCK, S, C, F, MR, NS, R>(
+        &mut self,
+        scan: &mut DeferredMissingNodeScan,
+        filter: &mut Option<&mut dyn SHAMapSyncFilter>,
+        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
+        max_deferred: usize,
+        max_branch_steps: usize,
+        next_first_child: &mut R,
+    ) -> bool
+    where
+        CLOCK: CacheClock,
+        S: BuildHasher + Clone,
+        C: FullBelowCache,
+        F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
+        R: FnMut() -> u8,
+    {
+        loop {
+            let progress_before = scan.progress();
+            scan.run_with_family_bounded(
+                family,
+                filter,
+                max_deferred,
+                max_branch_steps,
+                next_first_child,
+                &mut |_, _| {},
+            );
+
+            let pending = scan.pending_requests();
+            if !pending.is_empty() {
+                debug_assert!(
+                    pending.len() <= max_deferred,
+                    "a bounded deferred scan must not complete more reads than it admitted"
+                );
+                let mut completions_by_hash = BTreeMap::new();
+                for request in &pending {
+                    completions_by_hash
+                        .entry(request.hash())
+                        .or_insert_with(|| {
+                            self.load_node_with_owner_family(request.hash(), family)
+                        });
+                }
+                let completions = pending
+                    .iter()
+                    .map(|request| {
+                        completions_by_hash
+                            .get(&request.hash())
+                            .expect("every deferred request hash must have a completion")
+                            .clone()
+                    })
+                    .collect::<Vec<_>>();
+                scan.complete_pending_reads(completions);
+            }
+
+            let complete = scan.is_complete() || scan.remaining() <= 0;
+            if complete {
+                if scan.missing_nodes().is_empty() {
+                    self.clear_synching();
+                }
+                return true;
+            }
+            if scan.progress() == progress_before {
+                return false;
+            }
+        }
     }
 
     pub fn start_deferred_missing_node_scan_with_family<CLOCK, S, C, F, MR, NS, R>(
@@ -1417,7 +1541,32 @@ impl SyncTree {
                 continue;
             }
 
-            let completions = complete_async_fetches(pending);
+            let mut unique_hashes = BTreeSet::new();
+            let unique_pending = pending
+                .iter()
+                .copied()
+                .filter(|request| unique_hashes.insert(request.hash()))
+                .collect::<Vec<_>>();
+            let unique_completions = complete_async_fetches(unique_pending.clone());
+            assert_eq!(
+                unique_pending.len(),
+                unique_completions.len(),
+                "complete_async_fetches requires one completion per unique deferred hash"
+            );
+            let completions_by_hash = unique_pending
+                .into_iter()
+                .zip(unique_completions)
+                .map(|(request, completion)| (request.hash(), completion))
+                .collect::<BTreeMap<_, _>>();
+            let completions = pending
+                .iter()
+                .map(|request| {
+                    completions_by_hash
+                        .get(&request.hash())
+                        .expect("every deferred request hash must have a completion")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
             scan.complete_pending_reads(completions);
         }
 
@@ -2212,58 +2361,52 @@ impl SyncTree {
 }
 
 #[derive(Debug, Clone)]
-/// Scan state for getMissingNodes — uses raw pointer matching reference stack.
-/// Safety: parent node on the stack holds SharedIntrusive to children,
-/// keeping them alive for the scan duration. Single-threaded access.
+/// Scan state for getMissingNodes. The strong owner keeps a scan node alive
+/// even when a concurrent backed-tree eviction detaches it from its parent.
 struct MissingNodeScanState {
-    node: *const SHAMapTreeNode,
+    node: SharedIntrusive<SHAMapTreeNode>,
     node_id: SHAMapNodeId,
     first_child: usize,
     current_child: usize,
     full_below: bool,
 }
 
-unsafe impl Send for MissingNodeScanState {}
-
 impl MissingNodeScanState {
     #[inline(always)]
     fn node(&self) -> &SHAMapTreeNode {
-        unsafe { &*self.node }
+        &self.node
     }
 }
 
 #[derive(Debug, Clone)]
 struct DeferredSyncRead {
-    parent: *const SHAMapTreeNode,
+    parent: SharedIntrusive<SHAMapTreeNode>,
     parent_id: SHAMapNodeId,
     branch: usize,
     node: Option<SharedIntrusive<SHAMapTreeNode>>,
 }
 
-unsafe impl Send for DeferredSyncRead {}
-
 #[derive(Debug, Clone)]
 struct DeferredResume {
-    node: *const SHAMapTreeNode,
+    node: SharedIntrusive<SHAMapTreeNode>,
     node_id: SHAMapNodeId,
 }
 
-unsafe impl Send for DeferredResume {}
-
 #[derive(Debug, Clone)]
-/// Deferred fetch state — uses raw pointer for parent (parent is on scan stack).
+/// Deferred fetch state retains the parent while peer/NodeStore I/O is pending.
 struct PendingDeferredFetch {
-    parent: *const SHAMapTreeNode,
+    parent: SharedIntrusive<SHAMapTreeNode>,
     parent_id: SHAMapNodeId,
     branch: usize,
     hash: SHAMapHash,
     ledger_seq: u32,
 }
 
-unsafe impl Send for PendingDeferredFetch {}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeferredMissingNodeScanStats {
+    /// Every branch examined, including empty branches. This is the reliable
+    /// bounded-work progress unit used by resumable acquisition diagnostics.
+    pub branch_steps: u64,
     pub branches_seen: u64,
     pub duplicate_missing_hashes: u64,
     pub full_below_hits: u64,
@@ -2272,8 +2415,15 @@ pub struct DeferredMissingNodeScanStats {
     pub inner_children: u64,
     pub full_below_inner_children: u64,
     pub pending_reads: u64,
+    pub max_pending_reads: u64,
     pub completed_pending_reads: u64,
     pub completed_pending_misses: u64,
+    /// Broker admission rejected this retained hash and the continuation
+    /// re-announced it. This distinguishes capacity churn from NodeStore I/O.
+    pub requeued_rejected_reads: u64,
+    /// An admitted actor operation was cancelled and had to be re-armed while
+    /// its verified parent edges remained retained by this plan.
+    pub requeued_cancelled_reads: u64,
     pub missing_recorded: u64,
     pub full_below_marked: u64,
     pub deferred_resumes: u64,
@@ -2305,8 +2455,22 @@ pub struct DeferredMissingNodeScan {
     missing_nodes: Vec<(SHAMapNodeId, Uint256)>,
     stack: Vec<MissingNodeScanState>,
     pending_reads: Vec<PendingDeferredFetch>,
+    pending_hashes: BTreeSet<SHAMapHash>,
     deferred_resumes: BTreeMap<usize, DeferredResume>,
     stats: DeferredMissingNodeScanStats,
+}
+
+/// Read-only cumulative scan state sampled around one bounded traversal slice.
+/// Sampling does not mutate the retained traversal, deferred reads, or resume
+/// queue, so callers can compute deltas without changing scan behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeferredMissingNodeScanProgress {
+    pub branch_steps: u64,
+    pub deferred_reads: u64,
+    pub deferred_resumes: u64,
+    pub missing_nodes: u64,
+    pub remaining: i32,
+    pub complete: bool,
 }
 
 impl DeferredMissingNodeScan {
@@ -2351,6 +2515,7 @@ impl DeferredMissingNodeScan {
             missing_nodes: Vec::with_capacity(max as usize),
             stack,
             pending_reads: Vec::new(),
+            pending_hashes: BTreeSet::new(),
             deferred_resumes: BTreeMap::new(),
             stats: DeferredMissingNodeScanStats::default(),
         }
@@ -2378,11 +2543,59 @@ impl DeferredMissingNodeScan {
             .collect()
     }
 
+    /// Return only cumulative counters and completion state for diagnostics.
+    /// This intentionally exposes no mutable traversal internals.
+    pub fn progress(&self) -> DeferredMissingNodeScanProgress {
+        DeferredMissingNodeScanProgress {
+            branch_steps: self.stats.branch_steps,
+            deferred_reads: self.stats.pending_reads,
+            deferred_resumes: self.stats.deferred_resumes,
+            missing_nodes: self.stats.missing_recorded,
+            remaining: self.remaining,
+            complete: self.is_complete(),
+        }
+    }
+
+    /// Advance without a branch cap for existing whole-scan callers. New
+    /// resumable acquisition work uses `run_with_family_bounded` instead.
     pub fn run_with_family<CLOCK, S, FB, F, MR, NS, R, REQ>(
         &mut self,
         family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
         filter: &mut Option<&mut dyn SHAMapSyncFilter>,
         max_deferred: usize,
+        next_first_child: &mut R,
+        request_async_fetch: &mut REQ,
+    ) where
+        CLOCK: CacheClock,
+        S: BuildHasher + Clone,
+        FB: FullBelowCache,
+        F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
+        R: FnMut() -> u8,
+        REQ: FnMut(SHAMapHash, u32),
+    {
+        // Legacy whole scans historically admitted one deferred read after
+        // reaching `max_deferred`. Preserve that behavior only on this
+        // compatibility path; resumable acquisition calls the bounded method
+        // directly and receives its declared inclusive limit.
+        self.run_with_family_bounded(
+            family,
+            filter,
+            max_deferred.saturating_add(1),
+            usize::MAX,
+            next_first_child,
+            request_async_fetch,
+        );
+    }
+
+    /// Advance at most `max_branch_steps` branches while retaining all stack,
+    /// pending-read, and missing-node state for the next caller-owned turn.
+    pub fn run_with_family_bounded<CLOCK, S, FB, F, MR, NS, R, REQ>(
+        &mut self,
+        family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
+        filter: &mut Option<&mut dyn SHAMapSyncFilter>,
+        max_deferred: usize,
+        max_branch_steps: usize,
         next_first_child: &mut R,
         request_async_fetch: &mut REQ,
     ) where
@@ -2403,10 +2616,17 @@ impl DeferredMissingNodeScan {
             );
         }
 
+        let mut branch_steps = 0usize;
         while let Some(state) = self.stack.last_mut() {
-            // so a pass is allowed to post one more deferred read after reaching
-            // the threshold. Keep the same boundary here.
-            if self.remaining <= 0 || self.pending_reads.len() > max_deferred {
+            // A continuation yields after a deterministic number of examined
+            // branches. The legacy whole-scan callers pass `usize::MAX`.
+            if branch_steps >= max_branch_steps {
+                break;
+            }
+            // Bounded callers may complete no more than `max_deferred`
+            // synchronous reads in this turn. Legacy whole-scan callers keep
+            // their historic one-extra behavior via the adjusted wrapper.
+            if self.remaining <= 0 || self.pending_reads.len() >= max_deferred {
                 break;
             }
 
@@ -2432,6 +2652,8 @@ impl DeferredMissingNodeScan {
 
             let branch = (state.first_child + state.current_child) % BRANCH_FACTOR;
             state.current_child += 1;
+            branch_steps += 1;
+            self.stats.branch_steps += 1;
             if state.node().is_empty_branch(branch) {
                 continue;
             }
@@ -2453,16 +2675,22 @@ impl DeferredMissingNodeScan {
                 continue;
             }
 
-            match crate::fetch::descend_async_raw_nocopy(
-                state.node(),
+            let request_already_pending = self.pending_hashes.contains(&child_hash);
+            let mut request_once = |hash, ledger_seq| {
+                if !request_already_pending {
+                    request_async_fetch(hash, ledger_seq);
+                }
+            };
+            match crate::fetch::descend_async_with_family(
+                &state.node,
                 branch,
                 self.backed,
                 self.ledger_seq,
                 family,
                 filter,
-                request_async_fetch,
+                &mut request_once,
             ) {
-                crate::fetch::AsyncDescendResultRaw::Ready(None) => {
+                crate::fetch::AsyncDescendResult::Ready(None) => {
                     state.full_below = false;
                     let exhausted = record_missing_child(
                         &mut self.missing_hashes,
@@ -2477,9 +2705,8 @@ impl DeferredMissingNodeScan {
                         break;
                     }
                 }
-                crate::fetch::AsyncDescendResultRaw::Ready(Some(child_ptr)) => {
+                crate::fetch::AsyncDescendResult::Ready(Some(child)) => {
                     self.stats.loaded_or_cached_children += 1;
-                    let child = unsafe { &*child_ptr };
                     if child.is_inner() {
                         self.stats.inner_children += 1;
                         if child.is_full_below(self.generation) {
@@ -2489,27 +2716,27 @@ impl DeferredMissingNodeScan {
                                 .node_id
                                 .get_child_node_id(branch)
                                 .expect("branch selection must stay within SHAMap depth bounds");
-                            push_scan_state_raw(
-                                &mut self.stack,
-                                child_ptr,
-                                child_id,
-                                next_first_child,
-                            );
+                            push_scan_state(&mut self.stack, child, child_id, next_first_child);
                         }
                     } else {
                         self.stats.leaf_children += 1;
                     }
                 }
-                crate::fetch::AsyncDescendResultRaw::Pending(hash) => {
+                crate::fetch::AsyncDescendResult::Pending(hash) => {
                     state.full_below = false;
+                    self.pending_hashes.insert(hash);
                     self.stats.pending_reads += 1;
                     self.pending_reads.push(PendingDeferredFetch {
-                        parent: state.node,
+                        parent: state.node.clone(),
                         parent_id: state.node_id,
                         branch,
                         hash,
                         ledger_seq: self.ledger_seq,
                     });
+                    self.stats.max_pending_reads = self
+                        .stats
+                        .max_pending_reads
+                        .max(self.pending_reads.len() as u64);
                 }
             }
         }
@@ -2521,6 +2748,7 @@ impl DeferredMissingNodeScan {
     {
         let completions: Vec<_> = completions.into_iter().collect();
         let pending_reads = std::mem::take(&mut self.pending_reads);
+        self.pending_hashes.clear();
         assert_eq!(
             pending_reads.len(),
             completions.len(),
@@ -2559,27 +2787,1002 @@ impl DeferredMissingNodeScan {
     }
 }
 
+/// Identifies one retained, actor-owned missing-node traversal. Callers must
+/// carry this value with every read completion so a replaced tree root cannot
+/// be mutated by an older completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MissingNodePlanId(u64);
+
+impl MissingNodePlanId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// One unique local-read request emitted by [`MissingNodeContinuation`].
+///
+/// `node_id` and `branch` describe the first retained edge for diagnostics;
+/// the continuation keeps every duplicate edge internally and applies a
+/// single result to all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadNeed {
+    hash: SHAMapHash,
+    ledger_seq: u32,
+    node_id: SHAMapNodeId,
+    branch: usize,
+}
+
+impl ReadNeed {
+    pub fn hash(&self) -> SHAMapHash {
+        self.hash
+    }
+
+    pub fn ledger_seq(&self) -> u32 {
+        self.ledger_seq
+    }
+
+    pub fn node_id(&self) -> SHAMapNodeId {
+        self.node_id
+    }
+
+    pub fn branch(&self) -> usize {
+        self.branch
+    }
+}
+
+/// Synchronous sources that are already resident in the acquisition actor,
+/// such as the shared tree cache or a fetch-pack. Implementations must not
+/// perform NodeStore or network I/O; misses are represented by [`ReadNeed`].
+pub trait MissingNodeResidentLookup {
+    fn load_resident(
+        &mut self,
+        hash: SHAMapHash,
+        ledger_seq: u32,
+    ) -> Option<SharedIntrusive<SHAMapTreeNode>>;
+
+    fn is_full_below(&mut self, _hash: SHAMapHash) -> bool {
+        false
+    }
+
+    fn mark_full_below(&mut self, node: SharedIntrusive<SHAMapTreeNode>, generation: u32) {
+        node.set_full_below_gen(generation);
+    }
+}
+
+/// Individual result from the unique-read broker. `Rejected` means admission
+/// was not available and makes the need eligible for a later FIFO retry;
+/// `Cancelled` intentionally leaves the retained edges untouched because the
+/// acquisition terminal path owns their final settlement.
+#[derive(Debug, Clone)]
+pub enum MissingNodeReadOutcome {
+    Found(SharedIntrusive<SHAMapTreeNode>),
+    Miss,
+    Rejected,
+    Cancelled,
+}
+
+/// Result of applying exactly one broker completion to a continuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingNodeReadApply {
+    Applied {
+        attached_edges: usize,
+        missing_edges: usize,
+    },
+    Requeued,
+    Cancelled,
+    StalePlan,
+    HashMismatch,
+    UnknownRead,
+}
+
+/// A bounded, pure continuation result. It never owns NodeStore callbacks and
+/// never waits for a collection of reads before returning control to its
+/// actor.
+#[derive(Debug, Clone)]
+pub enum MissingNodeAdvance {
+    Ready,
+    NeedsReads(Vec<ReadNeed>),
+    NeedsNetwork(Vec<(SHAMapNodeId, Uint256)>),
+    Complete,
+    Invalid,
+}
+
+#[derive(Debug, Clone)]
+struct PendingReadEdges {
+    need: ReadNeed,
+    edges: Vec<PendingDeferredFetch>,
+}
+
+/// Finite retained-work budget for one async missing-node continuation.
+///
+/// Rippled keeps at most 512 deferred reads in one `getMissingNodes()` pass.
+/// The Rust continuation survives asynchronous actor turns, so it uses that
+/// same source-mapped pass ceiling independently for unique pending hashes,
+/// retained parent edges, and their fixed-size edge payload. A caller that
+/// needs a smaller owner budget may use [`MissingNodeContinuation::new_with_bounds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingNodeContinuationBounds {
+    pub max_pending_hashes: usize,
+    pub max_pending_edges: usize,
+    pub max_pending_edge_bytes: usize,
+}
+
+impl Default for MissingNodeContinuationBounds {
+    fn default() -> Self {
+        let max_pending_edges = DEFAULT_MAX_DEFERRED_MISSING_NODE_READS;
+        Self {
+            max_pending_hashes: DEFAULT_MAX_DEFERRED_MISSING_NODE_READS,
+            max_pending_edges,
+            max_pending_edge_bytes: max_pending_edges
+                .saturating_mul(std::mem::size_of::<PendingDeferredFetch>()),
+        }
+    }
+}
+
+impl MissingNodeContinuationBounds {
+    fn can_retain_edge(self, pending_hashes: usize, pending_edges: usize) -> bool {
+        pending_hashes <= self.max_pending_hashes
+            && pending_edges <= self.max_pending_edges
+            && pending_edges.saturating_mul(std::mem::size_of::<PendingDeferredFetch>())
+                <= self.max_pending_edge_bytes
+    }
+}
+
+/// Pure retained traversal for state and transaction acquisition.
+///
+/// This intentionally does not depend on `SHAMapFamily`, `SHAMapNodeFetcher`,
+/// or a callback. The acquisition actor advances bounded CPU work, submits the
+/// returned unique hashes to its broker after releasing actor ownership, then
+/// feeds every completion back through [`Self::apply_read_result`].
+#[derive(Debug, Clone)]
+pub struct MissingNodeContinuation {
+    plan_id: MissingNodePlanId,
+    root: SharedIntrusive<SHAMapTreeNode>,
+    generation: u32,
+    ledger_seq: u32,
+    backed: bool,
+    max_missing: i32,
+    remaining: i32,
+    missing_hashes: BTreeSet<SHAMapHash>,
+    missing_nodes: Vec<(SHAMapNodeId, Uint256)>,
+    unannounced_network: Vec<(SHAMapNodeId, Uint256)>,
+    stack: Vec<MissingNodeScanState>,
+    pending_by_hash: BTreeMap<SHAMapHash, PendingReadEdges>,
+    pending_network_by_hash: BTreeMap<SHAMapHash, Vec<PendingDeferredFetch>>,
+    unannounced_reads: BTreeSet<SHAMapHash>,
+    deferred_resumes: BTreeMap<usize, DeferredResume>,
+    bounds: MissingNodeContinuationBounds,
+    /// A full retained-edge budget is a genuine external-work wait, not a
+    /// runnable CPU frontier. It clears only when a read or peer result frees
+    /// an edge, preventing repeated Ready turns from spinning.
+    pending_edge_limit_reached: bool,
+    stats: DeferredMissingNodeScanStats,
+    invalid: bool,
+}
+
+impl MissingNodeContinuation {
+    pub fn new<R>(
+        plan_id: MissingNodePlanId,
+        root: &SharedIntrusive<SHAMapTreeNode>,
+        max_missing: i32,
+        backed: bool,
+        ledger_seq: u32,
+        full_below_generation: u32,
+        next_first_child: &mut R,
+    ) -> Self
+    where
+        R: FnMut() -> u8,
+    {
+        Self::new_with_bounds(
+            plan_id,
+            root,
+            max_missing,
+            backed,
+            ledger_seq,
+            full_below_generation,
+            MissingNodeContinuationBounds::default(),
+            next_first_child,
+        )
+    }
+
+    pub fn new_with_bounds<R>(
+        plan_id: MissingNodePlanId,
+        root: &SharedIntrusive<SHAMapTreeNode>,
+        max_missing: i32,
+        backed: bool,
+        ledger_seq: u32,
+        full_below_generation: u32,
+        bounds: MissingNodeContinuationBounds,
+        next_first_child: &mut R,
+    ) -> Self
+    where
+        R: FnMut() -> u8,
+    {
+        assert!(
+            root.get_hash().is_non_zero(),
+            "missing-node continuations require a non-zero root hash"
+        );
+        assert!(
+            max_missing > 0,
+            "missing-node continuations require a positive missing-node bound"
+        );
+        assert!(
+            bounds.max_pending_hashes > 0
+                && bounds.max_pending_edges > 0
+                && bounds.max_pending_edge_bytes >= std::mem::size_of::<PendingDeferredFetch>(),
+            "missing-node continuation retained-edge bounds must admit one edge"
+        );
+
+        let mut stack = Vec::new();
+        if root.is_inner() && !root.is_full_below(full_below_generation) {
+            push_scan_state(
+                &mut stack,
+                root.clone(),
+                SHAMapNodeId::default(),
+                next_first_child,
+            );
+        }
+
+        Self {
+            plan_id,
+            root: root.clone(),
+            generation: full_below_generation,
+            ledger_seq,
+            backed,
+            max_missing,
+            remaining: max_missing,
+            missing_hashes: BTreeSet::new(),
+            missing_nodes: Vec::with_capacity(max_missing as usize),
+            unannounced_network: Vec::new(),
+            stack,
+            pending_by_hash: BTreeMap::new(),
+            pending_network_by_hash: BTreeMap::new(),
+            unannounced_reads: BTreeSet::new(),
+            deferred_resumes: BTreeMap::new(),
+            bounds,
+            pending_edge_limit_reached: false,
+            stats: DeferredMissingNodeScanStats::default(),
+            invalid: false,
+        }
+    }
+
+    pub fn plan_id(&self) -> MissingNodePlanId {
+        self.plan_id
+    }
+
+    /// Starts the next reply-triggered missing-node scan epoch.
+    ///
+    /// rippled constructs a fresh `MissingNodes(max=256)` for every Reply
+    /// trigger. The retained Rust continuation keeps its exact in-flight edges,
+    /// but discovery credit and a randomized root walk are per trigger rather
+    /// than being replenished only by exact peer attachments.
+    pub fn begin_reply_scan<R>(&mut self, next_first_child: &mut R)
+    where
+        R: FnMut() -> u8,
+    {
+        if self.invalid {
+            return;
+        }
+        let pending_by_hash = std::mem::take(&mut self.pending_by_hash);
+        let pending_network_by_hash = std::mem::take(&mut self.pending_network_by_hash);
+        let unannounced_reads = std::mem::take(&mut self.unannounced_reads);
+        self.deferred_resumes.clear();
+        let mut replacement = Self::new_with_bounds(
+            self.plan_id,
+            &self.root,
+            self.max_missing,
+            self.backed,
+            self.ledger_seq,
+            self.generation,
+            self.bounds,
+            next_first_child,
+        );
+        // Diagnostics span scan epochs, while every cursor, missing set, read
+        // result and budget is deliberately fresh like rippled's local
+        // `MissingNodes` object. Async read waiters and peer-attachment edges
+        // are canonical tree work rather than scan-result state, so preserve
+        // them across epochs; source rippled completes those reads
+        // synchronously before getMissingNodes returns.
+        replacement.stats = self.stats;
+        replacement.pending_by_hash = pending_by_hash;
+        replacement.pending_network_by_hash = pending_network_by_hash;
+        replacement.unannounced_reads = unannounced_reads;
+        *self = replacement;
+    }
+
+    pub fn retain_network_hashes(&mut self, hashes: impl IntoIterator<Item = SHAMapHash>) {
+        let hashes = hashes.into_iter().collect::<BTreeSet<_>>();
+        self.pending_network_by_hash
+            .retain(|hash, _| hashes.contains(hash));
+    }
+
+    /// Re-announce every retained local-read waiter after its actor-side
+    /// operation identities were invalidated (for example while a session is
+    /// dormant). The strong parent edges remain authoritative; only fresh I/O
+    /// operations are required. This is idempotent because the announcement
+    /// queue is a set keyed by the unique child hash.
+    pub fn rearm_pending_reads(&mut self) {
+        self.unannounced_reads
+            .extend(self.pending_by_hash.keys().copied());
+        if !self.unannounced_reads.is_empty() {
+            self.pending_edge_limit_reached = false;
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        !self.invalid
+            && self.stack.is_empty()
+            && self.pending_by_hash.is_empty()
+            && self.missing_hashes.is_empty()
+            && self.deferred_resumes.is_empty()
+            && self.unannounced_network.is_empty()
+    }
+
+    /// Distinguish retained CPU work from a plan waiting exclusively on a
+    /// broker result or a peer response. This is the actor scheduling boundary:
+    /// `pending_*` alone must not manufacture another worker turn.
+    pub fn has_runnable_frontier(&self) -> bool {
+        !self.invalid
+            && !self.pending_edge_limit_reached
+            && ((!self.stack.is_empty() && self.remaining > 0)
+                || !self.deferred_resumes.is_empty()
+                || !self.unannounced_reads.is_empty()
+                || !self.unannounced_network.is_empty())
+    }
+
+    pub fn pending_hashes(&self) -> usize {
+        self.pending_by_hash.len()
+    }
+
+    pub fn pending_edges(&self) -> usize {
+        self.pending_by_hash
+            .values()
+            .map(|pending| pending.edges.len())
+            .sum::<usize>()
+            + self
+                .pending_network_by_hash
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+    }
+
+    /// Fixed-size retained edge payload currently owned by this continuation.
+    /// This excludes allocator metadata but bounds every payload-bearing edge
+    /// and is paired with the independent item limit above.
+    pub fn pending_edge_bytes(&self) -> usize {
+        self.pending_edges()
+            .saturating_mul(std::mem::size_of::<PendingDeferredFetch>())
+    }
+
+    pub const fn bounds(&self) -> MissingNodeContinuationBounds {
+        self.bounds
+    }
+
+    pub const fn is_pending_edge_limited(&self) -> bool {
+        self.pending_edge_limit_reached
+    }
+
+    /// Current verified network frontier. This remains available after the
+    /// initial `NeedsNetwork` command so timeout recovery can retarget this
+    /// plan without rebuilding its traversal.
+    pub fn network_candidates(&self) -> Vec<(SHAMapNodeId, Uint256)> {
+        self.pending_network_by_hash
+            .iter()
+            .filter_map(|(hash, edges)| {
+                edges.first().map(|edge| {
+                    (
+                        edge.parent_id
+                            .get_child_node_id(edge.branch)
+                            .expect("retained pending edge must have a child id"),
+                        *hash.as_uint256(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Transfer candidates created by completed local misses without another
+    /// traversal advance. The actor uses this for deferred-read fallback.
+    pub fn take_unannounced_network(&mut self) -> Vec<(SHAMapNodeId, Uint256)> {
+        std::mem::take(&mut self.unannounced_network)
+    }
+
+    /// Return an outbound-overflow batch to the retained immediate frontier.
+    /// Hash deduplication preserves one continuation per pending node even
+    /// when timeout recovery and bounded serialization meet the same edge.
+    pub fn restore_unannounced_network(
+        &mut self,
+        candidates: impl IntoIterator<Item = (SHAMapNodeId, Uint256)>,
+    ) {
+        for candidate @ (_, hash) in candidates {
+            if !self
+                .unannounced_network
+                .iter()
+                .any(|(_, queued_hash)| *queued_hash == hash)
+            {
+                self.unannounced_network.push(candidate);
+            }
+        }
+    }
+
+    pub fn missing_nodes(&self) -> &[(SHAMapNodeId, Uint256)] {
+        &self.missing_nodes
+    }
+
+    pub fn stats(&self) -> DeferredMissingNodeScanStats {
+        self.stats
+    }
+
+    pub fn into_missing_nodes(self) -> Vec<(SHAMapNodeId, Uint256)> {
+        self.missing_nodes
+    }
+
+    /// Run a bounded CPU slice. `max_new_reads` bounds *distinct hashes*, not
+    /// parent edges. A resident lookup can attach data immediately, but any
+    /// nonresident child is returned as a broker request instead of being read
+    /// here.
+    pub fn advance<L, R>(
+        &mut self,
+        max_branch_steps: usize,
+        max_new_reads: usize,
+        resident: &mut L,
+        next_first_child: &mut R,
+    ) -> MissingNodeAdvance
+    where
+        L: MissingNodeResidentLookup,
+        R: FnMut() -> u8,
+    {
+        self.advance_with_budget(
+            max_branch_steps,
+            max_new_reads,
+            resident,
+            next_first_child,
+            &mut || false,
+        )
+    }
+
+    /// Advance until traversal reaches its natural read/result boundary or the
+    /// scheduler asks a contested acquisition to yield. This is the async
+    /// counterpart to rippled's retained `getMissingNodes()` pass: it does not
+    /// impose an actor-local branch quota, and may announce up to 512 unique
+    /// deferred reads before returning control to the broker.
+    pub fn advance_with_yield<L, R, Y>(
+        &mut self,
+        max_new_reads: usize,
+        resident: &mut L,
+        next_first_child: &mut R,
+        should_yield: &mut Y,
+    ) -> MissingNodeAdvance
+    where
+        L: MissingNodeResidentLookup,
+        R: FnMut() -> u8,
+        Y: FnMut() -> bool,
+    {
+        self.advance_with_budget(
+            usize::MAX,
+            max_new_reads,
+            resident,
+            next_first_child,
+            should_yield,
+        )
+    }
+
+    fn advance_with_budget<L, R, Y>(
+        &mut self,
+        max_branch_steps: usize,
+        max_new_reads: usize,
+        resident: &mut L,
+        next_first_child: &mut R,
+        should_yield: &mut Y,
+    ) -> MissingNodeAdvance
+    where
+        L: MissingNodeResidentLookup,
+        R: FnMut() -> u8,
+        Y: FnMut() -> bool,
+    {
+        if self.invalid {
+            return MissingNodeAdvance::Invalid;
+        }
+        if self.stack.is_empty() && !self.deferred_resumes.is_empty() {
+            activate_deferred_resumes(
+                &mut self.stack,
+                &mut self.deferred_resumes,
+                self.generation,
+                next_first_child,
+            );
+        }
+
+        let mut branch_steps = 0usize;
+        // This advance slice only adds retained edges. Keep an exact local
+        // count so edge admission never borrows all of `self` while `state`
+        // mutably borrows the current stack entry.
+        // The 512 source bound applies to deferred DB reads in one scan, not
+        // to the attachment table for previously requested network nodes.
+        let mut retained_pending_edges = self
+            .pending_by_hash
+            .values()
+            .map(|pending| pending.edges.len())
+            .sum::<usize>();
+        while let Some(state) = self.stack.last_mut() {
+            if branch_steps >= max_branch_steps || self.remaining <= 0 || should_yield() {
+                break;
+            }
+
+            if state.current_child >= BRANCH_FACTOR {
+                let full_below = state.full_below;
+                let completed = full_below.then(|| state.node.clone());
+                self.stack.pop();
+                if let Some(node) = completed {
+                    if self.backed {
+                        resident.mark_full_below(node, self.generation);
+                    } else {
+                        node.set_full_below_gen(self.generation);
+                    }
+                    self.stats.full_below_marked += 1;
+                }
+                if !full_below && let Some(parent) = self.stack.last_mut() {
+                    parent.full_below = false;
+                }
+                continue;
+            }
+
+            let branch = (state.first_child + state.current_child) % BRANCH_FACTOR;
+            state.current_child += 1;
+            branch_steps += 1;
+            self.stats.branch_steps += 1;
+            if state.node().is_empty_branch(branch) {
+                continue;
+            }
+            self.stats.branches_seen += 1;
+
+            let child_hash = state.node().get_child_hash(branch);
+            if self.missing_hashes.contains(&child_hash) {
+                state.full_below = false;
+                self.stats.duplicate_missing_hashes += 1;
+                continue;
+            }
+            if self.backed && resident.is_full_below(child_hash) {
+                self.stats.full_below_hits += 1;
+                continue;
+            }
+
+            let child_id = state
+                .node_id
+                .get_child_node_id(branch)
+                .expect("branch selection must stay within SHAMap depth bounds");
+            if self.pending_network_by_hash.contains_key(&child_hash) {
+                state.full_below = false;
+                let edge = PendingDeferredFetch {
+                    parent: state.node.clone(),
+                    parent_id: state.node_id,
+                    branch,
+                    hash: child_hash,
+                    ledger_seq: self.ledger_seq,
+                };
+                let edges = self
+                    .pending_network_by_hash
+                    .get_mut(&child_hash)
+                    .expect("checked pending network hash");
+                if !edges.iter().any(|current| {
+                    std::ptr::eq(&*current.parent, &*edge.parent)
+                        && current.branch == edge.branch
+                        && current.hash == edge.hash
+                }) {
+                    edges.push(edge);
+                }
+                let before = self.missing_nodes.len();
+                record_missing_child(
+                    &mut self.missing_hashes,
+                    &mut self.missing_nodes,
+                    &mut self.remaining,
+                    state.node_id,
+                    branch,
+                    child_hash,
+                );
+                if self.missing_nodes.len() != before {
+                    self.unannounced_network.push(
+                        *self
+                            .missing_nodes
+                            .last()
+                            .expect("recorded network candidate must exist"),
+                    );
+                }
+                continue;
+            }
+            if let Some(child) = state.node().get_child(branch) {
+                self.attach_or_descend(child, child_id, next_first_child);
+                continue;
+            }
+            if let Some(child) = resident.load_resident(child_hash, self.ledger_seq) {
+                if child.get_hash() != child_hash {
+                    self.invalid = true;
+                    return MissingNodeAdvance::Invalid;
+                }
+                let child = state.node().canonicalize_child(branch, child);
+                self.attach_or_descend(child, child_id, next_first_child);
+                continue;
+            }
+
+            state.full_below = false;
+            let is_new_hash = !self.pending_by_hash.contains_key(&child_hash);
+            let pending_hashes = self.pending_by_hash.len() + usize::from(is_new_hash);
+            let pending_edges = retained_pending_edges.saturating_add(1);
+            if !self.bounds.can_retain_edge(pending_hashes, pending_edges) {
+                // The branch cursor was advanced before this ownership check.
+                // Restore it so a later read/peer completion retries this
+                // exact child rather than silently skipping a verified edge.
+                state.current_child = state.current_child.saturating_sub(1);
+                self.pending_edge_limit_reached = true;
+                break;
+            }
+            let edge = PendingDeferredFetch {
+                parent: state.node.clone(),
+                parent_id: state.node_id,
+                branch,
+                hash: child_hash,
+                ledger_seq: self.ledger_seq,
+            };
+            let pending = self.pending_by_hash.entry(child_hash).or_insert_with(|| {
+                self.unannounced_reads.insert(child_hash);
+                self.stats.pending_reads += 1;
+                PendingReadEdges {
+                    need: ReadNeed {
+                        hash: child_hash,
+                        ledger_seq: self.ledger_seq,
+                        node_id: state.node_id,
+                        branch,
+                    },
+                    edges: Vec::new(),
+                }
+            });
+            let duplicate = pending.edges.iter().any(|current| {
+                std::ptr::eq(&*current.parent, &*edge.parent)
+                    && current.branch == edge.branch
+                    && current.hash == edge.hash
+            });
+            if !duplicate {
+                pending.edges.push(edge);
+                retained_pending_edges = pending_edges;
+            }
+            self.stats.max_pending_reads = self
+                .stats
+                .max_pending_reads
+                .max(self.pending_by_hash.len() as u64);
+        }
+
+        let reads = self.take_unannounced_reads(max_new_reads);
+        if !reads.is_empty() {
+            return MissingNodeAdvance::NeedsReads(reads);
+        }
+        let scan_finished = self.remaining <= 0
+            || (self.stack.is_empty()
+                && self.deferred_resumes.is_empty()
+                && self.unannounced_reads.is_empty());
+        if self.pending_by_hash.is_empty() && scan_finished && !self.unannounced_network.is_empty()
+        {
+            return MissingNodeAdvance::NeedsNetwork(std::mem::take(&mut self.unannounced_network));
+        }
+        if self.invalid {
+            MissingNodeAdvance::Invalid
+        } else if self.is_complete() {
+            MissingNodeAdvance::Complete
+        } else {
+            MissingNodeAdvance::Ready
+        }
+    }
+
+    /// Apply one individual broker result. This is deliberately independent of
+    /// broker callback timing and therefore safe to invoke only from the actor
+    /// that owns the target tree.
+    pub fn apply_read_result(
+        &mut self,
+        plan_id: MissingNodePlanId,
+        hash: SHAMapHash,
+        outcome: MissingNodeReadOutcome,
+    ) -> MissingNodeReadApply {
+        if plan_id != self.plan_id {
+            return MissingNodeReadApply::StalePlan;
+        }
+        let Some(pending) = self.pending_by_hash.remove(&hash) else {
+            return MissingNodeReadApply::UnknownRead;
+        };
+        self.pending_edge_limit_reached = false;
+        self.unannounced_reads.remove(&hash);
+
+        match outcome {
+            MissingNodeReadOutcome::Rejected => {
+                self.pending_by_hash.insert(hash, pending);
+                self.unannounced_reads.insert(hash);
+                self.stats.requeued_rejected_reads += 1;
+                MissingNodeReadApply::Requeued
+            }
+            MissingNodeReadOutcome::Cancelled => {
+                self.pending_by_hash.insert(hash, pending);
+                // The actor-side operation that owned this read is terminal.
+                // Keeping its waiter without re-announcing it leaves the
+                // continuation permanently Ready-without-work: no broker
+                // ticket exists that can ever release the retained edge.
+                // Re-arm the unique hash exactly like rejected admission so a
+                // still-active acquisition can mint a fresh operation. Session
+                // cancellation remains safe because the owner drops the plan.
+                self.unannounced_reads.insert(hash);
+                self.stats.requeued_cancelled_reads += 1;
+                MissingNodeReadApply::Requeued
+            }
+            MissingNodeReadOutcome::Found(node) => {
+                if node.get_hash() != hash {
+                    self.invalid = true;
+                    return MissingNodeReadApply::HashMismatch;
+                }
+                let mut resumes = BTreeMap::new();
+                let mut attached_edges = 0;
+                for edge in pending.edges {
+                    edge.parent.canonicalize_child(edge.branch, node.clone());
+                    attached_edges += 1;
+                    resumes
+                        .entry(&*edge.parent as *const SHAMapTreeNode as usize)
+                        .or_insert(DeferredResume {
+                            node: edge.parent,
+                            node_id: edge.parent_id,
+                        });
+                }
+                self.stats.completed_pending_reads += 1;
+                self.stats.deferred_resumes += resumes.len() as u64;
+                self.deferred_resumes.extend(resumes);
+                MissingNodeReadApply::Applied {
+                    attached_edges,
+                    missing_edges: 0,
+                }
+            }
+            MissingNodeReadOutcome::Miss => {
+                let mut missing_edges = 0;
+                let mut candidate_recorded = false;
+                for edge in pending.edges {
+                    if edge.parent.get_child(edge.branch).is_some() {
+                        continue;
+                    }
+                    let parent_id = edge.parent_id;
+                    let branch = edge.branch;
+                    self.pending_network_by_hash
+                        .entry(hash)
+                        .or_default()
+                        .push(edge);
+                    if !candidate_recorded {
+                        let before = self.missing_nodes.len();
+                        record_missing_child(
+                            &mut self.missing_hashes,
+                            &mut self.missing_nodes,
+                            &mut self.remaining,
+                            parent_id,
+                            branch,
+                            hash,
+                        );
+                        if self.missing_nodes.len() != before {
+                            self.unannounced_network
+                                .push(*self.missing_nodes.last().expect(
+                                "recorded missing child must be available for network admission",
+                            ));
+                            missing_edges = 1;
+                            self.stats.missing_recorded += 1;
+                        }
+                        candidate_recorded = true;
+                    }
+                }
+                self.stats.completed_pending_misses += 1;
+                MissingNodeReadApply::Applied {
+                    attached_edges: 0,
+                    missing_edges,
+                }
+            }
+        }
+    }
+
+    /// Attach a peer-supplied, hash-validated node to every retained network
+    /// edge. The actor calls this only after packet parsing and SHAMap position
+    /// validation have accepted the node; it does no I/O and resumes parents
+    /// incrementally instead of restarting the plan.
+    pub fn apply_network_node(
+        &mut self,
+        plan_id: MissingNodePlanId,
+        hash: SHAMapHash,
+        node: SharedIntrusive<SHAMapTreeNode>,
+    ) -> MissingNodeReadApply {
+        if plan_id != self.plan_id {
+            return MissingNodeReadApply::StalePlan;
+        }
+        if node.get_hash() != hash {
+            self.invalid = true;
+            return MissingNodeReadApply::HashMismatch;
+        }
+        let Some(edges) = self.pending_network_by_hash.remove(&hash) else {
+            return MissingNodeReadApply::UnknownRead;
+        };
+        self.pending_edge_limit_reached = false;
+        self.missing_hashes.remove(&hash);
+        self.missing_nodes
+            .retain(|(_, candidate)| candidate != hash.as_uint256());
+        self.remaining = self.remaining.saturating_add(1).min(self.max_missing);
+        let mut resumes = BTreeMap::new();
+        let mut attached_edges = 0;
+        for edge in edges {
+            edge.parent.canonicalize_child(edge.branch, node.clone());
+            attached_edges += 1;
+            resumes
+                .entry(&*edge.parent as *const SHAMapTreeNode as usize)
+                .or_insert(DeferredResume {
+                    node: edge.parent,
+                    node_id: edge.parent_id,
+                });
+        }
+        self.stats.deferred_resumes += resumes.len() as u64;
+        self.deferred_resumes.extend(resumes);
+        MissingNodeReadApply::Applied {
+            attached_edges,
+            missing_edges: 0,
+        }
+    }
+
+    /// Apply a peer node by its advertised SHAMap position.
+    ///
+    /// Unlike a recovery read, a `TMLedgerData` reply may contain the requested
+    /// node followed by fat descendants which have not yet appeared in this
+    /// continuation's missing-hash table. rippled routes every such entry
+    /// through `SHAMap::addKnownNode(nodeID, ...)`, so walk the already-owned
+    /// graph and attach the first absent child at that exact position. This
+    /// also validates that a requested hash is not attached under a forged
+    /// packet node id.
+    pub fn apply_known_network_node(
+        &mut self,
+        plan_id: MissingNodePlanId,
+        node_id: SHAMapNodeId,
+        hash: SHAMapHash,
+        node: SharedIntrusive<SHAMapTreeNode>,
+    ) -> MissingNodeReadApply {
+        if plan_id != self.plan_id {
+            return MissingNodeReadApply::StalePlan;
+        }
+        if node.get_hash() != hash || node_id.is_root() {
+            self.invalid = node.get_hash() != hash;
+            return MissingNodeReadApply::HashMismatch;
+        }
+
+        let mut current = self.root.clone();
+        let mut current_id = SHAMapNodeId::default();
+        while current_id.get_depth() < node_id.get_depth() {
+            if !current.is_inner() {
+                return MissingNodeReadApply::HashMismatch;
+            }
+            let branch = crate::node_id::select_branch(current_id, node_id.get_node_id());
+            if current.is_empty_branch(branch) {
+                return MissingNodeReadApply::HashMismatch;
+            }
+            let child_id = current_id
+                .get_child_node_id(branch)
+                .expect("peer node position must stay within SHAMap bounds");
+            let child_hash = current.get_child_hash(branch);
+
+            if child_id == node_id {
+                if child_hash != hash {
+                    return MissingNodeReadApply::HashMismatch;
+                }
+                // Exact waiters may include several canonical parents sharing
+                // the same hash. Preserve the existing all-edge attachment.
+                if self.pending_network_by_hash.contains_key(&hash) {
+                    return self.apply_network_node(plan_id, hash, node);
+                }
+                if let Some(existing) = current.get_child(branch) {
+                    return if existing.get_hash() == hash {
+                        MissingNodeReadApply::Applied {
+                            attached_edges: 0,
+                            missing_edges: 0,
+                        }
+                    } else {
+                        MissingNodeReadApply::HashMismatch
+                    };
+                }
+
+                current.canonicalize_child(branch, node);
+                self.deferred_resumes.insert(
+                    &*current as *const SHAMapTreeNode as usize,
+                    DeferredResume {
+                        node: current,
+                        node_id: current_id,
+                    },
+                );
+                self.stats.deferred_resumes += 1;
+                return MissingNodeReadApply::Applied {
+                    attached_edges: 1,
+                    missing_edges: 0,
+                };
+            }
+
+            let Some(child) = current.get_child(branch) else {
+                // Same as rippled's `unable to hook node`: an out-of-order fat
+                // descendant is useful packet data but cannot yet mutate this
+                // graph. A later reply scan can accept it from the shared map.
+                return MissingNodeReadApply::UnknownRead;
+            };
+            current = child;
+            current_id = child_id;
+        }
+        MissingNodeReadApply::UnknownRead
+    }
+
+    /// Re-advertise an extant verified candidate after timeout policy decides
+    /// to retry it. No traversal state or plan identity changes.
+    pub fn retry_network_candidate(&mut self, hash: SHAMapHash) -> bool {
+        let Some(edge) = self
+            .pending_network_by_hash
+            .get(&hash)
+            .and_then(|edges| edges.first())
+        else {
+            return false;
+        };
+        let node_id = edge
+            .parent_id
+            .get_child_node_id(edge.branch)
+            .expect("retained pending edge must have a child id");
+        self.unannounced_network.push((node_id, *hash.as_uint256()));
+        true
+    }
+
+    /// Transfer a bounded FIFO batch of already-discovered local-read needs
+    /// without advancing the traversal. The acquisition actor uses this when
+    /// a previous bounded scan found more hashes than its completion mailbox
+    /// could admit, avoiding a zero-branch scan merely to extract the next
+    /// batch.
+    pub fn take_unannounced_reads(&mut self, max_new_reads: usize) -> Vec<ReadNeed> {
+        if max_new_reads == 0 {
+            return Vec::new();
+        }
+        let hashes = self
+            .unannounced_reads
+            .iter()
+            .copied()
+            .take(max_new_reads)
+            .collect::<Vec<_>>();
+        for hash in &hashes {
+            self.unannounced_reads.remove(hash);
+        }
+        hashes
+            .into_iter()
+            .filter_map(|hash| {
+                self.pending_by_hash
+                    .get(&hash)
+                    .map(|pending| pending.need.clone())
+            })
+            .collect()
+    }
+
+    fn attach_or_descend<R>(
+        &mut self,
+        child: SharedIntrusive<SHAMapTreeNode>,
+        child_id: SHAMapNodeId,
+        next_first_child: &mut R,
+    ) where
+        R: FnMut() -> u8,
+    {
+        self.stats.loaded_or_cached_children += 1;
+        if child.is_inner() {
+            self.stats.inner_children += 1;
+            if child.is_full_below(self.generation) {
+                self.stats.full_below_inner_children += 1;
+            } else {
+                push_scan_state(&mut self.stack, child, child_id, next_first_child);
+            }
+        } else {
+            self.stats.leaf_children += 1;
+        }
+    }
+}
+
 fn push_scan_state<R>(
     stack: &mut Vec<MissingNodeScanState>,
     node: SharedIntrusive<SHAMapTreeNode>,
-    node_id: SHAMapNodeId,
-    next_first_child: &mut R,
-) where
-    R: FnMut() -> u8,
-{
-    let ptr: *const SHAMapTreeNode = &*node;
-    stack.push(MissingNodeScanState {
-        node: ptr,
-        node_id,
-        first_child: next_first_child() as usize,
-        current_child: 0,
-        full_below: true,
-    });
-}
-
-fn push_scan_state_raw<R>(
-    stack: &mut Vec<MissingNodeScanState>,
-    node: *const SHAMapTreeNode,
     node_id: SHAMapNodeId,
     next_first_child: &mut R,
 ) where
@@ -2625,7 +3828,7 @@ fn process_deferred_sync_reads(
     let mut resumes = BTreeMap::<usize, DeferredResume>::new();
 
     for deferred in deferred_reads {
-        let parent = unsafe { &*deferred.parent };
+        let parent = &*deferred.parent;
         assert!(
             parent.is_inner(),
             "process_deferred_sync_reads requires inner parent nodes"
@@ -2635,7 +3838,7 @@ fn process_deferred_sync_reads(
         if let Some(node) = deferred.node {
             parent.canonicalize_child(deferred.branch, node);
             stats.completed_pending_reads += 1;
-            let parent_key = deferred.parent as usize;
+            let parent_key = parent as *const SHAMapTreeNode as usize;
             resumes.insert(
                 parent_key,
                 DeferredResume {
@@ -2672,8 +3875,8 @@ fn enqueue_deferred_resumes<R>(
     R: FnMut() -> u8,
 {
     for resume in resumes {
-        if !unsafe { &*resume.node }.is_full_below(generation) {
-            push_scan_state_raw(stack, resume.node, resume.node_id, next_first_child);
+        if !resume.node.is_full_below(generation) {
+            push_scan_state(stack, resume.node, resume.node_id, next_first_child);
         }
     }
 }
@@ -3514,13 +4717,14 @@ fn clone_sync_subtree_as_shareable(
 #[cfg(test)]
 mod tests {
     use super::{
-        DeferredSyncRead, MissingNodeRef, SHAMapAddNode, SHAMapMissingNode, SHAMapSyncFilter,
-        SHAMapType, SyncState, SyncTree, enqueue_deferred_resumes, get_missing_nodes, get_node_fat,
-        process_deferred_sync_reads, walk_map, walk_map_parallel,
+        DeferredMissingNodeScan, DeferredSyncRead, MissingNodeRef, SHAMapAddNode,
+        SHAMapMissingNode, SHAMapSyncFilter, SHAMapType, SyncState, SyncTree,
+        enqueue_deferred_resumes, get_missing_nodes, get_node_fat, process_deferred_sync_reads,
+        walk_map, walk_map_parallel,
     };
     use crate::family::{
         FullBelowCache, MissingNodeReporter, NullFullBelowCache, NullMissingNodeReporter,
-        NullNodeFetcher, SHAMapFamily,
+        NullNodeFetcher, SHAMapFamily, SHAMapNodeFetcher,
     };
     use crate::item::SHAMapItem;
     use crate::node_id::SHAMapNodeId;
@@ -3534,6 +4738,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use time::Duration;
 
     fn sample_uint256(fill: u8) -> Uint256 {
@@ -3623,6 +4828,28 @@ mod tests {
         }
 
         fn missing_node_acquire_by_hash(&self, _ref_hash: Uint256, _ref_num: u32) {}
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingMissingNodeFetcher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingMissingNodeFetcher {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl SHAMapNodeFetcher for CountingMissingNodeFetcher {
+        fn fetch_node_object(
+            &self,
+            _hash: SHAMapHash,
+            _ledger_seq: u32,
+        ) -> Option<crate::node_object::NodeObject> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
 
     #[test]
@@ -4102,6 +5329,42 @@ mod tests {
     }
 
     #[test]
+    fn backed_deferred_scan_probes_node_store_once_per_unresolved_child() {
+        let child_hash = sample_hash(0x6C);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(3, child_hash);
+        root.update_hash();
+
+        let fetcher = CountingMissingNodeFetcher::default();
+        let family = SHAMapFamily::new(
+            Arc::new(TreeNodeCache::new(
+                "family-single-deferred-probe",
+                8,
+                Duration::seconds(1),
+                ManualClock::new(0),
+            )),
+            NullFullBelowCache::new(24),
+            fetcher.clone(),
+            NullMissingNodeReporter,
+        );
+        let mut tree = SyncTree::from_root(root, true, 55, SyncState::Synching);
+        let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
+
+        let missing = tree.get_missing_nodes_with_family(8, &mut no_filter, &family, &mut || 0);
+
+        assert_eq!(
+            missing,
+            vec![(
+                SHAMapNodeId::default()
+                    .get_child_node_id(3)
+                    .expect("child node id should exist"),
+                *child_hash.as_uint256(),
+            )]
+        );
+        assert_eq!(fetcher.calls(), 1);
+    }
+
+    #[test]
     fn add_known_node_prefers_backed_fetch_before_filter_descend() {
         let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
@@ -4523,13 +5786,13 @@ mod tests {
         let resumes = process_deferred_sync_reads(
             [
                 DeferredSyncRead {
-                    parent: &*parent as *const SHAMapTreeNode,
+                    parent: parent.clone(),
                     parent_id: SHAMapNodeId::default(),
                     branch: 1,
                     node: Some(left_child.clone()),
                 },
                 DeferredSyncRead {
-                    parent: &*parent as *const SHAMapTreeNode,
+                    parent: parent.clone(),
                     parent_id: SHAMapNodeId::default(),
                     branch: 2,
                     node: Some(right_child.clone()),
@@ -4553,7 +5816,7 @@ mod tests {
             .values()
             .next()
             .expect("one deferred resume should be recorded");
-        assert!(std::ptr::eq(unsafe { &*resume.node }, &*parent));
+        assert!(std::ptr::eq(&*resume.node, &*parent));
         assert_eq!(resume.node_id, SHAMapNodeId::default());
     }
 
@@ -4571,13 +5834,13 @@ mod tests {
         let resumes = process_deferred_sync_reads(
             [
                 DeferredSyncRead {
-                    parent: &*parent as *const SHAMapTreeNode,
+                    parent: parent.clone(),
                     parent_id: SHAMapNodeId::default(),
                     branch: 3,
                     node: None,
                 },
                 DeferredSyncRead {
-                    parent: &*parent as *const SHAMapTreeNode,
+                    parent: parent.clone(),
                     parent_id: SHAMapNodeId::default(),
                     branch: 4,
                     node: None,
@@ -4616,11 +5879,11 @@ mod tests {
             &mut stack,
             vec![
                 super::DeferredResume {
-                    node: &*queued_parent as *const SHAMapTreeNode,
+                    node: queued_parent.clone(),
                     node_id: SHAMapNodeId::default(),
                 },
                 super::DeferredResume {
-                    node: &*skipped_parent as *const SHAMapTreeNode,
+                    node: skipped_parent.clone(),
                     node_id: SHAMapNodeId::default()
                         .get_child_node_id(1)
                         .expect("child id should exist"),
@@ -4635,11 +5898,73 @@ mod tests {
         );
 
         assert_eq!(stack.len(), 1);
-        assert!(std::ptr::eq(unsafe { &*stack[0].node }, &*queued_parent));
+        assert!(std::ptr::eq(&*stack[0].node, &*queued_parent));
         assert_eq!(stack[0].node_id, SHAMapNodeId::default());
         assert_eq!(stack[0].first_child, 5);
         assert_eq!(stack[0].current_child, 0);
         assert!(stack[0].full_below);
+    }
+
+    #[test]
+    fn deferred_missing_node_scan_keeps_nested_parent_alive_across_eviction() {
+        let missing_leaf_hash = sample_hash(0x73);
+        let fetched_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(sample_uint256(0x73), vec![3; 12]),
+            0,
+            missing_leaf_hash,
+        ));
+        let nested = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        nested.set_child_hash(7, missing_leaf_hash);
+        nested.update_hash();
+
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(3, nested.get_hash());
+        root.share_child(3, &nested);
+        root.update_hash_deep();
+
+        let family = SHAMapFamily::new(
+            Arc::new(TreeNodeCache::new(
+                "deferred-scan-eviction",
+                8,
+                Duration::seconds(1),
+                ManualClock::new(0),
+            )),
+            NullFullBelowCache::new(13),
+            NullNodeFetcher,
+            NullMissingNodeReporter,
+        );
+        let full_below = NullFullBelowCache::new(13);
+        let mut scan = DeferredMissingNodeScan::new(&root, 8, true, 55, &full_below, &mut || 0);
+        let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
+        let mut requests = Vec::new();
+
+        scan.run_with_family(
+            &family,
+            &mut no_filter,
+            8,
+            &mut || 0,
+            &mut |hash, ledger_seq| requests.push((hash, ledger_seq)),
+        );
+        assert_eq!(requests, vec![(missing_leaf_hash, 55)]);
+
+        // The active scan and its deferred fetch retain `nested`. After this
+        // release and drop, the root no longer owns that node at branch 3.
+        root.release_loaded_children();
+        drop(nested);
+        assert!(root.get_child(3).is_none());
+
+        scan.complete_pending_reads(vec![Some(fetched_leaf)]);
+        scan.run_with_family(
+            &family,
+            &mut no_filter,
+            8,
+            &mut || 0,
+            &mut |hash, ledger_seq| requests.push((hash, ledger_seq)),
+        );
+
+        assert!(scan.is_complete());
+        assert!(scan.missing_nodes().is_empty());
     }
 
     #[test]
@@ -4747,17 +6072,18 @@ mod tests {
             missing_hashes: BTreeSet::new(),
             missing_nodes: Vec::new(),
             stack: vec![super::MissingNodeScanState {
-                node: &*active_parent as *const SHAMapTreeNode,
+                node: active_parent.clone(),
                 node_id: SHAMapNodeId::default(),
                 first_child: 0,
                 current_child: 0,
                 full_below: true,
             }],
             pending_reads: Vec::new(),
+            pending_hashes: BTreeSet::new(),
             deferred_resumes: BTreeMap::from([(
                 (&*resumed_parent as *const SHAMapTreeNode) as usize,
                 super::DeferredResume {
-                    node: &*resumed_parent as *const SHAMapTreeNode,
+                    node: resumed_parent.clone(),
                     node_id: SHAMapNodeId::default()
                         .get_child_node_id(2)
                         .expect("child id should exist"),
@@ -4833,6 +6159,94 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(child_hash, 90)]
         );
+    }
+
+    #[test]
+    fn advance_deferred_missing_node_scan_with_family_drains_bounded_batches_in_one_call() {
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        for branch in 0..3 {
+            root.set_child_hash(branch, sample_hash(0x80 + branch as u8));
+        }
+        root.update_hash();
+
+        let fetcher = CountingMissingNodeFetcher::default();
+        let family = SHAMapFamily::new(
+            Arc::new(TreeNodeCache::new(
+                "advance-deferred-scan-batches",
+                8,
+                Duration::seconds(1),
+                ManualClock::new(0),
+            )),
+            NullFullBelowCache::new(16),
+            fetcher.clone(),
+            NullMissingNodeReporter,
+        );
+        let mut tree = SyncTree::from_root(root, true, 90, SyncState::Synching);
+        let mut scan = tree.start_deferred_missing_node_scan_with_family(8, &family, &mut || 0);
+        let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
+
+        assert!(tree.advance_deferred_missing_node_scan_with_family(
+            &mut scan,
+            &mut no_filter,
+            &family,
+            1,
+            usize::MAX,
+            &mut || 0,
+        ));
+        assert!(scan.is_complete());
+        assert!(scan.pending_requests().is_empty());
+        assert_eq!(scan.missing_nodes().len(), 3);
+        assert_eq!(scan.progress().deferred_reads, 3);
+        assert_eq!(fetcher.calls(), 3);
+    }
+
+    #[test]
+    fn deferred_missing_node_scan_bounded_read_limit_is_eight_and_legacy_keeps_extra_read() {
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        for branch in 0..9 {
+            root.set_child_hash(branch, sample_hash((0x80 + branch) as u8));
+        }
+        root.update_hash();
+
+        let tree = SyncTree::from_root(root, true, 90, SyncState::Synching);
+        let family = SHAMapFamily::new(
+            Arc::new(TreeNodeCache::new(
+                "deferred-eight-read-limit",
+                8,
+                Duration::seconds(1),
+                ManualClock::new(0),
+            )),
+            NullFullBelowCache::new(16),
+            NullNodeFetcher,
+            NullMissingNodeReporter,
+        );
+        let full_below = NullFullBelowCache::new(16);
+        let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
+
+        let mut bounded = tree.start_deferred_missing_node_scan(32, &full_below, &mut || 0);
+        let mut bounded_requests = Vec::new();
+        bounded.run_with_family_bounded(
+            &family,
+            &mut no_filter,
+            8,
+            usize::MAX,
+            &mut || 0,
+            &mut |hash, ledger_seq| bounded_requests.push((hash, ledger_seq)),
+        );
+        assert_eq!(bounded_requests.len(), 8);
+        assert_eq!(bounded.pending_requests().len(), 8);
+
+        let mut legacy = tree.start_deferred_missing_node_scan(32, &full_below, &mut || 0);
+        let mut legacy_requests = Vec::new();
+        legacy.run_with_family(
+            &family,
+            &mut no_filter,
+            8,
+            &mut || 0,
+            &mut |hash, ledger_seq| legacy_requests.push((hash, ledger_seq)),
+        );
+        assert_eq!(legacy_requests.len(), 9);
+        assert_eq!(legacy.pending_requests().len(), 9);
     }
 
     #[test]
@@ -5043,5 +6457,904 @@ mod tests {
 
         assert!(!found);
         assert!(data.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod native_missing_node_continuation_tests {
+    use super::*;
+
+    struct EmptyResident;
+
+    impl MissingNodeResidentLookup for EmptyResident {
+        fn load_resident(
+            &mut self,
+            _hash: SHAMapHash,
+            _ledger_seq: u32,
+        ) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            None
+        }
+    }
+
+    fn hash(fill: u8) -> SHAMapHash {
+        SHAMapHash::new(Uint256::from_array([fill; 32]))
+    }
+
+    fn continuation(root: &SharedIntrusive<SHAMapTreeNode>, plan: u64) -> MissingNodeContinuation {
+        MissingNodeContinuation::new(
+            MissingNodePlanId::new(plan),
+            root,
+            16,
+            true,
+            77,
+            9,
+            &mut || 0,
+        )
+    }
+
+    #[test]
+    fn duplicate_edges_emit_one_read_and_one_network_candidate() {
+        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            crate::tree_node::SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0x12; 32]), vec![0x12; 12]),
+            1,
+        ));
+        let child_hash = child.get_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(1, child_hash);
+        root.set_child_hash(2, child_hash);
+        root.update_hash();
+        let mut continuation = continuation(&root, 1);
+        let mut resident = EmptyResident;
+
+        let MissingNodeAdvance::NeedsReads(needs) =
+            continuation.advance(32, 4, &mut resident, &mut || 0)
+        else {
+            panic!("expected one unique read need");
+        };
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].hash(), child_hash);
+        assert_eq!(continuation.pending_hashes(), 1);
+        assert_eq!(continuation.pending_edges(), 2);
+        assert_eq!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(1),
+                child_hash,
+                MissingNodeReadOutcome::Miss,
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 0,
+                missing_edges: 1,
+            }
+        );
+        let MissingNodeAdvance::NeedsNetwork(missing) =
+            continuation.advance(32, 4, &mut resident, &mut || 0)
+        else {
+            panic!("expected one deduplicated network candidate");
+        };
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].1, *child_hash.as_uint256());
+        assert_eq!(
+            continuation.apply_network_node(MissingNodePlanId::new(1), child_hash, child),
+            MissingNodeReadApply::Applied {
+                attached_edges: 2,
+                missing_edges: 0,
+            }
+        );
+        assert!(matches!(
+            continuation.advance(32, 4, &mut resident, &mut || 0),
+            MissingNodeAdvance::Complete
+        ));
+    }
+
+    #[test]
+    fn fat_reply_descendant_attaches_by_node_id_before_it_is_requested() {
+        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            crate::tree_node::SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0x12; 32]), vec![0x44; 12]),
+            1,
+        ));
+        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        parent.set_child_hash(2, leaf.get_hash());
+        parent.update_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(1, parent.get_hash());
+        root.update_hash();
+
+        let parent_id = SHAMapNodeId::default()
+            .get_child_node_id(1)
+            .expect("depth-one id");
+        let leaf_id = parent_id.get_child_node_id(2).expect("depth-two id");
+        let mut continuation = continuation(&root, 1);
+
+        // A fat reply is ordered parent-first. The descendant has never been
+        // emitted by this continuation, but rippled's addKnownNode accepts it
+        // by position once its parent is attached.
+        assert_eq!(
+            continuation.apply_known_network_node(
+                MissingNodePlanId::new(1),
+                parent_id,
+                parent.get_hash(),
+                parent.clone(),
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 1,
+                missing_edges: 0,
+            }
+        );
+        assert_eq!(
+            continuation.apply_known_network_node(
+                MissingNodePlanId::new(1),
+                leaf_id,
+                leaf.get_hash(),
+                leaf.clone(),
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 1,
+                missing_edges: 0,
+            }
+        );
+        let attached_parent = root.get_child(1).expect("fat parent attached");
+        assert_eq!(attached_parent.get_hash(), parent.get_hash());
+        assert_eq!(
+            attached_parent
+                .get_child(2)
+                .expect("fat descendant attached")
+                .get_hash(),
+            leaf.get_hash()
+        );
+    }
+
+    #[test]
+    fn peer_node_id_cannot_redirect_a_requested_hash() {
+        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            crate::tree_node::SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0x10; 32]), vec![0x55; 12]),
+            1,
+        ));
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(1, child.get_hash());
+        root.update_hash();
+        let mut continuation = continuation(&root, 1);
+        let forged_id = SHAMapNodeId::default()
+            .get_child_node_id(2)
+            .expect("depth-one id");
+
+        assert_eq!(
+            continuation.apply_known_network_node(
+                MissingNodePlanId::new(1),
+                forged_id,
+                child.get_hash(),
+                child,
+            ),
+            MissingNodeReadApply::HashMismatch
+        );
+        assert!(root.get_child(1).is_none());
+    }
+
+    #[test]
+    fn reply_wire_batch_waits_until_deferred_reads_settle() {
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, hash(0x2f));
+        root.update_hash();
+        let mut continuation = continuation(&root, 32);
+        continuation.stack.clear();
+        let pending_hash = hash(0x30);
+        continuation.pending_by_hash.insert(
+            pending_hash,
+            PendingReadEdges {
+                need: ReadNeed {
+                    hash: pending_hash,
+                    ledger_seq: 77,
+                    node_id: SHAMapNodeId::default(),
+                    branch: 0,
+                },
+                edges: Vec::new(),
+            },
+        );
+        continuation
+            .unannounced_network
+            .extend((0..DEFAULT_NETWORK_FRONTIER_BATCH - 1).map(|index| {
+                (
+                    SHAMapNodeId::default(),
+                    Uint256::from(u64::try_from(index + 1).expect("batch index fits u64")),
+                )
+            }));
+        let mut resident = EmptyResident;
+        assert!(matches!(
+            continuation.advance(0, 0, &mut resident, &mut || 0),
+            MissingNodeAdvance::Ready
+        ));
+
+        continuation.unannounced_network.push((
+            SHAMapNodeId::default(),
+            Uint256::from(DEFAULT_NETWORK_FRONTIER_BATCH as u64),
+        ));
+        assert!(matches!(
+            continuation.advance(0, 0, &mut resident, &mut || 0),
+            MissingNodeAdvance::Ready
+        ));
+        continuation.pending_by_hash.clear();
+        let MissingNodeAdvance::NeedsNetwork(batch) =
+            continuation.advance(0, 0, &mut resident, &mut || 0)
+        else {
+            panic!("expected a full reply wire batch");
+        };
+        assert_eq!(batch.len(), DEFAULT_NETWORK_FRONTIER_BATCH);
+        assert_eq!(continuation.pending_hashes(), 0);
+    }
+
+    #[test]
+    fn reply_scan_refreshes_exhausted_discovery_credit_and_root_walk() {
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, hash(0x3f));
+        root.update_hash();
+        let mut continuation = continuation(&root, 256);
+        let scan_budget = continuation.max_missing;
+        continuation.remaining = 0;
+        continuation.pending_network_by_hash.insert(
+            hash(0x40),
+            vec![PendingDeferredFetch {
+                parent: root.clone(),
+                parent_id: SHAMapNodeId::default(),
+                branch: 0,
+                hash: hash(0x40),
+                ledger_seq: 77,
+            }],
+        );
+
+        continuation.begin_reply_scan(&mut || 7);
+
+        assert_eq!(continuation.remaining, scan_budget);
+        assert_eq!(continuation.stack.len(), 1);
+        assert_eq!(continuation.pending_network_by_hash.len(), 1);
+        assert!(continuation.has_runnable_frontier());
+    }
+
+    #[test]
+    fn rejected_and_cancelled_reads_rearm_the_unique_waiter_with_diagnostics() {
+        let child_hash = hash(0x45);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, child_hash);
+        root.update_hash();
+        let mut continuation = continuation(&root, 45);
+        let mut resident = EmptyResident;
+
+        let MissingNodeAdvance::NeedsReads(first) =
+            continuation.advance(32, 4, &mut resident, &mut || 0)
+        else {
+            panic!("expected the initial broker read");
+        };
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(45),
+                child_hash,
+                MissingNodeReadOutcome::Rejected,
+            ),
+            MissingNodeReadApply::Requeued
+        );
+        assert_eq!(continuation.take_unannounced_reads(4).len(), 1);
+        assert_eq!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(45),
+                child_hash,
+                MissingNodeReadOutcome::Cancelled,
+            ),
+            MissingNodeReadApply::Requeued
+        );
+        assert!(
+            continuation.has_runnable_frontier(),
+            "a cancelled external operation must leave work that can mint a replacement"
+        );
+        assert_eq!(continuation.pending_hashes(), 1);
+        assert_eq!(continuation.pending_edges(), 1);
+        let replacement = continuation.take_unannounced_reads(4);
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].hash(), child_hash);
+        assert_eq!(continuation.stats().requeued_rejected_reads, 1);
+        assert_eq!(continuation.stats().requeued_cancelled_reads, 1);
+    }
+
+    #[test]
+    fn dormant_operation_reset_rearms_retained_read_edge_idempotently() {
+        let child_hash = hash(0x47);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, child_hash);
+        root.update_hash();
+        let mut continuation = continuation(&root, 47);
+        let mut resident = EmptyResident;
+
+        let MissingNodeAdvance::NeedsReads(first) =
+            continuation.advance(32, 4, &mut resident, &mut || 0)
+        else {
+            panic!("expected the initial broker operation");
+        };
+        assert_eq!(first.len(), 1);
+        assert_eq!(continuation.pending_edges(), 1);
+        assert!(
+            !continuation.has_runnable_frontier(),
+            "the dispatched waiter normally waits on its exact actor operation"
+        );
+
+        continuation.rearm_pending_reads();
+        continuation.rearm_pending_reads();
+        assert!(continuation.has_runnable_frontier());
+        let replacement = continuation.take_unannounced_reads(4);
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].hash(), child_hash);
+        assert_eq!(continuation.pending_edges(), 1);
+    }
+
+    #[test]
+    fn reply_scan_reuses_network_waiter_without_repeating_db_read_or_edge() {
+        let child_hash = hash(0x46);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, child_hash);
+        root.update_hash();
+        let mut continuation = continuation(&root, 46);
+        let mut resident = EmptyResident;
+
+        let MissingNodeAdvance::NeedsReads(reads) =
+            continuation.advance(32, 4, &mut resident, &mut || 0)
+        else {
+            panic!("expected the initial broker read");
+        };
+        assert_eq!(reads.len(), 1);
+        assert!(matches!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(46),
+                child_hash,
+                MissingNodeReadOutcome::Miss,
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 0,
+                missing_edges: 1
+            }
+        ));
+        assert!(matches!(
+            continuation.advance(32, 4, &mut resident, &mut || 0),
+            MissingNodeAdvance::NeedsNetwork(_)
+        ));
+        assert_eq!(continuation.pending_edges(), 1);
+
+        continuation.begin_reply_scan(&mut || 0);
+        let next = continuation.advance(32, 4, &mut resident, &mut || 0);
+        let MissingNodeAdvance::NeedsNetwork(nodes) = next else {
+            panic!("an extant peer waiter must be re-advertised without another DB read: {next:?}");
+        };
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].1, *child_hash.as_uint256());
+        assert_eq!(continuation.pending_hashes(), 0);
+        assert_eq!(continuation.pending_edges(), 1);
+    }
+
+    #[test]
+    fn exhausted_missing_budget_waits_for_admitted_read_without_spinning() {
+        let missing_hash = hash(0x41);
+        let loaded_child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        loaded_child.set_child_hash(0, hash(0x43));
+        loaded_child.update_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, missing_hash);
+        root.set_child_hash(1, loaded_child.get_hash());
+        root.canonicalize_child(1, loaded_child);
+        root.update_hash();
+        let mut continuation = MissingNodeContinuation::new(
+            MissingNodePlanId::new(41),
+            &root,
+            1,
+            true,
+            77,
+            9,
+            &mut || 0,
+        );
+        let mut resident = EmptyResident;
+
+        let MissingNodeAdvance::NeedsReads(needs) =
+            continuation.advance(2, 16, &mut resident, &mut || 0)
+        else {
+            panic!("expected the sole brokered read");
+        };
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].hash(), missing_hash);
+        assert!(matches!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(41),
+                missing_hash,
+                MissingNodeReadOutcome::Miss,
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 0,
+                missing_edges: 1,
+            }
+        ));
+        assert!(matches!(
+            continuation.advance(2, 16, &mut resident, &mut || 0),
+            MissingNodeAdvance::NeedsNetwork(_)
+        ));
+        assert!(
+            !continuation.has_runnable_frontier(),
+            "a retained stack with no remaining discovery budget must wait for its peer result"
+        );
+        assert!(matches!(
+            continuation.advance(2, 16, &mut resident, &mut || 0),
+            MissingNodeAdvance::Ready
+        ));
+        assert!(
+            !continuation.has_runnable_frontier(),
+            "a Ready result must not manufacture a successor actor turn while budget remains exhausted"
+        );
+    }
+
+    #[test]
+    fn runnable_ready_turn_always_consumes_a_branch_step() {
+        let unloaded_grandchild = hash(0x51);
+        let loaded_child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        loaded_child.set_child_hash(0, unloaded_grandchild);
+        loaded_child.update_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, loaded_child.get_hash());
+        root.canonicalize_child(0, loaded_child);
+        root.update_hash();
+        let mut continuation = continuation(&root, 51);
+        let mut resident = EmptyResident;
+
+        let before = continuation.stats().branch_steps;
+        assert!(matches!(
+            continuation.advance(1, 16, &mut resident, &mut || 0),
+            MissingNodeAdvance::Ready
+        ));
+        let after = continuation.stats().branch_steps;
+        assert!(
+            continuation.has_runnable_frontier(),
+            "the loaded child leaves bounded CPU work for the next actor turn"
+        );
+        assert_eq!(
+            after,
+            before + 1,
+            "a Ready continuation may be requeued only after it advances its branch cursor"
+        );
+    }
+
+    #[test]
+    fn found_result_resumes_frontier_without_waiting_for_other_results() {
+        let grandchild_hash = hash(0x52);
+        let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        child.set_child_hash(4, grandchild_hash);
+        child.update_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(3, child.get_hash());
+        root.update_hash();
+        let mut continuation = continuation(&root, 2);
+        let mut resident = EmptyResident;
+
+        let first_hash = match continuation.advance(32, 1, &mut resident, &mut || 0) {
+            MissingNodeAdvance::NeedsReads(needs) => {
+                needs.into_iter().next().expect("root need").hash()
+            }
+            _ => panic!("expected root read"),
+        };
+        assert_eq!(first_hash, child.get_hash());
+        assert_eq!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(2),
+                first_hash,
+                MissingNodeReadOutcome::Found(child),
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 1,
+                missing_edges: 0,
+            }
+        );
+        let MissingNodeAdvance::NeedsReads(needs) =
+            continuation.advance(64, 1, &mut resident, &mut || 0)
+        else {
+            panic!("expected retained parent resume to discover grandchild");
+        };
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].hash(), grandchild_hash);
+    }
+
+    #[test]
+    fn local_read_batches_attach_strongly_publish_full_below_and_survive_next_scan() {
+        fn complete_inner(fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
+            let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+                crate::tree_node::SHAMapNodeType::AccountState,
+                SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 12]),
+                1,
+            ));
+            let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            inner.set_child_hash(0, leaf.get_hash());
+            inner.canonicalize_child(0, leaf);
+            inner.update_hash();
+            inner
+        }
+
+        let first = complete_inner(0x81);
+        let second = complete_inner(0x82);
+        let first_hash = first.get_hash();
+        let second_hash = second.get_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, first_hash);
+        root.set_child_hash(1, second_hash);
+        root.update_hash();
+        let bounds = MissingNodeContinuationBounds {
+            max_pending_hashes: 1,
+            max_pending_edges: 1,
+            max_pending_edge_bytes: std::mem::size_of::<PendingDeferredFetch>(),
+        };
+        let mut continuation = MissingNodeContinuation::new_with_bounds(
+            MissingNodePlanId::new(82),
+            &root,
+            16,
+            true,
+            77,
+            9,
+            bounds,
+            &mut || 0,
+        );
+        let mut resident = EmptyResident;
+        let mut read_batches = 0;
+
+        for _ in 0..16 {
+            match continuation.advance(64, 16, &mut resident, &mut || 0) {
+                MissingNodeAdvance::NeedsReads(needs) => {
+                    read_batches += 1;
+                    assert_eq!(
+                        needs.len(),
+                        1,
+                        "the retained-edge bound forces one read round"
+                    );
+                    let need_hash = needs[0].hash();
+                    let node = if need_hash == first_hash {
+                        first.clone()
+                    } else if need_hash == second_hash {
+                        second.clone()
+                    } else {
+                        panic!("unexpected local read hash {need_hash}");
+                    };
+                    assert!(matches!(
+                        continuation.apply_read_result(
+                            MissingNodePlanId::new(82),
+                            need_hash,
+                            MissingNodeReadOutcome::Found(node),
+                        ),
+                        MissingNodeReadApply::Applied {
+                            attached_edges: 1,
+                            missing_edges: 0
+                        }
+                    ));
+                }
+                MissingNodeAdvance::Ready => {}
+                MissingNodeAdvance::Complete => break,
+                other => panic!("local reconstruction must not need peers: {other:?}"),
+            }
+        }
+
+        assert_eq!(read_batches, 2);
+        assert!(root.is_full_below(9));
+        assert!(first.is_full_below(9));
+        assert!(second.is_full_below(9));
+        assert!(root.get_child(0).is_some());
+        assert!(root.get_child(1).is_some());
+        drop(first);
+        drop(second);
+        assert!(
+            root.get_child(0).is_some() && root.get_child(1).is_some(),
+            "canonicalized DB nodes are strongly owned by the ledger root graph"
+        );
+
+        let mut next = MissingNodeContinuation::new(
+            MissingNodePlanId::new(83),
+            &root,
+            16,
+            true,
+            77,
+            9,
+            &mut || 0,
+        );
+        assert!(matches!(
+            next.advance(64, 16, &mut resident, &mut || 0),
+            MissingNodeAdvance::Complete
+        ));
+        assert_eq!(next.pending_hashes(), 0);
+    }
+
+    #[test]
+    fn dense_local_tree_over_two_deferred_rounds_completes_and_publishes_full_below() {
+        let mut next_item = 1u64;
+        let mut local_nodes = BTreeMap::new();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+
+        // Five complete 16x16 subtrees produce 1,365 non-root reads. This is
+        // deliberately larger than two rippled-sized 512-read deferred rounds.
+        for top_branch in 0..5 {
+            let top = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            for middle_branch in 0..BRANCH_FACTOR {
+                let middle = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+                for leaf_branch in 0..BRANCH_FACTOR {
+                    let tag = next_item;
+                    next_item += 1;
+                    let mut payload = vec![0u8; 12];
+                    payload[4..].copy_from_slice(&tag.to_be_bytes());
+                    let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+                        crate::tree_node::SHAMapNodeType::AccountState,
+                        SHAMapItem::new(Uint256::from(tag), payload),
+                        1,
+                    ));
+                    middle.set_child_hash(leaf_branch, leaf.get_hash());
+                    local_nodes.insert(leaf.get_hash(), leaf);
+                }
+                middle.update_hash();
+                top.set_child_hash(middle_branch, middle.get_hash());
+                local_nodes.insert(middle.get_hash(), middle);
+            }
+            top.update_hash();
+            root.set_child_hash(top_branch, top.get_hash());
+            local_nodes.insert(top.get_hash(), top);
+        }
+        root.update_hash();
+        assert_eq!(local_nodes.len(), 1_365);
+
+        let plan_id = MissingNodePlanId::new(1_365);
+        let mut continuation =
+            MissingNodeContinuation::new(plan_id, &root, 256, true, 77, 9, &mut || 0);
+        let mut resident = EmptyResident;
+        let mut emitted_reads = 0usize;
+        let mut completed = false;
+
+        for _ in 0..64 {
+            match continuation.advance_with_yield(256, &mut resident, &mut || 0, &mut || false) {
+                MissingNodeAdvance::NeedsReads(needs) => {
+                    emitted_reads += needs.len();
+                    for need in needs {
+                        let node = local_nodes
+                            .get(&need.hash())
+                            .unwrap_or_else(|| panic!("missing local node {}", need.hash()))
+                            .clone();
+                        assert!(matches!(
+                            continuation.apply_read_result(
+                                plan_id,
+                                need.hash(),
+                                MissingNodeReadOutcome::Found(node),
+                            ),
+                            MissingNodeReadApply::Applied {
+                                attached_edges: 1,
+                                missing_edges: 0
+                            }
+                        ));
+                    }
+                }
+                MissingNodeAdvance::Ready => {}
+                MissingNodeAdvance::Complete => {
+                    completed = true;
+                    break;
+                }
+                other => panic!("dense local reconstruction must not need peers: {other:?}"),
+            }
+        }
+
+        assert!(completed, "dense local reconstruction did not terminate");
+        assert_eq!(emitted_reads, 1_365);
+        let stats = continuation.stats();
+        assert_eq!(stats.completed_pending_reads, 1_365);
+        assert_eq!(stats.completed_pending_misses, 0);
+        assert!(
+            stats.full_below_marked > 0,
+            "completed local subtrees must publish full-below state"
+        );
+        assert!(
+            stats.full_below_marked < 86,
+            "this fixture must exercise deferred ancestors that require the next scan; marked={}",
+            stats.full_below_marked
+        );
+
+        let mut replacement = MissingNodeContinuation::new(
+            MissingNodePlanId::new(1_366),
+            &root,
+            256,
+            true,
+            77,
+            9,
+            &mut || 0,
+        );
+        assert!(matches!(
+            replacement.advance_with_yield(256, &mut resident, &mut || 0, &mut || false),
+            MissingNodeAdvance::Complete
+        ));
+        assert_eq!(replacement.stats().completed_pending_reads, 0);
+        assert!(root.is_full_below(9));
+        assert_eq!(
+            local_nodes
+                .values()
+                .filter(|node| node.is_inner() && !node.is_full_below(9))
+                .count(),
+            0,
+            "the next scan must reuse the strong graph and finish deferred full-below propagation without I/O"
+        );
+    }
+
+    #[test]
+    fn mixed_local_hits_and_256_misses_drain_to_one_network_frontier() {
+        let mut found_nodes = BTreeMap::new();
+        let mut missing_hashes = BTreeSet::new();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+
+        // Every root branch and every middle branch is a local hit, followed
+        // by one distinct miss. The scan must stop at the 256-candidate source
+        // boundary even though local hits continuously expose more traversal.
+        for top_branch in 0..BRANCH_FACTOR {
+            let top = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            for middle_branch in 0..BRANCH_FACTOR {
+                let middle = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+                let ordinal = top_branch * BRANCH_FACTOR + middle_branch + 1;
+                let missing = SHAMapHash::new(Uint256::from(10_000u64 + ordinal as u64));
+                middle.set_child_hash(0, missing);
+                middle.update_hash();
+                top.set_child_hash(middle_branch, middle.get_hash());
+                found_nodes.insert(middle.get_hash(), middle);
+                missing_hashes.insert(missing);
+            }
+            top.update_hash();
+            root.set_child_hash(top_branch, top.get_hash());
+            found_nodes.insert(top.get_hash(), top);
+        }
+        root.update_hash();
+        assert_eq!(found_nodes.len(), 272);
+        assert_eq!(missing_hashes.len(), 256);
+
+        let plan_id = MissingNodePlanId::new(2_560);
+        let mut continuation =
+            MissingNodeContinuation::new(plan_id, &root, 256, true, 77, 9, &mut || 0);
+        let mut resident = EmptyResident;
+        let mut frontier = None;
+
+        for _ in 0..64 {
+            match continuation.advance_with_yield(256, &mut resident, &mut || 0, &mut || false) {
+                MissingNodeAdvance::NeedsReads(needs) => {
+                    for need in needs {
+                        let outcome = found_nodes
+                            .get(&need.hash())
+                            .cloned()
+                            .map(MissingNodeReadOutcome::Found)
+                            .unwrap_or(MissingNodeReadOutcome::Miss);
+                        assert!(matches!(
+                            continuation.apply_read_result(plan_id, need.hash(), outcome),
+                            MissingNodeReadApply::Applied { .. }
+                        ));
+                    }
+                }
+                MissingNodeAdvance::Ready => {}
+                MissingNodeAdvance::NeedsNetwork(nodes) => {
+                    frontier = Some(nodes);
+                    break;
+                }
+                other => panic!("mixed scan must terminate at a peer frontier: {other:?}"),
+            }
+        }
+
+        let frontier = frontier.expect("mixed scan never drained to its network frontier");
+        assert_eq!(frontier.len(), 256);
+        assert_eq!(
+            frontier
+                .iter()
+                .map(|(_, hash)| SHAMapHash::new(*hash))
+                .collect::<BTreeSet<_>>(),
+            missing_hashes
+        );
+        let stats = continuation.stats();
+        assert_eq!(stats.completed_pending_reads, 272);
+        assert_eq!(stats.completed_pending_misses, 256);
+        assert_eq!(stats.missing_recorded, 256);
+        assert_eq!(continuation.pending_hashes(), 0);
+    }
+
+    #[test]
+    fn retained_edge_bound_blocks_cpu_until_a_result_releases_capacity() {
+        let first = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            crate::tree_node::SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0x71; 32]), vec![0x71; 12]),
+            1,
+        ));
+        let second_hash = hash(0x72);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, first.get_hash());
+        root.set_child_hash(1, second_hash);
+        root.update_hash();
+        let bounds = MissingNodeContinuationBounds {
+            max_pending_hashes: 1,
+            max_pending_edges: 1,
+            max_pending_edge_bytes: std::mem::size_of::<PendingDeferredFetch>(),
+        };
+        let mut continuation = MissingNodeContinuation::new_with_bounds(
+            MissingNodePlanId::new(71),
+            &root,
+            16,
+            true,
+            77,
+            9,
+            bounds,
+            &mut || 0,
+        );
+        let mut resident = EmptyResident;
+
+        let MissingNodeAdvance::NeedsReads(needs) =
+            continuation.advance(32, 16, &mut resident, &mut || 0)
+        else {
+            panic!("expected the bounded first read");
+        };
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].hash(), first.get_hash());
+        assert_eq!(needs[0].ledger_seq(), 77);
+        assert_eq!(needs[0].node_id(), SHAMapNodeId::default());
+        assert_eq!(needs[0].branch(), 0);
+        assert!(continuation.is_pending_edge_limited());
+        assert_eq!(continuation.pending_edges(), 1);
+        assert_eq!(
+            continuation.pending_edge_bytes(),
+            std::mem::size_of::<PendingDeferredFetch>()
+        );
+        assert!(
+            !continuation.has_runnable_frontier(),
+            "a full retained-edge owner must wait instead of requeueing CPU work"
+        );
+
+        assert_eq!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(71),
+                first.get_hash(),
+                MissingNodeReadOutcome::Found(first),
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 1,
+                missing_edges: 0,
+            }
+        );
+        assert!(!continuation.is_pending_edge_limited());
+        let MissingNodeAdvance::NeedsReads(needs) =
+            continuation.advance(32, 16, &mut resident, &mut || 0)
+        else {
+            panic!("released edge capacity should admit the next retained read");
+        };
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].hash(), second_hash);
+    }
+
+    #[test]
+    fn stale_and_hash_mismatched_results_cannot_mutate_a_plan() {
+        let child_hash = hash(0x63);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(1, child_hash);
+        root.update_hash();
+        let mut continuation = continuation(&root, 3);
+        let mut resident = EmptyResident;
+        let _ = continuation.advance(32, 1, &mut resident, &mut || 0);
+
+        assert_eq!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(4),
+                child_hash,
+                MissingNodeReadOutcome::Miss,
+            ),
+            MissingNodeReadApply::StalePlan
+        );
+        assert_eq!(continuation.pending_hashes(), 1);
+        let wrong = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        wrong.set_child_hash(2, hash(0x64));
+        wrong.update_hash();
+        assert_ne!(wrong.get_hash(), child_hash);
+        assert_eq!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(3),
+                child_hash,
+                MissingNodeReadOutcome::Found(wrong),
+            ),
+            MissingNodeReadApply::HashMismatch
+        );
+        assert!(matches!(
+            continuation.advance(1, 1, &mut resident, &mut || 0),
+            MissingNodeAdvance::Invalid
+        ));
     }
 }

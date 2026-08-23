@@ -5,6 +5,7 @@ members = [
     "xrpl/resource",
     "xrpl/protocol",
     "xrpl/shamap",
+    "xrpld/acquisition",
     "xrpld/app",
     "xrpld/consensus",
     "xrpld/core",

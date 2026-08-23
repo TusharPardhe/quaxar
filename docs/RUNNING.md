@@ -2,24 +2,25 @@
 
 Guide for node operators running the Rust implementation of the XRP Ledger server.
 
-## Hardware Requirements
+## Capacity Planning
 
-| Resource | Minimum (mainnet) | Recommended |
-|----------|-------------------|-------------|
-| CPU | 4 cores | 8+ cores |
-| RAM | 32 GB | 32 GB |
-| Disk | 1 TB NVMe SSD | 1 TB NVMe SSD |
-| Network | 100 Mbps | 1 Gbps |
+| Resource | Starting point | Notes |
+|----------|----------------|-------|
+| CPU | 4 modern cores | More cores help builds, RPC, acquisition, and jobs. |
+| RAM | 16 GiB testnet; 32 GiB public-network evaluation | Size for the chosen cache profile and workload. |
+| Disk | Fast SSD/NVMe | Capacity depends primarily on history and deletion policy. |
+| Network | Stable broadband with public peer ingress | Sustained catch-up and peer relay can be bandwidth intensive. |
 
-For testnet, 16 GB RAM and a 500 GB SSD are sufficient.
-
-Disk usage grows over time with ledger history. NVMe is strongly recommended for NuDB performance.
+These are planning baselines, not guarantees. Measure the actual network,
+history, RPC traffic, and `[node_size]` profile before production use.
 
 ## Supported Platforms
 
 - Linux x86_64 (Ubuntu 22.04+, Debian 12+, RHEL 9+)
 - macOS arm64 (Apple Silicon)
 - macOS x86_64
+- Windows has a build/install script; server-service operation is not yet part
+  of the qualified platform matrix.
 
 ## Building from Source
 
@@ -40,7 +41,8 @@ The installer will:
 - Let you choose Docker or local build
 - Install all dependencies
 - Build and install `quaxar` to your PATH
-- Generate config files (all fields configurable)
+- Generate config files with guided essential settings; set
+  `QUAXAR_ADVANCED_CONFIG=1` for the additional installer prompts
 - Optionally set up a systemd service
 
 ### Manual Setup
@@ -67,27 +69,32 @@ brew install openssl rocksdb cmake
 ```bash
 git clone https://github.com/TusharPardhe/quaxar.git
 cd quaxar
-CC=clang CXX=clang++ cargo install --path xrpld/main
+CC=clang CXX=clang++ cargo install --path xrpld/main --locked
 ```
 
 This builds the release binary and installs it to `~/.cargo/bin/quaxar` (already in PATH).
+For the dedicated system service below, install a root-owned copy:
+
+```bash
+sudo install -o root -g root -m 0755 ~/.cargo/bin/quaxar /usr/local/bin/quaxar
+```
 
 ### Build Troubleshooting
 
-**RocksDB compilation segfault / OOM (common on ≤16GB RAM):**
+**RocksDB compilation segfault / OOM:**
 
 The RocksDB C++ library compiles from source by default and can exhaust memory. Fix by installing the system package:
 
 ```bash
 # Linux
 sudo apt install librocksdb-dev
-ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu CC=clang CXX=clang++ cargo install --path xrpld/main
+ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu CC=clang CXX=clang++ cargo install --path xrpld/main --locked
 ```
 
 **Rustc segfault during build (too many parallel jobs):**
 
 ```bash
-CARGO_BUILD_JOBS=2 CC=clang CXX=clang++ cargo install --path xrpld/main
+CARGO_BUILD_JOBS=2 CC=clang CXX=clang++ cargo install --path xrpld/main --locked
 ```
 
 **OpenSSL build failure:**
@@ -96,26 +103,104 @@ CARGO_BUILD_JOBS=2 CC=clang CXX=clang++ cargo install --path xrpld/main
 sudo apt install libssl-dev pkg-config
 ```
 
-**`.cargo/config.toml` linker error:**
-
-The repo includes an optional `lld` linker config for faster builds. If `lld` is not installed:
-
-```bash
-rm .cargo/config.toml
-# Or install lld:
-sudo apt install lld clang
-```
-
 ### Build Notes
 
-- **Linux without librocksdb-dev:** Set `ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu` or RocksDB will compile from source (slow, may OOM on 16GB machines)
+- **System RocksDB:** Install `librocksdb-dev` before setting `ROCKSDB_LIB_DIR` to the directory that actually contains the installed library.
+- **Bundled RocksDB:** Without a system library, the crate compiles RocksDB from source; allow additional build time and memory.
 - **Low-memory machines:** Use `CARGO_BUILD_JOBS=2` to limit parallelism
-- **`.cargo/config.toml`:** The repo includes an optional lld linker config for faster builds. If `lld` is not installed, remove this file: `rm .cargo/config.toml`
+- **Faster linking:** `.cargo/config.toml` contains commented examples. Install `clang` and `lld` before enabling the stanza for your target.
+
+### Checksum-staged service deployment
+
+For a Linux host that already has `quaxar.service`, build the exact clean
+checkout with all available CPUs and incremental artifacts disabled. Run the
+build as the checkout owner, not as root:
+
+```bash
+set -euo pipefail
+
+cd /srv/quaxar/src/quaxar
+test -z "$(git status --porcelain)"
+jobs=$(nproc)
+CARGO_BUILD_JOBS="$jobs" CARGO_INCREMENTAL=0 \
+  cargo build --release --locked --jobs "$jobs" -p quaxar-main
+test -x target/release/quaxar
+sha256sum target/release/quaxar
+```
+
+Validate the intended configuration with the newly built binary before the
+restart. Then checksum-stage that same binary, atomically replace the live
+symlink, and restart only the existing unit:
+
+For a persistent network node, set `fast_load = 1` in `[node_db]`. This makes
+normal service restarts hydrate the newest complete ledger from the relational
+database and NodeStore. Without `fast_load` (or an explicit `--load` startup
+flag), both Quaxar and rippled intentionally start from genesis and reacquire a
+network ledger. `fast_load` retains the safe first-install fallback to network
+bootstrap when no complete local ledger exists.
+
+```bash
+set -euo pipefail
+
+repo=/srv/quaxar/src/quaxar
+config=/etc/quaxar/quaxar.cfg
+stage_dir=/srv/quaxar/stage
+live_link=/opt/quaxar/bin/quaxar
+binary="$repo/target/release/quaxar"
+commit=$(git -C "$repo" rev-parse --short=12 HEAD)
+stage="$stage_dir/quaxar.$commit"
+previous=$(readlink -f "$live_link")
+
+test -x "$previous"
+systemctl cat quaxar.service >/dev/null
+unit_user=$(systemctl show -p User --value quaxar.service)
+unit_group=$(systemctl show -p Group --value quaxar.service)
+unit_user=${unit_user:-root}
+if test -z "$unit_group"; then
+  unit_group=$(id -gn "$unit_user")
+fi
+sudo -u "$unit_user" -g "$unit_group" -- "$binary" --conf "$config" config
+sudo -u "$unit_user" -g "$unit_group" -- \
+  grep -Eq '^[[:space:]]*fast_load[[:space:]]*=[[:space:]]*(1|true)[[:space:]]*$' "$config"
+expected=$(sha256sum "$binary" | awk '{print $1}')
+sudo install -o "$unit_user" -g "$unit_group" -m 0755 "$binary" "$stage"
+actual=$(sha256sum "$stage" | awk '{print $1}')
+test "$actual" = "$expected"
+
+sudo ln -sfn "$stage" "${live_link}.new"
+sudo mv -Tf "${live_link}.new" "$live_link"
+sudo systemctl restart quaxar.service
+
+pid=$(systemctl show -p MainPID --value quaxar.service)
+test "$pid" -gt 0
+test "$(sha256sum "$(readlink -f "$live_link")" | awk '{print $1}')" = "$expected"
+echo "rollback=$previous"
+```
+
+The procedure resolves ownership from the existing unit, including upgraded
+hosts that still run under a legacy account. After restart, sample
+`server_info`, `fetch_info`, local closed hashes, validated/published
+advancement, RSS, and the journal across several closes. Keep the prior staged
+path as the rollback target; do not declare readiness from process liveness or
+memory growth alone.
+If post-restart validation fails, atomically repoint the symlink and restart
+the same unit:
+
+```bash
+set -euo pipefail
+
+live_link=/opt/quaxar/bin/quaxar
+previous='/srv/quaxar/stage/quaxar.REPLACE_WITH_PRINTED_COMMIT'
+test -x "$previous"
+sudo ln -sfn "$previous" "${live_link}.rollback"
+sudo mv -Tf "${live_link}.rollback" "$live_link"
+sudo systemctl restart quaxar.service
+```
 
 ## Configuration
 
-Use the repository `xrpld.cfg` as the default starting point. It is intentionally
-small; detailed parameter explanations are kept in
+Use the repository `quaxar.cfg` as the default starting point. The following is
+a smaller bare-metal example; detailed parameter explanations are kept in
 [CONFIGURATION.md](CONFIGURATION.md).
 
 ```ini
@@ -127,6 +212,7 @@ port_peer
 port = 5005
 ip = 127.0.0.1
 protocol = http
+admin = 127.0.0.1
 
 [port_peer]
 port = 51235
@@ -138,24 +224,30 @@ medium
 
 [node_db]
 type = NuDB
-path = /var/lib/xrpld/db/nudb
-online_delete = 2000
+path = /var/lib/quaxar/db/nudb
+online_delete = 512
 advisory_delete = 0
 
 [database_path]
-/var/lib/xrpld/db
+/var/lib/quaxar/db
 
-[validators_file]
-validators.txt
+[ledger_history]
+256
+
+[validator_list_sites]
+https://vl.ripple.com
+
+[validator_list_keys]
+ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
 
 [ips]
 s1.ripple.com 51235
 s2.ripple.com 51235
 ```
 
-### Validator List (validators.txt)
+### Validator List
 
-The `[validators_file]` directive loads a separate file containing trusted validator list sources. Create `validators.txt` alongside your config:
+Configure the trusted validator-list publisher directly in `quaxar.cfg`:
 
 ```ini
 [validator_list_sites]
@@ -165,8 +257,6 @@ https://vl.ripple.com
 ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
 ```
 
-Alternatively, place these sections directly in `xrpld.cfg`.
-
 ### Configuration Sections
 
 | Section | Purpose |
@@ -175,27 +265,42 @@ Alternatively, place these sections directly in `xrpld.cfg`.
 | `[port_*]` | Port binding: port number, IP, protocol (http/ws/peer) |
 | `[node_db]` | Database backend (NuDB), path, deletion policy |
 | `[node_size]` | Memory tuning: tiny, small, medium, large, huge |
-| `[validators_file]` | Path to file with validator list sites and keys |
 | `[validator_list_sites]` | URLs to fetch trusted validator lists |
 | `[validator_list_keys]` | Public keys of validator list publishers |
 | `[ips]` | Peer endpoints to connect to on startup |
 
-See [CONFIGURATION.md](CONFIGURATION.md) for every supported config section.
+See [CONFIGURATION.md](CONFIGURATION.md) for operator-facing config sections
+and compatibility notes.
+
+The root example binds HTTP/WebSocket administration to `127.0.0.1` and is safe
+for the bare-metal service below. Docker Compose uses separate files under
+`infra/docker/` that listen inside the container while publishing admin ports
+only on host loopback. Never expose an admin listener publicly.
 
 ## Starting the Node
 
 ```bash
-RUST_LOG=info ./target/release/quaxar --conf xrpld.cfg
+RUST_LOG=info ./target/release/quaxar --conf quaxar.cfg
 ```
 
 Background:
 ```bash
-RUST_LOG=info nohup ./target/release/quaxar --conf xrpld.cfg > quaxar.log 2>&1 &
+RUST_LOG=info nohup ./target/release/quaxar --conf quaxar.cfg > quaxar.log 2>&1 &
 ```
 
 ## Systemd Service
 
-Create `/etc/systemd/system/quaxar.service`:
+Create a dedicated account and writable state directories when not using the
+interactive installer:
+
+```bash
+sudo useradd --system --home /var/lib/quaxar --shell /usr/sbin/nologin quaxar
+sudo install -d -o quaxar -g quaxar /var/lib/quaxar
+sudo install -d -o root -g quaxar -m 0750 /etc/quaxar
+sudo install -o root -g quaxar -m 0640 quaxar.cfg /etc/quaxar/quaxar.cfg
+```
+
+Then create `/etc/systemd/system/quaxar.service`:
 
 ```ini
 [Unit]
@@ -205,9 +310,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=xrpld
-Group=xrpld
-ExecStart=/usr/local/bin/quaxar --conf /etc/xrpld/xrpld.cfg
+User=quaxar
+Group=quaxar
+ExecStart=/usr/local/bin/quaxar --conf /etc/quaxar/quaxar.cfg
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536
@@ -222,14 +327,39 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now quaxar
 ```
 
+For an older or custom-layout host, first record the unit's `User`, `Group`,
+`ExecStart`, config path, database paths, and a tested rollback point. Build and
+stage the new binary before the outage; then stop both old and new units before
+moving data or changing ownership. Copy (do not remove) the protected legacy
+config to `/etc/quaxar/quaxar.cfg`, update and validate its paths/listeners, and
+transfer only the directories actually named by that config. Start Quaxar
+without disabling the old unit, require sustained `full`/`proposing` operation,
+advancing local-closed and validated ledgers, no recurring mode churn, and a
+writable database before enabling Quaxar and disabling the old unit. On
+failure, stop Quaxar, restore paths/ownership, and restart the old unit. Never
+run both daemons against one NuDB. Deployments that still intentionally run
+`quaxar.service` under an `xrpld` account must keep that ownership in deployment
+commands until this explicit cutover is performed.
+
 ## Monitoring
 
-### Health Check
+### Liveness and readiness
 
 ```bash
 quaxar health
-# Exit code 0 = reachable (healthy or syncing)
+# Exit code 0 = reachable (including while syncing)
 # Exit code 1 = unreachable (down)
+```
+
+`health` is a liveness check, not a readiness gate. Sample these commands over
+multiple ledger closes before declaring a node ready:
+
+```bash
+quaxar ledger-closed
+quaxar ledger-current
+quaxar server-info
+quaxar fetch-info
+quaxar get-counts
 ```
 
 Or via RPC:
@@ -239,6 +369,12 @@ curl -s http://127.0.0.1:5005 -d '{"method":"server_info"}' | jq .result.info.se
 ```
 
 A non-validator node normally progresses through `connected`, `syncing`, `tracking`, and `full`; it must not enter `proposing` without validator credentials.
+
+On a fresh database, an early small local ledger sequence is only the bootstrap
+chain. The process can consume substantial RAM while the shared NodeFamily
+fills from partial state trees and still remain unready. Require installation
+of a current network LCL and consecutive canonical validated/published
+advances; neither a target RSS nor one `full` sample is a readiness test.
 
 ### System Time
 
@@ -273,7 +409,7 @@ running a production node.
 ### Database Usage
 
 ```bash
-quaxar db-stats --conf /etc/xrpld.cfg
+quaxar db-stats --conf /etc/quaxar/quaxar.cfg
 ```
 
 Shows the configured node-store path, NuDB data/key/log file sizes, total disk
@@ -293,29 +429,44 @@ quaxar server-state
 quaxar rpc ledger '{"ledger_index":"validated"}'
 ```
 
+### Prometheus metrics
+
+The `quaxar-metrics` package defines `quaxar_*` Prometheus instruments and the
+runtime currently records acquisition queue/latency and operating-mode events.
+Normal `quaxar` bootstrap does not initialize the package's HTTP exporter, so
+the standard binary and Docker Compose files do not expose a `/metrics`
+endpoint. Use `server_info`, `fetch_info`, `get_counts`, the process supervisor,
+and host monitoring for packaged deployments. A custom embedding may call the
+metrics package's `init_prometheus` API, but that is an application integration
+surface rather than a supported `quaxar.cfg` setting.
+
 ## Log Management
 
 Control log verbosity with the `RUST_LOG` environment variable:
 
 ```bash
 # Levels: error, warn, info, debug, trace
-RUST_LOG=info ./quaxar --conf xrpld.cfg
+RUST_LOG=info quaxar --conf quaxar.cfg
 
 # Per-module control
-RUST_LOG=info,consensus=debug,overlay=warn ./quaxar --conf xrpld.cfg
+RUST_LOG=info,consensus=debug,overlay=warn quaxar --conf quaxar.cfg
 ```
 
 Change at runtime:
 
 ```bash
 quaxar log-level debug
-quaxar log-rotate
 ```
 
-## Bootstrapping from Snapshot
+`quaxar log-rotate` is currently a compatibility no-op because the runtime
+does not own a logfile; use the systemd/Docker supervisor's rotation policy.
 
-The fastest way to bring up a new node is to load a snapshot exported from an
-existing synced node. This bypasses the multi-hour network sync entirely.
+## Priming the NodeStore from a Snapshot
+
+A snapshot transfers immutable node objects from an existing node. Importing
+one can reduce later network fetches, but it does not currently install
+relational ledger metadata, select the snapshot ledger as the startup LCL, or
+bypass normal network synchronization by itself.
 
 **On the source node (online):**
 
@@ -327,19 +478,20 @@ The node exports in a background job and remains online. The CLI displays a
 spinner while it polls the admin `snapshot_status` RPC, then reports completion
 or failure and the resulting file size. On an older node without
 `snapshot_status`, the CLI reports that export was started and instructs the
-operator to monitor snapshot logs instead. On NVMe, 26.5M nodes export in ~3
-minutes. The snapshot file uses LZ4 compressed chunks with SHA-256 integrity
-verification.
+operator to monitor snapshot logs instead. The snapshot uses LZ4-compressed
+chunks with SHA-256 integrity verification; duration depends on store size and
+host I/O.
 
 **On the new node (stopped):**
 
 ```bash
-quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
+quaxar load-snapshot --input /path/to/snapshot.xrpls --conf /etc/quaxar/quaxar.cfg
 ```
 
 The CLI displays a spinner while it imports and verifies all chunk and final
-file hashes. After it reports completion, start the node normally. It will
-resume from the snapshot state and catch up to the network tip within minutes.
+file hashes. After it reports completion, start the node normally. Network
+acquisition can reuse matching objects from the primed NodeStore while the node
+establishes its current validated chain and relational metadata normally.
 
 See [CLI.md](CLI.md) for command details and [SYNCING.md](SYNCING.md) for
 alternative sync methods.
@@ -348,11 +500,14 @@ alternative sync methods.
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| OOM during sync | Insufficient RAM for state acquisition | Ensure 32 GB RAM for mainnet or use `[node_size] medium` |
+| OOM during sync | Cache/workload exceeds available memory | Select a smaller `[node_size]`, reduce competing workloads, or add RAM |
 | RocksDB build segfault | GCC OOM during compilation | `sudo apt install librocksdb-dev` or `CARGO_BUILD_JOBS=1` |
 | OpenSSL build failure | Missing system OpenSSL | `sudo apt install libssl-dev pkg-config` |
-| Node stuck in "connected" | Validator list not loading | Ensure `[validators_file]` points to valid file, or add `[validator_list_sites]` directly to config |
-| Slow sync | Spinning disk or limited bandwidth | Use NVMe SSD, ensure 100+ Mbps |
+| Node stuck in "connected" | No suitable current LCL has been installed | Check peers and trust data, preferred target, coordinator sessions/phase, `last_recovery_lcl_decision`, recovery latch, and current-open freshness |
+| Node reports "disconnected" with peers listed | Active peer count is below `[network_quorum]` | Compare the configured threshold with repeated peer counts; retained peers may still serve acquisition while consensus is paused |
+| Slow sync | Slow storage, limited bandwidth, or unstable peers | Use fast SSD storage and verify sustained network throughput and peer stability |
+| Full/proposing repeatedly returns to syncing | Preferred-LCL reconciliation is not converging | Compare repeated local closed, validated, published, and coordinator phase identities; capture mode-transition logs and `last_recovery_lcl_decision` |
+| Validated advances while local closed/coordinator LCL lags | Local consensus or recovery-anchor state is stale | Capture `server_info`, `ledger-closed`, `fetch-info`, session counters, and a redacted config; do not treat RAM growth as proof of correctness |
 | Port already in use | Another process on same port | Check with `lsof -i :51235`, change port in config |
 | No peers connecting | Firewall blocking port 51235 | Open TCP 51235 inbound |
-| `.cargo/config.toml` error | lld linker not installed | `rm .cargo/config.toml` or `sudo apt install lld clang` |
+| Linker error after enabling optional config | The selected linker is unavailable | Install the configured linker or comment out only the operator-enabled target stanza |

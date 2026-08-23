@@ -15,16 +15,19 @@ use protocol::{
     AccountID, JsonValue, KeyType, PublicKey, STAmount, STTx, STValidation, SecretKey,
     VF_FULL_VALIDATION, calc_node_id, derive_public_key, get_field_by_symbol,
 };
+use resource::{Charge, Disposition};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
 use super::{
-    OverlayHandoff, OverlayImpl, OverlayInboundRouter, PEERFINDER_LIVE_CACHE_TTL,
+    OverlayAcceptor, OverlayHandoff, OverlayImpl, OverlayInboundRouter, PEERFINDER_LIVE_CACHE_TTL,
     PEERFINDER_MAX_ACCEPTED_ENDPOINTS, PEERFINDER_MAX_HOPS, PEERFINDER_REDIRECT_ENDPOINT_COUNT,
-    PeerReservation, PeerReservationSource, PeerReservationTable, is_valid_peer_endpoint,
+    PeerReservation, PeerReservationSource, PeerReservationTable, RelayKind,
+    is_valid_peer_endpoint, read_http_request, validated_ledger_is_recent_for_peer_tracking,
 };
 use crate::message::{
     Message, ProtocolMessage, ProtocolPayload, TmEndpoints, TmGetLedger, TmGetObjectByHash,
@@ -36,12 +39,12 @@ use crate::message::{
 use crate::overlay::Overlay;
 use crate::overlay::{Handoff, Setup};
 use crate::peer::{Peer, ProtocolFeature};
-use crate::peer_imp::PeerImp;
+use crate::peer_imp::{PeerImp, Tracking};
 use crate::router::MessageRouter;
 use crate::session::PeerSessionStarter;
 use crate::slot::{Clock, ManualClock, SlotState};
 use crate::traffic_count::TrafficCategory;
-use crate::{Cluster, ConnectAttemptResult};
+use crate::{Cluster, ConnectAttemptError, ConnectAttemptResult};
 
 #[derive(Debug)]
 struct NoVerify;
@@ -142,6 +145,79 @@ fn peer(id: u32, seed: u8) -> Arc<PeerImp> {
         validator(seed),
         format!("peer-{id}"),
     )
+}
+
+fn inbound_peer(id: u32, seed: u8) -> Arc<PeerImp> {
+    PeerImp::new_with_inbound(
+        id,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51235 + id as u16),
+        true,
+        validator(seed),
+        format!("inbound-peer-{id}"),
+    )
+}
+
+fn directional_default_setup() -> Setup {
+    Setup {
+        peer_limit: 21,
+        want_incoming: true,
+        ..test_setup()
+    }
+}
+
+#[test]
+fn default_rippled_budget_inbound_exhaustion_does_not_block_outbound() {
+    let overlay =
+        OverlayImpl::new(directional_default_setup(), Arc::new(TestHandoff)).expect("overlay");
+    assert_eq!(
+        overlay.peer_limits(),
+        crate::overlay::PeerLimits {
+            max_peers: 21,
+            inbound_max: 11,
+            outbound_max: 10,
+        }
+    );
+
+    let inbound = (0..11)
+        .map(|index| inbound_peer(100 + index, 100 + index as u8))
+        .collect::<Vec<_>>();
+    for peer in &inbound {
+        assert!(overlay.activate(Arc::clone(peer)));
+    }
+    assert!(!overlay.activate(inbound_peer(111, 111)));
+    assert_eq!(overlay.active_inbound_peers_count(), 11);
+    assert_eq!(overlay.active_outbound_peers_count(), 0);
+
+    // `Counts::canActivate` compares only outActive/outMax for an outbound
+    // slot, so an exhausted inbound budget cannot block this peer.
+    assert!(overlay.activate(peer(200, 200)));
+    assert_eq!(overlay.active_outbound_peers_count(), 1);
+
+    // Deactivation removes the direction-specific slot and immediately frees
+    // one inbound admission, matching Counts::remove(Active).
+    overlay.on_peer_deactivate(inbound[0].id());
+    assert_eq!(overlay.active_inbound_peers_count(), 10);
+    assert!(overlay.activate(inbound_peer(112, 112)));
+    assert_eq!(overlay.active_inbound_peers_count(), 11);
+}
+
+#[test]
+fn default_rippled_budget_outbound_exhaustion_does_not_block_inbound() {
+    let overlay =
+        OverlayImpl::new(directional_default_setup(), Arc::new(TestHandoff)).expect("overlay");
+    assert_eq!(overlay.peer_limits().outbound_max, 10);
+    assert_eq!(overlay.peer_limits().inbound_max, 11);
+
+    for index in 0..10 {
+        assert!(overlay.activate(peer(220 + index, 120 + index as u8)));
+    }
+    assert!(!overlay.activate(peer(230, 130)));
+    assert_eq!(overlay.active_outbound_peers_count(), 10);
+    assert_eq!(overlay.active_inbound_peers_count(), 0);
+
+    // `Counts::canActivate` compares only inActive/inMax for an inbound slot.
+    assert!(overlay.activate(inbound_peer(240, 140)));
+    assert_eq!(overlay.active_inbound_peers_count(), 1);
 }
 
 /// Drop an overlay safely from within an async test context.
@@ -293,17 +369,81 @@ fn proposal_relay_updates_slot_and_sends_squelch_control() {
         ..Default::default()
     };
 
-    for uid in 1..=25 {
+    let sources = [&a, &b, &c, &d];
+    for uid in 1..=88 {
+        let source = sources[(uid as usize - 1) % sources.len()];
+        assert!(overlay.register_relay_source(
+            RelayKind::Proposal,
+            Uint256::from_u64(uid),
+            source.id(),
+        ));
         overlay.relay_proposal(proposal.clone(), Uint256::from_u64(uid), validator);
     }
 
     assert_eq!(overlay.slot_state(validator), Some(SlotState::Selected));
-    let squelch_messages = d
-        .queued_messages()
+    let squelch_messages = [&a, &b, &c, &d]
         .into_iter()
+        .flat_map(|peer| peer.queued_messages())
         .filter(|message| matches!(message.protocol().payload, ProtocolPayload::Squelch(_)))
         .count();
     assert!(squelch_messages > 0);
+}
+
+#[test]
+fn recent_duplicate_ingress_updates_source_peer_slot() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Duration::from_secs(0)));
+    let overlay =
+        OverlayImpl::with_clock(test_setup(), Arc::new(TestHandoff), clock).expect("overlay");
+    let first = peer(1, 11);
+    let duplicate = peer(2, 12);
+    overlay.activate(first.clone());
+    overlay.activate(duplicate.clone());
+
+    let validator = validator(99);
+    let uid = Uint256::from_u64(99);
+    let proposal = TmProposeSet {
+        propose_seq: 1,
+        current_tx_hash: vec![1; 32],
+        node_pub_key: validator.as_bytes().to_vec(),
+        close_time: 2,
+        signature: vec![3; 64],
+        previousledger: vec![4; 32],
+        ..Default::default()
+    };
+
+    assert!(overlay.register_relay_source(RelayKind::Proposal, uid, first.id()));
+    overlay.relay_proposal(proposal, uid, validator);
+    assert!(!overlay.register_relay_source(RelayKind::Proposal, uid, duplicate.id()));
+    overlay.update_slot_for_recent_duplicate(
+        RelayKind::Proposal,
+        uid,
+        validator,
+        duplicate.id(),
+        crate::message::ProtocolMessageType::MtProposeLedger,
+    );
+
+    assert!(overlay.slot_peers(validator).contains_key(&duplicate.id()));
+}
+
+#[test]
+fn local_validation_suppression_deduplicates_echo_without_marking_relayed() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let source = peer(1, 31);
+    let recipient = peer(2, 32);
+    overlay.activate(source.clone());
+    overlay.activate(recipient.clone());
+
+    let uid = Uint256::from_u64(101);
+    let signer = validator(100);
+    overlay.suppress_validation(uid);
+    assert!(!overlay.admit_validation_source(uid, signer, source.id()));
+
+    // A suppression-only entry has no relay timestamp: the local broadcast
+    // stays independent, while a later echo remains excluded as its source.
+    let relayed = overlay.relay_validation(TmValidation::default(), uid, signer);
+    assert_eq!(relayed, BTreeSet::from([source.id()]));
+    assert!(source.queued_messages().is_empty());
+    assert_eq!(recipient.queued_messages().len(), 1);
 }
 
 #[test]
@@ -419,6 +559,8 @@ fn activate_enforces_peer_limit_for_unreserved_peers_only() {
         Setup {
             ip_limit: 99,
             peer_limit: 1,
+            peer_limit_in: Some(0),
+            peer_limit_out: Some(1),
             ..test_setup()
         },
         Arc::new(TestHandoff),
@@ -444,7 +586,8 @@ fn activate_enforces_peer_limit_for_unreserved_peers_only() {
 
     assert!(overlay.activate(Arc::clone(&reserved)));
     assert!(overlay.activate(Arc::clone(&clustered)));
-    assert_eq!(overlay.limit(), 1);
+    // rippled: config.maxPeers = 0 when explicit in/out limits are set
+    assert_eq!(overlay.limit(), 0);
     assert_eq!(overlay.size(), 3);
     assert!(reserved.reserved());
     assert!(clustered.cluster());
@@ -497,6 +640,8 @@ fn activate_enforces_peer_limit_for_fixed_peers_slots() {
     let overlay = OverlayImpl::new(
         Setup {
             peer_limit: 1,
+            peer_limit_in: Some(0),
+            peer_limit_out: Some(1),
             fixed_peer_ips: HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 99))]),
             ..test_setup()
         },
@@ -514,9 +659,396 @@ fn activate_enforces_peer_limit_for_fixed_peers_slots() {
     assert!(overlay.activate(Arc::clone(&counted)));
     assert!(overlay.activate(Arc::clone(&fixed)));
     assert!(fixed.fixed());
-    assert_eq!(overlay.limit(), 1);
+    // rippled: config.maxPeers = 0 when explicit in/out limits are set
+    assert_eq!(overlay.limit(), 0);
     assert_eq!(overlay.size(), 2);
-    assert_eq!(overlay.counted_active_peers_count(), 1);
+    assert_eq!(overlay.active_outbound_peers_count(), 1);
+}
+
+#[test]
+fn inbound_blacklisted_resource_consumer_is_rejected_before_peer_slot_and_released() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 51235);
+
+    let blacklisted = overlay.resource_manager.new_inbound_endpoint(address);
+    assert_eq!(
+        blacklisted.charge(Charge::new(800_001, "blacklist test")),
+        Disposition::Drop
+    );
+    assert!(blacklisted.disconnect_with_manager_journal());
+    drop(blacklisted);
+
+    assert!(
+        overlay.reserve_inbound(address).is_none(),
+        "a dropped Resource consumer must reject before peer admission"
+    );
+    assert!(
+        overlay
+            .inbound_reservations
+            .lock()
+            .expect("inbound reservation lock")
+            .by_ip
+            .is_empty(),
+        "the rejected reservation must not retain an inbound IP slot"
+    );
+    assert!(
+        overlay.resource_manager.on_write()["inbound"]
+            .as_array()
+            .expect("inbound resource list")
+            .is_empty(),
+        "the temporary dropped consumer must be released"
+    );
+}
+
+#[test]
+fn inbound_reservation_counts_pending_peer_admissions_and_transfers_on_activation() {
+    let overlay = OverlayImpl::new(
+        Setup {
+            ip_limit: 1,
+            ..test_setup()
+        },
+        Arc::new(TestHandoff),
+    )
+    .expect("overlay");
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 51235);
+
+    let reservation = overlay.reserve_inbound(address).expect("first reservation");
+    assert!(
+        overlay.reserve_inbound(address).is_none(),
+        "a pending peer handoff must consume its inbound IP slot"
+    );
+    drop(reservation);
+    let reservation = overlay
+        .reserve_inbound(address)
+        .expect("released reservation");
+
+    let active = PeerImp::new_with_inbound(91, address, true, validator(91), "inbound-91");
+    assert!(overlay.activate_with_inbound_reservation(Arc::clone(&active), reservation));
+    assert!(
+        overlay.reserve_inbound(address).is_none(),
+        "activation retains the reservation as the active peer's IP resource"
+    );
+    overlay.on_peer_deactivate(active.id());
+    assert!(overlay.reserve_inbound(address).is_some());
+}
+
+#[test]
+fn inbound_ip_limit_is_applied_only_to_public_remote_addresses() {
+    let overlay = OverlayImpl::new(
+        Setup {
+            ip_limit: 1,
+            ..test_setup()
+        },
+        Arc::new(TestHandoff),
+    )
+    .expect("overlay");
+    let private_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51235);
+
+    let first = overlay
+        .reserve_inbound(private_address)
+        .expect("first private reservation");
+    let second = overlay
+        .reserve_inbound(private_address)
+        .expect("second private reservation");
+    assert!(
+        overlay
+            .inbound_reservations
+            .lock()
+            .expect("inbound reservation lock")
+            .by_ip
+            .is_empty(),
+        "private addresses must not consume PeerFinder ip_limit slots"
+    );
+    drop(first);
+    drop(second);
+}
+
+#[test]
+fn connect_as_peer_token_matches_rippled_comma_list_semantics() {
+    let peer = Request::builder()
+        .header("Connect-As", "client, PeEr")
+        .body(())
+        .expect("peer request");
+    let non_peer = Request::builder()
+        .header("Connect-As", "client, public")
+        .body(())
+        .expect("non-peer request");
+
+    assert!(super::request_connects_as_peer(&peer));
+    assert!(!super::request_connects_as_peer(&non_peer));
+}
+
+#[test]
+fn transaction_get_objects_query_precedes_generic_ledger_hash_validation() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let peer = peer(97, 97);
+    peer.set_tx_reduce_relay_enabled(true);
+    let mut router = OverlayInboundRouter {
+        overlay: &overlay,
+        peer: &peer,
+        ledger_data_deferred: false,
+    };
+    let request = TmGetObjectByHash {
+        r#type: wire::tm_get_object_by_hash::ObjectType::OtTransactions as i32,
+        query: true,
+        // Transaction queries are dispatched before generic ledger-hash
+        // validation in rippled, so this irrelevant malformed selector must
+        // not prevent queueing the request.
+        ledger_hash: Some(vec![0; 31]),
+        fat: None,
+        objects: Vec::new(),
+    };
+
+    let _ = router.on_get_objects(&request);
+
+    assert_eq!(overlay.queued_inbound_snapshot().get_objects.len(), 1);
+    assert!(peer.charges().is_empty());
+}
+
+#[test]
+fn disabled_transaction_get_objects_query_is_charged_as_malformed_request() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let peer = peer(98, 98);
+    peer.set_tx_reduce_relay_enabled(false);
+    let mut router = OverlayInboundRouter {
+        overlay: &overlay,
+        peer: &peer,
+        ledger_data_deferred: false,
+    };
+    let request = TmGetObjectByHash {
+        r#type: wire::tm_get_object_by_hash::ObjectType::OtTransactions as i32,
+        query: true,
+        ledger_hash: Some(vec![0; 31]),
+        fat: None,
+        objects: Vec::new(),
+    };
+
+    let _ = router.on_get_objects(&request);
+
+    assert!(overlay.queued_inbound_snapshot().get_objects.is_empty());
+    assert_eq!(peer.charges().len(), 1);
+    let (charge, context) = &peer.charges()[0];
+    assert_eq!(charge, &*resource::FEE_MALFORMED_REQUEST);
+    assert_eq!(context, "tx reduce-relay disabled");
+}
+
+#[test]
+fn inbound_feature_advertisement_honors_runtime_feature_switches() {
+    let overlay = OverlayImpl::new(
+        Setup {
+            tx_reduce_relay_enabled: false,
+            vp_reduce_relay_base_squelch_enabled: false,
+            ..test_setup()
+        },
+        Arc::new(TestHandoff),
+    )
+    .expect("overlay");
+    let request = crate::handshake::make_request(true, true, true, true, true);
+    let (compr, replay, txrr, vprr) = overlay.inbound_handshake_features();
+    let response = crate::handshake::make_response(
+        true,
+        &request,
+        &overlay.handshake_context(),
+        crate::ProtocolVersion::new(2, 2),
+        compr,
+        replay,
+        txrr,
+        vprr,
+    );
+    let features = response.headers()["X-Protocol-Ctl"]
+        .to_str()
+        .expect("feature header");
+
+    assert!(features.contains("compr=lz4"));
+    assert!(features.contains("ledgerreplay=1"));
+    assert!(!features.contains("txrr=1"));
+    assert!(!features.contains("vprr=1"));
+
+    let requested_peer = peer(96, 96);
+    overlay.configure_connected_peer(&requested_peer, request.headers());
+    assert!(
+        !requested_peer.tx_reduce_relay_enabled(),
+        "a peer request must not enable a locally disabled tx relay feature"
+    );
+}
+
+#[tokio::test]
+async fn listener_accepts_next_socket_while_earlier_tls_handshake_is_pending() {
+    let overlay = Arc::new(OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay"));
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("listener");
+    let endpoint = listener.local_addr().expect("listener endpoint");
+    let acceptor = OverlayAcceptor {
+        listener: Arc::new(listener),
+        acceptor: Arc::new(
+            openssl::ssl::SslAcceptor::mozilla_intermediate(openssl::ssl::SslMethod::tls())
+                .expect("ssl acceptor")
+                .build(),
+        ),
+    };
+
+    let first_once = {
+        let overlay = Arc::clone(&overlay);
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            overlay
+                .run_listener_once(&acceptor, overlay.stop_receiver())
+                .await
+        })
+    };
+    let first_client = tokio::net::TcpStream::connect(endpoint)
+        .await
+        .expect("first client");
+    timeout(Duration::from_secs(1), first_once)
+        .await
+        .expect("first accept must not wait for TLS")
+        .expect("first accept join")
+        .expect("first accept result");
+
+    let second_once = {
+        let overlay = Arc::clone(&overlay);
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            overlay
+                .run_listener_once(&acceptor, overlay.stop_receiver())
+                .await
+        })
+    };
+    let second_client = tokio::net::TcpStream::connect(endpoint)
+        .await
+        .expect("second client");
+    timeout(Duration::from_secs(1), second_once)
+        .await
+        .expect("second accept must not be blocked by first TLS handshake")
+        .expect("second accept join")
+        .expect("second accept result");
+
+    assert_eq!(
+        *overlay
+            .session_tasks
+            .active
+            .lock()
+            .expect("overlay session task lock"),
+        2,
+        "both unfinished TLS handshakes must remain independently tracked"
+    );
+
+    overlay.signal_stop();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if *overlay
+                .session_tasks
+                .active
+                .lock()
+                .expect("overlay session task lock")
+                == 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stop must cancel tracked inbound handshakes");
+
+    drop(first_client);
+    drop(second_client);
+    drop_overlay_safely(overlay);
+}
+
+#[test]
+fn activation_rejects_duplicate_node_key_and_deactivation_keeps_the_owner_mapping() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let first = peer(92, 92);
+    let duplicate = PeerImp::new(
+        93,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51328),
+        first.node_public(),
+        "duplicate-node-key",
+    );
+
+    assert!(overlay.activate(Arc::clone(&first)));
+    assert!(!overlay.activate(Arc::clone(&duplicate)));
+    assert_eq!(overlay.size(), 1);
+    assert_eq!(
+        overlay
+            .find_peer_by_public_key(first.node_public())
+            .expect("first key mapping")
+            .id(),
+        first.id()
+    );
+
+    overlay.on_peer_deactivate(duplicate.id());
+    assert_eq!(
+        overlay
+            .find_peer_by_public_key(first.node_public())
+            .expect("duplicate close must not erase owner mapping")
+            .id(),
+        first.id()
+    );
+    overlay.on_peer_deactivate(first.id());
+    assert!(
+        overlay
+            .find_peer_by_public_key(first.node_public())
+            .is_none()
+    );
+}
+
+#[test]
+fn outbound_endpoint_activity_covers_active_and_pending_connections() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 51235);
+
+    assert!(!overlay.outbound_endpoint_is_active_or_pending(target));
+    let reservation = overlay
+        .reserve_outbound_attempt(target)
+        .expect("attempt reservation");
+    assert!(overlay.outbound_endpoint_is_active_or_pending(target));
+    drop(reservation);
+
+    let active = PeerImp::new(94, target, validator(94), "outbound-94");
+    assert!(overlay.activate(active));
+    assert!(overlay.outbound_endpoint_is_active_or_pending(target));
+}
+
+#[tokio::test]
+async fn duplicate_outbound_attempt_is_suppression_not_protocol_failure() {
+    let overlay = Arc::new(OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay"));
+    let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8)), 51235);
+
+    let _reservation = overlay
+        .reserve_outbound_attempt(target)
+        .expect("attempt reservation");
+    assert!(matches!(
+        overlay.connect(target).await,
+        Err(ConnectAttemptError::DuplicateOutboundAttempt)
+    ));
+    drop_overlay_safely(overlay);
+}
+
+#[tokio::test]
+async fn healthy_active_fixed_peer_suppresses_duplicate_without_failure_backoff() {
+    let overlay = Arc::new(OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay"));
+    let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 51235);
+    overlay.remember_fixed_peer_endpoint(target);
+    let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    overlay.set_outbound_peer_failure_handler({
+        let failures = Arc::clone(&failures);
+        move |_address, _fixed| {
+            failures.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let active = PeerImp::new(95, target, validator(95), "healthy-fixed-peer");
+    assert!(overlay.activate(Arc::clone(&active)));
+    assert!(active.fixed());
+    assert!(matches!(
+        overlay.connect(target).await,
+        Err(ConnectAttemptError::DuplicateOutboundAttempt)
+    ));
+    assert_eq!(failures.load(Ordering::Relaxed), 0);
+    drop_overlay_safely(overlay);
 }
 
 #[test]
@@ -524,11 +1056,15 @@ fn outbound_attempt_registration_duplicate_ip_suppression() {
     let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
     let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 51235);
 
-    assert!(overlay.try_register_outbound_attempt(target));
-    assert!(!overlay.try_register_outbound_attempt(target));
-    overlay.finish_outbound_attempt(target);
-    assert!(overlay.try_register_outbound_attempt(target));
-    overlay.finish_outbound_attempt(target);
+    let first = overlay
+        .reserve_outbound_attempt(target)
+        .expect("first attempt");
+    assert!(overlay.reserve_outbound_attempt(target).is_none());
+    drop(first);
+    let second = overlay
+        .reserve_outbound_attempt(target)
+        .expect("released attempt");
+    drop(second);
 
     let active = PeerImp::new(
         31,
@@ -537,7 +1073,7 @@ fn outbound_attempt_registration_duplicate_ip_suppression() {
         "peer-31",
     );
     assert!(overlay.activate(active));
-    assert!(!overlay.try_register_outbound_attempt(target));
+    assert!(overlay.reserve_outbound_attempt(target).is_none());
 }
 
 #[test]
@@ -549,10 +1085,13 @@ fn outbound_attempt_registration_normalizes_ipv4_mapped_addresses() {
     );
     let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 51236);
 
-    assert!(overlay.try_register_outbound_attempt(mapped));
-    assert!(!overlay.try_register_outbound_attempt(v4));
-    overlay.finish_outbound_attempt(mapped);
-    assert!(overlay.try_register_outbound_attempt(v4));
+    let mapped_reservation = overlay
+        .reserve_outbound_attempt(mapped)
+        .expect("mapped attempt");
+    assert!(overlay.reserve_outbound_attempt(v4).is_none());
+    drop(mapped_reservation);
+    let v4_reservation = overlay.reserve_outbound_attempt(v4).expect("v4 attempt");
+    drop(v4_reservation);
 }
 
 #[test]
@@ -560,6 +1099,8 @@ fn refresh_membership_state_drops_excess_peers_after_reservation_loss() {
     let overlay = OverlayImpl::new(
         Setup {
             peer_limit: 1,
+            peer_limit_in: Some(0),
+            peer_limit_out: Some(1),
             ..test_setup()
         },
         Arc::new(TestHandoff),
@@ -587,10 +1128,34 @@ fn refresh_membership_state_drops_excess_peers_after_reservation_loss() {
 }
 
 #[test]
+fn resource_drop_charge_disconnects_and_deactivates_peer() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let charged = peer(40, 80);
+
+    assert!(overlay.activate(Arc::clone(&charged)));
+    assert!(charged.lifecycle_timer_active());
+    charged.charge(
+        Charge::new(800_001, "resource drop test"),
+        "sustained abusive peer load".to_owned(),
+    );
+
+    assert!(charged.disconnect_requested());
+    assert_eq!(overlay.peer_disconnect_charges(), 1);
+    assert_eq!(
+        overlay.size(),
+        0,
+        "disconnect request must prune active peer"
+    );
+    assert!(!charged.lifecycle_timer_active());
+    assert_eq!(overlay.peer_disconnect(), 1);
+}
+
+#[test]
 fn check_tracking_updates_active_peer_tracking_state() {
     let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
     let tracked = peer(12, 43);
     tracked.record_ledger(Uint256::from_u64(12), 200);
+    tracked.set_ledger_range(200, 200);
     overlay.activate(Arc::clone(&tracked));
 
     assert!(tracked.has_range(200, 200));
@@ -627,10 +1192,62 @@ fn finalize_connected_peer_activates_and_applies_negotiated_flags() {
 }
 
 #[test]
+fn finalize_connected_peer_sends_cached_manifests() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    overlay.set_manifests_message_provider(|| {
+        Some(ProtocolMessage::new(ProtocolPayload::Manifests(
+            TmManifests {
+                list: vec![wire::TmManifest {
+                    stobject: vec![1, 2, 3],
+                }],
+                ..Default::default()
+            },
+        )))
+    });
+    let peer = peer(130, 71);
+
+    overlay
+        .finalize_connect_result(ConnectAttemptResult {
+            peer: Arc::clone(&peer),
+            response: Response::builder().status(101).body(()).expect("response"),
+            negotiated_features: HeaderMap::new(),
+            session: None,
+        })
+        .expect("connect result should finalize");
+
+    let messages = peer.queued_messages();
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(
+        messages[0].protocol().payload,
+        ProtocolPayload::Manifests(TmManifests { ref list, .. }) if list.len() == 1
+    ));
+}
+
+#[tokio::test]
+async fn http_request_preserves_coalesced_overlay_read_ahead() {
+    let request = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    let frame = [0_u8, 0, 0, 1, 0, 3, 0x08];
+    let (mut reader, mut writer) = duplex(2048);
+    writer.write_all(request).await.expect("write request");
+    writer.write_all(&frame).await.expect("write frame");
+    let (_stop_tx, stop_rx) = watch::channel(false);
+
+    let (parsed, read_ahead) = read_http_request(&mut reader, stop_rx)
+        .await
+        .expect("read request")
+        .expect("request available");
+
+    assert_eq!(parsed.uri().path(), "/");
+    assert_eq!(read_ahead, frame);
+}
+
+#[test]
 fn finalize_connected_peer_rejects_unreserved_peer_when_limit_is_full() {
     let overlay = OverlayImpl::new(
         Setup {
             peer_limit: 1,
+            peer_limit_in: Some(0),
+            peer_limit_out: Some(1),
             ..test_setup()
         },
         Arc::new(TestHandoff),
@@ -865,6 +1482,7 @@ async fn inbound_status_change_preserves_status_publishes_and_skips_lost_sync() 
         Arc::clone(&clock) as Arc<dyn Clock>,
     )
     .expect("overlay");
+    overlay.set_validated_ledger_status_provider(|| Some((301, Duration::from_secs(119))));
     let published = Arc::new(Mutex::new(Vec::<JsonValue>::new()));
     overlay.set_peer_status_publisher({
         let published = Arc::clone(&published);
@@ -941,6 +1559,10 @@ async fn inbound_status_change_preserves_status_publishes_and_skips_lost_sync() 
     .await
     .expect("wait for published status events");
 
+    assert!(peer.has_ledger(Uint256::from_u64(301), 0));
+    assert!(peer.has_ledger(Uint256::from_u64(300), 0));
+    assert_eq!(peer.tracking(), Tracking::Converged);
+
     let published_events = published.lock().expect("published peer status lock");
     let JsonValue::Object(first) = &published_events[0] else {
         panic!("first peer status event should be an object");
@@ -1013,6 +1635,16 @@ async fn inbound_status_change_preserves_status_publishes_and_skips_lost_sync() 
     let _ = stop_requested.send(true);
 }
 
+#[test]
+fn peer_status_tracking_requires_strictly_recent_validated_ledger() {
+    assert!(validated_ledger_is_recent_for_peer_tracking(
+        Duration::from_secs(119)
+    ));
+    assert!(!validated_ledger_is_recent_for_peer_tracking(
+        Duration::from_secs(120)
+    ));
+}
+
 #[tokio::test]
 async fn inbound_session_queues_remaining_heavy_families() {
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Duration::from_secs(0)));
@@ -1038,7 +1670,11 @@ async fn inbound_session_queues_remaining_heavy_families() {
         .expect("connect result should finalize");
 
     peer.record_ledger(Uint256::from_u64(900), 900);
+    peer.set_ledger_range(900, 900);
     peer.check_tracking(900);
+    // This fixture uses a synthetic legacy proposal signature. Rippled
+    // bypasses proposal signature verification for trusted cluster peers.
+    peer.set_clustered(true);
 
     // Kept for compatibility with the legacy overlay wire fixtures; these
     // deprecated fields still exist on the protobuf surface we ingest.
@@ -1113,6 +1749,7 @@ async fn inbound_session_queues_remaining_heavy_families() {
             nodes: vec![wire::TmLedgerNode {
                 nodedata: vec![9, 9, 9],
                 nodeid: None,
+                ..wire::TmLedgerNode::default()
             }],
             request_cookie: None,
             error: None,
@@ -1305,7 +1942,6 @@ async fn inbound_session_queues_remaining_heavy_families() {
                 && snapshot.validator_list_collections.len() == 1
                 && snapshot.get_objects.len() == 1
                 && snapshot.have_transactions.len() == 1
-                && snapshot.transactions_batches.len() == 1
                 && snapshot.proof_path_requests.len() == 1
                 && snapshot.proof_path_responses.len() == 1
                 && snapshot.replay_delta_requests.len() == 1
@@ -1333,6 +1969,7 @@ async fn inbound_session_queues_remaining_heavy_families() {
     );
     assert!(!snapshot.transactions[0].batch);
     assert!(snapshot.transactions[1].batch);
+    assert!(snapshot.transactions[2].batch);
     assert_eq!(
         snapshot.proposals[0].current_tx_hash,
         Uint256::from_u64(800)
@@ -1340,10 +1977,6 @@ async fn inbound_session_queues_remaining_heavy_families() {
     assert_eq!(
         snapshot.have_transactions[0].hashes,
         vec![Uint256::from_u64(803)]
-    );
-    assert_eq!(
-        snapshot.transactions_batches[0].message.transactions.len(),
-        2
     );
 }
 
@@ -1360,11 +1993,13 @@ async fn inbound_endpoints_drop_excess_hops_and_cap_batch_size_peerfinder() {
     ));
     peer.set_listener_check_state(true, true);
     peer.record_ledger(Uint256::from_u64(900), 900);
+    peer.set_ledger_range(900, 900);
     peer.check_tracking(900);
 
     let mut router = OverlayInboundRouter {
         overlay: overlay.as_ref(),
         peer: &peer,
+        ledger_data_deferred: false,
     };
 
     let mut endpoints_v2 = Vec::new();
@@ -1409,11 +2044,13 @@ async fn inbound_endpoints_rate_limit_and_dedupe_peerfinder() {
     ));
     peer.set_listener_check_state(true, true);
     peer.record_ledger(Uint256::from_u64(901), 901);
+    peer.set_ledger_range(901, 901);
     peer.check_tracking(901);
 
     let mut router = OverlayInboundRouter {
         overlay: overlay.as_ref(),
         peer: &peer,
+        ledger_data_deferred: false,
     };
 
     let message = TmEndpoints {
@@ -1503,11 +2140,13 @@ async fn inbound_neighbor_endpoint_requires_listener_check_before_acceptance() {
     ));
     peer.set_listener_check_state(false, false);
     peer.record_ledger(Uint256::from_u64(902), 902);
+    peer.set_ledger_range(902, 902);
     peer.check_tracking(902);
 
     let mut router = OverlayInboundRouter {
         overlay: overlay.as_ref(),
         peer: &peer,
+        ledger_data_deferred: false,
     };
 
     let message = TmEndpoints {
@@ -1529,10 +2168,12 @@ async fn inbound_neighbor_endpoint_requires_listener_check_before_acceptance() {
     ));
     checked_peer.set_listener_check_state(true, true);
     checked_peer.record_ledger(Uint256::from_u64(902), 902);
+    checked_peer.set_ledger_range(902, 902);
     checked_peer.check_tracking(902);
     let mut checked_router = OverlayInboundRouter {
         overlay: overlay.as_ref(),
         peer: &checked_peer,
+        ledger_data_deferred: false,
     };
     let _ = checked_router.on_endpoints(&message);
     let snapshot = overlay.take_queued_inbound_snapshot();

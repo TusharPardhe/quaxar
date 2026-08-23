@@ -466,14 +466,22 @@ fn protocol_mpt_book_base_uses_mpt_id() {
     let xrp_to_mpt_base = get_book_base(xrp_to_mpt);
     let mpt_to_xrp_base = get_book_base(mpt_to_xrp);
 
-    assert!(!xrp_to_mpt_base.is_zero());
-    assert!(!mpt_to_xrp_base.is_zero());
+    assert_eq!(
+        xrp_to_mpt_base,
+        Uint256::from_hex("58697165BA86D1CA08E7FEB8BD33CD54B5C78C9C1F55A5B00000000000000000")
+            .expect("rippled untagged XRP-to-MPT book base"),
+    );
+    assert_eq!(
+        mpt_to_xrp_base,
+        Uint256::from_hex("1AADB7B2F5542B102201E34B8C00ACEB390F9A9514DCFD2D0000000000000000")
+            .expect("rippled untagged MPT-to-XRP book base"),
+    );
     assert_ne!(xrp_to_mpt_base, mpt_to_xrp_base);
     assert_eq!(book_keylet(xrp_to_mpt).key, xrp_to_mpt_base);
 }
 
 #[test]
-fn protocol_mpt_book_base_tags_mixed_asset_collision_preimages() {
+fn protocol_mpt_book_base_preserves_rippled_mixed_asset_collision_preimages() {
     let issuer_b =
         AccountID::from_hex("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA00000007").expect("issuer b");
     let issuer_a =
@@ -497,7 +505,14 @@ fn protocol_mpt_book_base_tags_mixed_asset_collision_preimages() {
     );
 
     assert_ne!(book_a, book_b);
-    assert_ne!(get_book_base(book_a), get_book_base(book_b));
+    // `Indexes.cpp::getBookBase` serializes these mixed assets without a
+    // discriminator, so deliberately identical byte preimages share a key.
+    assert_eq!(
+        get_book_base(book_a),
+        Uint256::from_hex("187DF97835E57EB98311484E712BADC97D87C3BF70A63ECF0000000000000000")
+            .expect("rippled untagged mixed-asset book base"),
+    );
+    assert_eq!(get_book_base(book_a), get_book_base(book_b));
 }
 
 #[test]

@@ -116,6 +116,59 @@ impl LedgerPersistenceRuntime for NoopPersistenceRuntime {
     }
 }
 
+#[derive(Debug, Default)]
+struct FailingPersistenceRuntime;
+
+impl LedgerPersistenceRuntime for FailingPersistenceRuntime {
+    fn mark_saved(&self, _hash: SHAMapHash) -> bool {
+        true
+    }
+
+    fn start_work(&self, _seq: u32) -> bool {
+        true
+    }
+
+    fn finish_work(&self, _seq: u32) {}
+
+    fn should_work(&self, _seq: u32, _is_synchronous: bool) -> bool {
+        true
+    }
+
+    fn pending(&self, _seq: u32) -> bool {
+        false
+    }
+
+    fn save_validated_ledger(&self, _ledger: Arc<Ledger>, _is_current: bool) -> bool {
+        false
+    }
+
+    fn enqueue_job(
+        &self,
+        _job_type: ledger::LedgerPersistenceJobType,
+        _job_name: String,
+        _job: ledger::LedgerPersistenceJob,
+    ) -> bool {
+        false
+    }
+}
+
+#[test]
+fn set_full_ledger_retracts_complete_range_when_sync_save_fails() {
+    let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+    let persistence = LedgerPersistence::new(Arc::new(FailingPersistenceRuntime));
+    let ledger = immutable_ledger(33, 0x21, 0x33);
+
+    assert!(
+        !master
+            .set_full_ledger(&persistence, Arc::clone(&ledger), true, false, None, None)
+            .expect("failed persistence is a result, not a traversal error")
+    );
+    assert!(
+        !master.have_ledger(33),
+        "a ledger whose synchronous save failed must not remain complete"
+    );
+}
+
 #[test]
 fn set_full_ledger_clears_mismatched_previous_sequence() {
     let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
@@ -383,6 +436,53 @@ fn set_full_ledger_keeps_history_backfill_separate_from_published_and_validated(
             .hash,
         published.header().hash
     );
+}
+
+#[test]
+fn last_valid_ledger_rejects_conflicting_cached_and_acquired_lcl_candidates() {
+    let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+    let quorum_backed = immutable_ledger(40, 0x10, 0x40);
+    master.note_last_valid_ledger(
+        *quorum_backed.header().hash.as_uint256(),
+        quorum_backed.header().seq,
+    );
+
+    let compatible = linked_ledger(&quorum_backed, 141);
+    let cached_conflict = immutable_ledger(41, 0x99, 0x41);
+    let acquired_conflict = immutable_ledger(42, 0x98, 0x42);
+    master
+        .ledger_history()
+        .insert(Arc::clone(&cached_conflict), false);
+
+    assert_eq!(
+        master.last_valid_ledger(),
+        Some((*quorum_backed.header().hash.as_uint256(), 40))
+    );
+    let compatible_audit = master.compatibility_audit(compatible.as_ref());
+    assert!(compatible_audit.compatible());
+    assert!(
+        compatible_audit
+            .last_valid_anchor
+            .is_some_and(|anchor| anchor.matches)
+    );
+    assert!(master.is_compatible(compatible.as_ref()));
+    assert!(
+        master
+            .ledger_history()
+            .get_cached_ledger_by_hash(cached_conflict.header().hash)
+            .is_some()
+    );
+    let cached_conflict_audit = master.compatibility_audit(cached_conflict.as_ref());
+    assert!(!cached_conflict_audit.compatible());
+    assert!(
+        cached_conflict_audit
+            .last_valid_anchor
+            .is_some_and(|anchor| !anchor.matches)
+    );
+    assert!(!master.is_compatible(cached_conflict.as_ref()));
+    // Acquired candidates take the identical guard after they enter the
+    // history cache; a conflicting acquired parent is still rejected.
+    assert!(!master.is_compatible(acquired_conflict.as_ref()));
 }
 
 #[test]

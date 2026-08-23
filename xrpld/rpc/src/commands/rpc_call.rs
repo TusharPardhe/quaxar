@@ -15,7 +15,7 @@ pub fn create_http_post(
     let mut request = String::new();
     let request_path = if path.is_empty() { "/" } else { path };
     request.push_str(&format!("POST {request_path} HTTP/1.0\r\n"));
-    request.push_str("User-Agent: xrpld-rust-json-rpc/v1\r\n");
+    request.push_str("User-Agent: quaxar-json-rpc/v1\r\n");
     request.push_str(&format!("Host: {host}\r\n"));
     request.push_str("Content-Type: application/json\r\n");
     request.push_str(&format!("Content-Length: {}\r\n", body.len()));

@@ -21,6 +21,11 @@ pub enum ProtocolFeature {
 
 pub trait Peer: Send + Sync {
     fn send(&self, message: Message);
+    /// Snapshot of messages accepted for outbound delivery. For live sessions,
+    /// this includes the message being written until its async write completes.
+    fn send_queue_size(&self) -> usize {
+        0
+    }
     fn remote_address(&self) -> SocketAddr;
     fn send_tx_queue(&self);
     fn add_tx_queue(&self, hash: Uint256);

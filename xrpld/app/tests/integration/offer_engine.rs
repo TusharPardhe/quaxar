@@ -497,7 +497,7 @@ fn oe_insufficient_reserve() {
     let a = acct(0x11);
     let gw = acct(0x33);
     let l = build_ledger(vec![
-        account_root(a, 300_000, 1, 0),
+        account_root(a, 299_999, 1, 0),
         account_root(gw, 10_000_000_000, 0, 0),
         trust_line(a, gw, usd_currency(), 100, 10000, 0),
     ]);

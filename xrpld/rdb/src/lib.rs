@@ -10,6 +10,7 @@
 //! re-acquiring it from peers — matching reference `getLastFullLedger()`.
 
 use rusqlite::{Connection, OptionalExtension, params};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -34,11 +35,23 @@ pub struct PeerFinderDb {
 }
 
 impl PeerFinderDb {
+    /// Current rippled `PeerFinder_BootstrapCache` schema version.
+    const SCHEMA_VERSION: i32 = 4;
+
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
+        // Keep this initialization/migration sequence compatible with
+        // `initPeerFinderDB` + `updatePeerFinderDB`: the database is a
+        // standalone PeerFinder store, and a version-4 migration removes the
+        // legacy `uptime` column while discarding unspecified endpoints.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
+             PRAGMA encoding=\"UTF-8\";
+             CREATE TABLE IF NOT EXISTS SchemaVersion (
+                 name TEXT PRIMARY KEY,
+                 version INTEGER
+             );
              CREATE TABLE IF NOT EXISTS PeerFinder_BootstrapCache (
                  id       INTEGER PRIMARY KEY AUTOINCREMENT,
                  address  TEXT UNIQUE NOT NULL,
@@ -47,9 +60,75 @@ impl PeerFinderDb {
              CREATE INDEX IF NOT EXISTS PeerFinder_BootstrapCache_Index
                  ON PeerFinder_BootstrapCache (address);",
         )?;
+        Self::update_schema(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    fn update_schema(conn: &mut Connection) -> rusqlite::Result<()> {
+        let transaction = conn.transaction()?;
+        let version = transaction
+            .query_row(
+                "SELECT version FROM SchemaVersion WHERE name = 'PeerFinder'",
+                [],
+                |row| row.get::<_, i32>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if version > Self::SCHEMA_VERSION {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+
+        if version < Self::SCHEMA_VERSION {
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS PeerFinder_BootstrapCache_Next (
+                     id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     address  TEXT UNIQUE NOT NULL,
+                     valence  INTEGER
+                 );
+                 CREATE INDEX IF NOT EXISTS PeerFinder_BootstrapCache_Next_Index
+                     ON PeerFinder_BootstrapCache_Next (address);",
+            )?;
+            {
+                let mut select = transaction
+                    .prepare("SELECT address, valence FROM PeerFinder_BootstrapCache;")?;
+                let rows = select.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+                })?;
+                let entries = rows
+                    .filter_map(Result::ok)
+                    .filter(|(address, _)| {
+                        address
+                            .parse::<SocketAddr>()
+                            .is_ok_and(|endpoint| !endpoint.ip().is_unspecified())
+                    })
+                    .collect::<Vec<_>>();
+                drop(select);
+                let mut insert = transaction.prepare(
+                    "INSERT INTO PeerFinder_BootstrapCache_Next (address, valence)
+                     VALUES (?1, ?2);",
+                )?;
+                for (address, valence) in entries {
+                    insert.execute(params![address, valence])?;
+                }
+            }
+            transaction.execute_batch(
+                "DROP TABLE IF EXISTS PeerFinder_BootstrapCache;
+                 DROP INDEX IF EXISTS PeerFinder_BootstrapCache_Index;
+                 ALTER TABLE PeerFinder_BootstrapCache_Next
+                     RENAME TO PeerFinder_BootstrapCache;
+                 CREATE INDEX IF NOT EXISTS PeerFinder_BootstrapCache_Index
+                     ON PeerFinder_BootstrapCache (address);",
+            )?;
+        }
+
+        transaction.execute(
+            "INSERT OR REPLACE INTO SchemaVersion (name, version)
+             VALUES ('PeerFinder', ?1)",
+            [Self::SCHEMA_VERSION],
+        )?;
+        transaction.commit()
     }
 
     pub fn load_bootcache(&self) -> rusqlite::Result<Vec<PeerFinderBootcacheEntry>> {

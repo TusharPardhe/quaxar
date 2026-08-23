@@ -28,14 +28,14 @@ fn update_trust_line<V: ApplyView>(
     sender: &AccountID,
     before: &STAmount,
     after: &STAmount,
-) -> (bool, Option<u32>) {
+) -> Result<(bool, Option<u32>), Ter> {
     // Returns (should_delete, new_flags_if_reserve_cleared)
     let flags = state.get_field_u32(sf("sfFlags"));
 
     let sender_keylet =
         protocol::account_keylet(basics::base_uint::Uint160::from_void(sender.data()));
     let Some(sle) = view.peek(sender_keylet).ok().flatten() else {
-        return (false, None);
+        return Err(Ter::TEF_BAD_LEDGER);
     };
 
     // Determine which side's flags to check based on sender position
@@ -86,7 +86,16 @@ fn update_trust_line<V: ApplyView>(
         && state.get_field_u32(quality_out_field) == 0
     {
         // Release reserve
-        adjust_owner_count(view, &sle, -1);
+        let sponsor_field = if b_sender_high {
+            sf("sfHighSponsor")
+        } else {
+            sf("sfLowSponsor")
+        };
+        let sponsor = state
+            .is_field_present(sponsor_field)
+            .then(|| state.get_account_id(sponsor_field));
+        crate::decrease_owner_count_for_trust_line(view, &sle, sponsor)
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?;
 
         // Clear reserve flag
         let new_flags = flags & !reserve_flag;
@@ -99,11 +108,11 @@ fn update_trust_line<V: ApplyView>(
             LSF_HIGH_RESERVE
         };
         if after.signum() == 0 && (new_flags & other_reserve) == 0 {
-            return (true, Some(new_flags));
+            return Ok((true, Some(new_flags)));
         }
-        return (false, Some(new_flags));
+        return Ok((false, Some(new_flags)));
     }
-    (false, None)
+    Ok((false, None))
 }
 
 fn adjust_owner_count<V: ApplyView>(view: &mut V, account_sle: &STLedgerEntry, adjustment: i32) {
@@ -124,11 +133,34 @@ fn adjust_owner_count<V: ApplyView>(view: &mut V, account_sle: &STLedgerEntry, a
 fn trust_delete<V: ApplyView>(
     view: &mut V,
     state: &STLedgerEntry,
-    _low_account: &AccountID,
-    _high_account: &AccountID,
+    low_account: &AccountID,
+    high_account: &AccountID,
 ) -> Ter {
-    // Remove from both owner directories and delete the entry
-    let _ = view.erase(Arc::new(state.clone()));
+    // Payment-path trust line deletion must mirror the canonical TrustSet
+    // deletion lifecycle: a zeroed RippleState is removed from both owners'
+    // directories before its SLE is erased. Previously this helper only erased
+    // the line itself, leaving stale directory entries unmodified and thus
+    // unthreaded in the accepted ledger.
+    let line_key = *state.key();
+    let low_node = state.get_field_u64(sf("sfLowNode"));
+    let low_dir =
+        protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(low_account.data()));
+    if !crate::dir_remove(view, &low_dir, low_node, line_key, false).unwrap_or(false) {
+        return Ter::TEF_BAD_LEDGER;
+    }
+
+    let high_node = state.get_field_u64(sf("sfHighNode"));
+    let high_dir =
+        protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(high_account.data()));
+    if !crate::dir_remove(view, &high_dir, high_node, line_key, false).unwrap_or(false) {
+        return Ter::TEF_BAD_LEDGER;
+    }
+
+    // update_trust_line already released the applicable reserve/owner count
+    // before selecting this delete path. Do not decrement it a second time.
+    if view.erase(Arc::new(state.clone())).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
     Ter::TES_SUCCESS
 }
 
@@ -146,7 +178,11 @@ pub fn issue_iou<V: ApplyView>(
     let b_sender_high = issue.account > *account;
     let line_keylet = protocol::line(issue.account, *account, issue.currency);
 
-    if let Some(state) = view.peek(line_keylet).ok().flatten() {
+    let state = match view.peek(line_keylet) {
+        Ok(state) => state,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if let Some(state) = state {
         let mut final_balance = state.get_field_amount(sf("sfBalance"));
         if b_sender_high {
             final_balance.negate();
@@ -154,14 +190,17 @@ pub fn issue_iou<V: ApplyView>(
         let start_balance = final_balance.clone();
         final_balance -= amount.clone();
 
-        let (must_delete, new_flags) = update_trust_line(
+        let (must_delete, new_flags) = match update_trust_line(
             view,
             &state,
             b_sender_high,
             &issue.account,
             &start_balance,
             &final_balance,
-        );
+        ) {
+            Ok(result) => result,
+            Err(ter) => return ter,
+        };
 
         if b_sender_high {
             final_balance.negate();
@@ -171,7 +210,13 @@ pub fn issue_iou<V: ApplyView>(
         obj.set_field_amount(sf("sfBalance"), final_balance);
         if let Some(nf) = new_flags {
             obj.set_field_u32(sf("sfFlags"), nf);
+            obj.make_field_absent(if b_sender_high {
+                sf("sfHighSponsor")
+            } else {
+                sf("sfLowSponsor")
+            });
         }
+        let updated = STLedgerEntry::from_stobject(obj, *state.key());
 
         if must_delete {
             let low = if b_sender_high {
@@ -184,11 +229,11 @@ pub fn issue_iou<V: ApplyView>(
             } else {
                 account
             };
-            return trust_delete(view, &state, low, high);
+            return trust_delete(view, &updated, low, high);
         }
 
-        let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *state.key())));
-        Ter::TES_SUCCESS
+        view.update(Arc::new(updated))
+            .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
     } else {
         // Trust line doesn't exist — create it
         // For the payment engine, this means the receiver gets a new trust line
@@ -265,8 +310,28 @@ pub fn issue_iou<V: ApplyView>(
             protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(low_account.data()));
         let high_dir =
             protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(high_account.data()));
-        let _ = crate::views::directory::dir_insert(view, &low_dir, line_keylet.key, &|_obj| {});
-        let _ = crate::views::directory::dir_insert(view, &high_dir, line_keylet.key, &|_obj| {});
+        if matches!(
+            crate::views::directory::dir_insert(
+                view,
+                &low_dir,
+                line_keylet.key,
+                &crate::describe_owner_dir(low_account),
+            ),
+            Ok(None)
+        ) {
+            return Ter::TEC_DIR_FULL;
+        }
+        if matches!(
+            crate::views::directory::dir_insert(
+                view,
+                &high_dir,
+                line_keylet.key,
+                &crate::describe_owner_dir(high_account),
+            ),
+            Ok(None)
+        ) {
+            return Ter::TEC_DIR_FULL;
+        }
 
         // Adjust owner count for receiver
         let acct_keylet =
@@ -292,8 +357,10 @@ pub fn redeem_iou<V: ApplyView>(
     let b_sender_high = *account > issue.account;
     let line_keylet = protocol::line(*account, issue.account, issue.currency);
 
-    let Some(state) = view.peek(line_keylet).ok().flatten() else {
-        return Ter::TEF_INTERNAL;
+    let state = match view.peek(line_keylet) {
+        Ok(Some(state)) => state,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     let mut final_balance = state.get_field_amount(sf("sfBalance"));
@@ -303,14 +370,17 @@ pub fn redeem_iou<V: ApplyView>(
     let start_balance = final_balance.clone();
     final_balance -= amount.clone();
 
-    let (must_delete, new_flags) = update_trust_line(
+    let (must_delete, new_flags) = match update_trust_line(
         view,
         &state,
         b_sender_high,
         account,
         &start_balance,
         &final_balance,
-    );
+    ) {
+        Ok(result) => result,
+        Err(ter) => return ter,
+    };
 
     if b_sender_high {
         final_balance.negate();
@@ -320,7 +390,13 @@ pub fn redeem_iou<V: ApplyView>(
     obj.set_field_amount(sf("sfBalance"), final_balance);
     if let Some(nf) = new_flags {
         obj.set_field_u32(sf("sfFlags"), nf);
+        obj.make_field_absent(if b_sender_high {
+            sf("sfHighSponsor")
+        } else {
+            sf("sfLowSponsor")
+        });
     }
+    let updated = STLedgerEntry::from_stobject(obj, *state.key());
 
     if must_delete {
         let low = if b_sender_high {
@@ -333,11 +409,11 @@ pub fn redeem_iou<V: ApplyView>(
         } else {
             &issue.account
         };
-        return trust_delete(view, &state, low, high);
+        return trust_delete(view, &updated, low, high);
     }
 
-    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *state.key())));
-    Ter::TES_SUCCESS
+    view.update(Arc::new(updated))
+        .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
 }
 
 pub fn transfer_xrp<V: ApplyView>(
@@ -390,11 +466,23 @@ pub fn transfer_xrp<V: ApplyView>(
             return Ter::TER_NO_ACCOUNT;
         };
         let to_balance = to_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+        let Some(updated_balance) = to_balance.checked_add(amount.drops()) else {
+            return Ter::TEC_FAILED_PROCESSING;
+        };
         let mut to_obj = to_sle.clone_as_object();
-        to_obj.set_field_amount(
-            sf("sfBalance"),
-            STAmount::from_xrp_amount(XRPAmount::from_drops(to_balance + amount.drops())),
-        );
+        // Flow reverse passes use the virtual XRP issuer as the sender when
+        // probing a destination endpoint. rippled's native STAmount addition
+        // materializes that bounded, ephemeral sandbox balance without the
+        // network-amount canonicalizer (TokenHelpers.cpp:905-912 and
+        // STAmount.cpp:371-387). Keep ordinary account credits canonicalized,
+        // but preserve the virtual-sender intermediate until Flow constrains
+        // it and the sandbox is discarded or committed.
+        let updated_amount = if from_is_zero {
+            STAmount::new_native(updated_balance.unsigned_abs(), updated_balance < 0)
+        } else {
+            STAmount::from_xrp_amount(XRPAmount::from_drops(updated_balance))
+        };
+        to_obj.set_field_amount(sf("sfBalance"), updated_amount);
         let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
             to_obj,
             *to_sle.key(),
@@ -623,7 +711,11 @@ fn direct_send_no_fee_iou<V: ApplyView>(
     let b_sender_high = *sender > *receiver;
     let line_keylet = protocol::line(*sender, *receiver, issue.currency);
 
-    if let Some(state) = view.peek(line_keylet).ok().flatten() {
+    let state = match view.peek(line_keylet) {
+        Ok(state) => state,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if let Some(state) = state {
         let mut balance = state.get_field_amount(sf("sfBalance"));
         if b_sender_high {
             balance.negate();
@@ -633,7 +725,10 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         balance -= amount.clone();
 
         let (must_delete, new_flags) =
-            update_trust_line(view, &state, b_sender_high, sender, &before, &balance);
+            match update_trust_line(view, &state, b_sender_high, sender, &before, &balance) {
+                Ok(result) => result,
+                Err(ter) => return ter,
+            };
 
         if b_sender_high {
             balance.negate();
@@ -643,16 +738,22 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         obj.set_field_amount(sf("sfBalance"), balance);
         if let Some(nf) = new_flags {
             obj.set_field_u32(sf("sfFlags"), nf);
+            obj.make_field_absent(if b_sender_high {
+                sf("sfHighSponsor")
+            } else {
+                sf("sfLowSponsor")
+            });
         }
+        let updated = STLedgerEntry::from_stobject(obj, *state.key());
 
         if must_delete {
             let low = if b_sender_high { receiver } else { sender };
             let high = if b_sender_high { sender } else { receiver };
-            return trust_delete(view, &state, low, high);
+            return trust_delete(view, &updated, low, high);
         }
 
-        let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *state.key())));
-        Ter::TES_SUCCESS
+        view.update(Arc::new(updated))
+            .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
     } else {
         // Trust line doesn't exist — create it (receiver gets balance)
         let b_high = *sender > *receiver;
@@ -708,24 +809,34 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         let new_sle = Arc::new(STLedgerEntry::from_stobject(new_obj, line_keylet.key));
 
         // Add to both owner directories
-        let low_dir = protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(
-            (if b_sender_high { receiver } else { sender }).data(),
-        ));
-        let _ = crate::dir_append(
-            view as &mut dyn ApplyView,
-            &low_dir,
-            line_keylet.key,
-            &|_| {},
-        );
-        let high_dir = protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(
-            (if b_sender_high { sender } else { receiver }).data(),
-        ));
-        let _ = crate::dir_append(
-            view as &mut dyn ApplyView,
-            &high_dir,
-            line_keylet.key,
-            &|_| {},
-        );
+        let low_account = if b_sender_high { *receiver } else { *sender };
+        let low_dir =
+            protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(low_account.data()));
+        if matches!(
+            crate::dir_insert(
+                view as &mut dyn ApplyView,
+                &low_dir,
+                line_keylet.key,
+                &crate::describe_owner_dir(low_account),
+            ),
+            Ok(None)
+        ) {
+            return Ter::TEC_DIR_FULL;
+        }
+        let high_account = if b_sender_high { *sender } else { *receiver };
+        let high_dir =
+            protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(high_account.data()));
+        if matches!(
+            crate::dir_insert(
+                view as &mut dyn ApplyView,
+                &high_dir,
+                line_keylet.key,
+                &crate::describe_owner_dir(high_account),
+            ),
+            Ok(None)
+        ) {
+            return Ter::TEC_DIR_FULL;
+        }
 
         // Adjust receiver's owner count
         if let Ok(Some(rcv_sle)) = view.peek(protocol::account_keylet(
@@ -791,22 +902,20 @@ pub fn is_frozen<V: ApplyView>(view: &mut V, account: &AccountID, issue: &Issue)
         return false;
     };
     let flags = state.get_field_u32(sf("sfFlags"));
-    // lsfLowFreeze means the low account froze it, lsfHighFreeze means the high account froze it.
-    // Either way, the line is frozen for both parties.
-    (flags & LSF_LOW_FREEZE) != 0 || (flags & LSF_HIGH_FREEZE) != 0
+    // Only the issuer's side can freeze this holder's funds. A holder setting
+    // its own freeze flag affects the counterparty, not itself.
+    let issuer_freeze = if issue.account > *account {
+        LSF_HIGH_FREEZE
+    } else {
+        LSF_LOW_FREEZE
+    };
+    (flags & issuer_freeze) != 0
 }
 
 /// Get the credit balance on a trust line from account's perspective.
-/// Returns positive when account HOLDS the IOU (issuer owes account).
-/// Returns negative when account OWES the issuer.
-///
-/// Convention: sfBalance is stored from the low account's perspective
-/// (positive = low account holds). When account is the high account
-/// (account > issuer), negate to convert to account's perspective.
-///
-/// NOTE: This is "hold semantics" — returns the balance the account holds,
-/// NOT debt semantics (opposite sign).
-/// Do NOT change the sign convention.
+/// Matches rippled `creditBalance`: `sfBalance` is negated when `account` is
+/// the low side of the canonical trust-line key and returned with `account` as
+/// issuer. Debt and credit-limit calculations depend on this exact orientation.
 pub fn credit_balance<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
@@ -820,14 +929,45 @@ pub fn credit_balance<V: ApplyView>(
         .flatten()
         .or_else(|| view.read(line_keylet).ok().flatten())
     else {
-        return STAmount::default();
+        return STAmount::new_with_asset(
+            sf("sfAmount"),
+            Asset::Issue(Issue::new(currency, *account)),
+            0,
+            0,
+            false,
+        );
     };
     let mut balance = state.get_field_amount(sf("sfBalance"));
-    // sfBalance is from the low account's perspective.
-    // If account is the high account, negate to get account's perspective.
+    if *account < *issuer {
+        balance.negate();
+    }
+    balance.set_issuer(*account);
+    balance
+}
+
+/// Spendable trust-line balance in the issued asset, matching rippled
+/// `accountHolds`/`getTrustLineBalance` without the optional opposite limit.
+pub fn account_holds<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    issuer: &AccountID,
+    currency: Currency,
+) -> STAmount {
+    let issue = Issue::new(currency, *issuer);
+    let line_keylet = protocol::line(*account, *issuer, currency);
+    let Some(state) = view
+        .peek(line_keylet)
+        .ok()
+        .flatten()
+        .or_else(|| view.read(line_keylet).ok().flatten())
+    else {
+        return STAmount::new_with_asset(sf("sfAmount"), Asset::Issue(issue), 0, 0, false);
+    };
+    let mut balance = state.get_field_amount(sf("sfBalance"));
     if *account > *issuer {
         balance.negate();
     }
+    balance.set_issuer(*issuer);
     balance
 }
 

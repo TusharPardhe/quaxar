@@ -68,6 +68,77 @@ fn protocol_stobject_apply_template_enforces_required_default_and_discardable_ru
 }
 
 #[test]
+fn protocol_stobject_apply_template_rejected_leftover_keeps_template_and_fields_consistent() {
+    // Regression test for a live panic observed in a two-validator disposable
+    // cluster: "index out of bounds: the len is 1 but the index is 10" inside
+    // get_pfield_mut. Root cause: apply_template unconditionally committed
+    // self.template = Some(template) up front, then bailed out early (leaving
+    // self.fields untouched/short) whenever a leftover field failed the
+    // is_discardable() check. That left self.template pointing at a full-size
+    // template while self.fields was still the old, shorter vector, so any
+    // later get_field_index() call returned a template-slot index with no
+    // matching entry in self.fields. This must never happen: either both
+    // self.template and self.fields are updated together, or neither is.
+    let account_field = get_field_by_symbol("sfAccount");
+    let flags_field = get_field_by_symbol("sfFlags");
+    let non_discardable_intruder = get_field_by_symbol("sfSequence");
+
+    // First, successfully apply a small template. This gives the object a
+    // populated self.template plus a self.fields vector sized/ordered to
+    // match it exactly (index 0 = sfAccount).
+    let small_template = SOTemplate::new(
+        vec![SOElement::new(account_field, SOEStyle::Required).expect("required element")],
+        vec![],
+    )
+    .expect("template should build");
+
+    let mut object = STObject::new(sf_generic());
+    object.set_account_id(account_field, account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"));
+    object.apply_template(&small_template);
+    assert_eq!(object.get_count(), 1);
+    assert!(object.is_field_present(account_field));
+
+    // Now inject a non-discardable field directly (bypassing templates via
+    // the free-object path is not applicable once a template is set, so we
+    // simulate the pre-condition seen live: a differently-shaped object with
+    // an extra field that a second, larger template attempt must reject).
+    // Re-derive a fresh object to model "wire data contains an unexpected
+    // required field from another transaction family" without fighting the
+    // now-templated object's own field-add restrictions.
+    let mut mismatched = STObject::new(sf_generic());
+    mismatched.set_account_id(account_field, account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"));
+    mismatched.set_field_u32(non_discardable_intruder, 7);
+
+    let larger_template = SOTemplate::new(
+        vec![SOElement::new(account_field, SOEStyle::Required).expect("required element")],
+        vec![SOElement::new(flags_field, SOEStyle::Optional).expect("optional element")],
+    )
+    .expect("template should build");
+
+    let fields_before = mismatched.get_count();
+    mismatched.apply_template(&larger_template);
+
+    // The rejected apply must be a complete no-op: field count must be
+    // unchanged, and the object must still behave as an untemplated
+    // (free-form) object — proving self.template was never committed to
+    // Some(larger_template) while self.fields stayed short.
+    assert_eq!(mismatched.get_count(), fields_before);
+    assert!(mismatched.is_field_present(account_field));
+    assert!(mismatched.is_field_present(non_discardable_intruder));
+
+    // The critical assertion: subsequent field access must not panic with
+    // an out-of-bounds index. Before the fix, self.template would already
+    // be Some(larger_template) (whose sfFlags slot has template-relative
+    // index 1) while self.fields still only had 2 raw entries in a
+    // different order — any lookup landing outside that range panicked.
+    // Exercise every access path that reads through get_field_index.
+    assert!(mismatched.get_pfield(account_field).is_some());
+    assert!(mismatched.get_pfield(flags_field).is_none());
+    mismatched.set_field_u32(flags_field, 1);
+    assert!(mismatched.is_field_present(flags_field));
+}
+
+#[test]
 fn protocol_stobject_typed_accessors_round_trip_issue_amount_and_xchain_bridge() {
     let issuer = account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh");
     let amount = STAmount::from_iou_amount(

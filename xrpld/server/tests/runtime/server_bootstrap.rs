@@ -7,17 +7,9 @@ use server::bootstrap::{
     ServerBootstrapConfig, build_runtime, build_runtime_report, parse_server_bootstrap_args,
 };
 
-fn install_crypto() {
-    use std::sync::Once;
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
 #[test]
 fn server_bootstrap_defaults_to_loopback_ephemeral_http_ws() {
-    let config = parse_server_bootstrap_args(["xrpld-server".to_owned()])
+    let config = parse_server_bootstrap_args(["quaxar-server".to_owned()])
         .expect("default bootstrap args should parse");
     assert_eq!(
         config.bind,
@@ -31,7 +23,7 @@ fn server_bootstrap_defaults_to_loopback_ephemeral_http_ws() {
 #[test]
 fn server_bootstrap_accepts_peer_and_secure_modes_in_mixed_protocol_sets() {
     let config = parse_server_bootstrap_args([
-        "xrpld-server".to_owned(),
+        "quaxar-server".to_owned(),
         "--protocols".to_owned(),
         "http,peer,https".to_owned(),
     ])
@@ -165,7 +157,6 @@ async fn server_bootstrap_runtime_serves_server_definitions() {
 
 #[test]
 fn server_bootstrap_runtime_reports_deferred_peer_and_secure_protocols() {
-    install_crypto();
     let config = ServerBootstrapConfig {
         bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         protocols: vec!["http".to_owned(), "peer".to_owned(), "https".to_owned()],

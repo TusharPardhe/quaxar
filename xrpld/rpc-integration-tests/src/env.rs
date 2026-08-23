@@ -158,9 +158,12 @@ impl RpcTestEnv {
         })
         .expect("standalone root should build");
         let _ = app.attach_default_network_ops_runtime();
+        let parent_hash = *parent.header().hash.as_uint256();
         app.on_closed_ledger(Arc::new(parent));
         let _ = app.open_ledger().modify(|view| {
-            *view = AppOpenLedgerView::new(2, 10);
+            // Simulate.cpp copies the current OpenLedger, which retains its
+            // parent ledger identity. Keep the integration fixture faithful.
+            *view = AppOpenLedgerView::with_parent_hash(2, 10, parent_hash);
             true
         });
 

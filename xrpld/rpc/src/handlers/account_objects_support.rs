@@ -7,6 +7,7 @@
 
 #![allow(clippy::collapsible_if, clippy::manual_contains, dead_code)]
 
+use crate::handlers::ledger_lookup::LedgerLookupLedger;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::Ledger;
 use protocol::{
@@ -147,6 +148,33 @@ pub trait AccountObjectsView {
         key: Uint256,
         last: Option<Uint256>,
     ) -> Result<Option<Uint256>, TraversalError>;
+
+    /// Account-objects requests must traverse the selected ledger, including
+    /// the mutable open ledger for `ledger_index: "current"`. Existing
+    /// read-only callers can use the legacy methods; runtime sources override
+    /// these scoped methods to honor the handler's resolved lookup.
+    fn read_entry_at(
+        &self,
+        _ledger: &LedgerLookupLedger,
+        keylet: Keylet,
+    ) -> Result<Option<STLedgerEntry>, TraversalError> {
+        self.read_entry(keylet)
+    }
+    fn exists_entry_at(
+        &self,
+        ledger: &LedgerLookupLedger,
+        keylet: Keylet,
+    ) -> Result<bool, TraversalError> {
+        Ok(self.read_entry_at(ledger, keylet)?.is_some())
+    }
+    fn succ_key_at(
+        &self,
+        _ledger: &LedgerLookupLedger,
+        key: Uint256,
+        last: Option<Uint256>,
+    ) -> Result<Option<Uint256>, TraversalError> {
+        self.succ_key(key, last)
+    }
 }
 
 impl AccountObjectsView for Ledger {
@@ -300,6 +328,7 @@ pub fn collect_account_nfts<V: AccountObjectsView>(
 
 pub fn collect_account_objects<V: AccountObjectsView>(
     view: &V,
+    ledger: &LedgerLookupLedger,
     account: AccountID,
     type_filter: Option<&[LedgerEntryType]>,
     dir_index: Uint256,
@@ -307,7 +336,10 @@ pub fn collect_account_objects<V: AccountObjectsView>(
     limit: u32,
 ) -> Result<AccountObjectsTraversal, AccountTraversalError> {
     if dir_index.is_non_zero()
-        && !view.exists_entry(Keylet::new(LedgerEntryType::DirectoryNode, dir_index))?
+        && !view.exists_entry_at(
+            ledger,
+            Keylet::new(LedgerEntryType::DirectoryNode, dir_index),
+        )?
     {
         return Err(AccountTraversalError::InvalidMarker);
     }
@@ -339,10 +371,12 @@ pub fn collect_account_objects<V: AccountObjectsView>(
         };
         let last = account_objects_nft_max(account);
         let mut current_key = view
-            .succ_key(first.key, Some(last.key.next()))?
+            .succ_key_at(ledger, first.key, Some(last.key.next()))?
             .unwrap_or(last.key);
-        let mut current_page =
-            view.read_entry(Keylet::new(LedgerEntryType::NFTokenPage, current_key))?;
+        let mut current_page = view.read_entry_at(
+            ledger,
+            Keylet::new(LedgerEntryType::NFTokenPage, current_key),
+        )?;
 
         while let Some(page) = current_page {
             items.push(nft_page_json(&page));
@@ -358,8 +392,10 @@ pub fn collect_account_objects<V: AccountObjectsView>(
 
             if let Some(next_page_min) = nft_next_page_min(&page) {
                 current_key = next_page_min;
-                current_page =
-                    view.read_entry(Keylet::new(LedgerEntryType::NFTokenPage, current_key))?;
+                current_page = view.read_entry_at(
+                    ledger,
+                    Keylet::new(LedgerEntryType::NFTokenPage, current_key),
+                )?;
             } else {
                 current_page = None;
             }
@@ -384,10 +420,10 @@ pub fn collect_account_objects<V: AccountObjectsView>(
         dir_index
     };
 
-    let mut current_dir: Option<STLedgerEntry> = match view.read_entry(Keylet::new(
-        LedgerEntryType::DirectoryNode,
-        current_dir_index,
-    ))? {
+    let mut current_dir: Option<STLedgerEntry> = match view.read_entry_at(
+        ledger,
+        Keylet::new(LedgerEntryType::DirectoryNode, current_dir_index),
+    )? {
         Some(dir) => Some(dir),
         None => {
             return Ok(AccountObjectsTraversal {
@@ -431,7 +467,7 @@ pub fn collect_account_objects<V: AccountObjectsView>(
         }
 
         for entry in remaining.into_iter() {
-            let Some(sle_node) = view.read_entry(child_keylet(entry))? else {
+            let Some(sle_node) = view.read_entry_at(ledger, child_keylet(entry))? else {
                 // Directory may reference entries that have been deleted
                 // (e.g., cleaned up by transaction processing). Skip gracefully.
                 continue;
@@ -472,10 +508,10 @@ pub fn collect_account_objects<V: AccountObjectsView>(
         }
 
         current_dir_index = page_keylet(root, next_page).key;
-        current_dir = view.read_entry(Keylet::new(
-            LedgerEntryType::DirectoryNode,
-            current_dir_index,
-        ))?;
+        current_dir = view.read_entry_at(
+            ledger,
+            Keylet::new(LedgerEntryType::DirectoryNode, current_dir_index),
+        )?;
         if current_dir.is_none() {
             return Ok(AccountObjectsTraversal {
                 items,

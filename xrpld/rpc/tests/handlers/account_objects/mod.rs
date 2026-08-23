@@ -3,6 +3,7 @@
 //! Tests for the account objects RPC handler.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     time::Duration,
 };
@@ -26,6 +27,7 @@ struct FakeSource {
     entries: HashMap<Keylet, STLedgerEntry>,
     fail_on_read: Option<Keylet>,
     fail_on_succ: Option<Uint256>,
+    scoped_ledger: RefCell<Option<LedgerLookupLedger>>,
 }
 
 impl LedgerLookupSource for FakeSource {
@@ -88,6 +90,25 @@ impl AccountObjectsView for FakeSource {
             .filter(|candidate| *candidate > key)
             .filter(|candidate| last.map(|bound| *candidate < bound).unwrap_or(true))
             .min())
+    }
+
+    fn read_entry_at(
+        &self,
+        ledger: &LedgerLookupLedger,
+        keylet: Keylet,
+    ) -> Result<Option<STLedgerEntry>, TraversalError> {
+        self.scoped_ledger.replace(Some(*ledger));
+        self.read_entry(keylet)
+    }
+
+    fn succ_key_at(
+        &self,
+        ledger: &LedgerLookupLedger,
+        key: Uint256,
+        last: Option<Uint256>,
+    ) -> Result<Option<Uint256>, TraversalError> {
+        self.scoped_ledger.replace(Some(*ledger));
+        self.succ_key(key, last)
     }
 }
 

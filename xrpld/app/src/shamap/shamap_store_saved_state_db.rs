@@ -1,6 +1,6 @@
 use crate::SHAMapStoreSavedState;
 use basics::basic_config::BasicConfig;
-use xrpld_core::StateDb;
+use quaxar_core::StateDb;
 
 #[derive(Debug)]
 pub struct SHAMapStoreSavedStateDb {

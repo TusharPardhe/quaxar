@@ -127,8 +127,12 @@ fn amm_info_returns_supported_shape_for_limited_slice() {
         make_amm_entry(amm_account, amm_key, issue1, issue2),
     );
     source.entries.insert(
+        line(amm_account, issuer1, issue1.currency).key,
+        make_trust_line(amm_account, issuer1, issue1.currency, 700, 0),
+    );
+    source.entries.insert(
         line(amm_account, issuer2, issue2.currency).key,
-        make_trust_line(amm_account, issuer2, issue2.currency, lsfLowFreeze),
+        make_trust_line(amm_account, issuer2, issue2.currency, -500, lsfLowFreeze),
     );
 
     let request = request(
@@ -151,6 +155,36 @@ fn amm_info_returns_supported_shape_for_limited_slice() {
         to_base58(amm_account)
     );
     assert_eq!(amm.get("trading_fee"), Some(&JsonValue::Unsigned(17)));
+    let amount = json_object(amm.get("amount").expect("amount"));
+    assert_eq!(
+        amount.get("value"),
+        Some(&JsonValue::String("700".to_owned()))
+    );
+    assert_eq!(
+        amount.get("currency"),
+        Some(&JsonValue::String(protocol::currency_to_string(
+            issue1.currency
+        )))
+    );
+    assert_eq!(
+        amount.get("issuer"),
+        Some(&JsonValue::String(to_base58(issuer1)))
+    );
+    let amount2 = json_object(amm.get("amount2").expect("amount2"));
+    assert_eq!(
+        amount2.get("value"),
+        Some(&JsonValue::String("500".to_owned()))
+    );
+    assert_eq!(
+        amount2.get("currency"),
+        Some(&JsonValue::String(protocol::currency_to_string(
+            issue2.currency
+        )))
+    );
+    assert_eq!(
+        amount2.get("issuer"),
+        Some(&JsonValue::String(to_base58(issuer2)))
+    );
     let lp_token = json_object(amm.get("lp_token").expect("lp_token"));
     assert_eq!(
         lp_token.get("value"),
@@ -225,4 +259,69 @@ fn amm_info_returns_supported_shape_for_limited_slice() {
 
     assert_eq!(amm.get("asset_frozen"), Some(&JsonValue::Bool(true)));
     assert_eq!(amm.get("asset2_frozen"), Some(&JsonValue::Bool(true)));
+}
+
+#[test]
+fn amm_info_reports_xrp_and_iou_pool_balances() {
+    let amm_account = sample_account(0x40);
+    let issuer = sample_account(0x60);
+    let issue1 = protocol::xrp_issue();
+    let issue2 = Issue::new(currency_from_string("USD"), issuer);
+    let amm_key = amm(Asset::from(issue1), Asset::from(issue2)).key;
+
+    let mut amm_root = make_account_root(amm_account, Some(amm_key), false);
+    amm_root.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::new_native(10_000_000, false),
+    );
+    let mut source = FakeSource {
+        ledger: Some(closed_ledger()),
+        validated: Some(closed_ledger()),
+        ..Default::default()
+    };
+    source.account_roots.insert(amm_account, amm_root);
+    source
+        .account_roots
+        .insert(issuer, make_account_root(issuer, None, false));
+    source.entries.insert(
+        amm_key,
+        make_amm_entry(amm_account, amm_key, issue1, issue2),
+    );
+    source.entries.insert(
+        line(amm_account, issuer, issue2.currency).key,
+        make_trust_line(amm_account, issuer, issue2.currency, 5_000, 0),
+    );
+
+    let result = do_amm_info(
+        &request(
+            object([
+                ("asset", issue_json(issue1)),
+                ("asset2", issue_json(issue2)),
+            ]),
+            3,
+        ),
+        &source,
+    );
+
+    let result = json_object(&result);
+    let amm = json_object(result.get("amm").expect("amm result"));
+    assert_eq!(
+        amm.get("amount"),
+        Some(&JsonValue::String("10000000".to_owned()))
+    );
+    let amount2 = json_object(amm.get("amount2").expect("amount2"));
+    assert_eq!(
+        amount2.get("value"),
+        Some(&JsonValue::String("5000".to_owned()))
+    );
+    assert_eq!(
+        amount2.get("currency"),
+        Some(&JsonValue::String(protocol::currency_to_string(
+            issue2.currency
+        )))
+    );
+    assert_eq!(
+        amount2.get("issuer"),
+        Some(&JsonValue::String(to_base58(issuer)))
+    );
 }

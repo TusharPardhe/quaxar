@@ -1,10 +1,10 @@
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{
-    Ledger, LedgerHeader, credit_balance, credit_limit, is_deep_frozen, is_frozen,
-    is_individual_frozen,
+    Ledger, LedgerHeader, Sandbox, credit_balance, credit_limit, is_deep_frozen, is_frozen,
+    is_individual_frozen, ripple_state_helpers,
 };
 use protocol::{
-    AccountID, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry,
+    AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry,
     account_keylet, currency_from_string, get_field_by_symbol, line, line_from_issue,
     lsfGlobalFreeze, lsfHighDeepFreeze, lsfHighFreeze, lsfLowDeepFreeze, lsfLowFreeze, sf_generic,
     xrp_currency,
@@ -172,6 +172,48 @@ fn credit_helpers_match_current_cpp_limit_and_balance_rules() {
     assert_eq!(high_limit, iou_amount(250));
     assert_eq!(low_balance, iou_amount(-77));
     assert_eq!(high_balance, iou_amount(77));
+}
+
+#[test]
+fn apply_view_credit_balance_matches_read_view_cpp_orientation() {
+    let low = sample_account(0x11);
+    let high = sample_account(0x22);
+    let low_id = to_account_id(low);
+    let high_id = to_account_id(high);
+    let currency = currency_from_string("USD");
+    let ledger = build_ledger(
+        &[(
+            (trustline_key(low, high, currency).key),
+            make_trustline_entry(low, high, currency, 77, 100, 250, 0),
+        )],
+        42,
+    );
+    let mut view = Sandbox::new(std::sync::Arc::new(ledger), ApplyFlags::NONE);
+
+    let low_balance = ripple_state_helpers::credit_balance(&mut view, &low_id, &high_id, currency);
+    let high_balance = ripple_state_helpers::credit_balance(&mut view, &high_id, &low_id, currency);
+    assert_eq!(low_balance.iou(), iou_amount(-77));
+    assert_eq!(low_balance.issue(), Issue::new(currency, low_id));
+    assert_eq!(high_balance.iou(), iou_amount(77));
+    assert_eq!(high_balance.issue(), Issue::new(currency, high_id));
+
+    let low_holds = ripple_state_helpers::account_holds(&mut view, &low_id, &high_id, currency);
+    let high_holds = ripple_state_helpers::account_holds(&mut view, &high_id, &low_id, currency);
+    assert_eq!(low_holds.iou(), iou_amount(77));
+    assert_eq!(low_holds.issue(), Issue::new(currency, high_id));
+    assert_eq!(high_holds.iou(), iou_amount(-77));
+    assert_eq!(high_holds.issue(), Issue::new(currency, low_id));
+
+    let missing_currency = currency_from_string("EUR");
+    let missing =
+        ripple_state_helpers::account_holds(&mut view, &low_id, &high_id, missing_currency);
+    assert_eq!(missing.iou(), IOUAmount::new());
+    assert_eq!(missing.issue(), Issue::new(missing_currency, high_id));
+
+    let missing_credit =
+        ripple_state_helpers::credit_balance(&mut view, &low_id, &high_id, missing_currency);
+    assert_eq!(missing_credit.iou(), IOUAmount::new());
+    assert_eq!(missing_credit.issue(), Issue::new(missing_currency, low_id));
 }
 
 #[test]

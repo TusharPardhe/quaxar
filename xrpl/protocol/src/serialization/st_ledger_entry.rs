@@ -14,6 +14,30 @@ use crate::{
     get_field_by_symbol, make_mpt_id,
 };
 
+/// A rejected ledger-entry construction or deserialization.
+///
+/// This mirrors rippled's `STLedgerEntry::setSLEType()` rejection of entries
+/// whose `sfLedgerEntryType` is absent or not registered in `LedgerFormats`
+/// (`rippled/src/libxrpl/protocol/STLedgerEntry.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum STLedgerEntryError {
+    MissingLedgerEntryType,
+    InvalidLedgerEntryType { type_code: u16 },
+}
+
+impl std::fmt::Display for STLedgerEntryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingLedgerEntryType => formatter.write_str("missing ledger entry type"),
+            Self::InvalidLedgerEntryType { type_code } => {
+                write!(formatter, "invalid ledger entry type {type_code}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for STLedgerEntryError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct STLedgerEntry {
     object: STObject,
@@ -22,46 +46,86 @@ pub struct STLedgerEntry {
 }
 
 impl STLedgerEntry {
+    /// Constructs a deliberate SLE from a known registered keylet.
+    ///
+    /// New code that accepts a type selected outside the process should use
+    /// [`Self::try_new`] and handle [`STLedgerEntryError`] instead.
     pub fn new(keylet: Keylet) -> Self {
+        Self::try_new(keylet).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallibly constructs an SLE from a keylet, rejecting unregistered entry
+    /// types instead of panicking.
+    pub fn try_new(keylet: Keylet) -> Result<Self, STLedgerEntryError> {
         let mut object = STObject::new(get_field_by_symbol("sfLedgerEntry"));
         let format = LedgerFormats::get_instance()
             .find_by_type(keylet.entry_type)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Attempt to create a SLE of unknown type {}",
-                    keylet.entry_type as u16
-                )
-            });
+            .ok_or(STLedgerEntryError::InvalidLedgerEntryType {
+                type_code: keylet.entry_type as u16,
+            })?;
         object.set(format.so_template());
         object.set_field_u16(
             get_field_by_symbol("sfLedgerEntryType"),
             keylet.entry_type as u16,
         );
 
-        Self {
+        Ok(Self {
             object,
             key: keylet.key,
             entry_type: keylet.entry_type,
-        }
+        })
     }
 
+    /// Constructs a deliberate SLE from a known registered type and key.
+    ///
+    /// New code that accepts a type selected outside the process should use
+    /// [`Self::try_from_type_and_key`] and handle [`STLedgerEntryError`]
+    /// instead.
     pub fn from_type_and_key(entry_type: LedgerEntryType, key: Uint256) -> Self {
         Self::new(Keylet::new(entry_type, key))
     }
 
-    pub fn from_serial_iter(sit: &mut SerialIter<'_>, index: Uint256) -> Self {
-        let object = STObject::from_serial_iter(sit, get_field_by_symbol("sfLedgerEntry"), 0);
-        Self::from_stobject(object, index)
+    /// Fallibly constructs an SLE from its type and key.
+    pub fn try_from_type_and_key(
+        entry_type: LedgerEntryType,
+        key: Uint256,
+    ) -> Result<Self, STLedgerEntryError> {
+        Self::try_new(Keylet::new(entry_type, key))
     }
 
-    pub fn from_stobject(object: STObject, index: Uint256) -> Self {
+    /// Deserializes an SLE from untrusted bytes, rejecting an absent or
+    /// unregistered `sfLedgerEntryType` through [`STLedgerEntryError`].
+    pub fn try_from_serial_iter(
+        sit: &mut SerialIter<'_>,
+        index: Uint256,
+    ) -> Result<Self, STLedgerEntryError> {
+        let object = STObject::from_serial_iter(sit, get_field_by_symbol("sfLedgerEntry"), 0);
+        Self::try_from_stobject(object, index)
+    }
+
+    /// Legacy trusted-input deserializer. Untrusted serialized SLEs must use
+    /// [`Self::try_from_serial_iter`] so invalid types cannot panic a runtime
+    /// worker thread.
+    pub fn from_serial_iter(sit: &mut SerialIter<'_>, index: Uint256) -> Self {
+        Self::try_from_serial_iter(sit, index).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Validates an SLE object, rejecting an absent or unregistered
+    /// `sfLedgerEntryType` through [`STLedgerEntryError`].
+    pub fn try_from_stobject(object: STObject, index: Uint256) -> Result<Self, STLedgerEntryError> {
         let mut entry = Self {
             object,
             key: index,
             entry_type: LedgerEntryType::Any,
         };
-        entry.set_sle_type();
-        entry
+        entry.set_sle_type()?;
+        Ok(entry)
+    }
+
+    /// Legacy trusted-object constructor. Objects derived from network or disk
+    /// input must use [`Self::try_from_stobject`].
+    pub fn from_stobject(object: STObject, index: Uint256) -> Self {
+        Self::try_from_stobject(object, index).unwrap_or_else(|error| panic!("{error}"))
     }
 
     pub fn key(&self) -> &Uint256 {
@@ -114,15 +178,20 @@ impl STLedgerEntry {
         true
     }
 
-    fn set_sle_type(&mut self) {
-        let entry_type = ledger_entry_type_from_code(
-            self.get_field_u16(get_field_by_symbol("sfLedgerEntryType")),
-        )
-        .and_then(|entry_type| LedgerFormats::get_instance().find_by_type(entry_type))
-        .unwrap_or_else(|| panic!("invalid ledger entry type"));
+    fn set_sle_type(&mut self) -> Result<(), STLedgerEntryError> {
+        let field = get_field_by_symbol("sfLedgerEntryType");
+        if !self.object.is_field_present(field) {
+            return Err(STLedgerEntryError::MissingLedgerEntryType);
+        }
+
+        let type_code = self.get_field_u16(field);
+        let entry_type = ledger_entry_type_from_code(type_code)
+            .and_then(|entry_type| LedgerFormats::get_instance().find_by_type(entry_type))
+            .ok_or(STLedgerEntryError::InvalidLedgerEntryType { type_code })?;
 
         self.entry_type = entry_type.format_type();
         self.object.apply_template(entry_type.so_template());
+        Ok(())
     }
 }
 
