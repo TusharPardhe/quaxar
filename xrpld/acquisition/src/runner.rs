@@ -2728,7 +2728,9 @@ impl CoordinatorRunner {
                 // batch therefore only settles its operation; the same owner
                 // resumes once the complete traversal barrier drains.
                 if operation_kind != OperationKind::Read || pending_traversal_after == 0 {
-                    self.run_plan_turn(session, None, &mut effects);
+                    if !self.yield_ordinary_scan_to_recovery(session, true, &mut effects) {
+                        self.run_plan_turn(session, None, &mut effects);
+                    }
                 }
                 effects
             }
@@ -2800,7 +2802,9 @@ impl CoordinatorRunner {
             }
         }
         for session in resume {
-            self.run_plan_turn(session, None, &mut effects);
+            if !self.yield_ordinary_scan_to_recovery(session, true, &mut effects) {
+                self.run_plan_turn(session, None, &mut effects);
+            }
         }
         effects
     }
@@ -3280,8 +3284,14 @@ impl CoordinatorRunner {
     /// Admit bounded local traversal work, not individual reads. At most three
     /// JtLedgerData-equivalent continuations may own a local scan. As in
     /// rippled, an owner retains its slot across successive 512-read batches
-    /// until the synchronous-scan analogue reaches a natural boundary.
-    fn ensure_local_scan_permit(&mut self, session: SessionRef) -> bool {
+    /// until the synchronous-scan analogue reaches a natural boundary, except
+    /// that the exact recovery owner may take the slot at an externalized
+    /// read/write boundary.
+    fn ensure_local_scan_permit(
+        &mut self,
+        session: SessionRef,
+        effects: &mut Vec<AcquisitionEffect>,
+    ) -> bool {
         let Some(state) = self.state.sessions.get(&session) else {
             return false;
         };
@@ -3291,8 +3301,10 @@ impl CoordinatorRunner {
         // An incremental write externalizes one synchronous store step from
         // rippled's JtLedgerData job. Keep the existing owner permit while the
         // write is pending, but do not run it again until its exact
-        // WriteCompleted event settles. Retaining this permit is what bounds
-        // physical persistence to the same three acquisition jobs.
+        // WriteCompleted event settles. The permit normally remains part of
+        // the three-job bound, but an exact recovery owner may reclaim it
+        // below because this session cannot submit another physical write
+        // before that exact completion wakes it.
         if matches!(
             state.plan.persistence(),
             crate::plan::SessionPersistence::IncrementalWritePending { .. }
@@ -3302,10 +3314,78 @@ impl CoordinatorRunner {
                 .retain(|candidate| *candidate != session);
             return false;
         }
+        if self.state.local_scan_owners.contains(&session) {
+            return true;
+        }
+        let authoritative_caller = self.state.recovery_anchor_session == Some(session)
+            || self.state.validation_recovery_session == Some(session);
+        let preferred_recovery = [
+            self.state.recovery_anchor_session,
+            self.state.validation_recovery_session,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|candidate| {
+            self.state
+                .sessions
+                .get(candidate)
+                .is_some_and(|state| state.phase == SessionPhase::Active)
+                && (*candidate == session || self.state.local_scan_waiters.contains(candidate))
+        });
+        let recovery_to_admit = authoritative_caller.then_some(preferred_recovery).flatten();
+        let blocked_ordinary = (recovery_to_admit.is_some()
+            && self.state.local_scan_owners.len() >= MAX_LOCAL_SCAN_OWNERS)
+            .then(|| {
+                self.state
+                    .local_scan_owners
+                    .iter()
+                    .copied()
+                    .find(|candidate| {
+                        self.state.recovery_anchor_session != Some(*candidate)
+                            && self.state.validation_recovery_session != Some(*candidate)
+                            && self.state.sessions.get(candidate).is_some_and(
+                                |candidate_state| {
+                                    matches!(
+                                        candidate_state.reason,
+                                        AcquireReason::Generic | AcquireReason::History
+                                    ) && matches!(
+                                        candidate_state.plan.persistence(),
+                                        crate::plan::SessionPersistence::IncrementalWritePending { .. }
+                                    )
+                                },
+                            )
+                    })
+            })
+            .flatten();
+        if let Some(blocked) = blocked_ordinary {
+            // A rippled JtLedgerData worker never remains occupied while an
+            // external durability acknowledgement is pending. Quaxar splits
+            // that synchronous job at the NodeStore boundary, so reclaim only
+            // an ordinary owner that cannot currently execute. Its exact
+            // WriteCompleted event is already the wake that will requeue it.
+            self.state.local_scan_owners.remove(&blocked);
+        }
         let owners = &mut self.state.local_scan_owners;
         let waiters = &mut self.state.local_scan_waiters;
-        if owners.contains(&session) {
-            return true;
+        if let Some(recovery) = recovery_to_admit {
+            if owners.contains(&recovery) {
+                if recovery != session && !waiters.contains(&session) {
+                    waiters.push_back(session);
+                }
+                return recovery == session;
+            }
+            if owners.len() < MAX_LOCAL_SCAN_OWNERS {
+                waiters.retain(|candidate| *candidate != recovery);
+                owners.insert(recovery);
+                if recovery == session {
+                    return true;
+                }
+                if !waiters.contains(&session) {
+                    waiters.push_back(session);
+                }
+                self.run_plan_turn(recovery, None, effects);
+                return false;
+            }
         }
         if owners.len() < MAX_LOCAL_SCAN_OWNERS && waiters.is_empty() {
             owners.insert(session);
@@ -3315,6 +3395,65 @@ impl CoordinatorRunner {
             waiters.push_back(session);
         }
         false
+    }
+
+    /// At an async boundary, transfer one ordinary scan slot to the exact
+    /// stable recovery waiter. rippled reaches the same boundary inside one
+    /// synchronous JtLedgerData job; without this handoff, Quaxar can let a
+    /// moving Generic scan repeatedly renew its 512-read/write continuation
+    /// while the phase owner waits with useful peer data already retained.
+    ///
+    /// A read-barrier owner is queued behind recovery. An owner that has just
+    /// submitted an incremental write is left unqueued because only its exact
+    /// WriteCompleted event may resume that plan.
+    fn yield_ordinary_scan_to_recovery(
+        &mut self,
+        session: SessionRef,
+        requeue: bool,
+        effects: &mut Vec<AcquisitionEffect>,
+    ) -> bool {
+        if !self.state.local_scan_owners.contains(&session)
+            || self.state.recovery_anchor_session == Some(session)
+            || self.state.validation_recovery_session == Some(session)
+            || self.state.sessions.get(&session).is_none_or(|state| {
+                !matches!(
+                    state.reason,
+                    AcquireReason::Generic | AcquireReason::History
+                ) || state.phase != SessionPhase::Active
+                    || state.plan.pending_read_count() != 0
+            })
+        {
+            return false;
+        }
+        let recovery = [
+            self.state.recovery_anchor_session,
+            self.state.validation_recovery_session,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|candidate| {
+            *candidate != session
+                && self.state.local_scan_waiters.contains(candidate)
+                && self
+                    .state
+                    .sessions
+                    .get(candidate)
+                    .is_some_and(|state| state.phase == SessionPhase::Active)
+        });
+        let Some(recovery) = recovery else {
+            return false;
+        };
+
+        self.state.local_scan_owners.remove(&session);
+        self.state
+            .local_scan_waiters
+            .retain(|candidate| *candidate != recovery && *candidate != session);
+        if requeue {
+            self.state.local_scan_waiters.push_back(session);
+        }
+        self.state.local_scan_owners.insert(recovery);
+        self.run_plan_turn(recovery, None, effects);
+        true
     }
 
     /// Select an exact recovery owner first, then retain admission order for
@@ -3383,7 +3522,7 @@ impl CoordinatorRunner {
         reply_peer: Option<PeerId>,
         effects: &mut Vec<AcquisitionEffect>,
     ) {
-        if !self.ensure_local_scan_permit(session) {
+        if !self.ensure_local_scan_permit(session, effects) {
             return;
         }
         self.stats.plan_turns += 1;
@@ -3514,10 +3653,14 @@ impl CoordinatorRunner {
                     self.discard_session_request_intents(session);
                 }
                 effects.push(AcquisitionEffect::SubmitWrite(batch));
-                // A non-final batch retains this scan's existing permit until
-                // its exact completion resumes the same owner. The owner is
-                // released only by the ensuing natural network/final/terminal
-                // boundary, matching one synchronous rippled JtLedgerData job.
+                if !final_batch {
+                    self.yield_ordinary_scan_to_recovery(session, false, effects);
+                }
+                // A non-final batch normally retains this scan's existing
+                // permit until its exact completion resumes the same owner.
+                // The sole exception above transfers the idle slot to an
+                // already-waiting exact recovery owner; this writer still
+                // resumes only from its exact completion.
             }
             PlanTurn::Invalid => {
                 self.release_local_scan_permit(session, effects);
@@ -10538,6 +10681,329 @@ mod tests {
                 .persistence(),
             crate::plan::SessionPersistence::None
         ));
+    }
+
+    #[test]
+    fn incremental_write_submission_yields_ordinary_owner_to_stable_recovery() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let ordinary = peer_request_session(&acquire_with_effects(&mut runner, 80));
+        let recovery = peer_request_session(&acquire_with_effects(&mut runner, 81));
+
+        {
+            let state = runner.state.sessions.get_mut(&ordinary).expect("ordinary");
+            state.reason = AcquireReason::Generic;
+            state.pending_header_read = None;
+            assert!(
+                state.plan.install_engine(Box::new(
+                    ScriptedEngine::new(
+                        TreePlanId::new(80),
+                        VecDeque::from([ScriptedStep::NeedsNetwork(vec![(
+                            SHAMapNodeId::default(),
+                            Uint256::from(80_040),
+                        )])]),
+                        vec![crate::io::PersistNode::new(
+                            SHAMapHash::new(Uint256::from(80_050)),
+                            bytes::Bytes::from_static(b"accepted-node"),
+                            crate::io::StoredObjectKind::AccountNode,
+                        )],
+                    )
+                    .with_persistence_sequence(80),
+                ))
+            );
+        }
+        {
+            let state = runner.state.sessions.get_mut(&recovery).expect("recovery");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(81),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(81_060)),
+                    81,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+        }
+        runner.state.local_scan_owners.insert(ordinary);
+        runner.state.local_scan_waiters.push_back(recovery);
+        runner.state.validation_recovery_session = Some(recovery);
+
+        let mut effects = Vec::new();
+        runner.run_plan_turn(ordinary, None, &mut effects);
+        let write_position = effects
+            .iter()
+            .position(|effect| {
+                matches!(
+                    effect,
+                    AcquisitionEffect::SubmitWrite(batch) if batch.operation().session() == ordinary
+                )
+            })
+            .expect("ordinary write is submitted");
+        let recovery_position = effects
+            .iter()
+            .position(|effect| {
+                matches!(
+                    effect,
+                    AcquisitionEffect::SubmitRead(read) if read.operation().session() == recovery
+                )
+            })
+            .expect("recovery read is submitted");
+        assert!(write_position < recovery_position);
+        assert!(
+            read_effects(&effects)
+                .iter()
+                .any(|read| read.operation().session() == recovery)
+        );
+        assert!(!runner.state.local_scan_owners.contains(&ordinary));
+        assert!(runner.state.local_scan_owners.contains(&recovery));
+        assert!(!runner.state.local_scan_waiters.contains(&ordinary));
+    }
+
+    #[test]
+    fn arriving_recovery_reclaims_only_an_ordinary_pending_writer() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let sessions = (90..95)
+            .map(|seq| peer_request_session(&acquire_with_effects(&mut runner, seq)))
+            .collect::<Vec<_>>();
+        let displaced = sessions[0];
+        let recovery_anchor = sessions[3];
+        let validation_recovery = sessions[4];
+
+        for session in &sessions[..3] {
+            runner
+                .state
+                .sessions
+                .get_mut(session)
+                .expect("ordinary")
+                .reason = AcquireReason::Generic;
+            runner.state.local_scan_owners.insert(*session);
+        }
+        {
+            let state = runner
+                .state
+                .sessions
+                .get_mut(&displaced)
+                .expect("displaced");
+            state.pending_header_read = None;
+            assert!(
+                state.plan.install_engine(Box::new(
+                    ScriptedEngine::new(
+                        TreePlanId::new(90),
+                        VecDeque::from([ScriptedStep::NeedsNetwork(vec![(
+                            SHAMapNodeId::default(),
+                            Uint256::from(90_040),
+                        )])]),
+                        vec![crate::io::PersistNode::new(
+                            SHAMapHash::new(Uint256::from(90_050)),
+                            bytes::Bytes::from_static(b"accepted-node"),
+                            crate::io::StoredObjectKind::AccountNode,
+                        )],
+                    )
+                    .with_persistence_sequence(90),
+                ))
+            );
+        }
+        let mut write_effects = Vec::new();
+        runner.run_plan_turn(displaced, None, &mut write_effects);
+        let write = write_batch(&write_effects);
+        assert!(runner.state.local_scan_owners.contains(&displaced));
+        runner.state.swept_local_scan_owners.insert(displaced);
+
+        {
+            let state = runner
+                .state
+                .sessions
+                .get_mut(&recovery_anchor)
+                .expect("recovery anchor");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(93),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(93_060)),
+                    93,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+        }
+        runner.state.local_scan_waiters.push_back(recovery_anchor);
+        runner.state.recovery_anchor_session = Some(recovery_anchor);
+        runner.state.validation_recovery_session = Some(validation_recovery);
+        let mut recovery_effects = Vec::new();
+        runner.run_plan_turn(validation_recovery, None, &mut recovery_effects);
+        assert!(
+            read_effects(&recovery_effects)
+                .iter()
+                .any(|read| read.operation().session() == recovery_anchor)
+        );
+        assert!(
+            read_effects(&recovery_effects)
+                .iter()
+                .all(|read| read.operation().session() != validation_recovery)
+        );
+        assert!(runner.state.local_scan_owners.contains(&recovery_anchor));
+        assert!(
+            runner
+                .state
+                .local_scan_waiters
+                .contains(&validation_recovery)
+        );
+        assert!(!runner.state.local_scan_owners.contains(&displaced));
+        assert!(runner.state.swept_local_scan_owners.contains(&displaced));
+
+        let resumed = runner.handle_event(AcquisitionEvent::WriteCompleted(WriteCompletion::new(
+            write.operation(),
+            WriteOutcome::Accepted,
+        )));
+        assert!(resumed.is_empty());
+        assert!(runner.state.local_scan_waiters.contains(&displaced));
+        assert!(runner.state.swept_local_scan_owners.contains(&displaced));
+        assert_eq!(runner.state.local_scan_owners.len(), MAX_LOCAL_SCAN_OWNERS);
+    }
+
+    #[test]
+    fn generic_provenance_exact_recovery_owner_is_never_displaced() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let exact = peer_request_session(&acquire_with_effects(&mut runner, 96));
+        let validation = peer_request_session(&acquire_with_effects(&mut runner, 97));
+
+        {
+            let state = runner
+                .state
+                .sessions
+                .get_mut(&exact)
+                .expect("exact recovery");
+            state.reason = AcquireReason::Generic;
+            state.pending_header_read = None;
+            assert!(
+                state.plan.install_engine(Box::new(
+                    ScriptedEngine::new(
+                        TreePlanId::new(96),
+                        VecDeque::from([ScriptedStep::NeedsNetwork(vec![(
+                            SHAMapNodeId::default(),
+                            Uint256::from(96_040),
+                        )])]),
+                        vec![crate::io::PersistNode::new(
+                            SHAMapHash::new(Uint256::from(96_050)),
+                            bytes::Bytes::from_static(b"accepted-node"),
+                            crate::io::StoredObjectKind::AccountNode,
+                        )],
+                    )
+                    .with_persistence_sequence(96),
+                ))
+            );
+        }
+        runner.state.recovery_anchor_session = Some(exact);
+        runner.state.validation_recovery_session = Some(validation);
+        runner.state.local_scan_owners.insert(exact);
+        runner.state.local_scan_waiters.push_back(validation);
+
+        let mut effects = Vec::new();
+        runner.run_plan_turn(exact, None, &mut effects);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            AcquisitionEffect::SubmitWrite(batch) if batch.operation().session() == exact
+        )));
+        assert!(runner.state.local_scan_owners.contains(&exact));
+        assert!(runner.state.local_scan_waiters.contains(&validation));
+        assert!(effects.iter().all(|effect| !matches!(
+            effect,
+            AcquisitionEffect::SubmitRead(read) if read.operation().session() == validation
+        )));
+    }
+
+    #[test]
+    fn completed_read_barrier_yields_ordinary_owner_to_stable_recovery() {
+        let budget = BudgetState::new(
+            8,
+            AdmissionBudget::new(600, 1 << 20),
+            Duration::from_secs(1),
+        );
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+        let ordinary = peer_request_session(&acquire_with_effects(&mut runner, 100));
+        let recovery = peer_request_session(&acquire_with_effects(&mut runner, 101));
+
+        {
+            let state = runner.state.sessions.get_mut(&ordinary).expect("ordinary");
+            state.reason = AcquireReason::Generic;
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(100),
+                VecDeque::from([
+                    ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                        SHAMapHash::new(Uint256::from(100_010)),
+                        100,
+                        SHAMapNodeId::default(),
+                        0,
+                    )]),
+                    ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                        SHAMapHash::new(Uint256::from(100_020)),
+                        100,
+                        SHAMapNodeId::default(),
+                        0,
+                    )]),
+                ]),
+                Vec::new(),
+            ))));
+        }
+        {
+            let state = runner.state.sessions.get_mut(&recovery).expect("recovery");
+            state.pending_header_read = None;
+            assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+                TreePlanId::new(101),
+                VecDeque::from([ScriptedStep::NeedsReads(vec![PlanReadNeed::new(
+                    SHAMapHash::new(Uint256::from(101_010)),
+                    101,
+                    SHAMapNodeId::default(),
+                    0,
+                )])]),
+                Vec::new(),
+            ))));
+        }
+        runner.state.local_scan_owners.insert(ordinary);
+        let mut first = Vec::new();
+        runner.run_plan_turn(ordinary, None, &mut first);
+        let first_read = read_effects(&first)[0].operation();
+        runner.state.local_scan_waiters.push_back(recovery);
+        runner.state.validation_recovery_session = Some(recovery);
+
+        let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
+            first_read,
+            ReadOutcome::Settled { node: None },
+        )));
+        assert!(
+            read_effects(&effects)
+                .iter()
+                .any(|read| read.operation().session() == recovery)
+        );
+        assert!(runner.state.local_scan_owners.contains(&recovery));
+        assert!(runner.state.local_scan_waiters.contains(&ordinary));
+        assert!(
+            read_effects(&effects)
+                .iter()
+                .all(|read| read.operation().session() != ordinary)
+        );
     }
 
     #[test]
