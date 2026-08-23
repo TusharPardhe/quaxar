@@ -1533,7 +1533,6 @@ impl InboundLedgers {
             .iter()
             .map(|peer| peer.id())
             .collect::<Vec<_>>();
-        let peerless = peers.is_empty();
         // A prior peerless demand may mint its session as this connectivity
         // fact restores peers; let that existing pending origin bind first.
         coordinator.connectivity(&peers);
@@ -1559,15 +1558,13 @@ impl InboundLedgers {
             AcquisitionEffect::SessionStarted(session) => Some(*session),
             _ => None,
         });
-        if !peerless
-            && session.is_none()
-            && !(reason == AcquireReason::Consensus
-                && coordinator.has_deferred_consensus_target(target))
-        {
-            // With usable peers, an empty start effect means coalescing or
-            // rejection, not deferred replay; retaining it could bind a later
-            // unrelated replacement session for the same target.
+        if session.is_none() && !coordinator.retains_session_origin_for_hash(hash) {
+            // Retain provenance only when the runner retained this exact
+            // demand as live/deferred work. In particular, a phase-neutral
+            // moving validation suppressed behind an exact recovery latch
+            // must not overwrite a genuine peerless Generic origin.
             coordinator.clear_pending_handoff_origin(hash, reason, acquisition_id, false);
+            self.coordinator_origins.remove(hash);
         }
         let Some(session) = session else {
             // An exact active target is intentionally coalesced by the runner:
@@ -2192,6 +2189,19 @@ impl InboundLedgers {
             let _ = self.coordinator_acquire_inner(hash, 0, AcquireReason::Consensus, true);
         } else {
             self.acquire_async(hash, 0, AcquireReason::Consensus);
+        }
+    }
+
+    /// Start the sequence-qualified Generic acquisition requested by
+    /// LedgerMaster::checkAccept for a quorum-backed validation miss. Preserve
+    /// rippled's Generic registry provenance while routing coordinator mode
+    /// through ValidationTarget, so successive validation tips cannot bypass
+    /// the exact phase-neutral recovery owner.
+    pub fn acquire_quorum_validation_ledger_async(&self, hash: Uint256, seq: u32) {
+        if self.coordinator_installed() {
+            let _ = self.coordinator_acquire_inner(hash, seq, AcquireReason::Generic, true);
+        } else {
+            self.acquire_async(hash, seq, AcquireReason::Generic);
         }
     }
 
@@ -4110,6 +4120,34 @@ mod tests {
             registry.coordinator_validation_recovery_latch(),
             (Some((Uint256::from(70), 70)), None)
         );
+    }
+
+    #[test]
+    fn quorum_validation_misses_use_validation_target_provenance() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        registry.set_phase_state(Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Full,
+        )));
+        assert!(registry.install_coordinator());
+        let anchor = (Uint256::from(80), 80);
+        assert!(registry.coordinator_validation_recovery_target(Some(anchor)));
+
+        for seq in 81..181 {
+            registry.acquire_quorum_validation_ledger_async(Uint256::from(seq), seq as u32);
+        }
+
+        let snapshot = registry
+            .coordinator_snapshot()
+            .expect("coordinator snapshot");
+        assert_eq!(snapshot.session_count(), 0);
+        assert_eq!(
+            registry.coordinator_validation_recovery_latch().0,
+            Some(anchor)
+        );
+        assert_eq!(registry.coordinator_origins.len(), 1);
     }
 
     #[test]

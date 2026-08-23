@@ -1895,7 +1895,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
 /// preferred hash.
 ///
 /// When the coordinator owns service phase this feeds the typed
-/// `PreferredLclDivergence` fact (demoting `Tracking/Full -> Syncing` without
+/// `PreferredLclDivergence` fact (`Connected/Tracking/Full -> Syncing` without
 /// minting a session); otherwise the legacy direct write remains. The caller
 /// must run this before any `acquire_closed_ledger_async` demand so the
 /// demotion drains first and the demand is accepted from `Syncing`.
@@ -1904,14 +1904,19 @@ fn demote_for_preferred_lcl_divergence(
     shared_inbound: &Arc<InboundLedgers>,
     target: acquisition::LedgerTarget,
 ) {
+    // Coordinator recovery is actionable from Connected as well as
+    // Tracking/Full: Connected describes operating mode, not the absence of a
+    // concrete wrong-ledger target. Feed the typed fact first so the exact
+    // recovery owner becomes stable before its acquire demand. The legacy
+    // direct mode write remains meaningful only as a Tracking/Full demotion.
+    if shared_inbound.coordinator_installed() {
+        shared_inbound.coordinator_preferred_lcl_divergence(target);
+        return;
+    }
     if !matches!(
         root.network_ops_operating_mode(),
         NetworkOpsOperatingMode::Tracking | NetworkOpsOperatingMode::Full
     ) {
-        return;
-    }
-    if shared_inbound.coordinator_installed() {
-        shared_inbound.coordinator_preferred_lcl_divergence(target);
         return;
     }
     root.set_network_ops_operating_mode_with_reason(

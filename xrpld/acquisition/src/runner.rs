@@ -1724,10 +1724,11 @@ impl CoordinatorRunner {
         // The exact anchor hash remains admissible, and Syncing LCL recovery
         // is deliberately unaffected.
         if reason == AcquireReason::Consensus
-            && matches!(
-                self.state.phase,
-                SyncPhase::Tracking { .. } | SyncPhase::Full { .. }
-            )
+            && (phase_neutral
+                || matches!(
+                    self.state.phase,
+                    SyncPhase::Tracking { .. } | SyncPhase::Full { .. }
+                ))
             && self
                 .state
                 .validation_recovery_target

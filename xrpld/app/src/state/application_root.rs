@@ -9001,11 +9001,7 @@ impl ApplicationRoot {
                 let mut acquisition_dispatched = false;
                 if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                     if let Some(shared) = guard.as_ref() {
-                        shared.acquire_async(
-                            hash,
-                            seq,
-                            crate::ledger::inbound_ledgers::AcquireReason::Generic,
-                        );
+                        shared.acquire_quorum_validation_ledger_async(hash, seq);
                         acquisition_dispatched = true;
                     }
                 }

@@ -197,6 +197,13 @@ fn coordinator_should_report_no_consensus_positions(positions: usize, _peer_coun
     positions == 0
 }
 
+fn validation_recovery_conflicts_with_parent(
+    recovery: Option<(Uint256, u32)>,
+    parent: Uint256,
+) -> bool {
+    recovery.is_some_and(|(hash, _)| hash != parent)
+}
+
 /// The open-ledger view consensus reads current (not-yet-consensus-agreed)
 /// transactions from, and resets once a round is accepted.
 pub trait RclConsensusOpenLedgerSource {
@@ -1935,6 +1942,7 @@ mod tests {
         disputed_relay_envelope, median_close_offset_seconds, pseudo_transaction_voting_enabled,
         reset_inbound_transactions_for_resolved_consensus_ledger,
         trusted_validation_quorum_reached, update_operating_mode_after_accept,
+        validation_recovery_conflicts_with_parent,
     };
     use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
     use crate::network::network_ops::{
@@ -2000,6 +2008,20 @@ mod tests {
             10,
             "the self sample retains exactly one vote"
         );
+    }
+
+    #[test]
+    fn different_validation_recovery_parent_vetoes_proposing_until_exact_match() {
+        let parent = Uint256::from(10);
+        assert!(!validation_recovery_conflicts_with_parent(None, parent));
+        assert!(!validation_recovery_conflicts_with_parent(
+            Some((parent, 10)),
+            parent
+        ));
+        assert!(validation_recovery_conflicts_with_parent(
+            Some((Uint256::from(11), 11)),
+            parent
+        ));
     }
 
     fn failed_candidate_test_runner(root: &mut ApplicationRoot) -> AppConsensus {
@@ -2543,8 +2565,24 @@ impl ConsensusRunner for AppConsensus {
             self.adaptor.network_ops_mode_owner.set_unl_blocked(false);
         }
         let validating = self.adaptor.update_validating_for_round(&prev_ledger);
+        // A Full node may still have a locally usable parent while a strict
+        // validation-backed recovery tree for a different network ledger is
+        // being acquired. rippled's acquisition normally resolves this
+        // transient quickly; Quaxar's externalized tree build can span many
+        // rounds. Observe during that interval instead of proposing on a
+        // known stale local fork. Normal proposing resumes after exact durable
+        // recovery clears the latch or when the latch already names this
+        // round's concrete parent.
+        let local_parent_hash = *lcl.header().hash.as_uint256();
+        let validation_recovery = self
+            .adaptor
+            .coordinator_inbound()
+            .and_then(|inbound| inbound.coordinator_validation_recovery_latch().0);
+        let conflicting_validation_recovery =
+            validation_recovery_conflicts_with_parent(validation_recovery, local_parent_hash);
         let actual_proposing = proposing
             && validating
+            && !conflicting_validation_recovery
             && self.adaptor.network_ops_mode_owner.operating_mode()
                 == crate::network::network_ops::NetworkOpsOperatingMode::Full;
         tracing::debug!(
@@ -2554,6 +2592,7 @@ impl ConsensusRunner for AppConsensus {
             local_parent_seq = lcl.header().seq,
             requested_proposing = proposing,
             actual_proposing,
+            conflicting_validation_recovery,
             is_validator = self.adaptor.is_validator(),
             validating,
             standalone = self.adaptor.options.standalone,
