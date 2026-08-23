@@ -103,9 +103,10 @@ pub struct PreferredLclDiagnostic<Seq, Id> {
     /// source-equivalent selector above.
     pub acquired_recovery_peer_support: Option<u32>,
     /// Exact unacquired ledger whose current trusted-full waiters form a
-    /// strict majority and whose hash is also the strict-majority peer LCL.
-    /// This is acquisition advice only: it never changes `selected` or the
-    /// rippled-compatible preferred-ledger ordering.
+    /// strict majority. Peer-LCL support is diagnostic only: peers may already
+    /// report a later ledger while this exact validated ancestor is still the
+    /// safe asynchronous catch-up anchor. This is acquisition advice only: it
+    /// never changes `selected` or rippled-compatible preferred-ledger ordering.
     pub validation_recovery_candidate: Option<(Seq, Id)>,
     pub validation_recovery_support: Option<usize>,
     pub validation_recovery_peer_support: Option<u32>,
@@ -1134,18 +1135,9 @@ impl<A: ValidationsAdaptor> Validations<A> {
                 (support > current_trusted_full_count / 2).then_some((key.0, key.1, support))
             })
             .max_by(|left, right| (left.2, left.0, left.1).cmp(&(right.2, right.0, right.1)));
-        let peer_total = peer_counts
-            .values()
-            .fold(0_u32, |total, count| total.saturating_add(*count));
         let validation_recovery_advice = acquiring_quorum_candidate.and_then(|candidate| {
             let peer_support = peer_counts.get(&candidate.1).copied().unwrap_or_default();
-            let dominates_peers = peer_preferred
-                .is_some_and(|(peer_hash, _)| peer_hash == candidate.1)
-                && peer_support > peer_total / 2;
-            (candidate.0 >= min_seq
-                && candidate.0 > lcl.seq()
-                && candidate.1 != lcl.id()
-                && dominates_peers)
+            (candidate.0 >= min_seq && candidate.0 > lcl.seq() && candidate.1 != lcl.id())
                 .then_some((candidate.0, candidate.1, candidate.2, peer_support))
         });
 
@@ -1865,10 +1857,12 @@ mod tests {
     }
 
     #[test]
-    fn validation_recovery_requires_strict_validation_and_peer_majorities() {
+    fn validation_recovery_requires_a_strict_validation_majority_not_peer_tip_equality() {
         let adaptor = MockAdaptor::new(1000);
         let local_lcl = ledger_at(10, 10);
         let network_lcl = ledger_at(20, 42);
+        let quorum_anchor = ledger_at(21, 43);
+        let moving_peer_tip = ledger_at(22, 44);
         adaptor.register_ledger(local_lcl.clone());
         let validations = Validations::new(ValidationParms::default(), adaptor);
 
@@ -1896,6 +1890,10 @@ mod tests {
                 ValStatus::Current
             );
         }
+        assert_eq!(
+            validations.add(7, val(local_lcl.id(), local_lcl.seq(), 1000, 7, 7),),
+            ValStatus::Current
+        );
 
         let tied_validations = BTreeMap::from([(network_lcl.id(), 9), (local_lcl.id(), 1)]);
         let diagnostic = validations.get_preferred_lcl_diagnostic(
@@ -1905,19 +1903,39 @@ mod tests {
         );
         assert_eq!(diagnostic.validation_recovery_candidate, None);
 
-        // A validation majority without a peer majority is likewise not
-        // sufficient acquisition policy.
-        assert_eq!(
-            validations.add(4, val(network_lcl.id(), network_lcl.seq() + 1, 1001, 4, 4)),
-            ValStatus::Current
-        );
-        let no_peer_majority = BTreeMap::from([(network_lcl.id(), 5), (local_lcl.id(), 5)]);
+        // The exact trusted-full quorum is authoritative acquisition
+        // provenance even when every peer has already advanced to a different
+        // child. Requiring peer-tip equality here strands the safe ancestor
+        // behind a moving three-second network tip.
+        for node_id in 1..=6 {
+            assert_eq!(
+                validations.add(
+                    node_id,
+                    val(
+                        quorum_anchor.id(),
+                        quorum_anchor.seq(),
+                        1001,
+                        node_id,
+                        node_id
+                    ),
+                ),
+                ValStatus::Current
+            );
+        }
+        let later_peer_majority = BTreeMap::from([(moving_peer_tip.id(), 10)]);
         let diagnostic = validations.get_preferred_lcl_diagnostic(
             &local_lcl,
             local_lcl.seq(),
-            &no_peer_majority,
+            &later_peer_majority,
         );
-        assert_eq!(diagnostic.validation_recovery_candidate, None);
+        assert_eq!(diagnostic.selected, local_lcl.id());
+        assert_eq!(
+            diagnostic.validation_recovery_candidate,
+            Some((quorum_anchor.seq(), quorum_anchor.id()))
+        );
+        assert_eq!(diagnostic.validation_recovery_support, Some(6));
+        assert_eq!(diagnostic.validation_recovery_peer_support, Some(0));
+        assert_eq!(diagnostic.peer_preferred, Some((moving_peer_tip.id(), 10)));
     }
 
     #[test]
