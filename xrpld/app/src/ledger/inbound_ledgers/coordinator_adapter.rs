@@ -757,6 +757,11 @@ where
         self.runner.has_deferred_consensus_target(target)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn current_validation_target(&self) -> Option<acquisition::LedgerTarget> {
+        self.runner.latest_validation_target()
+    }
+
     pub(crate) fn has_unbound_validation_recovery_target(
         &self,
         target: acquisition::LedgerTarget,

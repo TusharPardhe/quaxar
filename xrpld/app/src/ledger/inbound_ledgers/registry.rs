@@ -1457,6 +1457,15 @@ impl InboundLedgers {
         )
     }
 
+    #[cfg(test)]
+    fn coordinator_validation_target(&self) -> Option<acquisition::LedgerTarget> {
+        self.coordinator
+            .lock()
+            .expect("coordinator lock")
+            .as_ref()
+            .and_then(ProductionAdapter::current_validation_target)
+    }
+
     /// True when rippled's recent-failure cache must suppress non-consensus
     /// re-admission. Consensus remains exempt because an advancing preferred
     /// LCL must be allowed to retry independently of history backfill.
@@ -1558,6 +1567,8 @@ impl InboundLedgers {
             AcquisitionEffect::SessionStarted(session) => Some(*session),
             _ => None,
         });
+        self.coordinator_origins
+            .retain_targets(|target| coordinator.retains_session_origin_for_hash(target));
         if session.is_none() && !coordinator.retains_session_origin_for_hash(hash) {
             // Retain provenance only when the runner retained this exact
             // demand as live/deferred work. In particular, a phase-neutral
@@ -2193,13 +2204,12 @@ impl InboundLedgers {
     }
 
     /// Start the sequence-qualified Generic acquisition requested by
-    /// LedgerMaster::checkAccept for a quorum-backed validation miss. Preserve
-    /// rippled's Generic registry provenance while routing coordinator mode
-    /// through ValidationTarget, so successive validation tips cannot bypass
-    /// the exact phase-neutral recovery owner.
-    pub fn acquire_quorum_validation_ledger_async(&self, hash: Uint256, seq: u32) {
+    /// LedgerMaster::checkAccept for a trusted-validation miss. This is
+    /// an ordinary Generic demand in both registry modes, matching rippled;
+    /// only `RCLValidationsAdaptor::GetConsL2` uses `ValidationTarget`.
+    pub fn acquire_check_accept_ledger_async(&self, hash: Uint256, seq: u32) {
         if self.coordinator_installed() {
-            let _ = self.coordinator_acquire_inner(hash, seq, AcquireReason::Generic, true);
+            let _ = self.coordinator_acquire_inner(hash, seq, AcquireReason::Generic, false);
         } else {
             self.acquire_async(hash, seq, AcquireReason::Generic);
         }
@@ -4123,7 +4133,7 @@ mod tests {
     }
 
     #[test]
-    fn quorum_validation_misses_use_validation_target_provenance() {
+    fn check_accept_misses_remain_generic_without_mutating_recovery_latch() {
         use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
 
         let worker_pool = Arc::new(WorkerPool::new(0));
@@ -4136,18 +4146,64 @@ mod tests {
         assert!(registry.coordinator_validation_recovery_target(Some(anchor)));
 
         for seq in 81..181 {
-            registry.acquire_quorum_validation_ledger_async(Uint256::from(seq), seq as u32);
+            registry.acquire_check_accept_ledger_async(Uint256::from(seq), seq as u32);
         }
 
+        assert_eq!(
+            registry.coordinator_validation_recovery_latch(),
+            (Some(anchor), None),
+            "ordinary checkAccept misses must not become moving validation targets"
+        );
         let snapshot = registry
             .coordinator_snapshot()
             .expect("coordinator snapshot");
-        assert_eq!(snapshot.session_count(), 0);
         assert_eq!(
-            registry.coordinator_validation_recovery_latch().0,
-            Some(anchor)
+            snapshot
+                .active_by_reason()
+                .get(&acquisition::AcquireReason::Consensus),
+            None,
+            "checkAccept Generic misses must not be promoted to consensus priority"
         );
-        assert_eq!(registry.coordinator_origins.len(), 1);
+        assert_eq!(
+            registry.coordinator_validation_target(),
+            None,
+            "checkAccept Generic misses must not mutate GetConsL2 validation-target state"
+        );
+    }
+
+    #[test]
+    fn peerless_moving_check_accept_origins_follow_the_bounded_generic_owner() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        registry.set_phase_state(Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Full,
+        )));
+        assert!(registry.install_coordinator());
+
+        for seq in 81..181 {
+            registry.acquire_check_accept_ledger_async(Uint256::from(seq), seq as u32);
+        }
+
+        assert_eq!(
+            registry.coordinator_origins.len(),
+            1,
+            "superseded peerless Generic tips must not leak hash-keyed origin metadata"
+        );
+        assert_eq!(
+            registry.coordinator_validation_target(),
+            None,
+            "peerless checkAccept Generic misses must not become ValidationTargets"
+        );
+
+        let get_cons_l2 = Uint256::from(200);
+        registry.acquire_validation_ledger_async(get_cons_l2);
+        assert_eq!(
+            registry.coordinator_validation_target(),
+            Some(acquisition::LedgerTarget::new(get_cons_l2, None)),
+            "GetConsL2 remains the dedicated consensus-priority ValidationTarget path"
+        );
     }
 
     #[test]

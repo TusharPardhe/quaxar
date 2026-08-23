@@ -939,6 +939,16 @@ impl CoordinatorSessionOrigins {
             .remove(&target);
     }
 
+    /// Drop provenance whose coordinator demand was superseded before it
+    /// minted a session. The runner bounds peerless ordinary work to its
+    /// newest target, so this sidecar map must follow the same ownership set.
+    pub(crate) fn retain_targets(&self, mut retain: impl FnMut(Uint256) -> bool) {
+        self.map
+            .write()
+            .expect("session origin lock")
+            .retain(|target, _| retain(*target));
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.read().expect("session origin lock").len()

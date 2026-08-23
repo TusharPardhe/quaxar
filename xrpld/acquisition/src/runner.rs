@@ -852,6 +852,12 @@ impl CoordinatorRunner {
         self.state.deferred_consensus_acquire == Some(target)
     }
 
+    /// Newest trusted-validation target supplied by `GetConsL2`. Ordinary
+    /// Generic acquisitions must never mutate this phase-neutral owner hint.
+    pub const fn latest_validation_target(&self) -> Option<LedgerTarget> {
+        self.state.latest_validation_target
+    }
+
     /// True when `target` is the exact phase-neutral validation-recovery latch,
     /// including while it waits peerless or for a bounded session slot.
     pub fn has_validation_recovery_target(&self, target: LedgerTarget) -> bool {
