@@ -823,7 +823,13 @@ impl SessionPlan {
         self.network_lanes
             .extend(added_peers.into_iter().map(NetworkLane::Added));
         if was_empty {
-            self.reset_network_epoch();
+            // Keep any actor-visible exact frontier while rebuilding the
+            // SHAMap view. A useful partial reply may have cleared that
+            // frontier while `recent_nodes` suppressed the unanswered
+            // candidates produced by the reply scan. rippled's Timeout
+            // trigger clears `recentNodes_` and calls `getMissingNodes` again;
+            // restarting the engine scan here makes those retained SHAMap
+            // edges visible again without duplicating an extant actor need.
             if !self.network_lanes.is_empty()
                 && let Some(engine) = self.engine.as_mut()
             {
@@ -1202,16 +1208,12 @@ impl SessionPlan {
                     let peer = PeerId::new(peer);
                     self.network_lanes.push_back(NetworkLane::Reply(peer));
                 }
-                if was_empty
-                    && !self.network_lanes.is_empty()
-                    && let Some(engine) = self.engine.as_mut()
-                {
-                    self.network_backlog.clear();
-                    self.pending_network.clear();
-                    self.retained_network.clear();
-                    self.unemitted_network.clear();
-                    self.retained_network_cursor = 0;
-                    engine.begin_reply_scan();
+                if was_empty && !self.network_lanes.is_empty() && self.engine.is_some() {
+                    self.reset_network_epoch();
+                    self.engine
+                        .as_mut()
+                        .expect("engine presence checked before epoch reset")
+                        .begin_reply_scan();
                 }
             }
             // When a retained frontier is full, packet attachment is allowed
@@ -3035,6 +3037,44 @@ mod tests {
             .map(|offset| needs[(next_start + offset) % needs.len()])
             .collect::<Vec<_>>();
         assert_eq!(plan.next_timeout_recovery_batch(), expected_next);
+    }
+
+    #[test]
+    fn timeout_scan_republishes_a_recent_edge_hidden_after_a_partial_reply() {
+        let mut ids = IdCounter::new();
+        let s = session();
+        let need = PlanNetworkNeed::new(
+            SHAMapNodeId::default(),
+            Uint256::from(0x77),
+            TreeKind::State,
+        );
+        let mut plan = scripted(
+            1,
+            vec![
+                ScriptedStep::NeedsNetworkWithKind(vec![need]),
+                // A fresh SHAMap reply/timeout scan sees the same still-missing
+                // edge again.
+                ScriptedStep::NeedsNetworkWithKind(vec![need]),
+            ],
+        );
+
+        let PlanTurn::Network(_) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("expected initial network frontier");
+        };
+        assert_eq!(plan.take_next_normal_network_batch(1), vec![need]);
+
+        // A useful partial reply starts a new scan and clears the actor-side
+        // epoch. Its unanswered sibling remains owned by the SHAMap plan, but
+        // was recently requested and therefore was not re-published.
+        plan.reset_network_epoch();
+        assert!(plan.pending_network().is_empty());
+
+        plan.begin_timeout_scan(vec![PeerId::new(1)], std::iter::empty());
+        let PlanTurn::Network(republished) = plan.run_turn(&mut ctx(s, &mut ids)) else {
+            panic!("timeout must rebuild the hidden SHAMap frontier");
+        };
+        assert_eq!(republished, vec![need]);
+        assert_eq!(plan.pending_network(), &BTreeSet::from([need.hash()]));
     }
 
     #[test]

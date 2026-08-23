@@ -801,9 +801,13 @@ impl CoordinatorRunner {
             AcquisitionEvent::RegistrySweep => self.on_registry_sweep(),
             AcquisitionEvent::Heartbeat => self.on_heartbeat(),
         };
-        self.replay_deferred_consensus(&mut effects);
         self.reconcile_validation_owner();
         self.reconcile_validation_recovery_owner(&mut effects);
+        // A terminal validation-recovery owner must clear or promote its exact
+        // successor before ordinary preferred work observes the freed slot.
+        // Replaying first can admit a moving consensus tip, then admit the
+        // promoted recovery candidate in the same event.
+        self.replay_deferred_consensus(&mut effects);
         self.reconcile_recovery_anchor();
         self.enforce_recovery_anchor_phase(&mut effects);
         self.promote_latest_viable_syncing_anchor(&mut effects);
@@ -830,9 +834,9 @@ impl CoordinatorRunner {
         }
         let count = completions.len() as u64;
         let mut effects = self.on_read_batch(completions);
-        self.replay_deferred_consensus(&mut effects);
         self.reconcile_validation_owner();
         self.reconcile_validation_recovery_owner(&mut effects);
+        self.replay_deferred_consensus(&mut effects);
         self.reconcile_recovery_anchor();
         self.enforce_recovery_anchor_phase(&mut effects);
         self.promote_latest_viable_syncing_anchor(&mut effects);
@@ -1655,7 +1659,8 @@ impl CoordinatorRunner {
             .sessions
             .iter()
             .filter(|(session, state)| {
-                state.reason == AcquireReason::Consensus && state.phase == SessionPhase::Dormant
+                state.reason == AcquireReason::Consensus
+                    && state.phase == SessionPhase::Dormant
                     && recovery_anchor != Some(**session)
                     && validation_recovery != Some(**session)
             })
@@ -1721,26 +1726,6 @@ impl CoordinatorRunner {
         phase_neutral: bool,
     ) -> Vec<AcquisitionEffect> {
         let mut effects = Vec::new();
-        // NetworkOps reports a moving preferred ledger through both
-        // ConsensusTarget and AcquireRequested, while trusted validation has
-        // its own ValidationTarget path. Centralize the recovery gate here so
-        // none of those production paths can mint competing sessions while a
-        // phase-neutral exact recovery tree is restoring a Full/Tracking node.
-        // The exact anchor hash remains admissible, and Syncing LCL recovery
-        // is deliberately unaffected.
-        if reason == AcquireReason::Consensus
-            && (phase_neutral
-                || matches!(
-                    self.state.phase,
-                    SyncPhase::Tracking { .. } | SyncPhase::Full { .. }
-                ))
-            && self
-                .state
-                .validation_recovery_target
-                .is_some_and(|anchor| anchor.hash() != target.hash())
-        {
-            return effects;
-        }
         let authoritative_recovery_demand = reason == AcquireReason::Consensus
             && !phase_neutral
             && self
@@ -1753,6 +1738,50 @@ impl CoordinatorRunner {
                 .state
                 .validation_recovery_target
                 .is_some_and(|anchor| anchor.hash() == target.hash());
+        // NetworkOps reports a moving preferred ledger through both
+        // ConsensusTarget and AcquireRequested, while trusted validation has
+        // its own ValidationTarget path. Centralize the recovery gate here so
+        // none of those production paths can mint competing sessions while a
+        // phase-neutral exact recovery tree is restoring a Full/Tracking node.
+        // The exact anchor hash remains admissible. Once validation recovery
+        // is the stable NetworkOps target, its ownership applies in Syncing as
+        // well as Full/Tracking; otherwise a terminal owner can spawn both a
+        // moving preferred session and its promoted exact successor.
+        if reason == AcquireReason::Consensus
+            && self
+                .state
+                .validation_recovery_target
+                .is_some_and(|anchor| anchor.hash() != target.hash())
+        {
+            if preferred_target || authoritative_recovery_demand {
+                self.state.deferred_consensus_acquire = Some(target);
+            }
+            return effects;
+        }
+
+        // Rippled retains a failed InboundLedger in its hash registry for one
+        // minute; repeated acquire() calls return that failed actor until the
+        // sweep removes it. Our terminal session retains the same graph for
+        // the same interval, so do not mint a same-hash replacement around it.
+        // An authoritative unbound demand remains latched and is replayed by
+        // the TerminalRetention event immediately after the tombstone is reaped.
+        if self.state.sessions.iter().any(|(session, state)| {
+            session.target_hash() == target.hash()
+                && matches!(state.phase, SessionPhase::Failed { .. })
+        }) {
+            if preferred_target || authoritative_recovery_demand {
+                self.state.deferred_consensus_acquire = Some(target);
+            }
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "acquire_suppressed_by_failed_tombstone",
+                target_hash = %target.hash(),
+                target_seq = ?target.sequence(),
+                ?reason,
+                "acquisition trace: failed same-hash owner retained until terminal sweep"
+            );
+            return effects;
+        }
         let stable_priority_demand =
             authoritative_recovery_demand || authoritative_validation_recovery_demand;
         let moving_preferred_observation = preferred_target
@@ -2511,6 +2540,20 @@ impl CoordinatorRunner {
                         } else {
                             (peers_before_add, added_peers)
                         };
+                        // `InboundLedger::trigger(Timeout)` performs a fresh
+                        // getMissingNodes scan after clearing `recentNodes_`.
+                        // Retrying only the actor's retained batch can be
+                        // empty after a useful partial reply: the unanswered
+                        // edges still live in the SHAMap continuation but the
+                        // Reply scan suppressed them as recently requested.
+                        // Re-enter the existing timeout lanes so that scan can
+                        // re-publish those exact edges before another deadline.
+                        if let Some(state) = self.state.sessions.get_mut(&session) {
+                            state.plan.begin_timeout_scan(
+                                timeout_peers.clone(),
+                                added_trigger_peers.clone(),
+                            );
+                        }
                         self.send_timeout_frontier_requests_to_peers(
                             session,
                             &nodes,
@@ -7534,6 +7577,191 @@ mod tests {
     }
 
     #[test]
+    fn validation_recovery_promotes_before_replaying_deferred_consensus() {
+        let full = SyncPhase::Full {
+            lcl: identity(40),
+            published: identity(40),
+        };
+        let mut runner = CoordinatorRunner::with_phase(RunEpoch::new(1), full);
+        runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(1)]),
+        ));
+        let first = target(190);
+        let next = target(191);
+        let moving = target(192);
+
+        let first_session = peer_request_session(
+            &runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(first))),
+        );
+        let candidate = runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(next)));
+        assert!(
+            candidate
+                .iter()
+                .all(|effect| !matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+
+        // Entering Syncing must not weaken the exact validation-recovery
+        // ownership. The moving preferred target remains bounded metadata.
+        runner.handle_event(AcquisitionEvent::PreferredLclDivergence { target: moving });
+        let deferred = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: moving,
+            reason: AcquireReason::Consensus,
+        });
+        assert!(
+            deferred
+                .iter()
+                .all(|effect| !matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+        assert_eq!(runner.state.deferred_consensus_acquire, Some(moving));
+
+        let rotated = runner.handle_event(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
+        let started = rotated
+            .iter()
+            .filter_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].target_hash(), next.hash());
+        assert_ne!(started[0], first_session);
+        assert_eq!(runner.state.validation_recovery_target, Some(next));
+        assert_eq!(runner.state.validation_recovery_session, Some(started[0]));
+        assert_eq!(runner.state.deferred_consensus_acquire, Some(moving));
+        assert!(
+            runner
+                .state
+                .sessions
+                .iter()
+                .all(|(session, state)| session.target_hash() != moving.hash()
+                    || state.phase().is_terminal())
+        );
+    }
+
+    #[test]
+    fn failed_validation_recovery_waits_for_terminal_retention_then_retries() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let recovery = target(199);
+        let failed_session = peer_request_session(
+            &runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(recovery))),
+        );
+
+        let mut failure_effects = Vec::new();
+        runner.fail_session(
+            failed_session,
+            FailureReason::AcquisitionTimeout,
+            &mut failure_effects,
+        );
+        let retention = runner
+            .session(failed_session)
+            .expect("failed actor remains registered")
+            .pending_timer()
+            .expect("failed actor has a retention timer")
+            .1;
+
+        let immediate =
+            runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(recovery)));
+        assert!(
+            immediate
+                .iter()
+                .all(|effect| !matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+        assert_eq!(runner.state.validation_recovery_target, Some(recovery));
+        assert_eq!(runner.state.validation_recovery_session, None);
+        assert!(matches!(
+            runner
+                .session(failed_session)
+                .expect("failed tombstone remains until its sweep")
+                .phase(),
+            SessionPhase::Failed { .. }
+        ));
+
+        let retried = runner.handle_event(AcquisitionEvent::TimerFired {
+            operation: retention,
+            timer: TimerKind::TerminalRetention,
+        });
+        let replacement = retried
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("retained recovery demand retries after the failed tombstone is swept");
+        assert_ne!(replacement, failed_session);
+        assert_eq!(replacement.target_hash(), recovery.hash());
+        assert!(runner.session(failed_session).is_none());
+        assert_eq!(runner.state.validation_recovery_target, Some(recovery));
+        assert_eq!(runner.state.validation_recovery_session, Some(replacement));
+    }
+
+    #[test]
+    fn failed_preferred_anchor_restarts_after_terminal_retention() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let recovery = target(209);
+        let failed_session =
+            peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
+                ConsensusTarget::new(recovery, AcquireReason::Consensus),
+            )));
+        assert_eq!(runner.state.recovery_anchor_target, Some(recovery));
+        assert_eq!(runner.state.recovery_anchor_session, Some(failed_session));
+
+        let mut failure_effects = Vec::new();
+        runner.fail_session(
+            failed_session,
+            FailureReason::AcquisitionTimeout,
+            &mut failure_effects,
+        );
+        let retention = runner
+            .session(failed_session)
+            .expect("failed actor remains registered")
+            .pending_timer()
+            .expect("failed actor has a retention timer")
+            .1;
+        // Model the normal terminal event boundary before NetworkOps repeats
+        // its still-authoritative preferred target.
+        runner.reconcile_recovery_anchor();
+        assert_eq!(runner.state.recovery_anchor_target, None);
+
+        let immediate = runner.handle_event(AcquisitionEvent::ConsensusTarget(
+            ConsensusTarget::new(recovery, AcquireReason::Consensus),
+        ));
+        assert!(
+            immediate
+                .iter()
+                .all(|effect| !matches!(effect, AcquisitionEffect::SessionStarted(_)))
+        );
+        assert_eq!(runner.state.recovery_anchor_target, Some(recovery));
+        assert_eq!(runner.state.recovery_anchor_session, None);
+        assert_eq!(runner.state.deferred_consensus_acquire, Some(recovery));
+
+        let retried = runner.handle_event(AcquisitionEvent::TimerFired {
+            operation: retention,
+            timer: TimerKind::TerminalRetention,
+        });
+        let replacement = retried
+            .iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(*session),
+                _ => None,
+            })
+            .expect("preferred recovery retries when its failed actor leaves the hash registry");
+        assert_ne!(replacement, failed_session);
+        assert_eq!(replacement.target_hash(), recovery.hash());
+        assert_eq!(runner.state.deferred_consensus_acquire, None);
+        assert_eq!(runner.state.recovery_anchor_target, Some(recovery));
+        assert_eq!(runner.state.recovery_anchor_session, Some(replacement));
+        assert!(runner.request_intent_is_p0(&RequestIntent {
+            session: replacement,
+            peer: PeerId::new(1),
+            request: LedgerDataRequest::GetLedger {
+                sequence: recovery.sequence(),
+            },
+        }));
+    }
+
+    #[test]
     fn validation_recovery_preempts_lower_priority_and_survives_peerless_start() {
         let budget = BudgetState::new(1, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
         let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
@@ -7636,10 +7864,7 @@ mod tests {
             effect,
             AcquisitionEffect::CancelSession(_) | AcquisitionEffect::SessionStarted(_)
         )));
-        assert_eq!(
-            runner.state.validation_recovery_target,
-            Some(validation)
-        );
+        assert_eq!(runner.state.validation_recovery_target, Some(validation));
         assert_eq!(
             runner.state.validation_recovery_session,
             Some(validation_session)
@@ -7679,9 +7904,9 @@ mod tests {
         let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
         connect(&mut runner);
         let validation = target(220);
-        let validation_session = peer_request_session(&runner.handle_event(
-            AcquisitionEvent::ValidationRecoveryTarget(Some(validation)),
-        ));
+        let validation_session = peer_request_session(
+            &runner.handle_event(AcquisitionEvent::ValidationRecoveryTarget(Some(validation))),
+        );
         runner
             .state
             .sessions
@@ -7714,9 +7939,7 @@ mod tests {
         assert_eq!(runner.state.deferred_consensus_acquire, Some(preferred));
         assert_eq!(runner.snapshot().sessions_cancelled(), 0);
 
-        let terminal = runner.handle_event(AcquisitionEvent::StoreRotated(
-            StoreGeneration::new(2),
-        ));
+        let terminal = runner.handle_event(AcquisitionEvent::StoreRotated(StoreGeneration::new(2)));
         assert!(terminal.iter().any(|effect| {
             matches!(effect, AcquisitionEffect::CancelSession(session) if *session == validation_session)
         }));
@@ -7755,13 +7978,13 @@ mod tests {
     fn authoritative_request_and_scan_rank_above_validation_recovery() {
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         connect(&mut runner);
-        let validation = peer_request_session(&runner.handle_event(
-            AcquisitionEvent::ValidationRecoveryTarget(Some(target(210))),
-        ));
         let authoritative =
             peer_request_session(&runner.handle_event(AcquisitionEvent::ConsensusTarget(
                 ConsensusTarget::new(target(211), AcquireReason::Consensus),
             )));
+        let validation = peer_request_session(&runner.handle_event(
+            AcquisitionEvent::ValidationRecoveryTarget(Some(target(210))),
+        ));
         let request = |session| RequestIntent {
             session,
             peer: PeerId::new(1),
