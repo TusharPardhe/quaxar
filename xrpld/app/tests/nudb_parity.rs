@@ -1,11 +1,11 @@
 use app::{SHAMapStoreNodeStore, SHAMapStoreSavedStateDb, apply_submit_transactor_shell};
-use basics::base_uint::Uint256;
+use basics::base_uint::{Uint160, Uint256};
 use basics::basic_config::BasicConfig;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
 use basics::str_hex::str_hex;
 use basics::tagged_cache::MonotonicClock;
-use ledger::{Ledger, LedgerHeader, Sandbox};
+use ledger::{Ledger, LedgerHeader, RawView, ReadView, Sandbox};
 use nodestore::{
     Backend, DatabaseRotatingImp, DummyScheduler, FetchType, Manager, ManagerImp, NullJournal,
     Scheduler,
@@ -1627,5 +1627,92 @@ fn mainnet_ledger_106066664_replay_live_xrp_payment_regression() {
     assert_eq!(
         protocol::calculate_ledger_hash(&built.header()),
         header.hash
+    );
+}
+
+#[test]
+#[ignore = "requires testnet RPC access"]
+fn testnet_ledger_20157684_escrow_finish_targeted_parity() {
+    let parent_seq = 20_157_683;
+    let child_seq = 20_157_684;
+    let target = *parse_hash("F33083CB2A17391D9013EB4E03C52F63058157BB16F21E2D1760B8ED40258438")
+        .as_uint256();
+    let parent_header =
+        fetch_ledger_header_from(XRPL_TESTNET_RPC_URL, parent_seq).expect("fetch parent header");
+    let mut ledger = Ledger::new(parent_header, false);
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_token_escrow(),
+        protocol::feature_id("Credentials"),
+        protocol::feature_id("fixCleanup3_2_0"),
+        protocol::feature_id("fixCleanup3_3_0"),
+        protocol::feature_id("fixCleanup3_4_0"),
+        protocol::feature_id("fixIncludeKeyletFields"),
+        protocol::feature_id("fixPreviousTxnID"),
+    ]));
+
+    let keys = [
+        "22CB46FF8113A8DD6FD31AB64204947FD3CBE120DF4F73089FC57209740765AA",
+        "255C642AE2923E1302D750C1CBAB2D471486A4E49939780B2B2C8232D48D8411",
+        "5FDB9C488D2BDEB2C3D901160B6062437EA3A02DBFDC13A54D80993616BECDB6",
+        "89BFC6163487C77C04ED51AF5F3D04E52495D7C20B7482C444783FEB7661F9F1",
+        "9C3B5E87870556CEB0A508F0631D01630B77BDC56E837246411D3CB7DEDB9077",
+        "B3ADF56A46740FDF19F25504099A0EF6F3DCEBCC56C0DBC5543877E795314D92",
+        "E80EDFE3EFAD46B1682F377C3D53E9C32D7318B56E32AEBFBB43E5A789B7658F",
+        "F1259A12A4CF9B619B850D2DE378FDAA8CE14B73947BF3AE51E8EAB774600064",
+    ];
+    for key_hex in keys {
+        let key = Uint256::from_hex(key_hex).expect("fixture key");
+        let bytes = decode_hex(
+            &fetch_ledger_entry_binary(XRPL_TESTNET_RPC_URL, parent_seq, key)
+                .expect("fetch parent affected entry"),
+        );
+        let entry = protocol::STLedgerEntry::from_serial_iter(&mut SerialIter::new(&bytes), key);
+        ledger
+            .raw_insert(Arc::new(entry))
+            .expect("insert parent entry");
+    }
+    let issuer = protocol::parse_base58_account_id("rQBsiTpScJwEbJ5u89WPBWobKGh7dyVUUd")
+        .expect("issuer account");
+    let issuer_key = protocol::account_keylet(Uint160::from_void(issuer.data())).key;
+    let issuer_bytes = decode_hex(
+        &fetch_ledger_entry_binary(XRPL_TESTNET_RPC_URL, parent_seq, issuer_key)
+            .expect("fetch issuer AccountRoot"),
+    );
+    ledger
+        .raw_insert(Arc::new(protocol::STLedgerEntry::from_serial_iter(
+            &mut SerialIter::new(&issuer_bytes),
+            issuer_key,
+        )))
+        .expect("insert issuer AccountRoot");
+
+    let fetched = fetch_tx_items_for_ledger_from(XRPL_TESTNET_RPC_URL, child_seq)
+        .expect("fetch canonical transactions");
+    let (payload, _) = fetched
+        .iter()
+        .find(|(_, tx_id)| *tx_id == target)
+        .expect("find EscrowFinish");
+    let mut outer = SerialIter::new(payload);
+    let tx_bytes = outer.get_vl();
+    let canonical_meta = outer.get_vl();
+    let tx = STTx::from_serial_iter(&mut SerialIter::new(&tx_bytes));
+    let mut parent = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
+    let rules = parent.rules().clone();
+    let mut delta = ledger::FlowSandbox::new(&mut parent);
+    let (result, delivered_amount) = app::apply_submit_transactor_shell_with_delivered_amount(
+        &mut delta,
+        &tx,
+        tx.get_txn_type(),
+    );
+    assert_eq!(result, Ter::TES_SUCCESS, "EscrowFinish must apply");
+    let mut meta = delta
+        .to_tx_meta(target, child_seq, delivered_amount, &rules)
+        .expect("build EscrowFinish metadata");
+    let mut local_meta = Serializer::new(canonical_meta.len());
+    meta.add_raw(&mut local_meta, result, 2);
+
+    assert_eq!(
+        str_hex(local_meta.data()),
+        str_hex(&canonical_meta),
+        "targeted EscrowFinish metadata differs from rippled"
     );
 }
