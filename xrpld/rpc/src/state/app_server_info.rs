@@ -470,6 +470,36 @@ mod tests {
             ApplicationServerInfo::new(OwnedApplicationServerInfo::from_application_root(&app));
         assert!(source.network_synced());
     }
+
+    #[test]
+    fn amm_info_current_ledger_uses_parent_ledger_close_time() {
+        use rpc::amm::amm_info::AmmInfoSource;
+        use rpc::ledger_lookup::LedgerLookupSource;
+
+        let app = ApplicationRoot::with_options(ApplicationRootOptions::default())
+            .expect("app should build");
+        let parent_close_time = 840_000_123;
+        let ledger = Arc::new(Ledger::from_ledger_seq_and_close_time(
+            2048,
+            parent_close_time + 100,
+            false,
+        ));
+        let _ = app.on_validated_ledger(ledger);
+        let _ = app.open_ledger().modify(|open| {
+            open.ledger_current_index = 2049;
+            open.parent_close_time = parent_close_time;
+            open.close_time_resolution = 10;
+            true
+        });
+        let source =
+            ApplicationServerInfo::new(OwnedApplicationServerInfo::from_application_root(&app));
+        let current = source
+            .get_current_ledger()
+            .expect("current ledger lookup should use the validated parent");
+
+        assert!(current.open);
+        assert_eq!(source.parent_close_time(&current), parent_close_time);
+    }
 }
 
 impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
@@ -2927,6 +2957,34 @@ impl<V: AppServerInfoView> crate::amm::amm_info::AmmInfoSource for ApplicationSe
         entry_index: Uint256,
     ) -> Option<STLedgerEntry> {
         read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(entry_index))
+    }
+
+    fn parent_close_time(&self, ledger: &LedgerLookupLedger) -> u32 {
+        if ledger.open {
+            if let Some(open) = self.view.app().map(|app| app.open_ledger().current())
+                && open.ledger_current_index == ledger.seq
+                && open.close_time_resolution != 0
+            {
+                return open.parent_close_time;
+            }
+
+            // Bootstrap-only fallback for sources without a live ApplicationRoot.
+            return [
+                self.view.closed_ledger(),
+                self.view.published_ledger(),
+                self.view.validated_ledger(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|candidate| candidate.header().seq.saturating_add(1) == ledger.seq)
+            .max_by_key(|candidate| candidate.header().seq)
+            .map(|parent| parent.header().close_time)
+            .unwrap_or(0);
+        }
+
+        resolve_lookup_ledger(&self.view, ledger)
+            .map(|resolved| resolved.header().parent_close_time)
+            .unwrap_or(0)
     }
 }
 

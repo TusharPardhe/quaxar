@@ -107,6 +107,7 @@ fn amm_info_returns_supported_shape_for_limited_slice() {
     let mut source = FakeSource {
         ledger: Some(closed_ledger()),
         validated: Some(closed_ledger()),
+        parent_close_time: 100_000,
         ..Default::default()
     };
     source
@@ -225,8 +226,9 @@ fn amm_info_returns_supported_shape_for_limited_slice() {
     );
     assert_eq!(
         auction.get("expiration"),
-        Some(&JsonValue::Unsigned(123_456))
+        Some(&JsonValue::String("2000-01-02T10:17:36+0000".to_owned()))
     );
+    assert_eq!(auction.get("time_interval"), Some(&JsonValue::Unsigned(14)));
     let price = json_object(auction.get("price").expect("price"));
     assert_eq!(
         price.get("value"),

@@ -23,7 +23,14 @@ if "--node" in sys.argv:
 # --- Helpers ---
 def rpc(method, params=None):
     payload = {"method": method, "params": [params or {}]}
-    req = Request(NODE_URL, json.dumps(payload).encode(), {"Content-Type": "application/json"})
+    req = Request(
+        NODE_URL,
+        json.dumps(payload).encode(),
+        {
+            "Content-Type": "application/json",
+            "User-Agent": "quaxar-live-conformance/1.0",
+        },
+    )
     resp = json.loads(urlopen(req, timeout=30).read())
     return resp.get("result", resp)
 
@@ -58,19 +65,22 @@ def wait_validated(tx_hash, timeout=15):
         time.sleep(1)
     return None
 
-def submit_and_wait(tx, secret, label=""):
+def submit_and_wait(tx, secret, label="", expected=("tesSUCCESS",)):
     """Submit and wait for validation. Returns (engine_result, full_response)."""
     result = submit_tx(tx, secret)
     engine_result = result.get("engine_result", "UNKNOWN")
     tx_hash = result.get("tx_json", {}).get("hash", "")
     
-    if engine_result.startswith("tes"):
+    if engine_result.startswith(("tes", "tec")):
         validated = wait_validated(tx_hash)
-        if validated:
-            engine_result = validated.get("meta", {}).get("TransactionResult", engine_result)
+        if not validated:
+            raise RuntimeError(f"{label}: transaction {tx_hash} did not validate")
+        engine_result = validated.get("meta", {}).get("TransactionResult", engine_result)
     
-    status = "✓" if engine_result == "tesSUCCESS" else "✗" if "tec" in engine_result or "tem" in engine_result or "tef" in engine_result else "?"
+    status = "✓" if engine_result in expected else "✗"
     print(f"  {status} {label}: {engine_result}")
+    if engine_result not in expected:
+        raise RuntimeError(f"{label}: expected {expected}, got {engine_result}")
     return engine_result, result
 
 def get_account_info(address):
@@ -116,9 +126,9 @@ def test_account_settings():
     submit_and_wait({"TransactionType": "AccountSet", "Account": addr, "SetFlag": 6}, secret,
                     "Set NoFreeze (asfNoFreeze=6) - IRREVERSIBLE")
     
-    # 9. Try to clear NoFreeze (should fail)
+    # 9. Clearing NoFreeze is accepted as a no-op; the flag remains irreversible.
     submit_and_wait({"TransactionType": "AccountSet", "Account": addr, "ClearFlag": 6}, secret,
-                    "Clear NoFreeze (should fail - tecOWNERS or noop)")
+                    "Clear NoFreeze (accepted no-op)")
     
     # 10. Set AllowTrustLineClawback (flag 16)
     acct2 = fund_account()
@@ -127,7 +137,7 @@ def test_account_settings():
     
     # 11. Conflicting set and clear same flag
     submit_and_wait({"TransactionType": "AccountSet", "Account": addr, "SetFlag": 1, "ClearFlag": 1}, secret,
-                    "Conflicting Set+Clear same flag (should fail temINVALID_FLAG)")
+                    "Conflicting Set+Clear same flag", expected=("temINVALID_FLAG",))
 
 def test_trust_lines_and_freeze():
     """Test TrustSet with freeze, deep freeze, NoRipple flags."""
@@ -155,12 +165,12 @@ def test_trust_lines_and_freeze():
         "Flags": 1048576  # tfSetFreeze
     }, issuer["secret"], "Issuer freezes trust line")
     
-    # 4. Payment on frozen line (should fail)
+    # 4. The issuer can still issue directly across its frozen line.
     submit_and_wait({
         "TransactionType": "Payment", "Account": issuer["address"],
         "Destination": holder["address"],
         "Amount": {"currency": "USD", "issuer": issuer["address"], "value": "100"}
-    }, issuer["secret"], "Payment on frozen trust line (should fail tecPATH_DRY)")
+    }, issuer["secret"], "Issuer payment across frozen trust line")
     
     # 5. Issuer unfreezes
     submit_and_wait({
@@ -173,12 +183,12 @@ def test_trust_lines_and_freeze():
     submit_and_wait({"TransactionType": "AccountSet", "Account": issuer["address"], "SetFlag": 7},
                     issuer["secret"], "Set GlobalFreeze (asfGlobalFreeze=7)")
     
-    # 7. Payment during global freeze (should fail)
+    # 7. The issuer can still issue directly while globally frozen.
     submit_and_wait({
         "TransactionType": "Payment", "Account": issuer["address"],
         "Destination": holder["address"],
         "Amount": {"currency": "USD", "issuer": issuer["address"], "value": "50"}
-    }, issuer["secret"], "Payment during GlobalFreeze (should fail)")
+    }, issuer["secret"], "Issuer payment during GlobalFreeze")
 
 def test_offers_and_dex():
     """Test OfferCreate with complex flags."""
@@ -211,7 +221,7 @@ def test_offers_and_dex():
         "TakerGets": "500000000",  # 500 XRP (more than Bob has)
         "TakerPays": {"currency": "USD", "issuer": alice["address"], "value": "1000"},
         "Flags": 262144  # tfFillOrKill
-    }, alice["secret"], "FillOrKill that can't fill (should fail tecKILLED)")
+    }, alice["secret"], "FillOrKill that can't fill", expected=("tecKILLED",))
     
     # 3. ImmediateOrCancel partial fill
     submit_and_wait({
@@ -227,7 +237,7 @@ def test_offers_and_dex():
         "TakerGets": "10000000",
         "TakerPays": {"currency": "USD", "issuer": alice["address"], "value": "10"},
         "Expiration": 1  # epoch + 1 second (far in past)
-    }, alice["secret"], "Offer with past expiration (should fail tecEXPIRED)")
+    }, alice["secret"], "Offer with past expiration", expected=("tecEXPIRED",))
 
 def test_escrow():
     """Test Escrow create/finish/cancel with time conditions."""
@@ -236,50 +246,62 @@ def test_escrow():
     bob = fund_account()
     
     # Get current ledger close time
-    info = rpc("server_info")
-    close_time = info.get("info", {}).get("validated_ledger", {}).get("close_time", 0)
-    ripple_epoch_offset = 946684800
+    ledger = rpc("ledger", {"ledger_index": "validated"})
+    close_time = ledger.get("ledger", {}).get("close_time")
+    if not isinstance(close_time, int):
+        raise RuntimeError("validated ledger response did not include close_time")
     
-    # 1. Create escrow with FinishAfter (5 seconds from now)
-    finish_after = close_time + 5
+    # Leave enough room for signing, submission, and multiple Testnet closes.
+    finish_after = close_time + 30
     cancel_after = close_time + 3600  # 1 hour
     
-    submit_and_wait({
+    create_engine, create_result = submit_and_wait({
         "TransactionType": "EscrowCreate", "Account": alice["address"],
         "Destination": bob["address"],
         "Amount": "10000000",  # 10 XRP
         "FinishAfter": finish_after,
         "CancelAfter": cancel_after
-    }, alice["secret"], f"Create escrow (FinishAfter=+5s, CancelAfter=+1hr)")
+    }, alice["secret"], f"Create escrow (FinishAfter=+30s, CancelAfter=+1hr)")
+
+    offer_sequence = create_result.get("tx_json", {}).get("Sequence")
+    if create_engine != "tesSUCCESS" or not isinstance(offer_sequence, int):
+        raise RuntimeError("escrow creation did not return a usable OfferSequence")
     
     # 2. Try to finish too early (should fail)
     submit_and_wait({
         "TransactionType": "EscrowFinish", "Account": bob["address"],
-        "Owner": alice["address"], "OfferSequence": 1
-    }, bob["secret"], "Finish escrow too early (should fail tecNO_PERMISSION)")
+        "Owner": alice["address"], "OfferSequence": offer_sequence
+    }, bob["secret"], "Finish escrow too early", expected=("tecNO_PERMISSION",))
     
     # 3. Wait and finish
-    print("  ⏳ Waiting 8 seconds for FinishAfter...")
-    time.sleep(8)
+    print("  ⏳ Waiting 35 seconds for FinishAfter...")
+    time.sleep(35)
     
     submit_and_wait({
         "TransactionType": "EscrowFinish", "Account": bob["address"],
-        "Owner": alice["address"], "OfferSequence": 1
+        "Owner": alice["address"], "OfferSequence": offer_sequence
     }, bob["secret"], "Finish escrow after FinishAfter")
     
     # 4. Create escrow for cancel test
-    submit_and_wait({
+    ledger = rpc("ledger", {"ledger_index": "validated"})
+    close_time = ledger.get("ledger", {}).get("close_time")
+    create_engine, create_result = submit_and_wait({
         "TransactionType": "EscrowCreate", "Account": alice["address"],
         "Destination": bob["address"],
         "Amount": "5000000",
-        "CancelAfter": close_time + 5  # Cancellable in 5s
-    }, alice["secret"], "Create escrow for cancel (CancelAfter=+5s)")
+        "FinishAfter": close_time + 20,
+        "CancelAfter": close_time + 30
+    }, alice["secret"], "Create escrow for cancel (CancelAfter=+30s)")
+
+    cancel_offer_sequence = create_result.get("tx_json", {}).get("Sequence")
+    if create_engine != "tesSUCCESS" or not isinstance(cancel_offer_sequence, int):
+        raise RuntimeError("cancel escrow creation did not return a usable OfferSequence")
     
     # 5. Cancel before time (should fail)
     submit_and_wait({
         "TransactionType": "EscrowCancel", "Account": alice["address"],
-        "Owner": alice["address"], "OfferSequence": 2
-    }, alice["secret"], "Cancel before CancelAfter (should fail tecNO_PERMISSION)")
+        "Owner": alice["address"], "OfferSequence": cancel_offer_sequence
+    }, alice["secret"], "Cancel before CancelAfter", expected=("tecNO_PERMISSION",))
 
 def test_checks():
     """Test Check create/cash/cancel."""
@@ -326,7 +348,7 @@ def test_checks():
         submit_and_wait({
             "TransactionType": "CheckCancel", "Account": charlie["address"],
             "CheckID": check_id
-        }, charlie["secret"], "Third party cancel unexpired check (should fail tecNO_PERMISSION)")
+        }, charlie["secret"], "Third party cancel unexpired check", expected=("tecNO_PERMISSION",))
         
         # 5. Owner cancel (should succeed)
         submit_and_wait({
@@ -344,10 +366,10 @@ def test_payment_channels():
     submit_and_wait({
         "TransactionType": "PaymentChannelCreate", "Account": alice["address"],
         "Destination": bob["address"],
-        "Amount": "100000000",  # 100 XRP
+        "Amount": "10000000",  # 10 XRP, leaving reserve and fee headroom
         "SettleDelay": 86400,  # 1 day
         "PublicKey": "023693F15967AE357D0327974AD46FE3C127113B1110D6044FD41E723689F81CC6"
-    }, alice["secret"], "Create payment channel (100 XRP, 1 day settle)")
+        }, alice["secret"], "Create payment channel (10 XRP, 1 day settle)")
     
     time.sleep(4)
     
@@ -361,14 +383,14 @@ def test_payment_channels():
         # 2. Fund channel (add 50 XRP)
         submit_and_wait({
             "TransactionType": "PaymentChannelFund", "Account": alice["address"],
-            "Channel": channel_id, "Amount": "50000000"
-        }, alice["secret"], "Fund channel +50 XRP")
+            "Channel": channel_id, "Amount": "5000000"
+        }, alice["secret"], "Fund channel +5 XRP")
         
         # 3. Non-owner fund (should fail)
         submit_and_wait({
             "TransactionType": "PaymentChannelFund", "Account": bob["address"],
             "Channel": channel_id, "Amount": "10000000"
-        }, bob["secret"], "Non-owner fund (should fail tecNO_PERMISSION)")
+        }, bob["secret"], "Non-owner fund", expected=("tecNO_PERMISSION",))
         
         # 4. Close channel (tfClose)
         submit_and_wait({
@@ -450,7 +472,7 @@ def test_deposit_preauth():
     submit_and_wait({
         "TransactionType": "Payment", "Account": bob["address"],
         "Destination": alice["address"], "Amount": "10000000"
-    }, bob["secret"], "Bob pays Alice without preauth (should fail tecNO_PERMISSION)")
+    }, bob["secret"], "Bob pays Alice without preauth", expected=("tecNO_PERMISSION",))
     
     # 3. Alice preauthorizes Bob
     submit_and_wait({
@@ -495,7 +517,7 @@ def test_multisign():
     submit_and_wait({
         "TransactionType": "Payment", "Account": master["address"],
         "Destination": signer1["address"], "Amount": "1000000"
-    }, master["secret"], "Payment with disabled master (should fail tefMASTER_DISABLED)")
+    }, master["secret"], "Payment with disabled master", expected=("tefMASTER_DISABLED",))
 
 # --- Main ---
 if __name__ == "__main__":
@@ -507,12 +529,17 @@ if __name__ == "__main__":
     try:
         info = rpc("server_info")
         state = info.get("info", {}).get("server_state", "?")
+        network_id = info.get("info", {}).get("network_id")
         print(f"\nServer state: {state}")
-        print(f"Network ID: {info.get('info', {}).get('network_id', '?')}")
+        print(f"Network ID: {network_id}")
+        if network_id != 1:
+            raise RuntimeError(f"refusing transaction tests on network {network_id!r}")
+        if state not in {"full", "proposing"}:
+            raise RuntimeError(f"refusing transaction tests while server is {state!r}")
     except Exception as e:
         print(f"\n⚠ Cannot reach node: {e}")
-        print("  Using public testnet endpoint instead.")
-        NODE_URL = "https://s.altnet.rippletest.net:51234"
+        print("  Aborting instead of silently testing a different server.")
+        raise SystemExit(2)
     
     tests = [
         test_account_settings,
@@ -538,3 +565,5 @@ if __name__ == "__main__":
     
     print(f"\n{'═'*50}")
     print(f"Done. Run against: {NODE_URL}")
+    if failed:
+        raise SystemExit(1)
