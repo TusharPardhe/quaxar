@@ -6,7 +6,7 @@ use basics::base_uint::Uint256;
 use protocol::{
     AccountID, Asset, Currency, Issue, JsonValue, STAmount, STPathSet, asset_from_json,
     bad_currency, get_or_throw, is_bad_asset, is_consistent, is_xrp_currency, no_currency,
-    parse_base58_account_id, to_currency, xrp_account,
+    parse_base58_account_id, sf_generic, to_currency, xrp_account,
 };
 
 use quaxar_core::{RpcErrorCode, Status};
@@ -95,7 +95,7 @@ fn parse_amount(value: &JsonValue) -> Option<STAmount> {
 }
 
 fn is_convert_all(amount: &STAmount) -> bool {
-    amount.signum() == -1 && amount.mantissa() == 1 && amount.exponent() == 0
+    amount == &STAmount::new_with_asset(sf_generic(), amount.asset(), 1, 0, true)
 }
 
 fn valid_path_asset(asset: Asset) -> bool {
@@ -384,6 +384,21 @@ mod tests {
             JsonValue::String("broken".to_owned()),
         );
         assert_eq!(error(request), RpcErrorCode::SendmaxMalformed);
+
+        let issuer = account(3);
+        let mut request = base_request();
+        request.insert(
+            "destination_amount".to_owned(),
+            JsonValue::Object(BTreeMap::from([
+                ("currency".to_owned(), JsonValue::String("USD".to_owned())),
+                ("issuer".to_owned(), JsonValue::String(issuer)),
+                ("value".to_owned(), JsonValue::String("-1".to_owned())),
+            ])),
+        );
+        request.insert("send_max".to_owned(), JsonValue::String("10".to_owned()));
+        let parsed = parse_path_finder_request(&JsonValue::Object(request))
+            .expect("issued -1 is rippled's convert-all sentinel");
+        assert!(parsed.convert_all);
     }
 
     #[test]
