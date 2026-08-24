@@ -279,20 +279,37 @@ pub fn authorized_deposit_preauth(
     cred_ids: &STVector256,
     dst: &AccountID,
 ) -> Result<Ter, ViewError> {
-    let mut sorted_hashes: Vec<Uint256> = Vec::new();
+    // rippled builds a std::set<pair<AccountID, Slice>> and only then hashes
+    // each pair for the DepositPreauth key. Sorting the hashes themselves is
+    // not equivalent and selects a different ledger key for some multi-
+    // credential authorizations.
+    let mut sorted_credentials: Vec<(AccountID, Vec<u8>)> = Vec::new();
 
     for h in cred_ids.value() {
+        if view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_4_0"))
+            && h.is_zero()
+        {
+            return Ok(Ter::TEF_INTERNAL);
+        }
         let Some(sle_cred) = view.read(credential_keylet_from_key(*h))? else {
             return Ok(Ter::TEF_INTERNAL);
         };
 
         let issuer = sle_cred.get_account_id(sf("sfIssuer"));
         let cred_type = sle_cred.get_field_vl(sf("sfCredentialType"));
-        let hash = sha512_half_slices(&[issuer.data(), &cred_type]);
-        sorted_hashes.push(hash);
+        sorted_credentials.push((issuer, cred_type));
     }
 
-    sorted_hashes.sort();
+    sorted_credentials.sort_unstable();
+    if sorted_credentials.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Ok(Ter::TEF_INTERNAL);
+    }
+    let sorted_hashes = sorted_credentials
+        .iter()
+        .map(|(issuer, credential_type)| sha512_half_slices(&[issuer.data(), credential_type]))
+        .collect::<Vec<_>>();
 
     let keylet = deposit_preauth_credentials_keylet(to_uint160(*dst), &sorted_hashes);
     if !view.exists(keylet)? {

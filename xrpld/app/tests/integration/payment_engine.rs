@@ -22694,7 +22694,7 @@ fn cpp_step1_account_set_tick_size_too_large() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ACCOUNT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u8(sf("sfTickSize"), 16);
+        tx.set_field_u8(sf("sfTickSize"), 17);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -24209,7 +24209,7 @@ fn cpp_step3_account_set_tick_size_min_valid() {
     );
 }
 
-/// C++: AccountSet TickSize=15 (max valid) → TES_SUCCESS
+/// C++: AccountSet TickSize=15 (highest stored precision) → TES_SUCCESS
 #[test]
 fn cpp_step3_account_set_tick_size_max_valid() {
     let a = acct(0x41);
@@ -24225,6 +24225,11 @@ fn cpp_step3_account_set_tick_size_max_valid() {
         full_apply(&mut v, &tx, TxType::ACCOUNT_SET),
         Ter::TES_SUCCESS
     );
+    let root = v
+        .read(protocol::account_keylet(acct_id(a)))
+        .expect("account read")
+        .expect("account exists");
+    assert_eq!(root.get_field_u8(sf("sfTickSize")), 15);
 }
 
 /// C++: AccountSet TickSize=1 (invalid, < 3) → temBAD_TICK_SIZE

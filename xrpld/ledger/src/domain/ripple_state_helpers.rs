@@ -244,12 +244,16 @@ pub fn issue_iou<V: ApplyView>(
             protocol::LedgerEntryType::RippleState as u16,
         );
 
+        // trustCreate stores sfBalance from the low account's perspective.
+        // When the issuer/sender is high, the low holder owns a positive
+        // balance; when the issuer is low, the high holder's balance is
+        // represented as negative.
         let balance = if b_sender_high {
+            amount.clone()
+        } else {
             let mut b = amount.clone();
             b.negate();
             b
-        } else {
-            amount.clone()
         };
         new_state.set_field_amount(sf("sfBalance"), balance);
 
@@ -285,12 +289,32 @@ pub fn issue_iou<V: ApplyView>(
         new_state.set_field_amount(sf("sfLowLimit"), low_limit);
         new_state.set_field_amount(sf("sfHighLimit"), high_limit);
 
-        // Set flags with reserve for the receiver
-        let flags = if b_sender_high {
-            LSF_HIGH_RESERVE
-        } else {
-            LSF_LOW_RESERVE
+        let receiver_keylet =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
+        let Some(receiver) = view.peek(receiver_keylet).ok().flatten() else {
+            return Ter::TEF_INTERNAL;
         };
+        let issuer_keylet =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(issue.account.data()));
+        let Some(issuer) = view.peek(issuer_keylet).ok().flatten() else {
+            return Ter::TEF_INTERNAL;
+        };
+
+        // trustCreate reserves the receiver's side, applies the receiver's
+        // requested default NoRipple setting to that side, and independently
+        // applies the peer account's default to the opposite side.
+        let (receiver_reserve, receiver_no_ripple, peer_no_ripple) = if b_sender_high {
+            (LSF_LOW_RESERVE, LSF_LOW_NO_RIPPLE, LSF_HIGH_NO_RIPPLE)
+        } else {
+            (LSF_HIGH_RESERVE, LSF_HIGH_NO_RIPPLE, LSF_LOW_NO_RIPPLE)
+        };
+        let mut flags = receiver_reserve;
+        if !receiver.is_flag(LSF_DEFAULT_RIPPLE) {
+            flags |= receiver_no_ripple;
+        }
+        if !issuer.is_flag(LSF_DEFAULT_RIPPLE) {
+            flags |= peer_no_ripple;
+        }
         new_state.set_field_u32(sf("sfFlags"), flags);
 
         let sle = Arc::new(STLedgerEntry::from_stobject(new_state, line_keylet.key));
@@ -782,11 +806,20 @@ fn direct_send_no_fee_iou<V: ApplyView>(
             balance.negate();
         }
 
-        // Check receiver's DefaultRipple for NoRipple flag
+        // Check both accounts' DefaultRipple settings. rippled's trustCreate
+        // applies the receiver's setting to its own side and the peer's
+        // setting to the opposite side.
         let receiver_keylet =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(receiver.data()));
-        let no_ripple = if let Ok(Some(rcv_sle)) = view.peek(receiver_keylet) {
-            (rcv_sle.get_field_u32(sf("sfFlags")) & LSF_DEFAULT_RIPPLE) == 0
+        let receiver_no_ripple = if let Ok(Some(rcv_sle)) = view.peek(receiver_keylet) {
+            !rcv_sle.is_flag(LSF_DEFAULT_RIPPLE)
+        } else {
+            return Ter::TEF_INTERNAL;
+        };
+        let sender_keylet =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(sender.data()));
+        let sender_no_ripple = if let Ok(Some(sender_sle)) = view.peek(sender_keylet) {
+            !sender_sle.is_flag(LSF_DEFAULT_RIPPLE)
         } else {
             return Ter::TEF_INTERNAL;
         };
@@ -814,11 +847,18 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         } else {
             LSF_HIGH_RESERVE
         };
-        if no_ripple {
+        if receiver_no_ripple {
             flags |= if b_high {
                 LSF_LOW_NO_RIPPLE
             } else {
                 LSF_HIGH_NO_RIPPLE
+            };
+        }
+        if sender_no_ripple {
+            flags |= if b_high {
+                LSF_HIGH_NO_RIPPLE
+            } else {
+                LSF_LOW_NO_RIPPLE
             };
         }
         new_obj.set_field_u32(sf("sfFlags"), flags);

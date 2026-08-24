@@ -665,9 +665,9 @@ fn escrow_mpt_unlock_amounts<V: ledger::ApplyView>(
     locked_rate: u32,
     sender: &AccountID,
     receiver: &AccountID,
-) -> (STAmount, STAmount) {
+) -> Result<(STAmount, STAmount), Ter> {
     let Asset::MPTIssue(issue) = amount.asset() else {
-        return (amount.clone(), amount.clone());
+        return Ok((amount.clone(), amount.clone()));
     };
     let issuer = issue.issuer();
     let mut rate = protocol::Rate::new(locked_rate);
@@ -678,9 +678,24 @@ fn escrow_mpt_unlock_amounts<V: ledger::ApplyView>(
     }
 
     if sender != &issuer && receiver != &issuer && rate != protocol::PARITY_RATE {
-        return (protocol::divide_round(amount, rate, true), amount.clone());
+        let net_amount = if view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_4_0"))
+        {
+            protocol::mpt_amount::mul_ratio(
+                amount.mpt(),
+                protocol::PARITY_RATE.value,
+                rate.value,
+                false,
+            )
+            .map(|net| STAmount::from_mpt_amount(sf("sfAmount"), net, issue))
+            .map_err(|_| Ter::TEC_INTERNAL)?
+        } else {
+            protocol::divide_round(amount, rate, true)
+        };
+        return Ok((net_amount, amount.clone()));
     }
-    (amount.clone(), amount.clone())
+    Ok((amount.clone(), amount.clone()))
 }
 
 fn escrow_iou_unlock_amount<V: ledger::ApplyView>(
@@ -2476,7 +2491,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         let tick = sttx.get_field_u8(sf("sfTickSize"));
                         // rippled treats both zero and the maximum precision as
                         // the canonical absence of a TickSize field.
-                        if tick == 0 || tick == 15 {
+                        if tick == 0 || tick == 16 {
                             obj.make_field_absent(sf("sfTickSize"));
                         } else {
                             obj.set_field_u8(sf("sfTickSize"), tick);
@@ -3607,13 +3622,15 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         } else {
                             protocol::PARITY_RATE.value
                         };
-                        let (net_amount, gross_amount) = escrow_mpt_unlock_amounts(
+                        let Ok((net_amount, gross_amount)) = escrow_mpt_unlock_amounts(
                             view,
                             &amount,
                             locked_rate,
                             &escrow_owner,
                             &destination,
-                        );
+                        ) else {
+                            return Ter::TEC_INTERNAL;
+                        };
                         let gross_amount = if view
                             .rules()
                             .enabled(&protocol::feature_id("fixTokenEscrowV1"))
@@ -3774,13 +3791,15 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     }
                     protocol::Asset::MPTIssue(_) => {
                         let submitter = sttx.get_account_id(sf("sfAccount"));
-                        let (net_amount, gross_amount) = escrow_mpt_unlock_amounts(
+                        let Ok((net_amount, gross_amount)) = escrow_mpt_unlock_amounts(
                             view,
                             &amount,
                             protocol::PARITY_RATE.value,
                             &escrow_owner,
                             &escrow_owner,
-                        );
+                        ) else {
+                            return Ter::TEC_INTERNAL;
+                        };
                         let gross_amount = if view
                             .rules()
                             .enabled(&protocol::feature_id("fixTokenEscrowV1"))

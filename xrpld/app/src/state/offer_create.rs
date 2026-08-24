@@ -183,7 +183,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     // --- Tick size rounding ---
     // reference: round offer to tick size of the issuer accounts
     let tick_size = get_tick_size(view, &taker_pays, &taker_gets);
-    if tick_size < 15 {
+    if tick_size < 16 {
         // reference: auto const rate = Quality{saTakerGets, saTakerPays}.round(uTickSize).rate();
         // Quality is stored as (exponent << 56) | mantissa = getRate(taker_gets, taker_pays)
         let quality = get_rate(&taker_gets, &taker_pays);
@@ -813,7 +813,7 @@ fn get_tick_size<V: ledger::ApplyView>(
     taker_pays: &STAmount,
     taker_gets: &STAmount,
 ) -> u8 {
-    let mut tick_size: u8 = 15; // Quality::kMAX_TICK_SIZE
+    let mut tick_size: u8 = 16; // Quality::kMaxTickSize
 
     // Check pays issuer
     if let protocol::Asset::Issue(issue) = taker_pays.asset()

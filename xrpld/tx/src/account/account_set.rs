@@ -107,7 +107,7 @@ impl Default for AccountSetPreflightFacts {
             quality_one: 1_000_000_000,
             tick_size: None,
             min_tick_size: 3,
-            max_tick_size: 15,
+            max_tick_size: 16,
             message_key_present: false,
             message_key_is_valid: true,
             domain_len: None,

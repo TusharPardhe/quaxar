@@ -2928,7 +2928,12 @@ impl Backend for NuDbBackend {
                 self.finish_burst_writes(entries.len())?;
             }
             let objects_written = entries.len();
-            tracing::info!(target: "nodestore", objects_written, batch_size_bytes, "Batch flush complete");
+            // rippled does not emit one INFO record per NuDB insert/batch.
+            // Catch-up can produce thousands of these per minute; journald then
+            // competes with the database for I/O precisely while consensus
+            // needs its reserved close-path writes. Keep the diagnostic at
+            // debug level and expose aggregate write metrics separately.
+            tracing::debug!(target: "nodestore", objects_written, batch_size_bytes, "Batch flush complete");
             Ok(())
         })();
         result.map_err(|error| self.fail_stop_write_if_checkpointed(error))

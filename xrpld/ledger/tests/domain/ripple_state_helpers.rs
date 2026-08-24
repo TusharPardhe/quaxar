@@ -47,6 +47,13 @@ fn assert_root_directory_hints_are_present(view: &impl ReadView, issue: Issue, h
     );
 }
 
+fn trust_line_flags(view: &impl ReadView, issue: Issue, holder: AccountID) -> u32 {
+    view.read(protocol::line(issue.account, holder, issue.currency))
+        .expect("read trust line")
+        .expect("trust line exists")
+        .get_field_u32(sf("sfFlags"))
+}
+
 #[test]
 fn issue_iou_persists_zero_root_directory_hints() {
     let issuer = AccountID::from_array([0x11; 20]);
@@ -67,6 +74,9 @@ fn issue_iou_persists_zero_root_directory_hints() {
         Ter::TES_SUCCESS
     );
     assert_root_directory_hints_are_present(&view, issue, holder);
+    // Issuer is low and holder is high: reserve the holder's high side and,
+    // because neither account enables DefaultRipple, set both NoRipple bits.
+    assert_eq!(trust_line_flags(&view, issue, holder), 0x0032_0000);
 }
 
 #[test]
@@ -89,4 +99,32 @@ fn direct_send_persists_zero_root_directory_hints() {
         Ter::TES_SUCCESS
     );
     assert_root_directory_hints_are_present(&view, issue, holder);
+    assert_eq!(trust_line_flags(&view, issue, holder), 0x0032_0000);
+}
+
+#[test]
+fn issue_iou_uses_the_low_holder_side_when_the_issuer_sorts_high() {
+    let issuer = AccountID::from_array([0x44; 20]);
+    let holder = AccountID::from_array([0x12; 20]);
+    let issue = Issue::new(currency_from_string("JPY"), issuer);
+    let amount = STAmount::from_iou_amount(
+        sf("sfAmount"),
+        IOUAmount::from_parts(7, 0).expect("valid IOU amount"),
+        issue,
+    );
+    let mut ledger = Ledger::new(LedgerHeader::default(), false);
+    seed_account(&mut ledger, issuer);
+    seed_account(&mut ledger, holder);
+    let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    assert_eq!(
+        ripple_state_helpers::issue_iou(&mut view, &holder, &amount, &issue),
+        Ter::TES_SUCCESS
+    );
+    let line = view
+        .read(protocol::line(issue.account, holder, issue.currency))
+        .expect("read trust line")
+        .expect("trust line exists");
+    assert_eq!(line.get_field_u32(sf("sfFlags")), 0x0031_0000);
+    assert_eq!(line.get_field_amount(sf("sfBalance")).iou(), amount.iou());
 }

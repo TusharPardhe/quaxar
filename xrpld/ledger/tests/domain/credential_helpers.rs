@@ -3,12 +3,12 @@ use std::sync::Arc;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{
     ApplyView, ApplyViewImpl, Ledger, LedgerHeader, ReadView,
-    credential_helpers::{delete_sle, verify_deposit_preauth},
+    credential_helpers::{authorized_deposit_preauth, delete_sle, verify_deposit_preauth},
 };
 use protocol::{
     AccountID, ApplyFlags, LedgerEntryType, Rules, STLedgerEntry, STTx, STVector256, Ter, TxType,
-    XRPAmount, account_keylet, credential_keylet, get_field_by_symbol, lsfAccepted,
-    owner_dir_keylet,
+    XRPAmount, account_keylet, credential_keylet, deposit_preauth_credentials_keylet,
+    get_field_by_symbol, lsfAccepted, lsfDepositAuth, owner_dir_keylet, sha512_half_slices,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -17,6 +17,76 @@ use shamap::tree_node::SHAMapNodeType;
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
+}
+
+#[test]
+fn credential_deposit_preauth_sorts_pairs_before_hashing() {
+    let subject = account(0x20);
+    let destination = account(0x30);
+    let first_issuer = account(0x01);
+    let second_issuer = account(0x03);
+    let first_type = b"a";
+    let second_type = b"b";
+    let first = credential_entry(subject, first_issuer, first_type, true);
+    let second = credential_entry(subject, second_issuer, second_type, true);
+
+    // Pair order is first_issuer then second_issuer, while these particular
+    // SHA-512Half values sort in the opposite order. This catches the exact
+    // consensus bug seen in the live PaymentChannelClaim transactions.
+    let hashes = vec![
+        sha512_half_slices(&[first_issuer.data(), first_type]),
+        sha512_half_slices(&[second_issuer.data(), second_type]),
+    ];
+    assert!(hashes[0] > hashes[1]);
+
+    let preauth_keylet = deposit_preauth_credentials_keylet(account_raw(destination), &hashes);
+    let mut preauth = STLedgerEntry::new(preauth_keylet);
+    preauth.set_account_id(sf("sfAccount"), destination);
+    let mut destination_entry = account_entry(destination, 0);
+    destination_entry.set_field_u32(sf("sfFlags"), lsfDepositAuth);
+
+    let ids = STVector256::from_values(sf("sfCredentialIDs"), vec![*second.key(), *first.key()]);
+    let tx = STTx::new(TxType::PAYCHAN_CLAIM, |object| {
+        object.set_account_id(sf("sfAccount"), subject);
+        object.set_field_v256(sf("sfCredentialIDs"), ids);
+    });
+    let ledger = ledger_with([
+        account_entry(subject, 0),
+        destination_entry,
+        first,
+        second,
+        preauth,
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let destination_sle = view
+        .read(account_keylet(account_raw(destination)))
+        .expect("destination read")
+        .expect("destination exists");
+
+    assert_eq!(
+        verify_deposit_preauth(
+            &tx,
+            &mut view,
+            &subject,
+            &destination,
+            Some(destination_sle.as_ref()),
+        ),
+        Ok(Ter::TES_SUCCESS)
+    );
+}
+
+#[test]
+fn credential_deposit_preauth_rejects_zero_ids_after_cleanup_3_4() {
+    let destination = account(0x30);
+    let mut ledger = ledger_with([account_entry(destination, 0)]);
+    ledger.set_rules(Rules::new([protocol::feature_id("fixCleanup3_4_0")]));
+    let view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let ids = STVector256::from_values(sf("sfCredentialIDs"), vec![Uint256::zero()]);
+
+    assert_eq!(
+        authorized_deposit_preauth(&view, &ids, &destination),
+        Ok(Ter::TEF_INTERNAL)
+    );
 }
 
 fn account(byte: u8) -> AccountID {

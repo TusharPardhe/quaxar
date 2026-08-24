@@ -98,7 +98,7 @@ fn account_set_production_apply_matches_canonical_field_and_irreversible_flag_ru
 
     let clear_canonical_fields = STTx::new(TxType::ACCOUNT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), account);
-        tx.set_field_u8(sf("sfTickSize"), 15);
+        tx.set_field_u8(sf("sfTickSize"), 16);
         tx.set_field_vl(sf("sfDomain"), b"");
         tx.set_field_u32(sf("sfClearFlag"), 7);
     });
@@ -1200,6 +1200,92 @@ fn escrow_finish_mpt_token_escrow_v1_tracks_gross_lock_and_transfer_fee() {
 }
 
 #[test]
+fn escrow_finish_mpt_cleanup_3_4_rounds_transfer_fee_down() {
+    let owner = sample_account(0xB4);
+    let destination = sample_account(0xB5);
+    let issuer = sample_account(0xB6);
+    let issuance_id = share_id_for(issuer, 1);
+    let amount = STAmount::from_mpt_amount(
+        sf("sfAmount"),
+        MPTAmount::from_value(10_000),
+        MPTIssue::new(issuance_id),
+    );
+
+    let mut issuance =
+        mpt_issuance_entry_with_transfer_fee(issuer, 1, 100_000, MPT_CAN_TRANSFER_FLAG, 100);
+    issuance.set_field_u64(sf("sfLockedAmount"), 10_000);
+    let mut owner_token = mptoken_entry(owner, issuance_id, 90_000);
+    owner_token.set_field_u64(sf("sfLockedAmount"), 10_000);
+    let escrow_keylet = protocol::escrow_keylet(raw_account_id(owner), 1);
+    let mut escrow = STLedgerEntry::from_type_and_key(LedgerEntryType::Escrow, escrow_keylet.key);
+    escrow.set_account_id(sf("sfAccount"), owner);
+    escrow.set_account_id(sf("sfDestination"), destination);
+    escrow.set_field_amount(sf("sfAmount"), amount);
+    escrow.set_field_u32(sf("sfTransferRate"), 1_001_000_000);
+    escrow.set_field_u64(sf("sfOwnerNode"), 0);
+
+    let mut ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 1,
+            drops: 100_000_000_000,
+            ..LedgerHeader::default()
+        },
+        vec![
+            account_root(owner, 1, 0),
+            account_root(destination, 0, 0),
+            account_root(issuer, 0, 0),
+            issuance,
+            owner_token,
+            mptoken_entry(destination, issuance_id, 0),
+            owner_dir_root(owner, escrow_keylet.key),
+            escrow,
+        ],
+    );
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("fixTokenEscrowV1"),
+        protocol::feature_id("fixCleanup3_4_0"),
+    ]));
+    let tx = STTx::new(TxType::ESCROW_FINISH, |object| {
+        object.set_account_id(sf("sfAccount"), destination);
+        object.set_account_id(sf("sfOwner"), owner);
+        object.set_field_u32(sf("sfOfferSequence"), 1);
+        object.set_field_amount(sf("sfFee"), test_xrp(10));
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    let mut view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &tx, TxType::ESCROW_FINISH),
+        Ter::TES_SUCCESS
+    );
+    view.apply(&mut ledger).expect("escrow finish applies");
+
+    let destination_token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_account_id(destination),
+        ))
+        .expect("destination token read")
+        .expect("destination token");
+    assert_eq!(destination_token.get_field_u64(sf("sfMPTAmount")), 9_990);
+    let owner_token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_account_id(owner),
+        ))
+        .expect("owner token read")
+        .expect("owner token");
+    assert!(!owner_token.is_field_present(sf("sfLockedAmount")));
+    let issuance = ledger
+        .peek(protocol::mpt_issuance_keylet_from_mptid(issuance_id))
+        .expect("issuance read")
+        .expect("issuance");
+    assert!(!issuance.is_field_present(sf("sfLockedAmount")));
+    assert_eq!(issuance.get_field_u64(sf("sfOutstandingAmount")), 99_990);
+    assert!(ledger.peek(escrow_keylet).expect("escrow read").is_none());
+}
+
+#[test]
 fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
     let owner = sample_account(0x71);
     let destination = sample_account(0x72);
@@ -1250,12 +1336,18 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
         ),
         Ter::TES_SUCCESS
     );
-    assert!(
-        receiver_view
-            .read(protocol::line(destination, issuer, currency))
-            .expect("receiver line read")
-            .is_some(),
-        "the destination may create its zero-limit line while finishing the escrow"
+    let receiver_line = receiver_view
+        .read(protocol::line(destination, issuer, currency))
+        .expect("receiver line read")
+        .expect("the destination may create its zero-limit line while finishing the escrow");
+    // Destination sorts low and issuer sorts high. Canonical trustCreate
+    // reserves the destination's low side and applies both accounts' default
+    // NoRipple setting. This is the exact metadata field that diverged in the
+    // live incompatible child at ledger 20,189,822.
+    assert_eq!(receiver_line.get_field_u32(sf("sfFlags")), 0x0031_0000);
+    assert_eq!(
+        receiver_line.get_field_amount(sf("sfBalance")).iou(),
+        amount.iou()
     );
     assert_eq!(
         receiver_view
@@ -7064,6 +7156,98 @@ fn offer_create_hybrid_domain_offer_places_domain_and_open_books() {
             .get_field_v256(get_field_by_symbol("sfIndexes"))
             .value(),
         &[offer_keylet.key]
+    );
+}
+
+#[test]
+fn offer_create_crosses_equal_quality_permissioned_domain_offer() {
+    let taker = sample_account(0x51);
+    let offer_owner = sample_account(0x52);
+    let credential_issuer = sample_account(0x53);
+    let credential_type = b"graduate certificate";
+    let domain_sequence = 7;
+    let domain_id = permissioned_domain_keylet(raw_account_id(taker), domain_sequence).key;
+    let usd = currency_from_string("USD");
+    let issue = Issue::new(usd, offer_owner);
+
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(taker, 1, 1, 100_000_000),
+        account_root_with_balance(offer_owner, 1, 0, 100_000_000),
+        account_root_with_balance(credential_issuer, 1, 0, 100_000_000),
+        trust_line_entry(taker, offer_owner, usd, 0),
+        permissioned_domain_entry(
+            taker,
+            domain_sequence,
+            0,
+            &[(credential_issuer, credential_type)],
+        ),
+        credential_entry(
+            offer_owner,
+            credential_issuer,
+            credential_type,
+            0,
+            Some(0),
+            protocol::lsfAccepted,
+            None,
+        ),
+    ]);
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("Credentials"),
+        protocol::feature_id("PermissionedDEX"),
+        protocol::feature_id("fixCleanup3_2_0"),
+        protocol::fix_cleanup_3_3_0(),
+    ]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let maker = offer_create_tx(
+        offer_owner,
+        1,
+        STAmount::from_xrp_amount(XRPAmount::from_drops(2_000_000)),
+        STAmount::from_iou_amount(
+            sf("sfTakerGets"),
+            IOUAmount::from_parts(2, 0).expect("two USD"),
+            issue,
+        ),
+        protocol::tfSell,
+        Some(domain_id),
+    );
+    assert_eq!(
+        handle_real_dispatch(&mut view, &maker, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(protocol::offer_keylet(raw_account_id(offer_owner), 1))
+            .expect("maker offer read")
+            .is_some()
+    );
+
+    let crossing = offer_create_tx(
+        taker,
+        1,
+        STAmount::from_iou_amount(
+            sf("sfTakerPays"),
+            IOUAmount::from_parts(2, 0).expect("two USD"),
+            issue,
+        ),
+        STAmount::from_xrp_amount(XRPAmount::from_drops(2_000_000)),
+        0,
+        Some(domain_id),
+    );
+    assert_eq!(
+        handle_real_dispatch(&mut view, &crossing, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(protocol::offer_keylet(raw_account_id(offer_owner), 1))
+            .expect("consumed maker offer read")
+            .is_none(),
+        "the canonical equal-quality domain offer must be consumed"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(raw_account_id(taker), 1))
+            .expect("crossing offer read")
+            .is_none(),
+        "a fully crossed taker offer must not be placed"
     );
 }
 
