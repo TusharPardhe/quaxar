@@ -191,7 +191,8 @@ impl FlowStep for StepKind {
                 if !requested_out.matches_currency(*currency) {
                     return Err(Ter::TEF_INTERNAL);
                 }
-                let (input, output) = execute_direct_fwd(view, src, dst, requested_out.amount())?;
+                let (input, output) =
+                    execute_direct_fwd(view, src, dst, requested_out.amount(), context.strand_dst)?;
                 Ok(StepAmounts::direct(input, output, *currency))
             }
             StepKind::XrpEndpoint { account, is_last } => {
@@ -299,7 +300,8 @@ impl FlowStep for StepKind {
                 if !requested_in.matches_currency(*currency) {
                     return Err(Ter::TEF_INTERNAL);
                 }
-                let (input, output) = execute_direct_fwd(view, src, dst, requested_in.amount())?;
+                let (input, output) =
+                    execute_direct_fwd(view, src, dst, requested_in.amount(), context.strand_dst)?;
                 Ok(StepAmounts::direct(input, output, *currency))
             }
             StepKind::XrpEndpoint { account, is_last } => {
@@ -712,6 +714,7 @@ fn execute_direct_fwd<V: ApplyView>(
     src: &AccountID,
     dst: &AccountID,
     input: &STAmount,
+    strand_dst: &AccountID,
 ) -> Result<(STAmount, STAmount), Ter> {
     if input.signum() <= 0 {
         return Ok((input.zeroed(), input.zeroed()));
@@ -741,7 +744,15 @@ fn execute_direct_fwd<V: ApplyView>(
             *src
         },
     };
-    let rate = if debt_dir == crate::domain::ripple_calc::direct_step::DebtDirection::Redeems {
+    // A holder returning an IOU to its issuer does not pay the issuer's
+    // transfer rate. In rippled this is a one-step DirectStep whose
+    // `qualitiesSrcRedeems` has no previous step and therefore returns
+    // QUALITY_ONE. The Rust flow executor accounts for a multi-hop transfer
+    // fee at the redemption boundary, so preserve that representation while
+    // exempting the terminal issuer redemption.
+    let rate = if debt_dir == crate::domain::ripple_calc::direct_step::DebtDirection::Redeems
+        && dst != strand_dst
+    {
         ripple_state_helpers::transfer_rate(view, dst)
     } else {
         crate::domain::mul_ratio::QUALITY_ONE

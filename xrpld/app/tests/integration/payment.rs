@@ -280,6 +280,63 @@ fn payment_iou_with_transfer_rate() {
     let tx = payment_tx_with_sendmax(alice, bob, iou(gw, usd, 100), iou(gw, usd, 200), 1);
     let result = handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None);
     assert_eq!(result, Ter::TES_SUCCESS);
+    let alice_line = view
+        .read(protocol::line(alice, gw, usd))
+        .expect("alice line read")
+        .expect("alice line remains");
+    let bob_line = view
+        .read(protocol::line(bob, gw, usd))
+        .expect("bob line read")
+        .expect("bob line remains");
+    assert_eq!(
+        alice_line.get_field_amount(sf("sfBalance")).iou(),
+        IOUAmount::from_parts(880, 0).expect("alice pays amount plus transfer fee")
+    );
+    assert_eq!(
+        bob_line.get_field_amount(sf("sfBalance")).iou(),
+        IOUAmount::from_parts(100, 0).expect("bob receives requested amount")
+    );
+}
+
+/// rippled DirectStep: returning an issued asset to its issuer is a
+/// redemption, not a third-party transfer, so the issuer's transfer rate is
+/// never charged. Cover both low/high trust-line account orientations.
+#[test]
+fn payment_iou_issuer_redemption_waives_transfer_rate() {
+    let usd = usd_currency();
+
+    for (holder, issuer) in [(acct(0x11), acct(0x33)), (acct(0x33), acct(0x11))] {
+        let mut issuer_root = account_root(issuer, 5_000_000_000, 0, 0);
+        issuer_root.set_field_u32(sf("sfTransferRate"), 1_200_000_000);
+        let holder_is_low = holder < issuer;
+        let line = if holder_is_low {
+            trust_line(holder, issuer, usd, 1_000, 10_000, 0)
+        } else {
+            trust_line(issuer, holder, usd, -1_000, 0, 10_000)
+        };
+        let ledger = build_ledger(vec![
+            account_root(holder, 5_000_000_000, 1, 0),
+            issuer_root,
+            line,
+        ]);
+        let mut view = new_view(ledger);
+
+        let tx = payment_tx(holder, issuer, iou(issuer, usd, 100), 1);
+        assert_eq!(
+            handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None),
+            Ter::TES_SUCCESS,
+            "issuer redemption must be transfer-rate free for holder={holder} issuer={issuer}"
+        );
+        let line_after = view
+            .read(protocol::line(holder, issuer, usd))
+            .expect("redemption trust line read")
+            .expect("redemption trust line remains");
+        assert_eq!(
+            line_after.get_field_amount(sf("sfBalance")).iou(),
+            IOUAmount::from_parts(if holder_is_low { 900 } else { -900 }, 0)
+                .expect("post-redemption balance"),
+        );
+    }
 }
 
 /// C++ Flow_test — IOU payment to frozen destination fails.
