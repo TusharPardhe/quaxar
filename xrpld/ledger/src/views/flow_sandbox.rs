@@ -24,6 +24,7 @@ pub enum Action {
     Erase,
 }
 
+#[derive(Clone)]
 pub struct Entry {
     pub action: Action,
     pub sle: Arc<STLedgerEntry>,
@@ -112,9 +113,43 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         let mut meta = protocol::TxMeta::new(transaction_id, ledger_seq);
         meta.set_delivered_amount(delivered_amount);
 
-        for (key, entry) in &self.items {
+        // rippled mutates entries in its ordered items_ map while metadata is
+        // being built: threadOwners can change an AccountRoot that has not yet
+        // reached its own map position. Work on a shadow map so that exact
+        // ordering is represented without consuming the real transaction
+        // delta before commit.
+        let mut items = self.items.clone();
+        let mut new_mod = BTreeMap::<Uint256, Arc<STLedgerEntry>>::new();
+        let keys = items.keys().copied().collect::<Vec<_>>();
+
+        for key in keys {
+            let entry = items
+                .get(&key)
+                .cloned()
+                .expect("metadata key came from the shadow state table");
             match entry.action {
                 Action::Insert => {
+                    // ApplyStateTable::apply calls setAffectedNode for the
+                    // current map item before threadOwners may append a
+                    // supplemental AccountRoot. Preserve that insertion
+                    // order for the unsorted ledgerDelta representation too.
+                    let _ = meta.get_affected_node_for_sle(
+                        entry.sle.as_ref(),
+                        protocol::get_field_by_symbol("sfCreatedNode"),
+                    );
+                    self.thread_owners_for_metadata(
+                        entry.sle.as_ref(),
+                        &mut items,
+                        &mut new_mod,
+                        &mut meta,
+                        transaction_id,
+                        ledger_seq,
+                        rules,
+                    )?;
+                    let entry = items
+                        .get(&key)
+                        .cloned()
+                        .expect("created entry remains in the shadow state table");
                     // rippled threads created entries before it selects their
                     // `sfNewFields`, so the leaf and committed state agree.
                     let current = crate::apply_state_table::thread_sle(
@@ -137,11 +172,12 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
                     if selected {
                         node.set_field_object(protocol::get_field_by_symbol("sfNewFields"), fields);
                     }
+                    items.get_mut(&key).expect("created entry remains").sle = Arc::new(current);
                 }
                 Action::Modify => {
                     let original = self
                         .parent
-                        .read(Keylet::new(entry.sle.get_type(), *key))?
+                        .read(Keylet::new(entry.sle.get_type(), key))?
                         .ok_or_else(|| {
                             ViewError::Conversion(
                                 "FlowSandbox::to_tx_meta: modified parent entry disappeared"
@@ -187,17 +223,33 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
                             final_fields,
                         );
                     }
+                    items.get_mut(&key).expect("modified entry remains").sle = Arc::new(current);
                 }
                 Action::Erase => {
                     let original = self
                         .parent
-                        .read(Keylet::new(entry.sle.get_type(), *key))?
+                        .read(Keylet::new(entry.sle.get_type(), key))?
                         .ok_or_else(|| {
                             ViewError::Conversion(
                                 "FlowSandbox::to_tx_meta: erased parent entry disappeared"
                                     .to_owned(),
                             )
                         })?;
+                    // As with CreatedNode, rippled registers the DeletedNode
+                    // before owner threading can append metadata entries.
+                    let _ = meta.get_affected_node_for_sle(
+                        entry.sle.as_ref(),
+                        protocol::get_field_by_symbol("sfDeletedNode"),
+                    );
+                    self.thread_owners_for_metadata(
+                        original.as_ref(),
+                        &mut items,
+                        &mut new_mod,
+                        &mut meta,
+                        transaction_id,
+                        ledger_seq,
+                        rules,
+                    )?;
                     let node = meta.get_affected_node_for_sle(
                         entry.sle.as_ref(),
                         protocol::get_field_by_symbol("sfDeletedNode"),
@@ -229,37 +281,57 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
             }
         }
 
-        // ApplyStateTable::apply collects `newMod` AccountRoots while it
-        // builds metadata for created/deleted owner-bearing entries. These
-        // thread-only nodes are not part of the transactor's direct delta, so
-        // add them explicitly from the same collection used by commit below.
-        for owner in self.collect_owner_threads()?.into_values() {
-            let current = crate::apply_state_table::thread_sle(
-                owner.as_ref(),
+        Ok(meta)
+    }
+
+    fn thread_owners_for_metadata(
+        &self,
+        owner_source: &STLedgerEntry,
+        items: &mut BTreeMap<Uint256, Entry>,
+        new_mod: &mut BTreeMap<Uint256, Arc<STLedgerEntry>>,
+        meta: &mut protocol::TxMeta,
+        transaction_id: Uint256,
+        ledger_seq: u32,
+        rules: &Rules,
+    ) -> Result<(), ViewError> {
+        for owner in owner_accounts(owner_source) {
+            let keylet = account_keylet(Uint160::from_void(owner.data()));
+            let unthreaded = if let Some(sle) = new_mod.get(&keylet.key) {
+                Some(Arc::clone(sle))
+            } else if let Some(entry) = items.get(&keylet.key) {
+                (entry.action != Action::Erase).then(|| Arc::clone(&entry.sle))
+            } else {
+                self.parent.read(keylet)?
+            };
+            let Some(unthreaded) = unthreaded else {
+                continue;
+            };
+            let current = Arc::new(crate::apply_state_table::thread_sle(
+                unthreaded.as_ref(),
                 transaction_id,
                 ledger_seq,
                 rules,
-            );
-            let node = meta.get_affected_node_for_sle(
-                &current,
-                protocol::get_field_by_symbol("sfModifiedNode"),
-            );
-            add_threading_previous_fields(node, owner.as_ref(), transaction_id, rules);
-            // rippled applies each supplemental `newMod` AccountRoot as a
-            // complete ModifiedNode after threadItem. Although no business
-            // field changed, kSmdAlways fields still belong in FinalFields.
-            // Omitting them changes TransactionMd
-            let (final_fields, final_fields_selected) = metadata_fields(&current, |field| {
-                field
-                    .fname()
-                    .should_meta(SField::S_MD_ALWAYS | SField::S_MD_CHANGE_NEW)
-            });
-            if final_fields_selected {
-                node.set_field_object(protocol::get_field_by_symbol("sfFinalFields"), final_fields);
+            ));
+            let previous_transaction =
+                unthreaded.get_field_h256(protocol::get_field_by_symbol("sfPreviousTxnID"));
+            if unthreaded.is_threaded_type(rules)
+                && !previous_transaction.is_zero()
+                && previous_transaction != transaction_id
+            {
+                let node = meta.get_affected_node_for_sle(
+                    current.as_ref(),
+                    protocol::get_field_by_symbol("sfModifiedNode"),
+                );
+                add_threading_previous_fields(node, unthreaded.as_ref(), transaction_id, rules);
+            }
+
+            if let Some(entry) = items.get_mut(&keylet.key) {
+                entry.sle = current;
+            } else {
+                new_mod.insert(keylet.key, current);
             }
         }
-
-        Ok(meta)
+        Ok(())
     }
 
     /// Collect rippled ApplyStateTable's supplemental `newMod` AccountRoots.
@@ -1078,18 +1150,154 @@ mod tests {
             ledger_seq - 1
         );
         assert!(
-            destination_meta.is_field_present(get_field_by_symbol("sfFinalFields")),
-            "rippled newMod owner threads include the AccountRoot's kSmdAlways FinalFields"
+            !destination_meta.is_field_present(get_field_by_symbol("sfFinalFields")),
+            "rippled newMod owner threads contain only the prior transaction thread"
+        );
+        assert!(
+            !destination_meta.is_field_present(get_field_by_symbol("sfPreviousFields")),
+            "thread-only owner metadata must not synthesize PreviousFields"
+        );
+        assert_eq!(
+            destination_meta.iter().count(),
+            4,
+            "supplemental ModifiedNode must contain only its type, index, and prior thread pair"
+        );
+        assert_eq!(
+            metadata
+                .get_nodes()
+                .iter()
+                .next()
+                .expect("created offer metadata node")
+                .get_field_h256(get_field_by_symbol("sfLedgerIndex")),
+            offer_keylet.key,
+            "rippled registers the CreatedNode before supplemental owner metadata"
+        );
+    }
+
+    #[test]
+    fn owner_thread_without_prior_transaction_updates_state_without_empty_metadata_node() {
+        // threadItem mutates a never-threaded AccountRoot, but rippled only
+        // creates a supplemental ModifiedNode when prevTxID is non-zero.
+        let destination = protocol::AccountID::from_array([0x24; 20]);
+        let destination_keylet = account_keylet(Uint160::from_void(destination.data()));
+        let offer_keylet = Keylet::new(LedgerEntryType::NFTokenOffer, Uint256::from_u64(0x2400));
+        let current_tx = Uint256::from_u64(0x2401);
+
+        let mut destination_root = STLedgerEntry::new(destination_keylet);
+        destination_root.set_account_id(get_field_by_symbol("sfAccount"), destination);
+        let mut base = Ledger::new(LedgerHeader::default(), false);
+        base.raw_insert(Arc::new(destination_root))
+            .expect("seed never-threaded destination");
+        let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::default());
+        let rules = parent.rules();
+
+        let metadata = {
+            let mut delta = FlowSandbox::new(&mut parent);
+            let mut offer = STLedgerEntry::new(offer_keylet);
+            offer.set_account_id(get_field_by_symbol("sfDestination"), destination);
+            delta.insert(Arc::new(offer)).expect("stage directed offer");
+            let metadata = delta
+                .to_tx_meta(current_tx, 42, None, &rules)
+                .expect("build metadata");
+            delta
+                .apply_with_tx_thread(current_tx, 42, &rules)
+                .expect("commit owner thread");
+            metadata
+        };
+
+        assert!(!metadata.get_nodes().iter().any(|node| {
+            node.fname() == get_field_by_symbol("sfModifiedNode")
+                && node.get_field_h256(get_field_by_symbol("sfLedgerIndex"))
+                    == destination_keylet.key
+        }));
+        let destination_after = parent
+            .read(destination_keylet)
+            .expect("read destination")
+            .expect("destination remains present");
+        assert_eq!(
+            destination_after.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+            current_tx
+        );
+    }
+
+    #[test]
+    fn multiple_created_entries_reuse_one_supplemental_owner_thread() {
+        // ApplyStateTable's newMod map is shared across the full ordered pass.
+        // Two created objects for one otherwise-untouched owner must update
+        // that AccountRoot once and emit one supplemental ModifiedNode.
+        let destination = protocol::AccountID::from_array([0x25; 20]);
+        let destination_keylet = account_keylet(Uint160::from_void(destination.data()));
+        let prior_tx = Uint256::from_u64(0x2500);
+        let current_tx = Uint256::from_u64(0x2501);
+        let ledger_seq = 20_115_081;
+        let mut destination_root = STLedgerEntry::new(destination_keylet);
+        destination_root.set_account_id(get_field_by_symbol("sfAccount"), destination);
+        destination_root.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), prior_tx);
+        destination_root.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), ledger_seq - 1);
+
+        let mut base = Ledger::new(LedgerHeader::default(), false);
+        base.raw_insert(Arc::new(destination_root))
+            .expect("seed shared destination");
+        let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::default());
+        let rules = parent.rules();
+        let metadata = {
+            let mut delta = FlowSandbox::new(&mut parent);
+            for key in [Uint256::zero(), Uint256::from_array([0xFF; 32])] {
+                let mut offer = STLedgerEntry::new(Keylet::new(LedgerEntryType::NFTokenOffer, key));
+                offer.set_account_id(get_field_by_symbol("sfDestination"), destination);
+                delta.insert(Arc::new(offer)).expect("stage directed offer");
+            }
+            let metadata = delta
+                .to_tx_meta(current_tx, ledger_seq, None, &rules)
+                .expect("build shared-owner metadata");
+            delta
+                .apply_with_tx_thread(current_tx, ledger_seq, &rules)
+                .expect("commit shared owner thread");
+            metadata
+        };
+
+        assert_eq!(
+            metadata
+                .get_nodes()
+                .iter()
+                .filter(|node| {
+                    node.fname() == get_field_by_symbol("sfModifiedNode")
+                        && node.get_field_h256(get_field_by_symbol("sfLedgerIndex"))
+                            == destination_keylet.key
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            metadata
+                .get_nodes()
+                .iter()
+                .map(|node| node.get_field_h256(get_field_by_symbol("sfLedgerIndex")))
+                .collect::<Vec<_>>(),
+            vec![
+                Uint256::zero(),
+                destination_keylet.key,
+                Uint256::from_array([0xFF; 32]),
+            ],
+            "newMod is inserted once between the two ordered CreatedNodes"
+        );
+        assert_eq!(
+            parent
+                .read(destination_keylet)
+                .expect("read shared destination")
+                .expect("shared destination remains")
+                .get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+            current_tx
         );
     }
 
     #[test]
     fn owner_thread_revives_unchanged_modify_in_either_item_order() {
-        // ApplyStateTable::getForMod aliases an existing Modify entry. Even if
-        // the main metadata loop skipped it as equal to the parent, a later
-        // CreatedNode must revive it as a thread-only AccountRoot change. Run
-        // both key orders because rippled's behavior is independent of
-        // whether that unchanged item was visited before or after its owner.
+        // ApplyStateTable::getForMod aliases an existing Modify entry. The
+        // state result is order-independent, but rippled's metadata is not:
+        // an owner threaded before its own map position later runs through the
+        // ordinary ModifiedNode branch and gains FinalFields; an owner whose
+        // unchanged item was already skipped remains thread-only.
         let destination = protocol::AccountID::from_array([0x33; 20]);
         let destination_keylet = account_keylet(Uint160::from_void(destination.data()));
         for offer_key in [Uint256::zero(), Uint256::from_array([0xFF; 32])] {
@@ -1144,6 +1352,26 @@ mod tests {
                 matching_nodes[0].get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
                 prior_tx
             );
+            let source_precedes_owner = offer_key < destination_keylet.key;
+            assert_eq!(
+                matching_nodes[0].is_field_present(get_field_by_symbol("sfFinalFields")),
+                source_precedes_owner,
+                "FinalFields presence must follow rippled's ordered items_ mutation"
+            );
+            if source_precedes_owner {
+                assert_eq!(
+                    matching_nodes[0]
+                        .get_field_object(get_field_by_symbol("sfFinalFields"))
+                        .get_account_id(get_field_by_symbol("sfAccount")),
+                    destination,
+                    "revived normal ModifiedNode must carry canonical AccountRoot FinalFields"
+                );
+            }
+            assert_eq!(
+                matching_nodes[0].iter().count(),
+                if source_precedes_owner { 5 } else { 4 },
+                "owner metadata must contain exactly the rippled fields for its ordering case"
+            );
 
             let destination_after = parent
                 .read(destination_keylet)
@@ -1156,6 +1384,84 @@ mod tests {
             assert_eq!(
                 destination_after.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
                 ledger_seq
+            );
+        }
+    }
+
+    #[test]
+    fn erased_owner_source_revives_unchanged_modify_in_either_item_order() {
+        // DeletedNode runs threadOwners at the same point as CreatedNode.
+        // Cover both sides of the ordered-map alias case independently so an
+        // EscrowFinish/PayChannelClaim deletion cannot regress while fixing a
+        // TrustSet-style supplemental owner.
+        let destination = protocol::AccountID::from_array([0x35; 20]);
+        let destination_keylet = account_keylet(Uint160::from_void(destination.data()));
+        for escrow_key in [Uint256::from_u64(1), Uint256::from_array([0xFF; 32])] {
+            let escrow_keylet = Keylet::new(LedgerEntryType::Escrow, escrow_key);
+            let prior_tx = Uint256::from_u64(0x3500);
+            let current_tx = Uint256::from_u64(0x3501);
+            let ledger_seq = 20_115_083;
+            let mut destination_root = STLedgerEntry::new(destination_keylet);
+            destination_root.set_account_id(get_field_by_symbol("sfAccount"), destination);
+            destination_root.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), prior_tx);
+            destination_root
+                .set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), ledger_seq - 1);
+            let mut escrow = STLedgerEntry::new(escrow_keylet);
+            escrow.set_account_id(get_field_by_symbol("sfDestination"), destination);
+
+            let mut base = Ledger::new(LedgerHeader::default(), false);
+            base.raw_insert(Arc::new(destination_root.clone()))
+                .expect("seed unchanged destination");
+            base.raw_insert(Arc::new(escrow.clone()))
+                .expect("seed erased owner source");
+            let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::default());
+            let rules = parent.rules();
+            let metadata = {
+                let mut delta = FlowSandbox::new(&mut parent);
+                delta
+                    .raw_replace(Arc::new(destination_root.clone()))
+                    .expect("stage unchanged Modify");
+                delta
+                    .raw_erase(Arc::new(escrow))
+                    .expect("stage Escrow erase");
+                let metadata = delta
+                    .to_tx_meta(current_tx, ledger_seq, None, &rules)
+                    .expect("build erased-owner metadata");
+                delta
+                    .apply_with_tx_thread(current_tx, ledger_seq, &rules)
+                    .expect("commit erased-owner thread");
+                metadata
+            };
+
+            let destination_node = metadata
+                .get_nodes()
+                .iter()
+                .find(|node| {
+                    node.fname() == get_field_by_symbol("sfModifiedNode")
+                        && node.get_field_h256(get_field_by_symbol("sfLedgerIndex"))
+                            == destination_keylet.key
+                })
+                .expect("erased source must thread destination");
+            assert_eq!(
+                destination_node.is_field_present(get_field_by_symbol("sfFinalFields")),
+                escrow_key < destination_keylet.key,
+                "DeletedNode owner metadata must retain rippled's ordered alias behavior"
+            );
+            if escrow_key < destination_keylet.key {
+                assert_eq!(
+                    destination_node
+                        .get_field_object(get_field_by_symbol("sfFinalFields"))
+                        .get_account_id(get_field_by_symbol("sfAccount")),
+                    destination
+                );
+            }
+            assert_eq!(
+                parent
+                    .read(destination_keylet)
+                    .expect("read threaded destination")
+                    .expect("destination remains")
+                    .get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+                current_tx
             );
         }
     }
@@ -1251,6 +1557,16 @@ mod tests {
                 ledger_seq - 1
             );
         }
+        assert_eq!(
+            metadata
+                .get_nodes()
+                .iter()
+                .next()
+                .expect("deleted trust-line metadata node")
+                .get_field_h256(get_field_by_symbol("sfLedgerIndex")),
+            line_keylet.key,
+            "rippled registers the DeletedNode before supplemental owner metadata"
+        );
         assert!(
             !parent.exists(line_keylet).expect("read erased trust line"),
             "trust line must remain erased"

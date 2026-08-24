@@ -4885,17 +4885,89 @@ fn batch_inner_transactions_retain_parent_context_and_metadata() {
         3,
         "the outer Batch and both successfully applied inner transactions must be recorded"
     );
-    for inner in inners {
+    let source_key = account_keylet(raw_account_id(source)).key;
+    let destination = AccountID::from_array([0xF0; 20]);
+    let destination_key = account_keylet(raw_account_id(destination)).key;
+    let (_, outer_metadata) = transactions
+        .iter()
+        .find(|(transaction, _)| transaction.get_transaction_id() == batch_id)
+        .expect("outer Batch metadata must be recorded");
+    assert_eq!(outer_metadata.get_result_ter(), Ter::TES_SUCCESS);
+    assert_eq!(outer_metadata.get_index(), 0);
+    assert_eq!(
+        outer_metadata.get_nodes().len(),
+        1,
+        "outer Batch metadata must exclude every inner-only state delta"
+    );
+    assert_eq!(
+        outer_metadata
+            .get_nodes()
+            .iter()
+            .next()
+            .expect("outer Batch has one affected node")
+            .get_field_h256(get_field_by_symbol("sfLedgerIndex")),
+        source_key,
+        "outer Batch metadata contains only its own source preamble mutation"
+    );
+
+    for (position, inner) in inners.iter().enumerate() {
         let (_, metadata) = transactions
             .iter()
             .find(|(transaction, _)| transaction.get_transaction_id() == inner.get_transaction_id())
             .expect("applied inner transaction must retain its own ledger metadata");
+        assert_eq!(metadata.get_result_ter(), Ter::TES_SUCCESS);
+        assert_eq!(metadata.get_index(), position as u32 + 1);
         assert_eq!(
             metadata
                 .get_as_object()
                 .get_field_h256(get_field_by_symbol("sfParentBatchID")),
             batch_id,
             "inner metadata must retain the canonical parent Batch id"
+        );
+        assert_eq!(
+            metadata.get_nodes().len(),
+            2,
+            "each inner Payment metadata must be isolated to source and destination"
+        );
+        let source_node = metadata
+            .get_nodes()
+            .iter()
+            .find(|node| node.get_field_h256(get_field_by_symbol("sfLedgerIndex")) == source_key)
+            .expect("inner Payment metadata must modify its source AccountRoot");
+        assert_eq!(source_node.fname(), get_field_by_symbol("sfModifiedNode"));
+        let destination_node = metadata
+            .get_nodes()
+            .iter()
+            .find(|node| {
+                node.get_field_h256(get_field_by_symbol("sfLedgerIndex")) == destination_key
+            })
+            .expect("inner Payment metadata must contain its destination AccountRoot");
+        assert_eq!(
+            destination_node.fname(),
+            if position == 0 {
+                get_field_by_symbol("sfCreatedNode")
+            } else {
+                get_field_by_symbol("sfModifiedNode")
+            },
+            "the first inner creates the destination and the second modifies it"
+        );
+    }
+
+    let last_inner_id = inners[1].get_transaction_id();
+    for account in [source, destination] {
+        let sle = outcome
+            .closed
+            .read(account_keylet(raw_account_id(account)))
+            .expect("final Batch account read must succeed")
+            .expect("final Batch account must exist");
+        assert_eq!(
+            sle.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+            last_inner_id,
+            "the last inner transaction, not the outer Batch, must own the final SLE thread"
+        );
+        assert_eq!(
+            sle.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
+            11
         );
     }
 }
@@ -4960,6 +5032,25 @@ fn batch_all_or_nothing_discards_inner_metadata_with_the_whole_batch_view() {
             "discarded inner Batch transactions must not receive metadata entries"
         );
     }
+    let source_after = outcome
+        .closed
+        .read(account_keylet(raw_account_id(source)))
+        .expect("read source after all-or-nothing Batch")
+        .expect("outer Batch source remains");
+    assert_eq!(
+        source_after.get_field_u32(get_field_by_symbol("sfSequence")),
+        2,
+        "only the outer Batch sequence increment may survive inner rollback"
+    );
+    let inner_destination = AccountID::from_array([0xF0; 20]);
+    assert!(
+        outcome
+            .closed
+            .read(account_keylet(raw_account_id(inner_destination)))
+            .expect("read discarded inner destination")
+            .is_none(),
+        "the first inner Payment's created destination must roll back with wholeBatchView"
+    );
 }
 
 #[test]

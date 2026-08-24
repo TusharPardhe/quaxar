@@ -294,7 +294,9 @@ pub fn issue_iou<V: ApplyView>(
         new_state.set_field_u32(sf("sfFlags"), flags);
 
         let sle = Arc::new(STLedgerEntry::from_stobject(new_state, line_keylet.key));
-        let _ = view.insert(sle);
+        if view.insert(Arc::clone(&sle)).is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
 
         let low_account = if b_sender_high {
             *account
@@ -310,27 +312,42 @@ pub fn issue_iou<V: ApplyView>(
             protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(low_account.data()));
         let high_dir =
             protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(high_account.data()));
-        if matches!(
-            crate::views::directory::dir_insert(
-                view,
-                &low_dir,
-                line_keylet.key,
-                &crate::describe_owner_dir(low_account),
-            ),
-            Ok(None)
+        let low_node = match crate::views::directory::dir_insert(
+            view,
+            &low_dir,
+            line_keylet.key,
+            &crate::describe_owner_dir(low_account),
         ) {
-            return Ter::TEC_DIR_FULL;
-        }
-        if matches!(
-            crate::views::directory::dir_insert(
-                view,
-                &high_dir,
-                line_keylet.key,
-                &crate::describe_owner_dir(high_account),
-            ),
-            Ok(None)
+            Ok(Some(node)) => node,
+            Ok(None) => return Ter::TEC_DIR_FULL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        let high_node = match crate::views::directory::dir_insert(
+            view,
+            &high_dir,
+            line_keylet.key,
+            &crate::describe_owner_dir(high_account),
         ) {
-            return Ter::TEC_DIR_FULL;
+            Ok(Some(node)) => node,
+            Ok(None) => return Ter::TEC_DIR_FULL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+
+        // rippled::trustCreate stores both deletion hints even when the
+        // entries were inserted into root page zero. These optional zero-valued
+        // fields are omitted from CreatedNode metadata, but they are part of
+        // the canonical account-state leaf and therefore its SHAMap hash.
+        let mut finalized = sle.clone_as_object();
+        finalized.set_field_u64(sf("sfLowNode"), low_node);
+        finalized.set_field_u64(sf("sfHighNode"), high_node);
+        if view
+            .update(Arc::new(STLedgerEntry::from_stobject(
+                finalized,
+                line_keylet.key,
+            )))
+            .is_err()
+        {
+            return Ter::TEF_BAD_LEDGER;
         }
 
         // Adjust owner count for receiver
@@ -806,37 +823,36 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         }
         new_obj.set_field_u32(sf("sfFlags"), flags);
 
-        let new_sle = Arc::new(STLedgerEntry::from_stobject(new_obj, line_keylet.key));
-
         // Add to both owner directories
         let low_account = if b_sender_high { *receiver } else { *sender };
         let low_dir =
             protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(low_account.data()));
-        if matches!(
-            crate::dir_insert(
-                view as &mut dyn ApplyView,
-                &low_dir,
-                line_keylet.key,
-                &crate::describe_owner_dir(low_account),
-            ),
-            Ok(None)
+        let low_node = match crate::dir_insert(
+            view as &mut dyn ApplyView,
+            &low_dir,
+            line_keylet.key,
+            &crate::describe_owner_dir(low_account),
         ) {
-            return Ter::TEC_DIR_FULL;
-        }
+            Ok(Some(node)) => node,
+            Ok(None) => return Ter::TEC_DIR_FULL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
         let high_account = if b_sender_high { *sender } else { *receiver };
         let high_dir =
             protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(high_account.data()));
-        if matches!(
-            crate::dir_insert(
-                view as &mut dyn ApplyView,
-                &high_dir,
-                line_keylet.key,
-                &crate::describe_owner_dir(high_account),
-            ),
-            Ok(None)
+        let high_node = match crate::dir_insert(
+            view as &mut dyn ApplyView,
+            &high_dir,
+            line_keylet.key,
+            &crate::describe_owner_dir(high_account),
         ) {
-            return Ter::TEC_DIR_FULL;
-        }
+            Ok(Some(node)) => node,
+            Ok(None) => return Ter::TEC_DIR_FULL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+
+        new_obj.set_field_u64(sf("sfLowNode"), low_node);
+        new_obj.set_field_u64(sf("sfHighNode"), high_node);
 
         // Adjust receiver's owner count
         if let Ok(Some(rcv_sle)) = view.peek(protocol::account_keylet(
@@ -845,7 +861,15 @@ fn direct_send_no_fee_iou<V: ApplyView>(
             adjust_owner_count(view, &rcv_sle, 1);
         }
 
-        let _ = view.insert(new_sle);
+        if view
+            .insert(Arc::new(STLedgerEntry::from_stobject(
+                new_obj,
+                line_keylet.key,
+            )))
+            .is_err()
+        {
+            return Ter::TEF_BAD_LEDGER;
+        }
         Ter::TES_SUCCESS
     }
 }
