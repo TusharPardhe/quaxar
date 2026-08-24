@@ -15,5 +15,6 @@ mod mptoken_helpers;
 mod order_book_db;
 mod parity;
 mod permissioned_dex;
+mod ripple_state_helpers;
 mod trustline;
 mod vault_helpers;
