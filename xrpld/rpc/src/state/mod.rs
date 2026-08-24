@@ -18,6 +18,7 @@ pub mod context;
 pub mod feature;
 pub mod ledger_data_page_cache;
 pub mod ledger_state_index;
+mod ripple_path_find_engine;
 pub mod role;
 pub mod server_definitions;
 pub mod server_info;

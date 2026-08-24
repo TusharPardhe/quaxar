@@ -4,8 +4,8 @@ use std::{cell::Cell, collections::BTreeMap};
 
 use protocol::JsonValue;
 use rpc::{
-    PathFindSession, PathFinderRequest, PathFinderSource, PathRequestManager, RpcErrorCode,
-    RpcRuntime, do_path_find, do_ripple_path_find,
+    PathFindSession, PathFinderRequest, PathFinderResult, PathFinderSource, PathRequestManager,
+    RpcErrorCode, RpcRuntime, do_path_find, do_ripple_path_find,
 };
 
 fn object(entries: impl IntoIterator<Item = (&'static str, JsonValue)>) -> JsonValue {
@@ -30,6 +30,14 @@ impl RpcRuntime for FakeRuntime {
 
     fn network_synced(&self) -> bool {
         self.synced.get()
+    }
+
+    fn validated_ledger_age(&self) -> std::time::Duration {
+        if self.synced.get() {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs(121)
+        }
     }
 }
 
@@ -76,23 +84,27 @@ impl PathFinderSource for FakePathSource {
         _params: &JsonValue,
         search_level: u32,
         is_legacy: bool,
-    ) -> Result<JsonValue, rpc::RpcStatus> {
+        _api_version: u32,
+        _previous_paths: &BTreeMap<protocol::Asset, protocol::STPathSet>,
+    ) -> Result<PathFinderResult, rpc::RpcStatus> {
         self.levels.borrow_mut().push(search_level);
         if is_legacy {
             self.legacy_calls.set(self.legacy_calls.get() + 1);
         } else {
             self.normal_calls.set(self.normal_calls.get() + 1);
         }
-        Ok(JsonValue::Array(vec![JsonValue::Object(BTreeMap::from([
-            (
-                "source_account".to_owned(),
-                JsonValue::String(request.source_account.clone()),
-            ),
-            (
-                "destination_account".to_owned(),
-                JsonValue::String(request.destination_account.clone()),
-            ),
-        ]))]))
+        Ok(PathFinderResult::alternatives(JsonValue::Array(vec![
+            JsonValue::Object(BTreeMap::from([
+                (
+                    "source_account".to_owned(),
+                    JsonValue::String(request.source_account.clone()),
+                ),
+                (
+                    "destination_account".to_owned(),
+                    JsonValue::String(request.destination_account.clone()),
+                ),
+            ])),
+        ])))
     }
 }
 
@@ -279,12 +291,14 @@ fn ripple_path_find_prefers_direct_legacy_requests_when_explicit_or_unsynced() {
 
     let result = do_ripple_path_find(
         &request("create"),
+        1,
         &runtime,
         Some(&session),
         &manager,
         &source,
         90,
         true,
+        false,
     );
     let JsonValue::Object(result) = result else {
         panic!("legacy result must be an object");
@@ -293,6 +307,85 @@ fn ripple_path_find_prefers_direct_legacy_requests_when_explicit_or_unsynced() {
     assert!(result.contains_key("destination_currencies"));
     assert_eq!(source.legacy_calls.get(), 1);
     assert_eq!(session.request_id.get(), None);
+}
+
+#[test]
+fn explicit_ripple_path_find_enforces_rippleds_load_guard_with_admin_bypass() {
+    struct BusyRuntime;
+    impl RpcRuntime for BusyRuntime {
+        fn path_search_max(&self) -> u32 {
+            8
+        }
+
+        fn client_job_count(&self) -> u32 {
+            51
+        }
+    }
+
+    let manager = PathRequestManager::new();
+    let source = FakePathSource::default();
+    let rejected = do_ripple_path_find(
+        &request("create"),
+        2,
+        &BusyRuntime,
+        Option::<&FakeSession>::None,
+        &manager,
+        &source,
+        90,
+        true,
+        false,
+    );
+    let JsonValue::Object(rejected) = rejected else {
+        panic!("legacy error must be an object");
+    };
+    assert_eq!(
+        rejected.get("error"),
+        Some(&JsonValue::String(RpcErrorCode::TooBusy.token().to_owned()))
+    );
+
+    let allowed = do_ripple_path_find(
+        &request("create"),
+        2,
+        &BusyRuntime,
+        Option::<&FakeSession>::None,
+        &manager,
+        &source,
+        90,
+        true,
+        true,
+    );
+    let JsonValue::Object(allowed) = allowed else {
+        panic!("admin result must be an object");
+    };
+    assert!(allowed.contains_key("alternatives"));
+}
+
+#[test]
+fn ripple_path_find_rejects_implicit_stale_ledger_with_versioned_error() {
+    let runtime = FakeRuntime {
+        path_search_max: Cell::new(8),
+        synced: Cell::new(false),
+    };
+    for (api_version, expected) in [(1, "noNetwork"), (2, "notSynced")] {
+        let result = do_ripple_path_find(
+            &request("create"),
+            api_version,
+            &runtime,
+            Option::<&FakeSession>::None,
+            &PathRequestManager::new(),
+            &FakePathSource::default(),
+            90,
+            false,
+            false,
+        );
+        let JsonValue::Object(result) = result else {
+            panic!("legacy error must be an object");
+        };
+        assert_eq!(
+            result.get("error"),
+            Some(&JsonValue::String(expected.to_owned()))
+        );
+    }
 }
 
 #[test]

@@ -2295,6 +2295,10 @@ pub trait RpcRuntime {
         true
     }
 
+    fn validated_ledger_age(&self) -> StdDuration {
+        StdDuration::ZERO
+    }
+
     fn current_ledger_index(&self) -> Option<u32> {
         None
     }
@@ -2438,6 +2442,10 @@ impl RpcRuntime for ApplicationRoot {
         // FULL (displayed as "proposing" once active-validating) all count
         // as synced. Only DISCONNECTED/CONNECTED are rejected.
         self.network_ops_operating_mode() >= NetworkOpsOperatingMode::Syncing
+    }
+
+    fn validated_ledger_age(&self) -> StdDuration {
+        ApplicationRoot::validated_ledger_age(self)
     }
 
     fn current_ledger_index(&self) -> Option<u32> {

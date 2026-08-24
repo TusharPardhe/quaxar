@@ -270,12 +270,14 @@ where
 
     RpcReply::result(rpc::do_ripple_path_find(
         request.params,
+        request.metadata.api_version,
         &dispatcher.source,
         request.session,
         path_requests.as_ref(),
         path_source.as_ref(),
         ledger_index,
         has_explicit_ledger(request.params),
+        request.metadata.role == RpcRole::Admin,
     ))
 }
 

@@ -223,7 +223,9 @@ pub fn ripple_calculate<V: ApplyView>(
         input,
     )?;
 
-    flow_sb.apply()?;
+    if is_tes_success(result.result) {
+        flow_sb.apply()?;
+    }
 
     Ok(result)
 }

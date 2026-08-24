@@ -273,13 +273,21 @@ impl OrderBookDB {
     }
 
     pub fn get_books_by_taker_pays(&self, issue: Issue, domain: Option<Domain>) -> Vec<Book> {
+        self.get_books_by_taker_pays_asset(Asset::Issue(issue), domain)
+    }
+
+    /// Return books whose input side is `asset`.
+    ///
+    /// Pathfinder operates on `Asset`, not only legacy `Issue`, because MPT
+    /// books participate in exactly the same adjacency graph.
+    pub fn get_books_by_taker_pays_asset(&self, asset: Asset, domain: Option<Domain>) -> Vec<Book> {
         let mut ret = Vec::new();
         let state = self
             .state
             .lock()
             .expect("order book index mutex must not be poisoned");
 
-        let query = Asset::Issue(issue);
+        let query = asset;
         let mut get_books = |books: &IssueSet| {
             ret.reserve(books.len());
             for gets in books {
@@ -304,12 +312,16 @@ impl OrderBookDB {
     }
 
     pub fn get_book_size(&self, issue: Issue, domain: Option<Domain>) -> i32 {
+        self.get_book_size_asset(Asset::Issue(issue), domain)
+    }
+
+    pub fn get_book_size_asset(&self, asset: Asset, domain: Option<Domain>) -> i32 {
         let state = self
             .state
             .lock()
             .expect("order book index mutex must not be poisoned");
 
-        let query = Asset::Issue(issue);
+        let query = asset;
         match domain {
             Some(domain) => state
                 .domain_books
@@ -325,12 +337,16 @@ impl OrderBookDB {
     }
 
     pub fn is_book_to_xrp(&self, issue: Issue, domain: Option<Domain>) -> bool {
+        self.is_book_to_xrp_asset(Asset::Issue(issue), domain)
+    }
+
+    pub fn is_book_to_xrp_asset(&self, asset: Asset, domain: Option<Domain>) -> bool {
         let state = self
             .state
             .lock()
             .expect("order book index mutex must not be poisoned");
 
-        let query = Asset::Issue(issue);
+        let query = asset;
         match domain {
             Some(domain) => state.xrp_domain_books.contains(&(query, domain)),
             None => state.xrp_books.contains(&query),
