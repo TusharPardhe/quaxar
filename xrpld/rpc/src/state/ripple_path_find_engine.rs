@@ -14,8 +14,8 @@ use basics::base_uint::Uint160;
 use ledger::{Ledger, PaymentSandbox};
 use protocol::{
     AccountID, ApplyFlags, Asset, Issue, JsonOptions, JsonValue, LedgerEntryType, PathAsset,
-    STAmount, STPath, STPathElement, STPathSet, StBase, Ter, get_field_by_symbol, get_rate,
-    is_tes_success, owner_dir_keylet, page_keylet, to_max_amount, xrp_account, xrp_issue,
+    STAmount, STPath, STPathElement, STPathSet, StBase, Ter, equal_tokens, get_field_by_symbol,
+    get_rate, is_tes_success, owner_dir_keylet, page_keylet, to_max_amount, xrp_account, xrp_issue,
 };
 
 const MAX_COMPLETE_PATHS: usize = 1_000;
@@ -812,7 +812,21 @@ pub fn find_paths(
             .parsed_send_max
             .as_ref()
             .filter(|amount| amount.asset() == source_asset)
-            .cloned()
+            .map(|amount| {
+                // RippleCalc treats a negative-one SendMax as no limit when
+                // its token matches the destination and its issuer is the
+                // source account. Our Flow seam takes a concrete limit, so
+                // materialize rippled's unbounded sentinel as the largest
+                // representable amount for the derived source asset.
+                if amount.signum() < 0
+                    && equal_tokens(amount.asset(), destination_asset)
+                    && amount.asset().issuer() == request.source_account_id
+                {
+                    amount_for_asset(source_asset)
+                } else {
+                    amount.clone()
+                }
+            })
             .unwrap_or_else(|| amount_for_asset(source_asset));
         let issuer = if source_asset.native() {
             xrp_account()
@@ -1179,8 +1193,15 @@ mod tests {
             ),
         ]));
         let request = app::paths::parse_path_finder_request(&params).expect("request");
-        let result =
-            find_paths(&app, ledger, &request, 3, true, &BTreeMap::new()).expect("path result");
+        let result = find_paths(
+            &app,
+            Arc::clone(&ledger),
+            &request,
+            3,
+            true,
+            &BTreeMap::new(),
+        )
+        .expect("path result");
         let JsonValue::Array(alternatives) = result.alternatives else {
             panic!("alternatives must be array");
         };
@@ -1203,6 +1224,75 @@ mod tests {
             source_amount.get("issuer"),
             Some(&JsonValue::String(protocol::to_base58(source)))
         );
+
+        let mut convert_all_params = params.clone();
+        {
+            let JsonValue::Object(convert_all_object) = &mut convert_all_params else {
+                unreachable!("test request is an object");
+            };
+            let Some(JsonValue::Object(destination_amount)) =
+                convert_all_object.get_mut("destination_amount")
+            else {
+                unreachable!("test destination amount is issued currency");
+            };
+            destination_amount.insert("value".to_owned(), JsonValue::String("-1".to_owned()));
+            convert_all_object.insert(
+                "send_max".to_owned(),
+                JsonValue::Object(BTreeMap::from([
+                    ("currency".to_owned(), JsonValue::String("HST".to_owned())),
+                    (
+                        "issuer".to_owned(),
+                        JsonValue::String(protocol::to_base58(source)),
+                    ),
+                    ("value".to_owned(), JsonValue::String("10".to_owned())),
+                ])),
+            );
+        }
+        let convert_all_request = app::paths::parse_path_finder_request(&convert_all_params)
+            .expect("issued -1 convert-all request");
+        let convert_all_result = find_paths(
+            &app,
+            Arc::clone(&ledger),
+            &convert_all_request,
+            3,
+            true,
+            &BTreeMap::new(),
+        )
+        .expect("convert-all path result");
+        let JsonValue::Array(convert_all_alternatives) = convert_all_result.alternatives else {
+            panic!("convert-all alternatives must be an array");
+        };
+        assert_eq!(convert_all_alternatives.len(), 1);
+        let JsonValue::Object(convert_all_alternative) = &convert_all_alternatives[0] else {
+            panic!("convert-all alternative must be an object");
+        };
+        let Some(JsonValue::Object(delivered)) = convert_all_alternative.get("destination_amount")
+        else {
+            panic!("convert-all must report the actual destination amount");
+        };
+        assert_eq!(
+            delivered.get("value"),
+            Some(&JsonValue::String("10".to_owned()))
+        );
+
+        {
+            let JsonValue::Object(convert_all_object) = &mut convert_all_params else {
+                unreachable!("test request is an object");
+            };
+            let Some(JsonValue::Object(send_max)) = convert_all_object.get_mut("send_max") else {
+                unreachable!("test send max is issued currency");
+            };
+            send_max.insert("value".to_owned(), JsonValue::String("-1".to_owned()));
+        }
+        let unlimited_request = app::paths::parse_path_finder_request(&convert_all_params)
+            .expect("negative-one send max is unlimited for the matching source issue");
+        let unlimited_result =
+            find_paths(&app, ledger, &unlimited_request, 3, true, &BTreeMap::new())
+                .expect("unlimited convert-all path result");
+        let JsonValue::Array(unlimited_alternatives) = unlimited_result.alternatives else {
+            panic!("unlimited alternatives must be an array");
+        };
+        assert_eq!(unlimited_alternatives.len(), 1);
     }
 
     #[test]
