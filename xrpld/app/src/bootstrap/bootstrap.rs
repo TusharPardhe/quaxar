@@ -223,12 +223,14 @@ impl crate::SHAMapStoreNodeFamilyCacheRuntime for BootstrapNodeFamilyCacheRuntim
         self.full_below.clear();
     }
 
-    fn visit_state_map_hashes(
+    fn visit_state_map_nodes(
         &self,
         ledger: &Ledger,
-        visit: &mut dyn FnMut(Uint256) -> bool,
+        visit: &mut dyn FnMut(
+            &basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
+        ) -> bool,
     ) -> Result<(), shamap::traversal::TraversalError> {
-        self.node_family.visit_state_map_hashes(ledger, visit)
+        self.node_family.visit_state_map_nodes(ledger, visit)
     }
 }
 
@@ -252,6 +254,17 @@ impl crate::SHAMapStoreNodeStoreRuntime for BootstrapRotatingNodeStoreRuntime {
 
     fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
         self.database.copy_to_writable_batch(hashes)
+    }
+
+    fn copy_to_writable_batch_detailed(
+        &self,
+        hashes: &[Uint256],
+    ) -> Result<(usize, Vec<Uint256>), String> {
+        self.database.copy_to_writable_batch_detailed(hashes)
+    }
+
+    fn store_account_nodes(&self, nodes: Vec<(Uint256, basics::blob::Blob)>) -> Result<(), String> {
+        self.database.store_account_nodes(nodes)
     }
 
     fn set_rotation_in_flight(&self, in_flight: bool) {

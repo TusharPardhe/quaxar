@@ -241,6 +241,13 @@ pub trait DatabaseRotating: Database {
     /// hashes missing from both backends are not counted.
     fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String>;
 
+    fn copy_to_writable_batch_detailed(
+        &self,
+        hashes: &[Uint256],
+    ) -> Result<(usize, Vec<Uint256>), String>;
+
+    fn store_account_nodes(&self, nodes: Vec<(Uint256, Blob)>) -> Result<(), String>;
+
     fn rotate(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str));
 }
 

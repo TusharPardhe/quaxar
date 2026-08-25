@@ -2,7 +2,7 @@
 
 use crate::views::apply_view::ApplyView;
 use crate::views::read_view::ViewError;
-use crate::{adjust_owner_count, dir_remove};
+use crate::{decrease_owner_count_for_object, dir_remove};
 use basics::base_uint::Uint160;
 use protocol::{
     STLedgerEntry, Ter, account_keylet, directory_node_keylet, get_field_by_symbol, lsfHybrid,
@@ -91,9 +91,12 @@ pub fn offer_delete(view: &mut dyn ApplyView, sle: Arc<STLedgerEntry>) -> Result
         }
     }
 
-    // Adjust owner count
+    // Match rippled's decreaseOwnerCountForObject even for defensive legacy
+    // state. Offers are not currently sponsor-eligible, but using the object
+    // aware helper keeps sponsorship counters canonical if such an entry is
+    // ever encountered.
     if let Some(account_sle) = view.peek(account_keylet(to_uint160(owner)))? {
-        adjust_owner_count(view, &account_sle, -1)?;
+        decrease_owner_count_for_object(view, &account_sle, &sle, 1)?;
     }
 
     // Erase the offer

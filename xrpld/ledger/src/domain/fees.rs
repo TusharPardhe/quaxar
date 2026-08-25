@@ -9,9 +9,19 @@ pub struct Fees {
 
 impl Fees {
     pub fn account_reserve(&self, owner_count: usize) -> u64 {
+        self.account_reserve_with_account_count(owner_count, 1)
+    }
+
+    pub fn account_reserve_with_account_count(
+        &self,
+        owner_count: usize,
+        account_count: usize,
+    ) -> u64 {
         let owner_count =
             u64::try_from(owner_count).expect("owner count must fit within the fee range");
-        self.reserve + owner_count * self.increment
+        let account_count =
+            u64::try_from(account_count).expect("account count must fit within the fee range");
+        account_count * self.reserve + owner_count * self.increment
     }
 }
 
@@ -30,5 +40,7 @@ mod tests {
         assert_eq!(fees.account_reserve(0), 200);
         assert_eq!(fees.account_reserve(1), 250);
         assert_eq!(fees.account_reserve(3), 350);
+        assert_eq!(fees.account_reserve_with_account_count(3, 0), 150);
+        assert_eq!(fees.account_reserve_with_account_count(3, 2), 550);
     }
 }

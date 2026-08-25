@@ -8,6 +8,8 @@ use crate::shamap::shamap_store_health::{
 use crate::shamap::shamap_store_relational::SHAMapStoreRelationalRuntime;
 use crate::{NodeFamily, TransactionMaster};
 use basics::base_uint::Uint256;
+use basics::blob::Blob;
+use basics::memory::intrusive_pointer::SharedIntrusive;
 use basics::tagged_cache::CacheClock;
 use ledger::Ledger;
 use ledger::LedgerMaster;
@@ -26,10 +28,10 @@ pub trait SHAMapStoreLedgerRuntime: Send + Sync {
 pub trait SHAMapStoreNodeFamilyCacheRuntime: Send + Sync {
     fn tree_node_cache_keys(&self) -> Vec<Uint256>;
     fn clear_full_below_cache(&self);
-    fn visit_state_map_hashes(
+    fn visit_state_map_nodes(
         &self,
         ledger: &Ledger,
-        visit: &mut dyn FnMut(Uint256) -> bool,
+        visit: &mut dyn FnMut(&SharedIntrusive<shamap::tree_node::SHAMapTreeNode>) -> bool,
     ) -> Result<(), TraversalError>;
 }
 
@@ -45,6 +47,18 @@ pub trait SHAMapStoreNodeStoreRuntime: Send + Sync {
             .iter()
             .filter(|hash| self.fetch_node_object(hash, 0))
             .count())
+    }
+
+    fn copy_to_writable_batch_detailed(
+        &self,
+        hashes: &[Uint256],
+    ) -> Result<(usize, Vec<Uint256>), String> {
+        self.copy_to_writable_batch(hashes)
+            .map(|copied| (copied, Vec::new()))
+    }
+
+    fn store_account_nodes(&self, _nodes: Vec<(Uint256, Blob)>) -> Result<(), String> {
+        Err("NodeStore runtime does not support resident-node rescue".to_owned())
     }
 
     /// Enable archive-read copy-forward for the rotation exposure window.
@@ -421,17 +435,15 @@ where
         NodeFamily::clear_full_below_cache(self);
     }
 
-    fn visit_state_map_hashes(
+    fn visit_state_map_nodes(
         &self,
         ledger: &Ledger,
-        visit: &mut dyn FnMut(Uint256) -> bool,
+        visit: &mut dyn FnMut(&SharedIntrusive<shamap::tree_node::SHAMapTreeNode>) -> bool,
     ) -> Result<(), TraversalError> {
         let family = self.shared_family();
         ledger
             .state_map()
-            .visit_nodes_with_family(family.as_ref(), &mut |node| {
-                visit(*node.get_hash().as_uint256())
-            })
+            .visit_nodes_with_family(family.as_ref(), &mut |node| visit(node))
     }
 }
 
@@ -459,6 +471,17 @@ where
 
     fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
         nodestore::DatabaseRotating::copy_to_writable_batch(self, hashes)
+    }
+
+    fn copy_to_writable_batch_detailed(
+        &self,
+        hashes: &[Uint256],
+    ) -> Result<(usize, Vec<Uint256>), String> {
+        <T as nodestore::DatabaseRotating>::copy_to_writable_batch_detailed(self, hashes)
+    }
+
+    fn store_account_nodes(&self, nodes: Vec<(Uint256, Blob)>) -> Result<(), String> {
+        <T as nodestore::DatabaseRotating>::store_account_nodes(self, nodes)
     }
 
     fn rotate_with(&self, new_backend: Box<dyn Backend>) -> (String, String) {
@@ -531,10 +554,14 @@ mod tests {
                 .push("clear-full-below".to_owned());
         }
 
-        fn visit_state_map_hashes(
+        fn visit_state_map_nodes(
             &self,
             _ledger: &Ledger,
-            _visit: &mut dyn FnMut(Uint256) -> bool,
+            _visit: &mut dyn FnMut(
+                &basics::memory::intrusive_pointer::SharedIntrusive<
+                    shamap::tree_node::SHAMapTreeNode,
+                >,
+            ) -> bool,
         ) -> Result<(), TraversalError> {
             Ok(())
         }

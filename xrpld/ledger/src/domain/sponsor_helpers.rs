@@ -68,6 +68,14 @@ pub fn reserve_owner_count(sle: &STLedgerEntry, adjustment: i32) -> u32 {
     (owner + adjustment as i64 - sponsored + sponsoring).clamp(0, u32::MAX as i64) as u32
 }
 
+/// Number of account base reserves funded by this AccountRoot: zero for an
+/// account whose own reserve is sponsored, plus each account it sponsors.
+pub fn reserve_account_count(sle: &STLedgerEntry, adjustment: i32) -> u32 {
+    let own = u32::from(!sle.is_field_present(get_field_by_symbol("sfSponsor"))) as i64;
+    let sponsoring = sle.get_field_u32(get_field_by_symbol("sfSponsoringAccountCount")) as i64;
+    (own + sponsoring + adjustment as i64).clamp(0, u32::MAX as i64) as u32
+}
+
 /// Add one owned object, assigning its reserve to `sponsor_sle` when present.
 pub fn increase_owner_count_for_object(
     view: &mut dyn ApplyView,

@@ -100,6 +100,16 @@ impl NodeFamilyRuntime for RecordingNodeFamily {
     ) -> Result<(), TraversalError> {
         Ok(())
     }
+
+    fn visit_state_map_nodes(
+        &self,
+        _ledger: &Ledger,
+        _visit: &mut dyn FnMut(
+            &basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
+        ) -> bool,
+    ) -> Result<(), TraversalError> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]

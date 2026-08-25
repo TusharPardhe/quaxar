@@ -885,7 +885,12 @@ fn check_cash_has_object_reserve<V: ledger::ApplyView>(
         |sle| sle.get_field_amount(sf("sfBalance")).xrp().drops(),
     );
     let reserve_count = ledger::reserve_owner_count(reserve_sle, 1) as usize;
-    if balance < view.fees().account_reserve(reserve_count) as i64 {
+    let account_count = ledger::reserve_account_count(reserve_sle, 0) as usize;
+    if balance
+        < view
+            .fees()
+            .account_reserve_with_account_count(reserve_count, account_count) as i64
+    {
         return Ok(false);
     }
 
@@ -3639,6 +3644,16 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         } else {
                             &net_amount
                         };
+                        let reserve_sponsor = if destination == submitter
+                            && view.rules().enabled(&protocol::feature_id("Sponsor"))
+                        {
+                            match check_cash_reserve_sponsor(view, sttx) {
+                                Ok(sponsor) => sponsor,
+                                Err(result) => return result,
+                            }
+                        } else {
+                            None
+                        };
                         let result = ledger::mptoken_helpers::unlock_escrow_mpt(
                             view,
                             &escrow_owner,
@@ -3647,6 +3662,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                             gross_amount,
                             destination == submitter,
                             pre_fee_balance_drops,
+                            reserve_sponsor.as_ref(),
                         )
                         .unwrap_or(Ter::TEF_INTERNAL);
                         if result != Ter::TES_SUCCESS {
@@ -3789,7 +3805,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                             return result;
                         }
                     }
-                    protocol::Asset::MPTIssue(_) => {
+                    protocol::Asset::MPTIssue(issue) => {
                         let submitter = sttx.get_account_id(sf("sfAccount"));
                         let Ok((net_amount, gross_amount)) = escrow_mpt_unlock_amounts(
                             view,
@@ -3808,14 +3824,42 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         } else {
                             &net_amount
                         };
+                        let create_asset = escrow_owner == submitter;
+                        if create_asset
+                            && escrow_owner != issue.issuer()
+                            && !view
+                                .rules()
+                                .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+                        {
+                            let token = protocol::mptoken_keylet_from_mptid(
+                                issue.mpt_id(),
+                                Uint160::from_void(escrow_owner.data()),
+                            );
+                            match view.peek(token) {
+                                Ok(None) => return Ter::TEF_INTERNAL,
+                                Ok(Some(_)) => {}
+                                Err(_) => return Ter::TEF_BAD_LEDGER,
+                            }
+                        }
+                        let reserve_sponsor = if escrow_owner == submitter
+                            && view.rules().enabled(&protocol::feature_id("Sponsor"))
+                        {
+                            match check_cash_reserve_sponsor(view, sttx) {
+                                Ok(sponsor) => sponsor,
+                                Err(result) => return result,
+                            }
+                        } else {
+                            None
+                        };
                         let result = ledger::mptoken_helpers::unlock_escrow_mpt(
                             view,
                             &escrow_owner,
                             &escrow_owner,
                             &net_amount,
                             gross_amount,
-                            escrow_owner == submitter,
+                            create_asset,
                             pre_fee_balance_drops,
+                            reserve_sponsor.as_ref(),
                         )
                         .unwrap_or(Ter::TEF_INTERNAL);
                         if result != Ter::TES_SUCCESS {

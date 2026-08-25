@@ -544,8 +544,20 @@ impl DatabaseRotatingImp {
     /// priority gate so a slow archive lookup cannot delay consensus writes;
     /// only the bounded durable mutation is ordered behind foreground work.
     pub fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
+        self.copy_to_writable_batch_detailed(hashes)
+            .map(|(copied, _missing)| copied)
+    }
+
+    /// Copy archive-only objects into the writable backend and return hashes
+    /// that are absent from both backends.  Rotation callers that are walking
+    /// a resident validated SHAMap can serialize those exact clean nodes as a
+    /// fallback, matching rippled's `SHAMapStoreImp::copyNode` rescue path.
+    pub fn copy_to_writable_batch_detailed(
+        &self,
+        hashes: &[Uint256],
+    ) -> Result<(usize, Vec<Uint256>), String> {
         if hashes.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
         let mut unique = BTreeSet::new();
@@ -554,56 +566,75 @@ impl DatabaseRotatingImp {
             .copied()
             .filter(|hash| unique.insert(*hash))
             .collect::<Vec<_>>();
-        let (writable, archive) = {
+        loop {
+            let (writable, archive) = {
+                let state = self
+                    .state
+                    .lock()
+                    .expect("rotating backend mutex must not be poisoned");
+                (
+                    Arc::clone(&state.writable_backend),
+                    Arc::clone(&state.archive_backend),
+                )
+            };
+
+            let (writable_objects, writable_status) = writable.fetch_batch(&hashes);
+            check_copy_fetch_status("writable", writable_status)?;
+            if writable_objects.len() != hashes.len() {
+                return Err("writable backend returned a malformed copy batch".to_owned());
+            }
+            let missing = hashes
+                .iter()
+                .zip(writable_objects.iter())
+                .filter_map(|(hash, object)| object.is_none().then_some(*hash))
+                .collect::<Vec<_>>();
+
+            let (batch, missing_from_both) = if missing.is_empty() {
+                (crate::Batch::new(), Vec::new())
+            } else {
+                let (archive_objects, archive_status) = archive.fetch_batch(&missing);
+                check_copy_fetch_status("archive", archive_status)?;
+                if archive_objects.len() != missing.len() {
+                    return Err("archive backend returned a malformed copy batch".to_owned());
+                }
+                let mut missing_from_both = Vec::new();
+                let batch = missing
+                    .iter()
+                    .copied()
+                    .zip(archive_objects)
+                    .filter_map(|(hash, object)| match object {
+                        Some(object) => Some(object),
+                        None => {
+                            missing_from_both.push(hash);
+                            None
+                        }
+                    })
+                    .collect::<crate::Batch>();
+                (batch, missing_from_both)
+            };
+
+            let _maintenance = self.write_priority.maintenance();
             let state = self
                 .state
                 .lock()
                 .expect("rotating backend mutex must not be poisoned");
-            (
-                Arc::clone(&state.writable_backend),
-                Arc::clone(&state.archive_backend),
-            )
-        };
+            if !Arc::ptr_eq(&state.writable_backend, &writable)
+                || !Arc::ptr_eq(&state.archive_backend, &archive)
+            {
+                // The observations above span one backend generation only.
+                // Retry rather than treating hits in the retired writable as
+                // durable in the new pair.
+                drop(state);
+                continue;
+            }
 
-        let (writable_objects, writable_status) = writable.fetch_batch(&hashes);
-        check_copy_fetch_status("writable", writable_status)?;
-        if writable_objects.len() != hashes.len() {
-            return Err("writable backend returned a malformed copy batch".to_owned());
+            let copied = batch.len();
+            if !batch.is_empty() {
+                state.writable_backend.store_batch_result(&batch)?;
+            }
+            drop(state);
+            return Ok((copied, missing_from_both));
         }
-        let missing = hashes
-            .iter()
-            .zip(writable_objects.iter())
-            .filter_map(|(hash, object)| object.is_none().then_some(*hash))
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            return Ok(0);
-        }
-
-        let (archive_objects, archive_status) = archive.fetch_batch(&missing);
-        check_copy_fetch_status("archive", archive_status)?;
-        if archive_objects.len() != missing.len() {
-            return Err("archive backend returned a malformed copy batch".to_owned());
-        }
-        let batch = archive_objects
-            .into_iter()
-            .flatten()
-            .collect::<crate::Batch>();
-        if batch.is_empty() {
-            return Ok(0);
-        }
-
-        let copied = batch.len();
-        let _maintenance = self.write_priority.maintenance();
-        // Refresh the writable pointer after archive reads and retain the
-        // rotating generation fence through durable completion. A concurrent
-        // direct rotate may have changed the pairing while reads were active.
-        let state = self
-            .state
-            .lock()
-            .expect("rotating backend mutex must not be poisoned");
-        state.writable_backend.store_batch_result(&batch)?;
-        drop(state);
-        Ok(copied)
     }
 
     pub fn fetch_node_object(
@@ -835,6 +866,23 @@ impl DatabaseRotatingTrait for DatabaseRotatingImp {
         DatabaseRotatingImp::copy_to_writable_batch(self, hashes)
     }
 
+    fn copy_to_writable_batch_detailed(
+        &self,
+        hashes: &[Uint256],
+    ) -> Result<(usize, Vec<Uint256>), String> {
+        DatabaseRotatingImp::copy_to_writable_batch_detailed(self, hashes)
+    }
+
+    fn store_account_nodes(&self, nodes: Vec<(Uint256, Blob)>) -> Result<(), String> {
+        DatabaseRotatingImp::store_batch(
+            self,
+            nodes
+                .into_iter()
+                .map(|(hash, data)| (NodeObjectType::AccountNode, data, hash, 0))
+                .collect(),
+        )
+    }
+
     fn rotate(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str)) {
         self.rotate_impl(new_backend, callback);
     }
@@ -907,6 +955,7 @@ mod tests {
         batch_count: AtomicUsize,
         objects: Mutex<BTreeMap<Uint256, Arc<NodeObject>>>,
         batch_gate: Option<Arc<BatchGate>>,
+        fetch_gate: Option<Arc<BatchGate>>,
     }
 
     use std::collections::BTreeMap;
@@ -920,12 +969,20 @@ mod tests {
                 batch_count: AtomicUsize::new(0),
                 objects: Mutex::new(BTreeMap::new()),
                 batch_gate: None,
+                fetch_gate: None,
             }
         }
 
         fn new_with_batch_gate(name: &str, batch_gate: Arc<BatchGate>) -> Self {
             Self {
                 batch_gate: Some(batch_gate),
+                ..Self::new(name)
+            }
+        }
+
+        fn new_with_fetch_gate(name: &str, fetch_gate: Arc<BatchGate>) -> Self {
+            Self {
+                fetch_gate: Some(fetch_gate),
                 ..Self::new(name)
             }
         }
@@ -962,6 +1019,9 @@ mod tests {
         }
 
         fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status) {
+            if let Some(gate) = &self.fetch_gate {
+                gate.block_batch();
+            }
             (
                 hashes.iter().map(|hash| self.fetch(hash).0).collect(),
                 Status::Ok,
@@ -1365,8 +1425,8 @@ mod tests {
         .expect("rotating database");
 
         let missing = Uint256::from_array([0x73; 32]);
-        let copied = database
-            .copy_to_writable_batch(&[
+        let (copied, missing_from_both) = database
+            .copy_to_writable_batch_detailed(&[
                 *already_writable.hash(),
                 *archive_only.hash(),
                 *archive_only.hash(),
@@ -1375,8 +1435,60 @@ mod tests {
             .expect("checked archive copy");
 
         assert_eq!(copied, 1);
+        assert_eq!(missing_from_both, vec![missing]);
         assert_eq!(writable.batch_count.load(Ordering::Relaxed), 1);
         assert!(writable.fetch(archive_only.hash()).0.is_some());
+        database.stop();
+    }
+
+    #[test]
+    fn archive_copy_retries_when_backend_pair_rotates_during_fetch() {
+        let fetch_gate = Arc::new(BatchGate::default());
+        let writable = Arc::new(TestBackend::new_with_fetch_gate(
+            "writable",
+            Arc::clone(&fetch_gate),
+        ));
+        let archive = Arc::new(TestBackend::new("archive"));
+        let object = sample_object(0x74);
+        writable.store(Arc::clone(&object)).expect("seed writable");
+        let database = DatabaseRotatingImp::new(
+            Arc::new(DummyScheduler),
+            1,
+            Arc::clone(&writable) as Arc<dyn Backend>,
+            Arc::clone(&archive) as Arc<dyn Backend>,
+            &config(),
+            Arc::new(NullJournal),
+        )
+        .expect("rotating database");
+
+        let copy_database = Arc::clone(&database);
+        let hash = *object.hash();
+        let copy_thread =
+            std::thread::spawn(move || copy_database.copy_to_writable_batch_detailed(&[hash]));
+        fetch_gate.wait_until_entered();
+
+        database.rotate(Box::new(TestBackend::new("next")), |_, _| {});
+        fetch_gate.release();
+
+        let (copied, missing) = copy_thread
+            .join()
+            .expect("copy thread")
+            .expect("copy after retry");
+        assert_eq!(copied, 1);
+        assert!(missing.is_empty());
+        assert!(
+            database
+                .fetch_node_object(&hash, 0, FetchType::Synchronous, false)
+                .is_some()
+        );
+
+        database.rotate(Box::new(TestBackend::new("final")), |_, _| {});
+        assert!(
+            database
+                .fetch_node_object(&hash, 0, FetchType::Synchronous, false)
+                .is_some(),
+            "the retried copy must survive retirement of the snapshot writable"
+        );
         database.stop();
     }
 

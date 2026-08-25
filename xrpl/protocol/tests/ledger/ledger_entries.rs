@@ -4,13 +4,15 @@ use basics::base_uint::{Uint160, Uint256};
 use protocol::{
     ConstructorAccountRootEntry, ConstructorAmendmentsEntry, ConstructorFeeSettingsEntry,
     ConstructorLedgerEntry, ConstructorLedgerEntryDecodeError, DecodedLedgerEntry,
-    DecodedLedgerHashesEntry, PortedLedgerEntryDecodeError, account_root_key, amendments_key,
+    DecodedLedgerHashesEntry, PortedLedgerEntryDecodeError, SerialIter, Serializer,
+    SponsorshipBuilder, StBase, account_root_key, amendments_key,
     build_genesis_setup_constructor_entries, build_genesis_state_constructor_entries,
     constructor_ledger_entry_key, constructor_ledger_item, constructor_ledger_items,
     decode_constructor_fee_settings_entry, decode_constructor_ledger_entry,
     decode_ledger_entry_type_code, decode_ported_ledger_entry, encode_account_root_entry,
     encode_constructor_ledger_entry, encode_fee_settings_entry, encode_ledger_hashes_entry,
-    feature_xrp_fees, fees_key, genesis_account_id, make_constructor_fee_settings_entry,
+    feature_xrp_fees, fees_key, genesis_account_id, get_field_by_symbol,
+    make_constructor_fee_settings_entry,
 };
 
 #[test]
@@ -112,6 +114,41 @@ fn typed_entry_type_decode_reads_current_field_code() {
     ));
 
     assert_eq!(decode_ledger_entry_type_code(&payload), Ok(0x0061));
+}
+
+#[test]
+fn sponsorship_format_and_wire_ordinals_match_rippled() {
+    let owner = protocol::AccountID::from_array([0x11; 20]);
+    let sponsee = protocol::AccountID::from_array([0x22; 20]);
+    let index = Uint256::from_array([0x33; 32]);
+    let sponsorship = SponsorshipBuilder::new(owner, sponsee, 7, 9, Uint256::from_u64(5), 6)
+        .set_remaining_owner_count(12)
+        .build(index)
+        .get_sle();
+    let mut serializer = Serializer::default();
+    sponsorship.add(&mut serializer);
+    let decoded =
+        protocol::STLedgerEntry::from_serial_iter(&mut SerialIter::new(serializer.data()), index);
+
+    assert_eq!(decoded.get_type(), protocol::LedgerEntryType::Sponsorship);
+    assert_eq!(
+        decoded.get_account_id(get_field_by_symbol("sfOwner")),
+        owner
+    );
+    assert_eq!(
+        decoded.get_account_id(get_field_by_symbol("sfSponsee")),
+        sponsee
+    );
+    assert_eq!(
+        decoded.get_field_u32(get_field_by_symbol("sfRemainingOwnerCount")),
+        12
+    );
+    assert_eq!(
+        get_field_by_symbol("sfSponsoredOwnerCount").field_value(),
+        70
+    );
+    assert_eq!(get_field_by_symbol("sfSponsorFlags").field_value(), 74);
+    assert_eq!(get_field_by_symbol("sfSponseeNode").field_value(), 33);
 }
 
 #[test]

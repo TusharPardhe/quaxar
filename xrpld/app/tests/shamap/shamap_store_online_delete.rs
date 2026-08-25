@@ -80,10 +80,12 @@ impl SHAMapStoreNodeFamilyCacheRuntime for EmptyNodeFamilyRuntime {
             .expect("full-below mutex must not be poisoned") += 1;
     }
 
-    fn visit_state_map_hashes(
+    fn visit_state_map_nodes(
         &self,
         _ledger: &Ledger,
-        _visit: &mut dyn FnMut(Uint256) -> bool,
+        _visit: &mut dyn FnMut(
+            &basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
+        ) -> bool,
     ) -> Result<(), TraversalError> {
         Ok(())
     }

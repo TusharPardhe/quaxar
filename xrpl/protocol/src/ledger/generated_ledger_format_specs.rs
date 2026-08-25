@@ -1069,6 +1069,18 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
                 field_symbol: "sfReferenceHolding",
                 style: SOEStyle::Optional,
             },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfIssuerEncryptionKey",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfAuditorEncryptionKey",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfConfidentialOutstandingAmount",
+                style: SOEStyle::Default,
+            },
         ],
     },
     LedgerFormatSpecInit {
@@ -1104,6 +1116,30 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             LedgerFormatFieldSpec {
                 field_symbol: "sfPreviousTxnLgrSeq",
                 style: SOEStyle::Required,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfConfidentialBalanceInbox",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfConfidentialBalanceSpending",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfConfidentialBalanceVersion",
+                style: SOEStyle::Default,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfIssuerEncryptedBalance",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfAuditorEncryptedBalance",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfHolderEncryptionKey",
+                style: SOEStyle::Optional,
             },
         ],
     },
@@ -1329,6 +1365,22 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
                 field_symbol: "sfScale",
                 style: SOEStyle::Default,
             },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfLEVersion",
+                style: SOEStyle::Default,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfVaultKind",
+                style: SOEStyle::Default,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfSubscriptionDate",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfRedemptionDate",
+                style: SOEStyle::Optional,
+            },
         ],
     },
     LedgerFormatSpecInit {
@@ -1520,6 +1572,50 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             LedgerFormatFieldSpec {
                 field_symbol: "sfLoanScale",
                 style: SOEStyle::Default,
+            },
+        ],
+    },
+    LedgerFormatSpecInit {
+        tag_name: "ltSPONSORSHIP",
+        value: 0x0090,
+        name: "Sponsorship",
+        rpc_name: "sponsorship",
+        field_specs: &[
+            LedgerFormatFieldSpec {
+                field_symbol: "sfPreviousTxnID",
+                style: SOEStyle::Required,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfPreviousTxnLgrSeq",
+                style: SOEStyle::Required,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfOwner",
+                style: SOEStyle::Required,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfSponsee",
+                style: SOEStyle::Required,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfFeeAmount",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfMaxFee",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfRemainingOwnerCount",
+                style: SOEStyle::Default,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfOwnerNode",
+                style: SOEStyle::Required,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfSponseeNode",
+                style: SOEStyle::Required,
             },
         ],
     },

@@ -488,6 +488,7 @@ pub fn unlock_escrow_mpt(
     gross_amount: &STAmount,
     create_asset: bool,
     receiver_pre_fee_balance_drops: Option<i64>,
+    reserve_sponsor: Option<&Arc<STLedgerEntry>>,
 ) -> Result<Ter, ViewError> {
     let Asset::MPTIssue(mpt_issue) = net_amount.asset() else {
         return Ok(Ter::TEC_INTERNAL);
@@ -515,14 +516,39 @@ pub fn unlock_escrow_mpt(
             let Some(receiver_sle) = view.peek(account_keylet(to_uint160(*receiver)))? else {
                 return Ok(Ter::TEC_NO_PERMISSION);
             };
-            let owner_count = receiver_sle.get_field_u32(sf("sfOwnerCount"));
-            let balance = receiver_pre_fee_balance_drops
-                .unwrap_or_else(|| receiver_sle.get_field_amount(sf("sfBalance")).xrp().drops());
-            if balance < view.fees().account_reserve(owner_count as usize + 1) as i64 {
+            let reserve_bearer = reserve_sponsor.unwrap_or(&receiver_sle);
+            let balance = reserve_sponsor.map_or_else(
+                || {
+                    receiver_pre_fee_balance_drops.unwrap_or_else(|| {
+                        receiver_sle.get_field_amount(sf("sfBalance")).xrp().drops()
+                    })
+                },
+                |sponsor| sponsor.get_field_amount(sf("sfBalance")).xrp().drops(),
+            );
+            let reserve_count = crate::reserve_owner_count(reserve_bearer, 1);
+            let account_count = crate::reserve_account_count(reserve_bearer, 0);
+            if balance
+                < view.fees().account_reserve_with_account_count(
+                    reserve_count as usize,
+                    account_count as usize,
+                ) as i64
+            {
                 return Ok(Ter::TEC_INSUFFICIENT_RESERVE);
             }
 
-            let result = check_create_mpt(view, &mpt_issue, receiver)?;
+            if let Some(sponsor) = reserve_sponsor {
+                let sponsor_id = sponsor.get_account_id(sf("sfAccount"));
+                let sponsorship =
+                    protocol::sponsorship_keylet(to_uint160(sponsor_id), to_uint160(*receiver));
+                if let Some(sponsorship) = view.read(sponsorship)?
+                    && sponsorship.get_field_u32(sf("sfRemainingOwnerCount")) < 1
+                {
+                    return Ok(Ter::TEC_INSUFFICIENT_RESERVE);
+                }
+            }
+
+            let result =
+                check_create_mpt_with_sponsor(view, &mpt_issue, receiver, reserve_sponsor)?;
             if result != Ter::TES_SUCCESS && result != Ter::TEC_DUPLICATE {
                 return Ok(result);
             }

@@ -2699,7 +2699,9 @@ fn delete_submit_ticket<V: ledger::ApplyView>(
     };
 
     let Some(ticket) = ticket else {
-        return Ter::TEF_NO_TICKET;
+        // Preclaim already established that the ticket existed. Disappearing
+        // before apply is corrupt ledger state in Transactor::ticketDelete.
+        return Ter::TEF_BAD_LEDGER;
     };
 
     if !ledger::dir_remove(

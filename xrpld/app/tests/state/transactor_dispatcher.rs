@@ -7,6 +7,7 @@ use app::state::lending::calculate_loan_pay_base_fee;
 use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint192, Uint256};
 use basics::number::NumberParts as RuntimeNumber;
+use basics::string_utilities::str_unhex;
 use ledger::{
     ApplyView, ApplyViewImpl, Fees, Ledger, LedgerConfig, LedgerHeader, ReadView, Sandbox,
     pseudo_account_address,
@@ -14,9 +15,9 @@ use ledger::{
 use protocol::{
     AccountID, ApplyFlags, Asset, Currency, FeatureSet, IOUAmount, Issue, Keylet, LedgerEntryType,
     MPTAmount, MPTIssue, STAmount, STArray, STIssue, STLedgerEntry, STNumber, STObject, STTx,
-    Serializer, StBase, Ter, TxMeta, TxType, XRPAmount, account_keylet, amm_lpt_currency,
-    currency_from_string, get_field_by_symbol, line, lsfAllowTrustLineClawback, lsfDefaultRipple,
-    lsfDisableMaster, lsfLoanImpaired, lsfLowDeepFreeze, owner_dir_keylet,
+    SerialIter, Serializer, StBase, Ter, TxMeta, TxType, XRPAmount, account_keylet,
+    amm_lpt_currency, currency_from_string, get_field_by_symbol, line, lsfAllowTrustLineClawback,
+    lsfDefaultRipple, lsfDisableMaster, lsfLoanImpaired, lsfLowDeepFreeze, owner_dir_keylet,
     permissioned_domain_keylet, sf_generic, signers_keylet, tfLoanDefault, tfLoanImpair,
     tfLoanUnimpair, xrp_issue,
 };
@@ -28,6 +29,8 @@ use tx::{
     LSF_ONE_OWNER_COUNT, MPT_CAN_ESCROW_FLAG, MPT_CAN_TRADE_FLAG, MPT_CAN_TRANSFER_FLAG,
     VAULT_PRIVATE_FLAG,
 };
+
+use sha2::{Digest, Sha256};
 
 fn sample_account(fill: u8) -> AccountID {
     AccountID::from_array([fill; 20])
@@ -1360,6 +1363,202 @@ fn escrow_finish_created_mpt_records_its_issuance_id() {
         issuance_id
     );
     assert_eq!(destination_token.get_field_u64(sf("sfMPTAmount")), 9_990);
+}
+
+fn canonical_sle(index: &str, blob: &str) -> STLedgerEntry {
+    let mut key = Uint256::default();
+    assert!(key.parse_hex(index), "canonical ledger index");
+    let bytes = str_unhex(blob).expect("canonical SLE hex");
+    STLedgerEntry::from_serial_iter(&mut SerialIter::new(&bytes), key)
+}
+
+#[test]
+fn testnet_20208302_ticket_create_matches_canonical_metadata_bytes() {
+    // Exact parent objects and transaction from Testnet ledger 20,208,302.
+    // This fixture pins the transaction arithmetic and complete metadata
+    // independently of the online-delete MissingNode regression observed at
+    // the same transaction.
+    let entries = [
+        ("A1E4CAF1CA3C39F01702F3169EC3DC5A5A3D0F135C7EC45C1812E0EEC81E4B68", "1100612200000000240128BFCA2501345AAC2D0000001A2028000000145505051553864DE1BB81231C4E214013FB72E06AFB217B28B049D5B3BF1495314A62400000032636C9978114F73367B0DE7D54EAAA2A121E5AC3A4C2DC384A31"),
+        ("86EFD02B1D338D777E4ED6905985D1DDFDEE645EE969A8FDB5355DA57BE83D1A", "11006422000000002501345A9C310000000000002B28320000000000002B29553A2C40E948214AD7C115F1C0064DC8A5EA23EC86123A78F813BB1849BDE9928C5886EFD02B1D338D777E4ED6905985D1DDFDEE645EE969A8FDB5355DA57BE83D1A8214F73367B0DE7D54EAAA2A121E5AC3A4C2DC384A310113406CCF3EA6A7CA4EDD8ED289987EA0436DBF210B7EC978B8D3D169F75410E629C9AD0D156226831E98AA23CC43FB0EB5EEEAC8B524F4DBA03D0D0E2906D800596E"),
+        ("DE409FDF9131EEDBB93AB574E9403200A718FE5985FCF0C331454F603A0BB2FD", "11006422000000002501345AAC320000000000002B285505051553864DE1BB81231C4E214013FB72E06AFB217B28B049D5B3BF1495314A5886EFD02B1D338D777E4ED6905985D1DDFDEE645EE969A8FDB5355DA57BE83D1A8214F73367B0DE7D54EAAA2A121E5AC3A4C2DC384A310113C19F143F1A334651ABB3CD0E019A291BE16723C43A31835002B548C5E992CCDA749219755F42E55BC2AE62A007D67A0A32C550E64B664BF598DCD1313DEB2ECA1A172F29FB2C37CAEC83F82003FD945455F210E0490DCE379F0295789A8112D8DF6A30B0B3C2F7F6FAB5A98DFE3A956CE619D97BA392CC68E9CB5BF2B46B93C382553E9FE2E628BD38ECB9439FCE877F4C3C99C9684C6E0644554FE87FC54DA4306D5B2A9D293D5604A0AA679488336317E80217DF76E6E3C9E15BDC72834CF12799697A47E9D54C13E96DAC9B4805DB7B49A40EAFF545F935B876A691A370333ADB8ED4C1F15E3479979C8E376AF5570E27153A75BF7FBF9A46D7478AF0F8090BD4A0C92FF052004B5AF250B51A7E666A264344A37DE26F16F960BA1DF5B889925CBC23C2746BE85260385F4480B84FF838C3BA2BEB68F19C63802E9FAB8CAC31FFECEFF2D4AF9E44050F23A1CBE10B682ECA23D43CCC9FDD8C906C6BABA37B41DC"),
+    ]
+    .into_iter()
+    .map(|(index, blob)| canonical_sle(index, blob))
+    .collect();
+    let mut ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 20_208_301,
+            parent_close_time: 840_976_700,
+            drops: 100_000_000_000,
+            ..LedgerHeader::default()
+        },
+        entries,
+    );
+    ledger.set_rules(protocol::Rules::new([protocol::fix_previous_txn_id()]));
+    let tx_bytes = str_unhex("12000A23012347EC240128BFCA201B01345AC020280000001268400000000000001E7321ED3978DE2D2BC69F2D22E0277CB7812909AB240EA40BBFAAFEC92252438AE4CFBD7440238450A4BBD8C3AF16344ECAF93F93E4A20F2EBF4F8F73486E7C2B26DAAA2CAA292C25B6EEF394B7274478EB0D2E930999797B6C2E09DB03CF1279FCEE8B26048114F73367B0DE7D54EAAA2A121E5AC3A4C2DC384A31").expect("canonical transaction hex");
+    let tx = STTx::from_serial_iter(&mut SerialIter::new(&tx_bytes));
+    let tx_id = tx.get_transaction_id();
+    let mut expected_tx_id = Uint256::default();
+    assert!(
+        expected_tx_id
+            .parse_hex("9618EBEC428A45CC3E3A48E961C4BF1458AF1728D21E1C52C72EC680F9A6DD5F")
+    );
+    assert_eq!(tx_id, expected_tx_id);
+    let mut parent = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let rules = parent.rules();
+    let mut delta = ledger::FlowSandbox::new(&mut parent);
+    let (result, delivered) =
+        apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, TxType::TICKET_CREATE);
+    assert_eq!(result, Ter::TES_SUCCESS);
+    let mut meta = delta
+        .to_tx_meta(tx_id, 20_208_302, delivered, &rules)
+        .expect("canonical metadata");
+    let mut serializer = Serializer::default();
+    meta.add_raw(&mut serializer, result, 2);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(serializer.data())),
+        "69b2017f526b83600a78aabc8e91257428f3a29fa57380affc91215dfdf37849"
+    );
+}
+
+#[test]
+fn testnet_20207451_mpt_escrow_finish_matches_canonical_metadata_bytes() {
+    // Exact parent objects and transaction from Testnet ledger 20,207,451.
+    // This pins the complete MPT EscrowFinish state/metadata path that caused
+    // an incompatible local child, including both owner directories, reserve
+    // transfer, MPToken creation, transfer-fee rounding and threading.
+    let entries = [
+        ("09C1997589E8DF4F873B9C5D40016DC1974B56CC85294D22E2F521C7BF09A185", "1100642200000000250134575655125ED416F011D2E422D9F74FD3547D882D41177B35B8A2CF6DE0DC4E149BFE3F5809C1997589E8DF4F873B9C5D40016DC1974B56CC85294D22E2F521C7BF09A1858214D60941EB40688B0398EFED931713B28D82014DD501132068880A429021D50B75CEDBD18D2F4668B2EB820F47A115F256ED6E61492246B4"),
+        ("2CF863A234B6C0CD2D2C7925590A7BC6A0C33EA7FD8E1E0466BCD82B58B59E71", "1100612200000000240134575425013457562D0000000255125ED416F011D2E422D9F74FD3547D882D41177B35B8A2CF6DE0DC4E149BFE3F624000000005F5E0E78114928D967C63DBF9CE168429A33A371940E19007F0"),
+        ("3B50FDFC525FCBE0957F5FD1EF58DB93EE0E3834EC9505B6130D3A0FC623FEA3", "1100642200000000250134575655125ED416F011D2E422D9F74FD3547D882D41177B35B8A2CF6DE0DC4E149BFE3F583B50FDFC525FCBE0957F5FD1EF58DB93EE0E3834EC9505B6130D3A0FC623FEA38214928D967C63DBF9CE168429A33A371940E19007F001134068880A429021D50B75CEDBD18D2F4668B2EB820F47A115F256ED6E61492246B4C1DE342956EDF26FAF3BD37FA7651F3F72ECE4DAED2B0F744247D0B5A84D15E9"),
+        ("58B06B27D5BC0247468D409B34A4AAD355C7A80709DBC1E5DA7B3A5D7EB79356", "1100612200000000240134575225013457562D0000000055125ED416F011D2E422D9F74FD3547D882D41177B35B8A2CF6DE0DC4E149BFE3F624000000005F5E1008114D60941EB40688B0398EFED931713B28D82014DD5"),
+        ("68880A429021D50B75CEDBD18D2F4668B2EB820F47A115F256ED6E61492246B4", "1100752200000000240134575325013457562B3BAA0C40202432203E79202532203E1A34000000000000000039000000000000000055125ED416F011D2E422D9F74FD3547D882D41177B35B8A2CF6DE0DC4E149BFE3F616000000000000027100134575206B21C54497DF487B71A779F8953A5020D0853AD8114928D967C63DBF9CE168429A33A371940E19007F08314D60941EB40688B0398EFED931713B28D82014DD5"),
+        ("717291784C050956DE8657E039D6A20140C038FE910F4BD2CCECFB77B71C5D72", "11007E14006422000000282401345752250134575634000000000000000030187FFFFFFFFFFFFFFF301900000000000186A0301D000000000000271055125ED416F011D2E422D9F74FD3547D882D41177B35B8A2CF6DE0DC4E149BFE3F701E02ABCD841406B21C54497DF487B71A779F8953A5020D0853AD051002"),
+        ("C1DE342956EDF26FAF3BD37FA7651F3F72ECE4DAED2B0F744247D0B5A84D15E9", "11007F22000000002501345756340000000000000000301A0000000000015F90301D000000000000271055125ED416F011D2E422D9F74FD3547D882D41177B35B8A2CF6DE0DC4E149BFE3F8114928D967C63DBF9CE168429A33A371940E19007F001150134575206B21C54497DF487B71A779F8953A5020D0853AD"),
+    ]
+    .into_iter()
+    .map(|(index, blob)| canonical_sle(index, blob))
+    .collect::<Vec<_>>();
+
+    let mut ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 20_207_450,
+            parent_close_time: 840_973_860,
+            drops: 100_000_000_000,
+            ..LedgerHeader::default()
+        },
+        entries,
+    );
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV1"),
+        protocol::feature_id("TokenEscrow"),
+        protocol::feature_id("Sponsor"),
+        protocol::fix_previous_txn_id(),
+        protocol::feature_id("fixTokenEscrowV1"),
+        protocol::feature_id("fixCleanup3_1_3"),
+        protocol::feature_id("fixCleanup3_4_0"),
+    ]));
+    let tx_bytes = str_unhex("120002240134575220190134575368400000000000000A7321EDE4CF89B3718B1A57E4CB53E990B7693995EB551CB72038EF00A334351D7169EF74407EFB1AB1610919818E45CC601C936E6A02165DF42DE909ACAB4CB4FF21937CE98E10F4BB203931D3A07ABD40267E58CAFA363C76DA5490982A6BE3E625D2DF048114D60941EB40688B0398EFED931713B28D82014DD58214928D967C63DBF9CE168429A33A371940E19007F0").expect("canonical transaction hex");
+    let tx = STTx::from_serial_iter(&mut SerialIter::new(&tx_bytes));
+    let tx_id = tx.get_transaction_id();
+    let mut parent = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let rules = parent.rules();
+    let mut delta = ledger::FlowSandbox::new(&mut parent);
+    let (result, delivered) =
+        apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, TxType::ESCROW_FINISH);
+    assert_eq!(result, Ter::TES_SUCCESS);
+    let mut meta = delta
+        .to_tx_meta(tx_id, 20_207_451, delivered, &rules)
+        .expect("canonical metadata");
+    let mut serializer = Serializer::default();
+    meta.add_raw(&mut serializer, result, 3);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(serializer.data())),
+        "2eb437973fba87ed6981e8dd3eee37c0561928ed5906741738197e118b90ea5f"
+    );
+}
+
+#[test]
+fn testnet_20207451_ticket_payment_matches_canonical_metadata_bytes() {
+    let entries = [
+        ("30863A1FA4C1F456E94EBDFEBA293AEF1BD89FA5A7C5A8AAD3538BB1A87D61BA", "11006122200000002400B18B72250134575A2D000000B32028000000B355C46E21A762B248C3ED5793417077E71CD3E305CDACE949E3D89A70D6AA54ECB062402C49E43197D8F38114C2796AE9913E1229D03ED885A85B5AA2AA88CC8F"),
+        ("4A4833D6A2F3B81576E16115C5728F312A66564C62B7B9987DEEBA04535F87FA", "11006122000000002400ED3806250134575A2D0000000055C46E21A762B248C3ED5793417077E71CD3E305CDACE949E3D89A70D6AA54ECB062400002F66F8C192C811429F2FD277133712E9566EDE23FF5EBC6B5D1117A"),
+        ("688815D03089EDD2DC7F52AAA8EE71F4177047BB693EB6C2220FF0FFD48255AC", "1100642200000000250134575831000000000001AC6632000000000001AC645554A3C699351617B9E04029BBCDB70E570D0338D6A8603B941919CDD86F48A014585B4DA4491AB798C0D44E6FB1BA332CBBDCD572141F6FF184A21CE2E6EBA78F548214C2796AE9913E1229D03ED885A85B5AA2AA88CC8F0113C23FBC4E8EA3F5859FE28F965FBC9D7921A50CC32283B847AB1B0BB4D42D3F9E3DEEC45FA2CB67ADD89AF678285837E31AC67817D3B719DA2C5F2D2B01322D36B936C8E79AF4B3EDF254524DC55C7D8E049BE1B47CD5F77AF50DB081D5AA76286A52CB0FA0559CC7ED398A1852E4389518F39FEBC187D09141A9BEA292D9B714D010D031F8C87BE01C0A092028C99B916C5B863762CC56001274BE4EC3EA4A2620F3D1FBC955ACC03C7F0A2F2153F4E404EC3BB0B6660A2C72D529460AD12D807CDFD2E4E99BECDA1611D59D3CFAD720F4A94A84583946CB95DEB4D3955184E96142D6666970B8B701C3618A9EC66533B7E1A23D395B8908966AE3D90DA06D5E0A12E209D21F98EC184136CAC546D74B3B27D5353E38CFE67F3DB2C0F55502EE339CE34CE577B7A3D973B5E4FC851FBC1F9FA6BDED46669449A0671EE56B93AF4F4BE3D610688B6DF9B889B3423614BC5A4069A399083EA1C8D134FA28068E0543D9EA42F6D4710CFD52752CF84BB92F66FFECE1CB6AE1E01D044529A7908FA333F4F72EF94AC490F90713F214F7DB4CFBEEF7C004333A5A5C6A81DFA22243D9FFABF8698C5CA2905F7D7D9D10E55AF19DF079659E44B01C90BE021CF33446C71FABFD28FEB20588362325408793836C7F43860A23C77EF6A06BC911F27D0A25C2C1FE7BC07159634ADB206A8D4810BAA6F6A9F3C1B162E221E986043F4A2ECD67DA"),
+        ("BC4E8EA3F5859FE28F965FBC9D7921A50CC32283B847AB1B0BB4D42D3F9E3DEE", "11005422000000002501345693202900B18A9734000000000001AC655512B430F4BAC937B9975D9DA2856837750BB988AC376BDB4B1715CF6F3B5A6C9E8114C2796AE9913E1229D03ED885A85B5AA2AA88CC8F"),
+    ]
+    .into_iter()
+    .map(|(index, blob)| canonical_sle(index, blob))
+    .collect();
+    let mut ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 20_207_450,
+            parent_close_time: 840_973_860,
+            drops: 100_000_000_000,
+            ..LedgerHeader::default()
+        },
+        entries,
+    );
+    ledger.set_rules(protocol::Rules::new([protocol::fix_previous_txn_id()]));
+    let tx_bytes = str_unhex("12000022000000002400000000201B0134576D202900B18A97614000000005F5E10068400000000000000C7321EDA3952ACD931CCA26CC02AEA89037FCFD69821C428C8C3B6AB7A8E73C13E6926E7440D0E8F47229FE9794DEE827098DDA03009A803EFA6808C2E3426827E0DE90928DFD297C1CE10A7C9810F18A802A185278ED6DEB0BA8A778F6BF0BF9AEFDAA52088114C2796AE9913E1229D03ED885A85B5AA2AA88CC8F831429F2FD277133712E9566EDE23FF5EBC6B5D1117A").expect("canonical transaction hex");
+    let tx = STTx::from_serial_iter(&mut SerialIter::new(&tx_bytes));
+    let tx_id = tx.get_transaction_id();
+    let mut parent = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let rules = parent.rules();
+    let mut delta = ledger::FlowSandbox::new(&mut parent);
+    let (result, delivered) =
+        apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, TxType::PAYMENT);
+    assert_eq!(result, Ter::TES_SUCCESS);
+    let mut meta = delta
+        .to_tx_meta(tx_id, 20_207_451, delivered, &rules)
+        .expect("canonical metadata");
+    let mut serializer = Serializer::default();
+    meta.add_raw(&mut serializer, result, 2);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(serializer.data())),
+        "8cb82ed3e21b02c7bc0057c8f8fbe4c96d84c1430c197390f720d2778800e1e0"
+    );
+}
+
+#[test]
+fn testnet_20207451_offer_cancel_matches_canonical_metadata_bytes() {
+    let entries = [
+        ("2EA77F69A44AF96749727D300D45F78E2C4E8F648A59161B5017C79CA7B2F0BE", "110064220000000025013456F2365017C79CA7B2F0BE5586D749BB64D5301C3AD8FBBD4EE83BC375FE324A9A62FF430A174FF7C5ACA6CC582EA77F69A44AF96749727D300D45F78E2C4E8F648A59161B5017C79CA7B2F0BE011100000000000000000000000055414800000000000211EDD6165952C4DFE6E73AE99FAB2D8C4BAA261D6A0311000000000000000000000000000000000000000004110000000000000000000000000000000000000000011320DDCF138E2EB432D54D95FBA1B7AA732E64F56F1D2004D7DE238653A9D6692772"),
+        ("6F5B8631CB9B4B884B8FAD6DAB7E11D3188DC6DDF039855C328664E49902ED10", "1100642200000000250134575955DE4E919CCE8A089DC06BB6AB3DA2BE972DE769BC742E08A843F5327B2F9A2AA7586F5B8631CB9B4B884B8FAD6DAB7E11D3188DC6DDF039855C328664E49902ED1082147CCA603AD1D6A0558536E3C35DC3ADD7F8E33D0A0113A01C635B6813FD5040B7815B10A426F75757ED65A280C4C0A3D99C11D2DC5025DC874FD21D489AD7AD3829F5725349283568872E8DF2E47C8391D2E4CA3B14E1849A718A813C8A801BE9741558308DD6F47313582D3CC9DB10ACB56D4C55F80220DDCF138E2EB432D54D95FBA1B7AA732E64F56F1D2004D7DE238653A9D6692772E221A56D7DF2D15E7A258C502F4D3A5080A2803DF647C86B57B54D0186EA478A"),
+        ("DDCF138E2EB432D54D95FBA1B7AA732E64F56F1D2004D7DE238653A9D6692772", "11006F220000000024011E979425013456F23300000000000000003400000000000000005586D749BB64D5301C3AD8FBBD4EE83BC375FE324A9A62FF430A174FF7C5ACA6CC50102EA77F69A44AF96749727D300D45F78E2C4E8F648A59161B5017C79CA7B2F0BE64D511C37937E080000000000000000000000000005541480000000000EDD6165952C4DFE6E73AE99FAB2D8C4BAA261D6A65400000000071FBDD81147CCA603AD1D6A0558536E3C35DC3ADD7F8E33D0A"),
+        ("FC1FDB3493E58C6324E5898BEA1B09F1857FC5C6745D9157CD896D27F2ACBD01", "110061220000000024011E979B25013457592D0000000555DE4E919CCE8A089DC06BB6AB3DA2BE972DE769BC742E08A843F5327B2F9A2AA762400000000FFC9B4781147CCA603AD1D6A0558536E3C35DC3ADD7F8E33D0A"),
+    ]
+    .into_iter()
+    .map(|(index, blob)| canonical_sle(index, blob))
+    .collect();
+    let mut ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 20_207_450,
+            parent_close_time: 840_973_860,
+            drops: 100_000_000_000,
+            ..LedgerHeader::default()
+        },
+        entries,
+    );
+    ledger.set_rules(protocol::Rules::new([protocol::fix_previous_txn_id()]));
+    let tx_bytes = str_unhex("120008220000000024011E979B2019011E9794201B0134576D68400000000000000C7321EDEC6E407C5B9FE4D4270A49B960B14C6DD27A939F16EE3F189DAF43268E2476277440F1919473E8FFF6BA3126B5516EAEB3FCCBCE1069292E1AD6592C1948B443C0FCC79D1CED3C09399FF771700C5F99077CA16EAAFA73654D2E041C924EFEF4630081147CCA603AD1D6A0558536E3C35DC3ADD7F8E33D0A").expect("canonical transaction hex");
+    let tx = STTx::from_serial_iter(&mut SerialIter::new(&tx_bytes));
+    let tx_id = tx.get_transaction_id();
+    let mut parent = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let rules = parent.rules();
+    let mut delta = ledger::FlowSandbox::new(&mut parent);
+    let (result, delivered) =
+        apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, TxType::OFFER_CANCEL);
+    assert_eq!(result, Ter::TES_SUCCESS);
+    let mut meta = delta
+        .to_tx_meta(tx_id, 20_207_451, delivered, &rules)
+        .expect("canonical metadata");
+    let mut serializer = Serializer::default();
+    meta.add_raw(&mut serializer, result, 0);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(serializer.data())),
+        "3ddd6e05bd6143831a08c479ef903e17d7bd9cb849d56c93895b81d3da26e78c"
+    );
 }
 
 #[test]
@@ -3228,9 +3427,73 @@ fn check_cash_enforces_new_holding_reserve_and_accepts_reserve_sponsor() {
         .is_none()
     );
 
+    // Sponsor base-account reserves are part of the reserve calculation.
+    // This sponsor carries one additional account: 400 drops would satisfy
+    // the legacy owner-only formula (250) but not rippled's two-base formula
+    // (450).
+    let sponsor = sample_account(0xE6);
+    let mut sponsor_with_account = account_root_with_balance(sponsor, 0, 0, 400);
+    sponsor_with_account.set_field_u32(sf("sfSponsoringAccountCount"), 1);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 200),
+        sponsor_with_account,
+        account_root(mpt_issuer, 1, 0),
+        mpt_issuance_entry(mpt_issuer, 1, 100, protocol::lsfMPTCanTransfer),
+        mptoken_entry(source, mpt_id, 50),
+        owner_dir_root(source, mpt_check.key),
+        owner_dir_root(destination, mpt_check.key),
+        check_entry(source, destination, 3, mpt_send_max.clone()),
+    ]);
+    ledger.set_fees(fees);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &make_mpt_cash(Some(sponsor)),
+            TxType::CHECK_CASH,
+            Some(200),
+        ),
+        Ter::TEC_INSUFFICIENT_RESERVE
+    );
+
+    // A prefunded Sponsorship with no remaining object assignments cannot be
+    // consumed even when the sponsor otherwise has enough XRP.
+    let sponsorship_key =
+        protocol::sponsorship_keylet(raw_account_id(sponsor), raw_account_id(destination));
+    let empty_sponsorship =
+        protocol::SponsorshipBuilder::new(sponsor, destination, 0, 0, Uint256::default(), 0)
+            .set_remaining_owner_count(0)
+            .build(sponsorship_key.key)
+            .get_sle()
+            .as_ref()
+            .clone();
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 200),
+        account_root_with_balance(sponsor, 0, 0, 1_000),
+        account_root(mpt_issuer, 1, 0),
+        mpt_issuance_entry(mpt_issuer, 1, 100, protocol::lsfMPTCanTransfer),
+        mptoken_entry(source, mpt_id, 50),
+        owner_dir_root(source, mpt_check.key),
+        owner_dir_root(destination, mpt_check.key),
+        check_entry(source, destination, 3, mpt_send_max.clone()),
+        empty_sponsorship,
+    ]);
+    ledger.set_fees(fees);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &make_mpt_cash(Some(sponsor)),
+            TxType::CHECK_CASH,
+            Some(200),
+        ),
+        Ter::TEC_INSUFFICIENT_RESERVE
+    );
+
     // The same low-reserve destination succeeds when a reserve sponsor can
     // carry the extra owner reserve, and all sponsorship metadata is updated.
-    let sponsor = sample_account(0xE6);
     let mut ledger = empty_ledger(vec![
         account_root_with_balance(source, 1, 0, 1_000_000_000),
         account_root_with_balance(destination, 0, 0, 200),
@@ -4194,6 +4457,80 @@ fn mpt_escrow_create_then_cancel_enforces_boundary_and_releases_full_lock() {
                 .expect("rippled preserves the empty owner-directory root");
             assert!(directory.get_field_v256(sf("sfIndexes")).value().is_empty());
         }
+    }
+}
+
+#[test]
+fn mpt_escrow_cancel_missing_owner_holding_matches_cleanup_3_2_0_boundary() {
+    let owner = sample_account(0xB1);
+    let destination = sample_account(0xB2);
+    let issuer = sample_account(0xB3);
+    let issuance_id = share_id_for(issuer, 1);
+    let escrow_key = protocol::escrow_keylet(raw_account_id(owner), 1);
+    let amount = STAmount::from_mpt_amount(
+        sf("sfAmount"),
+        MPTAmount::from_value(125),
+        MPTIssue::new(issuance_id),
+    );
+    let mut escrow = STLedgerEntry::from_type_and_key(LedgerEntryType::Escrow, escrow_key.key);
+    escrow.set_account_id(sf("sfAccount"), owner);
+    escrow.set_account_id(sf("sfDestination"), destination);
+    escrow.set_field_amount(sf("sfAmount"), amount);
+    escrow.set_field_u32(sf("sfCancelAfter"), 1);
+    escrow.set_field_u64(sf("sfOwnerNode"), 0);
+    let cancel = STTx::new(TxType::ESCROW_CANCEL, |tx| {
+        tx.set_account_id(sf("sfAccount"), owner);
+        tx.set_account_id(sf("sfOwner"), owner);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+        tx.set_field_amount(sf("sfFee"), test_xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 2);
+    });
+
+    for (cleanup_enabled, expected) in [
+        (false, Ter::TEF_INTERNAL),
+        (true, Ter::TEC_INSUFFICIENT_RESERVE),
+    ] {
+        let mut issuance = mpt_issuance_entry(
+            issuer,
+            1,
+            1_000,
+            MPT_CAN_ESCROW_FLAG | MPT_CAN_TRANSFER_FLAG,
+        );
+        issuance.set_field_u64(sf("sfLockedAmount"), 125);
+        let mut ledger = ledger_with_header(
+            LedgerHeader {
+                seq: 2,
+                parent_close_time: 2,
+                ..LedgerHeader::default()
+            },
+            vec![
+                account_root_with_balance(owner, 1, 0, 0),
+                account_root_with_balance(destination, 0, 0, 1_000_000),
+                account_root_with_balance(issuer, 0, 0, 1_000_000),
+                issuance,
+                owner_dir_root(owner, escrow_key.key),
+                escrow.clone(),
+            ],
+        );
+        let mut features = vec![
+            protocol::feature_token_escrow(),
+            protocol::feature_id("MPTokensV1"),
+        ];
+        if cleanup_enabled {
+            features.push(protocol::feature_id("fixCleanup3_2_0"));
+        }
+        ledger.set_fees(Fees {
+            base: 10,
+            reserve: 200,
+            increment: 50,
+        });
+        ledger.set_rules(protocol::Rules::new(features));
+        let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
+        assert_eq!(
+            handle_real_dispatch(&mut view, &cancel, TxType::ESCROW_CANCEL, None),
+            expected,
+            "fixCleanup3_2_0 enabled={cleanup_enabled}"
+        );
     }
 }
 

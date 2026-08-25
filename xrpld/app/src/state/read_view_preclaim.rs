@@ -1013,6 +1013,12 @@ fn preclaim_escrow_finish<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
         }
         Asset::MPTIssue(issue) => {
             let destination = escrow.get_account_id(sf("sfDestination"));
+            // The issuer has no MPToken holding to authorize or freeze.
+            // rippled returns success before those checks when escrowed MPTs
+            // are redeemed to their issuer.
+            if destination == issue.issuer() {
+                return Ok(Ter::TES_SUCCESS);
+            }
             let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, &destination)
                 .map_err(|_| view_error())?;
             if auth != Ter::TES_SUCCESS {
