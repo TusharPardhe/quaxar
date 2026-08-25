@@ -54,6 +54,17 @@ fn trust_line_flags(view: &impl ReadView, issue: Issue, holder: AccountID) -> u3
         .get_field_u32(sf("sfFlags"))
 }
 
+fn assert_balance_uses_no_account(view: &impl ReadView, issue: Issue, holder: AccountID) {
+    let line = view
+        .read(protocol::line(issue.account, holder, issue.currency))
+        .expect("read trust line")
+        .expect("trust line exists");
+    assert_eq!(
+        line.get_field_amount(sf("sfBalance")).issue().account,
+        protocol::no_account()
+    );
+}
+
 #[test]
 fn issue_iou_persists_zero_root_directory_hints() {
     let issuer = AccountID::from_array([0x11; 20]);
@@ -74,6 +85,7 @@ fn issue_iou_persists_zero_root_directory_hints() {
         Ter::TES_SUCCESS
     );
     assert_root_directory_hints_are_present(&view, issue, holder);
+    assert_balance_uses_no_account(&view, issue, holder);
     // Issuer is low and holder is high: reserve the holder's high side and,
     // because neither account enables DefaultRipple, set both NoRipple bits.
     assert_eq!(trust_line_flags(&view, issue, holder), 0x0032_0000);
@@ -127,4 +139,5 @@ fn issue_iou_uses_the_low_holder_side_when_the_issuer_sorts_high() {
         .expect("trust line exists");
     assert_eq!(line.get_field_u32(sf("sfFlags")), 0x0031_0000);
     assert_eq!(line.get_field_amount(sf("sfBalance")).iou(), amount.iou());
+    assert_balance_uses_no_account(&view, issue, holder);
 }

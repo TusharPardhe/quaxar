@@ -158,7 +158,17 @@ fn trust_delete<V: ApplyView>(
 
     // update_trust_line already released the applicable reserve/owner count
     // before selecting this delete path. Do not decrement it a second time.
-    if view.erase(Arc::new(state.clone())).is_err() {
+    //
+    // rippled removes both sponsor fields before erasing the RippleState.  The
+    // erased SLE supplies DeletedNode FinalFields, so retaining either field
+    // changes transaction metadata and consequently the transaction SHAMap.
+    let mut deleted = state.clone_as_object();
+    deleted.make_field_absent(sf("sfHighSponsor"));
+    deleted.make_field_absent(sf("sfLowSponsor"));
+    if view
+        .erase(Arc::new(STLedgerEntry::from_stobject(deleted, line_key)))
+        .is_err()
+    {
         return Ter::TEF_BAD_LEDGER;
     }
     Ter::TES_SUCCESS
@@ -248,13 +258,14 @@ pub fn issue_iou<V: ApplyView>(
         // When the issuer/sender is high, the low holder owns a positive
         // balance; when the issuer is low, the high holder's balance is
         // represented as negative.
-        let balance = if b_sender_high {
-            amount.clone()
-        } else {
-            let mut b = amount.clone();
-            b.negate();
-            b
-        };
+        let mut balance = amount.clone();
+        // RippleState::sfBalance is denominated only by currency.  rippled's
+        // issueIOU explicitly replaces the issuer embedded in STAmount with
+        // noAccount before trustCreate serializes the line.
+        balance.set_issuer(protocol::no_account());
+        if !b_sender_high {
+            balance.negate();
+        }
         new_state.set_field_amount(sf("sfBalance"), balance);
 
         // Set limits (zero for the new side)

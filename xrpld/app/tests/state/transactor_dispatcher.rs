@@ -1286,6 +1286,83 @@ fn escrow_finish_mpt_cleanup_3_4_rounds_transfer_fee_down() {
 }
 
 #[test]
+fn escrow_finish_created_mpt_records_its_issuance_id() {
+    let owner = sample_account(0xC4);
+    let destination = sample_account(0xC5);
+    let issuer = sample_account(0xC6);
+    let issuance_id = share_id_for(issuer, 1);
+    let amount = STAmount::from_mpt_amount(
+        sf("sfAmount"),
+        MPTAmount::from_value(10_000),
+        MPTIssue::new(issuance_id),
+    );
+
+    let mut issuance =
+        mpt_issuance_entry_with_transfer_fee(issuer, 1, 100_000, MPT_CAN_TRANSFER_FLAG, 100);
+    issuance.set_field_u64(sf("sfLockedAmount"), 10_000);
+    let mut owner_token = mptoken_entry(owner, issuance_id, 90_000);
+    owner_token.set_field_u64(sf("sfLockedAmount"), 10_000);
+    let escrow_keylet = protocol::escrow_keylet(raw_account_id(owner), 1);
+    let mut escrow = STLedgerEntry::from_type_and_key(LedgerEntryType::Escrow, escrow_keylet.key);
+    escrow.set_account_id(sf("sfAccount"), owner);
+    escrow.set_account_id(sf("sfDestination"), destination);
+    escrow.set_field_amount(sf("sfAmount"), amount);
+    escrow.set_field_u32(sf("sfTransferRate"), 1_001_000_000);
+    escrow.set_field_u64(sf("sfOwnerNode"), 0);
+    escrow.set_field_u64(sf("sfDestinationNode"), 0);
+
+    let mut ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 1,
+            drops: 100_000_000_000,
+            ..LedgerHeader::default()
+        },
+        vec![
+            account_root(owner, 1, 0),
+            account_root(destination, 0, 0),
+            account_root(issuer, 0, 0),
+            issuance,
+            owner_token,
+            owner_dir_root(owner, escrow_keylet.key),
+            owner_dir_root(destination, escrow_keylet.key),
+            escrow,
+        ],
+    );
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("fixTokenEscrowV1"),
+        protocol::feature_id("fixCleanup3_4_0"),
+        protocol::feature_id("TokenEscrow"),
+    ]));
+    let tx = STTx::new(TxType::ESCROW_FINISH, |object| {
+        object.set_account_id(sf("sfAccount"), destination);
+        object.set_account_id(sf("sfOwner"), owner);
+        object.set_field_u32(sf("sfOfferSequence"), 1);
+        object.set_field_amount(sf("sfFee"), test_xrp(10));
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    let mut view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &tx, TxType::ESCROW_FINISH),
+        Ter::TES_SUCCESS
+    );
+    view.apply(&mut ledger).expect("escrow finish applies");
+
+    let destination_token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_account_id(destination),
+        ))
+        .expect("destination token read")
+        .expect("destination token");
+    assert_eq!(
+        destination_token.get_field_h192(sf("sfMPTokenIssuanceID")),
+        issuance_id
+    );
+    assert_eq!(destination_token.get_field_u64(sf("sfMPTAmount")), 9_990);
+}
+
+#[test]
 fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
     let owner = sample_account(0x71);
     let destination = sample_account(0x72);
@@ -1348,6 +1425,14 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
     assert_eq!(
         receiver_line.get_field_amount(sf("sfBalance")).iou(),
         amount.iou()
+    );
+    assert_eq!(
+        receiver_line
+            .get_field_amount(sf("sfBalance"))
+            .issue()
+            .account,
+        protocol::no_account(),
+        "payment-created RippleState balances use rippled's neutral issuer"
     );
     assert_eq!(
         receiver_view

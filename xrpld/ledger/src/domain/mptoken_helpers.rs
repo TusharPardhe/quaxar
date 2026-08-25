@@ -822,6 +822,7 @@ pub fn create_mp_token(
 
     let mut mptoken = STLedgerEntry::new(mptoken_key);
     mptoken.set_account_id(sf("sfAccount"), *account);
+    mptoken.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_issuance_id);
     mptoken.set_field_u32(sf("sfFlags"), flags);
     mptoken.set_field_u64(sf("sfOwnerNode"), node);
     view.insert(Arc::new(mptoken))?;
@@ -876,6 +877,7 @@ fn authorize_mp_token(
 
     let mut mptoken = STLedgerEntry::new(mptoken_key);
     mptoken.set_account_id(sf("sfAccount"), *account);
+    mptoken.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
     mptoken.set_field_u32(sf("sfFlags"), 0);
     mptoken.set_field_u64(sf("sfOwnerNode"), node);
     view.insert(Arc::new(mptoken))?;
