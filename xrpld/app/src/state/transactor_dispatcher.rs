@@ -4966,7 +4966,9 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         0
                     }
                 } else {
-                    amm_sle.get_field_u16(sf("sfTradingFee"))
+                    // Match rippled's getTradingFee(): an active auction-slot
+                    // owner (or authorized account) pays sfDiscountedFee.
+                    ledger::amm_utils::get_trading_fee(view, &amm_sle, account)
                 };
                 let math =
                     match tx::run_amm_deposit_apply_math_facts(&tx::AMMDepositApplyMathFacts {

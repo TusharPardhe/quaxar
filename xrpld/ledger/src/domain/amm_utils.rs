@@ -153,7 +153,11 @@ pub fn amm_lp_holds_from_sle(
     )
 }
 
-pub fn get_trading_fee(view: &Ledger, amm_sle: &STLedgerEntry, account: AccountID) -> u16 {
+pub fn get_trading_fee<V: ReadView + ?Sized>(
+    view: &V,
+    amm_sle: &STLedgerEntry,
+    account: AccountID,
+) -> u16 {
     if amm_sle.is_field_present(get_field_by_symbol("sfAuctionSlot")) {
         let auction_slot = amm_sle.get_field_object(get_field_by_symbol("sfAuctionSlot"));
         let expiration = u64::from(auction_slot.get_field_u32(get_field_by_symbol("sfExpiration")));

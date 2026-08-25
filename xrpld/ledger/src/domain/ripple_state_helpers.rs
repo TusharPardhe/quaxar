@@ -746,7 +746,7 @@ fn direct_send_no_fee_iou<V: ApplyView>(
     sender: &AccountID,
     receiver: &AccountID,
     amount: &STAmount,
-    check_issuer: bool,
+    _check_issuer: bool,
 ) -> Ter {
     if sender == receiver || amount.signum() <= 0 {
         return Ter::TES_SUCCESS;
@@ -754,11 +754,9 @@ fn direct_send_no_fee_iou<V: ApplyView>(
 
     let issue = amount.issue();
 
-    // Only check freeze when check_issuer is true.
-    // AMMClawback passes check_issuer=false to bypass freeze checks.
-    if check_issuer && (is_frozen(view, sender, &issue) || is_frozen(view, receiver, &issue)) {
-        return Ter::TEC_PATH_DRY;
-    }
+    // rippled's bCheckIssuer is an assertion that one endpoint is the issuer;
+    // it does not perform a freeze check. Callers enforce freeze policy before
+    // entering this balance-mutation primitive.
 
     let b_sender_high = *sender > *receiver;
     let line_keylet = protocol::line(*sender, *receiver, issue.currency);

@@ -367,6 +367,181 @@ fn testnet_20176955_transfer_rate_issuer_redemption_matches_rippled_metadata() {
     assert_eq!(serialized.data(), expected.as_slice());
 }
 
+#[test]
+fn clawback_ledger_20197848_matches_canonical_metadata() {
+    let issuer = protocol::parse_base58_account_id("rscFuQuPHKH4ov3faze4GJZT3MzEgV4YYb")
+        .expect("issuer account");
+    let holder = protocol::parse_base58_account_id("r4f4xLpXJtCh9PwdzsQ6KYwLevVnBpJV6f")
+        .expect("holder account");
+    let currency = protocol::currency_from_string("CLW");
+
+    let mut issuer_root = STLedgerEntry::new(account_keylet(raw_account_id(issuer)));
+    issuer_root.set_account_id(get_field_by_symbol("sfAccount"), issuer);
+    issuer_root.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::new_native(99_999_964, false),
+    );
+    issuer_root.set_field_u32(get_field_by_symbol("sfFlags"), 2_155_872_256);
+    issuer_root.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
+    issuer_root.set_field_u32(get_field_by_symbol("sfSequence"), 20_197_787);
+    issuer_root.set_field_h256(
+        get_field_by_symbol("sfPreviousTxnID"),
+        Uint256::from_hex("707F393E53A45FDE16D8C5A47825252EA83DFE8AE6CC1FEB384CFEB6D056F1CE")
+            .expect("issuer previous transaction"),
+    );
+    issuer_root.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), 20_197_793);
+
+    let mut holder_root = STLedgerEntry::new(account_keylet(raw_account_id(holder)));
+    holder_root.set_account_id(get_field_by_symbol("sfAccount"), holder);
+    holder_root.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::new_native(348_177_633, false),
+    );
+    holder_root.set_field_u32(get_field_by_symbol("sfFlags"), 8_388_608);
+    holder_root.set_field_u32(get_field_by_symbol("sfOwnerCount"), 489);
+    holder_root.set_field_u32(get_field_by_symbol("sfSequence"), 13_211_557);
+
+    let line_keylet = protocol::line(issuer, holder, currency);
+    let mut line = STLedgerEntry::new(line_keylet);
+    line.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::from_iou_amount(
+            get_field_by_symbol("sfBalance"),
+            protocol::IOUAmount::from_parts(-500, 0).expect("line balance"),
+            protocol::Issue::new(currency, protocol::no_account()),
+        ),
+    );
+    line.set_field_u32(get_field_by_symbol("sfFlags"), 2_228_224);
+    line.set_field_amount(
+        get_field_by_symbol("sfHighLimit"),
+        STAmount::from_iou_amount(
+            get_field_by_symbol("sfHighLimit"),
+            protocol::IOUAmount::from_parts(1_000_000, 0).expect("high limit"),
+            protocol::Issue::new(currency, holder),
+        ),
+    );
+    // UInt64 JSON fields are hexadecimal strings; canonical "41" is 0x41.
+    line.set_field_u64(get_field_by_symbol("sfHighNode"), 0x41);
+    line.set_field_amount(
+        get_field_by_symbol("sfLowLimit"),
+        STAmount::from_iou_amount(
+            get_field_by_symbol("sfLowLimit"),
+            protocol::IOUAmount::new(),
+            protocol::Issue::new(currency, issuer),
+        ),
+    );
+    line.set_field_u64(get_field_by_symbol("sfLowNode"), 0);
+    line.set_field_h256(
+        get_field_by_symbol("sfPreviousTxnID"),
+        Uint256::from_hex("707F393E53A45FDE16D8C5A47825252EA83DFE8AE6CC1FEB384CFEB6D056F1CE")
+            .expect("line previous transaction"),
+    );
+    line.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), 20_197_793);
+
+    let mut base = Ledger::new(
+        LedgerHeader {
+            seq: 20_197_848,
+            ..LedgerHeader::default()
+        },
+        false,
+    );
+    base.raw_insert(Arc::new(issuer_root)).expect("seed issuer");
+    base.raw_insert(Arc::new(holder_root)).expect("seed holder");
+    base.raw_insert(Arc::new(line)).expect("seed trust line");
+    let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::NONE);
+    let rules = parent.rules();
+
+    let tx_bytes = decode_hex_fixture(
+        "12001E2305F6081A240134319B201B013431EB61D5044364C5BB0000000000000000000000000000434C570000000000E78F76A49DD9158FA85DA4AAD95C0767303CC46168400000000000000C7321EDD93C87A1D380ECBAB63CACA6E580061A14D71EF07F794A3CC5FDAB095C8B2D127440E5E84CD3BBB922019A31EA1DDA8EB1C5DC4D6DF57BC339FEBD234CFD9872DB4FBE0B90E4FE74335E134EC3269D8FE8586560B4689153A382CF07BA5D6D3E0C0781141CB6CC5625F6A6FEE009AECD3CAD8F2FB2B953AB",
+    );
+    let mut sit = protocol::SerialIter::new(&tx_bytes);
+    let tx = STTx::from_serial_iter(&mut sit);
+    assert!(sit.empty());
+
+    let mut attempt = FlowSandbox::new_with_flags(&mut parent, ApplyFlags::RETRY);
+    let outcome = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+        &mut attempt,
+        &tx,
+        TxType::CLAWBACK,
+        ApplyFlags::RETRY,
+        Ter::TES_SUCCESS,
+    );
+    assert_eq!(outcome.result, Ter::TES_SUCCESS);
+    let mut metadata = attempt
+        .to_tx_meta(tx.get_transaction_id(), 20_197_848, None, &rules)
+        .expect("build Clawback metadata");
+    let mut serialized = protocol::Serializer::default();
+    metadata.add_raw(&mut serialized, Ter::TES_SUCCESS, 1);
+
+    let expected = decode_hex_fixture(
+        "201C00000001F8E511006125013431A155707F393E53A45FDE16D8C5A47825252EA83DFE8AE6CC1FEB384CFEB6D056F1CE56596B67FFE48EEA091EA43E3190487597035EC14AC08DFF1F12CE1BD54026C389E6240134319B624000000005F5E0DCE1E72280800000240134319C2D00000000624000000005F5E0D081141CB6CC5625F6A6FEE009AECD3CAD8F2FB2B953ABE1E1E511007225013431A155707F393E53A45FDE16D8C5A47825252EA83DFE8AE6CC1FEB384CFEB6D056F1CE56D3477E769AC1B0534CC8250E4A5867E51AB6E0DBCE8EC814E9B71C64882432F7E6629511C37937E08000000000000000000000000000434C5700000000000000000000000000000000000000000000000001E1E7220022000037000000000000000038000000000000004162950D801472258000000000000000000000000000434C5700000000000000000000000000000000000000000000000001668000000000000000000000000000000000000000434C5700000000001CB6CC5625F6A6FEE009AECD3CAD8F2FB2B953AB67D6038D7EA4C68000000000000000000000000000434C570000000000E78F76A49DD9158FA85DA4AAD95C0767303CC461E1E1F1031000",
+    );
+    assert_eq!(serialized.data(), expected.as_slice());
+}
+
+#[test]
+fn signer_list_set_ledger_20197848_matches_canonical_metadata() {
+    let account = protocol::parse_base58_account_id("r9iCr4Zdrih3UfLgKkeW8bcoo5Ww4zK9z6")
+        .expect("signer-list account");
+    let mut root = STLedgerEntry::new(account_keylet(raw_account_id(account)));
+    root.set_account_id(get_field_by_symbol("sfAccount"), account);
+    root.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::new_native(99_999_990, false),
+    );
+    root.set_field_u32(get_field_by_symbol("sfFlags"), 8_388_608);
+    root.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
+    root.set_field_u32(get_field_by_symbol("sfSequence"), 20_197_845);
+    root.set_field_h256(
+        get_field_by_symbol("sfPreviousTxnID"),
+        Uint256::from_hex("D89517ED11FAF72714CC6C4CF400BCD86BECF2230352F6FBBD3CB459789BBB98")
+            .expect("account previous transaction"),
+    );
+    root.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), 20_197_845);
+
+    let mut base = Ledger::new(
+        LedgerHeader {
+            seq: 20_197_848,
+            ..LedgerHeader::default()
+        },
+        false,
+    );
+    base.set_rules(Rules::new([
+        protocol::feature_id("MultiSignReserve"),
+        protocol::feature_id("fixIncludeKeyletFields"),
+    ]));
+    base.raw_insert(Arc::new(root)).expect("seed account");
+    let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::NONE);
+    let rules = parent.rules();
+
+    let tx_bytes = decode_hex_fixture(
+        "12000C220000000024013431D5201B013431E920230000000168400000000000000A7321ED17F9B48FDED171A05335FCCBAFC694B7AB899F1E27CABF04B3E4BC74A03991A67440AFF17F8A1B11E4008F53F331E448D9FE789AF60A5B7F95B6B43DA91BF1585631C7BD2EB43CF26D2DB90A924C6562616AED648C5ABF4862EA6CC850ABDE6C3F00811461251D53379CE80CCB388F9FC1E7D9DB07AA253BF4EB1300018114D37D7648AFE3622168F68C76B21020F9F38F5720E1EB130001811409054C92B3DC3DE64581C0E574705C0016D1C6E8E1EB1300018114583727F31F9AF00548D5F001FA528283450BA3E5E1EB1300018114877BB195E7B297BA1AF7DEE6A4B2E2D561930F7FE1EB130001811499A3E76669876DF13CB82846C87B34469DBE84AAE1EB13000181144062CC266C97417295FAAB1BB4334B5DF1987E11E1EB130001811437185E0697511FCC08089A9CC004D2D8C9631FE6E1F1",
+    );
+    let mut sit = protocol::SerialIter::new(&tx_bytes);
+    let tx = STTx::from_serial_iter(&mut sit);
+    assert!(sit.empty());
+
+    let mut attempt = FlowSandbox::new_with_flags(&mut parent, ApplyFlags::RETRY);
+    let outcome = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+        &mut attempt,
+        &tx,
+        TxType::SIGNER_LIST_SET,
+        ApplyFlags::RETRY,
+        Ter::TES_SUCCESS,
+    );
+    assert_eq!(outcome.result, Ter::TES_SUCCESS);
+    let mut metadata = attempt
+        .to_tx_meta(tx.get_transaction_id(), 20_197_848, None, &rules)
+        .expect("build SignerListSet metadata");
+    let mut serialized = protocol::Serializer::default();
+    metadata.add_raw(&mut serialized, Ter::TES_SUCCESS, 0);
+
+    let expected = decode_hex_fixture(
+        "201C00000000F8E511006125013431D555D89517ED11FAF72714CC6C4CF400BCD86BECF2230352F6FBBD3CB459789BBB985606F2DF5269518839BBF7A4F2C7A96113209A83DC941EC75986264C350A5E9730E624013431D52D00000000624000000005F5E0F6E1E7220080000024013431D62D00000001624000000005F5E0EC811461251D53379CE80CCB388F9FC1E7D9DB07AA253BE1E1E311006456A01346FB0C6E67EC42DBFEE7DEE729B9712060AD3E744023FDBB02D49F05A7EDE858A01346FB0C6E67EC42DBFEE7DEE729B9712060AD3E744023FDBB02D49F05A7ED821461251D53379CE80CCB388F9FC1E7D9DB07AA253BE1E1E311005356B76E5C5E7B135A7A5EF374B98F31836FF28E6B761156EBA2AEF933F178EF036CE82200010000202300000001821461251D53379CE80CCB388F9FC1E7D9DB07AA253BF4EB130001811409054C92B3DC3DE64581C0E574705C0016D1C6E8E1EB130001811437185E0697511FCC08089A9CC004D2D8C9631FE6E1EB13000181144062CC266C97417295FAAB1BB4334B5DF1987E11E1EB1300018114583727F31F9AF00548D5F001FA528283450BA3E5E1EB1300018114877BB195E7B297BA1AF7DEE6A4B2E2D561930F7FE1EB130001811499A3E76669876DF13CB82846C87B34469DBE84AAE1EB1300018114D37D7648AFE3622168F68C76B21020F9F38F5720E1F1E1E1F1031000",
+    );
+    assert_eq!(serialized.data(), expected.as_slice());
+}
+
 fn payment_tx(
     source: AccountID,
     destination: AccountID,

@@ -13790,6 +13790,92 @@ fn amm_deposit_waives_mpt_transfer_fee() {
 }
 
 #[test]
+fn amm_deposit_uses_active_auction_slot_discount_for_single_asset_math() {
+    let account = sample_account(0x48);
+    let non_owner = sample_account(0x49);
+    let issuer = sample_account(0x4A);
+    let amm_account = sample_account(0x4B);
+    let mpt_id = share_id_for(issuer, 1);
+    let mpt_issue = protocol::MPTIssue::new(mpt_id);
+    let mpt_asset = Asset::MPTIssue(mpt_issue);
+    let xrp_asset = Asset::Issue(xrp_issue());
+
+    let make_view = |slot_owner: AccountID| {
+        let mut amm = amm_mpt_xrp_entry(amm_account, mpt_issue, 1_000_000, 1_000_000);
+        amm.set_field_u16(sf("sfTradingFee"), 400);
+        let mut slot = amm.get_field_object(sf("sfAuctionSlot"));
+        slot.set_account_id(sf("sfAccount"), slot_owner);
+        slot.set_field_u16(sf("sfDiscountedFee"), 40);
+        amm.set_field_object(sf("sfAuctionSlot"), slot);
+
+        let mut ledger = empty_ledger(vec![
+            account_root_with_balance(account, 0, 0, 1_000_000_000),
+            account_root(issuer, 1, 0),
+            account_root_with_balance(amm_account, 0, 0, 1_000_000_000),
+            mpt_issuance_entry(
+                issuer,
+                1,
+                2_000_000,
+                protocol::lsfMPTCanTransfer | protocol::lsfMPTCanTrade,
+            ),
+            mptoken_entry(account, mpt_id, 1_000_000),
+            mptoken_entry(amm_account, mpt_id, 1_000_000),
+            amm,
+        ]);
+        ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV2")]));
+        ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE)
+    };
+
+    let tx = STTx::new(TxType::AMM_DEPOSIT, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), mpt_asset),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), xrp_asset),
+        );
+        tx.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_mpt_amount(
+                sf("sfAmount"),
+                protocol::MPTAmount::from_value(500_000),
+                mpt_issue,
+            ),
+        );
+        tx.set_field_amount(sf("sfFee"), test_xrp(10));
+        tx.set_field_u32(sf("sfFlags"), protocol::AMM_SINGLE_ASSET_FLAG);
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    let mut discounted = make_view(account);
+    let mut regular = make_view(non_owner);
+    assert_eq!(
+        handle_real_dispatch(&mut discounted, &tx, TxType::AMM_DEPOSIT, None),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        handle_real_dispatch(&mut regular, &tx, TxType::AMM_DEPOSIT, None),
+        Ter::TES_SUCCESS
+    );
+
+    let amm_key = protocol::keylet::amm(mpt_asset, xrp_asset);
+    let discounted_lp = discounted
+        .read(amm_key)
+        .expect("discounted AMM read")
+        .expect("discounted AMM")
+        .get_field_amount(sf("sfLPTokenBalance"));
+    let regular_lp = regular
+        .read(amm_key)
+        .expect("regular AMM read")
+        .expect("regular AMM")
+        .get_field_amount(sf("sfLPTokenBalance"));
+
+    assert!(discounted_lp > regular_lp);
+}
+
+#[test]
 fn amm_withdraw_allows_nontransferable_mpt_asset_recovery_path() {
     let account = sample_account(0x17);
     let issuer = sample_account(0x18);
