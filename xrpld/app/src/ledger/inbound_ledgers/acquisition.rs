@@ -4410,8 +4410,7 @@ fn record_resolver_visible_ledger(
 }
 
 fn publish_resolver_visible_ledger(
-    hash: Uint256,
-    durability_identity: PersistenceIdentity,
+    identity: ProvisionalLedgerIdentity,
     completion_recorder: &AcquisitionCompletionRecorder,
     resolver_published: &AtomicBool,
     completed_ledger: &Mutex<Option<Arc<Ledger>>>,
@@ -4419,25 +4418,14 @@ fn publish_resolver_visible_ledger(
     reason: AcquireReason,
     ledger: Arc<Ledger>,
 ) -> bool {
-    // Establish the registry's provisional identity before making the ledger
-    // visible to any cache-backed resolver. The queued strand work still
-    // performs validation registration and acceptance, just as rippled's
-    // separately dispatched AcqDone job does.
-    if !completion_recorder(
-        ProvisionalLedgerIdentity {
-            acquisition_id: durability_identity.acquisition_id,
-            target_hash: hash,
-            ledger_hash: *ledger.header().hash.as_uint256(),
-            ledger_seq: ledger.header().seq,
-            store_generation: durability_identity.store_generation,
-            persistence_generation: durability_identity.persistence_generation,
-        },
-        Arc::clone(&ledger),
-    ) {
+    // Establish the registry identity only after the acquisition durability
+    // fence. The queued strand work then performs validation registration and
+    // acceptance, just as rippled's separately dispatched AcqDone job does.
+    if !completion_recorder(identity, Arc::clone(&ledger)) {
         return false;
     }
     record_resolver_visible_ledger(
-        durability_identity.acquisition_id,
+        identity.acquisition_id,
         resolver_published,
         completed_ledger,
         store_tx,
@@ -4456,8 +4444,10 @@ fn snapshot_completed_ledger(state: &AcquisitionState) -> Option<Ledger> {
     mutable.inbound.ledger().cloned()
 }
 
-/// Build the cache-only immutable ledger that can safely satisfy validation
-/// resolver lookups before the FIFO persistence barrier reaches `sync_result`.
+/// Build the immutable acquired ledger with the same cache-then-NodeStore
+/// read-through ownership that rippled's SHAMap family provides. A completed
+/// ledger can outlive individual TreeNodeCache entries, so a cache-only
+/// fetcher would turn an evicted branch into an apparent absent ledger object.
 fn build_resolver_visible_ledger(state: &AcquisitionState) -> Option<Arc<Ledger>> {
     let mut ledger = snapshot_completed_ledger(state)?;
     if !ledger.is_immutable() {
@@ -4465,7 +4455,31 @@ fn build_resolver_visible_ledger(state: &AcquisitionState) -> Option<Arc<Ledger>
     }
     ledger.set_full();
     let tree_cache = Arc::clone(&state.shared_tree_cache);
-    ledger.set_node_fetcher(Arc::new(move |hash| tree_cache.fetch(hash.as_uint256())));
+    let node_store = state.node_store.clone();
+    let ledger_seq = ledger.header().seq;
+    ledger.set_node_fetcher(Arc::new(move |hash| {
+        if let Some(node) = tree_cache.fetch(hash.as_uint256()) {
+            return Some(node);
+        }
+        let object = match &node_store {
+            SHAMapStoreNodeStore::Single(database) => database.fetch_node_object(
+                hash.as_uint256(),
+                ledger_seq,
+                nodestore::FetchType::Synchronous,
+                false,
+            ),
+            SHAMapStoreNodeStore::Rotating(database) => database.fetch_node_object(
+                hash.as_uint256(),
+                ledger_seq,
+                nodestore::FetchType::Synchronous,
+                false,
+            ),
+        }?;
+        let mut node =
+            shamap::tree_node::SHAMapTreeNode::make_from_prefix(object.data(), hash).ok()?;
+        tree_cache.canonicalize_replace_client(hash.as_uint256(), &mut node);
+        Some(node)
+    }));
     Some(Arc::new(ledger))
 }
 
@@ -4507,48 +4521,32 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
     };
     let ledger_seq = ledger.header().seq;
     let ledger_hash = *ledger.header().hash.as_uint256();
-    let target_hash = *state.hash.as_uint256();
-    let Some(durability_identity) = state.enqueue_durability_barrier(ledger_hash, ledger_seq)
-    else {
+    if state
+        .enqueue_durability_barrier(ledger_hash, ledger_seq)
+        .is_none()
+    {
         state.mark_failed();
         return;
     };
-    let state_synching = ledger.state_map().is_synching();
-    let tx_synching = ledger.tx_map().is_synching();
-    state.provisional_registered.store(true, Ordering::Release);
-    if !publish_resolver_visible_ledger(
-        target_hash,
-        durability_identity,
-        &state.completion_recorder,
-        &state.resolver_published,
-        &state.completed_ledger,
-        &state.store_tx,
-        state.reason,
-        ledger,
-    ) {
-        state.mark_failed();
-        return;
-    }
+    *state
+        .completed_ledger
+        .lock()
+        .expect("acquisition completed ledger lock") = Some(ledger);
     tracing::info!(
         target: "lcl_trace",
-        event = "inbound_resolver_visible",
-        target_hash = %target_hash,
+        event = "inbound_waiting_for_durability",
+        target_hash = %state.hash,
         ledger_hash = %ledger_hash,
-        target_matches_header = target_hash == ledger_hash,
+        target_matches_header = *state.hash.as_uint256() == ledger_hash,
         ledger_seq,
         acquisition_id = state.acquisition_id,
-        store_generation = durability_identity.store_generation,
-        persistence_generation = durability_identity.persistence_generation,
         reason = ?state.reason,
-        state_synching,
-        tx_synching,
-        "LCL trace: completed inbound ledger published before durable NodeStore sync"
+        "LCL trace: completed inbound ledger held until NodeStore durability fence"
     );
 
-    // All accepted writes were already enqueued after their packet guards
-    // released. Keep the original FIFO barrier so durability is still tracked
-    // and persistence failures remain terminal; it simply no longer delays
-    // validation-trie and LedgerHistory resolver visibility.
+    // rippled does not expose an acquired ledger until its accepted nodes are
+    // owned by NodeStore. The Rust write port is asynchronous, so the FIFO
+    // fence is the equivalent ownership boundary.
     state.dispatch_next_persistence_command();
 }
 
@@ -4559,10 +4557,6 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
     {
-        return;
-    }
-    if !state.resolver_published.load(Ordering::Acquire) {
-        state.mark_failed();
         return;
     }
     let Some(ledger) = state
@@ -4588,6 +4582,20 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
         state.mark_failed();
         return;
     };
+
+    state.provisional_registered.store(true, Ordering::Release);
+    if !publish_resolver_visible_ledger(
+        provisional_identity,
+        &state.completion_recorder,
+        &state.resolver_published,
+        &state.completed_ledger,
+        &state.store_tx,
+        state.reason,
+        Arc::clone(&ledger),
+    ) {
+        state.mark_failed();
+        return;
+    }
 
     {
         let _outbound = state
@@ -5726,7 +5734,7 @@ mod actor_mailbox_tests {
     }
 
     #[test]
-    fn completed_ledger_fetcher_is_cache_only() {
+    fn completed_ledger_fetcher_reads_through_cache_and_nodestore() {
         let source = include_str!("acquisition.rs");
         let start = source
             .find("fn build_resolver_visible_ledger")
@@ -5738,8 +5746,25 @@ mod actor_mailbox_tests {
                 .expect("resolver-visible ledger builder boundary")];
         assert!(builder.contains("snapshot_completed_ledger(state)"));
         assert!(builder.contains("tree_cache.fetch(hash.as_uint256())"));
-        assert!(!builder.contains("fetch_node_object("));
-        assert!(!builder.contains("FetchType::Synchronous"));
+        assert!(builder.contains("fetch_node_object("));
+        assert!(builder.contains("FetchType::Synchronous"));
+    }
+
+    #[test]
+    fn resolver_publication_waits_for_durability_fence() {
+        let source = include_str!("acquisition.rs");
+        let start = source
+            .find("fn finalize_acquisition")
+            .expect("initial finalizer source");
+        let durable = source[start..]
+            .find("fn finalize_durable_acquisition")
+            .map(|offset| start + offset)
+            .expect("durable finalizer source");
+        let initial = &source[start..durable];
+        let durable_finalizer = &source[durable..];
+        assert!(initial.contains("enqueue_durability_barrier"));
+        assert!(!initial.contains("publish_resolver_visible_ledger("));
+        assert!(durable_finalizer.contains("publish_resolver_visible_ledger("));
     }
 
     #[test]

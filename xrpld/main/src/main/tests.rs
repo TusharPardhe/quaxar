@@ -73,6 +73,22 @@ fn cli_unknown_command_helpers_detect_command_and_suggest_close_matches() {
 }
 
 #[test]
+fn replay_values_are_not_treated_as_cli_subcommands() {
+    let args = vec![
+        "quaxar".to_owned(),
+        "--conf".to_owned(),
+        "/etc/quaxar/quaxar.cfg".to_owned(),
+        "--replay".to_owned(),
+        "--ledger".to_owned(),
+        "20214054".to_owned(),
+        "--trap_tx_hash".to_owned(),
+        "9424F00E0E100B25852995AF07E04DFFCD8D44C08A22DD86810A3E883C5B3948".to_owned(),
+    ];
+
+    assert_eq!(first_command_like_arg(&args, STARTUP_VALUE_FLAGS), None);
+}
+
+#[test]
 fn quaxar_main_binds_server_runtime_into_the_composed_app_graph() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

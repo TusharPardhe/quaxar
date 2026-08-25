@@ -9,8 +9,8 @@ use basics::base_uint::{Uint160, Uint192, Uint256};
 use basics::number::NumberParts as RuntimeNumber;
 use basics::string_utilities::str_unhex;
 use ledger::{
-    ApplyView, ApplyViewImpl, Fees, Ledger, LedgerConfig, LedgerHeader, ReadView, Sandbox,
-    pseudo_account_address,
+    ApplyView, ApplyViewImpl, CanonicalTXSet, Fees, Ledger, LedgerConfig, LedgerHeader, ReadView,
+    Sandbox, TxsRawView, pseudo_account_address,
 };
 use protocol::{
     AccountID, ApplyFlags, Asset, Currency, FeatureSet, IOUAmount, Issue, Keylet, LedgerEntryType,
@@ -1370,6 +1370,130 @@ fn canonical_sle(index: &str, blob: &str) -> STLedgerEntry {
     assert!(key.parse_hex(index), "canonical ledger index");
     let bytes = str_unhex(blob).expect("canonical SLE hex");
     STLedgerEntry::from_serial_iter(&mut SerialIter::new(&bytes), key)
+}
+
+#[test]
+fn testnet_20214054_clawback_and_account_set_match_canonical_metadata_bytes() {
+    // Exact parent objects, consensus salt, transactions, and metadata from
+    // Testnet ledger 20,214,054. The node produced an incompatible child at
+    // this boundary, so pin both canonical application order and leaf bytes.
+    let entries = [
+        ("BABED78B2E77358D608B70AC304E7C83FD91D62DA4C2FF63979EC2CA98A09A84", "1100612200000000240134712425013471242D00000000559BBA13F867B7CCBDB66CCA303E68D0FBB4ECB7CBF569E7F49608E440C7C3717E624000000005F5E10081146E26A037E5F3C80945C4765A025AFFAA0BFEABFB"),
+        ("1768F3A001B093B3453688DA92EC06148D0698BD1ED9E58A95903CC65C4E8E11", "1100612280800000240134711F25013471242D0000000055EA8B2C8C220C6C2399309D2A38274D89A24DD4BBDFD6976583AB5D94D4190C90624000000005F5E0DC8114D2F10EA6BAFAA38115E8180EF471241AF9DE8884"),
+        ("F6637C95924A6B0C16E971A5083456EB46E88C5C4A2F3919BCCC843FD916C383", "1100722200010000250134712437000000000000000038000000000000000055EA8B2C8C220C6C2399309D2A38274D89A24DD4BBDFD6976583AB5D94D4190C9062D4D1C37937E080000000000000000000000000005553440000000000000000000000000000000000000000000000000166D82386F26FC0FFF60000000000000000000000005553440000000000309A81C25988CA31DE41B2F84ECF7008C24A95456780000000000000000000000000000000000000005553440000000000D2F10EA6BAFAA38115E8180EF471241AF9DE8884"),
+        ("BADB94DC96DB2957AF0877A988A26E91B96036B6441226A8DAE48FE396F9715C", "1100612200000000240134711D25013471222D0000000155163B56DE54A554E09A31E6004CFAD5F77C794DE9F734F88F62EB74F13405A044624000000005F5E0F48114309A81C25988CA31DE41B2F84ECF7008C24A9545"),
+    ]
+    .into_iter()
+    .map(|(index, blob)| canonical_sle(index, blob))
+    .collect();
+    let mut ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 20_214_053,
+            parent_close_time: 840_995_000,
+            ..LedgerHeader::default()
+        },
+        entries,
+    );
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("Clawback"),
+        protocol::fix_previous_txn_id(),
+    ]));
+
+    let transaction_fixtures = [
+        (
+            TxType::CLAWBACK,
+            0,
+            "12001E2200000000240134711F201B0134713861D4D1C37937E080000000000000000000000000005553440000000000309A81C25988CA31DE41B2F84ECF7008C24A954568400000000000000C7321EDB5882D02C4F0B42905044A532B55D5114F43BFBB4A9D9E29777C68759A64F8B87440A6B86C331A1AB27EF3C42EFFE57596EA2E973F6F81B1D5FC0B45548DF0F81B2B224C8BA9F93A2B8FB313F44CC76E5B7DB1143AA4BC767DD4636B161D27C9610F8114D2F10EA6BAFAA38115E8180EF471241AF9DE8884",
+            "201C00000000F8E5110061250134712455EA8B2C8C220C6C2399309D2A38274D89A24DD4BBDFD6976583AB5D94D4190C90561768F3A001B093B3453688DA92EC06148D0698BD1ED9E58A95903CC65C4E8E11E6240134711F624000000005F5E0DCE1E7228080000024013471202D00000000624000000005F5E0D08114D2F10EA6BAFAA38115E8180EF471241AF9DE8884E1E1E5110072250134712455EA8B2C8C220C6C2399309D2A38274D89A24DD4BBDFD6976583AB5D94D4190C9056F6637C95924A6B0C16E971A5083456EB46E88C5C4A2F3919BCCC843FD916C383E662D4D1C37937E0800000000000000000000000000055534400000000000000000000000000000000000000000000000001E1E722000100003700000000000000003800000000000000006280000000000000000000000000000000000000005553440000000000000000000000000000000000000000000000000166D82386F26FC0FFF60000000000000000000000005553440000000000309A81C25988CA31DE41B2F84ECF7008C24A95456780000000000000000000000000000000000000005553440000000000D2F10EA6BAFAA38115E8180EF471241AF9DE8884E1E1F1031000",
+        ),
+        (
+            TxType::ACCOUNT_SET,
+            1,
+            "12000322000000002401347124201B0134713820210000000868400000000000000C7321ED6FD85AA4F87A1D6AC1E07EFAC8B71E2969C939AA3937B5275C3846B6340B8F717440E2B2E1B51F4FA5F97C59AF51E69170DEEB1C7B5EA1624C0761E45101BC44EBF8DB53CB6A845B18547F79F99CB32503C1E7FDFE169A6F0278965BDBF68A32F90681146E26A037E5F3C80945C4765A025AFFAA0BFEABFB",
+            "201C00000001F8E51100612501347124559BBA13F867B7CCBDB66CCA303E68D0FBB4ECB7CBF569E7F49608E440C7C3717E56BABED78B2E77358D608B70AC304E7C83FD91D62DA4C2FF63979EC2CA98A09A84E622000000002401347124624000000005F5E100E1E7220080000024013471252D00000000624000000005F5E0F481146E26A037E5F3C80945C4765A025AFFAA0BFEABFBE1E1F1031000",
+        ),
+    ];
+
+    let mut consensus_set = CanonicalTXSet::new(
+        Uint256::from_hex("B92A28C0FC4EFC0AFDE393433767CE38706845907C251659F98819EEA0C7C60F")
+            .expect("consensus salt"),
+    );
+    for (_, _, tx_blob, _) in transaction_fixtures {
+        let bytes = str_unhex(tx_blob).expect("canonical transaction hex");
+        consensus_set.insert(Arc::new(STTx::from_serial_iter(&mut SerialIter::new(
+            &bytes,
+        ))));
+    }
+    assert_eq!(
+        consensus_set
+            .drain_ordered()
+            .into_iter()
+            .map(|tx| tx.get_transaction_id().to_string())
+            .collect::<Vec<_>>(),
+        vec![
+            "94242075DCF7A53C4E18BC77E0D9BFDCAE8A3E44DC8B1D69C9BCC5E89F053948",
+            "04C55F5F2E4A36BFAB72C5E40DFB0E045B85DA38DE415A48500D66CAE87FA652",
+        ],
+    );
+
+    let mut parent = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let rules = parent.rules();
+    for (tx_type, index, tx_blob, expected_meta) in transaction_fixtures {
+        let tx_bytes = str_unhex(tx_blob).expect("canonical transaction hex");
+        let tx = STTx::from_serial_iter(&mut SerialIter::new(&tx_bytes));
+        let tx_id = tx.get_transaction_id();
+        let source = tx.get_account_id(get_field_by_symbol("sfAccount"));
+        assert!(
+            parent
+                .read(account_keylet(raw_account_id(source)))
+                .expect("read canonical source")
+                .is_some(),
+            "canonical parent is missing transaction source {source}"
+        );
+        let mut delta = ledger::FlowSandbox::new(&mut parent);
+        let (result, delivered) =
+            apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, tx_type);
+        assert_eq!(result, Ter::TES_SUCCESS);
+        let mut meta = delta
+            .to_tx_meta(tx_id, 20_214_054, delivered, &rules)
+            .expect("canonical metadata");
+        let mut serializer = Serializer::default();
+        meta.add_raw(&mut serializer, result, index);
+        assert_eq!(
+            serializer.data(),
+            str_unhex(expected_meta).expect("canonical metadata hex")
+        );
+        delta
+            .apply_with_tx_thread(tx_id, 20_214_054, &rules)
+            .expect("commit canonical transaction");
+    }
+
+    let mut canonical_tx_map = Ledger::new(LedgerHeader::default(), false);
+    for (_, index, tx_blob, canonical_meta) in transaction_fixtures {
+        let tx_bytes = str_unhex(tx_blob).expect("canonical transaction hex");
+        let tx = STTx::from_serial_iter(&mut SerialIter::new(&tx_bytes));
+        let tx_id = tx.get_transaction_id();
+        let meta_bytes = str_unhex(canonical_meta).expect("canonical metadata hex");
+        let mut meta = TxMeta::from_raw(tx_id, 20_214_054, &meta_bytes);
+        let mut serializer = Serializer::default();
+        meta.add_raw(&mut serializer, Ter::TES_SUCCESS, index);
+        canonical_tx_map
+            .raw_tx_insert(
+                tx_id,
+                Arc::new(Serializer::from_bytes(&tx_bytes)),
+                Some(Arc::new(serializer)),
+            )
+            .expect("insert canonical transaction");
+    }
+    assert_eq!(
+        canonical_tx_map
+            .tx_map_mut()
+            .hash()
+            .as_uint256()
+            .to_string(),
+        "31124D868654B96DE2C2736388543436A0E1BEDFACBF8E6BB08CF9650083D71C",
+        "canonical transaction leaves must reproduce rippled's transaction root"
+    );
 }
 
 #[test]
