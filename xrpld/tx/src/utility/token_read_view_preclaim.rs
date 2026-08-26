@@ -215,7 +215,16 @@ fn preclaim_clawback<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
                 ripple_state_exists: line.is_some(),
                 trustline_balance_sign: balance_sign,
                 issuer_holder_ordering: issuer.cmp(&holder),
-                account_holds_positive: account_holds_positive(view, holder, Asset::Issue(issue))?,
+                // Clawback deliberately overloads Amount.Issue.issuer with
+                // the holder account. rippled reconstructs accountHolds as
+                // (holder, currency, transaction source issuer); passing the
+                // wire Issue through unchanged makes holder == issue.account
+                // and falsely reports zero funds for every IOU Clawback.
+                account_holds_positive: account_holds_positive(
+                    view,
+                    holder,
+                    Asset::Issue(protocol::Issue::new(issue.currency, issuer)),
+                )?,
             })
         }
         Asset::MPTIssue(issue) => {
@@ -443,9 +452,13 @@ pub fn run_token_read_view_preclaim<V: ReadView>(
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
-    use basics::base_uint::Uint256;
+    use basics::base_uint::{Uint160, Uint256};
     use ledger::{Fees, LedgerHeader, ReadView, ReadViewTx, Rules, ViewError};
-    use protocol::{AccountID, Keylet, STAmount, STLedgerEntry, STTx, Ter, TxType, XRPAmount};
+    use protocol::{
+        AccountID, IOUAmount, Issue, Keylet, LedgerEntryType, STAmount, STLedgerEntry, STTx, Ter,
+        TxType, XRPAmount, account_keylet, currency_from_string, line, lsfAllowTrustLineClawback,
+        sf_generic,
+    };
 
     use super::{run_token_read_view_preclaim, sf};
 
@@ -530,6 +543,51 @@ mod tests {
             Some(Ter::TER_NO_ACCOUNT)
         );
         assert!(view.entries.is_empty(), "ReadView preclaim must not mutate");
+    }
+
+    #[test]
+    fn iou_clawback_reconstructs_the_real_issuer_for_account_holds() {
+        let issuer = account(1);
+        let holder = account(2);
+        let currency = currency_from_string("USD");
+        let mut view = View::default();
+
+        for (account, flags) in [(issuer, lsfAllowTrustLineClawback), (holder, 0)] {
+            let keylet = account_keylet(Uint160::from_void(account.data()));
+            let mut root =
+                STLedgerEntry::from_type_and_key(LedgerEntryType::AccountRoot, keylet.key);
+            root.set_account_id(sf("sfAccount"), account);
+            root.set_field_u32(sf("sfFlags"), flags);
+            view.entries.insert(keylet.key, Arc::new(root));
+        }
+
+        // issuer < holder, so a negative low-side balance means the holder
+        // owns positive issuer-issued USD. The transaction wire amount uses
+        // the holder in Issue.issuer by Clawback definition.
+        let line_keylet = line(issuer, holder, currency);
+        let iou = |value, account| {
+            STAmount::from_iou_amount(
+                sf_generic(),
+                IOUAmount::from_parts(value, 0).expect("valid IOU amount"),
+                Issue::new(currency, account),
+            )
+        };
+        let mut trust =
+            STLedgerEntry::from_type_and_key(LedgerEntryType::RippleState, line_keylet.key);
+        trust.set_field_amount(sf("sfBalance"), iou(-50, protocol::no_account()));
+        trust.set_field_amount(sf("sfLowLimit"), iou(0, issuer));
+        trust.set_field_amount(sf("sfHighLimit"), iou(0, holder));
+        view.entries.insert(line_keylet.key, Arc::new(trust));
+
+        let clawback = STTx::new(TxType::CLAWBACK, |tx| {
+            tx.set_account_id(sf("sfAccount"), issuer);
+            tx.set_field_amount(sf("sfAmount"), iou(10, holder));
+        });
+        assert_eq!(
+            run_token_read_view_preclaim(&view, &clawback, TxType::CLAWBACK),
+            Some(Ter::TES_SUCCESS),
+            "accountHolds must use the transaction source as the IOU issuer"
+        );
     }
 
     #[test]

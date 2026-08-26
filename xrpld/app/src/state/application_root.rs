@@ -1905,10 +1905,10 @@ struct StandaloneAcceptedTx {
 /// An inner transaction that reached the applied (`tes*` or `tec*`) state in
 /// the isolated Batch view. It is staged until the entire Batch policy decides
 /// whether that view can be committed.
-struct AppliedBatchInnerTransaction {
-    transaction: STTx,
-    result: Ter,
-    metadata: protocol::TxMeta,
+pub(crate) struct AppliedBatchInnerTransaction {
+    pub(crate) transaction: STTx,
+    pub(crate) result: Ter,
+    pub(crate) metadata: protocol::TxMeta,
 }
 
 pub(crate) struct SubmitApplyOutcome {
@@ -1920,8 +1920,8 @@ pub(crate) struct SubmitApplyOutcome {
     /// opened. Closed-ledger callers must therefore reuse this metadata and
     /// commit the already-threaded aggregate sandbox without threading it as
     /// the outer transaction a second time.
-    prebuilt_outer_metadata: Option<protocol::TxMeta>,
-    applied_batch_inner_transactions: Vec<AppliedBatchInnerTransaction>,
+    pub(crate) prebuilt_outer_metadata: Option<protocol::TxMeta>,
+    pub(crate) applied_batch_inner_transactions: Vec<AppliedBatchInnerTransaction>,
 }
 
 /// Result of a TxQ-admitted dry run. The state delta is retained only as
@@ -2964,7 +2964,8 @@ pub(crate) fn apply_submit_transactor_shell_with_flags_batch_outcome_and_preclai
             let outer_tx_id = tx.get_transaction_id();
             let outer_ledger_seq = tx_view.seq();
             let outer_metadata =
-                match tx_view.to_tx_meta(outer_tx_id, outer_ledger_seq, None, &rules) {
+                match tx_view.apply_with_tx_meta(outer_tx_id, outer_ledger_seq, None, None, &rules)
+                {
                     Ok(metadata) => metadata,
                     Err(_) => {
                         return SubmitApplyOutcome {
@@ -2976,19 +2977,6 @@ pub(crate) fn apply_submit_transactor_shell_with_flags_batch_outcome_and_preclai
                         };
                     }
                 };
-            if tx_view
-                .apply_with_tx_thread(outer_tx_id, outer_ledger_seq, &rules)
-                .is_err()
-            {
-                return SubmitApplyOutcome {
-                    result: Ter::TEF_INTERNAL,
-                    applied: false,
-                    delivered_amount: None,
-                    prebuilt_outer_metadata: None,
-                    applied_batch_inner_transactions: Vec::new(),
-                };
-            }
-
             // The parent now contains only the fully-applied outer Batch.
             // Open the inner whole-batch phase over that state, as rippled
             // does, rather than folding it back into the outer state table.
@@ -3820,10 +3808,11 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
         if inner_applied {
             let inner_tx_id = inner_tx.get_transaction_id();
             let inner_ledger_seq = per_tx_batch_view.seq();
-            let mut metadata = match per_tx_batch_view.to_tx_meta(
+            let metadata = match per_tx_batch_view.apply_with_tx_meta(
                 inner_tx_id,
                 inner_ledger_seq,
                 delivered_amount,
+                Some(parent_batch_id),
                 &rules,
             ) {
                 Ok(metadata) => metadata,
@@ -3834,16 +3823,6 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
                     };
                 }
             };
-            metadata.set_parent_batch_id(Some(parent_batch_id));
-            if per_tx_batch_view
-                .apply_with_tx_thread(inner_tx_id, inner_ledger_seq, &rules)
-                .is_err()
-            {
-                return BatchFollowupOutcome {
-                    result: Ter::TEF_INTERNAL,
-                    applied_inner_transactions: Vec::new(),
-                };
-            }
             applied_inner_transactions.push(AppliedBatchInnerTransaction {
                 transaction: inner_tx,
                 result,
@@ -4783,12 +4762,15 @@ impl ApplicationRoot {
             });
         let ledger_seq = open_view.ledger_current_index;
         let close_time = apply_view.header().close_time;
+        let simulation_rules = apply_view.rules();
+        let mut simulation_view =
+            ledger::FlowSandbox::new_with_flags(&mut apply_view, ApplyFlags::DRY_RUN);
         let tx_source = AppQueueApplyTxSource::new(tx.as_ref());
         let account_seqs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let result = self.registry.tx_q.simulate_with(|tx_q| {
             let metrics_snapshot = tx_q.metrics_snapshot();
             let live_queue_view =
-                open_view.queue_apply_view(&apply_view, tx.as_ref(), metrics_snapshot);
+                open_view.queue_apply_view(&simulation_view, tx.as_ref(), metrics_snapshot);
             let queue_view = snapshot_queue_apply_app_view_with_metrics(
                 &tx_source,
                 &live_queue_view,
@@ -4796,7 +4778,7 @@ impl ApplicationRoot {
             );
             let mut runtime = AppOpenLedgerTxQApplyRuntime::new_with_clear_ahead(
                 &mut open_view,
-                &mut apply_view,
+                &mut simulation_view,
                 Arc::clone(&tx),
                 ApplyFlags::DRY_RUN,
                 ledger_seq,
@@ -4819,15 +4801,23 @@ impl ApplicationRoot {
                 .apply_result();
             (result, runtime.delivered_amount.clone())
         });
-        let metadata = (is_tes_success(result.0.ter) || is_tec_claim(result.0.ter)).then(|| {
-            let mut metadata =
-                apply_view
-                    .table()
-                    .to_tx_meta(tx.get_transaction_id(), ledger_seq, result.1);
-            let mut serialized = Serializer::default();
-            metadata.add_raw(&mut serialized, result.0.ter, 0);
-            metadata
-        });
+        let metadata = (is_tes_success(result.0.ter) || is_tec_claim(result.0.ter))
+            .then(|| {
+                simulation_view
+                    .to_tx_meta(
+                        tx.get_transaction_id(),
+                        ledger_seq,
+                        result.1,
+                        &simulation_rules,
+                    )
+                    .ok()
+                    .map(|mut metadata| {
+                        let mut serialized = Serializer::default();
+                        metadata.add_raw(&mut serialized, result.0.ter, 0);
+                        metadata
+                    })
+            })
+            .flatten();
 
         SimulationOutcome {
             result: result.0,
@@ -9715,11 +9705,12 @@ impl ApplicationRoot {
                     })?;
                     metadata
                 } else {
-                    let metadata = attempt_view
-                        .to_tx_meta(
+                    attempt_view
+                        .apply_with_tx_meta(
                             st_tx.get_transaction_id(),
                             closed_seq,
                             delivered_amount,
+                            None,
                             &rules,
                         )
                         .map_err(|error| {
@@ -9727,16 +9718,7 @@ impl ApplicationRoot {
                                 "standalone accepted transaction {} metadata failed: {error:?}",
                                 st_tx.get_transaction_id()
                             )
-                        })?;
-                    attempt_view
-                        .apply_with_tx_thread(st_tx.get_transaction_id(), closed_seq, &rules)
-                        .map_err(|error| {
-                            format!(
-                                "standalone accepted transaction {} state commit failed: {error:?}",
-                                st_tx.get_transaction_id()
-                            )
-                        })?;
-                    metadata
+                        })?
                 };
                 let delta_meta_nodes = meta.get_nodes().json(protocol::JsonOptions::NONE);
                 let mut serializer = protocol::Serializer::default();
@@ -10226,26 +10208,19 @@ impl ApplicationRoot {
                             })?;
                             metadata
                         } else {
-                            let metadata = attempt_view
-                                .to_tx_meta(
+                            attempt_view
+                                .apply_with_tx_meta(
                                     transaction_id,
                                     closed_seq,
                                     delivered_amount,
+                                    None,
                                     &rules,
                                 )
                                 .map_err(|error| {
                                     crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
                                         "failed to build accepted transaction metadata {transaction_id}: {error:?}"
                                     ))
-                                })?;
-                            attempt_view
-                                .apply_with_tx_thread(transaction_id, closed_seq, &rules)
-                                .map_err(|error| {
-                                    crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
-                                        "failed to thread accepted transaction {transaction_id}: {error:?}"
-                                    ))
-                                })?;
-                            metadata
+                                })?
                         };
                         Some(meta)
                     } else {

@@ -633,6 +633,14 @@ fn build_ledger_from_acquired_tx_with_order(
         let txn_type = sttx.get_txn_type();
         let tx_id = sttx.get_transaction_id();
 
+        // rippled's LedgerReplay applies inner Batch transactions only while
+        // applying their outer Batch. TransactionMd contains separate leaves
+        // for them, but replaying those leaves as standalone transactions
+        // would execute or thread them twice.
+        if sttx.get_flags() & protocol::INNER_BATCH_TRANSACTION_FLAG != 0 {
+            continue;
+        }
+
         match parent.try_tx_exists(tx_id) {
             Ok(true) => {
                 tracing::debug!(target: "ledger",
@@ -685,8 +693,9 @@ fn build_ledger_from_acquired_tx_with_order(
         // Sandbox wraps a snapshot of the accumulator — reads see all prior
         // tx changes via the accumulator's delta table, then fall through to
         // the original built ledger. No SHAMap clone needed.
-        let base = Arc::new(accum.clone());
-        let mut view = ledger::Sandbox::new(base, protocol::ApplyFlags::default());
+        let mut tx_parent =
+            ledger::ApplyViewImpl::new(Arc::new(accum.clone()), protocol::ApplyFlags::default());
+        let mut view = ledger::FlowSandbox::new(&mut tx_parent);
 
         // Wrap individual tx application in catch_unwind for diagnostics
         let tx_type_name = format!("{:?}", txn_type);
@@ -718,7 +727,7 @@ fn build_ledger_from_acquired_tx_with_order(
             Ok(outcome) if outcome.applied => {
                 let ter = outcome.result;
                 // === DEBUG: Log sandbox modifications before apply ===
-                let mods = view.modification_summary();
+                let mods = format!("{} changes", view.item_count());
                 tracing::debug!(target: "ledger",
                     "[build] TX_PRE_APPLY seq={} tx={}/{} type={} ter={:?} txid={:02x}{:02x}{:02x}{:02x} account={:02x}{:02x}{:02x}{:02x} mods={}",
                     acquired_header.seq,
@@ -736,33 +745,55 @@ fn build_ledger_from_acquired_tx_with_order(
                     tx_account.data()[3],
                     mods,
                 );
-                for line in view.modification_debug_lines() {
-                    full_sync_debug!(
-                        "[full_debug][tx_touch] seq={} tx_index={} txid={} ter={:?} {}",
-                        acquired_header.seq,
-                        tx_index,
-                        tx_id,
-                        ter,
-                        line
-                    );
-                }
-
                 let rules = built.rules().clone();
-                if let Err(error) =
-                    view.apply_with_tx_thread(&mut accum, tx_id, acquired_header.seq, &rules)
-                {
-                    tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
-                        tx = %tx_id,
-                        "[build] transaction commit failed; refusing to publish acquired ledger");
-                    return None;
-                }
-
                 let Some(metadata) = transaction_metadata.get(&tx_id) else {
                     tracing::error!(target: "ledger", seq = acquired_header.seq,
                         tx = %tx_id,
                         "[build] verified transaction metadata missing; refusing acquired ledger");
                     return None;
                 };
+                let canonical_meta =
+                    protocol::TxMeta::from_raw(tx_id, acquired_header.seq, metadata.data());
+                let mut computed_meta = if let Some(outer) = outcome.prebuilt_outer_metadata {
+                    if let Err(error) = view.apply() {
+                        tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+                            tx = %tx_id,
+                            "[build] Batch aggregate commit failed; refusing acquired ledger");
+                        return None;
+                    }
+                    outer
+                } else {
+                    match view.apply_with_tx_meta(
+                        tx_id,
+                        acquired_header.seq,
+                        outcome.delivered_amount,
+                        None,
+                        &rules,
+                    ) {
+                        Ok(meta) => meta,
+                        Err(error) => {
+                            tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+                                tx = %tx_id,
+                                "[build] transaction metadata/state commit failed; refusing acquired ledger");
+                            return None;
+                        }
+                    }
+                };
+                let mut computed_raw = Serializer::default();
+                computed_meta.add_raw(&mut computed_raw, ter, canonical_meta.get_index());
+                if computed_raw.data() != metadata.data() {
+                    tracing::error!(target: "ledger", seq = acquired_header.seq, tx = %tx_id,
+                        canonical_result = ?canonical_meta.get_result_ter(),
+                        computed_result = ?ter,
+                        "[build] reconstructed transaction metadata differs from canonical ledger");
+                    return None;
+                }
+                if let Err(error) = tx_parent.into_table().apply(&mut accum) {
+                    tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+                        tx = %tx_id,
+                        "[build] transaction accumulator commit failed; refusing acquired ledger");
+                    return None;
+                }
                 if let Err(error) = accum.raw_tx_insert(
                     tx_id,
                     Arc::new(Serializer::from_bytes(sttx.get_serializer().data())),
@@ -772,6 +803,45 @@ fn build_ledger_from_acquired_tx_with_order(
                         tx = %tx_id,
                         "[build] transaction-map commit failed; refusing acquired ledger");
                     return None;
+                }
+                for inner in outcome.applied_batch_inner_transactions {
+                    let inner_tx_id = inner.transaction.get_transaction_id();
+                    let Some(inner_canonical_raw) = transaction_metadata.get(&inner_tx_id) else {
+                        tracing::error!(target: "ledger", seq = acquired_header.seq,
+                            tx = %inner_tx_id, parent_batch = %tx_id,
+                            "[build] canonical inner Batch metadata missing");
+                        return None;
+                    };
+                    let inner_canonical_meta = protocol::TxMeta::from_raw(
+                        inner_tx_id,
+                        acquired_header.seq,
+                        inner_canonical_raw.data(),
+                    );
+                    let mut inner_meta = inner.metadata;
+                    let mut inner_computed_raw = Serializer::default();
+                    inner_meta.add_raw(
+                        &mut inner_computed_raw,
+                        inner.result,
+                        inner_canonical_meta.get_index(),
+                    );
+                    if inner_computed_raw.data() != inner_canonical_raw.data() {
+                        tracing::error!(target: "ledger", seq = acquired_header.seq,
+                            tx = %inner_tx_id, parent_batch = %tx_id,
+                            "[build] reconstructed inner Batch metadata differs from canonical ledger");
+                        return None;
+                    }
+                    if let Err(error) = accum.raw_tx_insert(
+                        inner_tx_id,
+                        Arc::new(Serializer::from_bytes(
+                            inner.transaction.get_serializer().data(),
+                        )),
+                        Some(Arc::clone(inner_canonical_raw)),
+                    ) {
+                        tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+                            tx = %inner_tx_id, parent_batch = %tx_id,
+                            "[build] inner Batch transaction-map commit failed; refusing acquired ledger");
+                        return None;
+                    }
                 }
 
                 // Log TX result (without computing state hash — that's destructive
@@ -1153,19 +1223,24 @@ pub fn build_ledger_from_consensus(
                 // later child cannot recognize a parent-accepted transaction
                 // and replays it into already-threaded state.
                 let rules = built.rules().clone();
-                let mut meta = match view.to_tx_meta(tx_id, header.seq, delivered_amount, &rules) {
-                    Ok(meta) => meta,
-                    Err(error) => {
+                let mut meta = if let Some(metadata) = outcome.prebuilt_outer_metadata {
+                    if let Err(error) = view.apply() {
                         tracing::error!(target: "consensus", ?error, tx = %tx_id,
-                            "[build] transaction metadata failed; refusing consensus ledger");
+                            "[build] Batch aggregate commit failed; refusing consensus ledger");
                         return None;
                     }
+                    metadata
+                } else {
+                    match view.apply_with_tx_meta(tx_id, header.seq, delivered_amount, None, &rules)
+                    {
+                        Ok(meta) => meta,
+                        Err(error) => {
+                            tracing::error!(target: "consensus", ?error, tx = %tx_id,
+                                "[build] transaction metadata/state commit failed; refusing consensus ledger");
+                            return None;
+                        }
+                    }
                 };
-                if let Err(error) = view.apply_with_tx_thread(tx_id, header.seq, &rules) {
-                    tracing::error!(target: "consensus", ?error, tx = %tx_id,
-                        "[build] transaction commit failed; refusing consensus ledger");
-                    return None;
-                }
                 if let Err(error) = tx_parent.into_table().apply(&mut accum) {
                     tracing::error!(target: "consensus", ?error, tx = %tx_id,
                         "[build] transaction accumulator commit failed; refusing consensus ledger");
@@ -1183,6 +1258,24 @@ pub fn build_ledger_from_consensus(
                     tracing::error!(target: "consensus", ?error, tx = %tx_id,
                         "[build] transaction-map commit failed; refusing consensus ledger");
                     return None;
+                }
+                for inner in outcome.applied_batch_inner_transactions {
+                    let inner_tx_id = inner.transaction.get_transaction_id();
+                    let mut inner_meta = inner.metadata;
+                    let mut inner_metadata = protocol::Serializer::default();
+                    inner_meta.add_raw(&mut inner_metadata, inner.result, accum.tx_count() as u32);
+                    if let Err(error) = accum.raw_tx_insert(
+                        inner_tx_id,
+                        Arc::new(protocol::Serializer::from_bytes(
+                            inner.transaction.get_serializer().data(),
+                        )),
+                        Some(Arc::new(inner_metadata)),
+                    ) {
+                        tracing::error!(target: "consensus", ?error, tx = %inner_tx_id,
+                            parent_batch = %tx_id,
+                            "[build] inner Batch transaction-map commit failed; refusing consensus ledger");
+                        return None;
+                    }
                 }
             }
             Ok(outcome) => {

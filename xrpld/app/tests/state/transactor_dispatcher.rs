@@ -1389,7 +1389,10 @@ fn testnet_20214054_clawback_and_account_set_match_canonical_metadata_bytes() {
     let mut ledger = ledger_with_header(
         LedgerHeader {
             seq: 20_214_053,
-            parent_close_time: 840_995_000,
+            close_time: 840_995_000,
+            parent_close_time: 840_994_992,
+            close_time_resolution: 10,
+            drops: 99_999_892_391_774_847,
             ..LedgerHeader::default()
         },
         entries,
@@ -1424,16 +1427,48 @@ fn testnet_20214054_clawback_and_account_set_match_canonical_metadata_bytes() {
             &bytes,
         ))));
     }
+    let ordered_consensus = consensus_set.drain_ordered();
     assert_eq!(
-        consensus_set
-            .drain_ordered()
-            .into_iter()
+        ordered_consensus
+            .iter()
             .map(|tx| tx.get_transaction_id().to_string())
             .collect::<Vec<_>>(),
         vec![
             "94242075DCF7A53C4E18BC77E0D9BFDCAE8A3E44DC8B1D69C9BCC5E89F053948",
             "04C55F5F2E4A36BFAB72C5E40DFB0E045B85DA38DE415A48500D66CAE87FA652",
         ],
+    );
+
+    let consensus_items = ordered_consensus
+        .iter()
+        .map(|tx| (tx.get_serializer().data().to_vec(), tx.get_transaction_id()))
+        .collect::<Vec<_>>();
+    let built = app::build_ledger_from_consensus(
+        &ledger,
+        LedgerHeader {
+            seq: 20_214_054,
+            close_time: 840_995_001,
+            parent_close_time: 840_995_000,
+            close_time_resolution: 10,
+            // Consensus applies the set using its salted CanonicalTXSet key.
+            // This is the captured set hash, not the finished ledger's
+            // TransactionMd root (which the builder computes below).
+            tx_hash: basics::sha_map_hash::SHAMapHash::new(
+                Uint256::from_hex(
+                    "B92A28C0FC4EFC0AFDE393433767CE38706845907C251659F98819EEA0C7C60F",
+                )
+                .expect("consensus set hash"),
+            ),
+            ..LedgerHeader::default()
+        },
+        &consensus_items,
+        None,
+    )
+    .expect("the real consensus builder must accept the ordered canonical transaction set");
+    assert_eq!(
+        built.header().tx_hash.to_string(),
+        "31124D868654B96DE2C2736388543436A0E1BEDFACBF8E6BB08CF9650083D71C",
+        "the real builder must preserve rippled metadata and multi-transaction ordering"
     );
 
     let mut parent = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
@@ -1455,7 +1490,7 @@ fn testnet_20214054_clawback_and_account_set_match_canonical_metadata_bytes() {
             apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, tx_type);
         assert_eq!(result, Ter::TES_SUCCESS);
         let mut meta = delta
-            .to_tx_meta(tx_id, 20_214_054, delivered, &rules)
+            .apply_with_tx_meta(tx_id, 20_214_054, delivered, None, &rules)
             .expect("canonical metadata");
         let mut serializer = Serializer::default();
         meta.add_raw(&mut serializer, result, index);
@@ -1463,9 +1498,6 @@ fn testnet_20214054_clawback_and_account_set_match_canonical_metadata_bytes() {
             serializer.data(),
             str_unhex(expected_meta).expect("canonical metadata hex")
         );
-        delta
-            .apply_with_tx_thread(tx_id, 20_214_054, &rules)
-            .expect("commit canonical transaction");
     }
 
     let mut canonical_tx_map = Ledger::new(LedgerHeader::default(), false);
@@ -1547,7 +1579,10 @@ fn testnet_20219759_clawback_matches_canonical_metadata_bytes() {
     let mut ledger = ledger_with_header(
         LedgerHeader {
             seq: 20_219_758,
-            parent_close_time: 841_013_010,
+            close_time: 841_013_010,
+            parent_close_time: 841_013_003,
+            close_time_resolution: 10,
+            drops: 99_999_892_353_005_477,
             ..LedgerHeader::default()
         },
         vec![issuer_root, holder_root, trust],
@@ -1560,6 +1595,24 @@ fn testnet_20219759_clawback_matches_canonical_metadata_bytes() {
     let tx_bytes = str_unhex("12001E2200000000240134876C201B0134878261D4D1C37937E08000000000000000000000000000555344000000000092D2B62E80BEFDD73B03638F7B722B7578C1453368400000000000000C7321ED01CF43D87AE5694196F7F21C4EF71675CB820AD687EB40685F4FCCA623D2C6907440D313567184810DEE900C439254C9E57C7AC4FE022EE76EB6A0137C54A8620339DC064121D45788B222EC44D9CAAC63B8577E1DEE74B2CA08405C198FD1C0330181143AA6F1A49777A27F91A46566E18D1B89B4D08EDE").unwrap();
     let tx = STTx::from_serial_iter(&mut SerialIter::new(&tx_bytes));
     let tx_id = tx.get_transaction_id();
+    let built = app::build_ledger_from_consensus(
+        &ledger,
+        LedgerHeader {
+            seq: 20_219_759,
+            close_time: 841_013_011,
+            parent_close_time: 841_013_010,
+            close_time_resolution: 10,
+            ..LedgerHeader::default()
+        },
+        &[(tx_bytes.clone(), tx_id)],
+        None,
+    )
+    .expect("the real consensus builder must accept the canonical Clawback fixture");
+    assert_eq!(
+        built.header().tx_hash.to_string(),
+        "1DFAEFEE57042B2B8C427D1AC975FD298BB187E6C4967E7A5263CE2A14616EB7",
+        "the real consensus builder must reproduce rippled's canonical TransactionMd root"
+    );
     let mut parent = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let rules = parent.rules();
     let mut delta = ledger::FlowSandbox::new(&mut parent);
@@ -1567,7 +1620,7 @@ fn testnet_20219759_clawback_matches_canonical_metadata_bytes() {
         apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, TxType::CLAWBACK);
     assert_eq!(result, Ter::TES_SUCCESS);
     let mut meta = delta
-        .to_tx_meta(tx_id, 20_219_759, delivered, &rules)
+        .apply_with_tx_meta(tx_id, 20_219_759, delivered, None, &rules)
         .expect("canonical metadata");
     let mut serializer = Serializer::default();
     meta.add_raw(&mut serializer, result, 0);
@@ -1617,7 +1670,7 @@ fn testnet_20208302_ticket_create_matches_canonical_metadata_bytes() {
         apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, TxType::TICKET_CREATE);
     assert_eq!(result, Ter::TES_SUCCESS);
     let mut meta = delta
-        .to_tx_meta(tx_id, 20_208_302, delivered, &rules)
+        .apply_with_tx_meta(tx_id, 20_208_302, delivered, None, &rules)
         .expect("canonical metadata");
     let mut serializer = Serializer::default();
     meta.add_raw(&mut serializer, result, 2);
@@ -1674,7 +1727,7 @@ fn testnet_20207451_mpt_escrow_finish_matches_canonical_metadata_bytes() {
         apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, TxType::ESCROW_FINISH);
     assert_eq!(result, Ter::TES_SUCCESS);
     let mut meta = delta
-        .to_tx_meta(tx_id, 20_207_451, delivered, &rules)
+        .apply_with_tx_meta(tx_id, 20_207_451, delivered, None, &rules)
         .expect("canonical metadata");
     let mut serializer = Serializer::default();
     meta.add_raw(&mut serializer, result, 3);
@@ -1715,7 +1768,7 @@ fn testnet_20207451_ticket_payment_matches_canonical_metadata_bytes() {
         apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, TxType::PAYMENT);
     assert_eq!(result, Ter::TES_SUCCESS);
     let mut meta = delta
-        .to_tx_meta(tx_id, 20_207_451, delivered, &rules)
+        .apply_with_tx_meta(tx_id, 20_207_451, delivered, None, &rules)
         .expect("canonical metadata");
     let mut serializer = Serializer::default();
     meta.add_raw(&mut serializer, result, 2);
@@ -1756,7 +1809,7 @@ fn testnet_20207451_offer_cancel_matches_canonical_metadata_bytes() {
         apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, TxType::OFFER_CANCEL);
     assert_eq!(result, Ter::TES_SUCCESS);
     let mut meta = delta
-        .to_tx_meta(tx_id, 20_207_451, delivered, &rules)
+        .apply_with_tx_meta(tx_id, 20_207_451, delivered, None, &rules)
         .expect("canonical metadata");
     let mut serializer = Serializer::default();
     meta.add_raw(&mut serializer, result, 0);

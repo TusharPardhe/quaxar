@@ -5,6 +5,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use basics::{base_uint::Uint256, str_hex::str_hex, string_utilities::to_uint64};
+use ledger::ReadView;
 use protocol::tokens::decode_base58_token_multibyte;
 use protocol::{
     JsonOptions, JsonValue, KeyType, LedgerEntryType, LedgerFormats, PublicKey, STArray, STObject,
@@ -602,7 +603,9 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
     if let Some(ledger) = ctx.runtime.current_ledger_for_simulation() {
         let ledger_seq = ledger.header().seq;
         let close_time = ledger.header().close_time;
-        let mut view = ledger::ApplyViewImpl::new(Arc::clone(&ledger), tx::ApplyFlags::NONE);
+        let mut parent = ledger::ApplyViewImpl::new(Arc::clone(&ledger), tx::ApplyFlags::NONE);
+        let rules = parent.rules();
+        let mut view = ledger::FlowSandbox::new_with_flags(&mut parent, tx::ApplyFlags::DRY_RUN);
         // Minimal RPC runtimes have no ApplicationRoot/TxQ owner. Keep their
         // fallback on the app-level canonical dry-run boundary.
         let (result, delivered_amount) =
@@ -640,9 +643,19 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
         // Build one typed metadata object from the actual dry-run changes.
         // JSON and binary simulation responses must render the same metadata.
         if is_tes_success(result) || protocol::is_tec_claim(result) {
-            let mut transaction_meta =
-                view.table()
-                    .to_tx_meta(tx.get_transaction_id(), ledger_seq, delivered_amount);
+            let mut transaction_meta = view
+                .to_tx_meta(
+                    tx.get_transaction_id(),
+                    ledger_seq,
+                    delivered_amount,
+                    &rules,
+                )
+                .map_err(|error| {
+                    Status::with_message(
+                        RpcErrorCode::Internal,
+                        format!("simulation metadata failed: {error:?}"),
+                    )
+                })?;
             let mut serializer = Serializer::default();
             transaction_meta.add_raw(&mut serializer, result, 0);
 
