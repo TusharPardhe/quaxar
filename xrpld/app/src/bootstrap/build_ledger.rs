@@ -1126,8 +1126,12 @@ pub fn build_ledger_from_consensus(
             continue;
         }
 
-        let base = Arc::new(accum.clone());
-        let mut view = ledger::Sandbox::new(base, protocol::ApplyFlags::default());
+        // Keep the transaction's mutable parent separate from the cumulative
+        // OpenView so FlowSandbox can reproduce rippled's single ordered
+        // metadata/threading pass before that delta is committed.
+        let mut tx_parent =
+            ledger::ApplyViewImpl::new(Arc::new(accum.clone()), protocol::ApplyFlags::default());
+        let mut view = ledger::FlowSandbox::new(&mut tx_parent);
         let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
                 &mut view,
@@ -1148,12 +1152,23 @@ pub fn build_ledger_from_consensus(
                 // the same cumulative OpenView. Without this insertion a
                 // later child cannot recognize a parent-accepted transaction
                 // and replays it into already-threaded state.
-                let mut meta = view.table().to_tx_meta(tx_id, header.seq, delivered_amount);
                 let rules = built.rules().clone();
-                if let Err(error) = view.apply_with_tx_thread(&mut accum, tx_id, header.seq, &rules)
-                {
+                let mut meta = match view.to_tx_meta(tx_id, header.seq, delivered_amount, &rules) {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        tracing::error!(target: "consensus", ?error, tx = %tx_id,
+                            "[build] transaction metadata failed; refusing consensus ledger");
+                        return None;
+                    }
+                };
+                if let Err(error) = view.apply_with_tx_thread(tx_id, header.seq, &rules) {
                     tracing::error!(target: "consensus", ?error, tx = %tx_id,
                         "[build] transaction commit failed; refusing consensus ledger");
+                    return None;
+                }
+                if let Err(error) = tx_parent.into_table().apply(&mut accum) {
+                    tracing::error!(target: "consensus", ?error, tx = %tx_id,
+                        "[build] transaction accumulator commit failed; refusing consensus ledger");
                     return None;
                 }
                 let mut metadata = protocol::Serializer::default();

@@ -18,8 +18,8 @@ use protocol::{
     SerialIter, Serializer, StBase, Ter, TxMeta, TxType, XRPAmount, account_keylet,
     amm_lpt_currency, currency_from_string, get_field_by_symbol, line, lsfAllowTrustLineClawback,
     lsfDefaultRipple, lsfDisableMaster, lsfLoanImpaired, lsfLowDeepFreeze, owner_dir_keylet,
-    permissioned_domain_keylet, sf_generic, signers_keylet, tfLoanDefault, tfLoanImpair,
-    tfLoanUnimpair, xrp_issue,
+    parse_base58_account_id, permissioned_domain_keylet, sf_generic, signers_keylet, tfLoanDefault,
+    tfLoanImpair, tfLoanUnimpair, xrp_issue,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -1493,6 +1493,87 @@ fn testnet_20214054_clawback_and_account_set_match_canonical_metadata_bytes() {
             .to_string(),
         "31124D868654B96DE2C2736388543436A0E1BEDFACBF8E6BB08CF9650083D71C",
         "canonical transaction leaves must reproduce rippled's transaction root"
+    );
+}
+
+#[test]
+fn testnet_20219759_clawback_matches_canonical_metadata_bytes() {
+    let issuer = parse_base58_account_id("raM3BbP2mc6tJYcFR3GoteRFFGgnjr8nML").unwrap();
+    let holder = parse_base58_account_id("rNPLnWXmPyFbreFqyqeRNUjeotVz8nLHhb").unwrap();
+    let previous_tx =
+        Uint256::from_hex("68A1453266C33CE029204BFAF1C666FC1C5530398E5DF967B3BE204F50824136")
+            .unwrap();
+
+    let mut issuer_root = STLedgerEntry::from_type_and_key(
+        LedgerEntryType::AccountRoot,
+        account_keylet(raw_account_id(issuer)).key,
+    );
+    issuer_root.set_account_id(sf("sfAccount"), issuer);
+    issuer_root.set_field_amount(sf("sfBalance"), test_xrp(99_999_964));
+    issuer_root.set_field_u32(sf("sfFlags"), 2_155_872_256);
+    issuer_root.set_field_u32(sf("sfOwnerCount"), 0);
+    issuer_root.set_field_u32(sf("sfSequence"), 20_219_756);
+    issuer_root.set_field_h256(sf("sfPreviousTxnID"), previous_tx);
+    issuer_root.set_field_u32(sf("sfPreviousTxnLgrSeq"), 20_219_758);
+
+    let mut holder_root = STLedgerEntry::from_type_and_key(
+        LedgerEntryType::AccountRoot,
+        account_keylet(raw_account_id(holder)).key,
+    );
+    holder_root.set_account_id(sf("sfAccount"), holder);
+    holder_root.set_field_amount(sf("sfBalance"), test_xrp(100_000_000));
+    holder_root.set_field_u32(sf("sfOwnerCount"), 1);
+    holder_root.set_field_u32(sf("sfSequence"), 20_219_700);
+
+    let currency = currency_from_string("USD");
+    let line_keylet = line(issuer, holder, currency);
+    let iou = |mantissa, exponent, account| {
+        STAmount::from_iou_amount(
+            sf_generic(),
+            IOUAmount::from_parts(mantissa, exponent).unwrap(),
+            Issue::new(currency, account),
+        )
+    };
+    let mut trust = STLedgerEntry::from_type_and_key(LedgerEntryType::RippleState, line_keylet.key);
+    trust.set_field_amount(sf("sfBalance"), iou(-50, 0, protocol::no_account()));
+    trust.set_field_amount(sf("sfLowLimit"), iou(0, 0, issuer));
+    trust.set_field_amount(sf("sfHighLimit"), iou(9_999_999_999_999_990, -1, holder));
+    trust.set_field_u64(sf("sfLowNode"), 0);
+    trust.set_field_u64(sf("sfHighNode"), 0);
+    trust.set_field_u32(sf("sfFlags"), 131_072);
+    trust.set_field_h256(sf("sfPreviousTxnID"), previous_tx);
+    trust.set_field_u32(sf("sfPreviousTxnLgrSeq"), 20_219_758);
+
+    let mut ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 20_219_758,
+            parent_close_time: 841_013_010,
+            ..LedgerHeader::default()
+        },
+        vec![issuer_root, holder_root, trust],
+    );
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("Clawback"),
+        protocol::fix_previous_txn_id(),
+    ]));
+
+    let tx_bytes = str_unhex("12001E2200000000240134876C201B0134878261D4D1C37937E08000000000000000000000000000555344000000000092D2B62E80BEFDD73B03638F7B722B7578C1453368400000000000000C7321ED01CF43D87AE5694196F7F21C4EF71675CB820AD687EB40685F4FCCA623D2C6907440D313567184810DEE900C439254C9E57C7AC4FE022EE76EB6A0137C54A8620339DC064121D45788B222EC44D9CAAC63B8577E1DEE74B2CA08405C198FD1C0330181143AA6F1A49777A27F91A46566E18D1B89B4D08EDE").unwrap();
+    let tx = STTx::from_serial_iter(&mut SerialIter::new(&tx_bytes));
+    let tx_id = tx.get_transaction_id();
+    let mut parent = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let rules = parent.rules();
+    let mut delta = ledger::FlowSandbox::new(&mut parent);
+    let (result, delivered) =
+        apply_submit_transactor_shell_with_delivered_amount(&mut delta, &tx, TxType::CLAWBACK);
+    assert_eq!(result, Ter::TES_SUCCESS);
+    let mut meta = delta
+        .to_tx_meta(tx_id, 20_219_759, delivered, &rules)
+        .expect("canonical metadata");
+    let mut serializer = Serializer::default();
+    meta.add_raw(&mut serializer, result, 0);
+    assert_eq!(
+        serializer.data(),
+        str_unhex("201C00000000F8E5110072250134876E5568A1453266C33CE029204BFAF1C666FC1C5530398E5DF967B3BE204F508241365650B6E988397060423A07F149EECC15B3D08BDDB37FA037B4550CC55BFA49141AE66294D1C37937E0800000000000000000000000000055534400000000000000000000000000000000000000000000000001E1E722000200003700000000000000003800000000000000006280000000000000000000000000000000000000005553440000000000000000000000000000000000000000000000000166800000000000000000000000000000000000000055534400000000003AA6F1A49777A27F91A46566E18D1B89B4D08EDE67D82386F26FC0FFF6000000000000000000000000555344000000000092D2B62E80BEFDD73B03638F7B722B7578C14533E1E1E5110061250134876E5568A1453266C33CE029204BFAF1C666FC1C5530398E5DF967B3BE204F50824136568BC96739F2D895D760BB26775D8049A1D6EFEF583A7390DAD39050F569DF5E81E6240134876C624000000005F5E0DCE1E72280800000240134876D2D00000000624000000005F5E0D081143AA6F1A49777A27F91A46566E18D1B89B4D08EDEE1E1F1031000").unwrap()
     );
 }
 
