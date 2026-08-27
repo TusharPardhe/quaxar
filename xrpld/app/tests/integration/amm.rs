@@ -418,6 +418,38 @@ fn amm_create_two_different_ious() {
     );
     let result = full_apply(&mut view, &tx, TxType::AMM_CREATE);
     assert_eq!(result, Ter::TES_SUCCESS);
+
+    let usd = Issue::new(protocol::currency_from_string("USD"), gw);
+    let eur = Issue::new(protocol::currency_from_string("EUR"), gw);
+    let amm_key = protocol::keylet::amm(Asset::Issue(usd), Asset::Issue(eur));
+    let amm = view
+        .read(amm_key)
+        .expect("AMM read")
+        .expect("AMM should exist");
+    let amm_account = amm.get_account_id(sf("sfAccount"));
+    let lp_currency = protocol::amm_lpt_currency(usd.currency, eur.currency);
+    let lp_line = protocol::line(alice, amm_account, lp_currency).key;
+    let usd_line = protocol::line(amm_account, gw, usd.currency).key;
+    let eur_line = protocol::line(amm_account, gw, eur.currency).key;
+    let owner_dir = view
+        .read(protocol::owner_dir_keylet(acct_id(amm_account)))
+        .expect("AMM owner directory read")
+        .expect("AMM owner directory should exist");
+    let mut expected = vec![amm_key.key, lp_line, usd_line, eur_line];
+    expected.sort();
+    assert_eq!(
+        owner_dir.get_field_v256(sf("sfIndexes")).value(),
+        expected.as_slice(),
+        "all AMM-created owner objects must occupy the canonical sorted root page"
+    );
+    for key in [lp_line, usd_line, eur_line] {
+        let line = view
+            .read(protocol::Keylet::new(LedgerEntryType::RippleState, key))
+            .expect("AMM line read")
+            .expect("AMM line should exist");
+        assert_eq!(line.get_field_u64(sf("sfLowNode")), 0);
+        assert_eq!(line.get_field_u64(sf("sfHighNode")), 0);
+    }
 }
 
 /// C++ AMM_test — create pool then deposit more.
@@ -616,6 +648,13 @@ fn amm_withdraw_all_deletes_empty_pool_and_pseudo_account() {
         .expect("AMM read after create")
         .expect("AMM should exist after create");
     let amm_account = amm.get_account_id(sf("sfAccount"));
+    let lp_issue = amm.get_field_amount(sf("sfLPTokenBalance")).issue();
+    let lp_line = protocol::line(alice, amm_account, lp_issue.currency);
+    assert!(
+        view.read(lp_line)
+            .expect("LP trust line read after create")
+            .is_some()
+    );
 
     let withdraw = STTx::new(TxType::AMM_WITHDRAW, |tx| {
         tx.set_account_id(sf("sfAccount"), alice);
@@ -645,5 +684,11 @@ fn amm_withdraw_all_deletes_empty_pool_and_pseudo_account() {
         view.read(account_keylet(acct_id(amm_account)))
             .expect("AMM pseudo-account read after withdraw-all")
             .is_none()
+    );
+    assert!(
+        view.read(lp_line)
+            .expect("LP trust line read after withdraw-all")
+            .is_none(),
+        "redeemIOU must delete the holder's default zero-balance LP trust line"
     );
 }

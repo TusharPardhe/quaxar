@@ -59,7 +59,7 @@ pub fn run_mp_token_issuance_destroy_do_apply<S: MPTokenIssuanceDestroyApplySink
         return Ter::TEF_BAD_LEDGER;
     }
 
-    sink.erase_issuance();
     sink.adjust_owner_count(-1);
+    sink.erase_issuance();
     Ter::TES_SUCCESS
 }

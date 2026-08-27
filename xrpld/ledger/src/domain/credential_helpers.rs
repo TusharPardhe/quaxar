@@ -184,13 +184,19 @@ pub fn delete_sle(
 
 /// Validates the `sfCredentialIDs` field on a transaction (preflight check).
 ///
-pub fn check_fields(tx: &STTx) -> Ter {
+pub fn check_fields(tx: &STTx, rules: &protocol::Rules) -> Ter {
     if !tx.is_field_present(sf("sfCredentialIDs")) {
         return Ter::TES_SUCCESS;
     }
 
     let credentials = tx.get_field_v256(sf("sfCredentialIDs"));
     if credentials.value().is_empty() || credentials.value().len() > MAX_CREDENTIALS_ARRAY_SIZE {
+        return Ter::TEM_MALFORMED;
+    }
+
+    if rules.enabled(&protocol::fix_cleanup_3_4_0())
+        && credentials.value().iter().any(Uint256::is_zero)
+    {
         return Ter::TEM_MALFORMED;
     }
 
@@ -214,6 +220,9 @@ pub fn valid(view: &dyn ReadView, tx: &STTx, src: &AccountID) -> Result<Ter, Vie
 
     let cred_ids = tx.get_field_v256(sf("sfCredentialIDs"));
     for h in cred_ids.value() {
+        if view.rules().enabled(&protocol::fix_cleanup_3_4_0()) && h.is_zero() {
+            return Ok(Ter::TEC_INTERNAL);
+        }
         let Some(sle_cred) = view.read(credential_keylet_from_key(*h))? else {
             return Ok(Ter::TEC_BAD_CREDENTIALS);
         };
@@ -412,23 +421,22 @@ pub fn verify_valid_domain(
     })
 }
 
-/// Verifies deposit preauth with credential expiration handling.
+/// Removes expired credentials referenced by a transaction.
 ///
-pub fn verify_deposit_preauth(
-    tx: &STTx,
-    view: &mut dyn ApplyView,
-    src: &AccountID,
-    dst: &AccountID,
-    sle_dst: Option<&STLedgerEntry>,
-) -> Result<Ter, ViewError> {
-    let credentials_present = tx.is_field_present(sf("sfCredentialIDs"));
-
-    if credentials_present {
+/// This is the ApplyView half of rippled's `cleanupExpiredCredentials`.
+/// Preclaim has already validated the credential identifiers, so missing
+/// entries are ignored here; expired entries are removed even though the
+/// transaction returns `tecEXPIRED`.
+pub fn cleanup_expired_credentials(tx: &STTx, view: &mut dyn ApplyView) -> Result<Ter, ViewError> {
+    if tx.is_field_present(sf("sfCredentialIDs")) {
         let cred_ids = tx.get_field_v256(sf("sfCredentialIDs"));
         let close_time = view.header().parent_close_time;
         let mut found_expired = false;
 
         for h in cred_ids.value() {
+            if view.rules().enabled(&protocol::fix_cleanup_3_4_0()) && h.is_zero() {
+                return Ok(Ter::TEC_INTERNAL);
+            }
             if let Some(sle_cred) = view.peek(credential_keylet_from_key(*h))?
                 && check_expired(&sle_cred, close_time)
             {
@@ -448,6 +456,25 @@ pub fn verify_deposit_preauth(
             return Ok(Ter::TEC_EXPIRED);
         }
     }
+
+    Ok(Ter::TES_SUCCESS)
+}
+
+/// Verifies deposit preauth with credential expiration handling.
+///
+pub fn verify_deposit_preauth(
+    tx: &STTx,
+    view: &mut dyn ApplyView,
+    src: &AccountID,
+    dst: &AccountID,
+    sle_dst: Option<&STLedgerEntry>,
+) -> Result<Ter, ViewError> {
+    let cleanup = cleanup_expired_credentials(tx, view)?;
+    if !protocol::is_tes_success(cleanup) {
+        return Ok(cleanup);
+    }
+
+    let credentials_present = tx.is_field_present(sf("sfCredentialIDs"));
 
     if let Some(dst_sle) = sle_dst
         && dst_sle.is_flag(lsfDepositAuth)

@@ -1062,7 +1062,7 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
                 style: SOEStyle::Optional,
             },
             LedgerFormatFieldSpec {
-                field_symbol: "sfMutableFlags",
+                field_symbol: "sfImmutableFlags",
                 style: SOEStyle::Default,
             },
             LedgerFormatFieldSpec {
@@ -1288,6 +1288,10 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             LedgerFormatFieldSpec {
                 field_symbol: "sfOwnerNode",
                 style: SOEStyle::Required,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfDestinationNode",
+                style: SOEStyle::Optional,
             },
             LedgerFormatFieldSpec {
                 field_symbol: "sfPreviousTxnID",

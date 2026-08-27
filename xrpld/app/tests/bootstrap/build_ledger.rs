@@ -1,4 +1,9 @@
-use std::{cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeSet,
+    rc::Rc,
+    sync::Arc,
+};
 
 use app::{
     BuildLedgerError, BuildLedgerJournal, BuildLedgerView, LedgerReplay, apply_transactions,
@@ -131,6 +136,31 @@ fn sample_parent_with_tx(seq: u32, tx_id: Uint256) -> Ledger {
     )
 }
 
+fn sample_parent_with_unreadable_tx_branch(seq: u32, tx_id: Uint256) -> Ledger {
+    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let branch = usize::from(tx_id.data()[0] >> 4);
+    tx_root.set_child_hash(
+        branch,
+        basics::sha_map_hash::SHAMapHash::new(Uint256::from_array([0xA5; 32])),
+    );
+    tx_root.update_hash_deep();
+
+    Ledger::from_maps(
+        LedgerHeader {
+            seq,
+            ..LedgerHeader::default()
+        },
+        SyncTree::new_with_type(SHAMapType::State, false, seq),
+        SyncTree::from_root_with_type(
+            tx_root,
+            SHAMapType::Transaction,
+            true,
+            seq,
+            SyncState::Immutable,
+        ),
+    )
+}
+
 fn canonical_set(txs: impl IntoIterator<Item = Arc<STTx>>) -> CanonicalTXSet {
     let mut set = CanonicalTXSet::new(Uint256::from_array([0x55; 32]));
     for tx in txs {
@@ -210,6 +240,32 @@ fn build_ledger_apply_transactions_skips_existing_tx_on_first_pass() {
     assert_eq!(*apply_calls.borrow(), 0);
     assert!(txns.is_empty());
     assert!(failed.is_empty());
+}
+
+#[test]
+fn build_ledger_apply_transactions_rejects_unreadable_parent_tx_branch() {
+    let candidate = sample_tx(1);
+    let built = sample_parent_with_unreadable_tx_branch(10, candidate.get_transaction_id());
+    let mut txns = canonical_set([candidate]);
+    let mut failed = BTreeSet::new();
+    let mut view = StubBuildView::closed(Rc::new(RefCell::new(Vec::new())));
+    let apply_calls = Cell::new(0usize);
+
+    let applied = apply_transactions(
+        &built,
+        &mut txns,
+        &mut failed,
+        &mut view,
+        &RecordingJournal::default(),
+        &mut |_view, _tx, _retry, _flags| -> Result<ApplyTransactionResult, &'static str> {
+            apply_calls.set(apply_calls.get() + 1);
+            Ok(ApplyTransactionResult::Success)
+        },
+    );
+
+    assert_eq!(applied, 0);
+    assert_eq!(apply_calls.get(), 0);
+    assert_eq!(failed, BTreeSet::from([sample_tx(1).get_transaction_id()]));
 }
 
 #[test]
@@ -318,6 +374,72 @@ fn build_ledger_apply_transactions_routes_success_fail_retry_and_throw() {
             throwing.get_transaction_id()
         )]
     );
+}
+
+#[test]
+fn build_ledger_retry_pass_resolves_a_canonical_order_dependency() {
+    // BuildLedger.cpp::applyTransactions does not permanently discard a
+    // retryable transaction merely because its dependency sorts later in the
+    // canonical set. The later transaction changes the accumulator and the
+    // earlier one succeeds on the next TapRetry pass.
+    let left = sample_tx(1);
+    // Build the second transaction with its final fields. `STTx` caches its
+    // transaction ID, so cloning an already-hashed transaction and mutating
+    // sfAccount would leave both fixtures carrying the same cached ID. That
+    // makes the test classify both entries as the blocked transaction and
+    // never execute the unlocker.
+    let right = Arc::new(STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), account(0x33));
+        tx.set_account_id(get_field_by_symbol("sfDestination"), account(0x22));
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::new_native(1_000_001, false),
+        );
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+    }));
+    let probe = canonical_set([Arc::clone(&left), Arc::clone(&right)]);
+    let ordered = probe.iter().cloned().collect::<Vec<_>>();
+    let blocked_id = ordered[0].get_transaction_id();
+    let unlocker_id = ordered[1].get_transaction_id();
+
+    let built = sample_parent_ledger(21);
+    let mut txns = canonical_set([left, right]);
+    let mut failed = BTreeSet::new();
+    let mut view = StubBuildView::closed(Rc::new(RefCell::new(Vec::new())));
+    let unlocked = Cell::new(false);
+    let blocked_calls = Cell::new(0usize);
+
+    let applied = apply_transactions(
+        &built,
+        &mut txns,
+        &mut failed,
+        &mut view,
+        &RecordingJournal::default(),
+        &mut |view, tx, retry_assured, _flags| -> Result<ApplyTransactionResult, &'static str> {
+            let tx_id = tx.get_transaction_id();
+            if tx_id == blocked_id {
+                blocked_calls.set(blocked_calls.get() + 1);
+                if !unlocked.get() {
+                    assert!(retry_assured);
+                    return Ok(ApplyTransactionResult::Retry);
+                }
+            } else if tx_id == unlocker_id {
+                unlocked.set(true);
+            }
+            view.applied.push(tx_id);
+            Ok(ApplyTransactionResult::Success)
+        },
+    );
+
+    assert_eq!(applied, 2);
+    assert_eq!(blocked_calls.get(), 2);
+    assert!(txns.is_empty());
+    assert!(failed.is_empty());
+    assert_eq!(view.applied, vec![unlocker_id, blocked_id]);
 }
 
 #[test]

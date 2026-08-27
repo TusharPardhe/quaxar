@@ -1,8 +1,11 @@
-//! Regression tests for all 41 ledger mismatches from ledgers 104115399–104115992.
+//! Archived mismatch-data validator for ledgers 104115399–104115877.
 //!
-//! Each test case is a real transaction from the XRPL mainnet that our node
-//! produced the wrong TER for. The expected TER is what C++ (the validated
-//! ledger) produced. Tests are grouped by root cause.
+//! This file contains 31 abbreviated historical observations. It does **not**
+//! contain serialized transactions or their pre-ledger state, so it cannot
+//! execute the transactions or establish that a parity defect is fixed. The
+//! tests below validate only the integrity and categorization of this archive.
+//! Executable parity belongs in fixtures that reconstruct the complete pinned
+//! rippled prestate and compare TER, metadata, state root, and transaction root.
 //!
 //! Root causes:
 //!   P0  - tecDIR_FULL: directory chain find_previous_page fallback (306 txs)
@@ -11,10 +14,11 @@
 //!   P2  - IOC result shaping (51 tecKILLED→tesSUCCESS, 31 tecKILLED→tecUNFUNDED_OFFER)
 //!   P3  - tefBAD_LEDGER for passive OfferCreate (8 txs)
 //!   P4  - tecNO_DST / tecNO_DST_INSUF_XRP false positives (12 txs)
-//!   P5  - EscrowFinish IOU missing tecLIMIT_EXCEEDED check (5 txs)
 //!   P6  - tesSUCCESS when should be tecUNFUNDED_PAYMENT/OFFER/RESERVE (4 txs)
+//!   P7  - tecNO_LINE_REDUNDANT false positive (1 tx)
 //!
-//! Run with: cargo test -p app --test mismatch_regression -- --nocapture
+//! No P5 observation is present in the archived rows; the earlier claim that
+//! this file covered 41 mismatches including P5 was unsupported by its data.
 
 /// A single mismatch test case.
 #[derive(Debug)]
@@ -36,7 +40,7 @@ struct MismatchCase {
     cause: &'static str,
 }
 
-/// All 41 representative mismatch cases (one per distinct root cause instance).
+/// The 31 archived representative observations available in this source file.
 const CASES: &[MismatchCase] = &[
     // ── P0: tecDIR_FULL (306 total) ──────────────────────────────────────────
     MismatchCase {
@@ -331,8 +335,7 @@ const CASES: &[MismatchCase] = &[
     },
 ];
 
-/// Print a summary of all cases grouped by cause.
-/// Run with: cargo test -p app --test mismatch_regression summary -- --nocapture
+/// Print the archived observations grouped by cause.
 #[test]
 fn summary() {
     use std::collections::BTreeMap;
@@ -341,7 +344,7 @@ fn summary() {
         by_cause.entry(c.cause).or_default().push(c);
     }
     println!(
-        "\n=== Mismatch Regression Cases ({} total) ===",
+        "\n=== Archived Mismatch Observations ({} total) ===",
         CASES.len()
     );
     for (cause, cases) in &by_cause {
@@ -354,6 +357,43 @@ fn summary() {
         }
     }
     println!();
+}
+
+#[test]
+fn archived_manifest_is_internally_consistent() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    assert_eq!(CASES.len(), 31, "the archive contains exactly 31 rows");
+    let mut identities = BTreeSet::new();
+    let mut counts = BTreeMap::new();
+    for case in CASES {
+        assert!(
+            identities.insert((case.seq, case.txid)),
+            "duplicate archived identity: {}:{}",
+            case.seq,
+            case.txid
+        );
+        assert_eq!(case.txid.len(), 8, "archive stores an 8-hex hash prefix");
+        assert!(case.txid.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(
+            case.our_ter, case.ter,
+            "an archived mismatch must record differing outcomes"
+        );
+        *counts.entry(case.cause).or_insert(0usize) += 1;
+    }
+    assert_eq!(counts.get("P0_dir_full"), Some(&3));
+    assert_eq!(counts.get("P1a_unfunded_offer_flow_engine"), Some(&3));
+    assert_eq!(counts.get("P1b_flow_engine_path_dry"), Some(&3));
+    assert_eq!(counts.get("P1b_flow_engine_path_dry_vs_partial"), Some(&3));
+    assert_eq!(counts.get("P1b_flow_engine_over_delivers"), Some(&1));
+    assert_eq!(counts.get("P2_ioc_killed"), Some(&3));
+    assert_eq!(counts.get("P2_ioc_killed_vs_unfunded"), Some(&2));
+    assert_eq!(counts.get("P3_tef_bad_ledger_passive"), Some(&3));
+    assert_eq!(counts.get("P4_no_dst_false_positive"), Some(&3));
+    assert_eq!(counts.get("P4_no_dst_insuf_xrp_false_positive"), Some(&2));
+    assert_eq!(counts.get("P6_success_when_should_fail"), Some(&4));
+    assert_eq!(counts.get("P7_no_line_redundant_false_positive"), Some(&1));
+    assert!(!counts.keys().any(|cause| cause.starts_with("P5")));
 }
 
 // ── P0: tecDIR_FULL ──────────────────────────────────────────────────────────
@@ -731,10 +771,8 @@ fn p7_no_line_redundant_104115668_641cf153() {
 
 // ── assertion helper ─────────────────────────────────────────────────────────
 
-/// Assert that a mismatch case is documented correctly in CASES.
-/// This validates the test data itself — the txid, our_ter, and ter
-/// must match an entry in CASES. When the fix is applied, the test should
-/// be updated to assert our_ter == ter.
+/// Validate one archived row. This is deliberately a data-integrity check,
+/// not an execution or parity assertion; the archive lacks replay inputs.
 fn assert_case(txid: &str, expected_our: &str, expected_cpp: &str, expected_cause: &str) {
     let case = CASES.iter().find(|c| c.txid == txid);
     let case = case.unwrap_or_else(|| {

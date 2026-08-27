@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use app::state::application_root::{
-    apply_submit_transactor_shell, apply_submit_transactor_shell_with_delivered_amount,
+    apply_simulated_transaction, apply_submit_transactor_shell,
+    apply_submit_transactor_shell_with_delivered_amount,
 };
 use app::state::lending::calculate_loan_pay_base_fee;
 use app::state::transactor_dispatcher::handle_real_dispatch;
@@ -27,13 +28,26 @@ use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::SHAMapNodeType;
 use tx::{
     LSF_ONE_OWNER_COUNT, MPT_CAN_ESCROW_FLAG, MPT_CAN_TRADE_FLAG, MPT_CAN_TRANSFER_FLAG,
-    VAULT_PRIVATE_FLAG,
+    MPTokenIssuanceCreatePreflightFacts, VAULT_PRIVATE_FLAG,
+    run_mp_token_issuance_create_preflight,
 };
 
 use sha2::{Digest, Sha256};
 
 fn sample_account(fill: u8) -> AccountID {
     AccountID::from_array([fill; 20])
+}
+
+fn dispatch_with_pre_fee_balance<V: ApplyView>(view: &mut V, tx: &STTx, tx_type: TxType) -> Ter {
+    let account = tx.get_account_id(sf("sfAccount"));
+    let balance = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("fixture AccountRoot read")
+        .expect("fixture source AccountRoot")
+        .get_field_amount(sf("sfBalance"))
+        .xrp()
+        .drops();
+    handle_real_dispatch(view, tx, tx_type, Some(balance))
 }
 
 #[test]
@@ -136,6 +150,33 @@ fn account_set_production_apply_matches_canonical_field_and_irreversible_flag_ru
         .expect("read")
         .expect("account");
     assert_eq!(root.get_account_id(sf("sfNFTokenMinter")), minter);
+}
+
+#[test]
+fn did_set_reserve_uses_sponsored_account_base() {
+    let account = sample_account(0x34);
+    let sponsor = sample_account(0x35);
+    let mut root = account_root_with_balance(account, 0, 0, 100);
+    root.set_account_id(sf("sfSponsor"), sponsor);
+
+    let mut ledger = empty_ledger(vec![root]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 200,
+        increment: 50,
+    });
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("fixEmptyDID")]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::DID_SET, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_vl(sf("sfURI"), b"did:quaxar:sponsored");
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::DID_SET, Some(100)),
+        Ter::TES_SUCCESS,
+        "a sponsored AccountRoot owes one owner increment (50), not an account base plus increment (250)"
+    );
 }
 
 fn sample_uint256(fill: u8) -> Uint256 {
@@ -652,6 +693,21 @@ fn payment_tx(sequence: u32) -> STTx {
             STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
         );
         tx.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+    })
+}
+
+fn direct_xrp_payment_tx(
+    source: AccountID,
+    destination: AccountID,
+    amount_drops: i64,
+    fee_drops: i64,
+) -> STTx {
+    STTx::new(TxType::PAYMENT, move |tx| {
+        tx.set_account_id(sf("sfAccount"), source);
+        tx.set_account_id(sf("sfDestination"), destination);
+        tx.set_field_amount(sf("sfAmount"), test_xrp(amount_drops));
+        tx.set_field_amount(sf("sfFee"), test_xrp(fee_drops));
+        tx.set_field_u32(sf("sfSequence"), 1);
     })
 }
 
@@ -1227,65 +1283,76 @@ fn escrow_finish_mpt_cleanup_3_4_rounds_transfer_fee_down() {
     escrow.set_field_u32(sf("sfTransferRate"), 1_001_000_000);
     escrow.set_field_u64(sf("sfOwnerNode"), 0);
 
-    let mut ledger = ledger_with_header(
-        LedgerHeader {
-            seq: 1,
-            drops: 100_000_000_000,
-            ..LedgerHeader::default()
-        },
-        vec![
-            account_root(owner, 1, 0),
-            account_root(destination, 0, 0),
-            account_root(issuer, 0, 0),
-            issuance,
-            owner_token,
-            mptoken_entry(destination, issuance_id, 0),
-            owner_dir_root(owner, escrow_keylet.key),
-            escrow,
-        ],
-    );
-    ledger.set_rules(protocol::Rules::new([
-        protocol::feature_id("fixTokenEscrowV1"),
-        protocol::feature_id("fixCleanup3_4_0"),
-    ]));
-    let tx = STTx::new(TxType::ESCROW_FINISH, |object| {
-        object.set_account_id(sf("sfAccount"), destination);
-        object.set_account_id(sf("sfOwner"), owner);
-        object.set_field_u32(sf("sfOfferSequence"), 1);
-        object.set_field_amount(sf("sfFee"), test_xrp(10));
-        object.set_field_u32(sf("sfSequence"), 1);
-    });
+    for (cleanup_3_4, expected_delivered, expected_outstanding) in
+        [(false, 9_991, 99_991), (true, 9_990, 99_990)]
+    {
+        let mut ledger = ledger_with_header(
+            LedgerHeader {
+                seq: 1,
+                drops: 100_000_000_000,
+                ..LedgerHeader::default()
+            },
+            vec![
+                account_root(owner, 1, 0),
+                account_root(destination, 0, 0),
+                account_root(issuer, 0, 0),
+                issuance.clone(),
+                owner_token.clone(),
+                mptoken_entry(destination, issuance_id, 0),
+                owner_dir_root(owner, escrow_keylet.key),
+                escrow.clone(),
+            ],
+        );
+        let mut features = vec![protocol::feature_id("fixTokenEscrowV1")];
+        if cleanup_3_4 {
+            features.push(protocol::feature_id("fixCleanup3_4_0"));
+        }
+        ledger.set_rules(protocol::Rules::new(features));
+        let tx = STTx::new(TxType::ESCROW_FINISH, |object| {
+            object.set_account_id(sf("sfAccount"), destination);
+            object.set_account_id(sf("sfOwner"), owner);
+            object.set_field_u32(sf("sfOfferSequence"), 1);
+            object.set_field_amount(sf("sfFee"), test_xrp(10));
+            object.set_field_u32(sf("sfSequence"), 1);
+        });
 
-    let mut view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
-    assert_eq!(
-        apply_submit_transactor_shell(&mut view, &tx, TxType::ESCROW_FINISH),
-        Ter::TES_SUCCESS
-    );
-    view.apply(&mut ledger).expect("escrow finish applies");
+        let mut view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+        assert_eq!(
+            apply_submit_transactor_shell(&mut view, &tx, TxType::ESCROW_FINISH),
+            Ter::TES_SUCCESS
+        );
+        view.apply(&mut ledger).expect("escrow finish applies");
 
-    let destination_token = ledger
-        .peek(protocol::mptoken_keylet_from_mptid(
-            issuance_id,
-            raw_account_id(destination),
-        ))
-        .expect("destination token read")
-        .expect("destination token");
-    assert_eq!(destination_token.get_field_u64(sf("sfMPTAmount")), 9_990);
-    let owner_token = ledger
-        .peek(protocol::mptoken_keylet_from_mptid(
-            issuance_id,
-            raw_account_id(owner),
-        ))
-        .expect("owner token read")
-        .expect("owner token");
-    assert!(!owner_token.is_field_present(sf("sfLockedAmount")));
-    let issuance = ledger
-        .peek(protocol::mpt_issuance_keylet_from_mptid(issuance_id))
-        .expect("issuance read")
-        .expect("issuance");
-    assert!(!issuance.is_field_present(sf("sfLockedAmount")));
-    assert_eq!(issuance.get_field_u64(sf("sfOutstandingAmount")), 99_990);
-    assert!(ledger.peek(escrow_keylet).expect("escrow read").is_none());
+        let destination_token = ledger
+            .peek(protocol::mptoken_keylet_from_mptid(
+                issuance_id,
+                raw_account_id(destination),
+            ))
+            .expect("destination token read")
+            .expect("destination token");
+        assert_eq!(
+            destination_token.get_field_u64(sf("sfMPTAmount")),
+            expected_delivered
+        );
+        let owner_token = ledger
+            .peek(protocol::mptoken_keylet_from_mptid(
+                issuance_id,
+                raw_account_id(owner),
+            ))
+            .expect("owner token read")
+            .expect("owner token");
+        assert!(!owner_token.is_field_present(sf("sfLockedAmount")));
+        let issuance = ledger
+            .peek(protocol::mpt_issuance_keylet_from_mptid(issuance_id))
+            .expect("issuance read")
+            .expect("issuance");
+        assert!(!issuance.is_field_present(sf("sfLockedAmount")));
+        assert_eq!(
+            issuance.get_field_u64(sf("sfOutstandingAmount")),
+            expected_outstanding
+        );
+        assert!(ledger.peek(escrow_keylet).expect("escrow read").is_none());
+    }
 }
 
 #[test]
@@ -1866,7 +1933,7 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
             &mut receiver_view,
             &finish(destination),
             TxType::ESCROW_FINISH,
-            None,
+            Some(1_000_000),
         ),
         Ter::TES_SUCCESS
     );
@@ -1914,7 +1981,7 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
             &mut owner_no_line_view,
             &finish(owner),
             TxType::ESCROW_FINISH,
-            None,
+            Some(1_000_000),
         ),
         Ter::TEC_NO_LINE
     );
@@ -1947,7 +2014,7 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
             &mut limited_view,
             &finish(owner),
             TxType::ESCROW_FINISH,
-            None,
+            Some(1_000_000),
         ),
         Ter::TEC_LIMIT_EXCEEDED
     );
@@ -2065,7 +2132,7 @@ fn amm_clawback_last_lp_reconciliation_tracks_fix_amm_clawback_rounding() {
     // dust balance survives even though this is the only liquidity provider.
     let mut legacy_view = ApplyViewImpl::new(Arc::new(build(999_999, false)), ApplyFlags::NONE);
     assert_eq!(
-        handle_real_dispatch(&mut legacy_view, &clawback(), TxType::AMM_CLAWBACK, None),
+        dispatch_with_pre_fee_balance(&mut legacy_view, &clawback(), TxType::AMM_CLAWBACK),
         Ter::TES_SUCCESS
     );
     let legacy_amm = legacy_view
@@ -2081,7 +2148,7 @@ fn amm_clawback_last_lp_reconciliation_tracks_fix_amm_clawback_rounding() {
     // holder's LP trust-line balance before withdrawal, so the AMM is empty.
     let mut fixed_view = ApplyViewImpl::new(Arc::new(build(999_999, true)), ApplyFlags::NONE);
     assert_eq!(
-        handle_real_dispatch(&mut fixed_view, &clawback(), TxType::AMM_CLAWBACK, None),
+        dispatch_with_pre_fee_balance(&mut fixed_view, &clawback(), TxType::AMM_CLAWBACK),
         Ter::TES_SUCCESS
     );
     assert!(
@@ -2095,7 +2162,7 @@ fn amm_clawback_last_lp_reconciliation_tracks_fix_amm_clawback_rounding() {
     // Larger discrepancies are invalid rather than silently reconciling.
     let mut invalid_view = ApplyViewImpl::new(Arc::new(build(990_000, true)), ApplyFlags::NONE);
     assert_eq!(
-        handle_real_dispatch(&mut invalid_view, &clawback(), TxType::AMM_CLAWBACK, None),
+        dispatch_with_pre_fee_balance(&mut invalid_view, &clawback(), TxType::AMM_CLAWBACK),
         Ter::TEC_AMM_INVALID_TOKENS
     );
 }
@@ -2210,7 +2277,7 @@ fn amm_clawback_matching_amount_rounds_only_with_fix_amm_clawback_rounding() {
     ] {
         let mut view = ApplyViewImpl::new(Arc::new(build(rounding_enabled)), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut view, &clawback, TxType::AMM_CLAWBACK, None),
+            dispatch_with_pre_fee_balance(&mut view, &clawback, TxType::AMM_CLAWBACK),
             Ter::TES_SUCCESS
         );
         let amm = view
@@ -2245,7 +2312,7 @@ fn mptoken_authorize_dispatch_uses_h192_id_and_sets_token_issuance_id() {
         object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE, None);
+    let result = dispatch_with_pre_fee_balance(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE);
 
     assert_eq!(result, protocol::Ter::TES_SUCCESS);
     let token = view
@@ -2267,9 +2334,11 @@ fn mptoken_authorize_dispatch_deletes_zero_token_after_issuance_destroyed() {
     let holder = sample_account(0xC8);
     let issuer = sample_account(0xC9);
     let mpt_id = share_id_for(issuer, 1);
+    let token = mptoken_entry(holder, mpt_id, 0);
     let ledger = empty_ledger(vec![
         account_root(holder, 1, 0),
-        mptoken_entry(holder, mpt_id, 0),
+        owner_dir_root(holder, *token.key()),
+        token,
     ]);
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
@@ -2284,7 +2353,7 @@ fn mptoken_authorize_dispatch_deletes_zero_token_after_issuance_destroyed() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE, None),
+        dispatch_with_pre_fee_balance(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE),
         protocol::Ter::TES_SUCCESS
     );
     assert!(
@@ -2309,7 +2378,11 @@ fn mptoken_authorize_dispatch_rejects_locked_amount_without_issuance() {
     let mpt_id = share_id_for(issuer, 1);
     let mut token = mptoken_entry(holder, mpt_id, 0);
     token.set_field_u64(sf("sfLockedAmount"), 1);
-    let ledger = empty_ledger(vec![account_root(holder, 1, 0), token]);
+    let mut ledger = empty_ledger(vec![account_root(holder, 1, 0), token]);
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV1"),
+        protocol::feature_id("fixCleanup3_1_3"),
+    ]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
         object.set_account_id(sf("sfAccount"), holder);
@@ -2323,7 +2396,7 @@ fn mptoken_authorize_dispatch_rejects_locked_amount_without_issuance() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE, None),
+        apply_simulated_transaction(&mut view, &tx).0,
         protocol::Ter::TEF_INTERNAL
     );
     assert!(
@@ -2337,11 +2410,49 @@ fn mptoken_authorize_dispatch_rejects_locked_amount_without_issuance() {
 }
 
 #[test]
+fn mptoken_authorize_pre_cleanup_313_ignores_locked_amount_on_delete() {
+    let holder = sample_account(0xCC);
+    let issuer = sample_account(0xCD);
+    let mpt_id = share_id_for(issuer, 1);
+    let mut token = mptoken_entry(holder, mpt_id, 0);
+    token.set_field_u64(sf("sfLockedAmount"), 1);
+    let ledger = empty_ledger(vec![
+        account_root(holder, 1, 0),
+        owner_dir_root(holder, *token.key()),
+        token,
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
+        object.set_account_id(sf("sfAccount"), holder);
+        object.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
+        object.set_field_u32(sf("sfFlags"), protocol::tfMPTUnauthorize);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        dispatch_with_pre_fee_balance(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE),
+        protocol::Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(holder)
+        ))
+        .expect("token read")
+        .is_none()
+    );
+}
+
+#[test]
 fn mptoken_authorize_dispatch_rejects_self_holder_before_ledger_checks() {
     let account = sample_account(0xCC);
     let issuer = sample_account(0xCD);
     let mpt_id = share_id_for(issuer, 1);
-    let ledger = empty_ledger(vec![]);
+    let mut ledger = empty_ledger(vec![]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
         object.set_account_id(sf("sfAccount"), account);
@@ -2355,7 +2466,7 @@ fn mptoken_authorize_dispatch_rejects_self_holder_before_ledger_checks() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE, None),
+        apply_simulated_transaction(&mut view, &tx).0,
         protocol::Ter::TEM_MALFORMED
     );
 }
@@ -2368,6 +2479,7 @@ fn mptoken_issuance_create_dispatch_preserves_optional_fields() {
     let domain_id = sample_uint256(0xD2);
     let mut ledger = empty_ledger(vec![account_root_with_balance(issuer, 0, 0, 1_000_000_000)]);
     ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV1"),
         protocol::feature_id("PermissionedDomains"),
         protocol::feature_id("SingleAssetVault"),
         protocol::feature_id("DynamicMPT"),
@@ -2388,8 +2500,8 @@ fn mptoken_issuance_create_dispatch_preserves_optional_fields() {
         object.set_field_vl(get_field_by_symbol("sfMPTokenMetadata"), b"meta");
         object.set_field_h256(get_field_by_symbol("sfDomainID"), domain_id);
         object.set_field_u32(
-            get_field_by_symbol("sfMutableFlags"),
-            protocol::lsmfMPTCanMutateMetadata | protocol::lsmfMPTCanMutateTransferFee,
+            get_field_by_symbol("sfImmutableFlags"),
+            protocol::lsifMPTMetadata | protocol::lsifMPTTransferFee,
         );
         object.set_field_amount(
             get_field_by_symbol("sfFee"),
@@ -2397,7 +2509,7 @@ fn mptoken_issuance_create_dispatch_preserves_optional_fields() {
         );
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None);
+    let result = dispatch_with_pre_fee_balance(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_CREATE);
 
     assert_eq!(result, protocol::Ter::TES_SUCCESS);
     let issuance = view
@@ -2429,8 +2541,8 @@ fn mptoken_issuance_create_dispatch_preserves_optional_fields() {
         domain_id
     );
     assert_eq!(
-        issuance.get_field_u32(get_field_by_symbol("sfMutableFlags")),
-        protocol::lsmfMPTCanMutateMetadata | protocol::lsmfMPTCanMutateTransferFee
+        issuance.get_field_u32(get_field_by_symbol("sfImmutableFlags")),
+        protocol::lsifMPTMetadata | protocol::lsifMPTTransferFee
     );
     assert_eq!(
         issuance.get_field_u32(get_field_by_symbol("sfFlags")),
@@ -2447,15 +2559,9 @@ fn mptoken_issuance_create_dispatch_preserves_optional_fields() {
 fn mptoken_issuance_create_dispatch_checks_extra_features_before_apply() {
     let issuer = sample_account(0xD3);
     let domain_id = sample_uint256(0xD4);
-    let mut view = ApplyViewImpl::new(
-        Arc::new(empty_ledger(vec![account_root_with_balance(
-            issuer,
-            0,
-            0,
-            1_000_000_000,
-        )])),
-        ApplyFlags::NONE,
-    );
+    let mut ledger = empty_ledger(vec![account_root_with_balance(issuer, 0, 0, 1_000_000_000)]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
     let domain_tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |object| {
         object.set_account_id(sf("sfAccount"), issuer);
@@ -2468,27 +2574,22 @@ fn mptoken_issuance_create_dispatch_checks_extra_features_before_apply() {
         );
     });
     assert_eq!(
-        handle_real_dispatch(&mut view, &domain_tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
+        apply_simulated_transaction(&mut view, &domain_tx).0,
         protocol::Ter::TEM_DISABLED
     );
 
-    let mutable_tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |object| {
+    let immutable_tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |object| {
         object.set_account_id(sf("sfAccount"), issuer);
         object.set_field_u32(sf("sfSequence"), 2);
         object.set_field_u32(sf("sfFlags"), 0);
-        object.set_field_u32(sf("sfMutableFlags"), protocol::lsmfMPTCanMutateMetadata);
+        object.set_field_u32(sf("sfImmutableFlags"), protocol::lsifMPTMetadata);
         object.set_field_amount(
             sf("sfFee"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
         );
     });
     assert_eq!(
-        handle_real_dispatch(
-            &mut view,
-            &mutable_tx,
-            TxType::MPTOKEN_ISSUANCE_CREATE,
-            None
-        ),
+        apply_simulated_transaction(&mut view, &immutable_tx).0,
         protocol::Ter::TEM_DISABLED
     );
 }
@@ -2498,6 +2599,7 @@ fn mptoken_issuance_create_dispatch_runs_preflight_before_apply() {
     let issuer = sample_account(0xD4);
     let mut ledger = empty_ledger(vec![account_root_with_balance(issuer, 0, 0, 1_000_000_000)]);
     ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV1"),
         protocol::feature_id("PermissionedDomains"),
         protocol::feature_id("SingleAssetVault"),
         protocol::feature_id("DynamicMPT"),
@@ -2505,30 +2607,33 @@ fn mptoken_issuance_create_dispatch_runs_preflight_before_apply() {
     ]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
+    // sfReferenceHolding is not in the canonical MPTokenIssuanceCreate
+    // transaction format, so STTx correctly strips it. Exercise the pinned
+    // fixCleanup3_2_0 semantic branch at its facts boundary instead of using
+    // an impossible serialized transaction fixture.
+    assert_eq!(
+        run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+            fix_cleanup_3_2_0_enabled: true,
+            confidential_transfer_enabled: false,
+            reference_holding_present: true,
+            immutable_flags: None,
+            tx_flags: 0,
+            transfer_fee: None,
+            domain_id_present: false,
+            domain_id_is_zero: false,
+            metadata_len: None,
+            maximum_amount: None,
+        }),
+        protocol::Ter::TEM_MALFORMED
+    );
+
     let cases = [
-        (
-            {
-                let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |object| {
-                    object.set_account_id(sf("sfAccount"), issuer);
-                    object.set_field_u32(sf("sfSequence"), 1);
-                    object.set_field_u32(sf("sfFlags"), 0);
-                    object.set_field_h256(sf("sfReferenceHolding"), sample_uint256(0x88));
-                    object.set_field_amount(
-                        sf("sfFee"),
-                        STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
-                    );
-                });
-                assert!(tx.is_field_present(sf("sfReferenceHolding")));
-                tx
-            },
-            protocol::Ter::TEM_MALFORMED,
-        ),
         (
             STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |object| {
                 object.set_account_id(sf("sfAccount"), issuer);
                 object.set_field_u32(sf("sfSequence"), 2);
                 object.set_field_u32(sf("sfFlags"), 0);
-                object.set_field_u32(sf("sfMutableFlags"), 0);
+                object.set_field_u32(sf("sfImmutableFlags"), 0);
                 object.set_field_amount(
                     sf("sfFee"),
                     STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
@@ -2591,20 +2696,13 @@ fn mptoken_issuance_create_dispatch_runs_preflight_before_apply() {
     ];
 
     for (case_index, (tx, expected)) in cases.into_iter().enumerate() {
-        if case_index == 0 {
-            assert!(tx.is_field_present(sf("sfReferenceHolding")));
-            assert!(
-                view.rules()
-                    .enabled(&protocol::feature_id("fixCleanup3_2_0"))
-            );
-        }
         assert_eq!(
-            handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
+            apply_simulated_transaction(&mut view, &tx).0,
             expected,
             "preflight case {case_index}"
         );
     }
-    for sequence in 1..=6 {
+    for sequence in 2..=6 {
         assert!(
             view.read(protocol::mpt_issuance_keylet_from_mptid(share_id_for(
                 issuer, sequence
@@ -2636,7 +2734,7 @@ fn mptoken_issuance_create_dispatch_masks_universal_transaction_flags() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_CREATE),
         protocol::Ter::TES_SUCCESS
     );
     let issuance = view
@@ -2666,7 +2764,7 @@ fn mptoken_issuance_create_dispatch_rejects_missing_issuer() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
+        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, Some(0)),
         protocol::Ter::TEC_INTERNAL
     );
     assert!(
@@ -2725,19 +2823,9 @@ fn mptoken_issuance_set_dispatch_applies_cpp_mutation_order() {
         issuer,
         1,
         0,
-        protocol::lsfMPTCanLock
-            | protocol::lsfMPTCanTransfer
-            | protocol::lsfMPTRequireAuth
-            | protocol::lsmfMPTCanMutateCanTransfer
-            | protocol::lsmfMPTCanMutateMetadata
-            | protocol::lsmfMPTCanMutateTransferFee,
+        protocol::lsfMPTCanLock | protocol::lsfMPTCanTransfer | protocol::lsfMPTRequireAuth,
     );
-    issuance.set_field_u32(
-        get_field_by_symbol("sfMutableFlags"),
-        protocol::lsmfMPTCanMutateCanTransfer
-            | protocol::lsmfMPTCanMutateMetadata
-            | protocol::lsmfMPTCanMutateTransferFee,
-    );
+    issuance.set_field_u32(get_field_by_symbol("sfImmutableFlags"), 0);
     issuance.set_field_u16(get_field_by_symbol("sfTransferFee"), 500);
     issuance.set_field_h256(get_field_by_symbol("sfDomainID"), sample_uint256(0xD4));
     issuance.set_stbase(protocol::STBlob::from_buffer(
@@ -2756,8 +2844,8 @@ fn mptoken_issuance_set_dispatch_applies_cpp_mutation_order() {
         object.set_account_id(get_field_by_symbol("sfAccount"), issuer);
         object.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), mpt_id);
         object.set_field_u32(
-            get_field_by_symbol("sfMutableFlags"),
-            protocol::tmfMPTClearCanTransfer,
+            get_field_by_symbol("sfFlags"),
+            protocol::tfMPTSetCanTransfer,
         );
         object.set_field_u16(get_field_by_symbol("sfTransferFee"), 0);
         object.set_field_vl(get_field_by_symbol("sfMPTokenMetadata"), b"");
@@ -2781,7 +2869,7 @@ fn mptoken_issuance_set_dispatch_applies_cpp_mutation_order() {
         .expect("issuance should remain");
     let flags = issuance.get_field_u32(get_field_by_symbol("sfFlags"));
     assert_eq!(flags & protocol::lsfMPTLocked, 0);
-    assert_eq!(flags & protocol::lsmfMPTCanMutateCanTransfer, 0);
+    assert_ne!(flags & protocol::lsfMPTCanTransfer, 0);
     assert!(!issuance.is_field_present(get_field_by_symbol("sfTransferFee")));
     assert!(!issuance.is_field_present(get_field_by_symbol("sfMPTokenMetadata")));
     assert!(!issuance.is_field_present(get_field_by_symbol("sfDomainID")));
@@ -2791,13 +2879,8 @@ fn mptoken_issuance_set_dispatch_applies_cpp_mutation_order() {
 fn mptoken_issuance_set_dispatch_rejects_dynamic_mutation_without_dynamic_mpt() {
     let issuer = sample_account(0xE6);
     let mpt_id = share_id_for(issuer, 1);
-    let mut issuance = mpt_issuance_entry(
-        issuer,
-        1,
-        0,
-        protocol::lsfMPTCanTransfer | protocol::lsmfMPTCanMutateMetadata,
-    );
-    issuance.set_field_u32(sf("sfMutableFlags"), protocol::lsmfMPTCanMutateMetadata);
+    let mut issuance = mpt_issuance_entry(issuer, 1, 0, protocol::lsfMPTCanTransfer);
+    issuance.set_field_u32(sf("sfImmutableFlags"), protocol::lsifMPTMetadata);
     let ledger = empty_ledger(vec![account_root(issuer, 1, 0), issuance]);
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
@@ -2813,7 +2896,7 @@ fn mptoken_issuance_set_dispatch_rejects_dynamic_mutation_without_dynamic_mpt() 
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_SET, None),
+        apply_simulated_transaction(&mut view, &tx).0,
         protocol::Ter::TEM_DISABLED
     );
     let issuance = view
@@ -2821,6 +2904,234 @@ fn mptoken_issuance_set_dispatch_rejects_dynamic_mutation_without_dynamic_mpt() 
         .expect("issuance read should succeed")
         .expect("issuance should remain");
     assert!(!issuance.is_field_present(sf("sfMPTokenMetadata")));
+}
+
+#[test]
+fn mptoken_issuance_set_enables_capability_and_adds_immutable_bits() {
+    let issuer = sample_account(0xA7);
+    let mpt_id = share_id_for(issuer, 1);
+    let mut issuance = mpt_issuance_entry(issuer, 1, 0, 0);
+    issuance.set_field_u32(sf("sfImmutableFlags"), protocol::lsifMPTMetadata);
+    let mut ledger = empty_ledger(vec![account_root(issuer, 1, 0), issuance]);
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV1"),
+        protocol::feature_id("DynamicMPT"),
+    ]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_SET, |object| {
+        object.set_account_id(sf("sfAccount"), issuer);
+        object.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
+        object.set_field_u32(sf("sfFlags"), protocol::tfMPTSetCanTransfer);
+        object.set_field_u32(
+            sf("sfImmutableFlags"),
+            protocol::lsifMPTCanTransfer | protocol::lsifMPTTransferFee,
+        );
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_SET, None),
+        protocol::Ter::TES_SUCCESS
+    );
+    let issuance = view
+        .read(protocol::mpt_issuance_keylet_from_mptid(mpt_id))
+        .expect("issuance read")
+        .expect("issuance exists");
+    assert!(issuance.is_flag(protocol::lsfMPTCanTransfer));
+    assert_eq!(
+        issuance.get_field_u32(sf("sfImmutableFlags")),
+        protocol::lsifMPTMetadata | protocol::lsifMPTCanTransfer | protocol::lsifMPTTransferFee
+    );
+}
+
+#[test]
+fn mptoken_issuance_set_immutable_policy_is_enforced_by_production_preclaim() {
+    let issuer = sample_account(0xA6);
+    let mpt_id = share_id_for(issuer, 1);
+    let mut issuance = mpt_issuance_entry(issuer, 1, 0, 0);
+    issuance.set_field_u32(sf("sfImmutableFlags"), protocol::tifMPTCanTransfer);
+    let mut ledger = empty_ledger(vec![account_root(issuer, 1, 0), issuance]);
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV1"),
+        protocol::feature_id("DynamicMPT"),
+    ]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_SET, |object| {
+        object.set_account_id(sf("sfAccount"), issuer);
+        object.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
+        object.set_field_u32(sf("sfFlags"), protocol::tfMPTSetCanTransfer);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        apply_simulated_transaction(&mut view, &tx).0,
+        Ter::TEC_NO_PERMISSION
+    );
+    let issuance = view
+        .read(protocol::mpt_issuance_keylet_from_mptid(mpt_id))
+        .expect("issuance read")
+        .expect("issuance remains");
+    assert!(!issuance.is_flag(protocol::lsfMPTCanTransfer));
+}
+
+#[test]
+fn mpt_issuance_create_and_destroy_preserve_reserve_sponsor_accounting() {
+    let issuer = sample_account(0xA8);
+    let sponsor = sample_account(0xA9);
+    let mpt_id = share_id_for(issuer, 1);
+    let ledger = empty_ledger(vec![
+        account_root_with_balance(issuer, 0, 0, 1_000_000_000),
+        account_root_with_balance(sponsor, 0, 0, 1_000_000_000),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let create = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |object| {
+        object.set_account_id(sf("sfAccount"), issuer);
+        object.set_field_u32(sf("sfSequence"), 1);
+        object.set_account_id(sf("sfSponsor"), sponsor);
+        object.set_field_u32(sf("sfSponsorFlags"), ledger::SPF_SPONSOR_RESERVE);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+    });
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &create,
+            TxType::MPTOKEN_ISSUANCE_CREATE,
+            Some(1_000_000_000),
+        ),
+        Ter::TES_SUCCESS
+    );
+    let issuance = view
+        .read(protocol::mpt_issuance_keylet_from_mptid(mpt_id))
+        .expect("issuance read")
+        .expect("issuance created");
+    assert_eq!(issuance.get_account_id(sf("sfSponsor")), sponsor);
+    let issuer_root = view
+        .read(account_keylet(raw_account_id(issuer)))
+        .expect("issuer read")
+        .expect("issuer exists");
+    let sponsor_root = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .expect("sponsor read")
+        .expect("sponsor exists");
+    assert_eq!(issuer_root.get_field_u32(sf("sfOwnerCount")), 1);
+    assert_eq!(issuer_root.get_field_u32(sf("sfSponsoredOwnerCount")), 1);
+    assert_eq!(sponsor_root.get_field_u32(sf("sfSponsoringOwnerCount")), 1);
+
+    let destroy = STTx::new(TxType::MPTOKEN_ISSUANCE_DESTROY, |object| {
+        object.set_account_id(sf("sfAccount"), issuer);
+        object.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_field_u32(sf("sfSequence"), 2);
+    });
+    assert_eq!(
+        dispatch_with_pre_fee_balance(&mut view, &destroy, TxType::MPTOKEN_ISSUANCE_DESTROY),
+        Ter::TES_SUCCESS
+    );
+    let issuer_root = view
+        .read(account_keylet(raw_account_id(issuer)))
+        .expect("issuer read")
+        .expect("issuer exists");
+    let sponsor_root = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .expect("sponsor read")
+        .expect("sponsor exists");
+    assert_eq!(issuer_root.get_field_u32(sf("sfOwnerCount")), 0);
+    assert_eq!(issuer_root.get_field_u32(sf("sfSponsoredOwnerCount")), 0);
+    assert_eq!(sponsor_root.get_field_u32(sf("sfSponsoringOwnerCount")), 0);
+}
+
+#[test]
+fn mptoken_authorize_create_and_delete_preserve_reserve_sponsor_accounting() {
+    let issuer = sample_account(0xAA);
+    let holder = sample_account(0xAB);
+    let sponsor = sample_account(0xAC);
+    let mpt_id = share_id_for(issuer, 1);
+    let ledger = empty_ledger(vec![
+        account_root(issuer, 1, 0),
+        account_root_with_balance(holder, 0, 0, 1_000_000_000),
+        account_root_with_balance(sponsor, 0, 0, 1_000_000_000),
+        mpt_issuance_entry(issuer, 1, 0, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let create = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
+        object.set_account_id(sf("sfAccount"), holder);
+        object.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
+        object.set_account_id(sf("sfSponsor"), sponsor);
+        object.set_field_u32(sf("sfSponsorFlags"), ledger::SPF_SPONSOR_RESERVE);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &create,
+            TxType::MPTOKEN_AUTHORIZE,
+            Some(1_000_000_000),
+        ),
+        Ter::TES_SUCCESS
+    );
+    let token = view
+        .read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(holder),
+        ))
+        .expect("token read")
+        .expect("token created");
+    assert_eq!(token.get_account_id(sf("sfSponsor")), sponsor);
+    let holder_root = view
+        .read(account_keylet(raw_account_id(holder)))
+        .expect("holder read")
+        .expect("holder exists");
+    let sponsor_root = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .expect("sponsor read")
+        .expect("sponsor exists");
+    assert_eq!(holder_root.get_field_u32(sf("sfSponsoredOwnerCount")), 1);
+    assert_eq!(sponsor_root.get_field_u32(sf("sfSponsoringOwnerCount")), 1);
+
+    let remove = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
+        object.set_account_id(sf("sfAccount"), holder);
+        object.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
+        object.set_field_u32(sf("sfFlags"), protocol::tfMPTUnauthorize);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_field_u32(sf("sfSequence"), 2);
+    });
+    assert_eq!(
+        dispatch_with_pre_fee_balance(&mut view, &remove, TxType::MPTOKEN_AUTHORIZE),
+        Ter::TES_SUCCESS
+    );
+    let holder_root = view
+        .read(account_keylet(raw_account_id(holder)))
+        .expect("holder read")
+        .expect("holder exists");
+    let sponsor_root = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .expect("sponsor read")
+        .expect("sponsor exists");
+    assert_eq!(holder_root.get_field_u32(sf("sfOwnerCount")), 0);
+    assert_eq!(holder_root.get_field_u32(sf("sfSponsoredOwnerCount")), 0);
+    assert_eq!(sponsor_root.get_field_u32(sf("sfSponsoringOwnerCount")), 0);
 }
 
 #[test]
@@ -2850,7 +3161,7 @@ fn mptoken_issuance_set_dispatch_rejects_domain_without_required_features() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_SET, None),
+        apply_simulated_transaction(&mut view, &tx).0,
         protocol::Ter::TEM_DISABLED
     );
     let issuance = view
@@ -2865,11 +3176,12 @@ fn mptoken_issuance_set_dispatch_rejects_wrong_issuer() {
     let issuer = sample_account(0xE0);
     let other = sample_account(0xE1);
     let mpt_id = share_id_for(issuer, 1);
-    let ledger = empty_ledger(vec![
+    let mut ledger = empty_ledger(vec![
         account_root(issuer, 1, 0),
         account_root(other, 1, 0),
         mpt_issuance_entry(issuer, 1, 0, protocol::lsfMPTCanLock),
     ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_SET, |object| {
@@ -2884,7 +3196,7 @@ fn mptoken_issuance_set_dispatch_rejects_wrong_issuer() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_SET, None),
+        apply_simulated_transaction(&mut view, &tx).0,
         protocol::Ter::TEC_NO_PERMISSION
     );
     let issuance = view
@@ -2894,6 +3206,56 @@ fn mptoken_issuance_set_dispatch_rejects_wrong_issuer() {
     assert_eq!(
         issuance.get_field_u32(sf("sfFlags")) & protocol::lsfMPTLocked,
         0
+    );
+}
+
+#[test]
+fn mptoken_issuance_set_do_apply_maps_preclaim_proven_target_disappearance_to_internal() {
+    let issuer = sample_account(0xE8);
+    let holder = sample_account(0xE9);
+    let mpt_id = share_id_for(issuer, 1);
+    let ledger = empty_ledger(vec![account_root(issuer, 0, 0)]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_SET, |object| {
+        object.set_account_id(sf("sfAccount"), issuer);
+        object.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
+        object.set_field_u32(sf("sfFlags"), protocol::tfMPTLock);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    // This is deliberately a doApply-only harness: immutable preclaim would
+    // reject the missing issuance with tecOBJECT_NOT_FOUND.  Once preclaim has
+    // succeeded, pinned doApply classifies disappearance of either the
+    // issuance or holder-token target as tecINTERNAL.
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_SET, None),
+        Ter::TEC_INTERNAL
+    );
+
+    let ledger = empty_ledger(vec![
+        account_root(issuer, 1, 0),
+        account_root(holder, 0, 0),
+        mpt_issuance_entry(issuer, 1, 0, protocol::lsfMPTCanLock),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let holder_tx = STTx::new(TxType::MPTOKEN_ISSUANCE_SET, |object| {
+        object.set_account_id(sf("sfAccount"), issuer);
+        object.set_account_id(sf("sfHolder"), holder);
+        object.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
+        object.set_field_u32(sf("sfFlags"), protocol::tfMPTLock);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &holder_tx, TxType::MPTOKEN_ISSUANCE_SET, None,),
+        Ter::TEC_INTERNAL
     );
 }
 
@@ -2911,6 +3273,7 @@ fn mptoken_issuance_set_dispatch_rejects_missing_domain() {
         ),
     ]);
     ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV1"),
         protocol::feature_id("PermissionedDomains"),
         protocol::feature_id("SingleAssetVault"),
     ]));
@@ -2928,7 +3291,7 @@ fn mptoken_issuance_set_dispatch_rejects_missing_domain() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_SET, None),
+        apply_simulated_transaction(&mut view, &tx).0,
         protocol::Ter::TEC_OBJECT_NOT_FOUND
     );
     let issuance = view
@@ -2997,7 +3360,7 @@ fn mptoken_authorize_dispatch_rejects_issuer_unauthorize_of_amm_pseudo_holder() 
     amm_root.set_field_h256(get_field_by_symbol("sfAMMID"), sample_uint256(0xC5));
     let mut token = mptoken_entry(amm_holder, mpt_id, 0);
     token.set_field_u32(get_field_by_symbol("sfFlags"), protocol::lsfMPTAuthorized);
-    let ledger = empty_ledger(vec![
+    let mut ledger = empty_ledger(vec![
         account_root(issuer, 1, 0),
         amm_root,
         mpt_issuance_entry(
@@ -3008,6 +3371,7 @@ fn mptoken_authorize_dispatch_rejects_issuer_unauthorize_of_amm_pseudo_holder() 
         ),
         token,
     ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
         object.set_account_id(get_field_by_symbol("sfAccount"), issuer);
@@ -3021,7 +3385,7 @@ fn mptoken_authorize_dispatch_rejects_issuer_unauthorize_of_amm_pseudo_holder() 
         object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE, None);
+    let result = apply_simulated_transaction(&mut view, &tx).0;
 
     assert_eq!(result, protocol::Ter::TEC_NO_PERMISSION);
 }
@@ -3031,7 +3395,8 @@ fn mptoken_authorize_issuer_branch_checks_holder_before_issuance() {
     let issuer = sample_account(0xCF);
     let holder = sample_account(0xD0);
     let mpt_id = share_id_for(issuer, 1);
-    let ledger = empty_ledger(vec![account_root(issuer, 0, 0)]);
+    let mut ledger = empty_ledger(vec![account_root(issuer, 0, 0)]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
         object.set_account_id(sf("sfAccount"), issuer);
@@ -3045,7 +3410,7 @@ fn mptoken_authorize_issuer_branch_checks_holder_before_issuance() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE, None),
+        apply_simulated_transaction(&mut view, &tx).0,
         protocol::Ter::TEC_NO_DST
     );
 }
@@ -3057,7 +3422,7 @@ fn mptoken_authorize_issuer_branch_checks_holder_token_before_pseudo() {
     let mpt_id = share_id_for(issuer, 1);
     let mut holder_root = account_root(holder, 0, 0);
     holder_root.set_field_h256(sf("sfVaultID"), sample_uint256(0xD3));
-    let ledger = empty_ledger(vec![
+    let mut ledger = empty_ledger(vec![
         account_root(issuer, 1, 0),
         holder_root,
         mpt_issuance_entry(
@@ -3067,6 +3432,7 @@ fn mptoken_authorize_issuer_branch_checks_holder_token_before_pseudo() {
             protocol::lsfMPTCanTransfer | protocol::lsfMPTRequireAuth,
         ),
     ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
         object.set_account_id(sf("sfAccount"), issuer);
@@ -3080,8 +3446,47 @@ fn mptoken_authorize_issuer_branch_checks_holder_token_before_pseudo() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE, None),
+        apply_simulated_transaction(&mut view, &tx).0,
         protocol::Ter::TEC_OBJECT_NOT_FOUND
+    );
+}
+
+#[test]
+fn mptoken_authorize_do_apply_maps_preclaim_proven_targets_to_internal() {
+    let issuer = sample_account(0xDA);
+    let holder = sample_account(0xDB);
+    let mpt_id = share_id_for(issuer, 1);
+    let tx = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
+        object.set_account_id(sf("sfAccount"), issuer);
+        object.set_account_id(sf("sfHolder"), holder);
+        object.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    let ledger = empty_ledger(vec![account_root(issuer, 0, 0)]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    assert_eq!(
+        dispatch_with_pre_fee_balance(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE),
+        Ter::TEC_INTERNAL
+    );
+
+    let ledger = empty_ledger(vec![
+        account_root(issuer, 1, 0),
+        mpt_issuance_entry(
+            issuer,
+            1,
+            0,
+            protocol::lsfMPTCanTransfer | protocol::lsfMPTRequireAuth,
+        ),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    assert_eq!(
+        dispatch_with_pre_fee_balance(&mut view, &tx, TxType::MPTOKEN_AUTHORIZE),
+        Ter::TEC_INTERNAL
     );
 }
 
@@ -3091,7 +3496,8 @@ fn mptoken_issuance_destroy_rejects_active_escrow_locked_amount() {
     let mpt_id = share_id_for(issuer, 1);
     let mut issuance = mpt_issuance_entry(issuer, 1, 0, protocol::lsfMPTCanTransfer);
     issuance.set_field_u64(get_field_by_symbol("sfLockedAmount"), 10);
-    let ledger = empty_ledger(vec![account_root(issuer, 1, 0), issuance]);
+    let mut ledger = empty_ledger(vec![account_root(issuer, 1, 0), issuance]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_DESTROY, |object| {
@@ -3104,7 +3510,7 @@ fn mptoken_issuance_destroy_rejects_active_escrow_locked_amount() {
         object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_DESTROY, None);
+    let result = apply_simulated_transaction(&mut view, &tx).0;
 
     assert_eq!(result, protocol::Ter::TEC_HAS_OBLIGATIONS);
     assert!(
@@ -3134,7 +3540,7 @@ fn mptoken_issuance_destroy_rejects_missing_owner_dir_before_erase() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_DESTROY, None),
+        dispatch_with_pre_fee_balance(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_DESTROY),
         protocol::Ter::TEF_BAD_LEDGER
     );
     assert!(
@@ -3148,7 +3554,8 @@ fn mptoken_issuance_destroy_rejects_missing_owner_dir_before_erase() {
 fn mptoken_issuance_destroy_rejects_missing_issuance() {
     let issuer = sample_account(0xCC);
     let mpt_id = share_id_for(issuer, 1);
-    let ledger = empty_ledger(vec![account_root(issuer, 1, 0)]);
+    let mut ledger = empty_ledger(vec![account_root(issuer, 1, 0)]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_DESTROY, |object| {
@@ -3162,7 +3569,7 @@ fn mptoken_issuance_destroy_rejects_missing_issuance() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_DESTROY, None),
+        apply_simulated_transaction(&mut view, &tx).0,
         protocol::Ter::TEC_OBJECT_NOT_FOUND
     );
 }
@@ -3172,11 +3579,12 @@ fn mptoken_issuance_destroy_rejects_non_issuer() {
     let issuer = sample_account(0xC7);
     let other = sample_account(0xC8);
     let mpt_id = share_id_for(issuer, 1);
-    let ledger = empty_ledger(vec![
+    let mut ledger = empty_ledger(vec![
         account_root(issuer, 1, 0),
         account_root(other, 0, 0),
         mpt_issuance_entry(issuer, 1, 0, protocol::lsfMPTCanTransfer),
     ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_DESTROY, |object| {
@@ -3189,7 +3597,7 @@ fn mptoken_issuance_destroy_rejects_non_issuer() {
         object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_DESTROY, None);
+    let result = apply_simulated_transaction(&mut view, &tx).0;
 
     assert_eq!(result, protocol::Ter::TEC_NO_PERMISSION);
 }
@@ -3220,7 +3628,10 @@ fn offer_create_places_funded_mpt_offer_without_iou_issue_panic() {
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = offer_create_tx(owner, 2, taker_pays, taker_gets, 0, None);
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
+    // MPT authorization/freeze/trade checks are immutable OfferCreate
+    // preclaim work in rippled. Exercise the production shell so the test
+    // cannot accidentally skip that phase by calling the doApply dispatcher.
+    let result = apply_submit_transactor_shell(&mut view, &tx, TxType::OFFER_CREATE);
 
     assert_eq!(result, Ter::TES_SUCCESS);
     let offer = view
@@ -3261,7 +3672,9 @@ fn offer_create_rejects_locked_mpt_asset_before_placing_offer() {
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = offer_create_tx(owner, 2, taker_pays, taker_gets, 0, None);
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
+    // checkAcceptAsset(TakerPays) precedes canTrade in pinned OfferCreate.
+    // The full shell is required to preserve that preclaim ordering.
+    let result = apply_submit_transactor_shell(&mut view, &tx, TxType::OFFER_CREATE);
 
     assert_eq!(result, Ter::TEC_LOCKED);
     assert!(
@@ -3296,7 +3709,9 @@ fn offer_create_requires_authorization_for_mpt_accept_asset() {
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = offer_create_tx(owner, 2, taker_pays, taker_gets, 0, None);
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
+    // Pinned OfferCreate checks acceptance of TakerPays before canTrade.
+    // Exercise that immutable preclaim through the production shell.
+    let result = apply_submit_transactor_shell(&mut view, &tx, TxType::OFFER_CREATE);
 
     assert_eq!(result, Ter::TEC_NO_AUTH);
     assert!(
@@ -3327,7 +3742,7 @@ fn offer_create_allows_tradable_nontransferable_mpt_sell_offer() {
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = offer_create_tx(owner, 2, taker_pays, taker_gets, 0, None);
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
+    let result = dispatch_with_pre_fee_balance(&mut view, &tx, TxType::OFFER_CREATE);
 
     assert_eq!(result, Ter::TES_SUCCESS);
     assert!(
@@ -3379,7 +3794,7 @@ fn offer_create_tick_rounding_preserves_mpt_side_in_both_orientations() {
         None,
     );
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut view, &tx, TxType::OFFER_CREATE),
         Ter::TES_SUCCESS
     );
     assert_eq!(
@@ -3406,7 +3821,7 @@ fn offer_create_tick_rounding_preserves_mpt_side_in_both_orientations() {
         None,
     );
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut view, &tx, TxType::OFFER_CREATE),
         Ter::TES_SUCCESS
     );
     assert_eq!(
@@ -3457,6 +3872,72 @@ fn check_create_rejects_mpt_when_transfer_is_disabled() {
             .expect("check read should succeed")
             .is_none()
     );
+}
+
+#[test]
+fn check_create_uses_prefunded_reserve_sponsor_once() {
+    let source = sample_account(0xD7);
+    let destination = sample_account(0xD8);
+    let sponsor = sample_account(0xD9);
+    let sponsorship_key =
+        protocol::sponsorship_keylet(raw_account_id(sponsor), raw_account_id(source));
+    let sponsorship =
+        protocol::SponsorshipBuilder::new(sponsor, source, 0, 0, Uint256::default(), 0)
+            .set_remaining_owner_count(2)
+            .build(sponsorship_key.key)
+            .get_sle()
+            .as_ref()
+            .clone();
+    let mut ledger = empty_ledger(vec![
+        // The source cannot carry an owner reserve by itself.
+        account_root_with_balance(source, 0, 0, 200),
+        account_root_with_balance(destination, 0, 0, 1_000),
+        account_root_with_balance(sponsor, 0, 0, 1_000),
+        sponsorship,
+    ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("Sponsor")]));
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 200,
+        increment: 50,
+    });
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::CHECK_CREATE, |object| {
+        object.set_account_id(sf("sfAccount"), source);
+        object.set_account_id(sf("sfDestination"), destination);
+        object.set_field_amount(sf("sfSendMax"), test_xrp(100));
+        object.set_account_id(sf("sfSponsor"), sponsor);
+        object.set_field_u32(sf("sfSponsorFlags"), ledger::SPF_SPONSOR_RESERVE);
+        object.set_field_u32(sf("sfSequence"), 2);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::CHECK_CREATE, Some(200)),
+        Ter::TES_SUCCESS
+    );
+    let check = view
+        .read(protocol::check_keylet(raw_account_id(source), 2))
+        .expect("check read")
+        .expect("check created");
+    assert_eq!(check.get_account_id(sf("sfSponsor")), sponsor);
+    assert!(check.is_field_present(sf("sfOwnerNode")));
+    assert!(check.is_field_present(sf("sfDestinationNode")));
+    let source_root = view
+        .read(account_keylet(raw_account_id(source)))
+        .expect("source read")
+        .expect("source root");
+    let sponsor_root = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .expect("sponsor read")
+        .expect("sponsor root");
+    let sponsorship = view
+        .read(sponsorship_key)
+        .expect("sponsorship read")
+        .expect("sponsorship remains");
+    assert_eq!(source_root.get_field_u32(sf("sfOwnerCount")), 1);
+    assert_eq!(source_root.get_field_u32(sf("sfSponsoredOwnerCount")), 1);
+    assert_eq!(sponsor_root.get_field_u32(sf("sfSponsoringOwnerCount")), 1);
+    assert_eq!(sponsorship.get_field_u32(sf("sfRemainingOwnerCount")), 1);
 }
 
 #[test]
@@ -3844,6 +4325,141 @@ fn check_cash_delivered_amount_matches_xrp_amount_and_deliver_min_rules() {
             "XRP Amount has no delivered metadata; XRP DeliverMin records the actual maximum"
         );
     }
+}
+
+#[test]
+fn sponsored_xrp_check_does_not_release_source_owner_reserve() {
+    let source = sample_account(0xC7);
+    let destination = sample_account(0xC8);
+    let sponsor = sample_account(0xC9);
+    let check_keylet = protocol::check_keylet(raw_account_id(source), 3);
+    let cash = STTx::new(TxType::CHECK_CASH, |object| {
+        object.set_account_id(sf("sfAccount"), destination);
+        object.set_field_h256(sf("sfCheckID"), check_keylet.key);
+        object.set_field_amount(sf("sfAmount"), test_xrp(50));
+    });
+
+    let make_view = |sponsored: bool| {
+        let mut check = check_entry(source, destination, 3, test_xrp(50));
+        if sponsored {
+            check.set_account_id(sf("sfSponsor"), sponsor);
+        }
+        let mut ledger = empty_ledger(vec![
+            // With reserve=200 and increment=50, this account can cash 50
+            // only if deleting the Check releases its own owner increment.
+            account_root_with_balance(source, 1, 0, 250),
+            account_root_with_balance(destination, 0, 0, 1_000),
+            owner_dir_root(source, check_keylet.key),
+            owner_dir_root(destination, check_keylet.key),
+            check,
+        ]);
+        ledger.set_fees(Fees {
+            base: 10,
+            reserve: 200,
+            increment: 50,
+        });
+        ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE)
+    };
+
+    let mut unsponsored = make_view(false);
+    assert_eq!(
+        handle_real_dispatch(&mut unsponsored, &cash, TxType::CHECK_CASH, None),
+        Ter::TES_SUCCESS
+    );
+
+    let mut sponsored = make_view(true);
+    assert_eq!(
+        handle_real_dispatch(&mut sponsored, &cash, TxType::CHECK_CASH, None),
+        Ter::TEC_UNFUNDED_PAYMENT
+    );
+}
+
+#[test]
+fn check_cancel_releases_reserve_sponsor_counts() {
+    let source = sample_account(0xCA);
+    let destination = sample_account(0xCB);
+    let sponsor = sample_account(0xCC);
+    let check_keylet = protocol::check_keylet(raw_account_id(source), 3);
+    let mut source_root = account_root_with_balance(source, 1, 0, 1_000);
+    source_root.set_field_u32(sf("sfSponsoredOwnerCount"), 1);
+    let mut sponsor_root = account_root_with_balance(sponsor, 0, 0, 1_000);
+    sponsor_root.set_field_u32(sf("sfSponsoringOwnerCount"), 1);
+    let mut check = check_entry(source, destination, 3, test_xrp(100));
+    check.set_account_id(sf("sfSponsor"), sponsor);
+    let ledger = empty_ledger(vec![
+        source_root,
+        account_root_with_balance(destination, 0, 0, 1_000),
+        sponsor_root,
+        owner_dir_root(source, check_keylet.key),
+        owner_dir_root(destination, check_keylet.key),
+        check,
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let cancel = STTx::new(TxType::CHECK_CANCEL, |object| {
+        object.set_account_id(sf("sfAccount"), source);
+        object.set_field_h256(sf("sfCheckID"), check_keylet.key);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &cancel, TxType::CHECK_CANCEL, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(view.read(check_keylet).expect("check read").is_none());
+    let source_root = view
+        .read(account_keylet(raw_account_id(source)))
+        .expect("source read")
+        .expect("source root");
+    let sponsor_root = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .expect("sponsor read")
+        .expect("sponsor root");
+    assert_eq!(source_root.get_field_u32(sf("sfOwnerCount")), 0);
+    assert_eq!(source_root.get_field_u32(sf("sfSponsoredOwnerCount")), 0);
+    assert_eq!(sponsor_root.get_field_u32(sf("sfSponsoringOwnerCount")), 0);
+}
+
+#[test]
+fn check_cash_releases_reserve_sponsor_counts() {
+    let source = sample_account(0xCD);
+    let destination = sample_account(0xCE);
+    let sponsor = sample_account(0xCF);
+    let check_keylet = protocol::check_keylet(raw_account_id(source), 3);
+    let mut source_root = account_root_with_balance(source, 1, 0, 1_000);
+    source_root.set_field_u32(sf("sfSponsoredOwnerCount"), 1);
+    let mut sponsor_root = account_root_with_balance(sponsor, 0, 0, 1_000);
+    sponsor_root.set_field_u32(sf("sfSponsoringOwnerCount"), 1);
+    let mut check = check_entry(source, destination, 3, test_xrp(100));
+    check.set_account_id(sf("sfSponsor"), sponsor);
+    let ledger = empty_ledger(vec![
+        source_root,
+        account_root_with_balance(destination, 0, 0, 1_000),
+        sponsor_root,
+        owner_dir_root(source, check_keylet.key),
+        owner_dir_root(destination, check_keylet.key),
+        check,
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let cash = STTx::new(TxType::CHECK_CASH, |object| {
+        object.set_account_id(sf("sfAccount"), destination);
+        object.set_field_h256(sf("sfCheckID"), check_keylet.key);
+        object.set_field_amount(sf("sfAmount"), test_xrp(50));
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &cash, TxType::CHECK_CASH, None),
+        Ter::TES_SUCCESS
+    );
+    let source_root = view
+        .read(account_keylet(raw_account_id(source)))
+        .expect("source read")
+        .expect("source root");
+    let sponsor_root = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .expect("sponsor read")
+        .expect("sponsor root");
+    assert_eq!(source_root.get_field_u32(sf("sfOwnerCount")), 0);
+    assert_eq!(source_root.get_field_u32(sf("sfSponsoredOwnerCount")), 0);
+    assert_eq!(sponsor_root.get_field_u32(sf("sfSponsoringOwnerCount")), 0);
 }
 
 #[test]
@@ -4290,7 +4906,7 @@ fn conditional_escrow_create_persists_condition_and_finish_requires_matching_ful
             &mut missing_fulfillment,
             &finish_tx(None, None),
             TxType::ESCROW_FINISH,
-            None,
+            Some(1_000_000),
         ),
         Ter::TEC_CRYPTOCONDITION_ERROR
     );
@@ -4307,7 +4923,7 @@ fn conditional_escrow_create_persists_condition_and_finish_requires_matching_ful
             &mut malformed,
             &finish_tx(Some(&condition), None),
             TxType::ESCROW_FINISH,
-            None,
+            Some(1_000_000),
         ),
         Ter::TEM_MALFORMED
     );
@@ -4318,7 +4934,7 @@ fn conditional_escrow_create_persists_condition_and_finish_requires_matching_ful
             &mut successful,
             &finish_tx(Some(&condition), Some(&fulfillment)),
             TxType::ESCROW_FINISH,
-            None,
+            Some(1_000_000),
         ),
         Ter::TES_SUCCESS
     );
@@ -4847,6 +5463,193 @@ fn payment_transfers_mpt_without_rewriting_issue() {
     assert_eq!(
         destination_token.get_field_u64(get_field_by_symbol("sfMPTAmount")),
         10
+    );
+}
+
+#[test]
+fn direct_xrp_payment_preserves_fee_when_fee_exceeds_source_reserve() {
+    let source = sample_account(0xA1);
+    let destination = sample_account(0xA2);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(source, 0, 0, 599),
+        account_root_with_balance(destination, 0, 0, 0),
+    ]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 200,
+        increment: 50,
+    });
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = direct_xrp_payment_tx(source, destination, 100, 500);
+
+    // 599 covers amount + reserve, but not amount + max(reserve, Fee).
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(599)),
+        Ter::TEC_UNFUNDED_PAYMENT
+    );
+}
+
+#[test]
+fn payment_sponsor_created_account_tracks_base_reserve_sponsorship() {
+    let source = sample_account(0xB1);
+    let destination = sample_account(0xB2);
+    let mut ledger = empty_ledger(vec![account_root_with_balance(source, 0, 0, 1_000)]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 200,
+        increment: 50,
+    });
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("Sponsor")]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::PAYMENT, |object| {
+        object.set_account_id(sf("sfAccount"), source);
+        object.set_account_id(sf("sfDestination"), destination);
+        object.set_field_amount(sf("sfAmount"), test_xrp(1));
+        object.set_field_u32(sf("sfFlags"), protocol::tfSponsorCreatedAccount);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000)),
+        Ter::TES_SUCCESS
+    );
+    let destination_root = view
+        .read(account_keylet(raw_account_id(destination)))
+        .expect("destination read")
+        .expect("sponsored destination");
+    assert_eq!(destination_root.get_account_id(sf("sfSponsor")), source);
+    assert_eq!(
+        destination_root.get_field_amount(sf("sfBalance")),
+        test_xrp(1)
+    );
+    let source_root = view
+        .read(account_keylet(raw_account_id(source)))
+        .expect("source read")
+        .expect("sponsor source");
+    assert_eq!(source_root.get_field_u32(sf("sfSponsoringAccountCount")), 1);
+    assert_eq!(source_root.get_field_amount(sf("sfBalance")), test_xrp(999));
+}
+
+#[test]
+fn direct_xrp_payment_reserve_only_sponsor_does_not_override_initiator_fee_payer() {
+    let source = sample_account(0xB1);
+    let destination = sample_account(0xB2);
+    let delegate = sample_account(0xB3);
+    let sponsor = sample_account(0xB4);
+
+    let make_ledger = || {
+        let mut ledger = empty_ledger(vec![
+            account_root_with_balance(source, 0, 0, 599),
+            account_root_with_balance(destination, 0, 0, 0),
+            account_root_with_balance(delegate, 0, 0, 1_000),
+            account_root_with_balance(sponsor, 0, 0, 1_000),
+        ]);
+        ledger.set_fees(Fees {
+            base: 10,
+            reserve: 200,
+            increment: 50,
+        });
+        ledger
+    };
+
+    let mut account_paid = direct_xrp_payment_tx(source, destination, 100, 500);
+    account_paid.set_account_id(sf("sfSponsor"), sponsor);
+    account_paid.set_field_u32(sf("sfSponsorFlags"), 2);
+    let mut account_view = ApplyViewImpl::new(Arc::new(make_ledger()), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut account_view, &account_paid, TxType::PAYMENT, Some(599),),
+        Ter::TEC_UNFUNDED_PAYMENT,
+        "reserve-only sponsor leaves sfAccount responsible for the fee"
+    );
+
+    let mut delegate_paid = account_paid.clone();
+    delegate_paid.set_account_id(sf("sfDelegate"), delegate);
+    let mut delegate_view = ApplyViewImpl::new(Arc::new(make_ledger()), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(
+            &mut delegate_view,
+            &delegate_paid,
+            TxType::PAYMENT,
+            Some(599),
+        ),
+        Ter::TES_SUCCESS,
+        "reserve-only sponsor leaves sfDelegate responsible for the fee"
+    );
+}
+
+#[test]
+fn direct_xrp_payment_rejects_every_registered_pseudo_account_kind() {
+    let source = sample_account(0xA3);
+    for (index, discriminator) in ["sfAMMID", "sfVaultID", "sfLoanBrokerID"]
+        .into_iter()
+        .enumerate()
+    {
+        let destination = sample_account(0xA4 + index as u8);
+        let mut pseudo = account_root_with_balance(destination, 0, 0, 0);
+        pseudo.set_field_h256(sf(discriminator), sample_uint256(0xB0 + index as u8));
+        let mut ledger = empty_ledger(vec![account_root_with_balance(source, 0, 0, 1_000), pseudo]);
+        ledger.set_fees(Fees {
+            base: 10,
+            reserve: 200,
+            increment: 50,
+        });
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let tx = direct_xrp_payment_tx(source, destination, 1, 10);
+
+        assert_eq!(
+            handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000)),
+            Ter::TEC_NO_PERMISSION,
+            "{discriminator} must identify a pseudo-account"
+        );
+    }
+}
+
+#[test]
+fn delegated_single_sign_reaches_apply_after_shared_preclaim_authorization() {
+    let source = sample_account(0xA8);
+    let destination = sample_account(0xA9);
+    let delegate = sample_account(0xAA);
+    let ledger = empty_ledger(vec![
+        account_root_with_balance(source, 0, 0, 1_000_000),
+        account_root_with_balance(destination, 0, 0, 0),
+        account_root_with_balance(delegate, 0, 0, 1_000_000),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let mut tx = direct_xrp_payment_tx(source, destination, 100, 10);
+    tx.set_account_id(sf("sfDelegate"), delegate);
+    tx.set_field_vl(sf("sfSigningPubKey"), &[0xED; 33]);
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000)),
+        Ter::TES_SUCCESS
+    );
+}
+
+#[test]
+fn delegated_multisign_reaches_apply_after_shared_preclaim_authorization() {
+    let source = sample_account(0xAB);
+    let destination = sample_account(0xAC);
+    let delegate = sample_account(0xAD);
+    let signer = sample_account(0xAE);
+    let ledger = empty_ledger(vec![
+        account_root_with_balance(source, 0, 0, 1_000_000),
+        account_root_with_balance(destination, 0, 0, 0),
+        account_root_with_balance(delegate, 0, 0, 1_000_000),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let mut tx = direct_xrp_payment_tx(source, destination, 100, 10);
+    tx.set_account_id(sf("sfDelegate"), delegate);
+    tx.set_field_vl(sf("sfSigningPubKey"), &[]);
+    let mut signers = STArray::new(sf("sfSigners"));
+    let mut signer_object = STObject::make_inner_object(sf("sfSigner"));
+    signer_object.set_account_id(sf("sfAccount"), signer);
+    signer_object.set_field_vl(sf("sfSigningPubKey"), &[0xED; 33]);
+    signer_object.set_field_vl(sf("sfTxnSignature"), &[0x30, 0x00]);
+    signers.push_back(signer_object);
+    tx.set_field_array(sf("sfSigners"), signers);
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000)),
+        Ter::TES_SUCCESS
     );
 }
 
@@ -6503,7 +7306,7 @@ fn signer_list_set_destroy_modern_list_removes_one_owner_count() {
     let sttx = signer_list_set_tx(account, 0, &[]);
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &sttx, TxType::SIGNER_LIST_SET, None),
+        handle_real_dispatch(&mut view, &sttx, TxType::SIGNER_LIST_SET, Some(1_000_000),),
         Ter::TES_SUCCESS
     );
     let account_sle = view
@@ -6529,7 +7332,7 @@ fn signer_list_set_destroy_legacy_list_uses_signer_count_cost() {
             &mut view,
             &signer_list_set_tx(account, 0, &[]),
             TxType::SIGNER_LIST_SET,
-            None,
+            Some(1_000_000),
         ),
         Ter::TES_SUCCESS
     );
@@ -6563,7 +7366,7 @@ fn signer_list_set_destroy_updates_reserve_sponsor_counts() {
             &mut view,
             &signer_list_set_tx(account, 0, &[]),
             TxType::SIGNER_LIST_SET,
-            None,
+            Some(1_000_000),
         ),
         Ter::TES_SUCCESS
     );
@@ -6775,6 +7578,34 @@ fn permissioned_domain_set_dispatch_creates_sorted_domain_entry() {
             .get_field_v256(get_field_by_symbol("sfIndexes"))
             .value(),
         &[domain.key().to_owned()]
+    );
+}
+
+#[test]
+fn permissioned_domain_set_reserve_uses_sponsor_adjusted_owner_count() {
+    let account = sample_account(0x49);
+    let mut account_sle = account_root_with_balance(account, 1, 0, 160);
+    account_sle.set_field_u32(sf("sfSponsoredOwnerCount"), 1);
+    let mut ledger = empty_ledger(vec![account_sle]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 100,
+        increment: 50,
+    });
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = permissioned_domain_set_tx(account, 9, None, &[]);
+
+    // Pinned accountReserve computes (OwnerCount + 1 - SponsoredOwnerCount),
+    // so this needs 150 drops and succeeds. The obsolete OwnerCount+1 path
+    // would incorrectly require 200 drops and reject it.
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PERMISSIONED_DOMAIN_SET, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(permissioned_domain_keylet(raw_account_id(account), 9))
+            .expect("domain read")
+            .is_some()
     );
 }
 
@@ -7764,7 +8595,7 @@ fn offer_create_hybrid_domain_offer_places_domain_and_open_books() {
         Some(domain_id),
     );
 
-    let result = handle_real_dispatch(&mut view, &sttx, TxType::OFFER_CREATE, None);
+    let result = dispatch_with_pre_fee_balance(&mut view, &sttx, TxType::OFFER_CREATE);
 
     assert_eq!(result, protocol::Ter::TES_SUCCESS);
     let offer_keylet = protocol::offer_keylet(raw_account_id(account), 1);
@@ -7892,7 +8723,7 @@ fn offer_create_crosses_equal_quality_permissioned_domain_offer() {
         Some(domain_id),
     );
     assert_eq!(
-        handle_real_dispatch(&mut view, &maker, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut view, &maker, TxType::OFFER_CREATE),
         Ter::TES_SUCCESS
     );
     assert!(
@@ -7914,7 +8745,7 @@ fn offer_create_crosses_equal_quality_permissioned_domain_offer() {
         Some(domain_id),
     );
     assert_eq!(
-        handle_real_dispatch(&mut view, &crossing, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut view, &crossing, TxType::OFFER_CREATE),
         Ter::TES_SUCCESS
     );
     assert!(
@@ -7964,7 +8795,7 @@ fn offer_create_cancel_hybrid_offer_removes_domain_and_open_book_entries() {
         Some(domain_id),
     );
     assert_eq!(
-        handle_real_dispatch(&mut view, &create, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut view, &create, TxType::OFFER_CREATE),
         protocol::Ter::TES_SUCCESS
     );
 
@@ -7987,7 +8818,7 @@ fn offer_create_cancel_hybrid_offer_removes_domain_and_open_book_entries() {
         protocol::tfImmediateOrCancel,
     );
     assert_eq!(
-        handle_real_dispatch(&mut view, &cancel, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut view, &cancel, TxType::OFFER_CREATE),
         protocol::Ter::TEC_KILLED
     );
 
@@ -8057,12 +8888,7 @@ fn offer_create_hybrid_requires_domain_and_permissioned_dex_feature() {
         None,
     );
     assert_eq!(
-        handle_real_dispatch(
-            &mut no_domain_view,
-            &no_domain_tx,
-            TxType::OFFER_CREATE,
-            None
-        ),
+        dispatch_with_pre_fee_balance(&mut no_domain_view, &no_domain_tx, TxType::OFFER_CREATE,),
         protocol::Ter::TEM_INVALID_FLAG
     );
 
@@ -8077,7 +8903,7 @@ fn offer_create_hybrid_requires_domain_and_permissioned_dex_feature() {
         Some(sample_uint256(0x5A)),
     );
     assert_eq!(
-        handle_real_dispatch(&mut disabled_view, &disabled_tx, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut disabled_view, &disabled_tx, TxType::OFFER_CREATE),
         protocol::Ter::TEM_DISABLED
     );
 }
@@ -8159,6 +8985,87 @@ fn delegate_set_create_inserts_delegate_and_dual_owner_dirs() {
             .value(),
         &[delegate.key().to_owned()]
     );
+}
+
+#[test]
+fn delegate_set_reserve_uses_sponsor_adjusted_owner_and_account_counts() {
+    let account = sample_account(0x9A);
+    let authorize = sample_account(0x9B);
+    let mut account_sle = account_root_with_balance(account, 1, 0, 160);
+    account_sle.set_field_u32(sf("sfSponsoredOwnerCount"), 1);
+    let mut ledger = empty_ledger(vec![account_sle, account_root(authorize, 0, 0)]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 100,
+        increment: 50,
+    });
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = delegate_set_tx(account, authorize, &[65_540]);
+
+    // Pinned checkReserve charges one effective owner increment after
+    // subtracting sponsored objects. That is 150 drops here; the former
+    // account_reserve(OwnerCount+1) path incorrectly demanded 200.
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::DELEGATE_SET, None),
+        Ter::TES_SUCCESS
+    );
+}
+
+#[test]
+fn delegate_set_reserve_sponsor_is_persisted_and_counted_on_create_and_delete() {
+    let account = sample_account(0x33);
+    let authorize = sample_account(0x34);
+    let sponsor = sample_account(0x35);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(account, 0, 0, 1),
+        account_root(authorize, 0, 0),
+        account_root_with_balance(sponsor, 0, 0, 100_000_000),
+    ]);
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("PermissionDelegationV1_1"),
+        protocol::feature_id("Sponsor"),
+    ]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let mut create = delegate_set_tx(account, authorize, &[65_540]);
+    create.set_account_id(sf("sfSponsor"), sponsor);
+    create.set_field_u32(sf("sfSponsorFlags"), ledger::SPF_SPONSOR_RESERVE);
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &create, TxType::DELEGATE_SET, Some(1)),
+        Ter::TES_SUCCESS
+    );
+    let keylet = protocol::delegate_keylet(raw_account_id(account), raw_account_id(authorize));
+    let delegate = view.read(keylet).unwrap().expect("sponsored Delegate");
+    assert_eq!(delegate.get_account_id(sf("sfSponsor")), sponsor);
+    let owner = view
+        .read(account_keylet(raw_account_id(account)))
+        .unwrap()
+        .unwrap();
+    let sponsor_root = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.get_field_u32(sf("sfOwnerCount")), 1);
+    assert_eq!(owner.get_field_u32(sf("sfSponsoredOwnerCount")), 1);
+    assert_eq!(sponsor_root.get_field_u32(sf("sfSponsoringOwnerCount")), 1);
+
+    let delete = delegate_set_tx(account, authorize, &[]);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &delete, TxType::DELEGATE_SET, Some(1)),
+        Ter::TES_SUCCESS
+    );
+    assert!(view.read(keylet).unwrap().is_none());
+    let owner = view
+        .read(account_keylet(raw_account_id(account)))
+        .unwrap()
+        .unwrap();
+    let sponsor_root = view
+        .read(account_keylet(raw_account_id(sponsor)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.get_field_u32(sf("sfOwnerCount")), 0);
+    assert_eq!(owner.get_field_u32(sf("sfSponsoredOwnerCount")), 0);
+    assert_eq!(sponsor_root.get_field_u32(sf("sfSponsoringOwnerCount")), 0);
 }
 
 #[test]
@@ -8442,7 +9349,8 @@ fn loan_broker_set_create_mints_deterministic_pseudo_and_empty_holding() {
         protocol::feature_id("LendingProtocol"),
     ]));
     let broker_keylet = protocol::loan_broker_keylet(raw_account_id(owner), 1);
-    let expected_pseudo = pseudo_account_address(&ledger, broker_keylet.key);
+    let expected_pseudo =
+        pseudo_account_address(&ledger, broker_keylet.key).expect("pseudo account lookup");
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let sttx = loan_broker_set_tx(
         owner,
@@ -8802,7 +9710,7 @@ fn loan_broker_entrypoints_reject_missing_broker_with_no_entry() {
             &mut view,
             &loan_broker_cover_withdraw_tx(owner, broker_id, amount.clone()),
             TxType::LOAN_BROKER_COVER_WITHDRAW,
-            None,
+            Some(1_000_000),
         ),
         protocol::Ter::TEC_NO_ENTRY
     );
@@ -8911,7 +9819,7 @@ fn loan_broker_cover_withdraw_dispatch_rejects_malformed_before_lookup() {
             &mut view,
             &loan_broker_cover_withdraw_tx(owner, Uint256::zero(), positive_amount.clone()),
             TxType::LOAN_BROKER_COVER_WITHDRAW,
-            None,
+            Some(1_000_000),
         ),
         protocol::Ter::TEM_INVALID
     );
@@ -8920,7 +9828,7 @@ fn loan_broker_cover_withdraw_dispatch_rejects_malformed_before_lookup() {
             &mut view,
             &loan_broker_cover_withdraw_tx(owner, sample_uint256(0xB4), zero_amount),
             TxType::LOAN_BROKER_COVER_WITHDRAW,
-            None,
+            Some(1_000_000),
         ),
         protocol::Ter::TEM_BAD_AMOUNT
     );
@@ -8934,7 +9842,7 @@ fn loan_broker_cover_withdraw_dispatch_rejects_malformed_before_lookup() {
                 positive_amount,
             ),
             TxType::LOAN_BROKER_COVER_WITHDRAW,
-            None,
+            Some(1_000_000),
         ),
         protocol::Ter::TEM_MALFORMED
     );
@@ -8971,7 +9879,7 @@ fn loan_broker_cover_withdraw_rejects_pseudo_destination_before_missing_broker()
                 amount,
             ),
             TxType::LOAN_BROKER_COVER_WITHDRAW,
-            None,
+            Some(1_000_000),
         ),
         protocol::Ter::TEC_PSEUDO_ACCOUNT
     );
@@ -10010,7 +10918,7 @@ fn loan_broker_cover_withdraw_rejects_insufficient_pseudo_iou_balance_before_mut
         &mut view,
         &loan_broker_cover_withdraw_tx(owner, broker_id, amount),
         TxType::LOAN_BROKER_COVER_WITHDRAW,
-        None,
+        Some(1_000_000),
     );
 
     assert_eq!(result, protocol::Ter::TEC_INSUFFICIENT_FUNDS);
@@ -10082,7 +10990,7 @@ fn loan_broker_cover_withdraw_requires_strong_iou_auth_for_third_party_destinati
         &mut view,
         &loan_broker_cover_withdraw_to_tx(owner, destination, broker_id, amount),
         TxType::LOAN_BROKER_COVER_WITHDRAW,
-        None,
+        Some(1_000_000),
     );
 
     assert_eq!(result, protocol::Ter::TEC_NO_AUTH);
@@ -13438,6 +14346,25 @@ fn amm_deposit_clears_stale_auth_accounts_after_empty_pool_reinit() {
         .expect("amm should remain");
     let updated_slot = updated.get_field_object(sf("sfAuctionSlot"));
     assert!(!updated_slot.is_field_present(sf("sfAuthAccounts")));
+    assert_eq!(updated_slot.get_account_id(sf("sfAccount")), depositor);
+    assert_eq!(
+        updated_slot.get_field_u32(sf("sfExpiration")),
+        view.header()
+            .parent_close_time
+            .saturating_add(protocol::TOTAL_TIME_SLOT_SECS)
+    );
+    assert_eq!(updated_slot.get_field_amount(sf("sfPrice")).signum(), 0);
+    assert!(!updated_slot.is_field_present(sf("sfDiscountedFee")));
+    assert!(!updated.is_field_present(sf("sfTradingFee")));
+    let votes = updated.get_field_array(sf("sfVoteSlots"));
+    assert_eq!(votes.len(), 1);
+    let vote = votes.iter().next().expect("one vote slot");
+    assert_eq!(vote.get_account_id(sf("sfAccount")), depositor);
+    assert_eq!(
+        vote.get_field_u32(sf("sfVoteWeight")),
+        protocol::VOTE_WEIGHT_SCALE_FACTOR
+    );
+    assert!(!vote.is_field_present(sf("sfTradingFee")));
 }
 
 #[test]
@@ -14471,7 +15398,7 @@ fn amm_deposit_uses_active_auction_slot_discount_for_single_asset_math() {
 }
 
 #[test]
-fn amm_withdraw_allows_nontransferable_mpt_asset_recovery_path() {
+fn amm_withdraw_fix_v1_2_creates_missing_mpt_holding_only_after_amendment() {
     let account = sample_account(0x17);
     let issuer = sample_account(0x18);
     let amm_account = sample_account(0x40);
@@ -14483,23 +15410,6 @@ fn amm_withdraw_allows_nontransferable_mpt_asset_recovery_path() {
         mpt_issue,
     );
     let xrp_asset = STAmount::from_xrp_amount(XRPAmount::from_drops(100));
-    let mut ledger = empty_ledger(vec![
-        account_root_with_balance(account, 0, 0, 1_000_000_000),
-        account_root(issuer, 1, 0),
-        account_root(amm_account, 0, 0),
-        mpt_issuance_entry(issuer, 1, 100, protocol::lsfMPTCanTrade),
-        mptoken_entry(account, mpt_id, 50),
-        mptoken_entry(amm_account, mpt_id, 100),
-        trust_line_entry_iou(
-            account,
-            amm_account,
-            currency_from_string("LPT"),
-            IOUAmount::from_parts(1, 0).expect("lp trustline balance"),
-        ),
-        amm_mpt_xrp_entry(amm_account, mpt_issue, 100, 100),
-    ]);
-    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV2")]));
-    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::AMM_WITHDRAW, |tx| {
         tx.set_account_id(sf("sfAccount"), account);
         tx.set_field_u32(sf("sfFlags"), protocol::AMM_LP_TOKEN_FLAG);
@@ -14520,9 +15430,49 @@ fn amm_withdraw_allows_nontransferable_mpt_asset_recovery_path() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_WITHDRAW, None);
-
-    assert_eq!(result, Ter::TES_SUCCESS);
+    for (fix_enabled, owner_count, pre_fee_balance, expected, holding_created) in [
+        (false, 0, 1_000_000_000, Ter::TEC_NO_AUTH, false),
+        (true, 0, 1_000_000_000, Ter::TES_SUCCESS, true),
+        // MPT reserve uses the captured pre-fee balance, not the larger
+        // current balance. With two existing objects this must fail reserve.
+        (true, 2, 0, Ter::TEC_INSUFFICIENT_RESERVE, false),
+    ] {
+        let mut ledger = empty_ledger(vec![
+            account_root_with_balance(account, owner_count, 0, 1_000_000_000),
+            account_root(issuer, 1, 0),
+            account_root(amm_account, 0, 0),
+            mpt_issuance_entry(issuer, 1, 100, protocol::lsfMPTCanTrade),
+            mptoken_entry(amm_account, mpt_id, 100),
+            trust_line_entry_iou(
+                account,
+                amm_account,
+                currency_from_string("LPT"),
+                IOUAmount::from_parts(1, 0).expect("lp trustline balance"),
+            ),
+            amm_mpt_xrp_entry(amm_account, mpt_issue, 100, 100),
+        ]);
+        ledger.set_fees(Fees {
+            base: 10,
+            reserve: 200,
+            increment: 50,
+        });
+        let mut amendments = vec![protocol::feature_id("MPTokensV2")];
+        if fix_enabled {
+            amendments.push(protocol::feature_id("fixAMMv1_2"));
+        }
+        ledger.set_rules(protocol::Rules::new(amendments));
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let result =
+            handle_real_dispatch(&mut view, &tx, TxType::AMM_WITHDRAW, Some(pre_fee_balance));
+        assert_eq!(result, expected, "fixAMMv1_2 enabled={fix_enabled}");
+        let holding = view
+            .read(protocol::mptoken_keylet_from_mptid(
+                mpt_id,
+                Uint160::from_void(account.data()),
+            ))
+            .expect("holder MPToken read");
+        assert_eq!(holding.is_some(), holding_created);
+    }
 }
 
 #[test]
@@ -14572,7 +15522,7 @@ fn amm_withdraw_rejects_require_auth_mpt_asset_without_authorization() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_WITHDRAW, None);
+    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_WITHDRAW, Some(1_000_000_000));
 
     assert_eq!(result, Ter::TEC_NO_AUTH);
 }
@@ -14625,7 +15575,7 @@ fn amm_withdraw_rejects_locked_mpt_asset_before_pool_mutation() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_WITHDRAW, None);
+    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_WITHDRAW, Some(1_000_000_000));
 
     assert_eq!(result, Ter::TEC_LOCKED);
 }
@@ -14677,7 +15627,7 @@ fn amm_withdraw_rejects_locked_mpt_pool_holding_before_pool_mutation() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_WITHDRAW, None);
+    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_WITHDRAW, Some(1_000_000_000));
 
     assert_eq!(result, Ter::TEC_LOCKED);
 }
@@ -14724,7 +15674,7 @@ fn amm_clawback_with_amount_withdraws_from_pool_burns_lp_and_claws_primary_asset
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_CLAWBACK, None);
+    let result = dispatch_with_pre_fee_balance(&mut view, &tx, TxType::AMM_CLAWBACK);
 
     assert_eq!(result, Ter::TES_SUCCESS);
     let amm = view
@@ -14778,7 +15728,7 @@ fn amm_clawback_with_amount_withdraws_from_pool_burns_lp_and_claws_primary_asset
 }
 
 #[test]
-fn amm_clawback_mpt_amount_redeems_to_issuer_and_reduces_outstanding() {
+fn amm_clawback_fix_v1_2_recreates_authorized_mpt_then_redeems_to_issuer() {
     let issuer = sample_account(0x61);
     let holder = sample_account(0x62);
     let amm_account = sample_account(0x63);
@@ -14791,13 +15741,20 @@ fn amm_clawback_mpt_amount_redeems_to_issuer_and_reduces_outstanding() {
         account_root(issuer, 0, 0),
         account_root_with_balance(holder, 0, 0, 1_000),
         account_root_with_balance(amm_account, 0, 0, 100),
-        mpt_issuance_entry(issuer, 1, 200, protocol::lsfMPTCanClawback),
+        mpt_issuance_entry(
+            issuer,
+            1,
+            200,
+            protocol::lsfMPTCanClawback | protocol::lsfMPTRequireAuth,
+        ),
         mptoken_entry(amm_account, mpt_id, 100),
-        mptoken_entry(holder, mpt_id, 0),
         trust_line_entry(holder, amm_account, lpt_currency, 10),
         amm_mpt_xrp_entry(amm_account, mpt_issue, 100, 100),
     ]);
-    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV2")]));
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV2"),
+        protocol::feature_id("fixAMMv1_2"),
+    ]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::AMM_CLAWBACK, |tx| {
         tx.set_account_id(sf("sfAccount"), issuer);
@@ -14821,7 +15778,7 @@ fn amm_clawback_mpt_amount_redeems_to_issuer_and_reduces_outstanding() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_CLAWBACK, None);
+    let result = dispatch_with_pre_fee_balance(&mut view, &tx, TxType::AMM_CLAWBACK);
 
     assert_eq!(result, Ter::TES_SUCCESS);
     let issuance = view
@@ -14837,6 +15794,7 @@ fn amm_clawback_mpt_amount_redeems_to_issuer_and_reduces_outstanding() {
         .expect("holder token read should succeed")
         .expect("holder token should remain");
     assert_eq!(holder_token.get_field_u64(sf("sfMPTAmount")), 0);
+    assert!(holder_token.is_flag(protocol::lsfMPTAuthorized));
     let amm_token = view
         .read(protocol::mptoken_keylet_from_mptid(
             mpt_id,
@@ -14882,7 +15840,7 @@ fn amm_clawback_mpt_amount_requires_mptokens_v2_before_amount_validation() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::AMM_CLAWBACK, None),
+        handle_real_dispatch(&mut view, &tx, TxType::AMM_CLAWBACK, Some(0)),
         Ter::TEM_DISABLED
     );
 }
@@ -15517,7 +16475,7 @@ fn loan_pay_base_fee_uses_loan_scale_and_upward_periodic_rounding() {
         tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    assert_eq!(calculate_loan_pay_base_fee(&ledger, &tx, 10), 10);
+    assert_eq!(calculate_loan_pay_base_fee(&ledger, &tx, 10), Ok(10));
 }
 
 #[test]
@@ -15736,6 +16694,10 @@ fn loan_pay_regular_mpt_interest_payment_keeps_integer_principal_after_cleanup_3
         account_root(issuer, 1, 0),
         mpt_issuance_entry(issuer, 1, 10, protocol::lsfMPTCanTransfer),
         mptoken_entry(borrower, mpt_id, 3),
+        // A Vault pseudo-account owns its asset holding from VaultCreate.
+        // Pinned accountSendMulti does not synthesize a missing destination
+        // holding during LoanPay.
+        mptoken_entry(vault_pseudo, mpt_id, 0),
         loan,
         broker,
         vault,
@@ -16380,9 +17342,9 @@ fn loan_pay_overpayment_skips_invalid_reamortization_guard() {
 }
 
 #[test]
-fn mptoken_issuance_set_dispatch_ignores_set_clear_flag_without_mutable_flags() {
+fn mptoken_issuance_set_dispatch_lock_only_changes_holder_lock_state() {
     // Regression: C++ doApply has no sfSetFlag/sfClearFlag fallback.
-    // When sfMutableFlags is absent, the only flag mutation is lock/unlock.
+    // Without capability-enable flags, the only flag mutation is lock/unlock.
     let issuer = sample_account(0xB1);
     let mpt_id = share_id_for(issuer, 1);
     let issuance = mpt_issuance_entry(
@@ -16400,7 +17362,7 @@ fn mptoken_issuance_set_dispatch_ignores_set_clear_flag_without_mutable_flags() 
     ]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
-    // Submit with sfSetFlag present but no sfMutableFlags — C++ ignores it
+    // Submit only tfMPTLock; no capability flag is enabled.
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_SET, |object| {
         object.set_account_id(get_field_by_symbol("sfAccount"), issuer);
         object.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), mpt_id);
@@ -16502,6 +17464,39 @@ fn nftoken_mint_and_burn_dispatch_split_then_merge_pages_with_page_owner_counts(
             .expect("old page read")
             .is_none()
     );
+}
+
+#[test]
+fn nftoken_mint_reserve_uses_sponsored_account_base() {
+    let account = sample_account(0xAC);
+    let sponsor = sample_account(0xAD);
+    let mut root = account_root_with_balance(account, 0, 0, 50);
+    root.set_account_id(sf("sfSponsor"), sponsor);
+    let mut ledger = empty_ledger(vec![root]);
+    ledger.set_fees(ledger::Fees {
+        base: 10,
+        reserve: 200,
+        increment: 50,
+    });
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &nftoken_mint_tx(account, 0, None),
+            TxType::NFTOKEN_MINT,
+            Some(50),
+        ),
+        Ter::TES_SUCCESS,
+        "pinned accountReserve excludes a sponsored AccountRoot base while charging the new NFT page owner reserve"
+    );
+    let root = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("account read")
+        .expect("account exists");
+    assert_eq!(root.get_field_u32(sf("sfOwnerCount")), 1);
+    assert_eq!(ledger::reserve_owner_count(&root, 0), 1);
+    assert_eq!(ledger::reserve_account_count(&root, 0), 0);
 }
 
 #[test]
@@ -16713,7 +17708,7 @@ fn nftoken_accept_offer_propagates_underfunded_xrp_payment() {
             TxType::NFTOKEN_ACCEPT_OFFER,
             None,
         ),
-        Ter::TEC_FAILED_PROCESSING
+        Ter::TEC_INSUFFICIENT_FUNDS
     );
 }
 
@@ -17096,7 +18091,7 @@ fn amm_clawback_matrix_mpt_exact_thresholds() {
         });
 
         let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
-        let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_CLAWBACK, None);
+        let result = dispatch_with_pre_fee_balance(&mut view, &tx, TxType::AMM_CLAWBACK);
         assert_eq!(result, row.expected, "failed on: {}", row.desc);
     }
 }

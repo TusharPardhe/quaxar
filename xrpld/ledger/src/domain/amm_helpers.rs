@@ -233,6 +233,34 @@ where
     ((max_number - min_number) / max_number) < dist
 }
 
+/// Post-withdraw AMM supply invariant used by rippled's
+/// `checkAMMPrecisionLoss`. The geometric mean of the remaining pool balances
+/// must cover the remaining LP-token supply, subject only to the invariant
+/// checker's 1e-11 relative tolerance.
+pub fn check_amm_precision_loss(
+    amount: &STAmount,
+    amount2: &STAmount,
+    new_lp_token_balance: &STAmount,
+) -> protocol::Ter {
+    if new_lp_token_balance.signum() <= 0 {
+        return protocol::Ter::TES_SUCCESS;
+    }
+    let product_mean = root2(stamount_as_number(amount) * stamount_as_number(amount2))
+        .expect("nonnegative AMM pool product must have a square root");
+    let lp_balance = stamount_as_number(new_lp_token_balance);
+    if product_mean >= lp_balance {
+        return protocol::Ter::TES_SUCCESS;
+    }
+    let tolerance =
+        RuntimeNumber::try_from_external_parts(1, -11, basics::number::get_mantissa_scale())
+            .expect("AMM invariant tolerance must be representable");
+    if within_relative_distance_amount(product_mean, lp_balance, tolerance) {
+        protocol::Ter::TES_SUCCESS
+    } else {
+        protocol::Ter::TEC_PRECISION_LOSS
+    }
+}
+
 pub fn solve_quadratic_eq_smallest(
     a: RuntimeNumber,
     b: RuntimeNumber,

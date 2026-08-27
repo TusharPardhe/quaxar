@@ -71,13 +71,13 @@ impl MPTokenIssuanceCreateApplySink<&'static str, Vec<u8>, &'static str> for Tes
 #[test]
 fn mp_token_issuance_create_feature_gate() {
     assert!(!mp_token_issuance_create_check_extra_features(
-        true, false, true, false, true
+        true, false, true, false, true, false, 0, None
     ));
     assert!(!mp_token_issuance_create_check_extra_features(
-        false, true, true, true, false
+        false, true, true, true, false, false, 0, None
     ));
     assert!(mp_token_issuance_create_check_extra_features(
-        true, true, true, true, true
+        true, true, true, true, true, false, 0, None
     ));
 }
 
@@ -96,7 +96,7 @@ fn mp_token_issuance_create_preflight_guards() {
             fix_cleanup_3_2_0_enabled: true,
             confidential_transfer_enabled: false,
             reference_holding_present: true,
-            mutable_flags: None,
+            immutable_flags: None,
             tx_flags: 0,
             transfer_fee: None,
             domain_id_present: false,
@@ -109,7 +109,7 @@ fn mp_token_issuance_create_preflight_guards() {
             fix_cleanup_3_2_0_enabled: false,
             confidential_transfer_enabled: false,
             reference_holding_present: false,
-            mutable_flags: Some(0),
+            immutable_flags: Some(0),
             tx_flags: 0,
             transfer_fee: None,
             domain_id_present: false,
@@ -122,7 +122,7 @@ fn mp_token_issuance_create_preflight_guards() {
             fix_cleanup_3_2_0_enabled: false,
             confidential_transfer_enabled: false,
             reference_holding_present: false,
-            mutable_flags: Some(tmfMPTokenIssuanceCreateMutableMask),
+            immutable_flags: Some(tmfMPTokenIssuanceCreateMutableMask),
             tx_flags: 0,
             transfer_fee: None,
             domain_id_present: false,
@@ -134,7 +134,7 @@ fn mp_token_issuance_create_preflight_guards() {
         fix_cleanup_3_2_0_enabled: false,
         confidential_transfer_enabled: false,
         reference_holding_present: false,
-        mutable_flags: None,
+        immutable_flags: None,
         tx_flags: tfMPTCanTransfer,
         transfer_fee: Some(MAX_TRANSFER_FEE + 1),
         domain_id_present: false,
@@ -147,7 +147,7 @@ fn mp_token_issuance_create_preflight_guards() {
             fix_cleanup_3_2_0_enabled: false,
             confidential_transfer_enabled: false,
             reference_holding_present: false,
-            mutable_flags: None,
+            immutable_flags: None,
             tx_flags: 0,
             transfer_fee: Some(1),
             domain_id_present: false,
@@ -159,7 +159,7 @@ fn mp_token_issuance_create_preflight_guards() {
         fix_cleanup_3_2_0_enabled: false,
         confidential_transfer_enabled: false,
         reference_holding_present: false,
-        mutable_flags: None,
+        immutable_flags: None,
         tx_flags: tfMPTRequireAuth,
         transfer_fee: None,
         domain_id_present: true,
@@ -172,7 +172,7 @@ fn mp_token_issuance_create_preflight_guards() {
             fix_cleanup_3_2_0_enabled: false,
             confidential_transfer_enabled: false,
             reference_holding_present: false,
-            mutable_flags: None,
+            immutable_flags: None,
             tx_flags: 0,
             transfer_fee: None,
             domain_id_present: true,
@@ -185,7 +185,7 @@ fn mp_token_issuance_create_preflight_guards() {
             fix_cleanup_3_2_0_enabled: false,
             confidential_transfer_enabled: false,
             reference_holding_present: false,
-            mutable_flags: None,
+            immutable_flags: None,
             tx_flags: 0,
             transfer_fee: None,
             domain_id_present: false,
@@ -198,7 +198,7 @@ fn mp_token_issuance_create_preflight_guards() {
             fix_cleanup_3_2_0_enabled: false,
             confidential_transfer_enabled: false,
             reference_holding_present: false,
-            mutable_flags: None,
+            immutable_flags: None,
             tx_flags: 0,
             transfer_fee: None,
             domain_id_present: false,
@@ -210,7 +210,7 @@ fn mp_token_issuance_create_preflight_guards() {
         fix_cleanup_3_2_0_enabled: false,
         confidential_transfer_enabled: false,
         reference_holding_present: false,
-        mutable_flags: None,
+        immutable_flags: None,
         tx_flags: 0,
         transfer_fee: None,
         domain_id_present: false,
@@ -223,7 +223,7 @@ fn mp_token_issuance_create_preflight_guards() {
             fix_cleanup_3_2_0_enabled: false,
             confidential_transfer_enabled: false,
             reference_holding_present: false,
-            mutable_flags: None,
+            immutable_flags: None,
             tx_flags: 0,
             transfer_fee: None,
             domain_id_present: false,
@@ -251,7 +251,7 @@ fn mp_token_issuance_create_preflight_accepts_valid_inputs() {
         fix_cleanup_3_2_0_enabled: true,
         confidential_transfer_enabled: false,
         reference_holding_present: false,
-        mutable_flags: Some(tmfMPTCanMutateCanLock),
+        immutable_flags: Some(tmfMPTCanMutateCanLock),
         tx_flags: tfMPTCanTransfer | tfMPTRequireAuth,
         transfer_fee: Some(MAX_TRANSFER_FEE),
         domain_id_present: true,
@@ -277,7 +277,7 @@ fn mp_token_issuance_create_do_apply_preserves_and_masks_universal_flags() {
             transfer_fee: Some(10),
             metadata: Some(vec![1, 2]),
             domain_id: Some("domain"),
-            mutable_flags: Some(tmfMPTCanMutateCanLock),
+            immutable_flags: Some(tmfMPTCanMutateCanLock),
         },
         &mut sink,
     );
@@ -311,7 +311,7 @@ fn mp_token_issuance_create_do_apply_maps_cpp_failures() {
         transfer_fee: None,
         metadata: None::<Vec<u8>>,
         domain_id: None::<&'static str>,
-        mutable_flags: None,
+        immutable_flags: None,
     };
 
     let mut missing = TestSink::new();

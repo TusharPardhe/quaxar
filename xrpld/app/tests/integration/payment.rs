@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use app::state::transactor_dispatcher::handle_real_dispatch;
+use app::state::transactor_dispatcher::handle_real_dispatch as production_handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{
@@ -22,6 +22,28 @@ use super::pipeline::full_apply;
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
+}
+
+// These fixtures intentionally exercise the handler without the generic
+// fee/sequence shell. Production nevertheless captures the source balance
+// before fee payment, so supply that same snapshot for Payment/Offer routes.
+fn handle_real_dispatch<V: ApplyView>(
+    view: &mut V,
+    tx: &STTx,
+    tx_type: TxType,
+    pre_fee_balance: Option<i64>,
+) -> Ter {
+    let pre_fee_balance =
+        if pre_fee_balance.is_none() && matches!(tx_type, TxType::PAYMENT | TxType::OFFER_CREATE) {
+            let account = tx.get_account_id(sf("sfAccount"));
+            match view.read(account_keylet(Uint160::from_void(account.data()))) {
+                Ok(Some(sle)) => Some(sle.get_field_amount(sf("sfBalance")).xrp().drops()),
+                Ok(None) | Err(_) => None,
+            }
+        } else {
+            pre_fee_balance
+        };
+    production_handle_real_dispatch(view, tx, tx_type, pre_fee_balance)
 }
 
 fn payment_tx(from: AccountID, to: AccountID, amount: STAmount, seq: u32) -> STTx {

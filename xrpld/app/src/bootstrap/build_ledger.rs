@@ -25,9 +25,91 @@ use protocol::{
 };
 use rayon::prelude::*;
 use shamap::{mutation::MutationError, traversal::TraversalError};
-use tx::{ApplyFlags, ApplyTransactionResult};
+use tx::{ApplyFlags, ApplyResult, ApplyTransactionResult};
 
 use crate::{LEDGER_RETRY_PASSES, LEDGER_TOTAL_PASSES};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CanonicalRetryDisposition {
+    Applied,
+    Failed,
+    Retry,
+}
+
+pub(crate) fn canonical_retry_disposition(result: ApplyResult) -> CanonicalRetryDisposition {
+    match tx::classify_apply_transaction_result(result) {
+        ApplyTransactionResult::Success => CanonicalRetryDisposition::Applied,
+        ApplyTransactionResult::Fail => CanonicalRetryDisposition::Failed,
+        ApplyTransactionResult::Retry => CanonicalRetryDisposition::Retry,
+    }
+}
+
+/// Returns the flags for one canonical BuildLedger application pass.
+///
+/// Keep this shared with the live `ApplicationRoot` close path: an assured
+/// retry pass must carry `TapRETRY`, while the final pass must not, so an
+/// otherwise retryable `tec` can claim its fee exactly as rippled does.
+pub(crate) const fn canonical_retry_flags(certain_retry: bool) -> ApplyFlags {
+    if certain_retry {
+        ApplyFlags::RETRY
+    } else {
+        ApplyFlags::NONE
+    }
+}
+
+/// Advances rippled's `applyTransactions` retry state after one pass.
+/// Returns `false` when the caller must stop.
+pub(crate) fn advance_canonical_retry_pass(
+    changes: usize,
+    pass: usize,
+    certain_retry: &mut bool,
+) -> bool {
+    if changes == 0 && !*certain_retry {
+        return false;
+    }
+    if changes == 0 || pass >= LEDGER_RETRY_PASSES {
+        *certain_retry = false;
+    }
+    true
+}
+
+/// The exact retry/final-pass driver used by the bootstrap builder and its
+/// dependency regression. The live consensus close loop has richer metadata
+/// handling, but shares the classification, flags, and pass-state helpers
+/// above. LedgerReplay deliberately does not use this path because verified
+/// TransactionMd indexes already define its application order.
+fn run_canonical_retry_passes<T>(
+    mut pending: Vec<T>,
+    mut apply: impl FnMut(&T, ApplyFlags) -> Option<CanonicalRetryDisposition>,
+) -> Option<usize> {
+    let mut certain_retry = true;
+    let mut applied = 0usize;
+    for pass in 0..LEDGER_TOTAL_PASSES {
+        if pending.is_empty() {
+            break;
+        }
+        let mut changes = 0usize;
+        let pass_txs = std::mem::take(&mut pending);
+        let flags = canonical_retry_flags(certain_retry);
+
+        for item in pass_txs {
+            match apply(&item, flags)? {
+                CanonicalRetryDisposition::Applied => {
+                    changes += 1;
+                    applied += 1;
+                }
+                CanonicalRetryDisposition::Failed => {}
+                CanonicalRetryDisposition::Retry => pending.push(item),
+            }
+        }
+
+        if !advance_canonical_retry_pass(changes, pass, &mut certain_retry) {
+            break;
+        }
+    }
+    debug_assert!(pending.is_empty() || !certain_retry);
+    Some(applied)
+}
 
 fn full_sync_debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -129,8 +211,23 @@ where
         for tx in pending {
             let txid = tx.get_transaction_id();
 
-            if pass == 0 && built.tx_exists(txid) {
-                continue;
+            if pass == 0 {
+                match built.try_tx_exists(txid) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        // BuildLedger.cpp wraps both txExists and
+                        // applyTransaction in the same per-transaction try
+                        // block. A traversal exception rejects this
+                        // transaction; it must never be interpreted as
+                        // "absent" and replayed.
+                        journal.warn(&format!(
+                            "Transaction {txid} throws during parent transaction lookup: {error:?}"
+                        ));
+                        failed.insert(txid);
+                        continue;
+                    }
+                }
             }
 
             match apply_transaction(view, &tx, certain_retry, ApplyFlags::NONE) {
@@ -451,12 +548,17 @@ pub fn decode_acquired_tx_set(
 fn parallel_preflight_precheck(
     txs: &[Arc<STTx>],
     rules: &protocol::Rules,
+    node_network_id: u32,
 ) -> std::collections::HashSet<Uint256> {
     txs.par_iter()
         .filter_map(|tx| {
-            (!protocol::is_tes_success(crate::state::application_root::transaction_preflight_ter(
-                tx, rules,
-            )))
+            (!protocol::is_tes_success(
+                crate::state::application_root::transaction_preflight_ter_with_network_id(
+                    tx,
+                    rules,
+                    node_network_id,
+                ),
+            ))
             .then(|| tx.get_transaction_id())
         })
         .collect()
@@ -470,8 +572,12 @@ fn replay_transactions_for_reconstruction(replay: &LedgerReplay) -> Vec<ledger::
 
 fn decode_acquired_transaction_metadata(
     tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
-) -> Option<std::collections::BTreeMap<basics::base_uint::Uint256, Arc<Serializer>>> {
+) -> Option<(
+    Vec<Arc<STTx>>,
+    std::collections::BTreeMap<basics::base_uint::Uint256, Arc<Serializer>>,
+)> {
     let mut metadata = std::collections::BTreeMap::new();
+    let mut ordered = std::collections::BTreeMap::new();
     for (payload, expected_id) in tx_items {
         let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut outer = protocol::SerialIter::new(payload);
@@ -479,22 +585,51 @@ fn decode_acquired_transaction_metadata(
             let metadata_bytes = outer.get_vl();
             let mut tx_serial = protocol::SerialIter::new(&tx_bytes);
             let tx = STTx::from_serial_iter(&mut tx_serial);
-            (tx.get_transaction_id(), metadata_bytes)
+            let mut metadata_serial = protocol::SerialIter::new(&metadata_bytes);
+            let metadata_object = protocol::STObject::from_serial_iter(
+                &mut metadata_serial,
+                protocol::get_field_by_symbol("sfMetadata"),
+                0,
+            );
+            let transaction_index = protocol::get_field_by_symbol("sfTransactionIndex");
+            if !metadata_object.is_field_present(transaction_index) {
+                return None;
+            }
+            Some((
+                tx.get_transaction_id(),
+                tx,
+                metadata_object.get_field_u32(transaction_index),
+                metadata_bytes,
+            ))
         }))
-        .ok()?;
-        if parsed.0 != *expected_id
+        .ok()??;
+        let (transaction_id, transaction, transaction_index, metadata_bytes) = parsed;
+        if transaction_id != *expected_id
             || metadata
-                .insert(parsed.0, Arc::new(Serializer::from_bytes(parsed.1)))
+                .insert(
+                    transaction_id,
+                    Arc::new(Serializer::from_bytes(metadata_bytes)),
+                )
+                .is_some()
+            || ordered
+                .insert(transaction_index, Arc::new(transaction))
                 .is_some()
         {
             return None;
         }
     }
-    Some(metadata)
+    Some((ordered.into_values().collect(), metadata))
 }
 
 pub fn build_ledger_from_replay_delta(
     replay: &LedgerReplay,
+) -> Result<Arc<ledger::Ledger>, String> {
+    build_ledger_from_replay_delta_with_network_id(replay, 0)
+}
+
+pub fn build_ledger_from_replay_delta_with_network_id(
+    replay: &LedgerReplay,
+    node_network_id: u32,
 ) -> Result<Arc<ledger::Ledger>, String> {
     // Do not send verified replay transactions through CanonicalTXSet:
     // dependent transactions require their TransactionMd ordering.
@@ -504,6 +639,7 @@ pub fn build_ledger_from_replay_delta(
         replay.replay().header(),
         &[],
         Some(ordered),
+        node_network_id,
     )
     .map(Arc::new)
     .ok_or_else(|| "replay ledger build did not match its verified header".to_owned())
@@ -514,7 +650,7 @@ pub fn build_ledger_from_acquired_tx(
     acquired_header: protocol::LedgerHeader,
     tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
 ) -> Option<ledger::Ledger> {
-    build_ledger_from_acquired_tx_with_order(parent, acquired_header, tx_items, None)
+    build_ledger_from_acquired_tx_with_order(parent, acquired_header, tx_items, None, 0)
 }
 
 fn build_ledger_from_acquired_tx_with_order(
@@ -522,9 +658,10 @@ fn build_ledger_from_acquired_tx_with_order(
     acquired_header: protocol::LedgerHeader,
     tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
     replay_order: Option<Vec<ledger::ReplayTransaction>>,
+    node_network_id: u32,
 ) -> Option<ledger::Ledger> {
     use crate::state::application_root::{
-        apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim,
+        apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id,
         queue_apply_preclaim_ter,
     };
     use std::sync::Arc;
@@ -583,20 +720,13 @@ fn build_ledger_from_acquired_tx_with_order(
             .collect();
         (ordered_txs, transaction_metadata)
     } else {
-        (
-            decode_acquired_tx_set(
-                tx_items,
-                *acquired_header.tx_hash.as_uint256(),
-                shamap::tree_node::SHAMapNodeType::TransactionMd,
-            ),
-            decode_acquired_transaction_metadata(tx_items)?,
-        )
+        decode_acquired_transaction_metadata(tx_items)?
     };
     let tx_count = ordered_txs.len();
 
     // Parallel semantic + signature preflight: reject invalid transactions
     // before the sequential immutable preclaim and sandbox stages.
-    let bad_preflights = parallel_preflight_precheck(&ordered_txs, built.rules());
+    let bad_preflights = parallel_preflight_precheck(&ordered_txs, built.rules(), node_network_id);
     if !bad_preflights.is_empty() {
         tracing::debug!(target: "ledger",
             "[build] parallel sig precheck rejected {} of {} txs in seq={}",
@@ -714,12 +844,13 @@ fn build_ledger_from_acquired_tx_with_order(
             built.header().drops
         );
         let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id(
                 &mut view,
                 sttx,
                 txn_type,
                 protocol::ApplyFlags::NONE,
                 preclaim,
+                node_network_id,
             )
         }));
 
@@ -1116,8 +1247,29 @@ pub fn build_ledger_from_consensus(
         >,
     >,
 ) -> Option<ledger::Ledger> {
+    build_ledger_from_consensus_with_network_id(parent, header, tx_items, node_fetcher, 0)
+}
+
+pub fn build_ledger_from_consensus_with_network_id(
+    parent: &ledger::Ledger,
+    header: protocol::LedgerHeader,
+    tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
+    node_fetcher: Option<
+        std::sync::Arc<
+            dyn Fn(
+                    basics::sha_map_hash::SHAMapHash,
+                ) -> Option<
+                    basics::memory::intrusive_pointer::SharedIntrusive<
+                        shamap::nodes::tree_node::SHAMapTreeNode,
+                    >,
+                > + Send
+                + Sync,
+        >,
+    >,
+    node_network_id: u32,
+) -> Option<ledger::Ledger> {
     use crate::state::application_root::{
-        apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim,
+        apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id,
         queue_apply_preclaim_ter,
     };
     use std::sync::Arc;
@@ -1159,8 +1311,16 @@ pub fn build_ledger_from_consensus(
 
     // Parallel semantic + signature preflight; this is not a raw-signature
     // admission shortcut.
-    let bad_preflights = parallel_preflight_precheck(&ordered_txs, built.rules());
+    let bad_preflights = parallel_preflight_precheck(&ordered_txs, built.rules(), node_network_id);
 
+    // BuildLedger.cpp::applyTransactions keeps the canonical set pending
+    // across TapRetry passes.  A transaction encountered before the
+    // transaction that satisfies its sequence/ticket dependency must not be
+    // dropped permanently; it is retried after the accumulator changes, then
+    // receives one final non-retry attempt where a tec result may claim its
+    // fee.  LedgerReplay is intentionally different and remains the
+    // TransactionMd-index ordered path above.
+    let mut pending = Vec::with_capacity(ordered_txs.len());
     for sttx in ordered_txs {
         let tx_id = sttx.get_transaction_id();
 
@@ -1187,13 +1347,21 @@ pub fn build_ledger_from_consensus(
             continue;
         }
 
+        pending.push(sttx);
+    }
+
+    run_canonical_retry_passes(pending, |sttx, apply_flags| {
+        let tx_id = sttx.get_transaction_id();
+
         let txn_type = sttx.get_txn_type();
 
-        let preclaim =
-            queue_apply_preclaim_ter(&accum, &sttx, header.seq, protocol::ApplyFlags::NONE);
+        let preclaim = queue_apply_preclaim_ter(&accum, &sttx, header.seq, apply_flags);
         if !protocol::is_tes_success(preclaim) && !protocol::is_tec_claim(preclaim) {
-            tracing::debug!(target: "consensus", "SKIP preclaim replay tx={} ter={:?}", tx_id, preclaim);
-            continue;
+            tracing::debug!(target: "consensus", retry_pass = protocol::any_apply_flags(apply_flags & protocol::ApplyFlags::RETRY),
+                "SKIP preclaim replay tx={} ter={:?}", tx_id, preclaim);
+            return Some(canonical_retry_disposition(ApplyResult::new(
+                preclaim, false, false,
+            )));
         }
 
         // Keep the transaction's mutable parent separate from the cumulative
@@ -1203,12 +1371,13 @@ pub fn build_ledger_from_consensus(
             ledger::ApplyViewImpl::new(Arc::new(accum.clone()), protocol::ApplyFlags::default());
         let mut view = ledger::FlowSandbox::new(&mut tx_parent);
         let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id(
                 &mut view,
                 &sttx,
                 txn_type,
-                protocol::ApplyFlags::NONE,
+                apply_flags,
                 preclaim,
+                node_network_id,
             )
         }));
 
@@ -1277,15 +1446,22 @@ pub fn build_ledger_from_consensus(
                         return None;
                     }
                 }
+                Some(CanonicalRetryDisposition::Applied)
             }
             Ok(outcome) => {
                 tracing::debug!(target: "consensus", "SKIP unapplied replay tx={} ter={:?}", tx_id, outcome.result);
+                Some(canonical_retry_disposition(ApplyResult::new(
+                    outcome.result,
+                    false,
+                    false,
+                )))
             }
             Err(_) => {
                 // Skip panicking transactions (reference catches exceptions)
+                Some(CanonicalRetryDisposition::Failed)
             }
         }
-    }
+    })?;
 
     if let Err(error) = accum.apply(&mut built) {
         tracing::error!(target: "consensus", ?error,
@@ -1312,9 +1488,75 @@ mod replay_reconstruction_tests {
 
     use basics::base_uint::Uint256;
     use ledger::Ledger;
-    use protocol::{AccountID, STTx, TxType, get_field_by_symbol};
+    use protocol::{AccountID, STObject, STTx, Serializer, StBase, TxType, get_field_by_symbol};
 
-    use super::{LedgerReplay, replay_transactions_for_reconstruction};
+    use super::{
+        CanonicalRetryDisposition, LedgerReplay, canonical_retry_disposition,
+        decode_acquired_transaction_metadata, replay_transactions_for_reconstruction,
+        run_canonical_retry_passes,
+    };
+
+    #[test]
+    fn production_consensus_retry_driver_resolves_later_dependency() {
+        let unlocked = std::cell::Cell::new(false);
+        let blocked_calls = std::cell::Cell::new(0usize);
+        let order = std::cell::RefCell::new(Vec::new());
+        let applied = run_canonical_retry_passes(vec!["blocked", "unlocker"], |item, flags| {
+            if *item == "blocked" && !unlocked.get() {
+                assert!(protocol::any_apply_flags(
+                    flags & protocol::ApplyFlags::RETRY
+                ));
+                blocked_calls.set(blocked_calls.get() + 1);
+                return Some(CanonicalRetryDisposition::Retry);
+            }
+            if *item == "unlocker" {
+                unlocked.set(true);
+            }
+            order.borrow_mut().push(*item);
+            Some(CanonicalRetryDisposition::Applied)
+        })
+        .expect("retry driver should not fail");
+
+        assert_eq!(applied, 2);
+        assert_eq!(blocked_calls.get(), 1);
+        assert_eq!(*order.borrow(), vec!["unlocker", "blocked"]);
+    }
+
+    #[test]
+    fn production_consensus_retry_driver_runs_a_final_non_retry_pass() {
+        let flags_seen = std::cell::RefCell::new(Vec::new());
+        let applied = run_canonical_retry_passes(vec!["tec-on-final"], |_, flags| {
+            flags_seen.borrow_mut().push(flags);
+            if protocol::any_apply_flags(flags & protocol::ApplyFlags::RETRY) {
+                Some(CanonicalRetryDisposition::Retry)
+            } else {
+                Some(canonical_retry_disposition(tx::ApplyResult::new(
+                    protocol::Ter::TEC_CLAIM,
+                    true,
+                    false,
+                )))
+            }
+        })
+        .expect("retry driver should not fail");
+
+        assert_eq!(applied, 1);
+        assert_eq!(flags_seen.borrow().len(), 2);
+        assert!(protocol::any_apply_flags(
+            flags_seen.borrow()[0] & protocol::ApplyFlags::RETRY
+        ));
+        assert!(!protocol::any_apply_flags(
+            flags_seen.borrow()[1] & protocol::ApplyFlags::RETRY
+        ));
+        assert_eq!(
+            canonical_retry_disposition(tx::ApplyResult::new(
+                protocol::Ter::TEL_CAN_NOT_QUEUE,
+                false,
+                false,
+            )),
+            CanonicalRetryDisposition::Failed,
+            "the shared apply classifier must retain tel as a terminal failure"
+        );
+    }
 
     fn transaction(sequence: u32) -> Arc<STTx> {
         Arc::new(STTx::new(TxType::PAYMENT, |tx| {
@@ -1324,6 +1566,21 @@ mod replay_reconstruction_tests {
             );
             tx.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
         }))
+    }
+
+    fn transaction_md(tx: &STTx, index: Option<u32>) -> (Vec<u8>, Uint256) {
+        let mut tx_bytes = Serializer::new(128);
+        tx.add(&mut tx_bytes);
+        let mut metadata = STObject::new(get_field_by_symbol("sfMetadata"));
+        if let Some(index) = index {
+            metadata.set_field_u32(get_field_by_symbol("sfTransactionIndex"), index);
+        }
+        let mut metadata_bytes = Serializer::new(64);
+        metadata.add(&mut metadata_bytes);
+        let mut payload = Serializer::new(256);
+        payload.add_vl(tx_bytes.data());
+        payload.add_vl(metadata_bytes.data());
+        (payload.data().to_vec(), tx.get_transaction_id())
     }
 
     #[test]
@@ -1349,5 +1606,39 @@ mod replay_reconstruction_tests {
             .collect::<Vec<_>>();
         assert_eq!(sequences, vec![1, 2]);
         assert_ne!(first.get_transaction_id(), Uint256::zero());
+    }
+
+    #[test]
+    fn acquired_transaction_md_uses_metadata_index_not_canonical_tx_order() {
+        let first = transaction(1);
+        let dependent = transaction(2);
+        let items = vec![
+            transaction_md(&dependent, Some(9)),
+            transaction_md(&first, Some(4)),
+        ];
+        let (ordered, metadata) =
+            decode_acquired_transaction_metadata(&items).expect("valid TransactionMd set");
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|tx| tx.get_field_u32(get_field_by_symbol("sfSequence")))
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(metadata.len(), 2);
+    }
+
+    #[test]
+    fn acquired_transaction_md_rejects_missing_and_duplicate_indexes() {
+        let first = transaction(1);
+        let dependent = transaction(2);
+        assert!(decode_acquired_transaction_metadata(&[transaction_md(&first, None)]).is_none());
+        assert!(
+            decode_acquired_transaction_metadata(&[
+                transaction_md(&first, Some(7)),
+                transaction_md(&dependent, Some(7)),
+            ])
+            .is_none()
+        );
     }
 }

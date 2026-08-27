@@ -110,8 +110,8 @@ pub trait LoanBrokerCoverClawbackDoApplySink {
     type Asset;
     type VaultId;
 
-    fn read_broker(&mut self, broker_id: &Self::BrokerId) -> Option<Self::Broker>;
-    fn read_vault(&mut self, vault_id: &Self::VaultId) -> Option<Self::Vault>;
+    fn read_broker(&mut self, broker_id: &Self::BrokerId) -> Result<Option<Self::Broker>, Ter>;
+    fn read_vault(&mut self, vault_id: &Self::VaultId) -> Result<Option<Self::Vault>, Ter>;
     fn update_broker(&mut self, broker: &Self::Broker);
     fn associate_asset(&mut self, broker: &Self::Broker, asset: &Self::Asset);
     fn send_asset(
@@ -306,14 +306,16 @@ where
     };
 
     let mut broker = match sink.read_broker(&broker_id) {
-        Some(broker) => broker,
-        None => return Ter::TEC_INTERNAL,
+        Ok(Some(broker)) => broker,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(error) => return error,
     };
 
     let vault_id = broker.vault_id().clone();
     let vault = match sink.read_vault(&vault_id) {
-        Some(vault) => vault,
-        None => return Ter::TEC_INTERNAL,
+        Ok(Some(vault)) => vault,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(error) => return error,
     };
 
     let vault_asset = vault.asset().clone();
@@ -786,6 +788,8 @@ mod tests {
         steps: Rc<RefCell<Vec<String>>>,
         broker: Option<TestBroker>,
         vault: Option<TestVault>,
+        broker_read_error: Option<Ter>,
+        vault_read_error: Option<Ter>,
         send_result: Ter,
         observed_pseudo_account: Option<&'static str>,
         observed_destination: Option<&'static str>,
@@ -801,18 +805,24 @@ mod tests {
         type Asset = &'static str;
         type VaultId = &'static str;
 
-        fn read_broker(&mut self, broker_id: &Self::BrokerId) -> Option<Self::Broker> {
+        fn read_broker(&mut self, broker_id: &Self::BrokerId) -> Result<Option<Self::Broker>, Ter> {
             self.steps
                 .borrow_mut()
                 .push(format!("read_broker={broker_id}"));
-            self.broker.take()
+            match self.broker_read_error.take() {
+                Some(error) => Err(error),
+                None => Ok(self.broker.take()),
+            }
         }
 
-        fn read_vault(&mut self, vault_id: &Self::VaultId) -> Option<Self::Vault> {
+        fn read_vault(&mut self, vault_id: &Self::VaultId) -> Result<Option<Self::Vault>, Ter> {
             self.steps
                 .borrow_mut()
                 .push(format!("read_vault={vault_id}"));
-            self.vault.take()
+            match self.vault_read_error.take() {
+                Some(error) => Err(error),
+                None => Ok(self.vault.take()),
+            }
         }
 
         fn update_broker(&mut self, _broker: &Self::Broker) {
@@ -849,6 +859,8 @@ mod tests {
                 steps,
             }),
             vault: Some(TestVault { asset: "USD" }),
+            broker_read_error: None,
+            vault_read_error: None,
             send_result: Ter::TES_SUCCESS,
             observed_pseudo_account: None,
             observed_destination: None,
@@ -884,6 +896,8 @@ mod tests {
             steps: Rc::clone(&steps),
             broker: None,
             vault: Some(TestVault { asset: "USD" }),
+            broker_read_error: None,
+            vault_read_error: None,
             send_result: Ter::TES_SUCCESS,
             observed_pseudo_account: None,
             observed_destination: None,
@@ -914,6 +928,8 @@ mod tests {
                 steps: Rc::clone(&steps),
             }),
             vault: None,
+            broker_read_error: None,
+            vault_read_error: None,
             send_result: Ter::TES_SUCCESS,
             observed_pseudo_account: None,
             observed_destination: None,
@@ -932,6 +948,46 @@ mod tests {
             },
         );
         assert_eq!(missing_vault_result, Ter::TEC_INTERNAL);
+        assert_eq!(
+            steps.borrow().as_slice(),
+            ["read_broker=broker-1", "read_vault=vault-1"]
+        );
+    }
+
+    #[test]
+    fn loan_broker_cover_clawback_do_apply_propagates_storage_read_failures() {
+        let steps = Rc::new(RefCell::new(Vec::new()));
+        let mut broker_fault = build_sink(Rc::clone(&steps));
+        broker_fault.broker_read_error = Some(Ter::TEF_BAD_LEDGER);
+        assert_eq!(
+            run_loan_broker_cover_clawback_do_apply(
+                &mut broker_fault,
+                &"issuer",
+                || Ok("broker-1"),
+                |_, _| Ok(TestAmount {
+                    value: 15,
+                    native: false
+                }),
+            ),
+            Ter::TEF_BAD_LEDGER
+        );
+        assert_eq!(steps.borrow().as_slice(), ["read_broker=broker-1"]);
+
+        steps.borrow_mut().clear();
+        let mut vault_fault = build_sink(Rc::clone(&steps));
+        vault_fault.vault_read_error = Some(Ter::TEF_BAD_LEDGER);
+        assert_eq!(
+            run_loan_broker_cover_clawback_do_apply(
+                &mut vault_fault,
+                &"issuer",
+                || Ok("broker-1"),
+                |_, _| Ok(TestAmount {
+                    value: 15,
+                    native: false
+                }),
+            ),
+            Ter::TEF_BAD_LEDGER
+        );
         assert_eq!(
             steps.borrow().as_slice(),
             ["read_broker=broker-1", "read_vault=vault-1"]

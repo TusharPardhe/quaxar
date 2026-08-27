@@ -392,12 +392,12 @@ impl tx::loan_broker_cover_clawback::LoanBrokerCoverClawbackDoApplySink for Surf
     type Asset = &'static str;
     type VaultId = &'static str;
 
-    fn read_broker(&mut self, _broker_id: &Self::BrokerId) -> Option<Self::Broker> {
-        None
+    fn read_broker(&mut self, _broker_id: &Self::BrokerId) -> Result<Option<Self::Broker>, Ter> {
+        Ok(None)
     }
 
-    fn read_vault(&mut self, _vault_id: &Self::VaultId) -> Option<Self::Vault> {
-        None
+    fn read_vault(&mut self, _vault_id: &Self::VaultId) -> Result<Option<Self::Vault>, Ter> {
+        Ok(None)
     }
 
     fn update_broker(&mut self, _broker: &Self::Broker) {}

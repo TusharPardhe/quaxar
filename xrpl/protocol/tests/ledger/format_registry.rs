@@ -12,7 +12,7 @@ fn tx_formats_registry_matches_current_cpp_catalog_shape() {
         .collect::<Vec<_>>();
     let registry_names = formats.iter().map(|item| item.name()).collect::<Vec<_>>();
 
-    assert_eq!(formats.iter().count(), 75);
+    assert_eq!(formats.iter().count(), 82);
     assert_eq!(formats.get_common_fields().len(), 20);
     assert_eq!(
         common_symbols,
@@ -54,7 +54,7 @@ fn tx_formats_registry_matches_current_cpp_catalog_shape() {
         .expect("payment format");
     assert_eq!(payment.name(), "Payment");
     assert_eq!(payment.metadata().tag_name, "ttPAYMENT");
-    assert_eq!(payment.metadata().privileges, "createAcct");
+    assert_eq!(payment.metadata().privileges, "createAcct | mayCreateMPT");
     assert_eq!(payment.so_template().size(), 29);
 
     let amount_index = payment
@@ -72,6 +72,95 @@ fn tx_formats_registry_matches_current_cpp_catalog_shape() {
             .name(),
         "UNLModify"
     );
+}
+
+#[test]
+fn pinned_sponsorship_and_mpt_format_metadata_is_exact() {
+    let formats = TxFormats::get_instance();
+    let expected = [
+        (
+            TxType::SPONSORSHIP_TRANSFER,
+            "SponsorshipTransfer",
+            "Delegation::notDelegable",
+            "featureSponsor",
+            "noPriv",
+        ),
+        (
+            TxType::SPONSORSHIP_SET,
+            "SponsorshipSet",
+            "Delegation::delegable",
+            "featureSponsor",
+            "noPriv",
+        ),
+        (
+            TxType::OFFER_CREATE,
+            "OfferCreate",
+            "Delegation::delegable",
+            "uint256{}",
+            "mayCreateMPT",
+        ),
+        (
+            TxType::CHECK_CASH,
+            "CheckCash",
+            "Delegation::delegable",
+            "uint256{}",
+            "mayCreateMPT",
+        ),
+        (
+            TxType::AMM_CREATE,
+            "AMMCreate",
+            "Delegation::delegable",
+            "featureAMM",
+            "createPseudoAcct | mayCreateMPT",
+        ),
+        (
+            TxType::AMM_WITHDRAW,
+            "AMMWithdraw",
+            "Delegation::delegable",
+            "featureAMM",
+            "mayDeleteAcct | mayAuthorizeMPT",
+        ),
+        (
+            TxType::AMM_DELETE,
+            "AMMDelete",
+            "Delegation::delegable",
+            "featureAMM",
+            "mustDeleteAcct | mayDeleteMPT",
+        ),
+    ];
+    for (kind, name, delegable, amendment, privileges) in expected {
+        let item = formats.find_by_type(kind).expect(name);
+        assert_eq!(item.name(), name);
+        assert_eq!(item.metadata().delegable, delegable);
+        assert_eq!(item.metadata().amendment, amendment);
+        assert_eq!(item.metadata().privileges, privileges);
+    }
+    for (kind, fields) in [
+        (
+            TxType::SPONSORSHIP_TRANSFER,
+            &["sfObjectID", "sfSponsee"][..],
+        ),
+        (
+            TxType::SPONSORSHIP_SET,
+            &[
+                "sfCounterpartySponsor",
+                "sfSponsee",
+                "sfFeeAmountDelta",
+                "sfMaxFee",
+                "sfRemainingOwnerCountDelta",
+            ][..],
+        ),
+    ] {
+        let item = formats.find_by_type(kind).unwrap();
+        for field in fields {
+            assert!(
+                item.so_template()
+                    .get_index(get_field_by_symbol(field))
+                    .is_ok(),
+                "{kind} missing {field}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -105,4 +194,14 @@ fn ledger_formats_registry_preserves_name_and_rpc_name_independently() {
     );
     assert_eq!(deposit_ledger.metadata().rpc_name, "deposit_preauth");
     assert_eq!(deposit_tx.format_type(), TxType::DEPOSIT_PREAUTH);
+
+    let delegate = ledger_formats
+        .find_by_type(LedgerEntryType::Delegate)
+        .expect("delegate");
+    assert!(
+        delegate
+            .so_template()
+            .get_index(get_field_by_symbol("sfDestinationNode"))
+            .is_ok()
+    );
 }

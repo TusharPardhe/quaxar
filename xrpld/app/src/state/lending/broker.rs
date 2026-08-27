@@ -31,13 +31,16 @@ pub fn apply_loan_broker_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter 
         return preflight;
     }
 
-    let Ok(Some(broker_sle)) = view.peek(protocol::loan_broker_keylet_from_key(broker_id)) else {
-        return Ter::TEC_NO_ENTRY;
+    let broker_sle = match view.peek(protocol::loan_broker_keylet_from_key(broker_id)) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    let Ok(Some(vault_sle)) = view.peek(protocol::vault_keylet_from_key(
+    let vault_sle = match view.peek(protocol::vault_keylet_from_key(
         broker_sle.get_field_h256(sf("sfVaultID")),
-    )) else {
-        return Ter::TEF_BAD_LEDGER;
+    )) {
+        Ok(Some(sle)) => sle,
+        Ok(None) | Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let vault_pseudo_id = vault_sle.get_account_id(sf("sfAccount"));
     let vault_asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
@@ -116,13 +119,13 @@ pub fn apply_loan_broker_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter 
     let Ok(cover_amount) = vault_asset.amount(cover_available) else {
         return Ter::TEF_BAD_LEDGER;
     };
-    let waive_mpt_can_transfer = view.rules().enabled(&feature_id("fixCleanup3_2_0"));
     let payout = account_send_with_mpt_transfer_waiver(
         view,
+        sttx,
         &broker_pseudo_id,
         &account,
         &cover_amount,
-        waive_mpt_can_transfer,
+        true,
     );
     if payout != Ter::TES_SUCCESS {
         return payout;
@@ -142,12 +145,11 @@ pub fn apply_loan_broker_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter 
     if pseudo_sle.get_field_u32(sf("sfOwnerCount")) != 0 {
         return Ter::TEC_HAS_OBLIGATIONS;
     }
-    if view
-        .read(owner_dir_keylet(to_160(&broker_pseudo_id)))
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    let owner_dir_present = match view.read(owner_dir_keylet(to_160(&broker_pseudo_id))) {
+        Ok(directory) => directory.is_some(),
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if owner_dir_present {
         return Ter::TEC_HAS_OBLIGATIONS;
     }
 
@@ -157,7 +159,9 @@ pub fn apply_loan_broker_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter 
     let Ok(Some(owner_sle)) = view.peek(account_keylet(to_160(&account))) else {
         return Ter::TEF_BAD_LEDGER;
     };
-    let _ = ledger::adjust_owner_count(view, &owner_sle, -2);
+    if ledger::adjust_owner_count(view, &owner_sle, -2).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
     Ter::TES_SUCCESS
 }
 
@@ -175,8 +179,10 @@ pub fn apply_loan_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return Ter::TEM_INVALID;
     }
 
-    let Ok(Some(loan_sle)) = view.peek(protocol::loan_keylet_from_key(loan_id)) else {
-        return Ter::TEC_NO_ENTRY;
+    let loan_sle = match view.peek(protocol::loan_keylet_from_key(loan_id)) {
+        Ok(Some(loan_sle)) => loan_sle,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     if loan_sle.get_field_u32(sf("sfPaymentRemaining")) > 0 {
         return Ter::TEC_HAS_OBLIGATIONS;
@@ -187,8 +193,10 @@ pub fn apply_loan_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     };
 
     let broker_id = loan_sle.get_field_h256(sf("sfLoanBrokerID"));
-    let Ok(Some(broker_sle)) = view.peek(protocol::loan_broker_keylet_from_key(broker_id)) else {
-        return Ter::TEC_INTERNAL;
+    let broker_sle = match view.peek(protocol::loan_broker_keylet_from_key(broker_id)) {
+        Ok(Some(broker_sle)) => broker_sle,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     if broker_sle.get_account_id(sf("sfOwner")) != account && borrower_id != account {
         return Ter::TEC_NO_PERMISSION;
@@ -256,7 +264,9 @@ pub fn apply_loan_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return broker_result;
     }
 
-    let _ = ledger::adjust_owner_count(view, &borrower_sle, -1);
+    if ledger::adjust_owner_count(view, &borrower_sle, -1).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
     let mut loan = STLedgerEntry::from_stobject(loan_sle.clone_as_object(), *loan_sle.key());
     associate_asset_entry(&mut loan, vault_asset);
@@ -287,11 +297,15 @@ pub fn apply_loan_broker_cover_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) 
         return preflight;
     }
 
-    let Some(mut broker) = load_broker(view, broker_id) else {
-        return Ter::TEC_NO_ENTRY;
+    let mut broker = match load_broker(view, broker_id) {
+        Ok(Some(broker)) => broker,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(ter) => return ter,
     };
-    let Some(vault) = load_vault(view, broker.vault_id) else {
-        return Ter::TEF_INTERNAL;
+    let vault = match load_vault(view, broker.vault_id) {
+        Ok(Some(vault)) => vault,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(ter) => return ter,
     };
     if account != broker.owner {
         return Ter::TEC_NO_PERMISSION;
@@ -336,11 +350,21 @@ pub fn apply_loan_broker_cover_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) 
     if auth != Ter::TES_SUCCESS {
         return auth;
     }
-    if cover_asset_holding_number(view, &account, vault.asset) < added {
+    let account_holding = match cover_asset_holding_number(view, &account, vault.asset) {
+        Ok(holding) => holding,
+        Err(ter) => return ter,
+    };
+    if account_holding < added {
         return Ter::TEC_INSUFFICIENT_FUNDS;
     }
 
-    let transfer_result = account_send(view, &account, &broker.pseudo_account, &deposit_amount);
+    let transfer_result = account_send(
+        view,
+        sttx,
+        &account,
+        &broker.pseudo_account,
+        &deposit_amount,
+    );
     if transfer_result != Ter::TES_SUCCESS {
         return transfer_result;
     }
@@ -384,14 +408,21 @@ pub fn apply_loan_broker_cover_withdraw<V: ApplyView>(
         return preflight;
     }
 
-    if is_pseudo_account(view, &destination) {
+    let destination_is_pseudo = match is_pseudo_account(view, &destination) {
+        Ok(value) => value,
+        Err(ter) => return ter,
+    };
+    if destination_is_pseudo {
         return Ter::TEC_PSEUDO_ACCOUNT;
     }
 
     // C++ parity: RequireDestTag check
     if account != destination {
-        if let Ok(Some(dst_sle)) = view.peek(account_keylet(Uint160::from_void(destination.data())))
-        {
+        let dst_sle = match view.peek(account_keylet(Uint160::from_void(destination.data()))) {
+            Ok(destination) => destination,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        if let Some(dst_sle) = dst_sle {
             if dst_sle.is_flag(lsfRequireDestTag) && !sttx.is_field_present(sf("sfDestinationTag"))
             {
                 return Ter::TEC_DST_TAG_NEEDED;
@@ -402,18 +433,24 @@ pub fn apply_loan_broker_cover_withdraw<V: ApplyView>(
                     Uint160::from_void(destination.data()),
                     Uint160::from_void(account.data()),
                 );
-                if view.peek(preauth_keylet).ok().flatten().is_none() {
-                    return Ter::TEC_NO_PERMISSION;
+                match view.peek(preauth_keylet) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ter::TEC_NO_PERMISSION,
+                    Err(_) => return Ter::TEF_BAD_LEDGER,
                 }
             }
         }
     }
 
-    let Some(mut broker) = load_broker(view, broker_id) else {
-        return Ter::TEC_NO_ENTRY;
+    let mut broker = match load_broker(view, broker_id) {
+        Ok(Some(broker)) => broker,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(ter) => return ter,
     };
-    let Ok(Some(vault_sle)) = view.peek(protocol::vault_keylet_from_key(broker.vault_id)) else {
-        return Ter::TEC_INTERNAL;
+    let vault_sle = match view.peek(protocol::vault_keylet_from_key(broker.vault_id)) {
+        Ok(Some(vault_sle)) => vault_sle,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let vault_asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
 
@@ -473,7 +510,12 @@ pub fn apply_loan_broker_cover_withdraw<V: ApplyView>(
             return deep_frozen;
         }
     }
-    if cover_asset_holding_number(view, &broker.pseudo_account, vault_asset) < deducted {
+    let broker_holding = match cover_asset_holding_number(view, &broker.pseudo_account, vault_asset)
+    {
+        Ok(holding) => holding,
+        Err(ter) => return ter,
+    };
+    if broker_holding < deducted {
         return Ter::TEC_INSUFFICIENT_FUNDS;
     }
 
@@ -487,10 +529,11 @@ pub fn apply_loan_broker_cover_withdraw<V: ApplyView>(
 
     account_send_with_mpt_transfer_waiver(
         view,
+        sttx,
         &broker.pseudo_account,
         &destination,
         &amount,
-        waive_mpt_can_transfer,
+        true,
     )
 }
 
@@ -510,8 +553,10 @@ fn determine_clawback_broker_id<V: ApplyView>(view: &V, sttx: &STTx) -> Result<U
     let Asset::Issue(issue) = amount.asset() else {
         return Err(Ter::TEC_INTERNAL);
     };
-    let Ok(Some(pseudo_root)) = view.read(account_keylet(to_160(&issue.account))) else {
-        return Err(Ter::TEC_NO_ENTRY);
+    let pseudo_root = match view.read(account_keylet(to_160(&issue.account))) {
+        Ok(Some(pseudo_root)) => pseudo_root,
+        Ok(None) => return Err(Ter::TEC_NO_ENTRY),
+        Err(_) => return Err(Ter::TEF_BAD_LEDGER),
     };
     if !pseudo_root.is_field_present(sf("sfLoanBrokerID")) {
         return Err(Ter::TEC_OBJECT_NOT_FOUND);
@@ -556,9 +601,10 @@ fn check_clawback_permission<V: ApplyView>(
             }
         }
         Asset::MPTIssue(issue) => {
-            let Ok(Some(issuance)) = view.read(mpt_issuance_keylet_from_mptid(issue.mpt_id()))
-            else {
-                return Ter::TEC_OBJECT_NOT_FOUND;
+            let issuance = match view.read(mpt_issuance_keylet_from_mptid(issue.mpt_id())) {
+                Ok(Some(issuance)) => issuance,
+                Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
             };
             if !issuance.is_flag(protocol::lsfMPTCanClawback) {
                 return Ter::TEC_NO_PERMISSION;
@@ -623,11 +669,15 @@ pub fn apply_loan_broker_cover_clawback<V: ApplyView>(view: &mut V, sttx: &STTx)
         Err(ter) => return ter,
     };
 
-    let Some(mut broker) = load_broker(view, broker_id) else {
-        return Ter::TEC_NO_ENTRY;
+    let mut broker = match load_broker(view, broker_id) {
+        Ok(Some(broker)) => broker,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(ter) => return ter,
     };
-    let Some(vault) = load_vault(view, broker.vault_id) else {
-        return Ter::TEC_INTERNAL;
+    let vault = match load_vault(view, broker.vault_id) {
+        Ok(Some(vault)) => vault,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(ter) => return ter,
     };
 
     if vault.asset.native() || asset_issuer(vault.asset) != account {
@@ -678,7 +728,12 @@ pub fn apply_loan_broker_cover_clawback<V: ApplyView>(view: &mut V, sttx: &STTx)
     ) {
         return Ter::TEC_PRECISION_LOSS;
     }
-    if cover_asset_holding_number(view, &broker.pseudo_account, vault.asset) < deducted {
+    let broker_holding = match cover_asset_holding_number(view, &broker.pseudo_account, vault.asset)
+    {
+        Ok(holding) => holding,
+        Err(ter) => return ter,
+    };
+    if broker_holding < deducted {
         return Ter::TEC_INTERNAL;
     }
 
@@ -695,5 +750,5 @@ pub fn apply_loan_broker_cover_clawback<V: ApplyView>(view: &mut V, sttx: &STTx)
         return update_result;
     }
 
-    account_send(view, &broker.pseudo_account, &account, &claw_amount)
+    account_send(view, sttx, &broker.pseudo_account, &account, &claw_amount)
 }

@@ -800,6 +800,22 @@ impl AppRclConsensusAdaptor {
     }
 }
 
+fn open_ledger_consensus_snapshot(
+    cache: consensus::rcl::RclTxSetSharedCache,
+    ledger_seq: u32,
+    transactions: &[Arc<protocol::STTx>],
+) -> consensus::RclTxSet {
+    let mut set = consensus::RclTxSet::new(cache, ledger_seq);
+    {
+        let mut editable = set.mutable_view();
+        for tx in transactions {
+            editable.insert(&consensus::RclCxTxRef::from_transaction(tx));
+        }
+        set = editable.freeze();
+    }
+    set
+}
+
 impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
     type Ledger = RclCxLedger;
     type NodeId = PublicKey;
@@ -1072,14 +1088,13 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             RclConsensusOpenLedgerSource::current_open_transactions(&self.open_ledger)
         };
         // close_gate released — batch-apply can resume while we build the set.
-        let mut set =
-            consensus::RclTxSet::new(Arc::clone(&self.tx_set_cache), prev_ledger.seq() + 1);
+        let mut set = open_ledger_consensus_snapshot(
+            Arc::clone(&self.tx_set_cache),
+            prev_ledger.seq() + 1,
+            &txs,
+        );
         {
             let mut editable = set.mutable_view();
-            for tx in &txs {
-                editable.insert(&consensus::RclCxTxRef::from_transaction(tx));
-            }
-
             // Rippled injects amendment and fee pseudo-transactions after a
             // flag LCL. Negative-UNL voting runs after the preceding voting
             // LCL, for the consensus session that produces the flag ledger.
@@ -2806,8 +2821,8 @@ impl ConsensusRunner for AppConsensus {
 #[cfg(test)]
 mod sync_tree_conversion_tests {
     use super::{
-        resolved_consensus_ledger_is_adoptable, should_acquire_consensus_ledger,
-        sync_tree_to_rcl_tx_set,
+        open_ledger_consensus_snapshot, resolved_consensus_ledger_is_adoptable,
+        should_acquire_consensus_ledger, sync_tree_to_rcl_tx_set,
     };
     use basics::hardened_hash::HardenedHashBuilder;
     use basics::tagged_cache::MonotonicClock;
@@ -2899,6 +2914,25 @@ mod sync_tree_conversion_tests {
         assert!(adopted.exists(tx1_id));
         assert!(adopted.exists(tx2_id));
         assert_eq!(adopted.id(), *tree.root().get_hash().as_uint256());
+    }
+
+    #[test]
+    fn consensus_snapshot_preserves_outer_and_batch_inner_transaction_ids() {
+        let outer = Arc::new(payment(1));
+        let first_inner = Arc::new(payment(2));
+        let second_inner = Arc::new(payment(3));
+        let transactions = vec![
+            Arc::clone(&outer),
+            Arc::clone(&first_inner),
+            Arc::clone(&second_inner),
+        ];
+
+        let set = open_ledger_consensus_snapshot(cache(), 11, &transactions);
+
+        assert!(set.exists(outer.get_transaction_id()));
+        assert!(set.exists(first_inner.get_transaction_id()));
+        assert!(set.exists(second_inner.get_transaction_id()));
+        assert_eq!(set.all_items().len(), 3);
     }
 
     #[test]

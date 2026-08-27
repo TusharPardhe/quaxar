@@ -103,9 +103,9 @@ where
     }
 
     sink.set_credential_flags(CREDENTIAL_ACCEPTED_FLAG);
-    sink.update_credential();
     sink.adjust_issuer_owner_count(-1);
     sink.adjust_subject_owner_count(1);
+    sink.update_credential();
     Ter::TES_SUCCESS
 }
 

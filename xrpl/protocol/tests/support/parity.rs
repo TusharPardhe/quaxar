@@ -158,7 +158,7 @@ fn transaction_step_runtime_guard_uses_new_feature_path_when_single_asset_vault_
         let _guard = TransactionStepRuntimeGuard::new(&fixed_rules);
         assert_eq!(get_current_transaction_rules(), Some(fixed_rules.clone()));
         assert!(!get_st_number_switchover());
-        assert_eq!(get_mantissa_scale(), MantissaScale::Large);
+        assert_eq!(get_mantissa_scale(), MantissaScale::Large320);
     }
 
     assert_eq!(get_current_transaction_rules(), None);

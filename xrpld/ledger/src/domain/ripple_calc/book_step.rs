@@ -5,17 +5,18 @@
 
 use std::sync::Arc;
 
-use crate::ApplyView;
 use crate::domain::flow_engine::SelfCrossCancellation;
 use crate::domain::ripple_state_helpers;
+use crate::{ApplyView, ViewError};
 use basics;
 use basics::{
     base_uint::{Uint160, Uint256},
     number::{NumberParts as RuntimeNumber, NumberRoundModeGuard, RoundingMode},
 };
 use protocol::{
-    AccountID, Amounts, Asset, MPTAmount, Quality, QualityFunction, QualityFunctionAmmTag,
-    QualityFunctionClobLikeTag, STAmount, STLedgerEntry, Ter, get_field_by_symbol as sf,
+    AccountID, Amounts, Asset, IOUAmount, MPTAmount, Quality, QualityFunction,
+    QualityFunctionAmmTag, QualityFunctionClobLikeTag, STAmount, STLedgerEntry, Ter,
+    get_field_by_symbol as sf,
 };
 
 /// `BookStep::kMaxOffersToConsume` in rippled.  Reaching the cap marks the
@@ -88,32 +89,179 @@ fn is_self_crossing_offer(
             .is_some_and(|threshold| quality_satisfies_threshold(offer_quality, Some(threshold)))
 }
 
-fn offer_owner_authorized<V: ApplyView>(view: &V, asset: &Asset, owner: &AccountID) -> bool {
+fn offer_owner_authorized<V: ApplyView>(
+    view: &V,
+    asset: &Asset,
+    owner: &AccountID,
+) -> Result<bool, ViewError> {
     match asset {
-        Asset::Issue(issue) if issue.native() || issue.issuer() == *owner => true,
+        Asset::Issue(issue) if issue.native() || issue.issuer() == *owner => Ok(true),
         Asset::Issue(issue) => {
             let issuer_id =
                 Uint160::from_slice(issue.issuer().data()).expect("account width should match");
-            let Ok(Some(issuer)) = view.read(protocol::account_keylet(issuer_id)) else {
-                return false;
+            let Some(issuer) = view.read(protocol::account_keylet(issuer_id))? else {
+                return Ok(false);
             };
             if !issuer.is_flag(protocol::lsfRequireAuth) {
-                return true;
+                return Ok(true);
             }
-            let Ok(Some(line)) = view.read(protocol::line(*owner, issue.issuer(), issue.currency))
+            let Some(line) = view.read(protocol::line(*owner, issue.issuer(), issue.currency))?
             else {
-                return false;
+                return Ok(false);
             };
             let flag = if *owner > issue.issuer() {
                 protocol::lsfLowAuth
             } else {
                 protocol::lsfHighAuth
             };
-            line.is_flag(flag)
+            Ok(line.is_flag(flag))
         }
         Asset::MPTIssue(issue) => crate::mptoken_helpers::require_auth_mpt(view, issue, owner)
-            .is_ok_and(|ter| ter == Ter::TES_SUCCESS),
+            .map(|ter| ter == Ter::TES_SUCCESS),
     }
+}
+
+fn offer_owner_mpt_dex_allowed<V: ApplyView>(
+    view: &V,
+    book: &Book,
+    owner: &AccountID,
+    has_previous_step: bool,
+    previous_step_is_book: bool,
+    strand_dst: Option<&AccountID>,
+    strand_deliver: Asset,
+) -> Result<bool, ViewError> {
+    if let Asset::MPTIssue(issue) = book.r#in {
+        let input_allowed = match mpt_input_owner_policy(
+            has_previous_step,
+            previous_step_is_book,
+            issue.issuer() == *owner,
+        ) {
+            MptInputOwnerPolicy::Allow => true,
+            MptInputOwnerPolicy::FreezeOnly => {
+                !crate::mptoken_helpers::is_frozen_mpt(view, owner, &issue)?
+            }
+            MptInputOwnerPolicy::FreezeAndTransfer => {
+                !crate::mptoken_helpers::is_frozen_mpt(view, owner, &issue)?
+                    && crate::mptoken_helpers::can_transfer_mpt(view, &issue, owner, owner)?
+                        == Ter::TES_SUCCESS
+            }
+        };
+        if !input_allowed {
+            return Ok(false);
+        }
+    }
+
+    if let Asset::MPTIssue(issue) = book.out {
+        let final_delivery_to_issuer = strand_deliver == book.out
+            && strand_dst.is_some_and(|destination| *destination == issue.issuer());
+        if mpt_output_requires_transfer(final_delivery_to_issuer, issue.issuer() == *owner)
+            && crate::mptoken_helpers::can_transfer_mpt(view, &issue, owner, owner)?
+                != Ter::TES_SUCCESS
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MptInputOwnerPolicy {
+    Allow,
+    FreezeOnly,
+    FreezeAndTransfer,
+}
+
+fn mpt_input_owner_policy(
+    has_previous_step: bool,
+    previous_step_is_book: bool,
+    owner_is_issuer: bool,
+) -> MptInputOwnerPolicy {
+    if !has_previous_step || owner_is_issuer {
+        MptInputOwnerPolicy::Allow
+    } else if previous_step_is_book {
+        MptInputOwnerPolicy::FreezeOnly
+    } else {
+        MptInputOwnerPolicy::FreezeAndTransfer
+    }
+}
+
+fn mpt_output_requires_transfer(final_delivery_to_issuer: bool, owner_is_issuer: bool) -> bool {
+    !final_delivery_to_issuer && !owner_is_issuer
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmallOfferDisposition {
+    Keep,
+    RemoveIfFundingUnchanged,
+    RemovePermanently,
+    ArithmeticFailure,
+}
+
+fn small_offer_arithmetic_failure_disposition(mptokens_v2: bool) -> SmallOfferDisposition {
+    if mptokens_v2 {
+        SmallOfferDisposition::RemovePermanently
+    } else {
+        SmallOfferDisposition::ArithmeticFailure
+    }
+}
+
+fn minimum_positive_for(asset: Asset) -> STAmount {
+    match asset {
+        Asset::Issue(issue) if issue.native() => {
+            STAmount::from_xrp_amount(protocol::XRPAmount::min_positive_amount())
+        }
+        Asset::Issue(issue) => {
+            STAmount::from_iou_amount(sf("sfAmount"), IOUAmount::min_positive_amount(), issue)
+        }
+        Asset::MPTIssue(issue) => {
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::min_positive_amount(), issue)
+        }
+    }
+}
+
+fn small_increased_quality_offer_disposition(
+    taker_pays: &STAmount,
+    taker_gets: &STAmount,
+    owner_funds: &STAmount,
+    owner: &AccountID,
+    mptokens_v2: bool,
+) -> SmallOfferDisposition {
+    if !taker_pays.integral() && taker_gets.integral() {
+        return SmallOfferDisposition::Keep;
+    }
+    if !taker_pays.integral()
+        && !taker_gets.integral()
+        && crate::domain::amm_helpers::stamount_as_number(taker_pays)
+            >= crate::domain::amm_helpers::stamount_as_number(taker_gets)
+    {
+        return SmallOfferDisposition::Keep;
+    }
+
+    let issuer_has_unlimited_funds =
+        matches!(taker_gets.asset(), Asset::Issue(issue) if issue.issuer() == *owner);
+    let effective = if !issuer_has_unlimited_funds && owner_funds < taker_gets {
+        let amounts = Amounts::new(taker_pays.clone(), taker_gets.clone());
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Quality::from_amounts(&amounts).ceil_out_strict(&amounts, owner_funds, false)
+        })) {
+            Ok(amounts) => amounts,
+            Err(_) => return small_offer_arithmetic_failure_disposition(mptokens_v2),
+        }
+    } else {
+        Amounts::new(taker_pays.clone(), taker_gets.clone())
+    };
+
+    if effective.r#in.signum() <= 0 || effective.out.signum() <= 0 {
+        return SmallOfferDisposition::RemoveIfFundingUnchanged;
+    }
+    if effective.r#in > minimum_positive_for(taker_pays.asset()) {
+        return SmallOfferDisposition::Keep;
+    }
+    (Quality::from_amounts(&effective)
+        < Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone())))
+    .then_some(SmallOfferDisposition::RemoveIfFundingUnchanged)
+    .unwrap_or(SmallOfferDisposition::Keep)
 }
 
 /// Result of consuming offers from a book
@@ -140,6 +288,8 @@ pub struct BookStepOptions<'a> {
     pub amm_context: Option<crate::domain::flow_engine::AmmContext>,
     /// rippled's debt direction of the preceding strand step.
     pub previous_redeems: bool,
+    pub has_previous_step: bool,
+    pub previous_step_is_book: bool,
     /// Actual strand endpoint used by BookStep::rate. This is distinct from
     /// the transaction/taker account used for AMM auction fees and self-cross.
     pub strand_dst: Option<&'a AccountID>,
@@ -173,6 +323,8 @@ pub fn execute_book_step<V: ApplyView>(
             self_cross_cancellation: None,
             amm_context: None,
             previous_redeems: false,
+            has_previous_step: false,
+            previous_step_is_book: false,
             strand_dst: taker,
             strand_deliver: Some(max_out.asset()),
             enforce_quality_threshold: true,
@@ -202,49 +354,99 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     let mut offers_consumed: u32 = 0;
     let mut remaining_in = max_in.clone();
 
+    macro_rules! remove_offer_or_return {
+        ($offer:expr) => {{
+            let ter = remove_consumed_offer(view, $offer);
+            if ter != Ter::TES_SUCCESS {
+                return BookStepResult {
+                    amount_in: total_in,
+                    amount_out: total_out,
+                    offers_consumed,
+                    ter,
+                };
+            }
+        }};
+    }
+    macro_rules! update_or_return {
+        ($entry:expr) => {{
+            if view.update($entry).is_err() {
+                return BookStepResult {
+                    amount_in: total_in,
+                    amount_out: total_out,
+                    offers_consumed,
+                    ter: Ter::TEF_BAD_LEDGER,
+                };
+            }
+        }};
+    }
+
     // Get transfer rates
     // For payment context (owner_pays_transfer_fee=false): tr_in = QUALITY_ONE because
     // the sender→issuer transfer rate is handled separately by the payment wrapper.
     // For OfferCreate context (owner_pays_transfer_fee=true): apply transfer rates,
     // but reference rate(sb, issue, dst) returns QUALITY_ONE when dst == issue.getIssuer().
     // The "dst" in OfferCreate context is the taker (offer creator).
-    if let Ok(ter) = crate::mptoken_helpers::can_trade(view, &book.r#in)
-        && ter != Ter::TES_SUCCESS
-    {
-        return BookStepResult {
-            amount_in: total_in,
-            amount_out: total_out,
-            offers_consumed,
-            ter,
+    for asset in [&book.r#in, &book.out] {
+        let ter = match crate::mptoken_helpers::can_trade(view, asset) {
+            Ok(ter) => ter,
+            Err(_) => Ter::TEF_BAD_LEDGER,
         };
-    }
-    if let Ok(ter) = crate::mptoken_helpers::can_trade(view, &book.out)
-        && ter != Ter::TES_SUCCESS
-    {
-        return BookStepResult {
-            amount_in: total_in,
-            amount_out: total_out,
-            offers_consumed,
-            ter,
-        };
+        if ter != Ter::TES_SUCCESS {
+            return BookStepResult {
+                amount_in: total_in,
+                amount_out: total_out,
+                offers_consumed,
+                ter,
+            };
+        }
     }
 
     let strand_dst = effective_strand_dst(options.strand_dst, taker);
     let strand_deliver = options.strand_deliver.unwrap_or_else(|| max_out.asset());
     let tr_in = if options.previous_redeems {
-        transfer_rate_for_asset(view, book.r#in, strand_dst, strand_deliver)
+        match transfer_rate_for_asset(view, book.r#in, strand_dst, strand_deliver) {
+            Ok(rate) => rate,
+            Err(_) => {
+                return BookStepResult {
+                    amount_in: total_in,
+                    amount_out: total_out,
+                    offers_consumed,
+                    ter: Ter::TEF_BAD_LEDGER,
+                };
+            }
+        }
     } else {
         QUALITY_ONE
     };
     let tr_out = if owner_pays_transfer_fee {
-        transfer_rate_for_asset(view, book.out, strand_dst, strand_deliver)
+        match transfer_rate_for_asset(view, book.out, strand_dst, strand_deliver) {
+            Ok(rate) => rate,
+            Err(_) => {
+                return BookStepResult {
+                    amount_in: total_in,
+                    amount_out: total_out,
+                    offers_consumed,
+                    ter: Ter::TEF_BAD_LEDGER,
+                };
+            }
+        }
     } else {
         QUALITY_ONE
     };
 
     // Iterate offers in the book directory
     // We use get_book_offers which reads from the offer directory.
-    let raw_offers = get_book_offers(view, book, MAX_OFFERS_TO_CONSUME);
+    let raw_offers = match get_book_offers(view, book, MAX_OFFERS_TO_CONSUME) {
+        Ok(offers) => offers,
+        Err(_) => {
+            return BookStepResult {
+                amount_in: total_in,
+                amount_out: total_out,
+                offers_consumed,
+                ter: Ter::TEF_BAD_LEDGER,
+            };
+        }
+    };
 
     // FlowOfferStream removes malformed, unauthorized-domain and unfunded
     // entries before exposing tip(). Do the same discovery cleanup before
@@ -260,11 +462,21 @@ pub fn execute_book_step_with_options<V: ApplyView>(
         }
         let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
         let taker_gets = offer_sle.get_field_amount(sf("sfTakerGets"));
+        if offer_sle.is_field_present(sf("sfExpiration"))
+            && offer_sle.get_field_u32(sf("sfExpiration")) <= view.parent_close_time().as_seconds()
+        {
+            if let Some(removable) = &self_cross_cancellation {
+                removable.record(*offer_sle.key());
+            }
+            remove_offer_or_return!(&offer_sle);
+            offers_consumed += 1;
+            continue;
+        }
         if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
             if let Some(removable) = &self_cross_cancellation {
                 removable.record(*offer_sle.key());
             }
-            remove_consumed_offer(view, &offer_sle);
+            remove_offer_or_return!(&offer_sle);
             offers_consumed += 1;
             continue;
         }
@@ -272,29 +484,82 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             && (!view.rules().enabled(&protocol::fix_cleanup_3_3_0()) || book.domain.is_some())
         {
             let offer_domain = offer_sle.get_field_h256(sf("sfDomainID"));
-            if !crate::permissioned_dex_helpers::offer_in_domain(
+            let offer_in_domain = match crate::permissioned_dex_helpers::offer_in_domain(
                 &*view,
                 offer_sle.key(),
                 &offer_domain,
-            )
-            .unwrap_or(false)
-            {
+            ) {
+                Ok(in_domain) => in_domain,
+                Err(_) => {
+                    return BookStepResult {
+                        amount_in: total_in,
+                        amount_out: total_out,
+                        offers_consumed,
+                        ter: Ter::TEF_BAD_LEDGER,
+                    };
+                }
+            };
+            if !offer_in_domain {
                 if let Some(removable) = &self_cross_cancellation {
                     removable.record(*offer_sle.key());
                 }
-                remove_consumed_offer(view, &offer_sle);
+                remove_offer_or_return!(&offer_sle);
                 offers_consumed += 1;
                 continue;
             }
         }
         let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
-        if get_owner_funds(view, &offer_owner, &taker_gets).signum() <= 0 {
-            if let Some(removable) = &self_cross_cancellation {
-                removable.record(*offer_sle.key());
+        let owner_funds = match get_owner_funds(view, &offer_owner, &taker_gets) {
+            Ok(funds) => funds,
+            Err(_) => {
+                return BookStepResult {
+                    amount_in: total_in,
+                    amount_out: total_out,
+                    offers_consumed,
+                    ter: Ter::TEF_BAD_LEDGER,
+                };
             }
-            remove_consumed_offer(view, &offer_sle);
+        };
+        if owner_funds.signum() <= 0 {
+            if let Some(removable) = &self_cross_cancellation {
+                removable.record_if_funding_unchanged(*offer_sle.key(), owner_funds.clone());
+            }
+            remove_offer_or_return!(&offer_sle);
             offers_consumed += 1;
             continue;
+        }
+        match small_increased_quality_offer_disposition(
+            &taker_pays,
+            &taker_gets,
+            &owner_funds,
+            &offer_owner,
+            view.rules().enabled(&protocol::feature_id("MPTokensV2")),
+        ) {
+            SmallOfferDisposition::Keep => {}
+            SmallOfferDisposition::RemoveIfFundingUnchanged => {
+                if let Some(removable) = &self_cross_cancellation {
+                    removable.record_if_funding_unchanged(*offer_sle.key(), owner_funds.clone());
+                }
+                remove_offer_or_return!(&offer_sle);
+                offers_consumed += 1;
+                continue;
+            }
+            SmallOfferDisposition::RemovePermanently => {
+                if let Some(removable) = &self_cross_cancellation {
+                    removable.record(*offer_sle.key());
+                }
+                remove_offer_or_return!(&offer_sle);
+                offers_consumed += 1;
+                continue;
+            }
+            SmallOfferDisposition::ArithmeticFailure => {
+                return BookStepResult {
+                    amount_in: total_in,
+                    amount_out: total_out,
+                    offers_consumed,
+                    ter: Ter::TEF_EXCEPTION,
+                };
+            }
         }
         found_tip = true;
         offers.push(offer_sle);
@@ -321,17 +586,39 @@ pub fn execute_book_step_with_options<V: ApplyView>(
         amm_context.multi_path(),
     );
     let mut stop_before_clob = false;
-    if book.domain.is_none()
-        && remaining_in.signum() > 0
-        && total_out < *max_out
-        && let Some(amm_offer) = get_amm_offer(view, book, amm_generation_quality, &amm_context)
-    {
+    let amm_offer = if book.domain.is_none() && remaining_in.signum() > 0 && total_out < *max_out {
+        match get_amm_offer(view, book, amm_generation_quality, &amm_context) {
+            Ok(offer) => offer,
+            Err(_) => {
+                return BookStepResult {
+                    amount_in: total_in,
+                    amount_out: total_out,
+                    offers_consumed,
+                    ter: Ter::TEF_BAD_LEDGER,
+                };
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(amm_offer) = amm_offer {
         // `BookStep::execOffer` applies the same owner-authorization gate to
         // real offers and synthetic AMM offers.  An AMM trust line can exist
         // without the issuer having authorized it after `lsfRequireAuth` is
         // enabled; in that case the synthetic offer is skipped (there is no
         // ledger offer to erase) and the CLOB stream remains eligible.
-        if !offer_owner_authorized(view, &book.r#in, &amm_offer.account) {
+        let owner_authorized = match offer_owner_authorized(view, &book.r#in, &amm_offer.account) {
+            Ok(authorized) => authorized,
+            Err(_) => {
+                return BookStepResult {
+                    amount_in: total_in,
+                    amount_out: total_out,
+                    offers_consumed,
+                    ter: Ter::TEF_BAD_LEDGER,
+                };
+            }
+        };
+        if !owner_authorized {
             first_quality = None;
         } else if rejects_step_quality(
             options.enforce_quality_threshold,
@@ -397,8 +684,22 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
             let taker_gets = offer_sle.get_field_amount(sf("sfTakerGets"));
 
+            if offer_sle.is_field_present(sf("sfExpiration"))
+                && offer_sle.get_field_u32(sf("sfExpiration"))
+                    <= view.parent_close_time().as_seconds()
+            {
+                if let Some(removable) = &self_cross_cancellation {
+                    removable.record(*offer_sle.key());
+                }
+                remove_offer_or_return!(&offer_sle);
+                offers_consumed += 1;
+                continue;
+            }
             if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
-                remove_consumed_offer(view, &offer_sle);
+                if let Some(removable) = &self_cross_cancellation {
+                    removable.record(*offer_sle.key());
+                }
+                remove_offer_or_return!(&offer_sle);
                 offers_consumed += 1;
                 continue;
             }
@@ -407,14 +708,26 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 && (!view.rules().enabled(&protocol::fix_cleanup_3_3_0()) || book.domain.is_some())
             {
                 let offer_domain = offer_sle.get_field_h256(sf("sfDomainID"));
-                if !crate::permissioned_dex_helpers::offer_in_domain(
+                let offer_in_domain = match crate::permissioned_dex_helpers::offer_in_domain(
                     &*view,
                     offer_sle.key(),
                     &offer_domain,
-                )
-                .unwrap_or(false)
-                {
-                    remove_consumed_offer(view, &offer_sle);
+                ) {
+                    Ok(in_domain) => in_domain,
+                    Err(_) => {
+                        return BookStepResult {
+                            amount_in: total_in,
+                            amount_out: total_out,
+                            offers_consumed,
+                            ter: Ter::TEF_BAD_LEDGER,
+                        };
+                    }
+                };
+                if !offer_in_domain {
+                    if let Some(removable) = &self_cross_cancellation {
+                        removable.record(*offer_sle.key());
+                    }
+                    remove_offer_or_return!(&offer_sle);
                     offers_consumed += 1;
                     continue;
                 }
@@ -422,9 +735,22 @@ pub fn execute_book_step_with_options<V: ApplyView>(
 
             // The first tip was funded during discovery; later tips are checked
             // only when FlowOfferStream-equivalent iteration reaches them.
-            let owner_funds = get_owner_funds(view, &offer_owner, &taker_gets);
+            let owner_funds = match get_owner_funds(view, &offer_owner, &taker_gets) {
+                Ok(funds) => funds,
+                Err(_) => {
+                    return BookStepResult {
+                        amount_in: total_in,
+                        amount_out: total_out,
+                        offers_consumed,
+                        ter: Ter::TEF_BAD_LEDGER,
+                    };
+                }
+            };
             if owner_funds.signum() <= 0 {
-                remove_consumed_offer(view, &offer_sle);
+                if let Some(removable) = &self_cross_cancellation {
+                    removable.record_if_funding_unchanged(*offer_sle.key(), owner_funds.clone());
+                }
+                remove_offer_or_return!(&offer_sle);
                 if !offer_attempted {
                     first_quality = None;
                 }
@@ -475,8 +801,52 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             // Authorization follows the self-cross callback in rippled. An
             // invalid non-self tip is permanently cleaned and may expose the
             // next quality only when nothing has yet been attempted.
-            if !offer_owner_authorized(view, &book.r#in, &offer_owner) {
-                remove_consumed_offer(view, &offer_sle);
+            let owner_authorized = match offer_owner_authorized(view, &book.r#in, &offer_owner) {
+                Ok(authorized) => authorized,
+                Err(_) => {
+                    return BookStepResult {
+                        amount_in: total_in,
+                        amount_out: total_out,
+                        offers_consumed,
+                        ter: Ter::TEF_BAD_LEDGER,
+                    };
+                }
+            };
+            if !owner_authorized {
+                if let Some(removable) = &self_cross_cancellation {
+                    removable.record(*offer_sle.key());
+                }
+                remove_offer_or_return!(&offer_sle);
+                if !offer_attempted {
+                    first_quality = None;
+                }
+                offers_consumed += 1;
+                continue;
+            }
+            let owner_mpt_dex_allowed = match offer_owner_mpt_dex_allowed(
+                view,
+                book,
+                &offer_owner,
+                options.has_previous_step,
+                options.previous_step_is_book,
+                strand_dst,
+                strand_deliver,
+            ) {
+                Ok(allowed) => allowed,
+                Err(_) => {
+                    return BookStepResult {
+                        amount_in: total_in,
+                        amount_out: total_out,
+                        offers_consumed,
+                        ter: Ter::TEF_BAD_LEDGER,
+                    };
+                }
+            };
+            if !owner_mpt_dex_allowed {
+                if let Some(removable) = &self_cross_cancellation {
+                    removable.record(*offer_sle.key());
+                }
+                remove_offer_or_return!(&offer_sle);
                 if !offer_attempted {
                     first_quality = None;
                 }
@@ -524,7 +894,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 &consumption.owner_gives,
             );
             if res != Ter::TES_SUCCESS {
-                remove_consumed_offer(view, &offer_sle);
+                remove_offer_or_return!(&offer_sle);
                 offers_consumed += 1;
                 continue;
             }
@@ -542,13 +912,13 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 obj.set_field_amount(sf("sfTakerPays"), new_pays);
                 obj.set_field_amount(sf("sfTakerGets"), new_gets);
                 let consumed_offer = STLedgerEntry::from_stobject(obj, *offer_sle.key());
-                let _ = view.update(Arc::new(consumed_offer.clone()));
-                remove_consumed_offer(view, &consumed_offer);
+                update_or_return!(Arc::new(consumed_offer.clone()));
+                remove_offer_or_return!(&consumed_offer);
             } else {
                 let mut obj = offer_sle.clone_as_object();
                 obj.set_field_amount(sf("sfTakerPays"), new_pays);
                 obj.set_field_amount(sf("sfTakerGets"), new_gets);
-                let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+                update_or_return!(Arc::new(STLedgerEntry::from_stobject(
                     obj,
                     *offer_sle.key(),
                 )));
@@ -574,22 +944,21 @@ fn transfer_rate_for_asset<V: ApplyView>(
     asset: Asset,
     dst: Option<&AccountID>,
     strand_deliver: Asset,
-) -> u32 {
+) -> Result<u32, ViewError> {
     match asset {
         Asset::Issue(issue) => {
             if issue.native() || dst.is_some_and(|account| *account == issue.issuer()) {
-                QUALITY_ONE
+                Ok(QUALITY_ONE)
             } else {
-                ripple_state_helpers::transfer_rate(view, &issue.issuer())
+                ripple_state_helpers::try_transfer_rate(view, &issue.issuer())
             }
         }
         Asset::MPTIssue(issue) => {
             if asset == strand_deliver && dst.is_some_and(|account| *account == issue.issuer()) {
-                QUALITY_ONE
+                Ok(QUALITY_ONE)
             } else {
                 crate::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
                     .map(|rate| rate.value)
-                    .unwrap_or(QUALITY_ONE)
             }
         }
     }
@@ -1100,17 +1469,19 @@ fn get_amm_offer<V: ApplyView>(
     book: &Book,
     clob_quality: Option<Quality>,
     amm_context: &crate::domain::flow_engine::AmmContext,
-) -> Option<SyntheticAmmOffer> {
+) -> Result<Option<SyntheticAmmOffer>, ViewError> {
     if amm_context.max_iterations_reached() {
-        return None;
+        return Ok(None);
     }
     // Find AMM SLE for this book
     let amm_keylet = protocol::amm(book.r#in, book.out);
-    let amm_sle = view.read(amm_keylet).ok()??;
+    let Some(amm_sle) = view.read(amm_keylet)? else {
+        return Ok(None);
+    };
 
     // An empty AMM object is not a source of synthetic liquidity.
     if amm_sle.get_field_amount(sf("sfLPTokenBalance")).signum() <= 0 {
-        return None;
+        return Ok(None);
     }
 
     // Get AMM account
@@ -1127,11 +1498,15 @@ fn get_amm_offer<V: ApplyView>(
     // `ammAccountHolds`: frozen IOU/MPT assets have no AMM liquidity and IOU
     // balances must carry the book issuer, irrespective of trust-line storage
     // orientation.
-    let pool_in_amount = amm_account_holds(view, &amm_account, book.r#in)?;
-    let pool_out_amount = amm_account_holds(view, &amm_account, book.out)?;
+    let Some(pool_in_amount) = amm_account_holds(view, &amm_account, book.r#in)? else {
+        return Ok(None);
+    };
+    let Some(pool_out_amount) = amm_account_holds(view, &amm_account, book.out)? else {
+        return Ok(None);
+    };
 
     if pool_in_amount.signum() <= 0 || pool_out_amount.signum() <= 0 {
-        return None;
+        return Ok(None);
     }
 
     let amm_rounding_enabled = view.rules().enabled(&protocol::fix_ammv1_1());
@@ -1147,7 +1522,7 @@ fn get_amm_offer<V: ApplyView>(
                 RuntimeNumber::from_i64_and_exponent(1, -7),
             ))
     {
-        return None;
+        return Ok(None);
     }
 
     let max_offer = || {
@@ -1165,7 +1540,7 @@ fn get_amm_offer<V: ApplyView>(
             (book.r#in, book.out),
             &(pool_in_amount.clone(), pool_out_amount.clone()),
         );
-        let (offered_in, offered_out) = generate_fibonacci_amm_offer(
+        let Some((offered_in, offered_out)) = generate_fibonacci_amm_offer(
             &initial_in,
             &initial_out,
             &pool_in_amount,
@@ -1173,12 +1548,14 @@ fn get_amm_offer<V: ApplyView>(
             trading_fee,
             amm_rounding_enabled,
             amm_context.iterations(),
-        )?;
+        ) else {
+            return Ok(None);
+        };
         let quality = Quality::from_amounts(&Amounts::new(offered_in.clone(), offered_out.clone()));
         if clob_quality.is_some_and(|clob| quality < clob) {
-            return None;
+            return Ok(None);
         }
-        return Some(SyntheticAmmOffer {
+        return Ok(Some(SyntheticAmmOffer {
             account: amm_account,
             pool_in: pool_in_amount,
             pool_out: pool_out_amount,
@@ -1191,38 +1568,45 @@ fn get_amm_offer<V: ApplyView>(
             fix_reduced_offers_v2: view
                 .rules()
                 .enabled(&protocol::feature_id("fixReducedOffersV2")),
-        });
+        }));
     }
     let (offered_in, offered_out, offer_quality) = match clob_quality {
         None => {
-            let (input, out) = max_offer()?;
+            let Some((input, out)) = max_offer() else {
+                return Ok(None);
+            };
             (input, out, spot_quality)
         }
-        Some(clob) => amm_offer_for_clob_quality(
-            &pool_in_amount,
-            &pool_out_amount,
-            clob,
-            trading_fee,
-            amm_rounding_enabled,
-        )
-        .map(|(input, out)| {
-            let quality = Quality::from_amounts(&Amounts::new(input.clone(), out.clone()));
-            (input, out, quality)
-        })
-        .or_else(|| {
-            view.rules()
-                .enabled(&protocol::feature_id("fixAMMv1_2"))
-                .then(|| max_offer())
-                .flatten()
-                .filter(|amounts| {
-                    Quality::from_amounts(&Amounts::new(amounts.0.clone(), amounts.1.clone()))
-                        > clob
-                })
-                .map(|(input, out)| (input, out, spot_quality))
-        })?,
+        Some(clob) => {
+            match amm_offer_for_clob_quality(
+                &pool_in_amount,
+                &pool_out_amount,
+                clob,
+                trading_fee,
+                amm_rounding_enabled,
+            )
+            .map(|(input, out)| {
+                let quality = Quality::from_amounts(&Amounts::new(input.clone(), out.clone()));
+                (input, out, quality)
+            })
+            .or_else(|| {
+                view.rules()
+                    .enabled(&protocol::feature_id("fixAMMv1_2"))
+                    .then(|| max_offer())
+                    .flatten()
+                    .filter(|amounts| {
+                        Quality::from_amounts(&Amounts::new(amounts.0.clone(), amounts.1.clone()))
+                            > clob
+                    })
+                    .map(|(input, out)| (input, out, spot_quality))
+            }) {
+                Some(amounts) => amounts,
+                None => return Ok(None),
+            }
+        }
     };
 
-    Some(SyntheticAmmOffer {
+    Ok(Some(SyntheticAmmOffer {
         account: amm_account,
         pool_in: pool_in_amount,
         pool_out: pool_out_amount,
@@ -1235,7 +1619,7 @@ fn get_amm_offer<V: ApplyView>(
         fix_reduced_offers_v2: view
             .rules()
             .enabled(&protocol::feature_id("fixReducedOffersV2")),
-    })
+    }))
 }
 
 /// Non-mutating liquidity ordering key used by flow's ActiveStrands.  This is
@@ -1250,8 +1634,9 @@ pub(crate) fn book_quality_upper_bound<V: ApplyView>(
     previous_redeems: bool,
     strand_dst: &AccountID,
     strand_deliver: Asset,
-) -> Option<Quality> {
-    let clob = get_book_offers(view, book, 1).first().map(|offer| {
+) -> Result<Option<Quality>, ViewError> {
+    let clob_offers = get_book_offers(view, book, 1)?;
+    let clob = clob_offers.first().map(|offer| {
         Quality::from_amounts(&Amounts::new(
             offer.get_field_amount(sf("sfTakerPays")),
             offer.get_field_amount(sf("sfTakerGets")),
@@ -1263,19 +1648,19 @@ pub(crate) fn book_quality_upper_bound<V: ApplyView>(
         view.rules().enabled(&protocol::fix_ammv1_1()),
         amm_context.multi_path(),
     );
-    let amm = book
-        .domain
-        .is_none()
-        .then(|| get_amm_offer(view, book, generation_quality, amm_context))
-        .flatten();
+    let amm = if book.domain.is_none() {
+        get_amm_offer(view, book, generation_quality, amm_context)?
+    } else {
+        None
+    };
     let (quality, is_amm, amm_multi_path) = match (clob, amm) {
         (Some(lhs), Some(rhs)) if rhs.quality() > lhs => (rhs.quality(), true, rhs.multi_path),
         (Some(lhs), _) => (lhs, false, false),
         (None, Some(rhs)) => (rhs.quality(), true, rhs.multi_path),
-        (None, None) => return None,
+        (None, None) => return Ok(None),
     };
 
-    Some(adjust_quality_with_fees(
+    Ok(Some(adjust_quality_with_fees(
         view,
         book,
         quality,
@@ -1285,7 +1670,7 @@ pub(crate) fn book_quality_upper_bound<V: ApplyView>(
         previous_redeems,
         strand_dst,
         strand_deliver,
-    ))
+    )?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1298,8 +1683,9 @@ pub(crate) fn book_quality_function<V: ApplyView>(
     previous_redeems: bool,
     strand_dst: &AccountID,
     strand_deliver: Asset,
-) -> Option<QualityFunction> {
-    let clob = get_book_offers(view, book, 1).first().map(|offer| {
+) -> Result<Option<QualityFunction>, ViewError> {
+    let clob_offers = get_book_offers(view, book, 1)?;
+    let clob = clob_offers.first().map(|offer| {
         Quality::from_amounts(&Amounts::new(
             offer.get_field_amount(sf("sfTakerPays")),
             offer.get_field_amount(sf("sfTakerGets")),
@@ -1311,20 +1697,22 @@ pub(crate) fn book_quality_function<V: ApplyView>(
         view.rules().enabled(&protocol::fix_ammv1_1()),
         amm_context.multi_path(),
     );
-    let amm = book
-        .domain
-        .is_none()
-        .then(|| get_amm_offer(view, book, target, amm_context))
-        .flatten();
+    let amm = if book.domain.is_none() {
+        get_amm_offer(view, book, target, amm_context)?
+    } else {
+        None
+    };
     let choose_amm = match (clob, amm.as_ref()) {
         (Some(lhs), Some(rhs)) => rhs.quality() > lhs,
         (None, Some(_)) => true,
         _ => false,
     };
     if choose_amm {
-        let offer = amm?;
+        let Some(offer) = amm else {
+            return Ok(None);
+        };
         if offer.multi_path {
-            return Some(QualityFunction::from_quality(
+            return Ok(Some(QualityFunction::from_quality(
                 adjust_quality_with_fees(
                     view,
                     book,
@@ -1335,9 +1723,9 @@ pub(crate) fn book_quality_function<V: ApplyView>(
                     previous_redeems,
                     strand_dst,
                     strand_deliver,
-                ),
+                )?,
                 QualityFunctionClobLikeTag,
-            ));
+            )));
         }
         let compose_input_rate = should_compose_single_path_input_rate(
             previous_redeems,
@@ -1345,7 +1733,7 @@ pub(crate) fn book_quality_function<V: ApplyView>(
             view.rules().enabled(&protocol::fix_ammv1_1()),
         );
         let mut qf = if compose_input_rate {
-            let tr = transfer_rate_for_asset(view, book.r#in, Some(strand_dst), strand_deliver);
+            let tr = transfer_rate_for_asset(view, book.r#in, Some(strand_dst), strand_deliver)?;
             let input = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(i64::from(tr)));
             let output =
                 STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(i64::from(QUALITY_ONE)));
@@ -1365,10 +1753,10 @@ pub(crate) fn book_quality_function<V: ApplyView>(
             offer.trading_fee,
             QualityFunctionAmmTag,
         ));
-        Some(qf)
+        Ok(Some(qf))
     } else {
-        clob.map(|quality| {
-            QualityFunction::from_quality(
+        match clob {
+            Some(quality) => Ok(Some(QualityFunction::from_quality(
                 adjust_quality_with_fees(
                     view,
                     book,
@@ -1379,10 +1767,11 @@ pub(crate) fn book_quality_function<V: ApplyView>(
                     previous_redeems,
                     strand_dst,
                     strand_deliver,
-                ),
+                )?,
                 QualityFunctionClobLikeTag,
-            )
-        })
+            ))),
+            None => Ok(None),
+        }
     }
 }
 
@@ -1405,29 +1794,29 @@ fn adjust_quality_with_fees<V: ApplyView>(
     previous_redeems: bool,
     strand_dst: &AccountID,
     strand_deliver: Asset,
-) -> Quality {
+) -> Result<Quality, ViewError> {
     // BookOfferCrossingStep deliberately returns the raw upper bound for CLOB
     // and multipath AMM liquidity. For a single-path AMM, fixAMMv1_1 makes the
     // incoming transfer rate part of the nonlinear quality upper bound.
     if owner_pays_transfer_fee
         && (!view.rules().enabled(&protocol::fix_ammv1_1()) || !is_amm || amm_multi_path)
     {
-        return offer_quality;
+        return Ok(offer_quality);
     }
 
     let tr_in = if previous_redeems {
-        transfer_rate_for_asset(view, book.r#in, Some(strand_dst), strand_deliver)
+        transfer_rate_for_asset(view, book.r#in, Some(strand_dst), strand_deliver)?
     } else {
         QUALITY_ONE
     };
     // AMM synthetic offers waive the output transfer fee. Payments charge it
     // only when their BookStep policy says the offer owner pays it.
     let tr_out = if !is_amm && owner_pays_transfer_fee {
-        transfer_rate_for_asset(view, book.out, Some(strand_dst), strand_deliver)
+        transfer_rate_for_asset(view, book.out, Some(strand_dst), strand_deliver)?
     } else {
         QUALITY_ONE
     };
-    compose_transfer_quality(offer_quality, tr_in, tr_out)
+    Ok(compose_transfer_quality(offer_quality, tr_in, tr_out))
 }
 
 fn compose_transfer_quality(offer_quality: Quality, tr_in: u32, tr_out: u32) -> Quality {
@@ -1443,40 +1832,55 @@ fn amm_account_holds<V: ApplyView>(
     view: &mut V,
     amm_account: &AccountID,
     asset: Asset,
-) -> Option<STAmount> {
+) -> Result<Option<STAmount>, ViewError> {
     match asset {
         Asset::Issue(issue) if issue.native() => {
             let keylet =
                 protocol::account_keylet(basics::base_uint::Uint160::from_void(amm_account.data()));
-            Some(view.read(keylet).ok()??.get_field_amount(sf("sfBalance")))
+            Ok(view
+                .read(keylet)?
+                .map(|entry| entry.get_field_amount(sf("sfBalance"))))
         }
         Asset::Issue(issue) => {
-            if ripple_state_helpers::is_frozen(view, amm_account, &issue) {
-                return Some(STAmount::new_with_asset(sf("sfAmount"), asset, 0, 0, false));
+            if ripple_state_helpers::try_is_frozen(view, amm_account, &issue)? {
+                return Ok(Some(STAmount::new_with_asset(
+                    sf("sfAmount"),
+                    asset,
+                    0,
+                    0,
+                    false,
+                )));
             }
-            let balance = ripple_state_helpers::account_holds(
+            let balance = ripple_state_helpers::try_account_holds(
                 view,
                 amm_account,
                 &issue.account,
                 issue.currency,
-            );
-            Some(normalize_amount_to_asset(&balance, asset))
+            )?;
+            Ok(Some(normalize_amount_to_asset(&balance, asset)))
         }
         Asset::MPTIssue(issue) => {
-            if crate::mptoken_helpers::is_frozen_mpt(view, amm_account, &issue).unwrap_or(true) {
-                return Some(STAmount::new_with_asset(sf("sfAmount"), asset, 0, 0, false));
+            if crate::mptoken_helpers::is_frozen_mpt(view, amm_account, &issue)? {
+                return Ok(Some(STAmount::new_with_asset(
+                    sf("sfAmount"),
+                    asset,
+                    0,
+                    0,
+                    false,
+                )));
             }
-            let token = view
-                .read(protocol::mptoken_keylet_from_mptid(
-                    issue.mpt_id(),
-                    basics::base_uint::Uint160::from_void(amm_account.data()),
-                ))
-                .ok()??;
-            Some(STAmount::from_mpt_amount(
+            let Some(token) = view.read(protocol::mptoken_keylet_from_mptid(
+                issue.mpt_id(),
+                basics::base_uint::Uint160::from_void(amm_account.data()),
+            ))?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(STAmount::from_mpt_amount(
                 sf("sfAmount"),
                 MPTAmount::from_value(token.get_field_u64(sf("sfMPTAmount")) as i64),
                 issue,
-            ))
+            )))
         }
     }
 }
@@ -1509,52 +1913,11 @@ fn execute_amm_trade<V: ApplyView>(
 
 /// Remove a consumed offer — reference offerDelete parity.
 /// Removes from owner directory, book directory, adjusts owner count, erases SLE.
-fn remove_consumed_offer<V: ApplyView>(view: &mut V, offer_sle: &STLedgerEntry) {
-    let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
-
-    // Remove from owner directory
-    let owner_node = offer_sle.get_field_u64(sf("sfOwnerNode"));
-    let owner_dir = protocol::owner_dir_keylet(basics::math::base_uint::Uint160::from_void(
-        offer_owner.data(),
-    ));
-    let _ = crate::dir_remove(
-        view as &mut dyn ApplyView,
-        &owner_dir,
-        owner_node,
-        *offer_sle.key(),
-        false,
-    );
-
-    // Remove from book directory
-    let book_node = offer_sle.get_field_u64(sf("sfBookNode"));
-    let book_dir_key = offer_sle.get_field_h256(sf("sfBookDirectory"));
-    if !book_dir_key.is_zero() {
-        let book_dir =
-            protocol::Keylet::new(protocol::LedgerEntryType::DirectoryNode, book_dir_key);
-        let _ = crate::dir_remove(
-            view as &mut dyn ApplyView,
-            &book_dir,
-            book_node,
-            *offer_sle.key(),
-            false,
-        );
+fn remove_consumed_offer<V: ApplyView>(view: &mut V, offer_sle: &STLedgerEntry) -> Ter {
+    match crate::offer_helpers::offer_delete(view, Arc::new(offer_sle.clone())) {
+        Ok(ter) => ter,
+        Err(_) => Ter::TEF_BAD_LEDGER,
     }
-
-    // Adjust owner count
-    let acct_keylet = protocol::account_keylet(basics::math::base_uint::Uint160::from_void(
-        offer_owner.data(),
-    ));
-    if let Some(acct_sle) = view
-        .peek(acct_keylet)
-        .ok()
-        .flatten()
-        .or_else(|| view.read(acct_keylet).ok().flatten())
-    {
-        let _ = crate::adjust_owner_count(view as &mut dyn ApplyView, &acct_sle, -1);
-    }
-
-    // Erase the offer
-    let _ = view.erase(Arc::new(offer_sle.clone()));
 }
 
 /// Transaction-context-free identity fields for malformed-book diagnostics.
@@ -1571,7 +1934,11 @@ fn book_asset_identity(asset: Asset) -> (String, String) {
     }
 }
 
-fn get_book_offers<V: ApplyView>(view: &mut V, book: &Book, max: u32) -> Vec<STLedgerEntry> {
+fn get_book_offers<V: ApplyView>(
+    view: &mut V,
+    book: &Book,
+    max: u32,
+) -> Result<Vec<STLedgerEntry>, ViewError> {
     let mut offers = Vec::new();
 
     // Offers are stored under their executable TakerPays -> TakerGets book,
@@ -1605,20 +1972,19 @@ fn get_book_offers<V: ApplyView>(view: &mut V, book: &Book, max: u32) -> Vec<STL
     // Walk directory pages in quality order using succ
     while offers.len() < max as usize {
         // Find next directory page in the book range
-        let next_page = match view.succ(current_key, Some(book_end)) {
-            Ok(Some(key)) => key,
-            _ => break,
+        let next_page = match view.succ(current_key, Some(book_end))? {
+            Some(key) => key,
+            None => break,
         };
 
         // Read the directory page — use read fallback for NuDB-backed pages
         // not yet in the sandbox cache (fixes tecDIR_FULL for multi-page dirs).
         let page_keylet =
             protocol::Keylet::new(protocol::LedgerEntryType::DirectoryNode, next_page);
-        let dir = view
-            .peek(page_keylet)
-            .ok()
-            .flatten()
-            .or_else(|| view.read(page_keylet).ok().flatten());
+        // `peek` is an effective ApplyView read: it resolves the base entry
+        // and preserves staged erases. A fallback `read` would resurrect a
+        // directory page removed earlier in this flow pass.
+        let dir = view.peek(page_keylet)?;
         let Some(dir) = dir else {
             // Advance past this page
             current_key = next_page;
@@ -1634,12 +2000,7 @@ fn get_book_offers<V: ApplyView>(view: &mut V, book: &Book, max: u32) -> Vec<STL
                 }
                 let offer_keylet =
                     protocol::Keylet::new(protocol::LedgerEntryType::Offer, offer_key);
-                // Use read fallback for offers not yet in sandbox cache.
-                let offer_sle = view
-                    .peek(offer_keylet)
-                    .ok()
-                    .flatten()
-                    .or_else(|| view.read(offer_keylet).ok().flatten());
+                let offer_sle = view.peek(offer_keylet)?;
                 if let Some(offer_sle) = offer_sle {
                     offers.push(offer_sle.as_ref().clone());
                 }
@@ -1650,32 +2011,47 @@ fn get_book_offers<V: ApplyView>(view: &mut V, book: &Book, max: u32) -> Vec<STL
         current_key = next_page;
     }
 
-    offers
+    Ok(offers)
 }
 
 /// Get the funds available for an offer owner to deliver.
-fn get_owner_funds<V: ApplyView>(
+pub(crate) fn get_owner_funds<V: ApplyView>(
     view: &mut V,
     owner: &AccountID,
     default_amount: &STAmount,
-) -> STAmount {
+) -> Result<STAmount, ViewError> {
     let asset = default_amount.asset();
     if asset.native() {
         // XRP: balance minus reserve
         let acct_keylet =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(owner.data()));
-        if let Some(sle) = view
-            .peek(acct_keylet)
-            .ok()
-            .flatten()
-            .or_else(|| view.read(acct_keylet).ok().flatten())
-        {
-            let balance = sle.get_field_amount(sf("sfBalance")).xrp().drops();
-            let owner_count = sle.get_field_u32(sf("sfOwnerCount"));
-            let reserve = view.fees().account_reserve(owner_count as usize) as i64;
+        let account = view.peek(acct_keylet)?;
+        if let Some(sle) = account {
+            let balance = view
+                .balance_hook_iou(
+                    *owner,
+                    protocol::xrp_account(),
+                    sle.get_field_amount(sf("sfBalance")),
+                )
+                .xrp()
+                .drops();
+            let reserve = if crate::is_pseudo_account(&sle) {
+                0
+            } else {
+                let owner_count = view
+                    .owner_count_hook(*owner, crate::OwnerCounts::from_sle(&sle))
+                    .count();
+                crate::effective_account_reserve_with_owner_count(
+                    view.fees(),
+                    &sle,
+                    owner_count,
+                    0,
+                    0,
+                ) as i64
+            };
             let available = balance - reserve;
             if available <= 0 {
-                return STAmount::default();
+                return Ok(STAmount::default());
             }
             // The reverse XRP endpoint may have credited this disposable
             // sandbox with Flow's native delivery sentinel.  rippled keeps
@@ -1683,55 +2059,54 @@ fn get_owner_funds<V: ApplyView>(
             // balance-minus-reserve does not run STAmount's network-amount
             // canonicalizer a second time.  Preserve that internal value;
             // the forward pass constrains it before any ledger commit.
-            return STAmount::new_native(available as u64, false);
+            return Ok(STAmount::new_native(available as u64, false));
         }
-        return STAmount::default();
+        return Ok(STAmount::default());
     }
     if let Asset::MPTIssue(issue) = asset {
         if *owner == issue.issuer() {
-            let issuance = view
-                .read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
-                .ok()
-                .flatten();
+            let issuance = view.read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))?;
             let available = issuance
                 .as_deref()
                 .map(crate::mptoken_helpers::available_mpt_amount)
                 .unwrap_or(0);
-            return STAmount::from_mpt_amount(
+            return Ok(STAmount::from_mpt_amount(
                 sf("sfAmount"),
                 MPTAmount::from_value(available),
                 issue,
-            );
+            ));
         }
         let token_keylet = protocol::mptoken_keylet_from_mptid(
             issue.mpt_id(),
             basics::base_uint::Uint160::from_void(owner.data()),
         );
-        let Some(token) = view
-            .peek(token_keylet)
-            .ok()
-            .flatten()
-            .or_else(|| view.read(token_keylet).ok().flatten())
-        else {
-            return STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::new(), issue);
+        let token = view.peek(token_keylet)?;
+        let Some(token) = token else {
+            return Ok(STAmount::from_mpt_amount(
+                sf("sfAmount"),
+                MPTAmount::new(),
+                issue,
+            ));
         };
-        if crate::mptoken_helpers::is_frozen_mpt(view, owner, &issue).unwrap_or(true)
+        if crate::mptoken_helpers::is_frozen_mpt(view, owner, &issue)?
             || crate::mptoken_helpers::require_auth_mpt_with_type(
                 view,
                 &issue,
                 owner,
                 crate::mptoken_helpers::MPTAuthType::Strong,
-            )
-            .unwrap_or(Ter::TEC_NO_AUTH)
-                != Ter::TES_SUCCESS
+            )? != Ter::TES_SUCCESS
         {
-            return STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::new(), issue);
+            return Ok(STAmount::from_mpt_amount(
+                sf("sfAmount"),
+                MPTAmount::new(),
+                issue,
+            ));
         }
-        return STAmount::from_mpt_amount(
+        return Ok(STAmount::from_mpt_amount(
             sf("sfAmount"),
             MPTAmount::from_value(token.get_field_u64(sf("sfMPTAmount")) as i64),
             issue,
-        );
+        ));
     }
     let Asset::Issue(issue) = asset else {
         unreachable!("handled above");
@@ -1739,13 +2114,13 @@ fn get_owner_funds<V: ApplyView>(
     if *owner == issue.issuer() {
         // IOU issuers self-fund precisely the offer's output amount. Using a
         // synthetic fixed-exponent maximum can underfund valid large offers.
-        return default_amount.clone();
+        return Ok(default_amount.clone());
     }
     // IOU: check freeze status first (reference FreezeHandling::ZeroIfFrozen)
-    if ripple_state_helpers::is_frozen(view, owner, &issue) {
-        return STAmount::default();
+    if ripple_state_helpers::try_is_frozen(view, owner, &issue)? {
+        return Ok(STAmount::default());
     }
-    ripple_state_helpers::account_holds(view, owner, &issue.account, issue.currency)
+    ripple_state_helpers::try_account_holds(view, owner, &issue.account, issue.currency)
 }
 
 /// Result of offer consumption computation.
@@ -2097,8 +2472,77 @@ mod success_path_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use protocol::{STArray, STObject, StBase};
+    use basics::base_uint::{Uint192, Uint256};
+    use protocol::{ApplyFlags, Currency, MPTIssue, STArray, STObject, StBase};
+
+    use crate::{ApplyViewImpl, Fees, Ledger, LedgerHeader, ReadView, ReadViewTx, Rules};
+
+    #[derive(Debug)]
+    struct FaultingReadView {
+        base: Ledger,
+    }
+
+    impl ReadView for FaultingReadView {
+        fn open(&self) -> bool {
+            false
+        }
+        fn header(&self) -> LedgerHeader {
+            ReadView::header(&self.base)
+        }
+        fn fees(&self) -> Fees {
+            ReadView::fees(&self.base)
+        }
+        fn rules(&self) -> Rules {
+            ReadView::rules(&self.base)
+        }
+        fn exists(&self, _: protocol::Keylet) -> Result<bool, ViewError> {
+            Err(ViewError::Conversion(
+                "fault-injected offer auth read".into(),
+            ))
+        }
+        fn succ(&self, _: Uint256, _: Option<Uint256>) -> Result<Option<Uint256>, ViewError> {
+            Err(ViewError::Conversion(
+                "fault-injected offer auth read".into(),
+            ))
+        }
+        fn read(&self, _: protocol::Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
+            Err(ViewError::Conversion(
+                "fault-injected offer auth read".into(),
+            ))
+        }
+        fn sles(&self) -> Result<Vec<Arc<STLedgerEntry>>, ViewError> {
+            Err(ViewError::Conversion(
+                "fault-injected offer auth read".into(),
+            ))
+        }
+        fn tx_exists(&self, key: Uint256) -> Result<bool, ViewError> {
+            ReadView::tx_exists(&self.base, key)
+        }
+        fn tx_read(&self, key: Uint256) -> Result<Option<ReadViewTx>, ViewError> {
+            ReadView::tx_read(&self.base, key)
+        }
+        fn txs(&self) -> Result<Vec<ReadViewTx>, ViewError> {
+            ReadView::txs(&self.base)
+        }
+    }
+
+    #[test]
+    fn offer_authorization_propagates_issuer_trustline_and_mpt_read_failures() {
+        let base = Arc::new(FaultingReadView {
+            base: Ledger::from_ledger_seq_and_close_time(1, 1, false),
+        });
+        let view = ApplyViewImpl::new(base, ApplyFlags::NONE);
+        let owner = AccountID::from_array([0x11; 20]);
+        let issuer = AccountID::from_array([0x22; 20]);
+        let iou = Asset::Issue(protocol::Issue::new(Currency::from([0x33; 20]), issuer));
+        let mpt = Asset::MPTIssue(MPTIssue::new(Uint192::from_array([0x44; 24])));
+
+        assert!(offer_owner_authorized(&view, &iou, &owner).is_err());
+        assert!(offer_owner_authorized(&view, &mpt, &owner).is_err());
+    }
 
     #[test]
     fn amm_target_threshold_is_fix_and_single_path_conditional() {
@@ -2379,6 +2823,107 @@ mod tests {
             good,
             None
         ));
+    }
+
+    #[test]
+    fn mpt_dex_owner_policy_matches_pinned_previous_step_exceptions() {
+        assert_eq!(
+            mpt_input_owner_policy(false, false, false),
+            MptInputOwnerPolicy::Allow,
+            "an issuer-starting strand has no preceding step"
+        );
+        assert_eq!(
+            mpt_input_owner_policy(true, false, true),
+            MptInputOwnerPolicy::Allow,
+            "an issuer-owned offer bypasses holder checks"
+        );
+        assert_eq!(
+            mpt_input_owner_policy(true, true, false),
+            MptInputOwnerPolicy::FreezeOnly,
+            "a preceding BookStep checks the owner lock but not canTransfer"
+        );
+        assert_eq!(
+            mpt_input_owner_policy(true, false, false),
+            MptInputOwnerPolicy::FreezeAndTransfer,
+            "a preceding endpoint/direct step checks both lock and canTransfer"
+        );
+        assert!(!mpt_output_requires_transfer(true, false));
+        assert!(!mpt_output_requires_transfer(false, true));
+        assert!(mpt_output_requires_transfer(false, false));
+    }
+
+    #[test]
+    fn small_offer_policy_preserves_integral_output_exception() {
+        let issuer = AccountID::from_array([0x81; 20]);
+        let owner = AccountID::from_array([0x82; 20]);
+        let pays = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            IOUAmount::from_parts(1_000_000_000_000_000, 0).expect("canonical IOU"),
+            protocol::Issue::new(Currency::from([0x83; 20]), issuer),
+        );
+        let gets = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(10));
+        assert_eq!(
+            small_increased_quality_offer_disposition(&pays, &gets, &gets, &owner, true),
+            SmallOfferDisposition::Keep
+        );
+    }
+
+    #[test]
+    fn small_increased_quality_offer_is_funding_sensitive() {
+        let issuer = AccountID::from_array([0x84; 20]);
+        let owner = AccountID::from_array([0x85; 20]);
+        let issue = protocol::Issue::new(Currency::from([0x86; 20]), issuer);
+        let pays = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1));
+        let gets = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            IOUAmount::from_parts(1_000_000_000_000_000, -15).expect("one IOU"),
+            issue,
+        );
+        let owner_funds = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            IOUAmount::from_parts(4_990_000_000_000_000, -16).expect("0.499 IOU"),
+            issue,
+        );
+
+        assert_eq!(
+            small_increased_quality_offer_disposition(&pays, &gets, &owner_funds, &owner, true,),
+            SmallOfferDisposition::RemoveIfFundingUnchanged,
+            "pinned OfferStream removes the underfunded one-drop offer only when parent funding is unchanged"
+        );
+    }
+
+    #[test]
+    fn mpt_overflow_offer_is_permanently_removed_only_after_fix() {
+        assert_eq!(
+            small_offer_arithmetic_failure_disposition(true),
+            SmallOfferDisposition::RemovePermanently,
+            "fixMPTOfferOverflow removes the poison offer and continues crossing"
+        );
+        assert_eq!(
+            small_offer_arithmetic_failure_disposition(false),
+            SmallOfferDisposition::ArithmeticFailure,
+            "the legacy branch preserves the hard arithmetic failure"
+        );
+    }
+
+    #[test]
+    fn oversized_mpt_dust_reduction_removes_the_poison_offer() {
+        let issuer = AccountID::from_array([0x87; 20]);
+        let owner = AccountID::from_array([0x88; 20]);
+        let mpt_issue = protocol::MPTIssue::new(protocol::make_mpt_id(1, issuer));
+        // Pinned OfferMPT_test::testOverflowOffers: reducing this one-unit
+        // underfunded MPT offer used to overflow ceilOutStrict.
+        let funded = 1_844_674_407_370_955_162_i64;
+        let pays = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1));
+        let gets =
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(funded + 1), mpt_issue);
+        let owner_funds =
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(funded), mpt_issue);
+
+        assert_eq!(
+            small_increased_quality_offer_disposition(&pays, &gets, &owner_funds, &owner, true,),
+            SmallOfferDisposition::RemovePermanently
+        );
     }
 
     #[test]

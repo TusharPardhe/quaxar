@@ -273,9 +273,42 @@ pub fn validate_sttx_batch_preflight(tx: &STTx) -> NotTec {
 }
 
 pub fn validate_sttx_batch_preflight_with_rules(tx: &STTx, rules: &Rules) -> NotTec {
-    validate_sttx_batch_preflight_with_inner_preflight(tx, |inner| {
-        validate_sttx_inner_batch_preflight_with_rules(inner, rules)
+    validate_sttx_batch_preflight_with_rules_and_network_id(tx, rules, 0)
+}
+
+pub fn validate_sttx_batch_preflight_with_rules_and_network_id(
+    tx: &STTx,
+    rules: &Rules,
+    node_network_id: u32,
+) -> NotTec {
+    validate_sttx_batch_typed_preflight_with_inner_preflight(tx, |inner| {
+        validate_sttx_inner_batch_preflight_with_rules_and_network_id(inner, rules, node_network_id)
     })
+}
+
+/// The exact `Batch::preflightSigValidated` tail. This must run only after
+/// preflight2/checkValidity has accepted the outer signature.
+pub fn validate_sttx_batch_preflight_sig_validated(tx: &STTx) -> NotTec {
+    let inner_transactions = match canonical_batch_inner_transactions(tx) {
+        Ok(inner_transactions) => inner_transactions,
+        Err(error) => return error,
+    };
+    let batch_signers = get_field_by_symbol("sfBatchSigners");
+    if tx.is_field_present(batch_signers) {
+        validate_batch_preflight_sig_validated(
+            tx.get_account_id(get_field_by_symbol("sfAccount")),
+            inner_transactions.iter(),
+            Some(tx.get_field_array(batch_signers).iter()),
+            || true,
+        )
+    } else {
+        validate_batch_preflight_sig_validated(
+            tx.get_account_id(get_field_by_symbol("sfAccount")),
+            inner_transactions.iter(),
+            None::<std::iter::Empty<&STObject>>,
+            || true,
+        )
+    }
 }
 
 pub fn canonical_batch_inner_transactions(tx: &STTx) -> Result<Vec<STTx>, NotTec> {
@@ -350,11 +383,47 @@ fn validate_sttx_batch_preflight_with_inner_preflight(
     }
 }
 
+fn validate_sttx_batch_typed_preflight_with_inner_preflight(
+    tx: &STTx,
+    mut preflight_inner: impl FnMut(&STTx) -> NotTec,
+) -> NotTec {
+    if tx.get_txn_type() != TxType::BATCH {
+        return Ter::TEM_INVALID;
+    }
+    if tx.get_flags() & BATCH_FLAGS_MASK != 0 {
+        return Ter::TEM_INVALID_FLAG;
+    }
+    let sponsor_flags = get_field_by_symbol("sfSponsorFlags");
+    if tx.is_field_present(sponsor_flags) && is_reserve_sponsored(tx.get_field_u32(sponsor_flags)) {
+        return Ter::TEM_INVALID_FLAG;
+    }
+    let inner_transactions = match canonical_batch_inner_transactions(tx) {
+        Ok(inner_transactions) => inner_transactions,
+        Err(error) => return error,
+    };
+    validate_batch_preflight_structure(tx.get_flags(), inner_transactions.iter(), |inner| {
+        preflight_inner(inner)
+    })
+}
+
 /// Delegates Batch inner validation to the same shared dispatcher used for
 /// standalone transaction admission. This prevents Batch from bypassing a
 /// transaction type's semantic preflight.
 pub fn validate_sttx_inner_batch_preflight_with_rules(inner: &STTx, rules: &Rules) -> NotTec {
-    crate::validate_sttx_transaction_preflight_with_rules(inner, rules)
+    validate_sttx_inner_batch_preflight_with_rules_and_network_id(inner, rules, 0)
+}
+
+pub fn validate_sttx_inner_batch_preflight_with_rules_and_network_id(
+    inner: &STTx,
+    rules: &Rules,
+    node_network_id: u32,
+) -> NotTec {
+    crate::validate_sttx_transaction_preflight_with_rules_and_context(
+        inner,
+        rules,
+        node_network_id,
+        true,
+    )
 }
 
 fn st_object_signature_facts(object: &STObject) -> BatchSignatureFacts {
@@ -465,12 +534,16 @@ fn validate_signature_facts(signature_facts: BatchSignatureFacts) -> Option<NotT
 mod tests {
     use std::cell::Cell;
 
-    use protocol::{BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG};
+    use protocol::{
+        AccountID, BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, Rules, STAmount, STTx, Ter,
+        TxType, feature_batch_v1_1, get_field_by_symbol,
+    };
 
     use super::{
         BatchInnerTransaction, BatchSignatureFacts, BatchSignerEntry,
         DISABLED_INNER_BATCH_TX_TYPES, MAX_BATCH_SIGNER_COUNT, MAX_BATCH_TX_COUNT,
         validate_batch_preflight_sig_validated, validate_batch_preflight_structure,
+        validate_sttx_inner_batch_preflight_with_rules_and_network_id,
     };
 
     #[derive(Clone)]
@@ -702,5 +775,40 @@ mod tests {
         );
 
         assert_eq!(result, protocol::Ter::TES_SUCCESS);
+    }
+
+    #[test]
+    fn inner_batch_preflight_inherits_the_runtime_network_id() {
+        let source = AccountID::from_array([0x11; 20]);
+        let destination = AccountID::from_array([0x22; 20]);
+        let mut inner = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+            tx.set_account_id(get_field_by_symbol("sfDestination"), destination);
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+            tx.set_field_u32(get_field_by_symbol("sfFlags"), INNER_BATCH_TRANSACTION_FLAG);
+            tx.set_field_u32(get_field_by_symbol("sfNetworkID"), 1025);
+            tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(0, false));
+            tx.set_field_amount(
+                get_field_by_symbol("sfAmount"),
+                STAmount::new_native(1, false),
+            );
+            tx.set_field_vl(get_field_by_symbol("sfSigningPubKey"), &[]);
+        });
+        let rules = Rules::new([feature_batch_v1_1()]);
+
+        assert_eq!(
+            validate_sttx_inner_batch_preflight_with_rules_and_network_id(&inner, &rules, 1025),
+            Ter::TES_SUCCESS,
+        );
+        assert_eq!(
+            validate_sttx_inner_batch_preflight_with_rules_and_network_id(&inner, &rules, 1026),
+            Ter::TEL_WRONG_NETWORK,
+        );
+
+        inner.make_field_absent(get_field_by_symbol("sfNetworkID"));
+        assert_eq!(
+            validate_sttx_inner_batch_preflight_with_rules_and_network_id(&inner, &rules, 1025),
+            Ter::TEL_REQUIRES_NETWORK_ID,
+        );
     }
 }

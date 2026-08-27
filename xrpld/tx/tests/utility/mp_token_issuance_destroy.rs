@@ -110,8 +110,8 @@ fn mp_token_issuance_destroy_do_apply_preserves_cpp_delete_order() {
             "loaded_exists",
             "issuer_matches",
             "dir_remove",
-            "erase",
-            "owner_count:-1"
+            "owner_count:-1",
+            "erase"
         ]
     );
     assert!(sink.erased);

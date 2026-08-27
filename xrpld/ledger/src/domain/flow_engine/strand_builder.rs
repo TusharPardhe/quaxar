@@ -439,8 +439,14 @@ fn asset_frozen_for<V: ApplyView>(
     asset: Asset,
 ) -> Result<bool, Ter> {
     match asset {
-        Asset::Issue(issue) => Ok(!issue.native()
-            && crate::domain::ripple_state_helpers::is_frozen(view, account, &issue)),
+        Asset::Issue(issue) => {
+            if issue.native() {
+                Ok(false)
+            } else {
+                crate::domain::ripple_state_helpers::try_is_frozen(view, account, &issue)
+                    .map_err(|_| Ter::TEF_BAD_LEDGER)
+            }
+        }
         Asset::MPTIssue(issue) => {
             crate::domain::mptoken_helpers::is_frozen_mpt(view, account, &issue)
                 .map_err(|_| Ter::TEF_BAD_LEDGER)
@@ -730,9 +736,12 @@ fn validate_strand<V: ApplyView>(
                         return Ter::TER_NO_RIPPLE;
                     }
 
-                    let owed = crate::domain::ripple_state_helpers::credit_balance(
+                    let owed = match crate::domain::ripple_state_helpers::try_credit_balance(
                         view, dst, src, *currency,
-                    );
+                    ) {
+                        Ok(owed) => owed,
+                        Err(_) => return Ter::TEF_BAD_LEDGER,
+                    };
                     let limit_field = if dst < src {
                         sf("sfLowLimit")
                     } else {

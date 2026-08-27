@@ -1,9 +1,12 @@
 //! Tests for `AMMCreate` parity helpers.
 
-use protocol::{AccountID, Asset, Currency, Issue, TRADING_FEE_THRESHOLD, Ter};
+use protocol::{
+    AccountID, Asset, Currency, Issue, STAmount, TRADING_FEE_THRESHOLD, Ter, XRPAmount,
+};
 use tx::{
-    AMMCreatePreclaimFacts, AMMCreatePreflightFacts, amm_create_check_extra_features,
-    run_amm_create_preclaim_facts, run_amm_create_preflight_facts,
+    AMMCreateApplyFacts, AMMCreateApplySink, AMMCreatePreclaimFacts, AMMCreatePreflightFacts,
+    amm_create_check_extra_features, run_amm_create_do_apply, run_amm_create_preclaim_facts,
+    run_amm_create_preflight_facts,
 };
 
 fn account(fill: u8) -> AccountID {
@@ -202,4 +205,45 @@ fn amm_create_preclaim_preserves_reference_ordering() {
         run_amm_create_preclaim_facts(AMMCreatePreclaimFacts::default()),
         Ter::TES_SUCCESS
     );
+}
+
+#[test]
+fn amm_create_mints_lp_before_creating_pool_asset_holdings() {
+    #[derive(Default)]
+    struct Sink {
+        calls: Vec<&'static str>,
+    }
+    impl AMMCreateApplySink for Sink {
+        fn create_amm_account(&mut self) -> Ter {
+            self.calls.push("account");
+            Ter::TES_SUCCESS
+        }
+        fn create_amm_entry(&mut self) -> Ter {
+            self.calls.push("amm");
+            Ter::TES_SUCCESS
+        }
+        fn deposit_initial_liquidity(&mut self) -> Ter {
+            self.calls.push("assets");
+            Ter::TES_SUCCESS
+        }
+        fn mint_lp_tokens(&mut self) -> Ter {
+            self.calls.push("lp");
+            Ter::TES_SUCCESS
+        }
+    }
+
+    let mut sink = Sink::default();
+    let result = run_amm_create_do_apply(
+        AMMCreateApplyFacts {
+            amount1: STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+            amount2: STAmount::from_xrp_amount(XRPAmount::from_drops(2)),
+            trading_fee: 0,
+            account: account(1),
+            amm_account: account(2),
+        },
+        &mut sink,
+    );
+
+    assert_eq!(result, Ter::TES_SUCCESS);
+    assert_eq!(sink.calls, ["account", "amm", "lp", "assets"]);
 }

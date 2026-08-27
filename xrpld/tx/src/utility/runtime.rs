@@ -20,7 +20,7 @@ pub fn with_transaction_step_runtime<R>(rules: &Rules, f: impl FnOnce() -> R) ->
 #[cfg(test)]
 mod tests {
     use super::{with_transaction_apply_runtime, with_transaction_step_runtime};
-    use protocol::Rules;
+    use protocol::{Rules, fix_cleanup_3_2_0, fix_cleanup_3_3_0, is_feature_enabled};
 
     #[test]
     fn apply_runtime_returns_closure_result() {
@@ -38,5 +38,16 @@ mod tests {
         let value = with_transaction_step_runtime(&rules, || "ok");
 
         assert_eq!(value, "ok");
+    }
+
+    #[test]
+    fn cleanup_amendments_enter_the_current_rules_step_scope() {
+        for amendment in [fix_cleanup_3_2_0(), fix_cleanup_3_3_0()] {
+            let rules = Rules::new([amendment]);
+            assert!(with_transaction_step_runtime(&rules, || {
+                is_feature_enabled(&amendment)
+            }));
+            assert!(!is_feature_enabled(&amendment));
+        }
     }
 }

@@ -241,7 +241,7 @@ fn did_set_do_apply_create_path_honors_fix_empty_did_and_creates_nonempty_fields
         &mut gated,
     );
     assert_eq!(gated_result, Ter::TEC_EMPTY_DID);
-    assert_eq!(gated.events, ["existing", "owner_exists", "reserve"]);
+    assert_eq!(gated.events, ["existing"]);
 
     let mut sink = TestSink::new();
     let result = run_did_set_do_apply(

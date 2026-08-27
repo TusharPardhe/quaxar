@@ -67,7 +67,7 @@ impl BookTip {
         if self.valid
             && let Some(entry) = self.current_entry.take()
         {
-            let _ = view.erase(entry);
+            view.erase(entry)?;
         }
 
         loop {

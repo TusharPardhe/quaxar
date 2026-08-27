@@ -56,10 +56,9 @@ pub fn run_permissioned_domain_delete_loaded<S: PermissionedDomainDeleteLoadedSi
         return Ter::TEF_BAD_LEDGER;
     }
 
-    assert!(
-        sink.owner_exists_with_nonzero_count(),
-        "PermissionedDomainDelete::doApply expects owner and nonzero owner count"
-    );
+    if !sink.owner_exists_with_nonzero_count() {
+        return Ter::TEF_INTERNAL;
+    }
 
     sink.adjust_owner_count(-1);
     sink.erase_domain();

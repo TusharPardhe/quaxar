@@ -405,8 +405,9 @@ pub fn number_from_json_input(input: NumberJsonInput<'_>) -> Result<STNumber, Nu
 fn normalize_runtime_parts(parts: NumberParts) -> Result<RuntimeNumber, NumberPartsError> {
     let (min_mantissa, max_mantissa) = match get_mantissa_scale() {
         basics::number::MantissaScale::Small => (MANTISSA_SMALL_MIN, MANTISSA_SMALL_MAX),
-        basics::number::MantissaScale::LargeLegacy => (MANTISSA_LARGE_MIN, MANTISSA_LARGE_MAX),
-        basics::number::MantissaScale::Large => (MANTISSA_LARGE_MIN, MANTISSA_LARGE_MAX),
+        basics::number::MantissaScale::LargeLegacy
+        | basics::number::MantissaScale::Large320
+        | basics::number::MantissaScale::Large330 => (MANTISSA_LARGE_MIN, MANTISSA_LARGE_MAX),
     };
 
     normalize_parts_with_rounding(parts, min_mantissa, max_mantissa, get_rounding_mode())

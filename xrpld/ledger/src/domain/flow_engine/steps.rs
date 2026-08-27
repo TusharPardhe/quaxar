@@ -6,8 +6,8 @@
 //! compared with a requested XRP delivery.
 
 use super::{AmmContext, SelfCrossCancellation, StepKind};
-use crate::ApplyView;
 use crate::domain::ripple_state_helpers;
+use crate::{ApplyView, ViewError};
 use protocol::{
     AccountID, Asset, Issue, Quality, STAmount, Ter, XRPAmount, get_field_by_symbol as sf,
     xrp_account,
@@ -158,6 +158,11 @@ pub struct StepContext<'a> {
     pub offer_usage: Rc<Cell<u32>>,
     /// Debt direction immediately before the currently executing step.
     pub previous_redeems: Rc<Cell<bool>>,
+    /// `BookStep::checkMPTDEX` distinguishes an issuer-starting strand, a
+    /// preceding BookStep, and a preceding endpoint/direct step.  Debt
+    /// direction alone cannot recover that consensus-significant shape.
+    pub has_previous_step: Rc<Cell<bool>>,
+    pub previous_step_is_book: Rc<Cell<bool>>,
 }
 
 /// The Rust counterpart to rippled's `Step`.  Both directions mutate only the
@@ -265,6 +270,8 @@ impl FlowStep for StepKind {
                         self_cross_cancellation: context.self_cross_cancellation.clone(),
                         amm_context: Some(context.amm_context.clone()),
                         previous_redeems: context.previous_redeems.get(),
+                        has_previous_step: context.has_previous_step.get(),
+                        previous_step_is_book: context.previous_step_is_book.get(),
                         strand_dst: Some(context.strand_dst),
                         strand_deliver: Some(context.strand_deliver),
                         enforce_quality_threshold: *remove_self_crossing,
@@ -374,6 +381,8 @@ impl FlowStep for StepKind {
                         self_cross_cancellation: context.self_cross_cancellation.clone(),
                         amm_context: Some(context.amm_context.clone()),
                         previous_redeems: context.previous_redeems.get(),
+                        has_previous_step: context.has_previous_step.get(),
+                        previous_step_is_book: context.previous_step_is_book.get(),
                         strand_dst: Some(context.strand_dst),
                         strand_deliver: Some(context.strand_deliver),
                         enforce_quality_threshold: *remove_self_crossing,
@@ -406,15 +415,13 @@ impl StepKind {
         view: &mut V,
         previous_redeems: bool,
         context: &StepContext<'_>,
-    ) -> Option<(Quality, bool)> {
+    ) -> Result<Option<(Quality, bool)>, ViewError> {
         match self {
-            StepKind::XrpEndpoint { .. } => Some((quality_one(), false)),
+            StepKind::XrpEndpoint { .. } => Ok(Some((quality_one(), false))),
             StepKind::MptEndpoint { src, issue, .. } => {
                 let issuing = *src == issue.issuer();
                 let rate = if issuing && previous_redeems {
-                    crate::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
-                        .ok()
-                        .map_or(protocol::PARITY_RATE.value, |rate| rate.value)
+                    crate::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())?.value
                 } else {
                     protocol::PARITY_RATE.value
                 };
@@ -428,10 +435,10 @@ impl StepKind {
                     protocol::MPTAmount::from_value(i64::from(protocol::PARITY_RATE.value)),
                     *issue,
                 );
-                Some((
+                Ok(Some((
                     Quality::from_amounts(&protocol::Amounts::new(input, output)),
                     !issuing,
-                ))
+                )))
             }
             StepKind::Direct { src, dst, currency } => {
                 use crate::domain::ripple_calc::direct_step::{
@@ -439,28 +446,34 @@ impl StepKind {
                 };
                 let (_, direction) = crate::domain::ripple_calc::direct_step::max_payment_flow(
                     view, src, dst, *currency,
-                );
+                )?;
                 let redeeming = direction == DebtDirection::Redeems;
                 let (quality_out, quality_in) = if redeeming {
-                    qualities_src_redeems(view, src, dst, *currency)
+                    qualities_src_redeems(view, src, dst, *currency)?
                 } else {
-                    qualities_src_issues(view, src, dst, *currency, previous_redeems)
+                    qualities_src_issues(view, src, dst, *currency, previous_redeems)?
                 };
                 let issue = Issue::new(*currency, *src);
                 let input = STAmount::from_iou_amount(
                     sf("sfAmount"),
-                    protocol::IOUAmount::from_parts(i64::from(quality_out), 0).ok()?,
+                    match protocol::IOUAmount::from_parts(i64::from(quality_out), 0) {
+                        Ok(amount) => amount,
+                        Err(_) => return Ok(None),
+                    },
                     issue,
                 );
                 let output = STAmount::from_iou_amount(
                     sf("sfAmount"),
-                    protocol::IOUAmount::from_parts(i64::from(quality_in), 0).ok()?,
+                    match protocol::IOUAmount::from_parts(i64::from(quality_in), 0) {
+                        Ok(amount) => amount,
+                        Err(_) => return Ok(None),
+                    },
                     issue,
                 );
-                Some((
+                Ok(Some((
                     Quality::from_amounts(&protocol::Amounts::new(input, output)),
                     redeeming,
-                ))
+                )))
             }
             StepKind::Book {
                 book_in,
@@ -484,7 +497,7 @@ impl StepKind {
                     context.strand_dst,
                     context.strand_deliver,
                 )
-                .map(|quality| (quality, false))
+                .map(|quality| quality.map(|quality| (quality, false)))
             }
         }
     }
@@ -566,11 +579,13 @@ fn execute_mpt_endpoint<V: ApplyView>(
     // while the destination endpoint observes only its individual lock.
     if !(is_first && is_last) {
         let locked = if is_first {
-            crate::mptoken_helpers::is_global_frozen_mpt(view, issue).unwrap_or(true)
+            crate::mptoken_helpers::is_global_frozen_mpt(view, issue)
+                .map_err(|_| Ter::TEF_BAD_LEDGER)?
                 || crate::mptoken_helpers::is_individual_frozen_mpt(view, src, issue)
-                    .unwrap_or(true)
+                    .map_err(|_| Ter::TEF_BAD_LEDGER)?
         } else {
-            crate::mptoken_helpers::is_individual_frozen_mpt(view, dst, issue).unwrap_or(true)
+            crate::mptoken_helpers::is_individual_frozen_mpt(view, dst, issue)
+                .map_err(|_| Ter::TEF_BAD_LEDGER)?
         };
         if locked {
             return Err(Ter::TEC_LOCKED);
@@ -623,7 +638,7 @@ fn execute_mpt_endpoint<V: ApplyView>(
     let issuing_with_fee = *src == issuer && previous_redeems;
     let rate = if issuing_with_fee {
         crate::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
-            .unwrap_or(protocol::PARITY_RATE)
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?
     } else {
         protocol::PARITY_RATE
     };
@@ -730,7 +745,8 @@ fn execute_direct_fwd<V: ApplyView>(
 
     let currency = input.issue().currency;
     let (max_flow, debt_dir) =
-        crate::domain::ripple_calc::direct_step::max_payment_flow(view, src, dst, currency);
+        crate::domain::ripple_calc::direct_step::max_payment_flow(view, src, dst, currency)
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?;
     if max_flow.is_zero() || max_flow.signum() <= 0 {
         return Ok((input.zeroed(), input.zeroed()));
     }
@@ -753,7 +769,7 @@ fn execute_direct_fwd<V: ApplyView>(
     let rate = if debt_dir == crate::domain::ripple_calc::direct_step::DebtDirection::Redeems
         && dst != strand_dst
     {
-        ripple_state_helpers::transfer_rate(view, dst)
+        ripple_state_helpers::try_transfer_rate(view, dst).map_err(|_| Ter::TEF_BAD_LEDGER)?
     } else {
         crate::domain::mul_ratio::QUALITY_ONE
     };
@@ -803,7 +819,7 @@ fn execute_xrp_endpoint_fwd<V: ApplyView>(
         return Ok((zero.clone(), zero));
     }
     let actual_drops = if !is_last {
-        drops.min(xrp_liquid(view, account))
+        drops.min(xrp_liquid(view, account).map_err(|_| Ter::TEF_BAD_LEDGER)?)
     } else {
         drops
     };
@@ -830,16 +846,30 @@ fn execute_xrp_endpoint_fwd<V: ApplyView>(
     Ok((amount.clone(), amount))
 }
 
-fn xrp_liquid<V: ApplyView>(view: &mut V, account: &AccountID) -> i64 {
+fn xrp_liquid<V: ApplyView>(view: &mut V, account: &AccountID) -> Result<i64, ViewError> {
     let acct_keylet =
         protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
-    let Some(sle) = view.peek(acct_keylet).ok().flatten() else {
-        return 0;
+    let Some(sle) = view.peek(acct_keylet)? else {
+        return Ok(0);
     };
-    let balance = sle.get_field_amount(sf("sfBalance")).xrp().drops();
-    let owner_count = sle.get_field_u32(sf("sfOwnerCount"));
-    let reserve = view.fees().account_reserve(owner_count as usize) as i64;
-    (balance - reserve).max(0)
+    let balance = view
+        .balance_hook_iou(
+            *account,
+            xrp_account(),
+            sle.get_field_amount(sf("sfBalance")),
+        )
+        .xrp()
+        .drops();
+    let reserve = if crate::is_pseudo_account(&sle) {
+        0
+    } else {
+        let owner_count = view
+            .owner_count_hook(*account, crate::OwnerCounts::from_sle(&sle))
+            .count();
+        crate::effective_account_reserve_with_owner_count(view.fees(), &sle, owner_count, 0, 0)
+            as i64
+    };
+    Ok((balance - reserve).max(0))
 }
 
 #[cfg(test)]

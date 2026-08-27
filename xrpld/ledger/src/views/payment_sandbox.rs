@@ -39,7 +39,7 @@ struct IssuerValueMPT {
 struct DeferredCredits {
     credits_iou: BTreeMap<(AccountID, AccountID, Currency), ValueIOU>,
     credits_mpt: BTreeMap<MPTID, IssuerValueMPT>,
-    owner_counts: BTreeMap<AccountID, u32>,
+    owner_counts: BTreeMap<AccountID, crate::OwnerCounts>,
 }
 
 #[allow(dead_code)]
@@ -64,17 +64,24 @@ impl DeferredCredits {
         amount: STAmount,
         pre_credit_sender_balance: STAmount,
     ) {
+        let sender_is_low = sender < receiver;
         let key = Self::make_key_iou(sender, receiver, amount.issue().currency);
         let entry = self.credits_iou.entry(key).or_insert_with(|| ValueIOU {
             low_acct_credits: STAmount::new_with_asset(sf_generic(), amount.issue(), 0, 0, false),
             high_acct_credits: STAmount::new_with_asset(sf_generic(), amount.issue(), 0, 0, false),
-            low_acct_orig_balance: pre_credit_sender_balance,
+            low_acct_orig_balance: if sender_is_low {
+                pre_credit_sender_balance
+            } else {
+                let mut balance = pre_credit_sender_balance;
+                balance.negate();
+                balance
+            },
         });
 
-        if sender < receiver {
-            entry.high_acct_credits += amount;
-        } else {
+        if sender_is_low {
             entry.low_acct_credits += amount;
+        } else {
+            entry.high_acct_credits += amount;
         }
     }
 
@@ -127,14 +134,13 @@ impl DeferredCredits {
     }
 
     #[allow(dead_code)]
-    fn owner_count(&mut self, id: AccountID, _cur: u32, next: u32) {
-        let entry = self.owner_counts.entry(id).or_insert(next);
-        if next > *entry {
-            *entry = next;
-        }
+    fn owner_count(&mut self, id: AccountID, cur: crate::OwnerCounts, next: crate::OwnerCounts) {
+        let reached = cur.max(next);
+        let entry = self.owner_counts.entry(id).or_insert(reached);
+        *entry = (*entry).max(reached);
     }
 
-    fn get_owner_count(&self, id: AccountID) -> Option<u32> {
+    fn get_owner_count(&self, id: AccountID) -> Option<crate::OwnerCounts> {
         self.owner_counts.get(&id).copied()
     }
 
@@ -262,10 +268,25 @@ where
     ) -> STAmount {
         let key = DeferredCredits::make_key_iou(account, issuer, amount.issue().currency);
         if let Some(entry) = self.tab.credits_iou.get(&key) {
-            if account < issuer {
-                amount -= entry.low_acct_credits.clone();
+            let (debits, original_balance) = if account < issuer {
+                (
+                    entry.low_acct_credits.clone(),
+                    entry.low_acct_orig_balance.clone(),
+                )
             } else {
-                amount -= entry.high_acct_credits.clone();
+                let mut original_balance = entry.low_acct_orig_balance.clone();
+                original_balance.negate();
+                (entry.high_acct_credits.clone(), original_balance)
+            };
+            let available = original_balance.clone() - debits;
+            if available < amount {
+                amount = available;
+            }
+            if original_balance < amount {
+                amount = original_balance;
+            }
+            if issuer == protocol::xrp_account() && amount.signum() < 0 {
+                amount = amount.zeroed();
             }
         }
         self.base.balance_hook_iou(account, issuer, amount)
@@ -287,8 +308,16 @@ where
         self.base.balance_hook_self_issue_mpt(issue, amount)
     }
 
-    fn owner_count_hook(&self, account: AccountID, count: u32) -> u32 {
-        let count = self.tab.get_owner_count(account).unwrap_or(count);
+    fn owner_count_hook(
+        &self,
+        account: AccountID,
+        count: crate::OwnerCounts,
+    ) -> crate::OwnerCounts {
+        let count = self
+            .tab
+            .get_owner_count(account)
+            .unwrap_or(count)
+            .max(count);
         self.base.owner_count_hook(account, count)
     }
 }
@@ -341,5 +370,71 @@ where
 
     fn destroy_xrp(&mut self, fee: XRPAmount) -> Result<(), ViewError> {
         self.raw_destroy_xrp(fee)
+    }
+
+    fn credit_hook_iou(
+        &mut self,
+        from: AccountID,
+        to: AccountID,
+        amount: STAmount,
+        pre_credit_balance: STAmount,
+    ) {
+        self.tab.credit_iou(from, to, amount, pre_credit_balance);
+    }
+
+    fn adjust_owner_count_hook(
+        &mut self,
+        account: AccountID,
+        cur: crate::OwnerCounts,
+        next: crate::OwnerCounts,
+    ) {
+        self.tab.owner_count(account, cur, next);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeferredCredits;
+    use crate::OwnerCounts;
+    use protocol::AccountID;
+
+    #[test]
+    fn deferred_owner_counts_compare_effective_sponsor_reserve() {
+        let account =
+            AccountID::from_hex("0707070707070707070707070707070707070707").expect("valid account");
+        let mut credits = DeferredCredits::default();
+
+        // Adding a sponsored object raises both owner and sponsored, so the
+        // effective reserve count remains one. A later unsponsored object
+        // raises the effective count to two and must become the retained max.
+        credits.owner_count(
+            account,
+            OwnerCounts {
+                owner: 1,
+                sponsored: 0,
+                sponsoring: 0,
+            },
+            OwnerCounts {
+                owner: 2,
+                sponsored: 1,
+                sponsoring: 0,
+            },
+        );
+        assert_eq!(credits.get_owner_count(account).unwrap().count(), 1);
+
+        credits.owner_count(
+            account,
+            OwnerCounts {
+                owner: 2,
+                sponsored: 1,
+                sponsoring: 0,
+            },
+            OwnerCounts {
+                owner: 3,
+                sponsored: 1,
+                sponsoring: 0,
+            },
+        );
+        assert_eq!(credits.get_owner_count(account).unwrap().count(), 2);
     }
 }

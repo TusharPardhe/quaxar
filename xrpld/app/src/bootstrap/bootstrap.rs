@@ -1106,6 +1106,12 @@ where
 pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), String> {
     let runtime = Arc::clone(&bootstrap.runtime);
     let standalone = runtime.root().standalone();
+    let confidential_crypto_required = protocol::REGISTERED_FEATURES.iter().any(|feature| {
+        feature.name == protocol::FEATURE_CONFIDENTIAL_TRANSFER_NAME && feature.supported
+    });
+    protocol::confidential_transfer::validate_confidential_crypto_startup(
+        confidential_crypto_required,
+    )?;
     ensure_descriptor_budget(bootstrap.report.fd_required)?;
     runtime.start()?;
     tracing::info!(target: "app", "Node startup complete");
@@ -5407,7 +5413,9 @@ fn configured_feature_ids(config: &BasicConfig) -> Vec<Uint256> {
             let name = line.split_whitespace().next()?;
             REGISTERED_FEATURES
                 .iter()
-                .find(|feature| feature.supported && feature.name == name)
+                .find(|feature| {
+                    protocol::registered_feature_supported(feature) && feature.name == name
+                })
                 .map(|feature| feature_id(feature.name))
         })
         .collect()
@@ -5445,7 +5453,7 @@ fn amendments_from_config(config: &BasicConfig, start_type: StartUpType) -> Vec<
 
     REGISTERED_FEATURES
         .iter()
-        .filter(|f| f.supported)
+        .filter(|feature| protocol::registered_feature_supported(feature))
         .map(|f| feature_id(f.name))
         .collect()
 }

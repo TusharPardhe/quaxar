@@ -80,18 +80,46 @@ impl MPTokenIssuanceSet {
             .is_field_present(crate::get_field_by_symbol("sfTransferFee"))
     }
 
-    pub fn get_mutable_flags(&self) -> Option<u32> {
-        self.has_mutable_flags().then(|| {
+    pub fn get_immutable_flags(&self) -> Option<u32> {
+        self.has_immutable_flags().then(|| {
             self.base
                 .as_sttx()
-                .get_field_u32(crate::get_field_by_symbol("sfMutableFlags"))
+                .get_field_u32(crate::get_field_by_symbol("sfImmutableFlags"))
         })
     }
 
-    pub fn has_mutable_flags(&self) -> bool {
+    pub fn has_immutable_flags(&self) -> bool {
         self.base
             .as_sttx()
-            .is_field_present(crate::get_field_by_symbol("sfMutableFlags"))
+            .is_field_present(crate::get_field_by_symbol("sfImmutableFlags"))
+    }
+
+    pub fn get_issuer_encryption_key(&self) -> Option<Vec<u8>> {
+        self.has_issuer_encryption_key().then(|| {
+            self.base
+                .as_sttx()
+                .get_field_vl(crate::get_field_by_symbol("sfIssuerEncryptionKey"))
+        })
+    }
+
+    pub fn has_issuer_encryption_key(&self) -> bool {
+        self.base
+            .as_sttx()
+            .is_field_present(crate::get_field_by_symbol("sfIssuerEncryptionKey"))
+    }
+
+    pub fn get_auditor_encryption_key(&self) -> Option<Vec<u8>> {
+        self.has_auditor_encryption_key().then(|| {
+            self.base
+                .as_sttx()
+                .get_field_vl(crate::get_field_by_symbol("sfAuditorEncryptionKey"))
+        })
+    }
+
+    pub fn has_auditor_encryption_key(&self) -> bool {
+        self.base
+            .as_sttx()
+            .is_field_present(crate::get_field_by_symbol("sfAuditorEncryptionKey"))
     }
 }
 
@@ -246,10 +274,26 @@ impl MPTokenIssuanceSetBuilder {
         self
     }
 
-    pub fn set_mutable_flags(mut self, value: u32) -> Self {
+    pub fn set_immutable_flags(mut self, value: u32) -> Self {
         self.base
             .object_mut()
-            .set_field_u32(crate::get_field_by_symbol("sfMutableFlags"), value);
+            .set_field_u32(crate::get_field_by_symbol("sfImmutableFlags"), value);
+        self
+    }
+
+    pub fn set_issuer_encryption_key(mut self, value: impl AsRef<[u8]>) -> Self {
+        self.base.object_mut().set_field_vl(
+            crate::get_field_by_symbol("sfIssuerEncryptionKey"),
+            value.as_ref(),
+        );
+        self
+    }
+
+    pub fn set_auditor_encryption_key(mut self, value: impl AsRef<[u8]>) -> Self {
+        self.base.object_mut().set_field_vl(
+            crate::get_field_by_symbol("sfAuditorEncryptionKey"),
+            value.as_ref(),
+        );
         self
     }
 

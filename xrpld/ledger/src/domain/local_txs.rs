@@ -108,7 +108,11 @@ fn should_keep_tx(txn: &LocalTx, ledger_index: u32, view: &Ledger) -> Result<boo
         return Ok(false);
     }
 
-    if view.tx_exists(txn.id) {
+    // A missing backed transaction-map branch is not proof that the
+    // transaction is absent.  Fail the sweep so callers can acquire/repair
+    // the branch instead of retaining and later replaying a transaction that
+    // the validated ledger may already contain.
+    if view.try_tx_exists(txn.id)? {
         return Ok(false);
     }
 

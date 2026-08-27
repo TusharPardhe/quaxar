@@ -794,10 +794,9 @@ macro_rules! ter_catalog {
             "tecKILLED",
             "No funds transferred and no offer created."
         );
-        $macro!(TEC_AMM_NOT_FOUND, 151, "tecAMM_NOT_FOUND", "AMM not found.");
         $macro!(
             TEC_HAS_OBLIGATIONS,
-            152,
+            151,
             "tecHAS_OBLIGATIONS",
             "The account cannot be deleted since it has obligations."
         );
@@ -1064,20 +1063,14 @@ macro_rules! ter_catalog {
             "This operation is not allowed against a pseudo-account."
         );
         $macro!(
-            TEC_NO_ISSUANCE,
-            199,
-            "tecNO_ISSUANCE",
-            "The specified MPT issuance does not exist."
-        );
-        $macro!(
             TEC_BAD_PROOF,
-            200,
+            199,
             "tecBAD_PROOF",
             "Zero-knowledge proof verification failed."
         );
         $macro!(
             TEC_NO_SPONSOR_PERMISSION,
-            201,
+            200,
             "tecNO_SPONSOR_PERMISSION",
             "Sponsor does not permit this operation."
         );
@@ -1283,6 +1276,21 @@ mod tests {
             trans_code("tecPSEUDO_ACCOUNT"),
             Some(Ter::TEC_PSEUDO_ACCOUNT)
         );
+
+        // Pinned rippled TER.h: tecHAS_OBLIGATIONS immediately follows
+        // tecKILLED.  tecAMM_NOT_FOUND is not a current TER and must not shift
+        // the consensus-serialized result code.
+        assert_eq!(Ter::TEC_HAS_OBLIGATIONS.to_int(), 151);
+        assert_eq!(trans_token(Ter::from_int(151)), "tecHAS_OBLIGATIONS");
+        assert_eq!(
+            trans_code("tecHAS_OBLIGATIONS"),
+            Some(Ter::TEC_HAS_OBLIGATIONS)
+        );
+        assert_eq!(Ter::TEC_TOO_SOON.to_int(), 152);
+        assert_eq!(trans_code("tecAMM_NOT_FOUND"), None);
+        assert_eq!(Ter::TEC_BAD_PROOF.to_int(), 199);
+        assert_eq!(Ter::TEC_NO_SPONSOR_PERMISSION.to_int(), 200);
+        assert_eq!(trans_code("tecNO_ISSUANCE"), None);
 
         assert_eq!(trans_token(Ter::TEC_HOOK_REJECTED), "-");
         assert_eq!(trans_human(Ter::TEC_HOOK_REJECTED), "-");

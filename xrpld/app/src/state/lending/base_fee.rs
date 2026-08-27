@@ -1,22 +1,32 @@
 use basics::number::{NumberParts as RuntimeNumber, RoundingMode};
 use ledger::{ReadView, has_expired};
-use protocol::{STTx, lending::LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION};
+use protocol::{STTx, Ter, lending::LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION};
 
 use super::{common::*, helpers::*};
 
-pub fn calculate_loan_pay_base_fee<V: ReadView>(view: &V, sttx: &STTx, normal_cost: u64) -> u64 {
+fn base_fee_lookup<T>(lookup: Result<Option<T>, ledger::ViewError>) -> Result<Option<T>, Ter> {
+    lookup.map_err(|_| Ter::TEF_BAD_LEDGER)
+}
+
+pub fn calculate_loan_pay_base_fee<V: ReadView>(
+    view: &V,
+    sttx: &STTx,
+    normal_cost: u64,
+) -> Result<u64, Ter> {
     if sttx.is_flag(protocol::tfLoanFullPayment) || sttx.is_flag(protocol::tfLoanLatePayment) {
-        return normal_cost;
+        return Ok(normal_cost);
     }
 
     let loan_id = sttx.get_field_h256(sf("sfLoanID"));
-    let Ok(Some(loan_sle)) = view.read(protocol::loan_keylet_from_key(loan_id)) else {
-        return normal_cost;
+    let loan_sle = match base_fee_lookup(view.read(protocol::loan_keylet_from_key(loan_id))) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ok(normal_cost),
+        Err(_) => return Err(Ter::TEF_BAD_LEDGER),
     };
 
     let payments_remaining = loan_sle.get_field_u32(sf("sfPaymentRemaining"));
     if payments_remaining <= tx::LOAN_PAYMENTS_PER_FEE_INCREMENT {
-        return normal_cost;
+        return Ok(normal_cost);
     }
     if has_expired(
         view,
@@ -24,24 +34,28 @@ pub fn calculate_loan_pay_base_fee<V: ReadView>(view: &V, sttx: &STTx, normal_co
             .is_field_present(sf("sfNextPaymentDueDate"))
             .then(|| loan_sle.get_field_u32(sf("sfNextPaymentDueDate"))),
     ) {
-        return normal_cost;
+        return Ok(normal_cost);
     }
 
-    let Ok(Some(broker_sle)) = view.read(protocol::loan_broker_keylet_from_key(
+    let broker_sle = match base_fee_lookup(view.read(protocol::loan_broker_keylet_from_key(
         loan_sle.get_field_h256(sf("sfLoanBrokerID")),
-    )) else {
-        return normal_cost;
+    ))) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ok(normal_cost),
+        Err(_) => return Err(Ter::TEF_BAD_LEDGER),
     };
-    let Ok(Some(vault_sle)) = view.read(protocol::vault_keylet_from_key(
+    let vault_sle = match base_fee_lookup(view.read(protocol::vault_keylet_from_key(
         broker_sle.get_field_h256(sf("sfVaultID")),
-    )) else {
-        return normal_cost;
+    ))) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ok(normal_cost),
+        Err(_) => return Err(Ter::TEF_BAD_LEDGER),
     };
 
     let amount = sttx.get_field_amount(sf("sfAmount"));
     let vault_asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
     if amount.asset() != vault_asset {
-        return normal_cost;
+        return Ok(normal_cost);
     }
 
     let periodic_payment = loan_sle.get_field_number(sf("sfPeriodicPayment")).value();
@@ -58,7 +72,7 @@ pub fn calculate_loan_pay_base_fee<V: ReadView>(view: &V, sttx: &STTx, normal_co
         RoundingMode::Upward,
     ) + service_fee;
     if regular_payment <= RuntimeNumber::zero() {
-        return normal_cost;
+        return Ok(normal_cost);
     }
 
     let payment_amount = amount_number(&amount);
@@ -68,7 +82,7 @@ pub fn calculate_loan_pay_base_fee<V: ReadView>(view: &V, sttx: &STTx, normal_co
             >= regular_payment
                 * RuntimeNumber::from_i64(i64::from(LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION))
     {
-        return normal_cost.saturating_mul(tx::LOAN_MAXIMUM_FEE_INCREMENTS);
+        return Ok(normal_cost.saturating_mul(tx::LOAN_MAXIMUM_FEE_INCREMENTS));
     }
 
     let estimate = payment_amount / regular_payment;
@@ -84,7 +98,7 @@ pub fn calculate_loan_pay_base_fee<V: ReadView>(view: &V, sttx: &STTx, normal_co
     } else {
         increments
     };
-    normal_cost.saturating_mul(increments)
+    Ok(normal_cost.saturating_mul(increments))
 }
 
 #[cfg(test)]
@@ -102,6 +116,18 @@ mod tests {
         assert_eq!(
             runtime_number_floor_to_u32(RuntimeNumber::from_i64_and_exponent(5, 12)),
             u32::MAX
+        );
+    }
+
+    #[test]
+    fn loan_pay_base_fee_lookup_distinguishes_absence_from_storage_failure() {
+        assert_eq!(base_fee_lookup::<u8>(Ok(None)), Ok(None));
+        assert_eq!(base_fee_lookup(Ok(Some(7_u8))), Ok(Some(7)));
+        assert_eq!(
+            base_fee_lookup::<u8>(Err(ledger::ViewError::Conversion(
+                "injected loan base-fee SHAMap read failure".to_owned(),
+            ))),
+            Err(Ter::TEF_BAD_LEDGER)
         );
     }
 }

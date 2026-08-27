@@ -31,14 +31,22 @@ fn amm_entry(amm_account: AccountID, asset1: Asset, asset2: Asset) -> STLedgerEn
 #[derive(Default)]
 struct Sink {
     entry: Option<STLedgerEntry>,
+    read_error: Option<Ter>,
     deleted_account: Option<AccountID>,
     deleted_entry: bool,
     delete_account_result: Ter,
 }
 
 impl AMMDeleteApplySink for Sink {
-    fn get_amm_entry(&mut self, _asset1: &Asset, _asset2: &Asset) -> Option<STLedgerEntry> {
-        self.entry.clone()
+    fn get_amm_entry(
+        &mut self,
+        _asset1: &Asset,
+        _asset2: &Asset,
+    ) -> Result<Option<STLedgerEntry>, Ter> {
+        if let Some(ter) = self.read_error {
+            return Err(ter);
+        }
+        Ok(self.entry.clone())
     }
 
     fn delete_amm_entry(&mut self, _sle: STLedgerEntry) -> Ter {
@@ -107,6 +115,29 @@ fn amm_delete_returns_no_amm_when_entry_missing() {
     assert_eq!(result, Ter::TER_NO_AMM);
     assert!(sink.deleted_account.is_none());
     assert!(!sink.deleted_entry);
+}
+
+#[test]
+fn amm_delete_propagates_storage_failure_instead_of_reporting_no_amm() {
+    let issuer = account(1);
+    let asset1 = Asset::from(issue(2, issuer));
+    let asset2 = Asset::from(issue(3, issuer));
+    let mut sink = Sink {
+        read_error: Some(Ter::TEF_BAD_LEDGER),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        run_amm_delete_do_apply(
+            AMMDeleteApplyFacts {
+                account: account(4),
+                asset1,
+                asset2,
+            },
+            &mut sink,
+        ),
+        Ter::TEF_BAD_LEDGER
+    );
 }
 
 #[test]

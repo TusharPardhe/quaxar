@@ -15,6 +15,7 @@ basics = { path = "../basics" }
 bs58 = "0.5"
 ed25519-dalek = "2"
 getrandom = "0.3"
+libloading = "0.8"
 prost = "0.13"
 rfc1751 = "0.1"
 ripemd = "0.1"

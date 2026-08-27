@@ -32,146 +32,19 @@ fn permissioned_domain_credentials_to_array(
     array
 }
 
-fn update_nft_page_link<V: ApplyView>(
+fn repair_nftoken_directory_links<V: ApplyView>(
     view: &mut V,
-    page: &Arc<STLedgerEntry>,
-    field: &'static protocol::SField,
-    value: Option<Uint256>,
-) -> bool {
-    let mut obj = page.clone_as_object();
-    match value {
-        Some(value) => obj.set_field_h256(field, value),
-        None => obj.make_field_absent(field),
-    }
-
-    view.update(Arc::new(STLedgerEntry::from_stobject(obj, *page.key())))
-        .is_ok()
+    owner: &AccountID,
+) -> Result<bool, ledger::ViewError> {
+    ledger::nftoken_helpers::repair_nftoken_directory_links(view, owner)
 }
 
-fn repair_nftoken_directory_links<V: ApplyView>(view: &mut V, owner: &AccountID) -> bool {
-    let mut did_repair = false;
-    let last = protocol::nft_page_max_keylet(to_160(owner));
-    let first_key = match view.succ(
-        protocol::nft_page_min_keylet(to_160(owner)).key,
-        Some(last.key.next()),
-    ) {
-        Ok(candidate) => candidate.unwrap_or(last.key),
-        Err(_) => return false,
-    };
-
-    let Some(mut page) = (match view.peek(Keylet::new(LedgerEntryType::NFTokenPage, first_key)) {
-        Ok(page) => page,
-        Err(_) => return false,
-    }) else {
-        return false;
-    };
-
-    if *page.key() == last.key {
-        let next_present = page.is_field_present(sf("sfNextPageMin"));
-        let prev_present = page.is_field_present(sf("sfPreviousPageMin"));
-        if next_present || prev_present {
-            did_repair = true;
-            if !update_nft_page_link(view, &page, sf("sfPreviousPageMin"), None)
-                || !update_nft_page_link(view, &page, sf("sfNextPageMin"), None)
-            {
-                return false;
-            }
-        }
-        return did_repair;
+fn nft_repair_result_to_ter(result: Result<bool, ledger::ViewError>) -> Ter {
+    match result {
+        Ok(true) => Ter::TES_SUCCESS,
+        Ok(false) => Ter::TEC_FAILED_PROCESSING,
+        Err(_) => Ter::TEF_BAD_LEDGER,
     }
-
-    if page.is_field_present(sf("sfPreviousPageMin")) {
-        did_repair = true;
-        if !update_nft_page_link(view, &page, sf("sfPreviousPageMin"), None) {
-            return false;
-        }
-        let Ok(Some(updated_page)) =
-            view.peek(Keylet::new(LedgerEntryType::NFTokenPage, *page.key()))
-        else {
-            return false;
-        };
-        page = updated_page;
-    }
-
-    let mut next_page = None;
-    loop {
-        let next_key = match view.succ(page.key().next(), Some(last.key.next())) {
-            Ok(candidate) => candidate.unwrap_or(last.key),
-            Err(_) => return false,
-        };
-        let candidate = match view.peek(Keylet::new(LedgerEntryType::NFTokenPage, next_key)) {
-            Ok(candidate) => candidate,
-            Err(_) => return false,
-        };
-        let Some(mut candidate) = candidate else {
-            break;
-        };
-
-        if !page.is_field_present(sf("sfNextPageMin"))
-            || page.get_field_h256(sf("sfNextPageMin")) != *candidate.key()
-        {
-            did_repair = true;
-            if !update_nft_page_link(view, &page, sf("sfNextPageMin"), Some(*candidate.key())) {
-                return false;
-            }
-        }
-
-        if !candidate.is_field_present(sf("sfPreviousPageMin"))
-            || candidate.get_field_h256(sf("sfPreviousPageMin")) != *page.key()
-        {
-            did_repair = true;
-            if !update_nft_page_link(view, &candidate, sf("sfPreviousPageMin"), Some(*page.key())) {
-                return false;
-            }
-            let Ok(Some(updated_candidate)) =
-                view.peek(Keylet::new(LedgerEntryType::NFTokenPage, *candidate.key()))
-            else {
-                return false;
-            };
-            candidate = updated_candidate;
-        }
-
-        if *candidate.key() == last.key {
-            next_page = Some(candidate);
-            break;
-        }
-
-        page = candidate;
-    }
-
-    let Some(next_page) = next_page else {
-        did_repair = true;
-        let mut repaired_last = STLedgerEntry::new(last);
-        repaired_last.set_field_array(sf("sfNFTokens"), page.get_field_array(sf("sfNFTokens")));
-
-        if page.is_field_present(sf("sfPreviousPageMin")) {
-            let prev_key = page.get_field_h256(sf("sfPreviousPageMin"));
-            repaired_last.set_field_h256(sf("sfPreviousPageMin"), prev_key);
-
-            let Ok(Some(prev_page)) =
-                view.peek(Keylet::new(LedgerEntryType::NFTokenPage, prev_key))
-            else {
-                return false;
-            };
-            if !update_nft_page_link(view, &prev_page, sf("sfNextPageMin"), Some(last.key)) {
-                return false;
-            }
-        }
-
-        if view.erase(page).is_err() || view.insert(Arc::new(repaired_last)).is_err() {
-            return false;
-        }
-        return did_repair;
-    };
-
-    if next_page.is_field_present(sf("sfNextPageMin")) {
-        did_repair = true;
-        if !update_nft_page_link(view, &next_page, sf("sfNextPageMin"), None) {
-            return false;
-        }
-    }
-
-    did_repair
 }
 
 pub fn apply_ledger_state_fix<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
@@ -199,19 +72,23 @@ pub fn apply_ledger_state_fix<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return preflight;
     }
 
-    let book_dir = book_directory.and_then(|dir_key| {
-        view.peek(Keylet::new(LedgerEntryType::DirectoryNode, dir_key))
-            .ok()
-            .flatten()
-    });
+    let book_dir = match book_directory {
+        Some(dir_key) => match view.peek(Keylet::new(LedgerEntryType::DirectoryNode, dir_key)) {
+            Ok(dir) => dir,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        },
+        None => None,
+    };
+    let owner_exists = match owner.as_ref() {
+        Some(owner) => match view.peek(protocol::account_keylet(to_160(owner))) {
+            Ok(owner) => owner.is_some(),
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        },
+        None => false,
+    };
     let preclaim = run_ledger_state_fix_preclaim_facts(LedgerStateFixPreclaimFacts {
         fix_type,
-        owner_exists: owner.as_ref().is_some_and(|owner| {
-            matches!(
-                view.peek(protocol::account_keylet(to_160(owner))),
-                Ok(Some(_))
-            )
-        }),
+        owner_exists,
         book_directory_exists: book_dir.is_some(),
         book_directory_has_exchange_rate: book_dir
             .as_ref()
@@ -226,325 +103,30 @@ pub fn apply_ledger_state_fix<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     }
 
     match fix_type {
-        LedgerStateFixType::NfTokenPageLink => run_ledger_state_fix_do_apply(fix_type, || {
-            owner
-                .as_ref()
-                .is_some_and(|owner| repair_nftoken_directory_links(view, owner))
-        }),
-        LedgerStateFixType::BookExchangeRate => run_ledger_state_fix_do_apply_with_book(
-            fix_type,
-            || false,
-            || {
-                let Some(dir_key) = book_directory else {
-                    return false;
-                };
-                let Ok(Some(dir)) = view.peek(Keylet::new(LedgerEntryType::DirectoryNode, dir_key))
-                else {
-                    return false;
-                };
-                let mut obj = dir.clone_as_object();
-                obj.set_field_u64(sf("sfExchangeRate"), protocol::quality_from_key(*dir.key()));
-                view.update(Arc::new(STLedgerEntry::from_stobject(obj, *dir.key())))
-                    .is_ok()
-            },
-        ),
+        LedgerStateFixType::NfTokenPageLink => {
+            let Some(owner) = owner.as_ref() else {
+                return Ter::TEC_INTERNAL;
+            };
+            nft_repair_result_to_ter(repair_nftoken_directory_links(view, owner))
+        }
+        LedgerStateFixType::BookExchangeRate => {
+            let Some(dir_key) = book_directory else {
+                return Ter::TEC_INTERNAL;
+            };
+            let dir = match view.peek(Keylet::new(LedgerEntryType::DirectoryNode, dir_key)) {
+                Ok(Some(dir)) => dir,
+                Ok(None) => return Ter::TEC_INTERNAL,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            };
+            let mut obj = dir.clone_as_object();
+            obj.set_field_u64(sf("sfExchangeRate"), protocol::quality_from_key(*dir.key()));
+            match view.update(Arc::new(STLedgerEntry::from_stobject(obj, *dir.key()))) {
+                Ok(()) => Ter::TES_SUCCESS,
+                Err(_) => Ter::TEF_BAD_LEDGER,
+            }
+        }
         LedgerStateFixType::Unknown(_) => {
             run_ledger_state_fix_do_apply_with_book(fix_type, || false, || false)
-        }
-    }
-}
-
-pub struct ViewBackedAccountSetSink<'a, V> {
-    pub view: &'a mut V,
-    pub account: AccountID,
-}
-
-impl<'a, V: ApplyView> AccountSetDoApplySink for ViewBackedAccountSetSink<'a, V> {
-    type AccountId = AccountID;
-    fn set_account_txn_id(&mut self) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            // sfAccountTxnID tracks the last tx that modified this account.
-            // Set to zero here; the real value is applied by the outer tx engine.
-            obj.set_field_h256(sf("sfAccountTxnID"), Uint256::default());
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn clear_account_txn_id(&mut self) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.make_field_absent(sf("sfAccountTxnID"));
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn set_email_hash(&mut self, value: u128) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            let mut buf = [0u8; 16];
-            buf.copy_from_slice(&value.to_be_bytes());
-            obj.set_field_h128(get_field_by_symbol("sfEmailHash"), buf.into());
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn clear_email_hash(&mut self) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.make_field_absent(get_field_by_symbol("sfEmailHash"));
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn set_wallet_locator(&mut self, _value: Vec<u8>) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.set_field_h256(get_field_by_symbol("sfWalletLocator"), Uint256::default());
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn clear_wallet_locator(&mut self) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.make_field_absent(get_field_by_symbol("sfWalletLocator"));
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn set_message_key(&mut self, value: Vec<u8>) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.set_stbase(protocol::STBlob::from_buffer(
-                get_field_by_symbol("sfMessageKey"),
-                basics::buffer::Buffer::from(value.as_slice()),
-            ));
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn clear_message_key(&mut self) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.make_field_absent(get_field_by_symbol("sfMessageKey"));
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn set_domain(&mut self, value: Vec<u8>) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.set_stbase(protocol::STBlob::from_buffer(
-                get_field_by_symbol("sfDomain"),
-                basics::buffer::Buffer::from(value.as_slice()),
-            ));
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn clear_domain(&mut self) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.make_field_absent(get_field_by_symbol("sfDomain"));
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn set_transfer_rate(&mut self, value: u32) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.set_field_u32(get_field_by_symbol("sfTransferRate"), value);
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn clear_transfer_rate(&mut self) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.make_field_absent(get_field_by_symbol("sfTransferRate"));
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn set_tick_size(&mut self, value: u8) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.set_field_u8(get_field_by_symbol("sfTickSize"), value);
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn clear_tick_size(&mut self) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.make_field_absent(get_field_by_symbol("sfTickSize"));
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn set_nftoken_minter(&mut self, value: Self::AccountId) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.set_account_id(get_field_by_symbol("sfNFTokenMinter"), value);
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn clear_nftoken_minter(&mut self) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.make_field_absent(get_field_by_symbol("sfNFTokenMinter"));
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn set_account_flags(&mut self, value: u32) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::account_keylet(to_160(&self.account)))
-        {
-            let mut obj = sle.clone_as_object();
-            obj.set_field_u32(get_field_by_symbol("sfFlags"), value);
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn update_account(&mut self) {}
-}
-
-pub struct ViewBackedAccountDeleteSink<'a, V> {
-    pub view: &'a mut V,
-    pub account: AccountID,
-    pub destination: AccountID,
-}
-
-impl<'a, V: ApplyView> AccountDeleteDoApplyTailSink for ViewBackedAccountDeleteSink<'a, V> {
-    type Amount = STAmount;
-    fn source_balance(&mut self) -> Self::Amount {
-        let keylet = protocol::account_keylet(to_160(&self.account));
-        self.view
-            .read(keylet)
-            .ok()
-            .flatten()
-            .map(|sle| sle.get_field_amount(get_field_by_symbol("sfBalance")))
-            .unwrap_or_default()
-    }
-    fn destination_balance(&mut self) -> Self::Amount {
-        let keylet = protocol::account_keylet(to_160(&self.destination));
-        self.view
-            .read(keylet)
-            .ok()
-            .flatten()
-            .map(|sle| sle.get_field_amount(get_field_by_symbol("sfBalance")))
-            .unwrap_or_default()
-    }
-    fn set_source_balance(&mut self, amount: Self::Amount) {
-        let keylet = protocol::account_keylet(to_160(&self.account));
-        if let Ok(Some(sle)) = self.view.peek(keylet) {
-            let mut obj = sle.clone_as_object();
-            obj.set_field_amount(get_field_by_symbol("sfBalance"), amount);
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn set_destination_balance(&mut self, amount: Self::Amount) {
-        let keylet = protocol::account_keylet(to_160(&self.destination));
-        if let Ok(Some(sle)) = self.view.peek(keylet) {
-            let mut obj = sle.clone_as_object();
-            obj.set_field_amount(get_field_by_symbol("sfBalance"), amount);
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn deliver(&mut self, _amount: Self::Amount) {}
-    fn owner_dir_exists(&mut self) -> bool {
-        let dir_keylet = protocol::owner_dir_keylet(to_160(&self.account));
-        self.view.exists(dir_keylet).unwrap_or(false)
-    }
-    fn empty_dir_delete(&mut self) -> bool {
-        let dir_keylet = protocol::owner_dir_keylet(to_160(&self.account));
-        if let Ok(Some(sle)) = self.view.read(dir_keylet) {
-            let _ = self.view.erase(sle);
-        }
-        true
-    }
-    fn destination_password_spent(&mut self) -> bool {
-        false
-    }
-    fn clear_destination_password_spent(&mut self) {}
-    fn update_destination(&mut self) {}
-    fn erase_source(&mut self) {
-        let keylet = protocol::account_keylet(to_160(&self.account));
-        if let Ok(Some(sle)) = self.view.read(keylet) {
-            let _ = self.view.erase(sle);
         }
     }
 }
@@ -601,6 +183,7 @@ pub struct ViewBackedPermissionedDomainSetSink<'a, V> {
     pub tx_sequence: u32,
     pub existing_domain_id: Option<Uint256>,
     staged_domain: Option<STLedgerEntry>,
+    pub failure: Option<Ter>,
 }
 
 impl<'a, V> ViewBackedPermissionedDomainSetSink<'a, V> {
@@ -616,6 +199,7 @@ impl<'a, V> ViewBackedPermissionedDomainSetSink<'a, V> {
             tx_sequence,
             existing_domain_id,
             staged_domain: None,
+            failure: None,
         }
     }
 }
@@ -627,9 +211,16 @@ impl<'a, V: ApplyView>
     type OwnerNode = u64;
 
     fn owner_exists(&mut self) -> bool {
-        self.view
+        match self
+            .view
             .exists(protocol::account_keylet(to_160(&self.account)))
-            .unwrap_or(false)
+        {
+            Ok(exists) => exists,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                false
+            }
+        }
     }
 
     fn existing_domain_exists(&mut self) -> bool {
@@ -637,9 +228,16 @@ impl<'a, V: ApplyView>
             return false;
         };
 
-        self.view
+        match self
+            .view
             .exists(protocol::permissioned_domain_keylet_from_id(domain_id))
-            .unwrap_or(false)
+        {
+            Ok(exists) => exists,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                false
+            }
+        }
     }
 
     fn replace_existing_domain_credentials(
@@ -651,29 +249,61 @@ impl<'a, V: ApplyView>
         };
 
         let keylet = protocol::permissioned_domain_keylet_from_id(domain_id);
-        if let Ok(Some(sle)) = self.view.peek(keylet) {
-            let mut obj = sle.clone_as_object();
-            obj.set_field_array(
-                sf("sfAcceptedCredentials"),
-                permissioned_domain_credentials_to_array(credentials),
-            );
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
+        let sle = match self.view.peek(keylet) {
+            Ok(Some(sle)) => sle,
+            Ok(None) => {
+                self.failure = Some(Ter::TEF_INTERNAL);
+                return;
+            }
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                return;
+            }
+        };
+        let mut obj = sle.clone_as_object();
+        obj.set_field_array(
+            sf("sfAcceptedCredentials"),
+            permissioned_domain_credentials_to_array(credentials),
+        );
+        if self
+            .view
+            .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())))
+            .is_err()
+        {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
         }
     }
 
     fn owner_has_reserve_for_new_domain(&mut self) -> bool {
-        let Ok(Some(owner_sle)) = self
+        let owner_sle = match self
             .view
             .peek(protocol::account_keylet(to_160(&self.account)))
-        else {
-            return false;
+        {
+            Ok(Some(sle)) => sle,
+            Ok(None) => {
+                self.failure = Some(Ter::TEF_INTERNAL);
+                return false;
+            }
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                return false;
+            }
         };
 
         let balance = owner_sle.get_field_amount(sf("sfBalance")).xrp().drops();
-        let owner_count = owner_sle.get_field_u32(sf("sfOwnerCount"));
-        let reserve = self.view.fees().account_reserve(owner_count as usize + 1) as i64;
+        // Pinned accountReserve includes Sponsor-era sponsored/sponsoring
+        // owner counts and account-base reserve responsibility. A plain
+        // OwnerCount+1 calculation overcharges sponsored accounts and
+        // undercharges accounts sponsoring other objects/accounts.
+        let Ok(reserve) = i64::try_from(ledger::effective_account_reserve(
+            self.view.fees(),
+            &owner_sle,
+            1,
+            0,
+        )) else {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
+            return false;
+        };
         balance >= reserve
     }
 
@@ -694,14 +324,18 @@ impl<'a, V: ApplyView>
 
     fn dir_insert_new_domain(&mut self) -> Option<Self::OwnerNode> {
         let staged_domain = self.staged_domain.as_ref()?;
-        ledger::dir_insert(
+        match ledger::dir_insert(
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.account)),
             *staged_domain.key(),
             &ledger::describe_owner_dir(self.account),
-        )
-        .ok()
-        .flatten()
+        ) {
+            Ok(page) => page,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                None
+            }
+        }
     }
 
     fn set_new_domain_owner_node(&mut self, page: Self::OwnerNode) {
@@ -711,17 +345,25 @@ impl<'a, V: ApplyView>
     }
 
     fn adjust_owner_count(&mut self, delta: i32) {
-        if let Ok(Some(sle)) = self
+        match self
             .view
             .peek(protocol::account_keylet(to_160(&self.account)))
         {
-            let _ = adjust_owner_count(self.view, &sle, delta);
+            Ok(Some(sle)) => {
+                if adjust_owner_count(self.view, &sle, delta).is_err() {
+                    self.failure = Some(Ter::TEF_BAD_LEDGER);
+                }
+            }
+            Ok(None) => self.failure = Some(Ter::TEF_INTERNAL),
+            Err(_) => self.failure = Some(Ter::TEF_BAD_LEDGER),
         }
     }
 
     fn insert_new_domain(&mut self) {
         if let Some(staged_domain) = self.staged_domain.take() {
-            let _ = self.view.insert(Arc::new(staged_domain));
+            if self.view.insert(Arc::new(staged_domain)).is_err() {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+            }
         }
     }
 }
@@ -730,6 +372,7 @@ pub struct ViewBackedPermissionedDomainDeleteSink<'a, V> {
     pub view: &'a mut V,
     pub account: AccountID,
     pub domain_id: Uint256,
+    pub failure: Option<Ter>,
 }
 
 impl<'a, V: ApplyView> PermissionedDomainDeleteLoadedSink
@@ -737,42 +380,75 @@ impl<'a, V: ApplyView> PermissionedDomainDeleteLoadedSink
 {
     fn dir_remove(&mut self) -> bool {
         let keylet = protocol::permissioned_domain_keylet_from_id(self.domain_id);
-        let Ok(Some(domain_sle)) = self.view.peek(keylet) else {
-            return false;
+        let domain_sle = match self.view.peek(keylet) {
+            Ok(Some(sle)) => sle,
+            Ok(None) => {
+                self.failure = Some(Ter::TEF_INTERNAL);
+                return false;
+            }
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                return false;
+            }
         };
 
-        ledger::dir_remove(
+        match ledger::dir_remove(
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.account)),
             domain_sle.get_field_u64(sf("sfOwnerNode")),
             *domain_sle.key(),
             true,
-        )
-        .unwrap_or(false)
+        ) {
+            Ok(removed) => removed,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                false
+            }
+        }
     }
 
     fn owner_exists_with_nonzero_count(&mut self) -> bool {
-        self.view
+        match self
+            .view
             .read(protocol::account_keylet(to_160(&self.account)))
-            .ok()
-            .flatten()
-            .map(|sle| sle.get_field_u32(sf("sfOwnerCount")) > 0)
-            .unwrap_or(false)
+        {
+            Ok(Some(sle)) => sle.get_field_u32(sf("sfOwnerCount")) > 0,
+            Ok(None) => {
+                self.failure = Some(Ter::TEF_INTERNAL);
+                false
+            }
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                false
+            }
+        }
     }
 
     fn adjust_owner_count(&mut self, delta: i32) {
-        if let Ok(Some(sle)) = self
+        match self
             .view
             .peek(protocol::account_keylet(to_160(&self.account)))
         {
-            let _ = adjust_owner_count(self.view, &sle, delta);
+            Ok(Some(sle)) => {
+                if adjust_owner_count(self.view, &sle, delta).is_err() {
+                    self.failure = Some(Ter::TEF_BAD_LEDGER);
+                }
+            }
+            Ok(None) => self.failure = Some(Ter::TEF_INTERNAL),
+            Err(_) => self.failure = Some(Ter::TEF_BAD_LEDGER),
         }
     }
 
     fn erase_domain(&mut self) {
         let keylet = protocol::permissioned_domain_keylet_from_id(self.domain_id);
-        if let Ok(Some(domain_sle)) = self.view.peek(keylet) {
-            let _ = self.view.erase(domain_sle);
+        match self.view.peek(keylet) {
+            Ok(Some(domain_sle)) => {
+                if self.view.erase(domain_sle).is_err() {
+                    self.failure = Some(Ter::TEF_BAD_LEDGER);
+                }
+            }
+            Ok(None) => self.failure = Some(Ter::TEF_INTERNAL),
+            Err(_) => self.failure = Some(Ter::TEF_BAD_LEDGER),
         }
     }
 }
@@ -781,9 +457,16 @@ impl<'a, V: ApplyView> PermissionedDomainDeleteApplySink
     for ViewBackedPermissionedDomainDeleteSink<'a, V>
 {
     fn loaded_domain_exists(&mut self) -> bool {
-        self.view
+        match self
+            .view
             .exists(protocol::permissioned_domain_keylet_from_id(self.domain_id))
-            .unwrap_or(false)
+        {
+            Ok(exists) => exists,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                false
+            }
+        }
     }
 
     fn delete_loaded_domain(&mut self) -> Ter {
@@ -807,6 +490,8 @@ pub struct ViewBackedDelegateSetSink<'a, V> {
     pub account: AccountID,
     pub authorize: AccountID,
     pub pre_fee_balance_drops: i64,
+    pub reserve_sponsor: Option<Arc<STLedgerEntry>>,
+    pub failure: Option<Ter>,
     staged_delegate: Option<STLedgerEntry>,
 }
 
@@ -816,12 +501,15 @@ impl<'a, V> ViewBackedDelegateSetSink<'a, V> {
         account: AccountID,
         authorize: AccountID,
         pre_fee_balance_drops: i64,
+        reserve_sponsor: Option<Arc<STLedgerEntry>>,
     ) -> Self {
         Self {
             view,
             account,
             authorize,
             pre_fee_balance_drops,
+            reserve_sponsor,
+            failure: None,
             staged_delegate: None,
         }
     }
@@ -833,12 +521,23 @@ impl<'a, V> ViewBackedDelegateSetSink<'a, V> {
 
 impl<'a, V: ApplyView> DelegateSetDeleteSink for ViewBackedDelegateSetSink<'a, V> {
     fn delegate_exists_for_delete(&mut self) -> bool {
-        self.view.exists(self.keylet()).unwrap_or(false)
+        match self.view.exists(self.keylet()) {
+            Ok(exists) => exists,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                false
+            }
+        }
     }
 
     fn dir_remove_owner(&mut self) -> bool {
-        let Ok(Some(delegate_sle)) = self.view.peek(self.keylet()) else {
-            return false;
+        let delegate_sle = match self.view.peek(self.keylet()) {
+            Ok(Some(sle)) => sle,
+            Ok(None) => return false,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                return false;
+            }
         };
 
         ledger::dir_remove(
@@ -848,12 +547,20 @@ impl<'a, V: ApplyView> DelegateSetDeleteSink for ViewBackedDelegateSetSink<'a, V
             *delegate_sle.key(),
             false,
         )
-        .unwrap_or(false)
+        .unwrap_or_else(|_| {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
+            false
+        })
     }
 
     fn dir_remove_destination(&mut self) -> Option<bool> {
-        let Ok(Some(delegate_sle)) = self.view.peek(self.keylet()) else {
-            return None;
+        let delegate_sle = match self.view.peek(self.keylet()) {
+            Ok(Some(sle)) => sle,
+            Ok(None) => return None,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                return Some(false);
+            }
         };
 
         if !delegate_sle.is_field_present(sf("sfDestinationNode")) {
@@ -868,28 +575,77 @@ impl<'a, V: ApplyView> DelegateSetDeleteSink for ViewBackedDelegateSetSink<'a, V
                 *delegate_sle.key(),
                 false,
             )
-            .unwrap_or(false),
+            .unwrap_or_else(|_| {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                false
+            }),
         )
     }
 
     fn owner_exists(&mut self) -> bool {
-        self.view
+        match self
+            .view
             .exists(protocol::account_keylet(to_160(&self.account)))
-            .unwrap_or(false)
+        {
+            Ok(exists) => exists,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                false
+            }
+        }
     }
 
     fn adjust_owner_count(&mut self, delta: i32) {
-        if let Ok(Some(sle)) = self
+        let sle = match self
             .view
             .peek(protocol::account_keylet(to_160(&self.account)))
         {
-            let _ = adjust_owner_count(self.view, &sle, delta);
+            Ok(Some(sle)) => sle,
+            Ok(None) => {
+                self.failure = Some(Ter::TEC_INTERNAL);
+                return;
+            }
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                return;
+            }
+        };
+        let result = if delta < 0 {
+            match self.view.peek(self.keylet()) {
+                Ok(Some(delegate_sle)) => ledger::decrease_owner_count_for_object(
+                    self.view,
+                    &sle,
+                    &delegate_sle,
+                    delta.unsigned_abs(),
+                ),
+                Ok(None) => {
+                    self.failure = Some(Ter::TEC_INTERNAL);
+                    return;
+                }
+                Err(_) => {
+                    self.failure = Some(Ter::TEF_BAD_LEDGER);
+                    return;
+                }
+            }
+        } else if delta == 1 {
+            ledger::increase_owner_count_for_object(self.view, &sle, self.reserve_sponsor.as_ref())
+        } else {
+            adjust_owner_count(self.view, &sle, delta)
+        };
+        if result.is_err() {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
         }
     }
 
     fn erase_delegate(&mut self) {
-        if let Ok(Some(delegate_sle)) = self.view.peek(self.keylet()) {
-            let _ = self.view.erase(delegate_sle);
+        match self.view.peek(self.keylet()) {
+            Ok(Some(delegate_sle)) => {
+                if self.view.erase(delegate_sle).is_err() {
+                    self.failure = Some(Ter::TEF_BAD_LEDGER);
+                }
+            }
+            Ok(None) => self.failure = Some(Ter::TEC_INTERNAL),
+            Err(_) => self.failure = Some(Ter::TEF_BAD_LEDGER),
         }
     }
 }
@@ -906,32 +662,57 @@ impl<'a, V: ApplyView> DelegateSetApplySink<u32> for ViewBackedDelegateSetSink<'
     }
 
     fn update_existing_permissions(&mut self, permissions: Vec<u32>) {
-        if let Ok(Some(delegate_sle)) = self.view.peek(self.keylet()) {
-            let mut obj = delegate_sle.clone_as_object();
-            obj.set_field_array(
-                sf("sfPermissions"),
-                delegate_permissions_to_array(permissions),
-            );
-            let _ = self.view.update(Arc::new(STLedgerEntry::from_stobject(
-                obj,
-                *delegate_sle.key(),
-            )));
+        match self.view.peek(self.keylet()) {
+            Ok(Some(delegate_sle)) => {
+                let mut obj = delegate_sle.clone_as_object();
+                obj.set_field_array(
+                    sf("sfPermissions"),
+                    delegate_permissions_to_array(permissions),
+                );
+                if self
+                    .view
+                    .update(Arc::new(STLedgerEntry::from_stobject(
+                        obj,
+                        *delegate_sle.key(),
+                    )))
+                    .is_err()
+                {
+                    self.failure = Some(Ter::TEF_BAD_LEDGER);
+                }
+            }
+            Ok(None) => self.failure = Some(Ter::TEC_INTERNAL),
+            Err(_) => self.failure = Some(Ter::TEF_BAD_LEDGER),
         }
     }
 
     fn owner_has_reserve_for_create(&mut self) -> bool {
-        let Ok(Some(owner_sle)) = self
+        let owner_sle = match self
             .view
             .peek(protocol::account_keylet(to_160(&self.account)))
-        else {
+        {
+            Ok(Some(sle)) => sle,
+            Ok(None) => return false,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                return false;
+            }
+        };
+        let reserve_sle = self
+            .reserve_sponsor
+            .as_deref()
+            .unwrap_or(owner_sle.as_ref());
+        let reserve = ledger::effective_account_reserve(self.view.fees(), reserve_sle, 1, 0);
+        let Ok(reserve) = i64::try_from(reserve) else {
+            self.failure = Some(Ter::TEF_BAD_LEDGER);
             return false;
         };
-        let reserve = self
-            .view
-            .fees()
-            .account_reserve(owner_sle.get_field_u32(sf("sfOwnerCount")) as usize + 1)
-            as i64;
-        self.pre_fee_balance_drops >= reserve
+        let balance = self
+            .reserve_sponsor
+            .as_ref()
+            .map_or(self.pre_fee_balance_drops, |sponsor| {
+                sponsor.get_field_amount(sf("sfBalance")).xrp().drops()
+            });
+        balance >= reserve
     }
 
     fn stage_new_delegate(&mut self, permissions: Vec<u32>) {
@@ -942,19 +723,26 @@ impl<'a, V: ApplyView> DelegateSetApplySink<u32> for ViewBackedDelegateSetSink<'
             sf("sfPermissions"),
             delegate_permissions_to_array(permissions),
         );
+        if let Some(sponsor) = self.reserve_sponsor.as_ref() {
+            sle.set_account_id(sf("sfSponsor"), sponsor.get_account_id(sf("sfAccount")));
+        }
         self.staged_delegate = Some(sle);
     }
 
     fn dir_insert_owner(&mut self) -> Option<Self::OwnerNode> {
         let staged_delegate = self.staged_delegate.as_ref()?;
-        ledger::dir_insert(
+        match ledger::dir_insert(
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.account)),
             *staged_delegate.key(),
             &ledger::describe_owner_dir(self.account),
-        )
-        .ok()
-        .flatten()
+        ) {
+            Ok(page) => page,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                None
+            }
+        }
     }
 
     fn set_owner_node(&mut self, page: Self::OwnerNode) {
@@ -965,14 +753,18 @@ impl<'a, V: ApplyView> DelegateSetApplySink<u32> for ViewBackedDelegateSetSink<'
 
     fn dir_insert_destination(&mut self) -> Option<Self::OwnerNode> {
         let staged_delegate = self.staged_delegate.as_ref()?;
-        ledger::dir_insert(
+        match ledger::dir_insert(
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.authorize)),
             *staged_delegate.key(),
             &ledger::describe_owner_dir(self.authorize),
-        )
-        .ok()
-        .flatten()
+        ) {
+            Ok(page) => page,
+            Err(_) => {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+                None
+            }
+        }
     }
 
     fn set_destination_node(&mut self, page: Self::OwnerNode) {
@@ -983,7 +775,9 @@ impl<'a, V: ApplyView> DelegateSetApplySink<u32> for ViewBackedDelegateSetSink<'
 
     fn insert_new_delegate(&mut self) {
         if let Some(staged_delegate) = self.staged_delegate.take() {
-            let _ = self.view.insert(Arc::new(staged_delegate));
+            if self.view.insert(Arc::new(staged_delegate)).is_err() {
+                self.failure = Some(Ter::TEF_BAD_LEDGER);
+            }
         }
     }
 }
@@ -1002,8 +796,10 @@ pub struct ViewBackedAMMCreateSink<'a, V> {
 impl<'a, V: ApplyView> AMMCreateApplySink for ViewBackedAMMCreateSink<'a, V> {
     fn create_amm_account(&mut self) -> Ter {
         let amm_keylet = protocol::keylet::amm(self.amount1.asset(), self.amount2.asset());
-        if matches!(self.view.read(amm_keylet), Ok(Some(_))) {
-            return Ter::TEC_DUPLICATE;
+        match self.view.read(amm_keylet) {
+            Ok(Some(_)) => return Ter::TEC_DUPLICATE,
+            Ok(None) => {}
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         }
 
         let pseudo = match ledger::create_pseudo_account(self.view, amm_keylet.key, sf("sfAMMID")) {
@@ -1131,23 +927,30 @@ fn send_amm_initial_asset<V: ApplyView>(
     match amount.asset() {
         Asset::MPTIssue(issue) => send_amm_initial_mpt(view, sender, amm_account, amount, issue),
         Asset::Issue(issue) => {
-            let result =
-                ledger::ripple_state_helpers::account_send(view, sender, amm_account, amount);
+            // Pinned AMMCreate uses accountSend(...,
+            // WaiveTransferFee::Yes): a third-party creator deposits the exact
+            // amount even when the IOU issuer configured a transfer rate.
+            let result = ledger::ripple_state_helpers::account_send_waive_transfer_fee(
+                view,
+                sender,
+                amm_account,
+                amount,
+            );
             if result != Ter::TES_SUCCESS || issue.native() {
                 return result;
             }
-            if let Ok(Some(line)) =
-                view.peek(protocol::line(*amm_account, issue.issuer(), issue.currency))
+            let line = match view.peek(protocol::line(*amm_account, issue.issuer(), issue.currency))
             {
-                let mut updated = (*line).clone();
-                let flags = updated.get_flags() | protocol::lsfAMMNode;
-                updated.set_field_u32(sf("sfFlags"), flags);
-                return view
-                    .update(Arc::new(updated))
-                    .map(|_| Ter::TES_SUCCESS)
-                    .unwrap_or(Ter::TEF_BAD_LEDGER);
-            }
-            Ter::TEC_INTERNAL
+                Ok(Some(line)) => line,
+                Ok(None) => return Ter::TEC_INTERNAL,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            };
+            let mut updated = (*line).clone();
+            let flags = updated.get_flags() | protocol::lsfAMMNode;
+            updated.set_field_u32(sf("sfFlags"), flags);
+            view.update(Arc::new(updated))
+                .map(|_| Ter::TES_SUCCESS)
+                .unwrap_or(Ter::TEF_BAD_LEDGER)
         }
     }
 }
@@ -1167,12 +970,10 @@ fn send_amm_initial_mpt<V: ApplyView>(
     let mpt_id = issue.mpt_id();
     let issuer = issue.issuer();
 
-    let Some(issuance) = view
-        .peek(protocol::mpt_issuance_keylet_from_mptid(mpt_id))
-        .ok()
-        .flatten()
-    else {
-        return Ter::TEC_OBJECT_NOT_FOUND;
+    let issuance = match view.peek(protocol::mpt_issuance_keylet_from_mptid(mpt_id)) {
+        Ok(Some(issuance)) => issuance,
+        Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     if sender == &issuer {
@@ -1186,13 +987,12 @@ fn send_amm_initial_mpt<V: ApplyView>(
             return Ter::TEF_BAD_LEDGER;
         }
     } else {
-        let Some(sender_token) = view
-            .peek(protocol::mptoken_keylet_from_mptid(mpt_id, to_160(sender)))
-            .ok()
-            .flatten()
-        else {
-            return Ter::TEC_NO_AUTH;
-        };
+        let sender_token =
+            match view.peek(protocol::mptoken_keylet_from_mptid(mpt_id, to_160(sender))) {
+                Ok(Some(token)) => token,
+                Ok(None) => return Ter::TEC_NO_AUTH,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            };
         let current = sender_token.get_field_u64(sf("sfMPTAmount"));
         let Some(next) = current.checked_sub(value) else {
             return Ter::TEC_INSUFFICIENT_FUNDS;
@@ -1211,15 +1011,13 @@ fn send_amm_initial_mpt<V: ApplyView>(
         return result;
     }
 
-    let Some(amm_token) = view
-        .peek(protocol::mptoken_keylet_from_mptid(
-            mpt_id,
-            to_160(amm_account),
-        ))
-        .ok()
-        .flatten()
-    else {
-        return Ter::TEC_OBJECT_NOT_FOUND;
+    let amm_token = match view.peek(protocol::mptoken_keylet_from_mptid(
+        mpt_id,
+        to_160(amm_account),
+    )) {
+        Ok(Some(token)) => token,
+        Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let current = if amm_token.is_field_present(sf("sfMPTAmount")) {
         amm_token.get_field_u64(sf("sfMPTAmount"))
@@ -1259,192 +1057,15 @@ impl<'a, V: ApplyView> ViewBackedPaymentSink<'a, V> {
     }
 }
 
-pub struct ViewBackedTrustSetSink<'a, V> {
-    pub view: &'a mut V,
-    pub account: AccountID,
-    pub limit_amount: STAmount,
-    pub tx_flags: u32,
-    pub quality_in: Option<u32>,
-    pub quality_out: Option<u32>,
-}
-
-impl<'a, V: ApplyView> ViewBackedTrustSetSink<'a, V> {
-    /// Execute the trust set operation — set limit on the trust line.
-    pub fn execute(&mut self) -> Ter {
-        let issue = self.limit_amount.issue();
-        let dst_account = issue.account;
-        let currency = issue.currency;
-        let line_keylet = protocol::line(self.account, dst_account, currency);
-
-        if let Ok(Some(sle)) = self.view.peek(line_keylet) {
-            // Update existing trust line
-            let b_high = self.account > dst_account;
-            let limit_field = if !b_high {
-                sf("sfLowLimit")
-            } else {
-                sf("sfHighLimit")
-            };
-            let mut obj = sle.clone_as_object();
-            let mut limit_allow = self.limit_amount.clone();
-            limit_allow.set_issuer(self.account);
-            obj.set_field_amount(limit_field, limit_allow);
-            if let Some(qi) = self.quality_in {
-                let qi_field = if !b_high {
-                    sf("sfLowQualityIn")
-                } else {
-                    sf("sfHighQualityIn")
-                };
-                obj.set_field_u32(qi_field, qi);
-            }
-            if let Some(qo) = self.quality_out {
-                let qo_field = if !b_high {
-                    sf("sfLowQualityOut")
-                } else {
-                    sf("sfHighQualityOut")
-                };
-                obj.set_field_u32(qo_field, qo);
-            }
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        } else {
-            // Create new trust line
-            let mut sle = STLedgerEntry::new(line_keylet);
-            let b_high = self.account > dst_account;
-            let zero = STAmount::from_xrp_amount(protocol::XRPAmount::new());
-            sle.set_field_amount(sf("sfBalance"), zero.clone());
-            let mut limit_allow = self.limit_amount.clone();
-            limit_allow.set_issuer(self.account);
-            if !b_high {
-                sle.set_field_amount(sf("sfLowLimit"), limit_allow);
-                sle.set_field_amount(sf("sfHighLimit"), zero);
-            } else {
-                sle.set_field_amount(sf("sfLowLimit"), zero);
-                sle.set_field_amount(sf("sfHighLimit"), limit_allow);
-            }
-            let _ = self.view.insert(Arc::new(sle));
-        }
-        Ter::TES_SUCCESS
-    }
-}
-
-pub struct ViewBackedOfferCancelSink<'a, V> {
-    pub view: &'a mut V,
-    pub account: AccountID,
-    pub offer_sequence: u32,
-}
-
-impl<'a, V: ApplyView> OfferCancelApplySink for ViewBackedOfferCancelSink<'a, V> {
-    fn account_exists(&mut self) -> bool {
-        self.view
-            .exists(protocol::account_keylet(Uint160::from_void(
-                self.account.data(),
-            )))
-            .unwrap_or(false)
-    }
-    fn offer_exists(&mut self) -> bool {
-        let keylet =
-            protocol::offer_keylet(Uint160::from_void(self.account.data()), self.offer_sequence);
-        self.view.exists(keylet).unwrap_or(false)
-    }
-    fn delete_offer(&mut self) -> Ter {
-        let keylet =
-            protocol::offer_keylet(Uint160::from_void(self.account.data()), self.offer_sequence);
-        let Ok(Some(sle)) = self.view.peek(keylet) else {
-            return Ter::TES_SUCCESS;
-        };
-        match ledger::offer_helpers::offer_delete(self.view, sle) {
-            Ok(ter) => ter,
-            Err(_) => Ter::TEF_BAD_LEDGER,
-        }
-    }
-}
-
 pub struct ViewBackedSignerListSetSink<'a, V> {
     pub view: &'a mut V,
     pub account: AccountID,
 }
 
-pub struct ViewBackedAMMDepositSink<'a, V> {
-    pub view: &'a mut V,
-    pub account: AccountID,
-}
-
-impl<'a, V: ApplyView> AMMDepositApplySink for ViewBackedAMMDepositSink<'a, V> {
-    fn get_amm_entry(
-        &mut self,
-        _asset1: &protocol::Asset,
-        _asset2: &protocol::Asset,
-    ) -> Option<protocol::STLedgerEntry> {
-        None
-    }
-    fn update_amm_entry(&mut self, _sle: protocol::STLedgerEntry) {}
-    fn deposit_asset(
-        &mut self,
-        _account: &protocol::AccountID,
-        _amount: &protocol::STAmount,
-    ) -> Ter {
-        Ter::TES_SUCCESS
-    }
-    fn mint_lp_tokens(
-        &mut self,
-        _account: &protocol::AccountID,
-        _amount: &protocol::STAmount,
-    ) -> Ter {
-        Ter::TES_SUCCESS
-    }
-}
-
-pub struct ViewBackedAMMWithdrawSink<'a, V> {
-    pub view: &'a mut V,
-    pub account: AccountID,
-}
-
-impl<'a, V: ApplyView> AMMWithdrawApplySink for ViewBackedAMMWithdrawSink<'a, V> {
-    fn get_amm_entry(
-        &mut self,
-        _asset1: &protocol::Asset,
-        _asset2: &protocol::Asset,
-    ) -> Option<protocol::STLedgerEntry> {
-        None
-    }
-    fn update_amm_entry(&mut self, _sle: protocol::STLedgerEntry) {}
-    fn withdraw_asset(
-        &mut self,
-        _account: &protocol::AccountID,
-        _amount: &protocol::STAmount,
-    ) -> Ter {
-        Ter::TES_SUCCESS
-    }
-    fn burn_lp_tokens(
-        &mut self,
-        _account: &protocol::AccountID,
-        _amount: &protocol::STAmount,
-    ) -> Ter {
-        Ter::TES_SUCCESS
-    }
-}
-
-pub struct ViewBackedAMMVoteSink<'a, V> {
-    pub view: &'a mut V,
-    pub account: AccountID,
-}
-
-impl<'a, V: ApplyView> AMMVoteApplySink for ViewBackedAMMVoteSink<'a, V> {
-    fn get_amm_entry(
-        &mut self,
-        _asset1: &protocol::Asset,
-        _asset2: &protocol::Asset,
-    ) -> Option<protocol::STLedgerEntry> {
-        None
-    }
-    fn update_amm_entry(&mut self, _sle: protocol::STLedgerEntry) {}
-}
-
 fn amm_owner_dir_entries<V: ApplyView>(
     view: &mut V,
     amm_account: &AccountID,
-) -> Option<Vec<Uint256>> {
+) -> Result<Vec<Uint256>, Ter> {
     let owner_dir = protocol::owner_dir_keylet(to_160(amm_account));
     let mut page = 0_u64;
     let mut entries = Vec::new();
@@ -1453,15 +1074,15 @@ fn amm_owner_dir_entries<V: ApplyView>(
     loop {
         visited = visited.saturating_add(1);
         if visited > protocol::MAX_DELETABLE_AMM_TRUST_LINES + 4 {
-            return None;
+            return Err(Ter::TEC_INTERNAL);
         }
 
         let page_keylet = protocol::page_keylet(owner_dir, page);
-        let node = view
-            .peek(page_keylet)
-            .ok()
-            .flatten()
-            .or_else(|| view.read(page_keylet).ok().flatten())?;
+        let node = match view.peek(page_keylet) {
+            Ok(Some(node)) => node,
+            Ok(None) => return Err(Ter::TEC_INTERNAL),
+            Err(_) => return Err(Ter::TEF_BAD_LEDGER),
+        };
         entries.extend(node.get_field_v256(sf("sfIndexes")).value().iter().copied());
 
         let next = node.get_field_u64(sf("sfIndexNext"));
@@ -1471,15 +1092,27 @@ fn amm_owner_dir_entries<V: ApplyView>(
         page = next;
     }
 
-    Some(entries)
+    Ok(entries)
+}
+
+fn require_amm_owner_child(
+    result: Result<Option<Arc<protocol::STLedgerEntry>>, ledger::ViewError>,
+) -> Result<Arc<protocol::STLedgerEntry>, Ter> {
+    // cleanupOnAccountDelete treats both a missing indexed child and a view
+    // failure as malformed ledger state (tefBAD_LEDGER). Neither condition is
+    // a recoverable AMM semantic failure.
+    result
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?
+        .ok_or(Ter::TEF_BAD_LEDGER)
 }
 
 pub(crate) fn delete_empty_amm_owner_entries<V: ApplyView>(
     view: &mut V,
     amm_account: &AccountID,
 ) -> Ter {
-    let Some(entries) = amm_owner_dir_entries(view, amm_account) else {
-        return Ter::TEC_INTERNAL;
+    let entries = match amm_owner_dir_entries(view, amm_account) {
+        Ok(entries) => entries,
+        Err(ter) => return ter,
     };
 
     // cleanupOnAccountDelete applies its bound to every owner-directory
@@ -1492,8 +1125,9 @@ pub(crate) fn delete_empty_amm_owner_entries<V: ApplyView>(
         if entries_visited > protocol::MAX_DELETABLE_AMM_TRUST_LINES {
             return Ter::TEC_INCOMPLETE;
         }
-        let Some(sle) = view.peek(protocol::child_keylet(key)).ok().flatten() else {
-            return Ter::TEF_BAD_LEDGER;
+        let sle = match require_amm_owner_child(view.peek(protocol::child_keylet(key))) {
+            Ok(sle) => sle,
+            Err(ter) => return ter,
         };
         match sle.get_type() {
             LedgerEntryType::AMM | LedgerEntryType::MPToken => {}
@@ -1512,12 +1146,14 @@ pub(crate) fn delete_empty_amm_owner_entries<V: ApplyView>(
         }
     }
 
-    let Some(entries) = amm_owner_dir_entries(view, amm_account) else {
-        return Ter::TEC_INTERNAL;
+    let entries = match amm_owner_dir_entries(view, amm_account) {
+        Ok(entries) => entries,
+        Err(ter) => return ter,
     };
     for key in entries.iter().copied() {
-        let Some(sle) = view.peek(protocol::child_keylet(key)).ok().flatten() else {
-            return Ter::TEC_INTERNAL;
+        let sle = match require_amm_owner_child(view.peek(protocol::child_keylet(key))) {
+            Ok(sle) => sle,
+            Err(ter) => return ter,
         };
         match sle.get_type() {
             LedgerEntryType::AMM => {}
@@ -1537,11 +1173,13 @@ pub(crate) fn delete_empty_amm_owner_entries<V: ApplyView>(
                 }
                 let owner_node = sle.get_field_u64(sf("sfOwnerNode"));
                 let owner_dir = protocol::owner_dir_keylet(to_160(amm_account));
-                if ledger::dir_remove(view, &owner_dir, owner_node, *sle.key(), false).is_err() {
-                    return Ter::TEF_BAD_LEDGER;
+                match ledger::dir_remove(view, &owner_dir, owner_node, *sle.key(), false) {
+                    Ok(true) => {}
+                    Ok(false) => return Ter::TEC_INTERNAL,
+                    Err(_) => return Ter::TEF_BAD_LEDGER,
                 }
                 if view.erase(sle).is_err() {
-                    return Ter::TEC_INTERNAL;
+                    return Ter::TEF_BAD_LEDGER;
                 }
             }
             LedgerEntryType::RippleState => return Ter::TEC_INTERNAL,
@@ -1576,8 +1214,10 @@ pub(crate) fn delete_amm_account<V: ApplyView>(
     }
 
     let account_keylet = protocol::account_keylet(to_160(&amm_account));
-    let Some(account) = view.peek(account_keylet).ok().flatten() else {
-        return Ter::TEC_INTERNAL;
+    let account = match view.peek(account_keylet) {
+        Ok(Some(account)) => account,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     if view.erase(amm_sle.clone()).is_err() || view.erase(account).is_err() {
         return Ter::TEF_BAD_LEDGER;
@@ -1595,12 +1235,11 @@ impl<'a, V: ApplyView> AMMDeleteApplySink for ViewBackedAMMDeleteSink<'a, V> {
         &mut self,
         asset1: &protocol::Asset,
         asset2: &protocol::Asset,
-    ) -> Option<protocol::STLedgerEntry> {
+    ) -> Result<Option<protocol::STLedgerEntry>, Ter> {
         self.view
             .peek(protocol::keylet::amm(*asset1, *asset2))
-            .ok()
-            .flatten()
-            .map(|sle| (*sle).clone())
+            .map(|entry| entry.map(|sle| (*sle).clone()))
+            .map_err(|_| Ter::TEF_BAD_LEDGER)
     }
     fn delete_amm_entry(&mut self, sle: protocol::STLedgerEntry) -> Ter {
         let amm_account = sle.get_account_id(sf("sfAccount"));
@@ -1609,12 +1248,12 @@ impl<'a, V: ApplyView> AMMDeleteApplySink for ViewBackedAMMDeleteSink<'a, V> {
         match ledger::dir_remove(self.view, &owner_dir, owner_node, *sle.key(), false) {
             Ok(true) => {}
             Ok(false) => return Ter::TEC_INTERNAL,
-            Err(_) => return Ter::TEC_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         }
         self.view
             .erase(Arc::new(sle))
             .map(|_| Ter::TES_SUCCESS)
-            .unwrap_or(Ter::TEC_INTERNAL)
+            .unwrap_or(Ter::TEF_BAD_LEDGER)
     }
     fn delete_amm_account(&mut self, amm_account: &protocol::AccountID) -> Ter {
         let cleanup = delete_empty_amm_owner_entries(self.view, amm_account);
@@ -1622,13 +1261,15 @@ impl<'a, V: ApplyView> AMMDeleteApplySink for ViewBackedAMMDeleteSink<'a, V> {
             return cleanup;
         }
         let account_keylet = protocol::account_keylet(to_160(amm_account));
-        let Some(account) = self.view.peek(account_keylet).ok().flatten() else {
-            return Ter::TEC_INTERNAL;
+        let account = match self.view.peek(account_keylet) {
+            Ok(Some(account)) => account,
+            Ok(None) => return Ter::TEC_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         self.view
             .erase(account)
             .map(|_| Ter::TES_SUCCESS)
-            .unwrap_or(Ter::TEC_INTERNAL)
+            .unwrap_or(Ter::TEF_BAD_LEDGER)
     }
 }
 
@@ -1653,5 +1294,41 @@ impl<'a, V: ApplyView> ClawbackApplySink for ViewBackedClawbackSink<'a, V> {
         _amount: &protocol::STAmount,
     ) -> Ter {
         Ter::TES_SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::{nft_repair_result_to_ter, require_amm_owner_child};
+    use protocol::Ter;
+
+    #[test]
+    fn ledger_state_fix_distinguishes_no_repair_from_storage_failure() {
+        assert_eq!(nft_repair_result_to_ter(Ok(true)), Ter::TES_SUCCESS);
+        assert_eq!(
+            nft_repair_result_to_ter(Ok(false)),
+            Ter::TEC_FAILED_PROCESSING
+        );
+        assert_eq!(
+            nft_repair_result_to_ter(Err(ledger::ViewError::Conversion(
+                "injected NFTokenPage read failure".into(),
+            ))),
+            Ter::TEF_BAD_LEDGER
+        );
+    }
+
+    #[test]
+    fn amm_cleanup_missing_or_faulting_directory_child_is_bad_ledger() {
+        assert_eq!(
+            require_amm_owner_child(Ok(None)).expect_err("missing indexed child must fail hard"),
+            Ter::TEF_BAD_LEDGER
+        );
+        assert_eq!(
+            require_amm_owner_child(Err(ledger::ViewError::Conversion(
+                "fault-injected AMM child read".into(),
+            )))
+            .expect_err("storage failure must fail hard"),
+            Ter::TEF_BAD_LEDGER
+        );
     }
 }

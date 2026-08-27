@@ -211,17 +211,19 @@ pub use feature::{
     FEATURE_LENDING_PROTOCOL_V1_1_NAME, FEATURE_SINGLE_ASSET_VAULT_NAME, FEATURE_SPONSOR_NAME,
     FEATURE_TOKEN_ESCROW_NAME, FEATURE_UNIVERSAL_NUMBER_NAME, FEATURE_XCHAIN_BRIDGE_NAME,
     FEATURE_XRP_FEES_NAME, FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME, FIX_BATCH_INNER_SIGS_NAME,
-    FIX_CLEANUP_3_2_0_NAME, FIX_CLEANUP_3_3_0_NAME, FIX_INNER_OBJ_TEMPLATE_NAME,
-    FIX_INNER_OBJ_TEMPLATE2_NAME, FIX_MPT_DELIVERED_AMOUNT_NAME, FIX_PREVIOUS_TXN_ID_NAME,
-    FeatureSet, REGISTERED_FEATURES, RegisteredFeature, RegisteredFeatureVote, feature_amm,
-    feature_batch, feature_batch_v1_1, feature_clawback, feature_confidential_transfer,
-    feature_deep_freeze, feature_id, feature_lending_protocol, feature_lending_protocol_v1_1,
-    feature_mp_tokens_v1, feature_name, feature_nftoken_mint_offer, feature_permissioned_domains,
-    feature_single_asset_vault, feature_sponsor, feature_token_escrow, feature_universal_number,
-    feature_xchain_bridge, feature_xrp_fees, fix_ammv1_1, fix_ammv1_3, fix_batch_inner_sigs,
-    fix_cleanup_3_1_3, fix_cleanup_3_2_0, fix_cleanup_3_3_0, fix_enforce_nftoken_trustline_v2,
-    fix_inner_obj_template, fix_inner_obj_template2, fix_mpt_delivered_amount,
-    fix_nftoken_page_links, fix_previous_txn_id, fix_token_escrow_v1, registered_feature,
+    FIX_CLEANUP_3_2_0_NAME, FIX_CLEANUP_3_3_0_NAME, FIX_CLEANUP_3_4_0_NAME,
+    FIX_INNER_OBJ_TEMPLATE_NAME, FIX_INNER_OBJ_TEMPLATE2_NAME, FIX_MPT_DELIVERED_AMOUNT_NAME,
+    FIX_PREVIOUS_TXN_ID_NAME, FeatureSet, REGISTERED_FEATURES, RegisteredFeature,
+    RegisteredFeatureVote, feature_amm, feature_batch, feature_batch_v1_1, feature_clawback,
+    feature_confidential_transfer, feature_deep_freeze, feature_id, feature_lending_protocol,
+    feature_lending_protocol_v1_1, feature_mp_tokens_v1, feature_name, feature_nftoken_mint_offer,
+    feature_permissioned_domains, feature_single_asset_vault, feature_sponsor,
+    feature_token_escrow, feature_universal_number, feature_xchain_bridge, feature_xrp_fees,
+    fix_ammv1_1, fix_ammv1_3, fix_batch_inner_sigs, fix_cleanup_3_1_3, fix_cleanup_3_2_0,
+    fix_cleanup_3_3_0, fix_cleanup_3_4_0, fix_enforce_nftoken_trustline_v2, fix_inner_obj_template,
+    fix_inner_obj_template2, fix_mpt_delivered_amount, fix_nftoken_page_links, fix_previous_txn_id,
+    fix_token_escrow_v1, registered_feature, registered_feature_supported,
+    registered_feature_supported_with_confidential_crypto,
 };
 pub use fees::{calculate_base_fee, calculate_reserve};
 pub use genesis_identity::{
@@ -465,7 +467,7 @@ pub use tx_flags::*;
 pub use tx_formats::{TxFormatMetadata, TxFormats};
 pub use tx_meta::TxMeta;
 pub use tx_searched::TxSearched;
-pub use tx_type::TxType;
+pub use tx_type::{TxType, dispatchable_tx_types};
 pub use units::{
     Bips, Bips16, Bips32, FeeLevel, FeeLevel64, FeeLevelDouble, TenthBips, TenthBips16,
     TenthBips32, ValueUnit, scalar, unit,

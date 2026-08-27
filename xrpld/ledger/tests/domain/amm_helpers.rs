@@ -2,9 +2,9 @@ use basics::base_uint::Uint192;
 use basics::number::{NumberParts as RuntimeNumber, current_number_one};
 use ledger::{
     IsDeposit, adjust_amounts_by_lp_tokens, adjust_asset_in_by_tokens, adjust_asset_out_by_tokens,
-    adjust_frac_by_tokens, adjust_lp_tokens, amm_asset_out, amm_lp_tokens, get_rounded_asset,
-    get_rounded_lp_tokens, solve_quadratic_eq_smallest, within_relative_distance_amount,
-    within_relative_distance_quality,
+    adjust_frac_by_tokens, adjust_lp_tokens, amm_asset_out, amm_lp_tokens,
+    check_amm_precision_loss, get_rounded_asset, get_rounded_lp_tokens,
+    solve_quadratic_eq_smallest, within_relative_distance_amount, within_relative_distance_quality,
 };
 use protocol::{
     Asset, CurrentTransactionRulesGuard, IOUAmount, Issue, MPTAmount, MPTIssue, Quality, Rules,
@@ -34,6 +34,33 @@ fn large_rules(enable_fix_ammv1_1: bool, enable_fix_ammv1_3: bool) -> Rules {
 fn solve_quadratic_eq_smallest_returns_none_for_negative_discriminant() {
     let one = current_number_one();
     assert_eq!(solve_quadratic_eq_smallest(one, one, one), None);
+}
+
+#[test]
+fn amm_precision_loss_uses_rippled_strong_check_and_relative_tolerance() {
+    let pool1 = STAmount::from_xrp_amount(XRPAmount::from_drops(100));
+    let pool2 = STAmount::from_xrp_amount(XRPAmount::from_drops(100));
+    let lpt_issue = sample_issue("LPT", 0x62);
+    let lp = |mantissa, exponent| {
+        STAmount::from_iou_amount(
+            sf_generic(),
+            IOUAmount::from_parts(mantissa, exponent).expect("LP amount"),
+            lpt_issue,
+        )
+    };
+
+    assert_eq!(
+        check_amm_precision_loss(&pool1, &pool2, &lp(99, 0)),
+        protocol::Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        check_amm_precision_loss(&pool1, &pool2, &lp(1_000_000_000_005_000, -13),),
+        protocol::Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        check_amm_precision_loss(&pool1, &pool2, &lp(1_000_000_000_200_000, -13),),
+        protocol::Ter::TEC_PRECISION_LOSS
+    );
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //!
 //! This ports the exact current deterministic wrapper behavior for:
 //!
-//! - the no-op `preflight(...)`,
+//! - amendment-gated malformed CheckID preflight,
 //! - the `preclaim(...)` existence plus permission checks,
 //! - and the full `doApply()` lookup, directory-remove, owner-count, and erase
 //!   ordering.
@@ -26,8 +26,12 @@ pub trait CheckCancelApplySink {
     fn erase_check(&mut self);
 }
 
-pub fn run_check_cancel_preflight() -> NotTec {
-    Ter::TES_SUCCESS
+pub fn run_check_cancel_preflight(fix_cleanup_3_3_0: bool, check_id_is_zero: bool) -> NotTec {
+    if fix_cleanup_3_3_0 && check_id_is_zero {
+        Ter::TEM_MALFORMED
+    } else {
+        Ter::TES_SUCCESS
+    }
 }
 
 pub fn run_check_cancel_preclaim(facts: CheckCancelPreclaimFacts) -> Ter {
@@ -130,8 +134,10 @@ mod tests {
     }
 
     #[test]
-    fn check_cancel_preflight_is_noop() {
-        assert_eq!(run_check_cancel_preflight(), Ter::TES_SUCCESS);
+    fn check_cancel_preflight_rejects_zero_id_only_after_cleanup_fix() {
+        assert_eq!(run_check_cancel_preflight(false, true), Ter::TES_SUCCESS);
+        assert_eq!(run_check_cancel_preflight(true, false), Ter::TES_SUCCESS);
+        assert_eq!(run_check_cancel_preflight(true, true), Ter::TEM_MALFORMED);
     }
 
     #[test]

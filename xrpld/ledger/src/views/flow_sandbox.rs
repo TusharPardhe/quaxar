@@ -71,6 +71,11 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         self.items.len()
     }
 
+    /// XRP destruction accumulated by this uncommitted transaction view.
+    pub fn drops_destroyed(&self) -> XRPAmount {
+        self.drops_destroyed
+    }
+
     pub fn items(&self) -> &BTreeMap<Uint256, Entry> {
         &self.items
     }

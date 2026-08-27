@@ -525,13 +525,7 @@ pub fn unlock_escrow_mpt(
                 },
                 |sponsor| sponsor.get_field_amount(sf("sfBalance")).xrp().drops(),
             );
-            let reserve_count = crate::reserve_owner_count(reserve_bearer, 1);
-            let account_count = crate::reserve_account_count(reserve_bearer, 0);
-            if balance
-                < view.fees().account_reserve_with_account_count(
-                    reserve_count as usize,
-                    account_count as usize,
-                ) as i64
+            if balance < crate::effective_account_reserve(view.fees(), reserve_bearer, 1, 0) as i64
             {
                 return Ok(Ter::TEC_INSUFFICIENT_RESERVE);
             }

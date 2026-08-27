@@ -34,8 +34,10 @@ fn update_trust_line<V: ApplyView>(
 
     let sender_keylet =
         protocol::account_keylet(basics::base_uint::Uint160::from_void(sender.data()));
-    let Some(sle) = view.peek(sender_keylet).ok().flatten() else {
-        return Err(Ter::TEF_BAD_LEDGER);
+    let sle = match view.peek(sender_keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Err(Ter::TEF_INTERNAL),
+        Err(_) => return Err(Ter::TEF_BAD_LEDGER),
     };
 
     // Determine which side's flags to check based on sender position
@@ -115,7 +117,11 @@ fn update_trust_line<V: ApplyView>(
     Ok((false, None))
 }
 
-fn adjust_owner_count<V: ApplyView>(view: &mut V, account_sle: &STLedgerEntry, adjustment: i32) {
+fn adjust_owner_count<V: ApplyView>(
+    view: &mut V,
+    account_sle: &STLedgerEntry,
+    adjustment: i32,
+) -> Result<(), Ter> {
     let current = account_sle.get_field_u32(sf("sfOwnerCount"));
     let new_count = if adjustment > 0 {
         current.saturating_add(adjustment as u32)
@@ -124,10 +130,11 @@ fn adjust_owner_count<V: ApplyView>(view: &mut V, account_sle: &STLedgerEntry, a
     };
     let mut obj = account_sle.clone_as_object();
     obj.set_field_u32(sf("sfOwnerCount"), new_count);
-    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+    view.update(Arc::new(STLedgerEntry::from_stobject(
         obj,
         *account_sle.key(),
-    )));
+    )))
+    .map_err(|_| Ter::TEF_BAD_LEDGER)
 }
 
 fn trust_delete<V: ApplyView>(
@@ -145,14 +152,20 @@ fn trust_delete<V: ApplyView>(
     let low_node = state.get_field_u64(sf("sfLowNode"));
     let low_dir =
         protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(low_account.data()));
-    if !crate::dir_remove(view, &low_dir, low_node, line_key, false).unwrap_or(false) {
+    if !matches!(
+        crate::dir_remove(view, &low_dir, low_node, line_key, false),
+        Ok(true)
+    ) {
         return Ter::TEF_BAD_LEDGER;
     }
 
     let high_node = state.get_field_u64(sf("sfHighNode"));
     let high_dir =
         protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(high_account.data()));
-    if !crate::dir_remove(view, &high_dir, high_node, line_key, false).unwrap_or(false) {
+    if !matches!(
+        crate::dir_remove(view, &high_dir, high_node, line_key, false),
+        Ok(true)
+    ) {
         return Ter::TEF_BAD_LEDGER;
     }
 
@@ -302,13 +315,17 @@ pub fn issue_iou<V: ApplyView>(
 
         let receiver_keylet =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
-        let Some(receiver) = view.peek(receiver_keylet).ok().flatten() else {
-            return Ter::TEF_INTERNAL;
+        let receiver = match view.peek(receiver_keylet) {
+            Ok(Some(receiver)) => receiver,
+            Ok(None) => return Ter::TEF_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let issuer_keylet =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(issue.account.data()));
-        let Some(issuer) = view.peek(issuer_keylet).ok().flatten() else {
-            return Ter::TEF_INTERNAL;
+        let issuer = match view.peek(issuer_keylet) {
+            Ok(Some(issuer)) => issuer,
+            Ok(None) => return Ter::TEF_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
 
         // trustCreate reserves the receiver's side, applies the receiver's
@@ -388,8 +405,13 @@ pub fn issue_iou<V: ApplyView>(
         // Adjust owner count for receiver
         let acct_keylet =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
-        if let Some(acct_sle) = view.peek(acct_keylet).ok().flatten() {
-            adjust_owner_count(view, &acct_sle, 1);
+        let acct_sle = match view.peek(acct_keylet) {
+            Ok(Some(acct_sle)) => acct_sle,
+            Ok(None) => return Ter::TEF_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        if let Err(ter) = adjust_owner_count(view, &acct_sle, 1) {
+            return ter;
         }
 
         Ter::TES_SUCCESS
@@ -491,8 +513,10 @@ pub fn transfer_xrp<V: ApplyView>(
     if !from_is_zero {
         let from_keylet =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(from.data()));
-        let Some(from_sle) = view.peek(from_keylet).ok().flatten() else {
-            return Ter::TER_NO_ACCOUNT;
+        let from_sle = match view.peek(from_keylet) {
+            Ok(Some(sle)) => sle,
+            Ok(None) => return Ter::TER_NO_ACCOUNT,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let from_balance = from_sle.get_field_amount(sf("sfBalance")).xrp().drops();
         // Safety guard: prevent negative balance. Upstream callers should
@@ -500,27 +524,48 @@ pub fn transfer_xrp<V: ApplyView>(
         if from_balance < amount.drops() {
             return Ter::TEC_FAILED_PROCESSING;
         }
+        view.credit_hook_iou(
+            *from,
+            protocol::xrp_account(),
+            STAmount::from_xrp_amount(amount),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(from_balance)),
+        );
         let mut from_obj = from_sle.clone_as_object();
         from_obj.set_field_amount(
             sf("sfBalance"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(from_balance - amount.drops())),
         );
-        let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
-            from_obj,
-            *from_sle.key(),
-        )));
+        if view
+            .update(Arc::new(STLedgerEntry::from_stobject(
+                from_obj,
+                *from_sle.key(),
+            )))
+            .is_err()
+        {
+            return Ter::TEF_BAD_LEDGER;
+        }
     }
 
     // Credit receiver (if not xrpAccount)
     if !to_is_zero {
         let to_keylet = protocol::account_keylet(basics::base_uint::Uint160::from_void(to.data()));
-        let Some(to_sle) = view.peek(to_keylet).ok().flatten() else {
-            return Ter::TER_NO_ACCOUNT;
+        let to_sle = match view.peek(to_keylet) {
+            Ok(Some(sle)) => sle,
+            Ok(None) => return Ter::TER_NO_ACCOUNT,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let to_balance = to_sle.get_field_amount(sf("sfBalance")).xrp().drops();
         let Some(updated_balance) = to_balance.checked_add(amount.drops()) else {
             return Ter::TEC_FAILED_PROCESSING;
         };
+        let mut pre_credit_balance = STAmount::from_xrp_amount(XRPAmount::from_drops(to_balance));
+        pre_credit_balance.negate();
+        view.credit_hook_iou(
+            protocol::xrp_account(),
+            *to,
+            STAmount::from_xrp_amount(amount),
+            pre_credit_balance,
+        );
         let mut to_obj = to_sle.clone_as_object();
         // Flow reverse passes use the virtual XRP issuer as the sender when
         // probing a destination endpoint. rippled's native STAmount addition
@@ -535,10 +580,15 @@ pub fn transfer_xrp<V: ApplyView>(
             STAmount::from_xrp_amount(XRPAmount::from_drops(updated_balance))
         };
         to_obj.set_field_amount(sf("sfBalance"), updated_amount);
-        let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
-            to_obj,
-            *to_sle.key(),
-        )));
+        if view
+            .update(Arc::new(STLedgerEntry::from_stobject(
+                to_obj,
+                *to_sle.key(),
+            )))
+            .is_err()
+        {
+            return Ter::TEF_BAD_LEDGER;
+        }
     }
 
     Ter::TES_SUCCESS
@@ -572,7 +622,7 @@ pub fn account_send<V: ApplyView>(
     }
 
     if let Asset::MPTIssue(issue) = amount.asset() {
-        return account_send_mpt(view, from, to, amount, &issue);
+        return account_send_mpt(view, from, to, amount, &issue, false);
     }
 
     let issue = amount.issue();
@@ -583,7 +633,10 @@ pub fn account_send<V: ApplyView>(
     }
 
     // Sending 3rd party IOUs: transit with transfer fee
-    let rate = transfer_rate(view, &issue.account);
+    let rate = match try_transfer_rate(view, &issue.account) {
+        Ok(rate) => rate,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
     let actual_cost = if rate == 1_000_000_000 {
         amount.clone()
     } else {
@@ -606,6 +659,39 @@ pub fn account_send<V: ApplyView>(
     direct_send_no_fee_iou(view, from, &issue.account, &actual_cost, true)
 }
 
+/// Canonical `accountSend(..., WaiveTransferFee::Yes)`.
+///
+/// AMM and Vault transactors deliberately move the exact requested quantity
+/// between two third-party holders.  They still use the ordinary issuer
+/// transit legs and all of their balance/outstanding checks; only the issuer's
+/// transfer rate is waived.
+pub fn account_send_waive_transfer_fee<V: ApplyView>(
+    view: &mut V,
+    from: &AccountID,
+    to: &AccountID,
+    amount: &STAmount,
+) -> Ter {
+    if amount.signum() <= 0 || *from == *to {
+        return Ter::TES_SUCCESS;
+    }
+    if amount.native() {
+        return transfer_xrp(view, from, to, amount.xrp());
+    }
+    match amount.asset() {
+        Asset::MPTIssue(issue) => account_send_mpt(view, from, to, amount, &issue, true),
+        Asset::Issue(issue) => {
+            if *from == issue.account || *to == issue.account || issue.account.is_zero() {
+                return direct_send_no_fee_iou(view, from, to, amount, false);
+            }
+            let result = direct_send_no_fee_iou(view, &issue.account, to, amount, true);
+            if result != Ter::TES_SUCCESS {
+                return result;
+            }
+            direct_send_no_fee_iou(view, from, &issue.account, amount, true)
+        }
+    }
+}
+
 fn update_mpt_amount<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
@@ -620,8 +706,10 @@ fn update_mpt_amount<V: ApplyView>(
         issue.mpt_id(),
         basics::base_uint::Uint160::from_void(account.data()),
     );
-    let Some(token) = view.peek(token_key).ok().flatten() else {
-        return Ter::TEC_NO_AUTH;
+    let token = match view.peek(token_key) {
+        Ok(Some(token)) => token,
+        Ok(None) => return Ter::TEC_NO_AUTH,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let current = token.get_field_u64(sf("sfMPTAmount"));
     let Some(next) = (if delta.is_negative() {
@@ -648,6 +736,7 @@ fn account_send_mpt<V: ApplyView>(
     to: &AccountID,
     amount: &STAmount,
     issue: &MPTIssue,
+    waive_transfer_fee: bool,
 ) -> Ter {
     let value = amount.mpt().value();
     if value <= 0 || from == to {
@@ -655,9 +744,11 @@ fn account_send_mpt<V: ApplyView>(
     }
 
     let issuer = issue.issuer();
-    let debit_value = if from != &issuer && to != &issuer {
-        let rate = crate::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
-            .unwrap_or(protocol::PARITY_RATE);
+    let debit_value = if from != &issuer && to != &issuer && !waive_transfer_fee {
+        let rate = match crate::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id()) {
+            Ok(rate) => rate,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
         protocol::multiply_round(amount, rate, true).mpt().value()
     } else {
         value
@@ -666,12 +757,10 @@ fn account_send_mpt<V: ApplyView>(
         return Ter::TEC_INTERNAL;
     }
 
-    let Some(issuance) = view
-        .peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
-        .ok()
-        .flatten()
-    else {
-        return Ter::TEC_OBJECT_NOT_FOUND;
+    let issuance = match view.peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id())) {
+        Ok(Some(issuance)) => issuance,
+        Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let amount = value as u64;
     let debit_amount = debit_value as u64;
@@ -698,12 +787,10 @@ fn account_send_mpt<V: ApplyView>(
     }
 
     if to == &issuer {
-        let Some(issuance) = view
-            .peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
-            .ok()
-            .flatten()
-        else {
-            return Ter::TEC_OBJECT_NOT_FOUND;
+        let issuance = match view.peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id())) {
+            Ok(Some(issuance)) => issuance,
+            Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let outstanding = issuance.get_field_u64(sf("sfOutstandingAmount"));
         let Some(next_outstanding) = outstanding.checked_sub(amount) else {
@@ -722,12 +809,10 @@ fn account_send_mpt<V: ApplyView>(
         if fee == 0 {
             return Ter::TES_SUCCESS;
         }
-        let Some(issuance) = view
-            .peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
-            .ok()
-            .flatten()
-        else {
-            return Ter::TEC_OBJECT_NOT_FOUND;
+        let issuance = match view.peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id())) {
+            Ok(Some(issuance)) => issuance,
+            Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let outstanding = issuance.get_field_u64(sf("sfOutstandingAmount"));
         let Some(next_outstanding) = outstanding.checked_sub(fee) else {
@@ -820,17 +905,17 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         // setting to the opposite side.
         let receiver_keylet =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(receiver.data()));
-        let receiver_no_ripple = if let Ok(Some(rcv_sle)) = view.peek(receiver_keylet) {
-            !rcv_sle.is_flag(LSF_DEFAULT_RIPPLE)
-        } else {
-            return Ter::TEF_INTERNAL;
+        let receiver_no_ripple = match view.peek(receiver_keylet) {
+            Ok(Some(rcv_sle)) => !rcv_sle.is_flag(LSF_DEFAULT_RIPPLE),
+            Ok(None) => return Ter::TEF_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let sender_keylet =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(sender.data()));
-        let sender_no_ripple = if let Ok(Some(sender_sle)) = view.peek(sender_keylet) {
-            !sender_sle.is_flag(LSF_DEFAULT_RIPPLE)
-        } else {
-            return Ter::TEF_INTERNAL;
+        let sender_no_ripple = match view.peek(sender_keylet) {
+            Ok(Some(sender_sle)) => !sender_sle.is_flag(LSF_DEFAULT_RIPPLE),
+            Ok(None) => return Ter::TEF_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
 
         // Create the trust line
@@ -904,10 +989,15 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         new_obj.set_field_u64(sf("sfHighNode"), high_node);
 
         // Adjust receiver's owner count
-        if let Ok(Some(rcv_sle)) = view.peek(protocol::account_keylet(
+        let rcv_sle = match view.peek(protocol::account_keylet(
             basics::base_uint::Uint160::from_void(receiver.data()),
         )) {
-            adjust_owner_count(view, &rcv_sle, 1);
+            Ok(Some(rcv_sle)) => rcv_sle,
+            Ok(None) => return Ter::TEF_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        if let Err(ter) = adjust_owner_count(view, &rcv_sle, 1) {
+            return ter;
         }
 
         if view
@@ -946,33 +1036,27 @@ pub fn direct_send_no_fee_iou_pub<V: ApplyView>(
 }
 
 /// Check if a trust line is individually frozen.
-pub fn is_frozen<V: ApplyView>(view: &mut V, account: &AccountID, issue: &Issue) -> bool {
+pub fn try_is_frozen<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    issue: &Issue,
+) -> Result<bool, crate::ViewError> {
     if issue.currency == protocol::xrp_currency() {
-        return false;
+        return Ok(false);
     }
     let issuer_keylet =
         protocol::account_keylet(basics::base_uint::Uint160::from_void(issue.account.data()));
-    if let Some(issuer_sle) = view
-        .peek(issuer_keylet)
-        .ok()
-        .flatten()
-        .or_else(|| view.read(issuer_keylet).ok().flatten())
-    {
+    if let Some(issuer_sle) = view.peek(issuer_keylet)? {
         let issuer_flags = issuer_sle.get_field_u32(sf("sfFlags"));
         // lsfGlobalFreeze = 0x00400000
         if (issuer_flags & 0x0040_0000) != 0 {
-            return true;
+            return Ok(true);
         }
     }
     // Then check individual trust line freeze
     let line_keylet = protocol::line(*account, issue.account, issue.currency);
-    let Some(state) = view
-        .peek(line_keylet)
-        .ok()
-        .flatten()
-        .or_else(|| view.read(line_keylet).ok().flatten())
-    else {
-        return false;
+    let Some(state) = view.peek(line_keylet)? else {
+        return Ok(false);
     };
     let flags = state.get_field_u32(sf("sfFlags"));
     // Only the issuer's side can freeze this holder's funds. A holder setting
@@ -982,80 +1066,79 @@ pub fn is_frozen<V: ApplyView>(view: &mut V, account: &AccountID, issue: &Issue)
     } else {
         LSF_LOW_FREEZE
     };
-    (flags & issuer_freeze) != 0
+    Ok((flags & issuer_freeze) != 0)
 }
 
 /// Get the credit balance on a trust line from account's perspective.
 /// Matches rippled `creditBalance`: `sfBalance` is negated when `account` is
 /// the low side of the canonical trust-line key and returned with `account` as
 /// issuer. Debt and credit-limit calculations depend on this exact orientation.
-pub fn credit_balance<V: ApplyView>(
+pub fn try_credit_balance<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
     issuer: &AccountID,
     currency: Currency,
-) -> STAmount {
+) -> Result<STAmount, crate::ViewError> {
     let line_keylet = protocol::line(*account, *issuer, currency);
-    let Some(state) = view
-        .peek(line_keylet)
-        .ok()
-        .flatten()
-        .or_else(|| view.read(line_keylet).ok().flatten())
-    else {
-        return STAmount::new_with_asset(
+    let Some(state) = view.peek(line_keylet)? else {
+        return Ok(STAmount::new_with_asset(
             sf("sfAmount"),
             Asset::Issue(Issue::new(currency, *account)),
             0,
             0,
             false,
-        );
+        ));
     };
     let mut balance = state.get_field_amount(sf("sfBalance"));
     if *account < *issuer {
         balance.negate();
     }
     balance.set_issuer(*account);
-    balance
+    Ok(balance)
 }
 
 /// Spendable trust-line balance in the issued asset, matching rippled
 /// `accountHolds`/`getTrustLineBalance` without the optional opposite limit.
-pub fn account_holds<V: ApplyView>(
+pub fn try_account_holds<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
     issuer: &AccountID,
     currency: Currency,
-) -> STAmount {
+) -> Result<STAmount, crate::ViewError> {
     let issue = Issue::new(currency, *issuer);
     let line_keylet = protocol::line(*account, *issuer, currency);
-    let Some(state) = view
-        .peek(line_keylet)
-        .ok()
-        .flatten()
-        .or_else(|| view.read(line_keylet).ok().flatten())
-    else {
-        return STAmount::new_with_asset(sf("sfAmount"), Asset::Issue(issue), 0, 0, false);
+    let Some(state) = view.peek(line_keylet)? else {
+        return Ok(STAmount::new_with_asset(
+            sf("sfAmount"),
+            Asset::Issue(issue),
+            0,
+            0,
+            false,
+        ));
     };
     let mut balance = state.get_field_amount(sf("sfBalance"));
     if *account > *issuer {
         balance.negate();
     }
     balance.set_issuer(*issuer);
-    balance
+    Ok(balance)
 }
 
 /// Returns the rate as u32 (1000000000 = no fee, 2000000000 = 100% fee).
-pub fn transfer_rate<V: ApplyView>(view: &mut V, issuer: &AccountID) -> u32 {
+pub fn try_transfer_rate<V: ApplyView>(
+    view: &mut V,
+    issuer: &AccountID,
+) -> Result<u32, crate::ViewError> {
     let acct_keylet =
         protocol::account_keylet(basics::base_uint::Uint160::from_void(issuer.data()));
-    let Some(sle) = view.peek(acct_keylet).ok().flatten() else {
-        return 1_000_000_000; // PARITY_RATE
+    let Some(sle) = view.peek(acct_keylet)? else {
+        return Ok(1_000_000_000); // PARITY_RATE
     };
-    if sle.is_field_present(sf("sfTransferRate")) {
+    Ok(if sle.is_field_present(sf("sfTransferRate")) {
         sle.get_field_u32(sf("sfTransferRate"))
     } else {
         1_000_000_000 // PARITY_RATE (no fee)
-    }
+    })
 }
 
 /// Applies transfer rate when sender and receiver are both non-issuer.
@@ -1074,17 +1157,24 @@ pub fn account_send_with_fee<V: ApplyView>(
     }
 
     if let Asset::MPTIssue(issue) = amount.asset() {
-        return account_send_mpt(view, from, to, amount, &issue);
+        return account_send_mpt(view, from, to, amount, &issue, false);
     }
 
     let issue = amount.issue();
 
     // Exception: issuer is never frozen for their own tokens
-    if *from != issue.account
-        && *to != issue.account
-        && (is_frozen(view, from, &issue) || is_frozen(view, to, &issue))
-    {
-        return Ter::TEC_PATH_DRY;
+    if *from != issue.account && *to != issue.account {
+        let from_frozen = match try_is_frozen(view, from, &issue) {
+            Ok(frozen) => frozen,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        let to_frozen = match try_is_frozen(view, to, &issue) {
+            Ok(frozen) => frozen,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        if from_frozen || to_frozen {
+            return Ter::TEC_PATH_DRY;
+        }
     }
 
     // If sender or receiver is issuer, no transfer fee
@@ -1093,7 +1183,10 @@ pub fn account_send_with_fee<V: ApplyView>(
     }
 
     // Third-party transfer: apply transfer rate
-    let rate = transfer_rate(view, &issue.account);
+    let rate = match try_transfer_rate(view, &issue.account) {
+        Ok(rate) => rate,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
     let actual_cost = if rate == 1_000_000_000 {
         amount.clone()
     } else {
@@ -1116,4 +1209,108 @@ pub fn account_send_with_fee<V: ApplyView>(
 
     // Redeem from sender (amount + fee)
     redeem_iou(view, from, &actual_cost, &issue)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use basics::base_uint::Uint256;
+    use protocol::{
+        AccountID, ApplyFlags, Currency, Issue, Keylet, MPTAmount, MPTIssue, Rules, STAmount,
+        make_mpt_id, sf_generic,
+    };
+
+    use crate::{ApplyViewImpl, Fees, Ledger, LedgerHeader, ReadView, ReadViewTx, ViewError};
+
+    use super::{try_account_holds, try_credit_balance, try_is_frozen, try_transfer_rate};
+
+    /// A base view whose state reads fail like a corrupt/unavailable SHAMap
+    /// node. `ApplyViewImpl::peek` must preserve this error rather than turn it
+    /// into the canonical `None` (object absent) case.
+    #[derive(Debug)]
+    struct FaultingReadView {
+        base: Ledger,
+    }
+
+    impl ReadView for FaultingReadView {
+        fn open(&self) -> bool {
+            false
+        }
+
+        fn header(&self) -> LedgerHeader {
+            ReadView::header(&self.base)
+        }
+
+        fn fees(&self) -> Fees {
+            ReadView::fees(&self.base)
+        }
+
+        fn rules(&self) -> Rules {
+            ReadView::rules(&self.base)
+        }
+
+        fn exists(&self, _keylet: Keylet) -> Result<bool, ViewError> {
+            Err(ViewError::Conversion("injected state read failure".into()))
+        }
+
+        fn succ(
+            &self,
+            _key: Uint256,
+            _last: Option<Uint256>,
+        ) -> Result<Option<Uint256>, ViewError> {
+            Err(ViewError::Conversion("injected state read failure".into()))
+        }
+
+        fn read(&self, _keylet: Keylet) -> Result<Option<Arc<protocol::STLedgerEntry>>, ViewError> {
+            Err(ViewError::Conversion("injected state read failure".into()))
+        }
+
+        fn sles(&self) -> Result<Vec<Arc<protocol::STLedgerEntry>>, ViewError> {
+            Err(ViewError::Conversion("injected state read failure".into()))
+        }
+
+        fn tx_exists(&self, key: Uint256) -> Result<bool, ViewError> {
+            ReadView::tx_exists(&self.base, key)
+        }
+
+        fn tx_read(&self, key: Uint256) -> Result<Option<ReadViewTx>, ViewError> {
+            ReadView::tx_read(&self.base, key)
+        }
+
+        fn txs(&self) -> Result<Vec<ReadViewTx>, ViewError> {
+            ReadView::txs(&self.base)
+        }
+    }
+
+    #[test]
+    fn balance_freeze_and_rate_queries_propagate_storage_failures() {
+        let base = Arc::new(FaultingReadView {
+            base: Ledger::from_ledger_seq_and_close_time(1, 1, false),
+        });
+        let mut view = ApplyViewImpl::new(Arc::clone(&base), ApplyFlags::NONE);
+        let account = AccountID::from([0x11; 20]);
+        let issuer = AccountID::from([0x22; 20]);
+        let currency = Currency::from([0x33; 20]);
+        let issue = Issue::new(currency, issuer);
+
+        assert!(try_is_frozen(&mut view, &account, &issue).is_err());
+        assert!(try_credit_balance(&mut view, &account, &issuer, currency).is_err());
+        assert!(try_account_holds(&mut view, &account, &issuer, currency).is_err());
+        assert!(try_transfer_rate(&mut view, &issuer).is_err());
+        assert!(crate::pseudo_account_address(base.as_ref(), Uint256::from_u64(99)).is_err());
+
+        let mpt_issue = MPTIssue::new(make_mpt_id(1, issuer));
+        let mpt_amount =
+            STAmount::from_mpt_amount(sf_generic(), MPTAmount::from_value(1), mpt_issue);
+        assert_eq!(
+            super::account_send_with_fee(
+                &mut view,
+                &account,
+                &AccountID::from([0x44; 20]),
+                &mpt_amount
+            ),
+            protocol::Ter::TEF_BAD_LEDGER
+        );
+    }
 }

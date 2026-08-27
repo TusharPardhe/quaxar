@@ -19,6 +19,7 @@ pub const MAX_PATH_LENGTH: usize = 8;
 pub const TF_PARTIAL_PAYMENT: u32 = 0x0002_0000;
 pub const TF_LIMIT_QUALITY: u32 = 0x0004_0000;
 pub const TF_NO_DIRECT_RIPPLE: u32 = 0x0001_0000;
+pub const TF_SPONSOR_CREATED_ACCOUNT: u32 = 0x0008_0000;
 
 pub const PAYMENT_MPT_V1_FLAGS_MASK: u32 =
     !(FULLY_CANONICAL_SIGNATURE_FLAG | INNER_BATCH_TRANSACTION_FLAG | TF_PARTIAL_PAYMENT);
@@ -26,7 +27,8 @@ pub const PAYMENT_FLAGS_MASK: u32 = !(FULLY_CANONICAL_SIGNATURE_FLAG
     | INNER_BATCH_TRANSACTION_FLAG
     | TF_PARTIAL_PAYMENT
     | TF_LIMIT_QUALITY
-    | TF_NO_DIRECT_RIPPLE);
+    | TF_NO_DIRECT_RIPPLE
+    | TF_SPONSOR_CREATED_ACCOUNT);
 
 pub const fn run_payment_check_extra_features(
     credential_ids_present: bool,
@@ -360,6 +362,7 @@ pub struct PaymentPreclaimFacts {
     pub send_max_present: bool,
     pub dst_amount_native: bool,
     pub destination_exists: bool,
+    pub sponsor_created_account: bool,
     pub view_open: bool,
     pub destination_requires_tag: bool,
     pub destination_tag_present: bool,
@@ -382,6 +385,7 @@ impl PaymentPreclaimFacts {
             send_max_present: false,
             dst_amount_native: true,
             destination_exists: true,
+            sponsor_created_account: false,
             view_open: false,
             destination_requires_tag: false,
             destination_tag_present: false,
@@ -413,8 +417,13 @@ pub fn run_payment_preclaim_with_facts(facts: PaymentPreclaimFacts) -> Ter {
         if !facts.destination_can_create_with_amount {
             return Ter::TEC_NO_DST_INSUF_XRP;
         }
-    } else if facts.destination_requires_tag && !facts.destination_tag_present {
-        return Ter::TEC_DST_TAG_NEEDED;
+    } else {
+        if facts.sponsor_created_account {
+            return Ter::TEC_NO_SPONSOR_PERMISSION;
+        }
+        if facts.destination_requires_tag && !facts.destination_tag_present {
+            return Ter::TEC_DST_TAG_NEEDED;
+        }
     }
 
     if facts.has_paths || facts.send_max_present || !facts.dst_amount_native {
@@ -463,33 +472,21 @@ pub fn run_payment_preclaim_with_read_view(
         .is_field_present(domain_id_field)
         .then(|| tx.get_field_h256(domain_id_field));
 
-    let credentials_valid_result = ledger::credential_helpers::valid(view, tx, &account)?;
-    let (source_in_domain, destination_in_domain) = match domain_id {
-        Some(domain_id) => (
-            is_tes_success(ledger::credential_helpers::valid_domain(
-                view, domain_id, &account,
-            )?),
-            is_tes_success(ledger::credential_helpers::valid_domain(
-                view,
-                domain_id,
-                &destination,
-            )?),
-        ),
-        None => (true, true),
-    };
-
+    let sponsor_created_account = tx.get_flags() & protocol::tfSponsorCreatedAccount != 0;
     let destination_can_create_with_amount = amount.native()
-        && amount.xrp().drops() >= i64::try_from(view.fees().reserve).unwrap_or(i64::MAX);
+        && (sponsor_created_account
+            || amount.xrp().drops() >= i64::try_from(view.fees().reserve).unwrap_or(i64::MAX));
     let destination_requires_tag = destination_sle
         .as_ref()
         .is_some_and(|sle| sle.is_flag(lsfRequireDestTag));
 
-    Ok(run_payment_preclaim_with_facts(PaymentPreclaimFacts {
+    let early = run_payment_preclaim_with_facts(PaymentPreclaimFacts {
         tx_flags: tx.get_flags(),
         has_paths: paths.is_some(),
         send_max_present: tx.is_field_present(send_max_field),
         dst_amount_native: amount.native(),
         destination_exists: destination_sle.is_some(),
+        sponsor_created_account,
         view_open: view.open(),
         destination_requires_tag,
         destination_tag_present: tx.is_field_present(destination_tag_field),
@@ -498,13 +495,36 @@ pub fn run_payment_preclaim_with_read_view(
         path_has_too_long_segment: paths
             .as_ref()
             .is_some_and(|paths| paths.iter().any(|path| path.size() > MAX_PATH_LENGTH)),
-        credentials_valid_result,
-        domain_id_present: domain_id.is_some(),
-        source_in_domain,
-        destination_in_domain,
+        credentials_valid_result: Ter::TES_SUCCESS,
+        domain_id_present: false,
+        source_in_domain: true,
+        destination_in_domain: true,
         is_batch_inner: tx.is_flag(tfInnerBatchTxn),
         batch_v1_1_enabled: view.rules().enabled(&protocol::feature_id("BatchV1_1")),
-    }))
+    });
+    if !is_tes_success(early) {
+        return Ok(early);
+    }
+
+    let credentials_valid_result = ledger::credential_helpers::valid(view, tx, &account)?;
+    if !is_tes_success(credentials_valid_result) {
+        return Ok(credentials_valid_result);
+    }
+    if let Some(domain_id) = domain_id {
+        if !is_tes_success(ledger::credential_helpers::valid_domain(
+            view, domain_id, &account,
+        )?) {
+            return Ok(Ter::TEC_NO_PERMISSION);
+        }
+        if !is_tes_success(ledger::credential_helpers::valid_domain(
+            view,
+            domain_id,
+            &destination,
+        )?) {
+            return Ok(Ter::TEC_NO_PERMISSION);
+        }
+    }
+    Ok(Ter::TES_SUCCESS)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

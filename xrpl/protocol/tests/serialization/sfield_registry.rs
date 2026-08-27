@@ -118,3 +118,20 @@ fn protocol_sotemplate_indexes_runtime_registered_fields_by_field_num() {
         1
     );
 }
+
+#[test]
+fn pinned_sponsorship_sfield_wire_codes_are_exact() {
+    for (symbol, ty, value) in [
+        ("sfObjectID", SerializedTypeId::UInt256, 41),
+        ("sfBlindingFactor", SerializedTypeId::UInt256, 40),
+        ("sfRemainingOwnerCountDelta", SerializedTypeId::Int32, 2),
+        ("sfFeeAmountDelta", SerializedTypeId::Amount, 34),
+        ("sfContractResult", SerializedTypeId::UInt8, 21),
+        ("sfSigningAccounts", SerializedTypeId::Array, 2),
+    ] {
+        let field = get_field_by_symbol(symbol);
+        assert_eq!(field.field_type(), ty, "{symbol} type");
+        assert_eq!(field.field_value(), value, "{symbol} field number");
+        assert_eq!(field.code(), field_code(ty, value), "{symbol} wire code");
+    }
+}

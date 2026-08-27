@@ -56,7 +56,13 @@ pub trait ApplyView: ReadView + RawView {
     }
 
     /// Hook called when owner count changes (overridden by PaymentSandbox).
-    fn adjust_owner_count_hook(&mut self, _account: AccountID, _cur: u32, _next: u32) {}
+    fn adjust_owner_count_hook(
+        &mut self,
+        _account: AccountID,
+        _cur: crate::OwnerCounts,
+        _next: crate::OwnerCounts,
+    ) {
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +181,11 @@ where
         self.base.balance_hook_self_issue_mpt(issue, amount)
     }
 
-    fn owner_count_hook(&self, account: AccountID, count: u32) -> u32 {
+    fn owner_count_hook(
+        &self,
+        account: AccountID,
+        count: crate::OwnerCounts,
+    ) -> crate::OwnerCounts {
         self.base.owner_count_hook(account, count)
     }
 }
@@ -277,10 +287,15 @@ pub fn adjust_owner_count(
     let current = sle.get_field_u32(protocol::get_field_by_symbol("sfOwnerCount"));
     let account = sle.get_account_id(protocol::get_field_by_symbol("sfAccount"));
     let adjusted = confine_owner_count(current, amount);
-    view.adjust_owner_count_hook(account, current, adjusted);
     let mut updated = sle.clone_as_object();
     updated.set_field_u32(protocol::get_field_by_symbol("sfOwnerCount"), adjusted);
-    view.update(Arc::new(STLedgerEntry::from_stobject(updated, *sle.key())))
+    let updated = Arc::new(STLedgerEntry::from_stobject(updated, *sle.key()));
+    view.adjust_owner_count_hook(
+        account,
+        crate::OwnerCounts::from_sle(sle),
+        crate::OwnerCounts::from_sle(&updated),
+    );
+    view.update(updated)
 }
 
 pub fn is_global_frozen(view: &dyn ReadView, issuer: &AccountID) -> Result<bool, ViewError> {
@@ -306,10 +321,25 @@ pub fn xrp_liquid(
     let Some(sle) = view.read(account_keylet)? else {
         return Ok(XRPAmount::new());
     };
-    let balance = sle.get_field_amount(protocol::get_field_by_symbol("sfBalance"));
-    let owner_count = sle.get_field_u32(protocol::get_field_by_symbol("sfOwnerCount"));
-    let adjusted_count = confine_owner_count(owner_count, owner_count_adj);
-    let reserve = view.fees().account_reserve(adjusted_count as usize) as i64;
+    let balance = view.balance_hook_iou(
+        *id,
+        protocol::xrp_account(),
+        sle.get_field_amount(protocol::get_field_by_symbol("sfBalance")),
+    );
+    let reserve = if crate::is_pseudo_account(&sle) {
+        0
+    } else {
+        let owner_count = view
+            .owner_count_hook(*id, crate::OwnerCounts::from_sle(&sle))
+            .count();
+        crate::effective_account_reserve_with_owner_count(
+            view.fees(),
+            &sle,
+            owner_count,
+            owner_count_adj,
+            0,
+        ) as i64
+    };
     let liquid = balance.xrp().drops() - reserve;
     Ok(if liquid < 0 {
         XRPAmount::new()

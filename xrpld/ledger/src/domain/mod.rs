@@ -5,7 +5,6 @@ pub mod account_state_sf;
 pub mod amendment_table;
 pub mod amm_helpers;
 pub mod amm_utils;
-pub mod book_dirs;
 pub mod book_listeners;
 pub mod book_tip;
 pub mod canonical_tx_set;

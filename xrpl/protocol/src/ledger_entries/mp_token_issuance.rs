@@ -140,18 +140,18 @@ impl MPTokenIssuance {
             .is_field_present(crate::get_field_by_symbol("sfDomainID"))
     }
 
-    pub fn get_mutable_flags(&self) -> Option<u32> {
-        self.has_mutable_flags().then(|| {
+    pub fn get_immutable_flags(&self) -> Option<u32> {
+        self.has_immutable_flags().then(|| {
             self.base
                 .as_st_ledger_entry()
-                .get_field_u32(crate::get_field_by_symbol("sfMutableFlags"))
+                .get_field_u32(crate::get_field_by_symbol("sfImmutableFlags"))
         })
     }
 
-    pub fn has_mutable_flags(&self) -> bool {
+    pub fn has_immutable_flags(&self) -> bool {
         self.base
             .as_st_ledger_entry()
-            .is_field_present(crate::get_field_by_symbol("sfMutableFlags"))
+            .is_field_present(crate::get_field_by_symbol("sfImmutableFlags"))
     }
 
     pub fn get_reference_holding(&self) -> Option<basics::base_uint::Uint256> {
@@ -308,10 +308,10 @@ impl MPTokenIssuanceBuilder {
         self
     }
 
-    pub fn set_mutable_flags(mut self, value: u32) -> Self {
+    pub fn set_immutable_flags(mut self, value: u32) -> Self {
         self.base
             .object_mut()
-            .set_field_u32(crate::get_field_by_symbol("sfMutableFlags"), value);
+            .set_field_u32(crate::get_field_by_symbol("sfImmutableFlags"), value);
         self
     }
 

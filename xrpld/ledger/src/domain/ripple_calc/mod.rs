@@ -101,10 +101,10 @@ fn handle_xrp_to_xrp_flow<V: ApplyView>(
                     src_balance - actual_deliver,
                 )),
             );
-            let _ = view.update(Arc::new(protocol::STLedgerEntry::from_stobject(
+            view.update(Arc::new(protocol::STLedgerEntry::from_stobject(
                 src_obj,
                 *src_sle.key(),
-            )));
+            )))?;
 
             let dst_keylet = protocol::account_keylet(account_to_uint160(dst_account));
             if let Some(dst_sle) = view.peek(dst_keylet)? {
@@ -116,10 +116,10 @@ fn handle_xrp_to_xrp_flow<V: ApplyView>(
                         dst_balance + actual_deliver,
                     )),
                 );
-                let _ = view.update(Arc::new(protocol::STLedgerEntry::from_stobject(
+                view.update(Arc::new(protocol::STLedgerEntry::from_stobject(
                     dst_obj,
                     *dst_sle.key(),
-                )));
+                )))?;
             }
 
             return Ok(RippleCalcOutput {
@@ -145,10 +145,10 @@ fn handle_xrp_to_xrp_flow<V: ApplyView>(
         sf("sfBalance"),
         STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(src_balance - deliver_drops)),
     );
-    let _ = view.update(Arc::new(protocol::STLedgerEntry::from_stobject(
+    view.update(Arc::new(protocol::STLedgerEntry::from_stobject(
         src_obj,
         *src_sle.key(),
-    )));
+    )))?;
 
     let dst_keylet = protocol::account_keylet(account_to_uint160(dst_account));
     if let Some(dst_sle) = view.peek(dst_keylet)? {
@@ -158,10 +158,10 @@ fn handle_xrp_to_xrp_flow<V: ApplyView>(
             sf("sfBalance"),
             STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(dst_balance + deliver_drops)),
         );
-        let _ = view.update(Arc::new(protocol::STLedgerEntry::from_stobject(
+        view.update(Arc::new(protocol::STLedgerEntry::from_stobject(
             dst_obj,
             *dst_sle.key(),
-        )));
+        )))?;
     }
 
     Ok(RippleCalcOutput {
@@ -241,8 +241,8 @@ fn ripple_calculate_inner<V: ApplyView>(
     paths: &STPathSet,
     input: &RippleCalcInput,
 ) -> Result<RippleCalcOutput, ViewError> {
-    if frozen_iou_endpoint(view, dst_amount, src_account, dst_account)
-        || frozen_iou_endpoint(view, max_source_amount, src_account, dst_account)
+    if frozen_iou_endpoint(view, dst_amount, src_account, dst_account)?
+        || frozen_iou_endpoint(view, max_source_amount, src_account, dst_account)?
     {
         return Ok(RippleCalcOutput {
             result: Ter::TEC_PATH_DRY,
@@ -339,17 +339,19 @@ fn frozen_iou_endpoint<V: ApplyView>(
     amount: &STAmount,
     src_account: &AccountID,
     dst_account: &AccountID,
-) -> bool {
+) -> Result<bool, ViewError> {
     let Asset::Issue(issue) = amount.asset() else {
-        return false;
+        return Ok(false);
     };
 
     if amount.native() || *src_account == issue.account || *dst_account == issue.account {
-        return false;
+        return Ok(false);
     }
 
-    crate::domain::ripple_state_helpers::is_frozen(view, src_account, &issue)
-        || crate::domain::ripple_state_helpers::is_frozen(view, dst_account, &issue)
+    Ok(
+        crate::domain::ripple_state_helpers::try_is_frozen(view, src_account, &issue)?
+            || crate::domain::ripple_state_helpers::try_is_frozen(view, dst_account, &issue)?,
+    )
 }
 
 #[allow(dead_code)]
@@ -366,8 +368,8 @@ fn try_default_path<V: ApplyView>(
         let issue = dst_amount.issue();
         if *src_account != issue.account
             && *dst_account != issue.account
-            && (crate::domain::ripple_state_helpers::is_frozen(view, src_account, &issue)
-                || crate::domain::ripple_state_helpers::is_frozen(view, dst_account, &issue))
+            && (crate::domain::ripple_state_helpers::try_is_frozen(view, src_account, &issue)?
+                || crate::domain::ripple_state_helpers::try_is_frozen(view, dst_account, &issue)?)
         {
             return Ok(Some(RippleCalcOutput {
                 result: Ter::TEC_PATH_DRY,
@@ -458,14 +460,21 @@ fn try_default_path<V: ApplyView>(
                 );
                 let actual_out = actual_in.divide(&rate_amount, dst_amount.asset());
                 // Two-hop: sender→issuer→receiver
-                apply_direct_iou_transfer(
+                let transfer = apply_direct_iou_transfer(
                     view,
                     src_account,
                     dst_account,
                     &actual_out,
                     &issuer,
                     currency,
-                )?;
+                );
+                if transfer != Ter::TES_SUCCESS {
+                    return Ok(Some(failed_ripple_calc_output(
+                        transfer,
+                        max_source_amount,
+                        dst_amount,
+                    )));
+                }
                 return Ok(Some(RippleCalcOutput {
                     result: Ter::TES_SUCCESS,
                     actual_amount_in: actual_in,
@@ -476,14 +485,21 @@ fn try_default_path<V: ApplyView>(
         }
 
         // Two-hop transfer through issuer
-        apply_direct_iou_transfer(
+        let transfer = apply_direct_iou_transfer(
             view,
             src_account,
             dst_account,
             &amount_to_deliver,
             &issuer,
             currency,
-        )?;
+        );
+        if transfer != Ter::TES_SUCCESS {
+            return Ok(Some(failed_ripple_calc_output(
+                transfer,
+                max_source_amount,
+                dst_amount,
+            )));
+        }
         return Ok(Some(RippleCalcOutput {
             result: Ter::TES_SUCCESS,
             actual_amount_in: amount_needed,
@@ -524,14 +540,21 @@ fn try_default_path<V: ApplyView>(
                 false,
             );
             let actual_out = actual_in.divide(&rate_amount, dst_amount.asset());
-            apply_direct_iou_transfer(
+            let transfer = apply_direct_iou_transfer(
                 view,
                 src_account,
                 dst_account,
                 &actual_out,
                 &issuer,
                 currency,
-            )?;
+            );
+            if transfer != Ter::TES_SUCCESS {
+                return Ok(Some(failed_ripple_calc_output(
+                    transfer,
+                    max_source_amount,
+                    dst_amount,
+                )));
+            }
             return Ok(Some(RippleCalcOutput {
                 result: Ter::TES_SUCCESS,
                 actual_amount_in: actual_in,
@@ -541,14 +564,21 @@ fn try_default_path<V: ApplyView>(
         return Ok(None);
     }
 
-    apply_direct_iou_transfer(
+    let transfer = apply_direct_iou_transfer(
         view,
         src_account,
         dst_account,
         &amount_to_deliver,
         &issuer,
         currency,
-    )?;
+    );
+    if transfer != Ter::TES_SUCCESS {
+        return Ok(Some(failed_ripple_calc_output(
+            transfer,
+            max_source_amount,
+            dst_amount,
+        )));
+    }
     Ok(Some(RippleCalcOutput {
         result: Ter::TES_SUCCESS,
         actual_amount_in: amount_needed,
@@ -610,18 +640,25 @@ fn try_xrp_to_iou_default_path<V: ApplyView>(
             sf("sfBalance"),
             STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(balance - debit)),
         );
-        let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *src_sle.key())));
+        view.update(Arc::new(STLedgerEntry::from_stobject(obj, *src_sle.key())))?;
     }
 
     // Credit IOU to destination (issuer→dst via trust line)
     let issuer = dst_issue.account;
     if *dst_account != issuer {
-        let _ = crate::domain::ripple_state_helpers::direct_send_no_fee_iou_pub(
+        let transfer = crate::domain::ripple_state_helpers::direct_send_no_fee_iou_pub(
             view,
             &issuer,
             dst_account,
             &result.amount_out,
         );
+        if transfer != Ter::TES_SUCCESS {
+            return Ok(Some(failed_ripple_calc_output(
+                transfer,
+                max_source_amount,
+                dst_amount,
+            )));
+        }
     }
 
     Ok(Some(RippleCalcOutput {
@@ -675,12 +712,19 @@ fn try_iou_to_xrp_default_path<V: ApplyView>(
     // Debit IOU from source (src→issuer via trust line)
     let issuer = src_issue.account;
     if *src_account != issuer {
-        let _ = crate::domain::ripple_state_helpers::direct_send_no_fee_iou_pub(
+        let transfer = crate::domain::ripple_state_helpers::direct_send_no_fee_iou_pub(
             view,
             src_account,
             &issuer,
             &result.amount_in,
         );
+        if transfer != Ter::TES_SUCCESS {
+            return Ok(Some(failed_ripple_calc_output(
+                transfer,
+                max_source_amount,
+                dst_amount,
+            )));
+        }
     }
 
     // Credit XRP to destination
@@ -693,7 +737,7 @@ fn try_iou_to_xrp_default_path<V: ApplyView>(
             sf("sfBalance"),
             STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(balance + credit)),
         );
-        let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *dst_sle.key())));
+        view.update(Arc::new(STLedgerEntry::from_stobject(obj, *dst_sle.key())))?;
     }
 
     Ok(Some(RippleCalcOutput {
@@ -710,28 +754,34 @@ fn apply_direct_iou_transfer<V: ApplyView>(
     amount: &STAmount,
     issuer: &AccountID,
     _currency: protocol::Currency,
-) -> Result<(), ViewError> {
+) -> Ter {
     if amount.signum() == 0 {
-        return Ok(());
+        return Ter::TES_SUCCESS;
     }
     // If sender or receiver is issuer → single direct transfer (no fee)
     // If neither is issuer → two-leg transfer through issuer (fee applied by caller)
     if *sender == *issuer || *receiver == *issuer || issuer.data().iter().all(|&b| b == 0) {
         // Direct: sender → receiver (one of them is issuer)
-        let _ = crate::domain::ripple_state_helpers::direct_send_no_fee_iou_pub(
+        return crate::domain::ripple_state_helpers::direct_send_no_fee_iou_pub(
             view, sender, receiver, amount,
         );
     } else {
         // 3rd party: issuer credits receiver, sender debits to issuer
         // The caller already computed the fee-adjusted amount for the sender side
-        let _ = crate::domain::ripple_state_helpers::direct_send_no_fee_iou_pub(
+        let receiver_transfer = crate::domain::ripple_state_helpers::direct_send_no_fee_iou_pub(
             view, issuer, receiver, amount,
         );
+        if receiver_transfer != Ter::TES_SUCCESS {
+            return receiver_transfer;
+        }
         // Sender pays amount * rate to issuer (caller passes amount_to_deliver here,
         // but the actual debit from sender is amount_needed which includes fee)
         // Since try_default_path calls us with amount_to_deliver, we need to
         // compute the fee-adjusted amount for the sender→issuer leg
-        let rate = crate::domain::ripple_state_helpers::transfer_rate(view, issuer);
+        let rate = match crate::domain::ripple_state_helpers::try_transfer_rate(view, issuer) {
+            Ok(rate) => rate,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
         let sender_amount = if rate == 1_000_000_000 {
             amount.clone()
         } else {
@@ -744,14 +794,25 @@ fn apply_direct_iou_transfer<V: ApplyView>(
             );
             STAmount::from_iou_amount(sf("sfAmount"), adjusted, amount.issue())
         };
-        let _ = crate::domain::ripple_state_helpers::direct_send_no_fee_iou_pub(
+        return crate::domain::ripple_state_helpers::direct_send_no_fee_iou_pub(
             view,
             sender,
             issuer,
             &sender_amount,
         );
     }
-    Ok(())
+}
+
+fn failed_ripple_calc_output(
+    ter: Ter,
+    max_source_amount: &STAmount,
+    dst_amount: &STAmount,
+) -> RippleCalcOutput {
+    RippleCalcOutput {
+        result: ter,
+        actual_amount_in: max_source_amount.zeroed(),
+        actual_amount_out: dst_amount.zeroed(),
+    }
 }
 
 #[allow(dead_code)]

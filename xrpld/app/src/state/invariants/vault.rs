@@ -62,6 +62,10 @@ pub(super) fn vault_snapshot(sle: &STLedgerEntry) -> VaultSnapshot {
     }
 }
 
+pub(super) fn valid_vault_loss_unrealized(loss: RuntimeNumber, fix_cleanup_3_4_0: bool) -> bool {
+    !fix_cleanup_3_4_0 || loss >= RuntimeNumber::zero()
+}
+
 pub(super) fn vault_shares_snapshot(sle: &STLedgerEntry) -> VaultSharesSnapshot {
     VaultSharesSnapshot {
         share_mpt_id: mpt_id_from_issuance(sle),
@@ -268,15 +272,48 @@ pub(super) fn find_vault_share(
         .find(|candidate| candidate.share_mpt_id == share_mpt_id)
 }
 
-pub(super) fn read_vault_share<V: ApplyView + ?Sized>(
+#[derive(Default)]
+pub(super) struct VaultInvariantReads {
+    updated_shares: Option<VaultSharesSnapshot>,
+    current_vault: Option<std::sync::Arc<STLedgerEntry>>,
+    pseudo_account: Option<std::sync::Arc<STLedgerEntry>>,
+}
+
+/// Resolve every ledger object that `validates_vault_state` consults before
+/// entering its boolean protocol checks. This keeps canonical absence as an
+/// invariant failure while preserving a storage fault as `tefBAD_LEDGER` at
+/// the shared invariant boundary.
+pub(super) fn validate_vault_read_channel<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
-    share_mpt_id: MPTID,
-) -> Option<VaultSharesSnapshot> {
-    sandbox
-        .read(protocol::mpt_issuance_keylet_from_mptid(share_mpt_id))
-        .ok()
-        .flatten()
-        .map(|sle| vault_shares_snapshot(&sle))
+    txn_type: protocol::TxType,
+    state: &VaultState,
+) -> Result<VaultInvariantReads, ledger::ViewError> {
+    let Some(after_vault) = state.after_vaults.first() else {
+        return Ok(VaultInvariantReads::default());
+    };
+    let updated_shares =
+        if let Some(shares) = find_vault_share(&state.after_shares, after_vault.share_mpt_id) {
+            Some(shares.clone())
+        } else {
+            sandbox
+                .read(protocol::mpt_issuance_keylet_from_mptid(
+                    after_vault.share_mpt_id,
+                ))?
+                .map(|sle| vault_shares_snapshot(&sle))
+        };
+    let current_vault = sandbox.read(protocol::vault_keylet_from_key(after_vault.key))?;
+    let pseudo_account = if txn_type == protocol::TxType::VAULT_CREATE
+        && let Some(shares) = updated_shares.as_ref()
+    {
+        sandbox.read(protocol::account_keylet(raw_account_id(shares.issuer)))?
+    } else {
+        None
+    };
+    Ok(VaultInvariantReads {
+        updated_shares,
+        current_vault,
+        pseudo_account,
+    })
 }
 
 pub(super) fn vault_share_issuance_delta(state: &VaultState, share_mpt_id: MPTID) -> i128 {
@@ -439,11 +476,20 @@ pub(super) fn vault_transaction_account_asset_delta(
     state: &VaultState,
     account: AccountID,
     asset: Asset,
+    account_paid_fee: bool,
+    fee: protocol::XRPAmount,
 ) -> Option<VaultAssetDelta> {
-    // Quaxar deducts the XRP fee in the outer view before it creates the
-    // inner doApply sandbox. The balance delta captured here is therefore
-    // already post-fee and must not receive rippled's pre-fee compensation.
-    vault_asset_delta(state, account, asset)
+    let mut delta = vault_asset_delta(state, account, asset)?;
+    // Pinned ValidVault::deltaAssetsTxAccount adds the fee back only when
+    // sfAccount is the effective fee payer. The invariant sees the complete
+    // outer XRP delta, while delegated/sponsored fees do not touch sfAccount.
+    if asset.native() && account_paid_fee {
+        delta.delta += RuntimeNumber::from_i64(fee.drops());
+        if delta.delta == RuntimeNumber::zero() {
+            return None;
+        }
+    }
+    Some(delta)
 }
 
 pub(super) fn vault_asset_delta(
@@ -465,9 +511,12 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
     tx_destination: Option<AccountID>,
     tx_holder: Option<AccountID>,
     tx_amount: Option<&STAmount>,
+    tx_account_paid_fee: bool,
+    fee: protocol::XRPAmount,
     fix_cleanup_3_2_0: bool,
     result: Ter,
     state: &VaultState,
+    reads: &VaultInvariantReads,
 ) -> bool {
     if !protocol::is_tes_success(result) {
         return true;
@@ -516,7 +565,7 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
 
     let updated_shares = find_vault_share(&state.after_shares, after_vault.share_mpt_id)
         .cloned()
-        .or_else(|| read_vault_share(sandbox, after_vault.share_mpt_id));
+        .or_else(|| reads.updated_shares.clone());
     let Some(updated_shares) = updated_shares else {
         return false;
     };
@@ -542,15 +591,18 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
     // STNumber's asset association is transient serialization metadata and is
     // therefore deliberately not part of invariant validation.
     let unavailable = after_vault.assets_total - after_vault.assets_available;
-    let assets_maximum = sandbox
-        .read(protocol::vault_keylet_from_key(after_vault.key))
-        .ok()
-        .flatten()
+    let assets_maximum = reads
+        .current_vault
+        .as_ref()
         .map(|vault| vault.get_field_number(sf("sfAssetsMaximum")).value())
         .unwrap_or(zero);
     if after_vault.assets_available < zero
         || after_vault.assets_available > after_vault.assets_total
         || after_vault.loss_unrealized > unavailable
+        || !valid_vault_loss_unrealized(
+            after_vault.loss_unrealized,
+            sandbox.rules().enabled(&protocol::fix_cleanup_3_4_0()),
+        )
         || after_vault.assets_total < zero
         || assets_maximum < zero
     {
@@ -594,9 +646,7 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                 return false;
             }
 
-            let Ok(Some(pseudo_account)) = sandbox.read(protocol::account_keylet(raw_account_id(
-                updated_shares.issuer,
-            ))) else {
+            let Some(pseudo_account) = reads.pseudo_account.as_ref() else {
                 return false;
             };
             pseudo_account.is_field_present(sf("sfVaultID"))
@@ -661,20 +711,25 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                     if account == asset_issuer(after_vault.asset) {
                         return true;
                     }
-                    vault_transaction_account_asset_delta(state, account, after_vault.asset)
-                        .is_some_and(|delta| {
-                            let local_scale = min_scale.max(delta.scale.unwrap_or(0));
-                            let account_delta =
-                                rounded_vault_delta(after_vault.asset, delta, local_scale);
-                            let local_vault_delta = round_number_to_asset_with_scale(
-                                after_vault.asset,
-                                vault_delta_assets,
-                                local_scale,
-                                RoundingMode::ToNearest,
-                            );
-                            account_delta < RuntimeNumber::zero()
-                                && -account_delta == local_vault_delta
-                        })
+                    vault_transaction_account_asset_delta(
+                        state,
+                        account,
+                        after_vault.asset,
+                        tx_account_paid_fee,
+                        fee,
+                    )
+                    .is_some_and(|delta| {
+                        let local_scale = min_scale.max(delta.scale.unwrap_or(0));
+                        let account_delta =
+                            rounded_vault_delta(after_vault.asset, delta, local_scale);
+                        let local_vault_delta = round_number_to_asset_with_scale(
+                            after_vault.asset,
+                            vault_delta_assets,
+                            local_scale,
+                            RoundingMode::ToNearest,
+                        );
+                        account_delta < RuntimeNumber::zero() && -account_delta == local_vault_delta
+                    })
                 })
         }),
         protocol::TxType::VAULT_WITHDRAW => before_vault.is_some_and(|before| {
@@ -709,7 +764,18 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
             let destination_valid = if issuer_withdrawal {
                 true
             } else if let Some(destination) = destination {
-                vault_asset_delta(state, destination, after_vault.asset).is_some_and(|delta| {
+                let destination_delta = if Some(destination) == tx_account {
+                    vault_transaction_account_asset_delta(
+                        state,
+                        destination,
+                        after_vault.asset,
+                        tx_account_paid_fee,
+                        fee,
+                    )
+                } else {
+                    vault_asset_delta(state, destination, after_vault.asset)
+                };
+                destination_delta.is_some_and(|delta| {
                     let destination_scale = delta.scale.unwrap_or(0);
                     let local_scale = min_scale.max(destination_scale);
                     let rounded_destination =

@@ -26,6 +26,7 @@ pub enum MutationError {
     RootMustBeInner,
     InnerNodeMustBeOwned(SHAMapNodeId),
     LeafNodeMustBeOwned(SHAMapNodeId),
+    DuplicateExactLeaf(Uint256),
     MissingExactLeaf(Uint256),
     CrossTypeChange {
         requested: SHAMapNodeType,

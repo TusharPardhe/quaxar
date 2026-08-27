@@ -10,18 +10,17 @@ use ledger::ReadView;
 use protocol::{
     AMM_LP_TOKEN_FLAG, AMM_TWO_ASSET_IF_EMPTY_FLAG, AMM_WITHDRAW_ALL_FLAG, AccountID, ApplyFlags,
     Asset, IOUAmount, MPTAmount, STAmount, STTx, Ter, TxType, XRPAmount, get_field_by_symbol,
-    lsfAllowTrustLineClawback, lsfDefaultRipple, lsfGlobalFreeze, lsfHighAuth, lsfHighDeepFreeze,
-    lsfHighFreeze, lsfLowAuth, lsfLowDeepFreeze, lsfLowFreeze, lsfMPTAuthorized, lsfMPTCanClawback,
-    lsfMPTRequireAuth, lsfNoFreeze, lsfRequireAuth,
+    lsfAllowTrustLineClawback, lsfDefaultRipple, lsfDisallowIncomingTrustline, lsfGlobalFreeze,
+    lsfHighAuth, lsfHighDeepFreeze, lsfHighFreeze, lsfLowAuth, lsfLowDeepFreeze, lsfLowFreeze,
+    lsfMPTAuthorized, lsfMPTCanClawback, lsfMPTRequireAuth, lsfNoFreeze, lsfRequireAuth,
 };
 
 use crate::{
-    AMMClawbackPreclaimFacts, AMMCreatePreclaimFacts, AMMDeletePreclaimFacts,
-    AMMDepositPreclaimFacts, AMMVotePreclaimFacts, AMMWithdrawPreclaimFacts, AmmBidPreclaimFacts,
-    AmmBidSlotPricePreclaimFacts, OfferCancelPreclaimFacts, run_amm_bid_preclaim,
-    run_amm_clawback_preclaim_facts, run_amm_create_preclaim_facts, run_amm_delete_preclaim_facts,
-    run_amm_deposit_preclaim_facts, run_amm_vote_preclaim_facts, run_amm_withdraw_preclaim_facts,
-    run_offer_cancel_preclaim,
+    AMMCreatePreclaimFacts, AMMDeletePreclaimFacts, AMMDepositPreclaimFacts, AMMVotePreclaimFacts,
+    AMMWithdrawPreclaimFacts, AmmBidPreclaimFacts, AmmBidSlotPricePreclaimFacts,
+    OfferCancelPreclaimFacts, run_amm_bid_preclaim, run_amm_create_preclaim_facts,
+    run_amm_delete_preclaim_facts, run_amm_deposit_preclaim_facts, run_amm_vote_preclaim_facts,
+    run_amm_withdraw_preclaim_facts, run_offer_cancel_preclaim,
 };
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -64,17 +63,29 @@ fn xrp_liquid<V: ReadView>(
     let Some(account_sle) = read_account(view, account)? else {
         return Ok(XRPAmount::new());
     };
-    let owner_count = account_sle
-        .get_field_u32(sf("sfOwnerCount"))
-        .saturating_add(owner_count_adjustment) as usize;
-    let reserve = view.fees().account_reserve(owner_count) as i64;
+    let adjustment = i32::try_from(owner_count_adjustment).map_err(|_| Ter::TEF_BAD_LEDGER)?;
+    let reserve = if ledger::is_pseudo_account(&account_sle) {
+        0
+    } else {
+        let owner_count = view
+            .owner_count_hook(account, ledger::OwnerCounts::from_sle(&account_sle))
+            .count();
+        i64::try_from(ledger::effective_account_reserve_with_owner_count(
+            view.fees(),
+            &account_sle,
+            owner_count,
+            adjustment,
+            0,
+        ))
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?
+    };
+    let balance = view.balance_hook_iou(
+        account,
+        protocol::xrp_account(),
+        account_sle.get_field_amount(sf("sfBalance")),
+    );
     Ok(XRPAmount::from_drops(
-        account_sle
-            .get_field_amount(sf("sfBalance"))
-            .xrp()
-            .drops()
-            .saturating_sub(reserve)
-            .max(0),
+        balance.xrp().drops().saturating_sub(reserve).max(0),
     ))
 }
 
@@ -319,10 +330,22 @@ fn account_can_accept_offer_asset<V: ReadView>(
                     Ter::TEC_NO_ISSUER
                 });
             };
-            let Some(line) = view
+            let line = view
                 .read(protocol::line(account, issue.account, issue.currency))
-                .map_err(|_| read_error())?
-            else {
+                .map_err(|_| read_error())?;
+            if view
+                .rules()
+                .enabled(&protocol::feature_id("fixCleanup3_4_0"))
+                && issuer.is_flag(lsfDisallowIncomingTrustline)
+                && line.is_none()
+            {
+                return Ok(if apply_flags.bits() & ApplyFlags::RETRY.bits() != 0 {
+                    Ter::TER_NO_LINE
+                } else {
+                    Ter::TEC_NO_LINE
+                });
+            }
+            let Some(line) = line else {
                 return Ok(
                     if issuer.get_field_u32(sf("sfFlags")) & lsfRequireAuth != 0 {
                         if apply_flags.bits() & ApplyFlags::RETRY.bits() != 0 {
@@ -586,6 +609,81 @@ fn individually_frozen<V: ReadView>(
     }
 }
 
+fn deep_frozen<V: ReadView>(view: &V, account: AccountID, asset: Asset) -> Result<Ter, Ter> {
+    match asset {
+        Asset::Issue(issue) if issue.native() || issue.account == account => Ok(Ter::TES_SUCCESS),
+        Asset::Issue(issue) => Ok(
+            if view
+                .read(protocol::line(account, issue.account, issue.currency))
+                .map_err(|_| read_error())?
+                .is_some_and(|line| {
+                    line.is_flag(protocol::lsfHighDeepFreeze)
+                        || line.is_flag(protocol::lsfLowDeepFreeze)
+                })
+            {
+                Ter::TEC_FROZEN
+            } else {
+                Ter::TES_SUCCESS
+            },
+        ),
+        Asset::MPTIssue(issue) => Ok(
+            if ledger::mptoken_helpers::is_frozen_mpt(view, &account, &issue)
+                .map_err(|_| read_error())?
+            {
+                Ter::TEC_LOCKED
+            } else {
+                Ter::TES_SUCCESS
+            },
+        ),
+    }
+}
+
+fn check_deposit_freeze<V: ReadView>(
+    view: &V,
+    source: AccountID,
+    pseudo: AccountID,
+    asset: Asset,
+) -> Result<Ter, Ter> {
+    let global = global_frozen(view, asset)?;
+    if global != Ter::TES_SUCCESS {
+        return Ok(global);
+    }
+    if source != asset.issuer() {
+        let source_frozen = individually_frozen(view, source, asset)?;
+        if source_frozen != Ter::TES_SUCCESS {
+            return Ok(source_frozen);
+        }
+    }
+    individually_frozen(view, pseudo, asset)
+}
+
+fn check_withdraw_freeze<V: ReadView>(
+    view: &V,
+    pseudo: AccountID,
+    submitter: AccountID,
+    destination: AccountID,
+    asset: Asset,
+) -> Result<Ter, Ter> {
+    if destination == asset.issuer() {
+        return Ok(Ter::TES_SUCCESS);
+    }
+    let global = global_frozen(view, asset)?;
+    if global != Ter::TES_SUCCESS {
+        return Ok(global);
+    }
+    let pseudo_frozen = individually_frozen(view, pseudo, asset)?;
+    if pseudo_frozen != Ter::TES_SUCCESS {
+        return Ok(pseudo_frozen);
+    }
+    if submitter != destination {
+        let submitter_frozen = individually_frozen(view, submitter, asset)?;
+        if submitter_frozen != Ter::TES_SUCCESS {
+            return Ok(submitter_frozen);
+        }
+    }
+    deep_frozen(view, destination, asset)
+}
+
 fn deposit_balance<V: ReadView>(
     view: &V,
     account: AccountID,
@@ -632,13 +730,18 @@ fn deposit_amount_check<V: ReadView>(
     if result != Ter::TES_SUCCESS {
         return Ok(result);
     }
-    let result = asset_frozen(view, amm.get_account_id(sf("sfAccount")), amount.asset())?;
-    if result != Ter::TES_SUCCESS {
-        return Ok(result);
-    }
-    let result = individually_frozen(view, account, amount.asset())?;
-    if result != Ter::TES_SUCCESS {
-        return Ok(result);
+    if !view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_3_0"))
+    {
+        let result = asset_frozen(view, amm.get_account_id(sf("sfAccount")), amount.asset())?;
+        if result != Ter::TES_SUCCESS {
+            return Ok(result);
+        }
+        let result = individually_frozen(view, account, amount.asset())?;
+        if result != Ter::TES_SUCCESS {
+            return Ok(result);
+        }
     }
     if check_balance {
         deposit_balance(view, account, amm, amount)
@@ -664,11 +767,24 @@ fn withdraw_amount_check<V: ReadView>(
     if result != Ter::TES_SUCCESS {
         return Ok(result);
     }
-    let result = asset_frozen(view, amm.get_account_id(sf("sfAccount")), amount.asset())?;
-    if result != Ter::TES_SUCCESS {
-        return Ok(result);
+    if view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_3_0"))
+    {
+        check_withdraw_freeze(
+            view,
+            amm.get_account_id(sf("sfAccount")),
+            account,
+            account,
+            amount.asset(),
+        )
+    } else {
+        let result = asset_frozen(view, amm.get_account_id(sf("sfAccount")), amount.asset())?;
+        if result != Ter::TES_SUCCESS {
+            return Ok(result);
+        }
+        individually_frozen(view, account, amount.asset())
     }
-    individually_frozen(view, account, amount.asset())
 }
 
 fn preclaim_offer_create<V: ReadView>(
@@ -751,50 +867,135 @@ fn preclaim_amm_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
     let amount = tx.get_field_amount(sf("sfAmount"));
     let amount2 = tx.get_field_amount(sf("sfAmount2"));
-    let amm_keylet = protocol::keylet::amm(amount.asset(), amount2.asset());
+    let asset = amount.asset();
+    let asset2 = amount2.asset();
+    let amm_keylet = protocol::keylet::amm(asset, asset2);
     let single_asset_vault_enabled = view
         .rules()
         .enabled(&protocol::feature_id("SingleAssetVault"));
-    let address_collision = single_asset_vault_enabled
-        && ledger::pseudo_account_address(view, amm_keylet.key).is_zero();
-
-    Ok(run_amm_create_preclaim_facts(AMMCreatePreclaimFacts {
+    let mut facts = AMMCreatePreclaimFacts {
         amm_exists: view.read(amm_keylet).map_err(|_| read_error())?.is_some(),
-        amount_auth_result: asset_auth(view, account, amount.asset())?,
-        amount2_auth_result: asset_auth(view, account, amount2.asset())?,
-        amount_frozen_result: asset_frozen(view, account, amount.asset())?,
-        amount2_frozen_result: asset_frozen(view, account, amount2.asset())?,
-        amount_no_default_ripple: no_default_ripple(view, amount.asset())?,
-        amount2_no_default_ripple: no_default_ripple(view, amount2.asset())?,
-        xrp_reserve_positive: xrp_liquid(view, account, 1)?.drops() > 0,
-        amount_insufficient_balance: asset_funds(view, account, &amount, true)? < amount,
-        amount2_insufficient_balance: asset_funds(view, account, &amount2, true)? < amount2,
-        amount_is_lp_token: is_lp_token(view, amount.asset())?,
-        amount2_is_lp_token: is_lp_token(view, amount2.asset())?,
-        address_collision,
-        amount_mpt_trade_transfer_result: ledger::mptoken_helpers::can_mpt_trade_and_transfer(
-            view,
-            &amount.asset(),
-            &account,
-            &account,
-        )
-        .map_err(|_| read_error())?,
-        amount2_mpt_trade_transfer_result: ledger::mptoken_helpers::can_mpt_trade_and_transfer(
-            view,
-            &amount2.asset(),
-            &account,
-            &account,
-        )
-        .map_err(|_| read_error())?,
-        amm_clawback_enabled: view.rules().enabled(&protocol::feature_id("AMMClawback")),
-        amount_clawback_disabled_result: clawback_disabled(view, amount.asset())?,
-        amount2_clawback_disabled_result: clawback_disabled(view, amount2.asset())?,
-        amount_is_vault_share: single_asset_vault_enabled
-            && is_mpt_issuer_pseudo(view, amount.asset())?,
-        amount2_is_vault_share: single_asset_vault_enabled
-            && is_mpt_issuer_pseudo(view, amount2.asset())?,
         single_asset_vault_enabled,
-    }))
+        ..Default::default()
+    };
+    let mut result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+
+    facts.amount_auth_result = asset_auth(view, account, asset)?;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+    facts.amount2_auth_result = asset_auth(view, account, asset2)?;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+    facts.amount_frozen_result = asset_frozen(view, account, asset)?;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+    facts.amount2_frozen_result = asset_frozen(view, account, asset2)?;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+    facts.amount_no_default_ripple = no_default_ripple(view, asset)?;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+    facts.amount2_no_default_ripple = no_default_ripple(view, asset2)?;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+
+    let liquid = xrp_liquid(view, account, 1)?;
+    facts.xrp_reserve_positive = liquid.drops() > 0;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+    facts.amount_insufficient_balance = if amount.native() {
+        STAmount::from_xrp_amount(liquid) < amount
+    } else {
+        asset_funds(view, account, &amount, true)? < amount
+    };
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+    facts.amount2_insufficient_balance = if amount2.native() {
+        STAmount::from_xrp_amount(liquid) < amount2
+    } else {
+        asset_funds(view, account, &amount2, true)? < amount2
+    };
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+    facts.amount_is_lp_token = is_lp_token(view, asset)?;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+    facts.amount2_is_lp_token = is_lp_token(view, asset2)?;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+
+    if single_asset_vault_enabled {
+        facts.address_collision = ledger::pseudo_account_address(view, amm_keylet.key)
+            .map_err(|_| read_error())?
+            .is_zero();
+        result = run_amm_create_preclaim_facts(facts);
+        if result != Ter::TES_SUCCESS {
+            return Ok(result);
+        }
+        facts.amount_is_vault_share = is_mpt_issuer_pseudo(view, asset)?;
+        result = run_amm_create_preclaim_facts(facts);
+        if result != Ter::TES_SUCCESS {
+            return Ok(result);
+        }
+        facts.amount2_is_vault_share = is_mpt_issuer_pseudo(view, asset2)?;
+        result = run_amm_create_preclaim_facts(facts);
+        if result != Ter::TES_SUCCESS {
+            return Ok(result);
+        }
+    }
+
+    facts.amount_mpt_trade_transfer_result =
+        ledger::mptoken_helpers::can_mpt_trade_and_transfer(view, &asset, &account, &account)
+            .map_err(|_| read_error())?;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+    facts.amount2_mpt_trade_transfer_result =
+        ledger::mptoken_helpers::can_mpt_trade_and_transfer(view, &asset2, &account, &account)
+            .map_err(|_| read_error())?;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+
+    facts.amm_clawback_enabled = view.rules().enabled(&protocol::feature_id("AMMClawback"));
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS || facts.amm_clawback_enabled {
+        return Ok(result);
+    }
+    facts.amount_clawback_disabled_result = clawback_disabled(view, asset)?;
+    result = run_amm_create_preclaim_facts(facts);
+    if result != Ter::TES_SUCCESS {
+        return Ok(result);
+    }
+    facts.amount2_clawback_disabled_result = clawback_disabled(view, asset2)?;
+    Ok(run_amm_create_preclaim_facts(facts))
 }
 
 fn preclaim_offer_cancel<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
@@ -819,11 +1020,20 @@ fn preclaim_amm_vote<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             account_lp_holds_signum: None,
         }));
     };
+    let lp_token_balance_signum = amm.get_field_amount(sf("sfLPTokenBalance")).signum();
+    let front = run_amm_vote_preclaim_facts(AMMVotePreclaimFacts {
+        amm_exists: true,
+        lp_token_balance_signum,
+        account_lp_holds_signum: None,
+    });
+    if front != Ter::TES_SUCCESS {
+        return Ok(front);
+    }
     let account = tx.get_account_id(sf("sfAccount"));
     let lp_holds = lp_holds(view, &amm, account)?;
     Ok(run_amm_vote_preclaim_facts(AMMVotePreclaimFacts {
         amm_exists: true,
-        lp_token_balance_signum: amm.get_field_amount(sf("sfLPTokenBalance")).signum(),
+        lp_token_balance_signum,
         account_lp_holds_signum: Some(lp_holds.signum()),
     }))
 }
@@ -855,19 +1065,25 @@ fn preclaim_amm_bid<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         }));
     };
 
+    let lp_total = amm.get_field_amount(sf("sfLPTokenBalance"));
+    if lp_total.signum() == 0 {
+        return Ok(Ter::TEC_AMM_EMPTY);
+    }
+    let mut auth_accounts = Vec::new();
+    if tx.is_field_present(sf("sfAuthAccounts")) {
+        for entry in tx.get_field_array(sf("sfAuthAccounts")).iter() {
+            let exists = read_account(view, entry.get_account_id(sf("sfAccount")))?.is_some();
+            auth_accounts.push(exists);
+            if !exists {
+                return Ok(Ter::TER_NO_ACCOUNT);
+            }
+        }
+    }
     let account = tx.get_account_id(sf("sfAccount"));
     let lp_tokens = lp_holds(view, &amm, account)?;
-    let lp_total = amm.get_field_amount(sf("sfLPTokenBalance"));
-    let auth_accounts = if tx.is_field_present(sf("sfAuthAccounts")) {
-        tx.get_field_array(sf("sfAuthAccounts"))
-            .iter()
-            .map(|entry| {
-                read_account(view, entry.get_account_id(sf("sfAccount"))).map(|sle| sle.is_some())
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        Vec::new()
-    };
+    if lp_tokens.signum() == 0 {
+        return Ok(Ter::TEC_AMM_INVALID_TOKENS);
+    }
     let bid_min = tx
         .is_field_present(sf("sfBidMin"))
         .then(|| slot_price_facts(tx.get_field_amount(sf("sfBidMin")), &lp_tokens, &lp_total));
@@ -929,7 +1145,10 @@ fn preclaim_amm_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         amount_balance_signum: amount_balance.signum(),
         amount2_balance_signum: amount2_balance.signum(),
         lp_token_balance_signum: lp_token_balance.signum(),
-        amm_clawback_enabled: view.rules().enabled(&protocol::feature_id("AMMClawback")),
+        amm_clawback_enabled: view.rules().enabled(&protocol::feature_id("AMMClawback"))
+            || view
+                .rules()
+                .enabled(&protocol::feature_id("fixCleanup3_3_0")),
         ..Default::default()
     };
     let result = run_amm_deposit_preclaim_facts(facts);
@@ -943,7 +1162,14 @@ fn preclaim_amm_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         if result != Ter::TES_SUCCESS {
             return Ok(result);
         }
-        facts.asset_frozen_result = asset_frozen(view, account, asset)?;
+        facts.asset_frozen_result = if view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_3_0"))
+        {
+            check_deposit_freeze(view, account, amm.get_account_id(sf("sfAccount")), asset)?
+        } else {
+            asset_frozen(view, account, asset)?
+        };
         let result = run_amm_deposit_preclaim_facts(facts);
         if result != Ter::TES_SUCCESS {
             return Ok(result);
@@ -953,7 +1179,14 @@ fn preclaim_amm_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         if result != Ter::TES_SUCCESS {
             return Ok(result);
         }
-        facts.asset2_frozen_result = asset_frozen(view, account, asset2)?;
+        facts.asset2_frozen_result = if view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_3_0"))
+        {
+            check_deposit_freeze(view, account, amm.get_account_id(sf("sfAccount")), asset2)?
+        } else {
+            asset_frozen(view, account, asset2)?
+        };
         let result = run_amm_deposit_preclaim_facts(facts);
         if result != Ter::TES_SUCCESS {
             return Ok(result);
@@ -1178,18 +1411,23 @@ fn preclaim_amm_clawback<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     }
 
     let issuer_flags = issuer_sle.get_field_u32(sf("sfFlags"));
+    let mptokens_v2_enabled = view.rules().enabled(&protocol::feature_id("MPTokensV2"));
+    // AMMClawback::preclaim performs the legacy issuer permission check
+    // before checkClawAsset. In particular, without MPTokensV2 an MPT
+    // issuance must not be read before this canonical tecNO_PERMISSION.
+    if !mptokens_v2_enabled
+        && ((issuer_flags & lsfAllowTrustLineClawback) == 0 || (issuer_flags & lsfNoFreeze) != 0)
+    {
+        return Ok(Ter::TEC_NO_PERMISSION);
+    }
     let claw_two_assets = (tx.get_flags() & protocol::AMM_CLAWBACK_TWO_ASSETS_FLAG) != 0;
-    Ok(run_amm_clawback_preclaim_facts(AMMClawbackPreclaimFacts {
-        issuer_exists: true,
-        holder_exists: true,
-        amm_exists: true,
-        mptokens_v2_enabled: view.rules().enabled(&protocol::feature_id("MPTokensV2")),
-        issuer_allows_trustline_clawback: (issuer_flags & lsfAllowTrustLineClawback) != 0,
-        issuer_no_freeze: (issuer_flags & lsfNoFreeze) != 0,
-        asset_claw_allowed: clawback_asset_allowed(view, issuer, issuer_flags, asset)?,
-        claw_two_assets,
-        asset2_claw_allowed: clawback_asset_allowed(view, issuer, issuer_flags, asset2)?,
-    }))
+    if !clawback_asset_allowed(view, issuer, issuer_flags, asset)? {
+        return Ok(Ter::TEC_NO_PERMISSION);
+    }
+    if claw_two_assets && !clawback_asset_allowed(view, issuer, issuer_flags, asset2)? {
+        return Ok(Ter::TEC_NO_PERMISSION);
+    }
+    Ok(Ter::TES_SUCCESS)
 }
 
 /// Runs OfferCreate preclaim for direct state-dispatch callers that bypass
@@ -1251,7 +1489,7 @@ pub fn run_dex_read_view_preclaim<V: ReadView>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     use basics::base_uint::Uint256;
@@ -1262,8 +1500,8 @@ mod tests {
     };
 
     use super::{
-        is_mpt_issuer_pseudo, run_dex_read_view_preclaim, run_dex_read_view_preclaim_with_flags,
-        run_offer_create_direct_dispatch_preclaim,
+        account_can_accept_offer_asset, is_mpt_issuer_pseudo, run_dex_read_view_preclaim,
+        run_dex_read_view_preclaim_with_flags, run_offer_create_direct_dispatch_preclaim,
     };
 
     fn sf(name: &str) -> &'static protocol::SField {
@@ -1273,6 +1511,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct View {
         entries: BTreeMap<Uint256, Arc<STLedgerEntry>>,
+        fail_reads: BTreeSet<Uint256>,
+        rules: Rules,
     }
 
     impl View {
@@ -1292,7 +1532,7 @@ mod tests {
             Fees::default()
         }
         fn rules(&self) -> Rules {
-            Rules::default()
+            self.rules.clone()
         }
         fn exists(&self, keylet: protocol::Keylet) -> Result<bool, ViewError> {
             Ok(self.entries.contains_key(&keylet.key))
@@ -1305,6 +1545,9 @@ mod tests {
             Ok(None)
         }
         fn read(&self, keylet: protocol::Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
+            if self.fail_reads.contains(&keylet.key) {
+                return Err(ViewError::Conversion("fault-injected DEX read".into()));
+            }
             Ok(self.entries.get(&keylet.key).cloned())
         }
         fn sles(&self) -> Result<Vec<Arc<STLedgerEntry>>, ViewError> {
@@ -1358,6 +1601,36 @@ mod tests {
         assert_eq!(
             is_mpt_issuer_pseudo(&view, Asset::Issue(issue(4, issuer))),
             Ok(false)
+        );
+    }
+
+    #[test]
+    fn offer_acceptance_honors_disallow_incoming_trustline_only_after_cleanup_3_4() {
+        let owner = account(1);
+        let issuer = account(2);
+        let asset = Asset::Issue(issue(3, issuer));
+        let mut issuer_entry = account_entry(issuer, 1);
+        issuer_entry.set_field_u32(sf("sfFlags"), protocol::lsfDisallowIncomingTrustline);
+
+        let mut legacy = View::default();
+        legacy.insert(issuer_entry.clone());
+        assert_eq!(
+            account_can_accept_offer_asset(&legacy, owner, asset, ApplyFlags::NONE),
+            Ok(Ter::TES_SUCCESS)
+        );
+
+        let mut fixed = View {
+            rules: Rules::new([protocol::feature_id("fixCleanup3_4_0")]),
+            ..View::default()
+        };
+        fixed.insert(issuer_entry);
+        assert_eq!(
+            account_can_accept_offer_asset(&fixed, owner, asset, ApplyFlags::NONE),
+            Ok(Ter::TEC_NO_LINE)
+        );
+        assert_eq!(
+            account_can_accept_offer_asset(&fixed, owner, asset, ApplyFlags::RETRY),
+            Ok(Ter::TER_NO_LINE)
         );
     }
 
@@ -1652,6 +1925,42 @@ mod tests {
         assert_eq!(
             run_dex_read_view_preclaim(&View::default(), &tx, TxType::AMM_CLAWBACK),
             Some(protocol::Ter::TER_NO_ACCOUNT)
+        );
+    }
+
+    #[test]
+    fn amm_clawback_legacy_permission_precedes_mpt_issuance_read() {
+        let issuer = account(7);
+        let holder = account(8);
+        let amm_account = account(9);
+        let asset = Asset::MPTIssue(protocol::MPTIssue::new(protocol::make_mpt_id(1, issuer)));
+        let asset2 = Asset::from(issue(10, issuer));
+        let mut view = View::default();
+        view.insert(account_entry(issuer, 1));
+        view.insert(account_entry(holder, 1));
+        view.insert(amm_entry(amm_account, asset, asset2, 10));
+        let Asset::MPTIssue(mpt) = asset else {
+            unreachable!("fixture uses MPT")
+        };
+        view.fail_reads
+            .insert(protocol::mpt_issuance_keylet_from_mptid(mpt.mpt_id()).key);
+        let tx = STTx::new(TxType::AMM_CLAWBACK, |tx| {
+            tx.set_account_id(sf("sfAccount"), issuer);
+            tx.set_account_id(sf("sfHolder"), holder);
+            tx.set_field_issue(
+                sf("sfAsset"),
+                protocol::STIssue::new_with_asset(sf("sfAsset"), asset),
+            );
+            tx.set_field_issue(
+                sf("sfAsset2"),
+                protocol::STIssue::new_with_asset(sf("sfAsset2"), asset2),
+            );
+        });
+
+        assert_eq!(
+            run_dex_read_view_preclaim(&view, &tx, TxType::AMM_CLAWBACK),
+            Some(Ter::TEC_NO_PERMISSION),
+            "legacy issuer permission must precede checkClawAsset's MPT issuance read"
         );
     }
 }

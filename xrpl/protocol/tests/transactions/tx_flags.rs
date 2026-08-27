@@ -40,7 +40,7 @@ fn tx_flag_catalog_is_reexported_from_protocol_root() {
     assert_eq!(tfAccountSetMask, ACCOUNT_SET_FLAGS_MASK);
 
     assert_eq!(PAYMENT_PARTIAL_PAYMENT_FLAG, 0x0002_0000);
-    assert_eq!(PAYMENT_FLAGS, 0x0007_0000);
+    assert_eq!(PAYMENT_FLAGS, 0x000f_0000);
     assert_eq!(PAYMENT_FLAGS_MASK, transaction_flags_mask(PAYMENT_FLAGS));
     assert_eq!(tfPaymentMask, PAYMENT_FLAGS_MASK);
 

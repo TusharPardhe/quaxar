@@ -32,6 +32,10 @@ pub struct VaultCreatePreflightFacts {
     pub scale: Option<u8>,
     pub asset_is_mpt: bool,
     pub asset_is_native: bool,
+    pub lending_protocol_v1_1_enabled: bool,
+    pub vault_kind: Option<u8>,
+    pub subscription_date: Option<u32>,
+    pub redemption_date: Option<u32>,
 }
 
 pub const fn run_vault_create_preflight(facts: VaultCreatePreflightFacts) -> NotTec {
@@ -73,6 +77,35 @@ pub const fn run_vault_create_preflight(facts: VaultCreatePreflightFacts) -> Not
         }
     }
 
+    let has_lending_fields = facts.vault_kind.is_some()
+        || facts.subscription_date.is_some()
+        || facts.redemption_date.is_some();
+    if has_lending_fields && !facts.lending_protocol_v1_1_enabled {
+        return Ter::TEM_DISABLED;
+    }
+    let kind = match facts.vault_kind {
+        None | Some(0) => 0,
+        Some(1) => 1,
+        Some(_) => return Ter::TEM_MALFORMED,
+    };
+    if kind == 0 {
+        if facts.subscription_date.is_some() || facts.redemption_date.is_some() {
+            return Ter::TEM_MALFORMED;
+        }
+    } else {
+        let (Some(subscription), Some(redemption)) =
+            (facts.subscription_date, facts.redemption_date)
+        else {
+            return Ter::TEM_MALFORMED;
+        };
+        let gap = redemption as i64 - subscription as i64;
+        // Pinned kMinInvestmentPeriod=60 seconds and
+        // kMaxInvestmentPeriod=30 Gregorian years=946,708,560 seconds.
+        if gap < 60 || gap >= 946_708_560 {
+            return Ter::TEM_MALFORMED;
+        }
+    }
+
     Ter::TES_SUCCESS
 }
 
@@ -110,6 +143,44 @@ mod tests {
         });
 
         assert_eq!(result, Ter::TEM_MALFORMED);
+    }
+
+    #[test]
+    fn vault_create_preflight_matches_lending_v1_1_kind_and_date_rules() {
+        let gated = run_vault_create_preflight(VaultCreatePreflightFacts {
+            vault_kind: Some(1),
+            subscription_date: Some(100),
+            redemption_date: Some(160),
+            ..VaultCreatePreflightFacts::default()
+        });
+        assert_eq!(gated, Ter::TEM_DISABLED);
+
+        let open_with_dates = run_vault_create_preflight(VaultCreatePreflightFacts {
+            lending_protocol_v1_1_enabled: true,
+            vault_kind: Some(0),
+            subscription_date: Some(100),
+            redemption_date: Some(160),
+            ..VaultCreatePreflightFacts::default()
+        });
+        assert_eq!(open_with_dates, Ter::TEM_MALFORMED);
+
+        let closed_too_short = run_vault_create_preflight(VaultCreatePreflightFacts {
+            lending_protocol_v1_1_enabled: true,
+            vault_kind: Some(1),
+            subscription_date: Some(100),
+            redemption_date: Some(159),
+            ..VaultCreatePreflightFacts::default()
+        });
+        assert_eq!(closed_too_short, Ter::TEM_MALFORMED);
+
+        let closed = run_vault_create_preflight(VaultCreatePreflightFacts {
+            lending_protocol_v1_1_enabled: true,
+            vault_kind: Some(1),
+            subscription_date: Some(100),
+            redemption_date: Some(160),
+            ..VaultCreatePreflightFacts::default()
+        });
+        assert_eq!(closed, Ter::TES_SUCCESS);
     }
 
     #[test]

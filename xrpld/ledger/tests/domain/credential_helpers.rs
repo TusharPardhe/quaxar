@@ -3,7 +3,9 @@ use std::sync::Arc;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{
     ApplyView, ApplyViewImpl, Ledger, LedgerHeader, ReadView,
-    credential_helpers::{authorized_deposit_preauth, delete_sle, verify_deposit_preauth},
+    credential_helpers::{
+        authorized_deposit_preauth, check_fields, delete_sle, verify_deposit_preauth,
+    },
 };
 use protocol::{
     AccountID, ApplyFlags, LedgerEntryType, Rules, STLedgerEntry, STTx, STVector256, Ter, TxType,
@@ -86,6 +88,21 @@ fn credential_deposit_preauth_rejects_zero_ids_after_cleanup_3_4() {
     assert_eq!(
         authorized_deposit_preauth(&view, &ids, &destination),
         Ok(Ter::TEF_INTERNAL)
+    );
+}
+
+#[test]
+fn credential_field_zero_id_preserves_legacy_and_fixed_results() {
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_field_v256(
+            sf("sfCredentialIDs"),
+            STVector256::from_values(sf("sfCredentialIDs"), vec![Uint256::zero()]),
+        );
+    });
+    assert_eq!(check_fields(&tx, &Rules::default()), Ter::TES_SUCCESS);
+    assert_eq!(
+        check_fields(&tx, &Rules::new([protocol::feature_id("fixCleanup3_4_0")]),),
+        Ter::TEM_MALFORMED
     );
 }
 

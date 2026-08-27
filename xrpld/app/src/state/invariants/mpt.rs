@@ -33,6 +33,163 @@ pub(super) struct MptIssuanceLifecycle {
     token_created_by_issuer: bool,
 }
 
+#[derive(Default)]
+pub(super) struct ConfidentialMptChange {
+    mpt_amount_delta: i128,
+    coa_delta: i128,
+    outstanding_delta: i128,
+    issuance: Option<STLedgerEntry>,
+    deleted_with_encrypted: bool,
+    bad_consistency: bool,
+    bad_coa: bool,
+    changes_confidential_fields: bool,
+    bad_version: bool,
+}
+
+fn capped_delta(value: u64) -> i128 {
+    i128::from(value.min(max_mpt_token_amount()))
+}
+
+fn optional_u32_value(sle: &STLedgerEntry, field: &'static protocol::SField) -> Option<u32> {
+    sle.is_field_present(field)
+        .then(|| sle.get_field_u32(field))
+}
+
+fn optional_vl_value(sle: &STLedgerEntry, field: &'static protocol::SField) -> Option<Vec<u8>> {
+    sle.is_field_present(field).then(|| sle.get_field_vl(field))
+}
+
+pub(super) fn record_confidential_mpt(
+    changes: &mut BTreeMap<MPTID, ConfidentialMptChange>,
+    is_delete: bool,
+    before: Option<&STLedgerEntry>,
+    after: &STLedgerEntry,
+) {
+    let id = |sle: &STLedgerEntry| match sle.get_type() {
+        LedgerEntryType::MPToken => sle.get_field_h192(sf("sfMPTokenIssuanceID")),
+        LedgerEntryType::MPTokenIssuance => mpt_id_from_issuance(sle),
+        _ => MPTID::default(),
+    };
+    if let Some(before) = before.filter(|sle| sle.get_type() == LedgerEntryType::MPToken) {
+        let change = changes.entry(id(before)).or_default();
+        change.mpt_amount_delta -= capped_delta(before.get_field_u64(sf("sfMPTAmount")));
+        if is_delete {
+            change.deleted_with_encrypted = before.get_field_u64(sf("sfMPTAmount")) > 0
+                || [
+                    "sfConfidentialBalanceSpending",
+                    "sfConfidentialBalanceInbox",
+                    "sfIssuerEncryptedBalance",
+                    "sfAuditorEncryptedBalance",
+                ]
+                .iter()
+                .any(|field| before.is_field_present(sf(field)));
+        }
+    }
+    if after.get_type() == LedgerEntryType::MPToken {
+        let change = changes.entry(id(after)).or_default();
+        change.mpt_amount_delta += capped_delta(after.get_field_u64(sf("sfMPTAmount")));
+        let issuer = after.is_field_present(sf("sfIssuerEncryptedBalance"));
+        let inbox = after.is_field_present(sf("sfConfidentialBalanceInbox"));
+        let spending = after.is_field_present(sf("sfConfidentialBalanceSpending"));
+        let auditor = after.is_field_present(sf("sfAuditorEncryptedBalance"));
+        change.bad_consistency |= inbox != spending || inbox != issuer || (auditor && !issuer);
+        for field in [
+            "sfConfidentialBalanceInbox",
+            "sfConfidentialBalanceSpending",
+            "sfIssuerEncryptedBalance",
+            "sfAuditorEncryptedBalance",
+        ] {
+            let field = sf(field);
+            if after.is_field_present(field)
+                && before.is_none_or(|before| {
+                    before.get_type() != LedgerEntryType::MPToken
+                        || optional_vl_value(before, field) != optional_vl_value(after, field)
+                })
+            {
+                change.changes_confidential_fields = true;
+            }
+        }
+    }
+    if let Some(before) = before.filter(|sle| sle.get_type() == LedgerEntryType::MPTokenIssuance) {
+        let change = changes.entry(id(before)).or_default();
+        if before.is_field_present(sf("sfConfidentialOutstandingAmount")) {
+            change.coa_delta -=
+                capped_delta(before.get_field_u64(sf("sfConfidentialOutstandingAmount")));
+        }
+        change.outstanding_delta -= capped_delta(before.get_field_u64(sf("sfOutstandingAmount")));
+    }
+    if after.get_type() == LedgerEntryType::MPTokenIssuance {
+        let change = changes.entry(id(after)).or_default();
+        let coa = optional_u64(after, sf("sfConfidentialOutstandingAmount"));
+        if after.is_field_present(sf("sfConfidentialOutstandingAmount")) {
+            change.coa_delta += capped_delta(coa);
+        }
+        let outstanding = after.get_field_u64(sf("sfOutstandingAmount"));
+        change.outstanding_delta += capped_delta(outstanding);
+        change.issuance = Some(after.clone());
+        change.bad_coa |= coa > outstanding;
+    }
+    if let Some(before) = before.filter(|sle| sle.get_type() == LedgerEntryType::MPToken)
+        && after.get_type() == LedgerEntryType::MPToken
+    {
+        let spending_before = optional_vl_value(before, sf("sfConfidentialBalanceSpending"));
+        let spending_after = optional_vl_value(after, sf("sfConfidentialBalanceSpending"));
+        if spending_before.is_some() && spending_before != spending_after {
+            changes.entry(id(after)).or_default().bad_version |=
+                optional_u32_value(before, sf("sfConfidentialBalanceVersion"))
+                    == optional_u32_value(after, sf("sfConfidentialBalanceVersion"));
+        }
+    }
+}
+
+pub(super) fn validates_confidential_mpt<V: ApplyView + ?Sized>(
+    view: &FlowSandbox<V>,
+    txn_type: protocol::TxType,
+    result: Ter,
+    changes: &BTreeMap<MPTID, ConfidentialMptChange>,
+) -> bool {
+    if !protocol::is_tes_success(result) {
+        return true;
+    }
+    let confidential_tx = matches!(txn_type.to_u16(), 85..=89);
+    changes.iter().all(|(id, change)| {
+        let issuance = if let Some(issuance) = change.issuance.clone() {
+            Some(issuance)
+        } else {
+            match view.read(protocol::mpt_issuance_keylet_from_mptid(*id)) {
+                Ok(value) => value.map(|sle| (*sle).clone()),
+                // A SHAMap/storage failure is not evidence that the issuance
+                // was deleted. Fail the invariant closed instead of silently
+                // skipping all confidential-balance checks.
+                Err(_) => return false,
+            }
+        };
+        let Some(issuance) = issuance else {
+            return true;
+        };
+        if change.deleted_with_encrypted
+            && optional_u64(&issuance, sf("sfConfidentialOutstandingAmount")) > 0
+        {
+            return false;
+        }
+        if change.bad_consistency || change.bad_coa || change.bad_version {
+            return false;
+        }
+        if change.changes_confidential_fields
+            && !issuance.is_flag(protocol::lsfMPTCanHoldConfidentialBalance)
+        {
+            return false;
+        }
+        if change.coa_delta != 0 {
+            change.mpt_amount_delta + change.coa_delta == change.outstanding_delta
+        } else if confidential_tx {
+            change.mpt_amount_delta == 0 && change.outstanding_delta == 0
+        } else {
+            true
+        }
+    })
+}
+
 pub(super) fn max_mpt_token_amount() -> u64 {
     protocol::MAX_MP_TOKEN_AMOUNT as u64
 }
@@ -108,6 +265,22 @@ pub(super) fn validates_mpt_accounting(
     })
 }
 
+/// Mirrors rippled's `ValidMPTBalanceChanges::finalize`: confidential MPT
+/// transactions move value between the public amount and encrypted balances.
+/// Their accounting is owned by `ValidConfidentialMPToken`, so applying the
+/// ordinary `sfMPTAmount`/`sfOutstandingAmount` equation as well would reject
+/// valid convert, convert-back, and clawback transactions.
+pub(super) fn validates_mpt_accounting_for_transaction(
+    data: &BTreeMap<MPTID, MptAccounting>,
+    enforce: bool,
+    txn_type: protocol::TxType,
+) -> bool {
+    if matches!(txn_type.to_u16(), 85..=89) {
+        return true;
+    }
+    validates_mpt_accounting(data, enforce)
+}
+
 pub(super) fn record_mpt_transfer(
     transfers: &mut BTreeMap<MPTID, BTreeMap<AccountID, MptTransferAmount>>,
     sle: &STLedgerEntry,
@@ -169,13 +342,13 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
     fix_cleanup_3_2_0: bool,
     mptokens_v2_enabled: bool,
     transfers: &BTreeMap<MPTID, BTreeMap<AccountID, MptTransferAmount>>,
-) -> bool {
+) -> Result<bool, ledger::ViewError> {
     if txn_type == protocol::TxType::AMM_CLAWBACK {
-        return true;
+        return Ok(true);
     }
 
     for (mpt_id, holders) in transfers {
-        let Ok(Some(issuance)) = sandbox.read(protocol::mpt_issuance_keylet_from_mptid(*mpt_id))
+        let Some(issuance) = sandbox.read(protocol::mpt_issuance_keylet_from_mptid(*mpt_id))?
         else {
             continue;
         };
@@ -202,11 +375,11 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
             } else {
                 senders = senders.saturating_add(1);
             }
-            let frozen =
-                ledger::mptoken_helpers::is_frozen_mpt(sandbox, account, &issue).unwrap_or(true);
+            let frozen = ledger::mptoken_helpers::is_frozen_mpt(sandbox, account, &issue)?;
             let authorized = if req_auth {
-                ledger::mptoken_helpers::require_auth_mpt(sandbox, &issue, account)
-                    .is_ok_and(protocol::is_tes_success)
+                protocol::is_tes_success(ledger::mptoken_helpers::require_auth_mpt(
+                    sandbox, &issue, account,
+                )?)
             } else {
                 true
             };
@@ -221,11 +394,11 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
                 || !can_transfer
                 || (mpt_transfer_is_dex(txn_type, cross_currency_payment) && !can_trade))
         {
-            return !mptokens_v2_enabled;
+            return Ok(!mptokens_v2_enabled);
         }
     }
 
-    true
+    Ok(true)
 }
 
 pub(super) fn same_optional_h256(
@@ -247,7 +420,7 @@ pub(super) fn record_mpt_issuance_lifecycle<V: ApplyView + ?Sized>(
     before: Option<&STLedgerEntry>,
     after: Option<&STLedgerEntry>,
     deleted: &STLedgerEntry,
-) {
+) -> Result<(), ledger::ViewError> {
     if let Some(after) = after
         && after.get_type() == LedgerEntryType::MPTokenIssuance
     {
@@ -281,33 +454,32 @@ pub(super) fn record_mpt_issuance_lifecycle<V: ApplyView + ?Sized>(
     }
 
     if !is_delete || txn_type == protocol::TxType::VAULT_DELETE {
-        return;
+        return Ok(());
     }
 
     lifecycle.vault_holding_deleted |= match deleted.get_type() {
         LedgerEntryType::MPToken => {
             let holder = deleted.get_account_id(sf("sfAccount"));
-            is_vault_pseudo_account(sandbox, holder)
+            is_vault_pseudo_account(sandbox, holder)?
         }
         LedgerEntryType::RippleState => {
             let low_counterparty = deleted.get_field_amount(sf("sfLowLimit")).issue().account;
             let high_counterparty = deleted.get_field_amount(sf("sfHighLimit")).issue().account;
-            is_vault_pseudo_account(sandbox, low_counterparty)
-                || is_vault_pseudo_account(sandbox, high_counterparty)
+            is_vault_pseudo_account(sandbox, low_counterparty)?
+                || is_vault_pseudo_account(sandbox, high_counterparty)?
         }
         _ => false,
     };
+    Ok(())
 }
 
 pub(super) fn is_vault_pseudo_account<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     account: AccountID,
-) -> bool {
-    sandbox
-        .read(protocol::account_keylet(raw_account_id(account)))
-        .ok()
-        .flatten()
-        .is_some_and(|sle| sle.is_field_present(sf("sfVaultID")))
+) -> Result<bool, ledger::ViewError> {
+    Ok(sandbox
+        .read(protocol::account_keylet(raw_account_id(account)))?
+        .is_some_and(|sle| sle.is_field_present(sf("sfVaultID"))))
 }
 
 pub(super) fn validates_mpt_issuance_lifecycle(lifecycle: &MptIssuanceLifecycle) -> bool {

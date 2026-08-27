@@ -150,12 +150,17 @@ fn permissioned_domain_delete_do_apply_requires_loaded_domain_then_delegates() {
 }
 
 #[test]
-#[should_panic(
-    expected = "PermissionedDomainDelete::doApply expects owner and nonzero owner count"
-)]
-fn permissioned_domain_delete_loaded_keeps_cpp_owner_assert_boundary() {
+fn permissioned_domain_delete_loaded_fails_closed_at_cpp_owner_assert_boundary() {
     let mut sink = TestLoadedSink::new();
     sink.owner_and_count_valid = false;
 
-    let _ = run_permissioned_domain_delete_loaded(&mut sink);
+    // rippled expresses this impossible-state boundary as XRPL_ASSERT and
+    // subsequently dereferences the owner in release builds.  Rust must not
+    // reproduce a debug crash or release UB: fail closed with the internal
+    // code while preserving valid-ledger mutation order.
+    assert_eq!(
+        run_permissioned_domain_delete_loaded(&mut sink),
+        Ter::TEF_INTERNAL
+    );
+    assert_eq!(sink.events, ["dir_remove", "owner_and_count"]);
 }

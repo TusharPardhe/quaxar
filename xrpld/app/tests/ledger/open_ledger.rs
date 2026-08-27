@@ -132,18 +132,54 @@ fn openledger_apply_skips_transactions_already_in_closed_ledger() {
     };
     let mut view = StubView::empty("next");
 
-    run_open_ledger_apply(
-        &mut view,
-        &|tx_id: &u32| *tx_id == 2,
-        vec![StubTx::new(1), StubTx::new(2), StubTx::new(3)],
-        &mut retries,
-        ApplyFlags::NONE,
-        &mut apply,
+    assert!(
+        run_open_ledger_apply(
+            &mut view,
+            &|tx_id: &u32| Ok::<_, ()>(*tx_id == 2),
+            vec![StubTx::new(1), StubTx::new(2), StubTx::new(3)],
+            &mut retries,
+            ApplyFlags::NONE,
+            &mut apply,
+        )
+        .is_empty()
     );
 
     assert_eq!(seen.into_inner(), vec![1, 3]);
     assert_eq!(view.txs, vec![StubTx::new(1), StubTx::new(3)]);
     assert!(retries.is_empty());
+}
+
+#[test]
+fn openledger_accept_skips_only_transaction_with_failed_parent_lookup() {
+    let owner = OpenLedger::new(StubView {
+        txs: vec![StubTx::new(7)],
+        label: "current",
+    });
+    let mut retries = Vec::new();
+    let mut apply = |_view: &mut StubView, _tx: &StubTx, _flags: ApplyFlags| {
+        panic!("transaction application must not run after a parent lookup failure")
+    };
+    let mut apply_local = |_view: &mut StubView, _tx: &StubTx, _flags: ApplyFlags| {};
+    let mut should_relay = |_tx_id: &u32| true;
+    let mut relay = |_tx: &StubTx| {};
+
+    let result = owner.accept(
+        || StubView::empty("next"),
+        &|_: &u32| Err::<bool, _>("missing parent transaction branch"),
+        std::iter::empty::<StubTx>(),
+        false,
+        &mut retries,
+        ApplyFlags::NONE,
+        &mut apply,
+        &mut apply_local,
+        None::<fn(&mut StubView) -> bool>,
+        &mut should_relay,
+        &mut relay,
+    );
+
+    assert_eq!(result, vec!["missing parent transaction branch"]);
+    assert_eq!(owner.current().label, "next");
+    assert!(owner.current().txs.is_empty());
 }
 
 #[test]
@@ -171,13 +207,16 @@ fn openledger_apply_runs_final_non_retry_pass_after_retry_passes() {
     };
     let mut view = StubView::empty("next");
 
-    run_open_ledger_apply(
-        &mut view,
-        &|_: &u32| false,
-        std::iter::empty::<StubTx>(),
-        &mut retries,
-        ApplyFlags::NONE,
-        &mut apply,
+    assert!(
+        run_open_ledger_apply(
+            &mut view,
+            &|_: &u32| Ok::<_, ()>(false),
+            std::iter::empty::<StubTx>(),
+            &mut retries,
+            ApplyFlags::NONE,
+            &mut apply,
+        )
+        .is_empty()
     );
 
     let seen = seen_flags.into_inner();
@@ -274,25 +313,29 @@ fn openledger_accept_preservesing_for_retries_current_modifier_locals_and_relay(
         calls.borrow_mut().push(format!("relay:{}", tx.id));
     };
 
-    owner.accept(
-        || {
-            calls.borrow_mut().push("create".to_string());
-            StubView::empty("next")
-        },
-        &|_: &u32| false,
-        vec![StubTx::new(3)],
-        true,
-        &mut retries,
-        ApplyFlags::FAIL_HARD,
-        &mut apply,
-        &mut apply_local,
-        Some(|view: &mut StubView| {
-            calls.borrow_mut().push("modify".to_string());
-            view.label = "modified";
-            true
-        }),
-        &mut should_relay,
-        &mut relay,
+    assert!(
+        owner
+            .accept(
+                || {
+                    calls.borrow_mut().push("create".to_string());
+                    StubView::empty("next")
+                },
+                &|_: &u32| Ok::<_, ()>(false),
+                vec![StubTx::new(3)],
+                true,
+                &mut retries,
+                ApplyFlags::FAIL_HARD,
+                &mut apply,
+                &mut apply_local,
+                Some(|view: &mut StubView| {
+                    calls.borrow_mut().push("modify".to_string());
+                    view.label = "modified";
+                    true
+                }),
+                &mut should_relay,
+                &mut relay,
+            )
+            .is_empty()
     );
 
     assert!(retries.is_empty());

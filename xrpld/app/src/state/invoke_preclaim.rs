@@ -10,15 +10,141 @@ use protocol::{
     AccountID, ApplyFlags, NotTec, PublicKey, STLedgerEntry, STObject, STTx, Ter, calc_account_id,
     feature_batch, feature_lending_protocol, get_field_by_symbol, is_tes_success, lsfDisableMaster,
 };
+use std::cell::Cell;
 use tx::{
     TransactorCheckFeeTx, TransactorCheckPermissionTx, TransactorCheckPriorTxAndLastLedgerTx,
     TransactorCheckSeqProxyTx, TransactorMultiSignAccountSigner, TransactorMultiSignSignerList,
     TransactorMultiSignTxSigner, TransactorSignMultiSignObject, TransactorSignObject,
     TransactorSignTx, TransactorSingleSignAccountState, run_batch_check_sign,
-    run_check_tx_permission, run_transactor_check_fee, run_transactor_check_permission,
+    run_check_tx_permission, run_transactor_check_permission,
     run_transactor_check_prior_tx_and_last_ledger, run_transactor_check_seq_proxy,
     run_transactor_invoke_preclaim, run_transactor_preclaim_check_sign,
 };
+
+fn check_sponsor<V: ReadView>(view: &V, tx: &STTx) -> NotTec {
+    if !tx.is_field_present(sf("sfSponsor")) {
+        return Ter::TES_SUCCESS;
+    }
+
+    let sponsor = tx.get_account_id(sf("sfSponsor"));
+    let sponsor_flags = tx.get_field_u32(sf("sfSponsorFlags"));
+    if tx.is_field_present(sf("sfDelegate")) && ledger::is_reserve_sponsored(sponsor_flags) {
+        return Ter::TEM_INVALID;
+    }
+    match read_account_result(view, &sponsor) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Ter::TER_NO_ACCOUNT,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    }
+    if tx.is_field_present(sf("sfSponsorSignature")) {
+        return Ter::TES_SUCCESS;
+    }
+
+    let keylet = protocol::sponsorship_keylet(
+        Uint160::from_void(sponsor.data()),
+        Uint160::from_void(tx.get_initiator().data()),
+    );
+    let sponsorship = match view.read(keylet) {
+        Ok(Some(sponsorship)) => sponsorship,
+        Ok(None) => return Ter::TER_NO_PERMISSION,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    let flags = sponsorship.get_field_u32(sf("sfFlags"));
+    if ledger::is_fee_sponsored(sponsor_flags)
+        && flags & protocol::LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_FEE != 0
+    {
+        return Ter::TER_NO_PERMISSION;
+    }
+    if ledger::is_reserve_sponsored(sponsor_flags)
+        && flags & protocol::LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_RESERVE != 0
+    {
+        return Ter::TER_NO_PERMISSION;
+    }
+    Ter::TES_SUCCESS
+}
+
+fn check_fee<V: ReadView>(
+    view: &V,
+    tx: &STTx,
+    flags: ApplyFlags,
+    base_fee: i64,
+    minimum_fee: impl FnOnce(i64) -> i64,
+) -> Ter {
+    let fee = tx.get_field_amount(sf("sfFee"));
+    if !fee.native() || fee.negative() || !fee.is_legal_net() {
+        return Ter::TEM_BAD_FEE;
+    }
+    let paid = fee.xrp().drops();
+    if (flags & ApplyFlags::BATCH) == ApplyFlags::BATCH {
+        return if paid == 0 {
+            Ter::TES_SUCCESS
+        } else {
+            Ter::TEM_BAD_FEE
+        };
+    }
+    if view.open() && paid < minimum_fee(base_fee) {
+        return Ter::TEL_INSUF_FEE_P;
+    }
+    if paid == 0 {
+        return Ter::TES_SUCCESS;
+    }
+
+    let fee_sponsored = tx.is_field_present(sf("sfSponsor"))
+        && ledger::is_fee_sponsored(tx.get_field_u32(sf("sfSponsorFlags")));
+    let max_spendable = if fee_sponsored {
+        let sponsor = tx.get_account_id(sf("sfSponsor"));
+        let sponsorship_keylet = protocol::sponsorship_keylet(
+            Uint160::from_void(sponsor.data()),
+            Uint160::from_void(tx.get_initiator().data()),
+        );
+        let sponsorship = match view.read(sponsorship_keylet) {
+            Ok(sponsorship) => sponsorship,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        if let Some(sponsorship) = sponsorship {
+            let balance = if sponsorship.is_field_present(sf("sfFeeAmount")) {
+                sponsorship
+                    .get_field_amount(sf("sfFeeAmount"))
+                    .xrp()
+                    .drops()
+            } else {
+                0
+            };
+            if sponsorship.is_field_present(sf("sfMaxFee")) {
+                balance.min(sponsorship.get_field_amount(sf("sfMaxFee")).xrp().drops())
+            } else {
+                balance
+            }
+        } else {
+            let account = match read_account_result(view, &sponsor) {
+                Ok(Some(account)) => account,
+                Ok(None) => return Ter::TER_NO_ACCOUNT,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            };
+            let balance = account.get_field_amount(sf("sfBalance")).xrp().drops();
+            let reserve = ledger::effective_account_reserve(view.fees(), &account, 0, 0) as i64;
+            balance.saturating_sub(reserve).max(0)
+        }
+    } else {
+        let payer = tx.get_initiator();
+        let account = match read_account_result(view, &payer) {
+            Ok(Some(account)) => account,
+            Ok(None) => return Ter::TER_NO_ACCOUNT,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        account.get_field_amount(sf("sfBalance")).xrp().drops()
+    };
+
+    if max_spendable < paid {
+        if max_spendable > 0 && !view.open() {
+            Ter::TEC_INSUFF_FEE
+        } else {
+            Ter::TER_INSUF_FEE_B
+        }
+    } else {
+        Ter::TES_SUCCESS
+    }
+}
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
@@ -31,8 +157,22 @@ fn account_keylet(account: AccountID) -> protocol::Keylet {
 fn read_account<V: ReadView>(
     view: &V,
     account: &AccountID,
+    read_failed: &Cell<bool>,
 ) -> Option<std::sync::Arc<STLedgerEntry>> {
-    view.read(account_keylet(*account)).ok().flatten()
+    match view.read(account_keylet(*account)) {
+        Ok(account) => account,
+        Err(_) => {
+            read_failed.set(true);
+            None
+        }
+    }
+}
+
+fn read_account_result<V: ReadView>(
+    view: &V,
+    account: &AccountID,
+) -> Result<Option<std::sync::Arc<STLedgerEntry>>, ledger::ViewError> {
+    view.read(account_keylet(*account))
 }
 
 fn is_pseudo_account(account: Option<&LedgerSignAccountState>) -> bool {
@@ -70,7 +210,7 @@ where
         flags,
         None,
         || Ter::TES_SUCCESS,
-        calculate_base_fee,
+        || Ok(calculate_base_fee()),
         minimum_fee,
         typed_preclaim_tail,
     )
@@ -97,7 +237,7 @@ pub(crate) fn invoke_preclaim_with_parent_batch_id<
 ) -> Ter
 where
     V: ReadView,
-    CalculateBaseFee: FnOnce() -> i64,
+    CalculateBaseFee: FnOnce() -> Result<i64, Ter>,
     MinimumFee: FnOnce(i64) -> i64,
     TypedPreclaimTail: FnOnce() -> Ter,
 {
@@ -108,28 +248,44 @@ where
 
     let adapted = LedgerPreclaimTx { tx };
     let account_is_zero = tx.get_account_id(sf("sfAccount")).is_zero();
+    if !account_is_zero && read_account_result(view, &tx.get_account_id(sf("sfAccount"))).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
+    let base_fee_failure = Cell::new(None);
     run_transactor_invoke_preclaim(
         account_is_zero,
         || {
-            run_transactor_check_seq_proxy(
+            let read_failed = Cell::new(false);
+            let result = run_transactor_check_seq_proxy(
                 &adapted,
-                |account| read_account(view, account).map(LedgerSignAccountState::from),
-                |account| account.sequence,
-                |account, seq_proxy| {
-                    view.exists(protocol::ticket_keylet_from_seq_proxy(
-                        Uint160::from_void(account.data()),
-                        seq_proxy,
-                    ))
-                    .unwrap_or(false)
+                |account| {
+                    read_account(view, account, &read_failed).map(LedgerSignAccountState::from)
                 },
-            )
+                |account| account.sequence,
+                |account, seq_proxy| match view.exists(protocol::ticket_keylet_from_seq_proxy(
+                    Uint160::from_void(account.data()),
+                    seq_proxy,
+                )) {
+                    Ok(exists) => exists,
+                    Err(_) => {
+                        read_failed.set(true);
+                        false
+                    }
+                },
+            );
+            if read_failed.get() {
+                Ter::TEF_BAD_LEDGER
+            } else {
+                result
+            }
         },
         || {
-            run_transactor_check_prior_tx_and_last_ledger(
+            let read_failed = Cell::new(false);
+            let result = run_transactor_check_prior_tx_and_last_ledger(
                 current_ledger_seq,
                 &adapted,
-                |account| read_account(view, account),
+                |account| read_account(view, account, &read_failed),
                 |account| {
                     if account.is_field_present(sf("sfAccountTxnID")) {
                         account.get_field_h256(sf("sfAccountTxnID"))
@@ -137,10 +293,27 @@ where
                         Uint256::zero()
                     }
                 },
-                |tx_id| view.tx_exists(*tx_id).unwrap_or(false),
-            )
+                |tx_id| match view.tx_exists(*tx_id) {
+                    Ok(exists) => exists,
+                    Err(_) => {
+                        read_failed.set(true);
+                        false
+                    }
+                },
+            );
+            if read_failed.get() {
+                Ter::TEF_BAD_LEDGER
+            } else {
+                result
+            }
         },
-        || typed_check_permission(view, tx, &adapted),
+        || {
+            let sponsor = check_sponsor(view, tx);
+            if !protocol::is_tes_success(sponsor) {
+                return sponsor;
+            }
+            typed_check_permission(view, tx, &adapted)
+        },
         || {
             let check_standard_sign = || {
                 if tx.get_txn_type() == protocol::TxType::LOAN_SET {
@@ -162,19 +335,19 @@ where
                 check_standard_sign()
             }
         },
-        calculate_base_fee,
+        || match calculate_base_fee() {
+            Ok(base_fee) => base_fee,
+            Err(ter) => {
+                base_fee_failure.set(Some(ter));
+                0
+            }
+        },
         |base_fee| {
-            run_transactor_check_fee(
-                flags,
-                view.open(),
-                &adapted,
-                base_fee,
-                0_i64,
-                |_| true,
-                minimum_fee,
-                |payer| read_account(view, payer).map(LedgerSignAccountState::from),
-                |account| account.balance,
-            )
+            if let Some(ter) = base_fee_failure.get() {
+                ter
+            } else {
+                check_fee(view, tx, flags, base_fee, minimum_fee)
+            }
         },
         typed_preclaim_tail,
     )
@@ -222,14 +395,12 @@ fn read_delegate_permissions<V: ReadView>(
     view: &V,
     account: AccountID,
     delegate: AccountID,
-) -> Option<LedgerDelegatePermissions> {
+) -> Result<Option<LedgerDelegatePermissions>, ledger::ViewError> {
     view.read(protocol::delegate_keylet(
         Uint160::from_void(account.data()),
         Uint160::from_void(delegate.data()),
     ))
-    .ok()
-    .flatten()
-    .map(LedgerDelegatePermissions::from_entry)
+    .map(|entry| entry.map(LedgerDelegatePermissions::from_entry))
 }
 
 fn tx_permission_result(delegate: &LedgerDelegatePermissions, tx: &STTx) -> NotTec {
@@ -245,19 +416,93 @@ fn typed_check_permission<V: ReadView>(
     let delegate = tx
         .is_field_present(sf("sfDelegate"))
         .then(|| tx.get_account_id(sf("sfDelegate")));
-    let delegate_permissions =
-        delegate.and_then(|delegate| read_delegate_permissions(view, account, delegate));
+    let delegate_permissions = match delegate {
+        Some(delegate) => match read_delegate_permissions(view, account, delegate) {
+            Ok(permissions) => permissions,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        },
+        None => None,
+    };
+
+    // Match `Transactor::checkPermission` before transaction-specific
+    // `checkGranularSemantics`: transaction-level permission short-circuits;
+    // otherwise all held granular permissions for this transaction contribute
+    // a union of permitted flags and fields.
+    if delegate.is_some() {
+        let Some(permissions) = delegate_permissions.as_ref() else {
+            return Ter::TER_NO_DELEGATE_PERMISSION;
+        };
+        if is_tes_success(tx_permission_result(permissions, tx)) {
+            return Ter::TES_SUCCESS;
+        }
+        let registry = protocol::Permission::get_instance();
+        let held = permissions
+            .permissions
+            .iter()
+            .filter_map(|value| registry.get_granular_type(*value))
+            .filter(|permission| {
+                registry.get_granular_tx_type(*permission) == Some(tx.get_txn_type())
+            })
+            .collect::<Vec<_>>();
+        if held.is_empty() || !registry.check_granular_sandbox(tx, held) {
+            return Ter::TER_NO_DELEGATE_PERMISSION;
+        }
+    }
 
     match tx.get_txn_type() {
         protocol::TxType::ACCOUNT_SET => tx::run_account_set_check_permission(
             adapted,
-            |account, delegate| read_delegate_permissions(view, *account, *delegate),
+            |_account, _delegate| delegate_permissions.clone(),
             |permissions, permission| permissions.permissions.contains(&(permission as u32)),
         ),
         protocol::TxType::PAYMENT => {
             let amount = tx.get_field_amount(sf("sfAmount"));
             let asset = amount.asset();
             let issuer = asset.issuer();
+            let destination = tx.get_account_id(sf("sfDestination"));
+            // Payment::checkGranularSemantics determines IOU mint/burn from
+            // the source/destination trust-line orientation, not from the
+            // sfAmount issuer alias alone.  In particular, keylet::trustLine
+            // is built from both endpoints even when sfAmount names the
+            // source as issuer.
+            let (trustline_exists, account_is_holder, dest_limit_positive) = if delegate.is_some() {
+                match asset {
+                    protocol::Asset::Issue(issue)
+                        if !issue.native()
+                            && (issue.account == account || issue.account == destination) =>
+                    {
+                        let line =
+                            match view.read(protocol::line(account, destination, issue.currency)) {
+                                Ok(line) => line,
+                                Err(_) => return Ter::TEF_BAD_LEDGER,
+                            };
+                        match line {
+                            Some(line) => {
+                                let account_is_low = account < destination;
+                                let dest_limit = line.get_field_amount(if account_is_low {
+                                    sf("sfHighLimit")
+                                } else {
+                                    sf("sfLowLimit")
+                                });
+                                let raw_balance = line.get_field_amount(sf("sfBalance"));
+                                (
+                                    true,
+                                    Some(if account_is_low {
+                                        raw_balance.signum() > 0
+                                    } else {
+                                        raw_balance.signum() < 0
+                                    }),
+                                    Some(dest_limit.signum() > 0),
+                                )
+                            }
+                            None => (false, None, None),
+                        }
+                    }
+                    _ => (false, None, None),
+                }
+            } else {
+                (false, None, None)
+            };
             tx::run_payment_check_permission(tx::PaymentCheckPermissionFacts {
                 delegate_present: delegate.is_some(),
                 delegate_entry_exists: delegate_permissions.is_some(),
@@ -283,27 +528,20 @@ fn typed_check_permission<V: ReadView>(
                 amount_is_xrp: amount.native(),
                 is_mpt: matches!(asset, protocol::Asset::MPTIssue(_)),
                 amount_issuer_is_source: !amount.native() && issuer == account,
-                amount_issuer_is_destination: !amount.native()
-                    && issuer == tx.get_account_id(sf("sfDestination")),
-                trustline_exists: match asset {
-                    protocol::Asset::Issue(issue) if !issue.native() => view
-                        .read(protocol::line(account, issuer, issue.currency))
-                        .ok()
-                        .flatten()
-                        .is_some(),
-                    _ => false,
-                },
-                account_is_holder: None,
-                dest_limit_positive: None,
+                amount_issuer_is_destination: !amount.native() && issuer == destination,
+                trustline_exists,
+                account_is_holder,
+                dest_limit_positive,
             })
         }
         protocol::TxType::TRUST_SET => {
             let limit = tx.get_field_amount(sf("sfLimitAmount"));
             let issuer = limit.issue().account;
-            let trustline = view
-                .read(protocol::line(account, issuer, limit.issue().currency))
-                .ok()
-                .flatten();
+            let trustline = match view.read(protocol::line(account, issuer, limit.issue().currency))
+            {
+                Ok(line) => line,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            };
             let current_limit_equals_proposed_limit = trustline.as_ref().is_some_and(|line| {
                 let current = line.get_field_amount(if account > issuer {
                     sf("sfHighLimit")
@@ -378,7 +616,7 @@ fn typed_check_permission<V: ReadView>(
         }
         _ => run_transactor_check_permission(
             adapted,
-            |account, delegate| read_delegate_permissions(view, *account, *delegate),
+            |_account, _delegate| delegate_permissions.clone(),
             |permissions, delegated_tx| tx_permission_result(&permissions, delegated_tx.tx),
         ),
     }
@@ -510,20 +748,7 @@ impl TransactorCheckFeeTx for LedgerPreclaimTx<'_> {
     }
 
     fn fee_payer(&self) -> Self::AccountId {
-        // `../rippled/src/libxrpl/protocol/STTx.cpp::STTx::getFeePayer`
-        // selects sfDelegate when present. Once `checkSign` selected that
-        // delegate, checking sfAccount again here would reject legitimate
-        // delegated fee-claim (tec) outcomes before apply can charge the
-        // delegate. A sponsor remains the explicit higher-priority payer.
-        self.tx
-            .is_field_present(sf("sfSponsor"))
-            .then(|| self.tx.get_account_id(sf("sfSponsor")))
-            .or_else(|| {
-                self.tx
-                    .is_field_present(sf("sfDelegate"))
-                    .then(|| self.tx.get_account_id(sf("sfDelegate")))
-            })
-            .unwrap_or_else(|| self.tx.get_account_id(sf("sfAccount")))
+        self.tx.get_fee_payer_id()
     }
 }
 
@@ -543,6 +768,7 @@ impl TransactorSignTx for LedgerPreclaimTx<'_> {
     }
 }
 
+#[derive(Clone)]
 struct LedgerDelegatePermissions {
     permissions: Vec<u32>,
 }
@@ -791,21 +1017,28 @@ fn check_loan_set_counterparty_sign<V: ReadView>(
         tx,
         counterparty_signature: tx.get_field_object(sf("sfCounterpartySignature")),
     };
-    tx::run_loan_set_check_sign(
+    let read_failed = Cell::new(false);
+    let result = tx::run_loan_set_check_sign(
         &adapted,
-        || {
-            view.read(protocol::loan_broker_keylet_from_key(
-                tx.get_field_h256(sf("sfLoanBrokerID")),
-            ))
-            .ok()
-            .flatten()
-            .map(|broker| broker.get_account_id(sf("sfOwner")))
+        || match view.read(protocol::loan_broker_keylet_from_key(
+            tx.get_field_h256(sf("sfLoanBrokerID")),
+        )) {
+            Ok(broker) => broker.map(|broker| broker.get_account_id(sf("sfOwner"))),
+            Err(_) => {
+                read_failed.set(true);
+                None
+            }
         },
         check_primary_sign,
         |counter_signer, signature| {
             check_ledger_counterparty_signer_authorization(view, counter_signer, signature, flags)
         },
-    )
+    );
+    if read_failed.get() {
+        Ter::TEF_BAD_LEDGER
+    } else {
+        result
+    }
 }
 
 fn check_ledger_counterparty_signer_authorization<V: ReadView>(
@@ -818,19 +1051,21 @@ fn check_ledger_counterparty_signer_authorization<V: ReadView>(
         account: counter_signer,
     };
     let signature = LedgerCounterpartySignatureObject { object: signature };
-    tx::run_transactor_preclaim_check_sign(
+    let read_failed = Cell::new(false);
+    let result = tx::run_transactor_preclaim_check_sign(
         flags,
         false,
         view.rules().enabled(&feature_batch()),
         view.rules().enabled(&feature_lending_protocol()),
         &signer_tx,
         &signature,
-        |account| read_account(view, account).map(LedgerSignAccountState::from),
-        |account| {
-            view.read(protocol::signers_keylet(Uint160::from_void(account.data())))
-                .ok()
-                .flatten()
-                .map(LedgerSignerList::from)
+        |account| read_account(view, account, &read_failed).map(LedgerSignAccountState::from),
+        |account| match view.read(protocol::signers_keylet(Uint160::from_void(account.data()))) {
+            Ok(signers) => signers.map(LedgerSignerList::from),
+            Err(_) => {
+                read_failed.set(true);
+                None
+            }
         },
         is_pseudo_account,
         |signature| {
@@ -847,7 +1082,12 @@ fn check_ledger_counterparty_signer_authorization<V: ReadView>(
                 .expect("public-key type was checked before account derivation");
             calc_account_id(key.as_bytes())
         },
-    )
+    );
+    if read_failed.get() {
+        Ter::TEF_BAD_LEDGER
+    } else {
+        result
+    }
 }
 
 fn check_ledger_signer_authorization<V: ReadView>(
@@ -861,19 +1101,21 @@ fn check_ledger_signer_authorization<V: ReadView>(
     // Transactor::checkSign(PreclaimContext). `Batch::checkSign` then runs
     // its BatchSigners tail before `invokePreclaim` reaches checkFee.
     let signature = LedgerSignatureObject { tx: tx.tx };
-    run_transactor_preclaim_check_sign(
+    let read_failed = Cell::new(false);
+    let result = run_transactor_preclaim_check_sign(
         flags,
         parent_batch_id.is_some(),
         view.rules().enabled(&feature_batch()),
         view.rules().enabled(&feature_lending_protocol()),
         tx,
         &signature,
-        |account| read_account(view, account).map(LedgerSignAccountState::from),
-        |account| {
-            view.read(protocol::signers_keylet(Uint160::from_void(account.data())))
-                .ok()
-                .flatten()
-                .map(LedgerSignerList::from)
+        |account| read_account(view, account, &read_failed).map(LedgerSignAccountState::from),
+        |account| match view.read(protocol::signers_keylet(Uint160::from_void(account.data()))) {
+            Ok(signers) => signers.map(LedgerSignerList::from),
+            Err(_) => {
+                read_failed.set(true);
+                None
+            }
         },
         is_pseudo_account,
         |signature| {
@@ -890,22 +1132,156 @@ fn check_ledger_signer_authorization<V: ReadView>(
                 .expect("public-key type was checked before account derivation");
             calc_account_id(key.as_bytes())
         },
-    )
+    );
+    if read_failed.get() {
+        Ter::TEF_BAD_LEDGER
+    } else {
+        result
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use basics::base_uint::Uint160;
-    use ledger::{ApplyView, Ledger};
+    use basics::base_uint::{Uint160, Uint256};
+    use ledger::{ApplyView, Ledger, ReadView, ReadViewTx, ViewError};
     use protocol::{
-        AccountID, ApplyFlags, LedgerEntryType, STAmount, STArray, STLedgerEntry, STObject, STTx,
-        Ter, TxType, get_field_by_symbol,
+        AccountID, ApplyFlags, BatchTransactionFlags, Currency, INNER_BATCH_TRANSACTION_FLAG,
+        IOUAmount, Issue, LedgerEntryType, STAmount, STArray, STLedgerEntry, STObject, STTx,
+        StBase, Ter, TxType, get_field_by_symbol, sf_generic,
     };
 
-    use super::{LedgerPreclaimTx, scale_fee_load, typed_check_permission};
+    use super::{
+        LedgerPreclaimTx, check_fee, check_sponsor, invoke_preclaim, scale_fee_load,
+        typed_check_permission,
+    };
     use tx::TransactorCheckFeeTx;
+
+    #[derive(Debug)]
+    struct FaultReadView {
+        base: Arc<Ledger>,
+    }
+
+    impl ReadView for FaultReadView {
+        fn open(&self) -> bool {
+            ReadView::open(self.base.as_ref())
+        }
+        fn header(&self) -> ledger::LedgerHeader {
+            ReadView::header(self.base.as_ref())
+        }
+        fn fees(&self) -> ledger::Fees {
+            ReadView::fees(self.base.as_ref())
+        }
+        fn rules(&self) -> protocol::Rules {
+            ReadView::rules(self.base.as_ref())
+        }
+        fn exists(&self, key: protocol::Keylet) -> Result<bool, ViewError> {
+            ReadView::exists(self.base.as_ref(), key)
+        }
+        fn succ(&self, key: Uint256, last: Option<Uint256>) -> Result<Option<Uint256>, ViewError> {
+            ReadView::succ(self.base.as_ref(), key, last)
+        }
+        fn read(&self, _key: protocol::Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
+            Err(ViewError::Conversion("injected read failure".into()))
+        }
+        fn sles(&self) -> Result<Vec<Arc<STLedgerEntry>>, ViewError> {
+            ReadView::sles(self.base.as_ref())
+        }
+        fn tx_exists(&self, key: Uint256) -> Result<bool, ViewError> {
+            ReadView::tx_exists(self.base.as_ref(), key)
+        }
+        fn tx_read(&self, key: Uint256) -> Result<Option<ReadViewTx>, ViewError> {
+            ReadView::tx_read(self.base.as_ref(), key)
+        }
+        fn txs(&self) -> Result<Vec<ReadViewTx>, ViewError> {
+            ReadView::txs(self.base.as_ref())
+        }
+    }
+
+    #[test]
+    fn shared_sponsor_fee_and_preclaim_reads_fail_hard() {
+        let account = AccountID::from_array([0xE1; 20]);
+        let sponsor = AccountID::from_array([0xE2; 20]);
+        let tx = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+            tx.set_account_id(get_field_by_symbol("sfSponsor"), sponsor);
+            tx.set_field_u32(get_field_by_symbol("sfSponsorFlags"), 1);
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+        });
+        let view = FaultReadView {
+            base: Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false)),
+        };
+        assert_eq!(check_sponsor(&view, &tx), Ter::TEF_BAD_LEDGER);
+        assert_eq!(
+            check_fee(&view, &tx, ApplyFlags::NONE, 10, |fee| fee),
+            Ter::TEF_BAD_LEDGER
+        );
+        assert_eq!(
+            invoke_preclaim(
+                &view,
+                &tx,
+                1,
+                ApplyFlags::NONE,
+                || 10,
+                |fee| fee,
+                || Ter::TES_SUCCESS,
+            ),
+            Ter::TEF_BAD_LEDGER
+        );
+    }
+
+    #[test]
+    fn specialized_and_recursive_batch_base_fee_reads_fail_hard() {
+        let account = AccountID::from_array([0xE3; 20]);
+        let direct = STTx::new(TxType::REGULAR_KEY_SET, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        });
+        let view = FaultReadView {
+            base: Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false)),
+        };
+        assert_eq!(
+            crate::state::application_root::calculate_sttx_base_fee(&view, &direct),
+            Err(Ter::TEF_BAD_LEDGER)
+        );
+
+        let inner = STTx::new(TxType::REGULAR_KEY_SET, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+            tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(0, false));
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), 2);
+            tx.set_field_u32(get_field_by_symbol("sfFlags"), INNER_BATCH_TRANSACTION_FLAG);
+            tx.set_field_vl(get_field_by_symbol("sfSigningPubKey"), &[]);
+        });
+        let mut raw = STArray::new(get_field_by_symbol("sfRawTransactions"));
+        let mut raw_inner = inner.clone_as_object();
+        raw_inner.set_fname(get_field_by_symbol("sfRawTransaction"));
+        raw.push_back(raw_inner);
+        let batch = STTx::new(TxType::BATCH, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+            tx.set_field_u32(
+                get_field_by_symbol("sfFlags"),
+                BatchTransactionFlags::ALL_OR_NOTHING.bits(),
+            );
+            tx.set_field_array(get_field_by_symbol("sfRawTransactions"), raw);
+        });
+        assert_eq!(
+            crate::state::application_root::calculate_sttx_base_fee(&view, &batch),
+            Err(Ter::TEF_BAD_LEDGER)
+        );
+    }
 
     fn insert_delegate(
         view: &mut ledger::Sandbox<ledger::Ledger>,
@@ -929,6 +1305,117 @@ mod tests {
         entry.set_field_array(get_field_by_symbol("sfPermissions"), permission_entries);
         view.insert(Arc::new(entry))
             .expect("delegate entry should insert into the preclaim view");
+    }
+
+    fn insert_account(
+        view: &mut ledger::Sandbox<ledger::Ledger>,
+        account: AccountID,
+        balance: i64,
+        owner_count: u32,
+    ) {
+        let keylet = protocol::account_keylet(Uint160::from_void(account.data()));
+        let mut entry = STLedgerEntry::from_type_and_key(LedgerEntryType::AccountRoot, keylet.key);
+        entry.set_account_id(get_field_by_symbol("sfAccount"), account);
+        entry.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        entry.set_field_u32(get_field_by_symbol("sfOwnerCount"), owner_count);
+        entry.set_field_amount(
+            get_field_by_symbol("sfBalance"),
+            STAmount::new_native(balance.try_into().expect("nonnegative balance"), false),
+        );
+        view.insert(Arc::new(entry)).expect("account insert");
+    }
+
+    fn sponsored_payment(source: AccountID, sponsor: AccountID, fee: i64, co_signed: bool) -> STTx {
+        STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+            tx.set_account_id(
+                get_field_by_symbol("sfDestination"),
+                AccountID::from_array([0xEE; 20]),
+            );
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(fee.try_into().expect("nonnegative fee"), false),
+            );
+            tx.set_field_amount(
+                get_field_by_symbol("sfAmount"),
+                STAmount::new_native(1, false),
+            );
+            tx.set_account_id(get_field_by_symbol("sfSponsor"), sponsor);
+            tx.set_field_u32(get_field_by_symbol("sfSponsorFlags"), 1);
+            if co_signed {
+                tx.set_field_object(
+                    get_field_by_symbol("sfSponsorSignature"),
+                    STObject::make_inner_object(get_field_by_symbol("sfSponsorSignature")),
+                );
+            }
+        })
+    }
+
+    #[test]
+    fn sponsor_preclaim_uses_prefunded_keylet_cap_and_cosigned_reserve() {
+        let source = AccountID::from_array([0x11; 20]);
+        let sponsor = AccountID::from_array([0x22; 20]);
+        let mut view = ledger::Sandbox::new(
+            Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false)),
+            ApplyFlags::NONE,
+        );
+        insert_account(&mut view, source, 1_000_000_000, 0);
+        insert_account(&mut view, sponsor, 1_000_000_000, 0);
+
+        let keylet = protocol::sponsorship_keylet(
+            Uint160::from_void(sponsor.data()),
+            Uint160::from_void(source.data()),
+        );
+        let mut sponsorship =
+            STLedgerEntry::from_type_and_key(LedgerEntryType::Sponsorship, keylet.key);
+        sponsorship.set_field_amount(
+            get_field_by_symbol("sfFeeAmount"),
+            STAmount::new_native(50, false),
+        );
+        sponsorship.set_field_amount(
+            get_field_by_symbol("sfMaxFee"),
+            STAmount::new_native(20, false),
+        );
+        sponsorship.set_field_u32(get_field_by_symbol("sfFlags"), 0);
+        view.insert(Arc::new(sponsorship))
+            .expect("sponsorship insert");
+
+        let capped = sponsored_payment(source, sponsor, 25, false);
+        assert_eq!(check_sponsor(&view, &capped), Ter::TES_SUCCESS);
+        assert_eq!(
+            check_fee(&view, &capped, ApplyFlags::NONE, 10, |fee| fee),
+            Ter::TEC_INSUFF_FEE
+        );
+        let within_cap = sponsored_payment(source, sponsor, 15, false);
+        assert_eq!(
+            check_fee(&view, &within_cap, ApplyFlags::NONE, 10, |fee| fee),
+            Ter::TES_SUCCESS
+        );
+
+        // Removing the prefund selects the co-signed AccountRoot route. Its
+        // reserve, not its full balance, is spendable.
+        let prefund = view.peek(keylet).expect("peek").expect("sponsorship");
+        view.erase(prefund).expect("erase sponsorship");
+        let reserve = view.fees().account_reserve(0) as i64;
+        let sponsor_keylet = protocol::account_keylet(Uint160::from_void(sponsor.data()));
+        let sponsor_root = view.peek(sponsor_keylet).expect("peek").expect("sponsor");
+        let mut sponsor_root =
+            STLedgerEntry::from_stobject(sponsor_root.clone_as_object(), *sponsor_root.key());
+        sponsor_root.set_field_amount(
+            get_field_by_symbol("sfBalance"),
+            STAmount::new_native(
+                (reserve + 10).try_into().expect("nonnegative reserve"),
+                false,
+            ),
+        );
+        view.update(Arc::new(sponsor_root)).expect("update sponsor");
+        let cosigned = sponsored_payment(source, sponsor, 11, true);
+        assert_eq!(check_sponsor(&view, &cosigned), Ter::TES_SUCCESS);
+        assert_eq!(
+            check_fee(&view, &cosigned, ApplyFlags::NONE, 10, |fee| fee),
+            Ter::TEC_INSUFF_FEE
+        );
     }
 
     #[test]
@@ -991,8 +1478,8 @@ mod tests {
 
         assert_eq!(
             typed_check_permission(&view, &account_set, &LedgerPreclaimTx { tx: &account_set }),
-            Ter::TER_NO_DELEGATE_PERMISSION,
-            "AccountSet must not accept a transaction-level permission"
+            Ter::TES_SUCCESS,
+            "the generic rippled permission hierarchy short-circuits on a stored tx-level permission"
         );
         assert_eq!(
             typed_check_permission(&view, &payment, &LedgerPreclaimTx { tx: &payment }),
@@ -1006,6 +1493,56 @@ mod tests {
             typed_check_permission(&view, &mpt_set, &LedgerPreclaimTx { tx: &mpt_set }),
             Ter::TES_SUCCESS,
             "MPTokenIssuanceSet must accept its lock granular permission"
+        );
+    }
+
+    #[test]
+    fn delegated_iou_payment_mint_uses_endpoint_trustline_orientation() {
+        // Payment.cpp::checkGranularSemantics reads keylet::trustLine(source,
+        // destination, currency), then derives mint/burn from sfBalance and
+        // the destination-side limit. sfAmount may name either endpoint as
+        // issuer, so reading line(source, sfAmount.issuer) is not equivalent.
+        let issuer = AccountID::from_array([0x41; 20]);
+        let destination = AccountID::from_array([0x61; 20]);
+        let delegate = AccountID::from_array([0x51; 20]);
+        let currency = Currency::from_array([0x71; 20]);
+        let mut view = ledger::Sandbox::new(
+            Arc::new(ledger::Ledger::from_ledger_seq_and_close_time(1, 0, false)),
+            ApplyFlags::NONE,
+        );
+        insert_delegate(
+            &mut view,
+            issuer,
+            delegate,
+            &[protocol::GranularPermissionType::PaymentMint as u32],
+        );
+        let iou = |mantissa, account| {
+            STAmount::from_iou_amount(
+                sf_generic(),
+                IOUAmount::from_parts(mantissa, 0).expect("valid test IOU"),
+                Issue::new(currency, account),
+            )
+        };
+        let line_keylet = protocol::line(issuer, destination, currency);
+        let mut line =
+            STLedgerEntry::from_type_and_key(LedgerEntryType::RippleState, line_keylet.key);
+        line.set_field_amount(
+            get_field_by_symbol("sfBalance"),
+            iou(0, protocol::no_account()),
+        );
+        line.set_field_amount(get_field_by_symbol("sfLowLimit"), iou(0, issuer));
+        line.set_field_amount(get_field_by_symbol("sfHighLimit"), iou(1_000, destination));
+        view.insert(Arc::new(line)).expect("insert trust line");
+
+        let payment = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), issuer);
+            tx.set_account_id(get_field_by_symbol("sfDelegate"), delegate);
+            tx.set_account_id(get_field_by_symbol("sfDestination"), destination);
+            tx.set_field_amount(get_field_by_symbol("sfAmount"), iou(10, issuer));
+        });
+        assert_eq!(
+            typed_check_permission(&view, &payment, &LedgerPreclaimTx { tx: &payment }),
+            Ter::TES_SUCCESS
         );
     }
 
@@ -1042,12 +1579,31 @@ mod tests {
             tx.set_account_id(get_field_by_symbol("sfAccount"), account);
             tx.set_account_id(get_field_by_symbol("sfDelegate"), delegate);
             tx.set_account_id(get_field_by_symbol("sfSponsor"), sponsor);
+            tx.set_field_u32(get_field_by_symbol("sfSponsorFlags"), 1);
             tx.set_field_amount(
                 get_field_by_symbol("sfFee"),
                 STAmount::new_native(10, false),
             );
         });
         assert_eq!(LedgerPreclaimTx { tx: &sponsored }.fee_payer(), sponsor);
+
+        let reserve_sponsored = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+            tx.set_account_id(get_field_by_symbol("sfDelegate"), delegate);
+            tx.set_account_id(get_field_by_symbol("sfSponsor"), sponsor);
+            tx.set_field_u32(get_field_by_symbol("sfSponsorFlags"), 2);
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+        });
+        assert_eq!(
+            LedgerPreclaimTx {
+                tx: &reserve_sponsored
+            }
+            .fee_payer(),
+            delegate
+        );
     }
 
     #[test]

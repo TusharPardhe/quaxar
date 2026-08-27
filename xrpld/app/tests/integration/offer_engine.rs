@@ -11,8 +11,8 @@
 //! Ported from C++ Offer_test.cpp and OfferStream_test.cpp.
 
 use super::fixtures::*;
+use super::handle_real_dispatch;
 use super::pipeline::full_apply;
-use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{
@@ -184,7 +184,7 @@ fn oe_ioc_flag() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    let r = handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None);
+    let r = full_apply(&mut v, &tx, TxType::OFFER_CREATE);
     assert!(r == Ter::TES_SUCCESS || r.to_int() > 0);
 }
 #[test]
@@ -205,7 +205,7 @@ fn oe_fill_or_kill() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    let r = handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None);
+    let r = full_apply(&mut v, &tx, TxType::OFFER_CREATE);
     assert!(r == Ter::TES_SUCCESS || r.to_int() > 0);
 }
 
@@ -11478,7 +11478,9 @@ fn cpp_offer_create_passive_success() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    let r = handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None);
+    // The fixture asserts the complete C++ transaction pipeline, including
+    // immutable OfferCreate preclaim and the common fee/sequence shell.
+    let r = full_apply(&mut v, &tx, TxType::OFFER_CREATE);
     assert!(
         r == Ter::TES_SUCCESS || r == Ter::TEC_UNFUNDED_OFFER,
         "{:?}",
@@ -11505,7 +11507,7 @@ fn cpp_offer_create_sell_success() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    let r = handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None);
+    let r = full_apply(&mut v, &tx, TxType::OFFER_CREATE);
     assert!(
         r == Ter::TES_SUCCESS || r == Ter::TEC_UNFUNDED_OFFER,
         "{:?}",

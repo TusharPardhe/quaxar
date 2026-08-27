@@ -20,6 +20,7 @@ use std::{
 pub const NUMBER_MIN_EXPONENT: i32 = -32_768;
 pub const NUMBER_MAX_EXPONENT: i32 = 32_768;
 pub const NUMBER_MAX_REP: i64 = i64::MAX;
+pub const NUMBER_MAX_REP_UP: u64 = NUMBER_MAX_REP as u64 + 3;
 pub const NUMBER_ZERO_EXPONENT: i32 = i32::MIN;
 
 pub const MANTISSA_SMALL_MIN: u64 = 1_000_000_000_000_000;
@@ -47,15 +48,20 @@ pub const fn is_power_of_ten(value: u64) -> bool {
 pub enum MantissaScale {
     Small,
     LargeLegacy,
-    Large,
+    Large320,
+    Large330,
 }
 
 impl MantissaScale {
+    #[allow(non_upper_case_globals)]
+    pub const Large: Self = Self::Large330;
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Small => "small",
             Self::LargeLegacy => "largeLegacy",
-            Self::Large => "large",
+            Self::Large320 => "large320",
+            Self::Large330 => "large330",
         }
     }
 }
@@ -123,38 +129,48 @@ pub fn current_mantissa_range() -> MantissaRange {
 pub const fn mantissa_range_min(scale: MantissaScale) -> u64 {
     match scale {
         MantissaScale::Small => MANTISSA_SMALL_MIN,
-        MantissaScale::LargeLegacy => MANTISSA_LARGE_MIN,
-        MantissaScale::Large => MANTISSA_LARGE_MIN,
+        MantissaScale::LargeLegacy | MantissaScale::Large320 | MantissaScale::Large330 => {
+            MANTISSA_LARGE_MIN
+        }
     }
 }
 
 pub const fn mantissa_range_max(scale: MantissaScale) -> u64 {
     match scale {
         MantissaScale::Small => MANTISSA_SMALL_MAX,
-        MantissaScale::LargeLegacy => MANTISSA_LARGE_MAX,
-        MantissaScale::Large => MANTISSA_LARGE_MAX,
+        MantissaScale::LargeLegacy | MantissaScale::Large320 | MantissaScale::Large330 => {
+            MANTISSA_LARGE_MAX
+        }
     }
 }
 
 pub const fn mantissa_range_log(scale: MantissaScale) -> i32 {
     match scale {
         MantissaScale::Small => 15,
-        MantissaScale::LargeLegacy => 18,
-        MantissaScale::Large => 18,
+        MantissaScale::LargeLegacy | MantissaScale::Large320 | MantissaScale::Large330 => 18,
     }
 }
 
 pub const fn signed_external_mantissa_bounds(scale: MantissaScale) -> (i64, i64) {
     match scale {
         MantissaScale::Small => (-(MANTISSA_SMALL_MAX as i64), MANTISSA_SMALL_MAX as i64),
-        MantissaScale::LargeLegacy => (-NUMBER_MAX_REP, NUMBER_MAX_REP),
-        MantissaScale::Large => (-NUMBER_MAX_REP, NUMBER_MAX_REP),
+        MantissaScale::LargeLegacy | MantissaScale::Large320 | MantissaScale::Large330 => {
+            (-NUMBER_MAX_REP, NUMBER_MAX_REP)
+        }
     }
 }
 
 pub const fn external_mantissa_in_range(scale: MantissaScale, value: i64) -> bool {
     let (min, max) = signed_external_mantissa_bounds(scale);
     value >= min && value <= max
+}
+
+const fn cusp_rounding_320_enabled(scale: MantissaScale) -> bool {
+    matches!(scale, MantissaScale::Large320 | MantissaScale::Large330)
+}
+
+const fn cusp_rounding_330_enabled(scale: MantissaScale) -> bool {
+    matches!(scale, MantissaScale::Large330)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,8 +267,9 @@ impl NumberParts {
     pub const fn one(scale: MantissaScale) -> Self {
         match scale {
             MantissaScale::Small => Self::one_small(),
-            MantissaScale::LargeLegacy => Self::one_large(),
-            MantissaScale::Large => Self::one_large(),
+            MantissaScale::LargeLegacy | MantissaScale::Large320 | MantissaScale::Large330 => {
+                Self::one_large()
+            }
         }
     }
 
@@ -563,41 +580,77 @@ impl NumberParts {
         let mut ye = other.exponent;
 
         let mut guard = ArithmeticGuard::default();
+        let rep_limit = if cusp_rounding_330_enabled(scale) {
+            NUMBER_MAX_REP_UP
+        } else {
+            NUMBER_MAX_REP as u64
+        };
+        let upper_limit = u128::from(min_mantissa) * 1_000;
+
+        // Pinned Number::operator+= uses a three-stage exponent alignment for
+        // fixCleanup3_3: first discard exact trailing zeroes, then expand the
+        // smaller mantissa (bounded to three guard digits beyond the range),
+        // and only then discard significant digits into the Guard.  The older
+        // modes intentionally retain the legacy shrink-only behavior.
+        let adjust = |guard: &mut ArithmeticGuard,
+                      expand_m: &mut u128,
+                      expand_e: &mut i32,
+                      shrink_m: &mut u128,
+                      shrink_e: &mut i32|
+         -> Result<(), NumberArithmeticError> {
+            if cusp_rounding_330_enabled(scale) {
+                while *shrink_e < *expand_e && *shrink_m % 10 == 0 {
+                    guard.push((*shrink_m % 10) as u8);
+                    *shrink_m /= 10;
+                    *shrink_e = shrink_e
+                        .checked_add(1)
+                        .ok_or(NumberArithmeticError::Overflow)?;
+                }
+                while *shrink_e < *expand_e
+                    && *expand_e > NUMBER_MIN_EXPONENT
+                    && *expand_m < upper_limit
+                {
+                    *expand_m = expand_m
+                        .checked_mul(10)
+                        .ok_or(NumberArithmeticError::Overflow)?;
+                    *expand_e = expand_e
+                        .checked_sub(1)
+                        .ok_or(NumberArithmeticError::Overflow)?;
+                }
+            }
+            while *shrink_e < *expand_e {
+                guard.push((*shrink_m % 10) as u8);
+                *shrink_m /= 10;
+                *shrink_e = shrink_e
+                    .checked_add(1)
+                    .ok_or(NumberArithmeticError::Overflow)?;
+            }
+            Ok(())
+        };
         if xe < ye {
             if xn {
                 guard.set_negative();
             }
-            while xe < ye {
-                guard.push((xm % 10) as u8);
-                xm /= 10;
-                xe += 1;
-            }
+            adjust(&mut guard, &mut ym, &mut ye, &mut xm, &mut xe)?;
         } else if xe > ye {
             if yn {
                 guard.set_negative();
             }
-            while xe > ye {
-                guard.push((ym % 10) as u8);
-                ym /= 10;
-                ye += 1;
-            }
+            adjust(&mut guard, &mut xm, &mut xe, &mut ym, &mut ye)?;
+        } else if cusp_rounding_330_enabled(scale) && ((xm < ym && xn) || (ym < xm && yn)) {
+            guard.set_negative();
         }
 
         if xn == yn {
             xm = xm.checked_add(ym).ok_or(NumberArithmeticError::Overflow)?;
-            if xm > u128::from(max_mantissa) || xm > u128::from(NUMBER_MAX_REP as u64) {
-                guard.push((xm % 10) as u8);
-                xm /= 10;
-                xe = xe.checked_add(1).ok_or(NumberArithmeticError::Overflow)?;
+            if !cusp_rounding_330_enabled(scale) {
+                if xm > u128::from(max_mantissa) || xm > u128::from(rep_limit) {
+                    guard.push((xm % 10) as u8);
+                    xm /= 10;
+                    xe = xe.checked_add(1).ok_or(NumberArithmeticError::Overflow)?;
+                }
+                guard.do_round_up(&mut xn, &mut xm, &mut xe, min_mantissa, max_mantissa, scale)?;
             }
-            guard.do_round_up(
-                &mut xn,
-                &mut xm,
-                &mut xe,
-                min_mantissa,
-                max_mantissa,
-                scale == MantissaScale::Large,
-            )?;
         } else {
             if xm > ym {
                 xm -= ym;
@@ -607,17 +660,33 @@ impl NumberParts {
                 xn = yn;
             }
 
-            while xm < u128::from(min_mantissa)
-                && xm.saturating_mul(10) <= u128::from(NUMBER_MAX_REP as u64)
-            {
-                xm *= 10;
-                xm = xm.saturating_sub(u128::from(guard.pop()));
-                xe = xe.checked_sub(1).ok_or(NumberArithmeticError::Overflow)?;
+            if cusp_rounding_330_enabled(scale) {
+                while xm < upper_limit && !guard.empty() {
+                    xm = xm.checked_mul(10).ok_or(NumberArithmeticError::Overflow)?;
+                    xm = xm.saturating_sub(u128::from(guard.pop()));
+                    xe = xe.checked_sub(1).ok_or(NumberArithmeticError::Overflow)?;
+                }
+            } else {
+                while xm < u128::from(min_mantissa)
+                    && xm.saturating_mul(10) <= u128::from(rep_limit)
+                {
+                    xm *= 10;
+                    xm = xm.saturating_sub(u128::from(guard.pop()));
+                    xe = xe.checked_sub(1).ok_or(NumberArithmeticError::Overflow)?;
+                }
             }
-            guard.do_round_down(&mut xn, &mut xm, &mut xe, min_mantissa);
+            guard.do_round_down(&mut xn, &mut xm, &mut xe, min_mantissa, max_mantissa, scale);
         }
 
-        *self = Self::finish_arithmetic_result(xn, xm, xe, scale)?;
+        *self = Self::normalize_arithmetic_parts_with_dropped(
+            xn,
+            xm,
+            xe,
+            min_mantissa,
+            max_mantissa,
+            scale,
+            cusp_rounding_330_enabled(scale) && !guard.empty(),
+        )?;
         Ok(())
     }
 
@@ -653,20 +722,21 @@ impl NumberParts {
             guard.set_negative();
         }
 
-        while zm > u128::from(max_mantissa) || zm > u128::from(NUMBER_MAX_REP as u64) {
+        let rep_limit = if cusp_rounding_330_enabled(scale) {
+            NUMBER_MAX_REP_UP
+        } else {
+            NUMBER_MAX_REP as u64
+        };
+        while zm > u128::from(max_mantissa) || zm > u128::from(rep_limit) {
             guard.push((zm % 10) as u8);
             zm /= 10;
             ze = ze.checked_add(1).ok_or(NumberArithmeticError::Overflow)?;
         }
 
-        guard.do_round_up(
-            &mut zn,
-            &mut zm,
-            &mut ze,
-            min_mantissa,
-            max_mantissa,
-            scale == MantissaScale::Large,
-        )?;
+        guard.do_round_up(&mut zn, &mut zm, &mut ze, min_mantissa, max_mantissa, scale)?;
+        // Pinned operator*= invokes normalize(g), which reuses only the
+        // Guard's mantissa range/amendment mode; unlike operator+= it does not
+        // propagate the old guard's trailing-digit bit into doNormalize.
         *self = Self::finish_arithmetic_result(zn, zm, ze, scale)?;
         Ok(())
     }
@@ -683,7 +753,7 @@ impl NumberParts {
         let scale = get_mantissa_scale();
         let min_mantissa = mantissa_range_min(scale);
         let max_mantissa = mantissa_range_max(scale);
-        let cusp_fix = scale == MantissaScale::Large;
+        let cusp_fix = cusp_rounding_320_enabled(scale);
 
         // Stage 1: initial division with factor of 10^17
         const FACTOR_EXPONENT: i32 = 17;
@@ -805,6 +875,11 @@ impl NumberParts {
         if mantissa == 0 {
             return Ok(Self::zero());
         }
+        let rep_limit = if cusp_rounding_330_enabled(scale) {
+            NUMBER_MAX_REP_UP
+        } else {
+            NUMBER_MAX_REP as u64
+        };
 
         while mantissa < u128::from(min_mantissa) && exponent > NUMBER_MIN_EXPONENT {
             mantissa = mantissa
@@ -834,7 +909,7 @@ impl NumberParts {
             return Ok(Self::zero());
         }
 
-        if mantissa > u128::from(NUMBER_MAX_REP as u64) {
+        if mantissa > u128::from(rep_limit) {
             if exponent >= NUMBER_MAX_EXPONENT {
                 return Err(NumberArithmeticError::Overflow);
             }
@@ -849,7 +924,7 @@ impl NumberParts {
             &mut exponent,
             min_mantissa,
             max_mantissa,
-            scale == MantissaScale::Large,
+            scale,
         )?;
 
         Self::finish_arithmetic_result(negative, mantissa, exponent, scale)
@@ -913,6 +988,10 @@ impl ArithmeticGuard {
         digit
     }
 
+    fn empty(&self) -> bool {
+        self.digits == 0 && !self.has_extra
+    }
+
     fn round(&self) -> i8 {
         match get_rounding_mode() {
             RoundingMode::TowardsZero => -1,
@@ -953,12 +1032,15 @@ impl ArithmeticGuard {
         mantissa: &mut u128,
         exponent: &mut i32,
         min_mantissa: u64,
+        scale: MantissaScale,
     ) {
-        if *mantissa < u128::from(min_mantissa) {
+        if *mantissa < u128::from(min_mantissa)
+            && (!cusp_rounding_330_enabled(scale) || *mantissa != 0)
+        {
             *mantissa *= 10;
             *exponent -= 1;
         }
-        if *exponent < NUMBER_MIN_EXPONENT {
+        if *exponent < NUMBER_MIN_EXPONENT || (cusp_rounding_330_enabled(scale) && *mantissa == 0) {
             *negative = false;
             *mantissa = 0;
             *exponent = NUMBER_ZERO_EXPONENT;
@@ -972,17 +1054,38 @@ impl ArithmeticGuard {
         exponent: &mut i32,
         min_mantissa: u64,
         max_mantissa: u64,
-        cusp_rounding_fix_enabled: bool,
+        scale: MantissaScale,
     ) -> Result<(), NumberArithmeticError> {
+        if cusp_rounding_330_enabled(scale)
+            && *mantissa >= u128::from(NUMBER_MAX_REP as u64)
+            && *mantissa < u128::from(NUMBER_MAX_REP_UP)
+        {
+            if *mantissa % 10 < 9 {
+                let rounded = self.round();
+                if rounded == 1
+                    || (rounded == 0 && *mantissa == u128::from(NUMBER_MAX_REP as u64 + 1))
+                {
+                    *mantissa += 1;
+                }
+            }
+            let diff = *mantissa - u128::from(NUMBER_MAX_REP as u64);
+            let digit = (diff * 10 / u128::from(NUMBER_MAX_REP_UP - NUMBER_MAX_REP as u64)) as u8;
+            self.push(digit);
+        }
         let rounded = self.round();
         if rounded == 1 || (rounded == 0 && (*mantissa & 1) == 1) {
             let safe_to_increment = |mantissa: u128| {
                 mantissa < u128::from(max_mantissa) && mantissa < u128::from(NUMBER_MAX_REP as u64)
             };
 
-            if cusp_rounding_fix_enabled {
+            if cusp_rounding_320_enabled(scale) {
                 if safe_to_increment(*mantissa) {
                     *mantissa += 1;
+                } else if cusp_rounding_330_enabled(scale)
+                    && *mantissa > u128::from(NUMBER_MAX_REP as u64)
+                    && *mantissa < u128::from(NUMBER_MAX_REP_UP)
+                {
+                    *mantissa = u128::from(NUMBER_MAX_REP_UP);
                 } else {
                     self.push((*mantissa % 10) as u8);
                     *mantissa /= 10;
@@ -998,7 +1101,7 @@ impl ArithmeticGuard {
                         exponent,
                         min_mantissa,
                         max_mantissa,
-                        cusp_rounding_fix_enabled,
+                        scale,
                     )?;
                     return Ok(());
                 }
@@ -1015,8 +1118,13 @@ impl ArithmeticGuard {
                         .ok_or(NumberArithmeticError::Overflow)?;
                 }
             }
+        } else if cusp_rounding_330_enabled(scale)
+            && *mantissa > u128::from(NUMBER_MAX_REP as u64)
+            && *mantissa < u128::from(NUMBER_MAX_REP_UP)
+        {
+            *mantissa = u128::from(NUMBER_MAX_REP as u64);
         }
-        self.bring_into_range(negative, mantissa, exponent, min_mantissa);
+        self.bring_into_range(negative, mantissa, exponent, min_mantissa, scale);
         if *exponent > NUMBER_MAX_EXPONENT {
             return Err(NumberArithmeticError::Overflow);
         }
@@ -1029,16 +1137,23 @@ impl ArithmeticGuard {
         mantissa: &mut u128,
         exponent: &mut i32,
         min_mantissa: u64,
+        max_mantissa: u64,
+        scale: MantissaScale,
     ) {
         let rounded = self.round();
-        if rounded == 1 || (rounded == 0 && (*mantissa & 1) == 1) {
+        if cusp_rounding_330_enabled(scale) {
+            if !self.empty() {
+                *mantissa -= 1;
+            }
+        } else if rounded == 1 || (rounded == 0 && (*mantissa & 1) == 1) {
             *mantissa -= 1;
             if *mantissa < u128::from(min_mantissa) {
                 *mantissa *= 10;
                 *exponent -= 1;
             }
         }
-        self.bring_into_range(negative, mantissa, exponent, min_mantissa);
+        let _ = (rounded, max_mantissa);
+        self.bring_into_range(negative, mantissa, exponent, min_mantissa, scale);
     }
 
     fn do_round_i64(&self, drops: &mut i64) -> Result<(), NumberArithmeticError> {
@@ -1586,15 +1701,16 @@ impl Drop for NumberMantissaScaleGuard {
 mod tests {
     use super::{
         MANTISSA_LARGE_MAX, MANTISSA_LARGE_MIN, MANTISSA_SMALL_MAX, MANTISSA_SMALL_MIN,
-        MantissaRange, MantissaScale, NUMBER_MAX_EXPONENT, NUMBER_MAX_REP, NUMBER_MIN_EXPONENT,
-        NUMBER_ZERO_EXPONENT, NumberMantissaScaleGuard, NumberNormalizeError, NumberParts,
-        NumberRoundModeGuard, NumberShiftExponentError, RoundingMode, SaveNumberRoundMode,
-        abs_number, current_mantissa_log, current_mantissa_max, current_mantissa_min,
-        current_mantissa_range, current_number_lowest, current_number_max, current_number_min,
-        current_number_one, external_mantissa_in_range, external_to_internal_mantissa,
-        get_mantissa_scale, get_rounding_mode, is_power_of_ten, log_ten, mantissa_range_log,
-        mantissa_range_max, mantissa_range_min, mantissa_scale_to_string, set_mantissa_scale,
-        set_rounding_mode, signed_external_mantissa_bounds, squelch_number,
+        MantissaRange, MantissaScale, NUMBER_MAX_EXPONENT, NUMBER_MAX_REP, NUMBER_MAX_REP_UP,
+        NUMBER_MIN_EXPONENT, NUMBER_ZERO_EXPONENT, NumberMantissaScaleGuard, NumberNormalizeError,
+        NumberParts, NumberRoundModeGuard, NumberShiftExponentError, RoundingMode,
+        SaveNumberRoundMode, abs_number, current_mantissa_log, current_mantissa_max,
+        current_mantissa_min, current_mantissa_range, current_number_lowest, current_number_max,
+        current_number_min, current_number_one, external_mantissa_in_range,
+        external_to_internal_mantissa, get_mantissa_scale, get_rounding_mode, is_power_of_ten,
+        log_ten, mantissa_range_log, mantissa_range_max, mantissa_range_min,
+        mantissa_scale_to_string, set_mantissa_scale, set_rounding_mode,
+        signed_external_mantissa_bounds, squelch_number,
     };
     use std::cmp::Ordering;
     use std::thread;
@@ -1628,6 +1744,138 @@ mod tests {
                 scale: MantissaScale::LargeLegacy,
             }
         );
+    }
+
+    #[test]
+    fn cleanup_3_2_and_3_3_cusp_addition_are_distinct() {
+        fn value(mantissa: i64, exponent: i32, scale: MantissaScale) -> NumberParts {
+            NumberParts::try_from_external_parts(mantissa, exponent, scale).unwrap()
+        }
+
+        let lhs_legacy = value(NUMBER_MAX_REP, 0, MantissaScale::LargeLegacy);
+        let rhs_legacy = value(6, -1, MantissaScale::LargeLegacy);
+        let legacy_guard = NumberMantissaScaleGuard::new(MantissaScale::LargeLegacy);
+        assert_eq!(
+            lhs_legacy + rhs_legacy,
+            value(NUMBER_MAX_REP / 10, 1, MantissaScale::LargeLegacy)
+        );
+        drop(legacy_guard);
+
+        let lhs_320 = value(NUMBER_MAX_REP, 0, MantissaScale::Large320);
+        let rhs_320 = value(6, -1, MantissaScale::Large320);
+        let v320_guard = NumberMantissaScaleGuard::new(MantissaScale::Large320);
+        assert_eq!(
+            lhs_320 + rhs_320,
+            value((NUMBER_MAX_REP / 10) + 1, 1, MantissaScale::Large320)
+        );
+        drop(v320_guard);
+
+        let lhs_330 = value(NUMBER_MAX_REP, 0, MantissaScale::Large330);
+        let rhs_330 = value(6, -1, MantissaScale::Large330);
+        let _v330_guard = NumberMantissaScaleGuard::new(MantissaScale::Large330);
+        assert_eq!(lhs_330 + rhs_330, lhs_330);
+    }
+
+    #[test]
+    fn cleanup_3_3_cusp_normalization_and_subtraction_match_pinned_boundaries() {
+        let scale = MantissaScale::Large330;
+        let min = mantissa_range_min(scale);
+        let max = mantissa_range_max(scale);
+        let normalize = |mantissa: u128| {
+            NumberParts::normalize_arithmetic_parts(false, mantissa, 0, min, max, scale).unwrap()
+        };
+        let one = NumberParts::try_from_external_parts(1, 0, scale).unwrap();
+        let three = NumberParts::try_from_external_parts(3, 0, scale).unwrap();
+        let guard = NumberMantissaScaleGuard::new(scale);
+
+        let below_midpoint = normalize(NUMBER_MAX_REP as u128 + 1);
+        assert_eq!(below_midpoint.mantissa, NUMBER_MAX_REP as u64);
+        assert_eq!(below_midpoint - one, normalize(NUMBER_MAX_REP as u128 - 1));
+        assert_eq!(
+            below_midpoint - three,
+            normalize(NUMBER_MAX_REP as u128 - 3)
+        );
+
+        let above_midpoint = normalize(NUMBER_MAX_REP_UP as u128 - 1);
+        assert_eq!(above_midpoint.mantissa, NUMBER_MAX_REP_UP);
+        assert_eq!(
+            above_midpoint - one,
+            normalize(((NUMBER_MAX_REP / 10) + 1) as u128 * 10)
+        );
+        assert_eq!(above_midpoint - three, normalize(NUMBER_MAX_REP as u128));
+        drop(guard);
+    }
+
+    #[test]
+    fn cleanup_3_3_operator_differentials_match_pinned_all_rounding_modes() {
+        let _scale = NumberMantissaScaleGuard::new(MantissaScale::Large330);
+        let unit = NumberParts::unchecked(false, 1_000_000_000_000_000_000, 0);
+        let distant = NumberParts::unchecked(false, 1_234_567_890_123_456_789, -22);
+        let exact_zero_tail = NumberParts::unchecked(false, 1_000_000_000_000_000_000, -20);
+        let cusp = NumberParts::unchecked(false, NUMBER_MAX_REP as u64, 0);
+        let factor = NumberParts::unchecked(false, 1_000_000_000_000_000_001, -18);
+        let two = NumberParts::try_from_external_parts(2, 0, MantissaScale::Large330).unwrap();
+
+        let cases = [
+            (
+                RoundingMode::ToNearest,
+                [
+                    (1_000_000_000_000_000_000, 0),
+                    (1_000_000_000_000_000_000, 0),
+                    (5_000_000_000_000_000_000, -1),
+                    (922_337_203_685_477_582, 1),
+                    (-1_000_000_000_000_000_000, 0),
+                ],
+            ),
+            (
+                RoundingMode::TowardsZero,
+                [
+                    (1_000_000_000_000_000_000, 0),
+                    (999_999_999_999_999_999, 0),
+                    (5_000_000_000_000_000_000, -1),
+                    (922_337_203_685_477_581, 1),
+                    (-999_999_999_999_999_999, 0),
+                ],
+            ),
+            (
+                RoundingMode::Downward,
+                [
+                    (1_000_000_000_000_000_000, 0),
+                    (999_999_999_999_999_999, 0),
+                    (5_000_000_000_000_000_000, -1),
+                    (922_337_203_685_477_581, 1),
+                    (-1_000_000_000_000_000_000, 0),
+                ],
+            ),
+            (
+                RoundingMode::Upward,
+                [
+                    (1_000_000_000_000_000_001, 0),
+                    (1_000_000_000_000_000_000, 0),
+                    (5_000_000_000_000_000_000, -1),
+                    (922_337_203_685_477_582, 1),
+                    (-999_999_999_999_999_999, 0),
+                ],
+            ),
+        ];
+
+        for (mode, expected) in cases {
+            let _rounding = NumberRoundModeGuard::new(mode);
+            let actual = [
+                unit + exact_zero_tail,
+                unit - distant,
+                unit - unit / two,
+                cusp * factor,
+                -unit + distant,
+            ];
+            for (value, expected_parts) in actual.into_iter().zip(expected) {
+                assert_eq!(
+                    value.external_parts().unwrap(),
+                    expected_parts,
+                    "mode={mode:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2073,10 +2321,18 @@ mod tests {
     #[test]
     fn scale_display_strings() {
         assert_eq!(MantissaScale::Small.to_string(), "small");
-        assert_eq!(MantissaScale::Large.to_string(), "large");
+        assert_eq!(MantissaScale::Large320.to_string(), "large320");
+        assert_eq!(MantissaScale::Large330.to_string(), "large330");
         assert_eq!(MantissaScale::LargeLegacy.to_string(), "largeLegacy");
         assert_eq!(mantissa_scale_to_string(MantissaScale::Small), "small");
-        assert_eq!(mantissa_scale_to_string(MantissaScale::Large), "large");
+        assert_eq!(
+            mantissa_scale_to_string(MantissaScale::Large320),
+            "large320"
+        );
+        assert_eq!(
+            mantissa_scale_to_string(MantissaScale::Large330),
+            "large330"
+        );
         assert_eq!(
             mantissa_scale_to_string(MantissaScale::LargeLegacy),
             "largeLegacy"

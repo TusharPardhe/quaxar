@@ -161,6 +161,30 @@ fn protocol_sttx_fee_payer_uses_delegate_when_present() {
     });
 
     assert_eq!(tx.get_initiator(), delegated);
+    assert_eq!(tx.get_fee_payer_id(), delegated);
+}
+
+#[test]
+fn protocol_sttx_fee_payer_uses_only_fee_sponsor() {
+    let source = account("1111111111111111111111111111111111111111");
+    let delegate = account("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let sponsor = account("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+    for (sponsor_flags, expected) in [(1, sponsor), (2, delegate), (3, sponsor)] {
+        let tx = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+            tx.set_account_id(get_field_by_symbol("sfDelegate"), delegate);
+            tx.set_account_id(get_field_by_symbol("sfSponsor"), sponsor);
+            tx.set_field_u32(get_field_by_symbol("sfSponsorFlags"), sponsor_flags);
+        });
+        assert_eq!(tx.get_fee_payer_id(), expected);
+    }
+
+    let reserve_sponsored_account = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+        tx.set_account_id(get_field_by_symbol("sfSponsor"), sponsor);
+        tx.set_field_u32(get_field_by_symbol("sfSponsorFlags"), 2);
+    });
+    assert_eq!(reserve_sponsored_account.get_fee_payer_id(), source);
 }
 
 #[test]
@@ -260,4 +284,49 @@ fn protocol_sttx_json_adds_legacy_hash_and_omits_v2_hash() {
         }
         other => panic!("unexpected v2 json shape: {other:?}"),
     }
+}
+
+#[test]
+fn mpt_issuance_set_round_trips_pinned_immutable_and_encryption_fields() {
+    let source = account("1111111111111111111111111111111111111111");
+    let issuer_key = [0x02; 33];
+    let auditor_key = [0x03; 33];
+    let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_SET, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+        tx.set_field_h192(
+            get_field_by_symbol("sfMPTokenIssuanceID"),
+            basics::base_uint::Uint192::from_hex(
+                "000000011111111111111111111111111111111111111111",
+            )
+            .expect("valid issuance id"),
+        );
+        tx.set_field_u32(
+            get_field_by_symbol("sfImmutableFlags"),
+            protocol::tifMPTMetadata,
+        );
+        tx.set_field_vl(get_field_by_symbol("sfIssuerEncryptionKey"), &issuer_key);
+        tx.set_field_vl(get_field_by_symbol("sfAuditorEncryptionKey"), &auditor_key);
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+    });
+
+    let bytes = tx.get_serializer();
+    let mut iter = SerialIter::new(bytes.data());
+    let parsed = STTx::from_serial_iter(&mut iter);
+    assert!(iter.empty());
+    assert_eq!(
+        parsed.get_field_u32(get_field_by_symbol("sfImmutableFlags")),
+        protocol::tifMPTMetadata
+    );
+    assert_eq!(
+        parsed.get_field_vl(get_field_by_symbol("sfIssuerEncryptionKey")),
+        issuer_key
+    );
+    assert_eq!(
+        parsed.get_field_vl(get_field_by_symbol("sfAuditorEncryptionKey")),
+        auditor_key
+    );
 }

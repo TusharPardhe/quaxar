@@ -135,6 +135,7 @@ fn transactor_preflight2_keeps_simulate_and_inner_batch_bypass_rules() {
         TransactorPreflight2Facts {
             inner_batch_flag_set: true,
             batch_enabled: true,
+            parent_batch_id_present: true,
         },
         || None,
         || panic!("inner-batch bypass should skip validity"),

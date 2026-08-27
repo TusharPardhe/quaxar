@@ -50,8 +50,7 @@ fn sponsor_can_fund_reserve<V: ledger::ApplyView>(
     owner: &AccountID,
 ) -> Result<bool, Ter> {
     let balance = sponsor_sle.get_field_amount(sf("sfBalance")).xrp().drops();
-    let count = ledger::reserve_owner_count(sponsor_sle, 1) as usize;
-    if balance < view.fees().account_reserve(count) as i64 {
+    if balance < ledger::effective_account_reserve(view.fees(), sponsor_sle, 1, 0) as i64 {
         return Ok(false);
     }
     let sponsor = sponsor_sle.get_account_id(sf("sfAccount"));
@@ -126,12 +125,7 @@ pub fn do_trust_set<V: ledger::ApplyView>(
     let reserve_create = if owner_count < 2 {
         0i64
     } else {
-        let count = if sponsor_enabled {
-            ledger::reserve_owner_count(&sle, 1)
-        } else {
-            owner_count.saturating_add(1)
-        };
-        view.fees().account_reserve(count as usize) as i64
+        ledger::effective_account_reserve(view.fees(), &sle, 1, 0) as i64
     };
 
     let quality_in = if b_quality_in {
@@ -183,33 +177,32 @@ pub fn do_trust_set<V: ledger::ApplyView>(
         Ok(line) => line.is_some(),
         Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    if sle_dst.is_field_present(sf("sfAMMID")) {
-        if !line_exists {
-            let amm_id = sle_dst.get_field_h256(sf("sfAMMID"));
-            let amm = match view.peek(protocol::child_keylet(amm_id)) {
-                Ok(Some(amm)) => amm,
-                Ok(None) => return Ter::TEC_INTERNAL,
-                Err(_) => return Ter::TEF_BAD_LEDGER,
-            };
-            let lp_tokens = amm.get_field_amount(sf("sfLPTokenBalance"));
-            if lp_tokens.signum() == 0 {
-                return Ter::TEC_AMM_EMPTY;
+    if ledger::is_pseudo_account(&sle_dst) {
+        if sle_dst.is_field_present(sf("sfAMMID")) {
+            if !line_exists {
+                let amm_id = sle_dst.get_field_h256(sf("sfAMMID"));
+                let amm = match view.peek(protocol::child_keylet(amm_id)) {
+                    Ok(Some(amm)) => amm,
+                    Ok(None) => return Ter::TEC_INTERNAL,
+                    Err(_) => return Ter::TEF_BAD_LEDGER,
+                };
+                let lp_tokens = amm.get_field_amount(sf("sfLPTokenBalance"));
+                if lp_tokens.signum() == 0 {
+                    return Ter::TEC_AMM_EMPTY;
+                }
+                if lp_tokens.issue().currency != currency {
+                    return Ter::TEC_NO_PERMISSION;
+                }
             }
-            if lp_tokens.issue().currency != currency {
+        } else if sle_dst.is_field_present(sf("sfVaultID"))
+            || sle_dst.is_field_present(sf("sfLoanBrokerID"))
+        {
+            if !line_exists {
                 return Ter::TEC_NO_PERMISSION;
             }
+        } else {
+            return Ter::TEC_PSEUDO_ACCOUNT;
         }
-    } else if sle_dst.is_field_present(sf("sfVaultID"))
-        || sle_dst.is_field_present(sf("sfLoanBrokerID"))
-    {
-        if !line_exists {
-            return Ter::TEC_NO_PERMISSION;
-        }
-    } else if ["sfAMMID", "sfVaultID", "sfLoanBrokerID"]
-        .iter()
-        .any(|field| sle_dst.is_field_present(sf(field)))
-    {
-        return Ter::TEC_PSEUDO_ACCOUNT;
     }
 
     // `TrustSet::preclaim` validates the resulting freeze state before
@@ -780,15 +773,19 @@ pub(crate) fn trust_create<V: ledger::ApplyView>(
 
     // set NoRipple on their side of the trust line.
     let dst_keylet = protocol::account_keylet(Uint160::from_void(dst.data()));
-    if let Ok(Some(dst_sle)) = view.read(dst_keylet) {
-        let dst_flags = dst_sle.get_field_u32(sf("sfFlags"));
-        if (dst_flags & protocol::lsfDefaultRipple) == 0 {
-            flags |= if b_high {
-                LSF_LOW_NO_RIPPLE
-            } else {
-                LSF_HIGH_NO_RIPPLE
-            };
+    match view.read(dst_keylet) {
+        Ok(Some(dst_sle)) => {
+            let dst_flags = dst_sle.get_field_u32(sf("sfFlags"));
+            if (dst_flags & protocol::lsfDefaultRipple) == 0 {
+                flags |= if b_high {
+                    LSF_LOW_NO_RIPPLE
+                } else {
+                    LSF_HIGH_NO_RIPPLE
+                };
+            }
         }
+        Ok(None) => return Ter::TEF_BAD_LEDGER,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     }
 
     if ledger::increase_owner_count_for_object(view, account_sle, sponsor_sle).is_err() {
@@ -865,8 +862,9 @@ pub(crate) fn trust_delete<V: ledger::ApplyView>(
     let low_dir = protocol::owner_dir_keylet(Uint160::from_void(
         if *account < *dst { account } else { dst }.data(),
     ));
-    if !ledger::dir_remove(view, &low_dir, low_node, key, false).unwrap_or(false) {
-        return Ter::TEF_BAD_LEDGER;
+    match ledger::dir_remove(view, &low_dir, low_node, key, false) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Ter::TEF_BAD_LEDGER,
     }
 
     // Remove from high owner directory
@@ -874,8 +872,9 @@ pub(crate) fn trust_delete<V: ledger::ApplyView>(
     let high_dir = protocol::owner_dir_keylet(Uint160::from_void(
         if *account > *dst { account } else { dst }.data(),
     ));
-    if !ledger::dir_remove(view, &high_dir, high_node, key, false).unwrap_or(false) {
-        return Ter::TEF_BAD_LEDGER;
+    match ledger::dir_remove(view, &high_dir, high_node, key, false) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Ter::TEF_BAD_LEDGER,
     }
 
     let flags = state_sle.get_field_u32(sf("sfFlags"));

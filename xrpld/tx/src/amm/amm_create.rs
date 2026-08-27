@@ -235,11 +235,15 @@ pub fn run_amm_create_do_apply<S: AMMCreateApplySink>(
     if result != Ter::TES_SUCCESS {
         return result;
     }
-    let result = sink.deposit_initial_liquidity();
+    // rippled creates the LP trust line before either pool-asset trust line or
+    // MPToken. Owner-directory insertion order determines directory indexes,
+    // node hints, ledger hashes, and metadata, so these two phases are not
+    // interchangeable even though their final balances look equivalent.
+    let result = sink.mint_lp_tokens();
     if result != Ter::TES_SUCCESS {
         return result;
     }
-    let result = sink.mint_lp_tokens();
+    let result = sink.deposit_initial_liquidity();
     if result != Ter::TES_SUCCESS {
         return result;
     }

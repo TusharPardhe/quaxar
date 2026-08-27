@@ -83,6 +83,7 @@ fn preclaim_facts() -> PaymentPreclaimFacts {
         send_max_present: false,
         dst_amount_native: true,
         destination_exists: true,
+        sponsor_created_account: false,
         view_open: false,
         destination_requires_tag: false,
         destination_tag_present: false,
@@ -101,7 +102,7 @@ fn preclaim_facts() -> PaymentPreclaimFacts {
 #[test]
 fn payment_masks_and_path_limits_match_cpp() {
     assert_eq!(MAX_PATH_SIZE, 6);
-    assert_eq!(PAYMENT_FLAGS_MASK, 0x3ff8_ffff);
+    assert_eq!(PAYMENT_FLAGS_MASK, 0x3ff0_ffff);
     assert_eq!(PAYMENT_MPT_V1_FLAGS_MASK, 0x3ffd_ffff);
 }
 
@@ -269,10 +270,19 @@ fn payment_preclaim_maps_destination_and_path_gate_results() {
         path_count: MAX_PATH_SIZE + 1,
         ..preclaim_facts()
     });
+    let sponsored_existing_destination = run_payment_preclaim_with_facts(PaymentPreclaimFacts {
+        destination_exists: true,
+        sponsor_created_account: true,
+        ..preclaim_facts()
+    });
 
     assert_eq!(no_dst, Ter::TEC_NO_DST);
     assert_eq!(no_dst_partial, Ter::TEL_NO_DST_PARTIAL);
     assert_eq!(path_count, Ter::TEL_BAD_PATH_COUNT);
+    assert_eq!(
+        sponsored_existing_destination,
+        Ter::TEC_NO_SPONSOR_PERMISSION
+    );
 }
 
 #[test]

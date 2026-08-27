@@ -13,6 +13,7 @@ pub mod check_cancel;
 pub mod check_cash;
 pub mod check_create;
 pub mod clawback;
+pub mod confidential_mpt;
 pub mod credential_accept;
 pub mod credential_create;
 pub mod credential_delete;
@@ -57,6 +58,8 @@ pub mod permissioned_domain_set;
 pub mod set_fee;
 pub mod set_regular_key;
 pub mod signer_list_set;
+pub mod sponsorship_set;
+pub mod sponsorship_transfer;
 pub mod st_tx;
 pub mod st_validation;
 pub mod st_xchain_bridge;
@@ -103,6 +106,12 @@ pub use check_cancel::{CheckCancel, CheckCancelBuilder};
 pub use check_cash::{CheckCash, CheckCashBuilder};
 pub use check_create::{CheckCreate, CheckCreateBuilder};
 pub use clawback::{Clawback, ClawbackBuilder};
+pub use confidential_mpt::{
+    ConfidentialMPTClawback, ConfidentialMPTClawbackBuilder, ConfidentialMPTConvert,
+    ConfidentialMPTConvertBack, ConfidentialMPTConvertBackBuilder, ConfidentialMPTConvertBuilder,
+    ConfidentialMPTMergeInbox, ConfidentialMPTMergeInboxBuilder, ConfidentialMPTSend,
+    ConfidentialMPTSendBuilder,
+};
 pub use credential_accept::{CredentialAccept, CredentialAcceptBuilder};
 pub use credential_create::{CredentialCreate, CredentialCreateBuilder};
 pub use credential_delete::{CredentialDelete, CredentialDeleteBuilder};
@@ -147,6 +156,8 @@ pub use permissioned_domain_set::{PermissionedDomainSet, PermissionedDomainSetBu
 pub use set_fee::{SetFee, SetFeeBuilder};
 pub use set_regular_key::{SetRegularKey, SetRegularKeyBuilder};
 pub use signer_list_set::{SignerListSet, SignerListSetBuilder};
+pub use sponsorship_set::{SponsorshipSet, SponsorshipSetBuilder};
+pub use sponsorship_transfer::{SponsorshipTransfer, SponsorshipTransferBuilder};
 pub use ticket_create::{TicketCreate, TicketCreateBuilder};
 pub use trust_set::{TrustSet, TrustSetBuilder};
 pub use unl_modify::{UNLModify, UNLModifyBuilder};

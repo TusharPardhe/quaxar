@@ -10,7 +10,7 @@
 
 use protocol::{
     NotTec, Ter, tfMPTCanHoldConfidentialBalance, tfMPTCanTransfer, tfMPTRequireAuth,
-    tfMPTokenIssuanceCreateMask, tfUniversal, tmfMPTokenIssuanceCreateMutableMask,
+    tfMPTokenIssuanceCreateMask, tfUniversal, tifMPTokenIssuanceImmutableMask,
 };
 
 pub const MAX_TRANSFER_FEE: u16 = 50_000;
@@ -22,7 +22,7 @@ pub struct MPTokenIssuanceCreatePreflightFacts {
     pub fix_cleanup_3_2_0_enabled: bool,
     pub confidential_transfer_enabled: bool,
     pub reference_holding_present: bool,
-    pub mutable_flags: Option<u32>,
+    pub immutable_flags: Option<u32>,
     pub tx_flags: u32,
     pub transfer_fee: Option<u16>,
     pub domain_id_present: bool,
@@ -41,7 +41,7 @@ pub struct MPTokenIssuanceCreateApplyFacts<AccountId, Metadata, DomainId> {
     pub transfer_fee: Option<u16>,
     pub metadata: Option<Metadata>,
     pub domain_id: Option<DomainId>,
-    pub mutable_flags: Option<u32>,
+    pub immutable_flags: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +56,7 @@ pub struct MPTokenIssuanceCreateMutation<AccountId, Metadata, DomainId> {
     pub transfer_fee: Option<u16>,
     pub metadata: Option<Metadata>,
     pub domain_id: Option<DomainId>,
-    pub mutable_flags: Option<u32>,
+    pub immutable_flags: Option<u32>,
 }
 
 pub trait MPTokenIssuanceCreateApplySink<AccountId, Metadata, DomainId> {
@@ -74,14 +74,25 @@ pub fn mp_token_issuance_create_check_extra_features(
     domain_id_present: bool,
     permissioned_domains_enabled: bool,
     single_asset_vault_enabled: bool,
-    mutable_flags_present: bool,
+    immutable_flags_present: bool,
     dynamic_mpt_enabled: bool,
+    confidential_transfer_enabled: bool,
+    tx_flags: u32,
+    immutable_flags: Option<u32>,
 ) -> bool {
     if domain_id_present && !(permissioned_domains_enabled && single_asset_vault_enabled) {
         return false;
     }
 
-    if mutable_flags_present && !dynamic_mpt_enabled {
+    if immutable_flags_present && !dynamic_mpt_enabled {
+        return false;
+    }
+
+    if ((tx_flags & tfMPTCanHoldConfidentialBalance) != 0
+        || immutable_flags
+            .is_some_and(|flags| flags & protocol::tifMPTCanHoldConfidentialBalance != 0))
+        && !confidential_transfer_enabled
+    {
         return false;
     }
 
@@ -99,8 +110,8 @@ pub fn run_mp_token_issuance_create_preflight(
         return Ter::TEM_MALFORMED;
     }
 
-    if let Some(mutable_flags) = facts.mutable_flags
-        && (mutable_flags == 0 || (mutable_flags & tmfMPTokenIssuanceCreateMutableMask) != 0)
+    if let Some(immutable_flags) = facts.immutable_flags
+        && (immutable_flags == 0 || (immutable_flags & tifMPTokenIssuanceImmutableMask) != 0)
     {
         return Ter::TEM_INVALID_FLAG;
     }
@@ -118,7 +129,7 @@ pub fn run_mp_token_issuance_create_preflight(
             && facts.confidential_transfer_enabled
             && (facts.tx_flags & tfMPTCanHoldConfidentialBalance) != 0
         {
-            return Ter::TEM_MALFORMED;
+            return Ter::TEM_BAD_TRANSFER_FEE;
         }
     }
 
@@ -180,7 +191,7 @@ where
         transfer_fee: facts.transfer_fee,
         metadata: facts.metadata,
         domain_id: facts.domain_id,
-        mutable_flags: facts.mutable_flags,
+        immutable_flags: facts.immutable_flags,
     });
     sink.adjust_owner_count(1);
     Ter::TES_SUCCESS

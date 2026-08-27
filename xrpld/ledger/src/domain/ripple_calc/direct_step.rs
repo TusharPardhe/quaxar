@@ -3,8 +3,8 @@
 //! DirectStep handles IOU transfer between two accounts on the same trust line.
 //! It computes max flow, applies quality adjustments, and executes the transfer.
 
-use crate::ApplyView;
 use crate::domain::ripple_state_helpers;
+use crate::{ApplyView, ViewError};
 use protocol::{AccountID, Currency, IOUAmount, Issue, STAmount, Ter, get_field_by_symbol as sf};
 
 /// Debt direction: is the source redeeming (paying back) or issuing (lending)?
@@ -39,10 +39,10 @@ pub fn max_payment_flow<V: ApplyView>(
     src: &AccountID,
     dst: &AccountID,
     currency: Currency,
-) -> (IOUAmount, DebtDirection) {
+) -> Result<(IOUAmount, DebtDirection), ViewError> {
     // XRP has no trust line — DirectStep only handles IOU.
     if protocol::is_xrp_currency(currency) {
-        return (IOUAmount::new(), DebtDirection::Issues);
+        return Ok((IOUAmount::new(), DebtDirection::Issues));
     }
 
     // Compute how much src can send to dst on this trust line.
@@ -53,20 +53,20 @@ pub fn max_payment_flow<V: ApplyView>(
     //
     // account_holds(view, src, dst, currency) returns how much src holds
     // (from src's perspective). Positive = dst owes src (src can redeem).
-    let balance = ripple_state_helpers::account_holds(view, src, dst, currency);
+    let balance = ripple_state_helpers::try_account_holds(view, src, dst, currency)?;
 
     if balance.signum() > 0 {
         // Source is redeeming (has positive balance = dst owes src)
         if balance.native() {
-            return (IOUAmount::new(), DebtDirection::Issues);
+            return Ok((IOUAmount::new(), DebtDirection::Issues));
         }
-        (balance.iou(), DebtDirection::Redeems)
+        Ok((balance.iou(), DebtDirection::Redeems))
     } else {
         // Source is issuing (has zero or negative balance)
         // Max flow is dst's credit limit for src (how much dst allows src to owe)
         // reference: creditLimit2(sb, dst_, src_, currency_) + srcOwed
         let line_keylet = protocol::line(*src, *dst, currency);
-        let limit = if let Some(state) = view.peek(line_keylet).ok().flatten() {
+        let limit = if let Some(state) = view.peek(line_keylet)? {
             let b_src_high = *src > *dst;
             // We need DST's limit — which is the opposite side from src
             let limit_field = if b_src_high {
@@ -93,9 +93,9 @@ pub fn max_payment_flow<V: ApplyView>(
             .checked_add(src_owed)
             .unwrap_or_else(|_| IOUAmount::new());
         if available.signum() <= 0 {
-            (IOUAmount::new(), DebtDirection::Issues)
+            Ok((IOUAmount::new(), DebtDirection::Issues))
         } else {
-            (available, DebtDirection::Issues)
+            Ok((available, DebtDirection::Issues))
         }
     }
 }
@@ -108,10 +108,10 @@ pub fn get_quality<V: ApplyView>(
     dst: &AccountID,
     currency: Currency,
     direction: QualityDirection,
-) -> u32 {
+) -> Result<u32, ViewError> {
     let line_keylet = protocol::line(*src, *dst, currency);
-    let Some(state) = view.peek(line_keylet).ok().flatten() else {
-        return protocol::QUALITY_ONE;
+    let Some(state) = view.peek(line_keylet)? else {
+        return Ok(protocol::QUALITY_ONE);
     };
     let b_src_high = *src > *dst;
     let field = match direction {
@@ -131,7 +131,7 @@ pub fn get_quality<V: ApplyView>(
         }
     };
     let q = state.get_field_u32(field);
-    if q == 0 { protocol::QUALITY_ONE } else { q }
+    Ok(if q == 0 { protocol::QUALITY_ONE } else { q })
 }
 
 /// Execute a DirectStep: transfer IOU from src to dst on their shared trust line.
@@ -151,16 +151,17 @@ pub fn execute_direct_step<V: ApplyView>(
     }
 
     // Get max flow and qualities
-    let (max_src_to_dst, src_debt_dir) = max_payment_flow(view, src, dst, currency);
+    let (max_src_to_dst, src_debt_dir) =
+        max_payment_flow(view, src, dst, currency).map_err(|_| Ter::TEF_BAD_LEDGER)?;
     if max_src_to_dst.is_zero() {
         return Ok((IOUAmount::new(), IOUAmount::new()));
     }
 
     let (src_q_out, dst_q_in) = if src_debt_dir == DebtDirection::Redeems {
-        qualities_src_redeems(view, src, dst, currency)
+        qualities_src_redeems(view, src, dst, currency).map_err(|_| Ter::TEF_BAD_LEDGER)?
     } else {
         // reference: prevStepDebtDirection defaults to Issues when no previous step
-        qualities_src_issues(view, src, dst, currency, false)
+        qualities_src_issues(view, src, dst, currency, false).map_err(|_| Ter::TEF_BAD_LEDGER)?
     };
 
     let src_to_dst = crate::domain::mul_ratio::mul_ratio(
@@ -225,10 +226,10 @@ pub fn qualities_src_redeems<V: ApplyView>(
     src: &AccountID,
     dst: &AccountID,
     currency: Currency,
-) -> (u32, u32) {
-    let src_q_out = get_quality(view, src, dst, currency, QualityDirection::Out);
-    let dst_q_in = get_quality(view, dst, src, currency, QualityDirection::In);
-    (src_q_out, dst_q_in)
+) -> Result<(u32, u32), ViewError> {
+    let src_q_out = get_quality(view, src, dst, currency, QualityDirection::Out)?;
+    let dst_q_in = get_quality(view, dst, src, currency, QualityDirection::In)?;
+    Ok((src_q_out, dst_q_in))
 }
 
 /// Compute qualities for when source issues (zero/negative balance).
@@ -239,12 +240,12 @@ pub fn qualities_src_issues<V: ApplyView>(
     dst: &AccountID,
     currency: Currency,
     prev_step_redeems: bool,
-) -> (u32, u32) {
+) -> Result<(u32, u32), ViewError> {
     let src_q_out = if prev_step_redeems {
-        ripple_state_helpers::transfer_rate(view, src)
+        ripple_state_helpers::try_transfer_rate(view, src)?
     } else {
         protocol::QUALITY_ONE
     };
-    let dst_q_in = get_quality(view, dst, src, currency, QualityDirection::In);
-    (src_q_out, dst_q_in)
+    let dst_q_in = get_quality(view, dst, src, currency, QualityDirection::In)?;
+    Ok((src_q_out, dst_q_in))
 }

@@ -44,6 +44,7 @@ pub struct ViewBackedOracleSetSink<'a, V> {
     pub view: &'a mut V,
     pub account: AccountID,
     pub oracle_document_id: u32,
+    pub failure: Option<protocol::Ter>,
 }
 
 impl<V: ApplyView> ViewBackedOracleSetSink<'_, V> {
@@ -59,7 +60,7 @@ impl<V: ApplyView> OracleSetApplySink for ViewBackedOracleSetSink<'_, V> {
     fn existing_oracle(&mut self) -> Result<Option<OracleSetLoadedOracle>, protocol::Ter> {
         self.view
             .peek(self.oracle_keylet())
-            .map_err(|_| protocol::Ter::TEF_INTERNAL)
+            .map_err(|_| protocol::Ter::TEF_BAD_LEDGER)
             .map(|oracle| {
                 oracle.map(|oracle| OracleSetLoadedOracle {
                     has_oracle_document_id: oracle.is_field_present(sf("sfOracleDocumentID")),
@@ -81,17 +82,37 @@ impl<V: ApplyView> OracleSetApplySink for ViewBackedOracleSetSink<'_, V> {
     }
 
     fn adjust_owner_count(&mut self, delta: i8) -> bool {
-        let Ok(Some(account)) = self.view.peek(protocol::account_keylet(Uint160::from_void(
+        let account = match self.view.peek(protocol::account_keylet(Uint160::from_void(
             self.account.data(),
-        ))) else {
-            return false;
+        ))) {
+            Ok(Some(account)) => account,
+            Ok(None) => {
+                self.failure = Some(protocol::Ter::TEF_INTERNAL);
+                return false;
+            }
+            Err(_) => {
+                self.failure = Some(protocol::Ter::TEF_BAD_LEDGER);
+                return false;
+            }
         };
-        adjust_owner_count(self.view, &account, i32::from(delta)).is_ok()
+        if adjust_owner_count(self.view, &account, i32::from(delta)).is_err() {
+            self.failure = Some(protocol::Ter::TEF_BAD_LEDGER);
+            return false;
+        }
+        true
     }
 
     fn update_existing_oracle(&mut self, mutation: OracleSetUpdateMutation) -> bool {
-        let Ok(Some(oracle)) = self.view.peek(self.oracle_keylet()) else {
-            return false;
+        let oracle = match self.view.peek(self.oracle_keylet()) {
+            Ok(Some(oracle)) => oracle,
+            Ok(None) => {
+                self.failure = Some(protocol::Ter::TEF_INTERNAL);
+                return false;
+            }
+            Err(_) => {
+                self.failure = Some(protocol::Ter::TEF_BAD_LEDGER);
+                return false;
+            }
         };
         let mut object = oracle.clone_as_object();
         object.set_field_array(
@@ -108,12 +129,17 @@ impl<V: ApplyView> OracleSetApplySink for ViewBackedOracleSetSink<'_, V> {
         if mutation.set_oracle_document_id {
             object.set_field_u32(sf("sfOracleDocumentID"), mutation.oracle_document_id);
         }
-        self.view
+        let updated = self
+            .view
             .update(Arc::new(STLedgerEntry::from_stobject(
                 object,
                 *oracle.key(),
             )))
-            .is_ok()
+            .is_ok();
+        if !updated {
+            self.failure = Some(protocol::Ter::TEF_BAD_LEDGER);
+        }
+        updated
     }
 
     fn insert_owner_dir(&mut self) -> Result<Option<u64>, protocol::Ter> {
@@ -124,7 +150,7 @@ impl<V: ApplyView> OracleSetApplySink for ViewBackedOracleSetSink<'_, V> {
             oracle_keylet.key,
             &ledger::describe_owner_dir(self.account),
         )
-        .map_err(|_| protocol::Ter::TEF_INTERNAL)
+        .map_err(|_| protocol::Ter::TEF_BAD_LEDGER)
     }
 
     fn create_oracle(&mut self, mutation: OracleSetCreateMutation) -> bool {
@@ -147,6 +173,10 @@ impl<V: ApplyView> OracleSetApplySink for ViewBackedOracleSetSink<'_, V> {
             mutation.last_update_time_secs as u32,
         );
         oracle.set_field_u64(sf("sfOwnerNode"), mutation.owner_node);
-        self.view.insert(Arc::new(oracle)).is_ok()
+        let inserted = self.view.insert(Arc::new(oracle)).is_ok();
+        if !inserted {
+            self.failure = Some(protocol::Ter::TEF_BAD_LEDGER);
+        }
+        inserted
     }
 }

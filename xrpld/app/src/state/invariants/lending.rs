@@ -62,23 +62,24 @@ pub(super) fn maybe_record_loan_broker_account<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &mut LendingState,
     account: AccountID,
-) {
-    if let Ok(Some(root)) = sandbox.read(protocol::account_keylet(raw_account_id(account)))
+) -> Result<(), ledger::ViewError> {
+    if let Some(root) = sandbox.read(protocol::account_keylet(raw_account_id(account)))?
         && root.is_field_present(sf("sfLoanBrokerID"))
     {
         state
             .broker_refs
             .insert(root.get_field_h256(sf("sfLoanBrokerID")));
     }
+    Ok(())
 }
 
 pub(super) fn record_lending_state<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &mut LendingState,
     after: Option<&STLedgerEntry>,
-) {
+) -> Result<(), ledger::ViewError> {
     let Some(after) = after else {
-        return;
+        return Ok(());
     };
 
     match after.get_type() {
@@ -97,57 +98,63 @@ pub(super) fn record_lending_state<V: ApplyView + ?Sized>(
                 sandbox,
                 state,
                 after.get_field_amount(sf("sfLowLimit")).issue().account,
-            );
+            )?;
             maybe_record_loan_broker_account(
                 sandbox,
                 state,
                 after.get_field_amount(sf("sfHighLimit")).issue().account,
-            );
+            )?;
         }
         LedgerEntryType::MPToken => {
-            maybe_record_loan_broker_account(sandbox, state, after.get_account_id(sf("sfAccount")));
+            maybe_record_loan_broker_account(
+                sandbox,
+                state,
+                after.get_account_id(sf("sfAccount")),
+            )?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 pub(super) fn validate_zero_owner_count_broker_directory<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     broker: &STLedgerEntry,
-) -> bool {
+) -> Result<bool, ledger::ViewError> {
     if broker.get_field_u32(sf("sfOwnerCount")) != 0 {
-        return true;
+        return Ok(true);
     }
 
-    let Ok(Some(dir)) = sandbox.read(protocol::owner_dir_keylet(raw_account_id(
+    let Some(dir) = sandbox.read(protocol::owner_dir_keylet(raw_account_id(
         broker.get_account_id(sf("sfAccount")),
-    ))) else {
-        return true;
+    )))?
+    else {
+        return Ok(true);
     };
 
     if dir.is_field_present(sf("sfIndexPrevious")) && dir.get_field_u64(sf("sfIndexPrevious")) != 0
     {
-        return false;
+        return Ok(false);
     }
     if dir.is_field_present(sf("sfIndexNext")) && dir.get_field_u64(sf("sfIndexNext")) != 0 {
-        return false;
+        return Ok(false);
     }
 
     let indexes = dir.get_field_v256(sf("sfIndexes"));
     if indexes.value().len() > 1 {
-        return false;
+        return Ok(false);
     }
 
     if let Some(index) = indexes.value().first() {
-        let Ok(Some(indexed)) = sandbox.read(protocol::unchecked_keylet(*index)) else {
-            return false;
+        let Some(indexed) = sandbox.read(protocol::unchecked_keylet(*index))? else {
+            return Ok(false);
         };
-        matches!(
+        Ok(matches!(
             indexed.get_type(),
             LedgerEntryType::RippleState | LedgerEntryType::MPToken
-        )
+        ))
     } else {
-        true
+        Ok(true)
     }
 }
 
@@ -157,42 +164,43 @@ pub(super) fn validate_loan_broker_entry<V: ApplyView + ?Sized>(
     fix_cleanup_3_1_3: bool,
     before: Option<&STLedgerEntry>,
     after: &STLedgerEntry,
-) -> bool {
+) -> Result<bool, ledger::ViewError> {
     if before.is_some_and(|before| {
         before.get_field_u32(sf("sfLoanSequence")) > after.get_field_u32(sf("sfLoanSequence"))
     }) {
-        return false;
+        return Ok(false);
     }
     if number_field_negative(after, sf("sfDebtTotal"))
         || number_field_negative(after, sf("sfCoverAvailable"))
     {
-        return false;
+        return Ok(false);
     }
-    let Ok(Some(vault)) = sandbox.read(protocol::vault_keylet_from_key(
+    let Some(vault) = sandbox.read(protocol::vault_keylet_from_key(
         after.get_field_h256(sf("sfVaultID")),
-    )) else {
-        return false;
+    ))?
+    else {
+        return Ok(false);
     };
-    if !validate_zero_owner_count_broker_directory(sandbox, after) {
-        return false;
+    if !validate_zero_owner_count_broker_directory(sandbox, after)? {
+        return Ok(false);
     }
 
     let cover_available = number_field_value(after, sf("sfCoverAvailable"));
     let vault_asset = vault.get_field_issue(sf("sfAsset")).asset();
     let Some(pseudo_balance) =
-        account_holds_asset_number(sandbox, after.get_account_id(sf("sfAccount")), vault_asset)
+        account_holds_asset_number(sandbox, after.get_account_id(sf("sfAccount")), vault_asset)?
     else {
-        return false;
+        return Ok(false);
     };
 
     if cover_available < pseudo_balance {
-        return false;
+        return Ok(false);
     }
     if fix_cleanup_3_1_3 && txn_type != protocol::TxType::LOAN_BROKER_DELETE {
         if cover_available > pseudo_balance {
-            return false;
+            return Ok(false);
         }
     }
 
-    true
+    Ok(true)
 }

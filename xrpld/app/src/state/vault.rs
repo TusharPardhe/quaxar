@@ -110,6 +110,16 @@ fn vault_create_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
             .then(|| sttx.get_field_u8(sf("sfScale"))),
         asset_is_mpt: matches!(asset, Asset::MPTIssue(_)),
         asset_is_native: asset.native(),
+        lending_protocol_v1_1_enabled: feature_enabled(view, "LendingProtocolV1_1"),
+        vault_kind: sttx
+            .is_field_present(sf("sfVaultKind"))
+            .then(|| sttx.get_field_u8(sf("sfVaultKind"))),
+        subscription_date: sttx
+            .is_field_present(sf("sfSubscriptionDate"))
+            .then(|| sttx.get_field_u32(sf("sfSubscriptionDate"))),
+        redemption_date: sttx
+            .is_field_present(sf("sfRedemptionDate"))
+            .then(|| sttx.get_field_u32(sf("sfRedemptionDate"))),
     };
     run_vault_create_preflight(facts)
 }
@@ -207,8 +217,10 @@ fn can_vault_withdraw<V: ApplyView>(
     amount: &STAmount,
     has_destination_tag: bool,
 ) -> Ter {
-    let Some(destination) = view.peek(account_keylet(to_160(to))).ok().flatten() else {
-        return Ter::TEC_NO_DST;
+    let destination = match view.peek(account_keylet(to_160(to))) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_NO_DST,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     if destination.is_flag(protocol::lsfRequireDestTag) && !has_destination_tag {
         return Ter::TEC_DST_TAG_NEEDED;
@@ -216,14 +228,12 @@ fn can_vault_withdraw<V: ApplyView>(
     if from == to {
         return Ter::TES_SUCCESS;
     }
-    if destination.is_flag(protocol::lsfDepositAuth)
-        && view
-            .peek(protocol::deposit_preauth_keylet(to_160(to), to_160(from)))
-            .ok()
-            .flatten()
-            .is_none()
-    {
-        return Ter::TEC_NO_PERMISSION;
+    if destination.is_flag(protocol::lsfDepositAuth) {
+        match view.peek(protocol::deposit_preauth_keylet(to_160(to), to_160(from))) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ter::TEC_NO_PERMISSION,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        }
     }
 
     let Asset::Issue(issue) = amount.asset() else {
@@ -232,12 +242,10 @@ fn can_vault_withdraw<V: ApplyView>(
     if issue.native() || *to == issue.account {
         return Ter::TES_SUCCESS;
     }
-    let Some(line) = view
-        .peek(protocol::line(*to, issue.account, issue.currency))
-        .ok()
-        .flatten()
-    else {
-        return Ter::TEC_NO_LINE;
+    let line = match view.peek(protocol::line(*to, issue.account, issue.currency)) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_NO_LINE,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let mut owed = amount_number(&line.get_field_amount(sf("sfBalance")));
     if *to > issue.account {
@@ -376,25 +384,46 @@ fn share_asset(mpt_id: Uint192) -> Asset {
     Asset::MPTIssue(MPTIssue::new(mpt_id))
 }
 
-fn read_balance_drops<V: ApplyView>(view: &mut V, account: &AccountID) -> Option<XRPAmount> {
+fn read_balance_drops<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+) -> Result<Option<XRPAmount>, Ter> {
     view.peek(account_keylet(to_160(account)))
-        .ok()
-        .flatten()
-        .map(|sle| sle.get_field_amount(sf("sfBalance")).xrp())
+        .map(|entry| entry.map(|sle| sle.get_field_amount(sf("sfBalance")).xrp()))
+        .map_err(|_| Ter::TEF_BAD_LEDGER)
 }
 
-fn ensure_holding<V: ApplyView>(view: &mut V, account: &AccountID, asset: Asset) -> Ter {
-    let prior = read_balance_drops(view, account).unwrap_or_default();
-    ledger::add_empty_holding(view, account, prior, &asset)
+fn ensure_holding<V: ApplyView>(
+    view: &mut V,
+    sttx: &STTx,
+    account: &AccountID,
+    asset: Asset,
+) -> Ter {
+    let prior = match read_balance_drops(view, account) {
+        Ok(Some(balance)) => balance,
+        Ok(None) => XRPAmount::new(),
+        Err(ter) => return ter,
+    };
+    ledger::add_empty_holding_with_tx(view, sttx, account, prior, &asset)
 }
 
-fn load_vault<V: ApplyView>(view: &mut V, vault_id: Uint256) -> Option<LoadedVault> {
+fn ensure_holding_with_prior_balance<V: ApplyView>(
+    view: &mut V,
+    sttx: &STTx,
+    account: &AccountID,
+    prior_balance: XRPAmount,
+    asset: Asset,
+) -> Ter {
+    ledger::add_empty_holding_with_tx(view, sttx, account, prior_balance, &asset)
+}
+
+fn load_vault<V: ApplyView>(view: &mut V, vault_id: Uint256) -> Result<Option<LoadedVault>, Ter> {
     let sle = view
         .peek(protocol::vault_keylet_from_key(vault_id))
-        .ok()
-        .flatten()?;
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+    let Some(sle) = sle else { return Ok(None) };
     let asset = sle.get_field_issue(sf("sfAsset")).asset();
-    Some(LoadedVault {
+    Ok(Some(LoadedVault {
         key: *sle.key(),
         entry: (*sle).clone(),
         asset,
@@ -404,7 +433,7 @@ fn load_vault<V: ApplyView>(view: &mut V, vault_id: Uint256) -> Option<LoadedVau
         assets_total: sle.get_field_number(sf("sfAssetsTotal")).value(),
         assets_available: sle.get_field_number(sf("sfAssetsAvailable")).value(),
         loss_unrealized: sle.get_field_number(sf("sfLossUnrealized")).value(),
-    })
+    }))
 }
 
 fn persist_vault<V: ApplyView>(view: &mut V, vault: &mut LoadedVault) -> Ter {
@@ -426,19 +455,22 @@ fn persist_vault<V: ApplyView>(view: &mut V, vault: &mut LoadedVault) -> Ter {
         .unwrap_or(Ter::TEF_BAD_LEDGER)
 }
 
-fn load_issuance<V: ApplyView>(view: &mut V, mpt_id: Uint192) -> Option<LoadedIssuance> {
+fn load_issuance<V: ApplyView>(
+    view: &mut V,
+    mpt_id: Uint192,
+) -> Result<Option<LoadedIssuance>, Ter> {
     let sle = view
         .peek(mpt_issuance_keylet_from_mptid(mpt_id))
-        .ok()
-        .flatten()?;
-    Some(LoadedIssuance {
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+    let Some(sle) = sle else { return Ok(None) };
+    Ok(Some(LoadedIssuance {
         key: *sle.key(),
         entry: (*sle).clone(),
         issuer: sle.get_account_id(sf("sfIssuer")),
         sequence: sle.get_field_u32(sf("sfSequence")),
         owner_node: sle.get_field_u64(sf("sfOwnerNode")),
         outstanding_amount: sle.get_field_u64(sf("sfOutstandingAmount")),
-    })
+    }))
 }
 
 fn persist_issuance<V: ApplyView>(view: &mut V, issuance: &LoadedIssuance) -> Ter {
@@ -447,11 +479,14 @@ fn persist_issuance<V: ApplyView>(view: &mut V, issuance: &LoadedIssuance) -> Te
         .unwrap_or(Ter::TEF_BAD_LEDGER)
 }
 
-fn token_balance<V: ApplyView>(view: &mut V, mpt_id: Uint192, account: &AccountID) -> Option<u64> {
+fn token_balance<V: ApplyView>(
+    view: &mut V,
+    mpt_id: Uint192,
+    account: &AccountID,
+) -> Result<Option<u64>, Ter> {
     view.peek(mptoken_keylet_from_mptid(mpt_id, to_160(account)))
-        .ok()
-        .flatten()
-        .map(|sle| sle.get_field_u64(sf("sfMPTAmount")))
+        .map(|entry| entry.map(|sle| sle.get_field_u64(sf("sfMPTAmount"))))
+        .map_err(|_| Ter::TEF_BAD_LEDGER)
 }
 
 fn set_token_balance<V: ApplyView>(
@@ -461,8 +496,10 @@ fn set_token_balance<V: ApplyView>(
     balance: u64,
 ) -> Ter {
     let keylet = mptoken_keylet_from_mptid(mpt_id, to_160(account));
-    let Ok(Some(sle)) = view.peek(keylet) else {
-        return Ter::TEF_BAD_LEDGER;
+    let sle = match view.peek(keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_NO_AUTH,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let mut obj = sle.clone_as_object();
     obj.set_field_u64(sf("sfMPTAmount"), balance);
@@ -473,6 +510,7 @@ fn set_token_balance<V: ApplyView>(
 
 fn transfer_mpt<V: ApplyView>(
     view: &mut V,
+    sttx: &STTx,
     mpt_id: Uint192,
     from: &AccountID,
     to: &AccountID,
@@ -482,14 +520,18 @@ fn transfer_mpt<V: ApplyView>(
         return Ter::TES_SUCCESS;
     }
 
-    let Some(mut issuance) = load_issuance(view, mpt_id) else {
-        return Ter::TEF_BAD_LEDGER;
+    let mut issuance = match load_issuance(view, mpt_id) {
+        Ok(Some(issuance)) => issuance,
+        Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+        Err(ter) => return ter,
     };
     let issuer = issuance.issuer;
 
     if *from != issuer {
-        let Some(balance) = token_balance(view, mpt_id, from) else {
-            return Ter::TEF_BAD_LEDGER;
+        let balance = match token_balance(view, mpt_id, from) {
+            Ok(Some(balance)) => balance,
+            Ok(None) => return Ter::TEC_NO_AUTH,
+            Err(ter) => return ter,
         };
         if balance < amount {
             return Ter::TEC_INSUFFICIENT_FUNDS;
@@ -501,12 +543,14 @@ fn transfer_mpt<V: ApplyView>(
     }
 
     if *to != issuer {
-        let ter = ensure_holding(view, to, share_asset(mpt_id));
+        let ter = ensure_holding(view, sttx, to, share_asset(mpt_id));
         if ter != Ter::TES_SUCCESS && ter != Ter::TEC_DUPLICATE {
             return ter;
         }
-        let Some(balance) = token_balance(view, mpt_id, to) else {
-            return Ter::TEF_BAD_LEDGER;
+        let balance = match token_balance(view, mpt_id, to) {
+            Ok(Some(balance)) => balance,
+            Ok(None) => return Ter::TEC_NO_AUTH,
+            Err(ter) => return ter,
         };
         let Some(next) = balance.checked_add(amount) else {
             return Ter::TEF_INTERNAL;
@@ -534,6 +578,7 @@ fn transfer_mpt<V: ApplyView>(
 
 fn account_send<V: ApplyView>(
     view: &mut V,
+    sttx: &STTx,
     from: &AccountID,
     to: &AccountID,
     amount: &STAmount,
@@ -541,6 +586,7 @@ fn account_send<V: ApplyView>(
     match amount.asset() {
         Asset::MPTIssue(issue) => transfer_mpt(
             view,
+            sttx,
             issue.mpt_id(),
             from,
             to,
@@ -559,11 +605,15 @@ fn transfer_xrp<V: ApplyView>(
 ) -> Ter {
     let from_keylet = account_keylet(to_160(from));
     let to_keylet = account_keylet(to_160(to));
-    let Ok(Some(from_sle)) = view.peek(from_keylet) else {
-        return Ter::TEF_BAD_LEDGER;
+    let from_sle = match view.peek(from_keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    let Ok(Some(to_sle)) = view.peek(to_keylet) else {
-        return Ter::TEF_BAD_LEDGER;
+    let to_sle = match view.peek(to_keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let from_balance = from_sle.get_field_amount(sf("sfBalance")).xrp().drops();
     let to_balance = to_sle.get_field_amount(sf("sfBalance")).xrp().drops();
@@ -582,14 +632,21 @@ fn transfer_xrp<V: ApplyView>(
         sf("sfBalance"),
         STAmount::from_xrp_amount(XRPAmount::from_drops(to_balance + drops)),
     );
-    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
-        from_obj,
-        *from_sle.key(),
-    )));
-    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
-        to_obj,
-        *to_sle.key(),
-    )));
+    if view
+        .update(Arc::new(STLedgerEntry::from_stobject(
+            from_obj,
+            *from_sle.key(),
+        )))
+        .is_err()
+        || view
+            .update(Arc::new(STLedgerEntry::from_stobject(
+                to_obj,
+                *to_sle.key(),
+            )))
+            .is_err()
+    {
+        return Ter::TEF_BAD_LEDGER;
+    }
     Ter::TES_SUCCESS
 }
 
@@ -620,63 +677,61 @@ fn account_holds_vault_asset<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
     asset: Asset,
-) -> STAmount {
+) -> Result<STAmount, Ter> {
     let Asset::Issue(issue) = asset else {
-        return zero_amount(asset);
+        return Ok(zero_amount(asset));
     };
     if issue.native() {
-        return read_balance_drops(view, account)
+        return Ok(read_balance_drops(view, account)?
             .map(STAmount::from_xrp_amount)
-            .unwrap_or_else(|| zero_amount(asset));
+            .unwrap_or_else(|| zero_amount(asset)));
     }
     if issue.issuer() == *account {
-        return asset
+        return Ok(asset
             .amount(RuntimeNumber::max(get_mantissa_scale()))
-            .unwrap_or_else(|_| zero_amount(asset));
+            .unwrap_or_else(|_| zero_amount(asset)));
     }
     let mut amount = view
         .peek(protocol::line(*account, issue.issuer(), issue.currency))
-        .ok()
-        .flatten()
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?
         .map(|line| line.get_field_amount(sf("sfBalance")))
         .unwrap_or_else(|| zero_amount(asset));
     if *account > issue.issuer() {
         amount.negate();
     }
     amount.set_issuer(issue.issuer());
-    amount
+    Ok(amount)
 }
 
 fn account_holds_vault_asset_full_balance<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
     asset: Asset,
-) -> STAmount {
-    let balance = account_holds_vault_asset(view, account, asset);
+) -> Result<STAmount, Ter> {
+    let balance = account_holds_vault_asset(view, account, asset)?;
     let Asset::Issue(issue) = asset else {
-        return balance;
+        return Ok(balance);
     };
     if issue.native() || issue.issuer() == *account {
-        return balance;
+        return Ok(balance);
     }
 
-    let Some(line) = view
+    let line = view
         .peek(protocol::line(*account, issue.issuer(), issue.currency))
-        .ok()
-        .flatten()
-    else {
-        return balance;
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+    let Some(line) = line else {
+        return Ok(balance);
     };
     let opposite_limit = if *account > issue.issuer() {
         line.get_field_amount(sf("sfLowLimit"))
     } else {
         line.get_field_amount(sf("sfHighLimit"))
     };
-    runtime_to_amount(
+    Ok(runtime_to_amount(
         asset,
         amount_number(&balance) + amount_number(&opposite_limit),
     )
-    .unwrap_or(balance)
+    .unwrap_or(balance))
 }
 
 fn assets_to_shares_deposit(
@@ -782,25 +837,27 @@ fn is_sole_shareholder<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
     issuance: &LoadedIssuance,
-) -> bool {
+) -> Result<bool, Ter> {
     if issuance.outstanding_amount == 0 {
-        return false;
+        return Ok(false);
     }
-    token_balance(
+    Ok(token_balance(
         view,
         mpt_id_for(&issuance.issuer, issuance.sequence),
         account,
-    )
-    .is_some_and(|balance| balance == issuance.outstanding_amount)
+    )?
+    .is_some_and(|balance| balance == issuance.outstanding_amount))
 }
 
 fn should_waive_withdrawal<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
     issuance: &LoadedIssuance,
-) -> bool {
-    view.rules().enabled(&feature_id("fixCleanup3_2_0"))
-        && is_sole_shareholder(view, account, issuance)
+) -> Result<bool, Ter> {
+    if !view.rules().enabled(&feature_id("fixCleanup3_2_0")) {
+        return Ok(false);
+    }
+    is_sole_shareholder(view, account, issuance)
 }
 
 #[derive(Clone)]
@@ -826,7 +883,11 @@ struct LoadedIssuance {
     outstanding_amount: u64,
 }
 
-pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
+pub fn apply_vault_create<V: ApplyView>(
+    view: &mut V,
+    sttx: &STTx,
+    pre_fee_balance_drops: i64,
+) -> Ter {
     let preflight = vault_create_preflight(view, sttx);
     if preflight != Ter::TES_SUCCESS {
         return preflight;
@@ -842,7 +903,12 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         Err(err) => return err,
     };
 
-    let ter = ensure_holding(view, &pseudo, asset);
+    // Pinned VaultCreate passes the submitting owner's pre-fee balance to
+    // addEmptyHolding for the vault pseudo-account.  Using the pseudo's zero
+    // AccountRoot balance incorrectly rejects every IOU vault at the reserve
+    // boundary with tecNO_LINE_INSUF_RESERVE.
+    let pre_fee_balance = XRPAmount::from_drops(pre_fee_balance_drops);
+    let ter = ensure_holding_with_prior_balance(view, sttx, &pseudo, pre_fee_balance, asset);
     if ter != Ter::TES_SUCCESS && ter != Ter::TEC_DUPLICATE {
         return ter;
     }
@@ -898,12 +964,27 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         VAULT_DEFAULT_IOU_SCALE
     };
     issuance.set_field_u8(sf("sfAssetScale"), share_asset_scale);
-    let _ = view.insert(Arc::new(issuance));
-    if let Ok(Some(pseudo_root)) = view.peek(account_keylet(to_160(&pseudo))) {
-        let _ = adjust_owner_count(view, &pseudo_root, 1);
+    if view.insert(Arc::new(issuance)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
+    let pseudo_root = match view.peek(account_keylet(to_160(&pseudo))) {
+        Ok(Some(root)) => root,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if adjust_owner_count(view, &pseudo_root, 1).is_err() {
+        return Ter::TEF_BAD_LEDGER;
     }
 
-    let ter = ensure_holding(view, &owner, share_asset(share_id));
+    // authorizeMPToken(owner) receives the same captured preFeeBalance_ in
+    // rippled; do not substitute the post-fee AccountRoot balance here.
+    let ter = ensure_holding_with_prior_balance(
+        view,
+        sttx,
+        &owner,
+        pre_fee_balance,
+        share_asset(share_id),
+    );
     if ter != Ter::TES_SUCCESS && ter != Ter::TEC_DUPLICATE {
         return ter;
     }
@@ -965,11 +1046,38 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     if share_asset_scale != 0 {
         vault.set_field_u8(sf("sfScale"), share_asset_scale);
     }
+    if feature_enabled(view, "LendingProtocolV1_1") {
+        // Newly-created post-amendment vaults use cash-basis accounting and
+        // persist their kind even for the default open-ended case.
+        vault.set_field_u8(sf("sfLEVersion"), 1);
+        let kind = sttx
+            .is_field_present(sf("sfVaultKind"))
+            .then(|| sttx.get_field_u8(sf("sfVaultKind")))
+            .unwrap_or(0);
+        vault.set_field_u8(sf("sfVaultKind"), kind);
+        if kind == 1 {
+            vault.set_field_u32(
+                sf("sfSubscriptionDate"),
+                sttx.get_field_u32(sf("sfSubscriptionDate")),
+            );
+            vault.set_field_u32(
+                sf("sfRedemptionDate"),
+                sttx.get_field_u32(sf("sfRedemptionDate")),
+            );
+        }
+    }
     associate_asset(&mut vault, asset);
-    let _ = view.insert(Arc::new(vault));
+    if view.insert(Arc::new(vault)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
-    if let Ok(Some(owner_root)) = view.peek(account_keylet(to_160(&owner))) {
-        let _ = adjust_owner_count(view, &owner_root, 2);
+    let owner_root = match view.peek(account_keylet(to_160(&owner))) {
+        Ok(Some(root)) => root,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if adjust_owner_count(view, &owner_root, 2).is_err() {
+        return Ter::TEF_BAD_LEDGER;
     }
 
     Ter::TES_SUCCESS
@@ -982,8 +1090,10 @@ pub fn apply_vault_set<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     }
 
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
-    let Some(mut vault) = load_vault(view, vault_id) else {
-        return Ter::TEC_NO_ENTRY;
+    let mut vault = match load_vault(view, vault_id) {
+        Ok(Some(vault)) => vault,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(ter) => return ter,
     };
 
     let tx_account = sttx.get_account_id(sf("sfAccount"));
@@ -992,8 +1102,10 @@ pub fn apply_vault_set<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     }
 
     let mut issuance = if sttx.is_field_present(sf("sfDomainID")) {
-        let Some(issuance) = load_issuance(view, vault.share_id) else {
-            return Ter::TEF_INTERNAL;
+        let issuance = match load_issuance(view, vault.share_id) {
+            Ok(Some(issuance)) => issuance,
+            Ok(None) => return Ter::TEF_INTERNAL,
+            Err(ter) => return ter,
         };
         if vault.entry.get_field_u32(sf("sfFlags")) & VAULT_PRIVATE_FLAG == 0 {
             return Ter::TEC_NO_PERMISSION;
@@ -1002,14 +1114,12 @@ pub fn apply_vault_set<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
             return Ter::TEF_INTERNAL;
         }
         let domain = sttx.get_field_h256(sf("sfDomainID"));
-        if !domain.is_zero()
-            && view
-                .read(protocol::permissioned_domain_keylet_from_id(domain))
-                .ok()
-                .flatten()
-                .is_none()
-        {
-            return Ter::TEC_OBJECT_NOT_FOUND;
+        if !domain.is_zero() {
+            match view.read(protocol::permissioned_domain_keylet_from_id(domain)) {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            }
         }
         Some(issuance)
     } else {
@@ -1035,7 +1145,9 @@ pub fn apply_vault_set<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     }
     if sttx.is_field_present(sf("sfDomainID")) {
         let domain = sttx.get_field_h256(sf("sfDomainID"));
-        let issuance = issuance.as_mut().expect("domain update loaded issuance");
+        let Some(issuance) = issuance.as_mut() else {
+            return Ter::TEF_INTERNAL;
+        };
         if domain.is_zero() {
             issuance.entry.make_field_absent(sf("sfDomainID"));
         } else {
@@ -1058,8 +1170,10 @@ pub fn apply_vault_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
 
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
     let owner = sttx.get_account_id(sf("sfAccount"));
-    let Some(vault) = load_vault(view, vault_id) else {
-        return Ter::TEC_NO_ENTRY;
+    let vault = match load_vault(view, vault_id) {
+        Ok(Some(vault)) => vault,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(ter) => return ter,
     };
 
     if owner != vault.owner {
@@ -1072,8 +1186,10 @@ pub fn apply_vault_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return Ter::TEC_HAS_OBLIGATIONS;
     }
 
-    let Some(issuance) = load_issuance(view, vault.share_id) else {
-        return Ter::TEC_OBJECT_NOT_FOUND;
+    let issuance = match load_issuance(view, vault.share_id) {
+        Ok(Some(issuance)) => issuance,
+        Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+        Err(ter) => return ter,
     };
     if issuance.issuer != vault.pseudo {
         return Ter::TEC_NO_PERMISSION;
@@ -1087,43 +1203,73 @@ pub fn apply_vault_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return ter;
     }
 
-    if token_balance(view, vault.share_id, &owner).is_some() {
+    let owner_has_shares = match token_balance(view, vault.share_id, &owner) {
+        Ok(balance) => balance.is_some(),
+        Err(ter) => return ter,
+    };
+    if owner_has_shares {
         let ter = ledger::remove_empty_holding(view, &owner, &share_asset(vault.share_id));
         if ter != Ter::TES_SUCCESS && ter != Ter::TEC_OBJECT_NOT_FOUND {
             return ter;
         }
     }
 
-    let _ = dir_remove(
+    match dir_remove(
         view,
         &owner_dir_keylet(to_160(&issuance.issuer)),
         issuance.owner_node,
         issuance.key,
         false,
-    );
-    let _ = view.erase(Arc::new(issuance.entry));
-    if let Ok(Some(pseudo_root)) = view.peek(account_keylet(to_160(&vault.pseudo))) {
-        let _ = adjust_owner_count(view, &pseudo_root, -1);
+    ) {
+        Ok(true) => {}
+        Ok(false) => return Ter::TEF_BAD_LEDGER,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    }
+    if view.erase(Arc::new(issuance.entry)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
+    let pseudo_root = match view.peek(account_keylet(to_160(&vault.pseudo))) {
+        Ok(Some(root)) => root,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if adjust_owner_count(view, &pseudo_root, -1).is_err() {
+        return Ter::TEF_BAD_LEDGER;
     }
 
-    if let Ok(Some(pseudo_root)) = view.peek(account_keylet(to_160(&vault.pseudo))) {
-        if pseudo_root.get_field_amount(sf("sfBalance")).xrp().drops() == 0
-            && pseudo_root.get_field_u32(sf("sfOwnerCount")) == 0
-        {
-            let _ = view.erase(pseudo_root);
-        }
+    let pseudo_root = match view.peek(account_keylet(to_160(&vault.pseudo))) {
+        Ok(Some(root)) => root,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if pseudo_root.get_field_amount(sf("sfBalance")).xrp().drops() == 0
+        && pseudo_root.get_field_u32(sf("sfOwnerCount")) == 0
+        && view.erase(pseudo_root).is_err()
+    {
+        return Ter::TEF_BAD_LEDGER;
     }
 
-    let _ = dir_remove(
+    match dir_remove(
         view,
         &owner_dir_keylet(to_160(&vault.owner)),
         vault.entry.get_field_u64(sf("sfOwnerNode")),
         vault.key,
         false,
-    );
-    let _ = view.erase(Arc::new(vault.entry));
-    if let Ok(Some(owner_root)) = view.peek(account_keylet(to_160(&vault.owner))) {
-        let _ = adjust_owner_count(view, &owner_root, -2);
+    ) {
+        Ok(true) => {}
+        Ok(false) => return Ter::TEF_BAD_LEDGER,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    }
+    if view.erase(Arc::new(vault.entry)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
+    let owner_root = match view.peek(account_keylet(to_160(&vault.owner))) {
+        Ok(Some(root)) => root,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if adjust_owner_count(view, &owner_root, -2).is_err() {
+        return Ter::TEF_BAD_LEDGER;
     }
     Ter::TES_SUCCESS
 }
@@ -1137,11 +1283,14 @@ pub fn apply_vault_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
     let account = sttx.get_account_id(sf("sfAccount"));
     let tx_amount = sttx.get_field_amount(sf("sfAmount"));
-    let Some(mut vault) = load_vault(view, vault_id) else {
-        return Ter::TEC_NO_ENTRY;
+    let mut vault = match load_vault(view, vault_id) {
+        Ok(Some(vault)) => vault,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(ter) => return ter,
     };
-    let Some(issuance) = load_issuance(view, vault.share_id) else {
-        return Ter::TEF_BAD_LEDGER;
+    let issuance = match load_issuance(view, vault.share_id) {
+        Ok(Some(issuance)) => issuance,
+        Ok(None) | Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let Some(amount) = vault_deposit_amount_at_scale(
         &vault,
@@ -1165,11 +1314,17 @@ pub fn apply_vault_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         && !amount.integral()
         && account != amount.issue().issuer()
     {
-        let balance = account_holds_vault_asset_full_balance(view, &account, vault.asset);
+        let balance = match account_holds_vault_asset_full_balance(view, &account, vault.asset) {
+            Ok(balance) => balance,
+            Err(ter) => return ter,
+        };
         if balance < amount {
             return Ter::TEC_INSUFFICIENT_FUNDS;
         }
-        let trustline_balance = account_holds_vault_asset(view, &account, vault.asset);
+        let trustline_balance = match account_holds_vault_asset(view, &account, vault.asset) {
+            Ok(balance) => balance,
+            Err(ter) => return ter,
+        };
         if amount_is_zero_at_scale(vault.asset, &tx_amount, trustline_balance.exponent()) {
             return Ter::TEC_PRECISION_LOSS;
         }
@@ -1191,18 +1346,19 @@ pub fn apply_vault_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         }
     }
 
-    let ter = ensure_holding(view, &account, share_asset(vault.share_id));
+    let ter = ensure_holding(view, sttx, &account, share_asset(vault.share_id));
     if ter != Ter::TES_SUCCESS && ter != Ter::TEC_DUPLICATE {
         return ter;
     }
 
-    let ter = account_send(view, &account, &vault.pseudo, &assets_deposited);
+    let ter = account_send(view, sttx, &account, &vault.pseudo, &assets_deposited);
     if ter != Ter::TES_SUCCESS {
         return ter;
     }
 
     let ter = transfer_mpt(
         view,
+        sttx,
         vault.share_id,
         &vault.pseudo,
         &account,
@@ -1232,13 +1388,19 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         account
     };
     let amount = sttx.get_field_amount(sf("sfAmount"));
-    let Some(mut vault) = load_vault(view, vault_id) else {
-        return Ter::TEC_NO_ENTRY;
+    let mut vault = match load_vault(view, vault_id) {
+        Ok(Some(vault)) => vault,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(ter) => return ter,
     };
-    let Some(issuance) = load_issuance(view, vault.share_id) else {
-        return Ter::TEF_BAD_LEDGER;
+    let issuance = match load_issuance(view, vault.share_id) {
+        Ok(Some(issuance)) => issuance,
+        Ok(None) | Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    let waive_unrealized_loss = should_waive_withdrawal(view, &account, &issuance);
+    let waive_unrealized_loss = match should_waive_withdrawal(view, &account, &issuance) {
+        Ok(waive) => waive,
+        Err(ter) => return ter,
+    };
 
     let (shares_redeemed, assets_withdrawn) = if amount.asset() == vault.asset {
         let Some(shares) =
@@ -1283,7 +1445,11 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return can_withdraw;
     }
 
-    if token_balance(view, vault.share_id, &account).unwrap_or_default() < shares_redeemed {
+    let account_shares = match token_balance(view, vault.share_id, &account) {
+        Ok(balance) => balance.unwrap_or_default(),
+        Err(ter) => return ter,
+    };
+    if account_shares < shares_redeemed {
         return Ter::TEC_INSUFFICIENT_FUNDS;
     }
     let final_withdrawal = view.rules().enabled(&feature_id("fixCleanup3_2_0"))
@@ -1302,6 +1468,7 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
 
     let ter = transfer_mpt(
         view,
+        sttx,
         vault.share_id,
         &account,
         &vault.pseudo,
@@ -1320,7 +1487,7 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         }
     }
 
-    let ter = account_send(view, &vault.pseudo, &destination, &assets_withdrawn);
+    let ter = account_send(view, sttx, &vault.pseudo, &destination, &assets_withdrawn);
     if ter != Ter::TES_SUCCESS {
         return ter;
     }
@@ -1345,11 +1512,13 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
     let account = sttx.get_account_id(sf("sfAccount"));
     let holder = sttx.get_account_id(sf("sfHolder"));
-    let Some(mut vault) = load_vault(view, vault_id) else {
-        return Ter::TEF_BAD_LEDGER;
+    let mut vault = match load_vault(view, vault_id) {
+        Ok(Some(vault)) => vault,
+        Ok(None) | Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    let Some(issuance) = load_issuance(view, vault.share_id) else {
-        return Ter::TEF_BAD_LEDGER;
+    let issuance = match load_issuance(view, vault.share_id) {
+        Ok(Some(issuance)) => issuance,
+        Ok(None) | Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     let clawback_amount = if sttx.is_field_present(sf("sfAmount")) {
@@ -1363,11 +1532,17 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         && clawback_amount.asset() == share_asset(vault.share_id)
     {
         (
-            token_balance(view, vault.share_id, &holder).unwrap_or_default(),
+            match token_balance(view, vault.share_id, &holder) {
+                Ok(balance) => balance.unwrap_or_default(),
+                Err(ter) => return ter,
+            },
             zero_amount(vault.asset),
         )
     } else if clawback_amount.asset() == vault.asset && clawback_amount.signum() == 0 {
-        let shares = token_balance(view, vault.share_id, &holder).unwrap_or_default();
+        let shares = match token_balance(view, vault.share_id, &holder) {
+            Ok(balance) => balance.unwrap_or_default(),
+            Err(ter) => return ter,
+        };
         let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, false) else {
             return Ter::TEC_INTERNAL;
         };
@@ -1421,6 +1596,7 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
 
     let ter = transfer_mpt(
         view,
+        sttx,
         vault.share_id,
         &holder,
         &vault.pseudo,
@@ -1440,7 +1616,7 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     }
 
     if assets_recovered.signum() > 0 {
-        let ter = account_send(view, &vault.pseudo, &account, &assets_recovered);
+        let ter = account_send(view, sttx, &vault.pseudo, &account, &assets_recovered);
         if ter != Ter::TES_SUCCESS {
             return ter;
         }

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use basics::number::{NumberParts as RuntimeNumber, RoundingMode, get_mantissa_scale};
+use basics::number::{
+    NumberParts as RuntimeNumber, NumberRoundModeGuard, RoundingMode, get_mantissa_scale,
+};
 use ledger::{RelativeDistanceAmount, views::apply_view::ApplyView};
 use protocol::{
     AccountID, Asset, STAmount, STLedgerEntry, STNumber, TenthBips16, TenthBips32, Ter,
@@ -30,16 +32,16 @@ pub(super) fn round_number_to_asset(asset: Asset, value: RuntimeNumber) -> Runti
 }
 
 pub(super) fn vault_scale(vault_sle: &STLedgerEntry, asset: Asset) -> i32 {
-    if asset.integral() {
-        return 0;
-    }
-    if vault_sle.is_field_present(sf("sfScale")) {
-        return -(vault_sle.get_field_u8(sf("sfScale")) as i32);
-    }
-    asset
-        .amount(vault_sle.get_field_number(sf("sfAssetsTotal")).value())
-        .map(|amount| amount.exponent())
-        .unwrap_or(0)
+    // rippled's getAssetsTotalScale() is deliberately unrelated to the
+    // Vault's sfScale (which controls the vault-share conversion ratio).  It
+    // constructs an STAmount from the current sfAssetsTotal Number and returns
+    // that canonical amount's exponent.  In particular, an IOU Number whose
+    // external exponent is -6 can have an STAmount scale of -9 after the IOU
+    // mantissa is canonicalized.
+    asset_scale_from_value(
+        asset,
+        vault_sle.get_field_number(sf("sfAssetsTotal")).value(),
+    )
 }
 
 pub(super) fn round_runtime_to_scale(
@@ -63,8 +65,14 @@ pub(super) fn round_runtime_to_scale(
         exponent += 1;
     }
 
-    let first = removed.first().copied().unwrap_or(0);
-    let has_more = removed.iter().skip(1).any(|digit| *digit != 0);
+    // Digits are removed least-significant first.  The rounding digit is the
+    // final (most-significant) removed digit; all earlier removed digits are
+    // the sticky tail.  Using `first()` here rounds from the wrong end whenever
+    // more than one decimal place is discarded.
+    let first = removed.last().copied().unwrap_or(0);
+    let has_more = removed
+        .get(..removed.len().saturating_sub(1))
+        .is_some_and(|tail| tail.iter().any(|digit| *digit != 0));
     let round_up = match rounding {
         RoundingMode::TowardsZero => false,
         RoundingMode::Downward => negative && (first != 0 || has_more),
@@ -87,11 +95,34 @@ pub(super) fn round_number_to_asset_with_scale(
     scale: i32,
     rounding: RoundingMode,
 ) -> RuntimeNumber {
-    let rounded_to_asset = round_number_to_asset(asset, value);
     if asset.integral() {
         return round_runtime_to_scale(value, 0, rounding);
     }
-    round_runtime_to_scale(rounded_to_asset, scale, rounding)
+
+    // Match rippled's roundToAsset/roundToScale.  Both STAmount construction
+    // and IOU addition normalize through Number under the pinned implementation;
+    // the reference addition/subtraction is the requested precision gate.
+    let _rounding = NumberRoundModeGuard::new(rounding);
+    let Some(value_amount) = asset.amount(value).ok() else {
+        return value;
+    };
+    if value_amount.signum() == 0 || value_amount.exponent() >= scale {
+        return value_amount.as_number();
+    }
+    let reference_mantissa = if value < RuntimeNumber::zero() {
+        -1_000_000_000_000_000_i64
+    } else {
+        1_000_000_000_000_000_i64
+    };
+    let Ok(reference_value) =
+        RuntimeNumber::try_from_external_parts(reference_mantissa, scale, get_mantissa_scale())
+    else {
+        return value;
+    };
+    let Some(reference_amount) = asset.amount(reference_value).ok() else {
+        return value;
+    };
+    (value_amount + reference_amount.clone() - reference_amount).as_number()
 }
 
 pub(super) fn adjust_imprecise_number(
@@ -106,6 +137,22 @@ pub(super) fn adjust_imprecise_number(
         RuntimeNumber::zero()
     } else {
         adjusted
+    }
+}
+
+/// Exact `loanVaultExposure(vault, loan)` parity.  Cash-basis vaults (the
+/// version introduced by LendingProtocolV1_1) expose only principal; legacy
+/// accrual-basis vaults expose total value less the broker management fee.
+pub(super) fn loan_vault_exposure(vault: &STLedgerEntry, loan: &STLedgerEntry) -> RuntimeNumber {
+    let cash_basis =
+        vault.is_field_present(sf("sfLEVersion")) && vault.get_field_u8(sf("sfLEVersion")) == 1;
+    if cash_basis {
+        loan.get_field_number(sf("sfPrincipalOutstanding")).value()
+    } else {
+        loan.get_field_number(sf("sfTotalValueOutstanding")).value()
+            - loan
+                .get_field_number(sf("sfManagementFeeOutstanding"))
+                .value()
     }
 }
 
@@ -186,12 +233,17 @@ pub(super) fn loan_pay_fee_route_minimum_cover(
     )
 }
 
-pub(super) fn is_pseudo_account<V: ApplyView>(view: &mut V, account: &AccountID) -> bool {
-    let Ok(Some(account_sle)) = view.peek(account_keylet(to_160(account))) else {
-        return false;
+pub(super) fn is_pseudo_account<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+) -> Result<bool, Ter> {
+    let account_sle = match view.peek(account_keylet(to_160(account))) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ok(false),
+        Err(_) => return Err(Ter::TEF_BAD_LEDGER),
     };
-    account_sle.is_field_present(sf("sfVaultID"))
-        || account_sle.is_field_present(sf("sfLoanBrokerID"))
+    Ok(account_sle.is_field_present(sf("sfVaultID"))
+        || account_sle.is_field_present(sf("sfLoanBrokerID")))
 }
 
 pub(super) fn runtime_to_amount(
@@ -748,4 +800,29 @@ pub(super) fn compute_overpayment_reamortization(
         value_change,
         periodic_payment: new_loan_properties.periodic_payment,
     })
+}
+
+#[cfg(test)]
+mod rounding_tests {
+    use basics::number::{MantissaScale, NumberParts as RuntimeNumber, RoundingMode};
+
+    use super::round_runtime_to_scale;
+
+    fn number(mantissa: i64, exponent: i32) -> RuntimeNumber {
+        RuntimeNumber::try_from_external_parts(mantissa, exponent, MantissaScale::Large)
+            .expect("valid test number")
+    }
+
+    #[test]
+    fn multi_digit_scale_rounds_from_the_most_significant_removed_digit() {
+        let value = number(1_234_567, -6);
+        assert_eq!(
+            round_runtime_to_scale(value, -2, RoundingMode::ToNearest),
+            number(123, -2)
+        );
+        assert_eq!(
+            round_runtime_to_scale(value, -2, RoundingMode::Upward),
+            number(124, -2)
+        );
+    }
 }
