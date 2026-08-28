@@ -626,6 +626,10 @@ fn reverse_probe<V: ApplyView>(
         // rippled tests the first step's SendMax before treating that same
         // step's short output as a liquidity limit. The input is tagged, so a
         // malformed strand cannot turn this into a USD-vs-XRP comparison.
+        // Keep replacing a downstream limiter when an earlier step also
+        // limits. rippled resets its sandbox and re-executes at every such
+        // step while walking backwards, so the final (lowest-index) limiter
+        // is the point from which the forward suffix must be replayed.
         if index == 0 {
             if let Some(max_in) = max_in {
                 match amounts.input.greater_than(max_in) {
@@ -633,16 +637,16 @@ fn reverse_probe<V: ApplyView>(
                         limiting_step = Some(0);
                         limited_by_max_in = true;
                     }
-                    Some(false) if output_limited && limiting_step.is_none() => {
+                    Some(false) if output_limited => {
                         limiting_step = Some(index);
                     }
                     Some(false) => {}
                     None => return Ok(None),
                 }
-            } else if output_limited && limiting_step.is_none() {
+            } else if output_limited {
                 limiting_step = Some(index);
             }
-        } else if output_limited && limiting_step.is_none() {
+        } else if output_limited {
             limiting_step = Some(index);
         }
 

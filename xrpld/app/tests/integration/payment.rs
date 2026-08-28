@@ -174,6 +174,60 @@ fn payment_xrp_to_iou_partial_self_payment_with_3300_xrp_sendmax() {
     );
 }
 
+#[test]
+fn payment_xrp_to_iou_partial_self_payment_consumes_fractional_offer() {
+    let taker = acct(0x11);
+    let maker = acct(0x22);
+    let issuer = acct(0x33);
+    let usd = usd_currency();
+    let offered = STAmount::from_iou_amount(
+        sf_generic(),
+        IOUAmount::from_parts(4_975_000_000_000_002, -14).expect("49.75000000000002 USD"),
+        Issue::new(usd, issuer),
+    );
+    let ledger = build_ledger(vec![
+        account_root(taker, 118_260_767, 3, 0),
+        account_root(maker, 81_597_975, 6, 0),
+        account_root(issuer, 10_000_000_000, 0, 0),
+        trust_line(taker, issuer, usd, 100, 1_000_000_000, 0),
+        trust_line(maker, issuer, usd, 1_130, 1_000_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let offer = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), maker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(25_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), offered.clone());
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &offer, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    let payment = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_account_id(sf("sfDestination"), taker);
+        tx.set_field_amount(sf("sfAmount"), iou(issuer, usd, 1_000_000_000));
+        tx.set_field_amount(sf("sfSendMax"), xrp(25_000_000));
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfFlags"), 0x0002_0000);
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        full_apply(&mut view, &payment, TxType::PAYMENT),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(maker), 1))
+            .expect("offer read")
+            .is_none(),
+        "fully consumed offer must be removed"
+    );
+}
+
 /// C++ Payment — XRP payment to nonexistent creates account.
 #[test]
 fn payment_xrp_creates_account() {
