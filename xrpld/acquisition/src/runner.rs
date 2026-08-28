@@ -2751,7 +2751,7 @@ impl CoordinatorRunner {
                 session_state.plan.read_backlog_count(),
             )
         };
-        tracing::info!(
+        tracing::trace!(
             target: "acquisition_trace",
             event = "node_store_read_completed",
             run_epoch = session.run_epoch().get(),
@@ -2821,7 +2821,7 @@ impl CoordinatorRunner {
                     session_state.plan.read_backlog_count(),
                 )
             };
-            tracing::info!(
+            tracing::trace!(
                 target: "acquisition_trace",
                 event = "node_store_read_completed",
                 run_epoch = session.run_epoch().get(),

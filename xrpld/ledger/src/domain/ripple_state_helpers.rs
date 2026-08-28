@@ -560,10 +560,23 @@ pub fn transfer_xrp<V: ApplyView>(
         };
         let mut pre_credit_balance = STAmount::from_xrp_amount(XRPAmount::from_drops(to_balance));
         pre_credit_balance.negate();
+        // XRPEndpointStep's reverse pass uses rippled's internal kMaxNative
+        // value as an "unlimited" probe when XRP flows from the virtual XRP
+        // issuer into the destination.  rippled's toSTAmount(XRPAmount) uses
+        // the unchecked native constructor and accountSend passes that same
+        // value to creditHookIOU.  Do likewise here: this value exists only in
+        // the ephemeral PaymentSandbox and is bounded by the forward pass
+        // before any ledger state is committed.  Ordinary XRP transfers must
+        // continue through the network-validating constructor.
+        let credit_amount = if from_is_zero {
+            STAmount::new_native(amount.drops().unsigned_abs(), amount.drops() < 0)
+        } else {
+            STAmount::from_xrp_amount(amount)
+        };
         view.credit_hook_iou(
             protocol::xrp_account(),
             *to,
-            STAmount::from_xrp_amount(amount),
+            credit_amount,
             pre_credit_balance,
         );
         let mut to_obj = to_sle.clone_as_object();

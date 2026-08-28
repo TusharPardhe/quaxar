@@ -143,6 +143,31 @@ fn oe_sell_flag() {
         Ter::TES_SUCCESS
     );
 }
+
+#[test]
+fn oe_passive_sell_xrp_delivery_keeps_internal_native_probe_bounded() {
+    let taker = acct(0x11);
+    let issuer = acct(0x33);
+    let ledger = build_ledger(vec![
+        account_root(taker, 10_000_000_000, 1, 0),
+        account_root(issuer, 10_000_000_000, 0, protocol::lsfDefaultRipple),
+        trust_line(taker, issuer, usd_currency(), 1_000, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+    let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1_250_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(issuer, usd_currency(), 16));
+        tx.set_field_u32(sf("sfFlags"), 0x0001_0000 | 0x0008_0000);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+}
 #[test]
 fn oe_passive_flag() {
     let a = acct(0x11);
