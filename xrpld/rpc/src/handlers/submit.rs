@@ -2571,7 +2571,25 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
         }
     }
 
-    tracing::info!(target: "rpc", tx_hash = %st_tx.get_transaction_id(), "Transaction submitted via RPC");
+    // `accepted` is rippled's broad submit-result flag: a locally kept
+    // transaction can set it even when it was neither applied nor relayed.
+    // Keep all of the admission outcomes in the journal so operators do not
+    // mistake a held/failed transaction for a peer-relay failure.
+    let submit_result = transaction
+        .lock()
+        .expect("transaction mutex must not be poisoned")
+        .get_submit_result();
+    tracing::info!(
+        target: "rpc",
+        tx_hash = %st_tx.get_transaction_id(),
+        result = %trans_token(result),
+        accepted = submit_result.any(),
+        applied = submit_result.applied,
+        broadcast = submit_result.broadcast,
+        queued = submit_result.queued,
+        kept = submit_result.kept,
+        "RPC transaction submission completed"
+    );
 
     // In standalone mode, submit immediately closes the ledger
     // so that subsequent RPC calls (account_info, etc.) see the state changes.
