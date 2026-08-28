@@ -693,6 +693,23 @@ impl AppRclConsensusAdaptor {
                 .iter()
                 .map(|tx| tx.get_transaction_id())
                 .collect::<Vec<_>>();
+            let accepted_tx_metadata = accepted_transactions
+                .iter()
+                .filter_map(|tx| {
+                    let tx_id = tx.get_transaction_id();
+                    let (_, mut metadata) = built.tx_read(tx_id).ok()??;
+                    let result = metadata.get_result_ter();
+                    let index = metadata.get_index();
+                    let mut serialized = protocol::Serializer::default();
+                    metadata.add_raw(&mut serialized, result, index);
+                    Some((
+                        tx_id,
+                        result.to_int(),
+                        index,
+                        basics::str_hex::str_hex(serialized.data()),
+                    ))
+                })
+                .collect::<Vec<_>>();
             tracing::warn!(
                 target: "consensus",
                 seq = built.header().seq,
@@ -702,6 +719,7 @@ impl AppRclConsensusAdaptor {
                 state_root = %built.header().account_hash,
                 consensus_tx_set = %consensus_tx_set,
                 accepted_tx_ids = ?accepted_tx_ids,
+                accepted_tx_metadata = ?accepted_tx_metadata,
                 compatibility = ?compatibility,
                 "Not validating incompatible consensus child"
             );
