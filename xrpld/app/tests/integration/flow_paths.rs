@@ -12,7 +12,7 @@
 
 use super::fixtures::*;
 use super::pipeline::full_apply;
-use app::state::transactor_dispatcher::handle_real_dispatch;
+use app::state::transactor_dispatcher::handle_real_dispatch as production_handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, FlowSandbox, ReadView};
 use protocol::{
@@ -23,6 +23,28 @@ use std::sync::Arc;
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
+}
+
+// Flow fixtures call the handler directly to isolate path execution. Mirror
+// the production shell's mandatory source pre-fee balance capture without
+// adding sequence/fee mutations to those fixtures.
+fn handle_real_dispatch<V: ApplyView>(
+    view: &mut V,
+    tx: &STTx,
+    tx_type: TxType,
+    pre_fee_balance: Option<i64>,
+) -> Ter {
+    let pre_fee_balance =
+        if pre_fee_balance.is_none() && matches!(tx_type, TxType::PAYMENT | TxType::OFFER_CREATE) {
+            let account = tx.get_account_id(sf("sfAccount"));
+            match view.read(protocol::account_keylet(Uint160::from_void(account.data()))) {
+                Ok(Some(sle)) => Some(sle.get_field_amount(sf("sfBalance")).xrp().drops()),
+                Ok(None) | Err(_) => None,
+            }
+        } else {
+            pre_fee_balance
+        };
+    production_handle_real_dispatch(view, tx, tx_type, pre_fee_balance)
 }
 
 // ─── Virtual XRP endpoint reverse probe ─────────────────────────────────────

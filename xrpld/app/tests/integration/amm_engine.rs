@@ -10,8 +10,8 @@
 //! Ported from C++ AMM_test.cpp (608 assertions).
 
 use super::fixtures::*;
+use super::handle_real_dispatch;
 use super::pipeline::full_apply;
-use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{
@@ -654,7 +654,7 @@ fn amm2_vault_usd() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+        full_apply(&mut v, &tx, TxType::VAULT_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -680,7 +680,7 @@ fn amm2_vault_eur() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+        full_apply(&mut v, &tx, TxType::VAULT_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -707,7 +707,7 @@ fn amm2_vault_non_transferable() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+        full_apply(&mut v, &tx, TxType::VAULT_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -944,7 +944,7 @@ fn amm3_vault_gbp() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+        full_apply(&mut v, &tx, TxType::VAULT_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -971,7 +971,7 @@ fn amm3_vault_jpy() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+        full_apply(&mut v, &tx, TxType::VAULT_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -998,7 +998,7 @@ fn amm3_vault_chf() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+        full_apply(&mut v, &tx, TxType::VAULT_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -1025,7 +1025,7 @@ fn amm3_vault_cad() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+        full_apply(&mut v, &tx, TxType::VAULT_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -1052,7 +1052,7 @@ fn amm3_vault_aud() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+        full_apply(&mut v, &tx, TxType::VAULT_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -1185,7 +1185,10 @@ fn amm3_offer_iou_iou_cross() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    handle_real_dispatch(&mut v, &tx1, TxType::OFFER_CREATE, None);
+    assert_eq!(
+        full_apply(&mut v, &tx1, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
     let tx2 = STTx::new(TxType::OFFER_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), b);
         tx.set_field_amount(sf("sfTakerPays"), iou(gw, usd_currency(), 500));
@@ -1194,7 +1197,7 @@ fn amm3_offer_iou_iou_cross() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx2, TxType::OFFER_CREATE, None),
+        full_apply(&mut v, &tx2, TxType::OFFER_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -1253,7 +1256,7 @@ fn amm4_vault_2_currencies() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx1, TxType::VAULT_CREATE, None),
+        full_apply(&mut v, &tx1, TxType::VAULT_CREATE),
         Ter::TES_SUCCESS
     );
     let tx2 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -1266,7 +1269,7 @@ fn amm4_vault_2_currencies() {
         tx.set_field_u32(sf("sfSequence"), 2);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx2, TxType::VAULT_CREATE, None),
+        full_apply(&mut v, &tx2, TxType::VAULT_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -1293,10 +1296,7 @@ fn amm4_pay_iou_1() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-        Ter::TES_SUCCESS
-    );
+    assert_eq!(full_apply(&mut v, &tx, TxType::PAYMENT), Ter::TES_SUCCESS);
 }
 #[test]
 fn amm4_pay_iou_50() {
@@ -1318,10 +1318,7 @@ fn amm4_pay_iou_50() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-        Ter::TES_SUCCESS
-    );
+    assert_eq!(full_apply(&mut v, &tx, TxType::PAYMENT), Ter::TES_SUCCESS);
 }
 #[test]
 fn amm4_pay_iou_250() {
@@ -1343,10 +1340,7 @@ fn amm4_pay_iou_250() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-        Ter::TES_SUCCESS
-    );
+    assert_eq!(full_apply(&mut v, &tx, TxType::PAYMENT), Ter::TES_SUCCESS);
 }
 #[test]
 fn amm4_pay_iou_750() {
@@ -1368,10 +1362,7 @@ fn amm4_pay_iou_750() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-        Ter::TES_SUCCESS
-    );
+    assert_eq!(full_apply(&mut v, &tx, TxType::PAYMENT), Ter::TES_SUCCESS);
 }
 #[test]
 fn amm4_pay_iou_1000() {
@@ -1393,10 +1384,7 @@ fn amm4_pay_iou_1000() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-        Ter::TES_SUCCESS
-    );
+    assert_eq!(full_apply(&mut v, &tx, TxType::PAYMENT), Ter::TES_SUCCESS);
 }
 
 // ─── Trust: Various Limits ──────────────────────────────────────────────────
@@ -1928,7 +1916,7 @@ fn amm6_vault_diff_owners() {
             tx.set_field_u32(sf("sfSequence"), 1);
         });
         assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+            full_apply(&mut v, &tx, TxType::VAULT_CREATE),
             Ter::TES_SUCCESS
         );
     }
@@ -2188,7 +2176,7 @@ fn amm7_vault_10_currencies() {
             tx.set_field_u32(sf("sfSequence"), 1);
         });
         assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+            full_apply(&mut v, &tx, TxType::VAULT_CREATE),
             Ter::TES_SUCCESS
         );
     }
@@ -2379,7 +2367,7 @@ fn amm8_vault_10_owners() {
             tx.set_field_u32(sf("sfSequence"), 1);
         });
         assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+            full_apply(&mut v, &tx, TxType::VAULT_CREATE),
             Ter::TES_SUCCESS
         );
     }
@@ -2832,18 +2820,23 @@ fn amm11_mptoken_max_1t() {
 }
 #[test]
 fn amm11_mptoken_max_max() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-        tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x02);
-        tx.set_field_u64(sf("sfMaximumAmount"), u64::MAX);
-        tx.set_field_amount(sf("sfFee"), xrp(10));
-        tx.set_field_u32(sf("sfSequence"), 1);
-    });
+    // MPTokenIssuanceCreate rejects an unsigned-63-bit overflow in preflight.
+    // The typed apply dispatcher deliberately assumes preflight/preclaim have
+    // already succeeded, just like rippled's doApply, so exercise the actual
+    // preflight helper rather than reintroducing policy checks into doApply.
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
+        tx::run_mp_token_issuance_create_preflight(tx::MPTokenIssuanceCreatePreflightFacts {
+            fix_cleanup_3_2_0_enabled: false,
+            confidential_transfer_enabled: false,
+            reference_holding_present: false,
+            immutable_flags: None,
+            tx_flags: 0x02,
+            transfer_fee: None,
+            domain_id_present: false,
+            domain_id_is_zero: false,
+            metadata_len: None,
+            maximum_amount: Some(u64::MAX),
+        },),
         Ter::TEM_MALFORMED
     );
 }
@@ -3286,7 +3279,7 @@ fn amm24_vault_100_currencies() {
             tx.set_field_u32(sf("sfSequence"), 1);
         });
         assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
+            full_apply(&mut v, &tx, TxType::VAULT_CREATE),
             Ter::TES_SUCCESS
         );
     }

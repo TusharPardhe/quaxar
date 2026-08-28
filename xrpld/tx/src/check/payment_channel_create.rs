@@ -138,28 +138,35 @@ pub fn run_payment_channel_create_preclaim_with_read_view(
     let source = view.read(account_keylet(Uint160::from_void(account.data())))?;
     let destination_sle = view.read(account_keylet(Uint160::from_void(destination.data())))?;
 
-    let (source_balance_covers_reserve, source_balance_covers_reserve_plus_amount) = source
-        .as_ref()
-        .map(|source| {
-            let balance = source
-                .get_field_amount(get_field_by_symbol("sfBalance"))
-                .xrp()
-                .drops();
-            let reserve = i64::try_from(view.fees().account_reserve(
-                source.get_field_u32(get_field_by_symbol("sfOwnerCount")) as usize + 1,
-            ))
-            .unwrap_or(i64::MAX);
-            (
-                balance >= reserve,
-                amount.native()
-                    && amount
+    let (source_balance_covers_reserve, source_balance_covers_reserve_plus_amount) =
+        if view.rules().enabled(&protocol::feature_id("Sponsor")) {
+            // rippled skips both preclaim reserve checks under Sponsor. doApply
+            // separately checks the effective reserve bearer and source post-lock
+            // reserve, once the transaction's reserve sponsor is known.
+            (true, true)
+        } else {
+            source
+                .as_ref()
+                .map(|source| {
+                    let balance = source
+                        .get_field_amount(get_field_by_symbol("sfBalance"))
                         .xrp()
-                        .drops()
-                        .checked_add(reserve)
-                        .is_some_and(|required| balance >= required),
-            )
-        })
-        .unwrap_or((false, false));
+                        .drops();
+                    let reserve =
+                        i64::try_from(ledger::effective_account_reserve(view.fees(), source, 1, 0))
+                            .unwrap_or(i64::MAX);
+                    (
+                        balance >= reserve,
+                        amount.native()
+                            && amount
+                                .xrp()
+                                .drops()
+                                .checked_add(reserve)
+                                .is_some_and(|required| balance >= required),
+                    )
+                })
+                .unwrap_or((false, false))
+        };
 
     let destination_disallow_incoming_pay_chan = destination_sle
         .as_ref()

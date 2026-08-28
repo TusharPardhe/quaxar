@@ -15,19 +15,25 @@ use protocol::{
 const TAILING_SLOT: u8 = AUCTION_SLOT_TIME_INTERVALS as u8 - 1;
 
 /// Read LP token balance for an account from the trust line.
-fn read_lp_balance<V: ApplyView>(view: &mut V, account: AccountID, lp_issue: Issue) -> STAmount {
+fn read_lp_balance<V: ApplyView>(
+    view: &mut V,
+    account: AccountID,
+    lp_issue: Issue,
+) -> Result<STAmount, Ter> {
     let line_keylet = protocol::line(account, lp_issue.account, lp_issue.currency);
-    let Some(state) = view.peek(line_keylet).ok().flatten() else {
-        return STAmount::default();
+    let state = match view.peek(line_keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ok(STAmount::default()),
+        Err(_) => return Err(Ter::TEF_BAD_LEDGER),
     };
     let mut balance = state.get_field_amount(sf("sfBalance"));
     if account > lp_issue.account {
         balance.negate();
     }
     if balance.signum() > 0 {
-        balance
+        Ok(balance)
     } else {
-        STAmount::default()
+        Ok(STAmount::default())
     }
 }
 
@@ -37,23 +43,11 @@ fn redeem_iou<V: ApplyView>(
     amount: &STAmount,
     issue: &Issue,
 ) -> Ter {
-    let b_sender_high = *account > issue.account;
-    let line_keylet = protocol::line(*account, issue.account, issue.currency);
-    let Some(state) = view.peek(line_keylet).ok().flatten() else {
-        return Ter::TEF_INTERNAL;
-    };
-    let mut final_balance = state.get_field_amount(sf("sfBalance"));
-    if b_sender_high {
-        final_balance.negate();
-    }
-    final_balance -= amount.clone();
-    if b_sender_high {
-        final_balance.negate();
-    }
-    let mut obj = state.clone_as_object();
-    obj.set_field_amount(sf("sfBalance"), final_balance);
-    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *state.key())));
-    Ter::TES_SUCCESS
+    // `redeemIOU` is not a raw balance rewrite. It updates trust-line reserve
+    // flags and deletes a line that becomes default, including both directory
+    // links and the holder's owner count. AMMWithdraw-all and AMMBid burns rely
+    // on that cleanup for canonical state and metadata.
+    ledger::ripple_state_helpers::redeem_iou(view, account, amount, issue)
 }
 
 fn issue_iou<V: ApplyView>(
@@ -62,23 +56,7 @@ fn issue_iou<V: ApplyView>(
     amount: &STAmount,
     issue: &Issue,
 ) -> Ter {
-    let b_sender_high = *account > issue.account;
-    let line_keylet = protocol::line(*account, issue.account, issue.currency);
-    let Some(state) = view.peek(line_keylet).ok().flatten() else {
-        return Ter::TEF_INTERNAL;
-    };
-    let mut final_balance = state.get_field_amount(sf("sfBalance"));
-    if b_sender_high {
-        final_balance.negate();
-    }
-    final_balance += amount.clone();
-    if b_sender_high {
-        final_balance.negate();
-    }
-    let mut obj = state.clone_as_object();
-    obj.set_field_amount(sf("sfBalance"), final_balance);
-    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *state.key())));
-    Ter::TES_SUCCESS
+    ledger::ripple_state_helpers::issue_iou(view, account, amount, issue)
 }
 
 fn account_send_lp<V: ApplyView>(
@@ -121,15 +99,20 @@ pub fn apply_amm_bid<V: ApplyView>(view: &mut V, sttx: &protocol::STTx) -> Ter {
     let asset1 = sttx.get_field_issue(sf("sfAsset")).asset();
     let asset2 = sttx.get_field_issue(sf("sfAsset2")).asset();
     let amm_keylet = protocol::amm(asset1, asset2);
-    let Some(amm_sle) = view.peek(amm_keylet).ok().flatten() else {
-        return Ter::TEC_INTERNAL;
+    let amm_sle = match view.peek(amm_keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     let lpt_amm_balance = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
     let lp_issue = lpt_amm_balance.issue();
 
     // Get account's LP token holdings from trust line
-    let lp_tokens = read_lp_balance(view, account, lp_issue);
+    let lp_tokens = match read_lp_balance(view, account, lp_issue) {
+        Ok(amount) => amount,
+        Err(ter) => return ter,
+    };
     if lp_tokens.signum() <= 0 {
         return Ter::TEC_AMM_INVALID_TOKENS;
     }
@@ -145,11 +128,13 @@ pub fn apply_amm_bid<V: ApplyView>(view: &mut V, sttx: &protocol::STTx) -> Ter {
     let min_slot_price = lpt_balance_number * fee_number / min_fee_frac;
 
     // Get auction slot
-    let auction_slot_obj = if amm_sle.is_field_present(sf("sfAuctionSlot")) {
-        amm_sle.get_field_object(sf("sfAuctionSlot"))
-    } else {
-        STObject::new(sf("sfAuctionSlot"))
-    };
+    // Every valid AMM has an auction slot. rippled fails a corrupt AMM closed
+    // with tecINTERNAL; synthesizing an empty slot would instead burn tokens
+    // and install a new owner from noncanonical state.
+    if !amm_sle.is_field_present(sf("sfAuctionSlot")) {
+        return Ter::TEC_INTERNAL;
+    }
+    let auction_slot_obj = amm_sle.get_field_object(sf("sfAuctionSlot"));
 
     let time_slot = protocol::amm_auction_time_slot(current, &auction_slot_obj);
 
@@ -160,7 +145,10 @@ pub fn apply_amm_bid<V: ApplyView>(view: &mut V, sttx: &protocol::STTx) -> Ter {
             let acct_keylet = protocol::account_keylet(basics::base_uint::Uint160::from_void(
                 slot_account.data(),
             ));
-            view.peek(acct_keylet).ok().flatten().is_some()
+            match view.peek(acct_keylet) {
+                Ok(account) => account.is_some(),
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            }
         } else {
             false
         }
@@ -272,12 +260,11 @@ pub fn apply_amm_bid<V: ApplyView>(view: &mut V, sttx: &protocol::STTx) -> Ter {
     }
     amm_obj.set_field_object(sf("sfAuctionSlot"), slot);
     amm_obj.set_field_amount(sf("sfLPTokenBalance"), new_lpt_balance);
-    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+    view.update(Arc::new(STLedgerEntry::from_stobject(
         amm_obj,
         *amm_sle.key(),
-    )));
-
-    Ter::TES_SUCCESS
+    )))
+    .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
 }
 
 /// Compute the actual price to pay, respecting bidMin/bidMax constraints.

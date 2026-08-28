@@ -15,6 +15,13 @@ pub struct FlowCrossResult {
     pub ter: Ter,
 }
 
+fn delete_offer<V: ledger::ApplyView>(
+    view: &mut V,
+    offer: Arc<protocol::STLedgerEntry>,
+) -> Result<Ter, ledger::ViewError> {
+    ledger::offer_helpers::offer_delete(view, offer)
+}
+
 /// Core DEX matching loop matching reference flowCross.
 ///
 /// Iterates through offers in the book, consuming them and tracking
@@ -52,7 +59,14 @@ pub fn flow_cross<S: BookStep, V: ledger::ApplyView>(
         let offer_taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
 
         if offer_taker_gets.signum() <= 0 || offer_taker_pays.signum() <= 0 {
-            let _ = view.erase(offer_sle);
+            let ter = delete_offer(view, offer_sle)?;
+            if !is_tes_success(ter) {
+                return Ok(FlowCrossResult {
+                    taker_pays: total_taker_pays,
+                    taker_gets: total_taker_gets,
+                    ter,
+                });
+            }
             continue;
         }
 
@@ -66,12 +80,26 @@ pub fn flow_cross<S: BookStep, V: ledger::ApplyView>(
             let owner = offer_sle.get_account_id(sf("sfAccount"));
             let ter = mpt_dex::check_create_mpt(view, issue, &owner);
             if !is_tes_success(ter) {
-                let _ = view.erase(offer_sle);
+                let ter = delete_offer(view, offer_sle)?;
+                if !is_tes_success(ter) {
+                    return Ok(FlowCrossResult {
+                        taker_pays: total_taker_pays,
+                        taker_gets: total_taker_gets,
+                        ter,
+                    });
+                }
                 continue;
             }
             let auth = mpt_dex::require_mpt_auth(view, issue, &owner);
             if !is_tes_success(auth) {
-                let _ = view.erase(offer_sle);
+                let ter = delete_offer(view, offer_sle)?;
+                if !is_tes_success(ter) {
+                    return Ok(FlowCrossResult {
+                        taker_pays: total_taker_pays,
+                        taker_gets: total_taker_gets,
+                        ter,
+                    });
+                }
                 continue;
             }
         }
@@ -107,17 +135,24 @@ pub fn flow_cross<S: BookStep, V: ledger::ApplyView>(
 
         // Consume the offer
         if final_gets >= offer_taker_gets {
-            let _ = view.erase(offer_sle);
+            let ter = delete_offer(view, offer_sle)?;
+            if !is_tes_success(ter) {
+                return Ok(FlowCrossResult {
+                    taker_pays: total_taker_pays,
+                    taker_gets: total_taker_gets,
+                    ter,
+                });
+            }
         } else {
             let remaining_gets = offer_taker_gets - final_gets;
             let remaining_pays = offer_taker_pays - final_pays;
             let mut obj = offer_sle.clone_as_object();
             obj.set_field_amount(sf("sfTakerGets"), remaining_gets);
             obj.set_field_amount(sf("sfTakerPays"), remaining_pays);
-            let _ = view.update(Arc::new(protocol::STLedgerEntry::from_stobject(
+            view.update(Arc::new(protocol::STLedgerEntry::from_stobject(
                 obj,
                 *offer_sle.key(),
-            )));
+            )))?;
             break;
         }
     }

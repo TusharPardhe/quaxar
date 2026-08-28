@@ -190,15 +190,22 @@ fn apply_view_credit_balance_matches_read_view_cpp_orientation() {
     );
     let mut view = Sandbox::new(std::sync::Arc::new(ledger), ApplyFlags::NONE);
 
-    let low_balance = ripple_state_helpers::credit_balance(&mut view, &low_id, &high_id, currency);
-    let high_balance = ripple_state_helpers::credit_balance(&mut view, &high_id, &low_id, currency);
+    let low_balance =
+        ripple_state_helpers::try_credit_balance(&mut view, &low_id, &high_id, currency)
+            .expect("low balance read");
+    let high_balance =
+        ripple_state_helpers::try_credit_balance(&mut view, &high_id, &low_id, currency)
+            .expect("high balance read");
     assert_eq!(low_balance.iou(), iou_amount(-77));
     assert_eq!(low_balance.issue(), Issue::new(currency, low_id));
     assert_eq!(high_balance.iou(), iou_amount(77));
     assert_eq!(high_balance.issue(), Issue::new(currency, high_id));
 
-    let low_holds = ripple_state_helpers::account_holds(&mut view, &low_id, &high_id, currency);
-    let high_holds = ripple_state_helpers::account_holds(&mut view, &high_id, &low_id, currency);
+    let low_holds = ripple_state_helpers::try_account_holds(&mut view, &low_id, &high_id, currency)
+        .expect("low holds read");
+    let high_holds =
+        ripple_state_helpers::try_account_holds(&mut view, &high_id, &low_id, currency)
+            .expect("high holds read");
     assert_eq!(low_holds.iou(), iou_amount(77));
     assert_eq!(low_holds.issue(), Issue::new(currency, high_id));
     assert_eq!(high_holds.iou(), iou_amount(-77));
@@ -206,12 +213,14 @@ fn apply_view_credit_balance_matches_read_view_cpp_orientation() {
 
     let missing_currency = currency_from_string("EUR");
     let missing =
-        ripple_state_helpers::account_holds(&mut view, &low_id, &high_id, missing_currency);
+        ripple_state_helpers::try_account_holds(&mut view, &low_id, &high_id, missing_currency)
+            .expect("missing holds read");
     assert_eq!(missing.iou(), IOUAmount::new());
     assert_eq!(missing.issue(), Issue::new(missing_currency, high_id));
 
     let missing_credit =
-        ripple_state_helpers::credit_balance(&mut view, &low_id, &high_id, missing_currency);
+        ripple_state_helpers::try_credit_balance(&mut view, &low_id, &high_id, missing_currency)
+            .expect("missing credit read");
     assert_eq!(missing_credit.iou(), IOUAmount::new());
     assert_eq!(missing_credit.issue(), Issue::new(missing_currency, low_id));
 }

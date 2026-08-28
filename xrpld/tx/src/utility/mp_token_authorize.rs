@@ -25,6 +25,9 @@ pub struct MPTokenAuthorizePreclaimFacts {
     pub issuance_exists: bool,
     pub single_asset_vault_enabled: bool,
     pub token_locked: bool,
+    pub confidential_transfer_enabled: bool,
+    pub confidential_outstanding_nonzero: bool,
+    pub token_has_confidential_balance: bool,
     pub account_is_issuer: bool,
     pub holder_account_exists: bool,
     pub issuance_requires_auth: bool,
@@ -92,6 +95,13 @@ pub fn run_mp_token_authorize_preclaim(facts: MPTokenAuthorizePreclaimFacts) -> 
 
             if facts.single_asset_vault_enabled && facts.token_locked {
                 return Ter::TEC_NO_PERMISSION;
+            }
+
+            if facts.confidential_transfer_enabled
+                && facts.confidential_outstanding_nonzero
+                && facts.token_has_confidential_balance
+            {
+                return Ter::TEC_HAS_OBLIGATIONS;
             }
 
             return Ter::TES_SUCCESS;
@@ -256,6 +266,9 @@ mod tests {
             issuance_exists: true,
             single_asset_vault_enabled: false,
             token_locked: false,
+            confidential_transfer_enabled: false,
+            confidential_outstanding_nonzero: false,
+            token_has_confidential_balance: false,
             account_is_issuer: false,
             holder_account_exists: true,
             issuance_requires_auth: true,
@@ -274,6 +287,9 @@ mod tests {
                 issuance_exists: true,
                 single_asset_vault_enabled: false,
                 token_locked: false,
+                confidential_transfer_enabled: false,
+                confidential_outstanding_nonzero: false,
+                token_has_confidential_balance: false,
                 account_is_issuer: false,
                 holder_account_exists: true,
                 issuance_requires_auth: true,
@@ -290,6 +306,9 @@ mod tests {
             issuance_exists: true,
             single_asset_vault_enabled: true,
             token_locked: true,
+            confidential_transfer_enabled: false,
+            confidential_outstanding_nonzero: false,
+            token_has_confidential_balance: false,
             account_is_issuer: false,
             holder_account_exists: true,
             issuance_requires_auth: true,
@@ -305,6 +324,9 @@ mod tests {
             issuance_exists: true,
             single_asset_vault_enabled: false,
             token_locked: false,
+            confidential_transfer_enabled: false,
+            confidential_outstanding_nonzero: false,
+            token_has_confidential_balance: false,
             account_is_issuer: false,
             holder_account_exists: true,
             issuance_requires_auth: true,
@@ -319,6 +341,30 @@ mod tests {
     }
 
     #[test]
+    fn mp_token_unauthorize_rejects_possible_confidential_obligations() {
+        let result = run_mp_token_authorize_preclaim(MPTokenAuthorizePreclaimFacts {
+            holder_present: false,
+            account_token_exists: true,
+            tx_flags: tfMPTUnauthorize,
+            token_balance_is_zero: true,
+            token_locked_amount_is_zero: true,
+            issuance_exists: true,
+            single_asset_vault_enabled: false,
+            token_locked: false,
+            confidential_transfer_enabled: true,
+            confidential_outstanding_nonzero: true,
+            token_has_confidential_balance: true,
+            account_is_issuer: false,
+            holder_account_exists: true,
+            issuance_requires_auth: false,
+            holder_token_exists: true,
+            holder_is_pseudo_account: false,
+        });
+
+        assert_eq!(result, Ter::TEC_HAS_OBLIGATIONS);
+    }
+
+    #[test]
     fn mp_token_authorize_preclaim_matches_issuer_flow_guards() {
         let no_dst = run_mp_token_authorize_preclaim(MPTokenAuthorizePreclaimFacts {
             holder_present: true,
@@ -329,6 +375,9 @@ mod tests {
             issuance_exists: true,
             single_asset_vault_enabled: false,
             token_locked: false,
+            confidential_transfer_enabled: false,
+            confidential_outstanding_nonzero: false,
+            token_has_confidential_balance: false,
             account_is_issuer: true,
             holder_account_exists: false,
             issuance_requires_auth: true,
@@ -344,6 +393,9 @@ mod tests {
             issuance_exists: true,
             single_asset_vault_enabled: false,
             token_locked: false,
+            confidential_transfer_enabled: false,
+            confidential_outstanding_nonzero: false,
+            token_has_confidential_balance: false,
             account_is_issuer: true,
             holder_account_exists: true,
             issuance_requires_auth: false,
@@ -359,6 +411,9 @@ mod tests {
             issuance_exists: true,
             single_asset_vault_enabled: false,
             token_locked: false,
+            confidential_transfer_enabled: false,
+            confidential_outstanding_nonzero: false,
+            token_has_confidential_balance: false,
             account_is_issuer: true,
             holder_account_exists: true,
             issuance_requires_auth: true,

@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use basics::base_uint::Uint256;
 use ledger::CanonicalTXSet;
-use protocol::{AccountID, STAmount, STTx, SeqProxy, TxType, get_field_by_symbol};
+use protocol::{
+    AccountID, STAmount, STTx, SeqProxy, TxType, get_field_by_symbol, parse_base58_account_id,
+};
 
 fn account(hex: &str) -> AccountID {
     AccountID::from_hex(hex).expect("account hex should parse")
@@ -35,6 +37,30 @@ fn payment_tx(
 
 fn tx_ids(set: &CanonicalTXSet) -> Vec<Uint256> {
     set.iter().map(|tx| tx.get_transaction_id()).collect()
+}
+
+#[test]
+fn ledger_20197848_uses_rippled_canonical_account_order() {
+    let salt =
+        Uint256::from_hex("64CE30B96899680A1BF1F107772A34493026104D11ED3EC05216F1D3F6783370")
+            .expect("consensus transaction-set salt");
+    let signer_account = parse_base58_account_id("r9iCr4Zdrih3UfLgKkeW8bcoo5Ww4zK9z6")
+        .expect("SignerListSet account");
+    let clawback_account =
+        parse_base58_account_id("rscFuQuPHKH4ov3faze4GJZT3MzEgV4YYb").expect("Clawback account");
+    let destination = account("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let signer = payment_tx(signer_account, destination, 20_197_845, None, 10);
+    let clawback = payment_tx(clawback_account, destination, 20_197_787, None, 12);
+
+    let mut set = CanonicalTXSet::new(salt);
+    set.insert(Arc::clone(&clawback));
+    set.insert(Arc::clone(&signer));
+    let ordered_accounts = set
+        .iter()
+        .map(|tx| tx.get_account_id(get_field_by_symbol("sfAccount")))
+        .collect::<Vec<_>>();
+
+    assert_eq!(ordered_accounts, vec![signer_account, clawback_account]);
 }
 
 #[test]

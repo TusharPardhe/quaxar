@@ -1,10 +1,13 @@
-use basics::math::base_uint::Uint160;
+use basics::{
+    math::base_uint::Uint160,
+    number::{NumberRoundModeGuard, RoundingMode},
+};
 use ledger::{ApplyView, ReadView, adjust_owner_count, dir_insert, dir_remove};
 use protocol::{
     AccountID, Issue, Keylet, PublicKey, STAmount, STArray, STLedgerEntry, STObject, STTx,
-    STXChainBridge, Ter, XChainBridgeChainType, XChainCreateAccountAttestation,
-    XChainCreateAccountAttestations, XRPAmount, attestations, calc_account_id,
-    get_field_by_symbol as sf, lsfDisableMaster,
+    STXChainBridge, Ter, XChainBridgeChainType, XChainClaimAttestation, XChainClaimAttestations,
+    XChainCreateAccountAttestation, XChainCreateAccountAttestations, XRPAmount, attestations,
+    calc_account_id, get_field_by_symbol as sf, lsfDisableMaster,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,7 +24,8 @@ pub fn apply_xchain_create_bridge<V: ApplyView>(view: &mut V, sttx: &STTx) -> Te
 
     let sle_acct = match view.peek(protocol::account_keylet(Uint160::from_void(account.data()))) {
         Ok(Some(sle)) => sle,
-        _ => return Ter::TEC_INTERNAL,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     let chain_type = STXChainBridge::src_chain(account == bridge_spec.locking_chain_door());
@@ -54,13 +58,14 @@ pub fn apply_xchain_create_bridge<V: ApplyView>(view: &mut V, sttx: &STTx) -> Te
     ) {
         Ok(Some(p)) => p,
         Ok(None) => return Ter::TEC_DIR_FULL,
-        Err(_) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     sle_bridge.set_field_u64(sf("sfOwnerNode"), page);
 
-    let _ = adjust_owner_count(view, &sle_acct, 1);
-    let _ = view.insert(Arc::new(sle_bridge));
-    let _ = view.update(sle_acct);
+    if adjust_owner_count(view, &sle_acct, 1).is_err() || view.insert(Arc::new(sle_bridge)).is_err()
+    {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
     Ter::TES_SUCCESS
 }
@@ -89,7 +94,8 @@ pub fn apply_xchain_modify_bridge<V: ApplyView>(view: &mut V, sttx: &STTx) -> Te
 
     let mut sle_bridge = match view.peek(bridge_keylet) {
         Ok(Some(sle)) => (*sle).clone(),
-        _ => return Ter::TEC_INTERNAL,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     if let Some(r) = reward {
@@ -102,9 +108,8 @@ pub fn apply_xchain_modify_bridge<V: ApplyView>(view: &mut V, sttx: &STTx) -> Te
         sle_bridge.make_field_absent(sf("sfMinAccountCreateAmount"));
     }
 
-    let _ = view.update(Arc::new(sle_bridge));
-
-    Ter::TES_SUCCESS
+    view.update(Arc::new(sle_bridge))
+        .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
 }
 
 pub fn apply_xchain_create_claim_id<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
@@ -115,12 +120,14 @@ pub fn apply_xchain_create_claim_id<V: ApplyView>(view: &mut V, sttx: &STTx) -> 
 
     let sle_acct = match view.peek(protocol::account_keylet(Uint160::from_void(account.data()))) {
         Ok(Some(sle)) => sle,
-        _ => return Ter::TEC_INTERNAL,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
-    let sle_bridge = match peek_bridge_helper(view, &bridge_spec) {
-        Some(sle) => sle,
-        None => return Ter::TEC_INTERNAL,
+    let sle_bridge = match read_bridge_helper(view, &bridge_spec) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(ter) => return ter,
     };
 
     let claim_id = sle_bridge.get_field_u64(sf("sfXChainClaimID")) + 1;
@@ -139,8 +146,10 @@ pub fn apply_xchain_create_claim_id<V: ApplyView>(view: &mut V, sttx: &STTx) -> 
         claim_id,
     );
 
-    if view.exists(claim_id_keylet).unwrap_or(false) {
-        return Ter::TEC_INTERNAL;
+    match view.exists(claim_id_keylet) {
+        Ok(true) => return Ter::TEC_INTERNAL,
+        Ok(false) => {}
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     }
 
     let mut sle_claim_id = STLedgerEntry::new(claim_id_keylet);
@@ -167,37 +176,40 @@ pub fn apply_xchain_create_claim_id<V: ApplyView>(view: &mut V, sttx: &STTx) -> 
     ) {
         Ok(Some(p)) => p,
         Ok(None) => return Ter::TEC_DIR_FULL,
-        Err(_) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     sle_claim_id.set_field_u64(sf("sfOwnerNode"), page);
 
-    let _ = adjust_owner_count(view, &sle_acct, 1);
-    let _ = view.insert(Arc::new(sle_claim_id));
-    let _ = view.update(Arc::new(updated_bridge));
-    let _ = view.update(sle_acct);
+    if adjust_owner_count(view, &sle_acct, 1).is_err()
+        || view.insert(Arc::new(sle_claim_id)).is_err()
+        || view.update(Arc::new(updated_bridge)).is_err()
+    {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
     Ter::TES_SUCCESS
 }
 
-fn peek_bridge_helper<V: ApplyView>(
+fn read_bridge_helper<V: ReadView>(
     view: &V,
     bridge_spec: &STXChainBridge,
-) -> Option<Arc<STLedgerEntry>> {
-    let try_get = |chain_type: XChainBridgeChainType| -> Option<Arc<STLedgerEntry>> {
+) -> Result<Option<Arc<STLedgerEntry>>, Ter> {
+    let try_get = |chain_type: XChainBridgeChainType| -> Result<Option<Arc<STLedgerEntry>>, Ter> {
         let bridge_keylet = protocol::bridge_keylet_from_door_issue(
             Uint160::from_void(bridge_spec.door(chain_type).data()),
             *bridge_spec.issue(chain_type).get::<Issue>(),
         );
-        if let Ok(Some(sle)) = view.read(bridge_keylet) {
-            if sle.get_field_xchain_bridge(sf("sfXChainBridge")) == *bridge_spec {
-                return Some(sle);
-            }
+        let sle = view.read(bridge_keylet).map_err(|_| Ter::TEF_BAD_LEDGER)?;
+        if let Some(sle) = sle
+            && sle.get_field_xchain_bridge(sf("sfXChainBridge")) == *bridge_spec
+        {
+            return Ok(Some(sle));
         }
-        None
+        Ok(None)
     };
 
-    if let Some(r) = try_get(XChainBridgeChainType::Locking) {
-        return Some(r);
+    if let Some(result) = try_get(XChainBridgeChainType::Locking)? {
+        return Ok(Some(result));
     }
     try_get(XChainBridgeChainType::Issuing)
 }
@@ -215,7 +227,8 @@ pub fn apply_xchain_commit<V: ApplyView>(
 
     let sle_account = match psb.peek(protocol::account_keylet(Uint160::from_void(account.data()))) {
         Ok(Some(sle)) => sle,
-        _ => return Ter::TEC_INTERNAL,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let submitting_account_info =
         pre_fee_balance_drops.map(|pre_fee_balance| TransferHelperSubmittingAccountInfo {
@@ -224,9 +237,10 @@ pub fn apply_xchain_commit<V: ApplyView>(
             post_fee_balance: sle_account.get_field_amount(sf("sfBalance")),
         });
 
-    let sle_bridge = match peek_bridge_helper(&psb, &bridge_spec) {
-        Some(sle) => sle,
-        None => return Ter::TEC_INTERNAL,
+    let sle_bridge = match read_bridge_helper(&psb, &bridge_spec) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(ter) => return ter,
     };
 
     let dst = sle_bridge.get_account_id(sf("sfAccount"));
@@ -247,8 +261,8 @@ pub fn apply_xchain_commit<V: ApplyView>(
         return ter;
     }
 
-    let _ = psb.apply();
-    Ter::TES_SUCCESS
+    psb.apply()
+        .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
 }
 
 pub fn apply_xchain_account_create_commit<V: ApplyView>(
@@ -265,7 +279,8 @@ pub fn apply_xchain_account_create_commit<V: ApplyView>(
 
     let sle_account = match psb.peek(protocol::account_keylet(Uint160::from_void(account.data()))) {
         Ok(Some(sle)) => sle,
-        _ => return Ter::TEC_INTERNAL,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let submitting_account_info =
         pre_fee_balance_drops.map(|pre_fee_balance| TransferHelperSubmittingAccountInfo {
@@ -274,9 +289,10 @@ pub fn apply_xchain_account_create_commit<V: ApplyView>(
             post_fee_balance: sle_account.get_field_amount(sf("sfBalance")),
         });
 
-    let sle_bridge_arc = match peek_bridge_helper(&psb, &bridge_spec) {
-        Some(sle) => sle,
-        None => return Ter::TEC_INTERNAL,
+    let sle_bridge_arc = match read_bridge_helper(&psb, &bridge_spec) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(ter) => return ter,
     };
 
     let dst = sle_bridge_arc.get_account_id(sf("sfAccount"));
@@ -302,10 +318,12 @@ pub fn apply_xchain_account_create_commit<V: ApplyView>(
     let mut sle_bridge = (*sle_bridge_arc).clone();
     let count = sle_bridge.get_field_u64(sf("sfXChainAccountCreateCount"));
     sle_bridge.set_field_u64(sf("sfXChainAccountCreateCount"), count + 1);
-    let _ = psb.update(Arc::new(sle_bridge));
+    if psb.update(Arc::new(sle_bridge)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
-    let _ = psb.apply();
-    Ter::TES_SUCCESS
+    psb.apply()
+        .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,7 +355,10 @@ fn transfer_helper<V: ApplyView>(
     }
 
     let dst_keylet = protocol::account_keylet(Uint160::from_void(dst.data()));
-    if let Ok(Some(sle_dst)) = psb.peek(dst_keylet) {
+    if let Some(sle_dst) = match psb.peek(dst_keylet) {
+        Ok(value) => value,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    } {
         let flags = sle_dst.get_field_u32(sf("sfFlags"));
         if (flags & 0x0002_0000) != 0 && dst_tag.is_none() {
             return Ter::TEC_DST_TAG_NEEDED;
@@ -350,8 +371,10 @@ fn transfer_helper<V: ApplyView>(
                 Uint160::from_void(dst.data()),
                 Uint160::from_void(src.data()),
             );
-            if !psb.exists(preauth_keylet).unwrap_or(false) {
-                return Ter::TEC_NO_PERMISSION;
+            match psb.exists(preauth_keylet) {
+                Ok(true) => {}
+                Ok(false) => return Ter::TEC_NO_PERMISSION,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
             }
         }
     } else if !amt.native() || !can_create {
@@ -362,11 +385,11 @@ fn transfer_helper<V: ApplyView>(
         let src_keylet = protocol::account_keylet(Uint160::from_void(src.data()));
         let sle_src_arc = match psb.peek(src_keylet) {
             Ok(Some(sle)) => sle,
-            _ => return Ter::TEC_INTERNAL,
+            Ok(None) => return Ter::TEC_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
 
-        let owner_count = sle_src_arc.get_field_u32(sf("sfOwnerCount"));
-        let reserve = psb.fees().account_reserve(owner_count as usize);
+        let reserve = ledger::effective_account_reserve(psb.fees(), &sle_src_arc, 0, 0);
         let cur_balance = sle_src_arc.get_field_amount(sf("sfBalance"));
         let available_balance = match submitting_account_info {
             Some(info) if info.account == *src && info.post_fee_balance == cur_balance => {
@@ -383,7 +406,7 @@ fn transfer_helper<V: ApplyView>(
         let sle_dst_arc = match psb.peek(dst_keylet) {
             Ok(Some(sle)) => Some(sle),
             Ok(None) => None,
-            Err(_) => return Ter::TEC_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
 
         let mut sle_dst = if let Some(sle) = sle_dst_arc {
@@ -394,8 +417,10 @@ fn transfer_helper<V: ApplyView>(
             }
             let mut sle = STLedgerEntry::new(dst_keylet);
             sle.set_account_id(sf("sfAccount"), *dst);
-            sle.set_field_u32(sf("sfSequence"), 1);
-            let _ = psb.insert(Arc::new(sle.clone()));
+            sle.set_field_u32(sf("sfSequence"), psb.seq());
+            if psb.insert(Arc::new(sle.clone())).is_err() {
+                return Ter::TEF_BAD_LEDGER;
+            }
             sle
         };
 
@@ -409,39 +434,51 @@ fn transfer_helper<V: ApplyView>(
         sle_src.set_field_amount(sf("sfBalance"), STAmount::from_xrp_amount(new_src_bal));
         sle_dst.set_field_amount(sf("sfBalance"), STAmount::from_xrp_amount(new_dst_bal));
 
-        let _ = psb.update(Arc::new(sle_src));
-        let _ = psb.update(Arc::new(sle_dst));
+        if psb.update(Arc::new(sle_src)).is_err() || psb.update(Arc::new(sle_dst)).is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
 
         return Ter::TES_SUCCESS;
     }
 
-    let rc_input = ledger::ripple_calc::RippleCalcInput {
-        partial_payment_allowed: false,
-        default_paths_allowed: true,
-        limit_quality: false,
-        is_ledger_open: false,
-        domain_id: None,
-    };
-
-    match ledger::ripple_calc::ripple_calculate(
+    let paths = protocol::STPathSet::new(sf("sfPaths"));
+    let (strand_ter, strands) = ledger::flow_engine::strand_builder::to_strands_checked(
         psb,
-        amt,
-        amt,
-        dst,
         src,
-        &protocol::STPathSet::default(),
-        &rc_input,
-    ) {
-        Ok(out) => {
-            if protocol::is_tes_success(out.result)
-                || protocol::is_tec_claim(out.result)
-                || protocol::is_ter_retry(out.result)
-            {
-                return out.result;
-            }
+        dst,
+        &amt.asset(),
+        None,
+        &paths,
+        true,
+        true,
+        false,
+    );
+    if strand_ter != Ter::TES_SUCCESS {
+        return if protocol::is_tec_claim(strand_ter) || protocol::is_ter_retry(strand_ter) {
+            strand_ter
+        } else {
             Ter::TEC_XCHAIN_PAYMENT_FAILED
-        }
-        Err(_) => Ter::TEC_INTERNAL,
+        };
+    }
+    let result = ledger::flow_engine::strand_flow::execute_strands(
+        psb,
+        &strands,
+        amt,
+        false,
+        ledger::ripple_calc::OfferCrossing::No,
+        None,
+        src,
+        dst,
+        None,
+        None,
+    );
+    if protocol::is_tes_success(result.ter)
+        || protocol::is_tec_claim(result.ter)
+        || protocol::is_ter_retry(result.ter)
+    {
+        result.ter
+    } else {
+        Ter::TEC_XCHAIN_PAYMENT_FAILED
     }
 }
 
@@ -461,13 +498,15 @@ pub fn apply_xchain_claim<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         claim_id,
     );
 
-    let sle_bridge = match peek_bridge_helper(&psb, &bridge_spec) {
-        Some(sle) => sle,
-        None => return Ter::TEC_INTERNAL,
+    let sle_bridge = match read_bridge_helper(&psb, &bridge_spec) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(ter) => return ter,
     };
     let sle_claim_id = match psb.peek(claim_id_keylet) {
         Ok(Some(sle)) => sle,
-        _ => return Ter::TEC_INTERNAL,
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     let this_door = sle_bridge.get_account_id(sf("sfAccount"));
@@ -486,11 +525,16 @@ pub fn apply_xchain_claim<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return sl_ter;
     }
 
-    let mut cur_atts = sle_claim_id
-        .get_field_array(sf("sfXChainClaimAttestations"))
-        .clone();
+    let mut cur_atts = match XChainClaimAttestations::from_st_array(
+        &sle_claim_id.get_field_array(sf("sfXChainClaimAttestations")),
+        XChainClaimAttestation::from_st_object,
+    ) {
+        Ok(attestations) => attestations,
+        Err(_) => return Ter::TEC_INTERNAL,
+    };
 
     let claim_r = on_claim(
+        &psb,
         &mut cur_atts,
         &sending_amount,
         src_chain == XChainBridgeChainType::Locking,
@@ -531,21 +575,28 @@ pub fn apply_xchain_claim<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return r.ter();
     }
 
-    let _ = psb.apply();
-    Ter::TES_SUCCESS
+    psb.apply()
+        .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
 }
 
-fn get_signers_list_and_quorum<V: ApplyView>(
+fn get_signers_list_and_quorum<V: ReadView>(
     view: &V,
     sle_bridge: &STLedgerEntry,
 ) -> (HashMap<AccountID, u32>, u32, Ter) {
     let mut r = HashMap::new();
     let this_door = sle_bridge.get_account_id(sf("sfAccount"));
+    let door_keylet = protocol::account_keylet(Uint160::from_void(this_door.data()));
+    match view.read(door_keylet) {
+        Ok(Some(_)) => {}
+        Ok(None) => return (r, u32::MAX, Ter::TEC_INTERNAL),
+        Err(_) => return (r, u32::MAX, Ter::TEF_BAD_LEDGER),
+    }
 
     let signers_keylet = protocol::keylet::signers(Uint160::from_void(this_door.data()));
     let sle_s = match view.read(signers_keylet) {
         Ok(Some(sle)) => sle,
-        _ => return (r, 0, Ter::TEC_XCHAIN_NO_SIGNERS_LIST),
+        Ok(None) => return (r, u32::MAX, Ter::TEC_XCHAIN_NO_SIGNERS_LIST),
+        Err(_) => return (r, u32::MAX, Ter::TEF_BAD_LEDGER),
     };
 
     let quorum = sle_s.get_field_u32(sf("sfSignerQuorum"));
@@ -575,7 +626,7 @@ fn check_attestation_public_key<V: ApplyView>(
         protocol::account_keylet(Uint160::from_void(attestation_signer_account.data()));
     let account_sle = match view.read(account_keylet) {
         Ok(account_sle) => account_sle,
-        Err(_) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     if let Some(account_sle) = account_sle {
@@ -684,7 +735,7 @@ fn finalize_claim_helper<V: ApplyView>(
     {
         let mut inner_sb = ledger::FlowSandbox::new(outer_sb);
 
-        result.main_funds_ter = Some(transfer_helper(
+        let main_funds_ter = transfer_helper(
             &mut inner_sb,
             &this_door,
             dst,
@@ -694,15 +745,16 @@ fn finalize_claim_helper<V: ApplyView>(
             true,
             deposit_auth_policy,
             None,
-        ));
+        );
+        result.main_funds_ter = Some(main_funds_ter);
 
-        if !protocol::is_tes_success(result.main_funds_ter.unwrap())
+        if !protocol::is_tes_success(main_funds_ter)
             && on_transfer_fail == OnTransferFail::KeepClaim
         {
             return result;
         }
 
-        result.reward_ter = Some(if reward_accounts.is_empty() {
+        let reward_ter = if reward_accounts.is_empty() {
             Ter::TES_SUCCESS
         } else {
             let num_rewards = reward_accounts.len() as u64;
@@ -713,6 +765,10 @@ fn finalize_claim_helper<V: ApplyView>(
                 0,
                 false,
             );
+            let _rounding = inner_sb
+                .rules()
+                .enabled(&protocol::feature_id("fixXChainRewardRounding"))
+                .then(|| NumberRoundModeGuard::new(RoundingMode::Downward));
             let share = reward_pool.divide(&den, reward_pool.asset());
 
             for ra in reward_accounts {
@@ -736,46 +792,59 @@ fn finalize_claim_helper<V: ApplyView>(
                 }
             }
             Ter::TES_SUCCESS
-        });
+        };
+        result.reward_ter = Some(reward_ter);
 
-        if !protocol::is_tes_success(result.reward_ter.unwrap())
-            && (on_transfer_fail == OnTransferFail::KeepClaim
-                || result.reward_ter.unwrap() == Ter::TEC_INTERNAL)
+        if !protocol::is_tes_success(reward_ter)
+            && (on_transfer_fail == OnTransferFail::KeepClaim || reward_ter == Ter::TEC_INTERNAL)
         {
             return result;
         }
 
-        if !protocol::is_tes_success(result.main_funds_ter.unwrap())
-            || protocol::is_tes_success(result.reward_ter.unwrap())
-        {
-            let _ = inner_sb.apply();
+        if !protocol::is_tes_success(main_funds_ter) || protocol::is_tes_success(reward_ter) {
+            if inner_sb.apply().is_err() {
+                result.rm_sle_ter = Some(Ter::TEF_BAD_LEDGER);
+                return result;
+            }
         }
     }
 
-    if let Ok(Some(sle_claim_id)) = outer_sb.peek(*claim_id_keylet) {
+    let sle_claim_id = match outer_sb.peek(*claim_id_keylet) {
+        Ok(value) => value,
+        Err(_) => {
+            result.rm_sle_ter = Some(Ter::TEF_BAD_LEDGER);
+            return result;
+        }
+    };
+    if let Some(sle_claim_id) = sle_claim_id {
         let cid_owner = sle_claim_id.get_account_id(sf("sfAccount"));
-        let sle_owner = outer_sb
-            .peek(protocol::account_keylet(Uint160::from_void(
-                cid_owner.data(),
-            )))
-            .ok()
-            .flatten();
+        let sle_owner = match outer_sb.peek(protocol::account_keylet(Uint160::from_void(
+            cid_owner.data(),
+        ))) {
+            Ok(Some(value)) => value,
+            Ok(None) | Err(_) => {
+                result.rm_sle_ter = Some(Ter::TEF_BAD_LEDGER);
+                return result;
+            }
+        };
         let page = sle_claim_id.get_field_u64(sf("sfOwnerNode"));
 
-        if dir_remove(
+        match dir_remove(
             outer_sb as &mut dyn ApplyView,
             &protocol::owner_dir_keylet(Uint160::from_void(cid_owner.data())),
             page,
             claim_id_keylet.key,
             true,
-        )
-        .is_ok()
-        {
-            let _ = outer_sb.erase(sle_claim_id);
-            if let Some(so) = sle_owner {
-                let _ = adjust_owner_count(outer_sb, &so, -1);
+        ) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                result.rm_sle_ter = Some(Ter::TEF_BAD_LEDGER);
+                return result;
             }
-        } else {
+        }
+        if ledger::decrease_owner_count_for_object(outer_sb, &sle_owner, &sle_claim_id, 1).is_err()
+            || outer_sb.erase(sle_claim_id).is_err()
+        {
             result.rm_sle_ter = Some(Ter::TEF_BAD_LEDGER);
             return result;
         }
@@ -784,26 +853,27 @@ fn finalize_claim_helper<V: ApplyView>(
     result
 }
 
-fn on_claim(
-    attestations: &mut STArray,
+fn on_claim<V: ApplyView>(
+    view: &V,
+    attestations: &mut XChainClaimAttestations,
     sending_amount: &STAmount,
     was_locking_chain_send: bool,
     quorum: u32,
     signers_list: &HashMap<AccountID, u32>,
 ) -> Result<Vec<AccountID>, Ter> {
+    attestations.erase_if(|att| {
+        check_attestation_public_key(view, signers_list, att.key_account, &att.public_key)
+            != Ter::TES_SUCCESS
+    });
     let mut reward_accounts = Vec::new();
     let mut weight = 0;
-    for att in attestations.iter() {
-        let att_amt = att.get_field_amount(sf("sfAmount"));
-        let att_was_locking = (att.get_field_u32(sf("sfFlags")) & 0x0000_0001) != 0;
-
-        if att_amt == *sending_amount && att_was_locking == was_locking_chain_send {
-            let signer = att.get_account_id(sf("sfAttestationSignerAccount"));
-            if let Some(w) = signers_list.get(&signer) {
+    for att in attestations.attestations() {
+        if att.match_fields(sending_amount, was_locking_chain_send, None)
+            != protocol::AttestationMatch::NonDstMismatch
+        {
+            if let Some(w) = signers_list.get(&att.key_account) {
                 weight += *w;
-                if att.is_field_present(sf("sfAttestationRewardAccount")) {
-                    reward_accounts.push(att.get_account_id(sf("sfAttestationRewardAccount")));
-                }
+                reward_accounts.push(att.reward_account);
             }
         }
     }
@@ -816,18 +886,21 @@ fn on_claim(
 }
 
 pub fn apply_xchain_add_claim_attestation<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
+    let mut psb = ledger::FlowSandbox::new(view);
     let bridge_spec = sttx.get_field_xchain_bridge(sf("sfXChainBridge"));
-    let sle_bridge = match peek_bridge_helper(view, &bridge_spec) {
-        Some(sle) => sle,
-        None => return Ter::TEC_NO_ENTRY,
+    let sle_bridge = match read_bridge_helper(&psb, &bridge_spec) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(ter) => return ter,
     };
 
-    let (signers_list, _quorum, sl_ter) = get_signers_list_and_quorum(view, &sle_bridge);
+    let (signers_list, quorum, sl_ter) = get_signers_list_and_quorum(&psb, &sle_bridge);
     if !protocol::is_tes_success(sl_ter) {
         return sl_ter;
     }
 
-    let claim_id = sttx.get_field_u64(sf("sfXChainClaimID"));
+    let att = attestations::AttestationClaim::from_transaction_st_object(sttx);
+    let claim_id = att.claim_id;
     let claim_id_keylet = protocol::xchain_owned_claim_id_keylet_from_bridge(
         Uint160::from_void(bridge_spec.locking_chain_door().data()),
         *bridge_spec.locking_chain_issue().get::<Issue>(),
@@ -835,68 +908,120 @@ pub fn apply_xchain_add_claim_attestation<V: ApplyView>(view: &mut V, sttx: &STT
         *bridge_spec.issuing_chain_issue().get::<Issue>(),
         claim_id,
     );
-    let sle_claim_id_arc = match view.peek(claim_id_keylet) {
+    let sle_claim_id_arc = match psb.peek(claim_id_keylet) {
         Ok(Some(sle)) => sle,
         _ => return Ter::TEC_XCHAIN_NO_CLAIM_ID,
     };
 
-    let mut sle_claim_id = (*sle_claim_id_arc).clone();
-    let mut attestations = sle_claim_id
-        .get_field_array(sf("sfXChainClaimAttestations"))
-        .clone();
-
-    let signer = sttx.get_account_id(sf("sfAttestationSignerAccount"));
-    let public_key = match PublicKey::from_slice(&sttx.get_field_vl(sf("sfPublicKey"))) {
-        Ok(public_key) => public_key,
-        Err(_) => return Ter::TEC_XCHAIN_BAD_PUBLIC_KEY_ACCOUNT_PAIR,
-    };
-    let signer_key_ter = check_attestation_public_key(view, &signers_list, signer, &public_key);
+    let signer = att.base.attestation_signer_account;
+    let signer_key_ter =
+        check_attestation_public_key(&psb, &signers_list, signer, &att.base.public_key);
     if !protocol::is_tes_success(signer_key_ter) {
         return signer_key_ter;
     }
 
-    let mut found = false;
-    for att in attestations.iter_mut() {
-        if att.get_account_id(sf("sfAttestationSignerAccount")) == signer {
-            found = true;
+    if sle_claim_id_arc.get_account_id(sf("sfOtherChainSource")) != att.base.sending_account {
+        return Ter::TEC_XCHAIN_SENDING_ACCOUNT_MISMATCH;
+    }
+
+    let this_door = sle_bridge.get_account_id(sf("sfAccount"));
+    let dst_chain = if this_door == bridge_spec.locking_chain_door() {
+        XChainBridgeChainType::Locking
+    } else if this_door == bridge_spec.issuing_chain_door() {
+        XChainBridgeChainType::Issuing
+    } else {
+        return Ter::TEC_INTERNAL;
+    };
+    let src_chain = STXChainBridge::other_chain(dst_chain);
+    if STXChainBridge::dst_chain(att.base.was_locking_chain_send) != dst_chain {
+        return Ter::TEC_XCHAIN_WRONG_CHAIN;
+    }
+
+    let mut cur_atts = match XChainClaimAttestations::from_st_array(
+        &sle_claim_id_arc.get_field_array(sf("sfXChainClaimAttestations")),
+        XChainClaimAttestation::from_st_object,
+    ) {
+        Ok(attestations) => attestations,
+        Err(_) => return Ter::TEC_INTERNAL,
+    };
+    cur_atts.erase_if(|existing| {
+        check_attestation_public_key(
+            &psb,
+            &signers_list,
+            existing.key_account,
+            &existing.public_key,
+        ) != Ter::TES_SUCCESS
+    });
+    let new_attestation = XChainClaimAttestation::from_signed(&att);
+    let mut replaced = false;
+    for existing in cur_atts.attestations_mut() {
+        if existing.key_account == new_attestation.key_account {
+            *existing = new_attestation.clone();
+            replaced = true;
             break;
         }
     }
-    if !found {
-        let mut new_att = STObject::new(sf("sfXChainClaimAttestation"));
-        new_att.set_account_id(sf("sfAttestationSignerAccount"), signer);
-        new_att.set_field_vl(sf("sfPublicKey"), &sttx.get_field_vl(sf("sfPublicKey")));
-        new_att.set_account_id(
-            sf("sfOtherChainSource"),
-            sttx.get_account_id(sf("sfOtherChainSource")),
-        );
-        new_att.set_field_amount(sf("sfAmount"), sttx.get_field_amount(sf("sfAmount")));
-        new_att.set_account_id(
-            sf("sfAttestationRewardAccount"),
-            sttx.get_account_id(sf("sfAttestationRewardAccount")),
-        );
-        new_att.set_field_u32(
-            sf("sfFlags"),
-            if (sttx.get_field_u32(sf("sfFlags")) & 0x0000_0001) != 0 {
-                1
-            } else {
-                0
-            },
-        );
-        attestations.push_back(new_att);
+    if !replaced {
+        cur_atts.emplace_back(new_attestation);
     }
 
-    sle_claim_id.set_field_array(sf("sfXChainClaimAttestations"), attestations);
-    let _ = view.update(Arc::new(sle_claim_id));
+    let mut reward_accounts = Vec::new();
+    let mut weight = 0_u32;
+    for existing in cur_atts.attestations() {
+        if existing.match_fields(
+            &att.base.sending_amount,
+            att.base.was_locking_chain_send,
+            att.dst,
+        ) == protocol::AttestationMatch::Match
+            && let Some(signer_weight) = signers_list.get(&existing.key_account)
+        {
+            weight += *signer_weight;
+            reward_accounts.push(existing.reward_account);
+        }
+    }
 
-    Ter::TES_SUCCESS
+    let claim_owner = sle_claim_id_arc.get_account_id(sf("sfAccount"));
+    let reward_amount = sle_claim_id_arc.get_field_amount(sf("sfSignatureReward"));
+    let mut updated = (*sle_claim_id_arc).clone();
+    updated.set_field_array(sf("sfXChainClaimAttestations"), cur_atts.to_st_array());
+    if psb.update(Arc::new(updated)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
+
+    if weight >= quorum
+        && let Some(dst) = att.dst
+    {
+        let result = finalize_claim_helper(
+            &mut psb,
+            &bridge_spec,
+            &dst,
+            None,
+            &claim_owner,
+            &att.base.sending_amount,
+            &claim_owner,
+            &reward_amount,
+            &reward_accounts,
+            src_chain,
+            &claim_id_keylet,
+            OnTransferFail::KeepClaim,
+            DepositAuthPolicy::Normal,
+        );
+        let ter = result.ter();
+        if ter == Ter::TEC_INTERNAL || protocol::is_tef_failure(ter) {
+            return ter;
+        }
+    }
+
+    psb.apply()
+        .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
 }
 
 pub fn apply_xchain_add_account_create_attestation<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let bridge_spec = sttx.get_field_xchain_bridge(sf("sfXChainBridge"));
-    let sle_bridge = match peek_bridge_helper(view, &bridge_spec) {
-        Some(sle) => sle,
-        None => return Ter::TEC_NO_ENTRY,
+    let sle_bridge = match read_bridge_helper(view, &bridge_spec) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(ter) => return ter,
     };
 
     let (signers_list, quorum, sl_ter) = get_signers_list_and_quorum(view, &sle_bridge);
@@ -924,15 +1049,16 @@ pub fn apply_xchain_add_account_create_attestation<V: ApplyView>(view: &mut V, s
     };
     let src_chain = STXChainBridge::other_chain(dst_chain);
 
-    let att = attestations::AttestationCreateAccount::from_st_object(sttx);
+    let att = attestations::AttestationCreateAccount::from_transaction_st_object(sttx);
     if STXChainBridge::dst_chain(att.base.was_locking_chain_send) != dst_chain {
         return Ter::TEC_XCHAIN_WRONG_CHAIN;
     }
 
     let mut psb = ledger::FlowSandbox::new(view);
-    let mut sle_bridge_mut = match peek_bridge_helper(&psb, &bridge_spec) {
-        Some(sle) => (*sle).clone(),
-        None => return Ter::TEC_INTERNAL,
+    let mut sle_bridge_mut = match read_bridge_helper(&psb, &bridge_spec) {
+        Ok(Some(sle)) => (*sle).clone(),
+        Ok(None) => return Ter::TEC_INTERNAL,
+        Err(ter) => return ter,
     };
 
     let claim_count = sle_bridge_mut.get_field_u64(sf("sfXChainAccountClaimCount"));
@@ -955,7 +1081,7 @@ pub fn apply_xchain_add_account_create_attestation<V: ApplyView>(view: &mut V, s
 
     let sle_claim_id_arc = match psb.peek(claim_id_keylet) {
         Ok(sle) => sle,
-        Err(_) => return Ter::TEC_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let create_claim_id = sle_claim_id_arc.is_none();
 
@@ -964,11 +1090,10 @@ pub fn apply_xchain_add_account_create_attestation<V: ApplyView>(view: &mut V, s
             this_door.data(),
         ))) {
             Ok(Some(sle)) => sle,
-            _ => return Ter::TEC_INTERNAL,
+            Ok(None) => return Ter::TEC_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
-        let reserve = psb
-            .fees()
-            .account_reserve((sle_door.get_field_u32(sf("sfOwnerCount")) + 1) as usize);
+        let reserve = ledger::effective_account_reserve(psb.fees(), &sle_door, 1, 0);
         if sle_door.get_field_amount(sf("sfBalance")).xrp().drops() < reserve as i64 {
             return Ter::TEC_INSUFFICIENT_RESERVE;
         }
@@ -1028,7 +1153,9 @@ pub fn apply_xchain_add_account_create_attestation<V: ApplyView>(view: &mut V, s
             sf("sfXChainCreateAccountAttestations"),
             attestations.to_st_array(),
         );
-        let _ = psb.update(Arc::new(updated));
+        if psb.update(Arc::new(updated)).is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
     }
 
     if has_quorum && claim_count + 1 == att.create_count {
@@ -1056,7 +1183,9 @@ pub fn apply_xchain_add_account_create_attestation<V: ApplyView>(view: &mut V, s
         }
 
         sle_bridge_mut.set_field_u64(sf("sfXChainAccountClaimCount"), att.create_count);
-        let _ = psb.update(Arc::new(sle_bridge_mut));
+        if psb.update(Arc::new(sle_bridge_mut)).is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
     } else if create_claim_id {
         let mut sle_claim_id = STLedgerEntry::new(claim_id_keylet);
         sle_claim_id.set_account_id(sf("sfAccount"), this_door);
@@ -1079,7 +1208,7 @@ pub fn apply_xchain_add_account_create_attestation<V: ApplyView>(view: &mut V, s
         ) {
             Ok(Some(page)) => page,
             Ok(None) => return Ter::TEC_DIR_FULL,
-            Err(_) => return Ter::TEC_DIR_FULL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         sle_claim_id.set_field_u64(sf("sfOwnerNode"), page);
 
@@ -1087,13 +1216,172 @@ pub fn apply_xchain_add_account_create_attestation<V: ApplyView>(view: &mut V, s
             this_door.data(),
         ))) {
             Ok(Some(sle)) => sle,
-            _ => return Ter::TEC_INTERNAL,
+            Ok(None) => return Ter::TEC_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
-        let _ = adjust_owner_count(&mut psb, &sle_door, 1);
-        let _ = psb.insert(Arc::new(sle_claim_id));
-        let _ = psb.update(sle_door);
+        if adjust_owner_count(&mut psb, &sle_door, 1).is_err()
+            || psb.insert(Arc::new(sle_claim_id)).is_err()
+        {
+            return Ter::TEF_BAD_LEDGER;
+        }
     }
 
-    let _ = psb.apply();
-    Ter::TES_SUCCESS
+    psb.apply()
+        .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use basics::base_uint::Uint256;
+    use ledger::{ApplyViewImpl, Ledger, RawView, ReadViewTx, ViewError};
+    use protocol::{ApplyFlags, Currency, Issue, LedgerEntryType, Rules, TxType};
+
+    #[derive(Debug)]
+    struct FaultReadView {
+        base: Arc<Ledger>,
+    }
+
+    impl ReadView for FaultReadView {
+        fn open(&self) -> bool {
+            ReadView::open(self.base.as_ref())
+        }
+        fn header(&self) -> ledger::LedgerHeader {
+            ReadView::header(self.base.as_ref())
+        }
+        fn fees(&self) -> ledger::Fees {
+            ReadView::fees(self.base.as_ref())
+        }
+        fn rules(&self) -> Rules {
+            ReadView::rules(self.base.as_ref())
+        }
+        fn exists(&self, _key: Keylet) -> Result<bool, ViewError> {
+            Err(ViewError::Conversion("injected exists failure".into()))
+        }
+        fn succ(&self, key: Uint256, last: Option<Uint256>) -> Result<Option<Uint256>, ViewError> {
+            ReadView::succ(self.base.as_ref(), key, last)
+        }
+        fn read(&self, _key: Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
+            Err(ViewError::Conversion("injected read failure".into()))
+        }
+        fn sles(&self) -> Result<Vec<Arc<STLedgerEntry>>, ViewError> {
+            ReadView::sles(self.base.as_ref())
+        }
+        fn tx_exists(&self, key: Uint256) -> Result<bool, ViewError> {
+            ReadView::tx_exists(self.base.as_ref(), key)
+        }
+        fn tx_read(&self, key: Uint256) -> Result<Option<ReadViewTx>, ViewError> {
+            ReadView::tx_read(self.base.as_ref(), key)
+        }
+        fn txs(&self) -> Result<Vec<ReadViewTx>, ViewError> {
+            ReadView::txs(self.base.as_ref())
+        }
+    }
+
+    fn bridge() -> STXChainBridge {
+        STXChainBridge::from_parts(
+            AccountID::from_array([0x11; 20]),
+            Issue::new(Currency::from_u64(1), AccountID::from_array([0x12; 20])),
+            AccountID::from_array([0x13; 20]),
+            Issue::new(Currency::from_u64(2), AccountID::from_array([0x14; 20])),
+        )
+    }
+
+    fn account_root(account: AccountID) -> STLedgerEntry {
+        let keylet = protocol::account_keylet(Uint160::from_void(account.data()));
+        let mut sle = STLedgerEntry::from_type_and_key(LedgerEntryType::AccountRoot, keylet.key);
+        sle.set_account_id(sf("sfAccount"), account);
+        sle.set_field_amount(sf("sfBalance"), STAmount::new_native(10_000_000_000, false));
+        sle.set_field_u32(sf("sfSequence"), 1);
+        sle.set_field_u32(sf("sfOwnerCount"), 0);
+        sle.set_field_u32(sf("sfFlags"), 0);
+        sle
+    }
+
+    #[test]
+    fn xchain_created_objects_preserve_the_incremented_owner_count() {
+        let bridge = bridge();
+        let account = bridge.locking_chain_door();
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(1, 0, false);
+        ledger
+            .raw_insert(Arc::new(account_root(account)))
+            .expect("seed bridge owner");
+        let mut apply = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+        let create_bridge = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |object| {
+            object.set_account_id(sf("sfAccount"), account);
+            object.set_field_xchain_bridge(sf("sfXChainBridge"), bridge.clone());
+            object.set_field_amount(sf("sfSignatureReward"), STAmount::new_native(10, false));
+        });
+        assert_eq!(
+            apply_xchain_create_bridge(&mut apply, &create_bridge),
+            Ter::TES_SUCCESS
+        );
+        assert_eq!(
+            apply
+                .read(protocol::account_keylet(Uint160::from_void(account.data())))
+                .expect("read account")
+                .expect("account exists")
+                .get_field_u32(sf("sfOwnerCount")),
+            1
+        );
+
+        let create_claim = STTx::new(TxType::XCHAIN_CREATE_CLAIM_ID, |object| {
+            object.set_account_id(sf("sfAccount"), account);
+            object.set_field_xchain_bridge(sf("sfXChainBridge"), bridge.clone());
+            object.set_field_amount(sf("sfSignatureReward"), STAmount::new_native(10, false));
+            object.set_account_id(sf("sfOtherChainSource"), AccountID::from_array([0x21; 20]));
+        });
+        assert_eq!(
+            apply_xchain_create_claim_id(&mut apply, &create_claim),
+            Ter::TES_SUCCESS
+        );
+        assert_eq!(
+            apply
+                .read(protocol::account_keylet(Uint160::from_void(account.data())))
+                .expect("read account")
+                .expect("account exists")
+                .get_field_u32(sf("sfOwnerCount")),
+            2
+        );
+    }
+
+    #[test]
+    fn xchain_storage_reads_fail_hard_instead_of_becoming_missing_objects() {
+        let bridge = bridge();
+        let faulty = Arc::new(FaultReadView {
+            base: Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false)),
+        });
+        assert!(matches!(
+            read_bridge_helper(faulty.as_ref(), &bridge),
+            Err(Ter::TEF_BAD_LEDGER)
+        ));
+
+        let mut bridge_entry = STLedgerEntry::from_type_and_key(
+            LedgerEntryType::Bridge,
+            protocol::bridge_keylet_from_door_issue(
+                Uint160::from_void(bridge.locking_chain_door().data()),
+                *bridge.locking_chain_issue().get::<Issue>(),
+            )
+            .key,
+        );
+        bridge_entry.set_account_id(sf("sfAccount"), bridge.locking_chain_door());
+        assert_eq!(
+            get_signers_list_and_quorum(faulty.as_ref(), &bridge_entry).2,
+            Ter::TEF_BAD_LEDGER,
+            "a door AccountRoot storage failure must not become pinned's missing-door tecINTERNAL"
+        );
+
+        let account = bridge.locking_chain_door();
+        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |object| {
+            object.set_account_id(sf("sfAccount"), account);
+            object.set_field_xchain_bridge(sf("sfXChainBridge"), bridge.clone());
+            object.set_field_amount(sf("sfSignatureReward"), STAmount::new_native(10, false));
+        });
+        let mut apply = ApplyViewImpl::new(faulty, ApplyFlags::NONE);
+        assert_eq!(
+            apply_xchain_create_bridge(&mut apply, &tx),
+            Ter::TEF_BAD_LEDGER
+        );
+    }
 }

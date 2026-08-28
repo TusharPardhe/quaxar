@@ -77,12 +77,31 @@ fn funds_at_least<V: ReadView>(
             let Some(root) = account(view, account_id)? else {
                 return Ok(false);
             };
-            let balance = root.get_field_amount(sf("sfBalance")).xrp().drops();
-            let reserve = view
-                .fees()
-                .account_reserve(root.get_field_u32(sf("sfOwnerCount")) as usize)
-                as i64;
-            Ok(balance.saturating_sub(reserve) >= amount.xrp().drops())
+            let balance = view
+                .balance_hook_iou(
+                    account_id,
+                    protocol::xrp_account(),
+                    root.get_field_amount(sf("sfBalance")),
+                )
+                .xrp()
+                .drops();
+            let reserve = if ledger::is_pseudo_account(&root) {
+                0
+            } else {
+                let owner_count = view
+                    .owner_count_hook(account_id, ledger::OwnerCounts::from_sle(&root))
+                    .count();
+                ledger::effective_account_reserve_with_owner_count(
+                    view.fees(),
+                    &root,
+                    owner_count,
+                    0,
+                    0,
+                ) as i64
+            };
+            // rippled's xrpLiquid() clamps a below-reserve balance to zero;
+            // it never exposes negative liquid XRP to accountFunds().
+            Ok(balance.saturating_sub(reserve).max(0) >= amount.xrp().drops())
         }
         Asset::Issue(issue) if issue.account == account_id => Ok(true),
         Asset::Issue(issue) => {
@@ -476,6 +495,18 @@ fn preclaim_accept_offer<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         if result != Ter::TES_SUCCESS {
             return Ok(result);
         }
+        let Asset::Issue(issue) = amount.asset() else {
+            return Ok(Ter::TEC_INTERNAL);
+        };
+        let deep = ledger::nftoken_helpers::check_trustline_deep_frozen(
+            view,
+            &sell.get_account_id(sf("sfOwner")),
+            &issue,
+        )
+        .map_err(|_| read_error())?;
+        if deep != Ter::TES_SUCCESS {
+            return Ok(deep);
+        }
         if buy.is_none() {
             let result = authorize_and_check_deep_freeze(view, account_id, &amount, false)?;
             if result != Ter::TES_SUCCESS {
@@ -539,7 +570,9 @@ mod tests {
 
     use basics::base_uint::Uint256;
     use ledger::{Fees, LedgerHeader, ReadView, ReadViewTx, Rules, ViewError};
-    use protocol::{AccountID, Keylet, STLedgerEntry, STTx, Ter, TxType};
+    use protocol::{
+        AccountID, Keylet, STAmount, STArray, STLedgerEntry, STObject, STTx, Ter, TxType,
+    };
 
     use super::{run_nftoken_read_view_preclaim, sf};
 
@@ -585,6 +618,28 @@ mod tests {
 
     fn account(fill: u8) -> AccountID {
         AccountID::from_array([fill; 20])
+    }
+
+    fn account_root(id: AccountID, balance: u64) -> Arc<STLedgerEntry> {
+        let keylet = protocol::account_keylet(basics::base_uint::Uint160::from_void(id.data()));
+        let mut sle = STLedgerEntry::new(keylet);
+        sle.set_account_id(sf("sfAccount"), id);
+        sle.set_field_amount(sf("sfBalance"), STAmount::new_native(balance, false));
+        sle.set_field_u32(sf("sfOwnerCount"), 0);
+        sle.set_field_u32(sf("sfFlags"), 0);
+        Arc::new(sle)
+    }
+
+    fn nft_page(owner: AccountID, token_id: Uint256) -> Arc<STLedgerEntry> {
+        let keylet =
+            protocol::nft_page_max_keylet(basics::base_uint::Uint160::from_void(owner.data()));
+        let mut token = STObject::new(sf("sfNFToken"));
+        token.set_field_h256(sf("sfNFTokenID"), token_id);
+        let mut tokens = STArray::new(sf("sfNFTokens"));
+        tokens.push_back(token);
+        let mut page = STLedgerEntry::new(keylet);
+        page.set_field_array(sf("sfNFTokens"), tokens);
+        Arc::new(page)
     }
 
     #[test]
@@ -637,6 +692,57 @@ mod tests {
         assert_eq!(
             run_nftoken_read_view_preclaim(&view, &tx, TxType::NFTOKEN_MINT),
             Some(Ter::TEC_NO_ISSUER)
+        );
+    }
+
+    #[test]
+    fn create_buy_offer_requires_positive_liquid_funds_not_full_offer_amount() {
+        let buyer = account(10);
+        let owner = account(11);
+        let issuer = account(12);
+        let token_id = protocol::nft::create_nftoken_id(
+            protocol::nft::FLAG_TRANSFERABLE,
+            0,
+            &issuer,
+            protocol::nft::to_taxon(0),
+            1,
+        );
+        let mut view = View::default();
+        for entry in [
+            account_root(buyer, 0),
+            account_root(owner, 1_000_000_000),
+            nft_page(owner, token_id),
+        ] {
+            view.entries.insert(*entry.key(), entry);
+        }
+        let make_tx = |amount| {
+            STTx::new(TxType::NFTOKEN_CREATE_OFFER, |tx| {
+                tx.set_account_id(sf("sfAccount"), buyer);
+                tx.set_account_id(sf("sfOwner"), owner);
+                tx.set_field_h256(sf("sfNFTokenID"), token_id);
+                tx.set_field_amount(sf("sfAmount"), STAmount::new_native(amount, false));
+            })
+        };
+
+        assert_eq!(
+            run_nftoken_read_view_preclaim(
+                &view,
+                &make_tx(1_000_000),
+                TxType::NFTOKEN_CREATE_OFFER,
+            ),
+            Some(Ter::TEC_UNFUNDED_OFFER)
+        );
+
+        let funded = account_root(buyer, 100);
+        view.entries.insert(*funded.key(), funded);
+        // rippled checks signum(accountFunds), not funds >= offer amount.
+        assert_eq!(
+            run_nftoken_read_view_preclaim(
+                &view,
+                &make_tx(1_000_000),
+                TxType::NFTOKEN_CREATE_OFFER,
+            ),
+            Some(Ter::TES_SUCCESS)
         );
     }
 }

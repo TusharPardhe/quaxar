@@ -24,7 +24,6 @@ pub use domain::account_state_sf;
 pub use domain::amendment_table;
 pub use domain::amm_helpers;
 pub use domain::amm_utils;
-pub use domain::book_dirs;
 pub use domain::book_listeners;
 pub use domain::canonical_tx_set;
 pub use domain::cleaner;
@@ -43,9 +42,11 @@ pub use domain::persistence;
 pub use domain::ripple_calc;
 pub use domain::setup;
 pub use domain::sponsor_helpers::{
-    SPF_SPONSOR_FEE, SPF_SPONSOR_FLAG_MASK, SPF_SPONSOR_RESERVE, decrease_owner_count_for_object,
-    decrease_owner_count_for_trust_line, increase_owner_count_for_object, is_fee_sponsored,
-    is_reserve_sponsor_allowed, is_reserve_sponsored, reserve_owner_count,
+    OwnerCounts, SPF_SPONSOR_FEE, SPF_SPONSOR_FLAG_MASK, SPF_SPONSOR_RESERVE,
+    decrease_owner_count_for_object, decrease_owner_count_for_trust_line,
+    effective_account_reserve, effective_account_reserve_with_owner_count,
+    increase_owner_count_for_object, is_fee_sponsored, is_reserve_sponsor_allowed,
+    is_reserve_sponsored, reserve_account_count, reserve_owner_count,
 };
 pub use domain::timeout_counter;
 pub use domain::token_helpers;
@@ -78,30 +79,31 @@ pub use accepted_ledger::{AcceptedLedger, AcceptedLedgerBuildError};
 pub use accepted_ledger_tx::{AcceptedLedgerTx, AcceptedLedgerTxMeta};
 pub use account_root_helpers::{
     ACCOUNT_TRANSFER_RATE_PARITY, check_destination_and_tag, create_pseudo_account,
-    is_global_frozen, pseudo_account_address, transfer_rate,
+    is_global_frozen, is_pseudo_account, pseudo_account_address, transfer_rate,
 };
 pub use account_state_sf::AccountStateSF;
 pub use amendment_table::{AmendmentTable, FeatureInfo, VoteBehavior};
 pub use amm_helpers::{
     IsDeposit, RelativeDistanceAmount, adjust_amounts_by_lp_tokens, adjust_asset_in_by_tokens,
     adjust_asset_out_by_tokens, adjust_frac_by_tokens, adjust_lp_tokens, amm_asset_in,
-    amm_asset_out, amm_lp_tokens, get_rounded_asset, get_rounded_asset_with_product,
-    get_rounded_lp_tokens, get_rounded_lp_tokens_with_product, lp_tokens_in, lp_tokens_out,
-    multiply, solve_quadratic_eq_smallest, within_relative_distance_amount,
-    within_relative_distance_quality,
+    amm_asset_out, amm_lp_tokens, check_amm_precision_loss, get_rounded_asset,
+    get_rounded_asset_with_product, get_rounded_lp_tokens, get_rounded_lp_tokens_with_product,
+    lp_tokens_in, lp_tokens_out, multiply, solve_quadratic_eq_smallest,
+    within_relative_distance_amount, within_relative_distance_quality,
 };
 pub use amm_utils::{
     amm_account_holds, amm_holds, amm_lp_holds, amm_lp_holds_from_sle, amm_pool_holds,
-    get_trading_fee, is_only_liquidity_provider,
+    get_trading_fee, is_only_liquidity_provider, verify_and_adjust_lp_token_balance,
 };
-pub use apply_directory::{describe_owner_dir, dir_append, dir_insert, dir_remove};
+pub use apply_directory::{
+    describe_owner_dir, dir_append, dir_delete, dir_insert, dir_remove, empty_dir_delete,
+};
 pub use apply_state_table::ApplyStateTable;
 pub use apply_view::{ApplyView, ApplyViewImpl, adjust_owner_count};
 pub use basics::base_uint::Uint256;
 use basics::chrono::NetClockTimePoint;
 pub use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::CacheClock;
-pub use book_dirs::{BookDirIter, BookDirs};
 pub use book_listeners::{BookListenerSubscriber, BookListeners};
 pub use cached_sles::CachedSles;
 pub use cached_view::CachedView;
@@ -3007,16 +3009,25 @@ impl Ledger {
         // accept-time build both operating on the same closed ledger's state).
         static NEXT_COWID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
 
-        // across ALL transactions, matching reference where stateMap_ is a persistent
-        // SHAMap that rawInsert/rawErase/rawReplace all operate on directly.
-        if self.mutable_state.is_none() {
-            let cowid = NEXT_COWID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.mutable_state = Some(MutableTree::from_loaded_root(
-                self.state_map.root(),
-                cowid.max(1),
-            ));
-        }
-        let tree = self.mutable_state.as_mut().unwrap();
+        // Apply into a detached COW snapshot and publish it only after every
+        // operation succeeds. rippled treats a duplicate rawInsert or a
+        // missing rawErase as a ledger logic error; a failed batch must not
+        // leave an earlier operation reachable through `mutable_state`.
+        let current_root = self
+            .mutable_state
+            .as_ref()
+            .map(MutableTree::root)
+            .unwrap_or_else(|| self.state_map.root());
+        let minimum_cowid = current_root.cowid().saturating_add(1).max(1);
+        let allocated = NEXT_COWID
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |next| Some(next.max(minimum_cowid).saturating_add(1)),
+            )
+            .unwrap_or_else(|next| next);
+        let cowid = allocated.max(minimum_cowid);
+        let mut tree = MutableTree::from_loaded_root(current_root, cowid);
 
         let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
             basics::memory::intrusive_pointer::SharedIntrusive<
@@ -3035,17 +3046,8 @@ impl Ledger {
                         SHAMapItem::new(*key, payload.clone()),
                         &mut fetch_fn,
                     )?;
-                    // If the item already exists (add_item returns Ok(false)), fall back
-                    // to update. This handles the case where a sandbox tracks a modification
-                    // as Insert (because the item was created within the sandbox's scope)
-                    // but the item already exists in the underlying state map from a
-                    // previous ledger.
                     if !inserted {
-                        tree.update_item_with_fetch(
-                            shamap::tree_node::SHAMapNodeType::AccountState,
-                            SHAMapItem::new(*key, payload.clone()),
-                            &mut fetch_fn,
-                        )?;
+                        return Err(MutationError::DuplicateExactLeaf(*key));
                     }
                 }
                 StateBatchOp::Update => {
@@ -3056,7 +3058,9 @@ impl Ledger {
                     )?;
                 }
                 StateBatchOp::Delete => {
-                    tree.delete_item_with_fetch(*key, &mut fetch_fn)?;
+                    if !tree.delete_item_with_fetch(*key, &mut fetch_fn)? {
+                        return Err(MutationError::MissingExactLeaf(*key));
+                    }
                 }
             }
         }
@@ -3072,6 +3076,7 @@ impl Ledger {
             next_state_map.set_full();
         }
         self.state_map = next_state_map;
+        self.mutable_state = Some(tree);
         let seq = self.header.seq;
         let ops_count = ops.len();
         tracing::debug!(target: "ledger", seq, ops_count, "State batch applied");
@@ -3094,10 +3099,13 @@ impl Ledger {
         payload.add_vl(&metadata_bytes);
 
         let mut tree = MutableTree::from_loaded_root(self.tx_map.root(), ledger_seq.max(1));
-        tree.add_item(
+        let inserted = tree.add_item(
             SHAMapNodeType::TransactionMd,
             SHAMapItem::new(key, payload.data().to_vec()),
         )?;
+        if !inserted {
+            return Err(MutationError::DuplicateExactLeaf(key));
+        }
 
         let next_tx_map =
             SyncTree::from_root_with_type(tree.root(), map_type, backed, ledger_seq, state);
@@ -3206,6 +3214,86 @@ mod tests {
     use basics::base_uint::Uint256;
     use protocol::{ApplyFlags, Keylet, LedgerEntryType, STLedgerEntry, Serializer, XRPAmount};
     use std::sync::Arc;
+
+    #[test]
+    fn state_batch_duplicate_insert_is_atomic_and_does_not_replace() {
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(10, 1_000, false);
+        let existing = Uint256::from_array([0x41; 32]);
+        let earlier = Uint256::from_array([0x31; 32]);
+        ledger
+            .apply_state_batch(&[(StateBatchOp::Insert, existing, vec![1; 12])])
+            .expect("seed state item");
+        let root_before = ledger.state_map().root().get_hash();
+
+        let error = ledger
+            .apply_state_batch(&[
+                (StateBatchOp::Insert, earlier, vec![4; 12]),
+                (StateBatchOp::Insert, existing, vec![9; 12]),
+            ])
+            .expect_err("duplicate rawInsert must fail closed");
+
+        assert_eq!(error, MutationError::DuplicateExactLeaf(existing));
+        assert_eq!(ledger.state_map().root().get_hash(), root_before);
+        assert!(
+            ledger
+                .state_map()
+                .peek_item(earlier, &mut |_| None)
+                .expect("state lookup")
+                .is_none(),
+            "an earlier operation in the failed batch must not leak"
+        );
+        assert_eq!(
+            ledger
+                .state_map()
+                .peek_item(existing, &mut |_| None)
+                .expect("state lookup")
+                .expect("seed item remains")
+                .data(),
+            &[1; 12]
+        );
+    }
+
+    #[test]
+    fn state_batch_missing_delete_is_atomic() {
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(10, 1_000, false);
+        let earlier = Uint256::from_array([0x51; 32]);
+        let missing = Uint256::from_array([0x61; 32]);
+        let root_before = ledger.state_map().root().get_hash();
+
+        let error = ledger
+            .apply_state_batch(&[
+                (StateBatchOp::Insert, earlier, vec![7; 12]),
+                (StateBatchOp::Delete, missing, Vec::new()),
+            ])
+            .expect_err("missing rawErase must fail closed");
+
+        assert_eq!(error, MutationError::MissingExactLeaf(missing));
+        assert_eq!(ledger.state_map().root().get_hash(), root_before);
+        assert!(
+            ledger
+                .state_map()
+                .peek_item(earlier, &mut |_| None)
+                .expect("state lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn duplicate_transaction_md_is_rejected_without_replacing_root() {
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(10, 1_000, false);
+        let tx_id = Uint256::from_array([0x71; 32]);
+        ledger
+            .insert_tx_map_item(tx_id, vec![1; 12], vec![3; 12])
+            .expect("seed TransactionMd");
+        let root_before = ledger.tx_map().root().get_hash();
+
+        let error = ledger
+            .insert_tx_map_item(tx_id, vec![9; 12], vec![8; 12])
+            .expect_err("duplicate TransactionMd must fail closed");
+
+        assert_eq!(error, MutationError::DuplicateExactLeaf(tx_id));
+        assert_eq!(ledger.tx_map().root().get_hash(), root_before);
+    }
 
     #[test]
     fn fallible_dirty_flush_requires_node_writer() {
@@ -3511,6 +3599,52 @@ mod tests {
             ps_target
                 .exists(Keylet::new(LedgerEntryType::AccountRoot, k1))
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn payment_sandbox_xrp_liquid_excludes_deferred_xrp_credit() {
+        let account = protocol::AccountID::from_array([0x5a; 20]);
+        let keylet =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
+        let mut root = STLedgerEntry::new(keylet);
+        root.set_account_id(protocol::get_field_by_symbol("sfAccount"), account);
+        root.set_field_amount(
+            protocol::get_field_by_symbol("sfBalance"),
+            protocol::STAmount::from_xrp_amount(XRPAmount::from_drops(100)),
+        );
+        root.set_field_u32(protocol::get_field_by_symbol("sfOwnerCount"), 0);
+
+        let mut base = MockBaseView::default();
+        base.items.insert(keylet.key, Arc::new(root));
+        let mut sandbox = PaymentSandbox::new(Arc::new(base), ApplyFlags::default());
+
+        assert_eq!(
+            domain::ripple_state_helpers::transfer_xrp(
+                &mut sandbox,
+                &protocol::xrp_account(),
+                &account,
+                XRPAmount::from_drops(50),
+            ),
+            protocol::Ter::TES_SUCCESS
+        );
+        assert_eq!(
+            sandbox
+                .read(keylet)
+                .expect("sandbox read")
+                .expect("account root")
+                .get_field_amount(protocol::get_field_by_symbol("sfBalance"))
+                .xrp()
+                .drops(),
+            150,
+            "the sandbox ledger entry records the provisional credit"
+        );
+        assert_eq!(
+            views::apply_view::xrp_liquid(&sandbox, &account, 0)
+                .expect("xrp liquid")
+                .drops(),
+            100,
+            "xrpLiquid must exclude XRP acquired during this payment"
         );
     }
 
@@ -3850,5 +3984,5 @@ pub use domain::offer_helpers;
 pub use domain::payment_channel_helpers;
 pub use domain::permissioned_dex_helpers;
 pub use domain::ripple_state_helpers;
-pub use domain::token_helpers::{add_empty_holding, can_add_holding, remove_empty_holding};
+pub use domain::token_helpers::{add_empty_holding_with_tx, can_add_holding, remove_empty_holding};
 pub use domain::vault_helpers;

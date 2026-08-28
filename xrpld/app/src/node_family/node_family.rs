@@ -119,6 +119,11 @@ pub trait NodeFamilyRuntime: Send + Sync {
         ledger: &Ledger,
         visit: &mut dyn FnMut(Uint256) -> bool,
     ) -> Result<(), TraversalError>;
+    fn visit_state_map_nodes(
+        &self,
+        ledger: &Ledger,
+        visit: &mut dyn FnMut(&SharedIntrusive<SHAMapTreeNode>) -> bool,
+    ) -> Result<(), TraversalError>;
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +309,17 @@ where
             .visit_nodes_with_family(family.as_ref(), &mut |node| {
                 visit(*node.get_hash().as_uint256())
             })
+    }
+
+    fn visit_state_map_nodes(
+        &self,
+        ledger: &Ledger,
+        visit: &mut dyn FnMut(&SharedIntrusive<SHAMapTreeNode>) -> bool,
+    ) -> Result<(), TraversalError> {
+        let family = self.shared_family();
+        ledger
+            .state_map()
+            .visit_nodes_with_family(family.as_ref(), &mut |node| visit(node))
     }
 }
 

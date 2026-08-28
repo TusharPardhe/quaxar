@@ -1,12 +1,10 @@
 //! Escrow transactor apply bridge.
 
 use basics::math::base_uint::{Uint160, Uint256};
-use ledger::{ApplyView, ViewError, adjust_owner_count, dir_insert, dir_remove};
+use ledger::{ApplyView, ViewError, adjust_owner_count, dir_insert};
 use protocol::{AccountID, Asset, STAmount, STLedgerEntry, Ter, XRPAmount, get_field_by_symbol};
 use std::sync::Arc;
-use tx::escrow::escrow_cancel::EscrowCancelApplySink;
 use tx::escrow::escrow_create::{EscrowCreateApplyFacts, EscrowCreateApplySink};
-use tx::escrow::escrow_finish::EscrowFinishApplySink;
 
 /// Check the source account's reserve after XRP is locked without relying on
 /// signed subtraction. rippled's STAmount arithmetic permits an intermediate
@@ -45,8 +43,7 @@ pub fn build_escrow_create_facts<V: ApplyView>(
         view.peek(protocol::account_keylet(Uint160::from_void(account.data())))?
     {
         facts.owner_exists = true;
-        let owner_count = src_sle.get_field_u32(get_field_by_symbol("sfOwnerCount"));
-        let reserve_drops = view.fees().account_reserve(owner_count as usize + 1) as i64;
+        let reserve_drops = ledger::effective_account_reserve(view.fees(), &src_sle, 1, 0) as i64;
         let balance_drops = src_sle
             .get_field_amount(get_field_by_symbol("sfBalance"))
             .xrp()
@@ -58,13 +55,11 @@ pub fn build_escrow_create_facts<V: ApplyView>(
             && view.rules().enabled(&protocol::feature_token_escrow())
             && match amount.asset() {
                 Asset::Issue(issue) => {
-                    ledger::ripple_state_helpers::transfer_rate(view, &issue.issuer())
+                    ledger::ripple_state_helpers::try_transfer_rate(view, &issue.issuer())?
                         != protocol::PARITY_RATE.value
                 }
                 Asset::MPTIssue(issue) => {
-                    ledger::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
-                        .map(|rate| rate.value)
-                        .unwrap_or(protocol::PARITY_RATE.value)
+                    ledger::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())?.value
                         != protocol::PARITY_RATE.value
                 }
             };
@@ -158,12 +153,22 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
     fn set_transfer_rate(&mut self) {
         let rate = match self.amount.asset() {
             Asset::Issue(issue) => {
-                ledger::ripple_state_helpers::transfer_rate(self.view, &issue.issuer())
+                match ledger::ripple_state_helpers::try_transfer_rate(self.view, &issue.issuer()) {
+                    Ok(rate) => rate,
+                    Err(_) => {
+                        self.failure = Some(Ter::TEF_BAD_LEDGER);
+                        return;
+                    }
+                }
             }
             Asset::MPTIssue(issue) => {
-                ledger::mptoken_helpers::transfer_rate_mpt(self.view, issue.mpt_id())
-                    .map(|rate| rate.value)
-                    .unwrap_or(protocol::PARITY_RATE.value)
+                match ledger::mptoken_helpers::transfer_rate_mpt(self.view, issue.mpt_id()) {
+                    Ok(rate) => rate.value,
+                    Err(_) => {
+                        self.failure = Some(Ter::TEF_BAD_LEDGER);
+                        return;
+                    }
+                }
             }
         };
         if let Ok(Some(sle)) = self.view.peek(protocol::escrow_keylet(
@@ -324,7 +329,7 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
             ),
             Asset::MPTIssue(_) => {
                 ledger::mptoken_helpers::lock_escrow_mpt(self.view, &self.account, &self.amount)
-                    .unwrap_or(Ter::TEF_INTERNAL)
+                    .unwrap_or(Ter::TEF_BAD_LEDGER)
             }
         }
     }
@@ -373,211 +378,5 @@ mod tests {
     #[test]
     fn xrp_post_lock_reserve_accepts_an_exact_reserve_remainder() {
         assert!(xrp_post_lock_reserve_sufficient(100, 60, 40));
-    }
-}
-
-pub struct ViewBackedEscrowFinishSink<'a, V> {
-    pub view: &'a mut V,
-    pub owner: AccountID,
-    pub destination: AccountID,
-    pub amount: STAmount,
-    pub escrow_key: Uint256,
-}
-
-impl<'a, V: ApplyView> EscrowFinishApplySink for ViewBackedEscrowFinishSink<'a, V> {
-    fn transfer_escrow_amount(&mut self) -> Ter {
-        if self.amount.native() {
-            let dst_keylet = protocol::account_keylet(Uint160::from_void(self.destination.data()));
-            if let Ok(Some(dst_sle)) = self.view.peek(dst_keylet) {
-                let dst_balance = dst_sle.get_field_amount(get_field_by_symbol("sfBalance"));
-                let new_dst_balance = STAmount::from_xrp_amount(XRPAmount::from_drops(
-                    dst_balance.xrp().drops() + self.amount.xrp().drops(),
-                ));
-                let mut dst_obj = dst_sle.clone_as_object();
-                dst_obj.set_field_amount(get_field_by_symbol("sfBalance"), new_dst_balance);
-                let _ = self.view.update(Arc::new(STLedgerEntry::from_stobject(
-                    dst_obj,
-                    *dst_sle.key(),
-                )));
-            }
-            Ter::TES_SUCCESS
-        } else {
-            ledger::ripple_state_helpers::account_send(
-                self.view,
-                &self.owner,
-                &self.destination,
-                &self.amount,
-            )
-        }
-    }
-    fn remove_escrow_entry(&mut self) {
-        let keylet = protocol::escrow_keylet_from_key(self.escrow_key);
-        if let Ok(Some(sle)) = self.view.peek(keylet) {
-            let owner_node = sle.get_field_u64(get_field_by_symbol("sfOwnerNode"));
-            let _ = dir_remove(
-                self.view,
-                &protocol::owner_dir_keylet(Uint160::from_void(self.owner.data())),
-                owner_node,
-                *sle.key(),
-                false,
-            );
-            if sle.has_field(get_field_by_symbol("sfDestinationNode")) {
-                let dst_node = sle.get_field_u64(get_field_by_symbol("sfDestinationNode"));
-                let _ = dir_remove(
-                    self.view,
-                    &protocol::owner_dir_keylet(Uint160::from_void(self.destination.data())),
-                    dst_node,
-                    *sle.key(),
-                    false,
-                );
-            }
-            let _ = self.view.erase(sle);
-        }
-    }
-    fn adjust_owner_count(&mut self, account: &protocol::AccountID, delta: i32) {
-        let keylet = protocol::account_keylet(Uint160::from_void(account.data()));
-        if let Ok(Some(sle)) = self.view.peek(keylet) {
-            let _ = adjust_owner_count(self.view, &sle, delta);
-        }
-    }
-}
-
-pub struct ViewBackedEscrowCancelSink<'a, V> {
-    pub view: &'a mut V,
-    pub owner: AccountID,
-    pub destination: AccountID,
-    pub amount: STAmount,
-    pub escrow_key: Uint256,
-}
-
-impl<'a, V: ApplyView> EscrowCancelApplySink for ViewBackedEscrowCancelSink<'a, V> {
-    fn escrow_exists(&mut self) -> bool {
-        self.view
-            .exists(protocol::escrow_keylet_from_key(self.escrow_key))
-            .unwrap_or(false)
-    }
-    fn token_escrow_enabled(&mut self) -> bool {
-        false
-    }
-    fn cancel_after_present(&mut self) -> bool {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::escrow_keylet_from_key(self.escrow_key))
-        {
-            return sle.has_field(get_field_by_symbol("sfCancelAfter"));
-        }
-        false
-    }
-    fn cancel_after_passed(&mut self) -> bool {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::escrow_keylet_from_key(self.escrow_key))
-        {
-            if sle.has_field(get_field_by_symbol("sfCancelAfter")) {
-                let cancel_after = sle.get_field_u32(get_field_by_symbol("sfCancelAfter"));
-                return self.view.header().parent_close_time > cancel_after;
-            }
-        }
-        false
-    }
-    fn remove_owner_dir(&mut self) -> bool {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::escrow_keylet_from_key(self.escrow_key))
-        {
-            let owner_node = sle.get_field_u64(get_field_by_symbol("sfOwnerNode"));
-            return dir_remove(
-                self.view,
-                &protocol::owner_dir_keylet(Uint160::from_void(self.owner.data())),
-                owner_node,
-                *sle.key(),
-                false,
-            )
-            .is_ok();
-        }
-        false
-    }
-    fn destination_node_present(&mut self) -> bool {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::escrow_keylet_from_key(self.escrow_key))
-        {
-            return sle.has_field(get_field_by_symbol("sfDestinationNode"));
-        }
-        false
-    }
-    fn remove_destination_dir(&mut self) -> bool {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::escrow_keylet_from_key(self.escrow_key))
-        {
-            if sle.has_field(get_field_by_symbol("sfDestinationNode")) {
-                let dst_node = sle.get_field_u64(get_field_by_symbol("sfDestinationNode"));
-                return dir_remove(
-                    self.view,
-                    &protocol::owner_dir_keylet(Uint160::from_void(self.destination.data())),
-                    dst_node,
-                    *sle.key(),
-                    false,
-                )
-                .is_ok();
-            }
-        }
-        false
-    }
-    fn amount_is_xrp(&mut self) -> bool {
-        self.amount.native()
-    }
-    fn credit_owner_xrp(&mut self) {
-        let keylet = protocol::account_keylet(Uint160::from_void(self.owner.data()));
-        if let Ok(Some(sle)) = self.view.peek(keylet) {
-            let balance = sle.get_field_amount(get_field_by_symbol("sfBalance"));
-            let new_balance = STAmount::from_xrp_amount(XRPAmount::from_drops(
-                balance.xrp().drops() + self.amount.xrp().drops(),
-            ));
-            let mut obj = sle.clone_as_object();
-            obj.set_field_amount(get_field_by_symbol("sfBalance"), new_balance);
-            let _ = self
-                .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-        }
-    }
-    fn apply_token_unlock(&mut self) -> Ter {
-        Ter::TES_SUCCESS
-    }
-    fn issuer_node_present(&mut self) -> bool {
-        false
-    }
-    fn remove_issuer_dir(&mut self) -> bool {
-        true
-    }
-    fn owner_exists(&mut self) -> bool {
-        self.view
-            .exists(protocol::account_keylet(Uint160::from_void(
-                self.owner.data(),
-            )))
-            .unwrap_or(false)
-    }
-    fn adjust_owner_count(&mut self, delta: i32) {
-        if let Ok(Some(sle)) = self.view.peek(protocol::account_keylet(Uint160::from_void(
-            self.owner.data(),
-        ))) {
-            let _ = adjust_owner_count(self.view, &sle, delta);
-        }
-    }
-    fn update_owner(&mut self) {
-        if let Ok(Some(sle)) = self.view.peek(protocol::account_keylet(Uint160::from_void(
-            self.owner.data(),
-        ))) {
-            let _ = self.view.update(sle);
-        }
-    }
-    fn erase_escrow(&mut self) {
-        if let Ok(Some(sle)) = self
-            .view
-            .peek(protocol::escrow_keylet_from_key(self.escrow_key))
-        {
-            let _ = self.view.erase(sle);
-        }
     }
 }

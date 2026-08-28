@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
+use super::handle_real_dispatch;
 use app::state::application_root::apply_submit_transactor_shell;
-use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView, Sandbox};
 use protocol::{

@@ -13,15 +13,15 @@ pub fn max_xrp_flow<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
     reserve: XRPAmount,
-) -> XRPAmount {
+) -> Result<XRPAmount, crate::ViewError> {
     let acct_keylet =
         protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
-    let Some(sle) = view.peek(acct_keylet).ok().flatten() else {
-        return XRPAmount::from_drops(0);
+    let Some(sle) = view.peek(acct_keylet)? else {
+        return Ok(XRPAmount::from_drops(0));
     };
     let balance = sle.get_field_amount(sf("sfBalance")).xrp();
     let available = balance.drops().saturating_sub(reserve.drops());
-    XRPAmount::from_drops(available.max(0))
+    Ok(XRPAmount::from_drops(available.max(0)))
 }
 
 /// Execute an XRP endpoint step: transfer XRP from src to dst.

@@ -13,8 +13,6 @@ use basics::number::{
     get_rounding_mode,
 };
 
-use crate::st_number::get_st_number_switchover;
-
 pub const MIN_IOU_EXPONENT: i32 = -96;
 pub const MAX_IOU_EXPONENT: i32 = 80;
 pub const MIN_IOU_MANTISSA: i64 = 1_000_000_000_000_000;
@@ -119,36 +117,13 @@ impl IOUAmount {
             return Ok(());
         }
 
-        if get_st_number_switchover() {
-            let sum = RuntimeNumber::from(*self).try_add(RuntimeNumber::from(rhs))?;
-            *self = Self::from_number(sum)?;
-            return Ok(());
-        }
-
-        let mut rhs_mantissa = rhs.mantissa;
-        let mut rhs_exponent = rhs.exponent;
-
-        while self.exponent < rhs_exponent {
-            self.mantissa /= 10;
-            self.exponent += 1;
-        }
-
-        while rhs_exponent < self.exponent {
-            rhs_mantissa /= 10;
-            rhs_exponent += 1;
-        }
-
-        self.mantissa = self
-            .mantissa
-            .checked_add(rhs_mantissa)
-            .ok_or(NumberArithmeticError::Overflow)?;
-
-        if (-10..=10).contains(&self.mantissa) {
-            *self = Self::new();
-            return Ok(());
-        }
-
-        self.normalize()
+        // Pinned rippled IOUAmount::operator+= always performs the operation
+        // through Number, then normalizes the result back to the IOU wire
+        // range.  The old decimal-alignment branch predates that implementation
+        // and loses the low digits used by roundToScale.
+        let sum = RuntimeNumber::from(*self).try_add(RuntimeNumber::from(rhs))?;
+        *self = Self::from_number(sum)?;
+        Ok(())
     }
 
     pub fn checked_sub_assign(&mut self, rhs: Self) -> Result<(), NumberArithmeticError> {
@@ -161,52 +136,12 @@ impl IOUAmount {
             return Ok(());
         }
 
-        if get_st_number_switchover() {
-            let runtime = runtime_number_from_external_parts(
-                self.mantissa,
-                self.exponent,
-                current_runtime_mantissa_range().scale,
-            )?;
-            *self = Self::from_number(runtime)?;
-            return Ok(());
-        }
-
-        self.normalize_without_stnumber()
-    }
-
-    fn normalize_without_stnumber(&mut self) -> Result<(), NumberArithmeticError> {
-        let negative = self.mantissa < 0;
-        let mut mantissa = i128::from(self.mantissa).unsigned_abs();
-        let mut exponent = self.exponent;
-
-        while mantissa < MIN_IOU_MANTISSA as u128 && exponent > MIN_IOU_EXPONENT {
-            mantissa = mantissa
-                .checked_mul(10)
-                .ok_or(NumberArithmeticError::Overflow)?;
-            exponent -= 1;
-        }
-
-        while mantissa > MAX_IOU_MANTISSA as u128 {
-            if exponent >= MAX_IOU_EXPONENT {
-                return Err(NumberArithmeticError::Overflow);
-            }
-
-            mantissa /= 10;
-            exponent += 1;
-        }
-
-        if exponent < MIN_IOU_EXPONENT || mantissa < MIN_IOU_MANTISSA as u128 {
-            *self = Self::new();
-            return Ok(());
-        }
-
-        if exponent > MAX_IOU_EXPONENT {
-            return Err(NumberArithmeticError::Overflow);
-        }
-
-        let mantissa = i64::try_from(mantissa).map_err(|_| NumberArithmeticError::Overflow)?;
-        self.mantissa = if negative { -mantissa } else { mantissa };
-        self.exponent = exponent;
+        let runtime = runtime_number_from_external_parts(
+            self.mantissa,
+            self.exponent,
+            current_runtime_mantissa_range().scale,
+        )?;
+        *self = Self::from_number(runtime)?;
         Ok(())
     }
 }
@@ -689,5 +624,28 @@ impl IouRoundGuard {
             return Err(NumberArithmeticError::Overflow);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::st_number::{get_st_number_switchover, set_st_number_switchover};
+
+    use super::IOUAmount;
+
+    #[test]
+    fn addition_uses_pinned_number_path_independent_of_stnumber_wire_switch() {
+        let saved = get_st_number_switchover();
+        let value = IOUAmount::from_parts(9_750_144_547_690_000, -13).unwrap();
+        let reference = IOUAmount::from_parts(1_000_000_000_000_000, -9).unwrap();
+
+        set_st_number_switchover(false);
+        let legacy_flag_result = value + reference - reference;
+        set_st_number_switchover(true);
+        let universal_flag_result = value + reference - reference;
+        set_st_number_switchover(saved);
+
+        assert_eq!(legacy_flag_result, value);
+        assert_eq!(universal_flag_result, value);
     }
 }

@@ -6,6 +6,7 @@ use super::common::{raw_account_id, sf};
 #[derive(Default)]
 pub(super) struct ObjectDeletionState {
     pub deleted_pseudo_accounts: Vec<AccountID>,
+    pub deleted_object_missing_account: bool,
 }
 
 pub(super) fn record_object_deletion_state(
@@ -27,6 +28,8 @@ pub(super) fn record_object_deletion_state(
             if sle.is_field_present(sf("sfAccount")) {
                 let pseudo_id = sle.get_account_id(sf("sfAccount"));
                 state.deleted_pseudo_accounts.push(pseudo_id);
+            } else {
+                state.deleted_object_missing_account = true;
             }
         }
         _ => {}
@@ -36,12 +39,15 @@ pub(super) fn record_object_deletion_state(
 pub(super) fn validates_object_deletion<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &ObjectDeletionState,
-) -> bool {
+) -> Result<bool, ledger::ViewError> {
+    if state.deleted_object_missing_account {
+        return Ok(false);
+    }
     for pseudo_id in &state.deleted_pseudo_accounts {
         let keylet = protocol::account_keylet(raw_account_id(*pseudo_id));
-        if matches!(sandbox.read(keylet), Ok(Some(_))) {
-            return false;
+        if sandbox.read(keylet)?.is_some() {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }

@@ -174,6 +174,8 @@ fn credential_create_preclaim_maps_subject_and_duplicate_checks() {
         run_credential_create_preclaim(CredentialCreatePreclaimFacts {
             subject_exists: false,
             credential_exists: false,
+            reject_pseudo_subject: true,
+            subject_is_pseudo_account: false,
         }),
         Ter::TEC_NO_TARGET
     );
@@ -181,6 +183,8 @@ fn credential_create_preclaim_maps_subject_and_duplicate_checks() {
         run_credential_create_preclaim(CredentialCreatePreclaimFacts {
             subject_exists: true,
             credential_exists: true,
+            reject_pseudo_subject: true,
+            subject_is_pseudo_account: false,
         }),
         Ter::TEC_DUPLICATE
     );
@@ -188,6 +192,8 @@ fn credential_create_preclaim_maps_subject_and_duplicate_checks() {
         run_credential_create_preclaim(CredentialCreatePreclaimFacts {
             subject_exists: true,
             credential_exists: false,
+            reject_pseudo_subject: true,
+            subject_is_pseudo_account: false,
         }),
         Ter::TES_SUCCESS
     );

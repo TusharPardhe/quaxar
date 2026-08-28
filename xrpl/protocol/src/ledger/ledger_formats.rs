@@ -65,6 +65,7 @@ pub const MPT_CAN_MUTATE_CAN_TRANSFER_LEDGER_FLAG: LedgerFlagValue = 0x0000_0020
 pub const MPT_CAN_MUTATE_CAN_CLAWBACK_LEDGER_FLAG: LedgerFlagValue = 0x0000_0040;
 pub const MPT_CAN_MUTATE_METADATA_LEDGER_FLAG: LedgerFlagValue = 0x0001_0000;
 pub const MPT_CAN_MUTATE_TRANSFER_FEE_LEDGER_FLAG: LedgerFlagValue = 0x0002_0000;
+pub const MPT_CAN_HOLD_CONFIDENTIAL_BALANCE_IMMUTABLE_LEDGER_FLAG: LedgerFlagValue = 0x0000_0080;
 
 pub const MPT_AUTHORIZED_LEDGER_FLAG: LedgerFlagValue = 0x0000_0002;
 pub const MPT_AMM_LEDGER_FLAG: LedgerFlagValue = 0x0000_0004;
@@ -133,6 +134,15 @@ alias_consts!(
     (MPT_CAN_MUTATE_CAN_CLAWBACK_LEDGER_FLAG => lsmfMPTCanMutateCanClawback),
     (MPT_CAN_MUTATE_METADATA_LEDGER_FLAG => lsmfMPTCanMutateMetadata),
     (MPT_CAN_MUTATE_TRANSFER_FEE_LEDGER_FLAG => lsmfMPTCanMutateTransferFee),
+    (MPT_CAN_MUTATE_CAN_LOCK_LEDGER_FLAG => lsifMPTCanLock),
+    (MPT_CAN_MUTATE_REQUIRE_AUTH_LEDGER_FLAG => lsifMPTRequireAuth),
+    (MPT_CAN_MUTATE_CAN_ESCROW_LEDGER_FLAG => lsifMPTCanEscrow),
+    (MPT_CAN_MUTATE_CAN_TRADE_LEDGER_FLAG => lsifMPTCanTrade),
+    (MPT_CAN_MUTATE_CAN_TRANSFER_LEDGER_FLAG => lsifMPTCanTransfer),
+    (MPT_CAN_MUTATE_CAN_CLAWBACK_LEDGER_FLAG => lsifMPTCanClawback),
+    (MPT_CAN_HOLD_CONFIDENTIAL_BALANCE_IMMUTABLE_LEDGER_FLAG => lsifMPTCanHoldConfidentialBalance),
+    (MPT_CAN_MUTATE_METADATA_LEDGER_FLAG => lsifMPTMetadata),
+    (MPT_CAN_MUTATE_TRANSFER_FEE_LEDGER_FLAG => lsifMPTTransferFee),
     (MPT_AUTHORIZED_LEDGER_FLAG => lsfMPTAuthorized),
     (MPT_AMM_LEDGER_FLAG => lsfMPTAMM),
     (ACCEPTED_LEDGER_FLAG => lsfAccepted),
@@ -238,20 +248,28 @@ ledger_flag_getter!(
         ("lsfMPTCanTrade", lsfMPTCanTrade),
         ("lsfMPTCanTransfer", lsfMPTCanTransfer),
         ("lsfMPTCanClawback", lsfMPTCanClawback),
+        (
+            "lsfMPTCanHoldConfidentialBalance",
+            lsfMPTCanHoldConfidentialBalance
+        ),
     ]
 );
 ledger_flag_getter!(
-    getMPTokenIssuanceMutableFlags,
-    MPTOKEN_ISSUANCE_MUTABLE_FLAGS,
+    getMPTokenIssuanceImmutableFlags,
+    MPTOKEN_ISSUANCE_IMMUTABLE_FLAGS,
     [
-        ("lsmfMPTCanMutateCanLock", lsmfMPTCanMutateCanLock),
-        ("lsmfMPTCanMutateRequireAuth", lsmfMPTCanMutateRequireAuth),
-        ("lsmfMPTCanMutateCanEscrow", lsmfMPTCanMutateCanEscrow),
-        ("lsmfMPTCanMutateCanTrade", lsmfMPTCanMutateCanTrade),
-        ("lsmfMPTCanMutateCanTransfer", lsmfMPTCanMutateCanTransfer),
-        ("lsmfMPTCanMutateCanClawback", lsmfMPTCanMutateCanClawback),
-        ("lsmfMPTCanMutateMetadata", lsmfMPTCanMutateMetadata),
-        ("lsmfMPTCanMutateTransferFee", lsmfMPTCanMutateTransferFee),
+        ("lsifMPTCanLock", lsifMPTCanLock),
+        ("lsifMPTRequireAuth", lsifMPTRequireAuth),
+        ("lsifMPTCanEscrow", lsifMPTCanEscrow),
+        ("lsifMPTCanTrade", lsifMPTCanTrade),
+        ("lsifMPTCanTransfer", lsifMPTCanTransfer),
+        ("lsifMPTCanClawback", lsifMPTCanClawback),
+        (
+            "lsifMPTCanHoldConfidentialBalance",
+            lsifMPTCanHoldConfidentialBalance
+        ),
+        ("lsifMPTMetadata", lsifMPTMetadata),
+        ("lsifMPTTransferFee", lsifMPTTransferFee),
     ]
 );
 ledger_flag_getter!(
@@ -299,8 +317,8 @@ pub fn getAllLedgerFlags() -> &'static LedgerFlagMapPairList {
                 getMPTokenIssuanceFlags().clone(),
             ),
             (
-                "MPTokenIssuanceMutable".to_owned(),
-                getMPTokenIssuanceMutableFlags().clone(),
+                "MPTokenIssuanceImmutable".to_owned(),
+                getMPTokenIssuanceImmutableFlags().clone(),
             ),
             ("MPToken".to_owned(), getMPTokenFlags().clone()),
             ("Credential".to_owned(), getCredentialFlags().clone()),

@@ -139,20 +139,24 @@ where
         return Ter::TES_SUCCESS;
     }
 
-    if !sink.owner_account_exists() {
-        return Ter::TEF_INTERNAL;
-    }
-
-    if !sink.reserve_sufficient() {
-        return Ter::TEC_INSUFFICIENT_RESERVE;
-    }
-
     let uri = create_field(facts.uri);
     let did_document = create_field(facts.did_document);
     let data = create_field(facts.data);
 
     if facts.fix_empty_did_enabled && uri.is_none() && did_document.is_none() && data.is_none() {
         return Ter::TEC_EMPTY_DID;
+    }
+
+    // Pinned DIDSet::doApply performs the fixEmptyDID create guard before it
+    // enters addSLE(), where owner lookup and reserve checks occur.  This TER
+    // precedence matters for a malformed empty create over corrupt/low-reserve
+    // account state.
+    if !sink.owner_account_exists() {
+        return Ter::TEF_INTERNAL;
+    }
+
+    if !sink.reserve_sufficient() {
+        return Ter::TEC_INSUFFICIENT_RESERVE;
     }
 
     let Some(owner_node) = sink.insert_owner_dir() else {

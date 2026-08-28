@@ -55,7 +55,6 @@ fn preclaim_facts() -> TrustSetPreclaimFacts {
         destination_exists: true,
         amm_or_single_asset_vault_enabled: false,
         destination_account_flags: 0,
-        fix_disallow_incoming_v1_enabled: false,
         trustline_exists: true,
         destination_is_pseudo_account: false,
         pseudo_destination_is_amm: false,
@@ -233,14 +232,19 @@ fn trust_set_preclaim_maps_destination_and_disallow_incoming_rules() {
     });
     let disallow = run_trust_set_preclaim_with_facts(TrustSetPreclaimFacts {
         destination_account_flags: protocol::lsfDisallowIncomingTrustline,
-        fix_disallow_incoming_v1_enabled: false,
         trustline_exists: false,
+        ..preclaim_facts()
+    });
+    let existing = run_trust_set_preclaim_with_facts(TrustSetPreclaimFacts {
+        destination_account_flags: protocol::lsfDisallowIncomingTrustline,
+        trustline_exists: true,
         ..preclaim_facts()
     });
 
     assert_eq!(dst_is_src, Ter::TEM_DST_IS_SRC);
     assert_eq!(no_dst, Ter::TEC_NO_DST);
     assert_eq!(disallow, Ter::TEC_NO_PERMISSION);
+    assert_eq!(existing, Ter::TES_SUCCESS);
 }
 
 #[test]

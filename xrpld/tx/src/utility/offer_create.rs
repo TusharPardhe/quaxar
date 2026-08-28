@@ -160,8 +160,14 @@ where
     if tx.has_field(sf("sfOfferSequence")) {
         let cancel_seq = tx.get_field_u32(sf("sfOfferSequence"));
         let cancel_keylet = protocol::offer_keylet(Uint160::from_void(account.data()), cancel_seq);
-        if let Ok(Some(old_offer)) = ctx.view_mut().peek(cancel_keylet) {
-            let _ = ctx.view_mut().erase(old_offer);
+        match ctx.view_mut().peek(cancel_keylet) {
+            Ok(Some(old_offer)) => {
+                if ctx.view_mut().erase(old_offer).is_err() {
+                    return ApplyResult::new(Ter::TEF_BAD_LEDGER, false, false);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return ApplyResult::new(Ter::TEF_BAD_LEDGER, false, false),
         }
     }
 
@@ -251,11 +257,16 @@ where
     }
 
     // Adjust owner count
-    if let Ok(Some(acct_sle)) = ctx
+    let acct_sle = match ctx
         .view_mut()
         .peek(protocol::account_keylet(Uint160::from_void(account.data())))
     {
-        let _ = adjust_owner_count(ctx.view_mut(), &acct_sle, 1);
+        Ok(Some(acct_sle)) => acct_sle,
+        Ok(None) => return ApplyResult::new(Ter::TEF_INTERNAL, false, false),
+        Err(_) => return ApplyResult::new(Ter::TEF_FAILURE, false, false),
+    };
+    if adjust_owner_count(ctx.view_mut(), &acct_sle, 1).is_err() {
+        return ApplyResult::new(Ter::TEF_FAILURE, false, false);
     }
 
     if ctx.view_mut().insert(Arc::new(offer_sle)).is_err() {

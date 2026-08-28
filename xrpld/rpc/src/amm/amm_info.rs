@@ -8,10 +8,11 @@
 use std::collections::BTreeMap;
 
 use basics::base_uint::Uint256;
+use basics::chrono::{NetClockTimePoint, to_string_iso};
 use protocol::{
-    AccountID, Asset, Issue, JsonOptions, JsonValue, STArray, STLedgerEntry, STObject, StBase, amm,
-    get_field_by_symbol, is_xrp_currency, issue_from_json, line, parse_base58_account_id,
-    to_base58,
+    AUCTION_SLOT_TIME_INTERVALS, AccountID, Asset, Issue, JsonOptions, JsonValue, STArray,
+    STLedgerEntry, STObject, StBase, amm, amm_auction_time_slot, get_field_by_symbol,
+    is_xrp_currency, issue_from_json, line, parse_base58_account_id, to_base58,
 };
 
 use crate::commands::rpc_helpers::rpc_error;
@@ -39,6 +40,8 @@ pub trait AmmInfoSource: LedgerLookupSource {
         ledger: &LedgerLookupLedger,
         entry_index: Uint256,
     ) -> Option<STLedgerEntry>;
+
+    fn parent_close_time(&self, ledger: &LedgerLookupLedger) -> u32;
 }
 
 fn ensure_object(value: &mut JsonValue) -> &mut BTreeMap<String, JsonValue> {
@@ -140,7 +143,15 @@ fn shape_vote_slots(vote_slots: &STArray) -> JsonValue {
     JsonValue::Array(output)
 }
 
-fn shape_auction_slot(slot: &STObject) -> JsonValue {
+fn expiration_to_iso8601(expiration: u32) -> String {
+    let iso = to_string_iso(NetClockTimePoint::new(expiration));
+    match iso.strip_suffix('Z') {
+        Some(utc) => format!("{utc}+0000"),
+        None => iso,
+    }
+}
+
+fn shape_auction_slot(slot: &STObject, parent_close_time: u32) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert(
         "account".to_owned(),
@@ -156,8 +167,15 @@ fn shape_auction_slot(slot: &STObject) -> JsonValue {
     );
     object.insert(
         "expiration".to_owned(),
-        JsonValue::Unsigned(u64::from(
+        JsonValue::String(expiration_to_iso8601(
             slot.get_field_u32(get_field_by_symbol("sfExpiration")),
+        )),
+    );
+    object.insert(
+        "time_interval".to_owned(),
+        JsonValue::Unsigned(u64::from(
+            amm_auction_time_slot(u64::from(parent_close_time), slot)
+                .map_or(AUCTION_SLOT_TIME_INTERVALS, u16::from),
         )),
     );
     object.insert(
@@ -254,7 +272,10 @@ fn shape_amm_json<S: AmmInfoSource>(
     if amm_entry.is_field_present(get_field_by_symbol("sfAuctionSlot")) {
         let slot = amm_entry.get_field_object(get_field_by_symbol("sfAuctionSlot"));
         if slot.is_field_present(get_field_by_symbol("sfAccount")) {
-            object.insert("auction_slot".to_owned(), shape_auction_slot(&slot));
+            object.insert(
+                "auction_slot".to_owned(),
+                shape_auction_slot(&slot, source.parent_close_time(ledger)),
+            );
         }
     }
 
@@ -402,4 +423,70 @@ pub fn do_amm_info<S: AmmInfoSource>(request: &AmmInfoRequest<'_>, source: &S) -
     let object = ensure_object(&mut result);
     object.insert("amm".to_owned(), amm_json);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expiration_to_iso8601, shape_auction_slot};
+    use protocol::{JsonValue, STAmount, STObject, get_field_by_symbol, xrp_account, xrp_issue};
+
+    fn auction_slot(expiration: u32) -> STObject {
+        let mut slot = STObject::new(get_field_by_symbol("sfAuctionSlot"));
+        slot.set_account_id(get_field_by_symbol("sfAccount"), xrp_account());
+        slot.set_field_u16(get_field_by_symbol("sfDiscountedFee"), 10);
+        slot.set_field_u32(get_field_by_symbol("sfExpiration"), expiration);
+        slot.set_field_amount(
+            get_field_by_symbol("sfPrice"),
+            STAmount::new_with_asset(get_field_by_symbol("sfPrice"), xrp_issue(), 1, 0, false),
+        );
+        slot
+    }
+
+    fn time_interval(expiration: u32, parent_close_time: u32) -> u64 {
+        let JsonValue::Object(shaped) =
+            shape_auction_slot(&auction_slot(expiration), parent_close_time)
+        else {
+            panic!("auction slot should be an object");
+        };
+        let Some(JsonValue::Unsigned(interval)) = shaped.get("time_interval") else {
+            panic!("time_interval should be unsigned");
+        };
+        *interval
+    }
+
+    #[test]
+    fn auction_slot_time_interval_matches_reference_boundaries() {
+        let expiration = 100_000;
+        let start = expiration - protocol::TOTAL_TIME_SLOT_SECS;
+
+        assert_eq!(time_interval(expiration, start - 1), 20);
+        assert_eq!(time_interval(expiration, start), 0);
+        assert_eq!(
+            time_interval(
+                expiration,
+                start + protocol::AUCTION_SLOT_INTERVAL_DURATION - 1,
+            ),
+            0
+        );
+        assert_eq!(
+            time_interval(expiration, start + protocol::AUCTION_SLOT_INTERVAL_DURATION,),
+            1
+        );
+        assert_eq!(time_interval(expiration, expiration - 1), 19);
+        assert_eq!(time_interval(expiration, expiration), 20);
+    }
+
+    #[test]
+    fn auction_slot_time_interval_uses_fallback_for_invalid_expiration() {
+        assert_eq!(
+            time_interval(protocol::TOTAL_TIME_SLOT_SECS - 1, 0),
+            u64::from(protocol::AUCTION_SLOT_TIME_INTERVALS)
+        );
+    }
+
+    #[test]
+    fn auction_slot_expiration_uses_ripple_epoch_and_numeric_utc_offset() {
+        assert_eq!(expiration_to_iso8601(0), "2000-01-01T00:00:00+0000");
+        assert_eq!(expiration_to_iso8601(123_456), "2000-01-02T10:17:36+0000");
+    }
 }

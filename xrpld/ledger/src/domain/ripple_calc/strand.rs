@@ -403,14 +403,21 @@ pub(crate) fn execute_direct_strand<V: ApplyView>(
         if amount.signum() <= 0 {
             return Ok(None);
         }
-        apply_direct_iou_transfer(
+        let transfer = apply_direct_iou_transfer(
             view,
             &step.from,
             &step.to,
             amount,
             &strand.issue.account,
             strand.issue.currency,
-        )?;
+        );
+        if transfer != Ter::TES_SUCCESS {
+            return Ok(Some(super::failed_ripple_calc_output(
+                transfer,
+                max_source_amount,
+                dst_amount,
+            )));
+        }
     }
 
     Ok(Some(RippleCalcOutput {

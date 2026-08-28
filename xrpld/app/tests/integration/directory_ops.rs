@@ -11,8 +11,8 @@
 //! Ported from C++ Directory_test.cpp and View_test.cpp.
 
 use super::fixtures::*;
+use super::handle_real_dispatch;
 use super::pipeline::full_apply;
-use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{

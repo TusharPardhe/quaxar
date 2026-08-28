@@ -28,7 +28,6 @@ pub mod escrow;
 pub mod fees;
 pub mod lending;
 pub mod loan;
-pub mod paths;
 pub mod preflight;
 #[cfg(feature = "speculative-exec")]
 pub mod speculative;
@@ -48,7 +47,6 @@ pub use escrow::*;
 pub use fees::*;
 pub use lending::*;
 pub use loan::*;
-pub use paths::*;
 pub use preflight::*;
 pub use transactor::*;
 pub use utility::*;

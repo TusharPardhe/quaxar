@@ -2,6 +2,7 @@
 //! `detail::RawStateTable` contract.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
 
 use basics::base_uint::Uint256;
@@ -238,7 +239,11 @@ where
         self.base.balance_hook_self_issue_mpt(issue, amount)
     }
 
-    fn owner_count_hook(&self, account: protocol::AccountID, count: u32) -> u32 {
+    fn owner_count_hook(
+        &self,
+        account: protocol::AccountID,
+        count: crate::OwnerCounts,
+    ) -> crate::OwnerCounts {
         self.base.owner_count_hook(account, count)
     }
 }
@@ -275,18 +280,59 @@ where
         txn: Arc<Serializer>,
         metadata: Option<Arc<Serializer>>,
     ) -> Result<(), ViewError> {
-        if self.txs.insert(key, TxEntry { txn, metadata }).is_some() {
-            return Err(ViewError::DuplicateTx(key));
+        match self.txs.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(TxEntry { txn, metadata });
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(ViewError::DuplicateTx(key)),
         }
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::OpenView;
-    use crate::{Ledger, ReadView};
+    use crate::{Ledger, ReadView, TxsRawView, ViewError};
+    use basics::base_uint::Uint256;
+    use protocol::Serializer;
     use std::sync::Arc;
+
+    #[test]
+    fn duplicate_tx_insert_preserves_original_entry() {
+        let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(1, 100, false));
+        let mut view = OpenView::new_closed(parent);
+        let tx_id = Uint256::from_array([0x81; 32]);
+        let original_tx = Arc::new(Serializer::from_bytes(vec![1, 2, 3]));
+        let original_meta = Arc::new(Serializer::from_bytes(vec![4, 5, 6]));
+        view.raw_tx_insert(
+            tx_id,
+            Arc::clone(&original_tx),
+            Some(Arc::clone(&original_meta)),
+        )
+        .expect("seed transaction");
+
+        let error = view
+            .raw_tx_insert(
+                tx_id,
+                Arc::new(Serializer::from_bytes(vec![9, 9, 9])),
+                Some(Arc::new(Serializer::from_bytes(vec![8, 8, 8]))),
+            )
+            .expect_err("duplicate transaction must be rejected");
+
+        assert_eq!(error, ViewError::DuplicateTx(tx_id));
+        assert_eq!(view.tx_count(), 1);
+        let retained = view.txs.get(&tx_id).expect("original entry remains");
+        assert_eq!(retained.txn.data(), original_tx.data());
+        assert_eq!(
+            retained
+                .metadata
+                .as_ref()
+                .expect("original metadata")
+                .data(),
+            original_meta.data()
+        );
+    }
 
     #[test]
     fn new_open_uses_lcl_close_time_as_parent_close_time() {

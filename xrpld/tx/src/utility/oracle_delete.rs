@@ -44,7 +44,10 @@ pub fn run_oracle_delete_preclaim(facts: OracleDeletePreclaimFacts) -> Ter {
     }
 
     if !facts.tx_account_matches_owner {
-        return Ter::TEC_NO_PERMISSION;
+        // The keylet is derived from sfAccount, so a mismatching sfOwner is
+        // corrupt ledger state.  Pinned OracleDelete::preclaim classifies this
+        // unreachable branch as tecINTERNAL, not a user permission failure.
+        return Ter::TEC_INTERNAL;
     }
 
     Ter::TES_SUCCESS
@@ -78,7 +81,9 @@ pub fn run_oracle_delete_do_apply<S: OracleDeleteApplySink>(sink: &mut S) -> Ter
         return sink.delete_loaded_oracle();
     }
 
-    Ter::TEC_NO_ENTRY
+    // preclaim already established existence; disappearance before doApply is
+    // an internal ledger inconsistency in the pinned transactor.
+    Ter::TEC_INTERNAL
 }
 
 #[cfg(test)]
@@ -214,8 +219,8 @@ mod tests {
             tx_account_matches_owner: false,
         });
 
-        assert_eq!(result, Ter::TEC_NO_PERMISSION);
-        assert_eq!(trans_token(result), "tecNO_PERMISSION");
+        assert_eq!(result, Ter::TEC_INTERNAL);
+        assert_eq!(trans_token(result), "tecINTERNAL");
     }
 
     #[test]
@@ -289,13 +294,13 @@ mod tests {
     }
 
     #[test]
-    fn oracle_delete_do_apply_maps_missing_oracle_to_no_entry() {
+    fn oracle_delete_do_apply_maps_missing_oracle_to_internal() {
         let mut sink = TestApplySink::new();
         sink.oracle_exists = false;
 
         let result = run_oracle_delete_do_apply(&mut sink);
 
-        assert_eq!(result, Ter::TEC_NO_ENTRY);
+        assert_eq!(result, Ter::TEC_INTERNAL);
         assert_eq!(sink.events, ["peek_oracle"]);
     }
 }

@@ -86,7 +86,10 @@ use protocol::{
 use quaxar_core::DatabaseCon;
 use shamap::family::{NullMissingNodeReporter, NullNodeFetcher};
 use shamap::tree_node_cache::TreeNodeCache;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 use time::{Duration, OffsetDateTime};
 use tx::{
     ApplyFlags, ApplyResult, HasTxnType, PreclaimResult, PreflightResult,
@@ -242,6 +245,10 @@ impl crate::load::load_manager::LoadManagerEvents for AppLoadManagerEvents {
 pub struct ApplicationRootOptions {
     pub io_threads: usize,
     pub job_queue_threads: usize,
+    /// Node network ID used by transaction preflight before an overlay runtime
+    /// is attached. Production startup replaces it from the configured
+    /// overlay; deterministic ledger builders and parity fixtures set it here.
+    pub network_id: u32,
     pub start_valid: bool,
     pub elb_support: bool,
     pub standalone: bool,
@@ -265,6 +272,7 @@ impl Default for ApplicationRootOptions {
         Self {
             io_threads: 1,
             job_queue_threads: 1,
+            network_id: 0,
             start_valid: false,
             elb_support: false,
             standalone: false,
@@ -565,6 +573,11 @@ pub struct ApplicationRoot {
     consensus_runtime: Option<Arc<AppConsensusRuntime>>,
     ledger_master_state: Arc<SharedLedgerMasterState>,
     transaction_master: Arc<TransactionMaster>,
+    /// Strong lifecycle owner for the weak ConsensusTransSetSF -> NetworkOPs
+    /// submission handoff. Temporarily removed before cloning the submit root
+    /// so the callback cannot form an ApplicationRoot reference cycle.
+    consensus_tx_set_submit_adapter:
+        Option<Arc<crate::consensus::consensus_trans_set_sf::ConsensusFetchedTxSubmitAdapter>>,
     validations: SharedAppValidations<SystemTimeKeeperClock>,
     validators: Arc<ValidatorList>,
     status_rpc_state: Arc<StatusRpcState>,
@@ -1143,14 +1156,14 @@ impl tx::BatchBaseFeeSignerEntry for BatchFeeSignerEntry {
 
 const INVALID_BATCH_BASE_FEE: u64 = u64::MAX;
 
-fn batch_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
+fn batch_base_fee(view: &impl ReadView, tx: &STTx) -> Result<u64, Ter> {
     let raw_transactions_field = get_field_by_symbol("sfRawTransactions");
     if !tx.is_field_present(raw_transactions_field) {
-        return INVALID_BATCH_BASE_FEE;
+        return Ok(INVALID_BATCH_BASE_FEE);
     }
     let inner_transactions = match tx::canonical_batch_inner_transactions(tx) {
         Ok(inner_transactions) => inner_transactions,
-        Err(_) => return INVALID_BATCH_BASE_FEE,
+        Err(_) => return Ok(INVALID_BATCH_BASE_FEE),
     };
     let batch_signers_field = get_field_by_symbol("sfBatchSigners");
     let batch_signers = tx.is_field_present(batch_signers_field).then(|| {
@@ -1161,15 +1174,13 @@ fn batch_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
             .collect::<Vec<_>>()
     });
     let ledger_base_fee = view.fees().base;
-    let outer_signer_count = if tx.is_field_present(get_field_by_symbol("sfSigners")) {
-        tx.get_field_array(get_field_by_symbol("sfSigners")).len()
-    } else {
-        0
-    };
-    let transactor_base_fee =
-        tx::run_transactor_calculate_base_fee(ledger_base_fee, outer_signer_count);
+    // Batch::calculateBaseFeeImpl starts from
+    // Transactor::calculateBaseFee, including both the outer transaction's
+    // multisigners and any SponsorSignature multisigners.
+    let transactor_base_fee = calculate_default_sttx_base_fee(view, tx);
 
-    tx::run_batch_calculate_base_fee(
+    let fee_error = std::cell::Cell::new(None);
+    let fee = tx::run_batch_calculate_base_fee(
         INVALID_BATCH_BASE_FEE,
         transactor_base_fee,
         ledger_base_fee,
@@ -1180,10 +1191,17 @@ fn batch_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
                 .collect::<Vec<_>>(),
         ),
         batch_signers,
-        |inner| calculate_sttx_base_fee(view, inner.0),
+        |inner| match calculate_sttx_base_fee(view, inner.0) {
+            Ok(fee) => fee,
+            Err(ter) => {
+                fee_error.set(Some(ter));
+                INVALID_BATCH_BASE_FEE
+            }
+        },
         u64::checked_add,
         |fee, count| fee.checked_mul(u64::try_from(count).ok()?),
-    )
+    );
+    fee_error.get().map_or(Ok(fee), Err)
 }
 
 /// `../rippled/src/libxrpl/tx/transactors/system/Batch.cpp::Batch::checkSign`
@@ -1196,16 +1214,14 @@ pub(crate) fn batch_check_sign_ter(view: &impl ReadView, tx: &STTx, flags: Apply
         return Ter::TES_SUCCESS;
     }
 
-    tx::run_transactor_preclaim_check_batch_sign(
+    let read_failed = std::cell::Cell::new(false);
+    let result = tx::run_transactor_preclaim_check_batch_sign(
         flags,
         &BatchPreclaimTx { tx },
-        |account| {
-            view.read(account_keylet(
-                Uint160::from_slice(account.data()).expect("account width should match Uint160"),
-            ))
-            .ok()
-            .flatten()
-            .map(|account_root| {
+        |account| match view.read(account_keylet(
+            Uint160::from_slice(account.data()).expect("account width should match Uint160"),
+        )) {
+            Ok(account_root) => account_root.map(|account_root| {
                 let regular_key_field = get_field_by_symbol("sfRegularKey");
                 BatchPreclaimAccountState {
                     regular_key: account_root
@@ -1215,14 +1231,22 @@ pub(crate) fn batch_check_sign_ter(view: &impl ReadView, tx: &STTx, flags: Apply
                         & lsfDisableMaster
                         != 0,
                 }
-            })
+            }),
+            Err(_) => {
+                read_failed.set(true);
+                None
+            }
         },
         |account| {
-            view.read(protocol::signers_keylet(
+            match view.read(protocol::signers_keylet(
                 Uint160::from_slice(account.data()).expect("account width should match Uint160"),
-            ))
-            .ok()
-            .flatten()
+            )) {
+                Ok(signer_list) => signer_list,
+                Err(_) => {
+                    read_failed.set(true);
+                    None
+                }
+            }
             .map(|signer_list| BatchPreclaimSignerList {
                 signer_list_id_present: signer_list
                     .is_field_present(get_field_by_symbol("sfSignerListID")),
@@ -1274,7 +1298,12 @@ pub(crate) fn batch_check_sign_ter(view: &impl ReadView, tx: &STTx, flags: Apply
             .expect("public-key type was checked before deriving its account");
             calc_account_id(key.as_bytes())
         },
-    )
+    );
+    if read_failed.get() {
+        Ter::TEF_BAD_LEDGER
+    } else {
+        result
+    }
 }
 
 fn batch_preclaim_ter(view: &impl ReadView, tx: &STTx, _flags: ApplyFlags) -> Ter {
@@ -1285,10 +1314,10 @@ fn batch_preclaim_ter(view: &impl ReadView, tx: &STTx, _flags: ApplyFlags) -> Te
     // `Batch::calculateBaseFee` returns a payable placeholder on failure, but
     // Batch's typed preclaim rejects that same invalid calculation after the
     // shared signature and fee gates have run.
-    if batch_base_fee(view, tx) == INVALID_BATCH_BASE_FEE {
-        Ter::TEC_INSUFF_FEE
-    } else {
-        Ter::TES_SUCCESS
+    match batch_base_fee(view, tx) {
+        Err(ter) => ter,
+        Ok(INVALID_BATCH_BASE_FEE) => Ter::TEC_INSUFF_FEE,
+        Ok(_) => Ter::TES_SUCCESS,
     }
 }
 
@@ -1469,6 +1498,7 @@ struct AppOpenLedgerTxQApplyRuntime<'a, V> {
     clear_ahead_removed: Vec<SeqProxy>,
     multi_txn_adjustment: Option<tx::QueueApplyViewAdjustment>,
     delivered_amount: Option<STAmount>,
+    node_network_id: u32,
 }
 
 impl<'a, V> AppOpenLedgerTxQApplyRuntime<'a, V>
@@ -1493,6 +1523,7 @@ where
             current_ledger_seq,
             load_fee_track,
             account_seqs,
+            0,
             Vec::new(),
             tx::QueueFeeMetricsSnapshot {
                 txns_expected: 0,
@@ -1509,17 +1540,17 @@ where
         current_ledger_seq: u32,
         load_fee_track: &'a SharedLoadFeeTrack,
         account_seqs: Arc<std::sync::Mutex<std::collections::HashMap<protocol::AccountID, u32>>>,
+        node_network_id: u32,
         clear_ahead_queue: Vec<TxDetails<AppTxQTransaction, AppTxQAccount>>,
         clear_ahead_metrics: tx::QueueFeeMetricsSnapshot,
     ) -> Self {
-        let fee_field = get_field_by_symbol("sfFee");
-        let fee_drops = if tx.is_field_present(fee_field) {
-            tx.get_field_amount(fee_field).xrp().drops().max(0) as u64
-        } else {
-            0
-        };
         let rules = submit_view.rules().clone();
-        let result = transaction_preflight_ter_with_flags(&tx, &rules, flags);
+        let result = transaction_preflight_ter_with_flags_and_network_id(
+            &tx,
+            &rules,
+            flags,
+            node_network_id,
+        );
         let preclaim_ter = if is_tes_success(result) {
             queue_apply_preclaim_ter_with_load_fee(
                 submit_view,
@@ -1532,7 +1563,10 @@ where
             result
         };
         let consequences = if is_tes_success(result) {
-            TxConsequences::new(fee_drops, tx.get_seq_proxy())
+            // TxQ admission must use the transaction type's canonical
+            // consequences factory. A generic fee/sequence consequence loses
+            // blockers, custom potential spend, and ticket identity.
+            canonical_sttx_consequences(tx.as_ref())
         } else {
             TxConsequences::from_preflight_result(result)
         };
@@ -1570,6 +1604,7 @@ where
             clear_ahead_removed: Vec::new(),
             multi_txn_adjustment: None,
             delivered_amount: None,
+            node_network_id,
         }
     }
 
@@ -1607,8 +1642,18 @@ where
         view: &mut W,
         tx: &Arc<STTx>,
         flags: ApplyFlags,
-    ) -> (ApplyResult, Option<STAmount>) {
-        let preflight = transaction_preflight_ter_with_flags(tx, &view.rules(), flags);
+        node_network_id: u32,
+    ) -> (
+        ApplyResult,
+        Option<STAmount>,
+        Vec<AppliedBatchInnerTransaction>,
+    ) {
+        let preflight = transaction_preflight_ter_with_flags_and_network_id(
+            tx,
+            &view.rules(),
+            flags,
+            node_network_id,
+        );
         let preclaim = if is_tes_success(preflight) {
             queue_apply_preclaim_ter_with_load_fee(
                 view,
@@ -1621,18 +1666,22 @@ where
             preflight
         };
         if !is_tes_success(preclaim) && !is_tec_claim(preclaim) {
-            return (ApplyResult::new(preclaim, false, false), None);
+            return (ApplyResult::new(preclaim, false, false), None, Vec::new());
         }
-        let outcome = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
-            view,
-            tx.as_ref(),
-            tx.get_txn_type(),
-            flags,
-            preclaim,
-        );
+        let outcome =
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id(
+                view,
+                tx.as_ref(),
+                tx.get_txn_type(),
+                flags,
+                preclaim,
+                node_network_id,
+            );
+        let applied_batch_inner_transactions = outcome.applied_batch_inner_transactions;
         (
             ApplyResult::new(outcome.result, outcome.applied, false),
             outcome.delivered_amount,
+            applied_batch_inner_transactions,
         )
     }
 
@@ -1667,12 +1716,13 @@ where
         // fee/sequence lifecycle, but Transactor::operator() never invokes
         // the type-specific doApply unless preclaimResult is tesSUCCESS.
         let outcome = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
-            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id(
                 self.submit_view,
                 self.tx.as_ref(),
                 txn_type,
                 self.preflight_result.flags,
                 preclaim,
+                self.node_network_id,
             )
         } else {
             SubmitApplyOutcome {
@@ -1685,7 +1735,11 @@ where
         };
         self.delivered_amount = outcome.delivered_amount;
         if outcome.applied {
-            self.view.push_transaction(Arc::clone(&self.tx));
+            record_applied_open_transactions(
+                self.view,
+                Arc::clone(&self.tx),
+                &outcome.applied_batch_inner_transactions,
+            );
             tracing::debug!(
                 target: "rpc",
                 ter = ?outcome.result,
@@ -1738,15 +1792,28 @@ where
         let account = self.tx.get_account_id(get_field_by_symbol("sfAccount"));
         let account_key = account_keylet(Uint160::from_void(account.data()));
         let mut multi_txn = ledger::FlowSandbox::new(&mut *self.submit_view);
-        let Some(account_root) = multi_txn.peek(account_key).ok().flatten() else {
-            return PreclaimResult::new(
-                self.current_ledger_seq,
-                Arc::clone(&self.tx),
-                None,
-                self.preflight_result.flags,
-                self.preflight_result.journal.clone(),
-                Ter::TEF_INTERNAL,
-            );
+        let account_root = match multi_txn.peek(account_key) {
+            Ok(Some(account_root)) => account_root,
+            Ok(None) => {
+                return PreclaimResult::new(
+                    self.current_ledger_seq,
+                    Arc::clone(&self.tx),
+                    None,
+                    self.preflight_result.flags,
+                    self.preflight_result.journal.clone(),
+                    Ter::TEF_INTERNAL,
+                );
+            }
+            Err(_) => {
+                return PreclaimResult::new(
+                    self.current_ledger_seq,
+                    Arc::clone(&self.tx),
+                    None,
+                    self.preflight_result.flags,
+                    self.preflight_result.journal.clone(),
+                    Ter::TEF_BAD_LEDGER,
+                );
+            }
         };
         let mut adjusted =
             STLedgerEntry::from_stobject(account_root.clone_as_object(), *account_root.key());
@@ -1803,11 +1870,13 @@ where
 
         let fee_field = get_field_by_symbol("sfFee");
         let fee_paid_drops = self.tx.get_field_amount(fee_field).xrp().drops();
+        let calculated_base_fee = match calculate_sttx_base_fee(self.submit_view, self.tx.as_ref())
+        {
+            Ok(fee) => fee,
+            Err(ter) => return ApplyResult::new(ter, false, false),
+        };
         let fee_level_paid = evaluate_fee_level_paid(QueueFeeLevelPaidInputs {
-            calculated_base_fee_drops: fee_drops_as_i64(calculate_sttx_base_fee(
-                self.submit_view,
-                self.tx.as_ref(),
-            )),
+            calculated_base_fee_drops: fee_drops_as_i64(calculated_base_fee),
             fee_paid_drops,
             default_base_fee_drops: fee_drops_as_i64(calculate_default_sttx_base_fee(
                 self.submit_view,
@@ -1834,7 +1903,7 @@ where
         let mut sandbox = ledger::FlowSandbox::new(&mut *self.submit_view);
         let mut applied_predecessors = Vec::new();
         for queued in &predecessors {
-            let (result, _) = Self::clear_ahead_apply(
+            let (result, _, applied_batch_inner_transactions) = Self::clear_ahead_apply(
                 current_ledger_seq,
                 load_fee_track,
                 &mut sandbox,
@@ -1842,6 +1911,7 @@ where
                 // A clear-ahead predecessor is a persisted MaybeTx. TxQ.cpp
                 // invokes MaybeTx::apply, which retains that entry's flags.
                 queued.flags,
+                self.node_network_id,
             );
             self.clear_ahead_attempts
                 .push((queued.seq_proxy, result.clone()));
@@ -1854,15 +1924,16 @@ where
             if !result.applied {
                 return result;
             }
-            applied_predecessors.push(Arc::clone(&queued.tx));
+            applied_predecessors.push((Arc::clone(&queued.tx), applied_batch_inner_transactions));
         }
 
-        let (current, delivered) = Self::clear_ahead_apply(
+        let (current, delivered, current_batch_inner_transactions) = Self::clear_ahead_apply(
             current_ledger_seq,
             load_fee_track,
             &mut sandbox,
             &self.tx,
             self.preflight_result.flags,
+            self.node_network_id,
         );
         if !current.applied {
             return current;
@@ -1871,12 +1942,22 @@ where
             return ApplyResult::new(Ter::TEF_INTERNAL, false, false);
         }
 
-        for queued in &applied_predecessors {
-            self.view.push_transaction(Arc::clone(queued));
+        for (queued, inner_transactions) in &applied_predecessors {
+            record_applied_open_transactions(self.view, Arc::clone(queued), inner_transactions);
             self.record_clear_ahead_open_ledger_tx(queued);
+            for inner in inner_transactions {
+                self.record_clear_ahead_open_ledger_tx(&Arc::new(inner.transaction.clone()));
+            }
         }
-        self.view.push_transaction(Arc::clone(&self.tx));
+        record_applied_open_transactions(
+            self.view,
+            Arc::clone(&self.tx),
+            &current_batch_inner_transactions,
+        );
         self.record_clear_ahead_open_ledger_tx(&self.tx);
+        for inner in &current_batch_inner_transactions {
+            self.record_clear_ahead_open_ledger_tx(&Arc::new(inner.transaction.clone()));
+        }
         self.delivered_amount = delivered;
         self.clear_ahead_removed = predecessors.iter().map(|queued| queued.seq_proxy).collect();
         if self
@@ -1905,10 +1986,23 @@ struct StandaloneAcceptedTx {
 /// An inner transaction that reached the applied (`tes*` or `tec*`) state in
 /// the isolated Batch view. It is staged until the entire Batch policy decides
 /// whether that view can be committed.
-struct AppliedBatchInnerTransaction {
-    transaction: STTx,
-    result: Ter,
-    metadata: protocol::TxMeta,
+pub(crate) struct AppliedBatchInnerTransaction {
+    pub(crate) transaction: STTx,
+    pub(crate) result: Ter,
+    pub(crate) metadata: protocol::TxMeta,
+}
+
+fn record_applied_open_transactions(
+    open_ledger: &mut AppOpenLedgerView,
+    outer: Arc<STTx>,
+    inner_transactions: &[AppliedBatchInnerTransaction],
+) {
+    open_ledger.push_transaction(outer);
+    // `xrpl::apply` (the TxQ/OpenLedger boundary) never runs Batch's inner
+    // phase. Inner transactions are inserted only by closed-ledger
+    // `applyTransaction`, so this slice must be empty for every open-ledger
+    // caller and can never enter the proposed transaction set independently.
+    debug_assert!(inner_transactions.is_empty());
 }
 
 pub(crate) struct SubmitApplyOutcome {
@@ -1920,8 +2014,31 @@ pub(crate) struct SubmitApplyOutcome {
     /// opened. Closed-ledger callers must therefore reuse this metadata and
     /// commit the already-threaded aggregate sandbox without threading it as
     /// the outer transaction a second time.
-    prebuilt_outer_metadata: Option<protocol::TxMeta>,
-    applied_batch_inner_transactions: Vec<AppliedBatchInnerTransaction>,
+    pub(crate) prebuilt_outer_metadata: Option<protocol::TxMeta>,
+    pub(crate) applied_batch_inner_transactions: Vec<AppliedBatchInnerTransaction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchApplyDestination {
+    Open,
+    Closed,
+    DryRun,
+}
+
+impl BatchApplyDestination {
+    fn for_view(view: &dyn ledger::ReadView, flags: ApplyFlags) -> Self {
+        if protocol::any_apply_flags(flags & ApplyFlags::DRY_RUN) {
+            Self::DryRun
+        } else if view.open() {
+            Self::Open
+        } else {
+            Self::Closed
+        }
+    }
+
+    fn builds_metadata(self) -> bool {
+        matches!(self, Self::Closed | Self::DryRun)
+    }
 }
 
 /// Result of a TxQ-admitted dry run. The state delta is retained only as
@@ -2038,7 +2155,7 @@ fn is_change_pseudo_transaction(txn_type: TxType) -> bool {
 /// Runs Change's distinct pseudo-transaction preflight. Change does not
 /// inherit the ordinary preflight1 account rule: it requires a zero account,
 /// zero fee, empty signature fields, and zero sequence instead.
-fn change_pseudo_transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
+fn change_pseudo_transaction_preflight_ter(tx: &STTx, rules: &Rules, node_network_id: u32) -> Ter {
     let account = get_field_by_symbol("sfAccount");
     let fee = get_field_by_symbol("sfFee");
     let signing_pub_key = get_field_by_symbol("sfSigningPubKey");
@@ -2059,7 +2176,7 @@ fn change_pseudo_transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
                     is_pseudo_tx: true,
                     inner_batch_flag_set: tx.is_flag(tfInnerBatchTxn),
                     network_id_present: tx.is_field_present(network_id),
-                    node_network_id: 0,
+                    node_network_id,
                     tx_network_id: tx
                         .is_field_present(network_id)
                         .then(|| tx.get_field_u32(network_id)),
@@ -2147,11 +2264,33 @@ pub(crate) fn transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
     transaction_preflight_ter_with_flags(tx, rules, ApplyFlags::NONE)
 }
 
+pub(crate) fn transaction_preflight_ter_with_network_id(
+    tx: &STTx,
+    rules: &Rules,
+    node_network_id: u32,
+) -> Ter {
+    transaction_preflight_ter_with_flags_and_network_id(
+        tx,
+        rules,
+        ApplyFlags::NONE,
+        node_network_id,
+    )
+}
+
 /// Shared semantic preflight with explicit application flags. `simulate`
 /// supplies `DRY_RUN`, which is how rippled lets unsigned simulated
 /// transactions pass the signing boundary before TxQ admission.
 pub fn transaction_preflight_ter_with_flags(tx: &STTx, rules: &Rules, flags: ApplyFlags) -> Ter {
-    transaction_preflight_ter_with_parent_batch_id(tx, rules, None, flags)
+    transaction_preflight_ter_with_flags_and_network_id(tx, rules, flags, 0)
+}
+
+pub fn transaction_preflight_ter_with_flags_and_network_id(
+    tx: &STTx,
+    rules: &Rules,
+    flags: ApplyFlags,
+    node_network_id: u32,
+) -> Ter {
+    transaction_preflight_ter_with_parent_batch_id(tx, rules, None, flags, node_network_id)
 }
 
 /// Shared semantic preflight with the `parentBatchId` supplied by
@@ -2161,16 +2300,39 @@ fn transaction_preflight_ter_with_parent_batch_id(
     rules: &Rules,
     parent_batch_id: Option<Uint256>,
     flags: ApplyFlags,
+    node_network_id: u32,
+) -> Ter {
+    tx::with_transaction_step_runtime(rules, || {
+        transaction_preflight_ter_with_parent_batch_id_inner(
+            tx,
+            rules,
+            parent_batch_id,
+            flags,
+            node_network_id,
+        )
+    })
+}
+
+fn transaction_preflight_ter_with_parent_batch_id_inner(
+    tx: &STTx,
+    rules: &Rules,
+    parent_batch_id: Option<Uint256>,
+    flags: ApplyFlags,
+    node_network_id: u32,
 ) -> Ter {
     if is_change_pseudo_transaction(tx.get_txn_type()) {
-        return change_pseudo_transaction_preflight_ter(tx, rules);
+        return change_pseudo_transaction_preflight_ter(tx, rules, node_network_id);
     }
 
-    let semantic = if tx.get_txn_type() == TxType::BATCH {
-        tx::validate_sttx_batch_preflight_with_rules(tx, rules)
-    } else {
-        tx::validate_sttx_transaction_preflight_with_rules(tx, rules)
-    };
+    // The shared dispatcher preserves rippled's invokePreflight ordering for
+    // Batch too: feature/extra-feature, preflight1, universal and sponsor
+    // checks precede Batch's outer structure and canonical inner preflights.
+    let semantic = tx::validate_sttx_transaction_preflight_with_rules_and_context(
+        tx,
+        rules,
+        node_network_id,
+        parent_batch_id.is_some(),
+    );
     if !is_tes_success(semantic) {
         return semantic;
     }
@@ -2217,10 +2379,35 @@ fn transaction_preflight_ter_with_parent_batch_id(
         return Ter::TES_SUCCESS;
     }
 
-    match tx.check_sign(rules) {
-        Ok(()) => Ter::TES_SUCCESS,
-        Err(_) => Ter::TEM_BAD_SIGNATURE,
+    // checkValidity verifies the signature before local checks. preflight2
+    // rejects only SigBad; SigGoodOnly (a locally non-canonical transaction)
+    // remains a successful consensus preflight result and is filtered at the
+    // outer admission boundary, exactly as in rippled.
+    if tx.check_sign(rules).is_err() {
+        return Ter::TEM_INVALID;
     }
+    let _ = protocol::passes_local_checks(tx);
+
+    // Concrete preflightSigValidated tails run after preflight2.
+    if tx.get_txn_type() == TxType::ESCROW_FINISH {
+        let credentials = get_field_by_symbol("sfCredentialIDs");
+        if tx.is_field_present(credentials) {
+            let ids = tx.get_field_v256(credentials);
+            if rules.enabled(&protocol::feature_id("fixCleanup3_4_0"))
+                && ids.value().iter().any(Uint256::is_zero)
+            {
+                return Ter::TEM_MALFORMED;
+            }
+            let result = ledger::credential_helpers::check_fields(tx, rules);
+            if !is_tes_success(result) {
+                return result;
+            }
+        }
+    }
+    if tx.get_txn_type() == TxType::BATCH {
+        return tx::validate_sttx_batch_preflight_sig_validated(tx);
+    }
+    Ter::TES_SUCCESS
 }
 
 pub(crate) fn calculate_default_sttx_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
@@ -2229,22 +2416,42 @@ pub(crate) fn calculate_default_sttx_base_fee(view: &impl ReadView, tx: &STTx) -
     } else {
         0
     };
-    tx::run_transactor_calculate_base_fee(view.fees().base, signer_count)
+    let sponsor_signer_count = if tx.is_field_present(get_field_by_symbol("sfSponsorSignature")) {
+        let sponsor = tx.get_field_object(get_field_by_symbol("sfSponsorSignature"));
+        if sponsor.is_field_present(get_field_by_symbol("sfSigners")) {
+            sponsor
+                .get_field_array(get_field_by_symbol("sfSigners"))
+                .len()
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    tx::run_transactor_calculate_base_fee(
+        view.fees().base,
+        signer_count.saturating_add(sponsor_signer_count),
+    )
 }
 
 /// Shared exact base-fee dispatch for TxQ, replay, consensus, and direct
 /// ledger construction. It starts with Transactor's multisign amount and then
 /// applies only rippled's known specialized fee owners.
-pub(crate) fn calculate_sttx_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
+pub(crate) fn calculate_sttx_base_fee(view: &impl ReadView, tx: &STTx) -> Result<u64, Ter> {
+    let rules = view.rules();
+    tx::with_transaction_step_runtime(&rules, || calculate_sttx_base_fee_inner(view, tx))
+}
+
+fn calculate_sttx_base_fee_inner(view: &impl ReadView, tx: &STTx) -> Result<u64, Ter> {
     let ledger_base_fee = view.fees().base;
     let transactor_base_fee = calculate_default_sttx_base_fee(view, tx);
     let owner_reserve_fee = view.fees().increment;
 
-    match tx.get_txn_type() {
+    let fee = match tx.get_txn_type() {
         TxType::AMENDMENT | TxType::FEE | TxType::UNL_MODIFY => {
             tx::run_change_calculate_base_fee(0_u64)
         }
-        TxType::BATCH => batch_base_fee(view, tx),
+        TxType::BATCH => return batch_base_fee(view, tx),
         TxType::REGULAR_KEY_SET => {
             let signing_key =
                 PublicKey::from_slice(&tx.get_field_vl(get_field_by_symbol("sfSigningPubKey")));
@@ -2256,8 +2463,7 @@ pub(crate) fn calculate_sttx_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
                 .read(account_keylet(Uint160::from_void(
                     tx.get_account_id(get_field_by_symbol("sfAccount")).data(),
                 )))
-                .ok()
-                .flatten();
+                .map_err(|_| Ter::TEF_BAD_LEDGER)?;
             let password_spent = account_state.as_ref().is_some_and(|account| {
                 account.get_field_u32(get_field_by_symbol("sfFlags")) & protocol::lsfPasswordSpent
                     != 0
@@ -2298,13 +2504,30 @@ pub(crate) fn calculate_sttx_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
                         .expect("counterparty signer count must fit into u64")
         }
         TxType::LOAN_PAY => {
-            crate::state::lending::calculate_loan_pay_base_fee(view, tx, transactor_base_fee)
+            crate::state::lending::calculate_loan_pay_base_fee(view, tx, transactor_base_fee)?
         }
         TxType::LEDGER_STATE_FIX => {
             tx::run_ledger_state_fix_calculate_base_fee(ledger_base_fee, owner_reserve_fee)
         }
+        TxType::CONFIDENTIAL_MPT_CONVERT
+        | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
+        | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
+        | TxType::CONFIDENTIAL_MPT_SEND
+        | TxType::CONFIDENTIAL_MPT_CLAWBACK => {
+            transactor_base_fee
+                + ledger_base_fee
+                    * u64::from(protocol::confidential_transfer::CONFIDENTIAL_FEE_MULTIPLIER)
+        }
         _ => transactor_base_fee,
-    }
+    };
+    Ok(fee)
+}
+
+/// Explicitly infallible adapter for non-consensus fee displays/metrics.
+/// Consensus and TxQ admission must call `calculate_sttx_base_fee` and
+/// propagate its hard error.
+pub(crate) fn calculate_sttx_base_fee_for_metrics(view: &impl ReadView, tx: &STTx) -> u64 {
+    calculate_sttx_base_fee(view, tx).unwrap_or_else(|_| calculate_default_sttx_base_fee(view, tx))
 }
 
 /// Batch's invalid calculation is a documented sentinel consumed by its typed
@@ -2335,28 +2558,31 @@ fn queue_apply_preclaim_ter_with_parent_batch_id(
     flags: ApplyFlags,
     parent_batch_id: Option<Uint256>,
 ) -> Ter {
-    crate::state::invoke_preclaim::invoke_preclaim_with_parent_batch_id(
-        view,
-        tx,
-        current_ledger_seq,
-        flags,
-        parent_batch_id,
-        || batch_check_sign_ter(view, tx, flags),
-        || fee_drops_as_i64(calculate_sttx_base_fee(view, tx)),
-        |base_fee| base_fee,
-        || {
-            let typed_preclaim = typed_preclaim_ter(view, tx, flags);
-            if !is_tes_success(typed_preclaim) {
-                return typed_preclaim;
-            }
+    let rules = view.rules();
+    tx::with_transaction_step_runtime(&rules, || {
+        crate::state::invoke_preclaim::invoke_preclaim_with_parent_batch_id(
+            view,
+            tx,
+            current_ledger_seq,
+            flags,
+            parent_batch_id,
+            || batch_check_sign_ter(view, tx, flags),
+            || calculate_sttx_base_fee(view, tx).map(fee_drops_as_i64),
+            |base_fee| base_fee,
+            || {
+                let typed_preclaim = typed_preclaim_ter(view, tx, flags);
+                if !is_tes_success(typed_preclaim) {
+                    return typed_preclaim;
+                }
 
-            if tx.get_txn_type() == TxType::BATCH {
-                batch_preclaim_ter(view, tx, flags)
-            } else {
-                Ter::TES_SUCCESS
-            }
-        },
-    )
+                if tx.get_txn_type() == TxType::BATCH {
+                    batch_preclaim_ter(view, tx, flags)
+                } else {
+                    Ter::TES_SUCCESS
+                }
+            },
+        )
+    })
 }
 
 pub(crate) fn queue_apply_preclaim_ter_with_load_fee(
@@ -2367,36 +2593,39 @@ pub(crate) fn queue_apply_preclaim_ter_with_load_fee(
     load_fee_track: &SharedLoadFeeTrack,
 ) -> Ter {
     let (fee_factor, remote_fee_factor) = load_fee_track.scaling_factors();
-    crate::state::invoke_preclaim::invoke_preclaim_with_parent_batch_id(
-        view,
-        tx,
-        current_ledger_seq,
-        flags,
-        None,
-        || batch_check_sign_ter(view, tx, flags),
-        || fee_drops_as_i64(calculate_sttx_base_fee(view, tx)),
-        |base_fee| {
-            crate::state::invoke_preclaim::scale_fee_load(
-                base_fee,
-                fee_factor,
-                remote_fee_factor,
-                load_fee_track.load_base(),
-                tx::any_apply_flags(flags & ApplyFlags::UNLIMITED),
-            )
-        },
-        || {
-            let typed_preclaim = typed_preclaim_ter(view, tx, flags);
-            if !is_tes_success(typed_preclaim) {
-                return typed_preclaim;
-            }
+    let rules = view.rules();
+    tx::with_transaction_step_runtime(&rules, || {
+        crate::state::invoke_preclaim::invoke_preclaim_with_parent_batch_id(
+            view,
+            tx,
+            current_ledger_seq,
+            flags,
+            None,
+            || batch_check_sign_ter(view, tx, flags),
+            || calculate_sttx_base_fee(view, tx).map(fee_drops_as_i64),
+            |base_fee| {
+                crate::state::invoke_preclaim::scale_fee_load(
+                    base_fee,
+                    fee_factor,
+                    remote_fee_factor,
+                    load_fee_track.load_base(),
+                    tx::any_apply_flags(flags & ApplyFlags::UNLIMITED),
+                )
+            },
+            || {
+                let typed_preclaim = typed_preclaim_ter(view, tx, flags);
+                if !is_tes_success(typed_preclaim) {
+                    return typed_preclaim;
+                }
 
-            if tx.get_txn_type() == TxType::BATCH {
-                batch_preclaim_ter(view, tx, flags)
-            } else {
-                Ter::TES_SUCCESS
-            }
-        },
-    )
+                if tx.get_txn_type() == TxType::BATCH {
+                    batch_preclaim_ter(view, tx, flags)
+                } else {
+                    Ter::TES_SUCCESS
+                }
+            },
+        )
+    })
 }
 /// ../rippled/src/libxrpl/tx/applySteps.cpp::invokePreclaim (lines 162-201).
 /// Explicit classification for every routed Quaxar transaction type's typed
@@ -2417,6 +2646,8 @@ enum TypedPreclaimRoute {
     BridgeDomainReadViewHelper,
     BridgeDomainAuditedNoop,
     SystemReadViewHelper,
+    SponsorshipReadViewHelper,
+    ConfidentialMptReadViewHelper,
     BatchSpecialPreclaim,
     FailClosed,
 }
@@ -2509,6 +2740,14 @@ fn typed_preclaim_route(txn_type: TxType) -> TypedPreclaimRoute {
         TxType::TICKET_CREATE | TxType::LEDGER_STATE_FIX => {
             TypedPreclaimRoute::SystemReadViewHelper
         }
+        TxType::SPONSORSHIP_TRANSFER | TxType::SPONSORSHIP_SET => {
+            TypedPreclaimRoute::SponsorshipReadViewHelper
+        }
+        TxType::CONFIDENTIAL_MPT_CONVERT
+        | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
+        | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
+        | TxType::CONFIDENTIAL_MPT_SEND
+        | TxType::CONFIDENTIAL_MPT_CLAWBACK => TypedPreclaimRoute::ConfidentialMptReadViewHelper,
         // Unknown and non-dispatchable protocol values are likewise closed.
         _ => TypedPreclaimRoute::FailClosed,
     }
@@ -2569,21 +2808,32 @@ fn typed_preclaim_ter(view: &impl ReadView, tx: &STTx, flags: ApplyFlags) -> Ter
             _ => UNVERIFIED_TYPED_PRECLAIM_TER,
         },
         TypedPreclaimRoute::BatchSpecialPreclaim => Ter::TES_SUCCESS,
+        TypedPreclaimRoute::SponsorshipReadViewHelper => {
+            crate::state::sponsorship::preclaim(view, tx)
+        }
+        TypedPreclaimRoute::ConfidentialMptReadViewHelper => {
+            crate::state::confidential_mpt::preclaim(view, tx)
+        }
         TypedPreclaimRoute::FailClosed => UNVERIFIED_TYPED_PRECLAIM_TER,
     }
 }
 
 struct SubmitOracleSetReserveSink {
     balance_drops: i64,
-    owner_count: u32,
+    effective_owner_count: u32,
+    effective_account_count: u32,
     fees: ledger::Fees,
 }
 
 impl tx::OracleSetReserveSink for SubmitOracleSetReserveSink {
     fn is_reserve_sufficient(&mut self, adjust_reserve: i8) -> bool {
-        let owner_count = i64::from(self.owner_count) + i64::from(adjust_reserve);
+        let owner_count = i64::from(self.effective_owner_count) + i64::from(adjust_reserve);
         owner_count >= 0
-            && self.balance_drops >= self.fees.account_reserve(owner_count as usize) as i64
+            && self.balance_drops
+                >= self.fees.account_reserve_with_account_count(
+                    owner_count as usize,
+                    self.effective_account_count as usize,
+                ) as i64
     }
 }
 
@@ -2600,23 +2850,21 @@ fn run_oracle_set_preclaim_with_view<V: ReadView>(view: &V, st_tx: &STTx) -> Ter
     }
 
     let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-    let Some(account_sle) = view
-        .read(account_keylet(
-            Uint160::from_slice(account.data()).expect("account width should match Uint160"),
-        ))
-        .ok()
-        .flatten()
-    else {
-        return Ter::TER_NO_ACCOUNT;
+    let account_sle = match view.read(account_keylet(
+        Uint160::from_slice(account.data()).expect("account width should match Uint160"),
+    )) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TER_NO_ACCOUNT,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
-    let oracle = view
-        .read(protocol::oracle_keylet(
-            Uint160::from_slice(account.data()).expect("account width should match Uint160"),
-            st_tx.get_field_u32(get_field_by_symbol("sfOracleDocumentID")),
-        ))
-        .ok()
-        .flatten();
+    let oracle = match view.read(protocol::oracle_keylet(
+        Uint160::from_slice(account.data()).expect("account width should match Uint160"),
+        st_tx.get_field_u32(get_field_by_symbol("sfOracleDocumentID")),
+    )) {
+        Ok(oracle) => oracle,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
     let provider_present = st_tx.is_field_present(provider_field);
     let asset_class_present = st_tx.is_field_present(asset_class_field);
     let oracle_exists = oracle.is_some();
@@ -2663,7 +2911,8 @@ fn run_oracle_set_preclaim_with_view<V: ReadView>(view: &V, st_tx: &STTx) -> Ter
             .get_field_amount(get_field_by_symbol("sfBalance"))
             .xrp()
             .drops(),
-        owner_count: account_sle.get_field_u32(get_field_by_symbol("sfOwnerCount")),
+        effective_owner_count: ledger::reserve_owner_count(&account_sle, 0),
+        effective_account_count: ledger::reserve_account_count(&account_sle, 0),
         fees: view.fees(),
     };
     tx::run_oracle_set_preclaim(facts, &mut reserve_sink)
@@ -2699,7 +2948,9 @@ fn delete_submit_ticket<V: ledger::ApplyView>(
     };
 
     let Some(ticket) = ticket else {
-        return Ter::TEF_NO_TICKET;
+        // Preclaim already established that the ticket existed. Disappearing
+        // before apply is corrupt ledger state in Transactor::ticketDelete.
+        return Ter::TEF_BAD_LEDGER;
     };
 
     if !ledger::dir_remove(
@@ -2731,8 +2982,10 @@ fn delete_submit_ticket<V: ledger::ApplyView>(
         submit_confine_owner_count(owner_count, -1),
     );
 
-    let _ = view.erase(ticket.sle);
-    Ter::TES_SUCCESS
+    match view.erase(ticket.sle) {
+        Ok(()) => Ter::TES_SUCCESS,
+        Err(_) => Ter::TEF_BAD_LEDGER,
+    }
 }
 
 /// Apply exactly the canonical admission prefix used by `simulate`: semantic
@@ -2744,8 +2997,21 @@ pub fn apply_simulated_transaction<V: ledger::ApplyView>(
     view: &mut V,
     tx: &STTx,
 ) -> (Ter, Option<STAmount>) {
+    apply_simulated_transaction_with_network_id(view, tx, 0)
+}
+
+pub fn apply_simulated_transaction_with_network_id<V: ledger::ApplyView>(
+    view: &mut V,
+    tx: &STTx,
+    node_network_id: u32,
+) -> (Ter, Option<STAmount>) {
     let flags = ApplyFlags::DRY_RUN;
-    let preflight = transaction_preflight_ter_with_flags(tx, &view.rules(), flags);
+    let preflight = transaction_preflight_ter_with_flags_and_network_id(
+        tx,
+        &view.rules(),
+        flags,
+        node_network_id,
+    );
     let preclaim = if is_tes_success(preflight) {
         queue_apply_preclaim_ter(view, tx, view.seq(), flags)
     } else {
@@ -2753,13 +3019,16 @@ pub fn apply_simulated_transaction<V: ledger::ApplyView>(
     };
 
     if is_tes_success(preclaim) || is_tec_claim(preclaim) {
-        apply_submit_transactor_shell_with_preclaim_and_delivered_amount(
-            view,
-            tx,
-            tx.get_txn_type(),
-            flags,
-            preclaim,
-        )
+        let outcome =
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id(
+                view,
+                tx,
+                tx.get_txn_type(),
+                flags,
+                preclaim,
+                node_network_id,
+            );
+        (outcome.result, outcome.delivered_amount)
     } else {
         (preclaim, None)
     }
@@ -2838,7 +3107,27 @@ pub(crate) fn apply_submit_transactor_shell_with_flags_batch_outcome_and_preclai
     tx: &STTx,
     txn_type: TxType,
     flags: ApplyFlags,
+    preclaim_result: Ter,
+) -> SubmitApplyOutcome {
+    apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id(
+        view,
+        tx,
+        txn_type,
+        flags,
+        preclaim_result,
+        0,
+    )
+}
+
+pub(crate) fn apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id<
+    V: ledger::ApplyView,
+>(
+    view: &mut V,
+    tx: &STTx,
+    txn_type: TxType,
+    flags: ApplyFlags,
     mut preclaim_result: Ter,
+    node_network_id: u32,
 ) -> SubmitApplyOutcome {
     // An inner Batch transaction is valid only while its parent Batch applies
     // it through apply_submit_batch_followup. Never allow one through the
@@ -2854,6 +3143,11 @@ pub(crate) fn apply_submit_transactor_shell_with_flags_batch_outcome_and_preclai
     }
 
     let rules = view.rules();
+    // This is the exact ApplyStateTable destination boundary: normal open
+    // ledger application does not build/thread metadata, while closed-ledger
+    // and TapDryRun application do. Capture it before opening child views so
+    // Batch does not accidentally infer the mode from an intermediate parent.
+    let batch_destination = BatchApplyDestination::for_view(view, flags);
     // Consensus, acquired-ledger, and replay builders call the shared
     // semantic preflight and immutable preclaim before entering this shell.
     // The public TxQ apply path already owns the same facts, so only Batch's
@@ -2863,7 +3157,11 @@ pub(crate) fn apply_submit_transactor_shell_with_flags_batch_outcome_and_preclai
     // builder callers retain Batch::preflight's inner validation without
     // duplicating the outer raw-signature gate that shared preclaim owns.
     if txn_type == TxType::BATCH {
-        let preflight = tx::validate_sttx_batch_preflight_with_rules(tx, &rules);
+        let preflight = tx::validate_sttx_batch_preflight_with_rules_and_network_id(
+            tx,
+            &rules,
+            node_network_id,
+        );
         if !is_tes_success(preflight) {
             return SubmitApplyOutcome {
                 result: preflight,
@@ -2888,81 +3186,109 @@ pub(crate) fn apply_submit_transactor_shell_with_flags_batch_outcome_and_preclai
         }
     }
 
-    tx::with_transaction_apply_runtime(&rules, || {
-        // ApplyContext owns DeliveredAmount in rippled. Scope its Rust
-        // equivalent to this transaction so a Batch inner delivery cannot
-        // populate its parent Batch metadata.
-        let delivered_amount_capture = matches!(
-            txn_type,
-            TxType::PAYMENT | TxType::CHECK_CASH | TxType::ACCOUNT_DELETE
-        )
-        .then(crate::state::payment::DeliveredAmountCapture::new);
-
-        // Match rippled's ApplyContext: every mutation, including the common
-        // sequence/ticket and fee preamble, stays in a per-transaction view
-        // until the final TER says the transaction is applied. rippled's
-        // Transactor/BuildLedger catches arithmetic exceptions at this
-        // transaction boundary; retain the same atomicity here by dropping the
-        // unapplied FlowSandbox and reporting tefEXCEPTION.
-        // Keep the complete applyTransaction operation isolated. This extra
-        // level is essential for Batch: outer and inner phases have distinct
-        // ApplyStateTables, yet an internal failure must not expose only the
-        // already-threaded outer phase to an open-ledger caller.
-        let mut transaction_sequence_view = ledger::FlowSandbox::new_with_flags(view, flags);
-        let mut tx_view =
-            ledger::FlowSandbox::new_with_flags(&mut transaction_sequence_view, flags);
-        let mut invariant_fee_reset = false;
-        let mut result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell_impl(
-                &mut tx_view,
-                tx,
+    // applySteps.cpp::invokeApply enters withTxnType before constructing the
+    // concrete Transactor; Transactor::operator() then installs its legacy
+    // apply-time rules guard inside that scope.  The ordering matters on
+    // ledgers without Lending/Vault: withTxnType's small-mantissa guard must
+    // remain active throughout the common preamble, doApply, reset,
+    // invariants and metadata construction, not only in typed helpers.
+    tx::with_transaction_step_runtime(&rules, || {
+        tx::with_transaction_apply_runtime(&rules, || {
+            // ApplyContext owns DeliveredAmount in rippled. Scope its Rust
+            // equivalent to this transaction so a Batch inner delivery cannot
+            // populate its parent Batch metadata.
+            let delivered_amount_capture = matches!(
                 txn_type,
-                flags,
-                preclaim_result,
-                &mut invariant_fee_reset,
+                TxType::PAYMENT | TxType::CHECK_CASH | TxType::ACCOUNT_DELETE
             )
-        })) {
-            Ok(result) => result,
-            Err(payload) => {
-                let message = payload
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| {
-                        payload
-                            .downcast_ref::<&str>()
-                            .map(|message| (*message).to_owned())
-                    })
-                    .unwrap_or_else(|| "non-string panic payload".to_owned());
-                tracing::error!(
-                    target: "tx",
-                    tx_id = %tx.get_transaction_id(),
-                    ?txn_type,
-                    %message,
-                    "transaction execution panicked; mapped to tefEXCEPTION"
-                );
-                return SubmitApplyOutcome {
-                    result: Ter::TEF_EXCEPTION,
-                    applied: false,
-                    delivered_amount: None,
-                    prebuilt_outer_metadata: None,
-                    applied_batch_inner_transactions: Vec::new(),
-                };
-            }
-        };
+            .then(crate::state::payment::DeliveredAmountCapture::new);
 
-        // `rippled::applyTransaction` finishes ApplyStateTable::apply for the
-        // outer Batch before it opens the whole-batch view. That boundary is
-        // consensus-significant: outer metadata must not contain inner nodes,
-        // and the final SLE thread must belong to the last inner transaction.
-        let mut applied_batch_inner_transactions = Vec::new();
-        if is_tes_success(result)
-            && txn_type == TxType::BATCH
-            && !protocol::any_apply_flags(flags & ApplyFlags::DRY_RUN)
-        {
-            let outer_tx_id = tx.get_transaction_id();
-            let outer_ledger_seq = tx_view.seq();
-            let outer_metadata =
-                match tx_view.to_tx_meta(outer_tx_id, outer_ledger_seq, None, &rules) {
+            // Match rippled's ApplyContext: every mutation, including the common
+            // sequence/ticket and fee preamble, stays in a per-transaction view
+            // until the final TER says the transaction is applied. rippled's
+            // Transactor/BuildLedger catches arithmetic exceptions at this
+            // transaction boundary; retain the same atomicity here by dropping the
+            // unapplied FlowSandbox and reporting tefEXCEPTION.
+            // Keep the complete applyTransaction operation isolated. This extra
+            // level is essential for Batch: outer and inner phases have distinct
+            // ApplyStateTables, yet an internal failure must not expose only the
+            // already-threaded outer phase to an open-ledger caller.
+            let mut transaction_sequence_view = ledger::FlowSandbox::new_with_flags(view, flags);
+            let mut tx_view =
+                ledger::FlowSandbox::new_with_flags(&mut transaction_sequence_view, flags);
+            let mut invariant_fee_reset = false;
+            let mut result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                apply_submit_transactor_shell_impl(
+                    &mut tx_view,
+                    tx,
+                    txn_type,
+                    flags,
+                    preclaim_result,
+                    &mut invariant_fee_reset,
+                    node_network_id,
+                )
+            })) {
+                Ok(result) => result,
+                Err(payload) => {
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| {
+                            payload
+                                .downcast_ref::<&str>()
+                                .map(|message| (*message).to_owned())
+                        })
+                        .unwrap_or_else(|| "non-string panic payload".to_owned());
+                    tracing::error!(
+                        target: "tx",
+                        tx_id = %tx.get_transaction_id(),
+                        ?txn_type,
+                        %message,
+                        "transaction execution panicked; mapped to tefEXCEPTION"
+                    );
+                    return SubmitApplyOutcome {
+                        result: Ter::TEF_EXCEPTION,
+                        applied: false,
+                        delivered_amount: None,
+                        prebuilt_outer_metadata: None,
+                        applied_batch_inner_transactions: Vec::new(),
+                    };
+                }
+            };
+
+            // `rippled::applyTransaction` finishes ApplyStateTable::apply for the
+            // outer Batch before it opens the whole-batch view. That boundary is
+            // consensus-significant: outer metadata must not contain inner nodes,
+            // and the final SLE thread must belong to the last inner transaction.
+            let mut applied_batch_inner_transactions = Vec::new();
+            if is_tes_success(result)
+                && txn_type == TxType::BATCH
+                && batch_destination == BatchApplyDestination::Closed
+            {
+                let outer_tx_id = tx.get_transaction_id();
+                let outer_ledger_seq = tx_view.seq();
+                let outer_metadata = if batch_destination.builds_metadata() {
+                    match tx_view.to_tx_meta(outer_tx_id, outer_ledger_seq, None, &rules) {
+                        Ok(metadata) => metadata,
+                        Err(_) => {
+                            return SubmitApplyOutcome {
+                                result: Ter::TEF_INTERNAL,
+                                applied: false,
+                                delivered_amount: None,
+                                prebuilt_outer_metadata: None,
+                                applied_batch_inner_transactions: Vec::new(),
+                            };
+                        }
+                    }
+                } else {
+                    protocol::TxMeta::new(outer_tx_id, outer_ledger_seq)
+                };
+                let outer_commit = if batch_destination == BatchApplyDestination::Closed {
+                    tx_view.apply_with_tx_meta(outer_tx_id, outer_ledger_seq, None, None, &rules)
+                } else {
+                    tx_view.apply().map(|()| outer_metadata.clone())
+                };
+                let outer_metadata = match outer_commit {
                     Ok(metadata) => metadata,
                     Err(_) => {
                         return SubmitApplyOutcome {
@@ -2974,93 +3300,87 @@ pub(crate) fn apply_submit_transactor_shell_with_flags_batch_outcome_and_preclai
                         };
                     }
                 };
-            if tx_view
-                .apply_with_tx_thread(outer_tx_id, outer_ledger_seq, &rules)
-                .is_err()
-            {
-                return SubmitApplyOutcome {
-                    result: Ter::TEF_INTERNAL,
-                    applied: false,
-                    delivered_amount: None,
-                    prebuilt_outer_metadata: None,
-                    applied_batch_inner_transactions: Vec::new(),
-                };
-            }
-
-            // The parent now contains only the fully-applied outer Batch.
-            // Open the inner whole-batch phase over that state, as rippled
-            // does, rather than folding it back into the outer state table.
-            let followup = apply_submit_batch_followup(&mut transaction_sequence_view, tx);
-            result = followup.result;
-            applied_batch_inner_transactions = followup.applied_inner_transactions;
-            if !is_tes_success(result) {
-                applied_batch_inner_transactions.clear();
+                // The parent now contains only the fully-applied outer Batch.
+                // Open the inner whole-batch phase over that state, as rippled
+                // does, rather than folding it back into the outer state table.
+                let followup = apply_submit_batch_followup(
+                    &mut transaction_sequence_view,
+                    tx,
+                    batch_destination,
+                    node_network_id,
+                );
+                result = followup.result;
+                applied_batch_inner_transactions = followup.applied_inner_transactions;
+                if !is_tes_success(result) {
+                    applied_batch_inner_transactions.clear();
+                    return SubmitApplyOutcome {
+                        result,
+                        applied: false,
+                        delivered_amount: None,
+                        prebuilt_outer_metadata: None,
+                        applied_batch_inner_transactions,
+                    };
+                }
+                if transaction_sequence_view.apply().is_err() {
+                    return SubmitApplyOutcome {
+                        result: Ter::TEF_INTERNAL,
+                        applied: false,
+                        delivered_amount: None,
+                        prebuilt_outer_metadata: None,
+                        applied_batch_inner_transactions: Vec::new(),
+                    };
+                }
                 return SubmitApplyOutcome {
                     result,
-                    applied: false,
+                    applied: batch_destination != BatchApplyDestination::DryRun,
                     delivered_amount: None,
-                    prebuilt_outer_metadata: None,
+                    prebuilt_outer_metadata: (batch_destination == BatchApplyDestination::Closed)
+                        .then_some(outer_metadata),
                     applied_batch_inner_transactions,
                 };
             }
-            if transaction_sequence_view.apply().is_err() {
-                return SubmitApplyOutcome {
-                    result: Ter::TEF_INTERNAL,
-                    applied: false,
-                    delivered_amount: None,
-                    prebuilt_outer_metadata: None,
-                    applied_batch_inner_transactions: Vec::new(),
-                };
-            }
-            return SubmitApplyOutcome {
-                result,
-                applied: true,
-                delivered_amount: None,
-                prebuilt_outer_metadata: Some(outer_metadata),
-                applied_batch_inner_transactions,
-            };
-        }
 
-        let fail_hard_tec =
-            is_tec_claim(result) && protocol::any_apply_flags(flags & ApplyFlags::FAIL_HARD);
-        let persistent_cleanup_tec = matches!(
-            result,
-            Ter::TEC_OVERSIZE | Ter::TEC_KILLED | Ter::TEC_INCOMPLETE | Ter::TEC_EXPIRED
-        );
-        let invariant_fee_reset_applies =
-            invariant_fee_reset && result == Ter::TEC_INVARIANT_FAILED;
-        let mut applied = false;
-        if (likely_to_claim_fee(result, flags)
-            || persistent_cleanup_tec
-            || invariant_fee_reset_applies)
-            && (!fail_hard_tec || invariant_fee_reset_applies)
-        {
-            // Ordinary retry-pass `tec` results remain unapplied so
-            // BuildLedger can retry them after the canonical input. rippled
-            // immediately applies the four persistent-cleanup outcomes even
-            // during that pass, preserving their canonical deletions.
-            // A commit failure means the parent changed underneath this
-            // transaction. Never report an applied result after discarding a
-            // `FlowSandbox::apply` error.
-            if tx_view.apply().is_err() || transaction_sequence_view.apply().is_err() {
-                result = Ter::TEF_INTERNAL;
-                applied_batch_inner_transactions.clear();
+            let fail_hard_tec =
+                is_tec_claim(result) && protocol::any_apply_flags(flags & ApplyFlags::FAIL_HARD);
+            let persistent_cleanup_tec = matches!(
+                result,
+                Ter::TEC_OVERSIZE | Ter::TEC_KILLED | Ter::TEC_INCOMPLETE | Ter::TEC_EXPIRED
+            );
+            let invariant_fee_reset_applies =
+                invariant_fee_reset && result == Ter::TEC_INVARIANT_FAILED;
+            let mut applied = false;
+            if (likely_to_claim_fee(result, flags)
+                || persistent_cleanup_tec
+                || invariant_fee_reset_applies)
+                && (!fail_hard_tec || invariant_fee_reset_applies)
+            {
+                // Ordinary retry-pass `tec` results remain unapplied so
+                // BuildLedger can retry them after the canonical input. rippled
+                // immediately applies the four persistent-cleanup outcomes even
+                // during that pass, preserving their canonical deletions.
+                // A commit failure means the parent changed underneath this
+                // transaction. Never report an applied result after discarding a
+                // `FlowSandbox::apply` error.
+                if tx_view.apply().is_err() || transaction_sequence_view.apply().is_err() {
+                    result = Ter::TEF_INTERNAL;
+                    applied_batch_inner_transactions.clear();
+                } else {
+                    applied = !protocol::any_apply_flags(flags & ApplyFlags::DRY_RUN);
+                }
             } else {
-                applied = !protocol::any_apply_flags(flags & ApplyFlags::DRY_RUN);
+                applied_batch_inner_transactions.clear();
             }
-        } else {
-            applied_batch_inner_transactions.clear();
-        }
-        let delivered_amount = delivered_amount_capture
-            .and_then(crate::state::payment::DeliveredAmountCapture::finish)
-            .filter(|_| is_tes_success(result));
-        SubmitApplyOutcome {
-            result,
-            applied,
-            delivered_amount,
-            prebuilt_outer_metadata: None,
-            applied_batch_inner_transactions,
-        }
+            let delivered_amount = delivered_amount_capture
+                .and_then(crate::state::payment::DeliveredAmountCapture::finish)
+                .filter(|_| is_tes_success(result));
+            SubmitApplyOutcome {
+                result,
+                applied,
+                delivered_amount,
+                prebuilt_outer_metadata: None,
+                applied_batch_inner_transactions,
+            }
+        })
     })
 }
 
@@ -3071,12 +3391,17 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
     flags: ApplyFlags,
     preclaim_result: Ter,
     invariant_fee_reset: &mut bool,
+    node_network_id: u32,
 ) -> Ter {
     let account_field = get_field_by_symbol("sfAccount");
 
     let is_pseudo = is_change_pseudo_transaction(txn_type);
     if is_pseudo {
-        let preflight = tx::validate_sttx_transaction_preflight_with_rules(tx, &view.rules());
+        let preflight = tx::validate_sttx_transaction_preflight_with_rules_and_network_id(
+            tx,
+            &view.rules(),
+            node_network_id,
+        );
         if !is_tes_success(preflight) {
             return preflight;
         }
@@ -3141,8 +3466,10 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         Uint160::from_slice(account.data()).expect("account width should match Uint160");
     let account_key = account_keylet(account_uint160);
 
-    let Some(account_root) = view.peek(account_key).ok().flatten() else {
-        return Ter::TER_NO_ACCOUNT;
+    let account_root = match view.peek(account_key) {
+        Ok(Some(account_root)) => account_root,
+        Ok(None) => return Ter::TER_NO_ACCOUNT,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     // Match Transactor::checkPriorTxAndLastLedger: all ordering and replay
@@ -3163,8 +3490,10 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
     {
         return Ter::TEF_MAX_LEDGER;
     }
-    if view.tx_exists(tx.get_transaction_id()).unwrap_or(false) {
-        return Ter::TEF_ALREADY;
+    match view.tx_exists(tx.get_transaction_id()) {
+        Ok(true) => return Ter::TEF_ALREADY,
+        Ok(false) => {}
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     }
 
     // `OfferCreate::preclaim` is an immutable, pre-fee decision in rippled:
@@ -3216,51 +3545,55 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         {
             return Ter::TEM_INVALID;
         }
-        if view
-            .read(account_keylet(Uint160::from_void(sponsor.data())))
-            .ok()
-            .flatten()
-            .is_none()
-        {
-            return Ter::TER_NO_ACCOUNT;
+        match view.read(account_keylet(Uint160::from_void(sponsor.data()))) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ter::TER_NO_ACCOUNT,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         }
 
         let sponsorship_keylet = protocol::sponsorship_keylet(
             Uint160::from_void(sponsor.data()),
             Uint160::from_void(tx.get_initiator().data()),
         );
-        let sponsorship = view.read(sponsorship_keylet).ok().flatten();
+        let sponsorship = match view.read(sponsorship_keylet) {
+            Ok(sponsorship) => sponsorship,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
         if !tx.is_field_present(sponsor_signature_field) {
             let Some(sponsorship) = sponsorship.as_ref() else {
-                return Ter::TEC_NO_PERMISSION;
+                return Ter::TER_NO_PERMISSION;
             };
             let sponsor_flags = sponsorship.get_field_u32(get_field_by_symbol("sfFlags"));
             if fee_sponsored
                 && (sponsor_flags & protocol::LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_FEE) != 0
             {
-                return Ter::TEC_NO_PERMISSION;
+                return Ter::TER_NO_PERMISSION;
             }
             if tx.is_field_present(sponsor_flags_field)
                 && ledger::is_reserve_sponsored(tx.get_field_u32(sponsor_flags_field))
                 && (sponsor_flags & protocol::LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_RESERVE) != 0
             {
-                return Ter::TEC_NO_PERMISSION;
+                return Ter::TER_NO_PERMISSION;
             }
         }
         if fee_sponsored {
             if sponsorship.is_some() {
                 prefunded_sponsorship = Some(sponsorship_keylet);
             }
-            sponsor
-        } else {
-            tx.get_initiator()
         }
+        tx.get_fee_payer_id()
     } else {
-        tx.get_initiator()
+        tx.get_fee_payer_id()
     };
 
     let mut updated =
         STLedgerEntry::from_stobject(account_root.clone_as_object(), *account_root.key());
+    let mut charged_fee_drops = if tx.is_field_present(fee_field) {
+        tx.get_field_amount(fee_field).xrp().drops()
+    } else {
+        0
+    };
+    let mut fee_payment_result = Ter::TES_SUCCESS;
     let pre_fee_balance_drops = if updated.is_field_present(balance_field) {
         Some(updated.get_field_amount(balance_field).xrp().drops())
     } else {
@@ -3287,25 +3620,27 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
                 // In an open ledger, return terINSUF_FEE_B (retry, no fee burned).
                 // The build path is always a closed ledger.
                 if balance_drops > 0 && !view.open() {
-                    let actual_fee = balance_drops;
+                    charged_fee_drops = balance_drops;
+                    fee_payment_result = Ter::TEC_INSUFF_FEE;
                     updated.set_field_amount(
                         balance_field,
                         STAmount::from_xrp_amount(XRPAmount::from_drops(0)),
                     );
-                    let _ = view.update(Arc::new(updated));
-                    let _ = view.destroy_xrp(XRPAmount::from_drops(actual_fee));
-                    return Ter::TEC_INSUFF_FEE;
+                } else {
+                    return Ter::TER_INSUF_FEE_B;
                 }
-                return Ter::TER_INSUF_FEE_B;
+            } else {
+                updated.set_field_amount(
+                    balance_field,
+                    STAmount::from_xrp_amount(XRPAmount::from_drops(balance_drops - fee_drops)),
+                );
             }
-            updated.set_field_amount(
-                balance_field,
-                STAmount::from_xrp_amount(XRPAmount::from_drops(balance_drops - fee_drops)),
-            );
         }
     } else if let Some(sponsorship_keylet) = prefunded_sponsorship {
-        let Some(sponsorship_sle) = view.peek(sponsorship_keylet).ok().flatten() else {
-            return Ter::TEF_INTERNAL;
+        let sponsorship_sle = match view.peek(sponsorship_keylet) {
+            Ok(Some(sle)) => sle,
+            Ok(None) => return Ter::TEF_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let balance_drops = if sponsorship_sle.is_field_present(sponsor_fee_amount_field) {
             sponsorship_sle
@@ -3326,15 +3661,17 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         let fee_drops = tx.get_field_amount(fee_field).xrp().drops();
         let spendable = balance_drops.min(max_fee_drops);
         if spendable < fee_drops {
-            return if spendable > 0 && !view.open() {
-                Ter::TEC_INSUFF_FEE
-            } else {
-                Ter::TER_INSUF_FEE_B
-            };
+            if spendable <= 0 || view.open() {
+                return Ter::TER_INSUF_FEE_B;
+            }
+            // Transactor::reset caps a closed-ledger fee claim to the
+            // prefunded balance/MaxFee and still consumes the sequence.
+            charged_fee_drops = spendable;
+            fee_payment_result = Ter::TEC_INSUFF_FEE;
         }
         let mut updated_sponsorship =
             STLedgerEntry::from_stobject(sponsorship_sle.clone_as_object(), *sponsorship_sle.key());
-        let remaining = balance_drops - fee_drops;
+        let remaining = balance_drops - charged_fee_drops;
         if remaining == 0 {
             updated_sponsorship.make_field_absent(sponsor_fee_amount_field);
         } else {
@@ -3343,51 +3680,57 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
                 STAmount::from_xrp_amount(XRPAmount::from_drops(remaining)),
             );
         }
-        let _ = view.update(Arc::new(updated_sponsorship));
+        if view.update(Arc::new(updated_sponsorship)).is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
     } else {
         let fee_payer_uint160 =
             Uint160::from_slice(fee_payer.data()).expect("fee payer width should match Uint160");
-        let Some(fee_payer_sle) = view.peek(account_keylet(fee_payer_uint160)).ok().flatten()
-        else {
-            return Ter::TEF_INTERNAL;
+        let fee_payer_sle = match view.peek(account_keylet(fee_payer_uint160)) {
+            Ok(Some(sle)) => sle,
+            Ok(None) => return Ter::TEF_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let balance_drops = fee_payer_sle.get_field_amount(balance_field).xrp().drops();
         let fee_drops = tx.get_field_amount(fee_field).xrp().drops();
         // A co-signed sponsor may not pay into its account reserve. Ordinary
         // delegates retain the standard account-fee behavior.
         let spendable = if fee_sponsored {
-            let reserve = view.fees().account_reserve(
-                fee_payer_sle.get_field_u32(get_field_by_symbol("sfOwnerCount")) as usize,
-            ) as i64;
+            let reserve =
+                ledger::effective_account_reserve(view.fees(), &fee_payer_sle, 0, 0) as i64;
             (balance_drops - reserve).max(0)
         } else {
             balance_drops
         };
         if fee_sponsored && spendable < fee_drops {
-            return if spendable > 0 && !view.open() {
-                Ter::TEC_INSUFF_FEE
-            } else {
-                Ter::TER_INSUF_FEE_B
-            };
+            if spendable <= 0 || view.open() {
+                return Ter::TER_INSUF_FEE_B;
+            }
+            charged_fee_drops = spendable;
+            fee_payment_result = Ter::TEC_INSUFF_FEE;
         }
         let mut updated_fee_payer =
             STLedgerEntry::from_stobject(fee_payer_sle.clone_as_object(), *fee_payer_sle.key());
         updated_fee_payer.set_field_amount(
             balance_field,
-            STAmount::from_xrp_amount(XRPAmount::from_drops(balance_drops - fee_drops)),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(balance_drops - charged_fee_drops)),
         );
-        let _ = view.update(Arc::new(updated_fee_payer));
+        if view.update(Arc::new(updated_fee_payer)).is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
     }
 
-    if updated.is_field_present(account_txn_id_field) {
-        updated.set_field_h256(account_txn_id_field, tx.get_transaction_id());
+    if view.update(Arc::new(updated)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
     }
-
-    let _ = view.update(Arc::new(updated));
     if tx.is_field_present(fee_field) {
-        let fee_drops = tx.get_field_amount(fee_field).xrp().drops();
-        if fee_drops > 0 {
-            let _ = view.destroy_xrp(XRPAmount::from_drops(fee_drops));
+        if charged_fee_drops > 0 {
+            if view
+                .destroy_xrp(XRPAmount::from_drops(charged_fee_drops))
+                .is_err()
+            {
+                return Ter::TEF_BAD_LEDGER;
+            }
         }
     }
     {
@@ -3395,8 +3738,36 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         // fee deduction and sequence consumption that were already applied above.
         // We achieve this by running handle_real_dispatch in a nested FlowSandbox and
         // only applying it to the outer view when the result is NOT tecKILLED.
+        let invariant_prefix = match crate::state::invariants::InvariantDeltaPrefix::capture(view) {
+            Ok(prefix) => prefix,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        let preamble_item_keys = view.items().keys().copied().collect::<BTreeSet<_>>();
         let mut inner = ledger::FlowSandbox::new(view);
-        let mut result = if is_tec_claim(preclaim_result) {
+        // Transactor::apply updates sfAccountTxnID before doApply so the
+        // handler can observe it, but Transactor::reset discards that update
+        // and reapplies only the fee plus sequence/ticket. Keep the prior-tx
+        // chain in the success-only child sandbox rather than the persistent
+        // fee preamble, so every ordinary/persistent/invariant tec matches the
+        // canonical reset state.
+        if account_root.is_field_present(account_txn_id_field) {
+            let account_after_preamble = match inner.peek(account_key) {
+                Ok(Some(account)) => account,
+                Ok(None) => return Ter::TEF_INTERNAL,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            };
+            let mut account_after_preamble = STLedgerEntry::from_stobject(
+                account_after_preamble.clone_as_object(),
+                *account_after_preamble.key(),
+            );
+            account_after_preamble.set_field_h256(account_txn_id_field, tx.get_transaction_id());
+            if inner.update(Arc::new(account_after_preamble)).is_err() {
+                return Ter::TEF_BAD_LEDGER;
+            }
+        }
+        let mut result = if is_tec_claim(fee_payment_result) {
+            fee_payment_result
+        } else if is_tec_claim(preclaim_result) {
             preclaim_result
         } else if is_tec_claim(offer_preclaim) {
             offer_preclaim
@@ -3410,33 +3781,43 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         // Revert the account root to its pre-apply state so the transaction
         // is as if it was never applied.
         if is_tef_failure(result) || is_tem_malformed(result) {
-            let _ = view.update(account_root.clone());
-            return result;
+            return if view.update(account_root.clone()).is_err() {
+                Ter::TEF_BAD_LEDGER
+            } else {
+                result
+            };
         }
 
         // Rippld computes oversize before invariant evaluation; invariant
         // failure must retain precedence rather than being overwritten later.
-        if inner.item_count() > 32768 {
+        // Protocol.h::kOversizeMetaDataCap is a count of entries in the
+        // transaction ApplyStateTable, not a byte limit.  This boundary is
+        // consensus-critical because crossing it changes the result to
+        // tecOVERSIZE and preserves only the permitted cleanup deletions.
+        let transaction_item_count = preamble_item_keys
+            .iter()
+            .copied()
+            .chain(inner.items().keys().copied())
+            .collect::<BTreeSet<_>>()
+            .len();
+        if exceeds_oversize_metadata_cap(transaction_item_count) {
             result = Ter::TEC_OVERSIZE;
         }
 
-        let fee_amt = if tx.is_field_present(fee_field) {
-            tx.get_field_amount(fee_field).xrp()
-        } else {
-            protocol::XRPAmount::from_drops(0)
-        };
+        let fee_amt = protocol::XRPAmount::from_drops(charged_fee_drops);
 
         // rippled checks an ordinary tec only after resetting the handler
         // context to fee/sequence state. At this point `inner` still contains
         // partial doApply mutations, so only successful state is eligible for
         // invariant evaluation here.
         if protocol::is_tes_success(result) {
-            result = crate::state::invariants::check_invariants_for_tx_with_expected_xrp_delta(
+            result = crate::state::invariants::check_invariants_for_tx_with_prefix(
                 &inner,
                 tx,
                 result,
                 fee_amt,
-                Some(0),
+                Some(-fee_amt.drops()),
+                Some(&invariant_prefix),
             );
             *invariant_fee_reset = result == Ter::TEC_INVARIANT_FAILED;
         }
@@ -3493,7 +3874,6 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             // Cleanup path
             let mut removed_offers = Vec::new();
             let mut removed_trust_lines = Vec::new();
-            let mut removed_mpts = Vec::new();
             let mut expired_nft_offers = Vec::new();
             let mut expired_credentials = Vec::new();
 
@@ -3523,188 +3903,191 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
 
             drop(inner); // discard transactor state changes
             let mut cleanup = ledger::FlowSandbox::new(view);
+            let mut cleanup_read_failed = false;
 
             for (index, after) in erased_entries {
-                if let Ok(Some(before)) =
-                    cleanup.peek(protocol::Keylet::new(after.get_type(), index))
-                {
-                    if do_offers
-                        && Some(index) != preserved_offer_sequence_cancel
-                        && before.get_type() == protocol::LedgerEntryType::Offer
-                    {
-                        let taker_pays = protocol::get_field_by_symbol("sfTakerPays");
-                        if before.get_field_amount(taker_pays) == after.get_field_amount(taker_pays)
+                match cleanup.peek(protocol::Keylet::new(after.get_type(), index)) {
+                    Ok(Some(before)) => {
+                        if do_offers
+                            && Some(index) != preserved_offer_sequence_cancel
+                            && before.get_type() == protocol::LedgerEntryType::Offer
                         {
-                            removed_offers.push(index);
+                            let taker_pays = protocol::get_field_by_symbol("sfTakerPays");
+                            if before.get_field_amount(taker_pays)
+                                == after.get_field_amount(taker_pays)
+                            {
+                                removed_offers.push(index);
+                            }
                         }
-                    }
-                    if do_lines_or_mpts {
-                        if before.get_type() == protocol::LedgerEntryType::RippleState {
+                        if do_lines_or_mpts
+                            && before.get_type() == protocol::LedgerEntryType::RippleState
+                        {
+                            // Pinned Transactor::typesForResult(tecINCOMPLETE)
+                            // preserves only ltRIPPLE_STATE deletions. MPToken
+                            // deletions are ordinary doApply state and must reset.
                             removed_trust_lines.push(index);
-                        } else if before.get_type() == protocol::LedgerEntryType::MPToken {
-                            removed_mpts.push(index);
+                        }
+                        if do_nf_token_offers
+                            && before.get_type() == protocol::LedgerEntryType::NFTokenOffer
+                        {
+                            expired_nft_offers.push(index);
+                        }
+                        if do_credentials
+                            && before.get_type() == protocol::LedgerEntryType::Credential
+                        {
+                            expired_credentials.push(index);
                         }
                     }
-                    if do_nf_token_offers
-                        && before.get_type() == protocol::LedgerEntryType::NFTokenOffer
-                    {
-                        expired_nft_offers.push(index);
-                    }
-                    if do_credentials && before.get_type() == protocol::LedgerEntryType::Credential
-                    {
-                        expired_credentials.push(index);
+                    Ok(None) => {}
+                    Err(_) => {
+                        cleanup_read_failed = true;
+                        break;
                     }
                 }
             }
 
-            if do_offers && !removed_offers.is_empty() {
+            if !cleanup_read_failed && do_offers && !removed_offers.is_empty() {
                 let mut count = 0;
                 for index in removed_offers {
-                    if let Ok(Some(sle)) = cleanup.peek(protocol::Keylet::new(
+                    let sle = match cleanup.peek(protocol::Keylet::new(
                         protocol::LedgerEntryType::Offer,
                         index,
                     )) {
-                        let account =
-                            sle.get_account_id(protocol::get_field_by_symbol("sfAccount"));
-                        let _ = crate::state::offer_create::offer_delete_pub(
-                            &mut cleanup,
-                            &account,
-                            sle,
-                        );
-                        count += 1;
-                        if count == 1000 {
+                        Ok(Some(sle)) => sle,
+                        Ok(None) => continue,
+                        Err(_) => {
+                            cleanup_read_failed = true;
                             break;
                         }
+                    };
+                    let account = sle.get_account_id(protocol::get_field_by_symbol("sfAccount"));
+                    // C++ ApplyView mutation cannot fail at this boundary and
+                    // therefore ignores the semantic helper TER. A Rust
+                    // storage failure is represented as a hard TER and must
+                    // discard the entire cleanup sandbox, never commit a
+                    // partially removed offer.
+                    let cleanup_ter =
+                        crate::state::offer_create::offer_delete_pub(&mut cleanup, &account, sle);
+                    if is_tef_failure(cleanup_ter) || cleanup_ter == Ter::TEC_INTERNAL {
+                        cleanup_read_failed = true;
+                        break;
+                    }
+                    count += 1;
+                    if count == protocol::UNFUNDED_OFFER_REMOVE_LIMIT {
+                        break;
                     }
                 }
             }
 
-            if result == Ter::TEC_EXPIRED && !expired_nft_offers.is_empty() {
+            if !cleanup_read_failed && result == Ter::TEC_EXPIRED && !expired_nft_offers.is_empty()
+            {
                 let mut count = 0;
                 for index in expired_nft_offers {
-                    if let Ok(Some(offer)) = cleanup.peek(protocol::keylet::nft_offer_keylet(index))
-                    {
-                        let owner = offer.get_account_id(protocol::get_field_by_symbol("sfOwner"));
-                        let owner_node =
-                            offer.get_field_u64(protocol::get_field_by_symbol("sfOwnerNode"));
-                        let owner_dir =
-                            protocol::owner_dir_keylet(Uint160::from_void(owner.data()));
-                        let _ =
-                            ledger::dir_remove(&mut cleanup, &owner_dir, owner_node, index, false);
-
-                        let nftoken_id =
-                            offer.get_field_h256(protocol::get_field_by_symbol("sfNFTokenID"));
-                        let flags = offer.get_field_u32(protocol::get_field_by_symbol("sfFlags"));
-                        let is_sell = (flags & protocol::lsfSellNFToken) != 0;
-                        let nft_dir = if is_sell {
-                            protocol::nft_sell_offers_keylet(nftoken_id)
-                        } else {
-                            protocol::nft_buy_offers_keylet(nftoken_id)
-                        };
-                        let nft_node = offer
-                            .get_field_u64(protocol::get_field_by_symbol("sfNFTokenOfferNode"));
-                        let _ = ledger::dir_remove(&mut cleanup, &nft_dir, nft_node, index, false);
-
-                        if let Ok(Some(acct)) =
-                            cleanup.peek(protocol::account_keylet(Uint160::from_void(owner.data())))
-                        {
-                            let _ = ledger::adjust_owner_count(&mut cleanup, &acct, -1);
-                        }
-                        let _ = cleanup.erase(offer);
-                        count += 1;
-                        if count == 1000 {
+                    let offer = match cleanup.peek(protocol::keylet::nft_offer_keylet(index)) {
+                        Ok(Some(offer)) => offer,
+                        Ok(None) => continue,
+                        Err(_) => {
+                            cleanup_read_failed = true;
                             break;
                         }
+                    };
+                    // Pinned Transactor::removeExpiredNFTokenOffers delegates
+                    // the complete two-directory/owner-count/erase sequence to
+                    // nft::deleteTokenOffer and deliberately ignores only its
+                    // `false` return. Keep the same helper and mutation order;
+                    // a Rust view error is a hard bad-ledger condition, not a
+                    // missing offer.
+                    if ledger::nftoken_helpers::delete_token_offer(&mut cleanup, offer).is_err() {
+                        cleanup_read_failed = true;
+                        break;
+                    }
+                    count += 1;
+                    if count == protocol::EXPIRED_OFFER_REMOVE_LIMIT {
+                        break;
                     }
                 }
             }
 
-            if result == Ter::TEC_INCOMPLETE {
+            if !cleanup_read_failed && result == Ter::TEC_INCOMPLETE {
                 if !removed_trust_lines.is_empty()
                     && removed_trust_lines.len()
                         <= usize::from(protocol::MAX_DELETABLE_AMM_TRUST_LINES)
                 {
                     for index in removed_trust_lines {
-                        if let Ok(Some(sle)) = cleanup.peek(protocol::Keylet::new(
+                        let sle = match cleanup.peek(protocol::Keylet::new(
                             protocol::LedgerEntryType::RippleState,
                             index,
                         )) {
-                            let low = sle
-                                .get_field_amount(protocol::get_field_by_symbol("sfLowLimit"))
-                                .issue()
-                                .account;
-                            let high = sle
-                                .get_field_amount(protocol::get_field_by_symbol("sfHighLimit"))
-                                .issue()
-                                .account;
-                            let _ = crate::state::trust_set::trust_delete(
-                                &mut cleanup,
-                                &sle,
-                                &low,
-                                &high,
-                            );
-                        }
-                    }
-                }
-                if !removed_mpts.is_empty() && removed_mpts.len() <= 2 {
-                    for index in removed_mpts {
-                        if let Ok(Some(sle)) = cleanup.peek(protocol::Keylet::new(
-                            protocol::LedgerEntryType::MPToken,
-                            index,
-                        )) {
-                            let account =
-                                sle.get_account_id(protocol::get_field_by_symbol("sfAccount"));
-                            let node =
-                                sle.get_field_u64(protocol::get_field_by_symbol("sfOwnerNode"));
-                            let dir =
-                                protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-                            let _ = ledger::dir_remove(&mut cleanup, &dir, node, index, false);
-                            if let Ok(Some(acct)) = cleanup
-                                .peek(protocol::account_keylet(Uint160::from_void(account.data())))
-                            {
-                                let _ = ledger::adjust_owner_count(&mut cleanup, &acct, -1);
+                            Ok(Some(sle)) => sle,
+                            Ok(None) => continue,
+                            Err(_) => {
+                                cleanup_read_failed = true;
+                                break;
                             }
-                            let _ = cleanup.erase(sle);
+                        };
+                        let low = sle
+                            .get_field_amount(protocol::get_field_by_symbol("sfLowLimit"))
+                            .issue()
+                            .account;
+                        let high = sle
+                            .get_field_amount(protocol::get_field_by_symbol("sfHighLimit"))
+                            .issue()
+                            .account;
+                        // Preserve pinned logging/continuation for semantic
+                        // non-tes results, but fail the atomic cleanup on the
+                        // Rust storage/impossible-state hard boundary.
+                        let cleanup_ter =
+                            crate::state::trust_set::trust_delete(&mut cleanup, &sle, &low, &high);
+                        if is_tef_failure(cleanup_ter) || cleanup_ter == Ter::TEC_INTERNAL {
+                            cleanup_read_failed = true;
+                            break;
                         }
                     }
                 }
             }
 
-            if result == Ter::TEC_EXPIRED && !expired_credentials.is_empty() {
+            if !cleanup_read_failed && result == Ter::TEC_EXPIRED && !expired_credentials.is_empty()
+            {
                 for index in expired_credentials {
-                    if let Ok(Some(sle)) = cleanup.peek(protocol::Keylet::new(
+                    let sle = match cleanup.peek(protocol::Keylet::new(
                         protocol::LedgerEntryType::Credential,
                         index,
                     )) {
-                        match ledger::credential_helpers::delete_sle(&mut cleanup, sle) {
-                            Ok(ter) if protocol::is_tes_success(ter) => {}
-                            Ok(ter) => {
-                                tracing::error!(
-                                    target: "tx",
-                                    ?ter,
-                                    credential = %index,
-                                    "persistent expired-credential cleanup failed"
-                                );
-                            }
-                            Err(_) => {
-                                tracing::error!(
-                                    target: "tx",
-                                    credential = %index,
-                                    "persistent expired-credential cleanup hit a bad ledger"
-                                );
-                            }
+                        Ok(Some(sle)) => sle,
+                        Ok(None) => continue,
+                        Err(_) => {
+                            cleanup_read_failed = true;
+                            break;
+                        }
+                    };
+                    match ledger::credential_helpers::delete_sle(&mut cleanup, sle) {
+                        Ok(ter) if protocol::is_tes_success(ter) => {}
+                        Ok(ter) => {
+                            tracing::error!(
+                                target: "tx",
+                                ?ter,
+                                credential = %index,
+                                "persistent expired-credential cleanup failed"
+                            );
+                        }
+                        Err(_) => {
+                            cleanup_read_failed = true;
+                            break;
                         }
                     }
                 }
             }
 
-            if is_tec_claim(result) {
-                result = crate::state::invariants::check_invariants_for_tx_with_expected_xrp_delta(
+            if cleanup_read_failed {
+                result = Ter::TEF_BAD_LEDGER;
+            } else if is_tec_claim(result) {
+                result = crate::state::invariants::check_invariants_for_tx_with_prefix(
                     &cleanup,
                     tx,
                     result,
                     fee_amt,
-                    Some(0),
+                    Some(-fee_amt.drops()),
+                    Some(&invariant_prefix),
                 );
                 *invariant_fee_reset = result == Ter::TEC_INVARIANT_FAILED;
             }
@@ -3725,6 +4108,11 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
     }
 }
 
+#[inline]
+fn exceeds_oversize_metadata_cap(item_count: usize) -> bool {
+    item_count > protocol::OVERSIZE_METADATA_CAP
+}
+
 /// Implements `rippled/src/libxrpl/tx/apply.cpp::applyBatchTransactions`.
 /// Each inner transaction must use the same semantic preflight and immutable
 /// preclaim admission path as a standalone transaction, but with the parent
@@ -3732,6 +4120,8 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
 fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
     view: &mut V,
     batch_tx: &STTx,
+    destination: BatchApplyDestination,
+    node_network_id: u32,
 ) -> BatchFollowupOutcome {
     let batch_mode = BatchTransactionFlags::from_bits(batch_tx.get_flags());
     let parent_batch_id = batch_tx.get_transaction_id();
@@ -3753,21 +4143,27 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
         // This is rippled's `OpenView(kBatchView, batchView)` followed by
         // `apply(..., parentBatchId, tx, TapBatch, ...)`, not a dry-run or a
         // direct transactor dispatch substitute.
+        let inner_flags = if destination == BatchApplyDestination::DryRun {
+            ApplyFlags::BATCH | ApplyFlags::DRY_RUN
+        } else {
+            ApplyFlags::BATCH
+        };
         let mut per_tx_batch_view =
-            ledger::FlowSandbox::new_with_flags(whole_batch_view, ApplyFlags::BATCH);
+            ledger::FlowSandbox::new_with_flags(whole_batch_view, inner_flags);
         let rules = per_tx_batch_view.rules();
         let preflight = transaction_preflight_ter_with_parent_batch_id(
             &inner_tx,
             &rules,
             Some(parent_batch_id),
-            ApplyFlags::BATCH,
+            inner_flags,
+            node_network_id,
         );
         let preclaim = if is_tes_success(preflight) {
             queue_apply_preclaim_ter_with_parent_batch_id(
                 &per_tx_batch_view,
                 &inner_tx,
                 per_tx_batch_view.seq(),
-                ApplyFlags::BATCH,
+                inner_flags,
                 Some(parent_batch_id),
             )
         } else {
@@ -3789,9 +4185,10 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
                     &mut per_tx_batch_view,
                     &inner_tx,
                     inner_tx.get_txn_type(),
-                    ApplyFlags::BATCH,
+                    inner_flags,
                     preclaim,
                     &mut invariant_fee_reset,
+                    node_network_id,
                 );
                 let delivered_amount = delivered_amount_capture
                     .and_then(crate::state::payment::DeliveredAmountCapture::finish)
@@ -3818,12 +4215,22 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
         if inner_applied {
             let inner_tx_id = inner_tx.get_transaction_id();
             let inner_ledger_seq = per_tx_batch_view.seq();
-            let mut metadata = match per_tx_batch_view.to_tx_meta(
-                inner_tx_id,
-                inner_ledger_seq,
-                delivered_amount,
-                &rules,
-            ) {
+            let metadata = if destination.builds_metadata() {
+                per_tx_batch_view
+                    .to_tx_meta(
+                        inner_tx_id,
+                        inner_ledger_seq,
+                        delivered_amount.clone(),
+                        &rules,
+                    )
+                    .map(|mut metadata| {
+                        metadata.set_parent_batch_id(Some(parent_batch_id));
+                        metadata
+                    })
+            } else {
+                Ok(protocol::TxMeta::new(inner_tx_id, inner_ledger_seq))
+            };
+            let metadata = match metadata {
                 Ok(metadata) => metadata,
                 Err(_) => {
                     return BatchFollowupOutcome {
@@ -3832,11 +4239,18 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
                     };
                 }
             };
-            metadata.set_parent_batch_id(Some(parent_batch_id));
-            if per_tx_batch_view
-                .apply_with_tx_thread(inner_tx_id, inner_ledger_seq, &rules)
-                .is_err()
-            {
+            let committed = if destination == BatchApplyDestination::Closed {
+                per_tx_batch_view.apply_with_tx_meta(
+                    inner_tx_id,
+                    inner_ledger_seq,
+                    delivered_amount,
+                    Some(parent_batch_id),
+                    &rules,
+                )
+            } else {
+                per_tx_batch_view.apply().map(|()| metadata.clone())
+            };
+            if committed.is_err() {
                 return BatchFollowupOutcome {
                     result: Ter::TEF_INTERNAL,
                     applied_inner_transactions: Vec::new(),
@@ -3908,6 +4322,172 @@ fn stage_accepted_batch_inner_transactions(
     }
 }
 
+fn canonical_sttx_consequences(sttx: &STTx) -> TxConsequences {
+    let fee = sttx
+        .is_field_present(get_field_by_symbol("sfFee"))
+        .then(|| {
+            sttx.get_field_amount(get_field_by_symbol("sfFee"))
+                .xrp()
+                .drops()
+                .max(0) as u64
+        })
+        .unwrap_or(0);
+    // TxConsequences(STTx const&) uses getSeqProxy(), preserving tickets.
+    // Treating a ticket as Sequence(0) corrupts TxQ replacement, account
+    // window, and blocker admission semantics.
+    let seq = sttx.get_seq_proxy();
+    let native_spend = |field: &'static protocol::SField| {
+        if !sttx.is_field_present(field) {
+            return 0;
+        }
+        let amount = sttx.get_field_amount(field);
+        if amount.native() && amount.signum() > 0 {
+            amount.xrp().drops() as u64
+        } else {
+            0
+        }
+    };
+
+    match sttx.get_txn_type() {
+        TxType::ACCOUNT_SET => tx::run_account_set_make_tx_consequences(
+            fee,
+            seq,
+            sttx.get_flags(),
+            sttx.get_field_u32(get_field_by_symbol("sfSetFlag")),
+            sttx.get_field_u32(get_field_by_symbol("sfClearFlag")),
+        ),
+        TxType::REGULAR_KEY_SET | TxType::ACCOUNT_DELETE | TxType::SIGNER_LIST_SET => {
+            TxConsequences::with_category(fee, seq, tx::TxConsequencesCategory::Blocker)
+        }
+        TxType::XCHAIN_CLAIM
+        | TxType::XCHAIN_ADD_CLAIM_ATTESTATION
+        | TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION => {
+            TxConsequences::with_category(fee, seq, tx::TxConsequencesCategory::Blocker)
+        }
+        TxType::PAYMENT => tx::run_payment_make_tx_consequences(
+            fee,
+            seq,
+            sttx.is_field_present(get_field_by_symbol("sfSendMax"))
+                .then(|| native_spend(get_field_by_symbol("sfSendMax"))),
+            Some(native_spend(get_field_by_symbol("sfAmount"))),
+        ),
+        TxType::OFFER_CREATE => TxConsequences::with_potential_spend(
+            fee,
+            seq,
+            native_spend(get_field_by_symbol("sfTakerGets")),
+        ),
+        TxType::ESCROW_CREATE => {
+            let amount = sttx.get_field_amount(get_field_by_symbol("sfAmount"));
+            let kind = if amount.native() {
+                tx::EscrowCreateAmountKind::Xrp
+            } else if amount.holds_mpt_issue() {
+                tx::EscrowCreateAmountKind::Mpt
+            } else {
+                tx::EscrowCreateAmountKind::Issue
+            };
+            tx::run_escrow_create_make_tx_consequences(
+                fee,
+                seq,
+                kind,
+                native_spend(get_field_by_symbol("sfAmount")),
+            )
+        }
+        TxType::PAYCHAN_CREATE => tx::run_payment_channel_create_make_tx_consequences(
+            fee,
+            seq,
+            native_spend(get_field_by_symbol("sfAmount")),
+        ),
+        TxType::PAYCHAN_FUND => tx::run_payment_channel_fund_make_tx_consequences(
+            fee,
+            seq,
+            native_spend(get_field_by_symbol("sfAmount")),
+        ),
+        TxType::TICKET_CREATE => tx::run_ticket_create_make_tx_consequences(
+            fee,
+            seq,
+            sttx.get_field_u32(get_field_by_symbol("sfTicketCount")),
+        ),
+        TxType::XCHAIN_COMMIT => TxConsequences::with_potential_spend(
+            fee,
+            seq,
+            native_spend(get_field_by_symbol("sfAmount")),
+        ),
+        TxType::SPONSORSHIP_SET => TxConsequences::with_potential_spend(
+            fee,
+            seq,
+            native_spend(get_field_by_symbol("sfFeeAmountDelta")),
+        ),
+        _ => TxConsequences::new(fee, seq),
+    }
+}
+
+#[cfg(test)]
+mod canonical_consequences_tests {
+    use super::canonical_sttx_consequences;
+    use protocol::{AccountID, STAmount, STTx, SeqProxy, TxType, get_field_by_symbol};
+
+    fn tx(txn_type: TxType, sequence: u32) -> STTx {
+        STTx::new(txn_type, |tx| {
+            tx.set_account_id(
+                get_field_by_symbol("sfAccount"),
+                AccountID::from_array([0x11; 20]),
+            );
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+        })
+    }
+
+    #[test]
+    fn ticket_proxy_and_ticket_create_sequence_span_match_rippled() {
+        let mut ordinary = tx(TxType::PAYMENT, 0);
+        ordinary.set_field_u32(get_field_by_symbol("sfTicketSequence"), 77);
+        let ordinary = canonical_sttx_consequences(&ordinary);
+        assert_eq!(ordinary.seq_proxy(), SeqProxy::ticket(77));
+        assert_eq!(ordinary.sequences_consumed(), 0);
+
+        let mut create = tx(TxType::TICKET_CREATE, 9);
+        create.set_field_u32(get_field_by_symbol("sfTicketCount"), 4);
+        let create = canonical_sttx_consequences(&create);
+        assert_eq!(create.seq_proxy(), SeqProxy::sequence(9));
+        assert_eq!(create.sequences_consumed(), 4);
+    }
+
+    #[test]
+    fn blockers_and_custom_xrp_spend_match_pinned_factories() {
+        for txn_type in [
+            TxType::REGULAR_KEY_SET,
+            TxType::ACCOUNT_DELETE,
+            TxType::SIGNER_LIST_SET,
+            TxType::XCHAIN_CLAIM,
+            TxType::XCHAIN_ADD_CLAIM_ATTESTATION,
+            TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION,
+        ] {
+            assert!(canonical_sttx_consequences(&tx(txn_type, 1)).is_blocker());
+        }
+
+        let mut payment = tx(TxType::PAYMENT, 1);
+        payment.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::new_native(25, false),
+        );
+        payment.set_field_amount(
+            get_field_by_symbol("sfSendMax"),
+            STAmount::new_native(40, false),
+        );
+        assert_eq!(canonical_sttx_consequences(&payment).potential_spend(), 40);
+
+        let mut offer = tx(TxType::OFFER_CREATE, 1);
+        offer.set_field_amount(
+            get_field_by_symbol("sfTakerGets"),
+            STAmount::new_native(55, false),
+        );
+        assert_eq!(canonical_sttx_consequences(&offer).potential_spend(), 55);
+    }
+}
+
 impl
     AcceptLedgerPendingApplyRuntime<
         AppPlaceholder,
@@ -3934,21 +4514,7 @@ impl
         _txn_type: TxType,
     ) -> Result<(NotTec, TxConsequences), Self::PreflightError> {
         let sttx = Self::read_sttx(&ctx.tx);
-        let fee_field = get_field_by_symbol("sfFee");
-        let sequence_field = get_field_by_symbol("sfSequence");
-        let fee_drops = if sttx.is_field_present(fee_field) {
-            sttx.get_field_amount(fee_field).xrp().drops().max(0) as u64
-        } else {
-            0
-        };
-        let consequences = TxConsequences::new(
-            fee_drops,
-            SeqProxy::sequence(if sttx.is_field_present(sequence_field) {
-                sttx.get_field_u32(sequence_field)
-            } else {
-                0
-            }),
-        );
+        let consequences = canonical_sttx_consequences(sttx.as_ref());
         let result = transaction_preflight_ter(sttx.as_ref(), &ctx.rules);
 
         Ok((
@@ -3971,20 +4537,7 @@ impl
         >,
     ) -> TxConsequences {
         let sttx = Self::read_sttx(&ctx.tx);
-        let fee_field = get_field_by_symbol("sfFee");
-        let sequence_field = get_field_by_symbol("sfSequence");
-        TxConsequences::new(
-            if sttx.is_field_present(fee_field) {
-                sttx.get_field_amount(fee_field).xrp().drops().max(0) as u64
-            } else {
-                0
-            },
-            SeqProxy::sequence(if sttx.is_field_present(sequence_field) {
-                sttx.get_field_u32(sequence_field)
-            } else {
-                0
-            }),
-        )
+        canonical_sttx_consequences(sttx.as_ref())
     }
 
     fn dispatch_preclaim(
@@ -4020,7 +4573,7 @@ impl
             return 0;
         };
         let sttx = Self::read_sttx(tx);
-        let calculated = calculate_sttx_base_fee(ledger.as_ref(), sttx.as_ref());
+        let calculated = calculate_sttx_base_fee_for_metrics(ledger.as_ref(), sttx.as_ref());
         if calculated == INVALID_BATCH_BASE_FEE {
             ledger.fees().base
         } else {
@@ -4317,6 +4870,7 @@ impl ApplicationRoot {
         let ApplicationRootOptions {
             io_threads,
             job_queue_threads,
+            network_id,
             start_valid,
             elb_support,
             standalone,
@@ -4332,6 +4886,7 @@ impl ApplicationRoot {
         } = options;
 
         let mut registry = ApplicationRegistryOwners::new().map_err(std::io::Error::other)?;
+        registry.network_id_service = FixedNetworkIdService::new(network_id);
         registry.config.standalone = standalone;
         registry.config.start_valid = start_valid;
         registry.config.start_up = start_type;
@@ -4404,6 +4959,27 @@ impl ApplicationRoot {
             load_manager_timing,
         );
         let transaction_master = Arc::new(TransactionMaster::new());
+        let consensus_tx_set_submit_adapter = Arc::new(
+            crate::consensus::consensus_trans_set_sf::ConsensusFetchedTxSubmitAdapter::default(),
+        );
+        // rippled installs ConsensusTransSetSF on every inbound transaction-set
+        // acquisition. Its prefix payload is the NodeStore/SHAMap prefix
+        // format (not the peer wire format); SHAMapTreeNode::make_from_prefix
+        // is the corresponding decoder and is covered by an exact hash test.
+        // Keeping this disabled made every disputed set re-download transaction
+        // leaves already resident in TransactionMaster.
+        let consensus_tx_set_filter = Arc::new(
+            crate::consensus::consensus_trans_set_sf::ConsensusTransSetSFFactory::new(
+                Arc::clone(&transaction_master),
+                Arc::clone(&registry.temp_node_cache),
+                Arc::downgrade(&consensus_tx_set_submit_adapter),
+            ),
+        );
+        registry
+            .inbound_transactions
+            .lock()
+            .expect("inbound transactions mutex must not be poisoned")
+            .set_filter_factory(consensus_tx_set_filter);
 
         Ok(Self {
             basic_app: Arc::new(BasicApp::new(io_threads)?),
@@ -4448,6 +5024,7 @@ impl ApplicationRoot {
             consensus_runtime: None,
             ledger_master_state,
             transaction_master: Arc::clone(&transaction_master),
+            consensus_tx_set_submit_adapter: Some(consensus_tx_set_submit_adapter),
             validations,
             validators,
             status_rpc_state: Arc::new(StatusRpcState::new()),
@@ -4478,17 +5055,6 @@ impl ApplicationRoot {
             shared_tree_cache: std::sync::OnceLock::new(),
             max_disallowed_ledger: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         })
-
-        // TODO: Re-enable ConsensusTransSetSF filter once serialization is verified.
-        // Currently disabled because the filter's serialized output doesn't match
-        // SHAMap's expected wire format, causing acquisition failures.
-        // let factory = Arc::new(
-        //     crate::consensus::consensus_trans_set_sf::ConsensusTransSetSFFactory::new(
-        //         app_root.as_ref().unwrap().transaction_master.clone(),
-        //     ),
-        // );
-        // app_root.as_ref().unwrap().registry.inbound_transactions.lock()
-        //     .unwrap().set_filter_factory(factory);
     }
 
     pub fn basic_app(&self) -> &BasicApp {
@@ -4781,12 +5347,15 @@ impl ApplicationRoot {
             });
         let ledger_seq = open_view.ledger_current_index;
         let close_time = apply_view.header().close_time;
+        let simulation_rules = apply_view.rules();
+        let mut simulation_view =
+            ledger::FlowSandbox::new_with_flags(&mut apply_view, ApplyFlags::DRY_RUN);
         let tx_source = AppQueueApplyTxSource::new(tx.as_ref());
         let account_seqs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let result = self.registry.tx_q.simulate_with(|tx_q| {
             let metrics_snapshot = tx_q.metrics_snapshot();
             let live_queue_view =
-                open_view.queue_apply_view(&apply_view, tx.as_ref(), metrics_snapshot);
+                open_view.queue_apply_view(&simulation_view, tx.as_ref(), metrics_snapshot);
             let queue_view = snapshot_queue_apply_app_view_with_metrics(
                 &tx_source,
                 &live_queue_view,
@@ -4794,12 +5363,13 @@ impl ApplicationRoot {
             );
             let mut runtime = AppOpenLedgerTxQApplyRuntime::new_with_clear_ahead(
                 &mut open_view,
-                &mut apply_view,
+                &mut simulation_view,
                 Arc::clone(&tx),
                 ApplyFlags::DRY_RUN,
                 ledger_seq,
                 self.load_fee_track.as_ref(),
                 Arc::clone(&account_seqs),
+                self.registry.network_id_service.get_network_id(),
                 tx_q.get_account_txs(
                     &mut AppTxQLock,
                     &tx.get_account_id(get_field_by_symbol("sfAccount")),
@@ -4817,15 +5387,23 @@ impl ApplicationRoot {
                 .apply_result();
             (result, runtime.delivered_amount.clone())
         });
-        let metadata = (is_tes_success(result.0.ter) || is_tec_claim(result.0.ter)).then(|| {
-            let mut metadata =
-                apply_view
-                    .table()
-                    .to_tx_meta(tx.get_transaction_id(), ledger_seq, result.1);
-            let mut serialized = Serializer::default();
-            metadata.add_raw(&mut serialized, result.0.ter, 0);
-            metadata
-        });
+        let metadata = (is_tes_success(result.0.ter) || is_tec_claim(result.0.ter))
+            .then(|| {
+                simulation_view
+                    .to_tx_meta(
+                        tx.get_transaction_id(),
+                        ledger_seq,
+                        result.1,
+                        &simulation_rules,
+                    )
+                    .ok()
+                    .map(|mut metadata| {
+                        let mut serialized = Serializer::default();
+                        metadata.add_raw(&mut serialized, result.0.ter, 0);
+                        metadata
+                    })
+            })
+            .flatten();
 
         SimulationOutcome {
             result: result.0,
@@ -4852,9 +5430,9 @@ impl ApplicationRoot {
 
                         // Parity: ../rippled/src/xrpld/app/misc/detail/TxQ.cpp::getFeeLevelPaid.
                         evaluate_fee_level_paid(QueueFeeLevelPaidInputs {
-                            calculated_base_fee_drops: fee_drops_as_i64(calculate_sttx_base_fee(
-                                ledger, &tx,
-                            )),
+                            calculated_base_fee_drops: fee_drops_as_i64(
+                                calculate_sttx_base_fee_for_metrics(ledger, &tx),
+                            ),
                             fee_paid_drops,
                             default_base_fee_drops: fee_drops_as_i64(
                                 calculate_default_sttx_base_fee(ledger, &tx),
@@ -4892,10 +5470,20 @@ impl ApplicationRoot {
         let parent_hash = *parent.header().hash.as_uint256();
         let local_txs = self.local_open_ledger_records();
         let local_tx_count = local_txs.len();
-        let already_in_parent_count = local_txs
-            .iter()
-            .filter(|record| parent.tx_exists(record.tx.get_transaction_id()))
-            .count();
+        let mut already_in_parent_count = 0usize;
+        let mut parent_lookup_diagnostic_errors = 0usize;
+        for record in &local_txs {
+            match parent.try_tx_exists(record.tx.get_transaction_id()) {
+                Ok(true) => already_in_parent_count += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    parent_lookup_diagnostic_errors += 1;
+                    tracing::error!(target: "lcl_audit", ?error, parent_seq = parent.header().seq,
+                        tx = %record.tx.get_transaction_id(),
+                        "open-ledger rebase diagnostic parent transaction lookup failed");
+                }
+            }
+        }
         let local_tx_id_sample = local_txs
             .iter()
             .take(16)
@@ -4915,6 +5503,7 @@ impl ApplicationRoot {
             next_open_index,
             local_tx_count,
             already_in_parent_count,
+            parent_lookup_diagnostic_errors,
             local_tx_id_sample = ?local_tx_id_sample,
             open_before_count,
             open_before_id_sample = ?open_before_id_sample,
@@ -4930,7 +5519,7 @@ impl ApplicationRoot {
         ));
         let applied_ids = std::cell::RefCell::new(std::collections::HashSet::new());
 
-        self.open_ledger().accept(
+        let check_errors = self.open_ledger().accept(
             || {
                 AppOpenLedgerView::with_parent_timing(
                     next_open_index,
@@ -4940,7 +5529,7 @@ impl ApplicationRoot {
                     parent.header().close_time_resolution,
                 )
             },
-            &|tx_id: &Uint256| parent.tx_exists(*tx_id),
+            &|tx_id: &Uint256| parent.try_tx_exists(*tx_id),
             local_txs,
             false,
             &mut retries,
@@ -5010,6 +5599,10 @@ impl ApplicationRoot {
                 );
             },
         );
+        for error in check_errors {
+            tracing::error!(target: "lcl_audit", ?error, parent_seq = parent.header().seq,
+                "open-ledger rebase skipped a transaction whose parent lookup failed");
+        }
         *self.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(rebase_view.into_inner());
         let open_after = self.open_ledger().current_open_transactions();
         let open_after_id_sample = open_after
@@ -5043,8 +5636,12 @@ impl ApplicationRoot {
             return ApplyResult::new(Ter::TEF_ALREADY, false, false);
         }
 
-        let preflight =
-            transaction_preflight_ter_with_flags(tx.as_ref(), &rebase_view.rules(), flags);
+        let preflight = transaction_preflight_ter_with_flags_and_network_id(
+            tx.as_ref(),
+            &rebase_view.rules(),
+            flags,
+            self.registry.network_id_service.get_network_id(),
+        );
         let preclaim = if is_tes_success(preflight) {
             queue_apply_preclaim_ter_with_load_fee(
                 rebase_view,
@@ -5057,12 +5654,13 @@ impl ApplicationRoot {
             preflight
         };
         let outcome = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
-            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+            apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id(
                 rebase_view,
                 tx.as_ref(),
                 tx.get_txn_type(),
                 flags,
                 preclaim,
+                self.registry.network_id_service.get_network_id(),
             )
         } else {
             SubmitApplyOutcome {
@@ -5075,7 +5673,14 @@ impl ApplicationRoot {
         };
         if outcome.applied {
             applied_ids.insert(tx_id);
-            open_ledger.push_transaction(tx);
+            for inner in &outcome.applied_batch_inner_transactions {
+                applied_ids.insert(inner.transaction.get_transaction_id());
+            }
+            record_applied_open_transactions(
+                open_ledger,
+                tx,
+                &outcome.applied_batch_inner_transactions,
+            );
         }
         ApplyResult::new(outcome.result, outcome.applied, false)
     }
@@ -5125,6 +5730,7 @@ impl ApplicationRoot {
             current_ledger_index,
             self.load_fee_track.as_ref(),
             Arc::clone(&self.open_ledger_account_seqs),
+            self.registry.network_id_service.get_network_id(),
             clear_ahead_queue,
             metrics_snapshot,
         );
@@ -5224,7 +5830,7 @@ impl ApplicationRoot {
             ApplyFlags::NONE,
         ));
         let applied_ids = std::cell::RefCell::new(std::collections::HashSet::new());
-        self.open_ledger().accept(
+        let check_errors = self.open_ledger().accept(
             || {
                 AppOpenLedgerView::with_parent_timing(
                     next_open_index,
@@ -5234,7 +5840,7 @@ impl ApplicationRoot {
                     parent.header().close_time_resolution,
                 )
             },
-            &|tx_id: &Uint256| parent.tx_exists(*tx_id),
+            &|tx_id: &Uint256| parent.try_tx_exists(*tx_id),
             local_txs,
             retries_first,
             &mut retries,
@@ -5304,6 +5910,10 @@ impl ApplicationRoot {
                 );
             },
         );
+        for error in check_errors {
+            tracing::error!(target: "lcl_audit", ?error, parent_seq = parent.header().seq,
+                "consensus open-ledger rebuild skipped a transaction whose parent lookup failed");
+        }
         let open_after = self.open_ledger().current_open_transactions();
         let open_after_count = open_after.len();
         let open_after_id_sample = open_after
@@ -6503,7 +7113,48 @@ impl ApplicationRoot {
         if let Ok(mut guard) = self.shared_network_ops_rt.write() {
             *guard = Some(Arc::clone(&network_ops_runtime));
         }
-        self.network_ops_runtime.replace(network_ops_runtime)
+        let previous = self.network_ops_runtime.replace(network_ops_runtime);
+
+        // Match ConsensusTransSetSF::gotNode -> NetworkOPs::submitTransaction.
+        // Remove the lifecycle owner before cloning so the callback's root
+        // does not own the adapter that owns the callback (a strong cycle).
+        if let Some(submit_adapter) = self.consensus_tx_set_submit_adapter.take() {
+            let submit_root = self.clone();
+            let submit_job_queue = self.job_queue.clone();
+            submit_adapter.install(Arc::new(move |transaction| {
+                // rippled's filter does not call NetworkOPs on the SHAMap
+                // acquisition thread. It first posts `TxsToTxn` as a
+                // JtTransaction job; `submitTransaction` then validates and
+                // posts the normal `SubmitTxn` processing job. Preserve both
+                // queue boundaries so acquisition lock ownership, ordering,
+                // and load accounting stay identical.
+                let transaction_root = submit_root.clone();
+                let _ = submit_job_queue.add_job(
+                    crate::job::job_types::JobType::JtTransaction,
+                    "TxsToTxn",
+                    move || {
+                        let _ = transaction_root.submit_transaction_to_network_ops(transaction);
+                    },
+                );
+            }));
+            let weak_submit_adapter = Arc::downgrade(&submit_adapter);
+            self.register_stop_callback("consensus-tx-set-submit", move || {
+                if let Some(submit_adapter) = weak_submit_adapter.upgrade() {
+                    submit_adapter.disable();
+                }
+            });
+            // `attach_network_ops_runtime` can race shutdown. If StopTree
+            // completed between callback installation and registration, the
+            // newly registered child will not be visited by that completed
+            // traversal. A final state check closes that window; if shutdown
+            // begins afterward, the registered callback owns the disable.
+            if self.is_stopping() {
+                submit_adapter.disable();
+            }
+            self.consensus_tx_set_submit_adapter = Some(submit_adapter);
+        }
+
+        previous
     }
 
     pub fn network_ops_validation_runtime(&self) -> Option<Arc<AppNetworkOpsValidationRuntime>> {
@@ -6942,6 +7593,7 @@ impl ApplicationRoot {
                             current_ledger_index,
                             self.load_fee_track.as_ref(),
                             Arc::clone(&account_seqs),
+                            self.registry.network_id_service.get_network_id(),
                             clear_ahead_queue,
                             metrics_snapshot,
                         );
@@ -7024,6 +7676,13 @@ impl ApplicationRoot {
                     AppRequiredFeeView::new(state_ledger.as_ref(), open_ledger_for_state.current().open_ledger_tx_count());
                 let mut lock = AppTxQLock;
                 let fee_and_seq = tx_q_for_state.get_tx_required_fee_and_seq(&mut lock, &fee_view, &tx_source);
+                if fee_view.failure().is_some() {
+                    return crate::NetworkOpsCurrentLedgerState {
+                        fee: protocol::XRPAmount::from_drops(i64::MAX),
+                        account_seq: 0,
+                        available_seq: 0,
+                    };
+                }
                 crate::NetworkOpsCurrentLedgerState {
                     fee: protocol::XRPAmount::from_drops(
                         fee_and_seq.required_fee_drops,
@@ -8035,6 +8694,9 @@ impl ApplicationRoot {
                 .registry
                 .tx_q
                 .get_tx_required_fee_and_seq(&mut lock, &fee_view, &tx_source);
+            if fee_view.failure().is_some() {
+                return None;
+            }
             return (fee_and_seq.account_seq != 0).then_some(fee_and_seq.available_seq);
         }
 
@@ -8048,6 +8710,9 @@ impl ApplicationRoot {
             .registry
             .tx_q
             .get_tx_required_fee_and_seq(&mut lock, &fee_view, &tx_source);
+        if fee_view.failure().is_some() {
+            return None;
+        }
         (fee_and_seq.account_seq != 0).then_some(fee_and_seq.available_seq)
     }
 
@@ -8560,7 +9225,12 @@ impl ApplicationRoot {
                 let result = replayer.drive_timeouts(
                     std::time::Instant::now(),
                     &mut |hash| root.resolve_ledger_by_hash(SHAMapHash::new(hash)),
-                    &mut |replay| crate::build_ledger_from_replay_delta(replay),
+                    &mut |replay| {
+                        crate::build_ledger_from_replay_delta_with_network_id(
+                            replay,
+                            root.registry.network_id_service.get_network_id(),
+                        )
+                    },
                     &mut |hash, seq, _reason| {
                         if let Ok(guard) = inbound_ledgers.lock()
                             && let Some(shared) = guard.as_ref()
@@ -9667,7 +10337,11 @@ impl ApplicationRoot {
             // that exact admission boundary; a rejected transaction must not
             // consume a sequence, fee, or tx-map slot in `state_view`.
             let rules = state_view.rules();
-            let preflight = transaction_preflight_ter(st_tx, &rules);
+            let preflight = transaction_preflight_ter_with_network_id(
+                st_tx,
+                &rules,
+                self.registry.network_id_service.get_network_id(),
+            );
             let preclaim = if is_tes_success(preflight) {
                 queue_apply_preclaim_ter(&state_view, st_tx, closed_seq, ApplyFlags::NONE)
             } else {
@@ -9693,12 +10367,13 @@ impl ApplicationRoot {
                 delivered_amount,
                 prebuilt_outer_metadata,
                 applied_batch_inner_transactions,
-            } = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+            } = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id(
                 &mut attempt_view,
                 st_tx,
                 txn_type,
                 ApplyFlags::NONE,
                 preclaim,
+                self.registry.network_id_service.get_network_id(),
             );
             if applied {
                 // Keep replay's metadata boundary identical to consensus:
@@ -9713,11 +10388,12 @@ impl ApplicationRoot {
                     })?;
                     metadata
                 } else {
-                    let metadata = attempt_view
-                        .to_tx_meta(
+                    attempt_view
+                        .apply_with_tx_meta(
                             st_tx.get_transaction_id(),
                             closed_seq,
                             delivered_amount,
+                            None,
                             &rules,
                         )
                         .map_err(|error| {
@@ -9725,16 +10401,7 @@ impl ApplicationRoot {
                                 "standalone accepted transaction {} metadata failed: {error:?}",
                                 st_tx.get_transaction_id()
                             )
-                        })?;
-                    attempt_view
-                        .apply_with_tx_thread(st_tx.get_transaction_id(), closed_seq, &rules)
-                        .map_err(|error| {
-                            format!(
-                                "standalone accepted transaction {} state commit failed: {error:?}",
-                                st_tx.get_transaction_id()
-                            )
-                        })?;
-                    metadata
+                        })?
                 };
                 let delta_meta_nodes = meta.get_nodes().json(protocol::JsonOptions::NONE);
                 let mut serializer = protocol::Serializer::default();
@@ -10157,13 +10824,15 @@ impl ApplicationRoot {
                 // earlier version of this function did) skipped that preamble
                 // entirely, so successfully-applied transactions never
                 // incremented their sender's sequence number.
-                let retry_flags = if certain_retry {
-                    protocol::ApplyFlags::RETRY
-                } else {
-                    protocol::ApplyFlags::NONE
-                };
+                let retry_flags =
+                    crate::bootstrap::build_ledger::canonical_retry_flags(certain_retry);
                 let rules = view.rules();
-                let preflight = transaction_preflight_ter_with_flags(&sttx, &rules, retry_flags);
+                let preflight = transaction_preflight_ter_with_flags_and_network_id(
+                    &sttx,
+                    &rules,
+                    retry_flags,
+                    self.registry.network_id_service.get_network_id(),
+                );
                 let preclaim = is_tes_success(preflight).then(|| {
                     queue_apply_preclaim_ter_with_load_fee(
                         &*view,
@@ -10193,12 +10862,13 @@ impl ApplicationRoot {
                         delivered_amount,
                         prebuilt_outer_metadata,
                         applied_batch_inner_transactions,
-                    } = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+                    } = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id(
                         &mut attempt_view,
                         &sttx,
                         txn_type,
                         retry_flags,
                         preclaim.expect("preclaim-admitted transaction has a preclaim result"),
+                        self.registry.network_id_service.get_network_id(),
                     );
                     let replayed_threaded_entry = applied
                         .then(|| {
@@ -10224,26 +10894,19 @@ impl ApplicationRoot {
                             })?;
                             metadata
                         } else {
-                            let metadata = attempt_view
-                                .to_tx_meta(
+                            attempt_view
+                                .apply_with_tx_meta(
                                     transaction_id,
                                     closed_seq,
                                     delivered_amount,
+                                    None,
                                     &rules,
                                 )
                                 .map_err(|error| {
                                     crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
                                         "failed to build accepted transaction metadata {transaction_id}: {error:?}"
                                     ))
-                                })?;
-                            attempt_view
-                                .apply_with_tx_thread(transaction_id, closed_seq, &rules)
-                                .map_err(|error| {
-                                    crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
-                                        "failed to thread accepted transaction {transaction_id}: {error:?}"
-                                    ))
-                                })?;
-                            metadata
+                                })?
                         };
                         Some(meta)
                     } else {
@@ -10283,8 +10946,12 @@ impl ApplicationRoot {
                     continue;
                 }
                 if !applied {
-                    let retryable =
-                        protocol::is_ter_retry(result) || protocol::is_tec_claim(result);
+                    let retryable = matches!(
+                        crate::bootstrap::build_ledger::canonical_retry_disposition(
+                            ApplyResult::new(result, false, false)
+                        ),
+                        crate::bootstrap::build_ledger::CanonicalRetryDisposition::Retry
+                    );
                     let decision = if retryable {
                         CandidateDiagnosticDecision::Retry
                     } else {
@@ -10403,13 +11070,16 @@ impl ApplicationRoot {
                 "consensus ledger application pass completed"
             );
             pending_txs = retry_txs;
-            if changes == 0 && !certain_retry {
+            if !crate::bootstrap::build_ledger::advance_canonical_retry_pass(
+                changes,
+                pass,
+                &mut certain_retry,
+            ) {
                 break;
             }
-            if changes == 0 || pass >= crate::LEDGER_RETRY_PASSES {
-                certain_retry = false;
-            }
         }
+
+        debug_assert!(pending_txs.is_empty() || !certain_retry);
 
         if !failed_txns.is_empty() {
             tracing::warn!(

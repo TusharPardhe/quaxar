@@ -57,8 +57,8 @@ pub use validation::*;
 
 // Re-export from external modules
 pub use app::paths::{
-    PathFindSession, PathFindTuning, PathFinderRequest, PathFinderSource, PathRequest,
-    PathRequestManager, make_path_find_status, parse_path_finder_request,
+    PathFindSession, PathFindTuning, PathFinderRequest, PathFinderResult, PathFinderSource,
+    PathRequest, PathRequestManager, make_path_find_status, parse_path_finder_request,
 };
 pub use protocol::TxSearched;
 

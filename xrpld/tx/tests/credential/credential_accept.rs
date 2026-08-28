@@ -192,9 +192,9 @@ fn credential_accept_do_apply_preserves_current_cpp_success_order() {
             "credential_exists",
             "credential_expired",
             &format!("set_credential_flags:{CREDENTIAL_ACCEPTED_FLAG:#010x}"),
-            "update_credential",
             "adjust_issuer_owner_count:-1",
             "adjust_subject_owner_count:1",
+            "update_credential",
         ]
     );
 }

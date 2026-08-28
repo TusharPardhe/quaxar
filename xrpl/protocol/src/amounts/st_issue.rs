@@ -48,7 +48,11 @@ impl STIssue {
         if account == no_account() {
             let sequence = sit.get32();
             let mut bytes = [0u8; crate::MPTID::BYTES];
-            bytes[..4].copy_from_slice(&sequence.to_be_bytes());
+            // STIssue predates the canonical MPTID wire representation and
+            // preserves the sequence as legacy little-endian bytes. rippled
+            // converts the big-endian `get32()` value back to LE bytes before
+            // constructing the canonical MPTID.
+            bytes[..4].copy_from_slice(&sequence.to_le_bytes());
             bytes[4..].copy_from_slice(currency_or_account.data());
             return Self::new_with_asset(field, MPTIssue::new(crate::MPTID::from_array(bytes)));
         }
@@ -108,7 +112,10 @@ impl StBase for STIssue {
             Asset::MPTIssue(issue) => {
                 serializer.add_bit_string(issue.issuer());
                 serializer.add_bit_string(no_account());
-                let sequence = u32::from_be_bytes(
+                // Preserve rippled's legacy STIssue sequence encoding. The
+                // MPTID itself stores canonical big-endian bytes, while this
+                // field writes that four-byte sequence in little-endian order.
+                let sequence = u32::from_le_bytes(
                     issue.mpt_id().data()[..4]
                         .try_into()
                         .expect("MPT sequence width should match"),
@@ -129,4 +136,30 @@ impl StBase for STIssue {
 
 pub fn st_issue_from_json(field: &'static SField, value: &JsonValue) -> Result<STIssue, String> {
     asset_from_json(value).map(|asset| STIssue::new_with_asset(field, asset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MPTID, StBase, sf_generic};
+
+    #[test]
+    fn mpt_issue_preserves_pinned_legacy_sequence_wire_order() {
+        let issuer = AccountID::from_array([0x5a; 20]);
+        let mut id = [0u8; MPTID::BYTES];
+        id[..4].copy_from_slice(&4u32.to_be_bytes());
+        id[4..].copy_from_slice(issuer.data());
+        let expected = MPTIssue::new(MPTID::from_array(id));
+        let issue = STIssue::new_with_asset(sf_generic(), expected);
+
+        let mut serializer = Serializer::default();
+        issue.add(&mut serializer);
+        let bytes = serializer.data();
+        assert_eq!(&bytes[..20], issuer.data());
+        assert_eq!(&bytes[20..40], no_account().data());
+        assert_eq!(&bytes[40..44], &[4, 0, 0, 0]);
+
+        let decoded = STIssue::from_serial_iter(&mut SerialIter::new(bytes), sf_generic());
+        assert_eq!(decoded.asset(), Asset::MPTIssue(expected));
+    }
 }

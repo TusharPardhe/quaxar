@@ -25,6 +25,8 @@ pub struct CredentialCreatePreflightFacts {
 pub struct CredentialCreatePreclaimFacts {
     pub subject_exists: bool,
     pub credential_exists: bool,
+    pub reject_pseudo_subject: bool,
+    pub subject_is_pseudo_account: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +98,10 @@ pub fn run_credential_create_preclaim(facts: CredentialCreatePreclaimFacts) -> T
         return Ter::TEC_DUPLICATE;
     }
 
+    if facts.reject_pseudo_subject && facts.subject_is_pseudo_account {
+        return Ter::TEC_PSEUDO_ACCOUNT;
+    }
+
     Ter::TES_SUCCESS
 }
 
@@ -163,6 +169,8 @@ mod tests {
         let result = run_credential_create_preclaim(CredentialCreatePreclaimFacts {
             subject_exists: false,
             credential_exists: false,
+            reject_pseudo_subject: true,
+            subject_is_pseudo_account: false,
         });
 
         assert_eq!(result, Ter::TEC_NO_TARGET);
@@ -174,6 +182,8 @@ mod tests {
         let result = run_credential_create_preclaim(CredentialCreatePreclaimFacts {
             subject_exists: false,
             credential_exists: true,
+            reject_pseudo_subject: true,
+            subject_is_pseudo_account: false,
         });
 
         assert_eq!(result, Ter::TEC_NO_TARGET);
@@ -184,6 +194,8 @@ mod tests {
         let result = run_credential_create_preclaim(CredentialCreatePreclaimFacts {
             subject_exists: true,
             credential_exists: true,
+            reject_pseudo_subject: true,
+            subject_is_pseudo_account: true,
         });
 
         assert_eq!(result, Ter::TEC_DUPLICATE);
@@ -194,8 +206,29 @@ mod tests {
         let result = run_credential_create_preclaim(CredentialCreatePreclaimFacts {
             subject_exists: true,
             credential_exists: false,
+            reject_pseudo_subject: true,
+            subject_is_pseudo_account: false,
         });
 
         assert_eq!(result, Ter::TES_SUCCESS);
+    }
+
+    #[test]
+    fn credential_create_pseudo_subject_check_follows_duplicate() {
+        let pseudo = run_credential_create_preclaim(CredentialCreatePreclaimFacts {
+            subject_exists: true,
+            credential_exists: false,
+            reject_pseudo_subject: true,
+            subject_is_pseudo_account: true,
+        });
+        assert_eq!(pseudo, Ter::TEC_PSEUDO_ACCOUNT);
+
+        let duplicate = run_credential_create_preclaim(CredentialCreatePreclaimFacts {
+            subject_exists: true,
+            credential_exists: true,
+            reject_pseudo_subject: true,
+            subject_is_pseudo_account: true,
+        });
+        assert_eq!(duplicate, Ter::TEC_DUPLICATE);
     }
 }

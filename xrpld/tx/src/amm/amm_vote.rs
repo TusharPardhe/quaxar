@@ -166,11 +166,12 @@ pub fn run_amm_vote_apply_facts(facts: &AMMVoteApplyFacts) -> AMMVoteApplyResult
         numerator += u128::from(fee) * lp_tokens;
         denominator += lp_tokens;
 
-        if min_tokens.is_none()
-            || lp_tokens < min_tokens.unwrap()
-            || (lp_tokens == min_tokens.unwrap()
-                && (fee < min_fee || (fee == min_fee && slot.account < min_account)))
-        {
+        let is_new_minimum = min_tokens.is_none_or(|minimum| {
+            lp_tokens < minimum
+                || (lp_tokens == minimum
+                    && (fee < min_fee || (fee == min_fee && slot.account < min_account)))
+        });
+        if is_new_minimum {
             min_tokens = Some(lp_tokens);
             min_pos = updated_vote_slots.len();
             min_account = slot.account;

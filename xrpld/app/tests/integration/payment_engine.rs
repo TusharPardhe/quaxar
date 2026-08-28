@@ -11,8 +11,8 @@
 //! Ported from C++ Flow_test.cpp, Path_test.cpp, and Offer_test.cpp.
 
 use super::fixtures::*;
+use super::handle_real_dispatch;
 use super::pipeline::full_apply;
-use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{
@@ -22694,7 +22694,7 @@ fn cpp_step1_account_set_tick_size_too_large() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ACCOUNT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u8(sf("sfTickSize"), 16);
+        tx.set_field_u8(sf("sfTickSize"), 17);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -23190,19 +23190,20 @@ fn cpp_step2_oracle_set_empty_series() {
 #[test]
 fn cpp_step2_mptoken_set_invalid_flag() {
     let a = acct(0x41);
-    let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfFlags"), 0x03);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    let r = full_apply(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_SET);
-    assert!(
-        r == Ter::TEM_INVALID_FLAG || r == Ter::TEC_OBJECT_NOT_FOUND,
-        "{:?}",
-        r
+    // This is a preflight-only assertion. The legacy integration `full_apply`
+    // shim intentionally has no MPTokenIssuanceSet preflight implementation;
+    // use the production semantic dispatcher so doApply is not asked to
+    // repeat the mutually-exclusive lock/unlock policy check.
+    let rules = protocol::Rules::new([protocol::feature_id("MPTokensV1")]);
+    assert_eq!(
+        tx::validate_sttx_semantic_preflight_with_rules(&tx, &rules),
+        Ter::TEM_INVALID_FLAG
     );
 }
 
@@ -24209,7 +24210,7 @@ fn cpp_step3_account_set_tick_size_min_valid() {
     );
 }
 
-/// C++: AccountSet TickSize=15 (max valid) → TES_SUCCESS
+/// C++: AccountSet TickSize=15 (highest stored precision) → TES_SUCCESS
 #[test]
 fn cpp_step3_account_set_tick_size_max_valid() {
     let a = acct(0x41);
@@ -24225,6 +24226,11 @@ fn cpp_step3_account_set_tick_size_max_valid() {
         full_apply(&mut v, &tx, TxType::ACCOUNT_SET),
         Ter::TES_SUCCESS
     );
+    let root = v
+        .read(protocol::account_keylet(acct_id(a)))
+        .expect("account read")
+        .expect("account exists");
+    assert_eq!(root.get_field_u8(sf("sfTickSize")), 15);
 }
 
 /// C++: AccountSet TickSize=1 (invalid, < 3) → temBAD_TICK_SIZE

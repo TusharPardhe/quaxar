@@ -94,49 +94,54 @@ pub(super) fn valid_amm_balances(
 pub(super) fn amm_pool_holds<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &AmmState,
-) -> Option<(STAmount, STAmount)> {
+) -> Result<Option<(STAmount, STAmount)>, ledger::ViewError> {
     if let (Some(amount), Some(amount2)) = (&state.amount, &state.amount2) {
-        return Some((amount.clone(), amount2.clone()));
+        return Ok(Some((amount.clone(), amount2.clone())));
     }
 
-    let account = state.amm_account?;
-    let asset = state.asset?;
-    let asset2 = state.asset2?;
-    Some((
-        account_holds_asset_amount(sandbox, account, asset, sf("sfAmount"))?,
-        account_holds_asset_amount(sandbox, account, asset2, sf("sfAmount2"))?,
-    ))
+    let (Some(account), Some(asset), Some(asset2)) = (state.amm_account, state.asset, state.asset2)
+    else {
+        return Ok(None);
+    };
+    let Some(amount) = account_holds_asset_amount(sandbox, account, asset, sf("sfAmount"))? else {
+        return Ok(None);
+    };
+    let Some(amount2) = account_holds_asset_amount(sandbox, account, asset2, sf("sfAmount2"))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((amount, amount2)))
 }
 
 pub(super) fn validates_amm_create<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &AmmState,
-) -> bool {
+) -> Result<bool, ledger::ViewError> {
     let Some(lp_tokens) = &state.lpt_balance_after else {
-        return false;
+        return Ok(false);
     };
-    let Some((amount, amount2)) = amm_pool_holds(sandbox, state) else {
-        return false;
+    let Some((amount, amount2)) = amm_pool_holds(sandbox, state)? else {
+        return Ok(false);
     };
 
-    valid_amm_balances(&amount, &amount2, lp_tokens, false)
-        && ledger::amm_helpers::amm_lp_tokens(&amount, &amount2, lp_tokens.issue()) == *lp_tokens
+    Ok(valid_amm_balances(&amount, &amount2, lp_tokens, false)
+        && ledger::amm_helpers::amm_lp_tokens(&amount, &amount2, lp_tokens.issue()) == *lp_tokens)
 }
 
 pub(super) fn validates_amm_general<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &AmmState,
     zero_allowed: bool,
-) -> bool {
+) -> Result<bool, ledger::ViewError> {
     let Some(lp_tokens) = &state.lpt_balance_after else {
-        return false;
+        return Ok(false);
     };
-    let Some((amount, amount2)) = amm_pool_holds(sandbox, state) else {
-        return false;
+    let Some((amount, amount2)) = amm_pool_holds(sandbox, state)? else {
+        return Ok(false);
     };
 
     if !valid_amm_balances(&amount, &amount2, lp_tokens, zero_allowed) {
-        return false;
+        return Ok(false);
     }
 
     let Some(pool_product_mean) = root2(
@@ -144,19 +149,23 @@ pub(super) fn validates_amm_general<V: ApplyView + ?Sized>(
             * ledger::amm_helpers::stamount_as_number(&amount2),
     )
     .ok() else {
-        return false;
+        return Ok(false);
     };
     let lp_number = ledger::amm_helpers::stamount_as_number(lp_tokens);
     if pool_product_mean >= lp_number {
-        return true;
+        return Ok(true);
     }
     if lp_number == RuntimeNumber::zero() {
         // Pool fully emptied (all LP withdrawn for AMMDelete) — valid state
-        return true;
+        return Ok(true);
     }
     let distance = RuntimeNumber::try_from_external_parts(1, -11, get_mantissa_scale())
         .expect("relative distance constant");
-    ledger::amm_helpers::within_relative_distance_amount(pool_product_mean, lp_number, distance)
+    Ok(ledger::amm_helpers::within_relative_distance_amount(
+        pool_product_mean,
+        lp_number,
+        distance,
+    ))
 }
 
 pub(super) fn validates_amm_state<V: ApplyView + ?Sized>(
@@ -164,9 +173,9 @@ pub(super) fn validates_amm_state<V: ApplyView + ?Sized>(
     txn_type: protocol::TxType,
     result: Ter,
     state: &AmmState,
-) -> bool {
+) -> Result<bool, ledger::ViewError> {
     if !amm_invariant_result_applies(result) {
-        return true;
+        return Ok(true);
     }
 
     let enforce = sandbox.rules().enabled(&protocol::fix_ammv1_3());
@@ -181,52 +190,51 @@ pub(super) fn validates_amm_state<V: ApplyView + ?Sized>(
                 | protocol::TxType::AMM_DELETE
         )
     {
-        return false;
+        return Ok(false);
     }
 
     match txn_type {
         protocol::TxType::AMM_BID => {
             if state.pool_changed {
-                return false;
+                return Ok(false);
             }
             if let (Some(before), Some(after)) =
                 (&state.lpt_balance_before, &state.lpt_balance_after)
                 && (after > before || after.signum() <= 0)
             {
-                return false;
+                return Ok(false);
             }
-            true
+            Ok(true)
         }
         protocol::TxType::AMM_VOTE => {
-            !state.pool_changed && state.lpt_balance_before == state.lpt_balance_after
+            Ok(!state.pool_changed && state.lpt_balance_before == state.lpt_balance_after)
         }
         protocol::TxType::AMM_CREATE => {
-            state.amm_after && (validates_amm_create(sandbox, state) || !enforce)
+            Ok(state.amm_after && (validates_amm_create(sandbox, state)? || !enforce))
         }
         protocol::TxType::AMM_DEPOSIT => {
-            state.amm_after && (validates_amm_general(sandbox, state, false) || !enforce)
+            Ok(state.amm_after && (validates_amm_general(sandbox, state, false)? || !enforce))
         }
-        protocol::TxType::AMM_WITHDRAW | protocol::TxType::AMM_CLAWBACK => {
-            (enforce_amm_delete && state.amm_deleted)
-                || !state.amm_after
-                || validates_amm_general(sandbox, state, true)
-                || !enforce
-        }
+        protocol::TxType::AMM_WITHDRAW | protocol::TxType::AMM_CLAWBACK => Ok((enforce_amm_delete
+            && state.amm_deleted)
+            || !state.amm_after
+            || validates_amm_general(sandbox, state, true)?
+            || !enforce),
         protocol::TxType::AMM_DELETE => {
             if state.amm_after && enforce {
-                return false;
+                return Ok(false);
             }
             if !enforce_amm_delete {
-                return true;
+                return Ok(true);
             }
             if protocol::is_tes_success(result) {
-                state.amm_deleted
+                Ok(state.amm_deleted
                     && state
                         .lpt_balance_before_deletion
                         .as_ref()
-                        .is_some_and(|balance| balance.signum() == 0)
+                        .is_some_and(|balance| balance.signum() == 0))
             } else {
-                !state.amm_deleted
+                Ok(!state.amm_deleted)
             }
         }
         protocol::TxType::CHECK_CASH
@@ -237,11 +245,11 @@ pub(super) fn validates_amm_state<V: ApplyView + ?Sized>(
             if state.amm_after {
                 let enforce = sandbox.rules().enabled(&protocol::fix_ammv1_3());
                 if enforce {
-                    return false;
+                    return Ok(false);
                 }
             }
-            true
+            Ok(true)
         }
-        _ => true,
+        _ => Ok(true),
     }
 }

@@ -4,24 +4,27 @@
 //! result from immutable `ReadView` reads and return `None` for unowned types;
 //! no apply path, sandbox, or success fallback is used.
 
-use basics::base_uint::{Uint160, Uint256};
+use basics::{
+    base_uint::{Uint160, Uint256},
+    number::{NumberParts as RuntimeNumber, RoundingMode, get_mantissa_scale},
+};
 use ledger::{ReadView, RelativeDistanceAmount};
 use protocol::{
-    AccountID, Asset, STAmount, STLedgerEntry, STTx, Ter, TxType, get_field_by_symbol,
-    lsfAllowTrustLineClawback, lsfGlobalFreeze, lsfHighAuth, lsfHighDeepFreeze, lsfHighFreeze,
-    lsfLoanDefault, lsfLoanImpaired, lsfLoanOverpayment, lsfLowAuth, lsfLowDeepFreeze,
-    lsfLowFreeze, lsfMPTCanClawback, lsfNoFreeze, lsfRequireAuth, tfLoanDefault, tfLoanImpair,
-    tfLoanOverpayment, tfLoanUnimpair,
+    AccountID, Asset, STAmount, STLedgerEntry, STNumber, STTx, Ter, TxType, get_field_by_symbol,
+    lsfAllowTrustLineClawback, lsfDepositAuth, lsfGlobalFreeze, lsfHighAuth, lsfHighDeepFreeze,
+    lsfHighFreeze, lsfLoanDefault, lsfLoanImpaired, lsfLoanOverpayment, lsfLowAuth,
+    lsfLowDeepFreeze, lsfLowFreeze, lsfMPTCanClawback, lsfNoFreeze, lsfRequireAuth,
+    lsfRequireDestTag, tfLoanDefault, tfLoanImpair, tfLoanOverpayment, tfLoanUnimpair,
 };
 
 use crate::{
     LoanBrokerCoverClawbackAmountKind, LoanBrokerCoverClawbackPreclaimFacts,
-    LoanBrokerCoverDepositPreclaimFacts, LoanBrokerCoverWithdrawPreclaimFacts,
-    LoanBrokerDeletePreclaimFacts, LoanBrokerSetPreclaimFacts, LoanManagePreclaimFacts,
-    LoanPayPreclaimFacts, LoanSetScheduleGuardInputs, check_loan_set_schedule_guard,
-    run_loan_broker_cover_clawback_preclaim, run_loan_broker_cover_deposit_preclaim,
-    run_loan_broker_cover_withdraw_preclaim, run_loan_broker_delete_preclaim,
-    run_loan_broker_set_preclaim, run_loan_manage_preclaim, run_loan_pay_preclaim,
+    LoanBrokerCoverDepositPreclaimFacts, LoanBrokerDeletePreclaimFacts, LoanBrokerSetPreclaimFacts,
+    LoanManagePreclaimFacts, LoanPayPreclaimFacts, LoanSetScheduleGuardInputs,
+    check_loan_set_schedule_guard, run_loan_broker_cover_clawback_preclaim,
+    run_loan_broker_cover_deposit_preclaim, run_loan_broker_cover_withdraw_preflight,
+    run_loan_broker_delete_preclaim, run_loan_broker_set_preclaim, run_loan_manage_preclaim,
+    run_loan_pay_preclaim,
 };
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -58,31 +61,101 @@ fn vault<V: ReadView>(view: &V, id: Uint256) -> Result<Option<std::sync::Arc<STL
     read(view, protocol::vault_keylet_from_key(id))
 }
 
+fn round_to_scale(
+    value: RuntimeNumber,
+    target_scale: i32,
+    rounding: RoundingMode,
+) -> RuntimeNumber {
+    let Ok((mantissa, mut exponent)) = value.external_parts() else {
+        return value;
+    };
+    if mantissa == 0 || exponent >= target_scale {
+        return value;
+    }
+
+    let negative = mantissa < 0;
+    let mut absolute = mantissa.unsigned_abs() as u128;
+    let mut removed = Vec::new();
+    while exponent < target_scale {
+        removed.push((absolute % 10) as u8);
+        absolute /= 10;
+        exponent += 1;
+    }
+
+    let first = removed.first().copied().unwrap_or(0);
+    let has_more = removed.iter().skip(1).any(|digit| *digit != 0);
+    let round_up = match rounding {
+        RoundingMode::TowardsZero => false,
+        RoundingMode::Downward => negative && (first != 0 || has_more),
+        RoundingMode::Upward => !negative && (first != 0 || has_more),
+        RoundingMode::ToNearest => {
+            first > 5 || (first == 5 && (has_more || ((absolute as u64) & 1) == 1))
+        }
+    };
+    if round_up {
+        absolute += 1;
+    }
+    let signed = if negative {
+        -(absolute as i64)
+    } else {
+        absolute as i64
+    };
+    RuntimeNumber::try_from_external_parts(signed, exponent, get_mantissa_scale()).unwrap_or(value)
+}
+
+fn minimum_broker_cover(
+    asset: Asset,
+    broker: &STLedgerEntry,
+    vault: &STLedgerEntry,
+    fix_cleanup_3_2_0: bool,
+) -> RuntimeNumber {
+    let debt = broker.get_field_number(sf("sfDebtTotal")).value();
+    let rate = broker.get_field_u32(sf("sfCoverRateMinimum"));
+    let raw = debt * RuntimeNumber::from_i64(i64::from(rate)) / RuntimeNumber::from_i64(100_000);
+    let mut associated = STNumber::from(raw);
+    associated.associate_asset(asset);
+    let rounded_to_asset = associated.value();
+    let scale = if asset.integral() {
+        0
+    } else if fix_cleanup_3_2_0 && vault.is_field_present(sf("sfScale")) {
+        -(vault.get_field_u8(sf("sfScale")) as i32)
+    } else if fix_cleanup_3_2_0 {
+        asset
+            .amount(vault.get_field_number(sf("sfAssetsTotal")).value())
+            .map(|amount| amount.exponent())
+            .unwrap_or(0)
+    } else {
+        asset
+            .amount(debt)
+            .map(|amount| amount.exponent())
+            .unwrap_or(0)
+    };
+    round_to_scale(rounded_to_asset, scale, RoundingMode::Upward)
+}
+
 fn frozen<V: ReadView>(view: &V, id: AccountID, asset: Asset, deep: bool) -> Result<Ter, Ter> {
     match asset {
         Asset::Issue(issue) if issue.native() || issue.account == id => Ok(Ter::TES_SUCCESS),
         Asset::Issue(issue) => {
-            let globally_frozen =
-                account(view, issue.account)?.is_some_and(|sle| sle.is_flag(lsfGlobalFreeze));
+            let globally_frozen = !deep
+                && account(view, issue.account)?.is_some_and(|sle| sle.is_flag(lsfGlobalFreeze));
             let line = read(view, protocol::line(id, issue.account, issue.currency))?;
-            let flag = if deep {
-                if id > issue.account {
-                    lsfHighDeepFreeze
+            let individually_frozen = line.is_some_and(|sle| {
+                if deep {
+                    sle.is_flag(lsfHighDeepFreeze) || sle.is_flag(lsfLowDeepFreeze)
                 } else {
-                    lsfLowDeepFreeze
+                    sle.is_flag(if issue.account > id {
+                        lsfHighFreeze
+                    } else {
+                        lsfLowFreeze
+                    })
                 }
-            } else if id > issue.account {
-                lsfHighFreeze
+            });
+            Ok(if globally_frozen || individually_frozen {
+                Ter::TEC_FROZEN
             } else {
-                lsfLowFreeze
-            };
-            Ok(
-                if globally_frozen || line.is_some_and(|sle| sle.is_flag(flag)) {
-                    Ter::TEC_FROZEN
-                } else {
-                    Ter::TES_SUCCESS
-                },
-            )
+                Ter::TES_SUCCESS
+            })
         }
         Asset::MPTIssue(issue) => Ok(
             if ledger::mptoken_helpers::is_frozen_mpt(view, &id, &issue)
@@ -179,6 +252,63 @@ fn transfer<V: ReadView>(
     }
 }
 
+fn can_withdraw<V: ReadView>(
+    view: &V,
+    from: AccountID,
+    to: AccountID,
+    amount: &STAmount,
+    has_destination_tag: bool,
+) -> Result<Ter, Ter> {
+    let Some(destination) = account(view, to)? else {
+        return Ok(Ter::TEC_NO_DST);
+    };
+    if destination.is_flag(lsfRequireDestTag) && !has_destination_tag {
+        return Ok(Ter::TEC_DST_TAG_NEEDED);
+    }
+    if from == to {
+        return Ok(Ter::TES_SUCCESS);
+    }
+    if destination.is_flag(lsfDepositAuth)
+        && !view
+            .exists(protocol::deposit_preauth_keylet(
+                Uint160::from_void(to.data()),
+                Uint160::from_void(from.data()),
+            ))
+            .map_err(|_| read_error())?
+    {
+        return Ok(Ter::TEC_NO_PERMISSION);
+    }
+
+    let Asset::Issue(issue) = amount.asset() else {
+        return Ok(Ter::TES_SUCCESS);
+    };
+    if issue.native() || to == issue.account {
+        return Ok(Ter::TES_SUCCESS);
+    }
+    let Some(line) = read(view, protocol::line(to, issue.account, issue.currency))? else {
+        return Ok(Ter::TEC_NO_LINE);
+    };
+    let mut owed = line.get_field_amount(sf("sfBalance"));
+    if to < issue.account {
+        owed.negate();
+    }
+    owed.set_issuer(to);
+    if owed.signum() <= 0 {
+        let mut limit = line.get_field_amount(if to < issue.account {
+            sf("sfLowLimit")
+        } else {
+            sf("sfHighLimit")
+        });
+        limit.set_issuer(to);
+        let mut negative_owed = owed.clone();
+        negative_owed.negate();
+        if negative_owed >= limit || amount.clone() > limit + owed {
+            return Ok(Ter::TEC_NO_LINE);
+        }
+    }
+    Ok(Ter::TES_SUCCESS)
+}
+
 fn preclaim_loan_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     // Mirrors LoanSet.cpp's overflow check before its first ledger lookup.
     let schedule = LoanSetScheduleGuardInputs {
@@ -204,14 +334,22 @@ fn preclaim_loan_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         return Ok(Ter::TEC_NO_ENTRY);
     };
     let broker_owner = broker_sle.get_account_id(sf("sfOwner"));
-    let borrower = if tx.is_field_present(sf("sfCounterparty")) {
-        tx.get_account_id(sf("sfCounterparty"))
-    } else {
-        account_id
-    };
-    if account_id != broker_owner && borrower != broker_owner {
+    // LoanSet.cpp defaults Counterparty to the broker owner.  The borrower is
+    // then whichever participant is not the broker owner.  Treating a missing
+    // Counterparty as the submitter changes both the authorization decision
+    // and the borrower identity for the ordinary borrower-submitted form.
+    let counterparty = tx
+        .is_field_present(sf("sfCounterparty"))
+        .then(|| tx.get_account_id(sf("sfCounterparty")))
+        .unwrap_or(broker_owner);
+    if account_id != broker_owner && counterparty != broker_owner {
         return Ok(Ter::TEC_NO_PERMISSION);
     }
+    let borrower = if counterparty == broker_owner {
+        account_id
+    } else {
+        counterparty
+    };
     if account(view, borrower)?.is_none() {
         return Ok(Ter::TER_NO_ACCOUNT);
     }
@@ -300,24 +438,23 @@ fn preclaim_pay<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         broker_exists: broker_sle.is_some(),
         vault_exists: vault_sle.is_some(),
         amount_matches_vault_asset: asset == Some(amount.asset()),
-        frozen_result: asset
-            .map(|a| frozen(view, account_id, a, false).unwrap_or(Ter::TEF_BAD_LEDGER))
-            .unwrap_or(Ter::TES_SUCCESS),
+        frozen_result: match asset {
+            Some(a) => frozen(view, account_id, a, false).unwrap_or(Ter::TEF_BAD_LEDGER),
+            None => Ter::TES_SUCCESS,
+        },
         deep_frozen_result: match (asset, vault_sle.as_ref()) {
             (Some(a), Some(v)) => frozen(view, v.get_account_id(sf("sfAccount")), a, true)
                 .unwrap_or(Ter::TEF_BAD_LEDGER),
             _ => Ter::TES_SUCCESS,
         },
-        require_auth_result: asset
-            .map(|a| auth(view, account_id, a, false).unwrap_or(Ter::TEF_BAD_LEDGER))
-            .unwrap_or(Ter::TES_SUCCESS),
-        balance_is_less_than_amount: asset
-            .map(|_| {
-                holds_at_least(view, account_id, &amount)
-                    .map(|has| !has)
-                    .unwrap_or(true)
-            })
-            .unwrap_or(false),
+        require_auth_result: match asset {
+            Some(a) => auth(view, account_id, a, false).unwrap_or(Ter::TEF_BAD_LEDGER),
+            None => Ter::TES_SUCCESS,
+        },
+        balance_is_less_than_amount: match asset {
+            Some(_) => !holds_at_least(view, account_id, &amount)?,
+            None => false,
+        },
     }))
 }
 
@@ -400,6 +537,20 @@ fn preclaim_cover_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
     let asset = vault_sle
         .as_ref()
         .map(|v| v.get_field_issue(sf("sfAsset")).asset());
+    let fix_cleanup_3_3_0 = view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_3_0"));
+    let deposit_freeze = match (asset, broker_sle.as_ref()) {
+        (Some(a), Some(b)) if fix_cleanup_3_3_0 => {
+            let source = frozen(view, account_id, a, false)?;
+            if source != Ter::TES_SUCCESS {
+                source
+            } else {
+                frozen(view, b.get_account_id(sf("sfAccount")), a, false)?
+            }
+        }
+        _ => Ter::TES_SUCCESS,
+    };
     Ok(run_loan_broker_cover_deposit_preclaim(
         LoanBrokerCoverDepositPreclaimFacts {
             broker_exists: broker_sle.is_some(),
@@ -418,24 +569,31 @@ fn preclaim_cover_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
                 )?,
                 _ => Ter::TES_SUCCESS,
             },
-            frozen_result: asset
-                .map(|a| frozen(view, account_id, a, false).unwrap_or(Ter::TEF_BAD_LEDGER))
-                .unwrap_or(Ter::TES_SUCCESS),
-            deep_frozen_result: match (asset, broker_sle.as_ref()) {
-                (Some(a), Some(b)) => frozen(view, b.get_account_id(sf("sfAccount")), a, true)
-                    .unwrap_or(Ter::TEF_BAD_LEDGER),
-                _ => Ter::TES_SUCCESS,
+            frozen_result: if fix_cleanup_3_3_0 {
+                deposit_freeze
+            } else {
+                match asset {
+                    Some(a) => frozen(view, account_id, a, false).unwrap_or(Ter::TEF_BAD_LEDGER),
+                    None => Ter::TES_SUCCESS,
+                }
             },
-            require_auth_result: asset
-                .map(|a| auth(view, account_id, a, true).unwrap_or(Ter::TEF_BAD_LEDGER))
-                .unwrap_or(Ter::TES_SUCCESS),
-            balance_is_less_than_amount: asset
-                .map(|_| {
-                    holds_at_least(view, account_id, &amount)
-                        .map(|has| !has)
-                        .unwrap_or(true)
-                })
-                .unwrap_or(false),
+            deep_frozen_result: if fix_cleanup_3_3_0 {
+                Ter::TES_SUCCESS
+            } else {
+                match (asset, broker_sle.as_ref()) {
+                    (Some(a), Some(b)) => frozen(view, b.get_account_id(sf("sfAccount")), a, true)
+                        .unwrap_or(Ter::TEF_BAD_LEDGER),
+                    _ => Ter::TES_SUCCESS,
+                }
+            },
+            require_auth_result: match asset {
+                Some(a) => auth(view, account_id, a, true).unwrap_or(Ter::TEF_BAD_LEDGER),
+                None => Ter::TES_SUCCESS,
+            },
+            balance_is_less_than_amount: match asset {
+                Some(_) => !holds_at_least(view, account_id, &amount)?,
+                None => false,
+            },
         },
     ))
 }
@@ -448,68 +606,119 @@ fn preclaim_cover_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter>
         account_id
     };
     let amount = tx.get_field_amount(sf("sfAmount"));
-    let broker_sle = broker(view, tx.get_field_h256(sf("sfLoanBrokerID")))?;
-    let vault_sle = match broker_sle.as_ref() {
-        Some(b) => vault(view, b.get_field_h256(sf("sfVaultID")))?,
-        None => None,
-    };
-    let asset = vault_sle
-        .as_ref()
-        .map(|v| v.get_field_issue(sf("sfAsset")).asset());
-    let cover = broker_sle
-        .as_ref()
-        .map(|b| b.get_field_number(sf("sfCoverAvailable")).value())
-        .unwrap_or_else(basics::number::NumberParts::zero);
+    let preflight =
+        run_loan_broker_cover_withdraw_preflight(crate::LoanBrokerCoverWithdrawPreflightFacts {
+            loan_broker_id_is_zero: tx.get_field_h256(sf("sfLoanBrokerID")).is_zero(),
+            amount_is_positive: amount.signum() > 0,
+            amount_is_legal_net: amount.is_legal_net(),
+            destination_is_present: tx.is_field_present(sf("sfDestination")),
+            destination_is_zero: tx.is_field_present(sf("sfDestination")) && destination.is_zero(),
+        });
+    if preflight != Ter::TES_SUCCESS {
+        return Ok(preflight);
+    }
+
     let pseudo_destination = account(view, destination)?.is_some_and(|sle| {
         sle.is_field_present(sf("sfVaultID"))
             || sle.is_field_present(sf("sfLoanBrokerID"))
             || sle.is_field_present(sf("sfAMMID"))
     });
-    Ok(run_loan_broker_cover_withdraw_preclaim(
-        LoanBrokerCoverWithdrawPreclaimFacts {
-            destination_is_pseudo_account: pseudo_destination,
-            broker_exists: broker_sle.is_some(),
-            submitter_is_broker_owner: broker_sle
-                .as_ref()
-                .is_some_and(|b| b.get_account_id(sf("sfOwner")) == account_id),
-            vault_exists: vault_sle.is_some(),
-            amount_matches_vault_asset: asset == Some(amount.asset()),
-            destination_is_submitter: destination == account_id,
-            destination_is_vault_asset_issuer: asset.is_some_and(|a| destination == a.issuer()),
-            cover_available_at_least_amount: cover >= amount.as_number(),
-            cover_after_withdraw_at_least_minimum: cover >= amount.as_number(),
-            pseudo_balance_at_least_amount: match broker_sle.as_ref() {
-                Some(b) => holds_at_least(view, b.get_account_id(sf("sfAccount")), &amount)?,
-                None => true,
-            },
-            can_transfer_result: match (asset, broker_sle.as_ref()) {
-                (Some(a), Some(b)) => transfer(
-                    view,
-                    a,
-                    b.get_account_id(sf("sfAccount")),
-                    destination,
-                    view.rules()
-                        .enabled(&protocol::feature_id("fixCleanup3_2_0")),
-                )?,
-                _ => Ter::TES_SUCCESS,
-            },
-            can_withdraw_result: Ter::TES_SUCCESS,
-            require_auth_result: asset
-                .map(|a| {
-                    auth(view, destination, a, destination != account_id)
-                        .unwrap_or(Ter::TEF_BAD_LEDGER)
-                })
-                .unwrap_or(Ter::TES_SUCCESS),
-            source_frozen_result: match (asset, broker_sle.as_ref()) {
-                (Some(a), Some(b)) => frozen(view, b.get_account_id(sf("sfAccount")), a, false)
-                    .unwrap_or(Ter::TEF_BAD_LEDGER),
-                _ => Ter::TES_SUCCESS,
-            },
-            destination_deep_frozen_result: asset
-                .map(|a| frozen(view, destination, a, true).unwrap_or(Ter::TEF_BAD_LEDGER))
-                .unwrap_or(Ter::TES_SUCCESS),
-        },
-    ))
+    if pseudo_destination {
+        return Ok(Ter::TEC_PSEUDO_ACCOUNT);
+    }
+    let Some(broker_sle) = broker(view, tx.get_field_h256(sf("sfLoanBrokerID")))? else {
+        return Ok(Ter::TEC_NO_ENTRY);
+    };
+    if broker_sle.get_account_id(sf("sfOwner")) != account_id {
+        return Ok(Ter::TEC_NO_PERMISSION);
+    }
+    let Some(vault_sle) = vault(view, broker_sle.get_field_h256(sf("sfVaultID")))? else {
+        return Ok(Ter::TEF_BAD_LEDGER);
+    };
+    let asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
+    if amount.asset() != asset {
+        return Ok(Ter::TEC_WRONG_ASSET);
+    }
+
+    let fix_cleanup_3_3_0 = view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_3_0"));
+    let pseudo_account = broker_sle.get_account_id(sf("sfAccount"));
+    let can_transfer = transfer(
+        view,
+        asset,
+        pseudo_account,
+        destination,
+        view.rules()
+            .enabled(&protocol::feature_id("fixCleanup3_2_0")),
+    )?;
+    if can_transfer != Ter::TES_SUCCESS {
+        return Ok(can_transfer);
+    }
+    if destination != account_id {
+        let result = can_withdraw(
+            view,
+            account_id,
+            destination,
+            &amount,
+            tx.is_field_present(sf("sfDestinationTag")),
+        )?;
+        if result != Ter::TES_SUCCESS {
+            return Ok(result);
+        }
+    }
+    let require_auth = auth(view, destination, asset, destination != account_id)?;
+    if require_auth != Ter::TES_SUCCESS {
+        return Ok(require_auth);
+    }
+
+    if fix_cleanup_3_3_0 {
+        let withdraw_freeze = if destination == asset.issuer() {
+            Ter::TES_SUCCESS
+        } else {
+            let pseudo = frozen(view, pseudo_account, asset, false)?;
+            if pseudo != Ter::TES_SUCCESS {
+                pseudo
+            } else if account_id != destination {
+                let submitter = frozen(view, account_id, asset, false)?;
+                if submitter != Ter::TES_SUCCESS {
+                    submitter
+                } else {
+                    frozen(view, destination, asset, true)?
+                }
+            } else {
+                frozen(view, destination, asset, true)?
+            }
+        };
+        if withdraw_freeze != Ter::TES_SUCCESS {
+            return Ok(withdraw_freeze);
+        }
+    } else if destination != asset.issuer() {
+        let source_frozen = frozen(view, pseudo_account, asset, false)?;
+        if source_frozen != Ter::TES_SUCCESS {
+            return Ok(source_frozen);
+        }
+        let destination_frozen = frozen(view, destination, asset, true)?;
+        if destination_frozen != Ter::TES_SUCCESS {
+            return Ok(destination_frozen);
+        }
+    }
+
+    let cover = broker_sle.get_field_number(sf("sfCoverAvailable")).value();
+    let minimum_cover = minimum_broker_cover(
+        asset,
+        &broker_sle,
+        &vault_sle,
+        view.rules()
+            .enabled(&protocol::feature_id("fixCleanup3_2_0")),
+    );
+    if cover < amount.as_number() || cover - amount.as_number() < minimum_cover {
+        return Ok(Ter::TEC_INSUFFICIENT_FUNDS);
+    }
+    if !holds_at_least(view, pseudo_account, &amount)? {
+        return Ok(Ter::TEC_INSUFFICIENT_FUNDS);
+    }
+    Ok(Ter::TES_SUCCESS)
 }
 
 fn preclaim_cover_clawback<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
@@ -603,9 +812,10 @@ fn preclaim_broker_delete<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
                 b.get_field_number(sf("sfDebtTotal")).value() == basics::number::NumberParts::zero()
             }),
             cover_available_is_positive: cover > basics::number::NumberParts::zero(),
-            deep_frozen_result: asset
-                .map(|a| frozen(view, account_id, a, true).unwrap_or(Ter::TEF_BAD_LEDGER))
-                .unwrap_or(Ter::TES_SUCCESS),
+            deep_frozen_result: match asset {
+                Some(a) => frozen(view, account_id, a, true).unwrap_or(Ter::TEF_BAD_LEDGER),
+                None => Ter::TES_SUCCESS,
+            },
         },
     ))
 }
@@ -637,11 +847,12 @@ mod tests {
     use super::{run_loan_read_view_preclaim, sf};
     use basics::base_uint::Uint256;
     use ledger::{Fees, LedgerHeader, ReadView, ReadViewTx, Rules, ViewError};
-    use protocol::{STLedgerEntry, STTx, Ter, TxType};
+    use protocol::{STAmount, STLedgerEntry, STTx, Ter, TxType, XRPAmount};
     use std::{collections::BTreeMap, sync::Arc};
     #[derive(Debug, Default)]
     struct View {
         entries: BTreeMap<Uint256, Arc<STLedgerEntry>>,
+        fail_reads: bool,
     }
     impl ReadView for View {
         fn open(&self) -> bool {
@@ -663,6 +874,9 @@ mod tests {
             Ok(None)
         }
         fn read(&self, k: protocol::Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
+            if self.fail_reads {
+                return Err(ViewError::Conversion("fault-injected loan read".into()));
+            }
             Ok(self.entries.get(&k.key).cloned())
         }
         fn sles(&self) -> Result<Vec<Arc<STLedgerEntry>>, ViewError> {
@@ -697,5 +911,61 @@ mod tests {
             Some(Ter::TEC_NO_ENTRY)
         );
         assert!(view.entries.is_empty());
+    }
+    #[test]
+    fn loan_storage_failure_is_not_missing_state_or_success() {
+        let tx = STTx::new(TxType::LOAN_MANAGE, |tx| {
+            tx.set_field_h256(sf("sfLoanID"), Uint256::from_u64(10));
+        });
+        let view = View {
+            fail_reads: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_loan_read_view_preclaim(&view, &tx, TxType::LOAN_MANAGE),
+            Some(Ter::TEF_BAD_LEDGER)
+        );
+    }
+
+    #[test]
+    fn cover_withdraw_malformed_preflight_precedes_faulting_ledger_reads() {
+        let account = protocol::AccountID::from_array([0x41; 20]);
+        let tx = STTx::new(TxType::LOAN_BROKER_COVER_WITHDRAW, |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_field_h256(sf("sfLoanBrokerID"), Uint256::zero());
+            tx.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+            );
+        });
+        let fault = View {
+            fail_reads: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_loan_read_view_preclaim(&fault, &tx, TxType::LOAN_BROKER_COVER_WITHDRAW),
+            Some(Ter::TEM_INVALID)
+        );
+    }
+
+    #[test]
+    fn cover_withdraw_valid_shape_fails_closed_on_destination_read_error() {
+        let account = protocol::AccountID::from_array([0x42; 20]);
+        let tx = STTx::new(TxType::LOAN_BROKER_COVER_WITHDRAW, |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_field_h256(sf("sfLoanBrokerID"), Uint256::from_u64(7));
+            tx.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+            );
+        });
+        let fault = View {
+            fail_reads: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_loan_read_view_preclaim(&fault, &tx, TxType::LOAN_BROKER_COVER_WITHDRAW),
+            Some(Ter::TEF_BAD_LEDGER)
+        );
     }
 }

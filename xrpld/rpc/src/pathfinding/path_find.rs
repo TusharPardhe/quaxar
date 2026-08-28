@@ -65,23 +65,42 @@ pub fn do_ripple_path_find<
     Session: PathFindSession + ?Sized,
 >(
     params: &JsonValue,
+    api_version: u32,
     runtime: &Runtime,
     session: Option<&Session>,
     manager: &PathRequestManager,
     source: &S,
     ledger_index: u32,
     has_explicit_ledger: bool,
+    is_admin: bool,
 ) -> JsonValue {
     if runtime.path_search_max() == 0 {
         return status_json(Status::new(RpcErrorCode::NotSupported));
     }
 
-    let result = if has_explicit_ledger || !runtime.network_synced() {
-        manager.direct_legacy_path_request(source, ledger_index, params)
+    if !runtime.standalone()
+        && !has_explicit_ledger
+        && runtime.validated_ledger_age() > crate::state::tuning::Tuning::MAX_VALIDATED_LEDGER_AGE
+    {
+        return status_json(Status::new(if api_version == 1 {
+            RpcErrorCode::NoNetwork
+        } else {
+            RpcErrorCode::NotSynced
+        }));
+    }
+
+    let explicit_or_standalone = has_explicit_ledger || runtime.standalone();
+    let limiter = explicit_or_standalone.then(|| super::LegacyPathFind::new(is_admin, runtime));
+    if limiter.as_ref().is_some_and(|guard| !guard.is_ok()) {
+        return status_json(Status::new(RpcErrorCode::TooBusy));
+    }
+
+    let result = if explicit_or_standalone {
+        manager.direct_legacy_path_request(source, ledger_index, params, api_version)
     } else if let Some(session) = session {
         manager.make_legacy_path_request(session, source, ledger_index, params)
     } else {
-        manager.direct_legacy_path_request(source, ledger_index, params)
+        manager.direct_legacy_path_request(source, ledger_index, params, api_version)
     };
 
     result.unwrap_or_else(status_json)

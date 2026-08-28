@@ -2,7 +2,8 @@
 
 use std::time::Instant;
 
-use protocol::JsonValue;
+use protocol::{Asset, JsonValue, STPathSet};
+use std::collections::BTreeMap;
 
 use super::pathfinder::{
     PathFindTuning, PathFinderSource, make_path_find_status, parse_path_finder_request,
@@ -19,6 +20,8 @@ pub struct PathRequest {
     tuning: PathFindTuning,
     last_success: bool,
     legacy: bool,
+    api_version: u32,
+    context: BTreeMap<Asset, STPathSet>,
     created_at: Instant,
 }
 
@@ -33,6 +36,8 @@ impl PathRequest {
             tuning: PathFindTuning::default(),
             last_success: false,
             legacy: false,
+            api_version: 1,
+            context: BTreeMap::new(),
             created_at: Instant::now(),
         }
     }
@@ -52,6 +57,7 @@ impl PathRequest {
         ledger_index: u32,
         full_reply: bool,
         legacy: bool,
+        api_version: u32,
     ) -> Result<JsonValue, Status> {
         let parsed = parse_path_finder_request(params)?;
         self.tuning = source.path_find_tuning();
@@ -62,12 +68,22 @@ impl PathRequest {
         } else {
             self.tuning.fast.max(1)
         };
-        let result = source.find_paths(&parsed, params, self.search_level, legacy)?;
+        let result = source.find_paths(
+            &parsed,
+            params,
+            self.search_level,
+            legacy,
+            api_version,
+            &self.context,
+        )?;
         self.params = params.clone();
         self.status = make_path_find_status(self.id, &parsed, result.clone(), full_reply, legacy);
         self.last_ledger_index = ledger_index;
-        self.last_success = !matches!(result, JsonValue::Array(ref values) if values.is_empty());
+        self.last_success =
+            !matches!(result.alternatives, JsonValue::Array(ref values) if values.is_empty());
+        self.context = result.path_context.clone();
         self.legacy = legacy;
+        self.api_version = api_version;
         Ok(self.status.clone())
     }
 
@@ -91,10 +107,19 @@ impl PathRequest {
             self.search_level += 1;
         }
         let parsed = parse_path_finder_request(&self.params)?;
-        let result = source.find_paths(&parsed, &self.params, self.search_level, legacy)?;
+        let result = source.find_paths(
+            &parsed,
+            &self.params,
+            self.search_level,
+            legacy,
+            self.api_version,
+            &self.context,
+        )?;
         self.status = make_path_find_status(self.id, &parsed, result.clone(), full_reply, legacy);
         self.last_ledger_index = ledger_index;
-        self.last_success = !matches!(result, JsonValue::Array(ref values) if values.is_empty());
+        self.last_success =
+            !matches!(result.alternatives, JsonValue::Array(ref values) if values.is_empty());
+        self.context = result.path_context.clone();
         self.legacy = legacy;
         Ok(self.status.clone())
     }

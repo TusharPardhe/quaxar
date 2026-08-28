@@ -7,7 +7,7 @@ use basics::number::{MantissaScale, NumberMantissaScaleGuard};
 
 use crate::{
     CurrentTransactionRulesGuard, NumberSo, Rules, feature_lending_protocol,
-    feature_single_asset_vault, feature_universal_number,
+    feature_single_asset_vault, feature_universal_number, fix_cleanup_3_2_0, fix_cleanup_3_3_0,
 };
 
 /// Mirrors callers like `apply(...)`, `TxQ::apply(...)`, and
@@ -30,10 +30,10 @@ impl TransactionApplyRuntimeGuard {
 
 /// Mirrors `with_txn_type(...)` in the transaction dispatch layer.
 ///
-/// When SingleAssetVault or LendingProtocol is enabled, the current rules and
-/// STNumber switchover are both set explicitly. Otherwise, the legacy path
-/// forces the old small-mantissa policy without changing the current rules
-/// context or the STNumber switchover.
+/// `Rules.cpp::useRulesGuards` enables the current-rules path for
+/// SingleAssetVault, LendingProtocol, fixCleanup3_2_0, or fixCleanup3_3_0.
+/// Otherwise, the legacy path forces the old small-mantissa policy without
+/// changing the current rules context or the STNumber switchover.
 #[derive(Debug)]
 pub struct TransactionStepRuntimeGuard {
     _st_number: Option<NumberSo>,
@@ -45,6 +45,8 @@ impl TransactionStepRuntimeGuard {
     pub fn new(rules: &Rules) -> Self {
         if rules.enabled(&feature_single_asset_vault())
             || rules.enabled(&feature_lending_protocol())
+            || rules.enabled(&fix_cleanup_3_2_0())
+            || rules.enabled(&fix_cleanup_3_3_0())
         {
             Self {
                 _st_number: Some(NumberSo::new(rules.enabled(&feature_universal_number()))),

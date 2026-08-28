@@ -84,7 +84,7 @@ pub trait AMMDeleteApplySink {
         &mut self,
         asset1: &protocol::Asset,
         asset2: &protocol::Asset,
-    ) -> Option<protocol::STLedgerEntry>;
+    ) -> Result<Option<protocol::STLedgerEntry>, Ter>;
     fn delete_amm_entry(&mut self, sle: protocol::STLedgerEntry) -> Ter;
     fn delete_amm_account(&mut self, amm_account: &protocol::AccountID) -> Ter;
 }
@@ -93,8 +93,10 @@ pub fn run_amm_delete_do_apply<S: AMMDeleteApplySink>(
     facts: AMMDeleteApplyFacts,
     sink: &mut S,
 ) -> Ter {
-    let Some(amm_sle) = sink.get_amm_entry(&facts.asset1, &facts.asset2) else {
-        return Ter::TER_NO_AMM;
+    let amm_sle = match sink.get_amm_entry(&facts.asset1, &facts.asset2) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TER_NO_AMM,
+        Err(ter) => return ter,
     };
 
     let amm_account = amm_sle.get_account_id(protocol::get_field_by_symbol("sfAccount"));
@@ -111,4 +113,17 @@ pub fn run_amm_delete_apply<Registry, BaseView, View, Tx, Fee, Journal, ParentBa
     _ctx: &mut ApplyContext<Registry, BaseView, View, Tx, Fee, Journal, ParentBatchId>,
 ) -> ApplyResult {
     ApplyResult::new(Ter::TES_SUCCESS, true, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::amm_delete_check_extra_features;
+
+    #[test]
+    fn extra_feature_gate_matches_mptokens_v2_edges() {
+        assert!(!amm_delete_check_extra_features(false, true, true));
+        assert!(amm_delete_check_extra_features(true, false, false));
+        assert!(!amm_delete_check_extra_features(true, false, true));
+        assert!(amm_delete_check_extra_features(true, true, true));
+    }
 }

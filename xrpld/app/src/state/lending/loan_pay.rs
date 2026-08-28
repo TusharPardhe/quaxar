@@ -210,7 +210,7 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
 
     // Load and cache loan
     let loan_keylet = protocol::loan_keylet_from_key(loan_id);
-    let loan_sle = match view.peek(loan_keylet) {
+    let mut loan_sle = match view.peek(loan_keylet) {
         Ok(Some(sle)) => sle,
         _ => return Ter::TEC_NO_ENTRY,
     };
@@ -236,31 +236,41 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     // Load and cache vault
     let vault_id = broker_sle.get_field_h256(sf("sfVaultID"));
     let vault_keylet = protocol::vault_keylet_from_key(vault_id);
-    let vault_sle = match view.peek(vault_keylet) {
+    let mut vault_sle = match view.peek(vault_keylet) {
         Ok(Some(sle)) => sle,
         _ => return Ter::TEF_BAD_LEDGER,
     };
 
     let vault_asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
-    let loan_view = LpLoanView::from_sle(&loan_sle, vault_asset);
-    let mut broker_view = LpBrokerView::from_sle(&broker_sle, vault_asset);
-    let mut vault_view = LpVaultView::from_sle(&vault_sle);
-    let loan_scale = loan_view.scale;
-    let v_scale = vault_scale(&vault_sle, vault_asset);
-
     let payment_amount = amount_number(&amount);
     if payment_amount <= RuntimeNumber::zero() {
         return Ter::TEM_BAD_AMOUNT;
     }
 
-    // Unimpair if needed (reference LoanManage::unimpairLoan before payment)
-    if loan_view.impaired {
-        let loan_obj = loan_sle.clone_as_object();
-        let mut lu = STLedgerEntry::from_stobject(loan_obj, *loan_sle.key());
-        let cur_flags = lu.get_field_u32(sf("sfFlags"));
-        lu.set_field_u32(sf("sfFlags"), cur_flags & !protocol::lsfLoanImpaired);
-        let _ = view.update(Arc::new(lu));
+    // rippled runs the complete LoanManage::unimpairLoan transition before
+    // computing a payment: reverse vault loss, restore the due date, and clear
+    // the flag.  Reload both SLEs so the payment cannot overwrite that state
+    // from stale pre-unimpair snapshots.
+    if loan_sle.is_flag(protocol::lsfLoanImpaired) {
+        let result = super::manage::unimpair_loan(view, &loan_sle, &vault_sle, vault_asset);
+        if result != Ter::TES_SUCCESS {
+            return result;
+        }
+        loan_sle = match view.peek(loan_keylet) {
+            Ok(Some(sle)) => sle,
+            _ => return Ter::TEF_BAD_LEDGER,
+        };
+        vault_sle = match view.peek(vault_keylet) {
+            Ok(Some(sle)) => sle,
+            _ => return Ter::TEF_BAD_LEDGER,
+        };
     }
+
+    let loan_view = LpLoanView::from_sle(&loan_sle, vault_asset);
+    let mut broker_view = LpBrokerView::from_sle(&broker_sle, vault_asset);
+    let mut vault_view = LpVaultView::from_sle(&vault_sle);
+    let loan_scale = loan_view.scale;
+    let v_scale = vault_scale(&vault_sle, vault_asset);
 
     // Read loan payment state
     let periodic_payment = if loan_sle.is_field_present(sf("sfPeriodicPayment")) {
@@ -630,9 +640,18 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         v_scale,
         view.rules().enabled(&feature_id("fixCleanup3_2_0")),
     );
+    let owner_deep_frozen = match asset_deep_frozen(view, &broker_view.owner, vault_asset) {
+        Ok(frozen) => frozen,
+        Err(ter) => return ter,
+    };
+    let owner_requires_strong_auth =
+        match asset_requires_strong_auth(view, &broker_view.owner, vault_asset) {
+            Ok(required) => required,
+            Err(ter) => return ter,
+        };
     let send_fee_to_owner = broker_view.cover_available >= required_cover
-        && !asset_deep_frozen(view, &broker_view.owner, vault_asset)
-        && !asset_requires_strong_auth(view, &broker_view.owner, vault_asset);
+        && !owner_deep_frozen
+        && !owner_requires_strong_auth;
     let broker_payee = if send_fee_to_owner {
         broker_view.owner
     } else {
@@ -709,12 +728,10 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
             };
             total_send_amount = next_total;
         }
-        let Some(issuance) = view
-            .peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
-            .ok()
-            .flatten()
-        else {
-            return Ter::TEC_OBJECT_NOT_FOUND;
+        let issuance = match view.peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id())) {
+            Ok(Some(issuance)) => issuance,
+            Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let maximum_amount = ledger::mptoken_helpers::max_mpt_amount(&issuance);
         let Ok(maximum_amount) = u64::try_from(maximum_amount) else {
@@ -732,23 +749,22 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     }
 
     // Fund transfers
-    if rounded_to_vault > RuntimeNumber::zero() {
-        if let Some(xfer) = runtime_to_amount(vault_asset, rounded_to_vault, RoundingMode::Downward)
-        {
-            let ter = account_send(view, &borrower, &vault_view.pseudo, &xfer);
-            if !protocol::is_tes_success(ter) {
-                return ter;
-            }
-        }
-    }
-    if total_to_broker > RuntimeNumber::zero() {
-        if let Some(xfer) = runtime_to_amount(vault_asset, total_to_broker, RoundingMode::Downward)
-        {
-            let ter = account_send(view, &borrower, &broker_payee, &xfer);
-            if !protocol::is_tes_success(ter) {
-                return ter;
-            }
-        }
+    let Some(to_vault) = runtime_to_amount(vault_asset, rounded_to_vault, RoundingMode::Downward)
+    else {
+        return Ter::TEC_INTERNAL;
+    };
+    let Some(to_broker) = runtime_to_amount(vault_asset, total_to_broker, RoundingMode::Downward)
+    else {
+        return Ter::TEC_INTERNAL;
+    };
+    let transfer = account_send_multi(
+        view,
+        &borrower,
+        vault_asset,
+        &[(vault_view.pseudo, to_vault), (broker_payee, to_broker)],
+    );
+    if !protocol::is_tes_success(transfer) {
+        return transfer;
     }
 
     // Persist loan update
@@ -793,14 +809,35 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         let dec = match payment_type {
             tx::LoanPayPaymentType::Full => r,
             _ => payment_remaining_decrement
-                .max(1)
                 .min(r)
                 .min(tx::LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION),
         };
-        lu.set_field_u32(sf("sfPaymentRemaining"), r.saturating_sub(dec));
+        let remaining_after = r.saturating_sub(dec);
+        lu.set_field_u32(sf("sfPaymentRemaining"), remaining_after);
+        let next_due = lu.get_field_u32(sf("sfNextPaymentDueDate"));
+        // rippled's doPayment chooses PaymentSpecialCase::Final from the
+        // computed payment, not solely from tfLoanPayFull.  A regular payment
+        // which consumes the last scheduled instalment therefore follows the
+        // same terminal date cleanup as an explicitly full payment.
+        if remaining_after == 0 {
+            lu.set_field_u32(sf("sfPreviousPaymentDueDate"), next_due);
+            lu.set_field_u32(sf("sfNextPaymentDueDate"), 0);
+        } else if dec > 0 {
+            let interval = lu.get_field_u32(sf("sfPaymentInterval"));
+            lu.set_field_u32(
+                sf("sfPreviousPaymentDueDate"),
+                next_due.saturating_add(interval.saturating_mul(dec.saturating_sub(1))),
+            );
+            lu.set_field_u32(
+                sf("sfNextPaymentDueDate"),
+                next_due.saturating_add(interval.saturating_mul(dec)),
+            );
+        }
     }
     associate_asset_entry(&mut lu, vault_asset);
-    let _ = view.update(Arc::new(lu));
+    if view.update(Arc::new(lu)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
     // Persist vault update
     let vs = match view.peek(vault_keylet) {
@@ -818,7 +855,9 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         with_asset_number(vault_view.assets_total, vault_asset),
     );
     associate_asset_entry(&mut vu, vault_asset);
-    let _ = view.update(Arc::new(vu));
+    if view.update(Arc::new(vu)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
     // Persist broker update
     let bs = match view.peek(broker_keylet) {
@@ -836,7 +875,9 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         with_asset_number(broker_view.cover_available, vault_asset),
     );
     associate_asset_entry(&mut bu, vault_asset);
-    let _ = view.update(Arc::new(bu));
+    if view.update(Arc::new(bu)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
     Ter::TES_SUCCESS
 }

@@ -341,6 +341,36 @@ run both daemons against one NuDB. Deployments that still intentionally run
 `quaxar.service` under an `xrpld` account must keep that ownership in deployment
 commands until this explicit cutover is performed.
 
+### ConfidentialTransfer native artifact
+
+ConfidentialTransfer proof verification uses the official
+`mpt-crypto/1.0.2` C ABI. It is a consensus dependency, not an optional RPC
+accelerator. Releases must keep the amendment unsupported until exact replay
+certification is complete. Once a release advertises support, package the
+versioned native library beside the Quaxar binary and set an absolute path in
+the service unit:
+
+```ini
+Environment=QUAXAR_MPT_CRYPTO_LIBRARY=/opt/quaxar/lib/libmpt-crypto.so.1
+```
+
+On macOS the versioned artifact is `libmpt-crypto.1.dylib`; Windows uses
+`mpt-crypto.dll`. Build the shared artifact from the pinned Conan package with
+`mpt-crypto/*:shared=True` and its pinned OpenSSL, secp256k1, and zlib
+dependencies. Stage those runtime dependencies, preserve the major-versioned
+name, ownership, and mode, and record checksums for the binary and every native
+library in the deployment manifest. Do not point production at an unversioned
+developer build.
+
+At startup Quaxar resolves every required symbol and runs pinned context-hash
+ABI vectors before starting application components. A supported release with a
+missing library, or any explicitly configured path that is missing,
+ABI-incompatible, or fails the vectors, is a fatal startup error. After
+staging, verify the runtime dependency closure (`ldd` on Linux or `otool -L` on
+macOS), restart the service, and confirm the journal contains no native
+capability failure. Staging only the `quaxar` executable is insufficient for a
+ConfidentialTransfer-capable release.
+
 ## Monitoring
 
 ### Liveness and readiness

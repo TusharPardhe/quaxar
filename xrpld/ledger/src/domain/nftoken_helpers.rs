@@ -6,10 +6,11 @@ use crate::views::read_view::{ReadView, ViewError};
 use crate::{adjust_owner_count, dir_remove};
 use basics::base_uint::{Uint160, Uint256};
 use protocol::{
-    AccountID, Keylet, LedgerEntryType, Rules, STAmount, STArray, STLedgerEntry, STObject, Ter,
-    account_keylet, get_field_by_symbol, lsfSellNFToken, nft, nft_buy_offers_keylet,
-    nft_offer_keylet, nft_offer_keylet_for_owner, nft_page_keylet, nft_page_max_keylet,
-    nft_page_min_keylet, nft_sell_offers_keylet, owner_dir_keylet, tfSellNFToken,
+    AccountID, Asset, Keylet, LedgerEntryType, Rules, STAmount, STArray, STLedgerEntry, STObject,
+    Ter, account_keylet, get_field_by_symbol, lsfGlobalFreeze, lsfHighFreeze, lsfLowFreeze,
+    lsfSellNFToken, nft, nft_buy_offers_keylet, nft_offer_keylet, nft_offer_keylet_for_owner,
+    nft_page_keylet, nft_page_max_keylet, nft_page_min_keylet, nft_sell_offers_keylet,
+    owner_dir_keylet, tfSellNFToken,
 };
 use std::sync::Arc;
 
@@ -370,9 +371,12 @@ pub fn remove_token_offers_with_limit(
         let values: Vec<Uint256> = offer_indexes.value().to_vec();
 
         for offer_key in values.iter().rev() {
-            if let Some(offer) = view.peek(nft_offer_keylet(*offer_key))?
-                && delete_token_offer(view, offer)?
-            {
+            if let Some(offer) = view.peek(nft_offer_keylet(*offer_key))? {
+                if !delete_token_offer(view, offer)? {
+                    return Err(ViewError::Conversion(format!(
+                        "NFToken offer {offer_key} cannot be deleted"
+                    )));
+                }
                 deleted += 1;
             }
             if deleted >= max_deletable {
@@ -451,6 +455,13 @@ pub fn check_trustline_deep_frozen(
         return Ok(Ter::TES_SUCCESS);
     }
 
+    if view
+        .read(account_keylet(to_uint160(issue.issuer())))?
+        .is_none()
+    {
+        return Ok(Ter::TEC_NO_ISSUER);
+    }
+
     if issue.issuer() == *id {
         return Ok(Ter::TES_SUCCESS);
     }
@@ -471,6 +482,86 @@ pub fn check_trustline_deep_frozen(
     Ok(Ter::TES_SUCCESS)
 }
 
+fn nft_iou_frozen(
+    view: &dyn ReadView,
+    account: AccountID,
+    issue: protocol::Issue,
+) -> Result<bool, ViewError> {
+    if issue.native() || account == issue.account {
+        return Ok(false);
+    }
+    if view
+        .read(account_keylet(to_uint160(issue.account)))?
+        .is_some_and(|issuer| issuer.is_flag(lsfGlobalFreeze))
+    {
+        return Ok(true);
+    }
+    Ok(view
+        .read(protocol::line(account, issue.account, issue.currency))?
+        .is_some_and(|line| {
+            line.is_flag(if account > issue.account {
+                lsfLowFreeze
+            } else {
+                lsfHighFreeze
+            })
+        }))
+}
+
+fn nft_account_funds_positive(
+    view: &dyn ReadView,
+    account: AccountID,
+    amount: &STAmount,
+) -> Result<bool, ViewError> {
+    match amount.asset() {
+        Asset::Issue(issue) if issue.native() => {
+            let Some(root) = view.read(account_keylet(to_uint160(account)))? else {
+                return Ok(false);
+            };
+            let balance = view
+                .balance_hook_iou(
+                    account,
+                    protocol::xrp_account(),
+                    root.get_field_amount(sf("sfBalance")),
+                )
+                .xrp()
+                .drops();
+            let reserve = if crate::is_pseudo_account(&root) {
+                0
+            } else {
+                let owner_count = view
+                    .owner_count_hook(account, crate::OwnerCounts::from_sle(&root))
+                    .count();
+                crate::effective_account_reserve_with_owner_count(
+                    view.fees(),
+                    &root,
+                    owner_count,
+                    0,
+                    0,
+                ) as i64
+            };
+            Ok(balance.saturating_sub(reserve).max(0) > 0)
+        }
+        Asset::Issue(issue) if issue.account == account => Ok(true),
+        Asset::Issue(issue) => {
+            if nft_iou_frozen(view, account, issue)? {
+                return Ok(false);
+            }
+            let Some(line) = view.read(protocol::line(account, issue.account, issue.currency))?
+            else {
+                return Ok(false);
+            };
+            let mut balance = line.get_field_amount(sf("sfBalance"));
+            if account > issue.account {
+                balance.negate();
+            }
+            Ok(balance.signum() > 0)
+        }
+        // NFToken offer Amount fields do not support MPT issues in the pinned
+        // transaction formats.  Keep malformed bypasses fail-closed.
+        Asset::MPTIssue(_) => Ok(false),
+    }
+}
+
 /// Preclaim checks for NFToken offer creation.
 ///
 pub fn token_offer_create_preclaim(
@@ -482,15 +573,30 @@ pub fn token_offer_create_preclaim(
     nft_flags: u16,
     xfer_fee: u16,
     owner: Option<&AccountID>,
-    _tx_flags: u32,
+    tx_flags: u32,
 ) -> Result<Ter, ViewError> {
-    // Check trust line for transfer fee
-    if ((nft_flags & nft::FLAG_CREATE_TRUST_LINES) == 0)
-        && !amount.native()
-        && (xfer_fee != 0)
-        && !view.exists(account_keylet(to_uint160(*nft_issuer)))?
-    {
-        return Ok(Ter::TEC_NO_ISSUER);
+    // Exact tokenOfferCreatePreclaim ordering from rippled.  Before
+    // NFTokenMintOffer the royalty issuer always needed a trust line; after
+    // it, an IOU issuer accepting its own currency is exempt.
+    if ((nft_flags & nft::FLAG_CREATE_TRUST_LINES) == 0) && !amount.native() && (xfer_fee != 0) {
+        if !view.exists(account_keylet(to_uint160(*nft_issuer)))? {
+            return Ok(Ter::TEC_NO_ISSUER);
+        }
+        let Asset::Issue(issue) = amount.asset() else {
+            return Ok(Ter::TEC_INTERNAL);
+        };
+        let royalty_line_required = !view
+            .rules()
+            .enabled(&protocol::feature_nftoken_mint_offer())
+            || *nft_issuer != issue.account;
+        if royalty_line_required
+            && !view.exists(protocol::line(*nft_issuer, issue.account, issue.currency))?
+        {
+            return Ok(Ter::TEC_NO_LINE);
+        }
+        if nft_iou_frozen(view, *nft_issuer, issue)? {
+            return Ok(Ter::TEC_FROZEN);
+        }
     }
 
     // Non-transferable NFT check
@@ -506,6 +612,19 @@ pub fn token_offer_create_preclaim(
         } else {
             return Ok(Ter::TEF_NFTOKEN_IS_NOT_TRANSFERABLE);
         }
+    }
+
+    if let Asset::Issue(issue) = amount.asset()
+        && !issue.native()
+        && nft_iou_frozen(view, *acct_id, issue)?
+    {
+        return Ok(Ter::TEC_FROZEN);
+    }
+
+    // A buy offer only needs some currently spendable funds.  It does not
+    // reserve the full offer amount; the offer may later become unfunded.
+    if (tx_flags & tfSellNFToken) == 0 && !nft_account_funds_positive(view, *acct_id, amount)? {
+        return Ok(Ter::TEC_UNFUNDED_OFFER);
     }
 
     // Check destination exists and allows incoming offers
@@ -525,6 +644,20 @@ pub fn token_offer_create_preclaim(
         };
         if sle_owner.is_flag(protocol::lsfDisallowIncomingNFTokenOffer) {
             return Ok(Ter::TEC_NO_PERMISSION);
+        }
+    }
+
+    if view
+        .rules()
+        .enabled(&protocol::fix_enforce_nftoken_trustline_v2())
+        && !amount.native()
+    {
+        let Asset::Issue(issue) = amount.asset() else {
+            return Ok(Ter::TEC_INTERNAL);
+        };
+        let auth = check_trustline_authorized(view, acct_id, &issue)?;
+        if auth != Ter::TES_SUCCESS {
+            return Ok(auth);
         }
     }
 
@@ -553,8 +686,8 @@ pub fn token_offer_create_apply(
     };
     let prior_balance = pre_fee_balance_drops
         .unwrap_or_else(|| account.get_field_amount(sf("sfBalance")).xrp().drops());
-    let owner_count = account.get_field_u32(sf("sfOwnerCount")) as usize;
-    if prior_balance < view.fees().account_reserve(owner_count + 1) as i64 {
+    let reserve = crate::effective_account_reserve(view.fees(), &account, 1, 0);
+    if prior_balance < reserve as i64 {
         return Ok(Ter::TEC_INSUFFICIENT_RESERVE);
     }
 
@@ -636,7 +769,7 @@ pub fn repair_nftoken_directory_links(
     let succ_key = view.succ(first_kl.key, Some(last.key.next()))?;
     let page_key = succ_key.unwrap_or(last.key);
 
-    let Some(page) = view.peek(Keylet::new(LedgerEntryType::NFTokenPage, page_key))? else {
+    let Some(mut page) = view.peek(Keylet::new(LedgerEntryType::NFTokenPage, page_key))? else {
         return Ok(false);
     };
 
@@ -665,6 +798,79 @@ pub fn repair_nftoken_directory_links(
         did_repair = true;
         let mut updated = (*page).clone();
         updated.make_field_absent(sf("sfPreviousPageMin"));
+        page = Arc::new(updated);
+        view.update(Arc::clone(&page))?;
+    }
+
+    // Walk physical ledger order, repairing both links between every pair.
+    // This deliberately does not trust the links being repaired.
+    let mut next_page = None;
+    loop {
+        let next_key = view
+            .succ(page.key().next(), Some(last.key.next()))?
+            .unwrap_or(last.key);
+        let Some(mut next) = view.peek(Keylet::new(LedgerEntryType::NFTokenPage, next_key))? else {
+            break;
+        };
+
+        if !page.is_field_present(sf("sfNextPageMin"))
+            || page.get_field_h256(sf("sfNextPageMin")) != *next.key()
+        {
+            did_repair = true;
+            let mut updated = (*page).clone();
+            updated.set_field_h256(sf("sfNextPageMin"), *next.key());
+            page = Arc::new(updated);
+            view.update(Arc::clone(&page))?;
+        }
+
+        if !next.is_field_present(sf("sfPreviousPageMin"))
+            || next.get_field_h256(sf("sfPreviousPageMin")) != *page.key()
+        {
+            did_repair = true;
+            let mut updated = (*next).clone();
+            updated.set_field_h256(sf("sfPreviousPageMin"), *page.key());
+            next = Arc::new(updated);
+            view.update(Arc::clone(&next))?;
+        }
+
+        if *next.key() == last.key {
+            next_page = Some(next);
+            break;
+        }
+        page = next;
+    }
+
+    if next_page.is_none() {
+        // The physical last page has a non-canonical key. Move its contents
+        // to the canonical max key and repair the predecessor's forward link.
+        did_repair = true;
+        let mut canonical_last = STLedgerEntry::new(last);
+        canonical_last.set_field_array(sf("sfNFTokens"), page.get_field_array(sf("sfNFTokens")));
+
+        if page.is_field_present(sf("sfPreviousPageMin")) {
+            let previous_key = page.get_field_h256(sf("sfPreviousPageMin"));
+            canonical_last.set_field_h256(sf("sfPreviousPageMin"), previous_key);
+            let Some(previous) =
+                view.peek(Keylet::new(LedgerEntryType::NFTokenPage, previous_key))?
+            else {
+                return Err(ViewError::Conversion(format!(
+                    "NFTokenPage directory for {owner} cannot be repaired: missing previous page"
+                )));
+            };
+            let mut updated = (*previous).clone();
+            updated.set_field_h256(sf("sfNextPageMin"), last.key);
+            view.update(Arc::new(updated))?;
+        }
+        view.erase(page)?;
+        view.insert(Arc::new(canonical_last))?;
+        return Ok(did_repair);
+    }
+
+    let last_page = next_page.expect("checked above");
+    if last_page.is_field_present(sf("sfNextPageMin")) {
+        did_repair = true;
+        let mut updated = (*last_page).clone();
+        updated.make_field_absent(sf("sfNextPageMin"));
         view.update(Arc::new(updated))?;
     }
 

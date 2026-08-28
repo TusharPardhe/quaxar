@@ -7,6 +7,49 @@ use crate::{ApplyView, ViewError};
 use protocol::{AccountID, STLedgerEntry, TxType, get_field_by_symbol};
 use std::sync::Arc;
 
+/// The three AccountRoot object-reserve counters tracked by rippled's
+/// `OwnerCounts`. Ordering follows its effective count first, then each raw
+/// counter, so `max(cur, next)` preserves the greatest reserve reached inside
+/// a PaymentSandbox.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OwnerCounts {
+    pub owner: u32,
+    pub sponsored: u32,
+    pub sponsoring: u32,
+}
+
+impl OwnerCounts {
+    pub fn from_sle(sle: &STLedgerEntry) -> Self {
+        Self {
+            owner: sle.get_field_u32(get_field_by_symbol("sfOwnerCount")),
+            sponsored: sle.get_field_u32(get_field_by_symbol("sfSponsoredOwnerCount")),
+            sponsoring: sle.get_field_u32(get_field_by_symbol("sfSponsoringOwnerCount")),
+        }
+    }
+
+    pub fn count(self) -> u32 {
+        (i64::from(self.owner) - i64::from(self.sponsored) + i64::from(self.sponsoring))
+            .clamp(0, i64::from(u32::MAX)) as u32
+    }
+}
+
+impl Ord for OwnerCounts {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.count(), self.owner, self.sponsored, self.sponsoring).cmp(&(
+            other.count(),
+            other.owner,
+            other.sponsored,
+            other.sponsoring,
+        ))
+    }
+}
+
+impl PartialOrd for OwnerCounts {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Sponsor flags on the transaction `sfSponsorFlags` field.
 pub const SPF_SPONSOR_FEE: u32 = 1;
 pub const SPF_SPONSOR_RESERVE: u32 = 2;
@@ -51,6 +94,7 @@ pub fn reserve_sponsor_allowed_tx_types() -> &'static [TxType] {
         TxType::CREDENTIAL_DELETE,
         TxType::ACCOUNT_SET,
         TxType::REGULAR_KEY_SET,
+        TxType::SPONSORSHIP_TRANSFER,
     ]
 }
 
@@ -62,10 +106,61 @@ pub fn is_reserve_sponsor_allowed(tx_type: TxType) -> bool {
 
 /// Return the reserve-bearing owner count after sponsor accounting.
 pub fn reserve_owner_count(sle: &STLedgerEntry, adjustment: i32) -> u32 {
-    let owner = sle.get_field_u32(get_field_by_symbol("sfOwnerCount")) as i64;
+    let owner = sle.get_field_u32(get_field_by_symbol("sfOwnerCount"));
     let sponsored = sle.get_field_u32(get_field_by_symbol("sfSponsoredOwnerCount")) as i64;
     let sponsoring = sle.get_field_u32(get_field_by_symbol("sfSponsoringOwnerCount")) as i64;
-    (owner + adjustment as i64 - sponsored + sponsoring).clamp(0, u32::MAX as i64) as u32
+    // rippled confines the combined sponsor delta to i32 before applying it
+    // to sfOwnerCount, preserving its defensive overflow behavior exactly.
+    let delta = (i64::from(adjustment) - sponsored + sponsoring)
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    (i64::from(owner) + i64::from(delta)).clamp(0, i64::from(u32::MAX)) as u32
+}
+
+/// Number of account base reserves funded by this AccountRoot: zero for an
+/// account whose own reserve is sponsored, plus each account it sponsors.
+pub fn reserve_account_count(sle: &STLedgerEntry, adjustment: i32) -> u32 {
+    let own = u32::from(!sle.is_field_present(get_field_by_symbol("sfSponsor"))) as i64;
+    let sponsoring = sle.get_field_u32(get_field_by_symbol("sfSponsoringAccountCount")) as i64;
+    (own + sponsoring + adjustment as i64).clamp(0, u32::MAX as i64) as u32
+}
+
+/// Compute an AccountRoot's reserve using the Sponsor-era effective owner and
+/// account counts. This is the Rust counterpart of rippled's
+/// `accountReserve(ReadView const&, SLE::const_ref, ..., Adjustment)` after
+/// `featureSponsor` is enabled.
+pub fn effective_account_reserve(
+    fees: crate::Fees,
+    sle: &STLedgerEntry,
+    owner_count_adjustment: i32,
+    account_count_adjustment: i32,
+) -> u64 {
+    effective_account_reserve_with_owner_count(
+        fees,
+        sle,
+        reserve_owner_count(sle, 0),
+        owner_count_adjustment,
+        account_count_adjustment,
+    )
+}
+
+/// Compute the effective reserve while using an owner count supplied by a
+/// view's `owner_count_hook`. PaymentSandbox uses this to retain the maximum
+/// owner count reached during a payment.
+pub fn effective_account_reserve_with_owner_count(
+    fees: crate::Fees,
+    sle: &STLedgerEntry,
+    owner_count: u32,
+    owner_count_adjustment: i32,
+    account_count_adjustment: i32,
+) -> u64 {
+    // `owner_count` is the already-effective result of
+    // `ownerCountHook(id, OwnerCounts(sle)).count()`.
+    let effective_owner_count = (i64::from(owner_count) + i64::from(owner_count_adjustment))
+        .clamp(0, i64::from(u32::MAX)) as usize;
+    fees.account_reserve_with_account_count(
+        effective_owner_count,
+        reserve_account_count(sle, account_count_adjustment) as usize,
+    )
 }
 
 /// Add one owned object, assigning its reserve to `sponsor_sle` when present.
@@ -80,7 +175,6 @@ pub fn increase_owner_count_for_object(
     let account = account_sle.get_account_id(get_field_by_symbol("sfAccount"));
     let current = account_sle.get_field_u32(owner_field);
     let next = current.saturating_add(1);
-    view.adjust_owner_count_hook(account, current, next);
 
     let mut account_obj = account_sle.clone_as_object();
     account_obj.set_field_u32(owner_field, next);
@@ -90,10 +184,16 @@ pub fn increase_owner_count_for_object(
             account_sle.get_field_u32(sponsored_field).saturating_add(1),
         );
     }
-    view.update(Arc::new(STLedgerEntry::from_stobject(
+    let account_next = Arc::new(STLedgerEntry::from_stobject(
         account_obj,
         *account_sle.key(),
-    )))?;
+    ));
+    view.adjust_owner_count_hook(
+        account,
+        OwnerCounts::from_sle(account_sle),
+        OwnerCounts::from_sle(&account_next),
+    );
+    view.update(account_next)?;
 
     if let Some(sponsor_sle) = sponsor_sle {
         let sponsor = sponsor_sle.get_account_id(get_field_by_symbol("sfAccount"));
@@ -104,10 +204,16 @@ pub fn increase_owner_count_for_object(
                 .get_field_u32(sponsoring_field)
                 .saturating_add(1),
         );
-        view.update(Arc::new(STLedgerEntry::from_stobject(
+        let sponsor_next = Arc::new(STLedgerEntry::from_stobject(
             sponsor_obj,
             *sponsor_sle.key(),
-        )))?;
+        ));
+        view.adjust_owner_count_hook(
+            sponsor,
+            OwnerCounts::from_sle(sponsor_sle),
+            OwnerCounts::from_sle(&sponsor_next),
+        );
+        view.update(sponsor_next)?;
 
         // A prefunded Sponsorship consumes one remaining reserve assignment
         // when a new object is assigned to the sponsor. Directly authorized
@@ -175,17 +281,28 @@ pub fn decrease_owner_count_for_object(
                 .get_field_u32(sponsoring_field)
                 .saturating_sub(count),
         );
-        view.update(Arc::new(STLedgerEntry::from_stobject(
+        let sponsor_next = Arc::new(STLedgerEntry::from_stobject(
             sponsor_obj,
             *sponsor_sle.key(),
-        )))?;
+        ));
+        view.adjust_owner_count_hook(
+            sponsor,
+            OwnerCounts::from_sle(&sponsor_sle),
+            OwnerCounts::from_sle(&sponsor_next),
+        );
+        view.update(sponsor_next)?;
     }
 
-    view.adjust_owner_count_hook(account, current, next);
-    view.update(Arc::new(STLedgerEntry::from_stobject(
+    let account_next = Arc::new(STLedgerEntry::from_stobject(
         account_obj,
         *account_sle.key(),
-    )))?;
+    ));
+    view.adjust_owner_count_hook(
+        account,
+        OwnerCounts::from_sle(account_sle),
+        OwnerCounts::from_sle(&account_next),
+    );
+    view.update(account_next)?;
     Ok(())
 }
 
@@ -222,17 +339,28 @@ pub fn decrease_owner_count_for_trust_line(
                 .get_field_u32(sponsoring_field)
                 .saturating_sub(1),
         );
-        view.update(Arc::new(STLedgerEntry::from_stobject(
+        let sponsor_next = Arc::new(STLedgerEntry::from_stobject(
             sponsor_obj,
             *sponsor_sle.key(),
-        )))?;
+        ));
+        view.adjust_owner_count_hook(
+            sponsor,
+            OwnerCounts::from_sle(&sponsor_sle),
+            OwnerCounts::from_sle(&sponsor_next),
+        );
+        view.update(sponsor_next)?;
     }
 
-    view.adjust_owner_count_hook(account, current, next);
-    view.update(Arc::new(STLedgerEntry::from_stobject(
+    let account_next = Arc::new(STLedgerEntry::from_stobject(
         account_obj,
         *account_sle.key(),
-    )))
+    ));
+    view.adjust_owner_count_hook(
+        account,
+        OwnerCounts::from_sle(account_sle),
+        OwnerCounts::from_sle(&account_next),
+    );
+    view.update(account_next)
 }
 
 /// Extract the sponsor AccountID from an STLedgerEntry, defaulting to `sfSponsor`.
@@ -268,5 +396,58 @@ pub fn get_ledger_entry_low_sponsor(sle: &STLedgerEntry) -> Option<AccountID> {
         Some(sle.get_account_id(field))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{LedgerEntryType, STLedgerEntry};
+
+    fn account_root() -> STLedgerEntry {
+        STLedgerEntry::from_type_and_key(LedgerEntryType::AccountRoot, Default::default())
+    }
+
+    #[test]
+    fn effective_reserve_uses_sponsor_owner_and_account_counts() {
+        let mut root = account_root();
+        root.set_field_u32(get_field_by_symbol("sfOwnerCount"), 7);
+        root.set_field_u32(get_field_by_symbol("sfSponsoredOwnerCount"), 3);
+        root.set_field_u32(get_field_by_symbol("sfSponsoringOwnerCount"), 2);
+        root.set_field_u32(get_field_by_symbol("sfSponsoringAccountCount"), 4);
+        root.set_account_id(
+            get_field_by_symbol("sfSponsor"),
+            AccountID::from_array([1; 20]),
+        );
+
+        let fees = crate::Fees {
+            base: 10,
+            reserve: 200,
+            increment: 50,
+        };
+
+        // Effective owners: 7 + 1 - 3 + 2 = 7.
+        // Effective accounts: sponsored own account (0) + 4 sponsored accounts.
+        assert_eq!(effective_account_reserve(fees, &root, 1, 0), 1_150);
+    }
+
+    #[test]
+    fn reserve_count_confinement_matches_pinned_rippled_ordering() {
+        let mut root = account_root();
+        root.set_field_u32(get_field_by_symbol("sfOwnerCount"), u32::MAX);
+        root.set_field_u32(get_field_by_symbol("sfSponsoredOwnerCount"), u32::MAX);
+        assert_eq!(reserve_owner_count(&root, 0), i32::MAX as u32);
+
+        root.set_field_u32(get_field_by_symbol("sfSponsoredOwnerCount"), 0);
+        root.set_field_u32(get_field_by_symbol("sfSponsoringOwnerCount"), 1);
+        let fees = crate::Fees {
+            base: 0,
+            reserve: 0,
+            increment: 1,
+        };
+        assert_eq!(
+            effective_account_reserve_with_owner_count(fees, &root, u32::MAX, -1, 0),
+            u64::from(u32::MAX - 1)
+        );
     }
 }

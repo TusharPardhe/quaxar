@@ -42,7 +42,14 @@ impl PathRequestManager {
     ) -> Result<JsonValue, Status> {
         let request_id = self.next_request_id();
         let mut request = PathRequest::new(request_id);
-        let status = request.create(source, params, ledger_index, false, false)?;
+        let status = request.create(
+            source,
+            params,
+            ledger_index,
+            false,
+            false,
+            session.api_version(),
+        )?;
         self.requests
             .lock()
             .expect("path request manager mutex poisoned")
@@ -63,7 +70,14 @@ impl PathRequestManager {
     ) -> Result<JsonValue, Status> {
         let request_id = self.next_request_id();
         let mut request = PathRequest::new(request_id);
-        let status = request.create(source, params, ledger_index, true, true)?;
+        let status = request.create(
+            source,
+            params,
+            ledger_index,
+            true,
+            true,
+            session.api_version(),
+        )?;
         self.requests
             .lock()
             .expect("path request manager mutex poisoned")
@@ -77,9 +91,10 @@ impl PathRequestManager {
         source: &S,
         ledger_index: u32,
         params: &JsonValue,
+        api_version: u32,
     ) -> Result<JsonValue, Status> {
         let mut request = PathRequest::new(self.next_request_id());
-        request.create(source, params, ledger_index, true, true)
+        request.create(source, params, ledger_index, true, true, api_version)
     }
 
     pub fn close_request<Session: PathFindSession + ?Sized>(

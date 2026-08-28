@@ -13,8 +13,8 @@
 
 use basics::math::base_uint::Uint160;
 use protocol::{
-    AccountID, Amounts, Asset, Quality, STAmount, STLedgerEntry, STTx, Ter, XRPAmount,
-    get_field_by_symbol, is_tes_success,
+    AccountID, Amounts, Asset, Quality, STAmount, STLedgerEntry, STTx, Ter, get_field_by_symbol,
+    is_tes_success,
 };
 use std::sync::Arc;
 
@@ -132,20 +132,13 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             );
         }
         let cancel_keylet = protocol::offer_keylet(Uint160::from_void(account.data()), cancel_seq);
-        // `peek` consults the active transaction delta first. For an offer
-        // that only exists in the parent state tree, fall back to `read` so a
-        // backing-store/cache visibility miss cannot silently turn a valid
-        // OfferSequence cancellation into a no-op. rippled's psbCancel
-        // resolves this same preexisting SLE before deciding whether there is
-        // anything to remove. A genuine view error is ledger corruption/state
-        // unavailability, not "offer absent", and must fail rather than leave
-        // an orphaned owner-directory entry behind.
+        // ApplyView::peek is the canonical overlay-aware lookup and already
+        // resolves the parent view. A second `read` after Ok(None) bypasses the
+        // transaction overlay and can revive an entry erased earlier in the
+        // same sandbox; pinned psbCancel performs one `peek` only.
         let old_offer = match view.peek(cancel_keylet) {
             Ok(Some(offer)) => Some(offer),
-            Ok(None) => match view.read(cancel_keylet) {
-                Ok(offer) => offer,
-                Err(_) => return Ter::TEF_BAD_LEDGER,
-            },
+            Ok(None) => None,
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         if let Some(old_offer) = old_offer {
@@ -182,11 +175,17 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
     // --- Tick size rounding ---
     // reference: round offer to tick size of the issuer accounts
-    let tick_size = get_tick_size(view, &taker_pays, &taker_gets);
-    if tick_size < 15 {
+    let tick_size = match get_tick_size(view, &taker_pays, &taker_gets) {
+        Ok(tick_size) => tick_size,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if tick_size < 16 {
         // reference: auto const rate = Quality{saTakerGets, saTakerPays}.round(uTickSize).rate();
         // Quality is stored as (exponent << 56) | mantissa = getRate(taker_gets, taker_pays)
-        let quality = get_rate(&taker_gets, &taker_pays);
+        let quality = match get_rate(&taker_gets, &taker_pays) {
+            Ok(quality) => quality,
+            Err(ter) => return ter,
+        };
         let rounded_quality = round_quality(quality, tick_size);
         // Convert rounded quality back to a rate STAmount for multiply/divide
         let rate_amount = quality_to_rate_amount(rounded_quality);
@@ -246,7 +245,10 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     // the offer's limit.
     let gateway_rate = match taker_gets.asset() {
         protocol::Asset::Issue(issue) if !issue.native() && account != issue.issuer() => {
-            ledger::ripple_state_helpers::transfer_rate(view, &issue.issuer())
+            match ledger::ripple_state_helpers::try_transfer_rate(view, &issue.issuer()) {
+                Ok(rate) => rate,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            }
         }
         _ => 1_000_000_000u32,
     };
@@ -282,20 +284,26 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         // Build typed Issue/MPT strands for crossing (rippled toStrands with
         // offerCrossing=true).  Keeping the exact Asset here is consensus
         // critical: treating an MPT as XRP selects a different book key.
-        let (_, strands) = ledger::flow_engine::strand_builder::to_strands_checked_with_domain(
-            view,
-            &account,
-            &account, // src == dst for offer crossing
-            &deliver_asset,
-            Some(&send_max_asset),
-            &cross_paths,
-            true, // default paths allowed
-            true, // owner pays transfer fee
-            true, // offer crossing
-            domain_id,
-        );
+        let (strands_ter, strands) =
+            ledger::flow_engine::strand_builder::to_strands_checked_with_domain(
+                view,
+                &account,
+                &account, // src == dst for offer crossing
+                &deliver_asset,
+                Some(&send_max_asset),
+                &cross_paths,
+                true, // default paths allowed
+                true, // owner pays transfer fee
+                true, // offer crossing
+                domain_id,
+            );
+        // `flow()` returns a failed `toStrands` result immediately.  Continuing
+        // with a hand-built BookStep changes both the TER and the state changes
+        // for malformed or otherwise unavailable crossing paths.
+        if !is_tes_success(strands_ter) {
+            return strands_ter;
+        }
 
-        let cross_book = Some((taker_gets.asset(), taker_pays.asset(), domain_id));
         let self_cross_cancellations = ledger::flow_engine::SelfCrossCancellation::default();
 
         let (in_start_balance, disallow_unfunded) =
@@ -319,62 +327,22 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
         // Execute strands
         // reference: flow(deliver=takerAmount.out, sendMax=takerAmount.in)
-        let flow_result = if !strands.is_empty() {
-            ledger::flow_engine::strand_flow::execute_strands(
-                view,
-                &strands,
-                &cross_deliver,
-                (tx_flags & TF_FILL_OR_KILL) == 0,
-                if is_sell {
-                    ledger::ripple_calc::OfferCrossing::Sell
-                } else {
-                    ledger::ripple_calc::OfferCrossing::Yes
-                },
-                Some(&effective_send_max),
-                &account,
-                &account,
-                Some(quality_threshold),
-                Some(self_cross_cancellations.clone()),
-            )
-        } else if let Some((book_in, book_out, domain)) = cross_book {
-            let cross_book = ledger::ripple_calc::book_step::Book {
-                r#in: book_in,
-                out: book_out,
-                domain,
-            };
-            // Fallback to direct book step if strand building fails. It is
-            // still the default OfferCreate stream, so it receives the same
-            // cancellation-only accumulator as the normal direct strand.
-            let result = ledger::ripple_calc::book_step::execute_book_step_with_options(
-                view,
-                &cross_book,
-                &effective_send_max,
-                &cross_deliver,
-                ledger::ripple_calc::book_step::BookStepOptions {
-                    owner_pays_transfer_fee: true,
-                    taker: Some(&account),
-                    quality_threshold: Some(quality_threshold),
-                    remove_self_crossing: true,
-                    self_cross_cancellation: Some(self_cross_cancellations.clone()),
-                    amm_context: None,
-                    previous_redeems: false,
-                    strand_dst: Some(&account),
-                    strand_deliver: Some(taker_pays.asset()),
-                    enforce_quality_threshold: true,
-                },
-            );
-            ledger::flow_engine::FlowResult {
-                ter: result.ter,
-                actual_in: result.amount_in,
-                actual_out: result.amount_out,
-            }
-        } else {
-            ledger::flow_engine::FlowResult {
-                ter: Ter::TEC_PATH_DRY,
-                actual_in: taker_pays.zeroed(),
-                actual_out: taker_gets.zeroed(),
-            }
-        };
+        let flow_result = ledger::flow_engine::strand_flow::execute_strands(
+            view,
+            &strands,
+            &cross_deliver,
+            (tx_flags & TF_FILL_OR_KILL) == 0,
+            if is_sell {
+                ledger::ripple_calc::OfferCrossing::Sell
+            } else {
+                ledger::ripple_calc::OfferCrossing::Yes
+            },
+            Some(&effective_send_max),
+            &account,
+            &account,
+            Some(quality_threshold),
+            Some(self_cross_cancellations.clone()),
+        );
 
         let cancellation_result = self_cross_cancellations.apply_to(view);
         if cancellation_result != Ter::TES_SUCCESS {
@@ -395,68 +363,6 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
         if actual_in.signum() > 0 || actual_out.signum() > 0 {
             crossed = true;
-
-            // Manual taker transfers are only needed for the FALLBACK path
-            // (direct execute_book_step). When the flow engine succeeds via
-            // strands, the strand execution (DirectStep/XRPEndpointStep) already
-            // handles the taker's asset movement.
-            if strands.is_empty() {
-                // Fallback path: book step only handled offer owners' side.
-                // Transfer assets to/from the taker:
-                if actual_in.signum() > 0 {
-                    if actual_in.native() {
-                        let acct_k = protocol::account_keylet(Uint160::from_void(account.data()));
-                        if let Ok(Some(sle)) = view.peek(acct_k) {
-                            let bal = sle.get_field_amount(sf("sfBalance")).xrp().drops();
-                            let mut obj = sle.clone_as_object();
-                            obj.set_field_amount(
-                                sf("sfBalance"),
-                                STAmount::from_xrp_amount(XRPAmount::from_drops(
-                                    bal - actual_in.xrp().drops(),
-                                )),
-                            );
-                            let _ = view
-                                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-                        }
-                    } else {
-                        let issuer = actual_in.asset().issuer();
-                        let send = ledger::ripple_state_helpers::account_send(
-                            view, &account, &issuer, &actual_in,
-                        );
-                        if send != Ter::TES_SUCCESS {
-                            return send;
-                        }
-                    }
-                }
-                if actual_out.signum() > 0 {
-                    if actual_out.native() {
-                        let acct_k = protocol::account_keylet(Uint160::from_void(account.data()));
-                        if let Ok(Some(sle)) = view.peek(acct_k) {
-                            let bal = sle.get_field_amount(sf("sfBalance")).xrp().drops();
-                            let mut obj = sle.clone_as_object();
-                            obj.set_field_amount(
-                                sf("sfBalance"),
-                                STAmount::from_xrp_amount(XRPAmount::from_drops(
-                                    bal + actual_out.xrp().drops(),
-                                )),
-                            );
-                            let _ = view
-                                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
-                        }
-                    } else {
-                        let issuer = actual_out.asset().issuer();
-                        let send = ledger::ripple_state_helpers::account_send(
-                            view,
-                            &issuer,
-                            &account,
-                            &actual_out,
-                        );
-                        if send != Ter::TES_SUCCESS {
-                            return send;
-                        }
-                    }
-                }
-            }
         }
 
         // Compute the residual offer using rippled's flow result convention:
@@ -546,11 +452,12 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
     // --- Reserve check before placing ---
     let acct_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
-    let Some(acct_sle) = view.peek(acct_keylet).ok().flatten() else {
-        return Ter::TEF_INTERNAL;
+    let acct_sle = match view.peek(acct_keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    let owner_count = acct_sle.get_field_u32(sf("sfOwnerCount"));
-    let reserve = view.fees().account_reserve(owner_count as usize + 1);
+    let reserve = ledger::effective_account_reserve(view.fees(), &acct_sle, 1, 0);
     let balance = pre_fee_balance_drops
         .unwrap_or_else(|| acct_sle.get_field_amount(sf("sfBalance")).xrp().drops());
     if balance < reserve as i64 {
@@ -594,7 +501,9 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     };
 
     // Adjust owner count
-    let _ = ledger::adjust_owner_count(view, &acct_sle, 1);
+    if ledger::adjust_owner_count(view, &acct_sle, 1).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
     // Add to book directory
     let book = protocol::Book {
@@ -603,7 +512,10 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         domain: domain_id,
     };
     let book_base = protocol::book_keylet(book);
-    let rate = get_rate(&taker_gets, &taker_pays);
+    let rate = match get_rate(&taker_gets, &taker_pays) {
+        Ok(rate) => rate,
+        Err(ter) => return ter,
+    };
     let quality_dir = protocol::quality_keylet(book_base, rate);
 
     let book_node = match ledger::dir_append(view, &quality_dir, offer_keylet.key, &|sle| {
@@ -667,10 +579,13 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         {
             rate
         } else {
-            get_rate(
+            match get_rate(
                 &offer_obj.get_field_amount(sf("sfTakerGets")),
                 &offer_obj.get_field_amount(sf("sfTakerPays")),
-            )
+            ) {
+                Ok(rate) => rate,
+                Err(ter) => return ter,
+            }
         };
         let open_book = protocol::Book {
             r#in: taker_pays.asset(),
@@ -698,7 +613,9 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     }
 
     let offer_sle = STLedgerEntry::from_stobject(offer_obj, offer_keylet.key);
-    let _ = view.insert(Arc::new(offer_sle));
+    if view.insert(Arc::new(offer_sle)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
 
     Ter::TES_SUCCESS
 }
@@ -787,24 +704,24 @@ fn amount_or_exception(
 
 /// Returns the exchange rate encoded as u64: top 8 bits = exponent+100, lower 56 bits = mantissa.
 /// reference: getRate(offerOut=taker_gets, offerIn=taker_pays) = divide(taker_pays, taker_gets) encoded.
-fn get_rate(taker_gets: &STAmount, taker_pays: &STAmount) -> u64 {
+fn get_rate(taker_gets: &STAmount, taker_pays: &STAmount) -> Result<u64, Ter> {
     if taker_gets.signum() <= 0 {
-        return 0;
+        return Ok(0);
     }
     // STAmount r = divide(offerIn, offerOut, noIssue())
     let no_issue = protocol::no_issue();
-    let Ok(r) = taker_pays.try_divide(taker_gets, no_issue) else {
-        return 0;
-    };
+    let r = taker_pays
+        .try_divide(taker_gets, no_issue)
+        .map_err(|_| Ter::TEF_EXCEPTION)?;
     if r.signum() <= 0 {
-        return 0;
+        return Ok(0);
     }
     // reference: (r.exponent() + 100) << 56 | r.mantissa()
     let exp = r.exponent() + 100;
     if !(0..=255).contains(&exp) {
-        return 0;
+        return Ok(0);
     }
-    ((exp as u64) << 56) | r.mantissa()
+    Ok(((exp as u64) << 56) | r.mantissa())
 }
 
 /// Get tick size from issuer accounts.
@@ -812,8 +729,8 @@ fn get_tick_size<V: ledger::ApplyView>(
     view: &V,
     taker_pays: &STAmount,
     taker_gets: &STAmount,
-) -> u8 {
-    let mut tick_size: u8 = 15; // Quality::kMAX_TICK_SIZE
+) -> Result<u8, ledger::ViewError> {
+    let mut tick_size: u8 = 16; // Quality::kMaxTickSize
 
     // Check pays issuer
     if let protocol::Asset::Issue(issue) = taker_pays.asset()
@@ -821,7 +738,7 @@ fn get_tick_size<V: ledger::ApplyView>(
     {
         let issuer = issue.account;
         let issuer_keylet = protocol::account_keylet(Uint160::from_void(issuer.data()));
-        if let Ok(Some(sle)) = view.read(issuer_keylet) {
+        if let Some(sle) = view.read(issuer_keylet)? {
             if sle.is_field_present(sf("sfTickSize")) {
                 let ts = sle.get_field_u8(sf("sfTickSize"));
                 if ts < tick_size {
@@ -837,7 +754,7 @@ fn get_tick_size<V: ledger::ApplyView>(
     {
         let issuer = issue.account;
         let issuer_keylet = protocol::account_keylet(Uint160::from_void(issuer.data()));
-        if let Ok(Some(sle)) = view.read(issuer_keylet) {
+        if let Some(sle) = view.read(issuer_keylet)? {
             if sle.is_field_present(sf("sfTickSize")) {
                 let ts = sle.get_field_u8(sf("sfTickSize"));
                 if ts < tick_size {
@@ -847,7 +764,7 @@ fn get_tick_size<V: ledger::ApplyView>(
         }
     }
 
-    tick_size
+    Ok(tick_size)
 }
 
 /// Quality is encoded as (exponent << 56) | mantissa.
@@ -979,12 +896,13 @@ fn crossing_account_funds<V: ledger::ApplyView>(
                 return Ok((amount.zeroed(), true));
             }
             Ok((
-                ledger::ripple_state_helpers::account_holds(
+                ledger::ripple_state_helpers::try_account_holds(
                     view,
                     account,
                     &issue.issuer(),
                     issue.currency,
-                ),
+                )
+                .map_err(|_| Ter::TEF_BAD_LEDGER)?,
                 true,
             ))
         }
@@ -1040,7 +958,7 @@ fn crossing_account_funds<V: ledger::ApplyView>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::StBase;
+    use protocol::{StBase, XRPAmount};
 
     #[test]
     fn offer_create_amount_error_maps_to_tef_exception_without_unwinding() {
@@ -1158,7 +1076,10 @@ mod tests {
             rlusd,
         );
 
-        let quality = round_quality(get_rate(&taker_gets, &taker_pays), 5);
+        let quality = round_quality(
+            get_rate(&taker_gets, &taker_pays).expect("canonical quality"),
+            5,
+        );
         let rate = quality_to_rate_amount(quality);
         assert!(
             !rate.native(),

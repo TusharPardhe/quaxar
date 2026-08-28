@@ -5,7 +5,7 @@ use sha2::{Digest, Sha512};
 
 use crate::{
     AccountID, Asset, Currency, Issue, NotTec, Rules, STAmount, Ter, bad_currency, feature_amm,
-    feature_universal_number, is_xrp_currency,
+    is_xrp_currency,
 };
 
 pub const TRADING_FEE_THRESHOLD: u16 = 1_000;
@@ -144,7 +144,10 @@ pub fn amm_auction_time_slot(current: u64, auction_slot: &crate::STObject) -> Op
 }
 
 pub fn amm_enabled(rules: &Rules) -> bool {
-    rules.enabled(&feature_amm()) && rules.enabled(&feature_universal_number())
+    // rippled's AMMCore::ammEnabled is gated only by featureAMM.  The
+    // fixUniversalNumber amendment selects Number/STNumber behavior; it is
+    // not an additional transaction-family feature gate.
+    rules.enabled(&feature_amm())
 }
 
 pub fn get_fee(tfee: u16) -> RuntimeNumber {
@@ -164,4 +167,18 @@ pub fn fee_mult(tfee: u16) -> RuntimeNumber {
 
 pub fn fee_mult_half(tfee: u16) -> RuntimeNumber {
     current_number_one() - get_fee(tfee) / number_from_i64(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amm_family_gate_does_not_depend_on_fix_universal_number() {
+        assert!(!amm_enabled(&Rules::new(std::iter::empty())));
+        assert!(amm_enabled(&Rules::new([feature_amm()])));
+        assert!(!amm_enabled(&Rules::new([
+            crate::feature_universal_number(),
+        ])));
+    }
 }

@@ -37,6 +37,7 @@ fn brrl_to_rlusd_limited_input_is_a_generic_iou_book_fill() {
         &available_rlusd,
         QUALITY_ONE,
         QUALITY_ONE,
+        true,
     );
 
     assert_eq!(consumed.step_in, remaining_brrl);

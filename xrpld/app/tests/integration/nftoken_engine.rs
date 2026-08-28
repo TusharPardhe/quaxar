@@ -10,18 +10,31 @@
 //! Ported from C++ NFToken_test.cpp (788 assertions).
 
 use super::fixtures::*;
+use super::handle_real_dispatch;
 use super::pipeline::full_apply;
-use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{
     AccountID, Currency, IOUAmount, Issue, STAmount, STArray, STLedgerEntry, STObject, STTx, Ter,
-    TxType, XRPAmount, get_field_by_symbol, sf_generic,
+    TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
 };
 use std::sync::Arc;
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
+}
+
+fn dispatch_with_pre_fee_balance<V: ApplyView>(view: &mut V, tx: &STTx, tx_type: TxType) -> Ter {
+    let account = tx.get_account_id(sf("sfAccount"));
+    let keylet = account_keylet(Uint160::from_void(account.data()));
+    let pre_fee_balance = view
+        .read(keylet)
+        .expect("fixture AccountRoot read")
+        .expect("fixture source AccountRoot")
+        .get_field_amount(sf("sfBalance"))
+        .xrp()
+        .drops();
+    handle_real_dispatch(view, tx, tx_type, Some(pre_fee_balance))
 }
 
 // ─── NFToken Mint ───────────────────────────────────────────────────────────
@@ -2265,7 +2278,7 @@ fn nfe5_cross_100_usd() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    handle_real_dispatch(&mut v, &tx1, TxType::OFFER_CREATE, None);
+    dispatch_with_pre_fee_balance(&mut v, &tx1, TxType::OFFER_CREATE);
     let tx2 = STTx::new(TxType::OFFER_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), b);
         tx.set_field_amount(sf("sfTakerPays"), iou(gw, u, 100));
@@ -2274,7 +2287,7 @@ fn nfe5_cross_100_usd() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx2, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut v, &tx2, TxType::OFFER_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -2299,7 +2312,7 @@ fn nfe5_cross_500_usd() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    handle_real_dispatch(&mut v, &tx1, TxType::OFFER_CREATE, None);
+    dispatch_with_pre_fee_balance(&mut v, &tx1, TxType::OFFER_CREATE);
     let tx2 = STTx::new(TxType::OFFER_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), b);
         tx.set_field_amount(sf("sfTakerPays"), iou(gw, u, 500));
@@ -2308,7 +2321,7 @@ fn nfe5_cross_500_usd() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx2, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut v, &tx2, TxType::OFFER_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -2333,7 +2346,7 @@ fn nfe5_cross_1000_eur() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    handle_real_dispatch(&mut v, &tx1, TxType::OFFER_CREATE, None);
+    dispatch_with_pre_fee_balance(&mut v, &tx1, TxType::OFFER_CREATE);
     let tx2 = STTx::new(TxType::OFFER_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), b);
         tx.set_field_amount(sf("sfTakerPays"), iou(gw, e, 1000));
@@ -2342,7 +2355,7 @@ fn nfe5_cross_1000_eur() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx2, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut v, &tx2, TxType::OFFER_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -2367,7 +2380,7 @@ fn nfe5_cross_5000_usd() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    handle_real_dispatch(&mut v, &tx1, TxType::OFFER_CREATE, None);
+    dispatch_with_pre_fee_balance(&mut v, &tx1, TxType::OFFER_CREATE);
     let tx2 = STTx::new(TxType::OFFER_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), b);
         tx.set_field_amount(sf("sfTakerPays"), iou(gw, u, 5000));
@@ -2376,7 +2389,7 @@ fn nfe5_cross_5000_usd() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx2, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut v, &tx2, TxType::OFFER_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -3109,7 +3122,7 @@ fn nfe8_10_sellers_cross() {
             tx.set_field_u32(sf("sfSequence"), 1);
         });
         assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None),
+            dispatch_with_pre_fee_balance(&mut v, &tx, TxType::OFFER_CREATE),
             Ter::TES_SUCCESS
         );
     }
@@ -3121,7 +3134,7 @@ fn nfe8_10_sellers_cross() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     assert_eq!(
-        handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None),
+        dispatch_with_pre_fee_balance(&mut v, &tx, TxType::OFFER_CREATE),
         Ter::TES_SUCCESS
     );
 }
@@ -3146,7 +3159,7 @@ fn nfe8_100_payments() {
             tx.set_field_u32(sf("sfSequence"), seq);
         });
         assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
+            dispatch_with_pre_fee_balance(&mut v, &tx, TxType::PAYMENT),
             Ter::TES_SUCCESS
         );
     }
@@ -3176,7 +3189,7 @@ fn nfe8_50_iou_payments() {
             tx.set_field_u32(sf("sfSequence"), seq);
         });
         assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
+            dispatch_with_pre_fee_balance(&mut v, &tx, TxType::PAYMENT),
             Ter::TES_SUCCESS
         );
     }
@@ -3239,7 +3252,7 @@ fn nfe8_100_offers() {
             tx.set_field_u32(sf("sfSequence"), seq);
         });
         assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None),
+            dispatch_with_pre_fee_balance(&mut v, &tx, TxType::OFFER_CREATE),
             Ter::TES_SUCCESS
         );
     }
@@ -3270,7 +3283,7 @@ fn nfe9_300_offers() {
             tx.set_field_u32(sf("sfSequence"), seq);
         });
         assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None),
+            dispatch_with_pre_fee_balance(&mut v, &tx, TxType::OFFER_CREATE),
             Ter::TES_SUCCESS
         );
     }
@@ -3296,7 +3309,7 @@ fn nfe9_300_payments() {
             tx.set_field_u32(sf("sfSequence"), seq);
         });
         assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
+            dispatch_with_pre_fee_balance(&mut v, &tx, TxType::PAYMENT),
             Ter::TES_SUCCESS
         );
     }
@@ -3326,7 +3339,7 @@ fn nfe9_200_iou() {
             tx.set_field_u32(sf("sfSequence"), seq);
         });
         assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
+            dispatch_with_pre_fee_balance(&mut v, &tx, TxType::PAYMENT),
             Ter::TES_SUCCESS
         );
     }

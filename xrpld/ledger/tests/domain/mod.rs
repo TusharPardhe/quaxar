@@ -12,6 +12,7 @@ mod ledger_to_json;
 mod local_txs;
 mod master;
 mod mptoken_helpers;
+mod nftoken_helpers;
 mod order_book_db;
 mod parity;
 mod permissioned_dex;

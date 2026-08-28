@@ -207,24 +207,28 @@ fn delegate_set_preclaim_account_target_and_delete_checks() {
     let missing_account = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
         account_exists: false,
         authorize_exists: true,
+        authorize_is_pseudo: false,
         permissions_empty: false,
         delegate_exists: true,
     });
     let missing_target = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
         account_exists: true,
         authorize_exists: false,
+        authorize_is_pseudo: false,
         permissions_empty: false,
         delegate_exists: true,
     });
     let existing_target = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
         account_exists: true,
         authorize_exists: true,
+        authorize_is_pseudo: false,
         permissions_empty: false,
         delegate_exists: false,
     });
     let missing_delete_entry = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
         account_exists: true,
         authorize_exists: true,
+        authorize_is_pseudo: false,
         permissions_empty: true,
         delegate_exists: false,
     });

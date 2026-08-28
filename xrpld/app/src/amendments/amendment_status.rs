@@ -652,7 +652,7 @@ fn default_known_amendments() -> Vec<KnownAmendment> {
             KnownAmendment::new(
                 registered.name,
                 feature_id(registered.name),
-                registered.supported,
+                protocol::registered_feature_supported(registered),
                 match registered.vote {
                     RegisteredFeatureVote::DefaultYes => AmendmentVote::Up,
                     RegisteredFeatureVote::DefaultNo => AmendmentVote::Down,

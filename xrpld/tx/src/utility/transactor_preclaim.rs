@@ -164,6 +164,11 @@ pub trait TransactorCheckFeeTx {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// AccountRoot-only test primitive. Production application code must use its
+/// ledger-aware FeePayer adapter so prefunded and co-signed sponsorship cannot
+/// be represented as an ordinary account balance accidentally.
+#[doc(hidden)]
+#[deprecated(note = "account-only fixture helper; production must use ledger-aware check_fee")]
 pub fn run_transactor_check_fee<
     Tx,
     AccountState,

@@ -23,9 +23,9 @@ use crate::{
     PermissionedDomainDeletePreclaimFacts, PermissionedDomainSetPreclaimFacts,
     XChainCreateBridgePreclaimFacts, XChainModifyBridgePreclaimFacts,
     run_credential_accept_preclaim, run_credential_create_preclaim, run_credential_delete_preclaim,
-    run_oracle_delete_preclaim, run_oracle_set_preclaim, run_permissioned_domain_delete_preclaim,
-    run_permissioned_domain_set_preclaim, run_xchain_create_bridge_preclaim,
-    run_xchain_modify_bridge_preclaim,
+    run_oracle_delete_preclaim, run_oracle_set_preclaim, run_oracle_set_preclaim_front,
+    run_permissioned_domain_delete_preclaim, run_permissioned_domain_set_preclaim,
+    run_xchain_create_bridge_preclaim, run_xchain_modify_bridge_preclaim,
 };
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -101,12 +101,8 @@ fn bridge_chain_for_door(
 }
 
 fn account_has_reserve<V: ReadView>(view: &V, account: &STLedgerEntry, adjustment: i8) -> bool {
-    let owner_count = i64::from(account.get_field_u32(sf("sfOwnerCount"))) + i64::from(adjustment);
-    let Ok(owner_count) = usize::try_from(owner_count) else {
-        return false;
-    };
     account.get_field_amount(sf("sfBalance")).xrp().drops()
-        >= view.fees().account_reserve(owner_count) as i64
+        >= ledger::effective_account_reserve(view.fees(), account, i32::from(adjustment), 0) as i64
 }
 
 struct OracleReserve<'a, V> {
@@ -155,10 +151,18 @@ fn preclaim_xchain_create_bridge<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter
 
     let source_chain = STXChainBridge::src_chain(account == bridge.locking_chain_door());
     let source_issue = bridge_issue(&bridge, source_chain);
-    let source_issuer = match source_issue {
+    let source_issuer = match &source_issue {
         Asset::Issue(issue) if !issue.native() => read_account(view, issue.account)?,
         _ => None,
     };
+    if matches!(&source_issue, Asset::Issue(issue) if !issue.native()) {
+        let Some(source_issuer) = source_issuer.as_ref() else {
+            return Ok(Ter::TEC_NO_ISSUER);
+        };
+        if source_issuer.is_flag(lsfAllowTrustLineClawback) {
+            return Ok(Ter::TEC_NO_PERMISSION);
+        }
+    }
     let account_entry = read_account(view, account)?;
 
     Ok(run_xchain_create_bridge_preclaim(
@@ -172,9 +176,8 @@ fn preclaim_xchain_create_bridge<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter
             },
             bridge_exists_on_locking: false,
             bridge_exists_on_issuing: false,
-            source_issue_issuer_exists: source_issuer.is_some(),
-            source_issue_allows_clawback: source_issuer
-                .is_some_and(|issuer| issuer.is_flag(lsfAllowTrustLineClawback)),
+            source_issue_issuer_exists: true,
+            source_issue_allows_clawback: false,
             account_exists: account_entry.is_some(),
             reserve_sufficient: account_entry
                 .as_ref()
@@ -364,6 +367,15 @@ fn preclaim_oracle_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let Some(setter) = read_account(view, account)? else {
         return Ok(Ter::TER_NO_ACCOUNT);
     };
+    let front = OracleSetPreclaimFrontFacts {
+        account_exists: true,
+        close_time_secs: u64::from(view.parent_close_time().as_seconds()),
+        last_update_time_secs: u64::from(tx.get_field_u32(sf("sfLastUpdateTime"))),
+    };
+    let front_result = run_oracle_set_preclaim_front(front);
+    if front_result != Ter::TES_SUCCESS {
+        return Ok(front_result);
+    }
     let oracle = view
         .read(protocol::oracle_keylet(
             Uint160::from_void(account.data()),
@@ -399,11 +411,7 @@ fn preclaim_oracle_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     };
     Ok(run_oracle_set_preclaim(
         OracleSetPreclaimFacts {
-            front: OracleSetPreclaimFrontFacts {
-                account_exists: true,
-                close_time_secs: u64::from(view.parent_close_time().as_seconds()),
-                last_update_time_secs: u64::from(tx.get_field_u32(sf("sfLastUpdateTime"))),
-            },
+            front,
             oracle_exists,
             tx_provider_present: tx_provider,
             tx_asset_class_present: tx_asset_class,
@@ -419,7 +427,9 @@ fn preclaim_oracle_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
 
 fn preclaim_oracle_delete<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
-    let account_exists = read_account(view, account)?.is_some();
+    if read_account(view, account)?.is_none() {
+        return Ok(Ter::TER_NO_ACCOUNT);
+    }
     let oracle = view
         .read(protocol::oracle_keylet(
             Uint160::from_void(account.data()),
@@ -427,7 +437,7 @@ fn preclaim_oracle_delete<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
         ))
         .map_err(|_| read_error())?;
     Ok(run_oracle_delete_preclaim(OracleDeletePreclaimFacts {
-        account_exists,
+        account_exists: true,
         oracle_exists: oracle.is_some(),
         tx_account_matches_owner: oracle
             .is_some_and(|entry| entry.get_account_id(sf("sfOwner")) == account),
@@ -441,14 +451,13 @@ fn preclaim_permissioned_domain_set<V: ReadView>(view: &V, tx: &STTx) -> Result<
     if read_account(view, account)?.is_none() {
         return Ok(Ter::TEF_INTERNAL);
     }
-    let issuers = tx
-        .get_field_array(sf("sfAcceptedCredentials"))
-        .iter()
-        .map(|credential| {
-            read_account(view, credential.get_account_id(sf("sfIssuer")))
-                .map(|entry| entry.is_some())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut issuers = Vec::new();
+    for credential in tx.get_field_array(sf("sfAcceptedCredentials")).iter() {
+        if read_account(view, credential.get_account_id(sf("sfIssuer")))?.is_none() {
+            return Ok(Ter::TEC_NO_ISSUER);
+        }
+        issuers.push(true);
+    }
     let domain_id_present = tx.is_field_present(sf("sfDomainID"));
     let domain = if domain_id_present {
         Some(
@@ -500,12 +509,24 @@ fn credential_keylet(tx: &STTx, subject: AccountID, issuer: AccountID) -> protoc
 fn preclaim_credential_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let subject = tx.get_account_id(sf("sfSubject"));
     let issuer = tx.get_account_id(sf("sfAccount"));
+    // CredentialCreate reads the subject first, then the credential key, and
+    // only then applies fixCleanup3_3_0's pseudo-account prohibition.
+    let Some(subject_sle) = read_account(view, subject)? else {
+        return Ok(Ter::TEC_NO_TARGET);
+    };
+    let credential_exists = view
+        .exists(credential_keylet(tx, subject, issuer))
+        .map_err(|_| read_error())?;
     Ok(run_credential_create_preclaim(
         CredentialCreatePreclaimFacts {
-            subject_exists: read_account(view, subject)?.is_some(),
-            credential_exists: view
-                .exists(credential_keylet(tx, subject, issuer))
-                .map_err(|_| read_error())?,
+            subject_exists: true,
+            credential_exists,
+            reject_pseudo_subject: view.rules().enabled(&protocol::fix_cleanup_3_3_0()),
+            subject_is_pseudo_account: {
+                ["sfAMMID", "sfVaultID", "sfLoanBrokerID"]
+                    .into_iter()
+                    .any(|field| subject_sle.is_field_present(sf(field)))
+            },
         },
     ))
 }
@@ -586,7 +607,7 @@ pub fn run_bridge_domain_read_view_preclaim<V: ReadView>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     use super::run_bridge_domain_read_view_preclaim;
@@ -594,13 +615,15 @@ mod tests {
     use ledger::{Fees, LedgerHeader, ReadView, ReadViewTx, Rules, ViewError};
     use protocol::{
         AccountID, LedgerEntryType, STAmount, STLedgerEntry, STTx, STXChainBridge, Ter, TxType,
-        XRPAmount, get_field_by_symbol, xrp_issue,
+        XRPAmount, get_field_by_symbol, lsfAllowTrustLineClawback, xrp_issue,
     };
 
     #[derive(Debug, Default)]
     struct View {
         entries: BTreeMap<Uint256, Arc<STLedgerEntry>>,
+        fail_reads: BTreeSet<Uint256>,
         header: LedgerHeader,
+        rules: Rules,
     }
 
     impl View {
@@ -620,9 +643,12 @@ mod tests {
             Fees::default()
         }
         fn rules(&self) -> Rules {
-            Rules::default()
+            self.rules.clone()
         }
         fn exists(&self, keylet: protocol::Keylet) -> Result<bool, ViewError> {
+            if self.fail_reads.contains(&keylet.key) {
+                return Err(ViewError::Conversion("fault-injected exists".into()));
+            }
             Ok(self.entries.contains_key(&keylet.key))
         }
         fn succ(
@@ -633,6 +659,9 @@ mod tests {
             Ok(None)
         }
         fn read(&self, keylet: protocol::Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
+            if self.fail_reads.contains(&keylet.key) {
+                return Err(ViewError::Conversion("fault-injected read".into()));
+            }
             Ok(self.entries.get(&keylet.key).cloned())
         }
         fn sles(&self) -> Result<Vec<Arc<STLedgerEntry>>, ViewError> {
@@ -674,6 +703,15 @@ mod tests {
 
     fn bridge() -> STXChainBridge {
         STXChainBridge::from_parts(account(1), xrp_issue(), account(2), xrp_issue())
+    }
+
+    fn iou_bridge(issuer: AccountID) -> STXChainBridge {
+        STXChainBridge::from_parts(
+            account(1),
+            protocol::Issue::new(protocol::Currency::from_u64(1), issuer),
+            account(2),
+            protocol::Issue::new(protocol::Currency::from_u64(2), account(2)),
+        )
     }
 
     fn xchain_tx(txn_type: TxType) -> STTx {
@@ -738,6 +776,89 @@ mod tests {
     }
 
     #[test]
+    fn create_bridge_issuer_results_precede_the_source_account_read() {
+        // Make the submitting account the locking door so `issuer` below is
+        // the issuer of the selected source-chain issue.
+        let source = account(1);
+        let issuer = account(4);
+        let source_key = protocol::account_keylet(Uint160::from_void(source.data())).key;
+        let mut view = View::default();
+        view.fail_reads.insert(source_key);
+        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |tx| {
+            tx.set_account_id(sf("sfAccount"), source);
+            tx.set_field_xchain_bridge(sf("sfXChainBridge"), iou_bridge(issuer));
+            tx.set_field_amount(
+                sf("sfSignatureReward"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(0)),
+            );
+        });
+
+        assert_eq!(
+            run_bridge_domain_read_view_preclaim(&view, &tx, TxType::XCHAIN_CREATE_BRIDGE),
+            Some(Ter::TEC_NO_ISSUER),
+            "pinned preclaim returns the missing issuer before reading the source account"
+        );
+
+        let mut clawback_issuer = account_entry(issuer);
+        clawback_issuer.set_field_u32(sf("sfFlags"), lsfAllowTrustLineClawback);
+        view.insert(clawback_issuer);
+        assert_eq!(
+            run_bridge_domain_read_view_preclaim(&view, &tx, TxType::XCHAIN_CREATE_BRIDGE),
+            Some(Ter::TEC_NO_PERMISSION),
+            "the issuer clawback prohibition also precedes the source account read"
+        );
+    }
+
+    #[test]
+    fn credential_create_preserves_subject_duplicate_and_pseudo_order() {
+        let issuer = account(1);
+        let subject = account(2);
+        let credential_type = vec![0x41];
+        let tx = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), issuer);
+            tx.set_account_id(sf("sfSubject"), subject);
+            tx.set_field_vl(sf("sfCredentialType"), &credential_type);
+        });
+        let credential_key = protocol::credential_keylet(
+            Uint160::from_void(subject.data()),
+            Uint160::from_void(issuer.data()),
+            &credential_type,
+        )
+        .key;
+        let mut missing = View::default();
+        missing.fail_reads.insert(credential_key);
+        assert_eq!(
+            run_bridge_domain_read_view_preclaim(&missing, &tx, TxType::CREDENTIAL_CREATE),
+            Some(Ter::TEC_NO_TARGET),
+            "missing subject must short-circuit before credential existence"
+        );
+
+        let mut pseudo = View {
+            rules: Rules::new([protocol::fix_cleanup_3_3_0()]),
+            ..View::default()
+        };
+        let mut subject_root = account_entry(subject);
+        subject_root.set_field_h256(sf("sfAMMID"), Uint256::from_u64(7));
+        pseudo.insert(subject_root);
+        assert_eq!(
+            run_bridge_domain_read_view_preclaim(&pseudo, &tx, TxType::CREDENTIAL_CREATE),
+            Some(Ter::TEC_PSEUDO_ACCOUNT)
+        );
+
+        let mut credential =
+            STLedgerEntry::from_type_and_key(LedgerEntryType::Credential, credential_key);
+        credential.set_account_id(sf("sfSubject"), subject);
+        credential.set_account_id(sf("sfIssuer"), issuer);
+        credential.set_field_vl(sf("sfCredentialType"), &credential_type);
+        pseudo.insert(credential);
+        assert_eq!(
+            run_bridge_domain_read_view_preclaim(&pseudo, &tx, TxType::CREDENTIAL_CREATE),
+            Some(Ter::TEC_DUPLICATE),
+            "duplicate precedes the pseudo-account prohibition"
+        );
+    }
+
+    #[test]
     fn xchain_commit_preserves_self_commit_before_transfer_issue_check() {
         let bridge = bridge();
         let mut view = View::default();
@@ -778,6 +899,33 @@ mod tests {
         assert_eq!(
             run_bridge_domain_read_view_preclaim(&view, &oracle, TxType::ORACLE_SET),
             Some(Ter::TER_NO_ACCOUNT)
+        );
+        let mut oracle_set_front = View::default();
+        oracle_set_front.insert(account_entry(account(4)));
+        oracle_set_front
+            .fail_reads
+            .insert(protocol::oracle_keylet(Uint160::from_void(account(4).data()), 1).key);
+        assert_eq!(
+            run_bridge_domain_read_view_preclaim(&oracle_set_front, &oracle, TxType::ORACLE_SET,),
+            Some(Ter::TEC_INVALID_UPDATE_TIME),
+            "invalid update time precedes the oracle-object read"
+        );
+        let oracle_delete = STTx::new(TxType::ORACLE_DELETE, |tx| {
+            tx.set_account_id(sf("sfAccount"), account(4));
+            tx.set_field_u32(sf("sfOracleDocumentID"), 1);
+        });
+        let mut oracle_fault = View::default();
+        oracle_fault
+            .fail_reads
+            .insert(protocol::oracle_keylet(Uint160::from_void(account(4).data()), 1).key);
+        assert_eq!(
+            run_bridge_domain_read_view_preclaim(
+                &oracle_fault,
+                &oracle_delete,
+                TxType::ORACLE_DELETE,
+            ),
+            Some(Ter::TER_NO_ACCOUNT),
+            "missing owner precedes the oracle-object read"
         );
 
         let domain = STTx::new(TxType::PERMISSIONED_DOMAIN_DELETE, |tx| {
@@ -820,6 +968,35 @@ mod tests {
         assert_eq!(
             run_bridge_domain_read_view_preclaim(&view, &tx, TxType::PERMISSIONED_DOMAIN_SET),
             Some(Ter::TEF_INTERNAL)
+        );
+
+        let owner = account(6);
+        let first_missing = account(7);
+        let later_fault = account(8);
+        let mut staged = View::default();
+        staged.insert(account_entry(owner));
+        staged
+            .fail_reads
+            .insert(protocol::account_keylet(Uint160::from_void(later_fault.data())).key);
+        let ordered = STTx::new(TxType::PERMISSIONED_DOMAIN_SET, |tx| {
+            tx.set_account_id(sf("sfAccount"), owner);
+            let mut credentials = protocol::STArray::new(sf("sfAcceptedCredentials"));
+            for issuer in [first_missing, later_fault] {
+                let mut credential = protocol::STObject::make_inner_object(sf("sfCredential"));
+                credential.set_account_id(sf("sfIssuer"), issuer);
+                credential.set_field_vl(sf("sfCredentialType"), b"kyc");
+                credentials.push_back(credential);
+            }
+            tx.set_field_array(sf("sfAcceptedCredentials"), credentials);
+        });
+        assert_eq!(
+            run_bridge_domain_read_view_preclaim(
+                &staged,
+                &ordered,
+                TxType::PERMISSIONED_DOMAIN_SET,
+            ),
+            Some(Ter::TEC_NO_ISSUER),
+            "the first missing issuer short-circuits later issuer storage faults"
         );
     }
 }

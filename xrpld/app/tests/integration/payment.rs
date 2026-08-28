@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use app::state::transactor_dispatcher::handle_real_dispatch;
+use app::state::transactor_dispatcher::handle_real_dispatch as production_handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{
@@ -22,6 +22,28 @@ use super::pipeline::full_apply;
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
+}
+
+// These fixtures intentionally exercise the handler without the generic
+// fee/sequence shell. Production nevertheless captures the source balance
+// before fee payment, so supply that same snapshot for Payment/Offer routes.
+fn handle_real_dispatch<V: ApplyView>(
+    view: &mut V,
+    tx: &STTx,
+    tx_type: TxType,
+    pre_fee_balance: Option<i64>,
+) -> Ter {
+    let pre_fee_balance =
+        if pre_fee_balance.is_none() && matches!(tx_type, TxType::PAYMENT | TxType::OFFER_CREATE) {
+            let account = tx.get_account_id(sf("sfAccount"));
+            match view.read(account_keylet(Uint160::from_void(account.data()))) {
+                Ok(Some(sle)) => Some(sle.get_field_amount(sf("sfBalance")).xrp().drops()),
+                Ok(None) | Err(_) => None,
+            }
+        } else {
+            pre_fee_balance
+        };
+    production_handle_real_dispatch(view, tx, tx_type, pre_fee_balance)
 }
 
 fn payment_tx(from: AccountID, to: AccountID, amount: STAmount, seq: u32) -> STTx {
@@ -149,6 +171,66 @@ fn payment_xrp_to_iou_partial_self_payment_with_3300_xrp_sendmax() {
     assert_eq!(
         offer.get_field_amount(sf("sfTakerGets")),
         iou(issuer, usd, 500)
+    );
+}
+
+#[test]
+fn payment_xrp_to_iou_partial_self_payment_preserves_strict_offer_remainder() {
+    let taker = acct(0x11);
+    let maker = acct(0x22);
+    let issuer = acct(0x33);
+    let usd = usd_currency();
+    let offered = STAmount::from_iou_amount(
+        sf_generic(),
+        IOUAmount::from_parts(9_950_000_000_000_001, -14).expect("99.50000000000001 USD"),
+        Issue::new(usd, issuer),
+    );
+    let mut ledger = build_ledger(vec![
+        account_root(taker, 118_260_767, 3, 0),
+        account_root(maker, 81_597_975, 6, 0),
+        account_root(issuer, 10_000_000_000, 0, 0),
+        trust_line(taker, issuer, usd, 100, 1_000_000_000, 0),
+        trust_line(maker, issuer, usd, 1_130, 1_000_000, 0),
+    ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+        "fixReducedOffersV2",
+    )]));
+    let mut view = new_view(ledger);
+
+    let offer = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), maker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(50_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), offered.clone());
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &offer, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    let payment = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_account_id(sf("sfDestination"), taker);
+        tx.set_field_amount(sf("sfAmount"), iou(issuer, usd, 1_000_000_000));
+        tx.set_field_amount(sf("sfSendMax"), xrp(25_000_000));
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfFlags"), 0x0002_0000);
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        full_apply(&mut view, &payment, TxType::PAYMENT),
+        Ter::TES_SUCCESS
+    );
+    let offer = view
+        .read(protocol::offer_keylet(acct_id(maker), 1))
+        .expect("offer read")
+        .expect("half-consumed offer remains");
+    assert_eq!(offer.get_field_amount(sf("sfTakerPays")), xrp(25_000_000));
+    assert_eq!(
+        offer.get_field_amount(sf("sfTakerGets")).iou().to_string(),
+        "49.75000000000002"
     );
 }
 
@@ -280,6 +362,63 @@ fn payment_iou_with_transfer_rate() {
     let tx = payment_tx_with_sendmax(alice, bob, iou(gw, usd, 100), iou(gw, usd, 200), 1);
     let result = handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None);
     assert_eq!(result, Ter::TES_SUCCESS);
+    let alice_line = view
+        .read(protocol::line(alice, gw, usd))
+        .expect("alice line read")
+        .expect("alice line remains");
+    let bob_line = view
+        .read(protocol::line(bob, gw, usd))
+        .expect("bob line read")
+        .expect("bob line remains");
+    assert_eq!(
+        alice_line.get_field_amount(sf("sfBalance")).iou(),
+        IOUAmount::from_parts(880, 0).expect("alice pays amount plus transfer fee")
+    );
+    assert_eq!(
+        bob_line.get_field_amount(sf("sfBalance")).iou(),
+        IOUAmount::from_parts(100, 0).expect("bob receives requested amount")
+    );
+}
+
+/// rippled DirectStep: returning an issued asset to its issuer is a
+/// redemption, not a third-party transfer, so the issuer's transfer rate is
+/// never charged. Cover both low/high trust-line account orientations.
+#[test]
+fn payment_iou_issuer_redemption_waives_transfer_rate() {
+    let usd = usd_currency();
+
+    for (holder, issuer) in [(acct(0x11), acct(0x33)), (acct(0x33), acct(0x11))] {
+        let mut issuer_root = account_root(issuer, 5_000_000_000, 0, 0);
+        issuer_root.set_field_u32(sf("sfTransferRate"), 1_200_000_000);
+        let holder_is_low = holder < issuer;
+        let line = if holder_is_low {
+            trust_line(holder, issuer, usd, 1_000, 10_000, 0)
+        } else {
+            trust_line(issuer, holder, usd, -1_000, 0, 10_000)
+        };
+        let ledger = build_ledger(vec![
+            account_root(holder, 5_000_000_000, 1, 0),
+            issuer_root,
+            line,
+        ]);
+        let mut view = new_view(ledger);
+
+        let tx = payment_tx(holder, issuer, iou(issuer, usd, 100), 1);
+        assert_eq!(
+            handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None),
+            Ter::TES_SUCCESS,
+            "issuer redemption must be transfer-rate free for holder={holder} issuer={issuer}"
+        );
+        let line_after = view
+            .read(protocol::line(holder, issuer, usd))
+            .expect("redemption trust line read")
+            .expect("redemption trust line remains");
+        assert_eq!(
+            line_after.get_field_amount(sf("sfBalance")).iou(),
+            IOUAmount::from_parts(if holder_is_low { 900 } else { -900 }, 0)
+                .expect("post-redemption balance"),
+        );
+    }
 }
 
 /// C++ Flow_test — IOU payment to frozen destination fails.

@@ -217,7 +217,6 @@ pub struct TrustSetPreclaimFacts {
     pub destination_exists: bool,
     pub amm_or_single_asset_vault_enabled: bool,
     pub destination_account_flags: u32,
-    pub fix_disallow_incoming_v1_enabled: bool,
     pub trustline_exists: bool,
     pub destination_is_pseudo_account: bool,
     pub pseudo_destination_is_amm: bool,
@@ -253,7 +252,7 @@ pub fn run_trust_set_preclaim_with_facts(facts: TrustSetPreclaimFacts) -> Ter {
     }
 
     if (facts.destination_account_flags & lsfDisallowIncomingTrustline) != 0 {
-        if !(facts.fix_disallow_incoming_v1_enabled && facts.trustline_exists) {
+        if !facts.trustline_exists {
             return Ter::TEC_NO_PERMISSION;
         }
     }

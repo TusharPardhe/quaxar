@@ -575,7 +575,9 @@ fn nftoken_brokered_accept_pays_broker_before_seller() {
     );
     let token_id = get_token_id(&view, seller, &mint);
 
-    let sell = create_sell_offer_tx(seller, token_id, 1_000_000, 2);
+    // rippled requires the sell amount to fit inside the buy amount after
+    // subtracting the broker fee: 900,000 <= 1,000,000 - 100,000.
+    let sell = create_sell_offer_tx(seller, token_id, 900_000, 2);
     assert_eq!(
         full_apply(&mut view, &sell, TxType::NFTOKEN_CREATE_OFFER),
         Ter::TES_SUCCESS

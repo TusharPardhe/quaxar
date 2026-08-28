@@ -144,7 +144,11 @@ impl TestEnv {
             .read(keylet)
             .ok()
             .flatten()
-            .map(|sle| sle.get_field_amount(get_field_by_symbol("sfBalance")).xrp().drops())
+            .map(|sle| {
+                sle.get_field_amount(get_field_by_symbol("sfBalance"))
+                    .xrp()
+                    .drops()
+            })
             .unwrap_or(0)
     }
 

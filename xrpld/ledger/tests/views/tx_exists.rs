@@ -1,6 +1,6 @@
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::make_shared_intrusive;
-use ledger::{Ledger, LedgerHeader};
+use ledger::{Ledger, LedgerHeader, ReadView};
 use shamap::item::SHAMapItem;
 use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
@@ -110,6 +110,10 @@ fn ledger_tx_exists_does_not_need_fetch_for_missing_child_paths() {
     assert!(
         ledger.try_tx_exists(missing_key).is_err(),
         "consensus admission must distinguish an unreadable backed branch from a missing transaction"
+    );
+    assert!(
+        ReadView::tx_exists(&ledger, missing_key).is_err(),
+        "the fallible ReadView seam must preserve transaction-map traversal failure"
     );
     assert!(
         !ledger.tx_exists(missing_key),

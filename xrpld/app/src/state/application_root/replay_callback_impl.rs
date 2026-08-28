@@ -25,6 +25,7 @@ use shamap::{
     proof_path::verify_proof_path,
     tree_node::{SHAMapNodeType, SHAMapTreeNode},
 };
+use xrpl_core::NetworkIDService;
 
 use super::ApplicationRoot;
 
@@ -303,7 +304,12 @@ impl ApplicationRoot {
                 replayer.got_replay_delta_with_rules(info, ordered_txs, rules);
                 replayer.advance_ready_tasks(
                     &mut |hash, _seq| self.resolve_ledger_by_hash(SHAMapHash::new(hash)),
-                    &mut |replay| crate::build_ledger_from_replay_delta(replay),
+                    &mut |replay| {
+                        crate::build_ledger_from_replay_delta_with_network_id(
+                            replay,
+                            self.registry.network_id_service.get_network_id(),
+                        )
+                    },
                     &mut |hash, seq, _reason| {
                         if let Some(runtime) = self.ledger_master_runtime()
                             && let Ok(guard) = runtime.inbound_ledgers.lock()

@@ -108,7 +108,11 @@ pub trait ReadView: Send + Sync + std::fmt::Debug {
         STAmount::from_mpt_amount(sf_generic(), MPTAmount::from_value(amount), issue)
     }
 
-    fn owner_count_hook(&self, _account: AccountID, count: u32) -> u32 {
+    fn owner_count_hook(
+        &self,
+        _account: AccountID,
+        count: crate::OwnerCounts,
+    ) -> crate::OwnerCounts {
         count
     }
 }
@@ -187,7 +191,7 @@ impl ReadView for Ledger {
     }
 
     fn tx_exists(&self, key: Uint256) -> Result<bool, ViewError> {
-        Ok(self.tx_exists(key))
+        self.try_tx_exists(key).map_err(ViewError::from)
     }
 
     fn tx_read(&self, key: Uint256) -> Result<Option<ReadViewTx>, ViewError> {

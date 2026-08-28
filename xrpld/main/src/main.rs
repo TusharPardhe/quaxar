@@ -259,7 +259,25 @@ fn peerfinder_outbound_target(peer_limit: usize, want_incoming: bool) -> usize {
 /// Server-startup flags that consume the following argument. Keep this list
 /// aligned with `parse_bootstrap_args`: top-level CLI parsing uses it only to
 /// avoid treating a startup flag's value as an RPC subcommand.
-const STARTUP_VALUE_FLAGS: &[&str] = &["--conf", "-c", "--rpc-url", "--quorum"];
+const STARTUP_VALUE_FLAGS: &[&str] = &[
+    "--conf",
+    "-c",
+    "--rpc-url",
+    "--quorum",
+    "--nodeid",
+    "--force_ledger_present_range",
+    "--ledger",
+    "--ledgerfile",
+    "--trap_tx_hash",
+    "--rpc_ip",
+    "--rpc_port",
+    "--unittest",
+    "-u",
+    "--unittest-arg",
+    "--unittest-jobs",
+    "--io-threads",
+    "--job-queue-threads",
+];
 
 /// Try to parse CLI subcommands. Returns Some(ExitCode) if a subcommand was
 /// handled, None if the node should start normally.

@@ -766,15 +766,20 @@ pub struct SubmitSource;
 
 struct OracleSetReserveSink {
     balance_drops: i64,
-    owner_count: u32,
+    effective_owner_count: u32,
+    effective_account_count: u32,
     fees: ledger::Fees,
 }
 
 impl tx::OracleSetReserveSink for OracleSetReserveSink {
     fn is_reserve_sufficient(&mut self, adjust_reserve: i8) -> bool {
-        let owner_count = i64::from(self.owner_count) + i64::from(adjust_reserve);
+        let owner_count = i64::from(self.effective_owner_count) + i64::from(adjust_reserve);
         owner_count >= 0
-            && self.balance_drops >= self.fees.account_reserve(owner_count as usize) as i64
+            && self.balance_drops
+                >= self.fees.account_reserve_with_account_count(
+                    owner_count as usize,
+                    self.effective_account_count as usize,
+                ) as i64
     }
 }
 
@@ -841,7 +846,8 @@ fn run_oracle_set_preclaim_with_ledger(st_tx: &STTx, ledger: &Ledger) -> Ter {
             .get_field_amount(get_field_by_symbol("sfBalance"))
             .xrp()
             .drops(),
-        owner_count: account_sle.get_field_u32(get_field_by_symbol("sfOwnerCount")),
+        effective_owner_count: ledger::reserve_owner_count(&account_sle, 0),
+        effective_account_count: ledger::reserve_account_count(&account_sle, 0),
         fees: ledger.fees(),
     };
     tx::run_oracle_set_preclaim(facts, &mut reserve_sink)
@@ -1060,7 +1066,7 @@ fn xchain_add_claim_attestation_preflight(st_tx: &STTx) -> Ter {
     }
 
     let bridge = st_tx.get_field_xchain_bridge(bridge_field);
-    let attestation = protocol::attestations::AttestationClaim::from_st_object(st_tx);
+    let attestation = protocol::attestations::AttestationClaim::from_transaction_st_object(st_tx);
     if !attestation.valid_amounts() || !attestation.verify(&bridge) {
         return Ter::TEM_XCHAIN_BAD_PROOF;
     }
@@ -1092,7 +1098,8 @@ fn xchain_add_account_create_attestation_preflight(st_tx: &STTx) -> Ter {
     }
 
     let bridge = st_tx.get_field_xchain_bridge(bridge_field);
-    let attestation = protocol::attestations::AttestationCreateAccount::from_st_object(st_tx);
+    let attestation =
+        protocol::attestations::AttestationCreateAccount::from_transaction_st_object(st_tx);
     if !attestation.valid_amounts() || !attestation.verify(&bridge) {
         return Ter::TEM_XCHAIN_BAD_PROOF;
     }
@@ -1436,14 +1443,16 @@ fn submit_semantic_preflight_with_ledger(
             Ter::TES_SUCCESS
         }
         TxType::CHECK_CANCEL => {
-            let preflight = tx::run_check_cancel_preflight();
-            if preflight != Ter::TES_SUCCESS {
-                return preflight;
-            }
-
             let check_id_field = get_field_by_symbol("sfCheckID");
             if !st_tx.is_field_present(check_id_field) {
                 return Ter::TEM_MALFORMED;
+            }
+            let preflight = tx::run_check_cancel_preflight(
+                rules.enabled(&protocol::fix_cleanup_3_3_0()),
+                st_tx.get_field_h256(check_id_field).is_zero(),
+            );
+            if preflight != Ter::TES_SUCCESS {
+                return preflight;
             }
 
             // See CheckCash above: use the transactor's current-open preclaim
@@ -2027,6 +2036,10 @@ fn submit_semantic_preflight_with_ledger(
                 let issuance_id = st_tx.get_field_h192(issuance_id_field);
                 let issuance =
                     ledger_read_keylet(ledger, mpt_issuance_keylet_from_mptid(issuance_id));
+                let account_token = ledger_read_keylet(
+                    ledger,
+                    mptoken_keylet_from_mptid(issuance_id, account_to_uint160(account)),
+                );
                 let issuer_field = get_field_by_symbol("sfIssuer");
                 let flags_field = get_field_by_symbol("sfFlags");
                 let holder_token_exists = holder.is_some_and(|h| {
@@ -2038,16 +2051,28 @@ fn submit_semantic_preflight_with_ledger(
                 let preclaim =
                     tx::run_mp_token_authorize_preclaim(tx::MPTokenAuthorizePreclaimFacts {
                         holder_present: holder.is_some(),
-                        account_token_exists: ledger_keylet_exists(
-                            ledger,
-                            mptoken_keylet_from_mptid(issuance_id, account_to_uint160(account)),
-                        ),
+                        account_token_exists: account_token.is_some(),
                         tx_flags: st_tx.get_flags(),
                         token_balance_is_zero: true,
                         token_locked_amount_is_zero: true,
                         issuance_exists: issuance.is_some(),
                         single_asset_vault_enabled: rules.enabled(&feature_single_asset_vault()),
                         token_locked: false,
+                        confidential_transfer_enabled: rules
+                            .enabled(&protocol::feature_confidential_transfer()),
+                        confidential_outstanding_nonzero: issuance.as_ref().is_some_and(|sle| {
+                            sle.is_field_present(get_field_by_symbol(
+                                "sfConfidentialOutstandingAmount",
+                            )) && sle.get_field_u64(get_field_by_symbol(
+                                "sfConfidentialOutstandingAmount",
+                            )) != 0
+                        }),
+                        token_has_confidential_balance: account_token.as_ref().is_some_and(|sle| {
+                            sle.is_field_present(get_field_by_symbol("sfConfidentialBalanceInbox"))
+                                || sle.is_field_present(get_field_by_symbol(
+                                    "sfConfidentialBalanceSpending",
+                                ))
+                        }),
                         account_is_issuer: issuance
                             .as_ref()
                             .map(|sle| {
@@ -2097,21 +2122,24 @@ fn submit_semantic_preflight_with_ledger(
             let domain_id_field = get_field_by_symbol("sfDomainID");
             let metadata_field = get_field_by_symbol("sfMPTokenMetadata");
             let transfer_fee_field = get_field_by_symbol("sfTransferFee");
-            let mutable_flags_field = get_field_by_symbol("sfMutableFlags");
+            let immutable_flags_field = get_field_by_symbol("sfImmutableFlags");
             let tx_flags = st_tx.get_flags();
-            let mutable_flags = st_tx
-                .is_field_present(mutable_flags_field)
-                .then(|| st_tx.get_field_u32(mutable_flags_field));
+            let immutable_flags = st_tx
+                .is_field_present(immutable_flags_field)
+                .then(|| st_tx.get_field_u32(immutable_flags_field));
+            let has_encryption_key = st_tx
+                .is_field_present(get_field_by_symbol("sfIssuerEncryptionKey"))
+                || st_tx.is_field_present(get_field_by_symbol("sfAuditorEncryptionKey"));
             tx::run_mp_token_issuance_set_preflight(tx::MPTokenIssuanceSetPreflightFacts {
                 dynamic_mpt_enabled: true,
                 single_asset_vault_enabled: rules.enabled(&feature_single_asset_vault()),
-                domain_id_present: st_tx.is_field_present(domain_id_field),
+                domain_id_present: st_tx.is_field_present(domain_id_field) || has_encryption_key,
                 holder_present: st_tx.is_field_present(holder_field),
                 account_equals_holder: st_tx.is_field_present(holder_field)
                     && st_tx.get_account_id(holder_field)
                         == st_tx.get_account_id(get_field_by_symbol("sfAccount")),
                 tx_flags,
-                mutable_flags,
+                mutable_flags: immutable_flags,
                 metadata_len: st_tx
                     .is_field_present(metadata_field)
                     .then(|| st_tx.get_field_vl(metadata_field).len()),
@@ -2128,6 +2156,9 @@ fn submit_semantic_preflight_with_ledger(
             let assets_maximum_field = get_field_by_symbol("sfAssetsMaximum");
             let mptoken_metadata_field = get_field_by_symbol("sfMPTokenMetadata");
             let scale_field = get_field_by_symbol("sfScale");
+            let vault_kind_field = get_field_by_symbol("sfVaultKind");
+            let subscription_date_field = get_field_by_symbol("sfSubscriptionDate");
+            let redemption_date_field = get_field_by_symbol("sfRedemptionDate");
             if !st_tx.is_field_present(asset_field) {
                 return Ter::TEM_MALFORMED;
             }
@@ -2153,6 +2184,17 @@ fn submit_semantic_preflight_with_ledger(
                     .then(|| st_tx.get_field_u8(scale_field)),
                 asset_is_mpt: matches!(asset, Asset::MPTIssue(_)),
                 asset_is_native: asset.native(),
+                lending_protocol_v1_1_enabled: rules
+                    .enabled(&protocol::feature_id("LendingProtocolV1_1")),
+                vault_kind: st_tx
+                    .is_field_present(vault_kind_field)
+                    .then(|| st_tx.get_field_u8(vault_kind_field)),
+                subscription_date: st_tx
+                    .is_field_present(subscription_date_field)
+                    .then(|| st_tx.get_field_u32(subscription_date_field)),
+                redemption_date: st_tx
+                    .is_field_present(redemption_date_field)
+                    .then(|| st_tx.get_field_u32(redemption_date_field)),
             });
             if preflight != Ter::TES_SUCCESS {
                 return preflight;
@@ -2529,7 +2571,25 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
         }
     }
 
-    tracing::info!(target: "rpc", tx_hash = %st_tx.get_transaction_id(), "Transaction submitted via RPC");
+    // `accepted` is rippled's broad submit-result flag: a locally kept
+    // transaction can set it even when it was neither applied nor relayed.
+    // Keep all of the admission outcomes in the journal so operators do not
+    // mistake a held/failed transaction for a peer-relay failure.
+    let submit_result = transaction
+        .lock()
+        .expect("transaction mutex must not be poisoned")
+        .get_submit_result();
+    tracing::info!(
+        target: "rpc",
+        tx_hash = %st_tx.get_transaction_id(),
+        result = %trans_token(result),
+        accepted = submit_result.any(),
+        applied = submit_result.applied,
+        broadcast = submit_result.broadcast,
+        queued = submit_result.queued,
+        kept = submit_result.kept,
+        "RPC transaction submission completed"
+    );
 
     // In standalone mode, submit immediately closes the ledger
     // so that subsequent RPC calls (account_info, etc.) see the state changes.

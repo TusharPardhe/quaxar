@@ -326,7 +326,7 @@ fn account_set_preflight_rejects_current_ticksize_domain_and_message_key_failure
         ..AccountSetPreflightFacts::default()
     });
     let too_large_tick = run_account_set_preflight(AccountSetPreflightFacts {
-        tick_size: Some(16),
+        tick_size: Some(17),
         ..AccountSetPreflightFacts::default()
     });
     let bad_key = run_account_set_preflight(AccountSetPreflightFacts {
@@ -649,7 +649,7 @@ fn account_set_do_apply_tail_preserves_field_set_and_clear_rules() {
         nftoken_minter: Some("bob"),
         set_flag: ASF_AUTHORIZED_NFTOKEN_MINTER,
         quality_one: 1_000_000_000,
-        max_tick_size: 15,
+        max_tick_size: 16,
         ..AccountSetDoApplyTailFacts::default()
     });
     let cleared = run_account_set_do_apply_tail(AccountSetDoApplyTailFacts::<&'static str> {
@@ -658,11 +658,11 @@ fn account_set_do_apply_tail_preserves_field_set_and_clear_rules() {
         message_key: Some(Vec::new()),
         domain: Some(Vec::new()),
         transfer_rate: Some(1_000_000_000),
-        tick_size: Some(15),
+        tick_size: Some(16),
         clear_flag: ASF_AUTHORIZED_NFTOKEN_MINTER,
         nftoken_minter_present_on_account: true,
         quality_one: 1_000_000_000,
-        max_tick_size: 15,
+        max_tick_size: 16,
         ..AccountSetDoApplyTailFacts::default()
     });
 

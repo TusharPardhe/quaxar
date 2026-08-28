@@ -28,6 +28,7 @@ pub const FIX_AMMV1_1_NAME: &str = "fixAMMv1_1";
 pub const FIX_AMMV1_3_NAME: &str = "fixAMMv1_3";
 pub const FIX_CLEANUP_3_2_0_NAME: &str = "fixCleanup3_2_0";
 pub const FIX_CLEANUP_3_3_0_NAME: &str = "fixCleanup3_3_0";
+pub const FIX_CLEANUP_3_4_0_NAME: &str = "fixCleanup3_4_0";
 pub const FIX_MPT_DELIVERED_AMOUNT_NAME: &str = "fixMPTDeliveredAmount";
 pub const FEATURE_SPONSOR_NAME: &str = "Sponsor";
 
@@ -55,6 +56,26 @@ impl RegisteredFeature {
     }
 }
 
+/// Returns effective support after applying runtime capability requirements.
+/// ConfidentialTransfer is consensus-safe only when the official, ABI-tested
+/// mpt-crypto implementation is available; every other amendment follows its
+/// static registry declaration.
+pub fn registered_feature_supported(feature: &RegisteredFeature) -> bool {
+    if !feature.supported {
+        return false;
+    }
+    feature.name != FEATURE_CONFIDENTIAL_TRANSFER_NAME
+        || crate::confidential_transfer::confidential_crypto_available()
+}
+
+pub fn registered_feature_supported_with_confidential_crypto(
+    feature: &RegisteredFeature,
+    confidential_crypto_available: bool,
+) -> bool {
+    feature.supported
+        && (feature.name != FEATURE_CONFIDENTIAL_TRANSFER_NAME || confidential_crypto_available)
+}
+
 pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new(
         FEATURE_BATCH_V1_1_NAME,
@@ -78,6 +99,11 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     RegisteredFeature::new(
         FIX_CLEANUP_3_3_0_NAME,
+        true,
+        RegisteredFeatureVote::DefaultNo,
+    ),
+    RegisteredFeature::new(
+        FIX_CLEANUP_3_4_0_NAME,
         true,
         RegisteredFeatureVote::DefaultNo,
     ),
@@ -209,7 +235,7 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
         true,
         RegisteredFeatureVote::DefaultYes,
     ),
-    RegisteredFeature::new("Sponsor", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("Sponsor", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("fix1201", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("fix1368", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("fix1373", true, RegisteredFeatureVote::Obsolete),
@@ -429,6 +455,10 @@ pub fn fix_cleanup_3_3_0() -> Uint256 {
     feature_id(FIX_CLEANUP_3_3_0_NAME)
 }
 
+pub fn fix_cleanup_3_4_0() -> Uint256 {
+    feature_id(FIX_CLEANUP_3_4_0_NAME)
+}
+
 pub fn fix_token_escrow_v1() -> Uint256 {
     feature_id("fixTokenEscrowV1")
 }
@@ -510,15 +540,18 @@ impl IntoIterator for FeatureSet {
 mod tests {
     use super::{
         FEATURE_AMM_NAME, FEATURE_BATCH_V1_1_NAME, FEATURE_CLAWBACK_NAME,
-        FEATURE_LENDING_PROTOCOL_NAME, FEATURE_SINGLE_ASSET_VAULT_NAME, FEATURE_TOKEN_ESCROW_NAME,
+        FEATURE_CONFIDENTIAL_TRANSFER_NAME, FEATURE_LENDING_PROTOCOL_NAME,
+        FEATURE_SINGLE_ASSET_VAULT_NAME, FEATURE_SPONSOR_NAME, FEATURE_TOKEN_ESCROW_NAME,
         FEATURE_UNIVERSAL_NUMBER_NAME, FEATURE_XCHAIN_BRIDGE_NAME, FEATURE_XRP_FEES_NAME,
-        FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME, FIX_BATCH_INNER_SIGS_NAME, FIX_INNER_OBJ_TEMPLATE_NAME,
-        FIX_INNER_OBJ_TEMPLATE2_NAME, FIX_MPT_DELIVERED_AMOUNT_NAME, FIX_PREVIOUS_TXN_ID_NAME,
-        FeatureSet, REGISTERED_FEATURES, feature_amm, feature_batch, feature_clawback, feature_id,
+        FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME, FIX_BATCH_INNER_SIGS_NAME, FIX_CLEANUP_3_4_0_NAME,
+        FIX_INNER_OBJ_TEMPLATE_NAME, FIX_INNER_OBJ_TEMPLATE2_NAME, FIX_MPT_DELIVERED_AMOUNT_NAME,
+        FIX_PREVIOUS_TXN_ID_NAME, FeatureSet, REGISTERED_FEATURES, RegisteredFeature,
+        RegisteredFeatureVote, feature_amm, feature_batch, feature_clawback, feature_id,
         feature_lending_protocol, feature_name, feature_single_asset_vault, feature_token_escrow,
         feature_universal_number, feature_xchain_bridge, feature_xrp_fees, fix_ammv1_1,
         fix_ammv1_3, fix_batch_inner_sigs, fix_inner_obj_template, fix_inner_obj_template2,
         fix_mpt_delivered_amount, fix_previous_txn_id,
+        registered_feature_supported_with_confidential_crypto,
     };
     use basics::base_uint::Uint256;
 
@@ -573,6 +606,26 @@ mod tests {
             .find(|registered| registered.name == FIX_MPT_DELIVERED_AMOUNT_NAME)
             .expect("fixMPTDeliveredAmount must be registered");
         assert!(registered.supported);
+    }
+
+    #[test]
+    fn sponsor_matches_pinned_supported_default_no_registration() {
+        let registered = REGISTERED_FEATURES
+            .iter()
+            .find(|registered| registered.name == FEATURE_SPONSOR_NAME)
+            .expect("Sponsor must be registered");
+        assert!(registered.supported);
+        assert_eq!(registered.vote, RegisteredFeatureVote::DefaultNo);
+    }
+
+    #[test]
+    fn cleanup_3_4_matches_pinned_supported_default_no_registration() {
+        let registered = REGISTERED_FEATURES
+            .iter()
+            .find(|registered| registered.name == FIX_CLEANUP_3_4_0_NAME)
+            .expect("fixCleanup3_4_0 must be registered");
+        assert!(registered.supported);
+        assert_eq!(registered.vote, RegisteredFeatureVote::DefaultNo);
     }
 
     #[test]
@@ -688,5 +741,36 @@ mod tests {
         assert!(features.contains(&feature_xrp_fees()));
         assert!(features.contains(&unknown));
         assert!(!features.is_empty());
+    }
+
+    #[test]
+    fn confidential_support_is_conditioned_on_verified_runtime_crypto() {
+        let confidential = RegisteredFeature::new(
+            FEATURE_CONFIDENTIAL_TRANSFER_NAME,
+            true,
+            RegisteredFeatureVote::DefaultNo,
+        );
+        assert!(!registered_feature_supported_with_confidential_crypto(
+            &confidential,
+            false
+        ));
+        assert!(registered_feature_supported_with_confidential_crypto(
+            &confidential,
+            true
+        ));
+
+        let ordinary = RegisteredFeature::new("ordinary", true, RegisteredFeatureVote::DefaultNo);
+        assert!(registered_feature_supported_with_confidential_crypto(
+            &ordinary, false
+        ));
+        let unsupported = RegisteredFeature::new(
+            FEATURE_CONFIDENTIAL_TRANSFER_NAME,
+            false,
+            RegisteredFeatureVote::DefaultNo,
+        );
+        assert!(!registered_feature_supported_with_confidential_crypto(
+            &unsupported,
+            true
+        ));
     }
 }

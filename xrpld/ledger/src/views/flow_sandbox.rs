@@ -30,6 +30,12 @@ pub struct Entry {
     pub sle: Arc<STLedgerEntry>,
 }
 
+struct TxMetaPlan {
+    meta: protocol::TxMeta,
+    items: BTreeMap<Uint256, Entry>,
+    new_mod: BTreeMap<Uint256, Arc<STLedgerEntry>>,
+}
+
 /// A child view that captures writes locally and can be applied or discarded.
 /// Matches reference flow() internal sandbox: only applied on tesSUCCESS via finishFlow.
 pub struct FlowSandbox<'a, V: ApplyView + ?Sized> {
@@ -63,6 +69,11 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
 
     pub fn item_count(&self) -> usize {
         self.items.len()
+    }
+
+    /// XRP destruction accumulated by this uncommitted transaction view.
+    pub fn drops_destroyed(&self) -> XRPAmount {
+        self.drops_destroyed
     }
 
     pub fn items(&self) -> &BTreeMap<Uint256, Entry> {
@@ -110,6 +121,23 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         delivered_amount: Option<protocol::STAmount>,
         rules: &Rules,
     ) -> Result<protocol::TxMeta, ViewError> {
+        self.build_tx_meta_plan(transaction_id, ledger_seq, delivered_amount, rules)
+            .map(|plan| plan.meta)
+    }
+
+    /// Build the one ordered transaction plan used for both metadata and the
+    /// committed state. rippled does not calculate these in independent
+    /// passes: `ApplyStateTable::apply` threads its `items_` while constructing
+    /// `TxMeta`, then applies those exact mutated items. Keeping the threaded
+    /// shadow entries in this plan prevents metadata/state drift for every
+    /// transaction type and every Insert/Modify/Erase combination.
+    fn build_tx_meta_plan(
+        &self,
+        transaction_id: Uint256,
+        ledger_seq: u32,
+        delivered_amount: Option<protocol::STAmount>,
+        rules: &Rules,
+    ) -> Result<TxMetaPlan, ViewError> {
         let mut meta = protocol::TxMeta::new(transaction_id, ledger_seq);
         meta.set_delivered_amount(delivered_amount);
 
@@ -281,7 +309,11 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
             }
         }
 
-        Ok(meta)
+        Ok(TxMetaPlan {
+            meta,
+            items,
+            new_mod,
+        })
     }
 
     fn thread_owners_for_metadata(
@@ -334,63 +366,6 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         Ok(())
     }
 
-    /// Collect rippled ApplyStateTable's supplemental `newMod` AccountRoots.
-    /// Created and deleted owner-bearing SLEs thread their sfAccount and
-    /// sfDestination accounts; RippleState threads both issuers. A material
-    /// mutation of the same AccountRoot wins and is threaded by the ordinary
-    /// delta path.
-    fn collect_owner_threads(&self) -> Result<BTreeMap<Uint256, Arc<STLedgerEntry>>, ViewError> {
-        let mut owner_threads = BTreeMap::new();
-        for (key, entry) in &self.items {
-            let owner_source = match entry.action {
-                Action::Insert => Some(Arc::clone(&entry.sle)),
-                Action::Erase => self.parent.read(Keylet::new(entry.sle.get_type(), *key))?,
-                Action::Modify => None,
-            };
-            let Some(owner_source) = owner_source else {
-                continue;
-            };
-
-            for owner in owner_accounts(owner_source.as_ref()) {
-                let keylet = account_keylet(Uint160::from_void(owner.data()));
-                if owner_threads.contains_key(&keylet.key) {
-                    continue;
-                }
-                let owner_sle = match self.items.get(&keylet.key) {
-                    // A material mutation is threaded by the ordinary delta
-                    // path. An unchanged Modify is different: rippled's main
-                    // metadata loop may already have skipped it, but
-                    // getForMod returns and threadOwners mutates that same
-                    // item later, regardless of map iteration order.
-                    Some(Entry {
-                        action: Action::Modify,
-                        sle,
-                    }) => match self.parent.read(keylet)? {
-                        Some(original) if original.as_ref() == sle.as_ref() => {
-                            Some(Arc::clone(sle))
-                        }
-                        _ => continue,
-                    },
-                    // Inserts are always handled by the ordinary path.
-                    Some(Entry {
-                        action: Action::Insert,
-                        ..
-                    }) => continue,
-                    // Deleted destinations are intentionally not restored.
-                    Some(Entry {
-                        action: Action::Erase,
-                        ..
-                    }) => continue,
-                    None => self.parent.read(keylet)?,
-                };
-                if let Some(owner_sle) = owner_sle {
-                    owner_threads.insert(keylet.key, owner_sle);
-                }
-            }
-        }
-        Ok(owner_threads)
-    }
-
     pub fn peek_parent(&self, k: Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
         self.parent.read(k)
     }
@@ -400,12 +375,32 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
     /// `ApplyStateTable::threadItem` equivalent used by ledger acceptance;
     /// the parent remains the cumulative view for subsequent transactions.
     pub fn apply_with_tx_thread(
-        mut self,
+        self,
         tx_id: Uint256,
         ledger_seq: u32,
         rules: &Rules,
     ) -> Result<(), ViewError> {
-        let owner_threads = self.collect_owner_threads()?;
+        let plan = self.build_tx_meta_plan(tx_id, ledger_seq, None, rules)?;
+        self.apply_tx_meta_plan(plan).map(|_| ())
+    }
+
+    /// Canonical closed-ledger transaction boundary. This is the Rust
+    /// equivalent of rippled's consuming `ApplyStateTable::apply`: metadata and
+    /// committed SLEs come from one ordered threading pass.
+    pub fn apply_with_tx_meta(
+        self,
+        tx_id: Uint256,
+        ledger_seq: u32,
+        delivered_amount: Option<protocol::STAmount>,
+        parent_batch_id: Option<Uint256>,
+        rules: &Rules,
+    ) -> Result<protocol::TxMeta, ViewError> {
+        let mut plan = self.build_tx_meta_plan(tx_id, ledger_seq, delivered_amount, rules)?;
+        plan.meta.set_parent_batch_id(parent_batch_id);
+        self.apply_tx_meta_plan(plan)
+    }
+
+    fn apply_tx_meta_plan(mut self, plan: TxMetaPlan) -> Result<protocol::TxMeta, ViewError> {
         self.validate_parent_commit("FlowSandbox::apply_with_tx_thread")?;
         // `TapDryRun` must not burn the immutable ledger's XRP total.
         if self.drops_destroyed.drops() > 0
@@ -413,16 +408,10 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         {
             self.parent.destroy_xrp(self.drops_destroyed)?;
         }
-        for (key, entry) in self.items {
+        for (key, entry) in plan.items {
             match entry.action {
                 Action::Insert => {
-                    let threaded = Arc::new(crate::apply_state_table::thread_sle(
-                        entry.sle.as_ref(),
-                        tx_id,
-                        ledger_seq,
-                        rules,
-                    ));
-                    self.parent.insert(threaded)?;
+                    self.parent.insert(entry.sle)?;
                 }
                 Action::Modify => {
                     let keylet = Keylet::new(entry.sle.get_type(), key);
@@ -437,13 +426,7 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
                     if entry.sle.as_ref() == original.as_ref() {
                         continue;
                     }
-                    self.parent
-                        .update(Arc::new(crate::apply_state_table::thread_sle(
-                            entry.sle.as_ref(),
-                            tx_id,
-                            ledger_seq,
-                            rules,
-                        )))?;
+                    self.parent.update(entry.sle)?;
                 }
                 Action::Erase => {
                     let keylet = Keylet::new(entry.sle.get_type(), key);
@@ -461,22 +444,16 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         // Same-key material mutations are excluded above, so supplemental
         // copies cannot overwrite them and the resulting state matches
         // rippled's newMod-before-state-table application order.
-        for (key, owner) in owner_threads {
+        for (key, owner) in plan.new_mod {
             let keylet = Keylet::new(LedgerEntryType::AccountRoot, key);
             if self.parent.peek(keylet)?.is_none() {
                 return Err(ViewError::Conversion(
                     "FlowSandbox::apply_with_tx_thread: owner account disappeared".into(),
                 ));
             }
-            self.parent
-                .update(Arc::new(crate::apply_state_table::thread_sle(
-                    owner.as_ref(),
-                    tx_id,
-                    ledger_seq,
-                    rules,
-                )))?;
+            self.parent.update(owner)?;
         }
-        Ok(())
+        Ok(plan.meta)
     }
 
     /// Apply all captured changes to the parent view. Call on tesSUCCESS.

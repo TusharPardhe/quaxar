@@ -67,7 +67,7 @@ fn asset_frozen<V: ReadView>(view: &V, account: AccountID, asset: Asset) -> Resu
                 .read(protocol::line(account, issue.account, issue.currency))
                 .map_err(|_| read_error())?;
             let individual = line.is_some_and(|sle| {
-                sle.is_flag(if account > issue.account {
+                sle.is_flag(if issue.account > account {
                     lsfHighFreeze
                 } else {
                     lsfLowFreeze
@@ -89,6 +89,141 @@ fn asset_frozen<V: ReadView>(view: &V, account: AccountID, asset: Asset) -> Resu
             },
         ),
     }
+}
+
+fn asset_global_frozen<V: ReadView>(view: &V, asset: Asset) -> Result<Ter, Ter> {
+    match asset {
+        Asset::Issue(issue) if issue.native() => Ok(Ter::TES_SUCCESS),
+        Asset::Issue(issue) => Ok(
+            if read_account(view, issue.account)?.is_some_and(|sle| sle.is_flag(lsfGlobalFreeze)) {
+                Ter::TEC_FROZEN
+            } else {
+                Ter::TES_SUCCESS
+            },
+        ),
+        Asset::MPTIssue(issue) => Ok(
+            if ledger::mptoken_helpers::is_global_frozen_mpt(view, &issue)
+                .map_err(|_| read_error())?
+            {
+                Ter::TEC_LOCKED
+            } else {
+                Ter::TES_SUCCESS
+            },
+        ),
+    }
+}
+
+fn asset_individual_frozen<V: ReadView>(
+    view: &V,
+    account: AccountID,
+    asset: Asset,
+) -> Result<Ter, Ter> {
+    match asset {
+        Asset::Issue(issue) if issue.native() || issue.account == account => Ok(Ter::TES_SUCCESS),
+        Asset::Issue(issue) => {
+            let line = view
+                .read(protocol::line(account, issue.account, issue.currency))
+                .map_err(|_| read_error())?;
+            Ok(
+                if line.is_some_and(|sle| {
+                    sle.is_flag(if issue.account > account {
+                        lsfHighFreeze
+                    } else {
+                        lsfLowFreeze
+                    })
+                }) {
+                    Ter::TEC_FROZEN
+                } else {
+                    Ter::TES_SUCCESS
+                },
+            )
+        }
+        Asset::MPTIssue(issue) => Ok(
+            if ledger::mptoken_helpers::is_individual_frozen_mpt(view, &account, &issue)
+                .map_err(|_| read_error())?
+            {
+                Ter::TEC_LOCKED
+            } else {
+                Ter::TES_SUCCESS
+            },
+        ),
+    }
+}
+
+fn asset_deep_frozen<V: ReadView>(view: &V, account: AccountID, asset: Asset) -> Result<Ter, Ter> {
+    match asset {
+        Asset::Issue(issue) if issue.native() || issue.account == account => Ok(Ter::TES_SUCCESS),
+        Asset::Issue(issue) => {
+            let line = view
+                .read(protocol::line(account, issue.account, issue.currency))
+                .map_err(|_| read_error())?;
+            Ok(
+                if line.is_some_and(|sle| {
+                    sle.is_flag(protocol::lsfHighDeepFreeze)
+                        || sle.is_flag(protocol::lsfLowDeepFreeze)
+                }) {
+                    Ter::TEC_FROZEN
+                } else {
+                    Ter::TES_SUCCESS
+                },
+            )
+        }
+        Asset::MPTIssue(issue) => Ok(
+            if ledger::mptoken_helpers::is_frozen_mpt(view, &account, &issue)
+                .map_err(|_| read_error())?
+            {
+                Ter::TEC_LOCKED
+            } else {
+                Ter::TES_SUCCESS
+            },
+        ),
+    }
+}
+
+fn check_deposit_freeze<V: ReadView>(
+    view: &V,
+    source: AccountID,
+    pseudo: AccountID,
+    asset: Asset,
+) -> Result<Ter, Ter> {
+    let global = asset_global_frozen(view, asset)?;
+    if global != Ter::TES_SUCCESS {
+        return Ok(global);
+    }
+    if source != asset.issuer() {
+        let source_frozen = asset_individual_frozen(view, source, asset)?;
+        if source_frozen != Ter::TES_SUCCESS {
+            return Ok(source_frozen);
+        }
+    }
+    asset_individual_frozen(view, pseudo, asset)
+}
+
+fn check_withdraw_freeze<V: ReadView>(
+    view: &V,
+    pseudo: AccountID,
+    submitter: AccountID,
+    destination: AccountID,
+    asset: Asset,
+) -> Result<Ter, Ter> {
+    if destination == asset.issuer() {
+        return Ok(Ter::TES_SUCCESS);
+    }
+    let global = asset_global_frozen(view, asset)?;
+    if global != Ter::TES_SUCCESS {
+        return Ok(global);
+    }
+    let pseudo_frozen = asset_individual_frozen(view, pseudo, asset)?;
+    if pseudo_frozen != Ter::TES_SUCCESS {
+        return Ok(pseudo_frozen);
+    }
+    if submitter != destination {
+        let submitter_frozen = asset_individual_frozen(view, submitter, asset)?;
+        if submitter_frozen != Ter::TES_SUCCESS {
+            return Ok(submitter_frozen);
+        }
+    }
+    asset_deep_frozen(view, destination, asset)
 }
 
 fn require_auth<V: ReadView>(
@@ -246,6 +381,32 @@ fn valid_domain<V: ReadView>(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VaultPhase {
+    NoPhase,
+    Subscription,
+    Investment,
+    Redemption,
+}
+
+fn vault_phase<V: ReadView>(view: &V, vault: &STLedgerEntry) -> VaultPhase {
+    if !vault.is_field_present(sf("sfVaultKind")) || vault.get_field_u8(sf("sfVaultKind")) != 1 {
+        return VaultPhase::NoPhase;
+    }
+    let now = view.parent_close_time().as_seconds();
+    if !vault.is_field_present(sf("sfSubscriptionDate"))
+        || now <= vault.get_field_u32(sf("sfSubscriptionDate"))
+    {
+        return VaultPhase::Subscription;
+    }
+    if !vault.is_field_present(sf("sfRedemptionDate"))
+        || now < vault.get_field_u32(sf("sfRedemptionDate"))
+    {
+        return VaultPhase::Investment;
+    }
+    VaultPhase::Redemption
+}
+
 fn preclaim_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
     let asset = tx.get_field_issue(sf("sfAsset")).asset();
@@ -253,6 +414,29 @@ fn preclaim_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         .is_field_present(sf("sfDomainID"))
         .then(|| tx.get_field_h256(sf("sfDomainID")));
     let sequence = tx.get_seq_value();
+    let issuer_is_pseudo = if asset.native() {
+        false
+    } else {
+        read_account(view, asset.issuer())?.is_some_and(|sle| {
+            sle.is_field_present(sf("sfVaultID"))
+                || sle.is_field_present(sf("sfLoanBrokerID"))
+                || sle.is_field_present(sf("sfAMMID"))
+        })
+    };
+    let asset_is_frozen = asset_frozen(view, account, asset)? != Ter::TES_SUCCESS;
+    let domain_exists = match domain {
+        Some(id) => view
+            .read(protocol::permissioned_domain_keylet_from_id(id))
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?
+            .is_some(),
+        None => true,
+    };
+    let address_collision = ledger::pseudo_account_address(
+        view,
+        protocol::vault_keylet(Uint160::from_void(account.data()), sequence).key,
+    )
+    .map_err(|_| Ter::TEF_BAD_LEDGER)?
+    .is_zero();
     Ok(run_vault_create_preclaim(
         VaultCreatePreclaimFacts {
             asset_is_native: asset.native(),
@@ -260,39 +444,10 @@ fn preclaim_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             domain_id_present: domain.is_some(),
         },
         || ledger::can_add_holding(view, &asset),
-        || {
-            !asset.native()
-                && read_account(view, asset.issuer())
-                    .map(|entry| {
-                        entry.is_some_and(|sle| {
-                            sle.is_field_present(sf("sfVaultID"))
-                                || sle.is_field_present(sf("sfLoanBrokerID"))
-                                || sle.is_field_present(sf("sfAMMID"))
-                        })
-                    })
-                    .unwrap_or(true)
-        },
-        || {
-            asset_frozen(view, account, asset)
-                .map(|ter| ter != Ter::TES_SUCCESS)
-                .unwrap_or(true)
-        },
-        || {
-            domain
-                .map(|id| {
-                    view.read(protocol::permissioned_domain_keylet_from_id(id))
-                        .map(|entry| entry.is_some())
-                        .unwrap_or(false)
-                })
-                .unwrap_or(true)
-        },
-        || {
-            ledger::pseudo_account_address(
-                view,
-                protocol::vault_keylet(Uint160::from_void(account.data()), sequence).key,
-            )
-            .is_zero()
-        },
+        || issuer_is_pseudo,
+        || asset_is_frozen,
+        || domain_exists,
+        || address_collision,
     ))
 }
 
@@ -330,6 +485,13 @@ fn preclaim_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let domain = tx
         .is_field_present(sf("sfDomainID"))
         .then(|| tx.get_field_h256(sf("sfDomainID")));
+    let domain_exists = match domain.filter(|id| !id.is_zero()) {
+        Some(id) => view
+            .read(protocol::permissioned_domain_keylet_from_id(id))
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?
+            .is_some(),
+        None => false,
+    };
     Ok(run_vault_set_preclaim(VaultSetPreclaimFacts {
         vault_exists: true,
         submitter_is_owner: vault.get_account_id(sf("sfOwner")) == account,
@@ -337,14 +499,7 @@ fn preclaim_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         domain_id_present: domain.is_some(),
         domain_id_is_zero: domain.is_some_and(|id| id.is_zero()),
         vault_is_private: vault.is_flag(protocol::lsfVaultPrivate),
-        domain_exists: domain
-            .filter(|id| !id.is_zero())
-            .map(|id| {
-                view.read(protocol::permissioned_domain_keylet_from_id(id))
-                    .map(|entry| entry.is_some())
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false),
+        domain_exists,
         issuance_requires_auth: issuance
             .as_ref()
             .is_some_and(|sle| sle.is_flag(lsfMPTRequireAuth)),
@@ -362,6 +517,16 @@ fn preclaim_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             || Ter::TES_SUCCESS,
         ));
     };
+    if view
+        .rules()
+        .enabled(&protocol::feature_id("LendingProtocolV1_1"))
+        && matches!(
+            vault_phase(view, &vault),
+            VaultPhase::Investment | VaultPhase::Redemption
+        )
+    {
+        return Ok(Ter::TEC_EXPIRED);
+    }
     let amount = tx.get_field_amount(sf("sfAmount"));
     let asset = vault.get_field_issue(sf("sfAsset")).asset();
     let share = MPTIssue::new(vault.get_field_h192(sf("sfShareMPTID")));
@@ -386,7 +551,9 @@ fn preclaim_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             vault_asset_is_issue: matches!(asset, Asset::Issue(_)),
             vault_asset_frozen_for_account: frozen_asset != Ter::TES_SUCCESS,
             vault_share_frozen_for_account: frozen_share != Ter::TES_SUCCESS,
-            fix_cleanup_3_3_0_enabled: false,
+            fix_cleanup_3_3_0_enabled: view
+                .rules()
+                .enabled(&protocol::feature_id("fixCleanup3_3_0")),
             vault_is_private: private,
             submitter_is_owner: account == vault.get_account_id(sf("sfOwner")),
             domain_id_present: domain.is_some(),
@@ -402,13 +569,15 @@ fn preclaim_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             )
             .unwrap_or(Ter::TEF_BAD_LEDGER)
         },
-        || {
-            domain
-                .map(|id| valid_domain(view, account, id).unwrap_or(Ter::TEF_BAD_LEDGER))
-                .unwrap_or(Ter::TES_SUCCESS)
+        || match domain {
+            Some(id) => valid_domain(view, account, id).unwrap_or(Ter::TEF_BAD_LEDGER),
+            None => Ter::TES_SUCCESS,
         },
         || require_auth(view, account, asset, false).unwrap_or(Ter::TEF_BAD_LEDGER),
-        || frozen_asset,
+        || {
+            check_deposit_freeze(view, account, vault.get_account_id(sf("sfAccount")), asset)
+                .unwrap_or(Ter::TEF_BAD_LEDGER)
+        },
     ))
 }
 
@@ -432,6 +601,13 @@ fn preclaim_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             || Ter::TES_SUCCESS,
         ));
     };
+    if view
+        .rules()
+        .enabled(&protocol::feature_id("LendingProtocolV1_1"))
+        && vault_phase(view, &vault) == VaultPhase::Investment
+    {
+        return Ok(Ter::TEC_TOO_SOON);
+    }
     let amount = tx.get_field_amount(sf("sfAmount"));
     let asset = vault.get_field_issue(sf("sfAsset")).asset();
     let share = MPTIssue::new(vault.get_field_h192(sf("sfShareMPTID")));
@@ -476,7 +652,9 @@ fn preclaim_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         },
         VaultWithdrawPreclaimTailFacts {
             destination_is_submitter: destination == account,
-            fix_cleanup_3_3_0_enabled: false,
+            fix_cleanup_3_3_0_enabled: view
+                .rules()
+                .enabled(&protocol::feature_id("fixCleanup3_3_0")),
         },
         || {
             can_transfer(
@@ -500,7 +678,16 @@ fn preclaim_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             )
             .unwrap_or(Ter::TEF_BAD_LEDGER)
         },
-        || asset_frozen(view, destination, asset).unwrap_or(Ter::TEF_BAD_LEDGER),
+        || {
+            check_withdraw_freeze(
+                view,
+                vault.get_account_id(sf("sfAccount")),
+                account,
+                destination,
+                asset,
+            )
+            .unwrap_or(Ter::TEF_BAD_LEDGER)
+        },
         || asset_frozen(view, account, Asset::MPTIssue(share)).unwrap_or(Ter::TEF_BAD_LEDGER),
         || asset_frozen(view, destination, asset).unwrap_or(Ter::TEF_BAD_LEDGER),
     ))
@@ -621,6 +808,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct View {
         entries: BTreeMap<Uint256, Arc<STLedgerEntry>>,
+        fail_reads: bool,
     }
     impl View {
         fn insert(&mut self, entry: STLedgerEntry) {
@@ -647,6 +835,9 @@ mod tests {
             Ok(None)
         }
         fn read(&self, keylet: protocol::Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
+            if self.fail_reads {
+                return Err(ViewError::Conversion("fault-injected vault read".into()));
+            }
             Ok(self.entries.get(&keylet.key).cloned())
         }
         fn sles(&self) -> Result<Vec<Arc<STLedgerEntry>>, ViewError> {
@@ -699,6 +890,22 @@ mod tests {
             Some(Ter::TEC_NO_ENTRY)
         );
         assert!(view.entries.is_empty());
+    }
+    #[test]
+    fn vault_storage_failure_is_not_missing_state_or_success() {
+        let id = Uint256::from_u64(11);
+        let tx = STTx::new(TxType::VAULT_DELETE, |tx| {
+            tx.set_field_h256(sf("sfVaultID"), id);
+            tx.set_account_id(sf("sfAccount"), account(1));
+        });
+        let view = View {
+            fail_reads: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_vault_read_view_preclaim(&view, &tx, TxType::VAULT_DELETE),
+            Some(Ter::TEF_BAD_LEDGER)
+        );
     }
     #[test]
     fn vault_set_rejects_non_owner_before_missing_share_issuance() {

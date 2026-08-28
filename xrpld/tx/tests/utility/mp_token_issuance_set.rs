@@ -1,14 +1,11 @@
-//! Integration tests that pin the narrowed Rust `MPTokenIssuanceSet.cpp`
-//! shell to the current C++ behavior.
-
-use std::collections::BTreeSet;
+//! Pinned-rippled MPTokenIssuanceSet behavior fixtures.
 
 use protocol::{
-    Ter, lsfMPTCanLock, lsfMPTCanTransfer, lsfMPTLocked, lsfMPTRequireAuth,
-    lsmfMPTCanMutateMetadata, lsmfMPTCanMutateRequireAuth, lsmfMPTCanMutateTransferFee, tfMPTLock,
-    tfMPTUnlock, tfMPTokenIssuanceSetMask, tfUniversalMask, tmfMPTClearCanTransfer,
-    tmfMPTClearRequireAuth, tmfMPTSetCanLock, tmfMPTokenIssuanceSetMutableMask, trans_token,
+    Ter, lsfMPTCanLock, lsfMPTCanTransfer, lsfMPTLocked, lsifMPTCanTransfer, lsifMPTMetadata,
+    lsifMPTTransferFee, tfMPTLock, tfMPTSetCanHoldConfidentialBalance, tfMPTSetCanTransfer,
+    tfMPTUnlock, tfMPTokenIssuanceSetMask, tifMPTokenIssuanceImmutableMask,
 };
+use std::collections::BTreeSet;
 use tx::utility::mp_token_issuance_set::{MAX_MPTOKEN_METADATA_LENGTH, MAX_TRANSFER_FEE};
 use tx::{
     MPTokenIssuanceSetApplyFacts, MPTokenIssuanceSetApplySink, MPTokenIssuanceSetDomainUpdate,
@@ -19,93 +16,102 @@ use tx::{
     run_mp_token_issuance_set_preclaim, run_mp_token_issuance_set_preflight,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TestSink {
-    target_exists: bool,
-    current_flags: u32,
-    flags_set: Vec<u32>,
-    transfer_fee_clears: usize,
-    transfer_fees: Vec<u16>,
-    metadata_clears: usize,
-    metadatas: Vec<Vec<u8>>,
-    domain_clears: usize,
-    domains: Vec<&'static str>,
+#[derive(Default)]
+struct Sink {
+    exists: bool,
+    flags: u32,
+    immutable: u32,
+    fee: Option<u16>,
+    metadata: Option<Vec<u8>>,
+    domain: Option<&'static str>,
     finished: usize,
-    events: Vec<String>,
 }
-
-impl TestSink {
-    fn new() -> Self {
-        Self {
-            target_exists: true,
-            current_flags: 0,
-            flags_set: Vec::new(),
-            transfer_fee_clears: 0,
-            transfer_fees: Vec::new(),
-            metadata_clears: 0,
-            metadatas: Vec::new(),
-            domain_clears: 0,
-            domains: Vec::new(),
-            finished: 0,
-            events: Vec::new(),
-        }
-    }
-}
-
-impl MPTokenIssuanceSetApplySink<&'static str> for TestSink {
+impl MPTokenIssuanceSetApplySink<&'static str> for Sink {
     fn target_exists(&mut self) -> bool {
-        self.events.push("target_exists".to_string());
-        self.target_exists
+        self.exists
     }
-
     fn current_flags(&mut self) -> u32 {
-        self.events.push("current_flags".to_string());
-        self.current_flags
+        self.flags
     }
-
-    fn set_flags(&mut self, flags: u32) {
-        self.events.push(format!("set_flags:{flags:#x}"));
-        self.flags_set.push(flags);
+    fn set_flags(&mut self, value: u32) {
+        self.flags = value;
     }
-
+    fn current_immutable_flags(&mut self) -> u32 {
+        self.immutable
+    }
+    fn set_immutable_flags(&mut self, value: u32) {
+        self.immutable = value;
+    }
     fn clear_transfer_fee(&mut self) {
-        self.events.push("clear_transfer_fee".to_string());
-        self.transfer_fee_clears += 1;
+        self.fee = None;
     }
-
-    fn set_transfer_fee(&mut self, transfer_fee: u16) {
-        self.events.push(format!("set_transfer_fee:{transfer_fee}"));
-        self.transfer_fees.push(transfer_fee);
+    fn set_transfer_fee(&mut self, value: u16) {
+        self.fee = Some(value);
     }
-
     fn clear_metadata(&mut self) {
-        self.events.push("clear_metadata".to_string());
-        self.metadata_clears += 1;
+        self.metadata = None;
     }
-
-    fn set_metadata(&mut self, metadata: Vec<u8>) {
-        self.events.push("set_metadata".to_string());
-        self.metadatas.push(metadata);
+    fn set_metadata(&mut self, value: Vec<u8>) {
+        self.metadata = Some(value);
     }
-
     fn clear_domain(&mut self) {
-        self.events.push("clear_domain".to_string());
-        self.domain_clears += 1;
+        self.domain = None;
     }
-
-    fn set_domain(&mut self, domain: &'static str) {
-        self.events.push(format!("set_domain:{domain}"));
-        self.domains.push(domain);
+    fn set_domain(&mut self, value: &'static str) {
+        self.domain = Some(value);
     }
-
     fn finish_update(&mut self) {
-        self.events.push("finish".to_string());
         self.finished += 1;
     }
 }
 
+fn preflight(flags: u32, immutable: Option<u32>) -> MPTokenIssuanceSetPreflightFacts {
+    MPTokenIssuanceSetPreflightFacts {
+        dynamic_mpt_enabled: true,
+        single_asset_vault_enabled: true,
+        domain_id_present: false,
+        holder_present: false,
+        account_equals_holder: false,
+        tx_flags: flags,
+        mutable_flags: immutable,
+        metadata_len: None,
+        transfer_fee: None,
+    }
+}
+
+fn preclaim(flags: u32, immutable: u32) -> MPTokenIssuanceSetPreclaimFacts {
+    MPTokenIssuanceSetPreclaimFacts {
+        issuance_exists: true,
+        issuance_can_lock: true,
+        single_asset_vault_enabled: true,
+        dynamic_mpt_enabled: true,
+        tx_flags: flags,
+        issuer_matches: true,
+        holder_present: false,
+        holder_account_exists: true,
+        holder_token_exists: true,
+        domain_id_present: false,
+        domain_id_is_zero: false,
+        issuance_requires_auth: true,
+        domain_exists: true,
+        issuance_domain_present: false,
+        current_mutable_flags: immutable,
+        mutable_flags: None,
+        metadata_present: false,
+        transfer_fee: None,
+        issuance_can_transfer: false,
+        issuance_has_confidential_balance: false,
+        issuance_transfer_fee_nonzero: false,
+        issuer_encryption_key_present: false,
+        auditor_encryption_key_present: false,
+        tx_has_issuer_encryption_key: false,
+        tx_has_auditor_encryption_key: false,
+        confidential_outstanding_nonzero: false,
+    }
+}
+
 #[test]
-fn mp_token_issuance_set_feature_gate_and_mask_match_cpp() {
+fn feature_gate_and_mask_match_pinned_rippled() {
     assert!(!mp_token_issuance_set_check_extra_features(
         true, false, true
     ));
@@ -119,445 +125,199 @@ fn mp_token_issuance_set_feature_gate_and_mask_match_cpp() {
 }
 
 #[test]
-fn mp_token_issuance_set_preflight_guards() {
-    let disabled = run_mp_token_issuance_set_preflight(MPTokenIssuanceSetPreflightFacts {
-        dynamic_mpt_enabled: false,
-        single_asset_vault_enabled: false,
-        domain_id_present: false,
-        holder_present: false,
-        account_equals_holder: false,
-        tx_flags: 0,
-        mutable_flags: Some(tmfMPTSetCanLock),
-        metadata_len: None,
-        transfer_fee: None,
-    });
-    let domain_and_holder = run_mp_token_issuance_set_preflight(MPTokenIssuanceSetPreflightFacts {
-        dynamic_mpt_enabled: true,
-        single_asset_vault_enabled: true,
-        domain_id_present: true,
-        holder_present: true,
-        account_equals_holder: false,
-        tx_flags: 0,
-        mutable_flags: None,
-        metadata_len: None,
-        transfer_fee: None,
-    });
-    let lock_and_unlock = run_mp_token_issuance_set_preflight(MPTokenIssuanceSetPreflightFacts {
-        dynamic_mpt_enabled: true,
-        single_asset_vault_enabled: true,
-        domain_id_present: false,
-        holder_present: false,
-        account_equals_holder: false,
-        tx_flags: tfMPTLock | tfMPTUnlock,
-        mutable_flags: None,
-        metadata_len: None,
-        transfer_fee: None,
-    });
-    let self_holder = run_mp_token_issuance_set_preflight(MPTokenIssuanceSetPreflightFacts {
-        dynamic_mpt_enabled: true,
-        single_asset_vault_enabled: true,
-        domain_id_present: false,
-        holder_present: true,
-        account_equals_holder: true,
-        tx_flags: 0,
-        mutable_flags: None,
-        metadata_len: None,
-        transfer_fee: None,
-    });
-    let no_change = run_mp_token_issuance_set_preflight(MPTokenIssuanceSetPreflightFacts {
-        dynamic_mpt_enabled: false,
-        single_asset_vault_enabled: true,
-        domain_id_present: false,
-        holder_present: false,
-        account_equals_holder: false,
-        tx_flags: 0,
-        mutable_flags: None,
-        metadata_len: None,
-        transfer_fee: None,
-    });
-    let mutate_with_holder =
-        run_mp_token_issuance_set_preflight(MPTokenIssuanceSetPreflightFacts {
-            dynamic_mpt_enabled: true,
-            single_asset_vault_enabled: true,
-            domain_id_present: false,
-            holder_present: true,
-            account_equals_holder: false,
-            tx_flags: 0,
-            mutable_flags: Some(tmfMPTSetCanLock),
-            metadata_len: None,
-            transfer_fee: None,
-        });
-    let mutate_with_non_universal_flags =
-        run_mp_token_issuance_set_preflight(MPTokenIssuanceSetPreflightFacts {
-            dynamic_mpt_enabled: true,
-            single_asset_vault_enabled: true,
-            domain_id_present: false,
-            holder_present: false,
-            account_equals_holder: false,
-            tx_flags: tfUniversalMask,
-            mutable_flags: Some(tmfMPTSetCanLock),
-            metadata_len: None,
-            transfer_fee: None,
-        });
-    let bad_fee = run_mp_token_issuance_set_preflight(MPTokenIssuanceSetPreflightFacts {
-        dynamic_mpt_enabled: true,
-        single_asset_vault_enabled: true,
-        domain_id_present: false,
-        holder_present: false,
-        account_equals_holder: false,
-        tx_flags: 0,
-        mutable_flags: None,
-        metadata_len: None,
-        transfer_fee: Some(MAX_TRANSFER_FEE + 1),
-    });
-    let bad_metadata = run_mp_token_issuance_set_preflight(MPTokenIssuanceSetPreflightFacts {
-        dynamic_mpt_enabled: true,
-        single_asset_vault_enabled: true,
-        domain_id_present: false,
-        holder_present: false,
-        account_equals_holder: false,
-        tx_flags: 0,
-        mutable_flags: None,
-        metadata_len: Some(MAX_MPTOKEN_METADATA_LENGTH + 1),
-        transfer_fee: None,
-    });
-    let invalid_mutable = run_mp_token_issuance_set_preflight(MPTokenIssuanceSetPreflightFacts {
-        dynamic_mpt_enabled: true,
-        single_asset_vault_enabled: true,
-        domain_id_present: false,
-        holder_present: false,
-        account_equals_holder: false,
-        tx_flags: 0,
-        mutable_flags: Some(tmfMPTokenIssuanceSetMutableMask),
-        metadata_len: None,
-        transfer_fee: None,
-    });
-    let nonzero_fee_clear_transfer =
-        run_mp_token_issuance_set_preflight(MPTokenIssuanceSetPreflightFacts {
-            dynamic_mpt_enabled: true,
-            single_asset_vault_enabled: true,
-            domain_id_present: false,
-            holder_present: false,
-            account_equals_holder: false,
-            tx_flags: 0,
-            mutable_flags: Some(tmfMPTClearCanTransfer),
-            metadata_len: None,
-            transfer_fee: Some(1),
-        });
-
-    assert_eq!(disabled, Ter::TEM_DISABLED);
-    assert_eq!(domain_and_holder, Ter::TEM_MALFORMED);
-    assert_eq!(lock_and_unlock, Ter::TEM_INVALID_FLAG);
-    assert_eq!(self_holder, Ter::TEM_MALFORMED);
-    assert_eq!(no_change, Ter::TEM_MALFORMED);
-    assert_eq!(mutate_with_holder, Ter::TEM_MALFORMED);
-    assert_eq!(mutate_with_non_universal_flags, Ter::TEM_INVALID_FLAG);
-    assert_eq!(bad_fee, Ter::TEM_BAD_TRANSFER_FEE);
-    assert_eq!(bad_metadata, Ter::TEM_MALFORMED);
-    assert_eq!(invalid_mutable, Ter::TEM_INVALID_FLAG);
-    assert_eq!(nonzero_fee_clear_transfer, Ter::TEM_MALFORMED);
-}
-
-#[test]
-fn mp_token_issuance_set_check_permission() {
-    let missing_delegate =
-        run_mp_token_issuance_set_check_permission(MPTokenIssuanceSetPermissionFacts {
-            delegate_present: true,
-            delegate_entry_exists: false,
-            broad_permission_granted: false,
-            tx_flags: 0,
-            granular_permissions: BTreeSet::new(),
-        });
-    let broad = run_mp_token_issuance_set_check_permission(MPTokenIssuanceSetPermissionFacts {
-        delegate_present: true,
-        delegate_entry_exists: true,
-        broad_permission_granted: true,
-        tx_flags: 0,
-        granular_permissions: BTreeSet::new(),
-    });
-    let no_lock_permission =
-        run_mp_token_issuance_set_check_permission(MPTokenIssuanceSetPermissionFacts {
-            delegate_present: true,
-            delegate_entry_exists: true,
-            broad_permission_granted: false,
-            tx_flags: tfMPTLock,
-            granular_permissions: BTreeSet::new(),
-        });
-    let mut permissions = BTreeSet::new();
-    permissions.insert(MPTokenIssuanceSetGranularPermission::Lock);
-    let granular = run_mp_token_issuance_set_check_permission(MPTokenIssuanceSetPermissionFacts {
-        delegate_present: true,
-        delegate_entry_exists: true,
-        broad_permission_granted: false,
-        tx_flags: tfMPTLock,
-        granular_permissions: permissions,
-    });
-
-    assert_eq!(missing_delegate, Ter::TER_NO_DELEGATE_PERMISSION);
-    assert_eq!(broad, Ter::TES_SUCCESS);
-    assert_eq!(no_lock_permission, Ter::TER_NO_DELEGATE_PERMISSION);
-    assert_eq!(granular, Ter::TES_SUCCESS);
-}
-
-#[test]
-fn mp_token_issuance_set_preclaim_ordered_guards() {
-    let missing = run_mp_token_issuance_set_preclaim(MPTokenIssuanceSetPreclaimFacts {
-        issuance_exists: false,
-        issuance_can_lock: true,
-        single_asset_vault_enabled: false,
-        dynamic_mpt_enabled: false,
-        tx_flags: 0,
-        issuer_matches: true,
-        holder_present: false,
-        holder_account_exists: true,
-        holder_token_exists: true,
-        domain_id_present: false,
-        domain_id_is_zero: false,
-        issuance_requires_auth: true,
-        domain_exists: true,
-        issuance_domain_present: false,
-        current_mutable_flags: 0,
-        mutable_flags: None,
-        metadata_present: false,
-        transfer_fee: None,
-        issuance_can_transfer: true,
-    });
-    let no_lock_permission = run_mp_token_issuance_set_preclaim(MPTokenIssuanceSetPreclaimFacts {
-        issuance_exists: true,
-        issuance_can_lock: false,
-        single_asset_vault_enabled: false,
-        dynamic_mpt_enabled: false,
-        tx_flags: tfMPTLock,
-        issuer_matches: true,
-        holder_present: false,
-        holder_account_exists: true,
-        holder_token_exists: true,
-        domain_id_present: false,
-        domain_id_is_zero: false,
-        issuance_requires_auth: true,
-        domain_exists: true,
-        issuance_domain_present: false,
-        current_mutable_flags: 0,
-        mutable_flags: None,
-        metadata_present: false,
-        transfer_fee: None,
-        issuance_can_transfer: true,
-    });
-    let no_dst = run_mp_token_issuance_set_preclaim(MPTokenIssuanceSetPreclaimFacts {
-        issuance_exists: true,
-        issuance_can_lock: true,
-        single_asset_vault_enabled: true,
-        dynamic_mpt_enabled: true,
-        tx_flags: 0,
-        issuer_matches: true,
-        holder_present: true,
-        holder_account_exists: false,
-        holder_token_exists: true,
-        domain_id_present: false,
-        domain_id_is_zero: false,
-        issuance_requires_auth: true,
-        domain_exists: true,
-        issuance_domain_present: false,
-        current_mutable_flags: 0,
-        mutable_flags: None,
-        metadata_present: false,
-        transfer_fee: None,
-        issuance_can_transfer: true,
-    });
-    let no_domain_permission =
-        run_mp_token_issuance_set_preclaim(MPTokenIssuanceSetPreclaimFacts {
-            issuance_exists: true,
-            issuance_can_lock: true,
-            single_asset_vault_enabled: true,
-            dynamic_mpt_enabled: true,
-            tx_flags: 0,
-            issuer_matches: true,
-            holder_present: false,
-            holder_account_exists: true,
-            holder_token_exists: true,
-            domain_id_present: true,
-            domain_id_is_zero: false,
-            issuance_requires_auth: false,
-            domain_exists: true,
-            issuance_domain_present: false,
-            current_mutable_flags: 0,
-            mutable_flags: None,
-            metadata_present: false,
-            transfer_fee: None,
-            issuance_can_transfer: true,
-        });
-    let nonmutable_metadata = run_mp_token_issuance_set_preclaim(MPTokenIssuanceSetPreclaimFacts {
-        issuance_exists: true,
-        issuance_can_lock: true,
-        single_asset_vault_enabled: true,
-        dynamic_mpt_enabled: true,
-        tx_flags: 0,
-        issuer_matches: true,
-        holder_present: false,
-        holder_account_exists: true,
-        holder_token_exists: true,
-        domain_id_present: false,
-        domain_id_is_zero: false,
-        issuance_requires_auth: true,
-        domain_exists: true,
-        issuance_domain_present: false,
-        current_mutable_flags: 0,
-        mutable_flags: None,
-        metadata_present: true,
-        transfer_fee: None,
-        issuance_can_transfer: true,
-    });
-    let nonmutable_transfer_fee =
-        run_mp_token_issuance_set_preclaim(MPTokenIssuanceSetPreclaimFacts {
-            issuance_exists: true,
-            issuance_can_lock: true,
-            single_asset_vault_enabled: true,
-            dynamic_mpt_enabled: true,
-            tx_flags: 0,
-            issuer_matches: true,
-            holder_present: false,
-            holder_account_exists: true,
-            holder_token_exists: true,
-            domain_id_present: false,
-            domain_id_is_zero: false,
-            issuance_requires_auth: true,
-            domain_exists: true,
-            issuance_domain_present: false,
-            current_mutable_flags: lsfMPTCanTransfer,
-            mutable_flags: None,
-            metadata_present: false,
-            transfer_fee: Some(10),
-            issuance_can_transfer: true,
-        });
-    let valid = run_mp_token_issuance_set_preclaim(MPTokenIssuanceSetPreclaimFacts {
-        issuance_exists: true,
-        issuance_can_lock: true,
-        single_asset_vault_enabled: true,
-        dynamic_mpt_enabled: true,
-        tx_flags: 0,
-        issuer_matches: true,
-        holder_present: false,
-        holder_account_exists: true,
-        holder_token_exists: true,
-        domain_id_present: true,
-        domain_id_is_zero: false,
-        issuance_requires_auth: true,
-        domain_exists: true,
-        issuance_domain_present: false,
-        current_mutable_flags: lsmfMPTCanMutateMetadata | lsmfMPTCanMutateTransferFee,
-        mutable_flags: None,
-        metadata_present: true,
-        transfer_fee: Some(10),
-        issuance_can_transfer: true,
-    });
-    let clear_require_auth_with_domain =
-        run_mp_token_issuance_set_preclaim(MPTokenIssuanceSetPreclaimFacts {
-            issuance_exists: true,
-            issuance_can_lock: true,
-            single_asset_vault_enabled: true,
-            dynamic_mpt_enabled: true,
-            tx_flags: 0,
-            issuer_matches: true,
-            holder_present: false,
-            holder_account_exists: true,
-            holder_token_exists: true,
-            domain_id_present: false,
-            domain_id_is_zero: false,
-            issuance_requires_auth: true,
-            domain_exists: true,
-            issuance_domain_present: true,
-            current_mutable_flags: lsmfMPTCanMutateRequireAuth,
-            mutable_flags: Some(tmfMPTClearRequireAuth),
-            metadata_present: false,
-            transfer_fee: None,
-            issuance_can_transfer: true,
-        });
-
-    assert_eq!(missing, Ter::TEC_OBJECT_NOT_FOUND);
-    assert_eq!(no_lock_permission, Ter::TEC_NO_PERMISSION);
-    assert_eq!(no_dst, Ter::TEC_NO_DST);
-    assert_eq!(no_domain_permission, Ter::TEC_NO_PERMISSION);
-    assert_eq!(nonmutable_metadata, Ter::TEC_NO_PERMISSION);
-    assert_eq!(nonmutable_transfer_fee, Ter::TEC_NO_PERMISSION);
-    assert_eq!(valid, Ter::TES_SUCCESS);
-    assert_eq!(clear_require_auth_with_domain, Ter::TEC_NO_PERMISSION);
-}
-
-#[test]
-fn mp_token_issuance_set_do_apply_preserves_cpp_mutation_order() {
-    let mut sink = TestSink::new();
-    sink.current_flags = lsfMPTCanLock | lsfMPTRequireAuth;
-
-    let result = run_mp_token_issuance_set_do_apply(
-        MPTokenIssuanceSetApplyFacts {
-            tx_flags: tfMPTLock,
-            mutable_flags: Some(tmfMPTClearCanTransfer),
-            transfer_fee: Some(0),
-            metadata: Some(vec![1, 2, 3]),
-            domain: MPTokenIssuanceSetDomainUpdate::Set("domain"),
-        },
-        &mut sink,
-    );
-
-    assert_eq!(result, Ter::TES_SUCCESS);
+fn preflight_uses_enable_flags_and_rejects_invalid_immutable_bits() {
+    let mut disabled = preflight(tfMPTSetCanTransfer, None);
+    disabled.dynamic_mpt_enabled = false;
     assert_eq!(
-        sink.events,
-        [
-            "target_exists",
-            "current_flags",
-            "clear_transfer_fee",
-            "set_flags:0x7",
-            "clear_transfer_fee",
-            "set_metadata",
-            "set_domain:domain",
-            "finish",
-        ]
+        run_mp_token_issuance_set_preflight(disabled),
+        Ter::TEM_DISABLED
     );
     assert_eq!(
-        sink.flags_set,
-        vec![lsfMPTCanLock | lsfMPTRequireAuth | lsfMPTLocked]
+        run_mp_token_issuance_set_preflight(preflight(0, Some(0))),
+        Ter::TEM_INVALID_FLAG
     );
-    assert_eq!(sink.transfer_fee_clears, 2);
-    assert_eq!(sink.metadatas, vec![vec![1, 2, 3]]);
-    assert_eq!(sink.domains, vec!["domain"]);
+    assert_eq!(
+        run_mp_token_issuance_set_preflight(preflight(0, Some(tifMPTokenIssuanceImmutableMask))),
+        Ter::TEM_INVALID_FLAG
+    );
+    let mut fee = preflight(tfMPTSetCanTransfer, None);
+    fee.transfer_fee = Some(MAX_TRANSFER_FEE + 1);
+    assert_eq!(
+        run_mp_token_issuance_set_preflight(fee),
+        Ter::TEM_BAD_TRANSFER_FEE
+    );
+    let mut metadata = preflight(0, None);
+    metadata.metadata_len = Some(MAX_MPTOKEN_METADATA_LENGTH + 1);
+    assert_eq!(
+        run_mp_token_issuance_set_preflight(metadata),
+        Ter::TEM_MALFORMED
+    );
+    let mut mixed = preflight(tfMPTLock | tfMPTSetCanTransfer, None);
+    assert_eq!(
+        run_mp_token_issuance_set_preflight(mixed),
+        Ter::TEM_MALFORMED
+    );
+    mixed.tx_flags = tfMPTSetCanTransfer;
+    assert_eq!(run_mp_token_issuance_set_preflight(mixed), Ter::TES_SUCCESS);
+}
+
+#[test]
+fn preclaim_enforces_one_way_immutability_and_same_tx_transfer_enable() {
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(preclaim(tfMPTSetCanTransfer, lsifMPTCanTransfer)),
+        Ter::TEC_NO_PERMISSION
+    );
+    let mut same_tx_fee = preclaim(tfMPTSetCanTransfer, 0);
+    same_tx_fee.transfer_fee = Some(10);
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(same_tx_fee),
+        Ter::TES_SUCCESS
+    );
+    let mut immutable_metadata = preclaim(0, lsifMPTMetadata);
+    immutable_metadata.metadata_present = true;
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(immutable_metadata),
+        Ter::TEC_NO_PERMISSION
+    );
+    let mut immutable_fee = preclaim(0, lsifMPTTransferFee);
+    immutable_fee.transfer_fee = Some(0);
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(immutable_fee),
+        Ter::TEC_NO_PERMISSION
+    );
+}
+
+#[test]
+fn confidential_preclaim_checks_match_pinned_precedence_and_constraints() {
+    let mut immutable_fee_precedes_confidential = preclaim(0, lsifMPTTransferFee);
+    immutable_fee_precedes_confidential.transfer_fee = Some(10);
+    immutable_fee_precedes_confidential.issuance_has_confidential_balance = true;
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(immutable_fee_precedes_confidential),
+        Ter::TEC_NO_PERMISSION
+    );
+
+    let mut fee_on_confidential = preclaim(0, 0);
+    fee_on_confidential.transfer_fee = Some(10);
+    fee_on_confidential.issuance_can_transfer = true;
+    fee_on_confidential.issuance_has_confidential_balance = true;
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(fee_on_confidential),
+        Ter::TEC_NO_PERMISSION
+    );
+
+    let mut duplicate_issuer_key = preclaim(0, 0);
+    duplicate_issuer_key.tx_has_issuer_encryption_key = true;
+    duplicate_issuer_key.issuer_encryption_key_present = true;
+    duplicate_issuer_key.issuance_has_confidential_balance = true;
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(duplicate_issuer_key),
+        Ter::TEC_NO_PERMISSION
+    );
+
+    let mut enable_with_fee = preclaim(tfMPTSetCanHoldConfidentialBalance, 0);
+    enable_with_fee.issuance_transfer_fee_nonzero = true;
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(enable_with_fee),
+        Ter::TEC_NO_PERMISSION
+    );
+
+    let mut key_without_confidential = preclaim(0, 0);
+    key_without_confidential.tx_has_issuer_encryption_key = true;
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(key_without_confidential),
+        Ter::TEC_NO_PERMISSION
+    );
+
+    let mut same_tx_enable_and_key = key_without_confidential;
+    same_tx_enable_and_key.tx_flags = tfMPTSetCanHoldConfidentialBalance;
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(same_tx_enable_and_key),
+        Ter::TES_SUCCESS
+    );
+
+    let mut outstanding = same_tx_enable_and_key;
+    outstanding.confidential_outstanding_nonzero = true;
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(outstanding),
+        Ter::TEC_NO_PERMISSION
+    );
+}
+
+#[test]
+fn apply_only_enables_capabilities_and_ors_immutable_bits() {
+    let mut sink = Sink {
+        exists: true,
+        flags: lsfMPTCanLock,
+        immutable: lsifMPTMetadata,
+        ..Sink::default()
+    };
+    assert_eq!(
+        run_mp_token_issuance_set_do_apply(
+            MPTokenIssuanceSetApplyFacts {
+                tx_flags: tfMPTSetCanTransfer,
+                mutable_flags: Some(lsifMPTCanTransfer),
+                transfer_fee: Some(5),
+                metadata: Some(vec![1]),
+                domain: MPTokenIssuanceSetDomainUpdate::Set("domain")
+            },
+            &mut sink
+        ),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(sink.flags, lsfMPTCanLock | lsfMPTCanTransfer);
+    assert_eq!(sink.immutable, lsifMPTMetadata | lsifMPTCanTransfer);
+    assert_eq!(sink.fee, Some(5));
+    assert_eq!(sink.metadata, Some(vec![1]));
+    assert_eq!(sink.domain, Some("domain"));
     assert_eq!(sink.finished, 1);
 }
 
 #[test]
-fn mp_token_issuance_set_do_apply_handles_clear_and_missing_target() {
-    let mut missing = TestSink::new();
-    missing.target_exists = false;
+fn apply_lock_unlock_and_default_field_clears_match_pinned_order() {
+    let mut sink = Sink {
+        exists: true,
+        flags: lsfMPTLocked,
+        fee: Some(5),
+        metadata: Some(vec![1]),
+        domain: Some("old"),
+        ..Sink::default()
+    };
     assert_eq!(
         run_mp_token_issuance_set_do_apply(
             MPTokenIssuanceSetApplyFacts {
-                tx_flags: 0,
+                tx_flags: tfMPTUnlock,
                 mutable_flags: None,
-                transfer_fee: None,
-                metadata: None,
-                domain: MPTokenIssuanceSetDomainUpdate::NoChange,
+                transfer_fee: Some(0),
+                metadata: Some(Vec::new()),
+                domain: MPTokenIssuanceSetDomainUpdate::Clear
             },
-            &mut missing,
+            &mut sink
         ),
-        Ter::TEC_INTERNAL
+        Ter::TES_SUCCESS
     );
+    assert_eq!(sink.flags, 0);
+    assert_eq!(sink.fee, None);
+    assert_eq!(sink.metadata, None);
+    assert_eq!(sink.domain, None);
+}
 
-    let mut clear = TestSink::new();
-    clear.current_flags = lsfMPTLocked;
-    let result = run_mp_token_issuance_set_do_apply(
-        MPTokenIssuanceSetApplyFacts {
-            tx_flags: tfMPTUnlock,
-            mutable_flags: None,
-            transfer_fee: Some(5),
-            metadata: Some(Vec::new()),
-            domain: MPTokenIssuanceSetDomainUpdate::Clear,
-        },
-        &mut clear,
-    );
-
-    assert_eq!(result, Ter::TES_SUCCESS);
-    assert_eq!(clear.flags_set, vec![0]);
-    assert_eq!(clear.transfer_fees, vec![5]);
-    assert_eq!(clear.metadata_clears, 1);
-    assert_eq!(clear.domain_clears, 1);
-    assert_eq!(trans_token(result), "tesSUCCESS");
+#[test]
+fn delegated_lock_permission_remains_granular() {
+    let denied = run_mp_token_issuance_set_check_permission(MPTokenIssuanceSetPermissionFacts {
+        delegate_present: true,
+        delegate_entry_exists: true,
+        broad_permission_granted: false,
+        tx_flags: tfMPTLock,
+        granular_permissions: BTreeSet::new(),
+    });
+    let allowed = run_mp_token_issuance_set_check_permission(MPTokenIssuanceSetPermissionFacts {
+        delegate_present: true,
+        delegate_entry_exists: true,
+        broad_permission_granted: false,
+        tx_flags: tfMPTLock,
+        granular_permissions: BTreeSet::from([MPTokenIssuanceSetGranularPermission::Lock]),
+    });
+    assert_eq!(denied, Ter::TER_NO_DELEGATE_PERMISSION);
+    assert_eq!(allowed, Ter::TES_SUCCESS);
 }

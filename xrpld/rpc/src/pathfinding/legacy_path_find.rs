@@ -23,6 +23,17 @@ pub trait PathFindApp {
     fn is_loaded_local(&self) -> bool;
 }
 
+impl<T: crate::state::context::RpcRuntime + ?Sized> PathFindApp for T {
+    fn job_count_ge_client(&self) -> u32 {
+        self.client_job_count()
+    }
+
+    fn is_loaded_local(&self) -> bool {
+        self.app()
+            .is_some_and(app::ApplicationRoot::load_fee_track_loaded_local)
+    }
+}
+
 /// RAII guard that limits concurrent pathfind operations.
 ///
 /// On construction, attempts to acquire a slot. If successful, `is_ok()` returns true.
@@ -41,7 +52,7 @@ impl LegacyPathFind {
     ///
     /// `is_admin`: admin users bypass all checks.
     /// `app`: application context for job queue and load checks.
-    pub fn new(is_admin: bool, app: &dyn PathFindApp) -> Self {
+    pub fn new<T: PathFindApp + ?Sized>(is_admin: bool, app: &T) -> Self {
         if is_admin {
             IN_PROGRESS.fetch_add(1, Ordering::Release);
             return Self { is_ok: true };

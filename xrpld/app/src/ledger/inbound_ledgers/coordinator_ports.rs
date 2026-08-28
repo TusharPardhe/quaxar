@@ -188,15 +188,84 @@ struct SessionPersistence {
     completions: VecDeque<acquisition::AcquisitionEvent>,
 }
 
+// rippled processes inbound-ledger packets, including their synchronous NuDB
+// writes, through the globally limited JtLedgerData lane (limit 3). Quaxar
+// separates physical persistence from packet reduction, so it must reproduce
+// that same global exposure here; a per-session FIFO alone permits every
+// prefetched history ledger to occupy the JtWrite lane concurrently.
+const PERSISTENCE_EXECUTION_LIMIT: usize = 3;
+
+// Production bootstraps NodeStore with rippled's 40,000-byte NuDB burst.
+// Yield the backend mutation fence at that same byte boundary so an inbound
+// packet containing megabytes of nodes cannot exclude consensus persistence
+// for the duration of the entire packet. A single oversized object remains
+// indivisible, exactly like one rippled db.insert call.
+const PERSISTENCE_CHUNK_BYTES: usize = 40_000;
+
+fn persistence_chunks(nodes: &[acquisition::PersistNode]) -> Vec<&[acquisition::PersistNode]> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (index, node) in nodes.iter().enumerate() {
+        let node_bytes = node.data().len();
+        if index > start && bytes.saturating_add(node_bytes) > PERSISTENCE_CHUNK_BYTES {
+            chunks.push(&nodes[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(node_bytes);
+    }
+    if start < nodes.len() {
+        chunks.push(&nodes[start..]);
+    }
+    chunks
+}
+
 /// All live sessions' persistence state. Resource-local: the coordinator owns
 /// write intent and retry policy; this owns only submission accounting.
 #[derive(Debug, Default)]
 struct CoordinatorPersistence {
     by_session: HashMap<SessionRef, SessionPersistence>,
+    // Fair, unique-session admission for the global rippled JtLedgerData-sized
+    // persistence window. A session is present only while it has queued work
+    // and no write already in flight.
+    ready_write_sessions: VecDeque<SessionRef>,
+    in_flight_writes: usize,
     // Session IDs with at least one retained completion. The queue provides
     // bounded round-robin replay across sessions while each session's own
     // write/fence order stays intact.
     ready_completion_sessions: VecDeque<SessionRef>,
+}
+
+fn enqueue_ready_write(state: &mut CoordinatorPersistence, session: SessionRef) {
+    let ready = state
+        .by_session
+        .get(&session)
+        .is_some_and(|entry| entry.in_flight.is_none() && !entry.queued.is_empty());
+    if ready && !state.ready_write_sessions.contains(&session) {
+        state.ready_write_sessions.push_back(session);
+    }
+}
+
+fn claim_ready_write(state: &mut CoordinatorPersistence) -> Option<WriteBatch> {
+    if state.in_flight_writes >= PERSISTENCE_EXECUTION_LIMIT {
+        return None;
+    }
+    while let Some(session) = state.ready_write_sessions.pop_front() {
+        let Some(entry) = state.by_session.get_mut(&session) else {
+            continue;
+        };
+        if entry.in_flight.is_some() {
+            continue;
+        }
+        let Some(command) = entry.queued.pop_front() else {
+            continue;
+        };
+        entry.in_flight = Some(command.batch.operation());
+        state.in_flight_writes += 1;
+        return Some(command.batch);
+    }
+    None
 }
 
 /// The work record the NodeStore scheduler executes. It performs the physical
@@ -313,6 +382,10 @@ fn settle_coordinator_persistence(
             state.ready_completion_sessions.push_back(session);
         }
 
+        // Every settled guard corresponds to one physically admitted task,
+        // including late completions after session cancellation.
+        state.in_flight_writes = state.in_flight_writes.saturating_sub(1);
+
         // Cancellation may already have cleared this exact slot. Retain the
         // late completion for stale-event accounting, but never release or
         // dispatch a successor on behalf of a different operation.
@@ -320,14 +393,13 @@ fn settle_coordinator_persistence(
             .by_session
             .get_mut(&session)
             .expect("persistence entry was inserted above");
-        if entry.in_flight != Some(operation) {
-            None
-        } else {
+        if entry.in_flight == Some(operation) {
             entry.in_flight = None;
-            advance_fifo
-                .then(|| entry.queued.pop_front().map(|command| command.batch))
-                .flatten()
         }
+        enqueue_ready_write(&mut state, session);
+        advance_fifo
+            .then(|| claim_ready_write(&mut state))
+            .flatten()
     };
     flush_persistence_completions(pending, tx);
     next
@@ -362,28 +434,35 @@ impl PersistenceWork for CoordinatorPersistenceWork {
                     batch.fence().map(|_| DurabilityOutcome::Stale),
                 )
             } else {
-                // One coordinator WriteBatch is one physical NodeStore batch.
-                // Preserve each node's object classification and the verified
-                // ledger sequence while avoiding one backend lock/key-table
-                // transaction per PersistNode. The final logical acceptance
-                // fence is issued only after this whole batch succeeds.
-                let objects = batch
-                    .nodes()
-                    .iter()
-                    .map(|node| {
-                        (
-                            nodestore_object_type(node.object_kind()),
-                            node.data().to_vec(),
-                            *node.key().as_uint256(),
-                            batch.ledger_sequence(),
-                        )
-                    })
-                    .collect();
-                let write_failed = match &node_store {
-                    SHAMapStoreNodeStore::Single(database) => database.store_batch(objects),
-                    SHAMapStoreNodeStore::Rotating(database) => database.store_batch(objects),
+                // Preserve each node's object classification and verified
+                // ledger sequence, but split one logical coordinator batch at
+                // NuDB's byte burst boundary. The final logical acceptance
+                // fence is still issued only after every chunk succeeds.
+                let mut write_failed = None;
+                for nodes in persistence_chunks(batch.nodes()) {
+                    let objects = nodes
+                        .iter()
+                        .map(|node| {
+                            (
+                                nodestore_object_type(node.object_kind()),
+                                node.data().to_vec(),
+                                *node.key().as_uint256(),
+                                batch.ledger_sequence(),
+                            )
+                        })
+                        .collect();
+                    let result = match &node_store {
+                        SHAMapStoreNodeStore::Single(database) => database.store_batch(objects),
+                        SHAMapStoreNodeStore::Rotating(database) => database.store_batch(objects),
+                    };
+                    if let Err(error) = result {
+                        write_failed = Some(error);
+                        break;
+                    }
+                    // Each physical batch releases NuDB's mutation fence here,
+                    // allowing a waiting consensus close-path batch to run.
+                    std::thread::yield_now();
                 }
-                .err();
                 match (write_failed, batch.fence()) {
                     (Some(_), Some(_)) => (WriteOutcome::Failed, Some(DurabilityOutcome::Failed)),
                     (Some(_), None) => (WriteOutcome::Failed, None),
@@ -497,6 +576,7 @@ impl CoordinatorWritePort {
     /// delivered and rejected as stale rather than silently dropped.
     pub(crate) fn cancel_session(&self, session: SessionRef) {
         let mut state = self.pending.lock().expect("coordinator persistence lock");
+        state.ready_write_sessions.retain(|ready| *ready != session);
         let Some(entry) = state.by_session.get_mut(&session) else {
             return;
         };
@@ -514,19 +594,15 @@ impl acquisition::WritePort for CoordinatorWritePort {
         let node_store = self.node_store.clone();
         let pending = Arc::clone(&self.pending);
         let tx = self.tx.clone();
-        // Claim the one in-flight slot while holding the port lock; release it
-        // before the physical submission so an inline scheduler (DummyScheduler
-        // in tests) cannot deadlock on the same lock from `run`.
+        // Claim both the per-session FIFO and global inbound-persistence slot
+        // while holding the port lock; release it before physical submission
+        // so an inline scheduler cannot deadlock when completion re-enters.
         let command = {
             let mut state = pending.lock().expect("coordinator persistence lock");
             let entry = state.by_session.entry(session).or_default();
-            if entry.in_flight.is_some() {
-                entry.queued.push_back(PersistenceBatch { batch });
-                None
-            } else {
-                entry.in_flight = Some(batch.operation());
-                Some(batch)
-            }
+            entry.queued.push_back(PersistenceBatch { batch });
+            enqueue_ready_write(&mut state, session);
+            claim_ready_write(&mut state)
         };
         if let Some(batch) = command {
             dispatch_persistence(&node_store, &pending, &tx, batch);
@@ -1176,6 +1252,105 @@ mod tests {
                 (other, _) => panic!("expected a completion, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn write_port_limits_global_inbound_persistence_to_rippled_ledger_data_lane() {
+        let scheduler = Arc::new(CaptureScheduler::new());
+        let node_store = memory_node_store_with("coord-write-port-global-limit", scheduler.clone());
+        let (tx, rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let mut port = CoordinatorWritePort::new(node_store.clone(), tx);
+        let mut writes = Vec::new();
+
+        for id in 1..=5 {
+            let session = session(100 + id);
+            let write = operation(session, OperationKind::Write);
+            writes.push(write);
+            port.submit_write(WriteBatch::incremental(
+                write,
+                StoreGeneration::new(node_store.store_generation()),
+                777,
+                vec![PersistNode::new(
+                    SHAMapHash::new(Uint256::from(100 + id)),
+                    bytes::Bytes::from(vec![id as u8]),
+                    StoredObjectKind::AccountNode,
+                )],
+            ));
+        }
+
+        assert_eq!(
+            scheduler.pending(),
+            PERSISTENCE_EXECUTION_LIMIT,
+            "history-prefetch sessions must share rippled's three-job ledger-data lane"
+        );
+        assert_eq!(
+            port.pending
+                .lock()
+                .expect("coordinator persistence lock")
+                .in_flight_writes,
+            PERSISTENCE_EXECUTION_LIMIT
+        );
+
+        assert!(scheduler.run_next());
+        assert_eq!(
+            scheduler.pending(),
+            PERSISTENCE_EXECUTION_LIMIT,
+            "settling one write fairly admits exactly one waiting session"
+        );
+
+        while scheduler.run_next() {}
+        assert_eq!(
+            port.pending
+                .lock()
+                .expect("coordinator persistence lock")
+                .in_flight_writes,
+            0
+        );
+        for expected in writes {
+            match rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("write completion")
+            {
+                acquisition::AcquisitionEvent::WriteCompleted(completion) => {
+                    assert_eq!(completion.operation(), expected);
+                    assert_eq!(completion.outcome(), WriteOutcome::Accepted);
+                }
+                other => panic!("expected write completion, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn persistence_chunks_bound_nudb_lock_occupancy_by_bytes() {
+        let sizes = [20_000, 15_000, 10_000, 80_000, 1];
+        let nodes = sizes
+            .into_iter()
+            .enumerate()
+            .map(|(index, size)| {
+                PersistNode::new(
+                    SHAMapHash::new(Uint256::from(index as u64 + 1)),
+                    bytes::Bytes::from(vec![index as u8; size]),
+                    StoredObjectKind::AccountNode,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let chunks = persistence_chunks(&nodes);
+        let chunk_sizes = chunks
+            .iter()
+            .map(|chunk| chunk.iter().map(|node| node.data().len()).sum::<usize>())
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunk_sizes, vec![35_000, 10_000, 80_000, 1]);
+        assert!(chunks.iter().all(|chunk| {
+            chunk.len() == 1
+                || chunk.iter().map(|node| node.data().len()).sum::<usize>()
+                    <= PERSISTENCE_CHUNK_BYTES
+        }));
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+            nodes.len()
+        );
     }
 
     #[test]

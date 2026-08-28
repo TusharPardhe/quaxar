@@ -184,6 +184,20 @@ pub mod attestations {
             }
         }
 
+        /// Reinterpret an XChain attestation transaction as the signed claim.
+        ///
+        /// rippled's `toClaim` copies the transaction field bag and replaces
+        /// `sfAccount` (the submitter) with `sfOtherChainSource` before it
+        /// constructs the attestation.  Stored attestation objects genuinely
+        /// use `sfAccount`, so this must remain distinct from
+        /// [`Self::from_st_object`].
+        pub fn from_transaction_st_object(object: &STObject) -> Self {
+            let mut claim = Self::from_st_object(object);
+            claim.base.sending_account =
+                object.get_account_id(get_field_by_symbol("sfOtherChainSource"));
+            claim
+        }
+
         pub fn from_json_value(value: &JsonValue) -> Result<Self, JsonGetOrThrowError> {
             Ok(Self {
                 base: AttestationBase::from_json_value(value)?,
@@ -340,6 +354,15 @@ pub mod attestations {
                 to_create: object.get_account_id(get_field_by_symbol("sfDestination")),
                 reward_amount: object.get_field_amount(get_field_by_symbol("sfSignatureReward")),
             }
+        }
+
+        /// Reinterpret an XChain account-create attestation transaction as
+        /// the signed claim, matching rippled's `toClaim` field substitution.
+        pub fn from_transaction_st_object(object: &STObject) -> Self {
+            let mut claim = Self::from_st_object(object);
+            claim.base.sending_account =
+                object.get_account_id(get_field_by_symbol("sfOtherChainSource"));
+            claim
         }
 
         pub fn from_json_value(value: &JsonValue) -> Result<Self, JsonGetOrThrowError> {
@@ -748,7 +771,7 @@ mod tests {
     use super::{XChainAttestationsBase, XChainClaimAttestation, attestations};
     use crate::{
         JsonOptions, JsonValue, KeyType, STAmount, STXChainBridge, SecretKey, StBase, XRPAmount,
-        derive_public_key, parse_base58_account_id, xrp_issue,
+        derive_public_key, get_field_by_symbol, parse_base58_account_id, xrp_issue,
     };
 
     fn account(value: &str) -> crate::AccountID {
@@ -782,6 +805,33 @@ mod tests {
 
         assert!(signed.verify(&bridge));
         assert!(signed.valid_amounts());
+        let signed_object = signed.to_st_object();
+        assert_eq!(
+            signed_object.get_account_id(get_field_by_symbol("sfAccount")),
+            signed.base.sending_account
+        );
+        let reparsed_signed = attestations::AttestationClaim::from_st_object(&signed_object);
+        assert_eq!(
+            reparsed_signed.base.sending_account,
+            signed.base.sending_account
+        );
+        assert!(reparsed_signed.verify(&bridge));
+
+        let submitter = crate::AccountID::from_array([0xA5; 20]);
+        let other_chain_source = signed.base.sending_account;
+        let mut transaction_fields = crate::STObject::new(get_field_by_symbol("sfGeneric"));
+        signed.base.add_helper(&mut transaction_fields);
+        transaction_fields.set_field_u64(get_field_by_symbol("sfXChainClaimID"), signed.claim_id);
+        transaction_fields.set_account_id(get_field_by_symbol("sfAccount"), submitter);
+        transaction_fields.set_account_id(
+            get_field_by_symbol("sfOtherChainSource"),
+            other_chain_source,
+        );
+        let from_transaction =
+            attestations::AttestationClaim::from_transaction_st_object(&transaction_fields);
+        assert_eq!(from_transaction.base.sending_account, other_chain_source);
+        assert_ne!(from_transaction.base.sending_account, submitter);
+        assert!(from_transaction.verify(&bridge));
 
         let proof = XChainClaimAttestation::from_signed(&signed);
         let json = JsonValue::Object(BTreeMap::from([(

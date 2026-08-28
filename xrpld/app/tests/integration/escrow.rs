@@ -20,8 +20,8 @@ use shamap::mutation::MutableTree;
 use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::SHAMapNodeType;
 
+use super::handle_real_dispatch;
 use super::pipeline::full_apply;
-use app::state::transactor_dispatcher::handle_real_dispatch;
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)

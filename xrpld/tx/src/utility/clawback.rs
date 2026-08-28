@@ -180,7 +180,9 @@ pub trait ClawbackApplySink {
 
 pub fn run_clawback_do_apply<S: ClawbackApplySink>(facts: ClawbackApplyFacts, sink: &mut S) -> Ter {
     if facts.amount.holds_mpt_issue() {
-        let holder = facts.holder.ok_or(Ter::TEM_MALFORMED).unwrap(); // Holder must be present for MPT
+        let Some(holder) = facts.holder else {
+            return Ter::TEM_MALFORMED;
+        };
         sink.clawback_mpt(&facts.account, &holder, &facts.amount)
     } else {
         let holder = facts.amount.issue().account;

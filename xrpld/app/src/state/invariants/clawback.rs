@@ -28,27 +28,27 @@ pub(super) fn validates_clawback<V: ApplyView + ?Sized>(
     tx_amount: Option<&STAmount>,
     mptokens_v2_enabled: bool,
     state: &ClawbackState,
-) -> bool {
+) -> Result<bool, ledger::ViewError> {
     if txn_type != protocol::TxType::CLAWBACK {
-        return true;
+        return Ok(true);
     }
 
     if !protocol::is_tes_success(result) {
-        return state.trustlines_changed == 0 && state.mptokens_changed == 0;
+        return Ok(state.trustlines_changed == 0 && state.mptokens_changed == 0);
     }
 
     if state.trustlines_changed > 1 || state.mptokens_changed > 1 {
-        return false;
+        return Ok(false);
     }
 
     let should_check_balance =
         state.trustlines_changed == 1 || (mptokens_v2_enabled && state.mptokens_changed == 1);
     if !should_check_balance {
-        return true;
+        return Ok(true);
     }
 
     let (Some(issuer), Some(amount)) = (tx_account, tx_amount) else {
-        return false;
+        return Ok(false);
     };
 
     let (holder, asset) = match amount.asset() {
@@ -61,12 +61,14 @@ pub(super) fn validates_clawback<V: ApplyView + ?Sized>(
         ),
         Asset::MPTIssue(issue) => {
             let Some(holder) = tx_holder else {
-                return false;
+                return Ok(false);
             };
             (holder, Asset::MPTIssue(issue))
         }
     };
 
-    account_holds_asset_amount(sandbox, holder, asset, sf("sfAmount"))
-        .is_some_and(|balance| balance.signum() >= 0)
+    Ok(
+        account_holds_asset_amount(sandbox, holder, asset, sf("sfAmount"))?
+            .is_some_and(|balance| balance.signum() >= 0),
+    )
 }

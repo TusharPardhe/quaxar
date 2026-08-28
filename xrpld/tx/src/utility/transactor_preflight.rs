@@ -120,10 +120,9 @@ pub fn run_transactor_preflight1(
         return Ter::TEM_INVALID_FLAG;
     }
 
-    assert!(
-        facts.inner_batch_flag_set == facts.parent_batch_id_present || !facts.batch_enabled,
-        "Inner batch transaction must have a parent batch ID."
-    );
+    if facts.inner_batch_flag_set != facts.parent_batch_id_present {
+        return Ter::TEM_INVALID_INNER_BATCH;
+    }
 
     Ter::TES_SUCCESS
 }
@@ -132,6 +131,7 @@ pub fn run_transactor_preflight1(
 pub struct TransactorPreflight2Facts {
     pub inner_batch_flag_set: bool,
     pub batch_enabled: bool,
+    pub parent_batch_id_present: bool,
 }
 
 pub fn run_transactor_preflight2(
@@ -143,12 +143,13 @@ pub fn run_transactor_preflight2(
         return ret;
     }
 
-    assert!(
-        !facts.inner_batch_flag_set || facts.batch_enabled,
-        "InnerBatch flag only set if feature enabled"
-    );
-
-    if facts.inner_batch_flag_set && facts.batch_enabled {
+    if facts.inner_batch_flag_set && !facts.batch_enabled {
+        return Ter::TEM_INVALID_FLAG;
+    }
+    if facts.inner_batch_flag_set && !facts.parent_batch_id_present {
+        return Ter::TEM_INVALID_INNER_BATCH;
+    }
+    if facts.inner_batch_flag_set {
         return Ter::TES_SUCCESS;
     }
 
@@ -198,10 +199,18 @@ mod tests {
             },
             0,
         );
+        let zero_tx_id = run_transactor_preflight0(
+            TransactorPreflight0Facts {
+                tx_id_is_zero: true,
+                ..TransactorPreflight0Facts::default()
+            },
+            0,
+        );
 
         assert_eq!(pseudo, Ter::TEM_INVALID_FLAG);
         assert_eq!(legacy_network, Ter::TEL_NETWORK_ID_MAKES_TX_NON_CANONICAL);
         assert_eq!(modern_missing, Ter::TEL_REQUIRES_NETWORK_ID);
+        assert_eq!(zero_tx_id, Ter::TEM_INVALID);
         assert_eq!(trans_token(modern_missing), "telREQUIRES_NETWORK_ID");
     }
 
@@ -293,6 +302,7 @@ mod tests {
             TransactorPreflight2Facts {
                 inner_batch_flag_set: true,
                 batch_enabled: true,
+                parent_batch_id_present: true,
             },
             || None,
             || panic!("batch-inner bypass should skip validity"),

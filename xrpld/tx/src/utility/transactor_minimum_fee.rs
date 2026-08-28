@@ -24,6 +24,9 @@ pub fn run_transactor_minimum_fee<Registry: ?Sized, Fees: ?Sized, Fee>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[deprecated(
+    note = "account-only fee bridge; application code must use the ledger-aware FeePayer path"
+)]
 pub fn run_transactor_check_fee_with_minimum_fee<
     Tx,
     AccountState,

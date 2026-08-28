@@ -229,6 +229,21 @@ impl STTx {
         self.get_account_id(get_field_by_symbol("sfAccount"))
     }
 
+    /// Account charged for the transaction fee, matching rippled
+    /// `STTx::getFeePayerID()`.
+    pub fn get_fee_payer_id(&self) -> AccountID {
+        let sponsor = get_field_by_symbol("sfSponsor");
+        let sponsor_flags = get_field_by_symbol("sfSponsorFlags");
+        const SPF_SPONSOR_FEE: u32 = 1;
+        if self.is_field_present(sponsor)
+            && self.is_field_present(sponsor_flags)
+            && (self.get_field_u32(sponsor_flags) & SPF_SPONSOR_FEE) != 0
+        {
+            return self.get_account_id(sponsor);
+        }
+        self.get_initiator()
+    }
+
     #[deprecated(note = "renamed to get_initiator per rippled PR #7603")]
     pub fn get_fee_payer(&self) -> AccountID {
         self.get_initiator()

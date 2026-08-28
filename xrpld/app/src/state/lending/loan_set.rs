@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{cell::Cell, fmt, sync::Arc};
 
 use basics::{
     base_uint::Uint256,
@@ -542,42 +542,48 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
     let view_ptr: *mut V = view;
     let representability_asset = {
         let broker_id = sttx.get_field_h256(sf("sfLoanBrokerID"));
-        let Ok(Some(broker_sle)) = view.peek(protocol::loan_broker_keylet_from_key(broker_id))
-        else {
-            return Ter::TEC_NO_ENTRY;
+        let broker_sle = match view.peek(protocol::loan_broker_keylet_from_key(broker_id)) {
+            Ok(Some(sle)) => sle,
+            Ok(None) => return Ter::TEC_NO_ENTRY,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
-        let Ok(Some(vault_sle)) = view.peek(protocol::vault_keylet_from_key(
+        let vault_sle = match view.peek(protocol::vault_keylet_from_key(
             broker_sle.get_field_h256(sf("sfVaultID")),
-        )) else {
-            return Ter::TEF_BAD_LEDGER;
+        )) {
+            Ok(Some(sle)) => sle,
+            Ok(None) | Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         vault_sle.get_field_issue(sf("sfAsset")).asset()
     };
     let rules = view.rules();
 
-    tx::run_loan_set_family_do_apply(
+    let read_error = Cell::new(None);
+    let result = tx::run_loan_set_family_do_apply(
         &tx_view,
         &pre_fee_balance_drops,
-        |broker_id| {
-            unsafe { &mut *view_ptr }
-                .peek(protocol::loan_broker_keylet_from_key(*broker_id))
-                .ok()
-                .flatten()
-                .map(|sle| load_loan_set_broker_view((*sle).clone()))
+        |broker_id| match unsafe { &mut *view_ptr }
+            .peek(protocol::loan_broker_keylet_from_key(*broker_id))
+        {
+            Ok(entry) => entry.map(|sle| load_loan_set_broker_view((*sle).clone())),
+            Err(_) => {
+                read_error.set(Some(Ter::TEF_BAD_LEDGER));
+                None
+            }
         },
-        |vault_id| {
-            unsafe { &mut *view_ptr }
-                .peek(protocol::vault_keylet_from_key(*vault_id))
-                .ok()
-                .flatten()
-                .map(|sle| load_loan_set_vault_view((*sle).clone()))
+        |vault_id| match unsafe { &mut *view_ptr }.peek(protocol::vault_keylet_from_key(*vault_id))
+        {
+            Ok(entry) => entry.map(|sle| load_loan_set_vault_view((*sle).clone())),
+            Err(_) => {
+                read_error.set(Some(Ter::TEF_BAD_LEDGER));
+                None
+            }
         },
-        |account| {
-            unsafe { &mut *view_ptr }
-                .peek(account_keylet(to_160(account)))
-                .ok()
-                .flatten()
-                .map(|sle| load_loan_set_account_state((*sle).clone()))
+        |account| match unsafe { &mut *view_ptr }.peek(account_keylet(to_160(account))) {
+            Ok(entry) => entry.map(|sle| load_loan_set_account_state((*sle).clone())),
+            Err(_) => {
+                read_error.set(Some(Ter::TEF_BAD_LEDGER));
+                None
+            }
         },
         TenthBips32::new(0),
         2_592_000,
@@ -651,14 +657,23 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
         |debt_total, cover_rate| {
             let view = unsafe { &mut *view_ptr };
             let broker_id = sttx.get_field_h256(sf("sfLoanBrokerID"));
-            let Ok(Some(broker_sle)) = view.peek(protocol::loan_broker_keylet_from_key(broker_id))
-            else {
-                return tenth_bips_of_runtime_number(*debt_total, cover_rate);
+            let broker_sle = match view.peek(protocol::loan_broker_keylet_from_key(broker_id)) {
+                Ok(Some(sle)) => sle,
+                Ok(None) => return tenth_bips_of_runtime_number(*debt_total, cover_rate),
+                Err(_) => {
+                    read_error.set(Some(Ter::TEF_BAD_LEDGER));
+                    return tenth_bips_of_runtime_number(*debt_total, cover_rate);
+                }
             };
-            let Ok(Some(vault_sle)) = view.peek(protocol::vault_keylet_from_key(
+            let vault_sle = match view.peek(protocol::vault_keylet_from_key(
                 broker_sle.get_field_h256(sf("sfVaultID")),
-            )) else {
-                return tenth_bips_of_runtime_number(*debt_total, cover_rate);
+            )) {
+                Ok(Some(sle)) => sle,
+                Ok(None) => return tenth_bips_of_runtime_number(*debt_total, cover_rate),
+                Err(_) => {
+                    read_error.set(Some(Ter::TEF_BAD_LEDGER));
+                    return tenth_bips_of_runtime_number(*debt_total, cover_rate);
+                }
             };
             let asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
             minimum_broker_cover(
@@ -673,14 +688,16 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             let view = unsafe { &mut *view_ptr };
             let borrower = if sttx.is_field_present(sf("sfCounterparty")) {
                 let counterparty = sttx.get_account_id(sf("sfCounterparty"));
-                let broker_owner = view
-                    .peek(protocol::loan_broker_keylet_from_key(
-                        sttx.get_field_h256(sf("sfLoanBrokerID")),
-                    ))
-                    .ok()
-                    .flatten()
-                    .map(|sle| sle.get_account_id(sf("sfOwner")))
-                    .unwrap_or(sttx.get_account_id(sf("sfAccount")));
+                let broker_owner = match view.peek(protocol::loan_broker_keylet_from_key(
+                    sttx.get_field_h256(sf("sfLoanBrokerID")),
+                )) {
+                    Ok(Some(sle)) => sle.get_account_id(sf("sfOwner")),
+                    Ok(None) => sttx.get_account_id(sf("sfAccount")),
+                    Err(_) => {
+                        read_error.set(Some(Ter::TEF_BAD_LEDGER));
+                        return 0;
+                    }
+                };
                 if counterparty == broker_owner {
                     sttx.get_account_id(sf("sfAccount"))
                 } else {
@@ -690,21 +707,28 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                 sttx.get_account_id(sf("sfAccount"))
             };
             let keylet = account_keylet(to_160(&borrower));
-            let Ok(Some(borrower_sle)) = view.peek(keylet) else {
-                return 0;
+            let borrower_sle = match view.peek(keylet) {
+                Ok(Some(sle)) => sle,
+                Ok(None) => return 0,
+                Err(_) => {
+                    read_error.set(Some(Ter::TEF_BAD_LEDGER));
+                    return 0;
+                }
             };
-            let _ = ledger::adjust_owner_count(view, &borrower_sle, 1);
-            view.peek(keylet)
-                .ok()
-                .flatten()
-                .map(|sle| sle.get_field_u32(sf("sfOwnerCount")))
-                .unwrap_or(0)
+            if ledger::adjust_owner_count(view, &borrower_sle, 1).is_err() {
+                read_error.set(Some(Ter::TEF_BAD_LEDGER));
+                return 0;
+            }
+            match view.peek(keylet) {
+                Ok(Some(sle)) => ledger::effective_account_reserve(view.fees(), &sle, 0, 0) as i64,
+                Ok(None) => 0,
+                Err(_) => {
+                    read_error.set(Some(Ter::TEF_BAD_LEDGER));
+                    0
+                }
+            }
         },
-        |owner_count| {
-            unsafe { &*view_ptr }
-                .fees()
-                .account_reserve(owner_count as usize) as i64
-        },
+        |required_reserve| required_reserve,
         || {
             let view = unsafe { &mut *view_ptr };
             let borrower = sttx.get_account_id(sf("sfAccount"));
@@ -719,8 +743,9 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             )) else {
                 return Ter::TEF_BAD_LEDGER;
             };
-            ledger::add_empty_holding(
+            ledger::add_empty_holding_with_tx(
                 view,
+                sttx,
                 &borrower,
                 prior,
                 &vault_sle.get_field_issue(sf("sfAsset")).asset(),
@@ -735,19 +760,19 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                 return Ter::TEF_BAD_LEDGER;
             };
             let owner = broker_sle.get_account_id(sf("sfOwner"));
-            let prior = view
-                .peek(account_keylet(to_160(&owner)))
-                .ok()
-                .flatten()
-                .map(|sle| sle.get_field_amount(sf("sfBalance")).xrp())
-                .unwrap_or_else(XRPAmount::new);
+            let prior = match view.peek(account_keylet(to_160(&owner))) {
+                Ok(Some(sle)) => sle.get_field_amount(sf("sfBalance")).xrp(),
+                Ok(None) => XRPAmount::new(),
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            };
             let Ok(Some(vault_sle)) = view.peek(protocol::vault_keylet_from_key(
                 broker_sle.get_field_h256(sf("sfVaultID")),
             )) else {
                 return Ter::TEF_BAD_LEDGER;
             };
-            ledger::add_empty_holding(
+            ledger::add_empty_holding_with_tx(
                 view,
+                sttx,
                 &owner,
                 prior,
                 &vault_sle.get_field_issue(sf("sfAsset")).asset(),
@@ -775,47 +800,29 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                 return Ter::TEF_BAD_LEDGER;
             };
             let asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
-            let Some(origination_fee) = sttx
+            let origination_fee = sttx
                 .is_field_present(sf("sfLoanOriginationFee"))
                 .then(|| sttx.get_field_number(sf("sfLoanOriginationFee")).value())
-            else {
-                let Some(amount) =
-                    runtime_to_amount(asset, principal_requested, RoundingMode::ToNearest)
-                else {
-                    return Ter::TEC_INTERNAL;
-                };
-                return account_send(
-                    view,
-                    &vault_sle.get_account_id(sf("sfAccount")),
-                    &borrower,
-                    &amount,
-                );
-            };
+                .unwrap_or_else(RuntimeNumber::zero);
             let borrower_amount_number = principal_requested - origination_fee;
             let Some(borrower_amount) =
                 runtime_to_amount(asset, borrower_amount_number, RoundingMode::ToNearest)
             else {
                 return Ter::TEC_INTERNAL;
             };
-            let borrower_result = account_send(
-                view,
-                &vault_sle.get_account_id(sf("sfAccount")),
-                &borrower,
-                &borrower_amount,
-            );
-            if borrower_result != Ter::TES_SUCCESS {
-                return borrower_result;
-            }
             let Some(origination_fee_amount) =
                 runtime_to_amount(asset, origination_fee, RoundingMode::ToNearest)
             else {
                 return Ter::TEC_INTERNAL;
             };
-            account_send(
+            account_send_multi(
                 view,
                 &vault_sle.get_account_id(sf("sfAccount")),
-                &broker_owner,
-                &origination_fee_amount,
+                asset,
+                &[
+                    (borrower, borrower_amount),
+                    (broker_owner, origination_fee_amount),
+                ],
             )
         },
         || {
@@ -872,7 +879,10 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                 Some(cp) if cp != broker.owner => cp,
                 _ => sttx.get_account_id(sf("sfAccount")),
             };
-            let start_date = view.parent_close_time().as_seconds();
+            // LoanSet::getStartDate uses the ledger being built's close time,
+            // not its parent's close time.  The two differ by one close
+            // interval and feed both sfStartDate and sfNextPaymentDueDate.
+            let start_date = view.header().close_time;
             let loan_sequence = broker.entry.get_field_u32(sf("sfLoanSequence"));
             let loan_id = loan_key(broker_id, loan_sequence);
             let mut loan = STLedgerEntry::from_type_and_key(LedgerEntryType::Loan, loan_id);
@@ -992,7 +1002,8 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             }
             Ter::TES_SUCCESS
         },
-    )
+    );
+    read_error.get().unwrap_or(result)
 }
 
 pub fn apply_loan_broker_set<V: ApplyView>(
@@ -1013,8 +1024,10 @@ pub fn apply_loan_broker_set<V: ApplyView>(
 
     let account = sttx.get_account_id(sf("sfAccount"));
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
-    let Ok(Some(tx_vault_sle)) = view.peek(protocol::vault_keylet_from_key(vault_id)) else {
-        return Ter::TEC_NO_ENTRY;
+    let tx_vault_sle = match view.peek(protocol::vault_keylet_from_key(vault_id)) {
+        Ok(Some(vault_sle)) => vault_sle,
+        Ok(None) => return Ter::TEC_NO_ENTRY,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     if account != tx_vault_sle.get_account_id(sf("sfOwner")) {
         return Ter::TEC_NO_PERMISSION;
@@ -1022,9 +1035,10 @@ pub fn apply_loan_broker_set<V: ApplyView>(
 
     if sttx.is_field_present(sf("sfLoanBrokerID")) {
         let broker_id = sttx.get_field_h256(sf("sfLoanBrokerID"));
-        let Ok(Some(broker_sle)) = view.peek(protocol::loan_broker_keylet_from_key(broker_id))
-        else {
-            return Ter::TEC_NO_ENTRY;
+        let broker_sle = match view.peek(protocol::loan_broker_keylet_from_key(broker_id)) {
+            Ok(Some(broker_sle)) => broker_sle,
+            Ok(None) => return Ter::TEC_NO_ENTRY,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         if vault_id != broker_sle.get_field_h256(sf("sfVaultID")) {
             return Ter::TEC_NO_PERMISSION;
@@ -1101,13 +1115,13 @@ pub fn apply_loan_broker_set<V: ApplyView>(
         Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
-    let _ = ledger::adjust_owner_count(view, &owner_sle, 2);
+    if ledger::adjust_owner_count(view, &owner_sle, 2).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
     let Ok(Some(updated_owner_sle)) = view.peek(account_keylet(to_160(&account))) else {
         return Ter::TEF_BAD_LEDGER;
     };
-    let reserve = view
-        .fees()
-        .account_reserve(updated_owner_sle.get_field_u32(sf("sfOwnerCount")) as usize);
+    let reserve = ledger::effective_account_reserve(view.fees(), &updated_owner_sle, 0, 0);
     if pre_fee_balance_drops < reserve as i64 {
         return Ter::TEC_INSUFFICIENT_RESERVE;
     }
@@ -1119,8 +1133,9 @@ pub fn apply_loan_broker_set<V: ApplyView>(
     };
     let pseudo_id = pseudo.get_account_id(sf("sfAccount"));
 
-    let holding = ledger::add_empty_holding(
+    let holding = ledger::add_empty_holding_with_tx(
         view,
+        sttx,
         &pseudo_id,
         XRPAmount::from_drops(pre_fee_balance_drops),
         &vault_asset,

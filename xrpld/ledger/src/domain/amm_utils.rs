@@ -1,7 +1,10 @@
 //! `xrpl/ledger/helpers/AMMUtils.*` compatibility-safe read helpers.
 
 use basics::base_uint::Uint160;
+use std::sync::Arc;
+
 use basics::expected::{Expected, Unexpected};
+use basics::number::NumberParts as RuntimeNumber;
 use protocol::{
     AccountID, Currency, Issue, STAmount, STIssue, STLedgerEntry, Ter, amm_lpt_currency,
     get_field_by_symbol, invalid_amm_asset_pair, is_xrp_currency, line, owner_dir_keylet,
@@ -9,7 +12,10 @@ use protocol::{
 };
 use shamap::traversal::TraversalError;
 
-use crate::{FreezeHandling, Ledger, ReadView, account_funds, is_frozen};
+use crate::{
+    ApplyView, FreezeHandling, Ledger, ReadView, account_funds, is_frozen,
+    within_relative_distance_amount,
+};
 
 fn issue_from_stissue(issue: STIssue) -> Option<Issue> {
     match issue.asset() {
@@ -153,7 +159,11 @@ pub fn amm_lp_holds_from_sle(
     )
 }
 
-pub fn get_trading_fee(view: &Ledger, amm_sle: &STLedgerEntry, account: AccountID) -> u16 {
+pub fn get_trading_fee<V: ReadView + ?Sized>(
+    view: &V,
+    amm_sle: &STLedgerEntry,
+    account: AccountID,
+) -> u16 {
     if amm_sle.is_field_present(get_field_by_symbol("sfAuctionSlot")) {
         let auction_slot = amm_sle.get_field_object(get_field_by_symbol("sfAuctionSlot"));
         let expiration = u64::from(auction_slot.get_field_u32(get_field_by_symbol("sfExpiration")));
@@ -299,4 +309,90 @@ pub fn is_only_liquidity_provider<V: ReadView + ?Sized>(
     }
 
     Unexpected::new(Ter::TEC_INTERNAL).into()
+}
+
+fn reconciled_lp_token_balance(
+    only_liquidity_provider: bool,
+    lp_tokens: &STAmount,
+    amm_lp_token_balance: &STAmount,
+) -> Result<Option<STAmount>, Ter> {
+    if !only_liquidity_provider {
+        return Ok(None);
+    }
+    let tolerance =
+        RuntimeNumber::try_from_external_parts(1, -3, basics::number::get_mantissa_scale())
+            .expect("AMM LP reconciliation tolerance must be representable");
+    if !within_relative_distance_amount(lp_tokens.clone(), amm_lp_token_balance.clone(), tolerance)
+    {
+        return Err(Ter::TEC_AMM_INVALID_TOKENS);
+    }
+    Ok(Some(lp_tokens.clone()))
+}
+
+/// rippled's `verifyAndAdjustLPTokenBalance`: when the withdrawing account is
+/// the AMM's only liquidity provider, its LP trust-line balance is authoritative
+/// over the pool object's rounded aggregate, within the strict 1e-3 tolerance.
+pub fn verify_and_adjust_lp_token_balance<V: ApplyView + ?Sized>(
+    view: &mut V,
+    lp_tokens: &STAmount,
+    amm_sle: &mut Arc<STLedgerEntry>,
+    account: AccountID,
+) -> Result<(), Ter> {
+    let only = is_only_liquidity_provider(view, lp_tokens.issue(), account);
+    if !only.has_value() {
+        return Err(*only.error());
+    }
+    let Some(adjusted) = reconciled_lp_token_balance(
+        *only.value(),
+        lp_tokens,
+        &amm_sle.get_field_amount(get_field_by_symbol("sfLPTokenBalance")),
+    )?
+    else {
+        return Ok(());
+    };
+
+    let mut object = amm_sle.clone_as_object();
+    object.set_field_amount(get_field_by_symbol("sfLPTokenBalance"), adjusted);
+    let updated = Arc::new(STLedgerEntry::from_stobject(object, *amm_sle.key()));
+    view.update(updated.clone())
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+    *amm_sle = updated;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lp(value: i64, exponent: i32) -> STAmount {
+        let issue = Issue::new(
+            protocol::currency_from_string("LPT"),
+            AccountID::from_array([0x44; 20]),
+        );
+        STAmount::from_iou_amount(
+            protocol::sf_generic(),
+            protocol::IOUAmount::from_parts(value, exponent).expect("canonical LP amount"),
+            issue,
+        )
+    }
+
+    #[test]
+    fn sole_lp_reconciliation_uses_strict_one_per_thousand_boundary() {
+        let recorded = lp(1_000_000_000_000_000, -12); // 1000
+        let within = lp(9_991_000_000_000_000, -13); // 999.1
+        let boundary = lp(9_990_000_000_000_000, -13); // 999
+
+        assert_eq!(
+            reconciled_lp_token_balance(true, &within, &recorded),
+            Ok(Some(within))
+        );
+        assert_eq!(
+            reconciled_lp_token_balance(true, &boundary, &recorded),
+            Err(Ter::TEC_AMM_INVALID_TOKENS)
+        );
+        assert_eq!(
+            reconciled_lp_token_balance(false, &boundary, &recorded),
+            Ok(None)
+        );
+    }
 }

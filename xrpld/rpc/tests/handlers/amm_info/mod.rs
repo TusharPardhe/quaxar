@@ -18,6 +18,7 @@ use rpc::{
 struct FakeSource {
     ledger: Option<LedgerLookupLedger>,
     validated: Option<LedgerLookupLedger>,
+    parent_close_time: u32,
     account_roots: BTreeMap<AccountID, STLedgerEntry>,
     entries: BTreeMap<Uint256, STLedgerEntry>,
 }
@@ -71,6 +72,10 @@ impl AmmInfoSource for FakeSource {
         entry_index: Uint256,
     ) -> Option<STLedgerEntry> {
         self.entries.get(&entry_index).cloned()
+    }
+
+    fn parent_close_time(&self, _ledger: &LedgerLookupLedger) -> u32 {
+        self.parent_close_time
     }
 }
 

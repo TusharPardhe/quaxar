@@ -24,7 +24,10 @@ fn account_to_uint160(account: &protocol::AccountID) -> Uint160 {
 /// Returns `true` if the MPT issuance has the `lsfMPTCanTrade` flag set.
 pub fn can_mpt_trade<V: ReadView>(view: &V, issue: &MPTIssue) -> Result<bool, Ter> {
     let issuance_keylet = mpt_issuance_keylet_from_mptid(issue.mpt_id());
-    let Some(sle) = view.read(issuance_keylet).map_err(|_| Ter::TEF_INTERNAL)? else {
+    let Some(sle) = view
+        .read(issuance_keylet)
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?
+    else {
         return Err(Ter::TEC_OBJECT_NOT_FOUND);
     };
     Ok(sle.is_flag(lsfMPTCanTrade))
@@ -38,7 +41,10 @@ pub fn can_mpt_transfer<V: ReadView>(
     to: &protocol::AccountID,
 ) -> Result<bool, Ter> {
     let issuance_keylet = mpt_issuance_keylet_from_mptid(issue.mpt_id());
-    let Some(sle) = view.read(issuance_keylet).map_err(|_| Ter::TEF_INTERNAL)? else {
+    let Some(sle) = view
+        .read(issuance_keylet)
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?
+    else {
         return Err(Ter::TEC_OBJECT_NOT_FOUND);
     };
     let issuer = sle.get_account_id(sf("sfIssuer"));
@@ -83,8 +89,10 @@ pub fn require_mpt_auth<V: ReadView>(
     account: &protocol::AccountID,
 ) -> Ter {
     let issuance_keylet = mpt_issuance_keylet_from_mptid(issue.mpt_id());
-    let Ok(Some(sle_issuance)) = view.read(issuance_keylet) else {
-        return Ter::TEC_OBJECT_NOT_FOUND;
+    let sle_issuance = match view.read(issuance_keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let issuer = sle_issuance.get_account_id(sf("sfIssuer"));
     if issuer == *account {
@@ -94,11 +102,10 @@ pub fn require_mpt_auth<V: ReadView>(
         return Ter::TES_SUCCESS;
     }
     let token_keylet = mptoken_keylet(issuance_keylet.key, account_to_uint160(account));
-    let Ok(Some(sle_token)) = view.read(token_keylet) else {
-        // WeakAuth: token doesn't exist yet — that's fine for offer creation
-        // (will be created during crossing). But if requireAuth is set and no
-        // token exists, we can't verify authorization.
-        return Ter::TEC_NO_AUTH;
+    let sle_token = match view.read(token_keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEC_NO_AUTH,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     if !sle_token.is_flag(lsfMPTAuthorized) {
         return Ter::TEC_NO_AUTH;
@@ -107,12 +114,14 @@ pub fn require_mpt_auth<V: ReadView>(
 }
 
 /// Check if the MPT issuance is globally frozen (locked).
-pub fn is_mpt_frozen<V: ReadView>(view: &V, issue: &MPTIssue) -> bool {
+pub fn is_mpt_frozen<V: ReadView>(view: &V, issue: &MPTIssue) -> Result<bool, Ter> {
     let issuance_keylet = mpt_issuance_keylet_from_mptid(issue.mpt_id());
-    let Ok(Some(sle)) = view.read(issuance_keylet) else {
-        return false;
+    let sle = match view.read(issuance_keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ok(false),
+        Err(_) => return Err(Ter::TEF_BAD_LEDGER),
     };
-    sle.is_flag(lsfMPTLocked)
+    Ok(sle.is_flag(lsfMPTLocked))
 }
 
 /// Check if a specific account's MPToken is individually frozen.
@@ -120,13 +129,15 @@ pub fn is_mpt_individual_frozen<V: ReadView>(
     view: &V,
     issue: &MPTIssue,
     account: &protocol::AccountID,
-) -> bool {
+) -> Result<bool, Ter> {
     let issuance_keylet = mpt_issuance_keylet_from_mptid(issue.mpt_id());
     let token_keylet = mptoken_keylet(issuance_keylet.key, account_to_uint160(account));
-    let Ok(Some(sle)) = view.read(token_keylet) else {
-        return false;
+    let sle = match view.read(token_keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ok(false),
+        Err(_) => return Err(Ter::TEF_BAD_LEDGER),
     };
-    sle.is_flag(lsfMPTLocked)
+    Ok(sle.is_flag(lsfMPTLocked))
 }
 
 /// Create an MPToken for `holder` if one does not already exist.
@@ -143,8 +154,10 @@ pub fn check_create_mpt<V: ApplyView>(
     }
 
     let token_keylet = mptoken_keylet(issuance_keylet.key, account_to_uint160(holder));
-    if view.exists(token_keylet).unwrap_or(false) {
-        return Ter::TES_SUCCESS;
+    match view.exists(token_keylet) {
+        Ok(true) => return Ter::TES_SUCCESS,
+        Ok(false) => {}
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     }
 
     // Create a new MPToken for this holder
@@ -168,17 +181,22 @@ pub fn check_create_mpt<V: ApplyView>(
             mptoken.set_field_u64(sf("sfOwnerNode"), owner_node);
         }
         Ok(None) => return Ter::TEC_DIR_FULL,
-        Err(_) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     }
 
     if view.insert(Arc::new(mptoken)).is_err() {
-        return Ter::TEF_INTERNAL;
+        return Ter::TEF_BAD_LEDGER;
     }
 
     // Adjust owner count
     let acct_keylet = protocol::account_keylet(account_to_uint160(holder));
-    if let Ok(Some(acct_sle)) = view.peek(acct_keylet) {
-        let _ = ledger::adjust_owner_count(view, &acct_sle, 1);
+    let acct_sle = match view.peek(acct_keylet) {
+        Ok(Some(sle)) => sle,
+        Ok(None) => return Ter::TEF_INTERNAL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
+    };
+    if ledger::adjust_owner_count(view, &acct_sle, 1).is_err() {
+        return Ter::TEF_BAD_LEDGER;
     }
 
     Ter::TES_SUCCESS
@@ -199,8 +217,10 @@ pub fn check_mpt_dex_preclaim<V: ReadView>(
     };
 
     // Check global freeze
-    if is_mpt_frozen(view, issue) {
-        return Ter::TEC_FROZEN;
+    match is_mpt_frozen(view, issue) {
+        Ok(true) => return Ter::TEC_FROZEN,
+        Ok(false) => {}
+        Err(ter) => return ter,
     }
 
     // Check canTrade flag on issuance
@@ -231,4 +251,129 @@ pub fn check_mpt_dex_crossing<V: ApplyView>(
         return ter;
     }
     require_mpt_auth(view, issue, owner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        can_mpt_trade, check_create_mpt, is_mpt_frozen, is_mpt_individual_frozen, require_mpt_auth,
+    };
+    use basics::base_uint::Uint256;
+    use ledger::{ApplyViewImpl, Fees, Ledger, LedgerHeader, ReadView, ReadViewTx, ViewError};
+    use protocol::{AccountID, ApplyFlags, Keylet, MPTIssue, Rules, Ter, make_mpt_id};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct FaultReadView {
+        base: Ledger,
+        fail_exists: bool,
+    }
+
+    impl ReadView for FaultReadView {
+        fn open(&self) -> bool {
+            false
+        }
+
+        fn header(&self) -> LedgerHeader {
+            ReadView::header(&self.base)
+        }
+
+        fn fees(&self) -> Fees {
+            ReadView::fees(&self.base)
+        }
+
+        fn rules(&self) -> Rules {
+            ReadView::rules(&self.base)
+        }
+
+        fn exists(&self, _keylet: Keylet) -> Result<bool, ViewError> {
+            if self.fail_exists {
+                Err(ViewError::Conversion("injected MPT exists failure".into()))
+            } else {
+                Ok(false)
+            }
+        }
+
+        fn succ(
+            &self,
+            _key: Uint256,
+            _last: Option<Uint256>,
+        ) -> Result<Option<Uint256>, ViewError> {
+            Err(ViewError::Conversion(
+                "injected MPT successor failure".into(),
+            ))
+        }
+
+        fn read(&self, _keylet: Keylet) -> Result<Option<Arc<protocol::STLedgerEntry>>, ViewError> {
+            Err(ViewError::Conversion("injected MPT read failure".into()))
+        }
+
+        fn sles(&self) -> Result<Vec<Arc<protocol::STLedgerEntry>>, ViewError> {
+            Err(ViewError::Conversion(
+                "injected MPT traversal failure".into(),
+            ))
+        }
+
+        fn tx_exists(&self, key: Uint256) -> Result<bool, ViewError> {
+            ReadView::tx_exists(&self.base, key)
+        }
+
+        fn tx_read(&self, key: Uint256) -> Result<Option<ReadViewTx>, ViewError> {
+            ReadView::tx_read(&self.base, key)
+        }
+
+        fn txs(&self) -> Result<Vec<ReadViewTx>, ViewError> {
+            ReadView::txs(&self.base)
+        }
+    }
+
+    fn fixture_issue() -> (MPTIssue, AccountID) {
+        let issuer = AccountID::from_array([0x31; 20]);
+        let holder = AccountID::from_array([0x32; 20]);
+        (MPTIssue::new(make_mpt_id(7, issuer)), holder)
+    }
+
+    #[test]
+    fn mpt_dex_read_failures_are_hard_bad_ledger() {
+        let view = FaultReadView {
+            base: Ledger::from_ledger_seq_and_close_time(1, 1, false),
+            fail_exists: false,
+        };
+        let (issue, holder) = fixture_issue();
+
+        assert_eq!(can_mpt_trade(&view, &issue), Err(Ter::TEF_BAD_LEDGER));
+        assert_eq!(
+            require_mpt_auth(&view, &issue, &holder),
+            Ter::TEF_BAD_LEDGER
+        );
+        assert_eq!(is_mpt_frozen(&view, &issue), Err(Ter::TEF_BAD_LEDGER));
+        assert_eq!(
+            is_mpt_individual_frozen(&view, &issue, &holder),
+            Err(Ter::TEF_BAD_LEDGER)
+        );
+    }
+
+    #[test]
+    fn mpt_create_exists_and_directory_read_failures_are_not_semantic_absence() {
+        let (issue, holder) = fixture_issue();
+        let exists_fault = Arc::new(FaultReadView {
+            base: Ledger::from_ledger_seq_and_close_time(1, 1, false),
+            fail_exists: true,
+        });
+        let mut view = ApplyViewImpl::new(exists_fault, ApplyFlags::NONE);
+        assert_eq!(
+            check_create_mpt(&mut view, &issue, &holder),
+            Ter::TEF_BAD_LEDGER
+        );
+
+        let directory_fault = Arc::new(FaultReadView {
+            base: Ledger::from_ledger_seq_and_close_time(1, 1, false),
+            fail_exists: false,
+        });
+        let mut view = ApplyViewImpl::new(directory_fault, ApplyFlags::NONE);
+        assert_eq!(
+            check_create_mpt(&mut view, &issue, &holder),
+            Ter::TEF_BAD_LEDGER
+        );
+    }
 }

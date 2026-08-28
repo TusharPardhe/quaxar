@@ -59,14 +59,16 @@ impl SHAMapStoreNodeFamilyCacheRuntime for RecordingNodeFamily {
             .expect("cleared mutex must not be poisoned") += 1;
     }
 
-    fn visit_state_map_hashes(
+    fn visit_state_map_nodes(
         &self,
         ledger: &Ledger,
-        visit: &mut dyn FnMut(Uint256) -> bool,
+        visit: &mut dyn FnMut(
+            &basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
+        ) -> bool,
     ) -> Result<(), TraversalError> {
-        ledger.state_map().visit_nodes(&mut |_| None, &mut |node| {
-            visit(*node.get_hash().as_uint256())
-        })
+        ledger
+            .state_map()
+            .visit_nodes(&mut |_| None, &mut |node| visit(node))
     }
 }
 

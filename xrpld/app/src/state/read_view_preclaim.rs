@@ -11,29 +11,20 @@ use basics::base_uint::{Uint160, Uint256};
 use ledger::ReadView;
 use protocol::{
     AccountID, ApplyFlags, Asset, STAmount, STTx, Ter, TxType, feature_batch_v1_1,
-    get_field_by_symbol, lsfAllowTrustLineLocking, lsfDisallowIncomingCheck,
-    lsfDisallowIncomingPayChan, lsfGlobalFreeze, lsfHighAuth, lsfHighDeepFreeze, lsfHighFreeze,
-    lsfLowAuth, lsfLowDeepFreeze, lsfLowFreeze, lsfRequireAuth, lsfRequireDestTag,
+    get_field_by_symbol, is_tes_success, lsfAllowTrustLineLocking, lsfDepositAuth,
+    lsfDisallowIncomingCheck, lsfDisallowIncomingPayChan, lsfGlobalFreeze, lsfHighAuth,
+    lsfHighDeepFreeze, lsfHighFreeze, lsfLowAuth, lsfLowDeepFreeze, lsfLowFreeze, lsfRequireAuth,
+    lsfRequireDestTag,
 };
 use tx::{
-    AccountDeleteDirectoryEntryDisposition, AccountDeletePreclaimFrontFacts,
-    AccountDeletePreclaimNftAndSequenceFacts, AccountDeletePreclaimScanState,
-    AccountSetPreclaimFacts, CheckCancelPreclaimFacts, CheckCashPreclaimFacts,
-    CheckCreatePreclaimFacts, DelegateSetPreclaimFacts, DepositPreauthCredentialPreclaimFact,
-    DepositPreauthPreclaimFacts, EscrowCancelIssuePreclaimFacts, EscrowCancelMptPreclaimFacts,
-    EscrowCancelPreclaimFacts, EscrowCreateAmountKind, EscrowCreateIssuePreclaimFacts,
-    EscrowCreateMptPreclaimFacts, EscrowCreatePreclaimFacts, PaymentChannelCreatePreclaimFacts,
-    PaymentPreclaimFacts, run_account_delete_preclaim_directory_scan,
-    run_account_delete_preclaim_front, run_account_delete_preclaim_nft_and_sequence,
-    run_account_set_preclaim, run_check_cancel_preclaim, run_check_cash_preclaim,
-    run_check_create_preclaim, run_delegate_set_preclaim, run_deposit_preauth_preclaim,
-    run_escrow_cancel_issue_preclaim, run_escrow_cancel_mpt_preclaim, run_escrow_cancel_preclaim,
-    run_escrow_create_issue_preclaim, run_escrow_create_mpt_preclaim, run_escrow_create_preclaim,
+    AccountDeleteDirectoryEntryDisposition, AccountDeletePreclaimNftAndSequenceFacts,
+    AccountDeletePreclaimScanState, AccountSetPreclaimFacts, CheckCancelPreclaimFacts,
+    CheckCreatePreclaimFacts, PaymentChannelCreatePreclaimFacts, PaymentPreclaimFacts,
+    run_account_delete_preclaim_directory_scan, run_account_delete_preclaim_nft_and_sequence,
+    run_account_set_preclaim, run_check_cancel_preclaim, run_check_create_preclaim,
     run_payment_channel_claim_preclaim, run_payment_channel_create_preclaim,
     run_payment_preclaim_with_facts,
 };
-
-const LSF_PSEUDO_ACCOUNT_FIELDS: [&str; 3] = ["sfAMMID", "sfVaultID", "sfLoanBrokerID"];
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
@@ -55,9 +46,7 @@ fn read_account<V: ReadView>(
 }
 
 fn account_is_pseudo(sle: &protocol::STLedgerEntry) -> bool {
-    LSF_PSEUDO_ACCOUNT_FIELDS
-        .iter()
-        .any(|field| sle.is_field_present(sf(field)))
+    ledger::is_pseudo_account(sle)
 }
 
 fn has_expired<V: ReadView>(view: &V, expiration: Option<u32>) -> bool {
@@ -107,6 +96,30 @@ fn iou_frozen<V: ReadView>(
     };
     if account_flag(&issuer, lsfGlobalFreeze) {
         return Ok(true);
+    }
+    let Some(line) = view
+        .read(protocol::line(account, issue.account, issue.currency))
+        .map_err(|_| view_error())?
+    else {
+        return Ok(false);
+    };
+    Ok(account_flag(
+        &line,
+        if issue.account > account {
+            lsfHighFreeze
+        } else {
+            lsfLowFreeze
+        },
+    ))
+}
+
+fn iou_trustline_frozen<V: ReadView>(
+    view: &V,
+    account: AccountID,
+    issue: protocol::Issue,
+) -> Result<bool, Ter> {
+    if account == issue.account {
+        return Ok(false);
     }
     let Some(line) = view
         .read(protocol::line(account, issue.account, issue.currency))
@@ -191,11 +204,28 @@ fn account_holds_at_least<V: ReadView>(
             let Some(root) = read_account(view, account)? else {
                 return Ok(false);
             };
-            let balance = root.get_field_amount(sf("sfBalance")).xrp().drops();
-            let reserve = view
-                .fees()
-                .account_reserve(root.get_field_u32(sf("sfOwnerCount")) as usize)
-                as i64;
+            let balance = view
+                .balance_hook_iou(
+                    account,
+                    protocol::xrp_account(),
+                    root.get_field_amount(sf("sfBalance")),
+                )
+                .xrp()
+                .drops();
+            let owner_count = view
+                .owner_count_hook(account, ledger::OwnerCounts::from_sle(&root))
+                .count();
+            let reserve = if ledger::is_pseudo_account(&root) {
+                0
+            } else {
+                ledger::effective_account_reserve_with_owner_count(
+                    view.fees(),
+                    &root,
+                    owner_count,
+                    0,
+                    0,
+                ) as i64
+            };
             let available = balance.saturating_sub(reserve)
                 + if include_check_reserve {
                     view.fees().increment as i64
@@ -311,15 +341,27 @@ fn preclaim_account_set<V: ReadView>(
 ) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
     let account_root = read_account(view, account)?;
-    let owner_dir_empty = directory_entries(view, account)?.is_empty();
+    let Some(account_root_ref) = account_root.as_ref() else {
+        return Ok(Ter::TER_NO_ACCOUNT);
+    };
+    let account_flags = account_root_ref.get_field_u32(sf("sfFlags"));
+    let set_flag = tx.get_field_u32(sf("sfSetFlag"));
+    let setting_require_auth = (tx.get_flags() & tx::ACCOUNT_SET_REQUIRE_AUTH_FLAG != 0)
+        || set_flag == tx::ASF_REQUIRE_AUTH;
+    let needs_owner_directory = (setting_require_auth && account_flags & tx::LSF_REQUIRE_AUTH == 0)
+        || (set_flag == tx::ASF_ALLOW_TRUST_LINE_CLAWBACK
+            && account_flags & tx::LSF_NO_FREEZE == 0);
+    let owner_dir_empty = if needs_owner_directory {
+        directory_entries(view, account)?.is_empty()
+    } else {
+        true
+    };
     Ok(run_account_set_preclaim(AccountSetPreclaimFacts {
         tx_flags: tx.get_flags(),
-        set_flag: tx.get_field_u32(sf("sfSetFlag")),
+        set_flag,
         apply_flags,
-        account_exists: account_root.is_some(),
-        account_flags: account_root
-            .as_ref()
-            .map_or(0, |sle| sle.get_field_u32(sf("sfFlags"))),
+        account_exists: true,
+        account_flags,
         owner_dir_empty,
         feature_clawback_enabled: view.rules().enabled(&protocol::feature_clawback()),
     }))
@@ -328,34 +370,41 @@ fn preclaim_account_set<V: ReadView>(
 fn preclaim_account_delete<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
     let destination = tx.get_account_id(sf("sfDestination"));
-    let destination_sle = read_account(view, destination)?;
-    let source_sle = read_account(view, account)?;
+    let Some(destination_sle) = read_account(view, destination)? else {
+        return Ok(Ter::TEC_NO_DST);
+    };
+    if account_flag(&destination_sle, lsfRequireDestTag)
+        && !tx.is_field_present(sf("sfDestinationTag"))
+    {
+        return Ok(Ter::TEC_DST_TAG_NEEDED);
+    }
+
     let credentials_present = tx.is_field_present(sf("sfCredentialIDs"));
     let credentials =
         ledger::credential_helpers::valid(view, tx, &account).map_err(|_| view_error())?;
-    let preauth = view
-        .exists(protocol::deposit_preauth_keylet(
-            Uint160::from_void(destination.data()),
-            Uint160::from_void(account.data()),
-        ))
-        .map_err(|_| view_error())?;
-    let front = run_account_delete_preclaim_front(
-        AccountDeletePreclaimFrontFacts {
-            destination_exists: destination_sle.is_some(),
-            destination_flags: destination_sle
-                .as_ref()
-                .map_or(0, |sle| sle.get_field_u32(sf("sfFlags"))),
-            destination_tag_present: tx.is_field_present(sf("sfDestinationTag")),
-            credential_ids_present: credentials_present,
-            source_account_exists: source_sle.is_some(),
-        },
-        || credentials,
-        || preauth,
-    );
-    if front != Ter::TES_SUCCESS {
-        return Ok(front);
+    if credentials != Ter::TES_SUCCESS {
+        return Ok(credentials);
     }
-    let source = source_sle.expect("front verified source account");
+    if !credentials_present && account_flag(&destination_sle, lsfDepositAuth) {
+        let preauthorized = view
+            .exists(protocol::deposit_preauth_keylet(
+                Uint160::from_void(destination.data()),
+                Uint160::from_void(account.data()),
+            ))
+            .map_err(|_| view_error())?;
+        if !preauthorized {
+            return Ok(Ter::TEC_NO_PERMISSION);
+        }
+    }
+
+    let Some(source) = read_account(view, account)? else {
+        return Ok(Ter::TER_NO_ACCOUNT);
+    };
+    let minted_nftokens = source.get_field_u32(sf("sfMintedNFTokens"));
+    let burned_nftokens = source.get_field_u32(sf("sfBurnedNFTokens"));
+    if minted_nftokens != burned_nftokens {
+        return Ok(Ter::TEC_HAS_OBLIGATIONS);
+    }
     let nft_min = protocol::nft_page_min_keylet(Uint160::from_void(account.data()));
     let nft_max = protocol::nft_page_max_keylet(Uint160::from_void(account.data()));
     let owned_nft_page_present = view
@@ -363,8 +412,8 @@ fn preclaim_account_delete<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter>
         .map_err(|_| view_error())?
         .is_some();
     match run_account_delete_preclaim_nft_and_sequence(AccountDeletePreclaimNftAndSequenceFacts {
-        minted_nftokens: source.get_field_u32(sf("sfMintedNFTokens")),
-        burned_nftokens: source.get_field_u32(sf("sfBurnedNFTokens")),
+        minted_nftokens,
+        burned_nftokens,
         owned_nft_page_present,
         sponsor_mismatch: source.is_field_present(sf("sfSponsor"))
             && source.get_account_id(sf("sfSponsor")) != destination,
@@ -426,17 +475,29 @@ fn preclaim_account_delete<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter>
 fn preclaim_delegate_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
     let authorize = tx.get_account_id(sf("sfAuthorize"));
-    Ok(run_delegate_set_preclaim(DelegateSetPreclaimFacts {
-        account_exists: read_account(view, account)?.is_some(),
-        authorize_exists: read_account(view, authorize)?.is_some(),
-        permissions_empty: tx.get_field_array(sf("sfPermissions")).is_empty(),
-        delegate_exists: view
+    if !view
+        .exists(account_keylet(account))
+        .map_err(|_| view_error())?
+    {
+        return Ok(Ter::TER_NO_ACCOUNT);
+    }
+    let Some(authorize_sle) = read_account(view, authorize)? else {
+        return Ok(Ter::TEC_NO_TARGET);
+    };
+    if ledger::is_pseudo_account(&authorize_sle) {
+        return Ok(Ter::TEC_PSEUDO_ACCOUNT);
+    }
+    if tx.get_field_array(sf("sfPermissions")).is_empty()
+        && !view
             .exists(protocol::delegate_keylet(
                 Uint160::from_void(account.data()),
                 Uint160::from_void(authorize.data()),
             ))
-            .map_err(|_| view_error())?,
-    }))
+            .map_err(|_| view_error())?
+    {
+        return Ok(Ter::TEC_NO_ENTRY);
+    }
+    Ok(Ter::TES_SUCCESS)
 }
 
 // rippled SetRegularKey and SignerListSet inherit Transactor::preclaim without
@@ -452,95 +513,89 @@ fn preclaim_signer_list_set() -> Result<Ter, Ter> {
 
 fn preclaim_deposit_preauth<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
-    let authorize = tx
-        .is_field_present(sf("sfAuthorize"))
-        .then(|| tx.get_account_id(sf("sfAuthorize")));
-    let unauthorize = tx
-        .is_field_present(sf("sfUnauthorize"))
-        .then(|| tx.get_account_id(sf("sfUnauthorize")));
-    let authorize_credentials_present = tx.is_field_present(sf("sfAuthorizeCredentials"));
-    let unauthorize_credentials_present = tx.is_field_present(sf("sfUnauthorizeCredentials"));
     let account_key = Uint160::from_void(account.data());
-
-    let authorize_preauth_exists = if let Some(target) = authorize {
-        view.exists(protocol::deposit_preauth_keylet(
-            account_key,
-            Uint160::from_void(target.data()),
-        ))
-        .map_err(|_| view_error())?
-    } else {
-        false
-    };
-    let unauthorize_preauth_exists = if let Some(target) = unauthorize {
-        view.exists(protocol::deposit_preauth_keylet(
-            account_key,
-            Uint160::from_void(target.data()),
-        ))
-        .map_err(|_| view_error())?
-    } else {
-        false
-    };
-
-    let credential_field = if authorize_credentials_present {
-        sf("sfAuthorizeCredentials")
-    } else {
-        sf("sfUnauthorizeCredentials")
-    };
-    let raw_credentials = (authorize_credentials_present || unauthorize_credentials_present)
-        .then(|| tx.get_field_array(credential_field));
-    let credentials: Vec<DepositPreauthCredentialPreclaimFact<AccountID, Vec<u8>>> =
-        if let Some(items) = raw_credentials.as_ref() {
-            items
-                .iter()
-                .map(|item| {
-                    let issuer = item.get_account_id(sf("sfIssuer"));
-                    Ok(DepositPreauthCredentialPreclaimFact {
-                        issuer,
-                        credential_type: item.get_field_vl(sf("sfCredentialType")),
-                        issuer_exists: view
-                            .exists(account_keylet(issuer))
-                            .map_err(|_| view_error())?,
-                    })
-                })
-                .collect::<Result<_, Ter>>()?
-        } else {
-            Vec::new()
+    if tx.is_field_present(sf("sfAuthorize")) {
+        let target = tx.get_account_id(sf("sfAuthorize"));
+        let Some(target_sle) = read_account(view, target)? else {
+            return Ok(Ter::TEC_NO_TARGET);
         };
-    let mut credential_hashes = credentials
+        if view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_3_0"))
+            && account_is_pseudo(&target_sle)
+        {
+            return Ok(Ter::TEC_PSEUDO_ACCOUNT);
+        }
+        return Ok(
+            if view
+                .exists(protocol::deposit_preauth_keylet(
+                    account_key,
+                    Uint160::from_void(target.data()),
+                ))
+                .map_err(|_| view_error())?
+            {
+                Ter::TEC_DUPLICATE
+            } else {
+                Ter::TES_SUCCESS
+            },
+        );
+    }
+    if tx.is_field_present(sf("sfUnauthorize")) {
+        let target = tx.get_account_id(sf("sfUnauthorize"));
+        return Ok(
+            if view
+                .exists(protocol::deposit_preauth_keylet(
+                    account_key,
+                    Uint160::from_void(target.data()),
+                ))
+                .map_err(|_| view_error())?
+            {
+                Ter::TES_SUCCESS
+            } else {
+                Ter::TEC_NO_ENTRY
+            },
+        );
+    }
+
+    let (credential_field, authorizing) = if tx.is_field_present(sf("sfAuthorizeCredentials")) {
+        (sf("sfAuthorizeCredentials"), true)
+    } else if tx.is_field_present(sf("sfUnauthorizeCredentials")) {
+        (sf("sfUnauthorizeCredentials"), false)
+    } else {
+        return Ok(Ter::TES_SUCCESS);
+    };
+    let mut sorted = std::collections::BTreeSet::new();
+    for credential in tx.get_field_array(credential_field).iter() {
+        let issuer = credential.get_account_id(sf("sfIssuer"));
+        let credential_type = credential.get_field_vl(sf("sfCredentialType"));
+        if authorizing
+            && !view
+                .exists(account_keylet(issuer))
+                .map_err(|_| view_error())?
+        {
+            return Ok(Ter::TEC_NO_ISSUER);
+        }
+        if !sorted.insert((issuer, credential_type)) {
+            return Ok(Ter::TEF_INTERNAL);
+        }
+    }
+    let credential_hashes = sorted
         .iter()
-        .map(|credential| {
-            protocol::sha512_half_slices(&[credential.issuer.data(), &credential.credential_type])
+        .map(|(issuer, credential_type)| {
+            protocol::sha512_half_slices(&[issuer.data(), credential_type])
         })
         .collect::<Vec<_>>();
-    credential_hashes.sort();
-    let credential_preauth_exists = if raw_credentials.is_some() {
-        view.exists(protocol::deposit_preauth_credentials_keylet(
+    let exists = view
+        .exists(protocol::deposit_preauth_credentials_keylet(
             account_key,
             &credential_hashes,
         ))
-        .map_err(|_| view_error())?
-    } else {
-        false
-    };
-
-    Ok(run_deposit_preauth_preclaim(DepositPreauthPreclaimFacts {
-        authorize,
-        unauthorize,
-        authorize_target_exists: authorize
-            .map(|target| {
-                view.exists(account_keylet(target))
-                    .map_err(|_| view_error())
-            })
-            .transpose()?
-            .unwrap_or(false),
-        authorize_preauth_exists,
-        unauthorize_preauth_exists,
-        authorize_credentials_present,
-        authorize_credentials: credentials,
-        authorize_credentials_preauth_exists: credential_preauth_exists,
-        unauthorize_credentials_present,
-        unauthorize_credentials_preauth_exists: credential_preauth_exists,
-    }))
+        .map_err(|_| view_error())?;
+    Ok(match (authorizing, exists) {
+        (true, true) => Ter::TEC_DUPLICATE,
+        (false, false) => Ter::TEC_NO_ENTRY,
+        _ => Ter::TES_SUCCESS,
+    })
 }
 
 fn preclaim_payment<V: ReadView>(view: &V, tx: &STTx, apply_flags: ApplyFlags) -> Result<Ter, Ter> {
@@ -548,49 +603,65 @@ fn preclaim_payment<V: ReadView>(view: &V, tx: &STTx, apply_flags: ApplyFlags) -
     let destination = tx.get_account_id(sf("sfDestination"));
     let amount = tx.get_field_amount(sf("sfAmount"));
     let destination_sle = read_account(view, destination)?;
+    let sponsor_created_account = tx.get_flags() & protocol::tfSponsorCreatedAccount != 0;
     let paths = tx
         .is_field_present(sf("sfPaths"))
         .then(|| tx.get_field_path_set(sf("sfPaths")));
-    let credentials =
-        ledger::credential_helpers::valid(view, tx, &account).map_err(|_| view_error())?;
     let domain_id = tx
         .is_field_present(sf("sfDomainID"))
         .then(|| tx.get_field_h256(sf("sfDomainID")));
-    let (source_in_domain, destination_in_domain) = if let Some(domain) = domain_id {
-        (
-            ledger::permissioned_dex_helpers::account_in_domain(view, &account, &domain)
-                .map_err(|_| view_error())?,
-            ledger::permissioned_dex_helpers::account_in_domain(view, &destination, &domain)
-                .map_err(|_| view_error())?,
-        )
-    } else {
-        (true, true)
-    };
-    Ok(run_payment_preclaim_with_facts(PaymentPreclaimFacts {
+    // Pinned Payment::preclaim performs all destination/tag/path decisions
+    // before reading credentials or permissioned-domain objects.  Keep those
+    // later reads lazy so an unrelated SHAMap fault cannot override the
+    // canonical earlier TER.
+    let early = run_payment_preclaim_with_facts(PaymentPreclaimFacts {
         tx_flags: tx.get_flags(),
         has_paths: paths.is_some(),
         send_max_present: tx.is_field_present(sf("sfSendMax")),
         dst_amount_native: amount.native(),
         destination_exists: destination_sle.is_some(),
+        sponsor_created_account,
         view_open: view.open(),
         destination_requires_tag: destination_sle
             .as_ref()
             .is_some_and(|sle| account_flag(sle, lsfRequireDestTag)),
         destination_tag_present: tx.is_field_present(sf("sfDestinationTag")),
         destination_can_create_with_amount: amount.native()
-            && amount.xrp().drops() >= view.fees().reserve as i64,
+            && (sponsor_created_account || amount.xrp().drops() >= view.fees().reserve as i64),
         path_count: paths.as_ref().map_or(0, |paths| paths.size()),
         path_has_too_long_segment: paths
             .as_ref()
             .is_some_and(|paths| paths.iter().any(|path| path.size() > tx::MAX_PATH_LENGTH)),
-        credentials_valid_result: credentials,
-        domain_id_present: domain_id.is_some(),
-        source_in_domain,
-        destination_in_domain,
+        credentials_valid_result: Ter::TES_SUCCESS,
+        domain_id_present: false,
+        source_in_domain: true,
+        destination_in_domain: true,
         is_batch_inner: tx.get_flags() & protocol::INNER_BATCH_TRANSACTION_FLAG != 0
             || (apply_flags.bits() & ApplyFlags::BATCH.bits()) != 0,
         batch_v1_1_enabled: view.rules().enabled(&feature_batch_v1_1()),
-    }))
+    });
+    if !is_tes_success(early) {
+        return Ok(early);
+    }
+
+    let credentials =
+        ledger::credential_helpers::valid(view, tx, &account).map_err(|_| view_error())?;
+    if !is_tes_success(credentials) {
+        return Ok(credentials);
+    }
+    if let Some(domain) = domain_id {
+        if !ledger::permissioned_dex_helpers::account_in_domain(view, &account, &domain)
+            .map_err(|_| view_error())?
+        {
+            return Ok(Ter::TEC_NO_PERMISSION);
+        }
+        if !ledger::permissioned_dex_helpers::account_in_domain(view, &destination, &domain)
+            .map_err(|_| view_error())?
+        {
+            return Ok(Ter::TEC_NO_PERMISSION);
+        }
+    }
+    Ok(Ter::TES_SUCCESS)
 }
 
 fn preclaim_payment_channel_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
@@ -598,34 +669,35 @@ fn preclaim_payment_channel_create<V: ReadView>(view: &V, tx: &STTx) -> Result<T
     let destination = tx.get_account_id(sf("sfDestination"));
     let amount = tx.get_field_amount(sf("sfAmount"));
     let source = read_account(view, account)?;
+    let Some(source) = source.as_ref() else {
+        return Ok(Ter::TER_NO_ACCOUNT);
+    };
+    let (covers_reserve, covers_amount) = if view.rules().enabled(&protocol::feature_id("Sponsor"))
+    {
+        // rippled defers both reserve checks to doApply under Sponsor, where
+        // the transaction reserve bearer and the source's post-lock reserve
+        // can be evaluated independently.
+        (true, true)
+    } else {
+        let balance = source.get_field_amount(sf("sfBalance")).xrp().drops();
+        let reserve = ledger::effective_account_reserve(view.fees(), source, 1, 0) as i64;
+        (
+            balance >= reserve,
+            balance >= reserve.saturating_add(amount.xrp().drops()),
+        )
+    };
+    if !covers_reserve {
+        return Ok(Ter::TEC_INSUFFICIENT_RESERVE);
+    }
+    if !covers_amount {
+        return Ok(Ter::TEC_UNFUNDED);
+    }
     let destination_sle = read_account(view, destination)?;
-    let (covers_reserve, covers_amount) =
-        if source.is_some() && view.rules().enabled(&protocol::feature_id("Sponsor")) {
-            // rippled defers both reserve checks to doApply under Sponsor, where
-            // the transaction reserve bearer and the source's post-lock reserve
-            // can be evaluated independently.
-            (true, true)
-        } else {
-            source
-                .as_ref()
-                .map(|source| {
-                    let balance = source.get_field_amount(sf("sfBalance")).xrp().drops();
-                    let reserve = view
-                        .fees()
-                        .account_reserve(source.get_field_u32(sf("sfOwnerCount")) as usize + 1)
-                        as i64;
-                    (
-                        balance >= reserve,
-                        balance >= reserve.saturating_add(amount.xrp().drops()),
-                    )
-                })
-                .unwrap_or((false, false))
-        };
     Ok(run_payment_channel_create_preclaim(
         PaymentChannelCreatePreclaimFacts {
-            source_account_exists: source.is_some(),
-            source_balance_covers_reserve: covers_reserve,
-            source_balance_covers_reserve_plus_amount: covers_amount,
+            source_account_exists: true,
+            source_balance_covers_reserve: true,
+            source_balance_covers_reserve_plus_amount: true,
             destination_exists: destination_sle.is_some(),
             destination_disallow_incoming_pay_chan: destination_sle
                 .as_ref()
@@ -672,6 +744,18 @@ fn preclaim_check_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let destination = tx.get_account_id(sf("sfDestination"));
     let amount = tx.get_field_amount(sf("sfSendMax"));
     let destination_sle = read_account(view, destination)?;
+    let Some(destination_sle) = destination_sle.as_ref() else {
+        return Ok(Ter::TEC_NO_DST);
+    };
+    if account_flag(destination_sle, lsfDisallowIncomingCheck) || account_is_pseudo(destination_sle)
+    {
+        return Ok(Ter::TEC_NO_PERMISSION);
+    }
+    if account_flag(destination_sle, lsfRequireDestTag)
+        && !tx.is_field_present(sf("sfDestinationTag"))
+    {
+        return Ok(Ter::TEC_DST_TAG_NEEDED);
+    }
     let expired = has_expired(
         view,
         tx.is_field_present(sf("sfExpiration"))
@@ -680,17 +764,11 @@ fn preclaim_check_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let result = match amount.asset() {
         Asset::Issue(issue) if issue.native() => {
             run_check_create_preclaim(CheckCreatePreclaimFacts {
-                destination_exists: destination_sle.is_some(),
-                destination_disallow_incoming_check: destination_sle
-                    .as_ref()
-                    .is_some_and(|sle| account_flag(sle, lsfDisallowIncomingCheck)),
-                destination_is_pseudo_account: destination_sle
-                    .as_ref()
-                    .is_some_and(|sle| account_is_pseudo(sle)),
-                destination_require_dest_tag: destination_sle
-                    .as_ref()
-                    .is_some_and(|sle| account_flag(sle, lsfRequireDestTag)),
-                tx_has_destination_tag: tx.is_field_present(sf("sfDestinationTag")),
+                destination_exists: true,
+                destination_disallow_incoming_check: false,
+                destination_is_pseudo_account: false,
+                destination_require_dest_tag: false,
+                tx_has_destination_tag: true,
                 send_max_is_native: true,
                 send_max_issuer_is_source: true,
                 send_max_issuer_is_destination: true,
@@ -705,20 +783,20 @@ fn preclaim_check_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             let global = issuer
                 .as_ref()
                 .is_some_and(|sle| account_flag(sle, lsfGlobalFreeze));
-            let source_frozen = iou_frozen(view, source, issue)?;
-            let destination_frozen = iou_frozen(view, destination, issue)?;
+            if global {
+                return Ok(Ter::TEC_FROZEN);
+            }
+            let source_frozen = iou_trustline_frozen(view, source, issue)?;
+            if source_frozen {
+                return Ok(Ter::TEC_FROZEN);
+            }
+            let destination_frozen = iou_trustline_frozen(view, destination, issue)?;
             run_check_create_preclaim(CheckCreatePreclaimFacts {
-                destination_exists: destination_sle.is_some(),
-                destination_disallow_incoming_check: destination_sle
-                    .as_ref()
-                    .is_some_and(|sle| account_flag(sle, lsfDisallowIncomingCheck)),
-                destination_is_pseudo_account: destination_sle
-                    .as_ref()
-                    .is_some_and(|sle| account_is_pseudo(sle)),
-                destination_require_dest_tag: destination_sle
-                    .as_ref()
-                    .is_some_and(|sle| account_flag(sle, lsfRequireDestTag)),
-                tx_has_destination_tag: tx.is_field_present(sf("sfDestinationTag")),
+                destination_exists: true,
+                destination_disallow_incoming_check: false,
+                destination_is_pseudo_account: false,
+                destination_require_dest_tag: false,
+                tx_has_destination_tag: true,
                 send_max_is_native: false,
                 send_max_issuer_is_source: issue.account == source,
                 send_max_issuer_is_destination: issue.account == destination,
@@ -730,17 +808,11 @@ fn preclaim_check_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         }
         Asset::MPTIssue(issue) => {
             let base = run_check_create_preclaim(CheckCreatePreclaimFacts {
-                destination_exists: destination_sle.is_some(),
-                destination_disallow_incoming_check: destination_sle
-                    .as_ref()
-                    .is_some_and(|sle| account_flag(sle, lsfDisallowIncomingCheck)),
-                destination_is_pseudo_account: destination_sle
-                    .as_ref()
-                    .is_some_and(|sle| account_is_pseudo(sle)),
-                destination_require_dest_tag: destination_sle
-                    .as_ref()
-                    .is_some_and(|sle| account_flag(sle, lsfRequireDestTag)),
-                tx_has_destination_tag: tx.is_field_present(sf("sfDestinationTag")),
+                destination_exists: true,
+                destination_disallow_incoming_check: false,
+                destination_is_pseudo_account: false,
+                destination_require_dest_tag: false,
+                tx_has_destination_tag: true,
                 send_max_is_native: true,
                 send_max_issuer_is_source: false,
                 send_max_issuer_is_destination: false,
@@ -782,40 +854,56 @@ fn preclaim_check_cash<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         return Ok(Ter::TEM_MALFORMED);
     };
     let send_max = check.get_field_amount(sf("sfSendMax"));
+    if tx.get_account_id(sf("sfAccount")) != destination {
+        return Ok(Ter::TEC_NO_PERMISSION);
+    }
+    if source == destination {
+        return Ok(Ter::TEC_INTERNAL);
+    }
     let source_sle = read_account(view, source)?;
     let destination_sle = read_account(view, destination)?;
-    let amount_exceeds_available =
-        !account_holds_at_least(view, source, &requested, requested.native())?;
-    let mut base = run_check_cash_preclaim(CheckCashPreclaimFacts {
-        check_exists: true,
-        tx_account_is_check_destination: tx.get_account_id(sf("sfAccount")) == destination,
-        check_source_is_destination: source == destination,
-        source_account_exists: source_sle.is_some(),
-        destination_account_exists: destination_sle.is_some(),
-        destination_require_dest_tag: destination_sle
-            .as_ref()
-            .is_some_and(|sle| account_flag(sle, lsfRequireDestTag)),
-        check_has_destination_tag: check.is_field_present(sf("sfDestinationTag")),
-        check_expired: has_expired(
-            view,
-            check
-                .is_field_present(sf("sfExpiration"))
-                .then(|| check.get_field_u32(sf("sfExpiration"))),
-        ),
-        requested_currency_matches_send_max: requested.asset() == send_max.asset(),
-        requested_issuer_matches_send_max: requested.issue().issuer() == send_max.issue().issuer(),
-        requested_value_exceeds_send_max: requested > send_max,
-        requested_value_exceeds_available_funds: amount_exceeds_available,
-        requested_value_native: requested.native(),
-        requested_value_issuer_is_destination: requested.issue().issuer() == destination,
-        issuer_exists: true,
-        issuer_requires_auth: false,
-        destination_trustline_exists: true,
-        destination_trustline_authorized: true,
-        destination_trustline_frozen: false,
-    });
-    if base != Ter::TES_SUCCESS || requested.native() || requested.issue().issuer() == destination {
-        return Ok(base);
+    let (Some(_), Some(destination_sle)) = (source_sle, destination_sle) else {
+        return Ok(Ter::TEC_NO_ENTRY);
+    };
+    if account_flag(&destination_sle, lsfRequireDestTag)
+        && !check.is_field_present(sf("sfDestinationTag"))
+    {
+        return Ok(Ter::TEC_DST_TAG_NEEDED);
+    }
+    if has_expired(
+        view,
+        check
+            .is_field_present(sf("sfExpiration"))
+            .then(|| check.get_field_u32(sf("sfExpiration"))),
+    ) {
+        return Ok(Ter::TEC_EXPIRED);
+    }
+    if view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+        && !send_max.is_legal_mpt()
+    {
+        return Ok(Ter::TEF_BAD_LEDGER);
+    }
+    if requested.asset() != send_max.asset()
+        || requested.asset().issuer() != send_max.asset().issuer()
+    {
+        return Ok(Ter::TEM_MALFORMED);
+    }
+    if requested > send_max {
+        return Ok(Ter::TEC_PATH_PARTIAL);
+    }
+    // CheckCash releases the source's owner-reserve increment only when the
+    // Check itself is not sponsored. A sponsored Check is charged to its
+    // sponsor, so removing it does not increase the source's XRP liquidity.
+    // This is the `!sleCheck->isFieldPresent(sfSponsor)` branch in rippled's
+    // CheckCash::preclaim.
+    let releases_source_reserve = requested.native() && !check.is_field_present(sf("sfSponsor"));
+    if !account_holds_at_least(view, source, &requested, releases_source_reserve)? {
+        return Ok(Ter::TEC_PATH_PARTIAL);
+    }
+    if requested.native() || requested.asset().issuer() == destination {
+        return Ok(Ter::TES_SUCCESS);
     }
     match requested.asset() {
         Asset::Issue(issue) => {
@@ -832,10 +920,7 @@ fn preclaim_check_cash<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             }
         }
         Asset::MPTIssue(issue) => {
-            let Some(_) = view
-                .read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
-                .map_err(|_| view_error())?
-            else {
+            let Some(_) = read_account(view, issue.issuer())? else {
                 return Ok(Ter::TEC_NO_ISSUER);
             };
             let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, &destination)
@@ -848,11 +933,15 @@ fn preclaim_check_cash<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             {
                 return Ok(Ter::TEC_LOCKED);
             }
-            base = ledger::mptoken_helpers::can_transfer_mpt(view, &issue, &source, &destination)
-                .map_err(|_| view_error())?;
+            let transfer =
+                ledger::mptoken_helpers::can_transfer_mpt(view, &issue, &source, &destination)
+                    .map_err(|_| view_error())?;
+            if transfer != Ter::TES_SUCCESS {
+                return Ok(transfer);
+            }
         }
     }
-    Ok(base)
+    Ok(Ter::TES_SUCCESS)
 }
 
 fn preclaim_check_cancel<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
@@ -877,104 +966,123 @@ fn preclaim_escrow_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
     let account = tx.get_account_id(sf("sfAccount"));
     let destination = tx.get_account_id(sf("sfDestination"));
     let amount = tx.get_field_amount(sf("sfAmount"));
-    let destination_sle = read_account(view, destination)?;
-    let (kind, asset_preclaim_result) = match amount.asset() {
-        Asset::Issue(issue) if issue.native() => (EscrowCreateAmountKind::Xrp, Ter::TES_SUCCESS),
+    let Some(destination_sle) = read_account(view, destination)? else {
+        return Ok(Ter::TEC_NO_DST);
+    };
+    if account_is_pseudo(&destination_sle) {
+        return Ok(Ter::TEC_NO_PERMISSION);
+    }
+    if amount.native() {
+        return Ok(Ter::TES_SUCCESS);
+    }
+    if !view.rules().enabled(&protocol::feature_token_escrow()) {
+        return Ok(Ter::TEM_DISABLED);
+    }
+
+    match amount.asset() {
+        Asset::Issue(issue) if issue.native() => Ok(Ter::TES_SUCCESS),
         Asset::Issue(issue) => {
-            let issuer = read_account(view, issue.account)?;
-            let line = view
+            if issue.account == account {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            }
+            let Some(issuer) = read_account(view, issue.account)? else {
+                return Ok(Ter::TEC_NO_ISSUER);
+            };
+            if !account_flag(&issuer, lsfAllowTrustLineLocking) {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            }
+            let Some(line) = view
                 .read(protocol::line(account, issue.account, issue.currency))
-                .map_err(|_| view_error())?;
-            let mut spendable = line
-                .as_ref()
-                .map(|line| line.get_field_amount(sf("sfBalance")))
-                .unwrap_or_else(|| amount.zeroed());
+                .map_err(|_| view_error())?
+            else {
+                return Ok(Ter::TEC_NO_LINE);
+            };
+            let mut spendable = line.get_field_amount(sf("sfBalance"));
             if account > issue.account {
                 spendable.negate();
             }
             spendable.set_issuer(issue.account);
-            let asset = run_escrow_create_issue_preclaim(EscrowCreateIssuePreclaimFacts {
-                issuer_equals_account: issue.account == account,
-                issuer_exists: issuer.is_some(),
-                issuer_allows_trustline_locking: issuer
-                    .as_ref()
-                    .is_some_and(|sle| account_flag(sle, lsfAllowTrustLineLocking)),
-                trustline_exists: line.is_some(),
-                trustline_balance_sign_valid: spendable.signum() >= 0,
-                sender_auth_result: iou_auth(view, account, issue)?,
-                destination_auth_result: iou_auth(view, destination, issue)?,
-                sender_frozen: iou_frozen(view, account, issue)?,
-                destination_frozen: iou_frozen(view, destination, issue)?,
-                spendable_amount_positive: spendable.signum() > 0,
-                spendable_amount_covers_amount: amount <= spendable,
-                can_add_amount: spendable.iou().checked_add(amount.iou()).is_ok(),
-            });
-            (EscrowCreateAmountKind::Issue, asset)
+            if spendable.signum() < 0 {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            }
+            let auth = iou_auth(view, account, issue)?;
+            if auth != Ter::TES_SUCCESS {
+                return Ok(auth);
+            }
+            let auth = iou_auth(view, destination, issue)?;
+            if auth != Ter::TES_SUCCESS {
+                return Ok(auth);
+            }
+            if iou_frozen(view, account, issue)? || iou_frozen(view, destination, issue)? {
+                return Ok(Ter::TEC_FROZEN);
+            }
+            if spendable.signum() <= 0 || amount > spendable {
+                return Ok(Ter::TEC_INSUFFICIENT_FUNDS);
+            }
+            Ok(if spendable.iou().checked_add(amount.iou()).is_ok() {
+                Ter::TES_SUCCESS
+            } else {
+                Ter::TEC_PRECISION_LOSS
+            })
         }
         Asset::MPTIssue(issue) => {
-            let issuance = view
+            if issue.issuer() == account {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            }
+            let Some(issuance) = view
                 .read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
-                .map_err(|_| view_error())?;
-            let token = view
+                .map_err(|_| view_error())?
+            else {
+                return Ok(Ter::TEC_OBJECT_NOT_FOUND);
+            };
+            if !issuance.is_flag(protocol::lsfMPTCanEscrow) {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            }
+            if issuance.get_account_id(sf("sfIssuer")) != issue.issuer() {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            }
+            let Some(token) = view
                 .read(protocol::mptoken_keylet_from_mptid(
                     issue.mpt_id(),
                     Uint160::from_void(account.data()),
                 ))
+                .map_err(|_| view_error())?
+            else {
+                return Ok(Ter::TEC_OBJECT_NOT_FOUND);
+            };
+            let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, &account)
                 .map_err(|_| view_error())?;
-            let available = token
-                .as_ref()
-                .map_or(0, |token| token.get_field_u64(sf("sfMPTAmount")));
-            let asset = run_escrow_create_mpt_preclaim(EscrowCreateMptPreclaimFacts {
-                issuer_equals_account: issue.issuer() == account,
-                issuance_exists: issuance.is_some(),
-                issuance_can_escrow: issuance
-                    .as_ref()
-                    .is_some_and(|sle| sle.is_flag(protocol::lsfMPTCanEscrow)),
-                issuance_issuer_matches: issuance
-                    .as_ref()
-                    .is_some_and(|sle| sle.get_account_id(sf("sfIssuer")) == issue.issuer()),
-                sender_token_exists: token.is_some(),
-                sender_auth_result: ledger::mptoken_helpers::require_auth_mpt(
-                    view, &issue, &account,
-                )
-                .map_err(|_| view_error())?,
-                destination_auth_result: ledger::mptoken_helpers::require_auth_mpt(
-                    view,
-                    &issue,
-                    &destination,
-                )
-                .map_err(|_| view_error())?,
-                sender_locked: ledger::mptoken_helpers::is_frozen_mpt(view, &account, &issue)
-                    .map_err(|_| view_error())?,
-                destination_locked: ledger::mptoken_helpers::is_frozen_mpt(
-                    view,
-                    &destination,
-                    &issue,
-                )
-                .map_err(|_| view_error())?,
-                can_transfer_result: ledger::mptoken_helpers::can_transfer_mpt(
-                    view,
-                    &issue,
-                    &account,
-                    &destination,
-                )
-                .map_err(|_| view_error())?,
-                spendable_amount_positive: available > 0,
-                spendable_amount_covers_amount: amount.mpt().value() >= 0
-                    && (amount.mpt().value() as u64) <= available,
-            });
-            (EscrowCreateAmountKind::Mpt, asset)
+            if auth != Ter::TES_SUCCESS {
+                return Ok(auth);
+            }
+            let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, &destination)
+                .map_err(|_| view_error())?;
+            if auth != Ter::TES_SUCCESS {
+                return Ok(auth);
+            }
+            if ledger::mptoken_helpers::is_frozen_mpt(view, &account, &issue)
+                .map_err(|_| view_error())?
+                || ledger::mptoken_helpers::is_frozen_mpt(view, &destination, &issue)
+                    .map_err(|_| view_error())?
+            {
+                return Ok(Ter::TEC_LOCKED);
+            }
+            let transfer =
+                ledger::mptoken_helpers::can_transfer_mpt(view, &issue, &account, &destination)
+                    .map_err(|_| view_error())?;
+            if transfer != Ter::TES_SUCCESS {
+                return Ok(transfer);
+            }
+            let available = token.get_field_u64(sf("sfMPTAmount"));
+            Ok(
+                if amount.mpt().value() <= 0 || (amount.mpt().value() as u64) > available {
+                    Ter::TEC_INSUFFICIENT_FUNDS
+                } else {
+                    Ter::TES_SUCCESS
+                },
+            )
         }
-    };
-    Ok(run_escrow_create_preclaim(EscrowCreatePreclaimFacts {
-        destination_exists: destination_sle.is_some(),
-        destination_is_pseudo_account: destination_sle
-            .as_ref()
-            .is_some_and(|sle| account_is_pseudo(sle)),
-        amount_kind: kind,
-        token_escrow_enabled: view.rules().enabled(&protocol::feature_token_escrow()),
-        asset_preclaim_result,
-    }))
+    }
 }
 
 fn preclaim_escrow_finish<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
@@ -1013,6 +1121,19 @@ fn preclaim_escrow_finish<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
         }
         Asset::MPTIssue(issue) => {
             let destination = escrow.get_account_id(sf("sfDestination"));
+            // The issuer has no MPToken holding to authorize or freeze.
+            // rippled returns success before those checks when escrowed MPTs
+            // are redeemed to their issuer.
+            if destination == issue.issuer() {
+                return Ok(Ter::TES_SUCCESS);
+            }
+            if view
+                .read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
+                .map_err(|_| view_error())?
+                .is_none()
+            {
+                return Ok(Ter::TEC_OBJECT_NOT_FOUND);
+            }
             let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, &destination)
                 .map_err(|_| view_error())?;
             if auth != Ter::TES_SUCCESS {
@@ -1044,28 +1165,29 @@ fn preclaim_escrow_cancel<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
         return Ok(Ter::TEC_NO_TARGET);
     };
     let owner = escrow.get_account_id(sf("sfAccount"));
-    let asset_preclaim_result = match escrow.get_field_amount(sf("sfAmount")).asset() {
-        Asset::Issue(issue) if issue.native() => Ter::TES_SUCCESS,
-        Asset::Issue(issue) => run_escrow_cancel_issue_preclaim(EscrowCancelIssuePreclaimFacts {
-            issuer_equals_account: issue.account == owner,
-            require_auth_result: iou_auth(view, owner, issue)?,
-        }),
-        Asset::MPTIssue(issue) => run_escrow_cancel_mpt_preclaim(EscrowCancelMptPreclaimFacts {
-            issuer_equals_account: issue.issuer() == owner,
-            issuance_exists: view
+    match escrow.get_field_amount(sf("sfAmount")).asset() {
+        Asset::Issue(issue) if issue.native() => Ok(Ter::TES_SUCCESS),
+        Asset::Issue(issue) => {
+            if issue.account == owner {
+                return Ok(Ter::TEC_INTERNAL);
+            }
+            iou_auth(view, owner, issue)
+        }
+        Asset::MPTIssue(issue) => {
+            if issue.issuer() == owner {
+                return Ok(Ter::TEC_INTERNAL);
+            }
+            if view
                 .read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
                 .map_err(|_| view_error())?
-                .is_some(),
-            require_auth_result: ledger::mptoken_helpers::require_auth_mpt(view, &issue, &owner)
-                .map_err(|_| view_error())?,
-        }),
-    };
-    Ok(run_escrow_cancel_preclaim(EscrowCancelPreclaimFacts {
-        token_escrow_enabled: true,
-        escrow_exists: true,
-        amount_is_xrp: escrow.get_field_amount(sf("sfAmount")).native(),
-        asset_preclaim_result,
-    }))
+                .is_none()
+            {
+                return Ok(Ter::TEC_OBJECT_NOT_FOUND);
+            }
+            ledger::mptoken_helpers::require_auth_mpt(view, &issue, &owner)
+                .map_err(|_| view_error())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1075,7 +1197,8 @@ mod tests {
     use basics::base_uint::Uint256;
     use ledger::{Fees, LedgerHeader, ReadView, ReadViewTx, ViewError};
     use protocol::{
-        AccountID, ApplyFlags, Keylet, Rules, STAmount, STLedgerEntry, STTx, Ter, TxType, XRPAmount,
+        AccountID, ApplyFlags, Currency, IOUAmount, Issue, Keylet, MPTAmount, MPTIssue, Rules,
+        STAmount, STLedgerEntry, STTx, Ter, TxType, XRPAmount,
     };
 
     use super::run_read_view_preclaim;
@@ -1085,6 +1208,9 @@ mod tests {
         entries: BTreeMap<Uint256, Arc<STLedgerEntry>>,
         header: LedgerHeader,
         rules: Rules,
+        fail_read_key: Option<Uint256>,
+        fail_exists_key: Option<Uint256>,
+        fail_succ: bool,
     }
 
     impl ReadView for MockView {
@@ -1105,6 +1231,9 @@ mod tests {
             self.rules.clone()
         }
         fn exists(&self, keylet: Keylet) -> Result<bool, ViewError> {
+            if self.fail_exists_key == Some(keylet.key) {
+                return Err(ViewError::Conversion("injected exists failure".into()));
+            }
             Ok(self.entries.contains_key(&keylet.key))
         }
         fn succ(
@@ -1112,9 +1241,15 @@ mod tests {
             _key: Uint256,
             _last: Option<Uint256>,
         ) -> Result<Option<Uint256>, ViewError> {
+            if self.fail_succ {
+                return Err(ViewError::Conversion("injected successor failure".into()));
+            }
             Ok(None)
         }
         fn read(&self, keylet: Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
+            if self.fail_read_key == Some(keylet.key) {
+                return Err(ViewError::Conversion("injected read failure".into()));
+            }
             Ok(self.entries.get(&keylet.key).cloned())
         }
         fn sles(&self) -> Result<Vec<Arc<STLedgerEntry>>, ViewError> {
@@ -1143,6 +1278,587 @@ mod tests {
             tx.set_account_id(sf("sfDestination"), destination);
             tx.set_field_amount(sf("sfAmount"), amount);
         })
+    }
+
+    fn account_delete(account: AccountID, destination: AccountID) -> STTx {
+        STTx::new(TxType::ACCOUNT_DELETE, move |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_account_id(sf("sfDestination"), destination);
+        })
+    }
+
+    fn account_set(account: AccountID, set_flag: u32, tx_flags: u32) -> STTx {
+        STTx::new(TxType::ACCOUNT_SET, move |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_field_u32(sf("sfSetFlag"), set_flag);
+            tx.set_field_u32(sf("sfFlags"), tx_flags);
+        })
+    }
+
+    fn payment_channel_create(account: AccountID, destination: AccountID, amount: i64) -> STTx {
+        STTx::new(TxType::PAYCHAN_CREATE, move |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_account_id(sf("sfDestination"), destination);
+            tx.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(amount)),
+            );
+        })
+    }
+
+    fn deposit_preauth_authorize(account: AccountID, authorize: AccountID) -> STTx {
+        STTx::new(TxType::DEPOSIT_PREAUTH, move |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_account_id(sf("sfAuthorize"), authorize);
+        })
+    }
+
+    fn escrow_create_iou(account: AccountID, destination: AccountID, issuer: AccountID) -> STTx {
+        STTx::new(TxType::ESCROW_CREATE, move |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_account_id(sf("sfDestination"), destination);
+            tx.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_iou_amount(
+                    sf("sfAmount"),
+                    IOUAmount::from_parts(1, 0).expect("valid IOU"),
+                    Issue::new(Currency::from_array([0x5A; 20]), issuer),
+                ),
+            );
+        })
+    }
+
+    fn delegate_set(account: AccountID, authorize: AccountID) -> STTx {
+        STTx::new(TxType::DELEGATE_SET, move |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_account_id(sf("sfAuthorize"), authorize);
+        })
+    }
+
+    fn check_cash(account: AccountID, check_id: Uint256) -> STTx {
+        STTx::new(TxType::CHECK_CASH, move |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_field_h256(sf("sfCheckID"), check_id);
+            tx.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+            );
+        })
+    }
+
+    fn check_create_iou(account: AccountID, destination: AccountID, issuer: AccountID) -> STTx {
+        STTx::new(TxType::CHECK_CREATE, move |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_account_id(sf("sfDestination"), destination);
+            tx.set_field_amount(
+                sf("sfSendMax"),
+                STAmount::from_iou_amount(
+                    sf("sfSendMax"),
+                    IOUAmount::from_parts(1, 0).expect("valid IOU"),
+                    Issue::new(Currency::from_array([0x6A; 20]), issuer),
+                ),
+            );
+        })
+    }
+
+    fn account_root(account: AccountID, flags: u32) -> (Uint256, Arc<STLedgerEntry>) {
+        let keylet =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
+        let mut root = STLedgerEntry::new(keylet);
+        root.set_account_id(sf("sfAccount"), account);
+        root.set_field_u32(sf("sfFlags"), flags);
+        root.set_field_u32(sf("sfSequence"), 1);
+        (keylet.key, Arc::new(root))
+    }
+
+    #[test]
+    fn account_delete_missing_destination_precedes_source_storage_failure() {
+        let source = account(0x11);
+        let destination = account(0x12);
+        let source_key =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(source.data()));
+        let view = MockView {
+            fail_read_key: Some(source_key.key),
+            ..MockView::default()
+        };
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &account_delete(source, destination),
+                TxType::ACCOUNT_DELETE,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TEC_NO_DST)
+        );
+    }
+
+    #[test]
+    fn payment_missing_destination_precedes_permissioned_domain_storage_failure() {
+        let source = account(0x13);
+        let destination = account(0x14);
+        let domain = Uint256::from_array([0xD0; 32]);
+        let issue = protocol::Issue::new(protocol::currency_from_string("USD"), source);
+        let tx = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(sf("sfAccount"), source);
+            tx.set_account_id(sf("sfDestination"), destination);
+            tx.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_iou_amount(
+                    sf("sfAmount"),
+                    protocol::IOUAmount::from_parts(1, 0).expect("valid IOU"),
+                    issue,
+                ),
+            );
+            tx.set_field_h256(sf("sfDomainID"), domain);
+        });
+        let view = MockView {
+            fail_read_key: Some(domain),
+            ..MockView::default()
+        };
+
+        assert_eq!(
+            run_read_view_preclaim(&view, &tx, TxType::PAYMENT, ApplyFlags::NONE),
+            Some(Ter::TEC_NO_DST)
+        );
+    }
+
+    #[test]
+    fn account_delete_destination_tag_precedes_deposit_preauth_storage_failure() {
+        let source = account(0x21);
+        let destination = account(0x22);
+        let (destination_key, destination_root) = account_root(
+            destination,
+            protocol::lsfRequireDestTag | protocol::lsfDepositAuth,
+        );
+        let preauth = protocol::deposit_preauth_keylet(
+            basics::base_uint::Uint160::from_void(destination.data()),
+            basics::base_uint::Uint160::from_void(source.data()),
+        );
+        let mut view = MockView {
+            fail_exists_key: Some(preauth.key),
+            ..MockView::default()
+        };
+        view.entries.insert(destination_key, destination_root);
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &account_delete(source, destination),
+                TxType::ACCOUNT_DELETE,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TEC_DST_TAG_NEEDED)
+        );
+    }
+
+    #[test]
+    fn account_delete_deposit_preauth_storage_failure_is_hard() {
+        let source = account(0x23);
+        let destination = account(0x24);
+        let (destination_key, destination_root) =
+            account_root(destination, protocol::lsfDepositAuth);
+        let preauth = protocol::deposit_preauth_keylet(
+            basics::base_uint::Uint160::from_void(destination.data()),
+            basics::base_uint::Uint160::from_void(source.data()),
+        );
+        let mut view = MockView {
+            fail_exists_key: Some(preauth.key),
+            ..MockView::default()
+        };
+        view.entries.insert(destination_key, destination_root);
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &account_delete(source, destination),
+                TxType::ACCOUNT_DELETE,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TEF_BAD_LEDGER)
+        );
+    }
+
+    #[test]
+    fn account_delete_minted_obligation_precedes_nft_page_storage_failure() {
+        let source = account(0x25);
+        let destination = account(0x26);
+        let (source_key, source_root) = account_root(source, 0);
+        let (destination_key, destination_root) = account_root(destination, 0);
+        let mut source_root = (*source_root).clone();
+        source_root.set_field_u32(sf("sfMintedNFTokens"), 1);
+        source_root.set_field_u32(sf("sfBurnedNFTokens"), 0);
+        let mut view = MockView {
+            fail_succ: true,
+            ..MockView::default()
+        };
+        view.entries.insert(source_key, Arc::new(source_root));
+        view.entries.insert(destination_key, destination_root);
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &account_delete(source, destination),
+                TxType::ACCOUNT_DELETE,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TEC_HAS_OBLIGATIONS)
+        );
+    }
+
+    #[test]
+    fn unrelated_account_set_does_not_read_owner_directory() {
+        let account = account(0x27);
+        let (account_key, account_root) = account_root(account, 0);
+        let owner_dir =
+            protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(account.data()));
+        let mut view = MockView {
+            fail_read_key: Some(owner_dir.key),
+            ..MockView::default()
+        };
+        view.entries.insert(account_key, account_root);
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &account_set(account, tx::ASF_REQUIRE_DEST, 0),
+                TxType::ACCOUNT_SET,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TES_SUCCESS)
+        );
+    }
+
+    #[test]
+    fn account_set_clawback_no_freeze_precedes_owner_directory_failure() {
+        let account = account(0x28);
+        let (account_key, account_root) = account_root(account, tx::LSF_NO_FREEZE);
+        let owner_dir =
+            protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(account.data()));
+        let mut view = MockView {
+            fail_read_key: Some(owner_dir.key),
+            ..MockView::default()
+        };
+        view.entries.insert(account_key, account_root);
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &account_set(account, tx::ASF_ALLOW_TRUST_LINE_CLAWBACK, 0),
+                TxType::ACCOUNT_SET,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TEC_NO_PERMISSION)
+        );
+    }
+
+    #[test]
+    fn account_set_require_auth_owner_directory_failure_is_hard() {
+        let account = account(0x29);
+        let (account_key, account_root) = account_root(account, 0);
+        let owner_dir =
+            protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(account.data()));
+        let mut view = MockView {
+            fail_read_key: Some(owner_dir.key),
+            ..MockView::default()
+        };
+        view.entries.insert(account_key, account_root);
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &account_set(account, tx::ASF_REQUIRE_AUTH, 0),
+                TxType::ACCOUNT_SET,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TEF_BAD_LEDGER)
+        );
+    }
+
+    #[test]
+    fn paychan_source_reserve_failure_precedes_destination_storage_failure() {
+        let source = account(0x2A);
+        let destination = account(0x2B);
+        let (source_key, mut source_root) = account_root(source, 0);
+        Arc::make_mut(&mut source_root).set_field_amount(
+            sf("sfBalance"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+        );
+        let destination_key =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(destination.data()));
+        let mut view = MockView {
+            fail_read_key: Some(destination_key.key),
+            ..MockView::default()
+        };
+        view.entries.insert(source_key, source_root);
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &payment_channel_create(source, destination, 1),
+                TxType::PAYCHAN_CREATE,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TEC_INSUFFICIENT_RESERVE)
+        );
+    }
+
+    #[test]
+    fn deposit_preauth_missing_target_precedes_duplicate_lookup_failure() {
+        let source = account(0x2C);
+        let target = account(0x2D);
+        let preauth = protocol::deposit_preauth_keylet(
+            basics::base_uint::Uint160::from_void(source.data()),
+            basics::base_uint::Uint160::from_void(target.data()),
+        );
+        let view = MockView {
+            fail_exists_key: Some(preauth.key),
+            ..MockView::default()
+        };
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &deposit_preauth_authorize(source, target),
+                TxType::DEPOSIT_PREAUTH,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TEC_NO_TARGET)
+        );
+    }
+
+    #[test]
+    fn escrow_create_missing_destination_precedes_issuer_storage_failure() {
+        let source = account(0x2E);
+        let destination = account(0x2F);
+        let issuer = account(0x30);
+        let issuer_key =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(issuer.data()));
+        let view = MockView {
+            rules: Rules::new([protocol::feature_token_escrow()]),
+            fail_read_key: Some(issuer_key.key),
+            ..MockView::default()
+        };
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &escrow_create_iou(source, destination, issuer),
+                TxType::ESCROW_CREATE,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TEC_NO_DST)
+        );
+    }
+
+    #[test]
+    fn delegate_set_missing_source_precedes_authorize_storage_failure() {
+        let source = account(0x31);
+        let authorize = account(0x32);
+        let authorize_key =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(authorize.data()));
+        let view = MockView {
+            fail_read_key: Some(authorize_key.key),
+            ..MockView::default()
+        };
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &delegate_set(source, authorize),
+                TxType::DELEGATE_SET,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TER_NO_ACCOUNT)
+        );
+    }
+
+    #[test]
+    fn check_cash_wrong_actor_precedes_source_storage_failure() {
+        let source = account(0x33);
+        let destination = account(0x34);
+        let wrong_actor = account(0x35);
+        let check_id = Uint256::from_array([0x36; 32]);
+        let check_keylet = protocol::check_keylet_from_key(check_id);
+        let mut check = STLedgerEntry::new(check_keylet);
+        check.set_account_id(sf("sfAccount"), source);
+        check.set_account_id(sf("sfDestination"), destination);
+        check.set_field_amount(
+            sf("sfSendMax"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+        );
+        let source_key =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(source.data()));
+        let mut view = MockView {
+            fail_read_key: Some(source_key.key),
+            ..MockView::default()
+        };
+        view.entries.insert(check_keylet.key, Arc::new(check));
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &check_cash(wrong_actor, check_id),
+                TxType::CHECK_CASH,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TEC_NO_PERMISSION)
+        );
+    }
+
+    #[test]
+    fn check_create_missing_destination_precedes_issuer_storage_failure() {
+        let source = account(0x37);
+        let destination = account(0x38);
+        let issuer = account(0x39);
+        let issuer_key =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(issuer.data()));
+        let view = MockView {
+            fail_read_key: Some(issuer_key.key),
+            ..MockView::default()
+        };
+
+        assert_eq!(
+            run_read_view_preclaim(
+                &view,
+                &check_create_iou(source, destination, issuer),
+                TxType::CHECK_CREATE,
+                ApplyFlags::NONE,
+            ),
+            Some(Ter::TEC_NO_DST)
+        );
+    }
+
+    #[test]
+    fn check_cash_mpt_requires_issuer_account_root_not_only_issuance() {
+        let source = account(0x3A);
+        let destination = account(0x3B);
+        let issuer = account(0x3C);
+        let mpt_id = protocol::make_mpt_id(1, issuer);
+        let issue = MPTIssue::new(mpt_id);
+        let check_id = Uint256::from_array([0x3D; 32]);
+        let check_keylet = protocol::check_keylet_from_key(check_id);
+        let mut check = STLedgerEntry::new(check_keylet);
+        check.set_account_id(sf("sfAccount"), source);
+        check.set_account_id(sf("sfDestination"), destination);
+        check.set_field_amount(
+            sf("sfSendMax"),
+            STAmount::from_mpt_amount(sf("sfSendMax"), MPTAmount::from_value(10), issue),
+        );
+        let issuance_keylet = protocol::mpt_issuance_keylet_from_mptid(mpt_id);
+        let mut issuance = STLedgerEntry::new(issuance_keylet);
+        issuance.set_account_id(sf("sfIssuer"), issuer);
+        let token_keylet = protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            basics::base_uint::Uint160::from_void(source.data()),
+        );
+        let mut token = STLedgerEntry::new(token_keylet);
+        token.set_field_u64(sf("sfMPTAmount"), 10);
+        let (source_key, source_root) = account_root(source, 0);
+        let (destination_key, destination_root) = account_root(destination, 0);
+        let mut view = MockView::default();
+        view.entries.insert(check_keylet.key, Arc::new(check));
+        view.entries.insert(issuance_keylet.key, Arc::new(issuance));
+        view.entries.insert(token_keylet.key, Arc::new(token));
+        view.entries.insert(source_key, source_root);
+        view.entries.insert(destination_key, destination_root);
+
+        let tx = STTx::new(TxType::CHECK_CASH, |tx| {
+            tx.set_account_id(sf("sfAccount"), destination);
+            tx.set_field_h256(sf("sfCheckID"), check_id);
+            tx.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(1), issue),
+            );
+        });
+        assert_eq!(
+            run_read_view_preclaim(&view, &tx, TxType::CHECK_CASH, ApplyFlags::NONE),
+            Some(Ter::TEC_NO_ISSUER)
+        );
+    }
+
+    #[test]
+    fn sponsored_xrp_check_preclaim_does_not_release_source_reserve() {
+        let source = account(0x31);
+        let destination = account(0x32);
+        let sponsor = account(0x33);
+        let check_id = Uint256::from_array([0x44; 32]);
+
+        let mut view = MockView::default();
+        for (id, balance, owner_count) in [(source, 250, 1), (destination, 1_000, 0)] {
+            let keylet = protocol::account_keylet(basics::base_uint::Uint160::from_void(id.data()));
+            let mut root = STLedgerEntry::new(keylet);
+            root.set_account_id(sf("sfAccount"), id);
+            root.set_field_amount(
+                sf("sfBalance"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(balance)),
+            );
+            root.set_field_u32(sf("sfOwnerCount"), owner_count);
+            view.entries.insert(keylet.key, Arc::new(root));
+        }
+
+        let check_keylet = protocol::check_keylet_from_key(check_id);
+        let mut check = STLedgerEntry::new(check_keylet);
+        check.set_account_id(sf("sfAccount"), source);
+        check.set_account_id(sf("sfDestination"), destination);
+        check.set_account_id(sf("sfSponsor"), sponsor);
+        check.set_field_amount(
+            sf("sfSendMax"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(50)),
+        );
+        view.entries.insert(check_keylet.key, Arc::new(check));
+
+        let cash = STTx::new(TxType::CHECK_CASH, |tx| {
+            tx.set_account_id(sf("sfAccount"), destination);
+            tx.set_field_h256(sf("sfCheckID"), check_id);
+            tx.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(50)),
+            );
+        });
+
+        assert_eq!(
+            run_read_view_preclaim(&view, &cash, TxType::CHECK_CASH, ApplyFlags::NONE),
+            Some(Ter::TEC_PATH_PARTIAL)
+        );
+    }
+
+    #[test]
+    fn payment_sponsored_account_preclaim_allows_one_drop_only_for_new_destination() {
+        let source = account(0x41);
+        let destination = account(0x42);
+        let tx = STTx::new(TxType::PAYMENT, |object| {
+            object.set_account_id(sf("sfAccount"), source);
+            object.set_account_id(sf("sfDestination"), destination);
+            object.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+            );
+            object.set_field_u32(sf("sfFlags"), protocol::tfSponsorCreatedAccount);
+        });
+        let mut view = MockView {
+            rules: Rules::new([protocol::feature_id("Sponsor")]),
+            ..MockView::default()
+        };
+
+        assert_eq!(
+            run_read_view_preclaim(&view, &tx, TxType::PAYMENT, ApplyFlags::NONE),
+            Some(Ter::TES_SUCCESS)
+        );
+
+        let keylet =
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(destination.data()));
+        let mut destination_root = STLedgerEntry::new(keylet);
+        destination_root.set_account_id(sf("sfAccount"), destination);
+        destination_root.set_field_amount(
+            sf("sfBalance"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(200)),
+        );
+        view.entries.insert(keylet.key, Arc::new(destination_root));
+        assert_eq!(
+            run_read_view_preclaim(&view, &tx, TxType::PAYMENT, ApplyFlags::NONE),
+            Some(Ter::TEC_NO_SPONSOR_PERMISSION)
+        );
     }
 
     #[test]

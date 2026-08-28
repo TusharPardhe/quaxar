@@ -198,7 +198,11 @@ where
         self.base.balance_hook_self_issue_mpt(issue, amount)
     }
 
-    fn owner_count_hook(&self, account: protocol::AccountID, count: u32) -> u32 {
+    fn owner_count_hook(
+        &self,
+        account: protocol::AccountID,
+        count: crate::OwnerCounts,
+    ) -> crate::OwnerCounts {
         self.base.owner_count_hook(account, count)
     }
 }

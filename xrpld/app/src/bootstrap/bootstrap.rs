@@ -223,12 +223,14 @@ impl crate::SHAMapStoreNodeFamilyCacheRuntime for BootstrapNodeFamilyCacheRuntim
         self.full_below.clear();
     }
 
-    fn visit_state_map_hashes(
+    fn visit_state_map_nodes(
         &self,
         ledger: &Ledger,
-        visit: &mut dyn FnMut(Uint256) -> bool,
+        visit: &mut dyn FnMut(
+            &basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
+        ) -> bool,
     ) -> Result<(), shamap::traversal::TraversalError> {
-        self.node_family.visit_state_map_hashes(ledger, visit)
+        self.node_family.visit_state_map_nodes(ledger, visit)
     }
 }
 
@@ -252,6 +254,17 @@ impl crate::SHAMapStoreNodeStoreRuntime for BootstrapRotatingNodeStoreRuntime {
 
     fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
         self.database.copy_to_writable_batch(hashes)
+    }
+
+    fn copy_to_writable_batch_detailed(
+        &self,
+        hashes: &[Uint256],
+    ) -> Result<(usize, Vec<Uint256>), String> {
+        self.database.copy_to_writable_batch_detailed(hashes)
+    }
+
+    fn store_account_nodes(&self, nodes: Vec<(Uint256, basics::blob::Blob)>) -> Result<(), String> {
+        self.database.store_account_nodes(nodes)
     }
 
     fn set_rotation_in_flight(&self, in_flight: bool) {
@@ -1093,6 +1106,12 @@ where
 pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), String> {
     let runtime = Arc::clone(&bootstrap.runtime);
     let standalone = runtime.root().standalone();
+    let confidential_crypto_required = protocol::REGISTERED_FEATURES.iter().any(|feature| {
+        feature.name == protocol::FEATURE_CONFIDENTIAL_TRANSFER_NAME && feature.supported
+    });
+    protocol::confidential_transfer::validate_confidential_crypto_startup(
+        confidential_crypto_required,
+    )?;
     ensure_descriptor_budget(bootstrap.report.fd_required)?;
     runtime.start()?;
     tracing::info!(target: "app", "Node startup complete");
@@ -5394,7 +5413,9 @@ fn configured_feature_ids(config: &BasicConfig) -> Vec<Uint256> {
             let name = line.split_whitespace().next()?;
             REGISTERED_FEATURES
                 .iter()
-                .find(|feature| feature.supported && feature.name == name)
+                .find(|feature| {
+                    protocol::registered_feature_supported(feature) && feature.name == name
+                })
                 .map(|feature| feature_id(feature.name))
         })
         .collect()
@@ -5432,7 +5453,7 @@ fn amendments_from_config(config: &BasicConfig, start_type: StartUpType) -> Vec<
 
     REGISTERED_FEATURES
         .iter()
-        .filter(|f| f.supported)
+        .filter(|feature| protocol::registered_feature_supported(feature))
         .map(|f| feature_id(f.name))
         .collect()
 }

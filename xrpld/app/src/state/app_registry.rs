@@ -77,6 +77,7 @@ use protocol::{AccountID, PublicKey, SeqProxy};
 use quaxar_core::{DatabaseCon, WALLET_DB_INIT, WALLET_DB_NAME};
 use resource::ResourceManager;
 use shamap::tree_node_cache::TreeNodeCache;
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::ops::Deref;
@@ -382,6 +383,7 @@ impl tx::QueueAcceptLedgerViewSource for AppOpenLedgerView {
 pub struct AppRequiredFeeView<'a, V: ReadView> {
     ledger: &'a V,
     open_tx_count: usize,
+    failure: Cell<Option<protocol::Ter>>,
 }
 
 impl<'a, V: ReadView> AppRequiredFeeView<'a, V> {
@@ -389,7 +391,12 @@ impl<'a, V: ReadView> AppRequiredFeeView<'a, V> {
         Self {
             ledger,
             open_tx_count,
+            failure: Cell::new(None),
         }
+    }
+
+    pub fn failure(&self) -> Option<protocol::Ter> {
+        self.failure.get()
     }
 }
 
@@ -403,7 +410,13 @@ impl<V: ReadView> QueueTxQRequiredFeeViewSource<AccountID, AppQueueApplyTxSource
     /// Mirrors rippled `TxQ::getTxRequiredFeeAndSeq` which calls
     /// `calculateBaseFee(view, *tx)` on the open-ledger view.
     fn calculate_base_fee_drops(&self, tx: &AppQueueApplyTxSource<'_>) -> u64 {
-        crate::state::application_root::calculate_sttx_base_fee(self.ledger, tx.tx())
+        match crate::state::application_root::calculate_sttx_base_fee(self.ledger, tx.tx()) {
+            Ok(fee) => fee,
+            Err(ter) => {
+                self.failure.set(Some(ter));
+                u64::MAX
+            }
+        }
     }
 
     /// Reads `sfSequence` from the account SLE in the base ledger,
@@ -413,11 +426,15 @@ impl<V: ReadView> QueueTxQRequiredFeeViewSource<AccountID, AppQueueApplyTxSource
             basics::base_uint::Uint160::from_slice(account.data())
                 .expect("AccountID width should match Uint160"),
         );
-        self.ledger
-            .read(keylet)
-            .ok()
-            .flatten()
-            .map(|sle| sle.get_field_u32(protocol::get_field_by_symbol("sfSequence")))
+        match self.ledger.read(keylet) {
+            Ok(sle) => {
+                sle.map(|sle| sle.get_field_u32(protocol::get_field_by_symbol("sfSequence")))
+            }
+            Err(_) => {
+                self.failure.set(Some(protocol::Ter::TEF_BAD_LEDGER));
+                None
+            }
+        }
     }
 }
 
@@ -458,7 +475,10 @@ where
         tx: &'a protocol::STTx,
         metrics_snapshot: QueueFeeMetricsSnapshot,
     ) -> Self {
-        let base_fee_drops = crate::state::application_root::calculate_sttx_base_fee(read_view, tx);
+        // This observed queue snapshot is advisory. The authoritative
+        // preclaim path recalculates the fee fallibly before any mutation.
+        let base_fee_drops =
+            crate::state::application_root::calculate_sttx_base_fee_for_metrics(read_view, tx);
         let default_base_fee_drops =
             crate::state::application_root::calculate_default_sttx_base_fee(read_view, tx);
         let fee_field = protocol::get_field_by_symbol("sfFee");

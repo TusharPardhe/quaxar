@@ -132,7 +132,19 @@ impl<V> OpenLedger<V> {
         changed
     }
 
-    pub fn accept<Tx, Retries, Check, Create, Apply, LocalApply, Modify, ShouldRelay, Relay, I>(
+    pub fn accept<
+        Tx,
+        Retries,
+        Check,
+        CheckError,
+        Create,
+        Apply,
+        LocalApply,
+        Modify,
+        ShouldRelay,
+        Relay,
+        I,
+    >(
         &self,
         create: Create,
         check: &Check,
@@ -145,11 +157,12 @@ impl<V> OpenLedger<V> {
         modify: Option<Modify>,
         should_relay: &mut ShouldRelay,
         relay: &mut Relay,
-    ) where
+    ) -> Vec<CheckError>
+    where
         V: Clone + OpenLedgerView<Tx>,
         Tx: OpenLedgerTx,
         Retries: OpenLedgerRetries<Tx>,
-        Check: Fn(&Tx::Id) -> bool,
+        Check: Fn(&Tx::Id) -> Result<bool, CheckError>,
         Create: FnOnce() -> V,
         Apply: FnMut(&mut V, &Tx, ApplyFlags) -> ApplyResult,
         LocalApply: FnMut(&mut V, &Tx, ApplyFlags),
@@ -159,16 +172,17 @@ impl<V> OpenLedger<V> {
         I: IntoIterator<Item = Tx>,
     {
         let mut next = create();
+        let mut check_errors = Vec::new();
 
         if retries_first {
-            run_open_ledger_apply::<V, Tx, _, _, _, _>(
+            check_errors.extend(run_open_ledger_apply::<V, Tx, _, _, _, _, _>(
                 &mut next,
                 check,
                 std::iter::empty::<Tx>(),
                 retries,
                 flags,
                 apply,
-            );
+            ));
         }
 
         let _modify_lock = self
@@ -177,7 +191,14 @@ impl<V> OpenLedger<V> {
             .expect("OpenLedger modify lock poisoned");
         let current_txs = self.current().ordered_txs();
 
-        run_open_ledger_apply(&mut next, check, current_txs, retries, flags, apply);
+        check_errors.extend(run_open_ledger_apply(
+            &mut next,
+            check,
+            current_txs,
+            retries,
+            flags,
+            apply,
+        ));
 
         if let Some(modify) = modify {
             let _ = modify(&mut next);
@@ -198,6 +219,7 @@ impl<V> OpenLedger<V> {
             .current
             .lock()
             .expect("OpenLedger current lock poisoned") = Arc::new(next);
+        check_errors
     }
 }
 
@@ -246,24 +268,35 @@ where
     classify_open_ledger_apply_result(apply(view, tx, effective_flags))
 }
 
-pub fn run_open_ledger_apply<V, Tx, Retries, Check, Apply, Txs>(
+pub fn run_open_ledger_apply<V, Tx, Retries, Check, CheckError, Apply, Txs>(
     view: &mut V,
     check: &Check,
     txs: Txs,
     retries: &mut Retries,
     flags: ApplyFlags,
     apply: &mut Apply,
-) where
+) -> Vec<CheckError>
+where
     Tx: OpenLedgerTx,
     Retries: OpenLedgerRetries<Tx>,
-    Check: Fn(&Tx::Id) -> bool,
+    Check: Fn(&Tx::Id) -> Result<bool, CheckError>,
     Apply: FnMut(&mut V, &Tx, ApplyFlags) -> ApplyResult,
     Txs: IntoIterator<Item = Tx>,
 {
+    let mut check_errors = Vec::new();
     for tx in txs {
         let tx_id = tx.tx_id();
-        if check(&tx_id) {
-            continue;
+        match check(&tx_id) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                // OpenLedger.h catches a check.txExists exception for this
+                // transaction, logs it, and continues rebuilding the rest of
+                // the open ledger. Return the error to the owner for logging,
+                // but never reinterpret it as transaction absence.
+                check_errors.push(error);
+                continue;
+            }
         }
 
         if apply_one_open_ledger(view, &tx, true, flags, apply) == OpenLedgerApplyDisposition::Retry
@@ -291,7 +324,7 @@ pub fn run_open_ledger_apply<V, Tx, Retries, Check, Apply, Txs>(
         retries.restore_retries(remaining);
 
         if changes == 0 && !retry {
-            return;
+            return check_errors;
         }
 
         if changes == 0 || pass >= LEDGER_RETRY_PASSES {
@@ -300,6 +333,7 @@ pub fn run_open_ledger_apply<V, Tx, Retries, Check, Apply, Txs>(
     }
 
     debug_assert!(retries.is_empty() || !retry);
+    check_errors
 }
 
 const fn is_open_ledger_tel_local(code: Ter) -> bool {

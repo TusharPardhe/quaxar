@@ -11,8 +11,8 @@
 //! Ported from C++ Freeze_test.cpp, MultiSign_test.cpp, DepositAuth_test.cpp.
 
 use super::fixtures::*;
+use super::handle_real_dispatch;
 use super::pipeline::full_apply;
-use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{

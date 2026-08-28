@@ -8,6 +8,7 @@ pub const PERMISSION_MAX_SIZE: usize = 10;
 pub struct DelegateSetPreclaimFacts {
     pub account_exists: bool,
     pub authorize_exists: bool,
+    pub authorize_is_pseudo: bool,
     pub permissions_empty: bool,
     pub delegate_exists: bool,
 }
@@ -71,6 +72,10 @@ pub fn run_delegate_set_preclaim(facts: DelegateSetPreclaimFacts) -> Ter {
 
     if !facts.authorize_exists {
         return Ter::TEC_NO_TARGET;
+    }
+
+    if facts.authorize_is_pseudo {
+        return Ter::TEC_PSEUDO_ACCOUNT;
     }
 
     if facts.permissions_empty && !facts.delegate_exists {
@@ -199,14 +204,15 @@ mod tests {
     }
 
     #[test]
-    fn preclaim_accepts_existing_authorized_pseudo_account_like_rippled() {
+    fn preclaim_rejects_existing_authorized_pseudo_account_like_rippled() {
         let facts = DelegateSetPreclaimFacts {
             account_exists: true,
             authorize_exists: true,
+            authorize_is_pseudo: true,
             permissions_empty: false,
             delegate_exists: false,
         };
-        assert_eq!(run_delegate_set_preclaim(facts), Ter::TES_SUCCESS);
+        assert_eq!(run_delegate_set_preclaim(facts), Ter::TEC_PSEUDO_ACCOUNT);
     }
 
     #[test]
@@ -214,6 +220,7 @@ mod tests {
         let facts = DelegateSetPreclaimFacts {
             account_exists: true,
             authorize_exists: true,
+            authorize_is_pseudo: false,
             permissions_empty: true,
             delegate_exists: false,
         };
@@ -225,6 +232,7 @@ mod tests {
         let facts = DelegateSetPreclaimFacts {
             account_exists: true,
             authorize_exists: true,
+            authorize_is_pseudo: false,
             permissions_empty: false,
             delegate_exists: false,
         };

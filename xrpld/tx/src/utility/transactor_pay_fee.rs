@@ -21,6 +21,11 @@ pub trait TransactorPayFeeTx {
     fn fee_payer(&self) -> Self::AccountId;
 }
 
+/// AccountRoot-only test primitive. Production fee mutation belongs to the
+/// application Transactor context, which owns the selected FeePayer keylet,
+/// balance field, reserve/cap policy, reset, and XRP destruction accounting.
+#[doc(hidden)]
+#[deprecated(note = "account-only test primitive; production must use application FeePayer state")]
 pub fn run_transactor_pay_fee<
     Tx,
     AccountState,

@@ -65,8 +65,10 @@ impl CheckCancelApplySink for TestApplySink {
 }
 
 #[test]
-fn check_cancel_preflight_is_noop() {
-    assert_eq!(run_check_cancel_preflight(), Ter::TES_SUCCESS);
+fn check_cancel_preflight_matches_cleanup_3_3_0_zero_id_rule() {
+    assert_eq!(run_check_cancel_preflight(false, true), Ter::TES_SUCCESS);
+    assert_eq!(run_check_cancel_preflight(true, false), Ter::TES_SUCCESS);
+    assert_eq!(run_check_cancel_preflight(true, true), Ter::TEM_MALFORMED);
 }
 
 #[test]

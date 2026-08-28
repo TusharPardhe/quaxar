@@ -109,7 +109,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         name: "Payment",
         delegable: "Delegation::delegable",
         amendment: "uint256{}",
-        privileges: "createAcct",
+        privileges: "createAcct | mayCreateMPT",
         field_specs: &[
             FormatFieldSpec {
                 field_symbol: "sfDestination",
@@ -332,17 +332,17 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         name: "OfferCreate",
         delegable: "Delegation::delegable",
         amendment: "uint256{}",
-        privileges: "noPriv",
+        privileges: "mayCreateMPT",
         field_specs: &[
             FormatFieldSpec {
                 field_symbol: "sfTakerPays",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfTakerGets",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfExpiration",
@@ -528,7 +528,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
             FormatFieldSpec {
                 field_symbol: "sfSendMax",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfExpiration",
@@ -553,7 +553,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         name: "CheckCash",
         delegable: "Delegation::delegable",
         amendment: "uint256{}",
-        privileges: "noPriv",
+        privileges: "mayCreateMPT",
         field_specs: &[
             FormatFieldSpec {
                 field_symbol: "sfCheckID",
@@ -563,12 +563,12 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
             FormatFieldSpec {
                 field_symbol: "sfAmount",
                 style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfDeliverMin",
                 style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
         ],
     },
@@ -829,7 +829,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         name: "AMMClawback",
         delegable: "Delegation::delegable",
         amendment: "featureAMMClawback",
-        privileges: "mayDeleteAcct | overrideFreeze",
+        privileges: "mayDeleteAcct | overrideFreeze | mayAuthorizeMPT",
         field_specs: &[
             FormatFieldSpec {
                 field_symbol: "sfHolder",
@@ -839,17 +839,17 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
             FormatFieldSpec {
                 field_symbol: "sfAsset",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAsset2",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAmount",
                 style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
         ],
     },
@@ -859,17 +859,17 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         name: "AMMCreate",
         delegable: "Delegation::delegable",
         amendment: "featureAMM",
-        privileges: "createPseudoAcct",
+        privileges: "createPseudoAcct | mayCreateMPT",
         field_specs: &[
             FormatFieldSpec {
                 field_symbol: "sfAmount",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAmount2",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfTradingFee",
@@ -889,22 +889,22 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
             FormatFieldSpec {
                 field_symbol: "sfAsset",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAsset2",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAmount",
                 style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAmount2",
                 style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfEPrice",
@@ -929,27 +929,27 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         name: "AMMWithdraw",
         delegable: "Delegation::delegable",
         amendment: "featureAMM",
-        privileges: "mayDeleteAcct",
+        privileges: "mayDeleteAcct | mayAuthorizeMPT",
         field_specs: &[
             FormatFieldSpec {
                 field_symbol: "sfAsset",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAsset2",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAmount",
                 style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAmount2",
                 style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfEPrice",
@@ -974,12 +974,12 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
             FormatFieldSpec {
                 field_symbol: "sfAsset",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAsset2",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfTradingFee",
@@ -999,12 +999,12 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
             FormatFieldSpec {
                 field_symbol: "sfAsset",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAsset2",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfBidMin",
@@ -1029,17 +1029,17 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         name: "AMMDelete",
         delegable: "Delegation::delegable",
         amendment: "featureAMM",
-        privileges: "mustDeleteAcct",
+        privileges: "mustDeleteAcct | mayDeleteMPT",
         field_specs: &[
             FormatFieldSpec {
                 field_symbol: "sfAsset",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
             FormatFieldSpec {
                 field_symbol: "sfAsset2",
                 style: SOEStyle::Required,
-                mpt: SOETxMPTIssue::None,
+                mpt: SOETxMPTIssue::Supported,
             },
         ],
     },
@@ -1484,12 +1484,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
                 mpt: SOETxMPTIssue::None,
             },
             FormatFieldSpec {
-                field_symbol: "sfMutableFlags",
-                style: SOEStyle::Optional,
-                mpt: SOETxMPTIssue::None,
-            },
-            FormatFieldSpec {
-                field_symbol: "sfReferenceHolding",
+                field_symbol: "sfImmutableFlags",
                 style: SOEStyle::Optional,
                 mpt: SOETxMPTIssue::None,
             },
@@ -1542,7 +1537,17 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
                 mpt: SOETxMPTIssue::None,
             },
             FormatFieldSpec {
-                field_symbol: "sfMutableFlags",
+                field_symbol: "sfImmutableFlags",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfIssuerEncryptionKey",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfAuditorEncryptionKey",
                 style: SOEStyle::Optional,
                 mpt: SOETxMPTIssue::None,
             },
@@ -1764,6 +1769,21 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
                 style: SOEStyle::Optional,
                 mpt: SOETxMPTIssue::None,
             },
+            FormatFieldSpec {
+                field_symbol: "sfVaultKind",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfSubscriptionDate",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfRedemptionDate",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
         ],
     },
     TxFormatSpecInit {
@@ -1803,11 +1823,18 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         delegable: "Delegation::notDelegable",
         amendment: "featureSingleAssetVault",
         privileges: "mustDeleteAcct | destroyMPTIssuance | mustModifyVault",
-        field_specs: &[FormatFieldSpec {
-            field_symbol: "sfVaultID",
-            style: SOEStyle::Required,
-            mpt: SOETxMPTIssue::None,
-        }],
+        field_specs: &[
+            FormatFieldSpec {
+                field_symbol: "sfVaultID",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfMemoData",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+        ],
     },
     TxFormatSpecInit {
         tag_name: "ttVAULT_DEPOSIT",
@@ -2170,6 +2197,269 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
                 field_symbol: "sfAmount",
                 style: SOEStyle::Required,
                 mpt: SOETxMPTIssue::Supported,
+            },
+        ],
+    },
+    TxFormatSpecInit {
+        tag_name: "ttCONFIDENTIAL_MPT_CONVERT",
+        value: 85,
+        name: "ConfidentialMPTConvert",
+        delegable: "Delegation::notDelegable",
+        amendment: "featureConfidentialTransfer",
+        privileges: "noPriv",
+        field_specs: &[
+            FormatFieldSpec {
+                field_symbol: "sfMPTokenIssuanceID",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfMPTAmount",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfHolderEncryptionKey",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfHolderEncryptedAmount",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfIssuerEncryptedAmount",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfAuditorEncryptedAmount",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfBlindingFactor",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfZKProof",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+        ],
+    },
+    TxFormatSpecInit {
+        tag_name: "ttCONFIDENTIAL_MPT_MERGE_INBOX",
+        value: 86,
+        name: "ConfidentialMPTMergeInbox",
+        delegable: "Delegation::delegable",
+        amendment: "featureConfidentialTransfer",
+        privileges: "noPriv",
+        field_specs: &[FormatFieldSpec {
+            field_symbol: "sfMPTokenIssuanceID",
+            style: SOEStyle::Required,
+            mpt: SOETxMPTIssue::None,
+        }],
+    },
+    TxFormatSpecInit {
+        tag_name: "ttCONFIDENTIAL_MPT_CONVERT_BACK",
+        value: 87,
+        name: "ConfidentialMPTConvertBack",
+        delegable: "Delegation::delegable",
+        amendment: "featureConfidentialTransfer",
+        privileges: "noPriv",
+        field_specs: &[
+            FormatFieldSpec {
+                field_symbol: "sfMPTokenIssuanceID",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfMPTAmount",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfHolderEncryptedAmount",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfIssuerEncryptedAmount",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfAuditorEncryptedAmount",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfBlindingFactor",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfZKProof",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfBalanceCommitment",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+        ],
+    },
+    TxFormatSpecInit {
+        tag_name: "ttCONFIDENTIAL_MPT_SEND",
+        value: 88,
+        name: "ConfidentialMPTSend",
+        delegable: "Delegation::delegable",
+        amendment: "featureConfidentialTransfer",
+        privileges: "noPriv",
+        field_specs: &[
+            FormatFieldSpec {
+                field_symbol: "sfMPTokenIssuanceID",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfDestination",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfDestinationTag",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfSenderEncryptedAmount",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfDestinationEncryptedAmount",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfIssuerEncryptedAmount",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfAuditorEncryptedAmount",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfZKProof",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfAmountCommitment",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfBalanceCommitment",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfCredentialIDs",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+        ],
+    },
+    TxFormatSpecInit {
+        tag_name: "ttCONFIDENTIAL_MPT_CLAWBACK",
+        value: 89,
+        name: "ConfidentialMPTClawback",
+        delegable: "Delegation::delegable",
+        amendment: "featureConfidentialTransfer",
+        privileges: "noPriv",
+        field_specs: &[
+            FormatFieldSpec {
+                field_symbol: "sfMPTokenIssuanceID",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfHolder",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfMPTAmount",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfZKProof",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+        ],
+    },
+    TxFormatSpecInit {
+        tag_name: "ttSPONSORSHIP_TRANSFER",
+        value: 90,
+        name: "SponsorshipTransfer",
+        delegable: "Delegation::notDelegable",
+        amendment: "featureSponsor",
+        privileges: "noPriv",
+        field_specs: &[
+            FormatFieldSpec {
+                field_symbol: "sfObjectID",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfSponsee",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+        ],
+    },
+    TxFormatSpecInit {
+        tag_name: "ttSPONSORSHIP_SET",
+        value: 91,
+        name: "SponsorshipSet",
+        delegable: "Delegation::delegable",
+        amendment: "featureSponsor",
+        privileges: "noPriv",
+        field_specs: &[
+            FormatFieldSpec {
+                field_symbol: "sfCounterpartySponsor",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfSponsee",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfFeeAmountDelta",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfMaxFee",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfRemainingOwnerCountDelta",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
             },
         ],
     },

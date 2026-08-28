@@ -9,7 +9,9 @@ use basics::number::{MantissaScale, set_mantissa_scale};
 use basics::unordered_containers::{HardenedHashSet, HashSet};
 use std::sync::OnceLock;
 
-use crate::{feature_lending_protocol, feature_single_asset_vault, fix_cleanup_3_2_0};
+use crate::{
+    feature_lending_protocol, feature_single_asset_vault, fix_cleanup_3_2_0, fix_cleanup_3_3_0,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct Rules {
@@ -70,11 +72,15 @@ pub fn set_current_transaction_rules(rules: Option<Rules>) {
         Some(rules) => {
             let enable_vault_numbers = rules.enabled(&feature_single_asset_vault())
                 || rules.enabled(&feature_lending_protocol());
-            let enable_cusp_fix = rules.enabled(&fix_cleanup_3_2_0());
-            match (enable_vault_numbers, enable_cusp_fix) {
-                (true, true) => MantissaScale::Large,
-                (true, false) => MantissaScale::LargeLegacy,
-                (false, _) => MantissaScale::Small,
+            match (
+                enable_vault_numbers,
+                rules.enabled(&fix_cleanup_3_2_0()),
+                rules.enabled(&fix_cleanup_3_3_0()),
+            ) {
+                (true, _, true) => MantissaScale::Large330,
+                (true, true, false) => MantissaScale::Large320,
+                (true, false, false) => MantissaScale::LargeLegacy,
+                (false, _, _) => MantissaScale::Small,
             }
         }
     };
@@ -161,6 +167,7 @@ mod tests {
     };
     use crate::{
         feature_id, feature_lending_protocol, feature_single_asset_vault, fix_cleanup_3_2_0,
+        fix_cleanup_3_3_0,
     };
     use basics::base_uint::Uint256;
     use basics::local_value::{LocalSlotOwner, install_local_slot_owner};
@@ -324,13 +331,20 @@ mod tests {
             feature_single_asset_vault(),
             fix_cleanup_3_2_0(),
         ])));
-        assert_eq!(get_mantissa_scale(), MantissaScale::Large);
+        assert_eq!(get_mantissa_scale(), MantissaScale::Large320);
 
         set_current_transaction_rules(Some(Rules::new([
             feature_lending_protocol(),
             fix_cleanup_3_2_0(),
         ])));
-        assert_eq!(get_mantissa_scale(), MantissaScale::Large);
+        assert_eq!(get_mantissa_scale(), MantissaScale::Large320);
+
+        set_current_transaction_rules(Some(Rules::new([
+            feature_lending_protocol(),
+            fix_cleanup_3_2_0(),
+            fix_cleanup_3_3_0(),
+        ])));
+        assert_eq!(get_mantissa_scale(), MantissaScale::Large330);
 
         set_current_transaction_rules(None);
         assert_eq!(get_mantissa_scale(), MantissaScale::Large);
