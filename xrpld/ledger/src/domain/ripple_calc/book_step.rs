@@ -353,6 +353,9 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     let mut total_out = max_out.zeroed();
     let mut offers_consumed: u32 = 0;
     let mut remaining_in = max_in.clone();
+    let fix_reduced_offers_v2 = view
+        .rules()
+        .enabled(&protocol::feature_id("fixReducedOffersV2"));
 
     macro_rules! remove_offer_or_return {
         ($offer:expr) => {{
@@ -876,6 +879,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 &owner_funds,
                 tr_in,
                 tr_out,
+                fix_reduced_offers_v2,
             );
 
             if consumption.step_in.signum() <= 0 || consumption.step_out.signum() <= 0 {
@@ -2152,6 +2156,7 @@ fn compute_offer_consumption(
     owner_funds: &STAmount,
     transfer_rate_in: u32,
     transfer_rate_out: u32,
+    fix_reduced_offers_v2: bool,
 ) -> OfferConsumption {
     let ofr_in = taker_pays.clone();
     let ofr_out = taker_gets.clone();
@@ -2162,23 +2167,23 @@ fn compute_offer_consumption(
     let mut owner_gives = mul_ratio_amount(&ofr_out, transfer_rate_out, QUALITY_ONE, false);
     let mut actual_ofr_in = ofr_in;
     let mut actual_ofr_out = ofr_out;
+    // TOffer retains the quality calculated from the original ledger offer.
+    // Every subsequent limitIn/limitOut operation uses that stored quality,
+    // even after owner-funding has reduced the working offer amounts.
+    let offer_quality =
+        Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
 
     // reference: if (funds < ownerGives) — limit by owner funding
     if *owner_funds < owner_gives {
         owner_gives = owner_funds.clone();
         stp_out = mul_ratio_amount(&owner_gives, QUALITY_ONE, transfer_rate_out, false);
-        if taker_gets.signum() > 0 {
-            actual_ofr_out = stp_out.clone();
-            // quality.rate() = taker_pays / taker_gets
-            // Use cross_type_mul_div to avoid intermediate overflow.
-            actual_ofr_in = cross_type_scale(
-                &actual_ofr_out,
-                taker_pays,
-                taker_gets,
-                taker_pays.asset(),
-                true,
-            );
-        }
+        let limited = offer_quality.ceil_out_strict(
+            &Amounts::new(actual_ofr_in, actual_ofr_out),
+            &stp_out,
+            false,
+        );
+        actual_ofr_in = limited.r#in;
+        actual_ofr_out = limited.out;
         stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
     }
 
@@ -2191,7 +2196,7 @@ fn compute_offer_consumption(
     // has been derived.
     if *remaining_out < stp_out {
         let offer_amounts = Amounts::new(actual_ofr_in.clone(), actual_ofr_out.clone());
-        let clipped = Quality::from_amounts(&offer_amounts).ceil_out(&offer_amounts, remaining_out);
+        let clipped = offer_quality.ceil_out_strict(&offer_amounts, remaining_out, true);
         actual_ofr_in = clipped.r#in;
         actual_ofr_out = clipped.out;
         stp_out = actual_ofr_out.clone();
@@ -2203,21 +2208,17 @@ fn compute_offer_consumption(
     if *remaining_in < stp_in {
         stp_in = remaining_in.clone();
         let in_lmt = mul_ratio_amount(&stp_in, QUALITY_ONE, transfer_rate_in, false);
-        // Reference: rippled `BookStep.cpp::limitStepIn` is generic over
-        // `TIn`/`TOut`; this path must remain valid for IOU, XRP, and MPT
-        // inputs and must not inspect an amount as XRP merely for diagnostics.
-        if taker_pays.signum() > 0 {
-            actual_ofr_in = in_lmt;
-            // quality.rate() = taker_pays / taker_gets
-            // Use cross_type_mul_div to avoid intermediate overflow.
-            actual_ofr_out = cross_type_scale(
-                &actual_ofr_in,
-                taker_gets,
-                taker_pays,
-                taker_gets.asset(),
-                false,
-            );
-        }
+        let offer_amounts = Amounts::new(actual_ofr_in, actual_ofr_out);
+        let limited = if fix_reduced_offers_v2 {
+            // TOffer::limitIn selects the strict implementation under the
+            // amendment and deliberately rounds down. This one-ulp behavior
+            // is consensus-significant for fractional IOU offers.
+            offer_quality.ceil_in_strict(&offer_amounts, &in_lmt, false)
+        } else {
+            offer_quality.ceil_in(&offer_amounts, &in_lmt)
+        };
+        actual_ofr_in = limited.r#in;
+        actual_ofr_out = limited.out;
         stp_out = actual_ofr_out.clone();
         owner_gives = mul_ratio_amount(&stp_out, transfer_rate_out, QUALITY_ONE, false);
     }
@@ -2228,120 +2229,6 @@ fn compute_offer_consumption(
         offer_in: actual_ofr_in,
         owner_gives,
         offer_out: actual_ofr_out,
-    }
-}
-
-/// Scale `value` by `numerator / denominator`, producing a result with `result_asset`.
-/// Computes: result = value * numerator / denominator
-/// Handles cross-type (XRP drops * IOU / XRP drops) correctly.
-/// Matches reference Quality::ceilIn / ceilOut which use mulRound/divRound with full
-/// integer precision (not floating point).
-fn cross_type_scale(
-    value: &STAmount,
-    numerator: &STAmount,
-    denominator: &STAmount,
-    result_asset: protocol::Asset,
-    round_up: bool,
-) -> STAmount {
-    let sf_amt = protocol::get_field_by_symbol("sfAmount");
-    let zero = STAmount::new_with_asset(sf_amt, result_asset, 0, 0, false);
-
-    if value.signum() == 0 || numerator.signum() == 0 {
-        return zero;
-    }
-
-    let (d_m, _d_e) = raw_mantissa_exp(denominator);
-    if d_m == 0 {
-        return zero;
-    }
-
-    // Use i128 arithmetic to preserve full precision for the multiplication.
-    // Convert each amount to a scaled integer representation:
-    //   real_value = mantissa * 10^exponent
-    // We compute: result = (v_m * 10^v_e) * (n_m * 10^n_e) / (d_m * 10^d_e)
-    //           = (v_m * n_m / d_m) * 10^(v_e + n_e - d_e)
-    // But to avoid overflow and preserve precision, we keep the product in i128.
-
-    let (v_m, v_e) = raw_mantissa_exp(value);
-    let (n_m, n_e) = raw_mantissa_exp(numerator);
-    let (d_m, d_e) = raw_mantissa_exp(denominator);
-
-    // product_mantissa = v_m * n_m (fits in u128 since both are at most ~10^16)
-    let product: u128 = v_m as u128 * n_m as u128;
-    let combined_exp: i32 = v_e + n_e - d_e;
-
-    // result_mantissa = product / d_m (with rounding)
-    let (quotient, remainder) = (product / d_m as u128, product % d_m as u128);
-    let mut result_mantissa = if round_up && remainder > 0 {
-        quotient + 1
-    } else {
-        quotient
-    };
-
-    if result_mantissa == 0 {
-        return zero;
-    }
-
-    let negative = (value.negative() != numerator.negative()) != denominator.negative();
-
-    if result_asset.native() {
-        // XRP: result = result_mantissa * 10^combined_exp (in drops)
-        let drops: i64 = if combined_exp >= 0 {
-            (result_mantissa as i128 * 10i128.pow(combined_exp as u32)) as i64
-        } else {
-            let divisor = 10u128.pow((-combined_exp) as u32);
-            let rem = result_mantissa % divisor;
-            let q = result_mantissa / divisor;
-            if round_up && rem > 0 {
-                (q + 1) as i64
-            } else {
-                q as i64
-            }
-        };
-        return STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(if negative {
-            -drops
-        } else {
-            drops
-        }));
-    }
-
-    // IOU: normalize result_mantissa * 10^combined_exp into [1e15, 1e16) * 10^exp
-    let mut exponent = combined_exp;
-
-    // Normalize: shift mantissa into [1e15, 1e16)
-    while result_mantissa > 0 && result_mantissa < 1_000_000_000_000_000 {
-        result_mantissa *= 10;
-        exponent -= 1;
-    }
-    while result_mantissa >= 10_000_000_000_000_000 {
-        let rem = result_mantissa % 10;
-        result_mantissa /= 10;
-        if round_up && rem > 0 {
-            result_mantissa += 1;
-        }
-        exponent += 1;
-    }
-
-    // Clamp to valid IOU range
-    let mantissa = (result_mantissa as u64).clamp(1_000_000_000_000_000, 9_999_999_999_999_999);
-
-    STAmount::new_with_asset(
-        protocol::get_field_by_symbol("sfAmount"),
-        result_asset,
-        mantissa,
-        exponent,
-        negative,
-    )
-}
-
-/// Get raw (mantissa, exponent) for an STAmount without normalization.
-/// XRP: mantissa = drops, exponent = 0.
-/// IOU: stored mantissa and exponent.
-fn raw_mantissa_exp(amount: &STAmount) -> (u64, i32) {
-    if amount.native() {
-        (amount.xrp().drops().unsigned_abs(), 0)
-    } else {
-        (amount.mantissa(), amount.exponent())
     }
 }
 
@@ -3188,12 +3075,46 @@ mod tests {
             ),
             QUALITY_ONE,
             QUALITY_ONE,
+            true,
         );
 
         assert_eq!(consumption.step_in.xrp().drops(), 3_300_000);
         assert_eq!(consumption.step_out.iou().to_string(), "1");
         assert_eq!(consumption.offer_in.xrp().drops(), 3_300_000);
         assert_eq!(consumption.offer_out.iou().to_string(), "1");
+    }
+
+    #[test]
+    fn strict_input_limit_matches_fractional_iou_offer_rounding() {
+        // Canonical Testnet ledger 20,283,299. With fixReducedOffersV2,
+        // TOffer::limitIn uses ceilInStrict(..., roundUp=false). Consuming
+        // 25 XRP from this 50-XRP offer delivers 49.74999999999999 IOU and
+        // leaves 49.75000000000002, not the arithmetically tempting 49.75.
+        let issuer = AccountID::from_array([0x33; 20]);
+        let issue = protocol::Issue::new(protocol::currency_from_string("USD"), issuer);
+        let taker_gets = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            protocol::IOUAmount::from_parts(9_950_000_000_000_001, -14)
+                .expect("99.50000000000001 IOU"),
+            issue,
+        );
+        let consumption = compute_offer_consumption(
+            &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(25_000_000)),
+            &taker_gets,
+            &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(50_000_000)),
+            &taker_gets,
+            &taker_gets,
+            QUALITY_ONE,
+            QUALITY_ONE,
+            true,
+        );
+
+        assert_eq!(consumption.offer_in.xrp().drops(), 25_000_000);
+        assert_eq!(consumption.offer_out.iou().to_string(), "49.74999999999999");
+        assert_eq!(
+            (taker_gets - consumption.offer_out).iou().to_string(),
+            "49.75000000000002"
+        );
     }
 
     #[test]

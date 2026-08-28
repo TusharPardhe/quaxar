@@ -175,28 +175,31 @@ fn payment_xrp_to_iou_partial_self_payment_with_3300_xrp_sendmax() {
 }
 
 #[test]
-fn payment_xrp_to_iou_partial_self_payment_consumes_fractional_offer() {
+fn payment_xrp_to_iou_partial_self_payment_preserves_strict_offer_remainder() {
     let taker = acct(0x11);
     let maker = acct(0x22);
     let issuer = acct(0x33);
     let usd = usd_currency();
     let offered = STAmount::from_iou_amount(
         sf_generic(),
-        IOUAmount::from_parts(4_975_000_000_000_002, -14).expect("49.75000000000002 USD"),
+        IOUAmount::from_parts(9_950_000_000_000_001, -14).expect("99.50000000000001 USD"),
         Issue::new(usd, issuer),
     );
-    let ledger = build_ledger(vec![
+    let mut ledger = build_ledger(vec![
         account_root(taker, 118_260_767, 3, 0),
         account_root(maker, 81_597_975, 6, 0),
         account_root(issuer, 10_000_000_000, 0, 0),
         trust_line(taker, issuer, usd, 100, 1_000_000_000, 0),
         trust_line(maker, issuer, usd, 1_130, 1_000_000, 0),
     ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+        "fixReducedOffersV2",
+    )]));
     let mut view = new_view(ledger);
 
     let offer = STTx::new(TxType::OFFER_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), maker);
-        tx.set_field_amount(sf("sfTakerPays"), xrp(25_000_000));
+        tx.set_field_amount(sf("sfTakerPays"), xrp(50_000_000));
         tx.set_field_amount(sf("sfTakerGets"), offered.clone());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -220,11 +223,14 @@ fn payment_xrp_to_iou_partial_self_payment_consumes_fractional_offer() {
         full_apply(&mut view, &payment, TxType::PAYMENT),
         Ter::TES_SUCCESS
     );
-    assert!(
-        view.read(protocol::offer_keylet(acct_id(maker), 1))
-            .expect("offer read")
-            .is_none(),
-        "fully consumed offer must be removed"
+    let offer = view
+        .read(protocol::offer_keylet(acct_id(maker), 1))
+        .expect("offer read")
+        .expect("half-consumed offer remains");
+    assert_eq!(offer.get_field_amount(sf("sfTakerPays")), xrp(25_000_000));
+    assert_eq!(
+        offer.get_field_amount(sf("sfTakerGets")).iou().to_string(),
+        "49.75000000000002"
     );
 }
 
