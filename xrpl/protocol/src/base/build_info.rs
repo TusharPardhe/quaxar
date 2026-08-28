@@ -4,7 +4,10 @@ use std::sync::OnceLock;
 
 use crate::system_name;
 
-pub const VERSION_STRING: &str = "3.2.0-b0";
+/// Quaxar's user-visible release version, sourced from the workspace manifest.
+/// The separate implementation-family marker below remains XRPL wire-
+/// compatibility metadata.
+pub const VERSION_STRING: &str = env!("CARGO_PKG_VERSION");
 const IMPLEMENTATION_VERSION_IDENTIFIER: u64 = 0x183B_0000_0000_0000;
 const IMPLEMENTATION_VERSION_IDENTIFIER_MASK: u64 = 0xFFFF_0000_0000_0000;
 
@@ -77,7 +80,7 @@ mod tests {
 
     #[test]
     fn build_info_encodes_current_version_shape() {
-        assert_eq!(VERSION_STRING, "3.2.0-b0");
+        assert_eq!(VERSION_STRING, "0.8.0");
         assert!(is_xrpld_version(get_encoded_version()));
         assert_eq!(encode_software_version("3.2.0"), 0x183B_0302_00C0_0000);
     }
