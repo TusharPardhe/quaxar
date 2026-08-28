@@ -2875,7 +2875,7 @@ impl CoordinatorRunner {
                 .on_write(completion.operation(), completion.outcome());
             (outcome, session_state.plan.persistence().label())
         };
-        tracing::info!(
+        tracing::trace!(
             target: "acquisition_trace",
             event = "node_store_write_completed",
             run_epoch = session.run_epoch().get(),
@@ -3690,7 +3690,7 @@ impl CoordinatorRunner {
         };
         match turn {
             PlanTurn::Reads(requests) => {
-                tracing::info!(
+                tracing::trace!(
                     target: "acquisition_trace",
                     event = "node_store_reads_submitted",
                     run_epoch = session.run_epoch().get(),
@@ -3762,7 +3762,7 @@ impl CoordinatorRunner {
                 if final_batch {
                     self.release_local_scan_permit(session, effects);
                 }
-                tracing::info!(
+                tracing::trace!(
                     target: "acquisition_trace",
                     event = "persistence_batch_submitted",
                     run_epoch = session.run_epoch().get(),
@@ -4240,7 +4240,7 @@ impl CoordinatorRunner {
         let kind = first.kind();
         debug_assert!(nodes.iter().all(|node| node.kind() == kind));
         let node_ids = nodes.iter().map(|node| node.node_id()).collect::<Vec<_>>();
-        tracing::info!(
+        tracing::trace!(
             target: "acquisition_trace",
             event = "network_frontier_requested",
             run_epoch = session.run_epoch().get(),

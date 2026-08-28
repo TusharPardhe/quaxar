@@ -1260,7 +1260,7 @@ impl SessionPlan {
             self.runs += 1;
             self.retire_network_resolutions(&fed.resolved_network);
             if fed.nodes_seen != 0 {
-                tracing::info!(
+                tracing::trace!(
                     target: "acquisition_trace",
                     event = "packet_batch_applied",
                     run_epoch = ctx.session.run_epoch().get(),
@@ -1308,7 +1308,7 @@ impl SessionPlan {
                     _ => 0,
                 };
                 if deferred_reads != 0 || deferred_network != 0 {
-                    tracing::info!(
+                    tracing::trace!(
                         target: "acquisition_trace",
                         event = "effects_deferred_for_incremental_write",
                         run_epoch = ctx.session.run_epoch().get(),
