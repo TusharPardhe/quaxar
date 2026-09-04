@@ -2396,6 +2396,7 @@ dependencies = [
  "protocol",
  "reqwest",
  "serde_json",
+ "shamap",
  "terminal_size",
  "ureq",
 ]
