@@ -5,6 +5,34 @@ diagnostics, not state-transition counts. The retained journal contains 33
 confirmed incompatible children from 2–4 September 2026. In every case the
 local child shares the canonical parent and uses the same transaction-ID set.
 
+## OfferCreate flow-result parity (5 September)
+
+Four later incompatible children shared the canonical parent and candidate
+transaction set, but omitted one canonical successful `OfferCreate` from the
+locally built transaction map:
+
+| Ledger | Omitted transaction | Quaxar crossing result | Canonical result |
+| ---: | --- | --- | --- |
+| 20,496,487 | `711C83C47F6FBC2DB6F37947492F9B1D45BB924A2FA015FA7098AB8D9883694A` | Retry after the IOU crossing strands failed validation | `tesSUCCESS`, unchanged residual offer placed |
+| 20,499,545 | `035CEE565F07B9160E12B39306559727C724EE7F37DE9B417D91F3C1E0E38E58` | Retry after the IOU crossing strands failed validation | `tesSUCCESS`, unchanged residual offer placed |
+| 20,500,630 | `5E177243080CDE7E4636FB091A2537F87619265131868D1B4098B55B88018AE2` | `temBAD_PATH_LOOP` (`-290`) | `tesSUCCESS`, unchanged residual passive offer placed |
+| 20,500,732 | `171024C5CE9B97462FE834D25FFDD5A406786E7BE510AC3C76123CFBA55BB789` | `temBAD_PATH_LOOP` (`-290`) | `tesSUCCESS`, unchanged residual passive offer placed |
+
+The common root cause was above the individual strand validators. rippled's
+`OfferCreate::flowCross` propagates only the initial unfunded-account check.
+If `flow()` cannot construct or execute a crossing path, `flowCross` treats the
+cross as dry, preserves any stale-offer cleanup, and returns `tesSUCCESS` with
+the original offer amounts. Quaxar instead returned the internal Flow TER from
+`do_offer_create`, causing consensus application to retry and ultimately omit
+the otherwise valid offer.
+
+The correction implements that complete control-flow contract rather than
+special-casing either transaction shape. It also constructs rippled's explicit
+XRP bridge path as `TypeCurrency` instead of `TypeNone`, and validates serialized
+path elements before normalization as `PaySteps.cpp::toStrand` does. Regression
+fixtures cover both low/high NoRipple trust-line orientations and the passive
+same-currency, self-issued destination shape from the four live incidents.
+
 ## Exact transaction divergences
 
 Canonical binary metadata was compared byte-for-byte with serialized local

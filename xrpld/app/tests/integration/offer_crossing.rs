@@ -1195,7 +1195,9 @@ fn offer_globally_frozen_issuer() {
     // OfferCreate.cpp:190-212 rejects GlobalFreeze before accountFunds;
     // Freeze_test.cpp:480-489 expects tecFROZEN in both offer directions.
     let tx = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
-    let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
+    // GlobalFreeze is an OfferCreate preclaim decision in rippled, so this
+    // fixture must use the complete shell rather than the doApply-only helper.
+    let result = full_apply(&mut view, &tx, TxType::OFFER_CREATE);
     assert_eq!(result, Ter::TEC_FROZEN);
 }
 
