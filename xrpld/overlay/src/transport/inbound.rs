@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use prost::Message as ProstMessage;
+
 use crate::{HEADER_BYTES, MAXIMUM_MESSAGE_SIZE};
 
 use basics::base_uint::Uint256;
@@ -22,6 +24,13 @@ use crate::peer_imp::PeerImp;
 /// unbounded memory growth if a router is never installed or is cleared.
 const FALLBACK_QUEUE_CAP: usize = 10_000;
 
+/// All fallback families share one retained-payload budget. A per-family entry
+/// cap alone admits one large wire payload in every family, so it is not a
+/// memory bound. Keep this at the existing protocol-frame maximum: a normal
+/// largest legal frame still has room during startup, while mixed-family
+/// traffic cannot retain an unbounded multiple of that frame.
+pub const FALLBACK_QUEUE_BYTE_CAPACITY: usize = MAXIMUM_MESSAGE_SIZE;
+
 /// One paused session simultaneously retains decoded protobuf containers and
 /// the raw/decompression envelope from which they were accepted. Both maxima
 /// are existing decoder bounds; this is a finite Rust representation bound,
@@ -31,17 +40,131 @@ const DEFERRED_LEDGER_DATA_FRAME_CAPACITY: usize = MAXIMUM_MESSAGE_SIZE
     .saturating_add(HEADER_BYTES)
     .saturating_add(std::mem::size_of::<TmLedgerData>());
 
-fn push_bounded<T>(queue: &mut Vec<T>, message: T, _family: &'static str) -> bool {
-    if queue.len() >= FALLBACK_QUEUE_CAP {
+fn protobuf_bytes<M: ProstMessage>(message: &M) -> usize {
+    std::mem::size_of_val(message).saturating_add(message.encoded_len())
+}
+
+fn peer_message_bytes<M: ProstMessage>(message: &PeerMessage<M>) -> usize {
+    std::mem::size_of::<PeerId>().saturating_add(protobuf_bytes(&message.message))
+}
+
+fn queued_endpoints_bytes(message: &QueuedEndpoints) -> usize {
+    std::mem::size_of::<PeerId>()
+        .saturating_add(protobuf_bytes(&message.message))
+        .saturating_add(
+            message
+                .endpoints
+                .len()
+                .saturating_mul(std::mem::size_of::<QueuedEndpoint>()),
+        )
+}
+
+fn queued_transaction_bytes(message: &QueuedTransaction) -> usize {
+    std::mem::size_of::<PeerId>()
+        .saturating_add(std::mem::size_of::<Uint256>())
+        .saturating_add(protobuf_bytes(&message.message))
+}
+
+fn queued_proposal_bytes(message: &QueuedProposal) -> usize {
+    std::mem::size_of::<PeerId>()
+        .saturating_add(message.public_key.as_bytes().len())
+        .saturating_add(3 * std::mem::size_of::<Uint256>())
+        .saturating_add(protobuf_bytes(&message.message))
+}
+
+fn queued_validation_bytes(message: &QueuedValidation) -> usize {
+    std::mem::size_of::<PeerId>()
+        .saturating_add(std::mem::size_of::<Uint256>())
+        .saturating_add(protobuf_bytes(&message.message))
+        .saturating_add(message.validation.as_ref().map_or(0, std::mem::size_of_val))
+}
+
+fn queued_have_transactions_bytes(message: &QueuedHaveTransactions) -> usize {
+    std::mem::size_of::<PeerId>()
+        .saturating_add(protobuf_bytes(&message.message))
+        .saturating_add(
+            message
+                .hashes
+                .len()
+                .saturating_mul(std::mem::size_of::<Uint256>()),
+        )
+}
+
+fn fallback_snapshot_bytes(snapshot: &OverlayInboundSnapshot) -> usize {
+    snapshot
+        .manifests
+        .iter()
+        .map(peer_message_bytes)
+        .chain(snapshot.endpoints.iter().map(queued_endpoints_bytes))
+        .chain(snapshot.transactions.iter().map(queued_transaction_bytes))
+        .chain(snapshot.get_ledgers.iter().map(peer_message_bytes))
+        .chain(snapshot.ledger_data.iter().map(peer_message_bytes))
+        .chain(snapshot.proposals.iter().map(queued_proposal_bytes))
+        .chain(snapshot.validations.iter().map(queued_validation_bytes))
+        .chain(snapshot.validator_lists.iter().map(peer_message_bytes))
+        .chain(
+            snapshot
+                .validator_list_collections
+                .iter()
+                .map(peer_message_bytes),
+        )
+        .chain(snapshot.get_objects.iter().map(peer_message_bytes))
+        .chain(
+            snapshot
+                .have_transactions
+                .iter()
+                .map(queued_have_transactions_bytes),
+        )
+        .chain(snapshot.proof_path_requests.iter().map(peer_message_bytes))
+        .chain(snapshot.proof_path_responses.iter().map(peer_message_bytes))
+        .chain(
+            snapshot
+                .replay_delta_requests
+                .iter()
+                .map(peer_message_bytes),
+        )
+        .chain(
+            snapshot
+                .replay_delta_responses
+                .iter()
+                .map(peer_message_bytes),
+        )
+        .fold(0usize, usize::saturating_add)
+}
+
+fn push_bounded<T>(
+    queue: &mut Vec<T>,
+    message: T,
+    retained_bytes: usize,
+    message_bytes: usize,
+    _family: &'static str,
+) -> bool {
+    if queue.len() >= FALLBACK_QUEUE_CAP
+        || message_bytes > FALLBACK_QUEUE_BYTE_CAPACITY.saturating_sub(retained_bytes)
+    {
         return false;
     }
     queue.push(message);
     true
 }
 
-fn extend_bounded<T>(queue: &mut Vec<T>, messages: Vec<T>, _family: &'static str) {
-    let remaining = FALLBACK_QUEUE_CAP.saturating_sub(queue.len());
-    queue.extend(messages.into_iter().take(remaining));
+fn extend_bounded<T>(
+    queue: &mut Vec<T>,
+    messages: Vec<T>,
+    mut retained_bytes: usize,
+    item_bytes: impl Fn(&T) -> usize,
+    _family: &'static str,
+) {
+    for message in messages {
+        let message_bytes = item_bytes(&message);
+        if queue.len() >= FALLBACK_QUEUE_CAP
+            || message_bytes > FALLBACK_QUEUE_BYTE_CAPACITY.saturating_sub(retained_bytes)
+        {
+            break;
+        }
+        retained_bytes = retained_bytes.saturating_add(message_bytes);
+        queue.push(message);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -786,10 +909,14 @@ impl QueuedOverlayInboundHandler {
             return;
         }
         let mut inner = self.inner.lock().expect("overlay inbound lock");
-        // Validation fallback is used only before runtime routing is installed.
-        // Preserve every message in that handoff window; the active runtime
-        // uses the direct, lossless router below.
-        inner.validations.extend(validations);
+        let retained_bytes = fallback_snapshot_bytes(&inner);
+        extend_bounded(
+            &mut inner.validations,
+            validations,
+            retained_bytes,
+            queued_validation_bytes,
+            "validations",
+        );
     }
 
     pub fn requeue_proposals(&self, proposals: Vec<QueuedProposal>) {
@@ -797,7 +924,14 @@ impl QueuedOverlayInboundHandler {
             return;
         }
         let mut inner = self.inner.lock().expect("overlay inbound lock");
-        extend_bounded(&mut inner.proposals, proposals, "proposals");
+        let retained_bytes = fallback_snapshot_bytes(&inner);
+        extend_bounded(
+            &mut inner.proposals,
+            proposals,
+            retained_bytes,
+            queued_proposal_bytes,
+            "proposals",
+        );
     }
 
     /// Re-queue transactions taken from a snapshot that the caller isn't
@@ -810,7 +944,14 @@ impl QueuedOverlayInboundHandler {
             return;
         }
         let mut inner = self.inner.lock().expect("overlay inbound lock");
-        extend_bounded(&mut inner.transactions, transactions, "transactions");
+        let retained_bytes = fallback_snapshot_bytes(&inner);
+        extend_bounded(
+            &mut inner.transactions,
+            transactions,
+            retained_bytes,
+            queued_transaction_bytes,
+            "transactions",
+        );
     }
 
     /// Drain only validations from the queue, leaving all other messages.
@@ -933,20 +1074,30 @@ impl QueuedOverlayInboundHandler {
 impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     fn on_manifests(&self, peer: &Arc<PeerImp>, message: TmManifests) {
         let mut inner = self.inner.lock().expect("overlay inbound lock");
+        let queued = PeerMessage {
+            peer_id: peer.id(),
+            message,
+        };
+        let retained_bytes = fallback_snapshot_bytes(&inner);
+        let queued_bytes = peer_message_bytes(&queued);
         push_bounded(
             &mut inner.manifests,
-            PeerMessage {
-                peer_id: peer.id(),
-                message,
-            },
+            queued,
+            retained_bytes,
+            queued_bytes,
             "manifests",
         );
     }
 
     fn on_endpoints(&self, _peer: &Arc<PeerImp>, message: QueuedEndpoints) {
+        let mut inner = self.inner.lock().expect("overlay inbound lock");
+        let retained_bytes = fallback_snapshot_bytes(&inner);
+        let message_bytes = queued_endpoints_bytes(&message);
         push_bounded(
-            &mut self.inner.lock().expect("overlay inbound lock").endpoints,
+            &mut inner.endpoints,
             message,
+            retained_bytes,
+            message_bytes,
             "endpoints",
         );
     }
@@ -962,9 +1113,14 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
                 Some(router)
             } else {
                 let mut inbound = self.inner.lock().expect("overlay inbound lock");
+                let queued = message.take().expect("transaction present");
+                let retained_bytes = fallback_snapshot_bytes(&inbound);
+                let queued_bytes = queued_transaction_bytes(&queued);
                 push_bounded(
                     &mut inbound.transactions,
-                    message.take().expect("transaction present"),
+                    queued,
+                    retained_bytes,
+                    queued_bytes,
                     "transactions",
                 );
                 None
@@ -997,12 +1153,17 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
                 Some(router)
             } else {
                 let mut inner = self.inner.lock().expect("overlay inbound lock");
+                let queued = PeerMessage {
+                    peer_id: peer.id(),
+                    message: message.take().expect("message present"),
+                };
+                let retained_bytes = fallback_snapshot_bytes(&inner);
+                let queued_bytes = peer_message_bytes(&queued);
                 push_bounded(
                     &mut inner.get_ledgers,
-                    PeerMessage {
-                        peer_id: peer.id(),
-                        message: message.take().expect("message present"),
-                    },
+                    queued,
+                    retained_bytes,
+                    queued_bytes,
                     "get_ledgers",
                 );
                 None
@@ -1075,7 +1236,15 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
                     .unwrap_or(false);
                 if !sent_direct {
                     let mut inbound = self.inner.lock().expect("overlay inbound lock");
-                    if !push_bounded(&mut inbound.ledger_data, pm, "ledger_data") {
+                    let retained_bytes = fallback_snapshot_bytes(&inbound);
+                    let queued_bytes = peer_message_bytes(&pm);
+                    if !push_bounded(
+                        &mut inbound.ledger_data,
+                        pm,
+                        retained_bytes,
+                        queued_bytes,
+                        "ledger_data",
+                    ) {
                         peer.request_disconnect();
                     }
                 }
@@ -1121,9 +1290,14 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
                     Some(router)
                 } else {
                     let mut inner = self.inner.lock().expect("overlay inbound lock");
+                    let queued = message.take().expect("message present");
+                    let retained_bytes = fallback_snapshot_bytes(&inner);
+                    let queued_bytes = queued_proposal_bytes(&queued);
                     push_bounded(
                         &mut inner.proposals,
-                        message.take().expect("message present"),
+                        queued,
+                        retained_bytes,
+                        queued_bytes,
                         "proposals",
                     );
                     None
@@ -1163,9 +1337,16 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
                 Some(router)
             } else {
                 let mut inner = self.inner.lock().expect("overlay inbound lock");
-                inner
-                    .validations
-                    .push(message.take().expect("message present"));
+                let queued = message.take().expect("message present");
+                let retained_bytes = fallback_snapshot_bytes(&inner);
+                let queued_bytes = queued_validation_bytes(&queued);
+                push_bounded(
+                    &mut inner.validations,
+                    queued,
+                    retained_bytes,
+                    queued_bytes,
+                    "validations",
+                );
                 None
             }
         };
@@ -1186,12 +1367,17 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
 
     fn on_validator_list(&self, peer: &Arc<PeerImp>, message: TmValidatorList) {
         let mut inner = self.inner.lock().expect("overlay inbound lock");
+        let queued = PeerMessage {
+            peer_id: peer.id(),
+            message,
+        };
+        let retained_bytes = fallback_snapshot_bytes(&inner);
+        let queued_bytes = peer_message_bytes(&queued);
         push_bounded(
             &mut inner.validator_lists,
-            PeerMessage {
-                peer_id: peer.id(),
-                message,
-            },
+            queued,
+            retained_bytes,
+            queued_bytes,
             "validator_lists",
         );
     }
@@ -1202,12 +1388,17 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
         message: TmValidatorListCollection,
     ) {
         let mut inner = self.inner.lock().expect("overlay inbound lock");
+        let queued = PeerMessage {
+            peer_id: peer.id(),
+            message,
+        };
+        let retained_bytes = fallback_snapshot_bytes(&inner);
+        let queued_bytes = peer_message_bytes(&queued);
         push_bounded(
             &mut inner.validator_list_collections,
-            PeerMessage {
-                peer_id: peer.id(),
-                message,
-            },
+            queued,
+            retained_bytes,
+            queued_bytes,
             "validator_list_collections",
         );
     }
@@ -1234,12 +1425,17 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
                 Some(router)
             } else {
                 let mut inner = self.inner.lock().expect("overlay inbound lock");
+                let queued = PeerMessage {
+                    peer_id: peer.id(),
+                    message: message.take().expect("message present"),
+                };
+                let retained_bytes = fallback_snapshot_bytes(&inner);
+                let queued_bytes = peer_message_bytes(&queued);
                 push_bounded(
                     &mut inner.get_objects,
-                    PeerMessage {
-                        peer_id: peer.id(),
-                        message: message.take().expect("message present"),
-                    },
+                    queued,
+                    retained_bytes,
+                    queued_bytes,
                     "get_objects",
                 );
                 None
@@ -1251,13 +1447,14 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_have_transactions(&self, _peer: &Arc<PeerImp>, message: QueuedHaveTransactions) {
+        let mut inner = self.inner.lock().expect("overlay inbound lock");
+        let retained_bytes = fallback_snapshot_bytes(&inner);
+        let message_bytes = queued_have_transactions_bytes(&message);
         push_bounded(
-            &mut self
-                .inner
-                .lock()
-                .expect("overlay inbound lock")
-                .have_transactions,
+            &mut inner.have_transactions,
             message,
+            retained_bytes,
+            message_bytes,
             "have_transactions",
         );
     }
@@ -1274,12 +1471,17 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
             return;
         }
         let mut inner = self.inner.lock().expect("overlay inbound lock");
+        let queued = PeerMessage {
+            peer_id: peer.id(),
+            message,
+        };
+        let retained_bytes = fallback_snapshot_bytes(&inner);
+        let queued_bytes = peer_message_bytes(&queued);
         push_bounded(
             &mut inner.proof_path_requests,
-            PeerMessage {
-                peer_id: peer.id(),
-                message,
-            },
+            queued,
+            retained_bytes,
+            queued_bytes,
             "proof_path_requests",
         );
     }
@@ -1296,12 +1498,17 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
             return;
         }
         let mut inner = self.inner.lock().expect("overlay inbound lock");
+        let queued = PeerMessage {
+            peer_id: peer.id(),
+            message,
+        };
+        let retained_bytes = fallback_snapshot_bytes(&inner);
+        let queued_bytes = peer_message_bytes(&queued);
         push_bounded(
             &mut inner.proof_path_responses,
-            PeerMessage {
-                peer_id: peer.id(),
-                message,
-            },
+            queued,
+            retained_bytes,
+            queued_bytes,
             "proof_path_responses",
         );
     }
@@ -1318,12 +1525,17 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
             return;
         }
         let mut inner = self.inner.lock().expect("overlay inbound lock");
+        let queued = PeerMessage {
+            peer_id: peer.id(),
+            message,
+        };
+        let retained_bytes = fallback_snapshot_bytes(&inner);
+        let queued_bytes = peer_message_bytes(&queued);
         push_bounded(
             &mut inner.replay_delta_requests,
-            PeerMessage {
-                peer_id: peer.id(),
-                message,
-            },
+            queued,
+            retained_bytes,
+            queued_bytes,
             "replay_delta_requests",
         );
     }
@@ -1339,12 +1551,17 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
                 Some(router)
             } else {
                 let mut inner = self.inner.lock().expect("overlay inbound lock");
+                let queued = PeerMessage {
+                    peer_id: peer.id(),
+                    message: message.take().expect("replay delta response present"),
+                };
+                let retained_bytes = fallback_snapshot_bytes(&inner);
+                let queued_bytes = peer_message_bytes(&queued);
                 push_bounded(
                     &mut inner.replay_delta_responses,
-                    PeerMessage {
-                        peer_id: peer.id(),
-                        message: message.take().expect("replay delta response present"),
-                    },
+                    queued,
+                    retained_bytes,
+                    queued_bytes,
                     "replay_delta_responses",
                 );
                 None
@@ -1372,11 +1589,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aggregate_fallback_queue_byte_budget_spans_message_families() {
+        let handler = QueuedOverlayInboundHandler::default();
+        let public_key = protocol::derive_public_key(
+            protocol::KeyType::Secp256k1,
+            &protocol::SecretKey::from_bytes([74; 32]),
+        )
+        .expect("test public key");
+        let peer = Arc::new(PeerImp::new(
+            74,
+            "127.0.0.1:5074".parse().expect("test socket address"),
+            public_key,
+            "peer-74".to_owned(),
+        ));
+        let payload = vec![7; 1024 * 1024];
+        for sequence in 0..(FALLBACK_QUEUE_BYTE_CAPACITY / payload.len() + 2) {
+            handler.on_transaction(
+                &peer,
+                QueuedTransaction {
+                    peer_id: peer.id(),
+                    id: Uint256::from_u64(sequence as u64),
+                    batch: false,
+                    message: TmTransaction {
+                        raw_transaction: payload.clone(),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+
+        let snapshot = handler.snapshot();
+        assert!(fallback_snapshot_bytes(&snapshot) <= FALLBACK_QUEUE_BYTE_CAPACITY);
+        assert!(
+            snapshot.transactions.len() < FALLBACK_QUEUE_BYTE_CAPACITY / payload.len() + 2,
+            "the shared retained-byte budget, not only the per-family entry cap, rejects excess"
+        );
+    }
+
+    #[test]
     fn fallback_inbound_family_requeue_preserves_messages() {
         let mut queue = Vec::new();
-        extend_bounded(&mut queue, (0..=1_024).collect(), "test");
+        extend_bounded(
+            &mut queue,
+            (0..=1_024).collect(),
+            0,
+            |_| std::mem::size_of::<usize>(),
+            "test",
+        );
         assert_eq!(queue.len(), 1_025);
-        extend_bounded(&mut queue, vec![1_025usize], "test");
+        let retained_bytes = queue.len().saturating_mul(std::mem::size_of::<usize>());
+        extend_bounded(
+            &mut queue,
+            vec![1_025usize],
+            retained_bytes,
+            |_| std::mem::size_of::<usize>(),
+            "test",
+        );
         assert_eq!(queue.len(), 1_026);
     }
 
