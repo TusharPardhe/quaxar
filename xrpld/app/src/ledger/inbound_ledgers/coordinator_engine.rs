@@ -449,7 +449,18 @@ impl TreeEngine for AppLedgerPlanEngine {
                 kind: self.active_kind.expect("active tree kind set"),
             };
             let mut first_child = || rand_int_to(255u8);
-            let mut yield_now = || false;
+            // Unlike rippled's independently locked InboundLedger jobs, the
+            // Rust coordinator serializes every session behind one owner.
+            // Bound each resident-tree scan so policy facts and other ledgers
+            // cannot wait behind a multi-second cache traversal. The retained
+            // TreePlan resumes from the exact continuation on the next owner
+            // turn; no tree or missing-node frontier is rebuilt.
+            let slice_started = std::time::Instant::now();
+            let mut yielded = false;
+            let mut yield_now = || {
+                yielded = slice_started.elapsed() >= std::time::Duration::from_millis(5);
+                yielded
+            };
             let advance = {
                 let plan = self.active_plan.as_mut().expect("active plan set");
                 plan.advance_with_yield(
@@ -461,6 +472,9 @@ impl TreeEngine for AppLedgerPlanEngine {
             };
             match advance {
                 TreeAdvance::Ready => {
+                    if yielded {
+                        return PlanStepOutcome::Yielded;
+                    }
                     if !self.has_runnable_frontier() {
                         self.trace_idle_ready();
                     }

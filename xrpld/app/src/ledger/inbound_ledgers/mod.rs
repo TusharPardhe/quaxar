@@ -8,8 +8,10 @@
 //! - Touch-on-access keeps entries alive
 //! - 60s sweep removes idle entries
 //! - 5-minute failure cooldown prevents retry storms
-//! - Three running ledger-data workers plus five outstanding reservations match rippled's two JtLedgerData bounds
-//! - Each acquisition wraps InboundLedgerLocal (the per-ledger state machine)
+//! - One typed coordinator owns every per-hash session and retained tree plan
+//! - A dedicated wake-driven owner executes bounded SHAMap CPU slices away
+//!   from NetworkOps, matching rippled's ledger-data job isolation
+//! - Three concurrent persistence jobs match rippled's JtLedgerData running bound
 
 mod acquisition;
 mod coordinator_adapter;

@@ -27,12 +27,14 @@
 //! delivered record exactly once per handoff.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, TrySendError};
 
 use acquisition::{
     AcquisitionEvent, DurableHandoffId, DurableLedger, HandoffPort, HandoffRejectReason, SessionRef,
 };
 
+use super::coordinator_adapter::CoordinatorOwnerWake;
 use super::registry::{AcquireReason, CompletedInboundLedger};
 
 /// Delivery statistics for tracing. Mirrors the required durable-handoff
@@ -83,6 +85,7 @@ const MAX_PENDING_SESSION_ORIGINS: usize = 4;
 pub struct CoordinatorHandoffPort {
     tx: SyncSender<CompletedInboundLedger>,
     events: SyncSender<AcquisitionEvent>,
+    wake: Arc<CoordinatorOwnerWake>,
     published: HashSet<DurableHandoffId>,
     /// Origin metadata is keyed by the complete session identity. A reused
     /// `SessionId` from another run, plan, target, or store generation must
@@ -105,9 +108,18 @@ impl CoordinatorHandoffPort {
         tx: SyncSender<CompletedInboundLedger>,
         events: SyncSender<AcquisitionEvent>,
     ) -> Self {
+        Self::new_with_wake(tx, events, Arc::new(CoordinatorOwnerWake::default()))
+    }
+
+    pub(crate) fn new_with_wake(
+        tx: SyncSender<CompletedInboundLedger>,
+        events: SyncSender<AcquisitionEvent>,
+        wake: Arc<CoordinatorOwnerWake>,
+    ) -> Self {
         Self {
             tx,
             events,
+            wake,
             published: HashSet::new(),
             sessions: HashMap::new(),
             pending_session_origins: HashMap::new(),
@@ -356,7 +368,9 @@ impl CoordinatorHandoffPort {
             session: ledger.session(),
             reason,
         };
-        let _ = self.events.send(rejected);
+        if self.events.send(rejected).is_ok() {
+            self.wake.notify();
+        }
     }
 }
 

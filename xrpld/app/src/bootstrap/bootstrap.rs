@@ -1688,23 +1688,29 @@ fn run_start_mode_consensus_loop(
         shared_inbound.set_overlay_rt(overlay_rt);
     }
 
-    // Keep acquisition CPU off the NetworkOps/consensus owner.  Production
-    // uses the per-ledger AcquisitionState actor and its JtLedgerData-equivalent
-    // ready scheduler: overlay ingress only fills a bounded mailbox, while a
-    // three-worker pool performs SHAMap traversal, reads, packet application
-    // and persistence.  This is the same execution boundary as rippled's
-    // InboundLedgers::gotLedgerData -> JtLedgerData("ProcessLData") path.
-    //
-    // The coordinator remains available to deterministic unit/parity tests,
-    // but must not be installed here: its SessionPlan currently advances while
-    // its owner is drained, and installing that owner on NetworkOps allowed one
-    // resident-tree scan to delay consensus heartbeats for multiple seconds.
-    tracing::info!(
-        target: "inbound_ledger",
-        worker_limit = 3,
-        outstanding_limit = 5,
-        "worker-owned inbound ledger acquisition enabled"
-    );
+    // Install one typed lifecycle owner, then run its SHAMap plan turns on a
+    // dedicated execution lane. This preserves Quaxar's Rust state-machine
+    // ownership while matching rippled's essential boundary:
+    // gotLedgerData/TimeoutCounter only enqueue work and jtLEDGER_DATA performs
+    // reconstruction away from NetworkOPs and consensus.
+    shared_inbound.set_phase_mode_owner(runtime.root().network_ops_mode_owner());
+    if shared_inbound.install_coordinator() {
+        shared_inbound.coordinator_startup(startup_coordinator_phase(runtime.root()));
+        if let Some(owner) = shared_inbound.spawn_coordinator_owner(Arc::clone(&stop)) {
+            worker_handles.push(owner);
+        }
+        tracing::info!(
+            target: "inbound_ledger",
+            persistence_limit = 3,
+            "dedicated serialized inbound-ledger coordinator enabled"
+        );
+    } else {
+        tracing::error!(
+            target: "inbound_ledger",
+            "could not install production inbound-ledger coordinator"
+        );
+        return;
+    }
 
     // Spawn consensus event loop (validation/ledger promotion)
     let event_loop_app = runtime.root().clone();
@@ -2165,6 +2171,24 @@ fn run_start_mode_consensus_loop(
             .set_proposal_notify(Box::new(move || {
                 notify_root.notify_consensus_event();
             }));
+    }
+
+    fn startup_coordinator_phase(root: &ApplicationRoot) -> acquisition::SyncPhase {
+        if root.config().start_valid {
+            if let (Some(lcl), Some(published)) = (root.closed_ledger(), root.published_ledger()) {
+                return acquisition::SyncPhase::Full {
+                    lcl: acquisition::LedgerIdentity::new(
+                        *lcl.header().hash.as_uint256(),
+                        lcl.header().seq,
+                    ),
+                    published: acquisition::LedgerIdentity::new(
+                        *published.header().hash.as_uint256(),
+                        published.header().seq,
+                    ),
+                };
+            }
+        }
+        acquisition::SyncPhase::Connected
     }
 
     fn recover_deferred_replay_parent(

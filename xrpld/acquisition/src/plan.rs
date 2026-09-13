@@ -163,6 +163,9 @@ impl PlanNetworkNeed {
 pub enum PlanStepOutcome {
     /// No work command in this turn; the engine may still be runnable.
     Ready,
+    /// The engine retained an immediately runnable continuation but yielded
+    /// its CPU slice so the serialized owner can serve other sessions/facts.
+    Yielded,
     /// Unique missing nodes to submit to the NodeStore broker.
     NeedsReads(Vec<PlanReadNeed>),
     /// Unique network candidates to request from a peer.
@@ -595,6 +598,8 @@ pub struct TurnContext<'a> {
 pub enum PlanTurn {
     /// No work; wait for another event.
     Continue,
+    /// Resume this retained traversal in a later owner slice.
+    Yielded,
     /// Submit these brokered reads.
     Reads(Vec<ReadRequest>),
     /// Request these hashes from a peer.
@@ -1348,6 +1353,7 @@ impl SessionPlan {
                     }
                     return PlanTurn::Continue;
                 }
+                PlanStepOutcome::Yielded => return PlanTurn::Yielded,
                 PlanStepOutcome::NeedsReads(needs) => {
                     let requests = self.admit_reads(needs, ctx);
                     if requests.is_empty() {
@@ -1820,6 +1826,8 @@ impl SessionPlan {
 /// behavior).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptedStep {
+    /// Retain a runnable continuation for a later owner CPU slice.
+    Yielded,
     /// Announce these reads on the next advance.
     NeedsReads(Vec<PlanReadNeed>),
     /// Announce legacy network candidates as State nodes on the next advance.
@@ -1916,6 +1924,10 @@ impl TreeEngine for ScriptedEngine {
     fn advance(&mut self, _max_new_reads: usize) -> PlanStepOutcome {
         self.runnable_frontier = false;
         match self.steps.pop_front() {
+            Some(ScriptedStep::Yielded) => {
+                self.runnable_frontier = true;
+                PlanStepOutcome::Yielded
+            }
             Some(ScriptedStep::NeedsReads(needs)) => PlanStepOutcome::NeedsReads(needs),
             Some(ScriptedStep::NeedsNetwork(nodes)) => PlanStepOutcome::NeedsNetwork(
                 nodes

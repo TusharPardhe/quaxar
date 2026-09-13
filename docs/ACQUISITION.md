@@ -1,8 +1,8 @@
 # Acquisition architecture
 
 This document describes how Quaxar acquires a complete XRP Ledger from peers,
-how its hash-keyed acquisition actors are scheduled, and how the pure
-`xrpld/acquisition` coordinator is used as a parity model. Production execution
+how its hash-keyed sessions are scheduled, and how the pure
+`xrpld/acquisition` coordinator owns their lifecycle. Production execution
 lives in `xrpld/app/src/ledger/inbound_ledgers/` and follows rippled's
 `InboundLedger`/`JtLedgerData` isolation boundary.
 
@@ -28,16 +28,17 @@ that must coordinate:
 
 If each callback owned part of that lifecycle, a late read, timer, peer packet,
 or write could revive a cancelled session or install a ledger selected by stale
-policy. Production therefore gives each ledger hash one `AcquisitionState`
-actor. The registry coalesces demand by hash, and that actor alone mutates its
-mailbox, tree plan, retry, storage, and terminal state. A global ready scheduler
-admits five outstanding actor turns while three ledger-data workers may run,
-matching rippled's separate timeout-admission and JobQueue limits.
+policy. Production therefore installs one `CoordinatorRunner`; it owns every
+per-hash `SessionPlan`, retry, storage generation and terminal transition.
+Overlay and NodeStore callbacks publish typed events through bounded lanes.
 
-`xrpld/acquisition::CoordinatorRunner` remains the deterministic typed
-event/effect model and parity harness. It is not installed into the production
-NetworkOps strand. Advancing a coordinator `SessionPlan` there would make
-resident-tree scan time part of consensus latency.
+The coordinator is not drained by NetworkOps. A wake-driven `acquisition-owner`
+thread advances bounded five-millisecond resident-tree slices and retains the
+exact continuation between slices. This is Quaxar's Rust-native equivalent of
+rippled's `gotLedgerData -> jtLEDGER_DATA` boundary: consensus remains
+responsive, while moving preferred hashes cannot discard the stable recovery
+session. Physical persistence remains globally limited to three concurrent
+jobs, matching rippled's ledger-data running limit.
 
 The crate is intentionally below `xrpld/app`: it depends on ledger-domain
 types, but not on overlay, NetworkOps, LedgerMaster, JobQueue, or concrete
@@ -53,10 +54,10 @@ flowchart TB
     end
 
     subgraph Runtime[Production inbound-ledger runtime]
-        RG[Hash-keyed registry<br/>one actor per ledger]
-        RS[Ready scheduler<br/>five outstanding reservations]
-        A[AcquisitionState actors<br/>bounded mailboxes and plans]
-        RG --> RS --> A
+        RG[Hash-keyed registry<br/>demand and cooldown]
+        CO[CoordinatorRunner<br/>sole lifecycle owner]
+        EX[acquisition-owner<br/>bounded CPU slices]
+        RG --> CO --> EX
     end
 
     subgraph Resources[Resource owners]
@@ -71,26 +72,26 @@ flowchart TB
     LM -->|history demand| RG
     VA -->|validated target demand| RG
     OV -->|bounded packet lease| RG
-    A --> OV
-    A --> NS
-    A --> NF
-    A --> FP
-    A -->|exact completion| LM
-    WK --- RS
+    EX --> OV
+    EX --> NS
+    EX --> NF
+    EX --> FP
+    EX -->|exact completion| LM
+    WK --- EX
 ```
 
 ## Ownership model
 
 | State or resource | Sole mutable owner | Other components may do |
 | --- | --- | --- |
-| Acquisition service phase | NetworkOps strand | Registry reports results; it does not own public mode |
-| Per-hash session lifecycle | One `AcquisitionState` actor | Registry coalesces demand and routes bounded packets |
+| Acquisition service phase | Coordinator phase state machine | NetworkOps supplies preferred-LCL and publication facts |
+| Per-hash session lifecycle | One `CoordinatorRunner` | Registry coalesces demand; immutable ingress routes packets |
 | Preferred-LCL policy and LCL switch | NetworkOps strand | Acquisition never installs an arbitrary ledger |
 | Validated and published heads | LedgerMaster | Actors deliver a complete ledger by exact hash |
-| SHAMap traversal plan | Worker-owned actor plan | Shared stores provide verified nodes |
-| Peer connections and sends | Overlay | Actor selects bounded requests through its peer set |
-| Physical NodeStore reads and writes | Actor worker and NodeStore | Scheduler wakes exact actors for subsequent turns |
-| Admission accounting | Per-actor packet and byte leases | Overlay reserves and settles exact leases |
+| SHAMap traversal plan | Coordinator-owned `SessionPlan` | Dedicated owner advances retained five-millisecond slices |
+| Peer connections and sends | Overlay | Coordinator selects bounded requests through its peer snapshot |
+| Physical NodeStore reads and writes | Read broker and NodeStore | Typed completions wake the coordinator owner |
+| Admission accounting | Per-session packet and byte leases | Overlay reserves and settles exact leases |
 | Shared immutable nodes | NodeFamily caches, fetch pack, and NodeStore | Any later session may reuse verified nodes |
 
 NetworkOps is neither an acquisition orchestrator nor an I/O executor. It may
@@ -101,18 +102,18 @@ sequenceDiagram
     autonumber
     participant Producer as Overlay / NetworkOps / worker
     participant Registry as Hash registry
-    participant Mailbox as Per-ledger mailbox
-    participant Scheduler as Ready scheduler
-    participant Worker as Ledger-data worker
+    participant Queue as Typed bounded lanes
+    participant Owner as acquisition-owner
+    participant Plan as Per-ledger SessionPlan
     participant Resource as Cache / NodeStore / peer
 
     Producer->>Registry: target demand or peer packet
-    Registry->>Mailbox: coalesce by hash / reserve lease
-    Registry->>Scheduler: wake exact actor
-    Scheduler->>Worker: reserve one of five outstanding slots
-    Worker->>Mailbox: claim sole actor turn
-    Worker->>Resource: bounded traversal, reads, requests, writes
-    Worker->>Scheduler: terminal or reschedule decision
+    Registry->>Queue: coalesce by hash / reserve lease
+    Queue->>Owner: generation wake
+    Owner->>Plan: consume exact typed fact
+    Plan->>Resource: bounded traversal, reads, requests, writes
+    Resource->>Queue: exact typed completion
+    Plan-->>Owner: retain continuation and yield
     Note over Producer,Resource: NetworkOps remains free for heartbeats,<br/>proposals and transaction sets
 ```
 
@@ -120,8 +121,8 @@ sequenceDiagram
 
 ### `xrpld/acquisition`
 
-The crate contains the pure coordinator model used by deterministic parity
-tests and future non-consensus-thread adapters:
+The crate contains the production coordinator model and deterministic parity
+surface:
 
 - `event.rs`: every fact the owner may consume;
 - `effect.rs`: the complete typed output surface;
@@ -141,14 +142,14 @@ tests and future non-consensus-thread adapters:
 
 The application side supplies the production runtime:
 
-- `registry.rs`: global hash-keyed service, demand coalescing, failure cooldown,
-  and completion delivery;
-- `acquisition.rs`: sole mutable per-hash actor, bounded mailbox, retained tree
-  plan, retry, storage, and terminal state;
-- `scheduler.rs`: unique per-hash ready admission and five-outstanding fairness;
+- `registry.rs`: global hash-keyed service, coordinator installation, dedicated
+  owner thread, demand coalescing, failure cooldown, and completion delivery;
+- `acquisition.rs` and `scheduler.rs`: retained compatibility implementation
+  and focused parity fixtures; they are not the production lifecycle owner;
 - `coordinator_adapter.rs`, `coordinator_engine.rs`,
   `coordinator_ports.rs`, and `coordinator_handoff.rs`: deterministic
-  coordinator parity harness, not a production NetworkOps executor;
+  production typed adapter, retained tree engine, resource ports, and durable
+  handoff;
 - `read_broker.rs`: bounded, coalesced and priority-aware NodeStore reads;
 - `worker_pool.rs`: bounded ledger-data and timer work;
 - `wire_ledger_node.rs`: validated conversion of wire node identifiers and
@@ -198,36 +199,36 @@ generic session without discarding its plan.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Waiting: actor created and request queued
-    Waiting --> Dispatched: scheduler reserves one lane
-    Dispatched --> Running: worker claims exact actor
-    Running --> Waiting: bounded turn needs later work
-    Running --> Dispatched: immediate continuation is rescheduled
-    Running --> Complete: both maps verified and stored
-    Waiting --> Failed: timeout or invalid data
-    Running --> Failed: invalid node or storage failure
-    Waiting --> Cancelled: replaced, stopped, or swept
-    Running --> Cancelled: cancellation observed at turn boundary
+    [*] --> Active: coordinator creates exact SessionRef
+    Active --> Reading: brokered local reads
+    Reading --> Active: typed read batch completes
+    Active --> WaitingPeer: bounded network frontier
+    WaitingPeer --> Active: admitted packet arrives
+    Active --> Active: CPU slice yields exact continuation
+    Active --> Complete: both maps verified and stored
+    Active --> Failed: timeout, invalid node, or storage failure
+    Reading --> Cancelled: replaced, stopped, or swept
+    WaitingPeer --> Cancelled: replaced, stopped, or swept
     Complete --> [*]
     Failed --> [*]
     Cancelled --> [*]
 ```
 
-Only one scheduler entry for an `(ledger hash, acquisition id)` can be running.
-Wakes arriving during a turn are coalesced and cause one later turn rather than
-concurrent mutation.
+Only the coordinator owner mutates a session. Wakes arriving during a turn are
+coalesced by typed queues and generation wakeups; CPU-slice continuation retains
+the existing tree and frontier rather than rebuilding either.
 
 ## Exact identity and stale completion rejection
 
-A hash alone is not sufficient callback identity. Production actor work uses:
+A hash alone is not sufficient callback identity. Production work uses:
 
 ```text
-AcquisitionKey = target hash + acquisition id
-ReadTicket = AcquisitionKey + read generation + requested node identity
-PacketLease = AcquisitionKey + reserved packet and byte charge
+SessionRef = run epoch + session id + target hash + plan epoch + store generation
+OperationRef = SessionRef + operation kind + id + generation
+PacketLease = SessionRef + routing generation + packet and byte charge
 ```
 
-The actor accepts work only when the complete identity still names the live
+The coordinator accepts work only when the complete identity still names the live
 acquisition. Replacement, cancellation, NodeStore rotation, or restart makes
 old packet, timer, read, and worker callbacks stale by construction.
 
@@ -235,11 +236,11 @@ old packet, timer, read, and worker callbacks stale by construction.
 flowchart TD
     C[Work or completion arrives] --> S{Hash and acquisition id match?}
     S -- no --> STALE[Settle lease and ignore as stale]
-    S -- yes --> G{Read, timer, or store generation current?}
+    S -- yes --> G{Run, plan, timer, or store generation current?}
     G -- no --> STALE
-    G -- yes --> O{Actor is active and expected this work?}
+    G -- yes --> O{Session is active and expected this work?}
     O -- no --> STALE
-    O -- yes --> APPLY[Wake or apply on actor worker]
+    O -- yes --> APPLY[Apply on serialized coordinator owner]
 ```
 
 ## End-to-end current-ledger acquisition
@@ -250,19 +251,16 @@ sequenceDiagram
     participant V as Validations / NetworkOps
     participant R as Hash registry
     participant O as Overlay peers
-    participant S as Ready scheduler
-    participant W as Ledger-data worker
+    participant Q as Typed event lanes
+    participant W as acquisition-owner
     participant N as NodeFamily / FetchPack / NodeStore
     participant L as LedgerMaster / NetworkOps handoff
 
     V->>R: acquire preferred hash
-    R->>R: coalesce or create actor
-    R->>S: wake actor
-    S->>W: reserve one of five outstanding slots
+    R->>W: coalesce or create exact session
     W->>O: bounded base-ledger request
-    O-->>R: reserve lease and append packet
-    R->>S: wake exact actor
-    S->>W: run bounded turn
+    O-->>Q: reserve lease and append packet
+    Q->>W: generation wake
     loop State SHAMap, then transaction SHAMap
         W->>N: check tree cache, FullBelow, fetch pack, NodeStore
         alt object requires disk lookup
@@ -271,7 +269,7 @@ sequenceDiagram
             W->>O: bounded node-id/hash request
             O-->>R: admitted validated packet
         end
-        W->>S: yield or reschedule exact actor
+        W->>Q: retain exact continuation after CPU slice
     end
     W->>N: store verified nodes and ledger
     W->>L: exact completed-ledger message
@@ -321,27 +319,27 @@ flowchart TB
     LOOKUP --> GATE[Per-actor packet and byte lease]
     GATE --> MAILBOX[Bounded actor mailbox]
     MAILBOX --> READY[Unique ready entry per actor]
-    TIMEOUT[Timer wake] --> READY
-    READ[Read or fetch-pack wake] --> READY
-    READY --> LIMIT{Fewer than five outstanding?}
-    LIMIT -- no --> WAIT[Fair recovery and normal queues]
-    LIMIT -- yes --> WORKER[One of three ledger-data workers]
-    WORKER --> BUDGET[Bounded TurnBudget]
-    BUDGET --> READY
+    TIMEOUT[Timer completion] --> QUEUE[Reserved control lane]
+    READ[Read or fetch-pack completion] --> QUEUE
+    PACKET[Overlay packet] --> PACKETS[Bounded packet lane]
+    QUEUE --> OWNER[Serialized acquisition owner]
+    PACKETS --> OWNER
+    OWNER --> SLICE[Retained five-millisecond SHAMap slice]
+    SLICE --> OWNER
 ```
 
 Important bounds include:
 
-- per-actor packet and byte leases that remain charged until settlement;
-- exactly one running turn for each acquisition identity;
-- five global outstanding reservations and three running workers, with
-  recovery/normal fairness;
-- a wall-clock `TurnBudget` consulted during SHAMap traversal;
+- per-session packet and byte leases that remain charged until settlement;
+- exactly one mutable coordinator owner across all session identities;
+- three globally concurrent persistence jobs, matching rippled's
+  `jtLEDGER_DATA` running limit;
+- a five-millisecond CPU slice consulted during resident SHAMap traversal;
 - bounded reads, mailbox packets/bytes, and network request batches;
 - request batch sizes matching the relevant `rippled` paths.
 
-NetworkOps owns preferred-ledger and public-mode policy. The registry and actors
-own acquisition lifecycle, while the worker pool owns physical concurrency.
+NetworkOps owns preferred-ledger policy. The coordinator owns acquisition and
+service-phase transitions, while brokers and NodeStore own physical I/O.
 No per-session thread is created.
 
 ## Service phase versus session phase

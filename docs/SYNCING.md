@@ -167,8 +167,9 @@ journalctl -u quaxar.service -f
 quaxar log-level info
 ```
 
-The typed coordinator shadow is a parity-harness facility and is not installed
-in the production NetworkOps path.
+The typed coordinator is the production acquisition lifecycle owner. Its
+optional shadow is read-only, and its wake-driven executor is separate from
+NetworkOps so SHAMap reconstruction cannot delay consensus.
 
 ## Diagnosing a stuck node
 

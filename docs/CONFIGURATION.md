@@ -27,9 +27,10 @@ starting the service.
 
 ### Diagnostic environment
 
-`QUAXAR_ACQUISITION_SHADOW` belongs to the coordinator parity harness. The
-production runtime uses worker-owned per-ledger actors and does not install the
-coordinator on NetworkOps, so this variable has no production effect.
+`QUAXAR_ACQUISITION_SHADOW` enables the coordinator's bounded read-only parity
+mirror. Production always installs the coordinator on its dedicated acquisition
+owner thread; enabling the shadow adds comparison observations but no second
+lifecycle writer.
 
 ## Core Sections
 

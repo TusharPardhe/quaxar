@@ -694,6 +694,9 @@ pub struct CoordinatorRunner {
     /// One-shot engine construction port. It runs outside coordinator state
     /// mutation and returns a uniquely owned engine or nothing.
     plan_seed: Box<dyn PlanSeed + Send + Sync>,
+    /// Runnable CPU-sliced traversals awaiting a later adapter owner turn.
+    /// This is scheduling state only; session lifecycle remains in `state`.
+    plan_resumes: VecDeque<SessionRef>,
 }
 
 impl CoordinatorRunner {
@@ -756,6 +759,7 @@ impl CoordinatorRunner {
             stats: RunnerStats::default(),
             shutdown: false,
             plan_seed,
+            plan_resumes: VecDeque::new(),
         }
     }
 
@@ -795,6 +799,11 @@ impl CoordinatorRunner {
             AcquisitionEvent::BlockedWithNoTarget => self.on_blocked_with_no_target(),
             AcquisitionEvent::PacketAdmitted(packet) => self.on_packet(packet),
             AcquisitionEvent::ReadCompleted(completion) => self.on_read(completion),
+            AcquisitionEvent::PlanSliceReady(session) => {
+                let mut effects = Vec::new();
+                self.run_plan_turn(session, None, &mut effects);
+                effects
+            }
             AcquisitionEvent::WriteCompleted(completion) => self.on_write(completion),
             AcquisitionEvent::DurabilityFenced(completion) => self.on_durability(completion),
             AcquisitionEvent::DurableHandoffAcknowledged(ack) => self.on_handoff_ack(ack),
@@ -829,6 +838,11 @@ impl CoordinatorRunner {
         }
         self.stats.events_handled += 1;
         effects
+    }
+
+    /// Drain internal CPU-slice resumptions for the adapter's next owner turn.
+    pub fn take_plan_resumes(&mut self) -> Vec<SessionRef> {
+        self.plan_resumes.drain(..).collect()
     }
 
     /// Applies one drained NodeStore completion wave behind the same barrier
@@ -3756,6 +3770,14 @@ impl CoordinatorRunner {
                 });
                 if !local_pending {
                     self.release_local_scan_at_network_boundary(session, effects);
+                }
+            }
+            PlanTurn::Yielded => {
+                self.release_local_scan_permit(session, effects);
+                if self.state.sessions.get(&session).is_some_and(|state| {
+                    state.phase == SessionPhase::Active && !self.plan_resumes.contains(&session)
+                }) {
+                    self.plan_resumes.push_back(session);
                 }
             }
             PlanTurn::Persist(batch) => {
@@ -8429,6 +8451,40 @@ mod tests {
                 )))
         );
         assert!(!runner.retains_session_origin_for_hash(target.hash()));
+    }
+
+    #[test]
+    fn yielded_tree_slice_resumes_exact_session_on_later_owner_event() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let started = acquire_with_effects(&mut runner, 221);
+        let session = peer_request_session(&started);
+        let need = PlanReadNeed::new(
+            SHAMapHash::new(Uint256::from(9_221_u64)),
+            221,
+            SHAMapNodeId::default(),
+            0,
+        );
+        let state = runner
+            .state
+            .sessions
+            .get_mut(&session)
+            .expect("live session");
+        state.pending_header_read = None;
+        assert!(state.plan.install_engine(Box::new(ScriptedEngine::new(
+            TreePlanId::new(221),
+            VecDeque::from([ScriptedStep::Yielded, ScriptedStep::NeedsReads(vec![need]),]),
+            Vec::new(),
+        ))));
+
+        let mut first = Vec::new();
+        runner.run_plan_turn(session, None, &mut first);
+        assert!(first.is_empty(), "a CPU yield emits no external I/O");
+        assert_eq!(runner.take_plan_resumes(), vec![session]);
+
+        let resumed = runner.handle_event(AcquisitionEvent::PlanSliceReady(session));
+        assert_eq!(read_effects(&resumed).len(), 1);
+        assert!(runner.take_plan_resumes().is_empty());
     }
 
     #[test]
