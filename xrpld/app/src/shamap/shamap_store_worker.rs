@@ -85,24 +85,20 @@ where
     }
 
     let (last_good, _) = store.online_delete_health_progress();
-    // Health progress is process-local, while `last_rotated` is durable. On
-    // restart seed the first complete-range check at the durable boundary so
-    // an old gap between that boundary and the validated tip cannot be
-    // skipped merely because no prior worker snapshot exists.
-    let last_good = if last_good == 0 {
-        previous_last_rotated
-    } else {
-        last_good
-    };
+    // Match rippled's SHAMapStoreImp exactly: lastGoodValidatedLedger_ is a
+    // process-local health anchor and therefore starts at zero after restart.
+    // The first healthWait() deliberately checks current mode/age without
+    // requiring the in-memory complete-ledger range to extend back to the
+    // durable rotation boundary. Once that check succeeds, the current
+    // validated sequence becomes the anchor for every destructive-stage
+    // checkpoint in this rotation.
     store.set_online_delete_health_progress(last_good, 0);
     match wait_for_health_or_stop(&health_policy, store, runtime, validated_seq, &should_stop) {
         SHAMapStoreHealthStatus::KeepGoing => {}
         SHAMapStoreHealthStatus::Stopping => {
             return Ok(Some(finish_step(store, runtime, step, false, true)));
         }
-        SHAMapStoreHealthStatus::Expired
-        | SHAMapStoreHealthStatus::Disconnected
-        | SHAMapStoreHealthStatus::Waiting(_) => {
+        SHAMapStoreHealthStatus::Expired | SHAMapStoreHealthStatus::Waiting(_) => {
             return Ok(Some(finish_step(store, runtime, step, false, false)));
         }
     }
@@ -283,9 +279,6 @@ where
                 runtime.sleep(duration);
             }
             SHAMapStoreHealthStatus::Expired => return SHAMapStoreHealthStatus::Expired,
-            SHAMapStoreHealthStatus::Disconnected => {
-                return SHAMapStoreHealthStatus::Disconnected;
-            }
         }
     }
 }

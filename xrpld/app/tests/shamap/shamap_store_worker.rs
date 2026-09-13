@@ -21,6 +21,7 @@ struct RecordingRuntime {
     copy_result: SHAMapStoreCopyDisposition,
     validated_seq: AtomicU32,
     missing_ledgers: AtomicUsize,
+    missing_before_seq: AtomicU32,
     complete_validated_tip: AtomicBool,
     advance_on_sleep: bool,
     introduce_gap_after_copy: bool,
@@ -41,6 +42,7 @@ impl Default for RecordingRuntime {
             copy_result: SHAMapStoreCopyDisposition::Completed { node_count: 0 },
             validated_seq: AtomicU32::new(0),
             missing_ledgers: AtomicUsize::new(0),
+            missing_before_seq: AtomicU32::new(0),
             complete_validated_tip: AtomicBool::new(true),
             advance_on_sleep: false,
             introduce_gap_after_copy: false,
@@ -85,7 +87,11 @@ impl SHAMapStoreHealthRuntime for RecordingRuntime {
         }
     }
 
-    fn missing_from_complete_ledger_range(&self, _first: u32, _last: u32) -> usize {
+    fn missing_from_complete_ledger_range(&self, first: u32, last: u32) -> usize {
+        let missing_before = self.missing_before_seq.load(Ordering::Relaxed);
+        if missing_before != 0 && first <= missing_before && missing_before <= last {
+            return 1;
+        }
         self.missing_ledgers.load(Ordering::Relaxed)
     }
 
@@ -399,7 +405,7 @@ fn shamap_store_worker_circuit_breaker_abandons_without_advancing_boundary() {
 }
 
 #[test]
-fn shamap_store_health_marks_disconnected_work_as_abandonment() {
+fn shamap_store_health_uses_rippled_disconnected_maintenance_window() {
     let mut runtime = healthy_runtime();
     runtime.mode = SHAMapStoreOperatingMode::Other;
     runtime.disconnected = true;
@@ -411,12 +417,12 @@ fn shamap_store_health_marks_disconnected_work_as_abandonment() {
 
     assert_eq!(
         policy.evaluate_with_progress(&runtime, 900, 1_156).status,
-        app::SHAMapStoreHealthStatus::Disconnected
+        app::SHAMapStoreHealthStatus::KeepGoing
     );
 }
 
 #[test]
-fn shamap_store_worker_restart_checks_gaps_since_the_persisted_rotation_boundary() {
+fn shamap_store_worker_restart_uses_rippled_process_local_health_anchor() {
     let mut store = SHAMapStore::new(256, true, 0);
     store.set_saved_state(SHAMapStoreSavedState {
         writable_db: "writable.current".to_owned(),
@@ -424,32 +430,33 @@ fn shamap_store_worker_restart_checks_gaps_since_the_persisted_rotation_boundary
         last_rotated: 900,
     });
     store.set_can_delete(900);
-    store.set_max_waiting_ledgers(2);
     store.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
         1_156, 0, false,
     )));
     let mut runtime = healthy_runtime();
     runtime.validated_seq.store(1_156, Ordering::Relaxed);
-    runtime.missing_ledgers.store(1, Ordering::Relaxed);
-    runtime.advance_on_sleep = true;
+    runtime.missing_before_seq.store(900, Ordering::Relaxed);
 
     let step = run_shamap_store_worker_step(&mut store, &mut runtime, None)
         .expect("worker step")
         .expect("queued ledger");
 
-    assert!(!step.rotated);
+    assert!(step.rotated);
     assert!(!step.stopped);
-    assert_eq!(store.get_last_rotated(), 900);
-    assert_eq!(store.saved_state().last_rotated, 900);
-    assert_eq!(
-        runtime.events,
-        vec!["sleep:2s".to_owned(), "sleep:2s".to_owned()],
-        "restart must wait for a gap since the durable boundary instead of clearing prior data"
+    assert_eq!(store.get_last_rotated(), 1_156);
+    assert_eq!(store.saved_state().last_rotated, 1_156);
+    assert!(runtime.events.iter().any(|event| event == "rotate"));
+    assert!(
+        !runtime
+            .events
+            .iter()
+            .any(|event| event.starts_with("sleep:")),
+        "rippled does not seed its process-local health range from the durable rotation boundary"
     );
 }
 
 #[test]
-fn shamap_store_worker_abandons_disconnected_before_destructive_work() {
+fn shamap_store_worker_rotates_while_disconnected_like_rippled() {
     let initial = SHAMapStoreSavedState {
         writable_db: "writable.current".to_owned(),
         archive_db: "archive.current".to_owned(),
@@ -469,16 +476,18 @@ fn shamap_store_worker_abandons_disconnected_before_destructive_work() {
         .expect("worker step")
         .expect("queued ledger");
 
-    assert!(!step.rotated);
+    assert!(step.rotated);
     assert!(!step.stopped);
-    assert_eq!(runtime.events, Vec::<String>::new());
-    assert_eq!(store.get_last_rotated(), 900);
-    assert_eq!(store.saved_state(), &initial);
-    assert_eq!(state_db.get_state().expect("durable state"), initial);
+    assert_eq!(store.get_last_rotated(), 1_156);
+    assert!(runtime.events.iter().any(|event| event == "rotate"));
+    assert_eq!(
+        state_db.get_state().expect("durable state").last_rotated,
+        1_156
+    );
 }
 
 #[test]
-fn shamap_store_worker_abandons_mid_rotation_disconnect_and_retries() {
+fn shamap_store_worker_continues_mid_rotation_disconnect_like_rippled() {
     let initial = SHAMapStoreSavedState {
         writable_db: "writable.current".to_owned(),
         archive_db: "archive.current".to_owned(),
@@ -494,36 +503,15 @@ fn shamap_store_worker_abandons_mid_rotation_disconnect_and_retries() {
     let mut runtime = healthy_runtime();
     runtime.disconnect_after_copy = true;
 
-    let abandoned = run_shamap_store_worker_step(&mut store, &mut runtime, Some(&state_db))
+    let completed = run_shamap_store_worker_step(&mut store, &mut runtime, Some(&state_db))
         .expect("worker step")
         .expect("queued ledger");
 
-    assert!(!abandoned.rotated);
-    assert!(!abandoned.stopped);
-    assert_eq!(
-        runtime.events,
-        vec!["clear_prior:900".to_owned(), "copy:1156".to_owned()]
-    );
-    assert_eq!(store.get_last_rotated(), 900);
-    assert_eq!(store.saved_state(), &initial);
-    assert_eq!(state_db.get_state().expect("durable state"), initial);
-
-    runtime.disconnected = false;
-    runtime.disconnect_after_copy = false;
-    store.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
-        1_156, 0, false,
-    )));
-    let retried = run_shamap_store_worker_step(&mut store, &mut runtime, Some(&state_db))
-        .expect("retry worker step")
-        .expect("retry queued ledger");
-
-    assert!(retried.rotated);
+    assert!(completed.rotated);
+    assert!(!completed.stopped);
     assert_eq!(store.get_last_rotated(), 1_156);
     assert_eq!(
-        state_db
-            .get_state()
-            .expect("retried durable state")
-            .last_rotated,
+        state_db.get_state().expect("durable state").last_rotated,
         1_156
     );
     assert!(runtime.events.iter().any(|event| event == "rotate"));

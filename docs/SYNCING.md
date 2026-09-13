@@ -129,7 +129,8 @@ recovery anchor.
 
 After the current chain is established, configured history can be filled in
 without blocking live validated-ledger advancement. `[ledger_history]` controls
-the desired history and `[node_db] online_delete` controls retained history.
+the desired history and `[node_db] online_delete` controls the two-generation
+NodeStore rotation interval and batched relational pruning boundary.
 During recovery, current-ledger work has priority over backfill.
 
 ## Monitoring

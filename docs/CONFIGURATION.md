@@ -127,11 +127,17 @@ Configures persistent ledger object storage.
 | `delete_batch` | Relational cleanup batch size; default `100`. |
 | `back_off_milliseconds` | Delay between relational cleanup batches; default `100`. Legacy key `backOff` is also accepted. |
 | `age_threshold_seconds` | Maximum validated-ledger age allowed before a rotation waits; default `60`. |
-| `recovery_wait_seconds` | Retry delay after a rotation health gate blocks; default `5`. |
+| `recovery_wait_seconds` | Retry delay after a rotation health gate blocks; default `2`, matching `rippled`. |
 
 When nonzero, `online_delete` must be at least the selected numeric
 `ledger_history`. Online-delete rotation freshens cache generations and clears
 prior-ledger and FullBelow state; it is separate from normal age/size sweeps.
+The value is a rotation interval, not an exact instantaneous row count. Like
+`rippled`, Quaxar keeps the current writable NodeStore generation and one
+archive generation, so retained ledger coverage normally varies between about
+one and two `online_delete` intervals. At each successful rotation, SQL ledger,
+transaction, and account-transaction rows older than the previous rotation
+boundary are deleted in bounded batches.
 Rotating NodeStores intentionally bypass the encoded `NodeObject` cache, matching
 `rippled`: reads go directly to the writable and archive backends so cached
 archive objects cannot hide copy-forward work during rotation. Cache-size and

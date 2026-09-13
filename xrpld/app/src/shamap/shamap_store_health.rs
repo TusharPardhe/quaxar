@@ -20,9 +20,6 @@ pub enum SHAMapStoreHealthStatus {
     /// Validated progress exceeded the configured recovery bound. The caller
     /// must abandon this rotation attempt without persisting a new boundary.
     Expired,
-    /// NetworkOps is detached. A worker must not begin or advance destructive
-    /// maintenance from a disconnected snapshot.
-    Disconnected,
     Stopping,
 }
 
@@ -305,12 +302,13 @@ impl SHAMapStoreHealthPolicy {
             };
         }
 
-        // A detached worker cannot establish a fresh complete-ledger view.
-        // Treat this as an immediate, bounded abandonment signal rather than
-        // unconditionally permitting local deletion or rotation.
+        // Match rippled's SHAMapStoreImp::healthWait special case. While the
+        // server is disconnected it performs no ledger I/O, so this is the
+        // least contentious time to advance an already-eligible rotation.
+        // Stop is still checked first and remains authoritative.
         if runtime.is_disconnected() {
             return SHAMapStoreHealthCheck {
-                status: SHAMapStoreHealthStatus::Disconnected,
+                status: SHAMapStoreHealthStatus::KeepGoing,
                 validated_seq,
                 missing_ledgers: 0,
                 building_validated_tip: false,
