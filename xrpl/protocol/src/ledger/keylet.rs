@@ -600,6 +600,7 @@ pub fn get_book_base(book: Book) -> Uint256 {
         (Asset::Issue(input), Asset::MPTIssue(output), Some(domain)) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
             &[
+                &[0x01],
                 input.currency.data(),
                 output.mpt_id().data(),
                 input.account.data(),
@@ -609,6 +610,7 @@ pub fn get_book_base(book: Book) -> Uint256 {
         (Asset::Issue(input), Asset::MPTIssue(output), None) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
             &[
+                &[0x01],
                 input.currency.data(),
                 output.mpt_id().data(),
                 input.account.data(),
@@ -617,6 +619,7 @@ pub fn get_book_base(book: Book) -> Uint256 {
         (Asset::MPTIssue(input), Asset::Issue(output), Some(domain)) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
             &[
+                &[0x02],
                 input.mpt_id().data(),
                 output.currency.data(),
                 output.account.data(),
@@ -626,6 +629,7 @@ pub fn get_book_base(book: Book) -> Uint256 {
         (Asset::MPTIssue(input), Asset::Issue(output), None) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
             &[
+                &[0x02],
                 input.mpt_id().data(),
                 output.currency.data(),
                 output.account.data(),
@@ -633,11 +637,16 @@ pub fn get_book_base(book: Book) -> Uint256 {
         ),
         (Asset::MPTIssue(input), Asset::MPTIssue(output), Some(domain)) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
-            &[input.mpt_id().data(), output.mpt_id().data(), domain.data()],
+            &[
+                &[0x03],
+                input.mpt_id().data(),
+                output.mpt_id().data(),
+                domain.data(),
+            ],
         ),
         (Asset::MPTIssue(input), Asset::MPTIssue(output), None) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
-            &[input.mpt_id().data(), output.mpt_id().data()],
+            &[&[0x03], input.mpt_id().data(), output.mpt_id().data()],
         ),
     };
 

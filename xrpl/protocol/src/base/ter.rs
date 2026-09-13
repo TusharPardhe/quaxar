@@ -392,6 +392,18 @@ macro_rules! ter_catalog {
             "temBAD_CIPHERTEXT",
             "Malformed: Invalid ciphertext format."
         );
+        $macro!(
+            TEM_INVALID_BYTECODE,
+            -247,
+            "temINVALID_BYTECODE",
+            "Malformed: Provided byte code is invalid."
+        );
+        $macro!(
+            TEM_TEMP_DISABLED,
+            -246,
+            "temTEMP_DISABLED",
+            "The transaction requires logic that is currently temporarily disabled."
+        );
 
         $macro!(TEF_FAILURE, -199, "tefFAILURE", "Failed to apply.");
         $macro!(
@@ -526,6 +538,18 @@ macro_rules! ter_catalog {
             -176,
             "tefBAD_PATH_COUNT",
             "Too many paths or too long a path."
+        );
+        $macro!(
+            TEF_NO_BYTECODE,
+            -175,
+            "tefNO_BYTECODE",
+            "There is no WASM code to run, but a WASM-specific field was included."
+        );
+        $macro!(
+            TEF_BYTECODE_NOT_INCLUDED,
+            -174,
+            "tefBYTECODE_NOT_INCLUDED",
+            "WASM code requires a field that was not included."
         );
 
         $macro!(TER_RETRY, -99, "terRETRY", "Retry transaction.");
@@ -1073,6 +1097,18 @@ macro_rules! ter_catalog {
             200,
             "tecNO_SPONSOR_PERMISSION",
             "Sponsor does not permit this operation."
+        );
+        $macro!(
+            TEC_OUT_OF_GAS,
+            201,
+            "tecOUT_OF_GAS",
+            "The WASM code ran out of gas during execution."
+        );
+        $macro!(
+            TEC_BYTECODE_REJECTED,
+            202,
+            "tecBYTECODE_REJECTED",
+            "The custom WASM code that was run rejected your transaction."
         );
     };
 }

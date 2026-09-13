@@ -383,6 +383,15 @@ fn validation_format() -> &'static SOTemplate {
                     SOEStyle::Optional,
                 )
                 .expect("validation reserve increment drops field should be useful"),
+                SOElement::new(get_field_by_symbol("sfGasLimit"), SOEStyle::Optional)
+                    .expect("validation gas limit field should be useful"),
+                SOElement::new(
+                    get_field_by_symbol("sfBytecodeSizeLimit"),
+                    SOEStyle::Optional,
+                )
+                .expect("validation bytecode size limit field should be useful"),
+                SOElement::new(get_field_by_symbol("sfGasPrice"), SOEStyle::Optional)
+                    .expect("validation gas price field should be useful"),
             ],
             Vec::new(),
         )
