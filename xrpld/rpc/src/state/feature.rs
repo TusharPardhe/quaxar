@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn retired_amm_overflow_offer_is_absent_from_feature_rpc() {
+    fn retired_amm_overflow_offer_remains_registered_and_supported() {
         let registry = AmendmentStatus::new();
         let request = FeatureRequest {
             params: &JsonValue::Object(BTreeMap::new()),
@@ -167,7 +167,13 @@ mod tests {
         let JsonValue::Object(features) = response.get("features").expect("features table") else {
             panic!("features must be an object");
         };
-        assert!(!features.contains_key(&to_string(&feature_id("fixAMMOverflowOffer"))));
+        let feature = features
+            .get(&to_string(&feature_id("fixAMMOverflowOffer")))
+            .expect("retired enabled-ledger amendments remain supported");
+        let JsonValue::Object(feature) = feature else {
+            panic!("feature entry must be an object");
+        };
+        assert_eq!(feature.get("supported"), Some(&JsonValue::Bool(true)));
 
         let params = JsonValue::Object(BTreeMap::from([(
             "feature".to_owned(),
@@ -183,9 +189,16 @@ mod tests {
         let JsonValue::Object(response) = response else {
             panic!("feature lookup response must be an object");
         };
+        let JsonValue::Object(feature) = response
+            .get(&to_string(&feature_id("fixAMMOverflowOffer")))
+            .expect("single-feature reply is keyed by amendment ID")
+        else {
+            panic!("single-feature entry must be an object");
+        };
         assert_eq!(
-            response.get("error"),
-            Some(&JsonValue::String("badFeature".to_owned()))
+            feature.get("name"),
+            Some(&JsonValue::String("fixAMMOverflowOffer".to_owned()))
         );
+        assert_eq!(feature.get("supported"), Some(&JsonValue::Bool(true)));
     }
 }

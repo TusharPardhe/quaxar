@@ -272,6 +272,10 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
         true,
         RegisteredFeatureVote::Obsolete,
     ),
+    // Retired in rippled after its corrected max-offer and AMM invariant
+    // semantics became unconditional.  Retired amendments remain registered
+    // and supported because their IDs are still present in validated ledgers.
+    RegisteredFeature::new("fixAMMOverflowOffer", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("fixCheckThreading", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new(
         "fixMasterKeyAsRegularKey",
@@ -659,13 +663,17 @@ mod tests {
     }
 
     #[test]
-    fn retired_amm_overflow_offer_fix_is_not_advertised() {
-        assert!(
-            REGISTERED_FEATURES
-                .iter()
-                .all(|registered| registered.name != "fixAMMOverflowOffer")
+    fn retired_amm_overflow_offer_fix_remains_supported() {
+        let registered = REGISTERED_FEATURES
+            .iter()
+            .find(|registered| registered.name == "fixAMMOverflowOffer")
+            .expect("enabled retired amendments must remain registered");
+        assert!(registered.supported);
+        assert_eq!(registered.vote, RegisteredFeatureVote::Obsolete);
+        assert_eq!(
+            feature_name(&feature_id("fixAMMOverflowOffer")),
+            Some("fixAMMOverflowOffer")
         );
-        assert_eq!(feature_name(&feature_id("fixAMMOverflowOffer")), None);
     }
 
     #[test]
