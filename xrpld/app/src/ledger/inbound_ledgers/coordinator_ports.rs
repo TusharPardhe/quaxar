@@ -189,7 +189,8 @@ struct SessionPersistence {
 }
 
 // rippled processes inbound-ledger packets, including their synchronous NuDB
-// writes, through the globally limited JtLedgerData lane (limit 3). Quaxar
+// writes, through the globally limited JtLedgerData lane (running limit 3,
+// timeout/outstanding admission limit 5). Quaxar
 // separates physical persistence from packet reduction, so it must reproduce
 // that same global exposure here; a per-session FIFO alone permits every
 // prefetched history ledger to occupy the JtWrite lane concurrently.

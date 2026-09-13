@@ -27,11 +27,9 @@ starting the service.
 
 ### Diagnostic environment
 
-Set `QUAXAR_ACQUISITION_SHADOW=1` to enable the bounded, read-only acquisition
-shadow on the serialized coordinator owner. It compares typed events, exact
-session/timer identities, effects, and derived phase decisions without becoming
-a second lifecycle authority. The shadow is disabled by default and should be
-enabled temporarily when auditing acquisition parity or mode transitions.
+`QUAXAR_ACQUISITION_SHADOW` belongs to the coordinator parity harness. The
+production runtime uses worker-owned per-ledger actors and does not install the
+coordinator on NetworkOps, so this variable has no production effect.
 
 ## Core Sections
 

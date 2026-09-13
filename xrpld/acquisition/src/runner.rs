@@ -79,8 +79,9 @@ const AGGRESSIVE_TIMEOUT_THRESHOLD: u32 = 4;
 /// rippled's `InboundLedgers::sweep` removes a per-hash acquisition one minute
 /// after its constructor/update touch, even if it is still active.
 const SESSION_IDLE_MINIMUM: Duration = Duration::from_secs(60);
-/// `JtLedgerData` runs at most three jobs concurrently in rippled. Quaxar uses
-/// one serialized continuation per session, so one global three-owner pool is
+/// rippled's `InboundLedger` timeout path admits at most five total
+/// `JtLedgerData` jobs while the JobQueue category runs three concurrently.
+/// Quaxar uses one serialized continuation per session, so one global three-owner pool is
 /// the conservative async analogue for initial and triggered local scans.
 const MAX_LOCAL_SCAN_OWNERS: usize = 3;
 const MAX_PLAIN_CONSENSUS_SCAN_BURST: usize = 2;
@@ -10681,7 +10682,7 @@ mod tests {
         runner.state.latest_consensus_target = Some(target(44));
         assert_eq!(runner.state.latest_consensus_target, Some(target(44)));
 
-        // A reply received while all three jobs are occupied remains retained
+        // A reply received while all three running jobs are occupied remains retained
         // in its mailbox and queues the session for the next permit.
         let effects = runner.handle_event(AcquisitionEvent::PacketAdmitted(admitted_packet(
             reply_waiter,

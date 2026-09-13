@@ -78,9 +78,10 @@ pub(crate) struct CoordinatorAcquireOutcome {
     pub(crate) effects: Vec<AcquisitionEffect>,
 }
 
-/// rippled's `JtLedgerData` JobType permits at most three running jobs.
-/// This bounds packet processing while leaving the inbound registry free to
-/// track any number of hash-deduplicated acquisitions.
+/// rippled's global `JtLedgerData` JobQueue category runs at most three jobs.
+/// `InboundLedger` separately refuses to queue a timeout job once five total
+/// ledger-data jobs exist; `AcquisitionReadyScheduler` models that five-job
+/// admission boundary while this executor models the three running workers.
 const WORKER_COUNT: usize = 3;
 
 /// Acquire the registry `inner` mutex, recording the time spent blocked on the
@@ -765,11 +766,10 @@ pub struct InboundLedgers {
     /// Shared lifecycle counters incremented at request, wire, worker, retry,
     /// and terminal boundaries. The sampled snapshot never mutates state.
     lifecycle: Arc<AcquisitionLifecycleCounters>,
-    /// Coordinator-owned session lifecycle. Installed once the NodeStore and
-    /// the NetworkOps phase state are configured; when installed it is the
-    /// single session lifecycle owner for every target it creates. `None`
-    /// preserves the legacy `AcquisitionState` path behind the M4.2-C3
-    /// switchover, so the rollback feature flag is "never install". A mutex
+    /// Optional coordinator parity harness. Production deliberately leaves
+    /// this `None` and uses the worker-owned `AcquisitionState` path, ensuring
+    /// no coordinator plan can execute on NetworkOps. Deterministic tests may
+    /// install it to compare typed lifecycle behavior. A mutex
     /// (not `RwLock`) is required because the adapter's event receiver is not
     /// `Sync`; ingress/owner calls serialize through this short lock.
     /// Mutable owner for coordinator lifecycle transitions and effect dispatch.
@@ -789,9 +789,8 @@ pub struct InboundLedgers {
     /// Newest NodeStore generation published by the online-delete worker.
     /// Only the serialized coordinator owner consumes and applies this fact.
     pending_store_generation: AtomicU64,
-    /// The NetworkOps state the coordinator phase port publishes to. Wired by
-    /// ApplicationRoot before coordinator installation; the coordinator is the
-    /// single production mode writer for the sessions it owns.
+    /// NetworkOps state used only by coordinator parity tests. Production
+    /// operating-mode ownership remains directly on the NetworkOps strand.
     coordinator_phase: RwLock<Option<AppNetworkOpsModeOwner>>,
 }
 
@@ -925,11 +924,10 @@ impl InboundLedgers {
         *guard = Some(ns);
     }
 
-    // ─── Coordinator-owned session lifecycle (M4.2-C2/C3) ───────────────
+    // ─── Coordinator parity harness ──────────────────────────────────────
 
-    /// Wire the NetworkOps phase state the coordinator publishes to. The
-    /// coordinator is the single production mode writer for the sessions it
-    /// owns; it never reads a mode back from this state.
+    /// Wire the NetworkOps phase state used by coordinator parity tests.
+    #[allow(dead_code)] // coordinator parity harness; production uses worker-owned actors
     pub(crate) fn set_phase_mode_owner(&self, owner: AppNetworkOpsModeOwner) {
         *self
             .coordinator_phase
@@ -954,8 +952,8 @@ impl InboundLedgers {
         ));
     }
 
-    /// Whether the coordinator owns session lifecycle. When false, `acquire`
-    /// uses the legacy `AcquisitionState` path (M4.2-C3 rollback flag).
+    /// Whether the optional coordinator harness is installed. Production
+    /// leaves this false and uses worker-owned `AcquisitionState` actors.
     pub fn coordinator_installed(&self) -> bool {
         self.coordinator.lock().expect("coordinator lock").is_some()
     }
@@ -970,13 +968,13 @@ impl InboundLedgers {
         }
     }
 
-    /// Build and install the production coordinator adapter. Idempotent: the
+    /// Build and install the coordinator parity adapter. Production bootstrap
+    /// never calls this method. Idempotent: the
     /// first successful install wins and later calls return `false` without
     /// replacing the live owner. Installation is rejected while a legacy actor
     /// is live: those actors retain independent mailbox, scheduler, timer, and
     /// tree-plan ownership and cannot coexist with coordinator sessions.
-    /// Bootstrap installs before any acquisition can begin; keeping the
-    /// coordinator absent is the explicit compatibility fallback. Requires
+    /// Keeping the coordinator absent is the production execution mode. Requires
     /// the NodeStore, the phase state, and (optionally) the overlay runtime to
     /// be configured first.
     pub fn install_coordinator(&self) -> bool {
@@ -3847,6 +3845,36 @@ mod tests {
     ) -> Arc<super::super::acquisition::AcquisitionState> {
         let inner = registry.inner.lock().expect("registry lock");
         Arc::clone(&inner.entries.get(hash).expect("active acquisition").state)
+    }
+
+    #[test]
+    fn production_registry_uses_rippled_ledger_data_boundaries() {
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let registry = InboundLedgers::new(
+            Arc::new(TreeNodeCache::new(
+                "production-worker-boundary-test",
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            Arc::new(FullBelowCacheImpl::new(
+                1,
+                MonotonicClock::default(),
+                HardenedHashBuilder::default(),
+                8,
+            )),
+            Arc::new(FetchPackCache::new(
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            completed_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(registry.worker_pool.snapshot().worker_count, 3);
+        assert!(!registry.coordinator_installed());
+        registry.stop();
     }
 
     #[test]

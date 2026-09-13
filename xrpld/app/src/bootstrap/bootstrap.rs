@@ -1688,32 +1688,23 @@ fn run_start_mode_consensus_loop(
         shared_inbound.set_overlay_rt(overlay_rt);
     }
 
-    // M4.2-C3: install the coordinator as the single session lifecycle owner
-    // before any acquisition begins. The coordinator publishes the service
-    // phase into the same SharedNetworkOpsState every other component reads,
-    // and it never reads a mode back. From this point `acquire` delegates to
-    // coordinator sessions and returns None for new starts, exactly like
-    // rippled `InboundLedgers::acquire`.
-    shared_inbound.set_phase_mode_owner(runtime.root().network_ops_mode_owner());
-    if shared_inbound.install_coordinator() {
-        tracing::info!(
-            target: "inbound_ledger",
-            "coordinator installed as the single acquisition session lifecycle owner"
-        );
-        // M6-D: seed the coordinator's initial phase from the bootstrap startup
-        // intent so it alone owns the mode from install (the legacy startup
-        // write in `build_bootstrap_runtime` remains only as the pre-install
-        // seed and the rollback path). Quaxar preserves its legacy startup
-        // mode seed: networked -> Connected, `start_valid` -> Full from the
-        // hydrated LCL. rippled seeds `DISCONNECTED`/`FULL` in the NetworkOPs
-        // constructor (`rippled/src/xrpld/app/misc/NetworkOPs.cpp:318`).
-        shared_inbound.coordinator_startup(startup_coordinator_phase(runtime.root()));
-    } else {
-        tracing::warn!(
-            target: "inbound_ledger",
-            "coordinator install deferred: NodeStore or phase state unavailable; legacy acquisition remains the lifecycle owner"
-        );
-    }
+    // Keep acquisition CPU off the NetworkOps/consensus owner.  Production
+    // uses the per-ledger AcquisitionState actor and its JtLedgerData-equivalent
+    // ready scheduler: overlay ingress only fills a bounded mailbox, while a
+    // three-worker pool performs SHAMap traversal, reads, packet application
+    // and persistence.  This is the same execution boundary as rippled's
+    // InboundLedgers::gotLedgerData -> JtLedgerData("ProcessLData") path.
+    //
+    // The coordinator remains available to deterministic unit/parity tests,
+    // but must not be installed here: its SessionPlan currently advances while
+    // its owner is drained, and installing that owner on NetworkOps allowed one
+    // resident-tree scan to delay consensus heartbeats for multiple seconds.
+    tracing::info!(
+        target: "inbound_ledger",
+        worker_limit = 3,
+        outstanding_limit = 5,
+        "worker-owned inbound ledger acquisition enabled"
+    );
 
     // Spawn consensus event loop (validation/ledger promotion)
     let event_loop_app = runtime.root().clone();
@@ -2174,32 +2165,6 @@ fn run_start_mode_consensus_loop(
             .set_proposal_notify(Box::new(move || {
                 notify_root.notify_consensus_event();
             }));
-    }
-
-    /// The coordinator's initial phase derived from the bootstrap startup
-    /// intent. Quaxar preserves its legacy startup mode seed: networked ->
-    /// `Connected`, `start_valid` -> `Full` from the hydrated LCL and its
-    /// published ledger (the loaded ledger is published during
-    /// `initialize_startup_ledger_state`). rippled seeds the constructor mode
-    /// from `startValid` (`NetworkOPs.cpp:318`) and only later promotes with
-    /// peer heartbeat logic; Quaxar's `Connected` seed is the retained
-    /// divergence documented in the M6-D design note.
-    fn startup_coordinator_phase(root: &ApplicationRoot) -> acquisition::SyncPhase {
-        if root.config().start_valid {
-            if let (Some(lcl), Some(published)) = (root.closed_ledger(), root.published_ledger()) {
-                return acquisition::SyncPhase::Full {
-                    lcl: acquisition::LedgerIdentity::new(
-                        *lcl.header().hash.as_uint256(),
-                        lcl.header().seq,
-                    ),
-                    published: acquisition::LedgerIdentity::new(
-                        *published.header().hash.as_uint256(),
-                        published.header().seq,
-                    ),
-                };
-            }
-        }
-        acquisition::SyncPhase::Connected
     }
 
     fn recover_deferred_replay_parent(
