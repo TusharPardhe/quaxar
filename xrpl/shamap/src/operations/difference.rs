@@ -57,6 +57,12 @@ where
             return Ok(());
         }
 
+        // At leaf depth no key nibble remains. A malformed inner node may be
+        // reported to the caller, but must not be traversed into children.
+        if node_id.get_depth() >= crate::node_id::SHAMAP_LEAF_DEPTH {
+            continue;
+        }
+
         for branch in 0..BRANCH_FACTOR {
             if node.is_empty_branch(branch) {
                 continue;
@@ -171,6 +177,12 @@ where
     while let Some((node, node_id)) = stack.pop() {
         if !visit(&node) {
             return Ok(());
+        }
+
+        // At leaf depth no key nibble remains. A malformed inner node may be
+        // reported to the caller, but must not be traversed into children.
+        if node_id.get_depth() >= crate::node_id::SHAMAP_LEAF_DEPTH {
+            continue;
         }
 
         for branch in 0..BRANCH_FACTOR {
