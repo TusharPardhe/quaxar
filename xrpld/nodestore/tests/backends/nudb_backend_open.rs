@@ -336,6 +336,31 @@ fn nudb_backend_close_deletes_path_when_requested() {
 }
 
 #[test]
+fn nudb_backend_drop_deletes_retired_rotation_path() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("retired-generation");
+    {
+        let backend = NuDbBackend::new(
+            nodestore::NodeObject::KEY_BYTES,
+            &nudb_section(&path),
+            64,
+            Arc::new(RecordingJournal::default()),
+        )
+        .expect("nudb backend");
+
+        backend
+            .open_deterministic(true, NUDB_APPNUM, 71, 81)
+            .expect("deterministic create");
+        backend.set_delete_path();
+    }
+
+    assert!(
+        !path.exists(),
+        "dropping the final retired-backend owner must remove its directory"
+    );
+}
+
+#[test]
 fn nudb_backend_rejects_existing_file_set_with_mismatched_data_or_log_headers() {
     let temp = TempDir::new().expect("tempdir");
     let key_header = NuDbKeyFileHeader {
