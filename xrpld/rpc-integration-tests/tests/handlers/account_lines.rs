@@ -222,3 +222,33 @@ fn account_lines_limit_and_marker() {
         }
     }
 }
+
+#[test]
+fn account_lines_preserves_success_envelope_in_v1_and_v2() {
+    let alice = TestAccount::new("al_lines_versions");
+    let env = RpcTestEnv::new(&[(&alice, 10_000_000_000)]);
+    let source = env.rpc_source();
+
+    for api_version in [1, 2] {
+        let result = rpc::do_account_lines(
+            &rpc::AccountLinesRequest {
+                params: &json([("account", JsonValue::String(to_base58(alice.id)))]),
+                api_version,
+                role: rpc::Role::Admin,
+            },
+            &source,
+        );
+        let JsonValue::Object(result) = result else {
+            panic!("API v{api_version} result must be an object");
+        };
+        assert_eq!(
+            result.get("account"),
+            Some(&JsonValue::String(to_base58(alice.id)))
+        );
+        assert!(result.contains_key("lines"));
+        assert!(result.contains_key("ledger_hash") || result.contains_key("ledger_current_index"));
+        assert!(result.contains_key("ledger_index"));
+        assert!(result.contains_key("validated"));
+        assert!(!result.contains_key("error"));
+    }
+}

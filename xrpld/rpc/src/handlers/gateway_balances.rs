@@ -184,11 +184,17 @@ fn parse_account(params: &JsonValue) -> Result<String, JsonValue> {
     };
 
     if let Some(account) = object.get("account") {
-        return Ok(json_value_as_string(account));
+        let JsonValue::String(account) = account else {
+            return Err(crate::commands::rpc_helpers::invalid_field_error("account"));
+        };
+        return Ok(account.clone());
     }
 
     if let Some(ident) = object.get("ident") {
-        return Ok(json_value_as_string(ident));
+        let JsonValue::String(ident) = ident else {
+            return Err(crate::commands::rpc_helpers::invalid_field_error("ident"));
+        };
+        return Ok(ident.clone());
     }
 
     Err(missing_field_error("account"))

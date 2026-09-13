@@ -2,14 +2,14 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
+use app::ledger_to_json::ledger_to_json_tx::insert_all_synthetic_in_json;
 use app::{TransStatus, Transaction};
 use basics::{base_uint::Uint256, chrono::to_string_iso, str_hex::str_hex};
 use protocol::{JsonOptions, JsonValue, STTx};
 
 use crate::{
     RpcErrorCode, TxLookupError, TxLookupOutcome, TxRecord, decode_ctid, encode_ctid,
-    insert_deliver_max, insert_delivered_amount, insert_mp_token_issuance_id,
-    insert_nft_synthetic_in_json, make_error_message, rpc_error,
+    insert_deliver_max, make_error_message, rpc_error,
 };
 use protocol::TxSearched;
 
@@ -170,16 +170,14 @@ fn insert_meta(
     }
 
     let mut meta_json = meta.get_json(JsonOptions::NONE);
-    insert_delivered_amount(
+    insert_all_synthetic_in_json(
         &mut meta_json,
         record.ledger_index,
         record.close_time.map(|close_time| close_time.as_seconds()),
         txn,
         meta,
     );
-    insert_mp_token_issuance_id(&mut meta_json, txn, meta);
     ensure_object(response).insert("meta".to_owned(), meta_json);
-    insert_nft_synthetic_in_json(response, txn, meta);
 }
 
 fn insert_v2_response(response: &mut JsonValue, record: &TxRecord, binary: bool) {

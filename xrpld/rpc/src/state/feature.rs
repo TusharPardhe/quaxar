@@ -126,3 +126,66 @@ pub fn do_feature<S: FeatureSource>(request: &FeatureRequest<'_>, source: &S) ->
 
     JsonValue::Object(reply)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::{AmendmentStatus, AmendmentVote};
+
+    impl FeatureSource for AmendmentStatus {
+        fn feature_table_json(&self, is_admin: bool) -> JsonValue {
+            AmendmentStatus::feature_table_json(self, is_admin)
+        }
+
+        fn feature_json(&self, feature: Uint256, is_admin: bool) -> Option<JsonValue> {
+            AmendmentStatus::feature_json(self, feature, is_admin)
+        }
+
+        fn veto_feature(&self, feature: Uint256) {
+            self.set_vote(feature, AmendmentVote::Down);
+        }
+
+        fn unveto_feature(&self, feature: Uint256) {
+            self.set_vote(feature, AmendmentVote::Up);
+        }
+
+        fn majority_timestamps(&self) -> BTreeMap<Uint256, i64> {
+            AmendmentStatus::majority_timestamps(self)
+        }
+    }
+
+    #[test]
+    fn retired_amm_overflow_offer_is_absent_from_feature_rpc() {
+        let registry = AmendmentStatus::new();
+        let request = FeatureRequest {
+            params: &JsonValue::Object(BTreeMap::new()),
+            role: Role::Admin,
+        };
+        let JsonValue::Object(response) = do_feature(&request, &registry) else {
+            panic!("feature response must be an object");
+        };
+        let JsonValue::Object(features) = response.get("features").expect("features table") else {
+            panic!("features must be an object");
+        };
+        assert!(!features.contains_key(&to_string(&feature_id("fixAMMOverflowOffer"))));
+
+        let params = JsonValue::Object(BTreeMap::from([(
+            "feature".to_owned(),
+            JsonValue::String("fixAMMOverflowOffer".to_owned()),
+        )]));
+        let response = do_feature(
+            &FeatureRequest {
+                params: &params,
+                role: Role::Admin,
+            },
+            &registry,
+        );
+        let JsonValue::Object(response) = response else {
+            panic!("feature lookup response must be an object");
+        };
+        assert_eq!(
+            response.get("error"),
+            Some(&JsonValue::String("badFeature".to_owned()))
+        );
+    }
+}

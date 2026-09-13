@@ -493,3 +493,90 @@ fn ledger_to_json_tx_skips_delivered_amount_for_account_delete() {
 
     assert!(!meta_json.contains_key("delivered_amount"));
 }
+
+#[test]
+fn ledger_to_json_synthetic_nft_fields_stay_in_metadata() {
+    fn metadata(tx: &STTx, nodes: Vec<STObject>) -> TxMeta {
+        let mut affected = STArray::new(get_field_by_symbol("sfAffectedNodes"));
+        for node in nodes {
+            affected.push_back(node);
+        }
+        let mut object = STObject::new(get_field_by_symbol("sfTransactionMetaData"));
+        object.set_field_u8(get_field_by_symbol("sfTransactionResult"), 0);
+        object.set_field_u32(get_field_by_symbol("sfTransactionIndex"), 1);
+        object.set_field_array(get_field_by_symbol("sfAffectedNodes"), affected);
+        TxMeta::from_stobject(tx.get_transaction_id(), 91, object)
+    }
+
+    let token_id = Uint256::from_array([0xA1; 32]);
+    let offer_id = Uint256::from_array([0xB2; 32]);
+
+    let mint = STTx::new(TxType::NFTOKEN_MINT, |_| {});
+    let mut token = STObject::new(get_field_by_symbol("sfNFToken"));
+    token.set_field_h256(get_field_by_symbol("sfNFTokenID"), token_id);
+    let mut tokens = STArray::new(get_field_by_symbol("sfNFTokens"));
+    tokens.push_back(token);
+    let mut mint_fields = STObject::new(get_field_by_symbol("sfNewFields"));
+    mint_fields.set_field_array(get_field_by_symbol("sfNFTokens"), tokens);
+    let mut mint_node = STObject::new(get_field_by_symbol("sfCreatedNode"));
+    mint_node.set_field_u16(
+        get_field_by_symbol("sfLedgerEntryType"),
+        LedgerEntryType::NFTokenPage.code(),
+    );
+    mint_node.set_field_object(get_field_by_symbol("sfNewFields"), mint_fields);
+
+    let offer = STTx::new(TxType::NFTOKEN_CREATE_OFFER, |_| {});
+    let mut offer_node = STObject::new(get_field_by_symbol("sfCreatedNode"));
+    offer_node.set_field_u16(
+        get_field_by_symbol("sfLedgerEntryType"),
+        LedgerEntryType::NFTokenOffer.code(),
+    );
+    offer_node.set_field_h256(get_field_by_symbol("sfLedgerIndex"), offer_id);
+
+    let brokered_accept = STTx::new(TxType::NFTOKEN_ACCEPT_OFFER, |_| {});
+    let mut final_fields = STObject::new(get_field_by_symbol("sfFinalFields"));
+    final_fields.set_field_h256(get_field_by_symbol("sfNFTokenID"), token_id);
+    let mut deleted_offer = STObject::new(get_field_by_symbol("sfDeletedNode"));
+    deleted_offer.set_field_u16(
+        get_field_by_symbol("sfLedgerEntryType"),
+        LedgerEntryType::NFTokenOffer.code(),
+    );
+    deleted_offer.set_field_object(get_field_by_symbol("sfFinalFields"), final_fields);
+
+    for (tx, meta, field, expected) in [
+        (
+            &mint,
+            metadata(&mint, vec![mint_node]),
+            "nftoken_id",
+            token_id.to_string(),
+        ),
+        (
+            &offer,
+            metadata(&offer, vec![offer_node]),
+            "offer_id",
+            offer_id.to_string(),
+        ),
+        (
+            &brokered_accept,
+            metadata(&brokered_accept, vec![deleted_offer]),
+            "nftoken_id",
+            token_id.to_string(),
+        ),
+    ] {
+        let mut json = meta.get_json(protocol::JsonOptions::NONE);
+        app::ledger_to_json::ledger_to_json_tx::insert_all_synthetic_in_json(
+            &mut json,
+            91,
+            Some(600_000_000),
+            tx,
+            &meta,
+        );
+        let meta_json = object(json);
+        assert_eq!(
+            meta_json.get(field),
+            Some(&JsonValue::String(expected)),
+            "{:?} synthetic value must remain inside metadata",
+            tx.get_txn_type(),
+        );
+    }
+}

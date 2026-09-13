@@ -43,14 +43,12 @@ fn ensure_object(value: &mut JsonValue) -> &mut BTreeMap<String, JsonValue> {
     object
 }
 
-fn set_error(result: &mut JsonValue, error: &str) {
-    let object = ensure_object(result);
-    object.insert("error".to_owned(), JsonValue::String(error.to_owned()));
-}
-
 fn parse_vault_id(params: &JsonValue) -> Result<Uint256, JsonValue> {
     let JsonValue::Object(object) = params else {
-        return Err(JsonValue::String("malformedRequest".to_owned()));
+        return Err(crate::commands::rpc_helpers::make_error_message(
+            crate::RpcErrorCode::InvalidParams,
+            "Must specify either 'vault_id' or both 'owner' and 'seq'.",
+        ));
     };
 
     let has_vault_id = object.contains_key("vault_id");
@@ -59,27 +57,31 @@ fn parse_vault_id(params: &JsonValue) -> Result<Uint256, JsonValue> {
 
     if has_vault_id && !has_owner && !has_seq {
         let Some(JsonValue::String(text)) = object.get("vault_id") else {
-            return Err(JsonValue::String("malformedRequest".to_owned()));
+            return Err(crate::commands::rpc_helpers::expected_field_error(
+                "vault_id",
+                "hex string",
+            ));
         };
-
-        if text.len() != Uint256::BYTES * 2 {
-            return Err(JsonValue::String("malformedRequest".to_owned()));
+        if text == "0" {
+            return Ok(Uint256::zero());
         }
-
-        let key = Uint256::from_hex(text)
-            .map_err(|_| JsonValue::String("malformedRequest".to_owned()))?;
-        if key.is_zero() {
-            return Err(JsonValue::String("malformedRequest".to_owned()));
-        }
-        return Ok(key);
+        return Uint256::from_hex(text).map_err(|_| {
+            crate::commands::rpc_helpers::expected_field_error("vault_id", "hex string")
+        });
     }
 
     if !has_vault_id && has_owner && has_seq {
         let Some(JsonValue::String(owner_text)) = object.get("owner") else {
-            return Err(JsonValue::String("malformedRequest".to_owned()));
+            return Err(crate::commands::rpc_helpers::make_error_message(
+                crate::RpcErrorCode::ActMalformed,
+                crate::commands::rpc_helpers::expected_field_message("owner", "AccountID"),
+            ));
         };
         let Some(owner) = parse_base58_account_id(owner_text) else {
-            return Err(JsonValue::String("malformedRequest".to_owned()));
+            return Err(crate::commands::rpc_helpers::make_error_message(
+                crate::RpcErrorCode::ActMalformed,
+                crate::commands::rpc_helpers::expected_field_message("owner", "AccountID"),
+            ));
         };
 
         let seq = match object.get("seq") {
@@ -89,7 +91,12 @@ fn parse_vault_id(params: &JsonValue) -> Result<Uint256, JsonValue> {
             Some(JsonValue::Signed(value)) if *value > 0 && *value <= i64::from(u32::MAX) => {
                 *value as u32
             }
-            _ => return Err(JsonValue::String("malformedRequest".to_owned())),
+            _ => {
+                return Err(crate::commands::rpc_helpers::expected_field_error(
+                    "seq",
+                    "a positive 32-bit integer",
+                ));
+            }
         };
 
         return Ok(vault_keylet(
@@ -99,7 +106,10 @@ fn parse_vault_id(params: &JsonValue) -> Result<Uint256, JsonValue> {
         .key);
     }
 
-    Err(JsonValue::String("malformedRequest".to_owned()))
+    Err(crate::commands::rpc_helpers::make_error_message(
+        crate::RpcErrorCode::InvalidParams,
+        "Must specify either 'vault_id' or both 'owner' and 'seq'.",
+    ))
 }
 
 fn read_vault_info<S: VaultInfoSource>(
@@ -110,7 +120,7 @@ fn read_vault_info<S: VaultInfoSource>(
 ) -> bool {
     let Some(sle_vault) = source.read_ledger_entry(ledger, vault_keylet_from_key(vault_key).key)
     else {
-        set_error(result, "entryNotFound");
+        crate::commands::rpc_helpers::inject_error(crate::RpcErrorCode::EntryNotFound, result);
         return false;
     };
 
@@ -118,7 +128,7 @@ fn read_vault_info<S: VaultInfoSource>(
     let Some(sle_issuance) =
         source.read_ledger_entry(ledger, mpt_issuance_keylet_from_mptid(share_mpt_id).key)
     else {
-        set_error(result, "entryNotFound");
+        crate::commands::rpc_helpers::inject_error(crate::RpcErrorCode::EntryNotFound, result);
         return false;
     };
 
@@ -163,9 +173,10 @@ pub fn do_vault_info<S: VaultInfoSource>(request: &VaultInfoRequest<'_>, source:
     let vault_key = match parse_vault_id(request.params) {
         Ok(key) => key,
         Err(error) => {
-            if let JsonValue::String(token) = error {
-                set_error(&mut result, &token);
-            }
+            let JsonValue::Object(error) = error else {
+                unreachable!("typed vault parse errors must be JSON objects");
+            };
+            ensure_object(&mut result).extend(error);
             return result;
         }
     };
