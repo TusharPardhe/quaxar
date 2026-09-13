@@ -31,6 +31,7 @@ impl SHAMapStore {
             config: SHAMapStoreConfig {
                 delete_interval,
                 advisory_delete,
+                max_waiting_ledgers: delete_interval,
                 ..SHAMapStoreConfig::default()
             },
             fd_required,
@@ -57,6 +58,10 @@ impl SHAMapStore {
 
     pub fn set_delete_interval(&mut self, delete_interval: u32) {
         self.config.delete_interval = delete_interval;
+    }
+
+    pub fn set_max_waiting_ledgers(&mut self, max_waiting_ledgers: u32) {
+        self.config.max_waiting_ledgers = max_waiting_ledgers;
     }
 
     pub const fn advisory_delete(&self) -> bool {
@@ -168,6 +173,22 @@ impl SHAMapStore {
         self.runtime.note_rotation_boundary(last_rotated);
     }
 
+    pub fn online_delete_health_progress(&self) -> (u32, u32) {
+        (
+            self.runtime.last_good_validated_ledger,
+            self.runtime.last_successful_health_check,
+        )
+    }
+
+    pub fn set_online_delete_health_progress(
+        &mut self,
+        last_good_validated_ledger: u32,
+        last_successful_health_check: u32,
+    ) {
+        self.runtime.last_good_validated_ledger = last_good_validated_ledger;
+        self.runtime.last_successful_health_check = last_successful_health_check;
+    }
+
     /// Detach the current queued ledger into a private worker snapshot.
     ///
     /// The component's producer path only needs to replace the newest queued
@@ -187,6 +208,8 @@ impl SHAMapStore {
     pub fn merge_worker_state(&mut self, worker: &Self) {
         self.runtime.minimum_online = worker.runtime.minimum_online;
         self.runtime.saved_state = worker.runtime.saved_state.clone();
+        self.runtime.last_good_validated_ledger = worker.runtime.last_good_validated_ledger;
+        self.runtime.last_successful_health_check = worker.runtime.last_successful_health_check;
         if self.runtime.queued_ledger.is_none() {
             self.runtime.working = worker.runtime.working;
         }

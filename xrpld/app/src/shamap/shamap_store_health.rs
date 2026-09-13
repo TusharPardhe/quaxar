@@ -17,6 +17,12 @@ pub enum SHAMapStoreOperatingMode {
 pub enum SHAMapStoreHealthStatus {
     KeepGoing,
     Waiting(Duration),
+    /// Validated progress exceeded the configured recovery bound. The caller
+    /// must abandon this rotation attempt without persisting a new boundary.
+    Expired,
+    /// NetworkOps is detached. A worker must not begin or advance destructive
+    /// maintenance from a disconnected snapshot.
+    Disconnected,
     Stopping,
 }
 
@@ -30,6 +36,30 @@ pub trait SHAMapStoreHealthRuntime {
     fn is_stopping(&self) -> bool;
     fn operating_mode(&self) -> SHAMapStoreOperatingMode;
     fn validated_ledger_age(&self) -> Duration;
+
+    /// NetworkOps is disconnected and therefore not performing ledger I/O.
+    fn is_disconnected(&self) -> bool {
+        false
+    }
+
+    /// The current validated sequence. `None` is used by isolated unit
+    /// runtimes; the worker then falls back to the ledger it was handed.
+    fn validated_ledger_seq(&self) -> Option<u32> {
+        None
+    }
+
+    /// Count unavailable ledgers in an inclusive complete-ledger range. The
+    /// production runtime delegates this to LedgerMaster's synchronized range
+    /// snapshot; test runtimes can provide deterministic gap observations.
+    fn missing_from_complete_ledger_range(&self, _first: u32, _last: u32) -> usize {
+        0
+    }
+
+    /// Whether the current validated tip is already complete. A sole missing
+    /// tip means the ledger is still being built, rather than an old gap.
+    fn has_complete_validated_ledger(&self, _seq: u32) -> bool {
+        true
+    }
 }
 
 pub trait SHAMapStoreCloseTimeProvider: Send + Sync + 'static {
@@ -185,6 +215,18 @@ impl SHAMapStoreHealthRuntime for SharedSHAMapStoreHealthState {
         decode_operating_mode(self.operating_mode.load(Ordering::Acquire))
     }
 
+    fn is_disconnected(&self) -> bool {
+        self.network_ops_state
+            .as_ref()
+            .is_some_and(|network_ops_state| {
+                network_ops_state.operating_mode() == NetworkOpsOperatingMode::Disconnected
+            })
+    }
+
+    fn validated_ledger_seq(&self) -> Option<u32> {
+        self.validated_ledger_seq()
+    }
+
     fn validated_ledger_age(&self) -> Duration {
         if let Some(ledger_master_state) = &self.ledger_master_state {
             return ledger_master_state.validated_ledger_age();
@@ -226,22 +268,87 @@ const fn map_network_ops_operating_mode(mode: NetworkOpsOperatingMode) -> SHAMap
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SHAMapStoreHealthCheck {
+    pub status: SHAMapStoreHealthStatus,
+    pub validated_seq: u32,
+    pub missing_ledgers: usize,
+    pub building_validated_tip: bool,
+}
+
 impl SHAMapStoreHealthPolicy {
     pub fn evaluate<R>(&self, runtime: &R) -> SHAMapStoreHealthStatus
     where
         R: SHAMapStoreHealthRuntime + ?Sized,
     {
+        self.evaluate_with_progress(runtime, 0, 0).status
+    }
+
+    pub fn evaluate_with_progress<R>(
+        &self,
+        runtime: &R,
+        last_good_validated_ledger: u32,
+        fallback_validated_seq: u32,
+    ) -> SHAMapStoreHealthCheck
+    where
+        R: SHAMapStoreHealthRuntime + ?Sized,
+    {
+        let validated_seq = runtime
+            .validated_ledger_seq()
+            .unwrap_or(fallback_validated_seq);
         if runtime.is_stopping() {
-            return SHAMapStoreHealthStatus::Stopping;
+            return SHAMapStoreHealthCheck {
+                status: SHAMapStoreHealthStatus::Stopping,
+                validated_seq,
+                missing_ledgers: 0,
+                building_validated_tip: false,
+            };
         }
 
-        if runtime.operating_mode() != SHAMapStoreOperatingMode::Full
-            || runtime.validated_ledger_age() > self.age_threshold
+        // A detached worker cannot establish a fresh complete-ledger view.
+        // Treat this as an immediate, bounded abandonment signal rather than
+        // unconditionally permitting local deletion or rotation.
+        if runtime.is_disconnected() {
+            return SHAMapStoreHealthCheck {
+                status: SHAMapStoreHealthStatus::Disconnected,
+                validated_seq,
+                missing_ledgers: 0,
+                building_validated_tip: false,
+            };
+        }
+
+        let missing_ledgers = if last_good_validated_ledger != 0
+            && last_good_validated_ledger <= validated_seq
         {
-            return SHAMapStoreHealthStatus::Waiting(self.recovery_wait);
-        }
+            runtime.missing_from_complete_ledger_range(last_good_validated_ledger, validated_seq)
+        } else {
+            0
+        };
+        let building_validated_tip =
+            missing_ledgers == 1 && !runtime.has_complete_validated_ledger(validated_seq);
+        let status = if runtime.operating_mode() != SHAMapStoreOperatingMode::Full
+            || runtime.validated_ledger_age() > self.age_threshold
+            || missing_ledgers != 0
+        {
+            // A single missing tip is expected to be filled soon. It remains
+            // unsafe for deletion, but uses a shorter bounded sleep so it is
+            // distinguishable from a historical gap without spinning.
+            let wait = if building_validated_tip {
+                self.recovery_wait / 10
+            } else {
+                self.recovery_wait
+            };
+            SHAMapStoreHealthStatus::Waiting(wait.max(Duration::from_millis(1)))
+        } else {
+            SHAMapStoreHealthStatus::KeepGoing
+        };
 
-        SHAMapStoreHealthStatus::KeepGoing
+        SHAMapStoreHealthCheck {
+            status,
+            validated_seq,
+            missing_ledgers,
+            building_validated_tip,
+        }
     }
 }
 

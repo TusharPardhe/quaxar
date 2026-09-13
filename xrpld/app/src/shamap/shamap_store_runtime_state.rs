@@ -9,6 +9,13 @@ pub struct SHAMapStoreRuntimeState {
     pub working: bool,
     pub stop: bool,
     pub healthy: bool,
+    /// Highest validated sequence whose complete-ledger range passed the
+    /// online-delete health check. A gap below this value remains blocking
+    /// until it is repaired; it must not be advanced by a failed check.
+    pub last_good_validated_ledger: u32,
+    /// Latest validated sequence at which the health check succeeded. This
+    /// anchors the bounded recovery circuit breaker for one rotation attempt.
+    pub last_successful_health_check: u32,
     pub queued_ledger: Option<Arc<Ledger>>,
     pub saved_state: SHAMapStoreSavedState,
 }
@@ -21,6 +28,8 @@ impl Default for SHAMapStoreRuntimeState {
             working: false,
             stop: false,
             healthy: true,
+            last_good_validated_ledger: 0,
+            last_successful_health_check: 0,
             queued_ledger: None,
             saved_state: SHAMapStoreSavedState::default(),
         }

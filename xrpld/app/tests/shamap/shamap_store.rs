@@ -123,6 +123,7 @@ fn shamap_store_config_and_owner_state_match_current_rust_boundary() {
             delete_interval: 256,
             advisory_delete: true,
             delete_batch: 500,
+            max_waiting_ledgers: 256,
             ..SHAMapStoreConfig::default()
         }
     );

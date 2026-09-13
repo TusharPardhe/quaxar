@@ -21,10 +21,10 @@ pub fn run_shamap_store_worker_step(
     run_shamap_store_worker_step_with_policy_refresh(store, runtime, state_db, |_| {})
 }
 
-/// Run one maintenance step, refreshing live policy immediately before the
-/// destructive online-delete boundary. The component uses this variant after
-/// detaching a private worker snapshot, so an RPC policy update made while a
-/// health wait is in progress cannot be bypassed by stale snapshot state.
+/// Run one maintenance step, refreshing live advisory-delete policy immediately
+/// before the destructive boundary. A health failure or circuit-breaker expiry
+/// abandons only this snapshot; `last_rotated` is never persisted until the
+/// backend swap completes.
 pub fn run_shamap_store_worker_step_with_policy_refresh<F>(
     store: &mut SHAMapStore,
     runtime: &mut dyn SHAMapStoreComponentRuntime,
@@ -58,13 +58,11 @@ where
         return Ok(None);
     };
     let validated_seq = validated_ledger.header().seq;
-
     let previous_last_rotated = store.get_last_rotated();
     let health_policy = SHAMapStoreHealthPolicy {
         age_threshold: store.config().age_threshold,
         recovery_wait: store.config().recovery_wait,
     };
-
     let step = runloop_step(
         validated_seq,
         previous_last_rotated,
@@ -75,127 +73,111 @@ where
 
     if previous_last_rotated == 0 {
         let last_rotated = store.initialize_last_rotated(validated_seq);
+        // The first subsequent eligible attempt establishes its own
+        // last-success anchor; initialization is not a successful rotation
+        // health check.
+        store.set_online_delete_health_progress(validated_seq, 0);
         persist_last_rotated(state_db, last_rotated)?;
-        store.finish_rendezvous();
-        return Ok(Some(SHAMapStoreWorkerStep {
-            runloop: step,
-            rotated: false,
-            stopped: false,
-            minimum_online: store.minimum_online(runtime),
-        }));
+        return Ok(Some(finish_step(store, runtime, step, false, false)));
     }
-
     if !step.decision.ready_to_rotate {
-        store.finish_rendezvous();
-        return Ok(Some(SHAMapStoreWorkerStep {
-            runloop: step,
-            rotated: false,
-            stopped: false,
-            minimum_online: store.minimum_online(runtime),
-        }));
+        return Ok(Some(finish_step(store, runtime, step, false, false)));
     }
 
-    if wait_for_health_or_stop(&health_policy, runtime, &should_stop)
-        == SHAMapStoreHealthStatus::Stopping
-    {
-        store.finish_rendezvous();
-        return Ok(Some(SHAMapStoreWorkerStep {
-            runloop: step,
-            rotated: false,
-            stopped: true,
-            minimum_online: store.minimum_online(runtime),
-        }));
+    let (last_good, _) = store.online_delete_health_progress();
+    // Health progress is process-local, while `last_rotated` is durable. On
+    // restart seed the first complete-range check at the durable boundary so
+    // an old gap between that boundary and the validated tip cannot be
+    // skipped merely because no prior worker snapshot exists.
+    let last_good = if last_good == 0 {
+        previous_last_rotated
+    } else {
+        last_good
+    };
+    store.set_online_delete_health_progress(last_good, 0);
+    match wait_for_health_or_stop(&health_policy, store, runtime, validated_seq, &should_stop) {
+        SHAMapStoreHealthStatus::KeepGoing => {}
+        SHAMapStoreHealthStatus::Stopping => {
+            return Ok(Some(finish_step(store, runtime, step, false, true)));
+        }
+        SHAMapStoreHealthStatus::Expired
+        | SHAMapStoreHealthStatus::Disconnected
+        | SHAMapStoreHealthStatus::Waiting(_) => {
+            return Ok(Some(finish_step(store, runtime, step, false, false)));
+        }
     }
 
+    // Policy may have changed while recovery waited. Recheck it before any
+    // destructive work begins.
     refresh_policy(store);
     if !store
         .rotation_decision(validated_seq, SHAMapStoreHealthStatus::KeepGoing)
         .ready_to_rotate
     {
-        store.finish_rendezvous();
-        return Ok(Some(SHAMapStoreWorkerStep {
-            runloop: step,
-            rotated: false,
-            stopped: false,
-            minimum_online: store.minimum_online(runtime),
-        }));
+        return Ok(Some(finish_step(store, runtime, step, false, false)));
     }
 
+    if !checkpoint_allows(&health_policy, store, runtime, validated_seq, &should_stop) {
+        let stopped = checkpoint_stopped(runtime, &should_stop);
+        return Ok(Some(finish_step(store, runtime, step, false, stopped)));
+    }
+
+    // `clear_prior` deletes old ledger state, so its health check must be the
+    // immediately preceding operation.
     store.note_rotation_boundary(previous_last_rotated);
     runtime.clear_prior(previous_last_rotated)?;
-    if wait_for_health_or_stop(&health_policy, runtime, &should_stop)
-        == SHAMapStoreHealthStatus::Stopping
-    {
-        store.finish_rendezvous();
-        return Ok(Some(SHAMapStoreWorkerStep {
-            runloop: step,
-            rotated: false,
-            stopped: true,
-            minimum_online: store.minimum_online(runtime),
-        }));
-    }
 
+    // Copying a validated map writes into the rotating backend. Do not start
+    // it from a stale health observation.
+    if !checkpoint_allows(&health_policy, store, runtime, validated_seq, &should_stop) {
+        let stopped = checkpoint_stopped(runtime, &should_stop);
+        return Ok(Some(finish_step(store, runtime, step, false, stopped)));
+    }
     match runtime.copy_validated_ledger(Arc::clone(&validated_ledger), health_policy)? {
         SHAMapStoreCopyDisposition::Completed { .. } => {}
         SHAMapStoreCopyDisposition::Stopped { .. } => {
-            store.finish_rendezvous();
-            return Ok(Some(SHAMapStoreWorkerStep {
-                runloop: step,
-                rotated: false,
-                stopped: true,
-                minimum_online: store.minimum_online(runtime),
-            }));
+            let stopped = checkpoint_stopped(runtime, &should_stop);
+            return Ok(Some(finish_step(store, runtime, step, false, stopped)));
         }
         SHAMapStoreCopyDisposition::MissingNode { .. } => {
-            store.finish_rendezvous();
-            return Ok(Some(SHAMapStoreWorkerStep {
-                runloop: step,
-                rotated: false,
-                stopped: false,
-                minimum_online: store.minimum_online(runtime),
-            }));
+            return Ok(Some(finish_step(store, runtime, step, false, false)));
         }
     }
-    if wait_for_health_or_stop(&health_policy, runtime, &should_stop)
-        == SHAMapStoreHealthStatus::Stopping
-    {
-        store.finish_rendezvous();
-        return Ok(Some(SHAMapStoreWorkerStep {
-            runloop: step,
-            rotated: false,
-            stopped: true,
-            minimum_online: store.minimum_online(runtime),
-        }));
-    }
 
+    // Do not open the archive-read exposure window once a fresh checkpoint
+    // has rejected this snapshot.
+    if !checkpoint_allows(&health_policy, store, runtime, validated_seq, &should_stop) {
+        let stopped = checkpoint_stopped(runtime, &should_stop);
+        return Ok(Some(finish_step(store, runtime, step, false, stopped)));
+    }
     let _rotation_window = runtime.begin_rotation_window()?;
+
+    // Cache freshening is another copy-to-writable stage.
+    if !checkpoint_allows(&health_policy, store, runtime, validated_seq, &should_stop) {
+        let stopped = checkpoint_stopped(runtime, &should_stop);
+        return Ok(Some(finish_step(store, runtime, step, false, stopped)));
+    }
     runtime.freshen_caches()?;
-    if wait_for_health_or_stop(&health_policy, runtime, &should_stop)
-        == SHAMapStoreHealthStatus::Stopping
-    {
-        store.finish_rendezvous();
-        return Ok(Some(SHAMapStoreWorkerStep {
-            runloop: step,
-            rotated: false,
-            stopped: true,
-            minimum_online: store.minimum_online(runtime),
-        }));
-    }
 
+    if !checkpoint_allows(&health_policy, store, runtime, validated_seq, &should_stop) {
+        let stopped = checkpoint_stopped(runtime, &should_stop);
+        return Ok(Some(finish_step(store, runtime, step, false, stopped)));
+    }
     runtime.prepare_rotation()?;
-    runtime.clear_caches(validated_seq)?;
-    if wait_for_health_or_stop(&health_policy, runtime, &should_stop)
-        == SHAMapStoreHealthStatus::Stopping
-    {
-        store.finish_rendezvous();
-        return Ok(Some(SHAMapStoreWorkerStep {
-            runloop: step,
-            rotated: false,
-            stopped: true,
-            minimum_online: store.minimum_online(runtime),
-        }));
-    }
 
+    // Clearing caches invalidates resident state, so check directly before it.
+    if !checkpoint_allows(&health_policy, store, runtime, validated_seq, &should_stop) {
+        let stopped = checkpoint_stopped(runtime, &should_stop);
+        return Ok(Some(finish_step(store, runtime, step, false, stopped)));
+    }
+    runtime.clear_caches(validated_seq)?;
+
+    // The backend swap changes the durable store topology. A disconnect or
+    // gap after the cache clear abandons before that boundary advances.
+    if !checkpoint_allows(&health_policy, store, runtime, validated_seq, &should_stop) {
+        let stopped = checkpoint_stopped(runtime, &should_stop);
+        return Ok(Some(finish_step(store, runtime, step, false, stopped)));
+    }
     let (writable_db, archive_db) = runtime.rotate_backends()?;
     let next_state = SHAMapStoreSavedState {
         writable_db: if writable_db.is_empty() {
@@ -212,20 +194,48 @@ where
     };
     persist_state(state_db, &next_state)?;
     store.set_saved_state(next_state);
-    runtime.clear_caches(validated_seq)?;
-    store.finish_rendezvous();
 
-    Ok(Some(SHAMapStoreWorkerStep {
-        runloop: step,
-        rotated: true,
-        stopped: false,
-        minimum_online: store.minimum_online(runtime),
-    }))
+    // This is deliberately a fresh health observation immediately before the
+    // final cache clear. Once the backends are swapped and the state is
+    // durable, that clear is the only allowed disconnected/gapped completion:
+    // abandoning it would leave a completed rotation with stale caches.
+    let _post_commit_health = health_policy.evaluate_with_progress(
+        runtime,
+        store.online_delete_health_progress().0,
+        validated_seq,
+    );
+    runtime.clear_caches(validated_seq)?;
+    Ok(Some(finish_step(store, runtime, step, true, false)))
+}
+
+fn checkpoint_allows<S>(
+    policy: &SHAMapStoreHealthPolicy,
+    store: &mut SHAMapStore,
+    runtime: &mut dyn SHAMapStoreComponentRuntime,
+    fallback_validated_seq: u32,
+    should_stop: &S,
+) -> bool
+where
+    S: Fn() -> bool,
+{
+    matches!(
+        wait_for_health_or_stop(policy, store, runtime, fallback_validated_seq, should_stop),
+        SHAMapStoreHealthStatus::KeepGoing
+    )
+}
+
+fn checkpoint_stopped<S>(runtime: &dyn SHAMapStoreComponentRuntime, should_stop: &S) -> bool
+where
+    S: Fn() -> bool,
+{
+    should_stop() || runtime.is_stopping()
 }
 
 fn wait_for_health_or_stop<S>(
     policy: &SHAMapStoreHealthPolicy,
+    store: &mut SHAMapStore,
     runtime: &mut dyn SHAMapStoreComponentRuntime,
+    fallback_validated_seq: u32,
     should_stop: &S,
 ) -> SHAMapStoreHealthStatus
 where
@@ -235,10 +245,64 @@ where
         if should_stop() {
             return SHAMapStoreHealthStatus::Stopping;
         }
-        match policy.evaluate(runtime) {
-            SHAMapStoreHealthStatus::Waiting(duration) => runtime.sleep(duration),
-            status => return status,
+        let (last_good, last_success) = store.online_delete_health_progress();
+        let health = policy.evaluate_with_progress(runtime, last_good, fallback_validated_seq);
+        match health.status {
+            SHAMapStoreHealthStatus::Stopping => return SHAMapStoreHealthStatus::Stopping,
+            SHAMapStoreHealthStatus::KeepGoing => {
+                let last_success = if last_success == 0 {
+                    health.validated_seq
+                } else {
+                    last_success
+                };
+                let circuit_breaker =
+                    last_success.saturating_add(store.config().max_waiting_ledgers);
+                if health.validated_seq >= circuit_breaker {
+                    return SHAMapStoreHealthStatus::Expired;
+                }
+                // Do not advance last-good on a failed check: that is what
+                // keeps an older gap blocking even as newer ledgers arrive.
+                store.set_online_delete_health_progress(
+                    last_good.max(health.validated_seq),
+                    health.validated_seq,
+                );
+                return SHAMapStoreHealthStatus::KeepGoing;
+            }
+            SHAMapStoreHealthStatus::Waiting(duration) => {
+                let last_success = if last_success == 0 {
+                    health.validated_seq
+                } else {
+                    last_success
+                };
+                if health.validated_seq
+                    >= last_success.saturating_add(store.config().max_waiting_ledgers)
+                {
+                    return SHAMapStoreHealthStatus::Expired;
+                }
+                store.set_online_delete_health_progress(last_good, last_success);
+                runtime.sleep(duration);
+            }
+            SHAMapStoreHealthStatus::Expired => return SHAMapStoreHealthStatus::Expired,
+            SHAMapStoreHealthStatus::Disconnected => {
+                return SHAMapStoreHealthStatus::Disconnected;
+            }
         }
+    }
+}
+
+fn finish_step(
+    store: &mut SHAMapStore,
+    runtime: &dyn SHAMapStoreComponentRuntime,
+    step: SHAMapStoreRunLoopStep,
+    rotated: bool,
+    stopped: bool,
+) -> SHAMapStoreWorkerStep {
+    store.finish_rendezvous();
+    SHAMapStoreWorkerStep {
+        runloop: step,
+        rotated,
+        stopped,
+        minimum_online: store.minimum_online(runtime),
     }
 }
 

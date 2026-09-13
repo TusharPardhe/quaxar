@@ -237,6 +237,28 @@ impl AppLedgerMasterRuntime {
         }
     }
 
+    /// Return the number of unavailable ledgers in an inclusive range from one
+    /// mutex-synchronized LedgerMaster complete-range snapshot. This avoids a
+    /// per-sequence lock/read loop in online-delete health checks.
+    pub fn missing_from_complete_ledger_range(&self, first: u32, last: u32) -> usize {
+        if first > last {
+            return 0;
+        }
+        let complete = self.ledger_master.complete_ledgers();
+        let present = complete
+            .intervals()
+            .iter()
+            .filter_map(|interval| {
+                let first_present = interval.first().max(first);
+                let last_present = interval.last().min(last);
+                (first_present <= last_present)
+                    .then(|| u64::from(last_present) - u64::from(first_present) + 1)
+            })
+            .sum::<u64>();
+        let total = u64::from(last) - u64::from(first) + 1;
+        usize::try_from(total.saturating_sub(present)).unwrap_or(usize::MAX)
+    }
+
     pub fn check_accept(&self, hash: Uint256, seq: u32) -> bool {
         if seq <= self.ledger_master.valid_ledger_seq() {
             return false;

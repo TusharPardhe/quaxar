@@ -372,7 +372,12 @@ impl AppNetworkOpsRuntime {
                     tx.set_status(TransStatus::INVALID);
                     tx.set_result(Ter::TEM_BAD_SIGNATURE);
                 });
-                let _ = self.hash_router.set_flags(txid, HashRouterFlags::BAD);
+                // A post-fix role signature can be invalid against a pre-fix
+                // validated ledger yet valid against the activating open ledger.
+                // Do not permanently poison it before the amendment is active.
+                if should_cache_bad_signature(sttx.as_ref(), &rules) {
+                    let _ = self.hash_router.set_flags(txid, HashRouterFlags::BAD);
+                }
                 false
             }
         };
@@ -1047,7 +1052,16 @@ fn validity_facts(transaction: &STTx) -> CheckValidityFacts {
         txn_signature_present: transaction.is_field_present(txn_signature),
         signing_pub_key_empty: transaction.get_signing_pub_key().is_empty(),
         signers_present: transaction.is_field_present(signers),
+        alternate_signature_present: transaction
+            .is_field_present(get_field_by_symbol("sfCounterpartySignature"))
+            || transaction.is_field_present(get_field_by_symbol("sfSponsorSignature")),
     }
+}
+
+fn should_cache_bad_signature(transaction: &STTx, rules: &Rules) -> bool {
+    rules.enabled(&protocol::fix_cleanup_3_4_0())
+        || (!transaction.is_field_present(get_field_by_symbol("sfCounterpartySignature"))
+            && !transaction.is_field_present(get_field_by_symbol("sfSponsorSignature")))
 }
 
 fn pending_transaction(
@@ -1952,4 +1966,24 @@ mod tests {
         );
         assert_eq!(fail_hard_report.final_status, TransStatus::NEW);
     }
+}
+
+#[test]
+fn role_signature_bad_results_are_not_permanently_cached_before_fix_activation() {
+    let mut role_signature = STTx::new(protocol::TxType::LOAN_SET, |_| {});
+    role_signature.peek_field_object(get_field_by_symbol("sfCounterpartySignature"));
+    assert!(!should_cache_bad_signature(
+        &role_signature,
+        &protocol::Rules::default()
+    ));
+    assert!(should_cache_bad_signature(
+        &role_signature,
+        &protocol::Rules::new([protocol::fix_cleanup_3_4_0()])
+    ));
+
+    let ordinary = STTx::new(protocol::TxType::PAYMENT, |_| {});
+    assert!(should_cache_bad_signature(
+        &ordinary,
+        &protocol::Rules::default()
+    ));
 }
