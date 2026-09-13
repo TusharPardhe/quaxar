@@ -17,6 +17,28 @@ fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
 }
 
+fn smart_escrow_fields_are_disabled(
+    sttx: &STTx,
+    txn_type: TxType,
+    rules: &protocol::Rules,
+) -> bool {
+    let feature = protocol::feature_smart_escrow();
+    let smart_escrow_enabled = rules.enabled(&feature)
+        && protocol::registered_feature(&feature)
+            .is_some_and(protocol::registered_feature_supported);
+    !smart_escrow_enabled
+        && match txn_type {
+            TxType::ESCROW_CREATE => ["sfBytecode", "sfData"]
+                .into_iter()
+                .any(|field| sttx.is_field_present(sf(field))),
+            TxType::ESCROW_FINISH => sttx.is_field_present(sf("sfGas")),
+            TxType::FEE => ["sfGasLimit", "sfBytecodeSizeLimit", "sfGasPrice"]
+                .into_iter()
+                .any(|field| sttx.is_field_present(sf(field))),
+            _ => false,
+        }
+}
+
 fn decoded_amendments_entry(sle: &STLedgerEntry) -> protocol::DecodedAmendmentsEntry {
     let amendments = sle
         .is_field_present(sf("sfAmendments"))
@@ -386,6 +408,13 @@ fn amm_withdraw_asset<V: ledger::ApplyView>(
 /// non-XRP pool asset, reserve capacity is checked if the withdrawing account
 /// does not yet have the corresponding holding. IOU accountSend creates the
 /// trust line; MPT accountSend requires us to create the MPToken first.
+fn amm_clawback_ignores_recipient_reserve(
+    rules: &protocol::Rules,
+    clawback_issuer: Option<AccountID>,
+) -> bool {
+    clawback_issuer.is_some() && rules.enabled(&protocol::feature_id("fixCleanup3_4_0"))
+}
+
 fn amm_prepare_withdraw_holding<V: ledger::ApplyView>(
     view: &mut V,
     sttx: &STTx,
@@ -425,29 +454,29 @@ fn amm_prepare_withdraw_holding<V: ledger::ApplyView>(
         return Ter::TES_SUCCESS;
     }
 
-    let account_sle = match view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
-    {
-        Ok(Some(sle)) => sle,
-        Ok(None) => return Ter::TEC_INTERNAL,
-        Err(_) => return Ter::TEF_BAD_LEDGER,
-    };
-    let owner_count = ledger::reserve_owner_count(&account_sle, 0);
-    let reserve = if owner_count < 2 {
-        0_i64
-    } else {
-        let reserve = ledger::effective_account_reserve(view.fees(), &account_sle, 1, 0);
-        let Ok(reserve) = i64::try_from(reserve) else {
-            return Ter::TEF_BAD_LEDGER;
+    let ignore_reserve = amm_clawback_ignores_recipient_reserve(&view.rules(), clawback_issuer);
+    if !ignore_reserve {
+        let account_sle =
+            match view.peek(protocol::account_keylet(Uint160::from_void(account.data()))) {
+                Ok(Some(sle)) => sle,
+                Ok(None) => return Ter::TEC_INTERNAL,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            };
+        let owner_count = ledger::reserve_owner_count(&account_sle, 0);
+        let reserve = if owner_count < 2 {
+            0_i64
+        } else {
+            let reserve = ledger::effective_account_reserve(view.fees(), &account_sle, 1, 0);
+            let Ok(reserve) = i64::try_from(reserve) else {
+                return Ter::TEF_BAD_LEDGER;
+            };
+            reserve
         };
-        reserve
-    };
-    let current_balance = account_sle.get_field_amount(sf("sfBalance")).xrp();
-    let adjusted_balance = match asset {
-        Asset::Issue(_) => std::cmp::max(prior_balance, current_balance),
-        Asset::MPTIssue(_) => prior_balance,
-    };
-    if adjusted_balance.drops() < reserve {
-        return Ter::TEC_INSUFFICIENT_RESERVE;
+        let current_balance = account_sle.get_field_amount(sf("sfBalance")).xrp();
+        let adjusted_balance = std::cmp::max(prior_balance, current_balance);
+        if adjusted_balance.drops() < reserve {
+            return Ter::TEC_INSUFFICIENT_RESERVE;
+        }
     }
 
     if let Asset::MPTIssue(issue) = asset {
@@ -529,6 +558,16 @@ fn amm_clawback_lp_tokens(
     )
 }
 
+fn amm_clawback_full_withdraw_required(
+    rules: &protocol::Rules,
+    computed_lp_tokens: &STAmount,
+    holder_lp_tokens: &STAmount,
+) -> bool {
+    computed_lp_tokens > holder_lp_tokens
+        || (rules.enabled(&protocol::feature_id("fixCleanup3_4_0"))
+            && computed_lp_tokens == holder_lp_tokens)
+}
+
 fn amm_clawback_math(
     amount: Option<&STAmount>,
     pool1: &STAmount,
@@ -566,7 +605,7 @@ fn amm_clawback_math(
         / ledger::amm_helpers::stamount_as_number(pool1);
     let lp_tokens = amm_clawback_lp_tokens(lp_total, frac, RoundingMode::TowardsZero)
         .ok_or(Ter::TEC_INTERNAL)?;
-    if lp_tokens > *holder_lp {
+    if amm_clawback_full_withdraw_required(&rules, &lp_tokens, holder_lp) {
         return full_withdraw(holder_lp);
     }
 
@@ -883,14 +922,16 @@ fn escrow_mpt_unlock_amounts<V: ledger::ApplyView>(
             .rules()
             .enabled(&protocol::feature_id("fixCleanup3_4_0"))
         {
-            protocol::mpt_amount::mul_ratio(
+            // MPTs are integral, so round the delivered amount down and
+            // charge any fractional transfer fee to the escrowed amount.
+            let net = protocol::mpt_amount::mul_ratio(
                 amount.mpt(),
                 protocol::PARITY_RATE.value,
                 rate.value,
                 false,
             )
-            .map(|net| STAmount::from_mpt_amount(sf("sfAmount"), net, issue))
-            .map_err(|_| Ter::TEC_INTERNAL)?
+            .map_err(|_| Ter::TEC_INTERNAL)?;
+            STAmount::from_mpt_amount(sf("sfAmount"), net, issue)
         } else {
             protocol::divide_round(amount, rate, true)
         };
@@ -2571,6 +2612,10 @@ pub fn handle_real_dispatch<V: ledger::ApplyView>(
     txn_type: TxType,
     pre_fee_balance_drops: Option<i64>,
 ) -> Ter {
+    if smart_escrow_fields_are_disabled(sttx, txn_type, &view.rules()) {
+        return Ter::TEM_DISABLED;
+    }
+
     let tx_hash = sttx.get_hash(protocol::HashPrefix::TransactionId);
     tracing::trace!(target: "tx", tx_type = %format!("{:?}", txn_type), hash = %tx_hash, "Transaction preflight");
     let result = handle_real_dispatch_inner(view, sttx, txn_type, pre_fee_balance_drops);
@@ -4059,8 +4104,15 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 Ok(None) => return Ter::TEF_INTERNAL,
                 Err(_) => return Ter::TEF_BAD_LEDGER,
             };
-            let sponsor_enabled = view.rules().enabled(&protocol::feature_id("Sponsor"));
-            if sponsor_enabled
+            // Delivery can auto-create a destination holding.  Recycle the
+            // removed escrow's reserve when Sponsor already defines that
+            // ordering, or when fixCleanup3_4_0 extends it to unsponsored
+            // escrows; retain the legacy ordering otherwise.
+            let recycle_reserve = view.rules().enabled(&protocol::feature_id("Sponsor"))
+                || view
+                    .rules()
+                    .enabled(&protocol::feature_id("fixCleanup3_4_0"));
+            if recycle_reserve
                 && ledger::decrease_owner_count_for_object(view, &owner_sle, &escrow_sle, 1)
                     .is_err()
             {
@@ -4203,7 +4255,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 }
             }
 
-            if !sponsor_enabled {
+            if !recycle_reserve {
                 let current_owner = match view.peek(owner_keylet) {
                     Ok(Some(owner_sle)) => owner_sle,
                     _ => return Ter::TEF_BAD_LEDGER,
@@ -4274,6 +4326,25 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 Ok(None) => return Ter::TEF_INTERNAL,
                 Err(_) => return Ter::TEF_BAD_LEDGER,
             };
+            let recycle_reserve = view
+                .rules()
+                .enabled(&protocol::feature_id("fixCleanup3_4_0"));
+            if recycle_reserve
+                && ledger::decrease_owner_count_for_object(view, &owner_sle, &escrow_sle, 1)
+                    .is_err()
+            {
+                return Ter::TEF_BAD_LEDGER;
+            }
+            // The early decrement replaces the AccountRoot. Re-read before an
+            // XRP credit so that update retains the recycled owner count.
+            let owner_sle = if recycle_reserve {
+                match view.peek(owner_keylet) {
+                    Ok(Some(owner_sle)) => owner_sle,
+                    _ => return Ter::TEF_BAD_LEDGER,
+                }
+            } else {
+                owner_sle
+            };
             let amount = escrow_sle.get_field_amount(sf("sfAmount"));
             if amount.native() {
                 let balance = owner_sle.get_field_amount(sf("sfBalance")).xrp().drops();
@@ -4297,6 +4368,25 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             } else {
                 match amount.asset() {
                     protocol::Asset::Issue(issue) => {
+                        // Returning an IOU can recreate the owner's deleted
+                        // trust line.  Check its prospective reserve before
+                        // issue_iou mutates directories; cleanup has already
+                        // released the escrow's reserve above.
+                        let line_keylet =
+                            protocol::line(escrow_owner, issue.account, issue.currency);
+                        let line_missing = match view.peek(line_keylet) {
+                            Ok(line) => line.is_none(),
+                            Err(_) => return Ter::TEF_BAD_LEDGER,
+                        };
+                        if line_missing {
+                            let required =
+                                ledger::effective_account_reserve(view.fees(), &owner_sle, 1, 0)
+                                    as i64;
+                            if owner_sle.get_field_amount(sf("sfBalance")).xrp().drops() < required
+                            {
+                                return Ter::TEC_NO_LINE_INSUF_RESERVE;
+                            }
+                        }
                         let result = ledger::ripple_state_helpers::issue_iou(
                             view,
                             &escrow_owner,
@@ -4385,14 +4475,16 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     return Ter::TEF_BAD_LEDGER;
                 }
             }
-            let current_owner = match view.peek(owner_keylet) {
-                Ok(Some(owner_sle)) => owner_sle,
-                _ => return Ter::TEF_BAD_LEDGER,
-            };
-            if ledger::decrease_owner_count_for_object(view, &current_owner, &escrow_sle, 1)
-                .is_err()
-            {
-                return Ter::TEF_BAD_LEDGER;
+            if !recycle_reserve {
+                let current_owner = match view.peek(owner_keylet) {
+                    Ok(Some(owner_sle)) => owner_sle,
+                    _ => return Ter::TEF_BAD_LEDGER,
+                };
+                if ledger::decrease_owner_count_for_object(view, &current_owner, &escrow_sle, 1)
+                    .is_err()
+                {
+                    return Ter::TEF_BAD_LEDGER;
+                }
             }
             if view.erase(escrow_sle).is_err() {
                 return Ter::TEF_BAD_LEDGER;
@@ -8597,6 +8689,39 @@ fn close_channel<V: ledger::ApplyView>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amm_clawback_reserve_bypass_is_cleanup_gated_and_clawback_only() {
+        let issuer = AccountID::from_array([0xA1; 20]);
+        let legacy = protocol::Rules::new(std::iter::empty());
+        let cleanup = protocol::Rules::new([protocol::feature_id("fixCleanup3_4_0")]);
+
+        assert!(!amm_clawback_ignores_recipient_reserve(
+            &legacy,
+            Some(issuer)
+        ));
+        assert!(!amm_clawback_ignores_recipient_reserve(&cleanup, None));
+        assert!(amm_clawback_ignores_recipient_reserve(
+            &cleanup,
+            Some(issuer)
+        ));
+    }
+
+    #[test]
+    fn amm_clawback_exact_lp_equality_is_full_withdraw_only_after_cleanup() {
+        let held = STAmount::from_xrp_amount(XRPAmount::from_drops(10));
+        let less = STAmount::from_xrp_amount(XRPAmount::from_drops(9));
+        let greater = STAmount::from_xrp_amount(XRPAmount::from_drops(11));
+        let legacy = protocol::Rules::new(std::iter::empty());
+        let cleanup = protocol::Rules::new([protocol::feature_id("fixCleanup3_4_0")]);
+
+        assert!(!amm_clawback_full_withdraw_required(&legacy, &held, &held));
+        assert!(amm_clawback_full_withdraw_required(&cleanup, &held, &held));
+        assert!(!amm_clawback_full_withdraw_required(&cleanup, &less, &held));
+        assert!(amm_clawback_full_withdraw_required(
+            &legacy, &greater, &held
+        ));
+    }
 
     #[test]
     fn amm_clawback_balance_reads_follow_pinned_amendment_order() {

@@ -427,16 +427,29 @@ pub fn apply_loan_broker_cover_withdraw<V: ApplyView>(
             {
                 return Ter::TEC_DST_TAG_NEEDED;
             }
-            // C++ parity: DepositPreauth check
+            // C++ parity: DepositPreauth check. CredentialIDs select the
+            // credential-based preauth key; otherwise retain account preauth.
             if dst_sle.is_flag(lsfDepositAuth) {
-                let preauth_keylet = deposit_preauth_keylet(
-                    Uint160::from_void(destination.data()),
-                    Uint160::from_void(account.data()),
-                );
-                match view.peek(preauth_keylet) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => return Ter::TEC_NO_PERMISSION,
-                    Err(_) => return Ter::TEF_BAD_LEDGER,
+                let authorization = if sttx.is_field_present(sf("sfCredentialIDs")) {
+                    ledger::credential_helpers::authorized_deposit_preauth(
+                        view,
+                        &sttx.get_field_v256(sf("sfCredentialIDs")),
+                        &destination,
+                    )
+                    .unwrap_or(Ter::TEF_BAD_LEDGER)
+                } else {
+                    let preauth_keylet = deposit_preauth_keylet(
+                        Uint160::from_void(destination.data()),
+                        Uint160::from_void(account.data()),
+                    );
+                    match view.peek(preauth_keylet) {
+                        Ok(Some(_)) => Ter::TES_SUCCESS,
+                        Ok(None) => Ter::TEC_NO_PERMISSION,
+                        Err(_) => Ter::TEF_BAD_LEDGER,
+                    }
+                };
+                if authorization != Ter::TES_SUCCESS {
+                    return authorization;
                 }
             }
         }

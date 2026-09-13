@@ -76,6 +76,7 @@ fn mp_token_authorize_preclaim_matches_holder_flow_guards() {
         token_locked_amount_is_zero: true,
         issuance_exists: true,
         single_asset_vault_enabled: false,
+        fix_cleanup_3_4_0_enabled: false,
         token_locked: false,
         confidential_transfer_enabled: false,
         confidential_outstanding_nonzero: false,
@@ -94,6 +95,7 @@ fn mp_token_authorize_preclaim_matches_holder_flow_guards() {
         token_locked_amount_is_zero: true,
         issuance_exists: true,
         single_asset_vault_enabled: false,
+        fix_cleanup_3_4_0_enabled: false,
         token_locked: false,
         confidential_transfer_enabled: false,
         confidential_outstanding_nonzero: false,
@@ -112,6 +114,7 @@ fn mp_token_authorize_preclaim_matches_holder_flow_guards() {
         token_locked_amount_is_zero: true,
         issuance_exists: true,
         single_asset_vault_enabled: true,
+        fix_cleanup_3_4_0_enabled: false,
         token_locked: true,
         confidential_transfer_enabled: false,
         confidential_outstanding_nonzero: false,
@@ -130,6 +133,7 @@ fn mp_token_authorize_preclaim_matches_holder_flow_guards() {
         token_locked_amount_is_zero: true,
         issuance_exists: true,
         single_asset_vault_enabled: false,
+        fix_cleanup_3_4_0_enabled: false,
         token_locked: false,
         confidential_transfer_enabled: false,
         confidential_outstanding_nonzero: false,
@@ -148,6 +152,46 @@ fn mp_token_authorize_preclaim_matches_holder_flow_guards() {
 }
 
 #[test]
+fn mp_token_unauthorize_locked_token_requires_single_asset_vault_or_cleanup_3_4_0() {
+    let locked_unauthorize = MPTokenAuthorizePreclaimFacts {
+        holder_present: false,
+        account_token_exists: true,
+        tx_flags: tfMPTUnauthorize,
+        token_balance_is_zero: true,
+        token_locked_amount_is_zero: true,
+        issuance_exists: true,
+        single_asset_vault_enabled: false,
+        fix_cleanup_3_4_0_enabled: false,
+        token_locked: true,
+        confidential_transfer_enabled: false,
+        confidential_outstanding_nonzero: false,
+        token_has_confidential_balance: false,
+        account_is_issuer: false,
+        holder_account_exists: true,
+        issuance_requires_auth: true,
+        holder_token_exists: true,
+        holder_is_pseudo_account: false,
+    };
+
+    for (single_asset_vault_enabled, fix_cleanup_3_4_0_enabled, expected) in [
+        (false, false, Ter::TES_SUCCESS),
+        (true, false, Ter::TEC_NO_PERMISSION),
+        (false, true, Ter::TEC_NO_PERMISSION),
+        (true, true, Ter::TEC_NO_PERMISSION),
+    ] {
+        assert_eq!(
+            run_mp_token_authorize_preclaim(MPTokenAuthorizePreclaimFacts {
+                single_asset_vault_enabled,
+                fix_cleanup_3_4_0_enabled,
+                ..locked_unauthorize
+            }),
+            expected,
+            "SingleAssetVault={single_asset_vault_enabled}, fixCleanup3_4_0={fix_cleanup_3_4_0_enabled}"
+        );
+    }
+}
+
+#[test]
 fn mp_token_authorize_preclaim_matches_issuer_flow_guards() {
     let no_dst = run_mp_token_authorize_preclaim(MPTokenAuthorizePreclaimFacts {
         holder_present: true,
@@ -157,6 +201,7 @@ fn mp_token_authorize_preclaim_matches_issuer_flow_guards() {
         token_locked_amount_is_zero: true,
         issuance_exists: true,
         single_asset_vault_enabled: false,
+        fix_cleanup_3_4_0_enabled: false,
         token_locked: false,
         confidential_transfer_enabled: false,
         confidential_outstanding_nonzero: false,
@@ -175,6 +220,7 @@ fn mp_token_authorize_preclaim_matches_issuer_flow_guards() {
         token_locked_amount_is_zero: true,
         issuance_exists: true,
         single_asset_vault_enabled: false,
+        fix_cleanup_3_4_0_enabled: false,
         token_locked: false,
         confidential_transfer_enabled: false,
         confidential_outstanding_nonzero: false,
@@ -193,6 +239,7 @@ fn mp_token_authorize_preclaim_matches_issuer_flow_guards() {
         token_locked_amount_is_zero: true,
         issuance_exists: true,
         single_asset_vault_enabled: false,
+        fix_cleanup_3_4_0_enabled: false,
         token_locked: false,
         confidential_transfer_enabled: false,
         confidential_outstanding_nonzero: false,

@@ -1,7 +1,10 @@
 //! the reference implementation parity — vault share/asset conversion math.
 
+use crate::amm_helpers::RelativeDistanceAmount;
 use basics::base_uint::Uint160;
-use basics::number::{NumberParts as RuntimeNumber, RoundingMode, get_mantissa_scale};
+use basics::number::{
+    NumberParts as RuntimeNumber, NumberRoundModeGuard, RoundingMode, get_mantissa_scale,
+};
 use protocol::{
     AccountID, Asset, MPTIssue, STAmount, STLedgerEntry, get_field_by_symbol, make_mpt_id,
     mptoken_keylet_from_mptid, to_amount_from_number,
@@ -235,4 +238,151 @@ pub fn is_sole_shareholder(
     };
 
     Ok(token.get_field_u64(sf("sfMPTAmount")) == outstanding)
+}
+
+/// Return the canonical storage scale for an asset value.
+///
+/// This is rippled's `getAssetsTotalScale` rule: it is intentionally unrelated
+/// to a vault's `sfScale`, which controls share conversion rather than asset
+/// storage precision.
+pub fn asset_scale_from_value(asset: Asset, value: RuntimeNumber) -> i32 {
+    if asset.integral() {
+        0
+    } else {
+        asset
+            .amount(value)
+            .map(|amount| amount.exponent())
+            .unwrap_or(0)
+    }
+}
+
+/// Round a runtime number to a decimal grid without depending on ambient
+/// rounding state. Digits are removed least-significant first, so the final
+/// removed digit is the rounding digit and earlier digits are sticky.
+pub fn round_runtime_to_scale(
+    value: RuntimeNumber,
+    target_scale: i32,
+    rounding: RoundingMode,
+) -> RuntimeNumber {
+    let Ok((mantissa, mut exponent)) = value.external_parts() else {
+        return value;
+    };
+    if mantissa == 0 || exponent >= target_scale {
+        return value;
+    }
+
+    let negative = mantissa < 0;
+    let mut abs = mantissa.unsigned_abs() as u128;
+    let mut removed = Vec::new();
+    while exponent < target_scale {
+        removed.push((abs % 10) as u8);
+        abs /= 10;
+        exponent += 1;
+    }
+    let rounding_digit = removed.last().copied().unwrap_or(0);
+    let sticky = removed
+        .get(..removed.len().saturating_sub(1))
+        .is_some_and(|tail| tail.iter().any(|digit| *digit != 0));
+    let round_up = match rounding {
+        RoundingMode::TowardsZero => false,
+        RoundingMode::Downward => negative && (rounding_digit != 0 || sticky),
+        RoundingMode::Upward => !negative && (rounding_digit != 0 || sticky),
+        RoundingMode::ToNearest => {
+            rounding_digit > 5 || (rounding_digit == 5 && (sticky || ((abs as u64) & 1) == 1))
+        }
+    };
+    if round_up {
+        abs += 1;
+    }
+
+    let signed = if negative { -(abs as i64) } else { abs as i64 };
+    RuntimeNumber::try_from_external_parts(signed, exponent, get_mantissa_scale()).unwrap_or(value)
+}
+
+/// Quantize an asset value at `scale`, matching rippled's `roundToAsset` /
+/// `roundToScale` behavior while isolating callers from ambient rounding mode.
+pub fn round_number_to_asset_with_scale(
+    asset: Asset,
+    value: RuntimeNumber,
+    scale: i32,
+    rounding: RoundingMode,
+) -> RuntimeNumber {
+    if asset.integral() {
+        return round_runtime_to_scale(value, 0, rounding);
+    }
+
+    let _rounding = NumberRoundModeGuard::new(rounding);
+    let Some(value_amount) = asset.amount(value).ok() else {
+        return value;
+    };
+    if value_amount.signum() == 0 || value_amount.exponent() >= scale {
+        return value_amount.as_number();
+    }
+    let reference_mantissa = if value < RuntimeNumber::zero() {
+        -1_000_000_000_000_000_i64
+    } else {
+        1_000_000_000_000_000_i64
+    };
+    let Ok(reference_value) =
+        RuntimeNumber::try_from_external_parts(reference_mantissa, scale, get_mantissa_scale())
+    else {
+        return value;
+    };
+    let Some(reference_amount) = asset.amount(reference_value).ok() else {
+        return value;
+    };
+    (value_amount + reference_amount.clone() - reference_amount).as_number()
+}
+
+/// Clamp a signed Vault asset change to the decimal grid selected by the
+/// posterior `sfAssetsTotal`. The returned amount is always positive and never
+/// exceeds the requested magnitude. A sub-ULP result is `tecPRECISION_LOSS`.
+pub fn clamp_to_assets_total_scale(
+    vault: &STLedgerEntry,
+    delta: &STAmount,
+) -> Result<STAmount, protocol::Ter> {
+    let asset = vault_asset(vault);
+    if delta.asset() != asset {
+        return Err(protocol::Ter::TEC_INTERNAL);
+    }
+    let mut magnitude = delta.clone();
+    if magnitude.negative() {
+        magnitude.negate();
+    }
+    if asset.integral() {
+        return Ok(magnitude);
+    }
+
+    let total = vault_number(vault, "sfAssetsTotal");
+    let delta_number = stamount_as_number(delta);
+    let post_scale = {
+        let _rounding = NumberRoundModeGuard::new(RoundingMode::ToNearest);
+        asset_scale_from_value(asset, total + delta_number)
+    };
+    let actual = if delta.negative() {
+        round_number_to_asset_with_scale(
+            asset,
+            stamount_as_number(&magnitude),
+            post_scale,
+            RoundingMode::Downward,
+        )
+    } else {
+        let _rounding = NumberRoundModeGuard::new(RoundingMode::Downward);
+        let posterior = total + stamount_as_number(&magnitude);
+        let floored =
+            round_number_to_asset_with_scale(asset, posterior, post_scale, RoundingMode::Downward);
+        floored - total
+    };
+    if actual <= RuntimeNumber::zero() {
+        return Err(protocol::Ter::TEC_PRECISION_LOSS);
+    }
+    Ok(number_to_asset_stamount(asset, actual))
+}
+
+/// Canonicalize a runtime number to the asset's normal storage representation.
+pub fn round_number_to_asset(asset: Asset, value: RuntimeNumber) -> RuntimeNumber {
+    asset
+        .amount(value)
+        .map(|amount| amount.as_number())
+        .unwrap_or(value)
 }

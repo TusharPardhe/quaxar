@@ -650,15 +650,37 @@ fn preclaim_payment<V: ReadView>(view: &V, tx: &STTx, apply_flags: ApplyFlags) -
         return Ok(credentials);
     }
     if let Some(domain) = domain_id {
-        if !ledger::permissioned_dex_helpers::account_in_domain(view, &account, &domain)
-            .map_err(|_| view_error())?
+        if view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_4_0"))
         {
-            return Ok(Ter::TEC_NO_PERMISSION);
-        }
-        if !ledger::permissioned_dex_helpers::account_in_domain(view, &destination, &domain)
-            .map_err(|_| view_error())?
-        {
-            return Ok(Ter::TEC_NO_PERMISSION);
+            let Some(domain_sle) = view
+                .read(protocol::permissioned_domain_keylet_from_id(domain))
+                .map_err(|_| view_error())?
+            else {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            };
+            for member in [account, destination] {
+                if domain_sle.get_account_id(sf("sfOwner")) == member {
+                    continue;
+                }
+                let membership = ledger::credential_helpers::valid_domain(view, domain, &member)
+                    .map_err(|_| view_error())?;
+                if membership != Ter::TES_SUCCESS && membership != Ter::TEC_EXPIRED {
+                    return Ok(Ter::TEC_NO_PERMISSION);
+                }
+            }
+        } else {
+            if !ledger::permissioned_dex_helpers::account_in_domain(view, &account, &domain)
+                .map_err(|_| view_error())?
+            {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            }
+            if !ledger::permissioned_dex_helpers::account_in_domain(view, &destination, &domain)
+                .map_err(|_| view_error())?
+            {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            }
         }
     }
     Ok(Ter::TES_SUCCESS)

@@ -47,6 +47,28 @@ pub(super) fn account_send<V: ApplyView>(
     account_send_with_mpt_transfer_waiver(view, sttx, from, to, amount, true)
 }
 
+/// The `tfLoanDefault` settlement is the sole post-fixCleanup3_4_0 operation
+/// which may move the vault asset while its broker/vault legs are frozen or
+/// locked. The invariant resolves and limits that exemption to those legs;
+/// authorization is still independently checked there.
+pub(super) fn account_send_loan_default<V: ApplyView>(
+    view: &mut V,
+    sttx: &STTx,
+    from: &AccountID,
+    to: &AccountID,
+    amount: &STAmount,
+) -> Ter {
+    account_send_with_mpt_transfer_waiver_and_freeze_exemption(
+        view,
+        sttx,
+        from,
+        to,
+        amount,
+        true,
+        view.rules().enabled(&feature_id("fixCleanup3_4_0")),
+    )
+}
+
 /// Send one asset to multiple recipients as one canonical ledger operation.
 ///
 /// This is the lending-only equivalent of rippled's `accountSendMulti`.  In
@@ -348,6 +370,26 @@ pub(super) fn account_send_with_mpt_transfer_waiver<V: ApplyView>(
     amount: &STAmount,
     waive_mpt_can_transfer: bool,
 ) -> Ter {
+    account_send_with_mpt_transfer_waiver_and_freeze_exemption(
+        view,
+        sttx,
+        from,
+        to,
+        amount,
+        waive_mpt_can_transfer,
+        false,
+    )
+}
+
+fn account_send_with_mpt_transfer_waiver_and_freeze_exemption<V: ApplyView>(
+    view: &mut V,
+    sttx: &STTx,
+    from: &AccountID,
+    to: &AccountID,
+    amount: &STAmount,
+    waive_mpt_can_transfer: bool,
+    exempt_mpt_freeze: bool,
+) -> Ter {
     match amount.asset() {
         Asset::Issue(issue) if issue.native() => {
             let from_keylet = account_keylet(to_160(from));
@@ -404,6 +446,7 @@ pub(super) fn account_send_with_mpt_transfer_waiver<V: ApplyView>(
             to,
             amount.mpt().value().unsigned_abs(),
             waive_mpt_can_transfer,
+            exempt_mpt_freeze,
         ),
     }
 }
@@ -474,6 +517,7 @@ pub(super) fn transfer_mpt<V: ApplyView>(
     to: &AccountID,
     amount: u64,
     waive_can_transfer: bool,
+    exempt_from_freeze: bool,
 ) -> Ter {
     if amount == 0 || from == to {
         return Ter::TES_SUCCESS;
@@ -486,7 +530,7 @@ pub(super) fn transfer_mpt<V: ApplyView>(
         Ok(frozen) => frozen,
         Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    if from_frozen || to_frozen {
+    if !exempt_from_freeze && (from_frozen || to_frozen) {
         return Ter::TEC_LOCKED;
     }
     if !waive_can_transfer {
@@ -515,15 +559,28 @@ pub(super) fn transfer_mpt<V: ApplyView>(
     }
 
     if *to != issuer {
-        let prior_balance = match view.peek(account_keylet(to_160(to))) {
-            Ok(Some(sle)) => sle.get_field_amount(sf("sfBalance")).xrp(),
-            Ok(None) => XRPAmount::new(),
+        let token_keylet = mptoken_keylet_from_mptid(mpt_id, to_160(to));
+        let recipient_has_holding = match view.peek(token_keylet) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
-        let ter =
-            ledger::add_empty_holding_with_tx(view, sttx, to, prior_balance, &Asset::from(issue));
-        if ter != Ter::TES_SUCCESS && ter != Ter::TEC_DUPLICATE {
-            return ter;
+        if !recipient_has_holding {
+            let prior_balance = match view.peek(account_keylet(to_160(to))) {
+                Ok(Some(sle)) => sle.get_field_amount(sf("sfBalance")).xrp(),
+                Ok(None) => XRPAmount::new(),
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            };
+            let ter = ledger::add_empty_holding_with_tx(
+                view,
+                sttx,
+                to,
+                prior_balance,
+                &Asset::from(issue),
+            );
+            if ter != Ter::TES_SUCCESS && ter != Ter::TEC_DUPLICATE {
+                return ter;
+            }
         }
         let balance = match token_balance(view, mpt_id, to) {
             Ok(Some(balance)) => balance,

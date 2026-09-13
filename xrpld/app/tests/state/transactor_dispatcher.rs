@@ -885,6 +885,206 @@ fn credential_create_tx(account: AccountID, subject: AccountID, credential_type:
     })
 }
 
+struct PermissionedDexPaymentFixture {
+    ledger: Ledger,
+    tx: STTx,
+    source_credential: Keylet,
+    destination_credential: Option<Keylet>,
+}
+
+fn permissioned_dex_payment_fixture(
+    source_expired: bool,
+    destination_expired: Option<bool>,
+    destination_subject_directory: bool,
+) -> PermissionedDexPaymentFixture {
+    let issuer = sample_account(0xB1);
+    let source = sample_account(0xB2);
+    let destination = sample_account(0xB3);
+    let credential_type = b"payment-pdex";
+    let source_credential = credential_keylet(source, issuer, credential_type);
+    let destination_credential =
+        destination_expired.map(|_| credential_keylet(destination, issuer, credential_type));
+    let domain = permissioned_domain_entry(issuer, 1, 0, &[(issuer, credential_type)]);
+    let domain_id = domain.key().to_owned();
+    let expiration = |expired| Some(if expired { 99 } else { 101 });
+
+    let mut issuer_children = vec![source_credential.key];
+    if let Some(credential) = destination_credential {
+        issuer_children.push(credential.key);
+    }
+    let mut entries = vec![
+        account_root(issuer, 1, 0),
+        account_root(source, 1, 0),
+        account_root(destination, u32::from(destination_credential.is_some()), 0),
+        owner_dir_root_with_children(issuer, issuer_children),
+        owner_dir_root(source, source_credential.key),
+        credential_entry(
+            source,
+            issuer,
+            credential_type,
+            0,
+            Some(0),
+            protocol::lsfAccepted,
+            expiration(source_expired),
+        ),
+        domain,
+    ];
+    if let (Some(expired), Some(credential)) = (destination_expired, destination_credential) {
+        if destination_subject_directory {
+            entries.push(owner_dir_root(destination, credential.key));
+        }
+        entries.push(credential_entry(
+            destination,
+            issuer,
+            credential_type,
+            0,
+            Some(0),
+            protocol::lsfAccepted,
+            expiration(expired),
+        ));
+    }
+
+    let mut ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 1,
+            parent_close_time: 100,
+            ..LedgerHeader::default()
+        },
+        entries,
+    );
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("PermissionedDEX"),
+        protocol::fix_cleanup_3_1_3(),
+        protocol::fix_cleanup_3_4_0(),
+    ]));
+    let mut tx = direct_xrp_payment_tx(source, destination, 100, 10);
+    tx.set_field_h256(sf("sfDomainID"), domain_id);
+
+    PermissionedDexPaymentFixture {
+        ledger,
+        tx,
+        source_credential,
+        destination_credential,
+    }
+}
+
+fn assert_credential_present<V: ReadView>(view: &V, credential: Keylet, expected: bool) {
+    assert_eq!(
+        view.read(credential)
+            .expect("credential read should succeed")
+            .is_some(),
+        expected,
+        "credential presence must match the Payment cleanup result"
+    );
+}
+
+#[test]
+fn permissioned_dex_payment_source_expired_preclaim_then_apply_cleanup() {
+    let fixture = permissioned_dex_payment_fixture(true, Some(false), true);
+    let simulated = ApplyViewImpl::new(Arc::new(fixture.ledger.clone()), ApplyFlags::NONE);
+    assert_eq!(
+        app::state::read_view_preclaim::run_read_view_preclaim(
+            &simulated,
+            &fixture.tx,
+            TxType::PAYMENT,
+            ApplyFlags::NONE,
+        ),
+        Some(Ter::TES_SUCCESS),
+        "preclaim must admit source expiration so apply can clean it"
+    );
+    assert_credential_present(&simulated, fixture.source_credential, true);
+
+    let mut view = ApplyViewImpl::new(Arc::new(fixture.ledger), ApplyFlags::NONE);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &fixture.tx, TxType::PAYMENT),
+        Ter::TEC_EXPIRED
+    );
+    assert_credential_present(&view, fixture.source_credential, false);
+    assert_credential_present(
+        &view,
+        fixture
+            .destination_credential
+            .expect("destination credential"),
+        true,
+    );
+}
+
+#[test]
+fn permissioned_dex_payment_destination_expired_cleanup() {
+    let fixture = permissioned_dex_payment_fixture(false, Some(true), true);
+    let mut view = ApplyViewImpl::new(Arc::new(fixture.ledger), ApplyFlags::NONE);
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &fixture.tx, TxType::PAYMENT),
+        Ter::TEC_EXPIRED
+    );
+    assert_credential_present(&view, fixture.source_credential, true);
+    assert_credential_present(
+        &view,
+        fixture
+            .destination_credential
+            .expect("destination credential"),
+        false,
+    );
+}
+
+#[test]
+fn permissioned_dex_payment_both_expired_cleanup_in_source_destination_order() {
+    let fixture = permissioned_dex_payment_fixture(true, Some(true), true);
+    let mut view = ApplyViewImpl::new(Arc::new(fixture.ledger), ApplyFlags::NONE);
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &fixture.tx, TxType::PAYMENT),
+        Ter::TEC_EXPIRED
+    );
+    assert_credential_present(&view, fixture.source_credential, false);
+    assert_credential_present(
+        &view,
+        fixture
+            .destination_credential
+            .expect("destination credential"),
+        false,
+    );
+}
+
+#[test]
+fn permissioned_dex_payment_expired_plus_destination_auth_error_stops_in_preclaim() {
+    let fixture = permissioned_dex_payment_fixture(true, None, false);
+    let view = ApplyViewImpl::new(Arc::new(fixture.ledger), ApplyFlags::NONE);
+
+    assert_eq!(
+        app::state::read_view_preclaim::run_read_view_preclaim(
+            &view,
+            &fixture.tx,
+            TxType::PAYMENT,
+            ApplyFlags::NONE,
+        ),
+        Some(Ter::TEC_NO_PERMISSION),
+        "source expiration is suppressed, then destination authorization is checked"
+    );
+    assert_credential_present(&view, fixture.source_credential, true);
+}
+
+#[test]
+fn permissioned_dex_payment_cleanup_is_atomic_when_later_destination_cleanup_fails() {
+    // The source deletion is valid, but the destination's accepted credential
+    // lacks its subject directory. Payment still selects the source's
+    // tecEXPIRED exactly as rippled does; the staged child must roll back both
+    // cleanup mutations rather than replaying just the earlier source delete.
+    let fixture = permissioned_dex_payment_fixture(true, Some(true), false);
+    let destination_credential = fixture
+        .destination_credential
+        .expect("destination credential");
+    let mut view = ApplyViewImpl::new(Arc::new(fixture.ledger), ApplyFlags::NONE);
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &fixture.tx, TxType::PAYMENT),
+        Ter::TEC_EXPIRED
+    );
+    assert_credential_present(&view, fixture.source_credential, true);
+    assert_credential_present(&view, destination_credential, true);
+}
+
 fn credential_accept_tx(subject: AccountID, issuer: AccountID, credential_type: &[u8]) -> STTx {
     let credential_type = credential_type.to_vec();
     STTx::new(TxType::CREDENTIAL_ACCEPT, move |object| {
@@ -1303,7 +1503,12 @@ fn escrow_finish_mpt_cleanup_3_4_rounds_transfer_fee_down() {
                 escrow.clone(),
             ],
         );
-        let mut features = vec![protocol::feature_id("fixTokenEscrowV1")];
+        // Upstream exercises both cleanup paths with MPTokensV2 enabled;
+        // the legacy path still requests directed upward rounding.
+        let mut features = vec![
+            protocol::feature_id("fixTokenEscrowV1"),
+            protocol::feature_id("MPTokensV2"),
+        ];
         if cleanup_3_4 {
             features.push(protocol::feature_id("fixCleanup3_4_0"));
         }
@@ -1341,6 +1546,11 @@ fn escrow_finish_mpt_cleanup_3_4_rounds_transfer_fee_down() {
             ))
             .expect("owner token read")
             .expect("owner token");
+        assert_eq!(
+            owner_token.get_field_u64(sf("sfMPTAmount")),
+            90_000,
+            "finishing escrow must debit the locked amount, not the sender holding"
+        );
         assert!(!owner_token.is_field_present(sf("sfLockedAmount")));
         let issuance = ledger
             .peek(protocol::mpt_issuance_keylet_from_mptid(issuance_id))
@@ -1350,6 +1560,12 @@ fn escrow_finish_mpt_cleanup_3_4_rounds_transfer_fee_down() {
         assert_eq!(
             issuance.get_field_u64(sf("sfOutstandingAmount")),
             expected_outstanding
+        );
+        assert_eq!(
+            owner_token.get_field_u64(sf("sfMPTAmount"))
+                + destination_token.get_field_u64(sf("sfMPTAmount")),
+            expected_outstanding,
+            "post-fee issuance outstanding amount must equal the two holder balances"
         );
         assert!(ledger.peek(escrow_keylet).expect("escrow read").is_none());
     }
@@ -4819,6 +5035,136 @@ fn fee_pseudo_transaction_xrp_fees_replaces_legacy_fields_and_persists() {
 }
 
 #[test]
+fn smart_escrow_escrow_create_fields_are_disabled_without_mutation() {
+    let account = sample_account(0xD1);
+    let destination = sample_account(0xD2);
+    let mut view = ApplyViewImpl::new(
+        Arc::new(empty_ledger(vec![
+            account_root(account, 0, 0),
+            account_root(destination, 0, 0),
+        ])),
+        ApplyFlags::NONE,
+    );
+    let tx = STTx::new(TxType::ESCROW_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_account_id(sf("sfDestination"), destination);
+        tx.set_field_amount(sf("sfAmount"), test_xrp(1));
+        tx.set_field_u32(sf("sfFinishAfter"), 1);
+        tx.set_field_vl(sf("sfBytecode"), &[0]);
+        tx.set_field_amount(sf("sfFee"), test_xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let before = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("source read")
+        .expect("source exists")
+        .get_serializer()
+        .data()
+        .to_vec();
+
+    assert_eq!(
+        tx::validate_sttx_semantic_preflight_with_rules(&tx, &protocol::Rules::default()),
+        Ter::TEM_DISABLED
+    );
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::ESCROW_CREATE, None),
+        Ter::TEM_DISABLED
+    );
+    assert_eq!(
+        view.read(account_keylet(raw_account_id(account)))
+            .expect("source read")
+            .expect("source exists")
+            .get_serializer()
+            .data()
+            .to_vec(),
+        before
+    );
+}
+
+#[test]
+fn smart_escrow_escrow_finish_fields_are_disabled_without_mutation() {
+    let account = sample_account(0xD3);
+    let mut view = ApplyViewImpl::new(
+        Arc::new(empty_ledger(vec![account_root(account, 0, 0)])),
+        ApplyFlags::NONE,
+    );
+    let tx = STTx::new(TxType::ESCROW_FINISH, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_u32(sf("sfGas"), 1);
+        tx.set_field_amount(sf("sfFee"), test_xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let before = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("account read")
+        .expect("account exists")
+        .get_serializer()
+        .data()
+        .to_vec();
+
+    assert_eq!(
+        tx::validate_sttx_semantic_preflight_with_rules(&tx, &protocol::Rules::default()),
+        Ter::TEM_DISABLED
+    );
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::ESCROW_FINISH, None),
+        Ter::TEM_DISABLED
+    );
+    assert_eq!(
+        view.read(account_keylet(raw_account_id(account)))
+            .expect("account read")
+            .expect("account exists")
+            .get_serializer()
+            .data()
+            .to_vec(),
+        before
+    );
+}
+
+#[test]
+fn smart_escrow_set_fee_fields_are_disabled_without_mutation() {
+    let keylet = protocol::fee_settings_keylet();
+    let mut fee_settings = STLedgerEntry::new(keylet);
+    fee_settings.set_field_u64(sf("sfBaseFee"), 10);
+    fee_settings.set_field_u32(sf("sfReferenceFeeUnits"), 10);
+    fee_settings.set_field_u32(sf("sfReserveBase"), 20);
+    fee_settings.set_field_u32(sf("sfReserveIncrement"), 30);
+    let mut view = ApplyViewImpl::new(Arc::new(empty_ledger(vec![fee_settings])), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::FEE, |tx| {
+        tx.set_field_u64(sf("sfBaseFee"), 11);
+        tx.set_field_u32(sf("sfReferenceFeeUnits"), 11);
+        tx.set_field_u32(sf("sfReserveBase"), 21);
+        tx.set_field_u32(sf("sfReserveIncrement"), 31);
+        tx.set_field_u32(sf("sfGasLimit"), 1);
+    });
+    let before = view
+        .read(keylet)
+        .expect("fee settings read")
+        .expect("fee settings exist")
+        .get_serializer()
+        .data()
+        .to_vec();
+
+    assert_eq!(
+        tx::validate_sttx_semantic_preflight_with_rules(&tx, &protocol::Rules::default()),
+        Ter::TEM_DISABLED
+    );
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::FEE, None),
+        Ter::TEM_DISABLED
+    );
+    assert_eq!(
+        view.read(keylet)
+            .expect("fee settings read")
+            .expect("fee settings exist")
+            .get_serializer()
+            .data()
+            .to_vec(),
+        before
+    );
+}
+
+#[test]
 fn conditional_escrow_create_persists_condition_and_finish_requires_matching_fulfillment() {
     let owner = sample_account(0xE1);
     let destination = sample_account(0xE2);
@@ -5579,13 +5925,18 @@ fn direct_xrp_payment_reserve_only_sponsor_does_not_override_initiator_fee_payer
 #[test]
 fn direct_xrp_payment_rejects_every_registered_pseudo_account_kind() {
     let source = sample_account(0xA3);
-    for (index, discriminator) in ["sfAMMID", "sfVaultID", "sfLoanBrokerID"]
-        .into_iter()
-        .enumerate()
-    {
+    let discriminators = protocol::all_sfields()
+        .iter()
+        .filter(|field| field.should_meta(protocol::SField::S_MD_PSEUDO_ACCOUNT))
+        .collect::<Vec<_>>();
+    assert!(
+        !discriminators.is_empty(),
+        "the protocol metadata must register a pseudo-account discriminator"
+    );
+    for (index, discriminator) in discriminators.into_iter().enumerate() {
         let destination = sample_account(0xA4 + index as u8);
         let mut pseudo = account_root_with_balance(destination, 0, 0, 0);
-        pseudo.set_field_h256(sf(discriminator), sample_uint256(0xB0 + index as u8));
+        pseudo.set_field_h256(discriminator, sample_uint256(0xB0 + index as u8));
         let mut ledger = empty_ledger(vec![account_root_with_balance(source, 0, 0, 1_000), pseudo]);
         ledger.set_fees(Fees {
             base: 10,
@@ -5598,7 +5949,8 @@ fn direct_xrp_payment_rejects_every_registered_pseudo_account_kind() {
         assert_eq!(
             handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000)),
             Ter::TEC_NO_PERMISSION,
-            "{discriminator} must identify a pseudo-account"
+            "{} must identify a pseudo-account",
+            discriminator.symbol_name()
         );
     }
 }
@@ -9391,6 +9743,97 @@ fn loan_broker_set_create_mints_deterministic_pseudo_and_empty_holding() {
         .expect("trust line read should succeed")
         .expect("trust line should exist");
     assert_eq!(trust_line.get_type(), LedgerEntryType::RippleState);
+}
+
+#[test]
+fn loan_broker_set_create_v1_1_requires_closed_vault() {
+    let owner = sample_account(0x69);
+    let vault_pseudo = sample_account(0x6A);
+    let vault_sequence = 8;
+    let vault_id = protocol::vault_keylet(raw_account_id(owner), vault_sequence).key;
+    let broker_keylet = protocol::loan_broker_keylet(raw_account_id(owner), 1);
+    let asset = Asset::Issue(xrp_issue());
+    let tx = loan_broker_set_tx(owner, vault_id, 1);
+    let make_view = |vault_kind: Option<u8>, v1_1: bool| {
+        let mut vault = vault_entry(owner, vault_pseudo, vault_sequence, asset.clone());
+        if let Some(vault_kind) = vault_kind {
+            vault.set_field_u8(get_field_by_symbol("sfVaultKind"), vault_kind);
+        }
+        let mut ledger = empty_ledger(vec![
+            account_root(owner, 0, 0),
+            account_root(vault_pseudo, 0, 0),
+            vault,
+        ]);
+        let mut features = vec![
+            protocol::feature_id("SingleAssetVault"),
+            protocol::feature_id("MPTokensV1"),
+            protocol::feature_id("LendingProtocol"),
+        ];
+        if v1_1 {
+            features.push(protocol::feature_id("LendingProtocolV1_1"));
+        }
+        ledger.set_rules(protocol::Rules::new(features));
+        ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE)
+    };
+
+    let mut legacy = make_view(None, false);
+    assert_eq!(
+        handle_real_dispatch(&mut legacy, &tx, TxType::LOAN_BROKER_SET, Some(1_000_000),),
+        Ter::TES_SUCCESS,
+        "legacy behavior permits broker creation for an open-ended vault"
+    );
+    assert!(
+        legacy
+            .read(broker_keylet)
+            .expect("legacy broker read should succeed")
+            .is_some()
+    );
+
+    let mut v1_1_open = make_view(None, true);
+    assert_eq!(
+        handle_real_dispatch(
+            &mut v1_1_open,
+            &tx,
+            TxType::LOAN_BROKER_SET,
+            Some(1_000_000),
+        ),
+        Ter::TEC_NO_PERMISSION,
+        "LendingProtocolV1_1 rejects a new broker for an open-ended vault"
+    );
+    assert!(
+        v1_1_open
+            .read(broker_keylet)
+            .expect("rejected broker read should succeed")
+            .is_none(),
+        "rejection must occur before broker creation"
+    );
+    assert_eq!(
+        v1_1_open
+            .read(account_keylet(raw_account_id(owner)))
+            .expect("owner read should succeed")
+            .expect("owner should remain")
+            .get_field_u32(get_field_by_symbol("sfOwnerCount")),
+        0,
+        "rejection must not mutate the owner reserve count"
+    );
+
+    let mut v1_1_closed = make_view(Some(1), true);
+    assert_eq!(
+        handle_real_dispatch(
+            &mut v1_1_closed,
+            &tx,
+            TxType::LOAN_BROKER_SET,
+            Some(1_000_000),
+        ),
+        Ter::TES_SUCCESS,
+        "LendingProtocolV1_1 accepts a closed vault"
+    );
+    assert!(
+        v1_1_closed
+            .read(broker_keylet)
+            .expect("closed-vault broker read should succeed")
+            .is_some()
+    );
 }
 
 #[test]
@@ -18093,5 +18536,124 @@ fn amm_clawback_matrix_mpt_exact_thresholds() {
         let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
         let result = dispatch_with_pre_fee_balance(&mut view, &tx, TxType::AMM_CLAWBACK);
         assert_eq!(result, row.expected, "failed on: {}", row.desc);
+    }
+}
+
+#[test]
+fn vault_zero_value_mpt_self_withdraw_holding_is_amendment_gated_in_live_dispatch() {
+    let owner = sample_account(0xE1);
+    let pseudo = sample_account(0xE2);
+    let holder = sample_account(0xE3);
+    let asset_issuer = sample_account(0xE4);
+    let share_id = share_id_for(pseudo, 1);
+    let asset_id = share_id_for(asset_issuer, 9);
+    let asset = Asset::MPTIssue(MPTIssue::new(asset_id));
+    let vault_id = protocol::vault_keylet(raw_account_id(owner), 1).key;
+
+    for cleanup_3_4 in [false, true] {
+        let mut vault = vault_entry_with_share(owner, pseudo, 1, asset, share_id);
+        vault.set_field_number(sf("sfAssetsTotal"), asset_number(asset, 10));
+        vault.set_field_number(sf("sfAssetsAvailable"), asset_number(asset, 0));
+        vault.set_field_number(sf("sfLossUnrealized"), asset_number(asset, 10));
+
+        let mut ledger = empty_ledger(vec![
+            account_root(owner, 0, 0),
+            account_root(pseudo, 0, 0),
+            account_root(holder, 0, 0),
+            account_root(asset_issuer, 0, 0),
+            vault,
+            mpt_issuance_entry(pseudo, 1, 10, MPT_CAN_TRANSFER_FLAG),
+            mptoken_entry(holder, share_id, 2),
+            mpt_issuance_entry(asset_issuer, 9, 0, MPT_CAN_TRANSFER_FLAG),
+        ]);
+        let mut features = vec![
+            protocol::feature_id("SingleAssetVault"),
+            protocol::feature_id("MPTokensV1"),
+        ];
+        if cleanup_3_4 {
+            features.push(protocol::fix_cleanup_3_4_0());
+        }
+        ledger.set_rules(protocol::Rules::new(features));
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let withdraw = vault_withdraw_share_tx(holder, vault_id, share_id, 1);
+
+        assert_eq!(
+            handle_real_dispatch(
+                &mut view,
+                &withdraw,
+                TxType::VAULT_WITHDRAW,
+                Some(1_000_000),
+            ),
+            Ter::TES_SUCCESS,
+            "zero-value self-withdraw must remain a live apply success"
+        );
+        let holding = view
+            .read(protocol::mptoken_keylet_from_mptid(
+                asset_id,
+                raw_account_id(holder),
+            ))
+            .expect("asset holding read");
+        assert_eq!(
+            holding.is_some(),
+            !cleanup_3_4,
+            "fixCleanup3_4_0 must suppress only the empty MPT holding write"
+        );
+    }
+}
+
+#[test]
+fn vault_zero_value_iou_self_withdraw_holding_is_amendment_gated_in_live_dispatch() {
+    let owner = sample_account(0xE5);
+    let pseudo = sample_account(0xE6);
+    let holder = sample_account(0xE7);
+    let asset_issuer = sample_account(0xE8);
+    let issue = Issue::new(currency_from_string("USD"), asset_issuer);
+    let asset = Asset::Issue(issue);
+    let share_id = share_id_for(pseudo, 1);
+    let vault_id = protocol::vault_keylet(raw_account_id(owner), 1).key;
+
+    for cleanup_3_4 in [false, true] {
+        let mut vault = vault_entry_with_share(owner, pseudo, 1, asset, share_id);
+        vault.set_field_number(sf("sfAssetsTotal"), asset_number(asset, 10));
+        vault.set_field_number(sf("sfAssetsAvailable"), asset_number(asset, 0));
+        vault.set_field_number(sf("sfLossUnrealized"), asset_number(asset, 10));
+        let mut ledger = empty_ledger(vec![
+            account_root(owner, 0, 0),
+            account_root(pseudo, 0, 0),
+            account_root(holder, 0, 0),
+            account_root(asset_issuer, 0, protocol::lsfDefaultRipple),
+            vault,
+            mpt_issuance_entry(pseudo, 1, 10, MPT_CAN_TRANSFER_FLAG),
+            mptoken_entry(holder, share_id, 2),
+        ]);
+        let mut features = vec![
+            protocol::feature_id("SingleAssetVault"),
+            protocol::feature_id("MPTokensV1"),
+        ];
+        if cleanup_3_4 {
+            features.push(protocol::fix_cleanup_3_4_0());
+        }
+        ledger.set_rules(protocol::Rules::new(features));
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let withdraw = vault_withdraw_share_tx(holder, vault_id, share_id, 1);
+
+        assert_eq!(
+            handle_real_dispatch(
+                &mut view,
+                &withdraw,
+                TxType::VAULT_WITHDRAW,
+                Some(1_000_000),
+            ),
+            Ter::TES_SUCCESS,
+            "zero-value self-withdraw must remain a live apply success"
+        );
+        let holding = view
+            .read(protocol::line(holder, asset_issuer, issue.currency))
+            .expect("asset trust-line read");
+        assert_eq!(
+            holding.is_some(),
+            !cleanup_3_4,
+            "fixCleanup3_4_0 must suppress only the empty IOU holding write"
+        );
     }
 }

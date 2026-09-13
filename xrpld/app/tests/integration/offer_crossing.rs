@@ -194,7 +194,7 @@ fn offer_create_skips_unauthorized_synthetic_amm() {
             taker_line,
             authorized_taker_line,
         ],
-        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixAMMOverflowOffer"],
+        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2"],
     );
     let mut view = new_view(ledger);
 
@@ -303,7 +303,7 @@ fn unauthorized_synthetic_amm_does_not_block_eligible_clob() {
             taker_line,
             clob_maker_line,
         ],
-        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixAMMOverflowOffer"],
+        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2"],
     );
     let mut view = new_view(ledger);
 

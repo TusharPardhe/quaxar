@@ -663,16 +663,40 @@ fn execute_mpt_endpoint<V: ApplyView>(
     } else {
         protocol::PARITY_RATE
     };
+    // Reverse evaluation quotes a net destination amount. Cap it before the
+    // rounded-up fee conversion, otherwise a representable net MPT amount can
+    // produce an unrepresentable gross input at the issuance boundary.
+    let requested_output = if reverse && issuing_with_fee {
+        protocol::mpt_amount::mul_ratio(
+            protocol::MPTAmount::from_value(protocol::MAX_MP_TOKEN_AMOUNT),
+            protocol::QUALITY_ONE,
+            rate.value,
+            false,
+        )
+        .map_err(|_| Ter::TEC_INTERNAL)?
+        .value()
+        .min(requested_value)
+    } else {
+        requested_value
+    };
 
     let (mut input_value, mut output_value) = if reverse {
         let input = if issuing_with_fee {
-            protocol::multiply_round(requested, rate, true)
-                .mpt()
-                .value()
+            protocol::multiply_round(
+                &STAmount::from_mpt_amount(
+                    sf("sfAmount"),
+                    protocol::MPTAmount::from_value(requested_output),
+                    *issue,
+                ),
+                rate,
+                true,
+            )
+            .mpt()
+            .value()
         } else {
-            requested_value
+            requested_output
         };
-        (input, requested_value)
+        (input, requested_output)
     } else {
         let output = if issuing_with_fee {
             protocol::divide_round(requested, rate, false).mpt().value()

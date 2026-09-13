@@ -10,6 +10,12 @@ mod application_root;
 #[path = "invariants.rs"]
 mod invariants;
 
+#[path = "issue_56_escrow_sponsorship.rs"]
+mod issue_56_escrow_sponsorship;
+
+#[path = "lending/mod.rs"]
+mod lending;
+
 #[path = "manifest.rs"]
 mod manifest;
 

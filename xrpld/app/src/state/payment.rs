@@ -215,6 +215,64 @@ pub fn do_payment<V: ledger::ApplyView>(
         }
     }
 
+    // fixCleanup3_4_0 permits an expired domain credential through preclaim
+    // exclusively so doApply can remove it. Match Payment.cpp: read the
+    // domain once, evaluate source before destination, reuse the source
+    // result for a self-payment, then select the source TER before the
+    // destination TER. Stage all deletion work in a child sandbox: an error
+    // in a later member check or cleanup must not leak an earlier deletion
+    // into Transactor::reset's persistent tecEXPIRED cleanup.
+    if sttx.is_field_present(sf("sfDomainID"))
+        && view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_4_0"))
+    {
+        let domain_id = sttx.get_field_h256(sf("sfDomainID"));
+        let domain = match view.read(protocol::permissioned_domain_keylet_from_id(domain_id)) {
+            Ok(Some(domain)) => domain,
+            Ok(None) => return Ter::TEC_INTERNAL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        let domain_owner = domain.get_account_id(sf("sfOwner"));
+        let mut cleanup = ledger::FlowSandbox::new(view);
+        let cleanup_for = |cleanup: &mut ledger::FlowSandbox<'_, V>, member: &AccountID| {
+            if domain_owner == *member {
+                Ter::TES_SUCCESS
+            } else {
+                ledger::credential_helpers::verify_valid_domain(cleanup, member, domain_id)
+                    .unwrap_or(Ter::TEF_BAD_LEDGER)
+            }
+        };
+
+        let source_result = cleanup_for(&mut cleanup, &account);
+        let destination_result = if account == dst_account_id {
+            source_result
+        } else {
+            cleanup_for(&mut cleanup, &dst_account_id)
+        };
+        let result = if source_result != Ter::TES_SUCCESS {
+            source_result
+        } else {
+            destination_result
+        };
+        let all_cleanup_results_are_success_or_expired = [source_result, destination_result]
+            .into_iter()
+            .all(|ter| ter == Ter::TES_SUCCESS || ter == Ter::TEC_EXPIRED);
+
+        if result != Ter::TES_SUCCESS {
+            // Only tecEXPIRED is eligible for the transaction shell's durable
+            // credential replay. A non-expired failure observed after an earlier
+            // expiration leaves this child unapplied, preserving rollback
+            // atomicity while retaining Payment.cpp's selected TER.
+            if result == Ter::TEC_EXPIRED && all_cleanup_results_are_success_or_expired {
+                if cleanup.apply().is_err() {
+                    return Ter::TEF_BAD_LEDGER;
+                }
+            }
+            return result;
+        }
+    }
+
     // Determine if this is a "ripple" payment (IOU/path) or direct XRP.
     // In C++, MPTokensV1 direct payments bypass RippleCalc and are handled by
     // Payment::doApply's direct-MPT branch. MPTokensV2 routes through the

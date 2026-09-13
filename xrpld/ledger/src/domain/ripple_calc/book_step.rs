@@ -493,6 +493,17 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             offers_consumed += 1;
             continue;
         }
+        if let Some(domain) = book.domain
+            && (!offer_sle.is_field_present(sf("sfDomainID"))
+                || offer_sle.get_field_h256(sf("sfDomainID")) != domain)
+        {
+            return BookStepResult {
+                amount_in: total_in,
+                amount_out: total_out,
+                offers_consumed,
+                ter: Ter::TEF_INTERNAL,
+            };
+        }
         if offer_sle.is_field_present(sf("sfDomainID"))
             && (!view.rules().enabled(&protocol::fix_cleanup_3_3_0()) || book.domain.is_some())
         {
@@ -646,18 +657,12 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                         target: "ledger",
                         "[book_step] AMM pool product invariant failed"
                     );
-                    if amm_invariant_failure_is_fatal(
-                        false,
-                        view.rules()
-                            .enabled(&protocol::feature_id("fixAMMOverflowOffer")),
-                    ) {
-                        return BookStepResult {
-                            amount_in: total_in,
-                            amount_out: total_out,
-                            offers_consumed,
-                            ter: Ter::TEC_INVARIANT_FAILED,
-                        };
-                    }
+                    return BookStepResult {
+                        amount_in: total_in,
+                        amount_out: total_out,
+                        offers_consumed,
+                        ter: Ter::TEC_INVARIANT_FAILED,
+                    };
                 }
                 let res = execute_amm_trade(
                     view,
@@ -712,6 +717,17 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 continue;
             }
 
+            if let Some(domain) = book.domain
+                && (!offer_sle.is_field_present(sf("sfDomainID"))
+                    || offer_sle.get_field_h256(sf("sfDomainID")) != domain)
+            {
+                return BookStepResult {
+                    amount_in: total_in,
+                    amount_out: total_out,
+                    offers_consumed,
+                    ter: Ter::TEF_INTERNAL,
+                };
+            }
             if offer_sle.is_field_present(sf("sfDomainID"))
                 && (!view.rules().enabled(&protocol::fix_cleanup_3_3_0()) || book.domain.is_some())
             {
@@ -1203,10 +1219,6 @@ fn amm_offer_invariant_holds(
         )
 }
 
-fn amm_invariant_failure_is_fatal(invariant_holds: bool, fix_enabled: bool) -> bool {
-    !invariant_holds && fix_enabled
-}
-
 fn amm_max_output(pool_out: &STAmount) -> Option<STAmount> {
     let max_out = {
         let _rounding = NumberRoundModeGuard::new(RoundingMode::Downward);
@@ -1222,17 +1234,10 @@ fn amm_max_offer_amounts(
     pool_out: &STAmount,
     trading_fee: u16,
     amm_rounding_enabled: bool,
-    fix_overflow_offer: bool,
 ) -> Option<(STAmount, STAmount)> {
-    if fix_overflow_offer {
-        let out = amm_max_output(pool_out)?;
-        let input = amm_swap_asset_out(pool_in, pool_out, &out, trading_fee, amm_rounding_enabled)?;
-        Some((input, out))
-    } else {
-        let input = protocol::to_max_amount::<STAmount>(pool_in.asset());
-        let out = amm_swap_asset_in(pool_in, pool_out, &input, trading_fee, amm_rounding_enabled)?;
-        Some((input, out))
-    }
+    let out = amm_max_output(pool_out)?;
+    let input = amm_swap_asset_out(pool_in, pool_out, &out, trading_fee, amm_rounding_enabled)?;
+    Some((input, out))
 }
 
 fn amm_trading_fee(
@@ -1538,8 +1543,6 @@ fn get_amm_offer<V: ApplyView>(
             &pool_out_amount,
             trading_fee,
             amm_rounding_enabled,
-            view.rules()
-                .enabled(&protocol::feature_id("fixAMMOverflowOffer")),
         )
     };
     if amm_context.multi_path() {
@@ -2518,41 +2521,23 @@ mod tests {
     }
 
     #[test]
-    fn overflow_offer_amendment_switches_max_offer_shape() {
+    fn max_offer_uses_bounded_output_unconditionally() {
         let (offer, _, _) = canonical_20106714_amm_offer();
-        let legacy = amm_max_offer_amounts(
+        let max_offer = amm_max_offer_amounts(
             &offer.pool_in,
             &offer.pool_out,
             offer.trading_fee,
             offer.amm_rounding_enabled,
-            false,
         )
-        .expect("legacy max offer");
-        let fixed = amm_max_offer_amounts(
-            &offer.pool_in,
-            &offer.pool_out,
-            offer.trading_fee,
-            offer.amm_rounding_enabled,
-            true,
-        )
-        .expect("fixed max offer");
+        .expect("bounded max offer");
         assert_eq!(
-            legacy.0,
-            protocol::to_max_amount::<STAmount>(offer.pool_in.asset())
-        );
-        assert_eq!(
-            fixed.1,
+            max_offer.1,
             amm_max_output(&offer.pool_out).expect("99% output")
         );
-        assert_ne!(legacy, fixed);
-    }
-
-    #[test]
-    fn invariant_failure_is_fatal_only_after_overflow_offer_fix() {
-        assert!(!amm_invariant_failure_is_fatal(false, false));
-        assert!(amm_invariant_failure_is_fatal(false, true));
-        assert!(!amm_invariant_failure_is_fatal(true, false));
-        assert!(!amm_invariant_failure_is_fatal(true, true));
+        assert_ne!(
+            max_offer.0,
+            protocol::to_max_amount::<STAmount>(offer.pool_in.asset())
+        );
     }
 
     #[test]

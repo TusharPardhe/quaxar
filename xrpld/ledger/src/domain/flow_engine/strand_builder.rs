@@ -491,19 +491,24 @@ fn check_direct_freeze<V: ApplyView>(
         return Ter::TER_NO_LINE;
     }
 
-    check_lp_token_freeze(view, src, dst_root.as_deref())
+    check_lp_token_freeze(view, src, dst, dst_root.as_deref())
 }
 
 fn check_lp_token_freeze<V: ApplyView>(
     view: &mut V,
     src: &AccountID,
+    dst: &AccountID,
     dst_root: Option<&protocol::STLedgerEntry>,
 ) -> Ter {
+    let Some(dst_root) = dst_root else {
+        return Ter::TES_SUCCESS;
+    };
+    if !dst_root.is_field_present(sf("sfAMMID")) {
+        return Ter::TES_SUCCESS;
+    }
     if view
         .rules()
         .enabled(&protocol::feature_id("fixFrozenLPTokenTransfer"))
-        && let Some(dst_root) = dst_root
-        && dst_root.is_field_present(sf("sfAMMID"))
     {
         let amm = match read_sle(
             view,
@@ -524,7 +529,14 @@ fn check_lp_token_freeze<V: ApplyView>(
             _ => {}
         }
     }
-    Ter::TES_SUCCESS
+
+    // An LP redemption is a transfer to the AMM issuer. MPTs become AMM pool
+    // assets only with MPTokensV2, so this helper is naturally amendment-safe.
+    match crate::mptoken_helpers::can_transfer_lp_token(view, src, dst, dst) {
+        Ok(Ter::TES_SUCCESS) => Ter::TES_SUCCESS,
+        Ok(ter) => ter,
+        Err(_) => Ter::TEF_BAD_LEDGER,
+    }
 }
 
 fn check_xrp_endpoint_freeze<V: ApplyView>(
@@ -550,7 +562,7 @@ fn check_xrp_endpoint_freeze<V: ApplyView>(
     {
         return Ter::TER_NO_LINE;
     }
-    check_lp_token_freeze(view, &protocol::xrp_account(), root.as_deref())
+    check_lp_token_freeze(view, &protocol::xrp_account(), account, root.as_deref())
 }
 
 fn direct_no_ripple_flag(account: &AccountID, other: &AccountID) -> u32 {

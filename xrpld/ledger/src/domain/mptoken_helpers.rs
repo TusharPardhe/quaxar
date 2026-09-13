@@ -290,6 +290,42 @@ fn can_transfer_mpt_with_depth(
     Ok(Ter::TES_SUCCESS)
 }
 
+/// Check whether an AMM LP token may be transferred between two accounts.
+///
+/// Ordinary IOUs are unaffected. For an AMM issuer, every MPT pool asset must
+/// permit the same transfer; MPT issuers remain exempt through can_transfer_mpt.
+pub fn can_transfer_lp_token(
+    view: &dyn ReadView,
+    from: &AccountID,
+    to: &AccountID,
+    lp_token_issuer: &AccountID,
+) -> Result<Ter, ViewError> {
+    let Some(issuer_root) = view.read(account_keylet(to_uint160(*lp_token_issuer)))? else {
+        return Ok(Ter::TES_SUCCESS);
+    };
+    if !issuer_root.is_field_present(sf("sfAMMID")) {
+        return Ok(Ter::TES_SUCCESS);
+    }
+    let Some(amm) = view.read(protocol::amm_keylet(
+        issuer_root.get_field_h256(sf("sfAMMID")),
+    ))?
+    else {
+        return Ok(Ter::TEC_INTERNAL);
+    };
+    for asset in [
+        amm.get_field_issue(sf("sfAsset")).asset(),
+        amm.get_field_issue(sf("sfAsset2")).asset(),
+    ] {
+        if let Asset::MPTIssue(issue) = asset {
+            let result = can_transfer_mpt(view, &issue, from, to)?;
+            if result != Ter::TES_SUCCESS {
+                return Ok(result);
+            }
+        }
+    }
+    Ok(Ter::TES_SUCCESS)
+}
+
 /// Check if an asset can be traded on the DEX.
 pub fn can_trade(view: &dyn ReadView, asset: &Asset) -> Result<Ter, ViewError> {
     can_trade_with_depth(view, asset, 0)
@@ -375,9 +411,7 @@ pub fn require_auth_mpt_with_type(
         .enabled(&protocol::feature_id("SingleAssetVault"))
         || view.rules().enabled(&protocol::feature_id("MPTokensV2")))
         && let Some(account_root) = view.read(account_key)?
-        && (account_root.is_field_present(sf("sfVaultID"))
-            || account_root.is_field_present(sf("sfLoanBrokerID"))
-            || account_root.is_field_present(sf("sfAMMID")))
+        && crate::is_pseudo_account(&account_root)
     {
         return Ok(Ter::TES_SUCCESS);
     }
