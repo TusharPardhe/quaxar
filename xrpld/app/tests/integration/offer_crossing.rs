@@ -1013,8 +1013,23 @@ fn offer_partial_crossing_bob_smaller() {
     let r2 = handle_real_dispatch(&mut view, &tx2, TxType::OFFER_CREATE, None);
     assert_eq!(r2, Ter::TES_SUCCESS);
 
-    // Alice's offer should still exist (partially filled)
+    // Alice's offer should still exist with exact half principal remaining.
     assert_eq!(get_owner_count(&view, alice), 2); // trust + remaining offer
+    let remaining = view
+        .read(protocol::offer_keylet(acct_id(alice), 1))
+        .expect("read remaining offer")
+        .expect("partially consumed offer");
+    assert_eq!(
+        remaining.get_field_amount(sf("sfTakerPays")).xrp().drops(),
+        500_000_000
+    );
+    assert_eq!(
+        remaining
+            .get_field_amount(sf("sfTakerGets"))
+            .iou()
+            .to_string(),
+        "500"
+    );
 }
 
 /// C++ Offer_test — self-crossing: alice's new offer crosses her old one.
@@ -1304,7 +1319,7 @@ fn offer_ioc_full_crossing_no_remainder() {
     assert_eq!(get_owner_count(&view, bob), 1); // just trust line
 }
 
-/// C++ Offer_test::testTransferRateOffer — crossing with transfer fee.
+/// C++ Offer_test::testTransferRateOffer — exact crossing charge and quality behavior.
 #[test]
 fn offer_crossing_with_transfer_rate() {
     let alice = acct(0x11);
@@ -1312,36 +1327,63 @@ fn offer_crossing_with_transfer_rate() {
     let gw = acct(0x33);
     let usd = usd_currency();
 
-    // gw has transfer rate of 1.25 (25% fee)
+    // gw has transfer rate of 1.25 (25% fee).
     let mut gw_root = account_root(gw, 10_000_000_000, 0, 0);
-    gw_root.set_field_u32(sf("sfTransferRate"), 1_250_000_000); // 1.25
+    gw_root.set_field_u32(sf("sfTransferRate"), 1_250_000_000);
+    // Bob is the low side. Offer crossing must ignore this non-parity QualityIn.
+    let mut bob_line = trust_line(bob, gw, usd, 0, 10_000, 0);
+    bob_line.set_field_u32(sf("sfLowQualityIn"), 600_000_000);
 
     let ledger = build_ledger(vec![
         account_root(alice, 10_000_000_000, 1, 0),
         account_root(bob, 10_000_000_000, 1, 0),
         gw_root,
-        trust_line(alice, gw, usd, 1000, 10000, 0),
-        trust_line(bob, gw, usd, 0, 10000, 0),
+        // Alice owns 1250 and offers 1000. At rate 1.25, crossing charges
+        // all 1250 while Bob receives exactly the 1000 offer principal.
+        trust_line(alice, gw, usd, 1250, 10_000, 0),
+        bob_line,
     ]);
     let mut view = new_view(ledger);
 
-    // Alice: sell 1000 USD for 1B XRP
-    let tx1 = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
-    let r1 = handle_real_dispatch(&mut view, &tx1, TxType::OFFER_CREATE, None);
-    assert_eq!(r1, Ter::TES_SUCCESS);
+    let resting = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &resting, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
 
-    // Bob: buy USD, sell XRP — crossing with transfer fee
-    let tx2 = offer_tx(bob, iou(gw, usd, 1000), xrp(1_000_000_000), 1);
-    let r2 = handle_real_dispatch(&mut view, &tx2, TxType::OFFER_CREATE, None);
-    assert_eq!(r2, Ter::TES_SUCCESS);
+    let crossing = offer_tx(bob, iou(gw, usd, 1000), xrp(1_000_000_000), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &crossing, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
 
-    // With 25% transfer fee, bob should receive less than 1000 USD
-    // or alice should pay more than 1000 USD
-    let alice_owners = get_owner_count(&view, alice);
-    // Crossing should still happen (transfer fee doesn't prevent it)
+    let alice_line = view
+        .read(protocol::line(alice, gw, usd))
+        .expect("read alice line")
+        .expect("alice line");
+    let bob_line = view
+        .read(protocol::line(bob, gw, usd))
+        .expect("read bob line")
+        .expect("bob line");
+    assert_eq!(
+        alice_line
+            .get_field_amount(sf("sfBalance"))
+            .iou()
+            .to_string(),
+        "0",
+        "offer owner pays 1250 to deliver 1000 at rate 1.25"
+    );
+    assert_eq!(
+        bob_line.get_field_amount(sf("sfBalance")).iou().to_string(),
+        "1000",
+        "crossing ignores QualityIn and delivers exact principal"
+    );
+    assert_eq!(get_owner_count(&view, alice), 1);
+    assert_eq!(get_owner_count(&view, bob), 1);
     assert!(
-        alice_owners <= 2,
-        "Alice's offer should be consumed or partially filled"
+        view.read(protocol::offer_keylet(acct_id(alice), 1))
+            .expect("read consumed offer")
+            .is_none()
     );
 }
 
