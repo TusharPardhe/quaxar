@@ -158,7 +158,7 @@ pub fn execute_direct_step<V: ApplyView>(
     }
 
     let (src_q_out, dst_q_in) = if src_debt_dir == DebtDirection::Redeems {
-        qualities_src_redeems(view, src, dst, currency).map_err(|_| Ter::TEF_BAD_LEDGER)?
+        qualities_src_redeems(view, src, dst, currency, None).map_err(|_| Ter::TEF_BAD_LEDGER)?
     } else {
         // reference: prevStepDebtDirection defaults to Issues when no previous step
         qualities_src_issues(view, src, dst, currency, false).map_err(|_| Ter::TEF_BAD_LEDGER)?
@@ -226,10 +226,18 @@ pub fn qualities_src_redeems<V: ApplyView>(
     src: &AccountID,
     dst: &AccountID,
     currency: Currency,
+    previous_line_quality_in: Option<u32>,
 ) -> Result<(u32, u32), ViewError> {
-    let src_q_out = get_quality(view, src, dst, currency, QualityDirection::Out)?;
-    let dst_q_in = get_quality(view, dst, src, currency, QualityDirection::In)?;
-    Ok((src_q_out, dst_q_in))
+    let Some(previous_line_quality_in) = previous_line_quality_in else {
+        // DirectStepI::qualitiesSrcRedeems: the first step never charges a
+        // transfer rate or either trust-line quality.
+        return Ok((protocol::QUALITY_ONE, protocol::QUALITY_ONE));
+    };
+    let own_quality_out = get_quality(view, src, dst, currency, QualityDirection::Out)?;
+    Ok((
+        previous_line_quality_in.max(own_quality_out),
+        protocol::QUALITY_ONE,
+    ))
 }
 
 /// Compute qualities for when source issues (zero/negative balance).
