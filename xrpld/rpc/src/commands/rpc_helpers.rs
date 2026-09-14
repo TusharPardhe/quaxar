@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use app::ledger_to_json::ledger_to_json_tx::insert_all_synthetic_in_json;
 use std::{collections::BTreeMap, sync::Arc};
 
 use basics::{base_uint::Uint256, str_hex::str_hex, string_utilities::to_uint64};
@@ -9,10 +10,11 @@ use ledger::ReadView;
 use protocol::tokens::decode_base58_token_multibyte;
 use protocol::{
     JsonOptions, JsonValue, KeyType, LedgerEntryType, LedgerFormats, PublicKey, STArray, STObject,
-    STParsedJSONObject, STTx, SecretKey, Seed, SerialIter, Serializer, StBase,
-    build_multi_signing_data, derive_public_key, generate_secret_key, get_field_by_name,
-    get_field_by_symbol, is_tec_claim, is_tes_success, jss, parse_base58_account_id,
-    serialize_pay_chan_authorization, sf_generic, sign,
+    STParsedJSONObject, STTx, SecretKey, Seed, SerialIter, Serializer, SignatureRole, StBase,
+    build_multi_signing_data_with_prefix, derive_public_key, generate_secret_key,
+    get_field_by_name, get_field_by_symbol, is_tec_claim, is_tes_success, jss,
+    parse_base58_account_id, serialize_pay_chan_authorization, sf_generic, sign, signature_field,
+    signature_role, signing_prefix,
 };
 
 #[cfg(not(test))]
@@ -147,13 +149,14 @@ pub fn transaction_sign<Runtime: RpcRuntime, Source>(
         );
     }
     let (public_key, secret_key) = keypair_for_signature(params)?;
-    let signature_target = parse_signature_target(params)?;
-    signer_target_object(&mut st_tx, signature_target).set_field_vl(
+    let signing_rules = signing_rules(ctx);
+    let signature_role = parse_signature_target(params)?.unwrap_or(SignatureRole::Transaction);
+    signer_target_object(&mut st_tx, signature_field(signature_role)).set_field_vl(
         get_field_by_symbol("sfSigningPubKey"),
         public_key.as_bytes(),
     );
     st_tx
-        .sign(&public_key, &secret_key, signature_target)
+        .sign_with_role(&public_key, &secret_key, signature_role, &signing_rules)
         .map_err(|_| Status::new(RpcErrorCode::Internal))?;
 
     let mut result = transaction_format_result(&st_tx, ctx.api_version);
@@ -236,14 +239,19 @@ pub fn transaction_sign_for<Runtime: RpcRuntime, Source>(
 
     let mut st_tx = parse_sttx_from_json_value(&tx_json)?;
     let (public_key, secret_key) = keypair_for_signature(params)?;
-    let signature_target = parse_signature_target(params)?;
+    let signing_rules = signing_rules(ctx);
+    let signature_role = parse_signature_target(params)?.unwrap_or(SignatureRole::Transaction);
 
-    let signing_data = build_multi_signing_data(&st_tx.clone_as_object(), signer_account_id);
+    let signing_data = build_multi_signing_data_with_prefix(
+        &st_tx.clone_as_object(),
+        signer_account_id,
+        signing_prefix(signature_role, true, &signing_rules),
+    );
     let signature = sign(&public_key, &secret_key, signing_data.data())
         .map_err(|_| Status::new(RpcErrorCode::Internal))?;
 
     let signing_for_id = st_tx.get_initiator();
-    let mut signers = signer_target_object(&mut st_tx, signature_target)
+    let mut signers = signer_target_object(&mut st_tx, signature_field(signature_role))
         .get_field_array(get_field_by_symbol("sfSigners"))
         .iter()
         .cloned()
@@ -285,7 +293,7 @@ pub fn transaction_sign_for<Runtime: RpcRuntime, Source>(
     for signer in signers {
         signers_array.push_back(signer);
     }
-    signer_target_object(&mut st_tx, signature_target)
+    signer_target_object(&mut st_tx, signature_field(signature_role))
         .set_field_array(get_field_by_symbol("sfSigners"), signers_array);
 
     let mut result = transaction_format_result(&st_tx, ctx.api_version);
@@ -563,15 +571,13 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
                 );
             } else {
                 let mut meta = metadata.get_json(JsonOptions::new(0));
-                if is_tes_success(outcome.result.ter) {
-                    crate::handlers::delivered_amount::insert_delivered_amount(
-                        &mut meta,
-                        outcome.ledger_seq,
-                        Some(outcome.close_time),
-                        tx,
-                        &metadata,
-                    );
-                }
+                insert_all_synthetic_in_json(
+                    &mut meta,
+                    outcome.ledger_seq,
+                    Some(outcome.close_time),
+                    tx,
+                    &metadata,
+                );
                 ret.insert("meta".to_string(), meta);
             }
         } else {
@@ -660,15 +666,13 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
             transaction_meta.add_raw(&mut serializer, result, 0);
 
             let mut meta = transaction_meta.get_json(JsonOptions::new(0));
-            if is_tes_success(result) {
-                crate::handlers::delivered_amount::insert_delivered_amount(
-                    &mut meta,
-                    ledger_seq,
-                    Some(close_time),
-                    tx,
-                    &transaction_meta,
-                );
-            }
+            insert_all_synthetic_in_json(
+                &mut meta,
+                ledger_seq,
+                Some(close_time),
+                tx,
+                &transaction_meta,
+            );
             simulation_meta_blob = Some(hex::encode(serializer.data()));
             ret.insert("meta".to_string(), meta);
         } else {
@@ -924,20 +928,34 @@ fn keypair_for_signature(
     Ok((public_key, secret_key))
 }
 
+fn signing_rules<Runtime: RpcRuntime, Source>(
+    ctx: &RpcRequestContext<'_, Source, Runtime>,
+) -> protocol::Rules {
+    ctx.runtime
+        .app()
+        .map(|app| app.current_open_ledger_rules())
+        .unwrap_or_default()
+}
+
 fn parse_signature_target(
     params: &BTreeMap<String, JsonValue>,
-) -> Result<Option<&'static protocol::SField>, Status> {
+) -> Result<Option<SignatureRole>, Status> {
     let Some(value) = params.get(jss::signature_target) else {
         return Ok(None);
     };
     let JsonValue::String(target_name) = value else {
-        return Err(Status::new(RpcErrorCode::InvalidParams));
+        return Err(Status::with_message(
+            RpcErrorCode::InvalidParams,
+            invalid_field_message(jss::signature_target),
+        ));
     };
     let field = get_field_by_name(target_name);
-    if field.is_invalid() {
-        return Err(Status::new(RpcErrorCode::InvalidParams));
-    }
-    Ok(Some(field))
+    signature_role(field).map(Some).ok_or_else(|| {
+        Status::with_message(
+            RpcErrorCode::InvalidParams,
+            invalid_field_message(jss::signature_target),
+        )
+    })
 }
 
 fn signer_target_object<'a>(

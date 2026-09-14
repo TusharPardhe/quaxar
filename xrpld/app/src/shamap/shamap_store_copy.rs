@@ -102,11 +102,20 @@ pub fn copy_validated_state_map(
         pending.push(node.clone());
         node_count += 1;
 
-        if pending.len() == SHAMAP_STORE_COPY_BATCH_SIZE
-            && let Err(error) = copy_rotation_batch(&mut pending, node_store)
-        {
-            copy_error = Some(error);
-            return false;
+        if pending.len() == SHAMAP_STORE_COPY_BATCH_SIZE {
+            // A full batch writes into the new rotating backend. Refresh
+            // health immediately before that destructive copy boundary.
+            let keep_going = wait_for_health(&health_policy, runtime, |runtime, duration| {
+                runtime.sleep(duration);
+            }) == SHAMapStoreHealthStatus::KeepGoing;
+            if !keep_going {
+                stopped = true;
+                return false;
+            }
+            if let Err(error) = copy_rotation_batch(&mut pending, node_store) {
+                copy_error = Some(error);
+                return false;
+            }
         }
 
         if !node_count.is_multiple_of(SHAMAP_STORE_COPY_CHECK_HEALTH_INTERVAL) {
@@ -115,7 +124,7 @@ pub fn copy_validated_state_map(
 
         let keep_going = wait_for_health(&health_policy, runtime, |runtime, duration| {
             runtime.sleep(duration);
-        }) != SHAMapStoreHealthStatus::Stopping;
+        }) == SHAMapStoreHealthStatus::KeepGoing;
         stopped = !keep_going;
         keep_going
     });
@@ -124,7 +133,16 @@ pub fn copy_validated_state_map(
         return Err(error);
     }
     if !pending.is_empty() {
-        copy_rotation_batch(&mut pending, node_store)?;
+        // The partial tail is still a write batch and needs the same fresh
+        // health gate as a full batch.
+        let keep_going = wait_for_health(&health_policy, runtime, |runtime, duration| {
+            runtime.sleep(duration);
+        }) == SHAMapStoreHealthStatus::KeepGoing;
+        if !keep_going {
+            stopped = true;
+        } else {
+            copy_rotation_batch(&mut pending, node_store)?;
+        }
     }
 
     match visit_result {

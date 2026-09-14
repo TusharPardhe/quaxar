@@ -4,7 +4,7 @@ use basics::{
     base_uint::Uint256,
     number::{NumberParts as RuntimeNumber, RoundingMode},
 };
-use ledger::{has_expired, views::apply_view::ApplyView};
+use ledger::views::apply_view::ApplyView;
 use protocol::{AccountID, Asset, STLedgerEntry, STTx, TenthBips16, TenthBips32, Ter, feature_id};
 
 use super::common::*;
@@ -178,6 +178,46 @@ impl tx::LoanPayDoApplyVault for LpVaultView {
     fn associate_asset(&mut self, _asset: &Asset) {}
 }
 
+fn raw_xrp_balance<V: ApplyView>(view: &mut V, account: &AccountID) -> Result<i64, Ter> {
+    view.peek(protocol::account_keylet(to_160(account)))
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?
+        .map(|sle| sle.get_field_amount(sf("sfBalance")).xrp().drops())
+        .ok_or(Ter::TEF_BAD_LEDGER)
+}
+
+fn xrp_conservation_balance<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    use_raw_balance: bool,
+) -> Result<i64, Ter> {
+    if use_raw_balance {
+        return raw_xrp_balance(view, account);
+    }
+    ledger::apply_view::xrp_liquid(view, account, 0)
+        .map(|amount| amount.drops())
+        .map_err(|_| Ter::TEF_BAD_LEDGER)
+}
+
+/// LoanPay's XRP conservation check reads raw AccountRoot balances only after
+/// fixCleanup3_4_0. `accountHolds` subtracts reserves, which makes a valid
+/// payment to a vault/broker pseudo-account look non-conserving whenever a
+/// payee sits below reserve. Pre-amendment behavior deliberately retains that
+/// reserve-clamped liquidity sampling.
+fn xrp_balances_conserved<V: ApplyView>(
+    view: &mut V,
+    accounts: &[AccountID],
+    before: &[i64],
+    use_raw_balance: bool,
+) -> Result<bool, Ter> {
+    let mut after_total = 0_i128;
+    let mut before_total = 0_i128;
+    for (account, balance_before) in accounts.iter().zip(before) {
+        before_total += i128::from(*balance_before);
+        after_total += i128::from(xrp_conservation_balance(view, account, use_raw_balance)?);
+    }
+    Ok(before_total == after_total)
+}
+
 pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     if !view
         .rules()
@@ -214,6 +254,10 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         Ok(Some(sle)) => sle,
         _ => return Ter::TEC_NO_ENTRY,
     };
+
+    if payment_type != tx::LoanPayPaymentType::Late && loan_payment_is_late(view, &loan_sle) {
+        return Ter::TEC_EXPIRED;
+    }
 
     if payment_type == tx::LoanPayPaymentType::Overpayment
         && !loan_sle.is_flag(protocol::lsfLoanOverpayment)
@@ -428,7 +472,7 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
             let next_payment_due_date = loan_sle
                 .is_field_present(sf("sfNextPaymentDueDate"))
                 .then(|| loan_sle.get_field_u32(sf("sfNextPaymentDueDate")));
-            if !has_expired(view, next_payment_due_date) {
+            if !loan_payment_is_late(view, &loan_sle) {
                 return Ter::TEC_TOO_SOON;
             }
             let components = compute_loan_pay_periodic_components(
@@ -757,6 +801,26 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     else {
         return Ter::TEC_INTERNAL;
     };
+    let use_raw_xrp_conservation = view.rules().enabled(&feature_id("fixCleanup3_4_0"));
+    let xrp_conservation_accounts = if vault_asset.native() {
+        let mut accounts = vec![borrower, vault_view.pseudo];
+        if !accounts.contains(&broker_payee) {
+            accounts.push(broker_payee);
+        }
+        let mut balances = Vec::with_capacity(accounts.len());
+        for account in &accounts {
+            balances.push(
+                match xrp_conservation_balance(view, account, use_raw_xrp_conservation) {
+                    Ok(balance) => balance,
+                    Err(ter) => return ter,
+                },
+            );
+        }
+        Some((accounts, balances))
+    } else {
+        None
+    };
+
     let transfer = account_send_multi(
         view,
         &borrower,
@@ -765,6 +829,14 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     );
     if !protocol::is_tes_success(transfer) {
         return transfer;
+    }
+    if let Some((accounts, balances)) = xrp_conservation_accounts
+        && !matches!(
+            xrp_balances_conserved(view, &accounts, &balances, use_raw_xrp_conservation),
+            Ok(true)
+        )
+    {
+        return Ter::TEF_INTERNAL;
     }
 
     // Persist loan update
@@ -1036,7 +1108,7 @@ mod loan_pay_effective_amount_tests {
     }
 
     #[test]
-    fn loan_set_debt_total_update_uses_vault_scale_after_cleanup_3_2_0() {
+    fn loan_set_debt_total_update_uses_canonical_assets_total_scale_after_cleanup_3_2_0() {
         let asset = usd_asset();
         let vault_total = RuntimeNumber::try_from_external_parts(100, -2, get_mantissa_scale())
             .expect("valid vault total");
@@ -1049,8 +1121,8 @@ mod loan_pay_effective_amount_tests {
 
         assert_eq!(
             debt_total,
-            RuntimeNumber::try_from_external_parts(123, -2, get_mantissa_scale())
-                .expect("post-fix vault-scale debt total")
+            RuntimeNumber::try_from_external_parts(12345, -4, get_mantissa_scale())
+                .expect("canonical AssetsTotal-scale debt total")
         );
     }
 }

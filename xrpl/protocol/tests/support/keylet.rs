@@ -468,20 +468,20 @@ fn protocol_mpt_book_base_uses_mpt_id() {
 
     assert_eq!(
         xrp_to_mpt_base,
-        Uint256::from_hex("58697165BA86D1CA08E7FEB8BD33CD54B5C78C9C1F55A5B00000000000000000")
-            .expect("rippled untagged XRP-to-MPT book base"),
+        Uint256::from_hex("1A71C92B1B2636E6FC3837B38BEC342875471D1B6E64EFD80000000000000000")
+            .expect("rippled tagged XRP-to-MPT book base"),
     );
     assert_eq!(
         mpt_to_xrp_base,
-        Uint256::from_hex("1AADB7B2F5542B102201E34B8C00ACEB390F9A9514DCFD2D0000000000000000")
-            .expect("rippled untagged MPT-to-XRP book base"),
+        Uint256::from_hex("4BDF01687D5A3F1DBB505B59AA0D7D23FD8B23810283AF860000000000000000")
+            .expect("rippled tagged MPT-to-XRP book base"),
     );
     assert_ne!(xrp_to_mpt_base, mpt_to_xrp_base);
     assert_eq!(book_keylet(xrp_to_mpt).key, xrp_to_mpt_base);
 }
 
 #[test]
-fn protocol_mpt_book_base_preserves_rippled_mixed_asset_collision_preimages() {
+fn protocol_mpt_book_base_discriminates_mixed_asset_preimages() {
     let issuer_b =
         AccountID::from_hex("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA00000007").expect("issuer b");
     let issuer_a =
@@ -505,14 +505,14 @@ fn protocol_mpt_book_base_preserves_rippled_mixed_asset_collision_preimages() {
     );
 
     assert_ne!(book_a, book_b);
-    // `Indexes.cpp::getBookBase` serializes these mixed assets without a
-    // discriminator, so deliberately identical byte preimages share a key.
+    // The discriminator prefixes the otherwise colliding fixed-width
+    // preimages, so distinct mixed books get distinct BookDir keylets.
     assert_eq!(
         get_book_base(book_a),
-        Uint256::from_hex("187DF97835E57EB98311484E712BADC97D87C3BF70A63ECF0000000000000000")
-            .expect("rippled untagged mixed-asset book base"),
+        Uint256::from_hex("EA614167D8DC91E150462F521BA19E7439841C3EE557791E0000000000000000")
+            .expect("rippled tagged Issue-to-MPT book base"),
     );
-    assert_eq!(get_book_base(book_a), get_book_base(book_b));
+    assert_ne!(get_book_base(book_a), get_book_base(book_b));
 }
 
 #[test]

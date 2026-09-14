@@ -110,6 +110,7 @@ impl StepAmount {
 pub struct StepAmounts {
     pub input: StepAmount,
     pub output: StepAmount,
+    direct_src_to_dst: Option<StepAmount>,
     pub offers_used: u32,
     pub inactive: bool,
 }
@@ -119,15 +120,22 @@ impl StepAmounts {
         Self {
             input: StepAmount::new(input),
             output: StepAmount::new(output),
+            direct_src_to_dst: None,
             offers_used: 0,
             inactive: false,
         }
     }
 
-    fn direct(input: STAmount, output: STAmount, currency: protocol::Currency) -> Self {
+    fn direct(
+        input: STAmount,
+        src_to_dst: STAmount,
+        output: STAmount,
+        currency: protocol::Currency,
+    ) -> Self {
         Self {
             input: StepAmount::with_currency(input, currency),
             output: StepAmount::with_currency(output, currency),
+            direct_src_to_dst: Some(StepAmount::with_currency(src_to_dst, currency)),
             offers_used: 0,
             inactive: false,
         }
@@ -137,6 +145,7 @@ impl StepAmounts {
         Self {
             input: StepAmount::new(input),
             output: StepAmount::new(output),
+            direct_src_to_dst: None,
             offers_used,
             inactive: offers_used >= crate::domain::ripple_calc::book_step::MAX_OFFERS_TO_CONSUME,
         }
@@ -160,11 +169,14 @@ pub struct StepContext<'a> {
     pub offer_usage: Rc<Cell<u32>>,
     /// Debt direction immediately before the currently executing step.
     pub previous_redeems: Rc<Cell<bool>>,
+    /// `lineQualityIn()` of the immediately preceding step.
+    pub previous_line_quality_in: Rc<Cell<u32>>,
     /// `BookStep::checkMPTDEX` distinguishes an issuer-starting strand, a
     /// preceding BookStep, and a preceding endpoint/direct step.  Debt
     /// direction alone cannot recover that consensus-significant shape.
     pub has_previous_step: Rc<Cell<bool>>,
     pub previous_step_is_book: Rc<Cell<bool>>,
+    pub is_last_step: Rc<Cell<bool>>,
 }
 
 /// The Rust counterpart to rippled's `Step`.  Both directions mutate only the
@@ -198,15 +210,21 @@ impl FlowStep for StepKind {
                 if !requested_out.matches_currency(*currency) {
                     return Err(Ter::TEF_INTERNAL);
                 }
-                let (input, output) = execute_direct_fwd(
+                let (input, src_to_dst, output) = execute_direct_step(
                     view,
                     src,
                     dst,
                     requested_out.amount(),
-                    context.strand_dst,
+                    context.offer_crossing != OfferCrossing::No,
                     context.offer_crossing != OfferCrossing::No && dst == context.strand_dst,
+                    context.previous_redeems.get(),
+                    context.previous_line_quality_in.get(),
+                    context.has_previous_step.get(),
+                    context.is_last_step.get(),
+                    DirectRunDirection::Reverse,
+                    None,
                 )?;
-                Ok(StepAmounts::direct(input, output, *currency))
+                Ok(StepAmounts::direct(input, src_to_dst, output, *currency))
             }
             StepKind::XrpEndpoint { account, is_last } => {
                 if !requested_out.amount().native() {
@@ -315,15 +333,21 @@ impl FlowStep for StepKind {
                 if !requested_in.matches_currency(*currency) {
                     return Err(Ter::TEF_INTERNAL);
                 }
-                let (input, output) = execute_direct_fwd(
+                let (input, src_to_dst, output) = execute_direct_step(
                     view,
                     src,
                     dst,
                     requested_in.amount(),
-                    context.strand_dst,
+                    context.offer_crossing != OfferCrossing::No,
                     context.offer_crossing != OfferCrossing::No && dst == context.strand_dst,
+                    context.previous_redeems.get(),
+                    context.previous_line_quality_in.get(),
+                    context.has_previous_step.get(),
+                    context.is_last_step.get(),
+                    DirectRunDirection::Forward,
+                    Some(reverse_cache),
                 )?;
-                Ok(StepAmounts::direct(input, output, *currency))
+                Ok(StepAmounts::direct(input, src_to_dst, output, *currency))
             }
             StepKind::XrpEndpoint { account, is_last } => {
                 if !requested_in.amount().native() {
@@ -470,9 +494,24 @@ impl StepKind {
                     return Ok(Some((quality_one(), redeeming)));
                 }
                 let (quality_out, quality_in) = if redeeming {
-                    qualities_src_redeems(view, src, dst, *currency)?
+                    qualities_src_redeems(
+                        view,
+                        src,
+                        dst,
+                        *currency,
+                        context
+                            .has_previous_step
+                            .get()
+                            .then(|| context.previous_line_quality_in.get()),
+                    )?
                 } else {
                     qualities_src_issues(view, src, dst, *currency, previous_redeems)?
+                };
+                let quality_in = if context.is_last_step.get() && quality_in > protocol::QUALITY_ONE
+                {
+                    protocol::QUALITY_ONE
+                } else {
+                    quality_in
                 };
                 let issue = Issue::new(*currency, *src);
                 let input = STAmount::from_iou_amount(
@@ -518,7 +557,9 @@ impl StepKind {
                     context.strand_dst,
                     context.strand_deliver,
                 )
-                .map(|quality| quality.map(|quality| (quality, false)))
+                .map(|quality| {
+                    quality.map(|quality| (quality, book_step_redeems(*owner_pays_transfer_fee)))
+                })
             }
         }
     }
@@ -663,16 +704,40 @@ fn execute_mpt_endpoint<V: ApplyView>(
     } else {
         protocol::PARITY_RATE
     };
+    // Reverse evaluation quotes a net destination amount. Cap it before the
+    // rounded-up fee conversion, otherwise a representable net MPT amount can
+    // produce an unrepresentable gross input at the issuance boundary.
+    let requested_output = if reverse && issuing_with_fee {
+        protocol::mpt_amount::mul_ratio(
+            protocol::MPTAmount::from_value(protocol::MAX_MP_TOKEN_AMOUNT),
+            protocol::QUALITY_ONE,
+            rate.value,
+            false,
+        )
+        .map_err(|_| Ter::TEC_INTERNAL)?
+        .value()
+        .min(requested_value)
+    } else {
+        requested_value
+    };
 
     let (mut input_value, mut output_value) = if reverse {
         let input = if issuing_with_fee {
-            protocol::multiply_round(requested, rate, true)
-                .mpt()
-                .value()
+            protocol::multiply_round(
+                &STAmount::from_mpt_amount(
+                    sf("sfAmount"),
+                    protocol::MPTAmount::from_value(requested_output),
+                    *issue,
+                ),
+                rate,
+                true,
+            )
+            .mpt()
+            .value()
         } else {
-            requested_value
+            requested_output
         };
-        (input, requested_value)
+        (input, requested_output)
     } else {
         let output = if issuing_with_fee {
             protocol::divide_round(requested, rate, false).mpt().value()
@@ -742,19 +807,85 @@ fn execute_mpt_endpoint<V: ApplyView>(
     Ok((input, output))
 }
 
-/// Limits delivery to trust-line capacity.  It is used by both directions;
-/// reverse execution requests an output and receives the asset-correct input
-/// that would be consumed by forward execution.
-fn execute_direct_fwd<V: ApplyView>(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectRunDirection {
+    Reverse,
+    Forward,
+}
+
+pub(super) fn book_step_redeems(owner_pays_transfer_fee: bool) -> bool {
+    !owner_pays_transfer_fee
+}
+
+fn direct_qualities<V: ApplyView>(
+    view: &mut V,
+    src: &AccountID,
+    dst: &AccountID,
+    currency: protocol::Currency,
+    debt_direction: crate::domain::ripple_calc::direct_step::DebtDirection,
+    offer_crossing: bool,
+    previous_redeems: bool,
+    previous_line_quality_in: u32,
+    has_previous_step: bool,
+    is_last_step: bool,
+) -> Result<(u32, u32), Ter> {
+    use crate::domain::ripple_calc::direct_step::{DebtDirection, QualityDirection, get_quality};
+    let (src_quality_out, mut dst_quality_in) = match debt_direction {
+        DebtDirection::Redeems if !has_previous_step => {
+            (protocol::QUALITY_ONE, protocol::QUALITY_ONE)
+        }
+        DebtDirection::Redeems => {
+            let own_quality = if offer_crossing {
+                protocol::QUALITY_ONE
+            } else {
+                get_quality(view, src, dst, currency, QualityDirection::Out)
+                    .map_err(|_| Ter::TEF_BAD_LEDGER)?
+            };
+            (
+                previous_line_quality_in.max(own_quality),
+                protocol::QUALITY_ONE,
+            )
+        }
+        DebtDirection::Issues => {
+            let src_quality = if previous_redeems {
+                ripple_state_helpers::try_transfer_rate(view, src)
+                    .map_err(|_| Ter::TEF_BAD_LEDGER)?
+            } else {
+                protocol::QUALITY_ONE
+            };
+            let dst_quality = if offer_crossing {
+                protocol::QUALITY_ONE
+            } else {
+                get_quality(view, dst, src, currency, QualityDirection::In)
+                    .map_err(|_| Ter::TEF_BAD_LEDGER)?
+            };
+            (src_quality, dst_quality)
+        }
+    };
+    if is_last_step && dst_quality_in > protocol::QUALITY_ONE {
+        dst_quality_in = protocol::QUALITY_ONE;
+    }
+    Ok((src_quality_out, dst_quality_in))
+}
+
+/// Executes the arithmetic and no-fee ledger mutation of rippled's
+/// `DirectStepI::{revImp,fwdImp}`.
+fn execute_direct_step<V: ApplyView>(
     view: &mut V,
     src: &AccountID,
     dst: &AccountID,
     input: &STAmount,
-    strand_dst: &AccountID,
+    offer_crossing: bool,
     final_offer_crossing: bool,
-) -> Result<(STAmount, STAmount), Ter> {
+    previous_redeems: bool,
+    previous_line_quality_in: u32,
+    has_previous_step: bool,
+    is_last_step: bool,
+    direction: DirectRunDirection,
+    reverse_cache: Option<&StepAmounts>,
+) -> Result<(STAmount, STAmount, STAmount), Ter> {
     if input.signum() <= 0 {
-        return Ok((input.zeroed(), input.zeroed()));
+        return Ok((input.zeroed(), input.zeroed(), input.zeroed()));
     }
 
     if input.native() {
@@ -762,16 +893,20 @@ fn execute_direct_fwd<V: ApplyView>(
         if result != Ter::TES_SUCCESS {
             return Err(result);
         }
-        return Ok((input.clone(), input.clone()));
+        return Ok((input.clone(), input.clone(), input.clone()));
     }
 
     let currency = input.issue().currency;
+    let cached_src_to_dst = reverse_cache
+        .and_then(|cache| cache.direct_src_to_dst.as_ref())
+        .map(|amount| amount.amount().iou());
     let (max_flow, debt_dir) = if final_offer_crossing {
         // DirectIOfferCrossingStep::maxFlow: a final issuer-to-taker step
-        // deliberately ignores a pre-existing trust-line limit. This permits
-        // directSendNoFee to create the receiver's zero-limit trust line.
+        // deliberately ignores a pre-existing trust-line limit. During the
+        // forward pass rippled uses the exact reverse-cache srcToDst as its
+        // desired amount, not the forward input.
         (
-            input.iou(),
+            cached_src_to_dst.unwrap_or_else(|| input.iou()),
             crate::domain::ripple_calc::direct_step::DebtDirection::Issues,
         )
     } else {
@@ -779,10 +914,10 @@ fn execute_direct_fwd<V: ApplyView>(
             .map_err(|_| Ter::TEF_BAD_LEDGER)?
     };
     if max_flow.is_zero() || max_flow.signum() <= 0 {
-        return Ok((input.zeroed(), input.zeroed()));
+        return Ok((input.zeroed(), input.zeroed(), input.zeroed()));
     }
 
-    let input_iou = input.iou();
+    let requested = input.iou();
     let step_issue = Issue {
         currency,
         account: if debt_dir == crate::domain::ripple_calc::direct_step::DebtDirection::Redeems {
@@ -791,51 +926,106 @@ fn execute_direct_fwd<V: ApplyView>(
             *src
         },
     };
-    // A holder returning an IOU to its issuer does not pay the issuer's
-    // transfer rate. In rippled this is a one-step DirectStep whose
-    // `qualitiesSrcRedeems` has no previous step and therefore returns
-    // QUALITY_ONE. The Rust flow executor accounts for a multi-hop transfer
-    // fee at the redemption boundary, so preserve that representation while
-    // exempting the terminal issuer redemption.
-    let rate = if debt_dir == crate::domain::ripple_calc::direct_step::DebtDirection::Redeems
-        && dst != strand_dst
-    {
-        ripple_state_helpers::try_transfer_rate(view, dst).map_err(|_| Ter::TEF_BAD_LEDGER)?
-    } else {
-        crate::domain::mul_ratio::QUALITY_ONE
+    let (src_quality_out, dst_quality_in) = direct_qualities(
+        view,
+        src,
+        dst,
+        currency,
+        debt_dir,
+        offer_crossing,
+        previous_redeems,
+        previous_line_quality_in,
+        has_previous_step,
+        is_last_step,
+    )?;
+
+    let (consumed, mut delivered, mut src_to_dst) = match direction {
+        DirectRunDirection::Reverse => {
+            let wanted = crate::domain::mul_ratio::mul_ratio(
+                requested,
+                protocol::QUALITY_ONE,
+                dst_quality_in,
+                true,
+            );
+            let transfer = wanted.min(max_flow);
+            let consumed = crate::domain::mul_ratio::mul_ratio(
+                transfer,
+                src_quality_out,
+                protocol::QUALITY_ONE,
+                true,
+            );
+            let delivered = if wanted <= max_flow {
+                requested
+            } else {
+                crate::domain::mul_ratio::mul_ratio(
+                    transfer,
+                    dst_quality_in,
+                    protocol::QUALITY_ONE,
+                    false,
+                )
+            };
+            (consumed, delivered, transfer)
+        }
+        DirectRunDirection::Forward => {
+            let wanted = crate::domain::mul_ratio::mul_ratio(
+                requested,
+                protocol::QUALITY_ONE,
+                src_quality_out,
+                false,
+            );
+            let transfer = wanted.min(max_flow);
+            let consumed = if wanted <= max_flow {
+                requested
+            } else {
+                crate::domain::mul_ratio::mul_ratio(
+                    transfer,
+                    src_quality_out,
+                    protocol::QUALITY_ONE,
+                    true,
+                )
+            };
+            let delivered = crate::domain::mul_ratio::mul_ratio(
+                transfer,
+                dst_quality_in,
+                protocol::QUALITY_ONE,
+                false,
+            );
+            (consumed, delivered, transfer)
+        }
     };
-    let has_rate = rate > crate::domain::mul_ratio::QUALITY_ONE;
-    let effective_max = if has_rate {
-        crate::domain::mul_ratio::mul_ratio(
-            max_flow,
-            crate::domain::mul_ratio::QUALITY_ONE,
-            rate,
-            false,
-        )
-    } else {
-        max_flow
-    };
-    let deliver_iou = input_iou.min(effective_max);
-    let deliver = STAmount::from_iou_amount(sf("sfAmount"), deliver_iou, step_issue);
-    if deliver.signum() <= 0 {
-        return Ok((input.zeroed(), input.zeroed()));
+
+    // `setCacheLimiting`: never let forward rounding exceed reverse.
+    if let Some(cache) = reverse_cache {
+        let cached_in = cache.input.amount().iou();
+        let use_unbounded_forward_values = if consumed > cached_in {
+            let difference = consumed - cached_in;
+            let small_difference = protocol::IOUAmount::from_parts(1, -9)
+                .expect("DirectStep small-difference constant");
+            difference > small_difference
+                && (consumed.exponent() != cached_in.exponent()
+                    || cached_in.mantissa() == 0
+                    || (consumed.mantissa() as f64 / cached_in.mantissa() as f64) > 1.01)
+        } else {
+            false
+        };
+        if !use_unbounded_forward_values {
+            delivered = delivered.min(cache.output.amount().iou());
+            let cached_transfer = cached_src_to_dst.ok_or(Ter::TEF_INTERNAL)?;
+            src_to_dst = src_to_dst.min(cached_transfer);
+        }
     }
-    let consumed = if has_rate {
-        let adjusted_iou = crate::domain::mul_ratio::mul_ratio(
-            deliver_iou,
-            rate,
-            crate::domain::mul_ratio::QUALITY_ONE,
-            true,
-        );
-        STAmount::from_iou_amount(sf("sfAmount"), adjusted_iou, step_issue)
-    } else {
-        deliver.clone()
-    };
-    let result = ripple_state_helpers::account_send(view, src, dst, &consumed);
+
+    if consumed.signum() <= 0 || delivered.signum() <= 0 || src_to_dst.signum() <= 0 {
+        return Ok((input.zeroed(), input.zeroed(), input.zeroed()));
+    }
+    let transfer = STAmount::from_iou_amount(sf("sfAmount"), src_to_dst, step_issue);
+    let consumed = STAmount::from_iou_amount(sf("sfAmount"), consumed, step_issue);
+    let delivered = STAmount::from_iou_amount(sf("sfAmount"), delivered, step_issue);
+    let result = ripple_state_helpers::account_send(view, src, dst, &transfer);
     if result != Ter::TES_SUCCESS {
         return Err(result);
     }
-    Ok((consumed, deliver))
+    Ok((consumed, transfer, delivered))
 }
 
 fn execute_xrp_endpoint_fwd<V: ApplyView>(
@@ -913,6 +1103,64 @@ mod tests {
     use crate::{ApplyViewImpl, Ledger, RawView};
 
     #[test]
+    fn direct_qualities_charge_each_transfer_fee_at_the_rippled_boundary() {
+        use crate::domain::ripple_calc::direct_step::DebtDirection;
+
+        let issuer = AccountID::from_array([0x31; 20]);
+        let holder = AccountID::from_array([0x42; 20]);
+        let currency = protocol::currency_from_string("USD");
+        let mut issuer_root = STLedgerEntry::from_type_and_key(
+            LedgerEntryType::AccountRoot,
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(issuer.data())).key,
+        );
+        issuer_root.set_field_u32(sf("sfTransferRate"), 1_005_000_000);
+        let mut base = Ledger::from_ledger_seq_and_close_time(1, 1, false);
+        base.raw_insert(Arc::new(issuer_root))
+            .expect("seed issuer transfer rate");
+        let mut view = ApplyViewImpl::new(Arc::new(base), ApplyFlags::NONE);
+
+        // OfferCreate starts by redeeming holder IOUs into the issuer. In
+        // rippled a first DirectStep has no previous step, so it is parity
+        // quality and must not charge the issuer rate here.
+        assert_eq!(
+            direct_qualities(
+                &mut view,
+                &holder,
+                &issuer,
+                currency,
+                DebtDirection::Redeems,
+                true,
+                false,
+                protocol::QUALITY_ONE,
+                false,
+                false,
+            )
+            .expect("OfferCreate DirectStep qualities"),
+            (protocol::QUALITY_ONE, protocol::QUALITY_ONE)
+        );
+
+        // A payment BookStep reports Redeems. The following issuer DirectStep
+        // therefore charges the rate exactly once at its source-quality
+        // boundary: gross input 1.005 becomes net output 1.0.
+        assert_eq!(
+            direct_qualities(
+                &mut view,
+                &issuer,
+                &holder,
+                currency,
+                DebtDirection::Issues,
+                false,
+                true,
+                protocol::QUALITY_ONE,
+                true,
+                true,
+            )
+            .expect("payment post-book DirectStep qualities"),
+            (1_005_000_000, protocol::QUALITY_ONE)
+        );
+    }
+
+    #[test]
     fn offer_crossing_direct_quality_preserves_redeeming_direction() {
         let src = AccountID::from_array([0x11; 20]);
         let dst = AccountID::from_array([0x22; 20]);
@@ -942,8 +1190,10 @@ mod tests {
             amm_context: AmmContext::new(src, false),
             offer_usage: Rc::new(Cell::new(0)),
             previous_redeems: Rc::new(Cell::new(false)),
+            previous_line_quality_in: Rc::new(Cell::new(protocol::QUALITY_ONE)),
             has_previous_step: Rc::new(Cell::new(false)),
             previous_step_is_book: Rc::new(Cell::new(false)),
+            is_last_step: Rc::new(Cell::new(true)),
         };
 
         let (quality, redeeming) = step

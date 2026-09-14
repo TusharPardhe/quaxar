@@ -117,14 +117,26 @@ pub fn verify_st_object(
 }
 
 pub fn build_multi_signing_data(object: &STObject, signing_id: AccountID) -> Serializer {
-    let mut serializer = start_multi_signing_data(object);
+    build_multi_signing_data_with_prefix(object, signing_id, HashPrefix::TxMultiSign)
+}
+
+pub fn build_multi_signing_data_with_prefix(
+    object: &STObject,
+    signing_id: AccountID,
+    prefix: HashPrefix,
+) -> Serializer {
+    let mut serializer = start_multi_signing_data_with_prefix(object, prefix);
     finish_multi_signing_data(signing_id, &mut serializer);
     serializer
 }
 
 pub fn start_multi_signing_data(object: &STObject) -> Serializer {
+    start_multi_signing_data_with_prefix(object, HashPrefix::TxMultiSign)
+}
+
+pub fn start_multi_signing_data_with_prefix(object: &STObject, prefix: HashPrefix) -> Serializer {
     let mut serializer = Serializer::default();
-    serializer.add32_prefix(HashPrefix::TxMultiSign);
+    serializer.add32_prefix(prefix);
     object.add_without_signing_fields(&mut serializer);
     serializer
 }

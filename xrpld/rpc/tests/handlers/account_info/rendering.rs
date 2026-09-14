@@ -1,5 +1,7 @@
 //! Account info rendering tests.
 
+use protocol::getAccountRootFlags;
+
 use super::*;
 
 #[test]
@@ -10,7 +12,6 @@ fn account_info_renders_account_data_flags_and_v1_signer_lists() {
 
     let mut source = FakeSource {
         ledger: Some(ledger),
-        clawback_enabled: true,
         token_escrow_enabled: true,
         ..Default::default()
     };
@@ -315,4 +316,104 @@ fn account_info_summarizes_open_ledger_queue_stats() {
             ),
         ])))
     );
+}
+
+#[test]
+fn account_info_always_reports_allow_trust_line_clawback() {
+    let account = sample_account(0x77);
+    let mut source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    source
+        .account_roots
+        .insert(account, make_account_root(account, 0, None));
+    let result = do_account_info(
+        &AccountInfoRequest {
+            params: &object([("account", JsonValue::String(to_base58(account)))]),
+            api_version: 2,
+            role: Role::Admin,
+        },
+        &source,
+    );
+    let JsonValue::Object(result) = result else {
+        panic!("response must be an object")
+    };
+    let JsonValue::Object(flags) = result.get("account_flags").expect("account flags") else {
+        panic!("flags must be an object")
+    };
+    assert_eq!(
+        flags.get("allowTrustLineClawback"),
+        Some(&JsonValue::Bool(false))
+    );
+}
+
+#[test]
+fn account_info_intentionally_maps_every_account_root_registry_flag() {
+    const INTENTIONAL_MAPPINGS: &[(&str, &str)] = &[
+        ("lsfPasswordSpent", "passwordSpent"),
+        ("lsfRequireDestTag", "requireDestinationTag"),
+        ("lsfRequireAuth", "requireAuthorization"),
+        ("lsfDisallowXRP", "disallowIncomingXRP"),
+        ("lsfDisableMaster", "disableMasterKey"),
+        ("lsfNoFreeze", "noFreeze"),
+        ("lsfGlobalFreeze", "globalFreeze"),
+        ("lsfDefaultRipple", "defaultRipple"),
+        ("lsfDepositAuth", "depositAuth"),
+        (
+            "lsfDisallowIncomingNFTokenOffer",
+            "disallowIncomingNFTokenOffer",
+        ),
+        ("lsfDisallowIncomingCheck", "disallowIncomingCheck"),
+        ("lsfDisallowIncomingPayChan", "disallowIncomingPayChan"),
+        ("lsfDisallowIncomingTrustline", "disallowIncomingTrustline"),
+        ("lsfAllowTrustLineLocking", "allowTrustLineLocking"),
+        ("lsfAllowTrustLineClawback", "allowTrustLineClawback"),
+    ];
+
+    let registry = getAccountRootFlags();
+    assert_eq!(
+        registry.len(),
+        INTENTIONAL_MAPPINGS.len(),
+        "every AccountRoot registry flag needs an intentional account_info name"
+    );
+
+    for &(registry_name, account_info_name) in INTENTIONAL_MAPPINGS {
+        let flag = *registry
+            .get(registry_name)
+            .unwrap_or_else(|| panic!("missing AccountRoot registry flag: {registry_name}"));
+        let account = sample_account(flag as u8);
+        let mut source = FakeSource {
+            ledger: Some(closed_ledger()),
+            token_escrow_enabled: true,
+            ..Default::default()
+        };
+        source
+            .account_roots
+            .insert(account, make_account_root(account, flag, None));
+
+        let result = do_account_info(
+            &AccountInfoRequest {
+                params: &object([("account", JsonValue::String(to_base58(account)))]),
+                api_version: 2,
+                role: Role::Admin,
+            },
+            &source,
+        );
+        let JsonValue::Object(result) = result else {
+            panic!("account_info response must be an object");
+        };
+        let JsonValue::Object(flags) = result.get("account_flags").expect("account flags") else {
+            panic!("account flags must be an object");
+        };
+
+        assert_eq!(flags.len(), INTENTIONAL_MAPPINGS.len());
+        for &(_, expected_name) in INTENTIONAL_MAPPINGS {
+            assert_eq!(
+                flags.get(expected_name),
+                Some(&JsonValue::Bool(expected_name == account_info_name)),
+                "{registry_name} must map only to {account_info_name}"
+            );
+        }
+    }
 }

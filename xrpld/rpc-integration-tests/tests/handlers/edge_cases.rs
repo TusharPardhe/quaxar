@@ -444,3 +444,32 @@ fn gateway_balances_shows_obligations() {
         }
     }
 }
+
+#[test]
+fn gateway_balances_preserves_success_envelope_in_v1_and_v2() {
+    let gateway = TestAccount::new("edge_gateway_versions");
+    let env = RpcTestEnv::new(&[(&gateway, 10_000_000_000)]);
+    let source = env.rpc_source();
+
+    for api_version in [1, 2] {
+        let result = rpc::do_gateway_balances(
+            &rpc::GatewayBalancesRequest {
+                params: &json([("account", JsonValue::String(to_base58(gateway.id)))]),
+                api_version,
+                role: rpc::RpcRole::Admin,
+            },
+            &source,
+        );
+        let JsonValue::Object(result) = result else {
+            panic!("API v{api_version} result must be an object");
+        };
+        assert_eq!(
+            result.get("account"),
+            Some(&JsonValue::String(to_base58(gateway.id))),
+        );
+        assert!(result.contains_key("ledger_hash") || result.contains_key("ledger_current_index"));
+        assert!(result.contains_key("ledger_index"));
+        assert!(result.contains_key("validated"));
+        assert!(!result.contains_key("error"));
+    }
+}

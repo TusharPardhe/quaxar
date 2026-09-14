@@ -152,8 +152,13 @@ fn fill_json_tx_v2(
 
     if let Some(meta) = meta {
         let mut meta_json = meta.get_json(JsonOptions::NONE);
-        insert_delivered_amount(&mut meta_json, fill.ledger, txn, meta);
-        insert_mp_token_issuance_id(&mut meta_json, txn, meta);
+        insert_all_synthetic_in_json(
+            &mut meta_json,
+            fill.ledger.header().seq,
+            Some(fill.ledger.header().close_time),
+            txn,
+            meta,
+        );
         object.insert("meta".to_owned(), meta_json);
     }
 
@@ -197,10 +202,46 @@ fn fill_json_tx_v1(
 
     if let Some(meta) = meta {
         let mut meta_json = meta.get_json(JsonOptions::NONE);
-        insert_delivered_amount(&mut meta_json, fill.ledger, txn, meta);
-        insert_mp_token_issuance_id(&mut meta_json, txn, meta);
+        insert_all_synthetic_in_json(
+            &mut meta_json,
+            fill.ledger.header().seq,
+            Some(fill.ledger.header().close_time),
+            txn,
+            meta,
+        );
         object.insert("metaData".to_owned(), meta_json);
     }
+}
+
+pub fn insert_all_synthetic_in_json(
+    meta_json: &mut JsonValue,
+    ledger_seq: u32,
+    close_time: Option<u32>,
+    txn: &STTx,
+    meta: &TxMeta,
+) {
+    if matches!(txn.get_txn_type(), TxType::PAYMENT | TxType::CHECK_CASH)
+        && meta.get_result_ter().to_int() == 0
+    {
+        let delivered = meta
+            .get_delivered_amount()
+            .cloned()
+            .or_else(|| {
+                (txn.is_field_present(get_field_by_symbol("sfAmount"))
+                    && (ledger_seq >= DELIVERED_AMOUNT_SWITCH_LEDGER
+                        || close_time
+                            .is_some_and(|time| time > DELIVERED_AMOUNT_SWITCH_CLOSE_TIME)))
+                .then(|| txn.get_field_amount(get_field_by_symbol("sfAmount")))
+            })
+            .map(|amount| amount.json(JsonOptions::INCLUDE_DATE))
+            .unwrap_or_else(|| JsonValue::String("unavailable".to_owned()));
+        if let JsonValue::Object(object) = meta_json {
+            object.insert("delivered_amount".to_owned(), delivered);
+        }
+    }
+    protocol::insert_nftoken_id(meta_json, Some(txn), meta);
+    protocol::insert_nftoken_offer_id(meta_json, Some(txn), meta);
+    insert_mp_token_issuance_id(meta_json, txn, meta);
 }
 
 pub(crate) fn transaction_subscription_event(
@@ -217,8 +258,13 @@ pub(crate) fn transaction_subscription_event(
         );
     }
     let mut meta_json = meta.get_json(JsonOptions::NONE);
-    insert_delivered_amount(&mut meta_json, ledger, txn, meta);
-    insert_mp_token_issuance_id(&mut meta_json, txn, meta);
+    insert_all_synthetic_in_json(
+        &mut meta_json,
+        ledger.header().seq,
+        Some(ledger.header().close_time),
+        txn,
+        meta,
+    );
     JsonValue::Object(BTreeMap::from([
         (
             "type".to_owned(),
@@ -259,46 +305,6 @@ pub(crate) fn transaction_subscription_event(
             JsonValue::String(protocol::trans_human(result).to_owned()),
         ),
     ]))
-}
-
-fn insert_delivered_amount(meta_json: &mut JsonValue, ledger: &Ledger, txn: &STTx, meta: &TxMeta) {
-    if !can_have_delivered_amount(txn, meta) {
-        return;
-    }
-
-    let delivered = get_delivered_amount(ledger, txn, meta)
-        .map(|amount| amount.json(JsonOptions::INCLUDE_DATE))
-        .unwrap_or_else(|| JsonValue::String("unavailable".to_owned()));
-
-    let JsonValue::Object(object) = meta_json else {
-        return;
-    };
-    object.insert("delivered_amount".to_owned(), delivered);
-}
-
-fn can_have_delivered_amount(txn: &STTx, meta: &TxMeta) -> bool {
-    matches!(txn.get_txn_type(), TxType::PAYMENT | TxType::CHECK_CASH)
-        && meta.get_result_ter().to_int() == 0
-}
-
-fn get_delivered_amount(ledger: &Ledger, txn: &STTx, meta: &TxMeta) -> Option<protocol::STAmount> {
-    if let Some(amount) = meta.get_delivered_amount() {
-        return Some(amount.clone());
-    }
-
-    let amount_field = get_field_by_symbol("sfAmount");
-    if !txn.is_field_present(amount_field) {
-        return None;
-    }
-
-    let header = ledger.header();
-    if header.seq >= DELIVERED_AMOUNT_SWITCH_LEDGER
-        || header.close_time > DELIVERED_AMOUNT_SWITCH_CLOSE_TIME
-    {
-        return Some(txn.get_field_amount(amount_field));
-    }
-
-    None
 }
 
 fn insert_mp_token_issuance_id(meta_json: &mut JsonValue, txn: &STTx, meta: &TxMeta) {

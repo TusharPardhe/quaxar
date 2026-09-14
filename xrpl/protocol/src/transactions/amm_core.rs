@@ -161,6 +161,18 @@ pub fn get_fee(tfee: u16) -> RuntimeNumber {
         .expect("fee scale factor should stay representable in Number")
 }
 
+/// Returns the AMM auction slot's minimum LP-token price.
+///
+/// `fixCleanup3_4_0` uses a one-unit trading fee for zero-fee pools to keep
+/// an auction slot from being acquired for zero (or dust) LP tokens.
+pub fn amm_auction_min_slot_price(
+    lp_token_balance: RuntimeNumber,
+    trading_fee: u16,
+) -> RuntimeNumber {
+    lp_token_balance * get_fee(trading_fee)
+        / number_from_i64(i64::from(AUCTION_SLOT_MIN_FEE_FRACTION))
+}
+
 pub fn fee_mult(tfee: u16) -> RuntimeNumber {
     current_number_one() - get_fee(tfee)
 }
@@ -172,6 +184,19 @@ pub fn fee_mult_half(tfee: u16) -> RuntimeNumber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amm_auction_min_slot_price_uses_the_trading_fee_equivalent() {
+        let balance = RuntimeNumber::from_i64(10_000);
+        assert_eq!(
+            amm_auction_min_slot_price(balance, 0),
+            RuntimeNumber::zero()
+        );
+        assert_eq!(
+            amm_auction_min_slot_price(balance, 1),
+            balance * get_fee(1) / number_from_i64(i64::from(AUCTION_SLOT_MIN_FEE_FRACTION))
+        );
+    }
 
     #[test]
     fn amm_family_gate_does_not_depend_on_fix_universal_number() {

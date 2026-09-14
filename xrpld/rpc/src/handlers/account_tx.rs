@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use app::ledger_to_json::ledger_to_json_tx::insert_all_synthetic_in_json;
 use app::{TransStatus, Transaction};
 use basics::{
     base_uint::Uint256,
@@ -11,9 +12,7 @@ use basics::{
 use protocol::{AccountID, JsonOptions, JsonValue, parse_base58_account_id};
 
 use crate::commands::rpc_helpers::read_limit_field;
-use crate::handlers::delivered_amount::insert_delivered_amount;
 use crate::handlers::ledger_lookup::{LedgerLookupLedger, LedgerLookupSource};
-use crate::handlers::mp_token_issuance_id::insert_mp_token_issuance_id;
 use crate::insert_deliver_max;
 use crate::state::role::Role;
 use crate::state::tuning::Tuning;
@@ -288,14 +287,13 @@ fn insert_v1_transaction(target: &mut JsonValue, record: &TxRecord, binary: bool
     }
     if let Some(meta) = &record.meta {
         let mut meta_json = meta.get_json(JsonOptions::INCLUDE_DATE);
-        insert_delivered_amount(
+        insert_all_synthetic_in_json(
             &mut meta_json,
             record.ledger_index,
             record.close_time.map(|close_time| close_time.as_seconds()),
             txn,
             meta,
         );
-        insert_mp_token_issuance_id(&mut meta_json, txn, meta);
         ensure_object(target).insert("meta".to_owned(), meta_json);
     }
     ensure_object(target).insert("validated".to_owned(), JsonValue::Bool(record.validated));
@@ -328,14 +326,13 @@ fn insert_v2_transaction(target: &mut JsonValue, record: &TxRecord, binary: bool
         object.insert("tx_json".to_owned(), tx_json);
         if let Some(meta) = &record.meta {
             let mut meta_json = meta.get_json(JsonOptions::INCLUDE_DATE);
-            insert_delivered_amount(
+            insert_all_synthetic_in_json(
                 &mut meta_json,
                 record.ledger_index,
                 record.close_time.map(|close_time| close_time.as_seconds()),
                 txn,
                 meta,
             );
-            insert_mp_token_issuance_id(&mut meta_json, txn, meta);
             object.insert("meta".to_owned(), meta_json);
         }
     }

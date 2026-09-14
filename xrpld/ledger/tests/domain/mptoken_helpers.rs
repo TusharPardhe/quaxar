@@ -186,29 +186,136 @@ fn remove_empty_holding_rejects_locked_amount_after_fix_cleanup_3_1_3() {
 }
 
 #[test]
-fn require_auth_allows_vault_and_loanbroker_pseudo_accounts_under_sav() {
+fn require_auth_allows_every_metadata_pseudo_account_under_sav() {
     let issuer = account(0x51);
-    let vault_pseudo = account(0x52);
-    let broker_pseudo = account(0x53);
     let id = mpt_id(issuer, 3);
-    let ledger = ledger_with(
-        [
-            account_entry(issuer),
-            pseudo_account_entry(vault_pseudo, sf("sfVaultID")),
-            pseudo_account_entry(broker_pseudo, sf("sfLoanBrokerID")),
-            require_auth_issuance_entry(issuer, 3),
-        ],
-        &[feature_id("SingleAssetVault")],
+    let pseudo_fields = protocol::all_sfields()
+        .iter()
+        .filter(|field| field.should_meta(protocol::SField::S_MD_PSEUDO_ACCOUNT))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        !pseudo_fields.is_empty(),
+        "the protocol metadata must define pseudo-account discriminators"
     );
 
-    assert_eq!(
-        require_auth_mpt(&ledger, &MPTIssue::new(id), &vault_pseudo)
-            .expect("require auth should not throw"),
-        protocol::Ter::TES_SUCCESS
+    let mut entries = vec![
+        account_entry(issuer),
+        require_auth_issuance_entry(issuer, 3),
+    ];
+    let pseudos = pseudo_fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let pseudo = account(0x52 + index as u8);
+            entries.push(pseudo_account_entry(
+                pseudo,
+                get_field_by_symbol(field.symbol_name()),
+            ));
+            pseudo
+        })
+        .collect::<Vec<_>>();
+    let ledger = ledger_with(entries, &[feature_id("SingleAssetVault")]);
+
+    for pseudo in pseudos {
+        assert_eq!(
+            require_auth_mpt(&ledger, &MPTIssue::new(id), &pseudo)
+                .expect("require auth should not throw"),
+            protocol::Ter::TES_SUCCESS,
+            "every metadata-marked discriminator must confer pseudo authorization"
+        );
+    }
+}
+
+#[test]
+fn amm_lp_transfer_checks_each_underlying_mpt_for_redemption_and_spendability() {
+    let issuer = account(0x54);
+    let amm_account = account(0x55);
+    let holder = account(0x56);
+    let recipient = account(0x57);
+    let amm_id = Uint256::from_u64(0xA55);
+    let mpt = MPTIssue::new(mpt_id(issuer, 8));
+    let mut amm_root = pseudo_account_entry(amm_account, sf("sfAMMID"));
+    amm_root.set_field_h256(sf("sfAMMID"), amm_id);
+    let mut amm = STLedgerEntry::from_type_and_key(LedgerEntryType::AMM, amm_id);
+    amm.set_account_id(sf("sfAccount"), amm_account);
+    amm.set_field_issue(
+        sf("sfAsset"),
+        protocol::STIssue::new_with_asset(sf("sfAsset"), Asset::MPTIssue(mpt)),
+    );
+    amm.set_field_issue(
+        sf("sfAsset2"),
+        protocol::STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(protocol::xrp_issue())),
+    );
+
+    let no_transfer = ledger_with(
+        [
+            account_entry(issuer),
+            account_entry(holder),
+            account_entry(recipient),
+            amm_root.clone(),
+            amm.clone(),
+            issuance_entry_with_flags(issuer, 8, protocol::lsfMPTCanTrade),
+        ],
+        &[feature_id("MPTokensV2")],
     );
     assert_eq!(
-        require_auth_mpt(&ledger, &MPTIssue::new(id), &broker_pseudo)
-            .expect("require auth should not throw"),
+        ledger::mptoken_helpers::can_transfer_lp_token(
+            &no_transfer,
+            &holder,
+            &amm_account,
+            &amm_account,
+        )
+        .expect("direct redemption transfer check"),
+        protocol::Ter::TEC_NO_AUTH,
+        "non-transferable pool MPT blocks holder-to-AMM LP redemption"
+    );
+    assert_eq!(
+        ledger::mptoken_helpers::can_transfer_lp_token(
+            &no_transfer,
+            &holder,
+            &recipient,
+            &amm_account,
+        )
+        .expect("LP spendability transfer check"),
+        protocol::Ter::TEC_NO_AUTH,
+        "the same rule makes the LP token unspendable for a third-party transfer"
+    );
+    assert_eq!(
+        ledger::mptoken_helpers::can_transfer_lp_token(
+            &no_transfer,
+            &issuer,
+            &holder,
+            &amm_account,
+        )
+        .expect("issuer transfer check"),
+        protocol::Ter::TES_SUCCESS,
+        "the underlying MPT issuer remains exempt"
+    );
+
+    let transferable = ledger_with(
+        [
+            account_entry(issuer),
+            account_entry(holder),
+            account_entry(recipient),
+            amm_root,
+            amm,
+            issuance_entry_with_flags(
+                issuer,
+                8,
+                protocol::lsfMPTCanTrade | protocol::lsfMPTCanTransfer,
+            ),
+        ],
+        &[feature_id("MPTokensV2")],
+    );
+    assert_eq!(
+        ledger::mptoken_helpers::can_transfer_lp_token(
+            &transferable,
+            &holder,
+            &amm_account,
+            &amm_account,
+        )
+        .expect("transferable direct redemption check"),
         protocol::Ter::TES_SUCCESS
     );
 }

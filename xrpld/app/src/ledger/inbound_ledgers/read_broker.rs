@@ -21,8 +21,8 @@ use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 /// global, so coalesced acquisitions never multiply database I/O.
 pub const ACQ_READS_PER_SCAN: usize = 512;
 
-/// Rippled's `JtLedgerData` JobQueue category runs three jobs concurrently,
-/// each of which may hold one 512-read `getMissingNodes` batch. TimeoutCounter's
+/// Rippled's global `JtLedgerData` category runs three jobs concurrently, each
+/// of which may hold one 512-read `getMissingNodes` batch. TimeoutCounter's
 /// separate jobLimit=5 is an enqueue guard, not a running-job limit.
 pub const ACQ_SCAN_JOBS: usize = 3;
 

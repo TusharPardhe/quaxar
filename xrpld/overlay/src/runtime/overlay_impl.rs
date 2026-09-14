@@ -14,6 +14,7 @@ use basics::base_uint::Uint256;
 use basics::base64::base64_encode;
 use http::{Request, Response};
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+use prost::Message as ProstMessage;
 use protocol::{
     JsonValue, KeyType, PublicKey, STTx, SecretKey, SerialIter, Serializer, derive_public_key,
     sha512_half as protocol_sha512_half, sign_digest,
@@ -593,9 +594,8 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         // rippled 3.2.1 (OverlayImpl.cpp:678-762): process every trusted
         // manifest and cap *untrusted* processing at the configured
         // maxUntrustedCount, charging the sender once when untrusted entries
-        // are skipped. Trusted manifests are never dropped.
-        // TODO(peer-parity): enforce the untrusted cap here; the manifest batch
-        // is currently handed to the bounded inbound queue unclassified.
+        // are skipped. Trusted manifests are never dropped, including when
+        // they appear after the untrusted cap is exhausted.
         if message.list.is_empty() {
             self.peer.charge(
                 (*resource::FEE_USELESS_DATA).clone(),
@@ -609,9 +609,74 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             count = message.list.len(),
             "Manifests received"
         );
-        self.overlay
-            .inbound_handler
-            .on_manifests(self.peer, message.clone());
+
+        // At startup the app has not installed its ValidatorList-backed
+        // classifier yet, so retain only a bounded whole packet rather than
+        // risking a trusted key rotation by truncating it. Once installed,
+        // classify before queueing and retain only work that app-side manifest
+        // processing can consume.
+        let admitted = if let Some(classify) = self.overlay.manifest_admission_policy() {
+            let max_untrusted = self.overlay.max_untrusted_manifests.load(Ordering::Relaxed);
+            let mut untrusted = 0usize;
+            let mut skipped_untrusted = false;
+            let mut list = Vec::with_capacity(message.list.len());
+            for manifest in &message.list {
+                match classify(&manifest.stobject) {
+                    ManifestAdmission::Trusted => list.push(manifest.clone()),
+                    ManifestAdmission::Untrusted if untrusted < max_untrusted => {
+                        untrusted += 1;
+                        list.push(manifest.clone());
+                    }
+                    ManifestAdmission::Untrusted => skipped_untrusted = true,
+                    // The classifier has already established that application
+                    // parsing would reject this blob, so do not retain it.
+                    ManifestAdmission::Reject => {}
+                }
+            }
+            if skipped_untrusted {
+                // One charge for the entire skipped suffix, never one charge
+                // per manifest, matching rippled's flood accounting.
+                self.peer.charge(
+                    (*resource::FEE_MALFORMED_REQUEST).clone(),
+                    "too many untrusted manifests".to_owned(),
+                );
+            }
+            crate::message::TmManifests {
+                list,
+                ..message.clone()
+            }
+        } else {
+            // Before the ValidatorList-backed classifier is installed, every
+            // entry is potentially trusted. Admit the entire packet only when
+            // it fits the same wire and untrusted-work budgets that protect
+            // the normal path. Truncating here could discard a trusted key
+            // rotation that appears after an untrusted prefix; rejecting the
+            // over-budget packet avoids retaining an attacker-selected clone.
+            let max_untrusted = self.overlay.max_untrusted_manifests.load(Ordering::Relaxed);
+            if message.list.len() > max_untrusted {
+                self.peer.charge(
+                    (*resource::FEE_MALFORMED_REQUEST).clone(),
+                    "too many untrusted manifests".to_owned(),
+                );
+                return crate::router::RouteAction::Continue;
+            }
+            if message.encoded_len() > self.overlay.max_manifests_message_size() {
+                self.peer.charge(
+                    (*resource::FEE_MALFORMED_REQUEST).clone(),
+                    "oversized manifest batch".to_owned(),
+                );
+                return crate::router::RouteAction::Continue;
+            }
+            crate::message::TmManifests {
+                list: message.list.clone(),
+                ..Default::default()
+            }
+        };
+        if !admitted.list.is_empty() {
+            self.overlay
+                .inbound_handler
+                .on_manifests(self.peer, admitted);
+        }
         crate::router::RouteAction::Continue
     }
 
@@ -1376,6 +1441,19 @@ fn is_valid_shamap_node_id_wire(data: &[u8]) -> bool {
 }
 
 type ManifestsMessageProvider = Arc<dyn Fn() -> Option<ProtocolMessage> + Send + Sync>;
+
+/// App-provided, side-effect-free classification for a serialized validator
+/// manifest. Overlay uses it before its fallback queue so a peer cannot spend
+/// unbounded queue space on untrusted gossip. Application still owns manifest
+/// parsing, cache application, durability, and relay of accepted entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestAdmission {
+    Trusted,
+    Untrusted,
+    Reject,
+}
+
+type ManifestAdmissionPolicy = Arc<dyn Fn(&[u8]) -> ManifestAdmission + Send + Sync>;
 type OutboundPeerFailureHandler = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
 type OutboundPeerCloseHandler = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
 
@@ -1418,6 +1496,13 @@ pub struct OverlayImpl {
     manifests_message_provider: Arc<RwLock<Option<ManifestsMessageProvider>>>,
     /// Per-node [overlay] manifests frame limit, read before decompression.
     max_manifests_message_size: Arc<AtomicUsize>,
+    /// Trusted/untrusted classification installed by the application after its
+    /// validator list is ready. Leaving this unset preserves startup traffic
+    /// until the app can safely classify it.
+    manifest_admission_policy: Arc<RwLock<Option<ManifestAdmissionPolicy>>>,
+    /// Maximum untrusted manifests admitted from one message. Trusted entries
+    /// do not consume this budget and may follow skipped untrusted entries.
+    max_untrusted_manifests: Arc<AtomicUsize>,
     /// App-owned PeerFinder failure sink for outbound peers that remain Not
     /// Useful. Overlay retains only this callback, never PeerFinder state.
     outbound_peer_failure_handler: Arc<RwLock<Option<OutboundPeerFailureHandler>>>,
@@ -1528,6 +1613,10 @@ impl OverlayImpl {
             handshake_ledgers: Arc::new(RwLock::new(None)),
             manifests_message_provider: Arc::new(RwLock::new(None)),
             max_manifests_message_size: Arc::new(AtomicUsize::new(MAXIMUM_MANIFESTS_MESSAGE_SIZE)),
+            manifest_admission_policy: Arc::new(RwLock::new(None)),
+            max_untrusted_manifests: Arc::new(AtomicUsize::new(
+                crate::message::DEFAULT_MAX_UNTRUSTED_MANIFESTS,
+            )),
             outbound_peer_failure_handler: Arc::new(RwLock::new(None)),
             outbound_peer_close_handler: Arc::new(RwLock::new(None)),
             session_tasks: Arc::new(SessionTaskTracker::default()),
@@ -1548,6 +1637,37 @@ impl OverlayImpl {
     pub fn set_max_manifests_message_size(&self, max_manifests_message_size: usize) {
         self.max_manifests_message_size
             .store(max_manifests_message_size, Ordering::Relaxed);
+    }
+
+    /// Install manifest classification used for pre-queue admission. The
+    /// classifier must only inspect its input; it is called from a peer I/O
+    /// path and must not acquire the manifest-cache lock. `max_untrusted` is
+    /// the same configured limit used by app-side cache processing.
+    pub fn set_manifest_admission_policy<F>(&self, max_untrusted: usize, policy: F)
+    where
+        F: Fn(&[u8]) -> ManifestAdmission + Send + Sync + 'static,
+    {
+        self.max_untrusted_manifests
+            .store(max_untrusted, Ordering::Relaxed);
+        *self
+            .manifest_admission_policy
+            .write()
+            .expect("manifest admission policy lock") = Some(Arc::new(policy));
+    }
+
+    pub fn clear_manifest_admission_policy(&self) {
+        *self
+            .manifest_admission_policy
+            .write()
+            .expect("manifest admission policy lock") = None;
+    }
+
+    fn manifest_admission_policy(&self) -> Option<ManifestAdmissionPolicy> {
+        self.manifest_admission_policy
+            .read()
+            .expect("manifest admission policy lock")
+            .as_ref()
+            .map(Arc::clone)
     }
 
     fn max_manifests_message_size(&self) -> usize {
@@ -2174,6 +2294,8 @@ impl OverlayImpl {
             handshake_ledgers: Arc::clone(&self.handshake_ledgers),
             manifests_message_provider: Arc::clone(&self.manifests_message_provider),
             max_manifests_message_size: Arc::clone(&self.max_manifests_message_size),
+            manifest_admission_policy: Arc::clone(&self.manifest_admission_policy),
+            max_untrusted_manifests: Arc::clone(&self.max_untrusted_manifests),
             outbound_peer_failure_handler: Arc::clone(&self.outbound_peer_failure_handler),
             outbound_peer_close_handler: Arc::clone(&self.outbound_peer_close_handler),
             session_tasks: Arc::clone(&self.session_tasks),

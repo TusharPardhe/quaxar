@@ -308,20 +308,32 @@ fn validate_sttx_flag_mask(tx: &STTx, rules: &Rules) -> NotTec {
     }
 }
 
-fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
+fn smart_escrow_enabled(rules: &Rules) -> bool {
+    let feature = protocol::feature_smart_escrow();
+    rules.enabled(&feature)
+        && protocol::registered_feature(&feature)
+            .is_some_and(protocol::registered_feature_supported)
+}
+
+fn smart_escrow_fields_present(tx: &STTx) -> bool {
     match tx.get_txn_type() {
-        TxType::PAYMENT => {
-            if tx.is_field_present(get_field_by_symbol("sfDomainID"))
-                && !rules.enabled(&protocol::feature_id("PermissionedDEX"))
-            {
-                return Ter::TEM_DISABLED;
-            }
-            if tx.is_field_present(get_field_by_symbol("sfCredentialIDs"))
-                && !rules.enabled(&protocol::feature_id("Credentials"))
-            {
-                return Ter::TEM_DISABLED;
-            }
-        }
+        TxType::ESCROW_CREATE => ["sfBytecode", "sfData"]
+            .into_iter()
+            .any(|field| tx.is_field_present(get_field_by_symbol(field))),
+        TxType::ESCROW_FINISH => tx.is_field_present(get_field_by_symbol("sfGas")),
+        TxType::FEE => ["sfGasLimit", "sfBytecodeSizeLimit", "sfGasPrice"]
+            .into_iter()
+            .any(|field| tx.is_field_present(get_field_by_symbol(field))),
+        _ => false,
+    }
+}
+
+fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
+    if smart_escrow_fields_present(tx) && !smart_escrow_enabled(rules) {
+        return Ter::TEM_DISABLED;
+    }
+
+    match tx.get_txn_type() {
         TxType::NFTOKEN_MINT => {
             let has_offer_fields = ["sfAmount", "sfDestination", "sfExpiration"]
                 .into_iter()
@@ -535,6 +547,26 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
                 return Ter::TEM_DISABLED;
             }
         }
+        TxType::VAULT_WITHDRAW => {
+            if tx.is_field_present(get_field_by_symbol("sfCredentialIDs"))
+                && (!rules.enabled(&protocol::feature_id("Credentials"))
+                    || !rules.enabled(&protocol::fix_cleanup_3_4_0()))
+            {
+                return Ter::TEM_DISABLED;
+            }
+        }
+        TxType::LOAN_BROKER_COVER_WITHDRAW => {
+            if !rules.enabled(&protocol::feature_id("SingleAssetVault"))
+                || !rules.enabled(&protocol::feature_id("MPTokensV1"))
+                || (tx.is_field_present(get_field_by_symbol("sfDomainID"))
+                    && !rules.enabled(&protocol::feature_id("PermissionedDomains")))
+                || (tx.is_field_present(get_field_by_symbol("sfCredentialIDs"))
+                    && (!rules.enabled(&protocol::feature_id("Credentials"))
+                        || !rules.enabled(&protocol::fix_cleanup_3_4_0())))
+            {
+                return Ter::TEM_DISABLED;
+            }
+        }
         TxType::VAULT_CREATE => {
             if !rules.enabled(&protocol::feature_id("MPTokensV1"))
                 || (tx.is_field_present(get_field_by_symbol("sfDomainID"))
@@ -561,7 +593,6 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
         | TxType::LOAN_BROKER_SET
         | TxType::LOAN_BROKER_DELETE
         | TxType::LOAN_BROKER_COVER_DEPOSIT
-        | TxType::LOAN_BROKER_COVER_WITHDRAW
         | TxType::LOAN_BROKER_COVER_CLAWBACK => {
             if !rules.enabled(&protocol::feature_id("SingleAssetVault"))
                 || !rules.enabled(&protocol::feature_id("MPTokensV1"))
@@ -632,6 +663,10 @@ fn is_change_transaction(txn_type: TxType) -> bool {
 /// sequence.  Keep the reference's `preflight0` then Change ordering here so
 /// every canonical STTx admission path shares it.
 fn validate_sttx_change_preflight(tx: &STTx, rules: &Rules, node_network_id: u32) -> NotTec {
+    if smart_escrow_fields_present(tx) && !smart_escrow_enabled(rules) {
+        return Ter::TEM_DISABLED;
+    }
+
     let field = get_field_by_symbol;
     let account = tx.get_account_id(field("sfAccount"));
     let fee = tx.get_field_amount(field("sfFee"));
@@ -875,7 +910,7 @@ fn validate_sttx_typed_semantic_preflight(
         TxType::SIGNER_LIST_SET => validate_signer_list_set_preflight(tx, rules),
         TxType::NFTOKEN_MINT => validate_nftoken_mint_preflight(tx, rules),
         TxType::NFTOKEN_CREATE_OFFER => validate_nftoken_create_offer_preflight(tx, rules),
-        TxType::NFTOKEN_ACCEPT_OFFER => validate_nftoken_accept_offer_preflight(tx),
+        TxType::NFTOKEN_ACCEPT_OFFER => validate_nftoken_accept_offer_preflight(tx, rules),
         TxType::NFTOKEN_CANCEL_OFFER => validate_nftoken_cancel_offer_preflight(tx, rules),
         TxType::NFTOKEN_MODIFY => validate_nftoken_modify_preflight(tx),
         TxType::AMM_CREATE => validate_amm_create_preflight(tx, rules),
@@ -913,7 +948,7 @@ fn validate_sttx_typed_semantic_preflight(
         | TxType::LOAN_BROKER_DELETE
         | TxType::LOAN_BROKER_COVER_DEPOSIT
         | TxType::LOAN_BROKER_COVER_WITHDRAW
-        | TxType::LOAN_BROKER_COVER_CLAWBACK => validate_loan_broker_preflight(tx, txn_type),
+        | TxType::LOAN_BROKER_COVER_CLAWBACK => validate_loan_broker_preflight(tx, rules, txn_type),
         TxType::LOAN_DELETE => {
             if tx.get_field_h256(get_field_by_symbol("sfLoanID")).is_zero() {
                 Ter::TEM_INVALID
@@ -1500,7 +1535,7 @@ fn validate_vault_preflight(tx: &STTx, rules: &Rules, txn_type: TxType) -> NotTe
         }
         TxType::VAULT_WITHDRAW => {
             let destination_present = present("sfDestination");
-            crate::run_vault_withdraw_preflight(crate::VaultWithdrawPreflightFacts {
+            let result = crate::run_vault_withdraw_preflight(crate::VaultWithdrawPreflightFacts {
                 vault_id_is_zero: tx
                     .get_field_h256(get_field_by_symbol("sfVaultID"))
                     .is_zero(),
@@ -1513,7 +1548,12 @@ fn validate_vault_preflight(tx: &STTx, rules: &Rules, txn_type: TxType) -> NotTe
                     && tx
                         .get_account_id(get_field_by_symbol("sfDestination"))
                         .is_zero(),
-            })
+            });
+            if result != Ter::TES_SUCCESS {
+                result
+            } else {
+                ledger::credential_helpers::check_fields(tx, rules)
+            }
         }
         TxType::VAULT_CLAWBACK => {
             let amount =
@@ -1541,7 +1581,7 @@ fn xchain_bridge_spec(tx: &STTx) -> crate::XChainBridgeSpec {
     }
 }
 
-fn validate_loan_broker_preflight(tx: &STTx, txn_type: TxType) -> NotTec {
+fn validate_loan_broker_preflight(tx: &STTx, rules: &Rules, txn_type: TxType) -> NotTec {
     let field = get_field_by_symbol;
     let present = |name| tx.is_field_present(field(name));
     match txn_type {
@@ -1596,7 +1636,7 @@ fn validate_loan_broker_preflight(tx: &STTx, txn_type: TxType) -> NotTec {
         TxType::LOAN_BROKER_COVER_WITHDRAW => {
             let amount = tx.get_field_amount(field("sfAmount"));
             let destination_present = present("sfDestination");
-            crate::run_loan_broker_cover_withdraw_preflight(
+            let result = crate::run_loan_broker_cover_withdraw_preflight(
                 crate::LoanBrokerCoverWithdrawPreflightFacts {
                     loan_broker_id_is_zero: tx.get_field_h256(field("sfLoanBrokerID")).is_zero(),
                     amount_is_positive: amount.signum() > 0,
@@ -1605,7 +1645,12 @@ fn validate_loan_broker_preflight(tx: &STTx, txn_type: TxType) -> NotTec {
                     destination_is_zero: destination_present
                         && tx.get_account_id(field("sfDestination")).is_zero(),
                 },
-            )
+            );
+            if result != Ter::TES_SUCCESS {
+                result
+            } else {
+                ledger::credential_helpers::check_fields(tx, rules)
+            }
         }
         TxType::LOAN_BROKER_COVER_CLAWBACK => {
             let account = tx.get_account_id(field("sfAccount"));
@@ -2319,7 +2364,7 @@ fn validate_amm_create_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     })
 }
 
-fn validate_nftoken_accept_offer_preflight(tx: &STTx) -> NotTec {
+fn validate_nftoken_accept_offer_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     if tx.get_flags() & !UNIVERSAL_TRANSACTION_FLAGS != 0 {
         return Ter::TEM_INVALID_FLAG;
     }
@@ -2340,6 +2385,13 @@ fn validate_nftoken_accept_offer_preflight(tx: &STTx) -> NotTec {
         // Unlike OfferCreate, it does not apply isLegalNet to BrokerFee.
         if broker_fee.signum() <= 0 {
             return Ter::TEM_MALFORMED;
+        }
+        if rules.enabled(&protocol::fix_cleanup_3_4_0())
+            && let protocol::Asset::Issue(issue) = broker_fee.asset()
+            && protocol::is_xrp_currency(issue.currency)
+            && !issue.account.is_zero()
+        {
+            return Ter::TEM_BAD_CURRENCY;
         }
     }
     Ter::TES_SUCCESS

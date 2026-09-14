@@ -12,6 +12,9 @@ pub struct SHAMapStoreConfig {
     pub back_off: Duration,
     pub age_threshold: Duration,
     pub recovery_wait: Duration,
+    /// Bound the number of validated ledgers an unhealthy online-delete
+    /// attempt may wait through before it is abandoned and retried later.
+    pub max_waiting_ledgers: u32,
 }
 
 impl Default for SHAMapStoreConfig {
@@ -22,7 +25,8 @@ impl Default for SHAMapStoreConfig {
             delete_batch: 100,
             back_off: Duration::from_millis(100),
             age_threshold: Duration::from_secs(60),
-            recovery_wait: Duration::from_secs(5),
+            recovery_wait: Duration::from_secs(2),
+            max_waiting_ledgers: 0,
         }
     }
 }
@@ -56,6 +60,9 @@ impl SHAMapStoreConfig {
         if let Some(seconds) = read_u32(section, "recovery_wait_seconds") {
             result.recovery_wait = Duration::from_secs(seconds as u64);
         }
+        if result.recovery_wait < Duration::from_secs(1) {
+            return Err("recovery_wait_seconds must be at least 1 second".to_owned());
+        }
         result.advisory_delete = read_bool(section, "advisory_delete").unwrap_or(false);
 
         let min_interval = if standalone {
@@ -63,6 +70,14 @@ impl SHAMapStoreConfig {
         } else {
             MINIMUM_DELETION_INTERVAL
         };
+        result.max_waiting_ledgers =
+            read_u32(section, "max_waiting_ledgers").unwrap_or(result.delete_interval);
+        let minimum_waiting = min_interval / 4;
+        if result.max_waiting_ledgers < minimum_waiting {
+            return Err(format!(
+                "max_waiting_ledgers must be at least {minimum_waiting}"
+            ));
+        }
         if result.delete_interval < min_interval {
             return Err(format!("online_delete must be at least {min_interval}"));
         }
@@ -116,7 +131,7 @@ mod tests {
         assert_eq!(parsed.delete_batch, 100);
         assert_eq!(parsed.back_off.as_millis(), 100);
         assert_eq!(parsed.age_threshold.as_secs(), 60);
-        assert_eq!(parsed.recovery_wait.as_secs(), 5);
+        assert_eq!(parsed.recovery_wait.as_secs(), 2);
         assert!(!parsed.advisory_delete);
     }
 
@@ -153,4 +168,36 @@ mod tests {
             "online_delete must not be less than ledger_history (currently 300)"
         );
     }
+}
+
+#[test]
+fn config_validates_bounded_online_delete_recovery() {
+    let mut config = BasicConfig::new();
+    let node_db = config.section_mut("node_db");
+    node_db.set("type", "RocksDB");
+    node_db.set("path", "/tmp/node_db");
+    node_db.set("online_delete", "256");
+    node_db.set("max_waiting_ledgers", "63");
+    assert_eq!(
+        SHAMapStoreConfig::from_config(&config, false, 128).expect_err("minimum wait"),
+        "max_waiting_ledgers must be at least 64"
+    );
+
+    config
+        .section_mut("node_db")
+        .set("max_waiting_ledgers", "64");
+    config
+        .section_mut("node_db")
+        .set("recovery_wait_seconds", "0");
+    assert_eq!(
+        SHAMapStoreConfig::from_config(&config, false, 128).expect_err("zero wait would spin"),
+        "recovery_wait_seconds must be at least 1 second"
+    );
+
+    config
+        .section_mut("node_db")
+        .set("recovery_wait_seconds", "1");
+    let parsed = SHAMapStoreConfig::from_config(&config, false, 128).expect("config");
+    assert_eq!(parsed.max_waiting_ledgers, 64);
+    assert_eq!(parsed.recovery_wait, Duration::from_secs(1));
 }

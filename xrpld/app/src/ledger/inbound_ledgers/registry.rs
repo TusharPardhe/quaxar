@@ -36,7 +36,7 @@ use super::acquisition::{
     ProvisionalLedgerIdentity,
 };
 use super::coordinator_adapter::{
-    BrokerTicketState, CoordinatorIngress, LedgerDataIngressDisposition,
+    BrokerTicketState, CoordinatorIngress, CoordinatorOwnerWake, LedgerDataIngressDisposition,
 };
 use super::coordinator_engine::{CoordinatorPlanSeed, CoordinatorSessionOrigins};
 use super::coordinator_ports::{
@@ -78,9 +78,10 @@ pub(crate) struct CoordinatorAcquireOutcome {
     pub(crate) effects: Vec<AcquisitionEffect>,
 }
 
-/// rippled's `JtLedgerData` JobType permits at most three running jobs.
-/// This bounds packet processing while leaving the inbound registry free to
-/// track any number of hash-deduplicated acquisitions.
+/// rippled's global `JtLedgerData` JobQueue category runs at most three jobs.
+/// `InboundLedger` separately refuses to queue a timeout job once five total
+/// ledger-data jobs exist; `AcquisitionReadyScheduler` models that five-job
+/// admission boundary while this executor models the three running workers.
 const WORKER_COUNT: usize = 3;
 
 /// Acquire the registry `inner` mutex, recording the time spent blocked on the
@@ -765,11 +766,9 @@ pub struct InboundLedgers {
     /// Shared lifecycle counters incremented at request, wire, worker, retry,
     /// and terminal boundaries. The sampled snapshot never mutates state.
     lifecycle: Arc<AcquisitionLifecycleCounters>,
-    /// Coordinator-owned session lifecycle. Installed once the NodeStore and
-    /// the NetworkOps phase state are configured; when installed it is the
-    /// single session lifecycle owner for every target it creates. `None`
-    /// preserves the legacy `AcquisitionState` path behind the M4.2-C3
-    /// switchover, so the rollback feature flag is "never install". A mutex
+    /// Production coordinator and sole acquisition lifecycle owner. Bootstrap
+    /// installs it before acquisition ingress and a dedicated thread drains
+    /// its bounded work; NetworkOps never executes a drain. A mutex
     /// (not `RwLock`) is required because the adapter's event receiver is not
     /// `Sync`; ingress/owner calls serialize through this short lock.
     /// Mutable owner for coordinator lifecycle transitions and effect dispatch.
@@ -780,6 +779,9 @@ pub struct InboundLedgers {
     /// It is published before any request effect can synchronously yield a
     /// reply, so ingress never re-enters the mutable coordinator lock.
     coordinator_ingress: RwLock<Option<CoordinatorIngress>>,
+    /// Wake capability shared by every completion producer and the dedicated
+    /// serialized acquisition owner. NetworkOps never drains this owner.
+    coordinator_wake: RwLock<Option<Arc<CoordinatorOwnerWake>>>,
     /// Per-session `(sequence, reason)` origins the coordinator plan seed
     /// resolves when a Base/header packet arrives. Registered exactly once per
     /// requested session.
@@ -789,9 +791,7 @@ pub struct InboundLedgers {
     /// Newest NodeStore generation published by the online-delete worker.
     /// Only the serialized coordinator owner consumes and applies this fact.
     pending_store_generation: AtomicU64,
-    /// The NetworkOps state the coordinator phase port publishes to. Wired by
-    /// ApplicationRoot before coordinator installation; the coordinator is the
-    /// single production mode writer for the sessions it owns.
+    /// Phase publication capability used by the production coordinator.
     coordinator_phase: RwLock<Option<AppNetworkOpsModeOwner>>,
 }
 
@@ -899,6 +899,7 @@ impl InboundLedgers {
             lifecycle: Arc::new(AcquisitionLifecycleCounters::default()),
             coordinator: Mutex::new(None),
             coordinator_ingress: RwLock::new(None),
+            coordinator_wake: RwLock::new(None),
             coordinator_origins: CoordinatorSessionOrigins::default(),
             coordinator_budget,
             pending_store_generation: AtomicU64::new(0),
@@ -925,11 +926,9 @@ impl InboundLedgers {
         *guard = Some(ns);
     }
 
-    // ─── Coordinator-owned session lifecycle (M4.2-C2/C3) ───────────────
+    // ─── Coordinator parity harness ──────────────────────────────────────
 
-    /// Wire the NetworkOps phase state the coordinator publishes to. The
-    /// coordinator is the single production mode writer for the sessions it
-    /// owns; it never reads a mode back from this state.
+    /// Wire the phase publication capability before coordinator installation.
     pub(crate) fn set_phase_mode_owner(&self, owner: AppNetworkOpsModeOwner) {
         *self
             .coordinator_phase
@@ -954,8 +953,7 @@ impl InboundLedgers {
         ));
     }
 
-    /// Whether the coordinator owns session lifecycle. When false, `acquire`
-    /// uses the legacy `AcquisitionState` path (M4.2-C3 rollback flag).
+    /// Whether the production coordinator is installed.
     pub fn coordinator_installed(&self) -> bool {
         self.coordinator.lock().expect("coordinator lock").is_some()
     }
@@ -975,9 +973,7 @@ impl InboundLedgers {
     /// replacing the live owner. Installation is rejected while a legacy actor
     /// is live: those actors retain independent mailbox, scheduler, timer, and
     /// tree-plan ownership and cannot coexist with coordinator sessions.
-    /// Bootstrap installs before any acquisition can begin; keeping the
-    /// coordinator absent is the explicit compatibility fallback. Requires
-    /// the NodeStore, the phase state, and (optionally) the overlay runtime to
+    /// Requires the NodeStore, phase state, and (optionally) overlay runtime to
     /// be configured first.
     pub fn install_coordinator(&self) -> bool {
         if self.coordinator_installed() {
@@ -1043,6 +1039,7 @@ impl InboundLedgers {
             phase_mode_owner,
         });
         let ingress = adapter.ingress();
+        let wake = adapter.owner_wake();
         let mut guard = self.coordinator.lock().expect("coordinator lock");
         if guard.is_none() {
             // Publish before the adapter can dispatch any future peer request.
@@ -1051,6 +1048,10 @@ impl InboundLedgers {
                 .coordinator_ingress
                 .write()
                 .expect("coordinator ingress write") = Some(ingress);
+            *self
+                .coordinator_wake
+                .write()
+                .expect("coordinator wake write") = Some(wake);
             *guard = Some(adapter);
             true
         } else {
@@ -1082,8 +1083,8 @@ impl InboundLedgers {
     }
 
     /// Drain one bounded coordinator burst and report whether the owner hit a
-    /// work boundary. The NetworkOps strand uses the second value solely to
-    /// suppress its idle wait; all lifecycle mutation remains in `drain`.
+    /// work boundary. The dedicated executor uses the second value to suppress
+    /// its idle wait; NetworkOps never calls this production loop.
     pub fn coordinator_drain_with_status(&self) -> (usize, bool) {
         let (handled, failures) = {
             let mut guard = self.coordinator.lock().expect("coordinator lock");
@@ -1109,6 +1110,48 @@ impl InboundLedgers {
         handled
     }
 
+    /// Run the coordinator on its own serialized execution lane. This is the
+    /// Rust equivalent of rippled's bounded `jtLEDGER_DATA` job boundary: the
+    /// runner remains the sole lifecycle owner, while NetworkOps only submits
+    /// policy facts and overlay/NodeStore threads only submit typed events.
+    pub fn spawn_coordinator_owner(
+        self: &Arc<Self>,
+        stop: Arc<AtomicBool>,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let wake = self
+            .coordinator_wake
+            .read()
+            .expect("coordinator wake read")
+            .clone()?;
+        let inbound = Arc::clone(self);
+        Some(
+            std::thread::Builder::new()
+                .name("acquisition-owner".to_owned())
+                .spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        let observed = wake.generation();
+                        loop {
+                            let (_, has_more) = inbound.coordinator_drain_with_status();
+                            if !has_more || stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                        wake.wait_for_change(observed, &stop, Duration::from_millis(50));
+                    }
+                    // Shutdown is a typed owner fact. Drain its cancellation
+                    // effects before dependent pools are stopped.
+                    loop {
+                        let (_, has_more) = inbound.coordinator_drain_with_status();
+                        if !has_more {
+                            break;
+                        }
+                    }
+                })
+                .expect("spawn acquisition coordinator owner"),
+        )
+    }
+
     /// Publish a completed NodeStore rotation without mutating acquisition
     /// state from the online-delete worker. Bursts coalesce to the newest
     /// generation and remain retained until the owner drains them.
@@ -1116,6 +1159,14 @@ impl InboundLedgers {
         if generation != 0 {
             self.pending_store_generation
                 .fetch_max(generation, Ordering::Release);
+            if let Some(wake) = self
+                .coordinator_wake
+                .read()
+                .expect("coordinator wake read")
+                .as_ref()
+            {
+                wake.notify();
+            }
         }
     }
 
@@ -1132,7 +1183,7 @@ impl InboundLedgers {
             };
             coordinator.refresh_peers(self.coordinator_peer_snapshot());
             coordinator.connectivity(peers);
-            coordinator.drain();
+            coordinator.owner_wake().notify();
             coordinator.take_terminal_failures()
         };
         self.record_coordinator_failures(failures);
@@ -1149,7 +1200,7 @@ impl InboundLedgers {
             };
             coordinator.refresh_peers(self.coordinator_peer_snapshot());
             coordinator.transport_connectivity(peers);
-            coordinator.drain();
+            coordinator.owner_wake().notify();
             coordinator.take_terminal_failures()
         };
         self.record_coordinator_failures(failures);
@@ -1169,7 +1220,7 @@ impl InboundLedgers {
             } else {
                 coordinator.consensus_quorum_lost();
             }
-            coordinator.drain();
+            coordinator.owner_wake().notify();
             coordinator.take_terminal_failures()
         };
         self.record_coordinator_failures(failures);
@@ -1259,7 +1310,7 @@ impl InboundLedgers {
                     true,
                 );
             }
-            coordinator.drain();
+            coordinator.owner_wake().notify();
             coordinator.take_terminal_failures()
         };
         self.record_coordinator_failures(failures);
@@ -1351,7 +1402,7 @@ impl InboundLedgers {
                     self.coordinator_origins.remove(target.hash());
                 }
             }
-            coordinator.drain();
+            coordinator.owner_wake().notify();
             coordinator.take_terminal_failures()
         };
         self.record_coordinator_failures(failures);
@@ -1368,7 +1419,7 @@ impl InboundLedgers {
                 return false;
             };
             coordinator.consensus_view_change();
-            coordinator.drain();
+            coordinator.owner_wake().notify();
             coordinator.take_terminal_failures()
         };
         self.record_coordinator_failures(failures);
@@ -1386,7 +1437,7 @@ impl InboundLedgers {
                 return false;
             };
             coordinator.preferred_lcl_divergence(target);
-            coordinator.drain();
+            coordinator.owner_wake().notify();
             coordinator.take_terminal_failures()
         };
         self.record_coordinator_failures(failures);
@@ -1415,7 +1466,7 @@ impl InboundLedgers {
                 return false;
             };
             coordinator.blocked_with_no_target();
-            coordinator.drain();
+            coordinator.owner_wake().notify();
             coordinator.take_terminal_failures()
         };
         self.record_coordinator_failures(failures);
@@ -1455,7 +1506,11 @@ impl InboundLedgers {
         let Some(coordinator) = guard.as_mut() else {
             return false;
         };
-        coordinator.retain_durable_handoff_ack(handoff, session)
+        let retained = coordinator.retain_durable_handoff_ack(handoff, session);
+        if retained {
+            coordinator.owner_wake().notify();
+        }
+        retained
     }
 
     /// True only while the coordinator still awaits this exact recipient ack.
@@ -1666,10 +1721,8 @@ impl InboundLedgers {
             );
             return None;
         };
-        let handled = coordinator.drain();
-        let failures = coordinator.take_terminal_failures();
+        coordinator.owner_wake().notify();
         drop(coordinator_guard);
-        self.record_coordinator_failures(failures);
         tracing::info!(
             target: "inbound_ledger",
             %hash,
@@ -1677,7 +1730,6 @@ impl InboundLedgers {
             ?reason,
             session_id = session.session_id().get(),
             acquisition_id,
-            handled,
             "coordinator_acquire: session requested"
         );
         Some(CoordinatorAcquireOutcome {
@@ -1716,6 +1768,7 @@ impl InboundLedgers {
             return;
         };
         coordinator.handle_fact(acquisition::AcquisitionEvent::Shutdown);
+        coordinator.owner_wake().notify();
     }
 
     /// Install the app-owned `LedgerMaster::storeLedger` equivalent used by
@@ -3847,6 +3900,36 @@ mod tests {
     ) -> Arc<super::super::acquisition::AcquisitionState> {
         let inner = registry.inner.lock().expect("registry lock");
         Arc::clone(&inner.entries.get(hash).expect("active acquisition").state)
+    }
+
+    #[test]
+    fn production_registry_uses_rippled_ledger_data_boundaries() {
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let registry = InboundLedgers::new(
+            Arc::new(TreeNodeCache::new(
+                "production-worker-boundary-test",
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            Arc::new(FullBelowCacheImpl::new(
+                1,
+                MonotonicClock::default(),
+                HardenedHashBuilder::default(),
+                8,
+            )),
+            Arc::new(FetchPackCache::new(
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            completed_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(registry.worker_pool.snapshot().worker_count, 3);
+        assert!(!registry.coordinator_installed());
+        registry.stop();
     }
 
     #[test]

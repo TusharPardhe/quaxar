@@ -476,3 +476,103 @@ fn account_lines_negative_limit_rejected() {
         "negative limit should produce an error"
     );
 }
+
+#[test]
+fn account_lines_rejects_every_non_string_peer() {
+    let account = sample_account(0x99);
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        account_roots: BTreeMap::from([(account, make_account_root(account))]),
+        ..Default::default()
+    };
+    for peer in [
+        JsonValue::Unsigned(1),
+        JsonValue::Signed(-1),
+        JsonValue::Bool(true),
+        JsonValue::Null,
+        JsonValue::Array(Vec::new()),
+        JsonValue::Object(BTreeMap::new()),
+    ] {
+        let result = do_account_lines(
+            &AccountLinesRequest {
+                params: &object([
+                    ("account", JsonValue::String(to_base58(account))),
+                    ("peer", peer),
+                ]),
+                api_version: 2,
+                role: Role::Admin,
+            },
+            &source,
+        );
+        let JsonValue::Object(result) = result else {
+            panic!("response must be an object")
+        };
+        assert_eq!(
+            result.get("error"),
+            Some(&JsonValue::String("invalidParams".to_owned()))
+        );
+        assert_eq!(
+            result.get("error_message"),
+            Some(&JsonValue::String("Invalid field 'peer'.".to_owned()))
+        );
+    }
+}
+
+#[test]
+fn account_lines_peer_type_matrix_uses_canonical_errors_in_both_api_versions() {
+    let account = sample_account(0xA1);
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        account_roots: BTreeMap::from([(account, make_account_root(account))]),
+        ..Default::default()
+    };
+    // JSON floats are normalized to Null by protocol::JsonValue; construct it
+    // through serde_json to cover the wire-format float path explicitly.
+    let cases = [
+        ("unsigned integer", JsonValue::Unsigned(1)),
+        ("signed integer", JsonValue::Signed(-1)),
+        ("float", JsonValue::from(serde_json::json!(1.5))),
+        ("boolean", JsonValue::Bool(true)),
+        ("null", JsonValue::Null),
+        ("object", JsonValue::Object(BTreeMap::new())),
+        ("array", JsonValue::Array(Vec::new())),
+    ];
+
+    for api_version in [1, 2] {
+        for (kind, peer) in &cases {
+            let result = do_account_lines(
+                &AccountLinesRequest {
+                    params: &object([
+                        ("account", JsonValue::String(to_base58(account))),
+                        ("peer", peer.clone()),
+                    ]),
+                    api_version,
+                    role: Role::Admin,
+                },
+                &source,
+            );
+            let JsonValue::Object(result) = result else {
+                panic!("{kind} peer result must be an object");
+            };
+            assert_eq!(
+                result.get("error"),
+                Some(&JsonValue::String("invalidParams".to_owned())),
+                "API v{api_version}, {kind}",
+            );
+            assert_eq!(
+                result.get("error_code"),
+                Some(&JsonValue::Signed(31)),
+                "API v{api_version}, {kind}",
+            );
+            assert_eq!(
+                result.get("error_message"),
+                Some(&JsonValue::String("Invalid field 'peer'.".to_owned())),
+                "API v{api_version}, {kind}",
+            );
+            assert!(
+                !result.contains_key("ledger_hash") && !result.contains_key("ledger_index"),
+                "field error must retain its direct error envelope (API v{api_version}, {kind})",
+            );
+        }
+    }
+}

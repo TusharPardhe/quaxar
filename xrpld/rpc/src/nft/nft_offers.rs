@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use basics::base_uint::Uint256;
 use protocol::{
     JsonOptions, JsonValue, STLedgerEntry, STVector256, StBase, get_field_by_symbol,
-    nft_buy_offers_keylet, nft_offer_keylet, nft_sell_offers_keylet, page_keylet,
+    lsfSellNFToken, nft_buy_offers_keylet, nft_offer_keylet, nft_sell_offers_keylet, page_keylet,
 };
 
 use crate::commands::rpc_helpers::{
@@ -244,15 +244,15 @@ fn enumerate_nft_offers<S: NFTOffersSource>(
         NFTOfferKind::Buy => nft_buy_offers_keylet(nft_id),
         NFTOfferKind::Sell => nft_sell_offers_keylet(nft_id),
     };
-    if source.read_directory_page(&ledger, directory.key).is_none() {
-        return rpc_error(RpcErrorCode::ObjectNotFound);
-    }
 
     let mut offers = Vec::new();
     let mut reserve = limit;
     let mut start_after = Uint256::zero();
     let mut start_hint = 0u64;
 
+    // A marker identifies an offer, not a directory page. Validate it before
+    // consulting the requested side's directory so a buy/sell-side mismatch
+    // is rejected without any target-directory read or traversal.
     if let Some(marker) = marker {
         let Some(offer) = source.read_nft_offer(&ledger, nft_offer_keylet(marker).key) else {
             return rpc_error(RpcErrorCode::InvalidParams);
@@ -260,11 +260,19 @@ fn enumerate_nft_offers<S: NFTOffersSource>(
         if offer.get_field_h256(get_field_by_symbol("sfNFTokenID")) != nft_id {
             return rpc_error(RpcErrorCode::InvalidParams);
         }
+        let marker_is_sell = offer.is_flag(lsfSellNFToken);
+        if marker_is_sell != matches!(kind, NFTOfferKind::Sell) {
+            return rpc_error(RpcErrorCode::InvalidParams);
+        }
         start_after = marker;
         start_hint = offer.get_field_u64(get_field_by_symbol("sfNFTokenOfferNode"));
         append_nft_offer_json(&offer, &mut offers);
     } else {
         reserve += 1;
+    }
+
+    if source.read_directory_page(&ledger, directory.key).is_none() {
+        return rpc_error(RpcErrorCode::ObjectNotFound);
     }
 
     let keys = match collect_offer_keys_after(

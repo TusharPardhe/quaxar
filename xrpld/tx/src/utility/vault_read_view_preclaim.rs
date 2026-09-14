@@ -8,18 +8,18 @@ use basics::base_uint::{Uint160, Uint192};
 use ledger::{ReadView, RelativeDistanceAmount};
 use protocol::{
     AccountID, Asset, MPTIssue, STAmount, STLedgerEntry, STTx, Ter, TxType, get_field_by_symbol,
-    lsfAccepted, lsfAllowTrustLineClawback, lsfGlobalFreeze, lsfHighAuth, lsfHighFreeze,
-    lsfLowAuth, lsfLowFreeze, lsfMPTCanClawback, lsfMPTLocked, lsfMPTRequireAuth, lsfNoFreeze,
-    lsfRequireAuth,
+    lsfAccepted, lsfAllowTrustLineClawback, lsfDepositAuth, lsfGlobalFreeze, lsfHighAuth,
+    lsfHighFreeze, lsfLowAuth, lsfLowFreeze, lsfMPTCanClawback, lsfMPTLocked, lsfMPTRequireAuth,
+    lsfNoFreeze, lsfRequireAuth, lsfRequireDestTag,
 };
 
 use crate::{
     VaultClawbackPreclaimFacts, VaultClawbackSelectedAmountAssetKind, VaultClawbackVaultAssetKind,
     VaultCreatePreclaimFacts, VaultDeletePreclaimFacts, VaultDepositPreclaimFacts,
     VaultSetPreclaimFacts, VaultWithdrawPreclaimFrontFacts, VaultWithdrawPreclaimTailFacts,
-    VaultWithdrawRequireAuthType, VaultWithdrawShareBranchResult, run_vault_clawback_preclaim,
-    run_vault_create_preclaim, run_vault_delete_preclaim, run_vault_deposit_preclaim,
-    run_vault_set_preclaim, run_vault_withdraw_preclaim,
+    VaultWithdrawShareBranchResult, run_vault_clawback_preclaim, run_vault_create_preclaim,
+    run_vault_delete_preclaim, run_vault_deposit_preclaim, run_vault_set_preclaim,
+    run_vault_withdraw_preclaim,
 };
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -407,6 +407,68 @@ fn vault_phase<V: ReadView>(view: &V, vault: &STLedgerEntry) -> VaultPhase {
     VaultPhase::Redemption
 }
 
+fn is_pseudo_account<V: ReadView>(view: &V, account: AccountID) -> Result<bool, Ter> {
+    Ok(read_account(view, account)?.is_some_and(|sle| {
+        sle.is_field_present(sf("sfVaultID"))
+            || sle.is_field_present(sf("sfLoanBrokerID"))
+            || sle.is_field_present(sf("sfAMMID"))
+    }))
+}
+
+fn valid_vault_domain<V: ReadView>(
+    view: &V,
+    issuance: &STLedgerEntry,
+    subject: AccountID,
+) -> Result<Ter, Ter> {
+    match issuance.is_field_present(sf("sfDomainID")) {
+        true => ledger::credential_helpers::valid_domain(
+            view,
+            issuance.get_field_h256(sf("sfDomainID")),
+            &subject,
+        )
+        .map_err(|_| read_error()),
+        false => Ok(Ter::TEC_NO_AUTH),
+    }
+}
+
+fn can_vault_withdraw<V: ReadView>(
+    view: &V,
+    tx: &STTx,
+    source: AccountID,
+    destination: AccountID,
+) -> Result<Ter, Ter> {
+    let Some(destination_sle) = read_account(view, destination)? else {
+        return Ok(Ter::TEC_NO_DST);
+    };
+    if destination_sle.is_flag(lsfRequireDestTag) && !tx.is_field_present(sf("sfDestinationTag")) {
+        return Ok(Ter::TEC_DST_TAG_NEEDED);
+    }
+    if source == destination || !destination_sle.is_flag(lsfDepositAuth) {
+        return Ok(Ter::TES_SUCCESS);
+    }
+    if tx.is_field_present(sf("sfCredentialIDs")) {
+        return ledger::credential_helpers::authorized_deposit_preauth(
+            view,
+            &tx.get_field_v256(sf("sfCredentialIDs")),
+            &destination,
+        )
+        .map_err(|_| read_error());
+    }
+    Ok(
+        if view
+            .exists(protocol::deposit_preauth_keylet(
+                Uint160::from_void(destination.data()),
+                Uint160::from_void(source.data()),
+            ))
+            .map_err(|_| read_error())?
+        {
+            Ter::TES_SUCCESS
+        } else {
+            Ter::TEC_NO_PERMISSION
+        },
+    )
+}
+
 fn preclaim_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
     let asset = tx.get_field_issue(sf("sfAsset")).asset();
@@ -601,6 +663,10 @@ fn preclaim_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             || Ter::TES_SUCCESS,
         ));
     };
+    // LendingProtocolV1_1 closed-ended vaults accept withdrawals during
+    // Subscription and Redemption, but not while funds are committed to the
+    // Investment phase. Keep this gate after the vault lookup so a missing
+    // vault retains its established tecNO_ENTRY result.
     if view
         .rules()
         .enabled(&protocol::feature_id("LendingProtocolV1_1"))
@@ -608,89 +674,117 @@ fn preclaim_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     {
         return Ok(Ter::TEC_TOO_SOON);
     }
+
     let amount = tx.get_field_amount(sf("sfAmount"));
     let asset = vault.get_field_issue(sf("sfAsset")).asset();
     let share = MPTIssue::new(vault.get_field_h192(sf("sfShareMPTID")));
+    if amount.asset() != asset && amount.asset() != Asset::MPTIssue(share) {
+        return Ok(Ter::TEC_WRONG_ASSET);
+    }
+
+    // Keep the recovery-path transferability decision ahead of credentials,
+    // exactly as rippled does. Credentials must nevertheless be validated
+    // before any destination/deposit-preauth path consumes them.
+    let transfer = can_transfer(
+        view,
+        asset,
+        vault.get_account_id(sf("sfAccount")),
+        destination,
+        view.rules()
+            .enabled(&protocol::feature_id("fixCleanup3_2_0")),
+    )?;
+    if transfer != Ter::TES_SUCCESS {
+        return Ok(transfer);
+    }
+    if vault.get_field_u8(sf("sfWithdrawalPolicy"))
+        != protocol::VAULT_STRATEGY_FIRST_COME_FIRST_SERVE
+    {
+        return Ok(Ter::TEF_INTERNAL);
+    }
+
+    let credentials =
+        ledger::credential_helpers::valid(view, tx, &account).map_err(|_| Ter::TEF_BAD_LEDGER)?;
+    if credentials != Ter::TES_SUCCESS {
+        return Ok(credentials);
+    }
+    if view.rules().enabled(&protocol::fix_cleanup_3_4_0()) && is_pseudo_account(view, destination)?
+    {
+        return Ok(Ter::TEC_PSEUDO_ACCOUNT);
+    }
+
     let issuance = read_issuance(view, share.mpt_id())?;
+    let withdraw_authorization =
+        can_vault_withdraw(view, tx, vault.get_account_id(sf("sfAccount")), destination)?;
+    if withdraw_authorization != Ter::TES_SUCCESS {
+        return Ok(withdraw_authorization);
+    }
+
     let available = vault.get_field_number(sf("sfAssetsAvailable")).value();
-    let direct = if amount.asset() == asset && amount.as_number() <= available {
-        Ter::TES_SUCCESS
-    } else {
-        Ter::TEC_INSUFFICIENT_FUNDS
-    };
-    let share_branch = if let Some(issuance) = issuance.as_ref() {
+    let use_share_branch = view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_1_3"))
+        && amount.asset() == Asset::MPTIssue(share);
+    if use_share_branch {
+        let Some(issuance) = issuance.as_ref() else {
+            return Ok(Ter::TEF_INTERNAL);
+        };
         match ledger::vault_helpers::shares_to_assets_withdraw(
             &vault,
             issuance,
             &amount,
             ledger::vault_helpers::WaiveUnrealizedLoss::No,
         ) {
-            Some(converted) if converted.as_number() <= available => {
-                VaultWithdrawShareBranchResult::Success
-            }
-            Some(_) => {
-                VaultWithdrawShareBranchResult::CanWithdrawFailure(Ter::TEC_INSUFFICIENT_FUNDS)
-            }
-            None => VaultWithdrawShareBranchResult::MissingConvertedAssets,
+            Some(converted) if converted.as_number() <= available => {}
+            Some(_) => return Ok(Ter::TEC_INSUFFICIENT_FUNDS),
+            None => return Ok(Ter::TEF_INTERNAL),
         }
-    } else {
-        VaultWithdrawShareBranchResult::MissingConvertedAssets
-    };
-    Ok(run_vault_withdraw_preclaim(
-        VaultWithdrawPreclaimFrontFacts {
-            vault_exists: true,
-            amount_asset_matches_vault_asset_or_share: amount.asset() == asset
-                || amount.asset() == Asset::MPTIssue(share),
-            withdrawal_policy_is_first_come_first_serve: vault
-                .get_field_u8(sf("sfWithdrawalPolicy"))
-                == protocol::VAULT_STRATEGY_FIRST_COME_FIRST_SERVE,
-            fix_cleanup_3_1_3_enabled: view
-                .rules()
-                .enabled(&protocol::feature_id("fixCleanup3_1_3")),
-            amount_asset_is_vault_share: amount.asset() == Asset::MPTIssue(share),
-            share_issuance_exists: issuance.is_some(),
-        },
-        VaultWithdrawPreclaimTailFacts {
-            destination_is_submitter: destination == account,
-            fix_cleanup_3_3_0_enabled: view
-                .rules()
-                .enabled(&protocol::feature_id("fixCleanup3_3_0")),
-        },
-        || {
-            can_transfer(
-                view,
-                asset,
-                vault.get_account_id(sf("sfAccount")),
-                destination,
-                view.rules()
-                    .enabled(&protocol::feature_id("fixCleanup3_2_0")),
-            )
-            .unwrap_or(Ter::TEF_BAD_LEDGER)
-        },
-        || share_branch,
-        || direct,
-        |auth| {
-            require_auth(
-                view,
-                destination,
-                asset,
-                matches!(auth, VaultWithdrawRequireAuthType::StrongAuth),
-            )
-            .unwrap_or(Ter::TEF_BAD_LEDGER)
-        },
-        || {
-            check_withdraw_freeze(
-                view,
-                vault.get_account_id(sf("sfAccount")),
-                account,
-                destination,
-                asset,
-            )
-            .unwrap_or(Ter::TEF_BAD_LEDGER)
-        },
-        || asset_frozen(view, account, Asset::MPTIssue(share)).unwrap_or(Ter::TEF_BAD_LEDGER),
-        || asset_frozen(view, destination, asset).unwrap_or(Ter::TEF_BAD_LEDGER),
-    ))
+    } else if amount.asset() != asset || amount.as_number() > available {
+        return Ok(Ter::TEC_INSUFFICIENT_FUNDS);
+    }
+
+    let auth = require_auth(view, destination, asset, destination != account)?;
+    if auth != Ter::TES_SUCCESS {
+        return Ok(auth);
+    }
+
+    // The private-vault permissioned-domain matrix is intentionally applied
+    // only to third-party destinations. Self withdrawal remains an exit path,
+    // and returning the underlying IOU or MPT to its issuer remains allowed.
+    if view.rules().enabled(&protocol::fix_cleanup_3_4_0())
+        && vault.is_flag(protocol::lsfVaultPrivate)
+        && destination != account
+        && destination != asset.issuer()
+    {
+        let Some(issuance) = issuance.as_ref() else {
+            return Ok(Ter::TEF_INTERNAL);
+        };
+        let sender_domain = valid_vault_domain(view, issuance, account)?;
+        if sender_domain != Ter::TES_SUCCESS {
+            return Ok(sender_domain);
+        }
+        let destination_domain = valid_vault_domain(view, issuance, destination)?;
+        if destination_domain != Ter::TES_SUCCESS {
+            return Ok(destination_domain);
+        }
+    }
+
+    if view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_3_0"))
+    {
+        return check_withdraw_freeze(
+            view,
+            vault.get_account_id(sf("sfAccount")),
+            account,
+            destination,
+            asset,
+        );
+    }
+    let destination_frozen = asset_frozen(view, destination, asset)?;
+    if destination_frozen != Ter::TES_SUCCESS {
+        return Ok(destination_frozen);
+    }
+    asset_frozen(view, account, Asset::MPTIssue(share))
 }
 
 fn preclaim_clawback<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
@@ -704,6 +798,9 @@ fn preclaim_clawback<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let asset = vault.get_field_issue(sf("sfAsset")).asset();
     let share = MPTIssue::new(vault.get_field_h192(sf("sfShareMPTID")));
     let issuance = read_issuance(view, share.mpt_id())?;
+    if view.rules().enabled(&protocol::fix_cleanup_3_4_0()) && is_pseudo_account(view, holder)? {
+        return Ok(Ter::TEC_PSEUDO_ACCOUNT);
+    }
     let amount = if tx.is_field_present(sf("sfAmount")) {
         tx.get_field_amount(sf("sfAmount"))
     } else {
@@ -803,12 +900,14 @@ mod tests {
     use ledger::{Fees, LedgerHeader, ReadView, ReadViewTx, Rules, ViewError};
     use protocol::{AccountID, Asset, LedgerEntryType, STIssue, STLedgerEntry, STTx, Ter, TxType};
 
-    use super::{run_vault_read_view_preclaim, sf};
+    use super::{VaultPhase, run_vault_read_view_preclaim, sf, vault_phase};
 
     #[derive(Debug, Default)]
     struct View {
         entries: BTreeMap<Uint256, Arc<STLedgerEntry>>,
         fail_reads: bool,
+        header: LedgerHeader,
+        rules: Rules,
     }
     impl View {
         fn insert(&mut self, entry: STLedgerEntry) {
@@ -820,13 +919,13 @@ mod tests {
             false
         }
         fn header(&self) -> LedgerHeader {
-            LedgerHeader::default()
+            self.header.clone()
         }
         fn fees(&self) -> Fees {
             Fees::default()
         }
         fn rules(&self) -> Rules {
-            Rules::default()
+            self.rules.clone()
         }
         fn exists(&self, keylet: protocol::Keylet) -> Result<bool, ViewError> {
             Ok(self.entries.contains_key(&keylet.key))
@@ -921,5 +1020,47 @@ mod tests {
             Some(Ter::TEC_NO_PERMISSION)
         );
         assert_eq!(view.entries.len(), 1, "ReadView helper must not mutate");
+    }
+    #[test]
+    fn closed_ended_phase_boundaries_and_withdraw_gate_match_v1_1() {
+        let id = Uint256::from_u64(99);
+        let mut closed = vault(id, account(1), account(2));
+        closed.set_field_u8(sf("sfVaultKind"), 1);
+        closed.set_field_u32(sf("sfSubscriptionDate"), 100);
+        closed.set_field_u32(sf("sfRedemptionDate"), 280);
+
+        let phase_at = |now| {
+            let view = View {
+                header: LedgerHeader {
+                    parent_close_time: now,
+                    ..LedgerHeader::default()
+                },
+                ..View::default()
+            };
+            vault_phase(&view, &closed)
+        };
+        assert_eq!(phase_at(99), VaultPhase::Subscription);
+        assert_eq!(phase_at(100), VaultPhase::Subscription);
+        assert_eq!(phase_at(101), VaultPhase::Investment);
+        assert_eq!(phase_at(279), VaultPhase::Investment);
+        assert_eq!(phase_at(280), VaultPhase::Redemption);
+
+        let mut view = View {
+            header: LedgerHeader {
+                parent_close_time: 101,
+                ..LedgerHeader::default()
+            },
+            rules: Rules::new([protocol::feature_id("LendingProtocolV1_1")]),
+            ..View::default()
+        };
+        view.insert(closed);
+        let tx = STTx::new(TxType::VAULT_WITHDRAW, |tx| {
+            tx.set_field_h256(sf("sfVaultID"), id);
+            tx.set_account_id(sf("sfAccount"), account(1));
+        });
+        assert_eq!(
+            run_vault_read_view_preclaim(&view, &tx, TxType::VAULT_WITHDRAW),
+            Some(Ter::TEC_TOO_SOON)
+        );
     }
 }

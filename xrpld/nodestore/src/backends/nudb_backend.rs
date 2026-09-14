@@ -854,6 +854,22 @@ pub struct NuDbBackend {
     pub metrics: Arc<NuDbMetrics>,
 }
 
+impl Drop for NuDbBackend {
+    fn drop(&mut self) {
+        // DatabaseRotating retires an archive by marking it for deletion and
+        // dropping its final Arc after the pair swap. C++ Backend::~Backend
+        // closes the backend at that ownership boundary; mirror that RAII
+        // contract so NuDB observes delete_path and removes the retired
+        // generation instead of merely letting its file descriptors close.
+        if let Err(error) = Backend::close(self) {
+            self.journal.log(
+                JournalLevel::Error,
+                &format!("NuDB close during drop failed: {error}"),
+            );
+        }
+    }
+}
+
 /// Persistent file descriptors for NuDB key and data files.
 /// Uses pread/pwrite for thread-safe positional I/O without seeking.
 struct NuDbPersistentFds {

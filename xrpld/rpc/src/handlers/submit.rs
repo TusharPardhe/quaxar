@@ -33,8 +33,10 @@ pub fn run_submit_validity_gate(
 mod tests {
     use super::{
         FAILS_LOCAL_CHECKS_PREFIX, INVALID_TRANSACTION_ERROR, SubmitValidityFailure,
-        run_submit_validity_gate, submit_semantic_preflight,
+        account_keylet_for, run_submit_validity_gate, submit_semantic_preflight,
+        submit_semantic_preflight_with_ledger,
     };
+    use ledger::RawView;
     use protocol::{
         AccountID, Permission, Rules, STAmount, STArray, STObject, STTx, STXChainBridge, Ter,
         TxType, get_field_by_symbol,
@@ -690,6 +692,137 @@ mod tests {
         assert_eq!(
             submit_semantic_preflight(&tx, &rules_with_tx_enabled(TxType::MPTOKEN_ISSUANCE_SET)),
             Ter::TEM_MALFORMED
+        );
+    }
+
+    #[test]
+    fn rpc_submit_unauthorize_rejects_locked_mptoken_with_cleanup_3_4_0_only() {
+        let holder = account(0x67);
+        let issuer = account(0x68);
+        let mut id_bytes = [0_u8; 24];
+        id_bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
+        id_bytes[4..].copy_from_slice(issuer.data());
+        let issuance_id =
+            basics::base_uint::Uint192::from_slice(&id_bytes).expect("MPToken issuance ID width");
+
+        let mut issuance = protocol::STLedgerEntry::from_type_and_key(
+            protocol::LedgerEntryType::MPTokenIssuance,
+            protocol::mpt_issuance_keylet_from_mptid(issuance_id).key,
+        );
+        issuance.set_account_id(get_field_by_symbol("sfIssuer"), issuer);
+        issuance.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        issuance.set_field_u64(get_field_by_symbol("sfOutstandingAmount"), 0);
+        issuance.set_field_u32(get_field_by_symbol("sfFlags"), protocol::lsfMPTCanTransfer);
+
+        let mut token = protocol::STLedgerEntry::from_type_and_key(
+            protocol::LedgerEntryType::MPToken,
+            protocol::mptoken_keylet_from_mptid(
+                issuance_id,
+                basics::base_uint::Uint160::from_slice(holder.data()).expect("account width"),
+            )
+            .key,
+        );
+        token.set_account_id(get_field_by_symbol("sfAccount"), holder);
+        token.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), issuance_id);
+        token.set_field_u64(get_field_by_symbol("sfMPTAmount"), 0);
+        token.set_field_u32(get_field_by_symbol("sfFlags"), protocol::lsfMPTLocked);
+
+        let mut ledger = ledger::Ledger::from_ledger_seq_and_close_time(1, 0, false);
+        ledger
+            .raw_insert(std::sync::Arc::new(issuance))
+            .expect("issuance insertion");
+        ledger
+            .raw_insert(std::sync::Arc::new(token))
+            .expect("token insertion");
+
+        let mpt_feature = Permission::get_instance()
+            .get_tx_feature(TxType::MPTOKEN_AUTHORIZE)
+            .expect("MPTokenAuthorize feature");
+        let rules = Rules::new([mpt_feature, protocol::fix_cleanup_3_4_0()]);
+        let tx = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
+            object.set_account_id(get_field_by_symbol("sfAccount"), holder);
+            object.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), issuance_id);
+            object.set_field_u32(get_field_by_symbol("sfFlags"), protocol::tfMPTUnauthorize);
+            object.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+        });
+
+        assert_eq!(
+            submit_semantic_preflight_with_ledger(&tx, &rules, Some(&ledger)),
+            Ter::TEC_NO_PERMISSION
+        );
+    }
+
+    #[test]
+    fn rpc_submit_mptoken_authorize_rejects_metadata_marked_pseudo_holder() {
+        let issuer = account(0x69);
+        let holder = account(0x6A);
+        let mut id_bytes = [0_u8; 24];
+        id_bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
+        id_bytes[4..].copy_from_slice(issuer.data());
+        let issuance_id =
+            basics::base_uint::Uint192::from_slice(&id_bytes).expect("MPToken issuance ID width");
+
+        let mut issuance = protocol::STLedgerEntry::from_type_and_key(
+            protocol::LedgerEntryType::MPTokenIssuance,
+            protocol::mpt_issuance_keylet_from_mptid(issuance_id).key,
+        );
+        issuance.set_account_id(get_field_by_symbol("sfIssuer"), issuer);
+        issuance.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        issuance.set_field_u64(get_field_by_symbol("sfOutstandingAmount"), 0);
+        issuance.set_field_u32(
+            get_field_by_symbol("sfFlags"),
+            protocol::lsfMPTCanTransfer | protocol::lsfMPTRequireAuth,
+        );
+
+        let mut token = protocol::STLedgerEntry::from_type_and_key(
+            protocol::LedgerEntryType::MPToken,
+            protocol::mptoken_keylet_from_mptid(
+                issuance_id,
+                basics::base_uint::Uint160::from_slice(holder.data()).expect("account width"),
+            )
+            .key,
+        );
+        token.set_account_id(get_field_by_symbol("sfAccount"), holder);
+        token.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), issuance_id);
+        token.set_field_u64(get_field_by_symbol("sfMPTAmount"), 0);
+
+        let mut pseudo_holder = protocol::STLedgerEntry::from_type_and_key(
+            protocol::LedgerEntryType::AccountRoot,
+            account_keylet_for(holder).key,
+        );
+        pseudo_holder.set_account_id(get_field_by_symbol("sfAccount"), holder);
+        pseudo_holder.set_field_h256(
+            get_field_by_symbol("sfAMMID"),
+            basics::base_uint::Uint256::from_u64(1),
+        );
+
+        let mut ledger = ledger::Ledger::from_ledger_seq_and_close_time(1, 0, false);
+        for entry in [issuance, token, pseudo_holder] {
+            ledger
+                .raw_insert(std::sync::Arc::new(entry))
+                .expect("ledger entry insertion");
+        }
+
+        let mpt_feature = Permission::get_instance()
+            .get_tx_feature(TxType::MPTOKEN_AUTHORIZE)
+            .expect("MPTokenAuthorize feature");
+        let rules = Rules::new([mpt_feature]);
+        let tx = STTx::new(TxType::MPTOKEN_AUTHORIZE, |object| {
+            object.set_account_id(get_field_by_symbol("sfAccount"), issuer);
+            object.set_account_id(get_field_by_symbol("sfHolder"), holder);
+            object.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), issuance_id);
+            object.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+        });
+
+        assert_eq!(
+            submit_semantic_preflight_with_ledger(&tx, &rules, Some(&ledger)),
+            Ter::TEC_NO_PERMISSION
         );
     }
 
@@ -2048,6 +2181,8 @@ fn submit_semantic_preflight_with_ledger(
                         mptoken_keylet_from_mptid(issuance_id, account_to_uint160(h)),
                     )
                 });
+                let holder_account =
+                    holder.and_then(|h| ledger_read_keylet(ledger, account_keylet_for(h)));
                 let preclaim =
                     tx::run_mp_token_authorize_preclaim(tx::MPTokenAuthorizePreclaimFacts {
                         holder_present: holder.is_some(),
@@ -2057,7 +2192,10 @@ fn submit_semantic_preflight_with_ledger(
                         token_locked_amount_is_zero: true,
                         issuance_exists: issuance.is_some(),
                         single_asset_vault_enabled: rules.enabled(&feature_single_asset_vault()),
-                        token_locked: false,
+                        fix_cleanup_3_4_0_enabled: rules.enabled(&protocol::fix_cleanup_3_4_0()),
+                        token_locked: account_token
+                            .as_ref()
+                            .is_some_and(|sle| sle.is_flag(protocol::lsfMPTLocked)),
                         confidential_transfer_enabled: rules
                             .enabled(&protocol::feature_confidential_transfer()),
                         confidential_outstanding_nonzero: issuance.as_ref().is_some_and(|sle| {
@@ -2080,8 +2218,7 @@ fn submit_semantic_preflight_with_ledger(
                                     && sle.get_account_id(issuer_field) == account
                             })
                             .unwrap_or(false),
-                        holder_account_exists: holder
-                            .is_some_and(|h| ledger_account_exists(ledger, h)),
+                        holder_account_exists: holder_account.is_some(),
                         issuance_requires_auth: issuance
                             .as_ref()
                             .map(|sle| {
@@ -2092,7 +2229,9 @@ fn submit_semantic_preflight_with_ledger(
                             })
                             .unwrap_or(false),
                         holder_token_exists,
-                        holder_is_pseudo_account: holder.is_some_and(|h| h.is_zero()),
+                        holder_is_pseudo_account: holder_account
+                            .as_ref()
+                            .is_some_and(ledger::is_pseudo_account),
                     });
                 if preclaim != Ter::TES_SUCCESS {
                     return preclaim;

@@ -3,8 +3,8 @@ use basics::number::NumberParts as RuntimeNumber;
 use ledger::{
     Ledger, LedgerHeader,
     vault_helpers::{
-        TruncateShares, WaiveUnrealizedLoss, assets_to_shares_withdraw, is_sole_shareholder,
-        shares_to_assets_withdraw,
+        TruncateShares, WaiveUnrealizedLoss, assets_to_shares_withdraw,
+        clamp_to_assets_total_scale, is_sole_shareholder, shares_to_assets_withdraw,
     },
 };
 use protocol::{
@@ -203,4 +203,49 @@ fn is_sole_shareholder_matches_outstanding_amount() {
 
     let ledger = ledger_with([issuance.clone()]);
     assert!(!is_sole_shareholder(&ledger, &holder, &issuance).expect("read missing holder state"));
+}
+
+#[test]
+fn shared_assets_total_grid_clamp_handles_iou_and_mpt_boundaries() {
+    let owner = account(0x31);
+    let pseudo = account(0x32);
+    let issuer = account(0x33);
+    let share_id = make_mpt_id(1, pseudo);
+    let iou_asset = Asset::Issue(Issue::new(currency_from_string("USD"), issuer));
+    let mut iou_vault = vault_entry(owner, pseudo, 1, iou_asset, share_id, 0, 0);
+    let high_total = RuntimeNumber::try_from_external_parts(
+        9_999_999_999_999_999,
+        -15,
+        basics::number::get_mantissa_scale(),
+    )
+    .expect("representable IOU total");
+    let mut total = STNumber::from(high_total);
+    total.associate_asset(iou_asset);
+    iou_vault.set_field_number(sf("sfAssetsTotal"), total);
+
+    let requested = asset_amount(iou_asset, 5);
+    let credit = clamp_to_assets_total_scale(&iou_vault, &requested)
+        .expect("positive IOU credit must survive the posterior grid");
+    assert!(amount_number(&credit) > RuntimeNumber::zero());
+    assert!(amount_number(&credit) <= amount_number(&requested));
+
+    let mut debit_request = requested.clone();
+    debit_request.negate();
+    let debit = clamp_to_assets_total_scale(&iou_vault, &debit_request)
+        .expect("positive IOU debit magnitude must survive the posterior grid");
+    assert!(amount_number(&debit) > RuntimeNumber::zero());
+    assert!(amount_number(&debit) <= amount_number(&requested));
+
+    let mpt_asset = Asset::MPTIssue(MPTIssue::new(make_mpt_id(7, issuer)));
+    let mpt_vault = vault_entry(owner, pseudo, 2, mpt_asset, share_id, 100, 0);
+    let mut mpt_debit = asset_amount(mpt_asset, 7);
+    mpt_debit.negate();
+    assert_eq!(
+        amount_number(
+            &clamp_to_assets_total_scale(&mpt_vault, &mpt_debit)
+                .expect("MPT grid must be an identity clamp"),
+        ),
+        RuntimeNumber::from_i64(7),
+        "integral assets return a positive magnitude without IOU rounding"
+    );
 }

@@ -1,4 +1,5 @@
 use super::common::*;
+use super::freeze::LoanDefaultFreezeExemptAccounts;
 use ledger::{ApplyView, FlowSandbox, ReadView};
 use protocol::{AccountID, LedgerEntryType, MPTID, STLedgerEntry, Ter};
 use std::collections::BTreeMap;
@@ -274,9 +275,19 @@ pub(super) fn validates_mpt_accounting_for_transaction(
     data: &BTreeMap<MPTID, MptAccounting>,
     enforce: bool,
     txn_type: protocol::TxType,
+    result: Ter,
+    fix_cleanup_3_4_0: bool,
 ) -> bool {
+    // Confidential MPT operations have their own encrypted-balance invariant;
+    // do not subject them to public amount accounting on either outcome.
     if matches!(txn_type.to_u16(), 85..=89) {
         return true;
+    }
+    if fix_cleanup_3_4_0
+        && !protocol::is_tes_success(result)
+        && data.values().any(|entry| entry.amount_delta != 0)
+    {
+        return false;
     }
     validates_mpt_accounting(data, enforce)
 }
@@ -338,30 +349,55 @@ pub(super) fn mpt_transfer_is_dex(
 pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
+    result: Ter,
     cross_currency_payment: bool,
     fix_cleanup_3_2_0: bool,
+    fix_cleanup_3_4_0: bool,
     mptokens_v2_enabled: bool,
+    loan_default_accounts: Option<&LoanDefaultFreezeExemptAccounts>,
+    pseudo_accounts_before: &BTreeMap<AccountID, bool>,
     transfers: &BTreeMap<MPTID, BTreeMap<AccountID, MptTransferAmount>>,
 ) -> Result<bool, ledger::ViewError> {
-    if txn_type == protocol::TxType::AMM_CLAWBACK {
+    // Confidential MPT changes are checked only by ValidConfidentialMPToken.
+    if matches!(txn_type.to_u16(), 85..=89) || txn_type == protocol::TxType::AMM_CLAWBACK {
         return Ok(true);
     }
+    let enforce = mptokens_v2_enabled || fix_cleanup_3_4_0;
 
     for (mpt_id, holders) in transfers {
-        let Some(issuance) = sandbox.read(protocol::mpt_issuance_keylet_from_mptid(*mpt_id))?
-        else {
+        let issuance = sandbox.read(protocol::mpt_issuance_keylet_from_mptid(*mpt_id))?;
+        if issuance.is_none() {
+            // Orphaned zero-balance MPToken entries may be deleted later, but
+            // no transaction may change their balance after the issuance is
+            // gone.
+            if holders.values().any(|value| {
+                value
+                    .after
+                    .is_some_and(|after| value.before.unwrap_or(0) != after)
+            }) {
+                return Ok(!enforce);
+            }
             continue;
-        };
+        }
+        let issuance = issuance.expect("checked above");
 
         let can_transfer = issuance.is_flag(protocol::lsfMPTCanTransfer)
             || mpt_transfer_waives_can_transfer(txn_type, fix_cleanup_3_2_0);
         let can_trade = issuance.is_flag(protocol::lsfMPTCanTrade);
         let req_auth = issuance.is_flag(protocol::lsfMPTRequireAuth);
         let issue = protocol::MPTIssue::new(*mpt_id);
+        let loan_default_asset = loan_default_accounts.is_some_and(|accounts| {
+            matches!(accounts.asset, protocol::Asset::MPTIssue(expected) if expected.mpt_id() == *mpt_id)
+        });
 
         let mut senders = 0_u16;
         let mut receivers = 0_u16;
-        let mut invalid_transfer = issuance.is_flag(protocol::lsfMPTLocked);
+        // `is_frozen_mpt` includes the issuance-wide lock.  Evaluate that
+        // condition per affected account so fixCleanup3_4_0 can exempt only
+        // the resolved LoanBroker/Vault pseudo-account legs of a default;
+        // any unrelated participant in the same locked issuance remains
+        // rejected. Authorization is checked independently below.
+        let mut invalid_transfer = false;
         for (account, value) in holders {
             let Some(after) = value.after else {
                 continue;
@@ -376,16 +412,35 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
                 senders = senders.saturating_add(1);
             }
             let frozen = ledger::mptoken_helpers::is_frozen_mpt(sandbox, account, &issue)?;
-            let authorized = if req_auth {
+            let exempt_from_freeze = loan_default_asset
+                && loan_default_accounts.is_some_and(|accounts| {
+                    *account == accounts.broker || *account == accounts.vault
+                });
+            // A pseudo account can be erased with the MPToken transfer that
+            // drains it. Its poststate AccountRoot is then gone, so prefer the
+            // classification captured from every touched prestate root.
+            let authorized = if pseudo_accounts_before.get(account).copied() == Some(true) {
+                true
+            } else if req_auth {
                 protocol::is_tes_success(ledger::mptoken_helpers::require_auth_mpt(
                     sandbox, &issue, account,
                 )?)
             } else {
                 true
             };
-            if frozen || value.locked_before || value.locked_after || !authorized {
+            if (!exempt_from_freeze && (frozen || value.locked_before || value.locked_after))
+                || !authorized
+            {
                 invalid_transfer = true;
             }
+        }
+
+        // `Transactor::reset` discards every ordinary failed MPT mutation.
+        // After fixCleanup3_4_0, seeing even one changed public balance in a
+        // failed transaction is therefore an invariant failure.
+        if fix_cleanup_3_4_0 && !protocol::is_tes_success(result) && (senders > 0 || receivers > 0)
+        {
+            return Ok(false);
         }
 
         if senders > 0
@@ -394,7 +449,7 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
                 || !can_transfer
                 || (mpt_transfer_is_dex(txn_type, cross_currency_payment) && !can_trade))
         {
-            return Ok(!mptokens_v2_enabled);
+            return Ok(!(enforce || loan_default_accounts.is_some()));
         }
     }
 
@@ -547,8 +602,12 @@ pub(super) fn validates_mpt_lifecycle_counts(
     single_asset_vault_enabled: bool,
     lending_protocol_enabled: bool,
     mptokens_v2_enabled: bool,
+    fix_cleanup_3_4_0: bool,
     lifecycle: &MptIssuanceLifecycle,
 ) -> bool {
+    if fix_cleanup_3_4_0 && !protocol::is_tes_success(result) && lifecycle.tokens_deleted != 0 {
+        return false;
+    }
     let applies =
         protocol::is_tes_success(result) || (mptokens_v2_enabled && result == Ter::TEC_INCOMPLETE);
     if !applies {
@@ -591,7 +650,12 @@ pub(super) fn validates_mpt_lifecycle_counts(
             {
                 return false;
             }
-            return lifecycle.tokens_created <= 1 && lifecycle.tokens_deleted <= 2;
+            // An AMM has two pool assets. Either AMMWithdraw or
+            // AMMClawback can therefore recreate zero, one, or both missing
+            // recipient MPT holdings while deleting up to two emptied pool
+            // holdings. This matches the bounded lifecycle exception in
+            // rippled's MPT invariant.
+            return lifecycle.tokens_created <= 2 && lifecycle.tokens_deleted <= 2;
         }
 
         if lending_protocol_enabled && lifecycle.tokens_created + lifecycle.tokens_deleted > 1 {

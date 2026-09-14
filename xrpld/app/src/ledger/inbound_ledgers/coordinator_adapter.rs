@@ -39,8 +39,10 @@
 //! `rippled/src/xrpld/peer/PeerImp.cpp` (`processGetObjectByHash`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::Duration;
 
 use basics::base_uint::Uint256;
 use basics::sha_map_hash::SHAMapHash;
@@ -80,6 +82,82 @@ const QT_INDIRECT: i32 = 0;
 pub(crate) type EventSender = mpsc::SyncSender<AcquisitionEvent>;
 pub(crate) type EventReceiver = mpsc::Receiver<AcquisitionEvent>;
 
+/// Edge-triggered wakeup for the serialized coordinator owner.
+///
+/// The generation counter closes the classic notify-before-wait race: the
+/// owner snapshots it before draining and only sleeps when no producer changed
+/// it.  Ports wake the owner after retaining a typed completion; they never run
+/// coordinator or SHAMap code themselves.
+#[derive(Default)]
+pub(crate) struct CoordinatorOwnerWake {
+    generation: AtomicU64,
+    mutex: Mutex<()>,
+    condvar: Condvar,
+}
+
+impl CoordinatorOwnerWake {
+    pub(crate) fn notify(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.condvar.notify_one();
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn wait_for_change(&self, observed: u64, stopping: &AtomicBool, maximum: Duration) {
+        if stopping.load(Ordering::Acquire) || self.generation() != observed {
+            return;
+        }
+        let guard = self.mutex.lock().expect("coordinator owner wake lock");
+        if stopping.load(Ordering::Acquire) || self.generation() != observed {
+            return;
+        }
+        let _ = self
+            .condvar
+            .wait_timeout(guard, maximum)
+            .expect("coordinator owner wake wait");
+    }
+}
+
+#[cfg(test)]
+mod owner_wake_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn notification_before_wait_is_not_lost() {
+        let wake = CoordinatorOwnerWake::default();
+        let observed = wake.generation();
+        wake.notify();
+        let stopping = AtomicBool::new(false);
+        let started = Instant::now();
+        wake.wait_for_change(observed, &stopping, Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_ne!(wake.generation(), observed);
+    }
+
+    #[test]
+    fn retained_completion_wakes_owner_even_when_control_lane_is_full() {
+        let wake = Arc::new(CoordinatorOwnerWake::default());
+        let (tx, _rx) = mpsc::sync_channel(1);
+        tx.send(AcquisitionEvent::Heartbeat)
+            .expect("fill control lane");
+        let retained = RetainedControlEvents::new_with_wake(tx, Arc::clone(&wake));
+        let observed = wake.generation();
+        retained.retain(AcquisitionEvent::Heartbeat);
+        assert_ne!(wake.generation(), observed);
+        assert_eq!(
+            retained
+                .pending
+                .lock()
+                .expect("retained completion lock")
+                .len(),
+            1
+        );
+    }
+}
+
 /// Exact control events produced off the coordinator owner thread. A producer
 /// never waits on the owner that consumes this bounded lane: full events remain
 /// in this resource-local FIFO until its port is flushed from an owner turn.
@@ -87,13 +165,19 @@ pub(crate) type EventReceiver = mpsc::Receiver<AcquisitionEvent>;
 pub(crate) struct RetainedControlEvents {
     tx: EventSender,
     pending: Arc<Mutex<VecDeque<AcquisitionEvent>>>,
+    wake: Arc<CoordinatorOwnerWake>,
 }
 
 impl RetainedControlEvents {
     pub(crate) fn new(tx: EventSender) -> Self {
+        Self::new_with_wake(tx, Arc::new(CoordinatorOwnerWake::default()))
+    }
+
+    pub(crate) fn new_with_wake(tx: EventSender, wake: Arc<CoordinatorOwnerWake>) -> Self {
         Self {
             tx,
             pending: Arc::new(Mutex::new(VecDeque::new())),
+            wake,
         }
     }
 
@@ -101,6 +185,7 @@ impl RetainedControlEvents {
         let mut pending = self.pending.lock().expect("retained control events lock");
         pending.push_back(event);
         Self::flush_locked(&self.tx, &mut pending);
+        self.wake.notify();
     }
 
     /// Retain an exact completion without competing for the shared control
@@ -112,11 +197,15 @@ impl RetainedControlEvents {
             .lock()
             .expect("retained control events lock")
             .push_back(event);
+        self.wake.notify();
     }
 
     pub(crate) fn flush(&self) {
         let mut pending = self.pending.lock().expect("retained control events lock");
         Self::flush_locked(&self.tx, &mut pending);
+        if !pending.is_empty() {
+            self.wake.notify();
+        }
     }
 
     pub(crate) fn flush_bounded(&self, limit: usize) {
@@ -224,6 +313,7 @@ pub(crate) struct CoordinatorIngress {
     routing_snapshot: Arc<RwLock<Arc<RoutingSnapshot>>>,
     packet_tx: PacketEventSender,
     stats: Arc<Mutex<AdapterStats>>,
+    wake: Arc<CoordinatorOwnerWake>,
 }
 
 impl CoordinatorIngress {
@@ -294,6 +384,7 @@ impl CoordinatorIngress {
                     .try_send(AcquisitionEvent::PacketAdmitted(admitted))
                 {
                     Ok(()) => {
+                        self.wake.notify();
                         self.stats
                             .lock()
                             .expect("adapter stats lock")
@@ -377,11 +468,14 @@ pub(crate) struct CoordinatorAdapter<R, RD, WR, T, H, P, C> {
     /// It is processed first on the next control iteration, preserving channel
     /// order without preventing the read barrier from resuming once.
     pending_control_event: Option<AcquisitionEvent>,
+    /// CPU-sliced tree continuations. These are consumed only by the
+    /// dedicated owner and never exposed as port work.
+    pending_plan_resumes: VecDeque<SessionRef>,
     /// Whether the preceding bounded drain stopped with owner work remaining.
-    /// NetworkOps uses this signal to avoid an artificial 50ms sleep without
-    /// turning the coordinator into a separate scheduler.
+    /// The dedicated executor uses this signal to continue without sleeping.
     last_drain_has_more: bool,
     fetch_pack: Arc<FetchPackCache>,
+    owner_wake: Arc<CoordinatorOwnerWake>,
     /// Exact target hashes whose coordinator sessions terminally failed. The
     /// registry drains this bounded-per-owner-turn set after releasing the
     /// coordinator lock and records rippled-compatible failure cooldowns.
@@ -437,6 +531,42 @@ where
         packet_tx: PacketEventSender,
         packet_rx: PacketEventReceiver,
     ) -> Self {
+        Self::with_event_channel_and_wake(
+            runner,
+            shadow_config,
+            requests,
+            reads,
+            writes,
+            timers,
+            handoffs,
+            phase,
+            cancellations,
+            fetch_pack,
+            tx,
+            rx,
+            packet_tx,
+            packet_rx,
+            Arc::new(CoordinatorOwnerWake::default()),
+        )
+    }
+
+    pub(crate) fn with_event_channel_and_wake(
+        runner: CoordinatorRunner,
+        shadow_config: ShadowConfig,
+        requests: R,
+        reads: RD,
+        writes: WR,
+        timers: T,
+        handoffs: H,
+        phase: P,
+        cancellations: C,
+        fetch_pack: Arc<FetchPackCache>,
+        tx: EventSender,
+        rx: EventReceiver,
+        packet_tx: PacketEventSender,
+        packet_rx: PacketEventReceiver,
+        owner_wake: Arc<CoordinatorOwnerWake>,
+    ) -> Self {
         let shadow = ShadowRunner::new(shadow_config, runner.run_epoch());
         let ingress = CoordinatorIngress {
             routing_snapshot: Arc::new(RwLock::new(Arc::new(RoutingSnapshot::new(
@@ -445,6 +575,7 @@ where
             )))),
             packet_tx: packet_tx.clone(),
             stats: Arc::new(Mutex::new(AdapterStats::default())),
+            wake: Arc::clone(&owner_wake),
         };
         let mut adapter = Self {
             runner,
@@ -465,8 +596,10 @@ where
             routing_generation: 0,
             completion_flush_cursor: 0,
             pending_control_event: None,
+            pending_plan_resumes: VecDeque::new(),
             last_drain_has_more: false,
             fetch_pack,
+            owner_wake,
             terminal_failures: BTreeSet::new(),
             priority_durable_acks: VecDeque::new(),
             processed_durable_acks: VecDeque::new(),
@@ -475,6 +608,10 @@ where
         };
         adapter.publish_routing();
         adapter
+    }
+
+    pub(crate) fn owner_wake(&self) -> Arc<CoordinatorOwnerWake> {
+        Arc::clone(&self.owner_wake)
     }
 
     /// The immutable routing snapshot overlay ingress reads. Routes are cached
@@ -617,6 +754,7 @@ where
         let reference_session = event_session(&event);
         self.shadow.record(&event);
         let effects = self.runner.handle_event(event);
+        self.collect_plan_resumes();
         if let Some((handoff, session)) = processed_ack_candidate
             && self.runner.session(session).is_some_and(|state| {
                 state.phase() == &SessionPhase::Complete && state.pending_handoff().is_none()
@@ -645,6 +783,7 @@ where
                 .record(&AcquisitionEvent::ReadCompleted(completion.clone()));
         }
         let effects = self.runner.handle_read_batch(completions);
+        self.collect_plan_resumes();
         self.reconcile_exact_read_priorities();
         self.shadow.observe_effects(&effects);
         for session in reference_sessions {
@@ -669,6 +808,16 @@ where
         let mut packet_limited = false;
         let started = std::time::Instant::now();
         let mut control_limited = false;
+        while control_handled < CONTROL_EVENTS_PER_DRAIN
+            && started.elapsed() < CONTROL_DRAIN_TIME_SLICE
+        {
+            let Some(session) = self.pending_plan_resumes.pop_front() else {
+                break;
+            };
+            self.handle_fact(AcquisitionEvent::PlanSliceReady(session));
+            handled += 1;
+            control_handled += 1;
+        }
         while control_handled < CONTROL_EVENTS_PER_DRAIN {
             let Some(acknowledgement) = self.priority_durable_acks.pop_front() else {
                 break;
@@ -756,10 +905,19 @@ where
         let drained = self.drain_packet_events(packet_tail);
         handled += drained;
         packet_limited |= packet_tail != 0 && drained == packet_tail;
+        // A final completion-source flush can populate the control channel
+        // after the main loop observed it empty. Retain one lookahead so the
+        // owner continues immediately instead of waiting for its safety tick.
+        if self.pending_control_event.is_none()
+            && let Ok(event) = self.rx.try_recv()
+        {
+            self.pending_control_event = Some(event);
+        }
         self.last_drain_has_more = control_limited
             || control_handled >= CONTROL_EVENTS_PER_DRAIN
             || packet_limited
             || self.pending_control_event.is_some()
+            || !self.pending_plan_resumes.is_empty()
             || !self.priority_durable_acks.is_empty();
         handled
     }
@@ -776,8 +934,16 @@ where
         handled
     }
 
+    fn collect_plan_resumes(&mut self) {
+        for session in self.runner.take_plan_resumes() {
+            if !self.pending_plan_resumes.contains(&session) {
+                self.pending_plan_resumes.push_back(session);
+            }
+        }
+    }
+
     /// True when the previous bounded owner slice reached a work boundary and
-    /// NetworkOps should immediately run another ordinary strand iteration.
+    /// the dedicated executor should immediately run another slice.
     pub(crate) const fn drain_has_more(&self) -> bool {
         self.last_drain_has_more
     }
@@ -1193,6 +1359,7 @@ fn event_session(event: &AcquisitionEvent) -> Option<SessionRef> {
     match event {
         AcquisitionEvent::PacketAdmitted(packet) => Some(packet.lease().session()),
         AcquisitionEvent::ReadCompleted(completion) => Some(completion.operation().session()),
+        AcquisitionEvent::PlanSliceReady(session) => Some(*session),
         AcquisitionEvent::WriteCompleted(completion) => Some(completion.operation().session()),
         AcquisitionEvent::DurabilityFenced(completion) => Some(completion.operation().session()),
         AcquisitionEvent::DurableHandoffAcknowledged(acknowledgement) => {
@@ -1469,11 +1636,27 @@ impl BrokerReadPort {
         node_store: SHAMapStoreNodeStore,
         tx: EventSender,
     ) -> Self {
+        Self::new_with_wake(
+            broker,
+            tickets,
+            node_store,
+            tx,
+            Arc::new(CoordinatorOwnerWake::default()),
+        )
+    }
+
+    pub(crate) fn new_with_wake(
+        broker: NodeReadBroker,
+        tickets: BrokerTicketState,
+        node_store: SHAMapStoreNodeStore,
+        tx: EventSender,
+        wake: Arc<CoordinatorOwnerWake>,
+    ) -> Self {
         Self {
             broker,
             tickets,
             node_store,
-            completions: RetainedControlEvents::new(tx),
+            completions: RetainedControlEvents::new_with_wake(tx, wake),
         }
     }
 

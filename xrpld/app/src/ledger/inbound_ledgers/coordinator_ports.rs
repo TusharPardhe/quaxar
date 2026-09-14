@@ -34,7 +34,8 @@ use crate::network::network_ops::{AppNetworkOpsModeOwner, NetworkOpsOperatingMod
 
 use super::coordinator_adapter::{
     BrokerCancellationDispatcher, BrokerReadPort, BrokerTicketState, CONTROL_EVENT_QUEUE_CAPACITY,
-    CoordinatorAdapter, EventSender, OverlayLedgerRequestPort, PACKET_INGRESS_QUEUE_CAPACITY,
+    CoordinatorAdapter, CoordinatorOwnerWake, EventSender, OverlayLedgerRequestPort,
+    PACKET_INGRESS_QUEUE_CAPACITY,
 };
 use super::coordinator_handoff::CoordinatorHandoffPort;
 use super::read_broker::NodeReadBroker;
@@ -189,7 +190,8 @@ struct SessionPersistence {
 }
 
 // rippled processes inbound-ledger packets, including their synchronous NuDB
-// writes, through the globally limited JtLedgerData lane (limit 3). Quaxar
+// writes, through the globally limited JtLedgerData lane (running limit 3,
+// timeout/outstanding admission limit 5). Quaxar
 // separates physical persistence from packet reduction, so it must reproduce
 // that same global exposure here; a per-session FIFO alone permits every
 // prefetched history ledger to occupy the JtWrite lane concurrently.
@@ -292,6 +294,7 @@ struct CoordinatorPersistenceCompletionGuard {
     fence: Option<OperationRef>,
     pending: Arc<Mutex<CoordinatorPersistence>>,
     tx: EventSender,
+    wake: Arc<CoordinatorOwnerWake>,
     armed: bool,
 }
 
@@ -300,12 +303,14 @@ impl CoordinatorPersistenceCompletionGuard {
         batch: &WriteBatch,
         pending: Arc<Mutex<CoordinatorPersistence>>,
         tx: EventSender,
+        wake: Arc<CoordinatorOwnerWake>,
     ) -> Self {
         Self {
             operation: batch.operation(),
             fence: batch.fence(),
             pending,
             tx,
+            wake,
             armed: true,
         }
     }
@@ -327,6 +332,7 @@ impl CoordinatorPersistenceCompletionGuard {
             fence_outcome,
             &self.pending,
             &self.tx,
+            &self.wake,
             advance_fifo,
         )
     }
@@ -356,6 +362,7 @@ fn settle_coordinator_persistence(
     fence_outcome: Option<DurabilityOutcome>,
     pending: &Arc<Mutex<CoordinatorPersistence>>,
     tx: &EventSender,
+    wake: &CoordinatorOwnerWake,
     advance_fifo: bool,
 ) -> Option<WriteBatch> {
     let session = operation.session();
@@ -402,6 +409,7 @@ fn settle_coordinator_persistence(
             .flatten()
     };
     flush_persistence_completions(pending, tx);
+    wake.notify();
     next
 }
 
@@ -481,7 +489,13 @@ impl PersistenceWork for CoordinatorPersistenceWork {
             };
         let next = completion.settle(write_outcome, fence_outcome, true);
         if let Some(next) = next {
-            dispatch_persistence(&node_store, &completion.pending, &completion.tx, next);
+            dispatch_persistence(
+                &node_store,
+                &completion.pending,
+                &completion.tx,
+                &completion.wake,
+                next,
+            );
         }
     }
 }
@@ -540,10 +554,15 @@ fn dispatch_persistence(
     node_store: &SHAMapStoreNodeStore,
     pending: &Arc<Mutex<CoordinatorPersistence>>,
     tx: &EventSender,
+    wake: &Arc<CoordinatorOwnerWake>,
     batch: WriteBatch,
 ) {
-    let completion =
-        CoordinatorPersistenceCompletionGuard::new(&batch, Arc::clone(pending), tx.clone());
+    let completion = CoordinatorPersistenceCompletionGuard::new(
+        &batch,
+        Arc::clone(pending),
+        tx.clone(),
+        Arc::clone(wake),
+    );
     node_store.schedule_write(Box::new(CoordinatorPersistenceWork {
         node_store: node_store.clone(),
         batch,
@@ -559,15 +578,25 @@ pub(crate) struct CoordinatorWritePort {
     node_store: SHAMapStoreNodeStore,
     pending: Arc<Mutex<CoordinatorPersistence>>,
     tx: EventSender,
+    wake: Arc<CoordinatorOwnerWake>,
 }
 
 impl CoordinatorWritePort {
     /// Builds a write port over the NodeStore and the completion channel.
     pub(crate) fn new(node_store: SHAMapStoreNodeStore, tx: EventSender) -> Self {
+        Self::new_with_wake(node_store, tx, Arc::new(CoordinatorOwnerWake::default()))
+    }
+
+    pub(crate) fn new_with_wake(
+        node_store: SHAMapStoreNodeStore,
+        tx: EventSender,
+        wake: Arc<CoordinatorOwnerWake>,
+    ) -> Self {
         Self {
             node_store,
             pending: Arc::new(Mutex::new(CoordinatorPersistence::default())),
             tx,
+            wake,
         }
     }
 
@@ -594,6 +623,7 @@ impl acquisition::WritePort for CoordinatorWritePort {
         let node_store = self.node_store.clone();
         let pending = Arc::clone(&self.pending);
         let tx = self.tx.clone();
+        let wake = Arc::clone(&self.wake);
         // Claim both the per-session FIFO and global inbound-persistence slot
         // while holding the port lock; release it before physical submission
         // so an inline scheduler cannot deadlock when completion re-enters.
@@ -605,12 +635,22 @@ impl acquisition::WritePort for CoordinatorWritePort {
             claim_ready_write(&mut state)
         };
         if let Some(batch) = command {
-            dispatch_persistence(&node_store, &pending, &tx, batch);
+            dispatch_persistence(&node_store, &pending, &tx, &wake, batch);
         }
     }
 
     fn flush_completions(&mut self) {
         flush_persistence_completions(&self.pending, &self.tx);
+        if self
+            .pending
+            .lock()
+            .expect("coordinator persistence lock")
+            .ready_completion_sessions
+            .is_empty()
+        {
+            return;
+        }
+        self.wake.notify();
     }
 }
 
@@ -725,9 +765,17 @@ pub(crate) struct CoordinatorTimerPort {
 impl CoordinatorTimerPort {
     /// Builds a timer port over the shared timer service.
     pub(crate) fn new(pool: Arc<WorkerPool>, tx: EventSender) -> Self {
+        Self::new_with_wake(pool, tx, Arc::new(CoordinatorOwnerWake::default()))
+    }
+
+    pub(crate) fn new_with_wake(
+        pool: Arc<WorkerPool>,
+        tx: EventSender,
+        wake: Arc<CoordinatorOwnerWake>,
+    ) -> Self {
         Self {
             pool,
-            completions: super::coordinator_adapter::RetainedControlEvents::new(tx),
+            completions: super::coordinator_adapter::RetainedControlEvents::new_with_wake(tx, wake),
             armed: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -913,22 +961,26 @@ pub(crate) fn build_coordinator_adapter(resources: CoordinatorPortResources) -> 
     } = resources;
     let (tx, rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
     let (packet_tx, packet_rx) = mpsc::sync_channel(PACKET_INGRESS_QUEUE_CAPACITY);
-    let reads = BrokerReadPort::new(
+    let wake = Arc::new(CoordinatorOwnerWake::default());
+    let reads = BrokerReadPort::new_with_wake(
         broker.clone(),
         tickets.clone(),
         node_store.clone(),
         tx.clone(),
+        Arc::clone(&wake),
     );
-    let writes = CoordinatorWritePort::new(node_store.clone(), tx.clone());
-    let timers = CoordinatorTimerPort::new(timer_pool, tx.clone());
-    let handoffs = CoordinatorHandoffPort::new(completed_ledgers_tx, tx.clone());
+    let writes =
+        CoordinatorWritePort::new_with_wake(node_store.clone(), tx.clone(), Arc::clone(&wake));
+    let timers = CoordinatorTimerPort::new_with_wake(timer_pool, tx.clone(), Arc::clone(&wake));
+    let handoffs =
+        CoordinatorHandoffPort::new_with_wake(completed_ledgers_tx, tx.clone(), Arc::clone(&wake));
     let phase = CoordinatorPhasePort::new(phase_mode_owner);
     let cancellations = CoordinatorCancellationDispatcher::new(
         BrokerCancellationDispatcher::new(broker, tickets, node_store),
         timers.clone(),
         writes.clone(),
     );
-    CoordinatorAdapter::with_event_channel(
+    CoordinatorAdapter::with_event_channel_and_wake(
         runner,
         acquisition_shadow_config(),
         OverlayLedgerRequestPort::new(peers),
@@ -943,6 +995,7 @@ pub(crate) fn build_coordinator_adapter(resources: CoordinatorPortResources) -> 
         rx,
         packet_tx,
         packet_rx,
+        wake,
     )
 }
 

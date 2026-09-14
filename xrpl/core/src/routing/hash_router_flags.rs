@@ -22,6 +22,8 @@ impl HashRouterFlags {
     pub const PRIVATE4: Self = Self(0x0800);
     pub const PRIVATE5: Self = Self(0x1000);
     pub const PRIVATE6: Self = Self(0x2000);
+    pub const PRIVATE7: Self = Self(0x4000);
+    pub const PRIVATE8: Self = Self(0x8000);
 
     pub const fn bits(self) -> u16 {
         self.0
@@ -197,6 +199,8 @@ mod tests {
         assert_eq!(HashRouterFlags::PRIVATE4.bits(), 0x0800);
         assert_eq!(HashRouterFlags::PRIVATE5.bits(), 0x1000);
         assert_eq!(HashRouterFlags::PRIVATE6.bits(), 0x2000);
+        assert_eq!(HashRouterFlags::PRIVATE7.bits(), 0x4000);
+        assert_eq!(HashRouterFlags::PRIVATE8.bits(), 0x8000);
     }
 
     #[test]

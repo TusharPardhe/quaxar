@@ -1,5 +1,5 @@
 use basics::number::{NumberParts as RuntimeNumber, RoundingMode};
-use ledger::{ReadView, has_expired};
+use ledger::ReadView;
 use protocol::{STTx, Ter, lending::LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION};
 
 use super::{common::*, helpers::*};
@@ -28,12 +28,7 @@ pub fn calculate_loan_pay_base_fee<V: ReadView>(
     if payments_remaining <= tx::LOAN_PAYMENTS_PER_FEE_INCREMENT {
         return Ok(normal_cost);
     }
-    if has_expired(
-        view,
-        loan_sle
-            .is_field_present(sf("sfNextPaymentDueDate"))
-            .then(|| loan_sle.get_field_u32(sf("sfNextPaymentDueDate"))),
-    ) {
+    if loan_payment_is_late(view, &loan_sle) {
         return Ok(normal_cost);
     }
 

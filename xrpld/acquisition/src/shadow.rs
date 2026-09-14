@@ -174,6 +174,7 @@ pub enum ShadowEventTag {
     ValidationRecoveryTarget,
     PacketAdmitted,
     ReadCompleted,
+    PlanSliceReady,
     WriteCompleted,
     DurabilityFenced,
     DurableHandoffAcknowledged,
@@ -207,6 +208,7 @@ impl ShadowEventTag {
             Self::ValidationRecoveryTarget => "validation_recovery_target",
             Self::PacketAdmitted => "packet_admitted",
             Self::ReadCompleted => "read_completed",
+            Self::PlanSliceReady => "plan_slice_ready",
             Self::WriteCompleted => "write_completed",
             Self::DurabilityFenced => "durability_fenced",
             Self::DurableHandoffAcknowledged => "durable_handoff_acknowledged",
@@ -241,6 +243,7 @@ impl From<&AcquisitionEvent> for ShadowEventTag {
             AcquisitionEvent::ValidationRecoveryTarget(_) => Self::ValidationRecoveryTarget,
             AcquisitionEvent::PacketAdmitted(_) => Self::PacketAdmitted,
             AcquisitionEvent::ReadCompleted(_) => Self::ReadCompleted,
+            AcquisitionEvent::PlanSliceReady(_) => Self::PlanSliceReady,
             AcquisitionEvent::WriteCompleted(_) => Self::WriteCompleted,
             AcquisitionEvent::DurabilityFenced(_) => Self::DurabilityFenced,
             AcquisitionEvent::DurableHandoffAcknowledged(_) => Self::DurableHandoffAcknowledged,
@@ -625,6 +628,9 @@ impl ShadowRunner {
                     &mut out,
                 );
             }
+            // CPU slicing changes scheduling only; it carries no lifecycle or
+            // parity fact for the read-only shadow model.
+            AcquisitionEvent::PlanSliceReady(_) => {}
             AcquisitionEvent::WriteCompleted(completion) => {
                 self.derive_write(
                     tag,

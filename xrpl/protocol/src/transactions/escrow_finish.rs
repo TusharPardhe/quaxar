@@ -71,6 +71,20 @@ impl EscrowFinish {
             .as_sttx()
             .is_field_present(crate::get_field_by_symbol("sfCredentialIDs"))
     }
+
+    pub fn get_gas(&self) -> Option<u32> {
+        self.has_gas().then(|| {
+            self.base
+                .as_sttx()
+                .get_field_u32(crate::get_field_by_symbol("sfGas"))
+        })
+    }
+
+    pub fn has_gas(&self) -> bool {
+        self.base
+            .as_sttx()
+            .is_field_present(crate::get_field_by_symbol("sfGas"))
+    }
 }
 
 impl Deref for EscrowFinish {
@@ -217,6 +231,13 @@ impl EscrowFinishBuilder {
         self.base
             .object_mut()
             .set_field_v256(crate::get_field_by_symbol("sfCredentialIDs"), value);
+        self
+    }
+
+    pub fn set_gas(mut self, value: u32) -> Self {
+        self.base
+            .object_mut()
+            .set_field_u32(crate::get_field_by_symbol("sfGas"), value);
         self
     }
 

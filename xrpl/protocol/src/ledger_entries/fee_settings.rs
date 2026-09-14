@@ -118,6 +118,48 @@ impl FeeSettings {
             .is_field_present(crate::get_field_by_symbol("sfReserveIncrementDrops"))
     }
 
+    pub fn get_gas_limit(&self) -> Option<u32> {
+        self.has_gas_limit().then(|| {
+            self.base
+                .as_st_ledger_entry()
+                .get_field_u32(crate::get_field_by_symbol("sfGasLimit"))
+        })
+    }
+
+    pub fn has_gas_limit(&self) -> bool {
+        self.base
+            .as_st_ledger_entry()
+            .is_field_present(crate::get_field_by_symbol("sfGasLimit"))
+    }
+
+    pub fn get_bytecode_size_limit(&self) -> Option<u32> {
+        self.has_bytecode_size_limit().then(|| {
+            self.base
+                .as_st_ledger_entry()
+                .get_field_u32(crate::get_field_by_symbol("sfBytecodeSizeLimit"))
+        })
+    }
+
+    pub fn has_bytecode_size_limit(&self) -> bool {
+        self.base
+            .as_st_ledger_entry()
+            .is_field_present(crate::get_field_by_symbol("sfBytecodeSizeLimit"))
+    }
+
+    pub fn get_gas_price(&self) -> Option<u32> {
+        self.has_gas_price().then(|| {
+            self.base
+                .as_st_ledger_entry()
+                .get_field_u32(crate::get_field_by_symbol("sfGasPrice"))
+        })
+    }
+
+    pub fn has_gas_price(&self) -> bool {
+        self.base
+            .as_st_ledger_entry()
+            .is_field_present(crate::get_field_by_symbol("sfGasPrice"))
+    }
+
     pub fn get_previous_txn_id(&self) -> Option<basics::base_uint::Uint256> {
         self.has_previous_txn_id().then(|| {
             self.base
@@ -239,6 +281,27 @@ impl FeeSettingsBuilder {
         self.base
             .object_mut()
             .set_field_amount(crate::get_field_by_symbol("sfReserveIncrementDrops"), value);
+        self
+    }
+
+    pub fn set_gas_limit(mut self, value: u32) -> Self {
+        self.base
+            .object_mut()
+            .set_field_u32(crate::get_field_by_symbol("sfGasLimit"), value);
+        self
+    }
+
+    pub fn set_bytecode_size_limit(mut self, value: u32) -> Self {
+        self.base
+            .object_mut()
+            .set_field_u32(crate::get_field_by_symbol("sfBytecodeSizeLimit"), value);
+        self
+    }
+
+    pub fn set_gas_price(mut self, value: u32) -> Self {
+        self.base
+            .object_mut()
+            .set_field_u32(crate::get_field_by_symbol("sfGasPrice"), value);
         self
     }
 

@@ -208,3 +208,15 @@ fn application_root_can_own_and_expose_ledger_master_runtime_behaviors() {
     );
     assert_eq!(root.held_transaction_count(), Some(0));
 }
+
+#[test]
+fn app_ledger_master_runtime_counts_missing_ledgers_from_one_complete_range_snapshot() {
+    let runtime = AppLedgerMasterRuntime::default();
+    let master = runtime.ledger_master();
+    master.mark_ledger_complete_range(100, 102);
+    master.mark_ledger_complete_range(104, 106);
+
+    assert_eq!(runtime.missing_from_complete_ledger_range(100, 106), 1);
+    assert_eq!(runtime.missing_from_complete_ledger_range(99, 107), 3);
+    assert_eq!(runtime.missing_from_complete_ledger_range(107, 106), 0);
+}

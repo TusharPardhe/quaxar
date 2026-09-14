@@ -172,6 +172,11 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
                 mpt: SOETxMPTIssue::None,
             },
             FormatFieldSpec {
+                field_symbol: "sfDestinationTag",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
                 field_symbol: "sfAmount",
                 style: SOEStyle::Required,
                 mpt: SOETxMPTIssue::Supported,
@@ -192,7 +197,12 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
                 mpt: SOETxMPTIssue::None,
             },
             FormatFieldSpec {
-                field_symbol: "sfDestinationTag",
+                field_symbol: "sfBytecode",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfData",
                 style: SOEStyle::Optional,
                 mpt: SOETxMPTIssue::None,
             },
@@ -228,6 +238,11 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
             },
             FormatFieldSpec {
                 field_symbol: "sfCredentialIDs",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfGas",
                 style: SOEStyle::Optional,
                 mpt: SOETxMPTIssue::None,
             },
@@ -1884,6 +1899,11 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
                 style: SOEStyle::Optional,
                 mpt: SOETxMPTIssue::None,
             },
+            FormatFieldSpec {
+                field_symbol: "sfCredentialIDs",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
         ],
     },
     TxFormatSpecInit {
@@ -2034,6 +2054,11 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
             },
             FormatFieldSpec {
                 field_symbol: "sfDestinationTag",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfCredentialIDs",
                 style: SOEStyle::Optional,
                 mpt: SOETxMPTIssue::None,
             },
@@ -2528,6 +2553,21 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
             },
             FormatFieldSpec {
                 field_symbol: "sfReserveIncrementDrops",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfGasLimit",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfBytecodeSizeLimit",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfGasPrice",
                 style: SOEStyle::Optional,
                 mpt: SOETxMPTIssue::None,
             },

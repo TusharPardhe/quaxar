@@ -23,6 +23,15 @@ use std::time::Duration;
 pub trait SHAMapStoreLedgerRuntime: Send + Sync {
     fn clear_prior_ledgers(&self, last_rotated: u32);
     fn clear_online_delete_caches(&self, validated_seq: u32);
+
+    /// Count missing entries from the synchronized complete-ledger range.
+    fn missing_from_complete_ledger_range(&self, _first: u32, _last: u32) -> usize {
+        0
+    }
+
+    fn has_complete_ledger(&self, _seq: u32) -> bool {
+        true
+    }
 }
 
 pub trait SHAMapStoreNodeFamilyCacheRuntime: Send + Sync {
@@ -331,6 +340,26 @@ impl SHAMapStoreHealthRuntime for SHAMapStoreAppRuntime {
             })
     }
 
+    fn is_disconnected(&self) -> bool {
+        self.health_state
+            .as_ref()
+            .is_some_and(|health_state| health_state.is_disconnected())
+    }
+
+    fn validated_ledger_seq(&self) -> Option<u32> {
+        self.health_state
+            .as_ref()
+            .and_then(|health_state| health_state.validated_ledger_seq())
+    }
+
+    fn missing_from_complete_ledger_range(&self, first: u32, last: u32) -> usize {
+        self.ledger.missing_from_complete_ledger_range(first, last)
+    }
+
+    fn has_complete_validated_ledger(&self, seq: u32) -> bool {
+        self.ledger.has_complete_ledger(seq)
+    }
+
     fn validated_ledger_age(&self) -> Duration {
         self.health_state
             .as_ref()
@@ -415,6 +444,32 @@ where
 
     fn clear_online_delete_caches(&self, validated_seq: u32) {
         LedgerMaster::clear_cached_ledger_entries_prior(self, validated_seq);
+    }
+
+    fn missing_from_complete_ledger_range(&self, first: u32, last: u32) -> usize {
+        if first > last {
+            return 0;
+        }
+        // `complete_ledgers` returns one mutex-protected snapshot. Count the
+        // overlap by interval rather than scanning each sequence, so a large
+        // online-delete range remains proportional to its gap count.
+        let complete = LedgerMaster::complete_ledgers(self);
+        let present = complete
+            .intervals()
+            .iter()
+            .filter_map(|interval| {
+                let first_present = interval.first().max(first);
+                let last_present = interval.last().min(last);
+                (first_present <= last_present)
+                    .then(|| u64::from(last_present) - u64::from(first_present) + 1)
+            })
+            .sum::<u64>();
+        let total = u64::from(last) - u64::from(first) + 1;
+        usize::try_from(total.saturating_sub(present)).unwrap_or(usize::MAX)
+    }
+
+    fn has_complete_ledger(&self, seq: u32) -> bool {
+        LedgerMaster::have_ledger(self, seq)
     }
 }
 

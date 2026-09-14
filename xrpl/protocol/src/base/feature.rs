@@ -22,6 +22,8 @@ pub const FIX_INNER_OBJ_TEMPLATE2_NAME: &str = "fixInnerObjTemplate2";
 pub const FIX_PREVIOUS_TXN_ID_NAME: &str = "fixPreviousTxnID";
 pub const FEATURE_LENDING_PROTOCOL_NAME: &str = "LendingProtocol";
 pub const FEATURE_LENDING_PROTOCOL_V1_1_NAME: &str = "LendingProtocolV1_1";
+pub const FEATURE_LENDING_PROTOCOL_V1_2_NAME: &str = "LendingProtocolV1_2";
+pub const FEATURE_SMART_ESCROW_NAME: &str = "SmartEscrow";
 pub const FEATURE_SINGLE_ASSET_VAULT_NAME: &str = "SingleAssetVault";
 pub const FEATURE_UNIVERSAL_NUMBER_NAME: &str = "fixUniversalNumber";
 pub const FIX_AMMV1_1_NAME: &str = "fixAMMv1_1";
@@ -29,6 +31,7 @@ pub const FIX_AMMV1_3_NAME: &str = "fixAMMv1_3";
 pub const FIX_CLEANUP_3_2_0_NAME: &str = "fixCleanup3_2_0";
 pub const FIX_CLEANUP_3_3_0_NAME: &str = "fixCleanup3_3_0";
 pub const FIX_CLEANUP_3_4_0_NAME: &str = "fixCleanup3_4_0";
+pub const FIX_CLEANUP_3_5_0_NAME: &str = "fixCleanup3_5_0";
 pub const FIX_MPT_DELIVERED_AMOUNT_NAME: &str = "fixMPTDeliveredAmount";
 pub const FEATURE_SPONSOR_NAME: &str = "Sponsor";
 
@@ -102,6 +105,24 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
         true,
         RegisteredFeatureVote::DefaultNo,
     ),
+    // Newer amendments are listed first, as in rippled's features.macro.
+    // SmartEscrow and LendingProtocolV1_2 remain registered but unsupported:
+    // their runtime implementations have not been ported yet.
+    RegisteredFeature::new(
+        FEATURE_SMART_ESCROW_NAME,
+        false,
+        RegisteredFeatureVote::DefaultNo,
+    ),
+    RegisteredFeature::new(
+        FEATURE_LENDING_PROTOCOL_V1_2_NAME,
+        false,
+        RegisteredFeatureVote::DefaultNo,
+    ),
+    RegisteredFeature::new(
+        FIX_CLEANUP_3_5_0_NAME,
+        true,
+        RegisteredFeatureVote::DefaultNo,
+    ),
     RegisteredFeature::new(
         FIX_CLEANUP_3_4_0_NAME,
         true,
@@ -116,9 +137,11 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     RegisteredFeature::new("fixBatchInnerSigs", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("LendingProtocol", true, RegisteredFeatureVote::DefaultNo),
+    // Closed-ended Vault/Lending V1.1 lifecycle parity is implemented and
+    // differentially covered with the corresponding cleanup-era rules.
     RegisteredFeature::new(
         "LendingProtocolV1_1",
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new(
@@ -208,11 +231,6 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new("fixEmptyDID", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("PriceOracle", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
-        "fixAMMOverflowOffer",
-        true,
-        RegisteredFeatureVote::DefaultYes,
-    ),
-    RegisteredFeature::new(
         "fixInnerObjTemplate",
         true,
         RegisteredFeatureVote::DefaultNo,
@@ -254,6 +272,10 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
         true,
         RegisteredFeatureVote::Obsolete,
     ),
+    // Retired in rippled after its corrected max-offer and AMM invariant
+    // semantics became unconditional.  Retired amendments remain registered
+    // and supported because their IDs are still present in validated ledgers.
+    RegisteredFeature::new("fixAMMOverflowOffer", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("fixCheckThreading", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new(
         "fixMasterKeyAsRegularKey",
@@ -411,6 +433,14 @@ pub fn feature_lending_protocol_v1_1() -> Uint256 {
     feature_id(FEATURE_LENDING_PROTOCOL_V1_1_NAME)
 }
 
+pub fn feature_lending_protocol_v1_2() -> Uint256 {
+    feature_id(FEATURE_LENDING_PROTOCOL_V1_2_NAME)
+}
+
+pub fn feature_smart_escrow() -> Uint256 {
+    feature_id(FEATURE_SMART_ESCROW_NAME)
+}
+
 pub fn feature_single_asset_vault() -> Uint256 {
     feature_id(FEATURE_SINGLE_ASSET_VAULT_NAME)
 }
@@ -457,6 +487,10 @@ pub fn fix_cleanup_3_3_0() -> Uint256 {
 
 pub fn fix_cleanup_3_4_0() -> Uint256 {
     feature_id(FIX_CLEANUP_3_4_0_NAME)
+}
+
+pub fn fix_cleanup_3_5_0() -> Uint256 {
+    feature_id(FIX_CLEANUP_3_5_0_NAME)
 }
 
 pub fn fix_token_escrow_v1() -> Uint256 {
@@ -626,6 +660,20 @@ mod tests {
             .expect("fixCleanup3_4_0 must be registered");
         assert!(registered.supported);
         assert_eq!(registered.vote, RegisteredFeatureVote::DefaultNo);
+    }
+
+    #[test]
+    fn retired_amm_overflow_offer_fix_remains_supported() {
+        let registered = REGISTERED_FEATURES
+            .iter()
+            .find(|registered| registered.name == "fixAMMOverflowOffer")
+            .expect("enabled retired amendments must remain registered");
+        assert!(registered.supported);
+        assert_eq!(registered.vote, RegisteredFeatureVote::Obsolete);
+        assert_eq!(
+            feature_name(&feature_id("fixAMMOverflowOffer")),
+            Some("fixAMMOverflowOffer")
+        );
     }
 
     #[test]

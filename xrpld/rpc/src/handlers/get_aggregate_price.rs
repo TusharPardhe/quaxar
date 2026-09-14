@@ -4,7 +4,7 @@
 //! base/quote asset pair. Computes mean, median, standard deviation, and
 //! optionally trims outliers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use protocol::{JsonValue, STAmount, STObject, get_field_by_symbol};
 
@@ -182,7 +182,10 @@ pub fn do_get_aggregate_price<S: AggregatePriceSource>(
         0
     };
 
-    // Collect prices from all oracles
+    // Retain the raw request limit above, but only read each valid
+    // {account, oracle_document_id} pair once.  Deduplication must follow
+    // parsing so malformed duplicate entries keep their normal error.
+    let mut seen_oracles = BTreeSet::new();
     let mut entries: Vec<PriceEntry> = Vec::new();
 
     for oracle_param in oracles {
@@ -200,6 +203,10 @@ pub fn do_get_aggregate_price<S: AggregatePriceSource>(
             },
             _ => return oracle_malformed_error(),
         };
+
+        if !seen_oracles.insert((account.clone(), document_id)) {
+            continue;
+        }
 
         // Read oracle data from ledger (current state)
         if let Some(oracle_data) = source.read_oracle(account, document_id) {
@@ -361,6 +368,7 @@ mod tests {
 
     struct MockSource {
         oracles: BTreeMap<(String, u32), OracleData>,
+        history: BTreeMap<(String, u32), Vec<OracleData>>,
     }
 
     impl AggregatePriceSource for MockSource {
@@ -368,6 +376,18 @@ mod tests {
             self.oracles
                 .get(&(account.to_string(), document_id))
                 .cloned()
+        }
+
+        fn read_oracle_history(
+            &self,
+            account: &str,
+            document_id: u32,
+            max_history: usize,
+        ) -> Vec<OracleData> {
+            self.history
+                .get(&(account.to_string(), document_id))
+                .map(|history| history.iter().take(max_history).cloned().collect())
+                .unwrap_or_default()
         }
     }
 
@@ -387,7 +407,69 @@ mod tests {
                 },
             );
         }
-        MockSource { oracles }
+        MockSource {
+            oracles,
+            history: BTreeMap::new(),
+        }
+    }
+
+    fn aggregate_oracle_data(time: u32, price: u64) -> OracleData {
+        OracleData {
+            last_update_time: time,
+            price_data_series: vec![PriceDataEntry {
+                base_asset: "XRP".to_string(),
+                quote_asset: "USD".to_string(),
+                asset_price: Some(price),
+                scale: 0,
+            }],
+        }
+    }
+
+    fn with_trim(mut params: JsonValue, trim: u64) -> JsonValue {
+        let JsonValue::Object(obj) = &mut params else {
+            panic!("parameters must be an object")
+        };
+        obj.insert("trim".to_string(), JsonValue::Unsigned(trim));
+        params
+    }
+
+    fn assert_duplicate_aggregate_matches_unique(unique: &JsonValue, duplicate: &JsonValue) {
+        let JsonValue::Object(unique) = unique else {
+            panic!("unique response must be an object")
+        };
+        let JsonValue::Object(duplicate) = duplicate else {
+            panic!("duplicate response must be an object")
+        };
+        let unique_entire_set = unique.get("entire_set").expect("unique entire_set");
+        let duplicate_entire_set = duplicate.get("entire_set").expect("duplicate entire_set");
+        let JsonValue::Object(unique_stats) = unique_entire_set else {
+            panic!("unique entire_set must be an object")
+        };
+        let JsonValue::Object(duplicate_stats) = duplicate_entire_set else {
+            panic!("duplicate entire_set must be an object")
+        };
+
+        for field in ["size", "mean", "standard_deviation"] {
+            assert_eq!(
+                unique_stats.get(field),
+                duplicate_stats.get(field),
+                "entire_set.{field} must match the unique request"
+            );
+        }
+        assert_eq!(
+            unique.get("median"),
+            duplicate.get("median"),
+            "median must match the unique request"
+        );
+        assert_eq!(
+            unique.get("trimmed_set"),
+            duplicate.get("trimmed_set"),
+            "trimmed_set must match the unique request"
+        );
+        assert_eq!(
+            unique_entire_set, duplicate_entire_set,
+            "entire_set must match the unique request"
+        );
     }
 
     fn make_params(oracles: Vec<(&str, u32)>, base: &str, quote: &str) -> JsonValue {
@@ -762,5 +844,140 @@ mod tests {
         };
         // prices: 3, 5, 7 → median = 5
         assert_eq!(r.get("median"), Some(&JsonValue::String("5".to_string())));
+    }
+
+    #[test]
+    fn current_duplicate_matches_unique_aggregate_statistics() {
+        let source = make_source(vec![
+            ("rA", 1, 1_000, "XRP", "USD", 10, 0),
+            ("rB", 1, 1_000, "XRP", "USD", 20, 0),
+            ("rC", 1, 1_000, "XRP", "USD", 30, 0),
+            ("rD", 1, 1_000, "XRP", "USD", 40, 0),
+            ("rE", 1, 1_000, "XRP", "USD", 50, 0),
+        ]);
+        let unique = do_get_aggregate_price(
+            &with_trim(
+                make_params(
+                    vec![("rA", 1), ("rB", 1), ("rC", 1), ("rD", 1), ("rE", 1)],
+                    "XRP",
+                    "USD",
+                ),
+                20,
+            ),
+            &source,
+        );
+        let duplicate = do_get_aggregate_price(
+            &with_trim(
+                make_params(
+                    vec![
+                        ("rA", 1),
+                        ("rA", 1),
+                        ("rB", 1),
+                        ("rC", 1),
+                        ("rD", 1),
+                        ("rE", 1),
+                    ],
+                    "XRP",
+                    "USD",
+                ),
+                20,
+            ),
+            &source,
+        );
+
+        assert_duplicate_aggregate_matches_unique(&unique, &duplicate);
+    }
+
+    #[test]
+    fn history_duplicate_matches_unique_aggregate_statistics() {
+        let mut source = make_source(vec![("rA", 1, 1_000, "XRP", "USD", 10, 0)]);
+        source.history.insert(
+            ("rA".to_string(), 1),
+            vec![
+                aggregate_oracle_data(900, 20),
+                aggregate_oracle_data(800, 30),
+                aggregate_oracle_data(700, 40),
+                aggregate_oracle_data(600, 50),
+            ],
+        );
+        let unique = do_get_aggregate_price(
+            &with_trim(make_params(vec![("rA", 1)], "XRP", "USD"), 20),
+            &source,
+        );
+        let duplicate = do_get_aggregate_price(
+            &with_trim(make_params(vec![("rA", 1), ("rA", 1)], "XRP", "USD"), 20),
+            &source,
+        );
+
+        assert_duplicate_aggregate_matches_unique(&unique, &duplicate);
+    }
+
+    #[test]
+    fn duplicate_plus_distinct_oracles_match_unique_aggregate_statistics() {
+        let source = make_source(vec![
+            ("rA", 1, 1_000, "XRP", "USD", 10, 0),
+            ("rB", 1, 1_000, "XRP", "USD", 20, 0),
+            ("rC", 1, 1_000, "XRP", "USD", 30, 0),
+            ("rD", 1, 1_000, "XRP", "USD", 40, 0),
+            ("rE", 1, 1_000, "XRP", "USD", 50, 0),
+        ]);
+        let unique = do_get_aggregate_price(
+            &with_trim(
+                make_params(
+                    vec![("rA", 1), ("rB", 1), ("rC", 1), ("rD", 1), ("rE", 1)],
+                    "XRP",
+                    "USD",
+                ),
+                20,
+            ),
+            &source,
+        );
+        let duplicate = do_get_aggregate_price(
+            &with_trim(
+                make_params(
+                    vec![
+                        ("rA", 1),
+                        ("rB", 1),
+                        ("rA", 1),
+                        ("rC", 1),
+                        ("rB", 1),
+                        ("rD", 1),
+                        ("rE", 1),
+                    ],
+                    "XRP",
+                    "USD",
+                ),
+                20,
+            ),
+            &source,
+        );
+
+        assert_duplicate_aggregate_matches_unique(&unique, &duplicate);
+    }
+
+    #[test]
+    fn duplicate_requests_keep_the_raw_200_oracle_limit() {
+        let source = make_source(vec![("rA", 1, 1_000, "XRP", "USD", 10, 0)]);
+        let unique = do_get_aggregate_price(
+            &with_trim(make_params(vec![("rA", 1)], "XRP", "USD"), 20),
+            &source,
+        );
+        let at_limit = do_get_aggregate_price(
+            &with_trim(make_params(vec![("rA", 1); MAX_ORACLES], "XRP", "USD"), 20),
+            &source,
+        );
+        let over_limit = do_get_aggregate_price(
+            &with_trim(
+                make_params(vec![("rA", 1); MAX_ORACLES + 1], "XRP", "USD"),
+                20,
+            ),
+            &source,
+        );
+
+        assert_duplicate_aggregate_matches_unique(&unique, &at_limit);
+        assert_eq!(
+            error_code(&over_limit),
+            Some(&JsonValue::String("oracleMalformed".to_string()))
+        );
     }
 }

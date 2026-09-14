@@ -95,7 +95,7 @@ fn accepted_transaction_events<S: RpcRuntime>(source: &S) -> Vec<JsonValue> {
         .into_iter()
         .map(|(transaction, meta)| {
             let mut meta_json = meta.get_json(protocol::JsonOptions::NONE);
-            rpc::insert_delivered_amount(
+            app::ledger_to_json::ledger_to_json_tx::insert_all_synthetic_in_json(
                 &mut meta_json,
                 ledger.header().seq,
                 Some(ledger.header().close_time),
@@ -1174,6 +1174,67 @@ mod tests {
         assert_eq!(
             meta.get("DeliveredAmount"),
             Some(&JsonValue::String("800".to_owned()))
+        );
+    }
+
+    #[test]
+    fn accepted_transaction_events_publish_all_synthetic_metadata_fields() {
+        let issuer = protocol::AccountID::from_array([0x33; 20]);
+        let sequence = 7;
+        let tx = Arc::new(STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |object| {
+            object.set_account_id(get_field_by_symbol("sfAccount"), issuer);
+            object.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+            object.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+        }));
+        let issuance_id = protocol::make_mpt_id(sequence, issuer);
+
+        let mut new_fields = protocol::STObject::new(get_field_by_symbol("sfNewFields"));
+        new_fields.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+        new_fields.set_account_id(get_field_by_symbol("sfIssuer"), issuer);
+
+        let mut created = protocol::STObject::new(get_field_by_symbol("sfCreatedNode"));
+        created.set_field_h256(
+            get_field_by_symbol("sfLedgerIndex"),
+            basics::base_uint::Uint256::from_array([0x55; 32]),
+        );
+        created.set_field_u16(
+            get_field_by_symbol("sfLedgerEntryType"),
+            protocol::LedgerEntryType::MPTokenIssuance.code(),
+        );
+        created.set_field_object(get_field_by_symbol("sfNewFields"), new_fields);
+
+        let mut affected = protocol::STArray::new(get_field_by_symbol("sfAffectedNodes"));
+        affected.push_back(created);
+        let mut meta_object = protocol::STObject::new(get_field_by_symbol("sfTransactionMetaData"));
+        meta_object.set_field_u8(get_field_by_symbol("sfTransactionResult"), 0);
+        meta_object.set_field_u32(get_field_by_symbol("sfTransactionIndex"), 3);
+        meta_object.set_field_array(get_field_by_symbol("sfAffectedNodes"), affected);
+        let mut meta = TxMeta::from_stobject(tx.get_transaction_id(), 500, meta_object);
+        let mut raw_meta = Serializer::default();
+        meta.add_raw(&mut raw_meta, Ter::TES_SUCCESS, 0);
+
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(500, 500_000_000, false);
+        ledger
+            .raw_tx_insert(
+                tx.get_transaction_id(),
+                Arc::new(Serializer::from_bytes(tx.get_serializer().data())),
+                Some(Arc::new(raw_meta)),
+            )
+            .expect("accepted transaction should insert");
+
+        let events = accepted_transaction_events(&SnapshotRuntime(Arc::new(ledger)));
+        let JsonValue::Object(event) = &events[0] else {
+            panic!("transaction subscription event should be an object");
+        };
+        let JsonValue::Object(meta) = event.get("meta").expect("event metadata") else {
+            panic!("event metadata should be an object");
+        };
+        assert_eq!(
+            meta.get("mpt_issuance_id"),
+            Some(&JsonValue::String(issuance_id.to_string()))
         );
     }
 }

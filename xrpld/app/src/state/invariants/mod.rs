@@ -154,6 +154,11 @@ pub(crate) fn check_invariants_for_tx_with_prefix<V: ApplyView + ?Sized>(
         return invariant_failure_result(result);
     }
     let txn_type = tx.get_txn_type();
+    let loan_default =
+        txn_type == protocol::TxType::LOAN_MANAGE && tx.is_flag(protocol::tfLoanDefault);
+    let tx_loan_id = tx
+        .is_field_present(sf("sfLoanID"))
+        .then(|| tx.get_field_h256(sf("sfLoanID")));
     let tx_domain = tx
         .is_field_present(sf("sfDomainID"))
         .then(|| tx.get_field_h256(sf("sfDomainID")));
@@ -177,6 +182,8 @@ pub(crate) fn check_invariants_for_tx_with_prefix<V: ApplyView + ?Sized>(
         check_invariants_inner(
             sandbox,
             txn_type,
+            loan_default,
+            tx_loan_id,
             tx_domain,
             tx_account,
             tx_destination,
@@ -202,8 +209,8 @@ pub fn check_invariants<V: ApplyView + ?Sized>(
     map_invariant_result(
         result,
         check_invariants_inner(
-            sandbox, txn_type, None, None, None, None, None, false, false, false, result, fee,
-            None, None,
+            sandbox, txn_type, false, None, None, None, None, None, None, false, false, false,
+            result, fee, None, None,
         ),
     )
 }
@@ -229,6 +236,8 @@ fn pay_channel_held_drops(amount: STAmount, balance: STAmount) -> i64 {
 fn check_invariants_inner<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
+    loan_default: bool,
+    tx_loan_id: Option<Uint256>,
     tx_domain: Option<Uint256>,
     tx_account: Option<AccountID>,
     tx_destination: Option<AccountID>,
@@ -261,8 +270,15 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     let lending_protocol_enabled = sandbox
         .rules()
         .enabled(&protocol::feature_id("LendingProtocol"));
+    let lending_protocol_v1_1_enabled = sandbox
+        .rules()
+        .enabled(&protocol::feature_id("LendingProtocolV1_1"));
     let mptokens_v2_enabled = sandbox.rules().enabled(&protocol::feature_id("MPTokensV2"));
-    let mpt_transfer_invariant_enabled = fix_cleanup_3_2_0 || mptokens_v2_enabled;
+    let mpt_transfer_invariant_enabled = fix_cleanup_3_2_0
+        || mptokens_v2_enabled
+        || sandbox
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_4_0"));
     let permissioned_dex_invariant_enabled = fix_cleanup_3_2_0
         || sandbox
             .rules()
@@ -270,6 +286,10 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     let mut directory_roots = BTreeSet::new();
     let mut mpt_accounting = BTreeMap::new();
     let mut mpt_transfers = BTreeMap::new();
+    // Capture every touched AccountRoot's pre-transaction pseudo status. This
+    // survives a LoanBrokerDelete-style erase before MPT authorization is
+    // finalized, and false entries deliberately freeze ordinary classification.
+    let mut pseudo_accounts_before = BTreeMap::new();
     let mut mpt_issuance_lifecycle = MptIssuanceLifecycle::default();
     let mut confidential_mpt = BTreeMap::new();
     let mut permissioned_domain = PermissionedDomainState::default();
@@ -387,27 +407,44 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
                         "sfWithdrawalPolicy",
                         "sfScale",
                         "sfLEVersion",
+                        "sfAsset",
+                        "sfAccount",
+                        "sfShareMPTID",
                     ]
                 }
                 _ => &[],
             };
             changed |= fields.iter().any(|field| field_changed(field));
+            if lending_protocol_v1_1_enabled && entry.sle.get_type() == LedgerEntryType::Loan {
+                let before_flags = before.get_field_u32(sf("sfFlags"));
+                let after_flags = entry.sle.get_field_u32(sf("sfFlags"));
+                let overpayment_changed = (before_flags & protocol::lsfLoanOverpayment)
+                    != (after_flags & protocol::lsfLoanOverpayment);
+                let default_cleared = (before_flags & protocol::lsfLoanDefault) != 0
+                    && (after_flags & protocol::lsfLoanDefault) == 0;
+                changed |= overpayment_changed || default_cleared;
+            }
             invalid_unmodifiable_field |= changed;
         }
 
         if entry.sle.get_type() == LedgerEntryType::AccountRoot {
+            if let Some(before) = before_sle {
+                pseudo_accounts_before.insert(
+                    before.get_account_id(sf("sfAccount")),
+                    ledger::is_pseudo_account(before),
+                );
+            }
             if before_sle.is_none() && !is_delete {
                 accounts_created = accounts_created.saturating_add(1);
                 created_account_seq = entry.sle.get_field_u32(sf("sfSequence"));
                 created_account_is_pseudo = ledger::is_pseudo_account(&entry.sle);
                 created_account_flags = entry.sle.get_field_u32(sf("sfFlags"));
             }
-            if is_delete && before_sle.is_some() {
-                accounts_deleted = accounts_deleted.saturating_add(1);
-                deleted_account_roots.push((
-                    before_sle.expect("checked deleted account").clone(),
-                    entry.sle.as_ref().clone(),
-                ));
+            if is_delete {
+                if let Some(before) = before_sle {
+                    accounts_deleted = accounts_deleted.saturating_add(1);
+                    deleted_account_roots.push((before.clone(), entry.sle.as_ref().clone()));
+                }
             }
         }
 
@@ -489,10 +526,12 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
             && let Some(account) =
                 visited_after_sle.filter(|sle| sle.get_type() == LedgerEntryType::AccountRoot)
         {
-            let pseudo_fields = ["sfAMMID", "sfVaultID", "sfLoanBrokerID"];
-            let pseudo_field_count = pseudo_fields
+            let pseudo_field_count = protocol::all_sfields()
                 .iter()
-                .filter(|field| account.is_field_present(sf(field)))
+                .filter(|field| {
+                    field.should_meta(protocol::SField::S_MD_PSEUDO_ACCOUNT)
+                        && account.is_field_present(field)
+                })
                 .count();
             if pseudo_field_count != 0 || account.get_field_u32(sf("sfSequence")) == 0 {
                 let required_flags = protocol::lsfDisableMaster
@@ -609,7 +648,9 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
             record_vault_state(&mut vault, is_delete, before_sle, after_sle);
         }
         if lending_protocol_enabled {
-            if record_lending_state(sandbox, &mut lending, after_sle).is_err() {
+            if record_lending_state(sandbox, &mut lending, is_delete, before_sle, after_sle)
+                .is_err()
+            {
                 return Ok(Ter::TEF_BAD_LEDGER);
             }
         }
@@ -645,7 +686,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
             record_object_deletion_state(&mut object_deletion, is_delete, before_sle);
         }
 
-        if fix_cleanup_3_2_0 || mptokens_v2_enabled {
+        if fix_cleanup_3_2_0 || mptokens_v2_enabled || fix_cleanup_3_4_0 {
             let deleted_sle = before_sle.unwrap_or(&entry.sle);
             if record_mpt_issuance_lifecycle(
                 sandbox,
@@ -838,11 +879,21 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
                 }
             }
             LedgerEntryType::Loan => {
-                if lending_protocol_enabled
-                    && let Some(a) = after_sle
-                    && !validate_loan_entry(before_sle, a)
-                {
-                    return Err(());
+                if lending_protocol_enabled && let Some(a) = after_sle {
+                    let valid = match validate_loan_entry(
+                        sandbox,
+                        txn_type,
+                        result,
+                        lending_protocol_v1_1_enabled,
+                        before_sle,
+                        a,
+                    ) {
+                        Ok(valid) => valid,
+                        Err(_) => return Ok(Ter::TEF_BAD_LEDGER),
+                    };
+                    if !valid {
+                        return Err(());
+                    }
                 }
             }
             LedgerEntryType::LoanBroker => {
@@ -869,7 +920,17 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     if has_xrp_trust_line || deep_freeze_violation || mpt_issuance_locked_violation {
         return Err(());
     }
-    let valid_freeze = match validates_transfers_not_frozen(sandbox, txn_type, &freeze) {
+    let loan_default_accounts =
+        match loan_default_freeze_exempt_accounts(sandbox, loan_default, tx_loan_id) {
+            Ok(accounts) => accounts,
+            Err(_) => return Ok(Ter::TEF_BAD_LEDGER),
+        };
+    let valid_freeze = match validates_transfers_not_frozen(
+        sandbox,
+        txn_type,
+        loan_default_accounts.as_ref(),
+        &freeze,
+    ) {
         Ok(valid) => valid,
         Err(_) => return Ok(Ter::TEF_BAD_LEDGER),
     };
@@ -1021,16 +1082,17 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
                 Ok(None) => {}
                 Err(_) => return Ok(Ter::TEF_BAD_LEDGER),
             }
-            for field in ["sfAMMID", "sfVaultID", "sfLoanBrokerID"] {
-                if before.is_field_present(sf(field)) {
-                    match sandbox.read(protocol::Keylet::new(
-                        LedgerEntryType::Any,
-                        before.get_field_h256(sf(field)),
-                    )) {
-                        Ok(Some(_)) => return Err(()),
-                        Ok(None) => {}
-                        Err(_) => return Ok(Ter::TEF_BAD_LEDGER),
-                    }
+            for field in protocol::all_sfields().iter().filter(|field| {
+                field.should_meta(protocol::SField::S_MD_PSEUDO_ACCOUNT)
+                    && before.is_field_present(field)
+            }) {
+                match sandbox.read(protocol::Keylet::new(
+                    LedgerEntryType::Any,
+                    before.get_field_h256(field),
+                )) {
+                    Ok(Some(_)) => return Err(()),
+                    Ok(None) => {}
+                    Err(_) => return Ok(Ter::TEF_BAD_LEDGER),
                 }
             }
         }
@@ -1078,7 +1140,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         return Err(());
     }
 
-    if fix_cleanup_3_2_0 || mptokens_v2_enabled {
+    if fix_cleanup_3_2_0 || mptokens_v2_enabled || fix_cleanup_3_4_0 {
         if !validates_mpt_issuance_lifecycle(&mpt_issuance_lifecycle) {
             return Err(());
         }
@@ -1089,6 +1151,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
             single_asset_vault_enabled,
             lending_protocol_enabled,
             mptokens_v2_enabled,
+            fix_cleanup_3_4_0,
             &mpt_issuance_lifecycle,
         ) {
             return Err(());
@@ -1109,16 +1172,25 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     }
 
     if mpt_transfer_invariant_enabled {
-        if !validates_mpt_accounting_for_transaction(&mpt_accounting, mptokens_v2_enabled, txn_type)
-        {
+        if !validates_mpt_accounting_for_transaction(
+            &mpt_accounting,
+            mptokens_v2_enabled || fix_cleanup_3_4_0,
+            txn_type,
+            result,
+            fix_cleanup_3_4_0,
+        ) {
             return Err(());
         }
         let valid_mpt_transfers = match mpt_transfer_validation_result(validates_mpt_transfers(
             sandbox,
             txn_type,
+            result,
             cross_currency_payment,
             fix_cleanup_3_2_0,
+            fix_cleanup_3_4_0,
             mptokens_v2_enabled,
+            loan_default_accounts.as_ref(),
+            &pseudo_accounts_before,
             &mpt_transfers,
         )) {
             Ok(valid) => valid,
@@ -1154,7 +1226,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
             tx_amount.as_ref(),
             tx_account_paid_fee,
             fee,
-            fix_cleanup_3_2_0,
+            fix_cleanup_3_4_0,
             result,
             &vault,
             &vault_reads,
@@ -1172,6 +1244,13 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     }
 
     if lending_protocol_enabled {
+        if lending_protocol_v1_1_enabled {
+            match validate_v1_1_lending_deletions(sandbox, txn_type, &lending) {
+                Ok(true) => {}
+                Ok(false) => return Err(()),
+                Err(_) => return Ok(Ter::TEF_BAD_LEDGER),
+            }
+        }
         for broker_id in lending.broker_refs {
             match sandbox.read(protocol::loan_broker_keylet_from_key(broker_id)) {
                 Ok(Some(_)) => {}
@@ -1208,8 +1287,9 @@ mod tests {
         PermissionedDexState, permissioned_dex_consumed_wrong_domain, record_permissioned_dex,
     };
     use super::vault::{
-        VaultAssetDelta, VaultSnapshot, VaultState, add_vault_asset_delta, compute_vault_min_scale,
-        rounded_vault_delta, valid_vault_loss_unrealized, vault_transaction_account_asset_delta,
+        VaultAssetDelta, VaultSnapshot, VaultState, add_vault_asset_delta, agrees_within_one_unit,
+        compute_vault_min_scale, less_or_equal_plus_one_unit, rounded_vault_delta,
+        valid_vault_loss_unrealized, vault_transaction_account_asset_delta,
     };
     use super::{
         check_invariants_for_tx_with_expected_xrp_delta, mpt_transfer_validation_result,
@@ -1249,13 +1329,12 @@ mod tests {
         })
     }
 
-    fn vault_snapshot_with_scale(scale: Option<i32>) -> VaultSnapshot {
+    fn vault_snapshot_with_scale(_scale: Option<i32>) -> VaultSnapshot {
         VaultSnapshot {
             key: Uint256::from_u64(1),
             asset: usd_asset(),
             pseudo_id: account(0xA2),
             share_mpt_id: protocol::MPTIssue::new(protocol::make_mpt_id(1, account(0xA2))).mpt_id(),
-            scale,
             assets_total: RuntimeNumber::from_i64(1),
             assets_available: RuntimeNumber::from_i64(1),
             loss_unrealized: RuntimeNumber::zero(),
@@ -1510,20 +1589,32 @@ mod tests {
     }
 
     #[test]
-    fn vault_invariant_min_scale_prefers_explicit_vault_scale_after_cleanup_3_2_0() {
+    fn vault_invariant_min_scale_uses_posterior_assets_total_after_cleanup_3_4_0() {
         let before = vault_snapshot_with_scale(Some(-2));
-        let after = vault_snapshot_with_scale(Some(-2));
+        let mut after = vault_snapshot_with_scale(Some(-2));
+        after.assets_total =
+            RuntimeNumber::try_from_external_parts(10001, -4, get_mantissa_scale())
+                .expect("valid posterior total");
+        after.assets_available = after.assets_total;
         let delta = VaultAssetDelta {
             delta: RuntimeNumber::try_from_external_parts(12345, -4, get_mantissa_scale())
                 .expect("valid delta"),
             scale: Some(-4),
         };
 
-        assert_eq!(compute_vault_min_scale(&before, &after, delta, true), -2);
+        let expected_scale = after
+            .asset
+            .amount(after.assets_total)
+            .expect("representable posterior total")
+            .exponent();
         assert_eq!(
+            compute_vault_min_scale(&before, &after, delta, true),
+            expected_scale
+        );
+        assert_ne!(
+            rounded_vault_delta(after.asset, delta, expected_scale),
             rounded_vault_delta(after.asset, delta, -2),
-            RuntimeNumber::try_from_external_parts(123, -2, get_mantissa_scale())
-                .expect("vault-scale rounded delta")
+            "the posterior AssetsTotal grid must not fall back to sfScale"
         );
     }
 
@@ -1542,5 +1633,37 @@ mod tests {
         };
 
         assert_eq!(compute_vault_min_scale(&before, &after, delta, false), -4);
+    }
+
+    #[test]
+    fn vault_cleanup_3_4_tolerance_is_exactly_one_iou_ulp() {
+        let iou = usd_asset();
+        let one =
+            RuntimeNumber::try_from_external_parts(1, -6, get_mantissa_scale()).expect("one ULP");
+        let two =
+            RuntimeNumber::try_from_external_parts(2, -6, get_mantissa_scale()).expect("two ULPs");
+        let zero = RuntimeNumber::zero();
+
+        assert!(agrees_within_one_unit(one, zero, iou, -6, true));
+        assert!(!agrees_within_one_unit(two, zero, iou, -6, true));
+        assert!(!agrees_within_one_unit(one, zero, iou, -6, false));
+        assert!(less_or_equal_plus_one_unit(one, zero, iou, -6, true));
+        assert!(!less_or_equal_plus_one_unit(two, zero, iou, -6, true));
+
+        let xrp = Asset::Issue(protocol::xrp_issue());
+        assert!(!agrees_within_one_unit(
+            RuntimeNumber::from_i64(1),
+            zero,
+            xrp,
+            0,
+            true
+        ));
+        assert!(!less_or_equal_plus_one_unit(
+            RuntimeNumber::from_i64(1),
+            zero,
+            xrp,
+            0,
+            true
+        ));
     }
 }

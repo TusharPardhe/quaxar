@@ -63,6 +63,18 @@ fn mpt_v2_without_cleanup_ledger() -> Ledger {
     ledger
 }
 
+fn cleanup_3_4_mpt_ledger() -> Ledger {
+    let mut ledger = Ledger::new(
+        LedgerHeader {
+            seq: 32,
+            ..LedgerHeader::default()
+        },
+        false,
+    );
+    ledger.set_rules(Rules::new([protocol::fix_cleanup_3_4_0()]));
+    ledger
+}
+
 fn lending_ledger() -> Ledger {
     let mut ledger = test_ledger();
     ledger.set_rules(Rules::new([
@@ -80,6 +92,365 @@ fn lending_cleanup_ledger() -> Ledger {
         feature_id("LendingProtocol"),
     ]));
     ledger
+}
+
+fn lending_v1_1_ledger() -> Ledger {
+    let mut ledger = lending_ledger();
+    ledger.set_rules(Rules::new([
+        feature_id("fixCleanup3_2_0"),
+        feature_id("LendingProtocol"),
+        feature_id("LendingProtocolV1_1"),
+    ]));
+    ledger
+}
+
+fn v1_1_lending_parent() -> Sandbox<Ledger> {
+    Sandbox::new(Arc::new(lending_v1_1_ledger()), ApplyFlags::default())
+}
+
+fn v1_1_lending_context(
+    parent: &mut Sandbox<Ledger>,
+    vault_id: Uint256,
+    broker_id: Uint256,
+    closed_redemption: Option<u32>,
+) {
+    let owner = acct(0xD0);
+    let pseudo = acct(0xD1);
+    let asset = Asset::Issue(Issue {
+        currency: iou_currency(b"USD"),
+        account: acct(0xD2),
+    });
+    let share_mpt_id = MPTIssue::new(mpt_id(acct(0xD3), 1));
+    let mut vault =
+        vault_entry_with_values(vault_id, owner, acct(0xD4), asset, share_mpt_id, 0, 0, 0);
+    if let Some(redemption) = closed_redemption {
+        vault.set_field_u8(sf("sfVaultKind"), 1);
+        vault.set_field_u32(sf("sfSubscriptionDate"), 0);
+        vault.set_field_u32(sf("sfRedemptionDate"), redemption);
+    }
+    parent.insert(Arc::new(vault)).expect("insert V1.1 vault");
+    parent
+        .insert(Arc::new(loan_broker_entry(
+            broker_id, owner, pseudo, vault_id, 1, 0, 0, 0,
+        )))
+        .expect("insert V1.1 broker");
+}
+
+#[test]
+fn v1_1_invariant_rejects_orphan_loan_and_wrong_creation_transaction() {
+    let mut parent = v1_1_lending_parent();
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.insert(Arc::new(loan_entry(
+        Uint256::from_u64(8_001),
+        Uint256::from_u64(8_002),
+        acct(0xD5),
+        1,
+        1,
+        1,
+        0,
+        1,
+        0,
+    )))
+    .expect("insert orphan loan");
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::LOAN_BROKER_SET,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
+}
+
+#[test]
+fn v1_1_invariant_rejects_paid_loan_with_due_date() {
+    let mut parent = v1_1_lending_parent();
+    let vault_id = Uint256::from_u64(8_010);
+    let broker_id = Uint256::from_u64(8_011);
+    v1_1_lending_context(&mut parent, vault_id, broker_id, None);
+    let mut loan = loan_entry(
+        Uint256::from_u64(8_012),
+        broker_id,
+        acct(0xD6),
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+    );
+    loan.set_field_u32(sf("sfNextPaymentDueDate"), 1);
+
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.insert(Arc::new(loan)).expect("insert paid loan");
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::LOAN_SET,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
+}
+
+#[test]
+fn v1_1_invariant_rejects_invalid_closed_loan_schedule() {
+    let mut parent = v1_1_lending_parent();
+    let vault_id = Uint256::from_u64(8_020);
+    let broker_id = Uint256::from_u64(8_021);
+    v1_1_lending_context(&mut parent, vault_id, broker_id, Some(180));
+    let mut loan = loan_entry(
+        Uint256::from_u64(8_022),
+        broker_id,
+        acct(0xD7),
+        1,
+        1,
+        1,
+        0,
+        1,
+        0,
+    );
+    loan.set_field_u32(sf("sfStartDate"), 1);
+    loan.set_field_u32(sf("sfPaymentInterval"), 120);
+
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.insert(Arc::new(loan))
+        .expect("insert invalid schedule");
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::LOAN_SET,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
+}
+
+#[test]
+fn v1_1_invariant_rejects_default_clear_and_invalid_impairment_transition() {
+    let mut parent = v1_1_lending_parent();
+    let vault_id = Uint256::from_u64(8_030);
+    let broker_id = Uint256::from_u64(8_031);
+    let loan_id = Uint256::from_u64(8_032);
+    v1_1_lending_context(&mut parent, vault_id, broker_id, None);
+    parent
+        .insert(Arc::new(loan_entry(
+            loan_id,
+            broker_id,
+            acct(0xD8),
+            1,
+            1,
+            1,
+            0,
+            1,
+            protocol::lsfLoanDefault,
+        )))
+        .expect("insert defaulted loan");
+
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(loan_entry(
+        loan_id,
+        broker_id,
+        acct(0xD8),
+        1,
+        1,
+        1,
+        0,
+        1,
+        0,
+    )))
+    .expect("clear default flag");
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::LOAN_MANAGE,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
+
+    let mut parent = v1_1_lending_parent();
+    let vault_id = Uint256::from_u64(8_033);
+    let broker_id = Uint256::from_u64(8_034);
+    let loan_id = Uint256::from_u64(8_035);
+    v1_1_lending_context(&mut parent, vault_id, broker_id, None);
+    parent
+        .insert(Arc::new(loan_entry(
+            loan_id,
+            broker_id,
+            acct(0xD9),
+            1,
+            1,
+            1,
+            0,
+            1,
+            0,
+        )))
+        .expect("insert healthy loan");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(loan_entry(
+        loan_id,
+        broker_id,
+        acct(0xD9),
+        1,
+        1,
+        1,
+        0,
+        1,
+        protocol::lsfLoanImpaired,
+    )))
+    .expect("set impaired flag");
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::LOAN_SET,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
+}
+
+#[test]
+fn v1_1_invariant_rejects_invalid_loan_pay_progression() {
+    let mut parent = v1_1_lending_parent();
+    let vault_id = Uint256::from_u64(8_040);
+    let broker_id = Uint256::from_u64(8_041);
+    let loan_id = Uint256::from_u64(8_042);
+    v1_1_lending_context(&mut parent, vault_id, broker_id, None);
+    parent
+        .insert(Arc::new(loan_entry(
+            loan_id,
+            broker_id,
+            acct(0xDA),
+            2,
+            20,
+            10,
+            0,
+            1,
+            0,
+        )))
+        .expect("insert loan before payment");
+
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(loan_entry(
+        loan_id,
+        broker_id,
+        acct(0xDA),
+        2,
+        19,
+        9,
+        0,
+        1,
+        0,
+    )))
+    .expect("apply non-progressing payment");
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::LOAN_PAY,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
+}
+
+#[test]
+fn v1_1_invariant_rejects_wrong_loan_and_broker_deletions() {
+    let mut parent = v1_1_lending_parent();
+    let loan = loan_entry(
+        Uint256::from_u64(8_050),
+        Uint256::from_u64(8_051),
+        acct(0xDB),
+        1,
+        1,
+        1,
+        0,
+        1,
+        0,
+    );
+    parent.insert(Arc::new(loan.clone())).expect("insert loan");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.erase(Arc::new(loan)).expect("erase loan");
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::LOAN_PAY,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
+
+    let mut parent = v1_1_lending_parent();
+    let vault_id = Uint256::from_u64(8_052);
+    let broker_id = Uint256::from_u64(8_053);
+    v1_1_lending_context(&mut parent, vault_id, broker_id, None);
+    let broker = loan_broker_entry(broker_id, acct(0xD0), acct(0xD1), vault_id, 1, 0, 0, 0);
+    // Replace the context's broker with the exact SLE used for its erase.
+    parent
+        .update(Arc::new(broker.clone()))
+        .expect("reset broker");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.erase(Arc::new(broker)).expect("erase broker");
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::LOAN_BROKER_SET,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
+}
+
+#[test]
+fn v1_1_invariant_rejects_broker_deletion_with_owner_or_unrounded_debt() {
+    let mut parent = v1_1_lending_parent();
+    let vault_id = Uint256::from_u64(8_060);
+    let broker_id = Uint256::from_u64(8_061);
+    v1_1_lending_context(&mut parent, vault_id, broker_id, None);
+    let broker = loan_broker_entry(broker_id, acct(0xD0), acct(0xD1), vault_id, 1, 0, 0, 1);
+    parent
+        .update(Arc::new(broker.clone()))
+        .expect("set owner count");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.erase(Arc::new(broker)).expect("erase owned broker");
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::LOAN_BROKER_DELETE,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
+
+    let mut parent = v1_1_lending_parent();
+    let vault_id = Uint256::from_u64(8_062);
+    let broker_id = Uint256::from_u64(8_063);
+    v1_1_lending_context(&mut parent, vault_id, broker_id, None);
+    let broker = loan_broker_entry(broker_id, acct(0xD0), acct(0xD1), vault_id, 1, 1, 0, 0);
+    parent
+        .update(Arc::new(broker.clone()))
+        .expect("set broker debt");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.erase(Arc::new(broker)).expect("erase indebted broker");
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::LOAN_BROKER_DELETE,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
 }
 
 fn with_flow<R>(f: impl FnOnce(&mut FlowSandbox<Sandbox<Ledger>>) -> R) -> R {
@@ -1145,6 +1516,116 @@ fn invariant_rejects_deep_freeze_without_freeze_on_trustline() {
 }
 
 #[test]
+fn cleanup_3_4_mpt_invariants_reject_balance_and_deletion_changes_on_every_failure() {
+    for result in [Ter::TEC_KILLED, Ter::TEC_INCOMPLETE, Ter::TEC_EXPIRED] {
+        let issuer = acct(0x10);
+        let holder = acct(0x11);
+        let mut parent = Sandbox::new(Arc::new(cleanup_3_4_mpt_ledger()), ApplyFlags::default());
+        parent
+            .insert(Arc::new(mpt_issuance_entry(issuer, 1, 100, 0)))
+            .expect("insert issuance");
+        parent
+            .insert(Arc::new(mptoken_entry(holder, issuer, 1, 100)))
+            .expect("insert holder");
+        let mut flow = FlowSandbox::new(&mut parent);
+        flow.update(Arc::new(mpt_issuance_entry(issuer, 1, 110, 0)))
+            .expect("mutate outstanding amount");
+        flow.update(Arc::new(mptoken_entry(holder, issuer, 1, 110)))
+            .expect("mutate holder amount");
+        assert_eq!(
+            check_invariants(&flow, TxType::PAYMENT, result, XRPAmount::from_drops(10)),
+            Ter::TEC_INVARIANT_FAILED,
+            "{result:?} must not retain a consistent MPT mint"
+        );
+    }
+
+    let issuer = acct(0x12);
+    let holder = acct(0x13);
+    let mut parent = Sandbox::new(Arc::new(cleanup_3_4_mpt_ledger()), ApplyFlags::default());
+    let token = mptoken_entry(holder, issuer, 1, 0);
+    parent
+        .insert(Arc::new(mpt_issuance_entry(issuer, 1, 0, 0)))
+        .expect("insert issuance");
+    parent
+        .insert(Arc::new(token.clone()))
+        .expect("insert token");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.erase(Arc::new(token)).expect("erase zero token");
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::MPTOKEN_AUTHORIZE,
+            Ter::TEC_EXPIRED,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TEC_INVARIANT_FAILED,
+        "a failed transaction must not retain an MPToken deletion"
+    );
+}
+
+#[test]
+fn cleanup_3_4_mpt_transfer_uses_deleted_pseudo_account_prestate() {
+    let issuer = acct(0x14);
+    let broker_pseudo = acct(0x15);
+    let owner = acct(0x16);
+    let broker_id = Uint256::from_u64(0xB10C);
+    let mut parent = Sandbox::new(Arc::new(cleanup_3_4_mpt_ledger()), ApplyFlags::default());
+    let mut pseudo_root = account_root(broker_pseudo);
+    pseudo_root.set_field_h256(sf("sfLoanBrokerID"), broker_id);
+    parent
+        .insert(Arc::new(mpt_issuance_entry(
+            issuer,
+            1,
+            100,
+            protocol::lsfMPTCanTransfer | protocol::lsfMPTRequireAuth,
+        )))
+        .expect("insert auth-required issuance");
+    parent
+        .insert(Arc::new(pseudo_root.clone()))
+        .expect("insert broker pseudo root");
+    parent
+        .insert(Arc::new(account_root(owner)))
+        .expect("insert cover recipient root");
+    parent
+        .insert(Arc::new(mptoken_entry(broker_pseudo, issuer, 1, 100)))
+        .expect("insert implicit pseudo holding");
+    parent
+        .insert(Arc::new(mptoken_entry_with_flags(
+            owner,
+            issuer,
+            1,
+            0,
+            protocol::lsfMPTAuthorized,
+        )))
+        .expect("insert authorized recipient holding");
+
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(mptoken_entry(broker_pseudo, issuer, 1, 0)))
+        .expect("drain broker cover");
+    flow.update(Arc::new(mptoken_entry_with_flags(
+        owner,
+        issuer,
+        1,
+        100,
+        protocol::lsfMPTAuthorized,
+    )))
+    .expect("credit broker owner");
+    flow.erase(Arc::new(pseudo_root))
+        .expect("erase broker pseudo root");
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::LOAN_BROKER_DELETE,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TES_SUCCESS,
+        "the auth-required cover move must preserve the deleted broker's pseudo authorization"
+    );
+}
+
+#[test]
 fn invariant_rejects_mpt_holder_delta_without_outstanding_delta() {
     let base = Arc::new(mpt_v2_ledger());
     let mut parent = Sandbox::new(base, ApplyFlags::default());
@@ -1614,18 +2095,80 @@ fn invariant_allows_checkcash_single_mptoken_creation() {
 }
 
 #[test]
-fn invariant_rejects_amm_clawback_two_mptoken_creations_with_mptokens_v2() {
+fn invariant_allows_zero_or_two_amm_clawback_mptoken_recreations_with_mptokens_v2() {
     let base = Arc::new(mpt_v2_without_cleanup_ledger());
+    let mut parent = Sandbox::new(base.clone(), ApplyFlags::default());
+    let flow = FlowSandbox::new(&mut parent);
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::AMM_CLAWBACK,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TES_SUCCESS,
+        "a clawback may recreate no MPT holdings"
+    );
+
     let mut parent = Sandbox::new(base, ApplyFlags::default());
     let mut flow = FlowSandbox::new(&mut parent);
     let issuer = acct(0x1E);
     let holder_a = acct(0x1F);
     let holder_b = acct(0x20);
-
     flow.insert(Arc::new(mptoken_entry(holder_a, issuer, 1, 0)))
-        .expect("insert first token");
+        .expect("insert first recreated token");
     flow.insert(Arc::new(mptoken_entry(holder_b, issuer, 1, 0)))
-        .expect("insert second token");
+        .expect("insert second recreated token");
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::AMM_CLAWBACK,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TES_SUCCESS,
+        "a two-asset clawback may recreate both recipient MPT holdings"
+    );
+}
+
+#[test]
+fn invariant_rejects_more_than_two_amm_clawback_mptoken_recreations() {
+    let base = Arc::new(mpt_v2_without_cleanup_ledger());
+    let mut parent = Sandbox::new(base, ApplyFlags::default());
+    let mut flow = FlowSandbox::new(&mut parent);
+    let issuer = acct(0x21);
+    for holder in [acct(0x22), acct(0x23), acct(0x24)] {
+        flow.insert(Arc::new(mptoken_entry(holder, issuer, 1, 0)))
+            .expect("insert recreated token");
+    }
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::AMM_CLAWBACK,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
+}
+
+#[test]
+fn invariant_rejects_amm_clawback_mpt_balance_delta_without_outstanding_delta() {
+    let base = Arc::new(mpt_v2_ledger());
+    let mut parent = Sandbox::new(base, ApplyFlags::default());
+    let issuer = acct(0x25);
+    let holder = acct(0x26);
+    parent
+        .insert(Arc::new(mpt_issuance_entry(issuer, 1, 100, 0)))
+        .expect("insert issuance");
+    parent
+        .insert(Arc::new(mptoken_entry(holder, issuer, 1, 100)))
+        .expect("insert holding");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(mptoken_entry(holder, issuer, 1, 99)))
+        .expect("mutate holding without matching issuance delta");
 
     assert_eq!(
         check_invariants(

@@ -7,9 +7,8 @@ use std::sync::Arc;
 use basics::number::{self, NumberParts as RuntimeNumber};
 use ledger::ApplyView;
 use protocol::{
-    AUCTION_SLOT_DISCOUNTED_FEE_FRACTION, AUCTION_SLOT_MIN_FEE_FRACTION,
-    AUCTION_SLOT_TIME_INTERVALS, AccountID, Issue, STAmount, STLedgerEntry, STObject,
-    TOTAL_TIME_SLOT_SECS, Ter, get_field_by_symbol as sf,
+    AUCTION_SLOT_DISCOUNTED_FEE_FRACTION, AUCTION_SLOT_TIME_INTERVALS, AccountID, Issue, STAmount,
+    STLedgerEntry, STObject, TOTAL_TIME_SLOT_SECS, Ter, get_field_by_symbol as sf,
 };
 
 const TAILING_SLOT: u8 = AUCTION_SLOT_TIME_INTERVALS as u8 - 1;
@@ -122,10 +121,8 @@ pub fn apply_amm_bid<V: ApplyView>(view: &mut V, sttx: &protocol::STTx) -> Ter {
     // Compute discounted fee and min slot price
     let trading_fee = amm_sle.get_field_u16(sf("sfTradingFee"));
     let discounted_fee = trading_fee / AUCTION_SLOT_DISCOUNTED_FEE_FRACTION as u16;
-    let fee_number = protocol::get_fee(trading_fee);
     let lpt_balance_number = ledger::amm_helpers::stamount_as_number(&lpt_amm_balance);
-    let min_fee_frac = number_from_i64(AUCTION_SLOT_MIN_FEE_FRACTION as i64);
-    let min_slot_price = lpt_balance_number * fee_number / min_fee_frac;
+    let min_slot_price = protocol::amm_auction_min_slot_price(lpt_balance_number, trading_fee);
 
     // Get auction slot
     // Every valid AMM has an auction slot. rippled fails a corrupt AMM closed
@@ -169,10 +166,21 @@ pub fn apply_amm_bid<V: ApplyView>(view: &mut V, sttx: &protocol::STTx) -> Ter {
     };
 
     let lp_tokens_number = ledger::amm_helpers::stamount_as_number(&lp_tokens);
+    let zero_fee_min_slot_price = (view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_4_0"))
+        && trading_fee == 0)
+        .then(|| protocol::amm_auction_min_slot_price(lpt_balance_number, 1));
 
     // Compute pay price based on whether slot is owned
     let (pay_price, refund_amount) = if !has_valid_owner {
-        match get_pay_price(min_slot_price, &bid_min, &bid_max, lp_tokens_number) {
+        match get_pay_price(
+            min_slot_price,
+            &bid_min,
+            &bid_max,
+            lp_tokens_number,
+            zero_fee_min_slot_price,
+        ) {
             Ok(price) => (price, number_from_i64(0)),
             Err(ter) => return ter,
         }
@@ -196,7 +204,13 @@ pub fn apply_amm_bid<V: ApplyView>(view: &mut V, sttx: &protocol::STTx) -> Ter {
 
         let refund = fraction_remaining * price_purchased;
 
-        match get_pay_price(computed, &bid_min, &bid_max, lp_tokens_number) {
+        match get_pay_price(
+            computed,
+            &bid_min,
+            &bid_max,
+            lp_tokens_number,
+            zero_fee_min_slot_price,
+        ) {
             Ok(price) => {
                 if refund > price {
                     return Ter::TEC_INTERNAL;
@@ -273,7 +287,15 @@ fn get_pay_price(
     bid_min: &Option<STAmount>,
     bid_max: &Option<STAmount>,
     lp_tokens: RuntimeNumber,
+    minimum_price: Option<RuntimeNumber>,
 ) -> Result<RuntimeNumber, Ter> {
+    let computed_price = minimum_price.map_or(computed_price, |minimum| {
+        if computed_price < minimum {
+            minimum
+        } else {
+            computed_price
+        }
+    });
     let pay_price = match (bid_min, bid_max) {
         (Some(min), Some(max)) => {
             let min_n = ledger::amm_helpers::stamount_as_number(min);
@@ -330,4 +352,37 @@ pub fn issue_iou_pub<V: ApplyView>(
     issue: &Issue,
 ) -> Ter {
     issue_iou(view, account, amount, issue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_fee_auction_price_uses_cleanup_floor_and_respects_bid_max() {
+        let lp_tokens = number_from_i64(100);
+        let zero = number_from_i64(0);
+        let floor = protocol::amm_auction_min_slot_price(lp_tokens, 1);
+
+        assert_eq!(
+            get_pay_price(zero, &None, &None, lp_tokens, None).expect("legacy zero-fee bid"),
+            zero
+        );
+        assert_eq!(
+            get_pay_price(zero, &None, &None, lp_tokens, Some(floor))
+                .expect("cleanup zero-fee bid floor"),
+            floor
+        );
+        assert_eq!(
+            get_pay_price(
+                zero,
+                &None,
+                &Some(STAmount::default()),
+                lp_tokens,
+                Some(floor)
+            ),
+            Err(Ter::TEC_AMM_FAILED),
+            "the cleanup floor is applied before BidMax validation"
+        );
+    }
 }

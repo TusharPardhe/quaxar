@@ -5,9 +5,7 @@ use basics::{
     number::{NumberParts as RuntimeNumber, RoundingMode, get_mantissa_scale},
 };
 use ledger::{ApplyView, FlowSandbox, ReadView};
-use protocol::{
-    AccountID, Asset, Issue, LedgerEntryType, MPTID, STAmount, STLedgerEntry, STNumber, Ter,
-};
+use protocol::{AccountID, Asset, Issue, LedgerEntryType, MPTID, STAmount, STLedgerEntry, Ter};
 use std::collections::BTreeMap;
 
 pub(super) struct VaultSnapshot {
@@ -15,10 +13,71 @@ pub(super) struct VaultSnapshot {
     pub(super) asset: Asset,
     pub(super) pseudo_id: AccountID,
     pub(super) share_mpt_id: MPTID,
-    pub(super) scale: Option<i32>,
     pub(super) assets_total: RuntimeNumber,
     pub(super) assets_available: RuntimeNumber,
     pub(super) loss_unrealized: RuntimeNumber,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum V1_1VaultPhase {
+    OpenEnded,
+    Subscription,
+    Investment,
+    Redemption,
+    Invalid,
+}
+
+fn v1_1_vault_phase(vault: &STLedgerEntry, now: u32) -> V1_1VaultPhase {
+    let kind = vault
+        .is_field_present(sf("sfVaultKind"))
+        .then(|| vault.get_field_u8(sf("sfVaultKind")))
+        .unwrap_or(0);
+    match kind {
+        0 => V1_1VaultPhase::OpenEnded,
+        1 if !vault.is_field_present(sf("sfSubscriptionDate"))
+            || !vault.is_field_present(sf("sfRedemptionDate")) =>
+        {
+            V1_1VaultPhase::Invalid
+        }
+        1 => {
+            let subscription = vault.get_field_u32(sf("sfSubscriptionDate"));
+            let redemption = vault.get_field_u32(sf("sfRedemptionDate"));
+            let gap = i64::from(redemption) - i64::from(subscription);
+            if !(180..946_708_560).contains(&gap) {
+                return V1_1VaultPhase::Invalid;
+            }
+            if now <= subscription {
+                V1_1VaultPhase::Subscription
+            } else if now < redemption {
+                V1_1VaultPhase::Investment
+            } else {
+                V1_1VaultPhase::Redemption
+            }
+        }
+        _ => V1_1VaultPhase::Invalid,
+    }
+}
+
+/// ValidVault's V1.1 phase rules. The helper is intentionally independent of
+/// transaction preclaim so an invalid raw ApplyView mutation is rejected too.
+fn valid_v1_1_vault_lifecycle(txn_type: protocol::TxType, vault: &STLedgerEntry, now: u32) -> bool {
+    let phase = v1_1_vault_phase(vault, now);
+    if phase == V1_1VaultPhase::Invalid {
+        return false;
+    }
+    match txn_type {
+        protocol::TxType::VAULT_DEPOSIT => {
+            matches!(
+                phase,
+                V1_1VaultPhase::OpenEnded | V1_1VaultPhase::Subscription
+            )
+        }
+        protocol::TxType::VAULT_WITHDRAW => phase != V1_1VaultPhase::Investment,
+        protocol::TxType::LOAN_SET => {
+            phase == V1_1VaultPhase::OpenEnded || phase == V1_1VaultPhase::Investment
+        }
+        _ => true,
+    }
 }
 
 #[derive(Clone)]
@@ -53,9 +112,6 @@ pub(super) fn vault_snapshot(sle: &STLedgerEntry) -> VaultSnapshot {
         asset,
         pseudo_id: sle.get_account_id(sf("sfAccount")),
         share_mpt_id: sle.get_field_h192(sf("sfShareMPTID")),
-        scale: sle
-            .is_field_present(sf("sfScale"))
-            .then(|| -(sle.get_field_u8(sf("sfScale")) as i32)),
         assets_total: sle.get_field_number(sf("sfAssetsTotal")).value(),
         assets_available: sle.get_field_number(sf("sfAssetsAvailable")).value(),
         loss_unrealized: sle.get_field_number(sf("sfLossUnrealized")).value(),
@@ -369,62 +425,13 @@ pub(super) fn asset_issuer(asset: Asset) -> AccountID {
     }
 }
 
-pub(super) fn round_runtime_to_scale(
-    value: RuntimeNumber,
-    target_scale: i32,
-    rounding: RoundingMode,
-) -> RuntimeNumber {
-    let Ok((mantissa, mut exponent)) = value.external_parts() else {
-        return value;
-    };
-    if mantissa == 0 || exponent >= target_scale {
-        return value;
-    }
-
-    let negative = mantissa < 0;
-    let mut abs = mantissa.unsigned_abs() as u128;
-    let mut removed = Vec::new();
-    while exponent < target_scale {
-        removed.push((abs % 10) as u8);
-        abs /= 10;
-        exponent += 1;
-    }
-
-    let first = removed.first().copied().unwrap_or(0);
-    let has_more = removed.iter().skip(1).any(|digit| *digit != 0);
-    let round_up = match rounding {
-        RoundingMode::TowardsZero => false,
-        RoundingMode::Downward => negative && (first != 0 || has_more),
-        RoundingMode::Upward => !negative && (first != 0 || has_more),
-        RoundingMode::ToNearest => {
-            first > 5 || (first == 5 && (has_more || ((abs as u64) & 1) == 1))
-        }
-    };
-    if round_up {
-        abs += 1;
-    }
-
-    let signed = if negative { -(abs as i64) } else { abs as i64 };
-    RuntimeNumber::try_from_external_parts(signed, exponent, get_mantissa_scale()).unwrap_or(value)
-}
-
-pub(super) fn round_number_to_asset(asset: Asset, value: RuntimeNumber) -> RuntimeNumber {
-    let mut number = STNumber::from(value);
-    number.associate_asset(asset);
-    number.value()
-}
-
 pub(super) fn round_number_to_asset_with_scale(
     asset: Asset,
     value: RuntimeNumber,
     scale: i32,
     rounding: RoundingMode,
 ) -> RuntimeNumber {
-    let rounded_to_asset = round_number_to_asset(asset, value);
-    if asset.integral() {
-        return rounded_to_asset;
-    }
-    round_runtime_to_scale(rounded_to_asset, scale, rounding)
+    ledger::vault_helpers::round_number_to_asset_with_scale(asset, value, scale, rounding)
 }
 
 pub(super) fn number_scale(asset: Asset, value: RuntimeNumber) -> i32 {
@@ -446,12 +453,12 @@ pub(super) fn compute_vault_min_scale(
     before: &VaultSnapshot,
     after: &VaultSnapshot,
     vault_delta: VaultAssetDelta,
-    fix_cleanup_3_2_0: bool,
+    fix_cleanup_3_4_0: bool,
 ) -> i32 {
-    if fix_cleanup_3_2_0 {
-        return after
-            .scale
-            .unwrap_or_else(|| number_scale(after.asset, after.assets_total));
+    if fix_cleanup_3_4_0 {
+        // The fixCleanup3_4_0 clamp uses the updated AssetsTotal grid. Vault
+        // sfScale governs share conversion and must not participate here.
+        return number_scale(after.asset, after.assets_total);
     }
 
     let total_scale = vault_delta_scale(before.assets_total, after.assets_total, after.asset);
@@ -464,6 +471,46 @@ pub(super) fn compute_vault_min_scale(
         .max(available_scale)
 }
 
+fn one_unit_at_scale(scale: i32) -> RuntimeNumber {
+    RuntimeNumber::try_from_external_parts(1, scale, get_mantissa_scale())
+        .unwrap_or_else(|_| RuntimeNumber::zero())
+}
+
+/// fixCleanup3_4_0 tolerates exactly one IOU storage unit of independent
+/// quantization noise. XRP and MPT remain exact, and legacy ledgers preserve
+/// strict equality.
+pub(super) fn agrees_within_one_unit(
+    lhs: RuntimeNumber,
+    rhs: RuntimeNumber,
+    asset: Asset,
+    scale: i32,
+    fix_cleanup_3_4_0: bool,
+) -> bool {
+    if !fix_cleanup_3_4_0 || asset.integral() {
+        return lhs == rhs;
+    }
+    let difference = lhs - rhs;
+    let magnitude = if difference < RuntimeNumber::zero() {
+        -difference
+    } else {
+        difference
+    };
+    magnitude <= one_unit_at_scale(scale)
+}
+
+pub(super) fn less_or_equal_plus_one_unit(
+    lhs: RuntimeNumber,
+    rhs: RuntimeNumber,
+    asset: Asset,
+    scale: i32,
+    fix_cleanup_3_4_0: bool,
+) -> bool {
+    if !fix_cleanup_3_4_0 || asset.integral() {
+        lhs <= rhs
+    } else {
+        lhs <= rhs + one_unit_at_scale(scale)
+    }
+}
 pub(super) fn rounded_vault_delta(
     asset: Asset,
     delta: VaultAssetDelta,
@@ -513,7 +560,7 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
     tx_amount: Option<&STAmount>,
     tx_account_paid_fee: bool,
     fee: protocol::XRPAmount,
-    fix_cleanup_3_2_0: bool,
+    fix_cleanup_3_4_0: bool,
     result: Ter,
     state: &VaultState,
     reads: &VaultInvariantReads,
@@ -570,6 +617,19 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
         return false;
     };
 
+    if sandbox
+        .rules()
+        .enabled(&protocol::feature_id("LendingProtocolV1_1"))
+    {
+        let Some(current_vault) = reads.current_vault.as_deref() else {
+            return false;
+        };
+        if !valid_v1_1_vault_lifecycle(txn_type, current_vault, sandbox.header().parent_close_time)
+        {
+            return false;
+        }
+    }
+
     if let Some(before) = before_vault {
         if after_vault.asset != before.asset
             || after_vault.pseudo_id != before.pseudo_id
@@ -598,7 +658,13 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
         .unwrap_or(zero);
     if after_vault.assets_available < zero
         || after_vault.assets_available > after_vault.assets_total
-        || after_vault.loss_unrealized > unavailable
+        || !less_or_equal_plus_one_unit(
+            after_vault.loss_unrealized,
+            unavailable,
+            after_vault.asset,
+            number_scale(after_vault.asset, after_vault.assets_total),
+            fix_cleanup_3_4_0,
+        )
         || !valid_vault_loss_unrealized(
             after_vault.loss_unrealized,
             sandbox.rules().enabled(&protocol::fix_cleanup_3_4_0()),
@@ -667,7 +733,7 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                 before,
                 after_vault,
                 pseudo_delta_assets,
-                fix_cleanup_3_2_0,
+                sandbox.rules().enabled(&protocol::fix_cleanup_3_4_0()),
             );
             let vault_delta_assets =
                 rounded_vault_delta(after_vault.asset, pseudo_delta_assets, min_scale);
@@ -696,8 +762,20 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                 && after_vault.assets_available >= before.assets_available
                 && tx_amount_valid
                 && vault_delta_assets > RuntimeNumber::zero()
-                && vault_delta_total == vault_delta_assets
-                && vault_delta_available == vault_delta_assets
+                && agrees_within_one_unit(
+                    vault_delta_total,
+                    vault_delta_assets,
+                    after_vault.asset,
+                    min_scale,
+                    fix_cleanup_3_4_0,
+                )
+                && agrees_within_one_unit(
+                    vault_delta_available,
+                    vault_delta_assets,
+                    after_vault.asset,
+                    min_scale,
+                    fix_cleanup_3_4_0,
+                )
                 && tx_account.is_some_and(|account| {
                     let shares_valid = valid_vault_share_delta(
                         state,
@@ -728,21 +806,39 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                             local_scale,
                             RoundingMode::ToNearest,
                         );
-                        account_delta < RuntimeNumber::zero() && -account_delta == local_vault_delta
+                        account_delta < RuntimeNumber::zero()
+                            && agrees_within_one_unit(
+                                -account_delta,
+                                local_vault_delta,
+                                after_vault.asset,
+                                local_scale,
+                                fix_cleanup_3_4_0,
+                            )
                     })
                 })
         }),
         protocol::TxType::VAULT_WITHDRAW => before_vault.is_some_and(|before| {
-            let Some(pseudo_delta_assets) =
-                vault_asset_delta(state, after_vault.pseudo_id, after_vault.asset)
-            else {
-                return false;
-            };
+            let fix_cleanup_3_4_0 = sandbox.rules().enabled(&protocol::fix_cleanup_3_4_0());
+            let maybe_pseudo_delta =
+                vault_asset_delta(state, after_vault.pseudo_id, after_vault.asset);
+            // A fully impaired vault can burn shares for a genuine zero-asset
+            // self-withdrawal.  There is then no asset-holding mutation on
+            // either side (and post-cleanup must not manufacture an empty
+            // IOU/MPT holding merely to create one).  This is not a rounding
+            // tolerance: it is permitted only when no effective value backs
+            // the shares, and only after fixCleanup3_4_0.
+            let zero_value_withdrawal = fix_cleanup_3_4_0
+                && maybe_pseudo_delta.is_none()
+                && before.assets_total == before.loss_unrealized;
+            let pseudo_delta_assets = maybe_pseudo_delta.unwrap_or(VaultAssetDelta {
+                delta: RuntimeNumber::zero(),
+                scale: None,
+            });
             let min_scale = compute_vault_min_scale(
                 before,
                 after_vault,
                 pseudo_delta_assets,
-                fix_cleanup_3_2_0,
+                fix_cleanup_3_4_0,
             );
             let vault_delta_assets =
                 rounded_vault_delta(after_vault.asset, pseudo_delta_assets, min_scale);
@@ -761,7 +857,25 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
             let destination = tx_destination.or(tx_account);
             let issuer_withdrawal =
                 !after_vault.asset.native() && destination == Some(asset_issuer(after_vault.asset));
-            let destination_valid = if issuer_withdrawal {
+            let destination_valid = if zero_value_withdrawal {
+                // Existing zero-balance holdings are untouched, and missing
+                // holdings must remain missing.  Either way no recipient
+                // asset delta may exist for a genuine zero payout.
+                let destination_delta = destination.and_then(|destination| {
+                    if Some(destination) == tx_account {
+                        vault_transaction_account_asset_delta(
+                            state,
+                            destination,
+                            after_vault.asset,
+                            tx_account_paid_fee,
+                            fee,
+                        )
+                    } else {
+                        vault_asset_delta(state, destination, after_vault.asset)
+                    }
+                });
+                destination_delta.is_none()
+            } else if issuer_withdrawal {
                 true
             } else if let Some(destination) = destination {
                 let destination_delta = if Some(destination) == tx_account {
@@ -780,7 +894,7 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                     let local_scale = min_scale.max(destination_scale);
                     let rounded_destination =
                         rounded_vault_delta(after_vault.asset, delta, local_scale);
-                    let tolerate_zero_delta = fix_cleanup_3_2_0 && !after_vault.asset.integral();
+                    let tolerate_zero_delta = fix_cleanup_3_4_0 && !after_vault.asset.integral();
                     let valid_balance_change = if tolerate_zero_delta {
                         rounded_destination >= RuntimeNumber::zero()
                     } else {
@@ -800,16 +914,35 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                             RoundingMode::Downward,
                         ) == RuntimeNumber::zero();
                     valid_balance_change
-                        && (destroyed_is_sub_ulp || -local_pseudo_delta == rounded_destination)
+                        && (destroyed_is_sub_ulp
+                            || agrees_within_one_unit(
+                                -local_pseudo_delta,
+                                rounded_destination,
+                                after_vault.asset,
+                                local_scale,
+                                fix_cleanup_3_4_0,
+                            ))
                 })
             } else {
                 false
             };
             after_vault.assets_total <= before.assets_total
                 && after_vault.assets_available <= before.assets_available
-                && vault_delta_total == vault_delta_assets
-                && vault_delta_available == vault_delta_assets
-                && vault_delta_assets < RuntimeNumber::zero()
+                && agrees_within_one_unit(
+                    vault_delta_total,
+                    vault_delta_assets,
+                    after_vault.asset,
+                    min_scale,
+                    fix_cleanup_3_4_0,
+                )
+                && agrees_within_one_unit(
+                    vault_delta_available,
+                    vault_delta_assets,
+                    after_vault.asset,
+                    min_scale,
+                    fix_cleanup_3_4_0,
+                )
+                && (zero_value_withdrawal || vault_delta_assets < RuntimeNumber::zero())
                 && destination_valid
                 && tx_account.is_some_and(|account| {
                     valid_vault_share_delta(state, after_vault.share_mpt_id, account, |delta| {
@@ -825,7 +958,7 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                     before,
                     after_vault,
                     pseudo_delta_assets,
-                    fix_cleanup_3_2_0,
+                    fix_cleanup_3_4_0,
                 );
                 let vault_delta_assets =
                     rounded_vault_delta(after_vault.asset, pseudo_delta_assets, min_scale);
@@ -842,8 +975,20 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                     RoundingMode::ToNearest,
                 );
                 vault_delta_assets < RuntimeNumber::zero()
-                    && vault_delta_assets == vault_delta_total
-                    && vault_delta_assets == vault_delta_available
+                    && agrees_within_one_unit(
+                        vault_delta_assets,
+                        vault_delta_total,
+                        after_vault.asset,
+                        min_scale,
+                        fix_cleanup_3_4_0,
+                    )
+                    && agrees_within_one_unit(
+                        vault_delta_assets,
+                        vault_delta_available,
+                        after_vault.asset,
+                        min_scale,
+                        fix_cleanup_3_4_0,
+                    )
             } else {
                 before.assets_total == RuntimeNumber::zero()
                     && before.assets_available == RuntimeNumber::zero()
@@ -858,5 +1003,67 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                 })
         }),
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{V1_1VaultPhase, v1_1_vault_phase, valid_v1_1_vault_lifecycle};
+    use basics::base_uint::Uint256;
+    use protocol::{LedgerEntryType, STLedgerEntry, TxType, get_field_by_symbol};
+
+    fn sf(name: &str) -> &'static protocol::SField {
+        get_field_by_symbol(name)
+    }
+
+    fn closed(subscription: u32, redemption: u32) -> STLedgerEntry {
+        let mut vault =
+            STLedgerEntry::from_type_and_key(LedgerEntryType::Vault, Uint256::from_u64(1));
+        vault.set_field_u8(sf("sfVaultKind"), 1);
+        vault.set_field_u32(sf("sfSubscriptionDate"), subscription);
+        vault.set_field_u32(sf("sfRedemptionDate"), redemption);
+        vault
+    }
+
+    #[test]
+    fn v1_1_vault_phase_has_exact_subscription_and_redemption_boundaries() {
+        let vault = closed(100, 280);
+        assert_eq!(v1_1_vault_phase(&vault, 99), V1_1VaultPhase::Subscription);
+        assert_eq!(v1_1_vault_phase(&vault, 100), V1_1VaultPhase::Subscription);
+        assert_eq!(v1_1_vault_phase(&vault, 101), V1_1VaultPhase::Investment);
+        assert_eq!(v1_1_vault_phase(&vault, 279), V1_1VaultPhase::Investment);
+        assert_eq!(v1_1_vault_phase(&vault, 280), V1_1VaultPhase::Redemption);
+    }
+
+    #[test]
+    fn v1_1_vault_lifecycle_enforces_180_second_schedule_and_phase_permissions() {
+        assert_eq!(
+            v1_1_vault_phase(&closed(100, 279), 100),
+            V1_1VaultPhase::Invalid
+        );
+        let vault = closed(100, 280);
+        assert!(valid_v1_1_vault_lifecycle(
+            TxType::VAULT_DEPOSIT,
+            &vault,
+            100
+        ));
+        assert!(!valid_v1_1_vault_lifecycle(
+            TxType::VAULT_DEPOSIT,
+            &vault,
+            101
+        ));
+        assert!(!valid_v1_1_vault_lifecycle(
+            TxType::VAULT_WITHDRAW,
+            &vault,
+            101
+        ));
+        assert!(valid_v1_1_vault_lifecycle(
+            TxType::VAULT_WITHDRAW,
+            &vault,
+            280
+        ));
+        assert!(!valid_v1_1_vault_lifecycle(TxType::LOAN_SET, &vault, 100));
+        assert!(valid_v1_1_vault_lifecycle(TxType::LOAN_SET, &vault, 101));
+        assert!(!valid_v1_1_vault_lifecycle(TxType::LOAN_SET, &vault, 280));
     }
 }

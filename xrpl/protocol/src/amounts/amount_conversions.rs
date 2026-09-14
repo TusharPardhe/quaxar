@@ -177,7 +177,11 @@ pub fn to_amount_from_number<T>(
 where
     T: FromNumberAmount,
 {
-    let _guard = asset.native().then(|| NumberRoundModeGuard::new(mode));
+    // XRP and MPT amounts are integral. Both must materialize under the
+    // requested directed rounding mode; restricting this guard to XRP makes
+    // an MPT endpoint silently use the ambient mode and can round a reverse
+    // gross amount below its required whole-unit value.
+    let _guard = asset.integral().then(|| NumberRoundModeGuard::new(mode));
     T::from_number_amount(asset, number)
 }
 
