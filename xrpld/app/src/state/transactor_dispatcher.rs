@@ -1998,7 +1998,20 @@ fn nft_account_funds_at_least<V: ledger::ApplyView>(
     view: &mut V,
     account: &AccountID,
     amount: &STAmount,
+    native_balance_drops: Option<i64>,
 ) -> Result<bool, Ter> {
+    if amount.native() {
+        let root = match view.read(protocol::account_keylet(Uint160::from_void(account.data()))) {
+            Ok(Some(root)) => root,
+            Ok(None) => return Ok(false),
+            Err(_) => return Err(Ter::TEF_BAD_LEDGER),
+        };
+        let reserve = i64::try_from(ledger::effective_account_reserve(view.fees(), &root, 0, 0))
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+        let balance = native_balance_drops
+            .unwrap_or_else(|| root.get_field_amount(sf("sfBalance")).xrp().drops());
+        return Ok(balance.saturating_sub(reserve).max(0) >= amount.xrp().drops());
+    }
     nft_account_funds(view, account, amount).map(|funds| funds >= amount.clone())
 }
 
@@ -6693,7 +6706,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     }
                 }
                 let needed = bo.get_field_amount(sf("sfAmount"));
-                match nft_account_funds_at_least(view, &bo.get_account_id(sf("sfOwner")), &needed) {
+                match nft_account_funds_at_least(
+                    view,
+                    &bo.get_account_id(sf("sfOwner")),
+                    &needed,
+                    None,
+                ) {
                     Ok(true) => {}
                     Ok(false) => return Ter::TEC_INSUFFICIENT_FUNDS,
                     Err(ter) => return ter,
@@ -6754,7 +6772,16 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 }
                 let needed = so.get_field_amount(sf("sfAmount"));
                 if buy_offer.is_none() {
-                    match nft_account_funds_at_least(view, &tx_account, &needed) {
+                    // rippled performs this direct sell-offer funding check in
+                    // preclaim, before the transaction fee is deducted.  The
+                    // later NFT-page reserve check deliberately uses the
+                    // post-payment balance.
+                    match nft_account_funds_at_least(
+                        view,
+                        &tx_account,
+                        &needed,
+                        pre_fee_balance_drops,
+                    ) {
                         Ok(true) => {}
                         Ok(false) => return Ter::TEC_INSUFFICIENT_FUNDS,
                         Err(ter) => return ter,

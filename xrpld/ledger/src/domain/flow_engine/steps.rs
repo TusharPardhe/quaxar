@@ -813,7 +813,10 @@ enum DirectRunDirection {
     Forward,
 }
 
-pub(super) fn book_step_redeems(owner_pays_transfer_fee: bool) -> bool {
+/// Returns whether a BookStep redeems (`true`) or issues (`false`).
+/// Offer crossing sets `owner_pays_transfer_fee`, matching rippled's `Issues`;
+/// payment books leave it clear, matching `Redeems`.
+pub const fn book_step_redeems(owner_pays_transfer_fee: bool) -> bool {
     !owner_pays_transfer_fee
 }
 
@@ -836,7 +839,9 @@ fn direct_qualities<V: ApplyView>(
         }
         DebtDirection::Redeems => {
             let own_quality = if offer_crossing {
-                protocol::QUALITY_ONE
+                crate::domain::ripple_calc::direct_step::offer_crossing_quality(
+                    protocol::QUALITY_ONE,
+                )
             } else {
                 get_quality(view, src, dst, currency, QualityDirection::Out)
                     .map_err(|_| Ter::TEF_BAD_LEDGER)?
@@ -854,7 +859,9 @@ fn direct_qualities<V: ApplyView>(
                 protocol::QUALITY_ONE
             };
             let dst_quality = if offer_crossing {
-                protocol::QUALITY_ONE
+                crate::domain::ripple_calc::direct_step::offer_crossing_quality(
+                    protocol::QUALITY_ONE,
+                )
             } else {
                 get_quality(view, dst, src, currency, QualityDirection::In)
                     .map_err(|_| Ter::TEF_BAD_LEDGER)?
@@ -905,9 +912,8 @@ fn execute_direct_step<V: ApplyView>(
         // deliberately ignores a pre-existing trust-line limit. During the
         // forward pass rippled uses the exact reverse-cache srcToDst as its
         // desired amount, not the forward input.
-        (
+        crate::domain::ripple_calc::direct_step::final_offer_crossing_max_flow(
             cached_src_to_dst.unwrap_or_else(|| input.iou()),
-            crate::domain::ripple_calc::direct_step::DebtDirection::Issues,
         )
     } else {
         crate::domain::ripple_calc::direct_step::max_payment_flow(view, src, dst, currency)

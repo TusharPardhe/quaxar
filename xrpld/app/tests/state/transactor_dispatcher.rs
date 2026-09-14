@@ -18156,6 +18156,55 @@ fn nftoken_accept_offer_propagates_underfunded_xrp_payment() {
 }
 
 #[test]
+fn nftoken_accept_offer_uses_pre_fee_funds_before_post_payment_reserve_check() {
+    // Canonical Testnet transactions
+    // 74527B1A...B32FAC (ledger 20746026) and
+    // 52652B08...18159D (ledger 20746057) share this exact boundary:
+    // 100 XRP pre-fee balance, no owned objects, 99 XRP sell offer, 10-drop fee.
+    // Preclaim therefore has exactly 99 XRP liquid and passes.  After the fee
+    // and payment only 999,990 drops remain; creating the buyer's NFT page
+    // increases OwnerCount and must return tecINSUFFICIENT_RESERVE.
+    let seller = sample_account(0xA8);
+    let buyer = sample_account(0xA9);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(seller, 0, 0, 10_000_000_000),
+        account_root_with_balance(buyer, 0, 0, 100_000_000),
+    ]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 1_000_000,
+        increment: 200_000,
+    });
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &nftoken_mint_tx(seller, 0, Some(test_xrp(99_000_000))),
+            TxType::NFTOKEN_MINT,
+            Some(10_000_000_000),
+        ),
+        Ter::TES_SUCCESS
+    );
+    let offer = protocol::keylet::nft_offer_keylet_for_owner(raw_account_id(seller), 1).key;
+
+    let accept = nftoken_accept_sell_offer_tx(buyer, offer);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &accept, TxType::NFTOKEN_ACCEPT_OFFER),
+        Ter::TEC_INSUFFICIENT_RESERVE
+    );
+    let buyer_root = view
+        .read(account_keylet(raw_account_id(buyer)))
+        .expect("buyer read")
+        .expect("buyer account");
+    assert_eq!(
+        buyer_root.get_field_amount(sf("sfBalance")).xrp().drops(),
+        99_999_990
+    );
+    assert_eq!(buyer_root.get_field_u32(sf("sfOwnerCount")), 0);
+    assert_eq!(buyer_root.get_field_u32(sf("sfSequence")), 2);
+}
+
+#[test]
 fn nftoken_accept_offer_checks_reserve_when_buyer_needs_new_page() {
     let seller = sample_account(0xA6);
     let buyer = sample_account(0xA7);

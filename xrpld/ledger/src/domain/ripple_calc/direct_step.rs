@@ -16,6 +16,19 @@ pub enum DebtDirection {
     Issues,
 }
 
+/// Offer crossing ignores trust-line QualityIn and QualityOut fields.
+///
+/// The argument makes that independence executable at the public boundary.
+pub const fn offer_crossing_quality(_line_quality: u32) -> u32 {
+    protocol::QUALITY_ONE
+}
+
+/// A final offer-crossing DirectStep ignores the trust-line limit and issues
+/// exactly the amount requested by reverse execution.
+pub const fn final_offer_crossing_max_flow(desired: IOUAmount) -> (IOUAmount, DebtDirection) {
+    (desired, DebtDirection::Issues)
+}
+
 /// Quality direction for rate lookup
 #[derive(Debug, Clone, Copy)]
 pub enum QualityDirection {

@@ -2150,7 +2150,8 @@ struct OfferConsumption {
 
 /// Compute how much of an offer to consume, applying transfer rates.
 ///   stpAmt.in = mulRatio(ofrAmt.in, ofrInRate, QUALITY_ONE, true)
-///   ownerGives = mulRatio(ofrAmt.out, ofrOutRate, QUALITY_ONE, false)
+///   ownerGives = mulRatio(ofrAmt.out, ofrOutRate, QUALITY_ONE,
+///                         isMptOutput)
 ///   If funds < ownerGives: recompute from available funds
 ///   If remaining_out < stpAmt.out: recompute from requested output
 ///   If remaining_in < stpAmt.in: recompute from remaining input
@@ -2171,7 +2172,7 @@ fn compute_offer_consumption(
     // reference: stpAmt.in = mulRatio(ofrAmt.in, ofrInRate, QUALITY_ONE, true)
     let mut stp_in = mul_ratio_amount(&ofr_in, transfer_rate_in, QUALITY_ONE, true);
     let mut stp_out = ofr_out.clone();
-    let mut owner_gives = mul_ratio_amount(&ofr_out, transfer_rate_out, QUALITY_ONE, false);
+    let mut owner_gives = offer_owner_gives(&ofr_out, transfer_rate_out);
     let mut actual_ofr_in = ofr_in;
     let mut actual_ofr_out = ofr_out;
     // TOffer retains the BookDirectory quality supplied by BookTip. Every
@@ -2205,7 +2206,7 @@ fn compute_offer_consumption(
         actual_ofr_in = clipped.r#in;
         actual_ofr_out = clipped.out;
         stp_out = actual_ofr_out.clone();
-        owner_gives = mul_ratio_amount(&stp_out, transfer_rate_out, QUALITY_ONE, false);
+        owner_gives = offer_owner_gives(&stp_out, transfer_rate_out);
         stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
     }
 
@@ -2225,7 +2226,7 @@ fn compute_offer_consumption(
         actual_ofr_in = limited.r#in;
         actual_ofr_out = limited.out;
         stp_out = actual_ofr_out.clone();
-        owner_gives = mul_ratio_amount(&stp_out, transfer_rate_out, QUALITY_ONE, false);
+        owner_gives = offer_owner_gives(&stp_out, transfer_rate_out);
     }
 
     OfferConsumption {
@@ -2235,6 +2236,14 @@ fn compute_offer_consumption(
         owner_gives,
         offer_out: actual_ofr_out,
     }
+}
+
+/// Apply the offer-output transfer rate to the amount actually debited from
+/// the owner. Pinned rippled rounds upward for integral MPT output and retains
+/// historical non-integral IOU rounding otherwise.
+pub fn offer_owner_gives(amount: &STAmount, transfer_rate_out: u32) -> STAmount {
+    let round_up = matches!(amount.asset(), Asset::MPTIssue(_));
+    mul_ratio_amount(amount, transfer_rate_out, QUALITY_ONE, round_up)
 }
 
 /// When round_up=true, rounds away from zero. When false, rounds toward zero.
@@ -2419,6 +2428,15 @@ mod tests {
         fn txs(&self) -> Result<Vec<ReadViewTx>, ViewError> {
             ReadView::txs(&self.base)
         }
+    }
+
+    #[test]
+    fn mpt_offer_owner_transfer_charge_rounds_up_like_rippled() {
+        let issue = MPTIssue::new(Uint192::from_array([0x5A; 24]));
+        let principal =
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(999), issue);
+        let charged = offer_owner_gives(&principal, 1_001_000_000);
+        assert_eq!(charged.mpt().value(), 1_000);
     }
 
     #[test]
