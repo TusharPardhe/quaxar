@@ -1,6 +1,6 @@
 //! Tests for nft sell offers.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{cell::Cell, collections::BTreeMap, time::Duration};
 
 use basics::base_uint::Uint256;
 use protocol::{
@@ -17,6 +17,7 @@ struct FakeSource {
     ledger: Option<LedgerLookupLedger>,
     pages: BTreeMap<Uint256, STLedgerEntry>,
     offers: BTreeMap<Uint256, STLedgerEntry>,
+    directory_reads: Cell<usize>,
 }
 
 impl LedgerLookupSource for FakeSource {
@@ -59,6 +60,7 @@ impl NFTOffersSource for FakeSource {
         _ledger: &LedgerLookupLedger,
         page_key: Uint256,
     ) -> Option<STLedgerEntry> {
+        self.directory_reads.set(self.directory_reads.get() + 1);
         self.pages.get(&page_key).cloned()
     }
 
@@ -294,4 +296,38 @@ fn nft_sell_offers_match_cpp_count_matrix() {
         assert_eq!(returned, count as usize);
         assert_eq!(marker_count, expected_markers);
     }
+}
+
+#[test]
+fn nft_sell_offers_rejects_buy_offer_marker_before_directory_scan() {
+    let nft_id = Uint256::from_array([0xA2; 32]);
+    let marker = offer_key(100);
+    let root = nft_sell_offers_keylet(nft_id);
+    let mut source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    source.pages.insert(root.key, make_page(root, 0, &[], 0));
+    let mut buy_offer = make_offer(marker, nft_id, 1);
+    buy_offer.set_field_u32(get_field_by_symbol("sfFlags"), 0);
+    source
+        .offers
+        .insert(nft_offer_keylet(marker).key, buy_offer);
+
+    let result = do_nft_sell_offers(
+        &request(object([
+            ("nft_id", JsonValue::String(nft_id.to_string())),
+            ("marker", JsonValue::String(marker.to_string())),
+        ])),
+        &source,
+    );
+    assert_eq!(
+        json_object(&result).get("error"),
+        Some(&JsonValue::String("invalidParams".to_owned()))
+    );
+    assert_eq!(
+        source.directory_reads.get(),
+        0,
+        "a buy marker must be rejected before reading the sell-offer directory",
+    );
 }

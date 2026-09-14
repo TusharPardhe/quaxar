@@ -212,6 +212,7 @@ fn runtime_to_amount(asset: Asset, value: RuntimeNumber) -> Option<STAmount> {
 /// amount, while fixCleanup3_1_3 checks the converted vault asset amount.
 fn can_vault_withdraw<V: ApplyView>(
     view: &mut V,
+    sttx: &STTx,
     from: &AccountID,
     to: &AccountID,
     amount: &STAmount,
@@ -229,6 +230,14 @@ fn can_vault_withdraw<V: ApplyView>(
         return Ter::TES_SUCCESS;
     }
     if destination.is_flag(protocol::lsfDepositAuth) {
+        if sttx.is_field_present(sf("sfCredentialIDs")) {
+            return ledger::credential_helpers::authorized_deposit_preauth(
+                view,
+                &sttx.get_field_v256(sf("sfCredentialIDs")),
+                to,
+            )
+            .unwrap_or(Ter::TEF_BAD_LEDGER);
+        }
         match view.peek(protocol::deposit_preauth_keylet(to_160(to), to_160(from))) {
             Ok(Some(_)) => {}
             Ok(None) => return Ter::TEC_NO_PERMISSION,
@@ -264,62 +273,13 @@ fn can_vault_withdraw<V: ApplyView>(
     Ter::TES_SUCCESS
 }
 
-fn round_runtime_to_scale(
-    value: RuntimeNumber,
-    target_scale: i32,
-    rounding: RoundingMode,
-) -> RuntimeNumber {
-    let Ok((mantissa, mut exponent)) = value.external_parts() else {
-        return value;
-    };
-    if mantissa == 0 || exponent >= target_scale {
-        return value;
-    }
-
-    let negative = mantissa < 0;
-    let mut abs = mantissa.unsigned_abs() as u128;
-    let mut removed = Vec::new();
-    while exponent < target_scale {
-        removed.push((abs % 10) as u8);
-        abs /= 10;
-        exponent += 1;
-    }
-
-    let first = removed.first().copied().unwrap_or(0);
-    let has_more = removed.iter().skip(1).any(|digit| *digit != 0);
-    let round_up = match rounding {
-        RoundingMode::TowardsZero => false,
-        RoundingMode::Downward => negative && (first != 0 || has_more),
-        RoundingMode::Upward => !negative && (first != 0 || has_more),
-        RoundingMode::ToNearest => {
-            first > 5 || (first == 5 && (has_more || ((abs as u64) & 1) == 1))
-        }
-    };
-    if round_up {
-        abs += 1;
-    }
-
-    let signed = if negative { -(abs as i64) } else { abs as i64 };
-    RuntimeNumber::try_from_external_parts(signed, exponent, get_mantissa_scale()).unwrap_or(value)
-}
-
-fn round_number_to_asset(asset: Asset, value: RuntimeNumber) -> RuntimeNumber {
-    let mut number = STNumber::from(value);
-    number.associate_asset(asset);
-    number.value()
-}
-
 fn round_number_to_asset_with_scale(
     asset: Asset,
     value: RuntimeNumber,
     scale: i32,
     rounding: RoundingMode,
 ) -> RuntimeNumber {
-    let rounded_to_asset = round_number_to_asset(asset, value);
-    if asset.integral() {
-        return rounded_to_asset;
-    }
-    round_runtime_to_scale(rounded_to_asset, scale, rounding)
+    ledger::vault_helpers::round_number_to_asset_with_scale(asset, value, scale, rounding)
 }
 
 fn amount_is_zero_at_scale(asset: Asset, amount: &STAmount, scale: i32) -> bool {
@@ -332,29 +292,21 @@ fn amount_is_zero_at_scale(asset: Asset, amount: &STAmount, scale: i32) -> bool 
         ) == RuntimeNumber::zero()
 }
 
-fn vault_deposit_amount_at_scale(
+/// Clamp a positive Vault asset change to the decimal grid selected by the
+/// posterior `sfAssetsTotal`.  Credits derive their delta from the floored
+/// posterior total; debits floor the magnitude directly so a withdrawal can
+/// never pay more than the requested/conversion amount.  XRP and MPT assets
+/// are integral and therefore require no grid adjustment.
+fn clamp_to_assets_total_scale(
     vault: &LoadedVault,
     amount: &STAmount,
-    fix_cleanup_3_2_0: bool,
-) -> Option<STAmount> {
-    if !fix_cleanup_3_2_0 || amount.integral() {
-        return Some(amount.clone());
+    credit: bool,
+) -> Result<STAmount, Ter> {
+    let mut delta = amount.clone();
+    if !credit {
+        delta.negate();
     }
-
-    let posterior_total =
-        round_number_to_asset(vault.asset, vault.assets_total + amount_number(amount));
-    let scale = vault
-        .asset
-        .amount(posterior_total)
-        .map(|amount| amount.exponent())
-        .unwrap_or(0);
-    let rounded = round_number_to_asset_with_scale(
-        vault.asset,
-        amount_number(amount),
-        scale,
-        RoundingMode::Downward,
-    );
-    runtime_to_amount(vault.asset, rounded)
+    ledger::vault_helpers::clamp_to_assets_total_scale(&vault.entry, &delta)
 }
 
 fn number_to_mpt_units_truncated(value: RuntimeNumber) -> Option<u64> {
@@ -775,12 +727,20 @@ fn shares_to_assets(
         vault.assets_total
     };
     let amount = if asset_total == RuntimeNumber::zero() {
-        RuntimeNumber::try_from_external_parts(
-            shares as i64,
-            -vault_scale(vault),
-            get_mantissa_scale(),
-        )
-        .ok()?
+        // A zero effective withdrawal is a genuine zero payout (for example,
+        // a fully impaired vault), not the empty-vault deposit seed ratio.
+        // This is the narrow exception that permits burning fixed shares while
+        // preserving both asset holdings after fixCleanup3_4_0.
+        if withdraw {
+            RuntimeNumber::zero()
+        } else {
+            RuntimeNumber::try_from_external_parts(
+                shares as i64,
+                -vault_scale(vault),
+                get_mantissa_scale(),
+            )
+            .ok()?
+        }
     } else {
         asset_total * share_number / share_total
     };
@@ -1135,6 +1095,10 @@ pub fn apply_vault_set<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         let Some(assets_maximum) = tx_number_value_field(sttx, sf("sfAssetsMaximum")) else {
             return Ter::TEM_MALFORMED;
         };
+        // A VaultSet explicitly supplies a new cap, so it may not lower that
+        // cap below the current AssetsTotal.  Existing over-cap cash-basis
+        // vaults remain valid because transactions that do not set this field
+        // never enter this branch.
         if assets_maximum != RuntimeNumber::zero() && assets_maximum < vault.assets_total {
             return Ter::TEC_LIMIT_EXCEEDED;
         }
@@ -1292,13 +1256,12 @@ pub fn apply_vault_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         Ok(Some(issuance)) => issuance,
         Ok(None) | Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    let Some(amount) = vault_deposit_amount_at_scale(
-        &vault,
-        &tx_amount,
-        view.rules().enabled(&feature_id("fixCleanup3_2_0")),
-    ) else {
-        return Ter::TEC_INTERNAL;
-    };
+    // The share count is calculated from the requested amount.  Under
+    // fixCleanup3_4_0 only the transferred asset delta is subsequently
+    // clamped to the posterior AssetsTotal grid; recalculating shares from the
+    // clamp would burn a share unit without changing the source debit.
+    let amount = tx_amount.clone();
+    let fix_cleanup_3_4_0 = view.rules().enabled(&feature_id("fixCleanup3_4_0"));
     if amount.signum() == 0 {
         return Ter::TEC_PRECISION_LOSS;
     }
@@ -1310,32 +1273,47 @@ pub fn apply_vault_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return Ter::TEC_PRECISION_LOSS;
     }
 
-    if view.rules().enabled(&feature_id("fixCleanup3_2_0"))
-        && !amount.integral()
-        && account != amount.issue().issuer()
-    {
-        let balance = match account_holds_vault_asset_full_balance(view, &account, vault.asset) {
-            Ok(balance) => balance,
-            Err(ter) => return ter,
-        };
-        if balance < amount {
-            return Ter::TEC_INSUFFICIENT_FUNDS;
-        }
-        let trustline_balance = match account_holds_vault_asset(view, &account, vault.asset) {
-            Ok(balance) => balance,
-            Err(ter) => return ter,
-        };
-        if amount_is_zero_at_scale(vault.asset, &tx_amount, trustline_balance.exponent()) {
-            return Ter::TEC_PRECISION_LOSS;
-        }
-    }
-
-    let Some(assets_deposited) = shares_to_assets(&vault, &issuance, shares_created, false, false)
+    let Some(mut assets_deposited) =
+        shares_to_assets(&vault, &issuance, shares_created, false, false)
     else {
         return Ter::TEC_INTERNAL;
     };
     if assets_deposited.signum() <= 0 || amount_number(&assets_deposited) > amount_number(&amount) {
         return Ter::TEC_INTERNAL;
+    }
+
+    if fix_cleanup_3_4_0 {
+        let clamped = match clamp_to_assets_total_scale(&vault, &assets_deposited, true) {
+            Ok(clamped) => clamped,
+            Err(ter) => return ter,
+        };
+        if clamped.signum() <= 0 {
+            return Ter::TEC_PRECISION_LOSS;
+        }
+        assets_deposited = clamped;
+
+        // The representational no-op gate applies to the amount that will
+        // actually be transferred after the posterior-total clamp, not to the
+        // nominal transaction amount. This covers both positive-balance and
+        // opposite-limit/debt IOU orientations.
+        if !assets_deposited.integral() && account != assets_deposited.issue().issuer() {
+            let balance = match account_holds_vault_asset_full_balance(view, &account, vault.asset)
+            {
+                Ok(balance) => balance,
+                Err(ter) => return ter,
+            };
+            if balance < assets_deposited {
+                return Ter::TEC_INSUFFICIENT_FUNDS;
+            }
+            let trustline_balance = match account_holds_vault_asset(view, &account, vault.asset) {
+                Ok(balance) => balance,
+                Err(ter) => return ter,
+            };
+            if amount_is_zero_at_scale(vault.asset, &assets_deposited, trustline_balance.exponent())
+            {
+                return Ter::TEC_PRECISION_LOSS;
+            }
+        }
     }
 
     let deposited_number = amount_number(&assets_deposited);
@@ -1403,9 +1381,12 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     };
 
     let (shares_redeemed, assets_withdrawn) = if amount.asset() == vault.asset {
-        let Some(shares) =
+        let shares = if view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
+            assets_to_shares_withdraw_truncated(&vault, &issuance, &amount, waive_unrealized_loss)
+        } else {
             assets_to_shares_withdraw(&vault, &issuance, &amount, waive_unrealized_loss)
-        else {
+        };
+        let Some(shares) = shares else {
             return Ter::TEC_INTERNAL;
         };
         if shares == 0 {
@@ -1427,6 +1408,14 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return Ter::TEF_INTERNAL;
     };
 
+    if view.rules().enabled(&feature_id("fixCleanup3_4_0"))
+        && amount.asset() == share_asset(vault.share_id)
+        && assets_withdrawn.signum() == 0
+        && vault.assets_total != vault.loss_unrealized
+    {
+        return Ter::TEC_PRECISION_LOSS;
+    }
+
     let limit_check_amount = if view.rules().enabled(&protocol::fix_cleanup_3_1_3())
         && amount.asset() == share_asset(vault.share_id)
     {
@@ -1436,7 +1425,8 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     };
     let can_withdraw = can_vault_withdraw(
         view,
-        &account,
+        sttx,
+        &vault.pseudo,
         &destination,
         limit_check_amount,
         sttx.is_field_present(sf("sfDestinationTag")),
@@ -1464,6 +1454,16 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         }
         assets_withdrawn = runtime_to_amount(vault.asset, vault.assets_available)
             .unwrap_or_else(|| zero_amount(vault.asset));
+    } else if view.rules().enabled(&feature_id("fixCleanup3_4_0")) && assets_withdrawn.signum() > 0
+    {
+        let clamped = match clamp_to_assets_total_scale(&vault, &assets_withdrawn, false) {
+            Ok(clamped) => clamped,
+            Err(ter) => return ter,
+        };
+        if clamped.signum() == 0 {
+            return Ter::TEC_PRECISION_LOSS;
+        }
+        assets_withdrawn = clamped;
     }
 
     let ter = transfer_mpt(
@@ -1483,6 +1483,19 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
             && ter != Ter::TEC_HAS_OBLIGATIONS
             && ter != Ter::TEC_OBJECT_NOT_FOUND
         {
+            return ter;
+        }
+    }
+
+    // rippled historically created a self-destination empty holding even for a
+    // zero payout.  fixCleanup3_4_0 deliberately suppresses that write so a
+    // fully impaired IOU/MPT withdrawal cannot leave an empty holding behind.
+    if assets_withdrawn.signum() == 0
+        && destination == account
+        && !view.rules().enabled(&protocol::fix_cleanup_3_4_0())
+    {
+        let ter = ensure_holding(view, sttx, &destination, vault.asset);
+        if ter != Ter::TES_SUCCESS && ter != Ter::TEC_DUPLICATE {
             return ter;
         }
     }
@@ -1521,6 +1534,15 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         Ok(None) | Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
+    let waive_unrealized_loss = if view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
+        match is_sole_shareholder(view, &holder, &issuance) {
+            Ok(value) => value,
+            Err(ter) => return ter,
+        }
+    } else {
+        false
+    };
+
     let clawback_amount = if sttx.is_field_present(sf("sfAmount")) {
         sttx.get_field_amount(sf("sfAmount"))
     } else if account == vault.owner {
@@ -1543,16 +1565,27 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
             Ok(balance) => balance.unwrap_or_default(),
             Err(ter) => return ter,
         };
-        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, false) else {
+        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, waive_unrealized_loss)
+        else {
             return Ter::TEC_INTERNAL;
         };
         (shares, assets)
     } else {
-        let Some(shares) = assets_to_shares_withdraw(&vault, &issuance, &clawback_amount, false)
-        else {
+        let shares = if view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
+            assets_to_shares_withdraw_truncated(
+                &vault,
+                &issuance,
+                &clawback_amount,
+                waive_unrealized_loss,
+            )
+        } else {
+            assets_to_shares_withdraw(&vault, &issuance, &clawback_amount, waive_unrealized_loss)
+        };
+        let Some(shares) = shares else {
             return Ter::TEC_INTERNAL;
         };
-        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, false) else {
+        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, waive_unrealized_loss)
+        else {
             return Ter::TEC_INTERNAL;
         };
         (shares, assets)
@@ -1573,21 +1606,43 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         let Some(available) = runtime_to_amount(vault.asset, vault.assets_available) else {
             return Ter::TEC_INTERNAL;
         };
-        let Some(truncated_shares) =
-            assets_to_shares_withdraw_truncated(&vault, &issuance, &available, false)
-        else {
+        let Some(truncated_shares) = assets_to_shares_withdraw_truncated(
+            &vault,
+            &issuance,
+            &available,
+            waive_unrealized_loss,
+        ) else {
             return Ter::TEC_INTERNAL;
         };
         shares_destroyed = truncated_shares;
-        let Some(recomputed_assets) =
-            shares_to_assets(&vault, &issuance, shares_destroyed, true, false)
-        else {
+        let Some(recomputed_assets) = shares_to_assets(
+            &vault,
+            &issuance,
+            shares_destroyed,
+            true,
+            waive_unrealized_loss,
+        ) else {
             return Ter::TEC_INTERNAL;
         };
         assets_recovered = recomputed_assets;
         if assets_recovered > available {
             return Ter::TEC_INTERNAL;
         }
+    }
+
+    if view.rules().enabled(&feature_id("fixCleanup3_4_0")) && assets_recovered.signum() > 0 {
+        // Do not rederive shares after trimming a sub-ULP recovery. The
+        // already-selected shares are intentionally burned at their
+        // pre-clamp conversion value, leaving the trimmed value for remaining
+        // shareholders.
+        let clamped = match clamp_to_assets_total_scale(&vault, &assets_recovered, false) {
+            Ok(clamped) => clamped,
+            Err(ter) => return ter,
+        };
+        if clamped.signum() == 0 {
+            return Ter::TEC_PRECISION_LOSS;
+        }
+        assets_recovered = clamped;
     }
 
     if shares_destroyed == 0 {

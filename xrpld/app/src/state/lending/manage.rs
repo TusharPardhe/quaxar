@@ -35,26 +35,30 @@ pub(super) fn unimpair_loan<V: ApplyView>(
         return vault_update;
     }
 
-    let previous_due = if loan_sle.is_field_present(sf("sfPreviousPaymentDueDate")) {
-        loan_sle.get_field_u32(sf("sfPreviousPaymentDueDate"))
-    } else {
-        0
-    };
-    let start_date = loan_sle.get_field_u32(sf("sfStartDate"));
-    let payment_interval = loan_sle.get_field_u32(sf("sfPaymentInterval"));
-    let normal_payment_due_date = previous_due
-        .max(start_date)
-        .saturating_add(payment_interval);
-    let next_payment_due = if has_expired(view, Some(normal_payment_due_date)) {
-        view.parent_close_time()
-            .as_seconds()
-            .saturating_add(payment_interval)
-    } else {
-        normal_payment_due_date
-    };
     let mut loan_obj = loan_sle.clone_as_object();
     loan_obj.clear_flag(protocol::lsfLoanImpaired);
-    loan_obj.set_field_u32(sf("sfNextPaymentDueDate"), next_payment_due);
+    // fixCleanup3_4_0 makes impairment purely an accounting state: neither
+    // impair nor unimpair may rewrite the contractual next-due date.
+    if !view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
+        let previous_due = if loan_sle.is_field_present(sf("sfPreviousPaymentDueDate")) {
+            loan_sle.get_field_u32(sf("sfPreviousPaymentDueDate"))
+        } else {
+            0
+        };
+        let start_date = loan_sle.get_field_u32(sf("sfStartDate"));
+        let payment_interval = loan_sle.get_field_u32(sf("sfPaymentInterval"));
+        let normal_payment_due_date = previous_due
+            .max(start_date)
+            .saturating_add(payment_interval);
+        let next_payment_due = if has_expired(view, Some(normal_payment_due_date)) {
+            view.parent_close_time()
+                .as_seconds()
+                .saturating_add(payment_interval)
+        } else {
+            normal_payment_due_date
+        };
+        loan_obj.set_field_u32(sf("sfNextPaymentDueDate"), next_payment_due);
+    }
     persist_entry(
         view,
         STLedgerEntry::from_stobject(loan_obj, *loan_sle.key()),
@@ -109,6 +113,19 @@ pub fn apply_loan_manage<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         0
     };
     let default_expiration = next_due.map(|due| due.saturating_add(grace_period));
+    let cleanup_3_4 = view.rules().enabled(&feature_id("fixCleanup3_4_0"));
+    let now = view.parent_close_time().as_seconds();
+    if cleanup_3_4 && tx_requests_impair && !loan_payment_is_late(view, &loan_sle) {
+        return Ter::TEC_TOO_SOON;
+    }
+    let default_is_too_soon = tx_requests_default
+        && default_expiration.is_some_and(|expiry| {
+            if cleanup_3_4 {
+                now <= expiry
+            } else {
+                now < expiry
+            }
+        });
     let preclaim = tx::run_loan_manage_preclaim(tx::LoanManagePreclaimFacts {
         loan_exists: true,
         loan_is_defaulted: loan_sle.is_flag(protocol::lsfLoanDefault),
@@ -117,7 +134,7 @@ pub fn apply_loan_manage<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         tx_requests_unimpair,
         tx_requests_default,
         payment_remaining_is_zero: loan_sle.get_field_u32(sf("sfPaymentRemaining")) == 0,
-        default_is_too_soon: tx_requests_default && !has_expired(view, default_expiration),
+        default_is_too_soon,
         broker_exists: true,
         submitter_is_broker_owner: broker_sle.get_account_id(sf("sfOwner")) == account,
     });
@@ -272,7 +289,7 @@ pub fn apply_loan_manage<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
                             else {
                                 return Ter::TEF_BAD_LEDGER;
                             };
-                            account_send(
+                            account_send_loan_default(
                                 view,
                                 sttx,
                                 &broker_sle.get_account_id(sf("sfAccount")),
@@ -309,13 +326,15 @@ pub fn apply_loan_manage<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
             } else {
                 let mut loan_obj = loan_sle.clone_as_object();
                 loan_obj.set_flag(protocol::lsfLoanImpaired);
-                let current_due = next_due.unwrap_or(0);
-                let next_payment_due = if has_expired(view, Some(current_due)) {
-                    current_due
-                } else {
-                    view.parent_close_time().as_seconds()
-                };
-                loan_obj.set_field_u32(sf("sfNextPaymentDueDate"), next_payment_due);
+                if !cleanup_3_4 {
+                    let current_due = next_due.unwrap_or(0);
+                    let next_payment_due = if has_expired(view, Some(current_due)) {
+                        current_due
+                    } else {
+                        view.parent_close_time().as_seconds()
+                    };
+                    loan_obj.set_field_u32(sf("sfNextPaymentDueDate"), next_payment_due);
+                }
                 persist_entry(
                     view,
                     STLedgerEntry::from_stobject(loan_obj, *loan_sle.key()),

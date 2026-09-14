@@ -645,15 +645,11 @@ fn strand_loop(
             let _ = scheduler.schedule_pending_accept();
         }
 
-        // ─── 0. Drive the coordinator owner loop ─────────────────────────
-        // The coordinator is the single session lifecycle owner. Its typed
-        // events (connectivity, acquire requests, packet admissions, read/write/
-        // fence completions, timer wakeups, durable handoff acks, store rotation)
-        // arrive on an unbounded channel and must be drained on this owner
-        // strand so coordinator state never needs its own thread or lock
-        // choreography. Effects are dispatched to the resource ports inside the
-        // registry's coordinator adapter after each event.
-        let (_, mut coordinator_work_remains) = shared_inbound.coordinator_drain_with_status();
+        // NetworkOps must never execute inbound-ledger acquisition work.
+        // rippled admits ledger packets on the network path and performs map
+        // reconstruction in JtLedgerData jobs. Quaxar's production path now
+        // follows the same boundary through AcquisitionReadyScheduler.
+        let mut coordinator_work_remains = false;
         for (handoff, session) in shared_inbound.take_processed_coordinator_durable_acks() {
             if let Some(ledger) = pending_durable_graphs.take_processed(handoff, session) {
                 release_processed_durable_graphs(&root, handoff, session, &ledger);

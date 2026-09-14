@@ -30,6 +30,55 @@ const TX_MIN_SIZE_BYTES: i32 = 32;
 const TX_MAX_SIZE_BYTES: i32 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SignatureRole {
+    Transaction,
+    Counterparty,
+    Sponsor,
+}
+
+/// Return the transaction field which holds this role's nested signature.
+/// The primary transaction signature is held directly on the STTx.
+pub fn signature_field(role: SignatureRole) -> Option<&'static crate::SField> {
+    match role {
+        SignatureRole::Transaction => None,
+        SignatureRole::Counterparty => Some(get_field_by_symbol("sfCounterpartySignature")),
+        SignatureRole::Sponsor => Some(get_field_by_symbol("sfSponsorSignature")),
+    }
+}
+
+/// Resolve only the two protocol-defined alternate signature containers.
+pub fn signature_role(field: &'static crate::SField) -> Option<SignatureRole> {
+    if field == get_field_by_symbol("sfCounterpartySignature") {
+        Some(SignatureRole::Counterparty)
+    } else if field == get_field_by_symbol("sfSponsorSignature") {
+        Some(SignatureRole::Sponsor)
+    } else {
+        None
+    }
+}
+
+/// Select the role-specific signature domain after fixCleanup3_4_0. Before
+/// activation every role deliberately retains the historic STX/SMT domains.
+pub fn signing_prefix(role: SignatureRole, multi_signing: bool, rules: &Rules) -> HashPrefix {
+    if !rules.enabled(&crate::fix_cleanup_3_4_0()) || role == SignatureRole::Transaction {
+        return if multi_signing {
+            HashPrefix::TxMultiSign
+        } else {
+            HashPrefix::TxSign
+        };
+    }
+
+    match (role, multi_signing) {
+        (SignatureRole::Counterparty, false) => HashPrefix::CounterpartyTxSign,
+        (SignatureRole::Counterparty, true) => HashPrefix::CounterpartyTxMultiSign,
+        (SignatureRole::Sponsor, false) => HashPrefix::SponsorTxSign,
+        (SignatureRole::Sponsor, true) => HashPrefix::SponsorTxMultiSign,
+        (SignatureRole::Transaction, false) => HashPrefix::TxSign,
+        (SignatureRole::Transaction, true) => HashPrefix::TxMultiSign,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TxnSql {
     New,
     Conflict,
@@ -279,28 +328,51 @@ impl STTx {
         self.object.clone()
     }
 
+    /// Legacy-compatible signer. New role-aware callers must use
+    /// `sign_with_role` with the ledger rules that will verify the result.
     pub fn sign(
         &mut self,
         public_key: &PublicKey,
         secret_key: &SecretKey,
         signature_target: Option<&'static crate::SField>,
     ) -> Result<(), SignError> {
-        let signing_data = self.signing_data();
-        let signature = crate::sign(public_key, secret_key, signing_data.data())?;
+        if let Some(role) = signature_target.and_then(signature_role) {
+            return self.sign_with_role(public_key, secret_key, role, &Rules::default());
+        }
 
+        let signing_data = self.signing_data(HashPrefix::TxSign);
+        let signature = crate::sign(public_key, secret_key, signing_data.data())?;
         if let Some(signature_target) = signature_target {
             self.peek_field_object(signature_target)
                 .set_field_vl(get_field_by_symbol("sfTxnSignature"), &signature);
         } else {
             self.set_field_vl(get_field_by_symbol("sfTxnSignature"), &signature);
         }
+        self.transaction_id = self.object.get_hash(HashPrefix::TransactionId);
+        Ok(())
+    }
 
+    pub fn sign_with_role(
+        &mut self,
+        public_key: &PublicKey,
+        secret_key: &SecretKey,
+        role: SignatureRole,
+        rules: &Rules,
+    ) -> Result<(), SignError> {
+        let signing_data = self.signing_data(signing_prefix(role, false, rules));
+        let signature = crate::sign(public_key, secret_key, signing_data.data())?;
+        if let Some(signature_target) = signature_field(role) {
+            self.peek_field_object(signature_target)
+                .set_field_vl(get_field_by_symbol("sfTxnSignature"), &signature);
+        } else {
+            self.set_field_vl(get_field_by_symbol("sfTxnSignature"), &signature);
+        }
         self.transaction_id = self.object.get_hash(HashPrefix::TransactionId);
         Ok(())
     }
 
     pub fn check_sign(&self, rules: &Rules) -> Result<(), String> {
-        self.check_sign_for_object(rules, &self.object)?;
+        self.check_sign_for_object(rules, &self.object, SignatureRole::Transaction)?;
 
         let counterparty_field = get_field_by_symbol("sfCounterpartySignature");
         if self.is_field_present(counterparty_field) {
@@ -309,14 +381,20 @@ impl STTx {
                 &self.object,
                 Some(&counterparty_signature),
                 |_| Ok(()),
-                |counterparty_signature| self.check_sign_for_object(rules, counterparty_signature),
+                |counterparty_signature| {
+                    self.check_sign_for_object(
+                        rules,
+                        counterparty_signature,
+                        SignatureRole::Counterparty,
+                    )
+                },
             )?;
         }
 
         let sponsor_signature_field = get_field_by_symbol("sfSponsorSignature");
         if self.is_field_present(sponsor_signature_field) {
             let sponsor_signature = self.get_field_object(sponsor_signature_field);
-            self.check_sign_for_object(rules, &sponsor_signature)
+            self.check_sign_for_object(rules, &sponsor_signature, SignatureRole::Sponsor)
                 .map_err(|error| format!("Sponsor: {error}"))?;
         }
 
@@ -520,21 +598,25 @@ impl STTx {
         }
     }
 
-    fn signing_data(&self) -> Serializer {
+    fn signing_data(&self, prefix: HashPrefix) -> Serializer {
         let mut serializer = Serializer::default();
-        serializer.add32_prefix(HashPrefix::TxSign);
+        serializer.add32_prefix(prefix);
         self.object.add_without_signing_fields(&mut serializer);
         serializer
     }
 
-    fn check_sign_for_object(&self, _rules: &Rules, sig_object: &STObject) -> Result<(), String> {
-        let signing_data = self.signing_data();
-        let multi_signing_data_start = crate::start_multi_signing_data(&self.object);
-        let txn_account_id = std::ptr::eq(
-            sig_object as *const STObject,
-            &self.object as *const STObject,
-        )
-        .then(|| self.get_initiator());
+    fn check_sign_for_object(
+        &self,
+        rules: &Rules,
+        sig_object: &STObject,
+        role: SignatureRole,
+    ) -> Result<(), String> {
+        let signing_data = self.signing_data(signing_prefix(role, false, rules));
+        let multi_signing_data_start = crate::start_multi_signing_data_with_prefix(
+            &self.object,
+            signing_prefix(role, true, rules),
+        );
+        let txn_account_id = (role == SignatureRole::Transaction).then(|| self.get_initiator());
 
         check_signature(
             sig_object,

@@ -1,11 +1,12 @@
 use app::{
     LedgerMasterCloseTimeProvider, NetworkOpsOperatingMode, NullSHAMapStoreCopyRuntime,
-    SHAMAP_STORE_COPY_CHECK_HEALTH_INTERVAL, SHAMapStoreAppRuntime, SHAMapStoreCloseTimeProvider,
-    SHAMapStoreComponentRuntime, SHAMapStoreCopyDisposition, SHAMapStoreHealthPolicy,
-    SHAMapStoreHealthRuntime, SHAMapStoreLedgerRuntime, SHAMapStoreNodeFamilyCacheRuntime,
-    SHAMapStoreNodeStoreRuntime, SHAMapStoreOperatingMode, SHAMapStoreRotatingBackendFactory,
-    SHAMapStoreRuntime, SHAMapStoreTransactionCacheRuntime, SharedLedgerMasterState,
-    SharedNetworkOpsState, SharedSHAMapStoreHealthState, ValidatedLedgerCopyRuntime,
+    SHAMAP_STORE_COPY_BATCH_SIZE, SHAMAP_STORE_COPY_CHECK_HEALTH_INTERVAL, SHAMapStoreAppRuntime,
+    SHAMapStoreCloseTimeProvider, SHAMapStoreComponentRuntime, SHAMapStoreCopyDisposition,
+    SHAMapStoreHealthPolicy, SHAMapStoreHealthRuntime, SHAMapStoreLedgerRuntime,
+    SHAMapStoreNodeFamilyCacheRuntime, SHAMapStoreNodeStoreRuntime, SHAMapStoreOperatingMode,
+    SHAMapStoreRotatingBackendFactory, SHAMapStoreRuntime, SHAMapStoreTransactionCacheRuntime,
+    SharedLedgerMasterState, SharedNetworkOpsState, SharedSHAMapStoreHealthState,
+    ValidatedLedgerCopyRuntime,
 };
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::make_shared_intrusive;
@@ -438,6 +439,7 @@ fn shamap_store_app_runtime_copies_validated_state_map_in_preorder() {
         None,
         Arc::new(ValidatedLedgerCopyRuntime),
     );
+    runtime.set_operating_mode(SHAMapStoreOperatingMode::Full);
 
     let result = runtime
         .copy_validated_ledger(
@@ -500,7 +502,7 @@ fn shamap_store_app_runtime_stops_copy_at_health_checkpoint() {
     assert_eq!(
         result,
         SHAMapStoreCopyDisposition::Stopped {
-            node_count: SHAMAP_STORE_COPY_CHECK_HEALTH_INTERVAL
+            node_count: SHAMAP_STORE_COPY_BATCH_SIZE as u64
         }
     );
     assert_eq!(
@@ -509,7 +511,7 @@ fn shamap_store_app_runtime_stops_copy_at_health_checkpoint() {
             .lock()
             .expect("fetches mutex must not be poisoned")
             .len() as u64,
-        SHAMAP_STORE_COPY_CHECK_HEALTH_INTERVAL
+        0
     );
 }
 
@@ -538,6 +540,7 @@ fn shamap_store_app_runtime_surfaces_missing_state_node_without_rotating() {
         None,
         Arc::new(ValidatedLedgerCopyRuntime),
     );
+    runtime.set_operating_mode(SHAMapStoreOperatingMode::Full);
 
     let result = runtime
         .copy_validated_ledger(

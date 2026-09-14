@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
-use basics::number::{
-    NumberParts as RuntimeNumber, NumberRoundModeGuard, RoundingMode, get_mantissa_scale,
-};
-use ledger::{RelativeDistanceAmount, views::apply_view::ApplyView};
+use basics::number::{NumberParts as RuntimeNumber, RoundingMode};
+use ledger::{ReadView, RelativeDistanceAmount, views::apply_view::ApplyView};
 use protocol::{
     AccountID, Asset, STAmount, STLedgerEntry, STNumber, TenthBips16, TenthBips32, Ter,
     account_keylet, feature_id, to_amount_from_number,
@@ -26,67 +24,23 @@ pub(super) fn associate_asset_entry(entry: &mut STLedgerEntry, asset: Asset) {
 }
 
 pub(super) fn round_number_to_asset(asset: Asset, value: RuntimeNumber) -> RuntimeNumber {
-    let mut number = STNumber::from(value);
-    number.associate_asset(asset);
-    number.value()
+    ledger::vault_helpers::round_number_to_asset(asset, value)
 }
 
 pub(super) fn vault_scale(vault_sle: &STLedgerEntry, asset: Asset) -> i32 {
-    // rippled's getAssetsTotalScale() is deliberately unrelated to the
-    // Vault's sfScale (which controls the vault-share conversion ratio).  It
-    // constructs an STAmount from the current sfAssetsTotal Number and returns
-    // that canonical amount's exponent.  In particular, an IOU Number whose
-    // external exponent is -6 can have an STAmount scale of -9 after the IOU
-    // mantissa is canonicalized.
-    asset_scale_from_value(
+    ledger::vault_helpers::asset_scale_from_value(
         asset,
         vault_sle.get_field_number(sf("sfAssetsTotal")).value(),
     )
 }
 
+#[cfg(test)]
 pub(super) fn round_runtime_to_scale(
     value: RuntimeNumber,
     target_scale: i32,
     rounding: RoundingMode,
 ) -> RuntimeNumber {
-    let Ok((mantissa, mut exponent)) = value.external_parts() else {
-        return value;
-    };
-    if mantissa == 0 || exponent >= target_scale {
-        return value;
-    }
-
-    let negative = mantissa < 0;
-    let mut abs = mantissa.unsigned_abs() as u128;
-    let mut removed = Vec::new();
-    while exponent < target_scale {
-        removed.push((abs % 10) as u8);
-        abs /= 10;
-        exponent += 1;
-    }
-
-    // Digits are removed least-significant first.  The rounding digit is the
-    // final (most-significant) removed digit; all earlier removed digits are
-    // the sticky tail.  Using `first()` here rounds from the wrong end whenever
-    // more than one decimal place is discarded.
-    let first = removed.last().copied().unwrap_or(0);
-    let has_more = removed
-        .get(..removed.len().saturating_sub(1))
-        .is_some_and(|tail| tail.iter().any(|digit| *digit != 0));
-    let round_up = match rounding {
-        RoundingMode::TowardsZero => false,
-        RoundingMode::Downward => negative && (first != 0 || has_more),
-        RoundingMode::Upward => !negative && (first != 0 || has_more),
-        RoundingMode::ToNearest => {
-            first > 5 || (first == 5 && (has_more || ((abs as u64) & 1) == 1))
-        }
-    };
-    if round_up {
-        abs += 1;
-    }
-
-    let signed = if negative { -(abs as i64) } else { abs as i64 };
-    RuntimeNumber::try_from_external_parts(signed, exponent, get_mantissa_scale()).unwrap_or(value)
+    ledger::vault_helpers::round_runtime_to_scale(value, target_scale, rounding)
 }
 
 pub(super) fn round_number_to_asset_with_scale(
@@ -95,34 +49,7 @@ pub(super) fn round_number_to_asset_with_scale(
     scale: i32,
     rounding: RoundingMode,
 ) -> RuntimeNumber {
-    if asset.integral() {
-        return round_runtime_to_scale(value, 0, rounding);
-    }
-
-    // Match rippled's roundToAsset/roundToScale.  Both STAmount construction
-    // and IOU addition normalize through Number under the pinned implementation;
-    // the reference addition/subtraction is the requested precision gate.
-    let _rounding = NumberRoundModeGuard::new(rounding);
-    let Some(value_amount) = asset.amount(value).ok() else {
-        return value;
-    };
-    if value_amount.signum() == 0 || value_amount.exponent() >= scale {
-        return value_amount.as_number();
-    }
-    let reference_mantissa = if value < RuntimeNumber::zero() {
-        -1_000_000_000_000_000_i64
-    } else {
-        1_000_000_000_000_000_i64
-    };
-    let Ok(reference_value) =
-        RuntimeNumber::try_from_external_parts(reference_mantissa, scale, get_mantissa_scale())
-    else {
-        return value;
-    };
-    let Some(reference_amount) = asset.amount(reference_value).ok() else {
-        return value;
-    };
-    (value_amount + reference_amount.clone() - reference_amount).as_number()
+    ledger::vault_helpers::round_number_to_asset_with_scale(asset, value, scale, rounding)
 }
 
 pub(super) fn adjust_imprecise_number(
@@ -531,6 +458,31 @@ pub(super) fn loan_accrued_interest(
         / RuntimeNumber::from_i64(i64::from(payment_interval))
 }
 
+/// Returns whether the loan is late using rippled's amendment-gated boundary:
+/// the due instant itself was late before fixCleanup3_4_0 and is on time once
+/// the amendment is enabled.
+pub(super) const fn payment_is_late_at(now: u32, due: u32, fix_cleanup_3_4_0: bool) -> bool {
+    if fix_cleanup_3_4_0 {
+        now > due
+    } else {
+        now >= due
+    }
+}
+
+pub(super) fn loan_payment_is_late<V: ReadView>(view: &V, loan: &STLedgerEntry) -> bool {
+    let Some(due) = loan
+        .is_field_present(sf("sfNextPaymentDueDate"))
+        .then(|| loan.get_field_u32(sf("sfNextPaymentDueDate")))
+    else {
+        return false;
+    };
+    payment_is_late_at(
+        view.parent_close_time().as_seconds(),
+        due,
+        view.rules().enabled(&feature_id("fixCleanup3_4_0")),
+    )
+}
+
 pub(super) fn loan_late_payment_interest(
     principal_outstanding: RuntimeNumber,
     late_interest_rate: TenthBips32,
@@ -800,6 +752,25 @@ pub(super) fn compute_overpayment_reamortization(
         value_change,
         periodic_payment: new_loan_properties.periodic_payment,
     })
+}
+
+#[cfg(test)]
+mod payment_lateness_tests {
+    use super::payment_is_late_at;
+
+    #[test]
+    fn cleanup_3_4_lateness_is_strict_before_at_and_after_due() {
+        assert!(!payment_is_late_at(99, 100, true));
+        assert!(!payment_is_late_at(100, 100, true));
+        assert!(payment_is_late_at(101, 100, true));
+    }
+
+    #[test]
+    fn legacy_lateness_keeps_the_inclusive_due_boundary() {
+        assert!(!payment_is_late_at(99, 100, false));
+        assert!(payment_is_late_at(100, 100, false));
+        assert!(payment_is_late_at(101, 100, false));
+    }
 }
 
 #[cfg(test)]

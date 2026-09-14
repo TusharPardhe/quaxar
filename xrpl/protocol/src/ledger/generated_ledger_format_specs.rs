@@ -778,6 +778,18 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
                 style: SOEStyle::Optional,
             },
             LedgerFormatFieldSpec {
+                field_symbol: "sfGasLimit",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfBytecodeSizeLimit",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfGasPrice",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
                 field_symbol: "sfPreviousTxnID",
                 style: SOEStyle::Optional,
             },
@@ -855,6 +867,14 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             },
             LedgerFormatFieldSpec {
                 field_symbol: "sfFinishAfter",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfBytecode",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfData",
                 style: SOEStyle::Optional,
             },
             LedgerFormatFieldSpec {

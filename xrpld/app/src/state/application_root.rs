@@ -2360,6 +2360,20 @@ fn transaction_preflight_ter_with_parent_batch_id_inner(
         }
     }
 
+    // These transactors validate CredentialIDs in their concrete preflight
+    // tail, before parent-batch/signature handling. Their field gate has
+    // already run in the shared semantic preflight above.
+    if matches!(
+        tx.get_txn_type(),
+        TxType::VAULT_WITHDRAW | TxType::LOAN_BROKER_COVER_WITHDRAW
+    ) && tx.is_field_present(get_field_by_symbol("sfCredentialIDs"))
+    {
+        let result = ledger::credential_helpers::check_fields(tx, rules);
+        if !is_tes_success(result) {
+            return result;
+        }
+    }
+
     // `applySteps.cpp::preflight` constructs a context with parentBatchId for
     // inner transactions. Its signer gate is deliberately deferred to the
     // matching parent-aware shared preclaim path below; an inner transaction
@@ -3743,6 +3757,9 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let preamble_item_keys = view.items().keys().copied().collect::<BTreeSet<_>>();
+        let check_failed_mpt_invariants = view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_4_0"));
         let mut inner = ledger::FlowSandbox::new(view);
         // Transactor::apply updates sfAccountTxnID before doApply so the
         // handler can observe it, but Transactor::reset discards that update
@@ -3810,7 +3827,10 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         // context to fee/sequence state. At this point `inner` still contains
         // partial doApply mutations, so only successful state is eligible for
         // invariant evaluation here.
-        if protocol::is_tes_success(result) {
+        // fixCleanup3_4_0 makes the MPT invariants result-aware: inspect a
+        // failed handler sandbox before reset so a persisted balance/deletion
+        // mutation cannot be silently discarded by this implementation path.
+        if protocol::is_tes_success(result) || check_failed_mpt_invariants {
             result = crate::state::invariants::check_invariants_for_tx_with_prefix(
                 &inner,
                 tx,
@@ -5251,6 +5271,20 @@ impl ApplicationRoot {
 
     pub fn open_ledger(&self) -> &SharedAppOpenLedger {
         &self.registry.open_ledger
+    }
+
+    /// Snapshot the rules of the same current OpenView used by signing and
+    /// subsequent local admission. This avoids signing under a stale era if a
+    /// ledger closes between an RPC handler's separate rule lookups.
+    pub fn current_open_ledger_rules(&self) -> Rules {
+        if let Ok(sandbox) = self.open_ledger_sandbox.lock()
+            && let Some(view) = sandbox.as_ref()
+        {
+            return view.rules();
+        }
+        self.closed_ledger()
+            .map(|ledger| ledger.rules().clone())
+            .unwrap_or_default()
     }
 
     pub fn order_book_db(&self) -> Arc<OrderBookDB> {
@@ -6732,6 +6766,29 @@ impl ApplicationRoot {
         let overlay = overlay_runtime.overlay();
         let manifest_limits = self.manifest_limits;
         overlay.set_max_manifests_message_size(manifest_limits.maximum_message_size());
+        // Mirror rippled's pre-queue manifest admission: reject blobs the
+        // application would not deserialize, then classify only parsed
+        // manifests by the current ValidatorList. The shared list remains
+        // live as lists load and rotate; trusted entries do not consume the
+        // overlay's configured untrusted budget.
+        let admission_validators = self.validators();
+        overlay.set_manifest_admission_policy(
+            manifest_limits.max_untrusted_count,
+            move |serialized| {
+                if serialized.len() > overlay::message::MAX_MANIFEST_BYTES {
+                    return overlay::ManifestAdmission::Reject;
+                }
+                let Some(manifest) = crate::state::manifest::deserialize_manifest(serialized)
+                else {
+                    return overlay::ManifestAdmission::Reject;
+                };
+                if admission_validators.listed(manifest.master_key) {
+                    overlay::ManifestAdmission::Trusted
+                } else {
+                    overlay::ManifestAdmission::Untrusted
+                }
+            },
+        );
         let ledger_master_state = Arc::clone(&self.ledger_master_state);
         overlay.set_validated_ledger_status_provider(move || {
             ledger_master_state

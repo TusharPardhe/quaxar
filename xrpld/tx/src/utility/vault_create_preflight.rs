@@ -99,9 +99,11 @@ pub const fn run_vault_create_preflight(facts: VaultCreatePreflightFacts) -> Not
             return Ter::TEM_MALFORMED;
         };
         let gap = redemption as i64 - subscription as i64;
-        // Pinned kMinInvestmentPeriod=60 seconds and
-        // kMaxInvestmentPeriod=30 Gregorian years=946,708,560 seconds.
-        if gap < 60 || gap >= 946_708_560 {
+        // LendingProtocolV1_1 requires a 180-second minimum investment
+        // period: StartDate is strictly after SubscriptionDate, and a minimum
+        // 60-second payment plus the 60-second redemption buffer must fit.
+        // The upper bound remains 30 Gregorian years (946,708,560 seconds).
+        if gap < 180 || gap >= 946_708_560 {
             return Ter::TEM_MALFORMED;
         }
     }
@@ -168,7 +170,7 @@ mod tests {
             lending_protocol_v1_1_enabled: true,
             vault_kind: Some(1),
             subscription_date: Some(100),
-            redemption_date: Some(159),
+            redemption_date: Some(279),
             ..VaultCreatePreflightFacts::default()
         });
         assert_eq!(closed_too_short, Ter::TEM_MALFORMED);
@@ -177,7 +179,7 @@ mod tests {
             lending_protocol_v1_1_enabled: true,
             vault_kind: Some(1),
             subscription_date: Some(100),
-            redemption_date: Some(160),
+            redemption_date: Some(280),
             ..VaultCreatePreflightFacts::default()
         });
         assert_eq!(closed, Ter::TES_SUCCESS);

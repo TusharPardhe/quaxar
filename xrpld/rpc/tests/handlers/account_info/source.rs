@@ -19,7 +19,7 @@ fn application_account_info_source_reads_live_ledgers_features_and_queue_shell()
             ),
             make_signer_list(account, signer),
         ],
-        Rules::new([feature_clawback(), feature_token_escrow()]),
+        Rules::new([feature_token_escrow()]),
     );
     let closed_ledger = ledger_with_state_entries(
         199,

@@ -7,6 +7,8 @@ use std::collections::BTreeSet;
 #[derive(Default)]
 pub(super) struct LendingState {
     pub(super) broker_refs: BTreeSet<Uint256>,
+    deleted_loans: Vec<STLedgerEntry>,
+    deleted_brokers: Vec<STLedgerEntry>,
 }
 
 pub(super) fn number_field_value(
@@ -20,7 +22,14 @@ pub(super) fn number_field_negative(sle: &STLedgerEntry, field: &'static protoco
     number_field_value(sle, field) < RuntimeNumber::zero()
 }
 
-pub(super) fn validate_loan_entry(before: Option<&STLedgerEntry>, after: &STLedgerEntry) -> bool {
+pub(super) fn validate_loan_entry<V: ApplyView + ?Sized>(
+    sandbox: &FlowSandbox<V>,
+    txn_type: protocol::TxType,
+    result: protocol::Ter,
+    lending_protocol_v1_1: bool,
+    before: Option<&STLedgerEntry>,
+    after: &STLedgerEntry,
+) -> Result<bool, ledger::ViewError> {
     let zero = RuntimeNumber::zero();
     let payment_remaining = after.get_field_u32(sf("sfPaymentRemaining"));
     let total_value = number_field_value(after, sf("sfTotalValueOutstanding"));
@@ -30,16 +39,16 @@ pub(super) fn validate_loan_entry(before: Option<&STLedgerEntry>, after: &STLedg
     if payment_remaining == 0
         && (total_value != zero || principal != zero || management_fee != zero)
     {
-        return false;
+        return Ok(false);
     }
     if payment_remaining != 0 && total_value == zero && principal == zero && management_fee == zero
     {
-        return false;
+        return Ok(false);
     }
     if before.is_some_and(|before| {
         before.is_flag(protocol::lsfLoanOverpayment) != after.is_flag(protocol::lsfLoanOverpayment)
     }) {
-        return false;
+        return Ok(false);
     }
 
     for field in [
@@ -51,11 +60,103 @@ pub(super) fn validate_loan_entry(before: Option<&STLedgerEntry>, after: &STLedg
         sf("sfManagementFeeOutstanding"),
     ] {
         if number_field_negative(after, field) {
-            return false;
+            return Ok(false);
+        }
+    }
+    if number_field_value(after, sf("sfPeriodicPayment")) <= zero {
+        return Ok(false);
+    }
+
+    if !lending_protocol_v1_1 {
+        return Ok(true);
+    }
+
+    if before.is_none() && txn_type != protocol::TxType::LOAN_SET {
+        return Ok(false);
+    }
+    if payment_remaining == 0 && after.get_field_u32(sf("sfNextPaymentDueDate")) != 0 {
+        return Ok(false);
+    }
+    if let Some(before) = before {
+        let impaired_changed =
+            before.is_flag(protocol::lsfLoanImpaired) != after.is_flag(protocol::lsfLoanImpaired);
+        let default_changed =
+            before.is_flag(protocol::lsfLoanDefault) != after.is_flag(protocol::lsfLoanDefault);
+        if (impaired_changed
+            && !matches!(
+                txn_type,
+                protocol::TxType::LOAN_MANAGE | protocol::TxType::LOAN_PAY
+            ))
+            || (default_changed && txn_type != protocol::TxType::LOAN_MANAGE)
+        {
+            return Ok(false);
+        }
+        if protocol::is_tes_success(result)
+            && txn_type == protocol::TxType::LOAN_PAY
+            && payment_remaining != 0
+            && (!(principal < number_field_value(before, sf("sfPrincipalOutstanding")))
+                || payment_remaining >= before.get_field_u32(sf("sfPaymentRemaining")))
+        {
+            return Ok(false);
+        }
+        if protocol::is_tes_success(result)
+            && txn_type == protocol::TxType::LOAN_PAY
+            && payment_remaining != 0
+        {
+            let before_due = before.get_field_u32(sf("sfNextPaymentDueDate"));
+            let after_due = after.get_field_u32(sf("sfNextPaymentDueDate"));
+            let interval = after.get_field_u32(sf("sfPaymentInterval"));
+            if after_due <= before_due
+                || interval == 0
+                || !(after_due - before_due).is_multiple_of(interval)
+            {
+                return Ok(false);
+            }
         }
     }
 
-    number_field_value(after, sf("sfPeriodicPayment")) > zero
+    let Some(broker) = sandbox.read(protocol::loan_broker_keylet_from_key(
+        after.get_field_h256(sf("sfLoanBrokerID")),
+    ))?
+    else {
+        return Ok(false);
+    };
+    let Some(vault) = sandbox.read(protocol::vault_keylet_from_key(
+        broker.get_field_h256(sf("sfVaultID")),
+    ))?
+    else {
+        return Ok(false);
+    };
+
+    let interest_due = total_value - principal - management_fee;
+    let tolerance = if vault.get_field_issue(sf("sfAsset")).asset().integral() {
+        zero
+    } else {
+        RuntimeNumber::try_from_external_parts(
+            -1,
+            after.get_field_i32(sf("sfLoanScale")),
+            basics::number::get_mantissa_scale(),
+        )
+        .unwrap_or(zero)
+    };
+    if interest_due < tolerance {
+        return Ok(false);
+    }
+
+    if before.is_none()
+        && protocol::is_tes_success(result)
+        && vault.get_field_u8(sf("sfVaultKind")) == 1
+    {
+        let final_payment = u64::from(after.get_field_u32(sf("sfStartDate")))
+            + u64::from(after.get_field_u32(sf("sfPaymentInterval")))
+                * u64::from(payment_remaining);
+        let redemption = u64::from(vault.get_field_u32(sf("sfRedemptionDate")));
+        if final_payment + 60 > redemption {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 pub(super) fn maybe_record_loan_broker_account<V: ApplyView + ?Sized>(
@@ -76,8 +177,20 @@ pub(super) fn maybe_record_loan_broker_account<V: ApplyView + ?Sized>(
 pub(super) fn record_lending_state<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &mut LendingState,
+    is_delete: bool,
+    before: Option<&STLedgerEntry>,
     after: Option<&STLedgerEntry>,
 ) -> Result<(), ledger::ViewError> {
+    if is_delete {
+        if let Some(before) = before {
+            match before.get_type() {
+                LedgerEntryType::Loan => state.deleted_loans.push(before.clone()),
+                LedgerEntryType::LoanBroker => state.deleted_brokers.push(before.clone()),
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
     let Some(after) = after else {
         return Ok(());
     };
@@ -202,5 +315,57 @@ pub(super) fn validate_loan_broker_entry<V: ApplyView + ?Sized>(
         }
     }
 
+    Ok(true)
+}
+
+/// V1.1 deletion rules must consult the erased pre-state, just like the
+/// corresponding preclaims. Existing legacy lending ledgers retain their prior
+/// behavior because this function is called only when LendingProtocolV1_1 is
+/// enabled.
+pub(super) fn validate_v1_1_lending_deletions<V: ApplyView + ?Sized>(
+    sandbox: &FlowSandbox<V>,
+    txn_type: protocol::TxType,
+    state: &LendingState,
+) -> Result<bool, ledger::ViewError> {
+    if (!state.deleted_loans.is_empty() && txn_type != protocol::TxType::LOAN_DELETE)
+        || state.deleted_brokers.len() > 1
+        || (!state.deleted_brokers.is_empty() && txn_type != protocol::TxType::LOAN_BROKER_DELETE)
+    {
+        return Ok(false);
+    }
+
+    for broker in &state.deleted_brokers {
+        if broker.get_field_u32(sf("sfOwnerCount")) != 0 {
+            return Ok(false);
+        }
+        let debt = number_field_value(broker, sf("sfDebtTotal"));
+        if debt == RuntimeNumber::zero() {
+            continue;
+        }
+        let Some(vault) = sandbox.read(protocol::vault_keylet_from_key(
+            broker.get_field_h256(sf("sfVaultID")),
+        ))?
+        else {
+            return Ok(false);
+        };
+        let asset = vault.get_field_issue(sf("sfAsset")).asset();
+        let scale = if asset.integral() {
+            0
+        } else {
+            asset
+                .amount(number_field_value(&vault, sf("sfAssetsTotal")))
+                .map(|amount| amount.exponent())
+                .unwrap_or(0)
+        };
+        if ledger::vault_helpers::round_number_to_asset_with_scale(
+            asset,
+            debt,
+            scale,
+            basics::number::RoundingMode::TowardsZero,
+        ) != RuntimeNumber::zero()
+        {
+            return Ok(false);
+        }
+    }
     Ok(true)
 }

@@ -250,15 +250,18 @@ fn parse_account(params: &JsonValue) -> Result<String, JsonValue> {
     Ok(account.clone())
 }
 
-fn parse_peer(params: &JsonValue) -> Option<String> {
+fn parse_peer(params: &JsonValue) -> Result<Option<String>, JsonValue> {
     let JsonValue::Object(object) = params else {
-        return None;
+        return Ok(None);
     };
 
-    object
-        .get("peer")
-        .map(json_value_as_string)
-        .filter(|peer| !peer.is_empty())
+    let Some(peer) = object.get("peer") else {
+        return Ok(None);
+    };
+    let JsonValue::String(peer) = peer else {
+        return Err(crate::commands::rpc_helpers::invalid_field_error("peer"));
+    };
+    Ok((!peer.is_empty()).then(|| peer.clone()))
 }
 
 fn get_start_hint(sle: &STLedgerEntry, account_id: AccountID) -> u64 {
@@ -532,14 +535,16 @@ pub fn do_account_lines<S: AccountLinesSource>(
         return make_error(RpcErrorCode::ActNotFound);
     }
 
-    let peer = if let Some(peer) = parse_peer(request.params) {
-        let Some(peer_account) = parse_base58_account_id(&peer) else {
-            crate::commands::rpc_helpers::inject_error(RpcErrorCode::ActMalformed, &mut result);
-            return result;
-        };
-        Some(peer_account)
-    } else {
-        None
+    let peer = match parse_peer(request.params) {
+        Ok(Some(peer)) => {
+            let Some(peer_account) = parse_base58_account_id(&peer) else {
+                crate::commands::rpc_helpers::inject_error(RpcErrorCode::ActMalformed, &mut result);
+                return result;
+            };
+            Some(peer_account)
+        }
+        Ok(None) => None,
+        Err(error) => return error,
     };
 
     let ignore_default = matches!(

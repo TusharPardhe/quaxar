@@ -57,6 +57,20 @@ impl VaultWithdraw {
             .as_sttx()
             .is_field_present(crate::get_field_by_symbol("sfDestinationTag"))
     }
+
+    pub fn get_credential_ids(&self) -> Option<crate::STVector256> {
+        self.has_credential_ids().then(|| {
+            self.base
+                .as_sttx()
+                .get_field_v256(crate::get_field_by_symbol("sfCredentialIDs"))
+        })
+    }
+
+    pub fn has_credential_ids(&self) -> bool {
+        self.base
+            .as_sttx()
+            .is_field_present(crate::get_field_by_symbol("sfCredentialIDs"))
+    }
 }
 
 impl Deref for VaultWithdraw {
@@ -201,6 +215,13 @@ impl VaultWithdrawBuilder {
         self.base
             .object_mut()
             .set_field_u32(crate::get_field_by_symbol("sfDestinationTag"), value);
+        self
+    }
+
+    pub fn set_credential_ids(mut self, value: crate::STVector256) -> Self {
+        self.base
+            .object_mut()
+            .set_field_v256(crate::get_field_by_symbol("sfCredentialIDs"), value);
         self
     }
 

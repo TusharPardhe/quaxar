@@ -10,10 +10,10 @@ use basics::{
 };
 use ledger::{ReadView, RelativeDistanceAmount};
 use protocol::{
-    AccountID, Asset, STAmount, STLedgerEntry, STNumber, STTx, Ter, TxType, get_field_by_symbol,
-    lsfAllowTrustLineClawback, lsfDepositAuth, lsfGlobalFreeze, lsfHighAuth, lsfHighDeepFreeze,
-    lsfHighFreeze, lsfLoanDefault, lsfLoanImpaired, lsfLoanOverpayment, lsfLowAuth,
-    lsfLowDeepFreeze, lsfLowFreeze, lsfMPTCanClawback, lsfNoFreeze, lsfRequireAuth,
+    AccountID, Asset, STAmount, STLedgerEntry, STNumber, STTx, STVector256, Ter, TxType,
+    get_field_by_symbol, lsfAllowTrustLineClawback, lsfDepositAuth, lsfGlobalFreeze, lsfHighAuth,
+    lsfHighDeepFreeze, lsfHighFreeze, lsfLoanDefault, lsfLoanImpaired, lsfLoanOverpayment,
+    lsfLowAuth, lsfLowDeepFreeze, lsfLowFreeze, lsfMPTCanClawback, lsfNoFreeze, lsfRequireAuth,
     lsfRequireDestTag, tfLoanDefault, tfLoanImpair, tfLoanOverpayment, tfLoanUnimpair,
 };
 
@@ -258,6 +258,7 @@ fn can_withdraw<V: ReadView>(
     to: AccountID,
     amount: &STAmount,
     has_destination_tag: bool,
+    credentials: Option<&STVector256>,
 ) -> Result<Ter, Ter> {
     let Some(destination) = account(view, to)? else {
         return Ok(Ter::TEC_NO_DST);
@@ -268,15 +269,26 @@ fn can_withdraw<V: ReadView>(
     if from == to {
         return Ok(Ter::TES_SUCCESS);
     }
-    if destination.is_flag(lsfDepositAuth)
-        && !view
-            .exists(protocol::deposit_preauth_keylet(
-                Uint160::from_void(to.data()),
-                Uint160::from_void(from.data()),
-            ))
-            .map_err(|_| read_error())?
-    {
-        return Ok(Ter::TEC_NO_PERMISSION);
+    if destination.is_flag(lsfDepositAuth) {
+        let authorized = match credentials {
+            Some(credentials) => {
+                ledger::credential_helpers::authorized_deposit_preauth(view, credentials, &to)
+                    .map_err(|_| read_error())?
+            }
+            None if view
+                .exists(protocol::deposit_preauth_keylet(
+                    Uint160::from_void(to.data()),
+                    Uint160::from_void(from.data()),
+                ))
+                .map_err(|_| read_error())? =>
+            {
+                Ter::TES_SUCCESS
+            }
+            None => Ter::TEC_NO_PERMISSION,
+        };
+        if authorized != Ter::TES_SUCCESS {
+            return Ok(authorized);
+        }
     }
 
     let Asset::Issue(issue) = amount.asset() else {
@@ -356,8 +368,37 @@ fn preclaim_loan_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let Some(vault_sle) = vault(view, broker_sle.get_field_h256(sf("sfVaultID")))? else {
         return Ok(Ter::TEF_BAD_LEDGER);
     };
-    if vault_sle.get_field_number(sf("sfAssetsMaximum")).value()
-        != basics::number::NumberParts::zero()
+    if view
+        .rules()
+        .enabled(&protocol::feature_id("LendingProtocolV1_1"))
+        && vault_sle.get_field_u8(sf("sfVaultKind")) == 1
+    {
+        let now = view.parent_close_time().as_seconds();
+        let subscription = vault_sle.get_field_u32(sf("sfSubscriptionDate"));
+        let redemption = vault_sle.get_field_u32(sf("sfRedemptionDate"));
+        if now <= subscription {
+            return Ok(Ter::TEC_TOO_SOON);
+        }
+        if now >= redemption {
+            return Ok(Ter::TEC_EXPIRED);
+        }
+        let interval = tx
+            .is_field_present(sf("sfPaymentInterval"))
+            .then(|| tx.get_field_u32(sf("sfPaymentInterval")))
+            .unwrap_or(60);
+        let total = tx
+            .is_field_present(sf("sfPaymentTotal"))
+            .then(|| tx.get_field_u32(sf("sfPaymentTotal")))
+            .unwrap_or(1);
+        if u64::from(now) + u64::from(interval) * u64::from(total) + 60 > u64::from(redemption) {
+            return Ok(Ter::TEC_NO_PERMISSION);
+        }
+    }
+    let cash_basis = vault_sle.is_field_present(sf("sfLEVersion"))
+        && vault_sle.get_field_u8(sf("sfLEVersion")) == 1;
+    if !cash_basis
+        && vault_sle.get_field_number(sf("sfAssetsMaximum")).value()
+            != basics::number::NumberParts::zero()
         && vault_sle.get_field_number(sf("sfAssetsTotal")).value()
             >= vault_sle.get_field_number(sf("sfAssetsMaximum")).value()
     {
@@ -388,9 +429,13 @@ fn preclaim_manage<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         return Ok(run_loan_manage_preclaim(LoanManagePreclaimFacts::default()));
     };
     let broker_sle = broker(view, loan_sle.get_field_h256(sf("sfLoanBrokerID")))?;
-    let expiry = loan_sle
-        .get_field_u32(sf("sfNextPaymentDueDate"))
-        .saturating_add(loan_sle.get_field_u32(sf("sfGracePeriod")));
+    let now = view.parent_close_time().as_seconds();
+    let cleanup_3_4 = view.rules().enabled(&protocol::fix_cleanup_3_4_0());
+    let due = loan_sle.get_field_u32(sf("sfNextPaymentDueDate"));
+    if cleanup_3_4 && tx.is_flag(tfLoanImpair) && now <= due {
+        return Ok(Ter::TEC_TOO_SOON);
+    }
+    let expiry = due.saturating_add(loan_sle.get_field_u32(sf("sfGracePeriod")));
     Ok(run_loan_manage_preclaim(LoanManagePreclaimFacts {
         loan_exists: true,
         loan_is_defaulted: loan_sle.is_flag(lsfLoanDefault),
@@ -400,7 +445,11 @@ fn preclaim_manage<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         tx_requests_default: tx.is_flag(tfLoanDefault),
         payment_remaining_is_zero: loan_sle.get_field_u32(sf("sfPaymentRemaining")) == 0,
         default_is_too_soon: tx.is_flag(tfLoanDefault)
-            && view.parent_close_time().as_seconds() < expiry,
+            && if cleanup_3_4 {
+                now <= expiry
+            } else {
+                now < expiry
+            },
         broker_exists: broker_sle.is_some(),
         submitter_is_broker_owner: broker_sle
             .as_ref()
@@ -488,6 +537,14 @@ fn preclaim_broker_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             LoanBrokerSetPreclaimFacts::default(),
         ));
     };
+    if view
+        .rules()
+        .enabled(&protocol::feature_id("LendingProtocolV1_1"))
+        && !tx.is_field_present(sf("sfLoanBrokerID"))
+        && vault_sle.get_field_u8(sf("sfVaultKind")) != 1
+    {
+        return Ok(Ter::TEC_NO_PERMISSION);
+    }
     let asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
     let existing = if tx.is_field_present(sf("sfLoanBrokerID")) {
         broker(view, tx.get_field_h256(sf("sfLoanBrokerID")))?
@@ -606,6 +663,9 @@ fn preclaim_cover_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter>
         account_id
     };
     let amount = tx.get_field_amount(sf("sfAmount"));
+    let credentials = tx
+        .is_field_present(sf("sfCredentialIDs"))
+        .then(|| tx.get_field_v256(sf("sfCredentialIDs")));
     let preflight =
         run_loan_broker_cover_withdraw_preflight(crate::LoanBrokerCoverWithdrawPreflightFacts {
             loan_broker_id_is_zero: tx.get_field_h256(sf("sfLoanBrokerID")).is_zero(),
@@ -617,7 +677,6 @@ fn preclaim_cover_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter>
     if preflight != Ter::TES_SUCCESS {
         return Ok(preflight);
     }
-
     let pseudo_destination = account(view, destination)?.is_some_and(|sle| {
         sle.is_field_present(sf("sfVaultID"))
             || sle.is_field_present(sf("sfLoanBrokerID"))
@@ -655,6 +714,15 @@ fn preclaim_cover_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter>
     if can_transfer != Ter::TES_SUCCESS {
         return Ok(can_transfer);
     }
+
+    // `can_withdraw` may resolve credential-based DepositPreauth and assumes
+    // that every supplied ID is already valid. Preserve rippled's ordering:
+    // transferability first, credential validity next, then destination checks.
+    let credentials_valid =
+        ledger::credential_helpers::valid(view, tx, &account_id).map_err(|_| read_error())?;
+    if credentials_valid != Ter::TES_SUCCESS {
+        return Ok(credentials_valid);
+    }
     if destination != account_id {
         let result = can_withdraw(
             view,
@@ -662,6 +730,7 @@ fn preclaim_cover_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter>
             destination,
             &amount,
             tx.is_field_present(sf("sfDestinationTag")),
+            credentials.as_ref(),
         )?;
         if result != Ter::TES_SUCCESS {
             return Ok(result);
@@ -847,25 +916,30 @@ mod tests {
     use super::{run_loan_read_view_preclaim, sf};
     use basics::base_uint::Uint256;
     use ledger::{Fees, LedgerHeader, ReadView, ReadViewTx, Rules, ViewError};
-    use protocol::{STAmount, STLedgerEntry, STTx, Ter, TxType, XRPAmount};
+    use protocol::{
+        AccountID, Asset, LedgerEntryType, STAmount, STIssue, STLedgerEntry, STTx, Ter, TxType,
+        XRPAmount,
+    };
     use std::{collections::BTreeMap, sync::Arc};
     #[derive(Debug, Default)]
     struct View {
         entries: BTreeMap<Uint256, Arc<STLedgerEntry>>,
         fail_reads: bool,
+        header: LedgerHeader,
+        rules: Rules,
     }
     impl ReadView for View {
         fn open(&self) -> bool {
             false
         }
         fn header(&self) -> LedgerHeader {
-            LedgerHeader::default()
+            self.header.clone()
         }
         fn fees(&self) -> Fees {
             Fees::default()
         }
         fn rules(&self) -> Rules {
-            Rules::default()
+            self.rules.clone()
         }
         fn exists(&self, k: protocol::Keylet) -> Result<bool, ViewError> {
             Ok(self.entries.contains_key(&k.key))
@@ -892,6 +966,50 @@ mod tests {
             Ok(Vec::new())
         }
     }
+
+    fn closed_vault(
+        id: Uint256,
+        owner: AccountID,
+        pseudo: AccountID,
+        redemption: u32,
+    ) -> STLedgerEntry {
+        let mut entry = STLedgerEntry::from_type_and_key(LedgerEntryType::Vault, id);
+        entry.set_account_id(sf("sfOwner"), owner);
+        entry.set_account_id(sf("sfAccount"), pseudo);
+        entry.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), Asset::Issue(protocol::xrp_issue())),
+        );
+        entry.set_field_u8(sf("sfVaultKind"), 1);
+        entry.set_field_u32(sf("sfSubscriptionDate"), 100);
+        entry.set_field_u32(sf("sfRedemptionDate"), redemption);
+        entry.set_field_number(sf("sfAssetsMaximum"), protocol::STNumber::default());
+        entry.set_field_number(sf("sfAssetsTotal"), protocol::STNumber::default());
+        entry
+    }
+
+    fn broker(
+        id: Uint256,
+        owner: AccountID,
+        pseudo: AccountID,
+        vault_id: Uint256,
+    ) -> STLedgerEntry {
+        let mut entry = STLedgerEntry::from_type_and_key(LedgerEntryType::LoanBroker, id);
+        entry.set_account_id(sf("sfOwner"), owner);
+        entry.set_account_id(sf("sfAccount"), pseudo);
+        entry.set_field_h256(sf("sfVaultID"), vault_id);
+        entry
+    }
+
+    fn account_root(account: AccountID) -> STLedgerEntry {
+        let mut entry = STLedgerEntry::from_type_and_key(
+            LedgerEntryType::AccountRoot,
+            protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data())).key,
+        );
+        entry.set_account_id(sf("sfAccount"), account);
+        entry
+    }
+
     #[test]
     fn loan_helper_has_no_unowned_success_default() {
         let tx = STTx::new(TxType::PAYMENT, |_| {});
@@ -967,5 +1085,119 @@ mod tests {
             run_loan_read_view_preclaim(&fault, &tx, TxType::LOAN_BROKER_COVER_WITHDRAW),
             Some(Ter::TEF_BAD_LEDGER)
         );
+    }
+    #[test]
+    fn v1_1_broker_creation_rejects_open_ended_vault_but_legacy_allows_it() {
+        let owner = AccountID::from_array([0x51; 20]);
+        let pseudo = AccountID::from_array([0x52; 20]);
+        let vault_id = Uint256::from_u64(51);
+        let mut open = closed_vault(vault_id, owner, pseudo, 280);
+        open.make_field_absent(sf("sfVaultKind"));
+        open.make_field_absent(sf("sfSubscriptionDate"));
+        open.make_field_absent(sf("sfRedemptionDate"));
+        let tx = STTx::new(TxType::LOAN_BROKER_SET, |tx| {
+            tx.set_account_id(sf("sfAccount"), owner);
+            tx.set_field_h256(sf("sfVaultID"), vault_id);
+        });
+
+        let mut legacy = View::default();
+        legacy.entries.insert(vault_id, Arc::new(open.clone()));
+        assert_eq!(
+            run_loan_read_view_preclaim(&legacy, &tx, TxType::LOAN_BROKER_SET),
+            Some(Ter::TES_SUCCESS)
+        );
+
+        let mut amended = View {
+            rules: Rules::new([protocol::feature_id("LendingProtocolV1_1")]),
+            ..View::default()
+        };
+        amended.entries.insert(vault_id, Arc::new(open));
+        assert_eq!(
+            run_loan_read_view_preclaim(&amended, &tx, TxType::LOAN_BROKER_SET),
+            Some(Ter::TEC_NO_PERMISSION)
+        );
+    }
+
+    #[test]
+    fn v1_1_loan_set_accepts_exact_60_second_redemption_buffer_only() {
+        let owner = AccountID::from_array([0x61; 20]);
+        let borrower = AccountID::from_array([0x62; 20]);
+        let vault_id = Uint256::from_u64(61);
+        let broker_id = Uint256::from_u64(62);
+        let preclaim = |redemption| {
+            let mut view = View {
+                header: LedgerHeader {
+                    parent_close_time: 101,
+                    ..LedgerHeader::default()
+                },
+                rules: Rules::new([protocol::feature_id("LendingProtocolV1_1")]),
+                ..View::default()
+            };
+            view.entries.insert(
+                vault_id,
+                Arc::new(closed_vault(vault_id, owner, owner, redemption)),
+            );
+            view.entries.insert(
+                broker_id,
+                Arc::new(broker(broker_id, owner, owner, vault_id)),
+            );
+            let account = account_root(borrower);
+            view.entries.insert(*account.key(), Arc::new(account));
+            let tx = STTx::new(TxType::LOAN_SET, |tx| {
+                tx.set_account_id(sf("sfAccount"), borrower);
+                tx.set_field_h256(sf("sfLoanBrokerID"), broker_id);
+                tx.set_field_u32(sf("sfPaymentInterval"), 60);
+                tx.set_field_u32(sf("sfPaymentTotal"), 1);
+            });
+            run_loan_read_view_preclaim(&view, &tx, TxType::LOAN_SET)
+        };
+
+        assert_eq!(preclaim(221), Some(Ter::TES_SUCCESS));
+        assert_eq!(preclaim(220), Some(Ter::TEC_NO_PERMISSION));
+    }
+
+    #[test]
+    fn v1_1_cash_basis_loan_set_allows_assets_total_at_or_over_maximum() {
+        let owner = AccountID::from_array([0x71; 20]);
+        let borrower = AccountID::from_array([0x72; 20]);
+        let vault_id = Uint256::from_u64(71);
+        let broker_id = Uint256::from_u64(72);
+        let preclaim = |assets_total| {
+            let mut view = View {
+                header: LedgerHeader {
+                    parent_close_time: 101,
+                    ..LedgerHeader::default()
+                },
+                rules: Rules::new([protocol::feature_id("LendingProtocolV1_1")]),
+                ..View::default()
+            };
+            let mut vault = closed_vault(vault_id, owner, owner, 300);
+            vault.set_field_u8(sf("sfLEVersion"), 1);
+            vault.set_field_number(
+                sf("sfAssetsMaximum"),
+                protocol::STNumber::from(basics::number::NumberParts::from_i64(10)),
+            );
+            vault.set_field_number(
+                sf("sfAssetsTotal"),
+                protocol::STNumber::from(basics::number::NumberParts::from_i64(assets_total)),
+            );
+            view.entries.insert(vault_id, Arc::new(vault));
+            view.entries.insert(
+                broker_id,
+                Arc::new(broker(broker_id, owner, owner, vault_id)),
+            );
+            let account = account_root(borrower);
+            view.entries.insert(*account.key(), Arc::new(account));
+            let tx = STTx::new(TxType::LOAN_SET, |tx| {
+                tx.set_account_id(sf("sfAccount"), borrower);
+                tx.set_field_h256(sf("sfLoanBrokerID"), broker_id);
+                tx.set_field_u32(sf("sfPaymentInterval"), 60);
+                tx.set_field_u32(sf("sfPaymentTotal"), 1);
+            });
+            run_loan_read_view_preclaim(&view, &tx, TxType::LOAN_SET)
+        };
+
+        assert_eq!(preclaim(10), Some(Ter::TES_SUCCESS));
+        assert_eq!(preclaim(11), Some(Ter::TES_SUCCESS));
     }
 }

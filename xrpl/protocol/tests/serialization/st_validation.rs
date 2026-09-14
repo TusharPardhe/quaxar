@@ -19,6 +19,9 @@ fn protocol_stvalidation_signed_constructor_sets_trusted_signature_and_flags() {
         validation.set_field_h256(get_field_by_symbol("sfLedgerHash"), hash(0xA1));
         validation.set_field_h256(get_field_by_symbol("sfConsensusHash"), hash(0xB2));
         validation.set_field_u32(get_field_by_symbol("sfLedgerSequence"), 55);
+        validation.set_field_u32(get_field_by_symbol("sfGasLimit"), 1_000_000);
+        validation.set_field_u32(get_field_by_symbol("sfBytecodeSizeLimit"), 65_536);
+        validation.set_field_u32(get_field_by_symbol("sfGasPrice"), 10);
         validation.set_flag(VF_FULL_VALIDATION);
     })
     .expect("signed validation should build");
@@ -31,6 +34,18 @@ fn protocol_stvalidation_signed_constructor_sets_trusted_signature_and_flags() {
     assert_eq!(validation.get_seen_time(), 700);
     assert_eq!(validation.get_ledger_hash(), hash(0xA1));
     assert_eq!(validation.get_consensus_hash(), hash(0xB2));
+    assert_eq!(
+        validation.get_field_u32(get_field_by_symbol("sfGasLimit")),
+        1_000_000
+    );
+    assert_eq!(
+        validation.get_field_u32(get_field_by_symbol("sfBytecodeSizeLimit")),
+        65_536
+    );
+    assert_eq!(
+        validation.get_field_u32(get_field_by_symbol("sfGasPrice")),
+        10
+    );
     assert!(validation.is_full());
     assert!(validation.is_trusted());
     assert!(validation.is_valid());

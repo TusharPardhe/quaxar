@@ -110,8 +110,10 @@ pub fn execute_strands<V: ApplyView>(
             amm_context: amm_context.clone(),
             offer_usage: Rc::new(Cell::new(0)),
             previous_redeems: Rc::new(Cell::new(false)),
+            previous_line_quality_in: Rc::new(Cell::new(protocol::QUALITY_ONE)),
             has_previous_step: Rc::new(Cell::new(false)),
             previous_step_is_book: Rc::new(Cell::new(false)),
+            is_last_step: Rc::new(Cell::new(false)),
         };
         let mut candidates = match activate_candidates(active_indices, |index| {
             strand_quality_upper_bound(&mut aggregate, &strands[index], &ordering_context).map(
@@ -327,8 +329,8 @@ fn execute_single_strand<V: ApplyView>(
     adjusted_remaining_out: bool,
 ) -> Result<SingleStrandResult, Ter> {
     let offer_usage = Rc::new(Cell::new(0));
-    let preceding_redeems =
-        preceding_debt_directions(parent, strand).map_err(|_| Ter::TEF_BAD_LEDGER)?;
+    let preceding_contexts =
+        preceding_step_contexts(parent, strand, offer_crossing).map_err(|_| Ter::TEF_BAD_LEDGER)?;
     let context = StepContext {
         strand_src,
         strand_dst,
@@ -339,8 +341,10 @@ fn execute_single_strand<V: ApplyView>(
         amm_context,
         offer_usage: offer_usage.clone(),
         previous_redeems: Rc::new(Cell::new(false)),
+        previous_line_quality_in: Rc::new(Cell::new(protocol::QUALITY_ONE)),
         has_previous_step: Rc::new(Cell::new(false)),
         previous_step_is_book: Rc::new(Cell::new(false)),
+        is_last_step: Rc::new(Cell::new(false)),
     };
 
     let Some(probe) = ({
@@ -351,7 +355,7 @@ fn execute_single_strand<V: ApplyView>(
             max_in,
             requested_out,
             &context,
-            &preceding_redeems,
+            &preceding_contexts,
         )?
     }) else {
         return Ok(SingleStrandResult {
@@ -370,7 +374,7 @@ fn execute_single_strand<V: ApplyView>(
         requested_out,
         &context,
         &probe,
-        &preceding_redeems,
+        &preceding_contexts,
     )?
     else {
         return Ok(SingleStrandResult {
@@ -442,7 +446,9 @@ fn limit_single_strand_out<V: ApplyView>(
     use protocol::{QualityFunction, QualityFunctionClobLikeTag};
     let mut combined: Option<QualityFunction> = None;
     let mut previous_redeems = false;
-    for step in strand {
+    let preceding_contexts = preceding_step_contexts(view, strand, context.offer_crossing)?;
+    for (index, step) in strand.iter().enumerate() {
+        set_preceding_step_context(context, strand, index, &preceding_contexts);
         let (qf, direction) = match step {
             super::StepKind::Book {
                 book_in,
@@ -469,7 +475,10 @@ fn limit_single_strand_out<V: ApplyView>(
                 else {
                     return Ok(None);
                 };
-                (function, false)
+                (
+                    function,
+                    super::steps::book_step_redeems(*owner_pays_transfer_fee),
+                )
             }
             _ => {
                 let Some((quality, direction)) =
@@ -534,21 +543,40 @@ fn limit_single_strand_out<V: ApplyView>(
     Ok((out < *remaining_out).then_some((out, true)))
 }
 
-fn preceding_debt_directions<V: ApplyView>(
+fn preceding_step_contexts<V: ApplyView>(
     view: &mut V,
     strand: &Strand,
-) -> Result<Vec<bool>, ViewError> {
-    use crate::domain::ripple_calc::direct_step::{DebtDirection, max_payment_flow};
+    offer_crossing: OfferCrossing,
+) -> Result<Vec<(bool, u32)>, ViewError> {
+    use crate::domain::ripple_calc::direct_step::{
+        DebtDirection, QualityDirection, get_quality, max_payment_flow,
+    };
     let mut result = Vec::with_capacity(strand.len());
     let mut previous_redeems = false;
+    let mut previous_line_quality_in = protocol::QUALITY_ONE;
     for step in strand {
-        result.push(previous_redeems);
+        result.push((previous_redeems, previous_line_quality_in));
         previous_redeems = match step {
             super::StepKind::Direct { src, dst, currency } => {
                 max_payment_flow(view, src, dst, *currency)?.1 == DebtDirection::Redeems
             }
             super::StepKind::MptEndpoint { src, issue, .. } => *src != issue.issuer(),
-            super::StepKind::Book { .. } | super::StepKind::XrpEndpoint { .. } => false,
+            // BookPaymentStep::debtDirection returns Redeems so the following
+            // issuing DirectStep charges the issuer transfer rate. Offer
+            // crossing sets ownerPaysTransferFee and returns Issues instead.
+            super::StepKind::Book {
+                owner_pays_transfer_fee,
+                ..
+            } => super::steps::book_step_redeems(*owner_pays_transfer_fee),
+            super::StepKind::XrpEndpoint { .. } => false,
+        };
+        previous_line_quality_in = match step {
+            super::StepKind::Direct { src, dst, currency }
+                if offer_crossing == OfferCrossing::No =>
+            {
+                get_quality(view, dst, src, *currency, QualityDirection::In)?
+            }
+            _ => protocol::QUALITY_ONE,
         };
     }
     Ok(result)
@@ -564,7 +592,9 @@ fn strand_quality_upper_bound<V: ApplyView>(
         Quality::from_amounts(&protocol::Amounts::new(one.clone(), one))
     };
     let mut previous_redeems = false;
-    for step in strand {
+    let preceding_contexts = preceding_step_contexts(view, strand, context.offer_crossing)?;
+    for (index, step) in strand.iter().enumerate() {
+        set_preceding_step_context(context, strand, index, &preceding_contexts);
         let Some((step_quality, direction)) =
             step.quality_upper_bound(view, previous_redeems, context)?
         else {
@@ -611,7 +641,7 @@ fn reverse_probe<V: ApplyView>(
     max_in: Option<&STAmount>,
     requested_out: &STAmount,
     context: &StepContext<'_>,
-    preceding_redeems: &[bool],
+    preceding_contexts: &[(bool, u32)],
 ) -> Result<Option<ReverseProbe>, Ter> {
     let mut cache = vec![None; strand.len()];
     let mut step_out = StepAmount::new(requested_out.clone());
@@ -619,7 +649,7 @@ fn reverse_probe<V: ApplyView>(
     let mut limited_by_max_in = false;
 
     for index in (0..strand.len()).rev() {
-        set_preceding_step_context(context, strand, index, preceding_redeems);
+        set_preceding_step_context(context, strand, index, preceding_contexts);
         let amounts = strand[index].rev(sandbox, &step_out, context)?;
         if amounts.output.is_zero() {
             return Ok(None);
@@ -676,7 +706,7 @@ fn replay_probe<V: ApplyView>(
     requested_out: &STAmount,
     context: &StepContext<'_>,
     probe: &ReverseProbe,
-    preceding_redeems: &[bool],
+    preceding_contexts: &[(bool, u32)],
 ) -> Result<Option<Vec<Option<StepAmounts>>>, Ter> {
     let mut cache = vec![None; strand.len()];
 
@@ -688,7 +718,7 @@ fn replay_probe<V: ApplyView>(
         let Some(expected) = probe.cache[0].as_ref() else {
             return Ok(None);
         };
-        set_preceding_step_context(context, strand, 0, preceding_redeems);
+        set_preceding_step_context(context, strand, 0, preceding_contexts);
         let actual = strand[0].fwd(sandbox, &StepAmount::new(max_in.clone()), expected, context)?;
         if actual.output.is_zero() || !actual.input.equivalent(&StepAmount::new(max_in.clone())) {
             return Ok(None);
@@ -712,7 +742,7 @@ fn replay_probe<V: ApplyView>(
         };
 
         for index in (0..=reverse_start).rev() {
-            set_preceding_step_context(context, strand, index, preceding_redeems);
+            set_preceding_step_context(context, strand, index, preceding_contexts);
             let actual = strand[index].rev(sandbox, &step_out, context)?;
             if actual.output.is_zero() || !actual.output.equivalent(&step_out) {
                 return Ok(None);
@@ -744,7 +774,7 @@ fn replay_probe<V: ApplyView>(
     };
 
     for index in forward_start..strand.len() {
-        set_preceding_step_context(context, strand, index, preceding_redeems);
+        set_preceding_step_context(context, strand, index, preceding_contexts);
         let Some(expected) = probe.cache[index].as_ref() else {
             return Ok(None);
         };
@@ -763,9 +793,12 @@ fn set_preceding_step_context(
     context: &StepContext<'_>,
     strand: &Strand,
     index: usize,
-    preceding_redeems: &[bool],
+    preceding_contexts: &[(bool, u32)],
 ) {
-    context.previous_redeems.set(preceding_redeems[index]);
+    context.previous_redeems.set(preceding_contexts[index].0);
+    context
+        .previous_line_quality_in
+        .set(preceding_contexts[index].1);
     context.has_previous_step.set(index != 0);
     context.previous_step_is_book.set(
         index
@@ -773,12 +806,16 @@ fn set_preceding_step_context(
             .and_then(|previous| strand.get(previous))
             .is_some_and(|step| matches!(step, super::StepKind::Book { .. })),
     );
+    context.is_last_step.set(index + 1 == strand.len());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{Issue, XRPAmount, get_field_by_symbol};
+    use protocol::{ApplyFlags, Asset, Issue, XRPAmount, get_field_by_symbol};
+    use std::sync::Arc;
+
+    use crate::{ApplyViewImpl, Ledger};
 
     fn sf(name: &str) -> &'static protocol::SField {
         get_field_by_symbol(name)
@@ -829,6 +866,40 @@ mod tests {
     fn resource_caps_match_rippled_flow() {
         assert_eq!(MAX_TRIES, 1000);
         assert_eq!(MAX_OFFERS_TO_CONSIDER, 1500);
+    }
+
+    #[test]
+    fn book_debt_direction_distinguishes_payment_from_offer_crossing() {
+        let issuer = AccountID::from_array([0x51; 20]);
+        let issue = Issue::new(protocol::currency_from_string("USD"), issuer);
+        let endpoint = super::super::StepKind::XrpEndpoint {
+            account: issuer,
+            is_last: true,
+        };
+        let make_book = |owner_pays_transfer_fee| super::super::StepKind::Book {
+            book_in: Asset::Issue(issue),
+            book_out: Asset::Issue(protocol::xrp_issue()),
+            domain: None,
+            owner_pays_transfer_fee,
+            remove_self_crossing: false,
+        };
+        let mut view = ApplyViewImpl::new(
+            Arc::new(Ledger::from_ledger_seq_and_close_time(1, 1, false)),
+            ApplyFlags::NONE,
+        );
+
+        let payment = vec![make_book(false), endpoint.clone()];
+        let payment_context = preceding_step_contexts(&mut view, &payment, OfferCrossing::No)
+            .expect("payment contexts");
+        assert!(payment_context[1].0, "BookPaymentStep reports Redeems");
+
+        let crossing = vec![make_book(true), endpoint];
+        let crossing_context = preceding_step_contexts(&mut view, &crossing, OfferCrossing::Yes)
+            .expect("offer-crossing contexts");
+        assert!(
+            !crossing_context[1].0,
+            "BookOfferCrossingStep reports Issues"
+        );
     }
 
     fn iou(mantissa: i64, exponent: i32) -> STAmount {

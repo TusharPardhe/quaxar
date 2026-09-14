@@ -126,3 +126,79 @@ pub fn do_feature<S: FeatureSource>(request: &FeatureRequest<'_>, source: &S) ->
 
     JsonValue::Object(reply)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::{AmendmentStatus, AmendmentVote};
+
+    impl FeatureSource for AmendmentStatus {
+        fn feature_table_json(&self, is_admin: bool) -> JsonValue {
+            AmendmentStatus::feature_table_json(self, is_admin)
+        }
+
+        fn feature_json(&self, feature: Uint256, is_admin: bool) -> Option<JsonValue> {
+            AmendmentStatus::feature_json(self, feature, is_admin)
+        }
+
+        fn veto_feature(&self, feature: Uint256) {
+            self.set_vote(feature, AmendmentVote::Down);
+        }
+
+        fn unveto_feature(&self, feature: Uint256) {
+            self.set_vote(feature, AmendmentVote::Up);
+        }
+
+        fn majority_timestamps(&self) -> BTreeMap<Uint256, i64> {
+            AmendmentStatus::majority_timestamps(self)
+        }
+    }
+
+    #[test]
+    fn retired_amm_overflow_offer_remains_registered_and_supported() {
+        let registry = AmendmentStatus::new();
+        let request = FeatureRequest {
+            params: &JsonValue::Object(BTreeMap::new()),
+            role: Role::Admin,
+        };
+        let JsonValue::Object(response) = do_feature(&request, &registry) else {
+            panic!("feature response must be an object");
+        };
+        let JsonValue::Object(features) = response.get("features").expect("features table") else {
+            panic!("features must be an object");
+        };
+        let feature = features
+            .get(&to_string(&feature_id("fixAMMOverflowOffer")))
+            .expect("retired enabled-ledger amendments remain supported");
+        let JsonValue::Object(feature) = feature else {
+            panic!("feature entry must be an object");
+        };
+        assert_eq!(feature.get("supported"), Some(&JsonValue::Bool(true)));
+
+        let params = JsonValue::Object(BTreeMap::from([(
+            "feature".to_owned(),
+            JsonValue::String("fixAMMOverflowOffer".to_owned()),
+        )]));
+        let response = do_feature(
+            &FeatureRequest {
+                params: &params,
+                role: Role::Admin,
+            },
+            &registry,
+        );
+        let JsonValue::Object(response) = response else {
+            panic!("feature lookup response must be an object");
+        };
+        let JsonValue::Object(feature) = response
+            .get(&to_string(&feature_id("fixAMMOverflowOffer")))
+            .expect("single-feature reply is keyed by amendment ID")
+        else {
+            panic!("single-feature entry must be an object");
+        };
+        assert_eq!(
+            feature.get("name"),
+            Some(&JsonValue::String("fixAMMOverflowOffer".to_owned()))
+        );
+        assert_eq!(feature.get("supported"), Some(&JsonValue::Bool(true)));
+    }
+}

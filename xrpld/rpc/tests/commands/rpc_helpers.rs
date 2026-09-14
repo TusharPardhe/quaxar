@@ -358,3 +358,295 @@ fn channel_authorize_returns_real_signature_hex() {
     .expect("signature");
     assert_eq!(signature_hex, str_hex(&expected));
 }
+
+#[test]
+fn transaction_sign_rejects_non_role_signature_targets() {
+    let (_seed, secret_text, account) = seeded_account(0x77);
+    let params = object([
+        ("secret", JsonValue::String(secret_text)),
+        (
+            "signature_target",
+            JsonValue::String("Destination".to_owned()),
+        ),
+        (
+            "tx_json",
+            object([
+                ("TransactionType", JsonValue::String("Payment".to_owned())),
+                ("Account", JsonValue::String(protocol::to_base58(account))),
+                (
+                    "Destination",
+                    JsonValue::String(protocol::to_base58(AccountID::from_array([0x78; 20]))),
+                ),
+                ("Amount", JsonValue::String("1000".to_owned())),
+                ("Fee", JsonValue::String("10".to_owned())),
+                ("Sequence", JsonValue::Unsigned(1)),
+            ]),
+        ),
+    ]);
+    let ctx = RpcRequestContext {
+        params: &params,
+        env: &SignSource,
+        runtime: &(),
+        role: RpcRole::Admin,
+        api_version: 2,
+        headers: rpc::JsonContextHeaders {
+            user: "",
+            forwarded_for: "",
+        },
+        request_headers: BTreeMap::new(),
+        unlimited: true,
+        remote_ip: None,
+        load_type: rpc::RpcLoadType::Reference,
+    };
+
+    assert_eq!(
+        transaction_sign(&ctx),
+        Err(RpcStatus::with_message(
+            RpcErrorCode::InvalidParams,
+            "Invalid field 'signature_target'."
+        ))
+    );
+}
+
+#[test]
+fn transaction_sign_accepts_every_supported_signature_role() {
+    let (_seed, secret_text, account) = seeded_account(0x79);
+    let destination = AccountID::from_array([0x7A; 20]);
+
+    for (offset, signature_target) in [
+        None,
+        Some("CounterpartySignature"),
+        Some("SponsorSignature"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut tx_json = BTreeMap::from([
+            (
+                "TransactionType".to_owned(),
+                JsonValue::String("Payment".to_owned()),
+            ),
+            (
+                "Account".to_owned(),
+                JsonValue::String(protocol::to_base58(account)),
+            ),
+            (
+                "Destination".to_owned(),
+                JsonValue::String(protocol::to_base58(destination)),
+            ),
+            ("Amount".to_owned(), JsonValue::String("1000".to_owned())),
+            ("Fee".to_owned(), JsonValue::String("10".to_owned())),
+            (
+                "Sequence".to_owned(),
+                JsonValue::Unsigned(20 + offset as u64),
+            ),
+        ]);
+        if let Some(signature_target) = signature_target {
+            tx_json.insert(signature_target.to_owned(), object([]));
+        }
+        let mut params = BTreeMap::from([
+            ("secret".to_owned(), JsonValue::String(secret_text.clone())),
+            ("tx_json".to_owned(), JsonValue::Object(tx_json)),
+        ]);
+        if let Some(signature_target) = signature_target {
+            params.insert(
+                "signature_target".to_owned(),
+                JsonValue::String(signature_target.to_owned()),
+            );
+        }
+        let params = JsonValue::Object(params);
+        let ctx = RpcRequestContext {
+            params: &params,
+            env: &SignSource,
+            runtime: &(),
+            role: RpcRole::Admin,
+            api_version: 2,
+            headers: rpc::JsonContextHeaders {
+                user: "",
+                forwarded_for: "",
+            },
+            request_headers: BTreeMap::new(),
+            unlimited: true,
+            remote_ip: None,
+            load_type: rpc::RpcLoadType::Reference,
+        };
+
+        let JsonValue::Object(result) = transaction_sign(&ctx).expect("supported role signs")
+        else {
+            panic!("expected object");
+        };
+        let JsonValue::Object(tx_json) = result.get("tx_json").cloned().expect("tx_json") else {
+            panic!("tx_json object");
+        };
+        let signed_object = match signature_target {
+            Some(target) => match tx_json.get(target) {
+                Some(JsonValue::Object(object)) => object,
+                _ => panic!("{target} signature object"),
+            },
+            None => &tx_json,
+        };
+        assert!(matches!(
+            signed_object.get("SigningPubKey"),
+            Some(JsonValue::String(value)) if !value.is_empty()
+        ));
+        assert!(matches!(
+            signed_object.get("TxnSignature"),
+            Some(JsonValue::String(value)) if !value.is_empty()
+        ));
+    }
+}
+
+#[test]
+fn transaction_sign_for_accepts_every_supported_signature_role() {
+    let (_seed, secret_text, signer_account) = seeded_account(0x7B);
+    let source = AccountID::from_array([0x7C; 20]);
+    let destination = AccountID::from_array([0x7D; 20]);
+
+    for (offset, signature_target) in [
+        None,
+        Some("CounterpartySignature"),
+        Some("SponsorSignature"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut tx_json = BTreeMap::from([
+            (
+                "TransactionType".to_owned(),
+                JsonValue::String("Payment".to_owned()),
+            ),
+            (
+                "Account".to_owned(),
+                JsonValue::String(protocol::to_base58(source)),
+            ),
+            (
+                "Destination".to_owned(),
+                JsonValue::String(protocol::to_base58(destination)),
+            ),
+            ("Amount".to_owned(), JsonValue::String("1000".to_owned())),
+            ("Fee".to_owned(), JsonValue::String("10".to_owned())),
+            (
+                "Sequence".to_owned(),
+                JsonValue::Unsigned(30 + offset as u64),
+            ),
+            ("SigningPubKey".to_owned(), JsonValue::String(String::new())),
+        ]);
+        if let Some(signature_target) = signature_target {
+            tx_json.insert(signature_target.to_owned(), object([]));
+        }
+        let mut params = BTreeMap::from([
+            ("secret".to_owned(), JsonValue::String(secret_text.clone())),
+            (
+                "account".to_owned(),
+                JsonValue::String(protocol::to_base58(signer_account)),
+            ),
+            ("tx_json".to_owned(), JsonValue::Object(tx_json)),
+        ]);
+        if let Some(signature_target) = signature_target {
+            params.insert(
+                "signature_target".to_owned(),
+                JsonValue::String(signature_target.to_owned()),
+            );
+        }
+        let params = JsonValue::Object(params);
+        let ctx = RpcRequestContext {
+            params: &params,
+            env: &SignForSource,
+            runtime: &(),
+            role: RpcRole::Admin,
+            api_version: 2,
+            headers: rpc::JsonContextHeaders {
+                user: "",
+                forwarded_for: "",
+            },
+            request_headers: BTreeMap::new(),
+            unlimited: true,
+            remote_ip: None,
+            load_type: rpc::RpcLoadType::Reference,
+        };
+
+        let JsonValue::Object(result) =
+            transaction_sign_for(&ctx).expect("supported role multisigns")
+        else {
+            panic!("expected object");
+        };
+        let JsonValue::Object(tx_json) = result.get("tx_json").cloned().expect("tx_json") else {
+            panic!("tx_json object");
+        };
+        let signed_object = match signature_target {
+            Some(target) => match tx_json.get(target) {
+                Some(JsonValue::Object(object)) => object,
+                _ => panic!("{target} signature object"),
+            },
+            None => &tx_json,
+        };
+        if signature_target.is_none() {
+            assert!(matches!(
+                signed_object.get("SigningPubKey"),
+                Some(JsonValue::String(value)) if value.is_empty()
+            ));
+        } else {
+            assert!(!signed_object.contains_key("SigningPubKey"));
+        }
+        assert!(matches!(
+            signed_object.get("Signers"),
+            Some(JsonValue::Array(signers)) if signers.len() == 1
+        ));
+    }
+}
+
+#[test]
+fn transaction_sign_for_rejects_non_role_signature_targets() {
+    let (_seed, secret_text, signer_account) = seeded_account(0x7E);
+    let source = AccountID::from_array([0x7F; 20]);
+    let destination = AccountID::from_array([0x80; 20]);
+    let params = object([
+        ("secret", JsonValue::String(secret_text)),
+        (
+            "account",
+            JsonValue::String(protocol::to_base58(signer_account)),
+        ),
+        (
+            "signature_target",
+            JsonValue::String("Destination".to_owned()),
+        ),
+        (
+            "tx_json",
+            object([
+                ("TransactionType", JsonValue::String("Payment".to_owned())),
+                ("Account", JsonValue::String(protocol::to_base58(source))),
+                (
+                    "Destination",
+                    JsonValue::String(protocol::to_base58(destination)),
+                ),
+                ("Amount", JsonValue::String("1000".to_owned())),
+                ("Fee", JsonValue::String("10".to_owned())),
+                ("Sequence", JsonValue::Unsigned(1)),
+                ("SigningPubKey", JsonValue::String(String::new())),
+            ]),
+        ),
+    ]);
+    let ctx = RpcRequestContext {
+        params: &params,
+        env: &SignForSource,
+        runtime: &(),
+        role: RpcRole::Admin,
+        api_version: 2,
+        headers: rpc::JsonContextHeaders {
+            user: "",
+            forwarded_for: "",
+        },
+        request_headers: BTreeMap::new(),
+        unlimited: true,
+        remote_ip: None,
+        load_type: rpc::RpcLoadType::Reference,
+    };
+
+    assert_eq!(
+        transaction_sign_for(&ctx),
+        Err(RpcStatus::with_message(
+            RpcErrorCode::InvalidParams,
+            "Invalid field 'signature_target'."
+        ))
+    );
+}

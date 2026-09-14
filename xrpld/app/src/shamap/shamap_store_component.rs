@@ -640,7 +640,7 @@ mod tests {
         config.section_mut("node_db").set("online_delete", "8");
         config
             .section_mut("node_db")
-            .set("recovery_wait_seconds", "0");
+            .set("recovery_wait_seconds", "1");
         let store = SHAMapStore::from_config(&config, true, 8, 0).expect("store config");
         let entered_health_wait = Arc::new(AtomicBool::new(false));
         let stops = Arc::new(AtomicUsize::new(0));
@@ -840,7 +840,7 @@ mod tests {
                 .lock()
                 .expect("sleep mutex must not be poisoned")
                 .as_slice(),
-            &[Duration::from_secs(5)]
+            &[Duration::from_secs(2)]
         );
         assert_eq!(
             shared

@@ -226,3 +226,76 @@ fn gateway_balances_malformed_account() {
     let (error, _code, _message) = error_fields(&result);
     assert_eq!(error, "actMalformed");
 }
+
+#[test]
+fn gateway_balances_rejects_non_string_account_and_ident() {
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    for field in ["account", "ident"] {
+        let result = do_gateway_balances(
+            &GatewayBalancesRequest {
+                params: &object([(field, JsonValue::Unsigned(42))]),
+                api_version: 2,
+                role: RpcRole::Admin,
+            },
+            &source,
+        );
+        let (error, _code, message) = error_fields(&result);
+        assert_eq!(error, "invalidParams");
+        assert_eq!(message, format!("Invalid field '{field}'."));
+    }
+}
+
+#[test]
+fn gateway_balances_account_and_ident_type_matrices_use_canonical_errors() {
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    // protocol::JsonValue normalizes a JSON float to Null, so construct this
+    // case through serde_json to cover the external float representation.
+    let values = [
+        ("unsigned integer", JsonValue::Unsigned(1)),
+        ("signed integer", JsonValue::Signed(-1)),
+        ("float", JsonValue::from(serde_json::json!(1.5))),
+        ("boolean", JsonValue::Bool(true)),
+        ("null", JsonValue::Null),
+        ("object", JsonValue::Object(BTreeMap::new())),
+        ("array", JsonValue::Array(Vec::new())),
+    ];
+
+    for api_version in [1, 2] {
+        for field in ["account", "ident"] {
+            for (kind, value) in &values {
+                let result = do_gateway_balances(
+                    &GatewayBalancesRequest {
+                        params: &object([(field, value.clone())]),
+                        api_version,
+                        role: RpcRole::Admin,
+                    },
+                    &source,
+                );
+                assert_eq!(
+                    error_fields(&result),
+                    (
+                        "invalidParams",
+                        31,
+                        format!("Invalid field '{field}'.").as_str(),
+                    ),
+                    "API v{api_version}, {field} {kind}",
+                );
+                let JsonValue::Object(result) = result else {
+                    panic!("{field} {kind} result must be an object");
+                };
+                assert!(
+                    !result.contains_key("account")
+                        && !result.contains_key("ledger_hash")
+                        && !result.contains_key("ledger_index"),
+                    "field error must retain its direct error envelope (API v{api_version}, {field} {kind})",
+                );
+            }
+        }
+    }
+}

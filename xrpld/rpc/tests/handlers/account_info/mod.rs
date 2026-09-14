@@ -10,9 +10,9 @@ use basics::chrono::EPOCH_OFFSET_SECONDS;
 use ledger::{LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader};
 use protocol::{
     AccountID, JsonValue, LedgerEntryType, Rules, STArray, STLedgerEntry, STObject, SeqProxy,
-    account_keylet, feature_clawback, feature_token_escrow, get_field_by_symbol,
-    lsfAllowTrustLineClawback, lsfAllowTrustLineLocking, lsfDefaultRipple,
-    lsfDisallowIncomingCheck, lsfDisallowIncomingTrustline, signers_keylet, to_base58,
+    account_keylet, feature_token_escrow, get_field_by_symbol, lsfAllowTrustLineClawback,
+    lsfAllowTrustLineLocking, lsfDefaultRipple, lsfDisallowIncomingCheck,
+    lsfDisallowIncomingTrustline, signers_keylet, to_base58,
 };
 use rpc::Role;
 use rpc::{
@@ -31,7 +31,6 @@ struct FakeSource {
     account_roots: HashMap<AccountID, STLedgerEntry>,
     signer_lists: HashMap<AccountID, STLedgerEntry>,
     queue_txs: HashMap<AccountID, Vec<AccountQueueTransaction>>,
-    clawback_enabled: bool,
     token_escrow_enabled: bool,
 }
 
@@ -84,10 +83,6 @@ impl AccountInfoSource for FakeSource {
         account_id: AccountID,
     ) -> Option<STLedgerEntry> {
         self.signer_lists.get(&account_id).cloned()
-    }
-
-    fn feature_clawback_enabled(&self, _ledger: &LedgerLookupLedger) -> bool {
-        self.clawback_enabled
     }
 
     fn feature_token_escrow_enabled(&self, _ledger: &LedgerLookupLedger) -> bool {

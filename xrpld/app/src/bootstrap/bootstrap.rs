@@ -1688,31 +1688,28 @@ fn run_start_mode_consensus_loop(
         shared_inbound.set_overlay_rt(overlay_rt);
     }
 
-    // M4.2-C3: install the coordinator as the single session lifecycle owner
-    // before any acquisition begins. The coordinator publishes the service
-    // phase into the same SharedNetworkOpsState every other component reads,
-    // and it never reads a mode back. From this point `acquire` delegates to
-    // coordinator sessions and returns None for new starts, exactly like
-    // rippled `InboundLedgers::acquire`.
+    // Install one typed lifecycle owner, then run its SHAMap plan turns on a
+    // dedicated execution lane. This preserves Quaxar's Rust state-machine
+    // ownership while matching rippled's essential boundary:
+    // gotLedgerData/TimeoutCounter only enqueue work and jtLEDGER_DATA performs
+    // reconstruction away from NetworkOPs and consensus.
     shared_inbound.set_phase_mode_owner(runtime.root().network_ops_mode_owner());
     if shared_inbound.install_coordinator() {
+        shared_inbound.coordinator_startup(startup_coordinator_phase(runtime.root()));
+        if let Some(owner) = shared_inbound.spawn_coordinator_owner(Arc::clone(&stop)) {
+            worker_handles.push(owner);
+        }
         tracing::info!(
             target: "inbound_ledger",
-            "coordinator installed as the single acquisition session lifecycle owner"
+            persistence_limit = 3,
+            "dedicated serialized inbound-ledger coordinator enabled"
         );
-        // M6-D: seed the coordinator's initial phase from the bootstrap startup
-        // intent so it alone owns the mode from install (the legacy startup
-        // write in `build_bootstrap_runtime` remains only as the pre-install
-        // seed and the rollback path). Quaxar preserves its legacy startup
-        // mode seed: networked -> Connected, `start_valid` -> Full from the
-        // hydrated LCL. rippled seeds `DISCONNECTED`/`FULL` in the NetworkOPs
-        // constructor (`rippled/src/xrpld/app/misc/NetworkOPs.cpp:318`).
-        shared_inbound.coordinator_startup(startup_coordinator_phase(runtime.root()));
     } else {
-        tracing::warn!(
+        tracing::error!(
             target: "inbound_ledger",
-            "coordinator install deferred: NodeStore or phase state unavailable; legacy acquisition remains the lifecycle owner"
+            "could not install production inbound-ledger coordinator"
         );
+        return;
     }
 
     // Spawn consensus event loop (validation/ledger promotion)
@@ -2176,14 +2173,6 @@ fn run_start_mode_consensus_loop(
             }));
     }
 
-    /// The coordinator's initial phase derived from the bootstrap startup
-    /// intent. Quaxar preserves its legacy startup mode seed: networked ->
-    /// `Connected`, `start_valid` -> `Full` from the hydrated LCL and its
-    /// published ledger (the loaded ledger is published during
-    /// `initialize_startup_ledger_state`). rippled seeds the constructor mode
-    /// from `startValid` (`NetworkOPs.cpp:318`) and only later promotes with
-    /// peer heartbeat logic; Quaxar's `Connected` seed is the retained
-    /// divergence documented in the M6-D design note.
     fn startup_coordinator_phase(root: &ApplicationRoot) -> acquisition::SyncPhase {
         if root.config().start_valid {
             if let (Some(lcl), Some(published)) = (root.closed_ledger(), root.published_ledger()) {

@@ -24,6 +24,7 @@ pub struct MPTokenAuthorizePreclaimFacts {
     pub token_locked_amount_is_zero: bool,
     pub issuance_exists: bool,
     pub single_asset_vault_enabled: bool,
+    pub fix_cleanup_3_4_0_enabled: bool,
     pub token_locked: bool,
     pub confidential_transfer_enabled: bool,
     pub confidential_outstanding_nonzero: bool,
@@ -93,7 +94,10 @@ pub fn run_mp_token_authorize_preclaim(facts: MPTokenAuthorizePreclaimFacts) -> 
                 };
             }
 
-            if facts.single_asset_vault_enabled && facts.token_locked {
+            if facts.issuance_exists
+                && (facts.single_asset_vault_enabled || facts.fix_cleanup_3_4_0_enabled)
+                && facts.token_locked
+            {
                 return Ter::TEC_NO_PERMISSION;
             }
 
@@ -265,6 +269,7 @@ mod tests {
             token_locked_amount_is_zero: true,
             issuance_exists: true,
             single_asset_vault_enabled: false,
+            fix_cleanup_3_4_0_enabled: false,
             token_locked: false,
             confidential_transfer_enabled: false,
             confidential_outstanding_nonzero: false,
@@ -286,6 +291,7 @@ mod tests {
                 token_locked_amount_is_zero: true,
                 issuance_exists: true,
                 single_asset_vault_enabled: false,
+                fix_cleanup_3_4_0_enabled: false,
                 token_locked: false,
                 confidential_transfer_enabled: false,
                 confidential_outstanding_nonzero: false,
@@ -305,6 +311,7 @@ mod tests {
             token_locked_amount_is_zero: true,
             issuance_exists: true,
             single_asset_vault_enabled: true,
+            fix_cleanup_3_4_0_enabled: false,
             token_locked: true,
             confidential_transfer_enabled: false,
             confidential_outstanding_nonzero: false,
@@ -323,6 +330,7 @@ mod tests {
             token_locked_amount_is_zero: true,
             issuance_exists: true,
             single_asset_vault_enabled: false,
+            fix_cleanup_3_4_0_enabled: false,
             token_locked: false,
             confidential_transfer_enabled: false,
             confidential_outstanding_nonzero: false,
@@ -341,6 +349,43 @@ mod tests {
     }
 
     #[test]
+    fn mp_token_unauthorize_allows_dangling_locked_token_after_issuance_destroy() {
+        let dangling_locked_token = MPTokenAuthorizePreclaimFacts {
+            holder_present: false,
+            account_token_exists: true,
+            tx_flags: tfMPTUnauthorize,
+            token_balance_is_zero: true,
+            token_locked_amount_is_zero: true,
+            issuance_exists: false,
+            single_asset_vault_enabled: false,
+            fix_cleanup_3_4_0_enabled: false,
+            token_locked: true,
+            confidential_transfer_enabled: false,
+            confidential_outstanding_nonzero: false,
+            token_has_confidential_balance: false,
+            account_is_issuer: false,
+            holder_account_exists: true,
+            issuance_requires_auth: true,
+            holder_token_exists: true,
+            holder_is_pseudo_account: false,
+        };
+
+        for (single_asset_vault_enabled, fix_cleanup_3_4_0_enabled) in
+            [(true, false), (false, true), (true, true)]
+        {
+            assert_eq!(
+                run_mp_token_authorize_preclaim(MPTokenAuthorizePreclaimFacts {
+                    single_asset_vault_enabled,
+                    fix_cleanup_3_4_0_enabled,
+                    ..dangling_locked_token
+                }),
+                Ter::TES_SUCCESS,
+                "SingleAssetVault={single_asset_vault_enabled}, fixCleanup3_4_0={fix_cleanup_3_4_0_enabled}"
+            );
+        }
+    }
+
+    #[test]
     fn mp_token_unauthorize_rejects_possible_confidential_obligations() {
         let result = run_mp_token_authorize_preclaim(MPTokenAuthorizePreclaimFacts {
             holder_present: false,
@@ -350,6 +395,7 @@ mod tests {
             token_locked_amount_is_zero: true,
             issuance_exists: true,
             single_asset_vault_enabled: false,
+            fix_cleanup_3_4_0_enabled: false,
             token_locked: false,
             confidential_transfer_enabled: true,
             confidential_outstanding_nonzero: true,
@@ -374,6 +420,7 @@ mod tests {
             token_locked_amount_is_zero: true,
             issuance_exists: true,
             single_asset_vault_enabled: false,
+            fix_cleanup_3_4_0_enabled: false,
             token_locked: false,
             confidential_transfer_enabled: false,
             confidential_outstanding_nonzero: false,
@@ -392,6 +439,7 @@ mod tests {
             token_locked_amount_is_zero: true,
             issuance_exists: true,
             single_asset_vault_enabled: false,
+            fix_cleanup_3_4_0_enabled: false,
             token_locked: false,
             confidential_transfer_enabled: false,
             confidential_outstanding_nonzero: false,
@@ -410,6 +458,7 @@ mod tests {
             token_locked_amount_is_zero: true,
             issuance_exists: true,
             single_asset_vault_enabled: false,
+            fix_cleanup_3_4_0_enabled: false,
             token_locked: false,
             confidential_transfer_enabled: false,
             confidential_outstanding_nonzero: false,

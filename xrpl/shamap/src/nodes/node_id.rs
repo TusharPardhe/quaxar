@@ -117,8 +117,13 @@ pub fn deserialize_shamap_node_id(data: &[u8]) -> Option<SHAMapNodeId> {
     SHAMapNodeId::new(depth, Uint256::from_array(bytes)).ok()
 }
 
+/// Select the key nibble beneath an inner node.
+///
+/// A depth-64 ID identifies a leaf and has no child nibble. Callers must not
+/// select a branch from it, but clamp defensively so malformed traversal state
+/// cannot index beyond the 32-byte key before it is rejected by its caller.
 pub fn select_branch(id: SHAMapNodeId, hash: Uint256) -> usize {
-    let depth = id.get_depth();
+    let depth = id.get_depth().min(SHAMAP_LEAF_DEPTH - 1);
     let mut branch = hash.data()[depth / 2] as usize;
     if depth & 1 == 1 {
         branch &= 0x0F;
@@ -181,11 +186,42 @@ mod tests {
     }
 
     #[test]
+    fn invalid_leaf_depth_branch_selection_is_clamped_without_panicking() {
+        let key =
+            Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
+                .expect("hex should parse");
+        let leaf =
+            SHAMapNodeId::create_id(SHAMAP_LEAF_DEPTH, key).expect("leaf-depth id should be valid");
+        let deepest_inner = SHAMapNodeId::create_id(SHAMAP_LEAF_DEPTH - 1, key)
+            .expect("deepest inner id should be valid");
+
+        // Depth 64 has no child nibble. It is an invalid select_branch caller,
+        // but must be harmless while the caller rejects the malformed tree.
+        assert_eq!(select_branch(leaf, key), select_branch(deepest_inner, key));
+    }
+
+    #[test]
     fn serialization_and_deserialization_match_cpp_roles() {
         let id = SHAMapNodeId::create_id(5, sample(0xBC)).expect("id should be valid");
         let raw = id.get_raw_string();
         let parsed = deserialize_shamap_node_id(&raw).expect("serialized form should parse");
         assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn deserialize_rejects_adversarial_out_of_range_wire_depths_without_panicking() {
+        for depth in [65, 255] {
+            let mut raw = [0u8; 33];
+            raw[32] = depth;
+
+            let parsed = std::panic::catch_unwind(|| deserialize_shamap_node_id(&raw));
+            assert!(parsed.is_ok(), "depth {depth} must not panic");
+            assert_eq!(
+                parsed.expect("panic already checked"),
+                None,
+                "depth {depth}"
+            );
+        }
     }
 
     #[test]

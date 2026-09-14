@@ -5,6 +5,55 @@ use protocol::{AccountID, Issue, LedgerEntryType, STLedgerEntry};
 
 use super::common::{raw_account_id, sf};
 
+#[derive(Clone, Copy)]
+pub(crate) struct LoanDefaultFreezeExemptAccounts {
+    pub(crate) issuer: AccountID,
+    pub(crate) broker: AccountID,
+    pub(crate) vault: AccountID,
+    pub(crate) asset: protocol::Asset,
+}
+
+/// Resolve the only accounts and asset that may ignore freeze/lock during a
+/// fixCleanup3_4_0 LoanManage default. Missing chain objects fail closed: the
+/// normal invariant remains in force.
+pub(crate) fn loan_default_freeze_exempt_accounts<V: ApplyView + ?Sized>(
+    view: &FlowSandbox<V>,
+    loan_default: bool,
+    loan_id: Option<basics::base_uint::Uint256>,
+) -> Result<Option<LoanDefaultFreezeExemptAccounts>, ledger::ViewError> {
+    if !loan_default || !view.rules().enabled(&protocol::fix_cleanup_3_4_0()) {
+        return Ok(None);
+    }
+    let Some(loan_id) = loan_id else {
+        return Ok(None);
+    };
+    let Some(loan) = view.read(protocol::loan_keylet_from_key(loan_id))? else {
+        return Ok(None);
+    };
+    let Some(broker) = view.read(protocol::loan_broker_keylet_from_key(
+        loan.get_field_h256(sf("sfLoanBrokerID")),
+    ))?
+    else {
+        return Ok(None);
+    };
+    let Some(vault) = view.read(protocol::vault_keylet_from_key(
+        broker.get_field_h256(sf("sfVaultID")),
+    ))?
+    else {
+        return Ok(None);
+    };
+    let asset = vault.get_field_issue(sf("sfAsset")).asset();
+    Ok(Some(LoanDefaultFreezeExemptAccounts {
+        issuer: match asset {
+            protocol::Asset::Issue(issue) => issue.account,
+            protocol::Asset::MPTIssue(issue) => issue.issuer(),
+        },
+        broker: broker.get_account_id(sf("sfAccount")),
+        vault: vault.get_account_id(sf("sfAccount")),
+        asset,
+    }))
+}
+
 #[derive(Clone)]
 struct BalanceChange {
     line: STLedgerEntry,
@@ -90,6 +139,7 @@ pub(super) fn record_freeze_state(
 pub(super) fn validates_transfers_not_frozen<V: ApplyView + ?Sized>(
     view: &FlowSandbox<V>,
     txn_type: protocol::TxType,
+    loan_default_accounts: Option<&LoanDefaultFreezeExemptAccounts>,
     state: &FreezeState,
 ) -> Result<bool, ledger::ViewError> {
     let enforce = view.rules().enabled(&protocol::feature_id("DeepFreeze"));
@@ -115,34 +165,57 @@ pub(super) fn validates_transfers_not_frozen<V: ApplyView + ?Sized>(
             continue;
         }
         let global = issuer.is_flag(protocol::lsfGlobalFreeze);
-        let valid = changes
-            .senders
-            .iter()
-            .chain(changes.receivers.iter())
-            .all(|change| {
-                let high = change
-                    .line
-                    .get_field_amount(sf("sfLowLimit"))
-                    .issue()
-                    .account
-                    == issue.account;
-                let freeze = change.sign < 0
-                    && change.line.is_flag(if high {
-                        protocol::lsfLowFreeze
+        let valid =
+            changes
+                .senders
+                .iter()
+                .chain(changes.receivers.iter())
+                .all(|change| {
+                    let high = change
+                        .line
+                        .get_field_amount(sf("sfLowLimit"))
+                        .issue()
+                        .account
+                        == issue.account;
+                    let freeze = change.sign < 0
+                        && change.line.is_flag(if high {
+                            protocol::lsfLowFreeze
+                        } else {
+                            protocol::lsfHighFreeze
+                        });
+                    let deep = change.line.is_flag(if high {
+                        protocol::lsfLowDeepFreeze
                     } else {
-                        protocol::lsfHighFreeze
+                        protocol::lsfHighDeepFreeze
                     });
-                let deep = change.line.is_flag(if high {
-                    protocol::lsfLowDeepFreeze
-                } else {
-                    protocol::lsfHighDeepFreeze
+                    if !(global || deep || freeze) {
+                        return true;
+                    }
+                    let loan_default_exempt = loan_default_accounts.is_some_and(|accounts| {
+                    matches!(accounts.asset, protocol::Asset::Issue(expected) if expected == *issue)
+                        && ((change.line.get_field_amount(sf("sfLowLimit")).issue().account
+                            == accounts.issuer
+                            && change.line.get_field_amount(sf("sfHighLimit")).issue().account
+                                == accounts.broker)
+                            || (change.line.get_field_amount(sf("sfHighLimit")).issue().account
+                                == accounts.issuer
+                                && change.line.get_field_amount(sf("sfLowLimit")).issue().account
+                                    == accounts.broker)
+                            || (change.line.get_field_amount(sf("sfLowLimit")).issue().account
+                                == accounts.issuer
+                                && change.line.get_field_amount(sf("sfHighLimit")).issue().account
+                                    == accounts.vault)
+                            || (change.line.get_field_amount(sf("sfHighLimit")).issue().account
+                                == accounts.issuer
+                                && change.line.get_field_amount(sf("sfLowLimit")).issue().account
+                                    == accounts.vault))
                 });
-                if !(global || deep || freeze) {
-                    return true;
-                }
-                let amm_line = change.line.is_flag(protocol::lsfAMMNode);
-                freeze_override_allowed(override_freeze, fix_override, amm_line, global)
-            });
+                    if loan_default_exempt {
+                        return true;
+                    }
+                    let amm_line = change.line.is_flag(protocol::lsfAMMNode);
+                    freeze_override_allowed(override_freeze, fix_override, amm_line, global)
+                });
         if !valid {
             return Ok(false);
         }

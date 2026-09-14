@@ -692,6 +692,26 @@ fn apply_transfer<V: ApplyView>(view: &mut V, tx: &STTx, pre_fee: Option<i64>) -
         if balance < required {
             return Ter::TEC_INSUFFICIENT_RESERVE;
         }
+    } else if view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_4_0"))
+    {
+        // Ending an object sponsorship transfers its reserve burden back to
+        // the sponsee.  The cleanup amendment makes End consistent with an
+        // account-level End: the sponsee must be able to self-fund first.
+        let balance = if sponsee == account {
+            let Some(pre_fee) = pre_fee else {
+                return Ter::TEF_BAD_LEDGER;
+            };
+            pre_fee
+        } else {
+            sponsee_root.get_field_amount(sf("sfBalance")).xrp().drops()
+        };
+        let required =
+            ledger::effective_account_reserve(view.fees(), &sponsee_root, count as i32, 0) as i64;
+        if balance < required {
+            return Ter::TEC_INSUFFICIENT_RESERVE;
+        }
     }
     if object_id.is_some() {
         if let Err(ter) = update_count(
@@ -731,7 +751,7 @@ fn apply_transfer<V: ApplyView>(view: &mut V, tx: &STTx, pre_fee: Option<i64>) -
 mod tests {
     use super::*;
     use basics::base_uint::Uint256;
-    use ledger::{ApplyView, ApplyViewImpl, Ledger, ReadViewTx, Sandbox, ViewError};
+    use ledger::{ApplyView, ApplyViewImpl, Fees, Ledger, ReadViewTx, Sandbox, ViewError};
     use protocol::{ApplyFlags, Issue, STAmount, STArray, currency_from_string};
 
     #[derive(Debug)]
@@ -1097,6 +1117,7 @@ mod tests {
             } else {
                 assert_eq!(object_count(&unsupported), 2);
             }
+
             assert!(!supported_object(&unsupported));
         }
 
@@ -1114,6 +1135,77 @@ mod tests {
             ),
         );
         assert_eq!(sponsor_field(&low_line, owner), sf("sfLowSponsor"));
+    }
+
+    #[test]
+    fn sponsorship_end_object_reserve_check_is_gated_by_cleanup_3_4_0() {
+        let owner = AccountID::from_array([0x54; 20]);
+        let sponsor = AccountID::from_array([0x55; 20]);
+        let key = Uint256::from_u64(0x5455);
+
+        for cleanup_enabled in [false, true] {
+            let mut ledger = Ledger::from_ledger_seq_and_close_time(1, 0, false);
+            ledger.set_fees(Fees {
+                base: 10,
+                reserve: 200,
+                increment: 50,
+            });
+            if cleanup_enabled {
+                ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+                    "fixCleanup3_4_0",
+                )]));
+            }
+            let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
+            insert_account(&mut view, owner, 0);
+            insert_account(&mut view, sponsor, 1_000_000_000);
+            let mut owner_root = view
+                .peek(account_key(owner))
+                .unwrap()
+                .unwrap()
+                .clone_as_object();
+            owner_root.set_field_u32(sf("sfOwnerCount"), 1);
+            owner_root.set_field_u32(sf("sfSponsoredOwnerCount"), 1);
+            view.update(Arc::new(STLedgerEntry::from_stobject(
+                owner_root,
+                account_key(owner).key,
+            )))
+            .unwrap();
+            let mut sponsor_root = view
+                .peek(account_key(sponsor))
+                .unwrap()
+                .unwrap()
+                .clone_as_object();
+            sponsor_root.set_field_u32(sf("sfSponsoringOwnerCount"), 1);
+            view.update(Arc::new(STLedgerEntry::from_stobject(
+                sponsor_root,
+                account_key(sponsor).key,
+            )))
+            .unwrap();
+            let mut object = object_fixture(LedgerEntryType::Check, key, owner);
+            object.set_account_id(sf("sfSponsor"), sponsor);
+            view.insert(Arc::new(object)).unwrap();
+
+            let end = transfer_tx(owner, owner, key, protocol::SPONSORSHIP_END_FLAG, None);
+            assert_eq!(
+                apply(&mut view, &end, Some(0)),
+                if cleanup_enabled {
+                    Ter::TEC_INSUFFICIENT_RESERVE
+                } else {
+                    Ter::TES_SUCCESS
+                },
+                "fixCleanup3_4_0 enabled={cleanup_enabled}"
+            );
+            let object = view
+                .peek(protocol::Keylet::new(LedgerEntryType::Any, key))
+                .unwrap()
+                .unwrap();
+            assert_eq!(object.is_field_present(sf("sfSponsor")), cleanup_enabled);
+            let root = view.peek(account_key(owner)).unwrap().unwrap();
+            assert_eq!(
+                root.get_field_u32(sf("sfSponsoredOwnerCount")),
+                u32::from(cleanup_enabled)
+            );
+        }
     }
 
     #[test]

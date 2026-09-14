@@ -3,7 +3,7 @@
 //! This ports the deterministic control flow around `checkValidity(...)` and
 //! the flag-promotion logic used by `forceValidity(...)`.
 
-use protocol::{Rules, feature_batch, feature_batch_v1_1, fix_batch_inner_sigs};
+use protocol::{Rules, feature_batch, feature_batch_v1_1, fix_batch_inner_sigs, fix_cleanup_3_4_0};
 use xrpl_core::{HashRouterFlags, any, merge_set_flags};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +17,10 @@ const SF_SIGGOOD: HashRouterFlags = HashRouterFlags::PRIVATE2;
 const SF_SIGBAD: HashRouterFlags = HashRouterFlags::PRIVATE1;
 const SF_LOCALBAD: HashRouterFlags = HashRouterFlags::PRIVATE3;
 const SF_LOCALGOOD: HashRouterFlags = HashRouterFlags::PRIVATE4;
+// Historic STX/SMT role signatures need an era-private cache partition. These
+// are intentionally distinct from ordinary signature results.
+const SF_OLD_PREFIX_SIGBAD: HashRouterFlags = HashRouterFlags::PRIVATE7;
+const SF_OLD_PREFIX_SIGGOOD: HashRouterFlags = HashRouterFlags::PRIVATE8;
 
 pub const INVALID_INNER_BATCH_TRANSACTION_REASON: &str =
     "Malformed: Invalid inner batch transaction.";
@@ -29,6 +33,7 @@ pub struct CheckValidityFacts {
     pub txn_signature_present: bool,
     pub signing_pub_key_empty: bool,
     pub signers_present: bool,
+    pub alternate_signature_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,16 +80,22 @@ pub fn run_check_validity(
     }
 
     let mut flags_to_set = HashRouterFlags::UNDEFINED;
+    let old_prefix_sig = facts.alternate_signature_present && !rules.enabled(&fix_cleanup_3_4_0());
+    let (sig_bad, sig_good) = if old_prefix_sig {
+        (SF_OLD_PREFIX_SIGBAD, SF_OLD_PREFIX_SIGGOOD)
+    } else {
+        (SF_SIGBAD, SF_SIGGOOD)
+    };
 
-    if any(current_flags & SF_SIGBAD) {
+    if any(current_flags & sig_bad) {
         return CheckValidityResult::new(Validity::SigBad, BAD_SIGNATURE_REASON, flags_to_set);
     }
 
-    if !any(current_flags & SF_SIGGOOD) {
+    if !any(current_flags & sig_good) {
         match check_sign() {
-            Ok(()) => flags_to_set |= SF_SIGGOOD,
+            Ok(()) => flags_to_set |= sig_good,
             Err(reason) => {
-                return CheckValidityResult::new(Validity::SigBad, reason, SF_SIGBAD);
+                return CheckValidityResult::new(Validity::SigBad, reason, sig_bad);
             }
         }
     }
@@ -133,8 +144,10 @@ pub fn run_check_validity_with_flag_cache(
 pub fn forced_validity_flags(validity: Validity) -> HashRouterFlags {
     match validity {
         Validity::SigBad => HashRouterFlags::UNDEFINED,
-        Validity::SigGoodOnly => SF_SIGGOOD,
-        Validity::Valid => SF_SIGGOOD | SF_LOCALGOOD,
+        // forceValidity is an explicit bypass, not an observed verdict: make
+        // both eras good so callers retain its documented behavior.
+        Validity::SigGoodOnly => SF_SIGGOOD | SF_OLD_PREFIX_SIGGOOD,
+        Validity::Valid => SF_SIGGOOD | SF_OLD_PREFIX_SIGGOOD | SF_LOCALGOOD,
     }
 }
 
@@ -184,11 +197,11 @@ mod tests {
         );
         assert_eq!(
             forced_validity_flags(Validity::SigGoodOnly),
-            HashRouterFlags::PRIVATE2
+            HashRouterFlags::PRIVATE2 | HashRouterFlags::PRIVATE8
         );
         assert_eq!(
             forced_validity_flags(Validity::Valid),
-            HashRouterFlags::PRIVATE2 | HashRouterFlags::PRIVATE4
+            HashRouterFlags::PRIVATE2 | HashRouterFlags::PRIVATE4 | HashRouterFlags::PRIVATE8
         );
     }
 
@@ -196,11 +209,17 @@ mod tests {
     fn merge_forced_validity_matches_hash_router_setflags_rule() {
         let (sig_good, changed) =
             merge_forced_validity(HashRouterFlags::UNDEFINED, Validity::SigGoodOnly);
-        assert_eq!(sig_good, HashRouterFlags::PRIVATE2);
+        assert_eq!(
+            sig_good,
+            HashRouterFlags::PRIVATE2 | HashRouterFlags::PRIVATE8
+        );
         assert!(changed);
 
         let (valid, changed_again) = merge_forced_validity(sig_good, Validity::Valid);
-        assert_eq!(valid, HashRouterFlags::PRIVATE2 | HashRouterFlags::PRIVATE4);
+        assert_eq!(
+            valid,
+            HashRouterFlags::PRIVATE2 | HashRouterFlags::PRIVATE4 | HashRouterFlags::PRIVATE8
+        );
         assert!(changed_again);
 
         let (unchanged, changed_final) = merge_forced_validity(valid, Validity::Valid);
@@ -275,7 +294,10 @@ mod tests {
         let changed = run_force_validity(Validity::SigGoodOnly, |flags| seen.set(flags.bits()));
 
         assert!(changed);
-        assert_eq!(seen.get(), HashRouterFlags::PRIVATE2.bits());
+        assert_eq!(
+            seen.get(),
+            (HashRouterFlags::PRIVATE2 | HashRouterFlags::PRIVATE8).bits()
+        );
     }
 
     #[test]
@@ -297,6 +319,7 @@ mod tests {
                 txn_signature_present: true,
                 signing_pub_key_empty: true,
                 signers_present: false,
+                alternate_signature_present: false,
             },
             &Rules::new([feature_batch()]),
             || Ok(()),
@@ -324,6 +347,7 @@ mod tests {
                 txn_signature_present: false,
                 signing_pub_key_empty: true,
                 signers_present: false,
+                alternate_signature_present: false,
             },
             &Rules::new([feature_batch()]),
             || {
@@ -349,6 +373,7 @@ mod tests {
                 txn_signature_present: false,
                 signing_pub_key_empty: true,
                 signers_present: false,
+                alternate_signature_present: false,
             },
             &Rules::new([feature_batch()]),
             || Ok(()),
@@ -455,4 +480,57 @@ mod tests {
             )
         );
     }
+}
+
+#[test]
+fn role_signature_cache_is_partitioned_between_legacy_and_fixed_eras() {
+    let alternate = CheckValidityFacts {
+        alternate_signature_present: true,
+        ..CheckValidityFacts::default()
+    };
+    let legacy = Rules::default();
+    let fixed = Rules::new([protocol::fix_cleanup_3_4_0()]);
+
+    let legacy_bad = run_check_validity(
+        HashRouterFlags::UNDEFINED,
+        alternate,
+        &legacy,
+        || Err("legacy role signature invalid".to_owned()),
+        || Ok(()),
+    );
+    assert_eq!(legacy_bad.flags_to_set, HashRouterFlags::PRIVATE7);
+
+    let fixed_checks = std::cell::Cell::new(0);
+    let fixed_result = run_check_validity(
+        HashRouterFlags::PRIVATE7,
+        alternate,
+        &fixed,
+        || {
+            fixed_checks.set(fixed_checks.get() + 1);
+            Ok(())
+        },
+        || Ok(()),
+    );
+    assert_eq!(fixed_checks.get(), 1);
+    assert_eq!(
+        fixed_result.flags_to_set,
+        HashRouterFlags::PRIVATE2 | HashRouterFlags::PRIVATE4
+    );
+
+    let legacy_checks = std::cell::Cell::new(0);
+    let legacy_result = run_check_validity(
+        HashRouterFlags::PRIVATE1,
+        alternate,
+        &legacy,
+        || {
+            legacy_checks.set(legacy_checks.get() + 1);
+            Ok(())
+        },
+        || Ok(()),
+    );
+    assert_eq!(legacy_checks.get(), 1);
+    assert_eq!(
+        legacy_result.flags_to_set,
+        HashRouterFlags::PRIVATE8 | HashRouterFlags::PRIVATE4
+    );
 }

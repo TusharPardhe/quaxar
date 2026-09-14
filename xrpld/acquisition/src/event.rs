@@ -7,7 +7,7 @@
 
 use crate::handoff::{DurableHandoffAcknowledgement, HandoffRejectReason};
 use crate::id::StoreGeneration;
-use crate::identity::OperationRef;
+use crate::identity::{OperationRef, SessionRef};
 use crate::ingress::AdmittedLedgerPacket;
 use crate::io::{DurabilityCompletion, ReadCompletion, WriteCompletion};
 use crate::peer::PeerAvailabilitySnapshot;
@@ -76,6 +76,10 @@ pub enum AcquisitionEvent {
 
     /// The read broker settled a brokered NodeStore read.
     ReadCompleted(ReadCompletion),
+
+    /// A CPU-sliced SHAMap traversal retained runnable state and is ready for
+    /// another bounded owner turn. This is internal scheduling, not peer data.
+    PlanSliceReady(SessionRef),
 
     /// The NodeStore write adapter completed a write batch.
     WriteCompleted(WriteCompletion),

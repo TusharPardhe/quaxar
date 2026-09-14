@@ -12,7 +12,7 @@ use basics::number::{
 };
 
 use crate::st_amount::AmountError;
-use crate::{Asset, STAmount, no_issue, sf_generic};
+use crate::{Asset, STAmount, is_feature_enabled, no_issue, sf_generic};
 
 pub const QUALITY_ONE: u32 = 1_000_000_000;
 
@@ -421,6 +421,34 @@ fn amount_range_error(asset: Asset) -> AmountError {
     }
 }
 
+fn round_mode(result_negative: bool, round_up: bool) -> RoundingMode {
+    if round_up ^ result_negative {
+        RoundingMode::Upward
+    } else {
+        RoundingMode::Downward
+    }
+}
+
+/// Materialize the MPTokensV2 Number result under the same directed mode used
+/// for the operation. `round_up` means away from zero, matching mulRound and
+/// divRound's legacy contracts.
+fn round_mpt_number_result(
+    asset: Asset,
+    result_negative: bool,
+    round_up: bool,
+    number: RuntimeNumber,
+) -> STAmount {
+    let mode = round_mode(result_negative, round_up);
+    let result = crate::to_amount_from_number::<STAmount>(asset, number, mode)
+        .expect("MPTokensV2 Number result should materialize as an MPT amount");
+
+    if round_up && !result_negative && result.signum() == 0 {
+        return STAmount::new_with_asset(sf_generic(), asset, 1, 0, false);
+    }
+
+    result
+}
+
 pub fn mul_round(v1: &STAmount, v2: &STAmount, asset: Asset, round_up: bool) -> STAmount {
     mul_round_impl(v1, v2, asset, round_up, canonicalize_round)
 }
@@ -536,6 +564,15 @@ fn mul_round_impl(
         );
     }
 
+    let result_negative = v1.negative() != v2.negative();
+    if matches!(asset, Asset::MPTIssue(_)) && is_feature_enabled(&crate::feature_id("MPTokensV2")) {
+        let product = {
+            let _guard = NumberRoundModeGuard::new(round_mode(result_negative, round_up));
+            stamount_as_number(v1) * stamount_as_number(v2)
+        };
+        return round_mpt_number_result(asset, result_negative, round_up, product);
+    }
+
     let mut value1 = v1.mantissa();
     let mut value2 = v2.mantissa();
     let mut offset1 = v1.exponent();
@@ -597,6 +634,15 @@ fn div_round_impl(num: &STAmount, den: &STAmount, asset: Asset, round_up: bool) 
 
     if num.signum() == 0 {
         return STAmount::new_with_asset(sf_generic(), asset, 0, 0, false);
+    }
+
+    let result_negative = num.negative() != den.negative();
+    if matches!(asset, Asset::MPTIssue(_)) && is_feature_enabled(&crate::feature_id("MPTokensV2")) {
+        let quotient = {
+            let _guard = NumberRoundModeGuard::new(round_mode(result_negative, round_up));
+            stamount_as_number(num) / stamount_as_number(den)
+        };
+        return round_mpt_number_result(asset, result_negative, round_up, quotient);
     }
 
     let mut num_val = num.mantissa();

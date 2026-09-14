@@ -24,10 +24,11 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use super::{
-    OverlayAcceptor, OverlayHandoff, OverlayImpl, OverlayInboundRouter, PEERFINDER_LIVE_CACHE_TTL,
-    PEERFINDER_MAX_ACCEPTED_ENDPOINTS, PEERFINDER_MAX_HOPS, PEERFINDER_REDIRECT_ENDPOINT_COUNT,
-    PeerReservation, PeerReservationSource, PeerReservationTable, RelayKind,
-    is_valid_peer_endpoint, read_http_request, validated_ledger_is_recent_for_peer_tracking,
+    ManifestAdmission, OverlayAcceptor, OverlayHandoff, OverlayImpl, OverlayInboundRouter,
+    PEERFINDER_LIVE_CACHE_TTL, PEERFINDER_MAX_ACCEPTED_ENDPOINTS, PEERFINDER_MAX_HOPS,
+    PEERFINDER_REDIRECT_ENDPOINT_COUNT, PeerReservation, PeerReservationSource,
+    PeerReservationTable, RelayKind, is_valid_peer_endpoint, read_http_request,
+    validated_ledger_is_recent_for_peer_tracking,
 };
 use crate::message::{
     Message, ProtocolMessage, ProtocolPayload, TmEndpoints, TmGetLedger, TmGetObjectByHash,
@@ -1978,6 +1979,142 @@ async fn inbound_session_queues_remaining_heavy_families() {
         snapshot.have_transactions[0].hashes,
         vec![Uint256::from_u64(803)]
     );
+}
+
+#[test]
+fn manifest_prepolicy_admission_bounds_retention_and_defers_bounded_delivery() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let peer = peer(95, 95);
+    let mut router = OverlayInboundRouter {
+        overlay: &overlay,
+        peer: &peer,
+        ledger_data_deferred: false,
+    };
+
+    // This direct-router regression deliberately exercises the same payload
+    // cap the transport enforces before decode: policy-unset input must still
+    // be checked before a decoded batch is cloned into the fallback queue.
+    overlay.set_max_manifests_message_size(1);
+    let _ = router.on_manifests(&TmManifests {
+        list: vec![wire::TmManifest {
+            stobject: b"oversized".to_vec(),
+        }],
+        ..Default::default()
+    });
+    assert!(overlay.queued_inbound_snapshot().manifests.is_empty());
+
+    overlay.set_max_manifests_message_size(crate::message::MAXIMUM_MANIFESTS_MESSAGE_SIZE);
+    let _ = router.on_manifests(&TmManifests {
+        list: (0..=crate::message::DEFAULT_MAX_UNTRUSTED_MANIFESTS)
+            .map(|_| wire::TmManifest {
+                stobject: b"untrusted".to_vec(),
+            })
+            .collect(),
+        ..Default::default()
+    });
+    assert!(
+        overlay.queued_inbound_snapshot().manifests.is_empty(),
+        "an over-budget startup batch must not retain a full clone"
+    );
+
+    // A batch at the startup cap remains available for application processing
+    // after the ValidatorList-backed policy comes online. The policy must not
+    // discard this already bounded deferred packet before its app-side owner
+    // can classify it.
+    let _ = router.on_manifests(&TmManifests {
+        list: (0..crate::message::DEFAULT_MAX_UNTRUSTED_MANIFESTS)
+            .map(|index| wire::TmManifest {
+                stobject: format!("trusted-later-{index}").into_bytes(),
+            })
+            .collect(),
+        ..Default::default()
+    });
+    overlay.set_manifest_admission_policy(1, |_| ManifestAdmission::Trusted);
+    let deferred = overlay.queued_inbound().take_manifests();
+    assert_eq!(deferred.len(), 1);
+    assert_eq!(deferred[0].peer_id, peer.id());
+    assert_eq!(
+        deferred[0].message.list.len(),
+        crate::message::DEFAULT_MAX_UNTRUSTED_MANIFESTS
+    );
+    assert_eq!(deferred[0].message.list[0].stobject, b"trusted-later-0");
+    assert_eq!(
+        deferred[0]
+            .message
+            .list
+            .last()
+            .expect("bounded batch is nonempty")
+            .stobject,
+        format!(
+            "trusted-later-{}",
+            crate::message::DEFAULT_MAX_UNTRUSTED_MANIFESTS - 1
+        )
+        .into_bytes()
+    );
+
+    let charges = peer.charges();
+    assert_eq!(
+        charges.len(),
+        2,
+        "each rejected startup batch is charged once"
+    );
+    assert!(
+        charges
+            .iter()
+            .all(|(charge, _)| charge == &*resource::FEE_MALFORMED_REQUEST)
+    );
+    assert_eq!(charges[0].1, "oversized manifest batch");
+    assert_eq!(charges[1].1, "too many untrusted manifests");
+}
+#[test]
+fn manifest_prequeue_admission_keeps_trusted_after_untrusted_and_charges_once() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    overlay.set_manifest_admission_policy(1, |serialized| match serialized {
+        b"trusted" => ManifestAdmission::Trusted,
+        b"reject" => ManifestAdmission::Reject,
+        _ => ManifestAdmission::Untrusted,
+    });
+    let peer = peer(96, 96);
+    let mut router = OverlayInboundRouter {
+        overlay: &overlay,
+        peer: &peer,
+        ledger_data_deferred: false,
+    };
+
+    let _ = router.on_manifests(&TmManifests {
+        list: vec![
+            wire::TmManifest {
+                stobject: b"untrusted-first".to_vec(),
+            },
+            wire::TmManifest {
+                stobject: b"untrusted-skipped".to_vec(),
+            },
+            wire::TmManifest {
+                stobject: b"trusted".to_vec(),
+            },
+            wire::TmManifest {
+                stobject: b"reject".to_vec(),
+            },
+        ],
+        ..Default::default()
+    });
+
+    let snapshot = overlay.queued_inbound_snapshot();
+    assert_eq!(snapshot.manifests.len(), 1);
+    assert_eq!(snapshot.manifests[0].peer_id, peer.id());
+    assert_eq!(
+        snapshot.manifests[0]
+            .message
+            .list
+            .iter()
+            .map(|manifest| manifest.stobject.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"untrusted-first".as_slice(), b"trusted".as_slice()],
+        "trusted manifests are retained even after untrusted work is skipped"
+    );
+    let charges = peer.charges();
+    assert_eq!(charges.len(), 1, "one charge covers the skipped work");
+    assert_eq!(charges[0].1, "too many untrusted manifests");
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -397,11 +397,7 @@ fn is_lp_token<V: ReadView>(view: &V, asset: Asset) -> Result<bool, Ter> {
 }
 
 fn is_pseudo_account<V: ReadView>(view: &V, account: AccountID) -> Result<bool, Ter> {
-    Ok(read_account(view, account)?.is_some_and(|account| {
-        [sf("sfAMMID"), sf("sfVaultID"), sf("sfLoanBrokerID")]
-            .into_iter()
-            .any(|field| account.is_field_present(field))
-    }))
+    Ok(read_account(view, account)?.is_some_and(|account| ledger::is_pseudo_account(&account)))
 }
 
 fn is_mpt_issuer_pseudo<V: ReadView>(view: &V, asset: Asset) -> Result<bool, Ter> {
@@ -842,15 +838,33 @@ fn preclaim_offer_create<V: ReadView>(
         return Ok(acceptance);
     }
 
-    if tx.is_field_present(sf("sfDomainID"))
-        && !ledger::permissioned_dex_helpers::account_in_domain(
-            view,
-            &account,
-            &tx.get_field_h256(sf("sfDomainID")),
-        )
-        .map_err(|_| read_error())?
-    {
-        return Ok(Ter::TEC_NO_PERMISSION);
+    if tx.is_field_present(sf("sfDomainID")) {
+        let domain_id = tx.get_field_h256(sf("sfDomainID"));
+        if view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_4_0"))
+        {
+            let Some(domain) = view
+                .read(protocol::permissioned_domain_keylet_from_id(domain_id))
+                .map_err(|_| read_error())?
+            else {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            };
+            if domain.get_account_id(sf("sfOwner")) != account {
+                let membership =
+                    ledger::credential_helpers::valid_domain(view, domain_id, &account)
+                        .map_err(|_| read_error())?;
+                // Permit an expired credential through preclaim. doApply
+                // removes it before returning tecEXPIRED.
+                if membership != Ter::TES_SUCCESS && membership != Ter::TEC_EXPIRED {
+                    return Ok(Ter::TEC_NO_PERMISSION);
+                }
+            }
+        } else if !ledger::permissioned_dex_helpers::account_in_domain(view, &account, &domain_id)
+            .map_err(|_| read_error())?
+        {
+            return Ok(Ter::TEC_NO_PERMISSION);
+        }
     }
 
     for asset in [taker_pays.asset(), taker_gets.asset()] {

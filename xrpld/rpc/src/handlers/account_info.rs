@@ -8,7 +8,7 @@ use basics::str_hex::str_hex;
 use ledger::Ledger;
 use protocol::{
     AccountID, AccountRoot, JsonOptions, JsonValue, LedgerEntryType, LedgerFormats, SField,
-    STLedgerEntry, SignerList, StBase, account_keylet, feature_clawback, feature_token_escrow,
+    STLedgerEntry, SignerList, StBase, account_keylet, feature_token_escrow,
     lsfAllowTrustLineClawback, lsfAllowTrustLineLocking, lsfDefaultRipple, lsfDepositAuth,
     lsfDisableMaster, lsfDisallowIncomingCheck, lsfDisallowIncomingNFTokenOffer,
     lsfDisallowIncomingPayChan, lsfDisallowIncomingTrustline, lsfDisallowXRP, lsfGlobalFreeze,
@@ -274,11 +274,6 @@ impl AccountInfoSource for ApplicationAccountInfoSource<'_> {
         )
     }
 
-    fn feature_clawback_enabled(&self, ledger: &LedgerLookupLedger) -> bool {
-        self.lookup_resolved_ledger(ledger)
-            .is_some_and(|resolved| resolved.rules().enabled(&feature_clawback()))
-    }
-
     fn feature_token_escrow_enabled(&self, ledger: &LedgerLookupLedger) -> bool {
         self.lookup_resolved_ledger(ledger)
             .is_some_and(|resolved| resolved.rules().enabled(&feature_token_escrow()))
@@ -415,6 +410,7 @@ fn build_account_flags<S: AccountInfoSource>(
     let sle = account_root.as_st_ledger_entry();
 
     for (name, flag) in [
+        ("allowTrustLineClawback", lsfAllowTrustLineClawback),
         ("defaultRipple", lsfDefaultRipple),
         ("depositAuth", lsfDepositAuth),
         ("disableMasterKey", lsfDisableMaster),
@@ -433,15 +429,6 @@ fn build_account_flags<S: AccountInfoSource>(
         ("disallowIncomingTrustline", lsfDisallowIncomingTrustline),
     ] {
         insert_flag(&mut account_flags, name, sle, flag);
-    }
-
-    if source.feature_clawback_enabled(ledger) {
-        insert_flag(
-            &mut account_flags,
-            "allowTrustLineClawback",
-            sle,
-            lsfAllowTrustLineClawback,
-        );
     }
 
     if source.feature_token_escrow_enabled(ledger) {

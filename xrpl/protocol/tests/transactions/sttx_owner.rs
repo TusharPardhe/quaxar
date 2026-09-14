@@ -1,8 +1,9 @@
 use basics::base_uint::Uint256;
 use protocol::{
     AccountID, HashPrefix, KeyType, LoanSetBuilder, NumberJsonInput, Rules, STAmount, STArray,
-    STNumber, STObject, STTx, STUInt16, STUInt32, STVar, SecretKey, Serializer, StBase, TxType,
-    calc_account_id, derive_public_key, get_field_by_symbol, passes_local_checks, sf_generic, sign,
+    STNumber, STObject, STTx, STUInt16, STUInt32, STVar, SecretKey, Serializer, SignatureRole,
+    StBase, TxType, build_multi_signing_data_with_prefix, calc_account_id, derive_public_key,
+    fix_cleanup_3_4_0, get_field_by_symbol, passes_local_checks, sf_generic, sign, signing_prefix,
     sterilize,
 };
 
@@ -575,4 +576,212 @@ fn protocol_sttx_sterilize_round_trips_canonical_bytes() {
         sterilized.get_serializer().data(),
         tx.get_serializer().data()
     );
+}
+
+#[test]
+fn protocol_role_signature_domains_activate_with_fix_cleanup_3_4_0() {
+    let legacy = Rules::default();
+    let fixed = Rules::new([fix_cleanup_3_4_0()]);
+
+    assert_eq!(HashPrefix::CounterpartyTxSign.as_u32(), 0x4350_5400);
+    assert_eq!(HashPrefix::CounterpartyTxMultiSign.as_u32(), 0x4350_4D00);
+    assert_eq!(HashPrefix::SponsorTxSign.as_u32(), 0x5350_4E00);
+    assert_eq!(HashPrefix::SponsorTxMultiSign.as_u32(), 0x5350_4D00);
+    for role in [
+        SignatureRole::Transaction,
+        SignatureRole::Counterparty,
+        SignatureRole::Sponsor,
+    ] {
+        assert_eq!(signing_prefix(role, false, &legacy), HashPrefix::TxSign);
+        assert_eq!(signing_prefix(role, true, &legacy), HashPrefix::TxMultiSign);
+    }
+    assert_eq!(
+        signing_prefix(SignatureRole::Transaction, false, &fixed),
+        HashPrefix::TxSign
+    );
+    assert_eq!(
+        signing_prefix(SignatureRole::Transaction, true, &fixed),
+        HashPrefix::TxMultiSign
+    );
+    assert_eq!(
+        signing_prefix(SignatureRole::Counterparty, false, &fixed),
+        HashPrefix::CounterpartyTxSign
+    );
+    assert_eq!(
+        signing_prefix(SignatureRole::Counterparty, true, &fixed),
+        HashPrefix::CounterpartyTxMultiSign
+    );
+    assert_eq!(
+        signing_prefix(SignatureRole::Sponsor, false, &fixed),
+        HashPrefix::SponsorTxSign
+    );
+    assert_eq!(
+        signing_prefix(SignatureRole::Sponsor, true, &fixed),
+        HashPrefix::SponsorTxMultiSign
+    );
+}
+
+#[test]
+fn protocol_role_signatures_are_cryptographically_partitioned_by_cleanup_3_4_0() {
+    let legacy = Rules::default();
+    let fixed = Rules::new([fix_cleanup_3_4_0()]);
+    let payer_secret = SecretKey::from_bytes([0x71; 32]);
+    let payer_public = derive_public_key(KeyType::Secp256k1, &payer_secret).expect("payer key");
+    let role_secret = SecretKey::from_bytes([0x72; 32]);
+    let role_public = derive_public_key(KeyType::Secp256k1, &role_secret).expect("role key");
+    let payer = calc_account_id(payer_public.as_bytes());
+    let role_account = calc_account_id(role_public.as_bytes());
+
+    let make_loan = |sequence| {
+        let mut tx = LoanSetBuilder::new(
+            payer,
+            Uint256::from_array([0xC1; 32]),
+            STNumber::from_json_input(NumberJsonInput::UInt(100)).expect("number"),
+            Some(sequence),
+            Some(STAmount::new_native(10, false)),
+        )
+        .set_counterparty(role_account)
+        .build(&payer_public, &payer_secret)
+        .expect("loan set")
+        .tx()
+        .as_ref()
+        .clone();
+        tx.set_account_id(get_field_by_symbol("sfSponsor"), role_account);
+        tx.sign_with_role(
+            &payer_public,
+            &payer_secret,
+            SignatureRole::Transaction,
+            &legacy,
+        )
+        .expect("primary signature after sponsor assignment");
+        tx
+    };
+    let add_single = |tx: &mut STTx, role, rules: &Rules| {
+        role_target(tx, role).set_field_vl(
+            get_field_by_symbol("sfSigningPubKey"),
+            role_public.as_bytes(),
+        );
+        tx.sign_with_role(&role_public, &role_secret, role, rules)
+            .expect("role single signature");
+    };
+    let add_multi = |tx: &mut STTx, role, rules: &Rules| {
+        let message = build_multi_signing_data_with_prefix(
+            &tx.clone_as_object(),
+            role_account,
+            signing_prefix(role, true, rules),
+        );
+        let signature = sign(&role_public, &role_secret, message.data()).expect("multi signature");
+        let mut signer = STObject::make_inner_object(get_field_by_symbol("sfSigner"));
+        signer.set_account_id(get_field_by_symbol("sfAccount"), role_account);
+        signer.set_field_vl(
+            get_field_by_symbol("sfSigningPubKey"),
+            role_public.as_bytes(),
+        );
+        signer.set_field_vl(get_field_by_symbol("sfTxnSignature"), &signature);
+        let mut signers = STArray::new(get_field_by_symbol("sfSigners"));
+        signers.push_back(signer);
+        let target = role_target(tx, role);
+        target.set_field_vl(get_field_by_symbol("sfSigningPubKey"), &[]);
+        target.set_field_array(get_field_by_symbol("sfSigners"), signers);
+    };
+
+    for (offset, role) in [SignatureRole::Counterparty, SignatureRole::Sponsor]
+        .into_iter()
+        .enumerate()
+    {
+        let mut legacy_single = make_loan(71 + offset as u32);
+        add_single(&mut legacy_single, role, &legacy);
+        assert_eq!(legacy_single.check_sign(&legacy), Ok(()));
+        assert!(legacy_single.check_sign(&fixed).is_err());
+
+        let mut fixed_single = make_loan(81 + offset as u32);
+        add_single(&mut fixed_single, role, &fixed);
+        assert_eq!(fixed_single.check_sign(&fixed), Ok(()));
+        assert!(fixed_single.check_sign(&legacy).is_err());
+
+        let mut legacy_multi = make_loan(91 + offset as u32);
+        add_multi(&mut legacy_multi, role, &legacy);
+        assert_eq!(legacy_multi.check_sign(&legacy), Ok(()));
+        assert!(legacy_multi.check_sign(&fixed).is_err());
+
+        let mut fixed_multi = make_loan(101 + offset as u32);
+        add_multi(&mut fixed_multi, role, &fixed);
+        assert_eq!(fixed_multi.check_sign(&fixed), Ok(()));
+        assert!(fixed_multi.check_sign(&legacy).is_err());
+    }
+
+    let mut counterparty_single = make_loan(111);
+    add_single(
+        &mut counterparty_single,
+        SignatureRole::Counterparty,
+        &fixed,
+    );
+    let counterparty_signature = role_target(&mut counterparty_single, SignatureRole::Counterparty)
+        .get_field_vl(get_field_by_symbol("sfTxnSignature"));
+    let sponsor_target = role_target(&mut counterparty_single, SignatureRole::Sponsor);
+    sponsor_target.set_field_vl(
+        get_field_by_symbol("sfSigningPubKey"),
+        role_public.as_bytes(),
+    );
+    sponsor_target.set_field_vl(
+        get_field_by_symbol("sfTxnSignature"),
+        &counterparty_signature,
+    );
+    assert_eq!(
+        counterparty_single.check_sign(&fixed),
+        Err("Sponsor: Invalid signature.".to_owned())
+    );
+
+    let mut sponsor_single = make_loan(112);
+    add_single(&mut sponsor_single, SignatureRole::Sponsor, &fixed);
+    let sponsor_signature = role_target(&mut sponsor_single, SignatureRole::Sponsor)
+        .get_field_vl(get_field_by_symbol("sfTxnSignature"));
+    let counterparty_target = role_target(&mut sponsor_single, SignatureRole::Counterparty);
+    counterparty_target.set_field_vl(
+        get_field_by_symbol("sfSigningPubKey"),
+        role_public.as_bytes(),
+    );
+    counterparty_target.set_field_vl(get_field_by_symbol("sfTxnSignature"), &sponsor_signature);
+    assert_eq!(
+        sponsor_single.check_sign(&fixed),
+        Err("Counterparty: Invalid signature.".to_owned())
+    );
+
+    let mut counterparty_multi = make_loan(113);
+    add_multi(&mut counterparty_multi, SignatureRole::Counterparty, &fixed);
+    let counterparty_signers = role_target(&mut counterparty_multi, SignatureRole::Counterparty)
+        .get_field_array(get_field_by_symbol("sfSigners"))
+        .clone();
+    let sponsor_target = role_target(&mut counterparty_multi, SignatureRole::Sponsor);
+    sponsor_target.set_field_vl(get_field_by_symbol("sfSigningPubKey"), &[]);
+    sponsor_target.set_field_array(get_field_by_symbol("sfSigners"), counterparty_signers);
+    assert_eq!(
+        counterparty_multi.check_sign(&fixed),
+        Err(format!(
+            "Sponsor: Invalid signature on account {}.",
+            protocol::to_base58(role_account)
+        ))
+    );
+
+    let mut sponsor_multi = make_loan(114);
+    add_multi(&mut sponsor_multi, SignatureRole::Sponsor, &fixed);
+    let sponsor_signers = role_target(&mut sponsor_multi, SignatureRole::Sponsor)
+        .get_field_array(get_field_by_symbol("sfSigners"))
+        .clone();
+    let counterparty_target = role_target(&mut sponsor_multi, SignatureRole::Counterparty);
+    counterparty_target.set_field_vl(get_field_by_symbol("sfSigningPubKey"), &[]);
+    counterparty_target.set_field_array(get_field_by_symbol("sfSigners"), sponsor_signers);
+    assert_eq!(
+        sponsor_multi.check_sign(&fixed),
+        Err(format!(
+            "Counterparty: Invalid signature on account {}.",
+            protocol::to_base58(role_account)
+        ))
+    );
+}
+
+fn role_target(tx: &mut STTx, role: SignatureRole) -> &mut STObject {
+    tx.peek_field_object(
+        protocol::signature_field(role).expect("alternate role has a signature target"),
+    )
 }

@@ -176,62 +176,100 @@ fn vault_info_rejects_cpp_style_malformed_combinations() {
     };
 
     let cases = [
-        object([("ledger_index", JsonValue::String("validated".to_owned()))]),
-        object([
-            ("ledger_index", JsonValue::String("validated".to_owned())),
-            ("vault_id", JsonValue::String("foobar".to_owned())),
-        ]),
-        object([
-            ("ledger_index", JsonValue::String("validated".to_owned())),
-            ("vault_id", JsonValue::String("0".repeat(64))),
-        ]),
-        object([
-            ("ledger_index", JsonValue::String("validated".to_owned())),
-            ("vault_id", JsonValue::Unsigned(0)),
-        ]),
-        object([
-            ("ledger_index", JsonValue::String("validated".to_owned())),
-            ("owner", JsonValue::String("foobar".to_owned())),
-            ("seq", JsonValue::Unsigned(7)),
-        ]),
-        object([
-            ("ledger_index", JsonValue::String("validated".to_owned())),
-            ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
-        ]),
-        object([
-            ("ledger_index", JsonValue::String("validated".to_owned())),
-            ("seq", JsonValue::Unsigned(7)),
-        ]),
-        object([
-            ("ledger_index", JsonValue::String("validated".to_owned())),
-            ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
-            ("seq", JsonValue::String("nope".to_owned())),
-        ]),
-        object([
-            ("ledger_index", JsonValue::String("validated".to_owned())),
-            ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
-            ("seq", JsonValue::Bool(true)),
-        ]),
-        object([
-            ("ledger_index", JsonValue::String("validated".to_owned())),
-            ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
-            ("seq", JsonValue::Signed(-1)),
-        ]),
-        object([
-            ("ledger_index", JsonValue::String("validated".to_owned())),
-            ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
-            ("seq", JsonValue::Unsigned(0)),
-        ]),
-        object([
-            ("ledger_index", JsonValue::String("validated".to_owned())),
-            ("vault_id", JsonValue::String("0".repeat(64))),
-            ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
-        ]),
+        (
+            object([("ledger_index", JsonValue::String("validated".to_owned()))]),
+            "invalidParams",
+        ),
+        (
+            object([
+                ("ledger_index", JsonValue::String("validated".to_owned())),
+                ("vault_id", JsonValue::String("foobar".to_owned())),
+            ]),
+            "invalidParams",
+        ),
+        (
+            object([
+                ("ledger_index", JsonValue::String("validated".to_owned())),
+                ("vault_id", JsonValue::String("0".repeat(64))),
+            ]),
+            "entryNotFound",
+        ),
+        (
+            object([
+                ("ledger_index", JsonValue::String("validated".to_owned())),
+                ("vault_id", JsonValue::Unsigned(0)),
+            ]),
+            "invalidParams",
+        ),
+        (
+            object([
+                ("ledger_index", JsonValue::String("validated".to_owned())),
+                ("owner", JsonValue::String("foobar".to_owned())),
+                ("seq", JsonValue::Unsigned(7)),
+            ]),
+            "actMalformed",
+        ),
+        (
+            object([
+                ("ledger_index", JsonValue::String("validated".to_owned())),
+                ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
+            ]),
+            "invalidParams",
+        ),
+        (
+            object([
+                ("ledger_index", JsonValue::String("validated".to_owned())),
+                ("seq", JsonValue::Unsigned(7)),
+            ]),
+            "invalidParams",
+        ),
+        (
+            object([
+                ("ledger_index", JsonValue::String("validated".to_owned())),
+                ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
+                ("seq", JsonValue::String("nope".to_owned())),
+            ]),
+            "invalidParams",
+        ),
+        (
+            object([
+                ("ledger_index", JsonValue::String("validated".to_owned())),
+                ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
+                ("seq", JsonValue::Bool(true)),
+            ]),
+            "invalidParams",
+        ),
+        (
+            object([
+                ("ledger_index", JsonValue::String("validated".to_owned())),
+                ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
+                ("seq", JsonValue::Signed(-1)),
+            ]),
+            "invalidParams",
+        ),
+        (
+            object([
+                ("ledger_index", JsonValue::String("validated".to_owned())),
+                ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
+                ("seq", JsonValue::Unsigned(0)),
+            ]),
+            "invalidParams",
+        ),
+        (
+            object([
+                ("ledger_index", JsonValue::String("validated".to_owned())),
+                ("vault_id", JsonValue::String("0".repeat(64))),
+                ("owner", JsonValue::String(to_base58(sample_account(0x11)))),
+            ]),
+            "invalidParams",
+        ),
     ];
 
-    for params in cases {
+    for (params, expected) in cases {
         let result = do_vault_info(&request(params), &source);
-        assert_eq!(error_string(&result), Some("malformedRequest"));
+        assert_eq!(error_string(&result), Some(expected));
+        assert!(json_object(&result).contains_key("error_code"));
+        assert!(json_object(&result).contains_key("error_message"));
     }
 }
 
@@ -308,4 +346,163 @@ fn vault_info_shapes_direct_and_owner_lookup() {
         vault_json.get("shares"),
         Some(&issuance.json(protocol::JsonOptions::NONE))
     );
+}
+
+#[test]
+fn vault_info_short_zero_id_is_well_formed_but_not_found() {
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    let result = do_vault_info(
+        &request(object([
+            ("ledger_index", JsonValue::String("validated".to_owned())),
+            ("vault_id", JsonValue::String("0".to_owned())),
+        ])),
+        &source,
+    );
+    assert_eq!(error_string(&result), Some("entryNotFound"));
+    assert_eq!(
+        json_object(&result).get("error_code"),
+        Some(&JsonValue::Signed(98))
+    );
+    assert_eq!(
+        json_object(&result).get("error_message"),
+        Some(&JsonValue::String("Entry not found.".to_owned()))
+    );
+}
+
+#[test]
+fn vault_info_selector_combinations_and_malformed_types_are_exact() {
+    let owner = sample_account(0x41);
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    let invalid_selector = "Must specify either 'vault_id' or both 'owner' and 'seq'.";
+
+    for params in [
+        object([]),
+        object([("owner", JsonValue::String(to_base58(owner)))]),
+        object([("seq", JsonValue::Unsigned(1))]),
+        object([
+            ("vault_id", JsonValue::String("0".repeat(64))),
+            ("owner", JsonValue::String(to_base58(owner))),
+        ]),
+        object([
+            ("vault_id", JsonValue::String("0".repeat(64))),
+            ("seq", JsonValue::Unsigned(1)),
+        ]),
+        object([
+            ("vault_id", JsonValue::String("0".repeat(64))),
+            ("owner", JsonValue::String(to_base58(owner))),
+            ("seq", JsonValue::Unsigned(1)),
+        ]),
+    ] {
+        let result = do_vault_info(&request(params), &source);
+        let fields = json_object(&result);
+        assert_eq!(
+            fields.get("error"),
+            Some(&JsonValue::String("invalidParams".to_owned()))
+        );
+        assert_eq!(fields.get("error_code"), Some(&JsonValue::Signed(31)));
+        assert_eq!(
+            fields.get("error_message"),
+            Some(&JsonValue::String(invalid_selector.to_owned())),
+        );
+    }
+
+    let malformed_values = [
+        JsonValue::Unsigned(1),
+        JsonValue::Signed(-1),
+        JsonValue::from(serde_json::json!(1.5)),
+        JsonValue::Bool(true),
+        JsonValue::Null,
+        JsonValue::Object(BTreeMap::new()),
+        JsonValue::Array(Vec::new()),
+    ];
+    for value in &malformed_values {
+        let vault_id = do_vault_info(&request(object([("vault_id", value.clone())])), &source);
+        assert_eq!(
+            error_string(&vault_id),
+            Some("invalidParams"),
+            "vault_id value {value:?}",
+        );
+        assert_eq!(
+            json_object(&vault_id).get("error_message"),
+            Some(&JsonValue::String(
+                "Invalid field 'vault_id', not hex string.".to_owned()
+            )),
+        );
+
+        let owner_result = do_vault_info(
+            &request(object([
+                ("owner", value.clone()),
+                ("seq", JsonValue::Unsigned(1)),
+            ])),
+            &source,
+        );
+        assert_eq!(error_string(&owner_result), Some("actMalformed"));
+        assert_eq!(
+            json_object(&owner_result).get("error_message"),
+            Some(&JsonValue::String(
+                "Invalid field 'owner', not AccountID.".to_owned()
+            )),
+        );
+
+        let seq_result = do_vault_info(
+            &request(object([
+                ("owner", JsonValue::String(to_base58(owner))),
+                (
+                    "seq",
+                    match value {
+                        JsonValue::Unsigned(_) => JsonValue::Unsigned(0),
+                        _ => value.clone(),
+                    },
+                ),
+            ])),
+            &source,
+        );
+        assert_eq!(error_string(&seq_result), Some("invalidParams"));
+        assert_eq!(
+            json_object(&seq_result).get("error_message"),
+            Some(&JsonValue::String(
+                "Invalid field 'seq', not a positive 32-bit integer.".to_owned()
+            )),
+        );
+    }
+}
+
+#[test]
+fn vault_info_entry_not_found_has_exact_envelope_for_zero_and_missing_selectors() {
+    let owner = sample_account(0x52);
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    let missing_key = sample_uint256(0x53);
+    let requests = [
+        object([("vault_id", JsonValue::String("0".to_owned()))]),
+        object([("vault_id", JsonValue::String(vault_key_hex(missing_key)))]),
+        object([
+            ("owner", JsonValue::String(to_base58(owner))),
+            ("seq", JsonValue::Signed(1)),
+        ]),
+    ];
+
+    for params in requests {
+        let result = do_vault_info(&request(params), &source);
+        assert_eq!(
+            (
+                error_string(&result),
+                json_object(&result).get("error_code"),
+                json_object(&result).get("error_message")
+            ),
+            (
+                Some("entryNotFound"),
+                Some(&JsonValue::Signed(98)),
+                Some(&JsonValue::String("Entry not found.".to_owned())),
+            ),
+        );
+    }
 }

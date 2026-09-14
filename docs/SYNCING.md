@@ -5,8 +5,8 @@ means acquiring a validated ledger header plus its complete state and
 transaction SHAMaps, persisting the required nodes, and advancing LedgerMaster
 onto the network's validated chain.
 
-For the coordinator's internal ownership, typed event/effect loop, per-hash
-session lifecycle, backpressure, cache lookup order, and durability sequence,
+For per-hash actor ownership, worker scheduling, backpressure, cache lookup
+order, the coordinator parity model, and the durability sequence,
 see [ACQUISITION.md](ACQUISITION.md).
 
 ## Server states
@@ -36,7 +36,7 @@ disconnected -> connected -> syncing -> tracking -> full
 
 An actionable branch change can legitimately produce
 `full -> syncing -> tracking -> full`. Repeated flapping, growing local-closed
-versus validated lag, a static coordinator identity, or acquisitions that
+versus validated lag, a static acquisition actor, or acquisitions that
 continually reset require investigation.
 
 Targetless readiness loss follows the reference mode rules. A Full node with
@@ -47,8 +47,8 @@ normalize to `syncing` for a fresh validated ledger), while a blocked node is
 held at `connected`. Falling below `[network_quorum]` enters `disconnected`
 until the threshold is restored.
 When `start_valid` deliberately sets the threshold to zero, losing all peers
-does not change the operating phase, but the coordinator still removes those
-peer IDs and parks acquisition work until transport returns.
+does not change the operating phase, but acquisition actors park network work
+until transport returns.
 
 On an empty database, Quaxar may temporarily close a small bootstrap chain
 while the preferred network ledger's state tree is still being assembled. In
@@ -60,9 +60,9 @@ validated/published chain begins advancing.
 ## Current-ledger acquisition
 
 1. Trusted validations and peer status select a preferred ledger hash.
-2. The typed coordinator records a stable recovery anchor. The latest
-   preferred policy may continue moving and prioritize independent per-hash
-   acquisitions without replacing that anchor.
+2. NetworkOps retains the stable recovery decision while the registry
+   coalesces independent per-hash actors. Heavy acquisition work never runs on
+   the NetworkOps strand.
 3. The ledger header identifies state-map and transaction-map roots.
 4. Each map consults the shared NodeFamily/tree cache, fetch-pack cache, and
    NodeStore before requesting missing nodes from peers.
@@ -71,7 +71,7 @@ validated/published chain begins advancing.
    cleanup, verified nodes remain reusable through shared caches and storage.
 6. Once both maps are complete, immutable, and match their roots, the ledger is
    published by exact hash to history, persisted, and handed back through the
-   coordinator's durable completion path. Validation-trie residency is updated
+   registry's exact completion path. Validation-trie residency is updated
    only for validators still waiting on that exact sequence and hash. If a
    newer validation already replaced the waiter, a late older completion stays
    reusable in history/storage but does not revive superseded trie support;
@@ -85,7 +85,7 @@ validated/published chain begins advancing.
 
 A hash-only anchor is refined only by a verified header for that same hash;
 later hash-only observations cannot discard its sequence. Installing it moves
-the coordinator to `tracking`. A published head may be ahead of or behind the
+NetworkOps to `tracking`. A published head may be ahead of or behind the
 installed LCL; proof that both lie on the same chain plus fresh current-open
 timing permits `full`. Subsequent accepted closes and publications advance the
 phase's LCL and published identities independently. The independent
@@ -101,7 +101,7 @@ non-promoting pass.
 
 Per-hash demand is coalesced while bounded schedulers, worker pools, read
 brokers, mailboxes, and outbound credits control execution. The number of
-coordinator session identities is not an operator-configured `node_size`
+actor identities is not an operator-configured `node_size`
 limit. `[node_size]` controls tree-cache capacity and age, maintenance cadence,
 the adjacent history-fetch window, and selected JobQueue defaults.
 An acquisition session can expire or be replaced without erasing its verified
@@ -111,9 +111,9 @@ these shared caches fill and can later level off or fall after age/size sweeps.
 
 ## Preferred-ledger changes
 
-The preferred hash can change while a node catches up. NetworkOps updates that
-moving policy and acquisition priority while the coordinator preserves the
-active recovery anchor. Older and newer sessions may finish independently;
+The preferred hash can change while a node catches up. NetworkOps owns that
+moving policy while hash-keyed actors preserve reusable acquisition work.
+Older and newer actors may finish independently;
 retained sessions keep their frontiers and cleaned-up sessions still contribute
 verified nodes through shared caches and storage. After the stable anchor is
 installed, NetworkOps reconciles the current preferred policy again. A header
@@ -129,7 +129,8 @@ recovery anchor.
 
 After the current chain is established, configured history can be filled in
 without blocking live validated-ledger advancement. `[ledger_history]` controls
-the desired history and `[node_db] online_delete` controls retained history.
+the desired history and `[node_db] online_delete` controls the two-generation
+NodeStore rotation interval and batched relational pruning boundary.
 During recovery, current-ledger work has priority over backfill.
 
 ## Monitoring
@@ -145,9 +146,8 @@ quaxar server-info
 ```
 
 Compare repeated samples of `ledger_closed`, the open-ledger index from
-`ledger_current`, the validated and published heads, the coordinator LCL and
-published identities at `result.info.coordinator.phase` in raw `fetch_info`
-(`info.coordinator.phase` in CLI output), session completion counters, and mode
+`ledger_current`, the validated and published heads, acquisition completion
+counters, worker pressure, and mode
 transitions. A single `full` or
 `proposing` result is not readiness proof. Memory use alone is not a correctness signal:
 it varies with `[node_size]`, cache occupancy, allocator behavior, history, and
@@ -168,9 +168,9 @@ journalctl -u quaxar.service -f
 quaxar log-level info
 ```
 
-For a typed coordinator comparison during a controlled diagnostic restart, set
-`QUAXAR_ACQUISITION_SHADOW=1` in the service environment. The shadow is
-read-only and bounded; remove the variable after collecting the comparison.
+The typed coordinator is the production acquisition lifecycle owner. Its
+optional shadow is read-only, and its wake-driven executor is separate from
+NetworkOps so SHAMap reconstruction cannot delay consensus.
 
 ## Diagnosing a stuck node
 
@@ -181,7 +181,7 @@ Check these in order:
 3. `quaxar fetch-info` shows acquisitions receiving nodes rather than being
    repeatedly recreated.
 4. `quaxar get-counts` shows SHAMap/NodeStore activity and bounded caches.
-5. Local closed, validated, published, and coordinator identities do not show
+5. Local closed, validated, published, and acquisition target identities do not show
    growing lag or remain static while other heads advance.
 6. Logs do not show recurring Full/Syncing transitions; inspect
    `last_recovery_lcl_decision` and session completion/cancellation counters.

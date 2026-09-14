@@ -1029,6 +1029,12 @@ pub fn apply_loan_broker_set<V: ApplyView>(
         Ok(None) => return Ter::TEC_NO_ENTRY,
         Err(_) => return Ter::TEF_BAD_LEDGER,
     };
+    if view.rules().enabled(&feature_id("LendingProtocolV1_1"))
+        && !sttx.is_field_present(sf("sfLoanBrokerID"))
+        && tx_vault_sle.get_field_u8(sf("sfVaultKind")) != 1
+    {
+        return Ter::TEC_NO_PERMISSION;
+    }
     if account != tx_vault_sle.get_account_id(sf("sfOwner")) {
         return Ter::TEC_NO_PERMISSION;
     }

@@ -114,6 +114,30 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         }
     }
 
+    // cleanup-3.4 deliberately lets an expired credential pass preclaim so
+    // its removal is retained when this transaction claims tecEXPIRED.
+    if let Some(domain_id) = domain_id
+        && view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_4_0"))
+    {
+        let domain = match view.read(protocol::permissioned_domain_keylet_from_id(domain_id)) {
+            Ok(Some(domain)) => domain,
+            Ok(None) => return Ter::TEC_NO_PERMISSION,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        if domain.get_account_id(sf("sfOwner")) != account {
+            let result =
+                match ledger::credential_helpers::verify_valid_domain(view, &account, domain_id) {
+                    Ok(result) => result,
+                    Err(_) => return Ter::TEF_BAD_LEDGER,
+                };
+            if result != Ter::TES_SUCCESS {
+                return result;
+            }
+        }
+    }
+
     // Get offer sequence (for the new offer's key)
     let offer_sequence = sttx.get_seq_value();
 
@@ -179,6 +203,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         Ok(tick_size) => tick_size,
         Err(_) => return Ter::TEF_BAD_LEDGER,
     };
+    let mut unrepresentable_rate = false;
     if tick_size < 16 {
         // reference: auto const rate = Quality{saTakerGets, saTakerPays}.round(uTickSize).rate();
         // Quality is stored as (exponent << 56) | mantissa = getRate(taker_gets, taker_pays)
@@ -189,32 +214,36 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         let rounded_quality = round_quality(quality, tick_size);
         // Convert rounded quality back to a rate STAmount for multiply/divide
         let rate_amount = quality_to_rate_amount(rounded_quality);
+        unrepresentable_rate =
+            view.rules().enabled(&protocol::feature_id("MPTokensV2")) && rate_amount.signum() == 0;
 
-        if is_sell && !matches!(taker_pays.asset(), Asset::MPTIssue(_)) {
-            // reference: saTakerPays = multiply(saTakerGets, rate, saTakerPays.asset())
-            taker_pays = match amount_or_exception(
-                taker_gets.try_multiply(&rate_amount, taker_pays.asset()),
-            ) {
-                Ok(amount) => amount,
-                Err(ter) => return ter,
-            };
-        } else if !is_sell && !matches!(taker_gets.asset(), Asset::MPTIssue(_)) {
-            // rippled invokes divide here; its zero-rate exception is mapped by
-            // doApply to tefEXCEPTION. Preserve that result without emitting a
-            // Rust unwind from the consensus strand.
-            if rate_amount.signum() == 0 {
-                return Ter::TEF_EXCEPTION;
+        if !unrepresentable_rate {
+            if is_sell && !matches!(taker_pays.asset(), Asset::MPTIssue(_)) {
+                // reference: saTakerPays = multiply(saTakerGets, rate, saTakerPays.asset())
+                taker_pays = match amount_or_exception(
+                    taker_gets.try_multiply(&rate_amount, taker_pays.asset()),
+                ) {
+                    Ok(amount) => amount,
+                    Err(ter) => return ter,
+                };
+            } else if !is_sell && !matches!(taker_gets.asset(), Asset::MPTIssue(_)) {
+                // rippled invokes divide here; its zero-rate exception is mapped by
+                // doApply to tefEXCEPTION. Preserve that result without emitting a
+                // Rust unwind from the consensus strand.
+                if rate_amount.signum() == 0 {
+                    return Ter::TEF_EXCEPTION;
+                }
+                // reference: saTakerGets = divide(saTakerPays, rate, saTakerGets.asset())
+                taker_gets = match amount_or_exception(
+                    taker_pays.try_divide(&rate_amount, taker_gets.asset()),
+                ) {
+                    Ok(amount) => amount,
+                    Err(ter) => return ter,
+                };
             }
-            // reference: saTakerGets = divide(saTakerPays, rate, saTakerGets.asset())
-            taker_gets = match amount_or_exception(
-                taker_pays.try_divide(&rate_amount, taker_gets.asset()),
-            ) {
-                Ok(amount) => amount,
-                Err(ter) => return ter,
-            };
-        }
-        if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
-            return Ter::TES_SUCCESS; // Rounded to zero
+            if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
+                return Ter::TES_SUCCESS; // Rounded to zero
+            }
         }
     }
 
@@ -446,6 +475,14 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             return Ter::TEC_KILLED;
         }
         return Ter::TES_SUCCESS;
+    }
+
+    if unrepresentable_rate {
+        return if crossed {
+            Ter::TES_SUCCESS
+        } else {
+            Ter::TEC_KILLED
+        };
     }
 
     // --- Reserve check before placing ---
@@ -869,6 +906,17 @@ fn crossing_account_funds<V: ledger::ApplyView>(
         }
         protocol::Asset::Issue(issue) if issue.issuer() == *account => Ok((amount.clone(), true)),
         protocol::Asset::Issue(issue) => {
+            if ledger::mptoken_helpers::can_transfer_lp_token(
+                view,
+                account,
+                account,
+                &issue.issuer(),
+            )
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?
+                != Ter::TES_SUCCESS
+            {
+                return Ok((amount.zeroed(), true));
+            }
             let issuer_key = protocol::account_keylet(Uint160::from_void(issue.issuer().data()));
             let issuer = view.read(issuer_key).map_err(|_| Ter::TEF_BAD_LEDGER)?;
             let line_key = protocol::line(*account, issue.issuer(), issue.currency);

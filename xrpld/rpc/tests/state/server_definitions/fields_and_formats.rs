@@ -490,6 +490,10 @@ fn server_definitions_common_tx_fields_present() {
             "EscrowCreate should have Destination"
         );
         assert!(names.contains(&"Amount"), "EscrowCreate should have Amount");
+        assert!(
+            names.contains(&"Bytecode") && names.contains(&"Data"),
+            "EscrowCreate should advertise the SmartEscrow fields"
+        );
     }
 }
 

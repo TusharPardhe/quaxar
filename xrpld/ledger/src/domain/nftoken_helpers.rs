@@ -236,10 +236,18 @@ pub fn token_offer_create_preflight(
     dest: Option<&AccountID>,
     expiration: Option<u32>,
     nft_flags: u16,
-    _rules: &Rules,
+    rules: &Rules,
     owner: Option<&AccountID>,
     tx_flags: u32,
 ) -> Ter {
+    if rules.enabled(&protocol::fix_cleanup_3_4_0())
+        && let Asset::Issue(issue) = amount.asset()
+        && protocol::is_xrp_currency(issue.currency)
+        && !issue.account.is_zero()
+    {
+        return Ter::TEM_BAD_CURRENCY;
+    }
+
     if amount.negative() {
         return Ter::TEM_BAD_AMOUNT;
     }

@@ -13,7 +13,7 @@ use basics::tagged_cache::CacheClock;
 use std::hash::BuildHasher;
 
 pub fn verify_proof_path(root_hash: Uint256, key: Uint256, path: &[Blob]) -> bool {
-    if path.is_empty() || path.len() > 65 {
+    if path.is_empty() || path.len() > crate::node_id::SHAMAP_LEAF_DEPTH + 1 {
         return false;
     }
 
@@ -29,12 +29,22 @@ pub fn verify_proof_path(root_hash: Uint256, key: Uint256, path: &[Blob]) -> boo
         }
 
         if node.is_inner() {
+            // A key has exactly 64 nibbles, so only a terminal leaf may occur
+            // at depth 64. Reject an all-inner forged path before branch
+            // selection could consume a nonexistent nibble.
+            if depth >= crate::node_id::SHAMAP_LEAF_DEPTH {
+                return false;
+            }
+
             let Ok(node_id) = SHAMapNodeId::create_id(depth, key) else {
                 return false;
             };
             hash = node.get_child_hash(select_branch(node_id, key));
         } else {
-            return depth + 1 == path.len();
+            // A matching hash chain only proves where this leaf was grafted;
+            // its key must also match the key the proof claims to establish.
+            return node.peek_item().is_some_and(|item| item.key() == key)
+                && depth + 1 == path.len();
         }
     }
 
@@ -54,6 +64,13 @@ pub fn has_leaf_node(
     }
 
     loop {
+        // A leaf-depth node cannot have child branches. Treat a malformed
+        // inner node there as a failed membership lookup rather than allowing
+        // child-ID construction to panic.
+        if node_id.get_depth() >= crate::node_id::SHAMAP_LEAF_DEPTH {
+            return false;
+        }
+
         let branch = select_branch(node_id, tag);
         if node.is_empty_branch(branch) {
             return false;
@@ -96,6 +113,13 @@ where
     }
 
     loop {
+        // A leaf-depth node cannot have child branches. Treat a malformed
+        // inner node there as a failed membership lookup rather than allowing
+        // child-ID construction to panic.
+        if node_id.get_depth() >= crate::node_id::SHAMAP_LEAF_DEPTH {
+            return Ok(false);
+        }
+
         let branch = select_branch(node_id, tag);
         if node.is_empty_branch(branch) {
             return Ok(false);
@@ -328,14 +352,15 @@ mod tests {
 
         assert!(verify_proof_path(
             *leaf.get_hash().as_uint256(),
-            sample_uint256(0xAA),
+            key,
             std::slice::from_ref(&leaf_wire)
         ));
         assert!(!verify_proof_path(
-            Uint256::zero(),
+            *leaf.get_hash().as_uint256(),
             sample_uint256(0xAA),
-            &[leaf_wire]
+            std::slice::from_ref(&leaf_wire)
         ));
+        assert!(!verify_proof_path(Uint256::zero(), key, &[leaf_wire]));
     }
 
     #[test]
@@ -373,6 +398,93 @@ mod tests {
             key,
             &[leaf_wire, wrong_root_wire]
         ));
+    }
+
+    #[test]
+    fn forged_terminal_leaf_for_a_different_key_is_rejected() {
+        let key = sample_uint256(0x11);
+        let other_key = sample_uint256(0xEE);
+        let leaf = SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(other_key, vec![7; 12]),
+            0,
+        );
+        let root = SHAMapTreeNode::new_inner(0);
+        let branch = crate::node_id::select_branch(SHAMapNodeId::default(), key);
+        root.set_child_hash(branch, leaf.get_hash());
+        root.update_hash();
+
+        let path = vec![
+            leaf.serialize_for_wire()
+                .expect("leaf wire serialization should succeed"),
+            root.serialize_for_wire()
+                .expect("root wire serialization should succeed"),
+        ];
+        assert!(!verify_proof_path(
+            *root.get_hash().as_uint256(),
+            key,
+            &path
+        ));
+    }
+
+    #[test]
+    fn legitimate_sixty_four_nibble_proof_path_is_accepted() {
+        let key = sample_uint256(0xAA);
+        let leaf = SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(key, vec![8; 12]),
+            0,
+        );
+        let mut path = vec![
+            leaf.serialize_for_wire()
+                .expect("leaf wire serialization should succeed"),
+        ];
+        let mut child_hash = leaf.get_hash();
+
+        // Build the 64 inner nodes from depth 63 back to the root. The
+        // resulting leaf-to-root proof has the valid maximum of 65 blobs.
+        for depth in (0..crate::node_id::SHAMAP_LEAF_DEPTH).rev() {
+            let node_id = SHAMapNodeId::create_id(depth, key).expect("depth should be valid");
+            let inner = SHAMapTreeNode::new_inner(0);
+            inner.set_child_hash(crate::node_id::select_branch(node_id, key), child_hash);
+            inner.update_hash();
+            path.push(
+                inner
+                    .serialize_for_wire()
+                    .expect("inner wire serialization should succeed"),
+            );
+            child_hash = inner.get_hash();
+        }
+
+        assert_eq!(path.len(), crate::node_id::SHAMAP_LEAF_DEPTH + 1);
+        assert!(verify_proof_path(*child_hash.as_uint256(), key, &path));
+    }
+
+    #[test]
+    fn all_inner_proof_path_at_leaf_depth_is_rejected_without_panicking() {
+        let key = sample_uint256(0xAA);
+        let mut path = Vec::with_capacity(crate::node_id::SHAMAP_LEAF_DEPTH + 1);
+        let mut child_hash = sample_hash(0x01);
+
+        // This hash-chains all the way to a 65th inner node. It is malformed:
+        // depth 64 is terminal and must be a leaf, never another inner node.
+        for depth in (0..=crate::node_id::SHAMAP_LEAF_DEPTH).rev() {
+            let node_id =
+                SHAMapNodeId::create_id(depth.min(crate::node_id::SHAMAP_LEAF_DEPTH), key)
+                    .expect("depth should be valid");
+            let inner = SHAMapTreeNode::new_inner(0);
+            inner.set_child_hash(crate::node_id::select_branch(node_id, key), child_hash);
+            inner.update_hash();
+            path.push(
+                inner
+                    .serialize_for_wire()
+                    .expect("inner wire serialization should succeed"),
+            );
+            child_hash = inner.get_hash();
+        }
+
+        assert_eq!(path.len(), crate::node_id::SHAMAP_LEAF_DEPTH + 1);
+        assert!(!verify_proof_path(*child_hash.as_uint256(), key, &path));
     }
 
     #[test]

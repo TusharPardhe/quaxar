@@ -324,6 +324,16 @@ fn add_empty_iou_holding<V: ApplyView>(
         Ok(None) => return protocol::Ter::TEF_INTERNAL,
         Err(_) => return protocol::Ter::TEF_BAD_LEDGER,
     };
+    let fix_cleanup_3_4_0 = view.rules().enabled(&feature_id("fixCleanup3_4_0"));
+    // Post-fixCleanup3_4_0 an existing trust line is a no-op.  Its issuer's
+    // current freeze and DefaultRipple settings only govern the create path.
+    if fix_cleanup_3_4_0 {
+        match view.read(line_keylet) {
+            Ok(Some(_)) => return protocol::Ter::TEC_DUPLICATE,
+            Ok(None) => {}
+            Err(_) => return protocol::Ter::TEF_BAD_LEDGER,
+        }
+    }
     let sponsor = match effective_tx_reserve_sponsor(view, tx, &dst_sle) {
         Ok(sponsor) => sponsor,
         Err(ter) => return ter,
@@ -332,12 +342,18 @@ fn add_empty_iou_holding<V: ApplyView>(
         return protocol::Ter::TEC_FROZEN;
     }
     if src_sle.get_field_u32(sf("sfFlags")) & lsfDefaultRipple == 0 {
-        return protocol::Ter::TEC_INTERNAL;
+        return if fix_cleanup_3_4_0 {
+            protocol::Ter::TER_NO_RIPPLE
+        } else {
+            protocol::Ter::TEC_INTERNAL
+        };
     }
-    match view.read(line_keylet) {
-        Ok(Some(_)) => return protocol::Ter::TEC_DUPLICATE,
-        Ok(None) => {}
-        Err(_) => return protocol::Ter::TEF_BAD_LEDGER,
+    if !fix_cleanup_3_4_0 {
+        match view.read(line_keylet) {
+            Ok(Some(_)) => return protocol::Ter::TEC_DUPLICATE,
+            Ok(None) => {}
+            Err(_) => return protocol::Ter::TEF_BAD_LEDGER,
+        }
     }
 
     if let Err(ter) = check_holding_reserve(
@@ -1212,5 +1228,68 @@ mod tests {
             sponsor_root.get_field_u32(get_field_by_symbol("sfSponsoringOwnerCount")),
             0
         );
+    }
+
+    #[test]
+    fn existing_iou_holding_is_a_cleanup_3_4_noop_before_freeze_and_default_ripple() {
+        let issuer_raw = sample_account(0x91);
+        let holder_raw = sample_account(0x82);
+        let issuer = to_account_id(issuer_raw);
+        let holder = to_account_id(holder_raw);
+        let currency = currency_from_string("USD");
+        let issue = Issue::new(currency, issuer);
+        let tx = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), holder);
+        });
+
+        for (issuer_flags, pre_fix, post_fix, label) in [
+            (
+                0,
+                Ter::TEC_INTERNAL,
+                Ter::TEC_DUPLICATE,
+                "DefaultRipple cleared",
+            ),
+            (
+                protocol::lsfGlobalFreeze,
+                Ter::TEC_FROZEN,
+                Ter::TEC_DUPLICATE,
+                "globally frozen issuer",
+            ),
+        ] {
+            for (cleanup_3_4, expected) in [(false, pre_fix), (true, post_fix)] {
+                let mut ledger = build_ledger(
+                    &[
+                        (
+                            account_keylet(issuer_raw).key,
+                            account_root_entry_with_flags(issuer_raw, 10_000_000, 0, issuer_flags),
+                        ),
+                        (
+                            account_keylet(holder_raw).key,
+                            account_root_entry(holder_raw, 10_000_000, 0),
+                        ),
+                        (
+                            line(holder, issuer, currency).key,
+                            trustline_entry(holder_raw, issuer_raw, currency, 0),
+                        ),
+                    ],
+                    Fees::default(),
+                );
+                if cleanup_3_4 {
+                    ledger.set_rules(protocol::Rules::new([feature_id("fixCleanup3_4_0")]));
+                }
+                let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+                assert_eq!(
+                    add_empty_holding_with_tx(
+                        &mut view,
+                        &tx,
+                        &holder,
+                        XRPAmount::from_drops(10_000_000),
+                        &protocol::Asset::Issue(issue),
+                    ),
+                    expected,
+                    "{label}; cleanup340={cleanup_3_4}",
+                );
+            }
+        }
     }
 }

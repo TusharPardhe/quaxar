@@ -315,13 +315,16 @@ fn preclaim_mpt_authorize<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
     let holder = tx
         .is_field_present(sf("sfHolder"))
         .then(|| tx.get_account_id(sf("sfHolder")));
+    // Read once up front, matching rippled's preclaim. This deliberately makes
+    // a storage failure hard even for an otherwise-clean orphan unauthorize.
+    let issuance = mpt_issuance(view, issuance_id)?;
 
     if let Some(holder) = holder {
         let holder_sle = account(view, holder)?;
         let Some(holder_sle) = holder_sle else {
             return Ok(Ter::TEC_NO_DST);
         };
-        let Some(issuance) = mpt_issuance(view, issuance_id)? else {
+        let Some(issuance) = issuance else {
             return Ok(Ter::TEC_OBJECT_NOT_FOUND);
         };
         if issuance.get_account_id(sf("sfIssuer")) != account_id {
@@ -341,8 +344,8 @@ fn preclaim_mpt_authorize<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
         });
     }
 
-    // rippled reads the holding first. In the unauthorize success case it
-    // deliberately does not read the issuance, including when it was deleted.
+    // rippled reads the holding first after the shared upfront issuance lookup.
+    // A zero-balance orphan may still be deleted when the amendment permits it.
     let token = mptoken(view, issuance_id, account_id)?;
     let unauthorize = (tx.get_flags() & tfMPTUnauthorize) != 0;
     if unauthorize {
@@ -356,7 +359,6 @@ fn preclaim_mpt_authorize<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
             0
         };
         if balance != 0 || locked != 0 {
-            let issuance = mpt_issuance(view, issuance_id)?;
             return Ok(run_mp_token_authorize_preclaim(
                 MPTokenAuthorizePreclaimFacts {
                     holder_present: false,
@@ -366,6 +368,7 @@ fn preclaim_mpt_authorize<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
                     token_locked_amount_is_zero: locked == 0,
                     issuance_exists: issuance.is_some(),
                     single_asset_vault_enabled: view.rules().enabled(&feature_single_asset_vault()),
+                    fix_cleanup_3_4_0_enabled: view.rules().enabled(&protocol::fix_cleanup_3_4_0()),
                     token_locked: token.is_flag(lsfMPTLocked),
                     confidential_transfer_enabled: false,
                     confidential_outstanding_nonzero: false,
@@ -378,15 +381,23 @@ fn preclaim_mpt_authorize<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
                 },
             ));
         }
-        if view.rules().enabled(&feature_single_asset_vault()) && token.is_flag(lsfMPTLocked) {
-            return Ok(Ter::TEC_NO_PERMISSION);
+        let cleanup_3_4 = view.rules().enabled(&protocol::fix_cleanup_3_4_0());
+        if (view.rules().enabled(&feature_single_asset_vault()) || cleanup_3_4)
+            && token.is_flag(lsfMPTLocked)
+        {
+            // Before fixCleanup3_4_0 SingleAssetVault rejects any locked
+            // dangling token.  The fix preserves that legacy branch while
+            // allowing cleanup of a locked orphan after its issuance was
+            // destroyed.
+            if !cleanup_3_4 || issuance.is_some() {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            }
         }
         if view
             .rules()
             .enabled(&protocol::feature_confidential_transfer())
         {
-            let issuance = mpt_issuance(view, issuance_id)?;
-            if issuance.is_some_and(|issuance| {
+            if issuance.as_ref().is_some_and(|issuance| {
                 issuance.is_field_present(sf("sfConfidentialOutstandingAmount"))
                     && issuance.get_field_u64(sf("sfConfidentialOutstandingAmount")) != 0
                     && (token.is_field_present(sf("sfConfidentialBalanceInbox"))
@@ -398,7 +409,6 @@ fn preclaim_mpt_authorize<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
         return Ok(Ter::TES_SUCCESS);
     }
 
-    let issuance = mpt_issuance(view, issuance_id)?;
     Ok(run_mp_token_authorize_preclaim(
         MPTokenAuthorizePreclaimFacts {
             holder_present: false,
@@ -408,6 +418,7 @@ fn preclaim_mpt_authorize<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
             token_locked_amount_is_zero: true,
             issuance_exists: issuance.is_some(),
             single_asset_vault_enabled: view.rules().enabled(&feature_single_asset_vault()),
+            fix_cleanup_3_4_0_enabled: view.rules().enabled(&protocol::fix_cleanup_3_4_0()),
             token_locked: false,
             confidential_transfer_enabled: false,
             confidential_outstanding_nonzero: false,
@@ -1090,6 +1101,7 @@ mod tests {
         };
         view.entries.insert(token_keylet.key, Arc::new(token));
         view.fail_reads.insert(issuance_keylet.key);
+
         let tx = STTx::new(TxType::MPTOKEN_AUTHORIZE, |tx| {
             tx.set_account_id(sf("sfAccount"), holder);
             tx.set_field_h192(sf("sfMPTokenIssuanceID"), issuance_id);
@@ -1099,6 +1111,88 @@ mod tests {
         assert_eq!(
             run_token_read_view_preclaim(&view, &tx, TxType::MPTOKEN_AUTHORIZE),
             Some(Ter::TEF_BAD_LEDGER)
+        );
+    }
+    #[test]
+    fn locked_mptoken_unauthorize_tracks_sav_and_fix_cleanup_3_4_0() {
+        let issuance_id = basics::base_uint::Uint192::from_u64(10);
+        let holder = account(4);
+        let issuance_keylet = protocol::mpt_issuance_keylet_from_mptid(issuance_id);
+        let token_keylet =
+            protocol::mptoken_keylet_from_mptid(issuance_id, Uint160::from_void(holder.data()));
+        let unauthorize = STTx::new(TxType::MPTOKEN_AUTHORIZE, |tx| {
+            tx.set_account_id(sf("sfAccount"), holder);
+            tx.set_field_h192(sf("sfMPTokenIssuanceID"), issuance_id);
+            tx.set_field_u32(sf("sfFlags"), protocol::tfMPTUnauthorize);
+        });
+        let make_view = |features: &[basics::base_uint::Uint256], issuance_exists: bool| {
+            let mut view = View {
+                rules: Rules::new(features.iter().copied()),
+                ..View::default()
+            };
+            let mut token =
+                STLedgerEntry::from_type_and_key(LedgerEntryType::MPToken, token_keylet.key);
+            token.set_account_id(sf("sfAccount"), holder);
+            token.set_field_h192(sf("sfMPTokenIssuanceID"), issuance_id);
+            token.set_field_u64(sf("sfMPTAmount"), 0);
+            token.set_field_u32(sf("sfFlags"), protocol::lsfMPTLocked);
+            view.entries.insert(token_keylet.key, Arc::new(token));
+            if issuance_exists {
+                let mut issuance = STLedgerEntry::from_type_and_key(
+                    LedgerEntryType::MPTokenIssuance,
+                    issuance_keylet.key,
+                );
+                issuance.set_account_id(sf("sfIssuer"), account(5));
+                view.entries.insert(issuance_keylet.key, Arc::new(issuance));
+            }
+            view
+        };
+
+        for (features, issuance_exists, expected, label) in [
+            (&[][..], true, Ter::TES_SUCCESS, "legacy without SAV"),
+            (
+                &[protocol::feature_single_asset_vault()][..],
+                true,
+                Ter::TEC_NO_PERMISSION,
+                "SAV locked issuance",
+            ),
+            (
+                &[protocol::feature_single_asset_vault()][..],
+                false,
+                Ter::TEC_NO_PERMISSION,
+                "SAV locked orphan remains legacy-blocked",
+            ),
+            (
+                &[protocol::fix_cleanup_3_4_0()][..],
+                true,
+                Ter::TEC_NO_PERMISSION,
+                "cleanup340 locked issuance",
+            ),
+            (
+                &[protocol::fix_cleanup_3_4_0()][..],
+                false,
+                Ter::TES_SUCCESS,
+                "cleanup340 permits locked orphan cleanup",
+            ),
+        ] {
+            let view = make_view(features, issuance_exists);
+            assert_eq!(
+                run_token_read_view_preclaim(&view, &unauthorize, TxType::MPTOKEN_AUTHORIZE),
+                Some(expected),
+                "{label}"
+            );
+        }
+
+        let mut failed_issuance_read = make_view(&[], false);
+        failed_issuance_read.fail_reads.insert(issuance_keylet.key);
+        assert_eq!(
+            run_token_read_view_preclaim(
+                &failed_issuance_read,
+                &unauthorize,
+                TxType::MPTOKEN_AUTHORIZE,
+            ),
+            Some(Ter::TEF_BAD_LEDGER),
+            "the shared upfront issuance lookup must not be skipped for an orphan"
         );
     }
 }

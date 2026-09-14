@@ -55,7 +55,7 @@ pub use message::{
 };
 pub use overlay::{Handoff, Overlay, OverlayStats, Promote, Setup};
 pub use overlay_impl::{
-    OverlayAcceptor, OverlayError, OverlayHandoff, OverlayImpl, PeerReservation,
+    ManifestAdmission, OverlayAcceptor, OverlayError, OverlayHandoff, OverlayImpl, PeerReservation,
     PeerReservationSource, PeerReservationTable,
 };
 pub use peer::{Peer, PeerId, ProtocolFeature};

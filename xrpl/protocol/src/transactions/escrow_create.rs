@@ -85,6 +85,34 @@ impl EscrowCreate {
             .as_sttx()
             .is_field_present(crate::get_field_by_symbol("sfDestinationTag"))
     }
+
+    pub fn get_bytecode(&self) -> Option<Vec<u8>> {
+        self.has_bytecode().then(|| {
+            self.base
+                .as_sttx()
+                .get_field_vl(crate::get_field_by_symbol("sfBytecode"))
+        })
+    }
+
+    pub fn has_bytecode(&self) -> bool {
+        self.base
+            .as_sttx()
+            .is_field_present(crate::get_field_by_symbol("sfBytecode"))
+    }
+
+    pub fn get_data(&self) -> Option<Vec<u8>> {
+        self.has_data().then(|| {
+            self.base
+                .as_sttx()
+                .get_field_vl(crate::get_field_by_symbol("sfData"))
+        })
+    }
+
+    pub fn has_data(&self) -> bool {
+        self.base
+            .as_sttx()
+            .is_field_present(crate::get_field_by_symbol("sfData"))
+    }
 }
 
 impl Deref for EscrowCreate {
@@ -238,6 +266,20 @@ impl EscrowCreateBuilder {
         self.base
             .object_mut()
             .set_field_u32(crate::get_field_by_symbol("sfDestinationTag"), value);
+        self
+    }
+
+    pub fn set_bytecode(mut self, value: impl AsRef<[u8]>) -> Self {
+        self.base
+            .object_mut()
+            .set_field_vl(crate::get_field_by_symbol("sfBytecode"), value.as_ref());
+        self
+    }
+
+    pub fn set_data(mut self, value: impl AsRef<[u8]>) -> Self {
+        self.base
+            .object_mut()
+            .set_field_vl(crate::get_field_by_symbol("sfData"), value.as_ref());
         self
     }
 
