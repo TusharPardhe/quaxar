@@ -205,6 +205,32 @@ fn preferred_lcl_matches_local_or_parent(
     preferred_hash == local_hash || preferred_hash == parent_hash
 }
 
+/// Select a quorum-backed sibling of an observer's freshly built child.
+/// Validators retain rippled's normal `consensusBuilt` behavior; this guard
+/// only prevents a non-validating observer from installing a local child after
+/// the network has already validated a different hash at the same sequence.
+fn observer_quorum_alternate_candidate(
+    built_hash: Uint256,
+    built_seq: u32,
+    needed: usize,
+    candidates: impl IntoIterator<Item = (Uint256, (usize, u32))>,
+) -> Option<(Uint256, usize)> {
+    if needed == 0 {
+        return None;
+    }
+    candidates
+        .into_iter()
+        .filter(|(hash, (count, seq))| *hash != built_hash && *seq == built_seq && *count >= needed)
+        .max_by(
+            |(left_hash, (left_count, _)), (right_hash, (right_count, _))| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| left_hash.cmp(right_hash))
+            },
+        )
+        .map(|(hash, (count, _))| (hash, count))
+}
+
 fn full_sync_debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -6065,6 +6091,56 @@ impl ApplicationRoot {
 
         // `record_consensus_built_ledger` above is the sole owner of
         // LedgerHistory's built-ledger bookkeeping and its checkAccept scan.
+    }
+
+    /// If current trusted validations already have quorum for a different
+    /// sibling at `built_seq`, start canonical acceptance and veto installation
+    /// of the observer's local child. This closes the live race where
+    /// `consensusBuilt` discovered the alternate but `doAccept` installed the
+    /// local sibling immediately afterward.
+    pub(crate) fn observer_quorum_alternate_same_seq(
+        &self,
+        built_hash: Uint256,
+        built_seq: u32,
+    ) -> Option<(Uint256, usize)> {
+        let needed = self.needed_validations();
+        let current_trusted = {
+            let validations_guard = self
+                .validations()
+                .validations()
+                .lock()
+                .expect("validations mutex must not be poisoned");
+            validations_guard.current_trusted()
+        };
+        let current_trusted = self.validators().negative_unl_filter_validations(
+            current_trusted
+                .into_iter()
+                .map(|validation| (*validation).clone())
+                .collect(),
+        );
+        let mut candidates = consensus_built_current_validation_counts(
+            current_trusted.into_iter().map(|validation| {
+                (
+                    validation.get_ledger_hash(),
+                    validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence")),
+                )
+            }),
+        );
+        if let Some(lm_rt) = self.ledger_master_runtime() {
+            for (hash, (_, seq)) in &mut candidates {
+                if *seq == 0 {
+                    *seq = lm_rt
+                        .ledger_master()
+                        .get_ledger_by_hash(SHAMapHash::new(*hash))
+                        .map(|ledger| ledger.header().seq)
+                        .unwrap_or_default();
+                }
+            }
+        }
+        let alternate =
+            observer_quorum_alternate_candidate(built_hash, built_seq, needed, candidates)?;
+        self.check_accept_hash_seq(alternate.0, built_seq);
+        Some(alternate)
     }
 
     /// Matches rippled's `LedgerMaster::consensusBuilt` validation scan.

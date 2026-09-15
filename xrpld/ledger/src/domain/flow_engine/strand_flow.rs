@@ -168,6 +168,29 @@ pub fn execute_strands<V: ApplyView>(
                 (remaining_out.clone(), false)
             };
 
+            // rippled StrandFlow repeats theoretical-quality pruning directly
+            // before executing every OfferCreate strand, including the only
+            // active strand. ActiveStrands skips estimation when there is only
+            // one candidate because no sorting is needed, but this second gate
+            // is still consensus significant: it prevents OfferStream from
+            // discovering and permanently removing expired/unfunded offers in
+            // a book whose best directory is already below the taker's limit.
+            if offer_crossing != OfferCrossing::No
+                && let Some(limit) = quality_threshold
+            {
+                match strand_quality_upper_bound(&mut aggregate, strand, &ordering_context) {
+                    Ok(Some(quality)) if quality >= limit => {}
+                    Ok(_) => continue,
+                    Err(_) => {
+                        return FlowResult {
+                            ter: Ter::TEF_BAD_LEDGER,
+                            actual_in: total_in.zeroed(),
+                            actual_out: total_out.zeroed(),
+                        };
+                    }
+                }
+            }
+
             // Every candidate, including a dry probe, owns a child sandbox.
             // No mutation reaches `view` unless this candidate produced a
             // valid amount and was selected below.

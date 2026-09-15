@@ -173,9 +173,12 @@ fn check_offer<V: ReadView>(
     if id.is_zero() {
         return Err(Ter::TEC_OBJECT_NOT_FOUND);
     }
-    let Some(offer) = read(view, protocol::nft_offer_keylet(id))? else {
+    let Some(offer) = read(view, protocol::unchecked_keylet(id))? else {
         return Err(Ter::TEC_OBJECT_NOT_FOUND);
     };
+    if offer.get_type() != protocol::LedgerEntryType::NFTokenOffer {
+        return Err(Ter::TEC_OBJECT_NOT_FOUND);
+    }
     if expired(view, &offer) && !view.rules().enabled(&protocol::fix_cleanup_3_1_3()) {
         return Err(Ter::TEC_EXPIRED);
     }
@@ -680,6 +683,24 @@ mod tests {
             Some(Ter::TEC_OBJECT_NOT_FOUND)
         );
         assert!(view.entries.is_empty());
+    }
+
+    #[test]
+    fn accept_offer_rejects_non_offer_entry_at_supplied_key() {
+        let submitter = account(1);
+        let root = account_root(submitter, 1_000_000_000);
+        let colliding_id = *root.key();
+        let mut view = View::default();
+        view.entries.insert(colliding_id, root);
+        let tx = STTx::new(TxType::NFTOKEN_ACCEPT_OFFER, |tx| {
+            tx.set_account_id(sf("sfAccount"), submitter);
+            tx.set_field_h256(sf("sfNFTokenBuyOffer"), colliding_id);
+        });
+
+        assert_eq!(
+            run_nftoken_read_view_preclaim(&view, &tx, TxType::NFTOKEN_ACCEPT_OFFER),
+            Some(Ter::TEC_OBJECT_NOT_FOUND)
+        );
     }
 
     #[test]

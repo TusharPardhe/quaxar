@@ -8,8 +8,8 @@ use super::{
     apply_submit_transactor_shell_with_preclaim_and_delivered_amount, batch_base_fee,
     calculate_default_sttx_base_fee, calculate_sttx_base_fee, canonical_sttx_consequences,
     consensus_status_event, loan_set_counterparty_preflight_ter,
-    preferred_lcl_matches_local_or_parent, queue_apply_preclaim_ter,
-    record_applied_open_transactions, transaction_preflight_ter,
+    observer_quorum_alternate_candidate, preferred_lcl_matches_local_or_parent,
+    queue_apply_preclaim_ter, record_applied_open_transactions, transaction_preflight_ter,
     transaction_preflight_ter_with_flags, transaction_preflight_ter_with_network_id,
     typed_preclaim_route, typed_preclaim_ter,
 };
@@ -3234,6 +3234,33 @@ fn validation_resolver_miss_tracks_only_early_quorum_backed_observations() {
 fn consensus_built_alternate_scan_requires_strictly_more_than_needed_validations() {
     assert!(!super::consensus_built_alternate_threshold_met(3, 3));
     assert!(super::consensus_built_alternate_threshold_met(4, 3));
+}
+
+#[test]
+fn observer_veto_selects_only_quorum_backed_same_sequence_sibling() {
+    let built = Uint256::from_u64(80);
+    let sibling = Uint256::from_u64(81);
+    let later = Uint256::from_u64(82);
+
+    assert_eq!(
+        observer_quorum_alternate_candidate(
+            built,
+            900,
+            3,
+            [(built, (6, 900)), (sibling, (3, 900)), (later, (6, 901)),],
+        ),
+        Some((sibling, 3)),
+        "checkAccept quorum equality must veto an observer sibling"
+    );
+    assert_eq!(
+        observer_quorum_alternate_candidate(built, 900, 3, [(sibling, (2, 900))]),
+        None
+    );
+    assert_eq!(
+        observer_quorum_alternate_candidate(built, 900, 0, [(sibling, (6, 900))]),
+        None,
+        "standalone mode never uses the network sibling veto"
+    );
 }
 
 #[test]

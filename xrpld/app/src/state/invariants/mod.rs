@@ -1288,8 +1288,8 @@ mod tests {
     };
     use super::vault::{
         VaultAssetDelta, VaultSnapshot, VaultState, add_vault_asset_delta, agrees_within_one_unit,
-        compute_vault_min_scale, less_or_equal_plus_one_unit, rounded_vault_delta,
-        valid_vault_loss_unrealized, vault_transaction_account_asset_delta,
+        compute_vault_min_scale, less_or_equal_plus_one_unit, record_vault_asset_delta,
+        rounded_vault_delta, valid_vault_loss_unrealized, vault_transaction_account_asset_delta,
     };
     use super::{
         check_invariants_for_tx_with_expected_xrp_delta, mpt_transfer_validation_result,
@@ -1339,6 +1339,34 @@ mod tests {
             assets_available: RuntimeNumber::from_i64(1),
             loss_unrealized: RuntimeNumber::zero(),
         }
+    }
+
+    #[test]
+    fn vault_invariant_records_max_mpt_balance_without_panicking() {
+        let holder = account(0xA3);
+        let issuer = account(0xA4);
+        let mpt_id = protocol::make_mpt_id(1, issuer);
+        let asset = Asset::MPTIssue(protocol::MPTIssue::new(mpt_id));
+        let mut token = STLedgerEntry::from_type_and_key(
+            protocol::LedgerEntryType::MPToken,
+            Uint256::from_u64(0x4D50_54),
+        );
+        token.set_account_id(get_field_by_symbol("sfAccount"), holder);
+        token.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), mpt_id);
+        token.set_field_u64(get_field_by_symbol("sfMPTAmount"), i64::MAX as u64);
+
+        let mut state = VaultState::default();
+        record_vault_asset_delta(&mut state, &token, false);
+        let delta = vault_transaction_account_asset_delta(
+            &state,
+            holder,
+            asset,
+            false,
+            protocol::XRPAmount::from_drops(0),
+        )
+        .expect("the maximum MPT balance produces a nonzero invariant delta");
+
+        assert_eq!(delta.delta, RuntimeNumber::from_i64(i64::MAX));
     }
 
     #[test]

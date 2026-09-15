@@ -19,11 +19,11 @@ use basics::{
     str_hex::str_hex,
     string_utilities::str_unhex,
 };
-use ledger::{ApplyView, ReadView, Sandbox};
+use ledger::{ApplyView, RawView, ReadView, Sandbox};
 use protocol::{
-    AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, Rules, STAmount,
-    STLedgerEntry, STTx, SerialIter, Serializer, StBase, Ter, TxType, XRPAmount, account_keylet,
-    get_field_by_symbol, sf_generic,
+    AccountID, ApplyFlags, Currency, IOUAmount, Issue, KeyType, LedgerEntryType, Rules, STAmount,
+    STLedgerEntry, STTx, SecretKey, SerialIter, Serializer, StBase, Ter, TxType, XRPAmount,
+    account_keylet, calc_account_id, derive_public_key, get_field_by_symbol, sf_generic,
 };
 
 use super::fixtures::*;
@@ -1976,5 +1976,286 @@ fn testnet_20660471_passive_sell_cross_matches_canonical_metadata() {
         child["transaction_hash"]
             .as_str()
             .expect("canonical child transaction root")
+    );
+}
+
+/// Bounded behavioral replay of Testnet ledger 20,756,420 transaction
+/// BBDA6063A666F703F7C51DECB2CD15B469BD03042B5A6825460EBF6F1C1F8059.
+/// It uses the exact signed transaction, accounts, offer keys, quality
+/// directories, amounts, and canonical metadata. Six isolated AccountSet
+/// transactions precede BBDA so production ledger building assigns its
+/// historical transaction index 6; their accounts are otherwise unrelated to
+/// the bounded OfferCreate state.
+#[test]
+fn expired_offers_beyond_crossing_quality_remain_untouched() {
+    const TX_HEX: &str = "120007228000000024013CB78E6440000000000186A065D4438D7EA4C680000000000000000000000000005553440000000000A0028D8A1117342B2CB308B88894FF06461A9E8668400000000000000A7321027CD362D25AB0BC103CC20903B25CCE8DA7CB6C31382DC349BD5BC12354106BA874473045022100B777A06AACBD70098613F1AD8B9A50B71D3132B1D6BBB59AF36208610271CBD0022000F9C92F2F7138BF737F21104EF94A2F09063878AA98C1390545A08A94F696F7811403F882A04434E33E20BDF4D60F4750A35DE35D40";
+    const META_HEX: &str = "201C00000006F8E511006125013CB7B955AE4A7528C2281EC3B6D0E6D3A711B9797E2ACB3733BE15DE11DADFF1E798120F564759BE74AAB703CB80E04B8F74AFC7F53D7B1CFBA82E9E32CA599503B53AD961E624013CB78E2D000000016240000000004BD64CE1E7220000000024013CB78F2D000000026240000000004BD642811403F882A04434E33E20BDF4D60F4750A35DE35D40E1E1E511006425013CB7B955AE4A7528C2281EC3B6D0E6D3A711B9797E2ACB3733BE15DE11DADFF1E798120F567009358B82D2789E7EAACC0B048FAA0A1E410908DA575651ED16FD51400DC71FE72200000000587009358B82D2789E7EAACC0B048FAA0A1E410908DA575651ED16FD51400DC71F821403F882A04434E33E20BDF4D60F4750A35DE35D40E1E1E311006F568F5556CA5B42DEEAB8F19614ECB2203EABD3BCA665AAABC2235184157CDC18DCE824013CB78E5010A815A71607FA3B896286108370F9D615682A3BF6B6FF7D455B038D7EA4C680006440000000000186A065D4438D7EA4C680000000000000000000000000005553440000000000A0028D8A1117342B2CB308B88894FF06461A9E86811403F882A04434E33E20BDF4D60F4750A35DE35D40E1E1E511006425013CB322552468648F2D0685722CB379849781E69C3BC5F3C4A486FCFEEBAB627F79A5327356A815A71607FA3B896286108370F9D615682A3BF6B6FF7D455B038D7EA4C68000E72200000000365B038D7EA4C6800058A815A71607FA3B896286108370F9D615682A3BF6B6FF7D455B038D7EA4C680000111000000000000000000000000000000000000000002110000000000000000000000000000000000000000031100000000000000000000000055534400000000000411A0028D8A1117342B2CB308B88894FF06461A9E86E1E1F1031000";
+
+    let tx_bytes = str_unhex(TX_HEX).expect("historical transaction hex");
+    let incoming = STTx::from_serial_iter(&mut SerialIter::new(&tx_bytes));
+    assert_eq!(
+        incoming.get_transaction_id().to_string(),
+        "BBDA6063A666F703F7C51DECB2CD15B469BD03042B5A6825460EBF6F1C1F8059"
+    );
+
+    let maker_a = protocol::parse_base58_account_id("rDrTj5KwtCAzcvyGSk6qdQb1CLuCHcwNEc")
+        .expect("historical maker A");
+    let maker_b = protocol::parse_base58_account_id("rLATAtzSZ58qya41jLiBHR3GwEP2NjWGbV")
+        .expect("historical maker B");
+    let taker = protocol::parse_base58_account_id("rMzj4W8QjWZnD5J4NDgkAyuhxEqHidUE3")
+        .expect("historical taker");
+    let issuer = protocol::parse_base58_account_id("rEbhBnacVTvoDmpswgD2TzVQo4s6XkTCmq")
+        .expect("historical USD issuer");
+    assert_eq!(incoming.get_account_id(sf("sfAccount")), taker);
+
+    let usd = usd_currency();
+    let usd_amount = |mantissa, exponent| {
+        STAmount::from_iou_amount(
+            sf_generic(),
+            IOUAmount::from_parts(mantissa, exponent).expect("canonical IOU amount"),
+            Issue::new(usd, issuer),
+        )
+    };
+
+    let previous_taker_tx =
+        Uint256::from_hex("AE4A7528C2281EC3B6D0E6D3A711B9797E2ACB3733BE15DE11DADFF1E798120F")
+            .expect("historical taker previous transaction");
+    let mut maker_a_root = account_root(maker_a, 4_999_980, 1, 0);
+    maker_a_root.set_field_u32(sf("sfSequence"), 20_393_381);
+    let mut maker_b_root = account_root(maker_b, 4_999_980, 1, 0);
+    maker_b_root.set_field_u32(sf("sfSequence"), 20_393_461);
+    let mut taker_root = account_root(taker, 4_970_060, 1, 0);
+    taker_root.set_field_u32(sf("sfSequence"), 20_756_366);
+    taker_root.set_field_h256(sf("sfPreviousTxnID"), previous_taker_tx);
+    taker_root.set_field_u32(sf("sfPreviousTxnLgrSeq"), 20_756_409);
+
+    let trust_line = trust_line(taker, issuer, usd, 1, 10_000, 0);
+    let owner_dir_keylet = protocol::owner_dir_keylet(acct_id(taker));
+    let mut owner_dir = STLedgerEntry::new(owner_dir_keylet.clone());
+    owner_dir.set_field_h256(sf("sfRootIndex"), owner_dir_keylet.key);
+    owner_dir.set_account_id(sf("sfOwner"), taker);
+    owner_dir.set_field_u32(sf("sfFlags"), 0);
+    owner_dir.set_field_v256(
+        sf("sfIndexes"),
+        protocol::STVector256::from_values(sf("sfIndexes"), vec![*trust_line.key()]),
+    );
+    owner_dir.set_field_h256(sf("sfPreviousTxnID"), previous_taker_tx);
+    owner_dir.set_field_u32(sf("sfPreviousTxnLgrSeq"), 20_756_409);
+
+    let placement_dir_index =
+        Uint256::from_hex("A815A71607FA3B896286108370F9D615682A3BF6B6FF7D455B038D7EA4C68000")
+            .expect("historical placement directory");
+    let placement_dir_keylet =
+        protocol::Keylet::new(LedgerEntryType::DirectoryNode, placement_dir_index);
+    let mut placement_dir = STLedgerEntry::new(placement_dir_keylet);
+    placement_dir.set_field_h256(sf("sfRootIndex"), placement_dir_index);
+    placement_dir.set_field_u32(sf("sfFlags"), 0);
+    placement_dir.set_field_u64(sf("sfExchangeRate"), 0x5B03_8D7E_A4C6_8000);
+    placement_dir.set_field_h160(sf("sfTakerGetsCurrency"), Uint160::from_void(usd.data()));
+    placement_dir.set_field_h160(sf("sfTakerGetsIssuer"), Uint160::from_void(issuer.data()));
+    placement_dir.set_field_h160(sf("sfTakerPaysCurrency"), Uint160::zero());
+    placement_dir.set_field_h160(sf("sfTakerPaysIssuer"), Uint160::zero());
+    placement_dir.set_field_v256(
+        sf("sfIndexes"),
+        protocol::STVector256::from_values(sf("sfIndexes"), vec![Uint256::from_array([0xDD; 32])]),
+    );
+    placement_dir.set_field_h256(
+        sf("sfPreviousTxnID"),
+        Uint256::from_hex("2468648F2D0685722CB379849781E69C3BC5F3C4A486FCFEEBAB627F79A53273")
+            .expect("historical book previous transaction"),
+    );
+    placement_dir.set_field_u32(sf("sfPreviousTxnLgrSeq"), 20_755_234);
+
+    let fee_settings_key =
+        Uint256::from_hex("4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651")
+            .expect("canonical FeeSettings index");
+    let fee_settings_bytes = str_unhex(
+        "1100732200000000250049030155FB43E7E865C92E8AA03BCFC13BC76E63CB4C62FBED747519C765F151D711500E6016400000000000000A601740000000000F424060184000000000030D40",
+    )
+    .expect("canonical FeeSettings bytes");
+    let fee_settings = STLedgerEntry::from_serial_iter(
+        &mut SerialIter::new(&fee_settings_bytes),
+        fee_settings_key,
+    );
+
+    let prelude_signers: Vec<_> = (0xD0..=0xD5)
+        .map(|seed| {
+            let secret = SecretKey::from_bytes([seed; 32]);
+            let public =
+                derive_public_key(KeyType::Secp256k1, &secret).expect("prelude public key");
+            (calc_account_id(public.as_bytes()), public, secret)
+        })
+        .collect();
+    let mut entries = vec![
+        maker_a_root,
+        maker_b_root,
+        taker_root,
+        account_root(issuer, 10_000_000_000, 0, 0),
+        trust_line,
+        owner_dir,
+        placement_dir,
+        fee_settings,
+    ];
+    entries.extend(
+        prelude_signers
+            .iter()
+            .map(|(account, _, _)| account_root(*account, 10_000_000, 0, 0)),
+    );
+    let mut ledger = ledger::Ledger::from_ledger_seq_and_close_time(20_756_419, 842_720_000, false);
+    for entry in entries {
+        ledger
+            .raw_insert(Arc::new(entry))
+            .expect("insert bounded historical parent entry");
+    }
+    ledger.set_fees(ledger::Fees {
+        base: 10,
+        reserve: 1_000_000,
+        increment: 200_000,
+    });
+    ledger.set_rules(Rules::new([protocol::feature_id("fixPreviousTxnID")]));
+    ledger.set_total_drops(100_000_000_000);
+    let parent_seq = ledger.header().seq;
+    let child_seq = parent_seq + 1;
+    let rules = ledger.rules().clone();
+
+    let stale_transactions = [
+        offer_tx(
+            maker_a,
+            usd_amount(2_314_186_104, -9),
+            xrp(100_000),
+            20_393_381,
+        ),
+        offer_tx(
+            maker_b,
+            usd_amount(2_314_185_869, -9),
+            xrp(100_000),
+            20_393_461,
+        ),
+    ];
+    for transaction in &stale_transactions {
+        let mut setup = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+        assert_eq!(
+            apply_submit_transactor_shell(&mut setup, transaction, TxType::OFFER_CREATE),
+            Ter::TES_SUCCESS
+        );
+        setup
+            .apply_with_tx_thread(
+                &mut ledger,
+                transaction.get_transaction_id(),
+                parent_seq,
+                &rules,
+            )
+            .expect("commit resting offer");
+    }
+
+    let stale_keys = [
+        protocol::offer_keylet(acct_id(maker_a), 20_393_381),
+        protocol::offer_keylet(acct_id(maker_b), 20_393_461),
+    ];
+    assert_eq!(
+        stale_keys[0].key.to_string(),
+        "774820C1BF3194F84D8348F0F9E6706CC3C0A3724D0193A7128013E8346EA935"
+    );
+    assert_eq!(
+        stale_keys[1].key.to_string(),
+        "B0EAC3EC154A1B69122FB8E87780FE9D0046DA6F2F9DFCD88C0CA2C96077BDE9"
+    );
+    for (keylet, expiration) in stale_keys.iter().cloned().zip([841_574_496, 841_574_731]) {
+        let mut offer = ledger
+            .read(keylet)
+            .expect("read stale offer")
+            .expect("stale offer exists");
+        offer.set_field_u32(sf("sfExpiration"), expiration);
+        ledger
+            .raw_replace(Arc::new(offer))
+            .expect("expire resting offer");
+    }
+
+    let root = app::state::application_root::ApplicationRoot::with_options(
+        app::state::application_root::ApplicationRootOptions {
+            io_threads: 0,
+            job_queue_threads: 1,
+            ..Default::default()
+        },
+    )
+    .expect("BBDA replay application root");
+    root.on_closed_ledger(Arc::new(ledger));
+    let mut child_transactions: Vec<Arc<STTx>> = prelude_signers
+        .iter()
+        .map(|(account, public, secret)| {
+            let mut tx = STTx::new(TxType::ACCOUNT_SET, |tx| {
+                tx.set_account_id(sf("sfAccount"), *account);
+                tx.set_field_amount(sf("sfFee"), xrp(10));
+                tx.set_field_u32(sf("sfSequence"), 1);
+                tx.set_field_u32(sf("sfSetFlag"), 1); // asfRequireDest
+                tx.set_field_u32(sf("sfFlags"), 0);
+                tx.set_field_vl(sf("sfSigningPubKey"), public.as_bytes());
+            });
+            tx.sign(public, secret, None)
+                .expect("prelude AccountSet signature");
+            Arc::new(tx)
+        })
+        .collect();
+    child_transactions.push(Arc::new(incoming.clone()));
+    root.accept_ledger_with_txns(child_seq, 842_720_001, 10, true, 10, child_transactions)
+        .expect("build bounded BBDA child ledger");
+    let built = root.closed_ledger().expect("built BBDA ledger");
+
+    for keylet in stale_keys {
+        assert!(
+            built
+                .read(keylet)
+                .expect("read out-of-quality expired offer")
+                .is_some(),
+            "an expired offer beyond the crossing limit must remain untouched"
+        );
+    }
+    assert_eq!(get_owner_count(built.as_ref(), maker_a), 2);
+    assert_eq!(get_owner_count(built.as_ref(), maker_b), 2);
+
+    let expected_nodes = [
+        (
+            "4759BE74AAB703CB80E04B8F74AFC7F53D7B1CFBA82E9E32CA599503B53AD961",
+            sf("sfModifiedNode"),
+        ),
+        (
+            "7009358B82D2789E7EAACC0B048FAA0A1E410908DA575651ED16FD51400DC71F",
+            sf("sfModifiedNode"),
+        ),
+        (
+            "8F5556CA5B42DEEAB8F19614ECB2203EABD3BCA665AAABC2235184157CDC18DC",
+            sf("sfCreatedNode"),
+        ),
+        (
+            "A815A71607FA3B896286108370F9D615682A3BF6B6FF7D455B038D7EA4C68000",
+            sf("sfModifiedNode"),
+        ),
+    ];
+    let (_, mut meta) = built
+        .tx_read(incoming.get_transaction_id())
+        .expect("read built BBDA transaction map")
+        .expect("built BBDA transaction exists");
+    assert_eq!(meta.get_result_ter(), Ter::TES_SUCCESS);
+    assert_eq!(meta.get_nodes().len(), expected_nodes.len());
+    for (index, action) in expected_nodes {
+        let index = Uint256::from_hex(index).expect("canonical affected-node index");
+        let node = meta
+            .get_nodes()
+            .iter()
+            .find(|node| node.get_field_h256(sf("sfLedgerIndex")) == index)
+            .expect("canonical affected node");
+        assert_eq!(node.fname(), action);
+    }
+
+    let ter = meta.get_result_ter();
+    let index = meta.get_index();
+    assert_eq!(ter, Ter::TES_SUCCESS);
+    assert_eq!(index, 6);
+    let mut serialized = Serializer::default();
+    meta.add_raw(&mut serialized, ter, index);
+    assert_eq!(
+        str_hex(serialized.data()),
+        META_HEX,
+        "bounded replay must reproduce canonical BBDA metadata bytes"
     );
 }
