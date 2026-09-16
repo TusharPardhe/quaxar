@@ -15231,6 +15231,123 @@ fn amm_deposit_submit_shell_preserves_pool_invariant() {
 }
 
 #[test]
+fn amm_deposit_frozen_iou_is_rejected_before_transfers_not_frozen_invariant() {
+    let fixture = || {
+        // Same account ordering as Testnet tx F70F...4F39: the issuer is
+        // low, the depositor is high, and lsfLowFreeze is the issuer-side bit.
+        let asset_issuer = sample_account(0x10);
+        let depositor = sample_account(0x20);
+        let amm_account = sample_account(0x30);
+        let asset2_issuer = sample_account(0x40);
+        let asset = Issue::new(currency_from_string("ALI"), asset_issuer);
+        let asset2 = Issue::new(currency_from_string("BOB"), asset2_issuer);
+        let amm = amm_entry(amm_account, asset, asset2, 1_000, vec![], 0);
+        let amm_key = protocol::keylet::amm(Asset::Issue(asset), Asset::Issue(asset2));
+
+        let mut amm_root = account_root_with_balance(
+            amm_account,
+            2,
+            protocol::lsfDisableMaster | protocol::lsfDefaultRipple | protocol::lsfDepositAuth,
+            0,
+        );
+        amm_root.set_field_h256(sf("sfAMMID"), amm_key.key);
+
+        let mut depositor_asset = trust_line_entry(asset_issuer, depositor, asset.currency, -990);
+        depositor_asset.set_field_u32(sf("sfFlags"), protocol::lsfLowFreeze);
+        let mut amm_asset = trust_line_entry(asset_issuer, amm_account, asset.currency, -1_000);
+        amm_asset.set_field_u32(sf("sfFlags"), protocol::lsfAMMNode);
+        let mut amm_asset2 = trust_line_entry(amm_account, asset2_issuer, asset2.currency, 1_000);
+        amm_asset2.set_field_u32(sf("sfFlags"), protocol::lsfAMMNode);
+        let lp_line = trust_line_entry(
+            depositor,
+            amm_account,
+            amm_lpt_currency(asset.currency, asset2.currency),
+            10,
+        );
+
+        let mut ledger = empty_ledger(vec![
+            account_root_with_balance(depositor, 2, 0, 1_000_000_000),
+            account_root(asset_issuer, 2, protocol::lsfDefaultRipple),
+            account_root(asset2_issuer, 1, protocol::lsfDefaultRipple),
+            amm_root,
+            amm,
+            depositor_asset,
+            amm_asset,
+            amm_asset2,
+            lp_line,
+        ]);
+        ledger.set_rules(protocol::Rules::new([
+            protocol::feature_id("AMM"),
+            protocol::feature_id("DeepFreeze"),
+            protocol::feature_id("fixCleanup3_2_0"),
+            protocol::fix_ammv1_3(),
+        ]));
+        let view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let tx = STTx::new(TxType::AMM_DEPOSIT, |tx| {
+            tx.set_account_id(sf("sfAccount"), depositor);
+            tx.set_field_issue(
+                sf("sfAsset"),
+                STIssue::new_with_asset(sf("sfAsset"), Asset::Issue(asset)),
+            );
+            tx.set_field_issue(
+                sf("sfAsset2"),
+                STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(asset2)),
+            );
+            tx.set_field_amount(sf("sfAmount"), iou_amount(sf("sfAmount"), asset, 100));
+            tx.set_field_amount(sf("sfFee"), test_xrp(10));
+            tx.set_field_u32(sf("sfFlags"), protocol::AMM_SINGLE_ASSET_FLAG);
+            tx.set_field_u32(sf("sfSequence"), 1);
+        });
+        (view, tx, amm_key, asset_issuer, depositor)
+    };
+
+    let (mut bypassed_preclaim, tx, _, _, _) = fixture();
+    assert_eq!(
+        apply_submit_transactor_shell(&mut bypassed_preclaim, &tx, TxType::AMM_DEPOSIT),
+        Ter::TEC_INVARIANT_FAILED,
+        "without preclaim, the frozen transfer reaches TransfersNotFrozen"
+    );
+
+    let (mut production_path, tx, amm_key, asset_issuer, depositor) = fixture();
+    let pool_before = production_path
+        .read(amm_key)
+        .expect("AMM read")
+        .expect("AMM exists")
+        .get_field_amount(sf("sfLPTokenBalance"));
+    let line_before = production_path
+        .read(line(asset_issuer, depositor, currency_from_string("ALI")))
+        .expect("trust-line read")
+        .expect("trust line exists")
+        .get_field_amount(sf("sfBalance"));
+
+    assert_eq!(
+        tx::run_dex_read_view_preclaim(&production_path, &tx, TxType::AMM_DEPOSIT),
+        Some(Ter::TEC_FROZEN)
+    );
+    assert_eq!(
+        apply_simulated_transaction(&mut production_path, &tx).0,
+        Ter::TEC_FROZEN,
+        "the frozen deposit must retain its preclaim TER instead of reaching an invariant"
+    );
+    assert_eq!(
+        production_path
+            .read(amm_key)
+            .expect("AMM read")
+            .expect("AMM exists")
+            .get_field_amount(sf("sfLPTokenBalance")),
+        pool_before
+    );
+    assert_eq!(
+        production_path
+            .read(line(asset_issuer, depositor, currency_from_string("ALI")))
+            .expect("trust-line read")
+            .expect("trust line exists")
+            .get_field_amount(sf("sfBalance")),
+        line_before
+    );
+}
+
+#[test]
 fn amm_create_rejects_locked_mpt_asset_before_creating_pool() {
     let account = sample_account(0x13);
     let issuer = sample_account(0x14);

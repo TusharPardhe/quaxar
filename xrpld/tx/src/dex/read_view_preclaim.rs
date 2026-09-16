@@ -587,7 +587,10 @@ fn individually_frozen<V: ReadView>(
                 .read(protocol::line(account, issue.account, issue.currency))
                 .map_err(|_| read_error())?
                 .is_some_and(|line| {
-                    line.is_flag(if account > issue.account {
+                    // Freeze is directional: only the issuer-side bit freezes
+                    // this holder. If the issuer is the high account it sets
+                    // lsfHighFreeze; otherwise it sets lsfLowFreeze.
+                    line.is_flag(if issue.account > account {
                         lsfHighFreeze
                     } else {
                         lsfLowFreeze
@@ -1677,6 +1680,230 @@ mod tests {
             ),
         );
         entry
+    }
+
+    fn trust_line_entry(
+        low: AccountID,
+        high: AccountID,
+        currency: Currency,
+        balance: i64,
+        flags: u32,
+    ) -> STLedgerEntry {
+        let mut entry = STLedgerEntry::from_type_and_key(
+            LedgerEntryType::RippleState,
+            protocol::line(low, high, currency).key,
+        );
+        entry.set_field_amount(
+            sf("sfBalance"),
+            STAmount::from_iou_amount(
+                sf("sfBalance"),
+                IOUAmount::from_parts(balance, 0).expect("valid trust-line balance"),
+                Issue::new(currency, low),
+            ),
+        );
+        entry.set_field_amount(
+            sf("sfLowLimit"),
+            STAmount::from_iou_amount(
+                sf("sfLowLimit"),
+                IOUAmount::from_parts(1_000, 0).expect("valid low limit"),
+                Issue::new(currency, low),
+            ),
+        );
+        entry.set_field_amount(
+            sf("sfHighLimit"),
+            STAmount::from_iou_amount(
+                sf("sfHighLimit"),
+                IOUAmount::from_parts(1_000, 0).expect("valid high limit"),
+                Issue::new(currency, high),
+            ),
+        );
+        entry.set_field_u32(sf("sfFlags"), flags);
+        entry
+    }
+
+    fn amm_deposit_preclaim_fixture(
+        depositor_line_flags: u32,
+        asset_issuer_flags: u32,
+        asset2_issuer_flags: u32,
+        extra_features: &[Uint256],
+    ) -> (View, STTx) {
+        // Match the live ordering: the ALI issuer is low and the depositor is
+        // high, so an issuer freeze is lsfLowFreeze. The holder's own freeze
+        // bit on the same line is lsfHighFreeze and must not block a deposit.
+        let asset_issuer = account(0x10);
+        let depositor = account(0x20);
+        let amm_account = account(0x30);
+        let asset2_issuer = account(0x40);
+        let asset = Issue::new(protocol::currency_from_string("ALI"), asset_issuer);
+        let asset2 = Issue::new(protocol::currency_from_string("BOB"), asset2_issuer);
+        let asset_value = Asset::Issue(asset);
+        let asset2_value = Asset::Issue(asset2);
+        let amm = amm_entry(amm_account, asset_value, asset2_value, 10);
+        let lp_currency = protocol::amm_lpt_currency(asset.currency, asset2.currency);
+
+        let mut features = vec![protocol::feature_id("AMM")];
+        features.extend_from_slice(extra_features);
+        let mut view = View {
+            rules: Rules::new(features),
+            ..View::default()
+        };
+
+        let mut depositor_root = account_entry(depositor, 1);
+        depositor_root.set_field_amount(
+            sf("sfBalance"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(1_000_000_000)),
+        );
+        let mut asset_issuer_root = account_entry(asset_issuer, 1);
+        asset_issuer_root.set_field_u32(sf("sfFlags"), asset_issuer_flags);
+        let mut asset2_issuer_root = account_entry(asset2_issuer, 1);
+        asset2_issuer_root.set_field_u32(sf("sfFlags"), asset2_issuer_flags);
+        let mut amm_root = account_entry(amm_account, 0);
+        amm_root.set_field_h256(sf("sfAMMID"), *amm.key());
+
+        for entry in [
+            depositor_root,
+            asset_issuer_root,
+            asset2_issuer_root,
+            amm_root,
+            amm,
+            trust_line_entry(
+                asset_issuer,
+                depositor,
+                asset.currency,
+                -990,
+                depositor_line_flags,
+            ),
+            trust_line_entry(
+                asset_issuer,
+                amm_account,
+                asset.currency,
+                -10,
+                protocol::lsfAMMNode,
+            ),
+            trust_line_entry(
+                amm_account,
+                asset2_issuer,
+                asset2.currency,
+                10,
+                protocol::lsfAMMNode,
+            ),
+            trust_line_entry(depositor, amm_account, lp_currency, 1, 0),
+        ] {
+            view.insert(entry);
+        }
+
+        let tx = STTx::new(TxType::AMM_DEPOSIT, |tx| {
+            tx.set_account_id(sf("sfAccount"), depositor);
+            tx.set_field_issue(
+                sf("sfAsset"),
+                protocol::STIssue::new_with_asset(sf("sfAsset"), asset_value),
+            );
+            tx.set_field_issue(
+                sf("sfAsset2"),
+                protocol::STIssue::new_with_asset(sf("sfAsset2"), asset2_value),
+            );
+            tx.set_field_amount(
+                sf("sfAmount"),
+                STAmount::from_iou_amount(
+                    sf("sfAmount"),
+                    IOUAmount::from_parts(100, 0).expect("valid deposit amount"),
+                    asset,
+                ),
+            );
+            tx.set_field_amount(
+                sf("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+            );
+            tx.set_field_u32(sf("sfFlags"), protocol::AMM_SINGLE_ASSET_FLAG);
+            tx.set_field_u32(sf("sfSequence"), 1);
+        });
+        (view, tx)
+    }
+
+    #[test]
+    fn amm_deposit_preclaim_rejects_only_rippled_frozen_iou_variants() {
+        let fix_cleanup_3_3_0 = protocol::feature_id("fixCleanup3_3_0");
+        let amm_clawback = protocol::feature_id("AMMClawback");
+        let cases = [
+            (
+                "live issuer-side individual freeze",
+                protocol::lsfLowFreeze,
+                0,
+                &[][..],
+                Ter::TEC_FROZEN,
+            ),
+            (
+                "issuer-side deep freeze",
+                protocol::lsfLowFreeze | protocol::lsfLowDeepFreeze,
+                0,
+                &[][..],
+                Ter::TEC_FROZEN,
+            ),
+            (
+                "global freeze",
+                0,
+                protocol::lsfGlobalFreeze,
+                &[][..],
+                Ter::TEC_FROZEN,
+            ),
+            (
+                "unified cleanup freeze check",
+                protocol::lsfLowFreeze,
+                0,
+                std::slice::from_ref(&fix_cleanup_3_3_0),
+                Ter::TEC_FROZEN,
+            ),
+            (
+                "AMMClawback freeze check",
+                protocol::lsfLowFreeze,
+                0,
+                std::slice::from_ref(&amm_clawback),
+                Ter::TEC_FROZEN,
+            ),
+            (
+                "holder-side self freeze is not an issuer freeze",
+                protocol::lsfHighFreeze,
+                0,
+                &[][..],
+                Ter::TES_SUCCESS,
+            ),
+            ("non-frozen control", 0, 0, &[][..], Ter::TES_SUCCESS),
+        ];
+
+        for (name, line_flags, issuer_flags, features, expected) in cases {
+            let (view, tx) = amm_deposit_preclaim_fixture(line_flags, issuer_flags, 0, features);
+            assert_eq!(
+                run_dex_read_view_preclaim(&view, &tx, TxType::AMM_DEPOSIT),
+                Some(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn amm_deposit_preclaim_keeps_paired_asset_freeze_amendment_gating() {
+        let paired_asset_global_freeze = protocol::lsfGlobalFreeze;
+        for (name, features, expected) in [
+            ("legacy", &[][..], Ter::TES_SUCCESS),
+            (
+                "AMMClawback",
+                std::slice::from_ref(&protocol::feature_id("AMMClawback")),
+                Ter::TEC_FROZEN,
+            ),
+            (
+                "fixCleanup3_3_0",
+                std::slice::from_ref(&protocol::feature_id("fixCleanup3_3_0")),
+                Ter::TEC_FROZEN,
+            ),
+        ] {
+            let (view, tx) =
+                amm_deposit_preclaim_fixture(0, 0, paired_asset_global_freeze, features);
+            assert_eq!(
+                run_dex_read_view_preclaim(&view, &tx, TxType::AMM_DEPOSIT),
+                Some(expected),
+                "{name}"
+            );
+        }
     }
 
     #[test]
