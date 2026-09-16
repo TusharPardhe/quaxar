@@ -683,13 +683,17 @@ fn execute_mpt_endpoint<V: ApplyView>(
 
     for account in [src, dst] {
         if *account != issuer {
-            let auth = crate::mptoken_helpers::require_auth_mpt_with_type(
-                view,
-                issue,
-                account,
-                crate::mptoken_helpers::MPTAuthType::Strong,
-            )
-            .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+            let auth_type = if offer_crossing {
+                // Offer crossing may create the destination MPToken above;
+                // rippled's holding-creating paths use WeakAuth rather than
+                // weakening requireAuth's default Legacy contract.
+                crate::mptoken_helpers::MPTAuthType::Weak
+            } else {
+                crate::mptoken_helpers::MPTAuthType::Legacy
+            };
+            let auth =
+                crate::mptoken_helpers::require_auth_mpt_with_type(view, issue, account, auth_type)
+                    .map_err(|_| Ter::TEF_BAD_LEDGER)?;
             if auth != Ter::TES_SUCCESS {
                 return Err(auth);
             }
@@ -800,7 +804,7 @@ fn execute_mpt_endpoint<V: ApplyView>(
         protocol::MPTAmount::from_value(output_value),
         *issue,
     );
-    let sent = ripple_state_helpers::account_send(view, src, dst, &output);
+    let sent = ripple_state_helpers::account_send_allow_mpt_overflow(view, src, dst, &output);
     if sent != Ter::TES_SUCCESS {
         return Err(sent);
     }
@@ -1106,7 +1110,138 @@ mod tests {
     use protocol::{ApplyFlags, LedgerEntryType, STLedgerEntry};
 
     use super::*;
-    use crate::{ApplyViewImpl, Ledger, RawView};
+    use crate::{ApplyViewImpl, Ledger, RawView, ReadView};
+
+    #[test]
+    fn mpt_holder_to_holder_endpoints_allow_temporary_maximum_overflow() {
+        let issuer = AccountID::from_array([0x51; 20]);
+        let sender = AccountID::from_array([0x52; 20]);
+        let receiver = AccountID::from_array([0x53; 20]);
+        let issue = protocol::MPTIssue::new(protocol::make_mpt_id(1, issuer));
+        let amount =
+            STAmount::from_mpt_amount(sf("sfAmount"), protocol::MPTAmount::from_value(10), issue);
+        let account = |id: AccountID| {
+            let mut sle = STLedgerEntry::new(protocol::account_keylet(
+                basics::base_uint::Uint160::from_void(id.data()),
+            ));
+            sle.set_account_id(sf("sfAccount"), id);
+            sle.set_field_amount(
+                sf("sfBalance"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(100_000_000)),
+            );
+            sle.set_field_u32(sf("sfSequence"), 1);
+            sle.set_field_u32(sf("sfOwnerCount"), 1);
+            sle
+        };
+        let token = |holder: AccountID, balance: u64| {
+            let mut sle = STLedgerEntry::new(protocol::mptoken_keylet_from_mptid(
+                issue.mpt_id(),
+                basics::base_uint::Uint160::from_void(holder.data()),
+            ));
+            sle.set_account_id(sf("sfAccount"), holder);
+            sle.set_field_h192(sf("sfMPTokenIssuanceID"), issue.mpt_id());
+            sle.set_field_u64(sf("sfMPTAmount"), balance);
+            sle.set_field_u32(sf("sfFlags"), 0);
+            sle.set_field_u64(sf("sfOwnerNode"), 0);
+            sle
+        };
+        let mut issuance =
+            STLedgerEntry::new(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()));
+        issuance.set_account_id(sf("sfIssuer"), issuer);
+        issuance.set_field_u32(sf("sfSequence"), 1);
+        issuance.set_field_u32(sf("sfFlags"), protocol::lsfMPTCanTransfer);
+        issuance.set_field_u64(sf("sfOutstandingAmount"), 100);
+        issuance.set_field_u64(sf("sfMaximumAmount"), 100);
+        issuance.set_field_u64(sf("sfOwnerNode"), 0);
+
+        let mut base = Ledger::from_ledger_seq_and_close_time(1, 1, false);
+        base.set_rules(crate::Rules::new([protocol::feature_id("MPTokensV2")]));
+        for sle in [
+            account(issuer),
+            account(sender),
+            account(receiver),
+            issuance,
+            token(sender, 100),
+            token(receiver, 0),
+        ] {
+            base.raw_insert(Arc::new(sle))
+                .expect("seed MPT flow fixture");
+        }
+        let mut view = ApplyViewImpl::new(Arc::new(base), ApplyFlags::NONE);
+
+        // Reverse endpoint order issues to the destination before the matching
+        // source redemption. OutstandingAmount is temporarily 110, then the
+        // holder-to-issuer endpoint restores it to MaximumAmount.
+        let issued = execute_mpt_endpoint(
+            &mut view,
+            &issuer,
+            &receiver,
+            &issue,
+            &amount,
+            false,
+            true,
+            false,
+            true,
+            &sender,
+            &receiver,
+            Asset::MPTIssue(issue),
+            true,
+        )
+        .expect("destination endpoint permits temporary overflow");
+        assert_eq!(issued, (amount.clone(), amount.clone()));
+        assert_eq!(
+            view.read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
+                .expect("read issuance")
+                .expect("issuance exists")
+                .get_field_u64(sf("sfOutstandingAmount")),
+            110,
+        );
+
+        let redeemed = execute_mpt_endpoint(
+            &mut view,
+            &sender,
+            &issuer,
+            &issue,
+            &amount,
+            true,
+            false,
+            false,
+            false,
+            &sender,
+            &receiver,
+            Asset::MPTIssue(issue),
+            true,
+        )
+        .expect("source endpoint redeems matching amount");
+        assert_eq!(redeemed, (amount.clone(), amount.clone()));
+        assert_eq!(
+            view.read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
+                .expect("read final issuance")
+                .expect("issuance exists")
+                .get_field_u64(sf("sfOutstandingAmount")),
+            100,
+        );
+        assert_eq!(
+            view.read(protocol::mptoken_keylet_from_mptid(
+                issue.mpt_id(),
+                basics::base_uint::Uint160::from_void(sender.data()),
+            ))
+            .expect("read sender token")
+            .expect("sender token exists")
+            .get_field_u64(sf("sfMPTAmount")),
+            90,
+        );
+        assert_eq!(
+            view.read(protocol::mptoken_keylet_from_mptid(
+                issue.mpt_id(),
+                basics::base_uint::Uint160::from_void(receiver.data()),
+            ))
+            .expect("read receiver token")
+            .expect("receiver token exists")
+            .get_field_u64(sf("sfMPTAmount")),
+            10,
+        );
+    }
 
     #[test]
     fn direct_qualities_charge_each_transfer_fee_at_the_rippled_boundary() {

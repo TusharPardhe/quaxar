@@ -382,7 +382,13 @@ fn account_can_accept_offer_asset<V: ReadView>(
             )
         }
         Asset::MPTIssue(issue) => {
-            let auth = asset_auth(view, account, Asset::MPTIssue(issue))?;
+            let auth = ledger::mptoken_helpers::require_auth_mpt_with_type(
+                view,
+                &issue,
+                &account,
+                ledger::mptoken_helpers::MPTAuthType::Weak,
+            )
+            .map_err(|_| read_error())?;
             if auth != Ter::TES_SUCCESS {
                 return Ok(auth);
             }

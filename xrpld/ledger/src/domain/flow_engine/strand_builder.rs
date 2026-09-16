@@ -2,7 +2,8 @@ use super::{StepKind, Strand};
 use crate::ApplyView;
 use basics::base_uint::Uint256;
 use protocol::{
-    AccountID, Asset, Issue, STPath, STPathSet, Ter, get_field_by_symbol as sf, xrp_issue,
+    AccountID, Asset, Issue, STPath, STPathElement, STPathSet, Ter, get_field_by_symbol as sf,
+    is_consistent, is_xrp_currency, no_account, xrp_issue,
 };
 
 pub fn to_strand(
@@ -36,8 +37,21 @@ fn to_strand_with_domain(
     offer_crossing: bool,
     domain: Option<Uint256>,
 ) -> (Ter, Strand) {
-    if src.is_zero() || dst.is_zero() {
+    if src.is_zero()
+        || dst.is_zero()
+        || *src == no_account()
+        || *dst == no_account()
+        || !valid_path_asset(*deliver)
+        || send_max_asset.is_some_and(|asset| !valid_path_asset(*asset))
+        || send_max_asset.is_some_and(|asset| asset.issuer() == no_account())
+        || deliver.issuer() == no_account()
+    {
         return (Ter::TEM_BAD_PATH, Vec::new());
+    }
+    for (index, element) in path.iter().enumerate() {
+        if !valid_path_element(index, path, element) {
+            return (Ter::TEM_BAD_PATH, Vec::new());
+        }
     }
 
     let initial_asset = match *send_max_asset.unwrap_or(deliver) {
@@ -67,22 +81,35 @@ fn to_strand_with_domain(
         }
     }
 
-    // 3. Explicit path elements
+    // 3. Explicit path elements. Resolve omitted issuer/currency fields
+    // against the asset produced by preceding elements, exactly as PaySteps
+    // mutates curAsset while traversing the normalized path.
+    let mut resolved_asset = initial_asset;
     for elem in path.iter() {
+        if matches!(resolved_asset, Asset::MPTIssue(_)) && elem.has_currency() {
+            resolved_asset = Asset::Issue(Issue::default());
+        }
+        if let Asset::Issue(issue) = &mut resolved_asset {
+            if elem.is_account() {
+                issue.account = elem.account_id();
+            } else if elem.has_issuer() {
+                issue.account = elem.issuer_id();
+            }
+        }
+        if elem.has_currency() {
+            let mut issue = Issue::new(elem.currency(), resolved_asset.issuer());
+            if is_xrp_currency(issue.currency) {
+                issue.account = protocol::xrp_account();
+            }
+            resolved_asset = Asset::Issue(issue);
+        } else if elem.has_mpt() {
+            resolved_asset = Asset::from(elem.mpt_id());
+        }
+
         if elem.is_account() {
             norm.push(NormElem::Acct(elem.account_id()));
         } else {
-            let asset = if elem.has_mpt() {
-                Asset::from(elem.mpt_id())
-            } else {
-                let issuer = if elem.has_issuer() {
-                    elem.issuer_id()
-                } else {
-                    initial_asset.issuer()
-                };
-                Asset::Issue(Issue::new(elem.currency(), issuer))
-            };
-            norm.push(NormElem::Offer(asset));
+            norm.push(NormElem::Offer(resolved_asset));
         }
     }
 
@@ -864,14 +891,14 @@ fn validate_strand<V: ApplyView>(
                     for account in [src, dst] {
                         if *account != issuer {
                             // C++ MPTEndpointPaymentStep uses requireAuth's
-                            // default Legacy mode.  For MPTs, Legacy and
-                            // Strong both require an MPToken object; Weak is
-                            // reserved for operations which may create one.
+                            // default Legacy mode. Legacy still requires the
+                            // outer MPToken, while nested IOU authorization is
+                            // weak and may omit a trust line.
                             match crate::domain::mptoken_helpers::require_auth_mpt_with_type(
                                 view,
                                 issue,
                                 account,
-                                crate::domain::mptoken_helpers::MPTAuthType::Strong,
+                                crate::domain::mptoken_helpers::MPTAuthType::Legacy,
                             ) {
                                 Ok(Ter::TES_SUCCESS) => {}
                                 Ok(ter) => return ter,
@@ -947,6 +974,58 @@ fn validate_strand<V: ApplyView>(
     Ter::TES_SUCCESS
 }
 
+fn valid_path_asset(asset: Asset) -> bool {
+    asset.visit(
+        |issue| is_consistent(*issue),
+        |issue| !issue.issuer().is_zero(),
+    )
+}
+
+fn valid_path_element(index: usize, path: &STPath, element: &STPathElement) -> bool {
+    let node_type = element.node_type();
+    if node_type == STPathElement::TYPE_NONE || (node_type & !STPathElement::TYPE_ALL) != 0 {
+        return false;
+    }
+
+    let has_account = (node_type & STPathElement::TYPE_ACCOUNT) != 0;
+    let has_issuer = (node_type & STPathElement::TYPE_ISSUER) != 0;
+    let has_currency = (node_type & STPathElement::TYPE_CURRENCY) != 0;
+    let has_mpt = (node_type & STPathElement::TYPE_MPT) != 0;
+    let has_asset = (node_type & STPathElement::TYPE_ASSET) != 0;
+
+    if has_account && (has_issuer || has_currency) {
+        return false;
+    }
+    if has_issuer && element.issuer_id().is_zero() {
+        return false;
+    }
+    if has_account && element.account_id().is_zero() {
+        return false;
+    }
+    if has_currency
+        && has_issuer
+        && (is_xrp_currency(element.currency()) != element.issuer_id().is_zero())
+    {
+        return false;
+    }
+    if has_issuer && element.issuer_id() == no_account() {
+        return false;
+    }
+    if has_account && element.account_id() == no_account() {
+        return false;
+    }
+    if has_mpt && (has_currency || has_account) {
+        return false;
+    }
+    if has_mpt && has_issuer && element.issuer_id() != Asset::from(element.mpt_id()).issuer() {
+        return false;
+    }
+    if index > 0 && path[index - 1].has_mpt() && (has_account || (has_issuer && !has_asset)) {
+        return false;
+    }
+    true
+}
+
 /// Return the protocol's sole canonical issue for XRP while preserving the
 /// issuer required by every issued currency.  `Issue` equality intentionally
 /// ignores an XRP account, but `keylet::get_book_base` must receive the
@@ -985,7 +1064,13 @@ fn last_asset_in_norm(norm: &[NormElem], initial: Asset) -> Asset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{AccountID, Asset, Currency, Issue, xrp_issue};
+    use protocol::{
+        AccountID, ApplyFlags, Asset, Currency, Issue, LedgerEntryType, Rules, STIssue,
+        STLedgerEntry, xrp_issue,
+    };
+    use std::sync::Arc;
+
+    use crate::{ApplyViewImpl, Ledger, LedgerHeader, RawView};
 
     fn make_account(byte: u8) -> AccountID {
         let mut data = [0u8; 20];
@@ -999,6 +1084,191 @@ mod tests {
             data[12 + i] = b;
         }
         Currency::from(data)
+    }
+
+    fn account_root(account: AccountID) -> STLedgerEntry {
+        let key = protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
+        let mut root = STLedgerEntry::from_type_and_key(LedgerEntryType::AccountRoot, key.key);
+        root.set_account_id(sf("sfAccount"), account);
+        root
+    }
+
+    fn checked_view(
+        entries: impl IntoIterator<Item = STLedgerEntry>,
+        features: impl IntoIterator<Item = basics::base_uint::Uint256>,
+    ) -> ApplyViewImpl<Ledger> {
+        let mut ledger = Ledger::new(LedgerHeader::default(), false);
+        ledger.set_rules(Rules::new(features));
+        for entry in entries {
+            ledger.raw_insert(Arc::new(entry)).expect("seed entry");
+        }
+        ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE)
+    }
+
+    #[test]
+    fn direct_step_deep_freeze_blocks_both_directions() {
+        let low = make_account(1);
+        let high = make_account(2);
+        let currency = make_currency("USD");
+        let key = protocol::line(low, high, currency);
+        let mut line = STLedgerEntry::from_type_and_key(LedgerEntryType::RippleState, key.key);
+        line.set_field_u32(sf("sfFlags"), protocol::lsfLowDeepFreeze);
+        let mut view = checked_view(
+            [account_root(low), account_root(high), line],
+            [protocol::feature_deep_freeze()],
+        );
+
+        assert_eq!(
+            check_direct_freeze(&mut view, &low, &high, currency),
+            Ter::TER_NO_LINE
+        );
+        assert_eq!(
+            check_direct_freeze(&mut view, &high, &low, currency),
+            Ter::TER_NO_LINE
+        );
+    }
+
+    #[test]
+    fn lp_token_underlying_freeze_activates_only_with_fix_amendment() {
+        let holder = make_account(1);
+        let issuer = make_account(3);
+        let amm_account = make_account(4);
+        let currency = make_currency("USD");
+        let amm_id = Uint256::from_u64(0xA11);
+
+        let mut line = STLedgerEntry::from_type_and_key(
+            LedgerEntryType::RippleState,
+            protocol::line(holder, issuer, currency).key,
+        );
+        line.set_field_u32(sf("sfFlags"), protocol::lsfHighFreeze);
+
+        let mut amm_root = account_root(amm_account);
+        amm_root.set_field_h256(sf("sfAMMID"), amm_id);
+        let mut amm = STLedgerEntry::from_type_and_key(
+            LedgerEntryType::AMM,
+            protocol::amm_keylet(amm_id).key,
+        );
+        amm.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), Asset::Issue(Issue::new(currency, issuer))),
+        );
+        amm.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(xrp_issue())),
+        );
+        let entries = || {
+            [
+                account_root(holder),
+                account_root(issuer),
+                amm_root.clone(),
+                line.clone(),
+                amm.clone(),
+            ]
+        };
+
+        let mut legacy = checked_view(entries(), []);
+        assert_eq!(
+            check_lp_token_freeze(&mut legacy, &holder, &amm_account, Some(&amm_root)),
+            Ter::TES_SUCCESS
+        );
+
+        let mut fixed = checked_view(
+            entries(),
+            [protocol::feature_id("fixFrozenLPTokenTransfer")],
+        );
+        assert_eq!(
+            check_lp_token_freeze(&mut fixed, &holder, &amm_account, Some(&amm_root)),
+            Ter::TER_NO_LINE
+        );
+    }
+
+    #[test]
+    fn active_builder_rejects_noncanonical_path_elements() {
+        let src = make_account(1);
+        let dst = make_account(2);
+        let issuer = make_account(3);
+        let usd = make_currency("USD");
+        let deliver = Asset::Issue(Issue::new(usd, issuer));
+        let invalid = [
+            STPathElement::raw(
+                STPathElement::TYPE_NONE,
+                AccountID::zero(),
+                usd,
+                AccountID::zero(),
+            ),
+            STPathElement::raw(0x02, AccountID::zero(), usd, AccountID::zero()),
+            STPathElement::raw(
+                STPathElement::TYPE_ACCOUNT | STPathElement::TYPE_CURRENCY,
+                make_account(4),
+                usd,
+                AccountID::zero(),
+            ),
+            STPathElement::raw(
+                STPathElement::TYPE_ACCOUNT,
+                AccountID::zero(),
+                usd,
+                AccountID::zero(),
+            ),
+            STPathElement::raw(
+                STPathElement::TYPE_CURRENCY | STPathElement::TYPE_ISSUER,
+                AccountID::zero(),
+                usd,
+                AccountID::zero(),
+            ),
+            STPathElement::raw(
+                STPathElement::TYPE_CURRENCY | STPathElement::TYPE_ISSUER,
+                AccountID::zero(),
+                protocol::xrp_currency(),
+                issuer,
+            ),
+            STPathElement::raw(
+                STPathElement::TYPE_ACCOUNT,
+                protocol::no_account(),
+                usd,
+                AccountID::zero(),
+            ),
+        ];
+
+        for element in invalid {
+            let path = STPath::from_vec(vec![element]);
+            assert_eq!(
+                to_strand(&src, &dst, &deliver, None, &path, false, false).0,
+                Ter::TEM_BAD_PATH
+            );
+        }
+    }
+
+    #[test]
+    fn partial_currency_element_inherits_the_evolved_account_issuer() {
+        let src = make_account(1);
+        let dst = make_account(2);
+        let deliver_issuer = make_account(3);
+        let path_issuer = make_account(4);
+        let usd = make_currency("USD");
+        let eur = make_currency("EUR");
+        let deliver = Asset::Issue(Issue::new(usd, deliver_issuer));
+        let path = STPath::from_vec(vec![
+            STPathElement::raw(
+                STPathElement::TYPE_ACCOUNT,
+                path_issuer,
+                protocol::xrp_currency(),
+                AccountID::zero(),
+            ),
+            STPathElement::raw(
+                STPathElement::TYPE_CURRENCY,
+                AccountID::zero(),
+                eur,
+                AccountID::zero(),
+            ),
+        ]);
+
+        let (ter, strand) = to_strand(&src, &dst, &deliver, None, &path, false, false);
+        assert_eq!(ter, Ter::TES_SUCCESS);
+        assert!(strand.iter().any(|step| matches!(
+            step,
+            StepKind::Book { book_out: Asset::Issue(issue), .. }
+                if issue.currency == eur && issue.account == path_issuer
+        )));
     }
 
     #[test]

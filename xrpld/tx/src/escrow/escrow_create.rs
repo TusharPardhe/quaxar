@@ -86,6 +86,7 @@ pub struct EscrowCreateApplyFacts {
     pub owner_exists: bool,
     pub reserve_sufficient: bool,
     pub amount_is_xrp: bool,
+    pub token_escrow_enabled: bool,
     pub xrp_balance_covers_amount: bool,
     pub destination_exists: bool,
     pub destination_requires_tag: bool,
@@ -403,6 +404,9 @@ pub fn run_escrow_create_do_apply<S: EscrowCreateApplySink>(
     if facts.amount_is_xrp {
         sink.deduct_xrp_owner_balance();
     } else {
+        if !facts.token_escrow_enabled {
+            return Ter::TEM_DISABLED;
+        }
         let lock_result = sink.lock_non_xrp_amount();
         if !is_tes_success(lock_result) {
             return lock_result;

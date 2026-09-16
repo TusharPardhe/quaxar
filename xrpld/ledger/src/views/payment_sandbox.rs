@@ -36,7 +36,7 @@ struct IssuerValueMPT {
 }
 
 #[derive(Debug, Default)]
-struct DeferredCredits {
+pub(crate) struct DeferredCredits {
     credits_iou: BTreeMap<(AccountID, AccountID, Currency), ValueIOU>,
     credits_mpt: BTreeMap<MPTID, IssuerValueMPT>,
     owner_counts: BTreeMap<AccountID, crate::OwnerCounts>,
@@ -57,7 +57,7 @@ impl DeferredCredits {
     }
 
     #[allow(dead_code)]
-    fn credit_iou(
+    pub(crate) fn credit_iou(
         &mut self,
         sender: AccountID,
         receiver: AccountID,
@@ -86,18 +86,21 @@ impl DeferredCredits {
     }
 
     #[allow(dead_code)]
-    fn credit_mpt(
+    pub(crate) fn credit_mpt(
         &mut self,
         sender: AccountID,
-        _receiver: AccountID,
+        receiver: AccountID,
         amount: STAmount,
         pre_credit_balance_holder: u64,
         pre_credit_balance_issuer: i64,
     ) {
-        let mpt_id = amount.asset().get::<MPTIssue>().mpt_id();
+        let asset = amount.asset();
+        let issue = asset.get::<MPTIssue>();
+        let value = amount.mpt().value() as u64;
+        let sender_is_issuer = sender == issue.issuer();
         let entry = self
             .credits_mpt
-            .entry(mpt_id)
+            .entry(issue.mpt_id())
             .or_insert_with(|| IssuerValueMPT {
                 holders: BTreeMap::new(),
                 credit: 0,
@@ -105,22 +108,33 @@ impl DeferredCredits {
                 self_debit: 0,
             });
 
-        // credit to holder
-        entry.credit += amount.mpt().value() as u64;
-
-        // debit to issuer
-        let holder_entry = entry
-            .holders
-            .entry(sender)
-            .or_insert_with(|| HolderValueMPT {
-                debit: 0,
-                orig_balance: pre_credit_balance_holder,
-            });
-        holder_entry.debit += amount.mpt().value() as u64;
+        if sender_is_issuer {
+            entry.credit = entry.credit.wrapping_add(value);
+            entry
+                .holders
+                .entry(receiver)
+                .or_insert_with(|| HolderValueMPT {
+                    debit: 0,
+                    orig_balance: pre_credit_balance_holder,
+                });
+        } else {
+            let holder = entry
+                .holders
+                .entry(sender)
+                .or_insert_with(|| HolderValueMPT {
+                    debit: 0,
+                    orig_balance: pre_credit_balance_holder,
+                });
+            holder.debit = holder.debit.wrapping_add(value);
+        }
     }
 
-    #[allow(dead_code)]
-    fn issuer_self_debit_mpt(&mut self, issue: MPTIssue, amount: u64, orig_balance: i64) {
+    pub(crate) fn issuer_self_debit_mpt(
+        &mut self,
+        issue: MPTIssue,
+        amount: u64,
+        orig_balance: i64,
+    ) {
         let entry = self
             .credits_mpt
             .entry(issue.mpt_id())
@@ -130,21 +144,26 @@ impl DeferredCredits {
                 orig_balance,
                 self_debit: 0,
             });
-        entry.self_debit += amount;
+        entry.self_debit = entry.self_debit.wrapping_add(amount);
     }
 
     #[allow(dead_code)]
-    fn owner_count(&mut self, id: AccountID, cur: crate::OwnerCounts, next: crate::OwnerCounts) {
+    pub(crate) fn owner_count(
+        &mut self,
+        id: AccountID,
+        cur: crate::OwnerCounts,
+        next: crate::OwnerCounts,
+    ) {
         let reached = cur.max(next);
         let entry = self.owner_counts.entry(id).or_insert(reached);
         *entry = (*entry).max(reached);
     }
 
-    fn get_owner_count(&self, id: AccountID) -> Option<crate::OwnerCounts> {
+    pub(crate) fn get_owner_count(&self, id: AccountID) -> Option<crate::OwnerCounts> {
         self.owner_counts.get(&id).copied()
     }
 
-    fn apply(&self, to: &mut DeferredCredits) {
+    pub(crate) fn apply(&self, to: &mut DeferredCredits) {
         for (key, value) in &self.credits_iou {
             let to_entry = to.credits_iou.entry(*key).or_insert_with(|| value.clone());
             if to_entry != value {
@@ -153,22 +172,19 @@ impl DeferredCredits {
             }
         }
         for (mpt_id, value) in &self.credits_mpt {
-            let to_entry = to
-                .credits_mpt
-                .entry(*mpt_id)
-                .or_insert_with(|| value.clone());
-            if to_entry != value {
-                to_entry.credit += value.credit;
-                to_entry.self_debit += value.self_debit;
+            if let Some(to_entry) = to.credits_mpt.get_mut(mpt_id) {
+                to_entry.credit = to_entry.credit.wrapping_add(value.credit);
+                to_entry.self_debit = to_entry.self_debit.wrapping_add(value.self_debit);
                 for (holder, holder_val) in &value.holders {
-                    let to_holder = to_entry
-                        .holders
-                        .entry(*holder)
-                        .or_insert_with(|| holder_val.clone());
-                    if to_holder != holder_val {
-                        to_holder.debit += holder_val.debit;
+                    if let Some(to_holder) = to_entry.holders.get_mut(holder) {
+                        to_holder.debit = to_holder.debit.wrapping_add(holder_val.debit);
+                    } else {
+                        to_entry.holders.insert(*holder, holder_val.clone());
                     }
                 }
+                // The destination already owns the earliest original balances.
+            } else {
+                to.credits_mpt.insert(*mpt_id, value.clone());
             }
         }
         for (id, count) in &self.owner_counts {
@@ -177,6 +193,60 @@ impl DeferredCredits {
                 *to_count = *count;
             }
         }
+    }
+
+    pub(crate) fn balance_iou(
+        &self,
+        account: AccountID,
+        issuer: AccountID,
+        mut amount: STAmount,
+    ) -> STAmount {
+        let key = Self::make_key_iou(account, issuer, amount.issue().currency);
+        if let Some(entry) = self.credits_iou.get(&key) {
+            let (debits, original_balance) = if account < issuer {
+                (
+                    entry.low_acct_credits.clone(),
+                    entry.low_acct_orig_balance.clone(),
+                )
+            } else {
+                let mut original_balance = entry.low_acct_orig_balance.clone();
+                original_balance.negate();
+                (entry.high_acct_credits.clone(), original_balance)
+            };
+            amount = amount
+                .min(original_balance.clone() - debits)
+                .min(original_balance);
+            if issuer == protocol::xrp_account() && amount.signum() < 0 {
+                amount = amount.zeroed();
+            }
+        }
+        amount
+    }
+
+    pub(crate) fn balance_mpt(&self, account: AccountID, issue: MPTIssue, amount: i64) -> i64 {
+        let Some(entry) = self.credits_mpt.get(&issue.mpt_id()) else {
+            return amount.max(0);
+        };
+        let (delta, original) = if account == issue.issuer() {
+            (entry.credit as i64, entry.orig_balance)
+        } else if let Some(holder) = entry.holders.get(&account) {
+            (holder.debit as i64, holder.orig_balance as i64)
+        } else {
+            return amount.max(0);
+        };
+        amount
+            .min(original.wrapping_sub(delta))
+            .min(original)
+            .max(0)
+    }
+
+    pub(crate) fn balance_self_issue_mpt(&self, issue: MPTIssue, amount: i64) -> i64 {
+        let Some(entry) = self.credits_mpt.get(&issue.mpt_id()) else {
+            return amount.max(0);
+        };
+        amount
+            .min(entry.orig_balance.wrapping_sub(entry.self_debit as i64))
+            .max(0)
     }
 }
 
@@ -266,45 +336,17 @@ where
         issuer: AccountID,
         mut amount: STAmount,
     ) -> STAmount {
-        let key = DeferredCredits::make_key_iou(account, issuer, amount.issue().currency);
-        if let Some(entry) = self.tab.credits_iou.get(&key) {
-            let (debits, original_balance) = if account < issuer {
-                (
-                    entry.low_acct_credits.clone(),
-                    entry.low_acct_orig_balance.clone(),
-                )
-            } else {
-                let mut original_balance = entry.low_acct_orig_balance.clone();
-                original_balance.negate();
-                (entry.high_acct_credits.clone(), original_balance)
-            };
-            let available = original_balance.clone() - debits;
-            if available < amount {
-                amount = available;
-            }
-            if original_balance < amount {
-                amount = original_balance;
-            }
-            if issuer == protocol::xrp_account() && amount.signum() < 0 {
-                amount = amount.zeroed();
-            }
-        }
+        amount = self.tab.balance_iou(account, issuer, amount);
         self.base.balance_hook_iou(account, issuer, amount)
     }
 
     fn balance_hook_mpt(&self, account: AccountID, issue: MPTIssue, mut amount: i64) -> STAmount {
-        if let Some(entry) = self.tab.credits_mpt.get(&issue.mpt_id())
-            && let Some(holder_entry) = entry.holders.get(&account)
-        {
-            amount -= holder_entry.debit as i64;
-        }
+        amount = self.tab.balance_mpt(account, issue, amount);
         self.base.balance_hook_mpt(account, issue, amount)
     }
 
-    fn balance_hook_self_issue_mpt(&self, issue: MPTIssue, mut amount: i64) -> STAmount {
-        if let Some(entry) = self.tab.credits_mpt.get(&issue.mpt_id()) {
-            amount -= entry.self_debit as i64;
-        }
+    fn balance_hook_self_issue_mpt(&self, issue: MPTIssue, amount: i64) -> STAmount {
+        let amount = self.tab.balance_self_issue_mpt(issue, amount);
         self.base.balance_hook_self_issue_mpt(issue, amount)
     }
 
@@ -382,6 +424,27 @@ where
         self.tab.credit_iou(from, to, amount, pre_credit_balance);
     }
 
+    fn credit_hook_mpt(
+        &mut self,
+        from: AccountID,
+        to: AccountID,
+        amount: STAmount,
+        pre_credit_balance_holder: u64,
+        pre_credit_balance_issuer: i64,
+    ) {
+        self.tab.credit_mpt(
+            from,
+            to,
+            amount,
+            pre_credit_balance_holder,
+            pre_credit_balance_issuer,
+        );
+    }
+
+    fn issuer_self_debit_hook_mpt(&mut self, issue: MPTIssue, amount: u64, orig_balance: i64) {
+        self.tab.issuer_self_debit_mpt(issue, amount, orig_balance);
+    }
+
     fn adjust_owner_count_hook(
         &mut self,
         account: AccountID,
@@ -396,7 +459,47 @@ where
 mod tests {
     use super::DeferredCredits;
     use crate::OwnerCounts;
-    use protocol::AccountID;
+    use protocol::{AccountID, MPTAmount, MPTIssue, STAmount, get_field_by_symbol};
+
+    #[test]
+    fn deferred_mpt_credits_and_self_debits_cannot_be_reused() {
+        let issuer = AccountID::from_array([0x31; 20]);
+        let holder = AccountID::from_array([0x32; 20]);
+        let issue = MPTIssue::new(protocol::make_mpt_id(1, issuer));
+        let amount = STAmount::from_mpt_amount(
+            get_field_by_symbol("sfAmount"),
+            MPTAmount::from_value(1),
+            issue,
+        );
+        let mut credits = DeferredCredits::default();
+
+        credits.credit_mpt(issuer, holder, amount, 0, 0);
+        assert_eq!(credits.balance_mpt(holder, issue, 1), 0);
+        assert_eq!(credits.balance_mpt(issuer, issue, -1), 0);
+
+        let self_issue = MPTIssue::new(protocol::make_mpt_id(2, issuer));
+        credits.issuer_self_debit_mpt(self_issue, 3, 10);
+        assert_eq!(credits.balance_self_issue_mpt(self_issue, 10), 7);
+    }
+
+    #[test]
+    fn applying_equal_shaped_mpt_credit_tables_accumulates_both() {
+        let issuer = AccountID::from_array([0x41; 20]);
+        let holder = AccountID::from_array([0x42; 20]);
+        let issue = MPTIssue::new(protocol::make_mpt_id(1, issuer));
+        let amount = STAmount::from_mpt_amount(
+            get_field_by_symbol("sfAmount"),
+            MPTAmount::from_value(1),
+            issue,
+        );
+        let mut first = DeferredCredits::default();
+        let mut second = DeferredCredits::default();
+        first.credit_mpt(issuer, holder, amount.clone(), 0, 10);
+        second.credit_mpt(issuer, holder, amount, 0, 10);
+
+        second.apply(&mut first);
+        assert_eq!(first.balance_mpt(issuer, issue, 10), 8);
+    }
 
     #[test]
     fn deferred_owner_counts_compare_effective_sponsor_reserve() {

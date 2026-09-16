@@ -334,6 +334,16 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
     }
 
     match tx.get_txn_type() {
+        TxType::PAYMENT => {
+            if !crate::run_payment_check_extra_features(
+                tx.is_field_present(get_field_by_symbol("sfCredentialIDs")),
+                rules.enabled(&protocol::feature_id("Credentials")),
+                tx.is_field_present(get_field_by_symbol("sfDomainID")),
+                rules.enabled(&protocol::feature_id("PermissionedDEX")),
+            ) {
+                return Ter::TEM_DISABLED;
+            }
+        }
         TxType::NFTOKEN_MINT => {
             let has_offer_fields = ["sfAmount", "sfDestination", "sfExpiration"]
                 .into_iter()
@@ -2605,7 +2615,7 @@ fn validate_payment_preflight_with_rules(tx: &STTx, rules: &Rules) -> NotTec {
                 .is_none_or(|value| value <= &amount),
         },
         || Ter::TES_SUCCESS,
-        || Ter::TES_SUCCESS,
+        || ledger::credential_helpers::check_fields(tx, rules),
         || Ter::TES_SUCCESS,
     )
 }
@@ -3981,6 +3991,64 @@ mod tests {
                 &Rules::new(std::iter::empty()),
             ),
             Ter::TEM_DISABLED,
+        );
+
+        let mut permissioned_payment = network_payment(None);
+        permissioned_payment.set_account_id(sf("sfAccount"), AccountID::default());
+        permissioned_payment.set_field_h256(sf("sfDomainID"), Uint256::from_u64(1));
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &permissioned_payment,
+                &Rules::new(std::iter::empty()),
+            ),
+            Ter::TEM_DISABLED,
+            "Payment DomainID gate precedes the bad source account",
+        );
+
+        let mut credential_payment = network_payment(None);
+        credential_payment.set_account_id(sf("sfAccount"), AccountID::default());
+        credential_payment.set_field_v256(
+            sf("sfCredentialIDs"),
+            protocol::STVector256::from_values(sf("sfCredentialIDs"), vec![Uint256::from_u64(1)]),
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &credential_payment,
+                &Rules::new(std::iter::empty()),
+            ),
+            Ter::TEM_DISABLED,
+            "Payment CredentialIDs gate precedes the bad source account",
+        );
+
+        let mut empty_credentials = network_payment(None);
+        empty_credentials.set_field_v256(
+            sf("sfCredentialIDs"),
+            protocol::STVector256::from_values(sf("sfCredentialIDs"), vec![]),
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &empty_credentials,
+                &Rules::new([protocol::feature_id("Credentials")]),
+            ),
+            Ter::TEM_MALFORMED,
+            "Payment preflight validates CredentialIDs shape",
+        );
+
+        let mut duplicate_credentials = network_payment(None);
+        duplicate_credentials.set_field_v256(
+            sf("sfCredentialIDs"),
+            protocol::STVector256::from_values(
+                sf("sfCredentialIDs"),
+                vec![Uint256::from_u64(1), Uint256::from_u64(1)],
+            ),
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &duplicate_credentials,
+                &Rules::new([protocol::feature_id("Credentials")]),
+            ),
+            Ter::TEM_MALFORMED,
+            "Payment preflight rejects duplicate CredentialIDs",
         );
 
         let mut amm_bad_source = amm_create(0);

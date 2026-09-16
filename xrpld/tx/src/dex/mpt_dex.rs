@@ -8,8 +8,8 @@ use ledger::views::apply_view::ApplyView;
 use ledger::views::read_view::ReadView;
 use protocol::{
     Asset, Keylet, LedgerEntryType, MPTIssue, STLedgerEntry, Ter, get_field_by_symbol,
-    is_tes_success, lsfMPTAuthorized, lsfMPTCanTrade, lsfMPTCanTransfer, lsfMPTLocked,
-    lsfMPTRequireAuth, mpt_issuance_keylet_from_mptid, mptoken_keylet,
+    is_tes_success, lsfMPTCanTrade, lsfMPTCanTransfer, lsfMPTLocked,
+    mpt_issuance_keylet_from_mptid, mptoken_keylet,
 };
 use std::sync::Arc;
 
@@ -80,37 +80,21 @@ pub fn can_mpt_trade_and_transfer<V: ReadView>(
 /// Check that `account` is authorized to hold the given MPT issuance.
 /// Matches C++ `requireAuth(view, mptIssue, account, AuthType::WeakAuth)`.
 ///
-/// WeakAuth means we do NOT require the MPToken to already exist (it may be
-/// created on demand), but if the issuance has `lsfMPTRequireAuth` then an
-/// existing MPToken must carry `lsfMPTAuthorized`.
+/// WeakAuth allows a missing MPToken so DEX crossing can create it on demand,
+/// while the shared helper still enforces DomainID authorization, recursive
+/// SingleAssetVault underlying authorization, and pseudo-account ordering.
 pub fn require_mpt_auth<V: ReadView>(
     view: &V,
     issue: &MPTIssue,
     account: &protocol::AccountID,
 ) -> Ter {
-    let issuance_keylet = mpt_issuance_keylet_from_mptid(issue.mpt_id());
-    let sle_issuance = match view.read(issuance_keylet) {
-        Ok(Some(sle)) => sle,
-        Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
-        Err(_) => return Ter::TEF_BAD_LEDGER,
-    };
-    let issuer = sle_issuance.get_account_id(sf("sfIssuer"));
-    if issuer == *account {
-        return Ter::TES_SUCCESS;
-    }
-    if !sle_issuance.is_flag(lsfMPTRequireAuth) {
-        return Ter::TES_SUCCESS;
-    }
-    let token_keylet = mptoken_keylet(issuance_keylet.key, account_to_uint160(account));
-    let sle_token = match view.read(token_keylet) {
-        Ok(Some(sle)) => sle,
-        Ok(None) => return Ter::TEC_NO_AUTH,
-        Err(_) => return Ter::TEF_BAD_LEDGER,
-    };
-    if !sle_token.is_flag(lsfMPTAuthorized) {
-        return Ter::TEC_NO_AUTH;
-    }
-    Ter::TES_SUCCESS
+    ledger::mptoken_helpers::require_auth_mpt_with_type(
+        view,
+        issue,
+        account,
+        ledger::mptoken_helpers::MPTAuthType::Weak,
+    )
+    .unwrap_or(Ter::TEF_BAD_LEDGER)
 }
 
 /// Check if the MPT issuance is globally frozen (locked).

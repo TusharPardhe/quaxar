@@ -65,11 +65,7 @@ pub(super) fn record_amm_state(
             state.pool_changed = true;
         }
         LedgerEntryType::MPToken if after.is_flag(protocol::lsfMPTAMM) => {
-            let before_amount = before.map(|sle| optional_u64(sle, sf("sfMPTAmount")));
-            let after_amount = optional_u64(after, sf("sfMPTAmount"));
-            if before_amount != Some(after_amount) {
-                state.pool_changed = true;
-            }
+            state.pool_changed = true;
         }
         _ => {}
     }

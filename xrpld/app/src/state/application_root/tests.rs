@@ -6253,6 +6253,17 @@ fn xchain_commit_queue_consequences_include_native_amount_only() {
 }
 
 #[test]
+fn tentative_invariants_run_before_reset_only_for_success() {
+    assert!(super::tentative_invariant_check_applies(Ter::TES_SUCCESS));
+    for failed in [Ter::TEC_CLAIM, Ter::TEC_KILLED, Ter::TEC_INCOMPLETE] {
+        assert!(
+            !super::tentative_invariant_check_applies(failed),
+            "{failed:?} must reset or select persistent cleanup before invariants",
+        );
+    }
+}
+
+#[test]
 fn metadata_oversize_boundary_matches_pinned_rippled_protocol_cap() {
     assert_eq!(protocol::OVERSIZE_METADATA_CAP, 5_200);
     assert_eq!(protocol::UNFUNDED_OFFER_REMOVE_LIMIT, 1_000);

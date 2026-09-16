@@ -3783,9 +3783,6 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let preamble_item_keys = view.items().keys().copied().collect::<BTreeSet<_>>();
-        let check_failed_mpt_invariants = view
-            .rules()
-            .enabled(&protocol::feature_id("fixCleanup3_4_0"));
         let mut inner = ledger::FlowSandbox::new(view);
         // Transactor::apply updates sfAccountTxnID before doApply so the
         // handler can observe it, but Transactor::reset discards that update
@@ -3849,14 +3846,11 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
 
         let fee_amt = protocol::XRPAmount::from_drops(charged_fee_drops);
 
-        // rippled checks an ordinary tec only after resetting the handler
-        // context to fee/sequence state. At this point `inner` still contains
-        // partial doApply mutations, so only successful state is eligible for
-        // invariant evaluation here.
-        // fixCleanup3_4_0 makes the MPT invariants result-aware: inspect a
-        // failed handler sandbox before reset so a persisted balance/deletion
-        // mutation cannot be silently discarded by this implementation path.
-        if protocol::is_tes_success(result) || check_failed_mpt_invariants {
+        // rippled checks tentative invariants only when the transaction is
+        // eligible to apply. Ordinary tec outcomes reset to fee/sequence state
+        // first; persistent cleanup outcomes are checked against their filtered
+        // cleanup sandbox below.
+        if tentative_invariant_check_applies(result) {
             result = crate::state::invariants::check_invariants_for_tx_with_prefix(
                 &inner,
                 tx,
@@ -4155,6 +4149,11 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
 }
 
 #[inline]
+fn tentative_invariant_check_applies(result: Ter) -> bool {
+    protocol::is_tes_success(result)
+}
+
+#[inline]
 fn exceeds_oversize_metadata_cap(item_count: usize) -> bool {
     item_count > protocol::OVERSIZE_METADATA_CAP
 }
@@ -4294,7 +4293,12 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
                     &rules,
                 )
             } else {
-                per_tx_batch_view.apply().map(|()| metadata.clone())
+                // Open/DryRun Batch uses a fresh per-transaction open view.
+                // PaymentSandbox::apply(RawView&) commits only ledger state;
+                // deferred payment-tab adjustments must not leak into tx2.
+                per_tx_batch_view
+                    .apply_state_only()
+                    .map(|()| metadata.clone())
             };
             if committed.is_err() {
                 return BatchFollowupOutcome {
@@ -4327,7 +4331,7 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
         }
     }
 
-    if !applied_inner_transactions.is_empty() && whole_batch.apply().is_err() {
+    if !applied_inner_transactions.is_empty() && whole_batch.apply_state_only().is_err() {
         return BatchFollowupOutcome {
             result: Ter::TEF_INTERNAL,
             applied_inner_transactions: Vec::new(),

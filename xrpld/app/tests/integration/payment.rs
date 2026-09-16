@@ -421,34 +421,56 @@ fn payment_iou_issuer_redemption_waives_transfer_rate() {
     }
 }
 
-/// C++ Flow_test — IOU payment to frozen destination fails.
+/// Testnet ledgers 20,782,726 and 20,782,741: an endpoint holder's
+/// issuer-side freeze and NoRipple flags do not freeze that holder. The issuer
+/// may redeem from the source and issue to the destination through the default
+/// two-DirectStep path.
 #[test]
-fn payment_iou_frozen_destination() {
-    let alice = acct(0x11);
-    let bob = acct(0x22);
-    let gw = acct(0x33);
+fn payment_iou_issuer_side_freeze_does_not_block_endpoint_delivery() {
+    let gw = acct(0x11);
+    let alice = acct(0x22);
+    let bob = acct(0x33);
     let usd = usd_currency();
 
-    // Bob's trust line is frozen
-    let mut bob_tl = trust_line(bob, gw, usd, 0, 10000, 0);
-    bob_tl.set_field_u32(sf("sfFlags"), 0x00400000); // lsfLowFreeze (bob is low since bob < gw)
+    // The issuer is low and the holders are high. lsfLowFreeze freezes the
+    // issuer side, not either holder; high NoRipple is endpoint-only.
+    let mut alice_line = trust_line(gw, alice, usd, -1_000, 0, 10_000);
+    alice_line.set_field_u32(sf("sfFlags"), protocol::lsfHighNoRipple);
+    let mut bob_line = trust_line(gw, bob, usd, 0, 0, 10_000);
+    bob_line.set_field_u32(
+        sf("sfFlags"),
+        protocol::lsfLowFreeze | protocol::lsfHighNoRipple,
+    );
 
     let ledger = build_ledger(vec![
         account_root(alice, 5_000_000_000, 1, 0),
         account_root(bob, 5_000_000_000, 1, 0),
         account_root(gw, 5_000_000_000, 0, 0),
-        trust_line(alice, gw, usd, 1000, 10000, 0),
-        bob_tl,
+        alice_line,
+        bob_line,
     ]);
     let mut view = new_view(ledger);
 
     let tx = payment_tx(alice, bob, iou(gw, usd, 100), 1);
-    let result = handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None);
-    // Should fail — destination is frozen
-    assert!(
-        result == Ter::TEC_PATH_DRY || result == Ter::TEC_FROZEN || result == Ter::TEC_PATH_PARTIAL,
-        "Expected frozen/dry error, got {:?}",
-        result
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None),
+        Ter::TES_SUCCESS
+    );
+    let alice_line = view
+        .read(protocol::line(alice, gw, usd))
+        .expect("source line read")
+        .expect("source line exists");
+    let bob_line = view
+        .read(protocol::line(bob, gw, usd))
+        .expect("destination line read")
+        .expect("destination line exists");
+    assert_eq!(
+        alice_line.get_field_amount(sf("sfBalance")).iou(),
+        IOUAmount::from_parts(-900, 0).expect("source redeems 100")
+    );
+    assert_eq!(
+        bob_line.get_field_amount(sf("sfBalance")).iou(),
+        IOUAmount::from_parts(-100, 0).expect("issuer delivers 100")
     );
 }
 

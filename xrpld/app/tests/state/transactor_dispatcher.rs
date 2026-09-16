@@ -1615,7 +1615,9 @@ fn escrow_finish_created_mpt_records_its_issuance_id() {
         ],
     );
     ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV1"),
         protocol::feature_id("fixTokenEscrowV1"),
+        protocol::feature_id("fixCleanup3_2_0"),
         protocol::feature_id("fixCleanup3_4_0"),
         protocol::feature_id("TokenEscrow"),
     ]));
@@ -5718,7 +5720,12 @@ fn mpt_escrow_create_then_finish_tracks_gross_lock_across_fix_token_escrow_v1() 
         });
         let mut finish_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut finish_view, &finish, TxType::ESCROW_FINISH, None),
+            handle_real_dispatch(
+                &mut finish_view,
+                &finish,
+                TxType::ESCROW_FINISH,
+                Some(1_000_000),
+            ),
             Ter::TES_SUCCESS,
             "MPT escrow finish must succeed with amendment enabled={amendment_enabled}"
         );
@@ -5857,7 +5864,12 @@ fn mpt_escrow_create_then_cancel_enforces_boundary_and_releases_full_lock() {
         });
         let mut boundary_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut boundary_view, &cancel, TxType::ESCROW_CANCEL, None),
+            handle_real_dispatch(
+                &mut boundary_view,
+                &cancel,
+                TxType::ESCROW_CANCEL,
+                Some(1_000_000),
+            ),
             Ter::TEC_NO_PERMISSION,
             "CancelAfter is not cancellable at its exact boundary"
         );
@@ -5867,7 +5879,12 @@ fn mpt_escrow_create_then_cancel_enforces_boundary_and_releases_full_lock() {
         ledger.set_ledger_info(header);
         let mut cancel_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut cancel_view, &cancel, TxType::ESCROW_CANCEL, None),
+            handle_real_dispatch(
+                &mut cancel_view,
+                &cancel,
+                TxType::ESCROW_CANCEL,
+                Some(1_000_000),
+            ),
             Ter::TES_SUCCESS,
             "MPT escrow cancel must succeed after CancelAfter with amendment enabled={amendment_enabled}"
         );
@@ -5985,7 +6002,7 @@ fn mpt_escrow_cancel_missing_owner_holding_matches_cleanup_3_2_0_boundary() {
         ledger.set_rules(protocol::Rules::new(features));
         let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut view, &cancel, TxType::ESCROW_CANCEL, None),
+            handle_real_dispatch(&mut view, &cancel, TxType::ESCROW_CANCEL, Some(0)),
             expected,
             "fixCleanup3_2_0 enabled={cleanup_enabled}"
         );
@@ -6004,14 +6021,16 @@ fn payment_transfers_mpt_without_rewriting_issue() {
         protocol::MPTAmount::from_value(10),
         mpt_issue,
     );
-    let ledger = empty_ledger(vec![
+    let mut ledger = empty_ledger(vec![
         account_root_with_balance(source, 1, 0, 1_000_000_000),
-        account_root_with_balance(destination, 0, 0, 1_000_000_000),
+        account_root_with_balance(destination, 1, 0, 1_000_000_000),
         account_root(issuer, 1, 0),
         mpt_issuance_entry(issuer, 1, 100, protocol::lsfMPTCanTransfer),
         mptoken_entry(source, mpt_id, 50),
+        mptoken_entry(destination, mpt_id, 0),
     ]);
-    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
+    let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::PAYMENT, |object| {
         object.set_account_id(get_field_by_symbol("sfAccount"), source);
         object.set_account_id(get_field_by_symbol("sfDestination"), destination);
@@ -6023,7 +6042,7 @@ fn payment_transfers_mpt_without_rewriting_issue() {
         object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None);
+    let result = handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000_000));
 
     assert_eq!(result, Ter::TES_SUCCESS);
     let source_token = view
@@ -6047,6 +6066,120 @@ fn payment_transfers_mpt_without_rewriting_issue() {
     assert_eq!(
         destination_token.get_field_u64(get_field_by_symbol("sfMPTAmount")),
         10
+    );
+}
+
+#[test]
+fn payment_legacy_mpt_rejects_missing_destination_holding() {
+    let source = sample_account(0xDA);
+    let destination = sample_account(0xDB);
+    let issuer = sample_account(0xDC);
+    let mpt_id = share_id_for(issuer, 1);
+    let amount = STAmount::from_mpt_amount(
+        sf("sfAmount"),
+        MPTAmount::from_value(25_000),
+        MPTIssue::new(mpt_id),
+    );
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 1_000_000_000),
+        account_root(issuer, 1, 0),
+        mpt_issuance_entry(issuer, 1, 25_000, protocol::lsfMPTCanTransfer),
+        mptoken_entry(source, mpt_id, 25_000),
+    ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
+    let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
+    assert!(!view.rules().enabled(&protocol::feature_id("MPTokensV2")));
+    assert_eq!(
+        ledger::mptoken_helpers::require_auth_mpt(&view, &MPTIssue::new(mpt_id), &source)
+            .expect("source auth read"),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        ledger::mptoken_helpers::require_auth_mpt(&view, &MPTIssue::new(mpt_id), &destination)
+            .expect("destination auth read"),
+        Ter::TEC_NO_AUTH
+    );
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), source);
+        tx.set_account_id(sf("sfDestination"), destination);
+        tx.set_field_amount(sf("sfAmount"), amount);
+        tx.set_field_amount(sf("sfFee"), test_xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000_000),),
+        Ter::TEC_NO_AUTH,
+        "Payment uses rippled Legacy authorization rather than Weak auto-creation"
+    );
+    assert!(
+        view.read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(destination),
+        ))
+        .expect("destination token read")
+        .is_none()
+    );
+}
+
+#[test]
+fn payment_legacy_mpt_fee_quote_and_debit_use_non_directed_rounding() {
+    let source = sample_account(0xDD);
+    let destination = sample_account(0xDE);
+    let issuer = sample_account(0xDF);
+    let mpt_id = share_id_for(issuer, 1);
+    let amount = STAmount::from_mpt_amount(
+        sf("sfAmount"),
+        MPTAmount::from_value(1),
+        MPTIssue::new(mpt_id),
+    );
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 1, 0, 1_000_000_000),
+        account_root(issuer, 1, 0),
+        mpt_issuance_entry_with_transfer_fee(issuer, 1, 2, protocol::lsfMPTCanTransfer, 25_000),
+        mptoken_entry(source, mpt_id, 2),
+        mptoken_entry(destination, mpt_id, 0),
+    ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
+    let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), source);
+        tx.set_account_id(sf("sfDestination"), destination);
+        tx.set_field_amount(sf("sfAmount"), amount);
+        tx.set_field_amount(sf("sfFee"), test_xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000_000)),
+        Ter::TES_SUCCESS,
+    );
+    let source_token = view
+        .read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(source),
+        ))
+        .expect("source token read")
+        .expect("source token");
+    let destination_token = view
+        .read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(destination),
+        ))
+        .expect("destination token read")
+        .expect("destination token");
+    let issuance = view
+        .read(protocol::mpt_issuance_keylet_from_mptid(mpt_id))
+        .expect("issuance read")
+        .expect("issuance");
+    assert_eq!(source_token.get_field_u64(sf("sfMPTAmount")), 1);
+    assert_eq!(destination_token.get_field_u64(sf("sfMPTAmount")), 1);
+    assert_eq!(
+        issuance.get_field_u64(sf("sfOutstandingAmount")),
+        2,
+        "1 * 1.25 rounds to 1 in rippled's non-directed operation",
     );
 }
 

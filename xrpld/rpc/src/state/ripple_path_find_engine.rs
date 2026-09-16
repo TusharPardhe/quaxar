@@ -679,6 +679,7 @@ fn run_calc(
             default_paths_allowed,
             limit_quality: false,
             is_ledger_open: false,
+            send_max_present: true,
             domain_id: request.domain,
         },
     )
@@ -704,6 +705,7 @@ fn path_liquidity(
         default_paths_allowed: false,
         limit_quality: false,
         is_ledger_open: false,
+        send_max_present: true,
         domain_id: request.domain,
     };
     let first = ledger::ripple_calc::ripple_calculate(
