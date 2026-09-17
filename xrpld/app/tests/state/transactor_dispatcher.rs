@@ -447,6 +447,14 @@ fn amm_entry(
     entry
 }
 
+fn amm_mpt_xrp_lpt_issue(amm_account: AccountID, mpt_issue: MPTIssue) -> Issue {
+    protocol::amm_lpt_issue_from_assets(
+        Asset::MPTIssue(mpt_issue),
+        Asset::Issue(xrp_issue()),
+        amm_account,
+    )
+}
+
 fn amm_mpt_xrp_entry(
     amm_account: AccountID,
     mpt_issue: MPTIssue,
@@ -471,7 +479,7 @@ fn amm_mpt_xrp_entry(
         STAmount::from_iou_amount(
             sf_generic(),
             IOUAmount::from_parts(lp_balance, 0).expect("lp balance"),
-            Issue::new(currency_from_string("LPT"), amm_account),
+            amm_mpt_xrp_lpt_issue(amm_account, mpt_issue),
         ),
     );
     entry.set_field_issue(
@@ -15024,7 +15032,7 @@ fn loan_pay_dispatch_rejects_zero_vault_credit_after_rounding_before_transfer() 
 }
 
 #[test]
-fn amm_vote_dispatch_updates_vote_slots_and_weighted_fee() {
+fn amm_vote_submit_shell_updates_vote_slots_and_weighted_fee() {
     let voter = sample_account(0x11);
     let existing_lp = sample_account(0x12);
     let amm_account = sample_account(0x22);
@@ -15044,7 +15052,7 @@ fn amm_vote_dispatch_updates_vote_slots_and_weighted_fee() {
     );
     let mut ledger = empty_ledger(vec![
         account_root(amm_account, 0, 0),
-        account_root(voter, 0, 0),
+        account_root_with_balance(voter, 0, 0, 1_000_000_000),
         account_root(existing_lp, 0, 0),
         amm,
         trust_line_entry(voter, amm_account, lpt_currency, 600),
@@ -15071,7 +15079,7 @@ fn amm_vote_dispatch_updates_vote_slots_and_weighted_fee() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_VOTE, None);
+    let result = apply_submit_transactor_shell(&mut view, &tx, TxType::AMM_VOTE);
     assert_eq!(result, Ter::TES_SUCCESS);
 
     let amm_entry = view
@@ -15914,7 +15922,7 @@ fn amm_bid_finds_mpt_xrp_pool_by_full_asset_key() {
     let amm_account = sample_account(0x43);
     let mpt_id = share_id_for(issuer, 1);
     let mpt_issue = protocol::MPTIssue::new(mpt_id);
-    let lp_issue = Issue::new(currency_from_string("LPT"), amm_account);
+    let lp_issue = amm_mpt_xrp_lpt_issue(amm_account, mpt_issue);
     let mpt_asset =
         STAmount::from_mpt_amount(sf("sfAsset"), protocol::MPTAmount::from_value(0), mpt_issue);
     let xrp_asset = STAmount::from_xrp_amount(XRPAmount::from_drops(0));
@@ -16351,7 +16359,7 @@ fn amm_withdraw_fix_v1_2_creates_missing_mpt_holding_only_after_amendment() {
             STAmount::from_iou_amount(
                 sf("sfLPTokenIn"),
                 IOUAmount::from_parts(1, 0).expect("lp amount"),
-                Issue::new(currency_from_string("LPT"), amm_account),
+                amm_mpt_xrp_lpt_issue(amm_account, mpt_issue),
             ),
         );
         tx.set_field_amount(
@@ -16377,7 +16385,7 @@ fn amm_withdraw_fix_v1_2_creates_missing_mpt_holding_only_after_amendment() {
             trust_line_entry_iou(
                 account,
                 amm_account,
-                currency_from_string("LPT"),
+                amm_mpt_xrp_lpt_issue(amm_account, mpt_issue).currency,
                 IOUAmount::from_parts(1, 0).expect("lp trustline balance"),
             ),
             amm_mpt_xrp_entry(amm_account, mpt_issue, 100, 100),
@@ -16443,7 +16451,7 @@ fn amm_withdraw_rejects_require_auth_mpt_asset_without_authorization() {
             STAmount::from_iou_amount(
                 sf("sfLPTokenIn"),
                 IOUAmount::from_parts(1, 0).expect("lp amount"),
-                Issue::new(currency_from_string("LPT"), amm_account),
+                amm_mpt_xrp_lpt_issue(amm_account, mpt_issue),
             ),
         );
         tx.set_field_amount(
@@ -16496,7 +16504,7 @@ fn amm_withdraw_rejects_locked_mpt_asset_before_pool_mutation() {
             STAmount::from_iou_amount(
                 sf("sfLPTokenIn"),
                 IOUAmount::from_parts(1, 0).expect("lp amount"),
-                Issue::new(currency_from_string("LPT"), amm_account),
+                amm_mpt_xrp_lpt_issue(amm_account, mpt_issue),
             ),
         );
         tx.set_field_amount(
@@ -16548,7 +16556,7 @@ fn amm_withdraw_rejects_locked_mpt_pool_holding_before_pool_mutation() {
             STAmount::from_iou_amount(
                 sf("sfLPTokenIn"),
                 IOUAmount::from_parts(1, 0).expect("lp amount"),
-                Issue::new(currency_from_string("LPT"), amm_account),
+                amm_mpt_xrp_lpt_issue(amm_account, mpt_issue),
             ),
         );
         tx.set_field_amount(
@@ -16666,7 +16674,7 @@ fn amm_clawback_fix_v1_2_recreates_authorized_mpt_then_redeems_to_issuer() {
     let mpt_id = share_id_for(issuer, 1);
     let mpt_issue = MPTIssue::new(mpt_id);
     let xrp = xrp_issue();
-    let lpt_currency = currency_from_string("LPT");
+    let lpt_currency = amm_mpt_xrp_lpt_issue(amm_account, mpt_issue).currency;
 
     let mut ledger = empty_ledger(vec![
         account_root(issuer, 0, 0),

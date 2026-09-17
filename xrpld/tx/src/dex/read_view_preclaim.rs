@@ -446,21 +446,31 @@ fn clawback_disabled<V: ReadView>(view: &V, asset: Asset) -> Result<Ter, Ter> {
     }
 }
 
-/// Computes the LP balance using the same canonical trust-line orientation as
-/// `ammLPHolds` in rippled. The AMM LP token is always an IOU issue.
+/// Computes the LP balance with the exact `ammLPHolds` condition set:
+/// derive the LP currency from the pool assets, apply issuer/global freeze,
+/// orient the trust-line balance to the LP, then apply deferred-credit hooks.
 fn lp_holds<V: ReadView>(
     view: &V,
     amm: &protocol::STLedgerEntry,
     account: AccountID,
 ) -> Result<protocol::STAmount, Ter> {
-    let lp_total = amm.get_field_amount(sf("sfLPTokenBalance"));
-    let issue = lp_total.issue();
+    let asset = amm.get_field_issue(sf("sfAsset")).asset();
+    let asset2 = amm.get_field_issue(sf("sfAsset2")).asset();
     let amm_account = amm.get_account_id(sf("sfAccount"));
+    let issue = protocol::amm_lpt_issue_from_assets(asset, asset2, amm_account);
+    let zero = STAmount::from_iou_amount(sf("sfLPTokenBalance"), IOUAmount::new(), issue);
+
+    if read_account(view, amm_account)?
+        .is_some_and(|issuer| issuer.get_field_u32(sf("sfFlags")) & lsfGlobalFreeze != 0)
+    {
+        return Ok(zero);
+    }
+
     let Some(line) = view
         .read(protocol::line(account, amm_account, issue.currency))
         .map_err(|_| read_error())?
     else {
-        return Ok(lp_total.zeroed());
+        return Ok(zero);
     };
     let frozen_flag = if amm_account > account {
         lsfHighFreeze
@@ -468,7 +478,7 @@ fn lp_holds<V: ReadView>(
         lsfLowFreeze
     };
     if line.get_field_u32(sf("sfFlags")) & frozen_flag != 0 {
-        return Ok(lp_total.zeroed());
+        return Ok(zero);
     }
 
     let mut balance = line.get_field_amount(sf("sfBalance"));
@@ -476,7 +486,7 @@ fn lp_holds<V: ReadView>(
         balance.negate();
     }
     balance.set_issuer(amm_account);
-    Ok(balance)
+    Ok(view.balance_hook_iou(account, amm_account, balance))
 }
 
 fn amount_for_asset(asset: Asset) -> STAmount {
@@ -1818,6 +1828,70 @@ mod tests {
             tx.set_field_u32(sf("sfSequence"), 1);
         });
         (view, tx)
+    }
+
+    #[test]
+    fn testnet_20833348_amm_vote_reads_valid_lp_and_rejects_missing_lp_line() {
+        // Testnet transactions 728FC737...E64533 and 5712B00F...296335
+        // are XRP/USD votes by the sole LP. Both parent ledgers report a
+        // positive 3162.277660168379 LP balance. Preserve that asset and
+        // trust-line shape here; the integral amount is sufficient to pin the
+        // nonzero condition that canonical AMMVote::preclaim requires.
+        let voter = protocol::parse_base58_account_id("rP1jajKQ3QyXQqVRcTvmaC47WCXsgQZezZ")
+            .expect("Testnet voter");
+        let amm_account = protocol::parse_base58_account_id("rwkxJxHXEdV3WD9WyoQHkHbPLqJvTJ5JPd")
+            .expect("Testnet AMM account");
+        let usd_issuer = protocol::parse_base58_account_id("rDodBaXt5tB4VbJLp1VvdULwJ128kaCKDK")
+            .expect("Testnet USD issuer");
+        let xrp = Asset::Issue(protocol::xrp_issue());
+        let usd = Asset::Issue(Issue::new(
+            protocol::currency_from_string("USD"),
+            usd_issuer,
+        ));
+        let lp_currency = protocol::amm_lpt_currency(
+            protocol::xrp_currency(),
+            protocol::currency_from_string("USD"),
+        );
+        let (low, high, raw_balance) = if voter < amm_account {
+            (voter, amm_account, 3_162)
+        } else {
+            (amm_account, voter, -3_162)
+        };
+
+        let mut view = View {
+            rules: Rules::new([protocol::feature_id("AMM")]),
+            ..View::default()
+        };
+        view.insert(amm_entry(amm_account, xrp, usd, 3_162));
+        view.insert(trust_line_entry(low, high, lp_currency, raw_balance, 0));
+
+        let tx = STTx::new(TxType::AMM_VOTE, |tx| {
+            tx.set_account_id(sf("sfAccount"), voter);
+            tx.set_field_issue(
+                sf("sfAsset"),
+                protocol::STIssue::new_with_asset(sf("sfAsset"), xrp),
+            );
+            tx.set_field_issue(
+                sf("sfAsset2"),
+                protocol::STIssue::new_with_asset(sf("sfAsset2"), usd),
+            );
+            tx.set_field_u16(sf("sfTradingFee"), 500);
+            tx.set_field_u32(sf("sfFlags"), 0);
+        });
+
+        assert_eq!(
+            run_dex_read_view_preclaim(&view, &tx, TxType::AMM_VOTE),
+            Some(Ter::TES_SUCCESS),
+            "a real LP's vote must pass preclaim"
+        );
+
+        view.entries
+            .remove(&protocol::line(voter, amm_account, lp_currency).key);
+        assert_eq!(
+            run_dex_read_view_preclaim(&view, &tx, TxType::AMM_VOTE),
+            Some(Ter::TEC_AMM_INVALID_TOKENS),
+            "a voter with no LP trust line remains invalid"
+        );
     }
 
     #[test]

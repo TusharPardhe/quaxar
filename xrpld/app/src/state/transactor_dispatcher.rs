@@ -1491,21 +1491,40 @@ fn amm_lp_holds_in_view<V: ledger::ApplyView>(
     amm_sle: &STLedgerEntry,
     lp_account: AccountID,
 ) -> Result<Option<STAmount>, ledger::ViewError> {
-    let lp_tokens = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
-    let Asset::Issue(lp_issue) = lp_tokens.asset() else {
-        return Ok(None);
-    };
+    let asset = amm_sle.get_field_issue(sf("sfAsset")).asset();
+    let asset2 = amm_sle.get_field_issue(sf("sfAsset2")).asset();
     let amm_account = amm_sle.get_account_id(sf("sfAccount"));
+    let lp_issue = protocol::amm_lpt_issue_from_assets(asset, asset2, amm_account);
+    let zero = STAmount::from_iou_amount(sf("sfLPTokenBalance"), IOUAmount::new(), lp_issue);
+
+    if view
+        .read(protocol::account_keylet(Uint160::from_void(
+            amm_account.data(),
+        )))?
+        .is_some_and(|issuer| issuer.is_flag(protocol::lsfGlobalFreeze))
+    {
+        return Ok(Some(zero));
+    }
+
     let keylet = protocol::line(lp_account, amm_account, lp_issue.currency);
-    let Some(sle) = view.peek(keylet)? else {
-        return Ok(None);
+    let Some(sle) = view.read(keylet)? else {
+        return Ok(Some(zero));
     };
+    let issuer_freeze = if amm_account > lp_account {
+        protocol::lsfHighFreeze
+    } else {
+        protocol::lsfLowFreeze
+    };
+    if sle.is_flag(issuer_freeze) {
+        return Ok(Some(zero));
+    }
+
     let mut amount = sle.get_field_amount(sf("sfBalance"));
     if lp_account > amm_account {
         amount.negate();
     }
     amount.set_issuer(amm_account);
-    Ok(Some(amount))
+    Ok(Some(view.balance_hook_iou(lp_account, amm_account, amount)))
 }
 
 fn nft_locate_page<V: ledger::ApplyView>(
