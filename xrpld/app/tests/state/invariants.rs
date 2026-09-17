@@ -42,6 +42,17 @@ fn test_ledger() -> Ledger {
     ledger
 }
 
+fn vault_ledger() -> Ledger {
+    let mut ledger = test_ledger();
+    // VaultCreate/VaultDelete are gated by SingleAssetVault in rippled's
+    // transaction settings; their pseudo-account lifecycle is invalid without it.
+    ledger.set_rules(Rules::new([
+        feature_id("fixCleanup3_2_0"),
+        feature_id("SingleAssetVault"),
+    ]));
+    ledger
+}
+
 fn mpt_v2_ledger() -> Ledger {
     let mut ledger = test_ledger();
     ledger.set_rules(Rules::new([
@@ -478,6 +489,13 @@ fn with_amm_invariant_flow<R>(f: impl FnOnce(&mut FlowSandbox<Sandbox<Ledger>>) 
     f(&mut flow)
 }
 
+fn with_vault_flow<R>(f: impl FnOnce(&mut FlowSandbox<Sandbox<Ledger>>) -> R) -> R {
+    let base = Arc::new(vault_ledger());
+    let mut parent = Sandbox::new(base, ApplyFlags::default());
+    let mut flow = FlowSandbox::new(&mut parent);
+    f(&mut flow)
+}
+
 fn with_lending_flow<R>(f: impl FnOnce(&mut FlowSandbox<Sandbox<Ledger>>) -> R) -> R {
     let base = Arc::new(lending_ledger());
     let mut parent = Sandbox::new(base, ApplyFlags::default());
@@ -607,6 +625,12 @@ fn amm_entry_with_pool(
 fn vault_pseudo_account_root(account: AccountID, vault_id: Uint256) -> STLedgerEntry {
     let mut sle = account_root(account);
     sle.set_field_h256(sf("sfVaultID"), vault_id);
+    // ValidNewAccountRoot requires this exact flag set for a sequence-zero
+    // pseudo account once SingleAssetVault is enabled.
+    sle.set_field_u32(
+        sf("sfFlags"),
+        protocol::lsfDisableMaster | protocol::lsfDefaultRipple | protocol::lsfDepositAuth,
+    );
     sle
 }
 
@@ -775,9 +799,18 @@ fn offer_entry(
         sf("sfTakerPays"),
         STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
     );
+    // Keep PermissionedDEX fixtures otherwise valid: NoBadOffers rejects
+    // XRP-for-XRP offers independently of the permissioned-offer invariant.
     sle.set_field_amount(
         sf("sfTakerGets"),
-        STAmount::from_xrp_amount(XRPAmount::from_drops(2)),
+        STAmount::from_iou_amount(
+            sf("sfTakerGets"),
+            IOUAmount::from_parts(2, 0).expect("offer amount"),
+            Issue {
+                currency: iou_currency(b"USD"),
+                account,
+            },
+        ),
     );
     if flags != 0 {
         sle.set_field_u32(sf("sfFlags"), flags);
@@ -1474,12 +1507,7 @@ fn clawback_negative_final_iou_balance_is_always_an_invariant_failure() {
     });
 
     assert_eq!(
-        check_invariants_for_tx(
-            &flow,
-            &tx,
-            Ter::TES_SUCCESS,
-            XRPAmount::from_drops(10)
-        ),
+        check_invariants_for_tx(&flow, &tx, Ter::TES_SUCCESS, XRPAmount::from_drops(10)),
         Ter::TEC_INVARIANT_FAILED,
         "InvariantCheck.cpp rejects a negative final IOU balance regardless of MPTokensV2",
     );
@@ -2267,7 +2295,7 @@ fn invariant_rejects_reference_holding_on_non_vault_create_issuance() {
 
 #[test]
 fn invariant_allows_reference_holding_on_vault_create_issuance() {
-    with_flow(|flow| {
+    with_vault_flow(|flow| {
         let issuer = acct(0x2B);
         let owner = acct(0x2C);
         let asset = Asset::Issue(Issue {
@@ -2366,7 +2394,7 @@ fn invariant_rejects_vault_pseudo_mpt_holding_deleted_by_non_vault_delete() {
 
 #[test]
 fn invariant_allows_vault_pseudo_mpt_holding_deleted_by_vault_delete() {
-    let base = Arc::new(test_ledger());
+    let base = Arc::new(vault_ledger());
     let mut parent = Sandbox::new(base, ApplyFlags::default());
     let issuer = acct(0x2F);
     let pseudo = acct(0x30);
@@ -2387,8 +2415,9 @@ fn invariant_allows_vault_pseudo_mpt_holding_deleted_by_vault_delete() {
     );
     let issuance = mpt_issuance_entry(issuer, 1, 0, 0);
     let token = mptoken_entry(pseudo, issuer, 1, 0);
+    let pseudo_root = vault_pseudo_account_root(pseudo, vault_id);
     parent
-        .insert(Arc::new(vault_pseudo_account_root(pseudo, vault_id)))
+        .insert(Arc::new(pseudo_root.clone()))
         .expect("insert pseudo root");
     parent
         .insert(Arc::new(vault.clone()))
@@ -2404,6 +2433,10 @@ fn invariant_allows_vault_pseudo_mpt_holding_deleted_by_vault_delete() {
     flow.erase(Arc::new(vault)).expect("erase vault");
     flow.erase(Arc::new(issuance)).expect("erase issuance");
     flow.erase(Arc::new(token)).expect("erase mptoken");
+    // VaultDelete has MustDeleteAcct privilege, so the positive control must
+    // include the pseudo AccountRoot teardown performed by the real transactor.
+    flow.erase(Arc::new(pseudo_root))
+        .expect("erase pseudo root");
 
     assert_eq!(
         check_invariants(

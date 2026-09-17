@@ -3943,7 +3943,12 @@ mod tests {
             None,
             false,
         );
-        payment.set_field_u32(sf("sfFlags"), protocol::tfSell);
+        // 0x00080000 (tfSell) is a valid Payment flag: it is tfSponsorCreatedAccount,
+        // which shares the same bit in rippled's TxFlags. Use a bit that is genuinely
+        // outside PAYMENT_FLAGS_MASK so the flag mask actually rejects it, matching
+        // rippled Payment::getFlagsMask running before the common Fee check.
+        const INVALID_PAYMENT_FLAG: u32 = 0x0010_0000;
+        payment.set_field_u32(sf("sfFlags"), INVALID_PAYMENT_FLAG);
         payment.set_field_amount(sf("sfFee"), iou(sf("sfFee"), fee_issuer, 0x31));
         assert_eq!(
             validate_sttx_transaction_preflight_with_rules(&payment, &rules),
