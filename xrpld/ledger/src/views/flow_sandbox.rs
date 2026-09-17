@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use basics::base_uint::{Uint160, Uint256};
 use protocol::{
-    ApplyFlags, Keylet, LedgerEntryType, Rules, SField, STLedgerEntry, STObject, SerializedTypeId,
-    StBase, XRPAmount, account_keylet, get_field_by_symbol,
+    AccountID, ApplyFlags, Keylet, LedgerEntryType, MPTIssue, Rules, SField, STAmount,
+    STLedgerEntry, STObject, SerializedTypeId, StBase, XRPAmount, account_keylet,
+    get_field_by_symbol,
 };
 
 use crate::raw_view::RawView;
@@ -36,6 +37,27 @@ struct TxMetaPlan {
     new_mod: BTreeMap<Uint256, Arc<STLedgerEntry>>,
 }
 
+enum DeferredCreditEvent {
+    Iou {
+        from: AccountID,
+        to: AccountID,
+        amount: STAmount,
+        pre_credit_balance: STAmount,
+    },
+    Mpt {
+        from: AccountID,
+        to: AccountID,
+        amount: STAmount,
+        pre_credit_balance_holder: u64,
+        pre_credit_balance_issuer: i64,
+    },
+    MptIssuerSelfDebit {
+        issue: MPTIssue,
+        amount: u64,
+        orig_balance: i64,
+    },
+}
+
 /// A child view that captures writes locally and can be applied or discarded.
 /// Matches reference flow() internal sandbox: only applied on tesSUCCESS via finishFlow.
 pub struct FlowSandbox<'a, V: ApplyView + ?Sized> {
@@ -43,6 +65,9 @@ pub struct FlowSandbox<'a, V: ApplyView + ?Sized> {
     items: BTreeMap<Uint256, Entry>,
     drops_destroyed: XRPAmount,
     flags: Option<ApplyFlags>,
+    deferred_credits: super::payment_sandbox::DeferredCredits,
+    deferred_credit_events: Vec<DeferredCreditEvent>,
+    deferred_owner_count_events: Vec<(AccountID, crate::OwnerCounts, crate::OwnerCounts)>,
 }
 
 impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
@@ -52,6 +77,9 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
             items: BTreeMap::new(),
             drops_destroyed: XRPAmount::from_drops(0),
             flags: None,
+            deferred_credits: super::payment_sandbox::DeferredCredits::default(),
+            deferred_credit_events: Vec::new(),
+            deferred_owner_count_events: Vec::new(),
         }
     }
 
@@ -64,6 +92,9 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
             items: BTreeMap::new(),
             drops_destroyed: XRPAmount::from_drops(0),
             flags: Some(flags),
+            deferred_credits: super::payment_sandbox::DeferredCredits::default(),
+            deferred_credit_events: Vec::new(),
+            deferred_owner_count_events: Vec::new(),
         }
     }
 
@@ -456,8 +487,21 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         Ok(plan.meta)
     }
 
-    /// Apply all captured changes to the parent view. Call on tesSUCCESS.
-    pub fn apply(mut self) -> Result<(), ViewError> {
+    /// Apply all captured state and deferred payment adjustments to a parent
+    /// payment sandbox. This is `PaymentSandbox::apply(PaymentSandbox&)`.
+    pub fn apply(self) -> Result<(), ViewError> {
+        self.apply_impl(true)
+    }
+
+    /// Apply only captured ledger state to a raw/open transaction boundary.
+    /// This is `PaymentSandbox::apply(RawView&)`: deferred credit and owner
+    /// count adjustments are scoped to one payment and must not cross into a
+    /// later transaction (including the next inner transaction in a Batch).
+    pub fn apply_state_only(self) -> Result<(), ViewError> {
+        self.apply_impl(false)
+    }
+
+    fn apply_impl(mut self, propagate_deferred: bool) -> Result<(), ViewError> {
         self.validate_parent_commit("FlowSandbox::apply")?;
         // `TapDryRun` must not burn the immutable ledger's XRP total.
         if self.drops_destroyed.drops() > 0
@@ -498,6 +542,43 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
                     }
                     self.parent.erase(entry.sle)?;
                 }
+            }
+        }
+        if propagate_deferred {
+            for event in self.deferred_credit_events {
+                match event {
+                    DeferredCreditEvent::Iou {
+                        from,
+                        to,
+                        amount,
+                        pre_credit_balance,
+                    } => self
+                        .parent
+                        .credit_hook_iou(from, to, amount, pre_credit_balance),
+                    DeferredCreditEvent::Mpt {
+                        from,
+                        to,
+                        amount,
+                        pre_credit_balance_holder,
+                        pre_credit_balance_issuer,
+                    } => self.parent.credit_hook_mpt(
+                        from,
+                        to,
+                        amount,
+                        pre_credit_balance_holder,
+                        pre_credit_balance_issuer,
+                    ),
+                    DeferredCreditEvent::MptIssuerSelfDebit {
+                        issue,
+                        amount,
+                        orig_balance,
+                    } => self
+                        .parent
+                        .issuer_self_debit_hook_mpt(issue, amount, orig_balance),
+                }
+            }
+            for (account, cur, next) in self.deferred_owner_count_events {
+                self.parent.adjust_owner_count_hook(account, cur, next);
             }
         }
         Ok(())
@@ -711,6 +792,38 @@ impl<'a, V: ApplyView + ?Sized> ReadView for FlowSandbox<'a, V> {
     fn txs(&self) -> Result<Vec<ReadViewTx>, ViewError> {
         self.parent.txs()
     }
+    fn balance_hook_iou(
+        &self,
+        account: AccountID,
+        issuer: AccountID,
+        amount: STAmount,
+    ) -> STAmount {
+        let amount = self.deferred_credits.balance_iou(account, issuer, amount);
+        self.parent.balance_hook_iou(account, issuer, amount)
+    }
+
+    fn balance_hook_mpt(&self, account: AccountID, issue: MPTIssue, amount: i64) -> STAmount {
+        let amount = self.deferred_credits.balance_mpt(account, issue, amount);
+        self.parent.balance_hook_mpt(account, issue, amount)
+    }
+
+    fn balance_hook_self_issue_mpt(&self, issue: MPTIssue, amount: i64) -> STAmount {
+        let amount = self.deferred_credits.balance_self_issue_mpt(issue, amount);
+        self.parent.balance_hook_self_issue_mpt(issue, amount)
+    }
+
+    fn owner_count_hook(
+        &self,
+        account: AccountID,
+        count: crate::OwnerCounts,
+    ) -> crate::OwnerCounts {
+        let count = self
+            .deferred_credits
+            .get_owner_count(account)
+            .unwrap_or(count)
+            .max(count);
+        self.parent.owner_count_hook(account, count)
+    }
 }
 
 impl<'a, V: ApplyView + ?Sized> RawView for FlowSandbox<'a, V> {
@@ -805,6 +918,67 @@ impl<'a, V: ApplyView + ?Sized> ApplyView for FlowSandbox<'a, V> {
     fn destroy_xrp(&mut self, fee: XRPAmount) -> Result<(), ViewError> {
         self.raw_destroy_xrp(fee)
     }
+    fn credit_hook_iou(
+        &mut self,
+        from: AccountID,
+        to: AccountID,
+        amount: STAmount,
+        pre_credit_balance: STAmount,
+    ) {
+        self.deferred_credits
+            .credit_iou(from, to, amount.clone(), pre_credit_balance.clone());
+        self.deferred_credit_events.push(DeferredCreditEvent::Iou {
+            from,
+            to,
+            amount,
+            pre_credit_balance,
+        });
+    }
+
+    fn credit_hook_mpt(
+        &mut self,
+        from: AccountID,
+        to: AccountID,
+        amount: STAmount,
+        pre_credit_balance_holder: u64,
+        pre_credit_balance_issuer: i64,
+    ) {
+        self.deferred_credits.credit_mpt(
+            from,
+            to,
+            amount.clone(),
+            pre_credit_balance_holder,
+            pre_credit_balance_issuer,
+        );
+        self.deferred_credit_events.push(DeferredCreditEvent::Mpt {
+            from,
+            to,
+            amount,
+            pre_credit_balance_holder,
+            pre_credit_balance_issuer,
+        });
+    }
+
+    fn issuer_self_debit_hook_mpt(&mut self, issue: MPTIssue, amount: u64, orig_balance: i64) {
+        self.deferred_credits
+            .issuer_self_debit_mpt(issue, amount, orig_balance);
+        self.deferred_credit_events
+            .push(DeferredCreditEvent::MptIssuerSelfDebit {
+                issue,
+                amount,
+                orig_balance,
+            });
+    }
+
+    fn adjust_owner_count_hook(
+        &mut self,
+        account: AccountID,
+        cur: crate::OwnerCounts,
+        next: crate::OwnerCounts,
+    ) {
+        self.deferred_credits.owner_count(account, cur, next);
+        self.deferred_owner_count_events.push((account, cur, next));
+    }
 }
 
 #[cfg(test)]
@@ -814,6 +988,115 @@ mod tests {
     use basics::base_uint::Uint256;
     use protocol::{ApplyFlags, LedgerEntryType, StBase};
     use std::sync::Arc;
+
+    #[test]
+    fn selected_nested_flow_defers_credited_liquidity_and_owner_count() {
+        let issuer = AccountID::from_array([0x11; 20]);
+        let holder = AccountID::from_array([0x22; 20]);
+        let currency = protocol::currency_from_string("USD");
+        let issue = protocol::Issue::new(currency, issuer);
+        let credited = STAmount::from_iou_amount(
+            protocol::get_field_by_symbol("sfAmount"),
+            protocol::IOUAmount::from_parts(50, 0).expect("valid credit"),
+            issue,
+        );
+        let original = credited.zeroed();
+        let current = credited.clone();
+        let mut parent = Sandbox::new(
+            Arc::new(Ledger::new(LedgerHeader::default(), false)),
+            ApplyFlags::NONE,
+        );
+        let mut aggregate = FlowSandbox::new(&mut parent);
+
+        {
+            let mut discarded = FlowSandbox::new(&mut aggregate);
+            discarded.credit_hook_iou(issuer, holder, credited.clone(), original.clone());
+        }
+        assert_eq!(
+            aggregate.balance_hook_iou(holder, issuer, current.clone()),
+            current,
+            "a rejected candidate must not poison later strands"
+        );
+
+        let before = crate::OwnerCounts {
+            owner: 0,
+            sponsored: 0,
+            sponsoring: 0,
+        };
+        let after = crate::OwnerCounts {
+            owner: 1,
+            sponsored: 0,
+            sponsoring: 0,
+        };
+        {
+            let mut selected = FlowSandbox::new(&mut aggregate);
+            selected.credit_hook_iou(issuer, holder, credited, original);
+            selected.adjust_owner_count_hook(holder, before, after);
+            selected.apply().expect("select candidate");
+        }
+
+        assert_eq!(
+            aggregate.balance_hook_iou(holder, issuer, current).signum(),
+            0,
+            "IOUs credited earlier in one payment cannot fund a later strand"
+        );
+        assert_eq!(
+            aggregate.owner_count_hook(holder, before),
+            after,
+            "later reserve checks retain the maximum selected owner count"
+        );
+    }
+
+    #[test]
+    fn batch_inner_state_only_commit_drops_tx1_deferred_credit_before_tx2() {
+        let issuer = AccountID::from_array([0x31; 20]);
+        let holder = AccountID::from_array([0x32; 20]);
+        let issue = protocol::Issue::new(protocol::currency_from_string("USD"), issuer);
+        let credited = STAmount::from_iou_amount(
+            protocol::get_field_by_symbol("sfAmount"),
+            protocol::IOUAmount::from_parts(50, 0).expect("valid credit"),
+            issue,
+        );
+        let mut parent = Sandbox::new(
+            Arc::new(Ledger::new(LedgerHeader::default(), false)),
+            ApplyFlags::NONE,
+        );
+        let mut whole_batch = FlowSandbox::new(&mut parent);
+
+        // Inner tx1's payment sandbox records a deferred credit while its
+        // ledger delta materializes the corresponding current balance.
+        let before = crate::OwnerCounts {
+            owner: 0,
+            sponsored: 0,
+            sponsoring: 0,
+        };
+        let after = crate::OwnerCounts {
+            owner: 1,
+            sponsored: 0,
+            sponsoring: 0,
+        };
+        {
+            let mut tx1 = FlowSandbox::new(&mut whole_batch);
+            tx1.credit_hook_iou(issuer, holder, credited.clone(), credited.zeroed());
+            tx1.adjust_owner_count_hook(holder, before, after);
+            tx1.apply_state_only().expect("commit tx1 state only");
+        }
+
+        // A fresh per-transaction view must not inherit tx1's payment tab.
+        // It therefore sees tx1's committed balance as spendable. Replaying
+        // the event here would incorrectly clamp this balance back to zero.
+        let tx2 = FlowSandbox::new(&mut whole_batch);
+        assert_eq!(
+            tx2.balance_hook_iou(holder, issuer, credited.clone()),
+            credited,
+            "tx2 sees tx1's committed credit after the raw Batch boundary",
+        );
+        assert_eq!(
+            tx2.owner_count_hook(holder, before),
+            before,
+            "tx2 does not inherit tx1's payment-local owner-count adjustment",
+        );
+    }
 
     #[test]
     fn apply_checks_out_parent_directory_page_before_propagating_replace() {

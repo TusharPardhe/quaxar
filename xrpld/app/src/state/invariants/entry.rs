@@ -1,5 +1,5 @@
 use super::common::*;
-use super::mpt::{max_mpt_token_amount, mpt_max_amount};
+use super::mpt::max_mpt_token_amount;
 use protocol::{LedgerEntryType, STLedgerEntry};
 
 pub(super) fn validate_mpt_entry(sle: &STLedgerEntry) -> bool {
@@ -7,7 +7,7 @@ pub(super) fn validate_mpt_entry(sle: &STLedgerEntry) -> bool {
         LedgerEntryType::MPTokenIssuance => {
             let outstanding = optional_u64(sle, sf("sfOutstandingAmount"));
             let locked = optional_u64(sle, sf("sfLockedAmount"));
-            outstanding <= mpt_max_amount(sle) && locked <= outstanding
+            outstanding <= max_mpt_token_amount() && locked <= outstanding
         }
         LedgerEntryType::MPToken => {
             let account = sle.get_account_id(sf("sfAccount"));

@@ -18,8 +18,7 @@ pub(super) struct MptTransferAmount {
     after: Option<u64>,
     authorized_before: bool,
     authorized_after: bool,
-    locked_before: bool,
-    locked_after: bool,
+    deleted: bool,
 }
 
 #[derive(Default)]
@@ -296,6 +295,7 @@ pub(super) fn record_mpt_transfer(
     transfers: &mut BTreeMap<MPTID, BTreeMap<AccountID, MptTransferAmount>>,
     sle: &STLedgerEntry,
     before: bool,
+    is_delete: bool,
 ) {
     if sle.get_type() != LedgerEntryType::MPToken {
         return;
@@ -308,11 +308,10 @@ pub(super) fn record_mpt_transfer(
     if before {
         entry.before = Some(amount);
         entry.authorized_before = sle.is_flag(protocol::lsfMPTAuthorized);
-        entry.locked_before = sle.is_flag(protocol::lsfMPTLocked);
+        entry.deleted |= is_delete;
     } else {
         entry.after = Some(amount);
         entry.authorized_after = sle.is_flag(protocol::lsfMPTAuthorized);
-        entry.locked_after = sle.is_flag(protocol::lsfMPTLocked);
     }
 }
 
@@ -358,8 +357,10 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
     pseudo_accounts_before: &BTreeMap<AccountID, bool>,
     transfers: &BTreeMap<MPTID, BTreeMap<AccountID, MptTransferAmount>>,
 ) -> Result<bool, ledger::ViewError> {
-    // Confidential MPT changes are checked only by ValidConfidentialMPToken.
-    if matches!(txn_type.to_u16(), 85..=89) || txn_type == protocol::TxType::AMM_CLAWBACK {
+    // AMMClawback has rippled's OverrideFreeze privilege and bypasses this
+    // invariant. Confidential transfers do not: public-balance mutations must
+    // still be caught here, especially on the post-reset failure pass.
+    if txn_type == protocol::TxType::AMM_CLAWBACK {
         return Ok(true);
     }
     let enforce = mptokens_v2_enabled || fix_cleanup_3_4_0;
@@ -421,6 +422,8 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
             // classification captured from every touched prestate root.
             let authorized = if pseudo_accounts_before.get(account).copied() == Some(true) {
                 true
+            } else if req_auth && value.deleted {
+                value.authorized_before
             } else if req_auth {
                 protocol::is_tes_success(ledger::mptoken_helpers::require_auth_mpt(
                     sandbox, &issue, account,
@@ -428,9 +431,7 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
             } else {
                 true
             };
-            if (!exempt_from_freeze && (frozen || value.locked_before || value.locked_after))
-                || !authorized
-            {
+            if (!exempt_from_freeze && frozen) || !authorized {
                 invalid_transfer = true;
             }
         }
@@ -476,15 +477,18 @@ pub(super) fn record_mpt_issuance_lifecycle<V: ApplyView + ?Sized>(
     after: Option<&STLedgerEntry>,
     deleted: &STLedgerEntry,
 ) -> Result<(), ledger::ViewError> {
+    let fix_cleanup_3_2_0 = sandbox
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_2_0"));
     if let Some(after) = after
         && after.get_type() == LedgerEntryType::MPTokenIssuance
     {
         if before.is_none() {
             lifecycle.issuances_created = lifecycle.issuances_created.saturating_add(1);
-            lifecycle.reference_holding_set_on_create |= after
-                .is_field_present(sf("sfReferenceHolding"))
+            lifecycle.reference_holding_set_on_create |= fix_cleanup_3_2_0
+                && after.is_field_present(sf("sfReferenceHolding"))
                 && txn_type != protocol::TxType::VAULT_CREATE;
-        } else if let Some(before) = before {
+        } else if fix_cleanup_3_2_0 && let Some(before) = before {
             lifecycle.reference_holding_mutated |=
                 !same_optional_h256(before, after, sf("sfReferenceHolding"));
         }
@@ -508,7 +512,7 @@ pub(super) fn record_mpt_issuance_lifecycle<V: ApplyView + ?Sized>(
         lifecycle.tokens_deleted = lifecycle.tokens_deleted.saturating_add(1);
     }
 
-    if !is_delete || txn_type == protocol::TxType::VAULT_DELETE {
+    if !fix_cleanup_3_2_0 || !is_delete || txn_type == protocol::TxType::VAULT_DELETE {
         return Ok(());
     }
 
@@ -602,16 +606,15 @@ pub(super) fn validates_mpt_lifecycle_counts(
     single_asset_vault_enabled: bool,
     lending_protocol_enabled: bool,
     mptokens_v2_enabled: bool,
-    fix_cleanup_3_4_0: bool,
     lifecycle: &MptIssuanceLifecycle,
 ) -> bool {
-    if fix_cleanup_3_4_0 && !protocol::is_tes_success(result) && lifecycle.tokens_deleted != 0 {
-        return false;
-    }
     let applies =
         protocol::is_tes_success(result) || (mptokens_v2_enabled && result == Ter::TEC_INCOMPLETE);
     if !applies {
-        return true;
+        return lifecycle.issuances_created == 0
+            && lifecycle.issuances_deleted == 0
+            && lifecycle.tokens_created == 0
+            && lifecycle.tokens_deleted == 0;
     }
 
     if lifecycle.token_created_by_issuer && (single_asset_vault_enabled || lending_protocol_enabled)
@@ -673,6 +676,14 @@ pub(super) fn validates_mpt_lifecycle_counts(
             return false;
         }
 
+        return true;
+    }
+
+    if txn_type == protocol::TxType::ESCROW_FINISH {
+        // EscrowFinish may create the destination MPToken. The stricter
+        // SingleAssetVault/LendingProtocol case was validated above; rippled
+        // unconditionally permits the legacy lifecycle shape here.
+        debug_assert!(!enforce_escrow_finish);
         return true;
     }
 

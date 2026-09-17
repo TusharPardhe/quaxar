@@ -1151,8 +1151,13 @@ fn check_mpt_check_cash_allowed<V: ledger::ApplyView>(
         Ok(None) => return Ter::TEC_NO_ISSUER,
         Err(_) => return Ter::TEF_BAD_LEDGER,
     }
-    let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, destination)
-        .unwrap_or(Ter::TEF_BAD_LEDGER);
+    let auth = ledger::mptoken_helpers::require_auth_mpt_with_type(
+        view,
+        &issue,
+        destination,
+        ledger::mptoken_helpers::MPTAuthType::Weak,
+    )
+    .unwrap_or(Ter::TEF_BAD_LEDGER);
     if auth != Ter::TES_SUCCESS {
         return auth;
     }
@@ -1237,6 +1242,16 @@ fn check_cash_has_object_reserve<V: ledger::ApplyView>(
     Ok(true)
 }
 
+fn mpt_amm_auth_type(require_holding: bool) -> ledger::mptoken_helpers::MPTAuthType {
+    if require_holding {
+        // AMMDeposit::checkAmount calls requireAuth with its default Legacy
+        // mode after separately verifying that the outer holding exists.
+        ledger::mptoken_helpers::MPTAuthType::Legacy
+    } else {
+        ledger::mptoken_helpers::MPTAuthType::Weak
+    }
+}
+
 fn check_mpt_amm_asset_allowed<V: ledger::ApplyView>(
     view: &V,
     account: &AccountID,
@@ -1259,8 +1274,13 @@ fn check_mpt_amm_asset_allowed<V: ledger::ApplyView>(
         }
     }
 
-    let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, account)
-        .unwrap_or(Ter::TEF_BAD_LEDGER);
+    let auth = ledger::mptoken_helpers::require_auth_mpt_with_type(
+        view,
+        &issue,
+        account,
+        mpt_amm_auth_type(require_holding),
+    )
+    .unwrap_or(Ter::TEF_BAD_LEDGER);
     if auth != Ter::TES_SUCCESS {
         return auth;
     }
@@ -1274,6 +1294,107 @@ fn check_mpt_amm_asset_allowed<V: ledger::ApplyView>(
 
     ledger::mptoken_helpers::can_mpt_trade_and_transfer(view, &asset, account, account)
         .unwrap_or(Ter::TEF_BAD_LEDGER)
+}
+
+#[cfg(test)]
+mod mpt_amm_auth_tests {
+    use super::*;
+    use ledger::{ApplyViewImpl, Ledger, RawView};
+    use protocol::{
+        ApplyFlags, LedgerEntryType, MPTAmount, MPTIssue, Rules, STIssue, STLedgerEntry,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn amm_deposit_amount_holding_uses_legacy_auth_for_vault_share() {
+        let underlying_issuer = AccountID::from_array([0x71; 20]);
+        let vault_owner = AccountID::from_array([0x72; 20]);
+        let vault_pseudo = AccountID::from_array([0x73; 20]);
+        let holder = AccountID::from_array([0x74; 20]);
+        let vault_id = Uint256::from_u64(0xA11);
+        let issue = MPTIssue::new(protocol::make_mpt_id(1, vault_pseudo));
+        let asset = Asset::MPTIssue(issue);
+        let account_root = |account: AccountID| {
+            let mut sle =
+                STLedgerEntry::new(protocol::account_keylet(Uint160::from_void(account.data())));
+            sle.set_account_id(sf("sfAccount"), account);
+            sle.set_field_amount(sf("sfBalance"), STAmount::new_native(100_000_000, false));
+            sle.set_field_u32(sf("sfSequence"), 1);
+            sle.set_field_u32(sf("sfOwnerCount"), 1);
+            sle
+        };
+
+        let mut pseudo_root = account_root(vault_pseudo);
+        pseudo_root.set_field_h256(sf("sfVaultID"), vault_id);
+        let mut vault = STLedgerEntry::new(protocol::vault_keylet_from_key(vault_id));
+        vault.set_account_id(sf("sfOwner"), vault_owner);
+        vault.set_account_id(sf("sfAccount"), vault_pseudo);
+        vault.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(
+                sf("sfAsset"),
+                Asset::Issue(protocol::Issue::new(
+                    protocol::currency_from_string("USD"),
+                    underlying_issuer,
+                )),
+            ),
+        );
+        let mut issuance = STLedgerEntry::from_type_and_key(
+            LedgerEntryType::MPTokenIssuance,
+            protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()).key,
+        );
+        issuance.set_account_id(sf("sfIssuer"), vault_pseudo);
+        issuance.set_field_u32(sf("sfSequence"), 1);
+        issuance.set_field_u32(
+            sf("sfFlags"),
+            protocol::lsfMPTCanTrade | protocol::lsfMPTCanTransfer,
+        );
+        issuance.set_field_u64(sf("sfOutstandingAmount"), 1);
+        issuance.set_field_u64(sf("sfOwnerNode"), 0);
+        let mut token = STLedgerEntry::from_type_and_key(
+            LedgerEntryType::MPToken,
+            protocol::mptoken_keylet_from_mptid(issue.mpt_id(), Uint160::from_void(holder.data()))
+                .key,
+        );
+        token.set_account_id(sf("sfAccount"), holder);
+        token.set_field_h192(sf("sfMPTokenIssuanceID"), issue.mpt_id());
+        token.set_field_u64(sf("sfMPTAmount"), MPTAmount::from_value(1).value() as u64);
+        token.set_field_u32(sf("sfFlags"), 0);
+        token.set_field_u64(sf("sfOwnerNode"), 0);
+
+        let mut base = Ledger::from_ledger_seq_and_close_time(1, 1, false);
+        base.set_rules(Rules::new([protocol::feature_id("SingleAssetVault")]));
+        for sle in [
+            account_root(underlying_issuer),
+            account_root(vault_owner),
+            pseudo_root,
+            account_root(holder),
+            vault,
+            issuance,
+            token,
+        ] {
+            base.raw_insert(Arc::new(sle))
+                .expect("seed AMM auth fixture");
+        }
+        let view = ApplyViewImpl::new(Arc::new(base), ApplyFlags::NONE);
+
+        assert_eq!(
+            ledger::mptoken_helpers::require_auth_mpt_with_type(
+                &view,
+                &issue,
+                &holder,
+                ledger::mptoken_helpers::MPTAuthType::Strong,
+            )
+            .expect("strong auth read"),
+            Ter::TEC_NO_LINE,
+            "Strong incorrectly requires a trust line for the vault's IOU underlying",
+        );
+        assert_eq!(
+            check_mpt_amm_asset_allowed(&view, &holder, asset, true),
+            Ter::TES_SUCCESS,
+            "AMMDeposit amount checks use default Legacy auth after proving the share exists",
+        );
+    }
 }
 
 fn check_mpt_amm_withdraw_asset_allowed<V: ledger::ApplyView>(
@@ -1294,8 +1415,13 @@ fn check_mpt_amm_withdraw_asset_allowed<V: ledger::ApplyView>(
         return frozen;
     }
 
-    let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, account)
-        .unwrap_or(Ter::TEF_BAD_LEDGER);
+    let auth = ledger::mptoken_helpers::require_auth_mpt_with_type(
+        view,
+        &issue,
+        account,
+        ledger::mptoken_helpers::MPTAuthType::Weak,
+    )
+    .unwrap_or(Ter::TEF_BAD_LEDGER);
     if auth != Ter::TES_SUCCESS {
         return auth;
     }
@@ -3907,8 +4033,13 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     Err(_) => return Ter::TEF_BAD_LEDGER,
                 };
                 for party in [account, dst_account] {
-                    let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, &party)
-                        .unwrap_or(Ter::TEF_BAD_LEDGER);
+                    let auth = ledger::mptoken_helpers::require_auth_mpt_with_type(
+                        view,
+                        &issue,
+                        &party,
+                        ledger::mptoken_helpers::MPTAuthType::Weak,
+                    )
+                    .unwrap_or(Ter::TEF_BAD_LEDGER);
                     if auth != Ter::TES_SUCCESS {
                         return auth;
                     }
@@ -4156,6 +4287,9 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     return Ter::TEF_BAD_LEDGER;
                 }
             } else {
+                if !view.rules().enabled(&protocol::feature_token_escrow()) {
+                    return Ter::TEM_DISABLED;
+                }
                 match amount.asset() {
                     protocol::Asset::Issue(_) => {
                         let locked_rate = if escrow_sle.is_field_present(sf("sfTransferRate")) {
@@ -4379,6 +4513,9 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     return Ter::TEF_BAD_LEDGER;
                 }
             } else {
+                if !view.rules().enabled(&protocol::feature_token_escrow()) {
+                    return Ter::TEM_DISABLED;
+                }
                 match amount.asset() {
                     protocol::Asset::Issue(issue) => {
                         // Returning an IOU can recreate the owner's deleted

@@ -85,6 +85,7 @@ use basics::base_uint::Uint256;
 
 pub struct EscrowFinishApplyFacts {
     pub amount: protocol::STAmount,
+    pub token_escrow_enabled: bool,
     pub destination: protocol::AccountID,
     pub owner: protocol::AccountID,
     pub escrow_key: Uint256,
@@ -102,6 +103,9 @@ pub fn run_escrow_finish_do_apply<S: EscrowFinishApplySink>(
     _facts: EscrowFinishApplyFacts,
     sink: &mut S,
 ) -> Ter {
+    if !_facts.amount.native() && !_facts.token_escrow_enabled {
+        return Ter::TEM_DISABLED;
+    }
     let ter = sink.transfer_escrow_amount();
     if ter != Ter::TES_SUCCESS {
         return ter;

@@ -331,6 +331,7 @@ pub fn do_payment<V: ledger::ApplyView>(
             default_paths_allowed,
             limit_quality,
             is_ledger_open: view.open(),
+            send_max_present: send_max.is_some(),
             domain_id: sttx
                 .is_field_present(sf("sfDomainID"))
                 .then(|| sttx.get_field_h256(sf("sfDomainID"))),
@@ -498,32 +499,6 @@ fn do_direct_mpt_payment<V: ledger::ApplyView>(
         || deliver_min.is_some_and(|deliver_min| amount_deliver < *deliver_min)
     {
         return Ter::TEC_PATH_PARTIAL;
-    }
-
-    let destination_has_mpt = if dst_account_id == &issuer {
-        true
-    } else {
-        match view.peek(protocol::mptoken_keylet_from_mptid(
-            mpt_issue.mpt_id(),
-            Uint160::from_void(dst_account_id.data()),
-        )) {
-            Ok(token) => token.is_some(),
-            Err(_) => return Ter::TEF_BAD_LEDGER,
-        }
-    };
-    if !destination_has_mpt {
-        let Some(dst_sle) = dst_sle_opt else {
-            return Ter::TEC_NO_PERMISSION;
-        };
-        let balance = dst_sle.get_field_amount(sf("sfBalance")).xrp().drops();
-        if balance < ledger::effective_account_reserve(view.fees(), &dst_sle, 1, 0) as i64 {
-            return Ter::TEC_INSUFFICIENT_RESERVE;
-        }
-        match ledger::mptoken_helpers::check_create_mpt(view, &mpt_issue, dst_account_id) {
-            Ok(Ter::TES_SUCCESS | Ter::TEC_DUPLICATE) => {}
-            Ok(ter) => return ter,
-            Err(_) => return Ter::TEF_BAD_LEDGER,
-        }
     }
 
     let mut result =

@@ -42,6 +42,17 @@ fn test_ledger() -> Ledger {
     ledger
 }
 
+fn vault_ledger() -> Ledger {
+    let mut ledger = test_ledger();
+    // VaultCreate/VaultDelete are gated by SingleAssetVault in rippled's
+    // transaction settings; their pseudo-account lifecycle is invalid without it.
+    ledger.set_rules(Rules::new([
+        feature_id("fixCleanup3_2_0"),
+        feature_id("SingleAssetVault"),
+    ]));
+    ledger
+}
+
 fn mpt_v2_ledger() -> Ledger {
     let mut ledger = test_ledger();
     ledger.set_rules(Rules::new([
@@ -478,6 +489,13 @@ fn with_amm_invariant_flow<R>(f: impl FnOnce(&mut FlowSandbox<Sandbox<Ledger>>) 
     f(&mut flow)
 }
 
+fn with_vault_flow<R>(f: impl FnOnce(&mut FlowSandbox<Sandbox<Ledger>>) -> R) -> R {
+    let base = Arc::new(vault_ledger());
+    let mut parent = Sandbox::new(base, ApplyFlags::default());
+    let mut flow = FlowSandbox::new(&mut parent);
+    f(&mut flow)
+}
+
 fn with_lending_flow<R>(f: impl FnOnce(&mut FlowSandbox<Sandbox<Ledger>>) -> R) -> R {
     let base = Arc::new(lending_ledger());
     let mut parent = Sandbox::new(base, ApplyFlags::default());
@@ -607,6 +625,12 @@ fn amm_entry_with_pool(
 fn vault_pseudo_account_root(account: AccountID, vault_id: Uint256) -> STLedgerEntry {
     let mut sle = account_root(account);
     sle.set_field_h256(sf("sfVaultID"), vault_id);
+    // ValidNewAccountRoot requires this exact flag set for a sequence-zero
+    // pseudo account once SingleAssetVault is enabled.
+    sle.set_field_u32(
+        sf("sfFlags"),
+        protocol::lsfDisableMaster | protocol::lsfDefaultRipple | protocol::lsfDepositAuth,
+    );
     sle
 }
 
@@ -775,9 +799,18 @@ fn offer_entry(
         sf("sfTakerPays"),
         STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
     );
+    // Keep PermissionedDEX fixtures otherwise valid: NoBadOffers rejects
+    // XRP-for-XRP offers independently of the permissioned-offer invariant.
     sle.set_field_amount(
         sf("sfTakerGets"),
-        STAmount::from_xrp_amount(XRPAmount::from_drops(2)),
+        STAmount::from_iou_amount(
+            sf("sfTakerGets"),
+            IOUAmount::from_parts(2, 0).expect("offer amount"),
+            Issue {
+                currency: iou_currency(b"USD"),
+                account,
+            },
+        ),
     );
     if flags != 0 {
         sle.set_field_u32(sf("sfFlags"), flags);
@@ -1443,6 +1476,40 @@ fn invariant_rejects_failed_clawback_that_changes_trustline() {
             XRPAmount::from_drops(10)
         ),
         Ter::TEC_INVARIANT_FAILED
+    );
+}
+
+#[test]
+fn clawback_negative_final_iou_balance_is_always_an_invariant_failure() {
+    let mut parent = Sandbox::new(Arc::new(test_ledger()), ApplyFlags::default());
+    let issuer = acct(0x53);
+    let holder = acct(0x54);
+    parent
+        .insert(Arc::new(ripple_state_balance_entry(holder, issuer, 1)))
+        .expect("insert parent trustline");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(ripple_state_balance_entry(holder, issuer, -1)))
+        .expect("over-claw trustline below zero");
+    let currency = iou_currency(b"USD");
+    let tx = STTx::new(TxType::CLAWBACK, |object| {
+        object.set_account_id(sf("sfAccount"), issuer);
+        object.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_iou_amount(
+                sf("sfAmount"),
+                IOUAmount::from_parts(2, 0).expect("clawback amount"),
+                Issue {
+                    currency,
+                    account: holder,
+                },
+            ),
+        );
+    });
+
+    assert_eq!(
+        check_invariants_for_tx(&flow, &tx, Ter::TES_SUCCESS, XRPAmount::from_drops(10)),
+        Ter::TEC_INVARIANT_FAILED,
+        "InvariantCheck.cpp rejects a negative final IOU balance regardless of MPTokensV2",
     );
 }
 
@@ -2228,7 +2295,7 @@ fn invariant_rejects_reference_holding_on_non_vault_create_issuance() {
 
 #[test]
 fn invariant_allows_reference_holding_on_vault_create_issuance() {
-    with_flow(|flow| {
+    with_vault_flow(|flow| {
         let issuer = acct(0x2B);
         let owner = acct(0x2C);
         let asset = Asset::Issue(Issue {
@@ -2327,7 +2394,7 @@ fn invariant_rejects_vault_pseudo_mpt_holding_deleted_by_non_vault_delete() {
 
 #[test]
 fn invariant_allows_vault_pseudo_mpt_holding_deleted_by_vault_delete() {
-    let base = Arc::new(test_ledger());
+    let base = Arc::new(vault_ledger());
     let mut parent = Sandbox::new(base, ApplyFlags::default());
     let issuer = acct(0x2F);
     let pseudo = acct(0x30);
@@ -2348,8 +2415,9 @@ fn invariant_allows_vault_pseudo_mpt_holding_deleted_by_vault_delete() {
     );
     let issuance = mpt_issuance_entry(issuer, 1, 0, 0);
     let token = mptoken_entry(pseudo, issuer, 1, 0);
+    let pseudo_root = vault_pseudo_account_root(pseudo, vault_id);
     parent
-        .insert(Arc::new(vault_pseudo_account_root(pseudo, vault_id)))
+        .insert(Arc::new(pseudo_root.clone()))
         .expect("insert pseudo root");
     parent
         .insert(Arc::new(vault.clone()))
@@ -2365,6 +2433,10 @@ fn invariant_allows_vault_pseudo_mpt_holding_deleted_by_vault_delete() {
     flow.erase(Arc::new(vault)).expect("erase vault");
     flow.erase(Arc::new(issuance)).expect("erase issuance");
     flow.erase(Arc::new(token)).expect("erase mptoken");
+    // VaultDelete has MustDeleteAcct privilege, so the positive control must
+    // include the pseudo AccountRoot teardown performed by the real transactor.
+    flow.erase(Arc::new(pseudo_root))
+        .expect("erase pseudo root");
 
     assert_eq!(
         check_invariants(
@@ -3904,5 +3976,439 @@ fn invariant_rejects_payment_that_modifies_amm_entry() {
             XRPAmount::from_drops(10)
         ),
         Ter::TEC_INVARIANT_FAILED
+    );
+}
+
+#[test]
+fn audit_mpt_lifecycle_runs_without_amendments_and_rejects_failed_mutations() {
+    for result in [Ter::TES_SUCCESS, Ter::TEC_CLAIM] {
+        let mut ledger = Ledger::new(LedgerHeader::default(), false);
+        ledger.set_rules(Rules::default());
+        let mut parent = Sandbox::new(Arc::new(ledger), ApplyFlags::default());
+        let mut flow = FlowSandbox::new(&mut parent);
+        flow.insert(Arc::new(mpt_issuance_entry(acct(0xA0), 1, 0, 0)))
+            .expect("insert unauthorized issuance");
+
+        assert_eq!(
+            check_invariants(&flow, TxType::PAYMENT, result, XRPAmount::from_drops(10),),
+            Ter::TEC_INVARIANT_FAILED,
+            "lifecycle mutations must be checked for {result:?} without an amendment gate",
+        );
+    }
+}
+
+#[test]
+fn audit_mpt_lifecycle_tec_incomplete_destroy_still_requires_issuance_deletion() {
+    let issuer = acct(0xA0);
+
+    let mut empty_parent = Sandbox::new(Arc::new(mpt_v2_ledger()), ApplyFlags::default());
+    let empty_flow = FlowSandbox::new(&mut empty_parent);
+    assert_eq!(
+        check_invariants(
+            &empty_flow,
+            TxType::VAULT_DELETE,
+            Ter::TEC_INCOMPLETE,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TEC_INVARIANT_FAILED,
+        "MPTokensV2 applies destroy privileges to tecINCOMPLETE",
+    );
+
+    let issuance = mpt_issuance_entry(issuer, 1, 0, 0);
+    let mut deleted_parent = Sandbox::new(Arc::new(mpt_v2_ledger()), ApplyFlags::default());
+    deleted_parent
+        .insert(Arc::new(issuance.clone()))
+        .expect("insert issuance to delete");
+    let mut deleted_flow = FlowSandbox::new(&mut deleted_parent);
+    deleted_flow
+        .erase(Arc::new(issuance))
+        .expect("delete issuance");
+    assert_eq!(
+        check_invariants(
+            &deleted_flow,
+            TxType::VAULT_DELETE,
+            Ter::TEC_INCOMPLETE,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TEC_INCOMPLETE,
+        "exactly one issuance deletion satisfies the failed destroy lifecycle",
+    );
+}
+
+#[test]
+fn audit_mpt_reference_holding_invariant_is_gated_only_by_fix_cleanup_3_2_0() {
+    let mut ledger = Ledger::new(LedgerHeader::default(), false);
+    ledger.set_rules(Rules::default());
+    let mut parent = Sandbox::new(Arc::new(ledger), ApplyFlags::default());
+    let issuer = acct(0xA1);
+    parent
+        .insert(Arc::new(mpt_issuance_with_reference(
+            issuer,
+            1,
+            Uint256::from_u64(1),
+        )))
+        .expect("insert legacy reference");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(mpt_issuance_with_reference(
+        issuer,
+        1,
+        Uint256::from_u64(2),
+    )))
+    .expect("mutate legacy reference");
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::VAULT_SET,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TES_SUCCESS,
+        "SingleAssetVault alone must not activate fixCleanup3_2_0 reference checks",
+    );
+}
+
+#[test]
+fn audit_mpt_public_entry_precheck_uses_protocol_cap_not_issuance_maximum() {
+    let mut parent = Sandbox::new(Arc::new(test_ledger()), ApplyFlags::default());
+    let issuer = acct(0xA2);
+    let mut before = mpt_issuance_entry(issuer, 1, 10, 0);
+    before.set_field_u64(sf("sfMaximumAmount"), 10);
+    parent
+        .insert(Arc::new(before.clone()))
+        .expect("insert capped issuance");
+    let mut after = before;
+    after.set_field_u64(sf("sfOutstandingAmount"), 11);
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(after)).expect("raise outstanding");
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::MPTOKEN_ISSUANCE_SET,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TES_SUCCESS,
+        "ValidAmounts checks the public protocol cap; issuance maximum belongs to the MPT accounting invariant",
+    );
+}
+
+#[test]
+fn audit_mpt_balance_accounting_uses_the_after_sle_on_deletion() {
+    let issuer = acct(0xA3);
+    let holder = acct(0xA4);
+    let token = mptoken_entry(holder, issuer, 1, 100);
+    let mut parent = Sandbox::new(Arc::new(mpt_v2_ledger()), ApplyFlags::default());
+    parent
+        .insert(Arc::new(mpt_issuance_entry(issuer, 1, 100, 0)))
+        .expect("insert issuance");
+    parent
+        .insert(Arc::new(token.clone()))
+        .expect("insert token");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.erase(Arc::new(token)).expect("erase token");
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::MPTOKEN_AUTHORIZE,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TES_SUCCESS,
+        "ApplyStateTable supplies the erased entry as the invariant after-SLE",
+    );
+}
+
+#[test]
+fn audit_mpt_transfer_freeze_check_uses_posterior_token_state() {
+    let issuer = acct(0xA5);
+    let sender = acct(0xA6);
+    let receiver = acct(0xA7);
+    let mut parent = Sandbox::new(Arc::new(mpt_v2_ledger()), ApplyFlags::default());
+    parent
+        .insert(Arc::new(mpt_issuance_entry(
+            issuer,
+            1,
+            100,
+            protocol::lsfMPTCanTransfer,
+        )))
+        .expect("insert issuance");
+    parent
+        .insert(Arc::new(mptoken_entry_with_flags(
+            sender,
+            issuer,
+            1,
+            100,
+            protocol::lsfMPTLocked,
+        )))
+        .expect("insert locked sender");
+    parent
+        .insert(Arc::new(mptoken_entry(receiver, issuer, 1, 0)))
+        .expect("insert receiver");
+
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(mptoken_entry(sender, issuer, 1, 90)))
+        .expect("unlock and debit sender");
+    flow.update(Arc::new(mptoken_entry(receiver, issuer, 1, 10)))
+        .expect("credit receiver");
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::PAYMENT,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TES_SUCCESS,
+        "rippled evaluates freeze from the posterior view, not the token's prior flag",
+    );
+}
+
+#[test]
+fn audit_mpt_confidential_transactions_still_run_transfer_invariant_on_failure() {
+    let issuer = acct(0xA8);
+    let holder = acct(0xA9);
+    let mut parent = Sandbox::new(Arc::new(cleanup_3_4_mpt_ledger()), ApplyFlags::default());
+    parent
+        .insert(Arc::new(mpt_issuance_entry(issuer, 1, 100, 0)))
+        .expect("insert issuance");
+    parent
+        .insert(Arc::new(mptoken_entry(holder, issuer, 1, 100)))
+        .expect("insert token");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(mpt_issuance_entry(issuer, 1, 99, 0)))
+        .expect("mutate outstanding");
+    flow.update(Arc::new(mptoken_entry(holder, issuer, 1, 99)))
+        .expect("mutate public balance");
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::CONFIDENTIAL_MPT_SEND,
+            Ter::TEC_CLAIM,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TEC_INVARIANT_FAILED,
+    );
+}
+
+#[test]
+fn audit_mpt_amm_bid_treats_any_visited_pool_holding_as_pool_change() {
+    let issuer = acct(0xAA);
+    let amm = acct(0xAB);
+    let before = mptoken_entry_with_flags(amm, issuer, 1, 50, protocol::lsfMPTAMM);
+    let mut parent = Sandbox::new(Arc::new(test_ledger()), ApplyFlags::default());
+    parent
+        .insert(Arc::new(before.clone()))
+        .expect("insert AMM holding");
+    let mut after = before;
+    after.set_field_u32(
+        sf("sfFlags"),
+        protocol::lsfMPTAMM | protocol::lsfMPTAuthorized,
+    );
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(after)).expect("touch AMM holding");
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::AMM_BID,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TEC_INVARIANT_FAILED,
+        "pool-change visit semantics do not depend on sfMPTAmount changing",
+    );
+}
+
+fn mpt_clawback_tx(issuer: AccountID, holder: AccountID, issue: MPTIssue, amount: i64) -> STTx {
+    STTx::new(TxType::CLAWBACK, |object| {
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_account_id(sf("sfAccount"), issuer);
+        object.set_account_id(sf("sfHolder"), holder);
+        object.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(amount), issue),
+        );
+    })
+}
+
+#[test]
+fn audit_mpt_valid_clawback_requires_exact_identity_positive_amount_and_debit() {
+    let issuer = acct(0xAC);
+    let holder = acct(0xAD);
+    let other = acct(0xAE);
+    let issue = MPTIssue::new(mpt_id(issuer, 1));
+
+    for (name, changed_holder, after_amount, tx_amount) in [
+        ("wrong holder", other, 97, 3),
+        ("zero amount", holder, 99, 0),
+        ("wrong debit", holder, 98, 3),
+    ] {
+        let mut parent = Sandbox::new(Arc::new(mpt_v2_ledger()), ApplyFlags::default());
+        parent
+            .insert(Arc::new(mpt_issuance_entry(issuer, 1, 100, 0)))
+            .expect("insert issuance");
+        parent
+            .insert(Arc::new(mptoken_entry(changed_holder, issuer, 1, 100)))
+            .expect("insert changed token");
+        let mut flow = FlowSandbox::new(&mut parent);
+        flow.update(Arc::new(mpt_issuance_entry(issuer, 1, after_amount, 0)))
+            .expect("update issuance");
+        flow.update(Arc::new(mptoken_entry(
+            changed_holder,
+            issuer,
+            1,
+            after_amount,
+        )))
+        .expect("update token");
+        assert_eq!(
+            check_invariants_for_tx(
+                &flow,
+                &mpt_clawback_tx(issuer, holder, issue, tx_amount),
+                Ter::TES_SUCCESS,
+                XRPAmount::from_drops(10),
+            ),
+            Ter::TEC_INVARIANT_FAILED,
+            "{name}",
+        );
+    }
+
+    let mut parent = Sandbox::new(Arc::new(mpt_v2_ledger()), ApplyFlags::default());
+    parent
+        .insert(Arc::new(mpt_issuance_entry(issuer, 1, 100, 0)))
+        .expect("insert valid issuance");
+    parent
+        .insert(Arc::new(mptoken_entry(holder, issuer, 1, 100)))
+        .expect("insert valid token");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(mpt_issuance_entry(issuer, 1, 97, 0)))
+        .expect("update valid issuance");
+    flow.update(Arc::new(mptoken_entry(holder, issuer, 1, 97)))
+        .expect("update valid token");
+    assert_eq!(
+        check_invariants_for_tx(
+            &flow,
+            &mpt_clawback_tx(issuer, holder, issue, 3),
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TES_SUCCESS,
+    );
+}
+
+#[test]
+fn audit_mpt_valid_clawback_rejects_deleted_token_and_mixed_iou_mpt_changes() {
+    let issuer = acct(0xAF);
+    let holder = acct(0xB0);
+    let issue = MPTIssue::new(mpt_id(issuer, 1));
+
+    let mut parent = Sandbox::new(Arc::new(mpt_v2_ledger()), ApplyFlags::default());
+    parent
+        .insert(Arc::new(mpt_issuance_entry(issuer, 1, 100, 0)))
+        .expect("insert issuance");
+    let token = mptoken_entry(holder, issuer, 1, 100);
+    parent
+        .insert(Arc::new(token.clone()))
+        .expect("insert token");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.erase(Arc::new(token)).expect("delete token");
+    assert_eq!(
+        check_invariants_for_tx(
+            &flow,
+            &mpt_clawback_tx(issuer, holder, issue, 100),
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TEC_INVARIANT_FAILED,
+        "a deleted token has no valid clawback after-state",
+    );
+
+    let mut parent = Sandbox::new(Arc::new(mpt_v2_ledger()), ApplyFlags::default());
+    parent
+        .insert(Arc::new(mpt_issuance_entry(issuer, 1, 100, 0)))
+        .expect("insert mixed issuance");
+    parent
+        .insert(Arc::new(mptoken_entry(holder, issuer, 1, 100)))
+        .expect("insert mixed token");
+    parent
+        .insert(Arc::new(ripple_state_balance_entry(holder, issuer, 10)))
+        .expect("insert mixed line");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(mpt_issuance_entry(issuer, 1, 97, 0)))
+        .expect("update mixed issuance");
+    flow.update(Arc::new(mptoken_entry(holder, issuer, 1, 97)))
+        .expect("update mixed token");
+    flow.update(Arc::new(ripple_state_balance_entry(holder, issuer, 7)))
+        .expect("update mixed line");
+    assert_eq!(
+        check_invariants_for_tx(
+            &flow,
+            &mpt_clawback_tx(issuer, holder, issue, 3),
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TEC_INVARIANT_FAILED,
+        "MPTokensV2 forbids one Clawback from changing both an IOU line and MPToken",
+    );
+}
+
+#[test]
+fn audit_mpt_valid_clawback_requires_exact_iou_line_and_debit() {
+    let issuer = acct(0xB1);
+    let holder = acct(0xB2);
+    let wrong_holder = acct(0xB3);
+    let currency = iou_currency(b"USD");
+    let tx = STTx::new(TxType::CLAWBACK, |object| {
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_account_id(sf("sfAccount"), issuer);
+        object.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_iou_amount(
+                sf("sfAmount"),
+                IOUAmount::from_parts(3, 0).expect("claw amount"),
+                Issue::new(currency, holder),
+            ),
+        );
+    });
+
+    let mut parent = Sandbox::new(Arc::new(mpt_v2_ledger()), ApplyFlags::default());
+    parent
+        .insert(Arc::new(ripple_state_balance_entry(holder, issuer, 10)))
+        .expect("insert valid line");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(ripple_state_balance_entry(holder, issuer, 7)))
+        .expect("update valid line");
+    assert_eq!(
+        check_invariants_for_tx(&flow, &tx, Ter::TES_SUCCESS, XRPAmount::from_drops(10)),
+        Ter::TES_SUCCESS,
+    );
+
+    let mut parent = Sandbox::new(Arc::new(mpt_v2_ledger()), ApplyFlags::default());
+    parent
+        .insert(Arc::new(ripple_state_balance_entry(
+            wrong_holder,
+            issuer,
+            10,
+        )))
+        .expect("insert wrong line");
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.update(Arc::new(ripple_state_balance_entry(
+        wrong_holder,
+        issuer,
+        7,
+    )))
+    .expect("update wrong line");
+    assert_eq!(
+        check_invariants_for_tx(&flow, &tx, Ter::TES_SUCCESS, XRPAmount::from_drops(10)),
+        Ter::TEC_INVARIANT_FAILED,
     );
 }

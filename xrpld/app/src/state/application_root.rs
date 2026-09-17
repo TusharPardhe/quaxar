@@ -205,6 +205,32 @@ fn preferred_lcl_matches_local_or_parent(
     preferred_hash == local_hash || preferred_hash == parent_hash
 }
 
+/// Select a quorum-backed sibling of an observer's freshly built child.
+/// Validators retain rippled's normal `consensusBuilt` behavior; this guard
+/// only prevents a non-validating observer from installing a local child after
+/// the network has already validated a different hash at the same sequence.
+fn observer_quorum_alternate_candidate(
+    built_hash: Uint256,
+    built_seq: u32,
+    needed: usize,
+    candidates: impl IntoIterator<Item = (Uint256, (usize, u32))>,
+) -> Option<(Uint256, usize)> {
+    if needed == 0 {
+        return None;
+    }
+    candidates
+        .into_iter()
+        .filter(|(hash, (count, seq))| *hash != built_hash && *seq == built_seq && *count >= needed)
+        .max_by(
+            |(left_hash, (left_count, _)), (right_hash, (right_count, _))| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| left_hash.cmp(right_hash))
+            },
+        )
+        .map(|(hash, (count, _))| (hash, count))
+}
+
 fn full_sync_debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -3757,9 +3783,6 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let preamble_item_keys = view.items().keys().copied().collect::<BTreeSet<_>>();
-        let check_failed_mpt_invariants = view
-            .rules()
-            .enabled(&protocol::feature_id("fixCleanup3_4_0"));
         let mut inner = ledger::FlowSandbox::new(view);
         // Transactor::apply updates sfAccountTxnID before doApply so the
         // handler can observe it, but Transactor::reset discards that update
@@ -3823,14 +3846,11 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
 
         let fee_amt = protocol::XRPAmount::from_drops(charged_fee_drops);
 
-        // rippled checks an ordinary tec only after resetting the handler
-        // context to fee/sequence state. At this point `inner` still contains
-        // partial doApply mutations, so only successful state is eligible for
-        // invariant evaluation here.
-        // fixCleanup3_4_0 makes the MPT invariants result-aware: inspect a
-        // failed handler sandbox before reset so a persisted balance/deletion
-        // mutation cannot be silently discarded by this implementation path.
-        if protocol::is_tes_success(result) || check_failed_mpt_invariants {
+        // rippled checks tentative invariants only when the transaction is
+        // eligible to apply. Ordinary tec outcomes reset to fee/sequence state
+        // first; persistent cleanup outcomes are checked against their filtered
+        // cleanup sandbox below.
+        if tentative_invariant_check_applies(result) {
             result = crate::state::invariants::check_invariants_for_tx_with_prefix(
                 &inner,
                 tx,
@@ -4129,6 +4149,11 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
 }
 
 #[inline]
+fn tentative_invariant_check_applies(result: Ter) -> bool {
+    protocol::is_tes_success(result)
+}
+
+#[inline]
 fn exceeds_oversize_metadata_cap(item_count: usize) -> bool {
     item_count > protocol::OVERSIZE_METADATA_CAP
 }
@@ -4268,7 +4293,12 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
                     &rules,
                 )
             } else {
-                per_tx_batch_view.apply().map(|()| metadata.clone())
+                // Open/DryRun Batch uses a fresh per-transaction open view.
+                // PaymentSandbox::apply(RawView&) commits only ledger state;
+                // deferred payment-tab adjustments must not leak into tx2.
+                per_tx_batch_view
+                    .apply_state_only()
+                    .map(|()| metadata.clone())
             };
             if committed.is_err() {
                 return BatchFollowupOutcome {
@@ -4301,7 +4331,7 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
         }
     }
 
-    if !applied_inner_transactions.is_empty() && whole_batch.apply().is_err() {
+    if !applied_inner_transactions.is_empty() && whole_batch.apply_state_only().is_err() {
         return BatchFollowupOutcome {
             result: Ter::TEF_INTERNAL,
             applied_inner_transactions: Vec::new(),
@@ -6065,6 +6095,56 @@ impl ApplicationRoot {
 
         // `record_consensus_built_ledger` above is the sole owner of
         // LedgerHistory's built-ledger bookkeeping and its checkAccept scan.
+    }
+
+    /// If current trusted validations already have quorum for a different
+    /// sibling at `built_seq`, start canonical acceptance and veto installation
+    /// of the observer's local child. This closes the live race where
+    /// `consensusBuilt` discovered the alternate but `doAccept` installed the
+    /// local sibling immediately afterward.
+    pub(crate) fn observer_quorum_alternate_same_seq(
+        &self,
+        built_hash: Uint256,
+        built_seq: u32,
+    ) -> Option<(Uint256, usize)> {
+        let needed = self.needed_validations();
+        let current_trusted = {
+            let validations_guard = self
+                .validations()
+                .validations()
+                .lock()
+                .expect("validations mutex must not be poisoned");
+            validations_guard.current_trusted()
+        };
+        let current_trusted = self.validators().negative_unl_filter_validations(
+            current_trusted
+                .into_iter()
+                .map(|validation| (*validation).clone())
+                .collect(),
+        );
+        let mut candidates = consensus_built_current_validation_counts(
+            current_trusted.into_iter().map(|validation| {
+                (
+                    validation.get_ledger_hash(),
+                    validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence")),
+                )
+            }),
+        );
+        if let Some(lm_rt) = self.ledger_master_runtime() {
+            for (hash, (_, seq)) in &mut candidates {
+                if *seq == 0 {
+                    *seq = lm_rt
+                        .ledger_master()
+                        .get_ledger_by_hash(SHAMapHash::new(*hash))
+                        .map(|ledger| ledger.header().seq)
+                        .unwrap_or_default();
+                }
+            }
+        }
+        let alternate =
+            observer_quorum_alternate_candidate(built_hash, built_seq, needed, candidates)?;
+        self.check_accept_hash_seq(alternate.0, built_seq);
+        Some(alternate)
     }
 
     /// Matches rippled's `LedgerMaster::consensusBuilt` validation scan.

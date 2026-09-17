@@ -662,9 +662,10 @@ fn nftoken_accept_nonexistent_offer() {
 
     let fake_offer = Uint256::from_array([0xEE; 32]);
     let tx = accept_offer_tx(bob, Some(fake_offer), None, 1);
-    let result = full_apply(&mut view, &tx, TxType::NFTOKEN_ACCEPT_OFFER);
-    // Should fail — offer doesn't exist
-    assert!(result != Ter::TES_SUCCESS, "Got {:?}", result); // Accept the actual behavior
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::NFTOKEN_ACCEPT_OFFER),
+        Ter::TEC_OBJECT_NOT_FOUND
+    );
 }
 
 /// C++ NFToken_test — multiple mints with different taxons.

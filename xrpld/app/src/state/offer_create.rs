@@ -141,6 +141,14 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     // Get offer sequence (for the new offer's key)
     let offer_sequence = sttx.get_seq_value();
 
+    // Preserve the original pre-crossing rate for residual placement.  rippled
+    // computes this before cancellation/expiration and detects MPT qualities
+    // that cannot be represented even when no issuer TickSize is configured.
+    let mut placement_rate = match get_rate(&taker_gets, &taker_pays) {
+        Ok(rate) => rate,
+        Err(ter) => return ter,
+    };
+
     let mut result = Ter::TES_SUCCESS;
 
     // --- Cancel existing offer if OfferSequence present ---
@@ -185,12 +193,13 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     }
 
     // --- Expiration check ---
-    if sttx.is_field_present(sf("sfExpiration")) {
-        let expiration = sttx.get_field_u32(sf("sfExpiration"));
-        let close_time = view.header().close_time;
-        if close_time >= expiration {
-            return Ter::TEC_EXPIRED;
-        }
+    // OfferCreate::applyGuts uses hasExpired(), whose consensus boundary is
+    // the parent close time.  The candidate child close time can be later and
+    // must not expire an offer that passed preclaim.
+    if sttx.is_field_present(sf("sfExpiration"))
+        && ledger::has_expired(view, Some(sttx.get_field_u32(sf("sfExpiration"))))
+    {
+        return Ter::TEC_EXPIRED;
     }
 
     if !is_tes_success(result) {
@@ -203,48 +212,46 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         Ok(tick_size) => tick_size,
         Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    let mut unrepresentable_rate = false;
-    if tick_size < 16 {
+    let unrepresentable_rate =
+        view.rules().enabled(&protocol::feature_id("MPTokensV2")) && placement_rate == 0;
+    if tick_size < 16 && !unrepresentable_rate {
         // reference: auto const rate = Quality{saTakerGets, saTakerPays}.round(uTickSize).rate();
         // Quality is stored as (exponent << 56) | mantissa = getRate(taker_gets, taker_pays)
-        let quality = match get_rate(&taker_gets, &taker_pays) {
-            Ok(quality) => quality,
-            Err(ter) => return ter,
-        };
-        let rounded_quality = round_quality(quality, tick_size);
+        let rounded_quality = round_quality(placement_rate, tick_size);
         // Convert rounded quality back to a rate STAmount for multiply/divide
         let rate_amount = quality_to_rate_amount(rounded_quality);
-        unrepresentable_rate =
-            view.rules().enabled(&protocol::feature_id("MPTokensV2")) && rate_amount.signum() == 0;
 
-        if !unrepresentable_rate {
-            if is_sell && !matches!(taker_pays.asset(), Asset::MPTIssue(_)) {
-                // reference: saTakerPays = multiply(saTakerGets, rate, saTakerPays.asset())
-                taker_pays = match amount_or_exception(
-                    taker_gets.try_multiply(&rate_amount, taker_pays.asset()),
-                ) {
-                    Ok(amount) => amount,
-                    Err(ter) => return ter,
-                };
-            } else if !is_sell && !matches!(taker_gets.asset(), Asset::MPTIssue(_)) {
-                // rippled invokes divide here; its zero-rate exception is mapped by
-                // doApply to tefEXCEPTION. Preserve that result without emitting a
-                // Rust unwind from the consensus strand.
-                if rate_amount.signum() == 0 {
-                    return Ter::TEF_EXCEPTION;
-                }
-                // reference: saTakerGets = divide(saTakerPays, rate, saTakerGets.asset())
-                taker_gets = match amount_or_exception(
-                    taker_pays.try_divide(&rate_amount, taker_gets.asset()),
-                ) {
-                    Ok(amount) => amount,
-                    Err(ter) => return ter,
-                };
+        if is_sell && !matches!(taker_pays.asset(), Asset::MPTIssue(_)) {
+            // reference: saTakerPays = multiply(saTakerGets, rate, saTakerPays.asset())
+            taker_pays = match amount_or_exception(
+                taker_gets.try_multiply(&rate_amount, taker_pays.asset()),
+            ) {
+                Ok(amount) => amount,
+                Err(ter) => return ter,
+            };
+        } else if !is_sell && !matches!(taker_gets.asset(), Asset::MPTIssue(_)) {
+            // rippled invokes divide here; its zero-rate exception is mapped by
+            // doApply to tefEXCEPTION. Preserve that result without emitting a
+            // Rust unwind from the consensus strand.
+            if rate_amount.signum() == 0 {
+                return Ter::TEF_EXCEPTION;
             }
-            if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
-                return Ter::TES_SUCCESS; // Rounded to zero
-            }
+            // reference: saTakerGets = divide(saTakerPays, rate, saTakerGets.asset())
+            taker_gets = match amount_or_exception(
+                taker_pays.try_divide(&rate_amount, taker_gets.asset()),
+            ) {
+                Ok(amount) => amount,
+                Err(ter) => return ter,
+            };
         }
+        if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
+            return Ter::TES_SUCCESS; // Rounded to zero
+        }
+
+        placement_rate = match get_rate(&taker_gets, &taker_pays) {
+            Ok(rate) => rate,
+            Err(ter) => return ter,
+        };
     }
 
     // It does NOT prevent crossing. FOK+Passive and IOC+Passive proceed to crossing
@@ -547,10 +554,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         domain: domain_id,
     };
     let book_base = protocol::book_keylet(book);
-    let rate = match get_rate(&taker_gets, &taker_pays) {
-        Ok(rate) => rate,
-        Err(ter) => return ter,
-    };
+    let rate = placement_rate;
     let quality_dir = protocol::quality_keylet(book_base, rate);
 
     let book_node = match ledger::dir_append(view, &quality_dir, offer_keylet.key, &|sle| {
@@ -739,24 +743,10 @@ fn amount_or_exception(
 
 /// Returns the exchange rate encoded as u64: top 8 bits = exponent+100, lower 56 bits = mantissa.
 /// reference: getRate(offerOut=taker_gets, offerIn=taker_pays) = divide(taker_pays, taker_gets) encoded.
+/// rippled catches every divide/range failure and returns zero: an overflow is
+/// an unrepresentable offer quality, not a transaction exception.
 fn get_rate(taker_gets: &STAmount, taker_pays: &STAmount) -> Result<u64, Ter> {
-    if taker_gets.signum() <= 0 {
-        return Ok(0);
-    }
-    // STAmount r = divide(offerIn, offerOut, noIssue())
-    let no_issue = protocol::no_issue();
-    let r = taker_pays
-        .try_divide(taker_gets, no_issue)
-        .map_err(|_| Ter::TEF_EXCEPTION)?;
-    if r.signum() <= 0 {
-        return Ok(0);
-    }
-    // reference: (r.exponent() + 100) << 56 | r.mantissa()
-    let exp = r.exponent() + 100;
-    if !(0..=255).contains(&exp) {
-        return Ok(0);
-    }
-    Ok(((exp as u64) << 56) | r.mantissa())
+    Ok(protocol::get_rate(taker_gets, taker_pays))
 }
 
 /// Get tick size from issuer accounts.

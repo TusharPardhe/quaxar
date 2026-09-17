@@ -2,7 +2,7 @@
 
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
-use basics::number::{NumberArithmeticError, NumberParts, get_mantissa_scale};
+use basics::number::{NumberArithmeticError, NumberParts};
 
 pub const MAX_MP_TOKEN_AMOUNT: i64 = 0x7FFF_FFFF_FFFF_FFFF;
 
@@ -63,8 +63,7 @@ impl TryFrom<NumberParts> for MPTAmount {
 
 impl From<MPTAmount> for NumberParts {
     fn from(value: MPTAmount) -> Self {
-        NumberParts::try_from_external_parts(value.value, 0, get_mantissa_scale())
-            .expect("MPTAmount should normalize into current Number range")
+        NumberParts::from_i64(value.value)
     }
 }
 

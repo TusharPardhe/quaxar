@@ -62,14 +62,27 @@ fn accepts_step_quality(first: &mut Option<Quality>, candidate: Quality) -> bool
     }
 }
 
-/// A ledger offer retains the immutable quality assigned when it entered the
-/// book. Its amounts may later be partially consumed and no longer reproduce
-/// that quality exactly, so all TOffer limiting must use the BookDirectory
-/// suffix rather than recomputing a ratio from the current amounts.
-fn offer_directory_quality(offer: &STLedgerEntry) -> Quality {
-    Quality::from_value(protocol::quality_from_key(
-        offer.get_field_h256(sf("sfBookDirectory")),
-    ))
+/// One offer paired with the quality encoded by the traversed directory root.
+/// BookTip gets this from `firstPage`, not from the offer's sfBookDirectory:
+/// before fixCleanup3_2_0 a permissioned offer may retain its open-book pointer
+/// while being visited through a domain book's different quality root.
+struct TraversedOffer {
+    sle: STLedgerEntry,
+    quality: Quality,
+}
+
+fn insert_sorted_amount(amounts: &mut Vec<STAmount>, amount: STAmount) {
+    let index = amounts.partition_point(|saved| saved <= &amount);
+    amounts.insert(index, amount);
+}
+
+fn sum_sorted_amounts(amounts: &[STAmount], zero: &STAmount) -> STAmount {
+    let Some((first, rest)) = amounts.split_first() else {
+        return zero.zeroed();
+    };
+    rest.iter()
+        .cloned()
+        .fold(first.clone(), |sum, amount| sum + amount)
 }
 
 fn amm_target_quality(
@@ -124,11 +137,60 @@ fn offer_owner_authorized<V: ApplyView>(
             } else {
                 protocol::lsfHighAuth
             };
-            Ok(line.is_flag(flag))
+            if line.is_flag(flag) {
+                return Ok(true);
+            }
+            // fixCleanup3_4_0 makes every metadata-marked pseudo account
+            // implicitly authorized for IOUs, matching generic requireAuth.
+            if view.rules().enabled(&protocol::fix_cleanup_3_4_0())
+                && view
+                    .read(protocol::account_keylet(Uint160::from_void(owner.data())))?
+                    .is_some_and(|account| crate::is_pseudo_account(&account))
+            {
+                return Ok(true);
+            }
+            Ok(false)
         }
-        Asset::MPTIssue(issue) => crate::mptoken_helpers::require_auth_mpt(view, issue, owner)
-            .map(|ter| ter == Ter::TES_SUCCESS),
+        Asset::MPTIssue(issue) => crate::mptoken_helpers::require_auth_mpt_with_type(
+            view,
+            issue,
+            owner,
+            crate::mptoken_helpers::MPTAuthType::Weak,
+        )
+        .map(|ter| ter == Ter::TES_SUCCESS),
     }
+}
+
+fn offer_owner_deep_frozen<V: ApplyView>(
+    view: &V,
+    asset: Asset,
+    owner: &AccountID,
+) -> Result<bool, ViewError> {
+    match asset {
+        Asset::Issue(issue) if issue.native() || issue.issuer() == *owner => Ok(false),
+        Asset::Issue(issue) => Ok(view
+            .read(protocol::line(*owner, issue.issuer(), issue.currency))?
+            .is_some_and(|line| {
+                line.is_flag(protocol::lsfLowDeepFreeze)
+                    || line.is_flag(protocol::lsfHighDeepFreeze)
+            })),
+        // A locked MPT cannot send or receive, so its ordinary frozen state is
+        // the MPT equivalent of IOU deep freeze.
+        Asset::MPTIssue(issue) => crate::mptoken_helpers::is_frozen_mpt(view, owner, &issue),
+    }
+}
+
+fn domain_offer_error(
+    fix_cleanup_3_4_0: bool,
+    book_domain: Option<Uint256>,
+    offer_domain: Option<Uint256>,
+) -> Option<Ter> {
+    (fix_cleanup_3_4_0 && book_domain.is_some() && offer_domain != book_domain)
+        .then_some(Ter::TEC_INTERNAL)
+}
+
+fn amm_quality_estimation_allowed(book_domain: Option<Uint256>, fix_cleanup_3_3_0: bool) -> bool {
+    book_domain.is_none() || !fix_cleanup_3_3_0
 }
 
 fn offer_owner_mpt_dex_allowed<V: ApplyView>(
@@ -361,6 +423,11 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     });
     let mut total_in = max_in.zeroed();
     let mut total_out = max_out.zeroed();
+    // rippled retains every CLOB and synthetic-AMM contribution in
+    // flat_multisets and re-sums from smallest to largest. IOU addition is
+    // finite-precision and therefore order-sensitive.
+    let mut saved_ins = Vec::with_capacity(64);
+    let mut saved_outs = Vec::with_capacity(64);
     let mut offers_consumed: u32 = 0;
     let mut remaining_in = max_in.clone();
     let fix_reduced_offers_v2 = view
@@ -468,11 +535,13 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     // ends this step before FlowOfferStream advances to them.
     let mut offers = Vec::with_capacity(raw_offers.len());
     let mut found_tip = false;
-    for offer_sle in raw_offers {
+    for traversed in raw_offers {
         if found_tip {
-            offers.push(offer_sle);
+            offers.push(traversed);
             continue;
         }
+        let offer_sle = traversed.sle;
+        let offer_quality = traversed.quality;
         let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
         let taker_gets = offer_sle.get_field_amount(sf("sfTakerGets"));
         if offer_sle.is_field_present(sf("sfExpiration"))
@@ -493,15 +562,39 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             offers_consumed += 1;
             continue;
         }
-        if let Some(domain) = book.domain
-            && (!offer_sle.is_field_present(sf("sfDomainID"))
-                || offer_sle.get_field_h256(sf("sfDomainID")) != domain)
-        {
+        let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
+        let input_deep_frozen = match offer_owner_deep_frozen(view, book.r#in, &offer_owner) {
+            Ok(frozen) => frozen,
+            Err(_) => {
+                return BookStepResult {
+                    amount_in: total_in,
+                    amount_out: total_out,
+                    offers_consumed,
+                    ter: Ter::TEF_BAD_LEDGER,
+                };
+            }
+        };
+        if input_deep_frozen {
+            if let Some(removable) = &self_cross_cancellation {
+                removable.record(*offer_sle.key());
+            }
+            remove_offer_or_return!(&offer_sle);
+            offers_consumed += 1;
+            continue;
+        }
+        let offer_domain = offer_sle
+            .is_field_present(sf("sfDomainID"))
+            .then(|| offer_sle.get_field_h256(sf("sfDomainID")));
+        if let Some(ter) = domain_offer_error(
+            view.rules().enabled(&protocol::fix_cleanup_3_4_0()),
+            book.domain,
+            offer_domain,
+        ) {
             return BookStepResult {
                 amount_in: total_in,
                 amount_out: total_out,
                 offers_consumed,
-                ter: Ter::TEF_INTERNAL,
+                ter,
             };
         }
         if offer_sle.is_field_present(sf("sfDomainID"))
@@ -532,7 +625,6 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 continue;
             }
         }
-        let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
         let owner_funds = match get_owner_funds(view, &offer_owner, &taker_gets) {
             Ok(funds) => funds,
             Err(_) => {
@@ -586,7 +678,10 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             }
         }
         found_tip = true;
-        offers.push(offer_sle);
+        offers.push(TraversedOffer {
+            sle: offer_sle,
+            quality: offer_quality,
+        });
     }
 
     // A BookStep consumes one quality directory per call, as in rippled's
@@ -597,7 +692,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     // rippled tries AMM liquidity before the cleaned CLOB tip. The AMM offer
     // establishes the one-quality-per-step boundary just like a real offer.
     // Domain books never use AMM liquidity.
-    let clob_tip = offers.first().map(offer_directory_quality);
+    let clob_tip = offers.first().map(|offer| offer.quality);
     let amm_generation_quality = amm_target_quality(
         clob_tip,
         quality_threshold,
@@ -674,9 +769,11 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 );
                 if res == Ter::TES_SUCCESS {
                     amm_context.set_amm_used();
-                    total_in += step_in.clone();
-                    total_out += amm_gets;
-                    remaining_in -= step_in;
+                    insert_sorted_amount(&mut saved_ins, step_in);
+                    insert_sorted_amount(&mut saved_outs, amm_gets);
+                    total_in = sum_sorted_amounts(&saved_ins, max_in);
+                    total_out = sum_sorted_amounts(&saved_outs, max_out);
+                    remaining_in = max_in.clone() - total_in.clone();
                     offer_attempted = true;
                 } else {
                     stop_before_clob = true;
@@ -688,11 +785,13 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     }
 
     if !stop_before_clob {
-        for offer_sle in offers {
+        for traversed in offers {
             if offers_consumed >= MAX_OFFERS_TO_CONSUME || remaining_in.signum() <= 0 {
                 break;
             }
 
+            let offer_sle = traversed.sle;
+            let offer_quality = traversed.quality;
             let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
             let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
             let taker_gets = offer_sle.get_field_amount(sf("sfTakerGets"));
@@ -717,15 +816,41 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 continue;
             }
 
-            if let Some(domain) = book.domain
-                && (!offer_sle.is_field_present(sf("sfDomainID"))
-                    || offer_sle.get_field_h256(sf("sfDomainID")) != domain)
-            {
+            let input_deep_frozen = match offer_owner_deep_frozen(view, book.r#in, &offer_owner) {
+                Ok(frozen) => frozen,
+                Err(_) => {
+                    return BookStepResult {
+                        amount_in: total_in,
+                        amount_out: total_out,
+                        offers_consumed,
+                        ter: Ter::TEF_BAD_LEDGER,
+                    };
+                }
+            };
+            if input_deep_frozen {
+                if let Some(removable) = &self_cross_cancellation {
+                    removable.record(*offer_sle.key());
+                }
+                remove_offer_or_return!(&offer_sle);
+                if !offer_attempted {
+                    first_quality = None;
+                }
+                offers_consumed += 1;
+                continue;
+            }
+            let offer_domain = offer_sle
+                .is_field_present(sf("sfDomainID"))
+                .then(|| offer_sle.get_field_h256(sf("sfDomainID")));
+            if let Some(ter) = domain_offer_error(
+                view.rules().enabled(&protocol::fix_cleanup_3_4_0()),
+                book.domain,
+                offer_domain,
+            ) {
                 return BookStepResult {
                     amount_in: total_in,
                     amount_out: total_out,
                     offers_consumed,
-                    ter: Ter::TEF_INTERNAL,
+                    ter,
                 };
             }
             if offer_sle.is_field_present(sf("sfDomainID"))
@@ -782,11 +907,10 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 continue;
             }
 
-            // TOffer::quality() comes from BookTip's directory key. A partial
-            // consumption changes TakerPays/TakerGets but never relocates the
-            // offer, so recomputing their ratio can improve the quality and
-            // change both threshold selection and strict limit arithmetic.
-            let offer_quality = offer_directory_quality(&offer_sle);
+            // TOffer::quality() comes from the traversed BookTip directory
+            // root. A partial consumption changes TakerPays/TakerGets, and a
+            // legacy permissioned offer's sfBookDirectory may name its open
+            // book instead of the domain root currently being traversed.
 
             // `forEachOffer` stops before invoking the derived callback when
             // the stream advances to a second quality after an offer attempt.
@@ -915,6 +1039,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 &book.out,
                 &consumption.offer_in,
                 &consumption.owner_gives,
+                &consumption.offer_out,
             );
             if res != Ter::TES_SUCCESS {
                 remove_offer_or_return!(&offer_sle);
@@ -947,9 +1072,11 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 )));
             }
 
-            total_in += consumption.step_in.clone();
-            total_out += consumption.step_out.clone();
-            remaining_in -= consumption.step_in;
+            insert_sorted_amount(&mut saved_ins, consumption.step_in);
+            insert_sorted_amount(&mut saved_outs, consumption.step_out);
+            total_in = sum_sorted_amounts(&saved_ins, max_in);
+            total_out = sum_sorted_amounts(&saved_outs, max_out);
+            remaining_in = max_in.clone() - total_in.clone();
             offers_consumed += 1;
         }
     }
@@ -1646,19 +1773,17 @@ pub(crate) fn book_quality_upper_bound<V: ApplyView>(
     strand_deliver: Asset,
 ) -> Result<Option<Quality>, ViewError> {
     let clob_offers = get_book_offers(view, book, 1)?;
-    let clob = clob_offers.first().map(|offer| {
-        Quality::from_amounts(&Amounts::new(
-            offer.get_field_amount(sf("sfTakerPays")),
-            offer.get_field_amount(sf("sfTakerGets")),
-        ))
-    });
+    let clob = clob_offers.first().map(|offer| offer.quality);
     let generation_quality = amm_target_quality(
         clob,
         quality_threshold,
         view.rules().enabled(&protocol::fix_ammv1_1()),
         amm_context.multi_path(),
     );
-    let amm = if book.domain.is_none() {
+    let amm = if amm_quality_estimation_allowed(
+        book.domain,
+        view.rules().enabled(&protocol::fix_cleanup_3_3_0()),
+    ) {
         get_amm_offer(view, book, generation_quality, amm_context)?
     } else {
         None
@@ -1695,19 +1820,17 @@ pub(crate) fn book_quality_function<V: ApplyView>(
     strand_deliver: Asset,
 ) -> Result<Option<QualityFunction>, ViewError> {
     let clob_offers = get_book_offers(view, book, 1)?;
-    let clob = clob_offers.first().map(|offer| {
-        Quality::from_amounts(&Amounts::new(
-            offer.get_field_amount(sf("sfTakerPays")),
-            offer.get_field_amount(sf("sfTakerGets")),
-        ))
-    });
+    let clob = clob_offers.first().map(|offer| offer.quality);
     let target = amm_target_quality(
         clob,
         quality_threshold,
         view.rules().enabled(&protocol::fix_ammv1_1()),
         amm_context.multi_path(),
     );
-    let amm = if book.domain.is_none() {
+    let amm = if amm_quality_estimation_allowed(
+        book.domain,
+        view.rules().enabled(&protocol::fix_cleanup_3_3_0()),
+    ) {
         get_amm_offer(view, book, target, amm_context)?
     } else {
         None
@@ -1913,12 +2036,22 @@ fn execute_amm_trade<V: ApplyView>(
     let amount_out = normalize_amount_to_asset(amount_out, *book_out);
 
     // Taker pays amount_in to AMM (AMM receives book_in)
-    let res = ripple_state_helpers::account_send(view, &book_in.issuer(), amm_account, &amount_in);
+    let res = ripple_state_helpers::account_send_allow_mpt_overflow(
+        view,
+        &book_in.issuer(),
+        amm_account,
+        &amount_in,
+    );
     if res != Ter::TES_SUCCESS {
         return res;
     }
     // AMM pays amount_out to taker (AMM sends book_out)
-    ripple_state_helpers::account_send(view, amm_account, &book_out.issuer(), &amount_out)
+    ripple_state_helpers::account_send_allow_mpt_overflow(
+        view,
+        amm_account,
+        &book_out.issuer(),
+        &amount_out,
+    )
 }
 
 /// Remove a consumed offer — reference offerDelete parity.
@@ -1948,7 +2081,7 @@ fn get_book_offers<V: ApplyView>(
     view: &mut V,
     book: &Book,
     max: u32,
-) -> Result<Vec<STLedgerEntry>, ViewError> {
+) -> Result<Vec<TraversedOffer>, ViewError> {
     let mut offers = Vec::new();
 
     // Offers are stored under their executable TakerPays -> TakerGets book,
@@ -1979,46 +2112,55 @@ fn get_book_offers<V: ApplyView>(
 
     let mut current_key = book_base;
 
-    // Walk directory pages in quality order using succ
+    // `succ` finds only the quality root. Continuation pages are hashed
+    // directory-page keys outside the book's quality range and must be
+    // followed through sfIndexNext from that root.
     while offers.len() < max as usize {
-        // Find next directory page in the book range
-        let next_page = match view.succ(current_key, Some(book_end))? {
+        let quality_root_key = match view.succ(current_key, Some(book_end))? {
             Some(key) => key,
             None => break,
         };
+        let quality_root =
+            protocol::Keylet::new(protocol::LedgerEntryType::DirectoryNode, quality_root_key);
+        let quality = Quality::from_value(protocol::quality_from_key(quality_root_key));
+        let mut page = 0_u64;
 
-        // Read the directory page — use read fallback for NuDB-backed pages
-        // not yet in the sandbox cache (fixes tecDIR_FULL for multi-page dirs).
-        let page_keylet =
-            protocol::Keylet::new(protocol::LedgerEntryType::DirectoryNode, next_page);
-        // `peek` is an effective ApplyView read: it resolves the base entry
-        // and preserves staged erases. A fallback `read` would resurrect a
-        // directory page removed earlier in this flow pass.
-        let dir = view.peek(page_keylet)?;
-        let Some(dir) = dir else {
-            // Advance past this page
-            current_key = next_page;
-            continue;
-        };
+        loop {
+            let page_keylet = protocol::page_keylet(quality_root, page);
+            // `peek` preserves staged erases; `read` would resurrect a page
+            // removed earlier in this flow pass.
+            let Some(dir) = view.peek(page_keylet)? else {
+                break;
+            };
 
-        // Read offers from this page's sfIndexes
-        if dir.is_field_present(sf("sfIndexes")) {
-            let indexes = dir.get_field_v256(sf("sfIndexes"));
-            for &offer_key in indexes.value() {
-                if offers.len() >= max as usize {
-                    break;
-                }
-                let offer_keylet =
-                    protocol::Keylet::new(protocol::LedgerEntryType::Offer, offer_key);
-                let offer_sle = view.peek(offer_keylet)?;
-                if let Some(offer_sle) = offer_sle {
-                    offers.push(offer_sle.as_ref().clone());
+            if dir.is_field_present(sf("sfIndexes")) {
+                for &offer_key in dir.get_field_v256(sf("sfIndexes")).value() {
+                    if offers.len() >= max as usize {
+                        break;
+                    }
+                    if let Some(offer_sle) = view.peek(protocol::Keylet::new(
+                        protocol::LedgerEntryType::Offer,
+                        offer_key,
+                    ))? {
+                        offers.push(TraversedOffer {
+                            sle: offer_sle.as_ref().clone(),
+                            quality,
+                        });
+                    }
                 }
             }
+
+            if offers.len() >= max as usize {
+                break;
+            }
+            let next = dir.get_field_u64(sf("sfIndexNext"));
+            if next == 0 {
+                break;
+            }
+            page = next;
         }
 
-        // Move past this page for next iteration
-        current_key = next_page;
+        current_key = quality_root_key;
     }
 
     Ok(offers)
@@ -2126,9 +2268,20 @@ pub(crate) fn get_owner_funds<V: ApplyView>(
         // synthetic fixed-exponent maximum can underfund valid large offers.
         return Ok(default_amount.clone());
     }
-    // IOU: check freeze status first (reference FreezeHandling::ZeroIfFrozen)
-    if ripple_state_helpers::try_is_frozen(view, owner, &issue)? {
-        return Ok(STAmount::default());
+    // OfferStream's accountFunds(..., ZeroIfFrozen) treats both ordinary and
+    // deep freeze as zero. Deep freeze is symmetric and blocks receipt as
+    // well as spend.
+    if ripple_state_helpers::try_is_frozen(view, owner, &issue)?
+        || offer_owner_deep_frozen(view, asset, owner)?
+    {
+        return Ok(default_amount.zeroed());
+    }
+    // LP tokens backed by a non-transferable MPT are not spendable. The
+    // helper is a no-op for ordinary IOU issuers and non-MPT AMM pools.
+    if crate::mptoken_helpers::can_transfer_lp_token(view, owner, owner, &issue.issuer())?
+        != Ter::TES_SUCCESS
+    {
+        return Ok(default_amount.zeroed());
     }
     ripple_state_helpers::try_account_holds(view, owner, &issue.account, issue.currency)
 }
@@ -2302,14 +2455,43 @@ fn execute_offer_trade<V: ApplyView>(
     book_out: &Asset,
     amount_in: &STAmount,
     amount_out: &STAmount,
+    offer_out: &STAmount,
 ) -> Ter {
     // Credit offer owner with amount_in (they receive what taker pays)
-    let res = ripple_state_helpers::account_send(view, &book_in.issuer(), offer_owner, amount_in);
+    let res = ripple_state_helpers::account_send_allow_mpt_overflow(
+        view,
+        &book_in.issuer(),
+        offer_owner,
+        amount_in,
+    );
     if res != Ter::TES_SUCCESS {
         return res;
     }
     // Debit offer owner of amount_out (they give what taker gets)
-    ripple_state_helpers::account_send(view, offer_owner, &book_out.issuer(), amount_out)
+    let result = ripple_state_helpers::account_send_allow_mpt_overflow(
+        view,
+        offer_owner,
+        &book_out.issuer(),
+        amount_out,
+    );
+    if result != Ter::TES_SUCCESS {
+        return result;
+    }
+    if let Asset::MPTIssue(issue) = book_out
+        && *offer_owner == issue.issuer()
+    {
+        let issuance = match view.read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id())) {
+            Ok(Some(issuance)) => issuance,
+            Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        view.issuer_self_debit_hook_mpt(
+            *issue,
+            offer_out.mpt().value() as u64,
+            crate::mptoken_helpers::available_mpt_amount(&issuance),
+        );
+    }
+    Ter::TES_SUCCESS
 }
 
 /// Result from estimate/execute that strand.rs expects
@@ -2377,7 +2559,7 @@ mod tests {
 
     use super::*;
     use basics::base_uint::{Uint192, Uint256};
-    use protocol::{ApplyFlags, Currency, MPTIssue, STArray, STObject, StBase};
+    use protocol::{ApplyFlags, Currency, Issue, MPTIssue, STArray, STObject, StBase};
 
     use crate::{ApplyViewImpl, Fees, Ledger, LedgerHeader, ReadView, ReadViewTx, Rules};
 
@@ -2657,6 +2839,326 @@ mod tests {
     #[test]
     fn book_step_offer_cap_matches_rippled() {
         assert_eq!(MAX_OFFERS_TO_CONSUME, 1000);
+    }
+
+    fn test_apply_view(features: &[Uint256]) -> ApplyViewImpl<Ledger> {
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(1, 1, false);
+        ledger.set_rules(Rules::new(features.iter().copied()));
+        ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE)
+    }
+
+    fn test_account(account: AccountID, flags: u32) -> STLedgerEntry {
+        let mut root =
+            STLedgerEntry::new(protocol::account_keylet(Uint160::from_void(account.data())));
+        root.set_account_id(sf("sfAccount"), account);
+        root.set_field_u32(sf("sfFlags"), flags);
+        root.set_field_u32(sf("sfSequence"), 1);
+        root.set_field_u32(sf("sfOwnerCount"), 0);
+        root.set_field_amount(
+            sf("sfBalance"),
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(100_000_000)),
+        );
+        root
+    }
+
+    fn test_iou_line(
+        account: AccountID,
+        issuer: AccountID,
+        currency: Currency,
+        flags: u32,
+        balance: IOUAmount,
+    ) -> STLedgerEntry {
+        let mut line = STLedgerEntry::new(protocol::line(account, issuer, currency));
+        line.set_field_u32(sf("sfFlags"), flags);
+        line.set_field_amount(
+            sf("sfLowLimit"),
+            STAmount::from_iou_amount(
+                sf("sfLowLimit"),
+                IOUAmount::new(),
+                Issue::new(currency, account.min(issuer)),
+            ),
+        );
+        line.set_field_amount(
+            sf("sfHighLimit"),
+            STAmount::from_iou_amount(
+                sf("sfHighLimit"),
+                IOUAmount::new(),
+                Issue::new(currency, account.max(issuer)),
+            ),
+        );
+        line.set_field_amount(
+            sf("sfBalance"),
+            STAmount::from_iou_amount(
+                sf("sfBalance"),
+                balance,
+                Issue::new(currency, protocol::no_account()),
+            ),
+        );
+        line
+    }
+
+    #[test]
+    fn book_offer_walk_follows_quality_root_index_next_pages() {
+        let issuer = AccountID::from_array([0x61; 20]);
+        let owner = AccountID::from_array([0x62; 20]);
+        let usd = Issue::new(protocol::currency_from_string("USD"), issuer);
+        let book = Book {
+            r#in: Asset::Issue(protocol::xrp_issue()),
+            out: Asset::Issue(usd),
+            domain: None,
+        };
+        let proto_book = protocol::Book::new(book.r#in, book.out, None);
+        let quality_root = protocol::quality_keylet(protocol::book_keylet(proto_book), 77);
+        let offer_one_key = protocol::offer_keylet(Uint160::from_void(owner.data()), 1);
+        let offer_two_key = protocol::offer_keylet(Uint160::from_void(owner.data()), 2);
+        let mut root = STLedgerEntry::new(quality_root);
+        root.set_field_v256(
+            sf("sfIndexes"),
+            protocol::STVector256::from_values(sf("sfIndexes"), vec![offer_one_key.key]),
+        );
+        root.set_field_u64(sf("sfIndexNext"), 9);
+        root.set_field_u64(sf("sfIndexPrevious"), 9);
+        let mut continuation = STLedgerEntry::new(protocol::page_keylet(quality_root, 9));
+        continuation.set_field_v256(
+            sf("sfIndexes"),
+            protocol::STVector256::from_values(sf("sfIndexes"), vec![offer_two_key.key]),
+        );
+        continuation.set_field_u64(sf("sfIndexNext"), 0);
+        continuation.set_field_u64(sf("sfIndexPrevious"), 0);
+        let mut offer_one = STLedgerEntry::new(offer_one_key);
+        offer_one.set_account_id(sf("sfAccount"), owner);
+        offer_one.set_field_h256(sf("sfBookDirectory"), quality_root.key);
+        let mut offer_two = STLedgerEntry::new(offer_two_key);
+        offer_two.set_account_id(sf("sfAccount"), owner);
+        offer_two.set_field_h256(sf("sfBookDirectory"), quality_root.key);
+
+        let mut view = test_apply_view(&[]);
+        for entry in [root, continuation, offer_one, offer_two] {
+            view.insert(Arc::new(entry)).expect("insert book fixture");
+        }
+        let offers = get_book_offers(&mut view, &book, 2).expect("walk book");
+        assert_eq!(
+            offers
+                .iter()
+                .map(|offer| *offer.sle.key())
+                .collect::<Vec<_>>(),
+            vec![offer_one_key.key, offer_two_key.key]
+        );
+    }
+
+    #[test]
+    fn permissioned_offer_uses_traversed_domain_root_quality_before_cleanup_3_2() {
+        let issuer = AccountID::from_array([0x63; 20]);
+        let owner = AccountID::from_array([0x64; 20]);
+        let domain = Uint256::from_u64(0xD0);
+        let issue = Issue::new(protocol::currency_from_string("USD"), issuer);
+        let book = Book {
+            r#in: Asset::Issue(protocol::xrp_issue()),
+            out: Asset::Issue(issue),
+            domain: Some(domain),
+        };
+        let domain_base =
+            protocol::book_keylet(protocol::Book::new(book.r#in, book.out, book.domain));
+        let open_base = protocol::book_keylet(protocol::Book::new(book.r#in, book.out, None));
+        let domain_root = protocol::quality_keylet(domain_base, 0x1122_3344_5566_7788);
+        let stale_open_root = protocol::quality_keylet(open_base, 0x8877_6655_4433_2211);
+        let offer_keylet = protocol::offer_keylet(Uint160::from_void(owner.data()), 3);
+
+        let mut root = STLedgerEntry::new(domain_root);
+        root.set_field_v256(
+            sf("sfIndexes"),
+            protocol::STVector256::from_values(sf("sfIndexes"), vec![offer_keylet.key]),
+        );
+        root.set_field_u64(sf("sfIndexNext"), 0);
+        root.set_field_u64(sf("sfIndexPrevious"), 0);
+        let mut offer = STLedgerEntry::new(offer_keylet);
+        offer.set_account_id(sf("sfAccount"), owner);
+        offer.set_field_h256(sf("sfDomainID"), domain);
+        offer.set_field_h256(sf("sfBookDirectory"), stale_open_root.key);
+
+        // No fixCleanup3_2_0: this is the historical hybrid shape described by
+        // BookTip, where the stored pointer and traversed root can disagree.
+        let mut view = test_apply_view(&[]);
+        view.insert(Arc::new(root)).expect("insert domain root");
+        view.insert(Arc::new(offer)).expect("insert hybrid offer");
+        let offers = get_book_offers(&mut view, &book, 1).expect("walk domain book");
+
+        assert_eq!(offers.len(), 1);
+        assert_eq!(
+            offers[0].quality,
+            Quality::from_value(0x1122_3344_5566_7788)
+        );
+        assert_ne!(
+            offers[0].quality,
+            Quality::from_value(protocol::quality_from_key(
+                offers[0].sle.get_field_h256(sf("sfBookDirectory"))
+            ))
+        );
+    }
+
+    #[test]
+    fn book_local_sorted_multiset_accumulation_preserves_iou_ordering() {
+        let issue = Issue::new(
+            protocol::currency_from_string("USD"),
+            AccountID::from_array([0x64; 20]),
+        );
+        let amount = |mantissa, exponent| {
+            STAmount::from_iou_amount(
+                sf("sfAmount"),
+                IOUAmount::from_parts(mantissa, exponent).expect("canonical IOU"),
+                issue,
+            )
+        };
+        let large = amount(1_000_000_000_000_000, -15);
+        let dust = amount(6_000_000_000_000_000, -31);
+        let processing_order = large.clone() + dust.clone() + dust.clone();
+        let mut saved = Vec::new();
+        insert_sorted_amount(&mut saved, large.clone());
+        insert_sorted_amount(&mut saved, dust.clone());
+        insert_sorted_amount(&mut saved, dust);
+
+        assert_ne!(
+            sum_sorted_amounts(&saved, &large.zeroed()),
+            processing_order
+        );
+        assert_eq!(
+            sum_sorted_amounts(&saved, &large.zeroed()),
+            amount(1_000_000_000_000_001, -15)
+        );
+    }
+
+    #[test]
+    fn offer_consideration_rejects_input_deep_freeze_and_output_lp_unspendability() {
+        let owner = AccountID::from_array([0x10; 20]);
+        let issuer = AccountID::from_array([0x20; 20]);
+        let currency = protocol::currency_from_string("USD");
+        let issue = Issue::new(currency, issuer);
+        let mut view = test_apply_view(&[protocol::feature_id("MPTokensV2")]);
+        view.insert(Arc::new(test_account(owner, 0))).unwrap();
+        view.insert(Arc::new(test_account(issuer, 0))).unwrap();
+        view.insert(Arc::new(test_iou_line(
+            owner,
+            issuer,
+            currency,
+            protocol::lsfLowDeepFreeze,
+            IOUAmount::from_parts(10, 0).expect("balance"),
+        )))
+        .unwrap();
+        assert!(offer_owner_deep_frozen(&view, Asset::Issue(issue), &owner).unwrap());
+        let default = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            IOUAmount::from_parts(10, 0).expect("default"),
+            issue,
+        );
+        assert_eq!(
+            get_owner_funds(&mut view, &owner, &default)
+                .unwrap()
+                .signum(),
+            0
+        );
+
+        let amm = AccountID::from_array([0x30; 20]);
+        let mpt_issuer = AccountID::from_array([0x40; 20]);
+        let amm_id = Uint256::from_u64(0xA64);
+        let mpt = protocol::MPTIssue::new(protocol::make_mpt_id(1, mpt_issuer));
+        let lp_currency = protocol::currency_from_string("LPT");
+        let lp_issue = Issue::new(lp_currency, amm);
+        let mut amm_root = test_account(amm, 0);
+        amm_root.set_field_h256(sf("sfAMMID"), amm_id);
+        view.insert(Arc::new(amm_root)).unwrap();
+        view.insert(Arc::new(test_account(mpt_issuer, 0))).unwrap();
+        let mut issuance =
+            STLedgerEntry::new(protocol::mpt_issuance_keylet_from_mptid(mpt.mpt_id()));
+        issuance.set_account_id(sf("sfIssuer"), mpt_issuer);
+        issuance.set_field_u32(sf("sfSequence"), 1);
+        issuance.set_field_u32(sf("sfFlags"), protocol::lsfMPTCanTrade);
+        issuance.set_field_u64(sf("sfOutstandingAmount"), 0);
+        view.insert(Arc::new(issuance)).unwrap();
+        let mut amm_sle = STLedgerEntry::new(protocol::amm_keylet(amm_id));
+        amm_sle.set_account_id(sf("sfAccount"), amm);
+        amm_sle.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), Asset::MPTIssue(mpt)),
+        );
+        amm_sle.set_field_issue(
+            sf("sfAsset2"),
+            protocol::STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(protocol::xrp_issue())),
+        );
+        view.insert(Arc::new(amm_sle)).unwrap();
+        view.insert(Arc::new(test_iou_line(
+            owner,
+            amm,
+            lp_currency,
+            0,
+            IOUAmount::from_parts(10, 0).expect("LP balance"),
+        )))
+        .unwrap();
+        let lp = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            IOUAmount::from_parts(10, 0).expect("LP default"),
+            lp_issue,
+        );
+        assert_eq!(get_owner_funds(&mut view, &owner, &lp).unwrap().signum(), 0);
+    }
+
+    #[test]
+    fn cleanup_3_4_authorizes_iou_pseudo_offer_owner() {
+        let issuer = AccountID::from_array([0x65; 20]);
+        let pseudo = AccountID::from_array([0x66; 20]);
+        let currency = protocol::currency_from_string("USD");
+        let asset = Asset::Issue(Issue::new(currency, issuer));
+        let build = |fixed: bool| {
+            let features = fixed
+                .then_some(protocol::fix_cleanup_3_4_0())
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut view = test_apply_view(&features);
+            view.insert(Arc::new(test_account(issuer, protocol::lsfRequireAuth)))
+                .unwrap();
+            let mut pseudo_root = test_account(pseudo, 0);
+            pseudo_root.set_field_h256(sf("sfAMMID"), Uint256::from_u64(0xB65));
+            view.insert(Arc::new(pseudo_root)).unwrap();
+            view.insert(Arc::new(test_iou_line(
+                pseudo,
+                issuer,
+                currency,
+                0,
+                IOUAmount::new(),
+            )))
+            .unwrap();
+            view
+        };
+
+        assert!(!offer_owner_authorized(&build(false), &asset, &pseudo).unwrap());
+        assert!(offer_owner_authorized(&build(true), &asset, &pseudo).unwrap());
+    }
+
+    #[test]
+    fn domain_corruption_gate_is_cleanup_3_4_and_returns_tec_internal() {
+        let domain = Uint256::from_u64(1);
+        let mismatch = Uint256::from_u64(2);
+        assert_eq!(domain_offer_error(false, Some(domain), None), None);
+        assert_eq!(
+            domain_offer_error(false, Some(domain), Some(mismatch)),
+            None
+        );
+        assert_eq!(
+            domain_offer_error(true, Some(domain), None),
+            Some(Ter::TEC_INTERNAL)
+        );
+        assert_eq!(
+            domain_offer_error(true, Some(domain), Some(mismatch)),
+            Some(Ter::TEC_INTERNAL)
+        );
+        assert_eq!(domain_offer_error(true, Some(domain), Some(domain)), None);
+    }
+
+    #[test]
+    fn domain_amm_estimation_preserves_pre_cleanup_3_3_history() {
+        let domain = Some(Uint256::from_u64(3));
+        assert!(amm_quality_estimation_allowed(domain, false));
+        assert!(!amm_quality_estimation_allowed(domain, true));
+        assert!(amm_quality_estimation_allowed(None, true));
     }
 
     #[test]

@@ -274,13 +274,20 @@ impl NumberParts {
     }
 
     pub fn from_i64(mantissa: i64) -> Self {
-        Self::try_from_external_parts(mantissa, 0, get_mantissa_scale())
-            .expect("NumberParts from_i64 should not overflow")
+        Self::from_i64_and_exponent(mantissa, 0)
     }
 
     pub fn from_i64_and_exponent(mantissa: i64, exponent: i32) -> Self {
-        Self::try_from_external_parts(mantissa, exponent, get_mantissa_scale())
-            .expect("NumberParts from_i64_and_exponent should not overflow")
+        let scale = get_mantissa_scale();
+        Self::normalize_arithmetic_parts(
+            mantissa < 0,
+            u128::from(external_to_internal_mantissa(mantissa)),
+            exponent,
+            mantissa_range_min(scale),
+            mantissa_range_max(scale),
+            scale,
+        )
+        .expect("NumberParts integer construction should not overflow")
     }
 
     pub const fn isnormal(self, scale: MantissaScale) -> bool {
@@ -2405,5 +2412,45 @@ mod tests {
         assert_eq!(get_rounding_mode(), RoundingMode::Upward);
 
         set_rounding_mode(RoundingMode::ToNearest);
+    }
+
+    #[test]
+    fn integer_construction_rounds_large_values_like_cpp_number() {
+        let _scale = NumberMantissaScaleGuard::new(MantissaScale::Small);
+
+        let cases = [
+            (
+                RoundingMode::ToNearest,
+                9_223_372_036_854_776,
+                4_611_686_018_427_388,
+            ),
+            (
+                RoundingMode::TowardsZero,
+                9_223_372_036_854_775,
+                4_611_686_018_427_387,
+            ),
+            (
+                RoundingMode::Downward,
+                9_223_372_036_854_775,
+                4_611_686_018_427_387,
+            ),
+            (
+                RoundingMode::Upward,
+                9_223_372_036_854_776,
+                4_611_686_018_427_388,
+            ),
+        ];
+
+        for (mode, max_mantissa, power_mantissa) in cases {
+            let _rounding = NumberRoundModeGuard::new(mode);
+            assert_eq!(
+                NumberParts::from_i64(i64::MAX),
+                NumberParts::unchecked(false, max_mantissa, 3)
+            );
+            assert_eq!(
+                NumberParts::from_i64(1_i64 << 62),
+                NumberParts::unchecked(false, power_mantissa, 3)
+            );
+        }
     }
 }

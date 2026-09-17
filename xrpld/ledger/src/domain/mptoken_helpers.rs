@@ -7,10 +7,10 @@ use crate::{adjust_owner_count, dir_insert, dir_remove};
 use basics::base_uint::Uint160;
 use protocol::{
     AccountID, Asset, Issue, LedgerEntryType, MPTID, MPTIssue, Rate, STAmount, STLedgerEntry, Ter,
-    TxType, account_keylet, get_field_by_symbol, line, lsfGlobalFreeze, lsfHighFreeze,
-    lsfLowFreeze, lsfMPTAuthorized, lsfMPTCanTrade, lsfMPTCanTransfer, lsfMPTLocked,
-    lsfMPTRequireAuth, mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, owner_dir_keylet,
-    unchecked_keylet,
+    TxType, account_keylet, get_field_by_symbol, line, lsfDefaultRipple, lsfGlobalFreeze,
+    lsfHighAuth, lsfHighFreeze, lsfHighNoRipple, lsfLowAuth, lsfLowFreeze, lsfLowNoRipple,
+    lsfMPTAuthorized, lsfMPTCanTrade, lsfMPTCanTransfer, lsfMPTLocked, lsfMPTRequireAuth,
+    mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, owner_dir_keylet, unchecked_keylet,
 };
 use std::sync::Arc;
 
@@ -30,12 +30,12 @@ pub const MAX_TRANSFER_FEE: u16 = 50_000;
 
 /// Parity rate (no fee).
 pub const PARITY_RATE: Rate = Rate::new(1_000_000_000);
-const MAX_ASSET_CHECK_DEPTH: u8 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MPTAuthType {
     Weak,
     Strong,
+    Legacy,
 }
 
 /// Check if an MPT issuance is globally frozen (locked).
@@ -148,14 +148,11 @@ fn is_vault_share_underlying_frozen(
 ) -> Result<bool, ViewError> {
     if !view
         .rules()
-        .enabled(&protocol::feature_id("SingleAssetVault"))
-        && !view
-            .rules()
-            .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+        .enabled(&protocol::feature_id("fixCleanup3_2_0"))
     {
         return Ok(false);
     }
-    if depth >= MAX_ASSET_CHECK_DEPTH {
+    if depth >= protocol::MAX_ASSET_CHECK_DEPTH {
         return Ok(true);
     }
 
@@ -235,6 +232,17 @@ fn asset_of_holding(share_issuance: &STLedgerEntry, holding: &STLedgerEntry) -> 
     }
 }
 
+/// Check whether an Asset may transfer between two accounts. IOUs enforce
+/// the issuer-side NoRipple rule; MPTs enforce CanTransfer recursively.
+pub fn can_transfer_asset(
+    view: &dyn ReadView,
+    asset: Asset,
+    from: &AccountID,
+    to: &AccountID,
+) -> Result<Ter, ViewError> {
+    can_transfer_asset_with_depth(view, asset, from, to, 0)
+}
+
 fn can_transfer_asset_with_depth(
     view: &dyn ReadView,
     asset: Asset,
@@ -244,7 +252,39 @@ fn can_transfer_asset_with_depth(
 ) -> Result<Ter, ViewError> {
     match asset {
         Asset::MPTIssue(issue) => can_transfer_mpt_with_depth(view, &issue, from, to, depth),
-        Asset::Issue(_) => Ok(Ter::TES_SUCCESS),
+        Asset::Issue(issue) => can_transfer_iou(view, issue, from, to),
+    }
+}
+
+fn can_transfer_iou(
+    view: &dyn ReadView,
+    issue: Issue,
+    from: &AccountID,
+    to: &AccountID,
+) -> Result<Ter, ViewError> {
+    if issue.native() || *from == issue.issuer() || *to == issue.issuer() {
+        return Ok(Ter::TES_SUCCESS);
+    }
+
+    let issuer = issue.issuer();
+    let Some(issuer_root) = view.read(account_keylet(to_uint160(issuer)))? else {
+        return Ok(Ter::TEF_INTERNAL);
+    };
+    let ripple_disabled = |account: &AccountID| -> Result<bool, ViewError> {
+        let Some(line) = view.read(line(*account, issuer, issue.currency))? else {
+            return Ok(!issuer_root.is_flag(lsfDefaultRipple));
+        };
+        Ok(line.is_flag(if issuer > *account {
+            lsfHighNoRipple
+        } else {
+            lsfLowNoRipple
+        }))
+    };
+
+    if ripple_disabled(from)? && ripple_disabled(to)? {
+        Ok(Ter::TER_NO_RIPPLE)
+    } else {
+        Ok(Ter::TES_SUCCESS)
     }
 }
 
@@ -273,7 +313,7 @@ fn can_transfer_mpt_with_depth(
         .enabled(&protocol::feature_id("fixCleanup3_2_0"))
         && sle_issuance.is_field_present(sf("sfReferenceHolding"))
     {
-        if depth >= MAX_ASSET_CHECK_DEPTH {
+        if depth >= protocol::MAX_ASSET_CHECK_DEPTH {
             return Ok(Ter::TEC_INTERNAL);
         }
         let Some(holding) = view.read(unchecked_keylet(
@@ -345,7 +385,7 @@ fn can_trade_with_depth(view: &dyn ReadView, asset: &Asset, depth: u8) -> Result
                 .enabled(&protocol::feature_id("fixCleanup3_2_0"))
                 && sle.is_field_present(sf("sfReferenceHolding"))
             {
-                if depth >= MAX_ASSET_CHECK_DEPTH {
+                if depth >= protocol::MAX_ASSET_CHECK_DEPTH {
                     return Ok(Ter::TEC_INTERNAL);
                 }
                 let Some(holding) = view.read(unchecked_keylet(
@@ -387,7 +427,7 @@ pub fn require_auth_mpt(
     mpt_issue: &MPTIssue,
     account: &AccountID,
 ) -> Result<Ter, ViewError> {
-    require_auth_mpt_with_type(view, mpt_issue, account, MPTAuthType::Weak)
+    require_auth_mpt_with_type(view, mpt_issue, account, MPTAuthType::Legacy)
 }
 
 pub fn require_auth_mpt_with_type(
@@ -396,38 +436,156 @@ pub fn require_auth_mpt_with_type(
     account: &AccountID,
     auth_type: MPTAuthType,
 ) -> Result<Ter, ViewError> {
-    let Some(sle_issuance) = view.read(mpt_issuance_keylet_from_mptid(mpt_issue.mpt_id()))? else {
-        return Ok(Ter::TEC_OBJECT_NOT_FOUND);
-    };
+    require_auth_mpt_with_depth(view, mpt_issue, account, auth_type, 0)
+}
 
-    let issuer = sle_issuance.get_account_id(sf("sfIssuer"));
-    if &issuer == account {
+fn require_auth_asset_with_depth(
+    view: &dyn ReadView,
+    asset: Asset,
+    account: &AccountID,
+    auth_type: MPTAuthType,
+    depth: u8,
+) -> Result<Ter, ViewError> {
+    match asset {
+        Asset::MPTIssue(issue) => {
+            require_auth_mpt_with_depth(view, &issue, account, auth_type, depth)
+        }
+        Asset::Issue(issue) => require_auth_iou(view, issue, account, auth_type),
+    }
+}
+
+fn require_auth_iou(
+    view: &dyn ReadView,
+    issue: Issue,
+    account: &AccountID,
+    auth_type: MPTAuthType,
+) -> Result<Ter, ViewError> {
+    if issue.native() || issue.issuer() == *account {
         return Ok(Ter::TES_SUCCESS);
     }
 
-    let account_key = account_keylet(to_uint160(*account));
-    if (view
-        .rules()
-        .enabled(&protocol::feature_id("SingleAssetVault"))
-        || view.rules().enabled(&protocol::feature_id("MPTokensV2")))
-        && let Some(account_root) = view.read(account_key)?
-        && crate::is_pseudo_account(&account_root)
+    let trust_line = view.read(line(*account, issue.issuer(), issue.currency))?;
+    if trust_line.is_none() && auth_type == MPTAuthType::Strong {
+        return Ok(Ter::TEC_NO_LINE);
+    }
+
+    if let Some(issuer) = view.read(account_keylet(to_uint160(issue.issuer())))?
+        && issuer.is_flag(protocol::lsfRequireAuth)
     {
-        return Ok(Ter::TES_SUCCESS);
-    }
-
-    let mptoken_key = mptoken_keylet_from_mptid(mpt_issue.mpt_id(), to_uint160(*account));
-    let sle_token = view.read(mptoken_key)?;
-
-    if auth_type == MPTAuthType::Strong && sle_token.is_none() {
+        let Some(trust_line) = trust_line else {
+            return Ok(Ter::TEC_NO_LINE);
+        };
+        if trust_line.is_flag(if *account > issue.issuer() {
+            lsfLowAuth
+        } else {
+            lsfHighAuth
+        }) {
+            return Ok(Ter::TES_SUCCESS);
+        }
+        if view.rules().enabled(&protocol::fix_cleanup_3_4_0())
+            && view
+                .read(account_keylet(to_uint160(*account)))?
+                .is_some_and(|account| crate::is_pseudo_account(&account))
+        {
+            return Ok(Ter::TES_SUCCESS);
+        }
         return Ok(Ter::TEC_NO_AUTH);
     }
 
-    if sle_issuance.is_flag(lsfMPTRequireAuth) {
-        match sle_token {
-            Some(ref token) if token.is_flag(lsfMPTAuthorized) => {}
-            _ => return Ok(Ter::TEC_NO_AUTH),
+    Ok(Ter::TES_SUCCESS)
+}
+
+fn require_auth_mpt_with_depth(
+    view: &dyn ReadView,
+    mpt_issue: &MPTIssue,
+    account: &AccountID,
+    auth_type: MPTAuthType,
+    depth: u8,
+) -> Result<Ter, ViewError> {
+    let fix_cleanup_3_3_0 = view.rules().enabled(&protocol::fix_cleanup_3_3_0());
+    let single_asset_vault = view
+        .rules()
+        .enabled(&protocol::feature_id("SingleAssetVault"));
+    let pseudo_exempt = || -> Result<bool, ViewError> {
+        if !single_asset_vault && !view.rules().enabled(&protocol::feature_id("MPTokensV2")) {
+            return Ok(false);
         }
+        Ok(view
+            .read(account_keylet(to_uint160(*account)))?
+            .is_some_and(|account| crate::is_pseudo_account(&account)))
+    };
+
+    let Some(sle_issuance) = view.read(mpt_issuance_keylet_from_mptid(mpt_issue.mpt_id()))? else {
+        return Ok(Ter::TEC_OBJECT_NOT_FOUND);
+    };
+    let issuer = sle_issuance.get_account_id(sf("sfIssuer"));
+    if issuer == *account {
+        return Ok(Ter::TES_SUCCESS);
+    }
+
+    // fixCleanup3_3_0 moved pseudo authorization ahead of the recursive
+    // vault-underlying and holder checks. Preserve the legacy late exemption.
+    if fix_cleanup_3_3_0 && pseudo_exempt()? {
+        return Ok(Ter::TES_SUCCESS);
+    }
+
+    // Legacy vault shares identify their underlying through the issuer's
+    // AccountRoot.sfVaultID and the Vault.sfAsset field. Newer
+    // sfReferenceHolding data does not replace this requireAuth path.
+    if single_asset_vault {
+        if depth >= protocol::MAX_ASSET_CHECK_DEPTH {
+            return Ok(Ter::TEC_INTERNAL);
+        }
+        let Some(issuer_root) = view.read(account_keylet(to_uint160(issuer)))? else {
+            return Ok(Ter::TEF_INTERNAL);
+        };
+        if issuer_root.is_field_present(sf("sfVaultID")) {
+            let Some(vault) = view.read(protocol::vault_keylet_from_key(
+                issuer_root.get_field_h256(sf("sfVaultID")),
+            ))?
+            else {
+                return Ok(Ter::TEF_INTERNAL);
+            };
+            let underlying = vault.get_field_issue(sf("sfAsset")).asset();
+            let result =
+                require_auth_asset_with_depth(view, underlying, account, auth_type, depth + 1)?;
+            if result != Ter::TES_SUCCESS {
+                return Ok(result);
+            }
+        }
+    }
+
+    let sle_token = view.read(mptoken_keylet_from_mptid(
+        mpt_issue.mpt_id(),
+        to_uint160(*account),
+    ))?;
+    if sle_token.is_none() && matches!(auth_type, MPTAuthType::Strong | MPTAuthType::Legacy) {
+        return Ok(Ter::TEC_NO_AUTH);
+    }
+
+    if sle_issuance.is_field_present(sf("sfDomainID")) {
+        let domain = sle_issuance.get_field_h256(sf("sfDomainID"));
+        let domain_result = super::credential_helpers::valid_domain(view, domain, account)?;
+        if domain_result == Ter::TES_SUCCESS {
+            return Ok(Ter::TES_SUCCESS);
+        }
+        if sle_token.is_none() {
+            return Ok(domain_result);
+        }
+        // An existing token may have explicit issuer authorization. Domain
+        // lookup errors therefore do not mask the classic flag check.
+    }
+
+    if !fix_cleanup_3_3_0 && pseudo_exempt()? {
+        return Ok(Ter::TES_SUCCESS);
+    }
+
+    if sle_issuance.is_flag(lsfMPTRequireAuth)
+        && !sle_token
+            .as_ref()
+            .is_some_and(|token| token.is_flag(lsfMPTAuthorized))
+    {
+        return Ok(Ter::TEC_NO_AUTH);
     }
 
     Ok(Ter::TES_SUCCESS)
@@ -444,9 +602,9 @@ pub fn max_mpt_amount(sle_issuance: &STLedgerEntry) -> i64 {
 
 /// Get the available (remaining mintable) MPT amount.
 pub fn available_mpt_amount(sle_issuance: &STLedgerEntry) -> i64 {
-    let max = max_mpt_amount(sle_issuance);
-    let outstanding = sle_issuance.get_field_u64(sf("sfOutstandingAmount")) as i64;
-    max - outstanding
+    let max = max_mpt_amount(sle_issuance) as u64;
+    let outstanding = sle_issuance.get_field_u64(sf("sfOutstandingAmount"));
+    max.wrapping_sub(outstanding) as i64
 }
 
 /// Lock MPT tokens for escrow.
@@ -491,7 +649,10 @@ pub fn lock_escrow_mpt(
     } else {
         0
     };
-    let Some(next_locked) = locked.checked_add(pay) else {
+    let Some(next_locked) = locked
+        .checked_add(pay)
+        .filter(|next| *next <= MAX_MPT_AMOUNT as u64)
+    else {
         return Ok(Ter::TEC_INTERNAL);
     };
     updated_token.set_field_u64(sf("sfLockedAmount"), next_locked);
@@ -504,7 +665,10 @@ pub fn lock_escrow_mpt(
     } else {
         0
     };
-    let Some(next_issuance_locked) = issuance_locked.checked_add(pay) else {
+    let Some(next_issuance_locked) = issuance_locked
+        .checked_add(pay)
+        .filter(|next| *next <= MAX_MPT_AMOUNT as u64)
+    else {
         return Ok(Ter::TEC_INTERNAL);
     };
     updated_issuance.set_field_u64(sf("sfLockedAmount"), next_issuance_locked);
@@ -595,7 +759,10 @@ pub fn unlock_escrow_mpt(
     };
 
     let mut updated_issuance = (*sle_issuance).clone();
-    let Some(new_locked) = issuance_locked.checked_sub(gross) else {
+    let Some(new_locked) = issuance_locked
+        .checked_sub(gross)
+        .filter(|_| issuance_locked <= MAX_MPT_AMOUNT as u64)
+    else {
         return Ok(Ter::TEC_INTERNAL);
     };
     if new_locked == 0 {
@@ -605,7 +772,10 @@ pub fn unlock_escrow_mpt(
     }
     if receiver == &issuer {
         let outstanding = updated_issuance.get_field_u64(sf("sfOutstandingAmount"));
-        let Some(next_outstanding) = outstanding.checked_sub(net) else {
+        let Some(next_outstanding) = outstanding
+            .checked_sub(net)
+            .filter(|_| outstanding <= MAX_MPT_AMOUNT as u64)
+        else {
             return Ok(Ter::TEC_INTERNAL);
         };
         updated_issuance.set_field_u64(sf("sfOutstandingAmount"), next_outstanding);
@@ -619,7 +789,10 @@ pub fn unlock_escrow_mpt(
             return Ok(Ter::TEC_OBJECT_NOT_FOUND);
         };
         let current = sle_token.get_field_u64(sf("sfMPTAmount"));
-        let Some(next) = current.checked_add(net) else {
+        let Some(next) = current
+            .checked_add(net)
+            .filter(|next| *next <= MAX_MPT_AMOUNT as u64)
+        else {
             return Ok(Ter::TEC_INTERNAL);
         };
         let mut updated = (*sle_token).clone();
@@ -642,7 +815,10 @@ pub fn unlock_escrow_mpt(
         return Ok(Ter::TEC_INTERNAL);
     };
     let mut updated_sender = (*sle_sender).clone();
-    let Some(new_sender_locked) = sender_locked.checked_sub(gross) else {
+    let Some(new_sender_locked) = sender_locked
+        .checked_sub(gross)
+        .filter(|_| sender_locked <= MAX_MPT_AMOUNT as u64)
+    else {
         return Ok(Ter::TEC_INTERNAL);
     };
     if new_sender_locked == 0 {
@@ -658,7 +834,10 @@ pub fn unlock_escrow_mpt(
             return Ok(Ter::TEC_OBJECT_NOT_FOUND);
         };
         let outstanding = sle_issuance.get_field_u64(sf("sfOutstandingAmount"));
-        let Some(next_outstanding) = outstanding.checked_sub(fee) else {
+        let Some(next_outstanding) = outstanding
+            .checked_sub(fee)
+            .filter(|_| outstanding <= MAX_MPT_AMOUNT as u64)
+        else {
             return Ok(Ter::TEC_INTERNAL);
         };
         let mut updated_issuance = (*sle_issuance).clone();
@@ -726,7 +905,7 @@ fn check_mpt_tx_allowed_with_depth(
             .enabled(&protocol::feature_id("fixCleanup3_2_0"))
             && sle.is_field_present(sf("sfReferenceHolding"))
         {
-            if depth >= MAX_ASSET_CHECK_DEPTH {
+            if depth >= protocol::MAX_ASSET_CHECK_DEPTH {
                 return Ok(Ter::TEC_INTERNAL);
             }
             let Some(holding) = view.read(unchecked_keylet(
@@ -884,11 +1063,24 @@ pub fn create_mp_token(
     Ok(Ter::TES_SUCCESS)
 }
 
-/// Check if MPT overflow would occur.
-///
-pub fn is_mpt_overflow(send_amount: i64, outstanding_amount: u64, maximum_amount: i64) -> bool {
-    send_amount > maximum_amount
-        || outstanding_amount > (maximum_amount as u64).saturating_sub(send_amount as u64)
+/// Check if an MPT send would overflow. BookStep may temporarily exceed the
+/// issuance maximum under MPTokensV2, but never the u64 storage limit and
+/// never with a single send larger than MaximumAmount.
+pub fn is_mpt_overflow(
+    send_amount: i64,
+    outstanding_amount: u64,
+    maximum_amount: i64,
+    allow_temporary_overflow: bool,
+) -> bool {
+    if send_amount < 0 || maximum_amount < 0 || send_amount > maximum_amount {
+        return true;
+    }
+    let limit = if allow_temporary_overflow {
+        u64::MAX
+    } else {
+        maximum_amount as u64
+    };
+    outstanding_amount > limit - send_amount as u64
 }
 
 /// Check whether an issuer MPT send exceeds its maximum amount. With

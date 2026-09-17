@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::ApplyView;
 use protocol::{
-    AccountID, Asset, Currency, Issue, MPTIssue, STAmount, STLedgerEntry, STObject, Ter, XRPAmount,
-    get_field_by_symbol as sf,
+    AccountID, Asset, Currency, Issue, MPTAmount, MPTIssue, STAmount, STLedgerEntry, STObject, Ter,
+    XRPAmount, get_field_by_symbol as sf,
 };
 
 // Trust line flags (lsf* constants)
@@ -613,6 +613,29 @@ pub fn account_send<V: ApplyView>(
     to: &AccountID,
     amount: &STAmount,
 ) -> Ter {
+    account_send_with_options(view, from, to, amount, false)
+}
+
+/// BookStep's TOffer/AMMOffer send policy. Under MPTokensV2 an issuer leg may
+/// temporarily raise OutstandingAmount above MaximumAmount while the matching
+/// redemption later in the same sandbox brings it back down. The u64 storage
+/// bound and a single send larger than MaximumAmount remain invalid.
+pub fn account_send_allow_mpt_overflow<V: ApplyView>(
+    view: &mut V,
+    from: &AccountID,
+    to: &AccountID,
+    amount: &STAmount,
+) -> Ter {
+    account_send_with_options(view, from, to, amount, true)
+}
+
+fn account_send_with_options<V: ApplyView>(
+    view: &mut V,
+    from: &AccountID,
+    to: &AccountID,
+    amount: &STAmount,
+    allow_mpt_overflow: bool,
+) -> Ter {
     if amount.signum() <= 0 || *from == *to {
         return Ter::TES_SUCCESS;
     }
@@ -635,7 +658,7 @@ pub fn account_send<V: ApplyView>(
     }
 
     if let Asset::MPTIssue(issue) = amount.asset() {
-        return account_send_mpt(view, from, to, amount, &issue, false);
+        return account_send_mpt(view, from, to, amount, &issue, false, allow_mpt_overflow);
     }
 
     let issue = amount.issue();
@@ -691,7 +714,7 @@ pub fn account_send_waive_transfer_fee<V: ApplyView>(
         return transfer_xrp(view, from, to, amount.xrp());
     }
     match amount.asset() {
-        Asset::MPTIssue(issue) => account_send_mpt(view, from, to, amount, &issue, true),
+        Asset::MPTIssue(issue) => account_send_mpt(view, from, to, amount, &issue, true, false),
         Asset::Issue(issue) => {
             if *from == issue.account || *to == issue.account || issue.account.is_zero() {
                 return direct_send_no_fee_iou(view, from, to, amount, false);
@@ -743,6 +766,20 @@ fn update_mpt_amount<V: ApplyView>(
         .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
 }
 
+fn mpt_token_balance<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    issue: &MPTIssue,
+) -> Result<u64, Ter> {
+    view.peek(protocol::mptoken_keylet_from_mptid(
+        issue.mpt_id(),
+        basics::base_uint::Uint160::from_void(account.data()),
+    ))
+    .map_err(|_| Ter::TEF_BAD_LEDGER)?
+    .map(|token| token.get_field_u64(sf("sfMPTAmount")))
+    .ok_or(Ter::TEC_NO_AUTH)
+}
+
 fn account_send_mpt<V: ApplyView>(
     view: &mut V,
     from: &AccountID,
@@ -750,6 +787,7 @@ fn account_send_mpt<V: ApplyView>(
     amount: &STAmount,
     issue: &MPTIssue,
     waive_transfer_fee: bool,
+    allow_mpt_overflow: bool,
 ) -> Ter {
     let value = amount.mpt().value();
     if value <= 0 || from == to {
@@ -762,7 +800,10 @@ fn account_send_mpt<V: ApplyView>(
             Ok(rate) => rate,
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
-        protocol::multiply_round(amount, rate, true).mpt().value()
+        // TokenHelpers::directSendNoLimitMPT uses ordinary multiply(), not
+        // mulRound(). Legacy direct Payment quote and the actual debit must
+        // therefore materialize under the same ambient nearest mode.
+        protocol::multiply_rate(amount, rate).mpt().value()
     } else {
         value
     };
@@ -775,16 +816,82 @@ fn account_send_mpt<V: ApplyView>(
         Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
         Err(_) => return Ter::TEF_BAD_LEDGER,
     };
-    let amount = value as u64;
+    let value_u64 = value as u64;
     let debit_amount = debit_value as u64;
     let outstanding = issuance.get_field_u64(sf("sfOutstandingAmount"));
+    let maximum = crate::mptoken_helpers::max_mpt_amount(&issuance);
+    let available = crate::mptoken_helpers::available_mpt_amount(&issuance);
 
-    if from == &issuer {
-        let maximum = crate::mptoken_helpers::max_mpt_amount(&issuance);
-        if crate::mptoken_helpers::is_mpt_overflow(value, outstanding, maximum) {
+    // A holder-to-holder transfer is implemented as two issuer legs in
+    // rippled: issuer credits the receiver first, then the sender redeems the
+    // gross amount. Keep the intermediate issuance writes and holder order;
+    // hooks and metadata can observe this sequence.
+    if from != &issuer && to != &issuer {
+        if view.rules().enabled(&protocol::feature_id("MPTokensV2"))
+            && crate::mptoken_helpers::is_mpt_overflow(value, outstanding, maximum, true)
+        {
             return Ter::TEC_PATH_DRY;
         }
-        let Some(next_outstanding) = outstanding.checked_add(amount) else {
+        let Some(credited_outstanding) = outstanding.checked_add(value_u64) else {
+            return Ter::TEC_INTERNAL;
+        };
+        let mut credited_issuance = (*issuance).clone();
+        credited_issuance.set_field_u64(sf("sfOutstandingAmount"), credited_outstanding);
+        if view.update(Arc::new(credited_issuance)).is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
+
+        let receiver_pre_balance = match mpt_token_balance(view, to, issue) {
+            Ok(balance) => balance,
+            Err(ter) => return ter,
+        };
+        view.credit_hook_mpt(issuer, *to, amount.clone(), receiver_pre_balance, available);
+        let result = update_mpt_amount(view, to, issue, value);
+        if result != Ter::TES_SUCCESS {
+            return result;
+        }
+        let sender_pre_balance = match mpt_token_balance(view, from, issue) {
+            Ok(balance) => balance,
+            Err(ter) => return ter,
+        };
+        let gross_amount =
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(debit_value), *issue);
+        view.credit_hook_mpt(
+            *from,
+            issuer,
+            gross_amount,
+            sender_pre_balance,
+            (maximum as u64).wrapping_sub(credited_outstanding) as i64,
+        );
+        let result = update_mpt_amount(view, from, issue, -debit_value);
+        if result != Ter::TES_SUCCESS {
+            return result;
+        }
+
+        let issuance = match view.peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id())) {
+            Ok(Some(issuance)) => issuance,
+            Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        let current = issuance.get_field_u64(sf("sfOutstandingAmount"));
+        let Some(next) = current.checked_sub(debit_amount) else {
+            return Ter::TEC_INTERNAL;
+        };
+        let mut updated = (*issuance).clone();
+        updated.set_field_u64(sf("sfOutstandingAmount"), next);
+        return view
+            .update(Arc::new(updated))
+            .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS);
+    }
+
+    if from == &issuer {
+        let temporary_overflow =
+            allow_mpt_overflow && view.rules().enabled(&protocol::feature_id("MPTokensV2"));
+        if crate::mptoken_helpers::is_mpt_overflow(value, outstanding, maximum, temporary_overflow)
+        {
+            return Ter::TEC_PATH_DRY;
+        }
+        let Some(next_outstanding) = outstanding.checked_add(value_u64) else {
             return Ter::TEC_INTERNAL;
         };
         let mut updated = (*issuance).clone();
@@ -793,6 +900,13 @@ fn account_send_mpt<V: ApplyView>(
             return Ter::TEF_BAD_LEDGER;
         }
     } else {
+        let sender_pre_balance = match mpt_token_balance(view, from, issue) {
+            Ok(balance) => balance,
+            Err(ter) => return ter,
+        };
+        let gross_amount =
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(debit_value), *issue);
+        view.credit_hook_mpt(*from, issuer, gross_amount, sender_pre_balance, available);
         let result = update_mpt_amount(view, from, issue, -debit_value);
         if result != Ter::TES_SUCCESS {
             return result;
@@ -806,7 +920,7 @@ fn account_send_mpt<V: ApplyView>(
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         let outstanding = issuance.get_field_u64(sf("sfOutstandingAmount"));
-        let Some(next_outstanding) = outstanding.checked_sub(amount) else {
+        let Some(next_outstanding) = outstanding.checked_sub(value_u64) else {
             return Ter::TEC_INTERNAL;
         };
         let mut updated = (*issuance).clone();
@@ -814,27 +928,18 @@ fn account_send_mpt<V: ApplyView>(
         view.update(Arc::new(updated))
             .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
     } else {
+        let receiver_pre_balance = match mpt_token_balance(view, to, issue) {
+            Ok(balance) => balance,
+            Err(ter) => return ter,
+        };
+        if from == &issuer {
+            view.credit_hook_mpt(issuer, *to, amount.clone(), receiver_pre_balance, available);
+        }
         let result = update_mpt_amount(view, to, issue, value);
         if result != Ter::TES_SUCCESS {
             return result;
         }
-        let fee = debit_amount - amount;
-        if fee == 0 {
-            return Ter::TES_SUCCESS;
-        }
-        let issuance = match view.peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id())) {
-            Ok(Some(issuance)) => issuance,
-            Ok(None) => return Ter::TEC_OBJECT_NOT_FOUND,
-            Err(_) => return Ter::TEF_BAD_LEDGER,
-        };
-        let outstanding = issuance.get_field_u64(sf("sfOutstandingAmount"));
-        let Some(next_outstanding) = outstanding.checked_sub(fee) else {
-            return Ter::TEC_INTERNAL;
-        };
-        let mut updated = (*issuance).clone();
-        updated.set_field_u64(sf("sfOutstandingAmount"), next_outstanding);
-        view.update(Arc::new(updated))
-            .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
+        Ter::TES_SUCCESS
     }
 }
 
@@ -1075,9 +1180,11 @@ pub fn try_is_frozen<V: ApplyView>(
     // Only the issuer's side can freeze this holder's funds. A holder setting
     // its own freeze flag affects the counterparty, not itself.
     let issuer_freeze = if issue.account > *account {
-        LSF_HIGH_FREEZE
+        // Issuer is high, so the issuer-owned side is the high side.
+        protocol::lsfHighFreeze
     } else {
-        LSF_LOW_FREEZE
+        // Issuer is low, so the issuer-owned side is the low side.
+        protocol::lsfLowFreeze
     };
     Ok((flags & issuer_freeze) != 0)
 }
@@ -1170,7 +1277,7 @@ pub fn account_send_with_fee<V: ApplyView>(
     }
 
     if let Asset::MPTIssue(issue) = amount.asset() {
-        return account_send_mpt(view, from, to, amount, &issue, false);
+        return account_send_mpt(view, from, to, amount, &issue, false, false);
     }
 
     let issue = amount.issue();
@@ -1230,11 +1337,13 @@ mod tests {
 
     use basics::base_uint::Uint256;
     use protocol::{
-        AccountID, ApplyFlags, Currency, Issue, Keylet, MPTAmount, MPTIssue, Rules, STAmount,
-        make_mpt_id, sf_generic,
+        AccountID, ApplyFlags, Currency, Issue, Keylet, LedgerEntryType, MPTAmount, MPTIssue,
+        Rules, STAmount, STLedgerEntry, make_mpt_id, sf_generic,
     };
 
-    use crate::{ApplyViewImpl, Fees, Ledger, LedgerHeader, ReadView, ReadViewTx, ViewError};
+    use crate::{
+        ApplyViewImpl, Fees, Ledger, LedgerHeader, RawView, ReadView, ReadViewTx, ViewError,
+    };
 
     use super::{try_account_holds, try_credit_balance, try_is_frozen, try_transfer_rate};
 
@@ -1293,6 +1402,40 @@ mod tests {
 
         fn txs(&self) -> Result<Vec<ReadViewTx>, ViewError> {
             ReadView::txs(&self.base)
+        }
+    }
+
+    #[test]
+    fn active_freeze_lookup_uses_issuer_side_in_both_account_orderings() {
+        let currency = protocol::currency_from_string("USD");
+        let low = AccountID::from_array([0x11; 20]);
+        let high = AccountID::from_array([0x22; 20]);
+
+        for (holder, issuer, issuer_flag, holder_flag) in [
+            (low, high, protocol::lsfHighFreeze, protocol::lsfLowFreeze),
+            (high, low, protocol::lsfLowFreeze, protocol::lsfHighFreeze),
+        ] {
+            let issue = Issue::new(currency, issuer);
+            let key = protocol::line(holder, issuer, currency);
+            let make_view = |flags| {
+                let mut ledger = Ledger::new(LedgerHeader::default(), false);
+                let mut line =
+                    STLedgerEntry::from_type_and_key(LedgerEntryType::RippleState, key.key);
+                line.set_field_u32(protocol::get_field_by_symbol("sfFlags"), flags);
+                ledger.raw_insert(Arc::new(line)).expect("seed trust line");
+                ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE)
+            };
+
+            let mut issuer_frozen = make_view(issuer_flag);
+            assert!(
+                try_is_frozen(&mut issuer_frozen, &holder, &issue).expect("issuer freeze lookup")
+            );
+
+            let mut holder_frozen = make_view(holder_flag);
+            assert!(
+                !try_is_frozen(&mut holder_frozen, &holder, &issue).expect("holder freeze lookup"),
+                "the holder's own freeze flag must not freeze that holder"
+            );
         }
     }
 

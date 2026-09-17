@@ -666,12 +666,15 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         if mpt_transfer_invariant_enabled {
             if let Some(b) = before_sle {
                 record_mpt_accounting(&mut mpt_accounting, b, true);
-                record_mpt_transfer(&mut mpt_transfers, b, true);
+                record_mpt_transfer(&mut mpt_transfers, b, true, is_delete);
             }
-            if let Some(a) = after_sle {
+            if let Some(a) = visited_after_sle {
                 record_mpt_accounting(&mut mpt_accounting, a, false);
-                record_mpt_transfer(&mut mpt_transfers, a, false);
-                if fix_cleanup_3_2_0 && protocol::has_invalid_amount(&a.clone_as_object()) {
+                record_mpt_transfer(&mut mpt_transfers, a, false, is_delete);
+                if !is_delete
+                    && fix_cleanup_3_2_0
+                    && protocol::has_invalid_amount(&a.clone_as_object())
+                {
                     return Err(());
                 }
             }
@@ -680,27 +683,25 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         if permissioned_dex_invariant_enabled {
             record_permissioned_dex(&mut permissioned_dex, is_delete, before_sle, after_sle);
         }
-        record_clawback_state(&mut clawback, before_sle);
+        record_clawback_state(&mut clawback, is_delete, before_sle, visited_after_sle);
 
         if fix_cleanup_3_3_0 {
             record_object_deletion_state(&mut object_deletion, is_delete, before_sle);
         }
 
-        if fix_cleanup_3_2_0 || mptokens_v2_enabled || fix_cleanup_3_4_0 {
-            let deleted_sle = before_sle.unwrap_or(&entry.sle);
-            if record_mpt_issuance_lifecycle(
-                sandbox,
-                txn_type,
-                &mut mpt_issuance_lifecycle,
-                is_delete,
-                before_sle,
-                after_sle,
-                deleted_sle,
-            )
-            .is_err()
-            {
-                return Ok(Ter::TEF_BAD_LEDGER);
-            }
+        let deleted_sle = before_sle.unwrap_or(&entry.sle);
+        if record_mpt_issuance_lifecycle(
+            sandbox,
+            txn_type,
+            &mut mpt_issuance_lifecycle,
+            is_delete,
+            before_sle,
+            after_sle,
+            deleted_sle,
+        )
+        .is_err()
+        {
+            return Ok(Ter::TEF_BAD_LEDGER);
         }
 
         if fix_cleanup_3_2_0 {
@@ -1140,22 +1141,19 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         return Err(());
     }
 
-    if fix_cleanup_3_2_0 || mptokens_v2_enabled || fix_cleanup_3_4_0 {
-        if !validates_mpt_issuance_lifecycle(&mpt_issuance_lifecycle) {
-            return Err(());
-        }
-        if !validates_mpt_lifecycle_counts(
-            txn_type,
-            result,
-            tx_has_holder,
-            single_asset_vault_enabled,
-            lending_protocol_enabled,
-            mptokens_v2_enabled,
-            fix_cleanup_3_4_0,
-            &mpt_issuance_lifecycle,
-        ) {
-            return Err(());
-        }
+    if !validates_mpt_issuance_lifecycle(&mpt_issuance_lifecycle) {
+        return Err(());
+    }
+    if !validates_mpt_lifecycle_counts(
+        txn_type,
+        result,
+        tx_has_holder,
+        single_asset_vault_enabled,
+        lending_protocol_enabled,
+        mptokens_v2_enabled,
+        &mpt_issuance_lifecycle,
+    ) {
+        return Err(());
     }
 
     if fix_cleanup_3_2_0 {
@@ -1288,8 +1286,8 @@ mod tests {
     };
     use super::vault::{
         VaultAssetDelta, VaultSnapshot, VaultState, add_vault_asset_delta, agrees_within_one_unit,
-        compute_vault_min_scale, less_or_equal_plus_one_unit, rounded_vault_delta,
-        valid_vault_loss_unrealized, vault_transaction_account_asset_delta,
+        compute_vault_min_scale, less_or_equal_plus_one_unit, record_vault_asset_delta,
+        rounded_vault_delta, valid_vault_loss_unrealized, vault_transaction_account_asset_delta,
     };
     use super::{
         check_invariants_for_tx_with_expected_xrp_delta, mpt_transfer_validation_result,
@@ -1339,6 +1337,34 @@ mod tests {
             assets_available: RuntimeNumber::from_i64(1),
             loss_unrealized: RuntimeNumber::zero(),
         }
+    }
+
+    #[test]
+    fn vault_invariant_records_max_mpt_balance_without_panicking() {
+        let holder = account(0xA3);
+        let issuer = account(0xA4);
+        let mpt_id = protocol::make_mpt_id(1, issuer);
+        let asset = Asset::MPTIssue(protocol::MPTIssue::new(mpt_id));
+        let mut token = STLedgerEntry::from_type_and_key(
+            protocol::LedgerEntryType::MPToken,
+            Uint256::from_u64(0x4D50_54),
+        );
+        token.set_account_id(get_field_by_symbol("sfAccount"), holder);
+        token.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), mpt_id);
+        token.set_field_u64(get_field_by_symbol("sfMPTAmount"), i64::MAX as u64);
+
+        let mut state = VaultState::default();
+        record_vault_asset_delta(&mut state, &token, false);
+        let delta = vault_transaction_account_asset_delta(
+            &state,
+            holder,
+            asset,
+            false,
+            protocol::XRPAmount::from_drops(0),
+        )
+        .expect("the maximum MPT balance produces a nonzero invariant delta");
+
+        assert_eq!(delta.delta, RuntimeNumber::from_i64(i64::MAX));
     }
 
     #[test]

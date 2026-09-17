@@ -1884,6 +1884,26 @@ impl AppConsensus {
                 // mutable LCL here could attach this consensus result to a
                 // later validation/acquisition switch.
                 let closed = root.store_consensus_ledger(Arc::clone(&outcome.closed));
+                let closed_hash = *closed.header().hash.as_uint256();
+                if !self.adaptor.is_validator()
+                    && !self.adaptor.options.standalone
+                    && let Some((alternate_hash, validation_count)) =
+                        root.observer_quorum_alternate_same_seq(closed_hash, closed.header().seq)
+                {
+                    tracing::warn!(
+                        target: "lcl_audit",
+                        local_hash = %closed_hash,
+                        alternate_hash = %alternate_hash,
+                        closed_seq = closed.header().seq,
+                        validation_count,
+                        "LCL_AUDIT observer local child vetoed for quorum-backed canonical sibling"
+                    );
+                    // Leave generic consensus Accepted. The NetworkOps strand
+                    // owns endConsensus reconciliation and will switch to, or
+                    // finish acquiring, the exact validated sibling.
+                    root.notify_consensus_event();
+                    return;
+                }
                 tracing::info!(
                     target: "lcl_audit",
                     work_parent_hash = %work.parent_ledger.header().hash,

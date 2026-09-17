@@ -29,6 +29,7 @@ pub fn build_escrow_create_facts<V: ApplyView>(
 ) -> Result<EscrowCreateApplyFacts, ViewError> {
     let mut facts = EscrowCreateApplyFacts {
         amount_is_xrp: amount.native(),
+        token_escrow_enabled: view.rules().enabled(&protocol::feature_token_escrow()),
         finish_after_expired: finish_after
             .is_some_and(|time| view.header().parent_close_time > time),
         cancel_after_expired: cancel_after

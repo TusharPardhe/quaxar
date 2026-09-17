@@ -25,6 +25,7 @@ pub struct RippleCalcInput {
     pub default_paths_allowed: bool,
     pub limit_quality: bool,
     pub is_ledger_open: bool,
+    pub send_max_present: bool,
     pub domain_id: Option<Uint256>,
 }
 
@@ -176,6 +177,10 @@ fn preserves_partial_flow_result(ter: Ter, actual_amount_out: &STAmount) -> bool
     ter == Ter::TEC_PATH_PARTIAL && actual_amount_out.signum() > 0
 }
 
+fn flow_send_max_asset(max_source_amount: &STAmount, input: &RippleCalcInput) -> Option<Asset> {
+    input.send_max_present.then(|| max_source_amount.asset())
+}
+
 pub fn ripple_calculate<V: ApplyView>(
     view: &mut V,
     max_source_amount: &STAmount,
@@ -241,23 +246,14 @@ fn ripple_calculate_inner<V: ApplyView>(
     paths: &STPathSet,
     input: &RippleCalcInput,
 ) -> Result<RippleCalcOutput, ViewError> {
-    if frozen_iou_endpoint(view, dst_amount, src_account, dst_account)?
-        || frozen_iou_endpoint(view, max_source_amount, src_account, dst_account)?
-    {
-        return Ok(RippleCalcOutput {
-            result: Ter::TEC_PATH_DRY,
-            actual_amount_in: max_source_amount.zeroed(),
-            actual_amount_out: dst_amount.zeroed(),
-        });
-    }
+    // Endpoint freeze, authorization, and NoRipple semantics belong to the
+    // concrete DirectSteps. A blanket precheck here incorrectly rejects an
+    // issuer-to-frozen-holder issuance leg in an otherwise valid direct path.
+    // rippled enters RippleCalc first and lets each step decide by direction.
 
     // This replaces the simplified try_default_path approach.
     let deliver_asset = dst_amount.asset();
-    let send_max_asset = if max_source_amount.asset() != dst_amount.asset() {
-        Some(max_source_amount.asset())
-    } else {
-        None
-    };
+    let send_max_asset = flow_send_max_asset(max_source_amount, input);
 
     let (strand_ter, strands) =
         crate::domain::flow_engine::strand_builder::to_strands_checked_with_domain(
@@ -332,26 +328,6 @@ fn ripple_calculate_inner<V: ApplyView>(
         actual_amount_in: max_source_amount.zeroed(),
         actual_amount_out: dst_amount.zeroed(),
     })
-}
-
-fn frozen_iou_endpoint<V: ApplyView>(
-    view: &mut V,
-    amount: &STAmount,
-    src_account: &AccountID,
-    dst_account: &AccountID,
-) -> Result<bool, ViewError> {
-    let Asset::Issue(issue) = amount.asset() else {
-        return Ok(false);
-    };
-
-    if amount.native() || *src_account == issue.account || *dst_account == issue.account {
-        return Ok(false);
-    }
-
-    Ok(
-        crate::domain::ripple_state_helpers::try_is_frozen(view, src_account, &issue)?
-            || crate::domain::ripple_state_helpers::try_is_frozen(view, dst_account, &issue)?,
-    )
 }
 
 #[allow(dead_code)]
@@ -870,9 +846,40 @@ fn try_explicit_path<V: ApplyView>(
 }
 #[cfg(test)]
 mod tests {
-    use protocol::{STAmount, Ter, XRPAmount};
+    use protocol::{AccountID, Asset, IOUAmount, Issue, STAmount, Ter, XRPAmount};
 
-    use super::preserves_partial_flow_result;
+    use super::{RippleCalcInput, flow_send_max_asset, preserves_partial_flow_result};
+
+    #[test]
+    fn explicit_same_asset_send_max_remains_present_for_strand_building() {
+        let issuer = AccountID::from_array([0x44; 20]);
+        let asset = Asset::Issue(Issue::new(protocol::currency_from_string("USD"), issuer));
+        let amount = STAmount::from_iou_amount(
+            protocol::get_field_by_symbol("sfAmount"),
+            IOUAmount::from_parts(10, 0).expect("valid IOU"),
+            *asset.get::<Issue>(),
+        );
+        let input = RippleCalcInput {
+            partial_payment_allowed: false,
+            default_paths_allowed: true,
+            limit_quality: false,
+            is_ledger_open: false,
+            send_max_present: true,
+            domain_id: None,
+        };
+
+        assert_eq!(flow_send_max_asset(&amount, &input), Some(asset));
+        assert_eq!(
+            flow_send_max_asset(
+                &amount,
+                &RippleCalcInput {
+                    send_max_present: false,
+                    ..input
+                }
+            ),
+            None
+        );
+    }
 
     #[test]
     fn preserves_nonzero_partial_flow_result_without_committing_its_sandbox() {

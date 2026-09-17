@@ -197,6 +197,7 @@ fn escrow_create_do_apply_preserves_for_xrp_and_token_paths() {
             owner_exists: true,
             reserve_sufficient: true,
             amount_is_xrp: true,
+            token_escrow_enabled: false,
             xrp_balance_covers_amount: true,
             destination_exists: true,
             destination_requires_tag: false,
@@ -233,6 +234,7 @@ fn escrow_create_do_apply_preserves_for_xrp_and_token_paths() {
             owner_exists: true,
             reserve_sufficient: true,
             amount_is_xrp: false,
+            token_escrow_enabled: true,
             xrp_balance_covers_amount: false,
             destination_exists: true,
             destination_requires_tag: false,
@@ -274,6 +276,7 @@ fn escrow_create_do_apply_maps_cpp_failures() {
             owner_exists: true,
             reserve_sufficient: true,
             amount_is_xrp: true,
+            token_escrow_enabled: false,
             xrp_balance_covers_amount: true,
             destination_exists: true,
             destination_requires_tag: false,
@@ -287,6 +290,26 @@ fn escrow_create_do_apply_maps_cpp_failures() {
     );
     assert_eq!(dir_full, Ter::TEC_DIR_FULL);
     assert_eq!(trans_token(dir_full), "tecDIR_FULL");
+}
+
+#[test]
+fn escrow_create_do_apply_defensively_rejects_non_xrp_without_token_escrow() {
+    let mut sink = TestSink::new();
+    let result = run_escrow_create_do_apply(
+        EscrowCreateApplyFacts {
+            owner_exists: true,
+            reserve_sufficient: true,
+            amount_is_xrp: false,
+            token_escrow_enabled: false,
+            destination_exists: true,
+            destination_is_sender: true,
+            ..EscrowCreateApplyFacts::default()
+        },
+        &mut sink,
+    );
+
+    assert_eq!(result, Ter::TEM_DISABLED);
+    assert!(!sink.events.iter().any(|event| event == "lock_non_xrp"));
 }
 
 #[test]

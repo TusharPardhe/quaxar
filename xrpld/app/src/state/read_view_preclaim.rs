@@ -945,8 +945,13 @@ fn preclaim_check_cash<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             let Some(_) = read_account(view, issue.issuer())? else {
                 return Ok(Ter::TEC_NO_ISSUER);
             };
-            let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, &destination)
-                .map_err(|_| view_error())?;
+            let auth = ledger::mptoken_helpers::require_auth_mpt_with_type(
+                view,
+                &issue,
+                &destination,
+                ledger::mptoken_helpers::MPTAuthType::Weak,
+            )
+            .map_err(|_| view_error())?;
             if auth != Ter::TES_SUCCESS {
                 return Ok(auth);
             }
@@ -1072,13 +1077,23 @@ fn preclaim_escrow_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
             else {
                 return Ok(Ter::TEC_OBJECT_NOT_FOUND);
             };
-            let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, &account)
-                .map_err(|_| view_error())?;
+            let auth = ledger::mptoken_helpers::require_auth_mpt_with_type(
+                view,
+                &issue,
+                &account,
+                ledger::mptoken_helpers::MPTAuthType::Weak,
+            )
+            .map_err(|_| view_error())?;
             if auth != Ter::TES_SUCCESS {
                 return Ok(auth);
             }
-            let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, &destination)
-                .map_err(|_| view_error())?;
+            let auth = ledger::mptoken_helpers::require_auth_mpt_with_type(
+                view,
+                &issue,
+                &destination,
+                ledger::mptoken_helpers::MPTAuthType::Weak,
+            )
+            .map_err(|_| view_error())?;
             if auth != Ter::TES_SUCCESS {
                 return Ok(auth);
             }
@@ -1156,8 +1171,13 @@ fn preclaim_escrow_finish<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
             {
                 return Ok(Ter::TEC_OBJECT_NOT_FOUND);
             }
-            let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, &destination)
-                .map_err(|_| view_error())?;
+            let auth = ledger::mptoken_helpers::require_auth_mpt_with_type(
+                view,
+                &issue,
+                &destination,
+                ledger::mptoken_helpers::MPTAuthType::Weak,
+            )
+            .map_err(|_| view_error())?;
             if auth != Ter::TES_SUCCESS {
                 return Ok(auth);
             }
@@ -1206,8 +1226,13 @@ fn preclaim_escrow_cancel<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
             {
                 return Ok(Ter::TEC_OBJECT_NOT_FOUND);
             }
-            ledger::mptoken_helpers::require_auth_mpt(view, &issue, &owner)
-                .map_err(|_| view_error())
+            ledger::mptoken_helpers::require_auth_mpt_with_type(
+                view,
+                &issue,
+                &owner,
+                ledger::mptoken_helpers::MPTAuthType::Weak,
+            )
+            .map_err(|_| view_error())
         }
     }
 }
@@ -1670,6 +1695,100 @@ mod tests {
                 ApplyFlags::NONE,
             ),
             Some(Ter::TEC_NO_DST)
+        );
+    }
+
+    #[test]
+    fn mpt_escrow_preclaims_use_weak_auth_for_holdings_they_may_create() {
+        let source = account(0x40);
+        let destination = account(0x41);
+        let issuer = account(0x42);
+        let sequence = 7;
+        let mpt_id = protocol::make_mpt_id(sequence, issuer);
+        let issue = MPTIssue::new(mpt_id);
+        let amount = STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(10), issue);
+        let mut view = MockView {
+            rules: Rules::new([protocol::feature_token_escrow()]),
+            ..MockView::default()
+        };
+        for account in [source, destination, issuer] {
+            let (key, root) = account_root(account, 0);
+            view.entries.insert(key, root);
+        }
+
+        let issuance_keylet = protocol::mpt_issuance_keylet_from_mptid(mpt_id);
+        let mut issuance = STLedgerEntry::new(issuance_keylet);
+        issuance.set_account_id(sf("sfIssuer"), issuer);
+        issuance.set_field_u32(sf("sfSequence"), sequence);
+        issuance.set_field_u64(sf("sfOutstandingAmount"), 10);
+        issuance.set_field_u32(
+            sf("sfFlags"),
+            protocol::lsfMPTCanEscrow | protocol::lsfMPTCanTransfer,
+        );
+        view.entries.insert(issuance_keylet.key, Arc::new(issuance));
+
+        let source_token_keylet = protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            basics::base_uint::Uint160::from_void(source.data()),
+        );
+        let mut source_token = STLedgerEntry::new(source_token_keylet);
+        source_token.set_account_id(sf("sfAccount"), source);
+        source_token.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
+        source_token.set_field_u64(sf("sfMPTAmount"), 10);
+        view.entries
+            .insert(source_token_keylet.key, Arc::new(source_token));
+
+        assert_eq!(
+            ledger::mptoken_helpers::require_auth_mpt(&view, &issue, &destination)
+                .expect("legacy destination auth"),
+            Ter::TEC_NO_AUTH,
+            "the missing destination holding distinguishes Weak from Legacy auth",
+        );
+        let create = STTx::new(TxType::ESCROW_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), source);
+            tx.set_account_id(sf("sfDestination"), destination);
+            tx.set_field_amount(sf("sfAmount"), amount.clone());
+        });
+        assert_eq!(
+            run_read_view_preclaim(&view, &create, TxType::ESCROW_CREATE, ApplyFlags::NONE),
+            Some(Ter::TES_SUCCESS),
+        );
+
+        let escrow_keylet = protocol::escrow_keylet(
+            basics::base_uint::Uint160::from_void(source.data()),
+            sequence,
+        );
+        let mut escrow = STLedgerEntry::new(escrow_keylet);
+        escrow.set_account_id(sf("sfAccount"), source);
+        escrow.set_account_id(sf("sfDestination"), destination);
+        escrow.set_field_amount(sf("sfAmount"), amount);
+        view.entries.insert(escrow_keylet.key, Arc::new(escrow));
+
+        let finish = STTx::new(TxType::ESCROW_FINISH, |tx| {
+            tx.set_account_id(sf("sfAccount"), destination);
+            tx.set_account_id(sf("sfOwner"), source);
+            tx.set_field_u32(sf("sfOfferSequence"), sequence);
+        });
+        assert_eq!(
+            run_read_view_preclaim(&view, &finish, TxType::ESCROW_FINISH, ApplyFlags::NONE),
+            Some(Ter::TES_SUCCESS),
+        );
+
+        view.entries.remove(&source_token_keylet.key);
+        assert_eq!(
+            ledger::mptoken_helpers::require_auth_mpt(&view, &issue, &source)
+                .expect("legacy owner auth"),
+            Ter::TEC_NO_AUTH,
+            "the missing owner holding distinguishes Weak from Legacy auth",
+        );
+        let cancel = STTx::new(TxType::ESCROW_CANCEL, |tx| {
+            tx.set_account_id(sf("sfAccount"), source);
+            tx.set_account_id(sf("sfOwner"), source);
+            tx.set_field_u32(sf("sfOfferSequence"), sequence);
+        });
+        assert_eq!(
+            run_read_view_preclaim(&view, &cancel, TxType::ESCROW_CANCEL, ApplyFlags::NONE),
+            Some(Ter::TES_SUCCESS),
         );
     }
 

@@ -1615,7 +1615,9 @@ fn escrow_finish_created_mpt_records_its_issuance_id() {
         ],
     );
     ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV1"),
         protocol::feature_id("fixTokenEscrowV1"),
+        protocol::feature_id("fixCleanup3_2_0"),
         protocol::feature_id("fixCleanup3_4_0"),
         protocol::feature_id("TokenEscrow"),
     ]));
@@ -3819,6 +3821,244 @@ fn mptoken_issuance_destroy_rejects_non_issuer() {
 }
 
 #[test]
+fn offer_create_expiration_recheck_uses_parent_close_time() {
+    let owner = sample_account(0xC0);
+    let issuer = sample_account(0xC1);
+    let usd = currency_from_string("USD");
+    let mut ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 1,
+            parent_close_time: 100,
+            close_time: 110,
+            ..LedgerHeader::default()
+        },
+        vec![
+            account_root_with_balance(owner, 1, 0, 1_000_000_000),
+            account_root(issuer, 0, 0),
+            trust_line_entry(owner, issuer, usd, 0),
+        ],
+    );
+    ledger.set_rules(protocol::Rules::new([]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let wants_usd = STAmount::from_iou_amount(
+        sf("sfTakerPays"),
+        IOUAmount::from_parts(10, 0).expect("USD amount"),
+        Issue::new(usd, issuer),
+    );
+
+    let original = offer_create_tx(owner, 1, wants_usd.clone(), test_xrp(100), 0, None);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &original, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let mut replacement = offer_create_cancel_tx(
+        owner,
+        2,
+        1,
+        wants_usd,
+        test_xrp(200),
+        protocol::tfPassive | protocol::tfSell,
+    );
+    replacement.set_field_u32(sf("sfExpiration"), 105);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &replacement, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "parent close time 100 must keep Expiration 105 live even when child close time is 110"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(raw_account_id(owner), 1))
+            .expect("old offer read")
+            .is_none(),
+        "successful replacement removes the old offer"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(raw_account_id(owner), 2))
+            .expect("replacement offer read")
+            .is_some(),
+        "successful replacement rests under the transaction sequence"
+    );
+    assert_eq!(owner_count(&view, owner), 2, "trust line plus replacement");
+}
+
+#[test]
+fn offer_create_mpt_zero_rate_is_killed_at_default_tick_size() {
+    let owner = sample_account(0xC2);
+    let iou_issuer = sample_account(0xC3);
+    let mpt_issuer = sample_account(0xC4);
+    let usd = currency_from_string("USD");
+    let mpt_id = share_id_for(mpt_issuer, 1);
+    let max_mpt = 0x7FFF_FFFF_FFFF_FFFF_i64;
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(owner, 2, 0, 1_000_000_000),
+        account_root(iou_issuer, 0, 0),
+        account_root(mpt_issuer, 1, 0),
+        trust_line_entry(owner, iou_issuer, usd, 0),
+        mpt_issuance_entry(
+            mpt_issuer,
+            1,
+            max_mpt as u64,
+            protocol::lsfMPTCanTransfer | protocol::lsfMPTCanTrade,
+        ),
+        mptoken_entry(owner, mpt_id, max_mpt as u64),
+    ]);
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV1"),
+        protocol::feature_id("MPTokensV2"),
+    ]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tiny_usd = STAmount::from_iou_amount(
+        sf("sfTakerPays"),
+        IOUAmount::min_positive_amount(),
+        Issue::new(usd, iou_issuer),
+    );
+    let max_tokens = STAmount::from_mpt_amount(
+        sf("sfTakerGets"),
+        MPTAmount::from_value(max_mpt),
+        MPTIssue::new(mpt_id),
+    );
+    let tx = offer_create_tx(owner, 1, tiny_usd, max_tokens, 0, None);
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &tx, TxType::OFFER_CREATE),
+        Ter::TEC_KILLED,
+        "an unrepresentable MPT quality must not rest at book-base quality when TickSize is 16"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(raw_account_id(owner), 1))
+            .expect("offer read")
+            .is_none()
+    );
+    assert_eq!(owner_count(&view, owner), 2);
+}
+
+#[test]
+fn offer_create_mpt_zero_rate_partial_cross_keeps_fill_without_residual() {
+    let alice = sample_account(0xC5);
+    let bob = sample_account(0xC6);
+    let issuer = sample_account(0xC7);
+    let mpt_id = share_id_for(issuer, 1);
+    let issue = MPTIssue::new(mpt_id);
+    let maker_amount = 200_000_000_000_000_000_i64;
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(alice, 1, 0, 10_000_000_000),
+        account_root_with_balance(bob, 1, 0, 10_000_000_000),
+        account_root_with_balance(issuer, 1, 0, 10_000_000_000),
+        mpt_issuance_entry(
+            issuer,
+            1,
+            maker_amount as u64,
+            protocol::lsfMPTCanTransfer | protocol::lsfMPTCanTrade,
+        ),
+        mptoken_entry(alice, mpt_id, 0),
+        mptoken_entry(bob, mpt_id, maker_amount as u64),
+    ]);
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("MPTokensV1"),
+        protocol::feature_id("MPTokensV2"),
+        protocol::feature_id("fixReducedOffersV2"),
+    ]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    // Bob sells 2e17 MPT for one XRP. Alice asks for twice Bob's liquidity
+    // at the same economic price. Alice's encoded quality overflows to zero,
+    // but Bob's half must still cross before the unplaceable residual is
+    // discarded (rippled OfferMPT_test::testMPTOfferZeroRatePartialCross).
+    let bob_offer = offer_create_tx(
+        bob,
+        1,
+        test_xrp(1_000_000),
+        STAmount::from_mpt_amount(
+            sf("sfTakerGets"),
+            MPTAmount::from_value(maker_amount),
+            issue,
+        ),
+        0,
+        None,
+    );
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &bob_offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let bob_offer_key = protocol::offer_keylet(raw_account_id(bob), 1);
+    assert!(
+        view.read(bob_offer_key)
+            .expect("read Bob's resting offer")
+            .is_some()
+    );
+
+    let alice_balance_before = view
+        .read(protocol::account_keylet(raw_account_id(alice)))
+        .expect("read Alice account")
+        .expect("Alice account exists")
+        .get_field_amount(sf("sfBalance"))
+        .xrp()
+        .drops();
+    let alice_offer = offer_create_tx(
+        alice,
+        1,
+        STAmount::from_mpt_amount(
+            sf("sfTakerPays"),
+            MPTAmount::from_value(2 * maker_amount),
+            issue,
+        ),
+        test_xrp(2_000_000),
+        0,
+        None,
+    );
+    assert_eq!(
+        protocol::get_rate(
+            &alice_offer.get_field_amount(sf("sfTakerGets")),
+            &alice_offer.get_field_amount(sf("sfTakerPays")),
+        ),
+        0,
+        "the partially crossable incoming quality must be unrepresentable"
+    );
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &alice_offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "the crossed half is retained even though the zero-rate residual cannot rest"
+    );
+
+    assert!(
+        view.read(bob_offer_key)
+            .expect("read consumed Bob offer")
+            .is_none(),
+        "Bob's available half must be fully consumed"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(raw_account_id(alice), 1))
+            .expect("read Alice residual offer")
+            .is_none(),
+        "Alice's unrepresentable residual must not enter a quality-zero directory"
+    );
+    let alice_token = view
+        .read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(alice),
+        ))
+        .expect("read Alice MPToken")
+        .expect("partial crossing credits Alice's existing MPToken");
+    assert_eq!(
+        alice_token.get_field_u64(sf("sfMPTAmount")),
+        maker_amount as u64
+    );
+    assert_eq!(
+        owner_count(&view, alice),
+        1,
+        "only the received MPToken rests"
+    );
+    assert_eq!(owner_count(&view, bob), 1, "Bob retains only his MPToken");
+    let alice_balance_after = view
+        .read(protocol::account_keylet(raw_account_id(alice)))
+        .expect("read Alice account after crossing")
+        .expect("Alice account remains")
+        .get_field_amount(sf("sfBalance"))
+        .xrp()
+        .drops();
+    assert_eq!(alice_balance_after, alice_balance_before - 1_000_010);
+}
+#[test]
 fn offer_create_places_funded_mpt_offer_without_iou_issue_panic() {
     let owner = sample_account(0xCA);
     let issuer = sample_account(0xCB);
@@ -5480,7 +5720,12 @@ fn mpt_escrow_create_then_finish_tracks_gross_lock_across_fix_token_escrow_v1() 
         });
         let mut finish_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut finish_view, &finish, TxType::ESCROW_FINISH, None),
+            handle_real_dispatch(
+                &mut finish_view,
+                &finish,
+                TxType::ESCROW_FINISH,
+                Some(1_000_000),
+            ),
             Ter::TES_SUCCESS,
             "MPT escrow finish must succeed with amendment enabled={amendment_enabled}"
         );
@@ -5619,7 +5864,12 @@ fn mpt_escrow_create_then_cancel_enforces_boundary_and_releases_full_lock() {
         });
         let mut boundary_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut boundary_view, &cancel, TxType::ESCROW_CANCEL, None),
+            handle_real_dispatch(
+                &mut boundary_view,
+                &cancel,
+                TxType::ESCROW_CANCEL,
+                Some(1_000_000),
+            ),
             Ter::TEC_NO_PERMISSION,
             "CancelAfter is not cancellable at its exact boundary"
         );
@@ -5629,7 +5879,12 @@ fn mpt_escrow_create_then_cancel_enforces_boundary_and_releases_full_lock() {
         ledger.set_ledger_info(header);
         let mut cancel_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut cancel_view, &cancel, TxType::ESCROW_CANCEL, None),
+            handle_real_dispatch(
+                &mut cancel_view,
+                &cancel,
+                TxType::ESCROW_CANCEL,
+                Some(1_000_000),
+            ),
             Ter::TES_SUCCESS,
             "MPT escrow cancel must succeed after CancelAfter with amendment enabled={amendment_enabled}"
         );
@@ -5747,7 +6002,7 @@ fn mpt_escrow_cancel_missing_owner_holding_matches_cleanup_3_2_0_boundary() {
         ledger.set_rules(protocol::Rules::new(features));
         let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut view, &cancel, TxType::ESCROW_CANCEL, None),
+            handle_real_dispatch(&mut view, &cancel, TxType::ESCROW_CANCEL, Some(0)),
             expected,
             "fixCleanup3_2_0 enabled={cleanup_enabled}"
         );
@@ -5766,14 +6021,16 @@ fn payment_transfers_mpt_without_rewriting_issue() {
         protocol::MPTAmount::from_value(10),
         mpt_issue,
     );
-    let ledger = empty_ledger(vec![
+    let mut ledger = empty_ledger(vec![
         account_root_with_balance(source, 1, 0, 1_000_000_000),
-        account_root_with_balance(destination, 0, 0, 1_000_000_000),
+        account_root_with_balance(destination, 1, 0, 1_000_000_000),
         account_root(issuer, 1, 0),
         mpt_issuance_entry(issuer, 1, 100, protocol::lsfMPTCanTransfer),
         mptoken_entry(source, mpt_id, 50),
+        mptoken_entry(destination, mpt_id, 0),
     ]);
-    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
+    let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::PAYMENT, |object| {
         object.set_account_id(get_field_by_symbol("sfAccount"), source);
         object.set_account_id(get_field_by_symbol("sfDestination"), destination);
@@ -5785,7 +6042,7 @@ fn payment_transfers_mpt_without_rewriting_issue() {
         object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None);
+    let result = handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000_000));
 
     assert_eq!(result, Ter::TES_SUCCESS);
     let source_token = view
@@ -5809,6 +6066,120 @@ fn payment_transfers_mpt_without_rewriting_issue() {
     assert_eq!(
         destination_token.get_field_u64(get_field_by_symbol("sfMPTAmount")),
         10
+    );
+}
+
+#[test]
+fn payment_legacy_mpt_rejects_missing_destination_holding() {
+    let source = sample_account(0xDA);
+    let destination = sample_account(0xDB);
+    let issuer = sample_account(0xDC);
+    let mpt_id = share_id_for(issuer, 1);
+    let amount = STAmount::from_mpt_amount(
+        sf("sfAmount"),
+        MPTAmount::from_value(25_000),
+        MPTIssue::new(mpt_id),
+    );
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 1_000_000_000),
+        account_root(issuer, 1, 0),
+        mpt_issuance_entry(issuer, 1, 25_000, protocol::lsfMPTCanTransfer),
+        mptoken_entry(source, mpt_id, 25_000),
+    ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
+    let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
+    assert!(!view.rules().enabled(&protocol::feature_id("MPTokensV2")));
+    assert_eq!(
+        ledger::mptoken_helpers::require_auth_mpt(&view, &MPTIssue::new(mpt_id), &source)
+            .expect("source auth read"),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        ledger::mptoken_helpers::require_auth_mpt(&view, &MPTIssue::new(mpt_id), &destination)
+            .expect("destination auth read"),
+        Ter::TEC_NO_AUTH
+    );
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), source);
+        tx.set_account_id(sf("sfDestination"), destination);
+        tx.set_field_amount(sf("sfAmount"), amount);
+        tx.set_field_amount(sf("sfFee"), test_xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000_000),),
+        Ter::TEC_NO_AUTH,
+        "Payment uses rippled Legacy authorization rather than Weak auto-creation"
+    );
+    assert!(
+        view.read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(destination),
+        ))
+        .expect("destination token read")
+        .is_none()
+    );
+}
+
+#[test]
+fn payment_legacy_mpt_fee_quote_and_debit_use_non_directed_rounding() {
+    let source = sample_account(0xDD);
+    let destination = sample_account(0xDE);
+    let issuer = sample_account(0xDF);
+    let mpt_id = share_id_for(issuer, 1);
+    let amount = STAmount::from_mpt_amount(
+        sf("sfAmount"),
+        MPTAmount::from_value(1),
+        MPTIssue::new(mpt_id),
+    );
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 1, 0, 1_000_000_000),
+        account_root(issuer, 1, 0),
+        mpt_issuance_entry_with_transfer_fee(issuer, 1, 2, protocol::lsfMPTCanTransfer, 25_000),
+        mptoken_entry(source, mpt_id, 2),
+        mptoken_entry(destination, mpt_id, 0),
+    ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("MPTokensV1")]));
+    let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), source);
+        tx.set_account_id(sf("sfDestination"), destination);
+        tx.set_field_amount(sf("sfAmount"), amount);
+        tx.set_field_amount(sf("sfFee"), test_xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000_000)),
+        Ter::TES_SUCCESS,
+    );
+    let source_token = view
+        .read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(source),
+        ))
+        .expect("source token read")
+        .expect("source token");
+    let destination_token = view
+        .read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(destination),
+        ))
+        .expect("destination token read")
+        .expect("destination token");
+    let issuance = view
+        .read(protocol::mpt_issuance_keylet_from_mptid(mpt_id))
+        .expect("issuance read")
+        .expect("issuance");
+    assert_eq!(source_token.get_field_u64(sf("sfMPTAmount")), 1);
+    assert_eq!(destination_token.get_field_u64(sf("sfMPTAmount")), 1);
+    assert_eq!(
+        issuance.get_field_u64(sf("sfOutstandingAmount")),
+        2,
+        "1 * 1.25 rounds to 1 in rippled's non-directed operation",
     );
 }
 
@@ -14857,6 +15228,123 @@ fn amm_deposit_submit_shell_preserves_pool_invariant() {
     let result = apply_submit_transactor_shell(&mut view, &tx, TxType::AMM_DEPOSIT);
 
     assert_eq!(result, Ter::TES_SUCCESS);
+}
+
+#[test]
+fn amm_deposit_frozen_iou_is_rejected_before_transfers_not_frozen_invariant() {
+    let fixture = || {
+        // Same account ordering as Testnet tx F70F...4F39: the issuer is
+        // low, the depositor is high, and lsfLowFreeze is the issuer-side bit.
+        let asset_issuer = sample_account(0x10);
+        let depositor = sample_account(0x20);
+        let amm_account = sample_account(0x30);
+        let asset2_issuer = sample_account(0x40);
+        let asset = Issue::new(currency_from_string("ALI"), asset_issuer);
+        let asset2 = Issue::new(currency_from_string("BOB"), asset2_issuer);
+        let amm = amm_entry(amm_account, asset, asset2, 1_000, vec![], 0);
+        let amm_key = protocol::keylet::amm(Asset::Issue(asset), Asset::Issue(asset2));
+
+        let mut amm_root = account_root_with_balance(
+            amm_account,
+            2,
+            protocol::lsfDisableMaster | protocol::lsfDefaultRipple | protocol::lsfDepositAuth,
+            0,
+        );
+        amm_root.set_field_h256(sf("sfAMMID"), amm_key.key);
+
+        let mut depositor_asset = trust_line_entry(asset_issuer, depositor, asset.currency, -990);
+        depositor_asset.set_field_u32(sf("sfFlags"), protocol::lsfLowFreeze);
+        let mut amm_asset = trust_line_entry(asset_issuer, amm_account, asset.currency, -1_000);
+        amm_asset.set_field_u32(sf("sfFlags"), protocol::lsfAMMNode);
+        let mut amm_asset2 = trust_line_entry(amm_account, asset2_issuer, asset2.currency, 1_000);
+        amm_asset2.set_field_u32(sf("sfFlags"), protocol::lsfAMMNode);
+        let lp_line = trust_line_entry(
+            depositor,
+            amm_account,
+            amm_lpt_currency(asset.currency, asset2.currency),
+            10,
+        );
+
+        let mut ledger = empty_ledger(vec![
+            account_root_with_balance(depositor, 2, 0, 1_000_000_000),
+            account_root(asset_issuer, 2, protocol::lsfDefaultRipple),
+            account_root(asset2_issuer, 1, protocol::lsfDefaultRipple),
+            amm_root,
+            amm,
+            depositor_asset,
+            amm_asset,
+            amm_asset2,
+            lp_line,
+        ]);
+        ledger.set_rules(protocol::Rules::new([
+            protocol::feature_id("AMM"),
+            protocol::feature_id("DeepFreeze"),
+            protocol::feature_id("fixCleanup3_2_0"),
+            protocol::fix_ammv1_3(),
+        ]));
+        let view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let tx = STTx::new(TxType::AMM_DEPOSIT, |tx| {
+            tx.set_account_id(sf("sfAccount"), depositor);
+            tx.set_field_issue(
+                sf("sfAsset"),
+                STIssue::new_with_asset(sf("sfAsset"), Asset::Issue(asset)),
+            );
+            tx.set_field_issue(
+                sf("sfAsset2"),
+                STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(asset2)),
+            );
+            tx.set_field_amount(sf("sfAmount"), iou_amount(sf("sfAmount"), asset, 100));
+            tx.set_field_amount(sf("sfFee"), test_xrp(10));
+            tx.set_field_u32(sf("sfFlags"), protocol::AMM_SINGLE_ASSET_FLAG);
+            tx.set_field_u32(sf("sfSequence"), 1);
+        });
+        (view, tx, amm_key, asset_issuer, depositor)
+    };
+
+    let (mut bypassed_preclaim, tx, _, _, _) = fixture();
+    assert_eq!(
+        apply_submit_transactor_shell(&mut bypassed_preclaim, &tx, TxType::AMM_DEPOSIT),
+        Ter::TEC_INVARIANT_FAILED,
+        "without preclaim, the frozen transfer reaches TransfersNotFrozen"
+    );
+
+    let (mut production_path, tx, amm_key, asset_issuer, depositor) = fixture();
+    let pool_before = production_path
+        .read(amm_key)
+        .expect("AMM read")
+        .expect("AMM exists")
+        .get_field_amount(sf("sfLPTokenBalance"));
+    let line_before = production_path
+        .read(line(asset_issuer, depositor, currency_from_string("ALI")))
+        .expect("trust-line read")
+        .expect("trust line exists")
+        .get_field_amount(sf("sfBalance"));
+
+    assert_eq!(
+        tx::run_dex_read_view_preclaim(&production_path, &tx, TxType::AMM_DEPOSIT),
+        Some(Ter::TEC_FROZEN)
+    );
+    assert_eq!(
+        apply_simulated_transaction(&mut production_path, &tx).0,
+        Ter::TEC_FROZEN,
+        "the frozen deposit must retain its preclaim TER instead of reaching an invariant"
+    );
+    assert_eq!(
+        production_path
+            .read(amm_key)
+            .expect("AMM read")
+            .expect("AMM exists")
+            .get_field_amount(sf("sfLPTokenBalance")),
+        pool_before
+    );
+    assert_eq!(
+        production_path
+            .read(line(asset_issuer, depositor, currency_from_string("ALI")))
+            .expect("trust-line read")
+            .expect("trust line exists")
+            .get_field_amount(sf("sfBalance")),
+        line_before
+    );
 }
 
 #[test]

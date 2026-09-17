@@ -55,6 +55,10 @@ pub trait ApplyView: ReadView + RawView {
     ) {
     }
 
+    /// Hook called when an MPT issuer-owned offer consumes issuance capacity
+    /// without a physical issuer-to-issuer ledger transfer.
+    fn issuer_self_debit_hook_mpt(&mut self, _issue: MPTIssue, _amount: u64, _orig_balance: i64) {}
+
     /// Hook called when owner count changes (overridden by PaymentSandbox).
     fn adjust_owner_count_hook(
         &mut self,
