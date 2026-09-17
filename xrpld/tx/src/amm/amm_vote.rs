@@ -57,7 +57,10 @@ pub fn run_amm_vote_preclaim_facts(facts: AMMVotePreclaimFacts) -> Ter {
         return Ter::TEC_AMM_EMPTY;
     }
 
-    if facts.account_lp_holds_signum.unwrap_or(0) == 0 {
+    // `None` lets the read-view adapter run existence/empty checks before
+    // reading the LP trust line. Canonical AMMVote rejects only a balance
+    // that was actually read as zero.
+    if facts.account_lp_holds_signum == Some(0) {
         return Ter::TEC_AMM_INVALID_TOKENS;
     }
 

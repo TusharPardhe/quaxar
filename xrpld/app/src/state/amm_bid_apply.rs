@@ -17,23 +17,45 @@ const TAILING_SLOT: u8 = AUCTION_SLOT_TIME_INTERVALS as u8 - 1;
 fn read_lp_balance<V: ApplyView>(
     view: &mut V,
     account: AccountID,
-    lp_issue: Issue,
+    amm_sle: &STLedgerEntry,
 ) -> Result<STAmount, Ter> {
-    let line_keylet = protocol::line(account, lp_issue.account, lp_issue.currency);
-    let state = match view.peek(line_keylet) {
+    let asset = amm_sle.get_field_issue(sf("sfAsset")).asset();
+    let asset2 = amm_sle.get_field_issue(sf("sfAsset2")).asset();
+    let amm_account = amm_sle.get_account_id(sf("sfAccount"));
+    let lp_issue = protocol::amm_lpt_issue_from_assets(asset, asset2, amm_account);
+    let zero =
+        STAmount::from_iou_amount(sf("sfLPTokenBalance"), protocol::IOUAmount::new(), lp_issue);
+
+    let issuer = view
+        .read(protocol::account_keylet(
+            basics::base_uint::Uint160::from_void(amm_account.data()),
+        ))
+        .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+    if issuer.is_some_and(|issuer| issuer.is_flag(protocol::lsfGlobalFreeze)) {
+        return Ok(zero);
+    }
+
+    let line_keylet = protocol::line(account, amm_account, lp_issue.currency);
+    let state = match view.read(line_keylet) {
         Ok(Some(sle)) => sle,
-        Ok(None) => return Ok(STAmount::default()),
+        Ok(None) => return Ok(zero),
         Err(_) => return Err(Ter::TEF_BAD_LEDGER),
     };
+    let issuer_freeze = if amm_account > account {
+        protocol::lsfHighFreeze
+    } else {
+        protocol::lsfLowFreeze
+    };
+    if state.is_flag(issuer_freeze) {
+        return Ok(zero);
+    }
+
     let mut balance = state.get_field_amount(sf("sfBalance"));
-    if account > lp_issue.account {
+    if account > amm_account {
         balance.negate();
     }
-    if balance.signum() > 0 {
-        Ok(balance)
-    } else {
-        Ok(STAmount::default())
-    }
+    balance.set_issuer(amm_account);
+    Ok(view.balance_hook_iou(account, amm_account, balance))
 }
 
 fn redeem_iou<V: ApplyView>(
@@ -108,7 +130,7 @@ pub fn apply_amm_bid<V: ApplyView>(view: &mut V, sttx: &protocol::STTx) -> Ter {
     let lp_issue = lpt_amm_balance.issue();
 
     // Get account's LP token holdings from trust line
-    let lp_tokens = match read_lp_balance(view, account, lp_issue) {
+    let lp_tokens = match read_lp_balance(view, account, &amm_sle) {
         Ok(amount) => amount,
         Err(ter) => return ter,
     };

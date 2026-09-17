@@ -213,7 +213,8 @@ fn amm_vote_preclaim_matches_reference_ordering() {
             lp_token_balance_signum: 1,
             account_lp_holds_signum: None,
         }),
-        Ter::TEC_AMM_INVALID_TOKENS
+        Ter::TES_SUCCESS,
+        "an unread LP balance must not be classified as zero"
     );
 
     assert_eq!(
