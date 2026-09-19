@@ -1008,7 +1008,17 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                     );
                 }
             } else {
-                tracing::info!(
+                // rippled RCLConsensus::Adaptor::getPrevLedger only invokes the
+                // mode-only consensusViewChange() (the Full/Tracking demotion
+                // branch above) and otherwise just returns the preferred ledger
+                // with no further logging. When the node is already in a
+                // non-Full/Tracking mode (e.g. SwitchedLedger/Connected) a
+                // differing preferred ledger is the expected, in-progress
+                // recovery state, not a new divergence. Emit this only at trace
+                // level so it stays available for debugging without surfacing a
+                // misleading "mismatch" signal at info level. This branch has no
+                // state effect; it is purely diagnostic.
+                tracing::trace!(
                     target: "consensus",
                     event = "consensus_view_change_mismatch",
                     consensus_mode = ?mode,
