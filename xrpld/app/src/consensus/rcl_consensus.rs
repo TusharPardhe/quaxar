@@ -947,7 +947,15 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 .app_root
                 .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred))
                 .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
-            let local_closed = self.app_root.closed_ledger().map(|ledger| {
+            // Canonical installed closed ledger, read from ApplicationRoot.
+            // NOTE: this is DIAGNOSTIC ONLY and is intentionally NOT part of the
+            // divergence decision (which compares `preferred` against the
+            // consensus round's `prev_ledger_id`). During WrongLedger/
+            // SwitchedLedger recovery this canonical closed snapshot can
+            // legitimately lag the consensus working-previous ledger, exactly as
+            // rippled's acquireLedger returns an acquired ledger without an
+            // immediate switchLCL. Do not read it as a fork.
+            let canonical_app_closed = self.app_root.closed_ledger().map(|ledger| {
                 (
                     *ledger.header().hash.as_uint256(),
                     ledger.header().seq,
@@ -972,6 +980,19 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 prev_ledger.ledger().header().seq,
                 prev_ledger.ledger().header().close_time,
             );
+            // The ledger the consensus round is actually working on top of.
+            // This, not `canonical_app_closed`, is what the divergence decision
+            // compares against `preferred`.
+            let consensus_working_previous = (
+                *prev_ledger.ledger().header().hash.as_uint256(),
+                prev_ledger.ledger().header().seq,
+            );
+            // True when the canonical closed snapshot trails the consensus
+            // working-previous ledger, i.e. the expected in-recovery skew rather
+            // than a same-sequence hash fork.
+            let is_expected_recovery_divergence = canonical_app_closed
+                .map(|(_, closed_seq, _)| closed_seq < consensus_working_previous.1)
+                .unwrap_or(false);
             if current_mode == crate::NetworkOpsOperatingMode::Full
                 || current_mode == crate::NetworkOpsOperatingMode::Tracking
             {
@@ -982,10 +1003,12 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                     consensus_mode = ?mode,
                     min_valid_seq,
                     requested = %prev_ledger_id,
+                    consensus_working_previous = ?consensus_working_previous,
                     previous_ledger = ?previous_ledger,
                     preferred = %preferred,
                     preferred_resident = ?preferred_resident,
-                    local_closed = ?local_closed,
+                    canonical_app_closed = ?canonical_app_closed,
+                    is_expected_recovery_divergence,
                     published_ledger = ?published_ledger,
                     validated_anchor = ?validated_anchor,
                     last_valid_anchor = ?last_valid_anchor,
@@ -1024,10 +1047,12 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                     consensus_mode = ?mode,
                     min_valid_seq,
                     requested = %prev_ledger_id,
+                    consensus_working_previous = ?consensus_working_previous,
                     previous_ledger = ?previous_ledger,
                     preferred = %preferred,
                     preferred_resident = ?preferred_resident,
-                    local_closed = ?local_closed,
+                    canonical_app_closed = ?canonical_app_closed,
+                    is_expected_recovery_divergence,
                     published_ledger = ?published_ledger,
                     validated_anchor = ?validated_anchor,
                     last_valid_anchor = ?last_valid_anchor,
