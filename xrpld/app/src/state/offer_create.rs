@@ -58,6 +58,15 @@ const TF_IMMEDIATE_OR_CANCEL: u32 = 0x0002_0000;
 const TF_FILL_OR_KILL: u32 = 0x0004_0000;
 const TF_SELL: u32 = 0x0008_0000;
 
+fn offer_was_crossed(
+    original_gets: &STAmount,
+    original_pays: &STAmount,
+    remaining_gets: &STAmount,
+    remaining_pays: &STAmount,
+) -> bool {
+    remaining_gets != original_gets || remaining_pays != original_pays
+}
+
 /// Full reference OfferCreate::doApply parity.
 pub fn do_offer_create<V: ledger::ApplyView>(
     view: &mut V,
@@ -297,7 +306,6 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         quality_threshold.increment();
     }
 
-    let mut crossed = false;
     let (remaining_gets, remaining_pays) = 'cross: {
         // Cross as a payment from the offer creator back to themselves.
         // rippled's takerAmount.in is TakerGets (what the creator supplies)
@@ -395,10 +403,6 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         let actual_in = flow_result.actual_in;
         let actual_out = flow_result.actual_out;
 
-        if actual_in.signum() > 0 || actual_out.signum() > 0 {
-            crossed = true;
-        }
-
         // Compute the residual offer using rippled's flow result convention:
         // actual_in is TakerGets consumed and actual_out is TakerPays delivered.
         // A dry flow leaves the offer unchanged. Besides matching rippled's
@@ -414,18 +418,15 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             (taker_gets.clone(), taker_pays.clone())
         } else if is_sell {
             // tfSell reduces the input side, TakerGets.
-            let non_gateway_in = if gateway_rate != 1_000_000_000 {
-                let rate = STAmount::new_with_asset(
-                    sf("sfAmount"),
-                    protocol::no_issue(),
-                    gateway_rate as u64,
-                    -9,
-                    false,
-                );
-                match amount_or_exception(actual_in.try_divide(&rate, taker_gets.asset())) {
-                    Ok(amount) => amount,
-                    Err(ter) => return ter,
-                }
+            let non_gateway_in = if gateway_rate != protocol::QUALITY_ONE {
+                // OfferCreate.cpp flowCross uses divideRound(..., true): the
+                // gateway-free amount is rounded upward before subtraction.
+                protocol::divide_round_with_asset(
+                    &actual_in,
+                    protocol::Rate::new(gateway_rate),
+                    taker_gets.asset(),
+                    true,
+                )
             } else {
                 actual_in
             };
@@ -465,6 +466,12 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         };
         (rem_gets, rem_pays)
     };
+
+    // OfferCreate.cpp derives `crossed` from the final flowCross contract,
+    // not from positive intermediate flow amounts. Tiny positive amounts can
+    // disappear during residual subtraction/normalization and leave the offer
+    // byte-for-byte unchanged.
+    let crossed = offer_was_crossed(&taker_gets, &taker_pays, &remaining_gets, &remaining_pays);
 
     // --- Fully crossed check ---
     if remaining_gets.signum() <= 0 || remaining_pays.signum() <= 0 {
@@ -1087,6 +1094,53 @@ mod tests {
             protocol::div_round_strict(&remaining_in, &rate, original_out.asset(), false);
         assert!(remaining_in.signum() > 0);
         assert!(reconstructed_out <= remaining_out);
+    }
+
+    #[test]
+    fn sell_gateway_residual_division_rounds_up_like_flow_cross() {
+        let issue = protocol::Issue::new(
+            protocol::currency_from_string("USD"),
+            protocol::AccountID::from_array([0x89; 20]),
+        );
+        let actual_in =
+            STAmount::new_with_asset(sf("sfAmount"), issue, 1_000_000_000_000_000, -15, false);
+        let gateway_rate = protocol::Rate::new(1_300_000_000);
+        let rounded_up =
+            protocol::divide_round_with_asset(&actual_in, gateway_rate, actual_in.asset(), true);
+        let rounded_down =
+            protocol::divide_round_with_asset(&actual_in, gateway_rate, actual_in.asset(), false);
+
+        assert!(rounded_up > rounded_down);
+        assert_eq!(
+            rounded_up - rounded_down,
+            STAmount::new_with_asset(sf("sfAmount"), issue, 1_000_000_000_000_000, -31, false,)
+        );
+    }
+
+    #[test]
+    fn crossed_is_derived_from_final_residual_not_positive_flow_dust() {
+        let issue = protocol::Issue::new(
+            protocol::currency_from_string("USD"),
+            protocol::AccountID::from_array([0x8a; 20]),
+        );
+        let original_gets =
+            STAmount::new_with_asset(sf("sfTakerGets"), issue, 1_000_000_000_000_000, -15, false);
+        let original_pays = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+
+        assert!(!offer_was_crossed(
+            &original_gets,
+            &original_pays,
+            &original_gets,
+            &original_pays,
+        ));
+        let reduced_gets = original_gets.clone()
+            - STAmount::new_with_asset(sf("sfAmount"), issue, 1_000_000_000_000_000, -31, false);
+        assert!(offer_was_crossed(
+            &original_gets,
+            &original_pays,
+            &reduced_gets,
+            &original_pays,
+        ));
     }
 
     #[test]

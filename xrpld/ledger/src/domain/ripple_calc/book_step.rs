@@ -71,6 +71,29 @@ struct TraversedOffer {
     quality: Quality,
 }
 
+/// OfferStream also steps over directory indexes whose Offer SLE is missing.
+/// Keep those holes in traversal order so execution can erase and count them
+/// at the same point rippled does.
+enum TraversedBookEntry {
+    Offer(TraversedOffer),
+    Missing {
+        directory_page: protocol::Keylet,
+        offer_key: basics::base_uint::Uint256,
+        quality: Quality,
+    },
+}
+
+impl TraversedBookEntry {
+    /// BookTip exposes the traversed directory quality even when its current
+    /// offer SLE is missing. Estimation must therefore not discard a hole.
+    fn quality(&self) -> Quality {
+        match self {
+            Self::Offer(offer) => offer.quality,
+            Self::Missing { quality, .. } => *quality,
+        }
+    }
+}
+
 fn insert_sorted_amount(amounts: &mut Vec<STAmount>, amount: STAmount) {
     let index = amounts.partition_point(|saved| saved <= &amount);
     amounts.insert(index, amount);
@@ -535,11 +558,30 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     // ends this step before FlowOfferStream advances to them.
     let mut offers = Vec::with_capacity(raw_offers.len());
     let mut found_tip = false;
-    for traversed in raw_offers {
+    for entry in raw_offers {
         if found_tip {
-            offers.push(traversed);
+            offers.push(entry);
             continue;
         }
+        let traversed = match entry {
+            TraversedBookEntry::Offer(offer) => offer,
+            TraversedBookEntry::Missing {
+                directory_page,
+                offer_key,
+                ..
+            } => {
+                if erase_dangling_offer_index(view, directory_page, offer_key).is_err() {
+                    return BookStepResult {
+                        amount_in: total_in,
+                        amount_out: total_out,
+                        offers_consumed,
+                        ter: Ter::TEF_BAD_LEDGER,
+                    };
+                }
+                offers_consumed += 1;
+                continue;
+            }
+        };
         let offer_sle = traversed.sle;
         let offer_quality = traversed.quality;
         let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
@@ -678,10 +720,10 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             }
         }
         found_tip = true;
-        offers.push(TraversedOffer {
+        offers.push(TraversedBookEntry::Offer(TraversedOffer {
             sle: offer_sle,
             quality: offer_quality,
-        });
+        }));
     }
 
     // A BookStep consumes one quality directory per call, as in rippled's
@@ -692,7 +734,10 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     // rippled tries AMM liquidity before the cleaned CLOB tip. The AMM offer
     // establishes the one-quality-per-step boundary just like a real offer.
     // Domain books never use AMM liquidity.
-    let clob_tip = offers.first().map(|offer| offer.quality);
+    let clob_tip = offers.iter().find_map(|entry| match entry {
+        TraversedBookEntry::Offer(offer) => Some(offer.quality),
+        TraversedBookEntry::Missing { .. } => None,
+    });
     let amm_generation_quality = amm_target_quality(
         clob_tip,
         quality_threshold,
@@ -785,11 +830,30 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     }
 
     if !stop_before_clob {
-        for traversed in offers {
+        for entry in offers {
             if offers_consumed >= MAX_OFFERS_TO_CONSUME || remaining_in.signum() <= 0 {
                 break;
             }
 
+            let traversed = match entry {
+                TraversedBookEntry::Offer(offer) => offer,
+                TraversedBookEntry::Missing {
+                    directory_page,
+                    offer_key,
+                    ..
+                } => {
+                    if erase_dangling_offer_index(view, directory_page, offer_key).is_err() {
+                        return BookStepResult {
+                            amount_in: total_in,
+                            amount_out: total_out,
+                            offers_consumed,
+                            ter: Ter::TEF_BAD_LEDGER,
+                        };
+                    }
+                    offers_consumed += 1;
+                    continue;
+                }
+            };
             let offer_sle = traversed.sle;
             let offer_quality = traversed.quality;
             let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
@@ -1773,7 +1837,7 @@ pub(crate) fn book_quality_upper_bound<V: ApplyView>(
     strand_deliver: Asset,
 ) -> Result<Option<Quality>, ViewError> {
     let clob_offers = get_book_offers(view, book, 1)?;
-    let clob = clob_offers.first().map(|offer| offer.quality);
+    let clob = clob_offers.first().map(TraversedBookEntry::quality);
     let generation_quality = amm_target_quality(
         clob,
         quality_threshold,
@@ -1820,7 +1884,7 @@ pub(crate) fn book_quality_function<V: ApplyView>(
     strand_deliver: Asset,
 ) -> Result<Option<QualityFunction>, ViewError> {
     let clob_offers = get_book_offers(view, book, 1)?;
-    let clob = clob_offers.first().map(|offer| offer.quality);
+    let clob = clob_offers.first().map(TraversedBookEntry::quality);
     let target = amm_target_quality(
         clob,
         quality_threshold,
@@ -2081,7 +2145,7 @@ fn get_book_offers<V: ApplyView>(
     view: &mut V,
     book: &Book,
     max: u32,
-) -> Result<Vec<TraversedOffer>, ViewError> {
+) -> Result<Vec<TraversedBookEntry>, ViewError> {
     let mut offers = Vec::new();
 
     // Offers are stored under their executable TakerPays -> TakerGets book,
@@ -2138,12 +2202,17 @@ fn get_book_offers<V: ApplyView>(
                     if offers.len() >= max as usize {
                         break;
                     }
-                    if let Some(offer_sle) = view.peek(protocol::Keylet::new(
-                        protocol::LedgerEntryType::Offer,
-                        offer_key,
-                    ))? {
-                        offers.push(TraversedOffer {
+                    let offer_keylet =
+                        protocol::Keylet::new(protocol::LedgerEntryType::Offer, offer_key);
+                    if let Some(offer_sle) = view.peek(offer_keylet)? {
+                        offers.push(TraversedBookEntry::Offer(TraversedOffer {
                             sle: offer_sle.as_ref().clone(),
+                            quality,
+                        }));
+                    } else {
+                        offers.push(TraversedBookEntry::Missing {
+                            directory_page: page_keylet,
+                            offer_key,
                             quality,
                         });
                     }
@@ -2164,6 +2233,33 @@ fn get_book_offers<V: ApplyView>(
     }
 
     Ok(offers)
+}
+
+/// Mirrors OfferStream.cpp `erase`: remove a dangling index from the current
+/// page but deliberately do not use dirRemove or erase an empty directory.
+/// That historical behavior is consensus-significant.
+fn erase_dangling_offer_index<V: ApplyView>(
+    view: &mut V,
+    directory_page: protocol::Keylet,
+    offer_key: basics::base_uint::Uint256,
+) -> Result<(), ViewError> {
+    let Some(directory) = view.peek(directory_page)? else {
+        return Ok(());
+    };
+    let mut indexes = directory.get_field_v256(sf("sfIndexes")).value().to_vec();
+    let Some(position) = indexes.iter().position(|index| *index == offer_key) else {
+        return Ok(());
+    };
+    indexes.remove(position);
+    let mut object = directory.clone_as_object();
+    object.set_field_v256(
+        sf("sfIndexes"),
+        protocol::STVector256::from_values(sf("sfIndexes"), indexes),
+    );
+    view.update(Arc::new(STLedgerEntry::from_stobject(
+        object,
+        *directory.key(),
+    )))
 }
 
 /// Get the funds available for an offer owner to deliver.
@@ -2940,10 +3036,98 @@ mod tests {
         assert_eq!(
             offers
                 .iter()
-                .map(|offer| *offer.sle.key())
+                .filter_map(|entry| match entry {
+                    TraversedBookEntry::Offer(offer) => Some(*offer.sle.key()),
+                    TraversedBookEntry::Missing { .. } => None,
+                })
                 .collect::<Vec<_>>(),
             vec![offer_one_key.key, offer_two_key.key]
         );
+    }
+
+    #[test]
+    fn dangling_book_index_is_erased_and_counted_without_deleting_directory() {
+        let issuer = AccountID::from_array([0x65; 20]);
+        let missing_owner = AccountID::from_array([0x66; 20]);
+        let usd = Issue::new(protocol::currency_from_string("USD"), issuer);
+        let book = Book {
+            r#in: Asset::Issue(protocol::xrp_issue()),
+            out: Asset::Issue(usd),
+            domain: None,
+        };
+        let directory_quality = 0x5C04_1502_68D8_D000;
+        let quality_root = protocol::quality_keylet(
+            protocol::book_keylet(protocol::Book::new(book.r#in, book.out, None)),
+            directory_quality,
+        );
+        let missing_offer = protocol::offer_keylet(Uint160::from_void(missing_owner.data()), 1).key;
+        let mut root = STLedgerEntry::new(quality_root);
+        root.set_field_v256(
+            sf("sfIndexes"),
+            protocol::STVector256::from_values(sf("sfIndexes"), vec![missing_offer]),
+        );
+        root.set_field_u64(sf("sfIndexNext"), 0);
+        root.set_field_u64(sf("sfIndexPrevious"), 0);
+
+        let mut view = test_apply_view(&[]);
+        view.insert(Arc::new(test_account(issuer, 0)))
+            .expect("insert issuer");
+        view.insert(Arc::new(root)).expect("insert quality root");
+
+        // BookTip::step exposes the directory quality before OfferStream sees
+        // and removes the missing SLE. Both strand-estimation paths must do the
+        // same or ordinary/passive OfferCreate can deactivate this strand.
+        let expected_quality = Quality::from_value(directory_quality);
+        let amm_context = crate::domain::flow_engine::AmmContext::new(missing_owner, false);
+        assert_eq!(
+            book_quality_upper_bound(
+                &mut view,
+                &book,
+                None,
+                &amm_context,
+                false,
+                false,
+                &issuer,
+                book.out,
+            )
+            .expect("estimate book upper bound"),
+            Some(expected_quality)
+        );
+        let quality_function = book_quality_function(
+            &mut view,
+            &book,
+            None,
+            &amm_context,
+            false,
+            false,
+            &issuer,
+            book.out,
+        )
+        .expect("estimate book quality function")
+        .expect("dangling directory remains estimable");
+        assert_eq!(quality_function.quality(), Some(expected_quality));
+
+        let result = execute_book_step(
+            &mut view,
+            &book,
+            &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(100)),
+            &STAmount::from_iou_amount(
+                sf("sfAmount"),
+                IOUAmount::from_parts(100, 0).expect("valid IOU"),
+                usd,
+            ),
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(result.ter, Ter::TES_SUCCESS);
+        assert_eq!(result.offers_consumed, 1);
+        let directory = view
+            .peek(quality_root)
+            .expect("read directory")
+            .expect("historical erase keeps empty directory");
+        assert!(directory.get_field_v256(sf("sfIndexes")).value().is_empty());
     }
 
     #[test]
@@ -2984,14 +3168,15 @@ mod tests {
         let offers = get_book_offers(&mut view, &book, 1).expect("walk domain book");
 
         assert_eq!(offers.len(), 1);
-        assert_eq!(
-            offers[0].quality,
-            Quality::from_value(0x1122_3344_5566_7788)
-        );
+        let offer = match &offers[0] {
+            TraversedBookEntry::Offer(offer) => offer,
+            TraversedBookEntry::Missing { .. } => panic!("fixture offer must exist"),
+        };
+        assert_eq!(offer.quality, Quality::from_value(0x1122_3344_5566_7788));
         assert_ne!(
-            offers[0].quality,
+            offer.quality,
             Quality::from_value(protocol::quality_from_key(
-                offers[0].sle.get_field_h256(sf("sfBookDirectory"))
+                offer.sle.get_field_h256(sf("sfBookDirectory"))
             ))
         );
     }
