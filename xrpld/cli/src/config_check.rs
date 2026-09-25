@@ -344,6 +344,16 @@ fn validate_overlay(config: &BasicConfig, report: &mut ConfigValidationReport) {
             report.errors.push(format!("[overlay] {key} {error}"));
         }
     }
+    for (key, minimum, maximum) in [
+        ("max_diverged_time", 60, 900),
+        ("max_unknown_time", 300, 1_800),
+    ] {
+        if let Some(raw) = optional_string(section, key)
+            && let Err(error) = parse_usize_range(&raw, minimum, maximum)
+        {
+            report.errors.push(format!("[overlay] {key} {error}"));
+        }
+    }
     if let Some(raw) = optional_string(section, "verify_endpoints")
         && parse_bool_value(&raw).is_err()
     {
@@ -656,6 +666,25 @@ maybe
         let errors = invalid.errors.join("\n");
         assert!(errors.contains("[overlay] max_untrusted_count"));
         assert!(errors.contains("[overlay] max_trusted_count"));
+    }
+
+    #[test]
+    fn config_validation_enforces_rippled_tracking_deadline_bounds() {
+        let valid = validate_config_content(
+            "[node_size]\nmedium\n[node_db]\ntype = NuDB\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_diverged_time = 60\nmax_unknown_time = 300\n",
+        );
+        assert!(
+            valid.errors.is_empty(),
+            "unexpected errors: {:?}",
+            valid.errors
+        );
+
+        let invalid = validate_config_content(
+            "[node_size]\nmedium\n[node_db]\ntype = NuDB\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_diverged_time = 59\nmax_unknown_time = 1801\n",
+        );
+        let errors = invalid.errors.join("\n");
+        assert!(errors.contains("[overlay] max_diverged_time"));
+        assert!(errors.contains("[overlay] max_unknown_time"));
     }
 
     #[test]

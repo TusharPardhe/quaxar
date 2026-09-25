@@ -74,7 +74,7 @@ use ledger::{
     NullOrderBookDBJournal, NullOrderBookDBRuntime, OpenView, ReadView, Sandbox, TxsRawView,
 };
 use overlay::Cluster;
-use overlay::{OverlayHandoff, OverlayImpl, PeerReservationSource};
+use overlay::{Overlay, OverlayHandoff, OverlayImpl, PeerReservationSource};
 use perflog::PerfLogImp;
 use protocol::{
     AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NodeID, NotTec, PublicKey,
@@ -10083,6 +10083,15 @@ impl ApplicationRoot {
             ledger.header().seq,
             ledger.header().close_time,
         );
+        // LedgerMaster.cpp checks every peer against this first quorum-backed
+        // sequence before an initial validated ledger is available locally.
+        if current_valid_seq == 0 && val_count >= quorum {
+            if let Some(overlay_runtime) = self.overlay_runtime() {
+                overlay_runtime
+                    .overlay()
+                    .check_tracking(ledger.header().seq);
+            }
+        }
         let can_be_current = lm.can_be_current(ledger.as_ref(), self.current_close_time_seconds());
         let accepted = lm.check_accept_ledger(
             ledger.as_ref(),

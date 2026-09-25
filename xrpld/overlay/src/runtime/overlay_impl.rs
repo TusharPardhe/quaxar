@@ -2386,6 +2386,7 @@ impl OverlayImpl {
             }));
         }
         peer.install_resource_consumer(consumer, Arc::clone(&self.peer_disconnect_charges));
+        peer.set_tracking_deadlines(self.setup.max_diverged_time, self.setup.max_unknown_time);
         peer.start_lifecycle_timer(self.session_runtime.handle());
 
         tracing::info!(
