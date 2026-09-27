@@ -186,26 +186,6 @@ enum PreferredLclReconciliation {
     Switched,
 }
 
-fn effective_validation_recovery_target(
-    ordinary_selected: Uint256,
-    local_lcl: Uint256,
-    stable_anchor: Option<(Uint256, u32)>,
-    ordinary_selected_is_resident: bool,
-) -> acquisition::LedgerTarget {
-    // A stable acquisition owner prevents a moving, unresolved network tip
-    // from starving recovery.  It must not mask an ordinary getPreferredLCL
-    // result that is already locally available: rippled immediately hands
-    // that ledger to switchLastClosedLedger instead of waiting for an older
-    // asynchronous acquisition.
-    if ordinary_selected_is_resident && ordinary_selected != local_lcl {
-        return acquisition::LedgerTarget::new(ordinary_selected, None);
-    }
-    stable_anchor
-        .map(|(hash, seq)| acquisition::LedgerTarget::new(hash, Some(seq)))
-        .filter(|target| target.hash() != local_lcl)
-        .unwrap_or_else(|| acquisition::LedgerTarget::new(ordinary_selected, None))
-}
-
 fn preferred_candidate_passes_switch_admission(
     lm: &ledger::LedgerMaster,
     expected_hash: Uint256,
@@ -1523,11 +1503,12 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         .map(|(seq, hash)| (hash, seq));
     shared_inbound.coordinator_validation_recovery_target(validation_recovery_target);
     let ordinary_selected_preferred_hash = preference_diagnostic.selected;
-    // Resolve the ordinary rippled preference before applying Quaxar's
-    // phase-neutral stable acquisition owner.  The owner is only a liveness
-    // fallback for an unresolved moving tip; once the ordinary preferred LCL
-    // is durable, complete, current, and compatible, checkLastClosedLedger
-    // must be allowed to switch to it immediately.
+    // Resolve the ordinary rippled preference exactly as checkLastClosedLedger
+    // does. Validation-recovery advice remains a separate, phase-neutral
+    // acquisition; it must never replace getPreferredLCL as the consensus/LCL
+    // authority. Otherwise an unresolved advisory hash can repeatedly force
+    // resolver misses and Full -> Syncing even while the validation trie still
+    // prefers the installed LCL.
     let ordinary_selected_preferred_resident = (ordinary_selected_preferred_hash != our_hash
         && ordinary_selected_preferred_hash != parent_hash
         && !ordinary_selected_preferred_hash.is_zero())
@@ -1548,23 +1529,13 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
                 root.current_close_time_seconds(),
             )
         });
-    // The diagnostic candidate is moving advice. Only the coordinator's
-    // provenance-backed stable anchor may override a trie-local preference.
-    // Once bound, retain that exact networkClosed target until its lifecycle
-    // clears it so successive timer checks cannot redirect consensus to the
-    // stale local branch while the asynchronous acquisition is active.
-    let selected_preferred_target = effective_validation_recovery_target(
-        ordinary_selected_preferred_hash,
-        our_hash,
-        shared_inbound.coordinator_validation_recovery_latch().0,
-        ordinary_selected_preferred_is_admissible,
-    );
-    let selected_preferred_hash = selected_preferred_target.hash();
-    // Match rippled's checkLastClosedLedger: ordinary preference is recomputed
-    // for every accepted-boundary pass. The one exception is the bounded,
-    // provenance-backed recovery anchor above: while its exact acquisition is
-    // live it remains networkClosed, matching acquiringLedger_ ownership.
-    let preferred_hash = selected_preferred_hash;
+    // Recovery-target acquisition is advisory only. The accepted-boundary
+    // decision, networkClosed value, and any WrongLedger acquisition all use
+    // the current getPreferredLCL result, exactly like rippled.
+    let selected_preferred_target =
+        acquisition::LedgerTarget::new(ordinary_selected_preferred_hash, None);
+    let selected_preferred_hash = ordinary_selected_preferred_hash;
+    let preferred_hash = ordinary_selected_preferred_hash;
     if let Some(waiter) = provisional_waiter.as_ref().copied()
         && waiter.identity.target_hash == preferred_hash
         && shared_inbound.provisional_identity(&preferred_hash) == Some(waiter.identity)
@@ -1607,9 +1578,9 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         );
     }
     // The only early resolution above was for a nonlocal ordinary preference;
-    // local/parent no-switch paths remain provider-free.  Surface that lookup
-    // here so live diagnostics can prove when a resident B superseded fallback
-    // anchor A.
+    // local/parent no-switch paths remain provider-free. Surface that lookup
+    // here to distinguish a resident authoritative choice from background
+    // validation-recovery advice.
     let selected_preferred_resident = ordinary_selected_preferred_is_admissible
         .then_some(ordinary_selected_preferred_resident.as_ref())
         .flatten()
@@ -1621,7 +1592,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         local_lcl_seq = our_closed.header().seq,
         preferred_lcl_hash = %preferred_hash,
         selected_preferred_lcl_hash = %selected_preferred_hash,
-        recovery_target_stabilized = preferred_hash != ordinary_selected_preferred_hash,
+        recovery_target_stabilized = false,
         peer_count = peers.len(),
         selected_trusted_validation_count = root.validations().num_trusted_for_ledger(preferred_hash),
         selected_peer_lcl_support = peer_counts.get(&preferred_hash).copied().unwrap_or_default(),
@@ -3230,8 +3201,7 @@ mod tests {
         ConsensusJobScheduler, CoordinatorHandoffDedup, LclAuditSampler, MAX_COMMANDS_PER_TURN,
         MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, PendingDurableAckGate,
         PreferredLclReconciliation, coordinator_publication_is_fresh, drain_bounded,
-        effective_validation_recovery_target, enqueue_recovered_txsets,
-        heartbeat_operating_mode_reassertion, history_acquire_allowed,
+        enqueue_recovered_txsets, heartbeat_operating_mode_reassertion, history_acquire_allowed,
         history_fetch_pack_requested, persist_completed_inbound_ledger,
         preferred_candidate_passes_switch_admission, process_completed_inbound_ledger,
         published_ledger_is_contiguous_with_lcl, reconcile_preferred_lcl_with_status_broadcaster,
@@ -3256,39 +3226,7 @@ mod tests {
     };
 
     #[test]
-    fn stable_validation_recovery_anchor_overrides_local_and_moving_preferences() {
-        let local = Uint256::from(10);
-        let anchor = Uint256::from(20);
-        let moving = Uint256::from(30);
-        let stable = Some((anchor, 20));
-
-        assert_eq!(
-            effective_validation_recovery_target(local, local, stable, false),
-            acquisition::LedgerTarget::new(anchor, Some(20))
-        );
-        assert_eq!(
-            effective_validation_recovery_target(moving, local, stable, false),
-            acquisition::LedgerTarget::new(anchor, Some(20)),
-            "moving candidate B must not replace stable anchor A"
-        );
-        assert_eq!(
-            effective_validation_recovery_target(moving, local, stable, true),
-            acquisition::LedgerTarget::new(moving, None),
-            "a resident ordinary preference must supersede the fallback anchor"
-        );
-        assert_eq!(
-            effective_validation_recovery_target(moving, local, None, false),
-            acquisition::LedgerTarget::new(moving, None)
-        );
-        assert_eq!(
-            effective_validation_recovery_target(moving, local, Some((local, 10)), false),
-            acquisition::LedgerTarget::new(moving, None),
-            "an anchor equal to the installed LCL is not a divergence"
-        );
-    }
-
-    #[test]
-    fn partial_resident_preference_cannot_supersede_stable_anchor() {
+    fn incomplete_ordinary_preference_is_not_admissible_for_switch() {
         let root_node = shamap::tree_node::SHAMapTreeNode::new_inner(1);
         root_node.set_child_hash(0, SHAMapHash::new(Uint256::from_array([0x22; 32])));
         root_node.update_hash();
@@ -3324,15 +3262,6 @@ mod tests {
         assert!(!preferred_candidate_passes_switch_admission(
             &master, hash, &partial, 1_000,
         ));
-        assert_eq!(
-            effective_validation_recovery_target(
-                hash,
-                Uint256::from_u64(10),
-                Some((Uint256::from_u64(20), 20)),
-                false,
-            ),
-            LedgerTarget::new(Uint256::from_u64(20), Some(20)),
-        );
     }
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;

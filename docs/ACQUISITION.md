@@ -36,9 +36,10 @@ The coordinator is not drained by NetworkOps. A wake-driven `acquisition-owner`
 thread advances bounded five-millisecond resident-tree slices and retains the
 exact continuation between slices. This is Quaxar's Rust-native equivalent of
 rippled's `gotLedgerData -> jtLEDGER_DATA` boundary: consensus remains
-responsive, while moving preferred hashes cannot discard the stable recovery
-session. Physical persistence remains globally limited to three concurrent
-jobs, matching rippled's ledger-data running limit.
+responsive, while useful background recovery work can survive a moving
+preferred hash. That retained session is advisory and cannot override the
+current preferred-LCL decision. Physical persistence remains globally limited
+to three concurrent jobs, matching rippled's ledger-data running limit.
 
 The crate is intentionally below `xrpld/app`: it depends on ledger-domain
 types, but not on overlay, NetworkOps, LedgerMaster, JobQueue, or concrete
@@ -159,28 +160,35 @@ The similarly named `InboundLedgersLocal` in `mod.rs` is only an RPC resumable
 request cache. It is not the network acquisition registry and must not be
 merged into this lifecycle.
 
-## Demand, preference, and the recovery anchor
+## Demand, preference, and advisory recovery
 
-Three identities are deliberately separate:
+Three responsibilities are deliberately separate:
 
-1. **Moving preferred policy**: NetworkOps and validations continually select
-   the best ledger for the current network view.
-2. **Stable recovery decision**: while syncing, NetworkOps retains the target
-   whose completion and installation can finish the current recovery.
+1. **Authoritative preferred-LCL decision**: NetworkOps applies the same
+   validation-trie/peer fallback policy as rippled for each accepted-boundary
+   check. This alone determines `networkClosed`, a consensus-parent change,
+   and whether a completed ledger is eligible for LCL installation.
+2. **Advisory validation-recovery acquisition**: the coordinator may retain a
+   bounded, provenance-backed fetch anchor so useful SHAMap work survives a
+   moving tip. It is phase-neutral and cannot override preferred-LCL policy,
+   demote the node, veto accepted work, or make the node propose on a different
+   parent.
 3. **Per-hash sessions**: independent ledger hashes can be acquired and reused
-   without replacing the stable anchor.
+   without making an advisory session authoritative.
 
-This prevents a network tip that advances every few seconds from resetting the
-only tree that is close to completion.
+This preserves useful in-flight tree work without letting an acquisition
+candidate become a second consensus policy owner.
 
 ```mermaid
 flowchart LR
     TV[Trusted validations] --> PREF[Moving preferred-LCL policy]
     PS[Peer status] --> PREF
-    PREF -->|priority and demand| SESS[Hash-keyed sessions]
-    PREF -->|serialized NetworkOps decision| ANCHOR[Stable recovery target]
+    PREF -->|authoritative missing target| SESS[Hash-keyed sessions]
+    ADVICE[Trusted validation recovery advice] -->|phase-neutral fetch only| SESS
+    ADVICE -->|bounded lifecycle| ANCHOR[Advisory recovery anchor]
     ANCHOR -->|same hash only| REFINE[Optional sequence refinement]
     SESS -->|complete durable candidate| CHECK[Accepted-boundary policy recheck]
+    PREF -->|must still select candidate| CHECK
     CHECK -->|candidate is still compatible| INSTALL[NetworkOps installs LCL]
     CHECK -->|policy moved elsewhere| REUSE[Keep ledger in history/cache/store]
     INSTALL --> TRACK[Tracking]
@@ -441,8 +449,8 @@ Before changing acquisition behavior, verify all of these invariants:
 2. One actor is the only mutable owner for each acquisition identity.
 3. Every asynchronous callback carries the exact acquisition identity and
    generation needed to reject stale work.
-4. One live actor is coalesced per hash; moving preference does not reset the
-   stable recovery anchor.
+4. One live actor is coalesced per hash. Advisory recovery may retain useful
+   fetch work, but it never overrides the current preferred-LCL result.
 5. Session cancellation cannot erase reusable immutable cache/storage data.
 6. Structural completion cannot bypass storage, exact completion delivery, or
    the accepted-boundary policy check.

@@ -197,24 +197,6 @@ fn coordinator_should_report_no_consensus_positions(positions: usize, _peer_coun
     positions == 0
 }
 
-fn validation_recovery_conflicts_with_parent(
-    recovery: Option<(Uint256, u32)>,
-    parent: Uint256,
-) -> bool {
-    recovery.is_some_and(|(hash, _)| hash != parent)
-}
-
-fn retain_stable_recovery_preference(
-    ordinary_preferred: Uint256,
-    local_parent: Uint256,
-    stable_recovery: Option<(Uint256, u32)>,
-) -> Uint256 {
-    stable_recovery
-        .map(|(hash, _)| hash)
-        .filter(|hash| *hash != local_parent)
-        .unwrap_or(ordinary_preferred)
-}
-
 /// The open-ledger view consensus reads current (not-yet-consensus-agreed)
 /// transactions from, and resets once a round is accepted.
 pub trait RclConsensusOpenLedgerSource {
@@ -921,23 +903,10 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             .ledger_master()
             .valid_ledger_seq();
         let wrapped = self.validated_view(prev_ledger);
-        let ordinary_preferred = RclConsensusValidationSource::preferred_min_seq(
+        let preferred = RclConsensusValidationSource::preferred_min_seq(
             &self.validations,
             &wrapped,
             min_valid_seq,
-        );
-        // A validation-recovery candidate is moving advice, but once the
-        // coordinator binds its provenance-backed anchor it is the exact
-        // GetConsL1 target. Retain it across timer checks until lifecycle
-        // reconciliation clears it; otherwise the trie-local preference can
-        // redirect generic consensus back onto the stale local branch.
-        let stable_recovery_anchor = self
-            .coordinator_inbound()
-            .and_then(|inbound| inbound.coordinator_validation_recovery_latch().0);
-        let preferred = retain_stable_recovery_preference(
-            ordinary_preferred,
-            prev_ledger.id(),
-            stable_recovery_anchor,
         );
         if mode != ConsensusMode::WrongLedger && preferred != *prev_ledger_id {
             // rippled RCLConsensus.cpp:313-316: consensusViewChange() demotes
@@ -1822,33 +1791,6 @@ impl AppConsensus {
     fn do_accept_and_start_next_round(&mut self, now: NetClockTimePoint, work: PendingAcceptWork) {
         let closed_seq = work.closed_seq;
         let root = self.adaptor.app_root.clone();
-        let parent_hash = *work.parent_ledger.header().hash.as_uint256();
-        let stable_recovery_anchor = self
-            .adaptor
-            .coordinator_inbound()
-            .and_then(|inbound| inbound.coordinator_validation_recovery_latch().0);
-        if validation_recovery_conflicts_with_parent(stable_recovery_anchor, parent_hash) {
-            let (target_hash, target_seq) =
-                stable_recovery_anchor.expect("conflict requires a stable recovery anchor");
-            // The round may have entered Accepted before the asynchronous
-            // validation recovery became stable. Discard the captured child
-            // before any build, store, broadcast, validation, open-ledger
-            // rebuild, or LCL mutation can extend the stale branch. Keep the
-            // runner Accepted: the NetworkOps strand consumes this handoff and
-            // immediately runs its sole endConsensus reconciliation owner,
-            // which demotes on the exact target and starts WrongLedger.
-            root.notify_consensus_event();
-            tracing::warn!(
-                target: "lcl_audit",
-                work_parent_hash = %parent_hash,
-                work_parent_seq = work.parent_ledger.header().seq,
-                recovery_target_hash = %target_hash,
-                recovery_target_seq = target_seq,
-                closed_seq,
-                "LCL_AUDIT stale accepted child vetoed pending exact endConsensus recovery"
-            );
-            return;
-        }
         // Quaxar's on_closed_ledger schedules a JtBatch that can otherwise
         // race the newly rebased OpenLedger before this accept finishes.
         // This reentrant gate is the local analogue of rippled's master/ledger
@@ -2027,8 +1969,7 @@ mod tests {
         coordinator_should_report_no_consensus_positions, decode_consensus_accept_transactions,
         disputed_relay_envelope, median_close_offset_seconds, pseudo_transaction_voting_enabled,
         reset_inbound_transactions_for_resolved_consensus_ledger,
-        retain_stable_recovery_preference, trusted_validation_quorum_reached,
-        update_operating_mode_after_accept, validation_recovery_conflicts_with_parent,
+        trusted_validation_quorum_reached, update_operating_mode_after_accept,
     };
     use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
     use crate::network::network_ops::{
@@ -2093,43 +2034,6 @@ mod tests {
             offset(100, &[(110, 2), (130, 1)]),
             10,
             "the self sample retains exactly one vote"
-        );
-    }
-
-    #[test]
-    fn different_validation_recovery_parent_vetoes_proposing_until_exact_match() {
-        let parent = Uint256::from(10);
-        assert!(!validation_recovery_conflicts_with_parent(None, parent));
-        assert!(!validation_recovery_conflicts_with_parent(
-            Some((parent, 10)),
-            parent
-        ));
-        assert!(validation_recovery_conflicts_with_parent(
-            Some((Uint256::from(11), 11)),
-            parent
-        ));
-    }
-
-    #[test]
-    fn get_prev_retains_stable_anchor_over_local_or_moving_preference() {
-        let local = Uint256::from(10);
-        let anchor = Uint256::from(20);
-        let moving = Uint256::from(30);
-        assert_eq!(
-            retain_stable_recovery_preference(local, local, Some((anchor, 20))),
-            anchor
-        );
-        assert_eq!(
-            retain_stable_recovery_preference(moving, local, Some((anchor, 20))),
-            anchor
-        );
-        assert_eq!(
-            retain_stable_recovery_preference(moving, local, None),
-            moving
-        );
-        assert_eq!(
-            retain_stable_recovery_preference(moving, local, Some((local, 10))),
-            moving
         );
     }
 
@@ -2396,7 +2300,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_recovery_anchor_vetoes_captured_accept_before_child_install() {
+    fn advisory_validation_recovery_does_not_veto_captured_accept() {
         let mut root = ApplicationRoot::new(0).expect("root should build");
         let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 1_000, false));
         let parent_hash = *parent.header().hash.as_uint256();
@@ -2417,15 +2321,19 @@ mod tests {
             failed_candidate_work(Arc::clone(&parent)),
         );
 
-        let closed = root.closed_ledger().expect("parent remains installed");
-        assert_eq!(*closed.header().hash.as_uint256(), parent_hash);
-        assert_eq!(closed.header().seq, 10, "no stale child may be installed");
-        assert_eq!(runner.prev_ledger_id(), parent_hash);
-        assert_eq!(runner.phase(), ConsensusPhase::Accepted);
+        let closed = root
+            .closed_ledger()
+            .expect("accepted-round handler should install its child");
+        assert_eq!(closed.header().seq, 11);
+        assert_ne!(
+            *closed.header().hash.as_uint256(),
+            parent_hash,
+            "advisory recovery must not veto ordinary consensus acceptance"
+        );
         assert_eq!(
-            root.status_rpc_state().current_ledger_index(),
-            None,
-            "accept veto runs before open-ledger/status mutation"
+            inbound.coordinator_validation_recovery_latch().0,
+            Some((recovery, 20)),
+            "the background acquisition remains owned independently of consensus"
         );
     }
 
@@ -2763,34 +2671,16 @@ impl ConsensusRunner for AppConsensus {
             self.adaptor.network_ops_mode_owner.set_unl_blocked(false);
         }
         let validating = self.adaptor.update_validating_for_round(&prev_ledger);
-        // A Full node may still have a locally usable parent while a strict
-        // validation-backed recovery tree for a different network ledger is
-        // being acquired. rippled's acquisition normally resolves this
-        // transient quickly; Quaxar's externalized tree build can span many
-        // rounds. Observe during that interval instead of proposing on a
-        // known stale local fork. Normal proposing resumes after exact durable
-        // recovery clears the latch or when the latch already names this
-        // round's concrete parent.
-        let local_parent_hash = *lcl.header().hash.as_uint256();
-        let validation_recovery = self
-            .adaptor
-            .coordinator_inbound()
-            .and_then(|inbound| inbound.coordinator_validation_recovery_latch().0);
-        let conflicting_validation_recovery =
-            validation_recovery_conflicts_with_parent(validation_recovery, local_parent_hash);
         let actual_proposing = proposing
             && validating
-            && !conflicting_validation_recovery
             && self.adaptor.network_ops_mode_owner.operating_mode()
                 == crate::network::network_ops::NetworkOpsOperatingMode::Full;
         tracing::debug!(
             target: "lcl_audit",
             requested_prev_ledger = %prev_ledger_id,
-            local_parent_hash = %lcl.header().hash,
             local_parent_seq = lcl.header().seq,
             requested_proposing = proposing,
             actual_proposing,
-            conflicting_validation_recovery,
             is_validator = self.adaptor.is_validator(),
             validating,
             standalone = self.adaptor.options.standalone,
