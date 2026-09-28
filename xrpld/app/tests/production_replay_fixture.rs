@@ -138,13 +138,12 @@ fn json_hash(value: &serde_json::Value, field: &str) -> Uint256 {
         .unwrap_or_else(|_| panic!("invalid 256-bit field {field}"))
 }
 
-/// Replays a canonical multi-transaction close over the captured sparse SLE
-/// subset supplied by the fixture. This deliberately validates serialized
-/// metadata rather than the state root: a sparse state fixture cannot reproduce
-/// the untouched branches of the canonical SHAMap, and the test does not prove
-/// that the fixture includes every parent SLE read by execution. It can still
-/// expose the first transaction whose ApplyStateTable/TxMeta behavior differs
-/// from rippled for that supplied view.
+/// Replays a canonical multi-transaction close over captured parent SLEs.
+/// Sparse fixtures can expose metadata mismatches for their supplied view but
+/// cannot reproduce the untouched branches of the canonical state SHAMap.
+/// A fixture directory may instead provide a full parent snapshot in ordered
+/// JSONL shards and set `full_parent_state`; that mode verifies both parent and
+/// child state roots as well as every serialized transaction metadata blob.
 #[test]
 #[ignore = "TEST ONLY: requires QUAXAR_SPARSE_REPLAY_JSONL"]
 fn sparse_production_close_matches_every_canonical_metadata_blob() {
@@ -157,23 +156,54 @@ fn sparse_production_close_matches_every_canonical_metadata_blob() {
         !rendered.contains(LIVE_NODE_STATE_COMPONENT),
         "sparse replay fixture must not reference live node state"
     );
-    let fixture_bytes = fs::metadata(&path)
-        .expect("stat sparse replay fixture")
-        .len();
+    let fixture_bytes = if path.is_dir() {
+        fixture_size(&path)
+    } else {
+        fs::metadata(&path)
+            .expect("stat sparse replay fixture")
+            .len()
+    };
     assert!(
         fixture_bytes <= MAX_FIXTURE_BYTES,
         "sparse replay fixture exceeds the test-only size cap"
     );
-    let file = fs::File::open(path).expect("open sparse replay fixture");
-    let mut lines = BufReader::new(file).lines();
-    let manifest: serde_json::Value = serde_json::from_str(
-        &lines
-            .next()
-            .expect("manifest row")
-            .expect("read manifest row"),
-    )
-    .expect("parse manifest row");
+    let (manifest, lines): (
+        serde_json::Value,
+        Box<dyn Iterator<Item = std::io::Result<String>>>,
+    ) = if path.is_dir() {
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(path.join("manifest.json")).expect("read replay manifest"),
+        )
+        .expect("parse replay manifest");
+        let mut state_paths = fs::read_dir(&path)
+            .expect("read replay fixture directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|entry| entry.extension().is_some_and(|ext| ext == "jsonl"))
+            .collect::<Vec<_>>();
+        state_paths.sort();
+        assert!(
+            !state_paths.is_empty(),
+            "fixture directory has no parent SLE shards"
+        );
+        let rows = state_paths.into_iter().flat_map(|state_path| {
+            BufReader::new(fs::File::open(state_path).expect("open parent SLE shard")).lines()
+        });
+        (manifest, Box::new(rows))
+    } else {
+        let file = fs::File::open(&path).expect("open sparse replay fixture");
+        let mut lines = BufReader::new(file).lines();
+        let manifest: serde_json::Value = serde_json::from_str(
+            &lines
+                .next()
+                .expect("manifest row")
+                .expect("read manifest row"),
+        )
+        .expect("parse manifest row");
+        (manifest, Box::new(lines))
+    };
     assert_eq!(manifest["kind"], "manifest");
+    let full_parent_state = manifest["full_parent_state"].as_bool() == Some(true);
 
     let parent_json = &manifest["parent"];
     let parent_seq = json_u64(parent_json, "ledger_index") as u32;
@@ -189,13 +219,20 @@ fn sparse_production_close_matches_every_canonical_metadata_blob() {
             .add_item(SHAMapNodeType::AccountState, SHAMapItem::new(key, bytes))
             .expect("unique sparse SLE");
     }
-    let state_map = SyncTree::from_root_with_type(
+    let mut state_map = SyncTree::from_root_with_type(
         state.root(),
         SHAMapType::State,
         false,
         parent_seq,
         SyncState::Modifying,
     );
+    if full_parent_state {
+        assert_eq!(
+            state_map.hash().as_uint256(),
+            &json_hash(parent_json, "account_hash"),
+            "captured SLEs must reconstruct the exact canonical parent state root"
+        );
+    }
     let tx_map = SyncTree::new_with_type(SHAMapType::Transaction, false, parent_seq);
     let header = LedgerHeader {
         seq: parent_seq,
@@ -280,4 +317,11 @@ fn sparse_production_close_matches_every_canonical_metadata_blob() {
         json_hash(child, "transaction_hash"),
         "canonical transaction/metadata SHAMap root"
     );
+    if full_parent_state {
+        assert_eq!(
+            *built.header().account_hash.as_uint256(),
+            json_hash(child, "account_hash"),
+            "canonical post-execution state SHAMap root"
+        );
+    }
 }

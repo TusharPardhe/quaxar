@@ -289,6 +289,8 @@ impl FlowStep for StepKind {
                     &unlimited_amount(in_asset),
                     &requested_out,
                     crate::domain::ripple_calc::book_step::BookStepOptions {
+                        pass: crate::domain::ripple_calc::book_step::BookStepPass::Reverse,
+                        reverse_input: None,
                         owner_pays_transfer_fee: *owner_pays_transfer_fee,
                         taker: Some(context.strand_src),
                         quality_threshold: context.quality_threshold,
@@ -413,6 +415,11 @@ impl FlowStep for StepKind {
                     &requested_in,
                     &reverse_out,
                     crate::domain::ripple_calc::book_step::BookStepOptions {
+                        pass: crate::domain::ripple_calc::book_step::BookStepPass::Forward,
+                        reverse_input: Some(normalize_amount_asset(
+                            reverse_cache.input.amount(),
+                            in_asset,
+                        )),
                         owner_pays_transfer_fee: *owner_pays_transfer_fee,
                         taker: Some(context.strand_src),
                         quality_threshold: context.quality_threshold,

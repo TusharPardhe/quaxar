@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -40,22 +40,16 @@ pub enum Tracking {
     Diverged,
 }
 
-impl Tracking {
-    fn as_u8(self) -> u8 {
-        match self {
-            Self::Unknown => 0,
-            Self::Converged => 1,
-            Self::Diverged => 2,
-        }
-    }
+#[derive(Clone, Copy)]
+struct TrackingState {
+    state: Tracking,
+    since: Instant,
+}
 
-    fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::Converged,
-            2 => Self::Diverged,
-            _ => Self::Unknown,
-        }
-    }
+#[derive(Clone, Copy)]
+struct TrackingDeadlines {
+    diverged: Duration,
+    unknown: Duration,
 }
 
 #[derive(Default)]
@@ -117,10 +111,11 @@ pub struct PeerImp {
     features: RwLock<HashSet<ProtocolFeature>>,
     protocol_version: RwLock<ProtocolVersion>,
     last_status: Mutex<Option<i32>>,
-    tracking: AtomicU8,
-    /// When the peer entered its current tracking state. `onTimer` uses this
-    /// for the outbound Not Useful deadlines.
-    tracking_since: Mutex<Instant>,
+    /// `PeerImp.cpp` updates tracking and its entry time under one lock.
+    /// Keeping the pair together prevents the timer from observing a new
+    /// state with the previous state's age.
+    tracking: Mutex<TrackingState>,
+    tracking_deadlines: Mutex<TrackingDeadlines>,
     /// One active timer is owned by an activated peer and cancelled during
     /// overlay deactivation.
     lifecycle_timer: Mutex<Option<JoinHandle<()>>>,
@@ -258,8 +253,14 @@ impl PeerImp {
             features: RwLock::new(HashSet::new()),
             protocol_version: RwLock::new(ProtocolVersion::new(2, 2)),
             last_status: Mutex::new(None),
-            tracking: AtomicU8::new(Tracking::Unknown.as_u8()),
-            tracking_since: Mutex::new(Instant::now()),
+            tracking: Mutex::new(TrackingState {
+                state: Tracking::Unknown,
+                since: Instant::now(),
+            }),
+            tracking_deadlines: Mutex::new(TrackingDeadlines {
+                diverged: MAX_DIVERGED_TIME,
+                unknown: MAX_UNKNOWN_TIME,
+            }),
             lifecycle_timer: Mutex::new(None),
             large_sendq: AtomicUsize::new(0),
             outstanding_ping: Mutex::new(None),
@@ -369,13 +370,20 @@ impl PeerImp {
     }
 
     fn set_tracking(&self, tracking: Tracking) {
-        let previous = Tracking::from_u8(self.tracking.swap(tracking.as_u8(), Ordering::AcqRel));
-        if previous != tracking {
-            *self
-                .tracking_since
-                .lock()
-                .expect("peer tracking timer lock") = Instant::now();
+        let mut state = self.tracking.lock().expect("peer tracking state lock");
+        if state.state != tracking {
+            *state = TrackingState {
+                state: tracking,
+                since: Instant::now(),
+            };
         }
+    }
+
+    pub fn set_tracking_deadlines(&self, diverged: Duration, unknown: Duration) {
+        *self
+            .tracking_deadlines
+            .lock()
+            .expect("peer tracking deadlines lock") = TrackingDeadlines { diverged, unknown };
     }
 
     /// Return a safe snapshot of accepted outbound messages. A live
@@ -407,15 +415,16 @@ impl PeerImp {
         }
 
         if !self.inbound {
-            let state = self.tracking();
-            let state_age = self
-                .tracking_since
+            let tracking = *self.tracking.lock().expect("peer tracking state lock");
+            let deadlines = *self
+                .tracking_deadlines
                 .lock()
-                .expect("peer tracking timer lock")
-                .elapsed();
+                .expect("peer tracking deadlines lock");
+            let state = tracking.state;
+            let state_age = tracking.since.elapsed();
             // rippled uses strict > (duration > maxDivergedTime/maxUnknownTime)
-            let expired = matches!(state, Tracking::Diverged) && state_age > MAX_DIVERGED_TIME
-                || matches!(state, Tracking::Unknown) && state_age > MAX_UNKNOWN_TIME;
+            let expired = matches!(state, Tracking::Diverged) && state_age > deadlines.diverged
+                || matches!(state, Tracking::Unknown) && state_age > deadlines.unknown;
             if expired {
                 tracing::warn!(
                     target: "overlay",
@@ -749,7 +758,10 @@ impl PeerImp {
     }
 
     pub fn tracking(&self) -> Tracking {
-        Tracking::from_u8(self.tracking.load(Ordering::Relaxed))
+        self.tracking
+            .lock()
+            .expect("peer tracking state lock")
+            .state
     }
 
     pub fn check_tracking(&self, validation_seq: u32) {
@@ -1453,6 +1465,24 @@ mod tests {
         assert!(peer.is_squelched(public));
         peer.remove_squelch(public);
         assert!(!peer.is_squelched(public));
+    }
+
+    #[test]
+    fn configured_diverged_deadline_disconnects_after_divergence() {
+        let secret = SecretKey::from_bytes([0x19; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let peer = PeerImp::new(
+            19,
+            "127.0.0.1:51244".parse().expect("endpoint"),
+            public,
+            "configured-tracking-deadline",
+        );
+        peer.set_tracking_deadlines(Duration::ZERO, Duration::from_secs(600));
+        peer.check_tracking_pair(500, 1);
+
+        peer.on_timer_for_test();
+
+        assert!(peer.disconnect_requested());
     }
 
     #[test]

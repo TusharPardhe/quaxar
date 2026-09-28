@@ -69,6 +69,10 @@ pub struct Setup {
     pub vp_reduce_relay_base_squelch_enabled: bool,
     pub vp_reduce_relay_max_selected_peers: u16,
     pub reduce_relay_wait: Duration,
+    /// `[overlay] max_diverged_time`, matching rippled's 300-second default.
+    pub max_diverged_time: Duration,
+    /// `[overlay] max_unknown_time`, matching rippled's 600-second default.
+    pub max_unknown_time: Duration,
 }
 
 impl Default for Setup {
@@ -94,6 +98,8 @@ impl Default for Setup {
             vp_reduce_relay_base_squelch_enabled: true,
             vp_reduce_relay_max_selected_peers: crate::slot::MAX_SELECTED_PEERS,
             reduce_relay_wait: crate::slot::WAIT_ON_BOOTUP,
+            max_diverged_time: Duration::from_secs(300),
+            max_unknown_time: Duration::from_secs(600),
         }
     }
 }

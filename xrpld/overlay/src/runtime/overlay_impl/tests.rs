@@ -167,6 +167,19 @@ fn directional_default_setup() -> Setup {
 }
 
 #[test]
+fn all_peer_tracking_uses_each_peer_advertised_ledger() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let tracked = peer(305, 205);
+    tracked.record_ledger(Uint256::from_u64(500), 500);
+    tracked.set_ledger_range(500, 500);
+    assert!(overlay.activate(Arc::clone(&tracked)));
+
+    overlay.check_tracking(100);
+
+    assert_eq!(tracked.tracking(), Tracking::Diverged);
+}
+
+#[test]
 fn default_rippled_budget_inbound_exhaustion_does_not_block_outbound() {
     let overlay =
         OverlayImpl::new(directional_default_setup(), Arc::new(TestHandoff)).expect("overlay");

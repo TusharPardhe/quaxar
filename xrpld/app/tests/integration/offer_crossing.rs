@@ -161,6 +161,107 @@ fn fok_buy_full_output_uses_less_than_send_max_and_creates_trust_line() {
     run_fok_buy_full_output_below_send_max(false);
 }
 
+#[test]
+fn sell_fok_full_cross_succeeds_without_residual() {
+    let maker = acct(0x41);
+    let taker = acct(0x42);
+    let issuer = acct(0x43);
+    let usd = usd_currency();
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(maker, 10_000_000_000, 1, 0),
+            account_root(taker, 10_000_000_000, 1, 0),
+            account_root(issuer, 10_000_000_000, 0, protocol::lsfDefaultRipple),
+            trust_line(maker, issuer, usd, 100, 10_000, 0),
+            trust_line(taker, issuer, usd, 0, 10_000, 0),
+        ],
+        vec!["fixFillOrKill", "fixReducedOffersV2"],
+    );
+    let mut view = new_view(ledger);
+
+    let resting = offer_tx(maker, xrp(1_000_000), iou(issuer, usd, 100), 1);
+    assert_eq!(
+        full_apply(&mut view, &resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let before = xrp_balance(&view, taker);
+    let sell_fok = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), iou(issuer, usd, 100));
+        tx.set_field_amount(sf("sfTakerGets"), xrp(1_000_000));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell | protocol::tfFillOrKill);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &sell_fok, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "a full sell FoK cross must not be converted to tecKILLED"
+    );
+    assert_eq!(before - xrp_balance(&view, taker) - 10, 1_000_000);
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(taker), 1))
+            .expect("read sell FoK offer")
+            .is_none(),
+        "full sell FoK must leave a zero residual offer"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(maker), 1))
+            .expect("read fully crossed resting offer")
+            .is_none()
+    );
+}
+
+#[test]
+fn sell_fok_partial_cross_remains_killed() {
+    let maker = acct(0x51);
+    let taker = acct(0x52);
+    let issuer = acct(0x53);
+    let usd = usd_currency();
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(maker, 10_000_000_000, 1, 0),
+            account_root(taker, 10_000_000_000, 1, 0),
+            account_root(issuer, 10_000_000_000, 0, protocol::lsfDefaultRipple),
+            trust_line(maker, issuer, usd, 50, 10_000, 0),
+            trust_line(taker, issuer, usd, 0, 10_000, 0),
+        ],
+        vec!["fixFillOrKill", "fixReducedOffersV2"],
+    );
+    let mut view = new_view(ledger);
+
+    let resting = offer_tx(maker, xrp(500_000), iou(issuer, usd, 50), 1);
+    assert_eq!(
+        full_apply(&mut view, &resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let sell_fok = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), iou(issuer, usd, 100));
+        tx.set_field_amount(sf("sfTakerGets"), xrp(1_000_000));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell | protocol::tfFillOrKill);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &sell_fok, TxType::OFFER_CREATE),
+        Ter::TEC_KILLED,
+        "genuinely partial sell FoK liquidity must remain killed"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(taker), 1))
+            .expect("read killed sell FoK offer")
+            .is_none()
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(maker), 1))
+            .expect("read maker offer after killed sell FoK")
+            .is_some(),
+        "the killed crossing must not commit its partial fill"
+    );
+}
+
 /// `BookStep::execOffer` applies issuer authorization to synthetic AMM offers
 /// as well as CLOB offers.  The AMM pool may exist before its trust line is
 /// authorized; such a pool must not be crossed by an OfferCreate.

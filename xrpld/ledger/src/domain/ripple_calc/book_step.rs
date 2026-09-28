@@ -368,9 +368,21 @@ pub struct BookStepResult {
     pub ter: Ter,
 }
 
+/// Direction of a BookStep evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookStepPass {
+    Forward,
+    Reverse,
+    /// Reconciliation-only: apply `limitStepOut` without a following input cap.
+    OutputOnly,
+}
+
 /// Exact execution policy supplied by a flow `BookStep`.
 #[derive(Debug, Clone)]
 pub struct BookStepOptions<'a> {
+    pub pass: BookStepPass,
+    /// Reverse-pass input cache used only by forward reconciliation.
+    pub reverse_input: Option<STAmount>,
     pub owner_pays_transfer_fee: bool,
     pub taker: Option<&'a AccountID>,
     pub quality_threshold: Option<Quality>,
@@ -411,6 +423,10 @@ pub fn execute_book_step<V: ApplyView>(
         max_in,
         max_out,
         BookStepOptions {
+            // This compatibility entry point historically used the
+            // output-limited consumption order of `revImp`.
+            pass: BookStepPass::Reverse,
+            reverse_input: None,
             owner_pays_transfer_fee,
             taker,
             quality_threshold,
@@ -436,6 +452,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     max_out: &STAmount,
     options: BookStepOptions<'_>,
 ) -> BookStepResult {
+    let reverse_input = options.reverse_input.as_ref().unwrap_or(max_in);
     let owner_pays_transfer_fee = options.owner_pays_transfer_fee;
     let taker = options.taker;
     let quality_threshold = options.quality_threshold;
@@ -1072,12 +1089,11 @@ pub fn execute_book_step_with_options<V: ApplyView>(
 
             offer_attempted = true;
 
-            // Compute consumption amounts with transfer rates (reference forEachOffer parity).
-            // A reverse BookStep must limit the final offer by the outstanding
-            // requested output before it derives the required input. See
-            // rippled BookStep.cpp `limitStepOut` and `revImp`.
+            // Forward evaluation is input-limited before its output is reconciled
+            // to the reverse cache. Reverse evaluation remains output-limited.
             let remaining_out = max_out.clone() - total_out.clone();
-            let consumption = compute_offer_consumption(
+            let mut consumption = compute_offer_consumption(
+                options.pass,
                 &remaining_in,
                 &remaining_out,
                 &taker_pays,
@@ -1091,6 +1107,57 @@ pub fn execute_book_step_with_options<V: ApplyView>(
 
             if consumption.step_in.signum() <= 0 || consumption.step_out.signum() <= 0 {
                 break;
+            }
+
+            let mut reconciled_to_reverse_cache = false;
+            if options.pass == BookStepPass::Forward {
+                let mut candidate_ins = saved_ins.clone();
+                let mut candidate_outs = saved_outs.clone();
+                insert_sorted_amount(&mut candidate_ins, consumption.step_in.clone());
+                insert_sorted_amount(&mut candidate_outs, consumption.step_out.clone());
+                let candidate_in = sum_sorted_amounts(&candidate_ins, max_in);
+                let candidate_out = sum_sorted_amounts(&candidate_outs, max_out);
+
+                if candidate_out > *max_out && candidate_in <= *reverse_input {
+                    // Mirror rippled BookStep.cpp fwdImp lines 1261-1305:
+                    // limitStepOut against the cached remaining output, then
+                    // adopt only if it requires all remaining forward input.
+                    // Otherwise retain the ordinary forward saved amounts.
+                    let reverse_limited = compute_offer_consumption(
+                        BookStepPass::OutputOnly,
+                        &remaining_in,
+                        &remaining_out,
+                        &taker_pays,
+                        &taker_gets,
+                        &owner_funds,
+                        offer_quality,
+                        tr_in,
+                        tr_out,
+                        fix_reduced_offers_v2,
+                    );
+                    if reverse_limited.step_in == remaining_in {
+                        consumption = reverse_limited;
+                        // rippled's fwdImp does not keep the rounded result
+                        // returned by limitStepOut as the step accounting. Once
+                        // the reverse-cache reconciliation is accepted, it
+                        // explicitly records the exact remaining input/output
+                        // (`stpAdjAmt.in = remainingIn` and
+                        // `stpAdjAmt.out = remainingOut`). Preserve the same
+                        // boundary: retaining the rounded `step_out` can leave
+                        // a tiny residual and make OfferCreate::tfFillOrKill
+                        // report a complete fill when rippled returns
+                        // tecKILLED.
+                        consumption.reconcile_step_to_cache(&remaining_in, &remaining_out);
+                        saved_ins.clear();
+                        saved_ins.push(max_in.clone());
+                        saved_outs.clear();
+                        saved_outs.push(max_out.clone());
+                        total_in = max_in.clone();
+                        total_out = max_out.clone();
+                        remaining_in = max_in.zeroed();
+                        reconciled_to_reverse_cache = true;
+                    }
+                }
             }
 
             // Execute trade: transfer assets between offer owner and issuers
@@ -1136,11 +1203,13 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 )));
             }
 
-            insert_sorted_amount(&mut saved_ins, consumption.step_in);
-            insert_sorted_amount(&mut saved_outs, consumption.step_out);
-            total_in = sum_sorted_amounts(&saved_ins, max_in);
-            total_out = sum_sorted_amounts(&saved_outs, max_out);
-            remaining_in = max_in.clone() - total_in.clone();
+            if !reconciled_to_reverse_cache {
+                insert_sorted_amount(&mut saved_ins, consumption.step_in);
+                insert_sorted_amount(&mut saved_outs, consumption.step_out);
+                total_in = sum_sorted_amounts(&saved_ins, max_in);
+                total_out = sum_sorted_amounts(&saved_outs, max_out);
+                remaining_in = max_in.clone() - total_in.clone();
+            }
             offers_consumed += 1;
         }
     }
@@ -2397,6 +2466,16 @@ struct OfferConsumption {
     offer_out: STAmount,
 }
 
+impl OfferConsumption {
+    /// Match rippled fwdImp's accepted reverse-cache reconciliation, which
+    /// pins the step amounts to the exact remaining cache boundary after
+    /// limitStepOut has proven that the required input is exact.
+    fn reconcile_step_to_cache(&mut self, remaining_in: &STAmount, remaining_out: &STAmount) {
+        self.step_in = remaining_in.clone();
+        self.step_out = remaining_out.clone();
+    }
+}
+
 /// Compute how much of an offer to consume, applying transfer rates.
 ///   stpAmt.in = mulRatio(ofrAmt.in, ofrInRate, QUALITY_ONE, true)
 ///   ownerGives = mulRatio(ofrAmt.out, ofrOutRate, QUALITY_ONE,
@@ -2405,6 +2484,7 @@ struct OfferConsumption {
 ///   If remaining_out < stpAmt.out: recompute from requested output
 ///   If remaining_in < stpAmt.in: recompute from remaining input
 fn compute_offer_consumption(
+    pass: BookStepPass,
     remaining_in: &STAmount,
     remaining_out: &STAmount,
     taker_pays: &STAmount,
@@ -2442,40 +2522,41 @@ fn compute_offer_consumption(
         stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
     }
 
-    // reference: BookStep.cpp `limitStepOut` in `revImp`. The reverse pass
-    // receives an unbounded input and must not consume more than the output
-    // requested by the following step. `offer.limitOut(..., true)` delegates
-    // to Quality::ceilOut, which uses mulRound with round-away-from-zero.
-    // Do not use cross_type_scale here: its unchecked native conversion can
-    // construct an out-of-range XRP STAmount before the bounded offer input
-    // has been derived.
-    if *remaining_out < stp_out {
-        let offer_amounts = Amounts::new(actual_ofr_in.clone(), actual_ofr_out.clone());
-        let clipped = offer_quality.ceil_out_strict(&offer_amounts, remaining_out, true);
-        actual_ofr_in = clipped.r#in;
-        actual_ofr_out = clipped.out;
-        stp_out = actual_ofr_out.clone();
-        owner_gives = offer_owner_gives(&stp_out, transfer_rate_out);
-        stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
-    }
-
-    // reference: limitStepIn if remaining_in < stpAmt.in
-    if *remaining_in < stp_in {
-        stp_in = remaining_in.clone();
-        let in_lmt = mul_ratio_amount(&stp_in, QUALITY_ONE, transfer_rate_in, false);
-        let offer_amounts = Amounts::new(actual_ofr_in, actual_ofr_out);
-        let limited = if fix_reduced_offers_v2 {
-            // TOffer::limitIn selects the strict implementation under the
-            // amendment and deliberately rounds down. This one-ulp behavior
-            // is consensus-significant for fractional IOU offers.
-            offer_quality.ceil_in_strict(&offer_amounts, &in_lmt, false)
-        } else {
-            offer_quality.ceil_in(&offer_amounts, &in_lmt)
-        };
-        actual_ofr_in = limited.r#in;
-        actual_ofr_out = limited.out;
-        stp_out = actual_ofr_out.clone();
-        owner_gives = offer_owner_gives(&stp_out, transfer_rate_out);
+    // rippled revImp limits output then input. fwdImp limits input only;
+    // reconciliation invokes only limitStepOut before comparing required input.
+    let limit_order: &[bool] = match pass {
+        BookStepPass::Forward => &[false],
+        BookStepPass::Reverse => &[true, false],
+        BookStepPass::OutputOnly => &[true],
+    };
+    for &output_limit in limit_order {
+        if output_limit {
+            if *remaining_out < stp_out {
+                let offer_amounts = Amounts::new(actual_ofr_in.clone(), actual_ofr_out.clone());
+                let clipped = offer_quality.ceil_out_strict(&offer_amounts, remaining_out, true);
+                actual_ofr_in = clipped.r#in;
+                actual_ofr_out = clipped.out;
+                stp_out = actual_ofr_out.clone();
+                owner_gives = offer_owner_gives(&stp_out, transfer_rate_out);
+                stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
+            }
+        } else if *remaining_in < stp_in {
+            stp_in = remaining_in.clone();
+            let in_lmt = mul_ratio_amount(&stp_in, QUALITY_ONE, transfer_rate_in, false);
+            let offer_amounts = Amounts::new(actual_ofr_in.clone(), actual_ofr_out.clone());
+            let limited = if fix_reduced_offers_v2 {
+                // TOffer::limitIn selects the strict implementation under the
+                // amendment and deliberately rounds down. This one-ulp behavior
+                // is consensus-significant for fractional IOU offers.
+                offer_quality.ceil_in_strict(&offer_amounts, &in_lmt, false)
+            } else {
+                offer_quality.ceil_in(&offer_amounts, &in_lmt)
+            };
+            actual_ofr_in = limited.r#in;
+            actual_ofr_out = limited.out;
+            stp_out = actual_ofr_out.clone();
+            owner_gives = offer_owner_gives(&stp_out, transfer_rate_out);
+        }
     }
 
     OfferConsumption {
@@ -3756,6 +3837,7 @@ mod tests {
             ),
         ));
         let consumption = compute_offer_consumption(
+            BookStepPass::Reverse,
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(3_300_000_000)),
             &STAmount::from_iou_amount(
                 sf("sfAmount"),
@@ -3804,6 +3886,7 @@ mod tests {
             taker_gets.clone(),
         ));
         let consumption = compute_offer_consumption(
+            BookStepPass::Forward,
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(25_000_000)),
             &taker_gets,
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(50_000_000)),
@@ -3847,6 +3930,7 @@ mod tests {
         assert_eq!(recomputed_quality.rate().text(), "11489999.99999987");
 
         let consumption = compute_offer_consumption(
+            BookStepPass::Forward,
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(600_000)),
             &taker_gets,
             &taker_pays,
