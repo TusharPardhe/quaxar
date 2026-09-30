@@ -300,20 +300,44 @@ pub enum ConsensusCommand {
 #[derive(Clone)]
 pub struct ConsensusIngress {
     tx: std::sync::mpsc::SyncSender<ConsensusCommand>,
+    // Wakes the NetworkOps strand owner immediately after a command is
+    // enqueued. Without this, an inbound proposal/tx-set waits up to the
+    // strand's 50ms idle timeout before it is drained, which can push a peer
+    // proposal past a round-close boundary and leave the next round with zero
+    // visible proposers. rippled delivers a trusted proposal synchronously to
+    // `consensus_.peerProposal` (NetworkOPs.cpp:2280); this wake is the strand
+    // equivalent of that immediate hand-off.
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ConsensusIngress {
     pub(crate) fn bounded(capacity: usize) -> (Self, std::sync::mpsc::Receiver<ConsensusCommand>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
-        (Self { tx }, rx)
+        (Self { tx, wake: None }, rx)
+    }
+
+    /// Install the strand wake callback. Called once during strand spawn.
+    pub(crate) fn set_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.wake = Some(wake);
+    }
+
+    fn notify_owner(&self) {
+        if let Some(wake) = &self.wake {
+            wake();
+        }
     }
 
     /// Trusted proposals apply backpressure rather than being dropped while
     /// the consensus owner is busy.
     pub fn publish_trusted_proposal(&self, proposal: overlay::inbound::QueuedProposal) -> bool {
-        self.tx
+        let sent = self
+            .tx
             .send(ConsensusCommand::PeerProposal(proposal))
-            .is_ok()
+            .is_ok();
+        if sent {
+            self.notify_owner();
+        }
+        sent
     }
 
     /// A failed non-blocking completion handoff remains durable in
@@ -331,19 +355,32 @@ impl ConsensusIngress {
         hash: basics::base_uint::Uint256,
         set: Arc<shamap::sync::SyncTree>,
     ) -> Result<(), std::sync::mpsc::TrySendError<ConsensusCommand>> {
-        self.tx
-            .try_send(ConsensusCommand::TxSetComplete { hash, set })
+        let result = self
+            .tx
+            .try_send(ConsensusCommand::TxSetComplete { hash, set });
+        if result.is_ok() {
+            self.notify_owner();
+        }
+        result
     }
 
     pub fn publish_heartbeat(&self) -> bool {
-        self.tx.try_send(ConsensusCommand::Heartbeat).is_ok()
+        let sent = self.tx.try_send(ConsensusCommand::Heartbeat).is_ok();
+        if sent {
+            self.notify_owner();
+        }
+        sent
     }
 
     pub(crate) fn try_send(
         &self,
         command: ConsensusCommand,
     ) -> Result<(), std::sync::mpsc::TrySendError<ConsensusCommand>> {
-        self.tx.try_send(command)
+        let result = self.tx.try_send(command);
+        if result.is_ok() {
+            self.notify_owner();
+        }
+        result
     }
 
     pub(crate) fn sender(&self) -> std::sync::mpsc::SyncSender<ConsensusCommand> {
