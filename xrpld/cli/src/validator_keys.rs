@@ -157,28 +157,64 @@ pub fn run_create_token(secret_flag: Option<&str>) {
     let master_public = protocol::derive_public_key(protocol::KeyType::Secp256k1, &master_secret)
         .expect("master public key derivation should succeed");
 
-    // Generate ephemeral keypair
+    // Generate ephemeral (signing) keypair.
     let eph_seed = protocol::seed::random_seed();
     let eph_secret = protocol::generate_root_secret_key(protocol::KeyType::Secp256k1, &eph_seed)
         .expect("ephemeral key generation should succeed");
     let eph_public = protocol::derive_public_key(protocol::KeyType::Secp256k1, &eph_secret)
         .expect("ephemeral public key derivation should succeed");
 
-    // Build manifest payload: sequence + master_public + ephemeral_public
+    // Build the manifest as a typed STObject, matching rippled's manifest
+    // wire format and Quaxar's `deserialize_manifest`/`manifest_template`:
+    //   sfSequence, sfPublicKey (master), sfSigningPubKey (ephemeral),
+    //   sfSignature (ephemeral over HashPrefix::Manifest + unsigned fields),
+    //   sfMasterSignature (master over the same).
     let sequence: u32 = 1;
-    let mut manifest_data = Vec::new();
-    manifest_data.extend_from_slice(&sequence.to_be_bytes());
-    manifest_data.extend_from_slice(master_public.as_bytes());
-    manifest_data.extend_from_slice(eph_public.as_bytes());
+    let mut manifest = protocol::STObject::new(protocol::sf_generic());
+    manifest.set_field_u32(protocol::get_field_by_symbol("sfSequence"), sequence);
+    manifest.set_field_vl(
+        protocol::get_field_by_symbol("sfPublicKey"),
+        master_public.as_bytes(),
+    );
+    manifest.set_field_vl(
+        protocol::get_field_by_symbol("sfSigningPubKey"),
+        eph_public.as_bytes(),
+    );
 
-    let signature = protocol::sign::sign(&master_public, &master_secret, &manifest_data)
-        .expect("signing should succeed");
+    // The signed bytes are HashPrefix::Manifest followed by the manifest fields
+    // excluding the signature fields (matches STObject::add_without_signing_fields).
+    let signing_bytes = |st: &protocol::STObject| -> Vec<u8> {
+        let mut serializer = protocol::Serializer::default();
+        serializer.add32_prefix(protocol::HashPrefix::Manifest);
+        st.add_without_signing_fields(&mut serializer);
+        serializer.data().to_vec()
+    };
 
-    let mut token_data = manifest_data;
-    token_data.extend_from_slice(&signature);
+    let eph_signature = protocol::sign::sign(&eph_public, &eph_secret, &signing_bytes(&manifest))
+        .expect("ephemeral manifest signing should succeed");
+    manifest.set_field_vl(protocol::get_field_by_symbol("sfSignature"), &eph_signature);
+
+    let master_signature =
+        protocol::sign::sign(&master_public, &master_secret, &signing_bytes(&manifest))
+            .expect("master manifest signing should succeed");
+    manifest.set_field_vl(
+        protocol::get_field_by_symbol("sfMasterSignature"),
+        &master_signature,
+    );
+
+    let serialized_manifest = manifest.get_serializer().data().to_vec();
 
     use base64::Engine;
-    let token = base64::engine::general_purpose::STANDARD.encode(&token_data);
+    let manifest_b64 = base64::engine::general_purpose::STANDARD.encode(&serialized_manifest);
+
+    // The config [validator_token] value is base64(JSON), where the JSON carries
+    // the base64 manifest and the hex ephemeral (validation) secret key. This is
+    // exactly what `load_validator_token` decodes.
+    let token_json = json!({
+        "validation_secret_key": hex::encode_upper(eph_secret.as_bytes()),
+        "manifest": manifest_b64,
+    });
+    let token = base64::engine::general_purpose::STANDARD.encode(token_json.to_string().as_bytes());
 
     println!("  {} Validator token created", green().apply_to("●"));
     println!();

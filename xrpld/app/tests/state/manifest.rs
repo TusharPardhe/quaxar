@@ -483,3 +483,35 @@ fn validator_token_loader_trims_and_decodes_cpp_vector() {
     assert!(!reencoded.is_empty());
     assert!(load_validator_token(vec!["bad token".to_owned()]).is_none());
 }
+
+#[test]
+fn create_token_json_wrapped_format_round_trips_through_loader() {
+    // Mirrors what `quaxar validator-keys create-token` emits: a signed manifest
+    // STObject, base64-wrapped inside a JSON object carrying the hex ephemeral
+    // (validation) secret key, then base64-encoded as the [validator_token] value.
+    // This locks the CLI output format to what `load_validator_token` accepts.
+    let (st, _master_pub, _master_sec, _signing_pub, signing_sec) = build_manifest_object(
+        KeyType::Secp256k1,
+        11,
+        KeyType::Secp256k1,
+        21,
+        1,
+        None,
+        true,
+        true,
+    );
+    let serialized_manifest = serialize(&st);
+    let manifest_b64 = base64_encode(&serialized_manifest);
+    let token_json = serde_json::json!({
+        "validation_secret_key": signing_sec.as_bytes().iter().map(|b| format!("{b:02X}")).collect::<String>(),
+        "manifest": manifest_b64,
+    })
+    .to_string();
+    let token = base64_encode(token_json.as_bytes());
+
+    let loaded = load_validator_token(vec![token]).expect("create-token format should decode");
+    assert_eq!(loaded.manifest, manifest_b64);
+    let manifest = deserialize_manifest(&basics::base64::base64_decode(&loaded.manifest))
+        .expect("decoded manifest should deserialize");
+    assert!(manifest.verify(), "round-tripped manifest signatures must verify");
+}
