@@ -11,7 +11,7 @@ use protocol::{
 
 #[test]
 fn generated_jss_and_messages_surfaces_match_current_cpp_shape() {
-    assert_eq!(json_static_strings::ALL.len(), 623);
+    assert_eq!(json_static_strings::ALL.len(), 624);
     assert_eq!(
         json_static_strings::AcceptedCredentials,
         "AcceptedCredentials"

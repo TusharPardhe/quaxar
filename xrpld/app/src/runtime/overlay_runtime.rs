@@ -1315,6 +1315,8 @@ pub fn build_overlay_setup(config: &BasicConfig) -> Result<Setup, String> {
         vp_reduce_relay_base_squelch_enabled: false,
         vp_reduce_relay_max_selected_peers: 5,
         reduce_relay_wait: DEFAULT_REDUCE_RELAY_WAIT,
+        max_diverged_time: Duration::from_secs(300),
+        max_unknown_time: Duration::from_secs(600),
     };
 
     parse_peer_limit_sections(config, &mut setup)?;
@@ -1651,7 +1653,34 @@ fn parse_overlay_section(section: &Section, setup: &mut Setup) -> Result<(), Str
         }
         setup.public_ip = Some(parsed);
     }
+    if let Some(max_diverged_time) = raw(section, "max_diverged_time") {
+        setup.max_diverged_time =
+            parse_tracking_deadline(max_diverged_time, "max_diverged_time", 60, 900)?;
+    }
+
+    if let Some(max_unknown_time) = raw(section, "max_unknown_time") {
+        setup.max_unknown_time =
+            parse_tracking_deadline(max_unknown_time, "max_unknown_time", 300, 1_800)?;
+    }
+
     Ok(())
+}
+
+fn parse_tracking_deadline(
+    value: String,
+    key: &str,
+    minimum_seconds: u64,
+    maximum_seconds: u64,
+) -> Result<Duration, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| format!("Invalid [overlay] {key}: must be a whole number of seconds"))?;
+    if !(minimum_seconds..=maximum_seconds).contains(&seconds) {
+        return Err(format!(
+            "Invalid [overlay] {key}: must be between {minimum_seconds} and {maximum_seconds} seconds"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn parse_crawl_section(section: &Section, setup: &mut Setup) -> Result<(), String> {
@@ -1950,6 +1979,27 @@ mod tests {
         let enabled =
             build_overlay_setup(&config("[overlay]\nverify_endpoints = 1\n")).expect("true");
         assert!(enabled.verify_endpoints);
+    }
+
+    #[test]
+    fn overlay_setup_parses_rippled_tracking_deadlines() {
+        let setup = build_overlay_setup(&config(
+            "[overlay]\nmax_diverged_time = 90\nmax_unknown_time = 1200\n",
+        ))
+        .expect("valid tracking deadlines");
+        assert_eq!(setup.max_diverged_time, Duration::from_secs(90));
+        assert_eq!(setup.max_unknown_time, Duration::from_secs(1_200));
+
+        let error = match build_overlay_setup(&config("[overlay]\nmax_diverged_time = 59\n")) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted deadline below rippled minimum"),
+        };
+        assert!(error.contains("max_diverged_time"));
+        let error = match build_overlay_setup(&config("[overlay]\nmax_unknown_time = 1801\n")) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted deadline above rippled maximum"),
+        };
+        assert!(error.contains("max_unknown_time"));
     }
 
     #[test]

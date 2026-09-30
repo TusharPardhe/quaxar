@@ -333,16 +333,26 @@ fn verify_shamap_node(
         "transaction" => NodeObjectType::TransactionNode,
         _ => unreachable!("only known snapshot maps are verified"),
     };
-    if object.object_type() != expected_object_type {
+    let node = SHAMapTreeNode::make_from_prefix(object.data(), SHAMapHash::new(hash))
+        .map_err(|error| shamap_error(map, hash, format!("invalid encoded node: {error:?}")))?;
+    // NuDB's compact inner-node codecs intentionally discard the
+    // account-vs-transaction NodeObject wrapper tag and restore inner nodes as
+    // `Unknown`. The serialized SHAMap body still carries the node kind, so
+    // permit that wrapper only for inner nodes; leaves must retain their
+    // map-specific wrapper as well as their serialized leaf kind.
+    let wrapper_type_matches = if node.is_leaf() {
+        object.object_type() == expected_object_type
+    } else {
+        object.object_type() == expected_object_type
+            || object.object_type() == NodeObjectType::Unknown
+    };
+    if !wrapper_type_matches {
         return Err(shamap_error(
             map,
             hash,
             "reachable node has an incompatible NodeObject type",
         ));
     }
-
-    let node = SHAMapTreeNode::make_from_prefix(object.data(), SHAMapHash::new(hash))
-        .map_err(|error| shamap_error(map, hash, format!("invalid encoded node: {error:?}")))?;
     // `make_from_prefix` deliberately accepts a known hash for normal trusted
     // fetch paths. Snapshot input is untrusted, so force recomputation before
     // trusting the decoded graph.

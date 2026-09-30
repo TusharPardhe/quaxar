@@ -329,7 +329,7 @@ fn incomplete_offer_crossing_result(
         && (!fill_or_kill_enabled || offer_crossing == OfferCrossing::Sell)
     {
         return remaining_in
-            .is_some_and(|amount| amount.signum() > 0)
+            .is_some_and(|amount| amount.signum() != 0)
             .then_some(Ter::TEC_PATH_PARTIAL);
     }
     None
@@ -982,6 +982,7 @@ mod tests {
         let unlimited = STAmount::from_xrp_amount(XRPAmount::from_drops(100));
         let zero_in = STAmount::from_xrp_amount(XRPAmount::new());
         let remaining_in = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+        let negative_rounding_dust = STAmount::from_xrp_amount(XRPAmount::from_drops(-1));
 
         assert_eq!(
             incomplete_offer_crossing_result(
@@ -1004,6 +1005,18 @@ mod tests {
                 true,
             ),
             Some(Ter::TEC_PATH_PARTIAL)
+        );
+        assert_eq!(
+            incomplete_offer_crossing_result(
+                &delivered,
+                &unlimited,
+                false,
+                OfferCrossing::Sell,
+                Some(&negative_rounding_dust),
+                true,
+            ),
+            Some(Ter::TEC_PATH_PARTIAL),
+            "StrandFlow.h requires remainingIn to equal zero exactly"
         );
     }
 

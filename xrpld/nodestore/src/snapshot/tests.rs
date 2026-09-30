@@ -327,6 +327,47 @@ fn post_import_verifies_account_and_transaction_shamap_roots() {
 }
 
 #[test]
+fn post_import_accepts_nudb_unknown_wrapper_for_inner_shamap_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap_path = dir.path().join("unknown-inner.xrpls");
+    let src = make_backend("src-unknown-inner");
+    let (leaf, leaf_hash) = shamap_leaf(
+        NodeObjectType::AccountNode,
+        SHAMapNodeType::AccountState,
+        0x83,
+    );
+    src.store(leaf).expect("account leaf store must succeed");
+
+    let inner = SHAMapTreeNode::new_inner(0);
+    inner.set_child_hash(
+        0,
+        basics::sha_map_hash::SHAMapHash::new(Uint256::from_array(leaf_hash)),
+    );
+    inner.update_hash();
+    let inner_hash = *inner.get_hash().as_uint256();
+    let inner_hash_bytes = *inner_hash.data();
+    let inner_data = inner
+        .serialize_with_prefix()
+        .expect("test SHAMap inner node must serialize");
+    src.store(Arc::new(NodeObject::new(
+        NodeObjectType::Unknown,
+        inner_data,
+        inner_hash,
+    )))
+    .expect("unknown inner-node store must succeed");
+
+    let mut manifest = test_manifest();
+    manifest.account_hash = inner_hash_bytes;
+    refresh_manifest_ledger_hash(&mut manifest);
+    export_snapshot(src.as_ref(), &manifest, &snap_path).expect("export must succeed");
+
+    let dst = make_backend("dst-unknown-inner");
+    let loaded =
+        load_snapshot(dst.as_ref(), &snap_path).expect("NuDB-style untyped inner node must verify");
+    assert_eq!(loaded.account_hash, inner_hash_bytes);
+}
+
+#[test]
 fn post_import_rejects_manifest_root_missing_from_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let snap_path = dir.path().join("missing-root.xrpls");

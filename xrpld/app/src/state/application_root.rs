@@ -74,7 +74,7 @@ use ledger::{
     NullOrderBookDBJournal, NullOrderBookDBRuntime, OpenView, ReadView, Sandbox, TxsRawView,
 };
 use overlay::Cluster;
-use overlay::{OverlayHandoff, OverlayImpl, PeerReservationSource};
+use overlay::{Overlay, OverlayHandoff, OverlayImpl, PeerReservationSource};
 use perflog::PerfLogImp;
 use protocol::{
     AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NodeID, NotTec, PublicKey,
@@ -10083,6 +10083,15 @@ impl ApplicationRoot {
             ledger.header().seq,
             ledger.header().close_time,
         );
+        // LedgerMaster.cpp checks every peer against this first quorum-backed
+        // sequence before an initial validated ledger is available locally.
+        if current_valid_seq == 0 && val_count >= quorum {
+            if let Some(overlay_runtime) = self.overlay_runtime() {
+                overlay_runtime
+                    .overlay()
+                    .check_tracking(ledger.header().seq);
+            }
+        }
         let can_be_current = lm.can_be_current(ledger.as_ref(), self.current_close_time_seconds());
         let accepted = lm.check_accept_ledger(
             ledger.as_ref(),
@@ -10268,7 +10277,18 @@ impl ApplicationRoot {
         // install this ledger as the closed LCL, rebuild the open ledger,
         // change operating mode, or emit a switched-ledger StatusChange;
         // NetworkOpsStrand owns those actions after preferred-LCL selection.
-        self.try_advance_publication_serialized();
+        //
+        // Publication advance is NOT run synchronously here: `checkAccept` in
+        // rippled calls `tryAdvance()`, which merely marks single-flight state
+        // and queues a JtAdvance worker that releases the LedgerMaster lock
+        // before slow history/publish work (LedgerMaster.cpp:1352-1376,
+        // findNewLedgersToPublish ScopeUnlock). Running the heavy plan/publish
+        // pass here would hold `validation_advance_gate` across that work and
+        // block later validation admission + the consensus child's LCL install,
+        // widening the stale-parent window that triggers consensusViewChange.
+        // `request_publication_advance()` above already bumped the coalesced
+        // epoch and woke the strand, which runs `try_advance_publication()`
+        // outside this gate.
 
         // Consensus advancement after validating a new ledger.
         //

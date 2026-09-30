@@ -68,10 +68,10 @@ loop, state machines, backpressure lanes, and end-to-end sequence diagrams.
 flowchart TD
     INPUT[Peer messages and local transactions] --> DISPATCH[Overlay dispatch and JobQueue]
     DISPATCH --> STRAND[NetworkOps strand<br/>single policy owner]
-    STRAND --> PREF[Moving preferred-LCL policy]
-    STRAND --> ANCHOR[Stable recovery anchor<br/>and coordinator phase]
+    STRAND --> PREF[Current rippled-compatible<br/>preferred-LCL decision]
+    STRAND --> ADVICE[Validation-recovery advice<br/>phase-neutral only]
     PREF --> SESSIONS[Independent per-hash acquisitions]
-    ANCHOR --> SESSIONS
+    ADVICE --> SESSIONS
     SESSIONS --> RESIDENT[Shared NodeFamily caches,<br/>fetch pack, and NodeStore]
     SESSIONS --> PEERS[Bounded peer requests]
     RESIDENT --> MAPS[Complete immutable state<br/>and transaction SHAMaps]
@@ -86,15 +86,18 @@ flowchart TD
 ```
 
 The acquisition coordinator serializes typed events into phase transitions and
-effects. While syncing, its phase owns a stable recovery anchor. NetworkOps'
-latest preferred-LCL policy is separate moving state and may prioritize another
-per-hash acquisition without replacing that anchor. Only a verified header for
-the same hash may refine a hash-only anchor with its sequence. The coordinator
-also owns retry policy, durable completion handoff, and per-hash session
-lifecycle. A retained session keeps its traversal plan and exact frontier
-across timeouts and deferred I/O. After cancellation or terminal cleanup the
-actor-owned plan may be released, but verified hash-canonical nodes remain
-reusable through the shared tree cache, fetch pack, and NodeStore.
+effects. A bounded recovery acquisition may retain a stable fetch anchor so a
+moving peer tip does not discard useful traversal work. That anchor is
+advisory: it never replaces the current rippled-compatible preferred-LCL
+decision, selects `networkClosed`, vetoes an accepted consensus result, or
+changes the consensus parent. Only NetworkOps' current preferred-LCL decision
+can select a candidate for installation, after the candidate is complete,
+current, and compatible. The coordinator owns retry policy, durable completion
+handoff, and per-hash session lifecycle. A retained session keeps its traversal
+plan and exact frontier across timeouts and deferred I/O. After cancellation or
+terminal cleanup the actor-owned plan may be released, but verified
+hash-canonical nodes remain reusable through the shared tree cache, fetch pack,
+and NodeStore.
 
 NetworkOps owns the closed-ledger/LCL switch and reconciles it with the latest
 preferred-ledger policy. LedgerMaster owns validation acceptance plus validated
@@ -325,7 +328,8 @@ When changing the runtime, preserve these invariants:
 4. Ledger heads only reference complete, immutable ledgers.
 5. Caches are shared and swept by policy; they are not cleared on every ledger.
 6. Shutdown stops producers before queues, storage, and shared state.
-7. A moving preferred tip never replaces an in-flight stable recovery anchor.
+7. A recovery anchor may retain useful fetch work, but only the current
+   rippled-compatible preferred-LCL result controls consensus and LCL changes.
 8. The phase LCL tracks the canonical local closed ledger, while publication
    advances independently only on the proven contiguous chain.
 9. Full requires coherent advancing LCL/publication state, not merely a

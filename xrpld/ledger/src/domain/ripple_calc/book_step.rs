@@ -71,6 +71,29 @@ struct TraversedOffer {
     quality: Quality,
 }
 
+/// OfferStream also steps over directory indexes whose Offer SLE is missing.
+/// Keep those holes in traversal order so execution can erase and count them
+/// at the same point rippled does.
+enum TraversedBookEntry {
+    Offer(TraversedOffer),
+    Missing {
+        directory_page: protocol::Keylet,
+        offer_key: basics::base_uint::Uint256,
+        quality: Quality,
+    },
+}
+
+impl TraversedBookEntry {
+    /// BookTip exposes the traversed directory quality even when its current
+    /// offer SLE is missing. Estimation must therefore not discard a hole.
+    fn quality(&self) -> Quality {
+        match self {
+            Self::Offer(offer) => offer.quality,
+            Self::Missing { quality, .. } => *quality,
+        }
+    }
+}
+
 fn insert_sorted_amount(amounts: &mut Vec<STAmount>, amount: STAmount) {
     let index = amounts.partition_point(|saved| saved <= &amount);
     amounts.insert(index, amount);
@@ -345,9 +368,21 @@ pub struct BookStepResult {
     pub ter: Ter,
 }
 
+/// Direction of a BookStep evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookStepPass {
+    Forward,
+    Reverse,
+    /// Reconciliation-only: apply `limitStepOut` without a following input cap.
+    OutputOnly,
+}
+
 /// Exact execution policy supplied by a flow `BookStep`.
 #[derive(Debug, Clone)]
 pub struct BookStepOptions<'a> {
+    pub pass: BookStepPass,
+    /// Reverse-pass input cache used only by forward reconciliation.
+    pub reverse_input: Option<STAmount>,
     pub owner_pays_transfer_fee: bool,
     pub taker: Option<&'a AccountID>,
     pub quality_threshold: Option<Quality>,
@@ -388,6 +423,10 @@ pub fn execute_book_step<V: ApplyView>(
         max_in,
         max_out,
         BookStepOptions {
+            // This compatibility entry point historically used the
+            // output-limited consumption order of `revImp`.
+            pass: BookStepPass::Reverse,
+            reverse_input: None,
             owner_pays_transfer_fee,
             taker,
             quality_threshold,
@@ -413,6 +452,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     max_out: &STAmount,
     options: BookStepOptions<'_>,
 ) -> BookStepResult {
+    let reverse_input = options.reverse_input.as_ref().unwrap_or(max_in);
     let owner_pays_transfer_fee = options.owner_pays_transfer_fee;
     let taker = options.taker;
     let quality_threshold = options.quality_threshold;
@@ -535,11 +575,30 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     // ends this step before FlowOfferStream advances to them.
     let mut offers = Vec::with_capacity(raw_offers.len());
     let mut found_tip = false;
-    for traversed in raw_offers {
+    for entry in raw_offers {
         if found_tip {
-            offers.push(traversed);
+            offers.push(entry);
             continue;
         }
+        let traversed = match entry {
+            TraversedBookEntry::Offer(offer) => offer,
+            TraversedBookEntry::Missing {
+                directory_page,
+                offer_key,
+                ..
+            } => {
+                if erase_dangling_offer_index(view, directory_page, offer_key).is_err() {
+                    return BookStepResult {
+                        amount_in: total_in,
+                        amount_out: total_out,
+                        offers_consumed,
+                        ter: Ter::TEF_BAD_LEDGER,
+                    };
+                }
+                offers_consumed += 1;
+                continue;
+            }
+        };
         let offer_sle = traversed.sle;
         let offer_quality = traversed.quality;
         let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
@@ -678,10 +737,10 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             }
         }
         found_tip = true;
-        offers.push(TraversedOffer {
+        offers.push(TraversedBookEntry::Offer(TraversedOffer {
             sle: offer_sle,
             quality: offer_quality,
-        });
+        }));
     }
 
     // A BookStep consumes one quality directory per call, as in rippled's
@@ -692,7 +751,10 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     // rippled tries AMM liquidity before the cleaned CLOB tip. The AMM offer
     // establishes the one-quality-per-step boundary just like a real offer.
     // Domain books never use AMM liquidity.
-    let clob_tip = offers.first().map(|offer| offer.quality);
+    let clob_tip = offers.iter().find_map(|entry| match entry {
+        TraversedBookEntry::Offer(offer) => Some(offer.quality),
+        TraversedBookEntry::Missing { .. } => None,
+    });
     let amm_generation_quality = amm_target_quality(
         clob_tip,
         quality_threshold,
@@ -785,11 +847,30 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     }
 
     if !stop_before_clob {
-        for traversed in offers {
+        for entry in offers {
             if offers_consumed >= MAX_OFFERS_TO_CONSUME || remaining_in.signum() <= 0 {
                 break;
             }
 
+            let traversed = match entry {
+                TraversedBookEntry::Offer(offer) => offer,
+                TraversedBookEntry::Missing {
+                    directory_page,
+                    offer_key,
+                    ..
+                } => {
+                    if erase_dangling_offer_index(view, directory_page, offer_key).is_err() {
+                        return BookStepResult {
+                            amount_in: total_in,
+                            amount_out: total_out,
+                            offers_consumed,
+                            ter: Ter::TEF_BAD_LEDGER,
+                        };
+                    }
+                    offers_consumed += 1;
+                    continue;
+                }
+            };
             let offer_sle = traversed.sle;
             let offer_quality = traversed.quality;
             let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
@@ -1008,12 +1089,11 @@ pub fn execute_book_step_with_options<V: ApplyView>(
 
             offer_attempted = true;
 
-            // Compute consumption amounts with transfer rates (reference forEachOffer parity).
-            // A reverse BookStep must limit the final offer by the outstanding
-            // requested output before it derives the required input. See
-            // rippled BookStep.cpp `limitStepOut` and `revImp`.
+            // Forward evaluation is input-limited before its output is reconciled
+            // to the reverse cache. Reverse evaluation remains output-limited.
             let remaining_out = max_out.clone() - total_out.clone();
-            let consumption = compute_offer_consumption(
+            let mut consumption = compute_offer_consumption(
+                options.pass,
                 &remaining_in,
                 &remaining_out,
                 &taker_pays,
@@ -1027,6 +1107,57 @@ pub fn execute_book_step_with_options<V: ApplyView>(
 
             if consumption.step_in.signum() <= 0 || consumption.step_out.signum() <= 0 {
                 break;
+            }
+
+            let mut reconciled_to_reverse_cache = false;
+            if options.pass == BookStepPass::Forward {
+                let mut candidate_ins = saved_ins.clone();
+                let mut candidate_outs = saved_outs.clone();
+                insert_sorted_amount(&mut candidate_ins, consumption.step_in.clone());
+                insert_sorted_amount(&mut candidate_outs, consumption.step_out.clone());
+                let candidate_in = sum_sorted_amounts(&candidate_ins, max_in);
+                let candidate_out = sum_sorted_amounts(&candidate_outs, max_out);
+
+                if candidate_out > *max_out && candidate_in <= *reverse_input {
+                    // Mirror rippled BookStep.cpp fwdImp lines 1261-1305:
+                    // limitStepOut against the cached remaining output, then
+                    // adopt only if it requires all remaining forward input.
+                    // Otherwise retain the ordinary forward saved amounts.
+                    let reverse_limited = compute_offer_consumption(
+                        BookStepPass::OutputOnly,
+                        &remaining_in,
+                        &remaining_out,
+                        &taker_pays,
+                        &taker_gets,
+                        &owner_funds,
+                        offer_quality,
+                        tr_in,
+                        tr_out,
+                        fix_reduced_offers_v2,
+                    );
+                    if reverse_limited.step_in == remaining_in {
+                        consumption = reverse_limited;
+                        // rippled's fwdImp does not keep the rounded result
+                        // returned by limitStepOut as the step accounting. Once
+                        // the reverse-cache reconciliation is accepted, it
+                        // explicitly records the exact remaining input/output
+                        // (`stpAdjAmt.in = remainingIn` and
+                        // `stpAdjAmt.out = remainingOut`). Preserve the same
+                        // boundary: retaining the rounded `step_out` can leave
+                        // a tiny residual and make OfferCreate::tfFillOrKill
+                        // report a complete fill when rippled returns
+                        // tecKILLED.
+                        consumption.reconcile_step_to_cache(&remaining_in, &remaining_out);
+                        saved_ins.clear();
+                        saved_ins.push(max_in.clone());
+                        saved_outs.clear();
+                        saved_outs.push(max_out.clone());
+                        total_in = max_in.clone();
+                        total_out = max_out.clone();
+                        remaining_in = max_in.zeroed();
+                        reconciled_to_reverse_cache = true;
+                    }
+                }
             }
 
             // Execute trade: transfer assets between offer owner and issuers
@@ -1072,11 +1203,13 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 )));
             }
 
-            insert_sorted_amount(&mut saved_ins, consumption.step_in);
-            insert_sorted_amount(&mut saved_outs, consumption.step_out);
-            total_in = sum_sorted_amounts(&saved_ins, max_in);
-            total_out = sum_sorted_amounts(&saved_outs, max_out);
-            remaining_in = max_in.clone() - total_in.clone();
+            if !reconciled_to_reverse_cache {
+                insert_sorted_amount(&mut saved_ins, consumption.step_in);
+                insert_sorted_amount(&mut saved_outs, consumption.step_out);
+                total_in = sum_sorted_amounts(&saved_ins, max_in);
+                total_out = sum_sorted_amounts(&saved_outs, max_out);
+                remaining_in = max_in.clone() - total_in.clone();
+            }
             offers_consumed += 1;
         }
     }
@@ -1773,7 +1906,7 @@ pub(crate) fn book_quality_upper_bound<V: ApplyView>(
     strand_deliver: Asset,
 ) -> Result<Option<Quality>, ViewError> {
     let clob_offers = get_book_offers(view, book, 1)?;
-    let clob = clob_offers.first().map(|offer| offer.quality);
+    let clob = clob_offers.first().map(TraversedBookEntry::quality);
     let generation_quality = amm_target_quality(
         clob,
         quality_threshold,
@@ -1820,7 +1953,7 @@ pub(crate) fn book_quality_function<V: ApplyView>(
     strand_deliver: Asset,
 ) -> Result<Option<QualityFunction>, ViewError> {
     let clob_offers = get_book_offers(view, book, 1)?;
-    let clob = clob_offers.first().map(|offer| offer.quality);
+    let clob = clob_offers.first().map(TraversedBookEntry::quality);
     let target = amm_target_quality(
         clob,
         quality_threshold,
@@ -2081,7 +2214,7 @@ fn get_book_offers<V: ApplyView>(
     view: &mut V,
     book: &Book,
     max: u32,
-) -> Result<Vec<TraversedOffer>, ViewError> {
+) -> Result<Vec<TraversedBookEntry>, ViewError> {
     let mut offers = Vec::new();
 
     // Offers are stored under their executable TakerPays -> TakerGets book,
@@ -2138,12 +2271,17 @@ fn get_book_offers<V: ApplyView>(
                     if offers.len() >= max as usize {
                         break;
                     }
-                    if let Some(offer_sle) = view.peek(protocol::Keylet::new(
-                        protocol::LedgerEntryType::Offer,
-                        offer_key,
-                    ))? {
-                        offers.push(TraversedOffer {
+                    let offer_keylet =
+                        protocol::Keylet::new(protocol::LedgerEntryType::Offer, offer_key);
+                    if let Some(offer_sle) = view.peek(offer_keylet)? {
+                        offers.push(TraversedBookEntry::Offer(TraversedOffer {
                             sle: offer_sle.as_ref().clone(),
+                            quality,
+                        }));
+                    } else {
+                        offers.push(TraversedBookEntry::Missing {
+                            directory_page: page_keylet,
+                            offer_key,
                             quality,
                         });
                     }
@@ -2164,6 +2302,33 @@ fn get_book_offers<V: ApplyView>(
     }
 
     Ok(offers)
+}
+
+/// Mirrors OfferStream.cpp `erase`: remove a dangling index from the current
+/// page but deliberately do not use dirRemove or erase an empty directory.
+/// That historical behavior is consensus-significant.
+fn erase_dangling_offer_index<V: ApplyView>(
+    view: &mut V,
+    directory_page: protocol::Keylet,
+    offer_key: basics::base_uint::Uint256,
+) -> Result<(), ViewError> {
+    let Some(directory) = view.peek(directory_page)? else {
+        return Ok(());
+    };
+    let mut indexes = directory.get_field_v256(sf("sfIndexes")).value().to_vec();
+    let Some(position) = indexes.iter().position(|index| *index == offer_key) else {
+        return Ok(());
+    };
+    indexes.remove(position);
+    let mut object = directory.clone_as_object();
+    object.set_field_v256(
+        sf("sfIndexes"),
+        protocol::STVector256::from_values(sf("sfIndexes"), indexes),
+    );
+    view.update(Arc::new(STLedgerEntry::from_stobject(
+        object,
+        *directory.key(),
+    )))
 }
 
 /// Get the funds available for an offer owner to deliver.
@@ -2301,6 +2466,16 @@ struct OfferConsumption {
     offer_out: STAmount,
 }
 
+impl OfferConsumption {
+    /// Match rippled fwdImp's accepted reverse-cache reconciliation, which
+    /// pins the step amounts to the exact remaining cache boundary after
+    /// limitStepOut has proven that the required input is exact.
+    fn reconcile_step_to_cache(&mut self, remaining_in: &STAmount, remaining_out: &STAmount) {
+        self.step_in = remaining_in.clone();
+        self.step_out = remaining_out.clone();
+    }
+}
+
 /// Compute how much of an offer to consume, applying transfer rates.
 ///   stpAmt.in = mulRatio(ofrAmt.in, ofrInRate, QUALITY_ONE, true)
 ///   ownerGives = mulRatio(ofrAmt.out, ofrOutRate, QUALITY_ONE,
@@ -2309,6 +2484,7 @@ struct OfferConsumption {
 ///   If remaining_out < stpAmt.out: recompute from requested output
 ///   If remaining_in < stpAmt.in: recompute from remaining input
 fn compute_offer_consumption(
+    pass: BookStepPass,
     remaining_in: &STAmount,
     remaining_out: &STAmount,
     taker_pays: &STAmount,
@@ -2346,40 +2522,41 @@ fn compute_offer_consumption(
         stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
     }
 
-    // reference: BookStep.cpp `limitStepOut` in `revImp`. The reverse pass
-    // receives an unbounded input and must not consume more than the output
-    // requested by the following step. `offer.limitOut(..., true)` delegates
-    // to Quality::ceilOut, which uses mulRound with round-away-from-zero.
-    // Do not use cross_type_scale here: its unchecked native conversion can
-    // construct an out-of-range XRP STAmount before the bounded offer input
-    // has been derived.
-    if *remaining_out < stp_out {
-        let offer_amounts = Amounts::new(actual_ofr_in.clone(), actual_ofr_out.clone());
-        let clipped = offer_quality.ceil_out_strict(&offer_amounts, remaining_out, true);
-        actual_ofr_in = clipped.r#in;
-        actual_ofr_out = clipped.out;
-        stp_out = actual_ofr_out.clone();
-        owner_gives = offer_owner_gives(&stp_out, transfer_rate_out);
-        stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
-    }
-
-    // reference: limitStepIn if remaining_in < stpAmt.in
-    if *remaining_in < stp_in {
-        stp_in = remaining_in.clone();
-        let in_lmt = mul_ratio_amount(&stp_in, QUALITY_ONE, transfer_rate_in, false);
-        let offer_amounts = Amounts::new(actual_ofr_in, actual_ofr_out);
-        let limited = if fix_reduced_offers_v2 {
-            // TOffer::limitIn selects the strict implementation under the
-            // amendment and deliberately rounds down. This one-ulp behavior
-            // is consensus-significant for fractional IOU offers.
-            offer_quality.ceil_in_strict(&offer_amounts, &in_lmt, false)
-        } else {
-            offer_quality.ceil_in(&offer_amounts, &in_lmt)
-        };
-        actual_ofr_in = limited.r#in;
-        actual_ofr_out = limited.out;
-        stp_out = actual_ofr_out.clone();
-        owner_gives = offer_owner_gives(&stp_out, transfer_rate_out);
+    // rippled revImp limits output then input. fwdImp limits input only;
+    // reconciliation invokes only limitStepOut before comparing required input.
+    let limit_order: &[bool] = match pass {
+        BookStepPass::Forward => &[false],
+        BookStepPass::Reverse => &[true, false],
+        BookStepPass::OutputOnly => &[true],
+    };
+    for &output_limit in limit_order {
+        if output_limit {
+            if *remaining_out < stp_out {
+                let offer_amounts = Amounts::new(actual_ofr_in.clone(), actual_ofr_out.clone());
+                let clipped = offer_quality.ceil_out_strict(&offer_amounts, remaining_out, true);
+                actual_ofr_in = clipped.r#in;
+                actual_ofr_out = clipped.out;
+                stp_out = actual_ofr_out.clone();
+                owner_gives = offer_owner_gives(&stp_out, transfer_rate_out);
+                stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
+            }
+        } else if *remaining_in < stp_in {
+            stp_in = remaining_in.clone();
+            let in_lmt = mul_ratio_amount(&stp_in, QUALITY_ONE, transfer_rate_in, false);
+            let offer_amounts = Amounts::new(actual_ofr_in.clone(), actual_ofr_out.clone());
+            let limited = if fix_reduced_offers_v2 {
+                // TOffer::limitIn selects the strict implementation under the
+                // amendment and deliberately rounds down. This one-ulp behavior
+                // is consensus-significant for fractional IOU offers.
+                offer_quality.ceil_in_strict(&offer_amounts, &in_lmt, false)
+            } else {
+                offer_quality.ceil_in(&offer_amounts, &in_lmt)
+            };
+            actual_ofr_in = limited.r#in;
+            actual_ofr_out = limited.out;
+            stp_out = actual_ofr_out.clone();
+            owner_gives = offer_owner_gives(&stp_out, transfer_rate_out);
+        }
     }
 
     OfferConsumption {
@@ -2940,10 +3117,98 @@ mod tests {
         assert_eq!(
             offers
                 .iter()
-                .map(|offer| *offer.sle.key())
+                .filter_map(|entry| match entry {
+                    TraversedBookEntry::Offer(offer) => Some(*offer.sle.key()),
+                    TraversedBookEntry::Missing { .. } => None,
+                })
                 .collect::<Vec<_>>(),
             vec![offer_one_key.key, offer_two_key.key]
         );
+    }
+
+    #[test]
+    fn dangling_book_index_is_erased_and_counted_without_deleting_directory() {
+        let issuer = AccountID::from_array([0x65; 20]);
+        let missing_owner = AccountID::from_array([0x66; 20]);
+        let usd = Issue::new(protocol::currency_from_string("USD"), issuer);
+        let book = Book {
+            r#in: Asset::Issue(protocol::xrp_issue()),
+            out: Asset::Issue(usd),
+            domain: None,
+        };
+        let directory_quality = 0x5C04_1502_68D8_D000;
+        let quality_root = protocol::quality_keylet(
+            protocol::book_keylet(protocol::Book::new(book.r#in, book.out, None)),
+            directory_quality,
+        );
+        let missing_offer = protocol::offer_keylet(Uint160::from_void(missing_owner.data()), 1).key;
+        let mut root = STLedgerEntry::new(quality_root);
+        root.set_field_v256(
+            sf("sfIndexes"),
+            protocol::STVector256::from_values(sf("sfIndexes"), vec![missing_offer]),
+        );
+        root.set_field_u64(sf("sfIndexNext"), 0);
+        root.set_field_u64(sf("sfIndexPrevious"), 0);
+
+        let mut view = test_apply_view(&[]);
+        view.insert(Arc::new(test_account(issuer, 0)))
+            .expect("insert issuer");
+        view.insert(Arc::new(root)).expect("insert quality root");
+
+        // BookTip::step exposes the directory quality before OfferStream sees
+        // and removes the missing SLE. Both strand-estimation paths must do the
+        // same or ordinary/passive OfferCreate can deactivate this strand.
+        let expected_quality = Quality::from_value(directory_quality);
+        let amm_context = crate::domain::flow_engine::AmmContext::new(missing_owner, false);
+        assert_eq!(
+            book_quality_upper_bound(
+                &mut view,
+                &book,
+                None,
+                &amm_context,
+                false,
+                false,
+                &issuer,
+                book.out,
+            )
+            .expect("estimate book upper bound"),
+            Some(expected_quality)
+        );
+        let quality_function = book_quality_function(
+            &mut view,
+            &book,
+            None,
+            &amm_context,
+            false,
+            false,
+            &issuer,
+            book.out,
+        )
+        .expect("estimate book quality function")
+        .expect("dangling directory remains estimable");
+        assert_eq!(quality_function.quality(), Some(expected_quality));
+
+        let result = execute_book_step(
+            &mut view,
+            &book,
+            &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(100)),
+            &STAmount::from_iou_amount(
+                sf("sfAmount"),
+                IOUAmount::from_parts(100, 0).expect("valid IOU"),
+                usd,
+            ),
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(result.ter, Ter::TES_SUCCESS);
+        assert_eq!(result.offers_consumed, 1);
+        let directory = view
+            .peek(quality_root)
+            .expect("read directory")
+            .expect("historical erase keeps empty directory");
+        assert!(directory.get_field_v256(sf("sfIndexes")).value().is_empty());
     }
 
     #[test]
@@ -2984,14 +3249,15 @@ mod tests {
         let offers = get_book_offers(&mut view, &book, 1).expect("walk domain book");
 
         assert_eq!(offers.len(), 1);
-        assert_eq!(
-            offers[0].quality,
-            Quality::from_value(0x1122_3344_5566_7788)
-        );
+        let offer = match &offers[0] {
+            TraversedBookEntry::Offer(offer) => offer,
+            TraversedBookEntry::Missing { .. } => panic!("fixture offer must exist"),
+        };
+        assert_eq!(offer.quality, Quality::from_value(0x1122_3344_5566_7788));
         assert_ne!(
-            offers[0].quality,
+            offer.quality,
             Quality::from_value(protocol::quality_from_key(
-                offers[0].sle.get_field_h256(sf("sfBookDirectory"))
+                offer.sle.get_field_h256(sf("sfBookDirectory"))
             ))
         );
     }
@@ -3571,6 +3837,7 @@ mod tests {
             ),
         ));
         let consumption = compute_offer_consumption(
+            BookStepPass::Reverse,
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(3_300_000_000)),
             &STAmount::from_iou_amount(
                 sf("sfAmount"),
@@ -3619,6 +3886,7 @@ mod tests {
             taker_gets.clone(),
         ));
         let consumption = compute_offer_consumption(
+            BookStepPass::Forward,
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(25_000_000)),
             &taker_gets,
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(50_000_000)),
@@ -3662,6 +3930,7 @@ mod tests {
         assert_eq!(recomputed_quality.rate().text(), "11489999.99999987");
 
         let consumption = compute_offer_consumption(
+            BookStepPass::Forward,
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(600_000)),
             &taker_gets,
             &taker_pays,

@@ -332,18 +332,17 @@ pub fn encode_amendments_entry(amendments: &[Uint256]) -> Vec<u8> {
 pub fn encode_ledger_hashes_entry(entry: &DecodedLedgerHashesEntry) -> Vec<u8> {
     let mut bytes = Vec::new();
     append_u16_field(&mut bytes, SF_LEDGER_ENTRY_TYPE, LT_LEDGER_HASHES);
-    append_u32_field(&mut bytes, SF_FLAGS, 0);
     if let Some(last_ledger_sequence) = entry.last_ledger_sequence {
         append_u32_field(&mut bytes, SF_LAST_LEDGER_SEQUENCE, last_ledger_sequence);
     }
     append_vector256_field(&mut bytes, SF_HASHES, &entry.hashes);
+    bytes.push(OBJECT_END);
     bytes
 }
 
 pub fn encode_negative_unl_entry(entry: &DecodedNegativeUnlEntry) -> Vec<u8> {
     let mut bytes = Vec::new();
     append_u16_field(&mut bytes, SF_LEDGER_ENTRY_TYPE, LT_NEGATIVE_UNL);
-    append_u32_field(&mut bytes, SF_FLAGS, 0);
 
     if !entry.disabled_validators.is_empty() {
         append_field_id(&mut bytes, STI_ARRAY, SF_DISABLED_VALIDATORS);
@@ -373,6 +372,7 @@ pub fn encode_negative_unl_entry(entry: &DecodedNegativeUnlEntry) -> Vec<u8> {
         append_u32_field(&mut bytes, SF_PREVIOUS_TXN_LGR_SEQ, previous_txn_lgr_seq);
     }
 
+    bytes.push(OBJECT_END);
     bytes
 }
 

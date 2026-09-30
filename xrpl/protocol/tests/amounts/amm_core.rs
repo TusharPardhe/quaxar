@@ -12,8 +12,11 @@ fn sample_account(fill: u8) -> AccountID {
 
 #[test]
 fn amm_enabled_requires_both_amm_and_universal_number() {
+    // rippled HEAD ammEnabled (AMMCore.cpp:129-131) is gated only by
+    // featureAMM after the fixUniversalNumber amendment was retired
+    // (rippled 8a4bf2dee6). UniversalNumber is no longer an additional gate.
     assert!(!amm_enabled(&Rules::new([])));
-    assert!(!amm_enabled(&Rules::new([feature_amm()])));
+    assert!(amm_enabled(&Rules::new([feature_amm()])));
     assert!(!amm_enabled(&Rules::new([feature_universal_number()])));
     assert!(amm_enabled(&Rules::new([
         feature_amm(),

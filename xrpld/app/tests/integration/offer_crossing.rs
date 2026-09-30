@@ -161,6 +161,107 @@ fn fok_buy_full_output_uses_less_than_send_max_and_creates_trust_line() {
     run_fok_buy_full_output_below_send_max(false);
 }
 
+#[test]
+fn sell_fok_full_cross_succeeds_without_residual() {
+    let maker = acct(0x41);
+    let taker = acct(0x42);
+    let issuer = acct(0x43);
+    let usd = usd_currency();
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(maker, 10_000_000_000, 1, 0),
+            account_root(taker, 10_000_000_000, 1, 0),
+            account_root(issuer, 10_000_000_000, 0, protocol::lsfDefaultRipple),
+            trust_line(maker, issuer, usd, 100, 10_000, 0),
+            trust_line(taker, issuer, usd, 0, 10_000, 0),
+        ],
+        vec!["fixFillOrKill", "fixReducedOffersV2"],
+    );
+    let mut view = new_view(ledger);
+
+    let resting = offer_tx(maker, xrp(1_000_000), iou(issuer, usd, 100), 1);
+    assert_eq!(
+        full_apply(&mut view, &resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let before = xrp_balance(&view, taker);
+    let sell_fok = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), iou(issuer, usd, 100));
+        tx.set_field_amount(sf("sfTakerGets"), xrp(1_000_000));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell | protocol::tfFillOrKill);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &sell_fok, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "a full sell FoK cross must not be converted to tecKILLED"
+    );
+    assert_eq!(before - xrp_balance(&view, taker) - 10, 1_000_000);
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(taker), 1))
+            .expect("read sell FoK offer")
+            .is_none(),
+        "full sell FoK must leave a zero residual offer"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(maker), 1))
+            .expect("read fully crossed resting offer")
+            .is_none()
+    );
+}
+
+#[test]
+fn sell_fok_partial_cross_remains_killed() {
+    let maker = acct(0x51);
+    let taker = acct(0x52);
+    let issuer = acct(0x53);
+    let usd = usd_currency();
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(maker, 10_000_000_000, 1, 0),
+            account_root(taker, 10_000_000_000, 1, 0),
+            account_root(issuer, 10_000_000_000, 0, protocol::lsfDefaultRipple),
+            trust_line(maker, issuer, usd, 50, 10_000, 0),
+            trust_line(taker, issuer, usd, 0, 10_000, 0),
+        ],
+        vec!["fixFillOrKill", "fixReducedOffersV2"],
+    );
+    let mut view = new_view(ledger);
+
+    let resting = offer_tx(maker, xrp(500_000), iou(issuer, usd, 50), 1);
+    assert_eq!(
+        full_apply(&mut view, &resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let sell_fok = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), iou(issuer, usd, 100));
+        tx.set_field_amount(sf("sfTakerGets"), xrp(1_000_000));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell | protocol::tfFillOrKill);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &sell_fok, TxType::OFFER_CREATE),
+        Ter::TEC_KILLED,
+        "genuinely partial sell FoK liquidity must remain killed"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(taker), 1))
+            .expect("read killed sell FoK offer")
+            .is_none()
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(maker), 1))
+            .expect("read maker offer after killed sell FoK")
+            .is_some(),
+        "the killed crossing must not commit its partial fill"
+    );
+}
+
 /// `BookStep::execOffer` applies issuer authorization to synthetic AMM offers
 /// as well as CLOB offers.  The AMM pool may exist before its trust line is
 /// authorized; such a pool must not be crossed by an OfferCreate.
@@ -1816,6 +1917,97 @@ fn offer_crossing_taker_gets_xrp() {
     assert_eq!(get_owner_count(&view, bob), 1); // just trust line
 }
 
+/// A leading dangling directory index still contributes the directory quality
+/// during strand estimation. OfferStream removes it only once execution starts,
+/// then ordinary and passive crossing must both reach the live offer behind it.
+fn run_leading_dangling_index_crossing(flags: u32) {
+    let maker = acct(0x11);
+    let taker = acct(0x22);
+    let issuer = acct(0x33);
+    let missing_owner = acct(0x44);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(maker, 10_000_000_000, 1, 0),
+        account_root(taker, 10_000_000_000, 1, 0),
+        account_root(issuer, 10_000_000_000, 0, protocol::lsfDefaultRipple),
+        trust_line(maker, issuer, usd, 0, 10_000, 0),
+        trust_line(taker, issuer, usd, 100, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    // This 110 XRP for 50 USD offer is strictly better than the incoming
+    // 200 XRP for 100 USD limit, so tfPassive must cross it too.
+    let resting = offer_tx(maker, iou(issuer, usd, 50), xrp(110_000_000), 1);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let resting_key = protocol::offer_keylet(acct_id(maker), 1);
+    let resting_offer = view
+        .read(resting_key)
+        .expect("read resting offer")
+        .expect("resting offer must exist");
+    let directory_key = protocol::Keylet::new(
+        LedgerEntryType::DirectoryNode,
+        resting_offer.get_field_h256(sf("sfBookDirectory")),
+    );
+    let directory = view
+        .read(directory_key)
+        .expect("read book directory")
+        .expect("book directory must exist");
+    let missing_offer = protocol::offer_keylet(acct_id(missing_owner), 99).key;
+    let mut indexes = directory.get_field_v256(sf("sfIndexes")).value().to_vec();
+    assert_eq!(indexes, vec![resting_key.key]);
+    indexes.insert(0, missing_offer);
+    let mut object = directory.clone_as_object();
+    object.set_field_v256(
+        sf("sfIndexes"),
+        protocol::STVector256::from_values(sf("sfIndexes"), indexes),
+    );
+    view.update(Arc::new(STLedgerEntry::from_stobject(
+        object,
+        directory_key.key,
+    )))
+    .expect("prepend dangling book index");
+
+    let before_xrp = xrp_balance(&view, taker);
+    let crossing = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(200_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(issuer, usd, 100));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_u32(sf("sfFlags"), flags);
+    });
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &crossing, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    assert_eq!(xrp_balance(&view, taker), before_xrp - 10 + 110_000_000);
+    assert!(
+        view.read(resting_key)
+            .expect("read consumed maker offer")
+            .is_none(),
+        "leading dangling index must not deactivate the crossing strand"
+    );
+    if let Some(directory) = view.read(directory_key).expect("read cleaned directory") {
+        assert!(
+            !directory
+                .get_field_v256(sf("sfIndexes"))
+                .value()
+                .contains(&missing_offer),
+            "execution must erase the dangling index"
+        );
+    }
+}
+
+#[test]
+fn leading_dangling_index_does_not_deactivate_ordinary_or_passive_crossing() {
+    run_leading_dangling_index_crossing(0);
+    run_leading_dangling_index_crossing(protocol::tfPassive);
+}
+
 /// C++ Offer_test — passive offer doesn't cross same-quality offer.
 #[test]
 fn offer_passive_no_cross_same_quality() {
@@ -1855,6 +2047,101 @@ fn offer_passive_no_cross_same_quality() {
     // Both offers should remain on book (passive didn't cross)
     assert_eq!(get_owner_count(&view, alice), 2); // trust + offer
     assert_eq!(get_owner_count(&view, bob), 2); // trust + offer
+}
+
+/// Live-fork regression: an under-reserved passive offer at the exact book
+/// quality does not qualify to cross. The claimed transaction must preserve
+/// the pre-existing trust-line OwnerCount and must not place an offer.
+#[test]
+fn under_reserved_passive_same_quality_returns_insuf_reserve_and_preserves_owner_count() {
+    let maker = acct(0x11);
+    let taker = acct(0x22);
+    let issuer = acct(0x33);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(maker, 10_000_000_000, 1, 0),
+        // reserve(ownerCount=1) + two fees, but no reserve for another object.
+        account_root(taker, 250_020, 1, 0),
+        account_root(issuer, 10_000_000_000, 0, protocol::lsfDefaultRipple),
+        trust_line(maker, issuer, usd, 0, 10_000, 0),
+        trust_line(taker, issuer, usd, 100, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let resting = offer_tx(maker, iou(issuer, usd, 100), xrp(100_000_000), 1);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let passive = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(100_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(issuer, usd, 100));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_u32(sf("sfFlags"), protocol::tfPassive);
+    });
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &passive, TxType::OFFER_CREATE),
+        Ter::TEC_INSUF_RESERVE_OFFER
+    );
+    assert_eq!(get_owner_count(&view, taker), 1);
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(taker), 1))
+            .expect("read rejected passive offer")
+            .is_none()
+    );
+    assert_eq!(get_owner_count(&view, maker), 2);
+}
+
+/// Canonical reserve exception: a genuinely crossing offer keeps its crossing
+/// even when its pre-fee balance cannot reserve a residual offer. The residual
+/// is not placed, and the taker's existing OwnerCount remains unchanged.
+#[test]
+fn under_reserved_passive_better_quality_cross_succeeds_without_placing_residual() {
+    let maker = acct(0x11);
+    let taker = acct(0x22);
+    let issuer = acct(0x33);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(maker, 10_000_000_000, 1, 0),
+        account_root(taker, 250_020, 1, 0),
+        account_root(issuer, 10_000_000_000, 0, protocol::lsfDefaultRipple),
+        trust_line(maker, issuer, usd, 0, 10_000, 0),
+        trust_line(taker, issuer, usd, 100, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    // 110 XRP for 50 USD is strictly better than the incoming 200/100 limit.
+    let resting = offer_tx(maker, iou(issuer, usd, 50), xrp(110_000_000), 1);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let before_xrp = xrp_balance(&view, taker);
+    let passive = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(200_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(issuer, usd, 100));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_u32(sf("sfFlags"), protocol::tfPassive);
+    });
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &passive, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(get_owner_count(&view, taker), 1);
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(taker), 1))
+            .expect("read under-reserved crossing offer")
+            .is_none(),
+        "under-reserved residual must not be placed"
+    );
+    assert_eq!(xrp_balance(&view, taker), before_xrp - 10 + 110_000_000);
+    assert_eq!(get_owner_count(&view, maker), 1);
 }
 
 /// Testnet ledger 20,660,471 contains only this passive sell OfferCreate.

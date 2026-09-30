@@ -289,6 +289,8 @@ impl FlowStep for StepKind {
                     &unlimited_amount(in_asset),
                     &requested_out,
                     crate::domain::ripple_calc::book_step::BookStepOptions {
+                        pass: crate::domain::ripple_calc::book_step::BookStepPass::Reverse,
+                        reverse_input: None,
                         owner_pays_transfer_fee: *owner_pays_transfer_fee,
                         taker: Some(context.strand_src),
                         quality_threshold: context.quality_threshold,
@@ -312,9 +314,10 @@ impl FlowStep for StepKind {
                 if result.ter != Ter::TES_SUCCESS {
                     return Err(result.ter);
                 }
+                let amount_out = reverse_book_output(&requested_out, result.amount_out);
                 Ok(StepAmounts::book(
                     result.amount_in,
-                    result.amount_out,
+                    amount_out,
                     result.offers_consumed,
                 ))
             }
@@ -412,6 +415,11 @@ impl FlowStep for StepKind {
                     &requested_in,
                     &reverse_out,
                     crate::domain::ripple_calc::book_step::BookStepOptions {
+                        pass: crate::domain::ripple_calc::book_step::BookStepPass::Forward,
+                        reverse_input: Some(normalize_amount_asset(
+                            reverse_cache.input.amount(),
+                            in_asset,
+                        )),
                         owner_pays_transfer_fee: *owner_pays_transfer_fee,
                         taker: Some(context.strand_src),
                         quality_threshold: context.quality_threshold,
@@ -583,6 +591,18 @@ fn normalize_amount_asset(amount: &STAmount, asset: Asset) -> STAmount {
     )
 }
 
+fn reverse_book_output(requested_out: &STAmount, actual_out: STAmount) -> STAmount {
+    // BookStep.cpp revImp forces result.out to the requested output when the
+    // remaining amount normalizes to zero. Without this correction Flow sees
+    // a false limiting step even though the BookStep satisfied the request.
+    let remaining_out = requested_out.clone() - actual_out.clone();
+    if remaining_out.signum() == 0 {
+        requested_out.clone()
+    } else {
+        actual_out
+    }
+}
+
 fn unlimited_amount(asset: Asset) -> STAmount {
     if asset.native() {
         // The maximum valid XRPAmount is well above any practical ledger
@@ -597,7 +617,16 @@ fn unlimited_amount(asset: Asset) -> STAmount {
             issue,
         )
     } else {
-        STAmount::new_with_asset(sf("sfAmount"), asset, u64::MAX / 2, 0, false)
+        // Reverse BookStep is output-driven. Use the largest legal IOU so the
+        // implementation does not impose the old ~9.22e18 synthetic cap on
+        // assets whose canonical range extends to approximately 1e96.
+        STAmount::new_with_asset(
+            sf("sfAmount"),
+            asset,
+            protocol::ST_AMOUNT_MAX_MANTISSA,
+            protocol::ST_AMOUNT_MAX_OFFSET,
+            false,
+        )
     }
 }
 
@@ -1111,6 +1140,43 @@ mod tests {
 
     use super::*;
     use crate::{ApplyViewImpl, Ledger, RawView, ReadView};
+
+    #[test]
+    fn reverse_iou_book_input_uses_the_full_legal_amount_range() {
+        let issuer = AccountID::from_array([0x41; 20]);
+        let issue = Issue::new(protocol::currency_from_string("USD"), issuer);
+        let unlimited = unlimited_amount(Asset::Issue(issue));
+
+        assert_eq!(unlimited.mantissa(), protocol::ST_AMOUNT_MAX_MANTISSA);
+        assert_eq!(unlimited.exponent(), protocol::ST_AMOUNT_MAX_OFFSET);
+        assert!(
+            unlimited > STAmount::new_with_asset(sf("sfAmount"), issue, u64::MAX / 2, 0, false,)
+        );
+    }
+
+    #[test]
+    fn reverse_book_output_forces_requested_value_when_remainder_normalizes_to_zero() {
+        let issuer = AccountID::from_array([0x42; 20]);
+        let issue = Issue::new(protocol::currency_from_string("USD"), issuer);
+        let requested = STAmount::new_with_asset(
+            sf("sfAmount"),
+            issue,
+            1_000_000_000_000_009,
+            protocol::ST_AMOUNT_MIN_OFFSET,
+            false,
+        );
+        let summed = STAmount::new_with_asset(
+            sf("sfAmount"),
+            issue,
+            1_000_000_000_000_000,
+            protocol::ST_AMOUNT_MIN_OFFSET,
+            false,
+        );
+
+        assert_eq!((requested.clone() - summed.clone()).signum(), 0);
+        assert_ne!(summed, requested);
+        assert_eq!(reverse_book_output(&requested, summed), requested);
+    }
 
     #[test]
     fn mpt_holder_to_holder_endpoints_allow_temporary_maximum_overflow() {

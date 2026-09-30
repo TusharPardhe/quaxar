@@ -151,13 +151,14 @@ fn asset_frozen<V: ReadView>(view: &V, account: AccountID, asset: Asset) -> Resu
                 .read(protocol::line(account, issue.account, issue.currency))
                 .map_err(|_| read_error())?
                 .is_some_and(|line| {
-                    line.get_field_u32(sf("sfFlags"))
-                        & if issue.account > account {
-                            lsfHighFreeze
-                        } else {
-                            lsfLowFreeze
-                        }
-                        != 0
+                    let flags = line.get_field_u32(sf("sfFlags"));
+                    let issuer_freeze = if issue.account > account {
+                        lsfHighFreeze
+                    } else {
+                        lsfLowFreeze
+                    };
+                    flags & issuer_freeze != 0
+                        || flags & (lsfHighDeepFreeze | lsfLowDeepFreeze) != 0
                 });
             Ok(if global_frozen || individually_frozen {
                 Ter::TEC_FROZEN
@@ -1978,6 +1979,47 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn offer_create_taker_gets_deep_freeze_is_unfunded_before_apply() {
+        let issuer = account(0x10);
+        let holder = account(0x20);
+        let usd = protocol::currency_from_string("USD");
+        let issue = Issue::new(usd, issuer);
+        let mut view = View::default();
+        view.insert(account_entry(issuer, 1));
+        view.insert(account_entry(holder, 1));
+        // The holder is high. Canonical getLineIfUsable rejects either deep
+        // freeze side, even without relying on the ordinary issuer-freeze bit.
+        view.insert(trust_line_entry(
+            issuer,
+            holder,
+            usd,
+            -100,
+            protocol::lsfLowDeepFreeze,
+        ));
+        let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), holder);
+            tx.set_field_amount(
+                sf("sfTakerGets"),
+                STAmount::from_iou_amount(
+                    sf("sfTakerGets"),
+                    IOUAmount::from_parts(10, 0).expect("valid IOU"),
+                    issue,
+                ),
+            );
+            tx.set_field_amount(
+                sf("sfTakerPays"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+            );
+            tx.set_field_u32(sf("sfSequence"), 1);
+        });
+
+        assert_eq!(
+            run_dex_read_view_preclaim(&view, &tx, TxType::OFFER_CREATE),
+            Some(Ter::TEC_UNFUNDED_OFFER)
+        );
     }
 
     #[test]
