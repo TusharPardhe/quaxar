@@ -101,6 +101,7 @@ impl ShadowOutcome {
                 CancelReason::StoreRotated => "cancelled_store_rotated",
                 CancelReason::Shutdown => "cancelled_shutdown",
                 CancelReason::LclInstalled => "cancelled_lcl_installed",
+                CancelReason::Superseded => "cancelled_superseded",
                 CancelReason::Explicit => "cancelled_explicit",
                 CancelReason::IdleExpired => "cancelled_idle_expired",
             },
