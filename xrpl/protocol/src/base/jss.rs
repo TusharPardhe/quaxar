@@ -1882,7 +1882,7 @@ mod tests {
 
     #[test]
     fn jss_surface_matches_current_cpp_header_count_and_keywords() {
-        assert_eq!(ALL.len(), 623);
+        assert_eq!(ALL.len(), 624);
         assert_eq!(api_version, "api_version");
         assert_eq!(nftoken_id, "nftoken_id");
         assert_eq!(attestations, "attestations");

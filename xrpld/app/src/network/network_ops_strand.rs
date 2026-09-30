@@ -3897,6 +3897,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Obsolete: 5997d5d9 removed the stable-recovery-anchor override to \
+                match rippled getPreferredLCL/getPrevLedger authority; recovery is \
+                now advisory, so reconciliation returns NoChange instead of retaining \
+                a Pending anchor. Behavior is covered by \
+                advisory_validation_recovery_does_not_veto_captured_accept."]
     fn real_reconciliation_retains_stable_anchor_and_restarts_wrong_ledger() {
         let mut root = ApplicationRoot::new(0).expect("root should build");
         let local = immutable_ledger(10, 0x10);
@@ -4052,6 +4057,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Obsolete: 5997d5d9 removed the stable-recovery-anchor override to \
+                match rippled getPreferredLCL authority; recovery is now advisory."]
     fn real_reconciliation_retains_stable_anchor_for_incompatible_resident_preference() {
         let mut root = ApplicationRoot::new(0).expect("root should build");
         let local = immutable_ledger(10, 0x10);
@@ -4129,6 +4136,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Obsolete: 5997d5d9 removed the stable-recovery-anchor override to \
+                match rippled getPreferredLCL authority; recovery is now advisory."]
     fn real_reconciliation_does_not_let_resident_parent_clear_stable_anchor() {
         let mut root = ApplicationRoot::new(0).expect("root should build");
         let parent = immutable_ledger_with_parent_and_backing(

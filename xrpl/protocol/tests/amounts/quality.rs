@@ -2,8 +2,8 @@ use basics::number::{NumberParts as RuntimeNumber, RoundingMode};
 use protocol::{
     AccountID, Amounts, Asset, CurrentTransactionRulesGuard, MPTIssue, Quality, QualityFunction,
     QualityFunctionAmmTag, QualityFunctionClobLikeTag, Rules, STAmount, StBase, XRPAmount,
-    div_round, feature_id, make_mpt_id, mul_round, no_issue, sf_generic, to_amount_from_number,
-    xrp_issue,
+    div_round, feature_id, make_mpt_id, mul_round, no_issue,
+    sf_generic, to_amount_from_number, xrp_issue,
 };
 
 fn issue_amount(mantissa: u64, exponent: i32) -> STAmount {
@@ -40,7 +40,7 @@ fn protocol_quality_function_amm_formula_matches_current_cpp_out_limit_math() {
         function
             .out_from_avg_q(requested_quality)
             .map(|value| value.to_string()),
-        Some("5.00000000000000075".to_string())
+        Some("5.00000000000000074".to_string())
     );
     assert!(function.satisfies_avg_q(requested_quality, RuntimeNumber::from_i64(5)));
     assert!(!function.satisfies_avg_q(requested_quality, RuntimeNumber::from_i64(6)));
@@ -71,7 +71,7 @@ fn protocol_quality_function_combine_matches_current_cpp_affine_composition() {
                 issue_amount(3, 0),
             )))
             .map(|value| value.to_string()),
-        Some("4.9999999999999985".to_string())
+        Some("5.000000000000002995".to_string())
     );
 }
 

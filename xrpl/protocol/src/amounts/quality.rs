@@ -450,19 +450,25 @@ fn round_mpt_number_result(
 }
 
 pub fn mul_round(v1: &STAmount, v2: &STAmount, asset: Asset, round_up: bool) -> STAmount {
-    mul_round_impl(v1, v2, asset, round_up, canonicalize_round)
+    // rippled's mulRound uses DontAffectNumberRoundMode: materialization uses
+    // the caller's ambient Number mode.
+    mul_round_impl(v1, v2, asset, round_up, canonicalize_round, false)
 }
 
 pub fn mul_round_strict(v1: &STAmount, v2: &STAmount, asset: Asset, round_up: bool) -> STAmount {
-    mul_round_impl(v1, v2, asset, round_up, canonicalize_round_strict)
+    // rippled's mulRoundStrict installs TowardsZero only while the scaled
+    // result is materialized as an STAmount.
+    mul_round_impl(v1, v2, asset, round_up, canonicalize_round_strict, true)
 }
 
 pub fn div_round(num: &STAmount, den: &STAmount, asset: Asset, round_up: bool) -> STAmount {
-    div_round_impl(num, den, asset, round_up)
+    // rippled's divRound uses DontAffectNumberRoundMode.
+    div_round_impl(num, den, asset, round_up, false)
 }
 
 pub fn div_round_strict(num: &STAmount, den: &STAmount, asset: Asset, round_up: bool) -> STAmount {
-    div_round_impl(num, den, asset, round_up)
+    // rippled's divRoundStrict installs the directed materialization mode.
+    div_round_impl(num, den, asset, round_up, true)
 }
 
 fn ceil_in_impl(
@@ -513,6 +519,7 @@ fn mul_round_impl(
     asset: Asset,
     round_up: bool,
     canonicalize_fn: fn(bool, &mut u64, &mut i32, bool),
+    strict: bool,
 ) -> STAmount {
     if v1.signum() == 0 || v2.signum() == 0 {
         return STAmount::new_with_asset(sf_generic(), asset, 0, 0, false);
@@ -610,7 +617,16 @@ fn mul_round_impl(
         canonicalize_fn(xrp, &mut amount, &mut offset, round_up);
     }
 
-    let result = STAmount::new_with_asset(sf_generic(), asset, amount, offset, result_negative);
+    // STAmount::canonicalize converts integral Number values according to the
+    // current Number rounding mode.  This scope is deliberately asymmetric:
+    // C++ mulRound leaves the ambient mode alone, while mulRoundStrict forces
+    // TowardsZero (STAmount.cpp:1594-1599, :1621-1629).
+    let result = if strict {
+        let _guard = NumberRoundModeGuard::new(RoundingMode::TowardsZero);
+        STAmount::new_with_asset(sf_generic(), asset, amount, offset, result_negative)
+    } else {
+        STAmount::new_with_asset(sf_generic(), asset, amount, offset, result_negative)
+    };
     if round_up && !result_negative && result.signum() == 0 {
         if is_native_or_mpt_asset(asset) {
             return STAmount::new_with_asset(sf_generic(), asset, 1, 0, false);
@@ -627,7 +643,13 @@ fn mul_round_impl(
     result
 }
 
-fn div_round_impl(num: &STAmount, den: &STAmount, asset: Asset, round_up: bool) -> STAmount {
+fn div_round_impl(
+    num: &STAmount,
+    den: &STAmount,
+    asset: Asset,
+    round_up: bool,
+    strict: bool,
+) -> STAmount {
     if den.signum() == 0 {
         panic!("division by zero");
     }
@@ -687,12 +709,15 @@ fn div_round_impl(num: &STAmount, den: &STAmount, asset: Asset, round_up: bool) 
         );
     }
 
-    let _guard = NumberRoundModeGuard::new(if round_up ^ result_negative {
-        RoundingMode::Upward
+    // C++ divRound uses DontAffectNumberRoundMode, while divRoundStrict
+    // installs the directed mode only for STAmount materialization
+    // (STAmount.cpp:1697-1704, :1725-1734).
+    let result = if strict {
+        let _guard = NumberRoundModeGuard::new(round_mode(result_negative, round_up));
+        STAmount::new_with_asset(sf_generic(), asset, amount, offset, result_negative)
     } else {
-        RoundingMode::Downward
-    });
-    let result = STAmount::new_with_asset(sf_generic(), asset, amount, offset, result_negative);
+        STAmount::new_with_asset(sf_generic(), asset, amount, offset, result_negative)
+    };
 
     if round_up && !result_negative && result.signum() == 0 {
         if is_native_or_mpt_asset(asset) {

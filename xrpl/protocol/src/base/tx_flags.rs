@@ -917,8 +917,8 @@ mod tests {
         assert_eq!(MPT_ISSUANCE_CREATE_FLAGS, 0x0000_00fe);
         assert_eq!(MPT_ISSUANCE_CREATE_FLAGS_MASK, 0x3fff_ff01);
         assert_eq!(tfMPTokenIssuanceCreateMask, MPT_ISSUANCE_CREATE_FLAGS_MASK);
-        assert_eq!(MPT_ISSUANCE_SET_FLAGS, 0x0000_0003);
-        assert_eq!(MPT_ISSUANCE_SET_FLAGS_MASK, 0x3fff_fffc);
+        assert_eq!(MPT_ISSUANCE_SET_FLAGS, 0x0000_01ff);
+        assert_eq!(MPT_ISSUANCE_SET_FLAGS_MASK, 0x3fff_fe00);
         assert_eq!(MPT_ISSUANCE_CREATE_MUTABLE_MASK, 0xfffc_ff81);
         assert_eq!(MPT_ISSUANCE_SET_MUTABLE_MASK, 0xffff_f000);
 

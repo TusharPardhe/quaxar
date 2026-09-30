@@ -84,7 +84,7 @@ fn issue_json_text_and_wire_cover_xrp_iou_and_mpt_shapes() {
     mpt.add(&mut mpt_ser);
     assert_eq!(
         str_hex(mpt_ser.data()),
-        "B5F762798A53D543A014CAF8B297CFF8F2F937E8000000000000000000000000000000000000000100000007"
+        "B5F762798A53D543A014CAF8B297CFF8F2F937E8000000000000000000000000000000000000000107000000"
     );
 
     let parsed_iou = STIssue::from_serial_iter(

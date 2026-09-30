@@ -169,6 +169,7 @@ fn tx_flag_catalog_getters_cover_remaining_cpp_maps() {
         vec![
             "tfMPTCanClawback",
             "tfMPTCanEscrow",
+            "tfMPTCanHoldConfidentialBalance",
             "tfMPTCanLock",
             "tfMPTCanTrade",
             "tfMPTCanTransfer",
@@ -276,7 +277,7 @@ fn tx_flag_masks_match_current_cpp_inner_batch_and_legacy_rules() {
 
 #[test]
 fn tx_flag_catalog_keeps_current_mpt_and_batch_masks() {
-    assert_eq!(MPT_ISSUANCE_CREATE_FLAGS, 0x0000_007e);
+    assert_eq!(MPT_ISSUANCE_CREATE_FLAGS, 0x0000_00fe);
     assert_eq!(
         MPT_ISSUANCE_CREATE_FLAGS_MASK,
         transaction_flags_mask(MPT_ISSUANCE_CREATE_FLAGS)
