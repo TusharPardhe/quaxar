@@ -1793,10 +1793,11 @@ impl AppConsensus {
         let root = self.adaptor.app_root.clone();
         // Quaxar's on_closed_ledger schedules a JtBatch that can otherwise
         // race the newly rebased OpenLedger before this accept finishes.
-        // This reentrant gate is the local analogue of rippled's master/ledger
-        // locks around doAccept/OpenLedger::accept; it serializes writers but
-        // deliberately does not reintroduce a global-parent rejection.
-        let _lcl_transition_guard = root.lcl_transition_gate().lock();
+        // rippled's JtAccept job holds NO lock across the candidate build
+        // (RCLConsensus.cpp:429-450); only the OpenLedger::accept transition
+        // and switchLCL run under master/ledger locks. Mirror that: build the
+        // candidate lock-free here, then take `lcl_transition_gate` only around
+        // the atomic open-ledger rebase + closed-LCL install below.
         tracing::debug!(
             target: "lcl_audit",
             work_parent_hash = %work.parent_ledger.header().hash,
@@ -1899,23 +1900,29 @@ impl AppConsensus {
                 // rejected disputes to retriableTxs, then passes the combined
                 // canonical retry set to OpenLedger::accept.
                 retriable_transactions.extend(work.rejected_dispute_retries.iter().cloned());
-                root.rebuild_open_ledger_after_consensus_with_completed(
-                    Arc::clone(&closed),
-                    &retriable_transactions,
-                    !work.rejected_dispute_retries.is_empty(),
-                    &outcome.completed_transaction_ids,
-                );
-                root.set_status_rpc_current_ledger_index(Some(outcome.next_open_index));
-                root.set_status_rpc_queue_report(Some(root.tx_q_rpc_report()));
+                // Narrow critical section: only the atomic OpenLedger rebase +
+                // closed-LCL install run under the transition gate, matching
+                // rippled's master/ledger locks around OpenLedger::accept and
+                // switchLCL. The candidate was already built lock-free above.
+                {
+                    let _lcl_transition_guard = root.lcl_transition_gate().lock();
+                    root.rebuild_open_ledger_after_consensus_with_completed(
+                        Arc::clone(&closed),
+                        &retriable_transactions,
+                        !work.rejected_dispute_retries.is_empty(),
+                        &outcome.completed_transaction_ids,
+                    );
+                    root.set_status_rpc_current_ledger_index(Some(outcome.next_open_index));
+                    root.set_status_rpc_queue_report(Some(root.tx_q_rpc_report()));
+                    // Match rippled `doAccept`: after `consensusBuilt` and
+                    // `OpenLedger::accept`, switch the closed LCL to the built
+                    // child without a global-parent rejection gate.
+                    root.install_consensus_child(Arc::clone(&closed));
+                }
                 // `RCLConsensus::Adaptor::doAccept` reports fee changes only
                 // after OpenLedger::accept has installed the new open ledger.
                 // Keep the notification on its existing client-fee-change job.
                 let _ = root.report_fee_change();
-
-                // Match rippled `doAccept`: after `consensusBuilt` and
-                // `OpenLedger::accept`, switch the closed LCL to the built
-                // child without a global-parent rejection gate.
-                root.install_consensus_child(Arc::clone(&closed));
 
                 if let Some(offset_seconds) = work.close_time_adjustment_seconds {
                     let new_offset = self

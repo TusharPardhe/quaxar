@@ -1040,7 +1040,7 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
                 parms.av_ct_consensus_pct as i32,
             );
 
-            for (t, v) in &close_time_votes {
+            for (t, v) in close_time_votes.iter().rev() {
                 if *v >= thresh_vote {
                     consensus_close_time = *t;
                     thresh_vote = *v;
