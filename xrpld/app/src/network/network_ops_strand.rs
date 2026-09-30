@@ -484,7 +484,13 @@ impl NetworkOpsStrand {
     /// Spawn the strand thread. Takes ownership of the consensus runner.
     pub fn spawn(deps: NetworkOpsStrandDeps) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let (ingress, command_rx) = ConsensusIngress::bounded(MAX_STRAND_COMMAND_QUEUE);
+        let (mut ingress, command_rx) = ConsensusIngress::bounded(MAX_STRAND_COMMAND_QUEUE);
+
+        // Wake the strand owner immediately whenever a command is enqueued, so
+        // inbound proposals/tx-sets are drained without waiting for the 50ms
+        // idle timeout (rippled hands trusted proposals to the consensus
+        // engine synchronously).
+        ingress.set_wake(deps.root.consensus_wake_callback());
 
         // Wire the command sender to the consensus runtime so external code
         // (e.g. validation event loop) can issue StartRound commands.
