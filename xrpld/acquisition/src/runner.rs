@@ -3201,6 +3201,34 @@ impl CoordinatorRunner {
         for session in self.live_sessions_for_hash(identity.hash()) {
             self.cancel_session(session, CancelReason::LclInstalled, &mut effects);
         }
+        // Cancel any live session whose target sequence is strictly below the
+        // newly-installed LCL. Those ledgers can no longer become current or
+        // validated, so a recovery/consensus acquisition still fetching their
+        // full SHAMap is obsolete work. Left running, such a session churns
+        // NodeStore reads/writes every owner turn (observed ~90 incremental
+        // write acceptances/sec) and starves the single consensus owner,
+        // producing multi-second stalls where no proposals/validations are
+        // processed. rippled abandons superseded CONSENSUS/GENERIC inbound
+        // acquisitions once a newer validated ledger exists.
+        if identity.sequence() != 0 {
+            let installed_seq = identity.sequence();
+            let superseded: Vec<SessionRef> = self
+                .state
+                .sessions
+                .iter()
+                .filter(|(_, state)| !state.phase.is_terminal())
+                .filter(|(_, state)| {
+                    state
+                        .target
+                        .sequence()
+                        .is_some_and(|seq| seq < installed_seq)
+                })
+                .map(|(session, _)| *session)
+                .collect();
+            for session in superseded {
+                self.cancel_session(session, CancelReason::Superseded, &mut effects);
+            }
+        }
         if lcl_changed || !effects.is_empty() {
             tracing::info!(
                 target: "acquisition_trace",
@@ -9827,8 +9855,10 @@ mod tests {
         let session = acquire(&mut runner, 9);
         assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(9) });
 
-        // LCL installation for a hash that is not the syncing target is ignored.
-        let effects = runner.handle_event(AcquisitionEvent::LclInstalled(identity(99)));
+        // An LCL installation for a hash that is neither the syncing target
+        // nor a superseding (higher) sequence is ignored. Seq 5 is below the
+        // target seq 9, so it does not supersede the in-flight acquisition.
+        let effects = runner.handle_event(AcquisitionEvent::LclInstalled(identity(5)));
         assert!(effects.is_empty());
         assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(9) });
 
@@ -9869,6 +9899,30 @@ mod tests {
                 lcl: identity(9),
                 published: identity(9)
             })]
+        );
+    }
+
+    #[test]
+    fn lcl_installed_above_target_cancels_superseded_session() {
+        // A session acquiring an older ledger must be abandoned once the local
+        // LCL advances past its target sequence. Left running, such an obsolete
+        // recovery/consensus acquisition churns the NodeStore every owner turn
+        // and starves the single consensus owner, producing multi-second
+        // stalls. This mirrors rippled abandoning superseded inbound ledgers.
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let session = acquire(&mut runner, 7);
+        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(7) });
+
+        // A higher, non-matching LCL supersedes the seq-7 acquisition.
+        let effects = runner.handle_event(AcquisitionEvent::LclInstalled(identity(20)));
+        assert!(effects.contains(&AcquisitionEffect::CancelSession(session)));
+        assert_eq!(
+            runner
+                .snapshot()
+                .cancelled_by_reason()
+                .get(&CancelReason::Superseded),
+            Some(&1)
         );
     }
 

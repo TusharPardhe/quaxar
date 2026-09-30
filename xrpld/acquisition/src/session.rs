@@ -116,6 +116,11 @@ pub enum CancelReason {
     /// The exact target was installed locally as the LCL before this session
     /// reached its own durability handoff.
     LclInstalled,
+    /// The local LCL advanced past this session's target sequence, so the
+    /// ledger it is acquiring can no longer become the current/validated
+    /// ledger. Cancelling it stops obsolete recovery/consensus acquisitions
+    /// from thrashing the store and starving the consensus owner.
+    Superseded,
     /// An explicit cancellation request.
     Explicit,
     /// The per-hash acquisition received no repeated demand for one minute.
@@ -130,6 +135,7 @@ impl CancelReason {
             Self::StoreRotated => "store_rotated",
             Self::Shutdown => "shutdown",
             Self::LclInstalled => "lcl_installed",
+            Self::Superseded => "superseded",
             Self::Explicit => "explicit",
             Self::IdleExpired => "idle_expired",
         }
