@@ -971,7 +971,21 @@ pub fn find_paths(
         let mut entry = BTreeMap::from([
             (
                 "source_amount".to_owned(),
-                result.actual_amount_in.json(JsonOptions::new(0)),
+                {
+                    // Mirror rippled `PathRequest::doUpdate`: before reporting
+                    // the alternative's source_amount it rewrites the IOU
+                    // issuer to the source account
+                    // (`rc.actualAmountIn.get<Issue>().account = sourceAccount`).
+                    // RippleCalc returns the amount tagged with the path's
+                    // intermediate issuer; the response must present it as the
+                    // sender's own obligation. Native XRP carries no issuer in
+                    // JSON, so this applies only to non-native IOU amounts.
+                    let mut reported = result.actual_amount_in.clone();
+                    if !reported.native() && !reported.holds_mpt_issue() {
+                        reported.set_issuer(request.source_account_id);
+                    }
+                    reported.json(JsonOptions::new(0))
+                },
             ),
             (
                 "paths_computed".to_owned(),
