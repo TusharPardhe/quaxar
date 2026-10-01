@@ -137,6 +137,7 @@ impl NodeSizeResourceProfile {
             acquisition::AdmissionBudget::default(),
             std::time::Duration::from_secs(3),
         )
+        .with_max_generic_in_flight(self.ledger_fetch_size as usize)
     }
 }
 
