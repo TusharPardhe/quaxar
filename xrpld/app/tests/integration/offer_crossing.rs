@@ -272,6 +272,134 @@ fn iou_frac(issuer: AccountID, currency: Currency, mantissa: i64, exponent: i32)
     )
 }
 
+/// Build a trust line (RippleState) with fractional balance/limit for the
+/// taker/maker in the tx-35 reproduction. `bal_mant`/`bal_exp` set the balance
+/// from the account's perspective; `limit_units` sets a round positive limit.
+fn trust_line_frac(
+    account: AccountID,
+    issuer: AccountID,
+    currency: Currency,
+    bal_mant: i64,
+    bal_exp: i32,
+    limit_units: i64,
+) -> STLedgerEntry {
+    // Order low/high by account id bytes, as RippleState requires.
+    let (low, high, bal_sign) = if account.data() < issuer.data() {
+        (account, issuer, 1i64)
+    } else {
+        (issuer, account, -1i64)
+    };
+    let keylet = protocol::line(low, high, currency);
+    let mut sle = STLedgerEntry::from_type_and_key(LedgerEntryType::RippleState, keylet.key);
+    // Balance is stored from low's perspective; if the account is `high`, the
+    // held amount is negative.
+    let bal = STAmount::from_iou_amount(
+        sf_generic(),
+        IOUAmount::from_parts(bal_sign * bal_mant, bal_exp).expect("bal"),
+        Issue::new(currency, low),
+    );
+    sle.set_field_amount(sf("sfBalance"), bal);
+    let low_limit_units = if account == low { limit_units } else { 0 };
+    let high_limit_units = if account == high { limit_units } else { 0 };
+    sle.set_field_amount(
+        sf("sfLowLimit"),
+        STAmount::from_iou_amount(
+            sf_generic(),
+            IOUAmount::from_parts(low_limit_units, 0).expect("l"),
+            Issue::new(currency, low),
+        ),
+    );
+    sle.set_field_amount(
+        sf("sfHighLimit"),
+        STAmount::from_iou_amount(
+            sf_generic(),
+            IOUAmount::from_parts(high_limit_units, 0).expect("h"),
+            Issue::new(currency, high),
+        ),
+    );
+    sle.set_field_u32(sf("sfFlags"), 0);
+    sle
+}
+
+
+/// Exact reproduction of mainnet ledger 107359777 tx index 35 crossing math.
+///
+/// A `tfSell | tfImmediateOrCancel` OfferCreate (TakerGets 0.000003702929240260918
+/// ETH, TakerPays 0.01 RLUSD) crossed a deep resting offer (TakerGets 1907.18487
+/// RLUSD, TakerPays 0.70621 ETH) on the network -> tesSUCCESS. The counter-offer
+/// quality (code 0x510d27c2c6e057c3) is strictly better than the taker's
+/// threshold (code 0x510d27cb65fe8136), so it MUST cross. The node returned
+/// tecKILLED (dry cross), driving the consensusViewChange oscillation. This
+/// pins the exact high-precision crossing math.
+#[test]
+fn tx35_exact_tiny_sell_ioc_crosses_deep_offer() {
+    let maker = acct(0x71);
+    let taker = acct(0x72);
+    let eth_issuer = acct(0x73);
+    let rlusd_issuer = acct(0x74);
+    let eth = protocol::currency_from_string("ETH");
+    let rlusd = protocol::currency_from_string("USD"); // stand-in code; math is amount-driven
+
+    // Maker rests: TakerGets 1907.18487 RLUSD, TakerPays 0.70621 ETH (gives
+    // RLUSD, wants ETH). Maker must hold the RLUSD it sells.
+    // Taker: gives ETH (holds it), wants RLUSD.
+    let mut entries = vec![
+        account_root(maker, 100_000_000_000, 2, 0),
+        account_root(taker, 100_000_000_000, 2, 0),
+        account_root(eth_issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
+        account_root(rlusd_issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
+    ];
+    // Maker holds RLUSD (to sell) and can receive ETH.
+    entries.push(trust_line_frac(maker, rlusd_issuer, rlusd, 5_000_000_000_000_000, -12, 1));
+    entries.push(trust_line_frac(maker, eth_issuer, eth, 0, 0, 1));
+    // Taker holds ETH (to sell) and can receive RLUSD.
+    entries.push(trust_line_frac(taker, eth_issuer, eth, 1_000_000_000_000_000, -15, 1));
+    entries.push(trust_line_frac(taker, rlusd_issuer, rlusd, 0, 0, 1));
+
+    let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    let resting = offer_tx(
+        maker,
+        iou_frac(eth_issuer, eth, 7_062_100_000_000_000, -16), // TakerPays 0.70621 ETH
+        iou_frac(rlusd_issuer, rlusd, 1_907_184_870_000_000, -12), // TakerGets 1907.18487 RLUSD
+        1,
+    );
+    let resting_res = full_apply(&mut view, &resting, TxType::OFFER_CREATE);
+    assert_eq!(
+        resting_res,
+        Ter::TES_SUCCESS,
+        "resting maker offer must be placed; got {resting_res:?}"
+    );
+
+    // tx35: tfSell+IOC, TakerGets 0.000003702929240260918 ETH, TakerPays 0.01 RLUSD.
+    let tx35 = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(
+            sf("sfTakerPays"),
+            iou_frac(rlusd_issuer, rlusd, 1_000_000_000_000_000, -17), // 0.01 RLUSD
+        );
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            iou_frac(eth_issuer, eth, 3_702_929_240_260_918, -21), // 0.000003702929240260918 ETH
+        );
+        tx.set_field_u32(
+            sf("sfFlags"),
+            protocol::tfSell | protocol::tfImmediateOrCancel,
+        );
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let result = full_apply(&mut view, &tx35, TxType::OFFER_CREATE);
+    assert_eq!(
+        result,
+        Ter::TES_SUCCESS,
+        "tx35 crosses a strictly-better-quality deep offer and must return \
+         tesSUCCESS (network outcome); node returned {result:?}"
+    );
+}
+
+
 /// Regression guard for the mainnet oscillation class (ledger 107359777 tx
 /// index 35): a *tiny* `tfSell | tfImmediateOrCancel` OfferCreate that is fully
 /// coverable by deep, well-priced resting liquidity must deliver funds and

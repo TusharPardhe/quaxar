@@ -315,12 +315,22 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
         let mut cross_paths = protocol::STPathSet::new(sf("sfPaths"));
         if !taker_gets.native() && !taker_pays.native() {
+            // rippled OfferCreate.cpp: when neither side is XRP, cross through
+            // an extra path with XRP as the intermediate between two books,
+            // built as a currency-only element:
+            //   path.emplaceBack(std::nullopt, xrpCurrency(), std::nullopt)
+            // force_asset=true is required so the XRP currency element carries
+            // TYPE_CURRENCY. With force_asset=false the element collapses to
+            // TYPE_NONE (because the asset is XRP), which valid_path_element
+            // rejects as temBAD_PATH -> to_strands returns zero strands -> the
+            // cross is treated as dry and every IOU/IOU OfferCreate that must
+            // cross wrongly returns tecKILLED.
             let mut xrp_path = protocol::STPath::new();
             xrp_path.push_back(protocol::STPathElement::inferred(
                 protocol::AccountID::default(),
                 protocol::xrp_currency(),
                 protocol::AccountID::default(),
-                false,
+                true,
             ));
             cross_paths.push_back(xrp_path);
         }
