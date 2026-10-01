@@ -261,6 +261,102 @@ fn sell_fok_partial_cross_remains_killed() {
         "the killed crossing must not commit its partial fill"
     );
 }
+/// Build a fractional IOU amount (mantissa * 10^exponent) for a currency/issuer.
+/// Needed to reproduce sub-unit offer crossings that integer `iou()` cannot
+/// express.
+fn iou_frac(issuer: AccountID, currency: Currency, mantissa: i64, exponent: i32) -> STAmount {
+    STAmount::from_iou_amount(
+        sf_generic(),
+        IOUAmount::from_parts(mantissa, exponent).expect("fractional iou"),
+        Issue::new(currency, issuer),
+    )
+}
+
+/// Regression guard for the mainnet oscillation class (ledger 107359777 tx
+/// index 35): a *tiny* `tfSell | tfImmediateOrCancel` OfferCreate that is fully
+/// coverable by deep, well-priced resting liquidity must deliver funds and
+/// return `tesSUCCESS` -- it must NOT be killed by the Immediate-or-Cancel
+/// no-cross rule.
+///
+/// On mainnet the node built a divergent candidate ledger because tx 35
+/// resolved to `tecKILLED` (crossed nothing) where the network crossed and
+/// returned `tesSUCCESS`; the resulting tx-tree/account-hash mismatch drove the
+/// `consensusViewChange` demotion. This guard pins the general property that a
+/// sub-unit sell IOC offer against sufficient opposite-side liquidity crosses,
+/// matching rippled's flow() crossing. (The byte-exact tx-35 reproduction
+/// requires the full on-ledger ETH/RLUSD state and is tracked as a replay
+/// fixture.)
+#[test]
+fn tiny_sell_ioc_offer_crosses_resting_liquidity() {
+    let maker = acct(0x61);
+    let taker = acct(0x62);
+    let issuer = acct(0x63);
+    let usd = usd_currency();
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(maker, 10_000_000_000, 1, 0),
+            account_root(taker, 10_000_000_000, 1, 0),
+            account_root(issuer, 10_000_000_000, 0, protocol::lsfDefaultRipple),
+            // Maker holds plenty of USD and rests a large offer.
+            trust_line(maker, issuer, usd, 1_000, 1_000_000, 0),
+            // Taker holds USD to sell (tx35's taker held the ETH it sold).
+            trust_line(taker, issuer, usd, 10, 1_000_000, 0),
+        ],
+        vec!["fixFillOrKill", "fixReducedOffersV2"],
+    );
+    let mut view = new_view(ledger);
+
+    // Maker rests: give 100 USD, want 1,000,000 drops XRP (TakerPays=XRP,
+    // TakerGets=USD). Deep, well-priced resting liquidity.
+    let resting = offer_tx(maker, xrp(1_000_000), iou(issuer, usd, 100), 1);
+    assert_eq!(
+        full_apply(&mut view, &resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "resting maker offer must be placed"
+    );
+
+    let before_usd = taker_usd(&view, taker, issuer, usd);
+
+    // Taker: a TINY tfSell+IOC offer giving XRP, wanting USD (opposite side of
+    // the maker). Gives 1 drop XRP, wants 0.0001 USD. At the resting quality
+    // this is fully satisfiable, so the crossing must deliver funds ->
+    // tesSUCCESS, matching rippled flow() crossing.
+    let tiny_sell_ioc = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), iou_frac(issuer, usd, 1, -4)); // wants 0.0001 USD
+        tx.set_field_amount(sf("sfTakerGets"), xrp(1)); // gives 1 drop XRP
+        tx.set_field_u32(
+            sf("sfFlags"),
+            protocol::tfSell | protocol::tfImmediateOrCancel,
+        );
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let result = full_apply(&mut view, &tiny_sell_ioc, TxType::OFFER_CREATE);
+    assert_eq!(
+        result,
+        Ter::TES_SUCCESS,
+        "a tiny tfSell+IOC offer fully coverable by resting liquidity must cross \
+         (tesSUCCESS), not be killed; node returned {result:?}"
+    );
+
+    // Funds must actually have moved: the taker received USD from the maker.
+    let after_usd = taker_usd(&view, taker, issuer, usd);
+    assert!(
+        after_usd > before_usd,
+        "taker must receive USD from the crossing (before={before_usd}, after={after_usd})"
+    );
+}
+
+/// Read the taker's USD trust-line balance as a string for cross assertions.
+fn taker_usd(view: &impl ReadView, taker: AccountID, issuer: AccountID, usd: Currency) -> String {
+    view.read(protocol::line(taker, issuer, usd))
+        .ok()
+        .flatten()
+        .map(|sle| sle.get_field_amount(sf("sfBalance")).iou().to_string())
+        .unwrap_or_else(|| "0".to_string())
+}
+
 
 /// `BookStep::execOffer` applies issuer authorization to synthetic AMM offers
 /// as well as CLOB offers.  The AMM pool may exist before its trust line is
