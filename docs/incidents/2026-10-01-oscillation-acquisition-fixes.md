@@ -679,3 +679,41 @@ AMMLiquidity/BookStep for this pool+quality and fix the rounding to match.
 STATUS: 2 root causes fixed+deployed (frequent oscillation eliminated); this AMM
 sell-crossing rounding is the last known divergence class. Node healthy on
 quaxar.canonorder-5886b03a.
+
+## Iter (round 6, final) — AMM offer GENERATION verified faithful; divergence narrowed to limit/application
+
+Compared the node's AMM offer-at-quality generation to rippled line-by-line:
+  - node amm_offer_starting_with_pays == rippled getAMMOfferStartWithTakerPays
+    (AMMHelpers.h): identical quadratic (a=f, b=pool.in*(1+f),
+    c=pool.in^2 - pool.in*pool.out*q), identical nTakerPaysConstraint, identical
+    `toAmount(pool.in, nTakerPays, Downward)` then swapAssetIn, identical
+    reduceOffer fallback.
+  - node amm_offer_starting_with_gets == rippled getAMMOfferStartWithTakerGets.
+  - node amm_swap_asset_in/out staged Upward/Downward guards match AMMHelpers.
+This case is SINGLE-path (XRP<->RLUSD, one side native, no IOU/IOU XRP bridge),
+so it uses amm_offer_for_clob_quality (not the multi-path Fibonacci path), which
+is faithful. => the AMM synthetic-offer GENERATION is not the divergence.
+
+Therefore the -0.0000306 RLUSD is in how BookStep APPLIES/limits the generated
+AMM offer during the sell crossing: get_amm_offer -> amm_offer.limit(raw_in_limit
+= mul_ratio(remaining_in, QUALITY_ONE, tr_in, false), remaining_out) -> the
+clamped re-swap, and the step_in/step_out accounting (mul_ratio tr_in rounding),
+plus how the AMM contribution is summed with the CLOB contribution
+(insert_sorted/sum_sorted smallest-to-largest IOU re-summation). The exact
+differing step requires a faithful multi-liquidity replay (real AMM pool
+reserves 1526460107335 drops / 2278196.924178077 RLUSD, fee 197 + the rU8Q CLOB
+offer + the self-cross offer + fixAMMv1_1) to diff the node's clamped AMM output
+(1.533204646) vs rippled's (1.533235246).
+
+MEASURED (2-fix binary quaxar.canonorder-5886b03a, 30 min steady proposing):
+same_seq_divergent = 2 (seqs 107369025, 107369368 -- BOTH contain tfSell|FOK
+OfferCreates crossing AMM liquidity), node_behind_lag = 14. The remaining
+divergence is this ONE class (AMM sell-crossing output application).
+
+CAMPAIGN RESULT: 3 root causes fixed+deployed over the campaign
+(1) IOU/IOU OfferCreate XRP-bridge path temBAD_PATH (commit 567ee50d),
+(2) CanonicalTXSet ordering / TransactionIndex shift (commit 5886b03a),
+(and earlier the acquisition/sweep PRs). Frequent oscillation ELIMINATED;
+residual is a single rare AMM sell-crossing rounding class (~2 per 30 min),
+narrowed to the BookStep AMM offer limit/application (generation proven faithful
+to rippled this iteration). Node healthy and proposing on the 2-fix binary.
