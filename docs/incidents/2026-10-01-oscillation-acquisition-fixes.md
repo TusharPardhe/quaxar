@@ -217,3 +217,34 @@ Expected: tesSUCCESS, deliver 19309377 drops via AMM. Quaxar: tecPATH_DRY.
 A focused unit test comparing get_amm_offer's computed (in,out,quality) for
 pool (38763.602643 XRP / 57500.75485900167 USDC, fee 54) at target quality
 0.6677 against rippled changeSpotPriceQuality will expose the ULP divergence.
+
+## Iteration 5 — AMM path VERIFIED CORRECT via live tracing (AMM was a red herring)
+
+Deployed a temporary amm_divergence trace to the live validator and captured the
+real book-step AMM decisions. Findings:
+- 210/298 book steps generated an AMM synthetic offer (AMM works for most pools).
+- get_amm_offer None reasons: spot_le_clob (rippled-correct skip when CLOB better),
+  amm_sle_not_found (no AMM for that pair), and clob_quality_offer_none.
+- Reproduced a clob_quality_offer_none case (RLUSD/XRP AMM, pool 2269641.503657631
+  RLUSD / 1532052325896 drops XRP, fee 197, target quality 5694034051977024039)
+  as a unit test. amm_offer_starting_with_gets returns None because the
+  getAMMOfferStartWithTakerGets CONSTRAINT (pool.out - pool.in/(q*fee_mult)) is
+  GENUINELY NEGATIVE (-247,593,049 in exact 50-digit Decimal arithmetic), so the
+  AMM legitimately cannot reach the target quality via StartWithTakerGets. This
+  matches rippled: changeSpotPriceQuality returns nullopt and the CLOB is used.
+  NOT a precision bug, NOT a divergence.
+- The USDC->XRP AMM primitive test (amm_offer_for_usdc_to_xrp_clob_tip_is_not_skipped)
+  PASSES. So the AMM path is rippled-correct.
+
+CONCLUSION: The AMM synthetic-offer generation is verified correct against
+rippled (both the quadratic/changeSpotPriceQuality primitive and the live
+decisions). The tecPATH_DRY on tx 8CD880D2 is therefore NOT caused by the AMM
+skip; the divergence lies elsewhere in the tfPartialPayment flow (strand
+execution / rev-fwd liquidity / partial-delivery handling). The AMM was a red
+herring. Diagnostic traces and the incorrect RLUSD assertion were reverted;
+the valid USDC regression test is retained on main. Node restored to
+parallel-sweep-f915266e (proposing, healthy).
+
+NEXT: re-examine the tfPartialPayment flow rev/fwd execution for 8CD880D2 (the
+strand builds and the AMM/CLOB have liquidity, yet total_out=0). Capture the
+per-strand rev/fwd amounts for this payment to find where output becomes zero.
