@@ -183,8 +183,8 @@ where
     };
 
     // Cross offers (skip for passive offers — they don't cross)
-    let (remaining_pays, remaining_gets) = if is_passive {
-        (taker_pays.clone(), taker_gets.clone())
+    let (remaining_pays, remaining_gets, crossed) = if is_passive {
+        (taker_pays.clone(), taker_gets.clone(), false)
     } else {
         let mut book_step = BookStepImpl::new(reverse_book);
         let cross_result = match flow_cross(
@@ -196,18 +196,49 @@ where
             Ok(res) => res,
             Err(_) => return ApplyResult::new(Ter::TEF_FAILURE, false, false),
         };
+        // `crossed` mirrors rippled OfferCreate: the offer transferred funds
+        // (the taker received some output). Used by the IOC `!crossed`
+        // tecKILLED rule below.
+        let crossed = cross_result.taker_gets.signum() > 0;
         (
             taker_pays.clone() - cross_result.taker_pays.clone(),
             taker_gets.clone() - cross_result.taker_gets.clone(),
+            crossed,
         )
     };
 
-    // Handle FOK/IOC flags
-    if (flags & TF_FILL_OR_KILL) != 0 && remaining_pays.signum() > 0 {
-        return ApplyResult::new(Ter::TEC_KILLED, false, false);
+    // Fill-or-kill: failure to fully cross aborts with only fees paid. Under
+    // fixFillOrKill a tfSell FOK checks that all takerGets were delivered
+    // (output side) rather than that all takerPays were consumed, matching
+    // rippled OfferCreate.cpp.
+    let fix_fill_or_kill = ctx
+        .view()
+        .rules()
+        .enabled(&protocol::feature_id("fixFillOrKill"));
+    let is_sell = (flags & TF_SELL) != 0;
+    if (flags & TF_FILL_OR_KILL) != 0 {
+        let not_fully_filled = if fix_fill_or_kill && is_sell {
+            remaining_gets.signum() > 0
+        } else {
+            remaining_pays.signum() > 0
+        };
+        if not_fully_filled {
+            return ApplyResult::new(Ter::TEC_KILLED, false, false);
+        }
     }
 
-    if (flags & TF_IMMEDIATE_OR_CANCEL) != 0 || remaining_pays.signum() <= 0 {
+    // Immediate-or-cancel: the uncrossed remainder is cancelled (not placed)
+    // and the operation succeeds -- EXCEPT an IOC offer that transferred
+    // absolutely no funds returns tecKILLED, matching rippled
+    // OfferCreate.cpp (XRPLF/rippled#4115).
+    if (flags & TF_IMMEDIATE_OR_CANCEL) != 0 {
+        if !crossed {
+            return ApplyResult::new(Ter::TEC_KILLED, false, false);
+        }
+        return ApplyResult::new(Ter::TES_SUCCESS, true, false);
+    }
+
+    if remaining_pays.signum() <= 0 {
         return ApplyResult::new(Ter::TES_SUCCESS, true, false);
     }
 
