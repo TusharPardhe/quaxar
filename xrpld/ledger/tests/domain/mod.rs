@@ -4,6 +4,7 @@ mod accepted_ledger_tx;
 mod account_root_helpers;
 mod amendments;
 mod amm_helpers;
+mod amm_reverse_book_divergence;
 mod amm_utils;
 mod core_helpers;
 mod credential_helpers;
