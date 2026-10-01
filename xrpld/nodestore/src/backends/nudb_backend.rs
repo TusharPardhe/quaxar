@@ -1172,7 +1172,7 @@ impl NuDbBackend {
         let originals = self
             .burst_originals
             .lock()
-            .expect("nudb burst originals mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if originals.buckets.is_empty() {
             return Ok(());
         }
@@ -1342,7 +1342,7 @@ impl NuDbBackend {
         let mut runtime = self
             .runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if runtime.open_state.is_open() {
             return Err("NuDB backend is already open".to_owned());
         }
@@ -1383,7 +1383,7 @@ impl NuDbBackend {
             let mut originals = self
                 .burst_originals
                 .lock()
-                .expect("nudb burst originals mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
             originals.active = false;
             originals.original_bucket_count = 0;
             originals.buckets.clear();
@@ -1402,9 +1402,12 @@ impl NuDbBackend {
     }
 
     fn fail_stop_error(&self) -> Option<String> {
+        // Read-only accessor also used on the post-crash cleanup path, where
+        // `runtime` may be poisoned by a prior failpoint panic. The flag it
+        // reads is still valid, so recover the guard rather than panic.
         self.runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .fail_stop_error
             .clone()
     }
@@ -1421,7 +1424,7 @@ impl NuDbBackend {
             let mut runtime = self
                 .runtime
                 .lock()
-                .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
             if runtime.burst_checkpoint_active {
                 let fail_stop = runtime
                     .fail_stop_error
@@ -1475,7 +1478,7 @@ impl NuDbBackend {
             let mut runtime = self
                 .runtime
                 .lock()
-                .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !runtime.open_state.is_open() {
                 return Err("NuDB backend is not open".to_owned());
             }
@@ -1495,7 +1498,7 @@ impl NuDbBackend {
         if let Err(error) = self.write_log_checkpoint(key_header) {
             self.runtime
                 .lock()
-                .expect("nudb backend runtime mutex must not be poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .burst_checkpoint_active = false;
             return Err(error);
         }
@@ -1503,7 +1506,7 @@ impl NuDbBackend {
             let mut originals = self
                 .burst_originals
                 .lock()
-                .expect("nudb burst originals mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
             originals.original_bucket_count = key_header.buckets;
             originals.active = true;
             originals.buckets.clear();
@@ -1534,7 +1537,7 @@ impl NuDbBackend {
             let mut runtime = self
                 .runtime
                 .lock()
-                .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !runtime.open_state.is_open() {
                 return Err("NuDB backend is not open".to_owned());
             }
@@ -1561,13 +1564,13 @@ impl NuDbBackend {
             let mut runtime = self
                 .runtime
                 .lock()
-                .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
             runtime.burst_pending_writes = 0;
             runtime.burst_checkpoint_active = false;
             let mut originals = self
                 .burst_originals
                 .lock()
-                .expect("nudb burst originals mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
             originals.active = false;
             originals.buckets.clear();
         }
@@ -1584,7 +1587,7 @@ impl NuDbBackend {
             let runtime = self
                 .runtime
                 .lock()
-                .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
             runtime.open_state.is_open() && runtime.burst_checkpoint_active
         };
 
@@ -1608,13 +1611,13 @@ impl NuDbBackend {
                 let mut runtime = self
                     .runtime
                     .lock()
-                    .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
                 runtime.burst_pending_writes = 0;
                 runtime.burst_checkpoint_active = false;
                 let mut originals = self
                     .burst_originals
                     .lock()
-                    .expect("nudb burst originals mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
                 originals.active = false;
                 originals.buckets.clear();
             }
@@ -1627,7 +1630,7 @@ impl NuDbBackend {
         let mut runtime = self
             .runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         runtime.open_state.close();
         runtime.key_header = None;
         runtime.split_fraction = 0;
@@ -1643,7 +1646,7 @@ impl NuDbBackend {
     pub fn open_state(&self) -> NuDbOpenState {
         self.runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .open_state
             .clone()
     }
@@ -1651,7 +1654,7 @@ impl NuDbBackend {
     pub fn key_file_header(&self) -> Option<NuDbKeyFileHeader> {
         self.runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .key_header
     }
 
@@ -1659,7 +1662,7 @@ impl NuDbBackend {
         let runtime = self
             .runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !runtime.open_state.is_open() {
             return Err("NuDB backend is not open".to_owned());
         }
@@ -1750,7 +1753,7 @@ impl NuDbBackend {
         let mut originals = self
             .burst_originals
             .lock()
-            .expect("nudb burst originals mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let burst_active = originals.active;
         if burst_active
             && bucket_index < originals.original_bucket_count
@@ -2194,7 +2197,7 @@ impl NuDbBackend {
         let _store_guard = self
             .store_mutex
             .lock()
-            .expect("nudb backend store mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.ensure_not_fail_stopped()?;
         // Commit the active c0/c1 transaction before dropping its dirty view;
         // verification then reads only the durable key file.
@@ -2265,7 +2268,7 @@ impl NuDbBackend {
         let _store_guard = self
             .store_mutex
             .lock()
-            .expect("nudb backend store mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Err(error) = self.ensure_not_fail_stopped() {
             if fail_fast {
                 return Err(error);
@@ -2383,7 +2386,7 @@ impl Backend for NuDbBackend {
         let runtime = self
             .runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Some(
             runtime
                 .key_header
@@ -2416,24 +2419,42 @@ impl Backend for NuDbBackend {
     fn is_open(&self) -> bool {
         self.runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .open_state
             .is_open()
     }
 
     fn close(&self) -> Result<(), String> {
-        let _store_guard = self
-            .store_mutex
-            .lock()
-            .expect("nudb backend store mutex must not be poisoned");
+        // `close` is part of the crash-recovery / RAII teardown path. When a
+        // prior operation panicked at a deliberate failpoint (or any crash)
+        // while holding `store_mutex`, the mutex is poisoned. The store handle
+        // it guards is structurally valid and must still be closed, but a
+        // poisoned mutex signals an interrupted mutation: close must NOT commit
+        // or clear the recovery log, exactly like the fail-stop path, so a
+        // later reopen runs normal NuDB log recovery to the pre-mutation
+        // checkpoint. C++ has no mutex poisoning; this is the Rust-equivalent
+        // crash signal.
+        let store_lock = self.store_mutex.lock();
+        let crashed = store_lock.is_err();
+        let _store_guard = store_lock.unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self
             .runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .open_state
             .is_open()
         {
             return Ok(());
+        }
+
+        if crashed {
+            // Interrupted by a crash: drop live views of the partially mutated
+            // generation without committing, preserving the durable recovery
+            // log for the next reopen.
+            let reason = self
+                .fail_stop_error()
+                .unwrap_or_else(|| "nudb store closed after crash".to_owned());
+            return Err(self.close_fail_stopped_generation(&reason));
         }
 
         if let Some(error) = self.fail_stop_error() {
@@ -2452,7 +2473,7 @@ impl Backend for NuDbBackend {
         let mut runtime = self
             .runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !runtime.open_state.is_open() {
             return Ok(());
         }
@@ -2468,7 +2489,7 @@ impl Backend for NuDbBackend {
             let mut originals = self
                 .burst_originals
                 .lock()
-                .expect("nudb burst originals mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
             originals.active = false;
             originals.original_bucket_count = 0;
             originals.buckets.clear();
@@ -2694,7 +2715,7 @@ impl Backend for NuDbBackend {
         let _store_guard = self
             .store_mutex
             .lock()
-            .expect("nudb backend store mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.metrics
             .store_lock_wait_ns
             .fetch_add(lock_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2707,7 +2728,7 @@ impl Backend for NuDbBackend {
                 let runtime = self
                     .runtime
                     .lock()
-                    .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !runtime.open_state.is_open() {
                     let error = "NuDB backend is not open".to_owned();
                     self.journal.log(JournalLevel::Error, &error);
@@ -2738,7 +2759,7 @@ impl Backend for NuDbBackend {
                 let mut runtime = self
                     .runtime
                     .lock()
-                    .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
                 self.ensure_primary_bucket(&mut runtime)
                     .inspect_err(|error| {
                         self.journal.log(JournalLevel::Error, error);
@@ -2832,7 +2853,7 @@ impl Backend for NuDbBackend {
         let _store_guard = self
             .store_mutex
             .lock()
-            .expect("nudb backend store mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.metrics
             .store_lock_wait_ns
             .fetch_add(lock_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2845,7 +2866,7 @@ impl Backend for NuDbBackend {
                 let runtime = self
                     .runtime
                     .lock()
-                    .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !runtime.open_state.is_open() {
                     return Err("NuDB backend is not open".to_owned());
                 }
@@ -2878,7 +2899,7 @@ impl Backend for NuDbBackend {
                 let mut runtime = self
                     .runtime
                     .lock()
-                    .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
                 self.ensure_primary_bucket(&mut runtime)?;
                 if !bulk_importing {
                     runtime.split_fraction = runtime
@@ -2969,7 +2990,7 @@ impl Backend for NuDbBackend {
         let _store_guard = self
             .store_mutex
             .lock()
-            .expect("nudb backend store mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.commit_active_burst_if_needed()
             .and_then(|()| self.sync_data_files())
     }
@@ -2992,11 +3013,11 @@ impl Backend for NuDbBackend {
         let _store_guard = self
             .store_mutex
             .lock()
-            .expect("nudb backend store mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut runtime = self
             .runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.ensure_primary_bucket(&mut runtime)?;
         let header = runtime
             .key_header
@@ -3078,7 +3099,7 @@ impl Backend for NuDbBackend {
     fn set_delete_path(&self) {
         self.runtime
             .lock()
-            .expect("nudb backend runtime mutex must not be poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .open_state
             .set_delete_path();
     }
