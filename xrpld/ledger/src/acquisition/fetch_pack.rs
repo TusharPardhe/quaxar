@@ -49,7 +49,10 @@ where
         (sha512_half(&data) == hash).then_some(data)
     }
 
-    pub fn sweep(&self) {
+    pub fn sweep(&self)
+    where
+        S: Send,
+    {
         self.cache.sweep();
     }
 

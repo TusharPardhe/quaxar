@@ -599,7 +599,12 @@ where
         }
     }
 
-    pub fn sweep(&self) {
+    pub fn sweep(&self)
+    where
+        P: Send,
+        T: Send,
+        S: Send,
+    {
         let now = self.clock.now();
         let mut swept_pointers = Vec::new();
         let lock_hold_duration;
@@ -627,17 +632,37 @@ where
             let strong_cache_before = state.cache_count;
             let capacity_before = state.cache.total_capacity();
             let mut all_counts = SweepCounts::default();
-            for partition in state.cache.map_mut() {
-                let (counts, mut removed, _keys) = sweep_value_partition(partition, when_expire);
-                if counts.cache_removals != 0 || counts.map_removals != 0 {
-                    self.instrumentation.logger.debug(&format!(
-                        "TaggedCache partition sweep {}: cache = {}-{}, map-={}",
-                        self.name,
-                        partition.len(),
-                        counts.cache_removals,
-                        counts.map_removals
-                    ));
-                }
+            // Sweep partitions in parallel, mirroring rippled's
+            // `TaggedCache::sweep` which spawns one `sweepHelper` worker per
+            // partition and joins them while holding the cache lock. The Rust
+            // port previously swept every partition serially on the calling
+            // thread, so the single cache mutex was held for the full sum of
+            // all partition scans. On a large shared cache (the NodeFamily
+            // FullBelow/treenode caches reach hundreds of thousands of
+            // entries during catch-up) that serial hold blocked every
+            // concurrent `insert`/`touch`/`contains` from the acquisition
+            // owner and the consensus strand for seconds. Partitions are
+            // disjoint `&mut` maps, so scoped worker threads sweep them
+            // concurrently; the wall-clock lock hold drops to roughly
+            // `work / partitions`, matching the reference.
+            let partitions: Vec<&mut _> = state.cache.map_mut().iter_mut().collect();
+            let partition_results: Vec<(SweepCounts, Vec<_>)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = partitions
+                    .into_iter()
+                    .map(|partition| {
+                        scope.spawn(move || {
+                            let (counts, removed, _keys) =
+                                sweep_value_partition(partition, when_expire);
+                            (counts, removed)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("TaggedCache sweep worker panicked"))
+                    .collect()
+            });
+            for (counts, mut removed) in partition_results {
                 all_counts.cache_removals += counts.cache_removals;
                 all_counts.map_removals += counts.map_removals;
                 all_counts.strong_removals += counts.strong_removals;
