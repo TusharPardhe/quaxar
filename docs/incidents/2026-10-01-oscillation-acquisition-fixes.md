@@ -278,3 +278,37 @@ The book step rev() for the IOU->XRP direction is the prime suspect
 (limitStepOut / the reverse book consumption producing zero out).
 
 Node restored to parallel-sweep-f915266e; main has no diagnostic code.
+
+## New campaign iter 1 — CONFIRMED divergence + localized to strand step-0 dry
+
+CONFIRMED a real tx divergence by cross-checking node tecPATH_DRY candidates
+against the live network: tx 01D0D930DDF194A379A3A95941949ABE1A9B6BA969A9CD62F7D046C025B03F71
+(ledger 107359089) is a self-directed tfPartialPayment FRH->XRP (Account==Dest,
+SendMax=FRH, Amount=1M XRP, Flags=131072, no explicit Paths). NETWORK:
+tesSUCCESS delivering 564765 drops via a book/offer path (3 AccountRoot, 2
+DirectoryNode, 2 RippleState). NODE: tecPATH_DRY. (3 of 4 sampled dry txns the
+network ALSO rejects as tecPATH_DRY -> those are rippled-correct; only this one
+diverges, so most node tecPATH_DRY are correct.)
+
+Live flow_divergence tracing localized the dry: it is NOT the AMM/book step. It
+is STEP 0 of the strand (reverse_probe step_rev_zero at index 0) producing zero
+output, in two variants:
+- step_kind=Direct with has_line=false: max_payment_flow returns zero because
+  there is NO trust line between src and the SendMax issuer for that currency.
+  In rippled DirectIPaymentStep::check returns terNO_LINE which REJECTS the
+  strand at construction (so an alternative path/default is used), whereas
+  Quaxar builds the strand and dries it during execution. SUSPECT: strand
+  construction / validate_strand should reject a no-line direct step like
+  rippled's check(), OR the default path should not route through a nonexistent
+  line.
+- step_kind=XrpEndpoint at index 0 (XRP source): the XRP endpoint produces zero.
+
+NEXT: for the FRH->XRP divergence, determine the exact strand rippled builds vs
+Quaxar. rippled's default path for a self-payment IOU->XRP with SendMax issuer:
+[src -> (direct to issuer) -> book -> XRP]. If src has no line to the FRH
+issuer, rippled's check() rejects that strand (terNO_LINE) -> payment uses the
+book directly from src's own issued FRH? Verify validate_strand parity with
+DirectIPaymentStep::check (terNO_LINE / terNO_AUTH) so Quaxar rejects the same
+strands rippled rejects, changing which path executes.
+
+Node restored to parallel-sweep-f915266e; main has no diagnostic code.
