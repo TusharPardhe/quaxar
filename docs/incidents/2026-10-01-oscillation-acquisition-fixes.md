@@ -384,3 +384,41 @@ Two issues:
 NEXT: build a focused flow_cross reproduction for tx35's crossing, find why the
 tiny tfSell offer crosses zero, fix the rounding to match rippled, verify the
 affected-node count becomes 6 and result tesSUCCESS.
+
+## Iter 4 — tiny-amount hypothesis DISPROVEN; localized to BookTip traversal
+
+Decoded tx 35 fully: OfferCreate tfSell|tfImmediateOrCancel, TakerGets
+0.000003702929240260918 ETH / TakerPays 0.01 RLUSD, node tecKILLED(150) / 1
+affected vs network tesSUCCESS / 6 affected (crossed the rMsXVzCug ETH/RLUSD
+offer).
+
+Built a reproduction (xrpld/app/tests/integration/offer_crossing.rs
+`tiny_sell_ioc_offer_crosses_resting_liquidity`): a sub-unit tfSell+IOC offer
+(gives 1 drop XRP, wants 0.0001 USD) against deep resting liquidity CROSSES
+correctly (tesSUCCESS, committed as a passing regression guard). => The
+tiny/sub-precision rounding hypothesis is DISPROVEN; CLOB crossing of tiny
+offers is correct. (Early red runs were test-direction errors: both offers on
+the same book side -> genuine no-cross -> tecKILLED, which also independently
+validated the committed IOC no-cross tecKILLED parity fix a4ac0665.)
+
+Localized the tx-35 "crossed nothing" to BookTip traversal
+(xrpld/ledger/src/domain/book_tip.rs). For tx 35 the node's flow_cross loop got
+`next_offer == None`, i.e. `view.succ(book_base, Some(book_end))` returned None
+=> no directory page found in tx35's book range. Candidate causes to verify
+next:
+  1. get_book_base/book_end orientation for the ETH(issuer rvYAfWj5)/RLUSD
+     (issuer rMxCKbED) pair vs the counter-offer's BookDirectory
+     4327BA72...057C3 (does succ's (book_base, book_end) range actually contain
+     that directory?).
+  2. SEPARATE confirmed concern: BookTip::step ERASES current_entry on every
+     advance (view.erase at top of step) -- destructive read traversal; correct
+     only because flow_cross treats step as consume. Revisit when moving
+     OfferCreate onto the full flow() engine.
+
+NEXT (final iter): build a byte-exact tx-35 replay fixture (parent ledger +
+both book directions + account roots + trust lines for ETH/RLUSD), replay via
+the offer_crossing fixture harness, confirm the node reproduces tecKILLED, then
+fix get_book_base/succ (or move OfferCreate crossing to the flow() engine used
+by payments) so the counter-offer is found and crossed -> tesSUCCESS / 6
+affected. Verify affected-node parity, run full suites, deploy, measure
+demotions/min = 0 over >=15min.
