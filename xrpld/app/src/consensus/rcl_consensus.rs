@@ -1246,10 +1246,26 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             result.txns.id(),
             items.iter().map(|item| (item.data().len(), item.data())),
         );
-        let txns = decoded_txns
+        let decoded_canonical = decoded_txns
             .into_iter()
             .map(|tx| canonicalize_consensus_transaction(self.transaction_master.as_ref(), tx))
             .collect::<Vec<_>>();
+        // rippled RCLConsensus::buildLCL builds a CanonicalTXSet
+        // (`retriableTxs`) from the consensus tx-set items and applies it in
+        // canonical order (salted account, then sequence, then tx id). The raw
+        // SHAMap item order is tx-hash order, which can place a higher sequence
+        // of an account before a lower one; applying out of sequence forces a
+        // spurious retry that is only re-applied in a later pass and thus lands
+        // at a later TransactionIndex. Because TransactionIndex is serialized
+        // into every transaction's metadata, that shift changes the metadata of
+        // every subsequent transaction and diverges the ledger hash. Ordering
+        // through CanonicalTXSet keeps each account's sequence contiguous so the
+        // first pass applies them in order, matching rippled.
+        let mut canonical_set = ledger::CanonicalTXSet::new(result.txns.id());
+        for tx in &decoded_canonical {
+            canonical_set.insert(std::sync::Arc::clone(tx));
+        }
+        let txns = canonical_set.drain_ordered();
         let canonical_input_order = txns
             .iter()
             .enumerate()
