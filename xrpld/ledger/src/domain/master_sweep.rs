@@ -21,7 +21,7 @@ where
 impl<C, S> LedgerMasterSweepTarget for LedgerHistory<C, S>
 where
     C: CacheClock,
-    S: BuildHasher + Clone,
+    S: BuildHasher + Clone + Send,
 {
     fn sweep(&self) {
         LedgerHistory::sweep(self);
@@ -31,7 +31,7 @@ where
 impl<C, S> LedgerMasterSweepTarget for FetchPackCache<C, S>
 where
     C: CacheClock,
-    S: BuildHasher + Clone,
+    S: BuildHasher + Clone + Send,
 {
     fn sweep(&self) {
         FetchPackCache::sweep(self);

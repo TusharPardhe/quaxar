@@ -361,7 +361,10 @@ where
         removed
     }
 
-    pub fn sweep(&self) {
+    pub fn sweep(&self)
+    where
+        S: Send,
+    {
         self.ledgers_by_hash.sweep();
     }
 

@@ -261,7 +261,12 @@ impl AppLedgerPlanEngine {
             node.set_full_below_gen(generation);
             self.full_below.insert(hash);
         }
-        tracing::info!(
+        // This fires once per accepted NodeStore write batch. During a large
+        // recovery acquisition that is many times per second, so emitting it
+        // at INFO floods journald and competes with the consensus path for I/O
+        // and the shared cache lock. Keep it opt-in at DEBUG, consistent with
+        // the other high-frequency acquisition traces.
+        tracing::debug!(
             target: "acquisition_trace",
             event = "full_below_published_after_write",
             run_epoch = self.session.run_epoch().get(),

@@ -239,7 +239,7 @@ impl<C, S, FB, F, MR, NS> NodeFamily<C, S, FB, F, MR, NS> {
     pub fn sweep(&self)
     where
         C: CacheClock,
-        S: BuildHasher + Clone,
+        S: BuildHasher + Clone + Send,
         FB: FullBelowCache,
     {
         self.family.sweep();

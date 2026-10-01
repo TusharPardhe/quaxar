@@ -796,7 +796,7 @@ impl<C, S, FB, F, MR, NS> SHAMapFamily<C, S, FB, F, MR, NS> {
     pub fn sweep(&self)
     where
         C: CacheClock,
-        S: BuildHasher + Clone,
+        S: BuildHasher + Clone + Send,
         FB: FullBelowCache,
     {
         self.full_below_cache.sweep();
