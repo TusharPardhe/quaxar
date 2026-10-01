@@ -143,6 +143,11 @@ pub struct BudgetState {
     max_sessions: usize,
     admission: AdmissionBudget,
     acquire_timeout: Duration,
+    /// Maximum concurrent in-flight forward Generic acquisitions. Mirrors
+    /// rippled's `ledgerFetchSize_` bound in `findNewLedgersToPublish`
+    /// (`++acqCount < ledgerFetchSize_`). `0` means unbounded, preserving the
+    /// prior behavior for callers that do not configure it (tests).
+    max_generic_in_flight: usize,
 }
 
 impl BudgetState {
@@ -156,7 +161,22 @@ impl BudgetState {
             max_sessions,
             admission,
             acquire_timeout,
+            max_generic_in_flight: 0,
         }
+    }
+
+    /// Sets the maximum concurrent in-flight forward Generic acquisitions
+    /// (rippled `ledgerFetchSize_`). `0` leaves Generic acquisition bounded
+    /// only by `max_sessions`.
+    pub const fn with_max_generic_in_flight(mut self, max_generic_in_flight: usize) -> Self {
+        self.max_generic_in_flight = max_generic_in_flight;
+        self
+    }
+
+    /// The maximum concurrent in-flight forward Generic acquisitions, or `0`
+    /// for unbounded.
+    pub const fn max_generic_in_flight(self) -> usize {
+        self.max_generic_in_flight
     }
 
     /// The maximum concurrently live sessions.
@@ -1970,6 +1990,35 @@ impl CoordinatorRunner {
             .count();
         let mut would_exceed = !continuing_existing
             && live_sessions.saturating_sub(replaceable.len()) >= self.state.budgets.max_sessions;
+        // Bound concurrent in-flight Generic acquisitions to
+        // `max_generic_in_flight` (rippled `ledgerFetchSize_`). When the node
+        // is behind, `checkAccept` observes a trusted validation for many
+        // consecutive future sequences and requests a Generic acquisition for
+        // each. rippled bounds this with `++acqCount < ledgerFetchSize_`
+        // because its InboundLedgers run as independent jobs; the Rust
+        // coordinator serializes every session behind one owner, so an
+        // unbounded Generic fan-out thrashes the single owner and contends on
+        // the shared FullBelow/NodeFamily cache mutex that the consensus
+        // strand also needs, starving consensus for seconds. A new,
+        // non-continuing Generic demand beyond the bound is deferred; it is
+        // retried on a later pass once an earlier Generic completes and
+        // advances the validated head (which then filters stale sequences).
+        if !would_exceed
+            && !continuing_existing
+            && reason == AcquireReason::Generic
+            && self.state.budgets.max_generic_in_flight != 0
+        {
+            let generic_in_flight = self
+                .state
+                .sessions
+                .iter()
+                .filter(|(session, state)| self.counts_toward_live_capacity(**session, state))
+                .filter(|(_, state)| state.reason() == AcquireReason::Generic)
+                .count();
+            if generic_in_flight >= self.state.budgets.max_generic_in_flight {
+                would_exceed = true;
+            }
+        }
         // A retained preferred-LCL target reserves the next free slot. Generic
         // or History work may coalesce with an existing owner, but cannot take
         // that slot and permanently strand convergence.
@@ -9923,6 +9972,66 @@ mod tests {
                 .cancelled_by_reason()
                 .get(&CancelReason::Superseded),
             Some(&1)
+        );
+    }
+
+    #[test]
+    fn generic_acquisitions_bounded_by_max_generic_in_flight() {
+        // rippled bounds forward publication-gap acquisition with
+        // `++acqCount < ledgerFetchSize_`. The Rust coordinator serializes all
+        // sessions behind one owner, so an unbounded Generic fan-out thrashes
+        // that owner and the shared cache mutex, starving consensus. With a
+        // cap of 2, at most two concurrent Generic acquisitions may start; a
+        // third is rejected for capacity, while Consensus (recovery) is not
+        // subject to the Generic bound.
+        let budget = BudgetState::new(32, AdmissionBudget::new(4, 1024), Duration::from_secs(1))
+            .with_max_generic_in_flight(2);
+        let mut runner = CoordinatorRunner::with_budget(RunEpoch::new(1), budget);
+        connect(&mut runner);
+
+        let started = |effects: &[AcquisitionEffect]| {
+            effects
+                .iter()
+                .any(|e| matches!(e, AcquisitionEffect::SessionStarted(_)))
+        };
+
+        let first = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(101),
+            reason: AcquireReason::Generic,
+        });
+        assert!(started(&first), "first Generic must start a session");
+        let second = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(102),
+            reason: AcquireReason::Generic,
+        });
+        assert!(started(&second), "second Generic must start a session");
+
+        // Third Generic exceeds the cap: no new session.
+        let third = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(103),
+            reason: AcquireReason::Generic,
+        });
+        assert!(
+            !started(&third),
+            "third Generic beyond the cap must be rejected for capacity"
+        );
+        assert_eq!(
+            runner
+                .snapshot()
+                .active_by_reason()
+                .get(&AcquireReason::Generic),
+            Some(&2),
+            "exactly two Generic acquisitions remain in flight"
+        );
+
+        // Consensus (authoritative recovery) is not bounded by the Generic cap.
+        let consensus = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(104),
+            reason: AcquireReason::Consensus,
+        });
+        assert!(
+            started(&consensus),
+            "Consensus demand must not be blocked by the Generic bound"
         );
     }
 
