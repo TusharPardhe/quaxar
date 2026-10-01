@@ -321,7 +321,6 @@ fn trust_line_frac(
     sle
 }
 
-
 /// Exact reproduction of mainnet ledger 107359777 tx index 35 crossing math.
 ///
 /// A `tfSell | tfImmediateOrCancel` OfferCreate (TakerGets 0.000003702929240260918
@@ -350,10 +349,24 @@ fn tx35_exact_tiny_sell_ioc_crosses_deep_offer() {
         account_root(rlusd_issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
     ];
     // Maker holds RLUSD (to sell) and can receive ETH.
-    entries.push(trust_line_frac(maker, rlusd_issuer, rlusd, 5_000_000_000_000_000, -12, 1));
+    entries.push(trust_line_frac(
+        maker,
+        rlusd_issuer,
+        rlusd,
+        5_000_000_000_000_000,
+        -12,
+        1,
+    ));
     entries.push(trust_line_frac(maker, eth_issuer, eth, 0, 0, 1));
     // Taker holds ETH (to sell) and can receive RLUSD.
-    entries.push(trust_line_frac(taker, eth_issuer, eth, 1_000_000_000_000_000, -15, 1));
+    entries.push(trust_line_frac(
+        taker,
+        eth_issuer,
+        eth,
+        1_000_000_000_000_000,
+        -15,
+        1,
+    ));
     entries.push(trust_line_frac(taker, rlusd_issuer, rlusd, 0, 0, 1));
 
     let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
@@ -398,7 +411,6 @@ fn tx35_exact_tiny_sell_ioc_crosses_deep_offer() {
          tesSUCCESS (network outcome); node returned {result:?}"
     );
 }
-
 
 /// Regression guard for the mainnet oscillation class (ledger 107359777 tx
 /// index 35): a *tiny* `tfSell | tfImmediateOrCancel` OfferCreate that is fully
@@ -484,7 +496,6 @@ fn taker_usd(view: &impl ReadView, taker: AccountID, issuer: AccountID, usd: Cur
         .map(|sle| sle.get_field_amount(sf("sfBalance")).iou().to_string())
         .unwrap_or_else(|| "0".to_string())
 }
-
 
 /// `BookStep::execOffer` applies issuer authorization to synthetic AMM offers
 /// as well as CLOB offers.  The AMM pool may exist before its trust line is
@@ -2768,5 +2779,166 @@ fn expired_offers_beyond_crossing_quality_remain_untouched() {
         str_hex(serialized.data()),
         META_HEX,
         "bounded replay must reproduce canonical BBDA metadata bytes"
+    );
+}
+
+/// Mainnet ledger 107369025 tx 82 (`CE565E16…A7DE75`) replay: an XRP sell
+/// `tfSell | tfFillOrKill` crosses a CLOB offer then the XRP/RLUSD AMM after
+/// cancelling the creator's own resting offer. The public network delivered
+/// 2.323653246 RLUSD and ended at 19.46142097680886; keep this assertion
+/// intentionally failing until the local crossing result is byte-for-byte
+/// compatible with that ledger.
+#[test]
+#[ignore = "WIP: reproduces the tfSell|FOK multi-source delivery shortfall (node 2.323622646 vs network 2.323653246 RLUSD, -0.0000306). The real second source is an AMM pool (rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3, XRP/RLUSD, fee 197, reserves 1526460107335 drops / 2278196.924178077 RLUSD); this fixture uses a CLOB stand-in so it is not yet a faithful AMM reproduction. Root cause is AMM output rounding in sell crossing. See docs/incidents/2026-10-01-oscillation-acquisition-fixes.md."]
+fn mainnet_107369025_sell_fok_multi_source_delivery_matches_network() {
+    // Distinct fixture accounts preserve the parent-ledger topology:
+    // creator/taker, the first external CLOB maker, and the RLUSD issuer.
+    let taker = acct(0x11);
+    let clob_maker = acct(0x22);
+    // rhWTXC2m2g's AMM-side liquidity is represented as the second resting
+    // source using the node's observed rounded output.
+    let second_maker = acct(0x55);
+    let issuer = acct(0x44);
+    let rlusd =
+        Currency::from_hex("524C555344000000000000000000000000000000").expect("RLUSD hex currency");
+
+    // Parent ledger 107369024. The issuer has DefaultRipple and no
+    // sfTransferRate field, which is the canonical 1_000_000_000 rate.
+    let mut issuer_root = account_root(issuer, 10_000_000_000, 0, protocol::lsfDefaultRipple);
+    issuer_root.set_field_u32(sf("sfTransferRate"), 1_000_000_000);
+    let mut taker_root = account_root(taker, 10_000_000_000, 2, protocol::lsfDefaultRipple);
+    taker_root.set_field_u32(sf("sfSequence"), 105_265_383);
+    let mut clob_root = account_root(clob_maker, 10_000_000_000, 1, 0);
+    clob_root.set_field_u32(sf("sfSequence"), 99_443_197);
+
+    let ledger = build_ledger_with_features(
+        vec![
+            taker_root,
+            clob_root,
+            account_root(second_maker, 10_000_000_000, 1, 0),
+            issuer_root,
+            // rLPV1SB parent RLUSD balance: 17.13776773080886.
+            trust_line_frac(
+                taker,
+                issuer,
+                rlusd,
+                1_713_776_773_080_886,
+                -14,
+                1_000_000_000,
+            ),
+            // rU8Q parent RLUSD balance: 0.790418044819588.
+            trust_line_frac(
+                clob_maker,
+                issuer,
+                rlusd,
+                7_904_180_448_195_880,
+                -16,
+                1_000_000_000,
+            ),
+            // rhWT-side local node delivery is 1.533204646 RLUSD for the
+            // remaining 1,029,342 drops: 0.000030600 below network output.
+            trust_line_frac(
+                second_maker,
+                issuer,
+                rlusd,
+                1_533_204_646_000_000,
+                -15,
+                1_000_000_000,
+            ),
+        ],
+        vec!["fixFillOrKill", "fixReducedOffersV2"],
+    );
+    let mut view = new_view(ledger);
+
+    // Parent book tip rU8Q: gives 0.790418 RLUSD for 530,658 drops XRP.
+    let clob_offer = offer_tx(
+        clob_maker,
+        xrp(530_658),
+        iou_frac(issuer, rlusd, 790_418_000_000_000, -15),
+        99_443_197,
+    );
+    assert_eq!(
+        full_apply(&mut view, &clob_offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "parent CLOB offer must be placed"
+    );
+
+    // The rhWT-side AMM contribution is materialized as a second CLOB offer
+    // with the node's rounded output; that isolates the sell/FOK multi-source
+    // split while asserting the canonical network total below.
+    let second_offer = offer_tx(
+        second_maker,
+        xrp(1_029_342),
+        iou_frac(issuer, rlusd, 1_533_204_646_000_000, -15),
+        1,
+    );
+    assert_eq!(
+        full_apply(&mut view, &second_offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "rhWT-side liquidity must be placed as second resting source"
+    );
+
+    // Parent self-offer rLPV1SB seq 105265383: it is cancelled during the
+    // incoming cross and must not contribute any delivered RLUSD.
+    let self_offer = offer_tx(
+        taker,
+        xrp(1_812_312),
+        iou_frac(issuer, rlusd, 2_700_000_070_000_000, -15),
+        105_265_383,
+    );
+    assert_eq!(
+        full_apply(&mut view, &self_offer, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "parent self offer must be placed"
+    );
+    let self_key = protocol::offer_keylet(acct_id(taker), 105_265_383);
+    assert!(
+        view.read(self_key)
+            .expect("read parent self offer")
+            .is_some()
+    );
+
+    let before = view
+        .read(protocol::line(taker, issuer, rlusd))
+        .expect("read taker parent RLUSD line")
+        .expect("taker parent RLUSD line")
+        .get_field_amount(sf("sfBalance"));
+    let incoming = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(
+            sf("sfTakerPays"),
+            iou_frac(issuer, rlusd, 2_323_613_707_264_170, -15),
+        );
+        tx.set_field_amount(sf("sfTakerGets"), xrp(1_560_000));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell | protocol::tfFillOrKill);
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfSequence"), 105_265_384);
+    });
+    let result = full_apply(&mut view, &incoming, TxType::OFFER_CREATE);
+    assert_eq!(result, Ter::TES_SUCCESS, "network result is tesSUCCESS");
+
+    let after = view
+        .read(protocol::line(taker, issuer, rlusd))
+        .expect("read taker final RLUSD line")
+        .expect("taker final RLUSD line")
+        .get_field_amount(sf("sfBalance"));
+    let delivered = after.iou() - before.iou();
+    let self_cross_deleted = view
+        .read(self_key)
+        .expect("read self offer after crossing")
+        .is_none();
+    eprintln!(
+        "mainnet_107369025_sell_fok_multi_source_delivery: node delivered RLUSD={}; final balance={}; expected delivered=2.323653246; expected final=19.46142097680886; self_cross_deleted={self_cross_deleted}",
+        delivered,
+        after.iou(),
+    );
+    assert!(
+        self_cross_deleted,
+        "the creator's own seq 105265383 resting offer must be cancelled"
+    );
+    assert_eq!(
+        after.iou().to_string(),
+        "19.46142097680886",
+        "network final balance is 19.46142097680886; node delivered {delivered} RLUSD"
     );
 }
