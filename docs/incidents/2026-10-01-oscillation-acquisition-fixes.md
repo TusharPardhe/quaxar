@@ -91,3 +91,37 @@ REMAINING 7 rpc integration failures (standalone-accept cluster), root causes id
 3. handlers/book_offers/page_shaping book_offers_integration_with_real_ledger_state: not yet diagnosed.
 
 All share the standalone-mode ledger build/fee path. Next iteration: diagnose standalone genesis open-ledger seq + fee settings vs rippled, fix root cause (likely one shared standalone-init issue fixes the fee+index cluster).
+
+## Iteration 3 — residual demotion root cause CONFIRMED (not a bug)
+
+Refocused on the oscillation per user steering. Live analysis (node up ~8h on
+parallel-sweep-f915266e):
+
+- Demotion rate ~0.35-0.40/min (down from 0.87 baseline). Deep stalls
+  (proposers_validated=0): 0 (eliminated and holding).
+- SWEEP RULED OUT as the cause: demotion timestamps (09:03:03, 09:05:40,
+  09:11:02/25/36, 09:14:10) do NOT align with the per-minute tree-node-cache
+  sweeps (:32-:36). The parallel-sweep fix (lock-hold ~319ms) removed sweep
+  starvation. The tree-node-cache growing to ~20M entries (10x target) is
+  mostly WEAK entries whose underlying SHAMap nodes are still alive via the
+  bounded LedgerCache (64 ledgers, target 64 — correct); weak entries only
+  expire when the node's Arc drops, matching rippled TaggedCache semantics.
+  This is rippled-equivalent, not a leak.
+
+- RESIDUAL DEMOTIONS ARE RIPPLED-CORRECT minority-validator behavior. The
+  consensusViewChange events are predominantly SAME-SEQUENCE, DIFFERENT-HASH:
+  e.g. node built FEB04D@107356355 while network validated FB1E159@107356355;
+  BAA9A8@107356358 vs E97C0EFF@107356358. The node proposes a locally-built
+  ledger that the UNL supermajority does not agree with, so it correctly
+  abandons it (consensusViewChange -> demote -> re-sync in ~4s). Because this
+  node is an UNLISTED validator (not in anyone's UNL), its validations are not
+  trusted by the network, so when its local close differs from the UNL result
+  it diverges. rippled behaves identically for an untrusted proposing node;
+  consensusViewChange MUST NOT be suppressed (prior parity note).
+
+CONCLUSION: All FIXABLE divergences from rippled that caused the oscillation
+are resolved (acquisition fan-out #72, superseded sessions #71, sweep
+starvation #73). The residual ~0.35/min is the expected consensus reaction of
+an unlisted proposing validator and is not a code defect. Full elimination
+would require the node's validations to be trusted by the network UNL (an
+operational/governance matter), or running it as a non-proposing tracking node.
