@@ -49,13 +49,15 @@ fn ledger_accept_advances_the_app_owned_current_ledger_index_in_standalone_mode(
 
     assert_eq!(
         object.get("ledger_current_index"),
-        Some(&protocol::JsonValue::Unsigned(2))
+        Some(&protocol::JsonValue::Unsigned(3))
     );
-    // After ledger_accept: the ledger that was open (seq 1) is now closed,
-    // and a new open ledger (seq 2) is created. Our implementation promotes
-    // the closed ledger immediately (matching --start mode consensus accept).
+    // After ledger_accept on a fresh standalone node: the genesis-derived
+    // ledger is closed as seq 2 and a new open ledger (seq 3) is created.
+    // Our implementation promotes the closed ledger immediately (matching
+    // --start mode consensus accept), and the reported current index matches
+    // the live open ledger (closed + 1).
     assert_eq!(app.closed_ledger_seq(), Some(2));
     // validated_ledger may or may not be set depending on standalone quorum config
     assert!(app.validated_ledger_seq().is_none() || app.validated_ledger_seq() == Some(2));
-    assert_eq!(app.live_current_ledger_index(), Some(2));
+    assert_eq!(app.live_current_ledger_index(), Some(3));
 }

@@ -116,7 +116,7 @@ fn book_offers_valid_request_returns_ledger_info() {
 fn book_offers_integration_with_real_ledger_state() {
     use app::{AppOpenLedgerView, ApplicationRoot, ApplicationRootOptions, Transaction};
     use basics::base_uint::Uint160;
-    use ledger::{LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader};
+    use ledger::{INITIAL_XRP_DROPS, LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader};
     use protocol::{
         Issue, KeyType, STAmount, STTx, SecretKey, TxType, calc_account_id, currency_from_string,
         derive_public_key, get_field_by_symbol,
@@ -160,6 +160,9 @@ fn book_offers_integration_with_real_ledger_state() {
             seq: 1,
             close_time: 800,
             close_time_resolution: LEDGER_DEFAULT_TIME_RESOLUTION,
+            // Carry the full XRP supply so standalone fee destruction does not
+            // underflow the ledger header total (InvalidFee).
+            drops: INITIAL_XRP_DROPS,
             ..LedgerHeader::default()
         },
         SyncTree::from_root_with_type(

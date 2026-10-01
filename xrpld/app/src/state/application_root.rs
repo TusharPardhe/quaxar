@@ -10460,7 +10460,11 @@ impl ApplicationRoot {
             // with that already-established "current" status.
             ledger::LedgerPersistence::new(self.build_ledger_persistence_runtime())
                 .pend_save_validated(Arc::clone(&closed), true, true);
-            let next_open_index = closed_seq.saturating_add(1);
+            // Derive the next open index from the actual built closed ledger
+            // (what rebuild_open_ledger_after_close uses) rather than the
+            // pre-close `closed_seq` planning value, so the reported/status
+            // current index matches the live open ledger (closed + 1).
+            let next_open_index = closed.header().seq.saturating_add(1);
             self.clear_open_ledger_account_seqs();
             self.rebuild_open_ledger_after_close(Arc::clone(&closed));
             self.set_status_rpc_current_ledger_index(Some(next_open_index));
@@ -10663,7 +10667,14 @@ impl ApplicationRoot {
         ledger::LedgerPersistence::new(self.build_ledger_persistence_runtime())
             .pend_save_validated(Arc::clone(&closed), true, true);
 
-        let next_open_index = closed_seq.saturating_add(1);
+        // The next open ledger is built from the actual closed ledger
+        // (`rebuild_open_ledger_after_close` uses `closed.header().seq + 1`).
+        // Derive the reported/status index from that same closed seq rather
+        // than the pre-close `closed_seq` planning value, which can lag the
+        // built closed ledger by one on a fresh standalone (genesis parent).
+        // Otherwise `ledger_current_index` in the response and status RPC is
+        // one behind the live open ledger.
+        let next_open_index = closed.header().seq.saturating_add(1);
         self.clear_open_ledger_account_seqs();
         self.rebuild_open_ledger_after_close(Arc::clone(&closed));
         self.set_status_rpc_current_ledger_index(Some(next_open_index));
