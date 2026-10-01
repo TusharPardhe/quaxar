@@ -6,6 +6,7 @@ mod amendments;
 mod amm_helpers;
 mod amm_reverse_book_divergence;
 mod amm_utils;
+mod direct_step_max_flow_divergence;
 mod core_helpers;
 mod credential_helpers;
 mod directory_helpers;
