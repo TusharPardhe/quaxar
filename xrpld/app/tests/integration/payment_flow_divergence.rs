@@ -69,6 +69,7 @@ fn line_balance(view: &impl ReadView, low: AccountID, high: AccountID, currency:
 }
 
 #[test]
+#[ignore = "WIP reproduction: idx-104 divergence crosses offer BOOKS (path type-48 = book step), not pure rippling; trust lines alone yield tecPATH_DRY. Needs BITX/SOLO and SOLO/CSC book offers from parent ledger 107366838. See docs/incidents/2026-10-01-oscillation-acquisition-fixes.md."]
 fn mainnet_107366839_self_payment_must_modify_both_solo_hops() {
     // Map the mainnet participants to distinct, ordered fixture accounts while
     // preserving the payment cycle:
