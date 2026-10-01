@@ -10416,7 +10416,7 @@ impl ApplicationRoot {
         let parent_ledger = self.closed_ledger().or_else(|| self.validated_ledger());
         let parent = parent_ledger
             .clone()
-            .unwrap_or_else(|| Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false)));
+            .unwrap_or_else(|| Arc::new(Ledger::genesis_with_initial_drops(0, false)));
 
         // rippled only enters the synchronous NetworkOps batch from ledger
         // close when LedgerMaster has a held transaction set to process.

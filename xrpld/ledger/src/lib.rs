@@ -624,6 +624,26 @@ impl Ledger {
         )
     }
 
+    /// A seq-1 genesis ledger carrying the full initial XRP supply in its
+    /// header `drops`. rippled's genesis ledger holds `INITIAL_XRP_DROPS`;
+    /// standalone ledger-accept builds forward from this parent, so fee
+    /// destruction (`raw_destroy_xrp` subtracting from header drops) must not
+    /// underflow a zero-supply header. Use this instead of the bare
+    /// `from_ledger_seq_and_close_time` when fabricating a standalone genesis
+    /// parent with no prior validated/closed ledger.
+    pub fn genesis_with_initial_drops(close_time: u32, backed: bool) -> Self {
+        Self::new(
+            LedgerHeader {
+                seq: 1,
+                close_time,
+                close_time_resolution: LEDGER_DEFAULT_TIME_RESOLUTION,
+                drops: INITIAL_XRP_DROPS,
+                ..LedgerHeader::default()
+            },
+            backed,
+        )
+    }
+
     pub fn create_genesis_setup_only<I>(
         backed: bool,
         config: &LedgerConfig,
