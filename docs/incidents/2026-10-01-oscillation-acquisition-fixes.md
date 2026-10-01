@@ -471,3 +471,41 @@ in=sendMax ETH}, and fix the rounding to match rippled StrandFlow limitQuality
 VALUE computed for the offer or the threshold at this precision). Then verify
 affected-node parity == 6/tesSUCCESS, run full suites, deploy, measure
 demotions/min = 0 over >=15min.
+
+## Iter (round 2) — PRIMARY ROOT CAUSE FIXED: IOU/IOU offer-cross XRP-bridge path
+
+Found and fixed the primary oscillation root cause. In app/state/offer_create.rs
+the IOU/IOU crossing path adds an XRP intermediate (rippled OfferCreate.cpp:447
+`path.emplaceBack(nullopt, xrpCurrency(), nullopt)`). Quaxar built it via
+STPathElement::inferred(.., force_asset=FALSE); for an XRP asset that sets NO
+type bit -> TYPE_NONE, which valid_path_element rejects as temBAD_PATH(-291).
+Result: to_strands returned ZERO strands, the cross was treated as dry, and
+EVERY IOU/IOU OfferCreate needing to cross returned tecKILLED instead of
+crossing -> divergent tx-tree/account hash -> consensusViewChange demotion ->
+oscillation.
+
+Fix (commit 567ee50d): force_asset=TRUE so the XRP intermediate carries
+TYPE_CURRENCY. Reproduced exactly as mainnet seq 107359777 tx35
+(tfSell|IOC ETH/RLUSD): tecKILLED -> tesSUCCESS
+(test tx35_exact_tiny_sell_ioc_crosses_deep_offer). Diagnosed via tracing that
+to_strands returned Ter(-291)/0 strands before the fix.
+
+Deployed to mainnet (binary quaxar.xrp-bridge-567ee50d; rollback
+parallel-sweep-f915266e retained). Post-deploy measurement, classifying each
+consensusViewChange as SAME-SEQ-DIVERGENT (real oscillation: local_closed seq ==
+preferred seq, wrong hash) vs node-behind-lag (benign: local < preferred,
+catching up):
+  - Full 95 min since deploy: 47 demotions = 6 same-seq-divergent + 41 lag.
+  - The 6 divergent were 2 at warmup (18:14, empty DB) + a 4-cluster 18:35-39.
+  - Last 20 min: 0 same-seq-divergent, 9 lag.
+  - Last 10 min: 1 same-seq-divergent, 5 lag.
+So the IOU/IOU offer-cross divergence is largely eliminated, but a RESIDUAL
+same-seq-divergent source remains (~1 per 10 min, down from the pre-fix rate).
+node-behind-lag demotions are a separate benign performance issue (node falls
+~4-14 ledgers behind and resyncs; NOT a wrong-hash build).
+
+NEXT: redeploy the meta_divergence diagnostic (diag branch only) to capture the
+NEXT same-seq-divergent seq's first divergent tx (as done for tx35), identify
+its tx type, fix that transactor to match rippled, redeploy, confirm
+same-seq-divergent == 0 over >=20 min. Then address node-behind-lag separately
+(throughput) if Full<->Syncing transitions must also reach 0.
