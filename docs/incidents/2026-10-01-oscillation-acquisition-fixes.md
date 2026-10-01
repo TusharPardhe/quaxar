@@ -125,3 +125,95 @@ starvation #73). The residual ~0.35/min is the expected consensus reaction of
 an unlisted proposing validator and is not a code defect. Full elimination
 would require the node's validations to be trusted by the network UNL (an
 operational/governance matter), or running it as a non-proposing tracking node.
+
+## Iteration 3 — ACTUAL DIVERGENCE ROOT CAUSE FOUND (txn-level)
+
+The ledger-hash divergences are NOT minority-validator noise. Confirmed via
+per-txn hash comparison against the live network (xrplcluster) for divergent
+ledger 107356694 (node built 9532FEFC, network E840E5EB; identical parent 693
+468D8EF8, identical close_time 844162362, identical 60-tx set and canonical
+order for 0-56):
+
+ROOT CAUSE: transaction 8CD880D2A11D028603353992D76CF081F8282D9DE88B57793A524560F7E55D08
+diverges in RESULT:
+- Network: tesSUCCESS, partial payment, delivered 19309377 drops XRP.
+- Node:    tecPATH_DRY on pass 0/1/2 (then accepted as tecPATH_DRY at idx 59).
+
+The tx is a self-directed tfPartialPayment (Flags=131072): Account==Destination
+rfgtQeBdxp8yn7N2XAxGstMkPzSG9Pf8N3, DeliverMax=42664917 drops XRP,
+SendMax=28.7587 USDC (issuer rcEGREd8NmkKRE8GE424sksyt1tJVFZwu). Network meta
+touches 2 AccountRoot + 2 RippleState (direct IOU rippling / book path, no
+Offer node). Quaxar's flow engine returns tecPATH_DRY (no liquidity) where
+rippled finds partial liquidity and delivers 19309377 drops.
+
+Consequences cascade: tecPATH_DRY vs tesSUCCESS => different metadata +
+different state (RippleState/AccountRoot balances) + the failed tx retries,
+reordering it from idx 57 to idx 59 => different tx tree hash + account_hash
+=> divergent ledger hash => consensusViewChange demotion.
+
+NEXT: fix Quaxar's payment flow engine so a tfPartialPayment with available
+partial liquidity through trust lines/book delivers (tesSUCCESS partial)
+instead of tecPATH_DRY. Compare strand_flow / flow_engine partial-payment
+liquidity + path-dry determination to rippled Flow.cpp / StrandFlow.
+
+## Iteration 3 cont. — divergence mechanism refined
+
+The divergent tx 8CD880D2 (idx 57) is a self-directed tfPartialPayment swapping
+USDC->XRP. Confirmed:
+- The USDC->XRP CLOB has liquidity (node book_offers RPC sees 3 offers).
+- An XRP/USDC AMM exists (38763 XRP / 57500 USDC, fee 54).
+- Mainnet metadata: AMM swap (AccountRoot+RippleState, NO Offer consumed) => AMM won.
+- AMM keylet (sorted pair), Issue/Asset Ord (XRP first), Quality(Amounts)=getRate(out,in),
+  and the spot<=clob AMM-skip gate ALL match rippled exactly.
+- Computed AMM spot quality 0.6741 > CLOB tip 0.6677 => AMM should win and deliver.
+
+So the per-step logic is rippled-faithful. The node's tecPATH_DRY at idx 57 is
+therefore a CASCADE: tx 57 sees an AMM/book state produced by the 56 prior
+in-ledger transactions (many OfferCreate/OfferCancel + possible AMM touches).
+If Quaxar applied ANY earlier offer/AMM tx with a different fill/rounding
+(same result code, different state delta), the AMM pool balance or CLOB tip at
+idx 57 differs, flipping spot<=clob and skipping the AMM, then the partial
+payment finds no satisfying CLOB quality => tecPATH_DRY.
+
+ROOT CAUSE CLASS: a rounding/fill divergence in offer or AMM execution in an
+earlier transaction of the same ledger, cascading to the observable
+tecPATH_DRY. NEXT: find the FIRST per-tx metadata divergence (affected-node
+balances) in ledger 694 by comparing node-applied deltas vs network deltas for
+the OfferCreate/OfferCancel/AMM txns before idx 57, then fix the specific
+rounding in book_step/offer execution.
+
+## Iteration 3 — DIRECT BUG confirmed, isolated to AMM numeric execution
+
+Verified via network metadata that NEITHER the XRP/USDC AMM
+(rGHt6LT5v9DVaEAmFzj5ciuxuj41ZjLofs) NOR the USDC->XRP CLOB offers were touched
+by any prior tx (idx<57) in ledger 694. Therefore tx 8CD880D2 (idx 57) sees the
+EXACT parent-693 state, which the node has correct. So its tecPATH_DRY (vs
+network tesSUCCESS AMM swap delivering 19309377 drops) is a DIRECT determinism
+bug in Quaxar's AMM-in-payment execution, not a cascade.
+
+Exhaustively verified these match rippled line-for-line (NOT the bug):
+- AMM keylet amm(in,out) sorts the pair (XRP first); Issue/Asset Ord.
+- Quality(Amounts)=getRate(out,in); CLOB dir quality same orientation.
+- AMM spot(0.6741) > CLOB tip(0.6677) => AMM should win (verified by hand).
+- spot<=clob skip gate (AMMLiquidity.cpp:175) identical.
+- side select outIntegral && (!inIntegral||rate>=1) -> StartWithTakerGets.
+- getAMMOfferStartWithTakerGets quadratic (b,c), constraint, reduce: identical.
+- solveQuadraticEqSmallest citardauq form: identical.
+- fee_mult=1-getFee, getFee=tfee/100000: identical.
+- amm_trading_fee auction-slot logic matches (account not slot owner -> base 54).
+- swapAssetOut fixAMMv1_1 staged rounding dirs (Up num, Down denom, Up ratio-pool,
+  Down feeMult): match.
+
+REMAINING SUSPECT (the only unverified layer): the RuntimeNumber primitive
+(multiply/divide/root2) or number_to_amount/toAmount rounding producing a
+sub-ULP difference that flips the final `Quality{amounts} >= target` check in
+amm_offer_for_clob_quality, causing get_amm_offer to return None => AMM skipped
+=> partial payment finds no satisfying CLOB quality => tecPATH_DRY.
+
+REPRODUCTION (deterministic, offline-capable): apply tx
+8CD880D2A11D028603353992D76CF081F8282D9DE88B57793A524560F7E55D08 against ledger
+693 (468D8EF80B4B7CAE5C7643A5316481766C5B592F42B1C67ADF4EB85101144171) state.
+Expected: tesSUCCESS, deliver 19309377 drops via AMM. Quaxar: tecPATH_DRY.
+A focused unit test comparing get_amm_offer's computed (in,out,quality) for
+pool (38763.602643 XRP / 57500.75485900167 USDC, fee 54) at target quality
+0.6677 against rippled changeSpotPriceQuality will expose the ULP divergence.
