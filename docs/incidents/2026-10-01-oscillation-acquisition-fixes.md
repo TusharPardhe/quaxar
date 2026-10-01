@@ -248,3 +248,33 @@ parallel-sweep-f915266e (proposing, healthy).
 NEXT: re-examine the tfPartialPayment flow rev/fwd execution for 8CD880D2 (the
 strand builds and the AMM/CLOB have liquidity, yet total_out=0). Capture the
 per-strand rev/fwd amounts for this payment to find where output becomes zero.
+
+## Iteration 5 — divergence narrowed to strand reverse_probe (flow_divergence trace)
+
+Deployed a temporary flow_divergence trace to the live validator and captured
+the strand None reasons in execute_single_strand:
+- 13 reason=reverse_probe_none  <- the tfPartialPayment dry class (e.g. 8CD880D2;
+  no quality_threshold, so it cannot be a threshold reject). The strand's rev()
+  pass produces zero -> SingleStrandResult None -> strand deactivated -> total_out=0
+  -> tecPATH_DRY. THIS is the real divergence to fix next.
+- 2 reason=replay_probe_none.
+- 27 reason=quality_threshold_reject with realized.value - limit.value ~1.7e-10
+  relative (13th digit). These are limitQuality payments. The reject matches
+  rippled StrandFlow.h:730 (q < limitQuality && !(adjustedRemOut && within 1e-7)).
+  The 1e-7 tolerance is gated on adjustedRemOut (= out_from_avg_q produced
+  out < remainingOut). If both rippled and Quaxar get adjustedRemOut=false here,
+  both reject (rippled-correct limitQuality miss). Likely NOT a divergence, but
+  verify by correlating a reject tx with its network result.
+
+Verified matches rippled line-for-line: Quality Ord (reversed: higher value =
+worse), the limitQuality reject condition (StrandFlow.h:730), limitOut /
+limit_single_strand_out (adjustedRemOut = out < remainingOut, with 1e-9
+within-distance snap to remainingOut), AmmContext multi_path handling.
+
+NEXT (precise): instrument reverse_probe per-step rev() amounts for a
+tfPartialPayment USDC->XRP strand (steps: Direct USDC, Book USDC/XRP,
+XrpEndpoint). Find which step's rev() returns zero despite AMM+CLOB liquidity.
+The book step rev() for the IOU->XRP direction is the prime suspect
+(limitStepOut / the reverse book consumption producing zero out).
+
+Node restored to parallel-sweep-f915266e; main has no diagnostic code.
