@@ -3986,6 +3986,80 @@ mod tests {
         assert_eq!(result_up.xrp().drops(), 1_002_000_000);
         assert_eq!(result_down.xrp().drops(), 1_002_000_000);
     }
+
+    // Regression for the 2026-10-01 mainnet ledger-hash divergence: a
+    // self-directed tfPartialPayment swapping USDC->XRP delivered partial XRP
+    // through the XRP/USDC AMM on mainnet (tesSUCCESS) but Quaxar returned
+    // tecPATH_DRY. Root-caused to AMM synthetic-offer generation: with the
+    // competing CLOB tip quality, `amm_offer_for_clob_quality` (rippled
+    // `changeSpotPriceQuality`) must produce an offer at >= the CLOB quality so
+    // the AMM is not skipped. Pool/quality are the real mainnet values at
+    // ledger 107356693 (XRP/USDC AMM 38763.602643 XRP / 57500.75485900167 USDC,
+    // fee 54; CLOB tip 3755.33326 XRP for 5624.681641 USDC). The issuer/currency
+    // identity does not affect the quadratic math, so a synthetic IOU issue is
+    // used for the USDC side.
+    fn iou_usdc(mantissa: i64, exponent: i32) -> STAmount {
+        let issue = Issue::new(Currency::from([0x55; 20]), AccountID::from([0x42; 20]));
+        let number = basics::number::NumberParts::try_from_external_parts(
+            mantissa,
+            exponent,
+            basics::number::get_mantissa_scale(),
+        )
+        .expect("usdc number");
+        STAmount::from_iou_amount(
+            sf("sfAmount"),
+            IOUAmount::from_number(number).expect("iou amount"),
+            issue,
+        )
+    }
+
+    fn xrp_drops(drops: i64) -> STAmount {
+        STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(drops))
+    }
+
+    #[test]
+    fn amm_offer_for_usdc_to_xrp_clob_tip_is_not_skipped() {
+        // Book is USDC(in) -> XRP(out).
+        let pool_in = iou_usdc(5_750_075_485_900_167, -11); // 57500.75485900167 USDC
+        let pool_out = xrp_drops(38_763_602_643); // 38763.602643 XRP
+        let trading_fee: u16 = 54;
+
+        // CLOB tip quality from the first competing USDC->XRP offer.
+        let clob_in = iou_usdc(562_468_164_100_000, -11); // 5624.681641 USDC
+        let clob_out = xrp_drops(3_755_333_260); // 3755.33326 XRP
+        let clob_quality = Quality::from_amounts(&Amounts::new(clob_in, clob_out));
+
+        // Sanity: the AMM spot quality must beat the CLOB tip, so the AMM is
+        // eligible (matches the `spot <= clob` skip gate in get_amm_offer).
+        let spot_quality =
+            Quality::from_amounts(&Amounts::new(pool_in.clone(), pool_out.clone()));
+        assert!(
+            spot_quality > clob_quality,
+            "AMM spot quality {spot_quality:?} must beat CLOB tip {clob_quality:?}"
+        );
+
+        // fixAMMv1_1 is active on mainnet.
+        let offer = amm_offer_for_clob_quality(
+            &pool_in,
+            &pool_out,
+            clob_quality,
+            trading_fee,
+            true,
+        );
+
+        assert!(
+            offer.is_some(),
+            "AMM must generate a synthetic offer at the CLOB tip quality; returning None skips \
+             the AMM and dries the partial payment (tecPATH_DRY divergence from mainnet)"
+        );
+        let (amm_in, amm_out) = offer.expect("amm offer");
+        assert!(amm_out.signum() > 0, "AMM must offer positive XRP output");
+        let amm_quality = Quality::from_amounts(&Amounts::new(amm_in, amm_out));
+        assert!(
+            amm_quality >= clob_quality,
+            "AMM offer quality {amm_quality:?} must be >= CLOB target {clob_quality:?}"
+        );
+    }
 }
 
 /// Construct a transfer amount with the exact executable Book asset while
