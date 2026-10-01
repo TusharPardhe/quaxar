@@ -351,3 +351,36 @@ txns are applied, before LCL switch), so the divergent build is always logged.
 Then fix the first divergent tx's state-delta rounding.
 
 Node restored to parallel-sweep-f915266e; main has no diagnostic code.
+
+## New campaign iter 3 — FIRST divergent tx FOUND + offer-create parity fix
+
+Breakthrough: continuous journal capture + per-tx meta fingerprint
+(affected_nodes count) diffed against the network for divergent ledger 107359777
+(same parent C1788B8A, same 51 txns, same close 844174131, network ledger_hash
+2192C58F = node's demote target). FIRST divergent tx is at INDEX 35:
+  tx 56761BFCA8B7064AACE7818DAC854ADFBBF840B650105ECF76941FCFB7074E68
+  OfferCreate, Flags 655360 (tfSell|tfImmediateOrCancel),
+  TakerGets 0.000003702929240260918 ETH, TakerPays 0.01 RLUSD.
+  NETWORK: tesSUCCESS, 6 affected nodes (crosses the RLUSD/ETH counter-offer
+    owned by rMsXVzCug, modifies 4 RippleState + Offer + AccountRoot).
+  NODE: tecKILLED (150), 1 affected node (fee only) -> flow_cross crossed NOTHING.
+Transactions 0-34 matched (tx_id + affected_nodes), so the book state at idx 35
+equals the network's -> tx 35 is a DIRECT bug, not a cascade.
+
+Two issues:
+1. FIXED (committed a4ac0665): OfferCreate IOC/FOK result parity. rippled
+   returns tecKILLED for an IOC offer that crossed nothing (#4115) and uses
+   fixFillOrKill sell-mode (gets-side) completion; Quaxar always returned
+   tesSUCCESS for IOC and only checked takerPays for FOK. Now tracks `crossed`
+   and matches rippled. (This aligns the RESULT code but tx35 still needs #2.)
+2. ROOT (next): flow_cross crosses NOTHING for tx35's TINY tfSell offer
+   (0.0000037 ETH / 0.01 RLUSD) where rippled crosses the counter-offer. This
+   is a tiny/sub-precision offer-crossing bug in flow_cross/book_step for the
+   sell direction (near IOU precision limit; likely fixReducedOffers / small
+   increased-quality offer handling). Reproduce: cross tx35's offer against the
+   rMsXVzCug RLUSD/ETH offer (TakerGets 1907 RLUSD / TakerPays 0.706 ETH) and
+   assert positive cross; compare the rounded step amounts to rippled BookStep.
+
+NEXT: build a focused flow_cross reproduction for tx35's crossing, find why the
+tiny tfSell offer crosses zero, fix the rounding to match rippled, verify the
+affected-node count becomes 6 and result tesSUCCESS.
