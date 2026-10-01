@@ -7,7 +7,7 @@ use basics::{
     base_uint::{Uint160, Uint256},
     chrono::NetClockTimePoint,
 };
-use ledger::{LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader};
+use ledger::{INITIAL_XRP_DROPS, LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader};
 use protocol::{
     AccountID, JsonValue, KeyType, LedgerEntryType, STAmount, STArray, STLedgerEntry, STObject,
     STTx, SecretKey, TxMeta, TxType, account_keylet, calc_account_id, derive_public_key,
@@ -95,6 +95,9 @@ fn funded_parent_ledger(seq: u32, account: AccountID, account_sequence: u32) -> 
             seq,
             close_time: 800 + seq,
             close_time_resolution: LEDGER_DEFAULT_TIME_RESOLUTION,
+            // Carry the full XRP supply so standalone fee destruction does not
+            // underflow the ledger header total (InvalidFee).
+            drops: INITIAL_XRP_DROPS,
             ..LedgerHeader::default()
         },
         SyncTree::from_root_with_type(
