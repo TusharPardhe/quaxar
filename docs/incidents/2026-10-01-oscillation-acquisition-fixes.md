@@ -312,3 +312,42 @@ DirectIPaymentStep::check (terNO_LINE / terNO_AUTH) so Quaxar rejects the same
 strands rippled rejects, changing which path executes.
 
 Node restored to parallel-sweep-f915266e; main has no diagnostic code.
+
+## New campaign iter 2 — cascade confirmed; validated chain is correct
+
+Key proofs this iteration:
+1. Confirmed divergent tx 01D0D930 (FRH->XRP self-payment) is a CASCADE: txns
+   at index 0 and 83 in the same ledger (107359089) also touched the sender's
+   FRH RippleState BEFORE the divergent tx at index 439. So the sender's FRH
+   line state at tx 439 depends on earlier txns the node may apply differently.
+2. The network path for 01D0D930: sender's FRH line DELETED (balance->0),
+   consumed via a CLOB offer owned by rwZRg5AaB giving XRP. So the sender DID
+   hold FRH at ledger start; the node dried because by tx 439 its view of the
+   FRH line differs (cascade).
+3. Ruled out (3 passing isolation tests committed):
+   - AMM primitive (amm_offer_for_clob_quality) correct.
+   - Reverse book step consumes AMM liquidity correct.
+   - max_payment_flow returns positive redeem flow for an IOU-holding sender
+     (both low and high orientations) correct.
+4. The node's VALIDATED/stored ledgers all MATCH the network (checked
+   107359348-350,362). The node never persists a wrong ledger; the oscillation
+   is purely the transient losing-candidate build -> demote -> re-sync.
+5. Current rate on stable binary: ~0.27 demotions/min, ~2 same-seq
+   divergences/15min.
+
+DIAGNOSTIC GAP: added a per-tx meta_divergence fingerprint
+(sha512_half(metadata) + affected_nodes count) at the consensus-accept site
+(application_root ~11219). BUT the trace captured only the WINNING (network-
+matching) ledgers' meta, never the divergent seqs' meta in the same journal
+window -> the losing candidate's per-tx metadata is built/discarded without
+reaching that site in a capturable way, OR the divergent-seq meta scrolled past
+the --since window (divergences ~2/15min, meta ~1500 lines/min).
+
+NEXT: capture the LOSING candidate's per-tx metadata. Either (a) widen journal
+capture to guarantee the divergent seq's meta is included and diff
+affected_nodes vs network per tx to find the FIRST divergent tx, or (b) add the
+meta fingerprint earlier in the consensus close (where the losing candidate's
+txns are applied, before LCL switch), so the divergent build is always logged.
+Then fix the first divergent tx's state-delta rounding.
+
+Node restored to parallel-sweep-f915266e; main has no diagnostic code.
