@@ -422,3 +422,52 @@ fix get_book_base/succ (or move OfferCreate crossing to the flow() engine used
 by payments) so the counter-offer is found and crossed -> tesSUCCESS / 6
 affected. Verify affected-node parity, run full suites, deploy, measure
 demotions/min = 0 over >=15min.
+
+## Iter 5 — CRITICAL correction: real OfferCreate path + crossing setup verified rippled-faithful; divergence is inside the flow engine
+
+CORRECTION: the real consensus OfferCreate apply path is
+`xrpld/app/src/state/offer_create.rs::do_offer_create` (dispatched from
+transactor_dispatcher.rs:3174), NOT `xrpld/tx/src/utility/offer_create.rs`
+(system_invoke_apply) which is NOT wired into app apply. The iter-3 FOK/IOC fix
+(a4ac0665) was applied to the non-dispatched utility module — harmless and a
+correct improvement there, but it is NOT the path that produced tx35's
+tecKILLED. The real app path ALREADY has the correct rippled IOC logic
+(`if is_ioc { if !crossed { tecKILLED } }`, offer_create.rs:487-492) and
+derives `crossed` from the flow result via `offer_was_crossed`.
+
+Verified the real OfferCreate crossing setup is rippled-faithful end to end:
+  - Book base: get_book_base hashes [in.ccy,out.ccy,in.acct,out.acct] (==
+    rippled getBookBase); low 64 bits zeroed; next_quality_key == getQualityNext
+    (+1 at bit 64). succ(book_base, book_end) range covers all qualities.
+  - Threshold: Quaxar `Quality::from_amounts(Amounts::new(send_max,
+    taker_pays))` == rippled OfferCreate.cpp:429 `Quality{takerAmount.out,
+    sendMax}` (Quality.h:132 => Amounts(in=sendMax, out=TakerPays)). MATCHES.
+  - Crossing engine: `strand_flow::execute_strands` (the SAME full flow engine
+    payments use), with OfferCrossing::Sell, limit_quality=threshold, sendMax,
+    IOU/IOU XRP-bridge path added. Matches rippled flowCross(flow()).
+
+=> tx35 crossed nothing because `execute_strands` returned a DRY result for
+tx35's exact ETH(rvYAfWj5)/RLUSD(rMxCKbED) liquidity at these high-precision
+amounts (TakerGets 0.000003702929240260918 ETH / TakerPays 0.01 RLUSD). The
+divergence is INSIDE the flow-engine strand evaluation (BookStep quality
+rounding / limitQuality reject / AMM-vs-CLOB selection) for this specific
+book+amounts — NOT in OfferCreate result handling, book keying, or threshold
+construction (all verified equal to rippled this iteration). Synthetic
+round-number tiny tfSell+IOC crosses correctly (committed guard
+`tiny_sell_ioc_offer_crosses_resting_liquidity`), so the edge is specific to
+tx35's awkward-precision quality vs the counter-offer quality
+4327BA72...057C3.
+
+EXACT NEXT STEP (unavoidably requires real state; cannot be guessed): capture
+tx35's parent-ledger state via JSON-RPC — the 6 affected objects (taker
+AccountRoot; taker ETH + taker RLUSD + rMsXVzCug ETH + the RLUSD gateway
+RippleStates; the rMsXVzCug Offer) plus BOTH book directions and any ETH/RLUSD
+AMM — as an offer_create_* fixture, replay through the offer_crossing fixture
+harness, confirm the node reproduces tecKILLED, then instrument
+execute_strands/BookStep limitQuality to find where the counter-offer at quality
+4327BA72...057C3 is rejected against threshold Quality{out=RLUSD 0.01,
+in=sendMax ETH}, and fix the rounding to match rippled StrandFlow limitQuality
+(the StrandFlow.h:730 reject is faithful, so the divergence is in the quality
+VALUE computed for the offer or the threshold at this precision). Then verify
+affected-node parity == 6/tesSUCCESS, run full suites, deploy, measure
+demotions/min = 0 over >=15min.
