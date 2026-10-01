@@ -509,3 +509,42 @@ NEXT same-seq-divergent seq's first divergent tx (as done for tx35), identify
 its tx type, fix that transactor to match rippled, redeploy, confirm
 same-seq-divergent == 0 over >=20 min. Then address node-behind-lag separately
 (throughput) if Full<->Syncing transitions must also reach 0.
+
+## Iter (round 2 cont.) — residual divergence IDENTIFIED: multi-hop self-payment arbitrage flow
+
+With the offer-cross fix deployed, used the meta_divergence per-tx trace
+(diag/meta3, now deleted; main is diagnostic-free) to capture 3 same-seq
+divergent builds (seq 107366760, 107366764, 107366839) and diffed each tx's
+(index, tx_id, affected_node_count) against the live network.
+
+CONFIRMED FIRST DIVERGENCE (seq 107366839, idx 104): a Payment
+6277260729FE..., Account == Destination == rogue5HnPRSszD9CWGSUz8UGHMVwSSKF6
+(a circular self-payment / arbitrage), tfPartialPayment (Flags 131072):
+  Amount  = CSC  1051.839906607096  (issuer rCSCManTZ...)
+  SendMax = BITX 0.0007503332193915335 (issuer rBitcoiN...)
+  Paths   = [ SOLO(rsoLo2S1...) -> SOLO issuer -> CSC(rCSCManT...) -> CSC issuer ]
+  i.e. ripple BITX -> SOLO -> CSC, plus the default direct BITX -> CSC path.
+  NETWORK: tesSUCCESS, 7 AffectedNodes (CSC + BITX + SOLO RippleStates across
+    the rippling hops + AccountRoot).
+  NODE: tesSUCCESS but only 5 AffectedNodes -> it rippled through FEWER hops
+    (skipped the SOLO intermediate trust lines), producing different metadata
+    -> different tx hash -> different ledger hash -> consensusViewChange.
+
+This is a MULTI-PATH FLOW SELECTION divergence in ripple_calculate /
+execute_strands: given the default path + an explicit SOLO-bridge path, the node
+selects/combines a different set of strands than rippled's flow(), touching 2
+fewer trust lines. It is a DIFFERENT root cause from the offer-cross XRP-bridge
+fix. The other divergent seqs (760/764) also center on self-payment path
+payments (tecPATH_PARTIAL/tecPATH_DRY), confirming multi-hop rippling arbitrage
+as the residual class. Rate is low (~1 per few minutes) vs the pre-fix rate.
+
+Separately, node-behind-lag demotions (local_closed seq < preferred seq;
+benign catch-up, NOT wrong-hash) remain and are a throughput concern, not a
+divergence.
+
+NEXT: reproduce the idx-104 BITX->SOLO->CSC self-payment with tfPartialPayment
+against a CSC/BITX/SOLO multi-currency fixture, compare node strand
+selection/ordering to rippled flow() (default-path + explicit-path strand set
+and the order they are consumed), fix ripple_calculate/execute_strands to match,
+verify affected-node parity (7 nodes), then confirm same-seq-divergent == 0 over
+a sustained window.
