@@ -119,15 +119,15 @@ fn feature_lists_all_features_and_majorities() {
 #[test]
 fn feature_accepts_name_or_hex_and_applies_veto() {
     let source = FakeFeatureSource {
-        majorities: BTreeMap::from([(feature_id("Batch"), 99)]),
+        majorities: BTreeMap::from([(feature_id("BatchV1_1"), 99)]),
         ..Default::default()
     };
-    source.insert_feature(feature_id("Batch"), "Batch", false, false, true);
+    source.insert_feature(feature_id("BatchV1_1"), "BatchV1_1", false, false, true);
 
     let named = do_feature(
         &FeatureRequest {
             params: &object([
-                ("feature", JsonValue::String("Batch".to_owned())),
+                ("feature", JsonValue::String("BatchV1_1".to_owned())),
                 ("vetoed", JsonValue::Bool(true)),
             ]),
             role: RpcRole::Admin,
@@ -144,7 +144,7 @@ fn feature_accepts_name_or_hex_and_applies_veto() {
         &FeatureRequest {
             params: &object([(
                 "feature",
-                JsonValue::String(to_string(&feature_id("Batch"))),
+                JsonValue::String(to_string(&feature_id("BatchV1_1"))),
             )]),
             role: RpcRole::Admin,
         },
@@ -195,7 +195,7 @@ fn feature_rejects_invalid_and_unknown_features() {
     let denied = do_feature(
         &FeatureRequest {
             params: &object([
-                ("feature", JsonValue::String("Batch".to_owned())),
+                ("feature", JsonValue::String("BatchV1_1".to_owned())),
                 ("vetoed", JsonValue::Bool(true)),
             ]),
             role: RpcRole::User,
@@ -215,12 +215,12 @@ fn feature_rejects_invalid_and_unknown_features() {
 #[test]
 fn feature_unveto_clears_veto_state() {
     let source = FakeFeatureSource::default();
-    source.insert_feature(feature_id("Batch"), "Batch", false, true, true);
+    source.insert_feature(feature_id("BatchV1_1"), "BatchV1_1", false, true, true);
 
     // Verify it starts vetoed
     let before = do_feature(
         &FeatureRequest {
-            params: &object([("feature", JsonValue::String("Batch".to_owned()))]),
+            params: &object([("feature", JsonValue::String("BatchV1_1".to_owned()))]),
             role: RpcRole::Admin,
         },
         &source,
@@ -234,7 +234,7 @@ fn feature_unveto_clears_veto_state() {
     let result = do_feature(
         &FeatureRequest {
             params: &object([
-                ("feature", JsonValue::String("Batch".to_owned())),
+                ("feature", JsonValue::String("BatchV1_1".to_owned())),
                 ("vetoed", JsonValue::Bool(false)),
             ]),
             role: RpcRole::Admin,
@@ -247,7 +247,7 @@ fn feature_unveto_clears_veto_state() {
     assert_eq!(result.get("vetoed"), Some(&JsonValue::Bool(false)));
     assert_eq!(
         result.get("name"),
-        Some(&JsonValue::String("Batch".to_owned()))
+        Some(&JsonValue::String("BatchV1_1".to_owned()))
     );
     assert_eq!(result.get("supported"), Some(&JsonValue::Bool(true)));
     assert_eq!(result.get("enabled"), Some(&JsonValue::Bool(false)));
@@ -257,7 +257,7 @@ fn feature_unveto_clears_veto_state() {
 fn feature_list_returns_all_features_with_correct_structure() {
     let source = FakeFeatureSource::default();
     source.insert_feature(feature_id("XRPFees"), "XRPFees", true, false, true);
-    source.insert_feature(feature_id("Batch"), "Batch", false, true, true);
+    source.insert_feature(feature_id("BatchV1_1"), "BatchV1_1", false, true, true);
     source.insert_feature(feature_id("Clawback"), "Clawback", true, false, true);
 
     let result = do_feature(
@@ -290,12 +290,12 @@ fn feature_list_returns_all_features_with_correct_structure() {
 #[test]
 fn feature_user_can_read_but_not_veto() {
     let source = FakeFeatureSource::default();
-    source.insert_feature(feature_id("Batch"), "Batch", false, false, true);
+    source.insert_feature(feature_id("BatchV1_1"), "BatchV1_1", false, false, true);
 
     // User can read
     let read = do_feature(
         &FeatureRequest {
-            params: &object([("feature", JsonValue::String("Batch".to_owned()))]),
+            params: &object([("feature", JsonValue::String("BatchV1_1".to_owned()))]),
             role: RpcRole::User,
         },
         &source,
@@ -306,14 +306,14 @@ fn feature_user_can_read_but_not_veto() {
     assert_eq!(read.get("error"), None);
     assert_eq!(
         read.get("name"),
-        Some(&JsonValue::String("Batch".to_owned()))
+        Some(&JsonValue::String("BatchV1_1".to_owned()))
     );
 
     // User cannot veto
     let veto = do_feature(
         &FeatureRequest {
             params: &object([
-                ("feature", JsonValue::String("Batch".to_owned())),
+                ("feature", JsonValue::String("BatchV1_1".to_owned())),
                 ("vetoed", JsonValue::Bool(true)),
             ]),
             role: RpcRole::User,
@@ -332,14 +332,14 @@ fn feature_user_can_read_but_not_veto() {
 #[test]
 fn feature_single_lookup_returns_all_fields() {
     let source = FakeFeatureSource {
-        majorities: BTreeMap::from([(feature_id("Batch"), 1234)]),
+        majorities: BTreeMap::from([(feature_id("BatchV1_1"), 1234)]),
         ..Default::default()
     };
-    source.insert_feature(feature_id("Batch"), "Batch", true, false, true);
+    source.insert_feature(feature_id("BatchV1_1"), "BatchV1_1", true, false, true);
 
     let result = do_feature(
         &FeatureRequest {
-            params: &object([("feature", JsonValue::String("Batch".to_owned()))]),
+            params: &object([("feature", JsonValue::String("BatchV1_1".to_owned()))]),
             role: RpcRole::Admin,
         },
         &source,
@@ -351,7 +351,7 @@ fn feature_single_lookup_returns_all_fields() {
     // Single feature lookup should have name, enabled, supported, vetoed
     assert_eq!(
         result.get("name"),
-        Some(&JsonValue::String("Batch".to_owned()))
+        Some(&JsonValue::String("BatchV1_1".to_owned()))
     );
     assert_eq!(result.get("enabled"), Some(&JsonValue::Bool(true)));
     assert_eq!(result.get("supported"), Some(&JsonValue::Bool(true)));
@@ -403,10 +403,10 @@ fn feature_vetoed_feature_shows_vetoed_true() {
 #[test]
 fn feature_list_includes_majority_timestamps() {
     let source = FakeFeatureSource {
-        majorities: BTreeMap::from([(feature_id("Batch"), 100), (feature_id("XRPFees"), 200)]),
+        majorities: BTreeMap::from([(feature_id("BatchV1_1"), 100), (feature_id("XRPFees"), 200)]),
         ..Default::default()
     };
-    source.insert_feature(feature_id("Batch"), "Batch", false, false, true);
+    source.insert_feature(feature_id("BatchV1_1"), "BatchV1_1", false, false, true);
     source.insert_feature(feature_id("XRPFees"), "XRPFees", false, false, true);
 
     let result = do_feature(
@@ -423,7 +423,7 @@ fn feature_list_includes_majority_timestamps() {
         panic!("features must be an object");
     };
 
-    let batch_key = basics::base_uint::to_string(&feature_id("Batch"));
+    let batch_key = basics::base_uint::to_string(&feature_id("BatchV1_1"));
     let JsonValue::Object(batch) = features.get(&batch_key).expect("Batch feature") else {
         panic!("batch must be an object");
     };
@@ -439,13 +439,13 @@ fn feature_list_includes_majority_timestamps() {
 #[test]
 fn feature_veto_and_unveto_round_trip() {
     let source = FakeFeatureSource::default();
-    source.insert_feature(feature_id("Batch"), "Batch", false, false, true);
+    source.insert_feature(feature_id("BatchV1_1"), "BatchV1_1", false, false, true);
 
     // Veto
     let veto_result = do_feature(
         &FeatureRequest {
             params: &object([
-                ("feature", JsonValue::String("Batch".to_owned())),
+                ("feature", JsonValue::String("BatchV1_1".to_owned())),
                 ("vetoed", JsonValue::Bool(true)),
             ]),
             role: RpcRole::Admin,
@@ -461,7 +461,7 @@ fn feature_veto_and_unveto_round_trip() {
     let unveto_result = do_feature(
         &FeatureRequest {
             params: &object([
-                ("feature", JsonValue::String("Batch".to_owned())),
+                ("feature", JsonValue::String("BatchV1_1".to_owned())),
                 ("vetoed", JsonValue::Bool(false)),
             ]),
             role: RpcRole::Admin,
@@ -477,7 +477,7 @@ fn feature_veto_and_unveto_round_trip() {
 #[test]
 fn feature_non_admin_cannot_list_all() {
     let source = FakeFeatureSource::default();
-    source.insert_feature(feature_id("Batch"), "Batch", false, false, true);
+    source.insert_feature(feature_id("BatchV1_1"), "BatchV1_1", false, false, true);
 
     let result = do_feature(
         &FeatureRequest {
@@ -496,8 +496,8 @@ fn feature_non_admin_cannot_list_all() {
 #[test]
 fn feature_lookup_by_hex_hash() {
     let source = FakeFeatureSource::default();
-    let batch_id = feature_id("Batch");
-    source.insert_feature(batch_id, "Batch", true, false, true);
+    let batch_id = feature_id("BatchV1_1");
+    source.insert_feature(batch_id, "BatchV1_1", true, false, true);
 
     let result = do_feature(
         &FeatureRequest {
@@ -514,7 +514,7 @@ fn feature_lookup_by_hex_hash() {
     };
     assert_eq!(
         result.get("name"),
-        Some(&JsonValue::String("Batch".to_owned()))
+        Some(&JsonValue::String("BatchV1_1".to_owned()))
     );
     assert_eq!(result.get("enabled"), Some(&JsonValue::Bool(true)));
 }

@@ -52,7 +52,7 @@ fn server_info_pins_validated_age_status_flags_and_current_offset_omission() {
 
     assert_eq!(
         info.get("server_state"),
-        Some(&JsonValue::String("tracking".to_owned()))
+        Some(&JsonValue::String("connected".to_owned()))
     );
     assert_eq!(
         info.get("network_ledger"),

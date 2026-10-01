@@ -162,9 +162,11 @@ fn server_info_reads_application_owner_state_boundary() {
         panic!("info must be an object");
     };
 
+    // Amendment-blocked downgrades the operating mode to connected (rippled
+    // NetworkOPsImp::setAmendmentBlocked -> setMode(OperatingMode::CONNECTED)).
     assert_eq!(
         info.get("server_state"),
-        Some(&JsonValue::String("full".to_owned()))
+        Some(&JsonValue::String("connected".to_owned()))
     );
     assert_eq!(
         info.get("network_ledger"),

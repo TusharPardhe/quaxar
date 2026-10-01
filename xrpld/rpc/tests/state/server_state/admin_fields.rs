@@ -36,9 +36,13 @@ fn server_state_prefers_validated_ledger_and_omits_human_age_and_offset() {
         panic!("state must be object");
     };
 
+    // An amendment-blocked node downgrades its operating mode to connected,
+    // matching rippled `NetworkOPsImp::setAmendmentBlocked` which calls
+    // `setMode(OperatingMode::CONNECTED)`. The validated-ledger fields below
+    // are still reported from the fully-validated ledger.
     assert_eq!(
         state.get("server_state"),
-        Some(&JsonValue::String("full".to_owned()))
+        Some(&JsonValue::String("connected".to_owned()))
     );
     assert_eq!(
         state.get("network_ledger"),

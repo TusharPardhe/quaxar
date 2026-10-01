@@ -113,6 +113,8 @@ pub(super) fn overlay_setup(network_id: Option<u32>) -> Setup {
         vp_reduce_relay_base_squelch_enabled: true,
         vp_reduce_relay_max_selected_peers: 3,
         reduce_relay_wait: std::time::Duration::from_secs(0),
+        max_diverged_time: std::time::Duration::from_secs(300),
+        max_unknown_time: std::time::Duration::from_secs(600),
     }
 }
 
