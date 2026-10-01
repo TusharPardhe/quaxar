@@ -548,3 +548,46 @@ selection/ordering to rippled flow() (default-path + explicit-path strand set
 and the order they are consumed), fix ripple_calculate/execute_strands to match,
 verify affected-node parity (7 nodes), then confirm same-seq-divergent == 0 over
 a sustained window.
+
+## Iter (round 3) — residual divergence CLASS confirmed: multi-hop self-payment arbitrage through offer BOOKS
+
+Deployed-fix steady-state measurement (binary xrp-bridge-567ee50d): across a
+~20 min capture, same_seq_divergent demotions = 3 (seqs 107367440/454/458),
+node_behind_lag = 7. Divergent builds are much rarer than pre-fix but NOT zero.
+
+Characterized the residual class precisely by fetching each divergent ledger
+from the network: EVERY divergent seq contains multiple **self-payment
+arbitrage path-payments** (Account == Destination, tfPartialPayment, explicit
+Paths with type-48 currency = BOOK steps) run by market-maker bots doing
+circular crosses, e.g. CORE->BITX, CSC<->PLX, RED<->PLX, EURO, SOLO/BITX/CSC.
+Their AffectedNodes vary (5, 6, 7, 9, 11) and the node computes a DIFFERENT
+affected-node count than the network for some -> divergent tx tree -> hash
+mismatch -> consensusViewChange.
+
+Reproduction finding (sub-agent, test
+xrpld/app/tests/integration/payment_flow_divergence.rs
+`mainnet_107366839_self_payment_must_modify_both_solo_hops`): the idx-104 case
+(BITX->SOLO->CSC) does NOT reproduce from trust lines alone -> it returns
+tecPATH_DRY. The path's type-48 elements are OFFER-BOOK steps, so the delivery
+crosses the BITX/SOLO and SOLO/CSC order books; the SOLO trust-line changes are
+side effects of the offer owners' balances moving. Adding bridge book liquidity
+makes it deliver. => The divergence is in BOOK-STEP crossing WITHIN a payment
+path (offer_crossing=No), not pure rippling. This is a DIFFERENT code path from
+the OfferCreate XRP-bridge fix (offer_crossing=Sell/Yes) already landed.
+
+So the remaining root cause: payment-path book crossing (execute_strands /
+execute_book_step with offer_crossing=No) consumes a different set/amount of
+offers than rippled for these multi-book arbitrage paths. The OfferCreate fix
+does not cover it because payment paths are explicit (no synthetic XRP bridge).
+
+NEXT (hardest, do first): build a COMPLETE replay fixture for one divergent
+arbitrage payment INCLUDING the offer books it crosses (capture, from parent
+ledger, the book_offers for each hop's book: book_offers taker_gets/taker_pays
+for BITX/SOLO, SOLO/CSC, etc., plus the offer-owner trust lines and transfer
+rates), replay via the fixture harness, confirm node affected-node count != net,
+then diff the node's crossed offers vs the network's AffectedNodes to find which
+offer/book the node mis-crosses, and fix execute_book_step for the
+offer_crossing=No payment path to match rippled. The clustered recurring seqs
+(same MM bots every few ledgers) make capture reliable: pick a current divergent
+seq, pull its self-payment txns + referenced books from the network, build the
+fixture.

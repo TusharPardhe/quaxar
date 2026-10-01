@@ -18,6 +18,7 @@ mod offer_engine;
 mod paychan;
 mod payment;
 mod payment_engine;
+mod payment_flow_divergence;
 mod pipeline;
 mod trust_set;
 mod vault;
