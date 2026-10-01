@@ -591,3 +591,44 @@ offer_crossing=No payment path to match rippled. The clustered recurring seqs
 (same MM bots every few ledgers) make capture reliable: pick a current divergent
 seq, pull its self-payment txns + referenced books from the network, build the
 fixture.
+
+## Iter (round 4) — SECOND root cause FIXED: CanonicalTXSet ordering (TransactionIndex shift)
+
+Using the meta_divergence trace + per-tx meta_hash diff (match network tx by
+computing tx id = sha512_half(0x54584E00 ++ tx_blob) from `ledger expand binary`,
+then compare sha512_half(meta) to the node's logged meta_hash), root-caused a
+divergence on mainnet seq 107368090: a CONTIGUOUS tail (node idx 72..96) all
+diverged while idx 0..71 matched. The node assigned TransactionIndex 72 where
+the network assigned 74 -- a constant +2 shift -- with ALL balances/state
+identical. Cause: account r3ASEe1LLn had 4 consecutive sequences (595..598);
+the network applied them contiguously (TI 70,71,72,73) but the node applied
+595,596 early (idx 70,71) and DEFERRED 597,598 to the end (idx 95,96).
+
+Root: the consensus-accept build loop consumed `result.txns.all_items()` in raw
+SHAMap (tx-hash) order, NOT CanonicalTXSet order. Out-of-sequence same-account
+application forces a spurious retry that re-applies in a later pass at a later
+TransactionIndex; since TransactionIndex is serialized into every tx's metadata,
+that shifts the metadata of every subsequent tx and diverges the ledger hash.
+rippled RCLConsensus::buildLCL applies a CanonicalTXSet (retriableTxs) in
+canonical order (salted account, seq, tx id).
+
+FIX (commit 5886b03a): order the decoded consensus txns through
+CanonicalTXSet(salt = tx-set id) before the build loop. Deployed as
+quaxar.canonorder-5886b03a.
+
+MEASURED (diag binary = fix + trace): over ~26 min steady proposing,
+same_seq_divergent dropped to 1 (was ~3/20min + the frequent TI-shift class),
+node_behind_lag 9. The single remaining divergence (seq 107369025 idx 82) is
+NOT a contiguous tail (only idx 82 differs) => the TI-shift class is ELIMINATED.
+
+REMAINING (one class left): seq 107369025 idx 82 is an OfferCreate
+Flags=786432 (tfSell|tfFillOrKill) that crosses and DELETES 2 offers (13
+affected nodes). Single-tx content divergence in OfferCreate multi-offer book
+crossing (consumption amount / which offers consumed / rounding). Distinct from
+the XRP-bridge path fix and the canonical-order fix. This is the last known
+divergence class; rate ~1 per 26 min.
+
+NEXT: capture seq 107369025 idx 82's node AffectedNodes content (the diag trace
+logs `nodes=`) and diff against the network's 13 AffectedNodes to find the exact
+differing balance/offer, then fix the tfSell|FOK multi-offer crossing
+consumption in execute_book_step to match rippled.
