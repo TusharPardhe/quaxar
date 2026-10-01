@@ -632,3 +632,50 @@ NEXT: capture seq 107369025 idx 82's node AffectedNodes content (the diag trace
 logs `nodes=`) and diff against the network's 13 AffectedNodes to find the exact
 differing balance/offer, then fix the tfSell|FOK multi-offer crossing
 consumption in execute_book_step to match rippled.
+
+## Iter (round 5) — remaining class ROOT-CAUSED: AMM output rounding in tfSell|FOK crossing
+
+With the two prior fixes deployed (XRP-bridge + CanonicalTXSet), the residual
+divergence (~1 per 26 min, non-contiguous single-tx) was captured and
+root-caused via meta_divergence + per-tx meta_hash diff.
+
+DIVERGENT TX: mainnet 107369025 idx 82, OfferCreate
+CE565E16A5DFF7B9D996206C48CBD0F552CA4754774EE884437193C450A7DE75:
+  Account rLPV1SBMbiTMno43PxhBEMWK9pz1hXYk53, Flags 786432 (tfSell|tfFillOrKill),
+  TakerGets 1560000 drops XRP (sell XRP), TakerPays 2.32361370726417 RLUSD.
+It crosses: (1) a CLOB offer owner rU8QEjAbNbXDnBR7kx9TLPXsAEng3axsz4 giving
+0.790418 RLUSD for 530658 drops; (2) an AMM pool
+rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3 (confirmed AMMID) XRP/RLUSD, trading_fee=197,
+parent reserves XRP=1526460107335 drops, RLUSD=2278196.924178077; and it
+self-cross CANCELS the creator's own resting offer (seq 105265383), which both
+node and network delete.
+
+DIVERGENCE: node delivers 2.323622646 RLUSD to the taker; network delivers
+2.323653246 (taker RLUSD line 17.13776773080886 -> network 19.46142097680886 vs
+node 19.46139037215994). Node is short by EXACTLY 0.000030600 RLUSD, entirely in
+the AMM leg (CLOB leg 0.790418 matches). => AMM synthetic-offer output rounding
+in the sell crossing is slightly low vs rippled.
+
+Reproduced the SYMPTOM deterministically (test
+offer_crossing.rs::mainnet_107369025_sell_fok_multi_source_delivery_matches_network,
+currently #[ignore]) but with a CLOB stand-in for the AMM, so it is not yet a
+faithful AMM model.
+
+CODE AREA: xrpld/ledger/src/domain/ripple_calc/book_step.rs AMM path --
+get_amm_offer -> amm_offer_for_clob_quality (fixAMMv1_1 branch ->
+amm_offer_starting_with_gets / amm_offer_starting_with_pays /
+generate_fibonacci_amm_offer) -> amm_swap_asset_in/out. The output
+number_to_amount(..., RoundingMode::Downward) and the staged
+Upward/Downward guards are the suspects for the -0.0000306 shift.
+
+NEXT (final): build a FAITHFUL AMM reproduction -- create the XRP/RLUSD AMM pool
+(reserves above, fee 197) via amm_utils in xrpld/ledger/tests/domain/, place the
+rU8Q CLOB offer and the creator self-offer, enable fixAMMv1_1 + fixFillOrKill +
+fixReducedOffersV2, apply the tfSell|FOK OfferCreate, and assert the AMM leg
+delivers 1.533235246 RLUSD (network) not the node's 1.533204646. Then compare
+the node's generated AMM offer (amm_offer_for_clob_quality output) to rippled's
+AMMLiquidity/BookStep for this pool+quality and fix the rounding to match.
+
+STATUS: 2 root causes fixed+deployed (frequent oscillation eliminated); this AMM
+sell-crossing rounding is the last known divergence class. Node healthy on
+quaxar.canonorder-5886b03a.
