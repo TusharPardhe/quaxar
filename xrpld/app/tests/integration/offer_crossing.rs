@@ -3036,3 +3036,80 @@ fn mainnet_107369025_amm_sell_fok_faithful() {
     println!("[amm_faithful] result={result:?} before={before} after={after} (network expects 19.46142097680886)");
     assert_eq!(result, Ter::TES_SUCCESS, "tfSell|FOK must succeed");
 }
+
+/// Mainnet 107377610 idx 48 class: a tfPartialPayment self-payment delivering
+/// XRP with an IOU (USDC) SendMax and NO explicit Paths must cross the USDC/XRP
+/// AMM via the default path and deliver XRP (tesSUCCESS). On mainnet the node
+/// returned tecPATH_DRY (found no default-path AMM liquidity) where the network
+/// delivered 4-node tesSUCCESS; the tecPATH_DRY then forced a retry that
+/// re-applied the tx at a later TransactionIndex, shifting metadata of every
+/// subsequent tx and diverging the ledger hash (the busy-period oscillation
+/// bursts). This isolates the default-path AMM delivery for an XRP-out payment.
+#[test]
+fn amm_default_path_self_payment_delivers_xrp_not_path_dry() {
+    let taker = acct(0x11);
+    let pool_owner = acct(0x33);
+    let issuer = acct(0x44);
+    let usdc = protocol::currency_from_string("USD");
+
+    let mut issuer_root = account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple);
+    issuer_root.set_field_u32(sf("sfTransferRate"), 1_000_000_000);
+
+    let entries = vec![
+        account_root(pool_owner, 2_000_000_000_000, 1, 0),
+        // self-payer holds USDC to spend; delivers XRP to itself.
+        account_root(taker, 10_000_000_000, 1, protocol::lsfDefaultRipple),
+        issuer_root,
+        trust_line(pool_owner, issuer, usdc, 0, 100_000_000, 0),
+        trust_line_frac(taker, issuer, usdc, 1_000_000_000_000_000, -10, 100_000_000),
+    ];
+
+    let ledger = build_ledger_with_features(
+        entries,
+        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixFillOrKill", "fixReducedOffersV2"],
+    );
+    let mut view = new_view(ledger);
+
+    // USDC/XRP AMM pool at the exact mainnet reserves: XRP 38244294956 drops,
+    // USDC 58282.14276260956, trading fee 54.
+    let create = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), pool_owner);
+        tx.set_field_amount(sf("sfAmount"), xrp(38_244_294_956));
+        tx.set_field_amount(sf("sfAmount2"), iou_frac(issuer, usdc, 5_828_214_276_260_956, -11));
+        tx.set_field_u16(sf("sfTradingFee"), 54);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &create, TxType::AMM_CREATE),
+        Ter::TES_SUCCESS,
+        "USDC/XRP AMM must be created"
+    );
+
+    let before_xrp = xrp_balance(&view, taker);
+    // Self-payment: deliver 44426293 drops XRP to self, SendMax 29.1495305002868
+    // USDC, tfPartialPayment, no Paths (exact mainnet 107377610 idx48 values).
+    let pay = STTx::new(TxType::PAYMENT, |t| {
+        t.set_account_id(sf("sfAccount"), taker);
+        t.set_account_id(sf("sfDestination"), taker);
+        t.set_field_amount(sf("sfAmount"), xrp(44_426_293));
+        t.set_field_amount(sf("sfSendMax"), iou_frac(issuer, usdc, 2_914_953_050_028_680, -14));
+        t.set_field_u32(sf("sfFlags"), 0x0002_0000); // tfPartialPayment
+        t.set_field_amount(sf("sfFee"), xrp(10));
+        t.set_field_u32(sf("sfSequence"), 1);
+    });
+    let result = full_apply(&mut view, &pay, TxType::PAYMENT);
+    let after_xrp = xrp_balance(&view, taker);
+    println!(
+        "[amm_default_path] result={result:?} before_xrp={before_xrp} after_xrp={after_xrp}"
+    );
+    assert_eq!(
+        result,
+        Ter::TES_SUCCESS,
+        "default-path self-payment must cross the USDC/XRP AMM and deliver XRP, not tecPATH_DRY; node returned {result:?}"
+    );
+    assert!(
+        after_xrp > before_xrp - 10_000_000,
+        "taker must receive XRP from the AMM crossing"
+    );
+}
