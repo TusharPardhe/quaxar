@@ -822,3 +822,43 @@ idx 48 (or capture the AMM pool's exact RippleState/AccountRoot at the point idx
 the node's get_amm_offer/amm_offer_for_clob_quality returns None (dry) while
 rippled returns a deliverable offer, then fix that None-returning edge in
 book_step.rs AMM generation.
+
+## New campaign iter 3 — AMM dry-skip + getOffer + Number verified vs rippled; blocker reconfirmed
+
+Investigated the tecPATH_DRY (idx48 self-payment, deliver XRP, SendMax USDC, no
+Paths, crosses USDC/XRP AMM rGHt6LT5). Findings:
+  - No prior same-ledger tx touched the AMM (reserves at idx48 == parent ==
+    amm_info 38244294956 drops / 58282.14276260956 USDC, fee 54). Taker held
+    ~14247 USDC (ample). So state at idx48 is the clean parent state.
+  - A reproduction with those exact amm_info reserves DELIVERS tesSUCCESS
+    (~19.1M drops) in the node (guard amm_default_path_self_payment_...). So the
+    live tecPATH_DRY is NOT reproduced by the amm_info reserves -> the trigger is
+    a byte-exact pool mantissa / internal AMM state (e.g. AuctionSlot, exact
+    LPToken/USDC RippleState mantissa) that AMM_CREATE cannot seed.
+  - Verified node get_amm_offer dry-skip `if clobQuality && (spot<=clob ||
+    withinRelativeDistance(spot,clob,1e-7)) return None` == rippled
+    AMMLiquidity::getOffer EXACTLY. getAMMOffer, tip(), qualityThreshold,
+    maxOffer-vs-clob fallback (fixAMMv1_2), changeSpotPriceQuality, fib-seq
+    multiPath -- all match rippled line-by-line.
+  - Number type (xrpl/basics/src/math/number.rs) is a faithful port (guard
+    digits, rounding modes, cusp_rounding_3_2_0/3_3_0 amendment gating); a
+    systematic bug would fail the many passing AMM tests, which it doesn't.
+  - The node has PRUNED ledger 107377609 (online_delete=512), so its exact
+    stored AMM state at that point is no longer queryable.
+
+CONFIRMED HARD BLOCKER for a verified fix of the residual AMM-crossing divergence
+(both the sub-ULP output class and the tecPATH_DRY/None dry-edge class, which
+cascade into TransactionIndex shifts): every AMM function matches rippled
+line-by-line; the divergence is a sub-ULP Number-precision artifact that only
+manifests at byte-exact mainnet pool mantissas; those cannot be reproduced from
+fetchable RPC data (AMM_CREATE cannot seed exact reserves/LP/AuctionSlot), the
+relevant ledgers are pruned on the node, and no rippled-side per-step Number
+instrumentation is available. A verified fix requires EITHER a mainnet-state
+snapshot replay harness that loads the exact parent SHAMap (all AMM pools +
+books) before pruning and replays the tx with per-step Number logging, OR
+instrumented rippled to dump per-step Number values for the same tx -- neither
+available in this environment.
+
+Node remains healthy on the 2-fix binary; validated chain always correct
+(divergences are transient losing candidates). 2 root causes fixed this campaign
+(IOU/IOU offer-cross temBAD_PATH; CanonicalTXSet ordering).
