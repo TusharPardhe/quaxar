@@ -896,3 +896,42 @@ sub-ULP accumulation. Verified fix still blocked by lack of a byte-exact
 multi-AMM-pool reproduction + per-step Number logging (AMM_CREATE cannot seed
 exact pool mantissas; ledgers pruned on node; no rippled instrumentation).
 Node healthy on quaxar.canonorder-5886b03a; 2 root causes fixed this campaign.
+
+## New campaign iter 5 (final) — byte-exact 2-AMM repro attempted; AMM_CREATE cannot match mainnet behavior
+
+Built a full 2-AMM-hop reproduction (mainnet_107378058_two_amm_hop_delivery,
+ignored): both IOU/IOU AMMs created via AMM_CREATE at the exact amm_info reserves
+(AMM1 331602.0762681885 589 / 1174935.394386201 FUZZY fee 589; AMM2
+1403849.782855174 589 / 58056.49016902905 XPM fee 0), self-payment
+FUZZY->589->XPM, SendMax 819.6277679473462 FUZZY, deliver 9.501940276253348 XPM,
+tfPartialPayment. Node delivered 9.501940276253348 XPM (full target); network
+delivered 9.498596739306 (SendMax-limited partial). The pools do NOT reproduce
+mainnet behavior even at amm_info reserves.
+
+TRIPLE-CONFIRMED HARD BLOCKER: AMM_CREATE-seeded pools (and amm_info reserves)
+do not reproduce exact mainnet AMM crossing results -- the delivered amounts
+differ, so the sub-ULP divergence cannot be isolated or a fix verified this way.
+Confirmed across three independent reproductions this campaign (107369025 FOK,
+107377610 dry self-payment, 107378058 two-AMM-hop). A verified fix requires the
+EXACT mainnet AMM pool ledger state (LPToken balance, AuctionSlot, exact
+reserve mantissas, trust-line nodes) loaded directly -- i.e. a mainnet-SHAMap
+snapshot replay harness that reads the parent ledger from the node's store
+BEFORE online_delete prunes it, with per-step Number logging, OR instrumented
+rippled. Neither is available in this environment.
+
+FINAL CAMPAIGN RESULT:
+- 3 root causes fixed+deployed, eliminating the frequent/systematic oscillation
+  classes: (1) IOU/IOU OfferCreate XRP-bridge temBAD_PATH (567ee50d), (2)
+  CanonicalTXSet ordering / TransactionIndex shift (5886b03a), plus the earlier
+  acquisition/sweep PRs.
+- Residual: multi-AMM-hop (and tfSell|FOK + AMM) sub-ULP accumulation in
+  self-payment arbitrage by MM bots (rogue5 et al), rate elevated only during
+  busy arbitrage windows; validated chain always correct (transient losing
+  candidates).
+- Every AMM function (getAMMOffer, getOffer dry-skip, limitIn/Out,
+  qualityThreshold, changeSpotPriceQuality, getAMMOfferStartWith*, swapAssetIn/
+  Out, Number) verified line-by-line vs rippled -- no formula divergence found.
+- A code-audit candidate (strand_flow set_multi_path two-phase set vs rippled's
+  single activeStrands.size() set) is flagged for a multi-strand+AMM repro;
+  does not affect the single-strand rogue5 case; not changed speculatively.
+Node healthy on quaxar.canonorder-5886b03a.
