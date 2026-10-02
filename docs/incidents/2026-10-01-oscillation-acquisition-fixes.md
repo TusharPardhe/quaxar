@@ -783,3 +783,42 @@ snapshot, or (b) rippled-side instrumentation to dump per-step Number values for
 these exact txns. Node remains healthy on the 2-fix binary
 quaxar.canonorder-5886b03a; validated chain always correct (divergences are
 transient losing candidates).
+
+## New campaign iter 2 — KEY MECHANISM: content divergence (tecPATH_DRY) CASCADES into TransactionIndex shift
+
+Captured a busy-period divergent ledger (seq 107377610) with the full-content
+meta trace. The divergent set was a CONTIGUOUS tail (node idx 48-55), initially
+looking like the ordering bug. But it is a ROTATION: node idx 48->55 map to net
+TI 49->55 (+1), and node idx 55 -> net TI 48. I.e. one tx (A58C45C93D) the
+network placed FIRST (TI 48) the node placed LAST (idx 55).
+
+ROOT: A58C45C93D is a tfPartialPayment SELF-payment (rfgtQeBdx), deliver
+44426293 drops XRP, SendMax 29.1495305002868 USDC, NO explicit Paths. Network:
+tesSUCCESS, 4 nodes, crossing the USDC/XRP AMM rGHt6LT5 (confirmed AMMID; parent
+reserves XRP 38244294956 / USDC 58282.14276260956, fee 54). NODE: tecPATH_DRY
+(Ter 128), 1 node -- it found NO default-path AMM liquidity. Because tecPATH_DRY
+is a retry-class result, the node deferred the tx to a later pass and re-applied
+it at idx 55, shifting the TransactionIndex of every tx in between -> contiguous-
+tail metadata/hash divergence.
+
+=> IMPORTANT: the sub-ULP/edge AMM divergence and the TransactionIndex-shift
+bursts are the SAME underlying bug. When the node's AMM crossing returns dry (or
+a different result) at a specific pool state, the retry re-orders the tx and
+cascades the hash divergence across the rest of the ledger. Fixing the AMM
+dry/edge case fixes BOTH.
+
+Reproduction status: a default-path self-payment (deliver XRP, SendMax USDC, no
+Paths) against the USDC/XRP AMM at the amm_info reserves DELIVERS correctly
+(tesSUCCESS ~19.1M drops) in the node -- committed as guard
+amm_default_path_self_payment_delivers_xrp_not_path_dry. So the live tecPATH_DRY
+is NOT a plain default-path-AMM failure; it only occurs at the pool state AFTER
+earlier same-ledger txns depleted/modified the AMM (idx 48 is preceded by 47
+txns, several of which are AMM-crossing arbitrage). The dry condition is
+state-dependent on intra-ledger AMM consumption.
+
+NEXT: reproduce by applying the SEQUENCE of same-ledger AMM-touching txns before
+idx 48 (or capture the AMM pool's exact RippleState/AccountRoot at the point idx
+48 executes via the node's own store), to get the depleted pool state at which
+the node's get_amm_offer/amm_offer_for_clob_quality returns None (dry) while
+rippled returns a deliverable offer, then fix that None-returning edge in
+book_step.rs AMM generation.
