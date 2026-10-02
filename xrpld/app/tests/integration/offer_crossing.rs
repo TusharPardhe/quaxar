@@ -3113,3 +3113,111 @@ fn amm_default_path_self_payment_delivers_xrp_not_path_dry() {
         "taker must receive XRP from the AMM crossing"
     );
 }
+
+/// Byte-exact 2-AMM-hop reproduction of mainnet 107378058 idx 46: a rogue5
+/// self-payment FUZZY -> 589 -> XPM through two IOU/IOU AMMs. Network delivered
+/// 9.498596739306 XPM for 819.6277679471 FUZZY (tfPartialPayment). The node
+/// delivered a sub-ULP-different XPM amount, diverging the ledger hash.
+/// AMM1 rKrq8QShf: 331602.0762681885 589 / 1174935.394386201 FUZZY, fee 589.
+/// AMM2 rQJMAoBvG: 1403849.782855174 589 / 58056.49016902905 XPM, fee 0.
+#[test]
+#[ignore = "byte-exact 2-AMM-hop repro for 107378058 idx46; enable while fixing the multi-AMM sub-ULP divergence"]
+fn mainnet_107378058_two_amm_hop_delivery() {
+    let taker = acct(0x11);
+    let o1 = acct(0x61); // AMM1 pool_owner
+    let o2 = acct(0x62); // AMM2 pool_owner
+    let i_fuzzy = acct(0x71);
+    let i_589 = acct(0x72);
+    let i_xpm = acct(0x73);
+    let fuzzy = protocol::currency_from_string("FUZ");
+    let c589 = protocol::currency_from_string("589");
+    let xpm = protocol::currency_from_string("XPM");
+
+    let mk_issuer = |a| {
+        let mut r = account_root(a, 100_000_000_000, 0, protocol::lsfDefaultRipple);
+        r.set_field_u32(sf("sfTransferRate"), 1_000_000_000);
+        r
+    };
+    let mut entries = vec![
+        account_root(o1, 2_000_000_000_000, 2, 0),
+        account_root(o2, 2_000_000_000_000, 2, 0),
+        account_root(taker, 10_000_000_000, 1, protocol::lsfDefaultRipple),
+        mk_issuer(i_fuzzy),
+        mk_issuer(i_589),
+        mk_issuer(i_xpm),
+    ];
+    // o1 holds 589 + FUZZY to seed AMM1; o2 holds 589 + XPM to seed AMM2.
+    entries.push(trust_line_frac(o1, i_589, c589, 5_000_000_000_000_000, -10, 1_000_000_000));
+    entries.push(trust_line_frac(o1, i_fuzzy, fuzzy, 5_000_000_000_000_000, -9, 1_000_000_000));
+    entries.push(trust_line_frac(o2, i_589, c589, 5_000_000_000_000_000, -9, 1_000_000_000));
+    entries.push(trust_line_frac(o2, i_xpm, xpm, 5_000_000_000_000_000, -10, 1_000_000_000));
+    // taker holds FUZZY to spend; can receive XPM and 589.
+    entries.push(trust_line_frac(taker, i_fuzzy, fuzzy, 1_000_000_000_000_000, -9, 1_000_000_000));
+    entries.push(trust_line_frac(taker, i_xpm, xpm, 0, 0, 1_000_000_000));
+    entries.push(trust_line_frac(taker, i_589, c589, 0, 0, 1_000_000_000));
+
+    let ledger = build_ledger_with_features(
+        entries,
+        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixFillOrKill", "fixReducedOffersV2"],
+    );
+    let mut view = new_view(ledger);
+
+    // AMM1: 331602.0762681885 589 / 1174935.394386201 FUZZY, fee 589.
+    let c1 = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), o1);
+        tx.set_field_amount(sf("sfAmount"), iou_frac(i_589, c589, 3_316_020_762_681_885, -10));
+        tx.set_field_amount(sf("sfAmount2"), iou_frac(i_fuzzy, fuzzy, 1_174_935_394_386_201, -9));
+        tx.set_field_u16(sf("sfTradingFee"), 589);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(full_apply(&mut view, &c1, TxType::AMM_CREATE), Ter::TES_SUCCESS, "AMM1 create");
+
+    // AMM2: 1403849.782855174 589 / 58056.49016902905 XPM, fee 0.
+    let c2 = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), o2);
+        tx.set_field_amount(sf("sfAmount"), iou_frac(i_589, c589, 1_403_849_782_855_174, -9));
+        tx.set_field_amount(sf("sfAmount2"), iou_frac(i_xpm, xpm, 5_805_649_016_902_905, -11));
+        tx.set_field_u16(sf("sfTradingFee"), 0);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(full_apply(&mut view, &c2, TxType::AMM_CREATE), Ter::TES_SUCCESS, "AMM2 create");
+
+    // Self-payment FUZZY -> 589 -> XPM, deliver up to 9.501940276253348 XPM,
+    // SendMax 819.6277679473462 FUZZY, tfPartialPayment, explicit path.
+    let pay = STTx::new(TxType::PAYMENT, |t| {
+        t.set_account_id(sf("sfAccount"), taker);
+        t.set_account_id(sf("sfDestination"), taker);
+        t.set_field_amount(sf("sfAmount"), iou_frac(i_xpm, xpm, 9_501_940_276_253_348, -15));
+        t.set_field_amount(sf("sfSendMax"), iou_frac(i_fuzzy, fuzzy, 8_196_277_679_473_462, -13));
+        t.set_field_u32(sf("sfFlags"), 0x0002_0000); // tfPartialPayment
+        t.set_field_amount(sf("sfFee"), xrp(10));
+        t.set_field_u32(sf("sfSequence"), 1);
+        let mut path = protocol::STPath::new();
+        // 589 book step (currency+issuer offer element), then 589 issuer account
+        path.push_back(protocol::STPathElement::inferred(
+            protocol::AccountID::default(), c589, i_589, true,
+        ));
+        path.push_back(protocol::STPathElement::inferred(
+            i_589, protocol::PathAsset::Currency(protocol::currency_from_string("XRP")), protocol::AccountID::default(), false,
+        ));
+        // XPM book step, then XPM issuer account
+        path.push_back(protocol::STPathElement::inferred(
+            protocol::AccountID::default(), xpm, i_xpm, true,
+        ));
+        path.push_back(protocol::STPathElement::inferred(
+            i_xpm, protocol::PathAsset::Currency(protocol::currency_from_string("XRP")), protocol::AccountID::default(), false,
+        ));
+        let mut ps = protocol::STPathSet::new(sf("sfPaths"));
+        ps.push_back(path);
+        t.set_field_path_set(sf("sfPaths"), ps);
+    });
+    let result = full_apply(&mut view, &pay, TxType::PAYMENT);
+    let xpm_bal = view
+        .read(protocol::line(taker, i_xpm, xpm))
+        .expect("read").expect("xpm line")
+        .get_field_amount(sf("sfBalance")).iou().to_string();
+    println!("[two_amm_hop] result={result:?} taker_xpm_balance={xpm_bal} (network delivered 9.498596739306 XPM)");
+    assert_eq!(result, Ter::TES_SUCCESS, "2-AMM-hop payment must succeed");
+}
