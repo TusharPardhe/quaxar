@@ -743,3 +743,43 @@ AMM_CREATE), replay the crossing, and bisect the single Number rounding guard in
 amm_swap_asset_in / number_to_amount / mul_ratio that accounts for the 21-drop
 input (or ~0.0000306 output) delta -- comparing each intermediate Number against
 a rippled instrumented run of the same pool.
+
+## New campaign iter 1 — divergence confirmed sub-ULP in LATER hops of multi-step arbitrage flows
+
+Busy-period bursts (10 same-seq-divergent in 15 min) are dominated by rogue5-style
+market-maker self-payment arbitrage (Account==Destination, tfPartialPayment,
+multi-currency Paths crossing chains of IOU books + AMMs). Example captured:
+seq 107376752 idx 5 (hash C935028F...): self-payment XAH -> ... -> PLX, 9
+affected nodes.
+
+Byte-level finding (meta_divergence node-content trace, matched by tx id =
+sha512_half(0x54584E00 ++ tx_blob) vs sha512_half(meta)):
+  - For idx 5, the FIRST 5 affected-node final balances match the network
+    EXACTLY (-122952.8345465588, -3632.257444769506, 55870015833.29757,
+    -65859.94438178065, 3741456.286725798).
+  - The divergence is in a LATER hop (nodes DAFDE597 / E110DF4B2500 /
+    EF88142AFEEF, beyond the 6000-char trace truncation) -- a sub-ULP balance
+    difference accumulated through the multi-step strand.
+This confirms the residual is accumulated sub-ULP rounding in the LATER steps of
+long multi-book/AMM strands, not an early-step or ordering error. Divergent txns
+are single/non-contiguous (idx 5 and 114 independently), i.e. content rounding,
+not TransactionIndex shift (that class remains fixed by CanonicalTXSet).
+
+Verified earlier (still holds): AMM offer generation (getAMMOfferStartWith*),
+AMMOffer::limitIn/Out, BookStepCrossing::qualityThreshold, forEachOffer order,
+and swapAssetIn/Out all match rippled line-by-line. The residual sub-ULP delta
+only manifests with byte-exact multi-book/multi-AMM live state, which is NOT
+reconstructable from fetchable RPC data (every crossed offer book + AMM pool at
+the exact ledger; AMM_CREATE cannot seed byte-exact reserves/LP rounding).
+
+HARD BLOCKER for a verified fix: cannot build a byte-exact reproduction of these
+live multi-liquidity arbitrage flows, so cannot isolate the single Number
+rounding guard that differs, and cannot verify a candidate fix without risking
+regression of the extensive passing AMM/flow parity suite. A verified fix
+requires either (a) a mainnet-state snapshot replay harness that loads the exact
+parent-ledger SHAMap (all offer dirs + AMM pools) and replays the tx, diffing
+each strand step's Number against an instrumented rippled run of the same
+snapshot, or (b) rippled-side instrumentation to dump per-step Number values for
+these exact txns. Node remains healthy on the 2-fix binary
+quaxar.canonorder-5886b03a; validated chain always correct (divergences are
+transient losing candidates).
