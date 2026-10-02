@@ -862,3 +862,37 @@ available in this environment.
 Node remains healthy on the 2-fix binary; validated chain always correct
 (divergences are transient losing candidates). 2 root causes fixed this campaign
 (IOU/IOU offer-cross temBAD_PATH; CanonicalTXSet ordering).
+
+## New campaign iter 4 — rogue5 divergence = multi-AMM-hop single strand; multi_path timing candidate found
+
+Captured divergent seq 107378058 idx 46 (rogue5 self-payment, deliver XPM,
+SendMax FUZZY, Paths FUZZY->589->XPM). Single divergent tx (content, not
+ordering). AffectedNodes: all RippleState + rogue5 AccountRoot, NO Offer nodes.
+The two rippling intermediaries rKrq8QShfJUhHAZSf5TcT1kuxRfuu1bVue and
+rQJMAoBvGzrfFgvUS7JVgVtXgdWkcKKiuA are BOTH AMMs (confirmed AMMID). => the path
+crosses TWO AMM pools in sequence (FUZZY/589 AMM then 589/XPM AMM) within ONE
+strand (single path). The intermediate 589 handoff is consistent
+(AMM1 +229.78 589, AMM2 -229.78 589); the sub-ULP divergence is in a terminal
+balance, accumulated across the 2-AMM-step strand composition (reverse-then-
+forward across two BookSteps). It is single-strand, so multi_path=false; each
+AMM uses single-path amm_offer_for_clob_quality/maxOffer (verified faithful).
+
+Code-audit candidate found (NOT the rogue5 cause, single-strand unaffected):
+strand_flow.rs sets amm_context.set_multi_path TWICE per iteration -- line 102
+`active_indices.len() > 1` (pre-quality-estimation) for estimation, and line 140
+`candidates.len() > 1` (post-quality-prune) for execution. rippled StrandFlow.h:
+670 sets setMultiPath(activeStrands.size() > 1) ONCE after activateNext (which
+itself applies limitQuality activation/pruning), used for the whole iteration;
+Flow.cpp:105 sets it once from strands.size(). The node's two-phase setting
+could diverge from rippled for MULTI-strand payments that also touch AMM when
+quality-pruning changes the active/candidate count between estimation and
+execution (changes Fibonacci-vs-changeSpotPriceQuality AMM sizing). Needs a
+multi-strand+AMM byte-exact reproduction to validate which is correct; NOT
+changed speculatively (risks the passing multi-path AMM suite) and does not fix
+the dominant single-strand rogue5 case.
+
+CONFIRMED: the residual oscillation is multi-AMM-hop (and multi-strand+AMM)
+sub-ULP accumulation. Verified fix still blocked by lack of a byte-exact
+multi-AMM-pool reproduction + per-step Number logging (AMM_CREATE cannot seed
+exact pool mantissas; ledgers pruned on node; no rippled instrumentation).
+Node healthy on quaxar.canonorder-5886b03a; 2 root causes fixed this campaign.
