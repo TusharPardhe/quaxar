@@ -1958,6 +1958,62 @@ impl CoordinatorRunner {
         } else {
             None
         };
+        // rippled's `InboundLedgers::acquire` returns the existing per-hash
+        // `InboundLedger` from `ledgers_` whenever one is present, and only
+        // the age-based `sweep()` (1 minute since last action) removes it.
+        // That means repeated `acquire(hash)` for a ledger that was just
+        // obtained (installed as LCL) or made obsolete (superseded) coalesces
+        // onto the retained entry rather than minting a brand new acquisition.
+        // Our runner retains a cancelled/completed session for `TERMINAL_RETENTION`
+        // (60s) via `arm_terminal_retention`, but the live-coalescing checks
+        // above filter terminal phases, so a `checkLastClosedLedger` demand
+        // that re-fires every consensus round for a still-preferred (not
+        // superseded) hash found no owner and started a NEW session each round
+        // -- the observed 80x same-seq session churn on thin-peer networks.
+        // Coalesce onto the retained terminal owner (installed/superseded/
+        // completed/idle) and refresh its retention, exactly like rippled's
+        // `touch()`, so no redundant session is minted while the retention
+        // window is open. A genuinely failed target is excluded so recovery
+        // can still re-attempt it.
+        let retained_terminal_coalesce = if exact.is_none()
+            && promotion.is_none()
+            && hash_only_coalesce.is_none()
+        {
+            self.state
+                .sessions
+                .iter()
+                .find(|(session, state)| {
+                    session.target_hash() == target.hash()
+                        && matches!(
+                            state.phase,
+                            SessionPhase::Complete
+                                | SessionPhase::Cancelled {
+                                    reason: CancelReason::LclInstalled
+                                        | CancelReason::Superseded
+                                        | CancelReason::IdleExpired,
+                                }
+                        )
+                })
+                .map(|(session, _)| *session)
+        } else {
+            None
+        };
+        // Coalesce onto the retained terminal owner now: refresh its retention
+        // window (rippled `touch()`) and emit no new session. This is the
+        // `isNew == false` branch of `InboundLedgers::acquire`.
+        if let Some(retained) = retained_terminal_coalesce {
+            self.arm_terminal_retention(retained, &mut effects);
+            tracing::debug!(
+                target: "acquisition_trace",
+                event = "acquire_coalesced_retained_terminal",
+                target_hash = %target.hash(),
+                target_seq = ?target.sequence(),
+                ?reason,
+                session_id = retained.session_id().get(),
+                "acquisition trace: demand coalesced onto retained terminal per-hash owner (no new session)"
+            );
+            return effects;
+        }
         let replaceable: Vec<SessionRef> = if !ordinary_demand_with_preferred
             && exact.is_none()
             && promotion.is_none()
