@@ -717,3 +717,29 @@ CAMPAIGN RESULT: 3 root causes fixed+deployed over the campaign
 residual is a single rare AMM sell-crossing rounding class (~2 per 30 min),
 narrowed to the BookStep AMM offer limit/application (generation proven faithful
 to rippled this iteration). Node healthy and proposing on the 2-fix binary.
+
+## Iter (round 7) — AMM BookStep code diffed line-by-line vs rippled; no formula divergence found
+
+Checked the full AMM sell-crossing path against rippled:
+  - node amm_offer_starting_with_pays/gets == rippled getAMMOfferStartWithTakerPays/Gets (AMMHelpers.h): identical quadratic, constraint, toAmount(..,Downward), swapAssetIn/Out, reduceOffer fallback.
+  - node SyntheticAmmOffer::limit == rippled AMMOffer::limitOut/limitIn (AMMOffer.cpp): multiPath -> ceil_out_strict/ceil_in_strict(fixReducedOffersV2); single-path -> swapAssetOut/swapAssetIn(limit). Identical.
+  - node amm_target_quality == rippled BookStepCrossing::qualityThreshold (BookStep.cpp:478): returns None (uncapped AMM) iff fixAMMv1_1 && !multiPath && threshold>lobQuality; else lobQuality. Identical. For 107369025 idx82 the taker quality (0.000001489496 RLUSD/drop) is slightly WORSE than the CLOB tip (0.000001489505), so the AMM is correctly capped to the CLOB tip (not uncapped).
+  - node forEachOffer order == rippled: tryAMM(clobTipQuality) once, then CLOB offers (BookStep.cpp:887).
+  - Verified arithmetically: swapAssetIn(1029342 drops) = 1.5332352648 => rounds to the NETWORK value 1.533235246. The node consumed ~1029321 drops (1.533204646), ~21 drops short.
+
+CONCLUSION: no divergent AMM FORMULA or control-flow vs rippled was found; every
+checked function matches. The residual -0.0000306 RLUSD (~21 drops of AMM input)
+is a sub-ULP Number/STAmount precision artifact that only manifests with the
+byte-exact mainnet pool mantissas. A faithful AMM_CREATE reproduction
+(mainnet_107369025_amm_sell_fok_faithful, ignored) cannot be made byte-exact
+because AMM_CREATE-seeded reserves/LP rounding differ from the pool's exact
+RippleState at crossing time (amm_info 2278196.924178077 vs the RLUSD RippleState
+2278196.910635268), so the test is a diagnostic, not a pass/fail guard.
+
+To fix with certainty, the next step must capture the AMM pool's EXACT RippleState
+balances (both the AMM/XRP AccountRoot drops and the AMM/RLUSD RippleState value)
+at parent ledger 107369024, inject them directly as ledger entries (not via
+AMM_CREATE), replay the crossing, and bisect the single Number rounding guard in
+amm_swap_asset_in / number_to_amount / mul_ratio that accounts for the 21-drop
+input (or ~0.0000306 output) delta -- comparing each intermediate Number against
+a rippled instrumented run of the same pool.
