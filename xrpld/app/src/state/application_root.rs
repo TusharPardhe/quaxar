@@ -11220,6 +11220,14 @@ impl ApplicationRoot {
                 let mut serializer = protocol::Serializer::default();
                 meta.add_raw(&mut serializer, result, index as u32);
 
+                {
+                    let affected = meta.get_nodes().len();
+                    let meta_hash = protocol::sha512_half(serializer.data());
+                    let nodes_json = format!("{:?}", delta_meta_nodes);
+                    let nodes_json = if nodes_json.len() > 90000 { &nodes_json[..90000] } else { &nodes_json[..] };
+                    tracing::info!(target: "meta_divergence", closed_seq, tx_index = index, tx_id = %transaction_id, txn_type = ?txn_type, result = ?result, affected_nodes = affected, meta_hash = %meta_hash, nodes = %nodes_json, "meta_divergence");
+                }
+
                 accepted_entries.push(StandaloneAcceptedTx {
                     transaction_id,
                     txn: Arc::new(protocol::Serializer::from_bytes(
