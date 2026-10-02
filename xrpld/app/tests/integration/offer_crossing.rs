@@ -2942,3 +2942,97 @@ fn mainnet_107369025_sell_fok_multi_source_delivery_matches_network() {
         "network final balance is 19.46142097680886; node delivered {delivered} RLUSD"
     );
 }
+
+/// Faithful AMM reproduction of mainnet 107369025 idx 82: a tfSell|tfFillOrKill
+/// OfferCreate selling XRP for RLUSD crosses a CLOB offer plus the real XRP/RLUSD
+/// AMM pool (rhWTXC2m2g). The network delivered 2.323653246 RLUSD; the node
+/// delivered 2.323622646 (AMM leg short by 0.0000306). This builds the actual
+/// AMM via AMM_CREATE with the exact parent reserves (fee 197) so the node's own
+/// book-step AMM path is exercised.
+#[test]
+#[ignore = "faithful AMM repro for mainnet 107369025 idx 82 AMM-leg rounding; enable while fixing"]
+fn mainnet_107369025_amm_sell_fok_faithful() {
+    let taker = acct(0x11);
+    let pool_owner = acct(0x33);
+    let clob_maker = acct(0x22);
+    let issuer = acct(0x44);
+    let rlusd =
+        Currency::from_hex("524C555344000000000000000000000000000000").expect("RLUSD hex currency");
+
+    let mut issuer_root = account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple);
+    issuer_root.set_field_u32(sf("sfTransferRate"), 1_000_000_000);
+
+    let mut entries = vec![
+        // pool_owner must hold enough XRP + RLUSD to seed the pool.
+        account_root(pool_owner, 2_000_000_000_000, 1, 0),
+        account_root(taker, 10_000_000_000, 1, protocol::lsfDefaultRipple),
+        account_root(clob_maker, 10_000_000_000, 1, 0),
+        issuer_root,
+    ];
+    // pool_owner RLUSD to seed the pool.
+    entries.push(trust_line_frac(pool_owner, issuer, rlusd, 3_000_000_000_000_000, -9, 1_000_000_000));
+    // taker holds RLUSD at the parent balance 17.13776773080886 and sells XRP.
+    entries.push(trust_line_frac(taker, issuer, rlusd, 1_713_776_773_080_886, -14, 1_000_000_000));
+    // clob maker holds RLUSD to sell.
+    entries.push(trust_line_frac(clob_maker, issuer, rlusd, 7_904_180_448_195_880, -16, 1_000_000_000));
+
+    let ledger = build_ledger_with_features(entries, vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // Create the AMM with the exact parent reserves: XRP 1526460107335 drops,
+    // RLUSD 2278196.924178077, trading fee 197.
+    let create = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), pool_owner);
+        tx.set_field_amount(sf("sfAmount"), xrp(1_526_460_107_335));
+        tx.set_field_amount(sf("sfAmount2"), iou_frac(issuer, rlusd, 2_278_196_924_178_077, -9));
+        tx.set_field_u16(sf("sfTradingFee"), 197);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &create, TxType::AMM_CREATE),
+        Ter::TES_SUCCESS,
+        "AMM pool must be created with the exact reserves"
+    );
+
+    // External CLOB offer rU8Q: gives 0.790418 RLUSD for 530658 drops XRP.
+    let clob = offer_tx(
+        clob_maker,
+        xrp(530_658),
+        iou_frac(issuer, rlusd, 790_418_000_000_000, -15),
+        1,
+    );
+    assert_eq!(
+        full_apply(&mut view, &clob, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "CLOB offer must be placed"
+    );
+
+    let before = view
+        .read(protocol::line(taker, issuer, rlusd))
+        .expect("read")
+        .expect("taker rlusd line")
+        .get_field_amount(sf("sfBalance"))
+        .iou()
+        .to_string();
+
+    // tx: tfSell|FOK, TakerGets 1560000 drops XRP, TakerPays 2.32361370726417 RLUSD.
+    let tx = STTx::new(TxType::OFFER_CREATE, |t| {
+        t.set_account_id(sf("sfAccount"), taker);
+        t.set_field_amount(sf("sfTakerGets"), xrp(1_560_000));
+        t.set_field_amount(sf("sfTakerPays"), iou_frac(issuer, rlusd, 2_323_613_707_264_170, -15));
+        t.set_field_u32(sf("sfFlags"), protocol::tfSell | protocol::tfFillOrKill);
+        t.set_field_amount(sf("sfFee"), xrp(10));
+        t.set_field_u32(sf("sfSequence"), 1);
+    });
+    let result = full_apply(&mut view, &tx, TxType::OFFER_CREATE);
+    let after = view
+        .read(protocol::line(taker, issuer, rlusd))
+        .expect("read")
+        .expect("taker rlusd line")
+        .get_field_amount(sf("sfBalance"))
+        .iou()
+        .to_string();
+    println!("[amm_faithful] result={result:?} before={before} after={after} (network expects 19.46142097680886)");
+    assert_eq!(result, Ter::TES_SUCCESS, "tfSell|FOK must succeed");
+}
