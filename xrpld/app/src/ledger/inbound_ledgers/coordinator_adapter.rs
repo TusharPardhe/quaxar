@@ -312,6 +312,13 @@ struct AdapterStats {
 pub(crate) struct CoordinatorIngress {
     routing_snapshot: Arc<RwLock<Arc<RoutingSnapshot>>>,
     packet_tx: PacketEventSender,
+    /// Non-blocking control-fact lane. Consensus/NetworkOps producers submit
+    /// lifecycle facts (Heartbeat, LclInstalled, StartupMode, ...) through this
+    /// cloned `EventSender` + owner wake instead of locking the mutable
+    /// coordinator. This matches rippled, where `peerProposal`/mode facts never
+    /// block on in-flight ledger-data processing: a producer must never wait on
+    /// the owner thread that is draining heavy per-ledger work.
+    control_tx: EventSender,
     stats: Arc<Mutex<AdapterStats>>,
     wake: Arc<CoordinatorOwnerWake>,
 }
@@ -427,6 +434,28 @@ impl CoordinatorIngress {
                     .packets_terminal += 1;
                 LedgerDataIngressDisposition::Terminal
             }
+        }
+    }
+
+    /// Submit a lifecycle control fact to the coordinator owner WITHOUT taking
+    /// the mutable coordinator lock. Consensus/NetworkOps call this for
+    /// `Heartbeat`, `LclInstalled`, `StartupMode`, etc., so a producer never
+    /// blocks on the owner draining heavy per-ledger work (the cause of the
+    /// observed validated-ledger stalls). Mirrors rippled, where mode/propose
+    /// facts are delivered independently of in-flight `JtLedgerData` jobs.
+    ///
+    /// Returns `true` if the fact was accepted onto the owner's event lane.
+    /// A `Full`/`Disconnected` channel returns `false`; these lifecycle facts
+    /// are idempotent/periodic (heartbeat re-fires; LCL-installed is re-derived
+    /// from the next round), so dropping under transient saturation is safe and
+    /// still strictly better than blocking the consensus thread.
+    pub(crate) fn submit_control_fact(&self, event: AcquisitionEvent) -> bool {
+        match self.control_tx.try_send(event) {
+            Ok(()) => {
+                self.wake.notify();
+                true
+            }
+            Err(_) => false,
         }
     }
 }
@@ -574,6 +603,7 @@ where
                 BTreeMap::new(),
             )))),
             packet_tx: packet_tx.clone(),
+            control_tx: tx.clone(),
             stats: Arc::new(Mutex::new(AdapterStats::default())),
             wake: Arc::clone(&owner_wake),
         };

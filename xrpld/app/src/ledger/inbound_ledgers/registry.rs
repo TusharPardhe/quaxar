@@ -1233,36 +1233,69 @@ impl InboundLedgers {
     /// startup write remains only as the pre-install seed. Returns false unless
     /// installed.
     pub fn coordinator_startup(&self, phase: acquisition::SyncPhase) -> bool {
-        let mut guard = self.coordinator.lock().expect("coordinator lock");
-        let Some(coordinator) = guard.as_mut() else {
-            return false;
-        };
-        coordinator.handle_fact(acquisition::AcquisitionEvent::StartupMode { phase });
-        true
+        self.submit_coordinator_fact(acquisition::AcquisitionEvent::StartupMode { phase })
     }
 
     /// Feed a coordinator heartbeat so the phase port re-applies
     /// validated-ledger-age normalization on `Connected`/`Syncing` (rippled
     /// `processHeartbeatTimer` parity). Returns false unless installed.
     pub fn coordinator_heartbeat(&self) -> bool {
-        let mut guard = self.coordinator.lock().expect("coordinator lock");
-        let Some(coordinator) = guard.as_mut() else {
-            return false;
-        };
-        coordinator.handle_fact(acquisition::AcquisitionEvent::Heartbeat);
-        true
+        self.submit_coordinator_fact(acquisition::AcquisitionEvent::Heartbeat)
     }
 
     /// Feed an LCL-install fact so the coordinator can transition
     /// `Syncing -> Tracking` when the acquired target is installed as the last
     /// closed ledger. Returns false unless installed.
     pub fn coordinator_lcl_installed(&self, identity: acquisition::LedgerIdentity) -> bool {
-        let mut guard = self.coordinator.lock().expect("coordinator lock");
-        let Some(coordinator) = guard.as_mut() else {
-            return false;
-        };
-        coordinator.handle_fact(acquisition::AcquisitionEvent::LclInstalled(identity));
-        true
+        self.submit_coordinator_fact(acquisition::AcquisitionEvent::LclInstalled(identity))
+    }
+
+    /// Submit a lifecycle control fact to the coordinator.
+    ///
+    /// Fast path: `try_lock` the mutable coordinator and apply the fact
+    /// synchronously when the owner is not mid-drain. This preserves the
+    /// previous synchronous semantics in the common/uncontended case (and for
+    /// the single-threaded test registry, which has no owner thread).
+    ///
+    /// Slow path: when the owner thread is holding the coordinator lock to
+    /// drain heavy per-ledger work, DO NOT block. Submit the fact onto the
+    /// non-blocking control lane (channel + owner wake) so the consensus/timer
+    /// producer thread never stalls behind the drain. This is the fix for the
+    /// observed validated-ledger stalls, and matches rippled, where mode and
+    /// propose facts are delivered independently of in-flight `JtLedgerData`
+    /// jobs. The owner applies the queued fact through the same `handle_fact`
+    /// on its next turn, so processing is identical either way.
+    fn submit_coordinator_fact(&self, event: acquisition::AcquisitionEvent) -> bool {
+        match self.coordinator.try_lock() {
+            Ok(mut guard) => {
+                let Some(coordinator) = guard.as_mut() else {
+                    return false;
+                };
+                coordinator.handle_fact(event);
+                coordinator.owner_wake().notify();
+                let failures = coordinator.take_terminal_failures();
+                drop(guard);
+                self.record_coordinator_failures(failures);
+                true
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Owner is draining: route to the non-blocking control lane.
+                // Terminal failures from this fact are collected by the owner
+                // on its next drain turn.
+                let ingress = self
+                    .coordinator_ingress
+                    .read()
+                    .expect("coordinator ingress read")
+                    .clone();
+                let Some(ingress) = ingress else {
+                    return false;
+                };
+                ingress.submit_control_fact(event)
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("coordinator lock poisoned")
+            }
+        }
     }
 
     /// Feed NetworkOps' authoritative preferred-LCL selection. Register the
@@ -1413,17 +1446,7 @@ impl InboundLedgers {
     /// `Tracking/Full -> Connected` without selecting or pinning an acquisition
     /// target. Returns false unless the coordinator is installed.
     pub fn coordinator_consensus_view_change(&self) -> bool {
-        let failures = {
-            let mut guard = self.coordinator.lock().expect("coordinator lock");
-            let Some(coordinator) = guard.as_mut() else {
-                return false;
-            };
-            coordinator.consensus_view_change();
-            coordinator.owner_wake().notify();
-            coordinator.take_terminal_failures()
-        };
-        self.record_coordinator_failures(failures);
-        true
+        self.submit_coordinator_fact(acquisition::AcquisitionEvent::ConsensusViewChange)
     }
 
     /// Feed a target-bearing preferred-LCL divergence fact from the serialized
@@ -1431,46 +1454,21 @@ impl InboundLedgers {
     /// minting a session. Returns false unless installed, so the legacy strand
     /// writer remains authoritative when the coordinator is absent.
     pub fn coordinator_preferred_lcl_divergence(&self, target: acquisition::LedgerTarget) -> bool {
-        let failures = {
-            let mut guard = self.coordinator.lock().expect("coordinator lock");
-            let Some(coordinator) = guard.as_mut() else {
-                return false;
-            };
-            coordinator.preferred_lcl_divergence(target);
-            coordinator.owner_wake().notify();
-            coordinator.take_terminal_failures()
-        };
-        self.record_coordinator_failures(failures);
-        true
+        self.submit_coordinator_fact(acquisition::AcquisitionEvent::PreferredLclDivergence { target })
     }
 
     /// Report that an accepted-boundary preferred-LCL check selected the
     /// current local LCL. This retires obsolete Syncing policy without
     /// loosening the exact target-install gate.
     pub fn coordinator_preferred_lcl_reconciled(&self, lcl: acquisition::LedgerIdentity) -> bool {
-        let mut guard = self.coordinator.lock().expect("coordinator lock");
-        let Some(coordinator) = guard.as_mut() else {
-            return false;
-        };
-        coordinator.handle_fact(acquisition::AcquisitionEvent::PreferredLclReconciled { lcl });
-        true
+        self.submit_coordinator_fact(acquisition::AcquisitionEvent::PreferredLclReconciled { lcl })
     }
 
     /// Feed a no-consensus-positions fact (Quaxar-specific). Demotes
     /// `Full -> Connected` when consensus accepted a round with no usable peer
     /// positions. Returns false unless installed.
     pub fn coordinator_blocked_with_no_target(&self) -> bool {
-        let failures = {
-            let mut guard = self.coordinator.lock().expect("coordinator lock");
-            let Some(coordinator) = guard.as_mut() else {
-                return false;
-            };
-            coordinator.blocked_with_no_target();
-            coordinator.owner_wake().notify();
-            coordinator.take_terminal_failures()
-        };
-        self.record_coordinator_failures(failures);
-        true
+        self.submit_coordinator_fact(acquisition::AcquisitionEvent::BlockedWithNoTarget)
     }
 
     /// Feed a publication-committed fact. `fresh` is the adapter's
@@ -1482,13 +1480,10 @@ impl InboundLedgers {
         identity: acquisition::LedgerIdentity,
         fresh: bool,
     ) -> bool {
-        let mut guard = self.coordinator.lock().expect("coordinator lock");
-        let Some(coordinator) = guard.as_mut() else {
-            return false;
-        };
-        coordinator
-            .handle_fact(acquisition::AcquisitionEvent::PublicationCommitted { identity, fresh });
-        true
+        self.submit_coordinator_fact(acquisition::AcquisitionEvent::PublicationCommitted {
+            identity,
+            fresh,
+        })
     }
 
     /// Submit a durable-handoff acknowledgement after the NetworkOps recipient
