@@ -42,3 +42,39 @@ NA-noncore (RPC/peer-metric/C++-isms with no consensus effect; noted).
 - c8e767 PaymentBurn cross-zero reject (fixCleanup3_4_0): DONE. Granular
   PaymentBurn now requires dstAmount <= held (or mayIssue) so redeeming cannot
   cross zero into minting. payment.rs facts + invoke_preclaim builder.
+
+## FINAL STATUS (all 90 audited)
+
+### Implemented on branch sync/rippled-aug-sept-2026 (9 legit missing ports)
+1. #8254  0219c01b SponsorshipTransfer zero sfObjectID -> TEM_MALFORMED (fixCleanup3_5_0)
+2.        00eeb0a0 decode_vl_length_1 reject first byte > 192 (vl-prefix encoder/decoder parity)
+3. #8111  f8fba079 VaultClawback pseudo-holder -> TEC_PSEUDO_ACCOUNT (fixCleanup3_4_0)
+4.        c8e767af PaymentBurn cross-zero reject (fixCleanup3_4_0)
+5.        796f2f8f Loan invariant: allow non-final zero-principal LoanPay
+6.        a18839d9 MPT authorize-cap exception for LoanSet + VaultWithdraw (+test)
+7. #8141  b3b38e44 ValidVault fee-payer XRP delta for sponsored VaultWithdraw (+test)
+8.        53628b70/eae0a354 STPathElement seeded hardened dedup hash (non-consensus)
+9. overlay: 6099940c TMGetLedger bound; 9aebb5eb TMTransactions cap; e302e4ee #8220 peer
+   limit total; 7e82b066 #8309 queue tx to requesting peers; 54cfdda0 never truncate
+   trusted manifests for relay. (each +regression test)
+
+### SKIPPED per user steering (not legit Rust ports / keep 1:1 only where meaningful)
+- NA-CPPISM: b8451ff JSON iterator value_type; c5dc408 remove `explicit`; 4f88195 assorted
+  cleanup; ddbc5f1a IntrusivePointer leak; 0db7b766 protobuf DiscardUnknownFields (prost
+  discards unknown fields automatically); abf5511 message wording.
+- NA-RPC (non-consensus, RPC-handler-only robustness, already Option/Result-safe in Rust):
+  97f35add account-object null; 798e889e oracle dedup; 4173f7e4 account_lines peer type;
+  639943 nft buy/sell flag; d43e5ac gateway_balances type; 1a4a40eb noripple_check;
+  8f4e9c25 CTID in ledger expanded txns; 04eca6d6 book_offers running-balance rounding.
+- NA-NONCORE (telemetry): 768aef30 + 53246e5b cluster-traffic counting.
+- NA-FEATURE (amendment/tx-type not implemented in quaxar): d5bfe94f/7f55dd39/8b1a2282
+  ConfidentialMPT key rotation + MirrorUpdate; 028783 SmartEscrow .macro; 646d2ce6 Cosign v1
+  TransactionProposalCreate. (feature.rs registers these as unsupported, matching intent.)
+
+### Confirmed ALREADY-PRESENT (not reclassified above) : all remaining ~60 commits
+Verified present with file:line evidence in the batch-A/B/C audit (SHAMap #7940/#7941/#7942,
+MPT STIssue #7429, AMM #7430/#7704/#7373, all Vault/Lending consensus fixes #7863/#8004/#8013/
+#8014/#8055/#8057/#8075/#8119/#8140/#8143/#8144/#8151/#8153/#8154, credential #7971/#6827,
+escrow #8142, sig-prefixes #8162, calculateBaseFee #3e4e56, simulate dry-run #ea6226,
+amendment registrations #8125/#8174/#8185, manifest caps #8461ded, etc.), plus #7977 vault
+withdrawal destination checks and #7796 AMMClawback IgnoreReserve (reclassified PRESENT).
