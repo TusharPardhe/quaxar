@@ -342,8 +342,11 @@ impl Serializer {
         if b1 < 0 {
             panic!("b1<0");
         }
-        if b1 > 254 {
-            panic!("b1>254");
+        // rippled #00eeb0: a first byte above the 1-byte header maximum (192)
+        // is not a self-contained length; it signals a wider header and must
+        // be rejected here rather than silently accepted up to 254.
+        if b1 > 192 {
+            panic!("decodeVLLength 1 byte: first byte is not a length");
         }
         b1
     }
