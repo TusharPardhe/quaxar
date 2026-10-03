@@ -222,3 +222,30 @@ whether a sweep (or another periodic op) transiently starves the proposal+
 validation ingestion so a round sees zero peers. If so, that IS a quaxar defect
 to fix (decouple/lighten the sweep or ingestion). If proposals simply did not
 arrive from the network that round, it is not a quaxar bug.
+
+## FINAL (iteration 1 complete) - exhaustive rippled parity verification
+Ruled out as causes (hard evidence):
+- Peer churn: NO. overlay active_peers stable at 21 (3 consecutive samples);
+  the "peer_count=5" was initial_peer_count=5 = acquisition fanout, not peers.
+- Close-time drift / rounding bug: NO. round_close_time + effective_close_time
+  are BYTE-EXACT to rippled LedgerTiming.h roundCloseTime/effCloseTime
+  (closeTime += res/2; - (epoch % res); then max(rounded, prior+1)).
+- Validation ingestion lag: FIXED earlier (synchronous now).
+- consensus engine divergence: NONE found across check_consensus_reached,
+  shouldCloseLedger, updateOurPositions close-time vote loop, avalanche params.
+
+Established mechanism of residual 0.12% demotions:
+A rare ~4s stall on the consensus thread (observed gap 20:09:39->20:09:43)
+causes 1-2 rounds to see ZERO proposers/validations. check_consensus_reached
+then hits the total==0 -> reached_max path (BYTE-IDENTICAL to rippled, whose
+own comment says this "will likely desync"), closes solo on the local tx-set,
+diverges from the network, re-acquires, and briefly demotes.
+
+Honest completion status: the consensus/close/validation code is verified
+faithful to rippled; the residual behavior is rippled-identical under the same
+zero-proposer input. The ROOT of the zero-proposer round is a transient ~4s
+consensus-thread stall (not peers, not close-time, not validation ingestion).
+Pinpointing WHAT blocks the consensus thread for ~4s (candidate: a periodic
+heavy op - tree-node-cache sweep up to 1.6M entries, or a lock) is the next
+concrete sub-task. Proving it against a stock rippled node on the same testnet
+requires a reference node (unavailable in this environment).
