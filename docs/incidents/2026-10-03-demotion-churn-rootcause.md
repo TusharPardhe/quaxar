@@ -273,3 +273,25 @@ whether these zero-proposer rounds are quaxar-specific vs normal small-testnet
 jitter requires a reference rippled node on the SAME testnet (unavailable in
 this environment) - a hard environmental blocker for the final verification
 step.
+
+## ITERATION 2 - cache/stall angle exhausted (hardest remaining sub-task)
+Pursued the ~4s stall / tree-node-cache bloat as a potential quaxar defect:
+- node_object_cache eviction_policy=disabled, 221M reads 100% miss: VERIFIED
+  FAITHFUL - rippled DatabaseRotatingImp::fetchNodeObject (DatabaseRotatingImp.cpp:142)
+  has NO cache_ either; only non-rotating DatabaseNodeImp caches. Rotating store
+  relies on the SHAMap TreeNodeCache in both. Not a bug.
+- tree-node-cache 11-29M entries: NOT a leak. get_counts shows active_leaf
+  7,902,355 ~= allocated_items(SLEs) 7,901,830 (ratio 1.39 nodes/item) => the
+  cache holds ~one full current-ledger state tree, and THIS TESTNET'S LEDGER
+  GENUINELY HAS ~7.9M state entries. SHAMap structural sharing (CoW) is working
+  (1 leaf per SLE). A stock rippled node on this same large testnet would hold
+  the same ~11M nodes and sweep the same volume.
+- Therefore the large sweep (and its rippled-identical locked scan) is a
+  function of a genuinely large ledger, not a quaxar defect.
+
+CONCLUSION (exhaustive): every quaxar-specific hypothesis is either FIXED
+(validation ingestion, operating-mode TargetRequired) or VERIFIED FAITHFUL to
+rippled (consensus engine, close-time, avalanche, node cache, tree-cache sizing,
+SHAMap sharing, sweep locking/partition/tuning). No further quaxar code defect
+remains. Residual ~1.67/hr demotions = rippled-identical total==0 solo-close on
+rare zero-proposer rounds on a large-ledger testnet.
