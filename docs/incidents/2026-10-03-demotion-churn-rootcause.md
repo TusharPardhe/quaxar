@@ -117,3 +117,37 @@ effectively eliminated; node closes with network regardless of node type.
 Commits on branch sync/rippled-aug-sept-2026:
 - fde21eca: phase.rs TargetRequired phase-neutral for Full/Tracking (partial).
 - 3979ff71: synchronous validation ingress (ROOT CAUSE fix) + dead event-loop removal.
+
+## REMAINING ISSUE (what the residual ~5 demotions are) - 2026-10-03 22:xx
+After the valsync fix, the few remaining full->syncing demotions (5 in 3h,
+0 in the last 2h) are a DIFFERENT, deeper cause than validation ingestion:
+
+Mechanism (traced at 19:48:38-19:49:12):
+- Node closes ledger N locally in consensus_mode=Observing on its own tx-set
+  (e.g. 21254622, tx_set_id=B35D6F17, open_tx_count=6).
+- Peers do NOT agree: selected_peer_lcl_support collapses 16 -> 3 -> 1 for the
+  node's local LCL within the same second (184 preferred_lcl_selected evals in
+  19:48:41 alone).
+- Node launches acquisition for the network's actual ledger/tx-set (F5B58FC4),
+  stalls ~33s at 21254621 while peers advance to ~21254627, then catches up a
+  BURST out of order (inbound_completion_persisted seq 22,24,25,27 then 23;
+  10 out-of-order completions in 3h).
+- During the stall the preferred LCL legitimately diverges -> rippled-faithful
+  consensusViewChange / PreferredLclDivergence demotion.
+
+Root cause class: the node (non-proposing, Observing) intermittently builds a
+ledger on a local tx-set that diverges from the network consensus tx-set, then
+must discard+reacquire. This is the "is our transaction hash right" angle:
+tx-set selection for an Observing node sometimes != network's agreed set.
+validation ingestion is NOT the cause here (selected_trusted_validation_count=6
+throughout).
+
+Impact now: rare and self-correcting (0 in last 2h, node stays 96.9% full,
+closes with network in lockstep seq+1/3s). Lower severity than the fixed bug.
+
+NEXT (future iteration): investigate why an Observing round closes on a local
+tx-set diverging from the network. Candidates: (a) we start on_close/on_accept
+before peer proposals/tx-set are incorporated (timing), (b) tx-set acquisition
+(acquire_tx_set) returning our open set instead of the agreed one, (c)
+close-time / establish-phase threshold causing premature local close. Compare
+RCLConsensus onClose/onAccept + Consensus::closeLedger establish timing.
