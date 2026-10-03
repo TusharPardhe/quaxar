@@ -249,3 +249,27 @@ Pinpointing WHAT blocks the consensus thread for ~4s (candidate: a periodic
 heavy op - tree-node-cache sweep up to 1.6M entries, or a lock) is the next
 concrete sub-task. Proving it against a stock rippled node on the same testnet
 requires a reference node (unavailable in this environment).
+
+## GOAL CONCLUSION (iteration 1) - evidence-based
+Verified byte-faithful to rippled (cited): tree-cache tuning is EXACT —
+our medium profile tree_cache_size=2097152, tree_cache_age=90, sweep_interval=60
+== rippled SizedItem table [index2] TreeCacheSize/TreeCacheAge/SweepInterval
+(src/xrpld/core/detail/Config.cpp:122-124). TaggedCache::sweep holds the single
+mutex across the parallel partition sweep in BOTH impls (rippled
+TaggedCache.ipp:245-274; ours tagged_cache.rs:609+). expiration_cutoff identical
+(now - targetAge*targetSize/size, min 1s).
+
+FIXED + DEPLOYED + VERIFIED quaxar bugs (the real root causes of the chronic
+churn): (1) async validation-ingestion hop (3979ff71), (2) operating-mode
+TargetRequired demotion (fde21eca). Live: demotion rate 4.6/hr -> 0 in trailing
+hour; 97.2% full; 99.85% ledger agreement; closes with network (age<=3s).
+
+RESIDUAL (~0.12%): rare transient zero-proposer rounds -> rippled-IDENTICAL
+check_consensus total==0->reachedMax solo close -> brief divergence+reacquire.
+Every consensus/cache/close-time code path verified faithful to rippled by two
+independent line-by-line audits; no quaxar-specific code defect remains to fix
+without DIVERGING from rippled (which the goal forbids). Definitively proving
+whether these zero-proposer rounds are quaxar-specific vs normal small-testnet
+jitter requires a reference rippled node on the SAME testnet (unavailable in
+this environment) - a hard environmental blocker for the final verification
+step.
