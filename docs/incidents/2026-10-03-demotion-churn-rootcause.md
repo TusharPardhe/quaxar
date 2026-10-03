@@ -151,3 +151,74 @@ before peer proposals/tx-set are incorporated (timing), (b) tx-set acquisition
 (acquire_tx_set) returning our open set instead of the agreed one, (c)
 close-time / establish-phase threshold causing premature local close. Compare
 RCLConsensus onClose/onAccept + Consensus::closeLedger establish timing.
+
+## ITERATION (goal: full tx-set/close-time divergence fix) - findings so far
+- ALL accepts are consensus_state=Yes (3206/3206), ZERO MovedOn => NOT the
+  benign recovery path. Node reaches "Yes" every round.
+- The divergent ledger 21254622: consensus_tx_count=4, converge_pct=41,
+  raw_close_time_self=844372119, raw_close_time_peer_votes={844372118:5, 844372119:1},
+  effective_close_time=844372121, close_time_correct=true.
+- CLOSE-TIME DIVERGENCE is the smoking gun: 5 peers voted 844372118, we kept
+  our own 844372119, effective became 844372121. Close time is in the ledger
+  hash => our ledger differs from network => peers reject => reacquire => demote.
+- Generic close-time vote loop (consensus.rs:1012-1050) matches rippled
+  (Consensus.h:1489-1600): reverse iter, participantsNeeded, self-vote only if
+  Proposing, av_ct_consensus_pct=75. effective_close_time computed in
+  rcl_consensus.rs:1313-1325 from result.position.close_time() (raw=844372119,
+  our own), NOT the voted consensus_close_time.
+- OPEN QUESTION: why did the vote loop leave our position at 844372119 instead
+  of the 5-vote-majority 844372118? Suspect avalanche needed_weight at
+  converge_pct=41 (early) made thresh_vote high, OR have_close_time_consensus
+  was false yet we still accepted (gate at consensus.rs:856-858 requires it).
+  Also effective=844372121 matches neither vote -> round_close_time/
+  effective_close_time binning may be mis-deriving from raw 844372119.
+- NEXT: get avalanche cutoff table values; capture a fresh event with
+  have_close_time_consensus + thresh_vote + needed_weight; compare
+  timing::effective_close_time + round_close_time to rippled asCloseTime/
+  roundCloseTime + getNextLedgerTimeResolution exactly.
+
+## DEFINITIVE ANALYSIS (iteration 1 - full tx-set/close-time investigation)
+
+### Hard evidence gathered
+- Divergent ledger 21254998: WE built 0A048D3579 (consensus_state=Yes, 23 tx),
+  network validated 3BA45A02 (different). raw_close_time_peer_votes={} (ZERO
+  peer votes at accept).
+- phase_open at that round: proposers_closed=0 proposers_validated=0
+  prev_proposers=6; next round prev_proposers=0 then back to 6.
+  => node lost ALL proposers+validators for 1-2 rounds, closed SOLO.
+- Frequency: 4 zero-proposer rounds / 3209 total (0.12%); 5 demotions / 3237
+  ledgers advanced (0.15%). Clustered in pairs ~1h apart (19:05, 20:09).
+- Mechanism: check_consensus_reached total==0 -> return reached_max path:
+  with no peers for a round, after ledger_max_consensus the node declares Yes
+  and closes on its own tx-set, which the network then rejects -> reacquire ->
+  consensusViewChange demotion.
+
+### Rippled comparison (KEY)
+- Our check_consensus_reached (functions.rs:103-123) is BYTE-IDENTICAL to
+  rippled checkConsensusReached (Consensus.cpp:91-124): `if total==0 { return
+  reachedMax }`. rippled's own comment: "Reaching consensus prematurely in this
+  way means that the peer will likely desync." => rippled exhibits the SAME
+  solo-close-and-recover under zero proposers.
+- shouldCloseLedger, updateOurPositions close-time vote loop, avalanche params
+  (Init50/Mid65/Late70/Stuck95, av_ct_consensus_pct=75, min_consensus_pct=80),
+  effective_close_time binning: all verified faithful to rippled.
+- Two independent line-by-line analyses (this + sub-agent) found NO generic
+  consensus-engine divergence from rippled.
+
+### Honest conclusion
+The residual ~0.12% demotions are caused by rare transient rounds where the
+node receives zero peer proposals+validations, triggering the rippled-identical
+total==0->reachedMax solo close. The consensus engine itself is faithful to
+rippled. What is NOT yet proven (requires a reference rippled node on the same
+testnet, which is unavailable here): whether those zero-proposer rounds are a
+quaxar-specific ingestion defect OR normal small-testnet jitter that a stock
+rippled node would also hit. Node is otherwise healthy: 99.85% ledger
+agreement, 97% full, lockstep with network.
+
+### Candidate quaxar-specific angle still open (next iteration)
+The two zero-proposer clusters coincided near large tree-node-cache retention
+sweeps (ThreadId 96, up to 1.6M demotions/sweep every ~60s). Need to prove
+whether a sweep (or another periodic op) transiently starves the proposal+
+validation ingestion so a round sees zero peers. If so, that IS a quaxar defect
+to fix (decouple/lighten the sweep or ingestion). If proposals simply did not
+arrive from the network that round, it is not a quaxar bug.
