@@ -114,8 +114,9 @@ impl Setup {
         if let (Some(inbound_max), Some(outbound_max)) = (self.peer_limit_in, self.peer_limit_out) {
             let inbound_max = if self.want_incoming { inbound_max } else { 0 };
             return PeerLimits {
-                // rippled Config.cpp:112: config.maxPeers = 0 when explicit limits set
-                max_peers: 0,
+                // rippled e302e4eeed: maxPeers is the total of the configured
+                // directional budgets, after disabling inbound capacity.
+                max_peers: inbound_max + outbound_max,
                 inbound_max,
                 outbound_max,
             };

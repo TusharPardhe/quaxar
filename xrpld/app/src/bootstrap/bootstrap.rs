@@ -3197,7 +3197,9 @@ fn trusted_first_manifest_payloads(
             untrusted.push(serialized);
         }
     }
-    trusted.truncate(manifest_limits.max_trusted_count);
+    // rippled 54cfdda00b: trusted manifests are never dropped. max_trusted_count
+    // only sizes the largest accepted message; it must not cap relay contents,
+    // since dropping a trusted manifest would delay a validator key rotation.
     trusted.extend(
         untrusted
             .into_iter()

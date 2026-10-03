@@ -6895,7 +6895,8 @@ impl ApplicationRoot {
                     untrusted.push(serialized);
                 }
             }
-            trusted.truncate(manifest_limits.max_trusted_count);
+            // rippled 54cfdda00b: trusted manifests are never dropped;
+            // max_trusted_count only sizes the largest accepted message.
             trusted.extend(
                 untrusted
                     .into_iter()

@@ -309,9 +309,9 @@ fn activation_enforces_peer_limit_but_allows_reserved_or_cluster_bypass() {
 
     assert!(overlay.activate(Arc::clone(&reserved)));
     assert!(overlay.activate(Arc::clone(&clustered)));
-    // Rippled Config.cpp:112 sets maxPeers = 0 when explicit inbound/outbound
-    // limits are configured; enforcement runs on the directional budgets.
-    assert_eq!(overlay.peer_limits().max_peers, 0);
+    // rippled e302e4eeed: the reported total is the sum of the explicit
+    // directional budgets, while enforcement still runs on those budgets.
+    assert_eq!(overlay.peer_limits().max_peers, 1);
     assert_eq!(overlay.peer_limits().inbound_max, 0);
     assert_eq!(overlay.peer_limits().outbound_max, 1);
     assert_eq!(overlay.size(), 3);

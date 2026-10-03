@@ -43,7 +43,7 @@ use crate::peer::{Peer, ProtocolFeature};
 use crate::peer_imp::{PeerImp, Tracking};
 use crate::router::MessageRouter;
 use crate::session::PeerSessionStarter;
-use crate::slot::{Clock, ManualClock, SlotState};
+use crate::slot::{Clock, MAX_TX_QUEUE_SIZE, ManualClock, SlotState};
 use crate::traffic_count::TrafficCategory;
 use crate::{Cluster, ConnectAttemptError, ConnectAttemptResult};
 
@@ -461,6 +461,25 @@ fn local_validation_suppression_deduplicates_echo_without_marking_relayed() {
 }
 
 #[test]
+fn rippled_hardening_queue_only_relay_targets_negotiated_peers() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let disabled = peer(1, 21);
+    let enabled = peer(2, 22);
+    disabled.set_tx_reduce_relay_enabled(false);
+    enabled.set_tx_reduce_relay_enabled(true);
+    overlay.activate(Arc::clone(&disabled));
+    overlay.activate(Arc::clone(&enabled));
+
+    // rippled 7e82b0660f: a queue-only relay emits TMHaveTransactions later,
+    // so only a peer that negotiated tx-reduce-relay may receive the hash.
+    overlay.relay_transaction(Uint256::from_u64(89), None, &BTreeSet::new());
+    overlay.send_tx_queue();
+
+    assert!(disabled.queued_messages().is_empty());
+    assert_eq!(enabled.queued_messages().len(), 1);
+}
+
+#[test]
 fn tx_reduce_relay_selects_enabled_peers_and_queues_the_rest() {
     let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
 
@@ -790,6 +809,69 @@ fn connect_as_peer_token_matches_rippled_comma_list_semantics() {
 
     assert!(super::request_connects_as_peer(&peer));
     assert!(!super::request_connects_as_peer(&non_peer));
+}
+
+#[test]
+fn rippled_hardening_rejects_oversized_get_ledger_node_list_before_routing() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let peer = peer(99, 99);
+    let mut router = OverlayInboundRouter {
+        overlay: &overlay,
+        peer: &peer,
+        ledger_data_deferred: false,
+    };
+    let message = TmGetLedger {
+        itype: 1,
+        ltype: Some(2),
+        node_i_ds: vec![Vec::new(); crate::HARD_MAX_REPLY_NODES + 1],
+        ..Default::default()
+    };
+
+    // rippled 6099940c2c: the count gate precedes node-ID parsing and the
+    // NodeStore-serving inbound route, even if entries themselves are invalid.
+    let _ = router.on_get_ledger(&message);
+
+    assert!(overlay.queued_inbound_snapshot().get_ledgers.is_empty());
+    let charges = peer.charges();
+    assert_eq!(charges.len(), 1);
+    assert_eq!(charges[0].0, *resource::FEE_INVALID_DATA);
+    assert_eq!(charges[0].1, "get_ledger too many node ids");
+}
+
+#[test]
+fn rippled_hardening_rejects_oversized_transactions_and_charges_invalid_entries() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let peer = peer(100, 100);
+    peer.set_tx_reduce_relay_enabled(true);
+    let mut router = OverlayInboundRouter {
+        overlay: &overlay,
+        peer: &peer,
+        ledger_data_deferred: false,
+    };
+
+    // rippled 9aebb5ebea: reject the whole oversized list before expanding it.
+    let oversized = TmTransactions {
+        transactions: vec![TmTransaction::default(); MAX_TX_QUEUE_SIZE + 1],
+    };
+    let _ = router.on_transactions(&oversized);
+    assert!(overlay.queued_inbound_snapshot().transactions.is_empty());
+    let charges = peer.charges();
+    assert_eq!(charges.len(), 1);
+    assert_eq!(charges[0].0, *resource::FEE_MALFORMED_REQUEST);
+    assert_eq!(charges[0].1, "Transaction list too large");
+
+    // An in-limit member that cannot deserialize still costs invalid-data fee.
+    let _ = router.on_transactions(&TmTransactions {
+        transactions: vec![TmTransaction {
+            raw_transaction: vec![0xFF],
+            ..Default::default()
+        }],
+    });
+    assert!(overlay.queued_inbound_snapshot().transactions.is_empty());
+    let charges = peer.charges();
+    assert_eq!(charges.len(), 2);
+    assert_eq!(charges[1].0, *resource::FEE_INVALID_DATA);
+    assert_eq!(charges[1].1, "tx invalid");
 }
 
 #[test]
