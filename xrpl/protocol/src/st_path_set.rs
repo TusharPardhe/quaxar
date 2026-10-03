@@ -1,12 +1,18 @@
 //! `STPathSet` port from `xrpl/protocol/STPathSet.*`.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::OnceLock};
+
+use basics::hardened_hash::HardenedHashBuilder;
 
 use crate::{
     AccountID, JsonOptions, JsonValue, MPTID, PathAsset, SField, SerialIter, SerializedTypeId,
     Serializer, StBase, StBaseCore, currency_to_string, parse_base58_account_id, to_base58,
     to_currency,
 };
+
+/// Process-wide seed for the in-memory `STPathElement` equality prefilter.
+/// This hash is deliberately not used by wire serialization or consensus hashing.
+static PATH_ELEMENT_HASHER: OnceLock<HardenedHashBuilder> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct STPathElement {
@@ -213,35 +219,15 @@ impl STPathElement {
     }
 
     fn get_hash(element: &Self) -> usize {
-        let mut hash_account = 2_654_435_761usize;
-        let mut hash_asset = 2_654_435_761usize;
-        let mut hash_issuer = 2_654_435_761usize;
-
-        for byte in element.account_id.data() {
-            hash_account =
-                hash_account.wrapping_add(hash_account.wrapping_mul(257) ^ usize::from(*byte));
-        }
-
-        match element.asset_id {
-            PathAsset::Currency(currency) => {
-                for byte in currency.data() {
-                    hash_asset =
-                        hash_asset.wrapping_add(hash_asset.wrapping_mul(509) ^ usize::from(*byte));
-                }
-            }
-            PathAsset::MPTID(mpt_id) => {
-                for byte in mpt_id.data() {
-                    hash_asset = hash_asset.wrapping_add(usize::from(*byte));
-                }
-            }
-        }
-
-        for byte in element.issuer_id.data() {
-            hash_issuer =
-                hash_issuer.wrapping_add(hash_issuer.wrapping_mul(911) ^ usize::from(*byte));
-        }
-
-        hash_account ^ hash_asset ^ hash_issuer
+        let has_account = (element.node_type & Self::TYPE_ACCOUNT) != 0;
+        PATH_ELEMENT_HASHER
+            .get_or_init(HardenedHashBuilder::new)
+            .hash_one((
+                has_account,
+                element.account_id,
+                element.asset_id,
+                element.issuer_id,
+            )) as usize
     }
 }
 

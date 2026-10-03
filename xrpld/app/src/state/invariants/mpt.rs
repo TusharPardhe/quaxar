@@ -606,6 +606,7 @@ pub(super) fn validates_mpt_lifecycle_counts(
     single_asset_vault_enabled: bool,
     lending_protocol_enabled: bool,
     mptokens_v2_enabled: bool,
+    fix_cleanup_3_4_0: bool,
     lifecycle: &MptIssuanceLifecycle,
 ) -> bool {
     let applies =
@@ -661,7 +662,26 @@ pub(super) fn validates_mpt_lifecycle_counts(
             return lifecycle.tokens_created <= 2 && lifecycle.tokens_deleted <= 2;
         }
 
-        if lending_protocol_enabled && lifecycle.tokens_created + lifecycle.tokens_deleted > 1 {
+        // rippled a18839d92d: fixCleanup3_4_0 relaxes the LendingProtocol
+        // MayAuthorizeMpt cap only for these two transaction shapes. LoanSet
+        // may create its borrower and origination-fee holdings; VaultWithdraw
+        // may create a destination asset holding while deleting emptied shares.
+        let mptokens_exceed_authorize_cap = if !lending_protocol_enabled {
+            false
+        } else if fix_cleanup_3_4_0 {
+            match txn_type {
+                protocol::TxType::LOAN_SET => {
+                    lifecycle.tokens_deleted != 0 || lifecycle.tokens_created > 2
+                }
+                protocol::TxType::VAULT_WITHDRAW => {
+                    lifecycle.tokens_created > 1 || lifecycle.tokens_deleted > 1
+                }
+                _ => lifecycle.tokens_created + lifecycle.tokens_deleted > 1,
+            }
+        } else {
+            lifecycle.tokens_created + lifecycle.tokens_deleted > 1
+        };
+        if mptokens_exceed_authorize_cap {
             return false;
         }
 
@@ -717,4 +737,41 @@ pub(super) fn validates_mpt_lifecycle_counts(
         && lifecycle.issuances_deleted == 0
         && lifecycle.tokens_created == 0
         && lifecycle.tokens_deleted == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MptIssuanceLifecycle, validates_mpt_lifecycle_counts};
+    use protocol::{Ter, TxType};
+
+    fn lifecycle(tokens_created: u32, tokens_deleted: u32) -> MptIssuanceLifecycle {
+        MptIssuanceLifecycle {
+            tokens_created,
+            tokens_deleted,
+            ..MptIssuanceLifecycle::default()
+        }
+    }
+
+    #[test]
+    fn cleanup_3_4_0_relaxes_only_the_loan_set_and_vault_withdraw_mpt_caps() {
+        let validates = |txn_type, fix_cleanup_3_4_0, tokens_created, tokens_deleted| {
+            validates_mpt_lifecycle_counts(
+                txn_type,
+                Ter::TES_SUCCESS,
+                false,
+                true,
+                true,
+                true,
+                fix_cleanup_3_4_0,
+                &lifecycle(tokens_created, tokens_deleted),
+            )
+        };
+
+        assert!(!validates(TxType::LOAN_SET, false, 2, 0));
+        assert!(validates(TxType::LOAN_SET, true, 2, 0));
+        assert!(!validates(TxType::LOAN_SET, true, 0, 1));
+        assert!(validates(TxType::VAULT_WITHDRAW, true, 1, 1));
+        assert!(!validates(TxType::VAULT_WITHDRAW, true, 2, 0));
+        assert!(!validates(TxType::VAULT_WITHDRAW, true, 0, 2));
+    }
 }

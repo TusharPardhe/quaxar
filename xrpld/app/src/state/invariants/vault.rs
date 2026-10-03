@@ -523,13 +523,22 @@ pub(super) fn vault_transaction_account_asset_delta(
     state: &VaultState,
     account: AccountID,
     asset: Asset,
-    account_paid_fee: bool,
+    tx_account: Option<AccountID>,
+    fee_payer_account_root: Option<AccountID>,
     fee: protocol::XRPAmount,
+    fix_cleanup_3_4_0: bool,
 ) -> Option<VaultAssetDelta> {
     let mut delta = vault_asset_delta(state, account, asset)?;
-    // Pinned ValidVault::deltaAssetsTxAccount adds the fee back only when
-    // sfAccount is the effective fee payer. The invariant sees the complete
-    // outer XRP delta, while delegated/sponsored fees do not touch sfAccount.
+    // rippled b3b38e4416: post-fixCleanup3_4_0 ValidVault corrects the XRP
+    // delta for whichever AccountRoot actually paid the fee. That can be a
+    // distinct delegate or co-signed sponsor named as sfDestination; a
+    // prefunded sponsorship has no AccountRoot fee payer and must not be
+    // corrected. Legacy ledgers retain the original sender-only behavior.
+    let account_paid_fee = if fix_cleanup_3_4_0 {
+        fee_payer_account_root == Some(account)
+    } else {
+        tx_account == Some(account) && fee_payer_account_root == Some(account)
+    };
     if asset.native() && account_paid_fee {
         delta.delta += RuntimeNumber::from_i64(fee.drops());
         if delta.delta == RuntimeNumber::zero() {
@@ -558,7 +567,7 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
     tx_destination: Option<AccountID>,
     tx_holder: Option<AccountID>,
     tx_amount: Option<&STAmount>,
-    tx_account_paid_fee: bool,
+    fee_payer_account_root: Option<AccountID>,
     fee: protocol::XRPAmount,
     fix_cleanup_3_4_0: bool,
     result: Ter,
@@ -793,8 +802,10 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                         state,
                         account,
                         after_vault.asset,
-                        tx_account_paid_fee,
+                        tx_account,
+                        fee_payer_account_root,
                         fee,
+                        fix_cleanup_3_4_0,
                     )
                     .is_some_and(|delta| {
                         let local_scale = min_scale.max(delta.scale.unwrap_or(0));
@@ -862,33 +873,29 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                 // holdings must remain missing.  Either way no recipient
                 // asset delta may exist for a genuine zero payout.
                 let destination_delta = destination.and_then(|destination| {
-                    if Some(destination) == tx_account {
-                        vault_transaction_account_asset_delta(
-                            state,
-                            destination,
-                            after_vault.asset,
-                            tx_account_paid_fee,
-                            fee,
-                        )
-                    } else {
-                        vault_asset_delta(state, destination, after_vault.asset)
-                    }
+                    vault_transaction_account_asset_delta(
+                        state,
+                        destination,
+                        after_vault.asset,
+                        tx_account,
+                        fee_payer_account_root,
+                        fee,
+                        fix_cleanup_3_4_0,
+                    )
                 });
                 destination_delta.is_none()
             } else if issuer_withdrawal {
                 true
             } else if let Some(destination) = destination {
-                let destination_delta = if Some(destination) == tx_account {
-                    vault_transaction_account_asset_delta(
-                        state,
-                        destination,
-                        after_vault.asset,
-                        tx_account_paid_fee,
-                        fee,
-                    )
-                } else {
-                    vault_asset_delta(state, destination, after_vault.asset)
-                };
+                let destination_delta = vault_transaction_account_asset_delta(
+                    state,
+                    destination,
+                    after_vault.asset,
+                    tx_account,
+                    fee_payer_account_root,
+                    fee,
+                    fix_cleanup_3_4_0,
+                );
                 destination_delta.is_some_and(|delta| {
                     let destination_scale = delta.scale.unwrap_or(0);
                     let local_scale = min_scale.max(destination_scale);

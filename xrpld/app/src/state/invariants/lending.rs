@@ -94,10 +94,20 @@ pub(super) fn validate_loan_entry<V: ApplyView + ?Sized>(
         if protocol::is_tes_success(result)
             && txn_type == protocol::TxType::LOAN_PAY
             && payment_remaining != 0
-            && (!(principal < number_field_value(before, sf("sfPrincipalOutstanding")))
-                || payment_remaining >= before.get_field_u32(sf("sfPaymentRemaining")))
         {
-            return Ok(false);
+            let before_principal = number_field_value(before, sf("sfPrincipalOutstanding"));
+            let before_total_value = number_field_value(before, sf("sfTotalValueOutstanding"));
+            // rippled 796f2f8f1e: integer-scale amortization can leave
+            // PrincipalOutstanding unchanged while TotalValueOutstanding falls.
+            // A non-final payment must not increase either obligation, must
+            // reduce one of them, and must consume a scheduled payment.
+            if principal > before_principal
+                || total_value > before_total_value
+                || (principal == before_principal && total_value == before_total_value)
+                || payment_remaining >= before.get_field_u32(sf("sfPaymentRemaining"))
+            {
+                return Ok(false);
+            }
         }
         if protocol::is_tes_success(result)
             && txn_type == protocol::TxType::LOAN_PAY
