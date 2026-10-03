@@ -1574,8 +1574,6 @@ fn run_start_mode_consensus_loop(
         }
     };
 
-    // Consensus event channel for validations and ledger promotions
-    let (event_tx, event_rx) = crate::consensus::driver::consensus_event_channel();
     let (shared_completed_tx, shared_completed_rx) = std::sync::mpsc::sync_channel::<
         crate::ledger::inbound_ledgers::CompletedInboundLedger,
     >(1_024);
@@ -1712,30 +1710,14 @@ fn run_start_mode_consensus_loop(
         return;
     }
 
-    // Spawn consensus event loop (validation/ledger promotion)
-    let event_loop_app = runtime.root().clone();
-    let event_loop_stop = Arc::clone(&stop);
-    worker_handles.push(crate::consensus::driver::spawn_event_loop(
-        event_loop_app,
-        Arc::clone(&shared_inbound),
-        event_rx,
-        event_loop_stop,
-    ));
-
-    // Validation forwarding thread
+    // Validation processing. The overlay invokes the installed validation
+    // router synchronously on receipt (see QueuedInbound::on_validation,
+    // which early-returns once a router is set), so there is no separate
+    // forwarder thread or notify/queue fallback: the router runs the
+    // validation job directly, matching rippled's synchronous
+    // PeerImp::checkValidation -> NetworkOPsImp::recvValidation path.
     {
-        let (val_notify_tx, val_notify_rx) = std::sync::mpsc::sync_channel::<()>(1);
         if let Some(overlay_rt) = runtime.root().overlay_runtime() {
-            overlay_rt
-                .overlay()
-                .queued_inbound()
-                .set_validation_notify(val_notify_tx);
-        }
-        let fwd_stop = Arc::clone(&stop);
-        let fwd_runtime = Arc::clone(&runtime);
-        let fwd_event_tx = event_tx.clone();
-        if let Some(overlay_rt) = runtime.root().overlay_runtime() {
-            let direct_event_tx = event_tx.clone();
             let validation_root = runtime.root().clone();
             let validation_overlay = overlay_rt.overlay();
             overlay_rt
@@ -1799,61 +1781,34 @@ fn run_start_mode_consensus_loop(
                     } else {
                         crate::job::job_types::JobType::JtValidationUt
                     };
-                    let event_tx = direct_event_tx.clone();
+                    let job_app = validation_root.clone();
                     queued.validation = validation;
                     if !validation_root.job_queue().add_job(
                         job_type,
                         "checkValidation",
                         move || {
-                            // The event-loop parser performs the signature
-                            // check after scheduling, matching checkValidation.
-                            let _ = event_tx
-                                .send(crate::consensus::driver::ConsensusEvent::Validation(
-                                    Box::new(queued),
-                                ));
+                            // Match rippled PeerImp::checkValidation ->
+                            // NetworkOPsImp::recvValidation: process the
+                            // validation synchronously on the validation job
+                            // thread (signature check, ingress into
+                            // Validations::add/updateTrie, relay). Running it
+                            // here instead of forwarding a
+                            // ConsensusEvent::Validation removes an extra
+                            // shared-event-loop hop that could delay a trusted
+                            // validation past the next consensus
+                            // getPrevLedger read, which transiently skewed the
+                            // preferred ledger and demoted the node out of
+                            // full.
+                            crate::consensus::driver::process_validation_inline(
+                                &job_app,
+                                Box::new(queued),
+                            );
                         },
                     ) {
                         tracing::debug!(target: "consensus", "validation job rejected during shutdown");
                     }
                 }));
         }
-        worker_handles.push(
-            std::thread::Builder::new()
-                .name("validation-forwarder".into())
-                .spawn(move || {
-                    loop {
-                        match val_notify_rx.recv_timeout(Duration::from_millis(25)) {
-                            Ok(()) => {}
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                if fwd_stop.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                continue;
-                            }
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                        }
-                        if fwd_stop.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let root = fwd_runtime.root();
-                        let Some(overlay_rt) = root.overlay_runtime() else {
-                            continue;
-                        };
-                        let validations = overlay_rt.overlay().take_validations();
-                        for queued in validations {
-                            match fwd_event_tx.send(
-                                crate::consensus::driver::ConsensusEvent::Validation(Box::new(
-                                    queued,
-                                )),
-                            ) {
-                                Ok(()) => {}
-                                Err(_) => return,
-                            }
-                        }
-                    }
-                })
-                .expect("spawn validation-forwarder thread"),
-        );
     }
 
     // Transaction relay router. PeerImp schedules `RcvCheckTx` on the JobQueue;
