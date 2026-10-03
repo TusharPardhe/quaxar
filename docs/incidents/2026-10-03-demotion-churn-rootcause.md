@@ -326,3 +326,30 @@ lock-acquire timing instrumentation to the candidate mutexes (NuDb runtime /
 acquisition state) to name the contended lock, then fix (e.g. shard the lock or
 add a bounded read cache to cut burst volume) - rippled-safe since it does not
 change consensus behavior.
+
+## ITERATION 3 BREAKTHROUGH - the quaxar-specific divergence causing the stall
+The futex contention (proved via thread stacks) is on the SINGLE GLOBAL
+RegistryInner mutex: xrpld/app/src/ledger/inbound_ledgers/registry.rs:3
+("ONE global registry: HashMap<Uint256, Entry>. A single Mutex protects...")
+inner: Arc<Mutex<RegistryInner>> (:741), accessed via timed_inner_lock (:90)
+which records registry_lock_wait metric.
+
+DIVERGENCE from rippled (InboundLedgers.cpp): rippled holds the map lock_
+only BRIEFLY to find the InboundLedger (sl scope :163), then RELEASES it; heavy
+per-ledger data processing runs on the JobQueue with the per-InboundLedger lock
+(gotData/runData :203-206: addJob(JtLedgerData,...,[ledger](){ledger->runData();})).
+rippled shards: global map lock = lookup only; per-ledger work = per-ledger lock.
+
+Quaxar holds the ONE global RegistryInner mutex across the owner's heavy
+per-ledger drain/processing (coordinator_drain_with_status), so overlay packet
+ingress + db-prefetch read-completion delivery all serialize behind it ->
+during an acquisition burst (node slightly behind, fetching multiple ledgers)
+the owner holds inner for seconds -> db-prefetch + acquisition-own threads all
+block in futex_wait -> validated-seq stalls 8-54s -> node falls behind ->
+benign node_behind_lag demotion -> catch-up.
+
+FIX TARGET (full, rippled-faithful): narrow the global RegistryInner lock to
+brief map lookups; move per-ledger packet/read-completion processing off the
+global lock onto per-entry locks (+ job dispatch), matching rippled's
+InboundLedgers map-lock vs per-InboundLedger-lock split. This is a substantial
+acquisition-core refactor; next iteration begins it.
