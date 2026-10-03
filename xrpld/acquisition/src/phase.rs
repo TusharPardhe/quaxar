@@ -118,7 +118,8 @@ pub enum TransitionError {
 /// | `Connected` | consensus, validation, recovery, or startup target | `Syncing` |
 /// | `Syncing` | target complete, durable, accepted, installed as LCL | `Tracking` |
 /// | `Tracking` | validated/published chain contiguous and fresh | `Full` |
-/// | `Full` | preferred-LCL divergence / stale validation / required target | `Syncing { target }` |
+/// | `Full`/`Tracking` | ordinary acquisition target required | unchanged (phase-neutral) |
+/// | `Full` | proven preferred-LCL divergence with a target | `Syncing { target }` |
 /// | `Tracking`/`Full` | consensus view changed (mode-only) | `Connected` |
 /// | `Full` | blocked state / freshness loss with no concrete target | `Connected` |
 /// | any active phase | no usable peers | `Disconnected` |
@@ -168,12 +169,24 @@ pub fn phase_transition(from: &SyncPhase, fact: &TransitionFact) -> Option<SyncP
         (Syncing { .. }, TargetInstalledAsLcl { lcl }) => Tracking { lcl: *lcl },
         (Syncing { .. }, PreferredLclReconciled { lcl }) => Tracking { lcl: *lcl },
         (Tracking { .. }, PreferredLclDivergence { target }) => Syncing { target: *target },
+        // Ordinary acquisition of the agreed next ledger is phase-neutral once
+        // an LCL is installed. rippled never drops omTRACKING/omFULL merely
+        // because the next consensus ledger must be fetched from peers
+        // (endConsensus only *raises* mode; the only downward exits from
+        // FULL/TRACKING are consensusViewChange, a proven preferred-LCL
+        // divergence, a blocked/stale state, or quorum/peer loss). Treating a
+        // bare TargetRequired as a demotion caused spurious
+        // full->syncing->tracking->full churn on every tip acquisition.
+        (Tracking { lcl }, TargetRequired { .. }) => Tracking { lcl: *lcl },
         (Tracking { .. }, ConsensusViewChange) => Connected,
         (Tracking { .. }, ChainContiguous { lcl, published }) => Full {
             lcl: *lcl,
             published: *published,
         },
-        (Full { .. }, TargetRequired { target }) => Syncing { target: *target },
+        (Full { lcl, published }, TargetRequired { .. }) => Full {
+            lcl: *lcl,
+            published: *published,
+        },
         (Full { .. }, PreferredLclDivergence { target }) => Syncing { target: *target },
         (Full { .. }, ConsensusViewChange) => Connected,
         (Full { .. }, BlockedWithNoTarget) => Connected,
@@ -354,7 +367,11 @@ mod tests {
                 },
                 &TransitionFact::TargetRequired { target: target(12) }
             ),
-            Some(SyncPhase::Syncing { target: target(12) })
+            Some(SyncPhase::Full {
+                lcl: identity(9),
+                published: identity(9)
+            }),
+            "ordinary TargetRequired must keep Full (acquiring the next ledger is phase-neutral)"
         );
         assert_eq!(
             phase_transition(
@@ -513,30 +530,42 @@ mod tests {
     }
 
     #[test]
-    fn full_to_syncing_is_required_whenever_a_concrete_target_exists() {
-        // "Full -> Syncing is required whenever a concrete acquisition target
-        // exists; Full -> Connected is reserved for a demotion with no target."
-        for fact in [
-            TransitionFact::TargetRequired { target: target(20) },
-            TransitionFact::PreferredLclDivergence { target: target(20) },
-        ] {
-            let result = phase_transition(
-                &SyncPhase::Full {
-                    lcl: identity(1),
-                    published: identity(1),
-                },
-                &fact,
-            );
-            assert_eq!(result, Some(SyncPhase::Syncing { target: target(20) }));
-        }
-
-        // The next consensus target after a targetless demotion re-enters syncing.
-        let demoted = SyncPhase::Full {
+    fn ordinary_target_required_is_phase_neutral_for_full_and_tracking() {
+        // rippled keeps omFULL/omTRACKING while acquiring the agreed next
+        // ledger; only a proven preferred-LCL divergence demotes to syncing.
+        let full = SyncPhase::Full {
             lcl: identity(1),
             published: identity(1),
-        }
-        .apply(TransitionFact::BlockedWithNoTarget)
-        .unwrap();
+        };
+        assert_eq!(
+            phase_transition(&full, &TransitionFact::TargetRequired { target: target(20) }),
+            Some(full),
+            "a bare TargetRequired must not demote Full"
+        );
+        let tracking = SyncPhase::Tracking { lcl: identity(1) };
+        assert_eq!(
+            phase_transition(
+                &tracking,
+                &TransitionFact::TargetRequired { target: target(20) }
+            ),
+            Some(tracking),
+            "a bare TargetRequired must not demote Tracking"
+        );
+
+        // A proven preferred-LCL divergence still demotes Full to syncing.
+        assert_eq!(
+            phase_transition(
+                &full,
+                &TransitionFact::PreferredLclDivergence { target: target(20) }
+            ),
+            Some(SyncPhase::Syncing { target: target(20) }),
+        );
+
+        // After a targetless demotion to Connected, the next consensus target
+        // re-enters syncing (Connected is not phase-neutral).
+        let demoted = full
+            .apply(TransitionFact::BlockedWithNoTarget)
+            .unwrap();
         assert_eq!(demoted, SyncPhase::Connected);
         let re_syncing = demoted
             .apply(TransitionFact::TargetRequired { target: target(20) })

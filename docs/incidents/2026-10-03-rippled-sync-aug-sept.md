@@ -78,3 +78,29 @@ MPT STIssue #7429, AMM #7430/#7704/#7373, all Vault/Lending consensus fixes #786
 escrow #8142, sig-prefixes #8162, calculateBaseFee #3e4e56, simulate dry-run #ea6226,
 amendment registrations #8125/#8174/#8185, manifest caps #8461ded, etc.), plus #7977 vault
 withdrawal destination checks and #7796 AMMClawback IgnoreReserve (reclassified PRESENT).
+
+## Operating-mode churn fix (not chain oscillation)
+Observed: server_info state_accounting showed `full` with 54 transitions over
+~11.7h uptime (node spends 98.8% in full; each dip 2-7s). Journal showed
+repeated full->syncing->tracking->full cycles with reason coordinator-syncing/
+coordinator-connected.
+
+Diagnosis: these are OPERATING-MODE demotions, NOT consensus/chain oscillation
+(the validated LCL only ever advanced forward; no backward/competing-hash
+movement). Root cause: the acquisition phase state machine had
+`(Full, TargetRequired) => Syncing` and `(Tracking, PreferredLclDivergence)`
+only, so a plain `TargetRequired{reason=Consensus}` emitted to acquire the
+agreed NEXT tip ledger demoted the whole service out of full on those rounds
+where the ledger had to be fetched from peers.
+
+rippled parity: NetworkOPs has NO omFULL->omSYNCING-on-acquisition transition.
+endConsensus only RAISES mode (CONNECTED/SYNCING->TRACKING->FULL); the only
+downward exits from FULL/TRACKING are consensusViewChange (->CONNECTED), a
+proven preferred-LCL divergence, blocked/stale state, or quorum/peer loss.
+
+Fix (xrpld/acquisition/src/phase.rs): make a bare `TargetRequired` phase-neutral
+for Full and Tracking (acquisition proceeds in the background). Genuine
+divergence (`PreferredLclDivergence`), `ConsensusViewChange`,
+`BlockedWithNoTarget`, and quorum/peer loss still demote exactly as before.
+Structural fix at the shared transition fn, so every fact emit-site is covered.
+Tests updated; 250 acquisition unit tests + 7 operating_mode tests green.
