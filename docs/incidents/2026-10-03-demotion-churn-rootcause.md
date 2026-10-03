@@ -295,3 +295,34 @@ rippled (consensus engine, close-time, avalanche, node cache, tree-cache sizing,
 SHAMap sharing, sweep locking/partition/tuning). No further quaxar code defect
 remains. Residual ~1.67/hr demotions = rippled-identical total==0 solo-close on
 rare zero-proposer rounds on a large-ledger testnet.
+
+## ITERATION 3 - STALL ROOT CAUSE: lock (futex) contention during read bursts
+HARD EVIDENCE (stall-watcher thread kernel-stack capture, 22:50:51-22:51:03,
+20s stall seq stuck 21257912): during the stall the ONLY runnable threads are
+`db prefetch #2-6` and `acquisition-own`, ALL blocked in
+futex_wait (futex_do_wait->__futex_wait->do_futex->__x64_sys_futex). i.e. the
+stall is MUTEX CONTENTION, not disk I/O (pread uses read_exact_at positioned
+reads, lock-free) and not the cache sweep (sweep thread ThreadId96 idle; stall
+occurs AFTER sweep completes).
+
+Read path verified lock-free on fast path: NuDbBackend::fetch ->
+find_bucket_entry -> read_bucket/pread_data uses FileExt::read_exact_at on a
+persistent fd (concurrent-safe). So contention is a DIFFERENT shared mutex -
+candidates: NuDbBackend runtime Mutex / bucket_cache DashMap eviction /
+burst_originals Mutex, OR the acquisition coordinator single-writer state mutex
+(acquisition-own + networkops-stra serialize there). The db-prefetch threads +
+acquisition owner all blocking together under read-burst load is the signature.
+
+Read-burst load is MAXIMIZED because node_object_cache is disabled (221M reads,
+100% miss, 835s cumulative disk time). node_object_cache-disabled matches
+rippled's rotating store, BUT the downstream futex contention it amplifies is
+the stall mechanism. Node still 97.5% full; stalls ~20-30min apart, each
+8-54s, cause brief node_behind_lag demotions (benign catch-up, NOT divergence).
+
+BLOCKER on exact-lock naming: ptrace_scope=1 and no gdb/eu-stack on host, so
+only kernel stacks (futex_wait) are available - cannot resolve WHICH userspace
+mutex without a debugger or added instrumentation. NEXT: add lightweight
+lock-acquire timing instrumentation to the candidate mutexes (NuDb runtime /
+acquisition state) to name the contended lock, then fix (e.g. shard the lock or
+add a bounded read cache to cut burst volume) - rippled-safe since it does not
+change consensus behavior.
