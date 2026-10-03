@@ -39,3 +39,6 @@ NA-noncore (RPC/peer-metric/C++-isms with no consensus effect; noted).
   (transactor_dispatcher.rs:410) + amm_prepare_withdraw_holding reserve bypass (clawback_issuer
   present && fixCleanup3_4_0) is the ReserveHandling::IgnoreReserve equivalent. Audit grep
   false-negative (searched literal "IgnoreReserve").
+- c8e767 PaymentBurn cross-zero reject (fixCleanup3_4_0): DONE. Granular
+  PaymentBurn now requires dstAmount <= held (or mayIssue) so redeeming cannot
+  cross zero into minting. payment.rs facts + invoke_preclaim builder.

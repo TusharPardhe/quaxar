@@ -465,7 +465,7 @@ fn typed_check_permission<V: ReadView>(
             // sfAmount issuer alias alone.  In particular, keylet::trustLine
             // is built from both endpoints even when sfAmount names the
             // source as issuer.
-            let (trustline_exists, account_is_holder, dest_limit_positive) = if delegate.is_some() {
+            let (trustline_exists, account_is_holder, dest_limit_positive, dst_amount_within_held) = if delegate.is_some() {
                 match asset {
                     protocol::Asset::Issue(issue)
                         if !issue.native()
@@ -485,6 +485,19 @@ fn typed_check_permission<V: ReadView>(
                                     sf("sfLowLimit")
                                 });
                                 let raw_balance = line.get_field_amount(sf("sfBalance"));
+                                // rippled #c8e767: held = the amount the source
+                                // account currently holds, oriented so a
+                                // positive value means it can be redeemed. The
+                                // granular template forbids paths, partial
+                                // payment and cross-asset SendMax, so sfAmount
+                                // is exactly what the trust line is debited.
+                                let held = if account_is_low {
+                                    raw_balance.clone()
+                                } else {
+                                    let mut negated = raw_balance.clone();
+                                    negated.negate();
+                                    negated
+                                };
                                 (
                                     true,
                                     Some(if account_is_low {
@@ -493,15 +506,16 @@ fn typed_check_permission<V: ReadView>(
                                         raw_balance.signum() < 0
                                     }),
                                     Some(dest_limit.signum() > 0),
+                                    Some(amount <= held),
                                 )
                             }
-                            None => (false, None, None),
+                            None => (false, None, None, None),
                         }
                     }
-                    _ => (false, None, None),
+                    _ => (false, None, None, None),
                 }
             } else {
-                (false, None, None)
+                (false, None, None, None)
             };
             tx::run_payment_check_permission(tx::PaymentCheckPermissionFacts {
                 delegate_present: delegate.is_some(),
@@ -532,6 +546,10 @@ fn typed_check_permission<V: ReadView>(
                 trustline_exists,
                 account_is_holder,
                 dest_limit_positive,
+                fix_cleanup_3_4_0: view
+                    .rules()
+                    .enabled(&protocol::fix_cleanup_3_4_0()),
+                dst_amount_within_held,
             })
         }
         protocol::TxType::TRUST_SET => {

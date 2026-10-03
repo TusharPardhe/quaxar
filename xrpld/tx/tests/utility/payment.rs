@@ -209,6 +209,8 @@ fn payment_check_permission_follows_delegate_and_granular_rules() {
         trustline_exists: false,
         account_is_holder: None,
         dest_limit_positive: None,
+        fix_cleanup_3_4_0: false,
+        dst_amount_within_held: None,
     });
     let mint = run_payment_check_permission(PaymentCheckPermissionFacts {
         delegate_present: true,
@@ -226,6 +228,8 @@ fn payment_check_permission_follows_delegate_and_granular_rules() {
         trustline_exists: false,
         account_is_holder: None,
         dest_limit_positive: None,
+        fix_cleanup_3_4_0: false,
+        dst_amount_within_held: None,
     });
     let denied = run_payment_check_permission(PaymentCheckPermissionFacts {
         delegate_present: true,
@@ -243,6 +247,8 @@ fn payment_check_permission_follows_delegate_and_granular_rules() {
         trustline_exists: false,
         account_is_holder: None,
         dest_limit_positive: None,
+        fix_cleanup_3_4_0: false,
+        dst_amount_within_held: None,
     });
 
     assert_eq!(missing_delegate, Ter::TER_NO_DELEGATE_PERMISSION);
