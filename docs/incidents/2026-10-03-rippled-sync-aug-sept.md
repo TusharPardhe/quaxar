@@ -28,3 +28,14 @@ NA-noncore (RPC/peer-metric/C++-isms with no consensus effect; noted).
 - #7913 abf5511 sign-check wording lending msgs: SKIP (message wording only).
 - #37 c5dc408 Remove explicit from hash ctors: SKIP (C++ism).
 - #11 b19c3c6 #7971 Add zero keylet check in credential: PRESENT (credential_helpers.rs:223,437 fix_cleanup_3_4_0 && h.is_zero -> TEC_INTERNAL).
+
+### Implemented on this branch
+- #8254 0219c01b SponsorshipTransfer zero sfObjectID -> TEM_MALFORMED (fixCleanup3_5_0). DONE.
+- 00eeb0 decode_vl_length_1 reject first byte >192. DONE.
+- #8111 f8fba07 VaultClawback pseudo-holder -> TEC_PSEUDO_ACCOUNT (fixCleanup3_4_0). DONE.
+
+### Reclassified after close review
+- #7796 636d2d4 AMMClawback IgnoreReserve: PRESENT. Our amm_clawback_ignores_recipient_reserve
+  (transactor_dispatcher.rs:410) + amm_prepare_withdraw_holding reserve bypass (clawback_issuer
+  present && fixCleanup3_4_0) is the ReserveHandling::IgnoreReserve equivalent. Audit grep
+  false-negative (searched literal "IgnoreReserve").
