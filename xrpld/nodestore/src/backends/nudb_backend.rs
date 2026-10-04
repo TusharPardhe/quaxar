@@ -841,6 +841,17 @@ pub struct NuDbBackend {
     key_bucket_io: RwLock<()>,
     default_open_args: Option<NuDbOpenArgs>,
     persistent_fds: ArcSwapOption<NuDbPersistentFds>,
+    /// Lock-free mirror of `runtime.key_header`. Every read path
+    /// (`current_key_header`) consults this `ArcSwap` instead of taking the
+    /// `runtime` mutex, so a high-rate write/store burst (which repeatedly
+    /// locks `runtime`) cannot serialize concurrent reads behind it. This
+    /// removed the observed multi-second validated-ledger stalls where
+    /// consensus SHAMap reads blocked on `runtime` during an acquisition write
+    /// burst. The header changes only on open/close and key-file splits; those
+    /// sites update this mirror while already holding the write path, so the
+    /// cache is always consistent with the committed on-disk header. Reference
+    /// NuDB serves the in-memory key header locklessly on the read hot path.
+    key_header_cache: ArcSwapOption<NuDbKeyFileHeader>,
     /// Bucket cache matching reference NuDB's detail::cache. Clean entries
     /// avoid pread calls; only bulk-import entries remain dirty for a later
     /// write-back flush.
@@ -940,6 +951,7 @@ impl NuDbBackend {
             key_bucket_io: RwLock::new(()),
             default_open_args,
             persistent_fds: ArcSwapOption::empty(),
+            key_header_cache: ArcSwapOption::empty(),
             bucket_cache: DashMap::new(),
             burst_originals: Mutex::new(NuDbBurstOriginals::default()),
             data_file_size: AtomicU64::new(0),
@@ -1373,7 +1385,7 @@ impl NuDbBackend {
         // installed. Until this point concurrent callers still observe the
         // closed, fail-stopped generation.
         runtime.open_state = open_state;
-        runtime.key_header = Some(header);
+        Self::publish_key_header(&mut runtime, &self.key_header_cache, Some(header));
         runtime.split_threshold = nudb_split_threshold(&header);
         runtime.split_fraction = runtime.split_threshold / 2;
         runtime.burst_pending_writes = 0;
@@ -1632,7 +1644,7 @@ impl NuDbBackend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         runtime.open_state.close();
-        runtime.key_header = None;
+        Self::publish_key_header(&mut runtime, &self.key_header_cache, None);
         runtime.split_fraction = 0;
         runtime.split_threshold = 0;
         runtime.burst_pending_writes = 0;
@@ -1659,6 +1671,15 @@ impl NuDbBackend {
     }
 
     fn current_key_header(&self) -> Result<NuDbKeyFileHeader, String> {
+        // Lock-free fast path: serve the in-memory key header from the
+        // `ArcSwap` mirror so concurrent reads never contend on the `runtime`
+        // mutex that store/split bursts hold. The mirror is updated under the
+        // write path whenever the committed header changes (open/close/split).
+        if let Some(header) = self.key_header_cache.load_full() {
+            return Ok(*header);
+        }
+        // Cold cache (pre-open or just-closed): fall back to the authoritative
+        // runtime field.
         let runtime = self
             .runtime
             .lock()
@@ -1671,6 +1692,19 @@ impl NuDbBackend {
         runtime
             .key_header
             .ok_or_else(|| "NuDB key header not loaded".to_owned())
+    }
+
+    /// Set the committed key header on both the authoritative `runtime` field
+    /// (caller already holds the `runtime` guard) and the lock-free read
+    /// mirror. All header mutations (open/close/split) must route through here
+    /// so the mirror never lags the committed value.
+    fn publish_key_header(
+        runtime: &mut NuDbBackendRuntime,
+        cache: &ArcSwapOption<NuDbKeyFileHeader>,
+        header: Option<NuDbKeyFileHeader>,
+    ) {
+        runtime.key_header = header;
+        cache.store(header.map(Arc::new));
     }
 
     fn key_hash_prefix(&self, key: &[u8]) -> Result<u64, String> {
@@ -1877,6 +1911,8 @@ impl NuDbBackend {
         header.modulus = 1;
         runtime.split_threshold = nudb_split_threshold(header);
         runtime.split_fraction = runtime.split_threshold / 2;
+        // Re-publish the mutated header to the lock-free read mirror.
+        self.key_header_cache.store(runtime.key_header.map(Arc::new));
         #[cfg(test)]
         nudb_test_crash_if_requested(NuDbTestCrashPoint::PrimaryBucket, "primary bucket creation");
         Ok(())
@@ -1976,6 +2012,8 @@ impl NuDbBackend {
         header.modulus = new_modulus;
         self.write_key_bucket_with_header(left_index, &left, header)?;
         self.write_key_bucket_with_header(right_index, &right, header)?;
+        // Re-publish the mutated header to the lock-free read mirror.
+        self.key_header_cache.store(runtime.key_header.map(Arc::new));
         #[cfg(test)]
         nudb_test_crash_if_requested(NuDbTestCrashPoint::Split, "bucket split");
 
@@ -2479,7 +2517,7 @@ impl Backend for NuDbBackend {
         }
         let delete_path = runtime.open_state.delete_path();
         runtime.open_state.close();
-        runtime.key_header = None;
+        Self::publish_key_header(&mut runtime, &self.key_header_cache, None);
         runtime.split_fraction = 0;
         runtime.split_threshold = 0;
         runtime.burst_pending_writes = 0;
@@ -3039,6 +3077,9 @@ impl Backend for NuDbBackend {
             let h = *header;
             runtime.split_threshold = nudb_split_threshold(&h);
             runtime.split_fraction = runtime.split_threshold / 2;
+            // Re-publish the mutated header to the lock-free read mirror
+            // before releasing the runtime guard.
+            self.key_header_cache.store(Some(Arc::new(h)));
             drop(runtime);
 
             // Persist updated header to disk
