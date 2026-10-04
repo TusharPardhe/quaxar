@@ -2025,15 +2025,20 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     // on the SAME validated chain) from a genuine fork. We can: the candidate
     // already passed `is_compatible` (it is on the validated/quorum chain), so
     // if it is STRICTLY AHEAD of our current closed ledger AND our own closed
-    // ledger is itself still on that validated chain (an ancestor, not a
-    // minority sibling), the switch is a forward advance - adopting a newer
-    // validated ledger we were trailing, not abandoning a wrong ledger. In
-    // that case we must NOT demote: the node has never left the correct chain,
-    // so flapping FULL→SYNCING→TRACKING→FULL is spurious churn. A same-sequence
-    // sibling (fork / observer veto) or an our-closed ledger that is NOT on the
-    // validated chain still demotes exactly as rippled does.
-    let forward_catch_up = candidate.header().seq > our_closed.header().seq
-        && lm.is_compatible(our_closed.as_ref());
+    // ledger is a true ANCESTOR of the candidate on that chain (confirmed by
+    // asking the candidate to look DOWN its skip-list to our closed sequence,
+    // rippled areCompatible/hashOfSeq semantics), the switch is a forward
+    // advance - adopting a newer validated ledger we were trailing, not
+    // abandoning a wrong ledger. In that case we must NOT demote: the node has
+    // never left the correct chain, so flapping FULL→SYNCING→TRACKING→FULL is
+    // spurious churn. A same-sequence sibling (fork / observer veto) or a
+    // candidate whose ancestor at our sequence differs still demotes.
+    let our_seq = our_closed.header().seq;
+    let forward_catch_up = candidate.header().seq > our_seq
+        && candidate
+            .hash_of_seq(our_seq, &ledger::NullLedgerJournal)
+            .map(|ancestor| *ancestor.as_uint256() == our_hash)
+            .unwrap_or(false);
     if forward_catch_up {
         tracing::info!(
             target: "lcl_trace",

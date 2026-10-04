@@ -945,19 +945,30 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 || current_mode == crate::NetworkOpsOperatingMode::Tracking
             {
                 // Parity refinement matching the strand's reconcile path: a
-                // pure FORWARD catch-up (preferred is strictly ahead of our
-                // consensus parent AND that parent is still on the validated
+                // pure FORWARD catch-up (our consensus parent is a true
+                // ANCESTOR of the newer preferred ledger on the same validated
                 // chain) is not a wrong-ledger divergence - we are only
-                // trailing the same chain. Do not demote in that case; just
-                // let consensus adopt the newer preferred parent. A same-seq
-                // sibling (fork) or an off-chain parent still demotes exactly
-                // as rippled's consensusViewChange does.
+                // trailing the same chain. Confirm ancestry definitively by
+                // asking the resident preferred ledger to look DOWN its
+                // skip-list to our parent's sequence (rippled areCompatible /
+                // hashOfSeq semantics): if that ancestor hash equals our
+                // parent's hash, the switch is a forward advance and must NOT
+                // demote. A same-seq sibling (fork), a non-resident preferred
+                // (acquire-required), or a genuinely divergent ancestor still
+                // demotes exactly as rippled's consensusViewChange does.
+                let prev_seq = prev_ledger.ledger().header().seq;
+                let prev_hash = *prev_ledger.ledger().header().hash.as_uint256();
                 let forward_catch_up = preferred_resident
-                    .is_some_and(|(_, pref_seq)| pref_seq > prev_ledger.ledger().header().seq)
+                    .is_some_and(|(_, pref_seq)| pref_seq > prev_seq)
                     && self
-                        .ledger_master_runtime
-                        .ledger_master()
-                        .is_compatible(prev_ledger.ledger().as_ref());
+                        .app_root
+                        .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred))
+                        .and_then(|pref_ledger| {
+                            pref_ledger
+                                .hash_of_seq(prev_seq, &ledger::NullLedgerJournal)
+                                .map(|ancestor| *ancestor.as_uint256() == prev_hash)
+                        })
+                        .unwrap_or(false);
                 if forward_catch_up {
                     tracing::info!(
                         target: "consensus",
