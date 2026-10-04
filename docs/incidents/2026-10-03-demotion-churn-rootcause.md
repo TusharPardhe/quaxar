@@ -375,3 +375,27 @@ whole burst monolithically. FIX (next): break the owner's burst drain into
 bounded/interleavable units (yield between ledgers so consensus runs), or move
 heavy per-ledger processing off the owner thread onto the job pool like
 rippled's JtLedgerData. Substantial; next iteration.
+
+## ITERATION 3 - two more fixes deployed; stall persists (owner CPU-bound)
+Fix A (commit 21ce4b92, prior iter): non-blocking coordinator fact submission.
+Fix B (commit be3524bf, this iter): NuDB key header served lock-free via
+ArcSwapOption (key_header_cache) so reads don't block on store()'s runtime
+Mutex during write bursts. nodestore lib tests 114 pass; 4 integration
+failures are pre-existing (identical on clean HEAD). Deployed quaxar.nudbhdr-be3524bf.
+
+RESULT: stalls REDUCED but STILL PRESENT (12-16s gaps). CPU capture during a
+stall still shows acquisition-own at 90% CPU, disk only ~6% util. So the
+dominant remaining cause is NOT lock contention or disk I/O - it is the SINGLE
+acquisition-owner thread being CPU-SATURATED (90% of one core) processing a
+multi-ledger acquisition burst (SHAMap node insert/verify + NuDB write encode,
+~11.4k writes/s) serially, while consensus (tokio workers) is starved. Load
+only 1-2.8 on 4 cores => 3 cores idle while owner monopolizes progress on 1.
+
+RIPPLED DIVERGENCE (the real full fix): rippled runs per-ledger gotData/runData
+as separate JtLedgerData JobQueue jobs across the multi-threaded pool AND
+interleaved with consensus. Quaxar's owner is a single serialized lane doing
+all burst node-processing itself. FIX (next iter, major): offload the heavy
+per-ledger node insertion/verification/write-encode from the owner thread onto
+the worker pool (keep the owner as lifecycle sequencer only), OR bound the
+owner's per-burst CPU work with frequent yields so consensus interleaves on the
+idle cores. This is a substantial acquisition-core refactor.
