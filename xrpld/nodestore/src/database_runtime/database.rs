@@ -768,11 +768,18 @@ impl DatabaseRuntime {
                     });
                 admitted += 1;
             }
-            // One wake for the whole batch. notify_all lets every idle worker
-            // pick up part of the batch; a single notify_one would serialize
-            // the batch on one worker.
+            // Wake only as many workers as there is work for, bounded by the
+            // number of read threads. `notify_all` would wake every idle
+            // worker on every batch (even a 1-item batch), recreating the
+            // futex wake churn this batching is meant to remove. One
+            // `notify_one` per admitted item (capped at the thread count) wakes
+            // just enough workers to drain the batch in parallel.
             if admitted > 0 {
-                self.inner.read_condvar.notify_all();
+                let threads = self.inner.live_threads.load(Ordering::Relaxed).max(1);
+                let wakes = admitted.min(threads);
+                for _ in 0..wakes {
+                    self.inner.read_condvar.notify_one();
+                }
             }
         }
         for work in rejected {
