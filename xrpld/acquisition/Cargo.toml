@@ -13,5 +13,6 @@ path = "src/lib.rs"
 basics = { path = "../../xrpl/basics" }
 bytes = "1.11.1"
 ledger = { path = "../ledger" }
+rayon = "1"
 shamap = { path = "../../xrpl/shamap" }
 tracing = "=0.1.44"

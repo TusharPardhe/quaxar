@@ -9,6 +9,7 @@ dependencies = [
  "basics",
  "bytes",
  "ledger",
+ "rayon",
  "shamap",
  "tracing",
 ]

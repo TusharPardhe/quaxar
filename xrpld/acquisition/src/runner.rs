@@ -29,6 +29,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rayon::prelude::*;
+
 use ledger::Ledger;
 
 use basics::base_uint::Uint256;
@@ -59,6 +61,34 @@ use crate::timer::{TimerKind, TimerRequest};
 /// deliberately coordinator-owned and rearmed only after a later rejection;
 /// it avoids immediate retry loops while keeping failed delivery responsive.
 pub const HANDOFF_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Maximum number of per-session SHAMap read-apply groups processed
+/// concurrently, matching rippled's `JtLedgerData` JobQueue concurrency limit
+/// (`JobTypes.h`: `add(JtLedgerData, "ledgerData", 3, ...)`). rippled runs each
+/// `InboundLedger::runData` as an independent `JtLedgerData` job, so up to three
+/// different ledgers' received-data nodes are decoded/attached in parallel. We
+/// mirror that bound: distinct acquisition sessions (one SHAMap tree each) have
+/// their batched read completions applied on this bounded pool, while the owner
+/// strand retains authority over session lifecycle, effects, and shared state.
+const LEDGER_DATA_PARALLELISM: usize = 3;
+
+/// Below this many distinct sessions in a read batch, parallel dispatch costs
+/// more (pool handoff / join) than it saves, so the owner applies inline.
+const LEDGER_DATA_PARALLEL_MIN_SESSIONS: usize = 2;
+
+/// The bounded `JtLedgerData`-equivalent worker pool, created once. Threads are
+/// named for perf/wchan attribution during stall diagnosis.
+fn ledger_data_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(LEDGER_DATA_PARALLELISM)
+            .thread_name(|i| format!("ledger-data-{i}"))
+            .build()
+            .expect("ledger-data pool build")
+    })
+}
+
 
 /// rippled `InboundLedger::addPeers` begins acquisition through this many
 /// scored peers (`kPeerCountStart` in `InboundLedger.cpp`). Keep the
@@ -283,6 +313,15 @@ pub struct CoordinatorState {
     /// the common emitter can construct a `PeerRequest`.
     outbound: OutboundRequestAdmission,
     ids: IdCounter,
+}
+
+/// Result of applying one session's batched read completions, produced by the
+/// bounded `JtLedgerData`-equivalent parallel apply and folded back into shared
+/// runner state serially by the owner.
+struct SessionApplyResult {
+    session: Option<SessionRef>,
+    resume: bool,
+    stale: u64,
 }
 
 /// The coordinator-owned lifecycle of one session.
@@ -2910,61 +2949,95 @@ impl CoordinatorRunner {
     fn on_read_batch(&mut self, completions: Vec<ReadCompletion>) -> Vec<AcquisitionEffect> {
         let mut effects = Vec::new();
         let mut resume = BTreeSet::new();
+
+        // Phase 1: separate header reads (processed serially; they can mutate
+        // cross-session/shared runner state) from per-session Read/RecoveryRead
+        // completions, which touch only their own session's SHAMap engine and
+        // are therefore safe to apply in parallel - exactly as rippled runs one
+        // `InboundLedger::runData` job per ledger under the `JtLedgerData`
+        // concurrency limit.
+        let mut grouped: BTreeMap<SessionRef, Vec<ReadCompletion>> = BTreeMap::new();
         for completion in completions {
-            if completion.operation().kind() == OperationKind::HeaderRead {
-                effects.extend(self.on_read(completion));
-                continue;
-            }
-            if !matches!(
-                completion.operation().kind(),
-                OperationKind::Read | OperationKind::RecoveryRead
-            ) {
-                self.stats.stale_events += 1;
-                continue;
-            }
-            let session = completion.operation().session();
-            let operation_kind = completion.operation().kind();
-            let (outcome, pending_reads_after, pending_traversal_after, read_backlog_after) = {
-                let Some(session_state) = self.state.sessions.get_mut(&session) else {
-                    self.stats.stale_events += 1;
-                    continue;
-                };
-                if session_state.phase != SessionPhase::Active {
-                    self.stats.stale_events += 1;
-                    continue;
+            match completion.operation().kind() {
+                OperationKind::HeaderRead => {
+                    effects.extend(self.on_read(completion));
                 }
-                let outcome = session_state.plan.on_read(&completion);
-                (
-                    outcome,
-                    session_state.plan.pending_read_count(),
-                    session_state.plan.pending_traversal_read_count(),
-                    session_state.plan.read_backlog_count(),
-                )
+                OperationKind::Read | OperationKind::RecoveryRead => {
+                    let session = completion.operation().session();
+                    grouped.entry(session).or_default().push(completion);
+                }
+                _ => self.stats.stale_events += 1,
+            }
+        }
+
+        // Build disjoint `&mut` handles to exactly the sessions named in this
+        // batch. `iter_mut` yields non-overlapping borrows, so each worker owns
+        // one session's engine for the duration of its applies.
+        let mut jobs: Vec<(&mut CoordinatorSession, Vec<ReadCompletion>)> = self
+            .state
+            .sessions
+            .iter_mut()
+            .filter_map(|(session, state)| {
+                grouped.remove(session).map(|completions| (state, completions))
+            })
+            .collect();
+        // Completions whose session is gone (never matched above) are stale.
+        for (_, orphaned) in grouped {
+            self.stats.stale_events += orphaned.len() as u64;
+        }
+
+        // Per-session apply unit. Returns the sessions that must resume a plan
+        // turn plus the stale count accrued, so the owner can fold shared state
+        // serially after the parallel phase.
+        let apply_session = |pair: &mut (&mut CoordinatorSession, Vec<ReadCompletion>)|
+         -> SessionApplyResult {
+            let (state, completions) = pair;
+            let session = completions
+                .first()
+                .map(|completion| completion.operation().session());
+            let mut result = SessionApplyResult {
+                session,
+                resume: false,
+                stale: 0,
             };
-            tracing::trace!(
-                target: "acquisition_trace",
-                event = "node_store_read_completed",
-                run_epoch = session.run_epoch().get(),
-                session_id = session.session_id().get(),
-                target_hash = %session.target_hash(),
-                plan_epoch = session.plan_epoch().get(),
-                store_generation = session.store_generation().get(),
-                outcome = ?completion.outcome(),
-                plan_outcome = ?outcome,
-                pending_reads_after,
-                pending_traversal_after,
-                read_backlog_after,
-                "acquisition trace: batched brokered NodeStore read completion applied to session"
-            );
-            match outcome {
-                PlanReadOutcome::Applied
-                    if operation_kind == OperationKind::RecoveryRead
-                        || pending_traversal_after == 0 =>
-                {
-                    resume.insert(session);
+            if state.phase != SessionPhase::Active {
+                result.stale += completions.len() as u64;
+                return result;
+            }
+            for completion in completions.iter() {
+                let operation_kind = completion.operation().kind();
+                let outcome = state.plan.on_read(completion);
+                let pending_traversal_after = state.plan.pending_traversal_read_count();
+                match outcome {
+                    PlanReadOutcome::Applied
+                        if operation_kind == OperationKind::RecoveryRead
+                            || pending_traversal_after == 0 =>
+                    {
+                        result.resume = true;
+                    }
+                    PlanReadOutcome::Applied => {}
+                    PlanReadOutcome::Stale => result.stale += 1,
                 }
-                PlanReadOutcome::Applied => {}
-                PlanReadOutcome::Stale => self.stats.stale_events += 1,
+            }
+            result
+        };
+
+        // Phase 2: apply. Use the bounded `JtLedgerData`-equivalent pool only
+        // when enough distinct sessions are present to amortize the handoff;
+        // otherwise apply inline on the owner (single-session batches are the
+        // common steady-state case and must not pay pool cost).
+        let results: Vec<SessionApplyResult> = if jobs.len() >= LEDGER_DATA_PARALLEL_MIN_SESSIONS {
+            ledger_data_pool().install(|| jobs.par_iter_mut().map(apply_session).collect())
+        } else {
+            jobs.iter_mut().map(apply_session).collect()
+        };
+
+        // Phase 3: fold shared state serially on the owner, then run the plan
+        // turns (which require `&mut self` for ids/peer_view/effects).
+        for result in results {
+            self.stats.stale_events += result.stale;
+            if result.resume && let Some(session) = result.session {
+                resume.insert(session);
             }
         }
         for session in resume {
