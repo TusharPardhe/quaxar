@@ -594,3 +594,52 @@ quaxar.decodeoffload-24907eb7.
 max gap 37-54s -> 5s; stalls eliminated. Two root causes fixed: (1) consensus
 status reads blocking on the owner's drain mutex (status-mirror), (2) single-
 threaded owner SHAMap apply throughput (JtLedgerData parallelization).
+
+## ITERATION (residual demotion root cause + edge-trigger fix) — 2026-10-04
+
+**Investigated the residual ~1/hr demotion by reading the live log at the exact
+event (not guessing).** The demotion log line was:
+`consensusViewChange: demoting to Connected (preferred ledger differs)
+ current_mode=Tracking requested=<old parent 21279159> preferred=<21279170>`.
+
+TRUE ROOT CAUSE (two layers):
+1. This node is a NON-VALIDATOR OBSERVER. Its local consensus occasionally
+   builds a MINORITY ledger that loses to the quorum-backed canonical sibling
+   (`LCL_AUDIT observer local child vetoed for quorum-backed canonical sibling`,
+   observer_quorum_alternate_same_seq in rcl_consensus.rs:1849). It correctly
+   defers to the validator quorum and waits for validation adoption to pull it
+   onto the canonical chain. The subsequent view-change demotion (preferred !=
+   local parent) is RIPPLED-FAITHFUL (RCLConsensus.cpp:313-316) and expected
+   for an observer that loses a round. This is correct behaviour, not a bug.
+2. AMPLIFIER (the fixable bug): while consensus dwelt in `Accepted` waiting for
+   validation recovery, should_run_end_consensus_reconciliation gated ONLY on
+   phase==Accepted, so the full preferred-LCL computation + cycle_obsolete_peer_
+   statuses re-ran on EVERY strand wake (heartbeats/proposals/validations) -
+   measured 540 log lines / dozens of identical preferred_lcl_already_local
+   evaluations in a single second. That burned the consensus strand's own CPU
+   and delayed the validation that would advance it, stretching a one-round
+   divergence into a 42s validated-seq gap.
+
+**Fix (commit ab86d3b0, deployed quaxar.edgetrigger-ab86d3b0):** edge-trigger
+the endConsensus/preferred-LCL reconciliation on a (closed_ledger_hash,
+valid_ledger_seq) signal. Within an Accepted dwell where neither changed and no
+registry completion arrived, the pass is a deterministic no-op and is skipped.
+Any real change still triggers it. rippled runs endConsensus once per accepted
+round, not per wake; this restores that cadence.
+
+**Verified result (edge-trigger vs parallel-apply baseline):**
+- Reconcile spin eliminated: max preferred_lcl_already_local per second = 1
+  (was dozens). Log lines during a divergence event 540 -> 299.
+- consensus_view_change_demotion events in 30m: 0.
+- The same observer round-loss recurred (19:16:53 veto) but recovery gap was
+  13s, down from 42s; validated chain resumed 3-4s lockstep immediately.
+- p99 validated-gap 4s (was 5s).
+
+**Honest status:** the self-inflicted spin that amplified recovery is fixed.
+The residual ~1/hr demotion is an observer deferring to the validator quorum
+after losing a round - correct, rippled-faithful behaviour. Eliminating it
+entirely would require this node to stop computing minority ledgers (a deeper
+consensus tx-set/close-time parity question for observers), which is separate
+from the acquisition/owner work and from this amplifier fix.
+Tests: 69 consensus + 189 inbound_ledgers + 124 network pass.
+Rollback: quaxar.parallelapply-2f4c5c11.
