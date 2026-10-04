@@ -643,3 +643,43 @@ consensus tx-set/close-time parity question for observers), which is separate
 from the acquisition/owner work and from this amplifier fix.
 Tests: 69 consensus + 189 inbound_ledgers + 124 network pass.
 Rollback: quaxar.parallelapply-2f4c5c11.
+
+## ITERATION (full rippled parity audit of the oscillation) — 2026-10-04 (late)
+
+GOAL: drive oscillations to 0 via rippled parity. Did an exhaustive, cited,
+line-by-line audit (incl. a dedicated sub-agent audit of close/accept timing).
+
+AUDIT RESULT — the brief full->(syncing/connected)->tracking->full dips are
+RIPPLED-FAITHFUL at every level:
+- Close/accept timing, ALL ConsensusParms (ledgerMIN_CLOSE/IDLE/MIN_CONSENSUS/
+  MAX_CONSENSUS/avalanche/minCONSENSUS_PCT=80), close-time resolution ladder and
+  effCloseTime/roundCloseTime rounding, and non-proposing observer dispute-vote
+  adoption (yays>nays) ALL MATCH rippled line-by-line (Consensus.h/.cpp,
+  ConsensusParms.h, LedgerTiming.h, DisputedTx.h). Only abnormal zero/negative
+  close-time edge cases differ; unreachable in normal testnet operation.
+- get_prev_ledger: consensusViewChange() when preferred != prev_ledger_id,
+  mode != WrongLedger == rippled RCLConsensus.cpp:303-317 exactly.
+- checkLastClosedLedger: peer_counts[our_hash]+=1 when mode>=Tracking;
+  getPreferredLCL; switchLedgers => demote; canBeCurrent/isCompatible gate before
+  demote; getLedgerByHash(resident)-first before acquire == rippled
+  NetworkOPs.cpp:2072-2162 exactly.
+- DECISIVE: rippled endConsensus (NetworkOPs.cpp) itself demotes to CONNECTED on
+  an LCL switch (ledgerChange=true) and re-promotes CONNECTED/SYNCING->TRACKING->
+  FULL over the NEXT 1-2 rounds (both re-promote blocks require !ledgerChange).
+  This produces the IDENTICAL brief full->...->full dip we observe. rippled
+  oscillates the same way.
+
+MEASURED (edgetrigger-ab86d3b0, 2.9h): full_pct=96.6% but dips total only ~26s
+over 2.9h (syncing dur_s=4.3 + tracking 21.6 across 14 transitions) = ~99.75%
+full. Close cadence in lockstep (2-5s, matches testnet 3.5s). Persistence fast
+(1.7-7.5ms/ledger, occasional 26-35ms). local-closed tracks validated (often +1
+ahead). Demotes ~5/hr: ~1.25/hr observer vetoes (minority ledger, correct
+quorum deference) + the rest local-closed momentarily trailing validated by 3-4
+on a heavier-ledger spike -> rippled-faithful switch+demote.
+
+CONCLUSION: "0 oscillations" and "full rippled parity" are in direct tension.
+The dips ARE rippled's behavior; eliminating them entirely requires DIVERGING
+from rippled (suppressing the LCL-switch demote), which the parity requirement
+forbids. The node is already ~99.75% full with 2-3s self-correcting dips, which
+matches rippled's endConsensus demote/re-promote cadence. No parity-preserving
+change can reach literally 0.
