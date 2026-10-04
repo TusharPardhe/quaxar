@@ -399,3 +399,23 @@ per-ledger node insertion/verification/write-encode from the owner thread onto
 the worker pool (keep the owner as lifecycle sequencer only), OR bound the
 owner's per-burst CPU work with frequent yields so consensus interleaves on the
 idle cores. This is a substantial acquisition-core refactor.
+
+## ITERATION 4 - read-notify storm fix (commit 4a57d61c + bounded-notify follow-up)
+perf (owner TID, dwarf) during stall on nudbhdr binary proved the owner's CPU
+was a FUTEX WAKE STORM (futex_wake/try_to_wake_up ~17%, spin_lock_slowpath 11%),
+top app frames async_fetch + NodeReadBroker::complete, NOT hashing/disk.
+Cause: submit_ready_to_node_store issued one async_fetch per node (lock +
+notify_one each) -> per-read wake storm during bursts.
+Fix C: Database::async_fetch_batch (one lock + bounded notify) + routed broker
+through it; follow-up bounded the wake to min(admitted, threads) (notify_all
+over-woke). Deployed quaxar.batchread-4a57d61c. Tests 114+21+250 pass.
+
+RESULT: storm reduced but stalls PERSIST; owner now 99.9% CPU. Re-profile shows
+CPU now spread across async_fetch_batch wake (still ~16%), MissingNodeContinuation
+::advance_with_budget (SHAMap traversal, 8.8%), NodeReadBroker::request_with_priority
+(8.3%), BrokerReadPort::try_submit (7%), TaggedCache::canonicalize_with +
+PartitionedUnorderedMap::get_mut (cache, ~9%), Instant::elapsed/clock_gettime (4.8%).
+=> owner single-threaded read-brokering + SHAMap traversal + cache ops for the
+whole acquisition, amplified by constant disk re-reads (node_object_cache
+disabled, 221M reads 100% miss). Deeper fix: reduce re-read volume (warm cache /
+retain) or parallelize traversal; next iteration.
