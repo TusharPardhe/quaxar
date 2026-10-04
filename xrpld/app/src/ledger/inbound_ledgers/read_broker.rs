@@ -731,18 +731,22 @@ impl NodeReadBroker {
     pub fn submit_ready_to_node_store(&self, store: &SHAMapStoreNodeStore) -> usize {
         let dispatches = self.take_ready_dispatches();
         let count = dispatches.len();
+        if count == 0 {
+            return 0;
+        }
+        // Build the whole batch, then submit under one read-queue lock + one
+        // wake. Submitting per-node here caused a futex wake storm that
+        // starved consensus during acquisition bursts.
+        let mut batch: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)> = Vec::with_capacity(count);
         for dispatch in dispatches {
             let key = dispatch.key();
             let completion = dispatch.into_completion();
             let work: Box<dyn AsyncReadWork> = Box::new(completion);
-            match store {
-                SHAMapStoreNodeStore::Single(database) => {
-                    database.async_fetch(key.hash, key.ledger_seq, work)
-                }
-                SHAMapStoreNodeStore::Rotating(database) => {
-                    database.async_fetch(key.hash, key.ledger_seq, work)
-                }
-            }
+            batch.push((key.hash, key.ledger_seq, work));
+        }
+        match store {
+            SHAMapStoreNodeStore::Single(database) => database.async_fetch_batch(batch),
+            SHAMapStoreNodeStore::Rotating(database) => database.async_fetch_batch(batch),
         }
         count
     }

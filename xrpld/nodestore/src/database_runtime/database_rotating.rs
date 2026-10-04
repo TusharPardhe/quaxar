@@ -663,6 +663,13 @@ impl DatabaseRotatingImp {
         self.database.async_fetch(hash, ledger_seq, work);
     }
 
+    pub fn async_fetch_batch(
+        &self,
+        requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>,
+    ) {
+        self.database.async_fetch_batch(requests);
+    }
+
     pub fn stop(&self) {
         self.database.stop();
         let (writable, archive) = {
@@ -810,6 +817,10 @@ impl DatabaseTrait for DatabaseRotatingImp {
 
     fn async_fetch(&self, hash: Uint256, ledger_seq: u32, work: Box<dyn AsyncReadWork>) {
         DatabaseRotatingImp::async_fetch(self, hash, ledger_seq, work);
+    }
+
+    fn async_fetch_batch(&self, requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>) {
+        DatabaseRotatingImp::async_fetch_batch(self, requests);
     }
 
     fn stop(&self) {

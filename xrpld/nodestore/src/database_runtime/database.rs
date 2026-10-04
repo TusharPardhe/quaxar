@@ -199,6 +199,16 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
 
     fn async_fetch(&self, hash: Uint256, ledger_seq: u32, work: Box<dyn AsyncReadWork>);
 
+    /// Enqueue a batch of async reads. The default implementation falls back
+    /// to per-item `async_fetch`; `DatabaseRuntime`-backed implementations
+    /// override this to acquire the read-queue lock once and wake once,
+    /// avoiding a per-read futex wake storm during acquisition bursts.
+    fn async_fetch_batch(&self, requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>) {
+        for (hash, ledger_seq, work) in requests {
+            self.async_fetch(hash, ledger_seq, work);
+        }
+    }
+
     fn stop(&self);
 
     fn is_stopping(&self) -> bool;
@@ -677,6 +687,95 @@ impl DatabaseRuntime {
             }
         };
         if let Some(work) = rejected {
+            self.inner
+                .read_callbacks_cancelled
+                .fetch_add(1, Ordering::Relaxed);
+            deliver_rejected_async_work(&self.inner, work);
+        }
+    }
+
+    /// Enqueue a batch of async reads under a SINGLE acquisition of the read
+    /// queue mutex and a SINGLE condvar wake, instead of one lock+notify per
+    /// node as repeated `async_fetch` calls would do.
+    ///
+    /// During a multi-ledger acquisition burst the broker submits thousands of
+    /// physical reads at once. Issuing them individually produced a futex
+    /// wake storm (`notify_one` per read -> `try_to_wake_up`/`futex_wake`
+    /// dominating the profile and `native_queued_spin_lock_slowpath`
+    /// contention), which starved the consensus runtime and stalled the
+    /// validated ledger. Batching collapses that to one lock hold and one
+    /// `notify_all`, matching rippled's batched NodeStore read scheduling.
+    ///
+    /// Admission limits (key/callback/byte) are evaluated per item exactly as
+    /// in `async_fetch`; rejected items are delivered as cancelled after the
+    /// lock is released.
+    pub fn async_fetch_batch(
+        &self,
+        requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>,
+    ) {
+        if requests.is_empty() {
+            return;
+        }
+        let mut rejected: Vec<Box<dyn AsyncReadWork>> = Vec::new();
+        let mut admitted = 0usize;
+        {
+            let mut read_state = self
+                .inner
+                .read_state
+                .lock()
+                .expect("nodestore read queue mutex must not be poisoned");
+            let stopping = self.inner.is_stopping();
+            for (hash, ledger_seq, work) in requests {
+                let work_bytes = std::mem::size_of_val(work.as_ref())
+                    .saturating_add(std::mem::size_of::<AsyncReadRequest>());
+                let new_hash = !read_state.queue.contains_key(&hash);
+                let full = new_hash && read_state.queue.len() >= self.inner.read_queue_key_limit;
+                let callbacks_full = self
+                    .inner
+                    .outstanding_read_callbacks
+                    .load(Ordering::Acquire)
+                    >= self.inner.read_queue_callback_limit;
+                let bytes_full = self
+                    .inner
+                    .outstanding_read_bytes
+                    .load(Ordering::Acquire)
+                    .checked_add(work_bytes)
+                    .is_none_or(|total| total > self.inner.read_queue_byte_limit);
+                if stopping || full || callbacks_full || bytes_full {
+                    self.inner
+                        .read_queue_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    rejected.push(work);
+                    continue;
+                }
+                self.inner
+                    .outstanding_read_callbacks
+                    .fetch_add(1, Ordering::AcqRel);
+                self.inner
+                    .outstanding_read_bytes
+                    .fetch_add(work_bytes, Ordering::AcqRel);
+                read_state
+                    .queue
+                    .entry(hash)
+                    .or_default()
+                    .push(AsyncReadRequest {
+                        ledger_seq,
+                        work,
+                        _permit: ReadWorkPermit {
+                            inner: Arc::clone(&self.inner),
+                            bytes: work_bytes,
+                        },
+                    });
+                admitted += 1;
+            }
+            // One wake for the whole batch. notify_all lets every idle worker
+            // pick up part of the batch; a single notify_one would serialize
+            // the batch on one worker.
+            if admitted > 0 {
+                self.inner.read_condvar.notify_all();
+            }
+        }
+        for work in rejected {
             self.inner
                 .read_callbacks_cancelled
                 .fetch_add(1, Ordering::Relaxed);
