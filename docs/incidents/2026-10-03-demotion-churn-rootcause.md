@@ -419,3 +419,30 @@ PartitionedUnorderedMap::get_mut (cache, ~9%), Instant::elapsed/clock_gettime (4
 whole acquisition, amplified by constant disk re-reads (node_object_cache
 disabled, 221M reads 100% miss). Deeper fix: reduce re-read volume (warm cache /
 retain) or parallelize traversal; next iteration.
+
+## ITERATION 4 - DEEPEST FINDING: 27k NodeStore reads/sec, cache ineffective
+Live get_counts: node_reads_total +543,000 in ~20s = ~27,000 reads/sec, all
+node_object_cache_hits=0 (that cache is disabled). Every acquisition is
+reason=Consensus phase=Full (~1/round) - the node re-reads huge SHAMap state
+from disk EACH consensus round through the read-broker -> owner pipeline, which
+is what pegs the owner at 99.9% CPU.
+
+node_object_cache disabled IS faithful to rippled's rotating store, BUT rippled
+relies on the SHAMap TreeNodeCache holding DESERIALIZED nodes so traversals do
+NOT re-read from disk. Our 27k reads/s + hits=0 means SHAMap traversal is
+hitting the disk-backed NodeStore instead of the warm TreeNodeCache. THE REAL
+ROOT CAUSE candidate: SHAMap read path is not effectively served by the
+TreeNodeCache (cache miss/churn), so every traversal re-reads from NuDB.
+
+NEXT (iteration 5 target): verify the SHAMap node read path checks TreeNodeCache
+before NodeStore, and why hit rate is effectively zero / why the tree cache
+churns (earlier: 14M entries swept hard). If traversals were cache-served,
+NodeStore reads would be near-zero and the owner would not saturate. Compare to
+rippled SHAMap::fetchNodeNT / canonicalize against family treecache. This is the
+full-fledged fix: make SHAMap reads hit the in-memory cache, eliminating the
+27k/s disk-read pipeline that starves consensus.
+
+Committed fixes this round (all perf-verified contention reductions, deployed):
+3979ff71 validation-sync, 21ce4b92 fact-submission, be3524bf nudb-header-lockfree,
+4a57d61c + b0680510 batched/bounded read notify. Each removed a real bottleneck;
+the remaining one is cache-ineffectiveness causing 27k disk reads/s.
