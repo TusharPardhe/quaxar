@@ -353,3 +353,25 @@ brief map lookups; move per-ledger packet/read-completion processing off the
 global lock onto per-entry locks (+ job dispatch), matching rippled's
 InboundLedgers map-lock vs per-InboundLedger-lock split. This is a substantial
 acquisition-core refactor; next iteration begins it.
+
+## ITERATION 2 (round 2) - fact-submission fix deployed; refined root cause
+Deployed quaxar.lockfix-21ce4b92 (commit 21ce4b92): submit_coordinator_fact
+hybrid (try_lock sync fast-path + non-blocking control-lane fallback) for all
+consensus/NetworkOps fact submitters. Tests green (189+69+250+7).
+
+RESULT: stalls REDUCED but NOT eliminated (still a 45s gap + 10-20s stalls).
+Enhanced thread-stack capture during a 20s stall (00:08:30, seq stuck 21259317)
+shows the REFINED root cause: ALL tokio-rt-worker (consensus runtime) threads +
+networkops-stra + db-prefetch are PARKED in futex_wait, while acquisition-own
+is the ONLY RUNNING thread (st=R, cycling futex_wake/futex_wait). i.e. the
+acquisition owner MONOPOLIZES progress: it processes a whole multi-ledger
+acquisition burst in ONE serialized drain (inserting millions of SHAMap nodes +
+persistence, slowed by node_object_cache-disabled 100% disk reads), and
+consensus is starved until the drain finishes.
+
+This is deeper than fact-submission: rippled runs per-ledger gotData/runData as
+SEPARATE JobQueue jobs that interleave with consensus; our owner drains the
+whole burst monolithically. FIX (next): break the owner's burst drain into
+bounded/interleavable units (yield between ledgers so consensus runs), or move
+heavy per-ledger processing off the owner thread onto the job pool like
+rippled's JtLedgerData. Substantial; next iteration.
