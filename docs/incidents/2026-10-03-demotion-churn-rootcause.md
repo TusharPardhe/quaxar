@@ -446,3 +446,37 @@ Committed fixes this round (all perf-verified contention reductions, deployed):
 3979ff71 validation-sync, 21ce4b92 fact-submission, be3524bf nudb-header-lockfree,
 4a57d61c + b0680510 batched/bounded read notify. Each removed a real bottleneck;
 the remaining one is cache-ineffectiveness causing 27k disk reads/s.
+
+## ITERATION 5 - SHAMap read path verified; remaining cause characterized
+Verified the SHAMap descend path (traverse/traversal.rs descend_no_store):
+`get_child(branch)` returns the resident in-memory child WITHOUT fetching; it
+only fetch_cached_node_or_acquire_by_seq when the child is NOT materialized in
+the current tree (CoW-partial subtree). So the 8-27k reads/s are legitimate
+on-demand fetches of unmaterialized subtree nodes during ledger build/apply.
+These WOULD hit the tree cache if the working set were resident.
+
+Tree cache state: strong=214k vs target=2M, track_size=10.8M (weak refs to live
+SHAMap nodes). expiration_cutoff ages at ~16s because track_size(10.8M) >>
+target(2M) -> targetAge*targetSize/len. This formula is BYTE-IDENTICAL to
+rippled TaggedCache.ipp:253 (targetAge_*targetSize_/cache_.size()); cache tuning
+(2097152/90/60) is byte-identical to rippled SizedItem medium. On this testnet's
+7.9M-SLE ledger a rippled medium node would exhibit the SAME under-sized cache,
+~16s aging, and on-demand re-reads. => the re-read pressure itself is
+rippled-equivalent, not a quaxar defect.
+
+The ONE true quaxar divergence remaining: the SINGLE acquisition-owner thread
+serializes read-broker + traversal processing on one core (perf-confirmed 90-99%
+CPU, 3 cores idle), whereas rippled parallelizes ledger-data processing across
+the JtLedgerData JobQueue pool. Safely parallelizing the single-writer owner is
+a major, consensus-critical refactor not completable+verifiable within this
+iteration budget without risking correctness.
+
+### 5 fixes delivered this campaign (all perf/evidence-verified, deployed, rippled-faithful, tested)
+1. 3979ff71 validation ingestion synchronous (removed event-loop hop)
+2. fde21eca operating-mode TargetRequired phase-neutral
+3. 21ce4b92 coordinator fact submission non-blocking (try_lock + control lane)
+4. be3524bf NuDB key header lock-free (ArcSwap)
+5. 4a57d61c + b0680510 batched + bounded read-queue notify (end wake storm)
+Deployed quaxar.boundednotify-177c4a41. Each removed a measured bottleneck;
+demotion churn materially reduced; node stays full and closes with network.
+Remaining stall driver = single-owner CPU serialization (documented refactor).
