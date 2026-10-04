@@ -553,3 +553,44 @@ a separate larger refactor. networkops-stra still shows futex_do_wait during
 these bursts but the frequency/duration is now low enough that demotions are
 materially reduced.
 Rollback binary: quaxar.decodeoffload-24907eb7.
+
+## ITERATION (owner-parallelization: rippled JtLedgerData model) — 2026-10-04
+
+**Fix landed (commit 2f4c5c11, deployed quaxar.parallelapply-2f4c5c11):**
+The single owner strand applied every session's batched NodeStore read
+completions serially (plan.on_read -> engine.apply_read SHAMap attach) then ran
+each session's traversal. Perf during the residual post-status-mirror stalls
+showed the owner CPU-bound here (async_fetch_batch ~20%, advance_with_budget
+~10%), serializing all in-flight acquisitions behind one thread.
+
+rippled runs each InboundLedger::runData as an independent JtLedgerData JobQueue
+job (JobTypes.h: add(JtLedgerData,"ledgerData",3,...)) -> up to 3 ledgers'
+received-data nodes decoded/attached in parallel. Mirrored faithfully:
+on_read_batch (runner.rs) now groups read completions by session and applies
+each distinct session's reads on a bounded 3-thread pool (LEDGER_DATA_PARALLELISM
+= 3; threads named ledger-data-{0,1,2}). Safe because each session owns a
+disjoint SHAMap tree (engine: Box<dyn TreeEngine + Send + Sync>) and apply_read
+touches only that session's engine. Header reads + all shared runner state (ids,
+peer_view, stats, effects, resume traversal via run_plan_turn) stay serial on the
+owner (single-writer discipline preserved). Single-session batches apply inline
+(no pool cost). Resume/stale fold back serially via BTreeSet -> deterministic.
+
+**Verified result (1.04h steady state on testnet, vs status-mirror baseline):**
+- full_tr = 1 (reached full ONCE, never re-demoted).
+- Demotions: 0/hr (status-mirror ~3-5/hr; original baseline ~10/hr).
+- Validated-gap over 1017 ledgers (60m): median 3s p90 4s p99 5s MAX 5s;
+  ZERO gaps >=8s (status-mirror had 5 stalls >=8s / 1578 ledgers incl 13-26s).
+- Zero wchan stall captures across the whole window (networkops-stra never
+  futex-blocked behind the owner).
+- 3 ledger-data pool threads alive and stable.
+
+Tests: 250 acquisition + 189 inbound_ledgers + 69 consensus pass; full build.
+(2 pre-existing unrelated failures in bootstrap/overlay_runtime predate this,
+verified via git stash.)
+Rollback: quaxar.statusmirror-960cce19 (status-mirror only) or
+quaxar.decodeoffload-24907eb7.
+
+**NET across the whole investigation:** demotions ~10/hr -> 0/hr; validated-seq
+max gap 37-54s -> 5s; stalls eliminated. Two root causes fixed: (1) consensus
+status reads blocking on the owner's drain mutex (status-mirror), (2) single-
+threaded owner SHAMap apply throughput (JtLedgerData parallelization).
