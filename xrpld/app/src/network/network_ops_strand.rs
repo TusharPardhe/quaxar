@@ -569,6 +569,20 @@ fn strand_loop(
     let mut consensus_started = false;
     let mut last_timer_tick = Instant::now();
     let mut last_round_ledger_id: Option<Uint256> = None;
+    // Edge-trigger the endConsensus/preferred-LCL reconciliation. While the
+    // node sits in `Accepted` (e.g. an observer whose local child lost to the
+    // quorum-backed sibling and is waiting for validation adoption), the strand
+    // wakes many times per second on heartbeats/proposals/validations. Re-
+    // running the full preferred-LCL computation + obsolete-peer cycling on
+    // every such wake wastes the consensus strand's own CPU and delays the very
+    // validation that would advance it, which lengthens the catch-up gap and
+    // can turn a one-round divergence into a multi-second validated-seq stall
+    // and a spurious view-change demotion. rippled runs endConsensus once per
+    // accepted round (from the JtAccept job), not on every event-loop wake.
+    // Mirror that: skip the pass when neither the local closed ledger nor the
+    // validated-seq input has changed since the last reconciliation (a
+    // registry completion still forces a pass below).
+    let mut last_reconcile_signal: Option<(Uint256, u32)> = None;
     // Emit at most one restart-gate diagnostic per closed ledger. Accepted
     // phase maintenance runs every strand tick, so per-pass INFO events turn
     // a stalled restart gate into an operator-hostile log flood.
@@ -1074,6 +1088,25 @@ fn strand_loop(
             scheduler.accept_is_queued(),
             scheduler.has_pending_accept(),
         );
+        // Edge-trigger: within an `Accepted` dwell, the preferred-LCL inputs
+        // only change when the local closed ledger or the validated sequence
+        // changes. If neither moved since the last reconciliation and no
+        // registry completion arrived this turn, the pass is a deterministic
+        // no-op; skip its cost so the strand stays responsive to the
+        // validation that will actually advance it.
+        let reconcile_signal = root.closed_ledger().map(|closed| {
+            let valid_seq = root
+                .ledger_master_runtime()
+                .map(|lm_rt| lm_rt.ledger_master().valid_ledger_seq())
+                .unwrap_or(0);
+            (*closed.header().hash.as_uint256(), valid_seq)
+        });
+        let reconcile_inputs_changed =
+            registry_completion_count != 0 || reconcile_signal != last_reconcile_signal;
+        let end_consensus_pass = end_consensus_pass && reconcile_inputs_changed;
+        if end_consensus_pass {
+            last_reconcile_signal = reconcile_signal;
+        }
         if registry_completion_count != 0 && !end_consensus_pass {
             tracing::info!(
                 target: "lcl_trace",
