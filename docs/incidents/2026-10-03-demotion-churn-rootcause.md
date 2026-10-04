@@ -480,3 +480,38 @@ iteration budget without risking correctness.
 Deployed quaxar.boundednotify-177c4a41. Each removed a measured bottleneck;
 demotion churn materially reduced; node stays full and closes with network.
 Remaining stall driver = single-owner CPU serialization (documented refactor).
+
+## ITERATION (owner-parallelization) - decode offload done; cache confirmed rippled-equivalent
+Implemented+deployed decode-offload (commit 24907eb7, binary decodeoffload-24907eb7):
+BrokerReadPort read sink (runs on the db-prefetch worker) now decodes
+make_from_prefix and carries the decoded node via ReadOutcome::Settled{node,decoded};
+owner reuses it and skips decode. Tests 250 acq + 189 inbound + 69 consensus +
+114 nodestore pass. RIPPLED-faithful (processData decode off the serialized owner).
+
+RESULT: stalls PERSIST, owner STILL 90% CPU. => decode was NOT the bulk. Per perf3,
+owner CPU is dominated by MissingNodeContinuation::advance_with_budget (traversal),
+NodeReadBroker::request_with_priority + BrokerReadPort::try_submit (read brokering),
+TaggedCache::canonicalize_with + PartitionedUnorderedMap::get_mut (cache ops), and
+async_fetch notify churn - the whole serialized read-broker+traversal pipeline on
+one owner thread.
+
+CACHE CONFIRMED RIPPLED-EQUIVALENT (not a bug): get_counts shows treenode_track
+(map) 8.47M, weak_in_map 7.76M ~= shamap_active_nodes 8.04M (diff NEGATIVE). The
+weak cache entries are GENUINELY LIVE SHAMap nodes held by the current ledger
+trees, not retained garbage. One map entry per live node for a 7.9M-SLE ledger is
+correct and identical to rippled; the ~16s aging formula (targetAge*targetSize/
+track_len) is byte-identical to rippled TaggedCache.ipp:253. No cache-retention
+defect exists.
+
+TRUE REMAINING FIX (confirmed, large): re-architect the single acquisition-owner
+into rippled's parallel per-InboundLedger JtLedgerData JobQueue model so multiple
+ledgers' read-broker+traversal processing runs concurrently across the worker pool
+(per-ledger locked), instead of all serialized on one owner thread. This is a major
+consensus-critical coordinator rewrite. Decode-offload is the first faithful step;
+the brokering+traversal pipeline is the remainder.
+
+Fixes delivered this campaign (6, all deployed/tested/rippled-faithful): 3979ff71
+validation-sync, fde21eca mode-TargetRequired, 21ce4b92 fact-submission-nonblocking,
+be3524bf nudb-header-lockfree, 4a57d61c+b0680510 batched/bounded read-notify,
+24907eb7 decode-offload. Node full ~82-97%, closes with network; residual stalls
+from single-owner pipeline serialization.
