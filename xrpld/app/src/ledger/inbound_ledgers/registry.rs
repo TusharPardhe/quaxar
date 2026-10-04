@@ -775,6 +775,24 @@ pub struct InboundLedgers {
     /// Overlay ingress intentionally does not use this lock; it holds the
     /// separately published immutable [`CoordinatorIngress`] capability.
     coordinator: Mutex<Option<ProductionAdapter>>,
+    /// Lock-free published mirror of the coordinator's latest `RunnerSnapshot`
+    /// and installed flag. Consensus/NetworkOps read coordinator phase/status
+    /// every round via `coordinator_snapshot`/`coordinator_installed`; reading
+    /// those through `self.coordinator.lock()` blocked the consensus strand
+    /// (`networkops-strand`) on the SINGLE acquisition owner that holds that
+    /// mutex for the full multi-second drain, stalling the validated ledger
+    /// and causing full->syncing demotions. The owner republishes this mirror
+    /// at the end of every drain turn, so status reads are lock-free and never
+    /// contend with the owner's CPU-bound processing (rippled reads operating
+    /// mode/phase from published atomics, not by locking the inbound-ledger
+    /// owner).
+    coordinator_installed_flag: std::sync::atomic::AtomicBool,
+    coordinator_snapshot_cell: arc_swap::ArcSwapOption<RunnerSnapshot>,
+    /// Lock-free mirror of the validation-recovery latch (target, candidate)
+    /// published by the owner, so the consensus strand reads it without the
+    /// coordinator mutex.
+    coordinator_recovery_latch_cell:
+        arc_swap::ArcSwapOption<(Option<(Uint256, u32)>, Option<(Uint256, u32)>)>,
     /// Immutable route/admission capability for overlay `TmLedgerData` ingress.
     /// It is published before any request effect can synchronously yield a
     /// reply, so ingress never re-enters the mutable coordinator lock.
@@ -898,6 +916,9 @@ impl InboundLedgers {
             recovery_lcl_decision: Mutex::new(None),
             lifecycle: Arc::new(AcquisitionLifecycleCounters::default()),
             coordinator: Mutex::new(None),
+            coordinator_installed_flag: std::sync::atomic::AtomicBool::new(false),
+            coordinator_snapshot_cell: arc_swap::ArcSwapOption::empty(),
+            coordinator_recovery_latch_cell: arc_swap::ArcSwapOption::empty(),
             coordinator_ingress: RwLock::new(None),
             coordinator_wake: RwLock::new(None),
             coordinator_origins: CoordinatorSessionOrigins::default(),
@@ -955,7 +976,9 @@ impl InboundLedgers {
 
     /// Whether the production coordinator is installed.
     pub fn coordinator_installed(&self) -> bool {
-        self.coordinator.lock().expect("coordinator lock").is_some()
+        // Lock-free: never block the consensus strand on the owner's drain.
+        self.coordinator_installed_flag
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The active overlay peers the coordinator request port may deliver to.
@@ -1053,6 +1076,7 @@ impl InboundLedgers {
                 .write()
                 .expect("coordinator wake write") = Some(wake);
             *guard = Some(adapter);
+            self.publish_coordinator_mirror(&guard);
             true
         } else {
             false
@@ -1104,6 +1128,9 @@ impl InboundLedgers {
             handled += coordinator.drain();
             let has_more = coordinator.drain_has_more();
             let failures = coordinator.take_terminal_failures();
+            // Republish the lock-free status mirror while the guard is held so
+            // consensus/NetworkOps status reads never block on this owner.
+            self.publish_coordinator_mirror(&guard);
             ((handled, has_more), failures)
         };
         self.record_coordinator_failures(failures);
@@ -1184,7 +1211,9 @@ impl InboundLedgers {
             coordinator.refresh_peers(self.coordinator_peer_snapshot());
             coordinator.connectivity(peers);
             coordinator.owner_wake().notify();
-            coordinator.take_terminal_failures()
+            let __failures = coordinator.take_terminal_failures();
+            self.publish_coordinator_mirror(&guard);
+            __failures
         };
         self.record_coordinator_failures(failures);
         true
@@ -1201,7 +1230,9 @@ impl InboundLedgers {
             coordinator.refresh_peers(self.coordinator_peer_snapshot());
             coordinator.transport_connectivity(peers);
             coordinator.owner_wake().notify();
-            coordinator.take_terminal_failures()
+            let __failures = coordinator.take_terminal_failures();
+            self.publish_coordinator_mirror(&guard);
+            __failures
         };
         self.record_coordinator_failures(failures);
         true
@@ -1221,7 +1252,9 @@ impl InboundLedgers {
                 coordinator.consensus_quorum_lost();
             }
             coordinator.owner_wake().notify();
-            coordinator.take_terminal_failures()
+            let __failures = coordinator.take_terminal_failures();
+            self.publish_coordinator_mirror(&guard);
+            __failures
         };
         self.record_coordinator_failures(failures);
         true
@@ -1274,6 +1307,9 @@ impl InboundLedgers {
                 coordinator.handle_fact(event);
                 coordinator.owner_wake().notify();
                 let failures = coordinator.take_terminal_failures();
+                // Keep the lock-free status mirror fresh for immediate
+                // consensus reads after a synchronous fact application.
+                self.publish_coordinator_mirror(&guard);
                 drop(guard);
                 self.record_coordinator_failures(failures);
                 true
@@ -1344,7 +1380,9 @@ impl InboundLedgers {
                 );
             }
             coordinator.owner_wake().notify();
-            coordinator.take_terminal_failures()
+            let __failures = coordinator.take_terminal_failures();
+            self.publish_coordinator_mirror(&guard);
+            __failures
         };
         self.record_coordinator_failures(failures);
         true
@@ -1436,7 +1474,9 @@ impl InboundLedgers {
                 }
             }
             coordinator.owner_wake().notify();
-            coordinator.take_terminal_failures()
+            let __failures = coordinator.take_terminal_failures();
+            self.publish_coordinator_mirror(&guard);
+            __failures
         };
         self.record_coordinator_failures(failures);
         true
@@ -1554,11 +1594,41 @@ impl InboundLedgers {
 
     /// The coordinator's immutable observer snapshot, for status consumers.
     pub fn coordinator_snapshot(&self) -> Option<RunnerSnapshot> {
-        self.coordinator
-            .lock()
-            .expect("coordinator lock")
-            .as_ref()
-            .map(|adapter| adapter.snapshot())
+        // Lock-free: read the mirror the owner republishes after each drain,
+        // so consensus phase/status reads never block on the owner's
+        // multi-second CPU-bound drain holding `self.coordinator`.
+        self.coordinator_snapshot_cell
+            .load_full()
+            .map(|snapshot| (*snapshot).clone())
+    }
+
+    /// Republish the lock-free coordinator mirror. Called by the owner after
+    /// each drain turn (and at install) so lock-free readers observe fresh
+    /// phase/status without contending for the owner's mutex.
+    fn publish_coordinator_mirror(&self, guard: &Option<ProductionAdapter>) {
+        match guard.as_ref() {
+            Some(adapter) => {
+                self.coordinator_snapshot_cell
+                    .store(Some(Arc::new(adapter.snapshot())));
+                let exact = |target: Option<acquisition::LedgerTarget>| {
+                    target.and_then(|target| target.sequence().map(|seq| (target.hash(), seq)))
+                };
+                let latch = (
+                    exact(adapter.current_validation_recovery_target()),
+                    exact(adapter.current_validation_recovery_candidate()),
+                );
+                self.coordinator_recovery_latch_cell
+                    .store(Some(Arc::new(latch)));
+                self.coordinator_installed_flag
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            None => {
+                self.coordinator_snapshot_cell.store(None);
+                self.coordinator_recovery_latch_cell.store(None);
+                self.coordinator_installed_flag
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
     }
 
     /// Read the coordinator's exact validation-recovery latch without driving
@@ -1567,17 +1637,12 @@ impl InboundLedgers {
     pub fn coordinator_validation_recovery_latch(
         &self,
     ) -> (Option<(Uint256, u32)>, Option<(Uint256, u32)>) {
-        let guard = self.coordinator.lock().expect("coordinator lock");
-        let Some(coordinator) = guard.as_ref() else {
-            return (None, None);
-        };
-        let exact = |target: Option<acquisition::LedgerTarget>| {
-            target.and_then(|target| target.sequence().map(|seq| (target.hash(), seq)))
-        };
-        (
-            exact(coordinator.current_validation_recovery_target()),
-            exact(coordinator.current_validation_recovery_candidate()),
-        )
+        // Lock-free: read the owner-published mirror so the consensus strand
+        // does not block on the owner's drain.
+        self.coordinator_recovery_latch_cell
+            .load_full()
+            .map(|latch| *latch)
+            .unwrap_or((None, None))
     }
 
     #[cfg(test)]
@@ -1714,9 +1779,11 @@ impl InboundLedgers {
                 ?reason,
                 "coordinator_acquire: request emitted no new session effect (coalesced or rejected)"
             );
+            self.publish_coordinator_mirror(&coordinator_guard);
             return None;
         };
         coordinator.owner_wake().notify();
+        self.publish_coordinator_mirror(&coordinator_guard);
         drop(coordinator_guard);
         tracing::info!(
             target: "inbound_ledger",
