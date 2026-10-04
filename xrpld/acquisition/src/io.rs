@@ -6,7 +6,9 @@
 //! a typed event the coordinator validates before it may mutate a session.
 
 use basics::sha_map_hash::SHAMapHash;
+use basics::intrusive_pointer::SharedIntrusive;
 use bytes::Bytes;
+use shamap::tree_node::SHAMapTreeNode;
 
 use crate::id::StoreGeneration;
 use crate::identity::{OperationKind, OperationRef};
@@ -84,17 +86,62 @@ impl ReadRequest {
 }
 
 /// The outcome of one brokered read completion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ReadOutcome {
     /// The physical read settled. `node` is `None` when the key was not present
     /// in the store generation.
-    Settled { node: Option<Bytes> },
+    ///
+    /// `decoded` optionally carries the node already parsed from `node` on the
+    /// NodeStore read worker thread (rippled `processData` runs the per-node
+    /// decode on a `JtLedgerData` JobQueue worker, not on the serialized
+    /// acquisition owner). When present, the owner attaches it directly and
+    /// skips the expensive `make_from_prefix` decode, keeping the single-writer
+    /// owner off the CPU-heavy deserialize path. It is always derived from
+    /// `node` for the same hash, so equality is defined by `node` alone.
+    Settled {
+        node: Option<Bytes>,
+        decoded: Option<SharedIntrusive<SHAMapTreeNode>>,
+    },
     /// The session or operation is no longer live; the completion is stale and
     /// must not mutate a session.
     Stale,
     /// The read was explicitly cancelled.
     Cancelled,
 }
+
+impl ReadOutcome {
+    /// A settled completion carrying only raw bytes (no pre-decoded node).
+    pub const fn settled(node: Option<Bytes>) -> Self {
+        Self::Settled {
+            node,
+            decoded: None,
+        }
+    }
+
+    /// A settled completion carrying raw bytes plus a node already decoded on
+    /// the read worker.
+    pub const fn settled_decoded(
+        node: Option<Bytes>,
+        decoded: Option<SharedIntrusive<SHAMapTreeNode>>,
+    ) -> Self {
+        Self::Settled { node, decoded }
+    }
+}
+
+impl PartialEq for ReadOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        // `decoded` is a pure function of `node` for a fixed hash, so equality
+        // is defined by the raw payload and variant alone.
+        match (self, other) {
+            (Self::Settled { node: a, .. }, Self::Settled { node: b, .. }) => a == b,
+            (Self::Stale, Self::Stale) => true,
+            (Self::Cancelled, Self::Cancelled) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ReadOutcome {}
 
 /// A typed read completion reported by the broker. The coordinator validates
 /// `operation` against the expected in-flight read before mutating state.

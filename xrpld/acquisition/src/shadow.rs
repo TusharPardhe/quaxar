@@ -1087,7 +1087,7 @@ impl ShadowRunner {
         // traversal reads conservatively retain local-scan ownership because
         // their completion may synchronously schedule the next 512-read batch.
         if operation_kind == OperationKind::HeaderRead {
-            mirror.local_scan_in_flight = matches!(outcome, ReadOutcome::Settled { node: Some(_) });
+            mirror.local_scan_in_flight = matches!(outcome, ReadOutcome::Settled { node: Some(_), .. });
         } else {
             mirror.local_scan_in_flight = true;
         }
@@ -2198,7 +2198,7 @@ mod tests {
             crate::id::OperationId::new(1),
             crate::id::OperationGeneration::new(1),
         );
-        ReadCompletion::new(operation, ReadOutcome::Settled { node: None })
+        ReadCompletion::new(operation, ReadOutcome::settled(None))
     }
 
     fn header_read_completion(session: SessionRef) -> ReadCompletion {
@@ -2208,7 +2208,7 @@ mod tests {
             OperationId::new(2),
             OperationGeneration::new(2),
         );
-        ReadCompletion::new(operation, ReadOutcome::Settled { node: None })
+        ReadCompletion::new(operation, ReadOutcome::settled(None))
     }
 
     fn write_completion(session: SessionRef, outcome: WriteOutcome) -> WriteCompletion {

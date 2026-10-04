@@ -2829,7 +2829,7 @@ impl CoordinatorRunner {
                 return effects;
             }
             let engine = match completion.outcome() {
-                crate::io::ReadOutcome::Settled { node: Some(data) } => {
+                crate::io::ReadOutcome::Settled { node: Some(data), .. } => {
                     self.plan_seed.build_stored_header(session, data)
                 }
                 _ => None,
@@ -5972,7 +5972,7 @@ mod tests {
             _ => None,
         }) {
             replay.extend(runner.handle_event(AcquisitionEvent::ReadCompleted(
-                ReadCompletion::new(operation, ReadOutcome::Settled { node: None }),
+                ReadCompletion::new(operation, ReadOutcome::settled(None)),
             )));
         }
         assert_eq!(
@@ -6956,7 +6956,7 @@ mod tests {
             .expect("anchor starts with a local header probe");
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             header_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
 
         runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
@@ -7754,7 +7754,7 @@ mod tests {
         );
         let _ = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(runner.snapshot().plan_turns() > plan_turns);
         assert_eq!(runner.snapshot().stale_events(), 0);
@@ -7840,7 +7840,7 @@ mod tests {
             _ => None,
         }) {
             effects.extend(runner.handle_event(AcquisitionEvent::ReadCompleted(
-                ReadCompletion::new(operation, ReadOutcome::Settled { node: None }),
+                ReadCompletion::new(operation, ReadOutcome::settled(None)),
             )));
         }
         effects
@@ -7859,7 +7859,7 @@ mod tests {
             _ => None,
         }) {
             effects.extend(runner.handle_event(AcquisitionEvent::ReadCompleted(
-                ReadCompletion::new(operation, ReadOutcome::Settled { node: None }),
+                ReadCompletion::new(operation, ReadOutcome::settled(None)),
             )));
         }
         effects
@@ -7902,7 +7902,7 @@ mod tests {
                 _ => None,
             }) {
                 effects.extend(runner.handle_event(AcquisitionEvent::ReadCompleted(
-                    ReadCompletion::new(operation, ReadOutcome::Settled { node: None }),
+                    ReadCompletion::new(operation, ReadOutcome::settled(None)),
                 )));
             }
         }
@@ -7934,7 +7934,7 @@ mod tests {
             })
             .expect("latest consensus acquisition probes the resident header");
         consensus.extend(runner.handle_event(AcquisitionEvent::ReadCompleted(
-            ReadCompletion::new(consensus_header, ReadOutcome::Settled { node: None }),
+            ReadCompletion::new(consensus_header, ReadOutcome::settled(None)),
         )));
         assert!(
             consensus
@@ -8410,7 +8410,7 @@ mod tests {
             .expect("validation recovery starts with a header probe");
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             header_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
 
         let preferred = target(201);
@@ -8697,7 +8697,7 @@ mod tests {
             .expect("first acquisition probes the resident header");
         let _ = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             first_header,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         runner.release_session_request_credits(first_session);
         let synthetic_sessions = [
@@ -8776,7 +8776,7 @@ mod tests {
             .expect("older validation target starts behind the full window");
         let _ = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             older_header,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
 
         let validation = target(10_000);
@@ -8806,7 +8806,7 @@ mod tests {
         assert_eq!(runner.phase(), &full);
 
         let queued_base = runner.handle_event(AcquisitionEvent::ReadCompleted(
-            ReadCompletion::new(validation_header, ReadOutcome::Settled { node: None }),
+            ReadCompletion::new(validation_header, ReadOutcome::settled(None)),
         ));
         assert!(
             queued_base
@@ -9230,7 +9230,7 @@ mod tests {
             for read in read_effects(&effects) {
                 let _ = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
                     read.operation(),
-                    ReadOutcome::Settled { node: None },
+                    ReadOutcome::settled(None),
                 )));
             }
             effects = runner.handle_event(AcquisitionEvent::TimerFired {
@@ -9317,7 +9317,7 @@ mod tests {
             for read in read_effects(&effects) {
                 let _ = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
                     read.operation(),
-                    ReadOutcome::Settled { node: None },
+                    ReadOutcome::settled(None),
                 )));
             }
             assert!(
@@ -9534,7 +9534,7 @@ mod tests {
         );
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().stale_events(), 1);
 
@@ -9547,7 +9547,7 @@ mod tests {
         );
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             wrong_kind,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().stale_events(), 2);
 
@@ -9567,7 +9567,7 @@ mod tests {
         );
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().stale_events(), 3);
     }
@@ -10429,7 +10429,7 @@ mod tests {
 
         let network = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(network.contains(&AcquisitionEffect::CancelSession(session)));
         assert!(runner.session(session).is_none());
@@ -10462,7 +10462,7 @@ mod tests {
 
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             header_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(effects.iter().all(|effect| !matches!(
             effect,
@@ -10557,7 +10557,7 @@ mod tests {
         // At completed read-batch boundaries, a moving policy observation
         // cannot displace the latched owner. Non-anchor waiters remain FIFO.
         let first_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
-            ReadCompletion::new(owner_reads[0].1, ReadOutcome::Settled { node: None }),
+            ReadCompletion::new(owner_reads[0].1, ReadOutcome::settled(None)),
         ));
         assert!(
             read_effects(&first_release)
@@ -10565,7 +10565,7 @@ mod tests {
                 .any(|read| read.operation().session() == sessions[3])
         );
         let second_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
-            ReadCompletion::new(owner_reads[1].1, ReadOutcome::Settled { node: None }),
+            ReadCompletion::new(owner_reads[1].1, ReadOutcome::settled(None)),
         ));
         assert!(
             read_effects(&second_release)
@@ -10573,7 +10573,7 @@ mod tests {
                 .any(|read| read.operation().session() == sessions[4])
         );
         let third_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
-            ReadCompletion::new(owner_reads[2].1, ReadOutcome::Settled { node: None }),
+            ReadCompletion::new(owner_reads[2].1, ReadOutcome::settled(None)),
         ));
         let swept_read = read_effects(&third_release)
             .iter()
@@ -10584,7 +10584,7 @@ mod tests {
 
         let boundary = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             swept_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(boundary.contains(&AcquisitionEffect::CancelSession(swept)));
         assert!(runner.session(swept).is_none());
@@ -10658,7 +10658,7 @@ mod tests {
         // oldest owner resumes this sole waiter with its first read batch.
         let resumed = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             first_owner_read.expect("first owner read"),
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&resumed)
@@ -10874,7 +10874,7 @@ mod tests {
         let turns_before_partial = runner.snapshot().plan_turns();
         let partial = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             first_batch_reads[0],
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().plan_turns(), turns_before_partial);
         assert!(
@@ -10886,7 +10886,7 @@ mod tests {
 
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             first_batch_reads[1],
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&effects)
@@ -10905,7 +10905,7 @@ mod tests {
         // and the preferred queued job may begin.
         let boundary = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             retained_owner_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&boundary)
@@ -11000,7 +11000,7 @@ mod tests {
         // the retained continuation immediately emits its first local read.
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             owner_reads[0],
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&effects)
@@ -11063,7 +11063,7 @@ mod tests {
 
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             owner_reads[0],
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&effects)
@@ -12028,7 +12028,7 @@ mod tests {
 
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             first_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&effects)
@@ -12149,7 +12149,7 @@ mod tests {
         let turns_before = runner.snapshot().plan_turns();
         let mut completions = reads
             .into_iter()
-            .map(|read| ReadCompletion::new(read.operation(), ReadOutcome::Settled { node: None }))
+            .map(|read| ReadCompletion::new(read.operation(), ReadOutcome::settled(None)))
             .collect::<Vec<_>>();
         let final_completion = completions.pop().expect("512th completion");
 
@@ -12206,14 +12206,14 @@ mod tests {
         );
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             wrong,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().stale_events(), 1);
 
         // The exact in-flight operation applies and the plan advances.
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             inflight,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().stale_events(), 1);
         assert_eq!(runner.snapshot().plan_turns(), 2);
@@ -12256,7 +12256,7 @@ mod tests {
 
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             read.operation(),
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         let request = effects
             .iter()

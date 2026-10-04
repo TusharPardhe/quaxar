@@ -527,24 +527,36 @@ impl TreeEngine for AppLedgerPlanEngine {
             return PlanReadApply::StalePlan;
         }
         let missing = match outcome {
-            ReadOutcome::Settled { node: Some(bytes) } => {
+            ReadOutcome::Settled {
+                node: Some(bytes),
+                decoded,
+            } => {
                 // NodeReadBroker returns the NodeStore payload verbatim. SHAMap
                 // NodeStore objects are prefix-form, unlike overlay TMLedgerData
                 // nodes (which are decoded by `apply_network_node` as wire form).
-                match SHAMapTreeNode::make_from_prefix(bytes, hash) {
-                    Ok(mut node) if node.get_hash() == hash => {
-                        // Match SHAMap::fetchNodeNT: every verified NodeStore
-                        // result is canonicalized through the shared family
-                        // before it is attached to this acquisition. Without
-                        // this, read-heavy partial trees are owned only by the
-                        // current session and cannot seed a replacement plan.
-                        self.family.canonicalize(hash, &mut node);
-                        MissingNodeReadOutcome::Found(node)
-                    }
-                    Ok(_) | Err(_) => return PlanReadApply::UnknownRead,
-                }
+                //
+                // The CPU-heavy prefix decode is performed on the read-worker
+                // thread (rippled `processData` parity); when `decoded` is
+                // present the owner reuses it and skips `make_from_prefix`,
+                // staying off the deserialize hot path. The owner still
+                // canonicalizes (cheap, cache ordering is single-writer).
+                let node = match decoded.clone() {
+                    Some(node) if node.get_hash() == hash => node,
+                    _ => match SHAMapTreeNode::make_from_prefix(bytes, hash) {
+                        Ok(node) if node.get_hash() == hash => node,
+                        Ok(_) | Err(_) => return PlanReadApply::UnknownRead,
+                    },
+                };
+                let mut node = node;
+                // Match SHAMap::fetchNodeNT: every verified NodeStore result is
+                // canonicalized through the shared family before it is attached
+                // to this acquisition. Without this, read-heavy partial trees
+                // are owned only by the current session and cannot seed a
+                // replacement plan.
+                self.family.canonicalize(hash, &mut node);
+                MissingNodeReadOutcome::Found(node)
             }
-            ReadOutcome::Settled { node: None } => MissingNodeReadOutcome::Miss,
+            ReadOutcome::Settled { node: None, .. } => MissingNodeReadOutcome::Miss,
             ReadOutcome::Stale | ReadOutcome::Cancelled => MissingNodeReadOutcome::Cancelled,
         };
         let plan = self
@@ -566,21 +578,27 @@ impl TreeEngine for AppLedgerPlanEngine {
             return PlanReadApply::StalePlan;
         }
         let node = match outcome {
-            ReadOutcome::Settled { node: Some(bytes) } => {
+            ReadOutcome::Settled {
+                node: Some(bytes),
+                decoded,
+            } => {
                 // Recovery data comes from NodeStore in prefix form. It must
                 // never be sent through the TMLedgerData wire decoder or the
                 // map-level packet path: this exact retained need attaches
                 // directly to the active continuation after hash validation.
+                // The decode is reused from the read worker when present.
                 let hash = SHAMapHash::new(need.hash());
-                match SHAMapTreeNode::make_from_prefix(bytes, hash) {
-                    Ok(mut node) if *node.get_hash().as_uint256() == need.hash() => {
-                        self.family.canonicalize(hash, &mut node);
-                        node
-                    }
-                    _ => return PlanReadApply::HashMismatch,
-                }
+                let mut node = match decoded.clone() {
+                    Some(node) if *node.get_hash().as_uint256() == need.hash() => node,
+                    _ => match SHAMapTreeNode::make_from_prefix(bytes, hash) {
+                        Ok(node) if *node.get_hash().as_uint256() == need.hash() => node,
+                        _ => return PlanReadApply::HashMismatch,
+                    },
+                };
+                self.family.canonicalize(hash, &mut node);
+                node
             }
-            ReadOutcome::Settled { node: None } => return PlanReadApply::UnknownRead,
+            ReadOutcome::Settled { node: None, .. } => return PlanReadApply::UnknownRead,
             ReadOutcome::Stale | ReadOutcome::Cancelled => return PlanReadApply::Cancelled,
         };
         let plan = self
@@ -1336,6 +1354,7 @@ mod tests {
                     leaf.serialize_with_prefix()
                         .expect("leaf serializes for NodeStore"),
                 )),
+                decoded: None,
             },
         );
         assert!(
@@ -1400,6 +1419,7 @@ mod tests {
                     node: Some(Bytes::from(
                         leaf.serialize_with_prefix().expect("leaf serializes")
                     )),
+                    decoded: None,
                 }
             ),
             PlanReadApply::Applied { .. }
@@ -1600,6 +1620,7 @@ mod tests {
                         .serialize_for_wire()
                         .expect("node serializes for the wire"),
                 )),
+                decoded: None,
             },
         );
         assert_eq!(applied, PlanReadApply::UnknownRead);

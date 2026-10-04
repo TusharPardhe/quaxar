@@ -1716,12 +1716,27 @@ impl BrokerReadPort {
                 set.retain(|ticket| *ticket != ready.ticket);
             }
             let outcome = match ready.outcome {
-                BrokerReadOutcome::Found(object) => ReadOutcome::Settled {
-                    node: Some(Bytes::from(object.get_data().clone())),
-                },
-                BrokerReadOutcome::Miss => ReadOutcome::Settled { node: None },
+                BrokerReadOutcome::Found(object) => {
+                    // Decode the NodeStore prefix node HERE, on the read-worker
+                    // thread that delivered the completion (rippled runs
+                    // `processData` node decode on a JtLedgerData JobQueue
+                    // worker, not on the serialized acquisition owner). Carrying
+                    // the decoded node lets the single-writer owner skip the
+                    // CPU-heavy `make_from_prefix` on its hot path. If decode
+                    // fails or the hash does not match, carry only the raw
+                    // bytes and let the owner reject it deterministically.
+                    let bytes = Bytes::from(object.get_data().clone());
+                    let decoded = shamap::tree_node::SHAMapTreeNode::make_from_prefix(
+                        &bytes,
+                        SHAMapHash::new(key.hash),
+                    )
+                    .ok()
+                    .filter(|node| node.get_hash() == SHAMapHash::new(key.hash));
+                    ReadOutcome::settled_decoded(Some(bytes), decoded)
+                }
+                BrokerReadOutcome::Miss => ReadOutcome::settled(None),
                 BrokerReadOutcome::Cancelled => ReadOutcome::Cancelled,
-                BrokerReadOutcome::Fault(_) => ReadOutcome::Settled { node: None },
+                BrokerReadOutcome::Fault(_) => ReadOutcome::settled(None),
             };
             sink_completions.retain(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
                 operation, outcome,
@@ -2399,7 +2414,7 @@ mod tests {
             .expect("production expiry identity is observed");
 
         let read_effects = adapter.handle_fact(AcquisitionEvent::ReadCompleted(
-            ReadCompletion::new(header_read, ReadOutcome::Settled { node: None }),
+            ReadCompletion::new(header_read, ReadOutcome::settled(None)),
         ));
         if let Some(rearmed) = read_effects.iter().find_map(|effect| match effect {
             AcquisitionEffect::ArmTimer(request) if request.timer() == TimerKind::SessionExpiry => {
@@ -2624,7 +2639,7 @@ mod tests {
             .expect("new acquisition starts with an exact local header probe");
         adapter.handle_fact(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             operation,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )))
     }
 
@@ -3237,7 +3252,7 @@ mod tests {
             for operation in recovery_reads {
                 adapter.handle_fact(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
                     operation,
-                    ReadOutcome::Settled { node: None },
+                    ReadOutcome::settled(None),
                 )));
             }
             assert_eq!(
@@ -3814,7 +3829,7 @@ mod tests {
                 assert!(
                     matches!(
                         completion.outcome(),
-                        ReadOutcome::Cancelled | ReadOutcome::Settled { node: None }
+                        ReadOutcome::Cancelled | ReadOutcome::Settled { node: None, .. }
                     ),
                     "a submitted read may be cancelled or win the cancellation race as a miss"
                 );
@@ -3870,7 +3885,7 @@ mod tests {
         match event {
             AcquisitionEvent::ReadCompleted(completion) => {
                 assert_eq!(completion.operation(), operation);
-                assert_eq!(completion.outcome(), &ReadOutcome::Settled { node: None });
+                assert_eq!(completion.outcome(), &ReadOutcome::settled(None));
             }
             other => panic!("expected a read completion, got {other:?}"),
         }
