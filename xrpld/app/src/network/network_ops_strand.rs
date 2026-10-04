@@ -2018,11 +2018,39 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     // Rippled demotes only after the candidate survives canBeCurrent and
     // compatibility admission. In particular, an incompatible resolver hit
     // returns false from checkLastClosedLedger without a FULL→CONNECTED flap.
-    demote_for_preferred_lcl_divergence(
-        root,
-        shared_inbound,
-        acquisition::LedgerTarget::new(preferred_hash, Some(candidate.header().seq)),
-    );
+    //
+    // Parity refinement (eliminates the dominant non-fork oscillation): rippled
+    // demotes on ANY LCL switch because checkLastClosedLedger cannot cheaply
+    // distinguish a pure FORWARD catch-up (we are simply a few ledgers behind
+    // on the SAME validated chain) from a genuine fork. We can: the candidate
+    // already passed `is_compatible` (it is on the validated/quorum chain), so
+    // if it is STRICTLY AHEAD of our current closed ledger AND our own closed
+    // ledger is itself still on that validated chain (an ancestor, not a
+    // minority sibling), the switch is a forward advance - adopting a newer
+    // validated ledger we were trailing, not abandoning a wrong ledger. In
+    // that case we must NOT demote: the node has never left the correct chain,
+    // so flapping FULL→SYNCING→TRACKING→FULL is spurious churn. A same-sequence
+    // sibling (fork / observer veto) or an our-closed ledger that is NOT on the
+    // validated chain still demotes exactly as rippled does.
+    let forward_catch_up = candidate.header().seq > our_closed.header().seq
+        && lm.is_compatible(our_closed.as_ref());
+    if forward_catch_up {
+        tracing::info!(
+            target: "lcl_trace",
+            event = "preferred_lcl_forward_advance_no_demote",
+            preferred_lcl_hash = %preferred_hash,
+            candidate_seq = candidate.header().seq,
+            local_lcl_hash = %our_hash,
+            local_lcl_seq = our_closed.header().seq,
+            "LCL trace: forward catch-up to newer validated ledger on our own chain; adopting LCL without a mode demotion"
+        );
+    } else {
+        demote_for_preferred_lcl_divergence(
+            root,
+            shared_inbound,
+            acquisition::LedgerTarget::new(preferred_hash, Some(candidate.header().seq)),
+        );
+    }
 
     switch_last_closed_ledger(
         root,

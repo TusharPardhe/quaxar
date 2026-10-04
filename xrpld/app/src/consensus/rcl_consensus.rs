@@ -944,18 +944,44 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             if current_mode == crate::NetworkOpsOperatingMode::Full
                 || current_mode == crate::NetworkOpsOperatingMode::Tracking
             {
-                tracing::info!(
-                    target: "consensus",
-                    event = "consensus_view_change_demotion",
-                    ?current_mode,
-                    consensus_mode = ?mode,
-                    min_valid_seq,
-                    requested = %prev_ledger_id,
-                    previous_ledger = ?previous_ledger,
-                    preferred = %preferred,
-                    preferred_resident = ?preferred_resident,
-                    local_closed = ?local_closed,
-                    published_ledger = ?published_ledger,
+                // Parity refinement matching the strand's reconcile path: a
+                // pure FORWARD catch-up (preferred is strictly ahead of our
+                // consensus parent AND that parent is still on the validated
+                // chain) is not a wrong-ledger divergence - we are only
+                // trailing the same chain. Do not demote in that case; just
+                // let consensus adopt the newer preferred parent. A same-seq
+                // sibling (fork) or an off-chain parent still demotes exactly
+                // as rippled's consensusViewChange does.
+                let forward_catch_up = preferred_resident
+                    .is_some_and(|(_, pref_seq)| pref_seq > prev_ledger.ledger().header().seq)
+                    && self
+                        .ledger_master_runtime
+                        .ledger_master()
+                        .is_compatible(prev_ledger.ledger().as_ref());
+                if forward_catch_up {
+                    tracing::info!(
+                        target: "consensus",
+                        event = "consensus_view_change_forward_advance_no_demote",
+                        ?current_mode,
+                        requested = %prev_ledger_id,
+                        preferred = %preferred,
+                        preferred_resident = ?preferred_resident,
+                        previous_ledger = ?previous_ledger,
+                        "consensusViewChange: forward catch-up to newer validated ledger on our own chain; adopting preferred without a mode demotion"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "consensus",
+                        event = "consensus_view_change_demotion",
+                        ?current_mode,
+                        consensus_mode = ?mode,
+                        min_valid_seq,
+                        requested = %prev_ledger_id,
+                        previous_ledger = ?previous_ledger,
+                        preferred = %preferred,
+                        preferred_resident = ?preferred_resident,
+                        local_closed = ?local_closed,
+                        published_ledger = ?published_ledger,
                     validated_anchor = ?validated_anchor,
                     last_valid_anchor = ?last_valid_anchor,
                     live_current_ledger_index = ?self.app_root.live_current_ledger_index(),
@@ -975,6 +1001,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                         crate::NetworkOpsOperatingMode::Connected,
                         "preferred_lcl_divergence",
                     );
+                }
                 }
             } else {
                 tracing::info!(
