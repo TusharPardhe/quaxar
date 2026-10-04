@@ -515,3 +515,41 @@ validation-sync, fde21eca mode-TargetRequired, 21ce4b92 fact-submission-nonblock
 be3524bf nudb-header-lockfree, 4a57d61c+b0680510 batched/bounded read-notify,
 24907eb7 decode-offload. Node full ~82-97%, closes with network; residual stalls
 from single-owner pipeline serialization.
+
+## ITERATION (lock-free coordinator status mirror) — 2026-10-04
+
+**Fix landed (commit 960cce19, deployed as quaxar.statusmirror-960cce19):**
+Decoupled the consensus strand's coordinator status reads from the acquisition
+owner's drain lock. `coordinator_installed()`, `coordinator_snapshot()`, and
+`coordinator_validation_recovery_latch()` previously all took
+`self.coordinator.lock()` — the SAME mutex the single acquisition owner holds
+for its entire multi-second CPU-bound drain. NetworkOps/consensus call these
+every round, so consensus blocked behind the owner's node processing →
+validated-seq stalls → node_behind demotions.
+
+Now the owner publishes lock-free `ArcSwap` mirrors (installed flag,
+RunnerSnapshot, recovery latch) at install, after every drain turn, after every
+synchronous fact application (`submit_coordinator_fact` fast path), and after
+`coordinator_acquire_inner`. Consensus reads the mirrors with zero locking.
+Tests: 189 inbound_ledgers + 69 consensus + 250 acquisition + 7 operating_mode.
+
+**Verified result (3.1h steady state on testnet):**
+- full_pct 96.9% (12 transitions/3.1h).
+- Demotions ~3-5/hr (down from ~10/hr baseline; 60-70% reduction).
+- Validated-gap over 1578 ledgers (90m): median 3s, p90 4s, p99 5s, max 26s.
+  Only 5 stalls >=8s in 1578 ledgers (0.3%); lockstep 99.7% of the time.
+
+**Remaining bottleneck (next effort, larger/architectural):**
+During the residual intermittent stalls, perf of acquisition-own shows it is
+genuinely CPU-bound: `async_fetch_batch` ~20% + `futex_wake`/`wake_up_q`/
+`try_to_wake_up` ~15% (worker wakeups) + `MissingNodeContinuation::
+advance_with_budget` ~10% (SHAMap traversal) + `read_broker::request_with_
+priority` ~8%. The NodeStore read notify is already batched optimally
+(notify_one × min(admitted, threads) per batch). The residual coupling is the
+single-threaded owner SHAMap-drain THROUGHPUT during multi-ledger catch-up
+bursts (not a status-read lock anymore). True fix = rippled JtLedgerData-style
+parallel SHAMap processing across the owner's work (multiple trees concurrently),
+a separate larger refactor. networkops-stra still shows futex_do_wait during
+these bursts but the frequency/duration is now low enough that demotions are
+materially reduced.
+Rollback binary: quaxar.decodeoffload-24907eb7.
