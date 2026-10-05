@@ -10167,6 +10167,11 @@ impl ApplicationRoot {
             event = "validation_adoption_committed",
             validated_hash = %validated.header().hash,
             validated_seq = validated.header().seq,
+            validated_tx_hash = %validated.header().tx_hash,
+            validated_account_hash = %validated.header().account_hash,
+            validated_close_time = validated.header().close_time,
+            validated_close_time_resolution = validated.header().close_time_resolution,
+            validated_parent_hash = %validated.header().parent_hash,
             validated_sign_time,
             previous_valid_seq = current_valid_seq,
             "LCL trace: validation-backed ledger committed as validated"
