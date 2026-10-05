@@ -755,3 +755,54 @@ NET across the whole investigation: validated-ledger stalls and demotion churn
 owner-parallelization (JtLedgerData), edge-trigger reconcile, and forward-advance
 no-demote (validated-skiplist ancestry).
 Rollback: quaxar.fwdwalk-45cedc33 / fwdadvance-aff8e68f / edgetrigger-ab86d3b0.
+
+## FINAL SUMMARY (5-iteration oscillation investigation) — 2026-10-05
+
+GOAL: oscillations = 0, via proper ../rippled parity audit + fixes.
+
+FIXES LANDED (all tested, deployed, verified on testnet; branch
+sync/rippled-aug-sept-2026):
+1. 960cce19 status-mirror: consensus status reads (installed/snapshot/recovery-
+   latch) lock-free via ArcSwap, decoupled from the acquisition owner's drain
+   mutex. Removed the validated-ledger STALLS (37-54s) and ~10/hr node_behind
+   demotions.
+2. 2f4c5c11 owner-parallelization (rippled JtLedgerData model): per-session
+   SHAMap read-apply on a bounded 3-thread pool. Removed owner-drain throughput
+   stalls.
+3. ab86d3b0 edge-trigger endConsensus reconciliation: stopped the per-wake
+   preferred-LCL recompute spin during an Accepted dwell.
+4. aff8e68f + 45cedc33 + b61bb1b8 + 3256a611 forward-advance no-demote: when an
+   LCL switch is a pure FORWARD catch-up (our ledger is a true ancestor of the
+   newer preferred validated ledger), do NOT demote mode. Ancestry confirmed via
+   the LedgerMaster state-map-INDEPENDENT hash-by-sequence history index
+   (get_ledger_by_seq), robust during rapid validated-chain advance. Applied to
+   both demote paths (consensusViewChange + strand reconcile switch).
+
+VERIFIED TERMINAL STATE (histidx-3256a611, ~2.5h): node ~99% full
+(full_pct 93-95% incl. one cold-start; steady-state non-full = seconds). 5
+forward-advance oscillations SUPPRESSED. The ONLY residual demotes are GENUINE
+and correctness-mandatory, individually classified:
+ - acquire-required (preferred not resident) - must acquire;
+ - same-seq fork (prev seq == preferred seq, different hash) - observer built a
+   minority ledger, must switch to quorum;
+ - veto-correlated (our closed was a minority fork) - must switch.
+Chain monotonic, 0 wrong-ledger/invariant/fork errors. Tests: 250 acquisition +
+189 inbound_ledgers + 69 consensus + 124 network + 7 operating_mode pass.
+
+PARITY CONCLUSION (exhaustive audit incl. dedicated sub-agent): the consensus
+close/accept timing, ALL ConsensusParms, close-time resolution/rounding,
+non-proposing dispute-vote adoption, getPrevLedger/consensusViewChange, and
+checkLastClosedLedger demote-on-switch ALL match rippled. rippled's own
+endConsensus demotes on an LCL switch and re-promotes over 1-2 rounds - the
+identical brief-dip pattern. OBSERVER MINORITY LEDGERS ARE INHERENT: a non-
+validator observer under tx contention occasionally resolves disputed-tx
+avalanche votes to a set differing from the quorum (rippled-faithful), loses the
+round, and must switch+demote. Literal 0 oscillations is UNREACHABLE for a non-
+validator observer without a consensus-correctness regression (suppressing
+genuine-fork demotes = staying on a known-wrong ledger). The node here has
+pubkey_validator=none. The only path to also eliminate genuine-fork demotes is
+proposing-validator operation (requires testnet UNL trust; network-side).
+
+NET: validated-ledger stalls + ~10/hr demotion churn -> only genuine ~1-2/hr
+observer-fork recoveries, node ~99-100% full, chain-correct. All SPURIOUS
+oscillation classes eliminated via rippled-faithful / parity-informed fixes.
