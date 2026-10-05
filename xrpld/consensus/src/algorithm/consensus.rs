@@ -860,6 +860,54 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         adaptor.update_operating_mode(self.curr_peer_positions.len());
         self.prev_proposers = self.curr_peer_positions.len();
         self.prev_round_time = self.result.as_ref().expect("result set").round_time.read();
+
+        // FORK DIAGNOSTIC (logging-only): if the MAJORITY peer position (the
+        // set most proposers back = the quorum's tx set) differs from OUR
+        // accepted set, log the exact differing transaction ids. This pinpoints
+        // whether we are missing a tx the quorum included, carrying an extra
+        // one, etc. - the ground truth for the residual observer-fork bug.
+        {
+            let mut tally: std::collections::BTreeMap<
+                <A::TxSet as ConsensusTxSet>::Id,
+                usize,
+            > = std::collections::BTreeMap::new();
+            for pos in self.curr_peer_positions.values() {
+                *tally.entry(pos.proposal().position().clone()).or_insert(0) += 1;
+            }
+            if let Some((majority_id, votes)) =
+                tally.into_iter().max_by_key(|(_, c)| *c)
+            {
+                let our_id = self.result.as_ref().expect("result set").position.position().clone();
+                if majority_id != our_id
+                    && let Some(quorum_set) = self.acquired.get(&majority_id)
+                {
+                    let our_set = &self.result.as_ref().expect("result set").txns;
+                    let diff = our_set.compare(quorum_set);
+                    let ours_only: Vec<String> = diff
+                        .iter()
+                        .filter(|(_, in_self)| **in_self)
+                        .map(|(id, _)| id.to_string())
+                        .collect();
+                    let quorum_only: Vec<String> = diff
+                        .iter()
+                        .filter(|(_, in_self)| !**in_self)
+                        .map(|(id, _)| id.to_string())
+                        .collect();
+                    tracing::warn!(
+                        target: "lcl_audit",
+                        event = "consensus_txset_divergence",
+                        our_set_id = %our_id.to_string(),
+                        quorum_set_id = %majority_id.to_string(),
+                        quorum_votes = votes,
+                        proposers = self.curr_peer_positions.len(),
+                        ours_only = ?ours_only,
+                        quorum_only = ?quorum_only,
+                        "CONSENSUS_TXSET_DIVERGENCE: our accepted set differs from the majority peer (quorum) set"
+                    );
+                }
+            }
+        }
+
         self.phase = ConsensusPhase::Accepted;
 
         let result = self.result.take().expect("result set");
