@@ -904,6 +904,15 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
                         quorum_only = ?quorum_only,
                         "CONSENSUS_TXSET_DIVERGENCE: our accepted set differs from the majority peer (quorum) set"
                     );
+                } else if majority_id == our_id {
+                    tracing::info!(
+                        target: "lcl_audit",
+                        event = "consensus_txset_agreed",
+                        set_id = %our_id.to_string(),
+                        quorum_votes = votes,
+                        proposers = self.curr_peer_positions.len(),
+                        "CONSENSUS_TXSET_AGREED: our accepted set id matches the majority peer set (any resulting fork is in ledger BUILD/apply, not set selection)"
+                    );
                 }
             }
         }
