@@ -2088,9 +2088,25 @@ pub(crate) fn is_forward_ancestor(
     if descendant_seq <= ancestor_seq {
         return false;
     }
-    // Bounded header-only parent-chain walk from the descendant down to the
-    // ancestor sequence. 256 covers the common trailing distance; beyond that
-    // we conservatively decline (treat as not-provably-forward -> demote).
+    // Primary, authoritative check: ask the live VALIDATED ledger (whose state
+    // map is always materialized, unlike a freshly adopted preferred candidate)
+    // to look DOWN its skip-list to our sequence. If the validated chain's hash
+    // at our sequence equals our ledger's hash, our ledger is provably on the
+    // validated chain => the switch to the newer validated ledger is a pure
+    // forward catch-up. This is the rippled areCompatible/hashOfSeq relation
+    // evaluated from the authoritative chain head.
+    if let Some(validated) = root
+        .ledger_master_runtime()
+        .and_then(|lm_rt| lm_rt.ledger_master().validated_ledger())
+        && validated.header().seq >= ancestor_seq
+        && let Some(h) = validated.hash_of_seq(ancestor_seq, &ledger::NullLedgerJournal)
+        && *h.as_uint256() == ancestor_hash
+    {
+        return true;
+    }
+    // Secondary: bounded header-only parent-hash walk from the descendant down
+    // to the ancestor sequence (no state map needed), for cases where the
+    // intermediate chain is resident.
     let max_steps = (descendant_seq - ancestor_seq).min(256);
     let mut cursor_hash = *descendant.header().parent_hash.as_uint256();
     let mut cursor_seq = descendant_seq - 1;
@@ -2106,8 +2122,10 @@ pub(crate) fn is_forward_ancestor(
             None => break,
         }
     }
-    // Fallback: ask the descendant's skip-list directly (works when its state
-    // map is materialized). Only a POSITIVE match confirms forward advance.
+    // Tertiary fallback: the descendant's own skip-list (works only when its
+    // state map is materialized). Only a POSITIVE match confirms forward
+    // advance; any uncertainty returns false (preserving the rippled-faithful
+    // demote for genuine divergence).
     descendant
         .hash_of_seq(ancestor_seq, &ledger::NullLedgerJournal)
         .map(|ancestor| *ancestor.as_uint256() == ancestor_hash)
