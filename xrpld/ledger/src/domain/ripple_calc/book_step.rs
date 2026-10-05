@@ -2731,6 +2731,10 @@ pub fn execute_explicit_book_step<V: ApplyView>(
 mod success_path_tests;
 
 #[cfg(test)]
+#[path = "book_step_fork_repro_tests.rs"]
+mod fork_repro_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
