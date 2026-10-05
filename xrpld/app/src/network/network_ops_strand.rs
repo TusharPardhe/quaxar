@@ -2088,30 +2088,34 @@ pub(crate) fn is_forward_ancestor(
     if descendant_seq <= ancestor_seq {
         return false;
     }
-    // Primary, authoritative, state-map-INDEPENDENT check: ask the LedgerMaster
-    // for the validated-chain ledger at our sequence via its in-memory
-    // hash-by-sequence history index (get_ledger_by_seq -> get_cached_ledger_by_seq).
-    // If the validated chain's ledger at our sequence has our hash, our ledger
-    // is provably on the validated chain => the switch to the newer validated
-    // ledger is a pure forward catch-up. This does NOT depend on any ledger's
-    // state-map/skip-list being materialized, so it stays correct during rapid
-    // validated-chain advance (the case the skip-list-only checks missed).
+    // Confirm our ledger is a true ancestor of the newer preferred ledger on
+    // the same validated chain (=> the switch is a pure forward catch-up, not
+    // a fork, so no mode demotion). Try several independent ancestry sources;
+    // ONLY a positive match returns true. A negative from one source must NOT
+    // short-circuit (it may be stale/unmaterialized), so we fall through to the
+    // next source and only demote if NONE can confirm the forward relation.
+    //
+    // Source 1: LedgerMaster in-memory hash-by-sequence history index
+    // (state-map independent).
     if let Some(lm_rt) = root.ledger_master_runtime() {
         let lm = lm_rt.ledger_master();
-        if let Some(chain_ledger) = lm.get_ledger_by_seq(ancestor_seq, &ledger::NullLedgerJournal) {
-            return *chain_ledger.header().hash.as_uint256() == ancestor_hash;
+        if let Some(chain_ledger) = lm.get_ledger_by_seq(ancestor_seq, &ledger::NullLedgerJournal)
+            && *chain_ledger.header().hash.as_uint256() == ancestor_hash
+        {
+            return true;
         }
-        // Secondary: the live validated ledger's skip-list (materialized head).
+        // Source 2: the live validated ledger's skip-list (materialized head).
         if let Some(validated) = lm.validated_ledger()
             && validated.header().seq >= ancestor_seq
             && let Some(h) = validated.hash_of_seq(ancestor_seq, &ledger::NullLedgerJournal)
+            && *h.as_uint256() == ancestor_hash
         {
-            return *h.as_uint256() == ancestor_hash;
+            return true;
         }
     }
-    // Tertiary: bounded header-only parent-hash walk from the descendant down
-    // to the ancestor sequence (no state map needed), for cases where the
-    // intermediate chain is resident.
+    // Source 3: walk the PREFERRED descendant's own parent-hash chain
+    // (header-only; the descendant is resident and authoritative for its own
+    // ancestry) down to the ancestor sequence.
     let max_steps = (descendant_seq - ancestor_seq).min(256);
     let mut cursor_hash = *descendant.header().parent_hash.as_uint256();
     let mut cursor_seq = descendant_seq - 1;
@@ -2127,14 +2131,25 @@ pub(crate) fn is_forward_ancestor(
             None => break,
         }
     }
-    // Tertiary fallback: the descendant's own skip-list (works only when its
-    // state map is materialized). Only a POSITIVE match confirms forward
-    // advance; any uncertainty returns false (preserving the rippled-faithful
-    // demote for genuine divergence).
-    descendant
+    // Source 4: the descendant's own skip-list (works only when its state map
+    // is materialized). Only a POSITIVE match confirms forward advance; any
+    // uncertainty returns false (preserving the rippled-faithful demote for
+    // genuine divergence).
+    let confirmed = descendant
         .hash_of_seq(ancestor_seq, &ledger::NullLedgerJournal)
         .map(|ancestor| *ancestor.as_uint256() == ancestor_hash)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !confirmed {
+        tracing::info!(
+            target: "lcl_trace",
+            event = "forward_ancestor_unconfirmed",
+            ancestor_seq,
+            descendant_seq,
+            %ancestor_hash,
+            "LCL trace: could not confirm forward-ancestor relation from any source; treating as divergence (demote)"
+        );
+    }
+    confirmed
 }
 
 /// Demote only once a preferred-LCL divergence has become actionable.
