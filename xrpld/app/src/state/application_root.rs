@@ -11114,20 +11114,35 @@ impl ApplicationRoot {
                 // differently (e.g. an OfferCreate consuming different offers).
                 let (meta_node_count, meta_node_keys) = match &transaction_meta {
                     Some(meta) => {
+                        let fin = protocol::get_field_by_symbol("sfFinalFields");
+                        let newf = protocol::get_field_by_symbol("sfNewFields");
+                        let bal = protocol::get_field_by_symbol("sfBalance");
+                        let li = protocol::get_field_by_symbol("sfLedgerIndex");
                         let mut keys: Vec<String> = meta
                             .get_nodes()
                             .iter()
                             .map(|node| {
-                                format!(
-                                    "{}",
-                                    node.get_field_h256(protocol::get_field_by_symbol(
-                                        "sfLedgerIndex"
-                                    ))
-                                )
+                                let key = format!("{}", node.get_field_h256(li));
+                                // Extract the final balance of this entry (if any)
+                                // so our value can be diffed against the network's
+                                // FinalFields.Balance - value-level fork capture.
+                                let fields = if node.has_field(fin) {
+                                    Some(node.get_field_object(fin))
+                                } else if node.has_field(newf) {
+                                    Some(node.get_field_object(newf))
+                                } else {
+                                    None
+                                };
+                                let balance = fields
+                                    .as_ref()
+                                    .filter(|f| f.has_field(bal))
+                                    .map(|f| format!("{:?}", f.get_field_amount(bal)))
+                                    .unwrap_or_default();
+                                format!("{}:{}", &key[..key.len().min(12)], balance)
                             })
                             .collect();
                         keys.sort();
-                        (keys.len(), keys.join(","))
+                        (keys.len(), keys.join(" "))
                     }
                     None => (0, String::new()),
                 };
