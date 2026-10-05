@@ -11136,9 +11136,20 @@ impl ApplicationRoot {
                                 let balance = fields
                                     .as_ref()
                                     .filter(|f| f.has_field(bal))
-                                    .map(|f| format!("{:?}", f.get_field_amount(bal)))
+                                    .map(|f| {
+                                        let a = f.get_field_amount(bal);
+                                        // Clean, trivially-parseable encoding:
+                                        // mantissa|exponent|neg. Compare directly
+                                        // to the network FinalFields.Balance.
+                                        format!(
+                                            "{}|{}|{}",
+                                            a.mantissa(),
+                                            a.exponent(),
+                                            a.negative() as u8
+                                        )
+                                    })
                                     .unwrap_or_default();
-                                format!("{}:{}", &key[..key.len().min(12)], balance)
+                                format!("{}={}", &key[..key.len().min(12)], balance)
                             })
                             .collect();
                         keys.sort();
