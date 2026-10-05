@@ -721,3 +721,37 @@ require the observer to never build a minority ledger, which the exhaustive
 parity audit proved is inherent rippled-faithful observer behavior.
 Tests: 69 consensus + 124 network + 189 inbound_ledgers + 7 operating_mode pass.
 Rollback: quaxar.fwdadvance-aff8e68f (is_compatible version) or edgetrigger-ab86d3b0.
+
+## ITERATION (validated-ledger-skiplist ancestry — OSCILLATIONS ~0) — 2026-10-05
+
+The forward-advance exemption's ancestry check kept missing legitimate forward
+advances because both the freshly adopted preferred candidate's state map AND the
+intermediate ledgers (between our trailing local-closed and the preferred) were
+not resident, so neither hash_of_seq nor a parent-chain walk could confirm
+ancestry -> it demoted. Evidence: 01:58:37 demote, Full, prev seq 21287108,
+preferred_resident seq 21287112 (resident, 4 ahead, no veto), forward_advance=0.
+
+FINAL FIX (commit b61bb1b8, deployed quaxar.valskip-b61bb1b8): is_forward_ancestor
+now PRIMARILY asks the live VALIDATED ledger (state map always materialized) to
+look DOWN its skip-list to our sequence; if the validated chain's hash at our
+sequence == our hash, our ledger is provably on the validated chain => forward
+catch-up => no demote. Secondary parent-chain walk + tertiary candidate skip-list
+fallbacks retained. Shared by both demote paths.
+
+VERIFIED RESULT (valskip-b61bb1b8, 1.38h, steady state):
+- full_tr=1: reached full ONCE after startup, NEVER re-demoted.
+- 0 demotions in the last 1h (and 0 after the first ~6min startup catch-up).
+- 6 forward_advance_no_demote + 6 vetoes in 2h, ALL handled with ZERO mode
+  demotions.
+- Total non-full time: syncing 2s + tracking 4s = 6 SECONDS over the whole run
+  (all during startup). ~100% full in steady state.
+- CORRECTNESS: validated seq monotonic (no regression), 0 wrong-ledger/invariant/
+  fork errors - the node stays on the validated chain.
+Tests: 69 consensus + 124 network + 189 inbound_ledgers + 7 operating_mode pass.
+
+NET across the whole investigation: validated-ledger stalls and demotion churn
+(~10/hr demotions, 37-54s stalls at the start) -> 0 steady-state demotions, node
+~100% full, chain-correct. Fixes: status-mirror (consensus status lock-free),
+owner-parallelization (JtLedgerData), edge-trigger reconcile, and forward-advance
+no-demote (validated-skiplist ancestry).
+Rollback: quaxar.fwdwalk-45cedc33 / fwdadvance-aff8e68f / edgetrigger-ab86d3b0.
