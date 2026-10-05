@@ -1887,12 +1887,49 @@ impl AppConsensus {
                     && let Some((alternate_hash, validation_count)) =
                         root.observer_quorum_alternate_same_seq(closed_hash, closed.header().seq)
                 {
+                    // Capture the EXACT divergence field vs the quorum sibling
+                    // (which is resident, being quorum-validated) so a live
+                    // fork is classifiable: tx-set divergence (different
+                    // transaction_hash) vs close-time divergence (different
+                    // close_time/resolution) vs parent divergence vs state.
+                    let alt = root
+                        .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(alternate_hash));
+                    let (alt_parent, alt_tx_hash, alt_acct_hash, alt_close, alt_res) = match &alt {
+                        Some(a) => (
+                            format!("{}", a.header().parent_hash),
+                            format!("{}", a.header().tx_hash),
+                            format!("{}", a.header().account_hash),
+                            a.header().close_time,
+                            a.header().close_time_resolution,
+                        ),
+                        None => (
+                            "<not-resident>".to_owned(),
+                            String::new(),
+                            String::new(),
+                            0,
+                            0,
+                        ),
+                    };
                     tracing::warn!(
                         target: "lcl_audit",
                         local_hash = %closed_hash,
                         alternate_hash = %alternate_hash,
                         closed_seq = closed.header().seq,
                         validation_count,
+                        local_parent_hash = %closed.header().parent_hash,
+                        local_tx_hash = %closed.header().tx_hash,
+                        local_account_hash = %closed.header().account_hash,
+                        local_close_time = closed.header().close_time,
+                        local_close_time_resolution = closed.header().close_time_resolution,
+                        alt_parent_hash = %alt_parent,
+                        alt_tx_hash = %alt_tx_hash,
+                        alt_account_hash = %alt_acct_hash,
+                        alt_close_time = alt_close,
+                        alt_close_time_resolution = alt_res,
+                        same_parent = (format!("{}", closed.header().parent_hash) == alt_parent),
+                        same_tx_set = (format!("{}", closed.header().tx_hash) == alt_tx_hash),
+                        same_account = (format!("{}", closed.header().account_hash) == alt_acct_hash),
+                        same_close_time = (closed.header().close_time == alt_close),
                         "LCL_AUDIT observer local child vetoed for quorum-backed canonical sibling"
                     );
                     // Leave generic consensus Accepted. The NetworkOps strand
