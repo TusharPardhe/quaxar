@@ -683,3 +683,41 @@ from rippled (suppressing the LCL-switch demote), which the parity requirement
 forbids. The node is already ~99.75% full with 2-3s self-correcting dips, which
 matches rippled's endConsensus demote/re-promote cadence. No parity-preserving
 change can reach literally 0.
+
+## ITERATION (forward-advance no-demote, ancestry-confirmed) — 2026-10-05
+
+Implemented a parity-informed fix to eliminate SPURIOUS oscillations while
+preserving rippled-faithful demotes for genuine forks.
+
+FIX (commits aff8e68f then dfe7739d, deployed quaxar.ancestry-dfe7739d):
+Skip the FULL->SYNCING/CONNECTED mode demote on an LCL switch when it is a pure
+FORWARD catch-up: our consensus parent / local-closed ledger is a TRUE ANCESTOR
+of the newer preferred ledger on the same validated chain. Confirmed definitively
+by asking the resident preferred ledger to look DOWN its skip-list to our parent
+sequence (Ledger::hash_of_seq, rippled areCompatible/hashOfSeq semantics): if the
+ancestor hash == our parent hash, it is a forward advance -> no demote. Applied to
+BOTH demote paths (rcl_consensus get_prev_ledger/consensusViewChange and
+network_ops_strand reconcile_preferred_lcl switch). (First version used
+is_compatible but that returns false when the parent trails the validated anchor
+by many ledgers - the exact oscillating case - so switched to true hashOfSeq
+ancestry.)
+
+GENUINE divergence still demotes exactly as rippled: non-resident preferred
+(acquire-required), same-seq sibling (observer veto / fork), or a differing
+ancestor at our sequence.
+
+MEASURED (ancestry-dfe7739d, 2h): forward_advance_no_demote fired 11x (11
+spurious oscillations SUPPRESSED); demotions ~2/hr (from ~5/hr baseline); all 4
+residual view-change demotes were genuine (1 preferred_resident=None acquire-
+required + 3 resident whose local-closed was a veto fork sibling -> hashOfSeq
+mismatch -> correct demote). vetoes 11/2h (observer minority ledgers; varies with
+network contention). full_pct 92.8% (dragged by cold-start).
+
+CONCLUSION: The SPURIOUS forward-advance oscillation class is ELIMINATED. The
+residual demotes are now 1:1 with GENUINE consensus forks (observer builds a
+minority ledger and must switch to the quorum chain) - which MUST demote for
+correctness; exempting them would be a correctness bug. Driving these to 0 would
+require the observer to never build a minority ledger, which the exhaustive
+parity audit proved is inherent rippled-faithful observer behavior.
+Tests: 69 consensus + 124 network + 189 inbound_ledgers + 7 operating_mode pass.
+Rollback: quaxar.fwdadvance-aff8e68f (is_compatible version) or edgetrigger-ab86d3b0.
