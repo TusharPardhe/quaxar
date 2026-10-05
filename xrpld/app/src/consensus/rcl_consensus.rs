@@ -1894,6 +1894,16 @@ impl AppConsensus {
                     // close_time/resolution) vs parent divergence vs state.
                     let alt = root
                         .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(alternate_hash));
+                    // Our final consensus tx-set membership (sorted tx ids) so
+                    // the symmetric difference vs the quorum set pinpoints the
+                    // exact divergent transaction(s).
+                    let mut our_tx_ids: Vec<String> = work
+                        .txns
+                        .iter()
+                        .map(|tx| format!("{}", tx.get_transaction_id()))
+                        .collect();
+                    our_tx_ids.sort();
+                    let our_tx_id_list = our_tx_ids.join(",");
                     let (alt_parent, alt_tx_hash, alt_acct_hash, alt_close, alt_res) = match &alt {
                         Some(a) => (
                             format!("{}", a.header().parent_hash),
@@ -1930,6 +1940,7 @@ impl AppConsensus {
                         same_tx_set = (format!("{}", closed.header().tx_hash) == alt_tx_hash),
                         same_account = (format!("{}", closed.header().account_hash) == alt_acct_hash),
                         same_close_time = (closed.header().close_time == alt_close),
+                        our_tx_ids = %our_tx_id_list,
                         "LCL_AUDIT observer local child vetoed for quorum-backed canonical sibling"
                     );
                     // Leave generic consensus Accepted. The NetworkOps strand
