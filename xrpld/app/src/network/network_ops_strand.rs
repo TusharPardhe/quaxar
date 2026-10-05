@@ -2088,23 +2088,28 @@ pub(crate) fn is_forward_ancestor(
     if descendant_seq <= ancestor_seq {
         return false;
     }
-    // Primary, authoritative check: ask the live VALIDATED ledger (whose state
-    // map is always materialized, unlike a freshly adopted preferred candidate)
-    // to look DOWN its skip-list to our sequence. If the validated chain's hash
-    // at our sequence equals our ledger's hash, our ledger is provably on the
-    // validated chain => the switch to the newer validated ledger is a pure
-    // forward catch-up. This is the rippled areCompatible/hashOfSeq relation
-    // evaluated from the authoritative chain head.
-    if let Some(validated) = root
-        .ledger_master_runtime()
-        .and_then(|lm_rt| lm_rt.ledger_master().validated_ledger())
-        && validated.header().seq >= ancestor_seq
-        && let Some(h) = validated.hash_of_seq(ancestor_seq, &ledger::NullLedgerJournal)
-        && *h.as_uint256() == ancestor_hash
-    {
-        return true;
+    // Primary, authoritative, state-map-INDEPENDENT check: ask the LedgerMaster
+    // for the validated-chain ledger at our sequence via its in-memory
+    // hash-by-sequence history index (get_ledger_by_seq -> get_cached_ledger_by_seq).
+    // If the validated chain's ledger at our sequence has our hash, our ledger
+    // is provably on the validated chain => the switch to the newer validated
+    // ledger is a pure forward catch-up. This does NOT depend on any ledger's
+    // state-map/skip-list being materialized, so it stays correct during rapid
+    // validated-chain advance (the case the skip-list-only checks missed).
+    if let Some(lm_rt) = root.ledger_master_runtime() {
+        let lm = lm_rt.ledger_master();
+        if let Some(chain_ledger) = lm.get_ledger_by_seq(ancestor_seq, &ledger::NullLedgerJournal) {
+            return *chain_ledger.header().hash.as_uint256() == ancestor_hash;
+        }
+        // Secondary: the live validated ledger's skip-list (materialized head).
+        if let Some(validated) = lm.validated_ledger()
+            && validated.header().seq >= ancestor_seq
+            && let Some(h) = validated.hash_of_seq(ancestor_seq, &ledger::NullLedgerJournal)
+        {
+            return *h.as_uint256() == ancestor_hash;
+        }
     }
-    // Secondary: bounded header-only parent-hash walk from the descendant down
+    // Tertiary: bounded header-only parent-hash walk from the descendant down
     // to the ancestor sequence (no state map needed), for cases where the
     // intermediate chain is resident.
     let max_steps = (descendant_seq - ancestor_seq).min(256);
