@@ -11104,6 +11104,23 @@ impl ApplicationRoot {
                 };
                 let apply_ter = preclaim_admitted.then_some(result);
                 drop(view);
+                // FORK DIAGNOSTIC (logging-only): per-tx apply result during the
+                // consensus ledger build. Forks are proven to be apply-layer
+                // divergence (we agree on the tx set but build a different
+                // ledger). After we adopt the network's validated ledger, the
+                // `tx` RPC returns the NETWORK's result for each tx; diffing it
+                // against this log pinpoints the transactor whose result differs.
+                tracing::info!(
+                    target: "apply_audit",
+                    event = "consensus_build_tx_result",
+                    closed_seq,
+                    pass,
+                    tx_id = %transaction_id,
+                    txn_type = ?txn_type,
+                    result = ?result,
+                    applied,
+                    "APPLY_AUDIT consensus-build per-tx result"
+                );
                 if let Some((entry_key, prior_seq)) = replayed_threaded_entry {
                     completed_transaction_ids.insert(transaction_id);
                     emit_candidate_admission_diagnostic(
