@@ -11104,12 +11104,33 @@ impl ApplicationRoot {
                 };
                 let apply_ter = preclaim_admitted.then_some(result);
                 drop(view);
-                // FORK DIAGNOSTIC (logging-only): per-tx apply result during the
-                // consensus ledger build. Forks are proven to be apply-layer
-                // divergence (we agree on the tx set but build a different
-                // ledger). After we adopt the network's validated ledger, the
-                // `tx` RPC returns the NETWORK's result for each tx; diffing it
-                // against this log pinpoints the transactor whose result differs.
+                // FORK DIAGNOSTIC (logging-only): per-tx apply result + our
+                // metadata affected-node count and sorted ledger-index keys
+                // during the consensus ledger build. Forks are proven to be
+                // apply-layer divergence (we agree on the tx set but build a
+                // different ledger, all txs tesSUCCESS on both sides). Diffing
+                // our affected-node keys vs the network's `tx` RPC AffectedNodes
+                // pinpoints exactly which ledger entries a transactor touches
+                // differently (e.g. an OfferCreate consuming different offers).
+                let (meta_node_count, meta_node_keys) = match &transaction_meta {
+                    Some(meta) => {
+                        let mut keys: Vec<String> = meta
+                            .get_nodes()
+                            .iter()
+                            .map(|node| {
+                                format!(
+                                    "{}",
+                                    node.get_field_h256(protocol::get_field_by_symbol(
+                                        "sfLedgerIndex"
+                                    ))
+                                )
+                            })
+                            .collect();
+                        keys.sort();
+                        (keys.len(), keys.join(","))
+                    }
+                    None => (0, String::new()),
+                };
                 tracing::info!(
                     target: "apply_audit",
                     event = "consensus_build_tx_result",
@@ -11119,6 +11140,8 @@ impl ApplicationRoot {
                     txn_type = ?txn_type,
                     result = ?result,
                     applied,
+                    meta_node_count,
+                    meta_node_keys = %meta_node_keys,
                     "APPLY_AUDIT consensus-build per-tx result"
                 );
                 if let Some((entry_key, prior_seq)) = replayed_threaded_entry {
