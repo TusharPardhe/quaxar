@@ -47,6 +47,32 @@ fn drops(n: i64) -> STAmount {
 }
 
 #[test]
+fn fork_21305409_trustline_balance_addition_canonicalizes_like_network() {
+    // Network RippleState balance transitions for this crossing (16 sig digits):
+    //   taker line: -414.6200709596663 + (-2.04693805346036) = -416.6670090131267
+    //   owner line:  184.2149045765512 + (-2.04693805346036) =  182.1679665230908
+    // A 1-ULP IOU add/canonicalize divergence here forks the ledger even though
+    // the crossing step amounts match the network.
+    let delta = war("-2.04693805346036");
+
+    let taker_before = war("-414.6200709596663");
+    let taker_after = taker_before + delta.clone();
+    assert_eq!(
+        taker_after,
+        war("-416.6670090131267"),
+        "taker trustline balance must canonicalize exactly like the network"
+    );
+
+    let owner_before = war("184.2149045765512");
+    let owner_after = owner_before + delta.clone();
+    assert_eq!(
+        owner_after,
+        war("182.1679665230908"),
+        "owner trustline balance must canonicalize exactly like the network"
+    );
+}
+
+#[test]
 fn fork_21305409_offercreate_iou_crossing_matches_network() {
     // Consumed offer as it stood BEFORE this crossing.
     let offer_pays_xrp = drops(6_000_000); // owner receives XRP (offer "in")
