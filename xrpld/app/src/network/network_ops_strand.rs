@@ -2034,11 +2034,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     // spurious churn. A same-sequence sibling (fork / observer veto) or a
     // candidate whose ancestor at our sequence differs still demotes.
     let our_seq = our_closed.header().seq;
-    let forward_catch_up = candidate.header().seq > our_seq
-        && candidate
-            .hash_of_seq(our_seq, &ledger::NullLedgerJournal)
-            .map(|ancestor| *ancestor.as_uint256() == our_hash)
-            .unwrap_or(false);
+    let forward_catch_up = is_forward_ancestor(root, &candidate, our_hash, our_seq);
     if forward_catch_up {
         tracing::info!(
             target: "lcl_trace",
@@ -2068,6 +2064,54 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         status_broadcaster,
     );
     PreferredLclReconciliation::Switched
+}
+
+/// Confirm that `ancestor_hash`@`ancestor_seq` is a true ancestor of the
+/// resident `descendant` ledger on the same chain - i.e. the switch from our
+/// ledger to `descendant` is a pure FORWARD catch-up, not a fork.
+///
+/// `Ledger::hash_of_seq` alone is fragile here: for a freshly adopted preferred
+/// ledger whose state SHAMap is not yet fully materialized, its in-ledger
+/// skip-list read can miss and return None, which would wrongly classify a
+/// legitimate forward advance as a fork and demote. So we first walk the
+/// resident parent-hash chain (header-only, no state map needed) for a bounded
+/// number of steps, and fall back to `hash_of_seq` only if the walk cannot
+/// resolve. Returns false on any uncertainty (never over-claims a forward
+/// advance, preserving the rippled-faithful demote for genuine divergence).
+pub(crate) fn is_forward_ancestor(
+    root: &ApplicationRoot,
+    descendant: &Arc<ledger::Ledger>,
+    ancestor_hash: Uint256,
+    ancestor_seq: u32,
+) -> bool {
+    let descendant_seq = descendant.header().seq;
+    if descendant_seq <= ancestor_seq {
+        return false;
+    }
+    // Bounded header-only parent-chain walk from the descendant down to the
+    // ancestor sequence. 256 covers the common trailing distance; beyond that
+    // we conservatively decline (treat as not-provably-forward -> demote).
+    let max_steps = (descendant_seq - ancestor_seq).min(256);
+    let mut cursor_hash = *descendant.header().parent_hash.as_uint256();
+    let mut cursor_seq = descendant_seq - 1;
+    for _ in 0..max_steps {
+        if cursor_seq == ancestor_seq {
+            return cursor_hash == ancestor_hash;
+        }
+        match root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(cursor_hash)) {
+            Some(parent) => {
+                cursor_hash = *parent.header().parent_hash.as_uint256();
+                cursor_seq = cursor_seq.saturating_sub(1);
+            }
+            None => break,
+        }
+    }
+    // Fallback: ask the descendant's skip-list directly (works when its state
+    // map is materialized). Only a POSITIVE match confirms forward advance.
+    descendant
+        .hash_of_seq(ancestor_seq, &ledger::NullLedgerJournal)
+        .map(|ancestor| *ancestor.as_uint256() == ancestor_hash)
+        .unwrap_or(false)
 }
 
 /// Demote only once a preferred-LCL divergence has become actionable.

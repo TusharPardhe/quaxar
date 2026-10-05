@@ -958,17 +958,17 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 // demotes exactly as rippled's consensusViewChange does.
                 let prev_seq = prev_ledger.ledger().header().seq;
                 let prev_hash = *prev_ledger.ledger().header().hash.as_uint256();
-                let forward_catch_up = preferred_resident
-                    .is_some_and(|(_, pref_seq)| pref_seq > prev_seq)
-                    && self
-                        .app_root
-                        .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred))
-                        .and_then(|pref_ledger| {
-                            pref_ledger
-                                .hash_of_seq(prev_seq, &ledger::NullLedgerJournal)
-                                .map(|ancestor| *ancestor.as_uint256() == prev_hash)
-                        })
-                        .unwrap_or(false);
+                let forward_catch_up = self
+                    .app_root
+                    .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred))
+                    .is_some_and(|pref_ledger| {
+                        crate::network::network_ops_strand::is_forward_ancestor(
+                            &self.app_root,
+                            &pref_ledger,
+                            prev_hash,
+                            prev_seq,
+                        )
+                    });
                 if forward_catch_up {
                     tracing::info!(
                         target: "consensus",
