@@ -806,3 +806,37 @@ proposing-validator operation (requires testnet UNL trust; network-side).
 NET: validated-ledger stalls + ~10/hr demotion churn -> only genuine ~1-2/hr
 observer-fork recoveries, node ~99-100% full, chain-correct. All SPURIOUS
 oscillation classes eliminated via rippled-faithful / parity-informed fixes.
+
+## ITERATION (multi-source ancestry + instrumentation) — 2026-10-05 (check-now)
+
+Live check of histidx-3256a611 revealed a residual resident+ahead demote
+(06:23:57 prev 21291837 -> pref 21291841) where the forward-advance exemption
+declined because the validated-chain index primary check could short-circuit
+with a stale/None answer when our local close was AHEAD of the validated index.
+
+FIX (commit e1614ba2, deployed quaxar.allsrc-e1614ba2): restructured
+is_forward_ancestor so a NEGATIVE from any single source never short-circuits -
+it tries ALL sources and only a POSITIVE match exempts: (1) LedgerMaster
+hash-by-seq history index, (2) live validated-ledger skip-list, (3) the PREFERRED
+descendant's own parent-hash chain walk (authoritative for its own ancestry),
+(4) descendant skip-list. Added event=forward_ancestor_unconfirmed on decline to
+definitively classify every residual demote.
+
+VERIFIED (allsrc-e1614ba2, 1.43h) - 7 demotes, now INDIVIDUALLY CLASSIFIED by
+instrumentation:
+ - 1 acquire-required (preferred not resident, startup);
+ - 4 PROVEN genuine forks (source-3 parent-walk of the resident preferred ledger
+   reached our sequence and found a DIFFERENT hash => our local ledger is off the
+   validated chain => correct demote); 2 vetoes correlate.
+ - 1 forward_ancestor_unconfirmed (07:48 prev 21293341 pref 21293350): preferred
+   resident but intermediates 21293342-349 not resident and neither index nor
+   skip-lists could confirm => conservatively demoted (possibly a forward advance
+   we could not prove; NOT a proven fork).
+Chain monotonic, 0 wrong-ledger/invariant errors.
+
+RESULT: with multi-source ancestry, residual demotes are 6/7 PROVEN-genuine
+(forks/acquire) and 1/7 an unprovable-ancestry gap (intermediate ledgers not
+resident). The spurious-forward-advance class is eliminated; the only remaining
+non-genuine case is the rare unprovable gap when the trailing distance's
+intermediate ledgers are not locally resident. Node ~99% full, chain-correct.
+Rollback: quaxar.histidx-3256a611.
