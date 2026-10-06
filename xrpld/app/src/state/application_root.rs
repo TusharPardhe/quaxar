@@ -6066,6 +6066,33 @@ impl ApplicationRoot {
         ledger
     }
 
+    /// Diagnostic: record an observer's vetoed built ledger in ledger-history
+    /// so the `LedgerHistory::validated_ledger` built!=validated mismatch path
+    /// (which runs the FORK_STATE_DIFF state-map diff) fires when the quorum
+    /// sibling validates. Observers never reach `record_consensus_built_ledger`
+    /// for a vetoed ledger (the veto returns early), so without this the built
+    /// hash is never recorded for the fork sequence. Records the built hash
+    /// only; no check-accept side effects.
+    pub(crate) fn record_observer_built_for_fork_diff(
+        &self,
+        ledger: Arc<Ledger>,
+        consensus_hash: Uint256,
+    ) {
+        let ledger = self.ledger_with_node_fetcher(ledger);
+        // Keep it resident in the ledgers_by_hash cache so visit_differences
+        // can fetch its nodes when the validated sibling arrives.
+        let _ = self.store_consensus_ledger(Arc::clone(&ledger));
+        if let Some(runtime) = self.ledger_master_runtime()
+            && ledger.header().hash.is_non_zero()
+        {
+            runtime.ledger_master().ledger_history().built_ledger(
+                ledger,
+                consensus_hash,
+                JsonValue::Null,
+            );
+        }
+    }
+
     pub fn on_consensus_built_ledger(&self, ledger: Arc<Ledger>) {
         let consensus_hash = *ledger.header().tx_hash.as_uint256();
         let ledger = self.store_consensus_ledger(ledger);

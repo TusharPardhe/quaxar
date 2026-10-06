@@ -1943,6 +1943,16 @@ impl AppConsensus {
                         our_tx_ids = %our_tx_id_list,
                         "LCL_AUDIT observer local child vetoed for quorum-backed canonical sibling"
                     );
+                    // Record our vetoed built ledger in ledger-history so the
+                    // LedgerHistory::validated_ledger built!=validated mismatch
+                    // path (which runs the FORK_STATE_DIFF) fires when the
+                    // quorum sibling validates. Observers otherwise never call
+                    // built_ledger (the veto returns early), so the state diff
+                    // never had the built hash recorded. Diagnostic-only.
+                    root.record_observer_built_for_fork_diff(
+                        Arc::clone(&closed),
+                        work.consensus_hash,
+                    );
                     // Leave generic consensus Accepted. The NetworkOps strand
                     // owns endConsensus reconciliation and will switch to, or
                     // finish acquiring, the exact validated sibling.
