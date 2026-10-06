@@ -1109,6 +1109,32 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 break;
             }
 
+            // CLOB FORK TRACE (logging-only): record the exact per-offer
+            // consumption inputs/outputs so a steady-state offer-consumption
+            // rounding fork can be localized to a single ceil_out/mul_round
+            // call. Keyed by offer so it can be correlated with FORK_STATE_DIFF
+            // divergent offer keys. Only emitted for OfferCreate crossing
+            // (enforce_quality_threshold) to keep volume bounded.
+            if options.enforce_quality_threshold {
+                tracing::info!(
+                    target: "lcl_audit",
+                    event = "clob_offer_consumption",
+                    offer_key = %offer_sle.key(),
+                    oq = offer_quality.value(),
+                    ofr_gets_m = taker_gets.mantissa(), ofr_gets_e = taker_gets.exponent(),
+                    ofr_pays_m = taker_pays.mantissa(), ofr_pays_e = taker_pays.exponent(),
+                    own_m = owner_funds.mantissa(), own_e = owner_funds.exponent(),
+                    rem_in_m = remaining_in.mantissa(), rem_in_e = remaining_in.exponent(),
+                    rem_out_m = remaining_out.mantissa(), rem_out_e = remaining_out.exponent(),
+                    cons_in_m = consumption.step_in.mantissa(), cons_in_e = consumption.step_in.exponent(),
+                    cons_out_m = consumption.step_out.mantissa(), cons_out_e = consumption.step_out.exponent(),
+                    ofr_in_m = consumption.offer_in.mantissa(), ofr_in_e = consumption.offer_in.exponent(),
+                    ofr_out_m = consumption.offer_out.mantissa(), ofr_out_e = consumption.offer_out.exponent(),
+                    frv2 = fix_reduced_offers_v2,
+                    "CLOB_OFFER_CONSUMPTION per-offer crossing math"
+                );
+            }
+
             let mut reconciled_to_reverse_cache = false;
             if options.pass == BookStepPass::Forward {
                 let mut candidate_ins = saved_ins.clone();
