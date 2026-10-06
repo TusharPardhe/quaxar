@@ -1262,11 +1262,24 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             }
 
             if !reconciled_to_reverse_cache {
+                let capped_in_forward = consumption.input_capped_in_forward;
                 insert_sorted_amount(&mut saved_ins, consumption.step_in);
                 insert_sorted_amount(&mut saved_outs, consumption.step_out);
-                total_in = sum_sorted_amounts(&saved_ins, max_in);
                 total_out = sum_sorted_amounts(&saved_outs, max_out);
-                remaining_in = max_in.clone() - total_in.clone();
+                if capped_in_forward {
+                    // rippled BookStep.cpp fwdImp pins `result.in = in` after
+                    // limitStepIn and returns processMore=false, so remainingIn
+                    // becomes exactly zero and no further offer is processed.
+                    // Re-summing the capped input via STAmount folding can leave
+                    // a representable IOU dust > 0, which would make this book
+                    // loop visit one extra resting offer and fork the ledger
+                    // (same total input, redistributed across one more offer).
+                    total_in = max_in.clone();
+                    remaining_in = max_in.zeroed();
+                } else {
+                    total_in = sum_sorted_amounts(&saved_ins, max_in);
+                    remaining_in = max_in.clone() - total_in.clone();
+                }
             }
             offers_consumed += 1;
         }
@@ -2522,6 +2535,13 @@ struct OfferConsumption {
     owner_gives: STAmount,
     /// The actual offer output consumed (= ofrAmt.out, for updating offer SLE)
     offer_out: STAmount,
+    /// True only when the FORWARD pass strictly input-capped this offer
+    /// (pre-limit step_in > remaining_in). rippled BookStep.cpp fwdImp pins
+    /// `result.in = in` and sets `processMore = false` in this branch so the
+    /// book loop stops with remainingIn exactly zero. We mirror that pin to
+    /// avoid a representable IOU re-sum dust that would otherwise let the
+    /// forward loop visit one extra resting offer (consensus fork).
+    input_capped_in_forward: bool,
 }
 
 impl OfferConsumption {
@@ -2562,6 +2582,7 @@ fn compute_offer_consumption(
     let mut owner_gives = offer_owner_gives(&ofr_out, transfer_rate_out);
     let mut actual_ofr_in = ofr_in;
     let mut actual_ofr_out = ofr_out;
+    let mut input_capped_in_forward = false;
     // TOffer retains the BookDirectory quality supplied by BookTip. Every
     // subsequent limitIn/limitOut operation uses it even after owner funding
     // or an earlier crossing has reduced the working offer amounts.
@@ -2599,6 +2620,15 @@ fn compute_offer_consumption(
                 stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
             }
         } else if *remaining_in < stp_in {
+            // rippled BookStep.cpp fwdImp strict input-cap branch: this offer
+            // would consume more than the remaining input, so it is capped to
+            // exactly remaining_in and the book loop must stop with no residual
+            // (result.in pinned to `in`, processMore=false). Record it so the
+            // caller pins total_in to max_in instead of re-summing (which can
+            // leave IOU dust and over-consume the next offer).
+            if pass == BookStepPass::Forward {
+                input_capped_in_forward = true;
+            }
             stp_in = remaining_in.clone();
             let in_lmt = mul_ratio_amount(&stp_in, QUALITY_ONE, transfer_rate_in, false);
             let offer_amounts = Amounts::new(actual_ofr_in.clone(), actual_ofr_out.clone());
@@ -2623,6 +2653,7 @@ fn compute_offer_consumption(
         offer_in: actual_ofr_in,
         owner_gives,
         offer_out: actual_ofr_out,
+        input_capped_in_forward,
     }
 }
 

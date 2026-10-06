@@ -610,6 +610,7 @@ fn sell_offer_stops_when_input_exhausted_not_over_consuming() {
         c_xrp_before - c_xrp_after
     );
 }
+
 /// sub-unit sell IOC offer against sufficient opposite-side liquidity crosses,
 /// matching rippled's flow() crossing. (The byte-exact tx-35 reproduction
 /// requires the full on-ledger ETH/RLUSD state and is tracked as a replay
