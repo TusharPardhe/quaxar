@@ -483,6 +483,24 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     // byte-for-byte unchanged.
     let crossed = offer_was_crossed(&taker_gets, &taker_pays, &remaining_gets, &remaining_pays);
 
+    // OFFER-PLACEMENT FORK TRACE (logging-only): the residual offer amounts
+    // and crossed flag drive directory insertion + owner-count. A placement
+    // divergence (DirectoryNode/OwnerCount fork with no consumed-offer diff)
+    // is localized here. Bounded: one line per OfferCreate.
+    tracing::info!(
+        target: "lcl_audit",
+        event = "offer_create_residual",
+        acct = %account,
+        offer_seq = sttx.get_field_u32(sf("sfSequence")),
+        is_sell,
+        tg_m = taker_gets.mantissa(), tg_e = taker_gets.exponent(),
+        tp_m = taker_pays.mantissa(), tp_e = taker_pays.exponent(),
+        rem_g_m = remaining_gets.mantissa(), rem_g_e = remaining_gets.exponent(),
+        rem_p_m = remaining_pays.mantissa(), rem_p_e = remaining_pays.exponent(),
+        crossed,
+        "OFFER_CREATE_RESIDUAL residual offer after cross"
+    );
+
     // --- Fully crossed check ---
     if remaining_gets.signum() <= 0 || remaining_pays.signum() <= 0 {
         return Ter::TES_SUCCESS; // Fully crossed
