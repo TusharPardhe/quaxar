@@ -324,6 +324,11 @@ where
                 parts.push(format!("OwnerCount={}", sle.get_field_u32(f("sfOwnerCount"))));
                 parts.push(format!("Seq={}", sle.get_field_u32(f("sfSequence"))));
                 parts.push(format!("Flags={}", sle.get_field_u32(f("sfFlags"))));
+                parts.push(format!("PrevTxnID={}", sle.get_field_h256(f("sfPreviousTxnID"))));
+                parts.push(format!("PrevTxnLgr={}", sle.get_field_u32(f("sfPreviousTxnLgrSeq"))));
+                if sle.is_field_present(f("sfOwnerNode")) {
+                    parts.push(format!("OwnerNode={}", sle.get_field_u64(f("sfOwnerNode"))));
+                }
             }
             protocol::LedgerEntryType::RippleState => {
                 if let Some(s) = amt("sfBalance") { parts.push(s); }
@@ -332,6 +337,15 @@ where
             protocol::LedgerEntryType::DirectoryNode => {
                 parts.push(format!("IndexNext={}", sle.get_field_u64(f("sfIndexNext"))));
                 parts.push(format!("Flags={}", sle.get_field_u32(f("sfFlags"))));
+                if sle.is_field_present(f("sfIndexes")) {
+                    let idx = sle.get_field_v256(f("sfIndexes"));
+                    let v = idx.value();
+                    // XOR-fingerprint of the offer-key set so a differing
+                    // membership shows even when count matches.
+                    let mut fp = Uint256::default();
+                    for k in v { fp ^= *k; }
+                    parts.push(format!("Indexes_n={} Indexes_fp={}", v.len(), fp));
+                }
             }
             _ => {}
         }
