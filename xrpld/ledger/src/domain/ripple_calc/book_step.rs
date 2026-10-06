@@ -1139,7 +1139,9 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             // call. Keyed by offer so it can be correlated with FORK_STATE_DIFF
             // divergent offer keys. Only emitted for OfferCreate crossing
             // (enforce_quality_threshold) to keep volume bounded.
-            if options.enforce_quality_threshold {
+            // Widened: capture all crossings (payment-flow + self-dealing),
+            // not only enforce_quality_threshold OfferCreate crossings.
+            if true {
                 tracing::info!(
                     target: "lcl_audit",
                     event = "clob_offer_consumption",
