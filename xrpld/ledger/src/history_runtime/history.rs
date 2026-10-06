@@ -183,7 +183,29 @@ where
                         && let Some(item) = node.peek_item()
                         && diff_keys.len() < 32
                     {
-                        diff_keys.push(format!("{}", item.key()));
+                        let key = item.key();
+                        // Decode OUR built-side SLE so the entry type + salient
+                        // fields identify what diverges (e.g. an Offer we kept
+                        // that the network deleted, with its remaining amounts).
+                        let desc = match crate::parse_state_sle_any(item.data(), key) {
+                            Some(sle) => {
+                                let ty = sle.get_type();
+                                let extra = if ty == protocol::LedgerEntryType::Offer {
+                                    let tg = sle.get_field_amount(protocol::get_field_by_symbol("sfTakerGets"));
+                                    let tp = sle.get_field_amount(protocol::get_field_by_symbol("sfTakerPays"));
+                                    format!(
+                                        " OurOffer TakerGets[m={} e={} neg={}] TakerPays[m={} e={} neg={}]",
+                                        tg.mantissa(), tg.exponent(), tg.negative() as u8,
+                                        tp.mantissa(), tp.exponent(), tp.negative() as u8
+                                    )
+                                } else {
+                                    String::new()
+                                };
+                                format!("{:?}{}", ty, extra)
+                            }
+                            None => "<undecodable/absent-in-ours>".to_owned(),
+                        };
+                        diff_keys.push(format!("{key}={desc}"));
                     }
                     true
                 };
