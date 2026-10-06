@@ -2713,6 +2713,45 @@ impl ConsensusRunner for AppConsensus {
         // this proposal was queued — matching rippled's `checkPropose` which
         // calls `peerPos.checkSign()` and drops invalid proposals before they
         // reach `processTrustedProposal` / `peer_proposal`.
+        //
+        // Trust gate (parity with rippled PeerImp::checkPropose): ONLY a
+        // proposal signed by a trusted UNL validator key may influence local
+        // consensus. rippled calls `processTrustedProposal` -> `peerProposal`
+        // exclusively when `isTrusted`; untrusted proposals are only relayed
+        // (never fed to the consensus algorithm). Without this gate an observer
+        // ingests untrusted peer positions into `curr_peer_positions` and
+        // converges toward a non-quorum tx set (e.g. late-arriving txs other
+        // observers included), building a ledger that forks from the validator
+        // quorum's validated chain. The validator identity is the proposal's
+        // master key when a manifest maps it; fall back to the signing key.
+        let proposal_key = *peer_pos.public_key();
+        let is_trusted = self.adaptor.app_root.validators().trusted(proposal_key);
+        {
+            // Diagnostic: count trusted vs untrusted proposals so a deploy can
+            // confirm the trust gate does not starve consensus of validator
+            // positions. Logging-only.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TRUSTED: AtomicU64 = AtomicU64::new(0);
+            static UNTRUSTED: AtomicU64 = AtomicU64::new(0);
+            let (t, u) = if is_trusted {
+                (TRUSTED.fetch_add(1, Ordering::Relaxed) + 1, UNTRUSTED.load(Ordering::Relaxed))
+            } else {
+                (TRUSTED.load(Ordering::Relaxed), UNTRUSTED.fetch_add(1, Ordering::Relaxed) + 1)
+            };
+            if (t + u) % 50 == 0 {
+                tracing::info!(target: "consensus", event = "proposal_trust_tally", trusted = t, untrusted = u,
+                    "PROPOSAL_TRUST_TALLY trusted vs untrusted peer proposals seen");
+            }
+        }
+        if !is_trusted {
+            tracing::trace!(
+                target: "consensus",
+                proposal_key = %proposal_key,
+                "dropping untrusted peer proposal from consensus influence (relay-only, rippled checkPropose parity)"
+            );
+            return false;
+        }
+
         let our_prev = *self.state.prev_ledger_id();
         let their_prev = *peer_pos.proposal().prev_ledger();
         let accepted = self.state.peer_proposal(&self.adaptor, now, peer_pos);
