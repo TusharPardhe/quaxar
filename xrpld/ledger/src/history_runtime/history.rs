@@ -229,30 +229,37 @@ where
         // Pass 2: for each divergent key, decode BOTH our built and the
         // validated SLE and emit the exact field-level delta. This removes any
         // dependency on historical ledger RPC (which retention can block).
+        // Also cross-reference each key against the entries THIS ledger's own
+        // transactions touched (from our built tx-map metadata): a divergent
+        // key tagged THIS_LEDGER pinpoints the root transaction; INHERITED keys
+        // are cascaded from an earlier fork.
+        let touched = Self::this_ledger_touched_keys(built_ledger);
         let mut diff_keys: Vec<String> = Vec::new();
         for key in &diff_hashes {
+            let origin = if touched.contains(key) { "THIS_LEDGER" } else { "INHERITED" };
             let keylet = protocol::Keylet::new(protocol::LedgerEntryType::Any, *key);
             let ours = built_ledger.read(keylet).ok().flatten();
             let theirs = valid_ledger.read(keylet).ok().flatten();
             let desc = match (ours, theirs) {
                 (Some(o), None) => {
-                    format!("{:?} PRESENT_IN_OURS_ABSENT_IN_VALIDATED {}", o.get_type(), Self::sle_salient(&o))
+                    format!("[{origin}] {:?} PRESENT_IN_OURS_ABSENT_IN_VALIDATED {}", o.get_type(), Self::sle_salient(&o))
                 }
                 (None, Some(t)) => {
-                    format!("{:?} ABSENT_IN_OURS_PRESENT_IN_VALIDATED {}", t.get_type(), Self::sle_salient(&t))
+                    format!("[{origin}] {:?} ABSENT_IN_OURS_PRESENT_IN_VALIDATED {}", t.get_type(), Self::sle_salient(&t))
                 }
                 (Some(o), Some(t)) => {
                     format!(
-                        "{:?} VALUE_DIFF ours{{{}}} validated{{{}}}",
+                        "[{origin}] {:?} VALUE_DIFF ours{{{}}} validated{{{}}}",
                         o.get_type(),
                         Self::sle_salient(&o),
                         Self::sle_salient(&t)
                     )
                 }
-                (None, None) => "<absent-in-both?>".to_owned(),
+                (None, None) => format!("[{origin}] <absent-in-both?>"),
             };
             diff_keys.push(format!("{key}={desc}"));
         }
+        let touched_divergent = diff_hashes.iter().filter(|k| touched.contains(k)).count();
         tracing::warn!(
             target: "lcl_audit",
             event = "fork_state_diff",
@@ -260,9 +267,37 @@ where
             built = %built,
             validated = %validated,
             divergent_sle_count = diff_keys.len(),
+            touched_divergent,
             divergent_sle_keys = ?diff_keys,
             "FORK_STATE_DIFF: ledger entries differing between our built ledger and the validated sibling"
         );
+    }
+
+    /// Collect the set of ledger-entry keys touched by THIS ledger's own
+    /// transactions, by walking our built ledger's transaction map and reading
+    /// each tx metadata's affected-node LedgerIndex values. Used to classify a
+    /// divergent SLE as rooted in this ledger vs inherited from an earlier fork.
+    fn this_ledger_touched_keys(built_ledger: &Arc<Ledger>) -> std::collections::HashSet<Uint256> {
+        use protocol::get_field_by_symbol as f;
+        let mut touched = std::collections::HashSet::new();
+        let seq = built_ledger.header().seq;
+        let Some(fetch_arc) = built_ledger.node_fetcher_closure() else {
+            return touched;
+        };
+        let mut fetch = move |h| fetch_arc(h);
+        let mut visit = |item: &shamap::nodes::item::SHAMapItem| {
+            if let Ok((_tx, meta)) = crate::decode_transaction_md_item(seq, item)
+            {
+                for n in meta.get_nodes().iter() {
+                    let k = n.get_field_h256(f("sfLedgerIndex"));
+                    if k != Uint256::default() {
+                        touched.insert(k);
+                    }
+                }
+            }
+        };
+        let _ = built_ledger.tx_map().visit_leaves(&mut fetch, &mut visit);
+        touched
     }
 
     /// Render the salient fields of an SLE for fork diagnosis: entry type plus
