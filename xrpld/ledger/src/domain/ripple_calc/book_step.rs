@@ -1158,6 +1158,11 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                     ofr_in_m = consumption.offer_in.mantissa(), ofr_in_e = consumption.offer_in.exponent(),
                     ofr_out_m = consumption.offer_out.mantissa(), ofr_out_e = consumption.offer_out.exponent(),
                     frv2 = fix_reduced_offers_v2,
+                    max_in_m = max_in.mantissa(), max_in_e = max_in.exponent(),
+                    rev_in_m = reverse_input.mantissa(), rev_in_e = reverse_input.exponent(),
+                    tot_in_m = total_in.mantissa(), tot_in_e = total_in.exponent(),
+                    pass = ?options.pass,
+                    oc = offers_consumed,
                     "CLOB_OFFER_CONSUMPTION per-offer crossing math"
                 );
             }
