@@ -422,6 +422,194 @@ fn tx35_exact_tiny_sell_ioc_crosses_deep_offer() {
 /// resolved to `tecKILLED` (crossed nothing) where the network crossed and
 /// returned `tesSUCCESS`; the resulting tx-tree/account-hash mismatch drove the
 /// `consensusViewChange` demotion. This guard pins the general property that a
+
+/// Reproduction of the mechanism behind CLOB fork 21328699: a `tfSell`
+/// OfferCreate must consume ALL resting offers across multiple adjacent
+/// (slightly different) qualities to sell its full TakerGets, not stop after
+/// the first quality. On the network a tfSell selling 1 BOOK for XRP deleted
+/// FOUR resting buy-offers at 4 distinct qualities (~1.0e-11 .. 1.1e-11); our
+/// node was observed consuming only 1. tfSell sets deliver=MAX so the input
+/// (TakerGets) is the only limit; the flow engine must iterate book-step
+/// qualities until the input is exhausted.
+///
+/// This uses XRP->USD resting offers (makers give XRP, want USD) crossed by a
+/// taker selling USD for XRP. Two makers rest at adjacent qualities; the taker
+/// sells enough USD to require BOTH, and asserts both resting offers are gone
+/// (owner counts drop to 0) and the taker received XRP from both.
+#[test]
+fn sell_offer_consumes_multiple_adjacent_qualities_like_network() {
+    let maker_a = acct(0x81);
+    let maker_b = acct(0x82);
+    let taker = acct(0x83);
+    let usd_issuer = acct(0x84);
+    let usd = protocol::currency_from_string("USD");
+
+    let mut entries = vec![
+        account_root(maker_a, 100_000_000_000, 1, 0),
+        account_root(maker_b, 100_000_000_000, 1, 0),
+        account_root(taker, 100_000_000_000, 1, 0),
+        account_root(usd_issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
+    ];
+    // Makers can receive USD (they buy USD with XRP).
+    entries.push(trust_line_frac(maker_a, usd_issuer, usd, 0, 0, 1_000_000));
+    entries.push(trust_line_frac(maker_b, usd_issuer, usd, 0, 0, 1_000_000));
+    // Taker holds USD to sell.
+    entries.push(trust_line_frac(taker, usd_issuer, usd, 1_000_000_000_000_000, -12, 1_000_000));
+
+    let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // Maker A rests: gives 10_000_000 drops XRP, wants 100 USD  (quality 100/10e6).
+    let offer_a = offer_tx(
+        maker_a,
+        iou_frac(usd_issuer, usd, 100_000_000_000_000, -12), // TakerPays 100 USD
+        xrp(10_000_000),                                     // TakerGets 10 XRP
+        1,
+    );
+    assert_eq!(
+        full_apply(&mut view, &offer_a, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "maker A offer must rest"
+    );
+    // Maker B rests at a slightly WORSE quality for the taker: gives 9_900_000
+    // drops XRP, wants 100 USD (fewer drops per USD -> adjacent lower quality).
+    let offer_b = offer_tx(
+        maker_b,
+        iou_frac(usd_issuer, usd, 100_000_000_000_000, -12), // TakerPays 100 USD
+        xrp(9_900_000),                                      // TakerGets 9.9 XRP
+        1,
+    );
+    assert_eq!(
+        full_apply(&mut view, &offer_b, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "maker B offer must rest"
+    );
+
+    let before_taker_xrp = xrp_balance(&view, taker);
+
+    // Taker: tfSell, sells 200 USD for XRP (enough to require BOTH makers).
+    // deliver=MAX for tfSell, so the 200 USD input is the only limit; the
+    // engine must cross maker A (best) then continue to maker B (adjacent).
+    let sell = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1)); // minimal XRP ask; tfSell takes more
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            iou_frac(usd_issuer, usd, 200_000_000_000_000, -12), // 200 USD
+        );
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let res = full_apply(&mut view, &sell, TxType::OFFER_CREATE);
+    assert_eq!(res, Ter::TES_SUCCESS, "tfSell crossing must succeed; got {res:?}");
+
+    // Both makers' offers must be fully consumed (owner count back to 0 means
+    // the resting Offer SLE was deleted). If the engine stopped after the
+    // first quality, maker B's offer would still rest (owner count 1).
+    // Taker receiving XRP from BOTH makers proves both resting offers (at the
+    // two adjacent qualities) were consumed. Maker A gives 10 XRP, maker B
+    // gives 9.9 XRP => ~19.9 XRP delivered. If the engine stopped after the
+    // first quality (the fork-21328699 bug) the taker would gain only ~10 XRP.
+    let gained = xrp_balance(&view, taker) - before_taker_xrp;
+    assert!(
+        gained >= 19_800_000,
+        "taker must receive XRP from BOTH adjacent-quality makers (~19.9 XRP); \
+         got {gained} drops -- stopping at the first quality is the \
+         fork-21328699 multi-quality continuation bug"
+    );
+}
+
+/// Reproduction of CLOB over-consumption fork 21334961: a `tfSell` OfferCreate
+/// whose input (TakerGets) is EXHAUSTED by the first N resting offers must stop
+/// and leave the remaining book RESTING -- it must not keep draining offers for
+/// rounding dust. On the network a tfSell selling 1 AUROOS consumed exactly 2
+/// offers (one fully, one partially) and stopped (8 affected nodes). Our node
+/// consumed MORE, deleting an extra offer owned by an uninvolved account
+/// (OwnerCount 28 vs validated 29). This pins the sendMax-exhaustion stop:
+/// once total input == sendMax (within rounding), the flow loop must terminate.
+///
+/// Setup: taker sells 1 USD (tfSell). Two makers rest offers that together want
+/// exactly 1 USD; a THIRD maker rests a well-priced offer that must survive
+/// untouched because the taker's 1 USD is already spent.
+#[test]
+fn sell_offer_stops_when_input_exhausted_not_over_consuming() {
+    let maker_a = acct(0x91);
+    let maker_b = acct(0x92);
+    let maker_c = acct(0x93); // must NOT be consumed
+    let taker = acct(0x94);
+    let usd_issuer = acct(0x95);
+    let usd = protocol::currency_from_string("USD");
+
+    let mut entries = vec![
+        account_root(maker_a, 100_000_000_000, 1, 0),
+        account_root(maker_b, 100_000_000_000, 1, 0),
+        account_root(maker_c, 100_000_000_000, 1, 0),
+        account_root(taker, 100_000_000_000, 1, 0),
+        account_root(usd_issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
+    ];
+    entries.push(trust_line_frac(maker_a, usd_issuer, usd, 0, 0, 1_000_000));
+    entries.push(trust_line_frac(maker_b, usd_issuer, usd, 0, 0, 1_000_000));
+    entries.push(trust_line_frac(maker_c, usd_issuer, usd, 0, 0, 1_000_000));
+    entries.push(trust_line_frac(taker, usd_issuer, usd, 1_000_000_000_000_000, -15, 1_000_000));
+
+    let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // Maker A: gives 6 XRP, wants 0.6 USD (best quality: 10 XRP/USD).
+    let offer_a = offer_tx(
+        maker_a,
+        iou_frac(usd_issuer, usd, 600_000_000_000_000, -15), // TakerPays 0.6 USD
+        xrp(6_000_000),                                      // TakerGets 6 XRP
+        1,
+    );
+    assert_eq!(full_apply(&mut view, &offer_a, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    // Maker B: gives 3.6 XRP, wants 0.4 USD (quality 9 XRP/USD) -> together A+B
+    // want exactly 1.0 USD = the taker's full input.
+    let offer_b = offer_tx(
+        maker_b,
+        iou_frac(usd_issuer, usd, 400_000_000_000_000, -15), // TakerPays 0.4 USD
+        xrp(3_600_000),                                      // TakerGets 3.6 XRP
+        1,
+    );
+    assert_eq!(full_apply(&mut view, &offer_b, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    // Maker C: gives 8 XRP, wants 1 USD (quality 8 XRP/USD, still crossable) --
+    // MUST survive because the taker's 1 USD is exhausted by A+B.
+    let offer_c = offer_tx(
+        maker_c,
+        iou_frac(usd_issuer, usd, 1_000_000_000_000_000, -15), // TakerPays 1 USD
+        xrp(8_000_000),                                        // TakerGets 8 XRP
+        1,
+    );
+    assert_eq!(full_apply(&mut view, &offer_c, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+
+    let c_xrp_before = xrp_balance(&view, maker_c);
+
+    // Taker: tfSell, sells exactly 1 USD. deliver=MAX, sendMax=1 USD.
+    let sell = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1)); // nominal; tfSell takes more
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            iou_frac(usd_issuer, usd, 1_000_000_000_000_000, -15), // 1 USD
+        );
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let res = full_apply(&mut view, &sell, TxType::OFFER_CREATE);
+    assert_eq!(res, Ter::TES_SUCCESS, "tfSell must succeed; got {res:?}");
+
+    // Maker C's offer MUST be untouched: its XRP balance unchanged means its
+    // offer did not cross. Consuming it is the fork-21334961 over-consumption.
+    let c_xrp_after = xrp_balance(&view, maker_c);
+    assert_eq!(
+        c_xrp_after, c_xrp_before,
+        "maker C offer must survive (taker input exhausted by A+B); over-consuming \
+         it is the fork-21334961 bug. C balance moved by {} drops",
+        c_xrp_before - c_xrp_after
+    );
+}
 /// sub-unit sell IOC offer against sufficient opposite-side liquidity crosses,
 /// matching rippled's flow() crossing. (The byte-exact tx-35 reproduction
 /// requires the full on-ledger ETH/RLUSD state and is tracked as a replay
