@@ -1046,7 +1046,28 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             }
 
             if dispute_count > 0 || vote_changes > 0 {
-                tracing::info!(target: "consensus", dispute_count, vote_changes, proposing, converge_pct = self.converge_percent, "update_our_positions: dispute status");
+                // Sample up to 4 disputes' vote state so the convergence
+                // dynamics are visible: a dispute that keeps flipping or is
+                // freshly re-created each round (yays/nays churn) explains the
+                // vote_changes==dispute_count oscillation. Diagnostic-only.
+                let sample: Vec<String> = {
+                    let result = self.result.as_ref().expect("result set");
+                    result
+                        .disputes
+                        .values()
+                        .take(4)
+                        .map(|d| {
+                            format!(
+                                "{}:y{}n{}ov{}",
+                                d.id().to_string().get(..6).unwrap_or(""),
+                                d.yays(),
+                                d.nays(),
+                                d.get_our_vote() as u8
+                            )
+                        })
+                        .collect()
+                };
+                tracing::info!(target: "consensus", dispute_count, vote_changes, proposing, converge_pct = self.converge_percent, peers = self.curr_peer_positions.len(), dispute_sample = ?sample, "update_our_positions: dispute status");
             }
 
             our_new_set = mutable_set;
