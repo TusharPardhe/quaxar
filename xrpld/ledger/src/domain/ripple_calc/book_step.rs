@@ -996,6 +996,18 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             // `forEachOffer` stops before invoking the derived callback when
             // the stream advances to a second quality after an offer attempt.
             if !accepts_step_quality(&mut first_quality, offer_quality) {
+                if options.enforce_quality_threshold {
+                    tracing::info!(
+                        target: "lcl_audit",
+                        event = "clob_stop_quality_boundary",
+                        closed_seq = view.seq(),
+                        offer_key = %offer_sle.key(),
+                        first_q = first_quality.map(|q| q.value()).unwrap_or(0),
+                        this_q = offer_quality.value(),
+                        offers_consumed,
+                        "CLOB_STOP: one-quality-per-step boundary stopped consumption"
+                    );
+                }
                 break;
             }
 
@@ -1084,6 +1096,18 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 offer_quality,
                 quality_threshold,
             ) {
+                if options.enforce_quality_threshold {
+                    tracing::info!(
+                        target: "lcl_audit",
+                        event = "clob_stop_threshold",
+                        closed_seq = view.seq(),
+                        offer_key = %offer_sle.key(),
+                        this_q = offer_quality.value(),
+                        threshold_q = quality_threshold.map(|q| q.value()).unwrap_or(0),
+                        offers_consumed,
+                        "CLOB_STOP: offer quality below crossing threshold stopped consumption"
+                    );
+                }
                 break;
             }
 
