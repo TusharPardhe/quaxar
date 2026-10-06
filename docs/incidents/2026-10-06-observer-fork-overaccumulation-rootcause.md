@@ -1,93 +1,78 @@
-# Residual Observer Fork — Root Cause (2026-10-06)
+# Residual Fork — Final Diagnosis (2026-10-06, iters 1–5)
 
-## Status
-Node is **fully functional and syncing in lockstep** with testnet (our validated
-seq tracks the network, 0 wrong-ledger errors, 0 invariant failures, 0 panics
-over multi-hour runs, state=full, 17 peers). It still produces **intermittent
-local forks (~1–2/hr)** that **self-heal** (the node adopts the validated chain
-within one round, leaving a transient 1-ledger gap in `complete_ledgers`).
+## Node status (verified, end of session)
+Fully functional and syncing in lockstep with testnet: `state=full`, our validated
+seq within 1–3 of network, 20 peers, **0 wrong-ledger / 0 invariant errors**,
+cadence ~1.7s/ledger with **no stalls**. Disk healthy (2.4G free, journal capped
+at 300M). Residual forks are **rare, tiny (±1 drop / 2–4 SLEs), and self-healing**
+(node adopts the validated chain every time).
 
-## Ground-Truth-Proven Root Cause
+## Two fork classes identified and their status
 
-The fork is a **consensus tx-set OVER-ACCUMULATION on "spike" rounds**, NOT a
-transactor, build, apply, or ledger-hashing bug.
+### Class A — over-accumulation / recovery stalls (ROOT CAUSE FOUND + FIXED)
+The testnet server disk was **100% full (30G/30G)** during the earlier
+investigation. A full disk stalled NuDB/ledger-persistence writes, caused 16–82s
+`WrongLedger` recovery stalls, and amplified forks via open-ledger
+over-accumulation. **Fixed non-destructively**: vacuumed journald (freed 559M),
+removed ~30 stale diagnostic binaries, set a permanent `SystemMaxUse=300M`
+journald cap. After the fix the 82s stalls disappeared and cadence became clean.
+This was the dominant stability problem.
 
-### Decisive evidence (public testnet `s.altnet.rippletest.net`)
-For forked ledger **21324370**:
-- Our node proposed and built a **36-transaction** ledger (`consensus_tx_set=91FE397E…`).
-- The network validated a **3-transaction** ledger (`tx_hash=08ED3C6E…`, `ledger_hash=08ED…`).
-- Mapping our 36 tx-ids against the network's ledgers: all 36 are real (0 not-found),
-  distributed across **5 consecutive network ledgers**:
-  - 21324370: 3 (match) · 21324371: 9 · 21324372: 10 · 21324373: 3 · 21324374: 11 → **36 total**.
-- **We packed ~5 network ledgers' worth of transactions into one ledger.**
+### Class B — CLOB offer-crossing ±1-drop rounding (ROOT CAUSE PINPOINTED)
+Remaining rare forks are a **±1-drop rounding-direction mismatch** in offer
+crossing on heavily-traded self-dealing market-maker books (rLgZXam / BEEC74 /
+1860F4, book `21FBD3CA`).
 
-For a second fork (21323450): network validated **26** txs, we built **35** (strict
-superset, 9 extra = ticket/`Sequence=0` funding Payments + an AccountSet, all of
-which the network validated in the NEXT ledger 21323451).
+**Exact captured reproduction (fork 21332266, binary widetrace-1ae45356):**
+- Two XRP `AccountRoot`s differ by **exactly 1 drop**, with **identical**
+  `PreviousTxnID`, `Sequence`, `OwnerCount`, `Flags`:
+  - `BC3006…`: ours 262640361 vs validated 262640360 (+1)
+  - `1860F4…`: ours 609392365 vs validated 609392366 (−1)
+- Crossing (`CLOB_OFFER_CONSUMPTION`): resting offer `2E92317F` with
+  `TakerGets=5999993 drops XRP`, `TakerPays=3.039980301943390 524C`
+  (quality `oq=5625558974706031031`), a tfSell crossing wanting
+  `remaining_out=4000000 drops XRP`, consuming `cons_out=4000000` XRP for
+  `cons_in=2.026655899060810` 524C, `owner_funds=3541511999`.
+- Fork 21332270 shows the identical pattern (offer `9813D76`, 1-drop delta,
+  same PrevTxnID), confirming reproducibility.
 
-### Correlation
-When our `effective_close_time` and tx-count match the network (e.g. 21324407:
-both 22 txs / close 844606010; 21324410: both 18 txs / close 844606020), there is
-**no fork**. Forks occur only when `open_tx_count` SPIKES (normal 10–25, spikes to
-36/39/63) and we accept a superset.
+**Where it is:** the consumed amounts (`cons_out`/`cons_in`) themselves match the
+network; the ±1 drop appears in the **balance transfer** that maps those amounts
+to account balances (`execute_offer_trade` / `ownerGives` / the IOU↔XRP
+transfer-rate rounding), i.e. a ceil-vs-floor boundary.
 
-## What was verified BYTE-IDENTICAL to rippled (ruling these out)
-Exhaustive line-by-line audit against `../rippled` `develop`:
-- `LEDGER_TOTAL_PASSES=3`, `LEDGER_RETRY_PASSES=1`
-- `getNeededWeight`, avalanche cutoffs `{Init 50, Mid 65, Late 70, Stuck 95}`,
-  `avMinRounds=2`, `avStalledRounds=4`, `avCtConsensusPct=75`,
-  `ledgerMinConsensus=1950ms`, `minConsensusPct=80`, `ledgerGRANULARITY=1s`
-- `DisputedTx::stalled` / `update_vote` (observer branch `yays > nays`) /
-  `set_vote` / `un_vote`
-- `check_consensus` / `check_consensus_reached` (incl. `stalled => true`)
-- `Transactor::checkSeqProxy` (`terPRE_SEQ`/`tefPAST_SEQ`/`terPRE_TICKET`)
-- `applyTransaction` retry classification (applied⇒Success; tef/tem/tel⇒Fail; else⇒Retry)
-- `CanonicalTXSet` ordering `(account XOR salt, seqProxy, txId)` with salt =
-  tx-set SHAMap hash
-- Payment XRP source-reserve / `tecUNFUNDED_PAYMENT` check (`preFeeBalance_`)
-- `roundCloseTime` / `effCloseTime`
-- `shouldCloseLedger` fast-path `(proposersClosed + proposersValidated) > prevProposers/2`
-- `ApplyStateTable` / `RawStateTable` / sandboxes use deterministic `BTreeMap`
-  (no `HashMap` non-determinism)
+**Verified byte-parity with rippled (ruled OUT as the cause):** `mul_round` /
+`mulRoundImpl`, `get_rate`, `Quality::increment` (`--value_`),
+`quality_satisfies_threshold` (`>=`), gateway `send_max` / `multiplyRound`,
+`get_book_offers` directory-quality (`quality_from_key`), `checkSeqProxy`,
+retry classification, canonical ordering + salt, `LEDGER_TOTAL_PASSES=3`,
+`MAX_OFFERS_TO_CONSUME=1000`, avalanche params. Earlier root fork 21331433 showed
+a 7.1-XRP delta on an rLgZXam tfSell self-dealing OfferCreate (same signature,
+larger magnitude).
 
-## Fix shipped this investigation
-`fix(consensus): only trusted UNL validator proposals influence consensus`
-(commit `7670589f`). rippled (`PeerImp::checkPropose`) feeds ONLY trusted-validator
-proposals to `processTrustedProposal → peerProposal`; our ingress fed ALL peer
-proposals into `curr_peer_positions`. This is a correct parity gap and is fixed,
-but it is a **no-op on this testnet** (all received proposals are already trusted:
-`PROPOSAL_TRUST_TALLY trusted=N untrusted=0`), so it does not remove these forks.
+## Fixes shipped this investigation
+- `fix(consensus): only trusted UNL validator proposals influence consensus`
+  (7670589f) — correct rippled `PeerImp::checkPropose` parity (no-op on this
+  all-trusted testnet, but correct).
+- Disk-full remediation + permanent journald cap (environmental, major stability
+  win).
 
-## Remaining mechanism (the actual fix target)
-The abnormality is **dispute non-convergence on spike rounds**:
-`update_our_positions` logs `vote_changes == dispute_count` every round at
-`converge_pct` 82–95% (where votes should be STABLE by the Stuck=95% avalanche
-state). Our accepted position stays a superset of the quorum's final set.
+## Exact next step to eliminate Class B
+Build a deterministic regression in `book_step_fork_repro_tests.rs` using the
+captured amounts (offer `TakerGets=5999993` drops / `TakerPays=3.039980301943390`
+524C; tfSell `remaining_out=4000000`; `owner_funds=3541511999`) that runs the
+full `execute_book_step` + `execute_offer_trade` transfer and asserts the
+resulting XRP balance delta matches the network (currently off by 1 drop). Bisect
+the single ceil/floor op in the transfer (prime suspects: the XRP-side
+`mul_ratio_amount` round direction, or `ceil_out_strict` round_up on the
+remaining-out clip). Then correct that one rounding to match rippled's
+`BookStep`/`TOffer::consume`. Validate over a multi-hour testnet run that the
+fork rate drops to 0 before shipping, because a wrong rounding change regresses
+every crossing.
 
-Because every static consensus/build component matches rippled byte-for-byte, the
-divergence is a **live timing/convergence dynamic**, most consistent with
-**stale/lagging peer-position processing**: the validators trim their proposed set
-across the round, but our `curr_peer_positions` snapshot used by
-`update_our_positions`/`have_consensus` lags behind their latest (shrinking)
-positions, so we accept on a stale snapshot where peers appeared to agree on our
-bloated set.
-
-### Recommended next steps (require careful live validation)
-1. Instrument per-peer `propose_seq` held in `curr_peer_positions` at accept vs the
-   latest `propose_seq` the overlay received for that peer. Confirm/deny lag.
-2. Ensure the consensus strand drains ALL pending `PeerProposal` commands
-   immediately before each `timer_tick` (`phase_establish`/`update_our_positions`)
-   so disputes always run against the freshest peer positions.
-3. Verify `update_our_positions` runs enough establish rounds per ~3s round to
-   satisfy avalanche convergence (`avMinRounds`), and that it re-trims our set
-   against peers' latest positions each round.
-4. Any change here MUST be validated over a multi-hour testnet run measuring fork
-   rate before/after, because consensus-timing changes can regress convergence.
-
-## Diagnostics to strip before shipping
-Logging-only additions made during this investigation (harmless to behavior, but
-verbose): `FORK_STATE_DIFF` + `record_observer_built_for_fork_diff`
-(`history.rs`, `application_root.rs`, `rcl_consensus.rs`), `APPLY_AUDIT`
-per-tx, `CONSENSUS_TXSET_AGREED`/`DIVERGENCE`, `PROPOSAL_TRUST_TALLY`,
-`THIS_LEDGER`/`INHERITED` tags. The `7670589f` trust-gate change is a real fix
-and should be KEPT.
+## Diagnostics deployed (strip before final ship — all logging-only)
+`FORK_STATE_DIFF` (both-sides field delta incl. PrevTxnID/OwnerNode/Indexes +
+THIS_LEDGER/INHERITED tags), `CLOB_OFFER_CONSUMPTION` (per-offer crossing math,
+seq-tagged, widened to all crossings), `OFFER_CREATE_RESIDUAL`, `CLOB_STOP_*`,
+`consensus_txset_*`, `PROPOSAL_TRUST_TALLY`, `apply_audit`,
+`record_observer_built_for_fork_diff`. Keep the `7670589f` trust-gate fix.
