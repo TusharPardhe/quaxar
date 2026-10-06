@@ -1119,6 +1119,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 tracing::info!(
                     target: "lcl_audit",
                     event = "clob_offer_consumption",
+                    closed_seq = view.seq(),
                     offer_key = %offer_sle.key(),
                     oq = offer_quality.value(),
                     ofr_gets_m = taker_gets.mantissa(), ofr_gets_e = taker_gets.exponent(),

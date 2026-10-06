@@ -490,6 +490,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     tracing::info!(
         target: "lcl_audit",
         event = "offer_create_residual",
+        closed_seq = view.seq(),
         acct = %account,
         offer_seq = sttx.get_field_u32(sf("sfSequence")),
         is_sell,
