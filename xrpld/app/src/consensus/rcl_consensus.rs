@@ -1894,46 +1894,6 @@ impl AppConsensus {
                     // close_time/resolution) vs parent divergence vs state.
                     let alt = root
                         .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(alternate_hash));
-                    // IN-PROCESS STATE DIFF: when the quorum sibling is
-                    // resident, walk both state maps and log the EXACT ledger
-                    // entries whose value differs between our built ledger and
-                    // the validated sibling. This pinpoints the divergent SLE
-                    // from real data without reproduction. The first/only
-                    // differing key + its two decoded versions is the bug.
-                    if let Some(alt_ledger) = alt.as_ref() {
-                        let our_fetch = closed.node_fetcher_closure();
-                        let alt_fetch = alt_ledger.node_fetcher_closure();
-                        if let (Some(of), Some(af)) = (our_fetch, alt_fetch) {
-                            let mut diff_keys: Vec<String> = Vec::new();
-                            let mut of2 = move |h| of(h);
-                            let mut af2 = move |h| af(h);
-                            let mut visit = |node: &basics::memory::intrusive_pointer::SharedIntrusive<shamap::nodes::tree_node::SHAMapTreeNode>| {
-                                if node.is_leaf()
-                                    && let Some(item) = node.peek_item()
-                                    && diff_keys.len() < 32
-                                {
-                                    diff_keys.push(format!("{}", item.key()));
-                                }
-                                true
-                            };
-                            let _ = closed.state_map().visit_differences(
-                                Some(alt_ledger.state_map()),
-                                &mut of2,
-                                &mut af2,
-                                &mut visit,
-                            );
-                            tracing::warn!(
-                                target: "lcl_audit",
-                                event = "fork_state_diff",
-                                closed_seq = closed.header().seq,
-                                our_hash = %closed_hash,
-                                alt_hash = %alternate_hash,
-                                divergent_sle_count = diff_keys.len(),
-                                divergent_sle_keys = ?diff_keys,
-                                "FORK_STATE_DIFF: ledger entries differing between our built ledger and the quorum sibling"
-                            );
-                        }
-                    }
                     // Our final consensus tx-set membership (sorted tx ids) so
                     // the symmetric difference vs the quorum set pinpoints the
                     // exact divergent transaction(s).

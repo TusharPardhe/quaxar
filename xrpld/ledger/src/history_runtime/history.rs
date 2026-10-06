@@ -166,6 +166,44 @@ where
                 validated_consensus_hash: consensus_hash,
                 consensus: entry.consensus.clone(),
             });
+            // FORK STATE DIFF: both our built ledger and the validated sibling
+            // are cached here. Walk their state maps and log the EXACT ledger
+            // entries whose value differs - the definitive fork localization.
+            if let (Some(built_ledger), Some(valid_ledger)) = (
+                self.get_cached_ledger_by_hash(SHAMapHash::new(*built.as_uint256())),
+                Some(Arc::clone(&ledger)),
+            ) && let (Some(bf), Some(vf)) =
+                (built_ledger.node_fetcher_closure(), valid_ledger.node_fetcher_closure())
+            {
+                let mut diff_keys: Vec<String> = Vec::new();
+                let mut bf2 = move |h| bf(h);
+                let mut vf2 = move |h| vf(h);
+                let mut visit = |node: &basics::memory::intrusive_pointer::SharedIntrusive<shamap::nodes::tree_node::SHAMapTreeNode>| {
+                    if node.is_leaf()
+                        && let Some(item) = node.peek_item()
+                        && diff_keys.len() < 32
+                    {
+                        diff_keys.push(format!("{}", item.key()));
+                    }
+                    true
+                };
+                let _ = built_ledger.state_map().visit_differences(
+                    Some(valid_ledger.state_map()),
+                    &mut bf2,
+                    &mut vf2,
+                    &mut visit,
+                );
+                tracing::warn!(
+                    target: "lcl_audit",
+                    event = "fork_state_diff",
+                    seq,
+                    built = %built,
+                    validated = %hash,
+                    divergent_sle_count = diff_keys.len(),
+                    divergent_sle_keys = ?diff_keys,
+                    "FORK_STATE_DIFF: ledger entries differing between our built ledger and the validated sibling"
+                );
+            }
         }
 
         entry.validated = Some(hash);
