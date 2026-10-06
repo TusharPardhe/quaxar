@@ -204,34 +204,19 @@ where
         else {
             return;
         };
-        let mut diff_keys: Vec<String> = Vec::new();
+        // Pass 1: collect the divergent keys by walking the state-map diff.
+        let mut diff_hashes: Vec<Uint256> = Vec::new();
         let mut bf2 = move |h| bf(h);
         let mut vf2 = move |h| vf(h);
         let mut visit = |node: &basics::memory::intrusive_pointer::SharedIntrusive<shamap::nodes::tree_node::SHAMapTreeNode>| {
             if node.is_leaf()
                 && let Some(item) = node.peek_item()
-                && diff_keys.len() < 32
+                && diff_hashes.len() < 32
             {
                 let key = item.key();
-                let desc = match crate::parse_state_sle_any(item.data(), key) {
-                    Some(sle) => {
-                        let ty = sle.get_type();
-                        let extra = if ty == protocol::LedgerEntryType::Offer {
-                            let tg = sle.get_field_amount(protocol::get_field_by_symbol("sfTakerGets"));
-                            let tp = sle.get_field_amount(protocol::get_field_by_symbol("sfTakerPays"));
-                            format!(
-                                " OurOffer TakerGets[m={} e={} neg={}] TakerPays[m={} e={} neg={}]",
-                                tg.mantissa(), tg.exponent(), tg.negative() as u8,
-                                tp.mantissa(), tp.exponent(), tp.negative() as u8
-                            )
-                        } else {
-                            String::new()
-                        };
-                        format!("{ty:?}{extra}")
-                    }
-                    None => "<undecodable/absent-in-ours>".to_owned(),
-                };
-                diff_keys.push(format!("{key}={desc}"));
+                if !diff_hashes.contains(&key) {
+                    diff_hashes.push(key);
+                }
             }
             true
         };
@@ -241,6 +226,33 @@ where
             &mut vf2,
             &mut visit,
         );
+        // Pass 2: for each divergent key, decode BOTH our built and the
+        // validated SLE and emit the exact field-level delta. This removes any
+        // dependency on historical ledger RPC (which retention can block).
+        let mut diff_keys: Vec<String> = Vec::new();
+        for key in &diff_hashes {
+            let keylet = protocol::Keylet::new(protocol::LedgerEntryType::Any, *key);
+            let ours = built_ledger.read(keylet).ok().flatten();
+            let theirs = valid_ledger.read(keylet).ok().flatten();
+            let desc = match (ours, theirs) {
+                (Some(o), None) => {
+                    format!("{:?} PRESENT_IN_OURS_ABSENT_IN_VALIDATED {}", o.get_type(), Self::sle_salient(&o))
+                }
+                (None, Some(t)) => {
+                    format!("{:?} ABSENT_IN_OURS_PRESENT_IN_VALIDATED {}", t.get_type(), Self::sle_salient(&t))
+                }
+                (Some(o), Some(t)) => {
+                    format!(
+                        "{:?} VALUE_DIFF ours{{{}}} validated{{{}}}",
+                        o.get_type(),
+                        Self::sle_salient(&o),
+                        Self::sle_salient(&t)
+                    )
+                }
+                (None, None) => "<absent-in-both?>".to_owned(),
+            };
+            diff_keys.push(format!("{key}={desc}"));
+        }
         tracing::warn!(
             target: "lcl_audit",
             event = "fork_state_diff",
@@ -251,6 +263,44 @@ where
             divergent_sle_keys = ?diff_keys,
             "FORK_STATE_DIFF: ledger entries differing between our built ledger and the validated sibling"
         );
+    }
+
+    /// Render the salient fields of an SLE for fork diagnosis: entry type plus
+    /// the fields most likely to carry a value-level fork (amounts, balances,
+    /// owner counts, sequences, flags).
+    fn sle_salient(sle: &protocol::STLedgerEntry) -> String {
+        use protocol::get_field_by_symbol as f;
+        let ty = sle.get_type();
+        let mut parts: Vec<String> = Vec::new();
+        let amt = |sym: &str| -> Option<String> {
+            let a = sle.get_field_amount(f(sym));
+            Some(format!("{sym}[m={} e={} neg={}]", a.mantissa(), a.exponent(), a.negative() as u8))
+        };
+        match ty {
+            protocol::LedgerEntryType::Offer => {
+                if let Some(s) = amt("sfTakerGets") { parts.push(s); }
+                if let Some(s) = amt("sfTakerPays") { parts.push(s); }
+                parts.push(format!("Seq={}", sle.get_field_u32(f("sfSequence"))));
+                parts.push(format!("Flags={}", sle.get_field_u32(f("sfFlags"))));
+                parts.push(format!("BookDir={}", sle.get_field_h256(f("sfBookDirectory"))));
+            }
+            protocol::LedgerEntryType::AccountRoot => {
+                if let Some(s) = amt("sfBalance") { parts.push(s); }
+                parts.push(format!("OwnerCount={}", sle.get_field_u32(f("sfOwnerCount"))));
+                parts.push(format!("Seq={}", sle.get_field_u32(f("sfSequence"))));
+                parts.push(format!("Flags={}", sle.get_field_u32(f("sfFlags"))));
+            }
+            protocol::LedgerEntryType::RippleState => {
+                if let Some(s) = amt("sfBalance") { parts.push(s); }
+                parts.push(format!("Flags={}", sle.get_field_u32(f("sfFlags"))));
+            }
+            protocol::LedgerEntryType::DirectoryNode => {
+                parts.push(format!("IndexNext={}", sle.get_field_u64(f("sfIndexNext"))));
+                parts.push(format!("Flags={}", sle.get_field_u32(f("sfFlags"))));
+            }
+            _ => {}
+        }
+        parts.join(" ")
     }
 
     pub fn consensus_entry(&self, seq: u32) -> Option<ConsensusValidatedEntry> {
