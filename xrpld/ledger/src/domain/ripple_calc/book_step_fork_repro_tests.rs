@@ -119,3 +119,109 @@ fn fork_21305409_offercreate_iou_crossing_matches_network() {
         "XRP paid must match network (3992000 drops)"
     );
 }
+
+
+/// Build a 524C IOU STAmount from a decimal string.
+fn c524(value_str: &str) -> STAmount {
+    let issue = protocol::Issue::new(
+        protocol::currency_from_string("524C"),
+        AccountID::from_array([0x52; 20]),
+    );
+    let neg = value_str.starts_with('-');
+    let s = value_str.trim_start_matches('-');
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    let digits: String = format!("{int_part}{frac_part}");
+    let mut mantissa: i64 = digits.parse().expect("mantissa digits");
+    if neg {
+        mantissa = -mantissa;
+    }
+    let exponent = -(frac_part.len() as i32);
+    STAmount::from_iou_amount(
+        sf("sfAmount"),
+        protocol::IOUAmount::from_parts(mantissa, exponent).expect("canonical IOU amount"),
+        issue,
+    )
+}
+
+/// Reproduction of fork 21332266 (binary widetrace-1ae45356): a tfSell
+/// OfferCreate crossing a resting self-issued-524C offer produced a +-1 drop
+/// XRP balance divergence vs the network. Captured CLOB_OFFER_CONSUMPTION:
+///   resting offer 2E92317F: TakerGets=5999993 drops XRP (offer "out"),
+///   TakerPays=3.039980301943390 524C (offer "in"); owner_funds large;
+///   tfSell crossing wants remaining_out=4000000 drops XRP; our node consumed
+///   cons_out=4000000 XRP for cons_in=2.026655899060810 524C.
+/// This test runs the exact consumption and prints every intermediate so the
+/// +-1 drop can be bisected against rippled's BookStep.
+#[test]
+fn fork_21332266_tfsell_xrp_out_crossing_amounts() {
+    let offer_in_524 = c524("3.039980301943390"); // owner receives 524C (offer "in")
+    let offer_out_xrp = drops(5_999_993); // owner gives XRP (offer "out")
+    let offer_quality =
+        Quality::from_amounts(&Amounts::new(offer_in_524.clone(), offer_out_xrp.clone()));
+
+    // tfSell crossing: step in = 524C, step out = XRP, want 4,000,000 drops out.
+    let remaining_in_524 = c524("1000000000000000000"); // effectively unbounded (tfSell)
+    let remaining_out_xrp = drops(4_000_000);
+
+    let consumed = compute_offer_consumption(
+        BookStepPass::Reverse,
+        &remaining_in_524,
+        &remaining_out_xrp,
+        &offer_in_524,  // taker_pays == offer "in" (524C)
+        &offer_out_xrp, // taker_gets == offer "out" (XRP)
+        &offer_out_xrp, // owner_funds: fully funded for this repro (XRP side)
+        offer_quality,
+        QUALITY_ONE,
+        QUALITY_ONE,
+        true,
+    );
+
+    // Also run the raw ceil_out_strict that the remaining_out clip uses, to
+    // isolate the IOU rounding of the input side for 4,000,000 XRP out.
+    let clip = offer_quality.ceil_out_strict(
+        &Amounts::new(offer_in_524.clone(), offer_out_xrp.clone()),
+        &remaining_out_xrp,
+        true,
+    );
+    println!(
+        "REPRO 21332266 ceil_out_strict(roundUp=true): in(524C)={:?} out(XRP)={:?}",
+        clip.r#in, clip.out
+    );
+    println!(
+        "REPRO 21332266 consumed: step_in(524C)={:?} step_out(XRP)={:?} offer_in={:?} offer_out={:?} owner_gives={:?}",
+        consumed.step_in, consumed.step_out, consumed.offer_in, consumed.offer_out, consumed.owner_gives
+    );
+    // Our node produced cons_out=4000000 XRP and cons_in=2.026655899060810 524C.
+    assert_eq!(consumed.step_out, drops(4_000_000), "XRP out must be 4000000 drops");
+    // Record our current 524C input; the network's value is the comparison target.
+    assert_eq!(
+        consumed.step_in,
+        c524("2.026655899060810"),
+        "our captured 524C input (compare to network ground truth)"
+    );
+}
+
+
+/// Reproduction + regression for the NFTokenAcceptOffer royalty-split +-1-drop
+/// fork (fork 21332266, tx DD164285). Network split a 5,711,412-drop sale with a
+/// 5% (5000-bps) transfer fee into royalty=285571 (issuer) + seller=5425841.
+/// Our previous floor `mul_ratio` produced royalty=285570 (5711412*0.05 =
+/// 285570.6 floored), forking by 1 drop. rippled uses
+/// `multiply(amount, transferFeeAsRate(fee))` which canonicalize-rounds to
+/// 285571. This asserts the parity helper matches the network.
+#[test]
+fn nft_royalty_cut_canonicalize_rounds_like_network() {
+    let gross = drops(5_711_412);
+    let rate = protocol::rate::nft::transfer_fee_as_rate(5000);
+    let cut = protocol::rate::multiply_rate(&gross, rate);
+    assert_eq!(
+        cut, drops(285_571),
+        "NFT royalty cut must canonicalize-round to 285571 (network), not floor to 285570"
+    );
+    // Seller proceeds = gross - cut must match the network's 5425841.
+    let seller = gross - cut;
+    assert_eq!(seller, drops(5_425_841), "seller proceeds must match network");
+}
