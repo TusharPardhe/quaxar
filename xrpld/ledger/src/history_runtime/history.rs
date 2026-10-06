@@ -133,6 +133,13 @@ where
                 validated_consensus_hash: entry.validated_consensus_hash,
                 consensus: Some(consensus.clone()),
             });
+            // Validated-arrived-first ordering: our built ledger (`ledger`) is
+            // in hand; fetch the validated sibling from cache and diff.
+            if let Some(valid_ledger) =
+                self.get_cached_ledger_by_hash(SHAMapHash::new(*validated.as_uint256()))
+            {
+                self.fork_state_diff(seq, hash, validated, &ledger, &valid_ledger);
+            }
         }
 
         entry.built = Some(hash);
@@ -166,70 +173,84 @@ where
                 validated_consensus_hash: consensus_hash,
                 consensus: entry.consensus.clone(),
             });
-            // FORK STATE DIFF: both our built ledger and the validated sibling
-            // are cached here. Walk their state maps and log the EXACT ledger
-            // entries whose value differs - the definitive fork localization.
-            if let (Some(built_ledger), Some(valid_ledger)) = (
-                self.get_cached_ledger_by_hash(SHAMapHash::new(*built.as_uint256())),
-                Some(Arc::clone(&ledger)),
-            ) && let (Some(bf), Some(vf)) =
-                (built_ledger.node_fetcher_closure(), valid_ledger.node_fetcher_closure())
+            // FORK STATE DIFF: fetch our built ledger from cache (validated
+            // `ledger` is in hand) and run the shared diff.
+            if let Some(built_ledger) =
+                self.get_cached_ledger_by_hash(SHAMapHash::new(*built.as_uint256()))
             {
-                let mut diff_keys: Vec<String> = Vec::new();
-                let mut bf2 = move |h| bf(h);
-                let mut vf2 = move |h| vf(h);
-                let mut visit = |node: &basics::memory::intrusive_pointer::SharedIntrusive<shamap::nodes::tree_node::SHAMapTreeNode>| {
-                    if node.is_leaf()
-                        && let Some(item) = node.peek_item()
-                        && diff_keys.len() < 32
-                    {
-                        let key = item.key();
-                        // Decode OUR built-side SLE so the entry type + salient
-                        // fields identify what diverges (e.g. an Offer we kept
-                        // that the network deleted, with its remaining amounts).
-                        let desc = match crate::parse_state_sle_any(item.data(), key) {
-                            Some(sle) => {
-                                let ty = sle.get_type();
-                                let extra = if ty == protocol::LedgerEntryType::Offer {
-                                    let tg = sle.get_field_amount(protocol::get_field_by_symbol("sfTakerGets"));
-                                    let tp = sle.get_field_amount(protocol::get_field_by_symbol("sfTakerPays"));
-                                    format!(
-                                        " OurOffer TakerGets[m={} e={} neg={}] TakerPays[m={} e={} neg={}]",
-                                        tg.mantissa(), tg.exponent(), tg.negative() as u8,
-                                        tp.mantissa(), tp.exponent(), tp.negative() as u8
-                                    )
-                                } else {
-                                    String::new()
-                                };
-                                format!("{:?}{}", ty, extra)
-                            }
-                            None => "<undecodable/absent-in-ours>".to_owned(),
-                        };
-                        diff_keys.push(format!("{key}={desc}"));
-                    }
-                    true
-                };
-                let _ = built_ledger.state_map().visit_differences(
-                    Some(valid_ledger.state_map()),
-                    &mut bf2,
-                    &mut vf2,
-                    &mut visit,
-                );
-                tracing::warn!(
-                    target: "lcl_audit",
-                    event = "fork_state_diff",
-                    seq,
-                    built = %built,
-                    validated = %hash,
-                    divergent_sle_count = diff_keys.len(),
-                    divergent_sle_keys = ?diff_keys,
-                    "FORK_STATE_DIFF: ledger entries differing between our built ledger and the validated sibling"
-                );
+                self.fork_state_diff(seq, built, hash, &built_ledger, &ledger);
             }
         }
 
         entry.validated = Some(hash);
         entry.validated_consensus_hash = consensus_hash;
+    }
+
+    /// Diagnostic: walk the state maps of our built ledger and the validated
+    /// sibling and log the EXACT ledger entries whose value differs, decoding
+    /// each built-side SLE's type (and, for Offers, remaining amounts) - the
+    /// definitive fork localization. Fires from both the built-first and
+    /// validated-first mismatch orderings.
+    fn fork_state_diff(
+        &self,
+        seq: u32,
+        built: SHAMapHash,
+        validated: SHAMapHash,
+        built_ledger: &Arc<Ledger>,
+        valid_ledger: &Arc<Ledger>,
+    ) {
+        let (Some(bf), Some(vf)) =
+            (built_ledger.node_fetcher_closure(), valid_ledger.node_fetcher_closure())
+        else {
+            return;
+        };
+        let mut diff_keys: Vec<String> = Vec::new();
+        let mut bf2 = move |h| bf(h);
+        let mut vf2 = move |h| vf(h);
+        let mut visit = |node: &basics::memory::intrusive_pointer::SharedIntrusive<shamap::nodes::tree_node::SHAMapTreeNode>| {
+            if node.is_leaf()
+                && let Some(item) = node.peek_item()
+                && diff_keys.len() < 32
+            {
+                let key = item.key();
+                let desc = match crate::parse_state_sle_any(item.data(), key) {
+                    Some(sle) => {
+                        let ty = sle.get_type();
+                        let extra = if ty == protocol::LedgerEntryType::Offer {
+                            let tg = sle.get_field_amount(protocol::get_field_by_symbol("sfTakerGets"));
+                            let tp = sle.get_field_amount(protocol::get_field_by_symbol("sfTakerPays"));
+                            format!(
+                                " OurOffer TakerGets[m={} e={} neg={}] TakerPays[m={} e={} neg={}]",
+                                tg.mantissa(), tg.exponent(), tg.negative() as u8,
+                                tp.mantissa(), tp.exponent(), tp.negative() as u8
+                            )
+                        } else {
+                            String::new()
+                        };
+                        format!("{ty:?}{extra}")
+                    }
+                    None => "<undecodable/absent-in-ours>".to_owned(),
+                };
+                diff_keys.push(format!("{key}={desc}"));
+            }
+            true
+        };
+        let _ = built_ledger.state_map().visit_differences(
+            Some(valid_ledger.state_map()),
+            &mut bf2,
+            &mut vf2,
+            &mut visit,
+        );
+        tracing::warn!(
+            target: "lcl_audit",
+            event = "fork_state_diff",
+            seq,
+            built = %built,
+            validated = %validated,
+            divergent_sle_count = diff_keys.len(),
+            divergent_sle_keys = ?diff_keys,
+            "FORK_STATE_DIFF: ledger entries differing between our built ledger and the validated sibling"
+        );
     }
 
     pub fn consensus_entry(&self, seq: u32) -> Option<ConsensusValidatedEntry> {
