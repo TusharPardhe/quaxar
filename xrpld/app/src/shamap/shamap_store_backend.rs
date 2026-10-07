@@ -92,23 +92,3 @@ pub fn make_shamap_store_backend(
         saved_state: state.clone(),
     })
 }
-
-/// Open a single backend at a resolved path. Retained for the (now unused)
-/// configured backend factory; the rotating store that once consumed pairs of
-/// these has been removed.
-pub fn make_shamap_store_rotating_backend(
-    manager: &dyn Manager,
-    node_db: &Section,
-    burst_size: usize,
-    scheduler: Arc<dyn Scheduler>,
-    journal: Arc<dyn NodeStoreJournal>,
-    path: Option<&str>,
-) -> Result<Box<dyn Backend>, String> {
-    let mut section = node_db.clone();
-    if let Some(path) = path {
-        section.set("path", path);
-    }
-    let backend = manager.make_backend(&section, burst_size, scheduler, journal)?;
-    backend.open(true)?;
-    Ok(backend)
-}

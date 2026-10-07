@@ -4,14 +4,8 @@ mod shamap_store;
 #[path = "pruned_store.rs"]
 mod pruned_store;
 
-#[path = "shamap_store_app_runtime.rs"]
-mod shamap_store_app_runtime;
-
 #[path = "shamap_store_bootstrap.rs"]
 mod shamap_store_bootstrap;
-
-#[path = "shamap_store_online_delete.rs"]
-mod shamap_store_online_delete;
 
 #[path = "shamap_store_paths.rs"]
 mod shamap_store_paths;

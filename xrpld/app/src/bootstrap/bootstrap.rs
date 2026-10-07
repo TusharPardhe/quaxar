@@ -37,7 +37,7 @@ use quaxar_core::{
 };
 use rusqlite::{OptionalExtension, params};
 use shamap::family::{
-    FullBelowCache, NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
+    NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -332,32 +332,6 @@ impl SHAMapStoreComponentRuntime for BootstrapSHAMapStoreRuntime {}
 
 struct PendingProductionSHAMapStore {
     bootstrap: crate::SHAMapStoreBootstrap,
-}
-
-struct BootstrapNodeFamilyCacheRuntime {
-    node_family: Arc<dyn crate::NodeFamilyRuntime>,
-    tree_cache: Arc<TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>>,
-    full_below: crate::NodeFamilyFullBelowCache,
-}
-
-impl crate::SHAMapStoreNodeFamilyCacheRuntime for BootstrapNodeFamilyCacheRuntime {
-    fn tree_node_cache_keys(&self) -> Vec<Uint256> {
-        self.tree_cache.get_keys()
-    }
-
-    fn clear_full_below_cache(&self) {
-        self.full_below.clear();
-    }
-
-    fn visit_state_map_nodes(
-        &self,
-        ledger: &Ledger,
-        visit: &mut dyn FnMut(
-            &basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
-        ) -> bool,
-    ) -> Result<(), shamap::traversal::TraversalError> {
-        self.node_family.visit_state_map_nodes(ledger, visit)
-    }
 }
 
 #[derive(Clone)]

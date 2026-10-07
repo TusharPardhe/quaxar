@@ -192,10 +192,6 @@ mod tests {
             self.stored.lock().expect("stored nodes lock").extend(nodes);
             Ok(())
         }
-
-        fn rotate_with(&self, _new_backend: Box<dyn Backend>) -> (String, String) {
-            unreachable!("rotation is outside this batch-level regression")
-        }
     }
 
     #[test]
