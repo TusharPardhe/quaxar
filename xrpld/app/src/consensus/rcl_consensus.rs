@@ -1974,7 +1974,7 @@ impl AppConsensus {
                     consensus_succeeded = work.consensus_succeeded,
                     "LCL_AUDIT local consensus child built"
                 );
-                let mut retriable_transactions = outcome.retry_transactions.clone();
+                let retriable_transactions = outcome.retry_transactions.clone();
                 self.notify_accepted(&root, &closed, &work);
                 if work.have_correct_lcl && work.consensus_succeeded {
                     let accepted = work
@@ -2010,8 +2010,29 @@ impl AppConsensus {
                 root.record_consensus_built_ledger(Arc::clone(&closed), work.consensus_hash);
                 // Rippled performs censorshipDetector_.check before adding
                 // rejected disputes to retriableTxs, then passes the combined
-                // canonical retry set to OpenLedger::accept.
-                retriable_transactions.extend(work.rejected_dispute_retries.iter().cloned());
+                // canonical retry set to OpenLedger::accept. rippled keeps ONE
+                // `CanonicalTXSet retriableTxs` (RCLConsensus.cpp): build
+                // retries remain in it and rejected disputes are INSERTED into
+                // that same salted map, so the open-ledger rebuild applies the
+                // union in GLOBAL canonical order (salted account, SeqProxy,
+                // tx id). A plain Vec `extend` instead preserves two separate
+                // orderings and can apply a build-retry and a rejected dispute
+                // in the wrong relative order when they sort oppositely under
+                // the global canonical key -- shifting the speculative open
+                // ledger and the next proposal's executable set, which can
+                // propagate into a later consensus child (a fork seed). Merge
+                // them through a single CanonicalTXSet to match rippled exactly.
+                let retriable_transactions = {
+                    let mut retry_set =
+                        ledger::CanonicalTXSet::new(work.consensus_hash);
+                    for tx in &retriable_transactions {
+                        retry_set.insert(std::sync::Arc::clone(tx));
+                    }
+                    for tx in work.rejected_dispute_retries.iter() {
+                        retry_set.insert(std::sync::Arc::clone(tx));
+                    }
+                    retry_set.drain_ordered()
+                };
                 // Narrow critical section: only the atomic OpenLedger rebase +
                 // closed-LCL install run under the transition gate, matching
                 // rippled's master/ledger locks around OpenLedger::accept and

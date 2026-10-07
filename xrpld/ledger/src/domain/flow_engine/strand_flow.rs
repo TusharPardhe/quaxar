@@ -70,7 +70,16 @@ pub fn execute_strands<V: ApplyView>(
     // processing order is not associative and can change consensus results.
     let mut saved_ins = Vec::with_capacity(MAX_TRIES);
     let mut saved_outs = Vec::with_capacity(MAX_TRIES);
-    let mut active: Vec<bool> = vec![true; strands.len()];
+    // rippled ActiveStrands keeps `next_` as an ORDERED list of strand
+    // pointers (not a membership bitmap). `activateNext` stable-sorts that
+    // exact ordering by theoretical quality (best first), and after a
+    // successful pass the next ordering is: the selected strand (unless
+    // inactive) followed by the remaining sorted suffix in order. Preserving
+    // this order is consensus-significant: for equal-quality ties the stable
+    // sort must see rippled's ordering, otherwise a different strand is
+    // consumed first and the ledger diverges. We therefore track an ordered
+    // `active_order: Vec<usize>` initialized in path-set order.
+    let mut active_order: Vec<usize> = (0..strands.len()).collect();
     // Flow.cpp sets the initial AMM mode from all constructed strands before
     // StrandFlow performs its first quality estimate.
     let amm_context = AmmContext::new(*strand_src, strands.len() > 1);
@@ -90,16 +99,19 @@ pub fn execute_strands<V: ApplyView>(
             };
         }
 
-        let active_indices: Vec<usize> = active
+        // Candidate set in rippled `next_` order (path order on the first
+        // pass; selected-strand-first-then-suffix order afterwards), skipping
+        // emptied strands. rippled does NOT mutate the AMM multi-path mode
+        // before `activateNext`'s internal qualityUpperBound estimation: those
+        // estimates observe the PRIOR iteration's post-prune multi-path value
+        // (or the Flow.cpp initial `strands.size()>1` on the first pass). So
+        // we deliberately do not set multi_path here; it is set once below,
+        // after pruning, exactly like StrandFlow.h:670.
+        let active_indices: Vec<usize> = active_order
             .iter()
-            .enumerate()
-            .filter(|(index, enabled)| **enabled && !strands[*index].is_empty())
-            .map(|(index, _)| index)
+            .copied()
+            .filter(|index| !strands[*index].is_empty())
             .collect();
-        // Match ActiveStrands::activateNext/StrandFlow: AMM offer generation
-        // and quality estimation for this pass must observe the active-strand
-        // mode, not the mode left behind by the preceding pass.
-        amm_context.set_multi_path(active_indices.len() > 1);
         let ordering_context = StepContext {
             strand_src,
             strand_dst,
@@ -140,7 +152,12 @@ pub fn execute_strands<V: ApplyView>(
         amm_context.set_multi_path(candidates.len() > 1);
 
         let mut applied = false;
-        let mut next_active = vec![false; strands.len()];
+        // rippled builds the next iteration's `next_` ordering from the
+        // selection: dry/zero strands are dropped, and on a successful pick
+        // the order becomes [selected (unless inactive), then the remaining
+        // sorted suffix in order]. Strands that were pruned by quality this
+        // pass are NOT carried forward (they re-enter only if still active).
+        let mut next_order: Vec<usize> = Vec::with_capacity(candidates.len());
         for (candidate_position, (strand_index, _)) in candidates.iter().copied().enumerate() {
             let strand = &strands[strand_index];
             let (strand_out, adjusted_remaining_out) = if candidates.len() == 1 {
@@ -220,11 +237,11 @@ pub fn execute_strands<V: ApplyView>(
 
             offers_considered = offers_considered.saturating_add(result.offers_used);
             let Some((amount_in, amount_out, inactive)) = result.amounts else {
-                active[strand_index] = false;
+                // Dry strand: rippled drops it from `next_` (not carried).
                 continue;
             };
             if amount_out.signum() <= 0 {
-                active[strand_index] = false;
+                // Zero output: dropped from `next_` like rippled.
                 continue;
             }
 
@@ -237,19 +254,20 @@ pub fn execute_strands<V: ApplyView>(
                 remaining_in = Some(send_max.clone() - total_in.clone());
             }
             if inactive {
-                next_active[strand_index] = false;
+                // rippled: an inactive selected strand is NOT re-added to
+                // next_; only the remaining sorted suffix carries forward.
             } else {
-                next_active[strand_index] = true;
+                next_order.push(strand_index);
             }
             for (remaining_index, _) in candidates.iter().skip(candidate_position + 1) {
-                next_active[*remaining_index] = true;
+                next_order.push(*remaining_index);
             }
             applied = true;
             amm_context.update();
             break;
         }
 
-        active = next_active;
+        active_order = next_order;
 
         if !applied || offers_considered >= MAX_OFFERS_TO_CONSIDER {
             break;
