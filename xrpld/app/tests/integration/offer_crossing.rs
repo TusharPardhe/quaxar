@@ -3677,3 +3677,71 @@ fn crossing_removes_unfunded_offers_mid_traversal_fork21337951() {
         );
     }
 }
+
+/// Same-owner multi-offer draining during a single crossing (fork-21337951
+/// candidate mechanism): owner X rests TWO XRP->BLK offers at adjacent
+/// qualities, but holds only enough XRP to fund ONE. A tfSell sweep consumes
+/// X's best offer (draining X's spendable XRP to ~0), then reaches X's second
+/// offer which is now UNFUNDED and must be removed, advancing to the next
+/// maker. If our node leaves X's second offer resting (because it was funded at
+/// snapshot time), that is the offer-set-composition fork.
+#[test]
+fn crossing_drains_owner_then_removes_their_second_offer() {
+    let issuer = acct(0x4F);
+    let taker = acct(0x4E);
+    let owner_x = acct(0x41); // two offers, funds for ~one
+    let maker_z = acct(0x43); // funded, worse quality, must be reached
+    let blk = protocol::currency_from_string("BLK");
+
+    // owner_x: give it enough to place 2 offers (owner_count 2 -> reserve
+    // 200000+2*50000=300000) plus ~10 XRP spendable (funds ~one 10-XRP offer).
+    let x_bal = 300_000 + 10_000_000 + 100; // reserve + ~10 XRP + slack
+    let mut entries = vec![
+        account_root(taker, 100_000_000_000, 1, 0),
+        account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
+        account_root(owner_x, x_bal, 2, 0),
+        account_root(maker_z, 100_000_000, 1, 0),
+    ];
+    entries.push(trust_line_frac(owner_x, issuer, blk, 0, 0, 1_000_000));
+    entries.push(trust_line_frac(maker_z, issuer, blk, 0, 0, 1_000_000));
+    entries.push(trust_line_frac(taker, issuer, blk, 1_000_000_000_000_000, -12, 1_000_000_000));
+
+    let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // owner_x offer #1 (best quality): 10 XRP for 1.00 BLK, seq 1.
+    let x1 = offer_tx(owner_x, iou_frac(issuer, blk, 1_000_000_000_000_000, -15), xrp(10_000_000), 1);
+    assert_eq!(full_apply(&mut view, &x1, TxType::OFFER_CREATE), Ter::TES_SUCCESS, "x1 rests");
+    // owner_x offer #2 (next quality): 10 XRP for 1.01 BLK, seq 2.
+    let x2 = offer_tx(owner_x, iou_frac(issuer, blk, 1_010_000_000_000_000, -15), xrp(10_000_000), 2);
+    assert_eq!(full_apply(&mut view, &x2, TxType::OFFER_CREATE), Ter::TES_SUCCESS, "x2 rests");
+    // maker_z (worse quality 1.02), funded, must be reached after X drained.
+    let z = offer_tx(maker_z, iou_frac(issuer, blk, 1_020_000_000_000_000, -15), xrp(10_000_000), 1);
+    assert_eq!(full_apply(&mut view, &z, TxType::OFFER_CREATE), Ter::TES_SUCCESS, "z rests");
+
+    let z_before = xrp_balance(&view, maker_z);
+
+    // Taker sells 3 BLK: consumes x1 (drains X ~10 XRP), reaches x2 (X now
+    // unfunded -> remove), then maker_z (funded).
+    let sell = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1));
+        tx.set_field_amount(sf("sfTakerGets"), iou_frac(issuer, blk, 3_000_000_000_000_000, -15)); // 3 BLK
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let res = full_apply(&mut view, &sell, TxType::OFFER_CREATE);
+    assert_eq!(res, Ter::TES_SUCCESS, "tfSell must succeed; got {res:?}");
+
+    // owner_x offer #2 (seq 2) must be removed (X unfunded after x1 drained it).
+    let x2_offer = view.read(protocol::offer_keylet(acct_id(owner_x), 2)).expect("read x2");
+    assert!(
+        x2_offer.is_none(),
+        "owner_x's second offer MUST be removed once x1 drained X unfunded (fork-21337951 mechanism)"
+    );
+    assert!(
+        xrp_balance(&view, maker_z) < z_before,
+        "maker_z must be reached after removing X's unfunded second offer"
+    );
+}
