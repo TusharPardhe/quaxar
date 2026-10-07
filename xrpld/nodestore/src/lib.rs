@@ -11,7 +11,6 @@ pub use backends::backend;
 pub use backends::memory_backend;
 pub use backends::nudb_backend;
 pub use backends::null_backend;
-pub use backends::rocksdb;
 pub use database_runtime::batch_writer;
 pub use database_runtime::database;
 pub use database_runtime::database_node_imp;
@@ -65,7 +64,6 @@ pub use pruned::{
     ClaimDelta, IndexWriter, LedgerSnapshot, ModelStore, NotebookKind, PruneMode, PrunedConfig,
     PrunedMetrics, PrunedStore, VerifyReport, reconcile, verify_present,
 };
-pub use rocksdb::{RocksDbBackend, RocksDbConfigSnapshot, RocksDbFactory};
 pub use scheduler::{
     BatchWriteReport, DummyScheduler, FetchReport, FetchType, RealScheduler, Scheduler,
 };

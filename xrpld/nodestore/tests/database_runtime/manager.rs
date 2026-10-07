@@ -141,13 +141,6 @@ fn manager_nudb_entrypoint_uses_native_nudb_storage_policy() {
             .get_name(),
         "NuDB"
     );
-    assert_eq!(
-        manager
-            .find("RocksDB")
-            .expect("rocksdb backend should stay registered")
-            .get_name(),
-        "RocksDB"
-    );
     backend.open(true).expect("open");
     let object = NodeObject::create_object(
         NodeObjectType::Ledger,

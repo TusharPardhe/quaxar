@@ -65,6 +65,9 @@ pub struct FjallBackend {
     cache_bytes: u64,
     journal: Arc<dyn NodeStoreJournal>,
     db: Mutex<Option<Arc<OpenDb>>>,
+    // When set (via set_delete_path, used by rotation to retire an archive),
+    // close removes the database directory from disk after dropping it.
+    delete_on_close: std::sync::atomic::AtomicBool,
 }
 
 impl FjallBackend {
@@ -82,6 +85,7 @@ impl FjallBackend {
             cache_bytes: read_cache_bytes(key_values),
             journal,
             db: Mutex::new(None),
+            delete_on_close: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -162,6 +166,14 @@ impl Backend for FjallBackend {
             .expect("fjall backend db mutex must not be poisoned")
             .take();
         drop(open);
+        // Honor a pending delete-path request (rotation retiring this store):
+        // remove the whole database directory now that it is closed.
+        if self
+            .delete_on_close
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
         Ok(())
     }
 
@@ -258,7 +270,10 @@ impl Backend for FjallBackend {
         0
     }
 
-    fn set_delete_path(&self) {}
+    fn set_delete_path(&self) {
+        self.delete_on_close
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 
     fn fd_required(&self) -> i32 {
         // fjall manages its own file descriptors through a cached table; the

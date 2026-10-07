@@ -1,7 +1,7 @@
 use basics::basic_config::Section;
 use nodestore::{
-    Backend, DatabaseRotatingImp, JournalLevel, NodeObject, NodeStoreJournal, NullJournal,
-    RocksDbBackend, Scheduler,
+    Backend, DatabaseRotatingImp, Factory, FjallFactory, JournalLevel, NodeObject,
+    NodeStoreJournal, NullJournal, Scheduler,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -23,35 +23,39 @@ impl NodeStoreJournal for RecordingJournal {
 
 fn section(path: &Path) -> Section {
     let mut section = Section::new("node_db");
-    section.set("type", "RocksDB");
+    section.set("type", "fjall");
     section.set("path", path.to_string_lossy().as_ref());
     section
 }
 
 fn open_backend(path: &Path, scheduler: Arc<dyn Scheduler>) -> Arc<dyn Backend> {
-    let backend: Arc<dyn Backend> = Arc::new(
-        RocksDbBackend::new(
-            NodeObject::KEY_BYTES,
-            &section(path),
-            scheduler,
-            Arc::new(NullJournal),
-        )
-        .expect("rocksdb backend"),
+    let backend: Arc<dyn Backend> = Arc::from(
+        FjallFactory::new()
+            .create_instance(
+                NodeObject::KEY_BYTES,
+                &section(path),
+                0,
+                scheduler,
+                Arc::new(NullJournal),
+            )
+            .expect("fjall backend"),
     );
     backend.open(true).expect("open backend");
     backend
 }
 
 fn open_boxed_backend(path: &Path, scheduler: Arc<dyn Scheduler>) -> Box<dyn Backend> {
-    let backend = RocksDbBackend::new(
-        NodeObject::KEY_BYTES,
-        &section(path),
-        scheduler,
-        Arc::new(NullJournal),
-    )
-    .expect("rocksdb backend");
+    let backend = FjallFactory::new()
+        .create_instance(
+            NodeObject::KEY_BYTES,
+            &section(path),
+            0,
+            scheduler,
+            Arc::new(NullJournal),
+        )
+        .expect("fjall backend");
     backend.open(true).expect("open backend");
-    Box::new(backend)
+    backend
 }
 
 #[test]

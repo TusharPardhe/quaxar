@@ -12,5 +12,3 @@ mod nudb_recovery_robustness;
 mod nudb_split_policy_workloads;
 mod nudb_store_concurrency;
 mod nudb_verify;
-mod rocksdb;
-mod rocksdb_compat;

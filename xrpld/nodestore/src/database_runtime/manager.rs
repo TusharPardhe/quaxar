@@ -1,7 +1,7 @@
 use crate::{
     Backend, DatabaseImporter, DatabaseNodeImp, DatabaseRotatingImp, DatabaseSource, Factory,
     FjallFactory, MemoryFactory, NodeObject, NodeStoreJournal, NuDbContext, NuDbFactory,
-    NullFactory, RocksDbFactory, Scheduler,
+    NullFactory, Scheduler,
 };
 use basics::basic_config::Section;
 use std::any::Any;
@@ -129,7 +129,6 @@ impl ManagerImp {
         let manager = Self {
             factories: Mutex::new(Vec::new()),
         };
-        manager.insert(Arc::new(RocksDbFactory::new()));
         manager.insert(Arc::new(NuDbFactory::new()));
         manager.insert(Arc::new(NullFactory::new()));
         manager.insert(Arc::new(MemoryFactory::new()));
@@ -703,7 +702,6 @@ mod tests {
         assert!(manager.find("MeMoRy").is_some());
         assert!(manager.find("none").is_some());
         assert!(manager.find("nudb").is_some());
-        assert!(manager.find("rocksdb").is_some());
         assert!(manager.find("fjall").is_some());
     }
 

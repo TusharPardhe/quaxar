@@ -166,12 +166,9 @@ fn manager_and_factory_lookup_are_case_insensitive() {
             .get_name(),
         "NuDB"
     );
-    assert_eq!(
-        manager
-            .find("rocksdb")
-            .expect("rocksdb factory should remain available")
-            .get_name(),
-        "RocksDB"
+    assert!(
+        manager.find("rocksdb").is_none(),
+        "the RocksDB backend has been removed"
     );
 }
 
