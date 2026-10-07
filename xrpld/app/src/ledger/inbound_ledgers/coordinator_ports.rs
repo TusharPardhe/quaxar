@@ -461,7 +461,6 @@ impl PersistenceWork for CoordinatorPersistenceWork {
                         .collect();
                     let result = match &node_store {
                         SHAMapStoreNodeStore::Single(database) => database.store_batch(objects),
-                        SHAMapStoreNodeStore::Rotating(database) => database.store_batch(objects),
                     };
                     if let Err(error) = result {
                         write_failed = Some(error);

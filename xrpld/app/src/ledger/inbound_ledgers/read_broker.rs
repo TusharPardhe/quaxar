@@ -746,7 +746,6 @@ impl NodeReadBroker {
         }
         match store {
             SHAMapStoreNodeStore::Single(database) => database.async_fetch_batch(batch),
-            SHAMapStoreNodeStore::Rotating(database) => database.async_fetch_batch(batch),
         }
         count
     }

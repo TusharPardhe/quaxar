@@ -140,9 +140,6 @@ fn parent_with_account_in_nudb(
             app::SHAMapStoreNodeStore::Single(db) => {
                 db.fetch_node_object(hash.as_uint256(), 0, FetchType::Synchronous, false)
             }
-            app::SHAMapStoreNodeStore::Rotating(db) => {
-                db.fetch_node_object(hash.as_uint256(), 0, FetchType::Synchronous, false)
-            }
         }?;
         shamap::nodes::tree_node::SHAMapTreeNode::make_from_prefix(data.data(), hash).ok()
     }));
@@ -152,9 +149,6 @@ fn parent_with_account_in_nudb(
               data: Vec<u8>,
               ledger_seq: u32| match &ns_write {
             app::SHAMapStoreNodeStore::Single(db) => db
-                .store(test_node_type(object_type), data, hash, ledger_seq)
-                .expect("test node store write should succeed"),
-            app::SHAMapStoreNodeStore::Rotating(db) => db
                 .store(test_node_type(object_type), data, hash, ledger_seq)
                 .expect("test node store write should succeed"),
         },
@@ -205,9 +199,6 @@ fn backed_fee_ledger_without_fetcher(
               data: Vec<u8>,
               ledger_seq: u32| match &ns_write {
             app::SHAMapStoreNodeStore::Single(db) => db
-                .store(test_node_type(object_type), data, hash, ledger_seq)
-                .expect("test node store write should succeed"),
-            app::SHAMapStoreNodeStore::Rotating(db) => db
                 .store(test_node_type(object_type), data, hash, ledger_seq)
                 .expect("test node store write should succeed"),
         },

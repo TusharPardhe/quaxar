@@ -1,54 +1,47 @@
-use crate::shamap::shamap_store_paths::SHAMAP_STORE_DB_PREFIX;
-use crate::{SHAMapStorePathPlan, SHAMapStoreSavedState, reconcile_shamap_store_paths};
+use crate::SHAMapStoreSavedState;
 use basics::basic_config::Section;
-use nodestore::{
-    Backend, Database, DatabaseRotating, DatabaseRotatingImp, Manager, NodeStoreJournal, Scheduler,
-};
-use std::path::PathBuf;
+use nodestore::{Backend, Database, Manager, NodeStoreJournal, Scheduler};
 use std::sync::Arc;
 
+/// The application node store. Only the single-database shape remains: the
+/// fjall pruned store (which prunes continuously) and the in-memory/null
+/// stores all present as a single `Database`. The historical rotating
+/// (NuDB/RocksDB copy-forward) variant has been removed.
 #[derive(Clone)]
 pub enum SHAMapStoreNodeStore {
     Single(Arc<dyn Database>),
-    Rotating(Arc<dyn DatabaseRotating>),
 }
 
 impl SHAMapStoreNodeStore {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Single(_) => "single",
-            Self::Rotating(_) => "rotating",
         }
     }
 
     pub fn fd_required(&self) -> i32 {
         match self {
             Self::Single(database) => database.fd_required(),
-            Self::Rotating(database) => database.fd_required(),
         }
     }
 
     /// Stable nonzero NodeStore generation observed by local-read admission.
-    /// Rotating stores advance it before cache invalidation/copy-forward;
-    /// callers must include it in `ReadKey` and durable callback identities.
+    /// Callers include it in `ReadKey` and durable callback identities.
     pub fn store_generation(&self) -> u64 {
         match self {
             Self::Single(database) => database.store_generation(),
-            Self::Rotating(database) => database.store_generation(),
         }
     }
 
     pub fn schedule_write(&self, write: nodestore::ScheduledWrite) {
         match self {
             Self::Single(database) => database.schedule_write(write),
-            Self::Rotating(database) => database.schedule_write(write),
         }
     }
 
     pub fn export_backend(&self) -> Option<Arc<dyn Backend>> {
         match self {
             Self::Single(database) => database.export_backend(),
-            Self::Rotating(database) => database.export_backend(),
         }
     }
 }
@@ -65,28 +58,6 @@ impl SHAMapStoreBackendBundle {
     }
 }
 
-pub fn apply_rocksdb_online_delete_defaults(
-    node_db: &Section,
-    hash_node_db_cache_mb: usize,
-    node_size: u32,
-) -> Section {
-    let mut section = node_db.clone();
-    let backend_type = section
-        .get::<String>("type")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    if backend_type.eq_ignore_ascii_case("RocksDB") {
-        if !section.exists("cache_mb") {
-            section.set("cache_mb", hash_node_db_cache_mb.to_string());
-        }
-        if !section.exists("filter_bits") && node_size >= 2 {
-            section.set("filter_bits", "10");
-        }
-    }
-    section
-}
-
 pub fn make_shamap_store_backend(
     manager: &dyn Manager,
     scheduler: Arc<dyn Scheduler>,
@@ -97,34 +68,34 @@ pub fn make_shamap_store_backend(
     burst_size: usize,
     journal: Arc<dyn NodeStoreJournal>,
 ) -> Result<SHAMapStoreBackendBundle, String> {
-    if delete_interval == 0 {
-        let database = manager.make_database(
-            burst_size,
-            scheduler,
-            read_threads,
-            node_db,
-            Arc::clone(&journal),
-        )?;
-        let fd_required = database.fd_required();
-        return Ok(SHAMapStoreBackendBundle {
-            store: SHAMapStoreNodeStore::Single(database),
-            fd_required,
-            saved_state: state.clone(),
-        });
+    // The rotating node store has been removed. Online deletion is now provided
+    // by the fjall pruned store, which is a single database (delete_interval is
+    // zero at this layer; pruning is driven separately). A nonzero rotating
+    // delete_interval reaching here means an unsupported backend slipped past
+    // config validation.
+    if delete_interval != 0 {
+        return Err(
+            "rotating online_delete is no longer supported; use [node_db] type = fjall".to_owned(),
+        );
     }
-
-    let path_plan = reconcile_shamap_store_paths(node_db, state)?;
-    make_rotating_from_plan(
-        manager,
+    let database = manager.make_database(
+        burst_size,
         scheduler,
         read_threads,
         node_db,
-        path_plan,
-        burst_size,
-        journal,
-    )
+        Arc::clone(&journal),
+    )?;
+    let fd_required = database.fd_required();
+    Ok(SHAMapStoreBackendBundle {
+        store: SHAMapStoreNodeStore::Single(database),
+        fd_required,
+        saved_state: state.clone(),
+    })
 }
 
+/// Open a single backend at a resolved path. Retained for the (now unused)
+/// configured backend factory; the rotating store that once consumed pairs of
+/// these has been removed.
 pub fn make_shamap_store_rotating_backend(
     manager: &dyn Manager,
     node_db: &Section,
@@ -134,90 +105,10 @@ pub fn make_shamap_store_rotating_backend(
     path: Option<&str>,
 ) -> Result<Box<dyn Backend>, String> {
     let mut section = node_db.clone();
-    let resolved_path = match path {
-        Some(path) => path.to_owned(),
-        None => unique_backend_path(node_db)?,
-    };
-    section.set("path", resolved_path);
+    if let Some(path) = path {
+        section.set("path", path);
+    }
     let backend = manager.make_backend(&section, burst_size, scheduler, journal)?;
     backend.open(true)?;
     Ok(backend)
-}
-
-fn make_rotating_from_plan(
-    manager: &dyn Manager,
-    scheduler: Arc<dyn Scheduler>,
-    read_threads: i32,
-    node_db: &Section,
-    mut path_plan: SHAMapStorePathPlan,
-    burst_size: usize,
-    journal: Arc<dyn NodeStoreJournal>,
-) -> Result<SHAMapStoreBackendBundle, String> {
-    if path_plan.state.writable_db.is_empty() {
-        let mut reserved = path_plan.stale_paths.clone();
-        let writable_path = unique_backend_path_excluding(node_db, &reserved)?;
-        reserved.push(PathBuf::from(&writable_path));
-        let archive_path = unique_backend_path_excluding(node_db, &reserved)?;
-        path_plan.state.writable_db = writable_path;
-        path_plan.state.archive_db = archive_path;
-    }
-
-    path_plan.cleanup_stale_paths()?;
-
-    let writable = make_shamap_store_rotating_backend(
-        manager,
-        node_db,
-        burst_size,
-        Arc::clone(&scheduler),
-        Arc::clone(&journal),
-        (!path_plan.state.writable_db.is_empty()).then_some(path_plan.state.writable_db.as_str()),
-    )?;
-    let archive = make_shamap_store_rotating_backend(
-        manager,
-        node_db,
-        burst_size,
-        Arc::clone(&scheduler),
-        Arc::clone(&journal),
-        (!path_plan.state.archive_db.is_empty()).then_some(path_plan.state.archive_db.as_str()),
-    )?;
-
-    let rotating = DatabaseRotatingImp::new(
-        scheduler,
-        read_threads as usize,
-        Arc::from(writable),
-        Arc::from(archive),
-        node_db,
-        journal,
-    )?;
-    let fd_required = rotating.fd_required();
-
-    Ok(SHAMapStoreBackendBundle {
-        store: SHAMapStoreNodeStore::Rotating(rotating),
-        fd_required,
-        saved_state: path_plan.state,
-    })
-}
-
-fn unique_backend_path(node_db: &Section) -> Result<String, String> {
-    unique_backend_path_excluding(node_db, &[])
-}
-
-fn unique_backend_path_excluding(
-    node_db: &Section,
-    reserved: &[PathBuf],
-) -> Result<String, String> {
-    let base = PathBuf::from(
-        node_db
-            .get::<String>("path")
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
-    );
-    for suffix in 0..10_000_u32 {
-        let candidate = base.join(format!("{SHAMAP_STORE_DB_PREFIX}.{suffix:04}"));
-        if !candidate.exists() && !reserved.iter().any(|path| path == &candidate) {
-            return Ok(candidate.to_string_lossy().into_owned());
-        }
-    }
-    Err("Unable to allocate a unique rotating backend path".to_owned())
 }

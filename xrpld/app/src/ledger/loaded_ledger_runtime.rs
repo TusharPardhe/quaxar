@@ -142,12 +142,6 @@ impl SHAMapNodeFetcher for LoadedLedgerNodeFetcher {
                 FetchType::Synchronous,
                 false,
             ),
-            SHAMapStoreNodeStore::Rotating(database) => database.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                FetchType::Synchronous,
-                false,
-            ),
         }?;
 
         Some(SHAMapNodeObject::new(
@@ -354,7 +348,6 @@ impl AppLoadedLedgerRuntime {
     pub fn earliest_ledger_seq(&self) -> u32 {
         match self.node_store.as_ref() {
             Some(SHAMapStoreNodeStore::Single(database)) => database.earliest_ledger_seq(),
-            Some(SHAMapStoreNodeStore::Rotating(database)) => database.earliest_ledger_seq(),
             None => self.minimum_sql_ledger_seq().unwrap_or(1),
         }
     }
@@ -415,14 +408,6 @@ impl AppLoadedLedgerRuntime {
     pub fn has_ledger_object(&self, ledger_hash: SHAMapHash, ledger_seq: u32) -> bool {
         match self.node_store.as_ref() {
             Some(SHAMapStoreNodeStore::Single(database)) => database
-                .fetch_node_object(
-                    ledger_hash.as_uint256(),
-                    ledger_seq,
-                    FetchType::Synchronous,
-                    false,
-                )
-                .is_some(),
-            Some(SHAMapStoreNodeStore::Rotating(database)) => database
                 .fetch_node_object(
                     ledger_hash.as_uint256(),
                     ledger_seq,

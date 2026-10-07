@@ -980,13 +980,6 @@ impl LedgerAcceptor for ApplicationRoot {
                         nodestore::FetchType::Synchronous,
                         false,
                     ),
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => db
-                    .fetch_node_object(
-                        hash.as_uint256(),
-                        0,
-                        nodestore::FetchType::Synchronous,
-                        false,
-                    ),
             }?;
             shamap::nodes::tree_node::SHAMapTreeNode::make_from_prefix(data.data(), hash).ok()
         }))
@@ -4877,13 +4870,6 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                         nodestore::FetchType::Synchronous,
                         false,
                     ),
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => db
-                    .fetch_node_object(
-                        hash.as_uint256(),
-                        0,
-                        nodestore::FetchType::Synchronous,
-                        false,
-                    ),
             }?;
             shamap::nodes::tree_node::SHAMapTreeNode::make_from_prefix(data.data(), hash).ok()
         }))
@@ -6495,13 +6481,6 @@ impl ApplicationRoot {
                         nodestore::FetchType::Synchronous,
                         false,
                     ),
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => db
-                    .fetch_node_object(
-                        hash.as_uint256(),
-                        0,
-                        nodestore::FetchType::Synchronous,
-                        false,
-                    ),
             };
             let Some(data) = data else {
                 full_sync_debug!(
@@ -6551,9 +6530,6 @@ impl ApplicationRoot {
                 crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => {
                     db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
                 }
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => {
-                    db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
-                }
             },
         ))
     }
@@ -6583,9 +6559,6 @@ impl ApplicationRoot {
                 crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => {
                     db.store_batch(objects)
                 }
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => {
-                    db.store_batch(objects)
-                }
             }
         }))
     }
@@ -6613,9 +6586,6 @@ impl ApplicationRoot {
             move |object_type, hash, data, ledger_seq| {
                 let result = match &ns {
                     crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => {
-                        db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
-                    }
-                    crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => {
                         db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
                     }
                 };
@@ -9464,9 +9434,6 @@ impl ApplicationRoot {
                 crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(database) => {
                     database.get_write_load()
                 }
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(database) => {
-                    database.get_write_load()
-                }
             })
     }
 
@@ -9480,9 +9447,6 @@ impl ApplicationRoot {
             .as_ref()
             .map(|node_store| match node_store {
                 crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(database) => {
-                    database.earliest_ledger_seq()
-                }
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(database) => {
                     database.earliest_ledger_seq()
                 }
             })

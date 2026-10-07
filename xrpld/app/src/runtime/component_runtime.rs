@@ -65,7 +65,6 @@ impl ManagedComponent for AppNodeStoreRuntime {
         }
         match &self.node_store {
             SHAMapStoreNodeStore::Single(database) => database.stop(),
-            SHAMapStoreNodeStore::Rotating(database) => database.stop(),
         }
     }
 

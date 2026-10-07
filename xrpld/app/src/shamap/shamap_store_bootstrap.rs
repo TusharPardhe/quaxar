@@ -1,7 +1,7 @@
 use crate::shamap::shamap_store_config::node_db_section;
 use crate::{
     SHAMapStore, SHAMapStoreBackendBundle, SHAMapStoreNodeStore, SHAMapStoreSavedState,
-    SHAMapStoreSavedStateDb, apply_rocksdb_online_delete_defaults, make_shamap_store_backend,
+    SHAMapStoreSavedStateDb, make_shamap_store_backend,
 };
 use basics::basic_config::{BasicConfig, Section};
 use nodestore::{Manager, NodeStoreJournal, Scheduler};
@@ -40,11 +40,10 @@ pub fn bootstrap_shamap_store(
     scheduler: Arc<dyn Scheduler>,
     journal: Arc<dyn NodeStoreJournal>,
 ) -> Result<SHAMapStoreBootstrap, String> {
-    let mut node_db = apply_rocksdb_online_delete_defaults(
-        node_db_section(config)?,
-        hash_node_db_cache_mb,
-        node_size,
-    );
+    // RocksDB tuning defaults were dropped with the RocksDB backend; the
+    // node_db section is used as configured.
+    let _ = (hash_node_db_cache_mb, node_size);
+    let mut node_db = node_db_section(config)?.clone();
     let configured_node_size = config
         .exists("node_size")
         .then(|| config.section("node_size").values().first().cloned())

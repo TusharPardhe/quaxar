@@ -332,7 +332,6 @@ impl SHAMapStoreComponentRuntime for BootstrapSHAMapStoreRuntime {}
 
 struct PendingProductionSHAMapStore {
     bootstrap: crate::SHAMapStoreBootstrap,
-    backend_factory: Arc<dyn crate::SHAMapStoreRotatingBackendFactory>,
 }
 
 struct BootstrapNodeFamilyCacheRuntime {
@@ -563,12 +562,6 @@ impl SHAMapNodeFetcher for BootstrapNodeStoreFetcher {
     ) -> Option<SHAMapNodeObject> {
         let fetched = match &self.node_store {
             crate::SHAMapStoreNodeStore::Single(database) => database.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                FetchType::Synchronous,
-                false,
-            ),
-            crate::SHAMapStoreNodeStore::Rotating(database) => database.fetch_node_object(
                 hash.as_uint256(),
                 ledger_seq,
                 FetchType::Synchronous,
@@ -4145,9 +4138,6 @@ fn serve_get_object_by_hash_request(
             crate::SHAMapStoreNodeStore::Single(database) => {
                 database.fetch_node_object(&hash, ledger_seq, FetchType::Synchronous, false)
             }
-            crate::SHAMapStoreNodeStore::Rotating(database) => {
-                database.fetch_node_object(&hash, ledger_seq, FetchType::Synchronous, false)
-            }
         });
 
         if let Some(node_object) = fetched {
@@ -4323,17 +4313,7 @@ fn bootstrap_shamap_store_if_configured(
         Arc::clone(&journal),
     )?;
     let _ = bootstrap.attach_node_store(root);
-    let backend_factory = Arc::new(crate::ConfiguredSHAMapStoreBackendFactory::new(
-        manager,
-        bootstrap.effective_node_db_config.clone(),
-        40_000,
-        scheduler,
-        journal,
-    ));
-    Ok(Some(PendingProductionSHAMapStore {
-        bootstrap,
-        backend_factory,
-    }))
+    Ok(Some(PendingProductionSHAMapStore { bootstrap }))
 }
 
 /// Build the pruned-store driver for a fjall single store, reading its window
@@ -4372,15 +4352,13 @@ fn attach_production_shamap_store_runtime(
     let Some(pending) = pending else {
         return Ok(());
     };
-    let PendingProductionSHAMapStore {
-        bootstrap,
-        backend_factory,
-    } = pending;
+    let PendingProductionSHAMapStore { bootstrap } = pending;
 
-    // A single-backend store has no online-delete worker. Retain the small
-    // inert runtime for that configuration rather than inventing rotation
-    // capabilities which the backend cannot provide.
-    if bootstrap.store.delete_interval() == 0 {
+    // Every node store is now a single database: the fjall pruned store, or
+    // the in-memory/null stores. The rotating online-delete worker has been
+    // removed, so there is no rotating branch. The fjall path additionally
+    // attaches a PrunedDriver that prunes continuously.
+    {
         // The fjall path is a single store that prunes continuously through a
         // PrunedDriver instead of rotating. Detect it from the config and, when
         // present, attach the driver over the backend the store exports.
@@ -4417,61 +4395,6 @@ fn attach_production_shamap_store_runtime(
         let _ = root.attach_shamap_store_component(Arc::new(component));
         return Ok(());
     }
-
-    let crate::SHAMapStoreNodeStore::Rotating(database) = bootstrap.node_store else {
-        return Err("online_delete requires a rotating NodeStore backend".to_owned());
-    };
-    let ledger_master_runtime = root
-        .ledger_master_runtime()
-        .ok_or_else(|| "online_delete requires LedgerMaster runtime".to_owned())?;
-    let ledger_master = ledger_master_runtime.ledger_master();
-    let node_family = root
-        .node_family()
-        .ok_or_else(|| "online_delete requires the application NodeFamily".to_owned())?;
-    let tree_cache = root
-        .shared_tree_cache_arc()
-        .map(Arc::clone)
-        .ok_or_else(|| "online_delete requires the shared TreeNode cache".to_owned())?;
-    let full_below = root
-        .node_family_full_below_cache()
-        .ok_or_else(|| "online_delete requires the NodeFamily FullBelow cache".to_owned())?;
-    let node_family_runtime = Arc::new(BootstrapNodeFamilyCacheRuntime {
-        node_family,
-        tree_cache,
-        full_below,
-    });
-    let node_store_runtime = Arc::new(BootstrapRotatingNodeStoreRuntime {
-        database,
-        ledger_master_runtime,
-        owner_wake: root.consensus_wake_callback(),
-    });
-    let relational = root
-        .relational_database()
-        .as_ref()
-        .map(|database| Arc::clone(database) as Arc<dyn crate::SHAMapStoreRelationalRuntime>);
-    let health = Arc::new(crate::SharedSHAMapStoreHealthState::new_with_app_state(
-        root.shared_time_keeper(),
-        root.network_ops_state(),
-        root.ledger_master_state(),
-    ));
-    let runtime = crate::SHAMapStoreAppRuntime::new_with_health_state(
-        ledger_master,
-        node_family_runtime,
-        root.transaction_master(),
-        node_store_runtime,
-        backend_factory,
-        relational,
-        Arc::new(crate::ValidatedLedgerCopyRuntime),
-        Arc::clone(&health),
-    );
-    let component = Arc::new(SHAMapStoreComponent::new(
-        bootstrap.store,
-        Box::new(runtime),
-        bootstrap.state_db,
-    ));
-    let service = Arc::new(crate::SHAMapStoreService::new(component, health));
-    let _ = root.attach_shamap_store_service(service);
-    Ok(())
 }
 
 fn attach_relational_database_if_configured(
@@ -5454,7 +5377,6 @@ fn seed_startup_ledger_state(
         // written, otherwise `--load` finds metadata without its full tree.
         match root.node_store().as_ref() {
             Some(crate::SHAMapStoreNodeStore::Single(database)) => database.sync(),
-            Some(crate::SHAMapStoreNodeStore::Rotating(database)) => database.sync(),
             None => unreachable!("node store presence was checked above"),
         }
     }

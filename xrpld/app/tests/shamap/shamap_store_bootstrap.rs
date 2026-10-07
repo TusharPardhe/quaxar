@@ -47,7 +47,6 @@ fn shamap_store_bootstrap_persists_first_rotating_backend_names() {
     .expect("bootstrap");
 
     match bootstrap.node_store {
-        SHAMapStoreNodeStore::Rotating(_) => {}
         SHAMapStoreNodeStore::Single(_) => panic!("online delete should create rotating store"),
     }
 
