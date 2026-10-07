@@ -321,6 +321,141 @@ fn trust_line_frac(
     sle
 }
 
+/// Public testnet ledger 21346657 transaction-index 10 regression.
+///
+/// This is the exact XRP/ZYR AMM state and OfferCreate shape that first
+/// diverged after parent ledger 21346656 matched rippled byte-for-byte. The
+/// fixture deliberately gives the CLOB maker only its observed 354551632-drop
+/// funding so the test exercises the same mixed CLOB-plus-single-path-AMM
+/// limit-quality calculation as the network transaction.
+#[test]
+fn testnet_21346657_ioc_amm_cross_matches_rippled() {
+    let pool_owner = acct(0x11);
+    let taker = acct(0x22);
+    let maker = acct(0x33);
+    let next_maker = acct(0x35);
+    let issuer = acct(0x44);
+    let zyr = protocol::currency_from_string("ZYR");
+
+    let mut issuer_root = account_root(
+        issuer,
+        100_000_000_000,
+        0,
+        protocol::lsfDefaultRipple,
+    );
+    issuer_root.set_field_u32(sf("sfTransferRate"), 1_007_190_447);
+    issuer_root.set_field_u8(sf("sfTickSize"), 5);
+
+    // The fixture reserve is 300000 drops after maker's trust line and offer
+    // are owned. Together with the 10-drop offer fee this leaves exactly the
+    // observed owner funding for the CLOB offer.
+    let entries = vec![
+        account_root(pool_owner, 48_000_000_000, 1, 0),
+        account_root(taker, 39_263_427, 28, 0),
+        account_root(maker, 354_851_642, 1, 0),
+        account_root(next_maker, 70_327_334, 1, 0),
+        issuer_root,
+        trust_line_frac(pool_owner, issuer, zyr, 100_000_000_000_000, -15, 1),
+        trust_line_frac(taker, issuer, zyr, 5_001_099_238_509_418, -15, 10),
+        trust_line_frac(maker, issuer, zyr, 4_906_151_894_127_364, -15, 1_000),
+        trust_line_frac(next_maker, issuer, zyr, 0, 0, 1_000),
+    ];
+    let ledger = build_ledger_with_features(
+        entries,
+        vec![
+            "AMM",
+            "fixAMMv1_1",
+            "fixAMMv1_2",
+            "fixAMMv1_3",
+            "fixReducedOffersV2",
+            "fixFillOrKill",
+        ],
+    );
+    let mut view = new_view(ledger);
+
+    let create = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), pool_owner);
+        tx.set_field_amount(sf("sfAmount"), xrp(47_016_447_787));
+        tx.set_field_amount(
+            sf("sfAmount2"),
+            iou_frac(issuer, zyr, 7_401_525_054_657_880, -17),
+        );
+        tx.set_field_u16(sf("sfTradingFee"), 500);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(full_apply(&mut view, &create, TxType::AMM_CREATE), Ter::TES_SUCCESS);
+
+    // Network SLE 9E40F064: maker gives XRP and wants 115.0167 ZYR. Its
+    // offer amount is much larger than its 354551632-drop available funding.
+    let resting = offer_tx(
+        maker,
+        iou_frac(issuer, zyr, 1_150_167_000_000_000, -13),
+        xrp(54_694_326_881_925),
+        1,
+    );
+    assert_eq!(full_apply(&mut view, &resting, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    // The next parent-book tier is deliberately far below the limit. Its
+    // presence makes BookOfferCrossingStep::qualityThreshold return nullopt
+    // after the funded best offer is deleted, allowing rippled's final AMM
+    // retry to consume the remaining limit-quality liquidity.
+    let next_resting = offer_tx(
+        next_maker,
+        iou_frac(issuer, zyr, 1_502_119_392_748_935, -14),
+        xrp(70_027_324),
+        1,
+    );
+    assert_eq!(
+        full_apply(&mut view, &next_resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let amm_key = protocol::amm(protocol::xrp_issue().into(), Issue::new(zyr, issuer).into());
+    let amm = view.read(amm_key).expect("read AMM").expect("AMM exists");
+    let amm_account = amm.get_account_id(sf("sfAccount"));
+    let amm_xrp_key = protocol::account_keylet(acct_id(amm_account));
+    let amm_zyr_key = protocol::line(amm_account, issuer, zyr);
+
+    let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(456_512_435_209));
+        tx.set_field_amount(sf("sfTakerGets"), iou_frac(issuer, zyr, 1, 0));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfImmediateOrCancel);
+        tx.set_field_amount(sf("sfFee"), xrp(12)); // real tx 0D70650E Fee
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(full_apply(&mut view, &tx, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+
+    let amm_xrp_after = view
+        .read(amm_xrp_key)
+        .expect("read AMM XRP root")
+        .expect("AMM XRP root")
+        .get_field_amount(sf("sfBalance"))
+        .xrp()
+        .drops();
+    assert_eq!(amm_xrp_after, 39_262_527_611, "AMM must give 7753920176 drops");
+
+    let mut amm_zyr_after = view
+        .read(amm_zyr_key)
+        .expect("read AMM ZYR line")
+        .expect("AMM ZYR line")
+        .get_field_amount(sf("sfBalance"));
+    if amm_account > issuer {
+        amm_zyr_after.negate();
+    }
+    assert_eq!(amm_zyr_after.iou().to_string(), "0.08870802368025766");
+    assert_eq!(xrp_balance(&view, taker), 8_147_735_223);
+    assert_eq!(
+        view.read(protocol::line(taker, issuer, zyr))
+            .expect("read taker ZYR line")
+            .expect("taker ZYR line")
+            .get_field_amount(sf("sfBalance"))
+            .iou()
+            .to_string(),
+        "4.98554987004118"
+    );
+}
+
 /// Exact reproduction of mainnet ledger 107359777 tx index 35 crossing math.
 ///
 /// A `tfSell | tfImmediateOrCancel` OfferCreate (TakerGets 0.000003702929240260918
