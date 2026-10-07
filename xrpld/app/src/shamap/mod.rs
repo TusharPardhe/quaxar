@@ -1,4 +1,5 @@
 pub mod pruned_claim;
+pub mod pruned_driver;
 pub mod shamap_store;
 pub mod shamap_store_app_runtime;
 pub mod shamap_store_backend;
