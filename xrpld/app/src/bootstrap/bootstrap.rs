@@ -4336,6 +4336,35 @@ fn bootstrap_shamap_store_if_configured(
     }))
 }
 
+/// Build the pruned-store driver for a fjall single store, reading its window
+/// (`online_delete`) and prune settings from the node_db section. Returns None
+/// if the store does not export a key-value-capable backend (should not happen
+/// for fjall, but keeps the path non-fatal).
+fn build_pruned_driver(
+    node_db: &basics::basic_config::Section,
+    node_store: &crate::SHAMapStoreNodeStore,
+    can_delete: u32,
+) -> Result<Option<Arc<crate::shamap::pruned_driver::PrunedDriver>>, String> {
+    use crate::shamap::pruned_driver::{PrunedDriver, pruned_config_from_section};
+    let Some(backend) = node_store.export_backend() else {
+        return Ok(None);
+    };
+    if !backend.supports_kv() {
+        return Ok(None);
+    }
+    // online_delete is the retention window for the pruned store. Default to a
+    // conservative window when unset so pruning never runs unexpectedly tight.
+    let online_delete = node_db
+        .get::<u32>("online_delete")
+        .ok()
+        .flatten()
+        .filter(|&n| n > 0)
+        .unwrap_or(512);
+    let config = pruned_config_from_section(node_db, online_delete, can_delete);
+    let driver = PrunedDriver::open(backend, config)?;
+    Ok(Some(Arc::new(driver)))
+}
+
 fn attach_production_shamap_store_runtime(
     root: &mut ApplicationRoot,
     pending: Option<PendingProductionSHAMapStore>,
@@ -4352,12 +4381,33 @@ fn attach_production_shamap_store_runtime(
     // inert runtime for that configuration rather than inventing rotation
     // capabilities which the backend cannot provide.
     if bootstrap.store.delete_interval() == 0 {
-        let component = Arc::new(SHAMapStoreComponent::new(
+        // The fjall path is a single store that prunes continuously through a
+        // PrunedDriver instead of rotating. Detect it from the config and, when
+        // present, attach the driver over the backend the store exports.
+        let node_db = &bootstrap.effective_node_db_config;
+        let is_fjall = node_db
+            .get::<String>("type")
+            .ok()
+            .flatten()
+            .is_some_and(|t| t.eq_ignore_ascii_case("fjall"));
+        let pruned_driver = if is_fjall {
+            build_pruned_driver(
+                node_db,
+                &bootstrap.node_store,
+                bootstrap.store.get_can_delete(),
+            )?
+        } else {
+            None
+        };
+        let mut component = SHAMapStoreComponent::new(
             bootstrap.store,
             Box::new(BootstrapSHAMapStoreRuntime::default()),
             bootstrap.state_db,
-        ));
-        let _ = root.attach_shamap_store_component(component);
+        );
+        if let Some(driver) = pruned_driver {
+            component = component.with_pruned_driver(driver);
+        }
+        let _ = root.attach_shamap_store_component(Arc::new(component));
         return Ok(());
     }
 

@@ -73,6 +73,9 @@ struct SHAMapStoreComponentInner {
     /// operator drains. Producers never take this lease, so a health-blocked
     /// online-delete worker cannot delay validation notification.
     worker_execution: Mutex<()>,
+    /// Present only for the fjall pruned-store path. When set, on_ledger_closed
+    /// drives it (claim + prune) instead of the rotation worker.
+    pruned: Option<Arc<crate::shamap::pruned_driver::PrunedDriver>>,
 }
 
 pub struct SHAMapStoreComponent {
@@ -113,9 +116,26 @@ impl SHAMapStoreComponent {
                 can_delete: AtomicU32::new(can_delete),
                 stopping: AtomicBool::new(false),
                 worker_execution: Mutex::new(()),
+                pruned: None,
             }),
             worker: Mutex::new(None),
         }
+    }
+
+    /// Attach a pruned-store driver (the fjall path). When present, the
+    /// component drives claim + prune on each validated ledger and leaves the
+    /// rotation worker idle. Builder form so the existing constructors and
+    /// their call sites are unchanged.
+    pub fn with_pruned_driver(
+        mut self,
+        pruned: Arc<crate::shamap::pruned_driver::PrunedDriver>,
+    ) -> Self {
+        // The inner is freshly created in `new` and not yet shared, so a
+        // get_mut here is guaranteed to succeed.
+        Arc::get_mut(&mut self.inner)
+            .expect("component inner is unique before the worker starts")
+            .pruned = Some(pruned);
+        self
     }
 
     fn store(&self) -> &Mutex<SHAMapStore> {
@@ -130,6 +150,19 @@ impl SHAMapStoreComponent {
     }
 
     pub fn on_ledger_closed(&self, ledger: Arc<Ledger>) {
+        // fjall path: claim the validated ledger into the pruned index and
+        // advance pruning. A failure here is logged and swallowed; the index
+        // batch is atomic, so a failed claim is retried as a gap on the next
+        // ledger rather than corrupting state.
+        if let Some(pruned) = &self.inner.pruned {
+            if let Err(error) = pruned.on_validated_ledger(Arc::clone(&ledger)) {
+                tracing::warn!(
+                    target: "nodestore",
+                    %error,
+                    "pruned store claim/maintain failed; will re-diff on the next ledger"
+                );
+            }
+        }
         self.store()
             .lock()
             .expect("shamap store mutex must not be poisoned")
