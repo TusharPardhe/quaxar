@@ -1,7 +1,7 @@
 use crate::{
     Backend, DatabaseImporter, DatabaseNodeImp, DatabaseRotatingImp, DatabaseSource, Factory,
-    MemoryFactory, NodeObject, NodeStoreJournal, NuDbContext, NuDbFactory, NullFactory,
-    RocksDbFactory, Scheduler,
+    FjallFactory, MemoryFactory, NodeObject, NodeStoreJournal, NuDbContext, NuDbFactory,
+    NullFactory, RocksDbFactory, Scheduler,
 };
 use basics::basic_config::Section;
 use std::any::Any;
@@ -133,6 +133,7 @@ impl ManagerImp {
         manager.insert(Arc::new(NuDbFactory::new()));
         manager.insert(Arc::new(NullFactory::new()));
         manager.insert(Arc::new(MemoryFactory::new()));
+        manager.insert(Arc::new(FjallFactory::new()));
         manager
     }
 
