@@ -3832,3 +3832,64 @@ fn crossing_removes_expired_offer_mid_traversal_fork21337951() {
         "maker_z must be reached after removing the expired offer"
     );
 }
+
+/// Final reconstruction of the fork-21337951 CONTINUATION gap: MANY offers at
+/// the SAME best quality, each owner-funds-limited to a tiny sliver, so the best
+/// tier CANNOT satisfy the taker. The crossing must advance to a WORSE quality
+/// tier to source the remaining liquidity. If our node stops after the exhausted
+/// best tier (not advancing), that is the fork.
+#[test]
+fn crossing_advances_past_exhausted_best_tier_to_worse_tier() {
+    let issuer = acct(0x6F);
+    let taker = acct(0x6E);
+    let blk = protocol::currency_from_string("BLK");
+    // 4 best-tier makers, each owner-funds-limited to ~1 XRP spendable (reserve
+    // 250000 for 1 obj; give 1_250_000 -> ~1 XRP spendable), all at quality 1.00.
+    let best = [acct(0x61), acct(0x62), acct(0x63), acct(0x64)];
+    let deep = acct(0x6D); // worse quality 1.10, fully funded, must be reached
+
+    let mut entries = vec![
+        account_root(taker, 100_000_000_000, 1, 0),
+        account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
+        account_root(deep, 100_000_000, 1, 0),
+    ];
+    for m in best.iter() {
+        entries.push(account_root(*m, 1_250_000, 1, 0)); // ~1 XRP spendable
+        entries.push(trust_line_frac(*m, issuer, blk, 0, 0, 1_000_000));
+    }
+    entries.push(trust_line_frac(deep, issuer, blk, 0, 0, 1_000_000));
+    entries.push(trust_line_frac(taker, issuer, blk, 1_000_000_000_000_000, -12, 1_000_000_000));
+
+    let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // 4 best-tier offers: 10 XRP for 10 BLK (quality 1.00), each funded only ~1 XRP.
+    for m in best.iter() {
+        let o = offer_tx(*m, iou_frac(issuer, blk, 10_000_000_000_000_000, -15), xrp(10_000_000), 1);
+        assert_eq!(full_apply(&mut view, &o, TxType::OFFER_CREATE), Ter::TES_SUCCESS, "best offer rests");
+    }
+    // deep offer worse quality: 10 XRP for 11 BLK (quality ~0.909), fully funded.
+    let od = offer_tx(deep, iou_frac(issuer, blk, 11_000_000_000_000_000, -15), xrp(10_000_000), 1);
+    assert_eq!(full_apply(&mut view, &od, TxType::OFFER_CREATE), Ter::TES_SUCCESS, "deep offer rests");
+
+    let deep_before = xrp_balance(&view, deep);
+
+    // Taker sells 8 BLK. Best tier can only absorb ~4 XRP total worth (~4 BLK),
+    // so the crossing MUST advance to the deep worse-tier offer for the rest.
+    let sell = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1));
+        tx.set_field_amount(sf("sfTakerGets"), iou_frac(issuer, blk, 8_000_000_000_000_000, -15)); // 8 BLK
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let res = full_apply(&mut view, &sell, TxType::OFFER_CREATE);
+    assert_eq!(res, Ter::TES_SUCCESS, "tfSell must succeed; got {res:?}");
+
+    assert!(
+        xrp_balance(&view, deep) < deep_before,
+        "crossing MUST advance to the worse-tier deep offer after the best tier is \
+         owner-funds-exhausted (fork-21337951 continuation gap)"
+    );
+}
