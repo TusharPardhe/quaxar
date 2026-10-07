@@ -1,4 +1,6 @@
 pub mod backend;
+pub mod fault_backend;
+pub mod kv;
 pub mod memory_backend;
 #[cfg(feature = "mmap-store")]
 // Reserved zero-copy data-file utility for NuDB hot-path reads; not yet wired

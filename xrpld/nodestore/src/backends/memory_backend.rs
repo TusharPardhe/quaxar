@@ -1,3 +1,4 @@
+use crate::backends::kv::{Keyspace, KvBatch, KvOp, PersistMode};
 use crate::{Backend, Factory, JournalLevel, NodeObject, NodeStoreJournal, Scheduler, Status};
 use basics::{base_uint::Uint256, basic_config::Section};
 use std::{
@@ -21,6 +22,9 @@ fn normalize_case_fold(value: &str) -> String {
 struct MemoryDb {
     open: Mutex<bool>,
     table: Mutex<BTreeMap<Uint256, Arc<NodeObject>>>,
+    // Key-value v2 tables. One ordered map per keyspace gives the range scans
+    // the notebook needs; a plain lock is enough for the test backend.
+    kv: Mutex<BTreeMap<(Keyspace, Vec<u8>), Vec<u8>>>,
 }
 
 #[derive(Debug, Default)]
@@ -250,6 +254,80 @@ impl Backend for MemoryBackend {
     fn fd_required(&self) -> i32 {
         0
     }
+
+    fn supports_kv(&self) -> bool {
+        true
+    }
+
+    fn kv_get(&self, keyspace: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let db = self.open_database();
+        let kv = db
+            .kv
+            .lock()
+            .expect("memory database kv mutex must not be poisoned");
+        Ok(kv.get(&(keyspace, key.to_vec())).cloned())
+    }
+
+    fn kv_write_batch(&self, batch: &KvBatch) -> Result<(), String> {
+        let db = self.open_database();
+        let mut kv = db
+            .kv
+            .lock()
+            .expect("memory database kv mutex must not be poisoned");
+        // Holding the lock across the whole batch gives all-or-nothing
+        // visibility: concurrent readers never see a partial batch.
+        for op in batch.ops() {
+            match op {
+                KvOp::Put {
+                    keyspace,
+                    key,
+                    value,
+                } => {
+                    kv.insert((*keyspace, key.clone()), value.clone());
+                }
+                KvOp::Delete { keyspace, key } => {
+                    kv.remove(&(*keyspace, key.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn kv_range(
+        &self,
+        keyspace: Keyspace,
+        start: &[u8],
+        end: &[u8],
+        callback: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<(), String> {
+        let db = self.open_database();
+        // Snapshot the matching range so the callback can touch the backend
+        // (for example to stage follow-up writes) without holding the lock.
+        let snapshot: Vec<(Vec<u8>, Vec<u8>)> = {
+            let kv = db
+                .kv
+                .lock()
+                .expect("memory database kv mutex must not be poisoned");
+            let lo = (keyspace, start.to_vec());
+            let hi = (keyspace, end.to_vec());
+            kv.range(lo..hi)
+                .map(|((_, key), value)| (key.clone(), value.clone()))
+                .collect()
+        };
+        for (key, value) in snapshot {
+            if !callback(&key, &value) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn kv_persist(&self, _mode: PersistMode) -> Result<(), String> {
+        // The in-memory backend is durable only for the process lifetime, so a
+        // persist barrier is a no-op beyond confirming the database is open.
+        let _ = self.open_database();
+        Ok(())
+    }
 }
 
 impl Drop for MemoryBackend {
@@ -278,6 +356,30 @@ mod tests {
             payload.to_vec(),
             Uint256::from_array([fill; 32]),
         )
+    }
+
+    #[test]
+    fn memory_backend_satisfies_kv_conformance() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Each macro iteration needs a fresh, open, empty backend; a per-call
+        // unique path gives independent in-memory databases.
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let factory = MemoryFactory::new();
+        let open = || {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let backend = factory
+                .create_instance(
+                    NodeObject::KEY_BYTES,
+                    &section(&format!("conformance/{n}")),
+                    0,
+                    Arc::new(crate::DummyScheduler),
+                    Arc::new(NullJournal),
+                )
+                .expect("memory backend should construct");
+            backend.open(true).expect("open should succeed");
+            backend
+        };
+        crate::backend_conformance!(open());
     }
 
     #[test]

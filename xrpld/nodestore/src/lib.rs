@@ -25,6 +25,8 @@ pub use format::node_object;
 pub use format::types;
 
 pub use backend::Backend;
+pub use backends::fault_backend;
+pub use backends::kv;
 pub use batch_writer::BatchWriter;
 pub use codec::{
     DecodedBlob, EncodedBlob, filter_inner, nodeobject_compress, nodeobject_decompress,
@@ -38,7 +40,9 @@ pub use database::{
 pub use database_node_imp::DatabaseNodeImp;
 pub use database_rotating::DatabaseRotatingImp;
 pub use factory::{Factory, NuDbContext};
+pub use fault_backend::{FaultBackend, kv_collect};
 pub use journal::{JournalLevel, NodeStoreJournal, NullJournal};
+pub use kv::{Keyspace, KvBatch, KvOp, PersistMode, notebook_key, notebook_scan_end};
 pub use manager::{Manager, ManagerImp};
 pub use memory_backend::{MemoryBackend, MemoryFactory};
 pub use node_object::{NodeObject, NodeObjectType};
