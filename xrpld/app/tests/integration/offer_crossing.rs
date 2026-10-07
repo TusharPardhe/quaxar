@@ -4301,3 +4301,117 @@ fn testnet_21351203_issuer_self_buy_uses_amm_before_later_tiers() {
     assert!(present(maker_v, 1), "worse third party tier must stay untouched");
     assert!(present(issuer, 3), "self offer behind the AMM-filled pass must stay untouched");
 }
+
+/// Generated exact reconstruction of testnet fork 21351286 (tx DCA131C2):
+/// first 45 parent-ledger 21351285 RLUSD->XRP book offers (issuer self
+/// offers interleaved with third party tiers) plus the XRP/RLUSD AMM.
+#[test]
+fn testnet_21351286_issuer_self_buy_interleaved_self_offers_matches_rippled() {
+    let pool_owner = acct(0x11);
+    let issuer = acct(0x44);
+    let rlusd = protocol::currency_from_string("RLU");
+    let makers: Vec<AccountID> = (0..5).map(|i| acct(0x80 + i as u8)).collect();
+    let mut entries = vec![
+        account_root(pool_owner, 30_000_000_000, 1, 0),
+        account_root(issuer, 483_000_000_000, 0, protocol::lsfDefaultRipple),
+        trust_line_frac(pool_owner, issuer, rlusd, 3_000_000_000_000_000, -11, 1_000_000),
+    ];
+    let funds: [(i64, i32); 5] = [(8752778009420790, -14), (1566174875657419, -12), (3452319270997892, -13), (1372314517516535, -12), (2959363449620923, -13)];
+    for (i, m) in makers.iter().enumerate() {
+        entries.push(account_root(*m, 1_000_000_000, 1, 0));
+        entries.push(trust_line_frac(*m, issuer, rlusd, funds[i].0, funds[i].1, 1_000_000));
+    }
+    let ledger = build_ledger_with_features(
+        entries,
+        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixAMMv1_3", "fixReducedOffersV2", "fixFillOrKill"],
+    );
+    let mut view = new_view(ledger);
+    let create = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), pool_owner);
+        tx.set_field_amount(sf("sfAmount"), xrp(20154325941));
+        tx.set_field_amount(sf("sfAmount2"), iou_frac(issuer, rlusd, 2902625015629273, -11));
+        tx.set_field_u16(sf("sfTradingFee"), 10);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(full_apply(&mut view, &create, TxType::AMM_CREATE), Ter::TES_SUCCESS);
+    // (is_self, seq_or_maker_index, gets_mantissa, gets_exp, pays_drops)
+    let book: [(bool, usize, i64, i32, i64); 45] = [
+        (true, 1, 7594875186418300, -13, 527348825), // 63A8D6FA
+        (true, 2, 4000000000000000, -12, 2777464230), // A880C8CF
+        (true, 3, 1000000000000000, -12, 694396343), // 6FD90EFC
+        (true, 4, 1000000000000000, -12, 694396343), // A775F5A4
+        (true, 5, 1000000000000000, -12, 694396343), // 1D8DF54B
+        (false, 0, 4349400000000000, -15, 3020276), // B2F3A8B3
+        (true, 6, 4000000000000000, -12, 2777814430), // EF18B4A6
+        (true, 7, 2000000000000000, -12, 1388927241), // 29641A2E
+        (true, 8, 4000000000000000, -12, 2777967842), // F9CF814E
+        (true, 9, 1000000000000000, -12, 694492553), // 2B09C2FE
+        (true, 10, 4000000000000000, -12, 2778062883), // 81E1ECDE
+        (true, 11, 2000000000000000, -12, 1389056692), // AAAC1A6E
+        (true, 12, 4000000000000000, -12, 2778157931), // 3B9DC726
+        (true, 13, 1000000000000000, -12, 694540668), // 5E47E588
+        (false, 1, 2433020000000000, -14, 16898809), // 0B339726
+        (true, 14, 1000000000000000, -12, 694564728), // EE987507
+        (false, 2, 2913800000000000, -14, 20239831), // E5DC67F0
+        (true, 15, 4000000000000000, -12, 2778538188), // 05CA806E
+        (true, 16, 4000000000000000, -12, 2778538188), // E8210453
+        (true, 17, 4000000000000000, -12, 2778547696), // C917B985
+        (true, 18, 2000000000000000, -12, 1389334853), // 94F9CB17
+        (true, 19, 4000000000000000, -12, 2778918549), // 105CBF21
+        (true, 20, 4000000000000000, -12, 2779108769), // 4D9A2CF4
+        (true, 21, 2000000000000000, -12, 1389598730), // 6CAA91B7
+        (true, 22, 1000000000000000, -12, 694807828), // 823D1F89
+        (true, 23, 1000000000000000, -12, 694811762), // 4B25D4BA
+        (true, 24, 4000000000000000, -12, 2779251451), // 367E41A3
+        (true, 25, 4000000000000000, -12, 2779384634), // 33466EB1
+        (true, 26, 4000000000000000, -12, 2779489286), // D9C5AD2C
+        (true, 27, 2000000000000000, -12, 1389790703), // 35220E62
+        (true, 28, 4000000000000000, -12, 2779584432), // D4D27197
+        (true, 29, 2000000000000000, -12, 1389838705), // F8124B2C
+        (true, 30, 4000000000000000, -12, 2779679584), // 4BC3F39F
+        (true, 31, 4000000000000000, -12, 2779679584), // 2FC9ED38
+        (true, 32, 4000000000000000, -12, 2779727163), // E2E319B7
+        (true, 33, 4000000000000000, -12, 2779765227), // CBBC3DDA
+        (true, 34, 1000000000000000, -12, 694974004), // D4473F21
+        (false, 3, 5321100000000000, -14, 36981249), // 2A9DEC9F
+        (true, 35, 2000000000000000, -12, 1389992332), // DD77E023
+        (true, 36, 4000000000000000, -12, 2780155443), // 929E2D54
+        (false, 4, 5423680000000000, -14, 37698389), // D503A9EE
+        (true, 37, 2000000000000000, -12, 1390145993), // 5B30A40D
+        (true, 38, 2000000000000000, -12, 1390165204), // 14BD2FF2
+        (true, 39, 1000000000000000, -12, 695184598), // 2192D2A3
+        (true, 40, 2000000000000000, -12, 1390371745), // 4295F21F
+    ];
+    for (is_self, i, gm, ge, pays) in book {
+        let (owner, seq) = if is_self { (issuer, i as u32) } else { (makers[i], 1) };
+        let o = offer_tx(owner, xrp(pays), iou_frac(issuer, rlusd, gm, ge), seq);
+        assert_eq!(full_apply(&mut view, &o, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    }
+    let amm_key = protocol::amm(protocol::xrp_issue().into(), Issue::new(rlusd, issuer).into());
+    let amm_account = view.read(amm_key).expect("read").expect("AMM").get_account_id(sf("sfAccount"));
+    let amm_root = protocol::account_keylet(acct_id(amm_account));
+    let amm_before = view.read(amm_root.clone()).expect("read").expect("root").get_field_amount(sf("sfBalance")).xrp().drops();
+    let before: Vec<i64> = makers.iter().map(|m| xrp_balance(&view, *m)).collect();
+    let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), issuer);
+        tx.set_field_amount(sf("sfTakerPays"), iou_frac(issuer, rlusd, 1292285000000000, -13));
+        tx.set_field_amount(sf("sfTakerGets"), xrp(90521504));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfImmediateOrCancel);
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfSequence"), 41);
+    });
+    assert_eq!(full_apply(&mut view, &tx, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    let amm_after = view.read(amm_root).expect("read").expect("root").get_field_amount(sf("sfBalance")).xrp().drops();
+    let gains: Vec<i64> = makers.iter().enumerate().map(|(i, m)| xrp_balance(&view, *m) - before[i]).collect();
+    eprintln!("RESULT amm_gain={} maker_gains={:?}", amm_after - amm_before, gains);
+    let expected_gains: [i64; 5] = [3020276, 16898809, 20239831, 36981249, 3244169];
+    assert_eq!(amm_after - amm_before, 9401593, "network AMM XRP gain");
+    assert_eq!(gains, expected_gains.to_vec(), "network per maker XRP gains");
+    for seq in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36] {
+        assert!(view.read(protocol::offer_keylet(acct_id(issuer), seq)).expect("read").is_none(), "self offer {seq} removed by network");
+    }
+    for seq in [37, 38, 39, 40] {
+        assert!(view.read(protocol::offer_keylet(acct_id(issuer), seq)).expect("read").is_some(), "self offer {seq} untouched by network");
+    }
+}
