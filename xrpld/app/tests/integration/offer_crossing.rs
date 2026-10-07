@@ -3505,3 +3505,64 @@ fn mainnet_107378058_two_amm_hop_delivery() {
     assert_eq!(result, Ter::TES_SUCCESS, "2-AMM-hop payment must succeed");
 }
 
+
+/// Byte-exact replay of fork 21342178 root tx F5726EE6: a `tfSell` OfferCreate
+/// (TakerGets 10.1156838800057 WAR, TakerPays 20000000 drops) by an owner who
+/// holds 405.99 WAR, against a WAR issuer with TickSize=6, with NO crossing
+/// liquidity. The network rested the offer with TakerGets reduced to
+/// 10.1156727175249 WAR (TakerPays unchanged 20000000). Our node forked here
+/// (Offer VALUE_DIFF), so it must have rested a different TakerGets. This
+/// single-tx, no-crossing case isolates the placement-amount computation.
+#[test]
+fn war_offercreate_ticksize6_placement_matches_network_f5726ee6() {
+    let issuer = acct(0xE1);
+    let owner = acct(0xE2);
+    let war = protocol::currency_from_string("WAR");
+
+    let mut issuer_root = account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple);
+    issuer_root.set_field_u8(sf("sfTickSize"), 6);
+
+    let mut entries = vec![
+        account_root(owner, 2_115_025_829, 1, 0),
+        issuer_root,
+    ];
+    // Owner holds 405.9969873664264 WAR (mantissa normalized to 16 digits).
+    entries.push(trust_line_frac(owner, issuer, war, 4_059_969_873_664_264, -13, 10_000_000_000));
+
+    let ledger = build_ledger_with_features(entries, vec!["fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // Submit exactly the network tx: tfSell, TakerGets 10.1156838800057 WAR,
+    // TakerPays 20000000 drops.
+    let oc = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), owner);
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            iou_frac(issuer, war, 1_011_568_388_000_570, -14), // 10.1156838800057 WAR
+        );
+        tx.set_field_amount(sf("sfTakerPays"), xrp(20_000_000));
+        tx.set_field_u32(sf("sfFlags"), 0x0001_0000); // tfPassive (real tx Flags=65536)
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let res = full_apply(&mut view, &oc, TxType::OFFER_CREATE);
+    assert_eq!(res, Ter::TES_SUCCESS, "offer must rest; got {res:?}");
+
+    let offer = view
+        .read(protocol::offer_keylet(acct_id(owner), 1))
+        .expect("read resting offer")
+        .expect("offer must rest (no crossing liquidity)");
+    let rested_gets = offer.get_field_amount(sf("sfTakerGets"));
+    let rested_pays = offer.get_field_amount(sf("sfTakerPays"));
+    eprintln!(
+        "F5726EE6_REPLAY rested_gets={} rested_pays={} (network gets=10.1156727175249 pays=20000000)",
+        rested_gets.iou().to_string(),
+        rested_pays.xrp().drops()
+    );
+    // Network rested TakerGets = 10.1156727175249 WAR.
+    let expected_gets = iou_frac(issuer, war, 1_011_567_271_752_490, -14);
+    assert_eq!(
+        rested_gets, expected_gets,
+        "rested TakerGets must match network 10.1156727175249; divergence here is the fork-21342178 placement bug"
+    );
+}
