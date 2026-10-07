@@ -1395,7 +1395,7 @@ impl NuDbBackend {
             let mut originals = self
                 .burst_originals
                 .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             originals.active = false;
             originals.original_bucket_count = 0;
             originals.buckets.clear();
@@ -1409,8 +1409,7 @@ impl NuDbBackend {
     fn burst_commit_limit(&self) -> usize {
         self.config
             .burst_size
-            .max(1)
-            .min(MAX_SYNCHRONOUS_BURST_WRITES)
+            .clamp(1, MAX_SYNCHRONOUS_BURST_WRITES)
     }
 
     fn fail_stop_error(&self) -> Option<String> {
@@ -1436,7 +1435,7 @@ impl NuDbBackend {
             let mut runtime = self
                 .runtime
                 .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if runtime.burst_checkpoint_active {
                 let fail_stop = runtime
                     .fail_stop_error
@@ -1490,7 +1489,7 @@ impl NuDbBackend {
             let mut runtime = self
                 .runtime
                 .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !runtime.open_state.is_open() {
                 return Err("NuDB backend is not open".to_owned());
             }
@@ -1510,7 +1509,7 @@ impl NuDbBackend {
         if let Err(error) = self.write_log_checkpoint(key_header) {
             self.runtime
                 .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .burst_checkpoint_active = false;
             return Err(error);
         }
@@ -1518,7 +1517,7 @@ impl NuDbBackend {
             let mut originals = self
                 .burst_originals
                 .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             originals.original_bucket_count = key_header.buckets;
             originals.active = true;
             originals.buckets.clear();
@@ -1549,7 +1548,7 @@ impl NuDbBackend {
             let mut runtime = self
                 .runtime
                 .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !runtime.open_state.is_open() {
                 return Err("NuDB backend is not open".to_owned());
             }
@@ -1576,13 +1575,13 @@ impl NuDbBackend {
             let mut runtime = self
                 .runtime
                 .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             runtime.burst_pending_writes = 0;
             runtime.burst_checkpoint_active = false;
             let mut originals = self
                 .burst_originals
                 .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             originals.active = false;
             originals.buckets.clear();
         }
@@ -1599,7 +1598,7 @@ impl NuDbBackend {
             let runtime = self
                 .runtime
                 .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             runtime.open_state.is_open() && runtime.burst_checkpoint_active
         };
 
@@ -1623,13 +1622,13 @@ impl NuDbBackend {
                 let mut runtime = self
                     .runtime
                     .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 runtime.burst_pending_writes = 0;
                 runtime.burst_checkpoint_active = false;
                 let mut originals = self
                     .burst_originals
                     .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 originals.active = false;
                 originals.buckets.clear();
             }
@@ -1912,7 +1911,8 @@ impl NuDbBackend {
         runtime.split_threshold = nudb_split_threshold(header);
         runtime.split_fraction = runtime.split_threshold / 2;
         // Re-publish the mutated header to the lock-free read mirror.
-        self.key_header_cache.store(runtime.key_header.map(Arc::new));
+        self.key_header_cache
+            .store(runtime.key_header.map(Arc::new));
         #[cfg(test)]
         nudb_test_crash_if_requested(NuDbTestCrashPoint::PrimaryBucket, "primary bucket creation");
         Ok(())
@@ -2013,7 +2013,8 @@ impl NuDbBackend {
         self.write_key_bucket_with_header(left_index, &left, header)?;
         self.write_key_bucket_with_header(right_index, &right, header)?;
         // Re-publish the mutated header to the lock-free read mirror.
-        self.key_header_cache.store(runtime.key_header.map(Arc::new));
+        self.key_header_cache
+            .store(runtime.key_header.map(Arc::new));
         #[cfg(test)]
         nudb_test_crash_if_requested(NuDbTestCrashPoint::Split, "bucket split");
 
@@ -2527,7 +2528,7 @@ impl Backend for NuDbBackend {
             let mut originals = self
                 .burst_originals
                 .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             originals.active = false;
             originals.original_bucket_count = 0;
             originals.buckets.clear();
@@ -2766,7 +2767,7 @@ impl Backend for NuDbBackend {
                 let runtime = self
                     .runtime
                     .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !runtime.open_state.is_open() {
                     let error = "NuDB backend is not open".to_owned();
                     self.journal.log(JournalLevel::Error, &error);
@@ -2797,7 +2798,7 @@ impl Backend for NuDbBackend {
                 let mut runtime = self
                     .runtime
                     .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 self.ensure_primary_bucket(&mut runtime)
                     .inspect_err(|error| {
                         self.journal.log(JournalLevel::Error, error);
@@ -2904,7 +2905,7 @@ impl Backend for NuDbBackend {
                 let runtime = self
                     .runtime
                     .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !runtime.open_state.is_open() {
                     return Err("NuDB backend is not open".to_owned());
                 }
@@ -2937,7 +2938,7 @@ impl Backend for NuDbBackend {
                 let mut runtime = self
                     .runtime
                     .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 self.ensure_primary_bucket(&mut runtime)?;
                 if !bulk_importing {
                     runtime.split_fraction = runtime
@@ -2985,11 +2986,15 @@ impl Backend for NuDbBackend {
                 .store_batch_coalesced_bytes
                 .fetch_add(coalesced_buffer.len(), Ordering::Relaxed);
 
-            for (_index, (hash_prefix, size, relative_offset)) in
+            for (entry_index, (hash_prefix, size, relative_offset)) in
                 entries.iter().copied().enumerate()
             {
+                // `entry_index` drives the test-only fault injection below; it
+                // is otherwise unused, so reference it unconditionally to keep
+                // non-test builds warning-free.
+                let _ = entry_index;
                 #[cfg(test)]
-                nudb_test_batch_error_before_index_insert(_index + 1)?;
+                nudb_test_batch_error_before_index_insert(entry_index + 1)?;
                 let entry = NuDbBucketEntry {
                     offset: base_offset + relative_offset,
                     size,

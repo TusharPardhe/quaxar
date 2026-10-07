@@ -1,4 +1,3 @@
-use basics::intrusive_pointer::make_shared_intrusive;
 use protocol::{LedgerHeader, calculate_ledger_hash};
 use shamap::nodes::item::SHAMapItem;
 use shamap::nodes::tree_node::{SHAMapNodeType, SHAMapTreeNode};
@@ -609,7 +608,7 @@ fn truncated_file_detected() {
     let snap_path = dir.path().join("truncated.xrpls");
 
     // Write a file that's too short to even contain a header
-    std::fs::write(&snap_path, &[0u8; 10]).unwrap();
+    std::fs::write(&snap_path, [0u8; 10]).unwrap();
 
     let dst = make_backend("dst-trunc");
     let result = load_snapshot(dst.as_ref(), &snap_path);

@@ -197,10 +197,7 @@ impl DatabaseNodeImp {
         self.database.async_fetch(hash, ledger_seq, work);
     }
 
-    pub fn async_fetch_batch(
-        &self,
-        requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>,
-    ) {
+    pub fn async_fetch_batch(&self, requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>) {
         self.database.async_fetch_batch(requests);
     }
 
@@ -583,6 +580,9 @@ mod tests {
     }
 
     struct TerminalWriteWork {
+        // Held only to keep the terminal ticket alive until this work is
+        // dropped; never read directly.
+        #[allow(dead_code)]
         ticket: TerminalTicket,
         payload: Vec<u8>,
     }

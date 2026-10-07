@@ -1,3 +1,8 @@
+// The `#[cfg(test)]` module sits before the trailing `impl NodeObjectCache`
+// block for readability of this file's layout; reordering a large impl purely
+// to satisfy the lint would be churn with no behavioral value.
+#![allow(clippy::items_after_test_module)]
+
 use crate::{NodeObject, NodeObjectType};
 use basics::base_uint::Uint256;
 use basics::basic_config::{Section, get};
@@ -123,7 +128,7 @@ mod tests {
     #[test]
     fn rejects_max_entry_size_that_cannot_fit_moka_weight() {
         let mut config = Section::new("node_db");
-        config.set("cache_max_entry_bytes", &usize::MAX.to_string());
+        config.set("cache_max_entry_bytes", usize::MAX.to_string());
         let error = match NodeObjectCache::from_config(&config) {
             Ok(_) => panic!("oversized weight must fail"),
             Err(error) => error,
