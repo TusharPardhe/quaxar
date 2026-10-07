@@ -205,10 +205,10 @@ fn af_global_freeze_blocks_offer() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    assert_ne!(
-        handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None),
-        Ter::TES_SUCCESS
-    );
+    // rippled OfferCreate::preclaim rejects a globally frozen issuer of
+    // either side with tecFROZEN; doApply alone has no freeze gate, so the
+    // check must run through the full preflight/preclaim/apply pipeline.
+    assert_eq!(full_apply(&mut v, &tx, TxType::OFFER_CREATE), Ter::TEC_FROZEN);
 }
 #[test]
 fn af_global_freeze_blocks_payment() {

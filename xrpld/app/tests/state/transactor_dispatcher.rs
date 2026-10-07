@@ -5,7 +5,6 @@ use app::state::application_root::{
     apply_submit_transactor_shell_with_delivered_amount,
 };
 use app::state::lending::calculate_loan_pay_base_fee;
-use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint192, Uint256};
 use basics::number::NumberParts as RuntimeNumber;
 use basics::string_utilities::str_unhex;
@@ -36,6 +35,30 @@ use sha2::{Digest, Sha256};
 
 fn sample_account(fill: u8) -> AccountID {
     AccountID::from_array([fill; 20])
+}
+
+/// Handler-level tests bypass the fee shell. Production always supplies the
+/// source pre-fee balance (rippled `Transactor::preFeeBalance_` is captured in
+/// `Transactor::apply` before the fee is charged), so when a test passes
+/// `None` capture it from the fixture AccountRoot at the same boundary. An
+/// explicit `Some(balance)` is forwarded unchanged.
+fn handle_real_dispatch<V: ApplyView>(
+    view: &mut V,
+    tx: &STTx,
+    tx_type: TxType,
+    pre_fee_balance: Option<i64>,
+) -> Ter {
+    let pre_fee_balance = pre_fee_balance.or_else(|| {
+        if !tx.is_field_present(sf("sfAccount")) {
+            return None;
+        }
+        let account = tx.get_account_id(sf("sfAccount"));
+        view.read(account_keylet(raw_account_id(account)))
+            .ok()
+            .flatten()
+            .map(|sle| sle.get_field_amount(sf("sfBalance")).xrp().drops())
+    });
+    app::state::transactor_dispatcher::handle_real_dispatch(view, tx, tx_type, pre_fee_balance)
 }
 
 fn dispatch_with_pre_fee_balance<V: ApplyView>(view: &mut V, tx: &STTx, tx_type: TxType) -> Ter {
@@ -6399,6 +6422,10 @@ fn payment_recycles_max_issued_mpt_between_holders() {
         account_root(issuer, 1, 0),
         issuance,
         mptoken_entry(source, mpt_id, 50),
+        // rippled Payment::doApply requireAuth(dst) fails with tecNO_AUTH when
+        // the destination holds no MPToken, so a holder-to-holder transfer
+        // needs the destination's (empty) token.
+        mptoken_entry(destination, mpt_id, 0),
     ]);
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::PAYMENT, |object| {
@@ -6413,7 +6440,7 @@ fn payment_recycles_max_issued_mpt_between_holders() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None),
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000_000)),
         Ter::TES_SUCCESS
     );
     assert_eq!(
@@ -6442,6 +6469,41 @@ fn payment_recycles_max_issued_mpt_between_holders() {
             .expect("issuance")
             .get_field_u64(sf("sfOutstandingAmount")),
         100
+    );
+}
+
+#[test]
+fn payment_mpt_to_holder_without_mptoken_returns_tec_no_auth() {
+    // rippled Payment::doApply (direct MPT branch) calls requireAuth for the
+    // destination with AuthType::Legacy; a missing MPToken yields tecNO_AUTH
+    // (MPTokenHelpers.cpp requireAuth "if account has no MPToken, fail").
+    let source = sample_account(0xDA);
+    let destination = sample_account(0xDB);
+    let issuer = sample_account(0xDC);
+    let mpt_id = share_id_for(issuer, 1);
+    let mpt_issue = MPTIssue::new(mpt_id);
+    let issuance = mpt_issuance_entry(issuer, 1, 100, protocol::lsfMPTCanTransfer);
+    let ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 1_000_000_000),
+        account_root(issuer, 1, 0),
+        issuance,
+        mptoken_entry(source, mpt_id, 50),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::PAYMENT, |object| {
+        object.set_account_id(sf("sfAccount"), source);
+        object.set_account_id(sf("sfDestination"), destination);
+        object.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(10), mpt_issue),
+        );
+        object.set_field_amount(sf("sfFee"), test_xrp(10));
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000_000)),
+        Ter::TEC_NO_AUTH
     );
 }
 
@@ -18193,8 +18255,16 @@ fn loan_pay_overpayment_applies_penalty_fee_management_split_and_reamortizes() {
     );
 }
 
+/// rippled LendingHelpers.cpp tryOverpayment/doOverpayment on this fixture
+/// (zero interest, 2 payments left after the 3333 periodic payment, 1667
+/// overpayment with 5% fee, 20% overpayment interest, 10% management fee):
+/// trackedPrincipalDelta = 1667 - 300 - 33 - 83 = 1251; theoretical state
+/// 2*3333 = 6666 (rounding error 1); new principal 6666 - 1251 + 1 = 5416.
+/// checkLoanGuards passes (no interest expected or found, first payment
+/// principal 2707.5 > 0, ceil(5416 / roundUp(2707.5)) = 2 payments) and
+/// valueChange = 0 is not > 0, so the overpayment is applied, not ignored.
 #[test]
-fn loan_pay_overpayment_skips_invalid_reamortization_guard() {
+fn loan_pay_zero_interest_overpayment_reamortizes_like_rippled() {
     let borrower = sample_account(0x91);
     let broker_owner = sample_account(0x92);
     let broker_pseudo = sample_account(0x93);
@@ -18270,13 +18340,19 @@ fn loan_pay_overpayment_skips_invalid_reamortization_guard() {
         updated_loan
             .get_field_number(get_field_by_symbol("sfPrincipalOutstanding"))
             .value(),
-        RuntimeNumber::from_i64(6_667)
+        RuntimeNumber::from_i64(5_416)
     );
     assert_eq!(
         updated_loan
             .get_field_number(get_field_by_symbol("sfPeriodicPayment"))
             .value(),
-        RuntimeNumber::from_i64(3_333)
+        RuntimeNumber::from_i64_and_exponent(27_075, -1)
+    );
+    assert_eq!(
+        updated_loan
+            .get_field_number(get_field_by_symbol("sfTotalValueOutstanding"))
+            .value(),
+        RuntimeNumber::from_i64(5_416)
     );
 }
 
