@@ -212,10 +212,6 @@ validate_config_inputs() {
         fi
     done
 
-    if [ "$DB_TYPE" = "RocksDB" ] && [ "$LEDGER_HISTORY" = "full" ]; then
-        warn "RocksDB with full history can use significant disk and IO. NuDB is the default for non-validator/full-history testing."
-    fi
-
     if [ "$failed" = true ]; then
         exit 1
     fi
@@ -448,14 +444,10 @@ check_pkg "Git" "git" "git"
 
 if [ "$PKG_MGR" = "apt" ]; then
     check_pkg "OpenSSL" "openssl" "libssl-dev"
-    check_pkg "RocksDB" "" "librocksdb-dev"
-    dpkg -s librocksdb-dev &>/dev/null 2>&1 && ok "RocksDB (librocksdb-dev)" || { fail "RocksDB → will install ${DIM}(librocksdb-dev)${RESET}"; MISSING+=("librocksdb-dev"); }
-    check_pkg "clang" "clang" "clang"
     check_pkg "cmake" "cmake" "cmake"
     check_pkg "pkg-config" "pkg-config" "pkg-config"
 elif [ "$PKG_MGR" = "brew" ]; then
     check_pkg "OpenSSL" "openssl" "openssl"
-    check_pkg "RocksDB" "" "rocksdb"
     check_pkg "cmake" "cmake" "cmake"
 fi
 
@@ -655,10 +647,10 @@ if [ "$GENERATE_CONF" = true ]; then
 
         echo ""
         echo -e "  ${BOLD}── Database ──${RESET}"
-        ask_choice "Database type" "$DB_TYPE" DB_TYPE "nudb rocksdb"
+        ask_choice "Database type" "$DB_TYPE" DB_TYPE "nudb fjall"
         case "$DB_TYPE" in
             nudb) DB_TYPE="NuDB" ;;
-            rocksdb) DB_TYPE="RocksDB" ;;
+            fjall) DB_TYPE="fjall" ;;
         esac
         ask "Data directory" "$DATA_DIR" DATA_DIR
         DB_PATH="$DATA_DIR/db/nudb"
