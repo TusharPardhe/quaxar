@@ -167,10 +167,17 @@ fn self_payment_iou_to_iou_returns_tec_path_dry() {
             STAmount::from_iou_amount(sf("sfSendMax"), iou(1_000_000_000_000_000, 0), issue),
         );
     });
+    // rippled Payment::preflight (Payment.cpp:207-214): a self-payment
+    // (account == Destination) of the SAME token (equalTokens) WITHOUT paths
+    // is temREDUNDANT, not tecPATH_DRY. Our is_redundant_self_payment matches
+    // that condition exactly (payment.rs:92). The earlier tecPATH_DRY
+    // expectation was incorrect for a same-issuer PHX->PHX self payment with
+    // no sfPaths; that only reaches the dry path when the tokens differ or a
+    // path is supplied.
     assert_eq!(
         run(&ledger, tx),
-        Ter::TEC_PATH_DRY,
-        "self-payment IOU→IOU must return tecPATH_DRY"
+        Ter::TEM_REDUNDANT,
+        "same-token self-payment without paths is temREDUNDANT (rippled parity)"
     );
 }
 
