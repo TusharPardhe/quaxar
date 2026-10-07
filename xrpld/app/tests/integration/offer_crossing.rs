@@ -3745,3 +3745,90 @@ fn crossing_drains_owner_then_removes_their_second_offer() {
         "maker_z must be reached after removing X's unfunded second offer"
     );
 }
+
+/// Root-cause reconstruction of fork-21337951: the crossing must REMOVE EXPIRED
+/// resting offers it traverses. The network removed 3 offers (EFFBB8D1/B15338BC/
+/// B78796A9) during the BLKH crossing NOT because they were unfunded (their
+/// owners had positive XRP) but because they were EXPIRED (sfExpiration <
+/// ledger close time). rippled's FlowOfferStream::step removes expired offers as
+/// it advances. Our node left them resting -> Offer-PRESENT fork. This test
+/// places a best-quality funded offer and a worse-quality EXPIRED offer, then a
+/// tfSell that needs more than the funded offer provides; the expired offer must
+/// be removed and the crossing must reach a deeper funded maker.
+#[test]
+fn crossing_removes_expired_offer_mid_traversal_fork21337951() {
+    let issuer = acct(0x5F);
+    let taker = acct(0x5E);
+    let maker_a = acct(0x51); // funded, best quality, owner-funds-limited to a sliver
+    let maker_exp = acct(0x52); // EXPIRED offer at middle quality
+    let maker_z = acct(0x53); // funded, worst quality, must be reached
+    let blk = protocol::currency_from_string("BLK");
+
+    let mut entries = vec![
+        account_root(taker, 100_000_000_000, 1, 0),
+        account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
+        // maker_a: only ~5 XRP spendable (reserve 250000 for 1 obj) -> owner-funds-limited.
+        account_root(maker_a, 5_250_000, 1, 0),
+        account_root(maker_exp, 100_000_000, 1, 0),
+        account_root(maker_z, 100_000_000, 1, 0),
+    ];
+    for m in [maker_a, maker_exp, maker_z] {
+        entries.push(trust_line_frac(m, issuer, blk, 0, 0, 1_000_000));
+    }
+    entries.push(trust_line_frac(taker, issuer, blk, 1_000_000_000_000_000, -12, 1_000_000_000));
+
+    let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // maker_a best quality (10 XRP for 1.00 BLK), owner-funds-limited to ~5 XRP.
+    let oa = offer_tx(maker_a, iou_frac(issuer, blk, 1_000_000_000_000_000, -15), xrp(10_000_000), 1);
+    assert_eq!(full_apply(&mut view, &oa, TxType::OFFER_CREATE), Ter::TES_SUCCESS, "a rests");
+    // maker_exp middle quality (10 XRP for 1.01 BLK) with a FUTURE expiration so
+    // placement succeeds; we then rewrite it to an expired value below the
+    // ledger's parent_close_time (1000).
+    let oe = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), maker_exp);
+        tx.set_field_amount(sf("sfTakerPays"), iou_frac(issuer, blk, 1_010_000_000_000_000, -15));
+        tx.set_field_amount(sf("sfTakerGets"), xrp(10_000_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_u32(sf("sfExpiration"), 999_999_999); // far future for placement
+    });
+    assert_eq!(full_apply(&mut view, &oe, TxType::OFFER_CREATE), Ter::TES_SUCCESS, "exp offer rests");
+    // Rewrite maker_exp's offer sfExpiration to 500 (<= parent_close_time 1000 => expired).
+    {
+        let key = protocol::offer_keylet(acct_id(maker_exp), 1);
+        let sle = view.read(key).expect("read").expect("exp offer exists");
+        let mut obj = sle.clone_as_object();
+        obj.set_field_u32(sf("sfExpiration"), 500);
+        view.update(Arc::new(STLedgerEntry::from_stobject(obj, key.key))).expect("update exp");
+    }
+    // maker_z worst quality (10 XRP for 1.02 BLK), funded.
+    let oz = offer_tx(maker_z, iou_frac(issuer, blk, 1_020_000_000_000_000, -15), xrp(10_000_000), 1);
+    assert_eq!(full_apply(&mut view, &oz, TxType::OFFER_CREATE), Ter::TES_SUCCESS, "z rests");
+
+    let z_before = xrp_balance(&view, maker_z);
+
+    // Taker sells 3 BLK: maker_a gives only ~5 XRP (sliver), so the crossing
+    // must continue past the EXPIRED maker_exp (removing it) to reach maker_z.
+    let sell = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1));
+        tx.set_field_amount(sf("sfTakerGets"), iou_frac(issuer, blk, 3_000_000_000_000_000, -15)); // 3 BLK
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let res = full_apply(&mut view, &sell, TxType::OFFER_CREATE);
+    assert_eq!(res, Ter::TES_SUCCESS, "tfSell must succeed; got {res:?}");
+
+    let exp_offer = view.read(protocol::offer_keylet(acct_id(maker_exp), 1)).expect("read exp");
+    assert!(
+        exp_offer.is_none(),
+        "EXPIRED maker_exp offer MUST be removed during crossing traversal (fork-21337951 root cause)"
+    );
+    assert!(
+        xrp_balance(&view, maker_z) < z_before,
+        "maker_z must be reached after removing the expired offer"
+    );
+}
