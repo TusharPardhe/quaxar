@@ -7,6 +7,8 @@
 //! prune loop, orphan sweep, reconciler and verifier land in subsequent
 //! stages; see `docs/design/2026-10-07-fjall-pruned-nodestore.md`.
 
+pub mod index;
 pub mod model;
 
+pub use index::{ClaimDelta, IndexWriter, NotebookKind, SCHEMA_VERSION};
 pub use model::{LedgerSnapshot, ModelStore};
