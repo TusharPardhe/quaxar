@@ -4405,6 +4405,13 @@ fn attach_production_shamap_store_runtime(
             bootstrap.state_db,
         );
         if let Some(driver) = pruned_driver {
+            // Invalidate the FullBelowCache whenever a prune deletes nodes, so a
+            // stale "subtree fully present" claim cannot survive the removal of
+            // nodes beneath it (design Case 16).
+            if let Some(full_below) = root.node_family_full_below_cache() {
+                use shamap::family::FullBelowCache as _;
+                driver.set_on_prune(Box::new(move || full_below.clear()));
+            }
             component = component.with_pruned_driver(driver);
         }
         let _ = root.attach_shamap_store_component(Arc::new(component));

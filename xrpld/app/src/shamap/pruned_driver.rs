@@ -22,6 +22,12 @@ pub struct PrunedDriver {
     /// The last ledger claimed into the index. The next claim diffs against
     /// its state tree. `None` until the first (anchor) claim.
     last_claimed: Mutex<Option<Arc<Ledger>>>,
+    /// Invoked after a prune that actually deleted nodes. The integration
+    /// layer uses it to invalidate the FullBelowCache, whose "subtree fully
+    /// present" claims can otherwise go stale once pruning removes nodes
+    /// (design Case 16). A whole-cache clear is correct and matches what the
+    /// rotation path did; a per-hash removal would be a later optimization.
+    on_prune: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl PrunedDriver {
@@ -29,6 +35,7 @@ impl PrunedDriver {
         Self {
             store,
             last_claimed: Mutex::new(None),
+            on_prune: Mutex::new(None),
         }
     }
 
@@ -39,6 +46,13 @@ impl PrunedDriver {
     ) -> Result<Self, String> {
         let store = PrunedStore::open(backend, config)?;
         Ok(Self::new(Arc::new(store)))
+    }
+
+    /// Register a callback run after any prune that deleted nodes. Used to
+    /// invalidate the FullBelowCache so a stale "full below" claim cannot
+    /// survive the removal of nodes beneath it.
+    pub fn set_on_prune(&self, callback: Box<dyn Fn() + Send + Sync>) {
+        *self.on_prune.lock().expect("pruned driver on_prune mutex") = Some(callback);
     }
 
     /// Claim a validated ledger and advance pruning. Called from the SHAMap
@@ -60,8 +74,19 @@ impl PrunedDriver {
             compute_claim_delta(ledger.as_ref(), prev_state, state_root)
         };
         self.store.claim(&delta)?;
-        self.store.maintain(seq)?;
+        let pruned = self.store.maintain(seq)?;
         *last = Some(ledger);
+        drop(last);
+        if pruned > 0 {
+            if let Some(callback) = self
+                .on_prune
+                .lock()
+                .expect("pruned driver on_prune mutex")
+                .as_ref()
+            {
+                callback();
+            }
+        }
         Ok(())
     }
 

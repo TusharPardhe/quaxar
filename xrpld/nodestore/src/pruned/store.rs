@@ -144,26 +144,30 @@ impl PrunedStore {
 
     /// Advance pruning for the current validated sequence. In `DryRun` mode it
     /// records how many nodes it would delete without deleting; in `On` mode it
-    /// prunes to the window floor and runs the orphan sweep.
-    pub fn maintain(&self, validated_seq: u32) -> Result<(), String> {
+    /// prunes to the window floor and runs the orphan sweep. Returns the number
+    /// of nodes actually deleted (always 0 in dry-run), so the caller can
+    /// invalidate caches only when the on-disk node set changed.
+    pub fn maintain(&self, validated_seq: u32) -> Result<usize, String> {
         let k = self.prune_target(validated_seq);
         let mut writer = self.writer.lock().expect("pruned store writer mutex");
-        match self.config.prune_mode {
+        let pruned = match self.config.prune_mode {
             PruneMode::DryRun => {
                 let would = count_deletable(&self.backend, writer.pruned_to(), k)?;
                 let mut metrics = self.metrics.lock().expect("metrics mutex");
                 metrics.last_dry_run_would_delete = would;
+                0
             }
             PruneMode::On => {
-                writer.prune(k, self.config.prune_batch)?;
+                let pruned = writer.prune(k, self.config.prune_batch)?;
                 writer.orphan_sweep(validated_seq, self.config.online_delete)?;
+                pruned
             }
-        }
+        };
         let mut metrics = self.metrics.lock().expect("metrics mutex");
         metrics.pruned_to = writer.pruned_to();
         metrics.unclaimed = writer.unclaimed_len();
         metrics.retained_floor = k.saturating_add(1);
-        Ok(())
+        Ok(pruned)
     }
 
     /// Oldest ledger still dropped: `min(validated - online_delete, can_delete)`.
