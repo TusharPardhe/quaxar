@@ -426,9 +426,25 @@ impl STAmount {
         // mantissa drops a final digit >= 5, rippled rounds to nearest while
         // truncation produces a one-unit-lower quality key and a different
         // BookDirectory. This matters for offer quality directory placement.
+        //
+        // rippled reaches IOUAmount through `STAmount::iou()`, which does
+        // `static_cast<std::int64_t>(value_)` and then negates when
+        // `isNegative_` (STAmount.cpp `STAmount::iou`). A raw mantissa above
+        // i64::MAX therefore WRAPS (two's complement) before normalization,
+        // and `operator=(IOUAmount)` takes the sign from the wrapped result.
+        // Arithmetic does produce such mantissas: `divide()` returns
+        // `muldiv(numVal, 1e17, denVal) + 5`, and a native numerator above
+        // ~9.22e16 drops over a 1e15 denominator exceeds 2^63. The network
+        // enshrines the wrapped value: `getRate(1 BOOK, 94024544323757840)`
+        // yields 9.044289641333768e16, which OfferCreate's TickSize rounding
+        // then uses (testnet tx 6407F992, fork 21357187).
+        let mut wrapped = self.value as i64;
+        if self.is_negative {
+            wrapped = wrapped.wrapping_neg();
+        }
         let iou = IOUAmount::from_number(RuntimeNumber::unchecked(
-            self.is_negative,
-            self.value,
+            wrapped < 0,
+            wrapped.unsigned_abs(),
             self.offset,
         ))
         .map_err(|_| AmountError::IssuedOutOfRange)?;

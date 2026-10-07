@@ -4415,3 +4415,113 @@ fn testnet_21351286_issuer_self_buy_interleaved_self_offers_matches_rippled() {
         assert!(view.read(protocol::offer_keylet(acct_id(issuer), seq)).expect("read").is_some(), "self offer {seq} untouched by network");
     }
 }
+
+/// Exact reconstruction of testnet ledger 21357186 tx 6407F992 (tfIOC sell of
+/// BOOK for XRP across many owner-funds-limited offers). Network crossed the
+/// CD88D4E1 tier; our node stopped one tier earlier (fork 21357187 parent).
+#[test]
+fn testnet_21357186_book_ioc_crosses_like_network() {
+    let issuer = acct(0x44);
+    let taker = acct(0x22);
+    let book = protocol::currency_from_string("BKK");
+    let makers: Vec<AccountID> = (0..40).map(|i| acct(0x80 + i as u8)).collect();
+    let funds: [i64; 40] = [343665732, 406064237, 411274186, 441174534, 505731034, 313834164, 340723306, 440523318, 169682010501, 88837560520588109, 350298619, 271894794, 1129797539, 179398886, 157217879, 259869549, 637650435, 403589869, 632101058, 777077921, 1674686801, 356093573, 593668063, 36915216821526006, 881943985, 808148439, 156532867, 46855864, 1085944286, 517208750, 2224317109, 220377075, 5423106, 448561727, 21583913940618340, 273932680, 20556125417032399, 414148361, 18645063253377092, 164996549];
+    let mut issuer_root = account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple);
+    issuer_root.set_field_u32(sf("sfTransferRate"), 1004547145);
+    issuer_root.set_field_u8(sf("sfTickSize"), 6);
+    let mut entries = vec![
+        issuer_root,
+        account_root(taker, 1697052383, 1, 0),
+        trust_line_frac(taker, issuer, book, 1686657974201190, -13, 1_000_000),
+    ];
+    for (i, m) in makers.iter().enumerate() {
+        // reserve after line + offer = 200000 + 2*50000; +10 fee for the offer tx
+        entries.push(account_root(*m, funds[i] + 300_010, 1, 0));
+        entries.push(trust_line_frac(*m, issuer, book, 0, 0, 1_000_000));
+    }
+    let mut ledger = build_ledger(entries);
+    ledger.set_rules(protocol::Rules::new(
+        ["fixReducedOffersV2", "fixFillOrKill", "fixAMMv1_1", "fixAMMv1_2"].iter().map(|f| protocol::feature_id(f)),
+    ));
+    let mut view = new_view(ledger);
+    // (maker_index, pays_mantissa, pays_exp, gets_drops, expiration)
+    let book_rows: [(usize, i64, i32, i64, Option<u32>); 40] = [
+        (0, 1000000000000000, -15, 97942233670581096, None), // 2E983D4D
+        (1, 1000000000000000, -15, 97942233670581096, None), // DA3CAE7C
+        (2, 1000000000000000, -15, 97618117922686455, Some(844718077)), // 432B073D
+        (3, 1000000000000000, -15, 97557168500741439, None), // 716F126B
+        (4, 1000000000000000, -15, 96839169507282310, None), // FE90A0E6
+        (5, 1000000000000000, -15, 96565176665990715, Some(844713386)), // C813CDE1
+        (6, 1000000000000000, -15, 96395762442283042, Some(844719060)), // 05ECC58A
+        (7, 1000000000000000, -15, 96289021125811240, None), // EE16469B
+        (8, 1000000000000000, -15, 93279231379133440, None), // CD88D4E1
+        (9, 1000000000000000, -15, 88837560520588109, Some(844705943)), // 2D812351
+        (10, 1000000000000000, -15, 84607379455636125, None), // 4585095A
+        (11, 1000000000000000, -15, 80578878664324512, None), // 4F2CF5F4
+        (12, 1000000000000000, -15, 66292775413335459, None), // 3D1B0CC3
+        (13, 1000000000000000, -15, 63136096168901689, None), // 7CFD51A7
+        (14, 1000000000000000, -15, 60129760022127756, Some(844057469)), // D0BB1ECE
+        (15, 1000000000000000, -15, 57266552897114916, Some(844058008)), // 09A8BC41
+        (16, 1000000000000000, -15, 54539603933396240, Some(844055798)), // 819F84D8
+        (17, 1000000000000000, -15, 51942655308539377, Some(844055374)), // 1603D07C
+        (18, 1000000000000000, -15, 49469440253283539, Some(844057541)), // 467C126D
+        (19, 1000000000000000, -15, 47113808114882314, Some(844055613)), // 469861A0
+        (20, 1000000000000000, -15, 44870414243664302, Some(844053822)), // E7E29F59
+        (21, 1000000000000000, -15, 42733764374569996, Some(844055568)), // D7D9D32C
+        (22, 1000000000000000, -15, 38760891810598783, None), // C7D6CF19
+        (23, 1000000000000000, -15, 36915216821526006, Some(844055457)), // DEE7B7C4
+        (24, 1000000000000000, -15, 35157417336122493, None), // E041AB81
+        (25, 1000000000000000, -15, 35157417336122493, None), // 67018C7E
+        (26, 1000000000000000, -15, 33483338690667528, Some(844055559)), // 462ABBD9
+        (27, 1000000000000000, -15, 31888975343444269, Some(844053184)), // 77BD3CFD
+        (28, 1000000000000000, -15, 30370489602662889, None), // 95C6F17E
+        (29, 1000000000000000, -15, 30370489602662889, None), // C62D2F7E
+        (30, 1000000000000000, -15, 28924305093570131, None), // B9FD3434
+        (31, 1000000000000000, -15, 26235288561938897, Some(844054324)), // F8AA34FD
+        (32, 1000000000000000, -15, 23796209263864271, None), // DFE76E48
+        (33, 1000000000000000, -15, 21583913940618340, None), // A44E87E2
+        (34, 1000000000000000, -15, 21583913940618340, None), // 34170D2A
+        (35, 1000000000000000, -15, 20556125417032399, Some(844052813)), // B53BEAD9
+        (36, 1000000000000000, -15, 20556125417032399, None), // 8FC84C9F
+        (37, 1000000000000000, -15, 19577287214465270, Some(844053882)), // 1173E1DB
+        (38, 1000000000000000, -15, 18645063253377092, None), // BE7697B3
+        (39, 1000000000000000, -15, 17757226747355510, Some(844053549)), // C69E3883
+    ];
+    for (i, pm, pe, gets, exp) in book_rows {
+        let o = STTx::new(TxType::OFFER_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), makers[i]);
+            tx.set_field_amount(sf("sfTakerPays"), iou_frac(issuer, book, pm, pe));
+            tx.set_field_amount(sf("sfTakerGets"), xrp(gets));
+            tx.set_field_amount(sf("sfFee"), xrp(10));
+            tx.set_field_u32(sf("sfSequence"), 1);
+            if exp.is_some() { tx.set_field_u32(sf("sfExpiration"), 999_999_999); }
+        });
+        assert_eq!(full_apply(&mut view, &o, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+        if let Some(e) = exp {
+            // fixture parent close = 1000; map network expiry relative to parent close 844715480
+            let k = protocol::offer_keylet(acct_id(makers[i]), 1);
+            let sle = view.read(k.clone()).expect("read").expect("offer");
+            let mut obj = sle.clone_as_object();
+            obj.set_field_u32(sf("sfExpiration"), if e <= 844715480 { 500 } else { 999_999_999 });
+            view.update(Arc::new(STLedgerEntry::from_stobject(obj, k.key))).expect("update");
+        }
+    }
+    let before: Vec<i64> = makers.iter().map(|m| xrp_balance(&view, *m)).collect();
+    let taker_before = xrp_balance(&view, taker);
+    let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(94024544323757840));
+        tx.set_field_amount(sf("sfTakerGets"), iou_frac(issuer, book, 1000000000000000, -15));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfImmediateOrCancel);
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(full_apply(&mut view, &tx, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    let gains: Vec<i64> = makers.iter().enumerate().map(|(i, m)| xrp_balance(&view, *m) - before[i]).collect();
+    eprintln!("RESULT taker_gain={} maker_gains={:?}", xrp_balance(&view, taker) - taker_before, gains);
+    // Rows 8 and 9 share one owner (rsvfsyp: CD88D4E1 crossed, 2D812351 expired);
+    // the network balance change is counted once, on the crossed offer's row.
+    let expected: [i64; 40] = [-343665732, -406064237, -411274186, -441174534, -505731034, 0, -340723306, -440523318, -169682010501, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert_eq!(xrp_balance(&view, taker) - taker_before, 172571166836, "network taker XRP gain");
+    assert_eq!(gains, expected.to_vec(), "network per-maker XRP changes");
+}
