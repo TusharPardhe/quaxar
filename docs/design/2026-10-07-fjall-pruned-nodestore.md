@@ -180,6 +180,10 @@ close attempts, wrong-ledger builds (for example the 2026-10-07 fork at
 Rule of thumb: when unsure of a death seq, pick the **later** one. A later seq
 only leaks space for a while; an earlier one deletes live data.
 
+Two more rules govern the in-memory caches above the store: R4 (remove a
+hash from FullBelowCache when it dies) and R5 (reusing a dead-pending node pins
+it). Both are in Case 16.
+
 The race these rules close:
 
 ```
@@ -346,6 +350,107 @@ needs no rebuild), but prune never runs. `ledger_history = full` requires
 `type = RocksDB` after Stage 7 fails config validation with a migration
 message (§8). Tests: `T-CFG-4`, `T-CFG-5`.
 
+### Case 16: FullBelowCache must never vouch for a deletable subtree
+
+FullBelowCache (FBC) records "every node below hash H is present" so sync can
+skip a subtree (`xrpl/shamap/src/owners/sync.rs`, `touch_if_exists` → `duplicate`).
+The claim is keyed by hash, not by the stored nodes. Today that is safe for two
+reasons: NuDB never deletes single keys, and rotation wipes the whole FBC
+(`clear_full_below_cache()` in `shamap_store_app_runtime.rs:431`). Per-ledger
+pruning breaks both assumptions.
+
+The failure without a fix:
+
+```
+ L10: Carol's branch J fully synced     → FBC[J] = full
+ L20: J replaced (Carol changed)        → J, c1 dead, count 0
+ prune deletes J's children (c1 …)      → FBC[J] still "full"  (stale)
+ L25: an inbound ledger contains J again (resurrection / backfill)
+      sync sees FBC[J] → "duplicate, skip" → c1 never fetched
+ read Carol → c1 missing → SHAMapMissingNode 💥
+```
+
+The rules:
+
+- **R4: remove FBC entries at death, not at deletion.** When claim moves a
+  hash to count 0 (the DEAD set), it also removes that hash from FBC, through a
+  callback from the writer to `NodeFamily` so that nodestore stays below SHAMap.
+  FBC can then only describe live subtrees (count ≥ 1). Every descendant of a
+  live node is live, so it is never pruned. Cost: one hash-map remove per dead
+  node (~300–650 per ledger).
+- **R5: reuse pins dead nodes.** When acquisition or sync reuses a node that is
+  already on disk and that node is dead-pending (count 0, not yet pruned), it is
+  added to UNCLAIMED, so R2 protects it until the next claim or the orphan
+  sweep. The writer mirrors the count-0 rows in an in-memory `DEAD_PENDING` set
+  (about `online_delete × 650` hashes, ≈ 330 k for 512), so this check needs no
+  disk read.
+- The bulk `clear_full_below_cache()` on rotation goes away together with
+  rotation (Stage 7).
+
+The ancestor invariant makes R4 sufficient. A parent hash contains its child's
+hash, so whenever a child changes, every ancestor changes in the same ledger:
+`died(ancestor) ≤ died(descendant)`. A present, live ancestor therefore implies
+a present subtree. FBC only becomes dangerous for dead ancestors, and R4
+removes those.
+
+Tests: `T-FBC-1` is the exact sequence above (it must refetch c1, not skip it).
+`T-FBC-2` is a dead-pending reuse during catch-up that races prune (R5).
+`T-FBC-3`: the property test from Stage 3 also checks after every step that each
+FBC entry's subtree is fully present.
+
+### Case 17: serve peers from in-memory nodes first
+
+At the moment, `serve_get_object_by_hash_request` (`xrpld/app/src/bootstrap/bootstrap.rs`)
+answers each hash through `node_store.fetch_node_object`. That checks the
+nodestore's own NodeObject cache, then the NuDB writable and archive backends.
+It never consults the SHAMap `TreeNodeCache`, even though that cache already
+holds about 8.9 M live nodes in memory on our testnet node. This matches stock
+rippled. Xahau #728 adds the fallback.
+
+The new lookup order, in an app-level helper (`TreeNodeCodec`, kept out of the
+nodestore layer):
+
+```
+ 1. TreeNodeCache.fetch(h)  → alive anywhere in RAM (strong or weak tier)
+                             → serialize_with_prefix → reply
+ 2. LedgerMaster by hash     → ledger header objects (otLEDGER)
+ 3. nodestore.fetch(h)       → NodeObject cache → fjall `nodes`
+```
+
+Why it is safe: storage is content-addressed, and every node in memory was
+hash-verified when it was created. Bytes from memory are therefore exactly the
+bytes on disk, and the peer verifies the hash again. What it buys: hot
+consensus-era requests skip disk and LSM reads, and nodes stay servable for as
+long as any live ledger holds them, independently of prune timing. Billing
+(`hits`/`misses`, `computeGetObjectByHashFee`) is unchanged; a memory hit counts
+as a hit. The same helper serves fetch packs and `TMGetLedger` node lookups.
+
+Tests: `T-SERVE-1`: a reply from memory is byte-identical to the reply from
+disk for every node of a retained ledger. `T-SERVE-2`: a node that is only in
+memory (deleted on disk) is still served while a live ledger holds it.
+`T-SERVE-3`: the cost accounting matches the current tests. `T-SERVE-4` is a
+benchmark: disk reads per 1 k peer requests, before and after.
+
+### Case 18: `complete_ledgers` moves in lockstep with prune
+
+The advertised range (`complete_ledgers`, peer status) is lowered to `K + 1`
+in the same writer step that advances `meta.pruned_to`. It never advertises a
+ledger whose nodes may already be deleted. Xahau saw the advertised range grow
+to about 91 ledgers when `online_delete` was 16, because the bulk rotation it
+depended on was blocked.
+Tests: `T-RANGE-1`.
+
+### Case 19: no FULL-mode gate on prune
+
+The NuDB rotation waits on health gates (`shamap_store_health.rs`, rippled
+`healthWait`) because a premature rotation drops the archive. Prune deletes only
+dead nodes, so it has no such risk. It runs whenever claims advance, including
+during catch-up, and is throttled only by `prune_batch` and writer priority.
+Xahau observed rotation starving behind exactly this gate during catch-up. It is
+also the leading suspect, unconfirmed, for our NuDB rotation stalling since
+2026-10-02.
+Tests: `T-GATE-1` (prune keeps advancing while the node is `syncing`).
+
 ## 7. Staged implementation
 
 Every stage ends with the full gate:
@@ -410,7 +515,8 @@ Deliverables (`xrpld/nodestore/src/pruned/`):
 
 Tests:
 
-- Unit tests for every case: `T-RES-*`, `T-TX-*`, `T-GAP-*`, `T-ORPH-*`, `T-ANCH-*`, `T-BACK-*`, `T-ADV-1`, `T-VER-1`, `T-LAG-1`.
+- Unit tests for every case: `T-RES-*`, `T-TX-*`, `T-GAP-*`, `T-ORPH-*`, `T-ANCH-*`, `T-BACK-*`, `T-ADV-1`, `T-VER-1`, `T-LAG-1`, `T-FBC-1..2`.
+- `DEAD_PENDING` mirror, the R4 FBC-removal callback, and R5 reuse pinning.
 - A property test (proptest): random ledger sequences with edits, reverts (resurrection), forks/orphans, gaps, backfill and random window sizes. After each step, the store's node set must equal `ModelStore`'s required set ∪ allowed leaks, and no required node may be missing (ever).
 - Crash tests `T-CRASH-1..4`: FaultBackend at every boundary, then reopen, resume and assert the invariants.
 - Concurrency test `T-CONC-1`.
@@ -426,10 +532,15 @@ Deliverables:
 - `[node_db] prune_mode = dry_run | on` (dry-run logs would-be deletes and verifies them against reachability), plus `prune_batch`, `verify_interval`, `reserve_mb`.
 - Observability: `get_counts` / `fetch-info` / `server_info` fields `claimed_seq`, `pruned_to`, `unclaimed`, `notebook_rows`, `count_rows`, `prune_lag`, `verify_last_ok`. CLI `db-stats` shows fjall keyspace sizes.
 - `can_delete` RPC semantics preserved.
+- FBC callback wired to `NodeFamily` (R4); acquisition reuse hook (R5).
+- `TreeNodeCodec` app-level helper; `serve_get_object_by_hash_request`, fetch packs and `TMGetLedger` node lookups use memory → header → nodestore (Case 17).
+- `complete_ledgers` lowered with `pruned_to` (Case 18); prune not gated on operating mode (Case 19).
+- Lock-fairness audit of the read path (`nodes.get`, NodeObject cache, TreeNodeCache): no writer-preferring lock may block peer or consensus reads for longer than one prune batch (lesson L4).
 
 Tests: app integration tests for validated-ledger publishing with pruning;
 RPC `ledger`/`ledger_data`/`tx`/`account_tx` inside and outside the window match
-rippled-style not-found; `T-CFG-1..3`; `T-DISK-1`; full suite.
+rippled-style not-found; `T-CFG-1..3`; `T-DISK-1`; `T-FBC-3`; `T-SERVE-1..4`;
+`T-RANGE-1`; `T-GATE-1`; full suite.
 Exit: full gate green; dry-run on a local testnet sync shows 0 would-delete live nodes.
 
 ### Stage 5: testnet soak and benchmark gates
@@ -543,7 +654,32 @@ Native toolchain after removal (verified with `cargo tree -i` on `b8d3e196`):
 LSM write amplification (typically 10–20× for leveled compaction) has **not
 been measured** for random 32-byte keys on our host; Stage 0/5 measure it.
 
-## 11. Risks and open questions
+## 11. Lessons from Xahau PR #728
+
+Source: <https://github.com/Xahau/xahaud/pull/728> (open), the discussion
+between shortthefomo and sublimator, sublimator's design gist
+(<https://gist.github.com/sublimator/6da8c771c99e1a2446bb6b70aab571c2>), and the
+rippled port XRPLF/rippled #6549 (open). Xahau's `RWDB` is an in-memory
+`std::map` backend, not an LSM tree. PR #728 runs it as a null node store, in
+which the in-memory `Ledger → SHAMap → node` pointer graph is the store and
+`shared_ptr` refcounts do the garbage collection.
+
+| # | Their finding | What we adopt |
+|---|---|---|
+| L1 | FBC claims are keyed by hash and go stale once the nodes behind them are freed. They needed three checks: liveness, walked-ness, anchoring | Case 16 (R4, R5) |
+| L2 | Retire one ledger at a time, with the advertised range moving in lockstep | Cases 18 and 4.3 |
+| L3 | `healthWait` blocks rotation during catch-up, so ledgers pile up | Case 19 |
+| L4 | glibc `shared_mutex` prefers writers, so readers starve during rotation and consensus transitions stall | Stage 4 lock audit. Also a lead (unverified) for our ~20 s consensus stall at 21357187 |
+| L5 | Serve `GetObjectByHash` from TreeNodeCache and ledger headers (their `TreeNodeCodec` proposal) | Case 17 |
+| L6 | Rotation copies are redundant when live trees already hold the nodes | Already the premise of this design |
+| L7 | A unit typo (`burstSize` 64 TB) went unnoticed | Stage 8: a test that checks the `node_size` tables against rippled |
+
+Not adopted as the primary design: running with no durable store. It needs
+the whole state in RAM (#6549 reports 11–13 GB on XRPL), and every restart
+means a full resync. A future `type=none` mode for validators could reuse
+Case 17 and the FBC rules unchanged.
+
+## 12. Risks and open questions
 
 - DEAD-set exactness is the main correctness risk. It is contained by R1–R3, conservative seqs, the property tests against `ModelStore`, and verify.
 - UNCLAIMED memory during heavy acquisition needs a hard cap (spill to an `unclaimed` keyspace if exceeded); the size is to be tuned in Stage 3.
