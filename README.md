@@ -52,8 +52,8 @@ configuration may still change as parity work continues.
 | Area | Current support |
 | --- | --- |
 | Protocol | XRP Ledger serialization, field definitions, amendments, transaction models, and SHAMap support. |
-| Ledger sync | Parallel coalesced per-hash acquisition, one shared NodeFamily cache family, reusable verified SHAMap nodes, NuDB persistence, snapshot export/import, and bounded execution resources. |
-| Storage | NuDB node store with bulk import mode and streaming export, and a fjall pruned store that keeps a sliding window of validated ledgers. |
+| Ledger sync | Parallel coalesced per-hash acquisition, one shared NodeFamily cache family, reusable verified SHAMap nodes, fjall persistence, snapshot export/import, and bounded execution resources. |
+| Storage | Pure-Rust fjall pruned node store that keeps a sliding window of validated ledgers and prunes continuously, with snapshot export/import and no C/C++ build dependency. |
 | RPC | HTTP and WebSocket JSON RPC with public and admin command handling. |
 | Transactions | Core payment, account, trust line, NFT, AMM, MPT, vault, lending, queue, and invariant paths under active parity coverage. |
 | Operations | Interactive CLI, health checks, sync status, peer inspection, database statistics, log controls, and validator key tools. |
@@ -230,7 +230,7 @@ suggestions, clear errors for unknown commands, and direct RPC passthrough.
 | `ledger-header` | Show the validated ledger header. |
 | `fetch-info` | Show coordinator phase/anchors, per-hash sessions, and recovery counters. |
 | `get-counts` | Show cache, ledger, and node store counters. |
-| `db-stats` | Show NuDB file sizes and database counters. |
+| `db-stats` | Show node store file sizes and database counters. |
 | `can-delete [value]` | Get or set the advisory online deletion ledger. |
 | `config` | Validate the configuration file without starting the node. |
 | `connect <address>` | Request a connection to a peer address. |
@@ -279,8 +279,8 @@ protocol = peer
 medium
 
 [node_db]
-type = NuDB
-path = /var/lib/quaxar/db/nudb
+type = fjall
+path = /var/lib/quaxar/db/fjall
 
 [ledger_history]
 256
@@ -305,10 +305,9 @@ reference and [docs/RUNNING.md](docs/RUNNING.md) for operational guidance.
 
 | Topic | Guidance |
 | --- | --- |
-| Testnet operation | A medium node with NuDB has been validated on public testnet. |
+| Testnet operation | A medium node with the fjall node store has been validated on public testnet. |
 | Full history | Set `[ledger_history]` to `full` and provision storage accordingly. Full history requires significantly more disk and time. |
-| NuDB | Recommended for node store operation and used by the validated testnet deployment. |
-| fjall | A pure-Rust pruned node store that keeps the last `online_delete` validated ledgers and prunes continuously, with no C/C++ build dependency. |
+| fjall | The node store: a pure-Rust pruned store that keeps the last `online_delete` validated ledgers and prunes continuously, with no C/C++ build dependency. It is the only supported `[node_db] type`. |
 | Public endpoints | Use `verify_endpoints` for stricter advertised peer endpoint validation. |
 | RPC parameters | Pass JSON params as a single quoted JSON object, for example `quaxar rpc account_info '{"account":"...","ledger_index":"validated"}'`. |
 | Prometheus | The metrics package records selected acquisition/mode instruments, but normal bootstrap does not start its HTTP exporter; packaged deployments have no `/metrics` endpoint. |

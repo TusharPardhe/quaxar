@@ -119,10 +119,9 @@ Configures persistent ledger object storage.
 
 | Key | Meaning |
 |-----|---------|
-| `type` | Storage backend, commonly `NuDB` or `RocksDB`. |
+| `type` | Storage backend. Only `fjall` is supported. |
 | `path` | Filesystem path for the node database. |
-| `nudb_block_size` | Optional NuDB block size. |
-| `online_delete` | Retention interval; `0` disables online deletion. Minimum `256` on a networked node and `8` in standalone mode. |
+| `online_delete` | Retention window in validated ledgers; `0` disables pruning. Minimum `256` on a networked node and `8` in standalone mode. |
 | `advisory_delete` | When enabled, deletion waits for the advisory `can_delete` boundary. |
 | `delete_batch` | Relational cleanup batch size; default `100`. |
 | `back_off_milliseconds` | Delay between relational cleanup batches; default `100`. Legacy key `backOff` is also accepted. |

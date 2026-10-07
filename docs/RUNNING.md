@@ -56,7 +56,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 **Linux (Ubuntu/Debian):**
 ```bash
-sudo apt install build-essential pkg-config libssl-dev librocksdb-dev clang cmake git
+sudo apt install build-essential pkg-config libssl-dev cmake git
 ```
 
 **macOS:**
@@ -81,20 +81,10 @@ sudo install -o root -g root -m 0755 ~/.cargo/bin/quaxar /usr/local/bin/quaxar
 
 ### Build Troubleshooting
 
-**RocksDB compilation segfault / OOM:**
-
-The RocksDB C++ library compiles from source by default and can exhaust memory. Fix by installing the system package:
-
-```bash
-# Linux
-sudo apt install librocksdb-dev
-ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu CC=clang CXX=clang++ cargo install --path xrpld/main --locked
-```
-
 **Rustc segfault during build (too many parallel jobs):**
 
 ```bash
-CARGO_BUILD_JOBS=2 CC=clang CXX=clang++ cargo install --path xrpld/main --locked
+CARGO_BUILD_JOBS=2 cargo install --path xrpld/main --locked
 ```
 
 **OpenSSL build failure:**
@@ -105,8 +95,8 @@ sudo apt install libssl-dev pkg-config
 
 ### Build Notes
 
-- **System RocksDB:** Install `librocksdb-dev` before setting `ROCKSDB_LIB_DIR` to the directory that actually contains the installed library.
-- **Bundled RocksDB:** Without a system library, the crate compiles RocksDB from source; allow additional build time and memory.
+- **No C/C++ node store:** The fjall node store is pure Rust, so the build needs
+  no `librocksdb-dev`, no `clang`, and no C++ toolchain for storage.
 - **Low-memory machines:** Use `CARGO_BUILD_JOBS=2` to limit parallelism
 - **Faster linking:** `.cargo/config.toml` contains commented examples. Install `clang` and `lld` before enabling the stanza for your target.
 
@@ -223,8 +213,8 @@ protocol = peer
 medium
 
 [node_db]
-type = NuDB
-path = /var/lib/quaxar/db/nudb
+type = fjall
+path = /var/lib/quaxar/db/fjall
 online_delete = 512
 advisory_delete = 0
 
@@ -263,7 +253,7 @@ ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
 |---------|---------|
 | `[server]` | Lists port definitions to activate |
 | `[port_*]` | Port binding: port number, IP, protocol (http/ws/peer) |
-| `[node_db]` | Database backend (NuDB), path, deletion policy |
+| `[node_db]` | Database backend (fjall), path, deletion policy |
 | `[node_size]` | Memory tuning: tiny, small, medium, large, huge |
 | `[validator_list_sites]` | URLs to fetch trusted validator lists |
 | `[validator_list_keys]` | Public keys of validator list publishers |
@@ -337,7 +327,7 @@ without disabling the old unit, require sustained `full`/`proposing` operation,
 advancing local-closed and validated ledgers, no recurring mode churn, and a
 writable database before enabling Quaxar and disabling the old unit. On
 failure, stop Quaxar, restore paths/ownership, and restart the old unit. Never
-run both daemons against one NuDB. Deployments that still intentionally run
+run both daemons against one node store. Deployments that still intentionally run
 `quaxar.service` under an `xrpld` account must keep that ownership in deployment
 commands until this explicit cutover is performed.
 
@@ -442,7 +432,7 @@ running a production node.
 quaxar db-stats --conf /etc/quaxar/quaxar.cfg
 ```
 
-Shows the configured node-store path, NuDB data/key/log file sizes, total disk
+Shows the configured node-store path, fjall data file sizes, total disk
 usage, and live node-store counters when the local RPC server is reachable.
 
 For raw counters:
@@ -531,7 +521,6 @@ alternative sync methods.
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | OOM during sync | Cache/workload exceeds available memory | Select a smaller `[node_size]`, reduce competing workloads, or add RAM |
-| RocksDB build segfault | GCC OOM during compilation | `sudo apt install librocksdb-dev` or `CARGO_BUILD_JOBS=1` |
 | OpenSSL build failure | Missing system OpenSSL | `sudo apt install libssl-dev pkg-config` |
 | Node stuck in "connected" | No suitable current LCL has been installed | Check peers and trust data, preferred target, coordinator sessions/phase, `last_recovery_lcl_decision`, recovery latch, and current-open freshness |
 | Node reports "disconnected" with peers listed | Active peer count is below `[network_quorum]` | Compare the configured threshold with repeated peer counts; retained peers may still serve acquisition while consensus is paused |
