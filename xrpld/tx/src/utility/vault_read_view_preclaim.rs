@@ -568,6 +568,44 @@ fn preclaim_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     }))
 }
 
+/// rippled VaultDeposit.cpp `roundToVaultScale`: integral amounts are
+/// returned unchanged; otherwise round Downward to the scale of
+/// `AssetsTotal + amount` (computed with ToNearest rounding).
+fn round_to_vault_scale(amount: &STAmount, vault: &protocol::STLedgerEntry) -> STAmount {
+    if amount.integral() {
+        return amount.clone();
+    }
+    let asset = amount.asset();
+    let amount_number = amount.as_number();
+    let post_scale = {
+        let _guard = basics::number::NumberRoundModeGuard::new(basics::number::RoundingMode::ToNearest);
+        let total = if vault.is_field_present(sf("sfAssetsTotal")) {
+            vault.get_field_number(sf("sfAssetsTotal")).value()
+        } else {
+            basics::number::NumberParts::zero()
+        };
+        ledger::vault_helpers::asset_scale_from_value(asset, total + amount_number)
+    };
+    let rounded = ledger::vault_helpers::round_number_to_asset_with_scale(
+        asset,
+        amount_number,
+        post_scale,
+        basics::number::RoundingMode::Downward,
+    );
+    asset.amount(rounded).unwrap_or_else(|_| amount.clone())
+}
+
+/// rippled `STAmount::isZeroAtScale`: rounding ToNearest at `scale` yields 0.
+fn is_zero_at_scale(amount: &STAmount, scale: i32) -> bool {
+    amount.signum() == 0
+        || ledger::vault_helpers::round_number_to_asset_with_scale(
+            amount.asset(),
+            amount.as_number(),
+            scale,
+            basics::number::RoundingMode::ToNearest,
+        ) == basics::number::NumberParts::zero()
+}
+
 fn preclaim_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
     let Some(vault) = read_vault(view, tx.get_field_h256(sf("sfVaultID")))? else {
@@ -601,6 +639,24 @@ fn preclaim_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     let frozen_asset = asset_frozen(view, account, asset)?;
     let frozen_share = asset_frozen(view, account, Asset::MPTIssue(share))?;
     let holdings = asset_holds(view, account, &amount)?;
+    // rippled VaultDeposit::preclaim, fixCleanup3_2_0 precision checks.
+    let fix_cleanup_3_2_0 = view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_2_0"));
+    let rounded_amount = if fix_cleanup_3_2_0 && amount.asset() == asset {
+        round_to_vault_scale(&amount, &vault)
+    } else {
+        amount.clone()
+    };
+    let rounded_amount_is_zero = fix_cleanup_3_2_0 && rounded_amount.signum() == 0;
+    let amount_issuer = match amount.asset() {
+        Asset::Issue(issue) => Some(issue.account),
+        Asset::MPTIssue(issue) => Some(issue.issuer()),
+    };
+    let rounds_to_zero_at_depositor_scale = fix_cleanup_3_2_0
+        && !rounded_amount.integral()
+        && amount_issuer != Some(account)
+        && is_zero_at_scale(&amount, holdings.exponent());
     Ok(run_vault_deposit_preclaim(
         VaultDepositPreclaimFacts {
             vault_exists: true,
@@ -619,7 +675,9 @@ fn preclaim_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             vault_is_private: private,
             submitter_is_owner: account == vault.get_account_id(sf("sfOwner")),
             domain_id_present: domain.is_some(),
-            account_holds_sufficient_assets: holdings >= amount,
+            rounded_amount_is_zero_at_vault_scale: rounded_amount_is_zero,
+            account_holds_sufficient_assets: holdings >= rounded_amount,
+            rounds_to_zero_at_depositor_scale,
         },
         || {
             can_transfer(
