@@ -106,6 +106,17 @@ impl PrunedStore {
     /// claim decides its fate; rule R2/R5).
     pub fn store(&self, object: &Arc<NodeObject>, current_seq: u32) -> Result<(), String> {
         let encoded = EncodedBlob::new(object);
+        // Skip the node entirely if it is already present: re-storing a node
+        // the index already tracks (e.g. a shared state node flushed again by a
+        // later ledger) must not re-pin it in UNCLAIMED, or it would never be
+        // pruned. A new node is written and recorded as not-yet-claimed.
+        if self
+            .backend
+            .kv_get(Keyspace::Nodes, object.hash().as_slice())?
+            .is_some()
+        {
+            return Ok(());
+        }
         let mut batch = KvBatch::new();
         batch.put(
             Keyspace::Nodes,

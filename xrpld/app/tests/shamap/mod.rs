@@ -1,6 +1,9 @@
 #[path = "shamap_store.rs"]
 mod shamap_store;
 
+#[path = "pruned_store.rs"]
+mod pruned_store;
+
 #[path = "shamap_store_app_runtime.rs"]
 mod shamap_store_app_runtime;
 
