@@ -24,6 +24,7 @@ arc-swap = "1.9.1"
 dashmap = "6.2.1"
 moka = { version = "=0.12.13", features = ["sync"] }
 shamap = { path = "../../xrpl/shamap" }
+fjall = "=3.1.12"
 
 [features]
 gpu-hash = []

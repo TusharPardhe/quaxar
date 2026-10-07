@@ -26,6 +26,7 @@ pub use format::types;
 
 pub use backend::Backend;
 pub use backends::fault_backend;
+pub use backends::fjall_backend::{FjallBackend, FjallFactory};
 pub use backends::kv;
 pub use batch_writer::BatchWriter;
 pub use codec::{
