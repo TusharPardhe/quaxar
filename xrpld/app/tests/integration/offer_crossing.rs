@@ -3566,3 +3566,114 @@ fn war_offercreate_ticksize6_placement_matches_network_f5726ee6() {
         "rested TakerGets must match network 10.1156727175249; divergence here is the fork-21342178 placement bug"
     );
 }
+
+/// Deterministic reconstruction of the fork-21337951 crossing mechanism: a
+/// tfSell crossing sweeps a book of owner-funds-limited offers where SOME
+/// owners are already UNFUNDED (XRP balance at/below reserve, e.g. drained by
+/// earlier txns in the same ledger). rippled's live FlowOfferStream recomputes
+/// owner funds per step and REMOVES became/found-unfunded offers (permRmOffer),
+/// advancing past them. The network removed 3 unfunded offers (B15338BC/
+/// B78796A9/EFFBB8D1) while consuming 10 funded ones. Our node left the
+/// unfunded ones resting -> Offer-PRESENT fork. This test interleaves funded
+/// and unfunded makers and asserts the unfunded makers' offers are REMOVED.
+#[test]
+fn crossing_removes_unfunded_offers_mid_traversal_fork21337951() {
+    let issuer = acct(0xF1);
+    let taker = acct(0xF2);
+    let blk = protocol::currency_from_string("BLK");
+    // 5 makers each rest an XRP->BLK offer giving 10 XRP for 1 BLK, at distinct
+    // adjacent qualities. Makers B and D are UNFUNDED (balance <= reserve 250000)
+    // so their offers must be removed; A, C, E are funded.
+    let maker_a = acct(0xA1); // funded
+    let maker_b = acct(0xB2); // UNFUNDED
+    let maker_c = acct(0xC3); // funded
+    let maker_d = acct(0xD4); // UNFUNDED
+    let maker_e = acct(0xE5); // funded
+
+    let funded_bal = 100_000_000i64; // well above reserve
+    let sink = acct(0xF9);
+
+    let mut entries = vec![
+        account_root(taker, 100_000_000_000, 1, 0),
+        account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
+        account_root(maker_a, funded_bal, 1, 0),
+        account_root(maker_b, funded_bal, 1, 0),
+        account_root(maker_c, funded_bal, 1, 0),
+        account_root(maker_d, funded_bal, 1, 0),
+        account_root(maker_e, funded_bal, 1, 0),
+        account_root(sink, 100_000_000, 0, 0),
+    ];
+    for m in [maker_a, maker_b, maker_c, maker_d, maker_e] {
+        entries.push(trust_line_frac(m, issuer, blk, 0, 0, 1_000_000));
+    }
+    entries.push(trust_line_frac(taker, issuer, blk, 1_000_000_000_000_000, -12, 1_000_000_000));
+
+    let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // Rest offers at adjacent qualities (TakerPays BLK varies slightly), each
+    // giving 10 XRP. Best quality first: A(1.00) B(1.01) C(1.02) D(1.03) E(1.04).
+    let pays = [
+        1_000_000_000_000_000i64, // A 1.00 BLK (e-15)
+        1_010_000_000_000_000i64, // B 1.01
+        1_020_000_000_000_000i64, // C 1.02
+        1_030_000_000_000_000i64, // D 1.03
+        1_040_000_000_000_000i64, // E 1.04
+    ];
+    let makers = [maker_a, maker_b, maker_c, maker_d, maker_e];
+    for (i, m) in makers.iter().enumerate() {
+        let o = offer_tx(*m, iou_frac(issuer, blk, pays[i], -15), xrp(10_000_000), 1);
+        let r = full_apply(&mut view, &o, TxType::OFFER_CREATE);
+        assert_eq!(r, Ter::TES_SUCCESS, "maker {i} offer must rest; got {r:?}");
+    }
+
+    // Drain makers B and D below their reserve (owner_count=2 -> reserve
+    // 200000+2*50000=300000) so their XRP-giving offers become UNFUNDED, as if
+    // earlier txns in the same ledger spent their balance. Leave ~290000 drops
+    // (< 300000 reserve) so spendable owner funds <= 0.
+    for (idx, m) in [(1usize, maker_b), (3usize, maker_d)] {
+        let bal = xrp_balance(&view, m);
+        let send = bal - 300_000 - 10; // leave exactly reserve(owner_count=2)=300000 -> spendable 0
+        let drain = STTx::new(TxType::PAYMENT, |t| {
+            t.set_account_id(sf("sfAccount"), m);
+            t.set_account_id(sf("sfDestination"), sink);
+            t.set_field_amount(sf("sfAmount"), xrp(send));
+            t.set_field_amount(sf("sfFee"), xrp(10));
+            t.set_field_u32(sf("sfSequence"), 2);
+        });
+        assert_eq!(full_apply(&mut view, &drain, TxType::PAYMENT), Ter::TES_SUCCESS, "drain maker idx {idx} must succeed");
+    }
+
+    // Taker sells 5 BLK for XRP (tfSell). Must sweep the whole book: consume
+    // funded A/C/E, and REMOVE unfunded B/D (not leave them resting).
+    let sell = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1));
+        tx.set_field_amount(sf("sfTakerGets"), iou_frac(issuer, blk, 5_000_000_000_000_000, -15)); // 5 BLK
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let res = full_apply(&mut view, &sell, TxType::OFFER_CREATE);
+    assert_eq!(res, Ter::TES_SUCCESS, "tfSell sweep must succeed; got {res:?}");
+
+    // Unfunded makers B and D must have NO resting offer (removed). Check their
+    // owner_count returned to 1 (trust line only) and their offer SLE is gone.
+    let b_offer = view.read(protocol::offer_keylet(acct_id(maker_b), 1)).expect("read b");
+    let d_offer = view.read(protocol::offer_keylet(acct_id(maker_d), 1)).expect("read d");
+    assert!(
+        b_offer.is_none(),
+        "unfunded maker_b offer MUST be removed during crossing (fork-21337951: we left it resting)"
+    );
+    assert!(
+        d_offer.is_none(),
+        "unfunded maker_d offer MUST be removed during crossing (fork-21337951: we left it resting)"
+    );
+    // Funded makers A, C, E must have been consumed (gave XRP).
+    for (m, label) in [(maker_a, "A"), (maker_c, "C"), (maker_e, "E")] {
+        assert!(
+            xrp_balance(&view, m) < funded_bal,
+            "funded maker {label} must be consumed in the sweep"
+        );
+    }
+}
