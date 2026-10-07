@@ -611,6 +611,100 @@ fn sell_offer_stops_when_input_exhausted_not_over_consuming() {
     );
 }
 
+/// Deep owner-funds-limited crossing reproduction (fork class: seq 21337951 /
+/// 21340727 offer-set composition). A tfSell crossing must consume ALL funded
+/// resting offers across many adjacent single-offer quality directories, even
+/// though each resting offer's owner holds far less of the pay-side asset than
+/// the offer nominally wants (owner-funds-limited partial fills). rippled's live
+/// FlowOfferStream recomputes owner funds per step and advances the BookTip,
+/// consuming every funded quality; a pre-materialized book snapshot can stop
+/// early / reach a different offer set. Here: 5 makers each rest an XRP->USD
+/// offer giving a large nominal XRP (TakerGets) but holding only a small XRP
+/// balance (owner-funds-limited), at 5 distinct adjacent qualities. The taker
+/// sells enough USD to require ALL five; assert every maker's XRP is spent.
+#[test]
+fn deep_owner_funds_limited_crossing_consumes_all_qualities() {
+    let issuer = acct(0xC9);
+    let taker = acct(0xC8);
+    let usd = protocol::currency_from_string("USD");
+    // Five makers at adjacent qualities; each holds only ~2 XRP spendable but
+    // rests an offer nominally giving 100 XRP for USD (owner-funds-limited).
+    let makers = [acct(0xC1), acct(0xC2), acct(0xC3), acct(0xC4), acct(0xC5)];
+    // Reserve math: base 1 XRP + per-owner-object. Give each maker 5 XRP so
+    // after reserve ~2 XRP is spendable for the offer (owner-funds-limited).
+    let maker_balance = 5_000_000i64;
+
+    let mut entries = vec![
+        account_root(taker, 100_000_000_000, 1, 0),
+        account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
+    ];
+    for m in makers.iter() {
+        entries.push(account_root(*m, maker_balance, 1, 0));
+        // Maker can receive USD (buys USD with XRP).
+        entries.push(trust_line_frac(*m, issuer, usd, 0, 0, 1_000_000));
+    }
+    // Taker holds plenty of USD to sell.
+    entries.push(trust_line_frac(taker, issuer, usd, 100_000_000_000_000_000, -15, 1_000_000_000));
+
+    let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // Each maker rests: TakerGets = 100 XRP (nominal, but owner only has ~2 XRP),
+    // TakerPays = USD at a slightly different (adjacent) quality per maker so
+    // each occupies its own quality directory. Quality = TakerPays/TakerGets.
+    // Use TakerPays = 10.00, 10.01, 10.02, 10.03, 10.04 USD for 100 XRP.
+    let pays_usd = [
+        1_000_000_000_000_000i64, // 10.00 USD (e-14)
+        1_001_000_000_000_000i64, // 10.01
+        1_002_000_000_000_000i64, // 10.02
+        1_003_000_000_000_000i64, // 10.03
+        1_004_000_000_000_000i64, // 10.04
+    ];
+    for (i, m) in makers.iter().enumerate() {
+        let offer = offer_tx(
+            *m,
+            iou_frac(issuer, usd, pays_usd[i], -14), // TakerPays USD
+            xrp(100_000_000),                        // TakerGets 100 XRP (nominal)
+            1,
+        );
+        let r = full_apply(&mut view, &offer, TxType::OFFER_CREATE);
+        assert_eq!(r, Ter::TES_SUCCESS, "maker {i} offer must rest; got {r:?}");
+    }
+
+    let before: Vec<i64> = makers.iter().map(|m| xrp_balance(&view, *m)).collect();
+
+    // Taker: tfSell, sells 60 USD for XRP. Each maker can only provide ~2 XRP
+    // (owner-funds-limited), so the taker must sweep ALL FIVE makers to source
+    // liquidity. deliver=MAX for tfSell; sendMax=60 USD.
+    let sell = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1)); // nominal
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            iou_frac(issuer, usd, 6_000_000_000_000_000, -14), // 60 USD
+        );
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let res = full_apply(&mut view, &sell, TxType::OFFER_CREATE);
+    assert_eq!(res, Ter::TES_SUCCESS, "tfSell deep crossing must succeed; got {res:?}");
+
+    // Every maker's spendable XRP must have been consumed (each owner-funds-
+    // limited offer fully drained the owner's ~2 XRP). If our book traversal
+    // stops early / reaches a different offer set than rippled's live stream,
+    // some maker further down the book keeps its XRP (offer-set divergence).
+    let after: Vec<i64> = makers.iter().map(|m| xrp_balance(&view, *m)).collect();
+    for (i, (b, a)) in before.iter().zip(after.iter()).enumerate() {
+        assert!(
+            a < b,
+            "maker {i} XRP must be consumed in the deep owner-funds-limited \
+             crossing (before={b} after={a}); an untouched maker is the \
+             offer-set-composition fork"
+        );
+    }
+}
+
 /// sub-unit sell IOC offer against sufficient opposite-side liquidity crosses,
 /// matching rippled's flow() crossing. (The byte-exact tx-35 reproduction
 /// requires the full on-ledger ETH/RLUSD state and is tracked as a replay
@@ -3410,3 +3504,4 @@ fn mainnet_107378058_two_amm_hop_delivery() {
     println!("[two_amm_hop] result={result:?} taker_xpm_balance={xpm_bal} (network delivered 9.498596739306 XPM)");
     assert_eq!(result, Ter::TES_SUCCESS, "2-AMM-hop payment must succeed");
 }
+
