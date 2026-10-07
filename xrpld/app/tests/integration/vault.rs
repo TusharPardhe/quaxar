@@ -1110,6 +1110,11 @@ fn issue_54_private_mpt_vault(
         share_issuance,
         asset_issuance,
         static_mpt_holding(shareholder, share_id, 10),
+        // A shareholder necessarily held the vault asset to deposit. rippled
+        // requireAuth (MPTokenHelpers.cpp) ignores a failed validDomain only
+        // when the holder's MPToken exists, so the self-withdraw exception
+        // depends on this holding rather than on a domain credential.
+        static_mpt_holding(shareholder, asset_id, 0),
         static_mpt_holding(pseudo, asset_id, 10),
         static_mpt_holding(destination, asset_id, 0),
         domain,

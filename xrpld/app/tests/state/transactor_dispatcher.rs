@@ -1425,12 +1425,16 @@ fn escrow_finish_mpt_token_escrow_v1_tracks_gross_lock_and_transfer_fee() {
                 escrow,
             ],
         );
-        ledger.set_rules(protocol::Rules::new([]));
+        // EscrowFinish::doApply gates non-XRP escrows on TokenEscrow
+        // (EscrowFinish.cpp temDISABLED); MPT escrows also need MPTokensV1.
+        let mut features = vec![
+            protocol::feature_id("TokenEscrow"),
+            protocol::feature_id("MPTokensV1"),
+        ];
         if amended {
-            ledger.set_rules(protocol::Rules::new([protocol::feature_id(
-                "fixTokenEscrowV1",
-            )]));
+            features.push(protocol::feature_id("fixTokenEscrowV1"));
         }
+        ledger.set_rules(protocol::Rules::new(features));
 
         let tx = STTx::new(TxType::ESCROW_FINISH, |object| {
             object.set_account_id(sf("sfAccount"), destination);
@@ -1537,6 +1541,8 @@ fn escrow_finish_mpt_cleanup_3_4_rounds_transfer_fee_down() {
         // Upstream exercises both cleanup paths with MPTokensV2 enabled;
         // the legacy path still requests directed upward rounding.
         let mut features = vec![
+            protocol::feature_id("TokenEscrow"),
+            protocol::feature_id("MPTokensV1"),
             protocol::feature_id("fixTokenEscrowV1"),
             protocol::feature_id("MPTokensV2"),
         ];
@@ -2169,13 +2175,15 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
         })
     };
 
-    let receiver_ledger = empty_ledger(vec![
+    let mut receiver_ledger = empty_ledger(vec![
         account_root(owner, 1, 0),
         account_root(destination, 0, 0),
         account_root(issuer, 0, 0),
         owner_dir_root(owner, escrow_keylet.key),
         escrow(),
     ]);
+    // IOU escrows require TokenEscrow (EscrowFinish.cpp temDISABLED).
+    receiver_ledger.set_rules(protocol::Rules::new([protocol::feature_id("TokenEscrow")]));
     let mut receiver_view = ApplyViewImpl::new(Arc::new(receiver_ledger), ApplyFlags::NONE);
     assert_eq!(
         handle_real_dispatch(
@@ -2216,13 +2224,14 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
         1
     );
 
-    let owner_no_line_ledger = empty_ledger(vec![
+    let mut owner_no_line_ledger = empty_ledger(vec![
         account_root(owner, 1, 0),
         account_root(destination, 0, 0),
         account_root(issuer, 0, 0),
         owner_dir_root(owner, escrow_keylet.key),
         escrow(),
     ]);
+    owner_no_line_ledger.set_rules(protocol::Rules::new([protocol::feature_id("TokenEscrow")]));
     let mut owner_no_line_view =
         ApplyViewImpl::new(Arc::new(owner_no_line_ledger), ApplyFlags::NONE);
     assert_eq!(
@@ -2249,7 +2258,7 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
             Issue::new(currency, destination),
         ),
     );
-    let limited_ledger = empty_ledger(vec![
+    let mut limited_ledger = empty_ledger(vec![
         account_root(owner, 1, 0),
         account_root(destination, 1, 0),
         account_root(issuer, 0, 0),
@@ -2257,6 +2266,7 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
         escrow(),
         limited_line,
     ]);
+    limited_ledger.set_rules(protocol::Rules::new([protocol::feature_id("TokenEscrow")]));
     let mut limited_view = ApplyViewImpl::new(Arc::new(limited_ledger), ApplyFlags::NONE);
     assert_eq!(
         handle_real_dispatch(
@@ -5077,6 +5087,8 @@ fn fix_mpt_delivered_amount_records_actual_partial_mpt_delivery_only_when_enable
                 account_root(issuer, 1, 0),
                 issuance,
                 mptoken_entry(source, mpt_id, 10_000),
+                // requireAuth(dst) returns tecNO_AUTH without a holder MPToken.
+                mptoken_entry(destination, mpt_id, 0),
             ]);
             if amendment_enabled {
                 ledger.set_rules(protocol::Rules::new([protocol::fix_mpt_delivered_amount()]));
@@ -8565,16 +8577,22 @@ fn cleanup_3_3_0_rejects_pseudo_accounts_as_credential_subjects_and_preauth_targ
         account_root_with_balance(owner, 0, 0, 10_000_000),
         pseudo_root,
     ]);
-    ledger.set_rules(protocol::Rules::new([protocol::fix_cleanup_3_3_0()]));
+    ledger.set_rules(protocol::Rules::new([
+        protocol::fix_cleanup_3_3_0(),
+        protocol::feature_id("Credentials"),
+        protocol::feature_id("DepositPreauth"),
+    ]));
 
     let mut credential_view = ApplyViewImpl::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    // Both rejections live in rippled preclaim (CredentialCreate.cpp and
+    // DepositPreauth.cpp, gated on fixCleanup3_3_0), so run the full
+    // preflight/preclaim/apply pipeline rather than the doApply dispatcher.
     assert_eq!(
-        handle_real_dispatch(
+        apply_simulated_transaction(
             &mut credential_view,
             &credential_create_tx(issuer, pseudo, b"pseudo"),
-            TxType::CREDENTIAL_CREATE,
-            Some(10_000_000),
-        ),
+        )
+        .0,
         Ter::TEC_PSEUDO_ACCOUNT
     );
 
@@ -8586,12 +8604,7 @@ fn cleanup_3_3_0_rejects_pseudo_accounts_as_credential_subjects_and_preauth_targ
     });
     let mut preauth_view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     assert_eq!(
-        handle_real_dispatch(
-            &mut preauth_view,
-            &preauth,
-            TxType::DEPOSIT_PREAUTH,
-            Some(10_000_000),
-        ),
+        apply_simulated_transaction(&mut preauth_view, &preauth).0,
         Ter::TEC_PSEUDO_ACCOUNT
     );
 }
@@ -9787,6 +9800,11 @@ fn delegate_set_reserve_uses_sponsor_adjusted_owner_and_account_counts() {
     let mut account_sle = account_root_with_balance(account, 1, 0, 160);
     account_sle.set_field_u32(sf("sfSponsoredOwnerCount"), 1);
     let mut ledger = empty_ledger(vec![account_sle, account_root(authorize, 0, 0)]);
+    // DelegateSet is gated on PermissionDelegationV1_1 and sponsored counts on Sponsor.
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("PermissionDelegationV1_1"),
+        protocol::feature_id("Sponsor"),
+    ]));
     ledger.set_fees(Fees {
         base: 10,
         reserve: 100,
@@ -13546,9 +13564,14 @@ fn vault_delete_dispatch_removes_vault_and_share_issuance() {
                 MPT_CAN_ESCROW_FLAG | MPT_CAN_TRADE_FLAG | MPT_CAN_TRANSFER_FLAG,
             ),
             owner_token,
-            owner_dir_root(
+            // VaultDelete removes both the owner's share holding and the
+            // vault itself from the owner directory (VaultDelete.cpp).
+            owner_dir_root_with_children(
                 owner,
-                protocol::mptoken_keylet_from_mptid(share_id, raw_account_id(owner)).key,
+                vec![
+                    protocol::mptoken_keylet_from_mptid(share_id, raw_account_id(owner)).key,
+                    vault_id,
+                ],
             ),
             owner_dir_root(
                 pseudo,
@@ -14199,9 +14222,12 @@ fn vault_deposit_dispatch_rejects_zero_at_depositor_trustline_scale() {
             get_field_by_symbol("sfFee"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
         );
+        object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::VAULT_DEPOSIT, None);
+    // rippled rejects this in VaultDeposit::preclaim (amount.isZeroAtScale at
+    // the depositor's trust-line scale), so run preflight/preclaim/apply.
+    let result = apply_simulated_transaction(&mut view, &tx).0;
 
     assert_eq!(result, protocol::Ter::TEC_PRECISION_LOSS);
     assert!(
@@ -14651,6 +14677,12 @@ fn vault_withdraw_sole_shareholder_clean_full_exit_zeroes_vault() {
             MPT_CAN_ESCROW_FLAG | MPT_CAN_TRADE_FLAG | MPT_CAN_TRANSFER_FLAG,
         ),
         mptoken_entry(holder, share_id, 700),
+        // Emptied share holdings are removed via removeEmptyHolding, which
+        // unlinks the MPToken from the holder's owner directory.
+        owner_dir_root(
+            holder,
+            protocol::mptoken_keylet_from_mptid(share_id, raw_account_id(holder)).key,
+        ),
     ]);
     ledger.set_rules(protocol::Rules::new([
         protocol::feature_id("SingleAssetVault"),
@@ -14713,6 +14745,12 @@ fn vault_withdraw_sole_shareholder_clean_full_asset_exit_zeroes_vault() {
             MPT_CAN_ESCROW_FLAG | MPT_CAN_TRADE_FLAG | MPT_CAN_TRANSFER_FLAG,
         ),
         mptoken_entry(holder, share_id, 700),
+        // Emptied share holdings are removed via removeEmptyHolding, which
+        // unlinks the MPToken from the holder's owner directory.
+        owner_dir_root(
+            holder,
+            protocol::mptoken_keylet_from_mptid(share_id, raw_account_id(holder)).key,
+        ),
     ]);
     ledger.set_rules(protocol::Rules::new([
         protocol::feature_id("SingleAssetVault"),
@@ -14787,6 +14825,12 @@ fn vault_clawback_dispatch_burns_holder_shares() {
                 MPT_CAN_ESCROW_FLAG | MPT_CAN_TRADE_FLAG | MPT_CAN_TRANSFER_FLAG,
             ),
             mptoken_entry(holder, share_id, 500),
+            // Emptied share holdings are removed via removeEmptyHolding, which
+            // unlinks the MPToken from the holder's owner directory.
+            owner_dir_root(
+                holder,
+                protocol::mptoken_keylet_from_mptid(share_id, raw_account_id(holder)).key,
+            ),
         ]);
         ledger.set_rules(protocol::Rules::new([protocol::feature_id(
             "SingleAssetVault",
