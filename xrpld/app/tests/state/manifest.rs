@@ -55,10 +55,31 @@ fn build_manifest_object(
     include_signing_key: bool,
     include_signing_signature: bool,
 ) -> (STObject, PublicKey, SecretKey, PublicKey, SecretKey) {
-    let master_secret = secret(master_type, master_fill);
+    build_manifest_object_from_secrets(
+        master_type,
+        secret(master_type, master_fill),
+        signing_type,
+        secret(signing_type, signing_fill),
+        sequence,
+        domain,
+        include_signing_key,
+        include_signing_signature,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_manifest_object_from_secrets(
+    master_type: KeyType,
+    master_secret: SecretKey,
+    signing_type: KeyType,
+    signing_secret: SecretKey,
+    sequence: u32,
+    domain: Option<&str>,
+    include_signing_key: bool,
+    include_signing_signature: bool,
+) -> (STObject, PublicKey, SecretKey, PublicKey, SecretKey) {
     let master_public =
         derive_public_key(master_type, &master_secret).expect("master public key should derive");
-    let signing_secret = secret(signing_type, signing_fill);
     let signing_public =
         derive_public_key(signing_type, &signing_secret).expect("signing public key should derive");
 
@@ -113,6 +134,33 @@ fn build_manifest(
         signing_fill,
         sequence,
         domain,
+        true,
+        true,
+    );
+    deserialize_manifest(&serialize(&st)).expect("manifest should deserialize")
+}
+
+/// A distinct secret valid for both Ed25519 and secp256k1 for any `index`:
+/// a fixed nonzero prefix keeps it far below the secp256k1 group order, and
+/// the big-endian index in the last bytes keeps every key unique. Single-byte
+/// fill patterns cannot express more than 255 keys and some fills (0xFF..)
+/// are invalid secp256k1 scalars.
+fn indexed_secret(domain_byte: u8, index: u32) -> SecretKey {
+    let mut bytes = [0u8; 32];
+    bytes[0] = 0x01;
+    bytes[1] = domain_byte;
+    bytes[28..].copy_from_slice(&index.to_be_bytes());
+    SecretKey::from_bytes(bytes)
+}
+
+fn build_indexed_manifest(index: u32) -> Manifest {
+    let (st, ..) = build_manifest_object_from_secrets(
+        KeyType::Ed25519,
+        indexed_secret(0xA0, index),
+        KeyType::Secp256k1,
+        indexed_secret(0xB0, index),
+        1,
+        None,
         true,
         true,
     );
@@ -418,16 +466,9 @@ fn capped_manifest_gossip_limits_new_untrusted_keys_and_releases_promoted_slots(
     let cache = ManifestCache::new();
     let mut first_master = None;
 
-    for fill in 1..=MAX_UNTRUSTED_MANIFESTS {
-        let manifest = build_manifest(
-            KeyType::Ed25519,
-            fill as u8,
-            KeyType::Secp256k1,
-            (fill + MAX_UNTRUSTED_MANIFESTS) as u8,
-            1,
-            None,
-        );
-        if fill == 1 {
+    for index in 1..=MAX_UNTRUSTED_MANIFESTS {
+        let manifest = build_indexed_manifest(index as u32);
+        if index == 1 {
             first_master = Some(manifest.master_key);
         }
         assert_eq!(
@@ -436,7 +477,7 @@ fn capped_manifest_gossip_limits_new_untrusted_keys_and_releases_promoted_slots(
         );
     }
 
-    let overflow = build_manifest(KeyType::Ed25519, 101, KeyType::Secp256k1, 201, 1, None);
+    let overflow = build_indexed_manifest(MAX_UNTRUSTED_MANIFESTS as u32 + 1);
     assert_eq!(
         cache.apply_manifest_with_policy(overflow.clone(), ManifestRateLimitCapPolicy::Capped),
         ManifestDisposition::UntrustedCapacity
@@ -449,7 +490,7 @@ fn capped_manifest_gossip_limits_new_untrusted_keys_and_releases_promoted_slots(
     );
 
     // Configured, wallet, and listed manifests are deliberately uncapped.
-    let uncapped = build_manifest(KeyType::Ed25519, 102, KeyType::Secp256k1, 202, 1, None);
+    let uncapped = build_indexed_manifest(MAX_UNTRUSTED_MANIFESTS as u32 + 2);
     assert_eq!(
         cache.apply_manifest_with_policy(uncapped, ManifestRateLimitCapPolicy::Uncapped),
         ManifestDisposition::Accepted
