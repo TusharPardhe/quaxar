@@ -360,68 +360,6 @@ impl crate::SHAMapStoreNodeFamilyCacheRuntime for BootstrapNodeFamilyCacheRuntim
     }
 }
 
-struct BootstrapRotatingNodeStoreRuntime {
-    database: Arc<dyn nodestore::DatabaseRotating>,
-    ledger_master_runtime: Arc<crate::AppLedgerMasterRuntime>,
-    owner_wake: Arc<dyn Fn() + Send + Sync>,
-}
-
-impl crate::SHAMapStoreNodeStoreRuntime for BootstrapRotatingNodeStoreRuntime {
-    fn fetch_node_object(&self, hash: &Uint256, ledger_seq: u32) -> bool {
-        nodestore::Database::fetch_node_object(
-            self.database.as_ref(),
-            hash,
-            ledger_seq,
-            FetchType::Synchronous,
-            true,
-        )
-        .is_some()
-    }
-
-    fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
-        self.database.copy_to_writable_batch(hashes)
-    }
-
-    fn copy_to_writable_batch_detailed(
-        &self,
-        hashes: &[Uint256],
-    ) -> Result<(usize, Vec<Uint256>), String> {
-        self.database.copy_to_writable_batch_detailed(hashes)
-    }
-
-    fn store_account_nodes(&self, nodes: Vec<(Uint256, basics::blob::Blob)>) -> Result<(), String> {
-        self.database.store_account_nodes(nodes)
-    }
-
-    fn set_rotation_in_flight(&self, in_flight: bool) {
-        self.database.set_rotation_in_flight(in_flight);
-        if in_flight {
-            // DatabaseRotating advances its generation at the beginning of
-            // the exposure window, before the potentially long copy phase.
-            // Publish that identity immediately so no operation minted during
-            // the copy can carry the retired generation and self-cancel.
-            self.ledger_master_runtime.publish_store_rotation(
-                nodestore::Database::store_generation(self.database.as_ref()),
-            );
-            (self.owner_wake)();
-        }
-    }
-
-    fn rotate_with(&self, new_backend: Box<dyn nodestore::Backend>) -> (String, String) {
-        let mut names = None;
-        self.database
-            .rotate(new_backend, &mut |writable_name, archive_name| {
-                names = Some((writable_name.to_owned(), archive_name.to_owned()));
-            });
-        self.ledger_master_runtime
-            .publish_store_rotation(nodestore::Database::store_generation(
-                self.database.as_ref(),
-            ));
-        (self.owner_wake)();
-        names.expect("rotating NodeStore callback must publish backend names")
-    }
-}
-
 #[derive(Clone)]
 struct BootstrapLedgerDbProvider {
     relational: Arc<crate::SqliteSHAMapStoreRelational>,
