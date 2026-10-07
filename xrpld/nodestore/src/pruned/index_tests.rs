@@ -289,6 +289,191 @@ fn restart_resumes_from_meta_cursors() {
     assert_eq!(writer.claimed_seq(), Some(10));
 }
 
+#[test]
+fn crash_during_claim_leaves_no_partial_state() {
+    use crate::FaultBackend;
+    let inner = open_memory();
+    // Pre-store the node so a replayed claim can rewrite nothing new.
+    store_node(inner.as_ref(), &hid(1));
+    // Open once cleanly so the schema is stamped on the inner backend; the
+    // fault we arm next should only trip the claim batch, not open().
+    IndexWriter::open(Arc::clone(&inner)).expect("initial open stamps schema");
+    let fault = Arc::new(FaultBackend::new(Arc::clone(&inner)));
+    fault.fail_on_write(1); // trip the next write batch (the claim)
+    let fault_dyn: Arc<dyn Backend> = fault.clone();
+    {
+        let mut writer = IndexWriter::open(Arc::clone(&fault_dyn)).expect("writer");
+        let err = writer.claim(&ClaimDelta {
+            seq: 7,
+            state_root: hid(7),
+            new_state: vec![hid(1)],
+            dead_state: vec![],
+            owned: vec![],
+        });
+        assert!(err.is_err(), "the injected fault must fail the claim");
+    }
+    // The inner backend never saw the batch: a fresh writer sees no claim.
+    fault.clear();
+    let writer = IndexWriter::open(Arc::clone(&inner)).expect("reopen");
+    assert_eq!(writer.claimed_seq(), None, "failed claim did not persist");
+    // Retrying the claim now succeeds (R3: idempotent re-claim).
+    let mut writer = writer;
+    writer
+        .claim(&ClaimDelta {
+            seq: 7,
+            state_root: hid(7),
+            new_state: vec![hid(1)],
+            dead_state: vec![],
+            owned: vec![],
+        })
+        .expect("re-claim succeeds");
+    assert_eq!(writer.claimed_seq(), Some(7));
+}
+
+#[test]
+fn crash_during_prune_resumes_from_pruned_to() {
+    use crate::FaultBackend;
+    let inner = open_memory();
+    let mut setup = IndexWriter::open(Arc::clone(&inner)).expect("writer");
+    // Build several dead nodes across sequences so prune has multiple chunks.
+    for seq in 1..=6u32 {
+        let node = hid(1000 + seq as u64);
+        store_node(inner.as_ref(), &node);
+        setup.note_stored(node, seq);
+        let prev = if seq == 1 {
+            vec![]
+        } else {
+            vec![hid(1000 + seq as u64 - 1)]
+        };
+        setup
+            .claim(&ClaimDelta {
+                seq,
+                state_root: hid(seq as u64),
+                new_state: vec![node],
+                dead_state: prev,
+                owned: vec![],
+            })
+            .expect("claim");
+    }
+    // Now wrap in a fault backend and fail partway through a chunked prune.
+    let fault = Arc::new(FaultBackend::new(Arc::clone(&inner)));
+    fault.fail_on_write(2); // fail the second prune batch
+    let fault_dyn: Arc<dyn Backend> = fault.clone();
+    let mut writer = IndexWriter::open(Arc::clone(&fault_dyn)).expect("reopen on fault");
+    let before = writer.pruned_to();
+    let _ = writer.prune(5, 1); // chunk=1 forces several batches; one fails
+    // A fresh writer on the inner backend resumes from the persisted cursor
+    // and completes the prune; the invariant is that pruning is idempotent and
+    // never loses a required node.
+    fault.clear();
+    let mut resumed = IndexWriter::open(Arc::clone(&inner)).expect("resume");
+    assert!(
+        resumed.pruned_to() >= before,
+        "pruned_to never goes backwards"
+    );
+    resumed.prune(5, 16).expect("prune completes on resume");
+    assert_eq!(resumed.pruned_to(), 5, "prune reaches k after resume");
+}
+
+#[test]
+fn concurrent_readers_never_see_a_required_node_vanish() {
+    use crate::backends::kv::Keyspace;
+    use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+    use std::thread;
+    // A node that is live for the whole run (shared by every ledger) must be
+    // readable at every instant, even while prune deletes dead nodes.
+    let backend = open_memory();
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("writer");
+    let pinned = hid(0xA11CE);
+    // Seed a window of ledgers: each adds a unique node and retires the
+    // previous unique node; `pinned` stays live throughout.
+    store_node(backend.as_ref(), &pinned);
+    for seq in 1..=40u32 {
+        let unique = hid(10_000 + seq as u64);
+        store_node(backend.as_ref(), &unique);
+        writer.note_stored(unique, seq);
+        let dead = if seq == 1 {
+            vec![]
+        } else {
+            vec![hid(10_000 + seq as u64 - 1)]
+        };
+        let new_state = if seq == 1 {
+            vec![unique, pinned]
+        } else {
+            vec![unique]
+        };
+        writer
+            .claim(&ClaimDelta {
+                seq,
+                state_root: hid(seq as u64),
+                new_state,
+                dead_state: dead,
+                owned: vec![],
+            })
+            .expect("claim");
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_backend = Arc::clone(&backend);
+    let reader_stop = Arc::clone(&stop);
+    let reader = thread::spawn(move || {
+        // Continuously read the pinned node; it must always be present.
+        while !reader_stop.load(AOrd::Relaxed) {
+            let got = reader_backend
+                .kv_get(Keyspace::Nodes, pinned.as_slice())
+                .expect("read");
+            assert!(got.is_some(), "pinned live node vanished during prune");
+        }
+    });
+
+    // Prune hard while the reader runs. The pinned node is referenced by the
+    // latest claim (count >= 1), so prune must never delete it.
+    for k in 1..=38u32 {
+        writer.prune(k, 2).expect("prune");
+    }
+    stop.store(true, AOrd::Relaxed);
+    reader.join().expect("reader thread");
+
+    // Final check: the pinned node survived every prune.
+    assert!(
+        backend
+            .kv_get(Keyspace::Nodes, pinned.as_slice())
+            .expect("read")
+            .is_some(),
+        "pinned node present after all prunes"
+    );
+}
+
+#[test]
+fn reconcile_reclaims_orphans_the_index_missed() {
+    use crate::{reconcile, verify_present};
+    use std::collections::BTreeSet;
+    let backend = open_memory();
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("writer");
+    // Claim one ledger with a live node.
+    let live = hid(1);
+    store_node(backend.as_ref(), &live);
+    writer.note_stored(live, 1);
+    writer
+        .claim(&ClaimDelta {
+            seq: 1,
+            state_root: hid(1),
+            new_state: vec![live],
+            dead_state: vec![],
+            owned: vec![],
+        })
+        .expect("claim");
+    // Simulate a leaked orphan: a node stored but never claimed and never
+    // swept (e.g. from an abandoned close the writer forgot to track).
+    store_node(backend.as_ref(), &hid(999));
+
+    let required: BTreeSet<Uint256> = [live].into_iter().collect();
+    let swept = reconcile(backend.as_ref(), &required, 16).expect("reconcile");
+    assert_eq!(swept, 1, "the orphan is reclaimed");
+    let report = verify_present(backend.as_ref(), &required, 1).expect("verify");
+    assert!(report.is_ok(), "the live node is still present");
+}
+
 /// Randomized equivalence: random edits, reversions and a window, checked
 /// against the model after every step. Deterministic LCG so failures are
 /// reproducible without a proptest dependency.

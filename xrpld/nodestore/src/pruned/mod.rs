@@ -9,6 +9,8 @@
 
 pub mod index;
 pub mod model;
+pub mod reconcile;
 
 pub use index::{ClaimDelta, IndexWriter, NotebookKind, SCHEMA_VERSION};
 pub use model::{LedgerSnapshot, ModelStore};
+pub use reconcile::{VerifyReport, reconcile, verify_present};
