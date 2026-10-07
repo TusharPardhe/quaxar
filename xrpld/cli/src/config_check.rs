@@ -232,7 +232,14 @@ fn validate_node_size(config: &BasicConfig, report: &mut ConfigValidationReport)
 fn validate_node_db_and_history(config: &BasicConfig, report: &mut ConfigValidationReport) {
     let node_db = config.section("node_db");
     let db_type = optional_string(node_db, "type").unwrap_or_else(|| "NuDB".to_owned());
-    if !matches!(db_type.to_ascii_lowercase().as_str(), "nudb" | "rocksdb" | "fjall") {
+    let db_type_lower = db_type.to_ascii_lowercase();
+    if db_type_lower == "rocksdb" {
+        report.errors.push(
+            "[node_db] type = RocksDB is no longer supported; use type = fjall (or NuDB). \
+             Migrate by exporting a snapshot and loading it into the new store."
+                .to_owned(),
+        );
+    } else if !matches!(db_type_lower.as_str(), "nudb" | "fjall") {
         report
             .errors
             .push(format!("[node_db] type is invalid: {db_type}"));
