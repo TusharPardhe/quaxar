@@ -1088,15 +1088,24 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 offer_quality,
                 quality_threshold,
             ) {
-                // Do not remove through this value-flow sandbox. The caller
-                // applies the recorded key with offer_helpers::offer_delete
-                // even when this strand later proves dry.
+                // rippled records the key with `offers.permRmOffer` (applied
+                // even when the strand later proves dry) AND, because the
+                // callback returns true, `offers.step()` -> `BookTip::step`
+                // erases the tip from the working sandbox (BookTip.cpp:21-27,
+                // BookStep.cpp:446-455). The sandbox erase matters: when this
+                // strand's result is applied, later liquidity passes must not
+                // see the self offer at the book tip. Otherwise tryAMM is
+                // compared against the stale self quality instead of the real
+                // next tip, and a later self offer that rippled never reaches
+                // gets removed (testnet fork 21351203). `apply_to` skips keys
+                // already erased by the applied flow.
                 if let Some(cancellations) = &self_cross_cancellation {
                     cancellations.record(*offer_sle.key());
                 }
                 if !offer_attempted {
                     first_quality = None;
                 }
+                remove_offer_or_return!(&offer_sle);
                 offers_consumed += 1;
                 continue;
             }

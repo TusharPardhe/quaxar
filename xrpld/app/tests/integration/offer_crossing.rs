@@ -4206,3 +4206,98 @@ fn testnet_21347909_sell_ioc_amm_clob_cross_matches_rippled() {
     assert_eq!(amm_dust.iou().to_string(), "6241161.669022644");
     assert_eq!(taker_dust.iou().to_string(), "142633.289366646");
 }
+
+/// Public testnet ledger 21351203 tx C7B2C166 reconstruction: the RLUSD issuer
+/// buys its own RLUSD (tfIOC) through a book holding its own offers, a third
+/// party offer, more self offers, a worse third party offer, and an XRP/RLUSD
+/// AMM whose spot price is better than every CLOB tier. rippled removes the
+/// leading self offers (limitSelfCrossQuality, ofrQ reset), crosses the first
+/// third party tier, and the next pass's tryAMM fills the remainder from the
+/// AMM, which sets ofrQ/offerAttempted so the later self offer and the worse
+/// third party offer stay untouched.
+#[test]
+fn testnet_21351203_issuer_self_buy_uses_amm_before_later_tiers() {
+    let pool_owner = acct(0x11);
+    let issuer = acct(0x44);
+    let maker_e = acct(0x31);
+    let maker_v = acct(0x32);
+    let rlusd = protocol::currency_from_string("RLU");
+
+    let mut entries = vec![
+        account_root(pool_owner, 30_000_000_000, 1, 0),
+        account_root(issuer, 483_028_620_611, 0, protocol::lsfDefaultRipple),
+        account_root(maker_e, 378_636_184, 1, 0),
+        account_root(maker_v, 10_000_000_000, 1, 0),
+        trust_line_frac(pool_owner, issuer, rlusd, 3_000_000_000_000_000, -11, 1_000_000),
+        trust_line_frac(maker_e, issuer, rlusd, 1_004_522_614_598_032, -12, 1_000_000),
+        trust_line_frac(maker_v, issuer, rlusd, 3_733_585_844_626_890, -13, 1_000_000),
+    ];
+    let _ = &mut entries;
+    let ledger = build_ledger_with_features(
+        entries,
+        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixAMMv1_3", "fixReducedOffersV2", "fixFillOrKill"],
+    );
+    let mut view = new_view(ledger);
+
+    let create = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), pool_owner);
+        tx.set_field_amount(sf("sfAmount"), xrp(20_138_264_857));
+        tx.set_field_amount(sf("sfAmount2"), iou_frac(issuer, rlusd, 2_904_939_745_341_036, -11));
+        tx.set_field_u16(sf("sfTradingFee"), 10);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(full_apply(&mut view, &create, TxType::AMM_CREATE), Ter::TES_SUCCESS);
+
+    // Issuer self offers ahead of the first third party tier (real E8689BFC, 54AB4EBA).
+    let s1 = offer_tx(issuer, xrp(2_389_583_117), iou_frac(issuer, rlusd, 3_446_885_362_838_270, -12), 1);
+    assert_eq!(full_apply(&mut view, &s1, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    let s2 = offer_tx(issuer, xrp(2_773_129_334), iou_frac(issuer, rlusd, 4_000_000_000_000_000, -12), 2);
+    assert_eq!(full_apply(&mut view, &s2, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    // First third party tier (real 22ECDE90 by rwEhJZY4).
+    let e = offer_tx(maker_e, xrp(33_421_796), iou_frac(issuer, rlusd, 4_814_610_000_000_000, -14), 1);
+    assert_eq!(full_apply(&mut view, &e, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    // Self offer between tiers (q 694190).
+    let s3 = offer_tx(issuer, xrp(694_190_000), iou_frac(issuer, rlusd, 1_000_000_000_000_000, -12), 3);
+    assert_eq!(full_apply(&mut view, &s3, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    // Worse third party tier (real 78AB00D6 by rwVK5bRh).
+    let v = offer_tx(maker_v, xrp(35_813_631), iou_frac(issuer, rlusd, 5_158_940_000_000_000, -14), 1);
+    assert_eq!(full_apply(&mut view, &v, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+
+    let amm_key = protocol::amm(protocol::xrp_issue().into(), Issue::new(rlusd, issuer).into());
+    let amm_account = view.read(amm_key).expect("read").expect("AMM").get_account_id(sf("sfAccount"));
+    let amm_xrp_before = view
+        .read(protocol::account_keylet(acct_id(amm_account))).expect("read").expect("root")
+        .get_field_amount(sf("sfBalance")).xrp().drops();
+
+    let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), issuer);
+        tx.set_field_amount(sf("sfTakerPays"), iou_frac(issuer, rlusd, 6_051_170_000_000_000, -14));
+        tx.set_field_amount(sf("sfTakerGets"), xrp(42_121_467));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfImmediateOrCancel);
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfSequence"), 4);
+    });
+    assert_eq!(full_apply(&mut view, &tx, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+
+    let amm_xrp_after = view
+        .read(protocol::account_keylet(acct_id(amm_account))).expect("read").expect("root")
+        .get_field_amount(sf("sfBalance")).xrp().drops();
+    let present = |acc: AccountID, seq: u32| {
+        view.read(protocol::offer_keylet(acct_id(acc), seq)).expect("read").is_some()
+    };
+    eprintln!(
+        "RESULT amm_in={} s1={} s2={} e={} s3={} v={} maker_e_xrp={}",
+        amm_xrp_after - amm_xrp_before,
+        present(issuer, 1), present(issuer, 2), present(maker_e, 1), present(issuer, 3), present(maker_v, 1),
+        xrp_balance(&view, maker_e)
+    );
+    assert!(!present(issuer, 1) && !present(issuer, 2), "leading self offers removed");
+    assert!(!present(maker_e, 1), "first third party tier fully crossed");
+    // Network: maker received 33421796 drops (fixture paid a 10-drop offer fee).
+    assert_eq!(xrp_balance(&view, maker_e), 378_636_184 - 10 + 33_421_796);
+    // Network: AMM rPZ4iweT balance 20138264857 -> 20146841720.
+    assert_eq!(amm_xrp_after - amm_xrp_before, 8_576_863, "AMM must fill the remainder");
+    assert!(present(maker_v, 1), "worse third party tier must stay untouched");
+    assert!(present(issuer, 3), "self offer behind the AMM-filled pass must stay untouched");
+}
