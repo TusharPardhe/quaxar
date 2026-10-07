@@ -704,6 +704,42 @@ mod tests {
         assert!(manager.find("none").is_some());
         assert!(manager.find("nudb").is_some());
         assert!(manager.find("rocksdb").is_some());
+        assert!(manager.find("fjall").is_some());
+    }
+
+    #[test]
+    fn manager_make_database_builds_a_working_fjall_single_store() {
+        // type=fjall must resolve to a Single DatabaseNodeImp whose exported
+        // backend is key-value capable, which is what the pruned store attaches
+        // its index to. This is the seam Stage 4 integration relies on.
+        let dir = std::env::temp_dir().join(format!(
+            "quaxar-mgr-fjall-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut config = section("fjall");
+        config.set("path", dir.to_string_lossy().into_owned());
+        let manager = ManagerImp::new();
+        let database = manager
+            .make_database(
+                0,
+                Arc::new(crate::DummyScheduler),
+                1,
+                &config,
+                Arc::new(NullJournal),
+            )
+            .expect("fjall make_database should succeed");
+        use crate::Database as _;
+        let backend = database
+            .export_backend()
+            .expect("fjall exports its backend");
+        assert!(
+            backend.supports_kv(),
+            "the fjall backend must be key-value capable for the pruned index"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
