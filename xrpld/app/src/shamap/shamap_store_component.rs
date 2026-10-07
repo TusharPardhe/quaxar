@@ -142,6 +142,12 @@ impl SHAMapStoreComponent {
         &self.inner.store
     }
 
+    /// Pruned-store metrics for RPC/CLI (`get_counts`, `server_info`), or
+    /// `None` when this store is not the fjall pruned path.
+    pub fn pruned_metrics(&self) -> Option<nodestore::PrunedMetrics> {
+        self.inner.pruned.as_ref().map(|driver| driver.metrics())
+    }
+
     pub fn snapshot(&self) -> SHAMapStore {
         self.store()
             .lock()
@@ -906,5 +912,57 @@ mod tests {
         component.stop();
         assert_eq!(shared.starts.load(Ordering::Relaxed), 1);
         assert_eq!(shared.stops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn pruned_metrics_reflect_attached_driver() {
+        use crate::shamap::pruned_driver::PrunedDriver;
+        use nodestore::{Factory, MemoryFactory, NodeObject, NullJournal, PrunedConfig};
+
+        let shared = Arc::new(SharedRuntimeState::default());
+        let runtime = Runtime::new(
+            Arc::clone(&shared),
+            Arc::new(AtomicUsize::new(0)),
+            (String::new(), String::new()),
+        );
+        let bare =
+            SHAMapStoreComponent::new(SHAMapStore::new(256, false, 1), Box::new(runtime), None);
+        assert!(
+            bare.pruned_metrics().is_none(),
+            "a store with no pruned driver reports no pruned metrics"
+        );
+
+        // Attach a driver over an in-memory key-value backend and confirm the
+        // component surfaces its metrics.
+        let mut section = basics::basic_config::Section::new("node_db");
+        section.set("type", "Memory");
+        section.set("path", "component-pruned-metrics");
+        let backend = MemoryFactory::new()
+            .create_instance(
+                NodeObject::KEY_BYTES,
+                &section,
+                0,
+                Arc::new(nodestore::DummyScheduler),
+                Arc::new(NullJournal),
+            )
+            .expect("memory backend");
+        let backend: Arc<dyn nodestore::Backend> = Arc::from(backend);
+        backend.open(true).expect("open backend");
+        let driver =
+            Arc::new(PrunedDriver::open(backend, PrunedConfig::default()).expect("driver opens"));
+
+        let runtime = Runtime::new(
+            Arc::clone(&shared),
+            Arc::new(AtomicUsize::new(0)),
+            (String::new(), String::new()),
+        );
+        let component =
+            SHAMapStoreComponent::new(SHAMapStore::new(256, false, 1), Box::new(runtime), None)
+                .with_pruned_driver(driver);
+        let metrics = component
+            .pruned_metrics()
+            .expect("attached driver reports metrics");
+        assert_eq!(metrics.claimed_seq, None, "nothing claimed yet");
+        assert_eq!(metrics.pruned_to, 0);
     }
 }
