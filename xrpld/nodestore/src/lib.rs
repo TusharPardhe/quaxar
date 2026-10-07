@@ -4,6 +4,7 @@ mod database_runtime;
 mod format;
 #[cfg(feature = "gpu-hash")]
 pub mod gpu_hasher;
+pub mod pruned;
 pub mod snapshot;
 
 pub use backends::backend;
@@ -60,6 +61,7 @@ pub use nudb_backend::{
     read_nudb_key_file_header, read_nudb_log_file_header, validate_nudb_block_size,
 };
 pub use null_backend::{NullBackend, NullFactory};
+pub use pruned::{LedgerSnapshot, ModelStore};
 pub use rocksdb::{RocksDbBackend, RocksDbConfigSnapshot, RocksDbFactory};
 pub use scheduler::{
     BatchWriteReport, DummyScheduler, FetchReport, FetchType, RealScheduler, Scheduler,
