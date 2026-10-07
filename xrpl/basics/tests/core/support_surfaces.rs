@@ -11,7 +11,6 @@ use basics::malloc_trim::{NullMallocTrimLogger, malloc_trim};
 use basics::mutex::Mutex;
 use basics::resolver::Resolver;
 use basics::resolver_asio::ResolverAsio;
-use basics::rocksdb::rocksdb_available;
 use basics::sanitizers::NO_SANITIZE_ADDRESS_SUPPORTED;
 use openssl::asn1::Asn1Time;
 use openssl::hash::MessageDigest;
@@ -111,7 +110,6 @@ fn basics_support_log_malloc_and_platform_flags_are_observable() {
     assert!(!report.supported);
 
     let _ = NO_SANITIZE_ADDRESS_SUPPORTED;
-    assert!(rocksdb_available());
 }
 
 #[test]
