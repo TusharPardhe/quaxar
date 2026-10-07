@@ -465,6 +465,27 @@ cargo test -p nodestore -p app --test all state:: integration::   # focused re-r
 Until Stage 7, builds keep `CC=clang CXX=clang++`. After Stage 7 the gate also
 runs with the system C compiler (no clang) to prove the dependency is gone.
 
+### Implementation status
+
+As built on branch `feat/fjall-pruned-nodestore`:
+
+- Stages 0-3 complete: KV v2 backend trait, MemoryBackend/FaultBackend/
+  conformance macro, fjall backend (passes conformance), ModelStore oracle,
+  and the engine-agnostic index core (`claim`/`prune`/`orphan_sweep`,
+  reconcile/verify) with a 300-trial randomized equivalence check against the
+  oracle, crash tests over FaultBackend, and a concurrency test.
+- Stage 2 wiring: `FjallFactory` registered; `type=fjall` accepted by config.
+  `type=fjall` resolves to a single store, so no new node-store enum variant
+  is needed and the existing call sites are untouched.
+- Stage 4 core integration complete: `compute_claim_delta` bridges a validated
+  ledger's SHAMaps to a `ClaimDelta`; `PrunedStore`/`PrunedDriver` drive
+  claim+prune; the SHAMap store component runs the driver from
+  `on_ledger_closed` when `type=fjall`; metrics are exposed. End-to-end tests
+  build real ledgers and verify pruning on the fjall backend.
+- Remaining: Stage 4 polish (FullBelowCache removal callback, serve-from-memory,
+  surfacing metrics in RPC, disk-full reserve), Stages 5-6 (soak, migration),
+  and Stage 7 (removal of NuDB/RocksDB/rotation and the clang build dependency).
+
 ### Stage 0: baseline and harness
 
 Deliverables:
