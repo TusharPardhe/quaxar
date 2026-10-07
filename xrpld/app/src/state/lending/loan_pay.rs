@@ -873,7 +873,7 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     if let Some(periodic_payment) = periodic_payment_override {
         lu.set_field_number(
             sf("sfPeriodicPayment"),
-            with_asset_number(periodic_payment, vault_asset),
+            asset_number_for_field(sf("sfPeriodicPayment"), periodic_payment, vault_asset),
         );
     }
     if lu.is_field_present(sf("sfPaymentRemaining")) {

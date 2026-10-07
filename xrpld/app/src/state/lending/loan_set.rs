@@ -904,7 +904,11 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             );
             loan.set_field_number(
                 sf("sfPeriodicPayment"),
-                with_asset_number(properties.periodic_payment, vault.asset),
+                asset_number_for_field(
+                    sf("sfPeriodicPayment"),
+                    properties.periodic_payment,
+                    vault.asset,
+                ),
             );
             loan.set_field_number(
                 sf("sfTotalValueOutstanding"),

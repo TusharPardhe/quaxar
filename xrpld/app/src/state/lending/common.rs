@@ -877,6 +877,23 @@ pub(super) fn with_asset_number(value: RuntimeNumber, asset: Asset) -> STNumber 
     number
 }
 
+/// Build the STNumber stored in `field`, mirroring rippled
+/// `associateAsset(SLE&, Asset)` (STTakesAsset.cpp): only NUMBER fields whose
+/// SField carries `kSmdNeedsAsset` are rounded to the asset's precision.
+/// Fields without the flag (for example `sfPeriodicPayment`, sfields.macro)
+/// keep their full Number value, so re-amortized fractional payments survive.
+pub(super) fn asset_number_for_field(
+    field: &protocol::SField,
+    value: RuntimeNumber,
+    asset: Asset,
+) -> STNumber {
+    if field.should_meta(protocol::SField::S_MD_NEEDS_ASSET) {
+        with_asset_number(value, asset)
+    } else {
+        STNumber::from(value)
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct BrokerCoverState {
     pub(super) key: Uint256,
