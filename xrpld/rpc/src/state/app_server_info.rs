@@ -2227,6 +2227,35 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
                 database.add_counts_json(json);
             }
         }
+
+        // Pruned (fjall) store progress, when that path is active.
+        if let Some(metrics) = app
+            .shamap_store_service()
+            .and_then(|service| service.component().pruned_metrics())
+        {
+            if let Some(claimed) = metrics.claimed_seq {
+                json.insert(
+                    "pruned_claimed_seq".to_owned(),
+                    JsonValue::Unsigned(u64::from(claimed)),
+                );
+            }
+            json.insert(
+                "pruned_to".to_owned(),
+                JsonValue::Unsigned(u64::from(metrics.pruned_to)),
+            );
+            json.insert(
+                "pruned_retained_floor".to_owned(),
+                JsonValue::Unsigned(u64::from(metrics.retained_floor)),
+            );
+            json.insert(
+                "pruned_unclaimed".to_owned(),
+                JsonValue::Unsigned(metrics.unclaimed as u64),
+            );
+            json.insert(
+                "pruned_verify_last_ok".to_owned(),
+                JsonValue::Bool(metrics.verify_last_ok),
+            );
+        }
     }
 }
 
