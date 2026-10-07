@@ -25,6 +25,17 @@ fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
 }
 
+/// An account whose ID is derived from a real secp256k1 master key, with that
+/// public key. rippled AccountSet requires the master-key signature
+/// (`sigWithMaster`) to set asfNoFreeze or asfDisableMaster (AccountSet.cpp),
+/// so those cases must carry the matching sfSigningPubKey.
+fn master_acct(seed: u8) -> (AccountID, Vec<u8>) {
+    let secret = protocol::SecretKey::from_bytes([seed.max(1); 32]);
+    let public = protocol::derive_public_key(protocol::KeyType::Secp256k1, &secret)
+        .expect("master public key");
+    (protocol::calc_account_id(public.as_bytes()), public.as_bytes().to_vec())
+}
+
 // ─── AccountSet Flags ───────────────────────────────────────────────────────
 
 #[test]
@@ -75,11 +86,12 @@ fn af_set_disable_master() {
 }
 #[test]
 fn af_set_no_freeze() {
-    let a = acct(0x11);
+    let (a, master_pk) = master_acct(0x11);
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ACCOUNT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
+        tx.set_field_vl(sf("sfSigningPubKey"), &master_pk);
         tx.set_field_u32(sf("sfSetFlag"), 6);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -1061,11 +1073,12 @@ fn af5_flag_3() {
 }
 #[test]
 fn af5_flag_4() {
-    let a = acct(0x11);
+    let (a, master_pk) = master_acct(0x11);
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ACCOUNT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
+        tx.set_field_vl(sf("sfSigningPubKey"), &master_pk);
         tx.set_field_u32(sf("sfSetFlag"), 4);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -1466,11 +1479,12 @@ fn af6_set_clear_flag_3() {
 }
 #[test]
 fn af6_set_clear_flag_4() {
-    let a = acct(0x11);
+    let (a, master_pk) = master_acct(0x11);
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ACCOUNT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
+        tx.set_field_vl(sf("sfSigningPubKey"), &master_pk);
         tx.set_field_u32(sf("sfSetFlag"), 4);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -1481,6 +1495,7 @@ fn af6_set_clear_flag_4() {
     );
     let tx2 = STTx::new(TxType::ACCOUNT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
+        tx.set_field_vl(sf("sfSigningPubKey"), &master_pk);
         tx.set_field_u32(sf("sfClearFlag"), 4);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 2);
@@ -1901,11 +1916,12 @@ fn af7_100_require_auth() {
 #[test]
 fn af7_100_no_freeze() {
     for i in 1u8..=100 {
-        let a = acct(i);
+        let (a, master_pk) = master_acct(i);
         let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
         let mut v = new_view(l);
         let tx = STTx::new(TxType::ACCOUNT_SET, |tx| {
             tx.set_account_id(sf("sfAccount"), a);
+            tx.set_field_vl(sf("sfSigningPubKey"), &master_pk);
             tx.set_field_u32(sf("sfSetFlag"), 6);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
@@ -2803,11 +2819,12 @@ fn af14_50_accounts_5_trust() {
 #[test]
 fn af15_100_no_freeze() {
     for i in 1u8..=100 {
-        let a = acct(i);
+        let (a, master_pk) = master_acct(i);
         let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
         let mut v = new_view(l);
         let tx = STTx::new(TxType::ACCOUNT_SET, |tx| {
             tx.set_account_id(sf("sfAccount"), a);
+            tx.set_field_vl(sf("sfSigningPubKey"), &master_pk);
             tx.set_field_u32(sf("sfSetFlag"), 6);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
@@ -3600,11 +3617,12 @@ fn af27_60_accounts_set_clear_disallow() {
 #[test]
 fn af28_130_accounts_set_nofreeze() {
     for i in 0x41u8..=0xBD {
-        let a = acct(i);
+        let (a, master_pk) = master_acct(i);
         let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
         let mut v = new_view(l);
         let tx = STTx::new(TxType::ACCOUNT_SET, |tx| {
             tx.set_account_id(sf("sfAccount"), a);
+            tx.set_field_vl(sf("sfSigningPubKey"), &master_pk);
             tx.set_field_u32(sf("sfSetFlag"), 6);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
@@ -3750,11 +3768,12 @@ fn af32_170_accounts_set_global_freeze() {
 #[test]
 fn af32_85_accounts_set_clear_nofreeze() {
     for i in 0x41u8..=0x95 {
-        let a = acct(i);
+        let (a, master_pk) = master_acct(i);
         let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
         let mut v = new_view(l);
         let tx1 = STTx::new(TxType::ACCOUNT_SET, |tx| {
             tx.set_account_id(sf("sfAccount"), a);
+            tx.set_field_vl(sf("sfSigningPubKey"), &master_pk);
             tx.set_field_u32(sf("sfSetFlag"), 6);
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
