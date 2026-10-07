@@ -62,8 +62,8 @@ pub use nudb_backend::{
 };
 pub use null_backend::{NullBackend, NullFactory};
 pub use pruned::{
-    ClaimDelta, IndexWriter, LedgerSnapshot, ModelStore, NotebookKind, VerifyReport, reconcile,
-    verify_present,
+    ClaimDelta, IndexWriter, LedgerSnapshot, ModelStore, NotebookKind, PruneMode, PrunedConfig,
+    PrunedMetrics, PrunedStore, VerifyReport, reconcile, verify_present,
 };
 pub use rocksdb::{RocksDbBackend, RocksDbConfigSnapshot, RocksDbFactory};
 pub use scheduler::{

@@ -10,7 +10,9 @@
 pub mod index;
 pub mod model;
 pub mod reconcile;
+pub mod store;
 
 pub use index::{ClaimDelta, IndexWriter, NotebookKind, SCHEMA_VERSION};
 pub use model::{LedgerSnapshot, ModelStore};
 pub use reconcile::{VerifyReport, reconcile, verify_present};
+pub use store::{PruneMode, PrunedConfig, PrunedMetrics, PrunedStore};
