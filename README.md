@@ -53,7 +53,7 @@ configuration may still change as parity work continues.
 | --- | --- |
 | Protocol | XRP Ledger serialization, field definitions, amendments, transaction models, and SHAMap support. |
 | Ledger sync | Parallel coalesced per-hash acquisition, one shared NodeFamily cache family, reusable verified SHAMap nodes, NuDB persistence, snapshot export/import, and bounded execution resources. |
-| Storage | NuDB node store with bulk import mode, streaming export, and RocksDB configuration surfaces where implemented. |
+| Storage | NuDB node store with bulk import mode and streaming export, and a fjall pruned store that keeps a sliding window of validated ledgers. |
 | RPC | HTTP and WebSocket JSON RPC with public and admin command handling. |
 | Transactions | Core payment, account, trust line, NFT, AMM, MPT, vault, lending, queue, and invariant paths under active parity coverage. |
 | Operations | Interactive CLI, health checks, sync status, peer inspection, database statistics, log controls, and validator key tools. |
@@ -97,13 +97,13 @@ Install Rust `1.90` or newer and the required native dependencies.
 Linux:
 
 ```bash
-sudo apt install build-essential pkg-config libssl-dev librocksdb-dev clang cmake git
+sudo apt install build-essential pkg-config libssl-dev cmake git
 ```
 
 macOS:
 
 ```bash
-brew install openssl rocksdb cmake
+brew install openssl cmake
 ```
 
 Build and install from source:
@@ -111,7 +111,7 @@ Build and install from source:
 ```bash
 git clone https://github.com/TusharPardhe/quaxar.git
 cd quaxar
-CC=clang CXX=clang++ cargo install --path xrpld/main --locked
+cargo install --path xrpld/main --locked
 ```
 
 Run with an explicit configuration file:
@@ -308,7 +308,7 @@ reference and [docs/RUNNING.md](docs/RUNNING.md) for operational guidance.
 | Testnet operation | A medium node with NuDB has been validated on public testnet. |
 | Full history | Set `[ledger_history]` to `full` and provision storage accordingly. Full history requires significantly more disk and time. |
 | NuDB | Recommended for node store operation and used by the validated testnet deployment. |
-| RocksDB | Available where the Rust storage path exposes the matching backend. Use only when the target deployment requires it. |
+| fjall | A pure-Rust pruned node store that keeps the last `online_delete` validated ledgers and prunes continuously, with no C/C++ build dependency. |
 | Public endpoints | Use `verify_endpoints` for stricter advertised peer endpoint validation. |
 | RPC parameters | Pass JSON params as a single quoted JSON object, for example `quaxar rpc account_info '{"account":"...","ledger_index":"validated"}'`. |
 | Prometheus | The metrics package records selected acquisition/mode instruments, but normal bootstrap does not start its HTTP exporter; packaged deployments have no `/metrics` endpoint. |
