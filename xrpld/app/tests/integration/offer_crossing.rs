@@ -4028,3 +4028,181 @@ fn crossing_advances_past_exhausted_best_tier_to_worse_tier() {
          owner-funds-exhausted (fork-21337951 continuation gap)"
     );
 }
+
+/// Reconstruction of testnet fork 21346478 (tx E4277415, tfIOC OfferCreate).
+/// The best offer (BC5DCC11) more than satisfies the requested output, so
+/// rippled's revImp callback runs limitStepOut and returns
+/// `offer.fullyConsumed()` == false: forEachOffer breaks WITHOUT calling
+/// `offers.step()`. The next offer in the book (32836A75, already expired) is
+/// therefore never visited and must stay in the ledger untouched. We used to
+/// keep iterating (our loop-top stop looked at the unlimited reverse input)
+/// and removed the expired offer as stream cleanup, adding three nodes the
+/// network never touched.
+#[test]
+fn output_limited_partial_cross_does_not_visit_next_expired_offer_fork21346478() {
+    let issuer = acct(0x7F);
+    let taker = acct(0x7E);
+    let maker_a = acct(0x71); // best quality, fully funded, partially consumed
+    let maker_exp = acct(0x72); // next quality, EXPIRED
+    let fee_cur = protocol::currency_from_string("FEE");
+
+    let mut entries = vec![
+        account_root(taker, 100_000_000_000, 1, 0),
+        account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
+        account_root(maker_a, 100_000_000_000, 1, 0),
+        account_root(maker_exp, 100_000_000_000, 1, 0),
+    ];
+    for m in [maker_a, maker_exp] {
+        entries.push(trust_line_frac(m, issuer, fee_cur, 0, 0, 1_000_000));
+    }
+    entries.push(trust_line_frac(taker, issuer, fee_cur, 5_000_000_000_000_000, -15, 1_000_000));
+    let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // maker_a: gives 2423.026893 XRP for 1 FEE (best quality).
+    let oa = offer_tx(maker_a, iou_frac(issuer, fee_cur, 1_000_000_000_000_000, -15), xrp(2_423_026_893), 1);
+    assert_eq!(full_apply(&mut view, &oa, TxType::OFFER_CREATE), Ter::TES_SUCCESS, "a rests");
+    // maker_exp: slightly worse quality, placed with future expiry then expired.
+    let oe = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), maker_exp);
+        tx.set_field_amount(sf("sfTakerPays"), iou_frac(issuer, fee_cur, 1_000_000_000_000_000, -15));
+        tx.set_field_amount(sf("sfTakerGets"), xrp(2_421_547_086));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_u32(sf("sfExpiration"), 999_999_999);
+    });
+    assert_eq!(full_apply(&mut view, &oe, TxType::OFFER_CREATE), Ter::TES_SUCCESS, "exp rests");
+    let exp_key = protocol::offer_keylet(acct_id(maker_exp), 1);
+    {
+        let sle = view.read(exp_key.clone()).expect("read").expect("exp offer exists");
+        let mut obj = sle.clone_as_object();
+        obj.set_field_u32(sf("sfExpiration"), 500); // <= parent close 1000 => expired
+        view.update(Arc::new(STLedgerEntry::from_stobject(obj, exp_key.key))).expect("update");
+    }
+
+    // Taker: tfIOC, wants 2326.105817 XRP, gives up to 1 FEE (real tx shape).
+    let ioc = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(2_326_105_817));
+        tx.set_field_amount(sf("sfTakerGets"), iou_frac(issuer, fee_cur, 1_000_000_000_000_000, -15));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfImmediateOrCancel);
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(full_apply(&mut view, &ioc, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+
+    // The best offer is partially consumed and stays with its residual.
+    let a = view
+        .read(protocol::offer_keylet(acct_id(maker_a), 1))
+        .expect("read a")
+        .expect("partially consumed best offer must remain");
+    assert_eq!(a.get_field_amount(sf("sfTakerGets")), xrp(2_423_026_893 - 2_326_105_817));
+    // The expired next offer was never reached, so rippled leaves it in place.
+    assert!(
+        view.read(exp_key).expect("read exp").is_some(),
+        "expired next offer must NOT be removed: rippled never steps past a partially consumed tip"
+    );
+    assert_eq!(get_owner_count(&view, maker_exp), 2, "fixture count 1 + the untouched offer");
+}
+
+/// Public testnet ledger 21347909 transaction-index 0 (5811F9DE) regression.
+///
+/// tfSell|tfIOC OfferCreate selling 12678.7179 DUST (issuer TransferRate
+/// 1007080716) for XRP into an XRP/DUST AMM (fee 223) plus CLOB offers.
+/// Network: the best CLOB offer A1A62FB0 is fully consumed and the AMM gives
+/// 43356776 drops. Exact parent-ledger 21347908 amounts.
+#[test]
+fn testnet_21347909_sell_ioc_amm_clob_cross_matches_rippled() {
+    let pool_owner = acct(0x11);
+    let taker = acct(0x22);
+    let issuer = acct(0x44);
+    let makers = [acct(0x31), acct(0x32), acct(0x33), acct(0x34)];
+    let dust = protocol::currency_from_string("DST");
+
+    let mut issuer_root = account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple);
+    issuer_root.set_field_u32(sf("sfTransferRate"), 1_007_080_716);
+
+    let mut entries = vec![
+        account_root(pool_owner, 30_000_000_000, 1, 0),
+        account_root(taker, 415_731_380, 25, 0),
+        issuer_root,
+        trust_line_frac(pool_owner, issuer, dust, 7_000_000_000_000_000, -9, 10_000_000),
+        trust_line_frac(taker, issuer, dust, 1_554_017_816_673_400, -10, 1_000_000),
+    ];
+    for m in makers {
+        entries.push(account_root(m, 10_000_000_000, 1, 0));
+        entries.push(trust_line_frac(m, issuer, dust, 0, 0, 1_000_000));
+    }
+    let ledger = build_ledger_with_features(
+        entries,
+        vec!["AMM", "fixAMMv1_1", "fixAMMv1_2", "fixAMMv1_3", "fixReducedOffersV2", "fixFillOrKill"],
+    );
+    let mut view = new_view(ledger);
+
+    // Parent book (best first): maker gives XRP, wants DUST.
+    let book: [(i64, i32, i64); 4] = [
+        (2_077_881_000_000_000, -12, 8_511_871),  // A1A62FB0
+        (5_515_157_000_000_000, -13, 2_231_411),  // F34793C5
+        (1_210_926_900_000_000, -12, 4_898_750),  // 0138ED6F
+        (2_308_949_000_000_000, -12, 9_331_566),  // 20DFCBEB
+    ];
+    for (m, (pm, pe, gets)) in makers.iter().zip(book) {
+        let o = offer_tx(*m, iou_frac(issuer, dust, pm, pe), xrp(gets), 1);
+        assert_eq!(full_apply(&mut view, &o, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    }
+
+    let create = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), pool_owner);
+        tx.set_field_amount(sf("sfAmount"), xrp(25_582_930_053));
+        tx.set_field_amount(sf("sfAmount2"), iou_frac(issuer, dust, 6_230_560_832_122_644, -9));
+        tx.set_field_u16(sf("sfTradingFee"), 223);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(full_apply(&mut view, &create, TxType::AMM_CREATE), Ter::TES_SUCCESS);
+
+    let amm_key = protocol::amm(protocol::xrp_issue().into(), Issue::new(dust, issuer).into());
+    let amm_account = view.read(amm_key).expect("read").expect("AMM").get_account_id(sf("sfAccount"));
+
+    let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(49_859_846));
+        tx.set_field_amount(sf("sfTakerGets"), iou_frac(issuer, dust, 1_267_871_790_000_000, -11));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfSell | protocol::tfImmediateOrCancel);
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(full_apply(&mut view, &tx, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+
+    let amm_xrp = view
+        .read(protocol::account_keylet(acct_id(amm_account)))
+        .expect("read").expect("AMM root")
+        .get_field_amount(sf("sfBalance")).xrp().drops();
+    let mut amm_dust = view
+        .read(protocol::line(amm_account, issuer, dust))
+        .expect("read").expect("AMM line")
+        .get_field_amount(sf("sfBalance"));
+    if amm_account > issuer {
+        amm_dust.negate();
+    }
+    let mut taker_dust = view
+        .read(protocol::line(taker, issuer, dust))
+        .expect("read").expect("taker line")
+        .get_field_amount(sf("sfBalance"));
+    if taker > issuer {
+        taker_dust.negate();
+    }
+    eprintln!(
+        "RESULT amm_xrp={} amm_dust={} taker_xrp={} taker_dust={} makerA_offer={:?}",
+        amm_xrp,
+        amm_dust.iou(),
+        xrp_balance(&view, taker),
+        taker_dust.iou(),
+        view.read(protocol::offer_keylet(acct_id(makers[0]), 1)).expect("read").is_some()
+    );
+    assert!(view.read(protocol::offer_keylet(acct_id(makers[0]), 1)).expect("read").is_none());
+    assert_eq!(xrp_balance(&view, taker), 467_600_015);
+    assert_eq!(amm_xrp, 25_539_573_277, "AMM must give 43356776 drops");
+    assert_eq!(amm_dust.iou().to_string(), "6241161.669022644");
+    assert_eq!(taker_dust.iou().to_string(), "142633.289366646");
+}
