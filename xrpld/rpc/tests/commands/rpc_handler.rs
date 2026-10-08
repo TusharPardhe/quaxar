@@ -194,14 +194,24 @@ fn rpc_handler_registry_exposes_role_and_condition() {
 
 #[test]
 fn rpc_handler_registry_table_plus_expected_aliases() {
+    // rippled #8006 moved method names into `MethodNames.h` constants
+    // (`.name = method::kAccountInfo`); older trees used string literals
+    // (`.name = "account_info"`). Accept both.
+    let method_names = load_cpp_method_names();
     let cpp = load_cpp_handler_table()
         .lines()
         .filter_map(|line| {
-            let marker = ".name = \"";
-            let start = line.find(marker)? + marker.len();
+            if let Some(start) = line.find(".name = \"") {
+                let rest = &line[start + ".name = \"".len()..];
+                let end = rest.find('"')?;
+                return Some(rest[..end].to_owned());
+            }
+            let start = line.find(".name = method::")? + ".name = method::".len();
             let rest = &line[start..];
-            let end = rest.find('"')?;
-            Some(rest[..end].to_owned())
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            method_names.get(&rest[..end]).cloned()
         })
         .collect::<BTreeSet<_>>();
 
@@ -229,6 +239,26 @@ fn rpc_handler_registry_table_plus_expected_aliases() {
 
 fn load_cpp_handler_table() -> String {
     fs::read_to_string(handler_table_path()).expect("Handler.cpp should be readable")
+}
+
+/// Maps `kAccountInfo` -> `account_info` from rippled `rpc/MethodNames.h`
+/// (absent in trees older than rippled #8006, which is fine).
+fn load_cpp_method_names() -> std::collections::BTreeMap<String, String> {
+    let path = handler_table_path()
+        .parent()
+        .and_then(Path::parent)
+        .map(|rpc| rpc.join("MethodNames.h"));
+    let Some(text) = path.and_then(|path| fs::read_to_string(path).ok()) else {
+        return std::collections::BTreeMap::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("inline constexpr std::string_view ")?;
+            let (ident, rest) = rest.split_once('{')?;
+            let value = rest.strip_prefix('"')?.split('"').next()?;
+            Some((ident.trim().to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 fn handler_table_path() -> PathBuf {
