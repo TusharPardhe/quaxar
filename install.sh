@@ -508,16 +508,7 @@ if [ -f .cargo/config.toml ] && ! command -v lld &>/dev/null; then
     info "Removed .cargo/config.toml (lld not installed)"
 fi
 
-# Set ROCKSDB_LIB_DIR if system lib available
-if [ "$PKG_MGR" = "apt" ] && dpkg -s librocksdb-dev &>/dev/null 2>&1; then
-    export ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu
-fi
-
 info "Building quaxar (this may take a few minutes)..."
-if command -v clang &>/dev/null && command -v clang++ &>/dev/null; then
-    export CC=clang CXX=clang++
-    info "Using clang and clang++ for native dependencies"
-fi
 if [ "$RAM_GB" -le 16 ]; then
     CARGO_BUILD_JOBS=2 cargo install --path xrpld/main --locked --force 2>&1 | tail -1
 else
@@ -585,11 +576,11 @@ if [ "$GENERATE_CONF" = true ]; then
     WS_ADMIN="127.0.0.1"
     WS_SECURE_GATEWAY=""
     WS_SEND_QUEUE_LIMIT="500"
-    DB_TYPE="NuDB"
+    DB_TYPE="fjall"
     DATA_DIR="$HOME/.local/share/quaxar"
-    DB_PATH="$DATA_DIR/db/nudb"
+    DB_PATH="$DATA_DIR/db/fjall"
     SQLITE_PATH="$DATA_DIR/db"
-    NUDB_BLOCK_SIZE="4096"
+    RESERVE_MB="1024"
     ONLINE_DELETE="512"
     ADVISORY_DELETE="0"
     NODE_SIZE="medium"
@@ -619,7 +610,7 @@ if [ "$GENERATE_CONF" = true ]; then
         echo ""
         ask_choice "Network" "$NETWORK" NETWORK "mainnet testnet devnet"
         ask "Data directory" "$DATA_DIR" DATA_DIR
-        DB_PATH="$DATA_DIR/db/nudb"
+        DB_PATH="$DATA_DIR/db/fjall"
         SQLITE_PATH="$DATA_DIR/db"
         ask_choice "Node size" "$NODE_SIZE" NODE_SIZE "tiny small medium large huge"
         ask_ledger_history "Ledger history" "$LEDGER_HISTORY" LEDGER_HISTORY
@@ -647,17 +638,13 @@ if [ "$GENERATE_CONF" = true ]; then
 
         echo ""
         echo -e "  ${BOLD}── Database ──${RESET}"
-        ask_choice "Database type" "$DB_TYPE" DB_TYPE "nudb fjall"
-        case "$DB_TYPE" in
-            nudb) DB_TYPE="NuDB" ;;
-            fjall) DB_TYPE="fjall" ;;
-        esac
+        # fjall is the only supported node store; NuDB and RocksDB were removed.
+        DB_TYPE="fjall"
         ask "Data directory" "$DATA_DIR" DATA_DIR
-        DB_PATH="$DATA_DIR/db/nudb"
+        DB_PATH="$DATA_DIR/db/fjall"
         SQLITE_PATH="$DATA_DIR/db"
         ask "Node DB path" "$DB_PATH" DB_PATH
         ask "Relational database path" "$SQLITE_PATH" SQLITE_PATH
-        ask_choice "NuDB block size" "$NUDB_BLOCK_SIZE" NUDB_BLOCK_SIZE "4096 8192 16384 32768"
         ask_int_range "Online delete (ledgers, 0 disables)" "$ONLINE_DELETE" ONLINE_DELETE 0 100000000
         ask_bool_value "Advisory delete" "$ADVISORY_DELETE" ADVISORY_DELETE
 
@@ -787,9 +774,9 @@ $NODE_SIZE
 [node_db]
 type = $DB_TYPE
 path = $DB_PATH
-nudb_block_size = $NUDB_BLOCK_SIZE
 online_delete = $ONLINE_DELETE
 advisory_delete = $ADVISORY_DELETE
+reserve_mb = $RESERVE_MB
 
 [database_path]
 $SQLITE_PATH

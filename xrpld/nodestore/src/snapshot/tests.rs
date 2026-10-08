@@ -549,6 +549,138 @@ fn round_trip_export_load() {
     assert_eq!(obj.data().as_slice(), &[8, 9]);
 }
 
+// Stage 6 migration end-to-end: export a snapshot from an old store, load it
+// into a fresh store, then adopt it as the pruned anchor and keep claiming.
+// This is the operator migration path (design Case 7 / Stage 6): old binary
+// export-snapshot, new binary load-snapshot, node starts, claims, prunes.
+#[test]
+fn migration_snapshot_load_then_adopt_and_claim() {
+    use crate::backends::kv::{Keyspace, KvBatch};
+    use crate::{ClaimDelta, Factory, FjallFactory, PrunedConfig, PrunedStore};
+    use std::collections::BTreeSet;
+
+    // fjall is the migration target: its legacy store() and the KV `nodes`
+    // keyspace share one partition, so snapshot-imported nodes are visible to
+    // the pruned store's reconcile/fetch.
+    let make_fjall = |tag: &str| -> (Arc<dyn Backend>, String) {
+        let mut dir = std::env::temp_dir();
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = dir.as_path().join(format!("quaxar-migrate-{tag}-{t}"));
+        dir.push(format!("quaxar-migrate-{tag}-{t}"));
+        let mut section = Section::new("node_db");
+        section.set("type", "fjall");
+        section.set("path", path.to_string_lossy().into_owned());
+        let backend = FjallFactory::new()
+            .create_instance(
+                NodeObject::KEY_BYTES,
+                &section,
+                0,
+                Arc::new(DummyScheduler),
+                Arc::new(NullJournal),
+            )
+            .expect("fjall backend");
+        let backend: Arc<dyn Backend> = Arc::from(backend);
+        backend.open(true).expect("open");
+        (backend, path.to_string_lossy().into_owned())
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let snap_path = dir.path().join("migrate.xrpls");
+
+    // The old node holds a one-leaf account tree and a one-leaf tx tree.
+    let (src, src_path) = make_fjall("src");
+    let (account_node, account_hash) = shamap_leaf(
+        NodeObjectType::AccountNode,
+        SHAMapNodeType::AccountState,
+        0x91,
+    );
+    let (tx_node, tx_hash) = shamap_leaf(
+        NodeObjectType::TransactionNode,
+        SHAMapNodeType::TransactionMd,
+        0x92,
+    );
+    src.store(account_node).expect("store account leaf");
+    src.store(tx_node).expect("store tx leaf");
+
+    let mut manifest = test_manifest();
+    manifest.ledger_seq = 7000;
+    manifest.account_hash = account_hash;
+    manifest.tx_hash = tx_hash;
+    refresh_manifest_ledger_hash(&mut manifest);
+    export_snapshot(src.as_ref(), &manifest, &snap_path).expect("export");
+
+    // Fresh store the new binary opens. Pre-seed a leftover node a prior
+    // partial sync could have left behind; migration must reclaim it.
+    let (dst, dst_path) = make_fjall("dst");
+    let leftover = Uint256::from_array([0xEE; 32]);
+    {
+        let mut batch = KvBatch::new();
+        batch.put(Keyspace::Nodes, leftover.as_slice().to_vec(), vec![0xEE; 8]);
+        dst.kv_write_batch(&batch).expect("seed leftover");
+    }
+
+    // load-snapshot imports and verifies both roots, returning the retained set.
+    let outcome = load_snapshot(dst.as_ref(), &snap_path).expect("load");
+    assert_eq!(outcome.manifest.ledger_seq, 7000);
+    assert!(
+        outcome
+            .required_nodes
+            .contains(&Uint256::from_array(account_hash))
+    );
+
+    // The node starts: open the pruned store and adopt the snapshot as anchor.
+    let store = PrunedStore::open(Arc::clone(&dst), PrunedConfig::default()).expect("open pruned");
+    let required: BTreeSet<Uint256> = outcome.required_nodes.iter().copied().collect();
+    let swept = store
+        .adopt_snapshot(
+            &required,
+            outcome.manifest.ledger_seq,
+            Uint256::from_array(account_hash),
+        )
+        .expect("adopt");
+
+    // The leftover is reclaimed; the snapshot's nodes remain; anchor is set.
+    assert_eq!(swept, 1, "the pre-sync leftover is reconciled away");
+    assert_eq!(
+        store.fetch(&Uint256::from_array(account_hash)).1,
+        Status::Ok
+    );
+    assert_eq!(store.fetch(&leftover).1, Status::NotFound);
+    assert_eq!(store.metrics().claimed_seq, Some(7000));
+
+    // The node keeps claiming: ledger 7001 adds a node and retires the
+    // snapshot's account leaf.
+    let next_leaf = Uint256::from_array([0x93; 32]);
+    {
+        let mut batch = KvBatch::new();
+        batch.put(
+            Keyspace::Nodes,
+            next_leaf.as_slice().to_vec(),
+            vec![0x93; 8],
+        );
+        dst.kv_write_batch(&batch).expect("store next node");
+    }
+    store
+        .claim(&ClaimDelta {
+            seq: 7001,
+            state_root: next_leaf,
+            new_state: vec![next_leaf],
+            dead_state: vec![Uint256::from_array(account_hash)],
+            owned: vec![],
+        })
+        .expect("claim 7001");
+    assert_eq!(store.metrics().claimed_seq, Some(7001));
+
+    drop(store);
+    drop(src);
+    drop(dst);
+    let _ = std::fs::remove_dir_all(&src_path);
+    let _ = std::fs::remove_dir_all(&dst_path);
+}
+
 #[test]
 fn corrupt_chunk_hash_detected() {
     let dir = tempfile::tempdir().unwrap();
