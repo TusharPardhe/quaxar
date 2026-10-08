@@ -1,4 +1,4 @@
-use crate::database_runtime::node_object_cache::{NodeObjectCache, NodeObjectCacheMode};
+use crate::database_runtime::node_object_cache::NodeObjectCache;
 use crate::{
     Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType, NodeStoreJournal,
     Scheduler, Task, batch_write_preallocation_size,
@@ -465,27 +465,6 @@ impl DatabaseRuntime {
         config: &Section,
         journal: Arc<dyn NodeStoreJournal>,
     ) -> Result<Self, String> {
-        Self::new_with_node_object_cache_mode(
-            delegate,
-            scheduler,
-            read_threads,
-            config,
-            journal,
-            NodeObjectCacheMode::Enabled,
-        )
-    }
-
-    /// Constructs a runtime with an explicit NodeObject cache ownership mode.
-    /// Public callers retain the enabled-cache behavior through [`Self::new`];
-    /// rotating storage uses disabled mode so archive reads cannot be retained.
-    pub(crate) fn new_with_node_object_cache_mode(
-        delegate: Arc<dyn DatabaseDelegate>,
-        scheduler: Arc<dyn Scheduler>,
-        read_threads: usize,
-        config: &Section,
-        journal: Arc<dyn NodeStoreJournal>,
-        cache_mode: NodeObjectCacheMode,
-    ) -> Result<Self, String> {
         assert!(
             read_threads != 0,
             "xrpl::NodeStore::Database::new : nonzero threads input"
@@ -501,7 +480,7 @@ impl DatabaseRuntime {
             return Err("Invalid rq_bundle".to_owned());
         }
 
-        let node_object_cache = NodeObjectCache::new(cache_mode, config)?;
+        let node_object_cache = NodeObjectCache::from_config(config)?;
         let default_read_queue_budget =
             default_read_queue_budget(read_threads, request_bundle as usize)?;
         // Explicit operator settings may narrow or expand this shared logical
@@ -1001,31 +980,6 @@ impl DatabaseRuntime {
 
     pub(crate) fn promote_node_object(&self, object: Arc<NodeObject>) {
         self.inner.node_object_cache.promote(object);
-    }
-
-    pub(crate) fn invalidate_node_object_cache(&self) {
-        self.inner.node_object_cache.invalidate_all();
-    }
-
-    /// Advance before a rotation changes which durable backend pairing owns a
-    /// read. The returned value is never zero and is safe to retain in a
-    /// `ReadKey` or persistence acknowledgement identity.
-    pub(crate) fn advance_store_generation(&self) -> u64 {
-        let mut observed = self.inner.store_generation.load(Ordering::Acquire);
-        loop {
-            let next = observed
-                .checked_add(1)
-                .expect("NodeStore storage generation overflow");
-            match self.inner.store_generation.compare_exchange_weak(
-                observed,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return next,
-                Err(current) => observed = current,
-            }
-        }
     }
 
     pub fn store_generation(&self) -> u64 {

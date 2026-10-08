@@ -186,7 +186,6 @@ mod tests {
     use protocol::JsonValue;
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     struct TestBackend(&'static str);
 
