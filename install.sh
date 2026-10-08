@@ -581,6 +581,7 @@ if [ "$GENERATE_CONF" = true ]; then
     DB_PATH="$DATA_DIR/db/fjall"
     SQLITE_PATH="$DATA_DIR/db"
     RESERVE_MB="1024"
+    COMPACTION_BASE_MB=""
     ONLINE_DELETE="512"
     ADVISORY_DELETE="0"
     NODE_SIZE="medium"
@@ -694,16 +695,19 @@ if [ "$GENERATE_CONF" = true ]; then
             VL_SITE="https://vl.ripple.com"
             VL_KEY="ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734"
             PEERS="s1.ripple.com 51235,s2.ripple.com 51235"
+            COMPACTION_BASE_MB="${COMPACTION_BASE_MB:-256}"
             ;;
         testnet)
             VL_SITE="https://vl.altnet.rippletest.net"
             VL_KEY="ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860"
             PEERS="s.altnet.rippletest.net 51235"
+            COMPACTION_BASE_MB="${COMPACTION_BASE_MB:-64}"
             ;;
         devnet)
             VL_SITE="https://vl.devnet.rippletest.net"
             VL_KEY="EDDF2F53DFEC79C1EAAB2C1E8B1F2B4C85B0C264B37C2B8B8E4E3E6F0D5A7C8B9"
             PEERS="s.devnet.rippletest.net 51235"
+            COMPACTION_BASE_MB="${COMPACTION_BASE_MB:-64}"
             ;;
         *)
             fail "Unsupported network: $NETWORK"
@@ -777,6 +781,7 @@ path = $DB_PATH
 online_delete = $ONLINE_DELETE
 advisory_delete = $ADVISORY_DELETE
 reserve_mb = $RESERVE_MB
+compaction_base_mb = $COMPACTION_BASE_MB
 
 [database_path]
 $SQLITE_PATH

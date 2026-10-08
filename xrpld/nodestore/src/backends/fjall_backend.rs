@@ -55,6 +55,49 @@ fn read_reserve_bytes(section: &Section) -> u64 {
         .saturating_mul(1024 * 1024)
 }
 
+/// Default size of the first leveled-compaction level of the `nodes`
+/// keyspace, in MB (fjall's own default: 64 MiB tables x 4). Level targets grow
+/// x10 from here, and peak space amplification is about
+/// `1 + penultimate_level / live_data`, so the base should put the live node
+/// set just under a level target: 256 suits ~15-25 GB stores (mainnet), 64
+/// suits ~4-6 GB stores (testnet).
+const DEFAULT_COMPACTION_BASE_MB: u64 = 256;
+const COMPACTION_BASE_MB_RANGE: std::ops::RangeInclusive<u64> = 16..=4096;
+/// L0 tables merged at once; the base level is `L0_THRESHOLD` target tables.
+const L0_THRESHOLD: u8 = 4;
+
+/// Resolve `compaction_base_mb` into the per-table target size in bytes.
+/// Rejects values outside the supported range instead of silently clamping.
+fn read_table_target_bytes(section: &Section) -> Result<u64, String> {
+    let base_mb = section
+        .get::<u64>("compaction_base_mb")
+        .map_err(|error| format!("invalid compaction_base_mb: {error}"))?
+        .unwrap_or(DEFAULT_COMPACTION_BASE_MB);
+    if !COMPACTION_BASE_MB_RANGE.contains(&base_mb) {
+        return Err(format!(
+            "compaction_base_mb must be between {} and {}, got {base_mb}",
+            COMPACTION_BASE_MB_RANGE.start(),
+            COMPACTION_BASE_MB_RANGE.end()
+        ));
+    }
+    Ok(base_mb * 1024 * 1024 / u64::from(L0_THRESHOLD))
+}
+
+/// Create options for a keyspace. Only `nodes` is large enough for level
+/// sizing to matter; the index keyspaces keep fjall defaults. fjall persists
+/// these at creation, so a changed value applies only to a new store.
+fn keyspace_options(keyspace: Keyspace, table_target_bytes: u64) -> KeyspaceCreateOptions {
+    let options = KeyspaceCreateOptions::default();
+    match keyspace {
+        Keyspace::Nodes => options.compaction_strategy(Arc::new(
+            fjall::compaction::Leveled::default()
+                .with_l0_threshold(L0_THRESHOLD)
+                .with_table_target_size(table_target_bytes),
+        )),
+        _ => options,
+    }
+}
+
 /// The open fjall database and its four keyspace handles, resolved once at
 /// open so every operation is a direct handle call.
 struct OpenDb {
@@ -85,6 +128,8 @@ pub struct FjallBackend {
     /// enough room for LSM compaction and tombstone-driven deletes to proceed.
     /// Zero disables the ballast.
     reserve_bytes: u64,
+    /// Target table size for the `nodes` keyspace (`compaction_base_mb / 4`).
+    table_target_bytes: u64,
     journal: Arc<dyn NodeStoreJournal>,
     db: Mutex<Option<Arc<OpenDb>>>,
     // When set (via set_delete_path, used by rotation to retire an archive),
@@ -110,6 +155,7 @@ impl FjallBackend {
             path,
             cache_bytes: read_cache_bytes(key_values),
             reserve_bytes: read_reserve_bytes(key_values),
+            table_target_bytes: read_table_target_bytes(key_values)?,
             journal,
             db: Mutex::new(None),
             delete_on_close: std::sync::atomic::AtomicBool::new(false),
@@ -237,12 +283,13 @@ impl Backend for FjallBackend {
             .cache_size(self.cache_bytes)
             .open()
             .map_err(|error| Self::fjall_err("open", error))?;
-        // Each keyspace is its own LSM-tree. Defaults keep bloom filters and
-        // LZ4 on; the index layer tunes per-keyspace policy later if needed.
+        // Each keyspace is its own LSM-tree with bloom filters and LZ4 on.
         let mut handles = Vec::with_capacity(Keyspace::ALL.len());
         for keyspace in Keyspace::ALL {
             let handle = db
-                .keyspace(keyspace.name(), KeyspaceCreateOptions::default)
+                .keyspace(keyspace.name(), || {
+                    keyspace_options(keyspace, self.table_target_bytes)
+                })
                 .map_err(|error| Self::fjall_err("keyspace", error))?;
             handles.push(handle);
         }
@@ -530,7 +577,7 @@ impl Factory for FjallFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::{FjallBackend, FjallFactory};
+    use super::{FjallBackend, FjallFactory, read_table_target_bytes};
     use crate::{Backend, Factory, NodeObject, NodeObjectType, NullJournal};
     use basics::{base_uint::Uint256, basic_config::Section};
     use std::sync::{
@@ -576,6 +623,96 @@ mod tests {
             Ok(_) => panic!("backend should require a path"),
             Err(error) => assert_eq!(error, "Missing path in fjall backend"),
         }
+    }
+
+    #[test]
+    fn compaction_base_mb_defaults_and_rejects_out_of_range() {
+        let path = temp_path("base-parse");
+        assert_eq!(
+            read_table_target_bytes(&section(&path)).expect("default"),
+            64 * 1024 * 1024
+        );
+        let mut cfg = section(&path);
+        cfg.set("compaction_base_mb", "64");
+        assert_eq!(
+            read_table_target_bytes(&cfg).expect("64"),
+            16 * 1024 * 1024
+        );
+        for bad in ["8", "8192", "abc"] {
+            let mut cfg = section(&path);
+            cfg.set("compaction_base_mb", bad);
+            assert!(
+                FjallBackend::new(&cfg, Arc::new(NullJournal)).is_err(),
+                "compaction_base_mb = {bad} must be rejected"
+            );
+        }
+    }
+
+    /// Flush eight ~3 MB L0 tables of random values into `nodes`, wait for the
+    /// leveled strategy to merge L0 below its threshold, and return the number
+    /// of tables outside L0.
+    /// (`major_compact` is not used: fjall pins its output size at 64 MB.)
+    fn leveled_nodes_table_count(backend: &FjallBackend, seed: u64) -> usize {
+        let open = backend.open_db().expect("open");
+        // splitmix64 gives well-spread, incompressible keys and values.
+        let mut state = seed;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for _ in 0..8 {
+            for _ in 0..6_000 {
+                let bytes: Vec<u8> = (0..(32 + 512) / 8)
+                    .flat_map(|_| next().to_le_bytes())
+                    .collect();
+                open.nodes.insert(&bytes[..32], &bytes[32..]).expect("insert");
+            }
+            open.nodes.rotate_memtable_and_wait().expect("flush");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while open.nodes.l0_table_count() >= 4 {
+            assert!(std::time::Instant::now() < deadline, "L0 never compacted");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        open.nodes.table_count() - open.nodes.l0_table_count()
+    }
+
+    #[test]
+    fn compaction_base_mb_sizes_node_tables_and_persists_across_reopen() {
+        // Default base (64 MiB tables): the merged L0 fits in one table.
+        let default_path = temp_path("base-default");
+        let mut cfg = section(&default_path);
+        cfg.set("reserve_mb", "0");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("open");
+        let default_tables = leveled_nodes_table_count(&backend, 1);
+        assert!(default_tables <= 2, "expected one merged table, got {default_tables}");
+        let _ = backend.close();
+        let _ = std::fs::remove_dir_all(&default_path);
+
+        // Minimum base (4 MiB tables): the same volume splits into several.
+        let small_path = temp_path("base-small");
+        let mut cfg = section(&small_path);
+        cfg.set("reserve_mb", "0");
+        cfg.set("compaction_base_mb", "16");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("open");
+        let small_tables = leveled_nodes_table_count(&backend, 1);
+        assert!(small_tables >= 3, "expected split tables, got {small_tables}");
+        let _ = backend.close();
+
+        // Reopening without the key keeps the size the store was created with.
+        let mut cfg = section(&small_path);
+        cfg.set("reserve_mb", "0");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("reopen");
+        let tables = leveled_nodes_table_count(&backend, 2);
+        assert!(tables > small_tables, "persisted table size must win, got {tables}");
+        let _ = backend.close();
+        let _ = std::fs::remove_dir_all(&small_path);
     }
 
     #[test]

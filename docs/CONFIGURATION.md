@@ -125,6 +125,7 @@ Configures persistent ledger object storage.
 | `advisory_delete` | When enabled, pruning pauses at the advisory `can_delete` boundary. |
 | `cache_mb` | Block-cache budget for the fjall store, in MB. Defaults from `node_size`. |
 | `reserve_mb` | Disk-full ballast reserved at open, in MB; default `1024`, `0` disables. Released under disk pressure so compaction and deletes have room. |
+| `compaction_base_mb` | Size of the first leveled-compaction level of the node keyspace, in MB (`16`–`4096`, default `256`). Levels grow ×10 from it. Pick it so the live node set sits just under a level target: `256` for mainnet-sized stores, `64` for testnet/devnet. Fixed when the store is created; changing it needs a fresh store. |
 | `prune_mode` | `on` (default) deletes dead nodes as the window advances; `dry_run` logs what it would delete without deleting. |
 | `prune_batch` | Notebook rows processed per prune batch; default `10000`. |
 | `delete_batch` | Relational cleanup batch size; default `100`. |

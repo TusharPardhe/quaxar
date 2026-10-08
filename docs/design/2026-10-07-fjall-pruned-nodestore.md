@@ -704,6 +704,7 @@ prune_mode = on           # on | dry_run
 prune_batch = 10000       # notebook rows per prune batch
 verify_interval = 3600    # seconds between sampled verifies
 reserve_mb = 1024         # disk ballast for Case 10
+compaction_base_mb = 256  # first compaction level of `nodes`; 64 on testnet
 ```
 
 ## 9. Removal inventory (Stage 7)
@@ -744,6 +745,45 @@ Native toolchain after removal (verified with `cargo tree -i` on `b8d3e196`):
 
 LSM write amplification (typically 10–20× for leveled compaction) has **not
 been measured** for random 32-byte keys on our host; Stage 0/5 measure it.
+
+### Compaction level sizing
+
+Measured in steady state (window 512): 316 nodes (~156 KB, mean 505 B) are
+written per ledger and about as many deleted, ~170 MB/hour each way. Keys are
+uniformly random hashes, each written once and deleted once, read by point
+lookup only.
+
+The `nodes` keyspace uses leveled compaction: tables of `B/4` bytes, L0
+merged at 4 tables, level targets `T_i = B × 10^(i−1)` where
+`B = compaction_base_mb`. Live data `D` settles in the deepest level that
+fits it. Deletes are tombstones, and the old bytes are freed only when the
+penultimate level merges down, so up to one penultimate level of dead data is
+pending:
+
+    peak space amplification ≈ 1 + T_penultimate / D
+    write amplification     ≈ levels × ratio / 2 + 1
+
+With fjall's default `B = 256 MiB` the targets are 0.26 / 2.6 / 26 GB. A
+testnet store (`D ≈ 4.6 GB`) sits just above the 2.6 GB boundary: peak 1.56×
+(measured 1.54×, tables 7.1 GiB, falling to 5.9 GiB after a merge). With
+`B = 64 MiB` (targets 0.64 / 6.4 / 64 GB) the same store peaks at ≈ 1.14×
+(~5.2 GB), for one extra level of write amplification (~10× → ~13×, well
+under 1 MB/s). A mainnet-sized store (`D ≈ 15–25 GB`) is best at the
+default (1.10–1.17×); 64 would give 1.26–1.43×.
+
+Rejected alternatives:
+
+- **KV separation.** Blob files are reclaimed only when every table that
+  references them is compacted together; with uniformly random keys each
+  blob file is referenced across the whole key range, so space would almost
+  never be reclaimed. Values (~505 B) are also below the 1 KiB separation
+  threshold.
+- **Larger level ratio.** Lowers average amplification but makes each merge
+  into the last level rewrite ~50× its input.
+
+Bloom filters, 4 KiB blocks, LZ4 on deep levels and the 64 MiB memtable stay at
+the fjall defaults. fjall persists the strategy at keyspace creation, so a
+changed `compaction_base_mb` applies only to a new store.
 
 ## 11. Lessons from Xahau PR #728
 
@@ -818,7 +858,8 @@ Case 17 and the FBC rules unchanged.
   background compaction, so write amplification is higher than an
   append-only hash store, and per-key deletes leave tombstones until
   compaction removes them. Disk needs headroom for compaction (the ballast
-  exists for this) and the deleted space is reclaimed with a delay.
+  exists for this) and the deleted space is reclaimed with a delay: the store
+  saw-tooths by up to one penultimate level (§10, `compaction_base_mb`).
 - **Index overhead.** The notebook and counts keyspaces add a small amount of
   disk and a few reads and writes per changed node on every claim.
 - **More moving parts.** Correctness depends on an exact claim delta and on

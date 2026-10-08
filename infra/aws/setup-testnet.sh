@@ -153,6 +153,7 @@ type = fjall
 path = /var/lib/quaxar/db/fjall
 online_delete = 256
 advisory_delete = 0
+compaction_base_mb = 64
 
 [database_path]
 /var/lib/quaxar/db
