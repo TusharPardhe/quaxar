@@ -602,3 +602,57 @@ fn t_gate_1_prune_advances_unconditionally() {
         "dead node A is gone after prune"
     );
 }
+
+// Stage 0 replay determinism: the same recorded ledger trace replayed against
+// two independent fresh stores produces an identical final node set, and that
+// set equals the ModelStore oracle's required set. This is the determinism
+// property `nodestore-replay` checks (same trace -> same final node set).
+#[test]
+fn replay_of_a_fixed_trace_is_deterministic() {
+    // A fixed, hand-built trace: shared node that lives throughout, plus a
+    // per-ledger churn of unique nodes with retirements, over a small window.
+    let online_delete = 3u32;
+    let shared = hid(0x5A1ED);
+    let mut snaps: Vec<LedgerSnapshot> = Vec::new();
+    for seq in 1..=12u32 {
+        let unique = hid(60_000 + seq as u64);
+        let mut state: BTreeSet<Uint256> = BTreeSet::new();
+        state.insert(shared);
+        state.insert(unique);
+        // Carry the two most recent uniques so some nodes stay shared briefly.
+        if seq > 1 {
+            state.insert(hid(60_000 + seq as u64 - 1));
+        }
+        snaps.push(
+            LedgerSnapshot::new(seq)
+                .with_state(state)
+                .with_owned([hid(70_000 + seq as u64)]),
+        );
+    }
+
+    // Replay the identical trace against two independent stores.
+    let backend_a = open_memory();
+    let backend_b = open_memory();
+    run_sequence_on(&backend_a, &snaps, online_delete);
+    run_sequence_on(&backend_b, &snaps, online_delete);
+
+    let final_a = present_nodes(backend_a.as_ref());
+    let final_b = present_nodes(backend_b.as_ref());
+    assert_eq!(
+        final_a, final_b,
+        "the same trace must yield the same final node set on every replay"
+    );
+
+    // And the deterministic set matches the oracle's required set (plus the
+    // owned nodes of the last two ledgers, which have not yet aged out).
+    let mut model = ModelStore::new();
+    for snap in &snaps {
+        model.claim(snap.clone());
+    }
+    for required in model.required_nodes(online_delete, u32::MAX) {
+        assert!(
+            final_a.contains(&required),
+            "replay dropped a node the oracle still requires: {required:?}"
+        );
+    }
+}
