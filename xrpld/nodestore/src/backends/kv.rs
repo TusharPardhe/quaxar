@@ -3,7 +3,7 @@
 //! The historical [`Backend`](crate::Backend) trait is a single hash -> blob
 //! table. The pruned store needs several logically separate tables (nodes,
 //! a notebook of death records, reference counts, and metadata cursors) plus
-//! per-key deletes and atomic cross-table writes, which NuDB cannot express.
+//! per-key deletes and atomic cross-table writes, which an append-only hash store cannot express.
 //! These types model that capability without disturbing the hash -> blob API,
 //! so existing backends keep working through default trait methods.
 

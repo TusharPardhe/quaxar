@@ -339,7 +339,7 @@ impl SyncTree {
     /// The MutableTree's copy-on-write (unshare_node) will clone nodes
     /// when they're modified. This avoids the deep clone of
     /// clone_sync_subtree_as_shareable which can lose track of nodes
-    /// when the tree is backed by NuDB.
+    /// when the tree is backed by the node store.
     pub fn share_root_snapshot(&self) -> Self {
         // Ensure root hash is computed before sharing (reference SHAMap copy
         // constructor shares the root which already has its hash set from
@@ -432,7 +432,7 @@ impl SyncTree {
 
     /// Release all loaded tree nodes from memory, leaving only the root hash
     /// and branch topology intact. After this call, every traversal re-fetches
-    /// nodes from NuDB on demand via the backed-fetch path (`descend()`).
+    /// nodes from the node store on demand via the backed-fetch path (`descend()`).
     ///
     /// Takes `&self` (not `&mut self`) — operates via interior mutability using
     /// the per-branch spinlocks on each SHAMapTreeNode. This is critical: it
@@ -442,8 +442,8 @@ impl SyncTree {
     /// tree. No slot-swapping or cloning required.
     ///
     /// # Preconditions
-    /// - `self.backed` must be `true` (reads after release go to NuDB).
-    /// - All nodes must already be persisted to NuDB (via the acquisition
+    /// - `self.backed` must be `true` (reads after release go to the node store).
+    /// - All nodes must already be persisted to the node store (via the acquisition
     ///   worker's `store_object` or `persist_dirty_nodes_to_store`).
     ///
     /// # Safety
@@ -515,14 +515,14 @@ impl SyncTree {
     /// node count during acquisition. Unlike `release_to_disk` (which
     /// releases ALL children), this only releases children of inner nodes
     /// whose subtrees are fully downloaded (marked `full_below`). The
-    /// released subtrees can be re-fetched from NuDB on demand via the
+    /// released subtrees can be re-fetched from the node store on demand via the
     /// `node_fetcher` path.
     ///
     /// Returns the number of inner nodes whose children were released.
     ///
     /// # Preconditions
-    /// - `self.backed` must be true (reads after release go to NuDB).
-    /// - All "full below" nodes must already be persisted to NuDB.
+    /// - `self.backed` must be true (reads after release go to the node store).
+    /// - All "full below" nodes must already be persisted to the node store.
     pub fn spill_full_below_subtrees(&self, generation: u32) -> usize {
         if !self.backed {
             return 0;
@@ -590,7 +590,7 @@ impl SyncTree {
     ///
     /// Nodes at depth >= `keep_depth` have their children dropped. The next
     /// `get_missing_nodes` traversal will re-fetch only the frontier nodes it
-    /// actually needs from NuDB via the backed `descend()` path.
+    /// actually needs from the node store via the backed `descend()` path.
     ///
     /// This leverages quaxar's `release_loaded_children()` mechanism (which
     /// rippled lacks) to bound acquisition memory to approximately:
@@ -598,8 +598,8 @@ impl SyncTree {
     ///   + active frontier nodes loaded on-demand during getMissingNodes
     ///
     /// # Preconditions
-    /// - `self.backed` must be true (reads after release go to NuDB).
-    /// - Nodes must already be persisted to NuDB before calling this.
+    /// - `self.backed` must be true (reads after release go to the node store).
+    /// - Nodes must already be persisted to the node store before calling this.
     pub fn release_deep_children(&self, keep_depth: usize) -> usize {
         if !self.backed {
             return 0;
@@ -618,7 +618,7 @@ impl SyncTree {
             }
 
             if depth >= keep_depth {
-                // Release this node's children — they can be re-fetched from NuDB.
+                // Release this node's children — they can be re-fetched from the node store.
                 if node.has_any_loaded_child() {
                     node.release_loaded_children();
                     released += 1;

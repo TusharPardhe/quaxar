@@ -13,7 +13,7 @@
 //! - owner-backed direct-read wrappers so the mutable owner can reuse the
 //!   shared family cache/fetch policy instead of staying write-only.
 //!
-//! The Rust node store below this seam supports both RocksDB and NuDB backends;
+//! The Rust node store below this seam is the fjall pruned store;
 //! SHAMap maintains a backend-agnostic contract here.
 
 use crate::compare::{

@@ -6,7 +6,7 @@ use std::sync::Arc;
 /// The application node store. Only the single-database shape remains: the
 /// fjall pruned store (which prunes continuously) and the in-memory/null
 /// stores all present as a single `Database`. The historical rotating
-/// (NuDB/RocksDB copy-forward) variant has been removed.
+/// (rotating copy-forward) variant has been removed.
 #[derive(Clone)]
 pub enum SHAMapStoreNodeStore {
     Single(Arc<dyn Database>),

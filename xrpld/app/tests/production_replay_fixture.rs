@@ -1,7 +1,7 @@
 //! TEST ONLY: immutable production-path replay fixture gate.
 //!
 //! This integration test is deliberately ignored. It must never read or write
-//! the running node's NuDB. Fixture capture/load tooling supplies an immutable
+//! the running node's node store. Fixture capture/load tooling supplies an immutable
 //! parent snapshot and canonical child payload under a separate directory.
 
 use std::fs;
@@ -122,7 +122,7 @@ fn production_replay_fixture_is_isolated_and_bounded() {
 
     // The actual replay is intentionally enabled only after the capture tool
     // materializes a full parent snapshot. Keeping this gate separate ensures
-    // no production code path can accidentally use live NuDB state.
+    // no production code path can accidentally use live node-store state.
     let _bounded_budget = Duration::from_secs(manifest.max_replay_seconds);
 }
 

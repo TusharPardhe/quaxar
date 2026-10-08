@@ -4552,7 +4552,7 @@ fn initialize_startup_ledger_state(
             // Matches rippled Application.cpp normal startup branch: Normal
             // falls through to startGenesisLedger(). Durable getLastFullLedger
             // recovery is reserved for explicit Load/LoadFile/Replay modes.
-            // NuDB remains attached and available for later node/history
+            // node store remains attached and available for later node/history
             // acquisition; this changes startup selection, not retention.
             seed_startup_ledger_state(root, options, config)
         }
@@ -5248,7 +5248,7 @@ fn seed_startup_ledger_state(
     // GENESIS PERSISTENCE — MUST happen BEFORE on_closed_ledger.
     //
     // rippled parity: `Ledger::Ledger(kCreateGenesis, ...)` calls
-    //   stateMap_.flushDirty(AccountNode)   ← persists ALL nodes to NuDB + tree cache
+    //   stateMap_.flushDirty(AccountNode)   ← persists ALL nodes to the node store + tree cache
     //   setImmutable()
     // BEFORE `switchLCL` / `storeLedger` ever touches the ledger.
     //
@@ -5271,7 +5271,7 @@ fn seed_startup_ledger_state(
             genesis_for_persist.set_node_batch_writer_result(batch_writer);
             genesis_for_persist.state_map_mut().set_backed();
             genesis_for_persist.tx_map_mut().set_backed();
-            // Persist dirty nodes to NuDB + tree cache. Propagate failure:
+            // Persist dirty nodes to the node store + tree cache. Propagate failure:
             // rippled flushDirty/writeNode does not silently continue after a
             // backend write failure, and startup must not release an
             // unpersisted genesis tree.
@@ -5312,7 +5312,9 @@ fn seed_startup_ledger_state(
         .map_err(|error| format!("initial next-ledger skip list failed: {error:?}"))?;
     if root.node_store().is_some() {
         next.persist_dirty_nodes_to_store_result(root.shared_tree_cache())
-            .map_err(|error| format!("initial next-ledger node-store persistence failed: {error}"))?;
+            .map_err(|error| {
+                format!("initial next-ledger node-store persistence failed: {error}")
+            })?;
         // A start-valid forge is immediately copied and reopened by Pulsar.
         // Persisting dirty SHAMap nodes schedules backend writes; force the
         // NodeStore durability barrier before the validated header can be

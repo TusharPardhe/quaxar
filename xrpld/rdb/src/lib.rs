@@ -6,7 +6,7 @@
 //!   CloseTimeRes, CloseFlags, AccountSetHash, TransSetHash
 //!
 //! On startup, `get_newest_ledger_info()` returns the most recent persisted
-//! header so the node can reconstruct the validated ledger from NuDB without
+//! header so the node can reconstruct the validated ledger from the node store without
 //! re-acquiring it from peers — matching reference `getLastFullLedger()`.
 
 use rusqlite::{Connection, OptionalExtension, params};

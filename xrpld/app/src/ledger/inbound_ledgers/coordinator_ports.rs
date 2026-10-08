@@ -444,7 +444,7 @@ impl PersistenceWork for CoordinatorPersistenceWork {
             } else {
                 // Preserve each node's object classification and verified
                 // ledger sequence, but split one logical coordinator batch at
-                // NuDB's byte burst boundary. The final logical acceptance
+                // the backend write-burst boundary. The final logical acceptance
                 // fence is still issued only after every chunk succeeds.
                 let mut write_failed = None;
                 for nodes in persistence_chunks(batch.nodes()) {
@@ -466,7 +466,7 @@ impl PersistenceWork for CoordinatorPersistenceWork {
                         write_failed = Some(error);
                         break;
                     }
-                    // Each physical batch releases NuDB's mutation fence here,
+                    // Each physical batch releases the backend mutation fence here,
                     // allowing a waiting consensus close-path batch to run.
                     std::thread::yield_now();
                 }
@@ -1373,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn persistence_chunks_bound_nudb_lock_occupancy_by_bytes() {
+    fn persistence_chunks_bound_backend_lock_occupancy_by_bytes() {
         let sizes = [20_000, 15_000, 10_000, 80_000, 1];
         let nodes = sizes
             .into_iter()

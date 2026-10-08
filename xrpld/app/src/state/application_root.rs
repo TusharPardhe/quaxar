@@ -875,7 +875,7 @@ pub trait LedgerAcceptor: Send + Sync + 'static {
         None
     }
 
-    /// Get a node fetcher closure for backed state map reads from NuDB.
+    /// Get a node fetcher closure for backed state map reads from the node store.
     fn node_fetcher(
         &self,
     ) -> Option<
@@ -8746,7 +8746,7 @@ impl ApplicationRoot {
         // `LedgerMaster::switchLCL` installs `closedLedger_` and checks
         // validation; it does not evict the just-accepted state/transaction
         // maps. Evicting here clears shared nodes from the closed, open, and
-        // consensus-held views, forcing their next reads through NuDB while
+        // consensus-held views, forcing their next reads through the node store while
         // the next consensus round is still converging.
         // `SharedLedgerMasterState` (behind `ledger_master_state`) is this
         // node's SINGLE source of truth for "the closed ledger", matching
@@ -10615,9 +10615,9 @@ impl ApplicationRoot {
                     })?;
             }
             ledger.set_accepted(close_time, 0, true);
-            // Mark state_map unbacked: all nodes are in memory (never flushed to NuDB
+            // Mark state_map unbacked: all nodes are in memory (never flushed to the node store
             // in standalone mode). Without this, subsequent reads from child ledgers
-            // would try to fetch nodes from NuDB (which doesn't have them) and fail.
+            // would try to fetch nodes from the node store (which doesn't have them) and fail.
             ledger.state_map_mut().set_unbacked();
             Arc::new(ledger)
         };

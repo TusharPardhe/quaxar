@@ -54,8 +54,8 @@ pub trait Backend: Send + Sync + 'static {
     fn sync(&self);
 
     /// Checked durability barrier. Backends without a fallible checkpoint keep
-    /// the historical no-op/default behavior; NuDB overrides this to expose
-    /// its active-burst commit and fsync failures to lifecycle owners.
+    /// the historical no-op/default behavior; durable backends override this
+    /// to expose commit and fsync failures to lifecycle owners.
     fn sync_result(&self) -> Result<(), String> {
         self.sync();
         Ok(())
@@ -99,8 +99,8 @@ pub trait Backend: Send + Sync + 'static {
     //
     // The pruned node store needs per-key deletes, several keyspaces, atomic
     // cross-keyspace writes, ordered range scans, and an explicit durability
-    // barrier. NuDB and RocksDB cannot provide these, so the defaults report
-    // that the backend is not key-value capable; MemoryBackend and the fjall
+    // barrier. Backends without that surface (the null backend) keep the
+    // defaults, which report that the backend is not key-value capable; MemoryBackend and the fjall
     // backend override them. `supports_kv` lets callers select a path without
     // probing for errors.
 

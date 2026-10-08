@@ -1171,10 +1171,10 @@ impl Ledger {
     /// cache, consensus state) automatically see the released tree without any
     /// slot-swapping or cloning.
     ///
-    /// After this call, all SHAMap reads go through the `node_fetcher` to NuDB
+    /// After this call, all SHAMap reads go through the `node_fetcher` to the node store
     /// on demand. The tree's identity (root hash, branch topology) is preserved.
     ///
-    /// Call AFTER the ledger's nodes are confirmed durable in NuDB (either via
+    /// Call AFTER the ledger's nodes are confirmed durable in the node store (either via
     /// the acquisition worker's store_object path, or persist_dirty_nodes_to_store).
     pub fn release_maps_to_disk(&self) {
         self.state_map.release_to_disk();
@@ -1329,7 +1329,7 @@ impl Ledger {
         self.state_map.root().get_hash().as_uint256().is_zero()
     }
 
-    /// Load the real state root from NuDB using the given account_hash.
+    /// Load the real state root from the node store using the given account_hash.
     /// accessible via the Family. This method recovers that invariant.
     pub fn try_load_state_root_from_fetcher(
         &mut self,
@@ -2112,7 +2112,7 @@ impl Ledger {
     ///      `canonicalize(node->getHash(), node)` which calls
     ///      `f_.getTreeNodeCache()->canonicalizeReplaceClient()`. This ensures
     ///      subsequent `cacheLookup()` calls return a hit instead of falling
-    ///      through to a NuDB round-trip (fixes Issue B: tree cache = 0).
+    ///      through to a node-store round-trip (fixes Issue B: tree cache = 0).
     ///   2. **Install canonical pointers into the live trees**. A write error
     ///      leaves the original dirty ownership and cache visibility intact.
     ///
@@ -2284,7 +2284,7 @@ impl Ledger {
                     cache.canonicalize_replace_client(&key, &mut node_ref);
                 }
 
-                // Step 2: Persist to NuDB.
+                // Step 2: Persist to the node store.
                 // Matches rippled SHAMap::writeNode (SHAMap.cpp:944-945):
                 //   Serializer s; node->serializeWithPrefix(s);
                 //   f_.db().store(t, std::move(s.modData()), node->getHash().asUInt256(), ledgerSeq_);
@@ -2321,7 +2321,7 @@ impl Ledger {
                     cache.canonicalize_replace_client(&key, &mut node_ref);
                 }
 
-                // Step 2: Persist to NuDB (same as above).
+                // Step 2: Persist to the node store (same as above).
                 if let Some(ref write_fn) = writer {
                     let hash = node.get_hash();
                     if let Ok(data) = node.serialize_with_prefix() {
@@ -3059,7 +3059,7 @@ impl Ledger {
     /// Apply a batch of state map operations using a SINGLE MutableTree.
     /// This prevents MissingNode errors that occur when sequential individual
     /// mutations create new inner nodes that subsequent mutations can't find
-    /// in NuDB (because they only exist in memory from the previous mutation).
+    /// in the node store (because they only exist in memory from the previous mutation).
     ///
     /// This matches reference behavior where OpenView::apply writes all changes to
     /// the same underlying SHAMap in one session.

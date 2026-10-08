@@ -375,7 +375,7 @@ impl AppLedgerPlanEngine {
     }
 
     /// Drains accepted filter writes once per coordinator turn. The worker
-    /// store only collects commands; physical NuDB I/O remains outside this
+    /// store only collects commands; physical node-store I/O remains outside this
     /// engine through the coordinator write port.
     fn take_accepted_writes(&mut self) -> Vec<PersistNode> {
         self.store.take_pending_write_nodes()

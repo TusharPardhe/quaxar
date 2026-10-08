@@ -1882,7 +1882,7 @@ path = {}
         .ledger_master();
     assert!(master.have_ledger(21));
     // Explicit Load registers the selected durable LCL; older configured
-    // history is hydrated lazily through provider/NuDB recovery.
+    // history is hydrated lazily through provider/node store recovery.
     assert_eq!(master.complete_ledgers().to_string(), "21");
 }
 

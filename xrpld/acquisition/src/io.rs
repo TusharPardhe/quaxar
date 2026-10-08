@@ -5,8 +5,8 @@
 //! decision. Every request carries an [`OperationRef`] and every completion is
 //! a typed event the coordinator validates before it may mutate a session.
 
-use basics::sha_map_hash::SHAMapHash;
 use basics::intrusive_pointer::SharedIntrusive;
+use basics::sha_map_hash::SHAMapHash;
 use bytes::Bytes;
 use shamap::tree_node::SHAMapTreeNode;
 
@@ -171,7 +171,7 @@ impl ReadCompletion {
 /// The NodeStore object classification for a persisted node. Preserved from
 /// the traversal's store commands so the write adapter writes the exact object
 /// type the legacy path wrote (rippled `InboundLedgerStore` store-object
-/// parity). NuDB keys by hash only, so this does not affect read addressing,
+/// parity). The node store keys by hash only, so this does not affect read addressing,
 /// but the object classification participates in the encoded record and in
 /// post-store cache promotion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

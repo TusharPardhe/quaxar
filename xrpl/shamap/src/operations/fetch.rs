@@ -192,7 +192,7 @@ where
 
     // Match rippled `descendAsync`: after cache/filter misses, defer exactly
     // one backing-store resolution to the scan completion boundary. Doing a
-    // synchronous read here and another during completion probes NuDB twice
+    // synchronous read here and another during completion probes node store twice
     // for the same unresolved child.
     request_async_fetch(hash, ledger_seq);
     AsyncDescendResult::Pending(hash)
