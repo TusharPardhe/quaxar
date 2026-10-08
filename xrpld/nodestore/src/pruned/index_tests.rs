@@ -656,3 +656,94 @@ fn replay_of_a_fixed_trace_is_deterministic() {
         );
     }
 }
+
+// R3/R5 on the production write path: a node that dies (count 0) and is then
+// written again through the plain Backend::store path (how DatabaseNodeImp and
+// acquisition persist nodes, bypassing the index) must survive the next prune,
+// because some in-flight ledger needed those bytes.
+#[test]
+fn prune_keeps_a_dead_node_restored_through_the_backend_store_path() {
+    use crate::{NodeObject, NodeObjectType};
+    let backend = open_fjall();
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+    let a = hid(0xA);
+    let b = hid(0xB);
+    backend
+        .store(NodeObject::create_object(
+            NodeObjectType::AccountNode,
+            vec![1],
+            a,
+        ))
+        .expect("store a");
+    writer
+        .claim(&ClaimDelta {
+            seq: 1,
+            state_root: hid(1),
+            new_state: vec![a],
+            dead_state: vec![],
+            owned: vec![],
+        })
+        .expect("claim 1");
+    // Ledger 2 retires A: it is now dead-pending and watched for re-stores.
+    backend
+        .store(NodeObject::create_object(
+            NodeObjectType::AccountNode,
+            vec![2],
+            b,
+        ))
+        .expect("store b");
+    writer
+        .claim(&ClaimDelta {
+            seq: 2,
+            state_root: hid(2),
+            new_state: vec![b],
+            dead_state: vec![a],
+            owned: vec![],
+        })
+        .expect("claim 2");
+
+    // A is written again through the production path before prune runs.
+    backend
+        .store(NodeObject::create_object(
+            NodeObjectType::AccountNode,
+            vec![1],
+            a,
+        ))
+        .expect("re-store a");
+
+    writer.prune(2, 10_000).expect("prune");
+    assert!(
+        backend
+            .kv_get(Keyspace::Nodes, a.as_slice())
+            .unwrap()
+            .is_some(),
+        "a re-stored dead-pending node must not be pruned"
+    );
+
+    // Without a re-store the same dead node is pruned as usual.
+    let c = hid(0xC);
+    backend
+        .store(NodeObject::create_object(
+            NodeObjectType::AccountNode,
+            vec![3],
+            c,
+        ))
+        .expect("store c");
+    writer
+        .claim(&ClaimDelta {
+            seq: 3,
+            state_root: hid(3),
+            new_state: vec![c],
+            dead_state: vec![b],
+            owned: vec![],
+        })
+        .expect("claim 3");
+    writer.prune(3, 10_000).expect("prune 3");
+    assert!(
+        backend
+            .kv_get(Keyspace::Nodes, b.as_slice())
+            .unwrap()
+            .is_none(),
+        "a dead node that was not re-stored is pruned"
+    );
+}

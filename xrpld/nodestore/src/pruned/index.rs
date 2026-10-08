@@ -134,6 +134,11 @@ impl IndexWriter {
         self.unclaimed.len()
     }
 
+    /// Whether `hash` has reached count 0 and awaits pruning.
+    pub fn is_dead_pending(&self, hash: &Uint256) -> bool {
+        self.dead_pending.contains_key(hash)
+    }
+
     /// Record that `hash` was stored (via flush or acquisition) but is not yet
     /// owned by a validated ledger. Rule R5: if it is dead-pending, pin it so
     /// prune keeps it until the next claim decides its fate.
@@ -150,6 +155,8 @@ impl IndexWriter {
             return Ok(());
         }
         let mut batch = KvBatch::new();
+        let mut resurrected: Vec<Uint256> = Vec::new();
+        let mut newly_dead: Vec<Uint256> = Vec::new();
         // New state nodes: a node absent from counts is implicitly live-once
         // (count 1). A node that was dead-pending (explicit 0) or shared
         // (explicit >=2) has a row; bump it. `encode_count` drops the row when
@@ -163,6 +170,7 @@ impl IndexWriter {
             // death seq and remove a now-live node.
             if let Some(dead_seq) = self.dead_pending.remove(hash) {
                 batch.delete(Keyspace::Notebook, notebook_key(dead_seq, hash));
+                resurrected.push(*hash);
             }
             self.unclaimed.remove(hash);
         }
@@ -178,6 +186,7 @@ impl IndexWriter {
                     vec![NotebookKind::State as u8],
                 );
                 self.dead_pending.insert(*hash, delta.seq);
+                newly_dead.push(*hash);
             }
         }
         // Owned nodes die when the next ledger arrives.
@@ -207,8 +216,14 @@ impl IndexWriter {
                 delta.seq.to_le_bytes().to_vec(),
             );
         }
+        // Watch newly dead nodes so a re-store before prune keeps the bytes
+        // (R3/R5); stop watching nodes this claim brought back to life. Watch
+        // before the batch lands so no write can slip between death and watch.
+        self.backend.watch_restores(&newly_dead);
+        self.backend.watch_restores(&delta.owned);
         self.backend.kv_write_batch(&batch)?;
         self.backend.kv_persist(PersistMode::SyncAll)?;
+        self.backend.unwatch_restores(&resurrected);
         self.claimed_seq = Some(delta.seq);
         Ok(())
     }
@@ -281,8 +296,15 @@ impl IndexWriter {
             }
             let mut batch = KvBatch::new();
             let mut highest = self.pruned_to;
+            let mut released: Vec<Uint256> = Vec::with_capacity(rows.len());
             for (seq, hash, kind) in &rows {
                 highest = highest.max(*seq);
+                // A node written again after it died holds fresh bytes some
+                // in-flight ledger needs. Keep it and track it as unclaimed so
+                // the next claim (or the orphan sweep) decides its fate (R3/R5).
+                if self.backend.was_restored(hash) {
+                    self.unclaimed.entry(*hash).or_insert(*seq);
+                }
                 let pinned = self.unclaimed.contains_key(hash);
                 let deletable = !pinned
                     && match kind {
@@ -296,6 +318,7 @@ impl IndexWriter {
                 }
                 batch.delete(Keyspace::Notebook, notebook_key(*seq, hash));
                 self.dead_pending.remove(hash);
+                released.push(*hash);
             }
             // Only advance pruned_to to `k` once the final chunk is done; while
             // chunks remain, advance to the highest fully-scanned seq minus one
@@ -313,6 +336,7 @@ impl IndexWriter {
                 advance_to.to_le_bytes().to_vec(),
             );
             self.backend.kv_write_batch(&batch)?;
+            self.backend.unwatch_restores(&released);
             self.pruned_to = advance_to;
             if final_chunk {
                 break;
@@ -346,6 +370,7 @@ impl IndexWriter {
             self.unclaimed.remove(hash);
             self.dead_pending.insert(*hash, current_seq);
         }
+        self.backend.watch_restores(&orphans);
         self.backend.kv_write_batch(&batch)?;
         Ok(orphans.len())
     }

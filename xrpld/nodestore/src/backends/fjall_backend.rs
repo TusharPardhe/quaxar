@@ -90,6 +90,10 @@ pub struct FjallBackend {
     // When set (via set_delete_path, used by rotation to retire an archive),
     // close removes the database directory from disk after dropping it.
     delete_on_close: std::sync::atomic::AtomicBool,
+    /// Dead-pending node hashes the pruned index asked us to watch, mapped to
+    /// whether they were written again since. Bounded by the index's
+    /// dead-pending set. Prune keeps any node marked `true` (design R3/R5).
+    restore_watch: Mutex<std::collections::HashMap<Uint256, bool>>,
 }
 
 impl FjallBackend {
@@ -109,6 +113,7 @@ impl FjallBackend {
             journal,
             db: Mutex::new(None),
             delete_on_close: std::sync::atomic::AtomicBool::new(false),
+            restore_watch: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -176,6 +181,20 @@ impl FjallBackend {
         std::fs::metadata(self.reserve_path())
             .map(|m| m.len() >= self.reserve_bytes)
             .unwrap_or(false)
+    }
+
+    /// Record that `hash` was written, if the pruned index is watching it.
+    fn note_written(&self, hash: &Uint256) {
+        let mut watch = self
+            .restore_watch
+            .lock()
+            .expect("fjall restore watch mutex must not be poisoned");
+        if watch.is_empty() {
+            return;
+        }
+        if let Some(restored) = watch.get_mut(hash) {
+            *restored = true;
+        }
     }
 
     fn open_db(&self) -> Result<Arc<OpenDb>, String> {
@@ -305,7 +324,9 @@ impl Backend for FjallBackend {
         let encoded = EncodedBlob::new(&object);
         open.nodes
             .insert(object.hash().as_slice(), encoded.get_data())
-            .map_err(|error| Self::fjall_err("store", error))
+            .map_err(|error| Self::fjall_err("store", error))?;
+        self.note_written(object.hash());
+        Ok(())
     }
 
     fn store_batch(&self, batch: &crate::Batch) {
@@ -323,7 +344,11 @@ impl Backend for FjallBackend {
         }
         write
             .commit()
-            .map_err(|error| Self::fjall_err("store_batch", error))
+            .map_err(|error| Self::fjall_err("store_batch", error))?;
+        for object in batch {
+            self.note_written(object.hash());
+        }
+        Ok(())
     }
 
     fn sync(&self) {
@@ -426,6 +451,35 @@ impl Backend for FjallBackend {
             }
         }
         Ok(())
+    }
+
+    fn watch_restores(&self, hashes: &[Uint256]) {
+        let mut watch = self
+            .restore_watch
+            .lock()
+            .expect("fjall restore watch mutex must not be poisoned");
+        for hash in hashes {
+            watch.entry(*hash).or_insert(false);
+        }
+    }
+
+    fn unwatch_restores(&self, hashes: &[Uint256]) {
+        let mut watch = self
+            .restore_watch
+            .lock()
+            .expect("fjall restore watch mutex must not be poisoned");
+        for hash in hashes {
+            watch.remove(hash);
+        }
+    }
+
+    fn was_restored(&self, hash: &Uint256) -> bool {
+        self.restore_watch
+            .lock()
+            .expect("fjall restore watch mutex must not be poisoned")
+            .get(hash)
+            .copied()
+            .unwrap_or(false)
     }
 
     fn kv_persist(&self, mode: PersistMode) -> Result<(), String> {

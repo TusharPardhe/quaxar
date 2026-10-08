@@ -61,6 +61,10 @@ pub struct PrunedMetrics {
     pub retained_floor: u32,
     pub last_dry_run_would_delete: u64,
     pub verify_last_ok: bool,
+    /// Pruning is halted because a verify found a missing required node
+    /// (design Case 11). Claims continue; no further nodes are deleted until
+    /// an operator investigates and restarts the node.
+    pub halted: bool,
 }
 
 pub struct PrunedStore {
@@ -109,15 +113,22 @@ impl PrunedStore {
     /// claim decides its fate; rule R2/R5).
     pub fn store(&self, object: &Arc<NodeObject>, current_seq: u32) -> Result<(), String> {
         let encoded = EncodedBlob::new(object);
-        // Skip the node entirely if it is already present: re-storing a node
-        // the index already tracks (e.g. a shared state node flushed again by a
-        // later ledger) must not re-pin it in UNCLAIMED, or it would never be
-        // pruned. A new node is written and recorded as not-yet-claimed.
+        // Serialize against prune (R1): the presence check, the write and the
+        // UNCLAIMED note happen under the writer mutex, so prune cannot delete
+        // the node between them.
+        let mut writer = self.writer.lock().expect("pruned store writer mutex");
+        // An already-present node is not re-written. A live shared node must
+        // not be re-pinned (it would never be pruned), but a dead-pending node
+        // being stored again is needed by an in-flight ledger, so pin it until
+        // the next claim decides its fate (R5).
         if self
             .backend
             .kv_get(Keyspace::Nodes, object.hash().as_slice())?
             .is_some()
         {
+            if writer.is_dead_pending(object.hash()) {
+                writer.note_stored(*object.hash(), current_seq);
+            }
             return Ok(());
         }
         let mut batch = KvBatch::new();
@@ -127,10 +138,7 @@ impl PrunedStore {
             encoded.get_data().to_vec(),
         );
         self.backend.kv_write_batch(&batch)?;
-        self.writer
-            .lock()
-            .expect("pruned store writer mutex")
-            .note_stored(*object.hash(), current_seq);
+        writer.note_stored(*object.hash(), current_seq);
         Ok(())
     }
 
@@ -150,10 +158,16 @@ impl PrunedStore {
     /// prunes to the window floor and runs the orphan sweep. Returns the number
     /// of nodes actually deleted (always 0 in dry-run), so the caller can
     /// invalidate caches only when the on-disk node set changed.
-    pub fn maintain(&self, validated_seq: u32) -> Result<usize, String> {
-        let k = self.prune_target(validated_seq);
+    pub fn maintain(&self, validated_seq: u32, can_delete: u32) -> Result<usize, String> {
+        let k = self.prune_target(validated_seq, can_delete);
         let mut writer = self.writer.lock().expect("pruned store writer mutex");
-        let pruned = match self.config.prune_mode {
+        let halted = self.metrics.lock().expect("metrics mutex").halted;
+        let mode = if halted {
+            PruneMode::DryRun
+        } else {
+            self.config.prune_mode
+        };
+        let pruned = match mode {
             PruneMode::DryRun => {
                 let would = count_deletable(&self.backend, writer.pruned_to(), k)?;
                 let mut metrics = self.metrics.lock().expect("metrics mutex");
@@ -169,14 +183,24 @@ impl PrunedStore {
         let mut metrics = self.metrics.lock().expect("metrics mutex");
         metrics.pruned_to = writer.pruned_to();
         metrics.unclaimed = writer.unclaimed_len();
-        metrics.retained_floor = k.saturating_add(1);
+        // The advertised floor follows the durable prune cursor, not the
+        // target: in dry-run or while halted nothing was deleted, so nothing
+        // may be dropped from the advertised range.
+        metrics.retained_floor = writer.pruned_to().saturating_add(1);
         Ok(pruned)
     }
 
     /// Oldest ledger still dropped: `min(validated - online_delete, can_delete)`.
-    fn prune_target(&self, validated_seq: u32) -> u32 {
+    /// `can_delete` is read live so advisory updates take effect immediately.
+    fn prune_target(&self, validated_seq: u32, can_delete: u32) -> u32 {
         let window_k = validated_seq.saturating_sub(self.config.online_delete);
-        window_k.min(self.config.can_delete)
+        window_k.min(can_delete).min(self.config.can_delete)
+    }
+
+    /// Stop deleting nodes (design Case 11). Claims keep running so the index
+    /// stays current; pruning resumes only after a restart.
+    pub fn halt_pruning(&self) {
+        self.metrics.lock().expect("metrics mutex").halted = true;
     }
 
     /// Verify every required node is present. The caller supplies the required
@@ -267,6 +291,15 @@ impl PrunedStore {
         state_root: Uint256,
     ) -> Result<usize, String> {
         let mut writer = self.writer.lock().expect("pruned store writer mutex");
+        // Refuse before anything destructive: reconcile deletes every node
+        // outside the snapshot set, which on a store with claimed history
+        // would delete retained ledgers that the snapshot does not cover.
+        if let Some(prev) = writer.claimed_seq() {
+            return Err(format!(
+                "cannot adopt snapshot anchor {anchor_seq}: store already claimed {prev}; \
+                 load snapshots only into an empty fjall store"
+            ));
+        }
         let swept = crate::pruned::reconcile::reconcile(
             self.backend.as_ref(),
             required,
@@ -393,7 +426,7 @@ mod tests {
                     owned: vec![],
                 })
                 .expect("claim");
-            store.maintain(seq).expect("maintain");
+            store.maintain(seq, u32::MAX).expect("maintain");
         }
         // Window keeps seqs 3,4; node 101 (live only in ledger 1) is gone.
         assert_eq!(store.fetch(&hid(101)).1, Status::NotFound);
@@ -428,7 +461,7 @@ mod tests {
                     owned: vec![],
                 })
                 .expect("claim");
-            store.maintain(seq).expect("maintain");
+            store.maintain(seq, u32::MAX).expect("maintain");
         }
         // Dry-run deletes nothing: every stored node is still present.
         assert_eq!(store.fetch(&hid(201)).1, Status::Ok);
@@ -470,8 +503,23 @@ mod tests {
         // The anchor is the claimed sequence; the next claim diffs against it.
         assert_eq!(store.metrics().claimed_seq, Some(500));
 
-        // A second adopt is refused once the store is anchored.
-        assert!(store.adopt_snapshot(&required, 501, hid(98)).is_err());
+        // A second adopt is refused once the store is anchored, and refuses
+        // before reconciling: an empty required set must not sweep anything.
+        assert!(
+            store
+                .adopt_snapshot(&BTreeSet::new(), 501, hid(98))
+                .is_err()
+        );
+        assert_eq!(
+            store.fetch(&hid(10)).1,
+            Status::Ok,
+            "refusal is non-destructive"
+        );
+        assert_eq!(
+            store.fetch(&hid(11)).1,
+            Status::Ok,
+            "refusal is non-destructive"
+        );
     }
 
     #[test]
@@ -483,6 +531,78 @@ mod tests {
         let report = store.verify(&required, 1).expect("verify");
         assert!(!report.is_ok(), "hid(2) is missing");
         assert!(!store.metrics().verify_last_ok);
+    }
+
+    /// Drive `seqs` ledgers where each adds a unique node and retires the
+    /// previous one, calling maintain with `can_delete` after each claim.
+    fn churn(store: &PrunedStore, seqs: std::ops::RangeInclusive<u32>, can_delete: u32) {
+        for seq in seqs {
+            store
+                .store(&node(hid(300 + seq as u64)), seq)
+                .expect("store");
+            let dead = if seq == 1 {
+                vec![]
+            } else {
+                vec![hid(300 + seq as u64 - 1)]
+            };
+            store
+                .claim(&ClaimDelta {
+                    seq,
+                    state_root: hid(seq as u64),
+                    new_state: vec![hid(300 + seq as u64)],
+                    dead_state: dead,
+                    owned: vec![],
+                })
+                .expect("claim");
+            store.maintain(seq, can_delete).expect("maintain");
+        }
+    }
+
+    #[test]
+    fn halted_store_claims_but_never_prunes() {
+        let config = PrunedConfig {
+            online_delete: 1,
+            ..PrunedConfig::default()
+        };
+        let store = PrunedStore::open(open_memory(), config).expect("open");
+        store.halt_pruning();
+        churn(&store, 1..=5, u32::MAX);
+        // Every node is still present and the cursor never moved.
+        for seq in 1..=5u64 {
+            assert_eq!(store.fetch(&hid(300 + seq)).1, Status::Ok, "seq {seq}");
+        }
+        let metrics = store.metrics();
+        assert!(metrics.halted);
+        assert_eq!(
+            metrics.claimed_seq,
+            Some(5),
+            "claims keep the index current"
+        );
+        assert_eq!(metrics.pruned_to, 0);
+        assert_eq!(
+            metrics.retained_floor, 1,
+            "nothing may leave the advertised range"
+        );
+    }
+
+    #[test]
+    fn live_can_delete_caps_the_prune_target() {
+        let config = PrunedConfig {
+            online_delete: 1,
+            ..PrunedConfig::default()
+        };
+        let store = PrunedStore::open(open_memory(), config).expect("open");
+        // Advisory cap at 2: the window would allow pruning to 4.
+        churn(&store, 1..=5, 2);
+        assert_eq!(store.metrics().pruned_to, 2, "prune stops at can_delete");
+        assert_eq!(
+            store.fetch(&hid(303)).1,
+            Status::Ok,
+            "beyond the cap is kept"
+        );
+        // Raising the cap takes effect on the next pass.
+        churn(&store, 6..=6, u32::MAX);
+        assert_eq!(store.metrics().pruned_to, 5);
     }
 
     #[test]

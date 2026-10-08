@@ -136,6 +136,22 @@ pub trait Backend: Send + Sync + 'static {
         Err(self.kv_unsupported())
     }
 
+    /// Start watching `hashes` for re-stores. The pruned index calls this when
+    /// nodes become dead-pending (reference count 0). If any watched hash is
+    /// written again through `store`/`store_batch_result` before it is pruned,
+    /// the backend remembers it so prune can keep the freshly written bytes
+    /// (design rules R3/R5). Backends without the pruned store ignore it.
+    fn watch_restores(&self, _hashes: &[Uint256]) {}
+
+    /// Stop watching `hashes` (they were pruned or resurrected by a claim).
+    fn unwatch_restores(&self, _hashes: &[Uint256]) {}
+
+    /// Whether `hash` is watched and has been written again since it was
+    /// first watched. Prune must not delete such a node.
+    fn was_restored(&self, _hash: &Uint256) -> bool {
+        false
+    }
+
     #[doc(hidden)]
     fn kv_unsupported(&self) -> String {
         format!("backend {} is not key-value capable", self.get_name())
