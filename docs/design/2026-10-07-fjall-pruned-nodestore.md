@@ -526,11 +526,13 @@ As built on branch `feat/fjall-pruned-nodestore`:
   (still reachable via `rotation_decision`, the operating-mode health types,
   and saved-state paths) and compile with no dead-code warnings.
 - Remaining: Stage 5 (the live 48h/72h testnet soak and its benchmark gates,
-  which need a running testnet host), a full retained-window verify walk (the
-  current periodic verify samples the latest ledger's reachable set, a sound
-  safety net but not every retained ledger; the full walk needs a by-seq
-  ledger provider threaded into the driver), and the optional server_info
-  halted-state surface (verify_last_ok is already in get_counts).
+  which need a running testnet host) and, as a refinement, a full retained-
+  ledger-tree verify (the periodic verify now runs a latest-ledger reachable
+  walk plus a window-wide count-consistency check over the Counts keyspace,
+  which together cover the retained window; a per-retained-ledger tree walk
+  would need a by-seq ledger provider threaded into the driver). The pruned
+  health (claimed_seq, pruned_to, retained_floor, verify_last_ok) is now in
+  both get_counts and server_info.
 
 ### Stage 0: baseline and harness
 
