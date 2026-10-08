@@ -6052,33 +6052,6 @@ impl ApplicationRoot {
         ledger
     }
 
-    /// Diagnostic: record an observer's vetoed built ledger in ledger-history
-    /// so the `LedgerHistory::validated_ledger` built!=validated mismatch path
-    /// (which runs the FORK_STATE_DIFF state-map diff) fires when the quorum
-    /// sibling validates. Observers never reach `record_consensus_built_ledger`
-    /// for a vetoed ledger (the veto returns early), so without this the built
-    /// hash is never recorded for the fork sequence. Records the built hash
-    /// only; no check-accept side effects.
-    pub(crate) fn record_observer_built_for_fork_diff(
-        &self,
-        ledger: Arc<Ledger>,
-        consensus_hash: Uint256,
-    ) {
-        let ledger = self.ledger_with_node_fetcher(ledger);
-        // Keep it resident in the ledgers_by_hash cache so visit_differences
-        // can fetch its nodes when the validated sibling arrives.
-        let _ = self.store_consensus_ledger(Arc::clone(&ledger));
-        if let Some(runtime) = self.ledger_master_runtime()
-            && ledger.header().hash.is_non_zero()
-        {
-            runtime.ledger_master().ledger_history().built_ledger(
-                ledger,
-                consensus_hash,
-                JsonValue::Null,
-            );
-        }
-    }
-
     pub fn on_consensus_built_ledger(&self, ledger: Arc<Ledger>) {
         let consensus_hash = *ledger.header().tx_hash.as_uint256();
         let ledger = self.store_consensus_ledger(ledger);
@@ -10158,11 +10131,6 @@ impl ApplicationRoot {
             event = "validation_adoption_committed",
             validated_hash = %validated.header().hash,
             validated_seq = validated.header().seq,
-            validated_tx_hash = %validated.header().tx_hash,
-            validated_account_hash = %validated.header().account_hash,
-            validated_close_time = validated.header().close_time,
-            validated_close_time_resolution = validated.header().close_time_resolution,
-            validated_parent_hash = %validated.header().parent_hash,
             validated_sign_time,
             previous_valid_seq = current_valid_seq,
             "LCL trace: validation-backed ledger committed as validated"
@@ -11095,72 +11063,6 @@ impl ApplicationRoot {
                 };
                 let apply_ter = preclaim_admitted.then_some(result);
                 drop(view);
-                // FORK DIAGNOSTIC (logging-only): per-tx apply result + our
-                // metadata affected-node count and sorted ledger-index keys
-                // during the consensus ledger build. Forks are proven to be
-                // apply-layer divergence (we agree on the tx set but build a
-                // different ledger, all txs tesSUCCESS on both sides). Diffing
-                // our affected-node keys vs the network's `tx` RPC AffectedNodes
-                // pinpoints exactly which ledger entries a transactor touches
-                // differently (e.g. an OfferCreate consuming different offers).
-                let (meta_node_count, meta_node_keys) = match &transaction_meta {
-                    Some(meta) => {
-                        let fin = protocol::get_field_by_symbol("sfFinalFields");
-                        let newf = protocol::get_field_by_symbol("sfNewFields");
-                        let bal = protocol::get_field_by_symbol("sfBalance");
-                        let li = protocol::get_field_by_symbol("sfLedgerIndex");
-                        let mut keys: Vec<String> = meta
-                            .get_nodes()
-                            .iter()
-                            .map(|node| {
-                                let key = format!("{}", node.get_field_h256(li));
-                                // Extract the final balance of this entry (if any)
-                                // so our value can be diffed against the network's
-                                // FinalFields.Balance - value-level fork capture.
-                                let fields = if node.has_field(fin) {
-                                    Some(node.get_field_object(fin))
-                                } else if node.has_field(newf) {
-                                    Some(node.get_field_object(newf))
-                                } else {
-                                    None
-                                };
-                                let balance = fields
-                                    .as_ref()
-                                    .filter(|f| f.has_field(bal))
-                                    .map(|f| {
-                                        let a = f.get_field_amount(bal);
-                                        // Clean, trivially-parseable encoding:
-                                        // mantissa|exponent|neg. Compare directly
-                                        // to the network FinalFields.Balance.
-                                        format!(
-                                            "{}|{}|{}",
-                                            a.mantissa(),
-                                            a.exponent(),
-                                            a.negative() as u8
-                                        )
-                                    })
-                                    .unwrap_or_default();
-                                format!("{}={}", &key[..key.len().min(12)], balance)
-                            })
-                            .collect();
-                        keys.sort();
-                        (keys.len(), keys.join(" "))
-                    }
-                    None => (0, String::new()),
-                };
-                tracing::info!(
-                    target: "apply_audit",
-                    event = "consensus_build_tx_result",
-                    closed_seq,
-                    pass,
-                    tx_id = %transaction_id,
-                    txn_type = ?txn_type,
-                    result = ?result,
-                    applied,
-                    meta_node_count,
-                    meta_node_keys = %meta_node_keys,
-                    "APPLY_AUDIT consensus-build per-tx result"
-                );
                 if let Some((entry_key, prior_seq)) = replayed_threaded_entry {
                     completed_transaction_ids.insert(transaction_id);
                     emit_candidate_admission_diagnostic(

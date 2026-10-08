@@ -3689,11 +3689,6 @@ fn war_offercreate_ticksize6_placement_matches_network_f5726ee6() {
         .expect("offer must rest (no crossing liquidity)");
     let rested_gets = offer.get_field_amount(sf("sfTakerGets"));
     let rested_pays = offer.get_field_amount(sf("sfTakerPays"));
-    eprintln!(
-        "F5726EE6_REPLAY rested_gets={} rested_pays={} (network gets=10.1156727175249 pays=20000000)",
-        rested_gets.iou().to_string(),
-        rested_pays.xrp().drops()
-    );
     // Network rested TakerGets = 10.1156727175249 WAR.
     let expected_gets = iou_frac(issuer, war, 1_011_567_271_752_490, -14);
     assert_eq!(
@@ -4192,14 +4187,6 @@ fn testnet_21347909_sell_ioc_amm_clob_cross_matches_rippled() {
     if taker > issuer {
         taker_dust.negate();
     }
-    eprintln!(
-        "RESULT amm_xrp={} amm_dust={} taker_xrp={} taker_dust={} makerA_offer={:?}",
-        amm_xrp,
-        amm_dust.iou(),
-        xrp_balance(&view, taker),
-        taker_dust.iou(),
-        view.read(protocol::offer_keylet(acct_id(makers[0]), 1)).expect("read").is_some()
-    );
     assert!(view.read(protocol::offer_keylet(acct_id(makers[0]), 1)).expect("read").is_none());
     assert_eq!(xrp_balance(&view, taker), 467_600_015);
     assert_eq!(amm_xrp, 25_539_573_277, "AMM must give 43356776 drops");
@@ -4286,12 +4273,6 @@ fn testnet_21351203_issuer_self_buy_uses_amm_before_later_tiers() {
     let present = |acc: AccountID, seq: u32| {
         view.read(protocol::offer_keylet(acct_id(acc), seq)).expect("read").is_some()
     };
-    eprintln!(
-        "RESULT amm_in={} s1={} s2={} e={} s3={} v={} maker_e_xrp={}",
-        amm_xrp_after - amm_xrp_before,
-        present(issuer, 1), present(issuer, 2), present(maker_e, 1), present(issuer, 3), present(maker_v, 1),
-        xrp_balance(&view, maker_e)
-    );
     assert!(!present(issuer, 1) && !present(issuer, 2), "leading self offers removed");
     assert!(!present(maker_e, 1), "first third party tier fully crossed");
     // Network: maker received 33421796 drops (fixture paid a 10-drop offer fee).
@@ -4404,7 +4385,6 @@ fn testnet_21351286_issuer_self_buy_interleaved_self_offers_matches_rippled() {
     assert_eq!(full_apply(&mut view, &tx, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
     let amm_after = view.read(amm_root).expect("read").expect("root").get_field_amount(sf("sfBalance")).xrp().drops();
     let gains: Vec<i64> = makers.iter().enumerate().map(|(i, m)| xrp_balance(&view, *m) - before[i]).collect();
-    eprintln!("RESULT amm_gain={} maker_gains={:?}", amm_after - amm_before, gains);
     let expected_gains: [i64; 5] = [3020276, 16898809, 20239831, 36981249, 3244169];
     assert_eq!(amm_after - amm_before, 9401593, "network AMM XRP gain");
     assert_eq!(gains, expected_gains.to_vec(), "network per maker XRP gains");
@@ -4518,7 +4498,6 @@ fn testnet_21357186_book_ioc_crosses_like_network() {
     });
     assert_eq!(full_apply(&mut view, &tx, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
     let gains: Vec<i64> = makers.iter().enumerate().map(|(i, m)| xrp_balance(&view, *m) - before[i]).collect();
-    eprintln!("RESULT taker_gain={} maker_gains={:?}", xrp_balance(&view, taker) - taker_before, gains);
     // Rows 8 and 9 share one owner (rsvfsyp: CD88D4E1 crossed, 2D812351 expired);
     // the network balance change is counted once, on the crossed offer's row.
     let expected: [i64; 40] = [-343665732, -406064237, -411274186, -441174534, -505731034, 0, -340723306, -440523318, -169682010501, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];

@@ -1061,18 +1061,6 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             // `forEachOffer` stops before invoking the derived callback when
             // the stream advances to a second quality after an offer attempt.
             if !accepts_step_quality(&mut first_quality, offer_quality) {
-                if options.enforce_quality_threshold {
-                    tracing::info!(
-                        target: "lcl_audit",
-                        event = "clob_stop_quality_boundary",
-                        closed_seq = view.seq(),
-                        offer_key = %offer_sle.key(),
-                        first_q = first_quality.map(|q| q.value()).unwrap_or(0),
-                        this_q = offer_quality.value(),
-                        offers_consumed,
-                        "CLOB_STOP: one-quality-per-step boundary stopped consumption"
-                    );
-                }
                 break;
             }
 
@@ -1170,18 +1158,6 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 offer_quality,
                 quality_threshold,
             ) {
-                if options.enforce_quality_threshold {
-                    tracing::info!(
-                        target: "lcl_audit",
-                        event = "clob_stop_threshold",
-                        closed_seq = view.seq(),
-                        offer_key = %offer_sle.key(),
-                        this_q = offer_quality.value(),
-                        threshold_q = quality_threshold.map(|q| q.value()).unwrap_or(0),
-                        offers_consumed,
-                        "CLOB_STOP: offer quality below crossing threshold stopped consumption"
-                    );
-                }
                 break;
             }
 
@@ -1215,40 +1191,6 @@ pub fn execute_book_step_with_options<V: ApplyView>(
 
             if consumption.step_in.signum() <= 0 || consumption.step_out.signum() <= 0 {
                 break;
-            }
-
-            // CLOB FORK TRACE (logging-only): record the exact per-offer
-            // consumption inputs/outputs so a steady-state offer-consumption
-            // rounding fork can be localized to a single ceil_out/mul_round
-            // call. Keyed by offer so it can be correlated with FORK_STATE_DIFF
-            // divergent offer keys. Only emitted for OfferCreate crossing
-            // (enforce_quality_threshold) to keep volume bounded.
-            // Widened: capture all crossings (payment-flow + self-dealing),
-            // not only enforce_quality_threshold OfferCreate crossings.
-            if true {
-                tracing::info!(
-                    target: "lcl_audit",
-                    event = "clob_offer_consumption",
-                    closed_seq = view.seq(),
-                    offer_key = %offer_sle.key(),
-                    oq = offer_quality.value(),
-                    ofr_gets_m = taker_gets.mantissa(), ofr_gets_e = taker_gets.exponent(),
-                    ofr_pays_m = taker_pays.mantissa(), ofr_pays_e = taker_pays.exponent(),
-                    own_m = owner_funds.mantissa(), own_e = owner_funds.exponent(),
-                    rem_in_m = remaining_in.mantissa(), rem_in_e = remaining_in.exponent(),
-                    rem_out_m = remaining_out.mantissa(), rem_out_e = remaining_out.exponent(),
-                    cons_in_m = consumption.step_in.mantissa(), cons_in_e = consumption.step_in.exponent(),
-                    cons_out_m = consumption.step_out.mantissa(), cons_out_e = consumption.step_out.exponent(),
-                    ofr_in_m = consumption.offer_in.mantissa(), ofr_in_e = consumption.offer_in.exponent(),
-                    ofr_out_m = consumption.offer_out.mantissa(), ofr_out_e = consumption.offer_out.exponent(),
-                    frv2 = fix_reduced_offers_v2,
-                    max_in_m = max_in.mantissa(), max_in_e = max_in.exponent(),
-                    rev_in_m = reverse_input.mantissa(), rev_in_e = reverse_input.exponent(),
-                    tot_in_m = total_in.mantissa(), tot_in_e = total_in.exponent(),
-                    pass = ?options.pass,
-                    oc = offers_consumed,
-                    "CLOB_OFFER_CONSUMPTION per-offer crossing math"
-                );
             }
 
             // rippled's callback return value decides whether FlowOfferStream

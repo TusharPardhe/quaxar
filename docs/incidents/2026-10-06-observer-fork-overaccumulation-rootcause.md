@@ -70,7 +70,7 @@ remaining-out clip). Then correct that one rounding to match rippled's
 fork rate drops to 0 before shipping, because a wrong rounding change regresses
 every crossing.
 
-## Diagnostics deployed (strip before final ship — all logging-only)
+## Diagnostics deployed (logging-only; since stripped from the code)
 `FORK_STATE_DIFF` (both-sides field delta incl. PrevTxnID/OwnerNode/Indexes +
 THIS_LEDGER/INHERITED tags), `CLOB_OFFER_CONSUMPTION` (per-offer crossing math,
 seq-tagged, widened to all crossings), `OFFER_CREATE_RESIDUAL`, `CLOB_STOP_*`,

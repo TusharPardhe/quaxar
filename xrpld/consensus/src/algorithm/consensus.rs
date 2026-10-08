@@ -860,63 +860,6 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         adaptor.update_operating_mode(self.curr_peer_positions.len());
         self.prev_proposers = self.curr_peer_positions.len();
         self.prev_round_time = self.result.as_ref().expect("result set").round_time.read();
-
-        // FORK DIAGNOSTIC (logging-only): if the MAJORITY peer position (the
-        // set most proposers back = the quorum's tx set) differs from OUR
-        // accepted set, log the exact differing transaction ids. This pinpoints
-        // whether we are missing a tx the quorum included, carrying an extra
-        // one, etc. - the ground truth for the residual observer-fork bug.
-        {
-            let mut tally: std::collections::BTreeMap<
-                <A::TxSet as ConsensusTxSet>::Id,
-                usize,
-            > = std::collections::BTreeMap::new();
-            for pos in self.curr_peer_positions.values() {
-                *tally.entry(pos.proposal().position().clone()).or_insert(0) += 1;
-            }
-            if let Some((majority_id, votes)) =
-                tally.into_iter().max_by_key(|(_, c)| *c)
-            {
-                let our_id = self.result.as_ref().expect("result set").position.position().clone();
-                if majority_id != our_id
-                    && let Some(quorum_set) = self.acquired.get(&majority_id)
-                {
-                    let our_set = &self.result.as_ref().expect("result set").txns;
-                    let diff = our_set.compare(quorum_set);
-                    let ours_only: Vec<String> = diff
-                        .iter()
-                        .filter(|(_, in_self)| **in_self)
-                        .map(|(id, _)| id.to_string())
-                        .collect();
-                    let quorum_only: Vec<String> = diff
-                        .iter()
-                        .filter(|(_, in_self)| !**in_self)
-                        .map(|(id, _)| id.to_string())
-                        .collect();
-                    tracing::warn!(
-                        target: "lcl_audit",
-                        event = "consensus_txset_divergence",
-                        our_set_id = %our_id.to_string(),
-                        quorum_set_id = %majority_id.to_string(),
-                        quorum_votes = votes,
-                        proposers = self.curr_peer_positions.len(),
-                        ours_only = ?ours_only,
-                        quorum_only = ?quorum_only,
-                        "CONSENSUS_TXSET_DIVERGENCE: our accepted set differs from the majority peer (quorum) set"
-                    );
-                } else if majority_id == our_id {
-                    tracing::info!(
-                        target: "lcl_audit",
-                        event = "consensus_txset_agreed",
-                        set_id = %our_id.to_string(),
-                        quorum_votes = votes,
-                        proposers = self.curr_peer_positions.len(),
-                        "CONSENSUS_TXSET_AGREED: our accepted set id matches the majority peer set (any resulting fork is in ledger BUILD/apply, not set selection)"
-                    );
-                }
-            }
-        }
-
         self.phase = ConsensusPhase::Accepted;
 
         let result = self.result.take().expect("result set");
@@ -1046,28 +989,7 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             }
 
             if dispute_count > 0 || vote_changes > 0 {
-                // Sample up to 4 disputes' vote state so the convergence
-                // dynamics are visible: a dispute that keeps flipping or is
-                // freshly re-created each round (yays/nays churn) explains the
-                // vote_changes==dispute_count oscillation. Diagnostic-only.
-                let sample: Vec<String> = {
-                    let result = self.result.as_ref().expect("result set");
-                    result
-                        .disputes
-                        .values()
-                        .take(4)
-                        .map(|d| {
-                            format!(
-                                "{}:y{}n{}ov{}",
-                                d.id().to_string().get(..6).unwrap_or(""),
-                                d.yays(),
-                                d.nays(),
-                                d.get_our_vote() as u8
-                            )
-                        })
-                        .collect()
-                };
-                tracing::info!(target: "consensus", dispute_count, vote_changes, proposing, converge_pct = self.converge_percent, peers = self.curr_peer_positions.len(), dispute_sample = ?sample, "update_our_positions: dispute status");
+                tracing::info!(target: "consensus", dispute_count, vote_changes, proposing, converge_pct = self.converge_percent, "update_our_positions: dispute status");
             }
 
             our_new_set = mutable_set;

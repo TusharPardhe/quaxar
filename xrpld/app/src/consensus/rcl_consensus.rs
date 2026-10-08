@@ -1887,71 +1887,13 @@ impl AppConsensus {
                     && let Some((alternate_hash, validation_count)) =
                         root.observer_quorum_alternate_same_seq(closed_hash, closed.header().seq)
                 {
-                    // Capture the EXACT divergence field vs the quorum sibling
-                    // (which is resident, being quorum-validated) so a live
-                    // fork is classifiable: tx-set divergence (different
-                    // transaction_hash) vs close-time divergence (different
-                    // close_time/resolution) vs parent divergence vs state.
-                    let alt = root
-                        .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(alternate_hash));
-                    // Our final consensus tx-set membership (sorted tx ids) so
-                    // the symmetric difference vs the quorum set pinpoints the
-                    // exact divergent transaction(s).
-                    let mut our_tx_ids: Vec<String> = work
-                        .txns
-                        .iter()
-                        .map(|tx| format!("{}", tx.get_transaction_id()))
-                        .collect();
-                    our_tx_ids.sort();
-                    let our_tx_id_list = our_tx_ids.join(",");
-                    let (alt_parent, alt_tx_hash, alt_acct_hash, alt_close, alt_res) = match &alt {
-                        Some(a) => (
-                            format!("{}", a.header().parent_hash),
-                            format!("{}", a.header().tx_hash),
-                            format!("{}", a.header().account_hash),
-                            a.header().close_time,
-                            a.header().close_time_resolution,
-                        ),
-                        None => (
-                            "<not-resident>".to_owned(),
-                            String::new(),
-                            String::new(),
-                            0,
-                            0,
-                        ),
-                    };
                     tracing::warn!(
                         target: "lcl_audit",
                         local_hash = %closed_hash,
                         alternate_hash = %alternate_hash,
                         closed_seq = closed.header().seq,
                         validation_count,
-                        local_parent_hash = %closed.header().parent_hash,
-                        local_tx_hash = %closed.header().tx_hash,
-                        local_account_hash = %closed.header().account_hash,
-                        local_close_time = closed.header().close_time,
-                        local_close_time_resolution = closed.header().close_time_resolution,
-                        alt_parent_hash = %alt_parent,
-                        alt_tx_hash = %alt_tx_hash,
-                        alt_account_hash = %alt_acct_hash,
-                        alt_close_time = alt_close,
-                        alt_close_time_resolution = alt_res,
-                        same_parent = (format!("{}", closed.header().parent_hash) == alt_parent),
-                        same_tx_set = (format!("{}", closed.header().tx_hash) == alt_tx_hash),
-                        same_account = (format!("{}", closed.header().account_hash) == alt_acct_hash),
-                        same_close_time = (closed.header().close_time == alt_close),
-                        our_tx_ids = %our_tx_id_list,
                         "LCL_AUDIT observer local child vetoed for quorum-backed canonical sibling"
-                    );
-                    // Record our vetoed built ledger in ledger-history so the
-                    // LedgerHistory::validated_ledger built!=validated mismatch
-                    // path (which runs the FORK_STATE_DIFF) fires when the
-                    // quorum sibling validates. Observers otherwise never call
-                    // built_ledger (the veto returns early), so the state diff
-                    // never had the built hash recorded. Diagnostic-only.
-                    root.record_observer_built_for_fork_diff(
-                        Arc::clone(&closed),
-                        work.consensus_hash,
                     );
                     // Leave generic consensus Accepted. The NetworkOps strand
                     // owns endConsensus reconciliation and will switch to, or
@@ -2747,23 +2689,6 @@ impl ConsensusRunner for AppConsensus {
         // master key when a manifest maps it; fall back to the signing key.
         let proposal_key = *peer_pos.public_key();
         let is_trusted = self.adaptor.app_root.validators().trusted(proposal_key);
-        {
-            // Diagnostic: count trusted vs untrusted proposals so a deploy can
-            // confirm the trust gate does not starve consensus of validator
-            // positions. Logging-only.
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static TRUSTED: AtomicU64 = AtomicU64::new(0);
-            static UNTRUSTED: AtomicU64 = AtomicU64::new(0);
-            let (t, u) = if is_trusted {
-                (TRUSTED.fetch_add(1, Ordering::Relaxed) + 1, UNTRUSTED.load(Ordering::Relaxed))
-            } else {
-                (TRUSTED.load(Ordering::Relaxed), UNTRUSTED.fetch_add(1, Ordering::Relaxed) + 1)
-            };
-            if (t + u) % 50 == 0 {
-                tracing::info!(target: "consensus", event = "proposal_trust_tally", trusted = t, untrusted = u,
-                    "PROPOSAL_TRUST_TALLY trusted vs untrusted peer proposals seen");
-            }
-        }
         if !is_trusted {
             tracing::trace!(
                 target: "consensus",

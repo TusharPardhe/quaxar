@@ -105,11 +105,6 @@ fn fork_21305409_offercreate_iou_crossing_matches_network() {
     let expected_war_out = war("2.04693805346036");
     let expected_xrp_in = drops(3_992_000);
 
-    println!(
-        "REPRO step_in={:?} step_out={:?} offer_in={:?} offer_out={:?} owner_gives={:?}",
-        consumed.step_in, consumed.step_out, consumed.offer_in, consumed.offer_out,
-        consumed.owner_gives
-    );
     assert_eq!(
         consumed.step_out, expected_war_out,
         "WAR delivered must match network (2.04693805346036)"
@@ -179,21 +174,6 @@ fn fork_21332266_tfsell_xrp_out_crossing_amounts() {
         true,
     );
 
-    // Also run the raw ceil_out_strict that the remaining_out clip uses, to
-    // isolate the IOU rounding of the input side for 4,000,000 XRP out.
-    let clip = offer_quality.ceil_out_strict(
-        &Amounts::new(offer_in_524.clone(), offer_out_xrp.clone()),
-        &remaining_out_xrp,
-        true,
-    );
-    println!(
-        "REPRO 21332266 ceil_out_strict(roundUp=true): in(524C)={:?} out(XRP)={:?}",
-        clip.r#in, clip.out
-    );
-    println!(
-        "REPRO 21332266 consumed: step_in(524C)={:?} step_out(XRP)={:?} offer_in={:?} offer_out={:?} owner_gives={:?}",
-        consumed.step_in, consumed.step_out, consumed.offer_in, consumed.offer_out, consumed.owner_gives
-    );
     // Our node produced cons_out=4000000 XRP and cons_in=2.026655899060810 524C.
     assert_eq!(consumed.step_out, drops(4_000_000), "XRP out must be 4000000 drops");
     // Record our current 524C input; the network's value is the comparison target.

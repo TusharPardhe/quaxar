@@ -2140,7 +2140,7 @@ pub(crate) fn is_forward_ancestor(
         .map(|ancestor| *ancestor.as_uint256() == ancestor_hash)
         .unwrap_or(false);
     if !confirmed {
-        tracing::info!(
+        tracing::debug!(
             target: "lcl_trace",
             event = "forward_ancestor_unconfirmed",
             ancestor_seq,
