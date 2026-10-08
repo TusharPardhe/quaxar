@@ -1,10 +1,8 @@
 use crate::{
-    Backend, DatabaseImporter, DatabaseNodeImp, DatabaseRotatingImp, DatabaseSource, Factory,
-    FjallFactory, MemoryFactory, NodeObject, NodeStoreJournal, NuDbContext, NuDbFactory,
-    NullFactory, Scheduler,
+    Backend, DatabaseImporter, DatabaseNodeImp, DatabaseSource, Factory, FjallFactory,
+    MemoryFactory, NodeObject, NodeStoreJournal, NullFactory, Scheduler,
 };
 use basics::basic_config::Section;
-use std::any::Any;
 use std::sync::{Arc, Mutex, OnceLock};
 
 fn read_string(section: &Section, key: &str) -> String {
@@ -34,24 +32,6 @@ pub trait Manager: Send + Sync + 'static {
         journal: Arc<dyn NodeStoreJournal>,
     ) -> Result<Box<dyn Backend>, String>;
 
-    fn make_backend_with_context(
-        &self,
-        parameters: &Section,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        context: &mut dyn Any,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Box<dyn Backend>, String>;
-
-    fn make_backend_with_nudb_context(
-        &self,
-        parameters: &Section,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        context: &mut NuDbContext,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Box<dyn Backend>, String>;
-
     fn make_database(
         &self,
         burst_size: usize,
@@ -60,52 +40,6 @@ pub trait Manager: Send + Sync + 'static {
         config: &Section,
         journal: Arc<dyn NodeStoreJournal>,
     ) -> Result<Arc<DatabaseNodeImp>, String>;
-
-    #[allow(clippy::too_many_arguments)]
-    fn make_database_deterministic(
-        &self,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        read_threads: i32,
-        config: &Section,
-        app_type: u64,
-        uid: u64,
-        salt: u64,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Arc<DatabaseNodeImp>, String>;
-
-    #[allow(clippy::too_many_arguments)]
-    fn make_database_with_context(
-        &self,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        read_threads: i32,
-        config: &Section,
-        context: &mut dyn Any,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Arc<DatabaseNodeImp>, String>;
-
-    fn make_database_with_nudb_context(
-        &self,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        read_threads: i32,
-        config: &Section,
-        context: &mut NuDbContext,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Arc<DatabaseNodeImp>, String>;
-
-    #[allow(clippy::too_many_arguments)]
-    fn make_rotating_database(
-        &self,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        read_threads: i32,
-        writable_backend_config: &Section,
-        archive_backend_config: &Section,
-        database_config: &Section,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Arc<DatabaseRotatingImp>, String>;
 
     fn import(&self, destination: &dyn DatabaseImporter, source: &dyn DatabaseSource);
 
@@ -129,7 +63,6 @@ impl ManagerImp {
         let manager = Self {
             factories: Mutex::new(Vec::new()),
         };
-        manager.insert(Arc::new(NuDbFactory::new()));
         manager.insert(Arc::new(NullFactory::new()));
         manager.insert(Arc::new(MemoryFactory::new()));
         manager.insert(Arc::new(FjallFactory::new()));
@@ -209,80 +142,6 @@ impl Manager for ManagerImp {
         )
     }
 
-    fn make_backend_with_nudb_context(
-        &self,
-        parameters: &Section,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        context: &mut NuDbContext,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Box<dyn Backend>, String> {
-        let backend_type = read_string(parameters, "type");
-        if backend_type.is_empty() {
-            return Err(Self::missing_backend());
-        }
-
-        let Some(factory) = self.find(&backend_type) else {
-            return Err(Self::missing_backend());
-        };
-
-        if let Some(result) = factory.create_instance_with_nudb_context(
-            NodeObject::KEY_BYTES,
-            parameters,
-            burst_size,
-            Arc::clone(&scheduler),
-            context,
-            Arc::clone(&journal),
-        ) {
-            return result;
-        }
-
-        factory.create_instance(
-            NodeObject::KEY_BYTES,
-            parameters,
-            burst_size,
-            scheduler,
-            journal,
-        )
-    }
-
-    fn make_backend_with_context(
-        &self,
-        parameters: &Section,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        context: &mut dyn Any,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Box<dyn Backend>, String> {
-        let backend_type = read_string(parameters, "type");
-        if backend_type.is_empty() {
-            return Err(Self::missing_backend());
-        }
-
-        let Some(factory) = self.find(&backend_type) else {
-            return Err(Self::missing_backend());
-        };
-
-        if let Some(result) = factory.create_instance_with_context(
-            NodeObject::KEY_BYTES,
-            parameters,
-            burst_size,
-            Arc::clone(&scheduler),
-            context,
-            Arc::clone(&journal),
-        ) {
-            return result;
-        }
-
-        factory.create_instance(
-            NodeObject::KEY_BYTES,
-            parameters,
-            burst_size,
-            scheduler,
-            journal,
-        )
-    }
-
     fn make_database(
         &self,
         burst_size: usize,
@@ -301,111 +160,6 @@ impl Manager for ManagerImp {
         backend.open(true)?;
         let backend: Arc<dyn Backend> = backend.into();
         DatabaseNodeImp::new(scheduler, read_threads, backend, config, journal)
-    }
-
-    fn make_database_deterministic(
-        &self,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        read_threads: i32,
-        config: &Section,
-        app_type: u64,
-        uid: u64,
-        salt: u64,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Arc<DatabaseNodeImp>, String> {
-        let read_threads = clamp_read_threads(read_threads);
-        let backend = self.make_backend(
-            config,
-            burst_size,
-            Arc::clone(&scheduler),
-            Arc::clone(&journal),
-        )?;
-        backend.open_deterministic(true, app_type, uid, salt)?;
-        let backend: Arc<dyn Backend> = backend.into();
-        DatabaseNodeImp::new(scheduler, read_threads, backend, config, journal)
-    }
-
-    fn make_database_with_context(
-        &self,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        read_threads: i32,
-        config: &Section,
-        context: &mut dyn Any,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Arc<DatabaseNodeImp>, String> {
-        let read_threads = clamp_read_threads(read_threads);
-        let backend = self.make_backend_with_context(
-            config,
-            burst_size,
-            Arc::clone(&scheduler),
-            context,
-            Arc::clone(&journal),
-        )?;
-        backend.open(true)?;
-        let backend: Arc<dyn Backend> = backend.into();
-        DatabaseNodeImp::new(scheduler, read_threads, backend, config, journal)
-    }
-
-    fn make_database_with_nudb_context(
-        &self,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        read_threads: i32,
-        config: &Section,
-        context: &mut NuDbContext,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Arc<DatabaseNodeImp>, String> {
-        let read_threads = clamp_read_threads(read_threads);
-        let backend = self.make_backend_with_nudb_context(
-            config,
-            burst_size,
-            Arc::clone(&scheduler),
-            context,
-            Arc::clone(&journal),
-        )?;
-        backend.open(true)?;
-        let backend: Arc<dyn Backend> = backend.into();
-        DatabaseNodeImp::new(scheduler, read_threads, backend, config, journal)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn make_rotating_database(
-        &self,
-        burst_size: usize,
-        scheduler: Arc<dyn Scheduler>,
-        read_threads: i32,
-        writable_backend_config: &Section,
-        archive_backend_config: &Section,
-        database_config: &Section,
-        journal: Arc<dyn NodeStoreJournal>,
-    ) -> Result<Arc<DatabaseRotatingImp>, String> {
-        let read_threads = clamp_read_threads(read_threads);
-        let writable_backend = self.make_backend(
-            writable_backend_config,
-            burst_size,
-            Arc::clone(&scheduler),
-            Arc::clone(&journal),
-        )?;
-        writable_backend.open(true)?;
-
-        let archive_backend = self.make_backend(
-            archive_backend_config,
-            burst_size,
-            Arc::clone(&scheduler),
-            Arc::clone(&journal),
-        )?;
-        archive_backend.open(true)?;
-
-        DatabaseRotatingImp::new(
-            scheduler,
-            read_threads,
-            Arc::from(writable_backend),
-            Arc::from(archive_backend),
-            database_config,
-            journal,
-        )
     }
 
     fn import(&self, destination: &dyn DatabaseImporter, source: &dyn DatabaseSource) {
@@ -427,12 +181,9 @@ impl Manager for ManagerImp {
 mod tests {
     use super::{Manager, ManagerImp};
     use crate::database::{DatabaseImporter, DatabaseSource};
-    use crate::{
-        Backend, Factory, NodeObject, NodeStoreJournal, NuDbContext, NullJournal, Scheduler, Status,
-    };
+    use crate::{Backend, Factory, NodeObject, NodeStoreJournal, NullJournal, Scheduler, Status};
     use basics::{base_uint::Uint256, basic_config::Section};
     use protocol::JsonValue;
-    use std::any::Any;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -453,75 +204,6 @@ mod tests {
         }
 
         fn close(&self) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn fetch(&self, _hash: &Uint256) -> (Option<Arc<NodeObject>>, Status) {
-            (None, Status::NotFound)
-        }
-
-        fn fetch_batch(&self, _hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status) {
-            (Vec::new(), Status::Ok)
-        }
-
-        fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn store_batch(&self, _batch: &crate::Batch) {}
-
-        fn sync(&self) {}
-
-        fn for_each(&self, _callback: &mut dyn FnMut(Arc<NodeObject>)) {}
-
-        fn get_write_load(&self) -> i32 {
-            0
-        }
-
-        fn set_delete_path(&self) {}
-
-        fn fd_required(&self) -> i32 {
-            0
-        }
-    }
-
-    struct DeterministicBackend {
-        opened: Arc<AtomicBool>,
-        app_type: Arc<AtomicU64>,
-        uid: Arc<AtomicU64>,
-        salt: Arc<AtomicU64>,
-    }
-
-    impl Backend for DeterministicBackend {
-        fn get_name(&self) -> String {
-            "deterministic".to_owned()
-        }
-
-        fn open(&self, _create_if_missing: bool) -> Result<(), String> {
-            self.opened.store(true, Ordering::Relaxed);
-            Ok(())
-        }
-
-        fn open_deterministic(
-            &self,
-            _create_if_missing: bool,
-            app_type: u64,
-            uid: u64,
-            salt: u64,
-        ) -> Result<(), String> {
-            self.opened.store(true, Ordering::Relaxed);
-            self.app_type.store(app_type, Ordering::Relaxed);
-            self.uid.store(uid, Ordering::Relaxed);
-            self.salt.store(salt, Ordering::Relaxed);
-            Ok(())
-        }
-
-        fn is_open(&self) -> bool {
-            self.opened.load(Ordering::Relaxed)
-        }
-
-        fn close(&self) -> Result<(), String> {
-            self.opened.store(false, Ordering::Relaxed);
             Ok(())
         }
 
@@ -576,90 +258,6 @@ mod tests {
         }
     }
 
-    struct ContextFactory {
-        context_supported: bool,
-        context_seen: Arc<AtomicBool>,
-        deterministic_opened: Arc<AtomicBool>,
-        app_type: Arc<AtomicU64>,
-        uid: Arc<AtomicU64>,
-        salt: Arc<AtomicU64>,
-    }
-
-    impl Factory for ContextFactory {
-        fn get_name(&self) -> String {
-            "Context".to_owned()
-        }
-
-        fn create_instance(
-            &self,
-            _key_bytes: usize,
-            _parameters: &Section,
-            _burst_size: usize,
-            _scheduler: Arc<dyn Scheduler>,
-            _journal: Arc<dyn NodeStoreJournal>,
-        ) -> crate::factory::BackendResult {
-            Ok(Box::new(DeterministicBackend {
-                opened: Arc::clone(&self.deterministic_opened),
-                app_type: Arc::clone(&self.app_type),
-                uid: Arc::clone(&self.uid),
-                salt: Arc::clone(&self.salt),
-            }))
-        }
-
-        fn create_instance_with_context(
-            &self,
-            _key_bytes: usize,
-            _parameters: &Section,
-            _burst_size: usize,
-            _scheduler: Arc<dyn Scheduler>,
-            context: &mut dyn Any,
-            _journal: Arc<dyn NodeStoreJournal>,
-        ) -> Option<crate::factory::BackendResult> {
-            if !self.context_supported {
-                return None;
-            }
-
-            let marker = context
-                .downcast_mut::<bool>()
-                .expect("test context should be bool");
-            *marker = true;
-            self.context_seen.store(true, Ordering::Relaxed);
-
-            Some(self.create_instance(
-                0,
-                &Section::new("node_db"),
-                0,
-                Arc::new(crate::DummyScheduler),
-                Arc::new(NullJournal),
-            ))
-        }
-
-        fn create_instance_with_nudb_context(
-            &self,
-            _key_bytes: usize,
-            _parameters: &Section,
-            _burst_size: usize,
-            _scheduler: Arc<dyn Scheduler>,
-            context: &mut NuDbContext,
-            _journal: Arc<dyn NodeStoreJournal>,
-        ) -> Option<crate::factory::BackendResult> {
-            if !self.context_supported {
-                return None;
-            }
-
-            *context = NuDbContext::new(17, 19, 23);
-            self.context_seen.store(true, Ordering::Relaxed);
-
-            Some(self.create_instance(
-                0,
-                &Section::new("node_db"),
-                0,
-                Arc::new(crate::DummyScheduler),
-                Arc::new(NullJournal),
-            ))
-        }
-    }
-
     #[derive(Default)]
     struct TestSource {
         objects: Vec<Arc<NodeObject>>,
@@ -701,7 +299,6 @@ mod tests {
         assert!(manager.find("memory").is_some());
         assert!(manager.find("MeMoRy").is_some());
         assert!(manager.find("none").is_some());
-        assert!(manager.find("nudb").is_some());
         assert!(manager.find("fjall").is_some());
     }
 
@@ -820,31 +417,6 @@ mod tests {
     }
 
     #[test]
-    fn manager_can_construct_rotating_memory_database() {
-        let manager = ManagerImp::new();
-        let mut writable = section("memory");
-        writable.set("path", "writable");
-        let mut archive = section("memory");
-        archive.set("path", "archive");
-
-        let database = manager
-            .make_rotating_database(
-                0,
-                Arc::new(crate::DummyScheduler),
-                1,
-                &writable,
-                &archive,
-                &writable,
-                Arc::new(NullJournal),
-            )
-            .expect("rotating database");
-
-        assert_eq!(database.get_name(), "writable");
-        assert_eq!(database.fd_required(), 0);
-        database.stop();
-    }
-
-    #[test]
     fn manager_clamps_non_positive_read_threads_before_constructing_databases() {
         let manager = ManagerImp::new();
         let scheduler: Arc<dyn Scheduler> = Arc::new(crate::DummyScheduler);
@@ -887,164 +459,6 @@ mod tests {
             Some(&JsonValue::Signed(1))
         );
         negative_threads.stop();
-
-        let mut writable = section("memory");
-        writable.set("path", "writable");
-        let mut archive = section("memory");
-        archive.set("path", "archive");
-        let rotating = manager
-            .make_rotating_database(
-                0,
-                Arc::clone(&scheduler),
-                0,
-                &writable,
-                &archive,
-                &writable,
-                journal,
-            )
-            .expect("rotating zero read threads should clamp to one");
-        let JsonValue::Object(rotating_counts) = rotating.get_counts_json() else {
-            panic!("database counts should be a JSON object");
-        };
-        assert_eq!(
-            rotating_counts.get("read_threads_total"),
-            Some(&JsonValue::Signed(1))
-        );
-        rotating.stop();
-    }
-
-    #[test]
-    fn manager_make_backend_with_context_prefers_factory_context_path_and_falls_back() {
-        let manager = ManagerImp {
-            factories: std::sync::Mutex::new(Vec::new()),
-        };
-        let context_seen = Arc::new(AtomicBool::new(false));
-        let deterministic_opened = Arc::new(AtomicBool::new(false));
-        let app_type = Arc::new(AtomicU64::new(0));
-        let uid = Arc::new(AtomicU64::new(0));
-        let salt = Arc::new(AtomicU64::new(0));
-
-        manager.insert(Arc::new(ContextFactory {
-            context_supported: true,
-            context_seen: Arc::clone(&context_seen),
-            deterministic_opened: Arc::clone(&deterministic_opened),
-            app_type: Arc::clone(&app_type),
-            uid: Arc::clone(&uid),
-            salt: Arc::clone(&salt),
-        }));
-
-        let mut config = section("context");
-        let mut marker = false;
-        let backend = manager
-            .make_backend_with_context(
-                &config,
-                0,
-                Arc::new(crate::DummyScheduler),
-                &mut marker,
-                Arc::new(NullJournal),
-            )
-            .expect("context backend");
-        assert_eq!(backend.get_name(), "deterministic");
-        assert!(marker);
-        assert!(context_seen.load(Ordering::Relaxed));
-
-        let fallback_manager = ManagerImp {
-            factories: std::sync::Mutex::new(Vec::new()),
-        };
-        fallback_manager.insert(Arc::new(ContextFactory {
-            context_supported: false,
-            context_seen: Arc::new(AtomicBool::new(false)),
-            deterministic_opened: Arc::new(AtomicBool::new(false)),
-            app_type: Arc::new(AtomicU64::new(0)),
-            uid: Arc::new(AtomicU64::new(0)),
-            salt: Arc::new(AtomicU64::new(0)),
-        }));
-        config.set("type", "context");
-        let mut fallback_marker = false;
-        let backend = fallback_manager
-            .make_backend_with_context(
-                &config,
-                0,
-                Arc::new(crate::DummyScheduler),
-                &mut fallback_marker,
-                Arc::new(NullJournal),
-            )
-            .expect("fallback backend");
-        assert_eq!(backend.get_name(), "deterministic");
-        assert!(!fallback_marker);
-    }
-
-    #[test]
-    fn manager_make_database_deterministic_preserves_backend_open_arguments() {
-        let manager = ManagerImp {
-            factories: std::sync::Mutex::new(Vec::new()),
-        };
-        let deterministic_opened = Arc::new(AtomicBool::new(false));
-        let app_type = Arc::new(AtomicU64::new(0));
-        let uid = Arc::new(AtomicU64::new(0));
-        let salt = Arc::new(AtomicU64::new(0));
-
-        manager.insert(Arc::new(ContextFactory {
-            context_supported: false,
-            context_seen: Arc::new(AtomicBool::new(false)),
-            deterministic_opened: Arc::clone(&deterministic_opened),
-            app_type: Arc::clone(&app_type),
-            uid: Arc::clone(&uid),
-            salt: Arc::clone(&salt),
-        }));
-
-        let config = section("context");
-        let database = manager
-            .make_database_deterministic(
-                0,
-                Arc::new(crate::DummyScheduler),
-                1,
-                &config,
-                7,
-                11,
-                13,
-                Arc::new(NullJournal),
-            )
-            .expect("deterministic database");
-
-        assert!(deterministic_opened.load(Ordering::Relaxed));
-        assert_eq!(app_type.load(Ordering::Relaxed), 7);
-        assert_eq!(uid.load(Ordering::Relaxed), 11);
-        assert_eq!(salt.load(Ordering::Relaxed), 13);
-        database.stop();
-    }
-
-    #[test]
-    fn manager_make_backend_with_typed_nudb_context_prefers_typed_factory_path() {
-        let manager = ManagerImp {
-            factories: std::sync::Mutex::new(Vec::new()),
-        };
-        let context_seen = Arc::new(AtomicBool::new(false));
-
-        manager.insert(Arc::new(ContextFactory {
-            context_supported: true,
-            context_seen: Arc::clone(&context_seen),
-            deterministic_opened: Arc::new(AtomicBool::new(false)),
-            app_type: Arc::new(AtomicU64::new(0)),
-            uid: Arc::new(AtomicU64::new(0)),
-            salt: Arc::new(AtomicU64::new(0)),
-        }));
-
-        let config = section("context");
-        let mut context = NuDbContext::new(1, 2, 3);
-        let backend = manager
-            .make_backend_with_nudb_context(
-                &config,
-                0,
-                Arc::new(crate::DummyScheduler),
-                &mut context,
-                Arc::new(NullJournal),
-            )
-            .expect("typed NuDB context backend");
-
-        assert_eq!(backend.get_name(), "deterministic");
-        assert!(context_seen.load(Ordering::Relaxed));
-        assert_eq!(context, NuDbContext::new(17, 19, 23));
     }
 
     #[test]

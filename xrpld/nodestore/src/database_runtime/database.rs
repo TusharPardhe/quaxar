@@ -237,30 +237,6 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
     }
 }
 
-/// reference-style rotating owner extension.
-pub trait DatabaseRotating: Database {
-    /// Enable archive-read copy-forward for the complete rotation exposure
-    /// window, from cache freshening until `rotate` returns.
-    fn set_rotation_in_flight(&self, in_flight: bool);
-
-    /// Copy archive-resident objects into the current writable generation as
-    /// one bounded maintenance batch. Implementations must complete the write
-    /// synchronously before returning so online deletion can safely rotate the
-    /// archive afterward. The return value is the number of archive objects
-    /// submitted to the writable backend; hashes already present there and
-    /// hashes missing from both backends are not counted.
-    fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String>;
-
-    fn copy_to_writable_batch_detailed(
-        &self,
-        hashes: &[Uint256],
-    ) -> Result<(usize, Vec<Uint256>), String>;
-
-    fn store_account_nodes(&self, nodes: Vec<(Uint256, Blob)>) -> Result<(), String>;
-
-    fn rotate(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str));
-}
-
 /// Backward-compatible alias while older Rust modules migrate to the direct
 /// `Database` trait name.
 pub trait DatabaseSurface: Database {}
@@ -709,10 +685,7 @@ impl DatabaseRuntime {
     /// Admission limits (key/callback/byte) are evaluated per item exactly as
     /// in `async_fetch`; rejected items are delivered as cancelled after the
     /// lock is released.
-    pub fn async_fetch_batch(
-        &self,
-        requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>,
-    ) {
+    pub fn async_fetch_batch(&self, requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>) {
         if requests.is_empty() {
             return;
         }

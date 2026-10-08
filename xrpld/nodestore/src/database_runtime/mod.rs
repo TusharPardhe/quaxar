@@ -1,7 +1,6 @@
 pub mod batch_writer;
 pub mod database;
 pub mod database_node_imp;
-pub mod database_rotating;
 pub mod factory;
 pub mod journal;
 pub mod manager;
