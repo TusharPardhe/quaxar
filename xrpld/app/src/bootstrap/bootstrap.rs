@@ -4324,14 +4324,36 @@ fn attach_production_shamap_store_runtime(
             }
             // Lower the advertised complete_ledgers range to the retained floor
             // in lockstep with the prune cursor, so peers are never told about
-            // ledgers whose nodes may already be deleted (design Case 18).
-            if let Some(ledger_master_runtime) = root.ledger_master_runtime() {
-                driver.set_on_floor_advanced(Box::new(move |retained_floor| {
-                    ledger_master_runtime
-                        .ledger_master()
-                        .clear_prior_ledgers(retained_floor);
-                }));
-            }
+            // ledgers whose nodes may already be deleted (design Case 18), and
+            // delete relational history (Ledgers/Transactions/AccountTransactions)
+            // below the same floor, which the removed rotation worker used to
+            // do. This runs on the pruned-store worker, never on the publish
+            // path; SQL deletes run only when the floor actually advances and
+            // proceed in bounded batches with back-off.
+            let ledger_master_runtime = root.ledger_master_runtime();
+            let relational = root.relational_database().clone();
+            let last_sql_floor = std::sync::atomic::AtomicU32::new(0);
+            driver.set_on_floor_advanced(Box::new(move |retained_floor| {
+                if let Some(runtime) = &ledger_master_runtime {
+                    runtime.ledger_master().clear_prior_ledgers(retained_floor);
+                }
+                let previous = last_sql_floor.load(std::sync::atomic::Ordering::Acquire);
+                if retained_floor > previous.max(1)
+                    && let Some(relational) = &relational
+                {
+                    use crate::shamap::shamap_store_relational::SHAMapStoreRelationalRuntime as _;
+                    match relational.clear_prior(retained_floor, &|| false) {
+                        Ok(()) => last_sql_floor
+                            .store(retained_floor, std::sync::atomic::Ordering::Release),
+                        Err(error) => tracing::warn!(
+                            target: "nodestore",
+                            retained_floor,
+                            %error,
+                            "relational history clear below the retained floor failed"
+                        ),
+                    }
+                }
+            }));
             component = component.with_pruned_driver(driver);
         }
         let _ = root.attach_shamap_store_component(Arc::new(component));

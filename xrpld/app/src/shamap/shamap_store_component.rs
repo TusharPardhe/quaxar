@@ -106,13 +106,9 @@ impl SHAMapStoreComponent {
         // batch is atomic, so a failed claim is retried as a gap on the next
         // ledger rather than corrupting state.
         if let Some(pruned) = &self.inner.pruned {
-            if let Err(error) = pruned.on_validated_ledger(Arc::clone(&ledger)) {
-                tracing::warn!(
-                    target: "nodestore",
-                    %error,
-                    "pruned store claim/maintain failed; will re-diff on the next ledger"
-                );
-            }
+            // Hand off to the pruned-store worker: the validated-ledger publish
+            // path must not wait on diffing, pruning or fsync.
+            pruned.submit(Arc::clone(&ledger));
         }
         self.store()
             .lock()
@@ -163,7 +159,18 @@ impl SHAMapStoreComponent {
         self.inner
             .can_delete
             .store(effective_can_delete, Ordering::Release);
+        self.publish_can_delete(effective_can_delete);
         Ok(can_delete)
+    }
+
+    /// Push the effective advisory cap into the pruned driver so the next
+    /// prune target honours it immediately.
+    fn publish_can_delete(&self, effective_can_delete: u32) {
+        if let Some(pruned) = &self.inner.pruned {
+            pruned
+                .can_delete_handle()
+                .store(effective_can_delete, Ordering::Release);
+        }
     }
 
     pub fn saved_state(&self) -> SHAMapStoreSavedState {
@@ -190,6 +197,10 @@ impl ManagedComponent for SHAMapStoreComponent {
         self.inner
             .can_delete
             .store(store.get_can_delete(), Ordering::Release);
+        self.publish_can_delete(store.get_can_delete());
+        if let Some(pruned) = &self.inner.pruned {
+            pruned.spawn_worker();
+        }
         // `store.start` is a no-op for the single/pruned stores (delete_interval
         // is zero): the rotating online-delete worker was removed, and the
         // fjall path prunes through `on_ledger_closed` -> PrunedDriver instead.
@@ -203,6 +214,9 @@ impl ManagedComponent for SHAMapStoreComponent {
     }
 
     fn stop(&self) {
+        if let Some(pruned) = &self.inner.pruned {
+            pruned.stop_worker();
+        }
         let mut store = self
             .store()
             .lock()

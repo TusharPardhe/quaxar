@@ -368,3 +368,151 @@ fn pruned_store_periodic_verify_passes_when_nodes_present() {
     drop(driver);
     let _ = std::fs::remove_dir_all(&path);
 }
+
+/// A ledger with `accounts` state leaves, so the state tree has inner nodes
+/// below the root. `backed` marks both trees as store-backed, which lets
+/// `release_to_disk` drop resident children like a long-running node does.
+fn wide_ledger(seq: u32, accounts: u8, backed: bool) -> Ledger {
+    let mut state = MutableTree::new(1);
+    for byte in 0..accounts {
+        // Vary only the first account each ledger so most leaves are shared.
+        let sequence = if byte == 0 { seq } else { 1 };
+        state
+            .add_item(
+                SHAMapNodeType::AccountState,
+                account_item(account(byte.wrapping_mul(7).wrapping_add(1)), sequence),
+            )
+            .expect("account inserts");
+    }
+    let mut tx = MutableTree::new(1);
+    tx.add_item(
+        SHAMapNodeType::TransactionNm,
+        SHAMapItem::new(
+            Uint256::from_array([seq as u8; 32]),
+            vec![seq as u8 + 1; 12],
+        ),
+    )
+    .expect("tx inserts");
+    let mut identity = |node| node;
+    state.flush_dirty(&mut identity);
+    tx.flush_dirty(&mut identity);
+    Ledger::from_maps(
+        LedgerHeader {
+            seq,
+            close_time: 700 + seq,
+            close_time_resolution: LEDGER_DEFAULT_TIME_RESOLUTION,
+            account_hash: state.root().get_hash(),
+            ..LedgerHeader::default()
+        },
+        SyncTree::from_root_with_type(
+            state.root(),
+            SHAMapType::State,
+            backed,
+            seq,
+            SyncState::Modifying,
+        ),
+        SyncTree::from_root_with_type(
+            tx.root(),
+            SHAMapType::Transaction,
+            backed,
+            seq,
+            SyncState::Modifying,
+        ),
+    )
+}
+
+// A long-running node releases validated subtrees from memory and reads them
+// back from the store on demand. The claim diff must fetch those nodes and
+// produce the same delta as a fully resident ledger; it must never claim a
+// partial delta (which would leave live nodes for the orphan sweep).
+#[test]
+fn claim_over_a_released_backed_ledger_matches_the_resident_delta() {
+    let config = PrunedConfig {
+        online_delete: 1_000_000,
+        can_delete: u32::MAX,
+        prune_mode: PruneMode::On,
+        prune_batch: 64,
+        verify_interval_secs: 0,
+    };
+
+    // Reference: resident ledgers.
+    let (ref_backend, ref_path) = open_fjall_backend("resident");
+    let reference = PrunedDriver::open(Arc::clone(&ref_backend), config).expect("driver");
+    for seq in 1..=3u32 {
+        let ledger = wide_ledger(seq, 40, false);
+        flush_ledger_nodes(&reference, &ledger);
+        reference
+            .on_validated_ledger(Arc::new(ledger))
+            .expect("claim");
+    }
+
+    // Same ledgers, but backed and released to disk before each claim.
+    let (backend, path) = open_fjall_backend("released");
+    let driver = PrunedDriver::open(Arc::clone(&backend), config).expect("driver");
+    for seq in 1..=3u32 {
+        let ledger = wide_ledger(seq, 40, true);
+        flush_ledger_nodes(&driver, &ledger);
+        ledger.state_map().release_to_disk();
+        driver
+            .on_validated_ledger(Arc::new(ledger))
+            .expect("a released backed ledger must claim through the store fetcher");
+    }
+
+    let count_rows = |backend: &Arc<dyn Backend>| {
+        let mut rows = Vec::new();
+        backend
+            .kv_range(Keyspace::Counts, &[], &[0xFF; 64], &mut |key, value| {
+                rows.push((key.to_vec(), value.to_vec()));
+                true
+            })
+            .expect("range");
+        rows
+    };
+    assert_eq!(driver.metrics().claimed_seq, Some(3));
+    assert_eq!(
+        count_rows(&backend),
+        count_rows(&ref_backend),
+        "released and resident ledgers must yield identical reference counts"
+    );
+
+    drop((driver, reference));
+    let _ = std::fs::remove_dir_all(&path);
+    let _ = std::fs::remove_dir_all(&ref_path);
+}
+
+// Production path: the component hands ledgers to the worker with submit(),
+// which returns immediately; the worker claims them off the publish path.
+#[test]
+fn submitted_ledgers_are_claimed_by_the_worker() {
+    let (backend, path) = open_fjall_backend("worker");
+    let config = PrunedConfig {
+        online_delete: 3,
+        can_delete: u32::MAX,
+        prune_mode: PruneMode::On,
+        prune_batch: 64,
+        verify_interval_secs: 0,
+    };
+    let driver = Arc::new(PrunedDriver::open(Arc::clone(&backend), config).expect("driver"));
+    driver.spawn_worker();
+    for seq in 1..=6u32 {
+        let ledger = example_ledger(seq);
+        flush_ledger_nodes(&driver, &ledger);
+        driver.submit(Arc::new(ledger));
+        // Let the worker drain each ledger so every one is claimed in order.
+        for _ in 0..200 {
+            if driver.metrics().claimed_seq == Some(seq) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    let metrics = driver.metrics();
+    driver.stop_worker();
+    assert_eq!(metrics.claimed_seq, Some(6), "worker claimed every ledger");
+    assert!(
+        metrics.pruned_to >= 2,
+        "worker pruned behind the window: {metrics:?}"
+    );
+    drop(driver);
+    let _ = std::fs::remove_dir_all(&path);
+}

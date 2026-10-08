@@ -1,75 +1,84 @@
 //! Drives the pruned node store from the stream of validated ledgers.
 //!
 //! When `[node_db] type = fjall`, the SHAMap store component holds a
-//! `PrunedDriver` instead of running the rotation worker. On each validated
-//! ledger the driver computes the node delta against the previously claimed
-//! ledger ([`compute_claim_delta`]), claims it into the pruned index, and
-//! advances pruning to the retention-window floor. It keeps the last claimed
-//! ledger resident so the next diff has a `have` tree to compare against;
-//! holding one extra ledger is cheap relative to the window the store already
-//! retains.
+//! `PrunedDriver`. Validated ledgers are handed to [`PrunedDriver::submit`],
+//! which only records the newest ledger and wakes a dedicated worker thread,
+//! so the validated-ledger publish path never does pruning I/O. The worker
+//! computes the node delta against the previously claimed ledger
+//! ([`compute_claim_delta`]), claims it, advances pruning to the window floor,
+//! and periodically verifies. Intermediate ledgers can be skipped under load:
+//! the next claim diffs across the gap against the last claimed state, which
+//! yields a larger but still exact delta.
 
-use crate::shamap::pruned_claim::compute_claim_delta;
+use crate::shamap::pruned_claim::{ClaimNodeFetcher, compute_claim_delta};
+use basics::sha_map_hash::SHAMapHash;
 use ledger::Ledger;
-use nodestore::{PruneMode, PrunedConfig, PrunedMetrics, PrunedStore};
-use std::sync::{Arc, Mutex};
+use nodestore::{
+    Backend, DecodedBlob, Keyspace, PruneMode, PrunedConfig, PrunedMetrics, PrunedStore,
+};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 /// Owns the pruned store and the bookkeeping the claim path needs across
-/// ledgers. Cheap to clone-share via `Arc`; all mutable state is behind one
-/// mutex so claims stay serialized (design R1).
+/// ledgers. All claim/prune work is serialized on one worker (design R1).
 pub struct PrunedDriver {
     store: Arc<PrunedStore>,
+    /// Reads backed SHAMap nodes from this store when a validated ledger's
+    /// subtree is not resident, so claim deltas are complete.
+    fetch: Arc<ClaimNodeFetcher>,
     /// The last ledger claimed into the index. The next claim diffs against
     /// its state tree. `None` until the first (anchor) claim.
     last_claimed: Mutex<Option<Arc<Ledger>>>,
-    /// Invoked after a prune that actually deleted nodes. The integration
-    /// layer uses it to invalidate the FullBelowCache, whose "subtree fully
-    /// present" claims can otherwise go stale once pruning removes nodes
-    /// (design Case 16). A whole-cache clear is correct and matches what the
-    /// rotation path did; a per-hash removal would be a later optimization.
+    /// Invoked after a prune that actually deleted nodes, to invalidate the
+    /// FullBelowCache (design Case 16).
     on_prune: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    /// Invoked after every prune with the new retained floor (the oldest
-    /// validated ledger still fully retained, `pruned_to + 1`). The integration
-    /// layer lowers the advertised `complete_ledgers` range to this floor so a
-    /// peer is never told about a ledger whose nodes may already be deleted
-    /// (design Case 18).
+    /// Invoked after every maintain pass with the retained floor
+    /// (`pruned_to + 1`), to lower the advertised `complete_ledgers` (Case 18).
     on_floor_advanced: Mutex<Option<Box<dyn Fn(u32) + Send + Sync>>>,
-    /// When the last sampled verify ran. `None` until the first one, so the
-    /// first eligible validated ledger triggers an initial verify.
+    /// When the last sampled verify ran.
     last_verify: Mutex<Option<Instant>>,
+    /// Live advisory prune cap (`can_delete`), updated by the RPC.
+    can_delete: Arc<AtomicU32>,
+    /// Newest validated ledger waiting for the worker (latest wins).
+    pending: Mutex<Option<Arc<Ledger>>>,
+    wake: Condvar,
+    stopping: AtomicBool,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl PrunedDriver {
     pub fn new(store: Arc<PrunedStore>) -> Self {
+        let backend = Arc::clone(store.backend());
         Self {
+            fetch: store_fetcher(backend),
             store,
             last_claimed: Mutex::new(None),
             on_prune: Mutex::new(None),
             on_floor_advanced: Mutex::new(None),
             last_verify: Mutex::new(None),
+            can_delete: Arc::new(AtomicU32::new(u32::MAX)),
+            pending: Mutex::new(None),
+            wake: Condvar::new(),
+            stopping: AtomicBool::new(false),
+            worker: Mutex::new(None),
         }
     }
 
     /// Open a driver over an already-open, key-value-capable backend.
-    pub fn open(
-        backend: Arc<dyn nodestore::Backend>,
-        config: PrunedConfig,
-    ) -> Result<Self, String> {
+    pub fn open(backend: Arc<dyn Backend>, config: PrunedConfig) -> Result<Self, String> {
         let store = PrunedStore::open(backend, config)?;
         Ok(Self::new(Arc::new(store)))
     }
 
-    /// Register a callback run after any prune that deleted nodes. Used to
-    /// invalidate the FullBelowCache so a stale "full below" claim cannot
-    /// survive the removal of nodes beneath it.
+    /// Register a callback run after any prune that deleted nodes.
     pub fn set_on_prune(&self, callback: Box<dyn Fn() + Send + Sync>) {
         *self.on_prune.lock().expect("pruned driver on_prune mutex") = Some(callback);
     }
 
-    /// Register a callback run after every maintain pass with the new retained
-    /// floor. The integration layer uses it to lower `complete_ledgers` in
-    /// lockstep with the prune cursor (design Case 18).
+    /// Register a callback run after every maintain pass with the retained
+    /// floor (design Case 18).
     pub fn set_on_floor_advanced(&self, callback: Box<dyn Fn(u32) + Send + Sync>) {
         *self
             .on_floor_advanced
@@ -77,12 +86,84 @@ impl PrunedDriver {
             .expect("pruned driver on_floor_advanced mutex") = Some(callback);
     }
 
-    /// Claim a validated ledger and advance pruning. Called from the SHAMap
-    /// store component's `on_ledger_closed` for the fjall path.
+    /// Shared handle to the live advisory prune cap. The SHAMap store
+    /// component stores the effective `can_delete` here on every update.
+    pub fn can_delete_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.can_delete)
+    }
+
+    /// Start the worker thread. Idempotent.
+    pub fn spawn_worker(self: &Arc<Self>) {
+        let mut worker = self.worker.lock().expect("pruned driver worker mutex");
+        if worker.is_some() {
+            return;
+        }
+        self.stopping.store(false, Ordering::Release);
+        let driver = Arc::clone(self);
+        *worker = Some(
+            std::thread::Builder::new()
+                .name("pruned-store".to_owned())
+                .spawn(move || driver.run_worker())
+                .expect("spawn pruned-store worker"),
+        );
+    }
+
+    /// Stop the worker after it finishes the ledger in hand.
+    pub fn stop_worker(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.wake.notify_all();
+        if let Some(handle) = self
+            .worker
+            .lock()
+            .expect("pruned driver worker mutex")
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+
+    /// Hand a validated ledger to the worker. Never blocks on store I/O: it
+    /// replaces any ledger the worker has not picked up yet.
+    pub fn submit(&self, ledger: Arc<Ledger>) {
+        *self.pending.lock().expect("pruned driver pending mutex") = Some(ledger);
+        self.wake.notify_one();
+    }
+
+    fn run_worker(&self) {
+        loop {
+            let ledger = {
+                let mut pending = self.pending.lock().expect("pruned driver pending mutex");
+                loop {
+                    if self.stopping.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if let Some(ledger) = pending.take() {
+                        break ledger;
+                    }
+                    pending = self
+                        .wake
+                        .wait(pending)
+                        .expect("pruned driver pending condvar");
+                }
+            };
+            let seq = ledger.header().seq;
+            if let Err(error) = self.on_validated_ledger(ledger) {
+                tracing::warn!(
+                    target: "nodestore",
+                    seq,
+                    %error,
+                    "pruned store claim/maintain failed; will re-diff on the next ledger"
+                );
+            }
+        }
+    }
+
+    /// Claim a validated ledger, advance pruning and periodically verify. The
+    /// worker calls this; tests call it directly for determinism.
     ///
-    /// Errors are returned rather than panicking: the caller logs them and
-    /// keeps serving, since a failed claim leaves the index unchanged (the
-    /// batch is atomic) and the next ledger re-diffs across the gap.
+    /// A delta that cannot be computed completely (a backed node neither
+    /// resident nor in the store) aborts before the index is touched, so a
+    /// partial claim can never strand live nodes for the orphan sweep.
     pub fn on_validated_ledger(&self, ledger: Arc<Ledger>) -> Result<(), String> {
         let seq = ledger.header().seq;
         let state_root = *ledger.header().account_hash.as_uint256();
@@ -91,27 +172,31 @@ impl PrunedDriver {
             .last_claimed
             .lock()
             .expect("pruned driver last-claimed mutex");
+        if let Some(prev) = last.as_ref()
+            && seq <= prev.header().seq
+        {
+            return Ok(());
+        }
         let delta = {
             let prev_state = last.as_ref().map(|l| l.state_map());
-            compute_claim_delta(ledger.as_ref(), prev_state, state_root)
+            compute_claim_delta(ledger.as_ref(), prev_state, state_root, self.fetch.as_ref())?
         };
         self.store.claim(&delta)?;
-        let pruned = self.store.maintain(seq)?;
         *last = Some(Arc::clone(&ledger));
         drop(last);
-        if pruned > 0 {
-            if let Some(callback) = self
+
+        let pruned = self
+            .store
+            .maintain(seq, self.can_delete.load(Ordering::Acquire))?;
+        if pruned > 0
+            && let Some(callback) = self
                 .on_prune
                 .lock()
                 .expect("pruned driver on_prune mutex")
                 .as_ref()
-            {
-                callback();
-            }
+        {
+            callback();
         }
-        // Lower the advertised range to the new retained floor every pass, in
-        // lockstep with the prune cursor, so a peer is never told about a
-        // ledger whose nodes may already be deleted (design Case 18).
         if let Some(callback) = self
             .on_floor_advanced
             .lock()
@@ -120,18 +205,13 @@ impl PrunedDriver {
         {
             callback(self.store.metrics().retained_floor);
         }
-        // Periodic sampled verify (design Stage 4 `verify_interval`): on an
-        // interval, confirm every node reachable from the just-claimed ledger's
-        // state and tx trees is physically present. A miss is a correctness
-        // failure recorded in `verify_last_ok` (and surfaced via get_counts).
-        // This is a sampled safety net over the latest validated ledger, not a
-        // full retained-window walk.
-        self.maybe_verify(ledger.as_ref())?;
-        Ok(())
+        self.maybe_verify(ledger.as_ref())
     }
 
-    /// Run a sampled verify of `ledger`'s reachable nodes if `verify_interval`
-    /// has elapsed since the last one. `verify_interval_secs == 0` disables it.
+    /// Run a verify of `ledger`'s reachable nodes plus the window-wide count
+    /// check if `verify_interval` has elapsed. A miss halts pruning
+    /// permanently (design Case 11): deleting more nodes on top of a known
+    /// inconsistency could make it unrecoverable.
     fn maybe_verify(&self, ledger: &Ledger) -> Result<(), String> {
         let interval = self.store.verify_interval_secs();
         if interval == 0 {
@@ -145,35 +225,31 @@ impl PrunedDriver {
                 return Ok(());
             }
         }
-        // Collect every node hash reachable from the latest ledger's trees.
         let mut required = std::collections::BTreeSet::new();
         for tree in [ledger.state_map(), ledger.tx_map()] {
-            let mut fetch = |_hash| None;
-            let _ = tree.visit_nodes(&mut fetch, &mut |node| {
+            let mut fetch = |hash| (self.fetch)(hash);
+            tree.visit_nodes(&mut fetch, &mut |node| {
                 required.insert(*node.get_hash().as_uint256());
                 true
-            });
-        }
-        if required.is_empty() {
-            return Ok(());
+            })
+            .map_err(|error| format!("verify traversal failed: {error:?}"))?;
         }
         let report = self.store.verify(&required, 1)?;
-        // Also run the window-wide count-consistency check: every shared-state
-        // node (count >= 1) across the whole retained window must be present,
-        // not just the latest ledger's reachable set (design full-window
-        // verify).
         let window = self.store.verify_window()?;
         *self.last_verify.lock().expect("pruned driver verify mutex") = Some(Instant::now());
         if !report.is_ok() || !window.is_ok() {
-            return Err(format!(
+            self.store.halt_pruning();
+            let message = format!(
                 "pruned store verify failed at seq {}: {} of {} latest-ledger nodes missing, \
-                 {} of {} windowed count nodes missing",
+                 {} of {} windowed count nodes missing; pruning halted",
                 ledger.header().seq,
                 report.missing.len(),
                 report.checked,
                 window.missing.len(),
                 window.checked
-            ));
+            );
+            tracing::error!(target: "nodestore", "{message}");
+            return Err(message);
         }
         Ok(())
     }
@@ -185,6 +261,29 @@ impl PrunedDriver {
     pub fn store(&self) -> &Arc<PrunedStore> {
         &self.store
     }
+}
+
+impl Drop for PrunedDriver {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+}
+
+/// Node-store reader for backed SHAMap traversal during claims and verify.
+fn store_fetcher(backend: Arc<dyn Backend>) -> Arc<ClaimNodeFetcher> {
+    Arc::new(move |hash: SHAMapHash| {
+        let bytes = backend
+            .kv_get(Keyspace::Nodes, hash.as_uint256().as_slice())
+            .ok()
+            .flatten()?;
+        let decoded = DecodedBlob::new(hash.as_uint256().data(), &bytes);
+        if !decoded.was_ok() {
+            return None;
+        }
+        let object = decoded.create_object();
+        shamap::nodes::tree_node::SHAMapTreeNode::make_from_prefix(object.data(), hash).ok()
+    })
 }
 
 /// Read the pruned-store configuration from a `[node_db]` section. Unknown or
