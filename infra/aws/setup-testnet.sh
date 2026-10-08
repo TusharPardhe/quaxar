@@ -151,9 +151,8 @@ protocol = peer
 medium
 
 [node_db]
-type = NuDB
-path = /var/lib/quaxar/db/nudb
-fast_load = 1
+type = fjall
+path = /var/lib/quaxar/db/fjall
 online_delete = 256
 advisory_delete = 0
 
