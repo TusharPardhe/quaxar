@@ -152,11 +152,17 @@ pub fn pruned_config_from_section(
         .flatten()
         .filter(|&n| n > 0)
         .unwrap_or(10_000);
+    let verify_interval_secs = node_db
+        .get::<u64>("verify_interval")
+        .ok()
+        .flatten()
+        .unwrap_or(3600);
     PrunedConfig {
         online_delete,
         can_delete,
         prune_mode,
         prune_batch,
+        verify_interval_secs,
     }
 }
 
@@ -170,10 +176,12 @@ mod tests {
         let mut section = Section::new("node_db");
         section.set("prune_mode", "dry_run");
         section.set("prune_batch", "500");
+        section.set("verify_interval", "900");
         let config = pruned_config_from_section(&section, 512, u32::MAX);
         assert_eq!(config.prune_mode, PruneMode::DryRun);
         assert_eq!(config.prune_batch, 500);
         assert_eq!(config.online_delete, 512);
+        assert_eq!(config.verify_interval_secs, 900);
     }
 
     #[test]

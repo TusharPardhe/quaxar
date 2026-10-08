@@ -161,6 +161,7 @@ fn pruned_store_dedup_and_retention_without_pruning() {
         can_delete: u32::MAX,
         prune_mode: PruneMode::On,
         prune_batch: 64,
+        verify_interval_secs: 0,
     };
     let driver = PrunedDriver::open(Arc::clone(&backend), config).expect("driver opens");
 
@@ -191,6 +192,7 @@ fn pruned_store_prunes_old_ledgers_and_keeps_the_window() {
         can_delete: u32::MAX,
         prune_mode: PruneMode::On,
         prune_batch: 64,
+        verify_interval_secs: 0,
     };
     let driver = PrunedDriver::open(Arc::clone(&backend), config).expect("driver opens");
 
@@ -242,6 +244,7 @@ fn pruned_store_dry_run_keeps_everything() {
         can_delete: u32::MAX,
         prune_mode: PruneMode::DryRun,
         prune_batch: 64,
+        verify_interval_secs: 0,
     };
     let driver = PrunedDriver::open(Arc::clone(&backend), config).expect("driver opens");
 
@@ -280,6 +283,7 @@ fn pruned_store_reports_retained_floor_in_lockstep_with_prune() {
         can_delete: u32::MAX,
         prune_mode: PruneMode::On,
         prune_batch: 64,
+        verify_interval_secs: 0,
     };
     let driver = PrunedDriver::open(Arc::clone(&backend), config).expect("driver opens");
 

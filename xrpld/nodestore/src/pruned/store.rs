@@ -35,6 +35,8 @@ pub struct PrunedConfig {
     pub prune_mode: PruneMode,
     /// Notebook rows processed per prune batch.
     pub prune_batch: usize,
+    /// Seconds between sampled verify passes (`0` disables periodic verify).
+    pub verify_interval_secs: u64,
 }
 
 impl Default for PrunedConfig {
@@ -44,6 +46,7 @@ impl Default for PrunedConfig {
             can_delete: u32::MAX,
             prune_mode: PruneMode::On,
             prune_batch: 10_000,
+            verify_interval_secs: 3600,
         }
     }
 }
