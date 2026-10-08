@@ -2,8 +2,9 @@
 //! v2 surface the pruned store needs (per-key deletes, multiple keyspaces,
 //! atomic cross-keyspace batches, ordered range scans, an explicit durability
 //! barrier). It also serves the legacy hash -> NodeObject API from its `nodes`
-//! keyspace using the same `EncodedBlob`/`DecodedBlob` codec as RocksDB, so
-//! snapshot export/import and db-stats see an identical byte format.
+//! keyspace using the same `EncodedBlob`/`DecodedBlob` codec as the legacy
+//! node store, so snapshot export/import and db-stats see an identical byte
+//! format.
 
 use crate::backends::kv::{Keyspace, KvBatch, KvOp, PersistMode};
 use crate::{
@@ -38,6 +39,22 @@ fn read_cache_bytes(section: &Section) -> u64 {
         .unwrap_or(DEFAULT_CACHE_BYTES)
 }
 
+/// Default disk-full ballast, in MB, when the operator does not set
+/// `reserve_mb`. One GiB gives LSM compaction and tombstone deletes room to
+/// run once the ballast is released under disk pressure (design Case 10).
+const DEFAULT_RESERVE_MB: u64 = 1024;
+
+/// Resolve the ballast size in bytes. `reserve_mb = 0` disables it; absence
+/// uses the default.
+fn read_reserve_bytes(section: &Section) -> u64 {
+    section
+        .get::<u64>("reserve_mb")
+        .ok()
+        .flatten()
+        .unwrap_or(DEFAULT_RESERVE_MB)
+        .saturating_mul(1024 * 1024)
+}
+
 /// The open fjall database and its four keyspace handles, resolved once at
 /// open so every operation is a direct handle call.
 struct OpenDb {
@@ -63,6 +80,11 @@ pub struct FjallBackend {
     name: String,
     path: String,
     cache_bytes: u64,
+    /// Disk-full ballast size in bytes (design Case 10). A file of this size is
+    /// created at open so that, when free space runs out, deleting it frees
+    /// enough room for LSM compaction and tombstone-driven deletes to proceed.
+    /// Zero disables the ballast.
+    reserve_bytes: u64,
     journal: Arc<dyn NodeStoreJournal>,
     db: Mutex<Option<Arc<OpenDb>>>,
     // When set (via set_delete_path, used by rotation to retire an archive),
@@ -83,10 +105,77 @@ impl FjallBackend {
             name: path.clone(),
             path,
             cache_bytes: read_cache_bytes(key_values),
+            reserve_bytes: read_reserve_bytes(key_values),
             journal,
             db: Mutex::new(None),
             delete_on_close: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Absolute path of the disk-full ballast file for this store.
+    fn reserve_path(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.path).join(".reserve_ballast")
+    }
+
+    /// Create the ballast file if a reserve is configured and it is absent.
+    /// Best effort: a filesystem that cannot allocate it (e.g. already full)
+    /// is logged, not fatal, so the node still opens and can prune.
+    fn ensure_reserve(&self) {
+        if self.reserve_bytes == 0 {
+            return;
+        }
+        let path = self.reserve_path();
+        let present = std::fs::metadata(&path)
+            .map(|m| m.len() >= self.reserve_bytes)
+            .unwrap_or(false);
+        if present {
+            return;
+        }
+        match std::fs::File::create(&path).and_then(|file| {
+            file.set_len(self.reserve_bytes)?;
+            Ok(())
+        }) {
+            Ok(()) => tracing::info!(
+                target: "nodestore",
+                path = %path.display(),
+                reserve_bytes = self.reserve_bytes,
+                "fjall disk-full ballast reserved"
+            ),
+            Err(error) => tracing::warn!(
+                target: "nodestore",
+                path = %path.display(),
+                %error,
+                "could not create fjall disk-full ballast (continuing without reserve)"
+            ),
+        }
+    }
+
+    /// Release the ballast so freed space is available for compaction and
+    /// deletes under disk pressure (design Case 10). Returns true if a ballast
+    /// file was removed. Idempotent.
+    pub fn release_reserve(&self) -> bool {
+        let path = self.reserve_path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::warn!(
+                    target: "nodestore",
+                    path = %path.display(),
+                    "released fjall disk-full ballast under space pressure"
+                );
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Whether the ballast file is currently present at its configured size.
+    pub fn reserve_present(&self) -> bool {
+        if self.reserve_bytes == 0 {
+            return false;
+        }
+        std::fs::metadata(self.reserve_path())
+            .map(|m| m.len() >= self.reserve_bytes)
+            .unwrap_or(false)
     }
 
     fn open_db(&self) -> Result<Arc<OpenDb>, String> {
@@ -147,6 +236,9 @@ impl Backend for FjallBackend {
             db,
         };
         *guard = Some(Arc::new(open));
+        drop(guard);
+        // Reserve the disk-full ballast once the store is open (design Case 10).
+        self.ensure_reserve();
         Ok(())
     }
 
@@ -430,6 +522,59 @@ mod tests {
             Ok(_) => panic!("backend should require a path"),
             Err(error) => assert_eq!(error, "Missing path in fjall backend"),
         }
+    }
+
+    #[test]
+    fn disk_full_ballast_is_reserved_and_releasable() {
+        let path = temp_path("reserve");
+        let mut cfg = section(&path);
+        // Keep the test cheap: a 1 MiB ballast.
+        cfg.set("reserve_mb", "1");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("open");
+
+        // The ballast exists at the configured size after open.
+        assert!(
+            backend.reserve_present(),
+            "ballast should be reserved at open"
+        );
+        let ballast = std::path::Path::new(&path).join(".reserve_ballast");
+        assert_eq!(
+            std::fs::metadata(&ballast).expect("ballast metadata").len(),
+            1024 * 1024
+        );
+
+        // Releasing it frees the space and is idempotent.
+        assert!(
+            backend.release_reserve(),
+            "first release removes the ballast"
+        );
+        assert!(!backend.reserve_present());
+        assert!(!backend.release_reserve(), "second release is a no-op");
+
+        let _ = backend.close();
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn reserve_mb_zero_disables_the_ballast() {
+        let path = temp_path("reserve-off");
+        let mut cfg = section(&path);
+        cfg.set("reserve_mb", "0");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("open");
+        assert!(
+            !backend.reserve_present(),
+            "zero reserve creates no ballast"
+        );
+        assert!(
+            !std::path::Path::new(&path)
+                .join(".reserve_ballast")
+                .exists(),
+            "no ballast file should exist"
+        );
+        let _ = backend.close();
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
