@@ -501,8 +501,9 @@ As built on branch `feat/fjall-pruned-nodestore`:
   (`complete_ledgers` lowered to the retained floor in lockstep with the prune
   cursor via `PrunedDriver::on_floor_advanced` -> `clear_prior_ledgers`), and
   Case 19 (prune runs unconditionally, no operating-mode gate). The pruned
-  metrics are exposed through RPC `get_counts`, and `verify_interval` is parsed
-  into `PrunedConfig`.
+  metrics are exposed through RPC `get_counts`, and `verify_interval` drives a
+  time-gated sampled verify of the latest ledger's reachable nodes
+  (`verify_last_ok` records the result).
 - Stage 0 harness: a replay-determinism test (one trace -> identical final node
   set on independent replays, matching the ModelStore oracle) plus the
   crash-resume tests (`restart_resumes_from_meta_cursors`,
@@ -518,9 +519,13 @@ As built on branch `feat/fjall-pruned-nodestore`:
   paths/runtime_state`) remain wired into the component's queued-ledger path
   and are a bounded follow-up to excise.
 - Remaining: Stage 5 (the live 48h/72h testnet soak and its benchmark gates,
-  which need a running testnet host), the periodic sampled-verify loop that
-  consumes `verify_interval` (needs the retained-root walker), and the optional
-  server_info halted-state surface (verify_last_ok is already in get_counts).
+  which need a running testnet host), a full retained-window verify walk (the
+  current periodic verify samples the latest ledger's reachable set, a sound
+  safety net but not every retained ledger), the optional server_info
+  halted-state surface (verify_last_ok is already in get_counts), and excising
+  the dormant rotation worker modules (no production caller drives
+  `process_queued_ledger`, but they are still woven into the component's type
+  surface).
 
 ### Stage 0: baseline and harness
 
