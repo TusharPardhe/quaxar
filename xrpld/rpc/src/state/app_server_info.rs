@@ -220,6 +220,37 @@ impl<V: AppServerInfoView> ServerInfoSource for ApplicationServerInfo<V> {
             );
         }
 
+        // Pruned (fjall) store health, when that path is active, so operators
+        // see the retained floor and a verify failure (design Case 11) directly
+        // in server_info rather than only via get_counts.
+        if let Some(metrics) = self
+            .view
+            .app()
+            .and_then(|app| app.shamap_store_service())
+            .and_then(|service| service.component().pruned_metrics())
+        {
+            let mut pruned = BTreeMap::new();
+            if let Some(claimed) = metrics.claimed_seq {
+                pruned.insert(
+                    "claimed_seq".to_owned(),
+                    JsonValue::Unsigned(u64::from(claimed)),
+                );
+            }
+            pruned.insert(
+                "pruned_to".to_owned(),
+                JsonValue::Unsigned(u64::from(metrics.pruned_to)),
+            );
+            pruned.insert(
+                "retained_floor".to_owned(),
+                JsonValue::Unsigned(u64::from(metrics.retained_floor)),
+            );
+            pruned.insert(
+                "verify_last_ok".to_owned(),
+                JsonValue::Bool(metrics.verify_last_ok),
+            );
+            info.insert("pruned_store".to_owned(), JsonValue::Object(pruned));
+        }
+
         JsonValue::Object(info)
     }
 }
