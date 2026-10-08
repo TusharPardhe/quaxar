@@ -9669,7 +9669,7 @@ impl ApplicationRoot {
     /// cache-then-provider path used by ledger serving. A provider result is
     /// canonicalized as a nonvalidated history cache entry; callers must still
     /// apply compatibility, quorum, and publication policy themselves.
-    pub(crate) fn resolve_ledger_by_hash(&self, hash: SHAMapHash) -> Option<Arc<Ledger>> {
+    pub fn resolve_ledger_by_hash(&self, hash: SHAMapHash) -> Option<Arc<Ledger>> {
         let cache_visible_before = self.ledger_master_runtime().is_some_and(|runtime| {
             runtime
                 .ledger_master()

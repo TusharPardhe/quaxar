@@ -307,12 +307,14 @@ impl STAmount {
             panic!("Cannot return non-IOU STAmount as IOUAmount");
         }
 
-        let mantissa = i64::try_from(self.value).expect("IOU mantissa should fit i64");
+        // rippled: `static_cast<std::int64_t>(value_)` then `-mantissa`.
+        // Both wrap in two's complement; mirror that instead of panicking so
+        // non-canonical intermediates produce the same IOUAmount as rippled.
+        let mut mantissa = self.value as i64;
         if self.is_negative {
-            IOUAmount::from_parts(-mantissa, self.offset).expect("canonical IOU should round-trip")
-        } else {
-            IOUAmount::from_parts(mantissa, self.offset).expect("canonical IOU should round-trip")
+            mantissa = mantissa.wrapping_neg();
         }
+        IOUAmount::from_parts(mantissa, self.offset).expect("canonical IOU should round-trip")
     }
 
     pub fn mpt(&self) -> MPTAmount {
@@ -426,9 +428,25 @@ impl STAmount {
         // mantissa drops a final digit >= 5, rippled rounds to nearest while
         // truncation produces a one-unit-lower quality key and a different
         // BookDirectory. This matters for offer quality directory placement.
+        //
+        // rippled reaches IOUAmount through `STAmount::iou()`, which does
+        // `static_cast<std::int64_t>(value_)` and then negates when
+        // `isNegative_` (STAmount.cpp `STAmount::iou`). A raw mantissa above
+        // i64::MAX therefore WRAPS (two's complement) before normalization,
+        // and `operator=(IOUAmount)` takes the sign from the wrapped result.
+        // Arithmetic does produce such mantissas: `divide()` returns
+        // `muldiv(numVal, 1e17, denVal) + 5`, and a native numerator above
+        // ~9.22e16 drops over a 1e15 denominator exceeds 2^63. The network
+        // enshrines the wrapped value: `getRate(1 BOOK, 94024544323757840)`
+        // yields 9.044289641333768e16, which OfferCreate's TickSize rounding
+        // then uses (testnet tx 6407F992, fork 21357187).
+        let mut wrapped = self.value as i64;
+        if self.is_negative {
+            wrapped = wrapped.wrapping_neg();
+        }
         let iou = IOUAmount::from_number(RuntimeNumber::unchecked(
-            self.is_negative,
-            self.value,
+            wrapped < 0,
+            wrapped.unsigned_abs(),
             self.offset,
         ))
         .map_err(|_| AmountError::IssuedOutOfRange)?;
@@ -1085,6 +1103,30 @@ mod tests {
     use crate::stbase::StBase;
     use crate::{AccountID, MPTAmount, MPTIssue, STArray, STObject, get_field_by_symbol};
     use basics::base_uint::Uint192;
+
+    #[test]
+    fn iou_wraps_mantissa_through_int64_like_rippled() {
+        // rippled STAmount::iou(): static_cast<int64_t>(value_), then negate.
+        // A mantissa above i64::MAX wraps negative instead of throwing.
+        let mut issue = crate::no_issue();
+        issue.currency = crate::currency_from_string("USD");
+        let raw = 0x8000_0000_0000_0001u64;
+        let positive = STAmount {
+            core: crate::stbase::StBaseCore::with_field(sf_generic()),
+            asset: issue.clone().into(),
+            value: raw,
+            offset: -15,
+            is_negative: false,
+        };
+        let expected = crate::IOUAmount::from_parts(raw as i64, -15).unwrap();
+        assert_eq!(positive.iou(), expected);
+        assert!(positive.iou().mantissa() < 0);
+
+        let negative = STAmount { is_negative: true, ..positive.clone() };
+        let expected = crate::IOUAmount::from_parts((raw as i64).wrapping_neg(), -15).unwrap();
+        assert_eq!(negative.iou(), expected);
+        assert!(negative.iou().mantissa() > 0);
+    }
 
     #[test]
     fn native_zero_constructor_clears_negative_zero() {
