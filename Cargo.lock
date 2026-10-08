@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acquisition"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "bytes",
@@ -108,7 +108,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "acquisition",
  "arc-swap",
@@ -292,7 +292,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "basics"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "lz4_flex 0.11.6",
@@ -488,7 +488,7 @@ checksum = "ea0095f6103c2a8b44acd6fd15960c801dafebf02e21940360833e0673f48ba7"
 
 [[package]]
 name = "consensus"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "ledger",
@@ -1573,7 +1573,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "ledger"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "overlay",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "nodestore"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arc-swap",
  "basics",
@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "overlay"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "http",
@@ -2061,7 +2061,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "perflog"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "libc",
@@ -2317,7 +2317,7 @@ checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 
 [[package]]
 name = "protocol"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "bs58",
@@ -2373,7 +2373,7 @@ dependencies = [
 
 [[package]]
 name = "quaxar-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64",
  "basics",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "quaxar-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "ipnet",
@@ -2405,7 +2405,7 @@ dependencies = [
 
 [[package]]
 name = "quaxar-main"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "app",
  "base64",
@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "quaxar-metrics"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "rdb"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "protocol",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "resource"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "protocol",
@@ -2858,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "rpc"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "app",
  "basics",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "rpc-integration-tests"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "app",
  "basics",
@@ -3155,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "app",
  "axum",
@@ -3233,7 +3233,7 @@ dependencies = [
 
 [[package]]
 name = "shamap"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "parking_lot",
@@ -3877,7 +3877,7 @@ checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 
 [[package]]
 name = "tx"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "ledger",
@@ -4462,7 +4462,7 @@ dependencies = [
 
 [[package]]
 name = "xrpl_core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "basics",
  "generator",

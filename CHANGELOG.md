@@ -7,6 +7,50 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-08
+
+### Added
+
+- Added a continuously pruned, fjall-backed node store as the sole node-store
+  backend. Each validated ledger is claimed as an exact add/remove delta;
+  reference counts and self-validating death-sequence records drive deletion
+  once nodes fall more than `online_delete` ledgers behind, with incremental
+  and full-window verification that halts pruning on any inconsistency.
+- Added `[node_db] compaction_base_mb` (16-4096, default 256) to size the
+  first leveled-compaction level of the node keyspace, bounding peak space
+  amplification. Testnet and devnet default to 64.
+- Added a disk-full ballast (`reserve_mb`), pruned-aware snapshot load with
+  anchor adoption, and pruned-store health in `server_info` and `get_counts`.
+
+### Changed
+
+- Ported `rippled` Aug-Sept 2026 parity work: serialization and preflight
+  hardening, peer/overlay DoS limits, lending/vault invariant relaxations and
+  precision fixes, and canonical rounding for issued amounts, the NFT royalty
+  cut, and the CLOB/flow strand ordering (several testnet fork fixes with
+  byte-exact regression tests).
+- Improved consensus and acquisition stability: validations processed
+  synchronously, parallel per-session SHAMap read-apply, lock-free status
+  reads, edge-triggered preferred-LCL reconciliation, no mode demotion on a
+  pure forward LCL catch-up, and only trusted UNL proposals influencing
+  consensus.
+
+### Removed
+
+- Removed the NuDB and RocksDB node-store backends, the rotating node store,
+  and the associated clang/librocksdb build chain. `type = fjall` is the
+  default; `NuDB` and `RocksDB` are rejected with a migration hint.
+
+### Credits
+
+- The pruned node-store design follows the work of **@shortthefomo** in
+  [XRPLF/rippled#6549](https://github.com/XRPLF/rippled/pull/6549) (null-backend
+  object-cache, priming-retry and `completeLedgers`/purge-interval fixes) and
+  **@RichardAH** and contributors in
+  [Xahau/xahaud#728](https://github.com/Xahau/xahaud/pull/728) (RWDB null
+  node-store and online-delete behaviour). This release is built on their ideas;
+  thank you.
+
 ### Changed
 
 - Matched consensus child-ledger application semantics: transaction state is
