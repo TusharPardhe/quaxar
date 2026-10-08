@@ -197,6 +197,52 @@ impl PrunedStore {
         *self.metrics.lock().expect("metrics mutex")
     }
 
+    /// Full-window self-verify independent of any external ledger: every node
+    /// that carries an explicit reference count (a node shared across the
+    /// retained window, so count >= 2, or a dead-pending node at count 0) must
+    /// still be physically present in `nodes` unless its count is exactly 0.
+    /// A count >= 1 row whose node is missing is corruption spanning the whole
+    /// retained window, not just the latest ledger. This complements the
+    /// caller-supplied latest-ledger verify with a window-wide invariant the
+    /// store can check from its own index. Records the result in metrics.
+    pub fn verify_window(&self) -> Result<crate::pruned::reconcile::VerifyReport, String> {
+        use crate::backends::kv::Keyspace;
+        let mut report = crate::pruned::reconcile::VerifyReport::default();
+        let backend = self.backend.as_ref();
+        let mut missing = Vec::new();
+        backend.kv_range(Keyspace::Counts, &[], &[0xFF; 64], &mut |key, value| {
+            let Some(hash) = Uint256::from_slice(key) else {
+                return true;
+            };
+            // A count row stores a little-endian u32. Count 0 means dead-pending
+            // (the node may already be gone); count >= 1 means live-shared and
+            // must be present.
+            let count = if value.len() == 4 {
+                u32::from_le_bytes(value.try_into().expect("4 bytes"))
+            } else {
+                0
+            };
+            if count >= 1 {
+                report.checked += 1;
+                if backend
+                    .kv_get(Keyspace::Nodes, hash.as_slice())
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    missing.push(hash);
+                }
+            }
+            true
+        })?;
+        report.missing = missing;
+        {
+            let mut metrics = self.metrics.lock().expect("metrics mutex");
+            metrics.verify_last_ok = metrics.verify_last_ok && report.is_ok();
+        }
+        Ok(report)
+    }
+
     /// Seconds between sampled verify passes (`0` disables periodic verify).
     pub fn verify_interval_secs(&self) -> u64 {
         self.config.verify_interval_secs
@@ -436,6 +482,44 @@ mod tests {
         let required: std::collections::BTreeSet<Uint256> = [hid(1), hid(2)].into_iter().collect();
         let report = store.verify(&required, 1).expect("verify");
         assert!(!report.is_ok(), "hid(2) is missing");
+        assert!(!store.metrics().verify_last_ok);
+    }
+
+    #[test]
+    fn verify_window_flags_a_missing_shared_state_node() {
+        use crate::backends::kv::{Keyspace, KvBatch};
+        let store = PrunedStore::open(open_memory(), PrunedConfig::default()).expect("open");
+
+        // A shared-state node carries a count >= 2 row and must be present.
+        let shared = hid(0xBEEF);
+        let present = node(shared);
+        store.store(&present, 1).expect("store");
+        let mut counts = KvBatch::new();
+        counts.put(
+            Keyspace::Counts,
+            shared.as_slice().to_vec(),
+            2u32.to_le_bytes().to_vec(),
+        );
+        // A second shared node has a count row but its bytes were (wrongly)
+        // removed: window verify must catch it.
+        let orphan_count = hid(0xC0FFEE);
+        counts.put(
+            Keyspace::Counts,
+            orphan_count.as_slice().to_vec(),
+            3u32.to_le_bytes().to_vec(),
+        );
+        store
+            .backend()
+            .kv_write_batch(&counts)
+            .expect("seed counts");
+
+        let report = store.verify_window().expect("verify_window");
+        assert_eq!(report.checked, 2, "both count>=1 rows are checked");
+        assert_eq!(
+            report.missing,
+            vec![orphan_count],
+            "the missing shared node is flagged"
+        );
         assert!(!store.metrics().verify_last_ok);
     }
 }

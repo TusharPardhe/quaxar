@@ -158,13 +158,21 @@ impl PrunedDriver {
             return Ok(());
         }
         let report = self.store.verify(&required, 1)?;
+        // Also run the window-wide count-consistency check: every shared-state
+        // node (count >= 1) across the whole retained window must be present,
+        // not just the latest ledger's reachable set (design full-window
+        // verify).
+        let window = self.store.verify_window()?;
         *self.last_verify.lock().expect("pruned driver verify mutex") = Some(Instant::now());
-        if !report.is_ok() {
+        if !report.is_ok() || !window.is_ok() {
             return Err(format!(
-                "pruned store verify failed: {} of {} required nodes missing at seq {}",
+                "pruned store verify failed at seq {}: {} of {} latest-ledger nodes missing, \
+                 {} of {} windowed count nodes missing",
+                ledger.header().seq,
                 report.missing.len(),
                 report.checked,
-                ledger.header().seq
+                window.missing.len(),
+                window.checked
             ));
         }
         Ok(())
