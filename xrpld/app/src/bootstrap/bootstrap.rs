@@ -4029,6 +4029,13 @@ fn serve_get_object_by_hash_request(
     }
 
     let node_store = root.node_store().clone();
+    // Case 17: serve hot nodes from the in-memory SHAMap TreeNodeCache before
+    // touching the node store. Storage is content-addressed and every cached
+    // node was hash-verified when created, so bytes from memory are exactly
+    // the bytes on disk and the peer re-verifies the hash. This keeps nodes
+    // servable for as long as any live ledger holds them, independent of
+    // prune timing, and lets hot consensus-era requests skip disk/LSM reads.
+    let tree_cache = root.shared_tree_cache_arc().map(Arc::clone);
 
     let mut reply_objects: Vec<overlay::message::wire::TmIndexedObject> = Vec::new();
     let mut hits: u32 = 0;
@@ -4046,19 +4053,32 @@ fn serve_get_object_by_hash_request(
         };
 
         let ledger_seq = obj.ledger_seq.unwrap_or(0);
-        let fetched = node_store.as_ref().and_then(|node_store| match node_store {
-            crate::SHAMapStoreNodeStore::Single(database) => {
-                database.fetch_node_object(&hash, ledger_seq, FetchType::Synchronous, false)
-            }
+        // Tier 1: in-memory SHAMap node. Serialize with the node prefix so the
+        // bytes are byte-identical to the stored NodeObject encoding.
+        let from_memory = tree_cache.as_ref().and_then(|cache| {
+            cache
+                .fetch(&hash)
+                .and_then(|node| node.serialize_with_prefix().ok())
+        });
+        // Tier 2: the node store (its own NodeObject cache, then fjall `nodes`).
+        let data = from_memory.or_else(|| {
+            node_store
+                .as_ref()
+                .and_then(|node_store| match node_store {
+                    crate::SHAMapStoreNodeStore::Single(database) => {
+                        database.fetch_node_object(&hash, ledger_seq, FetchType::Synchronous, false)
+                    }
+                })
+                .map(|node_object| node_object.data().clone())
         });
 
-        if let Some(node_object) = fetched {
+        if let Some(data) = data {
             hits += 1;
             reply_objects.push(overlay::message::wire::TmIndexedObject {
                 hash: Some(hash.data().to_vec()),
                 node_id: None,
                 index: obj.node_id.clone(),
-                data: Some(node_object.data().clone()),
+                data: Some(data),
                 ledger_seq: obj.ledger_seq,
             });
         } else {
