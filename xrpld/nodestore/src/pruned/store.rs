@@ -194,6 +194,37 @@ impl PrunedStore {
         *self.metrics.lock().expect("metrics mutex")
     }
 
+    /// Adopt a freshly snapshot-imported store as the anchor ledger
+    /// (design Case 7). The snapshot loader has already written the retained
+    /// tree into `nodes` and verified both SHAMap roots. `required` is the
+    /// exact set of hashes reachable from those roots (the snapshot's node
+    /// set). This:
+    ///
+    ///   1. reconciles `nodes` down to `required`, reclaiming any leftovers a
+    ///      prior sync left behind (sync stores ~9 M nodes with no index), and
+    ///   2. stamps `anchor_seq`/`claimed_seq`/`claimed_state_root` so the next
+    ///      validated ledger diffs against the snapshot's state root.
+    ///
+    /// It is only valid on a store with no prior claim.
+    pub fn adopt_snapshot(
+        &self,
+        required: &std::collections::BTreeSet<Uint256>,
+        anchor_seq: u32,
+        state_root: Uint256,
+    ) -> Result<usize, String> {
+        let mut writer = self.writer.lock().expect("pruned store writer mutex");
+        let swept = crate::pruned::reconcile::reconcile(
+            self.backend.as_ref(),
+            required,
+            self.config.prune_batch,
+        )?;
+        writer.adopt_anchor(anchor_seq, state_root)?;
+        let mut metrics = self.metrics.lock().expect("metrics mutex");
+        metrics.claimed_seq = writer.claimed_seq();
+        metrics.unclaimed = writer.unclaimed_len();
+        Ok(swept)
+    }
+
     pub fn backend(&self) -> &Arc<dyn Backend> {
         &self.backend
     }
@@ -350,6 +381,43 @@ mod tests {
         assert_eq!(store.fetch(&hid(202)).1, Status::Ok);
         // But it reported that it would have deleted the dead nodes.
         assert!(store.metrics().last_dry_run_would_delete >= 1);
+    }
+
+    #[test]
+    fn adopt_snapshot_reconciles_leftovers_and_anchors() {
+        use std::collections::BTreeSet;
+        let backend = open_memory();
+        // Simulate a sync/import that wrote nodes into `nodes` with no index:
+        // two belong to the snapshot's tree, one is a leftover orphan.
+        let keep_a = node(hid(10));
+        let keep_b = node(hid(11));
+        let leftover = node(hid(12));
+        let mut raw = crate::backends::kv::KvBatch::new();
+        for n in [&keep_a, &keep_b, &leftover] {
+            raw.put(
+                Keyspace::Nodes,
+                n.hash().as_slice().to_vec(),
+                EncodedBlob::new(n).get_data().to_vec(),
+            );
+        }
+        backend.kv_write_batch(&raw).expect("seed nodes");
+
+        let store = PrunedStore::open(Arc::clone(&backend), PrunedConfig::default()).expect("open");
+        let required: BTreeSet<Uint256> = [hid(10), hid(11)].into_iter().collect();
+        let swept = store
+            .adopt_snapshot(&required, 500, hid(99))
+            .expect("adopt");
+
+        // The leftover is reclaimed; the snapshot's nodes remain servable.
+        assert_eq!(swept, 1, "only the leftover is swept");
+        assert_eq!(store.fetch(&hid(10)).1, Status::Ok);
+        assert_eq!(store.fetch(&hid(11)).1, Status::Ok);
+        assert_eq!(store.fetch(&hid(12)).1, Status::NotFound);
+        // The anchor is the claimed sequence; the next claim diffs against it.
+        assert_eq!(store.metrics().claimed_seq, Some(500));
+
+        // A second adopt is refused once the store is anchored.
+        assert!(store.adopt_snapshot(&required, 501, hid(98)).is_err());
     }
 
     #[test]

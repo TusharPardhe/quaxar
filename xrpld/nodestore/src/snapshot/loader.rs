@@ -44,15 +44,27 @@ impl Drop for BulkImportGuard<'_> {
     }
 }
 
+/// Result of a successful snapshot load.
+pub struct SnapshotLoadOutcome {
+    /// The verified manifest (header fields and chunk table).
+    pub manifest: SnapshotManifest,
+    /// Every node hash reachable from the two verified SHAMap roots: the exact
+    /// retained set for this snapshot. A pruned store uses it to reconcile the
+    /// imported `nodes` keyspace down to the snapshot and to stamp the anchor
+    /// (design Case 7). Empty roots contribute nothing.
+    pub required_nodes: HashSet<Uint256>,
+}
+
 /// Load a snapshot file from `input_path` into `backend`.
 ///
-/// Returns the verified manifest. A successful result proves that the manifest
-/// header is self-consistent and that both advertised SHAMap roots are complete,
+/// Returns the verified manifest and the set of node hashes reachable from the
+/// two SHAMap roots. A successful result proves that the manifest header is
+/// self-consistent and that both advertised SHAMap roots are complete,
 /// correctly typed, and content-addressed by their encoded bytes.
 pub fn load_snapshot(
     backend: &dyn Backend,
     input_path: &Path,
-) -> Result<SnapshotManifest, SnapshotError> {
+) -> Result<SnapshotLoadOutcome, SnapshotError> {
     let start = Instant::now();
     tracing::info!(
         target: "snapshot",
@@ -206,9 +218,9 @@ pub fn load_snapshot(
         }
     }
 
-    // NuDB needs this to flush its bulk index before graph fetches work. The
-    // guard restores its incomplete-import marker if any later verification
-    // fails, so finalization is not publication.
+    // Finalize any backend bulk-import indexes before the footer and SHAMap
+    // graph are verified. The guard restores the incomplete-import marker if a
+    // later verification fails, so finalization is not publication.
     backend
         .bulk_import_finish()
         .map_err(|e| SnapshotError::BackendWriteFailed {
@@ -235,8 +247,21 @@ pub fn load_snapshot(
         return Err(SnapshotError::TrailingData);
     }
 
-    verify_shamap_root(backend, "account-state", manifest.account_hash)?;
-    verify_shamap_root(backend, "transaction", manifest.tx_hash)?;
+    // Verify both roots, accumulating every reachable node hash into one set so
+    // a pruned store can reconcile and anchor to exactly this snapshot.
+    let mut required_nodes = HashSet::new();
+    verify_shamap_root(
+        backend,
+        "account-state",
+        manifest.account_hash,
+        &mut required_nodes,
+    )?;
+    verify_shamap_root(
+        backend,
+        "transaction",
+        manifest.tx_hash,
+        &mut required_nodes,
+    )?;
     backend
         .sync_result()
         .map_err(|e| SnapshotError::BackendWriteFailed {
@@ -249,11 +274,15 @@ pub fn load_snapshot(
         ledger_seq = manifest.ledger_seq,
         total_nodes,
         chunks = manifest.chunks.len(),
+        required_nodes = required_nodes.len(),
         elapsed_ms = start.elapsed().as_millis() as u64,
         "Snapshot load complete, ledger and SHAMap roots verified"
     );
 
-    Ok(manifest)
+    Ok(SnapshotLoadOutcome {
+        manifest,
+        required_nodes,
+    })
 }
 
 fn verify_manifest_ledger_hash(manifest: &SnapshotManifest) -> Result<(), SnapshotError> {
@@ -283,6 +312,7 @@ fn verify_shamap_root(
     backend: &dyn Backend,
     map: &'static str,
     root_bytes: [u8; 32],
+    required: &mut HashSet<Uint256>,
 ) -> Result<(), SnapshotError> {
     let root = Uint256::from_array(root_bytes);
     if root.is_zero() {
@@ -290,8 +320,7 @@ fn verify_shamap_root(
     }
 
     let mut visiting = HashSet::new();
-    let mut verified = HashSet::new();
-    verify_shamap_node(backend, map, root, 0, &mut visiting, &mut verified)
+    verify_shamap_node(backend, map, root, 0, &mut visiting, required)
 }
 
 fn verify_shamap_node(
@@ -335,11 +364,11 @@ fn verify_shamap_node(
     };
     let node = SHAMapTreeNode::make_from_prefix(object.data(), SHAMapHash::new(hash))
         .map_err(|error| shamap_error(map, hash, format!("invalid encoded node: {error:?}")))?;
-    // NuDB's compact inner-node codecs intentionally discard the
-    // account-vs-transaction NodeObject wrapper tag and restore inner nodes as
-    // `Unknown`. The serialized SHAMap body still carries the node kind, so
-    // permit that wrapper only for inner nodes; leaves must retain their
-    // map-specific wrapper as well as their serialized leaf kind.
+    // Some backend codecs discard the account-vs-transaction NodeObject
+    // wrapper tag and restore inner nodes as `Unknown`. The serialized SHAMap
+    // body still carries the node kind, so permit the `Unknown` wrapper for
+    // inner nodes only; leaves must retain their map-specific wrapper as well
+    // as their serialized leaf kind.
     let wrapper_type_matches = if node.is_leaf() {
         object.object_type() == expected_object_type
     } else {

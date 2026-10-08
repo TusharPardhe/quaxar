@@ -76,7 +76,7 @@ impl Backend for TraversalFailureBackend {
             vec![1, 2, 3],
             Uint256::from_array([0xEF; 32]),
         )));
-        Err("injected NuDB traversal failure".to_owned())
+        Err("injected traversal failure".to_owned())
     }
 
     fn get_write_load(&self) -> i32 {
@@ -277,7 +277,7 @@ fn snapshot_export_fails_atomically_on_backend_traversal_error() {
     assert!(matches!(
         error,
         SnapshotError::BackendTraversalFailed { ref reason }
-            if reason == "injected NuDB traversal failure"
+            if reason == "injected traversal failure"
     ));
     assert!(
         !output_path.exists(),
@@ -321,12 +321,12 @@ fn post_import_verifies_account_and_transaction_shamap_roots() {
 
     let dst = make_backend("dst-roots");
     let loaded = load_snapshot(dst.as_ref(), &snap_path).expect("roots must verify");
-    assert_eq!(loaded.account_hash, account_hash);
-    assert_eq!(loaded.tx_hash, tx_hash);
+    assert_eq!(loaded.manifest.account_hash, account_hash);
+    assert_eq!(loaded.manifest.tx_hash, tx_hash);
 }
 
 #[test]
-fn post_import_accepts_nudb_unknown_wrapper_for_inner_shamap_nodes() {
+fn post_import_accepts_untyped_unknown_wrapper_for_inner_shamap_nodes() {
     let dir = tempfile::tempdir().unwrap();
     let snap_path = dir.path().join("unknown-inner.xrpls");
     let src = make_backend("src-unknown-inner");
@@ -361,9 +361,9 @@ fn post_import_accepts_nudb_unknown_wrapper_for_inner_shamap_nodes() {
     export_snapshot(src.as_ref(), &manifest, &snap_path).expect("export must succeed");
 
     let dst = make_backend("dst-unknown-inner");
-    let loaded =
-        load_snapshot(dst.as_ref(), &snap_path).expect("NuDB-style untyped inner node must verify");
-    assert_eq!(loaded.account_hash, inner_hash_bytes);
+    let loaded = load_snapshot(dst.as_ref(), &snap_path)
+        .expect("untyped (Unknown-wrapper) inner node must verify");
+    assert_eq!(loaded.manifest.account_hash, inner_hash_bytes);
 }
 
 #[test]
@@ -527,9 +527,12 @@ fn round_trip_export_load() {
     let loaded_manifest = load_snapshot(dst.as_ref(), &snap_path).expect("load must succeed");
 
     // Verify manifest fields
-    assert_eq!(loaded_manifest.ledger_seq, 100);
-    assert_eq!(loaded_manifest.ledger_hash, test_manifest().ledger_hash);
-    assert_eq!(loaded_manifest.account_hash, [0; 32]);
+    assert_eq!(loaded_manifest.manifest.ledger_seq, 100);
+    assert_eq!(
+        loaded_manifest.manifest.ledger_hash,
+        test_manifest().ledger_hash
+    );
+    assert_eq!(loaded_manifest.manifest.account_hash, [0; 32]);
 
     // Verify all nodes are present
     let (obj, _) = dst.fetch(&Uint256::from_array([0x11; 32]));

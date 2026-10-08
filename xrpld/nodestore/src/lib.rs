@@ -59,6 +59,6 @@ pub use types::{
 };
 
 pub use snapshot::{
-    SnapshotError, SnapshotManifest, SnapshotScheduler, SnapshotSchedulerConfig, export_snapshot,
-    load_snapshot,
+    SnapshotError, SnapshotLoadOutcome, SnapshotManifest, SnapshotScheduler,
+    SnapshotSchedulerConfig, export_snapshot, load_snapshot,
 };

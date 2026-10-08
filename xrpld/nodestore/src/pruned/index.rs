@@ -213,6 +213,42 @@ impl IndexWriter {
         Ok(())
     }
 
+    /// Adopt a snapshot-loaded store as the anchor ledger (design Case 7).
+    ///
+    /// A snapshot import writes the whole retained tree into `nodes` with no
+    /// index history. This is the `claim(A)` with `P = ∅` case: every node is
+    /// implicitly live-once (count 1, so no explicit count rows), the dead set
+    /// is empty, and `A` becomes both the claimed sequence and the anchor. It
+    /// is only valid on a store with no prior claim; a store that already has
+    /// a claimed sequence returns an error rather than rewinding its cursors.
+    pub fn adopt_anchor(&mut self, seq: u32, state_root: Uint256) -> Result<(), String> {
+        if let Some(prev) = self.claimed_seq {
+            return Err(format!(
+                "cannot adopt snapshot anchor {seq}: store already claimed {prev}"
+            ));
+        }
+        let mut batch = KvBatch::new();
+        batch.put(
+            Keyspace::Meta,
+            meta_key::CLAIMED_SEQ,
+            seq.to_le_bytes().to_vec(),
+        );
+        batch.put(
+            Keyspace::Meta,
+            meta_key::CLAIMED_STATE_ROOT,
+            state_root.as_slice().to_vec(),
+        );
+        batch.put(
+            Keyspace::Meta,
+            meta_key::ANCHOR_SEQ,
+            seq.to_le_bytes().to_vec(),
+        );
+        self.backend.kv_write_batch(&batch)?;
+        self.backend.kv_persist(PersistMode::SyncAll)?;
+        self.claimed_seq = Some(seq);
+        Ok(())
+    }
+
     /// Prune every notebook record at or below `k`. A STATE record deletes its
     /// node only if the reference count is zero and it is not pinned; an OWNED
     /// record deletes unconditionally (unless pinned). Processes in bounded
