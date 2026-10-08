@@ -307,12 +307,14 @@ impl STAmount {
             panic!("Cannot return non-IOU STAmount as IOUAmount");
         }
 
-        let mantissa = i64::try_from(self.value).expect("IOU mantissa should fit i64");
+        // rippled: `static_cast<std::int64_t>(value_)` then `-mantissa`.
+        // Both wrap in two's complement; mirror that instead of panicking so
+        // non-canonical intermediates produce the same IOUAmount as rippled.
+        let mut mantissa = self.value as i64;
         if self.is_negative {
-            IOUAmount::from_parts(-mantissa, self.offset).expect("canonical IOU should round-trip")
-        } else {
-            IOUAmount::from_parts(mantissa, self.offset).expect("canonical IOU should round-trip")
+            mantissa = mantissa.wrapping_neg();
         }
+        IOUAmount::from_parts(mantissa, self.offset).expect("canonical IOU should round-trip")
     }
 
     pub fn mpt(&self) -> MPTAmount {
@@ -1101,6 +1103,30 @@ mod tests {
     use crate::stbase::StBase;
     use crate::{AccountID, MPTAmount, MPTIssue, STArray, STObject, get_field_by_symbol};
     use basics::base_uint::Uint192;
+
+    #[test]
+    fn iou_wraps_mantissa_through_int64_like_rippled() {
+        // rippled STAmount::iou(): static_cast<int64_t>(value_), then negate.
+        // A mantissa above i64::MAX wraps negative instead of throwing.
+        let mut issue = crate::no_issue();
+        issue.currency = crate::currency_from_string("USD");
+        let raw = 0x8000_0000_0000_0001u64;
+        let positive = STAmount {
+            core: crate::stbase::StBaseCore::with_field(sf_generic()),
+            asset: issue.clone().into(),
+            value: raw,
+            offset: -15,
+            is_negative: false,
+        };
+        let expected = crate::IOUAmount::from_parts(raw as i64, -15).unwrap();
+        assert_eq!(positive.iou(), expected);
+        assert!(positive.iou().mantissa() < 0);
+
+        let negative = STAmount { is_negative: true, ..positive.clone() };
+        let expected = crate::IOUAmount::from_parts((raw as i64).wrapping_neg(), -15).unwrap();
+        assert_eq!(negative.iou(), expected);
+        assert!(negative.iou().mantissa() > 0);
+    }
 
     #[test]
     fn native_zero_constructor_clears_negative_zero() {
