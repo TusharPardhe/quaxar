@@ -758,81 +758,6 @@ path = {}
 }
 
 #[test]
-fn app_bootstrap_online_delete_uses_production_rotation_runtime() {
-    let dir = TempDir::new().expect("tempdir");
-    let config_path = dir.path().join("quaxar.cfg");
-    let database_path = dir.path().join("sql");
-    let node_db_path = dir.path().join("node-db");
-    fs::write(
-        &config_path,
-        format!(
-            r#"
-[ledger_history]
-8
-
-[database_path]
-{}
-
-[node_db]
-type = RocksDB
-path = {}
-online_delete = 8
-"#,
-            database_path.display(),
-            node_db_path.display(),
-        ),
-    )
-    .expect("config file");
-
-    let config = load_basic_config_file(&config_path).expect("config");
-    let bootstrap = build_bootstrap_root(
-        &config,
-        &AppBootstrapOptions {
-            config_path,
-            standalone: true,
-            start_type: StartUpType::Fresh,
-            ..AppBootstrapOptions::default()
-        },
-    )
-    .expect("online-delete bootstrap");
-    let service = bootstrap
-        .root
-        .shamap_store_service()
-        .expect("online-delete service");
-    let component = service.component();
-    assert!(
-        bootstrap
-            .root
-            .set_shamap_store_operating_mode(SHAMapStoreOperatingMode::Full)
-    );
-
-    let close_time = bootstrap.root.current_close_time_seconds();
-    service.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
-        100, close_time, false,
-    )));
-    let initialized = component
-        .process_queued_ledger()
-        .expect("initial worker step")
-        .expect("initial queued ledger");
-    assert!(!initialized.rotated);
-    assert_eq!(component.get_last_rotated(), 100);
-
-    service.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
-        108, close_time, false,
-    )));
-    let rotated = component
-        .process_queued_ledger()
-        .expect("rotation worker step")
-        .expect("rotation queued ledger");
-    assert!(rotated.rotated);
-    let saved = component.saved_state();
-    assert_eq!(saved.last_rotated, 108);
-    assert!(!saved.writable_db.is_empty());
-    assert!(!saved.archive_db.is_empty());
-    assert_ne!(saved.writable_db, saved.archive_db);
-}
-
-#[test]
 fn app_bootstrap_loads_latest_local_ledger_from_sqlite_and_nodestore() {
     let dir = TempDir::new().expect("tempdir");
     let ledger = persisted_bootstrap_ledger(7);
@@ -1957,7 +1882,7 @@ path = {}
         .ledger_master();
     assert!(master.have_ledger(21));
     // Explicit Load registers the selected durable LCL; older configured
-    // history is hydrated lazily through provider/NuDB recovery.
+    // history is hydrated lazily through provider/node store recovery.
     assert_eq!(master.complete_ledgers().to_string(), "21");
 }
 

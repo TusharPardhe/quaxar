@@ -944,18 +944,55 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             if current_mode == crate::NetworkOpsOperatingMode::Full
                 || current_mode == crate::NetworkOpsOperatingMode::Tracking
             {
-                tracing::info!(
-                    target: "consensus",
-                    event = "consensus_view_change_demotion",
-                    ?current_mode,
-                    consensus_mode = ?mode,
-                    min_valid_seq,
-                    requested = %prev_ledger_id,
-                    previous_ledger = ?previous_ledger,
-                    preferred = %preferred,
-                    preferred_resident = ?preferred_resident,
-                    local_closed = ?local_closed,
-                    published_ledger = ?published_ledger,
+                // Parity refinement matching the strand's reconcile path: a
+                // pure FORWARD catch-up (our consensus parent is a true
+                // ANCESTOR of the newer preferred ledger on the same validated
+                // chain) is not a wrong-ledger divergence - we are only
+                // trailing the same chain. Confirm ancestry definitively by
+                // asking the resident preferred ledger to look DOWN its
+                // skip-list to our parent's sequence (rippled areCompatible /
+                // hashOfSeq semantics): if that ancestor hash equals our
+                // parent's hash, the switch is a forward advance and must NOT
+                // demote. A same-seq sibling (fork), a non-resident preferred
+                // (acquire-required), or a genuinely divergent ancestor still
+                // demotes exactly as rippled's consensusViewChange does.
+                let prev_seq = prev_ledger.ledger().header().seq;
+                let prev_hash = *prev_ledger.ledger().header().hash.as_uint256();
+                let forward_catch_up = self
+                    .app_root
+                    .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred))
+                    .is_some_and(|pref_ledger| {
+                        crate::network::network_ops_strand::is_forward_ancestor(
+                            &self.app_root,
+                            &pref_ledger,
+                            prev_hash,
+                            prev_seq,
+                        )
+                    });
+                if forward_catch_up {
+                    tracing::info!(
+                        target: "consensus",
+                        event = "consensus_view_change_forward_advance_no_demote",
+                        ?current_mode,
+                        requested = %prev_ledger_id,
+                        preferred = %preferred,
+                        preferred_resident = ?preferred_resident,
+                        previous_ledger = ?previous_ledger,
+                        "consensusViewChange: forward catch-up to newer validated ledger on our own chain; adopting preferred without a mode demotion"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "consensus",
+                        event = "consensus_view_change_demotion",
+                        ?current_mode,
+                        consensus_mode = ?mode,
+                        min_valid_seq,
+                        requested = %prev_ledger_id,
+                        previous_ledger = ?previous_ledger,
+                        preferred = %preferred,
+                        preferred_resident = ?preferred_resident,
+                        local_closed = ?local_closed,
+                        published_ledger = ?published_ledger,
                     validated_anchor = ?validated_anchor,
                     last_valid_anchor = ?last_valid_anchor,
                     live_current_ledger_index = ?self.app_root.live_current_ledger_index(),
@@ -975,6 +1012,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                         crate::NetworkOpsOperatingMode::Connected,
                         "preferred_lcl_divergence",
                     );
+                }
                 }
             } else {
                 tracing::info!(
@@ -1878,7 +1916,7 @@ impl AppConsensus {
                     consensus_succeeded = work.consensus_succeeded,
                     "LCL_AUDIT local consensus child built"
                 );
-                let mut retriable_transactions = outcome.retry_transactions.clone();
+                let retriable_transactions = outcome.retry_transactions.clone();
                 self.notify_accepted(&root, &closed, &work);
                 if work.have_correct_lcl && work.consensus_succeeded {
                     let accepted = work
@@ -1914,8 +1952,29 @@ impl AppConsensus {
                 root.record_consensus_built_ledger(Arc::clone(&closed), work.consensus_hash);
                 // Rippled performs censorshipDetector_.check before adding
                 // rejected disputes to retriableTxs, then passes the combined
-                // canonical retry set to OpenLedger::accept.
-                retriable_transactions.extend(work.rejected_dispute_retries.iter().cloned());
+                // canonical retry set to OpenLedger::accept. rippled keeps ONE
+                // `CanonicalTXSet retriableTxs` (RCLConsensus.cpp): build
+                // retries remain in it and rejected disputes are INSERTED into
+                // that same salted map, so the open-ledger rebuild applies the
+                // union in GLOBAL canonical order (salted account, SeqProxy,
+                // tx id). A plain Vec `extend` instead preserves two separate
+                // orderings and can apply a build-retry and a rejected dispute
+                // in the wrong relative order when they sort oppositely under
+                // the global canonical key -- shifting the speculative open
+                // ledger and the next proposal's executable set, which can
+                // propagate into a later consensus child (a fork seed). Merge
+                // them through a single CanonicalTXSet to match rippled exactly.
+                let retriable_transactions = {
+                    let mut retry_set =
+                        ledger::CanonicalTXSet::new(work.consensus_hash);
+                    for tx in &retriable_transactions {
+                        retry_set.insert(std::sync::Arc::clone(tx));
+                    }
+                    for tx in work.rejected_dispute_retries.iter() {
+                        retry_set.insert(std::sync::Arc::clone(tx));
+                    }
+                    retry_set.drain_ordered()
+                };
                 // Narrow critical section: only the atomic OpenLedger rebase +
                 // closed-LCL install run under the transition gate, matching
                 // rippled's master/ledger locks around OpenLedger::accept and
@@ -2617,6 +2676,28 @@ impl ConsensusRunner for AppConsensus {
         // this proposal was queued — matching rippled's `checkPropose` which
         // calls `peerPos.checkSign()` and drops invalid proposals before they
         // reach `processTrustedProposal` / `peer_proposal`.
+        //
+        // Trust gate (parity with rippled PeerImp::checkPropose): ONLY a
+        // proposal signed by a trusted UNL validator key may influence local
+        // consensus. rippled calls `processTrustedProposal` -> `peerProposal`
+        // exclusively when `isTrusted`; untrusted proposals are only relayed
+        // (never fed to the consensus algorithm). Without this gate an observer
+        // ingests untrusted peer positions into `curr_peer_positions` and
+        // converges toward a non-quorum tx set (e.g. late-arriving txs other
+        // observers included), building a ledger that forks from the validator
+        // quorum's validated chain. The validator identity is the proposal's
+        // master key when a manifest maps it; fall back to the signing key.
+        let proposal_key = *peer_pos.public_key();
+        let is_trusted = self.adaptor.app_root.validators().trusted(proposal_key);
+        if !is_trusted {
+            tracing::trace!(
+                target: "consensus",
+                proposal_key = %proposal_key,
+                "dropping untrusted peer proposal from consensus influence (relay-only, rippled checkPropose parity)"
+            );
+            return false;
+        }
+
         let our_prev = *self.state.prev_ledger_id();
         let their_prev = *peer_pos.proposal().prev_ledger();
         let accepted = self.state.peer_proposal(&self.adaptor, now, peer_pos);

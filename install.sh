@@ -212,10 +212,6 @@ validate_config_inputs() {
         fi
     done
 
-    if [ "$DB_TYPE" = "RocksDB" ] && [ "$LEDGER_HISTORY" = "full" ]; then
-        warn "RocksDB with full history can use significant disk and IO. NuDB is the default for non-validator/full-history testing."
-    fi
-
     if [ "$failed" = true ]; then
         exit 1
     fi
@@ -448,14 +444,10 @@ check_pkg "Git" "git" "git"
 
 if [ "$PKG_MGR" = "apt" ]; then
     check_pkg "OpenSSL" "openssl" "libssl-dev"
-    check_pkg "RocksDB" "" "librocksdb-dev"
-    dpkg -s librocksdb-dev &>/dev/null 2>&1 && ok "RocksDB (librocksdb-dev)" || { fail "RocksDB → will install ${DIM}(librocksdb-dev)${RESET}"; MISSING+=("librocksdb-dev"); }
-    check_pkg "clang" "clang" "clang"
     check_pkg "cmake" "cmake" "cmake"
     check_pkg "pkg-config" "pkg-config" "pkg-config"
 elif [ "$PKG_MGR" = "brew" ]; then
     check_pkg "OpenSSL" "openssl" "openssl"
-    check_pkg "RocksDB" "" "rocksdb"
     check_pkg "cmake" "cmake" "cmake"
 fi
 
@@ -516,16 +508,7 @@ if [ -f .cargo/config.toml ] && ! command -v lld &>/dev/null; then
     info "Removed .cargo/config.toml (lld not installed)"
 fi
 
-# Set ROCKSDB_LIB_DIR if system lib available
-if [ "$PKG_MGR" = "apt" ] && dpkg -s librocksdb-dev &>/dev/null 2>&1; then
-    export ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu
-fi
-
 info "Building quaxar (this may take a few minutes)..."
-if command -v clang &>/dev/null && command -v clang++ &>/dev/null; then
-    export CC=clang CXX=clang++
-    info "Using clang and clang++ for native dependencies"
-fi
 if [ "$RAM_GB" -le 16 ]; then
     CARGO_BUILD_JOBS=2 cargo install --path xrpld/main --locked --force 2>&1 | tail -1
 else
@@ -593,11 +576,12 @@ if [ "$GENERATE_CONF" = true ]; then
     WS_ADMIN="127.0.0.1"
     WS_SECURE_GATEWAY=""
     WS_SEND_QUEUE_LIMIT="500"
-    DB_TYPE="NuDB"
+    DB_TYPE="fjall"
     DATA_DIR="$HOME/.local/share/quaxar"
-    DB_PATH="$DATA_DIR/db/nudb"
+    DB_PATH="$DATA_DIR/db/fjall"
     SQLITE_PATH="$DATA_DIR/db"
-    NUDB_BLOCK_SIZE="4096"
+    RESERVE_MB="1024"
+    COMPACTION_BASE_MB=""
     ONLINE_DELETE="512"
     ADVISORY_DELETE="0"
     NODE_SIZE="medium"
@@ -627,7 +611,7 @@ if [ "$GENERATE_CONF" = true ]; then
         echo ""
         ask_choice "Network" "$NETWORK" NETWORK "mainnet testnet devnet"
         ask "Data directory" "$DATA_DIR" DATA_DIR
-        DB_PATH="$DATA_DIR/db/nudb"
+        DB_PATH="$DATA_DIR/db/fjall"
         SQLITE_PATH="$DATA_DIR/db"
         ask_choice "Node size" "$NODE_SIZE" NODE_SIZE "tiny small medium large huge"
         ask_ledger_history "Ledger history" "$LEDGER_HISTORY" LEDGER_HISTORY
@@ -655,17 +639,13 @@ if [ "$GENERATE_CONF" = true ]; then
 
         echo ""
         echo -e "  ${BOLD}── Database ──${RESET}"
-        ask_choice "Database type" "$DB_TYPE" DB_TYPE "nudb rocksdb"
-        case "$DB_TYPE" in
-            nudb) DB_TYPE="NuDB" ;;
-            rocksdb) DB_TYPE="RocksDB" ;;
-        esac
+        # fjall is the only supported node store; NuDB and RocksDB were removed.
+        DB_TYPE="fjall"
         ask "Data directory" "$DATA_DIR" DATA_DIR
-        DB_PATH="$DATA_DIR/db/nudb"
+        DB_PATH="$DATA_DIR/db/fjall"
         SQLITE_PATH="$DATA_DIR/db"
         ask "Node DB path" "$DB_PATH" DB_PATH
         ask "Relational database path" "$SQLITE_PATH" SQLITE_PATH
-        ask_choice "NuDB block size" "$NUDB_BLOCK_SIZE" NUDB_BLOCK_SIZE "4096 8192 16384 32768"
         ask_int_range "Online delete (ledgers, 0 disables)" "$ONLINE_DELETE" ONLINE_DELETE 0 100000000
         ask_bool_value "Advisory delete" "$ADVISORY_DELETE" ADVISORY_DELETE
 
@@ -715,16 +695,19 @@ if [ "$GENERATE_CONF" = true ]; then
             VL_SITE="https://vl.ripple.com"
             VL_KEY="ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734"
             PEERS="s1.ripple.com 51235,s2.ripple.com 51235"
+            COMPACTION_BASE_MB="${COMPACTION_BASE_MB:-256}"
             ;;
         testnet)
             VL_SITE="https://vl.altnet.rippletest.net"
             VL_KEY="ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860"
             PEERS="s.altnet.rippletest.net 51235"
+            COMPACTION_BASE_MB="${COMPACTION_BASE_MB:-64}"
             ;;
         devnet)
             VL_SITE="https://vl.devnet.rippletest.net"
             VL_KEY="EDDF2F53DFEC79C1EAAB2C1E8B1F2B4C85B0C264B37C2B8B8E4E3E6F0D5A7C8B9"
             PEERS="s.devnet.rippletest.net 51235"
+            COMPACTION_BASE_MB="${COMPACTION_BASE_MB:-64}"
             ;;
         *)
             fail "Unsupported network: $NETWORK"
@@ -795,9 +778,10 @@ $NODE_SIZE
 [node_db]
 type = $DB_TYPE
 path = $DB_PATH
-nudb_block_size = $NUDB_BLOCK_SIZE
 online_delete = $ONLINE_DELETE
 advisory_delete = $ADVISORY_DELETE
+reserve_mb = $RESERVE_MB
+compaction_base_mb = $COMPACTION_BASE_MB
 
 [database_path]
 $SQLITE_PATH

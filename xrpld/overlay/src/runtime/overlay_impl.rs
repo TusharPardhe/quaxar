@@ -53,7 +53,7 @@ use crate::peer_imp::PeerImp;
 use crate::protocol_version::negotiate_protocol_version;
 use crate::router::{MessageRouter, route_message};
 use crate::session::{PeerSessionHooks, PeerSessionStarter};
-use crate::slot::{Clock, Slots, SquelchHandler, SystemClock};
+use crate::slot::{Clock, MAX_TX_QUEUE_SIZE, Slots, SquelchHandler, SystemClock};
 use crate::traffic_count::{TrafficCategory, TrafficCount};
 use crate::transport::handshake::is_public_ip;
 use crate::tx_metrics::TxMetrics;
@@ -557,23 +557,38 @@ impl OverlayInboundRouter<'_> {
         crate::router::RouteAction::Continue
     }
 
-    fn parse_transaction(&self, message: &crate::message::TmTransaction) -> Option<Uint256> {
+    fn queue_transaction(&self, message: &crate::message::TmTransaction, batch: bool) {
         if self.peer.tracking() == crate::peer_imp::Tracking::Diverged {
-            return None;
+            return;
+        }
+
+        if !(protocol::TX_MIN_SIZE_BYTES..=protocol::TX_MAX_SIZE_BYTES)
+            .contains(&message.raw_transaction.len())
+        {
+            // rippled 9aebb5ebea: invalid wire lengths fail transaction
+            // deserialization; Rust's STTx parser returns a default object for
+            // them, so charge and reject before that fallback can be queued.
+            self.peer.charge(
+                (*resource::FEE_INVALID_DATA).clone(),
+                "tx invalid".to_owned(),
+            );
+            return;
         }
 
         let mut serial = SerialIter::new(&message.raw_transaction);
-        let transaction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(transaction) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             STTx::from_serial_iter(&mut serial)
         }))
-        .ok()?;
-        Some(transaction.get_transaction_id())
-    }
-
-    fn queue_transaction(&self, message: &crate::message::TmTransaction, batch: bool) {
-        let Some(id) = self.parse_transaction(message) else {
+        .ok() else {
+            // rippled 9aebb5ebea: an undeserializable transaction consumes
+            // peer resources even when it never reaches the transaction queue.
+            self.peer.charge(
+                (*resource::FEE_INVALID_DATA).clone(),
+                "tx invalid".to_owned(),
+            );
             return;
         };
+        let id = transaction.get_transaction_id();
         self.overlay.inbound_handler.on_transaction(
             self.peer,
             QueuedTransaction {
@@ -911,14 +926,26 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         {
             return self.reject_malformed("get_ledger malformed ledger hash");
         }
-        if message.itype != 0
-            && (message.node_i_ds.is_empty()
-                || message
-                    .node_i_ds
-                    .iter()
-                    .any(|node_id| !is_valid_shamap_node_id_wire(node_id)))
-        {
-            return self.reject_malformed("get_ledger invalid node ids");
+        if message.itype != 0 {
+            if message.node_i_ds.is_empty() {
+                return self.reject_malformed("get_ledger invalid node ids");
+            }
+            // rippled 6099940c2c: cap before parsing node IDs or handing the
+            // request to the NodeStore-serving route, preventing unbounded seeks.
+            if message.node_i_ds.len() > HARD_MAX_REPLY_NODES {
+                self.peer.charge(
+                    (*resource::FEE_INVALID_DATA).clone(),
+                    "get_ledger too many node ids".to_owned(),
+                );
+                return crate::router::RouteAction::Continue;
+            }
+            if message
+                .node_i_ds
+                .iter()
+                .any(|node_id| !is_valid_shamap_node_id_wire(node_id))
+            {
+                return self.reject_malformed("get_ledger invalid node ids");
+            }
         }
         // rippled accepts only qtINDIRECT when querytype is present.
         if message.query_type.is_some_and(|query_type| query_type != 0) {
@@ -1259,6 +1286,16 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         message: &crate::message::TmTransactions,
     ) -> crate::router::RouteAction {
         if !self.peer.tx_reduce_relay_enabled() {
+            return crate::router::RouteAction::Continue;
+        }
+        // rippled 9aebb5ebea: one TMTransactions frame cannot expand into an
+        // unbounded amount of deserialization and transaction-queue work.
+        if message.transactions.len() > MAX_TX_QUEUE_SIZE {
+            tracing::error!(target: "overlay", "TMTransactions: transaction list too large");
+            self.peer.charge(
+                (*resource::FEE_MALFORMED_REQUEST).clone(),
+                "Transaction list too large".to_owned(),
+            );
             return crate::router::RouteAction::Continue;
         }
         tracing::trace!(
@@ -2798,7 +2835,11 @@ impl OverlayImpl {
                 return;
             }
             for peer in self.active_peers_for_tx(to_skip).peers {
-                peer.add_tx_queue(hash);
+                // rippled 7e82b0660f: only peers that negotiated tx
+                // reduce-relay understand a queued TMHaveTransactions hash.
+                if peer.tx_reduce_relay_enabled() {
+                    peer.add_tx_queue(hash);
+                }
             }
             return;
         }

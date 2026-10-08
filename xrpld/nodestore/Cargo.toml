@@ -13,9 +13,7 @@ path = "src/lib.rs"
 quaxar-metrics = { path = "../metrics" }
 basics = { path = "../../xrpl/basics" }
 protocol = { path = "../../xrpl/protocol" }
-librocksdb-sys = "0.16.0"
 lz4_flex = "0.11"
-rocksdb = { version = "0.22", default-features = false, features = ["snappy"] }
 sha2 = { version = "0.10", features = ["asm"] }
 tracing = "0.1"
 xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
@@ -24,18 +22,10 @@ arc-swap = "1.9.1"
 dashmap = "6.2.1"
 moka = { version = "=0.12.13", features = ["sync"] }
 shamap = { path = "../../xrpl/shamap" }
+fjall = "=3.1.12"
 
 [features]
 gpu-hash = []
-
-mmap-store = []
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2.186"
-
-
-[dependencies.memmap2]
-version = "0.9"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

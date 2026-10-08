@@ -197,6 +197,10 @@ impl DatabaseNodeImp {
         self.database.async_fetch(hash, ledger_seq, work);
     }
 
+    pub fn async_fetch_batch(&self, requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>) {
+        self.database.async_fetch_batch(requests);
+    }
+
     /// Compatibility batch helper. The public Database trait has no batch
     /// surface, so route each element through DatabaseRuntime to retain the
     /// mandatory cache, validation, and single-flight policy.
@@ -344,6 +348,10 @@ impl DatabaseTrait for DatabaseNodeImp {
 
     fn async_fetch(&self, hash: Uint256, ledger_seq: u32, work: Box<dyn AsyncReadWork>) {
         DatabaseNodeImp::async_fetch(self, hash, ledger_seq, work);
+    }
+
+    fn async_fetch_batch(&self, requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>) {
+        DatabaseNodeImp::async_fetch_batch(self, requests);
     }
 
     fn stop(&self) {
@@ -572,6 +580,9 @@ mod tests {
     }
 
     struct TerminalWriteWork {
+        // Held only to keep the terminal ticket alive until this work is
+        // dropped; never read directly.
+        #[allow(dead_code)]
         ticket: TerminalTicket,
         payload: Vec<u8>,
     }

@@ -1,7 +1,7 @@
 use crate::shamap::shamap_store_config::node_db_section;
 use crate::{
     SHAMapStore, SHAMapStoreBackendBundle, SHAMapStoreNodeStore, SHAMapStoreSavedState,
-    SHAMapStoreSavedStateDb, apply_rocksdb_online_delete_defaults, make_shamap_store_backend,
+    SHAMapStoreSavedStateDb, make_shamap_store_backend,
 };
 use basics::basic_config::{BasicConfig, Section};
 use nodestore::{Manager, NodeStoreJournal, Scheduler};
@@ -40,11 +40,10 @@ pub fn bootstrap_shamap_store(
     scheduler: Arc<dyn Scheduler>,
     journal: Arc<dyn NodeStoreJournal>,
 ) -> Result<SHAMapStoreBootstrap, String> {
-    let mut node_db = apply_rocksdb_online_delete_defaults(
-        node_db_section(config)?,
-        hash_node_db_cache_mb,
-        node_size,
-    );
+    // RocksDB tuning defaults were dropped with the RocksDB backend; the
+    // node_db section is used as configured.
+    let _ = (hash_node_db_cache_mb, node_size);
+    let mut node_db = node_db_section(config)?.clone();
     let configured_node_size = config
         .exists("node_size")
         .then(|| config.section("node_size").values().first().cloned())
@@ -76,49 +75,30 @@ pub fn bootstrap_shamap_store(
     }
     let mut store = SHAMapStore::from_config(config, standalone, ledger_history, 0)?;
 
-    let saved_state = if store.delete_interval() != 0 {
-        let state_db = SHAMapStoreSavedStateDb::open(config, "state")?;
-        let saved_state = state_db.get_state()?;
-        let SHAMapStoreBackendBundle {
-            store: node_store,
-            fd_required,
-            saved_state: next_state,
-        } = make_shamap_store_backend(
-            manager,
-            scheduler,
-            read_threads,
-            &node_db,
-            store.delete_interval(),
-            &saved_state,
-            burst_size,
-            journal,
-        )?;
-        if next_state != saved_state {
-            state_db.set_state(&next_state)?;
-        }
-        store.set_saved_state(next_state.clone());
-        store.set_fd_required(fd_required);
-        return Ok(SHAMapStoreBootstrap {
-            store,
-            node_store,
-            state_db: Some(state_db),
-            effective_node_db_config: node_db,
-        });
+    // online_delete no longer selects a rotating store: the node store is always
+    // a single database, and the fjall path prunes continuously through the
+    // PrunedDriver using online_delete as its retention window. The interval is
+    // cleared here so the SHAMapStore never schedules the removed rotation; the
+    // validated value stays in the node_db section for the driver.
+    store.set_delete_interval(0);
+    // The saved-state DB persists the advisory can_delete boundary across
+    // restarts, so it is still opened when advisory deletion is enabled.
+    let state_db = if store.advisory_delete() {
+        Some(SHAMapStoreSavedStateDb::open(config, "state")?)
     } else {
-        SHAMapStoreSavedState::default()
+        None
     };
 
     let SHAMapStoreBackendBundle {
         store: node_store,
         fd_required,
-        ..
+        saved_state,
     } = make_shamap_store_backend(
         manager,
         scheduler,
         read_threads,
         &node_db,
-        0,
-        &saved_state,
+        &SHAMapStoreSavedState::default(),
         burst_size,
         journal,
     )?;
@@ -127,7 +107,7 @@ pub fn bootstrap_shamap_store(
     Ok(SHAMapStoreBootstrap {
         store,
         node_store,
-        state_db: None,
+        state_db,
         effective_node_db_config: node_db,
     })
 }

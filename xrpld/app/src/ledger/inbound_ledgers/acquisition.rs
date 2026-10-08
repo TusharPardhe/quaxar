@@ -741,17 +741,10 @@ impl PersistenceWork for AcquisitionPersistenceWork {
                             write.key.hash,
                             write.key.ledger_seq,
                         ),
-                        SHAMapStoreNodeStore::Rotating(database) => database.store(
-                            write.object_type,
-                            write.data,
-                            write.key.hash,
-                            write.key.ledger_seq,
-                        ),
                     })
                 }
                 PersistenceCommand::DurabilityBarrier { .. } => match &node_store {
                     SHAMapStoreNodeStore::Single(database) => database.sync_result(),
-                    SHAMapStoreNodeStore::Rotating(database) => database.sync_result(),
                 },
             };
             let elapsed_seconds = started.elapsed().as_secs_f64();
@@ -4463,12 +4456,6 @@ fn build_resolver_visible_ledger(state: &AcquisitionState) -> Option<Arc<Ledger>
         }
         let object = match &node_store {
             SHAMapStoreNodeStore::Single(database) => database.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                nodestore::FetchType::Synchronous,
-                false,
-            ),
-            SHAMapStoreNodeStore::Rotating(database) => database.fetch_node_object(
                 hash.as_uint256(),
                 ledger_seq,
                 nodestore::FetchType::Synchronous,

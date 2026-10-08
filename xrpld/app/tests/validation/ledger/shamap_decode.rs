@@ -76,7 +76,7 @@ fn leaf_node_hash_recomputation_matches() {
         // Compute expected hash
         let expected_hash = compute_leaf_hash(&key, &payload);
 
-        // Decode via prefix form (how nodes are stored in NuDB)
+        // Decode via prefix form (how nodes are stored in the node store)
         // Prefix form: 0x4D4C4E00 (HashPrefix::LeafNode) + payload
         let mut prefix_blob = Vec::new();
         prefix_blob.extend_from_slice(&0x4D4C4E00u32.to_be_bytes());

@@ -34,7 +34,7 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# Check for C++ build tools (needed for RocksDB)
+# Check for MSVC build tools (the Rust MSVC target needs its linker)
 $hasVS = (Get-Command cl.exe -ErrorAction SilentlyContinue) -or
          (Test-Path "C:\Program Files\Microsoft Visual Studio") -or
          (Test-Path "C:\Program Files (x86)\Microsoft Visual Studio")

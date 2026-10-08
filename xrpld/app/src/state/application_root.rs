@@ -875,7 +875,7 @@ pub trait LedgerAcceptor: Send + Sync + 'static {
         None
     }
 
-    /// Get a node fetcher closure for backed state map reads from NuDB.
+    /// Get a node fetcher closure for backed state map reads from the node store.
     fn node_fetcher(
         &self,
     ) -> Option<
@@ -974,13 +974,6 @@ impl LedgerAcceptor for ApplicationRoot {
         Some(Arc::new(move |hash| {
             let data = match &ns {
                 crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => db
-                    .fetch_node_object(
-                        hash.as_uint256(),
-                        0,
-                        nodestore::FetchType::Synchronous,
-                        false,
-                    ),
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => db
                     .fetch_node_object(
                         hash.as_uint256(),
                         0,
@@ -4877,13 +4870,6 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                         nodestore::FetchType::Synchronous,
                         false,
                     ),
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => db
-                    .fetch_node_object(
-                        hash.as_uint256(),
-                        0,
-                        nodestore::FetchType::Synchronous,
-                        false,
-                    ),
             }?;
             shamap::nodes::tree_node::SHAMapTreeNode::make_from_prefix(data.data(), hash).ok()
         }))
@@ -6468,13 +6454,6 @@ impl ApplicationRoot {
                         nodestore::FetchType::Synchronous,
                         false,
                     ),
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => db
-                    .fetch_node_object(
-                        hash.as_uint256(),
-                        0,
-                        nodestore::FetchType::Synchronous,
-                        false,
-                    ),
             };
             let Some(data) = data else {
                 full_sync_debug!(
@@ -6524,9 +6503,6 @@ impl ApplicationRoot {
                 crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => {
                     db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
                 }
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => {
-                    db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
-                }
             },
         ))
     }
@@ -6556,9 +6532,6 @@ impl ApplicationRoot {
                 crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => {
                     db.store_batch(objects)
                 }
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => {
-                    db.store_batch(objects)
-                }
             }
         }))
     }
@@ -6586,9 +6559,6 @@ impl ApplicationRoot {
             move |object_type, hash, data, ledger_seq| {
                 let result = match &ns {
                     crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => {
-                        db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
-                    }
-                    crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => {
                         db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
                     }
                 };
@@ -6895,7 +6865,8 @@ impl ApplicationRoot {
                     untrusted.push(serialized);
                 }
             }
-            trusted.truncate(manifest_limits.max_trusted_count);
+            // rippled 54cfdda00b: trusted manifests are never dropped;
+            // max_trusted_count only sizes the largest accepted message.
             trusted.extend(
                 untrusted
                     .into_iter()
@@ -8748,7 +8719,7 @@ impl ApplicationRoot {
         // `LedgerMaster::switchLCL` installs `closedLedger_` and checks
         // validation; it does not evict the just-accepted state/transaction
         // maps. Evicting here clears shared nodes from the closed, open, and
-        // consensus-held views, forcing their next reads through NuDB while
+        // consensus-held views, forcing their next reads through the node store while
         // the next consensus round is still converging.
         // `SharedLedgerMasterState` (behind `ledger_master_state`) is this
         // node's SINGLE source of truth for "the closed ledger", matching
@@ -9436,9 +9407,6 @@ impl ApplicationRoot {
                 crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(database) => {
                     database.get_write_load()
                 }
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(database) => {
-                    database.get_write_load()
-                }
             })
     }
 
@@ -9452,9 +9420,6 @@ impl ApplicationRoot {
             .as_ref()
             .map(|node_store| match node_store {
                 crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(database) => {
-                    database.earliest_ledger_seq()
-                }
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(database) => {
                     database.earliest_ledger_seq()
                 }
             })
@@ -9677,7 +9642,7 @@ impl ApplicationRoot {
     /// cache-then-provider path used by ledger serving. A provider result is
     /// canonicalized as a nonvalidated history cache entry; callers must still
     /// apply compatibility, quorum, and publication policy themselves.
-    pub(crate) fn resolve_ledger_by_hash(&self, hash: SHAMapHash) -> Option<Arc<Ledger>> {
+    pub fn resolve_ledger_by_hash(&self, hash: SHAMapHash) -> Option<Arc<Ledger>> {
         let cache_visible_before = self.ledger_master_runtime().is_some_and(|runtime| {
             runtime
                 .ledger_master()
@@ -10618,9 +10583,9 @@ impl ApplicationRoot {
                     })?;
             }
             ledger.set_accepted(close_time, 0, true);
-            // Mark state_map unbacked: all nodes are in memory (never flushed to NuDB
+            // Mark state_map unbacked: all nodes are in memory (never flushed to the node store
             // in standalone mode). Without this, subsequent reads from child ledgers
-            // would try to fetch nodes from NuDB (which doesn't have them) and fail.
+            // would try to fetch nodes from the node store (which doesn't have them) and fail.
             ledger.state_map_mut().set_unbacked();
             Arc::new(ledger)
         };

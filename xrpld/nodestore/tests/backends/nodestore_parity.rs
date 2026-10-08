@@ -13,9 +13,9 @@ fn memory_section(path: &str) -> Section {
     section
 }
 
-fn rocksdb_section(path: &str) -> Section {
+fn fjall_section(path: &str) -> Section {
     let mut section = Section::new("node_db");
-    section.set("type", "RocksDB");
+    section.set("type", "fjall");
     section.set("path", path);
     section
 }
@@ -63,11 +63,11 @@ impl DatabaseSource for ExportedObjects {
 }
 
 #[test]
-fn manager_import_export_round_trips_between_memory_and_rocksdb() {
+fn manager_import_export_round_trips_between_memory_and_fjall() {
     let manager = ManagerImp::new();
     let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
     let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
-    let rocks_dir = TempDir::new().expect("tempdir");
+    let fjall_dir = TempDir::new().expect("tempdir");
 
     let source = manager
         .make_database(
@@ -78,15 +78,15 @@ fn manager_import_export_round_trips_between_memory_and_rocksdb() {
             Arc::clone(&journal),
         )
         .expect("source database");
-    let rocks = manager
+    let fjall = manager
         .make_database(
             0,
             Arc::clone(&scheduler),
             1,
-            &rocksdb_section(&rocks_dir.path().join("parity-rocks").to_string_lossy()),
+            &fjall_section(&fjall_dir.path().join("parity-fjall").to_string_lossy()),
             Arc::clone(&journal),
         )
-        .expect("rocksdb database");
+        .expect("fjall database");
     let restored = manager
         .make_database(0, scheduler, 1, &memory_section("parity-restored"), journal)
         .expect("restored database");
@@ -103,10 +103,10 @@ fn manager_import_export_round_trips_between_memory_and_rocksdb() {
     let source_export = manager.export(source.as_ref());
     assert_eq!(source_export.len(), 3);
 
-    manager.import(rocks.as_ref(), &ExportedObjects(source_export));
+    manager.import(fjall.as_ref(), &ExportedObjects(source_export));
 
     let mut visited_hashes = Vec::new();
-    manager.visit(rocks.as_ref(), &mut |object| {
+    manager.visit(fjall.as_ref(), &mut |object| {
         visited_hashes.push(*object.hash())
     });
     visited_hashes.sort();
@@ -121,7 +121,7 @@ fn manager_import_export_round_trips_between_memory_and_rocksdb() {
 
     manager.import(
         restored.as_ref(),
-        &ExportedObjects(manager.export(rocks.as_ref())),
+        &ExportedObjects(manager.export(fjall.as_ref())),
     );
 
     let source_map = export_map(manager.export(source.as_ref()));
@@ -129,6 +129,6 @@ fn manager_import_export_round_trips_between_memory_and_rocksdb() {
     assert_eq!(restored_map, source_map);
 
     source.stop();
-    rocks.stop();
+    fjall.stop();
     restored.stop();
 }

@@ -316,7 +316,7 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
         if let Some(loaded_runtime) = loaded_runtime {
             // Match rippled RCLValidationsAdaptor::acquire exactly: call the
             // application LedgerMaster lookup before requesting an inbound
-            // ledger. AppLoadedLedgerRuntime performs cache -> provider/NuDB
+            // ledger. AppLoadedLedgerRuntime performs cache -> provider/node store
             // reload -> current closed slot and canonicalizes a provider hit in
             // LedgerHistory. Do not hold an adaptor mutex during this I/O.
             match loaded_runtime.get_history_ledger_by_hash(hash) {

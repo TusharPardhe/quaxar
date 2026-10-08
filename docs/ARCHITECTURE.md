@@ -211,16 +211,14 @@ flowchart LR
     PLAN --> FB[FullBelow cache]
     PLAN --> FP[Fetch-pack cache]
     PLAN --> NS[NodeStore abstraction]
-    NS --> NUDB[NuDB]
-    NS --> OTHER[Other configured backend]
-    NUDB --> DATA[nudb.dat<br/>immutable values and spills]
-    NUDB --> KEY[nudb.key<br/>hash buckets]
-    NUDB --> LOG[nudb.log<br/>crash recovery preimages]
+    NS --> FJ[fjall LSM store]
+    FJ --> NODES[nodes keyspace<br/>hash to encoded node]
+    FJ --> IDX[notebook / counts / meta<br/>pruned index]
     HEAD[LedgerMaster] --> HIST[Ledger history indexes]
     HEAD --> RDB[Relational ledger and tx metadata]
 ```
 
-- `NodeStore` persists immutable ledger objects, normally in NuDB.
+- `NodeStore` persists immutable ledger objects in the fjall pruned store.
 - `NodeFamily` supplies the shared tree-node and full-below caches used by
   ledger acquisition and SHAMap reads.
 - LedgerMaster owns the fetch-pack cache; NodeStore and acquisition services
@@ -236,45 +234,19 @@ maintenance performs bounded sweeping based on cache age and size.
 Per-hash acquisition expiry removes registry/session ownership only; it does
 not discard valid immutable nodes already admitted to the shared caches or
 NodeStore. A later target can therefore complete from earlier partial work.
-Online-delete rotation freshens tree and transaction cache keys, clears prior
-LedgerMaster caches and then clears FullBelow state. A complete NodeFamily
-reset is reserved for ordered shutdown.
 
-Online deletion uses two physical backend generations. It copies archive-only
-objects needed by the validated state tree into the writable generation before
-atomically rotating. Copies are bounded into 64-hash durable batches. A
-foreground-writer gate gives consensus writes priority between maintenance
-batches, so maintenance cannot monopolize the writable generation.
-
-```mermaid
-sequenceDiagram
-    participant S as SHAMapStore worker
-    participant R as DatabaseRotating
-    participant A as Archive backend
-    participant W as Writable backend
-    participant C as Consensus writer
-
-    S->>R: copy validated-state hashes (bounded batch)
-    R->>W: batch-fetch existing hashes
-    R->>A: batch-fetch writable misses
-    C->>R: queue foreground checked batch
-    Note over R: foreground has priority before<br/>the next maintenance batch
-    R->>W: durable archive-copy batch
-    R->>W: foreground consensus batch
-    S->>R: rotate new writable generation
-    R->>R: old writable becomes archive<br/>and old archive is retired
-```
-
-The current Rust NuDB backend uses transactional burst overlays. It writes a
-small durable checkpoint header before file growth, keeps modified key buckets
-dirty and fetch-visible in memory, records only first-touch preimages of
-modified original buckets (`c0`), fsyncs those preimages before overwriting any
-bucket, writes each final dirty bucket once (`c1`), syncs data/key files, and
-atomically clears the log. Recovery replays selective preimages and truncates
-both files to the exact checkpoint extents. Because this implementation still
-commits synchronously, each burst is capped at 1,024 admitted objects to bound
-the mutation-fence latency; native NuDB-style asynchronous byte-budgeted
-admission remains a future backend evolution, not a property claimed here.
+Online deletion is continuous, not generational. Validated ledgers are handed
+to a dedicated pruned-store worker, so the publish path does no pruning I/O.
+For each ledger the worker diffs its state tree against the last claimed one
+(reading released subtrees back from the store), records reference counts for
+new state nodes and death records for retired ones, then deletes nodes whose
+death falls below the retention floor (`validated - online_delete`, capped by
+`can_delete`). A node written again after it died is kept until the next claim
+decides its fate. Each prune that deletes nodes clears the FullBelow cache, and
+the advertised `complete_ledgers` range and relational history are lowered to
+the retained floor in the same step. A periodic verify halts pruning if any
+required node is missing. See
+[the pruned node store design](design/2026-10-07-fjall-pruned-nodestore.md).
 
 ## Networking and trust
 
@@ -304,7 +276,7 @@ and quorum decisions.
 | `xrpld/consensus` | Consensus algorithm and timing primitives |
 | `xrpld/ledger` | Ledger domain model, history, acquisition and LedgerMaster |
 | `xrpld/overlay` | Peer protocol, PeerFinder and overlay runtime |
-| `xrpld/nodestore` | Immutable node-object storage and NuDB backend |
+| `xrpld/nodestore` | Immutable node-object storage, fjall backend and pruned index |
 | `xrpld/rdb` | Relational ledger/transaction metadata |
 | `xrpld/tx` | Transaction checks, application and queueing |
 | `xrpld/rpc` | RPC handlers, request roles and subscriptions |

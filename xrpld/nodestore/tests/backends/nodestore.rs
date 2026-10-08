@@ -1,11 +1,10 @@
 use basics::base_uint::Uint256;
 use basics::basic_config::Section;
 use nodestore::{
-    AsyncReadWork, BATCH_WRITE_PREALLOCATION_SIZE, Backend, DatabaseDelegate, DatabaseRotatingImp,
-    DatabaseRuntime, DatabaseSource, DecodedBlob, DummyScheduler, EncodedBlob, Factory,
-    FetchReport, JournalLevel, Manager, ManagerImp, MemoryFactory, NodeObject, NodeObjectType,
-    NodeStoreJournal, NullJournal, Status, filter_inner, nodeobject_compress,
-    nodeobject_decompress,
+    AsyncReadWork, BATCH_WRITE_PREALLOCATION_SIZE, Backend, DatabaseDelegate, DatabaseRuntime,
+    DatabaseSource, DecodedBlob, DummyScheduler, EncodedBlob, Factory, FetchReport, JournalLevel,
+    Manager, ManagerImp, MemoryFactory, NodeObject, NodeObjectType, NodeStoreJournal, NullJournal,
+    Status, filter_inner, nodeobject_compress, nodeobject_decompress,
 };
 use protocol::hash_prefix::HashPrefix;
 use std::sync::Arc;
@@ -159,19 +158,17 @@ fn manager_and_factory_lookup_are_case_insensitive() {
     assert!(manager.find("MeMoRy").is_some());
     assert!(manager.find("MEMORY").is_some());
     assert!(manager.find("none").is_some());
-    assert_eq!(
-        manager
-            .find("NuDB")
-            .expect("NuDB factory should remain available")
-            .get_name(),
-        "NuDB"
+    assert!(
+        manager.find("fjall").is_some(),
+        "the fjall node store is the registered backend"
     );
-    assert_eq!(
-        manager
-            .find("rocksdb")
-            .expect("rocksdb factory should remain available")
-            .get_name(),
-        "RocksDB"
+    assert!(
+        manager.find("NuDB").is_none(),
+        "the NuDB backend has been removed"
+    );
+    assert!(
+        manager.find("rocksdb").is_none(),
+        "the RocksDB backend has been removed"
     );
 }
 
@@ -443,89 +440,4 @@ fn database_async_fetch_does_not_swallow_panicking_callbacks() {
     assert!(second_rx.recv_timeout(Duration::from_millis(250)).is_err());
 
     database.stop();
-}
-
-#[test]
-fn rotating_database_duplicates_archive_hits_and_rotates_backend_names() {
-    let manager = ManagerImp::new();
-    let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
-    let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
-
-    let writable_config = config("rotating-writable");
-    let archive_config = config("rotating-archive");
-    let writable_backend: Arc<dyn nodestore::Backend> = Arc::from(
-        manager
-            .make_backend(
-                &writable_config,
-                0,
-                Arc::clone(&scheduler),
-                Arc::clone(&journal),
-            )
-            .expect("writable backend"),
-    );
-    writable_backend.open(true).expect("writable open");
-
-    let archive_backend: Arc<dyn nodestore::Backend> = Arc::from(
-        manager
-            .make_backend(
-                &archive_config,
-                0,
-                Arc::clone(&scheduler),
-                Arc::clone(&journal),
-            )
-            .expect("archive backend"),
-    );
-    archive_backend.open(true).expect("archive open");
-
-    let rotating = DatabaseRotatingImp::new(
-        Arc::clone(&scheduler),
-        1,
-        Arc::clone(&writable_backend),
-        Arc::clone(&archive_backend),
-        &writable_config,
-        Arc::clone(&journal),
-    )
-    .expect("rotating database");
-
-    let item = NodeObject::create_object(NodeObjectType::Ledger, vec![9, 8, 7], hash(0xAA));
-    archive_backend.store(Arc::clone(&item));
-
-    let fetched = rotating
-        .fetch_node_object(item.hash(), 0, nodestore::FetchType::Synchronous, true)
-        .expect("archive fetch");
-    assert_eq!(fetched.data(), &[9, 8, 7]);
-    assert_eq!(
-        writable_backend
-            .fetch(item.hash())
-            .0
-            .expect("writable duplicate")
-            .data(),
-        &[9, 8, 7]
-    );
-
-    let mut next_config = config("rotating-next");
-    next_config.set("path", "rotating-next");
-    let new_backend = manager
-        .make_backend(
-            &next_config,
-            0,
-            Arc::clone(&scheduler),
-            Arc::clone(&journal),
-        )
-        .expect("next backend");
-    new_backend.open(true).expect("next open");
-    let callback = Arc::new(std::sync::Mutex::new(None));
-    let seen = Arc::clone(&callback);
-    rotating.rotate(new_backend, move |writable_name, archive_name| {
-        *seen.lock().expect("callback mutex") =
-            Some((writable_name.to_owned(), archive_name.to_owned()));
-    });
-
-    assert_eq!(rotating.get_name(), "rotating-next");
-    assert_eq!(
-        callback.lock().expect("callback mutex").clone(),
-        Some(("rotating-next".to_owned(), "rotating-writable".to_owned()))
-    );
-
-    rotating.stop();
 }

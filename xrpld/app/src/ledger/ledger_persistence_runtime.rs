@@ -51,12 +51,6 @@ impl SHAMapNodeFetcher for PersistenceNodeStoreFetcher {
                 FetchType::Synchronous,
                 false,
             ),
-            crate::SHAMapStoreNodeStore::Rotating(database) => database.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                FetchType::Synchronous,
-                false,
-            ),
         }?;
 
         Some(SHAMapNodeObject::new(

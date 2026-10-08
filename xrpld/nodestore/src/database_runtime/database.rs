@@ -1,4 +1,4 @@
-use crate::database_runtime::node_object_cache::{NodeObjectCache, NodeObjectCacheMode};
+use crate::database_runtime::node_object_cache::NodeObjectCache;
 use crate::{
     Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType, NodeStoreJournal,
     Scheduler, Task, batch_write_preallocation_size,
@@ -199,6 +199,16 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
 
     fn async_fetch(&self, hash: Uint256, ledger_seq: u32, work: Box<dyn AsyncReadWork>);
 
+    /// Enqueue a batch of async reads. The default implementation falls back
+    /// to per-item `async_fetch`; `DatabaseRuntime`-backed implementations
+    /// override this to acquire the read-queue lock once and wake once,
+    /// avoiding a per-read futex wake storm during acquisition bursts.
+    fn async_fetch_batch(&self, requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>) {
+        for (hash, ledger_seq, work) in requests {
+            self.async_fetch(hash, ledger_seq, work);
+        }
+    }
+
     fn stop(&self);
 
     fn is_stopping(&self) -> bool;
@@ -225,30 +235,6 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
     fn export_backend(&self) -> Option<Arc<dyn Backend>> {
         None
     }
-}
-
-/// reference-style rotating owner extension.
-pub trait DatabaseRotating: Database {
-    /// Enable archive-read copy-forward for the complete rotation exposure
-    /// window, from cache freshening until `rotate` returns.
-    fn set_rotation_in_flight(&self, in_flight: bool);
-
-    /// Copy archive-resident objects into the current writable generation as
-    /// one bounded maintenance batch. Implementations must complete the write
-    /// synchronously before returning so online deletion can safely rotate the
-    /// archive afterward. The return value is the number of archive objects
-    /// submitted to the writable backend; hashes already present there and
-    /// hashes missing from both backends are not counted.
-    fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String>;
-
-    fn copy_to_writable_batch_detailed(
-        &self,
-        hashes: &[Uint256],
-    ) -> Result<(usize, Vec<Uint256>), String>;
-
-    fn store_account_nodes(&self, nodes: Vec<(Uint256, Blob)>) -> Result<(), String>;
-
-    fn rotate(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str));
 }
 
 /// Backward-compatible alias while older Rust modules migrate to the direct
@@ -479,27 +465,6 @@ impl DatabaseRuntime {
         config: &Section,
         journal: Arc<dyn NodeStoreJournal>,
     ) -> Result<Self, String> {
-        Self::new_with_node_object_cache_mode(
-            delegate,
-            scheduler,
-            read_threads,
-            config,
-            journal,
-            NodeObjectCacheMode::Enabled,
-        )
-    }
-
-    /// Constructs a runtime with an explicit NodeObject cache ownership mode.
-    /// Public callers retain the enabled-cache behavior through [`Self::new`];
-    /// rotating storage uses disabled mode so archive reads cannot be retained.
-    pub(crate) fn new_with_node_object_cache_mode(
-        delegate: Arc<dyn DatabaseDelegate>,
-        scheduler: Arc<dyn Scheduler>,
-        read_threads: usize,
-        config: &Section,
-        journal: Arc<dyn NodeStoreJournal>,
-        cache_mode: NodeObjectCacheMode,
-    ) -> Result<Self, String> {
         assert!(
             read_threads != 0,
             "xrpl::NodeStore::Database::new : nonzero threads input"
@@ -515,7 +480,7 @@ impl DatabaseRuntime {
             return Err("Invalid rq_bundle".to_owned());
         }
 
-        let node_object_cache = NodeObjectCache::new(cache_mode, config)?;
+        let node_object_cache = NodeObjectCache::from_config(config)?;
         let default_read_queue_budget =
             default_read_queue_budget(read_threads, request_bundle as usize)?;
         // Explicit operator settings may narrow or expand this shared logical
@@ -677,6 +642,99 @@ impl DatabaseRuntime {
             }
         };
         if let Some(work) = rejected {
+            self.inner
+                .read_callbacks_cancelled
+                .fetch_add(1, Ordering::Relaxed);
+            deliver_rejected_async_work(&self.inner, work);
+        }
+    }
+
+    /// Enqueue a batch of async reads under a SINGLE acquisition of the read
+    /// queue mutex and a SINGLE condvar wake, instead of one lock+notify per
+    /// node as repeated `async_fetch` calls would do.
+    ///
+    /// During a multi-ledger acquisition burst the broker submits thousands of
+    /// physical reads at once. Issuing them individually produced a futex
+    /// wake storm (`notify_one` per read -> `try_to_wake_up`/`futex_wake`
+    /// dominating the profile and `native_queued_spin_lock_slowpath`
+    /// contention), which starved the consensus runtime and stalled the
+    /// validated ledger. Batching collapses that to one lock hold and one
+    /// `notify_all`, matching rippled's batched NodeStore read scheduling.
+    ///
+    /// Admission limits (key/callback/byte) are evaluated per item exactly as
+    /// in `async_fetch`; rejected items are delivered as cancelled after the
+    /// lock is released.
+    pub fn async_fetch_batch(&self, requests: Vec<(Uint256, u32, Box<dyn AsyncReadWork>)>) {
+        if requests.is_empty() {
+            return;
+        }
+        let mut rejected: Vec<Box<dyn AsyncReadWork>> = Vec::new();
+        let mut admitted = 0usize;
+        {
+            let mut read_state = self
+                .inner
+                .read_state
+                .lock()
+                .expect("nodestore read queue mutex must not be poisoned");
+            let stopping = self.inner.is_stopping();
+            for (hash, ledger_seq, work) in requests {
+                let work_bytes = std::mem::size_of_val(work.as_ref())
+                    .saturating_add(std::mem::size_of::<AsyncReadRequest>());
+                let new_hash = !read_state.queue.contains_key(&hash);
+                let full = new_hash && read_state.queue.len() >= self.inner.read_queue_key_limit;
+                let callbacks_full = self
+                    .inner
+                    .outstanding_read_callbacks
+                    .load(Ordering::Acquire)
+                    >= self.inner.read_queue_callback_limit;
+                let bytes_full = self
+                    .inner
+                    .outstanding_read_bytes
+                    .load(Ordering::Acquire)
+                    .checked_add(work_bytes)
+                    .is_none_or(|total| total > self.inner.read_queue_byte_limit);
+                if stopping || full || callbacks_full || bytes_full {
+                    self.inner
+                        .read_queue_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    rejected.push(work);
+                    continue;
+                }
+                self.inner
+                    .outstanding_read_callbacks
+                    .fetch_add(1, Ordering::AcqRel);
+                self.inner
+                    .outstanding_read_bytes
+                    .fetch_add(work_bytes, Ordering::AcqRel);
+                read_state
+                    .queue
+                    .entry(hash)
+                    .or_default()
+                    .push(AsyncReadRequest {
+                        ledger_seq,
+                        work,
+                        _permit: ReadWorkPermit {
+                            inner: Arc::clone(&self.inner),
+                            bytes: work_bytes,
+                        },
+                    });
+                admitted += 1;
+            }
+            // Wake only as many workers as there is work for, bounded by the
+            // number of read threads. `notify_all` would wake every idle
+            // worker on every batch (even a 1-item batch), recreating the
+            // futex wake churn this batching is meant to remove. One
+            // `notify_one` per admitted item (capped at the thread count) wakes
+            // just enough workers to drain the batch in parallel.
+            if admitted > 0 {
+                let threads = self.inner.live_threads.load(Ordering::Relaxed).max(1);
+                let wakes = admitted.min(threads);
+                for _ in 0..wakes {
+                    self.inner.read_condvar.notify_one();
+                }
+            }
+        }
+        for work in rejected {
             self.inner
                 .read_callbacks_cancelled
                 .fetch_add(1, Ordering::Relaxed);
@@ -922,31 +980,6 @@ impl DatabaseRuntime {
 
     pub(crate) fn promote_node_object(&self, object: Arc<NodeObject>) {
         self.inner.node_object_cache.promote(object);
-    }
-
-    pub(crate) fn invalidate_node_object_cache(&self) {
-        self.inner.node_object_cache.invalidate_all();
-    }
-
-    /// Advance before a rotation changes which durable backend pairing owns a
-    /// read. The returned value is never zero and is safe to retain in a
-    /// `ReadKey` or persistence acknowledgement identity.
-    pub(crate) fn advance_store_generation(&self) -> u64 {
-        let mut observed = self.inner.store_generation.load(Ordering::Acquire);
-        loop {
-            let next = observed
-                .checked_add(1)
-                .expect("NodeStore storage generation overflow");
-            match self.inner.store_generation.compare_exchange_weak(
-                observed,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return next,
-                Err(current) => observed = current,
-            }
-        }
     }
 
     pub fn store_generation(&self) -> u64 {

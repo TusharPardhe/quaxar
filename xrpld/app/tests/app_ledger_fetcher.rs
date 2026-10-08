@@ -87,9 +87,9 @@ fn acquired_tx_set_decodes_to_cpp_canonical_order_not_tx_map_leaf_order() {
 }
 
 /// Build a parent ledger that has one account root in its state tree,
-/// flush all nodes to NuDB, and attach fetcher + writer so the built
+/// flush all nodes to the node store, and attach fetcher + writer so the built
 /// child ledger can read state back through the node store.
-fn parent_with_account_in_nudb(
+fn parent_with_account_in_store(
     seq: u32,
     account: AccountID,
     balance_drops: u64,
@@ -114,7 +114,7 @@ fn parent_with_account_in_nudb(
         )
         .expect("account root should insert");
 
-    // 3. Build the ledger (backed=true so reads go through NuDB).
+    // 3. Build the ledger (backed=true so reads go through the node store).
     let state_map = SyncTree::from_root_with_type(
         state_tree.root(),
         SHAMapType::State,
@@ -140,9 +140,6 @@ fn parent_with_account_in_nudb(
             app::SHAMapStoreNodeStore::Single(db) => {
                 db.fetch_node_object(hash.as_uint256(), 0, FetchType::Synchronous, false)
             }
-            app::SHAMapStoreNodeStore::Rotating(db) => {
-                db.fetch_node_object(hash.as_uint256(), 0, FetchType::Synchronous, false)
-            }
         }?;
         shamap::nodes::tree_node::SHAMapTreeNode::make_from_prefix(data.data(), hash).ok()
     }));
@@ -154,13 +151,10 @@ fn parent_with_account_in_nudb(
             app::SHAMapStoreNodeStore::Single(db) => db
                 .store(test_node_type(object_type), data, hash, ledger_seq)
                 .expect("test node store write should succeed"),
-            app::SHAMapStoreNodeStore::Rotating(db) => db
-                .store(test_node_type(object_type), data, hash, ledger_seq)
-                .expect("test node store write should succeed"),
         },
     ));
 
-    // 5. Finalize: flush dirty nodes to NuDB, then mark immutable.
+    // 5. Finalize: flush dirty nodes to the node store, then mark immutable.
     ledger.flush_state_map_to_store();
     ledger.set_immutable(true);
     ledger
@@ -207,9 +201,6 @@ fn backed_fee_ledger_without_fetcher(
             app::SHAMapStoreNodeStore::Single(db) => db
                 .store(test_node_type(object_type), data, hash, ledger_seq)
                 .expect("test node store write should succeed"),
-            app::SHAMapStoreNodeStore::Rotating(db) => db
-                .store(test_node_type(object_type), data, hash, ledger_seq)
-                .expect("test node store write should succeed"),
         },
     ));
     ledger.flush_state_map_to_store();
@@ -239,9 +230,9 @@ fn backed_fee_ledger_without_fetcher(
     )
 }
 
-// ── NuDB bootstrap helper ────────────────────────────────────────────────────
+// ── Node store bootstrap helper ────────────────────────────────────────────────────
 
-fn nudb_bootstrap() -> (TempDir, app::SHAMapStoreNodeStore) {
+fn node_store_bootstrap() -> (TempDir, app::SHAMapStoreNodeStore) {
     let dir = TempDir::new().expect("tempdir");
     let mut config = BasicConfig::new();
     config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
@@ -270,7 +261,7 @@ fn nudb_bootstrap() -> (TempDir, app::SHAMapStoreNodeStore) {
 
 #[test]
 fn application_root_attaches_node_fetcher_to_backed_ledger_holders() {
-    let (_dir, node_store) = nudb_bootstrap();
+    let (_dir, node_store) = node_store_bootstrap();
     let mut root = ApplicationRoot::new(0).expect("root");
     root.attach_node_store(Some(node_store));
 
@@ -302,7 +293,7 @@ fn application_root_attaches_node_fetcher_to_backed_ledger_holders() {
 
 #[test]
 fn application_root_refreshes_fee_setup_after_attaching_fetcher() {
-    let (_dir, node_store) = nudb_bootstrap();
+    let (_dir, node_store) = node_store_bootstrap();
     let fees = Fees {
         base: 10,
         reserve: 1_000_000,
@@ -326,7 +317,7 @@ fn application_root_refreshes_fee_setup_after_attaching_fetcher() {
 
 #[test]
 fn application_root_replaces_stale_fetcher_when_family_runtime_is_attached() {
-    let (_dir, node_store) = nudb_bootstrap();
+    let (_dir, node_store) = node_store_bootstrap();
     let fees = Fees {
         base: 12,
         reserve: 2_000_000,
@@ -356,17 +347,17 @@ fn application_root_replaces_stale_fetcher_when_family_runtime_is_attached() {
 }
 
 /// Core regression test: a Sandbox built on a parent ledger whose state is
-/// stored in NuDB must be able to read account roots through the node fetcher.
+/// stored in the node store must be able to read account roots through the node fetcher.
 /// This is the offline equivalent of the TER_NO_ACCOUNT storm seen on mainnet.
 #[test]
-fn build_ledger_from_acquired_tx_reads_account_through_nudb_fetcher() {
-    let (_dir, node_store) = nudb_bootstrap();
+fn build_ledger_from_acquired_tx_reads_account_through_node_store_fetcher() {
+    let (_dir, node_store) = node_store_bootstrap();
 
     let account = AccountID::from_array([0x42; 20]);
     let balance = 100_000_000u64;
 
-    // Parent ledger: account root written to NuDB.
-    let parent = parent_with_account_in_nudb(100, account, balance, &node_store);
+    // Parent ledger: account root written to the node store.
+    let parent = parent_with_account_in_store(100, account, balance, &node_store);
     assert!(parent.has_node_fetcher(), "parent must have fetcher");
 
     // Simulate what build_ledger_from_acquired_tx does: clone parent into a
@@ -383,7 +374,7 @@ fn build_ledger_from_acquired_tx_reads_account_through_nudb_fetcher() {
 
     assert!(
         result.is_some(),
-        "account root not found in NuDB — TER_NO_ACCOUNT regression: \
+        "account root not found in the node store — TER_NO_ACCOUNT regression: \
          Sandbox::peek returned None even though the account exists in the node store"
     );
 
@@ -403,13 +394,13 @@ fn build_ledger_from_acquired_tx_reads_account_through_nudb_fetcher() {
 /// when child nodes are not loaded in memory.
 #[test]
 fn sandbox_peek_fails_without_node_fetcher() {
-    let (_dir, node_store) = nudb_bootstrap();
+    let (_dir, node_store) = node_store_bootstrap();
 
     let account = AccountID::from_array([0x42; 20]);
     let balance = 100_000_000u64;
 
-    // Build parent with fetcher so nodes are written to NuDB.
-    let parent = parent_with_account_in_nudb(100, account, balance, &node_store);
+    // Build parent with fetcher so nodes are written to the node store.
+    let parent = parent_with_account_in_store(100, account, balance, &node_store);
 
     // Strip the fetcher: rebuild from the same state root but backed=true, no fetcher.
     let state_root = parent.state_map().root();
@@ -441,7 +432,7 @@ fn sandbox_peek_fails_without_node_fetcher() {
 
 #[test]
 fn application_root_does_not_renormalize_fully_wired_ledger_with_shared_family() {
-    let (_dir, node_store) = nudb_bootstrap();
+    let (_dir, node_store) = node_store_bootstrap();
     let mut root = ApplicationRoot::new(0).expect("root");
     root.attach_node_store(Some(node_store));
     root.attach_default_node_family();

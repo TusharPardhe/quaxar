@@ -305,6 +305,11 @@ pub struct PaymentCheckPermissionFacts {
     pub trustline_exists: bool,
     pub account_is_holder: Option<bool>,
     pub dest_limit_positive: Option<bool>,
+    /// rippled #c8e767 (fixCleanup3_4_0): true when sfAmount is within the
+    /// balance the source account currently holds, so redeeming it does not
+    /// cross zero into minting the account's own IOUs.
+    pub fix_cleanup_3_4_0: bool,
+    pub dst_amount_within_held: Option<bool>,
 }
 
 pub fn run_payment_check_permission(facts: PaymentCheckPermissionFacts) -> NotTec {
@@ -349,7 +354,21 @@ pub fn run_payment_check_permission(facts: PaymentCheckPermissionFacts) -> NotTe
     }
     if facts.payment_burn_permission {
         if let Some(true) = facts.account_is_holder {
-            return Ter::TES_SUCCESS;
+            // rippled #c8e767: redeeming stops at the balance held; beyond that
+            // the payment engine crosses zero and issues the account's own
+            // IOUs, which is a mint. With only PaymentBurn we must check the
+            // amount against the balance held once fixCleanup3_4_0 is enabled.
+            // mayIssue == the account also holds PaymentMint and the
+            // destination is willing to hold its IOUs (dest_limit_positive).
+            if facts.fix_cleanup_3_4_0 {
+                let may_issue = facts.payment_mint_permission
+                    && facts.dest_limit_positive == Some(true);
+                if facts.dst_amount_within_held == Some(true) || may_issue {
+                    return Ter::TES_SUCCESS;
+                }
+            } else {
+                return Ter::TES_SUCCESS;
+            }
         }
     }
     Ter::TER_NO_DELEGATE_PERMISSION

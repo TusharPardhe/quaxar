@@ -9,16 +9,9 @@
 //! The export calls `Backend::for_each` which iterates all stored nodes.
 //! Consistency guarantees depend on the backend implementation:
 //!
-//! - **NuDB**: The data file is append-only. Iteration reads sequentially through
-//!   the data file. Concurrent writes append new records but do not modify existing
-//!   ones. The iterator sees a consistent view of all records that existed at the
-//!   time iteration started, plus potentially some records appended during iteration.
-//!   This is acceptable: extra nodes do not corrupt the snapshot (they are simply
-//!   additional data the loader writes to the target backend).
-//!
-//! - **RocksDB**: The iterator internally holds an LSM snapshot at creation time.
-//!   Concurrent writes are invisible to the iterator. This provides strict
-//!   point-in-time consistency automatically.
+//! - **fjall**: `for_each` iterates the `nodes` keyspace through an LSM
+//!   snapshot taken when iteration starts, so concurrent writes are invisible
+//!   to the iterator and the export is point-in-time consistent.
 //!
 //! - **MemoryBackend** (tests only): Uses a `HashMap` behind a `Mutex`. The
 //!   `for_each` implementation locks and clones the map, providing a consistent

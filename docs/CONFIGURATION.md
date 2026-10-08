@@ -119,29 +119,29 @@ Configures persistent ledger object storage.
 
 | Key | Meaning |
 |-----|---------|
-| `type` | Storage backend, commonly `NuDB` or `RocksDB`. |
+| `type` | Storage backend. Only `fjall` is supported. |
 | `path` | Filesystem path for the node database. |
-| `nudb_block_size` | Optional NuDB block size. |
-| `online_delete` | Retention interval; `0` disables online deletion. Minimum `256` on a networked node and `8` in standalone mode. |
-| `advisory_delete` | When enabled, deletion waits for the advisory `can_delete` boundary. |
+| `online_delete` | Retention window in validated ledgers; `0` disables pruning. Minimum `256` on a networked node and `8` in standalone mode. |
+| `advisory_delete` | When enabled, pruning pauses at the advisory `can_delete` boundary. |
+| `cache_mb` | Block-cache budget for the fjall store, in MB. Defaults from `node_size`. |
+| `reserve_mb` | Disk-full ballast reserved at open, in MB; default `1024`, `0` disables. Released under disk pressure so compaction and deletes have room. |
+| `compaction_base_mb` | Size of the first leveled-compaction level of the node keyspace, in MB (`16`–`4096`, default `256`). Levels grow ×10 from it. Pick it so the live node set sits just under a level target: `256` for mainnet-sized stores, `64` for testnet/devnet. Fixed when the store is created; changing it needs a fresh store. |
+| `prune_mode` | `on` (default) deletes dead nodes as the window advances; `dry_run` logs what it would delete without deleting. |
+| `prune_batch` | Notebook rows processed per prune batch; default `10000`. |
 | `delete_batch` | Relational cleanup batch size; default `100`. |
 | `back_off_milliseconds` | Delay between relational cleanup batches; default `100`. Legacy key `backOff` is also accepted. |
-| `age_threshold_seconds` | Maximum validated-ledger age allowed before a rotation waits; default `60`. |
-| `recovery_wait_seconds` | Retry delay after a rotation health gate blocks; default `2`, matching `rippled`. |
 
 When nonzero, `online_delete` must be at least the selected numeric
-`ledger_history`. Online-delete rotation freshens cache generations and clears
-prior-ledger and FullBelow state; it is separate from normal age/size sweeps.
-The value is a rotation interval, not an exact instantaneous row count. Like
-`rippled`, Quaxar keeps the current writable NodeStore generation and one
-archive generation, so retained ledger coverage normally varies between about
-one and two `online_delete` intervals. At each successful rotation, SQL ledger,
-transaction, and account-transaction rows older than the previous rotation
-boundary are deleted in bounded batches.
-Rotating NodeStores intentionally bypass the encoded `NodeObject` cache, matching
-`rippled`: reads go directly to the writable and archive backends so cached
-archive objects cannot hide copy-forward work during rotation. Cache-size and
-cache-age settings apply only to non-rotating NodeStores.
+`ledger_history`. The fjall store prunes continuously: as each validated
+ledger is claimed, nodes that no ledger within the last `online_delete`
+validated ledgers still needs are deleted, in bounded `prune_batch` steps. The
+retained floor advertised to peers tracks the prune cursor exactly, so there
+is no rotation interval or archive generation; retained coverage is the last
+`online_delete` ledgers rather than one-to-two rotation intervals. SQL ledger,
+transaction, and account-transaction rows older than the retained floor are
+deleted in bounded batches. Single-key deletes replace the old generation
+rotation, so the encoded `NodeObject` cache stays enabled and `cache_mb`
+applies normally.
 
 ### `[database_path]`
 

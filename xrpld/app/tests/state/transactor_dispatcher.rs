@@ -5,7 +5,6 @@ use app::state::application_root::{
     apply_submit_transactor_shell_with_delivered_amount,
 };
 use app::state::lending::calculate_loan_pay_base_fee;
-use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint192, Uint256};
 use basics::number::NumberParts as RuntimeNumber;
 use basics::string_utilities::str_unhex;
@@ -36,6 +35,30 @@ use sha2::{Digest, Sha256};
 
 fn sample_account(fill: u8) -> AccountID {
     AccountID::from_array([fill; 20])
+}
+
+/// Handler-level tests bypass the fee shell. Production always supplies the
+/// source pre-fee balance (rippled `Transactor::preFeeBalance_` is captured in
+/// `Transactor::apply` before the fee is charged), so when a test passes
+/// `None` capture it from the fixture AccountRoot at the same boundary. An
+/// explicit `Some(balance)` is forwarded unchanged.
+fn handle_real_dispatch<V: ApplyView>(
+    view: &mut V,
+    tx: &STTx,
+    tx_type: TxType,
+    pre_fee_balance: Option<i64>,
+) -> Ter {
+    let pre_fee_balance = pre_fee_balance.or_else(|| {
+        if !tx.is_field_present(sf("sfAccount")) {
+            return None;
+        }
+        let account = tx.get_account_id(sf("sfAccount"));
+        view.read(account_keylet(raw_account_id(account)))
+            .ok()
+            .flatten()
+            .map(|sle| sle.get_field_amount(sf("sfBalance")).xrp().drops())
+    });
+    app::state::transactor_dispatcher::handle_real_dispatch(view, tx, tx_type, pre_fee_balance)
 }
 
 fn dispatch_with_pre_fee_balance<V: ApplyView>(view: &mut V, tx: &STTx, tx_type: TxType) -> Ter {
@@ -1402,12 +1425,16 @@ fn escrow_finish_mpt_token_escrow_v1_tracks_gross_lock_and_transfer_fee() {
                 escrow,
             ],
         );
-        ledger.set_rules(protocol::Rules::new([]));
+        // EscrowFinish::doApply gates non-XRP escrows on TokenEscrow
+        // (EscrowFinish.cpp temDISABLED); MPT escrows also need MPTokensV1.
+        let mut features = vec![
+            protocol::feature_id("TokenEscrow"),
+            protocol::feature_id("MPTokensV1"),
+        ];
         if amended {
-            ledger.set_rules(protocol::Rules::new([protocol::feature_id(
-                "fixTokenEscrowV1",
-            )]));
+            features.push(protocol::feature_id("fixTokenEscrowV1"));
         }
+        ledger.set_rules(protocol::Rules::new(features));
 
         let tx = STTx::new(TxType::ESCROW_FINISH, |object| {
             object.set_account_id(sf("sfAccount"), destination);
@@ -1514,6 +1541,8 @@ fn escrow_finish_mpt_cleanup_3_4_rounds_transfer_fee_down() {
         // Upstream exercises both cleanup paths with MPTokensV2 enabled;
         // the legacy path still requests directed upward rounding.
         let mut features = vec![
+            protocol::feature_id("TokenEscrow"),
+            protocol::feature_id("MPTokensV1"),
             protocol::feature_id("fixTokenEscrowV1"),
             protocol::feature_id("MPTokensV2"),
         ];
@@ -2146,13 +2175,15 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
         })
     };
 
-    let receiver_ledger = empty_ledger(vec![
+    let mut receiver_ledger = empty_ledger(vec![
         account_root(owner, 1, 0),
         account_root(destination, 0, 0),
         account_root(issuer, 0, 0),
         owner_dir_root(owner, escrow_keylet.key),
         escrow(),
     ]);
+    // IOU escrows require TokenEscrow (EscrowFinish.cpp temDISABLED).
+    receiver_ledger.set_rules(protocol::Rules::new([protocol::feature_id("TokenEscrow")]));
     let mut receiver_view = ApplyViewImpl::new(Arc::new(receiver_ledger), ApplyFlags::NONE);
     assert_eq!(
         handle_real_dispatch(
@@ -2193,13 +2224,14 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
         1
     );
 
-    let owner_no_line_ledger = empty_ledger(vec![
+    let mut owner_no_line_ledger = empty_ledger(vec![
         account_root(owner, 1, 0),
         account_root(destination, 0, 0),
         account_root(issuer, 0, 0),
         owner_dir_root(owner, escrow_keylet.key),
         escrow(),
     ]);
+    owner_no_line_ledger.set_rules(protocol::Rules::new([protocol::feature_id("TokenEscrow")]));
     let mut owner_no_line_view =
         ApplyViewImpl::new(Arc::new(owner_no_line_ledger), ApplyFlags::NONE);
     assert_eq!(
@@ -2226,7 +2258,7 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
             Issue::new(currency, destination),
         ),
     );
-    let limited_ledger = empty_ledger(vec![
+    let mut limited_ledger = empty_ledger(vec![
         account_root(owner, 1, 0),
         account_root(destination, 1, 0),
         account_root(issuer, 0, 0),
@@ -2234,6 +2266,7 @@ fn escrow_finish_iou_unlocks_live_path_with_receiver_line_rules() {
         escrow(),
         limited_line,
     ]);
+    limited_ledger.set_rules(protocol::Rules::new([protocol::feature_id("TokenEscrow")]));
     let mut limited_view = ApplyViewImpl::new(Arc::new(limited_ledger), ApplyFlags::NONE);
     assert_eq!(
         handle_real_dispatch(
@@ -5054,6 +5087,8 @@ fn fix_mpt_delivered_amount_records_actual_partial_mpt_delivery_only_when_enable
                 account_root(issuer, 1, 0),
                 issuance,
                 mptoken_entry(source, mpt_id, 10_000),
+                // requireAuth(dst) returns tecNO_AUTH without a holder MPToken.
+                mptoken_entry(destination, mpt_id, 0),
             ]);
             if amendment_enabled {
                 ledger.set_rules(protocol::Rules::new([protocol::fix_mpt_delivered_amount()]));
@@ -6399,6 +6434,10 @@ fn payment_recycles_max_issued_mpt_between_holders() {
         account_root(issuer, 1, 0),
         issuance,
         mptoken_entry(source, mpt_id, 50),
+        // rippled Payment::doApply requireAuth(dst) fails with tecNO_AUTH when
+        // the destination holds no MPToken, so a holder-to-holder transfer
+        // needs the destination's (empty) token.
+        mptoken_entry(destination, mpt_id, 0),
     ]);
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::PAYMENT, |object| {
@@ -6413,7 +6452,7 @@ fn payment_recycles_max_issued_mpt_between_holders() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None),
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000_000)),
         Ter::TES_SUCCESS
     );
     assert_eq!(
@@ -6442,6 +6481,41 @@ fn payment_recycles_max_issued_mpt_between_holders() {
             .expect("issuance")
             .get_field_u64(sf("sfOutstandingAmount")),
         100
+    );
+}
+
+#[test]
+fn payment_mpt_to_holder_without_mptoken_returns_tec_no_auth() {
+    // rippled Payment::doApply (direct MPT branch) calls requireAuth for the
+    // destination with AuthType::Legacy; a missing MPToken yields tecNO_AUTH
+    // (MPTokenHelpers.cpp requireAuth "if account has no MPToken, fail").
+    let source = sample_account(0xDA);
+    let destination = sample_account(0xDB);
+    let issuer = sample_account(0xDC);
+    let mpt_id = share_id_for(issuer, 1);
+    let mpt_issue = MPTIssue::new(mpt_id);
+    let issuance = mpt_issuance_entry(issuer, 1, 100, protocol::lsfMPTCanTransfer);
+    let ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 1_000_000_000),
+        account_root(issuer, 1, 0),
+        issuance,
+        mptoken_entry(source, mpt_id, 50),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::PAYMENT, |object| {
+        object.set_account_id(sf("sfAccount"), source);
+        object.set_account_id(sf("sfDestination"), destination);
+        object.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(10), mpt_issue),
+        );
+        object.set_field_amount(sf("sfFee"), test_xrp(10));
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000_000)),
+        Ter::TEC_NO_AUTH
     );
 }
 
@@ -8503,16 +8577,22 @@ fn cleanup_3_3_0_rejects_pseudo_accounts_as_credential_subjects_and_preauth_targ
         account_root_with_balance(owner, 0, 0, 10_000_000),
         pseudo_root,
     ]);
-    ledger.set_rules(protocol::Rules::new([protocol::fix_cleanup_3_3_0()]));
+    ledger.set_rules(protocol::Rules::new([
+        protocol::fix_cleanup_3_3_0(),
+        protocol::feature_id("Credentials"),
+        protocol::feature_id("DepositPreauth"),
+    ]));
 
     let mut credential_view = ApplyViewImpl::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    // Both rejections live in rippled preclaim (CredentialCreate.cpp and
+    // DepositPreauth.cpp, gated on fixCleanup3_3_0), so run the full
+    // preflight/preclaim/apply pipeline rather than the doApply dispatcher.
     assert_eq!(
-        handle_real_dispatch(
+        apply_simulated_transaction(
             &mut credential_view,
             &credential_create_tx(issuer, pseudo, b"pseudo"),
-            TxType::CREDENTIAL_CREATE,
-            Some(10_000_000),
-        ),
+        )
+        .0,
         Ter::TEC_PSEUDO_ACCOUNT
     );
 
@@ -8524,12 +8604,7 @@ fn cleanup_3_3_0_rejects_pseudo_accounts_as_credential_subjects_and_preauth_targ
     });
     let mut preauth_view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     assert_eq!(
-        handle_real_dispatch(
-            &mut preauth_view,
-            &preauth,
-            TxType::DEPOSIT_PREAUTH,
-            Some(10_000_000),
-        ),
+        apply_simulated_transaction(&mut preauth_view, &preauth).0,
         Ter::TEC_PSEUDO_ACCOUNT
     );
 }
@@ -9725,6 +9800,11 @@ fn delegate_set_reserve_uses_sponsor_adjusted_owner_and_account_counts() {
     let mut account_sle = account_root_with_balance(account, 1, 0, 160);
     account_sle.set_field_u32(sf("sfSponsoredOwnerCount"), 1);
     let mut ledger = empty_ledger(vec![account_sle, account_root(authorize, 0, 0)]);
+    // DelegateSet is gated on PermissionDelegationV1_1 and sponsored counts on Sponsor.
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("PermissionDelegationV1_1"),
+        protocol::feature_id("Sponsor"),
+    ]));
     ledger.set_fees(Fees {
         base: 10,
         reserve: 100,
@@ -13484,9 +13564,14 @@ fn vault_delete_dispatch_removes_vault_and_share_issuance() {
                 MPT_CAN_ESCROW_FLAG | MPT_CAN_TRADE_FLAG | MPT_CAN_TRANSFER_FLAG,
             ),
             owner_token,
-            owner_dir_root(
+            // VaultDelete removes both the owner's share holding and the
+            // vault itself from the owner directory (VaultDelete.cpp).
+            owner_dir_root_with_children(
                 owner,
-                protocol::mptoken_keylet_from_mptid(share_id, raw_account_id(owner)).key,
+                vec![
+                    protocol::mptoken_keylet_from_mptid(share_id, raw_account_id(owner)).key,
+                    vault_id,
+                ],
             ),
             owner_dir_root(
                 pseudo,
@@ -14137,9 +14222,12 @@ fn vault_deposit_dispatch_rejects_zero_at_depositor_trustline_scale() {
             get_field_by_symbol("sfFee"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
         );
+        object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::VAULT_DEPOSIT, None);
+    // rippled rejects this in VaultDeposit::preclaim (amount.isZeroAtScale at
+    // the depositor's trust-line scale), so run preflight/preclaim/apply.
+    let result = apply_simulated_transaction(&mut view, &tx).0;
 
     assert_eq!(result, protocol::Ter::TEC_PRECISION_LOSS);
     assert!(
@@ -14589,6 +14677,12 @@ fn vault_withdraw_sole_shareholder_clean_full_exit_zeroes_vault() {
             MPT_CAN_ESCROW_FLAG | MPT_CAN_TRADE_FLAG | MPT_CAN_TRANSFER_FLAG,
         ),
         mptoken_entry(holder, share_id, 700),
+        // Emptied share holdings are removed via removeEmptyHolding, which
+        // unlinks the MPToken from the holder's owner directory.
+        owner_dir_root(
+            holder,
+            protocol::mptoken_keylet_from_mptid(share_id, raw_account_id(holder)).key,
+        ),
     ]);
     ledger.set_rules(protocol::Rules::new([
         protocol::feature_id("SingleAssetVault"),
@@ -14651,6 +14745,12 @@ fn vault_withdraw_sole_shareholder_clean_full_asset_exit_zeroes_vault() {
             MPT_CAN_ESCROW_FLAG | MPT_CAN_TRADE_FLAG | MPT_CAN_TRANSFER_FLAG,
         ),
         mptoken_entry(holder, share_id, 700),
+        // Emptied share holdings are removed via removeEmptyHolding, which
+        // unlinks the MPToken from the holder's owner directory.
+        owner_dir_root(
+            holder,
+            protocol::mptoken_keylet_from_mptid(share_id, raw_account_id(holder)).key,
+        ),
     ]);
     ledger.set_rules(protocol::Rules::new([
         protocol::feature_id("SingleAssetVault"),
@@ -14725,6 +14825,12 @@ fn vault_clawback_dispatch_burns_holder_shares() {
                 MPT_CAN_ESCROW_FLAG | MPT_CAN_TRADE_FLAG | MPT_CAN_TRANSFER_FLAG,
             ),
             mptoken_entry(holder, share_id, 500),
+            // Emptied share holdings are removed via removeEmptyHolding, which
+            // unlinks the MPToken from the holder's owner directory.
+            owner_dir_root(
+                holder,
+                protocol::mptoken_keylet_from_mptid(share_id, raw_account_id(holder)).key,
+            ),
         ]);
         ledger.set_rules(protocol::Rules::new([protocol::feature_id(
             "SingleAssetVault",
@@ -18193,8 +18299,16 @@ fn loan_pay_overpayment_applies_penalty_fee_management_split_and_reamortizes() {
     );
 }
 
+/// rippled LendingHelpers.cpp tryOverpayment/doOverpayment on this fixture
+/// (zero interest, 2 payments left after the 3333 periodic payment, 1667
+/// overpayment with 5% fee, 20% overpayment interest, 10% management fee):
+/// trackedPrincipalDelta = 1667 - 300 - 33 - 83 = 1251; theoretical state
+/// 2*3333 = 6666 (rounding error 1); new principal 6666 - 1251 + 1 = 5416.
+/// checkLoanGuards passes (no interest expected or found, first payment
+/// principal 2707.5 > 0, ceil(5416 / roundUp(2707.5)) = 2 payments) and
+/// valueChange = 0 is not > 0, so the overpayment is applied, not ignored.
 #[test]
-fn loan_pay_overpayment_skips_invalid_reamortization_guard() {
+fn loan_pay_zero_interest_overpayment_reamortizes_like_rippled() {
     let borrower = sample_account(0x91);
     let broker_owner = sample_account(0x92);
     let broker_pseudo = sample_account(0x93);
@@ -18270,13 +18384,19 @@ fn loan_pay_overpayment_skips_invalid_reamortization_guard() {
         updated_loan
             .get_field_number(get_field_by_symbol("sfPrincipalOutstanding"))
             .value(),
-        RuntimeNumber::from_i64(6_667)
+        RuntimeNumber::from_i64(5_416)
     );
     assert_eq!(
         updated_loan
             .get_field_number(get_field_by_symbol("sfPeriodicPayment"))
             .value(),
-        RuntimeNumber::from_i64(3_333)
+        RuntimeNumber::from_i64_and_exponent(27_075, -1)
+    );
+    assert_eq!(
+        updated_loan
+            .get_field_number(get_field_by_symbol("sfTotalValueOutstanding"))
+            .value(),
+        RuntimeNumber::from_i64(5_416)
     );
 }
 

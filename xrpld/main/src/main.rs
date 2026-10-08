@@ -1754,15 +1754,6 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
         }
     };
 
-    // Resolve sharded NuDB layout: actual files live in xrpldb.NNNN subdirectories.
-    let mut node_db = node_db;
-    if let Ok(Some(base_path)) = node_db.get::<String>("path") {
-        let writable_path = Path::new(&base_path).join("xrpldb.0000");
-        if writable_path.join("nudb.dat").exists() {
-            node_db.set("path", writable_path.to_string_lossy().into_owned());
-        }
-    }
-
     let manager = ManagerImp::instance();
     let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
     let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
@@ -1787,16 +1778,68 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
     ));
 
     match load_snapshot(backend.as_ref(), input_path) {
-        Ok(manifest) => {
-            backend.sync();
-            let _ = backend.close();
-            spinner.finish_with_message("✓ Snapshot import complete and integrity verified");
-            println!(
-                "  → Ledger seq: {}, chunks: {}",
-                manifest.ledger_seq,
-                manifest.chunks.len()
-            );
-            true
+        Ok(outcome) => {
+            let manifest = &outcome.manifest;
+            // For the fjall pruned store, adopt the imported snapshot as the
+            // anchor ledger: reconcile `nodes` down to the snapshot's node set
+            // (reclaiming any prior-sync leftovers) and stamp the anchor so the
+            // first validated ledger diffs against it (design Case 7).
+            let db_type = node_db
+                .get::<String>("type")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "fjall".to_owned());
+            if db_type.eq_ignore_ascii_case("fjall") {
+                let required: std::collections::BTreeSet<_> =
+                    outcome.required_nodes.iter().copied().collect();
+                let state_root = basics::base_uint::Uint256::from_array(manifest.account_hash);
+                let anchor_seq = manifest.ledger_seq;
+                let arc_backend: Arc<dyn nodestore::Backend> = Arc::from(backend);
+                match nodestore::PrunedStore::open(
+                    Arc::clone(&arc_backend),
+                    nodestore::PrunedConfig::default(),
+                ) {
+                    Ok(store) => match store.adopt_snapshot(&required, anchor_seq, state_root) {
+                        Ok(swept) => {
+                            arc_backend.sync();
+                            let _ = arc_backend.close();
+                            spinner.finish_with_message(
+                                "✓ Snapshot import complete, verified, and anchored",
+                            );
+                            println!(
+                                "  → Ledger seq: {}, chunks: {}, nodes: {}, leftovers reclaimed: {}",
+                                manifest.ledger_seq,
+                                manifest.chunks.len(),
+                                required.len(),
+                                swept
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            let _ = arc_backend.close();
+                            spinner.finish_and_clear();
+                            eprintln!("Snapshot anchor adoption failed: {e}");
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        let _ = arc_backend.close();
+                        spinner.finish_and_clear();
+                        eprintln!("Opening pruned store for anchor adoption failed: {e}");
+                        false
+                    }
+                }
+            } else {
+                backend.sync();
+                let _ = backend.close();
+                spinner.finish_with_message("✓ Snapshot import complete and integrity verified");
+                println!(
+                    "  → Ledger seq: {}, chunks: {}",
+                    manifest.ledger_seq,
+                    manifest.chunks.len()
+                );
+                true
+            }
         }
         Err(e) => {
             spinner.finish_and_clear();

@@ -302,14 +302,16 @@ path = {}
 }
 
 #[test]
-fn path_size_bytes_counts_rotating_backend_directories() {
+fn path_size_bytes_counts_nested_store_directories() {
+    // fjall spreads data over keyspace subdirectories and segment files; the
+    // size helper must sum the whole tree.
     let dir = TempDir::new().expect("tempdir");
-    let writable = dir.path().join("xrpldb.0000");
-    let archive = dir.path().join("xrpldb.0001");
-    fs::create_dir(&writable).expect("writable dir");
-    fs::create_dir(&archive).expect("archive dir");
-    fs::write(writable.join("nudb.dat"), vec![0_u8; 128]).expect("writable data");
-    fs::write(archive.join("nudb.dat"), vec![0_u8; 256]).expect("archive data");
+    let nodes = dir.path().join("keyspaces").join("nodes");
+    let meta = dir.path().join("keyspaces").join("meta");
+    fs::create_dir_all(&nodes).expect("nodes dir");
+    fs::create_dir_all(&meta).expect("meta dir");
+    fs::write(nodes.join("segment-0"), vec![0_u8; 128]).expect("nodes data");
+    fs::write(meta.join("segment-0"), vec![0_u8; 256]).expect("meta data");
 
     assert_eq!(path_size_bytes(dir.path()), 384);
 }

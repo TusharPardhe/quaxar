@@ -1445,36 +1445,6 @@ fn application_root_can_attach_status_metrics_source_for_server_info_reads() {
 }
 
 #[test]
-fn application_root_accept_ledger_does_not_include_signed_invalid_pending_transactions() {
-    let mut root = ApplicationRoot::new(0).expect("root shell should build");
-    let runtime = root.attach_default_network_ops_runtime();
-    let tx = signed_invalid_payment_tx(0x61);
-    let shared = Arc::new(Mutex::new(Transaction::new(Arc::clone(&tx))));
-
-    assert!(runtime.stage_transaction(Arc::clone(&shared), false, false, false));
-    assert_eq!(root.network_ops_pending_transaction_count(), Some(1));
-
-    let next_open = root
-        .accept_ledger(1, 1_234, 10)
-        .expect("ledger accept should complete");
-
-    assert_eq!(next_open, 2);
-    assert_eq!(root.closed_ledger_seq(), Some(1));
-    assert_eq!(root.network_ops_pending_transaction_count(), Some(0));
-    assert!(
-        root.closed_ledger()
-            .expect("closed ledger should be recorded")
-            .tx_map()
-            .root()
-            .is_empty()
-    );
-    assert_ne!(
-        shared.lock().expect("transaction mutex").get_status(),
-        TransStatus::INCLUDED
-    );
-}
-
-#[test]
 fn application_root_accept_ledger_builds_from_closed_parent_view() {
     let root = ApplicationRoot::new(0).expect("root shell should build");
     let mut parent = ledger_with_amendments(1, 1_111, &[Uint256::from_u64(7)], &[]);

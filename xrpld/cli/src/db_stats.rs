@@ -13,20 +13,10 @@ pub fn run(url: &str, conf: Option<&str>) -> bool {
     super::section_header("Database Statistics");
     println!();
 
-    if let Some(nudb_path) = find_nudb_path(conf) {
-        let (data_size, key_size, log_size) = nudb_file_sizes(&nudb_path);
-        let total = data_size + key_size + log_size;
-        super::kv("Node DB Path", &nudb_path);
-        if total > 0 {
-            super::kv("NuDB Data", &format_bytes(data_size));
-            super::kv("NuDB Keys", &format_bytes(key_size));
-            if log_size > 0 {
-                super::kv("NuDB Log", &format_bytes(log_size));
-            }
-            super::kv("NuDB Total", &format_bytes(total));
-        } else {
-            super::kv("NuDB Total", "0 B");
-        }
+    if let Some(db_path) = find_node_db_path(conf) {
+        let total = dir_size(Path::new(&db_path));
+        super::kv("Node DB Path", &db_path);
+        super::kv("Store Size", &format_bytes(total));
         println!();
         super::section_separator();
         println!();
@@ -71,7 +61,7 @@ pub fn run(url: &str, conf: Option<&str>) -> bool {
     true
 }
 
-fn find_nudb_path(conf: Option<&str>) -> Option<String> {
+fn find_node_db_path(conf: Option<&str>) -> Option<String> {
     let cfg_path = conf.map(Path::new).or_else(|| {
         [Path::new("quaxar.cfg"), Path::new("/etc/quaxar/quaxar.cfg")]
             .into_iter()
@@ -137,24 +127,22 @@ fn kv_hit_rate(label: &str, total: &serde_json::Value, hits: &serde_json::Value)
     );
 }
 
-fn nudb_file_sizes(base_path: &str) -> (u64, u64, u64) {
-    // NuDB stores in subdirectories like xrpldb.0000/
-    let base = Path::new(base_path);
-    let mut data_total = 0u64;
-    let mut key_total = 0u64;
-    let mut log_total = 0u64;
-
-    if let Ok(entries) = std::fs::read_dir(base) {
+/// Total on-disk size of the fjall store directory. fjall is an LSM engine
+/// that spreads data across many segment files and keyspace subdirectories, so
+/// the store size is the recursive sum of the configured path.
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                data_total += file_size(&path.join("nudb.dat"));
-                key_total += file_size(&path.join("nudb.key"));
-                log_total += file_size(&path.join("nudb.log"));
+            let child = entry.path();
+            if child.is_dir() {
+                total += dir_size(&child);
+            } else {
+                total += file_size(&child);
             }
         }
     }
-    (data_total, key_total, log_total)
+    total
 }
 
 fn file_size(path: &Path) -> u64 {

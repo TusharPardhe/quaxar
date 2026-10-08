@@ -1958,7 +1958,7 @@ impl TreeEngine for ScriptedEngine {
         outcome: &ReadOutcome,
     ) -> PlanReadApply {
         match outcome {
-            ReadOutcome::Settled { node: Some(_) } => {
+            ReadOutcome::Settled { node: Some(_), .. } => {
                 self.applied_reads += 1;
                 self.branch_steps += 1;
                 self.runnable_frontier = !self.steps.is_empty();
@@ -1967,7 +1967,7 @@ impl TreeEngine for ScriptedEngine {
                     missing_edges: 0,
                 }
             }
-            ReadOutcome::Settled { node: None } => PlanReadApply::UnknownRead,
+            ReadOutcome::Settled { node: None, .. } => PlanReadApply::UnknownRead,
             ReadOutcome::Stale | ReadOutcome::Cancelled => PlanReadApply::Cancelled,
         }
     }
@@ -2085,14 +2085,14 @@ impl TreeEngine for LedgerTreePlanEngine {
 
     fn apply_read(&mut self, hash: SHAMapHash, outcome: &ReadOutcome) -> PlanReadApply {
         let missing = match outcome {
-            ReadOutcome::Settled { node: Some(bytes) } => {
+            ReadOutcome::Settled { node: Some(bytes), .. } => {
                 match SHAMapTreeNode::make_from_wire(bytes) {
                     Ok(Some(node)) => MissingNodeReadOutcome::Found(node),
                     Ok(None) => MissingNodeReadOutcome::Miss,
                     Err(_) => return PlanReadApply::UnknownRead,
                 }
             }
-            ReadOutcome::Settled { node: None } => MissingNodeReadOutcome::Miss,
+            ReadOutcome::Settled { node: None, .. } => MissingNodeReadOutcome::Miss,
             ReadOutcome::Stale | ReadOutcome::Cancelled => MissingNodeReadOutcome::Cancelled,
         };
         Self::map_apply(self.plan.apply_read_result(self.plan.id(), hash, missing))
@@ -2107,13 +2107,13 @@ impl TreeEngine for LedgerTreePlanEngine {
             return PlanReadApply::StalePlan;
         }
         let node = match outcome {
-            ReadOutcome::Settled { node: Some(bytes) } => {
+            ReadOutcome::Settled { node: Some(bytes), .. } => {
                 match SHAMapTreeNode::make_from_prefix(bytes, SHAMapHash::new(need.hash())) {
                     Ok(node) if *node.get_hash().as_uint256() == need.hash() => node,
                     _ => return PlanReadApply::HashMismatch,
                 }
             }
-            ReadOutcome::Settled { node: None } => return PlanReadApply::UnknownRead,
+            ReadOutcome::Settled { node: None, .. } => return PlanReadApply::UnknownRead,
             ReadOutcome::Stale | ReadOutcome::Cancelled => return PlanReadApply::Cancelled,
         };
         Self::map_apply(self.plan.apply_network_node(
@@ -2452,19 +2452,19 @@ mod tests {
         );
         let stale = plan.on_read(&ReadCompletion::new(
             wrong,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         ));
         assert_eq!(stale, PlanReadOutcome::Stale);
         // The exact in-flight operation applies.
         let exact = plan.on_read(&ReadCompletion::new(
             request.operation(),
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         ));
         assert_eq!(exact, PlanReadOutcome::Applied);
         // The applied read cannot apply again.
         let again = plan.on_read(&ReadCompletion::new(
             request.operation(),
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         ));
         assert_eq!(again, PlanReadOutcome::Stale);
     }
@@ -2494,7 +2494,7 @@ mod tests {
         assert_eq!(
             plan.on_read(&ReadCompletion::new(
                 requests[0].operation(),
-                ReadOutcome::Settled { node: None },
+                ReadOutcome::settled(None),
             )),
             PlanReadOutcome::Applied
         );
@@ -2725,7 +2725,7 @@ mod tests {
             assert_eq!(
                 plan.on_read(&ReadCompletion::new(
                     request.operation(),
-                    ReadOutcome::Settled { node: None },
+                    ReadOutcome::settled(None),
                 )),
                 PlanReadOutcome::Applied
             );
@@ -2756,6 +2756,7 @@ mod tests {
                 requests[0].operation(),
                 ReadOutcome::Settled {
                     node: Some(Bytes::from_static(b"verified-local-node")),
+                    decoded: None,
                 },
             )),
             PlanReadOutcome::Applied
@@ -2858,7 +2859,7 @@ mod tests {
         assert_eq!(
             plan.on_read(&ReadCompletion::new(
                 requests[0].operation(),
-                ReadOutcome::Settled { node: None }
+                ReadOutcome::settled(None)
             )),
             PlanReadOutcome::Stale
         );
@@ -2922,6 +2923,7 @@ mod tests {
                 recovery[0].operation(),
                 ReadOutcome::Settled {
                     node: Some(Bytes::from_static(b"resolved")),
+                    decoded: None,
                 },
             )),
             PlanReadOutcome::Applied
@@ -3144,7 +3146,7 @@ mod tests {
         assert_eq!(
             plan.on_read(&ReadCompletion::new(
                 first[0].operation(),
-                ReadOutcome::Settled { node: None },
+                ReadOutcome::settled(None),
             )),
             PlanReadOutcome::Applied
         );
@@ -3162,6 +3164,7 @@ mod tests {
                 first[0].operation(),
                 ReadOutcome::Settled {
                     node: Some(Bytes::from_static(b"late")),
+                    decoded: None,
                 },
             )),
             PlanReadOutcome::Stale,
@@ -3172,6 +3175,7 @@ mod tests {
                 second[0].operation(),
                 ReadOutcome::Settled {
                     node: Some(Bytes::from_static(b"prefix-form-node")),
+                    decoded: None,
                 },
             )),
             PlanReadOutcome::Applied
@@ -3195,6 +3199,7 @@ mod tests {
                 third[0].operation(),
                 ReadOutcome::Settled {
                     node: Some(Bytes::from_static(b"cancelled")),
+                    decoded: None,
                 },
             )),
             PlanReadOutcome::Stale,
@@ -3357,6 +3362,7 @@ mod tests {
             child_hash,
             &ReadOutcome::Settled {
                 node: Some(Bytes::from(serialized)),
+                    decoded: None,
             },
         ) {
             PlanReadApply::Applied { .. } | PlanReadApply::HashMismatch => {}

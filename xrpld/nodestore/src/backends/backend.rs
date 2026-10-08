@@ -1,3 +1,4 @@
+use crate::backends::kv::{Keyspace, KvBatch, PersistMode};
 use crate::{Batch, NodeObject, Status};
 use basics::base_uint::Uint256;
 use std::sync::Arc;
@@ -53,8 +54,8 @@ pub trait Backend: Send + Sync + 'static {
     fn sync(&self);
 
     /// Checked durability barrier. Backends without a fallible checkpoint keep
-    /// the historical no-op/default behavior; NuDB overrides this to expose
-    /// its active-burst commit and fsync failures to lifecycle owners.
+    /// the historical no-op/default behavior; durable backends override this
+    /// to expose commit and fsync failures to lifecycle owners.
     fn sync_result(&self) -> Result<(), String> {
         self.sync();
         Ok(())
@@ -93,4 +94,66 @@ pub trait Backend: Send + Sync + 'static {
     fn verify(&self) {}
 
     fn fd_required(&self) -> i32;
+
+    // --- Key-value v2 surface -------------------------------------------
+    //
+    // The pruned node store needs per-key deletes, several keyspaces, atomic
+    // cross-keyspace writes, ordered range scans, and an explicit durability
+    // barrier. Backends without that surface (the null backend) keep the
+    // defaults, which report that the backend is not key-value capable; MemoryBackend and the fjall
+    // backend override them. `supports_kv` lets callers select a path without
+    // probing for errors.
+
+    /// Whether this backend implements the key-value v2 methods below.
+    fn supports_kv(&self) -> bool {
+        false
+    }
+
+    /// Read one key from a keyspace. `Ok(None)` is a definite miss.
+    fn kv_get(&self, _keyspace: Keyspace, _key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        Err(self.kv_unsupported())
+    }
+
+    /// Apply a batch atomically across keyspaces: all ops land or none do.
+    fn kv_write_batch(&self, _batch: &KvBatch) -> Result<(), String> {
+        Err(self.kv_unsupported())
+    }
+
+    /// Scan a keyspace over `[start, end)` in ascending key order, invoking the
+    /// callback for each pair. The callback returns `false` to stop early.
+    fn kv_range(
+        &self,
+        _keyspace: Keyspace,
+        _start: &[u8],
+        _end: &[u8],
+        _callback: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<(), String> {
+        Err(self.kv_unsupported())
+    }
+
+    /// Flush the backend journal to the requested durability level.
+    fn kv_persist(&self, _mode: PersistMode) -> Result<(), String> {
+        Err(self.kv_unsupported())
+    }
+
+    /// Start watching `hashes` for re-stores. The pruned index calls this when
+    /// nodes become dead-pending (reference count 0). If any watched hash is
+    /// written again through `store`/`store_batch_result` before it is pruned,
+    /// the backend remembers it so prune can keep the freshly written bytes
+    /// (design rules R3/R5). Backends without the pruned store ignore it.
+    fn watch_restores(&self, _hashes: &[Uint256]) {}
+
+    /// Stop watching `hashes` (they were pruned or resurrected by a claim).
+    fn unwatch_restores(&self, _hashes: &[Uint256]) {}
+
+    /// Whether `hash` is watched and has been written again since it was
+    /// first watched. Prune must not delete such a node.
+    fn was_restored(&self, _hash: &Uint256) -> bool {
+        false
+    }
+
+    #[doc(hidden)]
+    fn kv_unsupported(&self) -> String {
+        format!("backend {} is not key-value capable", self.get_name())
+    }
 }

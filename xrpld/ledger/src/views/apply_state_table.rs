@@ -357,7 +357,7 @@ impl ApplyStateTable {
     pub fn apply(&self, to: &mut dyn RawView) -> Result<(), ViewError> {
         // Collect all state map operations into a batch to apply using a single
         // MutableTree. This prevents MissingNode errors when sequential mutations
-        // create new inner nodes that subsequent mutations can't find in NuDB.
+        // create new inner nodes that subsequent mutations can't find in the node store.
         let mut batch_ops: Vec<(crate::StateBatchOp, Arc<STLedgerEntry>)> = Vec::new();
 
         for (key, entry) in &self.items {

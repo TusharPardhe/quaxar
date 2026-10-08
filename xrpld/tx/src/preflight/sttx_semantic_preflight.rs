@@ -828,7 +828,7 @@ fn validate_sponsorship_set_preflight(tx: &STTx) -> NotTec {
     Ter::TES_SUCCESS
 }
 
-fn validate_sponsorship_transfer_preflight(tx: &STTx) -> NotTec {
+fn validate_sponsorship_transfer_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     let flags = tx.get_flags();
     let transfer = flags & protocol::SPONSORSHIP_TRANSFER_FLAGS;
     if transfer.count_ones() != 1 {
@@ -838,6 +838,15 @@ fn validate_sponsorship_transfer_preflight(tx: &STTx) -> NotTec {
     let sponsor_flags = get_field_by_symbol("sfSponsorFlags");
     let sponsee = get_field_by_symbol("sfSponsee");
     let object = get_field_by_symbol("sfObjectID");
+    // rippled #8254: reject an all-zero sfObjectID in preflight once
+    // fixCleanup3_5_0 is active. An empty object id is never a real ledger
+    // entry and would otherwise be read as the zero Any-keylet downstream.
+    if rules.enabled(&protocol::fix_cleanup_3_5_0())
+        && tx.is_field_present(object)
+        && tx.get_field_h256(object).is_zero()
+    {
+        return Ter::TEM_MALFORMED;
+    }
     let create = flags & protocol::SPONSORSHIP_CREATE_FLAG != 0;
     let reassign = flags & protocol::SPONSORSHIP_REASSIGN_FLAG != 0;
     if create || reassign {
@@ -998,7 +1007,7 @@ fn validate_sttx_typed_semantic_preflight(
         // lending STTx adapters. Fail closed rather than silently accepting
         // malformed transactions through the former dispatchable wildcard.
         TxType::LOAN_SET => validate_loan_set_preflight(tx, rules),
-        TxType::SPONSORSHIP_TRANSFER => validate_sponsorship_transfer_preflight(tx),
+        TxType::SPONSORSHIP_TRANSFER => validate_sponsorship_transfer_preflight(tx, rules),
         TxType::SPONSORSHIP_SET => validate_sponsorship_set_preflight(tx),
         TxType::CONFIDENTIAL_MPT_CONVERT
         | TxType::CONFIDENTIAL_MPT_MERGE_INBOX

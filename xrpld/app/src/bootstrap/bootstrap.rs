@@ -37,7 +37,7 @@ use quaxar_core::{
 };
 use rusqlite::{OptionalExtension, params};
 use shamap::family::{
-    FullBelowCache, NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
+    NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -332,95 +332,6 @@ impl SHAMapStoreComponentRuntime for BootstrapSHAMapStoreRuntime {}
 
 struct PendingProductionSHAMapStore {
     bootstrap: crate::SHAMapStoreBootstrap,
-    backend_factory: Arc<dyn crate::SHAMapStoreRotatingBackendFactory>,
-}
-
-struct BootstrapNodeFamilyCacheRuntime {
-    node_family: Arc<dyn crate::NodeFamilyRuntime>,
-    tree_cache: Arc<TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>>,
-    full_below: crate::NodeFamilyFullBelowCache,
-}
-
-impl crate::SHAMapStoreNodeFamilyCacheRuntime for BootstrapNodeFamilyCacheRuntime {
-    fn tree_node_cache_keys(&self) -> Vec<Uint256> {
-        self.tree_cache.get_keys()
-    }
-
-    fn clear_full_below_cache(&self) {
-        self.full_below.clear();
-    }
-
-    fn visit_state_map_nodes(
-        &self,
-        ledger: &Ledger,
-        visit: &mut dyn FnMut(
-            &basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
-        ) -> bool,
-    ) -> Result<(), shamap::traversal::TraversalError> {
-        self.node_family.visit_state_map_nodes(ledger, visit)
-    }
-}
-
-struct BootstrapRotatingNodeStoreRuntime {
-    database: Arc<dyn nodestore::DatabaseRotating>,
-    ledger_master_runtime: Arc<crate::AppLedgerMasterRuntime>,
-    owner_wake: Arc<dyn Fn() + Send + Sync>,
-}
-
-impl crate::SHAMapStoreNodeStoreRuntime for BootstrapRotatingNodeStoreRuntime {
-    fn fetch_node_object(&self, hash: &Uint256, ledger_seq: u32) -> bool {
-        nodestore::Database::fetch_node_object(
-            self.database.as_ref(),
-            hash,
-            ledger_seq,
-            FetchType::Synchronous,
-            true,
-        )
-        .is_some()
-    }
-
-    fn copy_to_writable_batch(&self, hashes: &[Uint256]) -> Result<usize, String> {
-        self.database.copy_to_writable_batch(hashes)
-    }
-
-    fn copy_to_writable_batch_detailed(
-        &self,
-        hashes: &[Uint256],
-    ) -> Result<(usize, Vec<Uint256>), String> {
-        self.database.copy_to_writable_batch_detailed(hashes)
-    }
-
-    fn store_account_nodes(&self, nodes: Vec<(Uint256, basics::blob::Blob)>) -> Result<(), String> {
-        self.database.store_account_nodes(nodes)
-    }
-
-    fn set_rotation_in_flight(&self, in_flight: bool) {
-        self.database.set_rotation_in_flight(in_flight);
-        if in_flight {
-            // DatabaseRotating advances its generation at the beginning of
-            // the exposure window, before the potentially long copy phase.
-            // Publish that identity immediately so no operation minted during
-            // the copy can carry the retired generation and self-cancel.
-            self.ledger_master_runtime.publish_store_rotation(
-                nodestore::Database::store_generation(self.database.as_ref()),
-            );
-            (self.owner_wake)();
-        }
-    }
-
-    fn rotate_with(&self, new_backend: Box<dyn nodestore::Backend>) -> (String, String) {
-        let mut names = None;
-        self.database
-            .rotate(new_backend, &mut |writable_name, archive_name| {
-                names = Some((writable_name.to_owned(), archive_name.to_owned()));
-            });
-        self.ledger_master_runtime
-            .publish_store_rotation(nodestore::Database::store_generation(
-                self.database.as_ref(),
-            ));
-        (self.owner_wake)();
-        names.expect("rotating NodeStore callback must publish backend names")
-    }
 }
 
 #[derive(Clone)]
@@ -563,12 +474,6 @@ impl SHAMapNodeFetcher for BootstrapNodeStoreFetcher {
     ) -> Option<SHAMapNodeObject> {
         let fetched = match &self.node_store {
             crate::SHAMapStoreNodeStore::Single(database) => database.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                FetchType::Synchronous,
-                false,
-            ),
-            crate::SHAMapStoreNodeStore::Rotating(database) => database.fetch_node_object(
                 hash.as_uint256(),
                 ledger_seq,
                 FetchType::Synchronous,
@@ -1574,8 +1479,6 @@ fn run_start_mode_consensus_loop(
         }
     };
 
-    // Consensus event channel for validations and ledger promotions
-    let (event_tx, event_rx) = crate::consensus::driver::consensus_event_channel();
     let (shared_completed_tx, shared_completed_rx) = std::sync::mpsc::sync_channel::<
         crate::ledger::inbound_ledgers::CompletedInboundLedger,
     >(1_024);
@@ -1712,30 +1615,14 @@ fn run_start_mode_consensus_loop(
         return;
     }
 
-    // Spawn consensus event loop (validation/ledger promotion)
-    let event_loop_app = runtime.root().clone();
-    let event_loop_stop = Arc::clone(&stop);
-    worker_handles.push(crate::consensus::driver::spawn_event_loop(
-        event_loop_app,
-        Arc::clone(&shared_inbound),
-        event_rx,
-        event_loop_stop,
-    ));
-
-    // Validation forwarding thread
+    // Validation processing. The overlay invokes the installed validation
+    // router synchronously on receipt (see QueuedInbound::on_validation,
+    // which early-returns once a router is set), so there is no separate
+    // forwarder thread or notify/queue fallback: the router runs the
+    // validation job directly, matching rippled's synchronous
+    // PeerImp::checkValidation -> NetworkOPsImp::recvValidation path.
     {
-        let (val_notify_tx, val_notify_rx) = std::sync::mpsc::sync_channel::<()>(1);
         if let Some(overlay_rt) = runtime.root().overlay_runtime() {
-            overlay_rt
-                .overlay()
-                .queued_inbound()
-                .set_validation_notify(val_notify_tx);
-        }
-        let fwd_stop = Arc::clone(&stop);
-        let fwd_runtime = Arc::clone(&runtime);
-        let fwd_event_tx = event_tx.clone();
-        if let Some(overlay_rt) = runtime.root().overlay_runtime() {
-            let direct_event_tx = event_tx.clone();
             let validation_root = runtime.root().clone();
             let validation_overlay = overlay_rt.overlay();
             overlay_rt
@@ -1799,61 +1686,34 @@ fn run_start_mode_consensus_loop(
                     } else {
                         crate::job::job_types::JobType::JtValidationUt
                     };
-                    let event_tx = direct_event_tx.clone();
+                    let job_app = validation_root.clone();
                     queued.validation = validation;
                     if !validation_root.job_queue().add_job(
                         job_type,
                         "checkValidation",
                         move || {
-                            // The event-loop parser performs the signature
-                            // check after scheduling, matching checkValidation.
-                            let _ = event_tx
-                                .send(crate::consensus::driver::ConsensusEvent::Validation(
-                                    Box::new(queued),
-                                ));
+                            // Match rippled PeerImp::checkValidation ->
+                            // NetworkOPsImp::recvValidation: process the
+                            // validation synchronously on the validation job
+                            // thread (signature check, ingress into
+                            // Validations::add/updateTrie, relay). Running it
+                            // here instead of forwarding a
+                            // ConsensusEvent::Validation removes an extra
+                            // shared-event-loop hop that could delay a trusted
+                            // validation past the next consensus
+                            // getPrevLedger read, which transiently skewed the
+                            // preferred ledger and demoted the node out of
+                            // full.
+                            crate::consensus::driver::process_validation_inline(
+                                &job_app,
+                                Box::new(queued),
+                            );
                         },
                     ) {
                         tracing::debug!(target: "consensus", "validation job rejected during shutdown");
                     }
                 }));
         }
-        worker_handles.push(
-            std::thread::Builder::new()
-                .name("validation-forwarder".into())
-                .spawn(move || {
-                    loop {
-                        match val_notify_rx.recv_timeout(Duration::from_millis(25)) {
-                            Ok(()) => {}
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                if fwd_stop.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                continue;
-                            }
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                        }
-                        if fwd_stop.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let root = fwd_runtime.root();
-                        let Some(overlay_rt) = root.overlay_runtime() else {
-                            continue;
-                        };
-                        let validations = overlay_rt.overlay().take_validations();
-                        for queued in validations {
-                            match fwd_event_tx.send(
-                                crate::consensus::driver::ConsensusEvent::Validation(Box::new(
-                                    queued,
-                                )),
-                            ) {
-                                Ok(()) => {}
-                                Err(_) => return,
-                            }
-                        }
-                    }
-                })
-                .expect("spawn validation-forwarder thread"),
-        );
     }
 
     // Transaction relay router. PeerImp schedules `RcvCheckTx` on the JobQueue;
@@ -3197,7 +3057,9 @@ fn trusted_first_manifest_payloads(
             untrusted.push(serialized);
         }
     }
-    trusted.truncate(manifest_limits.max_trusted_count);
+    // rippled 54cfdda00b: trusted manifests are never dropped. max_trusted_count
+    // only sizes the largest accepted message; it must not cap relay contents,
+    // since dropping a trusted manifest would delay a validator key rotation.
     trusted.extend(
         untrusted
             .into_iter()
@@ -4167,6 +4029,13 @@ fn serve_get_object_by_hash_request(
     }
 
     let node_store = root.node_store().clone();
+    // Case 17: serve hot nodes from the in-memory SHAMap TreeNodeCache before
+    // touching the node store. Storage is content-addressed and every cached
+    // node was hash-verified when created, so bytes from memory are exactly
+    // the bytes on disk and the peer re-verifies the hash. This keeps nodes
+    // servable for as long as any live ledger holds them, independent of
+    // prune timing, and lets hot consensus-era requests skip disk/LSM reads.
+    let tree_cache = root.shared_tree_cache_arc().map(Arc::clone);
 
     let mut reply_objects: Vec<overlay::message::wire::TmIndexedObject> = Vec::new();
     let mut hits: u32 = 0;
@@ -4184,22 +4053,32 @@ fn serve_get_object_by_hash_request(
         };
 
         let ledger_seq = obj.ledger_seq.unwrap_or(0);
-        let fetched = node_store.as_ref().and_then(|node_store| match node_store {
-            crate::SHAMapStoreNodeStore::Single(database) => {
-                database.fetch_node_object(&hash, ledger_seq, FetchType::Synchronous, false)
-            }
-            crate::SHAMapStoreNodeStore::Rotating(database) => {
-                database.fetch_node_object(&hash, ledger_seq, FetchType::Synchronous, false)
-            }
+        // Tier 1: in-memory SHAMap node. Serialize with the node prefix so the
+        // bytes are byte-identical to the stored NodeObject encoding.
+        let from_memory = tree_cache.as_ref().and_then(|cache| {
+            cache
+                .fetch(&hash)
+                .and_then(|node| node.serialize_with_prefix().ok())
+        });
+        // Tier 2: the node store (its own NodeObject cache, then fjall `nodes`).
+        let data = from_memory.or_else(|| {
+            node_store
+                .as_ref()
+                .and_then(|node_store| match node_store {
+                    crate::SHAMapStoreNodeStore::Single(database) => {
+                        database.fetch_node_object(&hash, ledger_seq, FetchType::Synchronous, false)
+                    }
+                })
+                .map(|node_object| node_object.data().clone())
         });
 
-        if let Some(node_object) = fetched {
+        if let Some(data) = data {
             hits += 1;
             reply_objects.push(overlay::message::wire::TmIndexedObject {
                 hash: Some(hash.data().to_vec()),
                 node_id: None,
                 index: obj.node_id.clone(),
-                data: Some(node_object.data().clone()),
+                data: Some(data),
                 ledger_seq: obj.ledger_seq,
             });
         } else {
@@ -4366,17 +4245,36 @@ fn bootstrap_shamap_store_if_configured(
         Arc::clone(&journal),
     )?;
     let _ = bootstrap.attach_node_store(root);
-    let backend_factory = Arc::new(crate::ConfiguredSHAMapStoreBackendFactory::new(
-        manager,
-        bootstrap.effective_node_db_config.clone(),
-        40_000,
-        scheduler,
-        journal,
-    ));
-    Ok(Some(PendingProductionSHAMapStore {
-        bootstrap,
-        backend_factory,
-    }))
+    Ok(Some(PendingProductionSHAMapStore { bootstrap }))
+}
+
+/// Build the pruned-store driver for a fjall single store, reading its window
+/// (`online_delete`) and prune settings from the node_db section. Returns None
+/// if the store does not export a key-value-capable backend (should not happen
+/// for fjall, but keeps the path non-fatal).
+fn build_pruned_driver(
+    node_db: &basics::basic_config::Section,
+    node_store: &crate::SHAMapStoreNodeStore,
+    can_delete: u32,
+) -> Result<Option<Arc<crate::shamap::pruned_driver::PrunedDriver>>, String> {
+    use crate::shamap::pruned_driver::{PrunedDriver, pruned_config_from_section};
+    let Some(backend) = node_store.export_backend() else {
+        return Ok(None);
+    };
+    if !backend.supports_kv() {
+        return Ok(None);
+    }
+    // online_delete is the retention window for the pruned store. Default to a
+    // conservative window when unset so pruning never runs unexpectedly tight.
+    let online_delete = node_db
+        .get::<u32>("online_delete")
+        .ok()
+        .flatten()
+        .filter(|&n| n > 0)
+        .unwrap_or(512);
+    let config = pruned_config_from_section(node_db, online_delete, can_delete);
+    let driver = PrunedDriver::open(backend, config)?;
+    Ok(Some(Arc::new(driver)))
 }
 
 fn attach_production_shamap_store_runtime(
@@ -4386,78 +4284,81 @@ fn attach_production_shamap_store_runtime(
     let Some(pending) = pending else {
         return Ok(());
     };
-    let PendingProductionSHAMapStore {
-        bootstrap,
-        backend_factory,
-    } = pending;
+    let PendingProductionSHAMapStore { bootstrap } = pending;
 
-    // A single-backend store has no online-delete worker. Retain the small
-    // inert runtime for that configuration rather than inventing rotation
-    // capabilities which the backend cannot provide.
-    if bootstrap.store.delete_interval() == 0 {
-        let component = Arc::new(SHAMapStoreComponent::new(
+    // Every node store is now a single database: the fjall pruned store, or
+    // the in-memory/null stores. The rotating online-delete worker has been
+    // removed, so there is no rotating branch. The fjall path additionally
+    // attaches a PrunedDriver that prunes continuously.
+    {
+        // The fjall path is a single store that prunes continuously through a
+        // PrunedDriver instead of rotating. Detect it from the config and, when
+        // present, attach the driver over the backend the store exports.
+        let node_db = &bootstrap.effective_node_db_config;
+        let is_fjall = node_db
+            .get::<String>("type")
+            .ok()
+            .flatten()
+            .is_some_and(|t| t.eq_ignore_ascii_case("fjall"));
+        let pruned_driver = if is_fjall {
+            build_pruned_driver(
+                node_db,
+                &bootstrap.node_store,
+                bootstrap.store.get_can_delete(),
+            )?
+        } else {
+            None
+        };
+        let mut component = SHAMapStoreComponent::new(
             bootstrap.store,
             Box::new(BootstrapSHAMapStoreRuntime::default()),
             bootstrap.state_db,
-        ));
-        let _ = root.attach_shamap_store_component(component);
+        );
+        if let Some(driver) = pruned_driver {
+            // Invalidate the FullBelowCache whenever a prune deletes nodes, so a
+            // stale "subtree fully present" claim cannot survive the removal of
+            // nodes beneath it (design Case 16).
+            if let Some(full_below) = root.node_family_full_below_cache() {
+                use shamap::family::FullBelowCache as _;
+                driver.set_on_prune(Box::new(move || full_below.clear()));
+            }
+            // Lower the advertised complete_ledgers range to the retained floor
+            // in lockstep with the prune cursor, so peers are never told about
+            // ledgers whose nodes may already be deleted (design Case 18), and
+            // delete relational history (Ledgers/Transactions/AccountTransactions)
+            // below the same floor, which the removed rotation worker used to
+            // do. This runs on the pruned-store worker, never on the publish
+            // path; SQL deletes run only when the floor actually advances and
+            // proceed in bounded batches with back-off.
+            let ledger_master_runtime = root.ledger_master_runtime();
+            let relational = root.relational_database().clone();
+            let last_sql_floor = std::sync::atomic::AtomicU32::new(0);
+            driver.set_on_floor_advanced(Box::new(move |retained_floor| {
+                if let Some(runtime) = &ledger_master_runtime {
+                    runtime.ledger_master().clear_prior_ledgers(retained_floor);
+                }
+                let previous = last_sql_floor.load(std::sync::atomic::Ordering::Acquire);
+                if retained_floor > previous.max(1)
+                    && let Some(relational) = &relational
+                {
+                    use crate::shamap::shamap_store_relational::SHAMapStoreRelationalRuntime as _;
+                    match relational.clear_prior(retained_floor, &|| false) {
+                        Ok(()) => last_sql_floor
+                            .store(retained_floor, std::sync::atomic::Ordering::Release),
+                        Err(error) => tracing::warn!(
+                            target: "nodestore",
+                            retained_floor,
+                            %error,
+                            "relational history clear below the retained floor failed"
+                        ),
+                    }
+                }
+            }));
+            component = component.with_pruned_driver(driver);
+        }
+        let _ = root.attach_shamap_store_component(Arc::new(component));
         return Ok(());
     }
-
-    let crate::SHAMapStoreNodeStore::Rotating(database) = bootstrap.node_store else {
-        return Err("online_delete requires a rotating NodeStore backend".to_owned());
-    };
-    let ledger_master_runtime = root
-        .ledger_master_runtime()
-        .ok_or_else(|| "online_delete requires LedgerMaster runtime".to_owned())?;
-    let ledger_master = ledger_master_runtime.ledger_master();
-    let node_family = root
-        .node_family()
-        .ok_or_else(|| "online_delete requires the application NodeFamily".to_owned())?;
-    let tree_cache = root
-        .shared_tree_cache_arc()
-        .map(Arc::clone)
-        .ok_or_else(|| "online_delete requires the shared TreeNode cache".to_owned())?;
-    let full_below = root
-        .node_family_full_below_cache()
-        .ok_or_else(|| "online_delete requires the NodeFamily FullBelow cache".to_owned())?;
-    let node_family_runtime = Arc::new(BootstrapNodeFamilyCacheRuntime {
-        node_family,
-        tree_cache,
-        full_below,
-    });
-    let node_store_runtime = Arc::new(BootstrapRotatingNodeStoreRuntime {
-        database,
-        ledger_master_runtime,
-        owner_wake: root.consensus_wake_callback(),
-    });
-    let relational = root
-        .relational_database()
-        .as_ref()
-        .map(|database| Arc::clone(database) as Arc<dyn crate::SHAMapStoreRelationalRuntime>);
-    let health = Arc::new(crate::SharedSHAMapStoreHealthState::new_with_app_state(
-        root.shared_time_keeper(),
-        root.network_ops_state(),
-        root.ledger_master_state(),
-    ));
-    let runtime = crate::SHAMapStoreAppRuntime::new_with_health_state(
-        ledger_master,
-        node_family_runtime,
-        root.transaction_master(),
-        node_store_runtime,
-        backend_factory,
-        relational,
-        Arc::new(crate::ValidatedLedgerCopyRuntime),
-        Arc::clone(&health),
-    );
-    let component = Arc::new(SHAMapStoreComponent::new(
-        bootstrap.store,
-        Box::new(runtime),
-        bootstrap.state_db,
-    ));
-    let service = Arc::new(crate::SHAMapStoreService::new(component, health));
-    let _ = root.attach_shamap_store_service(service);
-    Ok(())
 }
 
 fn attach_relational_database_if_configured(
@@ -4673,7 +4574,7 @@ fn initialize_startup_ledger_state(
             // Matches rippled Application.cpp normal startup branch: Normal
             // falls through to startGenesisLedger(). Durable getLastFullLedger
             // recovery is reserved for explicit Load/LoadFile/Replay modes.
-            // NuDB remains attached and available for later node/history
+            // node store remains attached and available for later node/history
             // acquisition; this changes startup selection, not retention.
             seed_startup_ledger_state(root, options, config)
         }
@@ -5369,7 +5270,7 @@ fn seed_startup_ledger_state(
     // GENESIS PERSISTENCE — MUST happen BEFORE on_closed_ledger.
     //
     // rippled parity: `Ledger::Ledger(kCreateGenesis, ...)` calls
-    //   stateMap_.flushDirty(AccountNode)   ← persists ALL nodes to NuDB + tree cache
+    //   stateMap_.flushDirty(AccountNode)   ← persists ALL nodes to the node store + tree cache
     //   setImmutable()
     // BEFORE `switchLCL` / `storeLedger` ever touches the ledger.
     //
@@ -5392,19 +5293,19 @@ fn seed_startup_ledger_state(
             genesis_for_persist.set_node_batch_writer_result(batch_writer);
             genesis_for_persist.state_map_mut().set_backed();
             genesis_for_persist.tx_map_mut().set_backed();
-            // Persist dirty nodes to NuDB + tree cache. Propagate failure:
+            // Persist dirty nodes to the node store + tree cache. Propagate failure:
             // rippled flushDirty/writeNode does not silently continue after a
             // backend write failure, and startup must not release an
             // unpersisted genesis tree.
             genesis_for_persist
                 .persist_dirty_nodes_to_store_result(tree_cache)
-                .map_err(|error| format!("genesis NuDB persistence failed: {error}"))?;
+                .map_err(|error| format!("genesis node-store persistence failed: {error}"))?;
             tracing::info!(
                 target: "bootstrap",
                 seq = closed.header().seq,
                 has_fallible_writer = genesis_for_persist.has_node_writer_result(),
                 has_tree_cache = tree_cache.is_some(),
-                "Genesis state nodes persisted to NuDB (before on_closed_ledger)"
+                "Genesis state nodes persisted to the node store (before on_closed_ledger)"
             );
         }
     }
@@ -5433,14 +5334,15 @@ fn seed_startup_ledger_state(
         .map_err(|error| format!("initial next-ledger skip list failed: {error:?}"))?;
     if root.node_store().is_some() {
         next.persist_dirty_nodes_to_store_result(root.shared_tree_cache())
-            .map_err(|error| format!("initial next-ledger NuDB persistence failed: {error}"))?;
+            .map_err(|error| {
+                format!("initial next-ledger node-store persistence failed: {error}")
+            })?;
         // A start-valid forge is immediately copied and reopened by Pulsar.
         // Persisting dirty SHAMap nodes schedules backend writes; force the
         // NodeStore durability barrier before the validated header can be
         // written, otherwise `--load` finds metadata without its full tree.
         match root.node_store().as_ref() {
             Some(crate::SHAMapStoreNodeStore::Single(database)) => database.sync(),
-            Some(crate::SHAMapStoreNodeStore::Rotating(database)) => database.sync(),
             None => unreachable!("node store presence was checked above"),
         }
     }

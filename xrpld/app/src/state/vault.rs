@@ -1256,6 +1256,7 @@ pub fn apply_vault_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         Ok(Some(issuance)) => issuance,
         Ok(None) | Err(_) => return Ter::TEF_BAD_LEDGER,
     };
+
     // The share count is calculated from the requested amount.  Under
     // fixCleanup3_4_0 only the transferred asset delta is subsequently
     // clamped to the posterior AssetsTotal grid; recalculating shares from the
@@ -1533,6 +1534,22 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         Ok(Some(issuance)) => issuance,
         Ok(None) | Err(_) => return Ter::TEF_BAD_LEDGER,
     };
+
+    // rippled #8111: a pseudo-account holds no vault shares, so a clawback
+    // naming one is a no-op. Pre-fixCleanup3_4_0 an implicit amount ends in
+    // tecPRECISION_LOSS and an explicit one trips the "shares must move"
+    // invariant; post-fixCleanup3_4_0 it is refused here.
+    if view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
+        match view.read(account_keylet(to_160(&holder))) {
+            Ok(Some(holder_root)) => {
+                if ledger::is_pseudo_account(&holder_root) {
+                    return Ter::TEC_PSEUDO_ACCOUNT;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        }
+    }
 
     let waive_unrealized_loss = if view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
         match is_sole_shareholder(view, &holder, &issuance) {

@@ -699,7 +699,7 @@ pub trait InboundLedgerStore {
         true
     }
 
-    /// Fetch node data from local persistent storage (NuDB).
+    /// Fetch node data from local persistent storage (the fjall node store).
     /// Used for resume-from-disk on restart.
     fn fetch_node_data(&self, hash: Uint256) -> Option<Blob> {
         let _ = hash;

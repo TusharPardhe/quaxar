@@ -231,8 +231,14 @@ fn validate_node_size(config: &BasicConfig, report: &mut ConfigValidationReport)
 
 fn validate_node_db_and_history(config: &BasicConfig, report: &mut ConfigValidationReport) {
     let node_db = config.section("node_db");
-    let db_type = optional_string(node_db, "type").unwrap_or_else(|| "NuDB".to_owned());
-    if !matches!(db_type.to_ascii_lowercase().as_str(), "nudb" | "rocksdb") {
+    let db_type = optional_string(node_db, "type").unwrap_or_else(|| "fjall".to_owned());
+    let db_type_lower = db_type.to_ascii_lowercase();
+    if db_type_lower == "rocksdb" || db_type_lower == "nudb" {
+        report.errors.push(format!(
+            "[node_db] type = {db_type} is no longer supported; use type = fjall. \
+             Migrate by exporting a snapshot and loading it into the fjall store."
+        ));
+    } else if db_type_lower != "fjall" {
         report
             .errors
             .push(format!("[node_db] type is invalid: {db_type}"));
@@ -246,14 +252,6 @@ fn validate_node_db_and_history(config: &BasicConfig, report: &mut ConfigValidat
         }
         Ok(_) => {}
         Err(error) => report.errors.push(format!("[node_db] {error}")),
-    }
-
-    if let Some(raw) = optional_string(node_db, "nudb_block_size")
-        && !matches!(raw.as_str(), "4096" | "8192" | "16384" | "32768")
-    {
-        report.errors.push(format!(
-            "[node_db] nudb_block_size must be one of 4096, 8192, 16384, 32768; got {raw}"
-        ));
     }
 
     let online_delete = optional_string(node_db, "online_delete").map(|raw| {
@@ -281,6 +279,18 @@ fn validate_node_db_and_history(config: &BasicConfig, report: &mut ConfigValidat
         report
             .errors
             .push(format!("[node_db] advisory_delete is invalid: {raw}"));
+    }
+
+    // Mirrors the fjall backend's accepted range (16..=4096 MB).
+    if let Some(raw) = optional_string(node_db, "compaction_base_mb")
+        && !raw
+            .trim()
+            .parse::<u64>()
+            .is_ok_and(|mb| (16..=4096).contains(&mb))
+    {
+        report.errors.push(format!(
+            "[node_db] compaction_base_mb must be between 16 and 4096: {raw}"
+        ));
     }
 
     let ledger_history_raw = config
@@ -580,9 +590,9 @@ massive
 [node_db]
 type = BadDb
 path =
-nudb_block_size = 5000
 online_delete = 128
 advisory_delete = maybe
+compaction_base_mb = 8
 
 [ledger_history]
 256
@@ -624,9 +634,9 @@ maybe
             "[node_size] invalid",
             "[node_db] type is invalid",
             "[node_db] missing required field: path",
-            "nudb_block_size",
             "online_delete must be 0 or at least 256",
             "advisory_delete is invalid",
+            "compaction_base_mb must be between 16 and 4096",
             "[ledger_history] 256 cannot be greater than online_delete 128",
             "[network_id] invalid",
             "[overlay] ip_limit",
@@ -652,7 +662,7 @@ maybe
     #[test]
     fn config_validation_enforces_manifest_count_bounds() {
         let valid = validate_config_content(
-            "[node_size]\nmedium\n[node_db]\ntype = NuDB\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_untrusted_count = 50\nmax_trusted_count = 1000\n",
+            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/fjall\n[ledger_history]\n256\n[overlay]\nmax_untrusted_count = 50\nmax_trusted_count = 1000\n",
         );
         assert!(
             valid.errors.is_empty(),
@@ -661,7 +671,7 @@ maybe
         );
 
         let invalid = validate_config_content(
-            "[node_size]\nmedium\n[node_db]\ntype = NuDB\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_untrusted_count = 49\nmax_trusted_count = 1001\n",
+            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/fjall\n[ledger_history]\n256\n[overlay]\nmax_untrusted_count = 49\nmax_trusted_count = 1001\n",
         );
         let errors = invalid.errors.join("\n");
         assert!(errors.contains("[overlay] max_untrusted_count"));
@@ -671,7 +681,7 @@ maybe
     #[test]
     fn config_validation_enforces_rippled_tracking_deadline_bounds() {
         let valid = validate_config_content(
-            "[node_size]\nmedium\n[node_db]\ntype = NuDB\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_diverged_time = 60\nmax_unknown_time = 300\n",
+            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/fjall\n[ledger_history]\n256\n[overlay]\nmax_diverged_time = 60\nmax_unknown_time = 300\n",
         );
         assert!(
             valid.errors.is_empty(),
@@ -680,7 +690,7 @@ maybe
         );
 
         let invalid = validate_config_content(
-            "[node_size]\nmedium\n[node_db]\ntype = NuDB\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_diverged_time = 59\nmax_unknown_time = 1801\n",
+            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/fjall\n[ledger_history]\n256\n[overlay]\nmax_diverged_time = 59\nmax_unknown_time = 1801\n",
         );
         let errors = invalid.errors.join("\n");
         assert!(errors.contains("[overlay] max_diverged_time"));
@@ -718,9 +728,8 @@ send_queue_limit = 500
 medium
 
 [node_db]
-type = NuDB
-path = /tmp/quaxar/db/nudb
-nudb_block_size = 4096
+type = fjall
+path = /tmp/quaxar/db/fjall
 online_delete = 512
 advisory_delete = 0
 

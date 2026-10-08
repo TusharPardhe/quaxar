@@ -1122,7 +1122,7 @@ fn build_ledger_from_acquired_tx_with_order(
             types_str
         );
         // The next build uses this ledger as parent — it needs the state nodes
-        // in NuDB to read account/directory state via the fetcher.
+        // in the node store to read account/directory state via the fetcher.
         built.flush_state_map_to_store();
         built.flush_tx_map_to_store();
         return None;

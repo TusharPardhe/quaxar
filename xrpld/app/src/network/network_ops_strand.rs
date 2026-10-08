@@ -569,6 +569,20 @@ fn strand_loop(
     let mut consensus_started = false;
     let mut last_timer_tick = Instant::now();
     let mut last_round_ledger_id: Option<Uint256> = None;
+    // Edge-trigger the endConsensus/preferred-LCL reconciliation. While the
+    // node sits in `Accepted` (e.g. an observer whose local child lost to the
+    // quorum-backed sibling and is waiting for validation adoption), the strand
+    // wakes many times per second on heartbeats/proposals/validations. Re-
+    // running the full preferred-LCL computation + obsolete-peer cycling on
+    // every such wake wastes the consensus strand's own CPU and delays the very
+    // validation that would advance it, which lengthens the catch-up gap and
+    // can turn a one-round divergence into a multi-second validated-seq stall
+    // and a spurious view-change demotion. rippled runs endConsensus once per
+    // accepted round (from the JtAccept job), not on every event-loop wake.
+    // Mirror that: skip the pass when neither the local closed ledger nor the
+    // validated-seq input has changed since the last reconciliation (a
+    // registry completion still forces a pass below).
+    let mut last_reconcile_signal: Option<(Uint256, u32)> = None;
     // Emit at most one restart-gate diagnostic per closed ledger. Accepted
     // phase maintenance runs every strand tick, so per-pass INFO events turn
     // a stalled restart gate into an operator-hostile log flood.
@@ -1074,6 +1088,25 @@ fn strand_loop(
             scheduler.accept_is_queued(),
             scheduler.has_pending_accept(),
         );
+        // Edge-trigger: within an `Accepted` dwell, the preferred-LCL inputs
+        // only change when the local closed ledger or the validated sequence
+        // changes. If neither moved since the last reconciliation and no
+        // registry completion arrived this turn, the pass is a deterministic
+        // no-op; skip its cost so the strand stays responsive to the
+        // validation that will actually advance it.
+        let reconcile_signal = root.closed_ledger().map(|closed| {
+            let valid_seq = root
+                .ledger_master_runtime()
+                .map(|lm_rt| lm_rt.ledger_master().valid_ledger_seq())
+                .unwrap_or(0);
+            (*closed.header().hash.as_uint256(), valid_seq)
+        });
+        let reconcile_inputs_changed =
+            registry_completion_count != 0 || reconcile_signal != last_reconcile_signal;
+        let end_consensus_pass = end_consensus_pass && reconcile_inputs_changed;
+        if end_consensus_pass {
+            last_reconcile_signal = reconcile_signal;
+        }
         if registry_completion_count != 0 && !end_consensus_pass {
             tracing::info!(
                 target: "lcl_trace",
@@ -1985,11 +2018,40 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     // Rippled demotes only after the candidate survives canBeCurrent and
     // compatibility admission. In particular, an incompatible resolver hit
     // returns false from checkLastClosedLedger without a FULL→CONNECTED flap.
-    demote_for_preferred_lcl_divergence(
-        root,
-        shared_inbound,
-        acquisition::LedgerTarget::new(preferred_hash, Some(candidate.header().seq)),
-    );
+    //
+    // Parity refinement (eliminates the dominant non-fork oscillation): rippled
+    // demotes on ANY LCL switch because checkLastClosedLedger cannot cheaply
+    // distinguish a pure FORWARD catch-up (we are simply a few ledgers behind
+    // on the SAME validated chain) from a genuine fork. We can: the candidate
+    // already passed `is_compatible` (it is on the validated/quorum chain), so
+    // if it is STRICTLY AHEAD of our current closed ledger AND our own closed
+    // ledger is a true ANCESTOR of the candidate on that chain (confirmed by
+    // asking the candidate to look DOWN its skip-list to our closed sequence,
+    // rippled areCompatible/hashOfSeq semantics), the switch is a forward
+    // advance - adopting a newer validated ledger we were trailing, not
+    // abandoning a wrong ledger. In that case we must NOT demote: the node has
+    // never left the correct chain, so flapping FULL→SYNCING→TRACKING→FULL is
+    // spurious churn. A same-sequence sibling (fork / observer veto) or a
+    // candidate whose ancestor at our sequence differs still demotes.
+    let our_seq = our_closed.header().seq;
+    let forward_catch_up = is_forward_ancestor(root, &candidate, our_hash, our_seq);
+    if forward_catch_up {
+        tracing::info!(
+            target: "lcl_trace",
+            event = "preferred_lcl_forward_advance_no_demote",
+            preferred_lcl_hash = %preferred_hash,
+            candidate_seq = candidate.header().seq,
+            local_lcl_hash = %our_hash,
+            local_lcl_seq = our_closed.header().seq,
+            "LCL trace: forward catch-up to newer validated ledger on our own chain; adopting LCL without a mode demotion"
+        );
+    } else {
+        demote_for_preferred_lcl_divergence(
+            root,
+            shared_inbound,
+            acquisition::LedgerTarget::new(preferred_hash, Some(candidate.header().seq)),
+        );
+    }
 
     switch_last_closed_ledger(
         root,
@@ -2002,6 +2064,92 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         status_broadcaster,
     );
     PreferredLclReconciliation::Switched
+}
+
+/// Confirm that `ancestor_hash`@`ancestor_seq` is a true ancestor of the
+/// resident `descendant` ledger on the same chain - i.e. the switch from our
+/// ledger to `descendant` is a pure FORWARD catch-up, not a fork.
+///
+/// `Ledger::hash_of_seq` alone is fragile here: for a freshly adopted preferred
+/// ledger whose state SHAMap is not yet fully materialized, its in-ledger
+/// skip-list read can miss and return None, which would wrongly classify a
+/// legitimate forward advance as a fork and demote. So we first walk the
+/// resident parent-hash chain (header-only, no state map needed) for a bounded
+/// number of steps, and fall back to `hash_of_seq` only if the walk cannot
+/// resolve. Returns false on any uncertainty (never over-claims a forward
+/// advance, preserving the rippled-faithful demote for genuine divergence).
+pub(crate) fn is_forward_ancestor(
+    root: &ApplicationRoot,
+    descendant: &Arc<ledger::Ledger>,
+    ancestor_hash: Uint256,
+    ancestor_seq: u32,
+) -> bool {
+    let descendant_seq = descendant.header().seq;
+    if descendant_seq <= ancestor_seq {
+        return false;
+    }
+    // Confirm our ledger is a true ancestor of the newer preferred ledger on
+    // the same validated chain (=> the switch is a pure forward catch-up, not
+    // a fork, so no mode demotion). Try several independent ancestry sources;
+    // ONLY a positive match returns true. A negative from one source must NOT
+    // short-circuit (it may be stale/unmaterialized), so we fall through to the
+    // next source and only demote if NONE can confirm the forward relation.
+    //
+    // Source 1: LedgerMaster in-memory hash-by-sequence history index
+    // (state-map independent).
+    if let Some(lm_rt) = root.ledger_master_runtime() {
+        let lm = lm_rt.ledger_master();
+        if let Some(chain_ledger) = lm.get_ledger_by_seq(ancestor_seq, &ledger::NullLedgerJournal)
+            && *chain_ledger.header().hash.as_uint256() == ancestor_hash
+        {
+            return true;
+        }
+        // Source 2: the live validated ledger's skip-list (materialized head).
+        if let Some(validated) = lm.validated_ledger()
+            && validated.header().seq >= ancestor_seq
+            && let Some(h) = validated.hash_of_seq(ancestor_seq, &ledger::NullLedgerJournal)
+            && *h.as_uint256() == ancestor_hash
+        {
+            return true;
+        }
+    }
+    // Source 3: walk the PREFERRED descendant's own parent-hash chain
+    // (header-only; the descendant is resident and authoritative for its own
+    // ancestry) down to the ancestor sequence.
+    let max_steps = (descendant_seq - ancestor_seq).min(256);
+    let mut cursor_hash = *descendant.header().parent_hash.as_uint256();
+    let mut cursor_seq = descendant_seq - 1;
+    for _ in 0..max_steps {
+        if cursor_seq == ancestor_seq {
+            return cursor_hash == ancestor_hash;
+        }
+        match root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(cursor_hash)) {
+            Some(parent) => {
+                cursor_hash = *parent.header().parent_hash.as_uint256();
+                cursor_seq = cursor_seq.saturating_sub(1);
+            }
+            None => break,
+        }
+    }
+    // Source 4: the descendant's own skip-list (works only when its state map
+    // is materialized). Only a POSITIVE match confirms forward advance; any
+    // uncertainty returns false (preserving the rippled-faithful demote for
+    // genuine divergence).
+    let confirmed = descendant
+        .hash_of_seq(ancestor_seq, &ledger::NullLedgerJournal)
+        .map(|ancestor| *ancestor.as_uint256() == ancestor_hash)
+        .unwrap_or(false);
+    if !confirmed {
+        tracing::debug!(
+            target: "lcl_trace",
+            event = "forward_ancestor_unconfirmed",
+            ancestor_seq,
+            descendant_seq,
+            %ancestor_hash,
+            "LCL trace: could not confirm forward-ancestor relation from any source; treating as divergence (demote)"
+        );
+    }
+    confirmed
 }
 
 /// Demote only once a preferred-LCL divergence has become actionable.

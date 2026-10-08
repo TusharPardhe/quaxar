@@ -1,49 +1,86 @@
-//! The consensus event-loop driver: a dedicated background thread that
-//! processes incoming validations and newly-completed ledgers, feeding
-//! them into `NetworkOPs`-equivalent validation ingress
-//! (`receive_validation_to_network_ops_with_accept`) and ledger-history
-//! bookkeeping. Ported from the event-driven portions of
-//! `NetworkOPsImp::recvValidation` and `LedgerMaster::checkAccept`'s
-//! newly-completed-ledger handling.
+//! Synchronous validation ingress, matching rippled's
+//! `PeerImp::checkValidation -> NetworkOPsImp::recvValidation` path.
 //!
-//! `bootstrap.rs` constructs the channel via [`consensus_event_channel`],
-//! spawns the loop via [`spawn_event_loop`], and forwards events into it
-//! from two sources: a dedicated validation-forwarder thread (bridging the
-//! overlay's `SyncSender<()>` notify pattern into [`ConsensusEvent::Validation`])
-//! and the main bootstrap loop's `storeLedger` handling (emitting
-//! [`ConsensusEvent::LedgerDone`] whenever an `InboundLedger` or shared
-//! ledger-completion channel produces a new ledger).
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+//! A received `TMValidation` is processed directly on the `JtValidationT`/
+//! `JtValidationUt` job thread via [`process_validation_inline`]: the
+//! signature is verified, the validation is fed into `NetworkOPs`-equivalent
+//! ingress (`receive_validation_to_network_ops_with_accept`, which calls
+//! `Validations::add` + `updateTrie` and `checkAccept`), and it is relayed per
+//! the resulting report.
+//!
+//! There is deliberately no intermediate event queue or forwarder thread:
+//! the overlay invokes the installed validation router synchronously on
+//! receipt (`QueuedInbound::on_validation` early-returns once a router is
+//! set), so a trusted validation reaches the validation trie before the next
+//! consensus `getPrevLedger` read. An earlier design routed validations
+//! through a shared `ConsensusEvent` event loop that also handled ledger
+//! completion; that extra hop could delay a trusted validation past the
+//! consensus query, transiently skewing the preferred ledger and demoting the
+//! node out of `full`. Ledger-completion bookkeeping is owned by the
+//! acquisition/durable-handoff completion path, not by this module.
 
 use overlay::{Overlay, QueuedValidation};
 use protocol::STValidation;
 
-use crate::ledger::inbound_ledgers::InboundLedgers;
 use crate::state::application_root::ApplicationRoot;
 
-/// An event fed into the consensus driver's event loop.
-pub enum ConsensusEvent {
-    /// A validation received from a peer, still in wire form (its
-    /// suppression id and originating peer are carried alongside the raw
-    /// `TMValidation` payload for dedup/relay bookkeeping upstream).
-    Validation(Box<QueuedValidation>),
-    /// A ledger has finished acquiring/building and is ready for
-    /// `checkAccept`-style promotion to validated, if it has sufficient
-    /// validation support.
-    LedgerDone(Arc<ledger::Ledger>),
-}
-
-const CONSENSUS_EVENT_QUEUE_CAPACITY: usize = 1_024;
-
-/// Construct the bounded channel used to feed [`ConsensusEvent`]s into
-/// [`spawn_event_loop`]'s background thread. Validation arrivals are
-/// retransmitted by peers and ledger completions remain recoverable through
-/// the inbound registry, so overload can safely coalesce at this wake-up edge.
-pub fn consensus_event_channel() -> (SyncSender<ConsensusEvent>, Receiver<ConsensusEvent>) {
-    sync_channel(CONSENSUS_EVENT_QUEUE_CAPACITY)
+/// Process a single received validation inline: verify its signature, feed it
+/// into `NetworkOPs`-equivalent ingress
+/// (`receive_validation_to_network_ops_with_accept`), and relay it per the
+/// resulting report.
+///
+/// Runs synchronously on the validation job thread, matching rippled
+/// `PeerImp::checkValidation -> recvValidation`. Running it here (rather than
+/// forwarding onto a shared event loop) ensures a trusted validation reaches
+/// `Validations::add`/`updateTrie` before the next consensus `getPrevLedger`
+/// read, keeping the node's preferred ledger aligned with the network
+/// regardless of node type.
+pub fn process_validation_inline(app: &ApplicationRoot, mut queued: Box<QueuedValidation>) {
+    let Some(mut validation) = queued
+        .validation
+        .take()
+        .or_else(|| parse_validation(&queued.message.validation))
+    else {
+        tracing::warn!(target: "consensus", peer = ?queued.peer_id, "dropped malformed validation");
+        return;
+    };
+    if !validation.is_valid() {
+        // Match rippled PeerImp::checkValidation:
+        // charge(Resource::kFeeInvalidSignature, desc)
+        if let Some(overlay_rt) = app.overlay_runtime() {
+            if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(queued.peer_id) {
+                peer.charge(
+                    (*resource::FEE_INVALID_SIGNATURE).clone(),
+                    "validation invalid signature".to_owned(),
+                );
+            }
+        }
+        tracing::warn!(target: "consensus", peer = ?queued.peer_id, "dropped invalid validation signature");
+        return;
+    }
+    let report = app.receive_validation_to_network_ops_with_accept(&mut validation, "peer", app);
+    // Matches the reference's relay decision: after processing, relay the
+    // validation to other peers if the report indicates it should be relayed
+    // (trusted validations are always relayed; untrusted only when
+    // relay_untrusted_validations is configured), or if it came from a
+    // cluster peer.
+    if let Some(report) = report {
+        let relay_from_cluster = app.overlay_runtime().is_some_and(|overlay_rt| {
+            overlay_rt
+                .overlay()
+                .find_peer_by_short_id(queued.peer_id)
+                .is_some_and(|peer| peer.cluster())
+        });
+        if report.relay || relay_from_cluster {
+            if let Some(overlay_rt) = app.overlay_runtime() {
+                overlay_rt.overlay().relay_validation(
+                    queued.message.clone(),
+                    queued.suppression,
+                    *validation.get_signer_public(),
+                );
+            }
+        }
+    }
 }
 
 /// Parse a wire-format validation payload (`TMValidation.validation`) into
@@ -61,111 +98,4 @@ fn parse_validation(bytes: &[u8]) -> Option<STValidation> {
             None
         }
     }
-}
-
-/// Spawn the consensus event-loop background thread. Processes
-/// [`ConsensusEvent`]s from `event_rx` until `stop` is set, dispatching
-/// validations into `NetworkOPs`-equivalent ingress and newly-completed
-/// ledgers into ledger-history bookkeeping.
-pub fn spawn_event_loop(
-    app: ApplicationRoot,
-    shared_inbound: Arc<InboundLedgers>,
-    event_rx: Receiver<ConsensusEvent>,
-    stop: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("consensus-event-loop".into())
-        .spawn(move || {
-            let _ = &shared_inbound;
-            while !stop.load(Ordering::Acquire) {
-                let event = match event_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                    Ok(event) => event,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                };
-
-                match event {
-                    ConsensusEvent::Validation(mut queued) => {
-                        let Some(mut validation) = queued
-                            .validation
-                            .take()
-                            .or_else(|| parse_validation(&queued.message.validation))
-                        else {
-                            tracing::warn!(target: "consensus", peer = ?queued.peer_id, "dropped malformed validation");
-                            continue;
-                        };
-                        if !validation.is_valid() {
-                            // Match rippled PeerImp::checkValidation:
-                            // charge(Resource::kFeeInvalidSignature, desc)
-                            if let Some(overlay_rt) = app.overlay_runtime() {
-                                use overlay::Overlay;
-                                if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(queued.peer_id) {
-                                    peer.charge(
-                                        (*resource::FEE_INVALID_SIGNATURE).clone(),
-                                        "validation invalid signature".to_owned(),
-                                    );
-                                }
-                            }
-                            tracing::warn!(target: "consensus", peer = ?queued.peer_id, "dropped invalid validation signature");
-                            continue;
-                        }
-                        let report = app.receive_validation_to_network_ops_with_accept(&mut validation, "peer", &app);
-                        // Matches the reference's relay decision: after
-                        // processing, relay the validation to other peers
-                        // if the report indicates it should be relayed
-                        // (trusted validations are always relayed;
-                        // untrusted only when relay_untrusted_validations
-                        // is configured).
-                        if let Some(report) = report {
-                            let relay_from_cluster = app.overlay_runtime().is_some_and(|overlay_rt| {
-                                overlay_rt
-                                    .overlay()
-                                    .find_peer_by_short_id(queued.peer_id)
-                                    .is_some_and(|peer| peer.cluster())
-                            });
-                            if report.relay || relay_from_cluster {
-                                if let Some(overlay_rt) = app.overlay_runtime() {
-                                    overlay_rt.overlay().relay_validation(
-                                        queued.message.clone(),
-                                        queued.suppression,
-                                        *validation.get_signer_public(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    ConsensusEvent::LedgerDone(ledger) => {
-                        if let Some(runtime) = app.ledger_master_runtime() {
-                            // Completion persistence has already followed the acquisition
-                            // reason path. Preserve rippled's storeLedger invariant here:
-                            // sequence indexing is controlled by the ledger header's
-                            // validated bit, never by receipt of a wake-up event.
-                            runtime
-                                .ledger_master()
-                                .ledger_history()
-                                .insert(Arc::clone(&ledger), ledger.header().validated);
-                            // Matches rippled's storeLedger() → checkAccept(ledger):
-                            // once a newly-acquired ledger is stored in history,
-                            // immediately check whether it has reached quorum.
-                            // Without this, the ledger sits in history until
-                            // the periodic bootstrap check finds it (~50ms),
-                            // or worse, if the acquiring map promotion already
-                            // happened before this event fires, the trie has
-                            // the entry but check_accept was never triggered.
-                            app.check_accept_hash_seq(
-                                *ledger.header().hash.as_uint256(),
-                                ledger.header().seq,
-                            );
-                        }
-                        // Matches rippled's Validations::onLedger(ledger):
-                        // register the ledger in the validations adaptor's
-                        // local cache so subsequent trie operations
-                        // (updateTrie → acquire) find it immediately without
-                        // falling through to the slower ledger_history lookup.
-                        app.validations().register_ledger(&ledger);
-                    }
-                }
-            }
-        })
-        .expect("spawn consensus-event-loop thread")
 }

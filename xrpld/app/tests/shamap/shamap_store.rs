@@ -81,20 +81,7 @@ impl SHAMapStoreHealthRuntime for ComponentRuntime {
     }
 }
 
-impl SHAMapStoreComponentRuntime for ComponentRuntime {
-    fn copy_validated_ledger(
-        &mut self,
-        validated_ledger: Arc<Ledger>,
-        _health_policy: app::SHAMapStoreHealthPolicy,
-    ) -> Result<app::SHAMapStoreCopyDisposition, String> {
-        self.shared
-            .copied
-            .lock()
-            .expect("copied mutex")
-            .push(validated_ledger.header().seq);
-        Ok(app::SHAMapStoreCopyDisposition::Completed { node_count: 1 })
-    }
-}
+impl SHAMapStoreComponentRuntime for ComponentRuntime {}
 
 fn wait_for(condition: impl Fn() -> bool) {
     for _ in 0..50 {
@@ -131,60 +118,6 @@ fn shamap_store_config_and_owner_state_match_current_rust_boundary() {
 }
 
 #[test]
-fn shamap_store_rotation_boundary_overrides_minimum_sql_seq() {
-    let mut runtime = Runtime {
-        minimum_sql_seq: Some(700),
-    };
-    let mut store = SHAMapStore::new(256, true, 0);
-
-    assert_eq!(store.minimum_online(&runtime), Some(700));
-    store.note_rotation_boundary(900);
-    assert_eq!(store.minimum_online(&runtime), Some(901));
-
-    store.set_saved_state(SHAMapStoreSavedState {
-        writable_db: "writable".to_owned(),
-        archive_db: "archive".to_owned(),
-        last_rotated: 900,
-    });
-    let decision = store.rotation_decision(1156, SHAMapStoreHealthStatus::KeepGoing);
-    assert!(decision.ready_to_rotate);
-
-    runtime.minimum_sql_seq = Some(1_200);
-    assert_eq!(store.minimum_online(&runtime), Some(901));
-}
-
-#[test]
-fn shamap_store_component_updates_rotation_boundary_and_rendezvous() {
-    let component = SHAMapStoreComponent::new(
-        SHAMapStore::new(256, true, 9),
-        Box::new(Runtime::default()),
-        None,
-    );
-    component.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
-        900, 0, false,
-    )));
-
-    let initial = component
-        .process_queued_ledger()
-        .expect("step")
-        .expect("queued");
-    assert_eq!(initial.runloop.decision.last_rotated, 900);
-    assert!(component.rendezvous());
-
-    component.set_can_delete(900).expect("can delete");
-    component.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
-        1_156, 0, false,
-    )));
-    let rotated = component
-        .process_queued_ledger()
-        .expect("step")
-        .expect("queued");
-    assert!(rotated.runloop.decision.ready_to_rotate);
-    assert_eq!(component.get_last_rotated(), 1_156);
-    assert_eq!(component.saved_state().last_rotated, 1_156);
-}
-
-#[test]
 fn runtime_drives_real_shamap_store_component_lifecycle() {
     let shared = Arc::new(ComponentRuntimeShared::default());
     let component = Arc::new(SHAMapStoreComponent::new(
@@ -209,13 +142,13 @@ fn runtime_drives_real_shamap_store_component_lifecycle() {
             )))
     );
     assert_eq!(runtime.root().validated_ledger_seq(), Some(900));
-    wait_for(|| component.rendezvous());
 
     runtime.shutdown();
 
-    assert_eq!(component.get_last_rotated(), 900);
-    assert_eq!(shared.starts.load(Ordering::Relaxed), 1);
-    assert_eq!(shared.stops.load(Ordering::Relaxed), 1);
+    // With the rotating worker removed, a non-rotating store copies nothing and
+    // never advances a rotation boundary; the component simply passes validated
+    // ledgers through.
+    assert_eq!(component.get_last_rotated(), 0);
     assert_eq!(
         shared.copied.lock().expect("copied mutex").as_slice(),
         &[] as &[u32]

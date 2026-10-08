@@ -29,7 +29,15 @@ pub struct VaultDepositPreclaimFacts {
     pub vault_is_private: bool,
     pub submitter_is_owner: bool,
     pub domain_id_present: bool,
+    /// rippled VaultDeposit::preclaim (fixCleanup3_2_0): the amount rounded
+    /// Downward to the posterior AssetsTotal scale (`roundToVaultScale`) is 0.
+    pub rounded_amount_is_zero_at_vault_scale: bool,
+    /// `accountHolds(.., FullBalance) >= roundedAmount` (the unrounded amount
+    /// before fixCleanup3_2_0).
     pub account_holds_sufficient_assets: bool,
+    /// fixCleanup3_2_0, non-integral rounded amount, depositor not the issuer,
+    /// and `amount.isZeroAtScale(scale(accountBalance))`.
+    pub rounds_to_zero_at_depositor_scale: bool,
 }
 
 pub fn run_vault_deposit_preclaim<CanTransfer, ValidDomain, RequireAuth, CheckDepositFreeze>(
@@ -105,8 +113,18 @@ where
         return ter;
     }
 
+    if facts.rounded_amount_is_zero_at_vault_scale {
+        return Ter::TEC_PRECISION_LOSS;
+    }
+
     if !facts.account_holds_sufficient_assets {
         return Ter::TEC_INSUFFICIENT_FUNDS;
+    }
+
+    // Reject IOU deposits that would canonicalize to a no-op at the
+    // depositor's trust-line scale (VaultDeposit.cpp IOU precision checks).
+    if facts.rounds_to_zero_at_depositor_scale {
+        return Ter::TEC_PRECISION_LOSS;
     }
 
     Ter::TES_SUCCESS

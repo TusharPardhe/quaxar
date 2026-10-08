@@ -220,6 +220,37 @@ impl<V: AppServerInfoView> ServerInfoSource for ApplicationServerInfo<V> {
             );
         }
 
+        // Pruned (fjall) store health, when that path is active, so operators
+        // see the retained floor and a verify failure (design Case 11) directly
+        // in server_info rather than only via get_counts.
+        if let Some(metrics) = self
+            .view
+            .app()
+            .and_then(|app| app.shamap_store_service())
+            .and_then(|service| service.component().pruned_metrics())
+        {
+            let mut pruned = BTreeMap::new();
+            if let Some(claimed) = metrics.claimed_seq {
+                pruned.insert(
+                    "claimed_seq".to_owned(),
+                    JsonValue::Unsigned(u64::from(claimed)),
+                );
+            }
+            pruned.insert(
+                "pruned_to".to_owned(),
+                JsonValue::Unsigned(u64::from(metrics.pruned_to)),
+            );
+            pruned.insert(
+                "retained_floor".to_owned(),
+                JsonValue::Unsigned(u64::from(metrics.retained_floor)),
+            );
+            pruned.insert(
+                "verify_last_ok".to_owned(),
+                JsonValue::Bool(metrics.verify_last_ok),
+            );
+            info.insert("pruned_store".to_owned(), JsonValue::Object(pruned));
+        }
+
         JsonValue::Object(info)
     }
 }
@@ -405,11 +436,15 @@ mod tests {
         let source =
             ApplicationServerInfo::new(OwnedApplicationServerInfo::from_application_root(&app));
 
+        // rippled getOrAcquireLedger: a sequence needs a fresh validated
+        // ledger to resolve its hash.
         let status = source.ledger_request(1);
-        assert_eq!(status.error_code(), Some(RpcErrorCode::NoNetwork));
+        assert_eq!(status.error_code(), Some(RpcErrorCode::NotSynced));
 
+        // By hash it goes straight to InboundLedgers::acquire, which never
+        // blocks; with no registry/coordinator it reports "acquiring".
         let hash_status = source.ledger_request_by_hash(basics::base_uint::Uint256::zero());
-        assert_eq!(hash_status.error_code(), Some(RpcErrorCode::NoNetwork));
+        assert_eq!(hash_status.error_code(), Some(RpcErrorCode::NotReady));
     }
 
     #[test]
@@ -664,12 +699,6 @@ impl SHAMapNodeFetcher for RpcStateNodeStoreFetcher {
     fn fetch_node_object(&self, hash: SHAMapHash, ledger_seq: u32) -> Option<SHAMapNodeObject> {
         let fetched = match &self.node_store {
             app::SHAMapStoreNodeStore::Single(database) => database.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                FetchType::Synchronous,
-                false,
-            ),
-            app::SHAMapStoreNodeStore::Rotating(database) => database.fetch_node_object(
                 hash.as_uint256(),
                 ledger_seq,
                 FetchType::Synchronous,
@@ -2219,13 +2248,35 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
                 );
                 database.add_counts_json(json);
             }
-            app::SHAMapStoreNodeStore::Rotating(database) => {
+        }
+
+        // Pruned (fjall) store progress, when that path is active.
+        if let Some(metrics) = app
+            .shamap_store_service()
+            .and_then(|service| service.component().pruned_metrics())
+        {
+            if let Some(claimed) = metrics.claimed_seq {
                 json.insert(
-                    "node_db_earliest_seq".to_owned(),
-                    JsonValue::Unsigned(u64::from(database.earliest_ledger_seq())),
+                    "pruned_claimed_seq".to_owned(),
+                    JsonValue::Unsigned(u64::from(claimed)),
                 );
-                database.add_counts_json(json);
             }
+            json.insert(
+                "pruned_to".to_owned(),
+                JsonValue::Unsigned(u64::from(metrics.pruned_to)),
+            );
+            json.insert(
+                "pruned_retained_floor".to_owned(),
+                JsonValue::Unsigned(u64::from(metrics.retained_floor)),
+            );
+            json.insert(
+                "pruned_unclaimed".to_owned(),
+                JsonValue::Unsigned(metrics.unclaimed as u64),
+            );
+            json.insert(
+                "pruned_verify_last_ok".to_owned(),
+                JsonValue::Bool(metrics.verify_last_ok),
+            );
         }
     }
 }

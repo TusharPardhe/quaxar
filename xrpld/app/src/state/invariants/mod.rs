@@ -165,7 +165,7 @@ pub(crate) fn check_invariants_for_tx_with_prefix<V: ApplyView + ?Sized>(
     let tx_account = tx
         .is_field_present(sf("sfAccount"))
         .then(|| tx.get_account_id(sf("sfAccount")));
-    let tx_account_paid_fee = tx_account.is_some_and(|account| tx.get_fee_payer_id() == account);
+    let fee_payer_account_root = transaction_fee_payer_account_root(tx);
     let tx_destination = tx
         .is_field_present(sf("sfDestination"))
         .then(|| tx.get_account_id(sf("sfDestination")));
@@ -191,7 +191,7 @@ pub(crate) fn check_invariants_for_tx_with_prefix<V: ApplyView + ?Sized>(
             tx_amount,
             tx_has_holder,
             cross_currency_payment,
-            tx_account_paid_fee,
+            fee_payer_account_root,
             result,
             fee,
             expected_xrp_delta,
@@ -209,10 +209,22 @@ pub fn check_invariants<V: ApplyView + ?Sized>(
     map_invariant_result(
         result,
         check_invariants_inner(
-            sandbox, txn_type, false, None, None, None, None, None, None, false, false, false,
+            sandbox, txn_type, false, None, None, None, None, None, None, false, false, None,
             result, fee, None, None,
         ),
     )
+}
+
+/// Mirrors rippled b3b38e4416's `Transactor::getFeePayer` distinction for
+/// ValidVault. A signature-less fee sponsorship spends the Sponsorship SLE's
+/// prefunded `sfFeeAmount`, so no AccountRoot pays that fee; direct, delegated,
+/// and co-signed sponsorship fees are paid by `get_fee_payer_id()`.
+fn transaction_fee_payer_account_root(tx: &STTx) -> Option<AccountID> {
+    let fee_is_prefunded = tx.is_field_present(sf("sfSponsor"))
+        && tx.is_field_present(sf("sfSponsorFlags"))
+        && ledger::is_fee_sponsored(tx.get_field_u32(sf("sfSponsorFlags")))
+        && !tx.is_field_present(sf("sfSponsorSignature"));
+    (!fee_is_prefunded).then(|| tx.get_fee_payer_id())
 }
 
 fn payment_is_cross_currency(tx: &STTx) -> bool {
@@ -245,7 +257,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     tx_amount: Option<STAmount>,
     tx_has_holder: bool,
     cross_currency_payment: bool,
-    tx_account_paid_fee: bool,
+    fee_payer_account_root: Option<AccountID>,
     result: Ter,
     fee: XRPAmount,
     expected_xrp_delta: Option<i64>,
@@ -1151,6 +1163,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         single_asset_vault_enabled,
         lending_protocol_enabled,
         mptokens_v2_enabled,
+        fix_cleanup_3_4_0,
         &mpt_issuance_lifecycle,
     ) {
         return Err(());
@@ -1222,7 +1235,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
             tx_destination,
             tx_holder,
             tx_amount.as_ref(),
-            tx_account_paid_fee,
+            fee_payer_account_root,
             fee,
             fix_cleanup_3_4_0,
             result,
@@ -1359,8 +1372,10 @@ mod tests {
             &state,
             holder,
             asset,
-            false,
+            None,
+            None,
             protocol::XRPAmount::from_drops(0),
+            false,
         )
         .expect("the maximum MPT balance produces a nonzero invariant delta");
 
@@ -1368,45 +1383,76 @@ mod tests {
     }
 
     #[test]
-    fn vault_invariant_compensates_only_the_sources_own_xrp_fee() {
-        let depositor = account(0xA3);
+    fn vault_invariant_corrects_the_actual_xrp_fee_payer_after_cleanup_3_4_0() {
+        let source = account(0xA3);
+        let sponsor_destination = account(0xA4);
         let asset = Asset::Issue(protocol::xrp_issue());
-        let mut state = VaultState::default();
+
+        let mut source_state = VaultState::default();
         add_vault_asset_delta(
-            &mut state,
-            depositor,
+            &mut source_state,
+            source,
             asset,
             RuntimeNumber::from_i64(-1_000_010),
             None,
         );
-
-        let delta = vault_transaction_account_asset_delta(
-            &state,
-            depositor,
+        let source_delta = vault_transaction_account_asset_delta(
+            &source_state,
+            source,
             asset,
-            true,
+            Some(source),
+            Some(source),
             protocol::XRPAmount::from_drops(10),
+            true,
         )
         .expect("the XRP deposit transfer must retain its nonzero delta");
-        assert_eq!(delta.delta, RuntimeNumber::from_i64(-1_000_000));
+        assert_eq!(source_delta.delta, RuntimeNumber::from_i64(-1_000_000));
 
-        let mut sponsored_state = VaultState::default();
+        let mut sponsored_destination_state = VaultState::default();
         add_vault_asset_delta(
-            &mut sponsored_state,
-            depositor,
+            &mut sponsored_destination_state,
+            sponsor_destination,
             asset,
-            RuntimeNumber::from_i64(-1_000_000),
+            RuntimeNumber::from_i64(999_990),
             None,
         );
-        let sponsored = vault_transaction_account_asset_delta(
-            &sponsored_state,
-            depositor,
+        let sponsored_destination = vault_transaction_account_asset_delta(
+            &sponsored_destination_state,
+            sponsor_destination,
             asset,
-            false,
+            Some(source),
+            Some(sponsor_destination),
             protocol::XRPAmount::from_drops(10),
+            true,
         )
-        .expect("a sponsor's fee must not be added to the source delta");
-        assert_eq!(sponsored.delta, RuntimeNumber::from_i64(-1_000_000));
+        .expect("a co-signed destination sponsor pays its own XRP fee");
+        assert_eq!(
+            sponsored_destination.delta,
+            RuntimeNumber::from_i64(1_000_000)
+        );
+
+        let mut prefunded_destination_state = VaultState::default();
+        add_vault_asset_delta(
+            &mut prefunded_destination_state,
+            sponsor_destination,
+            asset,
+            RuntimeNumber::from_i64(1_000_000),
+            None,
+        );
+        let prefunded_destination = vault_transaction_account_asset_delta(
+            &prefunded_destination_state,
+            sponsor_destination,
+            asset,
+            Some(source),
+            None,
+            protocol::XRPAmount::from_drops(10),
+            true,
+        )
+        .expect("a prefunded sponsorship does not debit an AccountRoot");
+        assert_eq!(
+            prefunded_destination.delta,
+            RuntimeNumber::from_i64(1_000_000)
+        );
     }
 
     #[test]

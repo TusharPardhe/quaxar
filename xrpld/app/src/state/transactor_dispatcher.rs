@@ -2162,37 +2162,24 @@ fn nft_account_funds_at_least<V: ledger::ApplyView>(
 
 fn nft_transfer_fee_cut(amount: &STAmount, fee: u16) -> Result<STAmount, Ter> {
     const TRANSFER_FEE_DENOMINATOR: u32 = 100_000;
-    if amount.native() {
-        return protocol::xrp_amount::mul_ratio(
-            amount.xrp(),
-            u32::from(fee),
-            TRANSFER_FEE_DENOMINATOR,
-            false,
-        )
-        .map(STAmount::from_xrp_amount)
-        .map_err(|_| Ter::TEC_INTERNAL);
+    // Parity: rippled NFTokenAcceptOffer computes the issuer royalty cut as
+    //   cut = nft::multiply(amount, nft::transferFeeAsRate(fee))
+    // where transferFeeAsRate(fee) = Rate{fee * 10000} and nft::multiply ==
+    // STAmount multiply(amount, asAmount(rate), amount.asset()). For a native
+    // (XRP) amount this takes the general Number*Number -> STAmount(XRP) path,
+    // which canonicalizes drops with the legacy `canonicalizeRound` behavior
+    // (round the dropped fractional digits), NOT a plain integer floor. The
+    // previous `mul_ratio(.., round_up=false)` floor produced a royalty cut 1
+    // drop short of the network on fractional splits (e.g. 5711412 * 5% =
+    // 285570.6 -> floor 285570 vs network 285571), forking the ledger. Use
+    // the exact rippled helper so the split matches byte-for-byte.
+    let _ = TRANSFER_FEE_DENOMINATOR;
+    let rate = protocol::rate::nft::transfer_fee_as_rate(fee);
+    if rate == protocol::rate::PARITY_RATE {
+        // fee == 0 is handled by the caller; a parity rate yields no cut.
+        return Ok(amount.zeroed());
     }
-    if amount.holds_mpt_issue() {
-        let Asset::MPTIssue(issue) = amount.asset() else {
-            return Err(Ter::TEC_INTERNAL);
-        };
-        return protocol::mpt_amount::mul_ratio(
-            amount.mpt(),
-            u32::from(fee),
-            TRANSFER_FEE_DENOMINATOR,
-            false,
-        )
-        .map(|cut| STAmount::from_mpt_amount(sf("sfAmount"), cut, issue))
-        .map_err(|_| Ter::TEC_INTERNAL);
-    }
-    protocol::iou_amount::mul_ratio(
-        amount.iou(),
-        u32::from(fee),
-        TRANSFER_FEE_DENOMINATOR,
-        false,
-    )
-    .map(|cut| STAmount::from_iou_amount(sf("sfAmount"), cut, amount.issue()))
-    .map_err(|_| Ter::TEC_INTERNAL)
+    Ok(protocol::rate::multiply_rate(amount, rate))
 }
 
 struct DispatcherTicketCreateSink<'a, V> {

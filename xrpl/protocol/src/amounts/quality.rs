@@ -868,3 +868,29 @@ fn canonicalize_round_strict(native: bool, value: &mut u64, offset: &mut i32, ro
         *offset += 1;
     }
 }
+
+#[cfg(test)]
+mod int64_wrap_parity_tests {
+    use super::*;
+
+    /// rippled `divide()` returns `muldiv(numVal, 1e17, denVal) + 5` and the
+    /// issued-amount canonicalization goes through `STAmount::iou()`, which
+    /// casts that raw u64 mantissa to int64. For a native numerator above
+    /// ~9.22e16 drops over a 1e15 denominator the cast wraps, and rippled's
+    /// getRate keeps only the magnitude. xrpld 3.4.1 (standalone replay of
+    /// testnet tx 6407F992) crosses with TakerGets 1.039601166302251 BOOK,
+    /// which is TakerPays / round6(getRate) using this wrapped rate.
+    #[test]
+    fn get_rate_matches_rippled_int64_wrapped_canonicalization() {
+        let book = crate::Issue::new(crate::currency_from_string("BKK"), crate::AccountID::from_array([7; 20]));
+        let gets = STAmount::new_with_asset(sf_generic(), book, 1_000_000_000_000_000, -15, false);
+        let pays = STAmount::new_native(94_024_544_323_757_840, false);
+        let rate = get_rate(&gets, &pays);
+        assert_eq!(rate & !(255u64 << 56), 9_044_289_641_333_768, "wrapped mantissa");
+        assert_eq!(((rate >> 56) as i32) - 100, 1, "wrapped exponent");
+
+        let rounded = Quality::from_value(rate).round(6);
+        let taker_gets = divide(&pays, &amount_from_quality(rounded.value()), book);
+        assert_eq!((taker_gets.mantissa(), taker_gets.exponent()), (1_039_601_166_302_251, -15));
+    }
+}

@@ -29,6 +29,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rayon::prelude::*;
+
 use ledger::Ledger;
 
 use basics::base_uint::Uint256;
@@ -59,6 +61,34 @@ use crate::timer::{TimerKind, TimerRequest};
 /// deliberately coordinator-owned and rearmed only after a later rejection;
 /// it avoids immediate retry loops while keeping failed delivery responsive.
 pub const HANDOFF_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Maximum number of per-session SHAMap read-apply groups processed
+/// concurrently, matching rippled's `JtLedgerData` JobQueue concurrency limit
+/// (`JobTypes.h`: `add(JtLedgerData, "ledgerData", 3, ...)`). rippled runs each
+/// `InboundLedger::runData` as an independent `JtLedgerData` job, so up to three
+/// different ledgers' received-data nodes are decoded/attached in parallel. We
+/// mirror that bound: distinct acquisition sessions (one SHAMap tree each) have
+/// their batched read completions applied on this bounded pool, while the owner
+/// strand retains authority over session lifecycle, effects, and shared state.
+const LEDGER_DATA_PARALLELISM: usize = 3;
+
+/// Below this many distinct sessions in a read batch, parallel dispatch costs
+/// more (pool handoff / join) than it saves, so the owner applies inline.
+const LEDGER_DATA_PARALLEL_MIN_SESSIONS: usize = 2;
+
+/// The bounded `JtLedgerData`-equivalent worker pool, created once. Threads are
+/// named for perf/wchan attribution during stall diagnosis.
+fn ledger_data_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(LEDGER_DATA_PARALLELISM)
+            .thread_name(|i| format!("ledger-data-{i}"))
+            .build()
+            .expect("ledger-data pool build")
+    })
+}
+
 
 /// rippled `InboundLedger::addPeers` begins acquisition through this many
 /// scored peers (`kPeerCountStart` in `InboundLedger.cpp`). Keep the
@@ -283,6 +313,15 @@ pub struct CoordinatorState {
     /// the common emitter can construct a `PeerRequest`.
     outbound: OutboundRequestAdmission,
     ids: IdCounter,
+}
+
+/// Result of applying one session's batched read completions, produced by the
+/// bounded `JtLedgerData`-equivalent parallel apply and folded back into shared
+/// runner state serially by the owner.
+struct SessionApplyResult {
+    session: Option<SessionRef>,
+    resume: bool,
+    stale: u64,
 }
 
 /// The coordinator-owned lifecycle of one session.
@@ -2829,7 +2868,7 @@ impl CoordinatorRunner {
                 return effects;
             }
             let engine = match completion.outcome() {
-                crate::io::ReadOutcome::Settled { node: Some(data) } => {
+                crate::io::ReadOutcome::Settled { node: Some(data), .. } => {
                     self.plan_seed.build_stored_header(session, data)
                 }
                 _ => None,
@@ -2910,61 +2949,95 @@ impl CoordinatorRunner {
     fn on_read_batch(&mut self, completions: Vec<ReadCompletion>) -> Vec<AcquisitionEffect> {
         let mut effects = Vec::new();
         let mut resume = BTreeSet::new();
+
+        // Phase 1: separate header reads (processed serially; they can mutate
+        // cross-session/shared runner state) from per-session Read/RecoveryRead
+        // completions, which touch only their own session's SHAMap engine and
+        // are therefore safe to apply in parallel - exactly as rippled runs one
+        // `InboundLedger::runData` job per ledger under the `JtLedgerData`
+        // concurrency limit.
+        let mut grouped: BTreeMap<SessionRef, Vec<ReadCompletion>> = BTreeMap::new();
         for completion in completions {
-            if completion.operation().kind() == OperationKind::HeaderRead {
-                effects.extend(self.on_read(completion));
-                continue;
-            }
-            if !matches!(
-                completion.operation().kind(),
-                OperationKind::Read | OperationKind::RecoveryRead
-            ) {
-                self.stats.stale_events += 1;
-                continue;
-            }
-            let session = completion.operation().session();
-            let operation_kind = completion.operation().kind();
-            let (outcome, pending_reads_after, pending_traversal_after, read_backlog_after) = {
-                let Some(session_state) = self.state.sessions.get_mut(&session) else {
-                    self.stats.stale_events += 1;
-                    continue;
-                };
-                if session_state.phase != SessionPhase::Active {
-                    self.stats.stale_events += 1;
-                    continue;
+            match completion.operation().kind() {
+                OperationKind::HeaderRead => {
+                    effects.extend(self.on_read(completion));
                 }
-                let outcome = session_state.plan.on_read(&completion);
-                (
-                    outcome,
-                    session_state.plan.pending_read_count(),
-                    session_state.plan.pending_traversal_read_count(),
-                    session_state.plan.read_backlog_count(),
-                )
+                OperationKind::Read | OperationKind::RecoveryRead => {
+                    let session = completion.operation().session();
+                    grouped.entry(session).or_default().push(completion);
+                }
+                _ => self.stats.stale_events += 1,
+            }
+        }
+
+        // Build disjoint `&mut` handles to exactly the sessions named in this
+        // batch. `iter_mut` yields non-overlapping borrows, so each worker owns
+        // one session's engine for the duration of its applies.
+        let mut jobs: Vec<(&mut CoordinatorSession, Vec<ReadCompletion>)> = self
+            .state
+            .sessions
+            .iter_mut()
+            .filter_map(|(session, state)| {
+                grouped.remove(session).map(|completions| (state, completions))
+            })
+            .collect();
+        // Completions whose session is gone (never matched above) are stale.
+        for (_, orphaned) in grouped {
+            self.stats.stale_events += orphaned.len() as u64;
+        }
+
+        // Per-session apply unit. Returns the sessions that must resume a plan
+        // turn plus the stale count accrued, so the owner can fold shared state
+        // serially after the parallel phase.
+        let apply_session = |pair: &mut (&mut CoordinatorSession, Vec<ReadCompletion>)|
+         -> SessionApplyResult {
+            let (state, completions) = pair;
+            let session = completions
+                .first()
+                .map(|completion| completion.operation().session());
+            let mut result = SessionApplyResult {
+                session,
+                resume: false,
+                stale: 0,
             };
-            tracing::trace!(
-                target: "acquisition_trace",
-                event = "node_store_read_completed",
-                run_epoch = session.run_epoch().get(),
-                session_id = session.session_id().get(),
-                target_hash = %session.target_hash(),
-                plan_epoch = session.plan_epoch().get(),
-                store_generation = session.store_generation().get(),
-                outcome = ?completion.outcome(),
-                plan_outcome = ?outcome,
-                pending_reads_after,
-                pending_traversal_after,
-                read_backlog_after,
-                "acquisition trace: batched brokered NodeStore read completion applied to session"
-            );
-            match outcome {
-                PlanReadOutcome::Applied
-                    if operation_kind == OperationKind::RecoveryRead
-                        || pending_traversal_after == 0 =>
-                {
-                    resume.insert(session);
+            if state.phase != SessionPhase::Active {
+                result.stale += completions.len() as u64;
+                return result;
+            }
+            for completion in completions.iter() {
+                let operation_kind = completion.operation().kind();
+                let outcome = state.plan.on_read(completion);
+                let pending_traversal_after = state.plan.pending_traversal_read_count();
+                match outcome {
+                    PlanReadOutcome::Applied
+                        if operation_kind == OperationKind::RecoveryRead
+                            || pending_traversal_after == 0 =>
+                    {
+                        result.resume = true;
+                    }
+                    PlanReadOutcome::Applied => {}
+                    PlanReadOutcome::Stale => result.stale += 1,
                 }
-                PlanReadOutcome::Applied => {}
-                PlanReadOutcome::Stale => self.stats.stale_events += 1,
+            }
+            result
+        };
+
+        // Phase 2: apply. Use the bounded `JtLedgerData`-equivalent pool only
+        // when enough distinct sessions are present to amortize the handoff;
+        // otherwise apply inline on the owner (single-session batches are the
+        // common steady-state case and must not pay pool cost).
+        let results: Vec<SessionApplyResult> = if jobs.len() >= LEDGER_DATA_PARALLEL_MIN_SESSIONS {
+            ledger_data_pool().install(|| jobs.par_iter_mut().map(apply_session).collect())
+        } else {
+            jobs.iter_mut().map(apply_session).collect()
+        };
+
+        // Phase 3: fold shared state serially on the owner, then run the plan
+        // turns (which require `&mut self` for ids/peer_view/effects).
+        for result in results {
+            self.stats.stale_events += result.stale;
+            if result.resume && let Some(session) = result.session {
+                resume.insert(session);
             }
         }
         for session in resume {
@@ -3313,8 +3386,14 @@ impl CoordinatorRunner {
         // NodeStore reads/writes every owner turn (observed ~90 incremental
         // write acceptances/sec) and starves the single consensus owner,
         // producing multi-second stalls where no proposals/validations are
-        // processed. rippled abandons superseded CONSENSUS/GENERIC inbound
-        // acquisitions once a newer validated ledger exists.
+        // processed.
+        //
+        // Only Consensus sessions are superseded. Generic (ledger_request,
+        // LedgerMaster lookups) and History (backfill) acquisitions target
+        // past ledgers by design; rippled never cancels them on LCL advance
+        // (only `InboundLedgers::sweep` expires them when idle). Cancelling
+        // them here killed every such acquisition on the next close, which
+        // left permanent history gaps and made old-ledger RPCs never finish.
         if identity.sequence() != 0 {
             let installed_seq = identity.sequence();
             let superseded: Vec<SessionRef> = self
@@ -3322,6 +3401,7 @@ impl CoordinatorRunner {
                 .sessions
                 .iter()
                 .filter(|(_, state)| !state.phase.is_terminal())
+                .filter(|(_, state)| state.reason == AcquireReason::Consensus)
                 .filter(|(_, state)| {
                     state
                         .target
@@ -5972,7 +6052,7 @@ mod tests {
             _ => None,
         }) {
             replay.extend(runner.handle_event(AcquisitionEvent::ReadCompleted(
-                ReadCompletion::new(operation, ReadOutcome::Settled { node: None }),
+                ReadCompletion::new(operation, ReadOutcome::settled(None)),
             )));
         }
         assert_eq!(
@@ -6956,7 +7036,7 @@ mod tests {
             .expect("anchor starts with a local header probe");
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             header_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
 
         runner.handle_event(AcquisitionEvent::ConsensusTarget(ConsensusTarget::new(
@@ -7754,7 +7834,7 @@ mod tests {
         );
         let _ = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(runner.snapshot().plan_turns() > plan_turns);
         assert_eq!(runner.snapshot().stale_events(), 0);
@@ -7840,7 +7920,7 @@ mod tests {
             _ => None,
         }) {
             effects.extend(runner.handle_event(AcquisitionEvent::ReadCompleted(
-                ReadCompletion::new(operation, ReadOutcome::Settled { node: None }),
+                ReadCompletion::new(operation, ReadOutcome::settled(None)),
             )));
         }
         effects
@@ -7859,7 +7939,7 @@ mod tests {
             _ => None,
         }) {
             effects.extend(runner.handle_event(AcquisitionEvent::ReadCompleted(
-                ReadCompletion::new(operation, ReadOutcome::Settled { node: None }),
+                ReadCompletion::new(operation, ReadOutcome::settled(None)),
             )));
         }
         effects
@@ -7902,7 +7982,7 @@ mod tests {
                 _ => None,
             }) {
                 effects.extend(runner.handle_event(AcquisitionEvent::ReadCompleted(
-                    ReadCompletion::new(operation, ReadOutcome::Settled { node: None }),
+                    ReadCompletion::new(operation, ReadOutcome::settled(None)),
                 )));
             }
         }
@@ -7934,7 +8014,7 @@ mod tests {
             })
             .expect("latest consensus acquisition probes the resident header");
         consensus.extend(runner.handle_event(AcquisitionEvent::ReadCompleted(
-            ReadCompletion::new(consensus_header, ReadOutcome::Settled { node: None }),
+            ReadCompletion::new(consensus_header, ReadOutcome::settled(None)),
         )));
         assert!(
             consensus
@@ -8410,7 +8490,7 @@ mod tests {
             .expect("validation recovery starts with a header probe");
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             header_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
 
         let preferred = target(201);
@@ -8697,7 +8777,7 @@ mod tests {
             .expect("first acquisition probes the resident header");
         let _ = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             first_header,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         runner.release_session_request_credits(first_session);
         let synthetic_sessions = [
@@ -8776,7 +8856,7 @@ mod tests {
             .expect("older validation target starts behind the full window");
         let _ = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             older_header,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
 
         let validation = target(10_000);
@@ -8806,7 +8886,7 @@ mod tests {
         assert_eq!(runner.phase(), &full);
 
         let queued_base = runner.handle_event(AcquisitionEvent::ReadCompleted(
-            ReadCompletion::new(validation_header, ReadOutcome::Settled { node: None }),
+            ReadCompletion::new(validation_header, ReadOutcome::settled(None)),
         ));
         assert!(
             queued_base
@@ -9230,7 +9310,7 @@ mod tests {
             for read in read_effects(&effects) {
                 let _ = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
                     read.operation(),
-                    ReadOutcome::Settled { node: None },
+                    ReadOutcome::settled(None),
                 )));
             }
             effects = runner.handle_event(AcquisitionEvent::TimerFired {
@@ -9317,7 +9397,7 @@ mod tests {
             for read in read_effects(&effects) {
                 let _ = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
                     read.operation(),
-                    ReadOutcome::Settled { node: None },
+                    ReadOutcome::settled(None),
                 )));
             }
             assert!(
@@ -9534,7 +9614,7 @@ mod tests {
         );
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().stale_events(), 1);
 
@@ -9547,7 +9627,7 @@ mod tests {
         );
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             wrong_kind,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().stale_events(), 2);
 
@@ -9567,7 +9647,7 @@ mod tests {
         );
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().stale_events(), 3);
     }
@@ -10032,6 +10112,36 @@ mod tests {
     }
 
     #[test]
+    fn lcl_installed_above_target_keeps_generic_and_history_sessions() {
+        // rippled only sweeps idle Generic/History inbound ledgers; an LCL
+        // advance past their (necessarily older) target must not cancel them.
+        for reason in [AcquireReason::Generic, AcquireReason::History] {
+            let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+            connect(&mut runner);
+            let _ = runner.handle_event(AcquisitionEvent::LclInstalled(identity(20)));
+            let effects = runner.handle_event(AcquisitionEvent::AcquireRequested {
+                target: target(7),
+                reason,
+            });
+            assert!(!effects.is_empty(), "{reason:?} acquisition should start");
+            let effects = runner.handle_event(AcquisitionEvent::LclInstalled(identity(21)));
+            assert!(
+                !effects
+                    .iter()
+                    .any(|effect| matches!(effect, AcquisitionEffect::CancelSession(_))),
+                "{reason:?} session must survive LCL advance: {effects:?}"
+            );
+            assert_eq!(
+                runner
+                    .snapshot()
+                    .cancelled_by_reason()
+                    .get(&CancelReason::Superseded),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn generic_acquisitions_bounded_by_max_generic_in_flight() {
         // rippled bounds forward publication-gap acquisition with
         // `++acqCount < ledgerFetchSize_`. The Rust coordinator serializes all
@@ -10429,7 +10539,7 @@ mod tests {
 
         let network = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(network.contains(&AcquisitionEffect::CancelSession(session)));
         assert!(runner.session(session).is_none());
@@ -10462,7 +10572,7 @@ mod tests {
 
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             header_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(effects.iter().all(|effect| !matches!(
             effect,
@@ -10557,7 +10667,7 @@ mod tests {
         // At completed read-batch boundaries, a moving policy observation
         // cannot displace the latched owner. Non-anchor waiters remain FIFO.
         let first_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
-            ReadCompletion::new(owner_reads[0].1, ReadOutcome::Settled { node: None }),
+            ReadCompletion::new(owner_reads[0].1, ReadOutcome::settled(None)),
         ));
         assert!(
             read_effects(&first_release)
@@ -10565,7 +10675,7 @@ mod tests {
                 .any(|read| read.operation().session() == sessions[3])
         );
         let second_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
-            ReadCompletion::new(owner_reads[1].1, ReadOutcome::Settled { node: None }),
+            ReadCompletion::new(owner_reads[1].1, ReadOutcome::settled(None)),
         ));
         assert!(
             read_effects(&second_release)
@@ -10573,7 +10683,7 @@ mod tests {
                 .any(|read| read.operation().session() == sessions[4])
         );
         let third_release = runner.handle_event(AcquisitionEvent::ReadCompleted(
-            ReadCompletion::new(owner_reads[2].1, ReadOutcome::Settled { node: None }),
+            ReadCompletion::new(owner_reads[2].1, ReadOutcome::settled(None)),
         ));
         let swept_read = read_effects(&third_release)
             .iter()
@@ -10584,7 +10694,7 @@ mod tests {
 
         let boundary = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             swept_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(boundary.contains(&AcquisitionEffect::CancelSession(swept)));
         assert!(runner.session(swept).is_none());
@@ -10658,7 +10768,7 @@ mod tests {
         // oldest owner resumes this sole waiter with its first read batch.
         let resumed = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             first_owner_read.expect("first owner read"),
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&resumed)
@@ -10874,7 +10984,7 @@ mod tests {
         let turns_before_partial = runner.snapshot().plan_turns();
         let partial = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             first_batch_reads[0],
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().plan_turns(), turns_before_partial);
         assert!(
@@ -10886,7 +10996,7 @@ mod tests {
 
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             first_batch_reads[1],
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&effects)
@@ -10905,7 +11015,7 @@ mod tests {
         // and the preferred queued job may begin.
         let boundary = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             retained_owner_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&boundary)
@@ -11000,7 +11110,7 @@ mod tests {
         // the retained continuation immediately emits its first local read.
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             owner_reads[0],
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&effects)
@@ -11063,7 +11173,7 @@ mod tests {
 
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             owner_reads[0],
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&effects)
@@ -12028,7 +12138,7 @@ mod tests {
 
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             first_read,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert!(
             read_effects(&effects)
@@ -12149,7 +12259,7 @@ mod tests {
         let turns_before = runner.snapshot().plan_turns();
         let mut completions = reads
             .into_iter()
-            .map(|read| ReadCompletion::new(read.operation(), ReadOutcome::Settled { node: None }))
+            .map(|read| ReadCompletion::new(read.operation(), ReadOutcome::settled(None)))
             .collect::<Vec<_>>();
         let final_completion = completions.pop().expect("512th completion");
 
@@ -12206,14 +12316,14 @@ mod tests {
         );
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             wrong,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().stale_events(), 1);
 
         // The exact in-flight operation applies and the plan advances.
         runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             inflight,
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         assert_eq!(runner.snapshot().stale_events(), 1);
         assert_eq!(runner.snapshot().plan_turns(), 2);
@@ -12256,7 +12366,7 @@ mod tests {
 
         let effects = runner.handle_event(AcquisitionEvent::ReadCompleted(ReadCompletion::new(
             read.operation(),
-            ReadOutcome::Settled { node: None },
+            ReadOutcome::settled(None),
         )));
         let request = effects
             .iter()

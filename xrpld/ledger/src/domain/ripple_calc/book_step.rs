@@ -806,10 +806,50 @@ pub fn execute_book_step_with_options<V: ApplyView>(
         } else {
             first_quality = Some(amm_offer.quality());
             let remaining_out = max_out.clone() - total_out.clone();
-            let raw_in_limit = mul_ratio_amount(&remaining_in, QUALITY_ONE, tr_in, false);
-            if let Some((amm_pays, amm_gets)) = amm_offer.limit(&raw_in_limit, &remaining_out) {
-                let step_in = mul_ratio_amount(&amm_pays, tr_in, QUALITY_ONE, true);
-                if !amm_offer_invariant_holds(&amm_offer, &amm_pays, &amm_gets) {
+            // rippled passes the synthetic AMMOffer through the same
+            // execOffer/revImp/fwdImp callback as CLOB offers (BookStep.cpp
+            // tryAMM -> execOffer). Mirror that exactly, including fwdImp's
+            // reverse-cache reconciliation and the strict input-cap pin.
+            let mut consumption = compute_amm_consumption(
+                options.pass,
+                &remaining_in,
+                &remaining_out,
+                &amm_offer,
+                tr_in,
+            );
+            let mut reconciled_to_reverse_cache = false;
+            if let (Some(current), BookStepPass::Forward) = (&consumption, options.pass) {
+                let mut candidate_ins = saved_ins.clone();
+                let mut candidate_outs = saved_outs.clone();
+                insert_sorted_amount(&mut candidate_ins, current.step_in.clone());
+                insert_sorted_amount(&mut candidate_outs, current.step_out.clone());
+                let candidate_in = sum_sorted_amounts(&candidate_ins, max_in);
+                let candidate_out = sum_sorted_amounts(&candidate_outs, max_out);
+                if candidate_out > *max_out && candidate_in <= *reverse_input {
+                    // BookStep.cpp fwdImp: limitStepOut to the cached
+                    // remaining output; adopt only if it needs exactly the
+                    // remaining forward input, then pin step amounts to the
+                    // cache boundary (stpAdjAmt.in/out = remainingIn/Out).
+                    if let Some(mut reverse_limited) = compute_amm_consumption(
+                        BookStepPass::OutputOnly,
+                        &remaining_in,
+                        &remaining_out,
+                        &amm_offer,
+                        tr_in,
+                    ) && reverse_limited.step_in == remaining_in
+                    {
+                        reverse_limited.reconcile_step_to_cache(&remaining_in, &remaining_out);
+                        consumption = Some(reverse_limited);
+                        reconciled_to_reverse_cache = true;
+                    }
+                }
+            }
+            if let Some(consumption) = consumption {
+                if !amm_offer_invariant_holds(
+                    &amm_offer,
+                    &consumption.offer_in,
+                    &consumption.owner_gives,
+                ) {
                     tracing::warn!(
                         target: "ledger",
                         "[book_step] AMM pool product invariant failed"
@@ -826,16 +866,33 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                     &amm_offer.account,
                     &book.r#in,
                     &book.out,
-                    &amm_pays,
-                    &amm_gets,
+                    &consumption.offer_in,
+                    &consumption.owner_gives,
                 );
                 if res == Ter::TES_SUCCESS {
                     amm_context.set_amm_used();
-                    insert_sorted_amount(&mut saved_ins, step_in);
-                    insert_sorted_amount(&mut saved_outs, amm_gets);
-                    total_in = sum_sorted_amounts(&saved_ins, max_in);
-                    total_out = sum_sorted_amounts(&saved_outs, max_out);
-                    remaining_in = max_in.clone() - total_in.clone();
+                    if reconciled_to_reverse_cache {
+                        saved_ins.clear();
+                        saved_ins.push(max_in.clone());
+                        saved_outs.clear();
+                        saved_outs.push(max_out.clone());
+                        total_in = max_in.clone();
+                        total_out = max_out.clone();
+                        remaining_in = max_in.zeroed();
+                    } else {
+                        let capped_in_forward = consumption.input_capped_in_forward;
+                        insert_sorted_amount(&mut saved_ins, consumption.step_in);
+                        insert_sorted_amount(&mut saved_outs, consumption.step_out);
+                        total_out = sum_sorted_amounts(&saved_outs, max_out);
+                        if capped_in_forward {
+                            // fwdImp strict input cap: result.in = in.
+                            total_in = max_in.clone();
+                            remaining_in = max_in.zeroed();
+                        } else {
+                            total_in = sum_sorted_amounts(&saved_ins, max_in);
+                            remaining_in = max_in.clone() - total_in.clone();
+                        }
+                    }
                     offer_attempted = true;
                 } else {
                     stop_before_clob = true;
@@ -848,7 +905,15 @@ pub fn execute_book_step_with_options<V: ApplyView>(
 
     if !stop_before_clob {
         for entry in offers {
-            if offers_consumed >= MAX_OFFERS_TO_CONSUME || remaining_in.signum() <= 0 {
+            // rippled's FlowOfferStream counter (StepCounter) bounds every
+            // stepped entry. The "nothing left to fill" stop is NOT here: it
+            // lives at the top of the revImp/fwdImp callback, i.e. AFTER the
+            // stream has stepped past (and deleted) the previous tip and run
+            // its expired/unfunded/small-offer cleanup, the quality grouping,
+            // self-cross removal, authorization removal and the crossing
+            // quality threshold for the next tip. Stopping earlier would leave
+            // offers rippled removes during that step resting in our book.
+            if offers_consumed >= MAX_OFFERS_TO_CONSUME {
                 break;
             }
 
@@ -1011,15 +1076,24 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 offer_quality,
                 quality_threshold,
             ) {
-                // Do not remove through this value-flow sandbox. The caller
-                // applies the recorded key with offer_helpers::offer_delete
-                // even when this strand later proves dry.
+                // rippled records the key with `offers.permRmOffer` (applied
+                // even when the strand later proves dry) AND, because the
+                // callback returns true, `offers.step()` -> `BookTip::step`
+                // erases the tip from the working sandbox (BookTip.cpp:21-27,
+                // BookStep.cpp:446-455). The sandbox erase matters: when this
+                // strand's result is applied, later liquidity passes must not
+                // see the self offer at the book tip. Otherwise tryAMM is
+                // compared against the stale self quality instead of the real
+                // next tip, and a later self offer that rippled never reaches
+                // gets removed (testnet fork 21351203). `apply_to` skips keys
+                // already erased by the applied flow.
                 if let Some(cancellations) = &self_cross_cancellation {
                     cancellations.record(*offer_sle.key());
                 }
                 if !offer_attempted {
                     first_quality = None;
                 }
+                remove_offer_or_return!(&offer_sle);
                 offers_consumed += 1;
                 continue;
             }
@@ -1092,6 +1166,16 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             // Forward evaluation is input-limited before its output is reconciled
             // to the reverse cache. Reverse evaluation remains output-limited.
             let remaining_out = max_out.clone() - total_out.clone();
+            // BookStep.cpp revImp/fwdImp callback first line:
+            //   reverse: if (remainingOut <= 0) return false;
+            //   forward: if (remainingIn  <= 0) return false;
+            let nothing_left = match options.pass {
+                BookStepPass::Forward => remaining_in.signum() <= 0,
+                BookStepPass::Reverse | BookStepPass::OutputOnly => remaining_out.signum() <= 0,
+            };
+            if nothing_left {
+                break;
+            }
             let mut consumption = compute_offer_consumption(
                 options.pass,
                 &remaining_in,
@@ -1108,6 +1192,29 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             if consumption.step_in.signum() <= 0 || consumption.step_out.signum() <= 0 {
                 break;
             }
+
+            // rippled's callback return value decides whether FlowOfferStream
+            // steps past this tip, and `BookTip::step` DELETES the current tip
+            // before advancing (BookTip.cpp:21-27; OfferStream.cpp:213-215;
+            // BookStep.cpp:772 "Returning true causes offers.step() to delete
+            // the offer").
+            //   revImp: stpAmt.out <= remainingOut -> true; otherwise
+            //           limitStepOut then `return offer.fullyConsumed()`.
+            //   fwdImp: `return processMore || offer.fullyConsumed()` with
+            //           processMore = (stpAmt.in <= remainingIn); the
+            //           reverse-cache reconciliation does not change it.
+            // So an owner-funds-limited offer (step amounts fully taken while
+            // its nominal residual is still positive) is REMOVED by rippled,
+            // whereas we used to rewrite it as a resting residual. That left a
+            // dead offer at the book tip: the next liquidity pass then chose
+            // that tip's quality over a better AMM spot price, skipped the
+            // single-strand limitOut, and stopped Flow early (testnet fork
+            // 21346657, and the same mechanism behind the deep-crossing
+            // offer-set forks).
+            let callback_continues = match options.pass {
+                BookStepPass::Forward => !consumption.input_capped_in_forward,
+                BookStepPass::Reverse | BookStepPass::OutputOnly => !consumption.output_capped,
+            };
 
             let mut reconciled_to_reverse_cache = false;
             if options.pass == BookStepPass::Forward {
@@ -1181,12 +1288,15 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             // Update or remove the offer — reference offer.consume(sb, ofrAmt)
             let new_pays = taker_pays - consumption.offer_in.clone();
             let new_gets = taker_gets - consumption.offer_out.clone();
-            if new_pays.signum() <= 0 || new_gets.signum() <= 0 {
+            let fully_consumed = new_pays.signum() <= 0 || new_gets.signum() <= 0;
+            if fully_consumed || callback_continues {
                 // rippled's TOffer::consume writes the remaining amounts to
                 // the sandbox before BookTip advances and offerDelete erases
-                // the fully-consumed offer.  That intermediate write is
-                // consensus-visible in DeletedNode FinalFields/PreviousFields
-                // even though the final state no longer contains the offer.
+                // the offer.  That intermediate write is consensus-visible in
+                // DeletedNode FinalFields/PreviousFields even though the final
+                // state no longer contains the offer. The erase happens both
+                // for fully consumed offers and whenever the callback returns
+                // true (the stream steps past, deleting the tip).
                 let mut obj = offer_sle.clone_as_object();
                 obj.set_field_amount(sf("sfTakerPays"), new_pays);
                 obj.set_field_amount(sf("sfTakerGets"), new_gets);
@@ -1204,13 +1314,31 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             }
 
             if !reconciled_to_reverse_cache {
+                let capped_in_forward = consumption.input_capped_in_forward;
                 insert_sorted_amount(&mut saved_ins, consumption.step_in);
                 insert_sorted_amount(&mut saved_outs, consumption.step_out);
-                total_in = sum_sorted_amounts(&saved_ins, max_in);
                 total_out = sum_sorted_amounts(&saved_outs, max_out);
-                remaining_in = max_in.clone() - total_in.clone();
+                if capped_in_forward {
+                    // rippled BookStep.cpp fwdImp pins `result.in = in` after
+                    // limitStepIn and returns processMore=false, so remainingIn
+                    // becomes exactly zero and no further offer is processed.
+                    // Re-summing the capped input via STAmount folding can leave
+                    // a representable IOU dust > 0, which would make this book
+                    // loop visit one extra resting offer and fork the ledger
+                    // (same total input, redistributed across one more offer).
+                    total_in = max_in.clone();
+                    remaining_in = max_in.zeroed();
+                } else {
+                    total_in = sum_sorted_amounts(&saved_ins, max_in);
+                    remaining_in = max_in.clone() - total_in.clone();
+                }
             }
             offers_consumed += 1;
+            // Callback returned false: forEachOffer breaks without stepping,
+            // so no later entry is examined (or cleaned up) in this step.
+            if !callback_continues && !fully_consumed {
+                break;
+            }
         }
     }
 
@@ -1455,6 +1583,140 @@ impl SyntheticAmmOffer {
 
         (amount_in.signum() > 0 && amount_out.signum() > 0).then_some((amount_in, amount_out))
     }
+
+    /// rippled `AMMOffer::limitOut` (AMMOffer.cpp). Multi-path keeps the
+    /// offer's quality via `ceilOutStrict(offerAmount, limit, roundUp)`;
+    /// single-path re-solves the conservation function against the POOL
+    /// balances (`swapAssetOut(balances_, limit, fee)`), ignoring `roundUp`.
+    fn limit_out(
+        &self,
+        offer_in: &STAmount,
+        offer_out: &STAmount,
+        limit: &STAmount,
+        round_up: bool,
+    ) -> Option<(STAmount, STAmount)> {
+        if self.multi_path {
+            let limited = self.quality.ceil_out_strict(
+                &Amounts::new(offer_in.clone(), offer_out.clone()),
+                limit,
+                round_up,
+            );
+            return Some((limited.r#in, limited.out));
+        }
+        let amount_in = amm_swap_asset_out(
+            &self.pool_in,
+            &self.pool_out,
+            limit,
+            self.trading_fee,
+            self.amm_rounding_enabled,
+        )?;
+        Some((amount_in, limit.clone()))
+    }
+
+    /// rippled `AMMOffer::limitIn` (AMMOffer.cpp). Multi-path uses
+    /// `ceilInStrict` under fixReducedOffersV2 (else `ceilIn`); single-path
+    /// re-solves against the POOL balances (`swapAssetIn(balances_, limit)`).
+    fn limit_in(
+        &self,
+        offer_in: &STAmount,
+        offer_out: &STAmount,
+        limit: &STAmount,
+        round_up: bool,
+    ) -> Option<(STAmount, STAmount)> {
+        if self.multi_path {
+            let amounts = Amounts::new(offer_in.clone(), offer_out.clone());
+            let limited = if self.fix_reduced_offers_v2 {
+                self.quality.ceil_in_strict(&amounts, limit, round_up)
+            } else {
+                self.quality.ceil_in(&amounts, limit)
+            };
+            return Some((limited.r#in, limited.out));
+        }
+        let amount_out = amm_swap_asset_in(
+            &self.pool_in,
+            &self.pool_out,
+            limit,
+            self.trading_fee,
+            self.amm_rounding_enabled,
+        )?;
+        Some((limit.clone(), amount_out))
+    }
+}
+
+/// AMM counterpart of `compute_offer_consumption`, reproducing exactly how
+/// rippled feeds a synthetic `AMMOffer` through the SAME `execOffer` callback
+/// as a CLOB offer (BookStep.cpp forEachOffer + revImp/fwdImp):
+///   * `AMMOffer::adjustRates` returns `{ofrInRate, QUALITY_ONE}`: the AMM pays
+///     no transfer fee on its output, so `ownerGives == ofrAmt.out`.
+///   * `AMMOffer::isFunded()` is always true, so there is no owner-funds clamp.
+///   * `stpAmt.in = mulRatio(ofrAmt.in, trIn, QUALITY_ONE, roundUp=true)`.
+///   * Reverse: `limitStepOut` (`stpAmt.out = limit`, `ofrAmt =
+///     limitOut(ofrAmt, limit, roundUp=true)`, `stpAmt.in` re-derived).
+///   * Forward: `limitStepIn` (`stpAmt.in = limit`, `inLmt = mulRatio(limit,
+///     QUALITY_ONE, trIn, false)`, `ofrAmt = limitIn(ofrAmt, inLmt, false)`,
+///     `stpAmt.out = ofrAmt.out`).
+/// Previously the AMM was clipped by a single combined helper that applied an
+/// OUTPUT cap first in every pass (including forward) and never used the
+/// forward reverse-cache reconciliation. In a forward replay that produced a
+/// step input one IOU ULP different from the limiting `maxIn`, so the strand's
+/// replay was rejected and Flow stopped early, leaving AMM liquidity unused
+/// (testnet fork 21346657: AMM gave 6323148178 drops instead of 7753920176).
+fn compute_amm_consumption(
+    pass: BookStepPass,
+    remaining_in: &STAmount,
+    remaining_out: &STAmount,
+    amm: &SyntheticAmmOffer,
+    transfer_rate_in: u32,
+) -> Option<OfferConsumption> {
+    let mut ofr_in = amm.amount_in.clone();
+    let mut ofr_out = amm.amount_out.clone();
+    let mut stp_in = mul_ratio_amount(&ofr_in, transfer_rate_in, QUALITY_ONE, true);
+    let mut stp_out = ofr_out.clone();
+    let mut input_capped_in_forward = false;
+    let mut output_capped = false;
+
+    let limit_order: &[bool] = match pass {
+        BookStepPass::Forward => &[false],
+        BookStepPass::Reverse => &[true, false],
+        BookStepPass::OutputOnly => &[true],
+    };
+    for &output_limit in limit_order {
+        if output_limit {
+            if *remaining_out < stp_out {
+                output_capped = true;
+                stp_out = remaining_out.clone();
+                let (limited_in, limited_out) = amm.limit_out(&ofr_in, &ofr_out, &stp_out, true)?;
+                ofr_in = limited_in;
+                ofr_out = limited_out;
+                stp_in = mul_ratio_amount(&ofr_in, transfer_rate_in, QUALITY_ONE, true);
+            }
+        } else if *remaining_in < stp_in {
+            if pass == BookStepPass::Forward {
+                input_capped_in_forward = true;
+            }
+            stp_in = remaining_in.clone();
+            let in_lmt = mul_ratio_amount(&stp_in, QUALITY_ONE, transfer_rate_in, false);
+            let (limited_in, limited_out) = amm.limit_in(&ofr_in, &ofr_out, &in_lmt, false)?;
+            ofr_in = limited_in;
+            ofr_out = limited_out;
+            stp_out = ofr_out.clone();
+        }
+    }
+
+    if stp_in.signum() <= 0 || stp_out.signum() <= 0 || ofr_in.signum() <= 0 || ofr_out.signum() <= 0
+    {
+        return None;
+    }
+    Some(OfferConsumption {
+        owner_gives: stp_out.clone(),
+        step_in: stp_in,
+        step_out: stp_out,
+        offer_in: ofr_in,
+        // ownerGives = mulRatio(stpAmt.out, QUALITY_ONE, ...) == stpAmt.out.
+        offer_out: ofr_out,
+        input_capped_in_forward,
+        output_capped,
+    })
 }
 
 fn amm_offer_invariant_holds(
@@ -2464,6 +2726,18 @@ struct OfferConsumption {
     owner_gives: STAmount,
     /// The actual offer output consumed (= ofrAmt.out, for updating offer SLE)
     offer_out: STAmount,
+    /// True only when the FORWARD pass strictly input-capped this offer
+    /// (pre-limit step_in > remaining_in). rippled BookStep.cpp fwdImp pins
+    /// `result.in = in` and sets `processMore = false` in this branch so the
+    /// book loop stops with remainingIn exactly zero. We mirror that pin to
+    /// avoid a representable IOU re-sum dust that would otherwise let the
+    /// forward loop visit one extra resting offer (consensus fork).
+    input_capped_in_forward: bool,
+    /// True when `limitStepOut` fired (the offer's step output exceeded the
+    /// remaining requested output). In rippled revImp the callback then
+    /// returns `offer.fullyConsumed()` instead of `true`, so the stream does
+    /// NOT step past (and therefore does not delete) the tip.
+    output_capped: bool,
 }
 
 impl OfferConsumption {
@@ -2504,6 +2778,8 @@ fn compute_offer_consumption(
     let mut owner_gives = offer_owner_gives(&ofr_out, transfer_rate_out);
     let mut actual_ofr_in = ofr_in;
     let mut actual_ofr_out = ofr_out;
+    let mut input_capped_in_forward = false;
+    let mut output_capped = false;
     // TOffer retains the BookDirectory quality supplied by BookTip. Every
     // subsequent limitIn/limitOut operation uses it even after owner funding
     // or an earlier crossing has reduced the working offer amounts.
@@ -2532,6 +2808,7 @@ fn compute_offer_consumption(
     for &output_limit in limit_order {
         if output_limit {
             if *remaining_out < stp_out {
+                output_capped = true;
                 let offer_amounts = Amounts::new(actual_ofr_in.clone(), actual_ofr_out.clone());
                 let clipped = offer_quality.ceil_out_strict(&offer_amounts, remaining_out, true);
                 actual_ofr_in = clipped.r#in;
@@ -2541,6 +2818,15 @@ fn compute_offer_consumption(
                 stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
             }
         } else if *remaining_in < stp_in {
+            // rippled BookStep.cpp fwdImp strict input-cap branch: this offer
+            // would consume more than the remaining input, so it is capped to
+            // exactly remaining_in and the book loop must stop with no residual
+            // (result.in pinned to `in`, processMore=false). Record it so the
+            // caller pins total_in to max_in instead of re-summing (which can
+            // leave IOU dust and over-consume the next offer).
+            if pass == BookStepPass::Forward {
+                input_capped_in_forward = true;
+            }
             stp_in = remaining_in.clone();
             let in_lmt = mul_ratio_amount(&stp_in, QUALITY_ONE, transfer_rate_in, false);
             let offer_amounts = Amounts::new(actual_ofr_in.clone(), actual_ofr_out.clone());
@@ -2565,6 +2851,8 @@ fn compute_offer_consumption(
         offer_in: actual_ofr_in,
         owner_gives,
         offer_out: actual_ofr_out,
+        input_capped_in_forward,
+        output_capped,
     }
 }
 
@@ -2729,6 +3017,10 @@ pub fn execute_explicit_book_step<V: ApplyView>(
 #[cfg(test)]
 #[path = "book_step_success_path_tests.rs"]
 mod success_path_tests;
+
+#[cfg(test)]
+#[path = "book_step_fork_repro_tests.rs"]
+mod fork_repro_tests;
 
 #[cfg(test)]
 mod tests {
