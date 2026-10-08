@@ -231,14 +231,16 @@ impl PrunedDriver {
         {
             callback(self.store.metrics().retained_floor);
         }
-        self.maybe_verify(ledger.as_ref())
+        self.maybe_verify(ledger.as_ref(), &delta)
     }
 
-    /// Run a verify of `ledger`'s reachable nodes plus the window-wide count
-    /// check if `verify_interval` has elapsed. A miss halts pruning
-    /// permanently (design Case 11): deleting more nodes on top of a known
-    /// inconsistency could make it unrecoverable.
-    fn maybe_verify(&self, ledger: &Ledger) -> Result<(), String> {
+    /// Periodically verify, without walking whole trees: every node the
+    /// latest claim added (new state nodes, the ledger's own tx-tree nodes and
+    /// both roots) must be present, and every node holding a count row across
+    /// the retained window must be present. A miss halts pruning permanently
+    /// (design Case 11): deleting more nodes on top of a known inconsistency
+    /// could make it unrecoverable.
+    fn maybe_verify(&self, ledger: &Ledger, delta: &nodestore::ClaimDelta) -> Result<(), String> {
         let interval = self.store.verify_interval_secs();
         if interval == 0 {
             return Ok(());
@@ -251,14 +253,16 @@ impl PrunedDriver {
                 return Ok(());
             }
         }
-        let mut required = std::collections::BTreeSet::new();
-        for tree in [ledger.state_map(), ledger.tx_map()] {
-            let mut fetch = |hash| (self.fetch)(hash);
-            tree.visit_nodes(&mut fetch, &mut |node| {
-                required.insert(*node.get_hash().as_uint256());
-                true
-            })
-            .map_err(|error| format!("verify traversal failed: {error:?}"))?;
+        let mut required: std::collections::BTreeSet<_> = delta
+            .new_state
+            .iter()
+            .chain(delta.owned.iter())
+            .copied()
+            .collect();
+        required.insert(delta.state_root);
+        let tx_root = *ledger.tx_map().root().get_hash().as_uint256();
+        if !tx_root.is_zero() {
+            required.insert(tx_root);
         }
         let report = self.store.verify(&required, 1)?;
         let window = self.store.verify_window()?;
