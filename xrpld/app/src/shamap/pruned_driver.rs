@@ -28,6 +28,12 @@ pub struct PrunedDriver {
     /// (design Case 16). A whole-cache clear is correct and matches what the
     /// rotation path did; a per-hash removal would be a later optimization.
     on_prune: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Invoked after every prune with the new retained floor (the oldest
+    /// validated ledger still fully retained, `pruned_to + 1`). The integration
+    /// layer lowers the advertised `complete_ledgers` range to this floor so a
+    /// peer is never told about a ledger whose nodes may already be deleted
+    /// (design Case 18).
+    on_floor_advanced: Mutex<Option<Box<dyn Fn(u32) + Send + Sync>>>,
 }
 
 impl PrunedDriver {
@@ -36,6 +42,7 @@ impl PrunedDriver {
             store,
             last_claimed: Mutex::new(None),
             on_prune: Mutex::new(None),
+            on_floor_advanced: Mutex::new(None),
         }
     }
 
@@ -53,6 +60,16 @@ impl PrunedDriver {
     /// survive the removal of nodes beneath it.
     pub fn set_on_prune(&self, callback: Box<dyn Fn() + Send + Sync>) {
         *self.on_prune.lock().expect("pruned driver on_prune mutex") = Some(callback);
+    }
+
+    /// Register a callback run after every maintain pass with the new retained
+    /// floor. The integration layer uses it to lower `complete_ledgers` in
+    /// lockstep with the prune cursor (design Case 18).
+    pub fn set_on_floor_advanced(&self, callback: Box<dyn Fn(u32) + Send + Sync>) {
+        *self
+            .on_floor_advanced
+            .lock()
+            .expect("pruned driver on_floor_advanced mutex") = Some(callback);
     }
 
     /// Claim a validated ledger and advance pruning. Called from the SHAMap
@@ -86,6 +103,17 @@ impl PrunedDriver {
             {
                 callback();
             }
+        }
+        // Lower the advertised range to the new retained floor every pass, in
+        // lockstep with the prune cursor, so a peer is never told about a
+        // ledger whose nodes may already be deleted (design Case 18).
+        if let Some(callback) = self
+            .on_floor_advanced
+            .lock()
+            .expect("pruned driver on_floor_advanced mutex")
+            .as_ref()
+        {
+            callback(self.store.metrics().retained_floor);
         }
         Ok(())
     }

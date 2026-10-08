@@ -4322,6 +4322,16 @@ fn attach_production_shamap_store_runtime(
                 use shamap::family::FullBelowCache as _;
                 driver.set_on_prune(Box::new(move || full_below.clear()));
             }
+            // Lower the advertised complete_ledgers range to the retained floor
+            // in lockstep with the prune cursor, so peers are never told about
+            // ledgers whose nodes may already be deleted (design Case 18).
+            if let Some(ledger_master_runtime) = root.ledger_master_runtime() {
+                driver.set_on_floor_advanced(Box::new(move |retained_floor| {
+                    ledger_master_runtime
+                        .ledger_master()
+                        .clear_prior_ledgers(retained_floor);
+                }));
+            }
             component = component.with_pruned_driver(driver);
         }
         let _ = root.attach_shamap_store_component(Arc::new(component));

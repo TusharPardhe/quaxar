@@ -265,3 +265,65 @@ fn pruned_store_dry_run_keeps_everything() {
     drop(driver);
     let _ = std::fs::remove_dir_all(&path);
 }
+
+// T-RANGE-1 (Case 18): the retained-floor callback fires in lockstep with the
+// prune cursor, so the advertised complete_ledgers range can be lowered to the
+// floor. The driver reports `pruned_to + 1` after every maintain pass.
+#[test]
+fn pruned_store_reports_retained_floor_in_lockstep_with_prune() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let (backend, path) = open_fjall_backend("floor");
+    let config = PrunedConfig {
+        online_delete: 3,
+        can_delete: u32::MAX,
+        prune_mode: PruneMode::On,
+        prune_batch: 64,
+    };
+    let driver = PrunedDriver::open(Arc::clone(&backend), config).expect("driver opens");
+
+    // Record every retained floor the driver reports.
+    let last_floor = Arc::new(AtomicU32::new(0));
+    let history: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let last_floor_cb = Arc::clone(&last_floor);
+    let history_cb = Arc::clone(&history);
+    driver.set_on_floor_advanced(Box::new(move |floor| {
+        last_floor_cb.store(floor, Ordering::SeqCst);
+        history_cb.lock().expect("history").push(floor);
+    }));
+
+    for seq in 1..=8u32 {
+        let ledger = example_ledger(seq);
+        flush_ledger_nodes(&driver, &ledger);
+        driver
+            .on_validated_ledger(Arc::new(ledger))
+            .expect("claim + prune");
+    }
+
+    let metrics = driver.metrics();
+    // The callback fired once per ledger and the last reported floor equals the
+    // store's retained floor (pruned_to + 1).
+    assert_eq!(
+        history.lock().expect("history").len(),
+        8,
+        "floor callback fires every maintain pass"
+    );
+    assert_eq!(
+        last_floor.load(Ordering::SeqCst),
+        metrics.retained_floor,
+        "reported floor tracks the prune cursor"
+    );
+    assert_eq!(
+        metrics.retained_floor,
+        metrics.pruned_to + 1,
+        "retained floor is pruned_to + 1"
+    );
+    assert!(
+        metrics.retained_floor >= 5,
+        "floor advanced with pruning: {metrics:?}"
+    );
+
+    drop(driver);
+    let _ = std::fs::remove_dir_all(&path);
+}

@@ -518,3 +518,87 @@ fn randomized_matches_model_oracle() {
         run_sequence(&snaps, window);
     }
 }
+
+/// Count rows currently present in a keyspace.
+fn keyspace_rows(backend: &dyn Backend, keyspace: Keyspace) -> usize {
+    let mut n = 0usize;
+    backend
+        .kv_range(keyspace, &[], &[0xFF; 64], &mut |_, _| {
+            n += 1;
+            true
+        })
+        .expect("range");
+    n
+}
+
+// T-ANCH-1: the anchor claim (first validated ledger, empty previous state)
+// writes no explicit count rows — every node is implicitly live-once (count 1,
+// represented by the absence of a row) — and records the anchor sequence.
+#[test]
+fn t_anch_1_first_claim_writes_no_count_rows_and_sets_anchor() {
+    let backend = open_memory();
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+    // Anchor ledger A=100: whole tree is new, nothing dies.
+    writer
+        .claim(&ClaimDelta {
+            seq: 100,
+            state_root: hid(1),
+            new_state: vec![hid(10), hid(11), hid(12)],
+            dead_state: vec![],
+            owned: vec![hid(20)],
+        })
+        .expect("anchor claim");
+
+    assert_eq!(writer.claimed_seq(), Some(100));
+    // No count rows: all new state nodes are implicit count-1.
+    assert_eq!(
+        keyspace_rows(backend.as_ref(), Keyspace::Counts),
+        0,
+        "anchor claim must write zero explicit count rows"
+    );
+    // Reopening resumes from the persisted anchor/claimed cursor.
+    let reopened = IndexWriter::open(Arc::clone(&backend)).expect("reopen");
+    assert_eq!(reopened.claimed_seq(), Some(100));
+}
+
+// T-GATE-1 (core): prune is not gated on any operating mode — it advances
+// whenever called, deleting dead nodes up to K. (The app-level test that prune
+// keeps running while the node is `syncing` builds on this unconditional core.)
+#[test]
+fn t_gate_1_prune_advances_unconditionally() {
+    let backend = open_memory();
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+    // Ledger 1 stores node A; ledger 2 retires it (A dies at seq 2).
+    store_node(backend.as_ref(), &hid(10));
+    writer
+        .claim(&ClaimDelta {
+            seq: 1,
+            state_root: hid(1),
+            new_state: vec![hid(10)],
+            dead_state: vec![],
+            owned: vec![],
+        })
+        .expect("claim 1");
+    writer
+        .claim(&ClaimDelta {
+            seq: 2,
+            state_root: hid(2),
+            new_state: vec![hid(11)],
+            dead_state: vec![hid(10)],
+            owned: vec![],
+        })
+        .expect("claim 2");
+    store_node(backend.as_ref(), &hid(11));
+
+    // Prune to K=2 deletes the dead node with no mode/health gate.
+    let pruned = writer.prune(2, 10_000).expect("prune");
+    assert!(pruned >= 1, "the dead node must be pruned");
+    assert_eq!(writer.pruned_to(), 2);
+    assert!(
+        backend
+            .kv_get(Keyspace::Nodes, hid(10).as_slice())
+            .unwrap()
+            .is_none(),
+        "dead node A is gone after prune"
+    );
+}
