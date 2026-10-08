@@ -3386,8 +3386,14 @@ impl CoordinatorRunner {
         // NodeStore reads/writes every owner turn (observed ~90 incremental
         // write acceptances/sec) and starves the single consensus owner,
         // producing multi-second stalls where no proposals/validations are
-        // processed. rippled abandons superseded CONSENSUS/GENERIC inbound
-        // acquisitions once a newer validated ledger exists.
+        // processed.
+        //
+        // Only Consensus sessions are superseded. Generic (ledger_request,
+        // LedgerMaster lookups) and History (backfill) acquisitions target
+        // past ledgers by design; rippled never cancels them on LCL advance
+        // (only `InboundLedgers::sweep` expires them when idle). Cancelling
+        // them here killed every such acquisition on the next close, which
+        // left permanent history gaps and made old-ledger RPCs never finish.
         if identity.sequence() != 0 {
             let installed_seq = identity.sequence();
             let superseded: Vec<SessionRef> = self
@@ -3395,6 +3401,7 @@ impl CoordinatorRunner {
                 .sessions
                 .iter()
                 .filter(|(_, state)| !state.phase.is_terminal())
+                .filter(|(_, state)| state.reason == AcquireReason::Consensus)
                 .filter(|(_, state)| {
                     state
                         .target
@@ -10102,6 +10109,36 @@ mod tests {
                 .get(&CancelReason::Superseded),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn lcl_installed_above_target_keeps_generic_and_history_sessions() {
+        // rippled only sweeps idle Generic/History inbound ledgers; an LCL
+        // advance past their (necessarily older) target must not cancel them.
+        for reason in [AcquireReason::Generic, AcquireReason::History] {
+            let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+            connect(&mut runner);
+            let _ = runner.handle_event(AcquisitionEvent::LclInstalled(identity(20)));
+            let effects = runner.handle_event(AcquisitionEvent::AcquireRequested {
+                target: target(7),
+                reason,
+            });
+            assert!(!effects.is_empty(), "{reason:?} acquisition should start");
+            let effects = runner.handle_event(AcquisitionEvent::LclInstalled(identity(21)));
+            assert!(
+                !effects
+                    .iter()
+                    .any(|effect| matches!(effect, AcquisitionEffect::CancelSession(_))),
+                "{reason:?} session must survive LCL advance: {effects:?}"
+            );
+            assert_eq!(
+                runner
+                    .snapshot()
+                    .cancelled_by_reason()
+                    .get(&CancelReason::Superseded),
+                None
+            );
+        }
     }
 
     #[test]
