@@ -63,21 +63,12 @@ pub fn make_shamap_store_backend(
     scheduler: Arc<dyn Scheduler>,
     read_threads: i32,
     node_db: &Section,
-    delete_interval: u32,
     state: &SHAMapStoreSavedState,
     burst_size: usize,
     journal: Arc<dyn NodeStoreJournal>,
 ) -> Result<SHAMapStoreBackendBundle, String> {
-    // The rotating node store has been removed. Online deletion is now provided
-    // by the fjall pruned store, which is a single database (delete_interval is
-    // zero at this layer; pruning is driven separately). A nonzero rotating
-    // delete_interval reaching here means an unsupported backend slipped past
-    // config validation.
-    if delete_interval != 0 {
-        return Err(
-            "rotating online_delete is no longer supported; use [node_db] type = fjall".to_owned(),
-        );
-    }
+    // The node store is always a single database. Online deletion is provided
+    // by the fjall pruned store (driven separately), not by backend rotation.
     let database = manager.make_database(
         burst_size,
         scheduler,
