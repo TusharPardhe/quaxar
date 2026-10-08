@@ -45,8 +45,9 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 - The pruned node-store design follows the work of **@shortthefomo** in
   [XRPLF/rippled#6549](https://github.com/XRPLF/rippled/pull/6549) (null-backend
-  object-cache, priming-retry and `completeLedgers`/purge-interval fixes) and
-  **@RichardAH** and contributors in
+  object-cache, priming-retry and `completeLedgers`/purge-interval fixes),
+  **@sublimator**, whose design discussion and gist shaped the null-backend
+  pruned approach, and **@RichardAH** and contributors in
   [Xahau/xahaud#728](https://github.com/Xahau/xahaud/pull/728) (RWDB null
   node-store and online-delete behaviour). This release is built on their ideas;
   thank you.
