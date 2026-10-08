@@ -129,9 +129,13 @@ recovery anchor.
 
 After the current chain is established, configured history can be filled in
 without blocking live validated-ledger advancement. `[ledger_history]` controls
-the desired history and `[node_db] online_delete` controls the two-generation
-NodeStore rotation interval and batched relational pruning boundary.
-During recovery, current-ledger work has priority over backfill.
+the desired history and `[node_db] online_delete` sets the retained window: the
+fjall store prunes continuously so only the last `online_delete` validated
+ledgers (and the relational rows above the same boundary) are kept. The
+advertised `complete_ledgers` range is lowered to that retained floor in
+lockstep with pruning, so peers are never offered a ledger whose nodes may
+already be deleted. During recovery, current-ledger work has priority over
+backfill.
 
 ## Monitoring
 

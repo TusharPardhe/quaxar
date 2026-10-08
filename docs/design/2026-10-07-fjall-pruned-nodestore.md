@@ -494,18 +494,33 @@ As built on branch `feat/fjall-pruned-nodestore`:
   `rocksdb`, `bindgen`, `clang-sys` and `memmap2` dependencies are absent from
   the tree (verified via `cargo tree -i`), and the workspace builds with
   `CC=cc CXX=c++` with no C++ node-store build step.
-- Stage 4 polish complete: the FullBelowCache removal callback fires on every
-  prune that deletes nodes (Case 16); peer node requests are served from the
-  in-memory TreeNodeCache before the store (Case 17), byte-identical because
-  the store persists via the same `serialize_with_prefix` encoding; the pruned
-  metrics (claimed_seq, pruned_to, retained_floor, unclaimed, verify_last_ok)
-  are exposed through RPC `get_counts`; a disk-full ballast (`reserve_mb`,
-  default 1024) is reserved at open and releasable under pressure (Case 10);
-  and snapshot load adopts the import as the anchor and reconciles leftovers
-  (Case 7), while export streams the retained `nodes` set.
-- Remaining: Stages 5-6 (testnet soak, migration tooling) and the optional
-  server_info/fetch-info halted-state surface (verify_last_ok is already in
-  get_counts).
+- Stage 4 fully complete: Case 16 (FBC removal callback), Case 17 (serve from
+  the TreeNodeCache first, byte-identical via `serialize_with_prefix`), Case 10
+  (disk-full `reserve_mb` ballast), Case 7 (snapshot load adopts the anchor and
+  reconciles leftovers; export streams the retained `nodes` set), Case 18
+  (`complete_ledgers` lowered to the retained floor in lockstep with the prune
+  cursor via `PrunedDriver::on_floor_advanced` -> `clear_prior_ledgers`), and
+  Case 19 (prune runs unconditionally, no operating-mode gate). The pruned
+  metrics are exposed through RPC `get_counts`, and `verify_interval` is parsed
+  into `PrunedConfig`.
+- Stage 0 harness: a replay-determinism test (one trace -> identical final node
+  set on independent replays, matching the ModelStore oracle) plus the
+  crash-resume tests (`restart_resumes_from_meta_cursors`,
+  `crash_during_claim/prune`).
+- Stage 6 migration: an end-to-end test exports a snapshot, loads it into a
+  fresh fjall store (reclaiming a pre-sync leftover), adopts the anchor and
+  keeps claiming; the installer defaults `type = fjall`, writes `reserve_mb`,
+  and drops the NuDB block-size prompt and the dead RocksDB/clang build setup.
+- Dead code: the rotation-era node-cache paths are gone
+  (`invalidate_node_object_cache`, `advance_store_generation`, the
+  `NodeObjectCacheMode`/`CacheStorage::Disabled` no-cache mode and its tests).
+  The inert rotation worker modules (`shamap_store_worker/rotation/runloop/
+  paths/runtime_state`) remain wired into the component's queued-ledger path
+  and are a bounded follow-up to excise.
+- Remaining: Stage 5 (the live 48h/72h testnet soak and its benchmark gates,
+  which need a running testnet host), the periodic sampled-verify loop that
+  consumes `verify_interval` (needs the retained-root walker), and the optional
+  server_info halted-state surface (verify_last_ok is already in get_counts).
 
 ### Stage 0: baseline and harness
 
