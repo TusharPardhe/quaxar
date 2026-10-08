@@ -205,8 +205,14 @@ impl PrunedDriver {
                     .ok_or_else(|| format!("claimed state root {hash} is not in the store"))?
             }
         };
-        let delta =
+        let (delta, added) =
             compute_claim_delta(ledger.as_ref(), &prev_root, state_root, self.fetch.as_ref())?;
+        // R3: restore any node this ledger references that the store no longer
+        // holds (pruned after it died, then reused from the in-memory cache).
+        let restored = self.store.restore_missing(&added)?;
+        if restored > 0 {
+            tracing::info!(target: "nodestore", seq, restored, "pruned store restored reused nodes");
+        }
         self.store.claim(&delta)?;
         *last = Some(Arc::clone(&ledger));
         drop(last);

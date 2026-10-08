@@ -142,6 +142,33 @@ impl PrunedStore {
         Ok(())
     }
 
+    /// Write back any of `objects` whose bytes are missing from `nodes`
+    /// (design rule R3). Runs under the writer mutex so prune cannot interleave
+    /// with the presence check and the write. Returns how many were written.
+    pub fn restore_missing(&self, objects: &[Arc<NodeObject>]) -> Result<usize, String> {
+        let _writer = self.writer.lock().expect("pruned store writer mutex");
+        let mut batch = KvBatch::new();
+        let mut restored = 0usize;
+        for object in objects {
+            if self
+                .backend
+                .kv_get(Keyspace::Nodes, object.hash().as_slice())?
+                .is_none()
+            {
+                batch.put(
+                    Keyspace::Nodes,
+                    object.hash().as_slice().to_vec(),
+                    EncodedBlob::new(object).get_data().to_vec(),
+                );
+                restored += 1;
+            }
+        }
+        if restored > 0 {
+            self.backend.kv_write_batch(&batch)?;
+        }
+        Ok(restored)
+    }
+
     /// Claim a validated ledger from its node delta (computed by the caller via
     /// SHAMap diff). Updates the claimed-seq metric.
     pub fn claim(&self, delta: &ClaimDelta) -> Result<(), String> {
@@ -241,8 +268,8 @@ impl PrunedStore {
             // A count row stores a little-endian u32. Count 0 means dead-pending
             // (the node may already be gone); count >= 1 means live-shared and
             // must be present.
-            let count = if value.len() == 4 {
-                u32::from_le_bytes(value.try_into().expect("4 bytes"))
+            let count = if value.len() >= 4 {
+                u32::from_le_bytes(value[..4].try_into().expect("4 bytes"))
             } else {
                 0
             };
@@ -358,8 +385,15 @@ fn count_deletable(backend: &Arc<dyn Backend>, pruned_to: u32, k: u32) -> Result
                     .kv_get(Keyspace::Counts, hash.as_slice())
                     .ok()
                     .flatten()
-                    .map(|b| b == 0u32.to_le_bytes())
-                    .unwrap_or(false),
+                    .is_some_and(|b| {
+                        b.len() == 8
+                            && b[..4] == [0, 0, 0, 0]
+                            && key[..4]
+                                == crate::backends::kv::notebook_key(
+                                    u32::from_le_bytes(b[4..8].try_into().expect("4 bytes")),
+                                    &hash,
+                                )[..4]
+                    }),
                 _ => false,
             };
             if deletable {

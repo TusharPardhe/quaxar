@@ -747,3 +747,65 @@ fn prune_keeps_a_dead_node_restored_through_the_backend_store_path() {
         "a dead node that was not re-stored is pruned"
     );
 }
+
+// Production failure on testnet: a node died, the writer restarted (so the
+// in-memory dead-pending mirror was empty), a later ledger brought the node
+// back, and prune then acted on the stale death record and deleted a live
+// node. Death records must only delete a node still dead from that death.
+#[test]
+fn stale_death_record_after_restart_does_not_delete_a_resurrected_node() {
+    let backend = open_fjall();
+    let a = hid(0xAA);
+    let b = hid(0xBB);
+    {
+        let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("open");
+        store_node(backend.as_ref(), &a);
+        writer
+            .claim(&ClaimDelta {
+                seq: 1,
+                state_root: hid(1),
+                new_state: vec![a],
+                dead_state: vec![],
+                owned: vec![],
+            })
+            .expect("claim 1");
+        store_node(backend.as_ref(), &b);
+        // Ledger 2 retires A: death record at seq 2.
+        writer
+            .claim(&ClaimDelta {
+                seq: 2,
+                state_root: hid(2),
+                new_state: vec![b],
+                dead_state: vec![a],
+                owned: vec![],
+            })
+            .expect("claim 2");
+    }
+    // Restart: a fresh writer has an empty dead-pending mirror.
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("reopen");
+    // Ledger 3 brings A back (and B dies).
+    writer
+        .claim(&ClaimDelta {
+            seq: 3,
+            state_root: hid(3),
+            new_state: vec![a],
+            dead_state: vec![b],
+            owned: vec![],
+        })
+        .expect("claim 3");
+    writer.prune(3, 10_000).expect("prune");
+    assert!(
+        backend
+            .kv_get(Keyspace::Nodes, a.as_slice())
+            .unwrap()
+            .is_some(),
+        "a resurrected node must survive its stale death record"
+    );
+    assert!(
+        backend
+            .kv_get(Keyspace::Nodes, b.as_slice())
+            .unwrap()
+            .is_none(),
+        "the node that really died is pruned"
+    );
+}

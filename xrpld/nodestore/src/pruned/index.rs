@@ -186,7 +186,11 @@ impl IndexWriter {
         for hash in &delta.dead_state {
             let current = self.count_get(hash)?.unwrap_or(1);
             let updated = current.saturating_sub(1);
-            self.encode_count(&mut batch, hash, updated);
+            if updated == 0 {
+                self.encode_dead(&mut batch, hash, delta.seq);
+            } else {
+                self.encode_count(&mut batch, hash, updated);
+            }
             if updated == 0 {
                 batch.put(
                     Keyspace::Notebook,
@@ -314,10 +318,17 @@ impl IndexWriter {
                     self.unclaimed.entry(*hash).or_insert(*seq);
                 }
                 let pinned = self.unclaimed.contains_key(hash);
+                // A State row deletes its node only if the node is still dead
+                // from exactly this death: the count row must be count 0 with
+                // this death seq. A missing row means count 1 (live), and a
+                // death seq that differs means the node was resurrected (and
+                // possibly died again later); both rows are stale and only the
+                // notebook entry is dropped. This holds across restarts, when
+                // the in-memory dead-pending mirror is empty.
                 let deletable = !pinned
                     && match kind {
                         NotebookKind::Owned => true,
-                        NotebookKind::State => self.count_get(hash)?.unwrap_or(0) == 0,
+                        NotebookKind::State => self.dead_seq_get(hash)? == Some(*seq),
                     };
                 if deletable {
                     batch.delete(Keyspace::Nodes, hash.as_slice().to_vec());
@@ -369,7 +380,7 @@ impl IndexWriter {
         }
         let mut batch = KvBatch::new();
         for hash in &orphans {
-            self.encode_count(&mut batch, hash, 0);
+            self.encode_dead(&mut batch, hash, current_seq);
             batch.put(
                 Keyspace::Notebook,
                 notebook_key(current_seq, hash),
@@ -385,14 +396,33 @@ impl IndexWriter {
 
     // --- encoding helpers -------------------------------------------------
 
+    /// Reference count of `hash`. A missing row is the implicit count 1.
+    /// Rows are 4 bytes (count) or 8 bytes (count 0 plus death seq).
     fn count_get(&self, hash: &Uint256) -> Result<Option<u32>, String> {
         match self.backend.kv_get(Keyspace::Counts, hash.as_slice())? {
-            Some(bytes) if bytes.len() == 4 => {
-                Ok(Some(u32::from_le_bytes(bytes.try_into().expect("4 bytes"))))
-            }
-            Some(_) => Err("corrupt count row (expected 4 bytes)".to_owned()),
+            Some(bytes) if bytes.len() == 4 || bytes.len() == 8 => Ok(Some(u32::from_le_bytes(
+                bytes[..4].try_into().expect("4 bytes"),
+            ))),
+            Some(_) => Err("corrupt count row (expected 4 or 8 bytes)".to_owned()),
             None => Ok(None),
         }
+    }
+
+    /// The death seq of a dead (count 0) node, if it carries one.
+    fn dead_seq_get(&self, hash: &Uint256) -> Result<Option<u32>, String> {
+        match self.backend.kv_get(Keyspace::Counts, hash.as_slice())? {
+            Some(bytes) if bytes.len() == 8 && bytes[..4] == [0, 0, 0, 0] => Ok(Some(
+                u32::from_le_bytes(bytes[4..].try_into().expect("4 bytes")),
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    /// Record a node at count 0 together with the seq at which it died.
+    fn encode_dead(&self, batch: &mut KvBatch, hash: &Uint256, death_seq: u32) {
+        let mut value = 0u32.to_le_bytes().to_vec();
+        value.extend_from_slice(&death_seq.to_le_bytes());
+        batch.put(Keyspace::Counts, hash.as_slice().to_vec(), value);
     }
 
     /// Encode a count into the batch. A count of exactly 1 is represented by
