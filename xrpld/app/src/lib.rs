@@ -89,12 +89,12 @@ pub use runtime::component_runtime::*;
 pub use runtime::{main_runtime::*, overlay_runtime::*, resolver_runtime::*};
 pub use server::{grpc_server::*, server_okay::*, server_ports::*};
 pub use shamap::{
-    shamap_store::*, shamap_store_app_runtime::*, shamap_store_backend::*,
+    shamap_store::*, shamap_store_backend::*,
     shamap_store_bootstrap::*, shamap_store_component::*, shamap_store_config::*,
-    shamap_store_copy::*, shamap_store_health::*, shamap_store_paths::*,
+    shamap_store_health::*, shamap_store_paths::*,
     shamap_store_relational::*, shamap_store_rotation::*, shamap_store_runloop::*,
     shamap_store_runtime_state::*, shamap_store_saved_state::*, shamap_store_saved_state_db::*,
-    shamap_store_service::*, shamap_store_sql::*, shamap_store_worker::*,
+    shamap_store_service::*, shamap_store_sql::*,
 };
 pub use state::{
     app_registry::*, application_root::*, basic_app::*, collector_manager::*, manifest::*,

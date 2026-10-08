@@ -1,12 +1,10 @@
 pub mod pruned_claim;
 pub mod pruned_driver;
 pub mod shamap_store;
-pub mod shamap_store_app_runtime;
 pub mod shamap_store_backend;
 pub mod shamap_store_bootstrap;
 pub mod shamap_store_component;
 pub mod shamap_store_config;
-pub mod shamap_store_copy;
 pub mod shamap_store_health;
 pub mod shamap_store_paths;
 pub mod shamap_store_relational;
@@ -17,4 +15,3 @@ pub mod shamap_store_saved_state;
 pub mod shamap_store_saved_state_db;
 pub mod shamap_store_service;
 pub mod shamap_store_sql;
-pub mod shamap_store_worker;

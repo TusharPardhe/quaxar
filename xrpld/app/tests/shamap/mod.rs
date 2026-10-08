@@ -19,5 +19,3 @@ mod shamap_store_saved_state_db;
 #[path = "shamap_store_sql.rs"]
 mod shamap_store_sql;
 
-#[path = "shamap_store_worker.rs"]
-mod shamap_store_worker;
