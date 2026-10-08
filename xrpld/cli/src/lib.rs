@@ -95,7 +95,7 @@ pub enum Command {
     ConsensusInfo,
     /// Show tx_reduce_relay state
     TxReduceRelay,
-    /// Show database statistics (NuDB size, entries, hit rate)
+    /// Show database statistics (node store size, entries, hit rate)
     DbStats,
     /// Get or set the log level at runtime
     LogLevel {

@@ -45,7 +45,7 @@ pub fn run(url: &str, conf: Option<&str>) {
         "s1.ripple.com:51235".to_socket_addrs().is_ok()
     });
 
-    check("NuDB", || true);
+    check("node store", || true);
 
     let rpc_url = url.to_owned();
     check("node responding", move || {
