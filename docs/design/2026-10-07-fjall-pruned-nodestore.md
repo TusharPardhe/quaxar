@@ -482,9 +482,20 @@ As built on branch `feat/fjall-pruned-nodestore`:
   claim+prune; the SHAMap store component runs the driver from
   `on_ledger_closed` when `type=fjall`; metrics are exposed. End-to-end tests
   build real ledgers and verify pruning on the fjall backend.
+- Stage 7 removal complete: RocksDB, NuDB and the rotation machinery are gone.
+  The `SHAMapStoreNodeStore` enum collapsed to a single `Single` variant; the
+  rotating app runtime, bootstrap rotating path and rotation worker wiring are
+  removed. In the nodestore crate the NuDB backend, its mmap reader, the
+  `DatabaseRotating` trait and `database_rotating.rs`, the `NuDbContext`
+  plumbing and the context/deterministic/rotating `Factory`/`Manager`
+  constructors are deleted, and `NuDbFactory` is no longer registered
+  (fjall/memory/null remain). Config validation rejects `type = NuDB` and
+  `type = RocksDB` and defaults an unset type to fjall. The `librocksdb-sys`,
+  `rocksdb`, `bindgen`, `clang-sys` and `memmap2` dependencies are absent from
+  the tree (verified via `cargo tree -i`), and the workspace builds with
+  `CC=cc CXX=c++` with no C++ node-store build step.
 - Remaining: Stage 4 polish (FullBelowCache removal callback, serve-from-memory,
-  surfacing metrics in RPC, disk-full reserve), Stages 5-6 (soak, migration),
-  and Stage 7 (removal of NuDB/RocksDB/rotation and the clang build dependency).
+  surfacing metrics in RPC, disk-full reserve) and Stages 5-6 (soak, migration).
 
 ### Stage 0: baseline and harness
 
