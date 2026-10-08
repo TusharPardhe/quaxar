@@ -272,6 +272,25 @@ impl PrunedStore {
         self.config.verify_interval_secs
     }
 
+    /// Anchor an unclaimed store at a validated ledger without walking its
+    /// tree (design Case 7, `claim(A)` with `P = {}`): every node present is
+    /// implicitly live-once, so the anchor writes no count rows. Subsequent
+    /// claims diff against `state_root`. Errors if the store already claimed.
+    pub fn anchor(&self, seq: u32, state_root: Uint256) -> Result<(), String> {
+        let mut writer = self.writer.lock().expect("pruned store writer mutex");
+        writer.adopt_anchor(seq, state_root)?;
+        self.metrics.lock().expect("metrics mutex").claimed_seq = writer.claimed_seq();
+        Ok(())
+    }
+
+    /// The state root of the last claimed ledger, if any.
+    pub fn claimed_state_root(&self) -> Result<Option<Uint256>, String> {
+        self.writer
+            .lock()
+            .expect("pruned store writer mutex")
+            .claimed_state_root()
+    }
+
     /// Adopt a freshly snapshot-imported store as the anchor ledger
     /// (design Case 7). The snapshot loader has already written the retained
     /// tree into `nodes` and verified both SHAMap roots. `required` is the

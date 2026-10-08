@@ -130,6 +130,13 @@ impl PrunedDriver {
     }
 
     fn run_worker(&self) {
+        // Pruning is background maintenance: never compete with consensus.
+        #[cfg(target_os = "linux")]
+        // SAFETY: setpriority on the calling thread (who = 0) only changes this
+        // thread's nice value.
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+        }
         loop {
             let ledger = {
                 let mut pending = self.pending.lock().expect("pruned driver pending mutex");
@@ -172,15 +179,34 @@ impl PrunedDriver {
             .last_claimed
             .lock()
             .expect("pruned driver last-claimed mutex");
-        if let Some(prev) = last.as_ref()
-            && seq <= prev.header().seq
-        {
+        let claimed_seq = self.store.metrics().claimed_seq;
+        if claimed_seq.is_some_and(|claimed| seq <= claimed) {
             return Ok(());
         }
-        let delta = {
-            let prev_state = last.as_ref().map(|l| l.state_map());
-            compute_claim_delta(ledger.as_ref(), prev_state, state_root, self.fetch.as_ref())?
+        let Some(_) = claimed_seq else {
+            // First validated ledger on an unclaimed store: anchor it without
+            // walking its (multi-million node) state tree. Every node present
+            // is implicitly live-once; later claims diff against this root.
+            self.store.anchor(seq, state_root)?;
+            *last = Some(Arc::clone(&ledger));
+            tracing::info!(target: "nodestore", seq, "pruned store anchored");
+            return Ok(());
         };
+        // Diff against the resident previous claimed ledger, or after a restart
+        // against the persisted claimed root read back from the store.
+        let prev_root = match last.as_ref() {
+            Some(prev) => prev.state_map().root(),
+            None => {
+                let hash = self
+                    .store
+                    .claimed_state_root()?
+                    .ok_or_else(|| "claimed store has no claimed state root".to_owned())?;
+                (self.fetch)(SHAMapHash::new(hash))
+                    .ok_or_else(|| format!("claimed state root {hash} is not in the store"))?
+            }
+        };
+        let delta =
+            compute_claim_delta(ledger.as_ref(), &prev_root, state_root, self.fetch.as_ref())?;
         self.store.claim(&delta)?;
         *last = Some(Arc::clone(&ledger));
         drop(last);

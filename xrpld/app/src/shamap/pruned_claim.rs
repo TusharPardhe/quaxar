@@ -17,7 +17,6 @@ use basics::memory::intrusive_pointer::SharedIntrusive;
 use basics::sha_map_hash::SHAMapHash;
 use ledger::Ledger;
 use nodestore::ClaimDelta;
-use shamap::sync::SyncTree;
 use shamap::tree_node::SHAMapTreeNode;
 
 /// Resolves a node by hash when a validated ledger's tree is backed and a
@@ -25,34 +24,31 @@ use shamap::tree_node::SHAMapTreeNode;
 pub type ClaimNodeFetcher =
     dyn Fn(SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> + Send + Sync;
 
-/// Collect every node hash present in `want` but not in `have`, using the
-/// shared difference walk. `have` of `None` collects the whole `want` tree
-/// (used for owned tx-tree nodes and the first claim's anchor).
+/// Collect every node hash present under `want` but not under `have`, using
+/// the shared difference walk. `have` of `None` collects the whole `want`
+/// tree, which is only used for a ledger's own (small) transaction tree.
 ///
-/// Validated ledgers can be backed: released subtrees are read back from the
-/// node store on demand. A traversal error (a node neither resident nor
-/// fetchable) is returned instead of yielding a partial set, because claiming
-/// a partial delta would leave live nodes unclaimed for the orphan sweep.
+/// Both trees are treated as backed: any child that is not resident is read
+/// from the node store through `fetch`. A traversal error (a node neither
+/// resident nor fetchable) is returned instead of yielding a partial set,
+/// because claiming a partial delta would leave live nodes unclaimed.
 fn collect_new_nodes(
-    want: &SyncTree,
-    have: Option<&SyncTree>,
+    want: &SharedIntrusive<SHAMapTreeNode>,
+    have: Option<&SharedIntrusive<SHAMapTreeNode>>,
     fetch: &ClaimNodeFetcher,
 ) -> Result<Vec<Uint256>, String> {
-    let want_root = want.root();
-    if want_root.get_hash().is_zero() {
+    if want.get_hash().is_zero() {
         return Ok(Vec::new());
     }
-    let have_root = have.map(SyncTree::root);
-    let have_backed = have.is_some_and(SyncTree::backed);
     let mut want_fetch = |hash| fetch(hash);
     let mut have_fetch = |hash| fetch(hash);
     let mut out = Vec::new();
     shamap::difference::visit_differences(
-        &want_root,
-        have_root.as_ref(),
-        want.backed(),
+        want,
+        have,
+        true,
         &mut want_fetch,
-        have_backed,
+        true,
         &mut have_fetch,
         &mut |node: &SharedIntrusive<SHAMapTreeNode>| {
             out.push(*node.get_hash().as_uint256());
@@ -64,30 +60,28 @@ fn collect_new_nodes(
 }
 
 /// Build the [`ClaimDelta`] for `ledger` relative to the previously claimed
-/// state tree `claimed_state`.
+/// state root `claimed_state`.
 ///
 /// - `new_state` / `dead_state`: the symmetric difference of the state trees,
 ///   so shared subtrees (unchanged accounts) are visited in neither direction.
+///   For consecutive ledgers this touches only the few changed paths.
 /// - `owned`: every node of this ledger's transaction tree. These are unique
-///   to the ledger and die when it leaves the window, so the index records
-///   their death at `seq + 1`.
+///   to the ledger and die when it leaves the window.
 ///
-/// `claimed_state` is `None` for the anchor (first claim after sync), making
-/// the whole state tree new and nothing dead. Any traversal failure aborts the
-/// whole delta: the caller skips this claim and the next ledger re-diffs
-/// across the gap against the last claimed state.
+/// `claimed_state` is the root of the last claimed state tree, either the
+/// resident previous ledger's root or the persisted claimed root read back
+/// from the store after a restart. Any traversal failure aborts the delta: the
+/// caller skips this claim and the next ledger re-diffs across the gap.
 pub fn compute_claim_delta(
     ledger: &Ledger,
-    claimed_state: Option<&SyncTree>,
+    claimed_state: &SharedIntrusive<SHAMapTreeNode>,
     state_root_hash: Uint256,
     fetch: &ClaimNodeFetcher,
 ) -> Result<ClaimDelta, String> {
-    let new_state = collect_new_nodes(ledger.state_map(), claimed_state, fetch)?;
-    let dead_state = match claimed_state {
-        Some(prev) => collect_new_nodes(prev, Some(ledger.state_map()), fetch)?,
-        None => Vec::new(),
-    };
-    let owned = collect_new_nodes(ledger.tx_map(), None, fetch)?;
+    let state_root = ledger.state_map().root();
+    let new_state = collect_new_nodes(&state_root, Some(claimed_state), fetch)?;
+    let dead_state = collect_new_nodes(claimed_state, Some(&state_root), fetch)?;
+    let owned = collect_new_nodes(&ledger.tx_map().root(), None, fetch)?;
     Ok(ClaimDelta {
         seq: ledger.header().seq,
         state_root: state_root_hash,
@@ -99,5 +93,4 @@ pub fn compute_claim_delta(
 
 // Behavioural coverage for compute_claim_delta runs in the shamap-store
 // integration tests, which build real state and transaction trees through the
-// SHAMap family fixtures. SyncTree cannot be constructed meaningfully in a
-// unit test without that wiring, so there is no unit test module here.
+// SHAMap family fixtures.

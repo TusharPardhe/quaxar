@@ -310,8 +310,8 @@ fn pruned_store_reports_retained_floor_in_lockstep_with_prune() {
     // store's retained floor (pruned_to + 1).
     assert_eq!(
         history.lock().expect("history").len(),
-        8,
-        "floor callback fires every maintain pass"
+        7,
+        "floor callback fires on every claim after the anchor"
     );
     assert_eq!(
         last_floor.load(Ordering::SeqCst),

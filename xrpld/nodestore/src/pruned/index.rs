@@ -134,6 +134,14 @@ impl IndexWriter {
         self.unclaimed.len()
     }
 
+    /// The state root of the last claimed ledger, persisted with each claim.
+    pub fn claimed_state_root(&self) -> Result<Option<Uint256>, String> {
+        Ok(self
+            .backend
+            .kv_get(Keyspace::Meta, meta_key::CLAIMED_STATE_ROOT)?
+            .and_then(|bytes| Uint256::from_slice(&bytes)))
+    }
+
     /// Whether `hash` has reached count 0 and awaits pruning.
     pub fn is_dead_pending(&self, hash: &Uint256) -> bool {
         self.dead_pending.contains_key(hash)
