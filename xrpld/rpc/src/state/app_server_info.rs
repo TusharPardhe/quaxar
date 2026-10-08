@@ -405,11 +405,15 @@ mod tests {
         let source =
             ApplicationServerInfo::new(OwnedApplicationServerInfo::from_application_root(&app));
 
+        // rippled getOrAcquireLedger: a sequence needs a fresh validated
+        // ledger to resolve its hash.
         let status = source.ledger_request(1);
-        assert_eq!(status.error_code(), Some(RpcErrorCode::NoNetwork));
+        assert_eq!(status.error_code(), Some(RpcErrorCode::NotSynced));
 
+        // By hash it goes straight to InboundLedgers::acquire, which never
+        // blocks; with no registry/coordinator it reports "acquiring".
         let hash_status = source.ledger_request_by_hash(basics::base_uint::Uint256::zero());
-        assert_eq!(hash_status.error_code(), Some(RpcErrorCode::NoNetwork));
+        assert_eq!(hash_status.error_code(), Some(RpcErrorCode::NotReady));
     }
 
     #[test]
