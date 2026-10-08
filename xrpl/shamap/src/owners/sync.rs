@@ -507,7 +507,7 @@ impl SyncTree {
         tracing::info!(
             target: "ledger",
             inner_nodes_released = inner_nodes.len(),
-            "release_to_disk: evicted all loaded tree nodes to NuDB"
+            "release_to_disk: evicted all loaded tree nodes to the node store"
         );
     }
 

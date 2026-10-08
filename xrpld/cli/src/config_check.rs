@@ -648,7 +648,7 @@ maybe
     #[test]
     fn config_validation_enforces_manifest_count_bounds() {
         let valid = validate_config_content(
-            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_untrusted_count = 50\nmax_trusted_count = 1000\n",
+            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/fjall\n[ledger_history]\n256\n[overlay]\nmax_untrusted_count = 50\nmax_trusted_count = 1000\n",
         );
         assert!(
             valid.errors.is_empty(),
@@ -657,7 +657,7 @@ maybe
         );
 
         let invalid = validate_config_content(
-            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_untrusted_count = 49\nmax_trusted_count = 1001\n",
+            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/fjall\n[ledger_history]\n256\n[overlay]\nmax_untrusted_count = 49\nmax_trusted_count = 1001\n",
         );
         let errors = invalid.errors.join("\n");
         assert!(errors.contains("[overlay] max_untrusted_count"));
@@ -667,7 +667,7 @@ maybe
     #[test]
     fn config_validation_enforces_rippled_tracking_deadline_bounds() {
         let valid = validate_config_content(
-            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_diverged_time = 60\nmax_unknown_time = 300\n",
+            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/fjall\n[ledger_history]\n256\n[overlay]\nmax_diverged_time = 60\nmax_unknown_time = 300\n",
         );
         assert!(
             valid.errors.is_empty(),
@@ -676,7 +676,7 @@ maybe
         );
 
         let invalid = validate_config_content(
-            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/nudb\n[ledger_history]\n256\n[overlay]\nmax_diverged_time = 59\nmax_unknown_time = 1801\n",
+            "[node_size]\nmedium\n[node_db]\ntype = fjall\npath = /tmp/quaxar/db/fjall\n[ledger_history]\n256\n[overlay]\nmax_diverged_time = 59\nmax_unknown_time = 1801\n",
         );
         let errors = invalid.errors.join("\n");
         assert!(errors.contains("[overlay] max_diverged_time"));
@@ -715,7 +715,7 @@ medium
 
 [node_db]
 type = fjall
-path = /tmp/quaxar/db/nudb
+path = /tmp/quaxar/db/fjall
 online_delete = 512
 advisory_delete = 0
 

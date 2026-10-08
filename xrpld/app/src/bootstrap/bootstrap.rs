@@ -5277,13 +5277,13 @@ fn seed_startup_ledger_state(
             // unpersisted genesis tree.
             genesis_for_persist
                 .persist_dirty_nodes_to_store_result(tree_cache)
-                .map_err(|error| format!("genesis NuDB persistence failed: {error}"))?;
+                .map_err(|error| format!("genesis node-store persistence failed: {error}"))?;
             tracing::info!(
                 target: "bootstrap",
                 seq = closed.header().seq,
                 has_fallible_writer = genesis_for_persist.has_node_writer_result(),
                 has_tree_cache = tree_cache.is_some(),
-                "Genesis state nodes persisted to NuDB (before on_closed_ledger)"
+                "Genesis state nodes persisted to the node store (before on_closed_ledger)"
             );
         }
     }
@@ -5312,7 +5312,7 @@ fn seed_startup_ledger_state(
         .map_err(|error| format!("initial next-ledger skip list failed: {error:?}"))?;
     if root.node_store().is_some() {
         next.persist_dirty_nodes_to_store_result(root.shared_tree_cache())
-            .map_err(|error| format!("initial next-ledger NuDB persistence failed: {error}"))?;
+            .map_err(|error| format!("initial next-ledger node-store persistence failed: {error}"))?;
         // A start-valid forge is immediately copied and reopened by Pulsar.
         // Persisting dirty SHAMap nodes schedules backend writes; force the
         // NodeStore durability barrier before the validated header can be
