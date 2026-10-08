@@ -13,6 +13,7 @@ use crate::shamap::pruned_claim::compute_claim_delta;
 use ledger::Ledger;
 use nodestore::{PruneMode, PrunedConfig, PrunedMetrics, PrunedStore};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Owns the pruned store and the bookkeeping the claim path needs across
 /// ledgers. Cheap to clone-share via `Arc`; all mutable state is behind one
@@ -34,6 +35,9 @@ pub struct PrunedDriver {
     /// peer is never told about a ledger whose nodes may already be deleted
     /// (design Case 18).
     on_floor_advanced: Mutex<Option<Box<dyn Fn(u32) + Send + Sync>>>,
+    /// When the last sampled verify ran. `None` until the first one, so the
+    /// first eligible validated ledger triggers an initial verify.
+    last_verify: Mutex<Option<Instant>>,
 }
 
 impl PrunedDriver {
@@ -43,6 +47,7 @@ impl PrunedDriver {
             last_claimed: Mutex::new(None),
             on_prune: Mutex::new(None),
             on_floor_advanced: Mutex::new(None),
+            last_verify: Mutex::new(None),
         }
     }
 
@@ -92,7 +97,7 @@ impl PrunedDriver {
         };
         self.store.claim(&delta)?;
         let pruned = self.store.maintain(seq)?;
-        *last = Some(ledger);
+        *last = Some(Arc::clone(&ledger));
         drop(last);
         if pruned > 0 {
             if let Some(callback) = self
@@ -114,6 +119,53 @@ impl PrunedDriver {
             .as_ref()
         {
             callback(self.store.metrics().retained_floor);
+        }
+        // Periodic sampled verify (design Stage 4 `verify_interval`): on an
+        // interval, confirm every node reachable from the just-claimed ledger's
+        // state and tx trees is physically present. A miss is a correctness
+        // failure recorded in `verify_last_ok` (and surfaced via get_counts).
+        // This is a sampled safety net over the latest validated ledger, not a
+        // full retained-window walk.
+        self.maybe_verify(ledger.as_ref())?;
+        Ok(())
+    }
+
+    /// Run a sampled verify of `ledger`'s reachable nodes if `verify_interval`
+    /// has elapsed since the last one. `verify_interval_secs == 0` disables it.
+    fn maybe_verify(&self, ledger: &Ledger) -> Result<(), String> {
+        let interval = self.store.verify_interval_secs();
+        if interval == 0 {
+            return Ok(());
+        }
+        {
+            let last = self.last_verify.lock().expect("pruned driver verify mutex");
+            if let Some(at) = *last
+                && at.elapsed().as_secs() < interval
+            {
+                return Ok(());
+            }
+        }
+        // Collect every node hash reachable from the latest ledger's trees.
+        let mut required = std::collections::BTreeSet::new();
+        for tree in [ledger.state_map(), ledger.tx_map()] {
+            let mut fetch = |_hash| None;
+            let _ = tree.visit_nodes(&mut fetch, &mut |node| {
+                required.insert(*node.get_hash().as_uint256());
+                true
+            });
+        }
+        if required.is_empty() {
+            return Ok(());
+        }
+        let report = self.store.verify(&required, 1)?;
+        *self.last_verify.lock().expect("pruned driver verify mutex") = Some(Instant::now());
+        if !report.is_ok() {
+            return Err(format!(
+                "pruned store verify failed: {} of {} required nodes missing at seq {}",
+                report.missing.len(),
+                report.checked,
+                ledger.header().seq
+            ));
         }
         Ok(())
     }

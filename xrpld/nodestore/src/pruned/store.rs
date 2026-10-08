@@ -197,6 +197,11 @@ impl PrunedStore {
         *self.metrics.lock().expect("metrics mutex")
     }
 
+    /// Seconds between sampled verify passes (`0` disables periodic verify).
+    pub fn verify_interval_secs(&self) -> u64 {
+        self.config.verify_interval_secs
+    }
+
     /// Adopt a freshly snapshot-imported store as the anchor ledger
     /// (design Case 7). The snapshot loader has already written the retained
     /// tree into `nodes` and verified both SHAMap roots. `required` is the

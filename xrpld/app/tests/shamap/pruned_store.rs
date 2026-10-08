@@ -331,3 +331,40 @@ fn pruned_store_reports_retained_floor_in_lockstep_with_prune() {
     drop(driver);
     let _ = std::fs::remove_dir_all(&path);
 }
+
+// Periodic sampled verify (Stage 4 verify_interval): with a nonzero interval,
+// the driver verifies the latest ledger's reachable nodes are present. When
+// every node was flushed, verify passes and the claim succeeds; the metric
+// records the last result as ok.
+#[test]
+fn pruned_store_periodic_verify_passes_when_nodes_present() {
+    let (backend, path) = open_fjall_backend("verify");
+    let config = PrunedConfig {
+        online_delete: 3,
+        can_delete: u32::MAX,
+        prune_mode: PruneMode::On,
+        prune_batch: 64,
+        // A 1-second interval; last_verify is None so the first ledger verifies.
+        verify_interval_secs: 1,
+    };
+    let driver = PrunedDriver::open(Arc::clone(&backend), config).expect("driver opens");
+
+    for seq in 1..=4u32 {
+        let ledger = example_ledger(seq);
+        flush_ledger_nodes(&driver, &ledger);
+        driver
+            .on_validated_ledger(Arc::new(ledger))
+            .expect("claim + maintain + verify");
+    }
+
+    // Verify ran (interval elapsed on the first ledger) and found nothing
+    // missing, so the recorded result is ok.
+    assert!(
+        driver.metrics().verify_last_ok,
+        "verify over present nodes must pass: {:?}",
+        driver.metrics()
+    );
+
+    drop(driver);
+    let _ = std::fs::remove_dir_all(&path);
+}
