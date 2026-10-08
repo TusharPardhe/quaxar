@@ -91,7 +91,7 @@ if [[ "$INSTANCE_ID" == "None" || -z "$INSTANCE_ID" ]]; then
     --metadata-options 'HttpTokens=required,HttpEndpoint=enabled,HttpPutResponseHopLimit=1' \
     --user-data "file://$USER_DATA" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NODE_NAME},{Key=ManagedBy,Value=quaxar-infra},{Key=Network,Value=xrpl-testnet}]" \
-                         "ResourceType=volume,Tags=[{Key=Name,Value=$NODE_NAME-nudb},{Key=ManagedBy,Value=quaxar-infra},{Key=Purpose,Value=nudb}]" \
+                         "ResourceType=volume,Tags=[{Key=Name,Value=$NODE_NAME-nodestore},{Key=ManagedBy,Value=quaxar-infra},{Key=Purpose,Value=nodestore}]" \
     --query 'Instances[0].InstanceId' --output text)"
   aws_cmd ec2 wait instance-running --instance-ids "$INSTANCE_ID"
   aws_cmd ec2 associate-address --instance-id "$INSTANCE_ID" --allocation-id "$EIP_ALLOCATION_ID" >/dev/null

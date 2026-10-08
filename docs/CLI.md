@@ -96,7 +96,7 @@ Features:
 | `tx-reduce-relay` | Raw transaction relay reduction state |
 | `validators` | Trusted validator list and agreement |
 | `amendments` | Amendment status and voting |
-| `db-stats` | NuDB disk usage and database statistics |
+| `db-stats` | Node store disk usage and database statistics |
 | `log-level <level>` | Set log level; the no-argument query is not yet populated |
 | `benchmark` | Run internal performance benchmarks |
 | `validator-keys` | Key management (see below) |
@@ -186,7 +186,7 @@ quaxar ledger
 # View specific ledger
 quaxar ledger 95000000
 
-# Database statistics (NuDB path, file sizes, counters)
+# Database statistics (node store path, size, counters)
 quaxar db-stats
 
 # Database statistics using a specific config file
@@ -237,8 +237,10 @@ quaxar load-snapshot --input /path/to/snapshot.xrpls --conf /etc/quaxar/quaxar.c
 | `--input` | Yes | Path to snapshot file |
 | `--conf` | No | Config path determining the NodeStore; defaults to `/etc/quaxar/quaxar.cfg` |
 
-The import uses bulk loading mode with pre-allocated NuDB hash tables. The CLI
-shows a spinner throughout the synchronous import and reports success only
+The import writes nodes in bulk batches, verifies both SHAMap roots, and then
+adopts the snapshot ledger as the pruned store's anchor, reclaiming any nodes
+outside the snapshot. Load into an empty fjall store; a store that already has
+claimed history is refused before anything is deleted. The CLI shows a spinner throughout the synchronous import and reports success only
 after the loader has verified every chunk and the final file hash. Runtime
 depends on snapshot size, storage, CPU, and available memory.
 

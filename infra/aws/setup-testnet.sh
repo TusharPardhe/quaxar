@@ -46,8 +46,7 @@ retry() {
 export DEBIAN_FRONTEND=noninteractive
 retry apt-get update
 retry apt-get install -y --no-install-recommends \
-  ca-certificates curl git build-essential pkg-config libssl-dev librocksdb-dev \
-  clang cmake lld
+  ca-certificates curl git build-essential pkg-config libssl-dev cmake
 
 # This provisioner owns only fresh hosts and its canonical /var/lib/quaxar
 # layout. Refuse legacy in-place state before changing services, ownership, or
@@ -85,7 +84,7 @@ if [[ -e /srv/quaxar ]]; then
   exit 1
 fi
 if [[ -e /etc/quaxar/quaxar.cfg ]]; then
-  if ! grep -Fxq 'path = /var/lib/quaxar/db/nudb' /etc/quaxar/quaxar.cfg \
+  if ! grep -Fxq 'path = /var/lib/quaxar/db/fjall' /etc/quaxar/quaxar.cfg \
     || ! grep -Fxq '/var/lib/quaxar/db' /etc/quaxar/quaxar.cfg \
     || grep -Eq '/srv/|/var/lib/xrpld|/var/log/xrpld' /etc/quaxar/quaxar.cfg; then
     echo "Existing quaxar.cfg uses a noncanonical data layout; refusing to rewrite its service" >&2
@@ -97,7 +96,7 @@ if ! id -u quaxar >/dev/null 2>&1; then
   useradd --system --create-home --home-dir /home/quaxar --shell /usr/sbin/nologin quaxar
 fi
 install -d -o quaxar -g quaxar -m 0750 \
-  /var/lib/quaxar /var/lib/quaxar/db /var/lib/quaxar/db/nudb /var/log/quaxar
+  /var/lib/quaxar /var/lib/quaxar/db /var/log/quaxar
 if [[ "$SKIP_BUILD" == "1" ]]; then
   test -d /opt/quaxar/.git
   test -x /usr/local/bin/quaxar
@@ -115,8 +114,7 @@ else
     export PATH="$HOME/.cargo/bin:$PATH"
     rustup toolchain install 1.90.0 --profile minimal
     cd /opt/quaxar
-    ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu CARGO_BUILD_JOBS=2 CC=clang CXX=clang++ \
-      cargo +1.90.0 build --release -p quaxar-main
+    CARGO_BUILD_JOBS=2 cargo +1.90.0 build --release -p quaxar-main
   '
   install -m 0755 /opt/quaxar/target/release/quaxar /usr/local/bin/quaxar
 fi

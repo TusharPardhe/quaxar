@@ -61,7 +61,7 @@ sudo apt install build-essential pkg-config libssl-dev cmake git
 
 **macOS:**
 ```bash
-brew install openssl rocksdb cmake
+brew install openssl cmake
 ```
 
 ### Build & Install

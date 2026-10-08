@@ -95,7 +95,7 @@ All commits must follow the [Conventional Commits](https://www.conventionalcommi
 
 ```
 feat: add account_tx RPC handler
-fix: resolve NuDB 48-bit key overflow on large databases
+fix: bound pruned-store prune batches on large databases
 perf: parallelize state map acquisition across 4 threads
 docs: add architecture diagram to ARCHITECTURE.md
 ```
@@ -110,7 +110,7 @@ git config core.hooksPath .githooks
 ## PR Process
 
 1. **Fork** the repository
-2. **Branch** from `main` with a descriptive name: `feat/account-tx-rpc`, `fix/nudb-overflow`
+2. **Branch** from `main` with a descriptive name: `feat/account-tx-rpc`, `fix/prune-batch-bound`
 3. **Implement** your changes with tests
 4. **Run checks** locally:
    ```bash
@@ -139,7 +139,7 @@ Understanding which crate owns what helps you find the right place for changes:
 | `xrpld/consensus` | XRPL consensus protocol implementation |
 | `xrpld/ledger` | Ledger state, open/closed/validated lifecycle |
 | `xrpld/overlay` | P2P networking, peer message handling |
-| `xrpld/nodestore` | NuDB storage backend, node object persistence |
+| `xrpld/nodestore` | fjall node store, pruned index, node object persistence |
 | `xrpld/rdb` | Relational ledger and transaction metadata |
 | `xrpld/rpc` | JSON-RPC method handlers |
 | `xrpld/server` | HTTP/WebSocket server, request routing |
