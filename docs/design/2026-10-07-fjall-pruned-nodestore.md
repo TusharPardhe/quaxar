@@ -525,14 +525,36 @@ As built on branch `feat/fjall-pruned-nodestore`:
   tests. The health/rotation-decision/runloop/paths/saved-state modules remain
   (still reachable via `rotation_decision`, the operating-mode health types,
   and saved-state paths) and compile with no dead-code warnings.
-- Remaining: Stage 5 (the live 48h/72h testnet soak and its benchmark gates,
-  which need a running testnet host) and, as a refinement, a full retained-
-  ledger-tree verify (the periodic verify now runs a latest-ledger reachable
-  walk plus a window-wide count-consistency check over the Counts keyspace,
-  which together cover the retained window; a per-retained-ledger tree walk
-  would need a by-seq ledger provider threaded into the driver). The pruned
-  health (claimed_seq, pruned_to, retained_floor, verify_last_ok) is now in
-  both get_counts and server_info.
+- Production hardening after the first testnet deploy:
+  - **Worker thread.** `on_ledger_closed` only hands the newest validated
+    ledger to a dedicated `pruned-store` thread (nice 10); diffing, claiming,
+    pruning and verifying never run on the publish path. Skipped intermediate
+    ledgers are safe: the next claim diffs across the gap.
+  - **Anchor without a tree walk.** The first validated ledger on an empty
+    store is anchored directly (`claim(A)` with `P = {}` writes no count rows),
+    instead of walking a multi-million-node state tree.
+  - **Complete, fail-closed claims.** The claim diff reads non-resident
+    (released, backed) subtrees from the store and returns an error rather
+    than a partial delta. After a restart it diffs against the persisted
+    claimed root.
+  - **Death records are self-validating.** A count-0 row stores the seq of
+    the death that created it, and a State notebook row deletes its node only
+    if that seq still matches. A stale record left by a resurrection (whose
+    in-memory erase was lost on restart) can no longer delete a live node.
+  - **Re-store protection (R3/R5).** Writes reach the backend directly, so the
+    backend watches dead-pending and owned hashes and prune keeps any that are
+    written again. The claim also writes back any node the ledger reuses that
+    is missing from the store.
+  - **Fail-safe verify.** The periodic verify is incremental (nodes the claim
+    added plus the window-wide count check). A miss halts pruning; claims
+    continue.
+  - **Live `can_delete`, floor from the cursor.** Advisory updates reach the
+    prune target immediately, and `retained_floor` follows the durable
+    `pruned_to`, so a dry-run or halted pass never shrinks the advertised
+    range. The floor callback also clears relational history below the floor.
+  - `online_delete > 0` no longer routes into the removed rotating bootstrap.
+- Remaining: Stage 5 benchmark gates, a startup reconciler for sync leftovers
+  (see section 13), and a per-retained-ledger tree verify.
 
 ### Stage 0: baseline and harness
 
@@ -754,5 +776,70 @@ Case 17 and the FBC rules unchanged.
 - UNCLAIMED memory during heavy acquisition needs a hard cap (spill to an `unclaimed` keyspace if exceeded); the size is to be tuned in Stage 3.
 - fjall maturity versus RocksDB: mitigated by the conformance suite, crash tests, the soak, and the snapshot path as an escape hatch.
 - Mainnet churn is unmeasured; ratios should hold, absolute numbers will be larger.
-- The SQL ledger/transaction DB pruning (`clear_prior`) is kept as is and moves under `PrunedStore`.
-- Prerequisite outside this plan: the current NuDB rotation stall (no rotation since 2026-10-02, disk full in ~4 days) needs a stopgap before Stage 5.
+- The SQL ledger/transaction DB pruning (`clear_prior`) now runs from the pruned driver's retained-floor callback, on the pruned worker.
+
+## 13. Improvements and trade-offs
+
+### Improvements
+
+- **Disk stays flat at one window.** Only nodes some retained ledger needs are
+  kept, and dead nodes are deleted continuously in bounded batches. There is
+  no second generation and no growth between rotations, so the store holds
+  `online_delete` ledgers rather than one to two intervals of them.
+- **No full-state copy.** Pruning never copies the live state tree. Work per
+  ledger is proportional to what the ledger changed (hundreds of nodes), not
+  to the size of the state.
+- **No stall-prone maintenance step.** There is no rotation that must wait for
+  a health gate, so pruning cannot fall indefinitely behind during catch-up
+  (Case 19). Pruning runs on its own low-priority thread and never blocks the
+  ledger publish path.
+- **Exact advertised history.** `complete_ledgers` and the relational
+  history are lowered in the same step that advances the prune cursor, so the
+  node never advertises a ledger whose nodes may be gone (Case 18).
+- **Peers served from memory first.** Node requests are answered from the
+  TreeNodeCache before the store, so hot requests skip disk and a node stays
+  servable while any live ledger holds it (Case 17).
+- **Self-checking.** A periodic verify confirms recently added nodes and every
+  shared-state node are present; a miss halts pruning and is visible in
+  `server_info` and `get_counts`.
+- **Crash safe by construction.** Every claim is one atomic batch followed by
+  a durable flush, prune resumes from `meta.pruned_to`, and restart replay of
+  an already-claimed ledger is a no-op.
+- **Pure Rust build.** No C/C++ storage dependency: no `librocksdb-sys`,
+  `bindgen`, `clang-sys` or clang toolchain, and the workspace builds with
+  `CC=cc CXX=c++`.
+- **Operable.** Pruned metrics in `server_info`/`get_counts`, `db-stats` for
+  the store size, a `dry_run` prune mode, a disk-full ballast (`reserve_mb`),
+  and snapshot export/load with anchor adoption.
+
+### Trade-offs and drawbacks
+
+- **LSM cost.** fjall is an LSM engine: writes go through a journal and
+  background compaction, so write amplification is higher than an
+  append-only hash store, and per-key deletes leave tombstones until
+  compaction removes them. Disk needs headroom for compaction (the ballast
+  exists for this) and the deleted space is reclaimed with a delay.
+- **Index overhead.** The notebook and counts keyspaces add a small amount of
+  disk and a few reads and writes per changed node on every claim.
+- **More moving parts.** Correctness depends on an exact claim delta and on
+  the rules in section 5. These are covered by the property test against
+  `ModelStore`, crash tests, restart/resurrection regressions and the
+  runtime verify, but the design is more involved than dropping a whole
+  database generation.
+- **Sync leftovers are not yet reclaimed.** Nodes stored during the initial
+  sync that are not in the anchor ledger's tree, and the anchor ledger's own
+  transaction-tree nodes, are never claimed and so are never pruned. The
+  amount is bounded by one sync, but a one-time reconciler at startup is
+  still needed.
+- **Verify is sampled.** The periodic verify checks the nodes each claim adds
+  and every node with a count row, not every node of every retained ledger.
+  It catches the failure modes seen so far but is not a full proof.
+- **Halt is manual to clear.** After a verify failure pruning stays halted
+  until the node is restarted, so disk grows until an operator investigates.
+- **Format and engine.** The on-disk format is fjall-specific and not
+  interchangeable with other node stores; moving a node between formats needs
+  a resync or a snapshot export and load. fjall is younger and less
+  battle-tested than long-standing storage engines.
+- **Snapshot load needs an empty store.** Loading a snapshot into a store that
+  already has claimed history is refused rather than merged.
+
