@@ -326,12 +326,6 @@ impl SHAMapNodeFetcher for RpcNodeStoreFetcher {
                 FetchType::Synchronous,
                 false,
             ),
-            app::SHAMapStoreNodeStore::Rotating(database) => database.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                FetchType::Synchronous,
-                false,
-            ),
         }?;
 
         let object_type = match fetched.object_type() {
@@ -365,9 +359,6 @@ impl RpcInboundLedgerStore {
             app::SHAMapStoreNodeStore::Single(database) => database
                 .fetch_node_object(hash.as_uint256(), ledger_seq, FetchType::Synchronous, false)
                 .map(|object| object.data().to_vec()),
-            app::SHAMapStoreNodeStore::Rotating(database) => database
-                .fetch_node_object(hash.as_uint256(), ledger_seq, FetchType::Synchronous, false)
-                .map(|object| object.data().to_vec()),
         }
     }
 
@@ -380,9 +371,6 @@ impl RpcInboundLedgerStore {
     ) {
         let result = match &self.node_store {
             app::SHAMapStoreNodeStore::Single(database) => {
-                database.store(object_type, data, hash, ledger_seq)
-            }
-            app::SHAMapStoreNodeStore::Rotating(database) => {
                 database.store(object_type, data, hash, ledger_seq)
             }
         };

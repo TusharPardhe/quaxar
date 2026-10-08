@@ -669,12 +669,6 @@ impl SHAMapNodeFetcher for RpcStateNodeStoreFetcher {
                 FetchType::Synchronous,
                 false,
             ),
-            app::SHAMapStoreNodeStore::Rotating(database) => database.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                FetchType::Synchronous,
-                false,
-            ),
         }?;
 
         Some(SHAMapNodeObject::new(
@@ -2213,13 +2207,6 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
         );
         match node_store {
             app::SHAMapStoreNodeStore::Single(database) => {
-                json.insert(
-                    "node_db_earliest_seq".to_owned(),
-                    JsonValue::Unsigned(u64::from(database.earliest_ledger_seq())),
-                );
-                database.add_counts_json(json);
-            }
-            app::SHAMapStoreNodeStore::Rotating(database) => {
                 json.insert(
                     "node_db_earliest_seq".to_owned(),
                     JsonValue::Unsigned(u64::from(database.earliest_ledger_seq())),
