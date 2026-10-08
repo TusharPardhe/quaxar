@@ -515,17 +515,22 @@ As built on branch `feat/fjall-pruned-nodestore`:
 - Dead code: the rotation-era node-cache paths are gone
   (`invalidate_node_object_cache`, `advance_store_generation`, the
   `NodeObjectCacheMode`/`CacheStorage::Disabled` no-cache mode and its tests).
-  The inert rotation worker modules (`shamap_store_worker/rotation/runloop/
-  paths/runtime_state`) remain wired into the component's queued-ledger path
-  and are a bounded follow-up to excise.
+  The dormant rotation worker machinery is also removed: `SHAMapStore::start`
+  returns false for `delete_interval == 0`, so the component's worker thread
+  never ran once NuDB was gone. `SHAMapStoreComponent` no longer spawns a
+  worker or exposes `process_queued_ledger`/`run_detached_worker_step`,
+  `SHAMapStoreComponentRuntime` is now a marker trait, and the three
+  now-unreferenced modules `shamap_store_worker.rs`, `shamap_store_copy.rs`
+  and `shamap_store_app_runtime.rs` are deleted along with their rotation-only
+  tests. The health/rotation-decision/runloop/paths/saved-state modules remain
+  (still reachable via `rotation_decision`, the operating-mode health types,
+  and saved-state paths) and compile with no dead-code warnings.
 - Remaining: Stage 5 (the live 48h/72h testnet soak and its benchmark gates,
   which need a running testnet host), a full retained-window verify walk (the
   current periodic verify samples the latest ledger's reachable set, a sound
-  safety net but not every retained ledger), the optional server_info
-  halted-state surface (verify_last_ok is already in get_counts), and excising
-  the dormant rotation worker modules (no production caller drives
-  `process_queued_ledger`, but they are still woven into the component's type
-  surface).
+  safety net but not every retained ledger; the full walk needs a by-seq
+  ledger provider threaded into the driver), and the optional server_info
+  halted-state surface (verify_last_ok is already in get_counts).
 
 ### Stage 0: baseline and harness
 
