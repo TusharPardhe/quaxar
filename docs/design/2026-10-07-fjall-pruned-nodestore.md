@@ -494,8 +494,18 @@ As built on branch `feat/fjall-pruned-nodestore`:
   `rocksdb`, `bindgen`, `clang-sys` and `memmap2` dependencies are absent from
   the tree (verified via `cargo tree -i`), and the workspace builds with
   `CC=cc CXX=c++` with no C++ node-store build step.
-- Remaining: Stage 4 polish (FullBelowCache removal callback, serve-from-memory,
-  surfacing metrics in RPC, disk-full reserve) and Stages 5-6 (soak, migration).
+- Stage 4 polish complete: the FullBelowCache removal callback fires on every
+  prune that deletes nodes (Case 16); peer node requests are served from the
+  in-memory TreeNodeCache before the store (Case 17), byte-identical because
+  the store persists via the same `serialize_with_prefix` encoding; the pruned
+  metrics (claimed_seq, pruned_to, retained_floor, unclaimed, verify_last_ok)
+  are exposed through RPC `get_counts`; a disk-full ballast (`reserve_mb`,
+  default 1024) is reserved at open and releasable under pressure (Case 10);
+  and snapshot load adopts the import as the anchor and reconciles leftovers
+  (Case 7), while export streams the retained `nodes` set.
+- Remaining: Stages 5-6 (testnet soak, migration tooling) and the optional
+  server_info/fetch-info halted-state surface (verify_last_ok is already in
+  get_counts).
 
 ### Stage 0: baseline and harness
 
