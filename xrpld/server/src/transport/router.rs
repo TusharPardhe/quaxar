@@ -29,6 +29,25 @@ use crate::subscriptions::SubscriptionManager;
 use crate::transport::{RpcDispatcher, RpcReply, RpcRequest};
 use rpc::RpcRole;
 
+/// Concurrent ledger-reading RPC handlers per listener (blocking pool).
+///
+/// rippled runs RPC as JobQueue jobs on a worker pool sized to the machine;
+/// running far more CPU-bound handlers than cores only adds contention on
+/// shared SHAMap nodes (spinning on locks whose holder is descheduled) and
+/// lowers throughput. Override with `QUAXAR_RPC_HANDLER_THREADS`.
+fn handler_concurrency() -> usize {
+    std::env::var("QUAXAR_RPC_HANDLER_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|threads: &usize| *threads > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+                .max(2)
+        })
+}
+
 /// Methods whose handlers are constant-time and touch no ledger state, so
 /// they are dispatched on the async worker instead of the blocking pool.
 const INLINE_METHODS: &[&str] = &["ping", "random"];
@@ -253,8 +272,8 @@ impl Default for RpcServerState {
     fn default() -> Self {
         Self {
             p0_pool: tokio::sync::Semaphore::new(128),
-            p1_pool: tokio::sync::Semaphore::new(64),
-            p2_pool: tokio::sync::Semaphore::new(16),
+            p1_pool: tokio::sync::Semaphore::new(handler_concurrency()),
+            p2_pool: tokio::sync::Semaphore::new(handler_concurrency()),
         }
     }
 }
