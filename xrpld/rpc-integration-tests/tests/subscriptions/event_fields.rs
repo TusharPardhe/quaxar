@@ -127,9 +127,9 @@ fn accepted_mpt_partial_payment_publishes_persisted_delivered_amount_only_when_e
             "sub_mpt_issuer_off"
         });
         let issuance_id = mpt_id_for(issuer.id, 1);
-        let features = amendment_enabled
-            .then_some(protocol::fix_mpt_delivered_amount())
-            .into_iter()
+        // MPT payments require MPTokensV1 (rippled Payment::preflight -> temDISABLED).
+        let features = std::iter::once(protocol::feature_mp_tokens_v1())
+            .chain(amendment_enabled.then_some(protocol::fix_mpt_delivered_amount()))
             .collect::<Vec<_>>();
         let env = RpcTestEnv::with_entries_and_features(
             &[
@@ -140,6 +140,8 @@ fn accepted_mpt_partial_payment_publishes_persisted_delivered_amount_only_when_e
             &[
                 mpt_issuance_entry(issuer.id, 1),
                 mptoken_entry(source.id, issuance_id, 10_000),
+                // A holder must own an MPToken to receive (otherwise tecNO_AUTH).
+                mptoken_entry(destination.id, issuance_id, 0),
             ],
             &features,
         );

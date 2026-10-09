@@ -334,9 +334,9 @@ fn simulate_partial_mpt_payment_records_delivered_amount_only_with_amendment() {
             MPTAmount::from_value(800),
             mpt_issue,
         );
-        let features = amendment_enabled
-            .then_some(protocol::fix_mpt_delivered_amount())
-            .into_iter()
+        // MPT payments require MPTokensV1 (rippled Payment::preflight -> temDISABLED).
+        let features = std::iter::once(protocol::feature_mp_tokens_v1())
+            .chain(amendment_enabled.then_some(protocol::fix_mpt_delivered_amount()))
             .collect::<Vec<_>>();
         let env = RpcTestEnv::with_entries_and_features(
             &[
@@ -347,6 +347,8 @@ fn simulate_partial_mpt_payment_records_delivered_amount_only_with_amendment() {
             &[
                 mpt_issuance_entry(issuer.id, 1),
                 mptoken_entry(source_account.id, issuance_id, 10_000),
+                // A holder must own an MPToken to receive (otherwise tecNO_AUTH).
+                mptoken_entry(destination.id, issuance_id, 0),
             ],
             &features,
         );

@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use basics::base_uint::{Uint160, Uint256};
-use ledger::{Ledger, LedgerHeader, LEDGER_DEFAULT_TIME_RESOLUTION};
+use ledger::{
+    Ledger, LedgerHeader, CURRENT_DEFAULT_FEES, INITIAL_XRP_DROPS, LEDGER_DEFAULT_TIME_RESOLUTION,
+};
 use protocol::{
     account_keylet, calc_account_id, derive_public_key, get_field_by_symbol, AccountID, JsonValue,
     KeyType, LedgerEntryType, Rules, STAmount, STLedgerEntry, STTx, SecretKey,
@@ -132,6 +134,9 @@ impl RpcTestEnv {
                 seq: 1,
                 close_time: 1000,
                 close_time_resolution: LEDGER_DEFAULT_TIME_RESOLUTION,
+                // rippled genesis carries the full supply; fee destruction
+                // (raw_destroy_xrp) subtracts from header drops.
+                drops: INITIAL_XRP_DROPS,
                 ..LedgerHeader::default()
             },
             SyncTree::from_root_with_type(
@@ -151,6 +156,9 @@ impl RpcTestEnv {
         );
         parent.set_accepted(1000, LEDGER_DEFAULT_TIME_RESOLUTION, true);
         parent.set_rules(Rules::new(features.iter().copied()));
+        // No FeeSettings entry: use rippled FeeSetup defaults (10 drops base,
+        // 10 XRP reserve, 2 XRP owner increment) like test::jtx::Env.
+        parent.set_fees(CURRENT_DEFAULT_FEES);
 
         let mut app = ApplicationRoot::with_options(ApplicationRootOptions {
             standalone: true,

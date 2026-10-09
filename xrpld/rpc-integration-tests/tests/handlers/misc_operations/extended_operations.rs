@@ -153,7 +153,7 @@ fn defs_ext_98() {
     let s = e.rpc_source();
     let r = rpc::feature::do_feature(
         &rpc::feature::FeatureRequest {
-            params: &json([("feature", sv("Batch")), ("vetoed", b(true))]),
+            params: &json([("feature", sv("BatchV1_1")), ("vetoed", b(true))]),
             role: rpc::RpcRole::User,
         },
         &s,
@@ -381,7 +381,7 @@ fn defs_types_68_feature_no_perm() {
     let s = e.rpc_source();
     let r = rpc::feature::do_feature(
         &rpc::feature::FeatureRequest {
-            params: &json([("feature", sv("Batch")), ("vetoed", b(true))]),
+            params: &json([("feature", sv("BatchV1_1")), ("vetoed", b(true))]),
             role: rpc::RpcRole::User,
         },
         &s,

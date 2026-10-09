@@ -47,7 +47,7 @@ fn feature_veto_requires_admin() {
     let result = do_feature(
         &FeatureRequest {
             params: &json([
-                ("feature", JsonValue::String("Batch".to_owned())),
+                ("feature", JsonValue::String("BatchV1_1".to_owned())),
                 ("vetoed", JsonValue::Bool(true)),
             ]),
             role: rpc::RpcRole::User,
