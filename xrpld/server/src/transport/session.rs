@@ -363,6 +363,7 @@ impl WSSession {
         }
         let mut rx = self.subscriptions.subscribe_mpt_transactions();
         let sender = self.sender.clone();
+        let too_slow = self.too_slow.clone();
         let held = Arc::clone(&self.mpt_subscriptions);
         *task = Some(tokio::spawn(async move {
             loop {
@@ -378,12 +379,24 @@ impl WSSession {
                         if !wanted {
                             continue;
                         }
-                        let text: axum::extract::ws::Utf8Bytes = event.payload.try_into().unwrap();
-                        if sender.send(Message::Text(text)).is_err() {
-                            break;
+                        let Ok(text) = Utf8Bytes::try_from(event.payload) else {
+                            continue;
+                        };
+                        // Same egress policy as subscribe_stream.
+                        tokio::select! {
+                            biased;
+                            _ = too_slow.cancelled() => break,
+                            sent = sender.send(Message::Text(text)) => {
+                                if sent.is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        too_slow.cancel();
+                        break;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }

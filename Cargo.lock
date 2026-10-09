@@ -140,6 +140,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shamap",
+ "sonic-rs",
  "tempfile",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -2322,7 +2323,9 @@ dependencies = [
  "basics",
  "bs58",
  "ed25519-dalek",
+ "flate2",
  "getrandom 0.3.4",
+ "itoa",
  "libloading",
  "prost",
  "prost-build",
@@ -2333,6 +2336,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sonic-rs",
  "tracing",
 ]
 
@@ -2900,6 +2904,7 @@ dependencies = [
  "serde_json",
  "server",
  "shamap",
+ "sonic-rs",
  "tokio",
  "tx",
 ]

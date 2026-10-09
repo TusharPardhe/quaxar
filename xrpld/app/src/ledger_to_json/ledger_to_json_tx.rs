@@ -142,7 +142,10 @@ fn fill_json_tx_v2(
     let nested = object
         .entry("tx_json".to_owned())
         .or_insert(JsonValue::Object(BTreeMap::new()));
-    copy_from(nested, &txn.json(JsonOptions::DISABLE_API_PRIOR_V2));
+    copy_from(
+        nested,
+        &protocol::json_writer::shallow_json(txn, JsonOptions::DISABLE_API_PRIOR_V2),
+    );
     insert_deliver_max(nested, txn.get_txn_type(), fill.api_version());
 
     object.insert(
@@ -193,7 +196,10 @@ fn fill_json_tx_v1(
     txn: &STTx,
     meta: Option<&TxMeta>,
 ) {
-    copy_from(tx_json, &txn.json(JsonOptions::NONE));
+    copy_from(
+        tx_json,
+        &protocol::json_writer::shallow_json(txn, JsonOptions::NONE),
+    );
     insert_deliver_max(tx_json, txn.get_txn_type(), fill.api_version());
 
     let JsonValue::Object(object) = tx_json else {
@@ -250,13 +256,14 @@ pub(crate) fn transaction_subscription_event(
     meta: &TxMeta,
 ) -> JsonValue {
     let result = meta.get_result_ter();
-    let mut transaction = txn.json(JsonOptions::NONE);
-    if let JsonValue::Object(object) = &mut transaction {
-        object.insert(
-            "date".to_owned(),
+    let transaction = protocol::json_writer::transaction_json_extended(
+        txn,
+        JsonOptions::NONE,
+        vec![(
+            "date",
             JsonValue::Unsigned(u64::from(ledger.header().close_time)),
-        );
-    }
+        )],
+    );
     let mut meta_json = meta.get_json(JsonOptions::NONE);
     insert_all_synthetic_in_json(
         &mut meta_json,
@@ -353,9 +360,7 @@ pub(crate) fn fill_json_queue_tx(fill: &AppLedgerFill<'_>, txn: &STTx) -> JsonVa
 mod tests {
     use super::transaction_subscription_event;
     use ledger::Ledger;
-    use protocol::{
-        JsonValue, STArray, STObject, STTx, StBase, TxMeta, TxType, get_field_by_symbol,
-    };
+    use protocol::{JsonValue, STArray, STObject, STTx, TxMeta, TxType, get_field_by_symbol};
 
     #[test]
     fn validated_subscription_event_matches_rippled_trans_json_shape() {
@@ -392,6 +397,45 @@ mod tests {
         assert_eq!(
             transaction.get("date"),
             Some(&JsonValue::Unsigned(u64::from(ledger.header().close_time))),
+        );
+    }
+
+    #[test]
+    fn raw_rendered_subscription_event_is_byte_identical() {
+        let ledger = Ledger::from_ledger_seq_and_close_time(42, 600_000_000, false);
+        let tx = STTx::new(TxType::PAYMENT, |object| {
+            object.set_field_amount(
+                get_field_by_symbol("sfAmount"),
+                protocol::STAmount::new_native(5_000_000, false),
+            );
+            object.set_field_u32(get_field_by_symbol("sfSequence"), 7);
+        });
+        let mut meta_object = STObject::new(get_field_by_symbol("sfTransactionMetaData"));
+        meta_object.set_field_u8(get_field_by_symbol("sfTransactionResult"), 0);
+        meta_object.set_field_u32(get_field_by_symbol("sfTransactionIndex"), 3);
+        let mut nodes = STArray::new(get_field_by_symbol("sfAffectedNodes"));
+        let mut modified = STObject::new(get_field_by_symbol("sfModifiedNode"));
+        modified.set_field_u16(get_field_by_symbol("sfLedgerEntryType"), 0x0061);
+        modified.set_field_h256(
+            get_field_by_symbol("sfLedgerIndex"),
+            basics::base_uint::Uint256::from_array([9; 32]),
+        );
+        nodes.push_back(modified);
+        meta_object.set_field_array(get_field_by_symbol("sfAffectedNodes"), nodes);
+        let meta = TxMeta::from_stobject(tx.get_transaction_id(), 42, meta_object);
+
+        let tree = sonic_rs::to_vec(&transaction_subscription_event(&ledger, &tx, &meta)).unwrap();
+        let raw = protocol::json_writer::with_raw_rendering(|| {
+            let event = transaction_subscription_event(&ledger, &tx, &meta);
+            let JsonValue::Object(object) = &event else {
+                panic!("event object")
+            };
+            assert!(matches!(object.get("transaction"), Some(JsonValue::Raw(_))));
+            sonic_rs::to_vec(&event).unwrap()
+        });
+        assert_eq!(
+            String::from_utf8(raw).unwrap(),
+            String::from_utf8(tree).unwrap()
         );
     }
 }

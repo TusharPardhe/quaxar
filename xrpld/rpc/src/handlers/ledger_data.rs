@@ -281,6 +281,10 @@ pub fn do_ledger_data<S: LedgerDataSource>(
             node.insert("data".to_owned(), JsonValue::String(str_hex(entry.binary)));
             node.insert("index".to_owned(), JsonValue::String(entry.key.to_string()));
             nodes.push(JsonValue::Object(node));
+        } else if let JsonValue::Raw(_) = entry.json {
+            // Pre-rendered ledger entry: STLedgerEntry JSON already carries
+            // `index` (= entry.key, the key it was read under).
+            nodes.push(entry.json);
         } else {
             let mut node = entry.json;
             let node_object = ensure_object(&mut node);

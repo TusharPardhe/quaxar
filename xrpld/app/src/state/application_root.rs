@@ -8996,11 +8996,15 @@ impl ApplicationRoot {
             return;
         };
         for (transaction, meta) in transactions {
-            let event = crate::ledger_to_json::ledger_to_json_tx::transaction_subscription_event(
-                ledger.as_ref(),
-                transaction.as_ref(),
-                &meta,
-            );
+            // Events are only serialized by the subscription publisher, so
+            // nested transaction/metadata objects render without trees.
+            let event = protocol::json_writer::with_raw_rendering(|| {
+                crate::ledger_to_json::ledger_to_json_tx::transaction_subscription_event(
+                    ledger.as_ref(),
+                    transaction.as_ref(),
+                    &meta,
+                )
+            });
             // `transactions` receives only accepted events. The distinct
             // real-time stream receives both proposed and the terminal
             // validated event, matching rippled's STransactions/SRtTransactions

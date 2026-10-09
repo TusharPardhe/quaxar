@@ -1745,7 +1745,7 @@ async fn websocket_subscription_does_not_receive_unsubscribed_stream() {
 fn mpt_test_session(manager: Arc<SubscriptionManager>) -> (
     WSSession,
     RequestMetadata,
-    mpsc::UnboundedReceiver<axum::extract::ws::Message>,
+    mpsc::Receiver<axum::extract::ws::Message>,
 ) {
     let request = http::Request::builder()
         .method("GET")
@@ -1757,7 +1757,7 @@ fn mpt_test_session(manager: Arc<SubscriptionManager>) -> (
         &request,
     );
     metadata.is_websocket = true;
-    let (sender, receiver) = mpsc::unbounded_channel();
+    let (sender, receiver) = mpsc::channel(server::router::WS_SEND_QUEUE_LIMIT);
     let session = WSSession::new(40, metadata.clone(), sender, manager);
     (session, metadata, receiver)
 }

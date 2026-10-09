@@ -1136,7 +1136,10 @@ mod tests {
         assert_eq!(positive.iou(), expected);
         assert!(positive.iou().mantissa() < 0);
 
-        let negative = STAmount { is_negative: true, ..positive.clone() };
+        let negative = STAmount {
+            is_negative: true,
+            ..positive.clone()
+        };
         let expected = crate::IOUAmount::from_parts((raw as i64).wrapping_neg(), -15).unwrap();
         assert_eq!(negative.iou(), expected);
         assert!(negative.iou().mantissa() > 0);

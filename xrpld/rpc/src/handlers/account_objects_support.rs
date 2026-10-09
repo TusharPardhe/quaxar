@@ -474,7 +474,7 @@ pub fn collect_account_objects<V: AccountObjectsView>(
             };
 
             if type_matches(sle_node.get_type()) {
-                items.push(sle_node.json(JsonOptions::NONE));
+                items.push(protocol::json_writer::ledger_entry_json(&sle_node));
             }
 
             dir_count = dir_count.saturating_add(1);

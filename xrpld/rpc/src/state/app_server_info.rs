@@ -2423,19 +2423,18 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
                     continue;
                 };
 
-                let mut offer_json = offer_sle.json(JsonOptions::NONE);
-                if let JsonValue::Object(ref mut offer_obj) = offer_json {
-                    offer_obj.insert(
-                        "index".to_owned(),
-                        JsonValue::String(offer_index.to_string()),
-                    );
+                // Computed keys merged into the offer object (same order of
+                // insertion as before; later inserts win).
+                let mut offer_extras: Vec<(&str, JsonValue)> = Vec::with_capacity(5);
+                {
+                    offer_extras.push(("index", JsonValue::String(offer_index.to_string())));
 
                     // Compute quality from directory key (reference getQuality)
                     let quality_bytes = &next.data()[24..32];
                     let quality_u64 =
                         u64::from_be_bytes(quality_bytes.try_into().unwrap_or([0; 8]));
                     let dir_rate = protocol::amount_from_quality(quality_u64);
-                    offer_obj.insert("quality".to_owned(), JsonValue::String(dir_rate.text()));
+                    offer_extras.push(("quality", JsonValue::String(dir_rate.text())));
 
                     // Compute owner_funds: read owner's balance for the TakerGets asset.
                     let owner = offer_sle.get_account_id(get_field_by_symbol("sfAccount"));
@@ -2494,18 +2493,16 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
                     let taker_gets_funded = if owner_funds_limit >= taker_gets {
                         taker_gets.clone()
                     } else {
-                        offer_obj.insert(
-                            "taker_gets_funded".to_owned(),
+                        offer_extras.push((
+                            "taker_gets_funded",
                             owner_funds_limit.json(JsonOptions::NONE),
-                        );
+                        ));
                         let pays_funded = std::cmp::min(
                             taker_pays.clone(),
                             owner_funds_limit.multiply(&dir_rate, taker_pays.asset()),
                         );
-                        offer_obj.insert(
-                            "taker_pays_funded".to_owned(),
-                            pays_funded.json(JsonOptions::NONE),
-                        );
+                        offer_extras
+                            .push(("taker_pays_funded", pays_funded.json(JsonOptions::NONE)));
                         owner_funds_limit
                     };
 
@@ -2521,13 +2518,14 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
                     owner_balances.insert(owner, owner_funds.clone());
 
                     if first_owner_offer {
-                        offer_obj.insert(
-                            "owner_funds".to_owned(),
-                            JsonValue::String(owner_funds_before.text()),
-                        );
+                        offer_extras
+                            .push(("owner_funds", JsonValue::String(owner_funds_before.text())));
                     }
                 }
-                offers.push(offer_json);
+                offers.push(protocol::json_writer::ledger_entry_json_extended(
+                    &offer_sle,
+                    offer_extras,
+                ));
                 remaining -= 1;
             }
 
@@ -2609,7 +2607,7 @@ impl<V: AppServerInfoView + Sync> crate::handlers::ledger_data::LedgerDataSource
             let json = if binary {
                 JsonValue::Null
             } else {
-                sle.json(JsonOptions::NONE)
+                protocol::json_writer::ledger_entry_json(&sle)
             };
 
             entries.push(crate::handlers::ledger_data::LedgerDataEntry {
