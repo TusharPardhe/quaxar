@@ -48,6 +48,26 @@ fn handler_concurrency() -> usize {
         })
 }
 
+/// Methods that walk many ledger entries per call (pages of objects,
+/// transactions or order books). They run in a lane limited to one handler
+/// per CPU (`p2_pool`); point lookups share a lane with twice that, so a burst
+/// of heavy pages cannot crowd them out and cheap calls are not throttled to
+/// the heavy lane's width.
+const HEAVY_METHODS: &[&str] = &[
+    "ledger_data",
+    "book_offers",
+    "account_objects",
+    "account_tx",
+    "account_lines",
+    "account_offers",
+    "account_nfts",
+    "account_channels",
+    "ledger",
+    "tx_history",
+    "noripple_check",
+    "gateway_balances",
+];
+
 /// Methods whose handlers are constant-time and touch no ledger state, so
 /// they are dispatched on the async worker instead of the blocking pool.
 const INLINE_METHODS: &[&str] = &["ping", "random"];
@@ -272,7 +292,7 @@ impl Default for RpcServerState {
     fn default() -> Self {
         Self {
             p0_pool: tokio::sync::Semaphore::new(128),
-            p1_pool: tokio::sync::Semaphore::new(handler_concurrency()),
+            p1_pool: tokio::sync::Semaphore::new(handler_concurrency() * 2),
             p2_pool: tokio::sync::Semaphore::new(handler_concurrency()),
         }
     }
@@ -447,7 +467,9 @@ where
 
         let permit = match method.as_str() {
             "submit" | "fee" => self.state.p0_pool.acquire().await.unwrap(),
-            "ledger_data" => self.state.p2_pool.acquire().await.unwrap(),
+            method if HEAVY_METHODS.contains(&method) => {
+                self.state.p2_pool.acquire().await.unwrap()
+            }
             _ => self.state.p1_pool.acquire().await.unwrap(),
         };
 
