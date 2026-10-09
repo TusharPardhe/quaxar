@@ -78,14 +78,7 @@ fn main() {
     let b58 = bench("  of which: one AccountID -> base58", n, || {
         protocol::to_base58(owner)
     });
-    let hex = bench("  of which: one 32-byte hash -> hex", n, || {
-        let mut s = String::with_capacity(64);
-        for b in key.data() {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02X}");
-        }
-        s
-    });
+    let hex = bench("  of which: one 32-byte hash -> hex", n, || key.to_string());
     let total = decode + to_tree + ser;
     let iou = offer.get_field_amount(f("sfTakerPays"));
     let xrp = offer.get_field_amount(f("sfTakerGets"));

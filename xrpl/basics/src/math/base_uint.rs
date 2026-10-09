@@ -328,7 +328,15 @@ impl<const BYTES: usize, Tag> Add for BaseUInt<BYTES, Tag> {
 
 impl<const BYTES: usize, Tag> fmt::Display for BaseUInt<BYTES, Tag> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&to_string(self))
+        // Encode through a stack buffer: no heap allocation per hash.
+        let mut buf = [0_u8; 128];
+        for chunk in self.bytes.chunks(64) {
+            let out = &mut buf[..chunk.len() * 2];
+            crate::str_hex::encode_upper_to_slice(chunk, out);
+            // Hex digits are ASCII, so this never fails.
+            formatter.write_str(std::str::from_utf8(out).map_err(|_| fmt::Error)?)?;
+        }
+        Ok(())
     }
 }
 
@@ -386,22 +394,12 @@ pub type Uint192 = BaseUInt<24>;
 pub type Uint256 = BaseUInt<32>;
 
 pub fn to_string<const BYTES: usize, Tag>(value: &BaseUInt<BYTES, Tag>) -> String {
-    value
-        .bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect()
+    crate::str_hex::str_hex(value.bytes)
 }
 
 pub fn to_short_string<const BYTES: usize, Tag>(value: &BaseUInt<BYTES, Tag>) -> String {
     assert!(BYTES > 4, "For 4 bytes or less, use a native type");
-    value
-        .bytes
-        .iter()
-        .take(4)
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<String>()
-        + "..."
+    crate::str_hex::str_hex(&value.bytes[..4]) + "..."
 }
 
 impl PartitionKey for Uint256 {
@@ -442,6 +440,25 @@ mod tests {
         fn write(&mut self, bytes: &[u8]) {
             self.bytes.extend_from_slice(bytes);
         }
+    }
+
+    #[test]
+    fn hex_rendering_matches_byte_format_reference() {
+        let mut bytes = [0_u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        bytes[0] = 0x00;
+        bytes[31] = 0xFF;
+        let value = Uint256::from_array(bytes);
+        let reference: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+        assert_eq!(to_string(&value), reference);
+        assert_eq!(value.to_string(), reference);
+        assert_eq!(format!("{value}"), reference);
+        assert_eq!(format!("{value:?}"), format!("BaseUInt({reference:?})"));
+        assert_eq!(to_short_string(&value), format!("{}...", &reference[..8]));
+        let small = BaseUInt::<20>::from_array([0xAB; 20]);
+        assert_eq!(small.to_string(), "AB".repeat(20));
     }
 
     #[test]
