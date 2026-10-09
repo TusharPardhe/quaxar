@@ -86,6 +86,11 @@ impl STObject {
         self.template.is_none()
     }
 
+    /// Fields and template, for the direct JSON writer.
+    pub(crate) fn json_parts(&self) -> (&[STVar], Option<&SOTemplate>) {
+        (&self.fields, self.template.as_ref())
+    }
+
     pub fn empty(&self) -> bool {
         self.fields.is_empty()
     }
@@ -114,45 +119,55 @@ impl STObject {
     }
 
     pub fn apply_template(&mut self, template: &SOTemplate) {
-        // Reorder against a scratch copy of self.fields first. self.template
-        // must never be set to Some(template) unless self.fields is actually
-        // replaced with the reordered vector in the same step — leaving them
-        // out of sync (rippled's type_/v_ invariant) is what causes
-        // get_field_index to return a template-slot index that is out of
-        // bounds for a stale, un-reordered self.fields (matches rippled
-        // STObject::applyTemplate, where type_ and v_ are only ever updated
-        // together via the final v_.swap(v), and any rejection path throws
-        // before either is touched).
-        let mut remaining = self.fields.clone();
-        let mut reordered = Vec::with_capacity(template.size());
-
-        for element in template.iter() {
-            if let Some(index) = remaining
-                .iter()
-                .position(|field| field.get().fname() == element.sfield())
-            {
-                let field = remaining.remove(index);
-                if element.style() == SOEStyle::Default && field.get().is_default() {
-                    // them from wire serialization. Include in reordered.
+        // self.template must never be set to Some(template) unless
+        // self.fields is replaced with the reordered vector in the same step
+        // (rippled's type_/v_ invariant: get_field_index returns template
+        // slots, so a stale field vector would be indexed out of bounds).
+        // Equivalent to the clone-and-search formulation (rippled
+        // applyTemplate): each field goes to its template slot, the first
+        // occurrence of a field wins, and leftover fields (not in the
+        // template, or later duplicates) must all be discardable or the
+        // object is left untouched. Validated before anything moves, so
+        // rejection needs no scratch copy of the fields.
+        let mut slot_of = Vec::with_capacity(self.fields.len());
+        let mut claimed = vec![false; template.size()];
+        for field in &self.fields {
+            let fname = field.get().fname();
+            let slot = template
+                .get_index(fname)
+                .ok()
+                .filter(|index| *index >= 0)
+                .map(|index| index as usize)
+                .filter(|index| !claimed[*index]);
+            match slot {
+                Some(index) => {
+                    claimed[index] = true;
+                    slot_of.push(Some(index));
                 }
-                reordered.push(field);
-            } else if element.style() == SOEStyle::Required {
-                // Required field not in wire data — create with default
-                // value so it's always present for serialization/access.
-                reordered.push(STVar::default_object(element.sfield()));
-            } else {
-                reordered.push(STVar::non_present_object(element.sfield()));
+                None if fname.is_discardable() => slot_of.push(None),
+                None => return,
             }
         }
 
-        for field in &remaining {
-            if !field.get().fname().is_discardable() {
-                // In Rust, we silently discard the invalid field to avoid
-                // crashing. self.template/self.fields are left completely
-                // untouched so they remain mutually consistent.
-                return;
+        let mut slots: Vec<Option<STVar>> = (0..template.size()).map(|_| None).collect();
+        for (field, slot) in std::mem::take(&mut self.fields).into_iter().zip(slot_of) {
+            if let Some(index) = slot {
+                slots[index] = Some(field);
             }
         }
+        let reordered = slots
+            .into_iter()
+            .zip(template.iter())
+            .map(|(field, element)| match field {
+                Some(field) => field,
+                // Required field not in wire data: create with default
+                // value so it's always present for serialization/access.
+                None if element.style() == SOEStyle::Required => {
+                    STVar::default_object(element.sfield())
+                }
+                None => STVar::non_present_object(element.sfield()),
+            })
+            .collect();
 
         self.template = Some(template.clone());
         self.fields = reordered;
@@ -1242,5 +1257,94 @@ mod tests {
             result,
             Err(ValidationError::MissingField("Account"))
         ));
+    }
+}
+
+#[cfg(test)]
+mod apply_template_equivalence_tests {
+    use super::*;
+    use crate::LedgerFormats;
+    use crate::keylet::ledger_entry_type_from_code;
+
+    /// The previous clone-and-search implementation, kept as the reference.
+    fn reference_apply(object: &mut STObject, template: &SOTemplate) {
+        let mut remaining = object.fields.clone();
+        let mut reordered = Vec::with_capacity(template.size());
+        for element in template.iter() {
+            if let Some(index) = remaining
+                .iter()
+                .position(|field| field.get().fname() == element.sfield())
+            {
+                reordered.push(remaining.remove(index));
+            } else if element.style() == SOEStyle::Required {
+                reordered.push(STVar::default_object(element.sfield()));
+            } else {
+                reordered.push(STVar::non_present_object(element.sfield()));
+            }
+        }
+        if remaining
+            .iter()
+            .any(|field| !field.get().fname().is_discardable())
+        {
+            return;
+        }
+        object.template = Some(template.clone());
+        object.fields = reordered;
+    }
+
+    fn snapshot(object: &STObject) -> (Vec<(i32, SerializedTypeId, String)>, bool) {
+        (
+            object
+                .fields
+                .iter()
+                .map(|field| {
+                    let value = field.get();
+                    (value.fname().code(), value.stype(), value.full_text())
+                })
+                .collect(),
+            object.template.is_some(),
+        )
+    }
+
+    #[test]
+    fn matches_reference_on_shuffled_partial_duplicated_and_foreign_fields() {
+        let offer = LedgerFormats::get_instance()
+            .find_by_type(ledger_entry_type_from_code(0x006F).unwrap())
+            .unwrap()
+            .so_template()
+            .clone();
+        let foreign = [
+            get_field_by_symbol("sfDomain"), // not in Offer, not discardable
+            get_field_by_symbol("sfAffectedNodes"), // not in Offer
+        ];
+        let mut state = 0x1234_5678_9ABC_DEF1_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..5_000 {
+            let mut object = STObject::new(get_field_by_symbol("sfLedgerEntry"));
+            for element in offer.iter() {
+                let copies = next() % 4; // 0 = missing, 2-3 = duplicates
+                for _ in 0..copies.min(2) {
+                    object.fields.push(STVar::default_object(element.sfield()));
+                }
+            }
+            if next() % 5 == 0 {
+                let field = foreign[(next() % 2) as usize];
+                object.fields.push(STVar::default_object(field));
+            }
+            // Shuffle.
+            for i in (1..object.fields.len()).rev() {
+                let j = (next() as usize) % (i + 1);
+                object.fields.swap(i, j);
+            }
+            let mut expected = object.clone();
+            reference_apply(&mut expected, &offer);
+            object.apply_template(&offer);
+            assert_eq!(snapshot(&object), snapshot(&expected));
+        }
     }
 }

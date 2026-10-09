@@ -75,7 +75,11 @@ impl SHAMapNodeId {
             bytes[byte_index] |= (branch as u8) << 4;
         }
 
-        SHAMapNodeId::new(depth + 1, Uint256::from_array(bytes))
+        // A valid depth-d id with one more nibble set is valid at d + 1.
+        Ok(Self {
+            id: Uint256::from_array(bytes),
+            depth: (depth + 1) as u8,
+        })
     }
 
     pub fn create_id(depth: usize, key: Uint256) -> Result<Self, SHAMapNodeIdError> {
@@ -133,29 +137,61 @@ pub fn select_branch(id: SHAMapNodeId, hash: Uint256) -> usize {
     branch
 }
 
-fn depth_mask(depth: usize) -> Uint256 {
-    let mut bytes = [0u8; 32];
-    for nibble in 0..depth {
-        let byte_index = nibble / 2;
-        if nibble & 1 == 0 {
-            bytes[byte_index] |= 0xF0;
-        } else {
-            bytes[byte_index] |= 0x0F;
+/// `DEPTH_MASKS[d]` keeps the first `d` nibbles of a key. Built at compile
+/// time: node IDs are derived on every SHAMap descent, so recomputing the
+/// mask nibble-by-nibble per step showed up as the top frame of ledger reads.
+const DEPTH_MASKS: [[u8; 32]; SHAMAP_LEAF_DEPTH + 1] = {
+    let mut masks = [[0_u8; 32]; SHAMAP_LEAF_DEPTH + 1];
+    let mut depth = 0;
+    while depth <= SHAMAP_LEAF_DEPTH {
+        let mut nibble = 0;
+        while nibble < depth {
+            masks[depth][nibble / 2] |= if nibble & 1 == 0 { 0xF0 } else { 0x0F };
+            nibble += 1;
         }
+        depth += 1;
     }
-    Uint256::from_array(bytes)
+    masks
+};
+
+fn depth_mask(depth: usize) -> Uint256 {
+    Uint256::from_array(DEPTH_MASKS[depth])
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        SHAMAP_LEAF_DEPTH, SHAMapNodeId, SHAMapNodeIdError, depth_mask, deserialize_shamap_node_id,
-        select_branch,
+        DEPTH_MASKS, SHAMAP_LEAF_DEPTH, SHAMapNodeId, SHAMapNodeIdError, depth_mask,
+        deserialize_shamap_node_id, select_branch,
     };
     use basics::base_uint::Uint256;
 
     fn sample(fill: u8) -> Uint256 {
         Uint256::from_array([fill; 32])
+    }
+
+    #[test]
+    fn depth_mask_table_matches_nibble_loop() {
+        for depth in 0..=SHAMAP_LEAF_DEPTH {
+            let mut bytes = [0u8; 32];
+            for nibble in 0..depth {
+                bytes[nibble / 2] |= if nibble & 1 == 0 { 0xF0 } else { 0x0F };
+            }
+            assert_eq!(DEPTH_MASKS[depth], bytes, "depth {depth}");
+        }
+    }
+
+    #[test]
+    fn child_node_ids_match_validated_construction() {
+        let mut node = SHAMapNodeId::default();
+        for depth in 0..SHAMAP_LEAF_DEPTH {
+            let branch = (depth * 7) % 16;
+            let child = node.get_child_node_id(branch).unwrap();
+            let validated = SHAMapNodeId::new(child.get_depth(), child.get_node_id()).unwrap();
+            assert_eq!(child, validated);
+            assert_eq!(child.get_depth(), depth + 1);
+            node = child;
+        }
     }
 
     #[test]
