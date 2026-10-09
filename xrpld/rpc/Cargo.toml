@@ -10,6 +10,8 @@ name = "rpc"
 path = "src/lib.rs"
 
 [dependencies]
+# Same version/features as core and app (already in the lock file).
+rusqlite = { version = "0.31", features = ["bundled"] }
 tracing = "0.1"
 phf = { version = "0.11", features = ["macros"] }
 quaxar-metrics = { path = "../metrics" }

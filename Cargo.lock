@@ -2881,6 +2881,7 @@ dependencies = [
  "rand 0.8.5",
  "rayon",
  "resource",
+ "rusqlite",
  "rustls",
  "serde_json",
  "sha2",

@@ -1198,129 +1198,82 @@ impl<V: AppServerInfoView> AccountTxSource for ApplicationServerInfo<V> {
             };
 
             let fetch_limit = i64::from(query.limit.saturating_add(1));
-            let mut statement = connection
-                .prepare(sql)
-                .map_err(|_| Status::new(crate::status::RpcErrorCode::Internal))?;
-
             let account = protocol::to_base58(query.account);
-            match query.marker {
-                Some(marker) => {
-                    let rows = statement
-                        .query_map(
-                            (
-                                account.as_str(),
-                                i64::from(query.ledger_range.min),
-                                i64::from(query.ledger_range.max),
-                                fetch_limit,
-                                i64::from(marker.ledger),
-                                i64::from(marker.seq),
-                            ),
-                            |row| {
-                                Ok((
-                                    row.get::<_, u32>(0)?,
-                                    row.get::<_, u32>(1)?,
-                                    row.get::<_, String>(2)?,
-                                    row.get::<_, Vec<u8>>(3)?,
-                                    row.get::<_, Vec<u8>>(4)?,
-                                ))
-                            },
-                        )
-                        .map_err(|_| Status::new(crate::status::RpcErrorCode::Internal))?;
-
-                    for row in rows {
-                        let (ledger_seq, txn_seq, status, raw_txn, raw_meta) =
-                            row.map_err(|_| Status::new(crate::status::RpcErrorCode::Internal))?;
-
-                        let mut converted = Vec::new();
-                        app::convert_blobs_to_tx_result(
-                            &mut converted,
-                            ledger_seq,
-                            &status,
-                            &raw_txn,
-                            &raw_meta,
-                            self.view.network_id(),
-                        )
-                        .map_err(|_| Status::new(crate::status::RpcErrorCode::DbDeserialization))?;
-
-                        for entry in converted {
-                            page_rows.push((
-                                crate::state::TxRecord {
-                                    txn: std::sync::Arc::clone(
-                                        entry.transaction.get_s_transaction(),
-                                    ),
-                                    meta: Some(entry.meta),
-                                    ledger_index: ledger_seq,
-                                    close_time: find_close_time_by_seq(&self.view, ledger_seq),
-                                    ledger_hash: find_ledger_hash_by_seq(&self.view, ledger_seq),
-                                    validated: true,
-                                    txn_index: Some(txn_seq),
-                                    network_id: Some(self.view.network_id()),
-                                },
-                                AccountTxMarker {
-                                    ledger: ledger_seq,
-                                    seq: txn_seq,
-                                },
-                            ));
-                        }
-                    }
+            type RawRow = (u32, u32, String, Vec<u8>, Vec<u8>);
+            let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<RawRow> {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            };
+            // Hold the shared transaction-DB connection only while reading
+            // rows; decoding the transactions and metadata happens after it
+            // is released, so concurrent account_tx calls do not serialize
+            // on deserialization.
+            let raw_rows: Vec<RawRow> = {
+                let mut statement = connection
+                    .prepare(sql)
+                    .map_err(|_| Status::new(crate::status::RpcErrorCode::Internal))?;
+                let rows = match query.marker {
+                    Some(marker) => statement.query_map(
+                        (
+                            account.as_str(),
+                            i64::from(query.ledger_range.min),
+                            i64::from(query.ledger_range.max),
+                            fetch_limit,
+                            i64::from(marker.ledger),
+                            i64::from(marker.seq),
+                        ),
+                        map_row,
+                    ),
+                    None => statement.query_map(
+                        (
+                            account.as_str(),
+                            i64::from(query.ledger_range.min),
+                            i64::from(query.ledger_range.max),
+                            fetch_limit,
+                        ),
+                        map_row,
+                    ),
                 }
-                None => {
-                    let rows = statement
-                        .query_map(
-                            (
-                                account.as_str(),
-                                i64::from(query.ledger_range.min),
-                                i64::from(query.ledger_range.max),
-                                fetch_limit,
-                            ),
-                            |row| {
-                                Ok((
-                                    row.get::<_, u32>(0)?,
-                                    row.get::<_, u32>(1)?,
-                                    row.get::<_, String>(2)?,
-                                    row.get::<_, Vec<u8>>(3)?,
-                                    row.get::<_, Vec<u8>>(4)?,
-                                ))
-                            },
-                        )
-                        .map_err(|_| Status::new(crate::status::RpcErrorCode::Internal))?;
+                .map_err(|_| Status::new(crate::status::RpcErrorCode::Internal))?;
+                rows.collect::<rusqlite::Result<_>>()
+                    .map_err(|_| Status::new(crate::status::RpcErrorCode::Internal))?
+            };
+            drop(connection);
 
-                    for row in rows {
-                        let (ledger_seq, txn_seq, status, raw_txn, raw_meta) =
-                            row.map_err(|_| Status::new(crate::status::RpcErrorCode::Internal))?;
+            for (ledger_seq, txn_seq, status, raw_txn, raw_meta) in raw_rows {
+                let mut converted = Vec::new();
+                app::convert_blobs_to_tx_result(
+                    &mut converted,
+                    ledger_seq,
+                    &status,
+                    &raw_txn,
+                    &raw_meta,
+                    self.view.network_id(),
+                )
+                .map_err(|_| Status::new(crate::status::RpcErrorCode::DbDeserialization))?;
 
-                        let mut converted = Vec::new();
-                        app::convert_blobs_to_tx_result(
-                            &mut converted,
-                            ledger_seq,
-                            &status,
-                            &raw_txn,
-                            &raw_meta,
-                            self.view.network_id(),
-                        )
-                        .map_err(|_| Status::new(crate::status::RpcErrorCode::DbDeserialization))?;
-
-                        for entry in converted {
-                            page_rows.push((
-                                crate::state::TxRecord {
-                                    txn: std::sync::Arc::clone(
-                                        entry.transaction.get_s_transaction(),
-                                    ),
-                                    meta: Some(entry.meta),
-                                    ledger_index: ledger_seq,
-                                    close_time: find_close_time_by_seq(&self.view, ledger_seq),
-                                    ledger_hash: find_ledger_hash_by_seq(&self.view, ledger_seq),
-                                    validated: true,
-                                    txn_index: Some(txn_seq),
-                                    network_id: Some(self.view.network_id()),
-                                },
-                                AccountTxMarker {
-                                    ledger: ledger_seq,
-                                    seq: txn_seq,
-                                },
-                            ));
-                        }
-                    }
+                for entry in converted {
+                    page_rows.push((
+                        crate::state::TxRecord {
+                            txn: std::sync::Arc::clone(entry.transaction.get_s_transaction()),
+                            meta: Some(entry.meta),
+                            ledger_index: ledger_seq,
+                            close_time: find_close_time_by_seq(&self.view, ledger_seq),
+                            ledger_hash: find_ledger_hash_by_seq(&self.view, ledger_seq),
+                            validated: true,
+                            txn_index: Some(txn_seq),
+                            network_id: Some(self.view.network_id()),
+                        },
+                        AccountTxMarker {
+                            ledger: ledger_seq,
+                            seq: txn_seq,
+                        },
+                    ));
                 }
             }
         }
@@ -2401,17 +2354,37 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
             }
         };
 
+        // Quality directories are consecutive keys in [book_base, book_end):
+        // read them with forward walks of the state map (batched) instead of a
+        // successor search plus a lookup per directory.
+        let mut directories = std::collections::VecDeque::<STLedgerEntry>::new();
         while remaining > 0 {
-            let next = match ledger.succ(tip_index, Some(book_end)) {
-                Ok(Some(key)) => key,
-                _ => break,
+            if directories.is_empty() {
+                let want = usize::try_from(remaining).unwrap_or(1).clamp(1, 64);
+                match ledger.state_entries_after(tip_index, want) {
+                    Ok(batch) => directories.extend(batch),
+                    Err(_) => {
+                        // Unresolvable node: fall back to the per-step path.
+                        let Ok(Some(key)) = ledger.succ(tip_index, Some(book_end)) else {
+                            break;
+                        };
+                        let Ok(Some(sle)) =
+                            ledger.read(Keylet::new(LedgerEntryType::DirectoryNode, key))
+                        else {
+                            break;
+                        };
+                        directories.push_back(sle);
+                    }
+                }
+            }
+            let Some(dir_sle) = directories.pop_front() else {
+                break;
             };
-
-            let dir_keylet = Keylet::new(LedgerEntryType::DirectoryNode, next);
-            let dir_sle = match ledger.read(dir_keylet) {
-                Ok(Some(sle)) => sle,
-                _ => break,
-            };
+            let next = *dir_sle.key();
+            // Same stopping rules as succ(tip, book_end) + read(DirectoryNode).
+            if next >= book_end || dir_sle.get_type() != LedgerEntryType::DirectoryNode {
+                break;
+            }
 
             let indexes = dir_sle.get_field_v256(get_field_by_symbol("sfIndexes"));
             for &offer_index in indexes.value() {
@@ -2573,17 +2546,40 @@ impl<V: AppServerInfoView + Sync> crate::handlers::ledger_data::LedgerDataSource
         let mut remaining = remaining;
         let mut next_marker = None;
 
-        while let Some(next_key) = succ_lookup_ledger_key(&self.view, ledger, cursor, None) {
-            let Some(sle) =
-                read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key))
-            else {
-                // A successor returned by a complete ledger must be readable.
-                // Preserve the old tolerant behavior for a transient missing
-                // node, but never advance past it: otherwise a page could
-                // silently omit state.
-                break;
-            };
+        // Fast path: one forward walk of the closed/validated state map for
+        // the whole page (plus the look-ahead entry that sets the marker).
+        // Falls back to the per-entry successor/read loop for the open
+        // ledger, missing nodes, or anything the walk cannot resolve.
+        let page_batch = (!ledger.open)
+            .then(|| resolve_lookup_ledger(&self.view, ledger))
+            .flatten()
+            .and_then(|resolved| {
+                let want = usize::try_from(remaining.max(0)).unwrap_or(0) + 1;
+                let batch = resolved.state_entries_after(cursor, want).ok()?;
+                // A short batch is only trusted when it is the true end of the
+                // map; otherwise let the tolerant loop decide.
+                (batch.len() == want
+                    || resolved
+                        .succ(batch.last().map_or(cursor, |sle| *sle.key()), None)
+                        .ok()?
+                        .is_none())
+                .then_some(batch)
+            });
+        let mut page_batch = page_batch.map(Vec::into_iter);
+        let mut next_entry = |cursor: Uint256| -> Option<(Uint256, STLedgerEntry)> {
+            if let Some(batch) = page_batch.as_mut() {
+                return batch.next().map(|sle| (*sle.key(), sle));
+            }
+            let next_key = succ_lookup_ledger_key(&self.view, ledger, cursor, None)?;
+            // A successor returned by a complete ledger must be readable.
+            // Preserve the old tolerant behavior for a transient missing
+            // node, but never advance past it: otherwise a page could
+            // silently omit state.
+            let sle = read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key))?;
+            Some((next_key, sle))
+        };
 
+        while let Some((next_key, sle)) = next_entry(cursor) {
             if remaining <= 0 {
                 let mut resume_before = next_key;
                 resume_before.decrement();
