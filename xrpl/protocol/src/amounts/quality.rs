@@ -888,25 +888,15 @@ mod int64_wrap_parity_tests {
     /// which is TakerPays / round6(getRate) using this wrapped rate.
     #[test]
     fn get_rate_matches_rippled_int64_wrapped_canonicalization() {
-        let book = crate::Issue::new(
-            crate::currency_from_string("BKK"),
-            crate::AccountID::from_array([7; 20]),
-        );
+        let book = crate::Issue::new(crate::currency_from_string("BKK"), crate::AccountID::from_array([7; 20]));
         let gets = STAmount::new_with_asset(sf_generic(), book, 1_000_000_000_000_000, -15, false);
         let pays = STAmount::new_native(94_024_544_323_757_840, false);
         let rate = get_rate(&gets, &pays);
-        assert_eq!(
-            rate & !(255u64 << 56),
-            9_044_289_641_333_768,
-            "wrapped mantissa"
-        );
+        assert_eq!(rate & !(255u64 << 56), 9_044_289_641_333_768, "wrapped mantissa");
         assert_eq!(((rate >> 56) as i32) - 100, 1, "wrapped exponent");
 
         let rounded = Quality::from_value(rate).round(6);
         let taker_gets = divide(&pays, &amount_from_quality(rounded.value()), book);
-        assert_eq!(
-            (taker_gets.mantissa(), taker_gets.exponent()),
-            (1_039_601_166_302_251, -15)
-        );
+        assert_eq!((taker_gets.mantissa(), taker_gets.exponent()), (1_039_601_166_302_251, -15));
     }
 }
