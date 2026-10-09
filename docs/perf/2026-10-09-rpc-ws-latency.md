@@ -6,8 +6,9 @@ Branch `perf/rpc-ws-latency`. All numbers below were produced in containers
 ## Result
 
 On every measured method, transport and concurrency, this branch serves
-**1.85x to 275x the throughput of rippled 3.4.1**, with lower median and p99
-latency. Against `origin/main` it ranges from 0.97x (cheap `fee` calls at
+**1.85x to 275x the throughput of rippled 3.4.1**, with lower p99 latency
+everywhere and lower median latency everywhere except HTTP `fee` at 16
+connections (0.30 vs 0.27 ms p50, while serving 31x the requests). Against `origin/main` it ranges from 0.97x (cheap `fee` calls at
 16 connections, within the ~±10% run-to-run noise measured for small
 requests) to 14x. The largest
 gains are on the heavy, ledger-walking methods under concurrency
