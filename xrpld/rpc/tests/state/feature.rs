@@ -518,3 +518,37 @@ fn feature_lookup_by_hex_hash() {
     );
     assert_eq!(result.get("enabled"), Some(&JsonValue::Bool(true)));
 }
+
+#[test]
+fn feature_rejects_non_boolean_vetoed() {
+    // rippled #7583: a present `vetoed` that is not a JSON boolean is a
+    // parameter error, not silently coerced.
+    let source = FakeFeatureSource::default();
+    source.insert_feature(feature_id("BatchV1_1"), "BatchV1_1", false, false, true);
+
+    for bad in [
+        JsonValue::String("true".to_owned()),
+        JsonValue::Unsigned(1),
+        JsonValue::Signed(0),
+        JsonValue::Null,
+    ] {
+        let result = do_feature(
+            &FeatureRequest {
+                params: &object([
+                    ("feature", JsonValue::String("BatchV1_1".to_owned())),
+                    ("vetoed", bad.clone()),
+                ]),
+                role: RpcRole::Admin,
+            },
+            &source,
+        );
+        let JsonValue::Object(result) = result else {
+            panic!("result must be an object for {bad:?}");
+        };
+        assert_eq!(
+            result.get("error"),
+            Some(&JsonValue::String("invalidParams".to_owned())),
+            "non-boolean vetoed {bad:?} must be rejected"
+        );
+    }
+}

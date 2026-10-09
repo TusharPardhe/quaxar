@@ -45,6 +45,28 @@ fn parse_required_field(params: &JsonValue, field: &'static str) -> Result<Strin
     Ok(json_value_as_string(value))
 }
 
+/// rippled #7582: `channel_id` and `signature` must be JSON strings. A
+/// non-string type is a parameter error rather than being coerced to text and
+/// failing later as a malformed hex value.
+fn parse_required_string_field(
+    params: &JsonValue,
+    field: &'static str,
+) -> Result<String, JsonValue> {
+    let JsonValue::Object(object) = params else {
+        return Err(missing_field_error(field));
+    };
+
+    let Some(value) = object.get(field) else {
+        return Err(missing_field_error(field));
+    };
+
+    let JsonValue::String(text) = value else {
+        return Err(rpc_error(RpcErrorCode::InvalidParams));
+    };
+
+    Ok(text.clone())
+}
+
 fn parse_amount_field(params: &JsonValue) -> Result<u64, JsonValue> {
     let JsonValue::Object(object) = params else {
         return Err(rpc_error(RpcErrorCode::ChannelAmtMalformed));
@@ -71,11 +93,11 @@ pub fn do_channel_verify(params: &JsonValue) -> JsonValue {
         Ok(text) => text,
         Err(error) => return error,
     };
-    let channel_id_text = match parse_required_field(params, "channel_id") {
+    let channel_id_text = match parse_required_string_field(params, "channel_id") {
         Ok(text) => text,
         Err(error) => return error,
     };
-    let signature_text = match parse_required_field(params, "signature") {
+    let signature_text = match parse_required_string_field(params, "signature") {
         Ok(text) => text,
         Err(error) => return error,
     };

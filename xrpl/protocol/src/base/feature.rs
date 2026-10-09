@@ -146,7 +146,7 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     RegisteredFeature::new(
         "PermissionDelegationV1_1",
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("fixDirectoryLimit", true, RegisteredFeatureVote::DefaultNo),
