@@ -1,0 +1,69 @@
+# Matched standalone benchmark: rippled (prebuilt release image) vs quaxar
+# baseline (origin/main) vs quaxar (this branch). Servers run one at a time
+# with the same CPU/memory limits; the load generator is shared.
+# Driven by scripts/bench_matrix.sh.
+x-server: &server
+  cpus: 4
+  user: "0:0"
+  mem_limit: 4g
+  networks: [bench]
+
+services:
+  rippled:
+    <<: *server
+    image: rippleci/xrpld:3.4.1
+    platform: linux/amd64
+    entrypoint: ["/usr/bin/xrpld"]
+    command: ["-a", "--start", "--conf", "/etc/xrpld/xrpld.cfg"]
+    volumes:
+      - ./rippled.cfg:/etc/xrpld/xrpld.cfg:ro
+    tmpfs: [/var/lib/xrpld]
+
+  quaxar-base:
+    <<: *server
+    image: quaxar-bench:base
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/quaxar"]
+    command: ["--conf", "/etc/quaxar/quaxar.cfg", "-a", "--start"]
+    volumes:
+      - ./quaxar.cfg:/etc/quaxar/quaxar.cfg:ro
+    tmpfs: [/var/lib/quaxar]
+
+  quaxar-new:
+    <<: *server
+    image: quaxar-bench:new
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/quaxar"]
+    command: ["--conf", "/etc/quaxar/quaxar.cfg", "-a", "--start"]
+    volumes:
+      - ./quaxar.cfg:/etc/quaxar/quaxar.cfg:ro
+    tmpfs: [/var/lib/quaxar]
+
+  # Native (arm64) build of this branch from the dev target volume, with
+  # ptrace for stack sampling. Used for profiling, not the matched runs.
+  quaxar-native:
+    <<: *server
+    image: quaxar-dev:1.90
+    cap_add: [SYS_PTRACE]
+    entrypoint: ["/target/release/quaxar"]
+    command: ["--conf", "/etc/quaxar/quaxar.cfg", "-a", "--start"]
+    volumes:
+      - ./quaxar.cfg:/etc/quaxar/quaxar.cfg:ro
+      - quaxar-target-new:/target
+    tmpfs: [/var/lib/quaxar]
+
+  loadgen:
+    image: quaxar-dev:1.90
+    cpus: 4
+    networks: [bench]
+    volumes:
+      - ../..:/src
+      - quaxar-target-new:/target
+    entrypoint: ["sleep", "infinity"]
+
+networks:
+  bench: {}
+
+volumes:
+  quaxar-target-new:
+    external: true
