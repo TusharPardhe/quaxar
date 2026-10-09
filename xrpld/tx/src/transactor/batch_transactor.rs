@@ -45,10 +45,13 @@ where
     where
         InnerPreflight: FnMut(&InnerTx) -> NotTec,
     {
+        // Test/compat carrier: no rules context, so use the pre-amendment
+        // default (SAV/Lending inners disabled).
         validate_batch_preflight_structure(
             self.batch_flags,
             self.inner_transactions,
             preflight_inner_transaction,
+            false,
         )
     }
 }
