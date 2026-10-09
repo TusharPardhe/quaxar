@@ -404,6 +404,32 @@ impl Drop for InnerLock<'_> {
         self.0.children_lock.store(0, Ordering::Release);
     }
 }
+/// Bounded spinning, then yielding. RPC handlers can outnumber cores, and a
+/// pure spin while the holder is descheduled burns the waiter's whole time
+/// slice (observed as throughput collapsing under concurrent `ledger_data`).
+#[derive(Default)]
+struct SpinBackoff(u32);
+impl SpinBackoff {
+    #[inline]
+    fn wait(&mut self) {
+        if self.0 < 64 {
+            self.0 += 1;
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+/// One branch's bit of `children_lock` (rippled `PackedSpinlock` over
+/// `SHAMapInnerNode::lock_`): readers and canonicalizers of different
+/// branches of the same inner node no longer serialize, while the whole-node
+/// lock (all 16 bits) still excludes every branch lock.
+struct InnerBranchLock<'a>(&'a SHAMapInnerNode, u16);
+impl Drop for InnerBranchLock<'_> {
+    fn drop(&mut self) {
+        self.0.children_lock.fetch_and(!self.1, Ordering::Release);
+    }
+}
 // Leaf item synchronization must not consume a COW-ID bit: all `u32` COW
 // values, including the high bit, are public and valid. Address-striped locks
 // serialize leaf item access without adding a byte to the 56-byte leaf layout.
@@ -473,7 +499,10 @@ impl NodeStripedLock {
             {
                 return Self(lock);
             }
-            std::hint::spin_loop();
+            let mut backoff = SpinBackoff::default();
+            while lock.load(Ordering::Relaxed) {
+                backoff.wait();
+            }
         }
     }
 }
@@ -499,7 +528,25 @@ impl SHAMapInnerNode {
             {
                 return InnerLock(self);
             }
-            std::hint::spin_loop();
+            // Spin on loads, not writes, to limit cache-line traffic.
+            let mut backoff = SpinBackoff::default();
+            while self.children_lock.load(Ordering::Relaxed) != 0 {
+                backoff.wait();
+            }
+        }
+    }
+    /// Lock only `branch`. The branch-to-slot layout (`is_branch`) only
+    /// changes under the whole-node lock, so it is stable while held.
+    fn lock_branch(&self, branch: usize) -> InnerBranchLock<'_> {
+        let mask = 1_u16 << branch;
+        loop {
+            if self.children_lock.fetch_or(mask, Ordering::Acquire) & mask == 0 {
+                return InnerBranchLock(self, mask);
+            }
+            let mut backoff = SpinBackoff::default();
+            while self.children_lock.load(Ordering::Relaxed) & mask != 0 {
+                backoff.wait();
+            }
         }
     }
 }
@@ -715,7 +762,7 @@ impl SHAMapTreeNode {
             return SHAMapHash::default();
         }
         let i = self.inner();
-        let _l = i.lock();
+        let _l = i.lock_branch(branch);
         let b = i.is_branch.load(Ordering::Relaxed);
         i.tagged().get_hash(b, branch)
     }
@@ -766,7 +813,7 @@ impl SHAMapTreeNode {
             "owned inner nodes must have a non-zero cowid"
         );
         let i = self.inner();
-        let _l = i.lock();
+        let _l = i.lock_branch(branch);
         let b = i.is_branch.load(Ordering::Relaxed);
         let n = i
             .tagged()
@@ -780,7 +827,7 @@ impl SHAMapTreeNode {
             return None;
         }
         let i = self.inner();
-        let _l = i.lock();
+        let _l = i.lock_branch(branch);
         let b = i.is_branch.load(Ordering::Relaxed);
         i.tagged()
             .child_index(b, branch)
@@ -802,7 +849,7 @@ impl SHAMapTreeNode {
             return false;
         }
         let i = self.inner();
-        let _l = i.lock();
+        let _l = i.lock_branch(branch);
         let b = i.is_branch.load(Ordering::Relaxed);
         i.tagged()
             .child_index(b, branch)
@@ -832,7 +879,7 @@ impl SHAMapTreeNode {
             "canonicalized node hash must match the stored branch hash"
         );
         let i = self.inner();
-        let _l = i.lock();
+        let _l = i.lock_branch(branch);
         let b = i.is_branch.load(Ordering::Relaxed);
         let n = i
             .tagged()
@@ -844,6 +891,10 @@ impl SHAMapTreeNode {
             i.tagged().set_child_at_index(n, Some(node.clone()));
             node
         }
+    }
+    #[cfg(test)]
+    fn children_lock_bits(&self) -> u16 {
+        self.inner().children_lock.load(Ordering::Relaxed)
     }
     pub fn is_full_below(&self, generation: u32) -> bool {
         self.is_inner() && self.inner().full_below_gen.load(Ordering::Relaxed) == generation
@@ -1345,6 +1396,51 @@ mod tests {
 
     fn sample_uint256(fill: u8) -> Uint256 {
         Uint256::from_array([fill; 32])
+    }
+
+    #[test]
+    fn branch_locks_allow_concurrent_readers_and_exclude_whole_node_writers() {
+        // Inner node with all 16 branches populated, hash-only (as decoded
+        // from the wire), so canonicalize_child can race to hook children up.
+        let inner = SHAMapTreeNode::new_inner(1);
+        let leaves: Vec<_> = (0..BRANCH_FACTOR)
+            .map(|branch| {
+                let leaf = SHAMapTreeNode::new_leaf(
+                    SHAMapNodeType::AccountState,
+                    SHAMapItem::new(sample_uint256(branch as u8), vec![branch as u8; 40]),
+                    0,
+                );
+                inner.set_child_hash(branch, leaf.get_hash());
+                leaf
+            })
+            .collect();
+        let inner = std::sync::Arc::new(inner);
+        let leaves = std::sync::Arc::new(leaves);
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                let inner = std::sync::Arc::clone(&inner);
+                let leaves = std::sync::Arc::clone(&leaves);
+                thread::spawn(move || {
+                    for round in 0..20_000 {
+                        let branch = (worker * 7 + round) % BRANCH_FACTOR;
+                        let hooked = inner.canonicalize_child(branch, leaves[branch].clone());
+                        assert_eq!(hooked.get_hash(), leaves[branch].get_hash());
+                        let child = inner.get_child(branch).expect("hooked child");
+                        assert_eq!(child.get_hash(), leaves[branch].get_hash());
+                        assert!(inner.has_child(branch));
+                        assert_eq!(inner.get_child_hash(branch), leaves[branch].get_hash());
+                        if round % 997 == 0 {
+                            // Whole-node operation interleaved with branch locks.
+                            assert!(inner.has_any_loaded_child());
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("worker");
+        }
+        assert_eq!(inner.children_lock_bits(), 0, "every lock bit released");
     }
 
     fn sample_hash(fill: u8) -> SHAMapHash {
