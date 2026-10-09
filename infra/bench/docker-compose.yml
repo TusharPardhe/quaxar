@@ -11,12 +11,25 @@ x-server: &server
 services:
   rippled:
     <<: *server
-    image: rippleci/xrpld:3.4.1
+    image: rippleci/xrpld:3.4.0
     platform: linux/amd64
     entrypoint: ["/usr/bin/xrpld"]
     command: ["-a", "--start", "--conf", "/etc/xrpld/xrpld.cfg"]
     volumes:
       - ./rippled.cfg:/etc/xrpld/xrpld.cfg:ro
+    tmpfs: [/var/lib/xrpld]
+
+  # xrpld as a one-validator network (not standalone): standalone mode pins
+  # its JobQueue to 1 thread (Application.cpp, `config->standalone() &&
+  # !config->forceMultiThread`), so this is the multi-threaded configuration.
+  rippled-net:
+    <<: *server
+    image: rippleci/xrpld:3.4.0
+    platform: linux/amd64
+    entrypoint: ["/usr/bin/xrpld"]
+    command: ["--start", "--valid", "--quorum", "1", "--conf", "/etc/xrpld/xrpld.cfg"]
+    volumes:
+      - ./rippled-net.cfg:/etc/xrpld/xrpld.cfg:ro
     tmpfs: [/var/lib/xrpld]
 
   quaxar-base:

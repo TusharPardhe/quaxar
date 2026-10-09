@@ -361,6 +361,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 | [VALIDATORS.md](docs/VALIDATORS.md) | Validator identity, configuration, and operational guidance. |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout and runtime design. |
 | [RPC.md](docs/RPC.md) | Supported RPC methods and examples. |
+| [perf/BENCHMARKS.md](docs/perf/BENCHMARKS.md) | RPC/WebSocket benchmark against xrpld 3.4.0: conditions, results, reproduction. |
+| [perf/IMPROVEMENTS.md](docs/perf/IMPROVEMENTS.md) | Each RPC/WebSocket performance change, compared with the xrpld source. |
 
 ## Contributing
 

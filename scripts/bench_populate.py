@@ -2,7 +2,11 @@
 """Populate a standalone XRPL server with the benchmark ledger and record
 request bodies for the matched quaxar-vs-rippled benchmark.
 
-Usage: bench_populate.py <target-url> [<signer-url>]
+Usage: bench_populate.py <target-url> [<signer-url>] [--network]
+
+--network: the target is not standalone (no ledger_accept); each step waits
+until the target's validated ledger has advanced past the open ledger the
+step was submitted into.
 
 Transactions are signed offline by the signer (rippled) with sequence
 numbers read from the target, then submitted to the target with
@@ -42,13 +46,42 @@ def next_seq(url, account):
     return r["account_data"]["Sequence"]
 
 
-def populate(target, signer):
+FEE = "1000000"  # 1 XRP: above open-ledger fee escalation for 200 txs/ledger
+
+
+def make_closer(target, network):
+    import time
+
+    def close():
+        if not network:
+            rpc(target, "ledger_accept")
+            return
+        submitted_into = rpc(target, "ledger_current")["ledger_current_index"]
+        for _ in range(240):
+            info = rpc(target, "server_info")["info"]
+            if (info.get("validated_ledger") or {}).get("seq", 0) >= submitted_into:
+                return
+            time.sleep(0.5)
+        raise SystemExit("target did not validate a ledger in 120 s")
+
+    return close
+
+
+def populate(target, signer, network=False):
     """Build the benchmark ledger on `target`, signing offline on `signer`
     (rippled) with sequence numbers read from the target."""
     genesis, genesis_secret = wallet(signer, "masterpassphrase")
     gateway, gateway_secret = wallet(signer, "bench-gateway")
     holder, holder_secret = wallet(signer, "bench-holder")
     applied = []
+    close = make_closer(target, network)
+    if network:
+        import time
+        for _ in range(240):
+            info = rpc(target, "server_info")["info"]
+            if (info.get("validated_ledger") or {}).get("seq"):
+                break
+            time.sleep(0.5)
 
     def submit(secret, tx):
         blob = sign(signer, secret, tx)
@@ -60,44 +93,45 @@ def populate(target, signer):
     for dest in (gateway, holder):
         submit(genesis_secret, {
             "TransactionType": "Payment", "Account": genesis, "Destination": dest,
-            "Amount": "10000000000", "Fee": "10", "Sequence": seq})
+            "Amount": "10000000000", "Fee": FEE, "Sequence": seq})
         seq += 1
-    rpc(target, "ledger_accept")
+    close()
 
     hseq = next_seq(target, holder)
     submit(holder_secret, {
-        "TransactionType": "TrustSet", "Account": holder, "Fee": "10", "Sequence": hseq,
+        "TransactionType": "TrustSet", "Account": holder, "Fee": FEE, "Sequence": hseq,
         "LimitAmount": {"currency": "USD", "issuer": gateway, "value": "1000000"}})
     hseq += 1
-    rpc(target, "ledger_accept")
+    close()
     gseq = next_seq(target, gateway)
     submit(gateway_secret, {
-        "TransactionType": "Payment", "Account": gateway, "Destination": holder, "Fee": "10",
+        "TransactionType": "Payment", "Account": gateway, "Destination": holder, "Fee": FEE,
         "Sequence": gseq, "Amount": {"currency": "USD", "issuer": gateway, "value": "5000"}})
     gseq += 1
-    rpc(target, "ledger_accept")
+    close()
 
     sample = None
     for i in range(OFFERS):
         submit(gateway_secret, {
-            "TransactionType": "OfferCreate", "Account": gateway, "Fee": "10",
+            "TransactionType": "OfferCreate", "Account": gateway, "Fee": FEE,
             "Sequence": gseq,
             "TakerPays": str(1_000_000 + 1_000 * i),
             "TakerGets": {"currency": "USD", "issuer": gateway, "value": "1.234567890123456"}})
         gseq += 1
         sample = sample or applied[-1]
-        if (i + 1) % 8 == 0:
-            rpc(target, "ledger_accept")
-    rpc(target, "ledger_accept")
+        if (i + 1) % (20 if network else 8) == 0:
+            close()
+    close()
 
     submit(holder_secret, {
-        "TransactionType": "TicketCreate", "Account": holder, "Fee": "10",
+        "TransactionType": "TicketCreate", "Account": holder, "Fee": FEE,
         "Sequence": hseq, "TicketCount": TICKETS})
-    rpc(target, "ledger_accept")
-    rpc(target, "ledger_accept")
+    close()
+    close()
     print(json.dumps({"applied": len(applied), "gateway": gateway, "holder": holder,
                       "sample_tx": sample}))
 
 
 if __name__ == "__main__":
-    populate(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else sys.argv[1])
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    populate(args[0], args[1] if len(args) > 1 else args[0], "--network" in sys.argv)

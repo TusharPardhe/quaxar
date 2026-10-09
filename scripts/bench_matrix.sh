@@ -7,12 +7,13 @@
 # rippled) and driven by the same closed-loop client
 # (xrpld/server/examples/rpc_load.rs). Results: infra/bench/results.jsonl.
 #
-# Usage: scripts/bench_matrix.sh [servers...]   (default: all three)
+# Usage: scripts/bench_matrix.sh [servers...]
+#   (default: rippled rippled-net quaxar-new; also quaxar-base, quaxar-native)
 set -euo pipefail
 cd "$(dirname "$0")/../infra/bench"
 C="docker compose -f docker-compose.yml -p quaxar-bench"
 OUT=results.jsonl
-SERVERS=("${@:-rippled quaxar-base quaxar-new}")
+SERVERS=("${@:-rippled rippled-net quaxar-new}")
 read -r -a SERVERS <<<"${SERVERS[*]}"
 
 lg() { $C exec -T loadgen "$@"; }
@@ -39,7 +40,9 @@ for server in "${SERVERS[@]}"; do
     $C up -d "$server"
   fi
   wait_ready "$server"
-  state=$(lg python3 /src/scripts/bench_populate.py "http://$server:5005/" "http://rippled:5005/")
+  mode=""
+  [ "$server" = rippled-net ] && mode="--network"
+  state=$(lg python3 /src/scripts/bench_populate.py "http://$server:5005/" "http://rippled:5005/" $mode)
   gateway=$(jq -r .gateway <<<"$state")
   holder=$(jq -r .holder <<<"$state")
   sample=$(jq -r .sample_tx <<<"$state")
