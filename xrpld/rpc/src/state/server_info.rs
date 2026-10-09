@@ -59,7 +59,7 @@ fn json_value_as_bool(value: &JsonValue) -> bool {
         JsonValue::Signed(value) => *value != 0,
         JsonValue::Unsigned(value) => *value != 0,
         JsonValue::String(value) => !value.is_empty(),
-        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) => false,
+        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) | JsonValue::Raw(_) => false,
     }
 }
 

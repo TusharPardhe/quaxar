@@ -22,7 +22,9 @@ fn json_value_as_string(value: &JsonValue) -> String {
         JsonValue::Signed(value) => value.to_string(),
         JsonValue::Unsigned(value) => value.to_string(),
         JsonValue::Bool(value) => value.to_string(),
-        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) => String::new(),
+        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) | JsonValue::Raw(_) => {
+            String::new()
+        }
     }
 }
 

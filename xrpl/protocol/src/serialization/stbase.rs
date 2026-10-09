@@ -64,6 +64,91 @@ pub enum JsonValue {
     String(String),
     Array(Vec<JsonValue>),
     Object(BTreeMap<String, JsonValue>),
+    /// Already-serialized JSON text (one complete value), emitted verbatim.
+    /// Produced by the direct JSON writer (`json_writer`) so responses can
+    /// embed ledger objects without building a `JsonValue` tree for them.
+    /// Never produced by deserialization.
+    #[serde(skip_deserializing)]
+    Raw(RawJson),
+}
+
+/// A complete, valid JSON value in serialized form. Cheap to clone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawJson(std::sync::Arc<str>);
+
+impl RawJson {
+    /// Wrap `text`, which must be one complete, valid JSON value.
+    pub fn from_trusted(text: impl Into<std::sync::Arc<str>>) -> Self {
+        Self(text.into())
+    }
+
+    /// Wrap UTF-8 JSON bytes produced by a trusted writer.
+    pub fn from_trusted_bytes(bytes: Vec<u8>) -> Self {
+        Self(
+            String::from_utf8(bytes)
+                .expect("JSON writer produces UTF-8")
+                .into(),
+        )
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Materialize as a `JsonValue` tree (slow path, for code that needs to
+    /// inspect the value).
+    pub fn to_tree(&self) -> JsonValue {
+        let value: serde_json::Value =
+            serde_json::from_str(&self.0).expect("RawJson holds valid JSON");
+        json_from_serde_exact(value)
+    }
+}
+
+/// `serde_json::Value` -> `JsonValue` with the same number mapping the RPC
+/// transport uses (non-integers become strings).
+fn json_from_serde_exact(value: serde_json::Value) -> JsonValue {
+    match value {
+        serde_json::Value::Null => JsonValue::Null,
+        serde_json::Value::Bool(b) => JsonValue::Bool(b),
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                JsonValue::Unsigned(u)
+            } else if let Some(i) = n.as_i64() {
+                JsonValue::Signed(i)
+            } else {
+                JsonValue::String(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => JsonValue::String(s),
+        serde_json::Value::Array(a) => {
+            JsonValue::Array(a.into_iter().map(json_from_serde_exact).collect())
+        }
+        serde_json::Value::Object(o) => JsonValue::Object(
+            o.into_iter()
+                .map(|(k, v)| (k, json_from_serde_exact(v)))
+                .collect(),
+        ),
+    }
+}
+
+impl Serialize for RawJson {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // sonic-rs writes a value serialized as its LazyValue token struct
+        // verbatim (sonic-rs `lazyvalue/ser.rs`). Any other serializer gets
+        // the equivalent parsed value, so output is correct everywhere and
+        // zero-copy on the sonic-rs response path.
+        if std::any::type_name::<S>().starts_with("&mut sonic_rs::") {
+            use serde::ser::SerializeStruct;
+            const TOKEN: &str = "$sonic_rs::LazyValue";
+            let mut raw = serializer.serialize_struct(TOKEN, 1)?;
+            raw.serialize_field(TOKEN, &*self.0)?;
+            raw.end()
+        } else {
+            let value: serde_json::Value =
+                serde_json::from_str(&self.0).map_err(serde::ser::Error::custom)?;
+            value.serialize(serializer)
+        }
+    }
 }
 
 impl JsonValue {

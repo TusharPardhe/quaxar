@@ -118,6 +118,7 @@ fn transactions_requested(params: &JsonValue, api_version: u32) -> Result<bool, 
         JsonValue::Null => false,
         JsonValue::Array(values) => !values.is_empty(),
         JsonValue::Object(values) => !values.is_empty(),
+        JsonValue::Raw(raw) => !matches!(raw.as_str(), "{}" | "[]"),
     })
 }
 

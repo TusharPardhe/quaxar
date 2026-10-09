@@ -199,6 +199,7 @@ pub fn get_global_page_cache() -> &'static LedgerDataPageCacheStore {
 /// Convert protocol::JsonValue to serde_json::Value
 fn from_protocol_json(value: &JsonValue) -> serde_json::Value {
     match value {
+        JsonValue::Raw(raw) => serde_json::from_str(raw.as_str()).expect("RawJson is valid JSON"),
         JsonValue::Null => serde_json::Value::Null,
         JsonValue::Bool(value) => serde_json::Value::Bool(*value),
         JsonValue::Signed(value) => serde_json::Value::Number((*value).into()),

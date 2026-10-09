@@ -97,7 +97,7 @@ fn destination_string(params: &JsonValue) -> Option<String> {
         JsonValue::Bool(flag) => Some(flag.to_string()),
         JsonValue::Signed(value) => Some(value.to_string()),
         JsonValue::Unsigned(value) => Some(value.to_string()),
-        JsonValue::Array(_) | JsonValue::Object(_) => Some(String::new()),
+        JsonValue::Array(_) | JsonValue::Object(_) | JsonValue::Raw(_) => Some(String::new()),
     }
 }
 
