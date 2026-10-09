@@ -490,14 +490,57 @@ fn do_direct_mpt_payment<V: ledger::ApplyView>(
     }
 
     let mut amount_deliver = dst_amount.clone();
-    let mut required_max_source_amount = multiply_rate(dst_amount, rate);
-    if partial_payment_allowed && required_max_source_amount > *max_source_amount {
-        required_max_source_amount = max_source_amount.clone();
-        amount_deliver = divide_rate(max_source_amount, rate);
+    let exceeds_send_max;
+    if view.rules().enabled(&protocol::feature_id("fixCleanup3_5_0")) {
+        // rippled #8302: the legacy multiply()/divide() can overflow on large
+        // MPT amounts, and Number rounding can charge more than SendMax. MPTs
+        // are integral, so use exact integer arithmetic: the cost is rounded
+        // up (matching the transfer fee accountSend charges), and an overflow
+        // means the cost exceeds any SendMax.
+        let required = protocol::mpt_amount::mul_ratio(
+            dst_amount.mpt(),
+            rate.value,
+            protocol::QUALITY_ONE,
+            true,
+        );
+        let over = match &required {
+            Ok(required) => max_source_amount.mpt() < *required,
+            Err(_) => true,
+        };
+        if partial_payment_allowed && over {
+            // Round the delivered amount down so the sender is never charged
+            // more than SendMax.
+            let delivered = match protocol::mpt_amount::mul_ratio(
+                max_source_amount.mpt(),
+                protocol::QUALITY_ONE,
+                rate.value,
+                false,
+            ) {
+                Ok(delivered) => delivered,
+                Err(_) => return Ter::TEC_PATH_PARTIAL,
+            };
+            amount_deliver = protocol::STAmount::from_mpt_amount(
+                get_field_by_symbol("sfAmount"),
+                delivered,
+                mpt_issue,
+            );
+            if amount_deliver.signum() <= 0 {
+                return Ter::TEC_PATH_PARTIAL;
+            }
+            exceeds_send_max = false;
+        } else {
+            exceeds_send_max = over;
+        }
+    } else {
+        // Legacy path: factor in the transfer rate with no rounding.
+        let mut required_max_source_amount = multiply_rate(dst_amount, rate);
+        if partial_payment_allowed && required_max_source_amount > *max_source_amount {
+            required_max_source_amount = max_source_amount.clone();
+            amount_deliver = divide_rate(max_source_amount, rate);
+        }
+        exceeds_send_max = required_max_source_amount > *max_source_amount;
     }
-    if required_max_source_amount > *max_source_amount
-        || deliver_min.is_some_and(|deliver_min| amount_deliver < *deliver_min)
-    {
+    if exceeds_send_max || deliver_min.is_some_and(|deliver_min| amount_deliver < *deliver_min) {
         return Ter::TEC_PATH_PARTIAL;
     }
 
