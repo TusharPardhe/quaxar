@@ -31,6 +31,10 @@ pub(super) struct MptIssuanceLifecycle {
     tokens_created: u32,
     tokens_deleted: u32,
     token_created_by_issuer: bool,
+    /// rippled #8152: issuance flags cleared by a modification, excluding the
+    /// legally clearable lsfMPTLocked. Any nonzero value is an invariant
+    /// violation under fixCleanup3_5_0.
+    issuance_flags_cleared: u32,
 }
 
 #[derive(Default)]
@@ -488,9 +492,16 @@ pub(super) fn record_mpt_issuance_lifecycle<V: ApplyView + ?Sized>(
             lifecycle.reference_holding_set_on_create |= fix_cleanup_3_2_0
                 && after.is_field_present(sf("sfReferenceHolding"))
                 && txn_type != protocol::TxType::VAULT_CREATE;
-        } else if fix_cleanup_3_2_0 && let Some(before) = before {
-            lifecycle.reference_holding_mutated |=
-                !same_optional_h256(before, after, sf("sfReferenceHolding"));
+        } else if let Some(before) = before {
+            // rippled #8152: lsfMPTLocked is the only issuance flag with a
+            // legal clear path (tfMPTUnlock); every other flag is fixed at
+            // creation or set-once. Accumulate any other cleared flag.
+            lifecycle.issuance_flags_cleared |=
+                before.get_flags() & !after.get_flags() & !protocol::MPT_LOCKED_LEDGER_FLAG;
+            if fix_cleanup_3_2_0 {
+                lifecycle.reference_holding_mutated |=
+                    !same_optional_h256(before, after, sf("sfReferenceHolding"));
+            }
         }
     }
 
@@ -541,7 +552,15 @@ pub(super) fn is_vault_pseudo_account<V: ApplyView + ?Sized>(
         .is_some_and(|sle| sle.is_field_present(sf("sfVaultID"))))
 }
 
-pub(super) fn validates_mpt_issuance_lifecycle(lifecycle: &MptIssuanceLifecycle) -> bool {
+pub(super) fn validates_mpt_issuance_lifecycle(
+    lifecycle: &MptIssuanceLifecycle,
+    fix_cleanup_3_5_0: bool,
+) -> bool {
+    // rippled #8152: post-fixCleanup3_5_0, clearing any issuance flag other
+    // than lsfMPTLocked is an invariant violation.
+    if fix_cleanup_3_5_0 && lifecycle.issuance_flags_cleared != 0 {
+        return false;
+    }
     !lifecycle.reference_holding_set_on_create
         && !lifecycle.reference_holding_mutated
         && !lifecycle.vault_holding_deleted
@@ -741,7 +760,9 @@ pub(super) fn validates_mpt_lifecycle_counts(
 
 #[cfg(test)]
 mod tests {
-    use super::{MptIssuanceLifecycle, validates_mpt_lifecycle_counts};
+    use super::{
+        MptIssuanceLifecycle, validates_mpt_issuance_lifecycle, validates_mpt_lifecycle_counts,
+    };
     use protocol::{Ter, TxType};
 
     fn lifecycle(tokens_created: u32, tokens_deleted: u32) -> MptIssuanceLifecycle {
@@ -750,6 +771,27 @@ mod tests {
             tokens_deleted,
             ..MptIssuanceLifecycle::default()
         }
+    }
+
+    #[test]
+    fn issuance_flag_clear_rejected_only_under_cleanup_3_5_0() {
+        // rippled #8152: clearing a non-lock issuance flag fails post-3.5.0.
+        let cleared = MptIssuanceLifecycle {
+            issuance_flags_cleared: 0x0000_0002, // not lsfMPTLocked (0x1)
+            ..MptIssuanceLifecycle::default()
+        };
+        assert!(
+            validates_mpt_issuance_lifecycle(&cleared, false),
+            "pre-3.5.0 the cleared flag is tolerated"
+        );
+        assert!(
+            !validates_mpt_issuance_lifecycle(&cleared, true),
+            "post-3.5.0 a cleared non-lock issuance flag is an invariant failure"
+        );
+
+        // Clearing only lsfMPTLocked is always allowed (it is masked out).
+        let clean = MptIssuanceLifecycle::default();
+        assert!(validates_mpt_issuance_lifecycle(&clean, true));
     }
 
     #[test]

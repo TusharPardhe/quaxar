@@ -1153,7 +1153,10 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         return Err(());
     }
 
-    if !validates_mpt_issuance_lifecycle(&mpt_issuance_lifecycle) {
+    let fix_cleanup_3_5_0 = sandbox
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_5_0"));
+    if !validates_mpt_issuance_lifecycle(&mpt_issuance_lifecycle, fix_cleanup_3_5_0) {
         return Err(());
     }
     if !validates_mpt_lifecycle_counts(
