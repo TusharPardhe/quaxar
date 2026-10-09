@@ -24,7 +24,11 @@ fn bench<T>(label: &str, iters: u32, mut op: impl FnMut() -> T) -> f64 {
 fn main() {
     let owner = AccountID::from_array([7; 20]);
     let issuer = AccountID::from_array([9; 20]);
-    let key = offer_keylet(basics::base_uint::Uint160::from_slice(owner.data()).unwrap(), 42).key;
+    let key = offer_keylet(
+        basics::base_uint::Uint160::from_slice(owner.data()).unwrap(),
+        42,
+    )
+    .key;
     let mut offer = STLedgerEntry::from_type_and_key(LedgerEntryType::Offer, key);
     offer.set_account_id(f("sfAccount"), owner);
     offer.set_field_u32(f("sfSequence"), 42);
@@ -47,7 +51,11 @@ fn main() {
     offer.set_field_u32(f("sfPreviousTxnLgrSeq"), 21_305_409);
     let bytes = offer.get_serializer().data().to_vec();
     let json = offer.json(JsonOptions::NONE);
-    println!("Offer SLE: {} binary bytes, {} JSON bytes\n", bytes.len(), sonic_rs::to_string(&json).unwrap().len());
+    println!(
+        "Offer SLE: {} binary bytes, {} JSON bytes\n",
+        bytes.len(),
+        sonic_rs::to_string(&json).unwrap().len()
+    );
 
     let n = 200_000;
     if std::env::args().nth(1).as_deref() == Some("tree") {
@@ -60,10 +68,16 @@ fn main() {
     let decode = bench("1 decode bytes -> STLedgerEntry", n, || {
         STLedgerEntry::from_serial_iter(&mut SerialIter::new(&bytes), key)
     });
-    let to_tree = bench("2 STLedgerEntry -> JsonValue tree", n, || offer.json(JsonOptions::NONE));
-    let ser = bench("3 serialize tree -> JSON bytes", n, || sonic_rs::to_vec(&json).unwrap());
+    let to_tree = bench("2 STLedgerEntry -> JsonValue tree", n, || {
+        offer.json(JsonOptions::NONE)
+    });
+    let ser = bench("3 serialize tree -> JSON bytes", n, || {
+        sonic_rs::to_vec(&json).unwrap()
+    });
     let drop_tree = bench("4 clone+drop tree (alloc/free proxy)", n, || json.clone());
-    let b58 = bench("  of which: one AccountID -> base58", n, || protocol::to_base58(owner));
+    let b58 = bench("  of which: one AccountID -> base58", n, || {
+        protocol::to_base58(owner)
+    });
     let hex = bench("  of which: one 32-byte hash -> hex", n, || {
         let mut s = String::with_capacity(64);
         for b in key.data() {
@@ -75,8 +89,12 @@ fn main() {
     let total = decode + to_tree + ser;
     let iou = offer.get_field_amount(f("sfTakerPays"));
     let xrp = offer.get_field_amount(f("sfTakerGets"));
-    let iou_ns = bench("  of which: IOU STAmount -> json", n, || iou.json(JsonOptions::NONE));
-    let xrp_ns = bench("  of which: XRP STAmount -> json", n, || xrp.json(JsonOptions::NONE));
+    let iou_ns = bench("  of which: IOU STAmount -> json", n, || {
+        iou.json(JsonOptions::NONE)
+    });
+    let xrp_ns = bench("  of which: XRP STAmount -> json", n, || {
+        xrp.json(JsonOptions::NONE)
+    });
     println!("  amounts share ~{:.0}%", 100.0 * (iou_ns + xrp_ns) / total);
     println!(
         "\nper-entry pipeline (1+2+3): {total:.0} ns; tree build+serialize share {:.0}%; base58 x2 accounts ~{:.0}% ; hex x3 ~{:.0}%; drop proxy {drop_tree:.0} ns",
