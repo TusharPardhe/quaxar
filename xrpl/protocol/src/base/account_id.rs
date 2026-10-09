@@ -23,13 +23,7 @@ pub fn calc_account_id(public_key: &[u8]) -> AccountID {
 }
 
 pub fn to_base58(account_id: AccountID) -> String {
-    let mut payload = Vec::with_capacity(1 + AccountID::size() + 4);
-    payload.push(ACCOUNT_ID_TOKEN_TYPE);
-    payload.extend_from_slice(account_id.data());
-    payload.extend_from_slice(&checksum(&payload));
-    bs58::encode(payload)
-        .with_alphabet(xrpl_base58_alphabet())
-        .into_string()
+    crate::base::b58_fast::encode_token(ACCOUNT_ID_TOKEN_TYPE, account_id.data())
 }
 
 pub fn parse_base58_account_id(value: &str) -> Option<AccountID> {

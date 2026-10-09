@@ -1,4 +1,5 @@
 pub mod account_id;
+pub mod b58_fast;
 pub mod api_version;
 pub mod apply_flags;
 pub mod build_info;

@@ -102,13 +102,7 @@ pub fn parse_base58_with_type<T: TypedBase58Token>(
 }
 
 pub fn encode_base58_token(token_type: TokenType, token: &[u8]) -> String {
-    let mut payload = Vec::with_capacity(1 + token.len() + 4);
-    payload.push(token_type as u8);
-    payload.extend_from_slice(token);
-    payload.extend_from_slice(&checksum(&payload));
-    bs58::encode(payload)
-        .with_alphabet(xrpl_base58_alphabet())
-        .into_string()
+    crate::base::b58_fast::encode_token(token_type as u8, token)
 }
 
 pub fn decode_base58_token(value: &str, token_type: TokenType) -> Option<Vec<u8>> {

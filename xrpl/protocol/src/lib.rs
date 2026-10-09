@@ -31,6 +31,7 @@ pub use amounts::xrp_amount;
 pub use base::account_id;
 pub use base::api_version;
 pub use base::apply_flags;
+pub use base::b58_fast;
 pub use base::build_info;
 pub use base::concepts;
 pub use base::confidential_transfer;

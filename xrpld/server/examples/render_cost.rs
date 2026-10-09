@@ -79,6 +79,22 @@ fn main() {
         protocol::to_base58(owner)
     });
     let hex = bench("  of which: one 32-byte hash -> hex", n, || key.to_string());
+    let payload: Vec<u8> = (0..25_u8)
+        .map(|i| i.wrapping_mul(97).wrapping_add(3))
+        .collect();
+    let alphabet = bs58::Alphabet::new(protocol::b58_fast::ALPHABET).unwrap();
+    bench("  base58 encode only, bs58 crate (25 B)", n, || {
+        bs58::encode(&payload)
+            .with_alphabet(&alphabet)
+            .into_string()
+    });
+    bench("  base58 encode only, b58_fast (25 B)", n, || {
+        protocol::b58_fast::encode(&payload)
+    });
+    bench("  double SHA-256 checksum (21 B)", n, || {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(Sha256::digest(&payload[..21]))
+    });
     let total = decode + to_tree + ser;
     let iou = offer.get_field_amount(f("sfTakerPays"));
     let xrp = offer.get_field_amount(f("sfTakerGets"));
