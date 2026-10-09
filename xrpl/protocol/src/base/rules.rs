@@ -10,7 +10,8 @@ use basics::unordered_containers::{HardenedHashSet, HashSet};
 use std::sync::OnceLock;
 
 use crate::{
-    feature_lending_protocol, feature_single_asset_vault, fix_cleanup_3_2_0, fix_cleanup_3_3_0,
+    feature_id, feature_lending_protocol, feature_single_asset_vault, fix_cleanup_3_2_0,
+    fix_cleanup_3_3_0,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -71,7 +72,10 @@ pub fn set_current_transaction_rules(rules: Option<Rules>) {
         None => MantissaScale::Large,
         Some(rules) => {
             let enable_vault_numbers = rules.enabled(&feature_single_asset_vault())
-                || rules.enabled(&feature_lending_protocol());
+                || rules.enabled(&feature_lending_protocol())
+                // rippled #8330: MPTokensV2 also needs the large Number
+                // mantissa. Keep this in sync with the rules-guard predicate.
+                || rules.enabled(&feature_id("MPTokensV2"));
             match (
                 enable_vault_numbers,
                 rules.enabled(&fix_cleanup_3_2_0()),
