@@ -40,5 +40,7 @@ dashmap = "6.2.1"
 
 [dev-dependencies]
 ledger = { path = "../ledger" }
+# Already in Cargo.lock via axum's ws feature; used by examples/rpc_latency.rs.
+tokio-tungstenite = "=0.28.0"
 serde_json = "1"
 tx = { path = "../tx" }

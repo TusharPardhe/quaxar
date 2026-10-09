@@ -3182,6 +3182,7 @@ dependencies = [
  "sonic-rs",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "tokio-util",
  "tower",
  "tracing",

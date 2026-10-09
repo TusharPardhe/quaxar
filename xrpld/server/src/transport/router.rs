@@ -7,31 +7,44 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Once};
 
 use axum::Router;
-use axum::body::Body;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Json, State};
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::{SinkExt, StreamExt};
 use protocol::JsonValue;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use serde::Deserialize;
 use serde_json::Value;
-// sonic-rs provides SIMD-accelerated JSON serialization for outbound
-// RPC responses (3-10x faster than serde_json on large payloads).
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::auth::{ServerAuth, ServerAuthConfig, authorized_http, forwarded_for, request_role};
-use crate::json::{from_protocol_json, to_protocol_json};
-use crate::session::{RequestMetadata, Session, WSSession};
+use crate::json::{Envelope, EnvelopeField, RawRequest, from_protocol_json, result_reports_error};
+use crate::session::{RequestMetadata, WSSession};
 use crate::status::{ServerStatusSource, invalid_protocol_response, status_page_response};
 use crate::subscriptions::SubscriptionManager;
 use crate::transport::{RpcDispatcher, RpcReply, RpcRequest};
 use rpc::RpcRole;
+
+/// Methods whose handlers are constant-time and touch no ledger state, so
+/// they are dispatched on the async worker instead of the blocking pool.
+const INLINE_METHODS: &[&str] = &["ping", "random"];
+
+/// Per-connection outbound WebSocket queue (frames). RPC replies and
+/// subscription forwarders wait for capacity; bursts are absorbed by the
+/// shared per-stream broadcast ring (`DEFAULT_STREAM_CAPACITY`). A client
+/// that falls a whole ring behind, or overflows a non-waiting `send_text`, is
+/// closed with rippled's policy_error "Policy error: client is too slow."
+/// (`BaseWSPeer::send`) instead of silently losing messages. rippled's
+/// per-port `send_queue_limit` (default 100) is not yet plumbed through
+/// `ServerPortSetup`; this matches its default.
+pub const WS_SEND_QUEUE_LIMIT: usize = 100;
+
+/// Upper bound on frames written per flush by the WebSocket writer.
+const WS_MAX_FRAMES_PER_FLUSH: usize = 64;
 
 #[derive(Clone)]
 pub struct RpcServerConfig {
@@ -381,7 +394,7 @@ where
         method: String,
         params: JsonValue,
         metadata: RequestMetadata,
-    ) -> RpcReply {
+    ) -> (RpcReply, JsonValue) {
         // Do not share replies between identical requests. Some RPCs are
         // intentionally non-deterministic (for example, parameterless
         // wallet_propose), and others mutate server state. rippled dispatches
@@ -409,7 +422,7 @@ where
                     rpc::RpcErrorCode::TooBusy,
                     "Server is too busy. Try again later.",
                 );
-                return reply;
+                return (reply, params);
             }
         }
 
@@ -419,22 +432,36 @@ where
             _ => self.state.p1_pool.acquire().await.unwrap(),
         };
 
-        let dispatcher = self.dispatcher.clone();
-        let method_owned = method.clone();
-        let reply = tokio::task::spawn_blocking(move || {
-            dispatcher.dispatch(RpcRequest {
-                method: &method_owned,
+        // Constant-time handlers with no ledger, NodeStore, or lock-heavy
+        // work run inline: the blocking-pool hand-off (two thread wake-ups)
+        // would otherwise dominate their latency.
+        if INLINE_METHODS.contains(&method.as_str()) {
+            let reply = self.dispatcher.dispatch(RpcRequest {
+                method: &method,
                 params: &params,
                 metadata: &metadata,
                 session: None,
-            })
+            });
+            drop(permit);
+            return (reply, params);
+        }
+
+        let dispatcher = self.dispatcher.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let reply = dispatcher.dispatch(RpcRequest {
+                method: &method,
+                params: &params,
+                metadata: &metadata,
+                session: None,
+            });
+            (reply, params)
         })
         .await
         .expect("dispatcher::dispatch panicked");
 
         drop(permit);
 
-        reply
+        result
     }
 
     pub fn router(self) -> Router {
@@ -448,8 +475,11 @@ where
     }
 
     pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
+        use axum::serve::ListenerExt;
         axum::serve(
-            listener,
+            listener.tap_io(|stream| {
+                let _ = stream.set_nodelay(true);
+            }),
             self.router()
                 .into_make_service_with_connect_info::<SocketAddr>(),
         )
@@ -464,11 +494,11 @@ where
     ) -> Response {
         tracing::debug!(target: "server", client_ip = %remote_addr.ip(), "HTTP POST request");
         // axum's Json extractor rejects with 415 if Content-Type is missing.
-        // Parse the body manually to match reference behavior.
-        // Use serde_json for inbound parsing (preserves key ordering, small
-        // payloads). sonic-rs is used for outbound serialization where the
-        // large response payloads benefit from SIMD acceleration.
-        let payload: Value = match serde_json::from_slice(&body) {
+        // Parse the body manually to match reference behavior. The request is
+        // parsed once, straight into the protocol representation (SIMD
+        // parser, no intermediate serde_json tree). Object key order is not
+        // observable downstream: both representations are sorted maps.
+        let payload = match RawRequest::parse(&body) {
             Ok(v) => v,
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         };
@@ -491,32 +521,30 @@ where
             .map(|h| format!("\"{}\"", h));
         let mut etag_val = None;
 
-        let mut request = Request::new(Body::from(Vec::<u8>::new()));
-        *request.headers_mut() = headers.clone();
-        let mut metadata = RequestMetadata::new(remote_addr, &request);
-        metadata.local_addr = server
+        let mut request_metadata = RequestMetadata::from_headers(remote_addr, &headers);
+        request_metadata.local_addr = server
             .config
             .port_policy
             .as_ref()
             .map(|policy| policy.socket_addr);
-        metadata.forwarded_for = forwarded_for(&headers).unwrap_or_default();
-        metadata.user = headers
+        request_metadata.forwarded_for = forwarded_for(&headers).unwrap_or_default();
+        request_metadata.user = headers
             .get("x-user")
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_owned();
-        let request = Session::new(request, metadata);
-        let rpc_request = match JsonRpcEnvelope::try_from(payload) {
+        let mut rpc_request = match JsonRpcEnvelope::try_from(payload) {
             Ok(value) => value,
             Err(response) => return response.into_response(),
         };
 
-        let params = normalize_rpc_params(to_protocol_json(
+        let params = normalize_rpc_params(
             rpc_request
                 .params
-                .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
-        ));
-        let mut metadata = request.metadata().clone();
+                .take()
+                .unwrap_or_else(|| JsonValue::Object(BTreeMap::new())),
+        );
+        let mut metadata = request_metadata;
         metadata.api_version = Self::api_version_from_params(&params);
         metadata.role = request_role(
             RpcRole::User,
@@ -560,11 +588,8 @@ where
             }
         }
 
-        let method_owned = rpc_request.method.clone();
-        let params_owned = params.clone();
-        let metadata_owned = metadata.clone();
-        let reply = server
-            .dispatch_async(method_owned, params_owned, metadata_owned)
+        let (reply, params) = server
+            .dispatch_async(rpc_request.method.clone(), params, metadata)
             .await;
         let body = match reply {
             RpcReply::PreRendered(bytes) => {
@@ -589,6 +614,27 @@ where
                 out.extend_from_slice(&bytes);
                 out.extend_from_slice(b"}");
                 out
+            }
+            RpcReply::Result(result) if !result_reports_error(&result) => {
+                // Success fast path: serialize the protocol result in place
+                // inside the envelope. Byte-identical to json_rpc_response +
+                // sonic_rs::to_vec, without rebuilding a serde_json tree.
+                let mut envelope = Envelope::with_capacity(3);
+                if let Some(ver) = rpc_request.jsonrpc.as_deref() {
+                    envelope.insert("jsonrpc", EnvelopeField::Str(ver));
+                    envelope.insert(
+                        "id",
+                        rpc_request
+                            .id
+                            .as_ref()
+                            .map_or(EnvelopeField::Null, EnvelopeField::Json),
+                    );
+                }
+                envelope.insert("result", EnvelopeField::ProtoWithDefaultStatus(&result));
+                match sonic_rs::to_vec(&envelope) {
+                    Ok(b) => b,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
             }
             _ => {
                 let mut response =
@@ -617,8 +663,6 @@ where
                         echo
                     });
                 }
-                // Use sonic-rs (SIMD-accelerated) for output serialization instead of
-                // axum's default serde_json path for a 3-10x throughput improvement.
                 match sonic_rs::to_vec(&response) {
                     Ok(b) => b,
                     Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -689,9 +733,7 @@ where
                 .into_response();
         }
 
-        let mut base_request = Request::new(Body::from(Vec::<u8>::new()));
-        *base_request.headers_mut() = headers.clone();
-        let mut metadata = RequestMetadata::new(remote_addr, &base_request);
+        let mut metadata = RequestMetadata::from_headers(remote_addr, &headers);
         metadata.local_addr = server
             .config
             .port_policy
@@ -706,7 +748,7 @@ where
 
         let mut responses = Vec::with_capacity(requests.len());
         for payload in requests {
-            let rpc_request = match JsonRpcEnvelope::try_from(payload) {
+            let mut rpc_request = match JsonRpcEnvelope::try_from(RawRequest::from_value(payload)) {
                 Ok(value) => value,
                 Err(_) => {
                     responses.push(Value::Null);
@@ -714,11 +756,12 @@ where
                 }
             };
 
-            let params = normalize_rpc_params(to_protocol_json(
+            let params = normalize_rpc_params(
                 rpc_request
                     .params
-                    .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
-            ));
+                    .take()
+                    .unwrap_or_else(|| JsonValue::Object(BTreeMap::new())),
+            );
             let mut req_metadata = metadata.clone();
             req_metadata.api_version = Self::api_version_from_params(&params);
             req_metadata.role = request_role(
@@ -735,10 +778,8 @@ where
             req_metadata.unlimited =
                 matches!(req_metadata.role, RpcRole::Admin | RpcRole::Identified);
             let method_owned = rpc_request.method.clone();
-            let params_owned = params.clone();
-            let req_metadata_owned = req_metadata.clone();
-            let reply = server
-                .dispatch_async(method_owned, params_owned, req_metadata_owned)
+            let (reply, _params) = server
+                .dispatch_async(method_owned, params, req_metadata)
                 .await;
             responses.push(json_rpc_response(
                 rpc_request.id,
@@ -805,10 +846,9 @@ where
     ) {
         tracing::debug!(target: "server", client_ip = %remote_addr.ip(), "New WebSocket connection");
         let (mut sink, mut stream) = socket.split();
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let mut request = Request::new(Body::from(Vec::<u8>::new()));
-        *request.headers_mut() = headers.clone();
-        let mut metadata = RequestMetadata::new(remote_addr, &request);
+        // Bounded per-connection egress queue (rippled send_queue_limit).
+        let (sender, mut receiver) = mpsc::channel(WS_SEND_QUEUE_LIMIT);
+        let mut metadata = RequestMetadata::from_headers(remote_addr, &headers);
         metadata.local_addr = self
             .config
             .port_policy
@@ -822,25 +862,73 @@ where
             .to_owned();
         metadata.is_websocket = true;
         let session = WSSession::new(1, metadata.clone(), sender, self.subscriptions.clone());
+        let too_slow = session.too_slow_token();
 
+        // Single writer per connection. Frames already queued are written
+        // back-to-back and flushed once (tungstenite `send` = write + flush,
+        // i.e. one syscall per frame), bounded per flush so a hot stream
+        // cannot delay the flush indefinitely.
+        let writer_too_slow = too_slow.clone();
         let writer = tokio::spawn(async move {
-            while let Some(message) = receiver.recv().await {
-                if sink.send(message).await.is_err() {
+            loop {
+                let first = tokio::select! {
+                    biased;
+                    _ = writer_too_slow.cancelled() => {
+                        let _ = sink
+                            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: axum::extract::ws::close_code::POLICY,
+                                reason: "Policy error: client is too slow.".into(),
+                            })))
+                            .await;
+                        break;
+                    }
+                    message = receiver.recv() => match message {
+                        Some(message) => message,
+                        None => break,
+                    },
+                };
+                let mut closing = matches!(first, Message::Close(_));
+                if sink.feed(first).await.is_err() {
+                    break;
+                }
+                let mut frames = 1;
+                while !closing && frames < WS_MAX_FRAMES_PER_FLUSH {
+                    let Ok(message) = receiver.try_recv() else {
+                        break;
+                    };
+                    closing = matches!(message, Message::Close(_));
+                    if sink.feed(message).await.is_err() {
+                        return;
+                    }
+                    frames += 1;
+                }
+                if sink.flush().await.is_err() || closing {
                     break;
                 }
             }
         });
 
-        while let Some(result) = stream.next().await {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = too_slow.cancelled() => {
+                    tracing::info!(target: "server", client_ip = %remote_addr.ip(), "WebSocket client too slow; disconnecting");
+                    break;
+                }
+                next = stream.next() => next,
+            };
+            let Some(result) = next else {
+                break;
+            };
             let Ok(message) = result else {
                 break;
             };
 
             match message {
                 Message::Text(text) => {
-                    // Parse text frames with serde_json for inbound (preserves key
-                    // ordering). sonic-rs used only for outbound serialization.
-                    let parsed: Value = match serde_json::from_str(&text) {
+                    // Single-pass SIMD parse straight into the protocol
+                    // representation (see RawRequest).
+                    let parsed = match RawRequest::parse(text.as_bytes()) {
                         Ok(v) => v,
                         Err(_) => {
                             let response = websocket_error_response(
@@ -851,20 +939,28 @@ where
                                 rpc::RpcErrorCode::BadSyntax.message(),
                             );
                             let _ = session
-                                .send_text(sonic_rs::to_string(&response).unwrap_or_default());
+                                .send_reply(sonic_rs::to_string(&response).unwrap_or_default())
+                                .await;
                             continue;
                         }
                     };
 
-                    let Ok(envelope) = JsonRpcEnvelope::try_from(parsed) else {
+                    let Ok(mut envelope) = JsonRpcEnvelope::try_from(parsed) else {
                         continue;
                     };
 
-                    let request_params = envelope
-                        .params
-                        .clone()
-                        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-                    let params = normalize_rpc_params(to_protocol_json(request_params));
+                    // The error path echoes the request as received. Only the
+                    // array form differs from the normalized params, so only
+                    // that form is retained separately.
+                    let raw_params = envelope.params.take();
+                    let had_params = raw_params.is_some();
+                    let raw_array_params = match &raw_params {
+                        Some(value @ JsonValue::Array(_)) => Some(value.clone()),
+                        _ => None,
+                    };
+                    let params = normalize_rpc_params(
+                        raw_params.unwrap_or_else(|| JsonValue::Object(BTreeMap::new())),
+                    );
                     let mut metadata = metadata.clone();
                     metadata.api_version = Self::api_version_from_params(&params);
                     metadata.role = request_role(
@@ -880,30 +976,26 @@ where
                     }
                     metadata.unlimited =
                         matches!(metadata.role, RpcRole::Admin | RpcRole::Identified);
-                    let dispatcher = self.dispatcher.clone();
-                    let method_owned = envelope.method.clone();
-                    let params_owned = params.clone();
-                    let metadata_owned = metadata.clone();
+                    let api_version = metadata.api_version;
                     let is_subscription =
-                        method_owned == "subscribe" || method_owned == "unsubscribe";
+                        envelope.method == "subscribe" || envelope.method == "unsubscribe";
 
-                    let reply = if is_subscription {
-                        dispatcher.dispatch(RpcRequest {
-                            method: &method_owned,
-                            params: &params_owned,
-                            metadata: &metadata_owned,
+                    let (reply, params) = if is_subscription {
+                        let reply = self.dispatcher.dispatch(RpcRequest {
+                            method: &envelope.method,
+                            params: &params,
+                            metadata: &metadata,
                             session: Some(&session),
-                        })
+                        });
+                        (reply, params)
                     } else {
-                        // Note: WSSession is not passed into spawn_blocking because it
-                        // holds an unbounded sender (not blocking) and its subscription
-                        // callbacks are async. Subscription side-effects that need the
-                        // session are handled by the dispatcher synchronously before
-                        // returning; passing session: None here is intentional for the
-                        // blocking offload — the session ref is used post-dispatch.
-                        self.dispatch_async(method_owned, params_owned, metadata_owned)
+                        // WSSession is not passed into spawn_blocking; subscription
+                        // side-effects that need the session run synchronously in
+                        // the branch above.
+                        self.dispatch_async(envelope.method.clone(), params, metadata)
                             .await
                     };
+                    let explicit_api_version = has_explicit_api_version(&params);
                     let reply_msg = match reply {
                         RpcReply::PreRendered(bytes) => {
                             let mut prefix = Vec::new();
@@ -924,10 +1016,9 @@ where
                             } else {
                                 prefix.extend_from_slice(b"\"id\":null,");
                             }
-                            if has_explicit_api_version(&params) {
+                            if explicit_api_version {
                                 prefix.extend_from_slice(b"\"api_version\":");
-                                prefix
-                                    .extend_from_slice(metadata.api_version.to_string().as_bytes());
+                                prefix.extend_from_slice(api_version.to_string().as_bytes());
                                 prefix.extend_from_slice(b",");
                             }
                             prefix.extend_from_slice(b"\"result\":");
@@ -938,18 +1029,25 @@ where
                             out.extend_from_slice(b"}");
                             String::from_utf8(out).unwrap_or_default()
                         }
-                        _ => {
-                            let response = websocket_response(
+                        reply => {
+                            let request_echo = if !had_params {
+                                None
+                            } else if let Some(array) = raw_array_params.as_ref() {
+                                Some(array)
+                            } else {
+                                Some(&params)
+                            };
+                            websocket_response_text(
                                 &envelope,
                                 &params,
+                                request_echo,
                                 reply,
-                                metadata.api_version,
-                                has_explicit_api_version(&params),
-                            );
-                            sonic_rs::to_string(&response).unwrap_or_default()
+                                api_version,
+                                explicit_api_version,
+                            )
                         }
                     };
-                    let _ = session.send_text(reply_msg);
+                    let _ = session.send_reply(reply_msg).await;
                 }
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => {}
@@ -962,23 +1060,22 @@ where
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct JsonRpcEnvelope {
-    #[serde(default)]
     id: Option<Value>,
-    #[serde(default)]
     jsonrpc: Option<String>,
     method: String,
-    #[serde(default)]
-    params: Option<Value>,
+    params: Option<JsonValue>,
 }
 
 impl JsonRpcEnvelope {
     #[allow(clippy::result_large_err)]
-    fn try_from(value: Value) -> Result<Self, Response> {
-        let (id, jsonrpc, method, params) = match value {
-            Value::Object(mut map) => {
-                let id = map.get("id").cloned();
+    fn try_from(raw: RawRequest) -> Result<Self, Response> {
+        let (id, jsonrpc, method, params) = match raw {
+            RawRequest::Object {
+                id,
+                fields: mut map,
+            } => {
                 let jsonrpc = map
                     .get("jsonrpc")
                     .and_then(|v| v.as_str())
@@ -986,7 +1083,7 @@ impl JsonRpcEnvelope {
 
                 if let Some(command) = map.get("command").and_then(|v| v.as_str()) {
                     let method = command.to_owned();
-                    (id, jsonrpc, method, Some(Value::Object(map)))
+                    (id, jsonrpc, method, Some(JsonValue::Object(map)))
                 } else if let Some(method_val) = map.get("method").and_then(|v| v.as_str()) {
                     let method = method_val.to_owned();
                     let params = map.remove("params");
@@ -1000,7 +1097,7 @@ impl JsonRpcEnvelope {
                     ));
                 }
             }
-            _ => {
+            RawRequest::NotObject => {
                 return Err(json_rpc_error_response(
                     None,
                     None,
@@ -1141,9 +1238,52 @@ fn normalize_rpc_params(params: JsonValue) -> JsonValue {
     }
 }
 
+/// Serialize a WebSocket reply. Successful results take a direct path that
+/// serializes the protocol tree in place (byte-identical to
+/// `websocket_response` + `sonic_rs::to_string`); everything else falls back
+/// to the `serde_json::Value` builder.
+fn websocket_response_text(
+    envelope: &JsonRpcEnvelope,
+    params: &JsonValue,
+    request_echo: Option<&JsonValue>,
+    reply: RpcReply,
+    api_version: u32,
+    explicit_api_version: bool,
+) -> String {
+    if let RpcReply::Result(result) = &reply
+        && !protocol_has_error(result)
+    {
+        let mut response = Envelope::with_capacity(6);
+        response
+            .insert("type", EnvelopeField::Str("response"))
+            .insert("status", EnvelopeField::Str("success"))
+            .insert("result", EnvelopeField::Proto(result));
+        if let Some(id) = envelope.id.as_ref() {
+            response.insert("id", EnvelopeField::Json(id));
+        }
+        if let Some(jsonrpc) = envelope.jsonrpc.as_deref() {
+            response.insert("jsonrpc", EnvelopeField::Str(jsonrpc));
+        }
+        if explicit_api_version {
+            response.insert("api_version", EnvelopeField::U32(api_version));
+        }
+        return sonic_rs::to_string(&response).unwrap_or_default();
+    }
+    let response = websocket_response(
+        envelope,
+        params,
+        request_echo,
+        reply,
+        api_version,
+        explicit_api_version,
+    );
+    sonic_rs::to_string(&response).unwrap_or_default()
+}
+
 fn websocket_response(
     envelope: &JsonRpcEnvelope,
     params: &JsonValue,
+    request_echo: Option<&JsonValue>,
     reply: RpcReply,
     api_version: u32,
     explicit_api_version: bool,
@@ -1194,7 +1334,7 @@ fn websocket_response(
         RpcReply::Error(error) => websocket_error_response(
             envelope.id.clone(),
             envelope.jsonrpc.as_deref(),
-            envelope.params.as_ref(),
+            request_echo.map(from_protocol_json).as_ref(),
             rpc::RpcErrorCode::Internal,
             error.message,
         ),
@@ -1266,6 +1406,7 @@ mod tests {
                 server
                     .dispatch_async("wallet_propose".to_owned(), params, test_metadata())
                     .await
+                    .0
             }));
         }
 
@@ -1371,7 +1512,7 @@ mod tests {
             id: Some(Value::from(7)),
             jsonrpc: Some("2.0".to_owned()),
             method: "ping".to_owned(),
-            params: Some(json!({"api_version": 2})),
+            params: Some(crate::json::to_protocol_json(json!({"api_version": 2}))),
         };
         let reply = RpcReply::result(JsonValue::Object(BTreeMap::from([(
             "ok".to_owned(),
@@ -1384,6 +1525,7 @@ mod tests {
                 "api_version".to_owned(),
                 JsonValue::Unsigned(2),
             )])),
+            envelope.params.as_ref(),
             reply,
             2,
             true,
@@ -1395,6 +1537,50 @@ mod tests {
         assert_eq!(response["id"], 7);
         assert_eq!(response["api_version"], 2);
         assert_eq!(response["result"]["ok"], true);
+    }
+
+    #[test]
+    fn websocket_success_fast_path_is_byte_identical_to_value_path() {
+        let result = JsonValue::Object(BTreeMap::from([
+            ("zz".to_owned(), JsonValue::Signed(-3)),
+            ("aa".to_owned(), JsonValue::String("x\"y".to_owned())),
+            (
+                "nested".to_owned(),
+                JsonValue::Array(vec![JsonValue::Null, JsonValue::Unsigned(9)]),
+            ),
+        ]));
+        for (id, jsonrpc, explicit) in [
+            (Some(json!(7)), Some("2.0"), true),
+            (None, None, false),
+            (Some(json!("a")), None, true),
+            (Some(json!(1.5)), Some("2.0"), false),
+        ] {
+            let envelope = JsonRpcEnvelope {
+                id,
+                jsonrpc: jsonrpc.map(str::to_owned),
+                method: "account_info".to_owned(),
+                params: None,
+            };
+            let params = JsonValue::Object(BTreeMap::new());
+            let expected = sonic_rs::to_string(&websocket_response(
+                &envelope,
+                &params,
+                None,
+                RpcReply::result(result.clone()),
+                2,
+                explicit,
+            ))
+            .unwrap();
+            let actual = super::websocket_response_text(
+                &envelope,
+                &params,
+                None,
+                RpcReply::result(result.clone()),
+                2,
+                explicit,
+            );
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
@@ -1430,10 +1616,10 @@ mod tests {
             id: Some(Value::from(9)),
             jsonrpc: Some("2.0".to_owned()),
             method: "server_info".to_owned(),
-            params: Some(json!({
+            params: Some(crate::json::to_protocol_json(json!({
                 "method": "server_state",
                 "secret": "super-secret"
-            })),
+            }))),
         };
         let reply = RpcReply::result(JsonValue::Object(BTreeMap::from([
             (
@@ -1466,6 +1652,7 @@ mod tests {
                     JsonValue::String("super-secret".to_owned()),
                 ),
             ])),
+            envelope.params.as_ref(),
             reply,
             1,
             false,
