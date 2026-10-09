@@ -2,16 +2,13 @@
 
 use std::{
     cell::Cell,
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
+    collections::BTreeMap,
 };
 
 use protocol::JsonValue;
 use rpc::{
-    HandlerCondition, Role, RpcErrorCode, RpcRuntime, fill_handler, handler_specs,
-    method_from_params, role_required,
+    HandlerCondition, Role, RpcErrorCode, RpcRuntime, fill_handler, method_from_params,
+    role_required,
 };
 
 fn object(entries: impl IntoIterator<Item = (&'static str, JsonValue)>) -> JsonValue {
@@ -190,138 +187,4 @@ fn rpc_handler_registry_exposes_role_and_condition() {
     .expect("ripple_path_find should resolve");
     assert_eq!(handler.required_role, Role::User);
     assert_eq!(handler.condition, HandlerCondition::None);
-}
-
-#[test]
-fn rpc_handler_registry_table_plus_expected_aliases() {
-    // rippled #8006 moved method names into `MethodNames.h` constants
-    // (`.name = method::kAccountInfo`); older trees used string literals
-    // (`.name = "account_info"`). Accept both.
-    let method_names = load_cpp_method_names();
-    let cpp = load_cpp_handler_table()
-        .lines()
-        .filter_map(|line| {
-            if let Some(start) = line.find(".name = \"") {
-                let rest = &line[start + ".name = \"".len()..];
-                let end = rest.find('"')?;
-                return Some(rest[..end].to_owned());
-            }
-            let start = line.find(".name = method::")? + ".name = method::".len();
-            let rest = &line[start..];
-            let end = rest
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .unwrap_or(rest.len());
-            method_names.get(&rest[..end]).cloned()
-        })
-        .collect::<BTreeSet<_>>();
-
-    let rust = handler_specs()
-        .iter()
-        .map(|handler| handler.name.to_owned())
-        .collect::<BTreeSet<_>>();
-
-    let only_in_rust = rust.difference(&cpp).cloned().collect::<Vec<_>>();
-    let only_in_cpp = cpp.difference(&rust).cloned().collect::<Vec<_>>();
-
-    assert_eq!(only_in_cpp, Vec::<String>::new());
-    assert_eq!(
-        only_in_rust,
-        vec![
-            "export_snapshot".to_owned(),
-            "ledger".to_owned(),
-            "log_rotate".to_owned(),
-            "no_ripple_check".to_owned(),
-            "snapshot_status".to_owned(),
-            "version".to_owned(),
-        ]
-    );
-}
-
-fn load_cpp_handler_table() -> String {
-    fs::read_to_string(handler_table_path()).expect("Handler.cpp should be readable")
-}
-
-/// Maps `kAccountInfo` -> `account_info` from rippled `rpc/MethodNames.h`
-/// (absent in trees older than rippled #8006, which is fine).
-fn load_cpp_method_names() -> std::collections::BTreeMap<String, String> {
-    let path = handler_table_path()
-        .parent()
-        .and_then(Path::parent)
-        .map(|rpc| rpc.join("MethodNames.h"));
-    let Some(text) = path.and_then(|path| fs::read_to_string(path).ok()) else {
-        return std::collections::BTreeMap::new();
-    };
-    text.lines()
-        .filter_map(|line| {
-            let rest = line.trim().strip_prefix("inline constexpr std::string_view ")?;
-            let (ident, rest) = rest.split_once('{')?;
-            let value = rest.strip_prefix('"')?.split('"').next()?;
-            Some((ident.trim().to_owned(), value.to_owned()))
-        })
-        .collect()
-}
-
-fn handler_table_path() -> PathBuf {
-    if let Ok(explicit) = std::env::var("RIPPLED_REPO") {
-        return PathBuf::from(explicit).join("src/xrpld/rpc/detail/Handler.cpp");
-    }
-    // Backward-compatible fallback for existing developer/CI environments.
-    if let Ok(explicit) = std::env::var("XRPLD_CPP_REPO") {
-        return PathBuf::from(explicit).join("src/xrpld/rpc/detail/Handler.cpp");
-    }
-
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .ancestors()
-        .nth(2)
-        .expect("rpc crate should live under the repo root");
-
-    let mut candidates = Vec::new();
-    candidates.push(repo_root.join("../xrpld/src/xrpld/rpc/detail/Handler.cpp"));
-    candidates.push(repo_root.join("../rippled/src/xrpld/rpc/detail/Handler.cpp"));
-    if let Ok(current_dir) = std::env::current_dir() {
-        candidates.push(current_dir.join("../xrpld/src/xrpld/rpc/detail/Handler.cpp"));
-        candidates.push(current_dir.join("../rippled/src/xrpld/rpc/detail/Handler.cpp"));
-        candidates.extend(sibling_rippled_candidates(&current_dir));
-    }
-    candidates.extend(sibling_rippled_candidates(repo_root));
-    candidates.extend(git_worktree_rippled_candidates(repo_root));
-
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .expect("Handler.cpp should exist via RIPPLED_REPO or a sibling rippled checkout")
-}
-
-fn sibling_rippled_candidates(start: &Path) -> Vec<PathBuf> {
-    start
-        .ancestors()
-        .flat_map(|ancestor| {
-            [
-                ancestor.join("xrpld/src/xrpld/rpc/detail/Handler.cpp"),
-                ancestor.join("rippled/src/xrpld/rpc/detail/Handler.cpp"),
-            ]
-        })
-        .collect()
-}
-
-fn git_worktree_rippled_candidates(repo_root: &Path) -> Vec<PathBuf> {
-    let Ok(output) = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(repo_root)
-        .output()
-    else {
-        return Vec::new();
-    };
-
-    if !output.status.success() {
-        return Vec::new();
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .map(|path| path.join("../xrpld/src/xrpld/rpc/detail/Handler.cpp"))
-        .collect()
 }

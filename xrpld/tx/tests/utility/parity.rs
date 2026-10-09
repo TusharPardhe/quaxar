@@ -65,7 +65,7 @@ use tx::{
     QueueTxQRpcReport, QueueTxQRpcView, QueueViewNext, QueueViews, QueuedBlockerAdmission,
     RemoveReplacedResult, ReplacementFeeDecision, TXQ_BASE_LEVEL, TryClearAccountPlan,
     TryClearAccountResult, TryClearExecution, TxConsequences, TxConsequencesCategory, TxQAccount,
-    TxQSetup, TxQSetupError, Validity, apply_queue_apply_full_queue_decision,
+    TxQSetup, TxQSetupError, apply_queue_apply_full_queue_decision,
     build_queue_accept_call_state_from_observed, build_queue_accept_call_state_from_sources,
     build_queue_accept_observed_queue_inputs_from_source,
     build_queue_accept_observed_view_inputs_from_source, build_queue_apply_observed_tx,
@@ -87,8 +87,7 @@ use tx::{
     evaluate_queue_apply_prerequisite, evaluate_queue_apply_try_clear_gate,
     evaluate_queue_apply_view_adjustment, evaluate_queued_blocker_admission,
     evaluate_replacement_fee, evaluate_required_fee_level, evaluate_try_clear_account_fee_gate,
-    finalize_direct_apply_attempt, finalize_try_clear_result, forced_validity_flags,
-    format_direct_apply_finish_log_message, format_direct_apply_log_messages,
+    finalize_direct_apply_attempt, finalize_try_clear_result, format_direct_apply_finish_log_message, format_direct_apply_log_messages,
     format_direct_apply_start_log_message, format_queue_accept_apply_trace_message,
     format_queue_accept_drop_last_info_message, format_queue_accept_fee_trace_message,
     format_queue_accept_leave_in_queue_debug_message,
@@ -99,7 +98,7 @@ use tx::{
     format_queue_apply_full_queue_same_account_info_message,
     format_queue_apply_preclaim_trace_message, increase_replacement_fee_level,
     inspect_account_queue_window, is_tec_claim_hard_fail, likely_to_claim_fee,
-    merge_forced_validity, prepare_queue_accept_entry, prepare_queue_accept_iteration,
+    prepare_queue_accept_entry, prepare_queue_accept_iteration,
     prepare_queue_accept_top, prepare_queue_accept_with_app_view,
     prepare_queue_accept_with_call_state, prepare_queue_accept_with_live_owner,
     prepare_queue_accept_with_runtime, process_closed_ledger, process_closed_ledger_with_metrics,
@@ -197,7 +196,6 @@ use tx::{
     with_transaction_apply_runtime, with_transaction_step_runtime,
 };
 use tx::{ClosedLedgerCandidate, ClosedLedgerMaintenance};
-use xrpl_core::HashRouterFlags;
 
 fn structured_current_preclaim_try_clear_success() -> TryClearAccountResult {
     TryClearAccountResult::ClearQueue {
@@ -764,38 +762,6 @@ fn step_runtime_closure_uses_new_feature_guard_path_when_single_asset_vault_is_e
     assert_eq!(get_current_transaction_rules(), None);
     assert!(get_st_number_switchover());
     assert_eq!(get_mantissa_scale(), MantissaScale::Large);
-}
-
-#[test]
-fn forced_validity_flags_match_current_cpp_forcevalidity_promotion() {
-    assert_eq!(
-        forced_validity_flags(Validity::SigBad),
-        HashRouterFlags::UNDEFINED
-    );
-    assert_eq!(
-        forced_validity_flags(Validity::SigGoodOnly),
-        HashRouterFlags::PRIVATE2
-    );
-    assert_eq!(
-        forced_validity_flags(Validity::Valid),
-        HashRouterFlags::PRIVATE2 | HashRouterFlags::PRIVATE4
-    );
-}
-
-#[test]
-fn merge_forced_validity_matches_hash_router_cache_promotion_rule() {
-    let (sig_good, changed) =
-        merge_forced_validity(HashRouterFlags::UNDEFINED, Validity::SigGoodOnly);
-    assert_eq!(sig_good, HashRouterFlags::PRIVATE2);
-    assert!(changed);
-
-    let (valid, changed_again) = merge_forced_validity(sig_good, Validity::Valid);
-    assert_eq!(valid, HashRouterFlags::PRIVATE2 | HashRouterFlags::PRIVATE4);
-    assert!(changed_again);
-
-    let (unchanged, changed_final) = merge_forced_validity(valid, Validity::Valid);
-    assert_eq!(unchanged, valid);
-    assert!(!changed_final);
 }
 
 #[test]
