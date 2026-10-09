@@ -17,13 +17,14 @@ use basics::{
 use protocol::{
     AccountID, Asset, Bridge, Currency, Issue, JsonOptions, JsonValue, Keylet, LedgerEntryType,
     STLedgerEntry, StBase, XChainOwnedClaimID, XChainOwnedCreateAccountClaimID, account_keylet,
-    amendments_key, asset_from_json, bridge_keylet_from_door_issue, credential_keylet,
+    amendments_key, asset_from_json, bridge_keylet_from_door_issue, check_keylet, credential_keylet,
     delegate_keylet, deposit_preauth_credentials_keylet, deposit_preauth_keylet, did_keylet,
     escrow_keylet, fee_settings_keylet, issue_from_json, line, loan_broker_keylet, loan_keylet,
-    mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, negative_unl_keylet, offer_keylet,
-    oracle_keylet, owner_dir_keylet, page_keylet, parse_base58_account_id,
-    permissioned_domain_keylet, sha512_half_slices, skip_keylet, skip_keylet_for_ledger,
-    ticket_keylet, to_currency, vault_keylet, xchain_owned_claim_id_keylet_from_bridge,
+    mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, negative_unl_keylet,
+    nft_offer_keylet_for_owner, offer_keylet, oracle_keylet, owner_dir_keylet, page_keylet,
+    parse_base58_account_id, pay_channel_keylet, permissioned_domain_keylet, sha512_half_slices,
+    signers_keylet, skip_keylet, skip_keylet_for_ledger, ticket_keylet, to_currency, vault_keylet,
+    xchain_owned_claim_id_keylet_from_bridge,
     xchain_owned_create_account_claim_id_keylet_from_bridge,
 };
 
@@ -552,7 +553,19 @@ pub fn parse_oracle(params: &JsonValue, _field: &'static str) -> Result<Uint256,
 }
 
 pub fn parse_pay_channel(params: &JsonValue, field: &'static str) -> Result<Uint256, JsonValue> {
-    parse_object_id(params, field, "hex string")
+    // rippled #6319: accept either a raw object id or {account, destination, seq}.
+    if !matches!(params, JsonValue::Object(_)) {
+        return parse_object_id(params, field, "hex string");
+    }
+    let account = required_account_id(params, "account", "malformedAddress")?;
+    let destination = required_account_id(params, "destination", "malformedAddress")?;
+    let seq = required_uint32(params, "seq", "malformedRequest")?;
+    Ok(pay_channel_keylet(
+        Uint160::from_slice(account.data()).expect("account width"),
+        Uint160::from_slice(destination.data()).expect("account width"),
+        seq,
+    )
+    .key)
 }
 
 pub fn parse_permissioned_domain(
@@ -639,7 +652,12 @@ pub fn parse_ripple_state(params: &JsonValue, field: &'static str) -> Result<Uin
 }
 
 pub fn parse_signer_list(params: &JsonValue, field: &'static str) -> Result<Uint256, JsonValue> {
-    parse_object_id(params, field, "hex string")
+    // rippled #6319: accept either a raw object id or {account}.
+    if !matches!(params, JsonValue::Object(_)) {
+        return parse_object_id(params, field, "hex string");
+    }
+    let account = required_account_id(params, "account", "malformedAddress")?;
+    Ok(signers_keylet(Uint160::from_slice(account.data()).expect("account width")).key)
 }
 
 pub fn parse_ticket(params: &JsonValue, _field: &'static str) -> Result<Uint256, JsonValue> {
@@ -663,7 +681,13 @@ pub fn parse_vault(params: &JsonValue, _field: &'static str) -> Result<Uint256, 
 }
 
 pub fn parse_check(params: &JsonValue, field: &'static str) -> Result<Uint256, JsonValue> {
-    parse_object_id(params, field, "hex string")
+    // rippled #6319: accept either a raw object id or {account, seq}.
+    if !matches!(params, JsonValue::Object(_)) {
+        return parse_object_id(params, field, "hex string");
+    }
+    let account = required_account_id(params, "account", "malformedAddress")?;
+    let seq = required_uint32(params, "seq", "malformedRequest")?;
+    Ok(check_keylet(Uint160::from_slice(account.data()).expect("account width"), seq).key)
 }
 
 pub fn parse_did(params: &JsonValue, field: &'static str) -> Result<Uint256, JsonValue> {
@@ -682,7 +706,13 @@ pub fn parse_delegate(params: &JsonValue, _field: &'static str) -> Result<Uint25
 }
 
 pub fn parse_nftoken_offer(params: &JsonValue, field: &'static str) -> Result<Uint256, JsonValue> {
-    parse_object_id(params, field, "hex string")
+    // rippled #6319: accept either a raw object id or {owner, seq}.
+    if !matches!(params, JsonValue::Object(_)) {
+        return parse_object_id(params, field, "hex string");
+    }
+    let owner = required_account_id(params, "owner", "malformedOwner")?;
+    let seq = required_uint32(params, "seq", "malformedRequest")?;
+    Ok(nft_offer_keylet_for_owner(Uint160::from_slice(owner.data()).expect("account width"), seq).key)
 }
 
 pub fn parse_nftoken_page(params: &JsonValue, field: &'static str) -> Result<Uint256, JsonValue> {
