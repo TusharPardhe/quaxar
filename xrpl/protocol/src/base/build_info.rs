@@ -80,7 +80,9 @@ mod tests {
 
     #[test]
     fn build_info_encodes_current_version_shape() {
-        assert_eq!(VERSION_STRING, "0.8.0");
+        // Track the crate version rather than a hardcoded string so a version
+        // bump does not require editing this test.
+        assert_eq!(VERSION_STRING, env!("CARGO_PKG_VERSION"));
         assert!(is_xrpld_version(get_encoded_version()));
         assert_eq!(encode_software_version("3.2.0"), 0x183B_0302_00C0_0000);
     }
