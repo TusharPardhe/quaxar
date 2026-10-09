@@ -339,6 +339,10 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     let mut invalid_unmodifiable_field = false;
     let mut freeze = FreezeState::default();
 
+    let confidential_fix_cleanup_3_5_0 = sandbox
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_5_0"));
+
     let merged_entries = match merged_invariant_entries(sandbox, prefix) {
         Ok(entries) => entries,
         Err(_) => return Ok(Ter::TEF_BAD_LEDGER),
@@ -355,7 +359,13 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         // infer deletion from a null after pointer.
         let visited_after_sle = Some(&*entry.sle);
         record_freeze_state(&mut freeze, is_delete, before_sle, &entry.sle);
-        record_confidential_mpt(&mut confidential_mpt, is_delete, before_sle, &entry.sle);
+        record_confidential_mpt(
+            &mut confidential_mpt,
+            is_delete,
+            before_sle,
+            &entry.sle,
+            confidential_fix_cleanup_3_5_0,
+        );
 
         if !is_delete && let Some(before) = before_sle {
             let before_object = before.clone_as_object();
