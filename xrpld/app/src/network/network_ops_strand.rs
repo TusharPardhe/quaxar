@@ -604,6 +604,9 @@ fn strand_loop(
     let mut coordinator_handoff_dedup = CoordinatorHandoffDedup::default();
     let mut pending_durable_acks = VecDeque::new();
     let mut pending_durable_graphs = PendingDurableAckGate::default();
+    // Acquired ledgers whose deep graphs are kept while the node catches up.
+    let mut deferred_graph_releases: Vec<(DurableHandoffId, SessionRef, Arc<ledger::Ledger>)> =
+        Vec::new();
     // Durable overflow recovery crosses the same FIFO as ordinary map
     // completions. A saturated FIFO retains these exact items here.
     let mut pending_recovered_txsets = VecDeque::new();
@@ -650,9 +653,35 @@ fn strand_loop(
         // reconstruction in JtLedgerData jobs. Quaxar's production path now
         // follows the same boundary through AcquisitionReadyScheduler.
         let mut coordinator_work_remains = false;
+        // rippled keeps an acquired ledger's whole SHAMap resident (it never
+        // drops the children of a completed InboundLedger), so while a node
+        // catches up each later acquisition finds the shared, full-below
+        // subtrees in the TreeNodeCache and only fetches the changed paths.
+        // Quaxar releases those graphs after the durable handoff to bound
+        // steady-state memory. Releasing them while still catching up strips
+        // the canonical nodes shared with every in-progress acquisition, so a
+        // hot restart whose first completed batch was behind the tip rescanned
+        // the whole tree for every later ledger and never converged. Keep the
+        // graphs until the node tracks the network, then release them all.
+        let caught_up = root.network_ops_operating_mode() >= NetworkOpsOperatingMode::Tracking;
+        if caught_up && !deferred_graph_releases.is_empty() {
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "durable_handoff_graph_release_resumed",
+                deferred = deferred_graph_releases.len(),
+                "releasing acquired SHAMap graphs retained while catching up"
+            );
+            for (handoff, session, ledger) in deferred_graph_releases.drain(..) {
+                release_processed_durable_graphs(&root, handoff, session, &ledger);
+            }
+        }
         for (handoff, session) in shared_inbound.take_processed_coordinator_durable_acks() {
             if let Some(ledger) = pending_durable_graphs.take_processed(handoff, session) {
-                release_processed_durable_graphs(&root, handoff, session, &ledger);
+                if caught_up {
+                    release_processed_durable_graphs(&root, handoff, session, &ledger);
+                } else {
+                    deferred_graph_releases.push((handoff, session, ledger));
+                }
             } else {
                 tracing::warn!(
                     target: "acquisition_trace",
