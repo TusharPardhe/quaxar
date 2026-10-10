@@ -94,6 +94,37 @@ def main():
         want.add(account_key(a))
         root = owner_dir_key(a)
         want.add(root)
+        # NFToken pages: keys are AccountID || low 96 bits of the token, so
+        # enumerate the account's whole page range with a crafted marker.
+        prefix = account_id(a).hex().upper()
+        marker = prefix + "0" * 24
+        while marker:
+            try:
+                page = rpc("ledger_data", ledger_index=parent_seq, marker=marker,
+                           limit=64, type="nft_page", binary=True)
+            except RuntimeError:
+                break
+            rows_in = [r for r in page.get("state", []) if r["index"].startswith(prefix)]
+            for r in rows_in:
+                want.add(r["index"])
+            nxt = page.get("marker")
+            marker = nxt if (nxt and nxt.startswith(prefix) and len(rows_in) == len(page.get("state", []))) else None
+
+    # NFToken buy/sell offer directories for every referenced NFTokenID.
+    def collect_nft_ids(obj, out):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "NFTokenID" and isinstance(v, str) and len(v) == 64:
+                    out.add(v)
+                collect_nft_ids(v, out)
+        elif isinstance(obj, list):
+            for v in obj:
+                collect_nft_ids(v, out)
+    nft_ids = set()
+    collect_nft_ids(child["transactions"], nft_ids)
+    for nid in nft_ids:
+        for ns in (b"\x00h", b"\x00i"):  # NFTOKEN_BUY_OFFERS, NFTOKEN_SELL_OFFERS
+            want.add(sha512h(ns + bytes.fromhex(nid)))
 
     rows = {}
 
@@ -127,7 +158,7 @@ def main():
                 if p:
                     pending.append(dir_page_key(root, p))
             # owner directories: include every owned entry (reads during deletes)
-            if "Owner" in j:
+            if "Owner" in j or "NFTokenID" in j:
                 pending.extend(j.get("Indexes", []))
 
     amendments = rpc("ledger_entry", index=SINGLETONS[0], ledger_index=parent_seq)["node"]["Amendments"]
