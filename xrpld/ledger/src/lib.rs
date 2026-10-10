@@ -1652,6 +1652,47 @@ impl Ledger {
         Ok(parse_state_sle(item.data(), keylet))
     }
 
+    /// Up to `limit` state entries with keys strictly greater than `key`, in
+    /// key order, from one forward walk of the state map.
+    ///
+    /// Equivalent to repeating `succ` + `read` per entry (what `ledger_data`
+    /// paging did), but each step advances a live traversal stack instead of
+    /// re-descending from the root twice, which also cuts lock and refcount
+    /// traffic on the shared upper inner nodes. Stops at the first entry that
+    /// does not decode (the callers' per-entry read would also stop there).
+    pub fn state_entries_after(
+        &self,
+        key: Uint256,
+        limit: usize,
+    ) -> Result<Vec<STLedgerEntry>, TraversalError> {
+        let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
+            basics::memory::intrusive_pointer::SharedIntrusive<
+                shamap::nodes::tree_node::SHAMapTreeNode,
+            >,
+        > {
+            let fetcher = self.node_fetcher.as_ref()?;
+            fetcher(hash)
+        };
+        let leaves = shamap::iteration::iterate_from(
+            &self.state_map.root(),
+            key,
+            limit,
+            self.state_map.backed(),
+            &mut fetch_fn,
+        )?;
+        let mut entries = Vec::with_capacity(leaves.len());
+        for leaf in leaves {
+            let Some(item) = leaf.peek_item() else {
+                break;
+            };
+            let Some(entry) = parse_state_sle_any(item.data(), item.key()) else {
+                break;
+            };
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
     pub fn read_with_family<CLOCK, S, C, F, MR, NS>(
         &self,
         keylet: Keylet,

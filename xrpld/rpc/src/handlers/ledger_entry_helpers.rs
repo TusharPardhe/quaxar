@@ -60,7 +60,7 @@ pub fn render_ledger_entry_json(node: &STLedgerEntry) -> JsonValue {
                 .map(|entry| entry.as_st_ledger_entry().json(JsonOptions::NONE))
                 .unwrap_or_else(|_| node.json(JsonOptions::NONE))
         }
-        _ => node.json(JsonOptions::NONE),
+        _ => protocol::json_writer::ledger_entry_json(node),
     }
 }
 

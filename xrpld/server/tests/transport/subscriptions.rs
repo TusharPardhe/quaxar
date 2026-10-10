@@ -97,6 +97,49 @@ fn sample_ledger(seq: u32, close_time: u32, hash_byte: u8) -> Arc<Ledger> {
     Arc::new(ledger)
 }
 
+/// Closed ledger in which each `[byte; 20]` account root exists and is funded,
+/// so path finding has a ledger to search (rippled always passes the closed
+/// ledger to PathRequest; quaxar returns lgrNotFound without one).
+fn funded_closed_ledger(seq: u32, accounts: &[[u8; 20]]) -> Arc<Ledger> {
+    use ledger::RawView;
+    // Close "now" (ripple epoch = unix - 946_684_800) so a validated copy is
+    // fresh for the validated-ledger-age gates.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after unix epoch")
+        .as_secs();
+    let close_time = u32::try_from(now - 946_684_800).expect("ripple time fits u32");
+    let mut ledger = Ledger::from_ledger_seq_and_close_time(seq, close_time, false);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 10_000_000,
+        increment: 2_000_000,
+    });
+    for id in accounts {
+        let account = protocol::AccountID::from_array(*id);
+        let keylet = protocol::account_keylet(
+            basics::base_uint::Uint160::from_slice(account.data()).expect("account width"),
+        );
+        let mut entry = protocol::STLedgerEntry::from_type_and_key(
+            protocol::LedgerEntryType::AccountRoot,
+            keylet.key,
+        );
+        entry.set_account_id(protocol::get_field_by_symbol("sfAccount"), account);
+        entry.set_field_u32(protocol::get_field_by_symbol("sfSequence"), 1);
+        entry.set_field_amount(
+            protocol::get_field_by_symbol("sfBalance"),
+            protocol::STAmount::new_native(1_000_000_000, false),
+        );
+        entry.set_field_u32(protocol::get_field_by_symbol("sfOwnerCount"), 0);
+        entry.set_field_u32(protocol::get_field_by_symbol("sfFlags"), 0);
+        ledger
+            .raw_insert(Arc::new(entry))
+            .expect("account root should insert");
+    }
+    ledger.set_accepted(close_time, ledger::LEDGER_DEFAULT_TIME_RESOLUTION, true);
+    Arc::new(ledger)
+}
+
 #[test]
 fn auth_request_role_detects_admin_and_gateway_roles() {
     let auth = ServerAuth::new(ServerAuthConfig {
@@ -178,7 +221,7 @@ fn request_metadata_preserves_header_values_for_rpc_handoff() {
 #[tokio::test]
 async fn websocket_subscription_fanout_emits_json_text() {
     let manager = Arc::new(SubscriptionManager::new(8));
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (sender, mut receiver) = mpsc::channel(server::router::WS_SEND_QUEUE_LIMIT);
     let request = http::Request::builder()
         .method("GET")
         .uri("/")
@@ -851,7 +894,7 @@ fn builtin_dispatcher_reports_no_path_request_for_status_without_runtime_wiring(
     );
     let mut ws_metadata = metadata.clone();
     ws_metadata.is_websocket = true;
-    let (sender, _receiver) = mpsc::unbounded_channel();
+    let (sender, _receiver) = mpsc::channel(server::router::WS_SEND_QUEUE_LIMIT);
     let session = WSSession::new(
         7,
         ws_metadata,
@@ -899,7 +942,7 @@ fn builtin_dispatcher_reports_not_supported_for_unwired_path_find_create() {
     );
     let mut ws_metadata = metadata.clone();
     ws_metadata.is_websocket = true;
-    let (sender, _receiver) = mpsc::unbounded_channel();
+    let (sender, _receiver) = mpsc::channel(server::router::WS_SEND_QUEUE_LIMIT);
     let session = WSSession::new(
         7,
         ws_metadata,
@@ -1067,6 +1110,7 @@ fn builtin_dispatcher_routes_path_find_to_app_source_after_runtime_wiring() {
     app.set_network_ops_operating_mode(NetworkOpsOperatingMode::Tracking);
     app.set_status_rpc_current_ledger_index(Some(100));
     app.set_path_search_max(3);
+    app.on_closed_ledger(funded_closed_ledger(100, &[[1; 20], [2; 20]]));
 
     let source = rpc::ApplicationServerInfo::new(
         rpc::OwnedApplicationServerInfo::from_application_root(&app),
@@ -1085,7 +1129,7 @@ fn builtin_dispatcher_routes_path_find_to_app_source_after_runtime_wiring() {
     );
     let mut ws_metadata = metadata.clone();
     ws_metadata.is_websocket = true;
-    let (sender, _receiver) = mpsc::unbounded_channel();
+    let (sender, _receiver) = mpsc::channel(server::router::WS_SEND_QUEUE_LIMIT);
     let session = WSSession::new(
         7,
         ws_metadata,
@@ -1137,9 +1181,12 @@ fn builtin_dispatcher_routes_path_find_to_app_source_after_runtime_wiring() {
             [2; 20]
         )))
     );
+    // XRP -> XRP needs no path: rippled returns no alternative for it (its
+    // path table has no XRP-to-XRP entry). Verified against a live rippled
+    // testnet node's ripple_path_find, whose alternatives omit XRP.
     assert_eq!(
-        from_protocol_json(&reply)["alternatives"][0]["source_amount"],
-        serde_json::Value::String("1000000".to_owned())
+        from_protocol_json(&reply)["alternatives"],
+        serde_json::json!([])
     );
 }
 
@@ -1149,6 +1196,11 @@ fn builtin_dispatcher_routes_ripple_path_find_with_legacy_shape_after_runtime_wi
     app.set_network_ops_operating_mode(NetworkOpsOperatingMode::Tracking);
     app.set_status_rpc_current_ledger_index(Some(100));
     app.set_path_search_max(3);
+    // ripple_path_find (like rippled RipplePathFind) rejects an implicit
+    // ledger when the validated ledger is stale, so validate a fresh one.
+    let ledger = funded_closed_ledger(100, &[[1; 20], [2; 20]]);
+    app.on_closed_ledger(Arc::clone(&ledger));
+    app.on_validated_ledger(ledger);
 
     let source = rpc::ApplicationServerInfo::new(
         rpc::OwnedApplicationServerInfo::from_application_root(&app),
@@ -1194,15 +1246,16 @@ fn builtin_dispatcher_routes_ripple_path_find_with_legacy_shape_after_runtime_wi
         panic!("ripple_path_find reply must be a result");
     };
     assert!(from_protocol_json(&reply)["error"].is_null());
-    assert!(
-        from_protocol_json(&reply)["destination_currencies"]
-            .as_array()
-            .expect("legacy destination currencies should be present")
-            .is_empty()
+    // Legacy shape: destination_currencies always lists XRP for an existing
+    // destination (accountDestAssets includes XRP), and XRP -> XRP yields no
+    // alternative, as a live rippled testnet node returns.
+    assert_eq!(
+        from_protocol_json(&reply)["destination_currencies"],
+        serde_json::json!(["XRP"])
     );
     assert_eq!(
-        from_protocol_json(&reply)["alternatives"][0]["source_amount"],
-        serde_json::Value::String("1000000".to_owned())
+        from_protocol_json(&reply)["alternatives"],
+        serde_json::json!([])
     );
 }
 
@@ -1436,7 +1489,7 @@ fn json_conversion_round_trips_nested_objects() {
 #[tokio::test]
 async fn websocket_subscription_ledger_stream_receives_ledger_closed_event() {
     let manager = Arc::new(SubscriptionManager::new(8));
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (sender, mut receiver) = mpsc::channel(server::router::WS_SEND_QUEUE_LIMIT);
     let request = http::Request::builder()
         .method("GET")
         .uri("/")
@@ -1487,7 +1540,7 @@ async fn websocket_subscription_ledger_stream_receives_ledger_closed_event() {
 #[tokio::test]
 async fn websocket_subscription_server_stream_receives_fee_change() {
     let manager = Arc::new(SubscriptionManager::new(8));
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (sender, mut receiver) = mpsc::channel(server::router::WS_SEND_QUEUE_LIMIT);
     let request = http::Request::builder()
         .method("GET")
         .uri("/")
@@ -1534,7 +1587,7 @@ async fn websocket_subscription_server_stream_receives_fee_change() {
 #[tokio::test]
 async fn websocket_subscription_unsubscribe_stops_receiving() {
     let manager = Arc::new(SubscriptionManager::new(8));
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (sender, mut receiver) = mpsc::channel(server::router::WS_SEND_QUEUE_LIMIT);
     let request = http::Request::builder()
         .method("GET")
         .uri("/")
@@ -1574,7 +1627,7 @@ async fn websocket_subscription_unsubscribe_stops_receiving() {
 #[tokio::test]
 async fn websocket_subscription_multiple_streams_independent() {
     let manager = Arc::new(SubscriptionManager::new(8));
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (sender, mut receiver) = mpsc::channel(server::router::WS_SEND_QUEUE_LIMIT);
     let request = http::Request::builder()
         .method("GET")
         .uri("/")
@@ -1640,7 +1693,7 @@ async fn websocket_subscription_multiple_streams_independent() {
 #[tokio::test]
 async fn websocket_subscription_does_not_receive_unsubscribed_stream() {
     let manager = Arc::new(SubscriptionManager::new(8));
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (sender, mut receiver) = mpsc::channel(server::router::WS_SEND_QUEUE_LIMIT);
     let request = http::Request::builder()
         .method("GET")
         .uri("/")
@@ -1692,7 +1745,7 @@ async fn websocket_subscription_does_not_receive_unsubscribed_stream() {
 fn mpt_test_session(manager: Arc<SubscriptionManager>) -> (
     WSSession,
     RequestMetadata,
-    mpsc::UnboundedReceiver<axum::extract::ws::Message>,
+    mpsc::Receiver<axum::extract::ws::Message>,
 ) {
     let request = http::Request::builder()
         .method("GET")
@@ -1704,7 +1757,7 @@ fn mpt_test_session(manager: Arc<SubscriptionManager>) -> (
         &request,
     );
     metadata.is_websocket = true;
-    let (sender, receiver) = mpsc::unbounded_channel();
+    let (sender, receiver) = mpsc::channel(server::router::WS_SEND_QUEUE_LIMIT);
     let session = WSSession::new(40, metadata.clone(), sender, manager);
     (session, metadata, receiver)
 }

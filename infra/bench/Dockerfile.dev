@@ -1,0 +1,9 @@
+# Toolchain image for running the workspace tests, lints and benchmark
+# examples inside a container (source is bind-mounted, not copied).
+FROM rust:1.90-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang cmake pkg-config libssl-dev perl python3 curl jq \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup component add rustfmt clippy
+ENV CARGO_TARGET_DIR=/target CARGO_INCREMENTAL=0
+WORKDIR /src

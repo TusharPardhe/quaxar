@@ -93,9 +93,16 @@ pub struct SubscriptionManager {
     mpt_transactions: Arc<broadcast::Sender<MptTransactionEvent>>,
 }
 
+/// Per-stream broadcast ring size. Each subscriber's forwarding task moves
+/// events into its own bounded egress queue (`WS_SEND_QUEUE_LIMIT`), so this
+/// only needs to absorb publish bursts (a ledger close publishes every
+/// transaction back-to-back) while forwarding tasks are scheduled. A
+/// subscriber that still lags is disconnected, never silently skipped.
+pub const DEFAULT_STREAM_CAPACITY: usize = 1024;
+
 impl Default for SubscriptionManager {
     fn default() -> Self {
-        Self::new(32)
+        Self::new(DEFAULT_STREAM_CAPACITY)
     }
 }
 
@@ -178,8 +185,10 @@ impl SubscriptionManager {
     }
 
     pub fn publish_json(&self, stream: StreamKind, payload: JsonValue) -> usize {
-        let json = crate::json::from_protocol_json(&payload);
-        let text = sonic_rs::to_string(&json).unwrap_or_default();
+        // Serialized once per event and shared (refcounted) by all
+        // subscribers. The protocol tree is serialized directly: same sorted
+        // key output as converting to serde_json::Value first.
+        let text = sonic_rs::to_string(&payload).unwrap_or_default();
         self.publish(SubscriptionEvent {
             stream,
             payload: bytes::Bytes::from(text),

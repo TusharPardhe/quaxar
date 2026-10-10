@@ -257,7 +257,7 @@ impl TxMeta {
     }
 
     pub fn get_json(&self, options: JsonOptions) -> JsonValue {
-        self.get_as_object().json(options)
+        crate::json_writer::shallow_json(&self.get_as_object(), options)
     }
 
     pub fn add_raw(&mut self, serializer: &mut Serializer, result: Ter, index: u32) {

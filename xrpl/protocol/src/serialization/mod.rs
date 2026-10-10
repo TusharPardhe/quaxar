@@ -1,5 +1,6 @@
 pub mod error_codes;
 pub mod json_get_or_throw;
+pub mod json_writer;
 pub mod messages;
 pub mod multi_api_json;
 pub mod serialize;

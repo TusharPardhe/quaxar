@@ -1,3 +1,4 @@
+pub(crate) mod json_writer_corpus;
 mod serializer_kernel;
 mod sfield_registry;
 mod st_ledger_entry_parity;

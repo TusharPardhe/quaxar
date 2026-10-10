@@ -21,5 +21,6 @@ mod ledger_rpc;
 mod misc_operations;
 mod no_ripple_check;
 mod offer_paychan_deposit;
+mod raw_rendering_parity;
 mod signer_ticket_book;
 mod subscribe_gateway;

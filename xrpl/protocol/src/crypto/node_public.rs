@@ -13,13 +13,7 @@ pub const NODE_PUBLIC_KEY_LEN: usize = 33;
 pub type NodePublicKey = [u8; NODE_PUBLIC_KEY_LEN];
 
 pub fn encode_node_public_base58(public_key: NodePublicKey) -> String {
-    let mut payload = Vec::with_capacity(1 + public_key.len() + 4);
-    payload.push(NODE_PUBLIC_TOKEN_TYPE);
-    payload.extend_from_slice(&public_key);
-    payload.extend_from_slice(&checksum(&payload));
-    bs58::encode(payload)
-        .with_alphabet(xrpl_base58_alphabet())
-        .into_string()
+    crate::base::b58_fast::encode_token(NODE_PUBLIC_TOKEN_TYPE, &public_key)
 }
 
 pub fn parse_base58_node_public(value: &str) -> Option<NodePublicKey> {

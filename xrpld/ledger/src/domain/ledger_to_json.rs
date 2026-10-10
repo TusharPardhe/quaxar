@@ -1,7 +1,7 @@
 use crate::{Ledger, LedgerHeader, get_close_agree, serialize_ledger_header};
 use basics::chrono::{NetClockTimePoint, to_string, to_string_iso};
 use basics::str_hex::str_hex;
-use protocol::{JsonOptions, JsonValue, STLedgerEntry, SerialIter, StBase};
+use protocol::{JsonValue, STLedgerEntry, SerialIter};
 use shamap::family::{FullBelowCache, MissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
 use shamap::item::SHAMapItem;
 use shamap::traversal::TraversalError;
@@ -420,7 +420,7 @@ fn state_leaf_json(
         if !serial.empty() || entry.get_serializer().data() != item.data() {
             return Err(LedgerJsonError::InvalidLedgerEntry { key: item.key() });
         }
-        return Ok(entry.json(JsonOptions::NONE));
+        return Ok(protocol::json_writer::ledger_entry_json(&entry));
     }
 
     Ok(JsonValue::String(item.key().to_string()))

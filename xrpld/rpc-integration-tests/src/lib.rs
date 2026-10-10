@@ -2,5 +2,6 @@
 
 pub mod env;
 pub mod helpers;
+pub mod render_scenario;
 pub use helpers::*;
 pub use serde_json;

@@ -8996,11 +8996,15 @@ impl ApplicationRoot {
             return;
         };
         for (transaction, meta) in transactions {
-            let event = crate::ledger_to_json::ledger_to_json_tx::transaction_subscription_event(
-                ledger.as_ref(),
-                transaction.as_ref(),
-                &meta,
-            );
+            // Events are only serialized by the subscription publisher, so
+            // nested transaction/metadata objects render without trees.
+            let event = protocol::json_writer::with_raw_rendering(|| {
+                crate::ledger_to_json::ledger_to_json_tx::transaction_subscription_event(
+                    ledger.as_ref(),
+                    transaction.as_ref(),
+                    &meta,
+                )
+            });
             // `transactions` receives only accepted events. The distinct
             // real-time stream receives both proposed and the terminal
             // validated event, matching rippled's STransactions/SRtTransactions
@@ -10483,8 +10487,20 @@ impl ApplicationRoot {
         // but skip the state rebuild to avoid state map corruption from empty applies.
         if open_txs.is_empty() {
             let closed = {
+                let parent = self.ledger_with_node_fetcher(Arc::clone(&parent));
                 let mut ledger = Ledger::from_previous(&parent, close_time);
+                // rippled buildLedger updates the LedgerHashes skip list on
+                // every close, including empty ones. Without it the skip
+                // list's LastLedgerSequence lags the ledger and the next
+                // validation (RCLValidatedLedger) sees inconsistent ancestry.
+                if let Err(error) = ledger.update_skip_list() {
+                    tracing::error!(target: "app", ?error, seq = closed_seq,
+                        "standalone empty close: skip-list update failed");
+                }
                 ledger.set_accepted(close_time, 0, true);
+                // Same in-memory standalone state handling as the
+                // non-empty close below.
+                ledger.state_map_mut().set_unbacked();
                 Arc::new(ledger)
             };
             tracing::debug!(target: "app", seq = closed_seq, "Standalone ledger closed (empty)");
@@ -10663,6 +10679,11 @@ impl ApplicationRoot {
                         )
                     })?;
             }
+            // rippled buildLedgerImpl: updateSkipList after applying the
+            // accumulator, before setAccepted.
+            ledger
+                .update_skip_list()
+                .map_err(|error| format!("standalone skip-list update failed: {error:?}"))?;
             ledger.set_accepted(close_time, 0, true);
             // Mark state_map unbacked: all nodes are in memory (never flushed to the node store
             // in standalone mode). Without this, subsequent reads from child ledgers

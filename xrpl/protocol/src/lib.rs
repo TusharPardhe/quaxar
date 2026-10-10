@@ -31,6 +31,7 @@ pub use amounts::xrp_amount;
 pub use base::account_id;
 pub use base::api_version;
 pub use base::apply_flags;
+pub use base::b58_fast;
 pub use base::build_info;
 pub use base::concepts;
 pub use base::confidential_transfer;
@@ -80,6 +81,7 @@ pub use ledger::paychan;
 pub use ledger::seq_proxy;
 pub use serialization::error_codes;
 pub use serialization::json_get_or_throw;
+pub use serialization::json_writer;
 pub use serialization::messages;
 pub use serialization::multi_api_json;
 pub use serialization::serialize;
@@ -439,7 +441,7 @@ pub use st_var::{STVAR_MAX_NESTING_DEPTH, STVar};
 pub use st_vector256::STVector256;
 pub use st_xchain_bridge::{ChainType as XChainBridgeChainType, STXChainBridge};
 pub use stbase::{
-    JsonOptions, JsonValue, StBase, StBaseCore, ValidationError, downcast_stbase_mut,
+    JsonOptions, JsonValue, RawJson, StBase, StBaseCore, ValidationError, downcast_stbase_mut,
     downcast_stbase_ref, st_base_eq, st_base_ne, to_json,
 };
 pub use sttx_multi_sign::{

@@ -71,10 +71,16 @@ impl SOElement {
     }
 }
 
+/// Field layout for an object type. Cloned into every templated `STObject`,
+/// so storage is shared (`Arc`): a clone is three reference-count bumps
+/// rather than copying the per-SField index table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SOTemplate {
-    elements: Vec<SOElement>,
-    indices: Vec<i32>,
+    elements: std::sync::Arc<[SOElement]>,
+    indices: std::sync::Arc<[i32]>,
+    /// Element indices sorted by field name: the order fields appear in
+    /// JSON output (objects render with lexicographically sorted keys).
+    json_order: std::sync::Arc<[u16]>,
 }
 
 impl SOTemplate {
@@ -97,10 +103,19 @@ impl SOTemplate {
             indices[field_num] = index as i32;
         }
 
+        let mut json_order: Vec<u16> = (0..unique_fields.len() as u16).collect();
+        json_order.sort_by_key(|index| unique_fields[usize::from(*index)].sfield.name());
+
         Ok(Self {
-            elements: unique_fields,
-            indices,
+            elements: unique_fields.into(),
+            indices: indices.into(),
+            json_order: json_order.into(),
         })
+    }
+
+    /// Element indices in JSON key order (sorted by field name).
+    pub fn json_order(&self) -> &[u16] {
+        &self.json_order
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &SOElement> {

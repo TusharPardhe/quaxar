@@ -23,13 +23,55 @@ pub fn calc_account_id(public_key: &[u8]) -> AccountID {
 }
 
 pub fn to_base58(account_id: AccountID) -> String {
-    let mut payload = Vec::with_capacity(1 + AccountID::size() + 4);
-    payload.push(ACCOUNT_ID_TOKEN_TYPE);
-    payload.extend_from_slice(account_id.data());
-    payload.extend_from_slice(&checksum(&payload));
-    bs58::encode(payload)
-        .with_alphabet(xrpl_base58_alphabet())
-        .into_string()
+    with_base58(account_id, str::to_owned)
+}
+
+/// Call `f` with the classic address of `account_id`.
+///
+/// Addresses repeat heavily within a response (an owner across its offers,
+/// an issuer across trust lines and amounts), and each encoding costs a
+/// double SHA-256 checksum plus a base58 conversion. A small per-thread
+/// direct-mapped memo of the encoding (a pure function of the ID) turns
+/// repeats into a 20-byte compare. Account IDs are RIPEMD-160 outputs, so
+/// their low bytes index the table uniformly.
+pub fn with_base58<R>(account_id: AccountID, f: impl FnOnce(&str) -> R) -> R {
+    const SLOTS: usize = 1024;
+    #[derive(Clone, Copy)]
+    struct Slot {
+        id: [u8; 20],
+        len: u8,
+        text: [u8; 35],
+    }
+    thread_local! {
+        static MEMO: std::cell::RefCell<Vec<Slot>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    let id: [u8; 20] = *account_id.data();
+    let index = (usize::from(id[18]) << 8 | usize::from(id[19])) % SLOTS;
+    MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.is_empty() {
+            memo.resize(
+                SLOTS,
+                Slot {
+                    id: [0; 20],
+                    len: 0,
+                    text: [0; 35],
+                },
+            );
+        }
+        let slot = &mut memo[index];
+        if slot.len == 0 || slot.id != id {
+            let encoded = crate::base::b58_fast::encode_token(ACCOUNT_ID_TOKEN_TYPE, &id);
+            debug_assert!(encoded.len() <= 35);
+            slot.id = id;
+            slot.len = encoded.len() as u8;
+            slot.text[..encoded.len()].copy_from_slice(encoded.as_bytes());
+        }
+        let text = std::str::from_utf8(&slot.text[..usize::from(slot.len)])
+            .expect("base58 alphabet is ASCII");
+        f(text)
+    })
 }
 
 pub fn parse_base58_account_id(value: &str) -> Option<AccountID> {
@@ -96,6 +138,33 @@ mod tests {
         AccountID, calc_account_id, no_account, parse_base58_account_id, to_base58, xrp_account,
     };
     use crate::genesis_public_key;
+
+    #[test]
+    fn memoized_addresses_match_direct_encoding_including_slot_collisions() {
+        let mut state = 0x0BAD_C0DE_1234_5678_u64;
+        let mut ids = Vec::new();
+        for _ in 0..5_000 {
+            let mut bytes = [0_u8; 20];
+            for byte in &mut bytes {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            // Force collisions on the memo index (last two bytes).
+            if ids.len() % 3 == 0 {
+                bytes[18] = 0;
+                bytes[19] = 7;
+            }
+            ids.push(AccountID::from_array(bytes));
+        }
+        for round in 0..2 {
+            for id in &ids {
+                let expected = crate::base::b58_fast::encode_token(0, id.data());
+                assert_eq!(to_base58(*id), expected, "round {round}");
+            }
+        }
+    }
 
     #[test]
     fn base58_zero_and_genesis_vectors() {

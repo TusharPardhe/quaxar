@@ -1,6 +1,7 @@
 pub mod account_id;
 pub mod api_version;
 pub mod apply_flags;
+pub mod b58_fast;
 pub mod build_info;
 pub mod concepts;
 pub mod confidential_transfer;

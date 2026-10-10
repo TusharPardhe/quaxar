@@ -580,7 +580,7 @@ impl STTx {
             return JsonValue::String(data);
         }
 
-        self.json(options)
+        crate::json_writer::shallow_json(self, options)
     }
 
     fn finish_from_object(mut object: STObject, reapply_template: bool) -> Self {

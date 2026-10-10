@@ -1,0 +1,7 @@
+# Minimal runtime for a prebuilt quaxar binary (build context: a directory
+# containing `quaxar`).
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* && mkdir -p /var/lib/quaxar /etc/quaxar
+COPY quaxar /usr/local/bin/quaxar
+ENTRYPOINT ["/usr/local/bin/quaxar"]

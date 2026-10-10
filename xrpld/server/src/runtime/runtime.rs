@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
+use axum::serve::ListenerExt;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::service::TowerToHyperService;
 use tower::Service;
@@ -378,6 +379,9 @@ where
                                 },
                             };
                             let (stream, remote_address) = accepted;
+                            // Small JSON replies must not wait on Nagle +
+                            // delayed-ACK; the writer already coalesces frames.
+                            let _ = stream.set_nodelay(true);
                             let mut make_service = router.clone();
                             let overlay = Arc::clone(&overlay);
                             tokio::spawn(async move {
@@ -425,6 +429,9 @@ where
                         });
                         match axum_server::from_tcp_rustls(listener, config) {
                             Ok(server) => {
+                                let server = server.map(|acceptor| {
+                                    acceptor.acceptor(axum_server::accept::NoDelayAcceptor::new())
+                                });
                                 if let Err(error) = server.handle(handle).serve(router).await {
                                     tracing::warn!(target: "server",
                                         "server runtime secure listener stopped with error: {error}"
@@ -439,7 +446,10 @@ where
                         }
                     } else {
                         let bound_listener = tokio::net::TcpListener::from_std(listener)
-                            .expect("failed to adopt std listener");
+                            .expect("failed to adopt std listener")
+                            .tap_io(|stream| {
+                                let _ = stream.set_nodelay(true);
+                            });
                         if let Err(error) = axum::serve(bound_listener, router)
                             .with_graceful_shutdown(shutdown.wait_for_shutdown())
                             .await

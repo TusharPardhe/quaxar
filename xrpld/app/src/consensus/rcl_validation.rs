@@ -129,11 +129,21 @@ impl RclValidatedLedger {
         // become a synthetic window of zero hashes.
         let ancestors = match ledger.read(skip_keylet()) {
             Ok(Some(hash_index)) => {
-                assert_eq!(
-                    hash_index.get_field_u32(get_field_by_symbol("sfLastLedgerSequence")),
+                // rippled uses XRPL_ASSERT here, which is compiled out of
+                // release builds; a lagging skip list must not take the
+                // process down (it did in standalone mode on `submit`).
+                let last = hash_index.get_field_u32(get_field_by_symbol("sfLastLedgerSequence"));
+                debug_assert_eq!(
+                    last,
                     ledger_seq.saturating_sub(1),
                     "xrpl::RCLValidatedLedger::RCLValidatedLedger(Ledger): valid last ledger sequence"
                 );
+                if last != ledger_seq.saturating_sub(1) {
+                    journal.warn(&format!(
+                        "Ledger {ledger_seq}:{ledger_id} skip list ends at {last}, expected {}",
+                        ledger_seq.saturating_sub(1)
+                    ));
+                }
                 hash_index
                     .get_field_v256(get_field_by_symbol("sfHashes"))
                     .value()

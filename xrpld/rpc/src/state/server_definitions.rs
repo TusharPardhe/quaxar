@@ -150,6 +150,7 @@ fn append_json_string(out: &mut String, value: &str) {
 
 fn append_json_value(out: &mut String, value: &JsonValue) {
     match value {
+        JsonValue::Raw(raw) => out.push_str(raw.as_str()),
         JsonValue::Null => out.push_str("null"),
         JsonValue::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
         JsonValue::Signed(value) => out.push_str(&value.to_string()),

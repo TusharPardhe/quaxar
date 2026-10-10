@@ -352,16 +352,13 @@ fn signer_lists_requested(params: &JsonValue, api_version: u32) -> Result<bool, 
     }
 }
 
-fn insert_gravatar_if_present(
-    account_data: &mut BTreeMap<String, JsonValue>,
-    account_root: &AccountRoot,
-) {
+fn gravatar_url(account_root: &AccountRoot) -> Option<JsonValue> {
     let email_hash_field = protocol::get_field_by_symbol("sfEmailHash");
     if !account_root
         .as_st_ledger_entry()
         .is_field_present(email_hash_field)
     {
-        return;
+        return None;
     }
 
     let mut md5 = str_hex(
@@ -371,25 +368,30 @@ fn insert_gravatar_if_present(
             .data(),
     );
     md5.make_ascii_lowercase();
-    account_data.insert(
-        "urlgravatar".to_owned(),
-        JsonValue::String(format!("http://www.gravatar.com/avatar/{md5}")),
-    );
+    Some(JsonValue::String(format!(
+        "http://www.gravatar.com/avatar/{md5}"
+    )))
 }
 
-fn inject_account_data(account_root: &AccountRoot) -> JsonValue {
-    let mut account_data = match account_root.as_st_ledger_entry().json(JsonOptions::NONE) {
-        JsonValue::Object(object) => object,
-        _ => BTreeMap::new(),
-    };
-
+/// `account_data`: the AccountRoot JSON plus `urlgravatar` (or `Invalid`),
+/// and the API v1 `signer_lists` member when requested. Rendered without a
+/// tree when the server enables raw rendering.
+fn inject_account_data(
+    account_root: &AccountRoot,
+    signer_lists_v1: Option<JsonValue>,
+) -> JsonValue {
+    let mut extras: Vec<(&str, JsonValue)> = Vec::new();
     if account_root.get_type() == LedgerEntryType::AccountRoot {
-        insert_gravatar_if_present(&mut account_data, account_root);
+        if let Some(url) = gravatar_url(account_root) {
+            extras.push(("urlgravatar", url));
+        }
     } else {
-        account_data.insert("Invalid".to_owned(), JsonValue::Bool(true));
+        extras.push(("Invalid", JsonValue::Bool(true)));
     }
-
-    JsonValue::Object(account_data)
+    if let Some(signer_lists) = signer_lists_v1 {
+        extras.push(("signer_lists", signer_lists));
+    }
+    protocol::json_writer::ledger_entry_json_extended(account_root.as_st_ledger_entry(), extras)
 }
 
 fn insert_flag(
@@ -640,10 +642,27 @@ pub fn do_account_info<S: AccountInfoSource>(
     let account_root = AccountRoot::new(Arc::new(account_root))
         .expect("account root entry should match the AccountRoot wrapper");
 
+    let signer_lists_value =
+        signer_lists.then(|| match source.read_signer_list(&ledger, account_id) {
+            Some(signer_list) => {
+                let signer_list = SignerList::new(Arc::new(signer_list))
+                    .expect("signer list entry should match the SignerList wrapper");
+                JsonValue::Array(vec![protocol::json_writer::ledger_entry_json(
+                    signer_list.as_st_ledger_entry(),
+                )])
+            }
+            None => JsonValue::Array(Vec::new()),
+        });
+    let (signer_lists_v1, signer_lists_top) = if request.api_version == 1 {
+        (signer_lists_value, None)
+    } else {
+        (None, signer_lists_value)
+    };
+
     let object = ensure_object(&mut result);
     object.insert(
         "account_data".to_owned(),
-        inject_account_data(&account_root),
+        inject_account_data(&account_root, signer_lists_v1),
     );
     object.insert(
         "account_flags".to_owned(),
@@ -659,29 +678,8 @@ pub fn do_account_info<S: AccountInfoSource>(
         );
     }
 
-    if signer_lists {
-        let signer_lists_value = match source.read_signer_list(&ledger, account_id) {
-            Some(signer_list) => {
-                let signer_list = SignerList::new(Arc::new(signer_list))
-                    .expect("signer list entry should match the SignerList wrapper");
-                JsonValue::Array(vec![
-                    signer_list.as_st_ledger_entry().json(JsonOptions::NONE),
-                ])
-            }
-            None => JsonValue::Array(Vec::new()),
-        };
-
-        if request.api_version == 1 {
-            let JsonValue::Object(account_data) = object
-                .entry("account_data".to_owned())
-                .or_insert_with(|| JsonValue::Object(BTreeMap::new()))
-            else {
-                unreachable!("account_data should remain an object");
-            };
-            account_data.insert("signer_lists".to_owned(), signer_lists_value);
-        } else {
-            object.insert("signer_lists".to_owned(), signer_lists_value);
-        }
+    if let Some(signer_lists_value) = signer_lists_top {
+        object.insert("signer_lists".to_owned(), signer_lists_value);
     }
 
     if queue {
