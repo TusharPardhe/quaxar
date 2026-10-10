@@ -16,6 +16,28 @@ use crate::{
     RpcServerPortDeferredProtocol, RpcServerPortPolicy, ServerStatusSource, SubscriptionManager,
 };
 
+/// Unpack an `ApplicationRoot` MPT transaction envelope and route its event to
+/// `mpt_issuances` subscribers.
+fn publish_mpt_envelope(subscriptions: &SubscriptionManager, payload: protocol::JsonValue) {
+    let protocol::JsonValue::Object(mut envelope) = payload else {
+        return;
+    };
+    let Some(event) = envelope.remove("event") else {
+        return;
+    };
+    let Some(protocol::JsonValue::Array(ids)) = envelope.remove("mpt_issuance_ids") else {
+        return;
+    };
+    let ids = ids
+        .iter()
+        .filter_map(|id| match id {
+            protocol::JsonValue::String(text) => protocol::MPTID::from_hex(text).ok(),
+            _ => None,
+        })
+        .collect();
+    subscriptions.publish_mpt_transaction(ids, &event);
+}
+
 #[derive(Default)]
 struct ServerRuntimeState {
     started: AtomicBool,
@@ -507,7 +529,9 @@ impl ServerRuntime<BuiltinDispatcher<ApplicationServerInfo<OwnedApplicationServe
         let shared_subs = Arc::new(SubscriptionManager::default());
         let subscription_publisher = Arc::clone(&shared_subs);
         app.set_subscription_publisher(move |stream_name, payload| {
-            if let Some(stream) = crate::StreamKind::from_name(stream_name) {
+            if stream_name == app::state::application_root::MPT_TRANSACTION_PUBLICATION {
+                publish_mpt_envelope(&subscription_publisher, payload);
+            } else if let Some(stream) = crate::StreamKind::from_name(stream_name) {
                 subscription_publisher.publish_json(stream, payload);
             }
         });
@@ -962,6 +986,99 @@ mod tests {
             meta.get("DeliveredAmount"),
             Some(&JsonValue::String("800".to_owned()))
         );
+    }
+
+    #[test]
+    fn server_runtime_routes_validated_mpt_transactions_to_mpt_subscribers() {
+        let mut app = ApplicationRoot::new(0).expect("root shell should build");
+        app.attach_server_ports_setup(Arc::new(ServerPortsSetup {
+            ports: vec![ServerPortSetup {
+                name: "port_rpc".to_owned(),
+                ip: "127.0.0.1".to_owned(),
+                port: 0,
+                limit: 0,
+                protocols: vec!["http".to_owned(), "ws".to_owned()],
+                user: String::new(),
+                password: String::new(),
+                admin_user: String::new(),
+                admin_password: String::new(),
+                ssl_key: String::new(),
+                ssl_cert: String::new(),
+                ssl_chain: String::new(),
+                ssl_ciphers: String::new(),
+                admin_nets_v4: Vec::new(),
+                admin_nets_v6: Vec::new(),
+                secure_gateway_nets_v4: Vec::new(),
+                secure_gateway_nets_v6: Vec::new(),
+                standalone_mode: false,
+            }],
+            client: None,
+            overlay: None,
+            grpc: None,
+        }));
+        let runtime =
+            ServerRuntime::from_application_root(&app).expect("runtime should build from app");
+        let mut mpt_receiver = runtime.subscriptions().subscribe_mpt_transactions();
+
+        let issuer = protocol::AccountID::from_array([0x33; 20]);
+        let tx = Arc::new(STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |object| {
+            object.set_account_id(get_field_by_symbol("sfAccount"), issuer);
+            object.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+            object.set_field_u32(get_field_by_symbol("sfSequence"), 7);
+        }));
+        let mut new_fields = protocol::STObject::new(get_field_by_symbol("sfNewFields"));
+        new_fields.set_field_u32(get_field_by_symbol("sfSequence"), 7);
+        new_fields.set_account_id(get_field_by_symbol("sfIssuer"), issuer);
+        let mut created = protocol::STObject::new(get_field_by_symbol("sfCreatedNode"));
+        created.set_field_h256(
+            get_field_by_symbol("sfLedgerIndex"),
+            basics::base_uint::Uint256::from_array([0x55; 32]),
+        );
+        created.set_field_u16(
+            get_field_by_symbol("sfLedgerEntryType"),
+            protocol::LedgerEntryType::MPTokenIssuance.code(),
+        );
+        created.set_field_object(get_field_by_symbol("sfNewFields"), new_fields);
+        let mut affected = protocol::STArray::new(get_field_by_symbol("sfAffectedNodes"));
+        affected.push_back(created);
+        let mut meta_object = protocol::STObject::new(get_field_by_symbol("sfTransactionMetaData"));
+        meta_object.set_field_u8(get_field_by_symbol("sfTransactionResult"), 0);
+        meta_object.set_field_u32(get_field_by_symbol("sfTransactionIndex"), 0);
+        meta_object.set_field_array(get_field_by_symbol("sfAffectedNodes"), affected);
+        let mut meta = TxMeta::from_stobject(tx.get_transaction_id(), 500, meta_object);
+        let mut raw_meta = Serializer::default();
+        meta.add_raw(&mut raw_meta, Ter::TES_SUCCESS, 0);
+
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(500, 500_000_000, false);
+        ledger
+            .raw_tx_insert(
+                tx.get_transaction_id(),
+                Arc::new(Serializer::from_bytes(tx.get_serializer().data())),
+                Some(Arc::new(raw_meta)),
+            )
+            .expect("accepted transaction should insert");
+        app.on_published_ledger(Arc::new(ledger));
+
+        let event = mpt_receiver
+            .try_recv()
+            .expect("MPT subscribers should receive the validated transaction");
+        assert!(mpt_receiver.try_recv().is_err());
+        assert_eq!(
+            *event.mpt_ids,
+            std::collections::BTreeSet::from([protocol::make_mpt_id(7, issuer)])
+        );
+        let payload: JsonValue = sonic_rs::from_slice(&event.payload).expect("event JSON");
+        let JsonValue::Object(payload) = payload else {
+            panic!("MPT event should be an object")
+        };
+        assert_eq!(
+            payload.get("type"),
+            Some(&JsonValue::String("transaction".to_owned()))
+        );
+        assert_eq!(payload.get("validated"), Some(&JsonValue::Bool(true)));
     }
 
     #[test]

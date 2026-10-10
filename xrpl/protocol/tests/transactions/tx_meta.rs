@@ -237,3 +237,60 @@ fn tx_meta_add_raw_rejects_invalid_ter_range() {
 
     assert!(result.is_err());
 }
+
+#[test]
+fn tx_meta_collects_affected_mpts_like_rippled() {
+    let node = |kind: &str, entry: LedgerEntryType, idx: u8, payload: STObject| {
+        let mut node = STObject::new(get_field_by_symbol(kind));
+        node.set_field_h256(get_field_by_symbol("sfLedgerIndex"), hash(idx));
+        node.set_field_u16(get_field_by_symbol("sfLedgerEntryType"), entry.code());
+        let payload_field = if kind == "sfCreatedNode" { "sfNewFields" } else { "sfFinalFields" };
+        node.set_field_object(get_field_by_symbol(payload_field), payload);
+        node
+    };
+
+    // 1. A created issuance: id derived from its Sequence and Issuer.
+    let issuer = account(0x33);
+    let mut issuance = STObject::new(get_field_by_symbol("sfNewFields"));
+    issuance.set_field_u32(get_field_by_symbol("sfSequence"), 7);
+    issuance.set_account_id(get_field_by_symbol("sfIssuer"), issuer);
+    // 2. An MPToken carrying sfMPTokenIssuanceID.
+    let holder_issuance = make_mpt_id(11, account(0x44));
+    let mut mptoken = STObject::new(get_field_by_symbol("sfFinalFields"));
+    mptoken.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), holder_issuance);
+    // 3. An offer with an MPT amount (deleted node: FinalFields).
+    let offer_issuance = make_mpt_id(13, account(0x55));
+    let mut offer = STObject::new(get_field_by_symbol("sfFinalFields"));
+    offer.set_field_amount(
+        get_field_by_symbol("sfTakerGets"),
+        STAmount::from_mpt_amount(
+            get_field_by_symbol("sfTakerGets"),
+            MPTAmount::from_value(5),
+            MPTIssue::new(offer_issuance),
+        ),
+    );
+    // A modified node with no FinalFields contributes nothing.
+    let mut bare = STObject::new(get_field_by_symbol("sfModifiedNode"));
+    bare.set_field_h256(get_field_by_symbol("sfLedgerIndex"), hash(0x09));
+    bare.set_field_u16(
+        get_field_by_symbol("sfLedgerEntryType"),
+        LedgerEntryType::MPTokenIssuance.code(),
+    );
+
+    let mut affected = protocol::STArray::new(get_field_by_symbol("sfAffectedNodes"));
+    affected.push_back(node("sfCreatedNode", LedgerEntryType::MPTokenIssuance, 1, issuance));
+    affected.push_back(node("sfModifiedNode", LedgerEntryType::MPToken, 2, mptoken));
+    affected.push_back(node("sfDeletedNode", LedgerEntryType::Offer, 3, offer));
+    affected.push_back(bare);
+
+    let mut object = STObject::new(get_field_by_symbol("sfTransactionMetaData"));
+    object.set_field_u8(get_field_by_symbol("sfTransactionResult"), 0);
+    object.set_field_u32(get_field_by_symbol("sfTransactionIndex"), 1);
+    object.set_field_array(get_field_by_symbol("sfAffectedNodes"), affected);
+    let meta = TxMeta::from_stobject(hash(0xFE), 88, object);
+
+    assert_eq!(
+        meta.get_affected_mpts(),
+        std::collections::BTreeSet::from([make_mpt_id(7, issuer), holder_issuance, offer_issuance])
+    );
+}

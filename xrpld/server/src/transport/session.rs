@@ -1,13 +1,14 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::ws::Message;
 use http::{HeaderMap, Method, Request, Uri, Version};
-use protocol::JsonValue;
+use protocol::{JsonValue, MPTID};
 use rpc::RpcRole;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -106,6 +107,9 @@ pub struct WSSession {
     sender: mpsc::UnboundedSender<Message>,
     subscriptions: Arc<SubscriptionManager>,
     tasks: Mutex<HashMap<StreamKind, Vec<JoinHandle<()>>>>,
+    /// rippled `InfoSub::mptSubscriptions_`, shared with the delivery task.
+    mpt_subscriptions: Arc<Mutex<HashSet<MPTID>>>,
+    mpt_task: Mutex<Option<JoinHandle<()>>>,
     app_defined: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
     rpc_state: Mutex<WsRpcState>,
 }
@@ -123,6 +127,8 @@ impl WSSession {
             sender,
             subscriptions,
             tasks: Mutex::new(HashMap::new()),
+            mpt_subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            mpt_task: Mutex::new(None),
             app_defined: Mutex::new(None),
             rpc_state: Mutex::new(WsRpcState::default()),
         }
@@ -206,7 +212,105 @@ impl WSSession {
         }
     }
 
+    /// rippled `InfoSub::totalSubscriptionCount`. Quaxar tracks no account,
+    /// real-time account or account-history sets yet, so only MPT issuances
+    /// contribute.
+    pub fn total_subscription_count(&self) -> usize {
+        self.mpt_subscriptions
+            .lock()
+            .expect("mpt subscriptions mutex poisoned")
+            .len()
+    }
+
+    /// rippled `InfoSub::tryReserveMPTSubscriptions` followed by
+    /// `NetworkOPs::subMPT`: under one lock, charge only net-new issuances
+    /// against `cap` and insert all of them, or record nothing.
+    pub fn try_subscribe_mpts(&self, mpt_ids: &HashSet<MPTID>, cap: usize) -> bool {
+        {
+            let mut held = self
+                .mpt_subscriptions
+                .lock()
+                .expect("mpt subscriptions mutex poisoned");
+            let fresh = mpt_ids.iter().filter(|id| !held.contains(*id)).count();
+            if crate::subscriptions::exceeds_subscription_cap(held.len(), fresh, cap) {
+                return false;
+            }
+            held.extend(mpt_ids.iter().copied());
+        }
+        self.ensure_mpt_delivery_task();
+        true
+    }
+
+    /// rippled `NetworkOPs::unsubMPT`.
+    pub fn unsubscribe_mpts(&self, mpt_ids: &HashSet<MPTID>) {
+        let now_empty = {
+            let mut held = self
+                .mpt_subscriptions
+                .lock()
+                .expect("mpt subscriptions mutex poisoned");
+            for id in mpt_ids {
+                held.remove(id);
+            }
+            held.is_empty()
+        };
+        if now_empty
+            && let Some(handle) = self
+                .mpt_task
+                .lock()
+                .expect("mpt task mutex poisoned")
+                .take()
+        {
+            handle.abort();
+        }
+    }
+
+    fn ensure_mpt_delivery_task(&self) {
+        let mut task = self.mpt_task.lock().expect("mpt task mutex poisoned");
+        if task.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            return;
+        }
+        let mut rx = self.subscriptions.subscribe_mpt_transactions();
+        let sender = self.sender.clone();
+        let held = Arc::clone(&self.mpt_subscriptions);
+        *task = Some(tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        // One delivery per connection even when several of its
+                        // issuances are affected (rippled collects listeners
+                        // into a HashSet before sending).
+                        let wanted = {
+                            let held = held.lock().expect("mpt subscriptions mutex poisoned");
+                            event.mpt_ids.iter().any(|id| held.contains(id))
+                        };
+                        if !wanted {
+                            continue;
+                        }
+                        let text: axum::extract::ws::Utf8Bytes = event.payload.try_into().unwrap();
+                        if sender.send(Message::Text(text)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+    }
+
     pub fn complete(&self) {
+        if let Some(handle) = self
+            .mpt_task
+            .lock()
+            .expect("mpt task mutex poisoned")
+            .take()
+        {
+            handle.abort();
+        }
+        self.mpt_subscriptions
+            .lock()
+            .expect("mpt subscriptions mutex poisoned")
+            .clear();
         let mut tasks = self.tasks.lock().expect("tasks mutex poisoned");
         for handles in tasks.values_mut() {
             for handle in handles.drain(..) {

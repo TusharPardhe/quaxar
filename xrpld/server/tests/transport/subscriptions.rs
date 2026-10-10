@@ -1688,3 +1688,136 @@ async fn websocket_subscription_does_not_receive_unsubscribed_stream() {
     let json: serde_json::Value = serde_json::from_str(&text).expect("json");
     assert_eq!(json["type"], "ledgerClosed");
 }
+
+fn mpt_test_session(manager: Arc<SubscriptionManager>) -> (
+    WSSession,
+    RequestMetadata,
+    mpsc::UnboundedReceiver<axum::extract::ws::Message>,
+) {
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("/")
+        .body(axum::body::Body::from(Vec::<u8>::new()))
+        .expect("request should build");
+    let mut metadata = RequestMetadata::new(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51240),
+        &request,
+    );
+    metadata.is_websocket = true;
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let session = WSSession::new(40, metadata.clone(), sender, manager);
+    (session, metadata, receiver)
+}
+
+fn mpt_id(byte: u8) -> protocol::MPTID {
+    protocol::MPTID::from_array([byte; 24])
+}
+
+fn dispatch_mpt(
+    dispatcher: &impl RpcDispatcher,
+    method: &str,
+    params: serde_json::Value,
+    metadata: &RequestMetadata,
+    session: &WSSession,
+) -> serde_json::Value {
+    let params = to_protocol_json(params);
+    let reply = dispatcher.dispatch(RpcRequest {
+        method,
+        params: &params,
+        metadata,
+        session: Some(session),
+    });
+    let server::RpcReply::Result(reply) = reply else {
+        panic!("{method} reply must be a result");
+    };
+    from_protocol_json(&reply)
+}
+
+#[test]
+fn subscribe_mpt_issuances_rejects_malformed_requests_like_rippled() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = runtime.enter();
+    let manager = Arc::new(SubscriptionManager::new(8));
+    let dispatcher = BuiltinDispatcher::new(rpc::ApplicationServerInfo::new(&app), (*manager).clone());
+    let (session, metadata, _rx) = mpt_test_session(Arc::clone(&manager));
+    let valid = mpt_id(0xA1).to_string();
+
+    for method in ["subscribe", "unsubscribe"] {
+        for bad in [
+            json!({"mpt_issuances": valid.clone()}),
+            json!({"mpt_issuances": []}),
+            json!({"mpt_issuances": [valid.clone(), 7]}),
+            json!({"mpt_issuances": ["00AB"]}),
+            json!({"mpt_issuances": [format!("{}ZZ", &valid[..46])]}),
+        ] {
+            let reply = dispatch_mpt(&dispatcher, method, bad.clone(), &metadata, &session);
+            assert_eq!(reply["error"], "invalidParams", "{method} {bad}");
+        }
+    }
+    assert_eq!(session.total_subscription_count(), 0);
+
+    let reply = dispatch_mpt(
+        &dispatcher,
+        "subscribe",
+        json!({"mpt_issuances": [valid.clone(), valid]}),
+        &metadata,
+        &session,
+    );
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(session.total_subscription_count(), 1);
+}
+
+#[tokio::test]
+async fn mpt_subscription_cap_counts_only_net_new_issuances() {
+    let manager = Arc::new(SubscriptionManager::new(8));
+    let (session, _metadata, _rx) = mpt_test_session(Arc::clone(&manager));
+    let first: std::collections::HashSet<_> = [mpt_id(1), mpt_id(2)].into();
+    assert!(session.try_subscribe_mpts(&first, 2));
+    // Re-subscribing held issuances is free.
+    assert!(session.try_subscribe_mpts(&first, 2));
+    // One net-new issuance exceeds the cap: all-or-nothing, nothing recorded.
+    let over: std::collections::HashSet<_> = [mpt_id(2), mpt_id(3)].into();
+    assert!(!session.try_subscribe_mpts(&over, 2));
+    assert_eq!(session.total_subscription_count(), 2);
+}
+
+#[tokio::test]
+async fn mpt_stream_delivers_transaction_once_per_connection_for_affected_issuances() {
+    let manager = Arc::new(SubscriptionManager::new(8));
+    let (session, _metadata, mut rx) = mpt_test_session(Arc::clone(&manager));
+    let subscribed: std::collections::HashSet<_> = [mpt_id(1), mpt_id(2)].into();
+    assert!(session.try_subscribe_mpts(&subscribed, 100));
+
+    let event = |n: u64| {
+        to_protocol_json(json!({"type": "transaction", "validated": true, "ledger_index": n}))
+    };
+    // Unrelated issuance: not delivered.
+    assert_eq!(manager.publish_mpt_transaction([mpt_id(9)].into(), &event(1)), 1);
+    // Two subscribed issuances affected: delivered exactly once.
+    manager.publish_mpt_transaction([mpt_id(1), mpt_id(2), mpt_id(9)].into(), &event(2));
+
+    let message = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("mpt message should arrive")
+        .expect("channel open");
+    let axum::extract::ws::Message::Text(text) = message else {
+        panic!("unexpected ws message");
+    };
+    let emitted: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+    // rippled #8539: the message type stays `transaction`.
+    assert_eq!(emitted["type"], "transaction");
+    assert_eq!(emitted["ledger_index"], 2);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err(),
+        "a transaction must reach a connection once"
+    );
+
+    // After unsubscribing every issuance the connection receives nothing and
+    // the delivery task is released.
+    session.unsubscribe_mpts(&subscribed);
+    tokio::task::yield_now().await;
+    assert_eq!(manager.publish_mpt_transaction([mpt_id(1)].into(), &event(3)), 0);
+}

@@ -209,6 +209,53 @@ impl TxMeta {
         accounts
     }
 
+    /// MPT issuances whose ledger state this transaction touched, matching
+    /// rippled `TxMeta::getAffectedMPTs` (#5671): an `MPTokenIssuance` node
+    /// contributes the id derived from its `Sequence` and `Issuer`, and every
+    /// `sfMPTokenIssuanceID` field or MPT-denominated amount in the node's
+    /// new/final fields contributes its issuance id.
+    pub fn get_affected_mpts(&self) -> BTreeSet<MPTID> {
+        let mut list = BTreeSet::new();
+
+        for node in self.nodes.iter() {
+            let payload_field = if node.fname() == get_field_by_symbol("sfCreatedNode") {
+                get_field_by_symbol("sfNewFields")
+            } else {
+                get_field_by_symbol("sfFinalFields")
+            };
+
+            if !node.is_field_present(payload_field) {
+                continue;
+            }
+
+            let inner = node.get_field_object(payload_field);
+            // An MPTokenIssuance entry does not store its own issuance id; the
+            // id is derived from the issuer and the sequence that created it.
+            if node.get_field_u16(get_field_by_symbol("sfLedgerEntryType"))
+                == crate::LedgerEntryType::MPTokenIssuance.code()
+            {
+                list.insert(crate::make_mpt_id(
+                    inner.get_field_u32(get_field_by_symbol("sfSequence")),
+                    inner.get_account_id(get_field_by_symbol("sfIssuer")),
+                ));
+            }
+
+            for field in inner.iter() {
+                if field.fname() == get_field_by_symbol("sfMPTokenIssuanceID")
+                    && let Some(mpt_id) = field.as_any().downcast_ref::<STUInt192>()
+                {
+                    list.insert(MPTID::from_array(*mpt_id.value().data()));
+                } else if let Some(amount) = field.as_any().downcast_ref::<STAmount>()
+                    && let crate::Asset::MPTIssue(issue) = amount.asset()
+                {
+                    list.insert(issue.mpt_id());
+                }
+            }
+        }
+
+        list
+    }
+
     pub fn get_json(&self, options: JsonOptions) -> JsonValue {
         self.get_as_object().json(options)
     }

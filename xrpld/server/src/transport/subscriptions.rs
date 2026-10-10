@@ -1,6 +1,7 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use protocol::JsonValue;
+use protocol::{JsonValue, MPTID};
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,6 +60,24 @@ pub struct SubscriptionEvent {
     pub payload: bytes::Bytes,
 }
 
+/// rippled `kMaxSubscriptionsPerConnection`: the per-connection bound on the
+/// subscription sets counted by `InfoSub::totalSubscriptionCount`.
+pub const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 100_000;
+
+/// rippled `exceedsSubscriptionCap`.
+pub fn exceeds_subscription_cap(current: usize, additional: usize, cap: usize) -> bool {
+    additional > cap || current > cap - additional
+}
+
+/// A validated transaction published to `mpt_issuances` subscribers, carrying
+/// the issuance ids from `TxMeta::getAffectedMPTs` so each connection can
+/// deliver it once when any of its subscribed issuances is affected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MptTransactionEvent {
+    pub mpt_ids: Arc<BTreeSet<MPTID>>,
+    pub payload: bytes::Bytes,
+}
+
 #[derive(Debug, Clone)]
 pub struct SubscriptionManager {
     ledger: Arc<broadcast::Sender<SubscriptionEvent>>,
@@ -71,6 +90,7 @@ pub struct SubscriptionManager {
     validations: Arc<broadcast::Sender<SubscriptionEvent>>,
     peer_status: Arc<broadcast::Sender<SubscriptionEvent>>,
     consensus: Arc<broadcast::Sender<SubscriptionEvent>>,
+    mpt_transactions: Arc<broadcast::Sender<MptTransactionEvent>>,
 }
 
 impl Default for SubscriptionManager {
@@ -96,7 +116,30 @@ impl SubscriptionManager {
             validations: channel(capacity),
             peer_status: channel(capacity),
             consensus: channel(capacity),
+            mpt_transactions: Arc::new(broadcast::channel(capacity).0),
         }
+    }
+
+    pub fn subscribe_mpt_transactions(&self) -> broadcast::Receiver<MptTransactionEvent> {
+        self.mpt_transactions.subscribe()
+    }
+
+    /// rippled `NetworkOPsImp::pubMPTTransaction`: send the validated
+    /// transaction JSON unchanged (type `transaction`, rippled #8539) to
+    /// subscribers of any affected issuance. Returns early, before
+    /// serializing, when nobody holds an MPT subscription.
+    pub fn publish_mpt_transaction(&self, mpt_ids: BTreeSet<MPTID>, payload: &JsonValue) -> usize {
+        if mpt_ids.is_empty() || self.mpt_transactions.receiver_count() == 0 {
+            return 0;
+        }
+        let json = crate::json::from_protocol_json(payload);
+        let text = sonic_rs::to_string(&json).unwrap_or_default();
+        self.mpt_transactions
+            .send(MptTransactionEvent {
+                mpt_ids: Arc::new(mpt_ids),
+                payload: bytes::Bytes::from(text),
+            })
+            .unwrap_or(0)
     }
 
     pub fn subscribe(&self, stream: StreamKind) -> broadcast::Receiver<SubscriptionEvent> {
