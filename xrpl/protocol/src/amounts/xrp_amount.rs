@@ -110,6 +110,11 @@ impl From<XRPAmount> for bool {
     }
 }
 
+// rippled `XRPAmount::operator+=` / `operator-=` are unchecked `int64` adds
+// (`drops_ += other`), which wrap on every platform rippled ships. Keep
+// the same wrapping semantics so results stay identical to rippled; callers
+// that must reject overflow use explicit checked arithmetic, as rippled does
+// with `checkedAdd` (see `protocol::checked_step_add`).
 impl AddAssign for XRPAmount {
     fn add_assign(&mut self, rhs: Self) {
         self.drops = self.drops.wrapping_add(rhs.drops);

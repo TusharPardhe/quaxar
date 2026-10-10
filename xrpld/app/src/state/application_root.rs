@@ -2314,6 +2314,32 @@ pub fn transaction_preflight_ter_with_flags_and_network_id(
 
 /// Shared semantic preflight with the `parentBatchId` supplied by
 /// `rippled::preflight(..., parentBatchId, ..., TapBatch, ...)`.
+/// rippled `applySteps.cpp` wraps preflight and preclaim in
+/// `try { ... } catch (std::exception const&) { return tefEXCEPTION; }`.
+/// quaxar's protocol arithmetic panics where rippled throws (non-comparable
+/// amounts, out-of-range integral or issued values), so contain those panics
+/// here and report tefEXCEPTION instead of unwinding past the transaction.
+fn contain_transaction_step(stage: &'static str, tx: &STTx, step: impl FnOnce() -> Ter) -> Ter {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)) {
+        Ok(ter) => ter,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|m| (*m).to_owned()))
+                .unwrap_or_else(|| "non-string panic payload".to_owned());
+            tracing::error!(
+                target: "tx",
+                tx_id = %tx.get_transaction_id(),
+                stage,
+                %message,
+                "transaction step panicked; mapped to tefEXCEPTION"
+            );
+            Ter::TEF_EXCEPTION
+        }
+    }
+}
+
 fn transaction_preflight_ter_with_parent_batch_id(
     tx: &STTx,
     rules: &Rules,
@@ -2321,14 +2347,16 @@ fn transaction_preflight_ter_with_parent_batch_id(
     flags: ApplyFlags,
     node_network_id: u32,
 ) -> Ter {
-    tx::with_transaction_step_runtime(rules, || {
-        transaction_preflight_ter_with_parent_batch_id_inner(
-            tx,
-            rules,
-            parent_batch_id,
-            flags,
-            node_network_id,
-        )
+    contain_transaction_step("preflight", tx, || {
+        tx::with_transaction_step_runtime(rules, || {
+            transaction_preflight_ter_with_parent_batch_id_inner(
+                tx,
+                rules,
+                parent_batch_id,
+                flags,
+                node_network_id,
+            )
+        })
     })
 }
 
@@ -2592,7 +2620,8 @@ fn queue_apply_preclaim_ter_with_parent_batch_id(
     parent_batch_id: Option<Uint256>,
 ) -> Ter {
     let rules = view.rules();
-    tx::with_transaction_step_runtime(&rules, || {
+    contain_transaction_step("preclaim", tx, || {
+        tx::with_transaction_step_runtime(&rules, || {
         crate::state::invoke_preclaim::invoke_preclaim_with_parent_batch_id(
             view,
             tx,
@@ -2615,6 +2644,7 @@ fn queue_apply_preclaim_ter_with_parent_batch_id(
                 }
             },
         )
+        })
     })
 }
 
@@ -2627,7 +2657,8 @@ pub(crate) fn queue_apply_preclaim_ter_with_load_fee(
 ) -> Ter {
     let (fee_factor, remote_fee_factor) = load_fee_track.scaling_factors();
     let rules = view.rules();
-    tx::with_transaction_step_runtime(&rules, || {
+    contain_transaction_step("preclaim", tx, || {
+        tx::with_transaction_step_runtime(&rules, || {
         crate::state::invoke_preclaim::invoke_preclaim_with_parent_batch_id(
             view,
             tx,
@@ -2658,6 +2689,7 @@ pub(crate) fn queue_apply_preclaim_ter_with_load_fee(
                 }
             },
         )
+        })
     })
 }
 /// ../rippled/src/libxrpl/tx/applySteps.cpp::invokePreclaim (lines 162-201).

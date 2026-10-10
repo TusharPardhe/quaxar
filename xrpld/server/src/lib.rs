@@ -330,691 +330,704 @@ where
         + Sync,
 {
     fn dispatch(&self, request: RpcRequest<'_>) -> RpcReply {
-        tracing::debug!(target: "rpc", method = request.method, "RPC request received");
-        let start = std::time::Instant::now();
-        let method = request.method.to_owned();
-        let params = match command_params(request.method, request.params) {
-            Ok(params) => params,
-            Err(status) => return RpcReply::result(status_json(status)),
-        };
+        // rippled RPCHandler callMethod: an exception thrown by a handler is
+        // logged and answered with rpcINTERNAL. Contain handler panics the
+        // same way so one bad request cannot unwind the blocking RPC task.
+        let method_for_log = request.method.to_owned();
+        let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> RpcReply {
+            tracing::debug!(target: "rpc", method = request.method, "RPC request received");
+            let start = std::time::Instant::now();
+            let method = request.method.to_owned();
+            let params = match command_params(request.method, request.params) {
+                Ok(params) => params,
+                Err(status) => return RpcReply::result(status_json(status)),
+            };
 
-        let handler = match rpc::fill_handler(
-            &params,
-            request.metadata.role,
-            request.metadata.api_version,
-            &self.source,
-        ) {
-            Ok(handler) => handler,
-            Err(status) => return RpcReply::result(status_json(status)),
-        };
-
-        let reply = match handler.name {
-            "account_info" => RpcReply::result(rpc::do_account_info(
-                &AccountInfoRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "account_lines" => RpcReply::result(rpc::do_account_lines(
-                &AccountLinesRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "account_tx" => RpcReply::result(rpc::do_account_tx(
+            let handler = match rpc::fill_handler(
                 &params,
                 request.metadata.role,
                 request.metadata.api_version,
-                &self.source,
-            )),
-            "fee" => match rpc::do_fee_prerendered(&self.source) {
-                rpc::FeeResponse::Json(j) => RpcReply::result(j),
-                rpc::FeeResponse::PreRendered(p) => RpcReply::PreRendered(p),
-            },
-            "ledger" => RpcReply::result(rpc::do_ledger(
-                &params,
-                request.metadata.role,
-                request.metadata.api_version,
-                &self.source,
-            )),
-            "ledger_accept" => {
-                let context = rpc::RpcRequestContext {
-                    params: &params,
-                    env: &rpc::LedgerAcceptSource,
-                    runtime: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    request_headers: std::collections::BTreeMap::new(),
-                    unlimited: request.metadata.unlimited,
-                    remote_ip: None,
-                    load_type: rpc::RpcLoadType::Reference,
-                };
-                match rpc::do_ledger_accept(&context) {
-                    Ok(value) => {
-                        // Notify ledger stream subscribers about the closed ledger.
-                        if let protocol::JsonValue::Object(ref obj) = value {
-                            let seq = obj
-                                .get("ledger_current_index")
-                                .and_then(|v| {
-                                    if let protocol::JsonValue::Unsigned(n) = v {
-                                        Some(*n)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(0);
-                            if seq > 0 {
-                                let closed_seq = seq.saturating_sub(1);
-                                let transaction_events = accepted_transaction_events(&self.source);
-                                let mut notification = std::collections::BTreeMap::new();
-                                notification.insert(
-                                    "type".to_owned(),
-                                    protocol::JsonValue::String("ledgerClosed".to_owned()),
-                                );
-                                notification.insert(
-                                    "ledger_index".to_owned(),
-                                    protocol::JsonValue::Unsigned(closed_seq),
-                                );
-                                notification.insert(
-                                    "txn_count".to_owned(),
-                                    protocol::JsonValue::Unsigned(transaction_events.len() as u64),
-                                );
-                                notification.insert(
-                                    "validated_ledgers".to_owned(),
-                                    protocol::JsonValue::String(format!("2-{}", closed_seq)),
-                                );
-                                self.subscriptions.publish_json(
-                                    crate::StreamKind::Ledger,
-                                    protocol::JsonValue::Object(notification),
-                                );
-
-                                // Transaction notifications are emitted centrally by
-                                // ApplicationRoot::on_published_ledger through the runtime's
-                                // shared subscription publisher. Do not re-publish here.
-                            }
-                        }
-                        RpcReply::result(value)
-                    }
-                    Err(status) => RpcReply::result(status_json(status)),
-                }
-            }
-            "ledger_request" => {
-                let context = rpc::RpcRequestContext {
-                    params: &params,
-                    env: &rpc::LedgerRequestSource,
-                    runtime: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    request_headers: std::collections::BTreeMap::new(),
-                    unlimited: request.metadata.unlimited,
-                    remote_ip: None,
-                    load_type: rpc::RpcLoadType::Reference,
-                };
-                match rpc::do_ledger_request(&context) {
-                    Ok(value) => RpcReply::result(value),
-                    Err(status) => RpcReply::result(status_json(status)),
-                }
-            }
-            "ledger_closed" => RpcReply::result(rpc::do_ledger_closed(&self.source)),
-            "ledger_current" => RpcReply::result(rpc::do_ledger_current(&self.source)),
-            "ledger_entry" => RpcReply::result(rpc::do_ledger_entry(
-                &LedgerEntryRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "path_find" => handle_path_find(
-                self,
-                RpcRequest {
-                    params: &params,
-                    ..request
-                },
-            ),
-            "manifest" => RpcReply::result(rpc::do_manifest(&params, &self.source)),
-            "ripple_path_find" => handle_ripple_path_find(
-                self,
-                RpcRequest {
-                    params: &params,
-                    ..request
-                },
-            ),
-            "ping" => {
-                let context = JsonContext {
-                    params: &params,
-                    env: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    unlimited: request.metadata.unlimited,
-                };
-                RpcReply::result(rpc::do_ping(&context))
-            }
-            "server_definitions" => RpcReply::result(rpc::do_server_definitions(&params)),
-            "server_info" => {
-                let context = JsonContext {
-                    params: &params,
-                    env: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    unlimited: request.metadata.unlimited,
-                };
-                match rpc::do_server_info_prerendered(&context) {
-                    rpc::ServerInfoResponse::Json(j) => RpcReply::result(j),
-                    rpc::ServerInfoResponse::PreRendered(p) => RpcReply::PreRendered(p),
-                }
-            }
-            "server_state" => {
-                let context = JsonContext {
-                    params: &params,
-                    env: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    unlimited: request.metadata.unlimited,
-                };
-                RpcReply::result(rpc::do_server_state(&context))
-            }
-            "submit" => {
-                let context = rpc::RpcRequestContext {
-                    params: &params,
-                    env: &rpc::SubmitSource,
-                    runtime: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    request_headers: std::collections::BTreeMap::new(),
-                    unlimited: request.metadata.unlimited,
-                    remote_ip: None,
-                    load_type: rpc::RpcLoadType::Reference,
-                };
-                match rpc::do_submit(&context) {
-                    Ok(value) => RpcReply::result(value),
-                    Err(status) => RpcReply::result(status_json(status)),
-                }
-            }
-            "submit_multisigned" => {
-                let context = rpc::RpcRequestContext {
-                    params: &params,
-                    env: &rpc::SubmitMultiSignedSource,
-                    runtime: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    request_headers: std::collections::BTreeMap::new(),
-                    unlimited: request.metadata.unlimited,
-                    remote_ip: None,
-                    load_type: rpc::RpcLoadType::Reference,
-                };
-                match rpc::do_submit_multisigned(&context) {
-                    Ok(value) => RpcReply::result(value),
-                    Err(status) => RpcReply::result(status_json(status)),
-                }
-            }
-            "tx" => RpcReply::result(rpc::do_tx(
-                &TxRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                },
-                &self.source,
-            )),
-            "transaction_entry" => RpcReply::result(rpc::do_transaction_entry(
-                &TransactionEntryRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "subscribe" => handle_subscribe(RpcRequest {
-                params: &params,
-                ..request
-            }),
-            "unsubscribe" => handle_unsubscribe(RpcRequest {
-                params: &params,
-                ..request
-            }),
-            // Fully implemented handlers that just need wiring
-            "random" => RpcReply::result(rpc::do_random()),
-            "validators" => {
-                let context = JsonContext {
-                    params: &params,
-                    env: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    unlimited: request.metadata.unlimited,
-                };
-                RpcReply::result(rpc::do_validators(&context))
-            }
-            "validator_list_sites" => {
-                let context = JsonContext {
-                    params: &params,
-                    env: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    unlimited: request.metadata.unlimited,
-                };
-                RpcReply::result(rpc::do_validator_list_sites(&context))
-            }
-            "unl_list" => RpcReply::result(rpc::do_unl_list(&self.source)),
-            "consensus_info" => {
-                let context = JsonContext {
-                    params: &params,
-                    env: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    unlimited: request.metadata.unlimited,
-                };
-                RpcReply::result(rpc::do_consensus_info(&context))
-            }
-            "ledger_header" => RpcReply::result(rpc::do_ledger_header(&self.source)),
-            "account_channels" => RpcReply::result(rpc::do_account_channels(
-                &rpc::AccountChannelsRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "account_currencies" => RpcReply::result(rpc::do_account_currencies(
-                &rpc::AccountCurrenciesRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "account_offers" => RpcReply::result(rpc::do_account_offers(
-                &rpc::AccountOffersRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "deposit_authorized" => RpcReply::result(rpc::do_deposit_authorized(
-                &rpc::DepositAuthorizedRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "gateway_balances" => RpcReply::result(rpc::do_gateway_balances(
-                &rpc::GatewayBalancesRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "no_ripple_check" => RpcReply::result(rpc::do_no_ripple_check(
-                &rpc::NoRippleCheckRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "owner_info" => RpcReply::result(rpc::do_owner_info(&params, &self.source)),
-            "account_nfts" => RpcReply::result(rpc::do_account_nfts(
-                &rpc::AccountNFTsRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "account_objects" => RpcReply::result(rpc::do_account_objects(
-                &rpc::AccountObjectsRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "book_changes" => RpcReply::result(rpc::do_book_changes(
-                &rpc::BookChangesRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "get_counts" => RpcReply::result(rpc::do_get_counts(&params, &self.source)),
-            "print" => RpcReply::result(rpc::do_print(&params, &self.source)),
-            "validator_info" => RpcReply::result(rpc::do_validator_info(&self.source)),
-            "book_offers" => RpcReply::result(rpc::do_book_offers(
-                &rpc::BookOffersRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-                &self.source,
-            )),
-            "nft_buy_offers" => RpcReply::result(rpc::do_nft_buy_offers(
-                &rpc::NFTOffersRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "nft_sell_offers" => RpcReply::result(rpc::do_nft_sell_offers(
-                &rpc::NFTOffersRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "ledger_data" => match rpc::do_ledger_data(
-                &rpc::LedgerDataRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
                 &self.source,
             ) {
-                rpc::LedgerDataResponse::Json(j) => RpcReply::Result(j),
-                rpc::LedgerDataResponse::PreRendered(p) => RpcReply::PreRendered(p),
-            },
-            "feature" => RpcReply::result(rpc::state::feature::do_feature(
-                &rpc::state::feature::FeatureRequest {
-                    params: &params,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "fetch_info" => {
-                let context = JsonContext {
-                    params: &params,
-                    env: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
+                Ok(handler) => handler,
+                Err(status) => return RpcReply::result(status_json(status)),
+            };
+
+            let reply = match handler.name {
+                "account_info" => RpcReply::result(rpc::do_account_info(
+                    &AccountInfoRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
                     },
-                    unlimited: request.metadata.unlimited,
-                };
-                RpcReply::result(rpc::do_fetch_info(&context))
-            }
-            "sign" => {
-                let context = rpc::RpcRequestContext {
-                    params: &params,
-                    env: &rpc::SignSource,
-                    runtime: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
+                    &self.source,
+                )),
+                "account_lines" => RpcReply::result(rpc::do_account_lines(
+                    &AccountLinesRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
                     },
-                    request_headers: std::collections::BTreeMap::new(),
-                    unlimited: request.metadata.unlimited,
-                    remote_ip: None,
-                    load_type: rpc::RpcLoadType::Reference,
-                };
-                match rpc::do_sign(&context) {
-                    Ok(value) => RpcReply::result(value),
-                    Err(status) => RpcReply::result(status_json(status)),
-                }
-            }
-            "tx_history" => RpcReply::result(rpc::do_tx_history(
-                &TxHistoryRequest {
-                    params: &params,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
+                    &self.source,
+                )),
+                "account_tx" => RpcReply::result(rpc::do_account_tx(
+                    &params,
+                    request.metadata.role,
+                    request.metadata.api_version,
+                    &self.source,
+                )),
+                "fee" => match rpc::do_fee_prerendered(&self.source) {
+                    rpc::FeeResponse::Json(j) => RpcReply::result(j),
+                    rpc::FeeResponse::PreRendered(p) => RpcReply::PreRendered(p),
                 },
-                &self.source,
-            )),
-            "amm_info" => RpcReply::result(rpc::do_amm_info(
-                &rpc::AmmInfoRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "channel_verify" => RpcReply::result(rpc::do_channel_verify(&params)),
-            "vault_info" => RpcReply::result(rpc::do_vault_info(
-                &rpc::VaultInfoRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "tx_reduce_relay" => RpcReply::result(rpc::state::tx_reduce_relay::do_tx_reduce_relay(
-                &self.source,
-            )),
-            "logrotate" => {
-                let context = rpc::RpcRequestContext {
-                    params: &params,
-                    env: &rpc::LogRotateSource,
-                    runtime: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    request_headers: std::collections::BTreeMap::new(),
-                    unlimited: request.metadata.unlimited,
-                    remote_ip: None,
-                    load_type: rpc::RpcLoadType::Reference,
-                };
-                match rpc::do_log_rotate(&context) {
-                    Ok(value) => RpcReply::result(value),
-                    Err(status) => RpcReply::result(status_json(status)),
-                }
-            }
-            "noripple_check" => RpcReply::result(rpc::do_no_ripple_check(
-                &rpc::NoRippleCheckRequest {
-                    params: &params,
-                    api_version: request.metadata.api_version,
-                    role: request.metadata.role,
-                },
-                &self.source,
-            )),
-            "blacklist" => RpcReply::result(rpc::do_black_list(&params, &self.source)),
-            "get_aggregate_price" => RpcReply::result(
-                rpc::handlers::get_aggregate_price::do_get_aggregate_price(&params, &self.source),
-            ),
-            "stop" => {
-                let context = rpc::RpcRequestContext {
-                    params: &params,
-                    env: &rpc::StopSource,
-                    runtime: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
-                    },
-                    request_headers: std::collections::BTreeMap::new(),
-                    unlimited: request.metadata.unlimited,
-                    remote_ip: None,
-                    load_type: rpc::RpcLoadType::Reference,
-                };
-                match rpc::do_stop(&context) {
-                    Ok(v) => RpcReply::result(v),
-                    Err(s) => RpcReply::result(status_json(s)),
-                }
-            }
-            "version" => {
-                let mut version_obj = std::collections::BTreeMap::new();
-                version_obj.insert("first".to_string(), JsonValue::Unsigned(1));
-                version_obj.insert("last".to_string(), JsonValue::Unsigned(2));
-                let mut result = std::collections::BTreeMap::new();
-                result.insert("version".to_string(), JsonValue::Object(version_obj));
-                RpcReply::result(JsonValue::Object(result))
-            }
-            "connect"
-            | "peers"
-            | "log_level"
-            | "can_delete"
-            | "export_snapshot"
-            | "snapshot_status"
-            | "ledger_cleaner"
-            | "peer_reservations_list"
-            | "peer_reservations_add"
-            | "peer_reservations_del"
-            | "sign_for"
-            | "simulate"
-            | "channel_authorize" => {
-                macro_rules! dispatch_ctx {
-                    ($source:expr, $handler:expr) => {{
-                        let context = rpc::RpcRequestContext {
-                            params: &params,
-                            env: &$source,
-                            runtime: &self.source,
-                            role: request.metadata.role,
-                            api_version: request.metadata.api_version,
-                            headers: JsonContextHeaders {
-                                user: &request.metadata.user,
-                                forwarded_for: &request.metadata.forwarded_for,
-                            },
-                            request_headers: std::collections::BTreeMap::new(),
-                            unlimited: request.metadata.unlimited,
-                            remote_ip: None,
-                            load_type: rpc::RpcLoadType::Reference,
-                        };
-                        match $handler(&context) {
-                            Ok(v) => RpcReply::result(v),
-                            Err(s) => RpcReply::result(status_json(s)),
+                "ledger" => RpcReply::result(rpc::do_ledger(
+                    &params,
+                    request.metadata.role,
+                    request.metadata.api_version,
+                    &self.source,
+                )),
+                "ledger_accept" => {
+                    let context = rpc::RpcRequestContext {
+                        params: &params,
+                        env: &rpc::LedgerAcceptSource,
+                        runtime: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        request_headers: std::collections::BTreeMap::new(),
+                        unlimited: request.metadata.unlimited,
+                        remote_ip: None,
+                        load_type: rpc::RpcLoadType::Reference,
+                    };
+                    match rpc::do_ledger_accept(&context) {
+                        Ok(value) => {
+                            // Notify ledger stream subscribers about the closed ledger.
+                            if let protocol::JsonValue::Object(ref obj) = value {
+                                let seq = obj
+                                    .get("ledger_current_index")
+                                    .and_then(|v| {
+                                        if let protocol::JsonValue::Unsigned(n) = v {
+                                            Some(*n)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                if seq > 0 {
+                                    let closed_seq = seq.saturating_sub(1);
+                                    let transaction_events = accepted_transaction_events(&self.source);
+                                    let mut notification = std::collections::BTreeMap::new();
+                                    notification.insert(
+                                        "type".to_owned(),
+                                        protocol::JsonValue::String("ledgerClosed".to_owned()),
+                                    );
+                                    notification.insert(
+                                        "ledger_index".to_owned(),
+                                        protocol::JsonValue::Unsigned(closed_seq),
+                                    );
+                                    notification.insert(
+                                        "txn_count".to_owned(),
+                                        protocol::JsonValue::Unsigned(transaction_events.len() as u64),
+                                    );
+                                    notification.insert(
+                                        "validated_ledgers".to_owned(),
+                                        protocol::JsonValue::String(format!("2-{}", closed_seq)),
+                                    );
+                                    self.subscriptions.publish_json(
+                                        crate::StreamKind::Ledger,
+                                        protocol::JsonValue::Object(notification),
+                                    );
+
+                                    // Transaction notifications are emitted centrally by
+                                    // ApplicationRoot::on_published_ledger through the runtime's
+                                    // shared subscription publisher. Do not re-publish here.
+                                }
+                            }
+                            RpcReply::result(value)
                         }
-                    }};
+                        Err(status) => RpcReply::result(status_json(status)),
+                    }
                 }
-                match handler.name {
-                    "connect" => dispatch_ctx!(rpc::ConnectSource, rpc::do_connect),
-                    "peers" => dispatch_ctx!(rpc::PeersSource, rpc::do_peers),
-                    "log_level" => dispatch_ctx!(rpc::LogLevelSource, rpc::do_log_level),
-                    "can_delete" => dispatch_ctx!(rpc::CanDeleteSource, rpc::do_can_delete),
-                    "export_snapshot" => {
-                        dispatch_ctx!(rpc::ExportSnapshotSource, rpc::do_export_snapshot)
+                "ledger_request" => {
+                    let context = rpc::RpcRequestContext {
+                        params: &params,
+                        env: &rpc::LedgerRequestSource,
+                        runtime: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        request_headers: std::collections::BTreeMap::new(),
+                        unlimited: request.metadata.unlimited,
+                        remote_ip: None,
+                        load_type: rpc::RpcLoadType::Reference,
+                    };
+                    match rpc::do_ledger_request(&context) {
+                        Ok(value) => RpcReply::result(value),
+                        Err(status) => RpcReply::result(status_json(status)),
                     }
-                    "snapshot_status" => {
-                        dispatch_ctx!(rpc::SnapshotStatusSource, rpc::do_snapshot_status)
-                    }
-                    "ledger_cleaner" => {
-                        dispatch_ctx!(rpc::LedgerCleanerSource, rpc::do_ledger_cleaner)
-                    }
-                    "peer_reservations_list" => dispatch_ctx!(
-                        rpc::PeerReservationsListSource,
-                        rpc::do_peer_reservations_list
-                    ),
-                    "peer_reservations_add" => dispatch_ctx!(
-                        rpc::PeerReservationsAddSource,
-                        rpc::do_peer_reservations_add
-                    ),
-                    "peer_reservations_del" => dispatch_ctx!(
-                        rpc::PeerReservationsDelSource,
-                        rpc::do_peer_reservations_del
-                    ),
-                    "sign_for" => dispatch_ctx!(rpc::SignForSource, rpc::do_sign_for),
-                    "simulate" => dispatch_ctx!(rpc::SimulateSource, rpc::do_simulate),
-                    "channel_authorize" => {
-                        dispatch_ctx!(rpc::ChannelAuthorizeSource, rpc::do_channel_authorize)
-                    }
-                    _ => unreachable!(),
                 }
-            }
-            "wallet_propose" => {
-                let context = rpc::RpcRequestContext {
-                    params: &params,
-                    env: &rpc::WalletProposeSource,
-                    runtime: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
+                "ledger_closed" => RpcReply::result(rpc::do_ledger_closed(&self.source)),
+                "ledger_current" => RpcReply::result(rpc::do_ledger_current(&self.source)),
+                "ledger_entry" => RpcReply::result(rpc::do_ledger_entry(
+                    &LedgerEntryRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
                     },
-                    request_headers: std::collections::BTreeMap::new(),
-                    unlimited: request.metadata.unlimited,
-                    remote_ip: None,
-                    load_type: rpc::RpcLoadType::Reference,
-                };
-                match rpc::do_wallet_propose(&context) {
-                    Ok(v) => RpcReply::result(v),
-                    Err(s) => RpcReply::result(status_json(s)),
-                }
-            }
-            "validation_create" => {
-                let context = rpc::RpcRequestContext {
-                    params: &params,
-                    env: &rpc::ValidationCreateSource,
-                    runtime: &self.source,
-                    role: request.metadata.role,
-                    api_version: request.metadata.api_version,
-                    headers: JsonContextHeaders {
-                        user: &request.metadata.user,
-                        forwarded_for: &request.metadata.forwarded_for,
+                    &self.source,
+                )),
+                "path_find" => handle_path_find(
+                    self,
+                    RpcRequest {
+                        params: &params,
+                        ..request
                     },
-                    request_headers: std::collections::BTreeMap::new(),
-                    unlimited: request.metadata.unlimited,
-                    remote_ip: None,
-                    load_type: rpc::RpcLoadType::Reference,
-                };
-                match rpc::do_validation_create(&context) {
-                    Ok(v) => RpcReply::result(v),
-                    Err(s) => RpcReply::result(status_json(s)),
+                ),
+                "manifest" => RpcReply::result(rpc::do_manifest(&params, &self.source)),
+                "ripple_path_find" => handle_ripple_path_find(
+                    self,
+                    RpcRequest {
+                        params: &params,
+                        ..request
+                    },
+                ),
+                "ping" => {
+                    let context = JsonContext {
+                        params: &params,
+                        env: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        unlimited: request.metadata.unlimited,
+                    };
+                    RpcReply::result(rpc::do_ping(&context))
                 }
+                "server_definitions" => RpcReply::result(rpc::do_server_definitions(&params)),
+                "server_info" => {
+                    let context = JsonContext {
+                        params: &params,
+                        env: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        unlimited: request.metadata.unlimited,
+                    };
+                    match rpc::do_server_info_prerendered(&context) {
+                        rpc::ServerInfoResponse::Json(j) => RpcReply::result(j),
+                        rpc::ServerInfoResponse::PreRendered(p) => RpcReply::PreRendered(p),
+                    }
+                }
+                "server_state" => {
+                    let context = JsonContext {
+                        params: &params,
+                        env: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        unlimited: request.metadata.unlimited,
+                    };
+                    RpcReply::result(rpc::do_server_state(&context))
+                }
+                "submit" => {
+                    let context = rpc::RpcRequestContext {
+                        params: &params,
+                        env: &rpc::SubmitSource,
+                        runtime: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        request_headers: std::collections::BTreeMap::new(),
+                        unlimited: request.metadata.unlimited,
+                        remote_ip: None,
+                        load_type: rpc::RpcLoadType::Reference,
+                    };
+                    match rpc::do_submit(&context) {
+                        Ok(value) => RpcReply::result(value),
+                        Err(status) => RpcReply::result(status_json(status)),
+                    }
+                }
+                "submit_multisigned" => {
+                    let context = rpc::RpcRequestContext {
+                        params: &params,
+                        env: &rpc::SubmitMultiSignedSource,
+                        runtime: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        request_headers: std::collections::BTreeMap::new(),
+                        unlimited: request.metadata.unlimited,
+                        remote_ip: None,
+                        load_type: rpc::RpcLoadType::Reference,
+                    };
+                    match rpc::do_submit_multisigned(&context) {
+                        Ok(value) => RpcReply::result(value),
+                        Err(status) => RpcReply::result(status_json(status)),
+                    }
+                }
+                "tx" => RpcReply::result(rpc::do_tx(
+                    &TxRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                    },
+                    &self.source,
+                )),
+                "transaction_entry" => RpcReply::result(rpc::do_transaction_entry(
+                    &TransactionEntryRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "subscribe" => handle_subscribe(RpcRequest {
+                    params: &params,
+                    ..request
+                }),
+                "unsubscribe" => handle_unsubscribe(RpcRequest {
+                    params: &params,
+                    ..request
+                }),
+                // Fully implemented handlers that just need wiring
+                "random" => RpcReply::result(rpc::do_random()),
+                "validators" => {
+                    let context = JsonContext {
+                        params: &params,
+                        env: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        unlimited: request.metadata.unlimited,
+                    };
+                    RpcReply::result(rpc::do_validators(&context))
+                }
+                "validator_list_sites" => {
+                    let context = JsonContext {
+                        params: &params,
+                        env: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        unlimited: request.metadata.unlimited,
+                    };
+                    RpcReply::result(rpc::do_validator_list_sites(&context))
+                }
+                "unl_list" => RpcReply::result(rpc::do_unl_list(&self.source)),
+                "consensus_info" => {
+                    let context = JsonContext {
+                        params: &params,
+                        env: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        unlimited: request.metadata.unlimited,
+                    };
+                    RpcReply::result(rpc::do_consensus_info(&context))
+                }
+                "ledger_header" => RpcReply::result(rpc::do_ledger_header(&self.source)),
+                "account_channels" => RpcReply::result(rpc::do_account_channels(
+                    &rpc::AccountChannelsRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "account_currencies" => RpcReply::result(rpc::do_account_currencies(
+                    &rpc::AccountCurrenciesRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "account_offers" => RpcReply::result(rpc::do_account_offers(
+                    &rpc::AccountOffersRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "deposit_authorized" => RpcReply::result(rpc::do_deposit_authorized(
+                    &rpc::DepositAuthorizedRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "gateway_balances" => RpcReply::result(rpc::do_gateway_balances(
+                    &rpc::GatewayBalancesRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "no_ripple_check" => RpcReply::result(rpc::do_no_ripple_check(
+                    &rpc::NoRippleCheckRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "owner_info" => RpcReply::result(rpc::do_owner_info(&params, &self.source)),
+                "account_nfts" => RpcReply::result(rpc::do_account_nfts(
+                    &rpc::AccountNFTsRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "account_objects" => RpcReply::result(rpc::do_account_objects(
+                    &rpc::AccountObjectsRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "book_changes" => RpcReply::result(rpc::do_book_changes(
+                    &rpc::BookChangesRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "get_counts" => RpcReply::result(rpc::do_get_counts(&params, &self.source)),
+                "print" => RpcReply::result(rpc::do_print(&params, &self.source)),
+                "validator_info" => RpcReply::result(rpc::do_validator_info(&self.source)),
+                "book_offers" => RpcReply::result(rpc::do_book_offers(
+                    &rpc::BookOffersRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                    &self.source,
+                )),
+                "nft_buy_offers" => RpcReply::result(rpc::do_nft_buy_offers(
+                    &rpc::NFTOffersRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "nft_sell_offers" => RpcReply::result(rpc::do_nft_sell_offers(
+                    &rpc::NFTOffersRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "ledger_data" => match rpc::do_ledger_data(
+                    &rpc::LedgerDataRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                ) {
+                    rpc::LedgerDataResponse::Json(j) => RpcReply::Result(j),
+                    rpc::LedgerDataResponse::PreRendered(p) => RpcReply::PreRendered(p),
+                },
+                "feature" => RpcReply::result(rpc::state::feature::do_feature(
+                    &rpc::state::feature::FeatureRequest {
+                        params: &params,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "fetch_info" => {
+                    let context = JsonContext {
+                        params: &params,
+                        env: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        unlimited: request.metadata.unlimited,
+                    };
+                    RpcReply::result(rpc::do_fetch_info(&context))
+                }
+                "sign" => {
+                    let context = rpc::RpcRequestContext {
+                        params: &params,
+                        env: &rpc::SignSource,
+                        runtime: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        request_headers: std::collections::BTreeMap::new(),
+                        unlimited: request.metadata.unlimited,
+                        remote_ip: None,
+                        load_type: rpc::RpcLoadType::Reference,
+                    };
+                    match rpc::do_sign(&context) {
+                        Ok(value) => RpcReply::result(value),
+                        Err(status) => RpcReply::result(status_json(status)),
+                    }
+                }
+                "tx_history" => RpcReply::result(rpc::do_tx_history(
+                    &TxHistoryRequest {
+                        params: &params,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                    },
+                    &self.source,
+                )),
+                "amm_info" => RpcReply::result(rpc::do_amm_info(
+                    &rpc::AmmInfoRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "channel_verify" => RpcReply::result(rpc::do_channel_verify(&params)),
+                "vault_info" => RpcReply::result(rpc::do_vault_info(
+                    &rpc::VaultInfoRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "tx_reduce_relay" => RpcReply::result(rpc::state::tx_reduce_relay::do_tx_reduce_relay(
+                    &self.source,
+                )),
+                "logrotate" => {
+                    let context = rpc::RpcRequestContext {
+                        params: &params,
+                        env: &rpc::LogRotateSource,
+                        runtime: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        request_headers: std::collections::BTreeMap::new(),
+                        unlimited: request.metadata.unlimited,
+                        remote_ip: None,
+                        load_type: rpc::RpcLoadType::Reference,
+                    };
+                    match rpc::do_log_rotate(&context) {
+                        Ok(value) => RpcReply::result(value),
+                        Err(status) => RpcReply::result(status_json(status)),
+                    }
+                }
+                "noripple_check" => RpcReply::result(rpc::do_no_ripple_check(
+                    &rpc::NoRippleCheckRequest {
+                        params: &params,
+                        api_version: request.metadata.api_version,
+                        role: request.metadata.role,
+                    },
+                    &self.source,
+                )),
+                "blacklist" => RpcReply::result(rpc::do_black_list(&params, &self.source)),
+                "get_aggregate_price" => RpcReply::result(
+                    rpc::handlers::get_aggregate_price::do_get_aggregate_price(&params, &self.source),
+                ),
+                "stop" => {
+                    let context = rpc::RpcRequestContext {
+                        params: &params,
+                        env: &rpc::StopSource,
+                        runtime: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        request_headers: std::collections::BTreeMap::new(),
+                        unlimited: request.metadata.unlimited,
+                        remote_ip: None,
+                        load_type: rpc::RpcLoadType::Reference,
+                    };
+                    match rpc::do_stop(&context) {
+                        Ok(v) => RpcReply::result(v),
+                        Err(s) => RpcReply::result(status_json(s)),
+                    }
+                }
+                "version" => {
+                    let mut version_obj = std::collections::BTreeMap::new();
+                    version_obj.insert("first".to_string(), JsonValue::Unsigned(1));
+                    version_obj.insert("last".to_string(), JsonValue::Unsigned(2));
+                    let mut result = std::collections::BTreeMap::new();
+                    result.insert("version".to_string(), JsonValue::Object(version_obj));
+                    RpcReply::result(JsonValue::Object(result))
+                }
+                "connect"
+                | "peers"
+                | "log_level"
+                | "can_delete"
+                | "export_snapshot"
+                | "snapshot_status"
+                | "ledger_cleaner"
+                | "peer_reservations_list"
+                | "peer_reservations_add"
+                | "peer_reservations_del"
+                | "sign_for"
+                | "simulate"
+                | "channel_authorize" => {
+                    macro_rules! dispatch_ctx {
+                        ($source:expr, $handler:expr) => {{
+                            let context = rpc::RpcRequestContext {
+                                params: &params,
+                                env: &$source,
+                                runtime: &self.source,
+                                role: request.metadata.role,
+                                api_version: request.metadata.api_version,
+                                headers: JsonContextHeaders {
+                                    user: &request.metadata.user,
+                                    forwarded_for: &request.metadata.forwarded_for,
+                                },
+                                request_headers: std::collections::BTreeMap::new(),
+                                unlimited: request.metadata.unlimited,
+                                remote_ip: None,
+                                load_type: rpc::RpcLoadType::Reference,
+                            };
+                            match $handler(&context) {
+                                Ok(v) => RpcReply::result(v),
+                                Err(s) => RpcReply::result(status_json(s)),
+                            }
+                        }};
+                    }
+                    match handler.name {
+                        "connect" => dispatch_ctx!(rpc::ConnectSource, rpc::do_connect),
+                        "peers" => dispatch_ctx!(rpc::PeersSource, rpc::do_peers),
+                        "log_level" => dispatch_ctx!(rpc::LogLevelSource, rpc::do_log_level),
+                        "can_delete" => dispatch_ctx!(rpc::CanDeleteSource, rpc::do_can_delete),
+                        "export_snapshot" => {
+                            dispatch_ctx!(rpc::ExportSnapshotSource, rpc::do_export_snapshot)
+                        }
+                        "snapshot_status" => {
+                            dispatch_ctx!(rpc::SnapshotStatusSource, rpc::do_snapshot_status)
+                        }
+                        "ledger_cleaner" => {
+                            dispatch_ctx!(rpc::LedgerCleanerSource, rpc::do_ledger_cleaner)
+                        }
+                        "peer_reservations_list" => dispatch_ctx!(
+                            rpc::PeerReservationsListSource,
+                            rpc::do_peer_reservations_list
+                        ),
+                        "peer_reservations_add" => dispatch_ctx!(
+                            rpc::PeerReservationsAddSource,
+                            rpc::do_peer_reservations_add
+                        ),
+                        "peer_reservations_del" => dispatch_ctx!(
+                            rpc::PeerReservationsDelSource,
+                            rpc::do_peer_reservations_del
+                        ),
+                        "sign_for" => dispatch_ctx!(rpc::SignForSource, rpc::do_sign_for),
+                        "simulate" => dispatch_ctx!(rpc::SimulateSource, rpc::do_simulate),
+                        "channel_authorize" => {
+                            dispatch_ctx!(rpc::ChannelAuthorizeSource, rpc::do_channel_authorize)
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                "wallet_propose" => {
+                    let context = rpc::RpcRequestContext {
+                        params: &params,
+                        env: &rpc::WalletProposeSource,
+                        runtime: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        request_headers: std::collections::BTreeMap::new(),
+                        unlimited: request.metadata.unlimited,
+                        remote_ip: None,
+                        load_type: rpc::RpcLoadType::Reference,
+                    };
+                    match rpc::do_wallet_propose(&context) {
+                        Ok(v) => RpcReply::result(v),
+                        Err(s) => RpcReply::result(status_json(s)),
+                    }
+                }
+                "validation_create" => {
+                    let context = rpc::RpcRequestContext {
+                        params: &params,
+                        env: &rpc::ValidationCreateSource,
+                        runtime: &self.source,
+                        role: request.metadata.role,
+                        api_version: request.metadata.api_version,
+                        headers: JsonContextHeaders {
+                            user: &request.metadata.user,
+                            forwarded_for: &request.metadata.forwarded_for,
+                        },
+                        request_headers: std::collections::BTreeMap::new(),
+                        unlimited: request.metadata.unlimited,
+                        remote_ip: None,
+                        load_type: rpc::RpcLoadType::Reference,
+                    };
+                    match rpc::do_validation_create(&context) {
+                        Ok(v) => RpcReply::result(v),
+                        Err(s) => RpcReply::result(status_json(s)),
+                    }
+                }
+                _ => RpcReply::result(status_json(rpc::RpcStatus::new(
+                    rpc::RpcErrorCode::UnknownCommand,
+                ))),
+            };
+            let duration_ms = start.elapsed().as_millis() as u64;
+            if duration_ms > 1000 {
+                tracing::warn!(target: "rpc", method = %method, duration_ms, "Slow RPC request (>1s)");
             }
-            _ => RpcReply::result(status_json(rpc::RpcStatus::new(
-                rpc::RpcErrorCode::UnknownCommand,
-            ))),
-        };
-        let duration_ms = start.elapsed().as_millis() as u64;
-        if duration_ms > 1000 {
-            tracing::warn!(target: "rpc", method = %method, duration_ms, "Slow RPC request (>1s)");
+            tracing::debug!(target: "rpc", method = %method, duration_ms, "RPC request complete");
+            reply
+        }));
+        match reply {
+            Ok(reply) => reply,
+            Err(_) => {
+                tracing::info!(target: "rpc", method = %method_for_log, "Caught throw: RPC handler panicked");
+                RpcReply::result(status_json(rpc::RpcStatus::new(rpc::RpcErrorCode::Internal)))
+            }
         }
-        tracing::debug!(target: "rpc", method = %method, duration_ms, "RPC request complete");
-        reply
     }
 }
 
