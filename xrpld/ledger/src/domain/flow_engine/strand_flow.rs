@@ -247,8 +247,18 @@ pub fn execute_strands<V: ApplyView>(
 
             insert_sorted(&mut saved_ins, amount_in);
             insert_sorted(&mut saved_outs, amount_out);
-            total_in = sum_sorted(&saved_ins, &total_in);
-            total_out = sum_sorted(&saved_outs, &total_out);
+            let (Some(sum_in), Some(sum_out)) = (
+                sum_sorted(&saved_ins, &total_in),
+                sum_sorted(&saved_outs, &total_out),
+            ) else {
+                return FlowResult {
+                    ter: Ter::TEC_PATH_DRY,
+                    actual_in: total_in.zeroed(),
+                    actual_out: total_out.zeroed(),
+                };
+            };
+            total_in = sum_in;
+            total_out = sum_out;
             remaining_out = deliver.clone() - total_out.clone();
             if let Some(send_max) = send_max {
                 remaining_in = Some(send_max.clone() - total_in.clone());
@@ -310,13 +320,14 @@ fn insert_sorted(amounts: &mut Vec<STAmount>, amount: STAmount) {
     amounts.insert(index, amount);
 }
 
-fn sum_sorted(amounts: &[STAmount], zero: &STAmount) -> STAmount {
+/// Sum the retained pass amounts smallest-first. rippled 578224f2e6: `None`
+/// when an integral aggregate overflows; callers treat that as a dry path.
+fn sum_sorted(amounts: &[STAmount], zero: &STAmount) -> Option<STAmount> {
     let Some((first, rest)) = amounts.split_first() else {
-        return zero.zeroed();
+        return Some(zero.zeroed());
     };
     rest.iter()
-        .cloned()
-        .fold(first.clone(), |sum, amount| sum + amount)
+        .try_fold(first.clone(), |sum, amount| protocol::checked_step_add(&sum, amount))
 }
 
 fn incomplete_offer_crossing_result(
@@ -953,6 +964,27 @@ mod tests {
     }
 
     #[test]
+    fn sorted_pass_accumulation_reports_integral_overflow_as_none() {
+        // rippled 578224f2e6: an XRP or MPT aggregate that would wrap i64 is a
+        // dry path, not a silently wrapped total.
+        let issue = protocol::MPTIssue::new(protocol::MPTID::default());
+        let mpt = |value| {
+            STAmount::from_mpt_amount(sf("sfAmount"), protocol::MPTAmount::from_value(value), issue)
+        };
+        let near_max = mpt(i64::MAX - 1);
+        assert!(sum_sorted(&[mpt(1), near_max.clone()], &mpt(0)).is_some());
+        assert!(sum_sorted(&[mpt(2), near_max.clone()], &mpt(0)).is_none());
+        assert!(protocol::checked_step_add(&near_max, &mpt(2)).is_none());
+        assert_eq!(
+            protocol::checked_step_add(&mpt(3), &mpt(4)),
+            Some(mpt(7))
+        );
+        // Issued amounts are Number-backed and never report integral overflow.
+        let big = iou(9_999_999_999_999_999, -5);
+        assert!(protocol::checked_step_add(&big, &big).is_some());
+    }
+
+    #[test]
     fn sorted_pass_accumulation_preserves_iou_dust() {
         let large = iou(1_000_000_000_000_000, -15);
         let dust = iou(6_000_000_000_000_000, -31);
@@ -965,7 +997,7 @@ mod tests {
         insert_sorted(&mut passes, large.clone());
         insert_sorted(&mut passes, dust.clone());
         insert_sorted(&mut passes, dust);
-        let canonical = sum_sorted(&passes, &large.zeroed());
+        let canonical = sum_sorted(&passes, &large.zeroed()).expect("no overflow");
 
         assert_eq!(processing_order, iou(1_000_000_000_000_002, -15));
         assert_eq!(canonical, iou(1_000_000_000_000_001, -15));
@@ -989,8 +1021,8 @@ mod tests {
 
         assert_eq!(forward, reverse);
         assert_eq!(
-            sum_sorted(&forward, &amounts[0].zeroed()),
-            sum_sorted(&reverse, &amounts[0].zeroed())
+            sum_sorted(&forward, &amounts[0].zeroed()).expect("no overflow"),
+            sum_sorted(&reverse, &amounts[0].zeroed()).expect("no overflow")
         );
     }
 

@@ -263,7 +263,9 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     expected_xrp_delta: Option<i64>,
     prefix: Option<&InvariantDeltaPrefix>,
 ) -> Result<Ter, ()> {
-    let mut xrp_balance_change: i64 = 0;
+    // rippled 578224f2e6: a full-width running total, so a sum that would
+    // wrap a 64-bit accumulator is caught by the finalize check below.
+    let mut xrp_balance_change: i128 = 0;
     let mut has_xrp_trust_line = false;
     let mut deep_freeze_violation = false;
     let mut mpt_issuance_locked_violation = false;
@@ -764,7 +766,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
                             .drops() as i64
                     })
                     .unwrap_or(0);
-                xrp_balance_change += bal_after - bal_before;
+                xrp_balance_change += i128::from(bal_after) - i128::from(bal_before);
             }
             LedgerEntryType::Escrow => {
                 // 6. NoZeroEscrow
@@ -800,7 +802,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
                     .filter(|amount| amount.native())
                     .map(|amount| amount.xrp().drops())
                     .unwrap_or(0);
-                xrp_balance_change += bal_after - bal_before;
+                xrp_balance_change += i128::from(bal_after) - i128::from(bal_before);
             }
             LedgerEntryType::PayChannel => {
                 // 1. XRPNotCreated (PayChannel).  A channel's XRP still held
@@ -830,7 +832,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
                         )
                     })
                     .unwrap_or(0);
-                xrp_balance_change += bal_after - bal_before;
+                xrp_balance_change += i128::from(bal_after) - i128::from(bal_before);
             }
             LedgerEntryType::Sponsorship => {
                 // A prefunded sponsorship escrows XRP in sfFeeAmount. Match
@@ -847,7 +849,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
                     .filter(|sle| sle.is_field_present(fee_amount))
                     .map(|sle| sle.get_field_amount(fee_amount).xrp().drops())
                     .unwrap_or(0);
-                xrp_balance_change += bal_after - bal_before;
+                xrp_balance_change += i128::from(bal_after) - i128::from(bal_before);
             }
             LedgerEntryType::Offer => {
                 // 5. NoBadOffers
@@ -1289,7 +1291,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     // rippled's `-drops_ == fee`: handler/cleanup state must conserve XRP,
     // while the outer transaction delta must destroy exactly the charged fee.
     if let Some(expected) = expected_xrp_delta {
-        if xrp_balance_change != expected {
+        if xrp_balance_change != i128::from(expected) {
             return Err(());
         }
     } else if xrp_balance_change > 0 {

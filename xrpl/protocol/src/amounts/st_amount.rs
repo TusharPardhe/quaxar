@@ -643,6 +643,18 @@ pub fn can_add(a: &STAmount, b: &STAmount, mode: basics::number::RoundingMode) -
     .unwrap_or(false)
 }
 
+/// rippled `checkedStepAddOpt` (578224f2e6): add two payment-engine step
+/// amounts, returning `None` when an integral (XRP or MPT) sum is not
+/// representable in `i64`. Issued amounts are Number-backed and add as usual.
+/// `STAmount`'s `+` wraps integral overflow, so payment-engine accumulators
+/// must use this instead.
+pub fn checked_step_add(a: &STAmount, b: &STAmount) -> Option<STAmount> {
+    if a.integral() && a.are_comparable(b) {
+        signed_integral_value(a)?.checked_add(signed_integral_value(b)?)?;
+    }
+    Some(a.clone() + b.clone())
+}
+
 /// Returns whether `b` may be subtracted from `a` without violating the
 /// integral balance/overflow constraints. Comparable IOUs may always be
 /// subtracted.
