@@ -223,7 +223,7 @@ pub use feature::{
     feature_single_asset_vault, feature_smart_escrow, feature_sponsor, feature_token_escrow,
     feature_universal_number, feature_xchain_bridge, feature_xrp_fees, fix_ammv1_1, fix_ammv1_3,
     fix_batch_inner_sigs, fix_cleanup_3_1_3, fix_cleanup_3_2_0, fix_cleanup_3_3_0,
-    fix_cleanup_3_4_0, fix_cleanup_3_5_0, fix_enforce_nftoken_trustline_v2, fix_inner_obj_template,
+    fix_batch_v1_2, fix_cleanup_3_4_0, fix_cleanup_3_5_0, fix_enforce_nftoken_trustline_v2, fix_inner_obj_template,
     fix_inner_obj_template2, fix_mpt_delivered_amount, fix_nftoken_page_links, fix_previous_txn_id,
     fix_token_escrow_v1, registered_feature, registered_feature_supported,
     registered_feature_supported_with_confidential_crypto,
@@ -365,7 +365,7 @@ pub use rate::{
 };
 pub use rpc_err::{is_rpc_error, rpc_error};
 pub use rules::{
-    CurrentTransactionRulesGuard, Rules, get_current_transaction_rules, is_feature_enabled,
+    CurrentTransactionRulesGuard, Rules, get_current_transaction_rules, is_feature_enabled, is_feature_enabled_or,
     make_rules_given_current, make_rules_given_ledger, set_current_transaction_rules,
 };
 pub use secret_key::{

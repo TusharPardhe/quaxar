@@ -192,3 +192,48 @@ fn channel_verify_reports_the_current_malformed_error_surface() {
         Some(&JsonValue::String("channelAmtMalformed".to_owned()))
     );
 }
+
+#[test]
+fn channel_verify_rejects_non_string_channel_id_and_signature() {
+    // rippled #7582: channel_id and signature must be JSON strings; a
+    // non-string type is invalidParams, not coerced and parsed as hex.
+    let secret = SecretKey::from_bytes([1u8; 32]);
+    let public_key = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+    let public_key_bytes = public_key.as_bytes();
+    let channel_id =
+        Uint256::from_hex("0123456789ABCDEFFEDCBA98765432100123456789ABCDEFFEDCBA9876543210")
+            .expect("channel id should parse");
+    let amount = 1234_u64;
+    let message = serialize_pay_chan_authorization(&channel_id, amount);
+    let signature = sign(&public_key, &secret, &message).expect("secp signature");
+
+    let bad_channel = do_channel_verify(&object([
+        ("public_key", JsonValue::String(str_hex(&public_key_bytes))),
+        ("channel_id", JsonValue::Unsigned(1234)),
+        ("amount", JsonValue::String(amount.to_string())),
+        ("signature", JsonValue::String(str_hex(&signature))),
+    ]));
+    let JsonValue::Object(bad_channel) = bad_channel else {
+        panic!("expected object");
+    };
+    assert_eq!(
+        bad_channel.get("error"),
+        Some(&JsonValue::String("invalidParams".to_owned())),
+        "non-string channel_id must be rejected"
+    );
+
+    let bad_sig = do_channel_verify(&object([
+        ("public_key", JsonValue::String(str_hex(&public_key_bytes))),
+        ("channel_id", JsonValue::String(channel_id.to_string())),
+        ("amount", JsonValue::String(amount.to_string())),
+        ("signature", JsonValue::Bool(true)),
+    ]));
+    let JsonValue::Object(bad_sig) = bad_sig else {
+        panic!("expected object");
+    };
+    assert_eq!(
+        bad_sig.get("error"),
+        Some(&JsonValue::String("invalidParams".to_owned())),
+        "non-string signature must be rejected"
+    );
+}

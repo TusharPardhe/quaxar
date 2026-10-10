@@ -31,6 +31,14 @@ pub(super) struct MptIssuanceLifecycle {
     tokens_created: u32,
     tokens_deleted: u32,
     token_created_by_issuer: bool,
+    /// rippled #8152: issuance flags cleared by a modification, excluding the
+    /// legally clearable lsfMPTLocked. Any nonzero value is an invariant
+    /// violation under fixCleanup3_5_0.
+    issuance_flags_cleared: u32,
+    /// rippled #8209: an MPToken erased with a non-zero public sfMPTAmount.
+    /// Rejected under fixCleanup3_5_0 (the check moved here from the
+    /// confidential gate).
+    mptoken_deleted_with_balance: bool,
 }
 
 #[derive(Default)]
@@ -40,6 +48,10 @@ pub(super) struct ConfidentialMptChange {
     outstanding_delta: i128,
     issuance: Option<STLedgerEntry>,
     deleted_with_encrypted: bool,
+    /// rippled #8209: pre-fixCleanup3_5_0 only, a non-zero public balance at
+    /// erase time. Pre-amendment this fed the confidential (COA) gate; post
+    /// amendment the public-balance check moves to ValidMPTIssuance.
+    deleted_with_balance_before: bool,
     bad_consistency: bool,
     bad_coa: bool,
     changes_confidential_fields: bool,
@@ -64,6 +76,7 @@ pub(super) fn record_confidential_mpt(
     is_delete: bool,
     before: Option<&STLedgerEntry>,
     after: &STLedgerEntry,
+    fix_cleanup_3_5_0: bool,
 ) {
     let id = |sle: &STLedgerEntry| match sle.get_type() {
         LedgerEntryType::MPToken => sle.get_field_h192(sf("sfMPTokenIssuanceID")),
@@ -74,15 +87,29 @@ pub(super) fn record_confidential_mpt(
         let change = changes.entry(id(before)).or_default();
         change.mpt_amount_delta -= capped_delta(before.get_field_u64(sf("sfMPTAmount")));
         if is_delete {
-            change.deleted_with_encrypted = before.get_field_u64(sf("sfMPTAmount")) > 0
-                || [
-                    "sfConfidentialBalanceSpending",
-                    "sfConfidentialBalanceInbox",
-                    "sfIssuerEncryptedBalance",
-                    "sfAuditorEncryptedBalance",
-                ]
-                .iter()
-                .any(|field| before.is_field_present(sf(field)));
+            // changes is keyed by issuance, so sibling holders erased by the
+            // same transaction share this entry. Only ever SET these flags,
+            // never clear them, or an empty sibling visited later would mask a
+            // funded MPToken (rippled #8209).
+            //
+            // Pre-fixCleanup3_5_0 the non-zero public balance fed the COA gate
+            // below; post-amendment the public-balance check moves to
+            // ValidMPTIssuance::finalize, so only ciphertext fields feed the
+            // confidential gate here.
+            if !fix_cleanup_3_5_0 && before.get_field_u64(sf("sfMPTAmount")) > 0 {
+                change.deleted_with_balance_before = true;
+            }
+            if [
+                "sfConfidentialBalanceSpending",
+                "sfConfidentialBalanceInbox",
+                "sfIssuerEncryptedBalance",
+                "sfAuditorEncryptedBalance",
+            ]
+            .iter()
+            .any(|field| before.is_field_present(sf(field)))
+            {
+                change.deleted_with_encrypted = true;
+            }
         }
     }
     if after.get_type() == LedgerEntryType::MPToken {
@@ -152,6 +179,14 @@ pub(super) fn validates_confidential_mpt<V: ApplyView + ?Sized>(
         return true;
     }
     let confidential_tx = matches!(txn_type.to_u16(), 85..=89);
+    // rippled #8209: before fixCleanup3_5_0 the COA gate also absorbed the
+    // pre-transaction public balance, so a drain-then-erase of an MPToken was
+    // rejected whenever an unrelated holder of the same issuance held a
+    // confidential balance. Post-amendment the public-balance check lives in
+    // ValidMPTIssuance and only ciphertext feeds this gate.
+    let fix_cleanup_3_5_0 = view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_5_0"));
     changes.iter().all(|(id, change)| {
         let issuance = if let Some(issuance) = change.issuance.clone() {
             Some(issuance)
@@ -167,7 +202,12 @@ pub(super) fn validates_confidential_mpt<V: ApplyView + ?Sized>(
         let Some(issuance) = issuance else {
             return true;
         };
-        if change.deleted_with_encrypted
+        let deleted_with_encrypted = if fix_cleanup_3_5_0 {
+            change.deleted_with_encrypted
+        } else {
+            change.deleted_with_encrypted || change.deleted_with_balance_before
+        };
+        if deleted_with_encrypted
             && optional_u64(&issuance, sf("sfConfidentialOutstandingAmount")) > 0
         {
             return false;
@@ -488,9 +528,16 @@ pub(super) fn record_mpt_issuance_lifecycle<V: ApplyView + ?Sized>(
             lifecycle.reference_holding_set_on_create |= fix_cleanup_3_2_0
                 && after.is_field_present(sf("sfReferenceHolding"))
                 && txn_type != protocol::TxType::VAULT_CREATE;
-        } else if fix_cleanup_3_2_0 && let Some(before) = before {
-            lifecycle.reference_holding_mutated |=
-                !same_optional_h256(before, after, sf("sfReferenceHolding"));
+        } else if let Some(before) = before {
+            // rippled #8152: lsfMPTLocked is the only issuance flag with a
+            // legal clear path (tfMPTUnlock); every other flag is fixed at
+            // creation or set-once. Accumulate any other cleared flag.
+            lifecycle.issuance_flags_cleared |=
+                before.get_flags() & !after.get_flags() & !protocol::MPT_LOCKED_LEDGER_FLAG;
+            if fix_cleanup_3_2_0 {
+                lifecycle.reference_holding_mutated |=
+                    !same_optional_h256(before, after, sf("sfReferenceHolding"));
+            }
         }
     }
 
@@ -510,6 +557,11 @@ pub(super) fn record_mpt_issuance_lifecycle<V: ApplyView + ?Sized>(
 
     if is_delete && deleted.get_type() == LedgerEntryType::MPToken {
         lifecycle.tokens_deleted = lifecycle.tokens_deleted.saturating_add(1);
+        // rippled #8209: deleting an MPToken with a non-zero public balance is
+        // rejected under fixCleanup3_5_0 (checked in the verdict).
+        if deleted.get_field_u64(sf("sfMPTAmount")) > 0 {
+            lifecycle.mptoken_deleted_with_balance = true;
+        }
     }
 
     if !fix_cleanup_3_2_0 || !is_delete || txn_type == protocol::TxType::VAULT_DELETE {
@@ -541,7 +593,20 @@ pub(super) fn is_vault_pseudo_account<V: ApplyView + ?Sized>(
         .is_some_and(|sle| sle.is_field_present(sf("sfVaultID"))))
 }
 
-pub(super) fn validates_mpt_issuance_lifecycle(lifecycle: &MptIssuanceLifecycle) -> bool {
+pub(super) fn validates_mpt_issuance_lifecycle(
+    lifecycle: &MptIssuanceLifecycle,
+    fix_cleanup_3_5_0: bool,
+) -> bool {
+    // rippled #8152: post-fixCleanup3_5_0, clearing any issuance flag other
+    // than lsfMPTLocked is an invariant violation.
+    if fix_cleanup_3_5_0 && lifecycle.issuance_flags_cleared != 0 {
+        return false;
+    }
+    // rippled #8209: post-fixCleanup3_5_0, erasing an MPToken with a non-zero
+    // public balance is an invariant violation.
+    if fix_cleanup_3_5_0 && lifecycle.mptoken_deleted_with_balance {
+        return false;
+    }
     !lifecycle.reference_holding_set_on_create
         && !lifecycle.reference_holding_mutated
         && !lifecycle.vault_holding_deleted
@@ -741,7 +806,9 @@ pub(super) fn validates_mpt_lifecycle_counts(
 
 #[cfg(test)]
 mod tests {
-    use super::{MptIssuanceLifecycle, validates_mpt_lifecycle_counts};
+    use super::{
+        MptIssuanceLifecycle, validates_mpt_issuance_lifecycle, validates_mpt_lifecycle_counts,
+    };
     use protocol::{Ter, TxType};
 
     fn lifecycle(tokens_created: u32, tokens_deleted: u32) -> MptIssuanceLifecycle {
@@ -750,6 +817,27 @@ mod tests {
             tokens_deleted,
             ..MptIssuanceLifecycle::default()
         }
+    }
+
+    #[test]
+    fn issuance_flag_clear_rejected_only_under_cleanup_3_5_0() {
+        // rippled #8152: clearing a non-lock issuance flag fails post-3.5.0.
+        let cleared = MptIssuanceLifecycle {
+            issuance_flags_cleared: 0x0000_0002, // not lsfMPTLocked (0x1)
+            ..MptIssuanceLifecycle::default()
+        };
+        assert!(
+            validates_mpt_issuance_lifecycle(&cleared, false),
+            "pre-3.5.0 the cleared flag is tolerated"
+        );
+        assert!(
+            !validates_mpt_issuance_lifecycle(&cleared, true),
+            "post-3.5.0 a cleared non-lock issuance flag is an invariant failure"
+        );
+
+        // Clearing only lsfMPTLocked is always allowed (it is masked out).
+        let clean = MptIssuanceLifecycle::default();
+        assert!(validates_mpt_issuance_lifecycle(&clean, true));
     }
 
     #[test]

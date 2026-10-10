@@ -552,3 +552,56 @@ fn deposit_preauth_credential_duplicates_match_cpp_error_shape() {
         )
     );
 }
+
+#[test]
+fn structured_selectors_match_keylets_and_accept_raw_ids() {
+    // rippled #6319: Check, NFTokenOffer, PayChannel and SignerList accept a
+    // structured object as well as a raw hex id.
+    let account = AccountID::from_hex("1111111111111111111111111111111111111111")
+        .expect("account");
+    let destination = AccountID::from_hex("2222222222222222222222222222222222222222")
+        .expect("destination");
+    let acc160 = Uint160::from_slice(account.data()).expect("acc width");
+    let dst160 = Uint160::from_slice(destination.data()).expect("dst width");
+    let addr = to_base58(account);
+    let dst_addr = to_base58(destination);
+
+    let check = object([
+        ("account", JsonValue::String(addr.clone())),
+        ("seq", JsonValue::Unsigned(5)),
+    ]);
+    assert_eq!(parse_check(&check, "check").unwrap(), check_keylet(acc160, 5).key);
+
+    let nft = object([
+        ("owner", JsonValue::String(addr.clone())),
+        ("seq", JsonValue::Unsigned(7)),
+    ]);
+    assert_eq!(
+        parse_nftoken_offer(&nft, "nft").unwrap(),
+        nft_offer_keylet_for_owner(acc160, 7).key
+    );
+
+    let paychan = object([
+        ("account", JsonValue::String(addr.clone())),
+        ("destination", JsonValue::String(dst_addr)),
+        ("seq", JsonValue::Unsigned(9)),
+    ]);
+    assert_eq!(
+        parse_pay_channel(&paychan, "pay").unwrap(),
+        pay_channel_keylet(acc160, dst160, 9).key
+    );
+
+    let signers = object([("account", JsonValue::String(addr))]);
+    assert_eq!(
+        parse_signer_list(&signers, "signer").unwrap(),
+        signers_keylet(acc160).key
+    );
+
+    // A raw hex id is still accepted (non-object input).
+    let raw = "ABCD".repeat(16);
+    let raw_json = JsonValue::String(raw.clone());
+    assert_eq!(
+        parse_check(&raw_json, "check").unwrap(),
+        Uint256::from_hex(&raw).unwrap()
+    );
+}

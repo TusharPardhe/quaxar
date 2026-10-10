@@ -6227,6 +6227,59 @@ fn payment_legacy_mpt_fee_quote_and_debit_use_non_directed_rounding() {
 }
 
 #[test]
+fn payment_mpt_cleanup_3_5_0_rounds_transfer_cost_up_in_quote_and_debit() {
+    // rippled #8302: under fixCleanup3_5_0 the MPT transfer cost is exact and
+    // rounded up (1 * 1.25 -> 2) both when quoting against SendMax and when
+    // debiting the sender, so the two can never disagree.
+    let source = sample_account(0xD1);
+    let destination = sample_account(0xD2);
+    let issuer = sample_account(0xD3);
+    let mpt_id = share_id_for(issuer, 1);
+    let mpt = |value: i64, field: &'static str| {
+        STAmount::from_mpt_amount(sf(field), MPTAmount::from_value(value), MPTIssue::new(mpt_id))
+    };
+    let run = |send_max: Option<i64>| {
+        let mut ledger = empty_ledger(vec![
+            account_root_with_balance(source, 1, 0, 1_000_000_000),
+            account_root_with_balance(destination, 1, 0, 1_000_000_000),
+            account_root(issuer, 1, 0),
+            mpt_issuance_entry_with_transfer_fee(issuer, 1, 2, protocol::lsfMPTCanTransfer, 25_000),
+            mptoken_entry(source, mpt_id, 2),
+            mptoken_entry(destination, mpt_id, 0),
+        ]);
+        ledger.set_rules(protocol::Rules::new([
+            protocol::feature_id("MPTokensV1"),
+            protocol::feature_id("fixCleanup3_5_0"),
+        ]));
+        let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
+        let tx = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(sf("sfAccount"), source);
+            tx.set_account_id(sf("sfDestination"), destination);
+            tx.set_field_amount(sf("sfAmount"), mpt(1, "sfAmount"));
+            if let Some(max) = send_max {
+                tx.set_field_amount(sf("sfSendMax"), mpt(max, "sfSendMax"));
+            }
+            tx.set_field_amount(sf("sfFee"), test_xrp(10));
+            tx.set_field_u32(sf("sfSequence"), 1);
+        });
+        let ter = handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, Some(1_000_000_000));
+        let amount_of = |account| {
+            view.read(protocol::mptoken_keylet_from_mptid(mpt_id, raw_account_id(account)))
+                .expect("token read")
+                .expect("token")
+                .get_field_u64(sf("sfMPTAmount"))
+        };
+        (ter, amount_of(source), amount_of(destination))
+    };
+
+    // Without SendMax the cap is the delivered amount (1); the exact cost (2)
+    // exceeds it.
+    assert_eq!(run(None).0, Ter::TEC_PATH_PARTIAL);
+    // With SendMax 2 the sender is debited exactly the rounded-up cost.
+    assert_eq!(run(Some(2)), (Ter::TES_SUCCESS, 0, 1));
+}
+
+#[test]
 fn direct_xrp_payment_preserves_fee_when_fee_exceeds_source_reserve() {
     let source = sample_account(0xA1);
     let destination = sample_account(0xA2);

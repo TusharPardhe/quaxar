@@ -23,16 +23,6 @@ pub trait FeatureSource {
     fn majority_timestamps(&self) -> BTreeMap<Uint256, i64>;
 }
 
-fn json_value_as_bool(value: &JsonValue) -> bool {
-    match value {
-        JsonValue::Bool(value) => *value,
-        JsonValue::Signed(value) => *value != 0,
-        JsonValue::Unsigned(value) => *value != 0,
-        JsonValue::String(value) => !value.is_empty(),
-        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) => false,
-    }
-}
-
 fn ensure_object(value: &mut JsonValue) -> &mut BTreeMap<String, JsonValue> {
     if !matches!(value, JsonValue::Object(_)) {
         *value = JsonValue::Object(BTreeMap::new());
@@ -109,7 +99,13 @@ pub fn do_feature<S: FeatureSource>(request: &FeatureRequest<'_>, source: &S) ->
             return rpc_error(RpcErrorCode::NoPermission);
         }
 
-        if json_value_as_bool(vetoed) {
+        // rippled #7583: `vetoed` must be a JSON boolean when present; a
+        // non-boolean type is a parameter error, not silently coerced.
+        let JsonValue::Bool(vetoed) = vetoed else {
+            return rpc_error(RpcErrorCode::InvalidParams);
+        };
+
+        if *vetoed {
             source.veto_feature(feature);
         } else {
             source.unveto_feature(feature);

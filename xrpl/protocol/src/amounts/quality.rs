@@ -12,7 +12,7 @@ use basics::number::{
 };
 
 use crate::st_amount::AmountError;
-use crate::{Asset, STAmount, is_feature_enabled, no_issue, sf_generic};
+use crate::{Asset, STAmount, is_feature_enabled, is_feature_enabled_or, no_issue, sf_generic};
 
 pub const QUALITY_ONE: u32 = 1_000_000_000;
 
@@ -659,7 +659,13 @@ fn div_round_impl(
     }
 
     let result_negative = num.negative() != den.negative();
-    if matches!(asset, Asset::MPTIssue(_)) && is_feature_enabled(&crate::feature_id("MPTokensV2")) {
+    // rippled #8302: the legacy path below overflows on large MPT amounts, so
+    // the Number path is also taken under fixCleanup3_5_0. Both default to
+    // enabled when no transaction rules are installed.
+    if matches!(asset, Asset::MPTIssue(_))
+        && (is_feature_enabled_or(&crate::feature_id("MPTokensV2"), true)
+            || is_feature_enabled_or(&crate::fix_cleanup_3_5_0(), true))
+    {
         let quotient = {
             let _guard = NumberRoundModeGuard::new(round_mode(result_negative, round_up));
             stamount_as_number(num) / stamount_as_number(den)

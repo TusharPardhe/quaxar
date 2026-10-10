@@ -51,6 +51,24 @@ pub const DISABLED_INNER_BATCH_TX_TYPES: [TxType; 15] = [
     TxType::LOAN_PAY,
 ];
 
+/// Amendment gates consulted by the Batch structure checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BatchPreflightRules {
+    /// LendingProtocolV1_2: SAV and Lending types may be Batch inners.
+    pub lending_v1_2: bool,
+    /// fixBatchV1_2: every inner must be wrapped in a RawTransaction object.
+    pub fix_batch_v1_2: bool,
+}
+
+impl BatchPreflightRules {
+    pub fn from_rules(rules: &Rules) -> Self {
+        Self {
+            lending_v1_2: rules.enabled(&protocol::feature_lending_protocol_v1_2()),
+            fix_batch_v1_2: rules.enabled(&protocol::fix_batch_v1_2()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BatchSignatureFacts {
     pub has_txn_signature: bool,
@@ -84,6 +102,10 @@ pub trait BatchInnerTransaction {
     }
     fn sequence(&self) -> u32;
     fn ticket_sequence(&self) -> Option<u32>;
+    /// Whether the inner was carried in a `RawTransaction` wrapper object.
+    fn is_raw_transaction_wrapped(&self) -> bool {
+        true
+    }
 }
 
 pub trait BatchSignerEntry {
@@ -96,6 +118,7 @@ pub fn validate_batch_preflight_structure<InnerTx, InnerPreflight>(
     batch_flags: u32,
     inner_transactions: impl IntoIterator<Item = InnerTx>,
     mut preflight_inner_transaction: InnerPreflight,
+    rules: BatchPreflightRules,
 ) -> NotTec
 where
     InnerTx: BatchInnerTransaction,
@@ -121,6 +144,11 @@ where
     let mut account_seq_ticket: HashMap<InnerTx::Account, HashSet<u32>> = HashMap::new();
 
     for inner_transaction in &inner_transactions {
+        // rippled fixBatchV1_2: the txns array may contain only RawTransaction
+        // objects. Checked first, before uniqueness.
+        if rules.fix_batch_v1_2 && !inner_transaction.is_raw_transaction_wrapped() {
+            return Ter::TEM_MALFORMED;
+        }
         let tx_id = inner_transaction.transaction_id();
         if !unique_hashes.insert(tx_id) {
             return Ter::TEM_REDUNDANT;
@@ -130,7 +158,10 @@ where
         if txn_type == TxType::BATCH {
             return Ter::TEM_INVALID;
         }
-        if DISABLED_INNER_BATCH_TX_TYPES.contains(&txn_type) {
+        // rippled #8244: before LendingProtocolV1_2, SAV and Lending types
+        // cannot be Batch inners; after it, they pass through the normal
+        // Batch checks.
+        if !rules.lending_v1_2 && DISABLED_INNER_BATCH_TX_TYPES.contains(&txn_type) {
             return Ter::TEM_INVALID_INNER_BATCH;
         }
 
@@ -269,7 +300,9 @@ where
 }
 
 pub fn validate_sttx_batch_preflight(tx: &STTx) -> NotTec {
-    validate_sttx_batch_preflight_with_inner_preflight(tx, |_| Ter::TES_SUCCESS)
+    // No rules context: use the pre-amendment default (SAV/Lending inners
+    // disabled), matching the historical behaviour of this entry point.
+    validate_sttx_batch_preflight_with_inner_preflight(tx, |_| Ter::TES_SUCCESS, BatchPreflightRules::default())
 }
 
 pub fn validate_sttx_batch_preflight_with_rules(tx: &STTx, rules: &Rules) -> NotTec {
@@ -281,9 +314,18 @@ pub fn validate_sttx_batch_preflight_with_rules_and_network_id(
     rules: &Rules,
     node_network_id: u32,
 ) -> NotTec {
-    validate_sttx_batch_typed_preflight_with_inner_preflight(tx, |inner| {
-        validate_sttx_inner_batch_preflight_with_rules_and_network_id(inner, rules, node_network_id)
-    })
+    let batch_rules = BatchPreflightRules::from_rules(rules);
+    validate_sttx_batch_typed_preflight_with_inner_preflight(
+        tx,
+        |inner| {
+            validate_sttx_inner_batch_preflight_with_rules_and_network_id(
+                inner,
+                rules,
+                node_network_id,
+            )
+        },
+        batch_rules,
+    )
 }
 
 /// The exact `Batch::preflightSigValidated` tail. This must run only after
@@ -338,6 +380,7 @@ pub fn canonical_batch_inner_transactions(tx: &STTx) -> Result<Vec<STTx>, NotTec
 fn validate_sttx_batch_preflight_with_inner_preflight(
     tx: &STTx,
     mut preflight_inner: impl FnMut(&STTx) -> NotTec,
+    rules: BatchPreflightRules,
 ) -> NotTec {
     if tx.get_txn_type() != TxType::BATCH {
         return Ter::TEM_INVALID;
@@ -358,9 +401,12 @@ fn validate_sttx_batch_preflight_with_inner_preflight(
     };
 
     let structure =
-        validate_batch_preflight_structure(tx.get_flags(), inner_transactions.iter(), |inner| {
-            preflight_inner(inner)
-        });
+        validate_batch_preflight_structure(
+            tx.get_flags(),
+            inner_transactions.iter(),
+            |inner| preflight_inner(inner),
+            rules,
+        );
     if !is_tes_success(structure) {
         return structure;
     }
@@ -386,6 +432,7 @@ fn validate_sttx_batch_preflight_with_inner_preflight(
 fn validate_sttx_batch_typed_preflight_with_inner_preflight(
     tx: &STTx,
     mut preflight_inner: impl FnMut(&STTx) -> NotTec,
+    rules: BatchPreflightRules,
 ) -> NotTec {
     if tx.get_txn_type() != TxType::BATCH {
         return Ter::TEM_INVALID;
@@ -401,9 +448,12 @@ fn validate_sttx_batch_typed_preflight_with_inner_preflight(
         Ok(inner_transactions) => inner_transactions,
         Err(error) => return error,
     };
-    validate_batch_preflight_structure(tx.get_flags(), inner_transactions.iter(), |inner| {
-        preflight_inner(inner)
-    })
+    validate_batch_preflight_structure(
+        tx.get_flags(),
+        inner_transactions.iter(),
+        |inner| preflight_inner(inner),
+        rules,
+    )
 }
 
 /// Delegates Batch inner validation to the same shared dispatcher used for
@@ -439,6 +489,10 @@ fn st_object_signature_facts(object: &STObject) -> BatchSignatureFacts {
 impl BatchInnerTransaction for &STTx {
     type TxId = Uint256;
     type Account = AccountID;
+
+    fn is_raw_transaction_wrapped(&self) -> bool {
+        protocol::StBase::fname(*self) == get_field_by_symbol("sfRawTransaction")
+    }
 
     fn transaction_id(&self) -> Self::TxId {
         self.get_transaction_id()
@@ -533,6 +587,8 @@ fn validate_signature_facts(signature_facts: BatchSignatureFacts) -> Option<NotT
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+
+    use super::BatchPreflightRules;
 
     use protocol::{
         AccountID, BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, Rules, STAmount, STTx, Ter,
@@ -660,6 +716,7 @@ mod tests {
             BatchTransactionFlags::ALL_OR_NOTHING.bits(),
             [first, StubInnerTx::new("tx-2", "bob")],
             |_| protocol::Ter::TES_SUCCESS,
+            BatchPreflightRules::default(),
         );
 
         assert_eq!(result, protocol::Ter::TEM_BAD_SIGNER);
@@ -674,6 +731,7 @@ mod tests {
             BatchTransactionFlags::ALL_OR_NOTHING.bits(),
             [first, StubInnerTx::new("tx-2", "bob")],
             |_| protocol::Ter::TES_SUCCESS,
+            BatchPreflightRules::default(),
         );
 
         assert_eq!(result, protocol::Ter::TEM_SEQ_AND_TICKET);
@@ -689,6 +747,7 @@ mod tests {
             BatchTransactionFlags::INDEPENDENT.bits(),
             [first, second],
             |_| protocol::Ter::TES_SUCCESS,
+            BatchPreflightRules::default(),
         );
 
         assert_eq!(result, protocol::Ter::TES_SUCCESS);

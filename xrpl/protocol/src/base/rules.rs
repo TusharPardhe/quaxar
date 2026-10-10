@@ -10,7 +10,8 @@ use basics::unordered_containers::{HardenedHashSet, HashSet};
 use std::sync::OnceLock;
 
 use crate::{
-    feature_lending_protocol, feature_single_asset_vault, fix_cleanup_3_2_0, fix_cleanup_3_3_0,
+    feature_id, feature_lending_protocol, feature_single_asset_vault, fix_cleanup_3_2_0,
+    fix_cleanup_3_3_0,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -71,7 +72,10 @@ pub fn set_current_transaction_rules(rules: Option<Rules>) {
         None => MantissaScale::Large,
         Some(rules) => {
             let enable_vault_numbers = rules.enabled(&feature_single_asset_vault())
-                || rules.enabled(&feature_lending_protocol());
+                || rules.enabled(&feature_lending_protocol())
+                // rippled #8330: MPTokensV2 also needs the large Number
+                // mantissa. Keep this in sync with the rules-guard predicate.
+                || rules.enabled(&feature_id("MPTokensV2"));
             match (
                 enable_vault_numbers,
                 rules.enabled(&fix_cleanup_3_2_0()),
@@ -90,7 +94,16 @@ pub fn set_current_transaction_rules(rules: Option<Rules>) {
 }
 
 pub fn is_feature_enabled(feature: &Uint256) -> bool {
-    get_current_transaction_rules().is_some_and(|rules| rules.enabled(feature))
+    is_feature_enabled_or(feature, false)
+}
+
+/// rippled `isFeatureEnabled(feature, resultIfNoRules)`: the answer when no
+/// current-transaction rules are installed is chosen by the caller.
+pub fn is_feature_enabled_or(feature: &Uint256, result_if_no_rules: bool) -> bool {
+    match get_current_transaction_rules() {
+        Some(rules) => rules.enabled(feature),
+        None => result_if_no_rules,
+    }
 }
 
 #[derive(Debug)]

@@ -47,6 +47,9 @@ impl TransactionStepRuntimeGuard {
             || rules.enabled(&feature_lending_protocol())
             || rules.enabled(&fix_cleanup_3_2_0())
             || rules.enabled(&fix_cleanup_3_3_0())
+            // rippled #8330: MPTokensV2 uses the large Number mantissa and so
+            // must also engage the current-rules guard path.
+            || rules.enabled(&crate::feature_id("MPTokensV2"))
         {
             Self {
                 _st_number: Some(NumberSo::new(rules.enabled(&feature_universal_number()))),
