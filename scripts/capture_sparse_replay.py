@@ -82,7 +82,16 @@ def main():
             for v in obj:
                 collect_accounts(v)
 
+    deleting = set()
+
+    def collect_deleting(tx):
+        if tx.get("TransactionType") == "AccountDelete":
+            deleting.add(tx["Account"])
+        for raw in tx.get("RawTransactions", []):
+            collect_deleting(raw.get("RawTransaction", {}))
+
     for t in child["transactions"]:
+        collect_deleting(t)
         collect_accounts(t)
         for n in t["metaData"]["AffectedNodes"]:
             kind = next(iter(n)); v = n[kind]
@@ -90,8 +99,101 @@ def main():
                 want.add(v["LedgerIndex"])
             collect_accounts(v)
 
+    def currency_bytes(code):
+        if len(code) == 40:
+            return bytes.fromhex(code)
+        raw = bytearray(20)
+        raw[12:15] = code.encode()
+        return bytes(raw)
+
+    def line_key(a, b, code):
+        lo, hi = sorted([account_id(a), account_id(b)])
+        return sha512h(b"\x00r" + lo + hi + currency_bytes(code))
+
+    def collect_lines(tx):
+        parties = {tx.get("Account"), tx.get("Destination"), tx.get("Owner")} - {None}
+        for field in ("Amount", "SendMax", "DeliverMin", "TakerGets", "TakerPays",
+                      "LimitAmount", "Amount2", "EPrice", "LPTokenOut", "LPTokenIn"):
+            amt = tx.get(field)
+            if isinstance(amt, dict) and "issuer" in amt and "currency" in amt:
+                accounts.add(amt["issuer"])
+                for party in parties:
+                    if party != amt["issuer"]:
+                        want.add(line_key(party, amt["issuer"], amt["currency"]))
+        for raw in tx.get("RawTransactions", []):
+            collect_lines(raw.get("RawTransaction", {}))
+
+    for t in child["transactions"]:
+        collect_lines(t)
+
+    # Order books and AMM pools a transaction may cross: their offers are
+    # read (quality, funding) even when the network leaves them untouched.
+    def asset_of(amt):
+        if isinstance(amt, dict):
+            if "mpt_issuance_id" in amt:
+                return None
+            return {"currency": amt["currency"], "issuer": amt["issuer"]}
+        if isinstance(amt, str):
+            return {"currency": "XRP"}
+        return None
+
+    pairs = set()
+
+    def add_pair(a, b):
+        if a and b and a != b:
+            pairs.add((json.dumps(a, sort_keys=True), json.dumps(b, sort_keys=True)))
+
+    def collect_books(tx):
+        if "TakerGets" in tx and "TakerPays" in tx:
+            add_pair(asset_of(tx["TakerGets"]), asset_of(tx["TakerPays"]))
+        if tx.get("TransactionType") == "Payment":
+            src = asset_of(tx.get("SendMax", tx.get("Amount")))
+            dst = asset_of(tx.get("Amount"))
+            add_pair(src, dst)
+            for path in tx.get("Paths", []):
+                cur = src
+                for step in path:
+                    nxt = None
+                    if "currency" in step:
+                        nxt = {"currency": step["currency"]} if step["currency"] == "XRP" else {
+                            "currency": step["currency"], "issuer": step.get("issuer", (cur or {}).get("issuer"))}
+                    if nxt:
+                        add_pair(cur, nxt)
+                        cur = nxt
+                add_pair(cur, dst)
+        for raw in tx.get("RawTransactions", []):
+            collect_books(raw.get("RawTransaction", {}))
+
+    for t in child["transactions"]:
+        collect_books(t)
+
+    for a_json, b_json in list(pairs):
+        a, b = json.loads(a_json), json.loads(b_json)
+        for gets, pays in ((a, b), (b, a)):
+            try:
+                book = rpc("book_offers", taker_gets=gets, taker_pays=pays,
+                           ledger_index=parent_seq, limit=100)
+            except RuntimeError:
+                book = {}
+            for offer in book.get("offers", []):
+                want.add(offer["index"])
+                want.add(offer["BookDirectory"])
+                accounts.add(offer["Account"])
+                for side in (offer.get("TakerGets"), offer.get("TakerPays")):
+                    if isinstance(side, dict) and "issuer" in side:
+                        want.add(line_key(offer["Account"], side["issuer"], side["currency"]))
+        try:
+            amm = rpc("amm_info", asset=a, asset2=b, ledger_index=parent_seq)["amm"]
+            accounts.add(amm["account"])
+            for side in (a, b):
+                if "issuer" in side:
+                    want.add(line_key(amm["account"], side["issuer"], side["currency"]))
+        except (RuntimeError, KeyError):
+            pass
+
     for a in accounts:
         want.add(account_key(a))
+        want.add(sha512h(b"\x00S" + account_id(a) + (0).to_bytes(4, "big")))  # SignerList
         root = owner_dir_key(a)
         want.add(root)
         # NFToken pages: keys are AccountID || low 96 bits of the token, so
@@ -123,6 +225,8 @@ def main():
     nft_ids = set()
     collect_nft_ids(child["transactions"], nft_ids)
     for nid in nft_ids:
+        # The issuer AccountID is bytes 4..24 of the NFTokenID.
+        want.add(sha512h(b"\x00a" + bytes.fromhex(nid[8:48])))
         for ns in (b"\x00h", b"\x00i"):  # NFTOKEN_BUY_OFFERS, NFTOKEN_SELL_OFFERS
             want.add(sha512h(ns + bytes.fromhex(nid)))
 
@@ -151,6 +255,8 @@ def main():
             j = rpc("ledger_entry", index=idx, ledger_index=parent_seq)["node"]
         except RuntimeError:
             continue
+        if j.get("LedgerEntryType") == "AccountRoot" and "AMMID" in j:
+            pending.append(j["AMMID"])
         if j.get("LedgerEntryType") == "DirectoryNode":
             root = j.get("RootIndex", idx)
             for page_field in ("IndexNext", "IndexPrevious"):
@@ -158,7 +264,9 @@ def main():
                 if p:
                     pending.append(dir_page_key(root, p))
             # owner directories: include every owned entry (reads during deletes)
-            if "Owner" in j or "NFTokenID" in j:
+            # Every owned object is only read wholesale by AccountDelete;
+            # NFToken offer directories are walked by NFT transactions.
+            if "NFTokenID" in j or j.get("Owner") in deleting:
                 pending.extend(j.get("Indexes", []))
 
     amendments = rpc("ledger_entry", index=SINGLETONS[0], ledger_index=parent_seq)["node"]["Amendments"]
