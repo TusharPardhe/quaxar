@@ -147,10 +147,26 @@ fn json_hash(value: &serde_json::Value, field: &str) -> Uint256 {
 #[test]
 #[ignore = "TEST ONLY: requires QUAXAR_SPARSE_REPLAY_JSONL"]
 fn sparse_production_close_matches_every_canonical_metadata_blob() {
-    let path = PathBuf::from(
+    run_sparse_replay(PathBuf::from(
         std::env::var("QUAXAR_SPARSE_REPLAY_JSONL")
             .expect("set QUAXAR_SPARSE_REPLAY_JSONL to a captured fixture"),
+    ));
+}
+
+/// Testnet fork at 21427256 (2026-10-10): an ALL_OR_NOTHING Batch whose last
+/// inner AccountDelete removes 8 Tickets. Quaxar's ticket deleter left
+/// `sfTicketCount` on the account and dropped empty owner-directory roots,
+/// so the DeletedNode metadata and state diverged from rippled
+/// `Transactor::ticketDelete`. Captured with scripts/capture_sparse_replay.py.
+#[test]
+fn testnet_21427256_batch_account_delete_matches_network() {
+    run_sparse_replay(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21427256_batch_account_delete.jsonl"),
     );
+}
+
+fn run_sparse_replay(path: PathBuf) {
     let rendered = path.to_string_lossy();
     assert!(
         !rendered.contains(LIVE_NODE_STATE_COMPONENT),

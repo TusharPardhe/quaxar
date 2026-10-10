@@ -2677,10 +2677,14 @@ fn remove_deposit_preauth_entry<V: ledger::ApplyView>(
         .unwrap_or(Ter::TEF_BAD_LEDGER)
 }
 
+/// rippled `DIDDelete::deleteSLE` / `OracleDelete::deleteOracle` as used by
+/// AccountDelete: unlink from the owner directory (keeping the root page),
+/// release `owner_count` reserve units and erase the entry.
 fn remove_account_delete_owned_entry<V: ledger::ApplyView>(
     view: &mut V,
     account: AccountID,
     entry: Arc<STLedgerEntry>,
+    owner_count: u32,
 ) -> Ter {
     let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
     if !ledger::dir_remove(
@@ -2688,7 +2692,7 @@ fn remove_account_delete_owned_entry<V: ledger::ApplyView>(
         &owner_dir,
         entry.get_field_u64(sf("sfOwnerNode")),
         *entry.key(),
-        false,
+        true,
     )
     .unwrap_or(false)
     {
@@ -2697,12 +2701,59 @@ fn remove_account_delete_owned_entry<V: ledger::ApplyView>(
     let account_sle = match view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
     {
         Ok(Some(sle)) => sle,
-        _ => return Ter::TEF_BAD_LEDGER,
+        _ => return Ter::TEC_INTERNAL,
     };
-    if ledger::decrease_owner_count_for_object(view, &account_sle, &entry, 1).is_err() {
+    if ledger::decrease_owner_count_for_object(view, &account_sle, &entry, owner_count).is_err() {
         return Ter::TEF_BAD_LEDGER;
     }
     view.erase(entry)
+        .map(|_| Ter::TES_SUCCESS)
+        .unwrap_or(Ter::TEF_BAD_LEDGER)
+}
+
+/// rippled `Transactor::ticketDelete`: unlink the Ticket from the owner
+/// directory (keeping the root), decrement or remove `sfTicketCount`, release
+/// one reserve unit and erase the Ticket.
+fn remove_account_delete_ticket<V: ledger::ApplyView>(
+    view: &mut V,
+    account: AccountID,
+    ticket: Arc<STLedgerEntry>,
+) -> Ter {
+    let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
+    if !ledger::dir_remove(
+        view,
+        &owner_dir,
+        ticket.get_field_u64(sf("sfOwnerNode")),
+        *ticket.key(),
+        true,
+    )
+    .unwrap_or(false)
+    {
+        return Ter::TEF_BAD_LEDGER;
+    }
+    let account_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
+    let account_sle = match view.peek(account_keylet) {
+        Ok(Some(sle)) => sle,
+        _ => return Ter::TEF_BAD_LEDGER,
+    };
+    if !account_sle.is_field_present(sf("sfTicketCount")) {
+        return Ter::TEF_BAD_LEDGER;
+    }
+    let ticket_count = account_sle.get_field_u32(sf("sfTicketCount"));
+    let mut account_obj = account_sle.clone_as_object();
+    if ticket_count == 1 {
+        account_obj.make_field_absent(sf("sfTicketCount"));
+    } else {
+        account_obj.set_field_u32(sf("sfTicketCount"), ticket_count - 1);
+    }
+    let account_sle = Arc::new(STLedgerEntry::from_stobject(account_obj, *account_sle.key()));
+    if view.update(Arc::clone(&account_sle)).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
+    if ledger::decrease_owner_count_for_object(view, &account_sle, &ticket, 1).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
+    view.erase(ticket)
         .map(|_| Ter::TES_SUCCESS)
         .unwrap_or(Ter::TEF_BAD_LEDGER)
 }
@@ -3557,8 +3608,15 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         crate::state::offer_create::offer_delete_pub(view, &account, entry)
                     }
                     LedgerEntryType::SignerList => remove_signer_list(view, account),
-                    LedgerEntryType::Ticket | LedgerEntryType::DID | LedgerEntryType::Oracle => {
-                        remove_account_delete_owned_entry(view, account, entry)
+                    LedgerEntryType::Ticket => remove_account_delete_ticket(view, account, entry),
+                    LedgerEntryType::DID => {
+                        remove_account_delete_owned_entry(view, account, entry, 1)
+                    }
+                    LedgerEntryType::Oracle => {
+                        let count = oracle_owner_count(
+                            entry.get_field_array(sf("sfPriceDataSeries")).len(),
+                        ) as u32;
+                        remove_account_delete_owned_entry(view, account, entry, count)
                     }
                     LedgerEntryType::DepositPreauth => remove_deposit_preauth_entry(view, entry),
                     LedgerEntryType::NFTokenOffer => {
