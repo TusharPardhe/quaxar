@@ -473,8 +473,15 @@ impl TreeEngine for AppLedgerPlanEngine {
             // turn; no tree or missing-node frontier is rebuilt.
             let slice_started = std::time::Instant::now();
             let mut yielded = false;
+            // The traversal asks once per branch step. Reading the clock that
+            // often cost ~4% of the owner thread during a hot-restart scan, so
+            // only sample it every 64 steps (well under the 5 ms slice).
+            let mut yield_checks = 0u32;
             let mut yield_now = || {
-                yielded = slice_started.elapsed() >= std::time::Duration::from_millis(5);
+                yield_checks = yield_checks.wrapping_add(1);
+                if yield_checks % 64 == 0 {
+                    yielded = slice_started.elapsed() >= std::time::Duration::from_millis(5);
+                }
                 yielded
             };
             let advance = {

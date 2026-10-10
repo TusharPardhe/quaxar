@@ -293,6 +293,11 @@ struct BrokerState {
     ready_dispatches: VecDeque<ReadDispatch>,
     tickets: BTreeMap<ReadTicketId, TicketRecord>,
     metrics: ReadBrokerMetrics,
+    /// Flights in `FlightState::Dispatched`, and those of History priority.
+    /// Maintained on every transition so admission does not rescan `flights`
+    /// once per admitted key (quadratic when thousands of reads are queued).
+    dispatched: usize,
+    history_dispatched: usize,
 }
 
 impl Default for BrokerState {
@@ -306,6 +311,8 @@ impl Default for BrokerState {
             ready_dispatches: VecDeque::new(),
             tickets: BTreeMap::new(),
             metrics: ReadBrokerMetrics::default(),
+            dispatched: 0,
+            history_dispatched: 0,
         }
     }
 }
@@ -614,6 +621,10 @@ impl NodeReadBroker {
                 state.metrics.stale_completions += 1;
                 return false;
             }
+            state.dispatched -= 1;
+            if flight.priority == Some(ReadPriority::History) {
+                state.history_dispatched -= 1;
+            }
             let outcome = match outcome {
                 ReadOutcome::Found(object) if object.hash() != &key.hash => {
                     ReadOutcome::Fault(Arc::from("NodeStore returned a different hash"))
@@ -673,6 +684,8 @@ impl NodeReadBroker {
             }
             state.stopped = true;
             let flights = std::mem::take(&mut state.flights);
+            state.dispatched = 0;
+            state.history_dispatched = 0;
             state.consensus_fifo.clear();
             state.history_fifo.clear();
             for mut dispatch in state.ready_dispatches.drain(..) {
@@ -811,11 +824,16 @@ impl NodeReadBroker {
                 .iter()
                 .filter_map(|ticket_id| state.tickets.get(ticket_id).map(|r| r.requested_at))
                 .min();
-            state
+            let flight = state
                 .flights
                 .get_mut(&key)
-                .expect("queued broker flight must exist")
-                .state = Some(FlightState::Dispatched);
+                .expect("queued broker flight must exist");
+            flight.state = Some(FlightState::Dispatched);
+            let history = flight.priority == Some(ReadPriority::History);
+            state.dispatched += 1;
+            if history {
+                state.history_dispatched += 1;
+            }
             for ticket_id in subscriber_ids {
                 state
                     .tickets
@@ -926,22 +944,30 @@ impl NodeReadBroker {
     }
 
     fn in_flight_count(state: &BrokerState) -> usize {
-        state
-            .flights
-            .values()
-            .filter(|flight| flight.state == Some(FlightState::Dispatched))
-            .count()
+        debug_assert_eq!(
+            state.dispatched,
+            state
+                .flights
+                .values()
+                .filter(|flight| flight.state == Some(FlightState::Dispatched))
+                .count()
+        );
+        state.dispatched
     }
 
     fn history_in_flight_count(state: &BrokerState) -> usize {
-        state
-            .flights
-            .values()
-            .filter(|flight| {
-                flight.state == Some(FlightState::Dispatched)
-                    && flight.priority == Some(ReadPriority::History)
-            })
-            .count()
+        debug_assert_eq!(
+            state.history_dispatched,
+            state
+                .flights
+                .values()
+                .filter(|flight| {
+                    flight.state == Some(FlightState::Dispatched)
+                        && flight.priority == Some(ReadPriority::History)
+                })
+                .count()
+        );
+        state.history_dispatched
     }
 }
 
