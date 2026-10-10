@@ -800,10 +800,26 @@ fn account_send_mpt<V: ApplyView>(
             Ok(rate) => rate,
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
-        // TokenHelpers::directSendNoLimitMPT uses ordinary multiply(), not
-        // mulRound(). Legacy direct Payment quote and the actual debit must
-        // therefore materialize under the same ambient nearest mode.
-        protocol::multiply_rate(amount, rate).mpt().value()
+        // TokenHelpers::directSendNoLimitMPT. Pre-fixCleanup3_5_0 this is an
+        // ordinary multiply() under the ambient nearest mode; rippled #8302
+        // computes the cost exactly with integral mulRatio rounded up, so the
+        // debit matches the direct Payment quote and cannot be overcharged by
+        // Number precision loss on large amounts.
+        if view.rules().enabled(&protocol::fix_cleanup_3_5_0()) {
+            match protocol::mpt_amount::mul_ratio(
+                amount.mpt(),
+                rate.value,
+                protocol::QUALITY_ONE,
+                true,
+            ) {
+                Ok(cost) => cost.value(),
+                // rippled's mulRatio throws on overflow, which the transactor
+                // reports as tefEXCEPTION.
+                Err(_) => return Ter::TEF_EXCEPTION,
+            }
+        } else {
+            protocol::multiply_rate(amount, rate).mpt().value()
+        }
     } else {
         value
     };

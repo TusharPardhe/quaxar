@@ -94,7 +94,16 @@ pub fn set_current_transaction_rules(rules: Option<Rules>) {
 }
 
 pub fn is_feature_enabled(feature: &Uint256) -> bool {
-    get_current_transaction_rules().is_some_and(|rules| rules.enabled(feature))
+    is_feature_enabled_or(feature, false)
+}
+
+/// rippled `isFeatureEnabled(feature, resultIfNoRules)`: the answer when no
+/// current-transaction rules are installed is chosen by the caller.
+pub fn is_feature_enabled_or(feature: &Uint256, result_if_no_rules: bool) -> bool {
+    match get_current_transaction_rules() {
+        Some(rules) => rules.enabled(feature),
+        None => result_if_no_rules,
+    }
 }
 
 #[derive(Debug)]

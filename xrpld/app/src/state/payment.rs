@@ -517,7 +517,9 @@ fn do_direct_mpt_payment<V: ledger::ApplyView>(
                 false,
             ) {
                 Ok(delivered) => delivered,
-                Err(_) => return Ter::TEC_PATH_PARTIAL,
+                // rippled's mulRatio throws here; the transactor reports it as
+                // tefEXCEPTION. Unreachable for a valid rate (>= QUALITY_ONE).
+                Err(_) => return Ter::TEF_EXCEPTION,
             };
             amount_deliver = protocol::STAmount::from_mpt_amount(
                 get_field_by_symbol("sfAmount"),
