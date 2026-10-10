@@ -241,6 +241,14 @@ fn validate_sttx_flag_mask(tx: &STTx, rules: &Rules) -> NotTec {
         TxType::AMM_CLAWBACK => {
             flags & !(UNIVERSAL_TRANSACTION_FLAGS | protocol::AMM_CLAWBACK_TWO_ASSETS_FLAG)
         }
+        // rippled LoanBrokerSet::getFlagsMask: tfLoanBrokerPrivate is only a
+        // valid flag from LendingProtocolV1_2.
+        TxType::LOAN_BROKER_SET
+            if rules.enabled(&protocol::feature_lending_protocol_v1_2()) =>
+        {
+            flags & !(UNIVERSAL_TRANSACTION_FLAGS | protocol::LOAN_BROKER_PRIVATE_FLAG)
+        }
+        TxType::LOAN_BROKER_SET => flags & !UNIVERSAL_TRANSACTION_FLAGS,
         TxType::DID_SET
         | TxType::DID_DELETE
         | TxType::NFTOKEN_CANCEL_OFFER
@@ -290,7 +298,6 @@ fn validate_sttx_flag_mask(tx: &STTx, rules: &Rules) -> NotTec {
         | TxType::VAULT_DEPOSIT
         | TxType::VAULT_WITHDRAW
         | TxType::VAULT_CLAWBACK
-        | TxType::LOAN_BROKER_SET
         | TxType::LOAN_BROKER_DELETE
         | TxType::LOAN_BROKER_COVER_DEPOSIT
         | TxType::LOAN_BROKER_COVER_WITHDRAW
@@ -604,6 +611,14 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
         | TxType::LOAN_BROKER_DELETE
         | TxType::LOAN_BROKER_COVER_DEPOSIT
         | TxType::LOAN_BROKER_COVER_CLAWBACK => {
+            // rippled LoanBrokerSet::checkExtraFeatures: a DomainID requires
+            // LendingProtocolV1_2.
+            if tx.get_txn_type() == TxType::LOAN_BROKER_SET
+                && tx.is_field_present(get_field_by_symbol("sfDomainID"))
+                && !rules.enabled(&protocol::feature_lending_protocol_v1_2())
+            {
+                return Ter::TEM_DISABLED;
+            }
             if !rules.enabled(&protocol::feature_id("SingleAssetVault"))
                 || !rules.enabled(&protocol::feature_id("MPTokensV1"))
                 || (tx.is_field_present(get_field_by_symbol("sfDomainID"))
@@ -1637,6 +1652,10 @@ fn validate_loan_broker_preflight(tx: &STTx, rules: &Rules, txn_type: TxType) ->
                 vault_id_is_zero: vault_present && tx.get_field_h256(field("sfVaultID")).is_zero(),
                 cover_rate_minimum_value: minimum,
                 cover_rate_liquidation_value: liquidation,
+                domain_id_is_present: present("sfDomainID"),
+                domain_id_is_zero: present("sfDomainID")
+                    && tx.get_field_h256(field("sfDomainID")).is_zero(),
+                private_flag_is_set: tx.get_flags() & protocol::LOAN_BROKER_PRIVATE_FLAG != 0,
             })
         }
         TxType::LOAN_BROKER_DELETE => crate::run_loan_broker_delete_preflight(

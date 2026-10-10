@@ -1481,6 +1481,10 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
                 field_symbol: "sfCoverRateLiquidation",
                 style: SOEStyle::Default,
             },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfDomainID",
+                style: SOEStyle::Optional,
+            },
         ],
     },
     LedgerFormatSpecInit {

@@ -32,6 +32,9 @@ fn preflight_base() -> LoanBrokerSetPreflightFacts {
         vault_id_is_zero: false,
         cover_rate_minimum_value: None,
         cover_rate_liquidation_value: None,
+        domain_id_is_present: false,
+        domain_id_is_zero: false,
+        private_flag_is_set: false,
     }
 }
 
@@ -48,7 +51,70 @@ fn preclaim_base() -> LoanBrokerSetPreclaimFacts {
         debt_maximum_is_representable: true,
         can_add_holding_result: Ter::TES_SUCCESS,
         check_frozen_result: Ter::TES_SUCCESS,
+        existing_broker_is_private: false,
+        domain_id_is_present: false,
+        domain_exists_or_absent: true,
     }
+}
+
+#[test]
+fn tx_loan_broker_set_preflight_applies_private_domain_rules() {
+    // rippled #6517.
+    let create_private = LoanBrokerSetPreflightFacts {
+        domain_id_is_present: true,
+        private_flag_is_set: true,
+        ..preflight_base()
+    };
+    assert_eq!(run_loan_broker_set_preflight(create_private), Ter::TES_SUCCESS);
+    assert_eq!(
+        run_loan_broker_set_preflight(LoanBrokerSetPreflightFacts {
+            domain_id_is_zero: true,
+            ..create_private
+        }),
+        Ter::TEM_MALFORMED,
+        "a new broker's DomainID must be non-zero"
+    );
+    assert_eq!(
+        run_loan_broker_set_preflight(LoanBrokerSetPreflightFacts {
+            private_flag_is_set: false,
+            ..create_private
+        }),
+        Ter::TEM_INVALID,
+        "a public broker cannot have a DomainID"
+    );
+    assert_eq!(
+        run_loan_broker_set_preflight(LoanBrokerSetPreflightFacts {
+            loan_broker_id_is_present: true,
+            private_flag_is_set: true,
+            ..preflight_base()
+        }),
+        Ter::TEM_INVALID,
+        "the private flag cannot change on an existing broker"
+    );
+}
+
+#[test]
+fn tx_loan_broker_set_preclaim_applies_private_domain_rules() {
+    let update = LoanBrokerSetPreclaimFacts {
+        broker_id_is_present: true,
+        domain_id_is_present: true,
+        ..preclaim_base()
+    };
+    assert_eq!(run_loan_broker_set_preclaim(update), Ter::TEC_NO_PERMISSION);
+    assert_eq!(
+        run_loan_broker_set_preclaim(LoanBrokerSetPreclaimFacts {
+            existing_broker_is_private: true,
+            ..update
+        }),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        run_loan_broker_set_preclaim(LoanBrokerSetPreclaimFacts {
+            domain_exists_or_absent: false,
+            ..preclaim_base()
+        }),
+        Ter::TEC_OBJECT_NOT_FOUND
+    );
 }
 
 #[test]

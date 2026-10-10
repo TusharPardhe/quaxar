@@ -99,13 +99,14 @@ fn insert_sorted_amount(amounts: &mut Vec<STAmount>, amount: STAmount) {
     amounts.insert(index, amount);
 }
 
-fn sum_sorted_amounts(amounts: &[STAmount], zero: &STAmount) -> STAmount {
+/// rippled BookStep `sum` with `checkedStepAdd` (578224f2e6): `None` when an
+/// integral aggregate overflows. rippled throws FlowException(tecPATH_DRY).
+fn sum_sorted_amounts(amounts: &[STAmount], zero: &STAmount) -> Option<STAmount> {
     let Some((first, rest)) = amounts.split_first() else {
-        return zero.zeroed();
+        return Some(zero.zeroed());
     };
     rest.iter()
-        .cloned()
-        .fold(first.clone(), |sum, amount| sum + amount)
+        .try_fold(first.clone(), |sum, amount| protocol::checked_step_add(&sum, amount))
 }
 
 fn amm_target_quality(
@@ -487,6 +488,22 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             }
         }};
     }
+    // rippled FlowException(tecPATH_DRY) from checkedStepAdd on overflow.
+    macro_rules! sum_or_dry {
+        ($amounts:expr, $zero:expr) => {{
+            match sum_sorted_amounts($amounts, $zero) {
+                Some(sum) => sum,
+                None => {
+                    return BookStepResult {
+                        amount_in: total_in,
+                        amount_out: total_out,
+                        offers_consumed,
+                        ter: Ter::TEC_PATH_DRY,
+                    };
+                }
+            }
+        }};
+    }
     macro_rules! update_or_return {
         ($entry:expr) => {{
             if view.update($entry).is_err() {
@@ -823,8 +840,8 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 let mut candidate_outs = saved_outs.clone();
                 insert_sorted_amount(&mut candidate_ins, current.step_in.clone());
                 insert_sorted_amount(&mut candidate_outs, current.step_out.clone());
-                let candidate_in = sum_sorted_amounts(&candidate_ins, max_in);
-                let candidate_out = sum_sorted_amounts(&candidate_outs, max_out);
+                let candidate_in = sum_or_dry!(&candidate_ins, max_in);
+                let candidate_out = sum_or_dry!(&candidate_outs, max_out);
                 if candidate_out > *max_out && candidate_in <= *reverse_input {
                     // BookStep.cpp fwdImp: limitStepOut to the cached
                     // remaining output; adopt only if it needs exactly the
@@ -883,13 +900,13 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                         let capped_in_forward = consumption.input_capped_in_forward;
                         insert_sorted_amount(&mut saved_ins, consumption.step_in);
                         insert_sorted_amount(&mut saved_outs, consumption.step_out);
-                        total_out = sum_sorted_amounts(&saved_outs, max_out);
+                        total_out = sum_or_dry!(&saved_outs, max_out);
                         if capped_in_forward {
                             // fwdImp strict input cap: result.in = in.
                             total_in = max_in.clone();
                             remaining_in = max_in.zeroed();
                         } else {
-                            total_in = sum_sorted_amounts(&saved_ins, max_in);
+                            total_in = sum_or_dry!(&saved_ins, max_in);
                             remaining_in = max_in.clone() - total_in.clone();
                         }
                     }
@@ -1222,8 +1239,8 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 let mut candidate_outs = saved_outs.clone();
                 insert_sorted_amount(&mut candidate_ins, consumption.step_in.clone());
                 insert_sorted_amount(&mut candidate_outs, consumption.step_out.clone());
-                let candidate_in = sum_sorted_amounts(&candidate_ins, max_in);
-                let candidate_out = sum_sorted_amounts(&candidate_outs, max_out);
+                let candidate_in = sum_or_dry!(&candidate_ins, max_in);
+                let candidate_out = sum_or_dry!(&candidate_outs, max_out);
 
                 if candidate_out > *max_out && candidate_in <= *reverse_input {
                     // Mirror rippled BookStep.cpp fwdImp lines 1261-1305:
@@ -1317,7 +1334,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 let capped_in_forward = consumption.input_capped_in_forward;
                 insert_sorted_amount(&mut saved_ins, consumption.step_in);
                 insert_sorted_amount(&mut saved_outs, consumption.step_out);
-                total_out = sum_sorted_amounts(&saved_outs, max_out);
+                total_out = sum_or_dry!(&saved_outs, max_out);
                 if capped_in_forward {
                     // rippled BookStep.cpp fwdImp pins `result.in = in` after
                     // limitStepIn and returns processMore=false, so remainingIn
@@ -1329,7 +1346,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                     total_in = max_in.clone();
                     remaining_in = max_in.zeroed();
                 } else {
-                    total_in = sum_sorted_amounts(&saved_ins, max_in);
+                    total_in = sum_or_dry!(&saved_ins, max_in);
                     remaining_in = max_in.clone() - total_in.clone();
                 }
             }
@@ -3576,11 +3593,11 @@ mod tests {
         insert_sorted_amount(&mut saved, dust);
 
         assert_ne!(
-            sum_sorted_amounts(&saved, &large.zeroed()),
+            sum_sorted_amounts(&saved, &large.zeroed()).expect("no overflow"),
             processing_order
         );
         assert_eq!(
-            sum_sorted_amounts(&saved, &large.zeroed()),
+            sum_sorted_amounts(&saved, &large.zeroed()).expect("no overflow"),
             amount(1_000_000_000_000_001, -15)
         );
     }

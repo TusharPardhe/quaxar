@@ -101,9 +101,9 @@ fn tx_flag_catalog_map_getters_match_cpp_shape() {
     );
 
     let all = getAllTxFlags();
-    assert_eq!(all.len(), 21);
+    assert_eq!(all.len(), 22);
     assert_eq!(all.first().expect("universal entry").0, "universal");
-    assert_eq!(all.last().expect("loan manage entry").0, "LoanManage");
+    assert_eq!(all.last().expect("loan broker set entry").0, "LoanBrokerSet");
     assert_eq!(
         all[1].1.get("tfRequireDestTag"),
         Some(&(ACCOUNT_SET_FLAGS & 0x0001_0000))

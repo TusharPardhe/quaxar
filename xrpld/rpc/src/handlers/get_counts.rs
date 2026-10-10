@@ -48,6 +48,11 @@ pub trait GetCountsSource {
     fn treenode_track_size(&self) -> u64;
 
     fn add_node_store_counts(&self, json: &mut BTreeMap<String, JsonValue>);
+    /// Distinct resident (inner, leaf) tree nodes reachable from the ledgers
+    /// this node holds. Walks memory only; opt-in because it is O(live nodes).
+    fn held_tree_reachable(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 pub fn read_min_count(params: &JsonValue) -> u32 {
@@ -227,5 +232,15 @@ pub fn get_counts_json<S: GetCountsSource>(source: &S, min_count: u32) -> JsonVa
 }
 
 pub fn do_get_counts<S: GetCountsSource>(params: &JsonValue, source: &S) -> JsonValue {
-    get_counts_json(source, read_min_count(params))
+    let mut result = get_counts_json(source, read_min_count(params));
+    let held_tree = matches!(params, JsonValue::Object(object)
+        if matches!(object.get("held_tree"), Some(JsonValue::Bool(true))));
+    if held_tree
+        && let JsonValue::Object(object) = &mut result
+        && let Some((inner, leaf)) = source.held_tree_reachable()
+    {
+        object.insert("held_tree_inner_nodes".to_owned(), JsonValue::Unsigned(inner));
+        object.insert("held_tree_leaf_nodes".to_owned(), JsonValue::Unsigned(leaf));
+    }
+    result
 }

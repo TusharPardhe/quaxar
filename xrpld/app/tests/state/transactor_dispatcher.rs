@@ -10258,6 +10258,66 @@ fn loan_broker_set_create_mints_deterministic_pseudo_and_empty_holding() {
 }
 
 #[test]
+fn loan_broker_set_create_private_broker_records_domain() {
+    // rippled #6517: a private broker is created with lsfLoanBrokerPrivate and
+    // its DomainID; a DomainID naming a missing domain is tecOBJECT_NOT_FOUND.
+    let owner = sample_account(0x61);
+    let issuer = sample_account(0x62);
+    let vault_pseudo = sample_account(0x63);
+    let currency = Currency::from_array([0x56; 20]);
+    let vault_asset = Asset::Issue(Issue::new(currency, issuer));
+    let domain = permissioned_domain_entry(issuer, 3, 0, &[(issuer, b"kyc")]);
+    let domain_id = *domain.key();
+    let run = |with_domain: bool, domain_id: Uint256| {
+        let mut entries = vec![
+            account_root(owner, 0, 0),
+            account_root(issuer, 0, lsfDefaultRipple),
+            account_root(vault_pseudo, 0, 0),
+            vault_entry(owner, vault_pseudo, 7, vault_asset),
+        ];
+        if with_domain {
+            entries.push(permissioned_domain_entry(issuer, 3, 0, &[(issuer, b"kyc")]));
+        }
+        let mut ledger = empty_ledger(entries);
+        ledger.set_rules(protocol::Rules::new([
+            protocol::feature_id("SingleAssetVault"),
+            protocol::feature_id("MPTokensV1"),
+            protocol::feature_id("LendingProtocol"),
+            protocol::feature_id("LendingProtocolV1_2"),
+            protocol::feature_id("PermissionedDomains"),
+        ]));
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let vault_id = protocol::vault_keylet(raw_account_id(owner), 7).key;
+        let sttx = STTx::new(TxType::LOAN_BROKER_SET, move |object| {
+            object.set_account_id(get_field_by_symbol("sfAccount"), owner);
+            object.set_field_h256(get_field_by_symbol("sfVaultID"), vault_id);
+            object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+            object.set_field_u32(get_field_by_symbol("sfFlags"), protocol::LOAN_BROKER_PRIVATE_FLAG);
+            object.set_field_h256(get_field_by_symbol("sfDomainID"), domain_id);
+            object.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+            );
+        });
+        let ter = handle_real_dispatch(&mut view, &sttx, TxType::LOAN_BROKER_SET, Some(1_000_000));
+        let broker = view
+            .read(protocol::loan_broker_keylet(raw_account_id(owner), 1))
+            .expect("broker read");
+        (ter, broker)
+    };
+
+    let (ter, broker) = run(true, domain_id);
+    assert_eq!(ter, protocol::Ter::TES_SUCCESS);
+    let broker = broker.expect("broker created");
+    assert!(broker.is_flag(protocol::LOAN_BROKER_PRIVATE_LEDGER_FLAG));
+    assert_eq!(broker.get_field_h256(get_field_by_symbol("sfDomainID")), domain_id);
+
+    let (ter, broker) = run(false, domain_id);
+    assert_eq!(ter, protocol::Ter::TEC_OBJECT_NOT_FOUND);
+    assert!(broker.is_none());
+}
+
+#[test]
 fn loan_broker_set_create_v1_1_requires_closed_vault() {
     let owner = sample_account(0x69);
     let vault_pseudo = sample_account(0x6A);

@@ -345,6 +345,21 @@ fn loan_broker_debt_maximum_is_representable(sttx: &STTx, asset: Asset) -> bool 
         .unwrap_or(false)
 }
 
+/// rippled LoanBrokerSet preclaim: a non-zero DomainID must name an existing
+/// PermissionedDomain.
+fn loan_broker_domain_exists_or_absent<V: ApplyView>(view: &V, sttx: &STTx) -> Result<bool, Ter> {
+    if !sttx.is_field_present(sf("sfDomainID")) {
+        return Ok(true);
+    }
+    let domain_id = sttx.get_field_h256(sf("sfDomainID"));
+    if domain_id.is_zero() {
+        return Ok(true);
+    }
+    view.read(protocol::permissioned_domain_keylet_from_id(domain_id))
+        .map(|sle| sle.is_some())
+        .map_err(|_| Ter::TEF_BAD_LEDGER)
+}
+
 fn run_loan_broker_set_app_preflight(sttx: &STTx) -> Ter {
     let data = sttx
         .is_field_present(sf("sfData"))
@@ -383,6 +398,10 @@ fn run_loan_broker_set_app_preflight(sttx: &STTx) -> Ter {
         vault_id_is_zero,
         cover_rate_minimum_value,
         cover_rate_liquidation_value,
+        domain_id_is_present: sttx.is_field_present(sf("sfDomainID")),
+        domain_id_is_zero: sttx.is_field_present(sf("sfDomainID"))
+            && sttx.get_field_h256(sf("sfDomainID")).is_zero(),
+        private_flag_is_set: sttx.get_flags() & protocol::LOAN_BROKER_PRIVATE_FLAG != 0,
     })
 }
 
@@ -555,6 +574,41 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
         };
         vault_sle.get_field_issue(sf("sfAsset")).asset()
     };
+    // rippled #6517: a private LoanBroker only lends to members of its
+    // PermissionedDomain. rippled runs this in doApply after the broker,
+    // vault and account existence reads, which can only fail on a corrupt
+    // ledger, so running it here gives the same result.
+    {
+        let broker_id = sttx.get_field_h256(sf("sfLoanBrokerID"));
+        let broker_sle = match view.peek(protocol::loan_broker_keylet_from_key(broker_id)) {
+            Ok(Some(sle)) => sle,
+            Ok(None) => return Ter::TEC_NO_ENTRY,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        if broker_sle.is_flag(protocol::LOAN_BROKER_PRIVATE_LEDGER_FLAG) {
+            if !broker_sle.is_field_present(sf("sfDomainID")) {
+                return Ter::TEC_NO_AUTH;
+            }
+            let domain_id = broker_sle.get_field_h256(sf("sfDomainID"));
+            let broker_owner = broker_sle.get_account_id(sf("sfOwner"));
+            let counterparty = if sttx.is_field_present(sf("sfCounterparty")) {
+                sttx.get_account_id(sf("sfCounterparty"))
+            } else {
+                broker_owner
+            };
+            let borrower = if counterparty == broker_owner {
+                sttx.get_account_id(sf("sfAccount"))
+            } else {
+                counterparty
+            };
+            match ledger::credential_helpers::verify_valid_domain(view, &borrower, domain_id) {
+                Ok(Ter::TES_SUCCESS) => {}
+                Ok(Ter::TEC_NO_PERMISSION) => return Ter::TEC_NO_AUTH,
+                Ok(ter) => return ter,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            }
+        }
+    }
     let rules = view.rules();
 
     let read_error = Cell::new(None);
@@ -1063,6 +1117,17 @@ pub fn apply_loan_broker_set<V: ApplyView>(
                 return Ter::TEC_LIMIT_EXCEEDED;
             }
         }
+        // rippled #6517: only a private broker can carry a DomainID.
+        if !broker_sle.is_flag(protocol::LOAN_BROKER_PRIVATE_LEDGER_FLAG)
+            && sttx.is_field_present(sf("sfDomainID"))
+        {
+            return Ter::TEC_NO_PERMISSION;
+        }
+        match loan_broker_domain_exists_or_absent(view, sttx) {
+            Ok(true) => {}
+            Ok(false) => return Ter::TEC_OBJECT_NOT_FOUND,
+            Err(ter) => return ter,
+        }
         let vault_asset = tx_vault_sle.get_field_issue(sf("sfAsset")).asset();
         if !loan_broker_debt_maximum_is_representable(sttx, vault_asset) {
             return Ter::TEC_PRECISION_LOSS;
@@ -1079,6 +1144,16 @@ pub fn apply_loan_broker_set<V: ApplyView>(
                 sttx.get_field_number(sf("sfDebtMaximum")),
             );
         }
+        // rippled #6517: a non-zero DomainID replaces the broker's domain; a
+        // zero DomainID clears it.
+        if sttx.is_field_present(sf("sfDomainID")) {
+            let domain_id = sttx.get_field_h256(sf("sfDomainID"));
+            if !domain_id.is_zero() {
+                obj.set_field_h256(sf("sfDomainID"), domain_id);
+            } else if obj.is_field_present(sf("sfDomainID")) {
+                obj.make_field_absent(sf("sfDomainID"));
+            }
+        }
         let mut broker = STLedgerEntry::from_stobject(obj, *broker_sle.key());
         associate_asset_entry(&mut broker, vault_asset);
         return persist_entry(view, broker);
@@ -1093,6 +1168,11 @@ pub fn apply_loan_broker_set<V: ApplyView>(
     let vault_frozen = check_cover_sendable(view, &vault_pseudo_id, vault_asset);
     if vault_frozen != Ter::TES_SUCCESS {
         return vault_frozen;
+    }
+    match loan_broker_domain_exists_or_absent(view, sttx) {
+        Ok(true) => {}
+        Ok(false) => return Ter::TEC_OBJECT_NOT_FOUND,
+        Err(ter) => return ter,
     }
     if !loan_broker_debt_maximum_is_representable(sttx, vault_asset) {
         return Ter::TEC_PRECISION_LOSS;
@@ -1199,6 +1279,13 @@ pub fn apply_loan_broker_set<V: ApplyView>(
             sf("sfCoverRateLiquidation"),
             sttx.get_field_u32(sf("sfCoverRateLiquidation")),
         );
+    }
+    // rippled #6517: a private broker records its domain at creation.
+    if sttx.get_flags() & protocol::LOAN_BROKER_PRIVATE_FLAG != 0 {
+        broker.set_flag(protocol::LOAN_BROKER_PRIVATE_LEDGER_FLAG);
+        if sttx.is_field_present(sf("sfDomainID")) {
+            broker.set_field_h256(sf("sfDomainID"), sttx.get_field_h256(sf("sfDomainID")));
+        }
     }
     associate_asset_entry(&mut broker, vault_asset);
     view.insert(Arc::new(broker))
