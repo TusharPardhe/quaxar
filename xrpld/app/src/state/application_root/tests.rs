@@ -6271,3 +6271,30 @@ fn metadata_oversize_boundary_matches_pinned_rippled_protocol_cap() {
     assert!(!super::exceeds_oversize_metadata_cap(5_200));
     assert!(super::exceeds_oversize_metadata_cap(5_201));
 }
+
+#[test]
+fn transaction_step_panic_is_contained_as_tef_exception() {
+    // rippled applySteps.cpp maps an exception in preflight/preclaim to
+    // tefEXCEPTION; a panic in a quaxar step must do the same.
+    let tx = STTx::new(TxType::PAYMENT, |_| {});
+    assert_eq!(
+        super::contain_transaction_step("preflight", &tx, || Ter::TES_SUCCESS),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        super::contain_transaction_step("preflight", &tx, || {
+            let native = protocol::STAmount::new_native(1, false);
+            let mut issue = protocol::no_issue();
+            issue.currency = protocol::currency_from_string("USD");
+            let _ = native + protocol::STAmount::new_with_asset(
+                protocol::sf_generic(),
+                issue,
+                1,
+                0,
+                false,
+            );
+            Ter::TES_SUCCESS
+        }),
+        Ter::TEF_EXCEPTION
+    );
+}

@@ -177,8 +177,9 @@ pub(crate) fn check_invariants_for_tx_with_prefix<V: ApplyView + ?Sized>(
         .then(|| tx.get_field_amount(sf("sfAmount")));
     let tx_has_holder = tx.is_field_present(sf("sfHolder"));
     let cross_currency_payment = payment_is_cross_currency(tx);
-    map_invariant_result(
-        result,
+    // rippled InvariantRunner: an exception thrown while checking invariants
+    // is logged and treated as an invariant failure (failInvariantCheck).
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         check_invariants_inner(
             sandbox,
             txn_type,
@@ -196,8 +197,19 @@ pub(crate) fn check_invariants_for_tx_with_prefix<V: ApplyView + ?Sized>(
             fee,
             expected_xrp_delta,
             prefix,
-        ),
-    )
+        )
+    }));
+    match checked {
+        Ok(outcome) => map_invariant_result(result, outcome),
+        Err(_) => {
+            tracing::error!(
+                target: "tx",
+                tx_id = %tx.get_transaction_id(),
+                "Transaction caused an exception during invariant checks"
+            );
+            invariant_failure_result(result)
+        }
+    }
 }
 
 pub fn check_invariants<V: ApplyView + ?Sized>(

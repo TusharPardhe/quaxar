@@ -73,6 +73,11 @@ impl From<MPTAmount> for bool {
     }
 }
 
+// rippled `MPTAmount::operator+=` / `operator-=` are unchecked `int64` adds
+// (`value_ += other`), which wrap on every platform rippled ships. Keep
+// the same wrapping semantics so results stay identical to rippled; callers
+// that must reject overflow use explicit checked arithmetic, as rippled does
+// with `checkedAdd` (see `protocol::checked_step_add`).
 impl AddAssign for MPTAmount {
     fn add_assign(&mut self, rhs: Self) {
         self.value = self.value.wrapping_add(rhs.value);

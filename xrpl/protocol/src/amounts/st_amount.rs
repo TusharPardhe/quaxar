@@ -821,9 +821,11 @@ impl Ord for STAmount {
 
 impl AddAssign for STAmount {
     fn add_assign(&mut self, rhs: Self) {
+        // rippled operator+: Throw<std::runtime_error>. The transaction step
+        // boundaries (preflight, preclaim, apply, invariants) and the RPC
+        // dispatcher contain this panic exactly where rippled catches.
         if !self.are_comparable(&rhs) {
-            // In Rust, return self unchanged to avoid crashing the node.
-            return;
+            panic!("Can't add amounts that are't comparable!");
         }
 
         if self.native() {
@@ -855,9 +857,9 @@ impl Add for STAmount {
 
 impl SubAssign for STAmount {
     fn sub_assign(&mut self, rhs: Self) {
+        // rippled operator- is `v1 + (-v2)`, so it throws the same error.
         if !self.are_comparable(&rhs) {
-            // In Rust, return self unchanged to avoid crashing the node.
-            return;
+            panic!("Can't add amounts that are't comparable!");
         }
 
         if self.native() {
@@ -1205,6 +1207,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Can't add amounts that are't comparable!")]
     fn add_incompatible_amounts_panics() {
         let native = STAmount::new_native(1, false);
         let mut issue = crate::no_issue();
@@ -1212,9 +1215,8 @@ mod tests {
         issue.account =
             crate::parse_base58_account_id("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
         let iou = STAmount::new_with_asset(sf_generic(), issue, 100, 0, false);
-        let result = native + iou;
-        // Result should be the native amount unchanged (no-op on incompatible)
-        assert!(result.native());
+        // rippled operator+ throws on non-comparable assets.
+        let _ = native + iou;
     }
 
     #[test]
