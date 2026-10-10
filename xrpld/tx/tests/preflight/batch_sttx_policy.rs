@@ -127,7 +127,10 @@ fn tx_sttx_batch_preflight_applies_rule_aware_inner_delegate_validation() {
         Ter::TEM_INVALID_INNER_BATCH
     );
 
-    let delegation_rules = Rules::new([protocol::feature_id("PermissionDelegationV1_1")]);
+    let delegation_rules = Rules::new([
+        protocol::feature_id("BatchV1_1"),
+        protocol::feature_id("PermissionDelegationV1_1"),
+    ]);
     assert_eq!(
         validate_sttx_batch_preflight_with_rules(&batch_tx, &delegation_rules),
         Ter::TES_SUCCESS
@@ -304,5 +307,46 @@ fn tx_sttx_batch_preflight_rejects_typed_escrow_create_without_expiration() {
     assert_eq!(
         validate_sttx_batch_preflight_with_rules(&batch_tx, &Rules::default()),
         Ter::TEM_INVALID_INNER_BATCH
+    );
+}
+
+/// A batch whose first inner keeps the plain `Transaction` wrapper instead of
+/// `RawTransaction`.
+fn batch_with_wrong_wrapper(outer: AccountID, inners: &[STTx]) -> STTx {
+    let mut tx = batch(outer, inners);
+    let field = get_field_by_symbol("sfRawTransactions");
+    let mut array = tx.get_field_array(field).clone();
+    let mut first = array.iter().next().expect("inner").clone();
+    first.set_fname(get_field_by_symbol("sfTransaction"));
+    let mut rebuilt = STArray::new(field);
+    rebuilt.push_back(first);
+    for raw in array.iter_mut().skip(1) {
+        rebuilt.push_back(raw.clone());
+    }
+    tx.set_field_array(field, rebuilt);
+    tx
+}
+
+#[test]
+fn tx_sttx_batch_preflight_requires_raw_transaction_wrapper_under_fix_batch_v1_2() {
+    // rippled fixBatchV1_2: the txns array may contain only RawTransaction
+    // objects; anything else is temMALFORMED once the fix is enabled.
+    let outer = account(0x10);
+    let inners = [inner_payment(outer, 1), inner_payment(outer, 2)];
+    let fix = Rules::new([
+        protocol::feature_id("BatchV1_1"),
+        protocol::feature_id("fixBatchV1_2"),
+    ]);
+    let pre_fix = Rules::new([protocol::feature_id("BatchV1_1")]);
+
+    let wrapped = batch(outer, &inners);
+    assert_eq!(validate_sttx_batch_preflight_with_rules(&wrapped, &fix), Ter::TES_SUCCESS);
+
+    let wrong = batch_with_wrong_wrapper(outer, &inners);
+    assert_eq!(validate_sttx_batch_preflight_with_rules(&wrong, &fix), Ter::TEM_MALFORMED);
+    assert_eq!(
+        validate_sttx_batch_preflight_with_rules(&wrong, &pre_fix),
+        Ter::TES_SUCCESS,
+        "the wrapper is not checked before fixBatchV1_2"
     );
 }

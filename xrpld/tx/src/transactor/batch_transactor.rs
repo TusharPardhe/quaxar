@@ -51,7 +51,7 @@ where
             self.batch_flags,
             self.inner_transactions,
             preflight_inner_transaction,
-            false,
+            crate::preflight::batch_preflight::BatchPreflightRules::default(),
         )
     }
 }

@@ -2,7 +2,10 @@
 //! structure-validation seam to the current C++ behavior.
 
 use protocol::{BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, Ter, TxType, trans_token};
-use tx::{BatchInnerTransaction, BatchSignatureFacts, validate_batch_preflight_structure};
+use tx::{
+    BatchInnerTransaction, BatchPreflightRules, BatchSignatureFacts,
+    validate_batch_preflight_structure,
+};
 
 #[derive(Clone)]
 struct StubInnerTx {
@@ -110,7 +113,7 @@ fn tx_batch_preflight_requires_exactly_one_batch_mode() {
             StubInnerTx::new("tx-2", "bob"),
         ],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TEM_INVALID_FLAG);
@@ -123,7 +126,7 @@ fn tx_batch_preflight_requires_at_least_two_inner_transactions() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [StubInnerTx::new("tx-1", "alice")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TEM_ARRAY_EMPTY);
@@ -138,7 +141,7 @@ fn tx_batch_preflight_rejects_duplicate_inner_hashes() {
             StubInnerTx::new("dup", "bob"),
         ],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TEM_REDUNDANT);
@@ -153,7 +156,7 @@ fn tx_batch_preflight_rejects_nested_batch_transactions() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [nested, StubInnerTx::new("tx-2", "bob")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TEM_INVALID);
@@ -168,7 +171,7 @@ fn tx_batch_preflight_rejects_disabled_inner_transaction_types() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [disabled, StubInnerTx::new("tx-2", "bob")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TEM_INVALID_INNER_BATCH);
@@ -183,7 +186,7 @@ fn tx_batch_preflight_rejects_missing_inner_batch_flag() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [missing_flag, StubInnerTx::new("tx-2", "bob")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TEM_INVALID_FLAG);
@@ -201,7 +204,7 @@ fn tx_batch_preflight_rejects_signature_fields_and_non_empty_signing_pub_key() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [with_signature, StubInnerTx::new("tx-2", "bob")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
     assert_eq!(result, Ter::TEM_BAD_SIGNATURE);
 
@@ -214,7 +217,7 @@ fn tx_batch_preflight_rejects_signature_fields_and_non_empty_signing_pub_key() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [with_regkey, StubInnerTx::new("tx-4", "bob")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
     assert_eq!(result, Ter::TEM_BAD_REGKEY);
 }
@@ -232,7 +235,7 @@ fn tx_batch_preflight_rejects_sponsor_signature_fields() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [with_sponsor_signature, StubInnerTx::new("tx-2", "bob")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
     assert_eq!(result, Ter::TEM_BAD_SIGNATURE);
 
@@ -246,7 +249,7 @@ fn tx_batch_preflight_rejects_sponsor_signature_fields() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [with_sponsor_signers, StubInnerTx::new("tx-4", "bob")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
     assert_eq!(result, Ter::TEM_BAD_SIGNER);
 
@@ -259,7 +262,7 @@ fn tx_batch_preflight_rejects_sponsor_signature_fields() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [with_sponsor_regkey, StubInnerTx::new("tx-6", "bob")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
     assert_eq!(result, Ter::TEM_BAD_REGKEY);
 }
@@ -274,7 +277,7 @@ fn tx_batch_preflight_rejects_fee_sponsored_inner_transaction() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [fee_sponsored, StubInnerTx::new("tx-2", "bob")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TEM_INVALID_FLAG);
@@ -289,7 +292,7 @@ fn tx_batch_preflight_rejects_non_zero_or_non_native_fee() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [bad_fee, StubInnerTx::new("tx-2", "bob")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TEM_BAD_FEE);
@@ -304,7 +307,7 @@ fn tx_batch_preflight_maps_failed_inner_preflight_to_invalid_inner_batch() {
             StubInnerTx::new("tx-2", "bob"),
         ],
         |_| Ter::TER_PRE_SEQ,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TEM_INVALID_INNER_BATCH);
@@ -319,7 +322,7 @@ fn tx_batch_preflight_requires_exactly_one_of_sequence_and_ticket() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [both, StubInnerTx::new("tx-2", "bob")],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TEM_SEQ_AND_TICKET);
@@ -335,7 +338,7 @@ fn tx_batch_preflight_rejects_duplicate_sequence_and_ticket_for_ordered_modes() 
         BatchTransactionFlags::UNTIL_FAILURE.bits(),
         [first, second],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TEM_REDUNDANT);
@@ -351,7 +354,7 @@ fn tx_batch_preflight_accepts_valid_independent_batch_structure() {
         BatchTransactionFlags::INDEPENDENT.bits(),
         [first, second],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
 
     assert_eq!(result, Ter::TES_SUCCESS);
@@ -369,7 +372,7 @@ fn tx_batch_preflight_gates_lending_inner_on_v1_2() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [lending.clone(), other.clone()],
         |_| Ter::TES_SUCCESS,
-        false,
+        BatchPreflightRules::default(),
     );
     assert_eq!(
         rejected,
@@ -381,7 +384,10 @@ fn tx_batch_preflight_gates_lending_inner_on_v1_2() {
         BatchTransactionFlags::ALL_OR_NOTHING.bits(),
         [lending, other],
         |_| Ter::TES_SUCCESS,
-        true,
+        BatchPreflightRules {
+            lending_v1_2: true,
+            ..BatchPreflightRules::default()
+        },
     );
     assert_eq!(
         accepted,

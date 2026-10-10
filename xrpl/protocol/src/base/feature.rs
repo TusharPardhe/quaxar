@@ -17,6 +17,7 @@ pub const FEATURE_CLAWBACK_NAME: &str = "Clawback";
 pub const FEATURE_TOKEN_ESCROW_NAME: &str = "TokenEscrow";
 pub const FEATURE_CONFIDENTIAL_TRANSFER_NAME: &str = "ConfidentialTransfer";
 pub const FIX_BATCH_INNER_SIGS_NAME: &str = "fixBatchInnerSigs";
+pub const FIX_BATCH_V1_2_NAME: &str = "fixBatchV1_2";
 pub const FIX_INNER_OBJ_TEMPLATE_NAME: &str = "fixInnerObjTemplate";
 pub const FIX_INNER_OBJ_TEMPLATE2_NAME: &str = "fixInnerObjTemplate2";
 pub const FIX_PREVIOUS_TXN_ID_NAME: &str = "fixPreviousTxnID";
@@ -80,6 +81,8 @@ pub fn registered_feature_supported_with_confidential_crypto(
 }
 
 pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
+    // rippled 3.4.1: Batch inner transactions must be RawTransaction objects.
+    RegisteredFeature::new(FIX_BATCH_V1_2_NAME, true, RegisteredFeatureVote::DefaultYes),
     RegisteredFeature::new(
         FEATURE_BATCH_V1_1_NAME,
         true,
@@ -387,6 +390,10 @@ pub fn feature_batch() -> Uint256 {
 
 pub fn feature_batch_v1_1() -> Uint256 {
     feature_id(FEATURE_BATCH_V1_1_NAME)
+}
+
+pub fn fix_batch_v1_2() -> Uint256 {
+    feature_id(FIX_BATCH_V1_2_NAME)
 }
 
 pub fn feature_amm() -> Uint256 {
