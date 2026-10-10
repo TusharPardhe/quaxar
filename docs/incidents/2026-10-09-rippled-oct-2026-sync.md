@@ -78,3 +78,26 @@ amendment.
   utility::parity::forced_validity_flags_match_current_cpp_forcevalidity_promotion`,
   `tx utility::parity::merge_forced_validity_matches_hash_router_cache_promotion_rule`,
   and `tx batch_sttx_policy::...rule_aware_inner_delegate_validation`.
+
+## Pre-merge audit (2026-10-10)
+
+The testnet node running the pre-sync binary was amendment blocked and held
+at `connected` (rippled caps a blocked server at `connected`). Two enabled
+testnet amendments were unsupported: `PermissionDelegationV1_1` (flag fixed
+above) and **`fixBatchV1_2`**, which shipped in rippled 3.4.1 after this
+sync's upstream range. The audit added:
+
+- **`fixBatchV1_2`** (`19c94c73f4`): registered supported/DefaultYes; a Batch
+  inner not wrapped in a `RawTransaction` object is `temMALFORMED`, checked
+  first in the inner loop.
+- **#8302 completion**: the first port changed only the direct Payment
+  quote. The transit debit (`directSendNoLimitMPT`) now uses the exact
+  round-up `mulRatio` cost under `fixCleanup3_5_0`, so quote and debit agree,
+  and MPT `divRound` takes the Number path under `fixCleanup3_5_0` with
+  rippled's no-rules default of enabled. The multi-receiver send needs no
+  change: both lending callers waive the transfer fee.
+
+Still outstanding from rippled 3.4.1: `578224f2e6` (ungated integer-overflow
+hardening in StrandFlow, Steps accumulators and TokenHelpers send loops).
+It changes results only on arithmetic overflow and is tracked as the next
+sync item.
