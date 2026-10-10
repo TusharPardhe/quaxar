@@ -204,6 +204,15 @@ where
         self.ledgers_by_hash.fetch(&ledger_hash)
     }
 
+    /// Ledgers currently resident in the history cache (diagnostics).
+    pub fn cached_ledgers(&self) -> Vec<Arc<Ledger>> {
+        self.ledgers_by_hash
+            .get_keys()
+            .into_iter()
+            .filter_map(|hash| self.ledgers_by_hash.fetch(&hash))
+            .collect()
+    }
+
     pub fn get_cached_ledger_by_seq(&self, ledger_index: u32) -> Option<Arc<Ledger>> {
         let hash = self
             .ledgers_by_index

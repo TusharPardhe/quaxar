@@ -2190,6 +2190,10 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
             .map(|cache| cache.get_track_size() as u64)
             .unwrap_or(0)
     }
+    fn held_tree_reachable(&self) -> Option<(u64, u64)> {
+        let roots = self.view.app()?.held_ledger_tree_roots();
+        Some(shamap::tree_node::count_resident_reachable(roots.iter()))
+    }
     fn add_node_store_counts(&self, json: &mut BTreeMap<String, JsonValue>) {
         let Some(app) = self.view.app() else {
             return;

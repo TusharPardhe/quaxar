@@ -4095,3 +4095,36 @@ fn shamap_storage_tree_difference_wrappers_use_owner_backed_policy() {
         Some(differing_inner.get_hash())
     );
 }
+
+#[test]
+fn count_resident_reachable_counts_shared_subtrees_once_and_skips_unloaded() {
+    let keys = [
+        "1000000000000000000000000000000000000000000000000000000000000000",
+        "1100000000000000000000000000000000000000000000000000000000000000",
+        "2000000000000000000000000000000000000000000000000000000000000000",
+    ];
+    let mut tree = MutableTree::new(1);
+    for (i, key) in keys.iter().enumerate() {
+        tree.add_item(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_hex(key).expect("key"), vec![i as u8 + 1; 12]),
+        )
+        .expect("insert");
+    }
+    let root = tree.root();
+    root.update_hash_deep();
+
+    let (inner, leaf) = shamap::tree_node::count_resident_reachable([&root]);
+    assert_eq!(leaf, 3);
+    assert!(inner >= 2, "root plus the 0x1 branch inner node, got {inner}");
+
+    // The same root held twice is counted once.
+    assert_eq!(
+        shamap::tree_node::count_resident_reachable([&root, &root]),
+        (inner, leaf)
+    );
+
+    // Releasing loaded children leaves only the root resident.
+    root.release_loaded_children();
+    assert_eq!(shamap::tree_node::count_resident_reachable([&root]), (1, 0));
+}

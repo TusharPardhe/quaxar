@@ -10355,6 +10355,23 @@ impl ApplicationRoot {
         self.ledger_master_state.validated_ledger()
     }
 
+    /// State and transaction tree roots of every ledger this node holds:
+    /// closed, validated and the ledger history cache (diagnostics).
+    pub fn held_ledger_tree_roots(
+        &self,
+    ) -> Vec<basics::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>> {
+        let mut ledgers: Vec<Arc<Ledger>> = Vec::new();
+        ledgers.extend(self.closed_ledger());
+        ledgers.extend(self.validated_ledger());
+        if let Some(runtime) = self.ledger_master_runtime() {
+            ledgers.extend(runtime.ledger_master().ledger_history().cached_ledgers());
+        }
+        ledgers
+            .iter()
+            .flat_map(|ledger| [ledger.state_map().root(), ledger.tx_map().root()])
+            .collect()
+    }
+
     pub fn validated_ledger_seq(&self) -> Option<u32> {
         self.ledger_master_state.validated_ledger_seq()
     }

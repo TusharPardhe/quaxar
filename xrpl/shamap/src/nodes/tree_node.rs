@@ -37,6 +37,36 @@ pub struct SHAMapMemoryStats {
     pub allocated_item_bytes: u64,
     pub structural_bytes: u64,
 }
+/// Count the distinct in-memory tree nodes reachable from `roots` by
+/// following only children that are already resident. Nothing is fetched
+/// from the node store. Shared subtrees are counted once (nodes are
+/// content-addressed by hash). Diagnostic: compare with
+/// `active_inner_nodes + active_leaf_nodes` to see how much of the live tree
+/// is held by the given ledgers.
+pub fn count_resident_reachable<'a>(
+    roots: impl IntoIterator<Item = &'a SharedIntrusive<SHAMapTreeNode>>,
+) -> (u64, u64) {
+    let mut seen: std::collections::HashSet<SHAMapHash> = std::collections::HashSet::new();
+    let mut stack: Vec<SharedIntrusive<SHAMapTreeNode>> = roots.into_iter().cloned().collect();
+    let (mut inner, mut leaf) = (0u64, 0u64);
+    while let Some(node) = stack.pop() {
+        if !seen.insert(node.get_hash()) {
+            continue;
+        }
+        if node.is_inner() {
+            inner += 1;
+            for branch in 0..16 {
+                if let Some(child) = node.get_child(branch) {
+                    stack.push(child);
+                }
+            }
+        } else {
+            leaf += 1;
+        }
+    }
+    (inner, leaf)
+}
+
 pub fn shamap_memory_stats() -> SHAMapMemoryStats {
     let allocated_inner_nodes = ALLOCATED_INNER_NODES.load(Ordering::Relaxed);
     let allocated_leaf_nodes = ALLOCATED_LEAF_NODES.load(Ordering::Relaxed);
