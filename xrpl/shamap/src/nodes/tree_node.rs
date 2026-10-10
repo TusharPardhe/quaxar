@@ -353,7 +353,11 @@ pub struct SHAMapTreeNode {
     hash: std::cell::UnsafeCell<SHAMapHash>,
     cowid: AtomicU32,
     node_type: SHAMapNodeType,
-    base_padding: [u8; 3],
+    /// Set once this exact node is known to be in the NodeStore (it was read
+    /// from it). A TreeNodeCache hit on such a node needs no write, matching
+    /// rippled `SHAMap::cacheLookup`, which never stores.
+    persisted: AtomicBool,
+    base_padding: [u8; 2],
 }
 #[repr(C)]
 pub struct SHAMapInnerNode {
@@ -576,7 +580,8 @@ impl SHAMapTreeNode {
             hash: std::cell::UnsafeCell::new(hash),
             cowid: AtomicU32::new(cowid),
             node_type,
-            base_padding: [0; 3],
+            persisted: AtomicBool::new(false),
+            base_padding: [0; 2],
         }
     }
     pub fn new_inner(cowid: u32) -> SharedIntrusive<Self> {
@@ -899,6 +904,16 @@ impl SHAMapTreeNode {
     pub fn is_full_below(&self, generation: u32) -> bool {
         self.is_inner() && self.inner().full_below_gen.load(Ordering::Relaxed) == generation
     }
+    /// Record that this node was read from the NodeStore.
+    pub fn mark_persisted(&self) {
+        self.persisted.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this node is known to be present in the NodeStore.
+    pub fn is_persisted(&self) -> bool {
+        self.persisted.load(Ordering::Relaxed)
+    }
+
     pub fn set_full_below_gen(&self, generation: u32) {
         if self.is_inner() {
             self.inner()

@@ -80,6 +80,17 @@ impl MissingNodeResidentLookup for AppResident<'_> {
         ledger_seq: u32,
     ) -> Option<SharedIntrusive<SHAMapTreeNode>> {
         if let Some(node) = self.cache.fetch(hash.as_uint256()) {
+            // rippled SHAMap::cacheLookup attaches a cached node without
+            // storing it. A node read from the NodeStore is already durable,
+            // so re-storing it only adds a presence-check read and a write per
+            // node and, by leaving writes pending, holds back every FullBelow
+            // marker of this session until the batch is accepted. On a hot
+            // restart that made each concurrent acquisition rescan the shared
+            // tree. Nodes of other origin (network, fetch pack) may still be
+            // awaiting another session's write, so they keep the durable path.
+            if node.is_persisted() {
+                return Some(node);
+            }
             return self
                 .store
                 .store_resident_shamap_node(self.kind, &node, ledger_seq)
@@ -554,6 +565,7 @@ impl TreeEngine for AppLedgerPlanEngine {
                 // are owned only by the current session and cannot seed a
                 // replacement plan.
                 self.family.canonicalize(hash, &mut node);
+                node.mark_persisted();
                 MissingNodeReadOutcome::Found(node)
             }
             ReadOutcome::Settled { node: None, .. } => MissingNodeReadOutcome::Miss,
@@ -596,6 +608,7 @@ impl TreeEngine for AppLedgerPlanEngine {
                     },
                 };
                 self.family.canonicalize(hash, &mut node);
+                node.mark_persisted();
                 node
             }
             ReadOutcome::Settled { node: None, .. } => return PlanReadApply::UnknownRead,
@@ -1761,6 +1774,50 @@ mod tests {
             shared.insert(marker);
         }
         assert!(shared.touch_if_exists(*hash.as_uint256()));
+    }
+
+    #[test]
+    fn nodestore_origin_cache_hit_is_not_rewritten_and_publishes_full_below() {
+        let cache = TreeNodeCache::new(
+            "persisted-resident-test",
+            8,
+            Duration::seconds(60),
+            MonotonicClock::default(),
+        );
+        let shared = FullBelowCacheImpl::new(
+            1,
+            MonotonicClock::default(),
+            HardenedHashBuilder::default(),
+            8,
+        );
+        let fetch_pack = FetchPackCache::new(8, Duration::seconds(60), MonotonicClock::default());
+        let mut node = SHAMapTreeNode::new_inner(0);
+        node.set_child_hash(0, SHAMapHash::new(Uint256::from(0xD2)));
+        node.update_hash();
+        let hash = node.get_hash();
+        cache.canonicalize_replace_client(hash.as_uint256(), &mut node);
+        // As apply_read does for a node returned by the NodeStore.
+        node.mark_persisted();
+
+        let mut staged = BTreeMap::new();
+        let mut store = WorkerStore::default();
+        {
+            let mut resident = AppResident {
+                cache: &cache,
+                shared_full_below: &shared,
+                pending_full_below: &mut staged,
+                fetch_pack: &fetch_pack,
+                store: &mut store,
+                kind: TreeKind::State,
+            };
+            let loaded = resident
+                .load_resident(hash, SEQ)
+                .expect("shared cache node resolves");
+            resident.mark_full_below(loaded, 1);
+            assert!(resident.is_full_below(hash));
+        }
+        assert!(store.take_pending_write_nodes().is_empty());
+        assert!(staged.is_empty());
     }
 
     #[test]
