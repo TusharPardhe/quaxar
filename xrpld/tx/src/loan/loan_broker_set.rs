@@ -37,6 +37,9 @@ pub struct LoanBrokerSetPreflightFacts {
     pub vault_id_is_zero: bool,
     pub cover_rate_minimum_value: Option<u32>,
     pub cover_rate_liquidation_value: Option<u32>,
+    pub domain_id_is_present: bool,
+    pub domain_id_is_zero: bool,
+    pub private_flag_is_set: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -52,6 +55,11 @@ pub struct LoanBrokerSetPreclaimFacts {
     pub debt_maximum_is_representable: bool,
     pub can_add_holding_result: Ter,
     pub check_frozen_result: Ter,
+    /// The existing broker being updated has lsfLoanBrokerPrivate.
+    pub existing_broker_is_private: bool,
+    pub domain_id_is_present: bool,
+    /// False only when a non-zero DomainID names a missing domain.
+    pub domain_exists_or_absent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +196,20 @@ pub fn run_loan_broker_set_preflight(facts: LoanBrokerSetPreflightFacts) -> NotT
         if facts.loan_broker_id_is_zero {
             return Ter::TEM_INVALID;
         }
+
+        // rippled #6517: the private flag is fixed at creation.
+        if facts.private_flag_is_set {
+            return Ter::TEM_INVALID;
+        }
+    } else if facts.domain_id_is_present {
+        // rippled #6517: a new broker's DomainID must be non-zero, and only a
+        // private broker may have one.
+        if facts.domain_id_is_zero {
+            return Ter::TEM_MALFORMED;
+        }
+        if !facts.private_flag_is_set {
+            return Ter::TEM_INVALID;
+        }
     }
 
     if facts.vault_id_is_present && facts.vault_id_is_zero {
@@ -228,6 +250,11 @@ pub fn run_loan_broker_set_preclaim(facts: LoanBrokerSetPreclaimFacts) -> Ter {
         if !facts.debt_maximum_is_zero_or_not_below_current_debt {
             return Ter::TEC_LIMIT_EXCEEDED;
         }
+
+        // rippled #6517: only a private broker can carry a DomainID.
+        if !facts.existing_broker_is_private && facts.domain_id_is_present {
+            return Ter::TEC_NO_PERMISSION;
+        }
     } else {
         if !is_tes_success(facts.can_add_holding_result) {
             return facts.can_add_holding_result;
@@ -236,6 +263,11 @@ pub fn run_loan_broker_set_preclaim(facts: LoanBrokerSetPreclaimFacts) -> Ter {
         if !is_tes_success(facts.check_frozen_result) {
             return facts.check_frozen_result;
         }
+    }
+
+    // rippled #6517: a non-zero DomainID must name an existing domain.
+    if !facts.domain_exists_or_absent {
+        return Ter::TEC_OBJECT_NOT_FOUND;
     }
 
     if facts.debt_maximum_is_present && !facts.debt_maximum_is_representable {

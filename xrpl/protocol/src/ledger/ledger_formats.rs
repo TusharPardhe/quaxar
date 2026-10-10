@@ -74,6 +74,8 @@ pub const ACCEPTED_LEDGER_FLAG: LedgerFlagValue = 0x0001_0000;
 
 pub const VAULT_PRIVATE_LEDGER_FLAG: LedgerFlagValue = 0x0001_0000;
 
+pub const LOAN_BROKER_PRIVATE_LEDGER_FLAG: LedgerFlagValue = 0x0001_0000;
+
 pub const LOAN_DEFAULT_LEDGER_FLAG: LedgerFlagValue = 0x0001_0000;
 pub const LOAN_IMPAIRED_LEDGER_FLAG: LedgerFlagValue = 0x0002_0000;
 pub const LOAN_OVERPAYMENT_LEDGER_FLAG: LedgerFlagValue = 0x0004_0000;
@@ -147,6 +149,7 @@ alias_consts!(
     (MPT_AMM_LEDGER_FLAG => lsfMPTAMM),
     (ACCEPTED_LEDGER_FLAG => lsfAccepted),
     (VAULT_PRIVATE_LEDGER_FLAG => lsfVaultPrivate),
+    (LOAN_BROKER_PRIVATE_LEDGER_FLAG => lsfLoanBrokerPrivate),
     (LOAN_DEFAULT_LEDGER_FLAG => lsfLoanDefault),
     (LOAN_IMPAIRED_LEDGER_FLAG => lsfLoanImpaired),
     (LOAN_OVERPAYMENT_LEDGER_FLAG => lsfLoanOverpayment),
@@ -300,6 +303,11 @@ ledger_flag_getter!(
         ("lsfLoanOverpayment", lsfLoanOverpayment),
     ]
 );
+ledger_flag_getter!(
+    getLoanBrokerFlags,
+    LOAN_BROKER_FLAGS,
+    [("lsfLoanBrokerPrivate", lsfLoanBrokerPrivate),]
+);
 
 #[allow(non_snake_case)]
 pub fn getAllLedgerFlags() -> &'static LedgerFlagMapPairList {
@@ -324,6 +332,7 @@ pub fn getAllLedgerFlags() -> &'static LedgerFlagMapPairList {
             ("Credential".to_owned(), getCredentialFlags().clone()),
             ("Vault".to_owned(), getVaultFlags().clone()),
             ("Loan".to_owned(), getLoanFlags().clone()),
+            ("LoanBroker".to_owned(), getLoanBrokerFlags().clone()),
         ]
     })
 }

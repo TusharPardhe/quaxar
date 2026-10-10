@@ -580,7 +580,27 @@ fn preclaim_broker_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             asset,
             false,
         )?,
+        existing_broker_is_private: existing
+            .as_ref()
+            .is_some_and(|b| b.is_flag(protocol::LOAN_BROKER_PRIVATE_LEDGER_FLAG)),
+        domain_id_is_present: tx.is_field_present(sf("sfDomainID")),
+        domain_exists_or_absent: domain_exists_or_absent(view, tx)?,
     }))
+}
+
+/// rippled LoanBrokerSet preclaim: a non-zero DomainID must name an existing
+/// PermissionedDomain. A zero DomainID (clear) or no DomainID passes.
+fn domain_exists_or_absent<V: ReadView>(view: &V, tx: &STTx) -> Result<bool, Ter> {
+    if !tx.is_field_present(sf("sfDomainID")) {
+        return Ok(true);
+    }
+    let domain_id = tx.get_field_h256(sf("sfDomainID"));
+    if domain_id.is_zero() {
+        return Ok(true);
+    }
+    view.read(protocol::permissioned_domain_keylet_from_id(domain_id))
+        .map(|sle| sle.is_some())
+        .map_err(|_| Ter::TEF_BAD_LEDGER)
 }
 
 fn preclaim_cover_deposit<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {

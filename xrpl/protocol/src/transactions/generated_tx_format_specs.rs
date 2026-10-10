@@ -1994,6 +1994,11 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
                 style: SOEStyle::Optional,
                 mpt: SOETxMPTIssue::None,
             },
+            FormatFieldSpec {
+                field_symbol: "sfDomainID",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
         ],
     },
     TxFormatSpecInit {

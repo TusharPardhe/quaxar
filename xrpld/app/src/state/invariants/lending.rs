@@ -288,6 +288,25 @@ pub(super) fn validate_loan_broker_entry<V: ApplyView + ?Sized>(
     before: Option<&STLedgerEntry>,
     after: &STLedgerEntry,
 ) -> Result<bool, ledger::ViewError> {
+    // rippled #6517 (LendingProtocolV1_2): only a private broker may carry a
+    // DomainID, the DomainID is never zero, and lsfLoanBrokerPrivate is the
+    // only defined flag.
+    if sandbox
+        .rules()
+        .enabled(&protocol::feature_lending_protocol_v1_2())
+    {
+        if after.is_field_present(sf("sfDomainID")) {
+            if !after.is_flag(protocol::LOAN_BROKER_PRIVATE_LEDGER_FLAG) {
+                return Ok(false);
+            }
+            if after.get_field_h256(sf("sfDomainID")).is_zero() {
+                return Ok(false);
+            }
+        }
+        if after.get_flags() & !protocol::LOAN_BROKER_PRIVATE_LEDGER_FLAG != 0 {
+            return Ok(false);
+        }
+    }
     if before.is_some_and(|before| {
         before.get_field_u32(sf("sfLoanSequence")) > after.get_field_u32(sf("sfLoanSequence"))
     }) {

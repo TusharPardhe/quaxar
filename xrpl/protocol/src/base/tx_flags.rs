@@ -205,6 +205,10 @@ pub const LOAN_MANAGE_FLAGS: FlagValue =
     LOAN_MANAGE_DEFAULT_FLAG | LOAN_MANAGE_IMPAIR_FLAG | LOAN_MANAGE_UNIMPAIR_FLAG;
 pub const LOAN_MANAGE_FLAGS_MASK: FlagValue = transaction_flags_mask(LOAN_MANAGE_FLAGS);
 
+/// LendingProtocolV1_2: a private LoanBroker restricts borrowers to its domain.
+pub const LOAN_BROKER_PRIVATE_FLAG: FlagValue = 0x0001_0000;
+pub const LOAN_BROKER_SET_FLAGS_MASK: FlagValue = transaction_flags_mask(LOAN_BROKER_PRIVATE_FLAG);
+
 pub const SPONSORSHIP_SET_REQUIRE_SIGN_FOR_FEE_FLAG: FlagValue = 0x0001_0000;
 pub const SPONSORSHIP_CLEAR_REQUIRE_SIGN_FOR_FEE_FLAG: FlagValue = 0x0002_0000;
 pub const SPONSORSHIP_SET_REQUIRE_SIGN_FOR_RESERVE_FLAG: FlagValue = 0x0004_0000;
@@ -418,6 +422,8 @@ alias_consts!(
     (LOAN_MANAGE_IMPAIR_FLAG => tfLoanImpair),
     (LOAN_MANAGE_UNIMPAIR_FLAG => tfLoanUnimpair),
     (LOAN_MANAGE_FLAGS_MASK => tfLoanManageMask),
+    (LOAN_BROKER_PRIVATE_FLAG => tfLoanBrokerPrivate),
+    (LOAN_BROKER_SET_FLAGS_MASK => tfLoanBrokerSetMask),
     (SPONSORSHIP_SET_REQUIRE_SIGN_FOR_FEE_FLAG => tfSponsorshipSetRequireSignForFee),
     (SPONSORSHIP_CLEAR_REQUIRE_SIGN_FOR_FEE_FLAG => tfSponsorshipClearRequireSignForFee),
     (SPONSORSHIP_SET_REQUIRE_SIGN_FOR_RESERVE_FLAG => tfSponsorshipSetRequireSignForReserve),
@@ -703,6 +709,11 @@ pub fn get_loan_manage_flags() -> &'static FlagMap {
     })
 }
 
+pub fn get_loan_broker_set_flags() -> &'static FlagMap {
+    static FLAGS: OnceLock<FlagMap> = OnceLock::new();
+    FLAGS.get_or_init(|| make_flag_map(&[("tfLoanBrokerPrivate", tfLoanBrokerPrivate)]))
+}
+
 pub fn get_asf_flag_map() -> &'static FlagMap {
     static FLAGS: OnceLock<FlagMap> = OnceLock::new();
     FLAGS.get_or_init(|| {
@@ -776,6 +787,7 @@ pub fn get_all_tx_flags() -> &'static FlagMapPairList {
             ("LoanSet".to_string(), get_loan_set_flags().clone()),
             ("LoanPay".to_string(), get_loan_pay_flags().clone()),
             ("LoanManage".to_string(), get_loan_manage_flags().clone()),
+            ("LoanBrokerSet".to_string(), get_loan_broker_set_flags().clone()),
         ]
     })
 }
@@ -1024,9 +1036,10 @@ mod tests {
                 "LoanSet",
                 "LoanPay",
                 "LoanManage",
+                "LoanBrokerSet",
             ]
         );
-        assert_eq!(all.len(), 21);
+        assert_eq!(all.len(), 22);
         assert_eq!(
             all[1].1.get("tfRequireDestTag"),
             Some(&ACCOUNT_SET_REQUIRE_DEST_TAG_FLAG)

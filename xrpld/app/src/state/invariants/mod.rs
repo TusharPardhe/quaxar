@@ -439,6 +439,15 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
                 _ => &[],
             };
             changed |= fields.iter().any(|field| field_changed(field));
+            // rippled #6517: LoanBroker flags (lsfLoanBrokerPrivate) exist
+            // only from LendingProtocolV1_2 and are fixed at creation.
+            if entry.sle.get_type() == LedgerEntryType::LoanBroker
+                && sandbox
+                    .rules()
+                    .enabled(&protocol::feature_lending_protocol_v1_2())
+            {
+                changed |= field_changed("sfFlags");
+            }
             if lending_protocol_v1_1_enabled && entry.sle.get_type() == LedgerEntryType::Loan {
                 let before_flags = before.get_field_u32(sf("sfFlags"));
                 let after_flags = entry.sle.get_field_u32(sf("sfFlags"));
