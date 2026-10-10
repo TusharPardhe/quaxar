@@ -3,7 +3,7 @@
 use basics::base_uint::Uint256;
 use protocol::{
     AccountID, JsonOptions, JsonValue, MPTAmount, MPTIssue, STAmount, STArray, STObject, STTx,
-    StBase, TxMeta, TxType, get_field_by_symbol, make_mpt_id,
+    TxMeta, TxType, get_field_by_symbol, make_mpt_id,
 };
 use rpc::{DELIVERED_AMOUNT_SWITCH_LEDGER, get_delivered_amount, insert_delivered_amount};
 

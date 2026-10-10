@@ -1076,11 +1076,46 @@ fn handle_subscribe(request: RpcRequest<'_>) -> RpcReply {
         }
     }
 
+    if let Some(value) = object.get("mpt_issuances") {
+        let Some(ids) = parse_mpt_issuance_ids(value) else {
+            return RpcReply::result(status_json(rpc::RpcStatus::new(
+                rpc::RpcErrorCode::InvalidParams,
+            )));
+        };
+        // Counted per connection and capped like rippled's account branches:
+        // an atomic check-and-reserve of the net-new issuances.
+        if !session.try_subscribe_mpts(&ids, crate::subscriptions::MAX_SUBSCRIPTIONS_PER_CONNECTION)
+        {
+            return RpcReply::result(status_json(rpc::RpcStatus::with_message(
+                rpc::RpcErrorCode::InvalidParams,
+                "Too many subscriptions for this connection.",
+            )));
+        }
+        tracing::debug!(target: "server", mpts = ids.len(), "doSubscribe: mpts");
+    }
+
     RpcReply::result(JsonValue::Object(BTreeMap::from([(
         "status".to_owned(),
         JsonValue::String("subscribed".to_owned()),
     )])))
     .with_meta("streams", JsonValue::Array(subscribed))
+}
+
+/// rippled `doSubscribe`/`doUnsubscribe` validation of `mpt_issuances` plus
+/// `RPC::parseMPTIssuanceIDs`: the value must be an array of hex MPT issuance
+/// ids; any non-string or unparsable entry, or an empty result, is rejected.
+fn parse_mpt_issuance_ids(value: &JsonValue) -> Option<std::collections::HashSet<protocol::MPTID>> {
+    let JsonValue::Array(entries) = value else {
+        return None;
+    };
+    let mut ids = std::collections::HashSet::new();
+    for entry in entries {
+        let JsonValue::String(text) = entry else {
+            return None;
+        };
+        ids.insert(protocol::MPTID::from_hex(text).ok()?);
+    }
+    (!ids.is_empty()).then_some(ids)
 }
 
 fn handle_unsubscribe(request: RpcRequest<'_>) -> RpcReply {
@@ -1116,6 +1151,16 @@ fn handle_unsubscribe(request: RpcRequest<'_>) -> RpcReply {
             };
             session.unsubscribe_stream(kind);
         }
+    }
+
+    if let Some(value) = object.get("mpt_issuances") {
+        let Some(ids) = parse_mpt_issuance_ids(value) else {
+            return RpcReply::result(status_json(rpc::RpcStatus::new(
+                rpc::RpcErrorCode::InvalidParams,
+            )));
+        };
+        session.unsubscribe_mpts(&ids);
+        tracing::debug!(target: "server", mpts = ids.len(), "doUnsubscribe: mpts");
     }
 
     RpcReply::result(JsonValue::Object(BTreeMap::from([(

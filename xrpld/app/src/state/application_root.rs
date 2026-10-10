@@ -347,6 +347,10 @@ impl ServerFeeSummary {
 }
 
 type SubscriptionPublisher = Arc<dyn Fn(&str, protocol::JsonValue) + Send + Sync + 'static>;
+
+/// Internal publisher channel name for validated transactions that affect MPT
+/// issuances. Payload: `{"mpt_issuance_ids": [hex...], "event": <transaction>}`.
+pub const MPT_TRANSACTION_PUBLICATION: &str = "@mpt_transaction";
 type SharedSubscriptionPublisher = Arc<std::sync::RwLock<Option<SubscriptionPublisher>>>;
 
 /// The lifecycle-independent portion of `NetworkOPs::reportFeeChange`.
@@ -8996,6 +9000,28 @@ impl ApplicationRoot {
             // validated event, matching rippled's STransactions/SRtTransactions
             // split.
             publisher("transactions", event.clone());
+            // rippled pubValidatedTransaction -> pubMPTTransaction (#5671,
+            // #8539): the same `transaction` message, routed to subscribers of
+            // every issuance in TxMeta::getAffectedMPTs. The server bridge
+            // unpacks this envelope; it is never a client-visible stream.
+            let affected_mpts = meta.get_affected_mpts();
+            if !affected_mpts.is_empty() {
+                publisher(
+                    MPT_TRANSACTION_PUBLICATION,
+                    protocol::JsonValue::Object(std::collections::BTreeMap::from([
+                        (
+                            "mpt_issuance_ids".to_owned(),
+                            protocol::JsonValue::Array(
+                                affected_mpts
+                                    .iter()
+                                    .map(|id| protocol::JsonValue::String(id.to_string()))
+                                    .collect(),
+                            ),
+                        ),
+                        ("event".to_owned(), event.clone()),
+                    ])),
+                );
+            }
             publisher("transactions_proposed", event);
         }
     }
