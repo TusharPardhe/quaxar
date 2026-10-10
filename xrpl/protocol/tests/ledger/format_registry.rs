@@ -12,7 +12,7 @@ fn tx_formats_registry_matches_current_cpp_catalog_shape() {
         .collect::<Vec<_>>();
     let registry_names = formats.iter().map(|item| item.name()).collect::<Vec<_>>();
 
-    assert_eq!(formats.iter().count(), 82);
+    assert_eq!(formats.iter().count(), 84);
     assert_eq!(formats.get_common_fields().len(), 20);
     assert_eq!(
         common_symbols,

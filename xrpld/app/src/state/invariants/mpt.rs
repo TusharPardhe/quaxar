@@ -169,6 +169,20 @@ pub(super) fn record_confidential_mpt(
     }
 }
 
+/// rippled `kConfidentialMptTxTypes` (MPTInvariant.cpp, incl. #8192/#8266).
+fn is_confidential_mpt_tx(txn_type: protocol::TxType) -> bool {
+    matches!(
+        txn_type,
+        protocol::TxType::CONFIDENTIAL_MPT_SEND
+            | protocol::TxType::CONFIDENTIAL_MPT_CONVERT
+            | protocol::TxType::CONFIDENTIAL_MPT_CONVERT_BACK
+            | protocol::TxType::CONFIDENTIAL_MPT_MERGE_INBOX
+            | protocol::TxType::CONFIDENTIAL_MPT_CLAWBACK
+            | protocol::TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE
+            | protocol::TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE
+    )
+}
+
 pub(super) fn validates_confidential_mpt<V: ApplyView + ?Sized>(
     view: &FlowSandbox<V>,
     txn_type: protocol::TxType,
@@ -178,7 +192,7 @@ pub(super) fn validates_confidential_mpt<V: ApplyView + ?Sized>(
     if !protocol::is_tes_success(result) {
         return true;
     }
-    let confidential_tx = matches!(txn_type.to_u16(), 85..=89);
+    let confidential_tx = is_confidential_mpt_tx(txn_type);
     // rippled #8209: before fixCleanup3_5_0 the COA gate also absorbed the
     // pre-transaction public balance, so a drain-then-erase of an MPToken was
     // rejected whenever an unrelated holder of the same issuance held a
@@ -319,7 +333,7 @@ pub(super) fn validates_mpt_accounting_for_transaction(
 ) -> bool {
     // Confidential MPT operations have their own encrypted-balance invariant;
     // do not subject them to public amount accounting on either outcome.
-    if matches!(txn_type.to_u16(), 85..=89) {
+    if is_confidential_mpt_tx(txn_type) {
         return true;
     }
     if fix_cleanup_3_4_0

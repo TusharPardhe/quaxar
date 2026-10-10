@@ -107,6 +107,7 @@ fn preclaim(flags: u32, immutable: u32) -> MPTokenIssuanceSetPreclaimFacts {
         tx_has_issuer_encryption_key: false,
         tx_has_auditor_encryption_key: false,
         confidential_outstanding_nonzero: false,
+        key_rotation: Default::default(),
     }
 }
 
@@ -320,4 +321,60 @@ fn delegated_lock_permission_remains_granular() {
     });
     assert_eq!(denied, Ter::TER_NO_DELEGATE_PERMISSION);
     assert_eq!(allowed, Ter::TES_SUCCESS);
+}
+
+#[test]
+fn key_rotation_preclaim_matches_rippled_7915() {
+    use tx::MPTokenIssuanceSetKeyRotationFacts;
+    let confidential = |rotation: MPTokenIssuanceSetKeyRotationFacts| MPTokenIssuanceSetPreclaimFacts {
+        issuance_has_confidential_balance: true,
+        issuer_encryption_key_present: true,
+        tx_has_issuer_encryption_key: true,
+        key_rotation: rotation,
+        ..preclaim(0, 0)
+    };
+    let enabled = MPTokenIssuanceSetKeyRotationFacts {
+        can_rotate_key: true,
+        ..Default::default()
+    };
+
+    // Pre-amendment: an existing issuer key cannot be replaced.
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(confidential(Default::default())),
+        Ter::TEC_NO_PERMISSION
+    );
+    // Post-amendment: a real rotation is allowed, even with COA > 0.
+    assert_eq!(run_mp_token_issuance_set_preclaim(confidential(enabled)), Ter::TES_SUCCESS);
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(MPTokenIssuanceSetPreclaimFacts {
+            confidential_outstanding_nonzero: true,
+            ..confidential(enabled)
+        }),
+        Ter::TES_SUCCESS
+    );
+    // Rotating to the same key is a duplicate; an epoch at the cap cannot wrap.
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(confidential(MPTokenIssuanceSetKeyRotationFacts {
+            issuer_key_unchanged: true,
+            ..enabled
+        })),
+        Ter::TEC_DUPLICATE
+    );
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(confidential(MPTokenIssuanceSetKeyRotationFacts {
+            issuer_key_epoch: u32::MAX,
+            ..enabled
+        })),
+        Ter::TEC_NO_PERMISSION
+    );
+    // First-time auditor key needs an issuer key on the issuance or in the tx.
+    assert_eq!(
+        run_mp_token_issuance_set_preclaim(MPTokenIssuanceSetPreclaimFacts {
+            issuance_has_confidential_balance: true,
+            tx_has_auditor_encryption_key: true,
+            key_rotation: enabled,
+            ..preclaim(0, 0)
+        }),
+        Ter::TEC_NO_PERMISSION
+    );
 }

@@ -93,6 +93,8 @@ impl TxType {
     pub const CONFIDENTIAL_MPT_CLAWBACK: Self = Self(89);
     pub const SPONSORSHIP_TRANSFER: Self = Self(90);
     pub const SPONSORSHIP_SET: Self = Self(91);
+    pub const CONFIDENTIAL_MPT_MIRROR_UPDATE: Self = Self(92);
+    pub const CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE: Self = Self(93);
     pub const AMENDMENT: Self = Self(100);
     pub const FEE: Self = Self(101);
     pub const UNL_MODIFY: Self = Self(102);
@@ -291,6 +293,16 @@ const DISPATCHABLE_TX_TYPES: &[(u16, &str, &str)] = &[
     (89, "ttCONFIDENTIAL_MPT_CLAWBACK", "ConfidentialMPTClawback"),
     (90, "ttSPONSORSHIP_TRANSFER", "SponsorshipTransfer"),
     (91, "ttSPONSORSHIP_SET", "SponsorshipSet"),
+    (
+        92,
+        "ttCONFIDENTIAL_MPT_MIRROR_UPDATE",
+        "ConfidentialMPTMirrorUpdate",
+    ),
+    (
+        93,
+        "ttCONFIDENTIAL_MPT_HOLDER_KEY_UPDATE",
+        "ConfidentialMPTHolderKeyUpdate",
+    ),
     (100, "ttAMENDMENT", "EnableAmendment"),
     (101, "ttFEE", "SetFee"),
     (102, "ttUNL_MODIFY", "UNLModify"),
@@ -444,6 +456,16 @@ const TX_TYPE_TAGS: &[(u16, &str, Option<&str>)] = &[
     ),
     (90, "ttSPONSORSHIP_TRANSFER", Some("SponsorshipTransfer")),
     (91, "ttSPONSORSHIP_SET", Some("SponsorshipSet")),
+    (
+        92,
+        "ttCONFIDENTIAL_MPT_MIRROR_UPDATE",
+        Some("ConfidentialMPTMirrorUpdate"),
+    ),
+    (
+        93,
+        "ttCONFIDENTIAL_MPT_HOLDER_KEY_UPDATE",
+        Some("ConfidentialMPTHolderKeyUpdate"),
+    ),
     (100, "ttAMENDMENT", Some("EnableAmendment")),
     (101, "ttFEE", Some("SetFee")),
     (102, "ttUNL_MODIFY", Some("UNLModify")),

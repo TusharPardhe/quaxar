@@ -3027,7 +3027,9 @@ pub(crate) fn apply_dispatch_route(txn_type: TxType) -> Option<ApplyDispatchRout
         | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
         | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
         | TxType::CONFIDENTIAL_MPT_SEND
-        | TxType::CONFIDENTIAL_MPT_CLAWBACK => ConfidentialMpt,
+        | TxType::CONFIDENTIAL_MPT_CLAWBACK
+        | TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE
+        | TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE => ConfidentialMpt,
         TxType::AMENDMENT | TxType::FEE | TxType::UNL_MODIFY => SystemChange,
         _ => return None,
     })
@@ -7791,21 +7793,40 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     let current = obj.get_field_u32(sf("sfImmutableFlags"));
                     obj.set_field_u32(sf("sfImmutableFlags"), current | immutable_flags);
                 }
-                if sttx.is_field_present(sf("sfIssuerEncryptionKey")) {
+                // rippled #7915 setEncryptionKey: overwriting an existing key
+                // (a rotation) increments its key epoch; a first-time
+                // registration leaves the epoch absent (epoch 0).
+                let can_rotate_key = view
+                    .rules()
+                    .enabled(&protocol::feature_confidential_mpt_key_rotation());
+                for (key_field, epoch_field) in [
+                    ("sfIssuerEncryptionKey", "sfIssuerKeyEpoch"),
+                    ("sfAuditorEncryptionKey", "sfAuditorKeyEpoch"),
+                ] {
+                    if !sttx.is_field_present(sf(key_field)) {
+                        continue;
+                    }
+                    let is_rotation = obj.is_field_present(sf(key_field));
                     obj.set_stbase(protocol::STBlob::from_buffer(
-                        sf("sfIssuerEncryptionKey"),
-                        basics::buffer::Buffer::from(
-                            &sttx.get_field_vl(sf("sfIssuerEncryptionKey"))[..],
-                        ),
+                        sf(key_field),
+                        basics::buffer::Buffer::from(&sttx.get_field_vl(sf(key_field))[..]),
                     ));
-                }
-                if sttx.is_field_present(sf("sfAuditorEncryptionKey")) {
-                    obj.set_stbase(protocol::STBlob::from_buffer(
-                        sf("sfAuditorEncryptionKey"),
-                        basics::buffer::Buffer::from(
-                            &sttx.get_field_vl(sf("sfAuditorEncryptionKey"))[..],
-                        ),
-                    ));
+                    if is_rotation {
+                        // Preclaim rejects a rotation without the amendment or
+                        // one that would wrap the epoch.
+                        if !can_rotate_key {
+                            return Ter::TEC_INTERNAL;
+                        }
+                        let epoch = if obj.is_field_present(sf(epoch_field)) {
+                            obj.get_field_u32(sf(epoch_field))
+                        } else {
+                            0
+                        };
+                        if epoch >= protocol::confidential_transfer::MAX_KEY_EPOCH {
+                            return Ter::TEC_INTERNAL;
+                        }
+                        obj.set_field_u32(sf(epoch_field), epoch + 1);
+                    }
                 }
                 if view
                     .update(Arc::new(STLedgerEntry::from_stobject(
@@ -8815,7 +8836,11 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
         | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
         | TxType::CONFIDENTIAL_MPT_SEND
-        | TxType::CONFIDENTIAL_MPT_CLAWBACK => crate::state::confidential_mpt::apply(view, sttx),
+        | TxType::CONFIDENTIAL_MPT_CLAWBACK
+        | TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE
+        | TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE => {
+            crate::state::confidential_mpt::apply(view, sttx)
+        }
 
         _ => Ter::TEM_UNKNOWN,
     }

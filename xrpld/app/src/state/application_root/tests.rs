@@ -5348,7 +5348,7 @@ fn txq_try_clear_applies_predecessors_repreclaims_current_and_reports_cleanup() 
 }
 
 #[test]
-fn typed_preclaim_dispatcher_covers_all_82_routed_quaxar_types() {
+fn typed_preclaim_dispatcher_covers_all_84_routed_quaxar_types() {
     use TypedPreclaimRoute::{
         AppAuditedNoop, AppReadViewHelper, BatchSpecialPreclaim, BridgeDomainAuditedNoop,
         BridgeDomainReadViewHelper, ChangeReadViewHelper, ConfidentialMptReadViewHelper,
@@ -5462,6 +5462,14 @@ fn typed_preclaim_dispatcher_covers_all_82_routed_quaxar_types() {
         ),
         (TxType::SPONSORSHIP_TRANSFER, SponsorshipReadViewHelper),
         (TxType::SPONSORSHIP_SET, SponsorshipReadViewHelper),
+        (
+            TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE,
+            ConfidentialMptReadViewHelper,
+        ),
+        (
+            TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE,
+            ConfidentialMptReadViewHelper,
+        ),
         (TxType::AMENDMENT, ChangeReadViewHelper),
         (TxType::FEE, ChangeReadViewHelper),
         (TxType::UNL_MODIFY, ChangeReadViewHelper),

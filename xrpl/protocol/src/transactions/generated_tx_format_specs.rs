@@ -2494,6 +2494,76 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         ],
     },
     TxFormatSpecInit {
+        tag_name: "ttCONFIDENTIAL_MPT_MIRROR_UPDATE",
+        value: 92,
+        name: "ConfidentialMPTMirrorUpdate",
+        delegable: "Delegation::delegable",
+        amendment: "featureConfidentialMPTKeyRotation",
+        privileges: "noPriv",
+        field_specs: &[
+            FormatFieldSpec {
+                field_symbol: "sfMPTokenIssuanceID",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfHolder",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfIssuerEncryptedAmount",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfAuditorEncryptedAmount",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfZKProof",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+        ],
+    },
+    TxFormatSpecInit {
+        tag_name: "ttCONFIDENTIAL_MPT_HOLDER_KEY_UPDATE",
+        value: 93,
+        name: "ConfidentialMPTHolderKeyUpdate",
+        delegable: "Delegation::notDelegable",
+        amendment: "featureConfidentialMPTKeyRotation",
+        privileges: "noPriv",
+        field_specs: &[
+            FormatFieldSpec {
+                field_symbol: "sfMPTokenIssuanceID",
+                style: SOEStyle::Required,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfHolderEncryptionKey",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfConfidentialBalanceSpending",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfConfidentialBalanceInbox",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+            FormatFieldSpec {
+                field_symbol: "sfZKProof",
+                style: SOEStyle::Optional,
+                mpt: SOETxMPTIssue::None,
+            },
+        ],
+    },
+    TxFormatSpecInit {
         tag_name: "ttAMENDMENT",
         value: 100,
         name: "EnableAmendment",

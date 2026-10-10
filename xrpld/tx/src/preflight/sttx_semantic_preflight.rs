@@ -210,7 +210,11 @@ fn validate_sttx_flag_mask(tx: &STTx, rules: &Rules) -> NotTec {
         | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
         | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
         | TxType::CONFIDENTIAL_MPT_SEND
-        | TxType::CONFIDENTIAL_MPT_CLAWBACK => flags & !UNIVERSAL_TRANSACTION_FLAGS,
+        | TxType::CONFIDENTIAL_MPT_CLAWBACK
+        | TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE => flags & !UNIVERSAL_TRANSACTION_FLAGS,
+        TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE => {
+            flags & protocol::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE_FLAGS_MASK
+        }
         TxType::TRUST_SET => flags & crate::run_trust_set_get_flags_mask(),
         TxType::SIGNER_LIST_SET if rules.enabled(&protocol::feature_id("fixInvalidTxFlags")) => {
             flags & crate::get_signer_list_set_flags_mask(true)
@@ -412,6 +416,13 @@ fn validate_sttx_extra_features(tx: &STTx, rules: &Rules) -> NotTec {
             if tx.is_field_present(get_field_by_symbol("sfCredentialIDs"))
                 && !rules.enabled(&protocol::feature_id("Credentials"))
             {
+                return Ter::TEM_DISABLED;
+            }
+        }
+        // rippled #8192/#8266 checkExtraFeatures: key rotation is only
+        // meaningful once ConfidentialTransfer is enabled.
+        TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE | TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE => {
+            if !rules.enabled(&protocol::feature_confidential_transfer()) {
                 return Ter::TEM_DISABLED;
             }
         }
@@ -1029,6 +1040,10 @@ fn validate_sttx_typed_semantic_preflight(
         | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
         | TxType::CONFIDENTIAL_MPT_SEND
         | TxType::CONFIDENTIAL_MPT_CLAWBACK => validate_confidential_mpt_preflight(tx, rules),
+        TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE => validate_confidential_mpt_mirror_update_preflight(tx),
+        TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE => {
+            validate_confidential_mpt_holder_key_update_preflight(tx)
+        }
         _ => Ter::TEM_UNKNOWN,
     }
 }
@@ -1189,6 +1204,113 @@ fn validate_confidential_mpt_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     }
 }
 
+/// rippled `ConfidentialMPTMirrorUpdate::preflight` (#8192).
+fn validate_confidential_mpt_mirror_update_preflight(tx: &STTx) -> NotTec {
+    use protocol::confidential_transfer::{
+        EC_EQUALITY_PROOF_LENGTH, EC_GAMAL_ENCRYPTED_TOTAL_LENGTH, is_valid_ciphertext,
+    };
+    let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
+    let issuer = protocol::MPTIssue::new(
+        tx.get_field_h192(get_field_by_symbol("sfMPTokenIssuanceID")),
+    )
+    .issuer();
+    let holder_field = get_field_by_symbol("sfHolder");
+    if tx.is_field_present(holder_field) {
+        // Issuer mode: the account must be the issuer, rotating another holder.
+        if account != issuer || account == tx.get_account_id(holder_field) {
+            return Ter::TEM_MALFORMED;
+        }
+    } else if account == issuer {
+        // Holder self-migration: the submitter is the holder.
+        return Ter::TEM_MALFORMED;
+    }
+    let issuer_amount = get_field_by_symbol("sfIssuerEncryptedAmount");
+    let auditor_amount = get_field_by_symbol("sfAuditorEncryptedAmount");
+    let has_issuer_amount = tx.is_field_present(issuer_amount);
+    let has_auditor_amount = tx.is_field_present(auditor_amount);
+    if !has_issuer_amount && !has_auditor_amount {
+        return Ter::TEM_MALFORMED;
+    }
+    if has_issuer_amount && tx.get_field_vl(issuer_amount).len() != EC_GAMAL_ENCRYPTED_TOTAL_LENGTH {
+        return Ter::TEM_BAD_CIPHERTEXT;
+    }
+    if has_auditor_amount
+        && tx.get_field_vl(auditor_amount).len() != EC_GAMAL_ENCRYPTED_TOTAL_LENGTH
+    {
+        return Ter::TEM_BAD_CIPHERTEXT;
+    }
+    if tx.get_field_vl(get_field_by_symbol("sfZKProof")).len() != EC_EQUALITY_PROOF_LENGTH {
+        return Ter::TEM_MALFORMED;
+    }
+    if has_issuer_amount && !is_valid_ciphertext(&tx.get_field_vl(issuer_amount)) {
+        return Ter::TEM_BAD_CIPHERTEXT;
+    }
+    if has_auditor_amount && !is_valid_ciphertext(&tx.get_field_vl(auditor_amount)) {
+        return Ter::TEM_BAD_CIPHERTEXT;
+    }
+    Ter::TES_SUCCESS
+}
+
+/// rippled `ConfidentialMPTHolderKeyUpdate::preflight` (#8266).
+fn validate_confidential_mpt_holder_key_update_preflight(tx: &STTx) -> NotTec {
+    use protocol::confidential_transfer::{
+        EC_GAMAL_ENCRYPTED_TOTAL_LENGTH, is_valid_ciphertext, is_valid_compressed_ec_point,
+    };
+    let flags = tx.get_flags();
+    let rotation = flags & protocol::HOLDER_KEY_ROTATION_FLAG != 0;
+    let recovery = flags & protocol::HOLDER_KEY_RECOVERY_FLAG != 0;
+    let cancel = flags & protocol::CANCEL_RECOVERY_FLAG != 0;
+    if (flags & protocol::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE_FLAGS).count_ones() != 1 {
+        return Ter::TEM_INVALID_FLAG;
+    }
+    let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
+    let issuer = protocol::MPTIssue::new(
+        tx.get_field_h192(get_field_by_symbol("sfMPTokenIssuanceID")),
+    )
+    .issuer();
+    if account == issuer {
+        return Ter::TEM_MALFORMED;
+    }
+    let holder_key = get_field_by_symbol("sfHolderEncryptionKey");
+    let spending = get_field_by_symbol("sfConfidentialBalanceSpending");
+    let inbox = get_field_by_symbol("sfConfidentialBalanceInbox");
+    let has_holder_key = tx.is_field_present(holder_key);
+    let has_spending = tx.is_field_present(spending);
+    let has_inbox = tx.is_field_present(inbox);
+    let has_proof = tx.is_field_present(get_field_by_symbol("sfZKProof"));
+    if cancel {
+        if has_holder_key || has_spending || has_inbox || has_proof {
+            return Ter::TEM_MALFORMED;
+        }
+        return Ter::TES_SUCCESS;
+    }
+    if !has_holder_key || !has_proof {
+        return Ter::TEM_MALFORMED;
+    }
+    if rotation && (!has_spending || !has_inbox) {
+        return Ter::TEM_MALFORMED;
+    }
+    if recovery && (has_spending || has_inbox) {
+        return Ter::TEM_MALFORMED;
+    }
+    if has_spending && tx.get_field_vl(spending).len() != EC_GAMAL_ENCRYPTED_TOTAL_LENGTH {
+        return Ter::TEM_BAD_CIPHERTEXT;
+    }
+    if has_inbox && tx.get_field_vl(inbox).len() != EC_GAMAL_ENCRYPTED_TOTAL_LENGTH {
+        return Ter::TEM_BAD_CIPHERTEXT;
+    }
+    if !is_valid_compressed_ec_point(&tx.get_field_vl(holder_key)) {
+        return Ter::TEM_MALFORMED;
+    }
+    if has_spending && !is_valid_ciphertext(&tx.get_field_vl(spending)) {
+        return Ter::TEM_BAD_CIPHERTEXT;
+    }
+    if has_inbox && !is_valid_ciphertext(&tx.get_field_vl(inbox)) {
+        return Ter::TEM_BAD_CIPHERTEXT;
+    }
+    Ter::TES_SUCCESS
+}
+
 fn has_explicit_typed_preflight_route(txn_type: TxType) -> bool {
     matches!(
         txn_type,
@@ -1271,6 +1393,8 @@ fn has_explicit_typed_preflight_route(txn_type: TxType) -> bool {
             | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
             | TxType::CONFIDENTIAL_MPT_SEND
             | TxType::CONFIDENTIAL_MPT_CLAWBACK
+            | TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE
+            | TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE
             | TxType::AMENDMENT
             | TxType::FEE
             | TxType::UNL_MODIFY
@@ -1409,7 +1533,13 @@ fn validate_mpt_issuance_set_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     if holder.is_some() && (has_issuer_key || has_auditor_key) {
         return Ter::TEM_MALFORMED;
     }
-    if has_auditor_key && !has_issuer_key {
+    // rippled #7915: pre-ConfidentialMPTKeyRotation the auditor key cannot be
+    // registered independently of the issuer key; post-amendment it may be
+    // added after the issuer key is already registered.
+    if has_auditor_key
+        && !has_issuer_key
+        && !rules.enabled(&protocol::feature_confidential_mpt_key_rotation())
+    {
         return Ter::TEM_MALFORMED;
     }
     if has_issuer_key
@@ -3035,12 +3165,128 @@ mod tests {
         has_explicit_typed_preflight_route, validate_amm_bid_preflight,
         validate_amm_clawback_preflight, validate_amm_create_preflight,
         validate_amm_deposit_preflight, validate_amm_vote_preflight,
-        validate_amm_withdraw_preflight, validate_confidential_mpt_preflight,
+        validate_amm_withdraw_preflight, validate_confidential_mpt_holder_key_update_preflight,
+        validate_confidential_mpt_mirror_update_preflight, validate_confidential_mpt_preflight,
         validate_escrow_finish_preflight, validate_payment_preflight,
         validate_permissioned_domain_delete_preflight, validate_permissioned_domain_set_preflight,
         validate_sttx_transaction_preflight_with_rules,
         validate_sttx_transaction_preflight_with_rules_and_network_id,
     };
+
+    fn point(seed: u8) -> Vec<u8> {
+        derive_public_key(KeyType::Secp256k1, &SecretKey::from_bytes([seed; 32]))
+            .expect("valid test public key")
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn ciphertext() -> Vec<u8> {
+        [point(4), point(5)].concat()
+    }
+
+    #[test]
+    fn mirror_update_preflight_matches_rippled() {
+        let issuer = AccountID::from_array([0x11; 20]);
+        let holder = AccountID::from_array([0x22; 20]);
+        let id = protocol::make_mpt_id(1, issuer);
+        let tx = |account: AccountID, holder: Option<AccountID>, issuer_ct: Option<Vec<u8>>, proof: usize| {
+            STTx::new(TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE, |tx| {
+                tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+                tx.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), id);
+                if let Some(holder) = holder {
+                    tx.set_account_id(get_field_by_symbol("sfHolder"), holder);
+                }
+                if let Some(ct) = issuer_ct {
+                    tx.set_field_vl(get_field_by_symbol("sfIssuerEncryptedAmount"), &ct);
+                }
+                tx.set_field_vl(get_field_by_symbol("sfZKProof"), &vec![0; proof]);
+            })
+        };
+        let ok = Some(ciphertext());
+        let check = validate_confidential_mpt_mirror_update_preflight;
+        assert_eq!(check(&tx(issuer, Some(holder), ok.clone(), 128)), Ter::TES_SUCCESS);
+        assert_eq!(check(&tx(holder, None, ok.clone(), 128)), Ter::TES_SUCCESS);
+        // Issuer mode by a non-issuer, issuer rotating itself, issuer self-migration.
+        assert_eq!(check(&tx(holder, Some(issuer), ok.clone(), 128)), Ter::TEM_MALFORMED);
+        assert_eq!(check(&tx(issuer, Some(issuer), ok.clone(), 128)), Ter::TEM_MALFORMED);
+        assert_eq!(check(&tx(issuer, None, ok.clone(), 128)), Ter::TEM_MALFORMED);
+        // No ciphertext, bad length, bad proof length, invalid point.
+        assert_eq!(check(&tx(holder, None, None, 128)), Ter::TEM_MALFORMED);
+        assert_eq!(check(&tx(holder, None, Some(vec![2; 65]), 128)), Ter::TEM_BAD_CIPHERTEXT);
+        assert_eq!(check(&tx(holder, None, ok, 127)), Ter::TEM_MALFORMED);
+        assert_eq!(check(&tx(holder, None, Some(vec![5; 66]), 128)), Ter::TEM_BAD_CIPHERTEXT);
+    }
+
+    #[test]
+    fn holder_key_update_preflight_matches_rippled() {
+        let issuer = AccountID::from_array([0x11; 20]);
+        let holder = AccountID::from_array([0x22; 20]);
+        let id = protocol::make_mpt_id(1, issuer);
+        let build = |account: AccountID, flags: u32, key: Option<Vec<u8>>, balances: bool, proof: bool| {
+            STTx::new(TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE, |tx| {
+                tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+                tx.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), id);
+                tx.set_field_u32(get_field_by_symbol("sfFlags"), flags);
+                if let Some(key) = key {
+                    tx.set_field_vl(get_field_by_symbol("sfHolderEncryptionKey"), &key);
+                }
+                if balances {
+                    tx.set_field_vl(get_field_by_symbol("sfConfidentialBalanceSpending"), &ciphertext());
+                    tx.set_field_vl(get_field_by_symbol("sfConfidentialBalanceInbox"), &ciphertext());
+                }
+                if proof {
+                    tx.set_field_vl(get_field_by_symbol("sfZKProof"), &[0; 64]);
+                }
+            })
+        };
+        let (rot, rec, cancel) = (
+            protocol::HOLDER_KEY_ROTATION_FLAG,
+            protocol::HOLDER_KEY_RECOVERY_FLAG,
+            protocol::CANCEL_RECOVERY_FLAG,
+        );
+        let check = validate_confidential_mpt_holder_key_update_preflight;
+        let k = Some(point(3));
+        assert_eq!(check(&build(holder, rot, k.clone(), true, true)), Ter::TES_SUCCESS);
+        assert_eq!(check(&build(holder, rec, k.clone(), false, true)), Ter::TES_SUCCESS);
+        assert_eq!(check(&build(holder, cancel, None, false, false)), Ter::TES_SUCCESS);
+        // Exactly one mode flag.
+        assert_eq!(check(&build(holder, 0, k.clone(), true, true)), Ter::TEM_INVALID_FLAG);
+        assert_eq!(check(&build(holder, rot | rec, k.clone(), true, true)), Ter::TEM_INVALID_FLAG);
+        // Issuer cannot update a holder key.
+        assert_eq!(check(&build(issuer, rot, k.clone(), true, true)), Ter::TEM_MALFORMED);
+        // Field shape per mode.
+        assert_eq!(check(&build(holder, cancel, k.clone(), false, false)), Ter::TEM_MALFORMED);
+        assert_eq!(check(&build(holder, rot, k.clone(), false, true)), Ter::TEM_MALFORMED);
+        assert_eq!(check(&build(holder, rec, k.clone(), true, true)), Ter::TEM_MALFORMED);
+        assert_eq!(check(&build(holder, rec, k, false, false)), Ter::TEM_MALFORMED);
+        assert_eq!(check(&build(holder, rec, Some(vec![5; 33]), false, true)), Ter::TEM_MALFORMED);
+    }
+
+    #[test]
+    fn key_rotation_transactions_require_both_amendments() {
+        let holder = AccountID::from_array([0x22; 20]);
+        let id = protocol::make_mpt_id(1, AccountID::from_array([0x11; 20]));
+        for txn_type in [
+            TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE,
+            TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE,
+        ] {
+            let tx = STTx::new(txn_type, |tx| {
+                tx.set_account_id(get_field_by_symbol("sfAccount"), holder);
+                tx.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), id);
+                tx.set_field_vl(get_field_by_symbol("sfZKProof"), &[0; 128]);
+            });
+            for rules in [
+                Rules::new([protocol::feature_confidential_transfer()]),
+                Rules::new([protocol::feature_confidential_mpt_key_rotation()]),
+            ] {
+                assert_eq!(
+                    validate_sttx_transaction_preflight_with_rules(&tx, &rules),
+                    Ter::TEM_DISABLED,
+                    "{txn_type}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn every_current_quaxar_dispatchable_type_has_an_explicit_preflight_route() {

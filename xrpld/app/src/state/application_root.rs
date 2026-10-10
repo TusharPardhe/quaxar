@@ -2578,7 +2578,9 @@ fn calculate_sttx_base_fee_inner(view: &impl ReadView, tx: &STTx) -> Result<u64,
         | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
         | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
         | TxType::CONFIDENTIAL_MPT_SEND
-        | TxType::CONFIDENTIAL_MPT_CLAWBACK => {
+        | TxType::CONFIDENTIAL_MPT_CLAWBACK
+        | TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE
+        | TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE => {
             transactor_base_fee
                 + ledger_base_fee
                     * u64::from(protocol::confidential_transfer::CONFIDENTIAL_FEE_MULTIPLIER)
@@ -2816,7 +2818,11 @@ fn typed_preclaim_route(txn_type: TxType) -> TypedPreclaimRoute {
         | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
         | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
         | TxType::CONFIDENTIAL_MPT_SEND
-        | TxType::CONFIDENTIAL_MPT_CLAWBACK => TypedPreclaimRoute::ConfidentialMptReadViewHelper,
+        | TxType::CONFIDENTIAL_MPT_CLAWBACK
+        | TxType::CONFIDENTIAL_MPT_MIRROR_UPDATE
+        | TxType::CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE => {
+            TypedPreclaimRoute::ConfidentialMptReadViewHelper
+        }
         // Unknown and non-dispatchable protocol values are likewise closed.
         _ => TypedPreclaimRoute::FailClosed,
     }

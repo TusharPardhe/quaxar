@@ -229,6 +229,15 @@ pub const SPONSORSHIP_TRANSFER_FLAGS: FlagValue =
 pub const SPONSORSHIP_TRANSFER_FLAGS_MASK: FlagValue =
     transaction_flags_mask(SPONSORSHIP_TRANSFER_FLAGS);
 
+// rippled #8266 ConfidentialMPTHolderKeyUpdate flags.
+pub const HOLDER_KEY_ROTATION_FLAG: FlagValue = 0x0001_0000;
+pub const HOLDER_KEY_RECOVERY_FLAG: FlagValue = 0x0002_0000;
+pub const CANCEL_RECOVERY_FLAG: FlagValue = 0x0004_0000;
+pub const CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE_FLAGS: FlagValue =
+    HOLDER_KEY_ROTATION_FLAG | HOLDER_KEY_RECOVERY_FLAG | CANCEL_RECOVERY_FLAG;
+pub const CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE_FLAGS_MASK: FlagValue =
+    transaction_flags_mask(CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE_FLAGS);
+
 pub const MPT_PAYMENT_MASK: FlagValue =
     !(UNIVERSAL_TRANSACTION_FLAGS | PAYMENT_PARTIAL_PAYMENT_FLAG);
 pub const TRUST_SET_PERMISSION_MASK: FlagValue = !(UNIVERSAL_TRANSACTION_FLAGS
@@ -434,6 +443,10 @@ alias_consts!(
     (SPONSORSHIP_CREATE_FLAG => tfSponsorshipCreate),
     (SPONSORSHIP_REASSIGN_FLAG => tfSponsorshipReassign),
     (SPONSORSHIP_TRANSFER_FLAGS_MASK => tfSponsorshipTransferMask),
+    (HOLDER_KEY_ROTATION_FLAG => tfHolderKeyRotation),
+    (HOLDER_KEY_RECOVERY_FLAG => tfHolderKeyRecovery),
+    (CANCEL_RECOVERY_FLAG => tfCancelRecovery),
+    (CONFIDENTIAL_MPT_HOLDER_KEY_UPDATE_FLAGS_MASK => tfConfidentialMPTHolderKeyUpdateMask),
     (MPT_PAYMENT_MASK => tfMPTPaymentMask),
     (TRUST_SET_PERMISSION_MASK => tfTrustSetPermissionMask),
     (WITHDRAW_SUB_TX_FLAGS => tfWithdrawSubTx),
