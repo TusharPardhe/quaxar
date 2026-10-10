@@ -19435,3 +19435,55 @@ fn vault_zero_value_iou_self_withdraw_holding_is_amendment_gated_in_live_dispatc
         );
     }
 }
+
+#[test]
+fn mptoken_issuance_set_key_rotation_increments_epoch_like_rippled_7915() {
+    let point = |seed: u8| {
+        secp256k1::PublicKey::from_secret_key(
+            &secp256k1::Secp256k1::new(),
+            &secp256k1::SecretKey::from_byte_array([seed; 32]).unwrap(),
+        )
+        .serialize()
+        .to_vec()
+    };
+    let issuer = sample_account(0xE7);
+    let mpt_id = share_id_for(issuer, 1);
+    let mut issuance = mpt_issuance_entry(
+        issuer,
+        1,
+        0,
+        protocol::lsfMPTCanTransfer | protocol::lsfMPTCanHoldConfidentialBalance,
+    );
+    issuance.set_field_vl(sf("sfIssuerEncryptionKey"), &point(1));
+    let mut ledger = empty_ledger(vec![account_root(issuer, 1, 0), issuance]);
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_confidential_transfer(),
+        protocol::feature_confidential_mpt_key_rotation(),
+    ]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let rotate = |key: Vec<u8>, seq: u32| {
+        STTx::new(TxType::MPTOKEN_ISSUANCE_SET, |object| {
+            object.set_account_id(sf("sfAccount"), issuer);
+            object.set_field_h192(sf("sfMPTokenIssuanceID"), mpt_id);
+            object.set_field_vl(sf("sfIssuerEncryptionKey"), &key);
+            object.set_field_amount(
+                sf("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+            );
+            object.set_field_u32(sf("sfSequence"), seq);
+        })
+    };
+    for (seed, seq, expected_epoch) in [(2, 1, 1), (3, 2, 2)] {
+        let tx = rotate(point(seed), seq);
+        assert_eq!(
+            handle_real_dispatch(&mut view, &tx, TxType::MPTOKEN_ISSUANCE_SET, None),
+            protocol::Ter::TES_SUCCESS
+        );
+        let issuance = view
+            .read(protocol::mpt_issuance_keylet_from_mptid(mpt_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(issuance.get_field_vl(sf("sfIssuerEncryptionKey")), point(seed));
+        assert_eq!(issuance.get_field_u32(sf("sfIssuerKeyEpoch")), expected_epoch);
+    }
+}

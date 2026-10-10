@@ -22,6 +22,12 @@ pub const EC_CONVERT_BACK_PROOF_LENGTH: usize =
     EC_CONVERT_BACK_SIGMA_PROOF_LENGTH + EC_SINGLE_BULLETPROOF_LENGTH;
 pub const EC_CLAWBACK_PROOF_LENGTH: usize = 64;
 pub const CONFIDENTIAL_FEE_MULTIPLIER: u32 = 9;
+
+/// rippled `kMaxKeyEpoch` (#7915): largest confidential MPT key epoch.
+pub const MAX_KEY_EPOCH: u32 = u32::MAX;
+
+/// rippled `kEcEqualityProofLength` (#8192): compact equality proof length.
+pub const EC_EQUALITY_PROOF_LENGTH: usize = 128;
 pub const EC_COMPRESSED_PREFIX_EVEN_Y: u8 = 0x02;
 pub const EC_COMPRESSED_PREFIX_ODD_Y: u8 = 0x03;
 
@@ -701,6 +707,70 @@ pub fn verify_clawback_proof(
             context_hash.data().as_ptr(),
         )
     })
+}
+
+fn optional_epoch(entry: &crate::STLedgerEntry, field: &str) -> u32 {
+    let field = crate::get_field_by_symbol(field);
+    if entry.is_field_present(field) {
+        entry.get_field_u32(field)
+    } else {
+        0
+    }
+}
+
+/// rippled `isIssuerMirrorCurrent` (#8210).
+pub fn is_issuer_mirror_current(
+    issuance: &crate::STLedgerEntry,
+    mptoken: &crate::STLedgerEntry,
+) -> bool {
+    mptoken.is_field_present(crate::get_field_by_symbol("sfIssuerEncryptedBalance"))
+        && optional_epoch(mptoken, "sfIssuerKeyMirrorEpoch")
+            == optional_epoch(issuance, "sfIssuerKeyEpoch")
+}
+
+/// rippled `isAuditorMirrorCurrent` (#8210).
+pub fn is_auditor_mirror_current(
+    issuance: &crate::STLedgerEntry,
+    mptoken: &crate::STLedgerEntry,
+) -> bool {
+    if !issuance.is_field_present(crate::get_field_by_symbol("sfAuditorEncryptionKey")) {
+        return true;
+    }
+    mptoken.is_field_present(crate::get_field_by_symbol("sfAuditorEncryptedBalance"))
+        && optional_epoch(mptoken, "sfAuditorKeyMirrorEpoch")
+            == optional_epoch(issuance, "sfAuditorKeyEpoch")
+}
+
+/// rippled `areMirrorsCurrent` (#8210).
+pub fn are_mirrors_current(issuance: &crate::STLedgerEntry, mptoken: &crate::STLedgerEntry) -> bool {
+    is_issuer_mirror_current(issuance, mptoken) && is_auditor_mirror_current(issuance, mptoken)
+}
+
+/// rippled `setIssuerMirrorEpoch` (#8192). The issuer mirror is not optional,
+/// so there is no existence check; epoch 0 leaves the field untouched.
+pub fn set_issuer_mirror_epoch(issuance: &crate::STLedgerEntry, mptoken: &mut crate::STObject) {
+    let epoch = optional_epoch(issuance, "sfIssuerKeyEpoch");
+    if epoch != 0 {
+        mptoken.set_field_u32(crate::get_field_by_symbol("sfIssuerKeyMirrorEpoch"), epoch);
+    }
+}
+
+/// rippled `setAuditorMirrorEpoch` (#8192): only when the holder has an
+/// auditor mirror.
+pub fn set_auditor_mirror_epoch(issuance: &crate::STLedgerEntry, mptoken: &mut crate::STObject) {
+    if !mptoken.is_field_present(crate::get_field_by_symbol("sfAuditorEncryptedBalance")) {
+        return;
+    }
+    let epoch = optional_epoch(issuance, "sfAuditorKeyEpoch");
+    if epoch != 0 {
+        mptoken.set_field_u32(crate::get_field_by_symbol("sfAuditorKeyMirrorEpoch"), epoch);
+    }
+}
+
+/// rippled `setMirrorEpochs` (#8210).
+pub fn set_mirror_epochs(issuance: &crate::STLedgerEntry, mptoken: &mut crate::STObject) {
+    set_issuer_mirror_epoch(issuance, mptoken);
+    set_auditor_mirror_epoch(issuance, mptoken);
 }
 
 #[cfg(test)]

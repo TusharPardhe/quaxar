@@ -16,6 +16,7 @@ pub const FEATURE_XCHAIN_BRIDGE_NAME: &str = "XChainBridge";
 pub const FEATURE_CLAWBACK_NAME: &str = "Clawback";
 pub const FEATURE_TOKEN_ESCROW_NAME: &str = "TokenEscrow";
 pub const FEATURE_CONFIDENTIAL_TRANSFER_NAME: &str = "ConfidentialTransfer";
+pub const FEATURE_CONFIDENTIAL_MPT_KEY_ROTATION_NAME: &str = "ConfidentialMPTKeyRotation";
 pub const FIX_BATCH_INNER_SIGS_NAME: &str = "fixBatchInnerSigs";
 pub const FIX_BATCH_V1_2_NAME: &str = "fixBatchV1_2";
 pub const FIX_INNER_OBJ_TEMPLATE_NAME: &str = "fixInnerObjTemplate";
@@ -124,6 +125,12 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new(
         FIX_CLEANUP_3_5_0_NAME,
         true,
+        RegisteredFeatureVote::DefaultNo,
+    ),
+    // rippled #7915: key rotation for confidential MPT; unsupported upstream.
+    RegisteredFeature::new(
+        FEATURE_CONFIDENTIAL_MPT_KEY_ROTATION_NAME,
+        false,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new(
@@ -446,6 +453,10 @@ pub fn feature_lending_protocol_v1_2() -> Uint256 {
 
 pub fn feature_smart_escrow() -> Uint256 {
     feature_id(FEATURE_SMART_ESCROW_NAME)
+}
+
+pub fn feature_confidential_mpt_key_rotation() -> Uint256 {
+    feature_id(FEATURE_CONFIDENTIAL_MPT_KEY_ROTATION_NAME)
 }
 
 pub fn feature_single_asset_vault() -> Uint256 {

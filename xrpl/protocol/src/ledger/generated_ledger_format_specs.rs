@@ -1098,6 +1098,14 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
                 style: SOEStyle::Optional,
             },
             LedgerFormatFieldSpec {
+                field_symbol: "sfIssuerKeyEpoch",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfAuditorKeyEpoch",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
                 field_symbol: "sfConfidentialOutstandingAmount",
                 style: SOEStyle::Default,
             },
@@ -1158,7 +1166,19 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
                 style: SOEStyle::Optional,
             },
             LedgerFormatFieldSpec {
+                field_symbol: "sfIssuerKeyMirrorEpoch",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfAuditorKeyMirrorEpoch",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
                 field_symbol: "sfHolderEncryptionKey",
+                style: SOEStyle::Optional,
+            },
+            LedgerFormatFieldSpec {
+                field_symbol: "sfRecoveryKey",
                 style: SOEStyle::Optional,
             },
         ],

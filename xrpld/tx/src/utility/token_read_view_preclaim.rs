@@ -534,8 +534,31 @@ fn preclaim_mpt_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
             confidential_outstanding_nonzero: issuance
                 .is_field_present(sf("sfConfidentialOutstandingAmount"))
                 && issuance.get_field_u64(sf("sfConfidentialOutstandingAmount")) > 0,
+            key_rotation: crate::utility::mp_token_issuance_set::MPTokenIssuanceSetKeyRotationFacts {
+                can_rotate_key: view
+                    .rules()
+                    .enabled(&protocol::feature_confidential_mpt_key_rotation()),
+                issuer_key_unchanged: same_vl(tx, &issuance, "sfIssuerEncryptionKey"),
+                auditor_key_unchanged: same_vl(tx, &issuance, "sfAuditorEncryptionKey"),
+                issuer_key_epoch: optional_u32(&issuance, "sfIssuerKeyEpoch"),
+                auditor_key_epoch: optional_u32(&issuance, "sfAuditorKeyEpoch"),
+            },
         },
     ))
+}
+
+fn same_vl(tx: &protocol::STTx, sle: &protocol::STLedgerEntry, field: &str) -> bool {
+    tx.is_field_present(sf(field))
+        && sle.is_field_present(sf(field))
+        && tx.get_field_vl(sf(field)) == sle.get_field_vl(sf(field))
+}
+
+fn optional_u32(sle: &protocol::STLedgerEntry, field: &str) -> u32 {
+    if sle.is_field_present(sf(field)) {
+        sle.get_field_u32(sf(field))
+    } else {
+        0
+    }
 }
 
 /// Runs the complete immutable preclaim for the owned token families.

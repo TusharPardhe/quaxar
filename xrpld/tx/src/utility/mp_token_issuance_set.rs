@@ -73,6 +73,22 @@ pub struct MPTokenIssuanceSetPreclaimFacts {
     pub tx_has_issuer_encryption_key: bool,
     pub tx_has_auditor_encryption_key: bool,
     pub confidential_outstanding_nonzero: bool,
+    pub key_rotation: MPTokenIssuanceSetKeyRotationFacts,
+}
+
+/// Inputs to rippled #7915 key-rotation preclaim checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MPTokenIssuanceSetKeyRotationFacts {
+    /// `featureConfidentialMPTKeyRotation` is enabled.
+    pub can_rotate_key: bool,
+    /// The transaction's issuer key equals the issuance's current issuer key.
+    pub issuer_key_unchanged: bool,
+    /// The transaction's auditor key equals the issuance's current auditor key.
+    pub auditor_key_unchanged: bool,
+    /// The issuance's sfIssuerKeyEpoch (absent = 0).
+    pub issuer_key_epoch: u32,
+    /// The issuance's sfAuditorKeyEpoch (absent = 0).
+    pub auditor_key_epoch: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,11 +323,47 @@ pub fn run_mp_token_issuance_set_preclaim(f: MPTokenIssuanceSetPreclaimFacts) ->
     // These checks belong in the shared ledger-aware preclaim rather than only
     // in one dispatcher, otherwise typed execution can accept a transaction
     // which the consensus route rejects later.
-    if f.tx_has_issuer_encryption_key && f.issuer_encryption_key_present {
-        return Ter::TEC_NO_PERMISSION;
-    }
-    if f.tx_has_auditor_encryption_key && f.auditor_encryption_key_present {
-        return Ter::TEC_NO_PERMISSION;
+    let tx_has_issuer_key = f.tx_has_issuer_encryption_key;
+    let tx_has_auditor_key = f.tx_has_auditor_encryption_key;
+    let sle_has_issuer_key = f.issuer_encryption_key_present;
+    let sle_has_auditor_key = f.auditor_encryption_key_present;
+    let rotation = f.key_rotation;
+    if rotation.can_rotate_key {
+        // rippled #7915: a first-time auditor key registration requires an
+        // issuer key, already on the issuance or set by this transaction.
+        let registers_auditor_key = tx_has_auditor_key && !sle_has_auditor_key;
+        let issuer_key_exists = sle_has_issuer_key || tx_has_issuer_key;
+        if registers_auditor_key && !issuer_key_exists {
+            return Ter::TEC_NO_PERMISSION;
+        }
+        // A key epoch increment must always correspond to an actual change.
+        if tx_has_issuer_key && sle_has_issuer_key && rotation.issuer_key_unchanged {
+            return Ter::TEC_DUPLICATE;
+        }
+        if tx_has_auditor_key && sle_has_auditor_key && rotation.auditor_key_unchanged {
+            return Ter::TEC_DUPLICATE;
+        }
+        // Key epochs must never wrap: epoch 0 is the "never rotated" sentinel.
+        if tx_has_issuer_key
+            && sle_has_issuer_key
+            && rotation.issuer_key_epoch == protocol::confidential_transfer::MAX_KEY_EPOCH
+        {
+            return Ter::TEC_NO_PERMISSION;
+        }
+        if tx_has_auditor_key
+            && sle_has_auditor_key
+            && rotation.auditor_key_epoch == protocol::confidential_transfer::MAX_KEY_EPOCH
+        {
+            return Ter::TEC_NO_PERMISSION;
+        }
+    } else {
+        // Pre-amendment the encryption keys cannot be updated.
+        if tx_has_issuer_key && sle_has_issuer_key {
+            return Ter::TEC_NO_PERMISSION;
+        }
+        if tx_has_auditor_key && sle_has_auditor_key {
+            return Ter::TEC_NO_PERMISSION;
+        }
     }
     let enables_confidential_balance = (enable & tfMPTSetCanHoldConfidentialBalance) != 0;
     if enables_confidential_balance && f.issuance_transfer_fee_nonzero {
@@ -329,11 +381,16 @@ pub fn run_mp_token_issuance_set_preclaim(f: MPTokenIssuanceSetPreclaimFacts) ->
     {
         return Ter::TEC_NO_PERMISSION;
     }
-    if (f.tx_has_issuer_encryption_key
-        || f.tx_has_auditor_encryption_key
-        || enables_confidential_balance)
+    // Pre-ConfidentialMPTKeyRotation keys cannot be uploaded while COA > 0;
+    // post-amendment they can. Enabling confidential balances when COA > 0 is
+    // never permitted.
+    if !rotation.can_rotate_key
+        && (tx_has_issuer_key || tx_has_auditor_key)
         && f.confidential_outstanding_nonzero
     {
+        return Ter::TEC_NO_PERMISSION;
+    }
+    if enables_confidential_balance && f.confidential_outstanding_nonzero {
         return Ter::TEC_NO_PERMISSION;
     }
     Ter::TES_SUCCESS
