@@ -29,7 +29,8 @@ fn job_queue_prefers_higher_priority_waiting_jobs_in_the_same_window() {
 
 #[test]
 fn job_queue_counts_waiting_and_running_jobs_per_type() {
-    let queue = JobQueue::default();
+    // Manually reserved jobs: no background workers may race the counts.
+    let queue = JobQueue::new(0);
 
     assert!(queue.add_job(JobType::JtPack, "pack-1", || {}));
     assert!(queue.add_job(JobType::JtPack, "pack-2", || {}));
@@ -62,7 +63,8 @@ fn job_queue_counts_waiting_and_running_jobs_per_type() {
 
 #[test]
 fn job_queue_stop_waits_for_running_and_queued_work_to_drain() {
-    let queue = JobQueue::default();
+    // Jobs are dispatched manually: no background workers may race them.
+    let queue = JobQueue::new(0);
     let order = Arc::new(Mutex::new(Vec::new()));
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -114,7 +116,8 @@ fn job_queue_stop_waits_for_running_and_queued_work_to_drain() {
 
 #[test]
 fn job_queue_limit_zero_types_are_not_runnable() {
-    let queue = JobQueue::default();
+    // Manually reserved jobs: no background workers may race the counts.
+    let queue = JobQueue::new(0);
     assert!(!queue.add_job(JobType::JtPeer, "peer", || {}));
     assert_eq!(queue.job_count(JobType::JtPeer), 0);
     assert_eq!(queue.job_count_total(JobType::JtPeer), 0);
@@ -123,7 +126,8 @@ fn job_queue_limit_zero_types_are_not_runnable() {
 
 #[test]
 fn job_queue_running_job_is_fully_owned_by_the_reservation() {
-    let queue = JobQueue::default();
+    // Manually reserved jobs: no background workers may race the counts.
+    let queue = JobQueue::new(0);
     assert!(queue.add_job(JobType::JtPack, "pack", || {}));
 
     let running = queue.reserve_next_job().expect("job should be reserved");

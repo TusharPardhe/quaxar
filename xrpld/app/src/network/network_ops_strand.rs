@@ -607,6 +607,7 @@ fn strand_loop(
     // Acquired ledgers whose deep graphs are kept while the node catches up.
     let mut deferred_graph_releases: Vec<(DurableHandoffId, SessionRef, Arc<ledger::Ledger>)> =
         Vec::new();
+    let mut last_resident_trim_seq: u32 = 0;
     // Durable overflow recovery crosses the same FIFO as ordinary map
     // completions. A saturated FIFO retains these exact items here.
     let mut pending_recovered_txsets = VecDeque::new();
@@ -664,6 +665,9 @@ fn strand_loop(
         // the whole tree for every later ledger and never converged. Keep the
         // graphs until the node tracks the network, then release them all.
         let caught_up = root.network_ops_operating_mode() >= NetworkOpsOperatingMode::Tracking;
+        if root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full {
+            trim_resident_ledger_tree(&root, &mut last_resident_trim_seq);
+        }
         if caught_up && !deferred_graph_releases.is_empty() {
             tracing::info!(
                 target: "acquisition_trace",
@@ -2798,6 +2802,66 @@ fn trace_completed_inbound_handoff(
         acknowledged = persisted.acknowledged,
         "LCL trace: inbound ledger completion persisted before adoption"
     );
+}
+
+/// Ledgers between trims of the resident state tree.
+const RESIDENT_TRIM_INTERVAL: u32 = 64;
+/// How far behind the validated ledger the trimmed ledger is. Every node of a
+/// ledger this old was flushed to the NodeStore when it was built or acquired,
+/// and an old node's children are themselves old, so dropping them can only
+/// release persisted nodes.
+const RESIDENT_TRIM_LAG: u32 = 8;
+
+/// Bound the SHAMap nodes kept resident by the ledger lineage.
+///
+/// Every node read through a ledger (consensus apply, RPC, serving peers) is
+/// attached to its parent and, because unchanged inner nodes are shared by
+/// every later ledger, stays attached for the life of the lineage. rippled
+/// keeps them all, so its resident tree grows towards the whole state (about
+/// 24M nodes / 10 GiB on testnet). Quaxar already releases acquired ledgers'
+/// deep graphs for the same reason; this applies the same release to the
+/// validated lineage. Released nodes are reloaded on demand from the
+/// TreeNodeCache or the NodeStore.
+fn trim_resident_ledger_tree(root: &ApplicationRoot, last_trim_seq: &mut u32) {
+    let Some(validated) = root.validated_ledger_seq() else {
+        return;
+    };
+    if validated < last_trim_seq.saturating_add(RESIDENT_TRIM_INTERVAL) {
+        return;
+    }
+    let Some(lm_rt) = root.ledger_master_runtime() else {
+        return;
+    };
+    let target_seq = validated.saturating_sub(RESIDENT_TRIM_LAG);
+    let Some(ledger) = lm_rt
+        .ledger_master()
+        .ledger_history()
+        .get_cached_ledger_by_seq(target_seq)
+    else {
+        return;
+    };
+    *last_trim_seq = validated;
+    let generation = root
+        .node_family_full_below_cache()
+        .map(|cache| cache.generation());
+    match ledger.release_durable_map_graphs(generation, 2) {
+        Some(released) => tracing::info!(
+            target: "ledger",
+            event = "resident_tree_trimmed",
+            ledger_seq = target_seq,
+            validated_seq = validated,
+            state_full_below = released.state_full_below,
+            state_deep = released.state_deep,
+            transaction_deep = released.transaction_deep,
+            "released deep SHAMap children of the validated lineage"
+        ),
+        None => tracing::debug!(
+            target: "ledger",
+            event = "resident_tree_trim_skipped",
+            ledger_seq = target_seq,
+            "validated ledger did not satisfy graph-release guards"
+        ),
+    }
 }
 
 /// Release a durable ledger's deep SHAMap ownership only after the coordinator
