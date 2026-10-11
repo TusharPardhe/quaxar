@@ -134,4 +134,50 @@ restarts in section 1: time to `full`, NodeStore reads and writes until
 
 ## 8. Results
 
-Filled in after deployment.
+Testnet, same fjall store, `medium` node on a 4-vCPU / 31.5 GiB EC2 host.
+Probe every 5 s; raw data in `~/hot-restart/` on the server.
+
+| run | outage | time to `full` | NodeStore reads | NodeStore writes | peak jemalloc resident | peak tracked tree nodes |
+|---|---|---|---|---|---|---|
+| control, main `d223b8f9` | ~10 s | **504 s** | 26.2 M (to full) | 4.3 M | **13.9 GiB** | ≈ 30 M |
+| v1 `488909b0`, retire at Full | ~14 s | 15 s | 0.73 M (at 30 s) | – | 1.39 GiB | 0.86 M |
+| v1 `488909b0`, retire at Full | 5 min | 10 s | 8.8 M (backfill, 150 s) | 1.4 M | 5.9 GiB | 9.7 M |
+| v2 `b9507931`, retire by age | 5 min | **15 s** | 36 k (240 s) | 0.21 M | **0.67 GiB** | 73 k |
+| v2 `b9507931`, retire by age | ~10 s | **10 s** | 33 k (180 s) | 0.06 M | **0.62 GiB** | 45 k |
+
+Baseline counters (v1, 5-minute outage, first 9 s): 410,790 subtrees skipped
+for 3,596 baseline node loads, no load misses.
+
+Takeaways:
+
+- Restart time drops from ~8.5 min to 10–15 s (≈ 35–50×), and NodeStore
+  reads by ~3 orders of magnitude, matching the Dynamo bound: cost follows
+  the change since the baseline, not the state size.
+- Peak resident memory during catch-up drops from 13.9 GiB to < 0.7 GiB.
+- v1 showed that history backfill of the restart gap also needs the baseline:
+  retiring at Full let backfill rebuild 9.7 M resident nodes. v2 keeps it
+  until it ages out, which is safe by invariant B.
+
+Age retirement (v2, restart at 08:12): retired at 08:26 (`too_old`, validated
+> baseline + 256) after 2,027,392 subtree skips for 12,119 baseline node loads
+and no load misses; the node stayed `full` and RSS was 1.32 GiB afterwards.
+
+Correctness checks after v2 deploys:
+
+- `full`, `state_accounting.full.transitions == 1` after restart.
+- Validated `ledger_hash` and `account_hash` match the public testnet node on
+  31 of 31 sampled ledgers (every second ledger of the last 60).
+- `pruned_verify_last_ok = true`, `pruned_unclaimed = 0`.
+
+Pre-existing gap observed (not caused by this change): `ledger` by sequence
+or hash for a ledger in `complete_ledgers` that is no longer in the 64-entry
+ledger cache returns `lgrNotFound`, because `LedgerMaster::get_ledger_by_hash`
+only consults the cache and the closed ledger (rippled falls back to loading
+from the node store). Tracked separately.
+
+## 9. Next steps
+
+1. Children-first persistence in acquisition (Soft Updates) so a cold sync
+   on an empty store also stays bounded in RAM.
+2. Node-store fallback for `get_ledger_by_hash` / `by_seq` (section 8 gap).
+3. Re-check steady-state RSS over 24 h with the baseline-trimmed tree.
