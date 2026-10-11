@@ -109,16 +109,10 @@ impl Shards {
             .collect()
     }
 
-    /// Smallest size whose miss ratio is within `tolerance` of the curve's
-    /// best (largest-size) miss ratio: the knee beyond which more memory
-    /// buys less than `tolerance` hit ratio.
+    /// Diminishing-returns size of the miss-ratio curve (see
+    /// [`knee_of_curve`]).
     pub fn knee(&self, tolerance: f64) -> Option<u64> {
-        let curve = self.curve();
-        let best = curve.last()?.1;
-        curve
-            .iter()
-            .find(|(_, miss)| *miss <= best + tolerance)
-            .map(|(size, _)| *size)
+        knee_of_curve(&self.curve(), tolerance)
     }
 
     /// Halve all counts so the curve tracks recent behaviour.
@@ -191,6 +185,38 @@ impl SharedShards {
     }
 }
 
+/// Diminishing-returns size of a miss-ratio curve: the largest cache size
+/// reached by a doubling that still cuts the miss ratio by at least
+/// `tolerance`.
+///
+/// A miss-ratio curve is convex and non-increasing. The sizes in [`MRC_SIZES`]
+/// double at each step, so the natural unit is miss-ratio reduction *per
+/// doubling*. The target is the top of the last doubling that still earns at
+/// least `tolerance` of hit ratio; every doubling beyond it (a shallow tail)
+/// is not worth the memory, and a flat head before the steep region is skipped
+/// rather than mistaken for the stopping point. This expresses the memory
+/// objective directly (do not hold a larger cache for a gain below `tolerance`
+/// per doubling) and is well defined on a nearly straight convex curve, unlike
+/// a Kneedle elbow.
+///
+/// - No doubling gains `tolerance` (no useful reuse): the smallest size.
+/// - Every doubling gains at least `tolerance` (reuse keeps paying): the
+///   largest size.
+pub fn knee_of_curve(curve: &[(u64, f64)], tolerance: f64) -> Option<u64> {
+    if curve.is_empty() {
+        return None;
+    }
+    // Index of the top of the last doubling whose gain >= tolerance.
+    let mut target_index = 0usize;
+    for index in 1..curve.len() {
+        let gain = curve[index - 1].1 - curve[index].1;
+        if gain >= tolerance {
+            target_index = index;
+        }
+    }
+    Some(curve[target_index].0)
+}
+
 /// Render a curve as `size_k:miss` pairs for logs and RPC.
 pub fn format_curve(curve: &[(u64, f64)]) -> String {
     curve
@@ -240,5 +266,112 @@ mod tests {
         let curve = shards.curve();
         assert!(curve[0].1 < 0.15, "4k entries already catch the hot set: {}", curve[0].1);
         assert_eq!(shards.knee(0.01), Some(4_096));
+    }
+
+    #[test]
+    fn convex_sloping_nodeobject_curve_stops_at_first_weak_doubling() {
+        // Measured node-object curve after 8 h on testnet.
+        let curve = vec![
+            (4_096, 1.000),
+            (8_192, 1.000),
+            (16_384, 0.999),
+            (32_768, 0.999),
+            (65_536, 0.995),
+            (131_072, 0.963), // 65k->131k 0.032
+            (262_144, 0.934), // 0.029
+            (524_288, 0.875), // 0.059
+            (1_048_576, 0.804), // 0.071  <- last >= 0.05
+            (2_097_152, 0.778), // 0.026
+            (4_194_304, 0.757), // 0.021
+            (8_388_608, 0.757), // 0.0
+        ];
+        // Last doubling earning >= 0.05 is 524k->1M, so 1M. Far below the 4M
+        // the old within-tolerance rule chose.
+        assert_eq!(knee_of_curve(&curve, 0.05), Some(1_048_576));
+        // A looser budget keeps paying further out.
+        assert_eq!(knee_of_curve(&curve, 0.02), Some(4_194_304));
+    }
+
+    #[test]
+    fn convex_sloping_treenode_curve_last_strong_doubling() {
+        // Measured tree-node curve after 8 h on testnet.
+        let curve = vec![
+            (4_096, 0.527),
+            (8_192, 0.523),
+            (16_384, 0.518),
+            (32_768, 0.515),
+            (65_536, 0.511),
+            (131_072, 0.492), // 0.019
+            (262_144, 0.475), // 0.017
+            (524_288, 0.447), // 0.028
+            (1_048_576, 0.413), // 0.034
+            (2_097_152, 0.386), // 0.027
+            (4_194_304, 0.345), // 0.041  <- last >= 0.03
+            (8_388_608, 0.345), // 0.0
+        ];
+        // This curve keeps paying ~0.03 per doubling into the millions, so at a
+        // 0.03 budget the last strong doubling reaches 4M. A tighter budget of
+        // 0.05 finds no qualifying doubling and keeps the cache minimal.
+        assert_eq!(knee_of_curve(&curve, 0.03), Some(4_194_304));
+        assert_eq!(knee_of_curve(&curve, 0.05), Some(4_096));
+    }
+
+    #[test]
+    fn flat_curve_with_no_reuse_picks_the_minimum() {
+        let curve = vec![
+            (4_096, 0.998),
+            (8_192, 0.997),
+            (16_384, 0.997),
+            (32_768, 0.996),
+            (65_536, 0.996),
+            (131_072, 0.995),
+            (262_144, 0.995),
+            (524_288, 0.994),
+            (1_048_576, 0.994),
+            (2_097_152, 0.993),
+            (4_194_304, 0.993),
+            (8_388_608, 0.993),
+        ];
+        assert_eq!(knee_of_curve(&curve, 0.02), Some(4_096));
+    }
+
+    #[test]
+    fn sharp_step_curve_picks_the_working_set_size() {
+        // A clean step at 256k: the only doubling above tolerance is
+        // 131k->256k, so the target is 256k even though it has a flat head.
+        let curve = vec![
+            (4_096, 1.0),
+            (8_192, 1.0),
+            (16_384, 1.0),
+            (32_768, 1.0),
+            (65_536, 1.0),
+            (131_072, 1.0),
+            (262_144, 0.02),
+            (524_288, 0.01),
+            (1_048_576, 0.01),
+            (2_097_152, 0.01),
+            (4_194_304, 0.01),
+            (8_388_608, 0.01),
+        ];
+        assert_eq!(knee_of_curve(&curve, 0.02), Some(262_144));
+    }
+
+    #[test]
+    fn curve_that_always_pays_returns_the_maximum() {
+        let curve = vec![
+            (4_096, 0.80),
+            (8_192, 0.60),
+            (16_384, 0.45),
+            (32_768, 0.33),
+            (65_536, 0.24),
+            (131_072, 0.17),
+            (262_144, 0.12),
+            (524_288, 0.08),
+            (1_048_576, 0.05),
+            (2_097_152, 0.03),
+            (4_194_304, 0.015),
+            (8_388_608, 0.0),
+        ];
+        assert_eq!(knee_of_curve(&curve, 0.01), Some(8_388_608));
     }
 }

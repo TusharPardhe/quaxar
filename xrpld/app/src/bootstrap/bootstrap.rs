@@ -73,9 +73,20 @@ fn trim_after_application_sweep() -> MallocTrimReport {
     trim_after_application_sweep_with(|tag| malloc_trim(tag, &SweepMallocTrimLogger))
 }
 
-/// Miss-ratio tolerance for the cache knee: past the chosen size, extra cache
-/// would lower the miss ratio by less than this.
-const MRC_TOLERANCE: f64 = 0.02;
+/// Miss-ratio tolerance for the cache knee: a cache doubling is kept only if it
+/// cuts the miss ratio by at least this much. 0.03 means "a doubling of cache
+/// memory must buy at least 3 points of hit ratio". `QUAXAR_MRC_TOLERANCE`
+/// overrides it.
+fn mrc_tolerance() -> f64 {
+    static TOLERANCE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *TOLERANCE.get_or_init(|| {
+        std::env::var("QUAXAR_MRC_TOLERANCE")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| *value > 0.0 && *value < 1.0)
+            .unwrap_or(0.03)
+    })
+}
 /// Never size the TreeNodeCache below this many entries.
 const TREE_CACHE_MRC_MIN: usize = 65_536;
 /// Never size the NodeObject cache below this many bytes.
@@ -109,7 +120,7 @@ fn size_caches_from_mrc(root: &ApplicationRoot) {
             Ordering::Relaxed,
         );
         let configured = CONFIGURED.load(Ordering::Relaxed);
-        let (curve, samples, knee) = shamap::access_mrc::snapshot(MRC_TOLERANCE);
+        let (curve, samples, knee) = shamap::access_mrc::snapshot(mrc_tolerance());
         let target = match knee {
             Some(knee) if enabled && full && samples >= MRC_MIN_SAMPLES => {
                 (knee as usize).clamp(TREE_CACHE_MRC_MIN, configured.max(TREE_CACHE_MRC_MIN))
@@ -136,7 +147,7 @@ fn size_caches_from_mrc(root: &ApplicationRoot) {
         root.node_store().as_ref()
     {
         let (configured, live, entries, weighted) = database.node_object_cache_sizing();
-        let (curve, samples, knee) = nodestore::node_object_mrc::snapshot(MRC_TOLERANCE);
+        let (curve, samples, knee) = nodestore::node_object_mrc::snapshot(mrc_tolerance());
         // Convert the knee (entries) to bytes with the measured mean entry size.
         let mean = if entries > 0 { (weighted / entries).max(1) } else { 512 };
         let target = match knee {
