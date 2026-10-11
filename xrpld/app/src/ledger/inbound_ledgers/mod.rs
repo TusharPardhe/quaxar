@@ -126,3 +126,9 @@ impl<C> InboundLedgersLocal<C> {
         self.ledgers.remove(&key)
     }
 }
+
+/// Inner nodes whose loaded children were released once their subtree was
+/// durable (children-first release during acquisition).
+pub fn durable_release_count() -> u64 {
+    coordinator_engine::durable_release_count()
+}

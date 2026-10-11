@@ -2907,6 +2907,7 @@ fn release_processed_durable_graphs(
             transaction_full_below = released.transaction_full_below,
             transaction_deep = released.transaction_deep,
             released_total = released.total(),
+            durable_release_count = crate::ledger::inbound_ledgers::durable_release_count(),
             "released durable acquired SHAMap child graphs after coordinator acknowledgement"
         );
     } else {

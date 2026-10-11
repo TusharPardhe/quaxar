@@ -59,6 +59,33 @@ type AppFamily = SHAMapFamily<
     (),
 >;
 
+/// Children-first durable release (Soft Updates ordering, Ganger et al.,
+/// ACM TOCS 2000): a FullBelow marker is published only once the node and its
+/// whole subtree are durable, so the node's loaded children can be dropped.
+/// The node itself stays attached with its full-below generation, so every
+/// traversal still skips it; any later reader reloads children from the
+/// TreeNodeCache or NodeStore through the parent's child hashes. This bounds
+/// acquisition memory by the in-flight frontier instead of the whole tree.
+fn release_durable_complete_subtree(node: &SharedIntrusive<SHAMapTreeNode>) {
+    if node.is_inner() && node.cowid() == 0 && durable_release_enabled() {
+        node.release_loaded_children();
+        DURABLE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+static DURABLE_RELEASES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Inner nodes whose children were released by durable-complete release.
+pub(crate) fn durable_release_count() -> u64 {
+    DURABLE_RELEASES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `QUAXAR_DURABLE_RELEASE=0` disables the release (A/B measurement).
+fn durable_release_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("QUAXAR_DURABLE_RELEASE").map_or(true, |v| v != "0"))
+}
+
 /// Resident lookup over the shared caches and the fetch-pack, matching the
 /// actor's `ActorResident` semantics plus rippled `checkLocal`'s by-hash
 /// fetch-pack resolution. `is_full_below`/`mark_full_below` are retained so an
@@ -141,6 +168,7 @@ impl MissingNodeResidentLookup for AppResident<'_> {
         } else {
             node.set_full_below_gen(generation);
             self.shared_full_below.insert(hash);
+            release_durable_complete_subtree(&node);
         }
     }
 }
@@ -284,6 +312,7 @@ impl AppLedgerPlanEngine {
         for (hash, (node, generation)) in markers {
             node.set_full_below_gen(generation);
             self.full_below.insert(hash);
+            release_durable_complete_subtree(&node);
         }
         // This fires once per accepted NodeStore write batch. During a large
         // recovery acquisition that is many times per second, so emitting it
@@ -1793,6 +1822,55 @@ mod tests {
             shared.insert(marker);
         }
         assert!(shared.touch_if_exists(*hash.as_uint256()));
+    }
+
+    #[test]
+    fn durable_full_below_marker_releases_loaded_children_but_keeps_node() {
+        let cache = TreeNodeCache::new(
+            "durable-release-test",
+            8,
+            Duration::seconds(60),
+            MonotonicClock::default(),
+        );
+        let shared = FullBelowCacheImpl::new(
+            1,
+            MonotonicClock::default(),
+            HardenedHashBuilder::default(),
+            8,
+        );
+        let fetch_pack = FetchPackCache::new(8, Duration::seconds(60), MonotonicClock::default());
+        let leaf = SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from(0xE1), vec![7; 32]),
+            1,
+        );
+        let mut parent = SHAMapTreeNode::new_inner(1);
+        parent.set_child(3, Some(leaf));
+        parent.update_hash();
+        parent.unshare();
+        let hash = parent.get_hash();
+        cache.canonicalize_replace_client(hash.as_uint256(), &mut parent);
+        assert!(parent.has_any_loaded_child());
+
+        let mut staged = BTreeMap::new();
+        let mut store = WorkerStore::default();
+        {
+            let mut resident = AppResident {
+                cache: &cache,
+                shared_full_below: &shared,
+                pending_full_below: &mut staged,
+                fetch_pack: &fetch_pack,
+                store: &mut store,
+                kind: TreeKind::State,
+                baseline: None,
+            };
+            // No pending writes: the marker is durable and published at once.
+            resident.mark_full_below(parent.clone(), 1);
+        }
+        assert!(shared.touch_if_exists(*hash.as_uint256()));
+        assert!(parent.is_full_below(1), "node keeps its full-below generation");
+        assert!(!parent.has_any_loaded_child(), "durable subtree children released");
+        assert!(!parent.is_empty_branch(3), "child hash retained for reload");
     }
 
     #[test]
