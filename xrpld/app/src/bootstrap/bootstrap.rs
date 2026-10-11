@@ -75,51 +75,96 @@ fn trim_after_application_sweep() -> MallocTrimReport {
 
 /// Miss-ratio tolerance for the cache knee: past the chosen size, extra cache
 /// would lower the miss ratio by less than this.
-const TREE_CACHE_MRC_TOLERANCE: f64 = 0.02;
+const MRC_TOLERANCE: f64 = 0.02;
 /// Never size the TreeNodeCache below this many entries.
 const TREE_CACHE_MRC_MIN: usize = 65_536;
+/// Never size the NodeObject cache below this many bytes.
+const NODE_OBJECT_CACHE_MRC_MIN_BYTES: u64 = 64 << 20;
+/// Sampled references needed before a curve is trusted.
+const MRC_MIN_SAMPLES: u64 = 20_000;
 
-/// Size the TreeNodeCache from its measured miss-ratio curve (SHARDS,
-/// Waldspurger et al., FAST 2015) instead of the fixed `node_size` constant:
-/// the target becomes the knee of the curve, capped by the configured size.
-/// `QUAXAR_MRC_CACHE=0` keeps the configured size (the curve is still logged).
-fn size_tree_cache_from_mrc(root: &ApplicationRoot) {
+/// Size the TreeNodeCache and NodeObject cache from their measured
+/// miss-ratio curves (SHARDS, Waldspurger et al., FAST 2015) instead of fixed
+/// `node_size` constants. Sampling runs only while the node is full, so the
+/// one-off sync workload neither pays for it nor shapes the steady-state
+/// curve. Each cache target becomes its curve's knee, capped by the configured
+/// size; the OS page cache keeps serving the rest of the store.
+/// `QUAXAR_MRC_CACHE=0` keeps the configured sizes (curves are still logged).
+fn size_caches_from_mrc(root: &ApplicationRoot) {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     static SWEEPS: AtomicU64 = AtomicU64::new(0);
     static CONFIGURED: AtomicUsize = AtomicUsize::new(0);
-    let Some(cache) = root.shared_tree_cache() else {
-        return;
-    };
-    let _ = CONFIGURED.compare_exchange(0, cache.target_size(), Ordering::Relaxed, Ordering::Relaxed);
-    let configured = CONFIGURED.load(Ordering::Relaxed);
-    let (curve, samples, knee) = shamap::access_mrc::snapshot(TREE_CACHE_MRC_TOLERANCE);
-    let enabled = !std::env::var("QUAXAR_MRC_CACHE").is_ok_and(|value| value == "0");
     let full = root.network_ops_operating_mode() == crate::NetworkOpsOperatingMode::Full;
-    // Only resize from a curve with enough samples, and only once the node
-    // follows the network (sync has a different, transient access pattern).
-    let target = match knee {
-        Some(knee) if enabled && full && samples >= 5_000 => {
-            (knee as usize).clamp(TREE_CACHE_MRC_MIN, configured.max(TREE_CACHE_MRC_MIN))
+    shamap::access_mrc::set_enabled(full);
+    nodestore::node_object_mrc::set_enabled(full);
+    let enabled = !std::env::var("QUAXAR_MRC_CACHE").is_ok_and(|value| value == "0");
+
+    if let Some(cache) = root.shared_tree_cache() {
+        let _ = CONFIGURED.compare_exchange(
+            0,
+            cache.target_size(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        let configured = CONFIGURED.load(Ordering::Relaxed);
+        let (curve, samples, knee) = shamap::access_mrc::snapshot(MRC_TOLERANCE);
+        let target = match knee {
+            Some(knee) if enabled && full && samples >= MRC_MIN_SAMPLES => {
+                (knee as usize).clamp(TREE_CACHE_MRC_MIN, configured.max(TREE_CACHE_MRC_MIN))
+            }
+            _ => configured,
+        };
+        if target != cache.target_size() {
+            cache.set_target_size(target);
         }
-        _ => configured,
-    };
-    if target != cache.target_size() {
-        cache.set_target_size(target);
+        tracing::info!(
+            target: "app",
+            event = "tree_cache_mrc",
+            samples,
+            knee = knee.unwrap_or(0),
+            target,
+            configured,
+            cache_size = cache.size(),
+            curve = %basics::sync::shards::format_curve(&curve),
+            "TreeNodeCache miss-ratio curve"
+        );
     }
-    let points = basics::sync::shards::format_curve(&curve);
-    tracing::info!(
-        target: "app",
-        event = "tree_cache_mrc",
-        samples,
-        knee = knee.unwrap_or(0),
-        target,
-        configured,
-        cache_size = cache.size(),
-        curve = %points,
-        "TreeNodeCache miss-ratio curve"
-    );
+
+    if let Some(crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(database)) =
+        root.node_store().as_ref()
+    {
+        let (configured, live, entries, weighted) = database.node_object_cache_sizing();
+        let (curve, samples, knee) = nodestore::node_object_mrc::snapshot(MRC_TOLERANCE);
+        // Convert the knee (entries) to bytes with the measured mean entry size.
+        let mean = if entries > 0 { (weighted / entries).max(1) } else { 512 };
+        let target = match knee {
+            Some(knee) if enabled && full && samples >= MRC_MIN_SAMPLES => knee
+                .saturating_mul(mean)
+                .clamp(NODE_OBJECT_CACHE_MRC_MIN_BYTES, configured.max(NODE_OBJECT_CACHE_MRC_MIN_BYTES)),
+            _ => configured,
+        };
+        // Resize only on a >25% change: a resize drops the cache contents.
+        if target.abs_diff(live) > live / 4 {
+            database.resize_node_object_cache_bytes(target);
+        }
+        tracing::info!(
+            target: "app",
+            event = "node_object_cache_mrc",
+            samples,
+            knee = knee.unwrap_or(0),
+            mean_entry_bytes = mean,
+            target_bytes = target,
+            live_bytes = live,
+            configured_bytes = configured,
+            entries,
+            curve = %basics::sync::shards::format_curve(&curve),
+            "NodeObject cache miss-ratio curve"
+        );
+    }
+
     if SWEEPS.fetch_add(1, Ordering::Relaxed) % 10 == 9 {
         shamap::access_mrc::decay();
+        nodestore::node_object_mrc::decay();
     }
 }
 
@@ -171,7 +216,7 @@ impl ApplicationSweepActions for ProductionApplicationSweep<'_> {
     }
 
     fn sweep_node_family(&self) {
-        size_tree_cache_from_mrc(self.root);
+        size_caches_from_mrc(self.root);
         let before_size = self
             .root
             .shared_tree_cache()

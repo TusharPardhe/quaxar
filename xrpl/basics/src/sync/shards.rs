@@ -137,6 +137,7 @@ impl Shards {
 pub struct SharedShards {
     rate: f64,
     max_tracked: usize,
+    enabled: std::sync::atomic::AtomicBool,
     inner: std::sync::OnceLock<std::sync::Mutex<Shards>>,
 }
 
@@ -145,8 +146,16 @@ impl SharedShards {
         Self {
             rate,
             max_tracked,
+            enabled: std::sync::atomic::AtomicBool::new(false),
             inner: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Sampling is off until enabled, so a transient workload (initial sync)
+    /// neither costs anything nor distorts the steady-state curve.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn get(&self) -> &std::sync::Mutex<Shards> {
@@ -155,6 +164,9 @@ impl SharedShards {
     }
 
     pub fn record(&self, key_hash: u64) {
+        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let threshold = ((self.rate * MODULUS as f64) as u64).max(1);
         if key_hash % MODULUS >= threshold {
             return;

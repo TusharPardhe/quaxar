@@ -18,6 +18,10 @@ pub use database_runtime::journal;
 pub use database_runtime::manager;
 pub use database_runtime::scheduler;
 pub use database_runtime::task;
+/// Miss-ratio-curve sampling of NodeObject lookups.
+pub mod node_object_mrc {
+    pub use crate::database_runtime::node_object_cache::{mrc_decay as decay, mrc_snapshot as snapshot, set_mrc_enabled as set_enabled};
+}
 pub use format::codec;
 pub use format::node_object;
 pub use format::types;

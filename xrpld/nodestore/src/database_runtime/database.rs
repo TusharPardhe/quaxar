@@ -229,6 +229,15 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
 
     fn get_counts_json(&self) -> JsonValue;
 
+    /// Resize the NodeObject cache (no-op for stores without one).
+    fn resize_node_object_cache_bytes(&self, _bytes: u64) {}
+
+    /// `(configured bytes, live bytes, entries, weighted bytes)` of the
+    /// NodeObject cache; zeros for stores without one.
+    fn node_object_cache_sizing(&self) -> (u64, u64, u64, u64) {
+        (0, 0, 0, 0)
+    }
+
     fn fd_required(&self) -> i32;
 
     /// Returns the primary backend for snapshot export.
@@ -889,6 +898,18 @@ impl DatabaseRuntime {
 
     pub fn get_fetch_size(&self) -> u64 {
         self.inner.fetch_size.load(Ordering::Relaxed)
+    }
+
+    /// Resize the NodeObject cache to `bytes` (used by miss-ratio-curve sizing).
+    pub fn resize_node_object_cache_bytes(&self, bytes: u64) {
+        self.inner.node_object_cache.resize_capacity_bytes(bytes);
+    }
+
+    /// `(configured bytes, live bytes, entries, weighted bytes)`.
+    pub fn node_object_cache_sizing(&self) -> (u64, u64, u64, u64) {
+        let cache = &self.inner.node_object_cache;
+        let (entries, weighted) = cache.entries_and_weighted_bytes();
+        (cache.configured_capacity_bytes(), cache.capacity_bytes_live(), entries, weighted)
     }
 
     pub fn add_counts_json(&self, obj: &mut BTreeMap<String, JsonValue>) {

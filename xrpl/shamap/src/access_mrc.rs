@@ -7,8 +7,14 @@
 use basics::sha_map_hash::SHAMapHash;
 use basics::sync::shards::SharedShards;
 
-/// 1 in 1024 lookups sampled; at most 64k sampled keys tracked.
-static SAMPLER: SharedShards = SharedShards::new(1.0 / 1024.0, 65_536);
+/// 1 in 64 lookups sampled; at most 64k sampled keys tracked (scaled reach
+/// 4M entries, beyond the largest configured cache).
+static SAMPLER: SharedShards = SharedShards::new(1.0 / 64.0, 65_536);
+
+/// Enable or disable sampling (enabled only while the node is full).
+pub fn set_enabled(enabled: bool) {
+    SAMPLER.set_enabled(enabled);
+}
 
 /// Record one decoded-node lookup. Takes the lock only for sampled keys.
 pub fn record(hash: SHAMapHash) {

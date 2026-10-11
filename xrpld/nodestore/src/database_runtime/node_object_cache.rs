@@ -56,7 +56,7 @@ enum CacheLoadError {
 }
 
 enum CacheStorage {
-    Enabled(Cache<Uint256, Arc<NodeObject>>),
+    Enabled(arc_swap::ArcSwap<Cache<Uint256, Arc<NodeObject>>>),
 }
 
 #[cfg(test)]
@@ -145,6 +145,24 @@ mod tests {
     }
 
     #[test]
+    fn resize_bounds_weighted_bytes_and_keeps_serving_loads() {
+        let mut config = Section::new("node_db");
+        config.set("node_object_cache_capacity_bytes", "1048576");
+        let cache = NodeObjectCache::from_config(&config).expect("cache");
+        cache.resize_capacity_bytes(4096);
+        assert_eq!(cache.capacity_bytes_live(), 4096);
+        assert_eq!(cache.configured_capacity_bytes(), 1_048_576);
+        for byte in 0..64u8 {
+            let hash = Uint256::from_array([byte; 32]);
+            let object = Arc::new(NodeObject::new(NodeObjectType::AccountNode, vec![byte; 96], hash));
+            let loaded = cache.get_or_load(hash, || Some(Arc::clone(&object)));
+            assert_eq!(loaded.expect("loaded").data(), object.data());
+        }
+        cache.run_pending_tasks();
+        assert!(cache.weighted_size() <= 4096, "{}", cache.weighted_size());
+    }
+
+    #[test]
     fn invalidation_during_loader_does_not_repopulate_cache() {
         let cache = NodeObjectCache::from_config(&Section::new("node_db")).expect("cache");
         let hash = Uint256::from_array([0xD1; 32]);
@@ -168,9 +186,24 @@ mod tests {
 /// Owns Moka and applies weighted LRU admission over immutable encoded
 /// NodeObjects. It retains counters and a generation fence so an invalidation
 /// cannot be repopulated by a load that began before it.
-/// Sampled reuse distances of NodeObject lookups (1 in 1024 hashes).
+/// Sampled reuse distances of NodeObject lookups (1 in 64 hashes).
 static NODE_OBJECT_MRC: basics::sync::shards::SharedShards =
-    basics::sync::shards::SharedShards::new(1.0 / 1024.0, 65_536);
+    basics::sync::shards::SharedShards::new(1.0 / 64.0, 65_536);
+
+/// Enable or disable NodeObject lookup sampling.
+pub fn set_mrc_enabled(enabled: bool) {
+    NODE_OBJECT_MRC.set_enabled(enabled);
+}
+
+/// `(curve, sampled references, knee)` of NodeObject lookups.
+pub fn mrc_snapshot(tolerance: f64) -> (Vec<(u64, f64)>, u64, Option<u64>) {
+    NODE_OBJECT_MRC.snapshot(tolerance)
+}
+
+/// Halve the NodeObject lookup history.
+pub fn mrc_decay() {
+    NODE_OBJECT_MRC.decay();
+}
 
 pub(crate) struct NodeObjectCache {
     storage: CacheStorage,
@@ -181,6 +214,8 @@ pub(crate) struct NodeObjectCache {
     /// Moka's byte-weighted admission capacity. `capacity_entries` remains a
     /// compatibility planning counter rather than a second eviction limit.
     capacity_bytes: u64,
+    /// Current byte capacity; differs from `capacity_bytes` after a resize.
+    capacity_bytes_live: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
     durable_loads: AtomicU64,
@@ -285,7 +320,8 @@ impl NodeObjectCache {
         }
 
         Ok(Self {
-            storage: CacheStorage::Enabled(builder.build()),
+            storage: CacheStorage::Enabled(arc_swap::ArcSwap::from_pointee(builder.build())),
+            capacity_bytes_live: AtomicU64::new(capacity_bytes),
             max_entry_bytes,
             capacity_entries: entry_capacity,
             idle_seconds,
@@ -315,7 +351,8 @@ impl NodeObjectCache {
             hash.data()[..8].try_into().expect("8 bytes"),
         ));
         match &self.storage {
-            CacheStorage::Enabled(cache) => {
+            CacheStorage::Enabled(slot) => {
+                let cache = slot.load();
                 if let Some(object) = cache.get(&hash) {
                     if object.hash() == &hash {
                         self.hits.fetch_add(1, Ordering::Relaxed);
@@ -373,13 +410,53 @@ impl NodeObjectCache {
     /// Promote only a valid, reasonably sized positive object. Store callers
     /// invoke this after their backend write returns normally.
     pub(crate) fn promote(&self, object: Arc<NodeObject>) {
-        let CacheStorage::Enabled(cache) = &self.storage;
+        let CacheStorage::Enabled(slot) = &self.storage;
+        let cache = slot.load();
         if object.data().len() > self.max_entry_bytes {
             self.oversized.fetch_add(1, Ordering::Relaxed);
             return;
         }
         cache.insert(*object.hash(), object);
         self.promotions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Replace the cache with one of `bytes` capacity (same eviction policy
+    /// and idle/TTL). Contents are dropped; callers resize only when the
+    /// measured miss-ratio curve shows the current contents earn little.
+    pub(crate) fn resize_capacity_bytes(&self, bytes: u64) {
+        let bytes = bytes.max(1);
+        if self.capacity_bytes_live.swap(bytes, Ordering::AcqRel) == bytes {
+            return;
+        }
+        let mut builder = Cache::builder()
+            .name("node-object-cache")
+            .max_capacity(bytes)
+            .weigher(node_object_cache_entry_weight)
+            .eviction_policy(EvictionPolicy::lru());
+        if self.idle_seconds > 0 {
+            builder = builder.time_to_idle(std::time::Duration::from_secs(self.idle_seconds));
+        }
+        if self.ttl_seconds > 0 {
+            builder = builder.time_to_live(std::time::Duration::from_secs(self.ttl_seconds));
+        }
+        // Fence in-flight loads exactly like invalidate_all.
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        let CacheStorage::Enabled(slot) = &self.storage;
+        slot.store(Arc::new(builder.build()));
+    }
+
+    pub(crate) fn configured_capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
+    }
+
+    pub(crate) fn capacity_bytes_live(&self) -> u64 {
+        self.capacity_bytes_live.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn entries_and_weighted_bytes(&self) -> (u64, u64) {
+        let CacheStorage::Enabled(slot) = &self.storage;
+        let cache = slot.load();
+        (cache.entry_count(), cache.weighted_size())
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -393,21 +470,23 @@ impl NodeObjectCache {
     #[allow(dead_code)]
     pub(crate) fn invalidate_all(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
-        let CacheStorage::Enabled(cache) = &self.storage;
+        let CacheStorage::Enabled(slot) = &self.storage;
+        let cache = slot.load();
         cache.invalidate_all();
         self.invalidations.fetch_add(1, Ordering::Relaxed);
     }
 
     #[cfg(test)]
     fn run_pending_tasks(&self) {
-        let CacheStorage::Enabled(cache) = &self.storage;
+        let CacheStorage::Enabled(slot) = &self.storage;
+        let cache = slot.load();
         cache.run_pending_tasks();
     }
 
     #[cfg(test)]
     fn weighted_size(&self) -> u64 {
         match &self.storage {
-            CacheStorage::Enabled(cache) => cache.weighted_size(),
+            CacheStorage::Enabled(slot) => slot.load().weighted_size(),
         }
     }
 
@@ -440,7 +519,8 @@ impl NodeObjectCache {
             );
         }
         {
-            let CacheStorage::Enabled(cache) = &self.storage;
+            let CacheStorage::Enabled(slot) = &self.storage;
+        let cache = slot.load();
             obj.insert(
                 "node_object_cache_eviction_policy".to_owned(),
                 JsonValue::String(NODE_OBJECT_CACHE_EVICTION_POLICY.to_owned()),
@@ -470,7 +550,7 @@ impl NodeObjectCache {
             );
             obj.insert(
                 "node_object_cache_weighted_capacity_bytes".to_owned(),
-                JsonValue::String(self.capacity_bytes.to_string()),
+                JsonValue::String(self.capacity_bytes_live().to_string()),
             );
             obj.insert(
                 "node_object_cache_weighted_size_bytes".to_owned(),

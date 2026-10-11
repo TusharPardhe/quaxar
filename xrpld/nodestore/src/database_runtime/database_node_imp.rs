@@ -390,6 +390,14 @@ impl DatabaseTrait for DatabaseNodeImp {
         DatabaseNodeImp::add_counts_json(self, obj);
     }
 
+    fn resize_node_object_cache_bytes(&self, bytes: u64) {
+        self.database.resize_node_object_cache_bytes(bytes);
+    }
+
+    fn node_object_cache_sizing(&self) -> (u64, u64, u64, u64) {
+        self.database.node_object_cache_sizing()
+    }
+
     fn get_counts_json(&self) -> JsonValue {
         DatabaseNodeImp::get_counts_json(self)
     }
