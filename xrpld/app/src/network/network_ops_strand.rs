@@ -665,22 +665,18 @@ fn strand_loop(
         // the whole tree for every later ledger and never converged. Keep the
         // graphs until the node tracks the network, then release them all.
         let caught_up = root.network_ops_operating_mode() >= NetworkOpsOperatingMode::Tracking;
-        // The committed baseline is only trusted while catching up and well
-        // inside the prune window: its nodes die as newer ledgers are claimed
-        // and become prunable `online_delete` ledgers later.
+        // The committed baseline is only trusted well inside the prune window:
+        // its nodes die as newer ledgers are claimed and become prunable
+        // `online_delete` ledgers later.
         if let Some(baseline) = crate::ledger::inbound_ledgers::trusted_baseline::active() {
             let too_old = root
                 .validated_ledger_seq()
                 .is_some_and(|validated| validated > baseline.seq().saturating_add(TRUSTED_BASELINE_MAX_AGE));
-            // Startup briefly reports tracking from the stub ledger, so only a
-            // real Full retires it.
-            let full = root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full;
-            if full || too_old {
-                crate::ledger::inbound_ledgers::trusted_baseline::retire(if full {
-                    "full"
-                } else {
-                    "too_old"
-                });
+            // Kept past Full: history backfill of the restart gap and of the
+            // retained window also diverges little from the baseline. It is
+            // safe until its nodes could be pruned (section 3 of the design).
+            if too_old {
+                crate::ledger::inbound_ledgers::trusted_baseline::retire("too_old");
             }
         }
         if root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full {
