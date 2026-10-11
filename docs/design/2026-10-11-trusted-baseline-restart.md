@@ -1,7 +1,7 @@
 # Trusted committed baseline for restart catch-up
 
 Status: implemented on branch `perf/trusted-baseline-restart` (not merged).
-Results: see section 8.
+Results: see section 9.
 
 ## 1. Problem
 
@@ -65,7 +65,48 @@ From `xrpld/nodestore/src/pruned` and `xrpld/app/src/shamap/pruned_driver.rs`:
 ledgers are claimed and are deleted no earlier than `online_delete` (512)
 ledgers after that.
 
-## 4. Design
+## 4. Example
+
+Each box holds the hash of everything below it, so equal hashes at the same
+position mean identical subtrees.
+
+```
+Ledger 100: last claimed, complete on disk     Ledger 105: network now (only Bob changed)
+              [R100]                                        [R105]
+          /     |     \                                 /     |     \
+       [A]     [B]     [C]                           [A]    [B']    [C]
+       / \     / \     / \                           / \     / \     / \
+     Ali Ann Bob Bea Cat Cal                       Ali Ann Bob' Bea Cat Cal
+```
+
+Before: a restart read and loaded every node of ledger 105 (10 nodes here,
+about 30 M on testnet).
+
+After: walk ledger 105 against the baseline at the same positions.
+
+```
+   R105 vs R100 -> differ -> descend
+     A  vs A    -> same   -> skip (subtree complete on disk, never read)
+     B' vs B    -> differ -> descend
+       Bob' vs Bob -> differ -> read Bob'
+       Bea  vs Bea -> same   -> skip
+     C  vs C    -> same   -> skip
+
+              [R105]
+          /     |     \
+     (A skip) [B']  (C skip)
+               / \
+           [Bob'] (Bea skip)
+```
+
+Only the changed path is read: 3 reads here instead of 10.
+
+```
+ baseline claimed --> used for skipping --> retired at +256 --> nodes prunable at +512
+                      |---- safe window ----|
+```
+
+## 5. Design
 
 ```
 startup ── read claimed (seq, root) ── install TrustedBaseline
@@ -106,7 +147,7 @@ startup ── read claimed (seq, root) ── install TrustedBaseline
 | `xrpld/app/src/shamap/shamap_store_component.rs` | `pruned_driver()` accessor |
 | `xrpld/app/src/network/network_ops_strand.rs` | retire at `full` or when too old |
 
-## 5. What this does not change
+## 6. What this does not change
 
 - Cold sync (empty store) still materializes the tree. Bounded-RAM cold sync
   needs children-first persistence (Soft Updates applied to acquisition
@@ -114,7 +155,7 @@ startup ── read claimed (seq, root) ── install TrustedBaseline
 - Steady-state RAM is unchanged (resident trim from #89 still applies).
 - Fresh-store behaviour: no claimed root, so no baseline.
 
-## 6. Failure modes considered
+## 7. Failure modes considered
 
 | case | handling |
 |---|---|
@@ -124,7 +165,7 @@ startup ── read claimed (seq, root) ── install TrustedBaseline
 | baseline node unreadable | treated as divergent; normal path |
 | target on a fork | still correct: equal hash ⇒ equal subtree |
 
-## 7. Measurement plan
+## 8. Measurement plan
 
 Hot restarts on the same testnet store, probe every 5 s
 (`server_info`, `fetch_info`, `get_counts`), compared with the six baseline
@@ -132,7 +173,7 @@ restarts in section 1: time to `full`, NodeStore reads and writes until
 `full`, peak jemalloc resident, peak tracked tree nodes, baseline skips/loads
 (`trusted_baseline_retired` log event).
 
-## 8. Results
+## 9. Results
 
 Testnet, same fjall store, `medium` node on a 4-vCPU / 31.5 GiB EC2 host.
 Probe every 5 s; raw data in `~/hot-restart/` on the server.
@@ -175,9 +216,9 @@ ledger cache returns `lgrNotFound`, because `LedgerMaster::get_ledger_by_hash`
 only consults the cache and the closed ledger (rippled falls back to loading
 from the node store). Tracked separately.
 
-## 9. Next steps
+## 10. Next steps
 
 1. Children-first persistence in acquisition (Soft Updates) so a cold sync
    on an empty store also stays bounded in RAM.
-2. Node-store fallback for `get_ledger_by_hash` / `by_seq` (section 8 gap).
+2. Node-store fallback for `get_ledger_by_hash` / `by_seq` (section 9 gap).
 3. Re-check steady-state RSS over 24 h with the baseline-trimmed tree.
