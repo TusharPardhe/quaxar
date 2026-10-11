@@ -370,7 +370,7 @@ pub struct TaggedCache<
     SP = Arc<T>,
 > {
     name: String,
-    target_size: usize,
+    target_size: std::sync::atomic::AtomicUsize,
     target_age: Duration,
     clock: C,
     instrumentation: TaggedCacheInstrumentation,
@@ -384,7 +384,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaggedCache")
             .field("name", &self.name)
-            .field("target_size", &self.target_size)
+            .field("target_size", &self.target_size.load(std::sync::atomic::Ordering::Relaxed))
             .field("target_age", &self.target_age)
             .field("clock", &self.clock)
             .finish_non_exhaustive()
@@ -426,7 +426,7 @@ where
     ) -> Self {
         Self {
             name: name.into(),
-            target_size: size,
+            target_size: std::sync::atomic::AtomicUsize::new(size),
             target_age: expiration,
             clock,
             instrumentation: TaggedCacheInstrumentation::default(),
@@ -450,7 +450,7 @@ where
     ) -> Self {
         Self {
             name: name.into(),
-            target_size: size,
+            target_size: std::sync::atomic::AtomicUsize::new(size),
             target_age: expiration,
             clock,
             instrumentation: TaggedCacheInstrumentation { metrics, logger },
@@ -467,8 +467,15 @@ where
         &self.name
     }
 
-    pub const fn target_size(&self) -> usize {
+    pub fn target_size(&self) -> usize {
+        self.target_size.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Change the retention target at runtime (e.g. from a measured
+    /// miss-ratio curve). Takes effect at the next sweep.
+    pub fn set_target_size(&self, size: usize) {
         self.target_size
+            .store(size, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub const fn target_age(&self) -> Duration {
@@ -615,14 +622,14 @@ where
                 .expect("TaggedCache mutex must not be poisoned");
             let lock_hold_start = Instant::now();
             let when_expire =
-                expiration_cutoff(now, self.target_age, self.target_size, state.cache.len());
+                expiration_cutoff(now, self.target_age, self.target_size(), state.cache.len());
 
-            if self.target_size != 0 && state.cache.len() > self.target_size {
+            if self.target_size() != 0 && state.cache.len() > self.target_size() {
                 self.instrumentation.logger.trace(&format!(
                     "{} is growing fast {} of {} aging at {:?} of {:?}",
                     self.name,
                     state.cache.len(),
-                    self.target_size,
+                    self.target_size(),
                     now - when_expire,
                     self.target_age
                 ));
@@ -682,7 +689,7 @@ where
                 target: "cache_retention",
                 event = "tagged_cache_sweep",
                 cache_name = self.name.as_str(),
-                target_size = self.target_size,
+                target_size = self.target_size(),
                 target_age_seconds = self.target_age.whole_seconds(),
                 track_before,
                 track_after = state.cache.len(),
