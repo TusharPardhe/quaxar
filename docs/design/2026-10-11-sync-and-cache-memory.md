@@ -240,3 +240,52 @@ bytes at 320k nodes) is the next thing to watch, trimmed every 64 ledgers
    strong set during sync. This is the remaining part of A's peak.
 3. If RSS still creeps with the caches pinned, measure which retained ledgers
    pin the resident tree and compare with rippled's `LedgerHistory` retention.
+
+## 5. Snapshot bootstrap (sidesteps the sync peak entirely)
+
+The cold-sync peak (section on A) is a one-time cost of downloading state from
+peers. A node can instead be bootstrapped from a snapshot of an existing full
+node, which skips the network state download and therefore the in-memory
+frontier that drives the peak. This is the assumeutxo model (Bitcoin Core,
+`doc/design/assumeutxo.md`): trust the snapshot producer until local
+verification confirms it. OPODIS 2022 ("Robust and Fast Blockchain State
+Synchronization") documents the same snapshot-based catch-up.
+
+Quaxar already ships `export-snapshot` (online) and `load-snapshot` (offline).
+Measured on testnet (medium node, 4 vCPU, 30.6M nodes, 4.6–5.2 GB file):
+
+| Step | Network cold sync | Snapshot bootstrap |
+| --- | --- | --- |
+| export (node stays online) | — | 58 s |
+| load into fresh store (offline) | — | 2m 9s (parallel verify) |
+| start to `full` | ~1527 s | ~15–20 s |
+| peak RSS | 13.3 GiB | under 0.7 GiB |
+
+Correctness on the bootstrapped node: `full` with one transition (no
+oscillation), hash and account_hash parity on every sampled ledger,
+`pruned_verify_last_ok = true`.
+
+Operational note: the snapshot file is written by the node's service user
+(`rippled`), not the invoking shell, so the output directory must be writable
+by that user.
+
+### Parallelizing the load verification
+
+`load-snapshot` runs in two phases: a sequential bulk write of all nodes, then
+a verification that walks the entire reachable SHAMap graph (one random
+NodeStore read plus a SHA recomputation per node). On a fresh store the verify
+walk is the dominant cost. A SHAMap is a radix tree, so the root's 16 top
+subtrees are disjoint and can be verified independently. Fanning them out with
+rayon (fork-join parallel tree traversal) gives, on 4 cores, measured on the
+same snapshot:
+
+| Phase | Serial (`RAYON_NUM_THREADS=1`) | Parallel (4 cores) |
+| --- | --- | --- |
+| load | 50.1 s | 50.2 s |
+| verify | 210.5 s | 78.4 s (2.7x) |
+| total | 260.6 s | 128.6 s (2.0x) |
+
+The verify speedup is 2.7x rather than 4x because part of the walk is bound by
+random LSM reads, which do not scale linearly with threads. The load phase is
+sequential bulk writes (fjall's strong suit) and is unchanged. Verification
+semantics are identical; the 19 snapshot tests pass on the parallel path.
