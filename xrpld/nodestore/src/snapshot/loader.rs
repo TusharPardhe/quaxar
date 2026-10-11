@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use shamap::nodes::tree_node::{BRANCH_FACTOR, SHAMapNodeType, SHAMapTreeNode};
 
@@ -226,6 +227,13 @@ pub fn load_snapshot(
         .map_err(|e| SnapshotError::BackendWriteFailed {
             reason: format!("bulk_import_finish: {e}"),
         })?;
+    let load_elapsed_ms = start.elapsed().as_millis() as u64;
+    tracing::info!(
+        target: "snapshot",
+        total_nodes,
+        load_elapsed_ms,
+        "Snapshot chunk load complete, starting verification"
+    );
 
     let mut footer = [0u8; SNAPSHOT_FOOTER_SIZE];
     reader
@@ -249,6 +257,7 @@ pub fn load_snapshot(
 
     // Verify both roots, accumulating every reachable node hash into one set so
     // a pruned store can reconcile and anchor to exactly this snapshot.
+    let verify_start = Instant::now();
     let mut required_nodes = HashSet::new();
     verify_shamap_root(
         backend,
@@ -262,6 +271,7 @@ pub fn load_snapshot(
         manifest.tx_hash,
         &mut required_nodes,
     )?;
+    let verify_elapsed_ms = verify_start.elapsed().as_millis() as u64;
     backend
         .sync_result()
         .map_err(|e| SnapshotError::BackendWriteFailed {
@@ -275,6 +285,8 @@ pub fn load_snapshot(
         total_nodes,
         chunks = manifest.chunks.len(),
         required_nodes = required_nodes.len(),
+        load_elapsed_ms,
+        verify_elapsed_ms,
         elapsed_ms = start.elapsed().as_millis() as u64,
         "Snapshot load complete, ledger and SHAMap roots verified"
     );
@@ -319,28 +331,52 @@ fn verify_shamap_root(
         return Ok(());
     }
 
-    let mut visiting = HashSet::new();
-    verify_shamap_node(backend, map, root, 0, &mut visiting, required)
+    // Verify the root node itself, then fan its children out across a rayon
+    // pool. A SHAMap is a radix tree, so the 16 top subtrees are disjoint:
+    // no node is reachable from two branches. Each worker therefore keeps its
+    // own `visiting`/`verified` sets with no shared state and no lost dedup,
+    // and the per-subtree results are unioned once at the end. The walk is
+    // dominated by random NodeStore reads plus a SHA recomputation per node,
+    // both of which scale with cores (fork-join parallel tree traversal).
+    let root_node = fetch_and_decode_node(backend, map, root, 0)?;
+
+    if root_node.is_leaf() {
+        // A single-leaf map: nothing to fan out.
+        let mut visiting = HashSet::new();
+        verify_shamap_node(backend, map, root, 0, &mut visiting, required)?;
+        return Ok(());
+    }
+
+    required.insert(root);
+    let child_hashes: Vec<Uint256> = (0..BRANCH_FACTOR)
+        .filter(|&branch| !root_node.is_empty_branch(branch))
+        .map(|branch| *root_node.get_child_hash(branch).as_uint256())
+        .collect();
+
+    let subtree_results: Result<Vec<HashSet<Uint256>>, SnapshotError> = child_hashes
+        .par_iter()
+        .map(|&child_hash| {
+            let mut visiting = HashSet::new();
+            let mut verified = HashSet::new();
+            verify_shamap_node(backend, map, child_hash, 1, &mut visiting, &mut verified)?;
+            Ok(verified)
+        })
+        .collect();
+
+    for verified in subtree_results? {
+        required.extend(verified);
+    }
+    Ok(())
 }
 
-fn verify_shamap_node(
+/// Fetch, decode, and content-verify a single node without descending. Shared
+/// by the root check and the recursive walk so both apply identical rules.
+fn fetch_and_decode_node(
     backend: &dyn Backend,
     map: &'static str,
     hash: Uint256,
-    depth: usize,
-    visiting: &mut HashSet<Uint256>,
-    verified: &mut HashSet<Uint256>,
-) -> Result<(), SnapshotError> {
-    if verified.contains(&hash) {
-        return Ok(());
-    }
-    if depth > MAX_SHAMAP_DEPTH {
-        return Err(shamap_error(map, hash, "tree exceeds maximum SHAMap depth"));
-    }
-    if !visiting.insert(hash) {
-        return Err(shamap_error(map, hash, "cycle in reachable SHAMap graph"));
-    }
-
+    _depth: usize,
+) -> Result<basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>, SnapshotError> {
     let (object, status) = backend.fetch(&hash);
     let object = object.ok_or_else(|| {
         shamap_error(
@@ -364,11 +400,6 @@ fn verify_shamap_node(
     };
     let node = SHAMapTreeNode::make_from_prefix(object.data(), SHAMapHash::new(hash))
         .map_err(|error| shamap_error(map, hash, format!("invalid encoded node: {error:?}")))?;
-    // Some backend codecs discard the account-vs-transaction NodeObject
-    // wrapper tag and restore inner nodes as `Unknown`. The serialized SHAMap
-    // body still carries the node kind, so permit the `Unknown` wrapper for
-    // inner nodes only; leaves must retain their map-specific wrapper as well
-    // as their serialized leaf kind.
     let wrapper_type_matches = if node.is_leaf() {
         object.object_type() == expected_object_type
     } else {
@@ -382,9 +413,7 @@ fn verify_shamap_node(
             "reachable node has an incompatible NodeObject type",
         ));
     }
-    // `make_from_prefix` deliberately accepts a known hash for normal trusted
-    // fetch paths. Snapshot input is untrusted, so force recomputation before
-    // trusting the decoded graph.
+    // Snapshot input is untrusted, so force recomputation before trusting it.
     node.update_hash();
     if node.get_hash().as_uint256() != &hash {
         return Err(shamap_error(
@@ -393,6 +422,28 @@ fn verify_shamap_node(
             "encoded node body does not match its content-addressed hash",
         ));
     }
+    Ok(node)
+}
+
+fn verify_shamap_node(
+    backend: &dyn Backend,
+    map: &'static str,
+    hash: Uint256,
+    depth: usize,
+    visiting: &mut HashSet<Uint256>,
+    verified: &mut HashSet<Uint256>,
+) -> Result<(), SnapshotError> {
+    if verified.contains(&hash) {
+        return Ok(());
+    }
+    if depth > MAX_SHAMAP_DEPTH {
+        return Err(shamap_error(map, hash, "tree exceeds maximum SHAMap depth"));
+    }
+    if !visiting.insert(hash) {
+        return Err(shamap_error(map, hash, "cycle in reachable SHAMap graph"));
+    }
+
+    let node = fetch_and_decode_node(backend, map, hash, depth)?;
 
     if node.is_leaf() {
         let expected_leaf_type = match map {
