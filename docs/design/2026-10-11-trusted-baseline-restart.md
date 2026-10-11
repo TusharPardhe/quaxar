@@ -218,7 +218,8 @@ from the node store). Tracked separately.
 
 ## 10. Next steps
 
-1. Children-first persistence in acquisition (Soft Updates) so a cold sync
-   on an empty store also stays bounded in RAM.
+1. Done: children-first release during acquisition (cold sync peak 13.3 →
+   6.5 GiB) and cache sizing from a measured miss-ratio curve (RSS at 25 min
+   1.91 → 1.08 GiB). See `2026-10-11-sync-and-cache-memory.md`.
 2. Node-store fallback for `get_ledger_by_hash` / `by_seq` (section 9 gap).
-3. Re-check steady-state RSS over 24 h with the baseline-trimmed tree.
+3. Resident-tree creep after `full`, then a 24 h soak.
