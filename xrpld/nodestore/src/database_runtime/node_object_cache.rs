@@ -186,9 +186,9 @@ mod tests {
 /// Owns Moka and applies weighted LRU admission over immutable encoded
 /// NodeObjects. It retains counters and a generation fence so an invalidation
 /// cannot be repopulated by a load that began before it.
-/// Sampled reuse distances of NodeObject lookups (1 in 64 hashes).
+/// Sampled reuse distances of NodeObject lookups (1 in 16 hashes).
 static NODE_OBJECT_MRC: basics::sync::shards::SharedShards =
-    basics::sync::shards::SharedShards::new(1.0 / 64.0, 65_536);
+    basics::sync::shards::SharedShards::new(1.0 / 16.0, 262_144);
 
 /// Enable or disable NodeObject lookup sampling.
 pub fn set_mrc_enabled(enabled: bool) {

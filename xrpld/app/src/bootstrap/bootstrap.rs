@@ -80,8 +80,10 @@ const MRC_TOLERANCE: f64 = 0.02;
 const TREE_CACHE_MRC_MIN: usize = 65_536;
 /// Never size the NodeObject cache below this many bytes.
 const NODE_OBJECT_CACHE_MRC_MIN_BYTES: u64 = 64 << 20;
-/// Sampled references needed before a curve is trusted.
-const MRC_MIN_SAMPLES: u64 = 20_000;
+/// Sampled references needed before a curve is trusted. SHARDS reports mean
+/// absolute MRC error around 0.01 at a few thousand samples; a few hundred
+/// bound the error near 0.05, enough to pick a knee on a curve this flat.
+const MRC_MIN_SAMPLES: u64 = 400;
 
 /// Size the TreeNodeCache and NodeObject cache from their measured
 /// miss-ratio curves (SHARDS, Waldspurger et al., FAST 2015) instead of fixed
