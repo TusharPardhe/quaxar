@@ -71,9 +71,22 @@ struct AppResident<'a> {
     fetch_pack: &'a FetchPackCache,
     store: &'a mut WorkerStore,
     kind: TreeKind,
+    /// Committed restart baseline (state tree only); see `trusted_baseline`.
+    baseline: Option<Arc<super::trusted_baseline::TrustedBaseline>>,
 }
 
 impl MissingNodeResidentLookup for AppResident<'_> {
+    fn is_known_complete_child(
+        &mut self,
+        parent: shamap::node_id::SHAMapNodeId,
+        branch: usize,
+        hash: SHAMapHash,
+    ) -> bool {
+        self.baseline
+            .as_ref()
+            .is_some_and(|baseline| baseline.has_complete_child(parent, branch, hash))
+    }
+
     fn load_resident(
         &mut self,
         hash: SHAMapHash,
@@ -456,13 +469,17 @@ impl TreeEngine for AppLedgerPlanEngine {
                 self.active_plan = Some(plan);
             }
 
+            let kind = self.active_kind.expect("active tree kind set");
             let mut resident = AppResident {
                 cache: &self.cache,
                 shared_full_below: &self.full_below,
                 pending_full_below: &mut self.pending_full_below,
                 fetch_pack: self.fetch_pack.cache(),
                 store: &mut self.store,
-                kind: self.active_kind.expect("active tree kind set"),
+                kind,
+                baseline: (kind == TreeKind::State)
+                    .then(super::trusted_baseline::active)
+                    .flatten(),
             };
             let mut first_child = || rand_int_to(255u8);
             // Unlike rippled's independently locked InboundLedger jobs, the
@@ -1701,6 +1718,7 @@ mod tests {
                 fetch_pack: &fetch_pack,
                 store: &mut store,
                 kind: TreeKind::State,
+                baseline: None,
             };
             resident.mark_full_below(node.clone(), 1);
             assert!(!node.is_full_below(1));
@@ -1755,6 +1773,7 @@ mod tests {
                 fetch_pack: &fetch_pack,
                 store: &mut store,
                 kind: TreeKind::State,
+                baseline: None,
             };
             let loaded = resident
                 .load_resident(hash, SEQ)
@@ -1809,6 +1828,7 @@ mod tests {
                 fetch_pack: &fetch_pack,
                 store: &mut store,
                 kind: TreeKind::State,
+                baseline: None,
             };
             let loaded = resident
                 .load_resident(hash, SEQ)
@@ -1856,6 +1876,7 @@ mod tests {
                 fetch_pack: &fetch_pack,
                 store: &mut store,
                 kind: TreeKind::State,
+                baseline: None,
             };
             resident
                 .load_resident(hash, SEQ)

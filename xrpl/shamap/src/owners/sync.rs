@@ -2851,6 +2851,20 @@ pub trait MissingNodeResidentLookup {
     fn mark_full_below(&mut self, node: SharedIntrusive<SHAMapTreeNode>, generation: u32) {
         node.set_full_below_gen(generation);
     }
+
+    /// Whether the child `hash` under branch `branch` of the inner node at
+    /// `parent` is already known to be durably present together with its
+    /// whole subtree, without reading it. Used to skip subtrees shared with a
+    /// committed baseline tree (a copy-on-write ancestor whose completeness is
+    /// guaranteed by the store). Must only return `true` under that guarantee.
+    fn is_known_complete_child(
+        &mut self,
+        _parent: SHAMapNodeId,
+        _branch: usize,
+        _hash: SHAMapHash,
+    ) -> bool {
+        false
+    }
 }
 
 /// Individual result from the unique-read broker. `Rejected` means admission
@@ -3346,6 +3360,10 @@ impl MissingNodeContinuation {
                 continue;
             }
             if self.backed && resident.is_full_below(child_hash) {
+                self.stats.full_below_hits += 1;
+                continue;
+            }
+            if self.backed && resident.is_known_complete_child(state.node_id, branch, child_hash) {
                 self.stats.full_below_hits += 1;
                 continue;
             }
@@ -6541,6 +6559,57 @@ mod native_missing_node_continuation_tests {
             9,
             &mut || 0,
         )
+    }
+
+    struct BaselineResident {
+        complete: SHAMapHash,
+    }
+
+    impl MissingNodeResidentLookup for BaselineResident {
+        fn load_resident(
+            &mut self,
+            _hash: SHAMapHash,
+            _ledger_seq: u32,
+        ) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            None
+        }
+
+        fn is_known_complete_child(
+            &mut self,
+            parent: SHAMapNodeId,
+            branch: usize,
+            hash: SHAMapHash,
+        ) -> bool {
+            parent.is_root() && branch == 1 && hash == self.complete
+        }
+    }
+
+    #[test]
+    fn known_complete_child_is_skipped_without_a_read() {
+        let leaf = |fill: u8| {
+            SHAMapTreeNode::new_leaf(
+                crate::tree_node::SHAMapNodeType::AccountState,
+                SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 12]),
+                1,
+            )
+        };
+        let shared = leaf(0x21).get_hash();
+        let changed = leaf(0x22).get_hash();
+        let root = SHAMapTreeNode::new_inner(1);
+        root.set_child_hash(1, shared);
+        root.set_child_hash(2, changed);
+        root.update_hash();
+        let mut continuation = continuation(&root, 1);
+        let mut resident = BaselineResident { complete: shared };
+
+        let MissingNodeAdvance::NeedsReads(needs) =
+            continuation.advance(32, 4, &mut resident, &mut || 0)
+        else {
+            panic!("expected a read for the changed child only");
+        };
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].hash(), changed);
+        assert_eq!(continuation.pending_hashes(), 1);
     }
 
     #[test]

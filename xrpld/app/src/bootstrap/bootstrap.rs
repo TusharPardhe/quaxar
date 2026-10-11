@@ -1596,6 +1596,7 @@ fn run_start_mode_consensus_loop(
     // ownership while matching rippled's essential boundary:
     // gotLedgerData/TimeoutCounter only enqueue work and jtLEDGER_DATA performs
     // reconstruction away from NetworkOPs and consensus.
+    install_trusted_restart_baseline(runtime.root());
     shared_inbound.set_phase_mode_owner(runtime.root().network_ops_mode_owner());
     if shared_inbound.install_coordinator() {
         shared_inbound.coordinator_startup(startup_coordinator_phase(runtime.root()));
@@ -4246,6 +4247,51 @@ fn bootstrap_shamap_store_if_configured(
     )?;
     let _ = bootstrap.attach_node_store(root);
     Ok(Some(PendingProductionSHAMapStore { bootstrap }))
+}
+
+/// Install the pruned store's last claimed ledger as the trusted restart
+/// baseline (`docs/design/2026-10-11-trusted-baseline-restart.md`). Set
+/// `QUAXAR_TRUSTED_RESTART=0` to disable.
+fn install_trusted_restart_baseline(root: &ApplicationRoot) {
+    if std::env::var("QUAXAR_TRUSTED_RESTART").is_ok_and(|value| value == "0") {
+        tracing::info!(target: "acquisition_trace", "trusted restart baseline disabled by QUAXAR_TRUSTED_RESTART=0");
+        return;
+    }
+    let Some(driver) = root
+        .shamap_store_service()
+        .and_then(|service| service.component().pruned_driver())
+    else {
+        return;
+    };
+    let store = Arc::clone(driver.store());
+    let Some(seq) = store.metrics().claimed_seq else {
+        return;
+    };
+    let root_hash = match store.claimed_state_root() {
+        Ok(Some(hash)) => hash,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(target: "acquisition_trace", %error, "trusted restart baseline: claimed root unreadable");
+            return;
+        }
+    };
+    let fetch_store = Arc::clone(&store);
+    let fetch: crate::ledger::inbound_ledgers::trusted_baseline::BaselineFetch =
+        Arc::new(move |hash| fetch_store.fetch(hash).0.map(|object| object.data().to_vec()));
+    if fetch(&root_hash).is_none() {
+        tracing::warn!(target: "acquisition_trace", seq, %root_hash, "trusted restart baseline: claimed root missing from store");
+        return;
+    }
+    crate::ledger::inbound_ledgers::trusted_baseline::install(Arc::new(
+        crate::ledger::inbound_ledgers::trusted_baseline::TrustedBaseline::new(seq, root_hash, fetch),
+    ));
+    tracing::info!(
+        target: "acquisition_trace",
+        event = "trusted_baseline_installed",
+        baseline_seq = seq,
+        baseline_root = %root_hash,
+        "trusted committed baseline installed for restart catch-up"
+    );
 }
 
 /// Build the pruned-store driver for a fjall single store, reading its window

@@ -665,6 +665,24 @@ fn strand_loop(
         // the whole tree for every later ledger and never converged. Keep the
         // graphs until the node tracks the network, then release them all.
         let caught_up = root.network_ops_operating_mode() >= NetworkOpsOperatingMode::Tracking;
+        // The committed baseline is only trusted while catching up and well
+        // inside the prune window: its nodes die as newer ledgers are claimed
+        // and become prunable `online_delete` ledgers later.
+        if let Some(baseline) = crate::ledger::inbound_ledgers::trusted_baseline::active() {
+            let too_old = root
+                .validated_ledger_seq()
+                .is_some_and(|validated| validated > baseline.seq().saturating_add(TRUSTED_BASELINE_MAX_AGE));
+            // Startup briefly reports tracking from the stub ledger, so only a
+            // real Full retires it.
+            let full = root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full;
+            if full || too_old {
+                crate::ledger::inbound_ledgers::trusted_baseline::retire(if full {
+                    "full"
+                } else {
+                    "too_old"
+                });
+            }
+        }
         if root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full {
             trim_resident_ledger_tree(&root, &mut last_resident_trim_seq);
         }
@@ -2803,6 +2821,10 @@ fn trace_completed_inbound_handoff(
         "LCL trace: inbound ledger completion persisted before adoption"
     );
 }
+
+/// The trusted restart baseline is retired once the validated ledger is this
+/// far past it (half the default 512-ledger prune window).
+const TRUSTED_BASELINE_MAX_AGE: u32 = 256;
 
 /// Ledgers between trims of the resident state tree.
 const RESIDENT_TRIM_INTERVAL: u32 = 64;
