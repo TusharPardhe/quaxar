@@ -182,22 +182,61 @@ Correctness checks on the B run:
 - 31 of 31 ledgers match on hash and account_hash.
 - `pruned_verify_last_ok = true`.
 
-### What B does not fix
+### The knee regression and its fix
 
-RSS still rises after 25 min with B: 1.08 GiB at 25 min, 1.30 GiB at 36 min.
-Neither cache is responsible. The NodeObject cache stays at 63 MB and the
-TreeNodeCache at 9–38k entries. The growth is the resident ledger tree:
-inner nodes went from 502k to 752k and leaves from 130k to 236k. Those nodes
-are reachable from the retained ledgers, which are the 64-entry ledger cache
-plus the open and closed ledgers. They are trimmed every 64 ledgers
-(`trim_resident_ledger_tree`; the interval is set with
-`QUAXAR_RESIDENT_TRIM_INTERVAL`). That is the next target.
+The first B build sized the caches well for the first half hour but drifted
+back to full size over the following hours: at 8 h, RSS had reached 3.2 GiB,
+the NodeObject cache was back to 1.3 GB and the TreeNodeCache target to its
+configured 2,097,152.
+
+Root cause was the knee rule, not the resident tree. The original rule picked
+the smallest size whose miss ratio was within `tolerance` of the best
+(largest-size) miss ratio. A miss-ratio curve is convex and non-increasing. In
+the first half hour the sampled curve was flat (little reuse seen yet), so the
+knee sat at the minimum. As samples accumulated, real reuse at large sizes
+appeared and the curve sloped down all the way to the top:
+
+```text
+node-object @ 8 h: 4k:1.00 64k:0.995 256k:0.934 1M:0.804 2M:0.778 4M:0.757
+tree       @ 8 h: 4k:0.527 64k:0.511 256k:0.475 1M:0.413 2M:0.386 4M:0.345
+```
+
+On such a curve "within tolerance of the best" degenerates to the maximum
+size, because the best is only reached near the maximum. So both caches grew
+back.
+
+The fix replaces the rule with a diminishing-returns criterion. Sizes double
+at each step, so the target is the top of the last doubling that still cuts the
+miss ratio by at least `tolerance` (`QUAXAR_MRC_TOLERANCE`, default 0.03: a
+doubling of cache memory must buy at least 3 points of hit ratio). A flat head
+before a steep region is skipped; a shallow tail past the last paying doubling
+is not bought. `knee_of_curve` has unit tests for the measured production
+curves plus flat, step, and always-paying shapes.
+
+With the fix, at 36 min uptime and 13k samples the curves had flattened past
+128k and both caches were held at their floors:
+
+- TreeNodeCache target 65,536 (knee 4,096, clamped to the floor).
+- NodeObject cache 64 MiB (knee 4,096, clamped to the floor).
+- RSS 1.30 GiB, with one `full` transition and 21 of 21 ledgers matching.
+
+The soak over several hours is pending to confirm the caches stay at the floor
+rather than drifting up again.
+
+### Note on the resident ledger tree
+
+An earlier draft attributed the long-run growth to the resident ledger tree
+(inner nodes rising from 502k to 752k). That rise is real but secondary: the
+dominant cause of the 8 h growth was the knee regression above. With the caches
+held at their floors, the resident tree (about 150 MB of structural plus item
+bytes at 320k nodes) is the next thing to watch, trimmed every 64 ledgers
+(`trim_resident_ledger_tree`, interval `QUAXAR_RESIDENT_TRIM_INTERVAL`).
 
 ## 4. Next steps
 
-1. Resident-tree creep: measure which retained ledgers pin the 750k inner
-   nodes, then compare with rippled's `LedgerHistory` retention (64 ledgers
-   for 180 s at medium) and its node sharing.
+1. Soak the knee fix for several hours to confirm the caches hold at the floor
+   and RSS stays flat.
 2. Rerun A's cold sync with B's sampling enabled, to size the TreeNodeCache's
    strong set during sync. This is the remaining part of A's peak.
-3. 24-hour soak of A + B to confirm hit ratios and RSS.
+3. If RSS still creeps with the caches pinned, measure which retained ledgers
+   pin the resident tree and compare with rippled's `LedgerHistory` retention.
