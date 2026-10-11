@@ -1140,6 +1140,19 @@ impl<V: AppServerInfoView> LedgerEntrySource for ApplicationServerInfo<V> {
 
 impl<V: AppServerInfoView> AccountTxSource for ApplicationServerInfo<V> {
     fn validated_range(&self) -> Option<AccountTxLedgerRange> {
+        // rippled AccountTx uses LedgerMaster::getValidatedRange, whose base
+        // is getFullValidatedRange: the contiguous complete range ending at
+        // the published ledger. Quaxar previously reported min = 1, so
+        // ledger_index_min claimed history this node does not have.
+        if let Some((min, max)) = self
+            .view
+            .app()
+            .and_then(|app| app.ledger_master_runtime())
+            .and_then(|runtime| runtime.ledger_master().full_validated_range())
+        {
+            return Some(AccountTxLedgerRange { min, max });
+        }
+        // Standalone/test views without a ledger-master runtime.
         let max = self
             .view
             .validated_ledger()
