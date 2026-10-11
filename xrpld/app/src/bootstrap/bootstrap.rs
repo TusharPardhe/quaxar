@@ -106,11 +106,7 @@ fn size_tree_cache_from_mrc(root: &ApplicationRoot) {
     if target != cache.target_size() {
         cache.set_target_size(target);
     }
-    let points = curve
-        .iter()
-        .map(|(size, miss)| format!("{}k:{:.3}", size / 1024, miss))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let points = basics::sync::shards::format_curve(&curve);
     tracing::info!(
         target: "app",
         event = "tree_cache_mrc",

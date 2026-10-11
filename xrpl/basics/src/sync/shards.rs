@@ -131,6 +131,63 @@ impl Shards {
     }
 }
 
+/// A process-wide sampler: lock-free rejection of unsampled keys, a mutex
+/// only for the sampled ~1/1024.
+#[derive(Debug)]
+pub struct SharedShards {
+    rate: f64,
+    max_tracked: usize,
+    inner: std::sync::OnceLock<std::sync::Mutex<Shards>>,
+}
+
+impl SharedShards {
+    pub const fn new(rate: f64, max_tracked: usize) -> Self {
+        Self {
+            rate,
+            max_tracked,
+            inner: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn get(&self) -> &std::sync::Mutex<Shards> {
+        self.inner
+            .get_or_init(|| std::sync::Mutex::new(Shards::new(self.rate, self.max_tracked)))
+    }
+
+    pub fn record(&self, key_hash: u64) {
+        let threshold = ((self.rate * MODULUS as f64) as u64).max(1);
+        if key_hash % MODULUS >= threshold {
+            return;
+        }
+        if let Ok(mut shards) = self.get().lock() {
+            shards.record(key_hash);
+        }
+    }
+
+    /// `(curve, sampled references, knee within tolerance)`.
+    pub fn snapshot(&self, tolerance: f64) -> (Vec<(u64, f64)>, u64, Option<u64>) {
+        self.get()
+            .lock()
+            .map(|shards| (shards.curve(), shards.samples(), shards.knee(tolerance)))
+            .unwrap_or_default()
+    }
+
+    pub fn decay(&self) {
+        if let Ok(mut shards) = self.get().lock() {
+            shards.decay();
+        }
+    }
+}
+
+/// Render a curve as `size_k:miss` pairs for logs and RPC.
+pub fn format_curve(curve: &[(u64, f64)]) -> String {
+    curve
+        .iter()
+        .map(|(size, miss)| format!("{}k:{:.3}", size / 1024, miss))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

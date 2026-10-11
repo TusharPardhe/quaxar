@@ -168,6 +168,10 @@ mod tests {
 /// Owns Moka and applies weighted LRU admission over immutable encoded
 /// NodeObjects. It retains counters and a generation fence so an invalidation
 /// cannot be repopulated by a load that began before it.
+/// Sampled reuse distances of NodeObject lookups (1 in 1024 hashes).
+static NODE_OBJECT_MRC: basics::sync::shards::SharedShards =
+    basics::sync::shards::SharedShards::new(1.0 / 1024.0, 65_536);
+
 pub(crate) struct NodeObjectCache {
     storage: CacheStorage,
     max_entry_bytes: usize,
@@ -307,6 +311,9 @@ impl NodeObjectCache {
         F: FnOnce() -> Option<Arc<NodeObject>>,
     {
         let generation = self.generation();
+        NODE_OBJECT_MRC.record(u64::from_le_bytes(
+            hash.data()[..8].try_into().expect("8 bytes"),
+        ));
         match &self.storage {
             CacheStorage::Enabled(cache) => {
                 if let Some(object) = cache.get(&hash) {
@@ -405,6 +412,33 @@ impl NodeObjectCache {
     }
 
     pub(crate) fn add_counts_json(&self, obj: &mut BTreeMap<String, JsonValue>) {
+        {
+            // Miss-ratio curve of NodeObject lookups (SHARDS): the entry count
+            // past which more cache lowers the miss ratio by under 2 points.
+            let (curve, samples, knee) = NODE_OBJECT_MRC.snapshot(0.02);
+            obj.insert(
+                "node_object_mrc".to_owned(),
+                JsonValue::String(basics::sync::shards::format_curve(&curve)),
+            );
+            obj.insert(
+                "node_object_mrc_samples".to_owned(),
+                JsonValue::Unsigned(samples),
+            );
+            obj.insert(
+                "node_object_mrc_knee_entries".to_owned(),
+                JsonValue::Unsigned(knee.unwrap_or(0)),
+            );
+            let (curve, samples, knee) = shamap::access_mrc::snapshot(0.02);
+            obj.insert(
+                "treenode_mrc".to_owned(),
+                JsonValue::String(basics::sync::shards::format_curve(&curve)),
+            );
+            obj.insert("treenode_mrc_samples".to_owned(), JsonValue::Unsigned(samples));
+            obj.insert(
+                "treenode_mrc_knee_entries".to_owned(),
+                JsonValue::Unsigned(knee.unwrap_or(0)),
+            );
+        }
         {
             let CacheStorage::Enabled(cache) = &self.storage;
             obj.insert(

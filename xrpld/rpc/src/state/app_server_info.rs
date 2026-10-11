@@ -2183,6 +2183,14 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
             app::NodeSizeResourceProfile::for_node_size(app.status_rpc_node_size().as_deref());
         json.insert(
             "treenode_cache_target_size".to_owned(),
+            JsonValue::Unsigned(
+                app.shared_tree_cache()
+                    .map_or(profile.tree_cache_size, |cache| cache.target_size())
+                    as u64,
+            ),
+        );
+        json.insert(
+            "treenode_cache_configured_size".to_owned(),
             JsonValue::Unsigned(profile.tree_cache_size as u64),
         );
         json.insert(

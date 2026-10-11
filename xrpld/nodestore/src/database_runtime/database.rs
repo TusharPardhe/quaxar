@@ -1194,6 +1194,9 @@ mod tests {
                 "node_object_cache_ttl_seconds",
                 "node_object_cache_weighted_capacity_bytes",
                 "node_object_cache_weighted_size_bytes",
+                "node_object_mrc",
+                "node_object_mrc_knee_entries",
+                "node_object_mrc_samples",
                 "node_read_bytes",
                 "node_reads_duration_us",
                 "node_reads_hit",
@@ -1204,6 +1207,9 @@ mod tests {
                 "read_request_bundle",
                 "read_threads_running",
                 "read_threads_total",
+                "treenode_mrc",
+                "treenode_mrc_knee_entries",
+                "treenode_mrc_samples",
             ]
         );
         assert_eq!(counts.get("read_queue"), Some(&JsonValue::Unsigned(0)));
