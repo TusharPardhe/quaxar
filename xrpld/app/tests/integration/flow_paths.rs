@@ -14123,3 +14123,119 @@ fn fp_ag55() {
         Ter::TES_SUCCESS
     );
 }
+
+// ─── Testnet fork 21485530: crafted offer overflowing native range ──────────
+//
+// Reproduces ledger 21485530 on testnet. The XRP->USD book held a crafted
+// offer asking 10^17 drops (the native maximum) for 9.999999999999995 USD.
+// Consuming it overflows the native range; rippled throws
+// "Native currency amount out of range" inside flow() and RippleCalc returns
+// tecINTERNAL (fee claimed, no other state change). The network recorded
+// Payment 1E2B5609... as tecINTERNAL; quaxar previously let the panic escape as
+// tefEXCEPTION, dropped the tx and forked.
+#[test]
+fn fp_crafted_offer_overflowing_native_range_is_tec_internal_like_rippled() {
+    // runtime_error is not caught by OfferStream's overflow_error handler, so
+    // the result is the same with and without MPTokensV2.
+    crafted_offer_payment_case(&[]);
+    crafted_offer_payment_case(&["MPTokensV1", "MPTokensV2"]);
+}
+
+fn crafted_offer_payment_case(features: &[&str]) {
+    // Exact state of testnet ledger 21485529 for the accounts involved.
+    let sender = acct(0x11);
+    let dest = acct(0x22);
+    let honest = acct(0x44);
+    let crafted = acct(0x55);
+    let gw = acct(0x33);
+    let u = usd_currency();
+    let usd = |mantissa: i64, exponent: i32| {
+        STAmount::from_iou_amount(
+            sf_generic(),
+            IOUAmount::from_parts(mantissa, exponent).expect("valid IOU"),
+            Issue::new(u, gw),
+        )
+    };
+    // gw sorts between dest (low) and honest/crafted (high).
+    let holder_line = |holder: AccountID, held: STAmount| {
+        let mut line = trust_line(gw, holder, u, 0, 0, 1_000);
+        let negated = STAmount::from_iou_amount(
+            sf_generic(),
+            -held.iou(),
+            Issue::new(u, gw),
+        );
+        line.set_field_amount(sf("sfBalance"), negated);
+        line
+    };
+    const LSF_DEFAULT_RIPPLE: u32 = 0x0080_0000;
+    let l = build_ledger_with_features(vec![
+        account_root(sender, 99_999_930, 2, 0),
+        account_root(dest, 99_999_970, 2, 0),
+        account_root(honest, 29_999_890, 7, 0),
+        account_root(crafted, 29_999_920, 5, 0),
+        account_root(gw, 99_999_970, 0, LSF_DEFAULT_RIPPLE),
+        trust_line(sender, gw, u, 0, 1_000, 0),
+        trust_line(dest, gw, u, 0, 1_000, 0),
+        holder_line(honest, usd(10, 0)),
+        holder_line(crafted, usd(9_999_999_999_999_994, -15)),
+    ], features.to_vec());
+    let mut v = new_view(l);
+
+    // Book tip: 10 XRP for 10 USD.
+    let honest_offer = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), honest);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(10_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), usd(10, 0));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut v, &honest_offer, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    // Crafted: 10^17 drops for 9.999999999999995 USD, owner holds ...994.
+    let crafted_offer = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), crafted);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(100_000_000_000_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), usd(9_999_999_999_999_995, -15));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut v, &crafted_offer, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    // Payment 1E2B5609...: 20 USD, SendMax 90 XRP, tfPartialPayment, path via
+    // the USD issuer.
+    let mut paths = protocol::STPathSet::new(sf("sfPaths"));
+    let mut path = protocol::STPath::new();
+    path.push_back(protocol::STPathElement::inferred(
+        AccountID::default(),
+        u,
+        gw,
+        true,
+    ));
+    paths.push_back(path);
+    let payment = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), sender);
+        tx.set_account_id(sf("sfDestination"), dest);
+        tx.set_field_amount(sf("sfAmount"), usd(20, 0));
+        tx.set_field_amount(sf("sfSendMax"), xrp(90_000_000));
+        tx.set_field_path_set(sf("sfPaths"), paths.clone());
+        tx.set_field_u32(sf("sfFlags"), 0x0002_0000);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut v, &payment, TxType::PAYMENT, None),
+        Ter::TEC_INTERNAL,
+        "rippled records this payment as tecINTERNAL ({features:?})"
+    );
+    // tecINTERNAL discards the flow sandbox: the crafted offer is untouched.
+    let crafted_offer_key = protocol::offer_keylet(Uint160::from_void(crafted.data()), 1);
+    assert!(
+        v.read(crafted_offer_key).expect("read").is_some(),
+        "the crafted offer must not be removed ({features:?})"
+    );
+}

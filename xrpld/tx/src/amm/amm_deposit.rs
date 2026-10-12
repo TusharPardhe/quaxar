@@ -332,7 +332,7 @@ fn number_from_i64(value: i64) -> RuntimeNumber {
 }
 
 fn solve_quadratic_eq(a: RuntimeNumber, b: RuntimeNumber, c: RuntimeNumber) -> RuntimeNumber {
-    (-b + root2(b * b - number_from_i64(4) * a * c).expect("discriminant should be nonnegative"))
+    (-b + root2(b * b - number_from_i64(4) * a * c).unwrap_or_else(|error| basics::contract::throw_overflow(format!("Number::root {error:?}"))))
         / (number_from_i64(2) * a)
 }
 
@@ -398,29 +398,43 @@ pub fn run_amm_deposit_apply_math_facts(
     let sub_tx_flags = facts.flags & protocol::DEPOSIT_SUB_TX_FLAGS;
 
     if (sub_tx_flags & protocol::AMM_LP_TOKEN_FLAG) != 0 {
-        let Some(lp_token_out) = &facts.lp_token_out else {
-            return Err(Ter::TEM_MALFORMED);
-        };
-        let lp_tokens = adjusted_lp_tokens_out(&facts.rules, &facts.lp_token_balance, lp_token_out);
-        if facts.rules.enabled(&fix_ammv1_3()) && lp_tokens.signum() == 0 {
-            return Err(Ter::TEC_AMM_INVALID_TOKENS);
-        }
-        let frac = amm_helpers::stamount_as_number(&lp_tokens)
-            / amm_helpers::stamount_as_number(&facts.lp_token_balance);
-        let amount1 =
-            amm_helpers::get_rounded_asset(&facts.rules, &facts.pool_amount1, frac, IsDeposit::Yes);
-        let amount2 =
-            amm_helpers::get_rounded_asset(&facts.rules, &facts.pool_amount2, frac, IsDeposit::Yes);
-        return finalize_deposit_math(
-            facts,
-            amount1,
-            Some(amount2),
-            lp_tokens,
-            facts.amount1.as_ref(),
-            facts.amount2.as_ref(),
-            None,
-            false,
-        );
+        // rippled AMMDeposit::equalDepositTokens: `try { ... } catch
+        // (std::exception&) { return tecINTERNAL; }`, independent of
+        // amendments and of the exception class.
+        return basics::contract::try_catch(|| {
+            let Some(lp_token_out) = &facts.lp_token_out else {
+                return Err(Ter::TEM_MALFORMED);
+            };
+            let lp_tokens = adjusted_lp_tokens_out(&facts.rules, &facts.lp_token_balance, lp_token_out);
+            if facts.rules.enabled(&fix_ammv1_3()) && lp_tokens.signum() == 0 {
+                return Err(Ter::TEC_AMM_INVALID_TOKENS);
+            }
+            let frac = amm_helpers::stamount_as_number(&lp_tokens)
+                / amm_helpers::stamount_as_number(&facts.lp_token_balance);
+            let amount1 =
+                amm_helpers::get_rounded_asset(&facts.rules, &facts.pool_amount1, frac, IsDeposit::Yes);
+            let amount2 =
+                amm_helpers::get_rounded_asset(&facts.rules, &facts.pool_amount2, frac, IsDeposit::Yes);
+            return finalize_deposit_math(
+                facts,
+                amount1,
+                Some(amount2),
+                lp_tokens,
+                facts.amount1.as_ref(),
+                facts.amount2.as_ref(),
+                None,
+                false,
+            );
+        
+        })
+        .unwrap_or_else(|payload| {
+            tracing::error!(
+                target: "tx",
+                exception = %basics::contract::exception_message(payload.as_ref()),
+                "AMMDeposit::equalDepositTokens exception"
+            );
+            Err(Ter::TEC_INTERNAL)
+        });
     }
 
     if (sub_tx_flags & protocol::AMM_TWO_ASSET_IF_EMPTY_FLAG) != 0 {

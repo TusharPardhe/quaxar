@@ -287,7 +287,9 @@ impl NumberParts {
             mantissa_range_max(scale),
             scale,
         )
-        .expect("NumberParts integer construction should not overflow")
+        .unwrap_or_else(|error| {
+            crate::core::contract::throw_overflow(format!("Number::normalize {error:?}"))
+        })
     }
 
     pub const fn isnormal(self, scale: MantissaScale) -> bool {
@@ -1206,9 +1208,10 @@ impl Neg for NumberParts {
 
 impl AddAssign for NumberParts {
     fn add_assign(&mut self, rhs: Self) {
-        self.try_add_assign(rhs).expect(
-            "NumberParts addition should preserve the reference implementation overflow behavior",
-        );
+        // rippled Number arithmetic throws std::overflow_error.
+        if let Err(error) = self.try_add_assign(rhs) {
+            crate::core::contract::throw_overflow(format!("Number::operator+= {error:?}"));
+        }
     }
 }
 
@@ -1223,8 +1226,9 @@ impl Add for NumberParts {
 
 impl SubAssign for NumberParts {
     fn sub_assign(&mut self, rhs: Self) {
-        self.try_sub_assign(rhs)
-            .expect("NumberParts subtraction should preserve the reference implementation overflow behavior");
+        if let Err(error) = self.try_sub_assign(rhs) {
+            crate::core::contract::throw_overflow(format!("Number::operator-= {error:?}"));
+        }
     }
 }
 
@@ -1239,8 +1243,9 @@ impl Sub for NumberParts {
 
 impl MulAssign for NumberParts {
     fn mul_assign(&mut self, rhs: Self) {
-        self.try_mul_assign(rhs)
-            .expect("NumberParts multiplication should preserve the reference implementation overflow behavior");
+        if let Err(error) = self.try_mul_assign(rhs) {
+            crate::core::contract::throw_overflow(format!("Number::operator*= {error:?}"));
+        }
     }
 }
 
@@ -1255,9 +1260,9 @@ impl Mul for NumberParts {
 
 impl DivAssign for NumberParts {
     fn div_assign(&mut self, rhs: Self) {
-        self.try_div_assign(rhs).expect(
-            "NumberParts division should preserve the reference implementation overflow behavior",
-        );
+        if let Err(error) = self.try_div_assign(rhs) {
+            crate::core::contract::throw_overflow(format!("Number::operator/= {error:?}"));
+        }
     }
 }
 

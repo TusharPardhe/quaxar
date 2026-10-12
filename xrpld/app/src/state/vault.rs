@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use basics::{
     base_uint::{Uint160, Uint192, Uint256},
-    number::{MantissaScale, NumberParts as RuntimeNumber, RoundingMode, get_mantissa_scale},
+    contract::{exception_kind, rethrow, throw_overflow, try_catch},
+    number::{MantissaScale, NumberArithmeticError, NumberParts as RuntimeNumber, RoundingMode, get_mantissa_scale},
 };
 use ledger::{
     ApplyView, account_root_helpers::create_pseudo_account, adjust_owner_count,
@@ -203,8 +204,44 @@ fn vault_clawback_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
     })
 }
 
+/// Materialize a Number as an asset amount. In rippled this conversion calls
+/// `Number::operator rep()` for integral assets, which throws
+/// `std::overflow_error` rather than making its enclosing Vault helper empty.
 fn runtime_to_amount(asset: Asset, value: RuntimeNumber) -> Option<STAmount> {
-    to_amount_from_number(asset, value, basics::number::RoundingMode::TowardsZero).ok()
+    match to_amount_from_number(asset, value, basics::number::RoundingMode::TowardsZero) {
+        Ok(amount) => Some(amount),
+        Err(NumberArithmeticError::Overflow) => {
+            throw_overflow("Vault Number-to-STAmount conversion overflow")
+        }
+        Err(NumberArithmeticError::DivideByZero) => None,
+    }
+}
+
+fn debit_is_nonzero_dust(
+    asset: Asset,
+    total: RuntimeNumber,
+    amount: &STAmount,
+) -> Result<bool, Ter> {
+    if amount.signum() == 0 {
+        return Ok(false);
+    }
+    // VaultHelpers.cpp::debitIsNonZeroDust: materialize the post-debit Number
+    // at STAmount precision and compare it to the stored total.
+    let post_debit = runtime_to_amount(asset, total - amount_number(amount))
+        .ok_or(Ter::TEC_INTERNAL)?;
+    let stored_total = runtime_to_amount(asset, total).ok_or(Ter::TEC_INTERNAL)?;
+    Ok(post_debit == stored_total)
+}
+
+/// Execute one of rippled's Vault `try` scopes. Only the typed equivalent of
+/// `std::overflow_error` is translated to `tecPATH_DRY`; every other panic
+/// retains its original exception behavior.
+fn catch_vault_overflow<T>(f: impl FnOnce() -> Result<T, Ter>) -> Result<T, Ter> {
+    match try_catch(f) {
+        Ok(result) => result,
+        Err(payload) if exception_kind(payload.as_ref()).is_overflow() => Err(Ter::TEC_PATH_DRY),
+        Err(payload) => rethrow(payload),
+    }
 }
 
 /// Port of `View.cpp::canWithdraw` for VaultWithdraw. The caller selects the
@@ -310,11 +347,14 @@ fn clamp_to_assets_total_scale(
 }
 
 fn number_to_mpt_units_truncated(value: RuntimeNumber) -> Option<u64> {
-    value
+    let value = value
         .truncate(MantissaScale::Large)
         .try_to_i64()
-        .ok()
-        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_else(|_| throw_overflow("Vault share Number::rep overflow"));
+    Some(
+        u64::try_from(value)
+            .unwrap_or_else(|_| throw_overflow("Vault share Number::rep overflow")),
+    )
 }
 
 fn vault_scale(vault: &LoadedVault) -> i32 {
@@ -701,7 +741,7 @@ fn assets_to_shares_deposit(
             amount.exponent() + vault_scale(vault),
             get_mantissa_scale(),
         )
-        .ok()?
+        .unwrap_or_else(|_| throw_overflow("Vault deposit Number::normalize overflow"))
     } else {
         RuntimeNumber::from_i64(issuance.outstanding_amount as i64) * assets / vault.assets_total
     };
@@ -739,7 +779,7 @@ fn shares_to_assets(
                 -vault_scale(vault),
                 get_mantissa_scale(),
             )
-            .ok()?
+            .unwrap_or_else(|_| throw_overflow("Vault deposit Number::normalize overflow"))
         }
     } else {
         asset_total * share_number / share_total
@@ -767,7 +807,12 @@ fn assets_to_shares_withdraw(
     let shares = RuntimeNumber::from_i64(issuance.outstanding_amount as i64)
         * amount_number(amount)
         / asset_total;
-    shares.try_to_i64().ok().map(|value| value.unsigned_abs())
+    Some(
+        shares
+            .try_to_i64()
+            .unwrap_or_else(|_| throw_overflow("Vault share Number::rep overflow"))
+            .unsigned_abs(),
+    )
 }
 
 fn assets_to_shares_withdraw_truncated(
@@ -1267,55 +1312,57 @@ pub fn apply_vault_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return Ter::TEC_PRECISION_LOSS;
     }
 
-    let Some(shares_created) = assets_to_shares_deposit(&vault, &issuance, &amount) else {
-        return Ter::TEC_INTERNAL;
-    };
-    if shares_created == 0 {
-        return Ter::TEC_PRECISION_LOSS;
-    }
-
-    let Some(mut assets_deposited) =
-        shares_to_assets(&vault, &issuance, shares_created, false, false)
-    else {
-        return Ter::TEC_INTERNAL;
-    };
-    if assets_deposited.signum() <= 0 || amount_number(&assets_deposited) > amount_number(&amount) {
-        return Ter::TEC_INTERNAL;
-    }
-
-    if fix_cleanup_3_4_0 {
-        let clamped = match clamp_to_assets_total_scale(&vault, &assets_deposited, true) {
-            Ok(clamped) => clamped,
-            Err(ter) => return ter,
+    // Matches VaultDeposit.cpp:312-375. Number normalization, conversion,
+    // and the post-fixCleanup3_4_0 clamp share one overflow boundary.
+    let (shares_created, assets_deposited) = match catch_vault_overflow(|| {
+        let Some(shares_created) = assets_to_shares_deposit(&vault, &issuance, &amount) else {
+            return Err(Ter::TEC_INTERNAL);
         };
-        if clamped.signum() <= 0 {
-            return Ter::TEC_PRECISION_LOSS;
+        if shares_created == 0 {
+            return Err(Ter::TEC_PRECISION_LOSS);
         }
-        assets_deposited = clamped;
 
-        // The representational no-op gate applies to the amount that will
-        // actually be transferred after the posterior-total clamp, not to the
-        // nominal transaction amount. This covers both positive-balance and
-        // opposite-limit/debt IOU orientations.
-        if !assets_deposited.integral() && account != assets_deposited.issue().issuer() {
-            let balance = match account_holds_vault_asset_full_balance(view, &account, vault.asset)
-            {
-                Ok(balance) => balance,
-                Err(ter) => return ter,
-            };
-            if balance < assets_deposited {
-                return Ter::TEC_INSUFFICIENT_FUNDS;
+        let Some(mut assets_deposited) =
+            shares_to_assets(&vault, &issuance, shares_created, false, false)
+        else {
+            return Err(Ter::TEC_INTERNAL);
+        };
+        if assets_deposited.signum() <= 0
+            || amount_number(&assets_deposited) > amount_number(&amount)
+        {
+            return Err(Ter::TEC_INTERNAL);
+        }
+
+        if fix_cleanup_3_4_0 {
+            let clamped = clamp_to_assets_total_scale(&vault, &assets_deposited, true)?;
+            if clamped.signum() <= 0 {
+                return Err(Ter::TEC_PRECISION_LOSS);
             }
-            let trustline_balance = match account_holds_vault_asset(view, &account, vault.asset) {
-                Ok(balance) => balance,
-                Err(ter) => return ter,
-            };
-            if amount_is_zero_at_scale(vault.asset, &assets_deposited, trustline_balance.exponent())
-            {
-                return Ter::TEC_PRECISION_LOSS;
+            assets_deposited = clamped;
+
+            // The representational no-op gate applies to the amount that will
+            // actually be transferred after the posterior-total clamp, not to
+            // the nominal transaction amount.
+            if !assets_deposited.integral() && account != assets_deposited.issue().issuer() {
+                let balance = account_holds_vault_asset_full_balance(view, &account, vault.asset)?;
+                if balance < assets_deposited {
+                    return Err(Ter::TEC_INSUFFICIENT_FUNDS);
+                }
+                let trustline_balance = account_holds_vault_asset(view, &account, vault.asset)?;
+                if amount_is_zero_at_scale(
+                    vault.asset,
+                    &assets_deposited,
+                    trustline_balance.exponent(),
+                ) {
+                    return Err(Ter::TEC_PRECISION_LOSS);
+                }
             }
         }
-    }
+        Ok((shares_created, assets_deposited))
+    }) {
+        Ok(exchange) => exchange,
+        Err(ter) => return ter,
+    };
 
     let deposited_number = amount_number(&assets_deposited);
     if vault.entry.is_field_present(sf("sfAssetsMaximum")) {
@@ -1381,32 +1428,46 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         Err(ter) => return ter,
     };
 
-    let (shares_redeemed, assets_withdrawn) = if amount.asset() == vault.asset {
-        let shares = if view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
-            assets_to_shares_withdraw_truncated(&vault, &issuance, &amount, waive_unrealized_loss)
+    // Matches VaultWithdraw.cpp:315-380. This is intentionally before any
+    // transfer or holding mutation.
+    let (shares_redeemed, assets_withdrawn) = match catch_vault_overflow(|| {
+        if amount.asset() == vault.asset {
+            let shares = if view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
+                assets_to_shares_withdraw_truncated(
+                    &vault,
+                    &issuance,
+                    &amount,
+                    waive_unrealized_loss,
+                )
+            } else {
+                assets_to_shares_withdraw(&vault, &issuance, &amount, waive_unrealized_loss)
+            };
+            let Some(shares) = shares else {
+                return Err(Ter::TEC_INTERNAL);
+            };
+            if shares == 0 {
+                return Err(Ter::TEC_PRECISION_LOSS);
+            }
+            let Some(assets) =
+                shares_to_assets(&vault, &issuance, shares, true, waive_unrealized_loss)
+            else {
+                return Err(Ter::TEC_INTERNAL);
+            };
+            Ok((shares, assets))
+        } else if amount.asset() == share_asset(vault.share_id) {
+            let shares = amount.mpt().value().unsigned_abs();
+            let Some(assets) =
+                shares_to_assets(&vault, &issuance, shares, true, waive_unrealized_loss)
+            else {
+                return Err(Ter::TEC_INTERNAL);
+            };
+            Ok((shares, assets))
         } else {
-            assets_to_shares_withdraw(&vault, &issuance, &amount, waive_unrealized_loss)
-        };
-        let Some(shares) = shares else {
-            return Ter::TEC_INTERNAL;
-        };
-        if shares == 0 {
-            return Ter::TEC_PRECISION_LOSS;
+            Err(Ter::TEF_INTERNAL)
         }
-        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, waive_unrealized_loss)
-        else {
-            return Ter::TEC_INTERNAL;
-        };
-        (shares, assets)
-    } else if amount.asset() == share_asset(vault.share_id) {
-        let shares = amount.mpt().value().unsigned_abs();
-        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, waive_unrealized_loss)
-        else {
-            return Ter::TEC_INTERNAL;
-        };
-        (shares, assets)
-    } else {
-        return Ter::TEF_INTERNAL;
+    }) {
+        Ok(exchange) => exchange,
+        Err(ter) => return ter,
     };
 
     if view.rules().enabled(&feature_id("fixCleanup3_4_0"))
@@ -1415,6 +1476,22 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         && vault.assets_total != vault.loss_unrealized
     {
         return Ter::TEC_PRECISION_LOSS;
+    }
+
+    // Matches VaultWithdraw.cpp:404-430. The fixed-share zero-payout guard
+    // above remains outside this narrower Number arithmetic catch scope.
+    if view.rules().enabled(&feature_id("fixCleanup3_4_0"))
+        && shares_redeemed != issuance.outstanding_amount
+    {
+        let dust = match catch_vault_overflow(|| {
+            debit_is_nonzero_dust(vault.asset, vault.assets_total, &assets_withdrawn)
+        }) {
+            Ok(dust) => dust,
+            Err(ter) => return ter,
+        };
+        if dust {
+            return Ter::TEC_PRECISION_LOSS;
+        }
     }
 
     let limit_check_amount = if view.rules().enabled(&protocol::fix_cleanup_3_1_3())
@@ -1457,13 +1534,17 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
             .unwrap_or_else(|| zero_amount(vault.asset));
     } else if view.rules().enabled(&feature_id("fixCleanup3_4_0")) && assets_withdrawn.signum() > 0
     {
-        let clamped = match clamp_to_assets_total_scale(&vault, &assets_withdrawn, false) {
+        // Matches VaultWithdraw.cpp:467-492.
+        let clamped = match catch_vault_overflow(|| {
+            let clamped = clamp_to_assets_total_scale(&vault, &assets_withdrawn, false)?;
+            if clamped.signum() == 0 {
+                return Err(Ter::TEC_PRECISION_LOSS);
+            }
+            Ok(clamped)
+        }) {
             Ok(clamped) => clamped,
             Err(ter) => return ter,
         };
-        if clamped.signum() == 0 {
-            return Ter::TEC_PRECISION_LOSS;
-        }
         assets_withdrawn = clamped;
     }
 
@@ -1567,7 +1648,13 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     } else {
         zero_amount(vault.asset)
     };
-    let (mut shares_destroyed, mut assets_recovered) = if account == vault.owner
+    // Before fixCleanup3_1_3, an asset-zero clawback returns before the
+    // AssetsAvailable clamp. Keep that replay behavior and its lack of the
+    // later C++ overflow catch.
+    let legacy_unclamped_zero = !view.rules().enabled(&protocol::fix_cleanup_3_1_3())
+        && clawback_amount.asset() == vault.asset
+        && clawback_amount.signum() == 0;
+    let (shares_destroyed, assets_recovered) = if account == vault.owner
         && clawback_amount.asset() == share_asset(vault.share_id)
     {
         (
@@ -1577,7 +1664,7 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
             },
             zero_amount(vault.asset),
         )
-    } else if clawback_amount.asset() == vault.asset && clawback_amount.signum() == 0 {
+    } else if legacy_unclamped_zero {
         let shares = match token_balance(view, vault.share_id, &holder) {
             Ok(balance) => balance.unwrap_or_default(),
             Err(ter) => return ter,
@@ -1588,82 +1675,103 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         };
         (shares, assets)
     } else {
-        let shares = if view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
-            assets_to_shares_withdraw_truncated(
-                &vault,
-                &issuance,
-                &clawback_amount,
-                waive_unrealized_loss,
-            )
-        } else {
-            assets_to_shares_withdraw(&vault, &issuance, &clawback_amount, waive_unrealized_loss)
-        };
-        let Some(shares) = shares else {
-            return Ter::TEC_INTERNAL;
-        };
-        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, waive_unrealized_loss)
-        else {
-            return Ter::TEC_INTERNAL;
-        };
-        (shares, assets)
-    };
+        // Matches VaultClawback.cpp:273-384. This scope deliberately includes
+        // the availability retry and the fixCleanup3_4_0 asset-scale clamp.
+        match catch_vault_overflow(|| {
+            let (mut shares_destroyed, mut assets_recovered) = if clawback_amount.signum() == 0 {
+                let shares = token_balance(view, vault.share_id, &holder)?.unwrap_or_default();
+                let Some(assets) =
+                    shares_to_assets(&vault, &issuance, shares, true, waive_unrealized_loss)
+                else {
+                    return Err(Ter::TEC_INTERNAL);
+                };
+                (shares, assets)
+            } else {
+                let shares = if view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
+                    assets_to_shares_withdraw_truncated(
+                        &vault,
+                        &issuance,
+                        &clawback_amount,
+                        waive_unrealized_loss,
+                    )
+                } else {
+                    assets_to_shares_withdraw(
+                        &vault,
+                        &issuance,
+                        &clawback_amount,
+                        waive_unrealized_loss,
+                    )
+                };
+                let Some(shares) = shares else {
+                    return Err(Ter::TEC_INTERNAL);
+                };
+                let Some(assets) =
+                    shares_to_assets(&vault, &issuance, shares, true, waive_unrealized_loss)
+                else {
+                    return Err(Ter::TEC_INTERNAL);
+                };
+                (shares, assets)
+            };
 
-    // Before fixCleanup3_1_3, an asset-zero clawback returns before the
-    // AssetsAvailable clamp. Keep that replay behavior. The amended path
-    // clamps the asset recovery and recomputes a truncated share amount so
-    // the resulting conversion cannot exceed AssetsAvailable through rounding.
-    let legacy_unclamped_zero = !view.rules().enabled(&protocol::fix_cleanup_3_1_3())
-        && clawback_amount.asset() == vault.asset
-        && clawback_amount.signum() == 0;
-    if !legacy_unclamped_zero
-        && assets_recovered
-            > runtime_to_amount(vault.asset, vault.assets_available)
-                .unwrap_or_else(|| zero_amount(vault.asset))
-    {
-        let Some(available) = runtime_to_amount(vault.asset, vault.assets_available) else {
-            return Ter::TEC_INTERNAL;
-        };
-        let Some(truncated_shares) = assets_to_shares_withdraw_truncated(
-            &vault,
-            &issuance,
-            &available,
-            waive_unrealized_loss,
-        ) else {
-            return Ter::TEC_INTERNAL;
-        };
-        shares_destroyed = truncated_shares;
-        let Some(recomputed_assets) = shares_to_assets(
-            &vault,
-            &issuance,
-            shares_destroyed,
-            true,
-            waive_unrealized_loss,
-        ) else {
-            return Ter::TEC_INTERNAL;
-        };
-        assets_recovered = recomputed_assets;
-        if assets_recovered > available {
-            return Ter::TEC_INTERNAL;
-        }
-    }
+            let available = runtime_to_amount(vault.asset, vault.assets_available)
+                .ok_or(Ter::TEC_INTERNAL)?;
+            if assets_recovered > available {
+                let Some(truncated_shares) = assets_to_shares_withdraw_truncated(
+                    &vault,
+                    &issuance,
+                    &available,
+                    waive_unrealized_loss,
+                ) else {
+                    return Err(Ter::TEC_INTERNAL);
+                };
+                shares_destroyed = truncated_shares;
+                let Some(recomputed_assets) = shares_to_assets(
+                    &vault,
+                    &issuance,
+                    shares_destroyed,
+                    true,
+                    waive_unrealized_loss,
+                ) else {
+                    return Err(Ter::TEC_INTERNAL);
+                };
+                assets_recovered = recomputed_assets;
+                if assets_recovered > available {
+                    return Err(Ter::TEC_INTERNAL);
+                }
+            }
 
-    if view.rules().enabled(&feature_id("fixCleanup3_4_0")) && assets_recovered.signum() > 0 {
-        // Do not rederive shares after trimming a sub-ULP recovery. The
-        // already-selected shares are intentionally burned at their
-        // pre-clamp conversion value, leaving the trimmed value for remaining
-        // shareholders.
-        let clamped = match clamp_to_assets_total_scale(&vault, &assets_recovered, false) {
-            Ok(clamped) => clamped,
+            if view.rules().enabled(&feature_id("fixCleanup3_4_0"))
+                && assets_recovered.signum() > 0
+            {
+                let clamped = clamp_to_assets_total_scale(&vault, &assets_recovered, false)?;
+                if clamped.signum() == 0 {
+                    return Err(Ter::TEC_PRECISION_LOSS);
+                }
+                assets_recovered = clamped;
+            }
+            Ok((shares_destroyed, assets_recovered))
+        }) {
+            Ok(parts) => parts,
             Err(ter) => return ter,
-        };
-        if clamped.signum() == 0 {
-            return Ter::TEC_PRECISION_LOSS;
         }
-        assets_recovered = clamped;
-    }
+    };
 
     if shares_destroyed == 0 {
         return Ter::TEC_PRECISION_LOSS;
+    }
+
+    // Matches VaultClawback.cpp:441-473. Like rippled, only the amended
+    // nonzero-dust test is protected by this separate overflow catch scope.
+    if view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
+        let dust = match catch_vault_overflow(|| {
+            debit_is_nonzero_dust(vault.asset, vault.assets_total, &assets_recovered)
+        }) {
+            Ok(dust) => dust,
+            Err(ter) => return ter,
+        };
+        if dust {
+            return Ter::TEC_PRECISION_LOSS;
+        }
     }
 
     let ter = transfer_mpt(

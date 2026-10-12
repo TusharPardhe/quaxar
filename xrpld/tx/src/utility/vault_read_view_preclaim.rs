@@ -4,7 +4,10 @@
 //! deliberately creates no sandbox, and returns `None` for every unowned type.
 //! Read failures are ledger failures (`tefBAD_LEDGER`), never success.
 
-use basics::base_uint::{Uint160, Uint192};
+use basics::{
+    base_uint::{Uint160, Uint192},
+    contract::{exception_kind, rethrow, try_catch},
+};
 use ledger::{ReadView, RelativeDistanceAmount};
 use protocol::{
     AccountID, Asset, MPTIssue, STAmount, STLedgerEntry, STTx, Ter, TxType, get_field_by_symbol,
@@ -786,12 +789,23 @@ fn preclaim_withdraw<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         let Some(issuance) = issuance.as_ref() else {
             return Ok(Ter::TEF_INTERNAL);
         };
-        match ledger::vault_helpers::shares_to_assets_withdraw(
-            &vault,
-            issuance,
-            &amount,
-            ledger::vault_helpers::WaiveUnrealizedLoss::No,
-        ) {
+        // Mirrors VaultWithdraw.cpp:166-193: the share-to-asset conversion
+        // for fixCleanup3_1_3 is an overflow-catching preclaim scope.
+        let converted = match try_catch(|| {
+            ledger::vault_helpers::shares_to_assets_withdraw(
+                &vault,
+                issuance,
+                &amount,
+                ledger::vault_helpers::WaiveUnrealizedLoss::No,
+            )
+        }) {
+            Ok(converted) => converted,
+            Err(payload) if exception_kind(payload.as_ref()).is_overflow() => {
+                return Ok(Ter::TEC_PATH_DRY);
+            }
+            Err(payload) => rethrow(payload),
+        };
+        match converted {
             Some(converted) if converted.as_number() <= available => {}
             Some(_) => return Ok(Ter::TEC_INSUFFICIENT_FUNDS),
             None => return Ok(Ter::TEF_INTERNAL),

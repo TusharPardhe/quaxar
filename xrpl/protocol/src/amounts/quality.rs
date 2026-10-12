@@ -286,7 +286,7 @@ pub fn get_rate(offer_out: &STAmount, offer_in: &STAmount) -> u64 {
 }
 
 pub fn divide(num: &STAmount, den: &STAmount, asset: impl Into<Asset>) -> STAmount {
-    try_divide(num, den, asset).unwrap_or_else(|error| panic!("{error}"))
+    try_divide(num, den, asset).unwrap_or_else(|error| error.throw())
 }
 
 pub fn try_divide(
@@ -336,7 +336,7 @@ pub fn try_divide(
 }
 
 pub fn multiply(v1: &STAmount, v2: &STAmount, asset: impl Into<Asset>) -> STAmount {
-    try_multiply(v1, v2, asset).unwrap_or_else(|error| panic!("{error}"))
+    try_multiply(v1, v2, asset).unwrap_or_else(|error| error.throw())
 }
 
 pub fn try_multiply(
@@ -409,7 +409,15 @@ pub fn try_multiply(
     catch_unwind(AssertUnwindSafe(|| {
         crate::to_amount_from_number::<STAmount>(asset, product, get_rounding_mode())
     }))
-    .map_err(|_| amount_range_error(asset))?
+    .map_err(|payload| {
+        // Number::operator rep() past int64 throws std::overflow_error;
+        // a value above the asset maximum is canonicalize's runtime_error.
+        if basics::contract::exception_kind(payload.as_ref()).is_overflow() {
+            AmountError::ArithmeticOverflow
+        } else {
+            amount_range_error(asset)
+        }
+    })?
     .map_err(|_| amount_range_error(asset))
 }
 
@@ -610,7 +618,8 @@ fn mul_round_impl(
             0
         },
     )
-    .expect("mulRound should preserve the reference implementation overflow behavior");
+    // rippled muldivRound throws std::overflow_error.
+    .unwrap_or_else(|_| basics::contract::throw_overflow("overflow: mulRound"));
 
     let mut offset = offset1 + offset2 + 14;
     if result_negative != round_up {
@@ -703,7 +712,8 @@ fn div_round_impl(
             0
         },
     )
-    .expect("divRound should preserve the reference implementation overflow behavior");
+    // rippled muldivRound throws std::overflow_error.
+    .unwrap_or_else(|_| basics::contract::throw_overflow("overflow: divRound"));
 
     let mut offset = num_offset - den_offset - 17;
     if result_negative != round_up {

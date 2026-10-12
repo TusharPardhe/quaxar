@@ -291,14 +291,22 @@ enum SmallOfferDisposition {
     Keep,
     RemoveIfFundingUnchanged,
     RemovePermanently,
-    ArithmeticFailure,
 }
 
-fn small_offer_arithmetic_failure_disposition(mptokens_v2: bool) -> SmallOfferDisposition {
-    if mptokens_v2 {
+/// rippled `OfferStream::step`:
+/// `try { shouldRmSmallIncreasedQOffer() } catch (std::overflow_error&) {
+/// if (MPTokensV2) permRmOffer; else throw; }`. Only an overflow_error under
+/// MPTokensV2 removes the offer. Every other exception (for example the
+/// runtime_error "Native currency amount out of range") propagates out of
+/// flow, where RippleCalc / flowCross turn it into tecINTERNAL.
+fn small_offer_exception_disposition(
+    payload: Box<dyn std::any::Any + Send>,
+    mptokens_v2: bool,
+) -> SmallOfferDisposition {
+    if mptokens_v2 && basics::contract::exception_kind(payload.as_ref()).is_overflow() {
         SmallOfferDisposition::RemovePermanently
     } else {
-        SmallOfferDisposition::ArithmeticFailure
+        basics::contract::rethrow(payload)
     }
 }
 
@@ -342,7 +350,7 @@ fn small_increased_quality_offer_disposition(
             Quality::from_amounts(&amounts).ceil_out_strict(&amounts, owner_funds, false)
         })) {
             Ok(amounts) => amounts,
-            Err(_) => return small_offer_arithmetic_failure_disposition(mptokens_v2),
+            Err(payload) => return small_offer_exception_disposition(payload, mptokens_v2),
         }
     } else {
         Amounts::new(taker_pays.clone(), taker_gets.clone())
@@ -744,14 +752,6 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 offers_consumed += 1;
                 continue;
             }
-            SmallOfferDisposition::ArithmeticFailure => {
-                return BookStepResult {
-                    amount_in: total_in,
-                    amount_out: total_out,
-                    offers_consumed,
-                    ter: Ter::TEF_EXCEPTION,
-                };
-            }
         }
         found_tip = true;
         offers.push(TraversedBookEntry::Offer(TraversedOffer {
@@ -918,6 +918,40 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 stop_before_clob = true;
             }
         }
+    }
+
+    // rippled BookStep::forEachOffer wraps the per-offer crossing arithmetic
+    // in `try { ... } catch (std::overflow_error&) { if (MPTokensV2) {
+    // removeOffer(); return true; } throw; }`.
+    let crossing_overflow_removes_offer =
+        view.rules().enabled(&protocol::feature_id("MPTokensV2"));
+    macro_rules! catch_crossing_overflow {
+        ($offer_sle:expr, $attempted_before:expr, $body:expr) => {
+            match basics::contract::try_catch(|| $body) {
+                Ok(value) => value,
+                Err(payload) => {
+                    if crossing_overflow_removes_offer
+                        && basics::contract::exception_kind(payload.as_ref()).is_overflow()
+                    {
+                        tracing::trace!(
+                            target: "ledger",
+                            offer = %$offer_sle.key(),
+                            "Removing offer with overflowing amount calculation"
+                        );
+                        if let Some(removable) = &self_cross_cancellation {
+                            removable.record(*$offer_sle.key());
+                        }
+                        remove_offer_or_return!(&$offer_sle);
+                        if !$attempted_before {
+                            first_quality = None;
+                        }
+                        offers_consumed += 1;
+                        continue;
+                    }
+                    basics::contract::rethrow(payload)
+                }
+            }
+        };
     }
 
     if !stop_before_clob {
@@ -1178,6 +1212,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 break;
             }
 
+            let attempted_before_offer = offer_attempted;
             offer_attempted = true;
 
             // Forward evaluation is input-limited before its output is reconciled
@@ -1193,17 +1228,23 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             if nothing_left {
                 break;
             }
-            let mut consumption = compute_offer_consumption(
-                options.pass,
-                &remaining_in,
-                &remaining_out,
-                &taker_pays,
-                &taker_gets,
-                &owner_funds,
-                offer_quality,
-                tr_in,
-                tr_out,
-                fix_reduced_offers_v2,
+            // Transfer-rate, owner-funds and limit arithmetic: the start of
+            // rippled's forEachOffer try block, before `offerAttempted = true`.
+            let mut consumption = catch_crossing_overflow!(
+                offer_sle,
+                attempted_before_offer,
+                compute_offer_consumption(
+                    options.pass,
+                    &remaining_in,
+                    &remaining_out,
+                    &taker_pays,
+                    &taker_gets,
+                    &owner_funds,
+                    offer_quality,
+                    tr_in,
+                    tr_out,
+                    fix_reduced_offers_v2,
+                )
             );
 
             if consumption.step_in.signum() <= 0 || consumption.step_out.signum() <= 0 {
@@ -1247,17 +1288,23 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                     // limitStepOut against the cached remaining output, then
                     // adopt only if it requires all remaining forward input.
                     // Otherwise retain the ordinary forward saved amounts.
-                    let reverse_limited = compute_offer_consumption(
-                        BookStepPass::OutputOnly,
-                        &remaining_in,
-                        &remaining_out,
-                        &taker_pays,
-                        &taker_gets,
-                        &owner_funds,
-                        offer_quality,
-                        tr_in,
-                        tr_out,
-                        fix_reduced_offers_v2,
+                    // Callback arithmetic (fwdImp limitStepOut): still inside
+                    // forEachOffer's try, after offerAttempted was set.
+                    let reverse_limited = catch_crossing_overflow!(
+                        offer_sle,
+                        true,
+                        compute_offer_consumption(
+                            BookStepPass::OutputOnly,
+                            &remaining_in,
+                            &remaining_out,
+                            &taker_pays,
+                            &taker_gets,
+                            &owner_funds,
+                            offer_quality,
+                            tr_in,
+                            tr_out,
+                            fix_reduced_offers_v2,
+                        )
                     );
                     if reverse_limited.step_in == remaining_in {
                         consumption = reverse_limited;
@@ -2076,99 +2123,119 @@ fn get_amm_offer<V: ApplyView>(
         return Ok(None);
     }
 
-    let max_offer = || {
-        amm_max_offer_amounts(
-            &pool_in_amount,
-            &pool_out_amount,
-            trading_fee,
-            amm_rounding_enabled,
-        )
-    };
-    if amm_context.multi_path() {
-        let (initial_in, initial_out) = amm_context.initial_balances(
-            (book.r#in, book.out),
-            &(pool_in_amount.clone(), pool_out_amount.clone()),
-        );
-        let Some((offered_in, offered_out)) = generate_fibonacci_amm_offer(
-            &initial_in,
-            &initial_out,
-            &pool_in_amount,
-            &pool_out_amount,
-            trading_fee,
-            amm_rounding_enabled,
-            amm_context.iterations(),
-        ) else {
-            return Ok(None);
+    let fix_reduced_offers_v2 = view
+        .rules()
+        .enabled(&protocol::feature_id("fixReducedOffersV2"));
+    let fix_amm_v1_2 = view.rules().enabled(&protocol::feature_id("fixAMMv1_2"));
+    // rippled AMMLiquidity::getOffer computes the offer inside
+    // `try { ... } catch (std::overflow_error&) { return nullopt; }
+    // catch (std::exception&) {}`: an arithmetic exception while generating
+    // AMM liquidity means "no AMM offer" for this step, never a failed
+    // transaction. Contain a panic the same way.
+    let generated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> Option<SyntheticAmmOffer> {
+        let max_offer = || {
+            amm_max_offer_amounts(
+                &pool_in_amount,
+                &pool_out_amount,
+                trading_fee,
+                amm_rounding_enabled,
+            )
         };
-        let quality = Quality::from_amounts(&Amounts::new(offered_in.clone(), offered_out.clone()));
-        if clob_quality.is_some_and(|clob| quality < clob) {
-            return Ok(None);
+        if amm_context.multi_path() {
+            let (initial_in, initial_out) = amm_context.initial_balances(
+                (book.r#in, book.out),
+                &(pool_in_amount.clone(), pool_out_amount.clone()),
+            );
+            let Some((offered_in, offered_out)) = generate_fibonacci_amm_offer(
+                &initial_in,
+                &initial_out,
+                &pool_in_amount,
+                &pool_out_amount,
+                trading_fee,
+                amm_rounding_enabled,
+                amm_context.iterations(),
+            ) else {
+                return None;
+            };
+            let quality = Quality::from_amounts(&Amounts::new(offered_in.clone(), offered_out.clone()));
+            if clob_quality.is_some_and(|clob| quality < clob) {
+                return None;
+            }
+            return Some(SyntheticAmmOffer {
+                account: amm_account,
+                pool_in: pool_in_amount,
+                pool_out: pool_out_amount,
+                amount_in: offered_in,
+                amount_out: offered_out,
+                quality,
+                trading_fee,
+                amm_rounding_enabled,
+                multi_path: true,
+                fix_reduced_offers_v2,
+            });
         }
-        return Ok(Some(SyntheticAmmOffer {
+        let (offered_in, offered_out, offer_quality) = match clob_quality {
+            None => {
+                let Some((input, out)) = max_offer() else {
+                    return None;
+                };
+                (input, out, spot_quality)
+            }
+            Some(clob) => {
+                match amm_offer_for_clob_quality(
+                    &pool_in_amount,
+                    &pool_out_amount,
+                    clob,
+                    trading_fee,
+                    amm_rounding_enabled,
+                )
+                .map(|(input, out)| {
+                    let quality = Quality::from_amounts(&Amounts::new(input.clone(), out.clone()));
+                    (input, out, quality)
+                })
+                .or_else(|| {
+                    fix_amm_v1_2
+                        .then(|| max_offer())
+                        .flatten()
+                        .filter(|amounts| {
+                            Quality::from_amounts(&Amounts::new(amounts.0.clone(), amounts.1.clone()))
+                                > clob
+                        })
+                        .map(|(input, out)| (input, out, spot_quality))
+                }) {
+                    Some(amounts) => amounts,
+                    None => return None,
+                }
+            }
+        };
+
+        Some(SyntheticAmmOffer {
             account: amm_account,
             pool_in: pool_in_amount,
             pool_out: pool_out_amount,
             amount_in: offered_in,
             amount_out: offered_out,
-            quality,
+            quality: offer_quality,
             trading_fee,
             amm_rounding_enabled,
-            multi_path: true,
-            fix_reduced_offers_v2: view
-                .rules()
-                .enabled(&protocol::feature_id("fixReducedOffersV2")),
-        }));
+            multi_path: false,
+            fix_reduced_offers_v2,
+        })
+        },
+    ));
+    match generated {
+        Ok(offer) => Ok(offer),
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            tracing::error!(target: "ledger", %message, "AMMLiquidity::getOffer exception");
+            Ok(None)
+        }
     }
-    let (offered_in, offered_out, offer_quality) = match clob_quality {
-        None => {
-            let Some((input, out)) = max_offer() else {
-                return Ok(None);
-            };
-            (input, out, spot_quality)
-        }
-        Some(clob) => {
-            match amm_offer_for_clob_quality(
-                &pool_in_amount,
-                &pool_out_amount,
-                clob,
-                trading_fee,
-                amm_rounding_enabled,
-            )
-            .map(|(input, out)| {
-                let quality = Quality::from_amounts(&Amounts::new(input.clone(), out.clone()));
-                (input, out, quality)
-            })
-            .or_else(|| {
-                view.rules()
-                    .enabled(&protocol::feature_id("fixAMMv1_2"))
-                    .then(|| max_offer())
-                    .flatten()
-                    .filter(|amounts| {
-                        Quality::from_amounts(&Amounts::new(amounts.0.clone(), amounts.1.clone()))
-                            > clob
-                    })
-                    .map(|(input, out)| (input, out, spot_quality))
-            }) {
-                Some(amounts) => amounts,
-                None => return Ok(None),
-            }
-        }
-    };
-
-    Ok(Some(SyntheticAmmOffer {
-        account: amm_account,
-        pool_in: pool_in_amount,
-        pool_out: pool_out_amount,
-        amount_in: offered_in,
-        amount_out: offered_out,
-        quality: offer_quality,
-        trading_fee,
-        amm_rounding_enabled,
-        multi_path: false,
-        fix_reduced_offers_v2: view
-            .rules()
-            .enabled(&protocol::feature_id("fixReducedOffersV2")),
-    }))
 }
 
 /// Non-mutating liquidity ordering key used by flow's ActiveStrands.  This is
@@ -3862,17 +3929,30 @@ mod tests {
     }
 
     #[test]
-    fn mpt_overflow_offer_is_permanently_removed_only_after_fix() {
+    fn small_offer_catch_matches_offer_stream_exception_types() {
+        let overflow = || basics::contract::try_catch(|| basics::contract::throw_overflow("o"))
+            .unwrap_err();
+        let runtime = || basics::contract::try_catch(|| panic!("Native currency amount out of range"))
+            .unwrap_err();
+
+        // catch (std::overflow_error&) under MPTokensV2: remove the offer.
         assert_eq!(
-            small_offer_arithmetic_failure_disposition(true),
-            SmallOfferDisposition::RemovePermanently,
-            "fixMPTOfferOverflow removes the poison offer and continues crossing"
+            small_offer_exception_disposition(overflow(), true),
+            SmallOfferDisposition::RemovePermanently
         );
-        assert_eq!(
-            small_offer_arithmetic_failure_disposition(false),
-            SmallOfferDisposition::ArithmeticFailure,
-            "the legacy branch preserves the hard arithmetic failure"
-        );
+        // Pre-MPTokensV2 overflow: rethrown.
+        let rethrown = basics::contract::try_catch(|| small_offer_exception_disposition(overflow(), false))
+            .unwrap_err();
+        assert!(basics::contract::exception_kind(rethrown.as_ref()).is_overflow());
+        // runtime_error is not caught by OfferStream at all, amendment or not.
+        for mptokens_v2 in [true, false] {
+            let rethrown = basics::contract::try_catch(|| small_offer_exception_disposition(runtime(), mptokens_v2))
+                .unwrap_err();
+            assert_eq!(
+                basics::contract::exception_message(rethrown.as_ref()),
+                "Native currency amount out of range"
+            );
+        }
     }
 
     #[test]

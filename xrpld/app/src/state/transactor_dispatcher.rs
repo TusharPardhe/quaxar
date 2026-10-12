@@ -684,8 +684,14 @@ fn amm_clawback_balance_read_plan(
     }
 }
 
-fn amm_math_panic_ter(rules: &protocol::Rules) -> Ter {
-    if rules.enabled(&protocol::feature_id("fixCleanup3_4_0")) {
+/// rippled AMMDeposit/AMMWithdraw::applyGuts: `catch (std::runtime_error&)
+/// { if (!fixCleanup3_4_0) throw; return tecAMM_FAILED; }`. overflow_error is a
+/// runtime_error; logic errors are not caught there and reach the transactor's
+/// `catch (std::exception&)`, i.e. tefEXCEPTION.
+fn amm_math_panic_ter(rules: &protocol::Rules, payload: &(dyn std::any::Any + Send)) -> Ter {
+    if rules.enabled(&protocol::feature_id("fixCleanup3_4_0"))
+        && basics::contract::exception_kind(payload).is_runtime()
+    {
         Ter::TEC_AMM_FAILED
     } else {
         Ter::TEF_EXCEPTION
@@ -5881,7 +5887,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 let math = match math_result {
                     Ok(Ok(math)) => math,
                     Ok(Err(ter)) => return ter,
-                    Err(_) => return amm_math_panic_ter(&view.rules()),
+                    Err(payload) => return amm_math_panic_ter(&view.rules(), payload.as_ref()),
                 };
 
                 // AMMDeposit is intentionally different from AMMCreate here.
@@ -6123,7 +6129,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 let math = match math_result {
                     Ok(Ok(math)) => math,
                     Ok(Err(ter)) => return ter,
-                    Err(_) => return amm_math_panic_ter(&view.rules()),
+                    Err(payload) => return amm_math_panic_ter(&view.rules(), payload.as_ref()),
                 };
 
                 if let Some(amount) = &math.amount1 {
@@ -9044,16 +9050,18 @@ mod tests {
 
     #[test]
     fn amm_deposit_and_withdraw_math_panics_are_cleanup_3_4_gated() {
-        assert_eq!(
-            amm_math_panic_ter(&protocol::Rules::new([])),
-            Ter::TEF_EXCEPTION
-        );
-        assert_eq!(
-            amm_math_panic_ter(&protocol::Rules::new([protocol::feature_id(
-                "fixCleanup3_4_0"
-            )])),
-            Ter::TEC_AMM_FAILED
-        );
+        let fixed = protocol::Rules::new([protocol::feature_id("fixCleanup3_4_0")]);
+        let legacy = protocol::Rules::new([]);
+        let runtime = basics::contract::try_catch(|| panic!("amount out of range")).unwrap_err();
+        let overflow =
+            basics::contract::try_catch(|| basics::contract::throw_overflow("o")).unwrap_err();
+        let logic = basics::contract::try_catch(|| basics::contract::logic_error("l")).unwrap_err();
+
+        assert_eq!(amm_math_panic_ter(&legacy, runtime.as_ref()), Ter::TEF_EXCEPTION);
+        assert_eq!(amm_math_panic_ter(&fixed, runtime.as_ref()), Ter::TEC_AMM_FAILED);
+        assert_eq!(amm_math_panic_ter(&fixed, overflow.as_ref()), Ter::TEC_AMM_FAILED);
+        // catch (std::runtime_error&) does not catch a logic_error.
+        assert_eq!(amm_math_panic_ter(&fixed, logic.as_ref()), Ter::TEF_EXCEPTION);
     }
 
     #[test]

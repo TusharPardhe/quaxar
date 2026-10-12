@@ -28,12 +28,15 @@ fn stamount_as_number(amount: &STAmount) -> RuntimeNumber {
 
 fn number_to_mpt_stamount(issue: MPTIssue, number: RuntimeNumber) -> STAmount {
     to_amount_from_number(Asset::MPTIssue(issue), number, RoundingMode::TowardsZero)
-        .expect("MPT amount should stay representable")
+        .unwrap_or_else(|_| {
+            basics::contract::throw_overflow("Vault MPT Number::rep overflow")
+        })
 }
 
 fn number_to_asset_stamount(asset: Asset, number: RuntimeNumber) -> STAmount {
-    to_amount_from_number(asset, number, RoundingMode::TowardsZero)
-        .expect("asset amount should stay representable")
+    to_amount_from_number(asset, number, RoundingMode::TowardsZero).unwrap_or_else(|_| {
+        basics::contract::throw_overflow("Vault asset Number materialization overflow")
+    })
 }
 
 fn vault_asset(vault: &STLedgerEntry) -> Asset {
@@ -112,7 +115,7 @@ pub fn assets_to_shares_deposit(
             assets.exponent() + vault_scale,
             scale,
         )
-        .ok()?;
+        .unwrap_or_else(|_| basics::contract::throw_overflow("Vault deposit Number::normalize overflow"));
         let truncated = scaled.truncate(scale);
         return Some(number_to_mpt_stamount(share_issue, truncated));
     }
@@ -147,7 +150,7 @@ pub fn shares_to_assets_deposit(
             shares.exponent() - vault_scale,
             scale,
         )
-        .ok()?;
+        .unwrap_or_else(|_| basics::contract::throw_overflow("Vault deposit Number::normalize overflow"));
         return Some(number_to_asset_stamount(asset, result));
     }
 

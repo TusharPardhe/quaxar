@@ -64,7 +64,7 @@ pub fn multiply(amount: &STAmount, frac: RuntimeNumber, mode: RoundingMode) -> S
 }
 
 fn solve_quadratic_eq(a: RuntimeNumber, b: RuntimeNumber, c: RuntimeNumber) -> RuntimeNumber {
-    (-b + root2(b * b - number_from_i64(4) * a * c).expect("discriminant should be nonnegative"))
+    (-b + root2(b * b - number_from_i64(4) * a * c).unwrap_or_else(|error| basics::contract::throw_overflow(format!("Number::root {error:?}"))))
         / (number_from_i64(2) * a)
 }
 
@@ -81,8 +81,7 @@ pub fn amm_lp_tokens(asset1: &STAmount, asset2: &STAmount, lpt_issue: Issue) -> 
         get_rounding_mode()
     };
     let _guard = NumberRoundModeGuard::new(rounding);
-    let tokens = root2(stamount_as_number(asset1) * stamount_as_number(asset2))
-        .expect("square root should succeed for nonnegative pool balances");
+    let tokens = root2(stamount_as_number(asset1) * stamount_as_number(asset2)).unwrap_or_else(|error| basics::contract::throw_overflow(format!("Number::root {error:?}")));
     to_st_amount(lpt_issue, tokens)
 }
 
@@ -95,7 +94,7 @@ pub fn lp_tokens_out(
     let f1 = protocol::fee_mult(tfee);
     let f2 = protocol::fee_mult_half(tfee) / f1;
     let r = stamount_as_number(asset1_deposit) / stamount_as_number(asset1_balance);
-    let c = root2(f2 * f2 + r / f1).expect("root2 should succeed") - f2;
+    let c = root2(f2 * f2 + r / f1).unwrap_or_else(|error| basics::contract::throw_overflow(format!("Number::root {error:?}"))) - f2;
     if !is_feature_enabled(&fix_ammv1_3()) {
         let t = stamount_as_number(lpt_amm_balance) * (r - c) / (number_from_i64(1) + c);
         return to_st_amount(lpt_amm_balance.issue(), t);
@@ -141,7 +140,7 @@ pub fn lp_tokens_in(
     let fr = stamount_as_number(asset1_withdraw) / stamount_as_number(asset1_balance);
     let f1 = get_fee(tfee);
     let c = fr * f1 + number_from_i64(2) - f1;
-    let frac = (c - root2(c * c - number_from_i64(4) * fr).expect("root2 should succeed"))
+    let frac = (c - root2(c * c - number_from_i64(4) * fr).unwrap_or_else(|error| basics::contract::throw_overflow(format!("Number::root {error:?}"))))
         / number_from_i64(2);
     if !is_feature_enabled(&fix_ammv1_3()) {
         return to_st_amount(
@@ -245,8 +244,7 @@ pub fn check_amm_precision_loss(
     if new_lp_token_balance.signum() <= 0 {
         return protocol::Ter::TES_SUCCESS;
     }
-    let product_mean = root2(stamount_as_number(amount) * stamount_as_number(amount2))
-        .expect("nonnegative AMM pool product must have a square root");
+    let product_mean = root2(stamount_as_number(amount) * stamount_as_number(amount2)).unwrap_or_else(|error| basics::contract::throw_overflow(format!("Number::root {error:?}")));
     let lp_balance = stamount_as_number(new_lp_token_balance);
     if product_mean >= lp_balance {
         return protocol::Ter::TES_SUCCESS;

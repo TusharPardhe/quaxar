@@ -50,6 +50,26 @@ impl fmt::Display for AmountError {
 
 impl std::error::Error for AmountError {}
 
+impl AmountError {
+    /// Unwind with the payload of the C++ exception rippled throws for this
+    /// failure, so typed catch sites (`catch (std::overflow_error&)`) select
+    /// the same branch:
+    /// - `ArithmeticOverflow`: `muldiv`/`Number` overflow, `std::overflow_error`.
+    /// - `IssuedOutOfRange`: `IOUAmount(Number)` "value overflow",
+    ///   `std::overflow_error`.
+    /// - native/MPT range and division by zero: `std::runtime_error`.
+    pub fn throw(self) -> ! {
+        match self {
+            Self::ArithmeticOverflow | Self::IssuedOutOfRange => {
+                basics::contract::throw_overflow(self.to_string())
+            }
+            Self::NativeOutOfRange | Self::MptOutOfRange | Self::DivisionByZero => {
+                basics::contract::throw_runtime(self.to_string())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct STAmount {
     core: StBaseCore,
@@ -179,7 +199,7 @@ impl STAmount {
         negative: bool,
     ) -> Self {
         Self::try_new_with_asset(field, asset, mantissa, exponent, negative)
-            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|error| error.throw())
     }
 
     pub fn try_new_with_asset(
@@ -372,7 +392,7 @@ impl STAmount {
 
     fn canonicalize(&mut self) {
         self.try_canonicalize()
-            .unwrap_or_else(|error| panic!("{error}"));
+            .unwrap_or_else(|error| error.throw());
     }
 
     fn try_canonicalize(&mut self) -> Result<(), AmountError> {
