@@ -358,3 +358,49 @@ on-disk bytes and SHAMap verification are unchanged.
 Remaining: the export is still bound by the serial LSM scan (34 s) and the
 pass-2 copy (8.5 s); those levers (partitioned parallel scan, chunk-table at
 file end) are described above and not yet done.
+
+## 7. Snapshot format v2: leaves only, rebuilt on load
+
+A SHAMap inner node is fully determined by its 16 child hashes, so v2 stores
+only the leaves of the anchor ledger's state and transaction maps, sorted by
+key. The loader rebuilds every inner node bottom-up with one open node per
+depth (O(depth) memory), writes each node as soon as it is final, and verifies
+by matching the rebuilt roots with the header's `account_hash` / `tx_hash`.
+That replaces the separate read-back walk of all 30M nodes. This is the
+Ethereum `snap` approach ("retrieve and verify all the account and storage
+data without downloading intermediate Merkle trie nodes. The final state trie
+is reassembled locally") and bottom-up bulk loading of a B+-tree from sorted
+input. The builder reproduces rippled's canonical shape (no path compression)
+and is tested against quaxar's own SHAMap insert path: same root, same bytes
+for every node. v1 files are rejected by version.
+
+Testnet, same ledger size (22.1M state leaves, 30.6M nodes rebuilt), 4 vCPU:
+
+| | v1 best (parallel verify + ingestion) | v2 |
+| --- | --- | --- |
+| file size | 4.98 GB | 2.68 GB |
+| export (node online) | 43 s | 112 s |
+| load into a fresh store | 114 s | 99 s |
+| load peak RSS | ~4.6 GB | 0.38 GB |
+| start to `full` | ~15 s | ~20 s |
+
+What made the v2 load fast, from a perf profile of the first cut (142 s):
+- Nodes are hashed directly (SHA-512-half over the stored prefix bytes)
+  instead of building `SHAMapTreeNode` objects, and each chunk's leaves are
+  hashed in parallel.
+- On a store whose node table was empty, there is nothing to reconcile, so
+  the 30M-hash retained set is not collected (this removed ~27 s and most of
+  the memory); non-empty stores keep the reconcile path.
+
+A writer-thread pipeline was tried and reverted: it hung in fjall's
+`local_backpressure` (4+ sealed memtables, all fjall workers idle, no flush
+queued). Writes run inline from the rebuild loop.
+
+Export is slower than v1 (112 s vs 43 s) because it walks the tree with one
+random store lookup per node rather than scanning the store sequentially; it
+is parallelized over the state map's depth-2 subtrees. Export runs in the
+background on a node that is already serving, so it is off the bootstrap
+critical path; download size and load time are on it, and both improved.
+
+Correctness on a v2-bootstrapped node: `full` with one transition, ledger and
+account hash parity on every sampled ledger, `pruned_verify_last_ok = true`.
