@@ -1013,6 +1013,11 @@ pub fn build_bootstrap_root(
     root.set_status_rpc_node_size(configured_node_size.clone());
     attach_bootstrap_node_family(&mut root, configured_node_size.as_deref());
     attach_production_shamap_store_runtime(&mut root, pending_shamap_store)?;
+    // LedgerHistory falls back to the store for uncached ledgers, as rippled's
+    // getLedgerByHash/getLedgerBySeq do via loadByHash/loadByIndex.
+    if crate::ledger::loaded_ledger_runtime::AppLedgerStoreLoader::install(&root) {
+        tracing::info!(target: "bootstrap", "ledger history store loader installed");
+    }
     initialize_startup_ledger_state(&root, options, config)?;
     root.bind_default_component_runtimes();
 

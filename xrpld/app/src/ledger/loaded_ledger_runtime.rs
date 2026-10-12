@@ -159,6 +159,84 @@ impl SHAMapNodeFetcher for LoadedLedgerNodeFetcher {
     }
 }
 
+/// rippled `loadByHash` / `loadByIndex` for `LedgerHistory`: the ledger
+/// header comes from the relational `Ledgers` table and the maps from the
+/// node store, through the node family's shared tree-node cache.
+pub struct AppLedgerStoreLoader {
+    config: LedgerConfig,
+    provider: LoadedLedgerDbProvider,
+    family: LoadedLedgerFamily,
+}
+
+impl std::fmt::Debug for AppLedgerStoreLoader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AppLedgerStoreLoader")
+    }
+}
+
+impl AppLedgerStoreLoader {
+    /// `None` unless both the relational database and the node store exist.
+    pub fn from_root(root: &ApplicationRoot) -> Option<Self> {
+        let relational = root.relational_database().clone()?;
+        let node_store = root.node_store().clone()?;
+        let tree_cache = root.shared_tree_cache_arc().cloned().unwrap_or_else(|| {
+            Arc::new(TreeNodeCache::new(
+                "ledger-store-loader",
+                DEFAULT_TREE_CACHE_SIZE,
+                DEFAULT_TREE_CACHE_AGE,
+                MonotonicClock::default(),
+            ))
+        });
+        Some(Self {
+            config: LedgerConfig::default(),
+            provider: LoadedLedgerDbProvider::new(Some(relational)),
+            family: SHAMapFamily::new(
+                tree_cache,
+                NullFullBelowCache::new(0),
+                LoadedLedgerNodeFetcher::new(Some(node_store)),
+                NullMissingNodeReporter,
+            ),
+        })
+    }
+
+    /// Install on the root's LedgerMaster. Returns whether it was installed.
+    pub fn install(root: &ApplicationRoot) -> bool {
+        let (Some(runtime), Some(loader)) = (root.ledger_master_runtime(), Self::from_root(root))
+        else {
+            return false;
+        };
+        runtime.ledger_master().set_store_loader(Arc::new(loader))
+    }
+}
+
+impl ledger::LedgerStoreLoader for AppLedgerStoreLoader {
+    fn load_by_hash(&self, hash: SHAMapHash) -> Option<Ledger> {
+        Ledger::load_by_hash_with_provider_and_config_or_none(
+            hash,
+            true,
+            &NullLedgerJournal,
+            &self.config,
+            &self.family,
+            &self.provider,
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn load_by_index(&self, seq: u32) -> Option<Ledger> {
+        Ledger::load_by_index_with_provider_and_config_or_none(
+            seq,
+            true,
+            &NullLedgerJournal,
+            &self.config,
+            &self.family,
+            &self.provider,
+        )
+        .ok()
+        .flatten()
+    }
+}
+
 #[derive(Clone)]
 pub struct AppLoadedLedgerRuntime {
     ledger_master: Arc<AppLedgerMaster>,

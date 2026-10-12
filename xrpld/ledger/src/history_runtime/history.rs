@@ -31,6 +31,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use time::Duration;
 
+/// rippled `loadByHash` / `loadByIndex` (Ledger.cpp): build an immutable
+/// ledger from the relational ledger header and the node store. The
+/// application supplies this so the ledger crate stays storage-agnostic.
+pub trait LedgerStoreLoader: Send + Sync + std::fmt::Debug {
+    fn load_by_hash(&self, hash: SHAMapHash) -> Option<Ledger>;
+    fn load_by_index(&self, seq: u32) -> Option<Ledger>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConsensusValidatedEntry {
     pub built: Option<SHAMapHash>,
@@ -221,6 +229,56 @@ where
             .get(&ledger_index)
             .copied()?;
         self.get_cached_ledger_by_hash(hash)
+    }
+
+    /// rippled `LedgerHistory::getLedgerByHash`: the cache, then
+    /// `loadByHash` from the store, canonicalized into the cache.
+    pub fn get_ledger_by_hash_or_load(
+        &self,
+        ledger_hash: SHAMapHash,
+        loader: Option<&dyn LedgerStoreLoader>,
+    ) -> Option<Arc<Ledger>> {
+        if let Some(ledger) = self.ledgers_by_hash.fetch(&ledger_hash) {
+            return Some(ledger);
+        }
+        let ledger = loader?.load_by_hash(ledger_hash)?;
+        if ledger.header().hash != ledger_hash || !ledger.is_immutable() {
+            return None;
+        }
+        let mut ledger = Arc::new(ledger);
+        self.ledgers_by_hash
+            .canonicalize_replace_client(&ledger.header().hash, &mut ledger);
+        Some(ledger)
+    }
+
+    /// rippled `LedgerHistory::getLedgerBySeq`: a known index goes through
+    /// `getLedgerByHash`; otherwise `loadByIndex`, then cache and index it.
+    pub fn get_ledger_by_seq_or_load(
+        &self,
+        ledger_index: u32,
+        loader: Option<&dyn LedgerStoreLoader>,
+    ) -> Option<Arc<Ledger>> {
+        if let Some(hash) = self
+            .ledgers_by_index
+            .lock()
+            .expect("ledger-history index mutex must not be poisoned")
+            .get(&ledger_index)
+            .copied()
+        {
+            return self.get_ledger_by_hash_or_load(hash, loader);
+        }
+        let ledger = loader?.load_by_index(ledger_index)?;
+        if ledger.header().seq != ledger_index || !ledger.is_immutable() {
+            return None;
+        }
+        let mut ledger = Arc::new(ledger);
+        self.ledgers_by_hash
+            .canonicalize_replace_client(&ledger.header().hash, &mut ledger);
+        self.ledgers_by_index
+            .lock()
+            .expect("ledger-history index mutex must not be poisoned")
+            .insert(ledger.header().seq, ledger.header().hash);
+        Some(ledger)
     }
 
     pub fn get_ledger_by_hash<P, CLOCK, FB, F, MR, NS, J>(
