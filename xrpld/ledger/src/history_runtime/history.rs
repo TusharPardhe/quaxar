@@ -205,12 +205,12 @@ where
     }
 
     /// Ledgers currently resident in the history cache (diagnostics).
+    /// Strongly held ledgers, read without refreshing access times or
+    /// promoting weak entries. `fetch` on every key would touch them all and
+    /// stop the size/age sweep from ever expiring history (diagnostics call
+    /// this once a minute).
     pub fn cached_ledgers(&self) -> Vec<Arc<Ledger>> {
-        self.ledgers_by_hash
-            .get_keys()
-            .into_iter()
-            .filter_map(|hash| self.ledgers_by_hash.fetch(&hash))
-            .collect()
+        self.ledgers_by_hash.strong_values()
     }
 
     pub fn get_cached_ledger_by_seq(&self, ledger_index: u32) -> Option<Arc<Ledger>> {
