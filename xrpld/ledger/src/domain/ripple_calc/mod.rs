@@ -218,21 +218,56 @@ pub fn ripple_calculate<V: ApplyView>(
     // Only apply the sandbox to the parent view on tesSUCCESS.
     // On failure, the sandbox is discarded (no state changes).
     let mut flow_sb = crate::FlowSandbox::new(view);
-    let result = ripple_calculate_inner(
-        &mut flow_sb,
-        max_source_amount,
-        dst_amount,
-        dst_account,
-        src_account,
-        paths,
-        input,
-    )?;
+    // rippled RippleCalc::rippleCalculate wraps flow() in
+    // `catch (std::exception&)` and returns tecINTERNAL ("return a tec so the
+    // tx is stored"), discarding the flow sandbox. A panic inside the flow
+    // engine (e.g. an STAmount overflow) must do the same here: letting it
+    // escape turns it into tefEXCEPTION at the apply layer, which drops the
+    // transaction from the ledger and forks from the network.
+    let result = match catch_flow_exception(|| {
+        ripple_calculate_inner(
+            &mut flow_sb,
+            max_source_amount,
+            dst_amount,
+            dst_account,
+            src_account,
+            paths,
+            input,
+        )
+    }) {
+        Some(result) => result?,
+        None => {
+            return Ok(RippleCalcOutput {
+                result: Ter::TEC_INTERNAL,
+                actual_amount_in: max_source_amount.zeroed(),
+                actual_amount_out: dst_amount.zeroed(),
+            });
+        }
+    };
 
     if is_tes_success(result.result) {
         flow_sb.apply()?;
     }
 
     Ok(result)
+}
+
+/// Run the flow engine, containing a panic as rippled's RippleCalc contains a
+/// thrown exception from `flow()`: `None` means the caller must return
+/// tecINTERNAL and discard the flow sandbox.
+fn catch_flow_exception<T>(flow: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(flow)) {
+        Ok(value) => Some(value),
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            tracing::error!(target: "ledger", %message, "Exception from flow");
+            None
+        }
+    }
 }
 
 /// Inner flow engine logic that operates on the FlowSandbox.
@@ -848,7 +883,18 @@ fn try_explicit_path<V: ApplyView>(
 mod tests {
     use protocol::{AccountID, Asset, IOUAmount, Issue, STAmount, Ter, XRPAmount};
 
-    use super::{RippleCalcInput, flow_send_max_asset, preserves_partial_flow_result};
+    use super::{
+        RippleCalcInput, catch_flow_exception, flow_send_max_asset, preserves_partial_flow_result,
+    };
+
+    #[test]
+    fn flow_panic_is_contained_like_rippled_exception() {
+        // rippled returns tecINTERNAL for an exception thrown from flow();
+        // the caller maps `None` to that result instead of unwinding.
+        assert_eq!(catch_flow_exception(|| 7), Some(7));
+        let contained: Option<u8> = catch_flow_exception(|| panic!("STAmount overflow"));
+        assert_eq!(contained, None);
+    }
 
     #[test]
     fn explicit_same_asset_send_max_remains_present_for_strand_building() {
