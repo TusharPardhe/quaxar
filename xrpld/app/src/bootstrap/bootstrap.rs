@@ -89,27 +89,24 @@ fn mrc_tolerance() -> f64 {
 }
 /// Never size the TreeNodeCache below this many entries.
 const TREE_CACHE_MRC_MIN: usize = 65_536;
-/// Never size the NodeObject cache below this many bytes.
-const NODE_OBJECT_CACHE_MRC_MIN_BYTES: u64 = 64 << 20;
 /// Sampled references needed before a curve is trusted. SHARDS reports mean
 /// absolute MRC error around 0.01 at a few thousand samples; a few hundred
 /// bound the error near 0.05, enough to pick a knee on a curve this flat.
 const MRC_MIN_SAMPLES: u64 = 400;
 
-/// Size the TreeNodeCache and NodeObject cache from their measured
-/// miss-ratio curves (SHARDS, Waldspurger et al., FAST 2015) instead of fixed
+/// Size the TreeNodeCache from its measured
+/// miss-ratio curve (SHARDS, Waldspurger et al., FAST 2015) instead of fixed
 /// `node_size` constants. Sampling runs only while the node is full, so the
 /// one-off sync workload neither pays for it nor shapes the steady-state
-/// curve. Each cache target becomes its curve's knee, capped by the configured
-/// size; the OS page cache keeps serving the rest of the store.
+/// curve. The target becomes the curve's knee, capped by the configured size.
+/// There is no NodeObject cache: store reads are served by the OS page cache.
 /// `QUAXAR_MRC_CACHE=0` keeps the configured sizes (curves are still logged).
-fn size_caches_from_mrc(root: &ApplicationRoot) {
+fn size_tree_cache_from_mrc(root: &ApplicationRoot) {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     static SWEEPS: AtomicU64 = AtomicU64::new(0);
     static CONFIGURED: AtomicUsize = AtomicUsize::new(0);
     let full = root.network_ops_operating_mode() == crate::NetworkOpsOperatingMode::Full;
     shamap::access_mrc::set_enabled(full);
-    nodestore::node_object_mrc::set_enabled(full);
     let enabled = !std::env::var("QUAXAR_MRC_CACHE").is_ok_and(|value| value == "0");
 
     if let Some(cache) = root.shared_tree_cache() {
@@ -143,41 +140,8 @@ fn size_caches_from_mrc(root: &ApplicationRoot) {
         );
     }
 
-    if let Some(crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(database)) =
-        root.node_store().as_ref()
-    {
-        let (configured, live, entries, weighted) = database.node_object_cache_sizing();
-        let (curve, samples, knee) = nodestore::node_object_mrc::snapshot(mrc_tolerance());
-        // Convert the knee (entries) to bytes with the measured mean entry size.
-        let mean = if entries > 0 { (weighted / entries).max(1) } else { 512 };
-        let target = match knee {
-            Some(knee) if enabled && full && samples >= MRC_MIN_SAMPLES => knee
-                .saturating_mul(mean)
-                .clamp(NODE_OBJECT_CACHE_MRC_MIN_BYTES, configured.max(NODE_OBJECT_CACHE_MRC_MIN_BYTES)),
-            _ => configured,
-        };
-        // Resize only on a >25% change: a resize drops the cache contents.
-        if target.abs_diff(live) > live / 4 {
-            database.resize_node_object_cache_bytes(target);
-        }
-        tracing::info!(
-            target: "app",
-            event = "node_object_cache_mrc",
-            samples,
-            knee = knee.unwrap_or(0),
-            mean_entry_bytes = mean,
-            target_bytes = target,
-            live_bytes = live,
-            configured_bytes = configured,
-            entries,
-            curve = %basics::sync::shards::format_curve(&curve),
-            "NodeObject cache miss-ratio curve"
-        );
-    }
-
     if SWEEPS.fetch_add(1, Ordering::Relaxed) % 10 == 9 {
         shamap::access_mrc::decay();
-        nodestore::node_object_mrc::decay();
     }
 }
 
@@ -229,7 +193,7 @@ impl ApplicationSweepActions for ProductionApplicationSweep<'_> {
     }
 
     fn sweep_node_family(&self) {
-        size_caches_from_mrc(self.root);
+        size_tree_cache_from_mrc(self.root);
         let before_size = self
             .root
             .shared_tree_cache()

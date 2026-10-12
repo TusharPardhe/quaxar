@@ -56,7 +56,7 @@ fn shamap_store_bootstrap_can_attach_node_store_to_application_root() {
 }
 
 #[test]
-fn shamap_store_bootstrap_injects_large_profile_into_node_object_cache() {
+fn shamap_store_bootstrap_injects_no_node_object_cache_settings() {
     let dir = TempDir::new().expect("tempdir");
     let mut config = BasicConfig::new();
     config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
@@ -79,25 +79,15 @@ fn shamap_store_bootstrap_injects_large_profile_into_node_object_cache() {
     )
     .expect("bootstrap");
 
-    assert_eq!(
-        bootstrap
-            .effective_node_db_config
-            .get::<u64>("node_object_cache_target_nodes")
-            .expect("valid target"),
-        Some(4_194_304)
-    );
-    assert_eq!(
-        bootstrap
-            .effective_node_db_config
-            .get::<u64>("cache_idle_seconds")
-            .expect("valid age"),
-        Some(7_200)
-    );
-    assert_eq!(
-        bootstrap
-            .effective_node_db_config
-            .get::<u64>("cache_ttl_seconds")
-            .expect("valid ttl"),
-        Some(0)
-    );
+    // There is no NodeObject cache, so no cache sizing is injected.
+    for key in [
+        "node_object_cache_target_nodes",
+        "cache_idle_seconds",
+        "cache_ttl_seconds",
+    ] {
+        assert!(
+            !bootstrap.effective_node_db_config.exists(key),
+            "{key} must not be injected"
+        );
+    }
 }
