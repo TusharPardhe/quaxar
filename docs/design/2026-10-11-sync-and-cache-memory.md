@@ -289,3 +289,55 @@ The verify speedup is 2.7x rather than 4x because part of the walk is bound by
 random LSM reads, which do not scale linearly with threads. The load phase is
 sequential bulk writes (fjall's strong suit) and is unchanged. Verification
 semantics are identical; the 19 snapshot tests pass on the parallel path.
+
+## 6. Snapshot export/load profiling (what is and is not the bottleneck)
+
+Full flow, measured on testnet (4 vCPU with SHA-NI + AVX2, 31M nodes, 4.9 GB
+file). The CPU has hardware SHA-256, so SHA-256 is already fast; the levers are
+I/O structure and the storage write path, not the hash or compression
+algorithm.
+
+### Export (~43 s)
+
+| Phase | Time | Bound by |
+| --- | --- | --- |
+| node iteration (LSM scan + encode + compress + hash) | 34.3 s | serial LSM scan of 31M nodes |
+| pass-2 copy (temp file to final file + whole-file SHA-256) | 8.5 s | 4.9 GB reread/rewrite |
+
+A parallel per-chunk compress+hash stage (pigz model, pigz(1): independent
+blocks compressed in parallel) was implemented and measured: **no change**
+(42 s serial vs 43 s with 4 threads). Compression is not the bottleneck; the
+export is bound by the single-cursor LSM scan. The change was reverted to keep
+the code simple. Real export levers, not yet done:
+- Partitioned parallel range scan: split the 256-bit key space into N ranges,
+  scan each concurrently (`Keyspace::range`), emit per-range chunk streams
+  (chunk order does not matter: the loader stores all nodes and verifies from
+  the roots). Targets the 34 s scan.
+- Eliminate the pass-2 copy by moving the chunk table to the end of the file
+  (so chunk data streams straight to the final file after a fixed header).
+  Removes the 8.5 s recopy but changes the file layout (needs a version bump).
+
+### Load (~2 m 25 s = ~46 s load + ~76 s verify)
+
+| Phase | Serial | Parallel (4 cores) | Bound by |
+| --- | --- | --- | --- |
+| load (verify chunk hash, decompress, decode, store) | 50.1 s | 46.5 s | serial fjall batch commits |
+| verify (walk the SHAMap graph) | 210.5 s | 75.6 s (2.8x) | random reads + SHA recompute |
+
+Only the verify parallelism (section 5) is a real win. A parallel per-chunk
+decode stage was implemented and measured: **negligible** (50 s to 46 s),
+because the load phase is bound by the single-writer fjall commit, not by
+decompression. Reverted with the export change.
+
+The real load lever is the storage write path. fjall 3.1 exposes a bulk
+ingestion API (`Keyspace::start_ingestion` to `write` to `finish`) that builds
+SSTables directly, bypassing the memtable and per-batch journal commit — the
+standard fast bulk-load technique (cf. RocksDB `IngestExternalFile`). Its
+precondition is that keys are written in strictly ascending order. The export
+iterates the fjall `nodes` keyspace, which yields keys in sorted order, and
+that order is preserved through the chunk stream, so the load can feed
+ingestion directly if the decode path stays in order (another reason the
+reordering parallel-decode window was the wrong direction). Wiring ingestion
+through the backend's `bulk_import_start`/`bulk_import_finish` hooks (currently
+no-ops) is the next step and should move the 46 s load phase toward its
+disk-write floor.
