@@ -20,6 +20,7 @@ use std::sync::{
 };
 use std::time::Instant;
 
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use super::{SnapshotError, manifest::*};
@@ -151,29 +152,52 @@ fn export_snapshot_inner(
     let mut node_count: u64 = 0;
     let mut total_compressed: u64 = 0;
 
-    // Closure to flush one chunk to the temp file
-    let flush_chunk = |buf: &mut Vec<u8>,
-                       metas: &mut Vec<ChunkMeta>,
-                       writer: &mut BufWriter<File>,
-                       total: &mut u64|
+    // Raw (uncompressed) chunks awaiting the parallel compress+hash stage.
+    // Compression and SHA-256 of independent chunks are embarrassingly
+    // parallel (the pigz model: the input is split into independent blocks,
+    // each compressed in parallel; see pigz(1)). We buffer up to
+    // `compress_window` raw chunks, process them across a rayon pool, and
+    // write the results in chunk order so the file bytes are identical to the
+    // serial path. Peak extra memory is bounded to
+    // `compress_window * (raw + compressed)` (~tens of MB), preserving the
+    // streaming design.
+    let compress_window = rayon::current_num_threads().max(1);
+    let mut pending_raw: Vec<Vec<u8>> = Vec::with_capacity(compress_window);
+
+    // Compress + hash a window of raw chunks in parallel and write them in
+    // order, appending their metadata.
+    let drain_window = |pending: &mut Vec<Vec<u8>>,
+                        metas: &mut Vec<ChunkMeta>,
+                        writer: &mut BufWriter<File>,
+                        total: &mut u64|
      -> Result<(), SnapshotError> {
         check_cancelled(cancellation)?;
-        if buf.is_empty() {
+        if pending.is_empty() {
             return Ok(());
         }
-        let compressed = lz4_flex::block::compress_prepend_size(buf);
-        let hash: [u8; 32] = Sha256::digest(&compressed).into();
-        let compressed_len = compressed.len() as u32;
-        metas.push(ChunkMeta {
-            compressed_len,
-            sha256: hash,
-        });
-        writer
-            .write_all(&compressed)
-            .map_err(|e| SnapshotError::io("writing chunk to temp file", e))?;
-        check_cancelled(cancellation)?;
-        *total += compressed.len() as u64;
-        buf.clear();
+        // par_iter preserves index order in the collected Vec, so chunk order
+        // (and thus the chunk table) is deterministic regardless of thread
+        // scheduling.
+        let processed: Vec<(Vec<u8>, ChunkMeta)> = pending
+            .par_iter()
+            .map(|buf| {
+                let compressed = lz4_flex::block::compress_prepend_size(buf);
+                let sha256: [u8; 32] = Sha256::digest(&compressed).into();
+                let meta = ChunkMeta {
+                    compressed_len: compressed.len() as u32,
+                    sha256,
+                };
+                (compressed, meta)
+            })
+            .collect();
+        for (compressed, meta) in processed {
+            writer
+                .write_all(&compressed)
+                .map_err(|e| SnapshotError::io("writing chunk to temp file", e))?;
+            *total += compressed.len() as u64;
+            metas.push(meta);
+        }
+        pending.clear();
         Ok(())
     };
 
@@ -193,7 +217,7 @@ fn export_snapshot_inner(
         let obj_type_u32 = node.object_type() as u32;
         if obj_type_u32 > MAX_NODE_TYPE_U8 {
             export_error = Some(SnapshotError::MalformedNodeRecord {
-                chunk_index: chunk_metas.len(),
+                chunk_index: chunk_metas.len() + pending_raw.len(),
                 offset: current_buf.len(),
                 reason: format!(
                     "NodeObjectType discriminant {} exceeds u8 range; cannot encode in snapshot",
@@ -212,12 +236,21 @@ fn export_snapshot_inner(
         node_count += 1;
 
         if current_buf.len() >= SNAPSHOT_CHUNK_UNCOMPRESSED_TARGET {
-            if let Err(e) = flush_chunk(
+            // Hand the finished raw chunk to the pending window and start a new
+            // buffer; drain (compress+hash+write) once the window is full.
+            let finished = std::mem::replace(
                 &mut current_buf,
-                &mut chunk_metas,
-                &mut chunks_writer,
-                &mut total_compressed,
-            ) {
+                Vec::with_capacity(SNAPSHOT_CHUNK_UNCOMPRESSED_TARGET + 4096),
+            );
+            pending_raw.push(finished);
+            if pending_raw.len() >= compress_window
+                && let Err(e) = drain_window(
+                    &mut pending_raw,
+                    &mut chunk_metas,
+                    &mut chunks_writer,
+                    &mut total_compressed,
+                )
+            {
                 export_error = Some(e);
                 return;
             }
@@ -239,9 +272,12 @@ fn export_snapshot_inner(
     traversal_result.map_err(|reason| SnapshotError::BackendTraversalFailed { reason })?;
     check_cancelled(cancellation)?;
 
-    // Flush remaining buffer
-    flush_chunk(
-        &mut current_buf,
+    // Final partial chunk, then drain whatever remains in the window.
+    if !current_buf.is_empty() {
+        pending_raw.push(std::mem::take(&mut current_buf));
+    }
+    drain_window(
+        &mut pending_raw,
         &mut chunk_metas,
         &mut chunks_writer,
         &mut total_compressed,

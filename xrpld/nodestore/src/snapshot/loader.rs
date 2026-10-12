@@ -136,6 +136,43 @@ pub fn load_snapshot(
     let mut import_guard = BulkImportGuard::new(backend);
 
     let mut total_nodes = 0u64;
+
+    // Decode a window of chunks in parallel (verify SHA-256, decompress, decode
+    // records), then commit the resulting batches to the backend in chunk
+    // order. Reading and the whole-file hash stay serial to keep file order;
+    // the CPU-bound per-chunk work (independent blocks, pigz model) runs across
+    // a rayon pool. The fjall commit is the single-writer serialization point.
+    let decode_window = rayon::current_num_threads().max(1);
+    // Each entry: (chunk_index, compressed_bytes).
+    let mut pending: Vec<(usize, Vec<u8>)> = Vec::with_capacity(decode_window);
+
+    let decode_and_store = |pending: &mut Vec<(usize, Vec<u8>)>,
+                            backend: &dyn Backend,
+                            total_nodes: &mut u64|
+     -> Result<(), SnapshotError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        // par_iter preserves order; each worker verifies + decompresses +
+        // decodes one chunk into an owned Batch. Errors propagate as the first
+        // Err by index.
+        let decoded: Vec<Result<Batch, SnapshotError>> = pending
+            .par_iter()
+            .map(|(i, compressed)| decode_chunk(*i, compressed))
+            .collect();
+        for batch in decoded {
+            let batch = batch?;
+            backend
+                .store_batch_result(&batch)
+                .map_err(|reason| SnapshotError::BackendWriteFailed {
+                    reason: format!("batch store: {reason}"),
+                })?;
+            *total_nodes += batch.len() as u64;
+        }
+        pending.clear();
+        Ok(())
+    };
+
     for (i, meta) in manifest.chunks.iter().enumerate() {
         let compressed_len = meta.compressed_len as usize;
         if compressed_len > SNAPSHOT_MAX_COMPRESSED_CHUNK_BYTES {
@@ -152,6 +189,8 @@ pub fn load_snapshot(
             .map_err(|e| SnapshotError::io("reading chunk data", e))?;
         file_hasher.update(&compressed);
 
+        // Cheap bound check up front; the full SHA-256 verify and decompress
+        // happen in the parallel stage.
         let computed_hash: [u8; 32] = Sha256::digest(&compressed).into();
         if computed_hash != meta.sha256 {
             return Err(SnapshotError::ChunkHashMismatch {
@@ -161,53 +200,9 @@ pub fn load_snapshot(
             });
         }
 
-        let (declared_uncompressed_len, _) = lz4_flex::block::uncompressed_size(&compressed)
-            .map_err(|e| SnapshotError::DecompressionFailed {
-                chunk_index: i,
-                reason: e.to_string(),
-            })?;
-        if declared_uncompressed_len > SNAPSHOT_MAX_UNCOMPRESSED_CHUNK_BYTES {
-            return Err(SnapshotError::ResourceLimitExceeded {
-                resource: "uncompressed chunk bytes",
-                actual: declared_uncompressed_len as u64,
-                limit: SNAPSHOT_MAX_UNCOMPRESSED_CHUNK_BYTES as u64,
-            });
-        }
-        let decompressed =
-            lz4_flex::block::decompress_size_prepended(&compressed).map_err(|e| {
-                SnapshotError::DecompressionFailed {
-                    chunk_index: i,
-                    reason: e.to_string(),
-                }
-            })?;
-
-        let mut batch: Batch = Vec::new();
-        let mut offset = 0;
-        while offset < decompressed.len() {
-            let (node_type_byte, hash, data_range, consumed) =
-                decode_node_record(&decompressed, offset, i)?;
-            let object_type = NodeObjectType::try_from(node_type_byte).map_err(|_| {
-                SnapshotError::MalformedNodeRecord {
-                    chunk_index: i,
-                    offset,
-                    reason: format!("unsupported node type {node_type_byte}"),
-                }
-            })?;
-            batch.push(Arc::new(NodeObject::new(
-                object_type,
-                decompressed[data_range].to_vec(),
-                Uint256::from_array(hash),
-            )));
-            offset += consumed;
-        }
-
-        backend
-            .store_batch_result(&batch)
-            .map_err(|reason| SnapshotError::BackendWriteFailed {
-                reason: format!("chunk {i}: {reason}"),
-            })?;
-        total_nodes += batch.len() as u64;
-        if (i + 1) % 10 == 0 || i + 1 == manifest.chunks.len() {
+        pending.push((i, compressed));
+        if pending.len() >= decode_window {
+            decode_and_store(&mut pending, backend, &mut total_nodes)?;
             tracing::info!(
                 target: "snapshot",
                 chunk = i + 1,
@@ -218,6 +213,7 @@ pub fn load_snapshot(
             );
         }
     }
+    decode_and_store(&mut pending, backend, &mut total_nodes)?;
 
     // Finalize any backend bulk-import indexes before the footer and SHAMap
     // graph are verified. The guard restores the incomplete-import marker if a
@@ -295,6 +291,52 @@ pub fn load_snapshot(
         manifest,
         required_nodes,
     })
+}
+
+/// Verify one compressed chunk's bound, decompress it, and decode its node
+/// records into a `Batch`. Runs on a rayon worker; does no backend I/O.
+fn decode_chunk(chunk_index: usize, compressed: &[u8]) -> Result<Batch, SnapshotError> {
+    let (declared_uncompressed_len, _) =
+        lz4_flex::block::uncompressed_size(compressed).map_err(|e| {
+            SnapshotError::DecompressionFailed {
+                chunk_index,
+                reason: e.to_string(),
+            }
+        })?;
+    if declared_uncompressed_len > SNAPSHOT_MAX_UNCOMPRESSED_CHUNK_BYTES {
+        return Err(SnapshotError::ResourceLimitExceeded {
+            resource: "uncompressed chunk bytes",
+            actual: declared_uncompressed_len as u64,
+            limit: SNAPSHOT_MAX_UNCOMPRESSED_CHUNK_BYTES as u64,
+        });
+    }
+    let decompressed = lz4_flex::block::decompress_size_prepended(compressed).map_err(|e| {
+        SnapshotError::DecompressionFailed {
+            chunk_index,
+            reason: e.to_string(),
+        }
+    })?;
+
+    let mut batch: Batch = Vec::new();
+    let mut offset = 0;
+    while offset < decompressed.len() {
+        let (node_type_byte, hash, data_range, consumed) =
+            decode_node_record(&decompressed, offset, chunk_index)?;
+        let object_type = NodeObjectType::try_from(node_type_byte).map_err(|_| {
+            SnapshotError::MalformedNodeRecord {
+                chunk_index,
+                offset,
+                reason: format!("unsupported node type {node_type_byte}"),
+            }
+        })?;
+        batch.push(Arc::new(NodeObject::new(
+            object_type,
+            decompressed[data_range].to_vec(),
+            Uint256::from_array(hash),
+        )));
+        offset += consumed;
+    }
+    Ok(batch)
 }
 
 fn verify_manifest_ledger_hash(manifest: &SnapshotManifest) -> Result<(), SnapshotError> {
