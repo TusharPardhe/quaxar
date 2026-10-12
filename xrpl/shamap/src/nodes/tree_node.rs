@@ -67,6 +67,39 @@ pub fn count_resident_reachable<'a>(
     (inner, leaf)
 }
 
+/// Count distinct resident nodes per owner group, exclusively: each group is
+/// walked in order and nodes already counted by an earlier group are skipped
+/// (ledgers share structure). Returns `(inner, leaf)` per group, in order.
+pub fn count_resident_by_owner(
+    groups: &[Vec<SharedIntrusive<SHAMapTreeNode>>],
+) -> Vec<(u64, u64)> {
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(groups.len());
+    for roots in groups {
+        let mut stack: Vec<SharedIntrusive<SHAMapTreeNode>> = roots.to_vec();
+        let (mut inner, mut leaf) = (0u64, 0u64);
+        while let Some(node) = stack.pop() {
+            // Identity by address: distinct allocations are distinct memory.
+            let addr = &*node as *const SHAMapTreeNode as usize;
+            if !seen.insert(addr) {
+                continue;
+            }
+            if node.is_inner() {
+                inner += 1;
+                for branch in 0..16 {
+                    if let Some(child) = node.get_child(branch) {
+                        stack.push(child);
+                    }
+                }
+            } else {
+                leaf += 1;
+            }
+        }
+        out.push((inner, leaf));
+    }
+    out
+}
+
 pub fn shamap_memory_stats() -> SHAMapMemoryStats {
     let allocated_inner_nodes = ALLOCATED_INNER_NODES.load(Ordering::Relaxed);
     let allocated_leaf_nodes = ALLOCATED_LEAF_NODES.load(Ordering::Relaxed);

@@ -886,6 +886,20 @@ where
         self.fetch(key).map(|value| (*value).clone())
     }
 
+    /// Clones of the strongly held values only, without touching access
+    /// times or promoting weak entries (diagnostics).
+    pub fn strong_values(&self) -> Vec<SP> {
+        let guard = self
+            .state
+            .lock()
+            .expect("TaggedCache mutex must not be poisoned");
+        guard
+            .cache
+            .iter()
+            .filter_map(|(_, entry)| entry.ptr.strong_clone())
+            .collect()
+    }
+
     pub fn get_keys(&self) -> Vec<K> {
         // Pre-allocate outside the lock to avoid blocking other threads
         // during potentially expensive heap allocation (rippled parity:

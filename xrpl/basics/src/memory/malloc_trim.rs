@@ -43,6 +43,15 @@ pub struct JemallocStats {
     pub resident_bytes: usize,
     pub retained_bytes: usize,
     pub arenas: u32,
+    /// Dirty and muzzy pages held by all arenas (bytes), not yet purged.
+    pub dirty_bytes: usize,
+    pub muzzy_bytes: usize,
+    /// Small-object bins: bytes in slabs vs bytes actually allocated in them.
+    /// The difference is fragmentation inside partly used slabs.
+    pub small_slab_bytes: usize,
+    pub small_allocated_bytes: usize,
+    /// Large allocations (beyond the small bins).
+    pub large_allocated_bytes: usize,
 }
 
 /// Return a refreshed snapshot of the allocator used by every Quaxar runtime
@@ -82,7 +91,22 @@ pub fn jemalloc_stats() -> Option<JemallocStats> {
             return None;
         }
 
+        let page = read_jemalloc_usize(c"arenas.page").unwrap_or(4096);
+        // MALLCTL_ARENAS_ALL = 4096: merged stats across arenas.
+        let pdirty = read_jemalloc_usize(c"stats.arenas.4096.pdirty").unwrap_or(0);
+        let pmuzzy = read_jemalloc_usize(c"stats.arenas.4096.pmuzzy").unwrap_or(0);
+        let small_allocated =
+            read_jemalloc_usize(c"stats.arenas.4096.small.allocated").unwrap_or(0);
+        let large_allocated =
+            read_jemalloc_usize(c"stats.arenas.4096.large.allocated").unwrap_or(0);
+        let small_slab_bytes = small_slab_bytes(page).unwrap_or(0);
+
         return Some(JemallocStats {
+            dirty_bytes: pdirty.saturating_mul(page),
+            muzzy_bytes: pmuzzy.saturating_mul(page),
+            small_slab_bytes,
+            small_allocated_bytes: small_allocated,
+            large_allocated_bytes: large_allocated,
             allocated_bytes: read_jemalloc_usize(c"stats.allocated")?,
             active_bytes: read_jemalloc_usize(c"stats.active")?,
             metadata_bytes: read_jemalloc_usize(c"stats.metadata")?,
@@ -95,6 +119,42 @@ pub fn jemalloc_stats() -> Option<JemallocStats> {
 
     #[cfg(not(all(feature = "jemalloc", not(target_env = "msvc"))))]
     None
+}
+
+/// Total bytes in small-bin slabs across all bins: sum over bins of
+/// `curslabs * slab_size`, with `slab_size = arenas.bin.<i>.slab_size`.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+fn small_slab_bytes(_page: usize) -> Option<usize> {
+    let nbins = read_jemalloc_u32(c"arenas.nbins")? as usize;
+    let mut total = 0usize;
+    for bin in 0..nbins {
+        let slab_size = read_jemalloc_usize_name(&format!("arenas.bin.{bin}.slab_size"))?;
+        let curslabs = read_jemalloc_usize_name(&format!("stats.arenas.4096.bins.{bin}.curslabs"))?;
+        total = total.saturating_add(slab_size.saturating_mul(curslabs));
+    }
+    Some(total)
+}
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+fn read_jemalloc_usize_name(name: &str) -> Option<usize> {
+    let name = std::ffi::CString::new(name).ok()?;
+    read_jemalloc_usize(&name)
+}
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+fn read_jemalloc_u32(name: &std::ffi::CStr) -> Option<u32> {
+    let mut value = 0_u32;
+    let mut value_len = std::mem::size_of_val(&value);
+    let result = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            name.as_ptr(),
+            (&mut value as *mut u32).cast(),
+            &mut value_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0).then_some(value)
 }
 
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]

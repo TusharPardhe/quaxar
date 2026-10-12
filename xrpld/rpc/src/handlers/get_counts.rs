@@ -11,6 +11,17 @@ use std::time::Duration;
 
 use basics::counted_object::CountedObjects;
 use basics::memory::malloc_trim::jemalloc_stats;
+
+/// Requests served per RPC method since start (diagnostics for memory soaks).
+static RPC_METHOD_COUNTS: std::sync::Mutex<BTreeMap<String, u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Count one served request for `method`.
+pub fn record_rpc_method(method: &str) {
+    if let Ok(mut counts) = RPC_METHOD_COUNTS.lock() {
+        *counts.entry(method.to_owned()).or_insert(0) += 1;
+    }
+}
 use basics::uptime_clock::{UptimeClock, UptimeTimePoint};
 use protocol::JsonValue;
 
@@ -52,6 +63,10 @@ pub trait GetCountsSource {
     /// this node holds. Walks memory only; opt-in because it is O(live nodes).
     fn held_tree_reachable(&self) -> Option<(u64, u64)> {
         None
+    }
+    /// Exclusive resident nodes per owner: `(name, inner, leaf)`.
+    fn resident_by_owner(&self) -> Vec<(&'static str, u64, u64)> {
+        Vec::new()
     }
 }
 
@@ -195,6 +210,13 @@ pub fn get_counts_json<S: GetCountsSource>(source: &S, min_count: u32) -> JsonVa
         JsonValue::String(format_uptime(UptimeClock::now())),
     );
 
+    if let Ok(counts) = RPC_METHOD_COUNTS.lock() {
+        let methods: BTreeMap<String, JsonValue> = counts
+            .iter()
+            .map(|(method, count)| (method.clone(), JsonValue::Unsigned(*count)))
+            .collect();
+        result.insert("rpc_method_counts".to_owned(), JsonValue::Object(methods));
+    }
     if let Some(stats) = jemalloc_stats() {
         result.insert(
             "jemalloc_allocated_bytes".to_owned(),
@@ -220,6 +242,15 @@ pub fn get_counts_json<S: GetCountsSource>(source: &S, min_count: u32) -> JsonVa
             "jemalloc_retained_bytes".to_owned(),
             JsonValue::Unsigned(stats.retained_bytes as u64),
         );
+        for (name, value) in [
+            ("jemalloc_dirty_bytes", stats.dirty_bytes),
+            ("jemalloc_muzzy_bytes", stats.muzzy_bytes),
+            ("jemalloc_small_slab_bytes", stats.small_slab_bytes),
+            ("jemalloc_small_allocated_bytes", stats.small_allocated_bytes),
+            ("jemalloc_large_allocated_bytes", stats.large_allocated_bytes),
+        ] {
+            result.insert(name.to_owned(), JsonValue::Unsigned(value as u64));
+        }
         result.insert(
             "jemalloc_arenas".to_owned(),
             JsonValue::Unsigned(u64::from(stats.arenas)),
@@ -241,6 +272,10 @@ pub fn do_get_counts<S: GetCountsSource>(params: &JsonValue, source: &S) -> Json
     {
         object.insert("held_tree_inner_nodes".to_owned(), JsonValue::Unsigned(inner));
         object.insert("held_tree_leaf_nodes".to_owned(), JsonValue::Unsigned(leaf));
+        for (owner, inner, leaf) in source.resident_by_owner() {
+            object.insert(format!("resident_{owner}_inner"), JsonValue::Unsigned(inner));
+            object.insert(format!("resident_{owner}_leaf"), JsonValue::Unsigned(leaf));
+        }
     }
     result
 }
