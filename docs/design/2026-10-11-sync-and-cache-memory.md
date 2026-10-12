@@ -335,9 +335,26 @@ SSTables directly, bypassing the memtable and per-batch journal commit — the
 standard fast bulk-load technique (cf. RocksDB `IngestExternalFile`). Its
 precondition is that keys are written in strictly ascending order. The export
 iterates the fjall `nodes` keyspace, which yields keys in sorted order, and
-that order is preserved through the chunk stream, so the load can feed
-ingestion directly if the decode path stays in order (another reason the
-reordering parallel-decode window was the wrong direction). Wiring ingestion
-through the backend's `bulk_import_start`/`bulk_import_finish` hooks (currently
-no-ops) is the next step and should move the 46 s load phase toward its
-disk-write floor.
+that order is preserved through the chunk stream.
+
+This is now implemented. `Backend::bulk_ingest_sorted` (default: fall back to
+`store_batch_result`) is overridden by the fjall backend to drive one
+ingestion across the whole load; the loader feeds it a pull-based, in-order
+chunk stream. The fjall path enforces ascending order and returns a clean
+error (never panics) on a violation, since snapshot input is untrusted.
+
+Measured on the same hardware/snapshot, load phase only (verify unchanged at
+~77 s):
+
+| Load write path | Load phase |
+| --- | --- |
+| per-chunk batch commit (memtable + journal) | 50.1 s |
+| bulk ingestion (direct SSTable build) | 37.2 s |
+
+A 26% cut on the load phase. Correctness on the ingestion-loaded store: `full`
+with one transition, 13/13 ledger parity, `pruned_verify_last_ok = true`. The
+on-disk bytes and SHAMap verification are unchanged.
+
+Remaining: the export is still bound by the serial LSM scan (34 s) and the
+pass-2 copy (8.5 s); those levers (partitioned parallel scan, chunk-table at
+file end) are described above and not yet done.
