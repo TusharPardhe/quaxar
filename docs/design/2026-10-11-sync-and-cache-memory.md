@@ -404,3 +404,56 @@ critical path; download size and load time are on it, and both improved.
 
 Correctness on a v2-bootstrapped node: `full` with one transition, ledger and
 account hash parity on every sampled ledger, `pruned_verify_last_ok = true`.
+
+## 8. NodeObject cache removed
+
+rippled with `online_delete` uses `DatabaseRotatingImp`, which has no
+NodeObject cache. Measured on testnet, quaxar's cache had a 2 to 8 % hit
+ratio at about 1 GB. It is now removed as standard behavior (`c1e5ff88`).
+Store reads are served by fjall and the OS page cache.
+
+A sampler artifact was also fixed (`e71b58c3`): `LedgerHistory::cached_ledgers`
+called `fetch` on every entry, which refreshed each one, so history never
+aged out (879 ledgers, 1.3M inner nodes). It now reads `strong_values()`.
+
+## 9. Testnet fork at 21485530: exception classes
+
+Transaction 32 (`1E2B5609…`) was a Payment of 20 USD, SendMax 90 XRP,
+tfPartialPayment. The XRP to USD book held a crafted offer asking 10^17 drops
+(the native maximum) for 9.999999999999995 USD, from an owner holding
+9.999999999999994 USD. The owner is underfunded, so OfferStream reduces the
+offer (`ceil_out_strict`), and the reduced input exceeds the native range.
+
+| | rippled | quaxar before `e8899f93` |
+| --- | --- | --- |
+| Throw | `std::runtime_error` "Native currency amount out of range" | panic, same message |
+| OfferStream catch | `std::overflow_error` only; runtime_error passes | caught every panic |
+| Result | RippleCalc `catch (std::exception&)`: tecINTERNAL, fee only | BookStep returned tefEXCEPTION; with MPTokensV2 it would remove the offer |
+
+`b3f3be3d` added the RippleCalc and flowCross catches, but that was not
+enough: the panic never reached them. The regression test
+`fp_crafted_offer_overflowing_native_range_is_tec_internal_like_rippled`
+uses the exact parent-ledger state. It failed with tefEXCEPTION before the
+fix and passes after, with and without MPTokensV2.
+
+Fix (`e8899f93`): typed payloads in `basics::contract`. `OverflowError`
+mirrors `std::overflow_error`. Untyped panics count as `runtime_error`, and
+`ContractViolation` counts as `logic_error`. Every rippled
+`std::overflow_error` site we found now throws `OverflowError`: Number,
+IOUAmount, muldiv/mulRound/divRound, IOU range, and root2. Catch sites match
+on the C++ class:
+
+| rippled site | catches | quaxar |
+| --- | --- | --- |
+| OfferStream::step | overflow_error (MPTokensV2: remove, else rethrow) | `small_offer_exception_disposition` |
+| BookStep::forEachOffer | overflow_error (MPTokensV2: remove offer) | `catch_crossing_overflow!` around crossing arithmetic |
+| AMMLiquidity::getOffer | overflow_error, std::exception: no offer | `get_amm_offer` |
+| RippleCalc, OfferCreate::flowCross | std::exception: tecINTERNAL | `b3f3be3d` |
+| AMMDeposit/Withdraw applyGuts | runtime_error (fixCleanup3_4_0: tecAMM_FAILED) | `amm_math_panic_ter` (logic_error stays tefEXCEPTION) |
+| equalDepositTokens, equalWithdrawTokens | std::exception: tecINTERNAL | LP-token branches |
+| VaultDeposit/Withdraw/Clawback | overflow_error: tecPATH_DRY | `catch_vault_overflow`, plus the missing `debitIsNonZeroDust` |
+
+Not ported:
+- `validFwd` FlowException catches: rippled has no production callers.
+- The AMM synthetic-offer consumption inside forEachOffer's try block.
+- XChainBridge attestation parsing `catch (...)`.
