@@ -3,7 +3,6 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -19,10 +18,6 @@ use protocol::{LedgerHeader, calculate_ledger_hash};
 
 /// Number of rebuilt nodes per backend batch write.
 const WRITE_BATCH_NODES: usize = 65_536;
-
-/// Batches queued between the rebuild and the writer thread. Bounds memory and
-/// applies backpressure when the store is the slower stage.
-const WRITE_QUEUE_BATCHES: usize = 4;
 
 /// Keeps a failed import fail-closed even if a backend must finalize on-disk
 /// indexes before the footer and roots can be verified.
@@ -77,10 +72,11 @@ pub struct SnapshotLoadOutcome {
 /// and transaction roots; every stored node is keyed by its own recomputed
 /// content hash.
 ///
-/// The load is a three-stage pipeline: leaves of each chunk are serialized and
-/// hashed in parallel; the bottom-up rebuild runs sequentially (it depends on
-/// key order); and a writer thread commits node batches to the store while
-/// the next chunk is processed.
+/// Leaves of each chunk are serialized and hashed in parallel; the bottom-up
+/// rebuild runs sequentially (it depends on key order) and commits node
+/// batches to the store as it goes. Writes stay on this thread: a dedicated,
+/// back-to-back writer thread drove fjall into a write halt with no flush
+/// scheduled (writer parked in `local_backpressure`, all workers idle).
 pub fn load_snapshot(
     backend: &dyn Backend,
     input_path: &Path,
@@ -156,26 +152,14 @@ pub fn load_snapshot(
         })?;
     let mut import_guard = BulkImportGuard::new(backend);
 
-    let (sender, receiver) = sync_channel::<Batch>(WRITE_QUEUE_BATCHES);
-    let (rebuild, written) = std::thread::scope(|scope| {
-        let writer = scope.spawn(move || write_batches(backend, receiver));
-        let rebuild = rebuild_from_leaves(
-            &manifest,
-            &mut reader,
-            &mut file_hasher,
-            NodeSink::new(sender, !store_was_empty),
-            start,
-        );
-        // `rebuild` owns (and has dropped) the sender, so the writer drains and
-        // exits. A writer failure takes precedence: it is the root cause of
-        // any send failure the rebuild saw.
-        let written = writer.join().unwrap_or_else(|_| {
-            Err("snapshot writer thread panicked".to_owned())
-        });
-        (rebuild, written)
-    });
-    let nodes_written = written.map_err(|reason| SnapshotError::BackendWriteFailed { reason })?;
-    let rebuilt = rebuild?;
+    let rebuilt = rebuild_from_leaves(
+        &manifest,
+        &mut reader,
+        &mut file_hasher,
+        NodeSink::new(backend, !store_was_empty),
+        start,
+    )?;
+    let nodes_written = rebuilt.nodes_written;
 
     // Finalize any backend bulk-import indexes before the footer and roots are
     // checked. The guard restores the incomplete-import marker if a later
@@ -237,32 +221,22 @@ pub fn load_snapshot(
     })
 }
 
-/// Writer stage: commit batches until the sender is dropped.
-fn write_batches(backend: &dyn Backend, receiver: Receiver<Batch>) -> Result<u64, String> {
-    let mut written = 0u64;
-    for batch in receiver {
-        backend.store_batch_result(&batch)?;
-        written += batch.len() as u64;
-    }
-    Ok(written)
-}
-
 struct Rebuilt {
     state_root: Uint256,
     tx_root: Uint256,
     state_leaves: u64,
     tx_leaves: u64,
+    nodes_written: u64,
     required: HashSet<Uint256>,
 }
 
 /// Read, verify and decompress each chunk; hash its leaves in parallel; feed
-/// them in key order to the two bottom-up builders; send every node to the
-/// writer.
+/// them in key order to the two bottom-up builders; write every node.
 fn rebuild_from_leaves(
     manifest: &SnapshotManifest,
     reader: &mut impl Read,
     file_hasher: &mut Sha256,
-    mut sink: NodeSink,
+    mut sink: NodeSink<'_>,
     start: Instant,
 ) -> Result<Rebuilt, SnapshotError> {
     let mut state = SortedLeafBuilder::new();
@@ -328,19 +302,15 @@ fn rebuild_from_leaves(
                 _ => (&mut tx, NodeObjectType::TransactionNode),
             };
             let leaf_hash = leaf.hash;
-            sink.push(leaf, object_type).map_err(|_| sink.writer_gone())?;
-            let mut send_failed = false;
+            sink.push(leaf, object_type).map_err(write_failed)?;
+            let mut write_error = None;
             let pushed = builder.push(*key, leaf_hash, &mut |node| {
-                sink.push(node, object_type).map_err(|e| {
-                    send_failed = true;
-                    e
-                })
+                sink.push(node, object_type).inspect_err(|e| write_error = Some(e.clone()))
             });
             if let Err(reason) = pushed {
-                return Err(if send_failed {
-                    sink.writer_gone()
-                } else {
-                    malformed(i, *record_offset, &reason)
+                return Err(match write_error {
+                    Some(reason) => write_failed(reason),
+                    None => malformed(i, *record_offset, &reason),
                 });
             }
         }
@@ -361,18 +331,23 @@ fn rebuild_from_leaves(
     let tx_leaves = tx.leaves();
     let state_root = state
         .finish(&mut |node| sink.push(node, NodeObjectType::AccountNode))
-        .map_err(|_| sink.writer_gone())?;
+        .map_err(write_failed)?;
     let tx_root = tx
         .finish(&mut |node| sink.push(node, NodeObjectType::TransactionNode))
-        .map_err(|_| sink.writer_gone())?;
-    sink.flush().map_err(|_| sink.writer_gone())?;
+        .map_err(write_failed)?;
+    sink.flush().map_err(write_failed)?;
     Ok(Rebuilt {
         state_root,
         tx_root,
         state_leaves,
         tx_leaves,
-        required: sink.into_required(),
+        nodes_written: sink.written,
+        required: sink.required.unwrap_or_default(),
     })
+}
+
+fn write_failed(reason: String) -> SnapshotError {
+    SnapshotError::BackendWriteFailed { reason }
 }
 
 fn malformed(chunk_index: usize, offset: usize, reason: &str) -> SnapshotError {
@@ -407,19 +382,21 @@ fn decompress_chunk(chunk_index: usize, compressed: &[u8]) -> Result<Vec<u8>, Sn
     })
 }
 
-/// Batches rebuilt nodes for the writer thread and, if requested, records
+/// Batches rebuilt nodes into backend writes and, if requested, records
 /// every hash as part of the snapshot's retained set.
-struct NodeSink {
-    sender: Option<SyncSender<Batch>>,
+struct NodeSink<'a> {
+    backend: &'a dyn Backend,
     pending: Batch,
+    written: u64,
     required: Option<HashSet<Uint256>>,
 }
 
-impl NodeSink {
-    fn new(sender: SyncSender<Batch>, collect_required: bool) -> Self {
+impl<'a> NodeSink<'a> {
+    fn new(backend: &'a dyn Backend, collect_required: bool) -> Self {
         Self {
-            sender: Some(sender),
+            backend,
             pending: Vec::with_capacity(WRITE_BATCH_NODES),
+            written: 0,
             required: collect_required.then(HashSet::new),
         }
     }
@@ -440,31 +417,10 @@ impl NodeSink {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let batch = std::mem::replace(&mut self.pending, Vec::with_capacity(WRITE_BATCH_NODES));
-        self.sender
-            .as_ref()
-            .expect("sink sender is live until into_required")
-            .send(batch)
-            .map_err(|_| "snapshot writer stopped".to_owned())
-    }
-
-    /// The writer exited early; its own error (returned from `join`) is the
-    /// cause and is reported instead of this placeholder.
-    fn writer_gone(&self) -> SnapshotError {
-        SnapshotError::BackendWriteFailed {
-            reason: "snapshot writer stopped".to_owned(),
-        }
-    }
-
-    fn into_required(mut self) -> HashSet<Uint256> {
-        self.sender = None; // close the channel so the writer finishes
-        self.required.take().unwrap_or_default()
-    }
-}
-
-impl Drop for NodeSink {
-    fn drop(&mut self) {
-        self.sender = None;
+        self.backend.store_batch_result(&self.pending)?;
+        self.written += self.pending.len() as u64;
+        self.pending.clear();
+        Ok(())
     }
 }
 
