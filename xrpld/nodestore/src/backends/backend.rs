@@ -72,6 +72,26 @@ pub trait Backend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Bulk-ingest a stream of batches whose keys are already in strictly
+    /// ascending order across the whole stream, building storage structures
+    /// directly and bypassing the normal per-write path. `next_batch` is
+    /// pulled until it returns `None`. Backends without a bulk path use the
+    /// default, which stores each batch through `store_batch_result` (so
+    /// callers get the speedup only where a backend overrides this, and
+    /// correctness everywhere).
+    ///
+    /// The caller guarantees ascending order; a backend that cannot verify it
+    /// cheaply may rely on that, but must fail (not panic) on a violation.
+    fn bulk_ingest_sorted(
+        &self,
+        next_batch: &mut dyn FnMut() -> Result<Option<Batch>, String>,
+    ) -> Result<(), String> {
+        while let Some(batch) = next_batch()? {
+            self.store_batch_result(&batch)?;
+        }
+        Ok(())
+    }
+
     /// Mark an import as failed after it has started. Backends with an
     /// incomplete-import marker must keep or restore that marker so an invalid
     /// post-finalization snapshot cannot be reopened as a successful import.
