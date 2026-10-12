@@ -358,6 +358,30 @@ impl PrunedStore {
         Ok(swept)
     }
 
+    /// Adopt a snapshot imported into a store whose `nodes` keyspace was
+    /// empty before the import. The store then holds exactly the snapshot's
+    /// nodes, so the reconcile step of [`Self::adopt_snapshot`] would sweep
+    /// nothing; only the anchor is stamped. Refuses a store with a prior claim,
+    /// like `adopt_snapshot`.
+    pub fn adopt_snapshot_into_empty_store(
+        &self,
+        anchor_seq: u32,
+        state_root: Uint256,
+    ) -> Result<(), String> {
+        let mut writer = self.writer.lock().expect("pruned store writer mutex");
+        if let Some(prev) = writer.claimed_seq() {
+            return Err(format!(
+                "cannot adopt snapshot anchor {anchor_seq}: store already claimed {prev}; \
+                 load snapshots only into an empty fjall store"
+            ));
+        }
+        writer.adopt_anchor(anchor_seq, state_root)?;
+        let mut metrics = self.metrics.lock().expect("metrics mutex");
+        metrics.claimed_seq = writer.claimed_seq();
+        metrics.unclaimed = writer.unclaimed_len();
+        Ok(())
+    }
+
     pub fn backend(&self) -> &Arc<dyn Backend> {
         &self.backend
     }

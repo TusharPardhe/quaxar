@@ -72,6 +72,12 @@ pub trait Backend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether the node table holds no objects. `None` means the backend
+    /// cannot tell cheaply; callers must then assume it is not empty.
+    fn nodes_is_empty(&self) -> Option<bool> {
+        None
+    }
+
     /// Mark an import as failed after it has started. Backends with an
     /// incomplete-import marker must keep or restore that marker so an invalid
     /// post-finalization snapshot cannot be reopened as a successful import.

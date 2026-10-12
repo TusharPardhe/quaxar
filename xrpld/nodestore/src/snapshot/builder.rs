@@ -20,30 +20,82 @@
 //! leaves, the same idea as bulk-loading a B+-tree bottom-up from sorted input.
 //! A node is emitted as soon as no later key can fall beneath it.
 //!
+//! Hashing follows quaxar's (and rippled's) node encoding exactly: a node's
+//! hash is the first 32 bytes of SHA-512 over its prefix-serialized bytes,
+//! `prefix || data || key` for a leaf and `prefix || 16 child hashes` for an
+//! inner node (empty branches as zero). Leaves are prepared independently of
+//! the tree ([`prepare_leaf`]) so their hashing can run in parallel.
+//!
 //! Every node is keyed by its own recomputed content hash, so any corrupted or
 //! substituted leaf changes the rebuilt root. Comparing the rebuilt root with
 //! the ledger header's `account_hash` / `tx_hash` therefore verifies the whole
 //! tree in the same pass that builds it.
 
 use basics::base_uint::Uint256;
-use basics::sha_map_hash::SHAMapHash;
-use shamap::nodes::item::SHAMapItem;
-use shamap::nodes::tree_node::{BRANCH_FACTOR, SHAMapNodeType, SHAMapTreeNode};
+use sha2::{Digest, Sha512};
+use shamap::nodes::tree_node::{BRANCH_FACTOR, SHAMapNodeType};
 
 /// Leaf depth in nibbles (64 nibbles = 256 bits).
 const LEAF_DEPTH: usize = 64;
 
 /// Smallest SHAMap item payload (mirrors the private `MIN_SHAMAP_ITEM_BYTES`
-/// that the leaf constructor asserts; checked here so bad input returns an
-/// error instead of panicking).
+/// the SHAMap leaf constructor asserts).
 const MIN_ITEM_BYTES: usize = 12;
 
-/// A node produced by the builder: content hash and prefix-serialized bytes
+/// Hash prefixes (big-endian `u32`), identical to `xrpl/shamap` tree_node.rs.
+const HASH_PREFIX_INNER_NODE: u32 = 0x4D49_4E00; // "MIN\0"
+const HASH_PREFIX_LEAF_NODE: u32 = 0x4D4C_4E00; // "MLN\0" account state
+const HASH_PREFIX_TX_NODE: u32 = 0x534E_4400; // "SND\0" transaction + metadata
+
+/// A node produced by the rebuild: content hash and prefix-serialized bytes
 /// exactly as the NodeStore stores them.
 pub struct BuiltNode {
     pub hash: Uint256,
     pub data: Vec<u8>,
-    pub is_leaf: bool,
+}
+
+fn sha512_half(bytes: &[u8]) -> Uint256 {
+    let digest = Sha512::digest(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    Uint256::from_array(out)
+}
+
+/// Serialize and hash one leaf. Independent of tree position, so callers may
+/// run it in parallel. Supports the two leaf kinds a ledger holds.
+pub fn prepare_leaf(
+    leaf_type: SHAMapNodeType,
+    key: &Uint256,
+    data: &[u8],
+) -> Result<BuiltNode, String> {
+    let prefix = match leaf_type {
+        SHAMapNodeType::AccountState => HASH_PREFIX_LEAF_NODE,
+        SHAMapNodeType::TransactionMd => HASH_PREFIX_TX_NODE,
+        other => return Err(format!("unsupported snapshot leaf type {other:?}")),
+    };
+    if data.len() < MIN_ITEM_BYTES {
+        return Err(format!("leaf {key} payload below minimum size"));
+    }
+    let mut bytes = Vec::with_capacity(4 + data.len() + 32);
+    bytes.extend_from_slice(&prefix.to_be_bytes());
+    bytes.extend_from_slice(data);
+    bytes.extend_from_slice(key.data());
+    Ok(BuiltNode {
+        hash: sha512_half(&bytes),
+        data: bytes,
+    })
+}
+
+fn inner_node(children: &[Uint256; BRANCH_FACTOR]) -> BuiltNode {
+    let mut bytes = Vec::with_capacity(4 + BRANCH_FACTOR * 32);
+    bytes.extend_from_slice(&HASH_PREFIX_INNER_NODE.to_be_bytes());
+    for child in children {
+        bytes.extend_from_slice(child.data());
+    }
+    BuiltNode {
+        hash: sha512_half(&bytes),
+        data: bytes,
+    }
 }
 
 fn nibble(key: &Uint256, depth: usize) -> usize {
@@ -70,9 +122,10 @@ struct Open {
     children: [Uint256; BRANCH_FACTOR],
 }
 
-/// Builds a SHAMap from leaves supplied in strictly ascending key order.
+/// Builds the inner nodes of a SHAMap from leaf (key, hash) pairs supplied in
+/// strictly ascending key order. Leaf nodes themselves come from
+/// [`prepare_leaf`]; the builder emits only inner nodes.
 pub struct SortedLeafBuilder {
-    leaf_type: SHAMapNodeType,
     /// Open inner nodes; `path[d]` is the open node at depth `d`.
     path: Vec<Open>,
     /// The most recent leaf, waiting for the next key to fix its depth.
@@ -83,11 +136,15 @@ pub struct SortedLeafBuilder {
     inners: u64,
 }
 
+impl Default for SortedLeafBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SortedLeafBuilder {
-    pub fn new(leaf_type: SHAMapNodeType) -> Self {
-        assert_ne!(leaf_type, SHAMapNodeType::Inner, "leaf type required");
+    pub fn new() -> Self {
         Self {
-            leaf_type,
             path: Vec::with_capacity(LEAF_DEPTH),
             pending: None,
             pending_prev_lcp: 0,
@@ -104,11 +161,12 @@ impl SortedLeafBuilder {
         self.inners
     }
 
-    /// Add the next leaf. `emit` receives each node once it is final.
+    /// Add the next leaf by key and leaf hash. `emit` receives each inner node
+    /// once it is final.
     pub fn push(
         &mut self,
         key: Uint256,
-        data: Vec<u8>,
+        leaf_hash: Uint256,
         emit: &mut dyn FnMut(BuiltNode) -> Result<(), String>,
     ) -> Result<(), String> {
         let lcp_with_prev = match self.pending {
@@ -118,21 +176,7 @@ impl SortedLeafBuilder {
             Some((prev, _)) => common_prefix(&prev, &key),
             None => 0,
         };
-        if data.len() < MIN_ITEM_BYTES {
-            return Err(format!("leaf {key} payload below minimum size"));
-        }
-        let leaf = SHAMapTreeNode::new_leaf(self.leaf_type, SHAMapItem::new(key, data), 0);
-        let leaf_hash = *leaf.get_hash().as_uint256();
-        let bytes = leaf
-            .serialize_with_prefix()
-            .map_err(|e| format!("serialize leaf {key}: {e:?}"))?;
-        emit(BuiltNode {
-            hash: leaf_hash,
-            data: bytes,
-            is_leaf: true,
-        })?;
         self.leaves += 1;
-
         if let Some((prev_key, prev_hash)) = self.pending.take() {
             // The pending leaf hangs at the deeper of its shared prefix with the
             // leaf before it and with this one.
@@ -149,8 +193,7 @@ impl SortedLeafBuilder {
 
     /// Open inner nodes down to `depth` along `key`'s path and store the leaf
     /// hash in the depth-`depth` node. Every node already open lies on `key`'s
-    /// path (invariant maintained by `push`), and it is never deeper than
-    /// `depth`.
+    /// path (maintained by `push`) and is never deeper than `depth`.
     fn place_leaf(&mut self, key: Uint256, leaf_hash: Uint256, depth: usize) {
         debug_assert!(self.path.len() <= depth + 1);
         while self.path.len() <= depth {
@@ -172,16 +215,13 @@ impl SortedLeafBuilder {
         emit: &mut dyn FnMut(BuiltNode) -> Result<(), String>,
     ) -> Result<(), String> {
         while self.path.len() > depth + 1 {
-            let node = self.path.pop().expect("non-empty path");
-            let (hash, bytes) = hash_inner(&node.children)?;
-            emit(BuiltNode {
-                hash,
-                data: bytes,
-                is_leaf: false,
-            })?;
+            let open = self.path.pop().expect("non-empty path");
+            let node = inner_node(&open.children);
+            let hash = node.hash;
+            emit(node)?;
             self.inners += 1;
             let parent_depth = self.path.len() - 1;
-            let branch = nibble(&node.path_key, parent_depth);
+            let branch = nibble(&open.path_key, parent_depth);
             let parent = self.path.last_mut().expect("closed node has a parent");
             debug_assert!(parent.children[branch].is_zero());
             parent.children[branch] = hash;
@@ -203,37 +243,22 @@ impl SortedLeafBuilder {
         self.close_deeper_than(0, emit)?;
         let root = self.path.pop().expect("root is open");
         debug_assert!(self.path.is_empty());
-        let (hash, bytes) = hash_inner(&root.children)?;
-        emit(BuiltNode {
-            hash,
-            data: bytes,
-            is_leaf: false,
-        })?;
+        let node = inner_node(&root.children);
+        let hash = node.hash;
+        emit(node)?;
         self.inners += 1;
         Ok(hash)
     }
 }
 
-/// Hash and serialize an inner node with quaxar's own SHAMap code so the bytes
-/// are identical to those written by normal persistence.
-fn hash_inner(children: &[Uint256; BRANCH_FACTOR]) -> Result<(Uint256, Vec<u8>), String> {
-    let node = SHAMapTreeNode::new_inner(1);
-    for (branch, child) in children.iter().enumerate() {
-        if !child.is_zero() {
-            node.set_child_hash(branch, SHAMapHash::new(*child));
-        }
-    }
-    node.update_hash();
-    let bytes = node
-        .serialize_with_prefix()
-        .map_err(|e| format!("serialize inner: {e:?}"))?;
-    Ok((*node.get_hash().as_uint256(), bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use basics::intrusive_pointer::SharedIntrusive;
+    use shamap::nodes::item::SHAMapItem;
+    use shamap::nodes::tree_node::SHAMapTreeNode;
     use shamap::operations::mutation::add_item;
+    use std::collections::BTreeMap;
 
     fn key(seed: u64) -> Uint256 {
         // splitmix64 spread into 32 bytes: uniform, distinct keys.
@@ -250,7 +275,7 @@ mod tests {
     }
 
     /// Post-order rehash: `add_item` leaves ancestor hashes dirty.
-    fn rehash(node: &basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>) {
+    fn rehash(node: &SharedIntrusive<SHAMapTreeNode>) {
         if !node.is_inner() {
             return;
         }
@@ -262,54 +287,72 @@ mod tests {
         node.update_hash_deep();
     }
 
-    /// Every inner node in the reference tree, as (hash, serialized bytes).
-    fn collect_inners(
-        node: &basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>,
-        out: &mut std::collections::BTreeMap<Uint256, Vec<u8>>,
-    ) {
-        if !node.is_inner() {
-            return;
-        }
+    /// Every node in the reference tree, as (hash, serialized bytes).
+    fn collect(node: &SharedIntrusive<SHAMapTreeNode>, out: &mut BTreeMap<Uint256, Vec<u8>>) {
         out.insert(
             *node.get_hash().as_uint256(),
             node.serialize_with_prefix().expect("serialize"),
         );
-        for branch in 0..BRANCH_FACTOR {
-            if let Some(child) = node.get_child(branch) {
-                collect_inners(&child, out);
+        if node.is_inner() {
+            for branch in 0..BRANCH_FACTOR {
+                if let Some(child) = node.get_child(branch) {
+                    collect(&child, out);
+                }
             }
         }
     }
 
-    /// Root hash and inner nodes from quaxar's own SHAMap insert path.
+    /// Root hash and every node from quaxar's own SHAMap insert path.
     fn reference(
         leaves: &[(Uint256, Vec<u8>)],
         ty: SHAMapNodeType,
-    ) -> (Uint256, std::collections::BTreeMap<Uint256, Vec<u8>>) {
+    ) -> (Uint256, BTreeMap<Uint256, Vec<u8>>) {
         let root = SHAMapTreeNode::new_inner(1);
         for (k, v) in leaves {
             add_item(&root, ty, SHAMapItem::new(*k, v.clone())).expect("insert");
         }
         rehash(&root);
-        let mut inners = std::collections::BTreeMap::new();
-        collect_inners(&root, &mut inners);
-        (*root.get_hash().as_uint256(), inners)
+        let mut nodes = BTreeMap::new();
+        collect(&root, &mut nodes);
+        (*root.get_hash().as_uint256(), nodes)
     }
 
-    fn build(leaves: &[(Uint256, Vec<u8>)], ty: SHAMapNodeType) -> (Uint256, Vec<BuiltNode>) {
+    fn build(
+        leaves: &[(Uint256, Vec<u8>)],
+        ty: SHAMapNodeType,
+    ) -> (Uint256, BTreeMap<Uint256, Vec<u8>>, SortedLeafBuilderCounts) {
         let mut sorted = leaves.to_vec();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut out = Vec::new();
-        let mut emit = |n: BuiltNode| {
-            out.push(n);
-            Ok(())
-        };
-        let mut b = SortedLeafBuilder::new(ty);
-        for (k, v) in sorted {
-            b.push(k, v, &mut emit).expect("push");
+        let mut nodes = BTreeMap::new();
+        let mut b = SortedLeafBuilder::new();
+        for (k, v) in &sorted {
+            let leaf = prepare_leaf(ty, k, v).expect("leaf");
+            let hash = leaf.hash;
+            nodes.insert(leaf.hash, leaf.data);
+            b.push(*k, hash, &mut |n| {
+                nodes.insert(n.hash, n.data);
+                Ok(())
+            })
+            .expect("push");
         }
-        let root = b.finish(&mut emit).expect("finish");
-        (root, out)
+        let (l, _) = (b.leaves(), b.inners());
+        let mut inner_count = 0;
+        let root = {
+            let mut emit = |n: BuiltNode| {
+                nodes.insert(n.hash, n.data);
+                Ok(())
+            };
+            let before = b.inners();
+            let r = b.finish(&mut emit).expect("finish");
+            inner_count += before;
+            r
+        };
+        (root, nodes, SortedLeafBuilderCounts { leaves: l, _inners: inner_count })
+    }
+
+    struct SortedLeafBuilderCounts {
+        leaves: u64,
+        _inners: u64,
     }
 
     fn leaves(n: u64) -> Vec<(Uint256, Vec<u8>)> {
@@ -319,16 +362,11 @@ mod tests {
     }
 
     fn assert_matches_reference(input: &[(Uint256, Vec<u8>)], ty: SHAMapNodeType) {
-        let (want_root, want_inners) = reference(input, ty);
-        let (got_root, nodes) = build(input, ty);
+        let (want_root, want_nodes) = reference(input, ty);
+        let (got_root, got_nodes, counts) = build(input, ty);
         assert_eq!(got_root, want_root, "rebuilt root must equal SHAMap root");
-        let got_inners: std::collections::BTreeMap<Uint256, Vec<u8>> = nodes
-            .iter()
-            .filter(|n| !n.is_leaf)
-            .map(|n| (n.hash, n.data.clone()))
-            .collect();
-        assert_eq!(got_inners, want_inners, "every inner node, byte for byte");
-        assert_eq!(nodes.iter().filter(|n| n.is_leaf).count(), input.len());
+        assert_eq!(got_nodes, want_nodes, "every node, byte for byte");
+        assert_eq!(counts.leaves, input.len() as u64);
     }
 
     #[test]
@@ -337,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn random_maps_match_shamap_root_and_inner_nodes() {
+    fn random_maps_match_shamap_root_and_all_nodes() {
         for n in [2u64, 3, 17, 256, 5_000] {
             assert_matches_reference(&leaves(n), SHAMapNodeType::AccountState);
         }
@@ -360,24 +398,24 @@ mod tests {
 
     #[test]
     fn empty_map_has_zero_root() {
-        let (root, nodes) = build(&[], SHAMapNodeType::AccountState);
+        let mut emit = |_: BuiltNode| Ok(());
+        let root = SortedLeafBuilder::new().finish(&mut emit).unwrap();
         assert!(root.is_zero());
-        assert!(nodes.is_empty());
     }
 
     #[test]
-    fn unsorted_or_duplicate_keys_are_rejected_not_panicked() {
+    fn unsorted_duplicate_or_short_leaves_are_rejected_not_panicked() {
         let mut emit = |_: BuiltNode| Ok(());
-        let mut b = SortedLeafBuilder::new(SHAMapNodeType::AccountState);
-        b.push(key(2).max(key(1)), vec![1; 16], &mut emit).unwrap();
-        let smaller = key(2).min(key(1));
-        assert!(b.push(smaller, vec![1; 16], &mut emit).is_err());
+        let (lo, hi) = (key(1).min(key(2)), key(1).max(key(2)));
+        let mut b = SortedLeafBuilder::new();
+        b.push(hi, key(9), &mut emit).unwrap();
+        assert!(b.push(lo, key(9), &mut emit).is_err(), "descending");
 
-        let mut b = SortedLeafBuilder::new(SHAMapNodeType::AccountState);
-        b.push(key(5), vec![1; 16], &mut emit).unwrap();
-        assert!(b.push(key(5), vec![1; 16], &mut emit).is_err());
+        let mut b = SortedLeafBuilder::new();
+        b.push(key(5), key(9), &mut emit).unwrap();
+        assert!(b.push(key(5), key(9), &mut emit).is_err(), "duplicate");
 
-        let mut b = SortedLeafBuilder::new(SHAMapNodeType::AccountState);
-        assert!(b.push(key(7), vec![1; 3], &mut emit).is_err(), "short payload");
+        assert!(prepare_leaf(SHAMapNodeType::AccountState, &key(7), &[1; 3]).is_err());
+        assert!(prepare_leaf(SHAMapNodeType::Inner, &key(7), &[1; 16]).is_err());
     }
 }

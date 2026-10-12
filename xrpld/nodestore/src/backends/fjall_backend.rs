@@ -382,6 +382,15 @@ impl Backend for FjallBackend {
         }
     }
 
+    fn nodes_is_empty(&self) -> Option<bool> {
+        // `store` and the KV `Nodes` keyspace share this partition.
+        let open = self.open_db().ok()?;
+        match open.nodes.iter().next() {
+            None => Some(true),
+            Some(entry) => entry.into_inner().ok().map(|_| false),
+        }
+    }
+
     fn store_batch_result(&self, batch: &crate::Batch) -> Result<(), String> {
         let open = self.open_db()?;
         let mut write = open.db.batch();

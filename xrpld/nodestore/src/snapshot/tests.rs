@@ -255,9 +255,8 @@ fn round_trip_rebuilds_every_node_byte_for_byte() {
 
     assert_eq!(outcome.manifest.account_hash, l.manifest.account_hash);
     assert_eq!(outcome.manifest.tx_hash, l.manifest.tx_hash);
-    let want: BTreeSet<Uint256> = l.nodes.keys().copied().collect();
-    let got: BTreeSet<Uint256> = outcome.required_nodes.iter().copied().collect();
-    assert_eq!(got, want, "retained set is exactly the two trees");
+    assert!(outcome.store_was_empty);
+    assert_eq!(outcome.nodes_written, l.nodes.len() as u64, "exactly the two trees");
     for (hash, data) in &l.nodes {
         let (object, status) = dst.fetch(hash);
         assert_eq!(status, Status::Ok, "node {hash} must be written");
@@ -320,7 +319,27 @@ fn single_leaf_and_empty_transaction_map_round_trip() {
     export_snapshot(src.as_ref(), &l.manifest, &snap_path).expect("export");
     let dst = make_backend("dst-one");
     let outcome = load_snapshot(dst.as_ref(), &snap_path).expect("load");
-    assert_eq!(outcome.required_nodes.len(), l.nodes.len());
+    assert_eq!(outcome.nodes_written, l.nodes.len() as u64);
+}
+
+#[test]
+fn non_empty_store_load_collects_exact_retained_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap_path = dir.path().join("retained.xrpls");
+    let src = make_backend("src-retained");
+    let l = ledger(src.as_ref(), 400, 12);
+    export_snapshot(src.as_ref(), &l.manifest, &snap_path).expect("export");
+
+    let dst = make_backend("dst-retained");
+    let leftover = Uint256::from_array([0x5A; 32]);
+    dst.store(Arc::new(NodeObject::new(NodeObjectType::AccountNode, vec![1; 40], leftover)))
+        .unwrap();
+    let outcome = load_snapshot(dst.as_ref(), &snap_path).expect("load");
+    assert!(!outcome.store_was_empty);
+    let want: BTreeSet<Uint256> = l.nodes.keys().copied().collect();
+    let got: BTreeSet<Uint256> = outcome.required_nodes.iter().copied().collect();
+    assert_eq!(got, want, "retained set is exactly the two trees");
+    assert!(!outcome.required_nodes.contains(&leftover));
 }
 
 // ─── Verification failures (crafted input) ───────────────────────────────────
@@ -532,7 +551,13 @@ fn exported(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 fn corrupt_chunk_hash_detected() {
     let (_dir, path) = exported("corrupt");
     let mut data = std::fs::read(&path).unwrap();
-    data[SNAPSHOT_HEADER_SIZE + CHUNK_META_SIZE] ^= 0xFF; // first chunk byte
+    let chunks = u32::from_be_bytes(
+        data[SNAPSHOT_HEADER_SIZE - 10..SNAPSHOT_HEADER_SIZE - 6]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    assert!(chunks >= 1);
+    data[SNAPSHOT_HEADER_SIZE + chunks * CHUNK_META_SIZE] ^= 0xFF; // first chunk byte
     std::fs::write(&path, &data).unwrap();
     assert!(matches!(
         load_snapshot(make_backend("dst-corrupt").as_ref(), &path),
@@ -690,6 +715,61 @@ fn snapshot_loader_propagates_batch_write_failure_and_aborts_import() {
     assert!(destination.aborted.load(std::sync::atomic::Ordering::Acquire));
 }
 
+// ─── Retained-set collection ─────────────────────────────────────────────────
+
+fn fjall_store(tag: &str) -> (Arc<dyn Backend>, String) {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("quaxar-snap-{tag}-{t}"));
+    let mut section = Section::new("node_db");
+    section.set("type", "fjall");
+    section.set("path", path.to_string_lossy().into_owned());
+    let backend = crate::FjallFactory::new()
+        .create_instance(
+            NodeObject::KEY_BYTES,
+            &section,
+            0,
+            Arc::new(DummyScheduler),
+            Arc::new(NullJournal),
+        )
+        .expect("fjall backend");
+    let backend: Arc<dyn Backend> = Arc::from(backend);
+    backend.open(true).expect("open");
+    (backend, path.to_string_lossy().into_owned())
+}
+
+#[test]
+fn empty_store_load_skips_retained_set_and_adopts_anchor_only() {
+    use crate::{PrunedConfig, PrunedStore};
+    let dir = tempfile::tempdir().unwrap();
+    let snap_path = dir.path().join("empty.xrpls");
+    let src = make_backend("src-empty-store");
+    let l = ledger(src.as_ref(), 120, 4);
+    export_snapshot(src.as_ref(), &l.manifest, &snap_path).expect("export");
+
+    let (dst, dst_path) = fjall_store("empty");
+    let outcome = load_snapshot(dst.as_ref(), &snap_path).expect("load");
+    assert!(outcome.store_was_empty);
+    assert!(outcome.required_nodes.is_empty(), "nothing to reconcile");
+    assert_eq!(outcome.nodes_written, l.nodes.len() as u64);
+    for hash in l.nodes.keys() {
+        assert_eq!(dst.fetch(hash).1, Status::Ok);
+    }
+
+    let store = PrunedStore::open(Arc::clone(&dst), PrunedConfig::default()).expect("open pruned");
+    store
+        .adopt_snapshot_into_empty_store(outcome.manifest.ledger_seq, Uint256::from_array(l.manifest.account_hash))
+        .expect("adopt");
+    assert_eq!(store.metrics().claimed_seq, Some(outcome.manifest.ledger_seq));
+    // A second adoption on a claimed store is refused.
+    assert!(store.adopt_snapshot_into_empty_store(1, Uint256::default()).is_err());
+    drop(store);
+    drop(dst);
+    let _ = std::fs::remove_dir_all(&dst_path);
+}
+
 // ─── Operator migration path ─────────────────────────────────────────────────
 
 // Export from an old fjall store, load into a fresh one, adopt the snapshot as
@@ -738,6 +818,7 @@ fn migration_snapshot_load_then_adopt_and_claim() {
     dst.kv_write_batch(&batch).expect("seed leftover");
 
     let outcome = load_snapshot(dst.as_ref(), &snap_path).expect("load");
+    assert!(!outcome.store_was_empty, "the leftover makes the store non-empty");
     let account_root = Uint256::from_array(l.manifest.account_hash);
     assert!(outcome.required_nodes.contains(&account_root));
 
