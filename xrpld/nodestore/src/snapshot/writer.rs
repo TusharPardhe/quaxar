@@ -3,8 +3,9 @@
 //! The export uses a streaming two-pass approach that keeps peak memory at ~16 MB
 //! regardless of backend size:
 //!
-//! 1. First pass: iterate all nodes, compress into chunks, write chunk data to a
-//!    temporary file while accumulating only the per-chunk metadata (36 bytes each).
+//! 1. First pass: walk the ledger's two SHAMaps from their roots and write only
+//!    their leaves, in ascending key order, as compressed chunks to a temporary
+//!    file, accumulating only the per-chunk metadata (36 bytes each).
 //! 2. Second pass: write the final snapshot file (header + chunk table + chunk data
 //!    copied from temp file + footer), then atomically rename into place.
 //!
@@ -23,11 +24,7 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use super::{SnapshotError, manifest::*};
-use crate::{Backend, NodeObject};
-
-/// Maximum `NodeObjectType` discriminant value that fits in a u8.
-/// The snapshot format stores node type as a single byte.
-const MAX_NODE_TYPE_U8: u32 = 255;
+use crate::Backend;
 
 /// Owned cooperative cancellation signal for a snapshot export task.
 ///
@@ -94,6 +91,60 @@ impl Drop for SnapshotTempFiles {
 ///
 /// The final file is written to a `.tmp` sibling path, then atomically renamed
 /// into place so a crash never leaves a partial file at `output_path`.
+/// Visit the leaves of the SHAMap rooted at `root` in ascending key order.
+///
+/// Depth-first, children visited in branch order 0..15, which is ascending key
+/// order for a radix tree. The explicit stack holds at most 15 pending siblings
+/// per level, so memory is O(depth). A missing node fails the export (the
+/// anchor ledger must be fully present in the store).
+fn walk_leaves(
+    backend: &dyn Backend,
+    root: [u8; 32],
+    cancellation: Option<&SnapshotExportCancellation>,
+    visit: &mut dyn FnMut(&[u8; 32], &[u8]) -> Result<(), SnapshotError>,
+) -> Result<(), SnapshotError> {
+    use basics::base_uint::Uint256;
+    use basics::sha_map_hash::SHAMapHash;
+    use shamap::nodes::tree_node::{BRANCH_FACTOR, SHAMapTreeNode};
+
+    let root = Uint256::from_array(root);
+    if root.is_zero() {
+        return Ok(());
+    }
+    let mut stack = vec![root];
+    let mut visited: u64 = 0;
+    while let Some(hash) = stack.pop() {
+        visited += 1;
+        if visited % 65_536 == 0 {
+            check_cancelled(cancellation)?;
+        }
+        let (object, status) = backend.fetch(&hash);
+        let object = object.ok_or_else(|| SnapshotError::BackendTraversalFailed {
+            reason: format!("SHAMap node {hash} missing from store ({status:?})"),
+        })?;
+        let node = SHAMapTreeNode::make_from_prefix(object.data(), SHAMapHash::new(hash))
+            .map_err(|e| SnapshotError::BackendTraversalFailed {
+                reason: format!("SHAMap node {hash} does not decode: {e:?}"),
+            })?;
+        if node.is_inner() {
+            // Push in reverse so branch 0 is visited first.
+            for branch in (0..BRANCH_FACTOR).rev() {
+                if !node.is_empty_branch(branch) {
+                    stack.push(*node.get_child_hash(branch).as_uint256());
+                }
+            }
+        } else {
+            let item = node
+                .peek_item()
+                .ok_or_else(|| SnapshotError::BackendTraversalFailed {
+                    reason: format!("SHAMap leaf {hash} has no item"),
+                })?;
+            visit(item.key().data(), item.data())?;
+        }
+    }
+    Ok(())
+}
+
 /// Export all nodes without a cancellation signal.
 ///
 /// This retains the historical behavior used by automatic exports.
@@ -181,62 +232,43 @@ fn export_snapshot_inner(
     // errors while the backend reports its own traversal failures directly.
     let mut export_error: Option<SnapshotError> = None;
 
-    let traversal_result = backend.for_each_result(&mut |node: Arc<NodeObject>| {
-        if export_error.is_some() {
-            return; // Skip remaining nodes after an error
-        }
-        if let Err(error) = check_cancelled(cancellation) {
-            export_error = Some(error);
-            return;
-        }
-
-        let obj_type_u32 = node.object_type() as u32;
-        if obj_type_u32 > MAX_NODE_TYPE_U8 {
-            export_error = Some(SnapshotError::MalformedNodeRecord {
-                chunk_index: chunk_metas.len(),
-                offset: current_buf.len(),
-                reason: format!(
-                    "NodeObjectType discriminant {} exceeds u8 range; cannot encode in snapshot",
-                    obj_type_u32
-                ),
-            });
-            return;
-        }
-
-        encode_node_record(
-            obj_type_u32 as u8,
-            node.hash().data(),
-            node.data(),
-            &mut current_buf,
-        );
+    // v2: write only the leaves of the ledger's two SHAMaps, in ascending key
+    // order (state map first, then the transaction map). Inner nodes are not
+    // exported; the loader rebuilds them from the sorted leaves and verifies
+    // the rebuilt roots against the header. A depth-first walk that visits
+    // branches 0..15 in order yields leaves in ascending key order, and keeps
+    // only O(depth) nodes in memory.
+    let mut emit_leaf = |map_tag: u8, key: &[u8; 32], data: &[u8]| -> Result<(), SnapshotError> {
+        encode_node_record(map_tag, key, data, &mut current_buf);
         node_count += 1;
-
         if current_buf.len() >= SNAPSHOT_CHUNK_UNCOMPRESSED_TARGET {
-            if let Err(e) = flush_chunk(
+            flush_chunk(
                 &mut current_buf,
                 &mut chunk_metas,
                 &mut chunks_writer,
                 &mut total_compressed,
-            ) {
-                export_error = Some(e);
-                return;
-            }
-            tracing::debug!(
-                target: "snapshot",
-                chunks_written = chunk_metas.len(),
-                nodes_so_far = node_count,
-                "Chunk flushed during export"
-            );
+            )?;
         }
-    });
+        Ok(())
+    };
+    for (map_tag, root) in [
+        (LEAF_TAG_ACCOUNT_STATE, manifest.account_hash),
+        (LEAF_TAG_TRANSACTION, manifest.tx_hash),
+    ] {
+        if let Err(e) = walk_leaves(backend, root, cancellation, &mut |key, data| {
+            emit_leaf(map_tag, key, data)
+        }) {
+            export_error = Some(e);
+            break;
+        }
+    }
+    drop(emit_leaf);
 
     // Check for errors captured during iteration
     if let Some(e) = export_error {
         let _ = fs::remove_file(&tmp_chunks_path);
         return Err(e);
     }
-
-    traversal_result.map_err(|reason| SnapshotError::BackendTraversalFailed { reason })?;
     check_cancelled(cancellation)?;
 
     // Flush remaining buffer

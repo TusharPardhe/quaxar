@@ -382,54 +382,6 @@ impl Backend for FjallBackend {
         }
     }
 
-    /// Bulk-ingest sorted batches by building SSTables directly through fjall's
-    /// ingestion API, bypassing the memtable and the per-batch journal commit.
-    /// This is the fast path for snapshot load. fjall requires strictly
-    /// ascending keys and panics otherwise, so we enforce order ourselves and
-    /// return a clean error on a violation (snapshot input is untrusted). The
-    /// `Ingestion` and the `Arc<OpenDb>` it borrows both live only for this
-    /// call, so there is no self-referential borrow.
-    fn bulk_ingest_sorted(
-        &self,
-        next_batch: &mut dyn FnMut() -> Result<Option<crate::Batch>, String>,
-    ) -> Result<(), String> {
-        let open = self.open_db()?;
-        let mut ingestion = open
-            .nodes
-            .start_ingestion()
-            .map_err(|error| Self::fjall_err("start_ingestion", error))?;
-
-        let mut last_key: Option<[u8; 32]> = None;
-        while let Some(batch) = next_batch()? {
-            for object in &batch {
-                let key = *object.hash().data();
-                // Enforce the ascending-key precondition instead of letting
-                // fjall panic on a corrupt or unsorted snapshot.
-                if let Some(prev) = last_key
-                    && key <= prev
-                {
-                    return Err(format!(
-                        "bulk_ingest_sorted: keys not strictly ascending at {}",
-                        object.hash()
-                    ));
-                }
-                let encoded = EncodedBlob::new(object);
-                ingestion
-                    .write(object.hash().as_slice(), encoded.get_data())
-                    .map_err(|error| Self::fjall_err("ingestion write", error))?;
-                last_key = Some(key);
-                // Cheap no-op unless the pruned index is watching hashes; keeps
-                // the restore-watch correct without buffering every key.
-                self.note_written(object.hash());
-            }
-        }
-
-        ingestion
-            .finish()
-            .map_err(|error| Self::fjall_err("ingestion finish", error))?;
-        Ok(())
-    }
-
     fn store_batch_result(&self, batch: &crate::Batch) -> Result<(), String> {
         let open = self.open_db()?;
         let mut write = open.db.batch();
@@ -868,81 +820,6 @@ mod tests {
             assert_eq!(fetched.expect("persisted node").data(), &[5, 6, 7]);
         }
         let _ = std::fs::remove_dir_all(&path);
-    }
-
-    #[test]
-    fn bulk_ingest_sorted_round_trips_and_rejects_out_of_order() {
-        let path = temp_path("ingest");
-        {
-            let backend = open_backend(&path);
-            // Three nodes in ascending key order.
-            let keys = [[0x11u8; 32], [0x22; 32], [0x33; 32]];
-            let objects: Vec<_> = keys
-                .iter()
-                .map(|k| {
-                    NodeObject::create_object(
-                        NodeObjectType::AccountNode,
-                        vec![k[0], 1, 2, 3],
-                        Uint256::from_array(*k),
-                    )
-                })
-                .collect();
-            let mut sent = 0usize;
-            let batch = objects.clone();
-            let mut next = move || -> Result<Option<crate::Batch>, String> {
-                if sent == 0 {
-                    sent += 1;
-                    Ok(Some(batch.clone()))
-                } else {
-                    Ok(None)
-                }
-            };
-            backend.bulk_ingest_sorted(&mut next).expect("sorted ingest");
-            backend.sync_result().expect("sync");
-            for object in &objects {
-                let (fetched, status) = backend.fetch(object.hash());
-                assert_eq!(status, crate::Status::Ok, "node must be present after ingest");
-                assert_eq!(fetched.expect("present").data(), object.data());
-            }
-        }
-        let _ = std::fs::remove_dir_all(&path);
-
-        // Out-of-order keys must return an error, never panic.
-        let path2 = temp_path("ingest-bad");
-        {
-            let backend = open_backend(&path2);
-            let descending = vec![
-                NodeObject::create_object(
-                    NodeObjectType::AccountNode,
-                    vec![9; 4],
-                    Uint256::from_array([0x99; 32]),
-                ),
-                NodeObject::create_object(
-                    NodeObjectType::AccountNode,
-                    vec![1; 4],
-                    Uint256::from_array([0x11; 32]),
-                ),
-            ];
-            let mut sent = 0usize;
-            let mut next = move || -> Result<Option<crate::Batch>, String> {
-                if sent == 0 {
-                    sent += 1;
-                    Ok(Some(descending.clone()))
-                } else {
-                    Ok(None)
-                }
-            };
-            let result = backend.bulk_ingest_sorted(&mut next);
-            assert!(
-                result.is_err(),
-                "descending keys must be rejected, not panic"
-            );
-            assert!(
-                result.unwrap_err().contains("ascending"),
-                "error should name the ordering precondition"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&path2);
     }
 
     #[test]
