@@ -108,3 +108,31 @@ mod tests {
         assert_eq!(Rate::new(7).to_string(), "7");
     }
 }
+
+#[cfg(test)]
+mod mpt_rate_tests {
+    use super::*;
+    use crate::{AccountID, MPTAmount, MPTIssue, make_mpt_id, sf_generic};
+
+    /// Testnet ledger 21511422, tx 492FDB4D...: an MPT partial payment with
+    /// TransferFee 3 and SendMax 122354741735175090. `divide` builds an
+    /// MPT mantissa above i64::MAX at exponent -2; rippled's canonicalize
+    /// truncates the last internal digit and the network delivered
+    /// 122351071203038999. quaxar threw "MPT amount out of range"
+    /// (tefEXCEPTION) and forked.
+    #[test]
+    fn mpt_partial_payment_rate_math_matches_testnet_21511422() {
+        let issue = MPTIssue::new(make_mpt_id(21_511_363, AccountID::from_array([0x11; 20])));
+        let amt = |v: i64| STAmount::from_mpt_amount(sf_generic(), MPTAmount::from(v), issue);
+        let rate = Rate::new(1_000_000_000 + 3 * 10_000);
+        // Testnet rules at that ledger select the Small Number mantissa.
+        let _scale = basics::number::NumberMantissaScaleGuard::new(
+            basics::number::MantissaScale::Small,
+        );
+
+        let delivered = divide_rate(&amt(122_354_741_735_175_090), rate);
+        assert_eq!(delivered.mpt().value(), 122_351_071_203_038_999);
+        // Sender debit including the fee, as recorded by the network.
+        assert_eq!(multiply_rate(&delivered, rate).mpt().value(), 122_354_741_735_175_100);
+    }
+}
