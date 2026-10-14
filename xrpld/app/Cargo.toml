@@ -14,6 +14,9 @@ path = "src/lib.rs"
 # _RJEM_MALLOC_CONF=prof:true,...). Off by default; production builds are
 # unchanged.
 heap-profiling = ["tikv-jemallocator/profiling"]
+# Test-only: keep AppJournal messages in memory for inspection. rippled's
+# Journal keeps nothing; production builds leave this off.
+journal-capture = []
 
 [dependencies]
 acquisition = { path = "../acquisition" }
@@ -57,5 +60,8 @@ arc-swap = "1"
 rayon = "1"
 
 [dev-dependencies]
+# Integration tests inspect journal messages and peer charges.
+app = { path = ".", features = ["journal-capture"] }
+overlay = { path = "../overlay", features = ["charge-capture"] }
 sonic-rs = "0.3.17"
 tempfile = "3"

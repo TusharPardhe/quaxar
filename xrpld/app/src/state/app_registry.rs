@@ -1123,51 +1123,62 @@ pub struct AppJournalEntry {
     pub message: String,
 }
 
-/// Most recent entries an [`AppJournal`] retains for inspection.
+/// A named log partition, the equivalent of rippled's `beast::Journal`.
 ///
-/// rippled's `beast::Journal` writes to a log sink and keeps nothing in
-/// memory. This journal keeps a bounded window so tests and diagnostics can
-/// read recent messages. Unbounded, it grew by every validation the node
-/// handled (about 17 MB per hour on testnet, found with heap profiling).
-pub const APP_JOURNAL_RETAINED_ENTRIES: usize = 512;
-
+/// Like rippled, a message is written to the log (here through `tracing`,
+/// with the partition name as a field) and nothing is kept in process memory.
+/// An earlier version stored every message in an unbounded `Vec`; validation
+/// handling alone grew it by about 17 MB per hour on testnet.
+///
+/// Tests that inspect messages enable capture: it is compiled in only for unit
+/// tests and under the test-only `journal-capture` feature, never in
+/// production builds.
 #[derive(Debug)]
 pub struct AppJournal {
     owner: String,
-    entries: Mutex<std::collections::VecDeque<AppJournalEntry>>,
+    #[cfg(any(test, feature = "journal-capture"))]
+    entries: Mutex<Vec<AppJournalEntry>>,
 }
 
 impl AppJournal {
     pub fn new(owner: impl Into<String>) -> Self {
         Self {
             owner: owner.into(),
-            entries: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(any(test, feature = "journal-capture"))]
+            entries: Mutex::new(Vec::new()),
         }
     }
 
-    /// The retained entries, oldest first.
+    /// Messages recorded so far. Test-only.
+    #[cfg(any(test, feature = "journal-capture"))]
     pub fn entries(&self) -> Vec<AppJournalEntry> {
         self.entries
             .lock()
             .expect("app journal mutex must not be poisoned")
-            .iter()
-            .cloned()
-            .collect()
+            .clone()
     }
 
     fn record(&self, level: impl Into<String>, message: impl Into<String>) {
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("app journal mutex must not be poisoned");
-        if entries.len() == APP_JOURNAL_RETAINED_ENTRIES {
-            entries.pop_front();
+        let level = level.into();
+        let message = message.into();
+        let partition = self.owner.as_str();
+        // rippled maps fatal to its highest severity; tracing has no fatal.
+        match level.as_str() {
+            "trace" => tracing::trace!(target: "journal", partition, "{message}"),
+            "debug" => tracing::debug!(target: "journal", partition, "{message}"),
+            "info" => tracing::info!(target: "journal", partition, "{message}"),
+            "warn" | "warning" => tracing::warn!(target: "journal", partition, "{message}"),
+            _ => tracing::error!(target: "journal", partition, level = %level, "{message}"),
         }
-        entries.push_back(AppJournalEntry {
-            owner: self.owner.clone(),
-            level: level.into(),
-            message: message.into(),
-        });
+        #[cfg(any(test, feature = "journal-capture"))]
+        self.entries
+            .lock()
+            .expect("app journal mutex must not be poisoned")
+            .push(AppJournalEntry {
+                owner: self.owner.clone(),
+                level,
+                message,
+            });
     }
 }
 
@@ -1575,19 +1586,6 @@ mod tests {
         assert_eq!(journal.entries()[1].message, "world");
     }
 
-    #[test]
-    fn app_journal_keeps_only_the_most_recent_entries() {
-        use super::{APP_JOURNAL_RETAINED_ENTRIES, AppJournal, LoadManagerJournal};
-        let journal = AppJournal::new("bounded");
-        let total = APP_JOURNAL_RETAINED_ENTRIES + 100;
-        for i in 0..total {
-            LoadManagerJournal::info(&journal, &format!("m{i}"));
-        }
-        let entries = journal.entries();
-        assert_eq!(entries.len(), APP_JOURNAL_RETAINED_ENTRIES);
-        assert_eq!(entries[0].message, format!("m{}", total - APP_JOURNAL_RETAINED_ENTRIES));
-        assert_eq!(entries.last().unwrap().message, format!("m{}", total - 1));
-    }
 
     #[test]
     fn application_registry_owners_seed_real_default_runtime_shell_state() {
