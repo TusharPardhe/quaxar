@@ -83,6 +83,9 @@ impl PeerLedgerStatus {
     }
 }
 
+/// Most recent resource charges a peer retains for diagnostics.
+pub const PEER_RETAINED_CHARGES: usize = 64;
+
 pub struct PeerImp {
     id: PeerId,
     remote_address: SocketAddr,
@@ -127,7 +130,10 @@ pub struct PeerImp {
     endpoint_accept_after: Mutex<Option<Instant>>,
     recent_endpoints: Mutex<HashMap<SocketAddr, RecentEndpoint>>,
     listener_check: Mutex<ListenerCheckState>,
-    charges: Mutex<Vec<(Charge, String)>>,
+    /// Recent resource charges, for diagnostics and tests. Bounded: a peer
+    /// connection lives for hours and is charged for every request, so an
+    /// unbounded list grew without limit (rippled keeps no such list).
+    charges: Mutex<std::collections::VecDeque<(Charge, String)>>,
     squelch: Mutex<Squelch>,
     /// Set when a non-droppable message cannot enter the bounded send queue.
     /// The session stop signal then tears down the non-reading peer.
@@ -273,7 +279,7 @@ impl PeerImp {
                 can_accept: true,
                 in_progress: false,
             }),
-            charges: Mutex::new(Vec::new()),
+            charges: Mutex::new(std::collections::VecDeque::new()),
             squelch: Mutex::new(Squelch::new(Arc::new(SystemClock))),
             disconnect_requested: AtomicBool::new(false),
             outbound_failure_notifier: Mutex::new(None),
@@ -671,7 +677,12 @@ impl PeerImp {
 
     /// Returns a snapshot of resource charges applied through `Peer::charge`.
     pub fn charges(&self) -> Vec<(Charge, String)> {
-        self.charges.lock().expect("peer charges lock").clone()
+        self.charges
+            .lock()
+            .expect("peer charges lock")
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn attach_session(
@@ -1057,10 +1068,13 @@ impl Peer for PeerImp {
     fn charge(&self, fee: Charge, context: String) {
         // Retain the local diagnostic snapshot used by existing callers and
         // tests, but make the Resource Manager disposition authoritative.
-        self.charges
-            .lock()
-            .expect("peer charges lock")
-            .push((fee.clone(), context.clone()));
+        {
+            let mut charges = self.charges.lock().expect("peer charges lock");
+            if charges.len() == PEER_RETAINED_CHARGES {
+                charges.pop_front();
+            }
+            charges.push_back((fee.clone(), context.clone()));
+        }
 
         let (consumer, disconnect_counter) = {
             let resource = self.resource.lock().expect("peer resource lock");

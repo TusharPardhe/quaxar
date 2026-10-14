@@ -1123,36 +1123,51 @@ pub struct AppJournalEntry {
     pub message: String,
 }
 
+/// Most recent entries an [`AppJournal`] retains for inspection.
+///
+/// rippled's `beast::Journal` writes to a log sink and keeps nothing in
+/// memory. This journal keeps a bounded window so tests and diagnostics can
+/// read recent messages. Unbounded, it grew by every validation the node
+/// handled (about 17 MB per hour on testnet, found with heap profiling).
+pub const APP_JOURNAL_RETAINED_ENTRIES: usize = 512;
+
 #[derive(Debug)]
 pub struct AppJournal {
     owner: String,
-    entries: Mutex<Vec<AppJournalEntry>>,
+    entries: Mutex<std::collections::VecDeque<AppJournalEntry>>,
 }
 
 impl AppJournal {
     pub fn new(owner: impl Into<String>) -> Self {
         Self {
             owner: owner.into(),
-            entries: Mutex::new(Vec::new()),
+            entries: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
+    /// The retained entries, oldest first.
     pub fn entries(&self) -> Vec<AppJournalEntry> {
         self.entries
             .lock()
             .expect("app journal mutex must not be poisoned")
-            .clone()
+            .iter()
+            .cloned()
+            .collect()
     }
 
     fn record(&self, level: impl Into<String>, message: impl Into<String>) {
-        self.entries
+        let mut entries = self
+            .entries
             .lock()
-            .expect("app journal mutex must not be poisoned")
-            .push(AppJournalEntry {
-                owner: self.owner.clone(),
-                level: level.into(),
-                message: message.into(),
-            });
+            .expect("app journal mutex must not be poisoned");
+        if entries.len() == APP_JOURNAL_RETAINED_ENTRIES {
+            entries.pop_front();
+        }
+        entries.push_back(AppJournalEntry {
+            owner: self.owner.clone(),
+            level: level.into(),
+            message: message.into(),
+        });
     }
 }
 
@@ -1558,6 +1573,20 @@ mod tests {
         assert_eq!(journal.entries().len(), 2);
         assert_eq!(journal.entries()[0].message, "hello");
         assert_eq!(journal.entries()[1].message, "world");
+    }
+
+    #[test]
+    fn app_journal_keeps_only_the_most_recent_entries() {
+        use super::{APP_JOURNAL_RETAINED_ENTRIES, AppJournal, LoadManagerJournal};
+        let journal = AppJournal::new("bounded");
+        let total = APP_JOURNAL_RETAINED_ENTRIES + 100;
+        for i in 0..total {
+            LoadManagerJournal::info(&journal, &format!("m{i}"));
+        }
+        let entries = journal.entries();
+        assert_eq!(entries.len(), APP_JOURNAL_RETAINED_ENTRIES);
+        assert_eq!(entries[0].message, format!("m{}", total - APP_JOURNAL_RETAINED_ENTRIES));
+        assert_eq!(entries.last().unwrap().message, format!("m{}", total - 1));
     }
 
     #[test]
