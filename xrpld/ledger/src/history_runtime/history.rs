@@ -58,6 +58,9 @@ pub struct LedgerHistoryMismatch {
     pub consensus: Option<JsonValue>,
 }
 
+/// Sequences of built/validated bookkeeping kept by `sweep`.
+pub const CONSENSUS_VALIDATED_RETAINED: u32 = 128;
+
 /// Mismatch records kept for diagnostics (rippled keeps only a counter).
 pub const MISMATCHES_RETAINED: usize = 64;
 
@@ -436,6 +439,31 @@ where
         S: Send,
     {
         self.ledgers_by_hash.sweep();
+        self.sweep_consensus_validated();
+    }
+
+    /// rippled keeps built/validated bookkeeping in `consensusValidated_`, a
+    /// TaggedCache of 64 entries aged out after 5 minutes, swept with the
+    /// ledger cache. quaxar kept a plain map that was never pruned and grew
+    /// by one entry per ledger. Keep the newest
+    /// `CONSENSUS_VALIDATED_RETAINED` sequences (about 8 minutes of ledgers),
+    /// long enough for a late validation or late build to be matched.
+    pub fn sweep_consensus_validated(&self) {
+        let mut by_seq = self
+            .consensus_validated
+            .lock()
+            .expect("consensus-validations mutex must not be poisoned");
+        if let Some((&newest, _)) = by_seq.last_key_value() {
+            let floor = newest.saturating_sub(CONSENSUS_VALIDATED_RETAINED);
+            by_seq.retain(|&seq, _| seq > floor);
+        }
+    }
+
+    pub fn consensus_validated_len(&self) -> usize {
+        self.consensus_validated
+            .lock()
+            .expect("consensus-validations mutex must not be poisoned")
+            .len()
     }
 
     pub fn fix_index(&self, ledger_index: u32, ledger_hash: SHAMapHash) -> bool {
