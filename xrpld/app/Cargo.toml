@@ -9,6 +9,12 @@ publish = false
 name = "app"
 path = "src/lib.rs"
 
+[features]
+# Opt-in jemalloc heap profiling (enable at runtime with
+# _RJEM_MALLOC_CONF=prof:true,...). Off by default; production builds are
+# unchanged.
+heap-profiling = ["tikv-jemallocator/profiling"]
+
 [dependencies]
 acquisition = { path = "../acquisition" }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }

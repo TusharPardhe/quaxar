@@ -9,6 +9,9 @@ publish = false
 name = "quaxar"
 path = "src/main.rs"
 
+[features]
+heap-profiling = ["app/heap-profiling"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 
