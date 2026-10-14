@@ -809,3 +809,35 @@ fn stale_death_record_after_restart_does_not_delete_a_resurrected_node() {
         "the node that really died is pruned"
     );
 }
+
+#[test]
+fn restart_rebuilds_dead_pending_so_reuse_pins_the_node() {
+    // X dies at seq 2. The process restarts. A new in-flight ledger reuses X
+    // (store sees the bytes present). Before the fix the dead-pending mirror
+    // was empty after reopen, so X was not pinned and prune deleted it while
+    // the next validated ledger still needed it.
+    let backend = open_memory();
+    let x = hid(0x99);
+    {
+        let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("writer");
+        store_node(backend.as_ref(), &x);
+        writer
+            .claim(&ClaimDelta { seq: 1, state_root: hid(1), new_state: vec![x], dead_state: vec![], owned: vec![] })
+            .expect("claim 1");
+        writer
+            .claim(&ClaimDelta { seq: 2, state_root: hid(2), new_state: vec![hid(2)], dead_state: vec![x], owned: vec![] })
+            .expect("claim 2");
+        assert!(writer.is_dead_pending(&x));
+    }
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("reopen");
+    assert!(writer.is_dead_pending(&x), "dead-pending mirror rebuilt on open");
+    // Reuse by an in-flight ledger: pin (rule R5).
+    writer.note_stored(x, 3);
+    writer.prune(2, 16).expect("prune");
+    assert!(present_nodes(backend.as_ref()).contains(&x), "reused dead node kept");
+    writer
+        .claim(&ClaimDelta { seq: 3, state_root: hid(3), new_state: vec![x], dead_state: vec![hid(2)], owned: vec![] })
+        .expect("claim 3");
+    writer.prune(3, 16).expect("prune 3");
+    assert!(present_nodes(backend.as_ref()).contains(&x), "resurrected node stays live");
+}

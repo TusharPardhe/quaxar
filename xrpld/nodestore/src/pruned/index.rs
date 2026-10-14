@@ -113,13 +113,44 @@ impl IndexWriter {
         }
         let claimed_seq = read_u32(backend.as_ref(), meta_key::CLAIMED_SEQ)?;
         let pruned_to = read_u32(backend.as_ref(), meta_key::PRUNED_TO)?.unwrap_or(0);
-        Ok(Self {
+        let mut writer = Self {
             backend,
             unclaimed: HashMap::new(),
             dead_pending: HashMap::new(),
             claimed_seq,
             pruned_to,
-        })
+        };
+        writer.rebuild_pending_from_notebook()?;
+        Ok(writer)
+    }
+
+    /// Rebuild the in-memory dead-pending mirror and the restore watch from
+    /// the persisted notebook. Both protect a dead node that an in-flight
+    /// ledger reuses before prune reaches it (rules R3/R5). They were empty
+    /// after a restart, so for one retention window a reused dead node could
+    /// be pruned while a later validated ledger still needed it.
+    fn rebuild_pending_from_notebook(&mut self) -> Result<(), String> {
+        let start = notebook_key(self.pruned_to.saturating_add(1), &Uint256::from_array([0; 32]));
+        let end = notebook_scan_end(u32::MAX);
+        let mut rows: Vec<(u32, Uint256, NotebookKind)> = Vec::new();
+        self.backend
+            .kv_range(Keyspace::Notebook, &start, &end, &mut |key, value| {
+                if let Some((seq, hash)) = decode_notebook_key(key)
+                    && let Some(kind) = value.first().and_then(|b| NotebookKind::from_byte(*b))
+                {
+                    rows.push((seq, hash, kind));
+                }
+                true
+            })?;
+        let mut watched = Vec::with_capacity(rows.len());
+        for (seq, hash, kind) in rows {
+            if kind == NotebookKind::State && self.dead_seq_get(&hash)? == Some(seq) {
+                self.dead_pending.insert(hash, seq);
+            }
+            watched.push(hash);
+        }
+        self.backend.watch_restores(&watched);
+        Ok(())
     }
 
     pub fn claimed_seq(&self) -> Option<u32> {

@@ -14,10 +14,19 @@ NETWORK_ID = 1
 
 
 def rpc(method, **params):
-    req = urllib.request.Request(
-        RPC, json.dumps({"method": method, "params": [params]}).encode(),
-        {"Content-Type": "application/json"})
-    out = json.load(urllib.request.urlopen(req, timeout=60))["result"]
+    import time, urllib.error
+    body = json.dumps({"method": method, "params": [params]}).encode()
+    if method != "ledger_entry":
+        print("rpc", method, flush=True)
+    for attempt in range(8):
+        try:
+            req = urllib.request.Request(RPC, body, {"Content-Type": "application/json"})
+            out = json.load(urllib.request.urlopen(req, timeout=60))["result"]
+            break
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+            if attempt == 7:
+                raise
+            time.sleep(min(30, 1.5 ** attempt))
     if out.get("status") == "error":
         raise RuntimeError(f"{method} {params}: {out.get('error')}")
     return out
@@ -191,26 +200,17 @@ def main():
         except (RuntimeError, KeyError):
             pass
 
+    nft_pages = []
     for a in accounts:
         want.add(account_key(a))
         want.add(sha512h(b"\x00S" + account_id(a) + (0).to_bytes(4, "big")))  # SignerList
         root = owner_dir_key(a)
         want.add(root)
-        # NFToken pages: keys are AccountID || low 96 bits of the token, so
-        # enumerate the account's whole page range with a crafted marker.
-        prefix = account_id(a).hex().upper()
-        marker = prefix + "0" * 24
-        while marker:
-            try:
-                page = rpc("ledger_data", ledger_index=parent_seq, marker=marker,
-                           limit=64, type="nft_page", binary=True)
-            except RuntimeError:
-                break
-            rows_in = [r for r in page.get("state", []) if r["index"].startswith(prefix)]
-            for r in rows_in:
-                want.add(r["index"])
-            nxt = page.get("marker")
-            marker = nxt if (nxt and nxt.startswith(prefix) and len(rows_in) == len(page.get("state", []))) else None
+        # NFToken pages: the newest page is keylet::nftpage_max (AccountID ||
+        # 0xFF*12); older pages are chained through sfPreviousPageMin. Walk
+        # that chain with ledger_entry instead of a type-filtered
+        # ledger_data scan, which makes the server scan its whole state.
+        nft_pages.append(account_id(a).hex().upper() + "F" * 24)
 
     # NFToken buy/sell offer directories for every referenced NFTokenID.
     def collect_nft_ids(obj, out):
@@ -239,35 +239,43 @@ def main():
         except RuntimeError:
             return None
 
-    pending = list(want)
-    seen = set()
-    while pending:
-        idx = pending.pop()
-        if idx in seen:
-            continue
-        seen.add(idx)
-        data = fetch(idx)
-        if data is None:
-            continue
-        rows[idx] = data
-        # follow owner-directory pages
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch_both(idx):
         try:
-            j = rpc("ledger_entry", index=idx, ledger_index=parent_seq)["node"]
+            binary = rpc("ledger_entry", index=idx, ledger_index=parent_seq, binary=True)["node_binary"]
+            node = rpc("ledger_entry", index=idx, ledger_index=parent_seq)["node"]
+            return idx, binary, node
         except RuntimeError:
-            continue
-        if j.get("LedgerEntryType") == "AccountRoot" and "AMMID" in j:
-            pending.append(j["AMMID"])
-        if j.get("LedgerEntryType") == "DirectoryNode":
-            root = j.get("RootIndex", idx)
-            for page_field in ("IndexNext", "IndexPrevious"):
-                p = int(j.get(page_field, "0"), 16)
-                if p:
-                    pending.append(dir_page_key(root, p))
-            # owner directories: include every owned entry (reads during deletes)
-            # Every owned object is only read wholesale by AccountDelete;
-            # NFToken offer directories are walked by NFT transactions.
-            if "NFTokenID" in j or j.get("Owner") in deleting:
-                pending.extend(j.get("Indexes", []))
+            return idx, None, None
+
+    pending = set(want) | set(nft_pages)
+    seen = set()
+    with ThreadPoolExecutor(4) as pool:
+        while pending:
+            batch = [i for i in pending if i not in seen]
+            pending = set()
+            seen.update(batch)
+            for idx, data, j in pool.map(fetch_both, batch):
+                if data is None:
+                    continue
+                rows[idx] = data
+                if j.get("LedgerEntryType") == "NFTokenPage":
+                    for link in ("PreviousPageMin", "NextPageMin"):
+                        if j.get(link):
+                            pending.add(j[link])
+                if j.get("LedgerEntryType") == "AccountRoot" and "AMMID" in j:
+                    pending.add(j["AMMID"])
+                if j.get("LedgerEntryType") == "DirectoryNode":
+                    root = j.get("RootIndex", idx)
+                    for page_field in ("IndexNext", "IndexPrevious"):
+                        p = int(j.get(page_field, "0"), 16)
+                        if p:
+                            pending.add(dir_page_key(root, p))
+                    if "NFTokenID" in j or j.get("Owner") in deleting:
+                        pending.update(j.get("Indexes", []))
+            pending -= seen
+        print(f"fetched {len(rows)} SLEs", flush=True)
 
     amendments = rpc("ledger_entry", index=SINGLETONS[0], ledger_index=parent_seq)["node"]["Amendments"]
     fee = rpc("ledger_entry", index=SINGLETONS[1], ledger_index=parent_seq)["node"]

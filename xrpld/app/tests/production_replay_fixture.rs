@@ -166,6 +166,21 @@ fn testnet_21427256_batch_account_delete_matches_network() {
     );
 }
 
+/// Testnet fork at 21534114 (2026-10-14): a FillOrKill OfferCreate (tx index
+/// 44, tecKILLED) consumed a partially funded XRP offer to zero in its first
+/// liquidity pass. On the next pass rippled's OfferStream compares the owner's
+/// funds with the strand's `afView` (the flow sandbox including the first
+/// pass), finds them equal, and permanently removes the offer; the killed
+/// transaction then deletes it. quaxar compared against the transaction's
+/// pristine view, kept the offer, and forked.
+#[test]
+fn testnet_21534114_fill_or_kill_removes_offer_unfunded_by_earlier_pass() {
+    run_sparse_replay(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21534114_fok_unfunded_offer.jsonl"),
+    );
+}
+
 fn run_sparse_replay(path: PathBuf) {
     let rendered = path.to_string_lossy();
     assert!(
