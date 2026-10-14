@@ -58,6 +58,9 @@ pub struct LedgerHistoryMismatch {
     pub consensus: Option<JsonValue>,
 }
 
+/// Mismatch records kept for diagnostics (rippled keeps only a counter).
+pub const MISMATCHES_RETAINED: usize = 64;
+
 #[derive(Debug)]
 pub struct LedgerHistory<C = MonotonicClock, S = HardenedHashBuilder> {
     ledgers_by_hash: TaggedCache<SHAMapHash, Ledger, C, S>,
@@ -491,10 +494,96 @@ where
 
     fn record_mismatch(&self, mismatch: LedgerHistoryMismatch) {
         self.mismatch_count.fetch_add(1, Ordering::SeqCst);
-        self.mismatches
+        self.handle_mismatch(&mismatch);
+        let mut kept = self
+            .mismatches
             .lock()
-            .expect("mismatches mutex must not be poisoned")
-            .push(mismatch);
+            .expect("mismatches mutex must not be poisoned");
+        // rippled keeps only a counter; keep a short window for diagnostics.
+        if kept.len() >= MISMATCHES_RETAINED {
+            kept.remove(0);
+        }
+        kept.push(mismatch);
+    }
+
+    /// rippled `LedgerHistory::handleMismatch`: when the ledger we built and
+    /// the network-validated ledger for the same sequence differ, log why.
+    /// This is the record that pinpoints a fork: the first transaction whose
+    /// result or metadata differs.
+    fn handle_mismatch(&self, m: &LedgerHistoryMismatch) {
+        let built = self.ledgers_by_hash.fetch(&m.built);
+        let valid = self.ledgers_by_hash.fetch(&m.validated);
+        let (built_present, valid_present) = (built.is_some(), valid.is_some());
+        let (Some(built), Some(valid)) = (built, valid) else {
+            tracing::error!(target: "ledger_history", seq = m.seq, built = %m.built,
+                validated = %m.validated,
+                built_present, valid_present,
+                "MISMATCH cannot be analyzed");
+            return;
+        };
+        let (bh, vh) = (built.header(), valid.header());
+        if bh.parent_hash != vh.parent_hash {
+            tracing::error!(target: "ledger_history", seq = m.seq,
+                built_parent = %bh.parent_hash, valid_parent = %vh.parent_hash,
+                "MISMATCH on prior ledger");
+            return;
+        }
+        if bh.close_time != vh.close_time {
+            tracing::error!(target: "ledger_history", seq = m.seq,
+                built_close = bh.close_time, valid_close = vh.close_time,
+                "MISMATCH on close time");
+            return;
+        }
+        match (m.built_consensus_hash, m.validated_consensus_hash) {
+            (Some(b), Some(v)) if b != v => tracing::error!(target: "ledger_history",
+                seq = m.seq, built = %b, validated = %v,
+                "MISMATCH on consensus transaction set"),
+            (Some(b), Some(_)) => tracing::error!(target: "ledger_history",
+                seq = m.seq, tx_set = %b, "MISMATCH with same consensus transaction set"),
+            _ => {}
+        }
+        let (Ok(built_txs), Ok(valid_txs)) = (built.tx_snapshot(), valid.tx_snapshot()) else {
+            tracing::error!(target: "ledger_history", seq = m.seq,
+                "MISMATCH transaction maps unreadable");
+            return;
+        };
+        tracing::error!(target: "ledger_history", seq = m.seq,
+            built_txs = built_txs.len(), valid_txs = valid_txs.len(),
+            built_account_hash = %bh.account_hash, valid_account_hash = %vh.account_hash,
+            "MISMATCH transaction counts");
+        let meta_json = |meta: &protocol::TxMeta| {
+            serde_json::to_string(&meta.get_json(protocol::JsonOptions::NONE))
+                .unwrap_or_default()
+        };
+        let by_id = |txs: &[crate::LedgerTxRead]| {
+            txs.iter()
+                .map(|(tx, meta)| (tx.get_transaction_id(), (tx.clone(), meta.clone())))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let (bmap, vmap) = (by_id(&built_txs), by_id(&valid_txs));
+        let mut ids: Vec<_> = bmap.keys().chain(vmap.keys()).copied().collect();
+        ids.sort();
+        ids.dedup();
+        for id in ids {
+            match (bmap.get(&id), vmap.get(&id)) {
+                (Some(_), None) => tracing::error!(target: "ledger_history", seq = m.seq,
+                    tx = %id, "MISMATCH transaction only in built ledger"),
+                (None, Some(_)) => tracing::error!(target: "ledger_history", seq = m.seq,
+                    tx = %id, "MISMATCH transaction only in valid ledger"),
+                (Some((tx, bm)), Some((_, vm))) => {
+                    let (bj, vj) = (meta_json(bm), meta_json(vm));
+                    if bj != vj {
+                        tracing::error!(target: "ledger_history", seq = m.seq, tx = %id,
+                            tx_type = ?tx.get_txn_type(),
+                            built_result = bm.get_result(), valid_result = vm.get_result(),
+                            built_index = bm.get_index(), valid_index = vm.get_index(),
+                            built_meta = %bj, valid_meta = %vj,
+                            "MISMATCH on transaction metadata");
+                    }
+                }
+                (None, None) => {}
+            }
+        }
     }
 }
 
