@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod ballast;
 pub mod fault_backend;
 pub mod fjall_backend;
 pub mod kv;
