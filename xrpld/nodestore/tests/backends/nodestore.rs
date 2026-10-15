@@ -112,6 +112,12 @@ impl Backend for FailingBatchBackend {
     }
 
     fn store_batch(&self, batch: &nodestore::Batch) {
+        let _ = self.store_batch_result(batch);
+    }
+
+    // import_internal writes through the checked path; inject the failure
+    // there so the first batch is rejected and must be kept intact.
+    fn store_batch_result(&self, batch: &nodestore::Batch) -> Result<(), String> {
         let call = self.calls.fetch_add(1, Ordering::Relaxed);
         self.batch_lengths
             .lock()
@@ -120,6 +126,7 @@ impl Backend for FailingBatchBackend {
         if call == 0 {
             panic!("storeBatch failed");
         }
+        Ok(())
     }
 
     fn sync(&self) {}
@@ -399,8 +406,11 @@ fn database_async_fetch_uses_backend_object_and_updates_metrics() {
     database.stop();
 }
 
+/// A panicking async-read callback is contained: the read worker logs it and
+/// keeps serving, so later callbacks (including others for the same hash) are
+/// still delivered instead of being stranded behind a dead worker.
 #[test]
-fn database_async_fetch_does_not_swallow_panicking_callbacks() {
+fn database_async_fetch_contains_panicking_callbacks() {
     let manager = ManagerImp::new();
     let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
     let journal = Arc::new(NullJournal);
@@ -437,7 +447,25 @@ fn database_async_fetch_does_not_swallow_panicking_callbacks() {
             .expect("first callback object must exist"),
         vec![8, 8, 8]
     );
-    assert!(second_rx.recv_timeout(Duration::from_millis(250)).is_err());
+    assert_eq!(
+        second_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second callback must still be delivered")
+            .expect("second callback object must exist"),
+        vec![8, 8, 8]
+    );
+
+    // The worker survived: a fresh request is served too.
+    let (third_tx, third_rx) = mpsc::channel();
+    database.async_fetch(
+        item_hash,
+        1,
+        Box::new(BlobChannelReadWork {
+            sender: third_tx,
+            panic_after_send: false,
+        }),
+    );
+    assert!(third_rx.recv_timeout(Duration::from_secs(2)).is_ok());
 
     database.stop();
 }
