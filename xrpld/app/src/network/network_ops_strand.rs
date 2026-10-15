@@ -671,7 +671,7 @@ fn strand_loop(
         if let Some(baseline) = crate::ledger::inbound_ledgers::trusted_baseline::active() {
             let too_old = root
                 .validated_ledger_seq()
-                .is_some_and(|validated| validated > baseline.seq().saturating_add(TRUSTED_BASELINE_MAX_AGE));
+                .is_some_and(|validated| baseline.is_too_old(validated));
             // Kept past Full: history backfill of the restart gap and of the
             // retained window also diverges little from the baseline. It is
             // safe until its nodes could be pruned (section 3 of the design).
@@ -2817,10 +2817,6 @@ fn trace_completed_inbound_handoff(
         "LCL trace: inbound ledger completion persisted before adoption"
     );
 }
-
-/// The trusted restart baseline is retired once the validated ledger is this
-/// far past it (half the default 512-ledger prune window).
-const TRUSTED_BASELINE_MAX_AGE: u32 = 256;
 
 /// Ledgers between trims of the resident state tree
 /// (`QUAXAR_RESIDENT_TRIM_INTERVAL`, default 64).

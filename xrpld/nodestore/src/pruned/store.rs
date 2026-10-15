@@ -108,6 +108,18 @@ impl PrunedStore {
         }
     }
 
+    /// Read a node without the restore watch (index-internal readers such as
+    /// the trusted baseline, whose nodes are live and must not pin anything).
+    pub fn fetch_unwatched(&self, hash: &Uint256) -> Option<Arc<NodeObject>> {
+        let value = self
+            .backend
+            .kv_get(Keyspace::Nodes, hash.as_slice())
+            .ok()
+            .flatten()?;
+        let decoded = DecodedBlob::new(hash.data(), &value);
+        decoded.was_ok().then(|| decoded.create_object())
+    }
+
     /// Store a node's bytes in the `nodes` keyspace and record it as not yet
     /// claimed into a validated ledger (so prune cannot delete it before the
     /// claim decides its fate; rule R2/R5).
@@ -201,16 +213,6 @@ impl PrunedStore {
                 metrics.last_dry_run_would_delete = would;
                 0
             }
-            // rippled SHAMapStoreImp deletes only at rotation, once
-            // `validatedSeq >= lastRotated + deleteInterval`, and then clears
-            // the caches (including the FullBelowCache). Deleting on every
-            // validated ledger forced the FullBelowCache to be cleared every
-            // ~4 s, discarding the progress of any acquisition whose tree walk
-            // lasts longer than one ledger (fork recovery on a multi-million
-            // node state tree never converged). Batch deletions at the same
-            // cadence: the retained window grows from `online_delete` to
-            // `2 * online_delete` ledgers between bursts, exactly like rippled.
-            PruneMode::On if k < writer.pruned_to().saturating_add(self.config.online_delete) => 0,
             PruneMode::On => {
                 let pruned = writer.prune(k, self.config.prune_batch)?;
                 writer.orphan_sweep(validated_seq, self.config.online_delete)?;
@@ -305,6 +307,10 @@ impl PrunedStore {
     }
 
     /// Seconds between sampled verify passes (`0` disables periodic verify).
+    pub fn online_delete(&self) -> u32 {
+        self.config.online_delete
+    }
+
     pub fn verify_interval_secs(&self) -> u64 {
         self.config.verify_interval_secs
     }
@@ -645,11 +651,54 @@ mod tests {
         }
     }
 
-    /// rippled SHAMapStoreImp deletes only when `validated >= lastRotated +
-    /// deleteInterval`, so the FullBelowCache (cleared after each deletion)
-    /// survives between rotations and long acquisition walks can converge.
+    fn open_fjall(tag: &str) -> Arc<dyn Backend> {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("quaxar-pruned-{tag}-{t}"));
+        let mut section = Section::new("node_db");
+        section.set("type", "fjall");
+        section.set("path", path.to_string_lossy().into_owned());
+        let backend = crate::FjallFactory::new()
+            .create_instance(
+                NodeObject::KEY_BYTES,
+                &section,
+                0,
+                Arc::new(crate::DummyScheduler),
+                Arc::new(NullJournal),
+            )
+            .expect("fjall backend");
+        let backend: Arc<dyn Backend> = Arc::from(backend);
+        backend.open(true).expect("open");
+        backend
+    }
+
+    /// Claim ledger `seq` that adds node `300+seq` and retires `300+seq-1`.
+    fn churn_one(store: &PrunedStore, seq: u32) {
+        store
+            .store(&node(hid(300 + seq as u64)), seq)
+            .expect("store");
+        let dead = if seq == 1 {
+            vec![]
+        } else {
+            vec![hid(300 + seq as u64 - 1)]
+        };
+        store
+            .claim(&ClaimDelta {
+                seq,
+                state_root: hid(seq as u64),
+                new_state: vec![hid(300 + seq as u64)],
+                dead_state: dead,
+                owned: vec![],
+            })
+            .expect("claim");
+    }
+
+    /// The window slides one ledger at a time: every validated ledger past
+    /// the window deletes exactly the nodes that died `online_delete` ago.
     #[test]
-    fn deletions_follow_rippled_rotation_cadence() {
+    fn retained_window_slides_continuously() {
         let config = PrunedConfig {
             online_delete: 4,
             prune_mode: PruneMode::On,
@@ -657,35 +706,78 @@ mod tests {
         };
         let store = PrunedStore::open(open_memory(), config).expect("open");
         let mut deleted_at = Vec::new();
-        for seq in 1..=16u32 {
-            store
-                .store(&node(hid(300 + seq as u64)), seq)
-                .expect("store");
-            let dead = if seq == 1 {
-                vec![]
-            } else {
-                vec![hid(300 + seq as u64 - 1)]
-            };
-            store
-                .claim(&ClaimDelta {
-                    seq,
-                    state_root: hid(seq as u64),
-                    new_state: vec![hid(300 + seq as u64)],
-                    dead_state: dead,
-                    owned: vec![],
-                })
-                .expect("claim");
+        for seq in 1..=10u32 {
+            churn_one(&store, seq);
             if store.maintain(seq, u32::MAX).expect("maintain") > 0 {
                 deleted_at.push(seq);
             }
+            // The cursor advances when a ledger's deaths are deleted; ledger 1
+            // had none, so the floor first moves at 6.
+            if seq >= 6 {
+                assert_eq!(store.metrics().retained_floor, seq - 3, "floor at {seq}");
+            }
         }
-        // Bursts every `online_delete` ledgers, not on every ledger.
-        assert_eq!(deleted_at, vec![8, 12, 16]);
-        // The burst at 16 deletes through 12; node 312 died at 13 and stays
-        // until the next rotation.
-        assert_eq!(store.fetch(&hid(311)).1, Status::NotFound);
-        assert_eq!(store.fetch(&hid(312)).1, Status::Ok);
-        assert_eq!(store.metrics().retained_floor, 13);
+        assert_eq!(deleted_at, vec![6, 7, 8, 9, 10]);
+    }
+
+    /// Problem 5: an acquisition reads a dead-pending node through the node
+    /// store (to attach it to a ledger that is not yet claimed). Prune must
+    /// keep it instead of deleting it under that ledger.
+    #[test]
+    fn dead_node_read_by_node_store_is_kept_by_prune() {
+        let config = PrunedConfig {
+            online_delete: 2,
+            prune_mode: PruneMode::On,
+            ..PrunedConfig::default()
+        };
+        let backend = open_fjall("read-pin");
+        let store = PrunedStore::open(Arc::clone(&backend), config).expect("open");
+        churn_one(&store, 1);
+        store.maintain(1, u32::MAX).expect("maintain");
+        churn_one(&store, 2); // node 301 dies at 2
+        store.maintain(2, u32::MAX).expect("maintain");
+        // An acquisition reads the dead node through the node store.
+        let (object, status) = backend.fetch(&hid(301));
+        assert_eq!(status, Status::Ok);
+        assert!(object.is_some());
+        for seq in 3..=6u32 {
+            churn_one(&store, seq);
+            store.maintain(seq, u32::MAX).expect("maintain");
+        }
+        // 302 died at 3 and was never read: deleted on schedule.
+        assert_eq!(backend.fetch(&hid(302)).1, Status::NotFound);
+        // 301 was read after it died: kept past its scheduled deletion (4).
+        // The orphan sweep re-retired it at 5, so it lives one more window.
+        assert_eq!(store.fetch(&hid(301)).1, Status::Ok);
+        for seq in 7..=8u32 {
+            churn_one(&store, seq);
+            store.maintain(seq, u32::MAX).expect("maintain");
+        }
+        // Not read again: deleted after that window, so retention is bounded.
+        assert_eq!(store.fetch(&hid(301)).1, Status::NotFound);
+    }
+
+    /// A read that races the delete batch is rescued and written back.
+    #[test]
+    fn read_racing_the_delete_batch_is_rescued() {
+        let backend = open_fjall("rescue");
+        let store = PrunedStore::open(
+            Arc::clone(&backend),
+            PrunedConfig {
+                online_delete: 2,
+                prune_mode: PruneMode::On,
+                ..PrunedConfig::default()
+            },
+        )
+        .expect("open");
+        churn_one(&store, 1);
+        churn_one(&store, 2); // 301 dies at 2 and is watched
+        // Simulate prune having started the delete when a reader arrives.
+        assert_eq!(backend.begin_delete(&[hid(301)]), vec![false]);
+        assert_eq!(backend.fetch(&hid(301)).1, Status::Ok);
+        let rescued = backend.finish_delete(&[hid(301)]);
+        assert_eq!(rescued.len(), 1, "the racing read is captured");
+        assert_eq!(rescued[0].0, hid(301));
     }
 
     #[test]

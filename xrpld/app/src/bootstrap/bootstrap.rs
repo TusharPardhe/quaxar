@@ -4353,16 +4353,36 @@ fn install_trusted_restart_baseline(root: &ApplicationRoot) {
             return;
         }
     };
+    use crate::ledger::inbound_ledgers::trusted_baseline as baseline;
+    // Read through the index's key-value path, not the node-store fetch: a
+    // baseline lookup must not pin dead-pending nodes (restore watch), and
+    // baseline nodes are live by construction.
     let fetch_store = Arc::clone(&store);
-    let fetch: crate::ledger::inbound_ledgers::trusted_baseline::BaselineFetch =
-        Arc::new(move |hash| fetch_store.fetch(hash).0.map(|object| object.data().to_vec()));
+    let fetch: baseline::BaselineFetch = Arc::new(move |hash| {
+        fetch_store
+            .fetch_unwatched(hash)
+            .map(|object| object.data().to_vec())
+    });
+    let max_age = baseline::max_age_for(driver.online_delete());
+    // Roll the baseline to every claimed ledger. Fork recovery and catch-up
+    // then skip every subtree shared with the newest committed tree, even
+    // though the FullBelowCache is cleared whenever a prune deletes nodes.
+    let roll_fetch = Arc::clone(&fetch);
+    driver.set_on_claimed(Box::new(move |seq, root_hash| {
+        baseline::advance(Arc::new(baseline::TrustedBaseline::with_max_age(
+            seq,
+            root_hash,
+            Arc::clone(&roll_fetch),
+            max_age,
+        )));
+    }));
     if fetch(&root_hash).is_none() {
         tracing::warn!(target: "acquisition_trace", seq, %root_hash, "trusted restart baseline: claimed root missing from store");
         return;
     }
-    crate::ledger::inbound_ledgers::trusted_baseline::install(Arc::new(
-        crate::ledger::inbound_ledgers::trusted_baseline::TrustedBaseline::new(seq, root_hash, fetch),
-    ));
+    baseline::install(Arc::new(baseline::TrustedBaseline::with_max_age(
+        seq, root_hash, fetch, max_age,
+    )));
     tracing::info!(
         target: "acquisition_trace",
         event = "trusted_baseline_installed",

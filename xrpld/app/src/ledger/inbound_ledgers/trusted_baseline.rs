@@ -36,8 +36,18 @@ pub(crate) type BaselineFetch = Arc<dyn Fn(&Uint256) -> Option<Vec<u8>> + Send +
 /// since the restart; the bound only guards against a pathological gap.
 const MAX_MEMO_NODES: usize = 2_000_000;
 
+/// Age limit for a store pruned `online_delete` ledgers after death: half the
+/// window, so a baseline is retired long before any of its nodes is deletable.
+pub(crate) fn max_age_for(online_delete: u32) -> u32 {
+    (online_delete / 2).max(1)
+}
+
 pub(crate) struct TrustedBaseline {
     seq: u32,
+    /// Ledgers past `seq` for which the baseline stays trusted. Its nodes die
+    /// no earlier than `seq + 1` and are deleted `online_delete` ledgers after
+    /// they die, so any value below `online_delete` keeps every use safe.
+    max_age: u32,
     root_hash: Uint256,
     fetch: BaselineFetch,
     retired: AtomicBool,
@@ -71,9 +81,20 @@ pub struct TrustedBaselineStats {
 }
 
 impl TrustedBaseline {
+    #[cfg(test)]
     pub(crate) fn new(seq: u32, root_hash: Uint256, fetch: BaselineFetch) -> Self {
+        Self::with_max_age(seq, root_hash, fetch, 256)
+    }
+
+    pub(crate) fn with_max_age(
+        seq: u32,
+        root_hash: Uint256,
+        fetch: BaselineFetch,
+        max_age: u32,
+    ) -> Self {
         Self {
             seq,
+            max_age,
             root_hash,
             fetch,
             retired: AtomicBool::new(false),
@@ -84,8 +105,15 @@ impl TrustedBaseline {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn seq(&self) -> u32 {
         self.seq
+    }
+
+    /// Whether the baseline is too old to trust at validated ledger
+    /// `validated` (some of its nodes may become deletable).
+    pub(crate) fn is_too_old(&self, validated: u32) -> bool {
+        validated > self.seq.saturating_add(self.max_age)
     }
 
     pub(crate) fn is_retired(&self) -> bool {
@@ -198,6 +226,19 @@ pub(crate) fn install(baseline: Arc<TrustedBaseline>) {
     }
 }
 
+/// Roll the baseline forward to a newly claimed ledger. The claim is synced
+/// before this runs, so the new root's tree is complete on disk; the previous
+/// baseline is retired (its memo is released once in-flight users drop it).
+pub(crate) fn advance(baseline: Arc<TrustedBaseline>) {
+    let previous = slot()
+        .write()
+        .ok()
+        .and_then(|mut guard| guard.replace(baseline));
+    if let Some(previous) = previous {
+        previous.retire();
+    }
+}
+
 /// The active baseline, if any.
 pub(crate) fn active() -> Option<Arc<TrustedBaseline>> {
     slot()
@@ -292,6 +333,42 @@ mod tests {
         // Root, X and the unreadable 0x99 were each read once (memoized).
         assert_eq!(*reads.lock().unwrap(), 3);
         assert_eq!(baseline.stats().skips, 3);
+    }
+
+    #[test]
+    fn age_limit_is_half_the_prune_window() {
+        assert_eq!(max_age_for(512), 256);
+        assert_eq!(max_age_for(256), 128);
+        assert_eq!(max_age_for(1), 1);
+        let (_, x_hash, root, _) = baseline();
+        let fetch: BaselineFetch = Arc::new(|_| None);
+        let b = TrustedBaseline::with_max_age(100, *root.as_uint256(), fetch, 10);
+        assert!(!b.is_too_old(110));
+        assert!(b.is_too_old(111));
+        let _ = x_hash;
+    }
+
+    /// Rolling forward replaces the active baseline and retires the old one,
+    /// so an in-flight holder of the previous Arc stops trusting it.
+    #[test]
+    fn advance_replaces_and_retires_previous_baseline() {
+        clear_for_test();
+        let (first, x_hash, _, _) = baseline();
+        let first = Arc::new(first);
+        install(Arc::clone(&first));
+        assert!(first.has_complete_child(SHAMapNodeId::default(), 3, x_hash));
+        let (second, _, _, _) = baseline();
+        let second = Arc::new(TrustedBaseline::with_max_age(
+            8,
+            second.root_hash,
+            Arc::clone(&second.fetch),
+            256,
+        ));
+        advance(Arc::clone(&second));
+        assert!(first.is_retired(), "previous baseline retired");
+        assert!(!first.has_complete_child(SHAMapNodeId::default(), 3, x_hash));
+        assert_eq!(active().map(|b| b.seq()), Some(8));
+        clear_for_test();
     }
 
     #[test]

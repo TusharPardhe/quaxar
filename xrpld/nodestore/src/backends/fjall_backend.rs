@@ -138,7 +138,7 @@ pub struct FjallBackend {
     /// Dead-pending node hashes the pruned index asked us to watch, mapped to
     /// whether they were written again since. Bounded by the index's
     /// dead-pending set. Prune keeps any node marked `true` (design R3/R5).
-    restore_watch: Mutex<std::collections::HashMap<Uint256, bool>>,
+    restore_watch: super::restore_watch::RestoreWatch,
 }
 
 impl FjallBackend {
@@ -159,7 +159,7 @@ impl FjallBackend {
             journal,
             db: Mutex::new(None),
             delete_on_close: std::sync::atomic::AtomicBool::new(false),
-            restore_watch: Mutex::new(std::collections::HashMap::new()),
+            restore_watch: super::restore_watch::RestoreWatch::new(),
         })
     }
 
@@ -227,20 +227,6 @@ impl FjallBackend {
         std::fs::metadata(self.reserve_path())
             .map(|m| m.len() >= self.reserve_bytes)
             .unwrap_or(false)
-    }
-
-    /// Record that `hash` was written, if the pruned index is watching it.
-    fn note_written(&self, hash: &Uint256) {
-        let mut watch = self
-            .restore_watch
-            .lock()
-            .expect("fjall restore watch mutex must not be poisoned");
-        if watch.is_empty() {
-            return;
-        }
-        if let Some(restored) = watch.get_mut(hash) {
-            *restored = true;
-        }
     }
 
     fn open_db(&self) -> Result<Arc<OpenDb>, String> {
@@ -339,7 +325,17 @@ impl Backend for FjallBackend {
         let Ok(open) = self.open_db() else {
             return (None, Status::NotFound);
         };
-        match open.nodes.get(hash.as_slice()) {
+        // A read of a watched (dead-pending) node pins it so prune cannot
+        // delete it under the ledger being built from it (restore_watch).
+        let read = self.restore_watch.read(hash, || {
+            let read = open.nodes.get(hash.as_slice());
+            let bytes = match &read {
+                Ok(Some(value)) => Some(value.to_vec()),
+                _ => None,
+            };
+            (read, bytes)
+        });
+        match read {
             Ok(Some(value)) => {
                 let decoded = DecodedBlob::new(hash.data(), &value);
                 if decoded.was_ok() {
@@ -369,10 +365,11 @@ impl Backend for FjallBackend {
     fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
         let open = self.open_db()?;
         let encoded = EncodedBlob::new(&object);
+        self.restore_watch
+            .before_write(object.hash(), || encoded.get_data().to_vec());
         open.nodes
             .insert(object.hash().as_slice(), encoded.get_data())
             .map_err(|error| Self::fjall_err("store", error))?;
-        self.note_written(object.hash());
         Ok(())
     }
 
@@ -396,14 +393,13 @@ impl Backend for FjallBackend {
         let mut write = open.db.batch();
         for object in batch {
             let encoded = EncodedBlob::new(object);
+            self.restore_watch
+                .before_write(object.hash(), || encoded.get_data().to_vec());
             write.insert(&open.nodes, object.hash().as_slice(), encoded.get_data());
         }
         write
             .commit()
             .map_err(|error| Self::fjall_err("store_batch", error))?;
-        for object in batch {
-            self.note_written(object.hash());
-        }
         Ok(())
     }
 
@@ -510,32 +506,23 @@ impl Backend for FjallBackend {
     }
 
     fn watch_restores(&self, hashes: &[Uint256]) {
-        let mut watch = self
-            .restore_watch
-            .lock()
-            .expect("fjall restore watch mutex must not be poisoned");
-        for hash in hashes {
-            watch.entry(*hash).or_insert(false);
-        }
+        self.restore_watch.watch(hashes);
     }
 
     fn unwatch_restores(&self, hashes: &[Uint256]) {
-        let mut watch = self
-            .restore_watch
-            .lock()
-            .expect("fjall restore watch mutex must not be poisoned");
-        for hash in hashes {
-            watch.remove(hash);
-        }
+        self.restore_watch.unwatch(hashes);
     }
 
     fn was_restored(&self, hash: &Uint256) -> bool {
-        self.restore_watch
-            .lock()
-            .expect("fjall restore watch mutex must not be poisoned")
-            .get(hash)
-            .copied()
-            .unwrap_or(false)
+        self.restore_watch.was_restored(hash)
+    }
+
+    fn begin_delete(&self, hashes: &[Uint256]) -> Vec<bool> {
+        self.restore_watch.begin_delete(hashes)
+    }
+
+    fn finish_delete(&self, hashes: &[Uint256]) -> Vec<(Uint256, Vec<u8>)> {
+        self.restore_watch.finish_delete(hashes)
     }
 
     fn kv_persist(&self, mode: PersistMode) -> Result<(), String> {

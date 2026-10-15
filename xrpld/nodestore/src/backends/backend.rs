@@ -158,6 +158,20 @@ pub trait Backend: Send + Sync + 'static {
         false
     }
 
+    /// Prune is about to delete `hashes` (see `restore_watch`). Returns, per
+    /// hash, whether the node must be kept because it was read or written
+    /// while watched.
+    fn begin_delete(&self, hashes: &[Uint256]) -> Vec<bool> {
+        hashes.iter().map(|hash| self.was_restored(hash)).collect()
+    }
+
+    /// The delete batch for `hashes` committed. Returns the bytes of nodes
+    /// read or written during the delete, which prune writes back.
+    fn finish_delete(&self, hashes: &[Uint256]) -> Vec<(Uint256, Vec<u8>)> {
+        self.unwatch_restores(hashes);
+        Vec::new()
+    }
+
     #[doc(hidden)]
     fn kv_unsupported(&self) -> String {
         format!("backend {} is not key-value capable", self.get_name())

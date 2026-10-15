@@ -11,6 +11,7 @@
 //! yields a larger but still exact delta.
 
 use crate::shamap::pruned_claim::{ClaimNodeFetcher, compute_claim_delta};
+use basics::base_uint::Uint256;
 use basics::sha_map_hash::SHAMapHash;
 use ledger::Ledger;
 use nodestore::{
@@ -37,6 +38,10 @@ pub struct PrunedDriver {
     /// Invoked after every maintain pass with the retained floor
     /// (`pruned_to + 1`), to lower the advertised `complete_ledgers` (Case 18).
     on_floor_advanced: Mutex<Option<Box<dyn Fn(u32) + Send + Sync>>>,
+    /// Invoked after every successful claim with `(seq, state_root)`: the
+    /// claimed tree is then complete and synced on disk (invariant B), so it
+    /// can serve as the trusted acquisition baseline.
+    on_claimed: Mutex<Option<Box<dyn Fn(u32, Uint256) + Send + Sync>>>,
     /// When the last sampled verify ran.
     last_verify: Mutex<Option<Instant>>,
     /// Live advisory prune cap (`can_delete`), updated by the RPC.
@@ -57,6 +62,7 @@ impl PrunedDriver {
             last_claimed: Mutex::new(None),
             on_prune: Mutex::new(None),
             on_floor_advanced: Mutex::new(None),
+            on_claimed: Mutex::new(None),
             last_verify: Mutex::new(None),
             can_delete: Arc::new(AtomicU32::new(u32::MAX)),
             pending: Mutex::new(None),
@@ -84,6 +90,17 @@ impl PrunedDriver {
             .on_floor_advanced
             .lock()
             .expect("pruned driver on_floor_advanced mutex") = Some(callback);
+    }
+
+    /// Register a callback run after every successful claim with the claimed
+    /// sequence and state root.
+    pub fn set_on_claimed(&self, callback: Box<dyn Fn(u32, Uint256) + Send + Sync>) {
+        *self.on_claimed.lock().expect("pruned driver on_claimed mutex") = Some(callback);
+    }
+
+    /// The configured retention window (`online_delete`).
+    pub fn online_delete(&self) -> u32 {
+        self.store.online_delete()
     }
 
     /// Shared handle to the live advisory prune cap. The SHAMap store
@@ -216,6 +233,17 @@ impl PrunedDriver {
         self.store.claim(&delta)?;
         *last = Some(Arc::clone(&ledger));
         drop(last);
+        // Publish the new committed baseline before pruning: the claim batch
+        // is synced, so every node of this tree is on disk, and none of them
+        // can be deleted for `online_delete` more ledgers.
+        if let Some(callback) = self
+            .on_claimed
+            .lock()
+            .expect("pruned driver on_claimed mutex")
+            .as_ref()
+        {
+            callback(seq, state_root);
+        }
 
         let pruned = self
             .store

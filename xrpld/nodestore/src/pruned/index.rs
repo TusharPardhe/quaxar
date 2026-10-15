@@ -340,12 +340,19 @@ impl IndexWriter {
             let mut batch = KvBatch::new();
             let mut highest = self.pruned_to;
             let mut released: Vec<Uint256> = Vec::with_capacity(rows.len());
-            for (seq, hash, kind) in &rows {
+            let mut deleted: Vec<(u32, Uint256)> = Vec::new();
+            // Move every candidate to Deleting before deciding: a node read or
+            // written from here on is rescued after the batch commits instead
+            // of being lost (restore_watch). One already read or written since
+            // it died is kept now.
+            let candidates: Vec<Uint256> = rows.iter().map(|(_, hash, _)| *hash).collect();
+            let needed = self.backend.begin_delete(&candidates);
+            for ((seq, hash, kind), needed) in rows.iter().zip(needed) {
                 highest = highest.max(*seq);
-                // A node written again after it died holds fresh bytes some
-                // in-flight ledger needs. Keep it and track it as unclaimed so
-                // the next claim (or the orphan sweep) decides its fate (R3/R5).
-                if self.backend.was_restored(hash) {
+                // A node read or written again after it died is needed by some
+                // in-flight ledger. Keep it and track it as unclaimed so the
+                // next claim (or the orphan sweep) decides its fate (R3/R5).
+                if needed {
                     self.unclaimed.entry(*hash).or_insert(*seq);
                 }
                 let pinned = self.unclaimed.contains_key(hash);
@@ -364,6 +371,7 @@ impl IndexWriter {
                 if deletable {
                     batch.delete(Keyspace::Nodes, hash.as_slice().to_vec());
                     batch.delete(Keyspace::Counts, hash.as_slice().to_vec());
+                    deleted.push((*seq, *hash));
                     total += 1;
                 }
                 batch.delete(Keyspace::Notebook, notebook_key(*seq, hash));
@@ -386,6 +394,29 @@ impl IndexWriter {
                 advance_to.to_le_bytes().to_vec(),
             );
             self.backend.kv_write_batch(&batch)?;
+            // Nodes read or written while this batch was deleting them are
+            // written back and pinned as unclaimed; the next claim or orphan
+            // sweep decides their fate like any other re-stored node.
+            let deleted_hashes: Vec<Uint256> = deleted.iter().map(|(_, hash)| *hash).collect();
+            let rescued = self.backend.finish_delete(&deleted_hashes);
+            if !rescued.is_empty() {
+                let mut restore = KvBatch::new();
+                for (hash, bytes) in &rescued {
+                    restore.put(Keyspace::Nodes, hash.as_slice().to_vec(), bytes.clone());
+                    let seq = deleted
+                        .iter()
+                        .find(|(_, deleted)| deleted == hash)
+                        .map_or(advance_to, |(seq, _)| *seq);
+                    self.unclaimed.entry(*hash).or_insert(seq);
+                    total = total.saturating_sub(1);
+                }
+                self.backend.kv_write_batch(&restore)?;
+                tracing::info!(
+                    target: "nodestore",
+                    rescued = rescued.len(),
+                    "pruned store kept nodes read or written while being deleted"
+                );
+            }
             self.backend.unwatch_restores(&released);
             self.pruned_to = advance_to;
             if final_chunk {
