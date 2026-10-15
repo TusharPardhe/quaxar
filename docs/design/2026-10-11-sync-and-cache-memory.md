@@ -48,7 +48,6 @@ full-below generation, so:
   hash, exactly like a backed SHAMap descend.
 
 Only nodes with `cowid == 0` (shared, immutable) are released.
-`QUAXAR_DURABLE_RELEASE=0` turns the release off.
 
 ### Example
 
@@ -207,7 +206,7 @@ back.
 
 The fix replaces the rule with a diminishing-returns criterion. Sizes double
 at each step, so the target is the top of the last doubling that still cuts the
-miss ratio by at least `tolerance` (`QUAXAR_MRC_TOLERANCE`, default 0.03: a
+miss ratio by at least a fixed tolerance (0.03: a
 doubling of cache memory must buy at least 3 points of hit ratio). A flat head
 before a steep region is skipped; a shallow tail past the last paying doubling
 is not bought. `knee_of_curve` has unit tests for the measured production
@@ -230,7 +229,7 @@ An earlier draft attributed the long-run growth to the resident ledger tree
 dominant cause of the 8 h growth was the knee regression above. With the caches
 held at their floors, the resident tree (about 150 MB of structural plus item
 bytes at 320k nodes) is the next thing to watch, trimmed every 64 ledgers
-(`trim_resident_ledger_tree`, interval `QUAXAR_RESIDENT_TRIM_INTERVAL`).
+(`trim_resident_ledger_tree`).
 
 ## 4. Next steps
 
