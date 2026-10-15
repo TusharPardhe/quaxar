@@ -3394,8 +3394,20 @@ impl CoordinatorRunner {
         // (only `InboundLedgers::sweep` expires them when idle). Cancelling
         // them here killed every such acquisition on the next close, which
         // left permanent history gaps and made old-ledger RPCs never finish.
-        if identity.sequence() != 0 {
-            let installed_seq = identity.sequence();
+        // The floor is the published (network-validated) ledger, not the
+        // local LCL. A locally built LCL can be on a fork: the network's
+        // ledger at a lower sequence is then exactly what recovery needs, and
+        // cancelling it as "superseded" left the node on its own chain
+        // (testnet fork at 21534114: the network's ledger was cancelled the
+        // moment the local fork advanced). rippled never cancels an
+        // InboundLedger on LCL advance; only ledgers behind the validated
+        // chain are obsolete.
+        let validated_floor = match self.state.phase {
+            SyncPhase::Full { published, .. } => published.sequence(),
+            _ => 0,
+        };
+        if identity.sequence() != 0 && validated_floor != 0 {
+            let installed_seq = validated_floor;
             let superseded: Vec<SessionRef> = self
                 .state
                 .sessions
@@ -10088,27 +10100,44 @@ mod tests {
     }
 
     #[test]
-    fn lcl_installed_above_target_cancels_superseded_session() {
-        // A session acquiring an older ledger must be abandoned once the local
-        // LCL advances past its target sequence. Left running, such an obsolete
-        // recovery/consensus acquisition churns the NodeStore every owner turn
-        // and starves the single consensus owner, producing multi-second
-        // stalls. This mirrors rippled abandoning superseded inbound ledgers.
+    fn local_fork_lcl_does_not_cancel_the_network_ledger_acquisition() {
+        // Testnet fork at 21534114: the node acquired the network's ledger at
+        // seq N while its own forked chain advanced to N+1. Cancelling the
+        // network ledger as "superseded" by the local LCL left the node on
+        // its fork. Only the validated (published) chain makes a lower
+        // ledger obsolete; rippled never cancels on LCL advance.
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         connect(&mut runner);
         let session = acquire(&mut runner, 7);
-        assert_eq!(runner.phase(), &SyncPhase::Syncing { target: target(7) });
-
-        // A higher, non-matching LCL supersedes the seq-7 acquisition.
         let effects = runner.handle_event(AcquisitionEvent::LclInstalled(identity(20)));
-        assert!(effects.contains(&AcquisitionEffect::CancelSession(session)));
+        assert!(!effects.contains(&AcquisitionEffect::CancelSession(session)));
         assert_eq!(
             runner
                 .snapshot()
                 .cancelled_by_reason()
                 .get(&CancelReason::Superseded),
-            Some(&1)
+            None
         );
+    }
+
+    #[test]
+    fn consensus_session_below_published_ledger_is_superseded() {
+        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        connect(&mut runner);
+        let _ = runner.handle_event(AcquisitionEvent::LclInstalled(identity(9)));
+        let _ = runner.handle_event(AcquisitionEvent::PublicationCommitted {
+            identity: identity(9),
+            fresh: true,
+        });
+        assert!(matches!(runner.phase(), SyncPhase::Full { .. }));
+        let effects = runner.handle_event(AcquisitionEvent::AcquireRequested {
+            target: target(7),
+            reason: AcquireReason::Consensus,
+        });
+        let session = peer_request_session(&effects);
+        // Behind the published (validated) seq 9: obsolete, cancel it.
+        let effects = runner.handle_event(AcquisitionEvent::LclInstalled(identity(10)));
+        assert!(effects.contains(&AcquisitionEffect::CancelSession(session)));
     }
 
     #[test]

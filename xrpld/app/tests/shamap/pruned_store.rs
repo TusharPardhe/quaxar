@@ -516,3 +516,70 @@ fn submitted_ledgers_are_claimed_by_the_worker() {
     drop(driver);
     let _ = std::fs::remove_dir_all(&path);
 }
+
+/// The rolling trusted baseline is published from `on_claimed`. At that
+/// moment every node of the claimed state tree must already be on disk (the
+/// claim batch is synced), even while the window prunes on every ledger.
+#[test]
+fn on_claimed_publishes_a_tree_that_is_complete_on_disk() {
+    use std::sync::Mutex;
+    let (backend, path) = open_fjall_backend("on-claimed");
+    let config = PrunedConfig {
+        online_delete: 2,
+        can_delete: u32::MAX,
+        prune_mode: PruneMode::On,
+        prune_batch: 64,
+        verify_interval_secs: 0,
+    };
+    let driver = PrunedDriver::open(Arc::clone(&backend), config).expect("driver opens");
+    let claimed: Arc<Mutex<Vec<(u32, Uint256, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&claimed);
+    let check_backend = Arc::clone(&backend);
+    driver.set_on_claimed(Box::new(move |seq, root| {
+        // Walk the claimed tree from the store only.
+        let mut complete = true;
+        let mut stack = vec![root];
+        while let Some(hash) = stack.pop() {
+            let Some(bytes) = check_backend
+                .kv_get(Keyspace::Nodes, hash.as_slice())
+                .expect("read")
+            else {
+                complete = false;
+                break;
+            };
+            let decoded = nodestore::DecodedBlob::new(hash.data(), &bytes);
+            let object = decoded.create_object();
+            let node = shamap::tree_node::SHAMapTreeNode::make_from_prefix(
+                object.data(),
+                basics::sha_map_hash::SHAMapHash::new(hash),
+            )
+            .expect("decode");
+            if node.is_inner() {
+                for branch in 0..16 {
+                    if !node.is_empty_branch(branch) {
+                        stack.push(*node.get_child_hash(branch).as_uint256());
+                    }
+                }
+            }
+        }
+        sink.lock().unwrap().push((seq, root, complete));
+    }));
+    for seq in 1..=8u32 {
+        let ledger = example_ledger(seq);
+        flush_ledger_nodes(&driver, &ledger);
+        driver.on_validated_ledger(Arc::new(ledger)).expect("claim");
+    }
+    let claimed = claimed.lock().unwrap().clone();
+    // Anchor (seq 1) is not a claim; every later claim is published.
+    assert_eq!(
+        claimed.iter().map(|(seq, _, _)| *seq).collect::<Vec<_>>(),
+        (2..=8).collect::<Vec<_>>()
+    );
+    for (seq, root, complete) in &claimed {
+        assert_eq!(*root, *example_ledger(*seq).state_map().root().get_hash().as_uint256());
+        assert!(complete, "claimed tree {seq} complete on disk at publication");
+    }
+    assert!(driver.metrics().pruned_to >= 5, "pruning ran every ledger");
+    drop(driver);
+    let _ = std::fs::remove_dir_all(&path);
+}

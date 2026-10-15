@@ -736,6 +736,69 @@ fn static_vault(
     entry
 }
 
+fn vault_scale_overflow_view(
+    assets_total: i64,
+    outstanding_shares: u64,
+) -> (ApplyViewImpl<Ledger>, AccountID, Uint256, AccountID) {
+    // Port of VaultScale_test.cpp's scale=18 setup. A first deposit of 10
+    // creates 10e18 shares; an existing five-unit vault has 5e18 shares.
+    let owner = acct(0xB1);
+    let pseudo = acct(0xB2);
+    let issuer = acct(0xB3);
+    let sequence = 17;
+    let asset = iou(issuer, "USD", 0).asset();
+    let share_id = static_share_id(pseudo, 1);
+    let vault_id = protocol::vault_keylet(acct_id(owner), sequence).key;
+    let mut vault = static_vault(owner, pseudo, sequence, asset, share_id);
+    vault.set_field_u8(sf("sfScale"), 18);
+    for field in ["sfAssetsTotal", "sfAssetsAvailable"] {
+        let mut number = protocol::STNumber::from(RuntimeNumber::from_i64(assets_total));
+        number.associate_asset(asset);
+        vault.set_field_number(sf(field), number);
+    }
+
+    let ledger = make_ledger(vec![
+        account_root(owner, 10_000_000_000, 0, 0),
+        account_root(pseudo, 10_000_000_000, 0, 0),
+        account_root(issuer, 10_000_000_000, 0, 0),
+        vault,
+        static_mpt_issuance(pseudo, 1, outstanding_shares),
+    ]);
+    (
+        ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE),
+        owner,
+        vault_id,
+        issuer,
+    )
+}
+
+/// rippled VaultScale_test.cpp:144-150: first deposit into a Scale=18 vault
+/// overflows when the whole-share Number is converted to an MPT unit count.
+#[test]
+fn vault_scale_18_deposit_overflow_is_path_dry() {
+    let (mut view, owner, vault_id, issuer) = vault_scale_overflow_view(0, 0);
+    let tx = vault_deposit_tx(owner, vault_id, iou(issuer, "USD", 10), 1);
+
+    assert_eq!(
+        app::state::vault::apply_vault_deposit(&mut view, &tx),
+        Ter::TEC_PATH_DRY
+    );
+}
+
+/// rippled VaultScale_test.cpp:446-464: a Scale=18 vault with five deposited
+/// assets has 5e18 shares; redeeming ten assets overflows share conversion.
+#[test]
+fn vault_scale_18_withdraw_overflow_is_path_dry() {
+    let (mut view, owner, vault_id, issuer) =
+        vault_scale_overflow_view(5, 5_000_000_000_000_000_000);
+    let tx = vault_withdraw_tx(owner, vault_id, iou(issuer, "USD", 10), 1);
+
+    assert_eq!(
+        app::state::vault::apply_vault_withdraw(&mut view, &tx),
+        Ter::TEC_PATH_DRY
+    );
+}
+
 fn static_iou_holding(low: AccountID, high: AccountID, currency: Currency) -> STLedgerEntry {
     let mut entry = STLedgerEntry::from_type_and_key(
         LedgerEntryType::RippleState,

@@ -377,34 +377,47 @@ pub fn run_amm_withdraw_apply_math_facts(
         let Some(lp_tokens_in) = lp_tokens_withdraw else {
             return Err(Ter::TEM_MALFORMED);
         };
-        if lp_tokens_in == facts.lp_token_balance {
-            return finalize_withdraw_math(
-                facts,
-                facts.pool_amount1.clone(),
-                Some(facts.pool_amount2.clone()),
-                lp_tokens_in,
-                true,
+        // rippled AMMWithdraw::equalWithdrawTokens: `try { ... } catch
+        // (std::exception&) {} return tecINTERNAL;`.
+        return basics::contract::try_catch(|| {
+            if lp_tokens_in == facts.lp_token_balance {
+                return finalize_withdraw_math(
+                    facts,
+                    facts.pool_amount1.clone(),
+                    Some(facts.pool_amount2.clone()),
+                    lp_tokens_in,
+                    true,
+                );
+            }
+            let tokens = adjusted_lp_tokens_in(
+                &facts.rules,
+                &facts.lp_token_balance,
+                &lp_tokens_in,
+                is_withdraw_all,
             );
-        }
-        let tokens = adjusted_lp_tokens_in(
-            &facts.rules,
-            &facts.lp_token_balance,
-            &lp_tokens_in,
-            is_withdraw_all,
-        );
-        if facts.rules.enabled(&protocol::fix_ammv1_3()) && tokens.signum() == 0 {
-            return Err(Ter::TEC_AMM_INVALID_TOKENS);
-        }
-        let frac = amm_helpers::stamount_as_number(&tokens)
-            / amm_helpers::stamount_as_number(&facts.lp_token_balance);
-        let amount1 =
-            amm_helpers::get_rounded_asset(&facts.rules, &facts.pool_amount1, frac, IsDeposit::No);
-        let amount2 =
-            amm_helpers::get_rounded_asset(&facts.rules, &facts.pool_amount2, frac, IsDeposit::No);
-        if amount1.signum() == 0 || amount2.signum() == 0 {
-            return Err(Ter::TEC_AMM_FAILED);
-        }
-        return finalize_withdraw_math(facts, amount1, Some(amount2), tokens, is_withdraw_all);
+            if facts.rules.enabled(&protocol::fix_ammv1_3()) && tokens.signum() == 0 {
+                return Err(Ter::TEC_AMM_INVALID_TOKENS);
+            }
+            let frac = amm_helpers::stamount_as_number(&tokens)
+                / amm_helpers::stamount_as_number(&facts.lp_token_balance);
+            let amount1 =
+                amm_helpers::get_rounded_asset(&facts.rules, &facts.pool_amount1, frac, IsDeposit::No);
+            let amount2 =
+                amm_helpers::get_rounded_asset(&facts.rules, &facts.pool_amount2, frac, IsDeposit::No);
+            if amount1.signum() == 0 || amount2.signum() == 0 {
+                return Err(Ter::TEC_AMM_FAILED);
+            }
+            return finalize_withdraw_math(facts, amount1, Some(amount2), tokens, is_withdraw_all);
+
+        })
+        .unwrap_or_else(|payload| {
+            tracing::error!(
+                target: "tx",
+                exception = %basics::contract::exception_message(payload.as_ref()),
+                "AMMWithdraw::equalWithdrawTokens exception"
+            );
+            Err(Ter::TEC_INTERNAL)
+        });
     }
 
     if (sub_tx_flags & protocol::AMM_TWO_ASSET_FLAG) != 0 {

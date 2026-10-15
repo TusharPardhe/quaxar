@@ -151,6 +151,9 @@ pub struct LedgerMaster<C = MonotonicClock, S = HardenedHashBuilder> {
     /// This is intentionally retained even while the ledger is being
     /// acquired, matching rippled's `lastValidLedger_` safety anchor.
     last_valid_ledger: Mutex<Option<(Uint256, u32)>>,
+    /// Store fallback for history lookups (rippled LedgerHistory's
+    /// `loadByHash` / `loadByIndex`). Unset in tests and pure-memory nodes.
+    store_loader: std::sync::OnceLock<Arc<dyn crate::LedgerStoreLoader>>,
 }
 
 impl<C> LedgerMaster<C, HardenedHashBuilder>
@@ -208,6 +211,7 @@ where
             valid_ledger_sign: AtomicU32::new(0),
             valid_ledger_seq: AtomicU32::new(0),
             last_valid_ledger: Mutex::new(None),
+            store_loader: std::sync::OnceLock::new(),
         }
     }
 
@@ -293,8 +297,25 @@ where
         self.published_ledger.get()
     }
 
+    /// Install the store fallback used when a ledger is not cached. The
+    /// first installation wins.
+    pub fn set_store_loader(&self, loader: Arc<dyn crate::LedgerStoreLoader>) -> bool {
+        self.ledger_history
+            .set_store_loader(std::sync::Arc::clone(&loader));
+        self.store_loader.set(loader).is_ok()
+    }
+
+    fn store_loader(&self) -> Option<&dyn crate::LedgerStoreLoader> {
+        self.store_loader.get().map(|loader| loader.as_ref())
+    }
+
+    /// rippled `LedgerMaster::getLedgerByHash`: LedgerHistory (cache, then
+    /// store), then the current closed ledger.
     pub fn get_ledger_by_hash(&self, hash: SHAMapHash) -> Option<Arc<Ledger>> {
-        if let Some(ledger) = self.ledger_history.get_cached_ledger_by_hash(hash) {
+        if let Some(ledger) = self
+            .ledger_history
+            .get_ledger_by_hash_or_load(hash, self.store_loader())
+        {
             return Some(ledger);
         }
 
@@ -322,13 +343,20 @@ where
             }
 
             if let Some(hash) = valid.hash_of_seq(seq, journal)
-                && let Some(ledger) = self.ledger_history.get_cached_ledger_by_hash(hash)
+                && let Some(ledger) = self
+                    .ledger_history
+                    .get_ledger_by_hash_or_load(hash, self.store_loader())
             {
                 return Some(ledger);
             }
         }
 
-        if let Some(ledger) = self.ledger_history.get_cached_ledger_by_seq(seq) {
+        // rippled clears the sequence from completeLedgers only after
+        // LedgerHistory has also failed to load it from the store.
+        if let Some(ledger) = self
+            .ledger_history
+            .get_ledger_by_seq_or_load(seq, self.store_loader())
+        {
             tracing::debug!(target: "ledger", seq, "Ledger fetched from history");
             return Some(ledger);
         }
@@ -1643,6 +1671,70 @@ mod tests {
                 .expect("validated parent lookup"),
             &parent
         ));
+    }
+
+    #[derive(Debug)]
+    struct FixedStoreLoader {
+        seq: u32,
+        fill: u8,
+        loads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FixedStoreLoader {
+        fn ledger(&self) -> Ledger {
+            Arc::try_unwrap(immutable_ledger(self.seq, self.fill)).expect("unique ledger")
+        }
+    }
+
+    impl crate::LedgerStoreLoader for FixedStoreLoader {
+        fn load_by_hash(&self, hash: SHAMapHash) -> Option<Ledger> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            let ledger = self.ledger();
+            (ledger.header().hash == hash).then_some(ledger)
+        }
+
+        fn load_by_index(&self, seq: u32) -> Option<Ledger> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            (seq == self.seq).then(|| self.ledger())
+        }
+    }
+
+    #[test]
+    fn uncached_ledgers_load_from_the_store_before_clearing_complete_ledgers() {
+        let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+        let expected = immutable_ledger(40, 0x44);
+        master.mark_ledger_complete(40);
+        master.mark_ledger_complete(41);
+
+        // Without a loader: a cache miss clears the sequence (rippled with no
+        // stored ledger).
+        assert!(master.get_ledger_by_seq(41, &NullLedgerJournal).is_none());
+        assert!(!master.have_ledger(41));
+
+        let loader = Arc::new(FixedStoreLoader {
+            seq: 40,
+            fill: 0x44,
+            loads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        assert!(master.set_store_loader(loader.clone()));
+
+        // rippled LedgerHistory::getLedgerBySeq -> loadByIndex.
+        let loaded = master
+            .get_ledger_by_seq(40, &NullLedgerJournal)
+            .expect("ledger loaded from the store");
+        assert_eq!(loaded.header().hash, expected.header().hash);
+        assert!(master.have_ledger(40), "a loadable ledger stays complete");
+
+        // Canonicalized into history: the second lookup is a cache hit.
+        let again = master.get_ledger_by_seq(40, &NullLedgerJournal).expect("cached");
+        assert!(Arc::ptr_eq(&loaded, &again));
+        assert_eq!(loader.loads.load(Ordering::SeqCst), 1);
+
+        // rippled LedgerHistory::getLedgerByHash -> loadByHash.
+        let by_hash = master
+            .get_ledger_by_hash(expected.header().hash)
+            .expect("hash lookup");
+        assert!(Arc::ptr_eq(&loaded, &by_hash));
     }
 
     #[test]

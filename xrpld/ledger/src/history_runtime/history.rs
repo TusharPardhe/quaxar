@@ -31,6 +31,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use time::Duration;
 
+/// rippled `loadByHash` / `loadByIndex` (Ledger.cpp): build an immutable
+/// ledger from the relational ledger header and the node store. The
+/// application supplies this so the ledger crate stays storage-agnostic.
+pub trait LedgerStoreLoader: Send + Sync + std::fmt::Debug {
+    fn load_by_hash(&self, hash: SHAMapHash) -> Option<Ledger>;
+    fn load_by_index(&self, seq: u32) -> Option<Ledger>;
+    /// Read a ledger's transactions and metadata, fetching tx-tree nodes that
+    /// are not resident from the node store. rippled's handleMismatch reads
+    /// both maps through the backed family the same way.
+    fn tx_snapshot(&self, _ledger: &Ledger) -> Option<Vec<crate::LedgerTxRead>> {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConsensusValidatedEntry {
     pub built: Option<SHAMapHash>,
@@ -50,6 +64,12 @@ pub struct LedgerHistoryMismatch {
     pub consensus: Option<JsonValue>,
 }
 
+/// Sequences of built/validated bookkeeping kept by `sweep`.
+pub const CONSENSUS_VALIDATED_RETAINED: u32 = 128;
+
+/// Mismatch records kept for diagnostics (rippled keeps only a counter).
+pub const MISMATCHES_RETAINED: usize = 64;
+
 #[derive(Debug)]
 pub struct LedgerHistory<C = MonotonicClock, S = HardenedHashBuilder> {
     ledgers_by_hash: TaggedCache<SHAMapHash, Ledger, C, S>,
@@ -57,6 +77,8 @@ pub struct LedgerHistory<C = MonotonicClock, S = HardenedHashBuilder> {
     consensus_validated: Mutex<BTreeMap<u32, ConsensusValidatedEntry>>,
     mismatch_count: AtomicU64,
     mismatches: Mutex<Vec<LedgerHistoryMismatch>>,
+    /// Store-backed reader for mismatch analysis of non-resident ledgers.
+    store_loader: std::sync::OnceLock<std::sync::Arc<dyn LedgerStoreLoader>>,
 }
 
 impl<C> LedgerHistory<C, HardenedHashBuilder>
@@ -80,6 +102,7 @@ where
             consensus_validated: Mutex::new(BTreeMap::new()),
             mismatch_count: AtomicU64::new(0),
             mismatches: Mutex::new(Vec::new()),
+            store_loader: std::sync::OnceLock::new(),
         }
     }
 
@@ -205,12 +228,12 @@ where
     }
 
     /// Ledgers currently resident in the history cache (diagnostics).
+    /// Strongly held ledgers, read without refreshing access times or
+    /// promoting weak entries. `fetch` on every key would touch them all and
+    /// stop the size/age sweep from ever expiring history (diagnostics call
+    /// this once a minute).
     pub fn cached_ledgers(&self) -> Vec<Arc<Ledger>> {
-        self.ledgers_by_hash
-            .get_keys()
-            .into_iter()
-            .filter_map(|hash| self.ledgers_by_hash.fetch(&hash))
-            .collect()
+        self.ledgers_by_hash.strong_values()
     }
 
     pub fn get_cached_ledger_by_seq(&self, ledger_index: u32) -> Option<Arc<Ledger>> {
@@ -221,6 +244,56 @@ where
             .get(&ledger_index)
             .copied()?;
         self.get_cached_ledger_by_hash(hash)
+    }
+
+    /// rippled `LedgerHistory::getLedgerByHash`: the cache, then
+    /// `loadByHash` from the store, canonicalized into the cache.
+    pub fn get_ledger_by_hash_or_load(
+        &self,
+        ledger_hash: SHAMapHash,
+        loader: Option<&dyn LedgerStoreLoader>,
+    ) -> Option<Arc<Ledger>> {
+        if let Some(ledger) = self.ledgers_by_hash.fetch(&ledger_hash) {
+            return Some(ledger);
+        }
+        let ledger = loader?.load_by_hash(ledger_hash)?;
+        if ledger.header().hash != ledger_hash || !ledger.is_immutable() {
+            return None;
+        }
+        let mut ledger = Arc::new(ledger);
+        self.ledgers_by_hash
+            .canonicalize_replace_client(&ledger.header().hash, &mut ledger);
+        Some(ledger)
+    }
+
+    /// rippled `LedgerHistory::getLedgerBySeq`: a known index goes through
+    /// `getLedgerByHash`; otherwise `loadByIndex`, then cache and index it.
+    pub fn get_ledger_by_seq_or_load(
+        &self,
+        ledger_index: u32,
+        loader: Option<&dyn LedgerStoreLoader>,
+    ) -> Option<Arc<Ledger>> {
+        if let Some(hash) = self
+            .ledgers_by_index
+            .lock()
+            .expect("ledger-history index mutex must not be poisoned")
+            .get(&ledger_index)
+            .copied()
+        {
+            return self.get_ledger_by_hash_or_load(hash, loader);
+        }
+        let ledger = loader?.load_by_index(ledger_index)?;
+        if ledger.header().seq != ledger_index || !ledger.is_immutable() {
+            return None;
+        }
+        let mut ledger = Arc::new(ledger);
+        self.ledgers_by_hash
+            .canonicalize_replace_client(&ledger.header().hash, &mut ledger);
+        self.ledgers_by_index
+            .lock()
+            .expect("ledger-history index mutex must not be poisoned")
+            .insert(ledger.header().seq, ledger.header().hash);
+        Some(ledger)
     }
 
     pub fn get_ledger_by_hash<P, CLOCK, FB, F, MR, NS, J>(
@@ -375,6 +448,31 @@ where
         S: Send,
     {
         self.ledgers_by_hash.sweep();
+        self.sweep_consensus_validated();
+    }
+
+    /// rippled keeps built/validated bookkeeping in `consensusValidated_`, a
+    /// TaggedCache of 64 entries aged out after 5 minutes, swept with the
+    /// ledger cache. quaxar kept a plain map that was never pruned and grew
+    /// by one entry per ledger. Keep the newest
+    /// `CONSENSUS_VALIDATED_RETAINED` sequences (about 8 minutes of ledgers),
+    /// long enough for a late validation or late build to be matched.
+    pub fn sweep_consensus_validated(&self) {
+        let mut by_seq = self
+            .consensus_validated
+            .lock()
+            .expect("consensus-validations mutex must not be poisoned");
+        if let Some((&newest, _)) = by_seq.last_key_value() {
+            let floor = newest.saturating_sub(CONSENSUS_VALIDATED_RETAINED);
+            by_seq.retain(|&seq, _| seq > floor);
+        }
+    }
+
+    pub fn consensus_validated_len(&self) -> usize {
+        self.consensus_validated
+            .lock()
+            .expect("consensus-validations mutex must not be poisoned")
+            .len()
     }
 
     pub fn fix_index(&self, ledger_index: u32, ledger_hash: SHAMapHash) -> bool {
@@ -433,10 +531,113 @@ where
 
     fn record_mismatch(&self, mismatch: LedgerHistoryMismatch) {
         self.mismatch_count.fetch_add(1, Ordering::SeqCst);
-        self.mismatches
+        self.handle_mismatch(&mismatch);
+        let mut kept = self
+            .mismatches
             .lock()
-            .expect("mismatches mutex must not be poisoned")
-            .push(mismatch);
+            .expect("mismatches mutex must not be poisoned");
+        // rippled keeps only a counter; keep a short window for diagnostics.
+        if kept.len() >= MISMATCHES_RETAINED {
+            kept.remove(0);
+        }
+        kept.push(mismatch);
+    }
+
+    /// rippled `LedgerHistory::handleMismatch`: when the ledger we built and
+    /// the network-validated ledger for the same sequence differ, log why.
+    /// This is the record that pinpoints a fork: the first transaction whose
+    /// result or metadata differs.
+    /// Install the store-backed reader used by mismatch analysis.
+    pub fn set_store_loader(&self, loader: std::sync::Arc<dyn LedgerStoreLoader>) -> bool {
+        self.store_loader.set(loader).is_ok()
+    }
+
+    fn tx_snapshot_for_mismatch(&self, ledger: &Ledger) -> Option<Vec<crate::LedgerTxRead>> {
+        ledger
+            .tx_snapshot()
+            .ok()
+            .or_else(|| self.store_loader.get()?.tx_snapshot(ledger))
+    }
+
+    fn handle_mismatch(&self, m: &LedgerHistoryMismatch) {
+        let built = self.ledgers_by_hash.fetch(&m.built);
+        let valid = self.ledgers_by_hash.fetch(&m.validated);
+        let (built_present, valid_present) = (built.is_some(), valid.is_some());
+        let (Some(built), Some(valid)) = (built, valid) else {
+            tracing::error!(target: "ledger_history", seq = m.seq, built = %m.built,
+                validated = %m.validated,
+                built_present, valid_present,
+                "MISMATCH cannot be analyzed");
+            return;
+        };
+        let (bh, vh) = (built.header(), valid.header());
+        if bh.parent_hash != vh.parent_hash {
+            tracing::error!(target: "ledger_history", seq = m.seq,
+                built_parent = %bh.parent_hash, valid_parent = %vh.parent_hash,
+                "MISMATCH on prior ledger");
+            return;
+        }
+        if bh.close_time != vh.close_time {
+            tracing::error!(target: "ledger_history", seq = m.seq,
+                built_close = bh.close_time, valid_close = vh.close_time,
+                "MISMATCH on close time");
+            return;
+        }
+        match (m.built_consensus_hash, m.validated_consensus_hash) {
+            (Some(b), Some(v)) if b != v => tracing::error!(target: "ledger_history",
+                seq = m.seq, built = %b, validated = %v,
+                "MISMATCH on consensus transaction set"),
+            (Some(b), Some(_)) => tracing::error!(target: "ledger_history",
+                seq = m.seq, tx_set = %b, "MISMATCH with same consensus transaction set"),
+            _ => {}
+        }
+        let built_txs = self.tx_snapshot_for_mismatch(&built);
+        let valid_txs = self.tx_snapshot_for_mismatch(&valid);
+        let (Some(built_txs), Some(valid_txs)) = (built_txs, valid_txs) else {
+            tracing::error!(target: "ledger_history", seq = m.seq,
+                built_readable = built.tx_snapshot().is_ok(),
+                valid_readable = valid.tx_snapshot().is_ok(),
+                loader = self.store_loader.get().is_some(),
+                "MISMATCH transaction maps unreadable");
+            return;
+        };
+        tracing::error!(target: "ledger_history", seq = m.seq,
+            built_txs = built_txs.len(), valid_txs = valid_txs.len(),
+            built_account_hash = %bh.account_hash, valid_account_hash = %vh.account_hash,
+            "MISMATCH transaction counts");
+        let meta_json = |meta: &protocol::TxMeta| {
+            serde_json::to_string(&meta.get_json(protocol::JsonOptions::NONE))
+                .unwrap_or_default()
+        };
+        let by_id = |txs: &[crate::LedgerTxRead]| {
+            txs.iter()
+                .map(|(tx, meta)| (tx.get_transaction_id(), (tx.clone(), meta.clone())))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let (bmap, vmap) = (by_id(&built_txs), by_id(&valid_txs));
+        let mut ids: Vec<_> = bmap.keys().chain(vmap.keys()).copied().collect();
+        ids.sort();
+        ids.dedup();
+        for id in ids {
+            match (bmap.get(&id), vmap.get(&id)) {
+                (Some(_), None) => tracing::error!(target: "ledger_history", seq = m.seq,
+                    tx = %id, "MISMATCH transaction only in built ledger"),
+                (None, Some(_)) => tracing::error!(target: "ledger_history", seq = m.seq,
+                    tx = %id, "MISMATCH transaction only in valid ledger"),
+                (Some((tx, bm)), Some((_, vm))) => {
+                    let (bj, vj) = (meta_json(bm), meta_json(vm));
+                    if bj != vj {
+                        tracing::error!(target: "ledger_history", seq = m.seq, tx = %id,
+                            tx_type = ?tx.get_txn_type(),
+                            built_result = bm.get_result(), valid_result = vm.get_result(),
+                            built_index = bm.get_index(), valid_index = vm.get_index(),
+                            built_meta = %bj, valid_meta = %vj,
+                            "MISMATCH on transaction metadata");
+                    }
+                }
+                (None, None) => {}
+            }
+        }
     }
 }
 

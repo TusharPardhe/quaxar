@@ -1123,9 +1123,20 @@ pub struct AppJournalEntry {
     pub message: String,
 }
 
+/// A named log partition, the equivalent of rippled's `beast::Journal`.
+///
+/// Like rippled, a message is written to the log (here through `tracing`,
+/// with the partition name as a field) and nothing is kept in process memory.
+/// An earlier version stored every message in an unbounded `Vec`; validation
+/// handling alone grew it by about 17 MB per hour on testnet.
+///
+/// Tests that inspect messages enable capture: it is compiled in only for unit
+/// tests and under the test-only `journal-capture` feature, never in
+/// production builds.
 #[derive(Debug)]
 pub struct AppJournal {
     owner: String,
+    #[cfg(any(test, feature = "journal-capture"))]
     entries: Mutex<Vec<AppJournalEntry>>,
 }
 
@@ -1133,10 +1144,13 @@ impl AppJournal {
     pub fn new(owner: impl Into<String>) -> Self {
         Self {
             owner: owner.into(),
+            #[cfg(any(test, feature = "journal-capture"))]
             entries: Mutex::new(Vec::new()),
         }
     }
 
+    /// Messages recorded so far. Test-only.
+    #[cfg(any(test, feature = "journal-capture"))]
     pub fn entries(&self) -> Vec<AppJournalEntry> {
         self.entries
             .lock()
@@ -1145,13 +1159,25 @@ impl AppJournal {
     }
 
     fn record(&self, level: impl Into<String>, message: impl Into<String>) {
+        let level = level.into();
+        let message = message.into();
+        let partition = self.owner.as_str();
+        // rippled maps fatal to its highest severity; tracing has no fatal.
+        match level.as_str() {
+            "trace" => tracing::trace!(target: "journal", partition, "{message}"),
+            "debug" => tracing::debug!(target: "journal", partition, "{message}"),
+            "info" => tracing::info!(target: "journal", partition, "{message}"),
+            "warn" | "warning" => tracing::warn!(target: "journal", partition, "{message}"),
+            _ => tracing::error!(target: "journal", partition, level = %level, "{message}"),
+        }
+        #[cfg(any(test, feature = "journal-capture"))]
         self.entries
             .lock()
             .expect("app journal mutex must not be poisoned")
             .push(AppJournalEntry {
                 owner: self.owner.clone(),
-                level: level.into(),
-                message: message.into(),
+                level,
+                message,
             });
     }
 }
@@ -1559,6 +1585,7 @@ mod tests {
         assert_eq!(journal.entries()[0].message, "hello");
         assert_eq!(journal.entries()[1].message, "world");
     }
+
 
     #[test]
     fn application_registry_owners_seed_real_default_runtime_shell_state() {

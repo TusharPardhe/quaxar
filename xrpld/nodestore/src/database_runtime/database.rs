@@ -1,4 +1,3 @@
-use crate::database_runtime::node_object_cache::NodeObjectCache;
 use crate::{
     Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType, NodeStoreJournal,
     Scheduler, Task, batch_write_preallocation_size,
@@ -246,13 +245,6 @@ impl<T> DatabaseSurface for T where T: Database + ?Sized {}
 pub trait DatabaseDelegate: Send + Sync + 'static {
     fn is_same_db(&self, first: u32, second: u32) -> bool;
 
-    /// Whether this request may be satisfied by the encoded-object cache.
-    /// Copy-on-read (`duplicate`) requests are durable side-effect operations,
-    /// so they always bypass the cache by default.
-    fn cache_read_allowed(&self, duplicate: bool) -> bool {
-        !duplicate
-    }
-
     fn fetch_node_object(
         &self,
         hash: &Uint256,
@@ -301,7 +293,6 @@ struct DatabaseInner {
     read_queue_key_limit: usize,
     read_queue_callback_limit: usize,
     read_queue_byte_limit: usize,
-    node_object_cache: NodeObjectCache,
     read_state: Mutex<ReadState>,
     /// Queued plus worker-owned logical work items. It is reserved before a
     /// request enters the BTreeMap and released only after terminal delivery.
@@ -394,45 +385,11 @@ impl DatabaseInner {
     ) -> Option<Arc<NodeObject>> {
         let mut fetch_report = FetchReport::new(fetch_type);
         let begin = Instant::now();
-        let node_object = if self.delegate.cache_read_allowed(duplicate) {
-            let cache_generation = self.node_object_cache.generation();
-            let cached = self.node_object_cache.get_or_load(*hash, || {
-                self.fetch_node_object_from_delegate(hash, ledger_seq, &mut fetch_report, duplicate)
-            });
-
-            // A rotation can start after this request accepted a cacheable
-            // read. Do not return an archive-sourced hit across that fence:
-            // retry through the delegate so its copy-forward path runs.
-            if self.node_object_cache.generation() == cache_generation
-                && self.delegate.cache_read_allowed(duplicate)
-            {
-                cached
-            } else {
-                let node_object = self.fetch_node_object_from_delegate(
-                    hash,
-                    ledger_seq,
-                    &mut fetch_report,
-                    duplicate,
-                );
-                if let Some(object) = &node_object {
-                    self.node_object_cache
-                        .promote_for_hash(hash, Arc::clone(object));
-                }
-                node_object
-            }
-        } else {
-            let node_object = self.fetch_node_object_from_delegate(
-                hash,
-                ledger_seq,
-                &mut fetch_report,
-                duplicate,
-            );
-            if let Some(object) = &node_object {
-                self.node_object_cache
-                    .promote_for_hash(hash, Arc::clone(object));
-            }
-            node_object
-        };
+        // No NodeObject cache: every read goes to the backend, which is served
+        // from its own block cache and the OS page cache. This matches rippled
+        // with online_delete, whose rotating NodeStore has no NodeObject cache.
+        let node_object =
+            self.fetch_node_object_from_delegate(hash, ledger_seq, &mut fetch_report, duplicate);
         let elapsed = begin.elapsed();
         let elapsed_us = elapsed.as_micros() as u64;
 
@@ -480,7 +437,6 @@ impl DatabaseRuntime {
             return Err("Invalid rq_bundle".to_owned());
         }
 
-        let node_object_cache = NodeObjectCache::from_config(config)?;
         let default_read_queue_budget =
             default_read_queue_budget(read_threads, request_bundle as usize)?;
         // Explicit operator settings may narrow or expand this shared logical
@@ -514,7 +470,6 @@ impl DatabaseRuntime {
             read_queue_key_limit,
             read_queue_callback_limit,
             read_queue_byte_limit,
-            node_object_cache,
             read_state: Mutex::new(ReadState::default()),
             outstanding_read_callbacks: AtomicUsize::new(0),
             outstanding_read_bytes: AtomicUsize::new(0),
@@ -754,11 +709,6 @@ impl DatabaseRuntime {
                         .map(|node_object| node_object.data().len() as u64)
                         .sum();
                     self.inner.store_stats(batch.len() as u64, size);
-                    for node_object in batch.iter() {
-                        self.inner
-                            .node_object_cache
-                            .promote(Arc::clone(node_object));
-                    }
                     self.inner
                         .store_duration_us
                         .fetch_add(begin.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -942,7 +892,6 @@ impl DatabaseRuntime {
                     .to_string(),
             ),
         );
-        self.inner.node_object_cache.add_counts_json(obj);
     }
 
     pub fn get_counts_json(&self) -> JsonValue {
@@ -976,10 +925,6 @@ impl DatabaseRuntime {
 
     pub(crate) fn store_stats(&self, count: u64, size: u64) {
         self.inner.store_stats(count, size);
-    }
-
-    pub(crate) fn promote_node_object(&self, object: Arc<NodeObject>) {
-        self.inner.node_object_cache.promote(object);
     }
 
     pub fn store_generation(&self) -> u64 {
@@ -1154,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn get_counts_json_includes_node_object_cache_metrics() {
+    fn get_counts_json_reports_store_read_and_write_metrics() {
         let hash = Uint256::from_array([0xA5; 32]);
         let object = Arc::new(NodeObject::new(NodeObjectType::Ledger, vec![1, 2, 3], hash));
         let delegate = Arc::new(TestDelegate {
@@ -1178,22 +1123,6 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "node_object_cache_capacity_bytes",
-                "node_object_cache_capacity_bytes_is_estimate",
-                "node_object_cache_capacity_entries",
-                "node_object_cache_durable_loads",
-                "node_object_cache_entries",
-                "node_object_cache_eviction_policy",
-                "node_object_cache_hits",
-                "node_object_cache_idle_seconds",
-                "node_object_cache_invalidations",
-                "node_object_cache_misses",
-                "node_object_cache_oversized",
-                "node_object_cache_promotions",
-                "node_object_cache_rejected",
-                "node_object_cache_ttl_seconds",
-                "node_object_cache_weighted_capacity_bytes",
-                "node_object_cache_weighted_size_bytes",
                 "node_read_bytes",
                 "node_reads_duration_us",
                 "node_reads_hit",
@@ -1207,22 +1136,6 @@ mod tests {
             ]
         );
         assert_eq!(counts.get("read_queue"), Some(&JsonValue::Unsigned(0)));
-        assert_eq!(
-            counts.get("node_object_cache_eviction_policy"),
-            Some(&JsonValue::String("lru".to_owned()))
-        );
-        assert_eq!(
-            counts.get("node_object_cache_capacity_entries"),
-            Some(&JsonValue::String("1000000".to_owned()))
-        );
-        assert_eq!(
-            counts.get("node_object_cache_capacity_bytes_is_estimate"),
-            Some(&JsonValue::Bool(true))
-        );
-        assert!(matches!(
-            counts.get("node_object_cache_weighted_size_bytes"),
-            Some(JsonValue::String(value)) if value.parse::<u64>().is_ok()
-        ));
         assert!(matches!(
             counts.get("read_threads_total"),
             Some(JsonValue::Signed(value)) if *value >= 1
@@ -1292,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn node_object_cache_serves_repeated_reads_without_a_second_delegate_fetch() {
+    fn every_read_goes_to_the_store_with_no_node_object_cache() {
         let hash = Uint256::from_array([0xC1; 32]);
         let delegate = Arc::new(CountingDelegate {
             object: Some(Arc::new(NodeObject::new(
@@ -1322,52 +1235,8 @@ mod tests {
                 .fetch_node_object(&hash, 1, FetchType::Synchronous, false)
                 .is_some()
         );
-        assert_eq!(delegate.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
-
-        database.stop();
-    }
-
-    #[test]
-    fn node_object_cache_coalesces_concurrent_same_hash_misses() {
-        let hash = Uint256::from_array([0xC2; 32]);
-        let delegate = Arc::new(CountingDelegate {
-            object: Some(Arc::new(NodeObject::new(
-                NodeObjectType::AccountNode,
-                vec![4, 5, 6],
-                hash,
-            ))),
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            delay: std::time::Duration::from_millis(25),
-        });
-        let database = Arc::new(
-            DatabaseRuntime::new(
-                Arc::clone(&delegate) as Arc<dyn DatabaseDelegate>,
-                Arc::new(DummyScheduler),
-                1,
-                &Section::new("node_db"),
-                Arc::new(NullJournal),
-            )
-            .expect("database"),
-        );
-        let start = Arc::new(std::sync::Barrier::new(9));
-        let mut workers = Vec::new();
-        for _ in 0..8 {
-            let database = Arc::clone(&database);
-            let start = Arc::clone(&start);
-            workers.push(std::thread::spawn(move || {
-                start.wait();
-                assert!(
-                    database
-                        .fetch_node_object(&hash, 1, FetchType::Synchronous, false)
-                        .is_some()
-                );
-            }));
-        }
-        start.wait();
-        for worker in workers {
-            worker.join().expect("cache worker must not panic");
-        }
-        assert_eq!(delegate.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // No NodeObject cache: both reads reach the backend.
+        assert_eq!(delegate.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 
         database.stop();
     }

@@ -381,22 +381,40 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
         // Execute strands
         // reference: flow(deliver=takerAmount.out, sendMax=takerAmount.in)
-        let flow_result = ledger::flow_engine::strand_flow::execute_strands(
-            view,
-            &strands,
-            &cross_deliver,
-            (tx_flags & TF_FILL_OR_KILL) == 0,
-            if is_sell {
-                ledger::ripple_calc::OfferCrossing::Sell
-            } else {
-                ledger::ripple_calc::OfferCrossing::Yes
-            },
-            Some(&effective_send_max),
-            &account,
-            &account,
-            Some(quality_threshold),
-            Some(self_cross_cancellations.clone()),
-        );
+        // rippled OfferCreate::flowCross runs this inside
+        // `try { ... } catch (std::exception const&)` and returns tecINTERNAL
+        // ("Exception during offer crossing"); the transaction then claims
+        // only its fee. Contain a panic the same way instead of letting it
+        // escape as tefEXCEPTION, which would drop the transaction and fork.
+        let flow_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ledger::flow_engine::strand_flow::execute_strands(
+                view,
+                &strands,
+                &cross_deliver,
+                (tx_flags & TF_FILL_OR_KILL) == 0,
+                if is_sell {
+                    ledger::ripple_calc::OfferCrossing::Sell
+                } else {
+                    ledger::ripple_calc::OfferCrossing::Yes
+                },
+                Some(&effective_send_max),
+                &account,
+                &account,
+                Some(quality_threshold),
+                Some(self_cross_cancellations.clone()),
+            )
+        })) {
+            Ok(result) => result,
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                tracing::error!(target: "tx", %message, "Exception during offer crossing");
+                return Ter::TEC_INTERNAL;
+            }
+        };
 
         let cancellation_result = self_cross_cancellations.apply_to(view);
         if cancellation_result != Ter::TES_SUCCESS {

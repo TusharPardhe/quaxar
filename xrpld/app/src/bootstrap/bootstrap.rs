@@ -73,6 +73,67 @@ fn trim_after_application_sweep() -> MallocTrimReport {
     trim_after_application_sweep_with(|tag| malloc_trim(tag, &SweepMallocTrimLogger))
 }
 
+/// Miss-ratio tolerance for the cache knee: a cache doubling is kept only if it
+/// cuts the miss ratio by at least this much (3 points of hit ratio).
+const MRC_TOLERANCE: f64 = 0.03;
+/// Never size the TreeNodeCache below this many entries.
+const TREE_CACHE_MRC_MIN: usize = 65_536;
+/// Sampled references needed before a curve is trusted. SHARDS reports mean
+/// absolute MRC error around 0.01 at a few thousand samples; a few hundred
+/// bound the error near 0.05, enough to pick a knee on a curve this flat.
+const MRC_MIN_SAMPLES: u64 = 400;
+
+/// Size the TreeNodeCache from its measured
+/// miss-ratio curve (SHARDS, Waldspurger et al., FAST 2015) instead of fixed
+/// `node_size` constants. Sampling runs only while the node is full, so the
+/// one-off sync workload neither pays for it nor shapes the steady-state
+/// curve. The target becomes the curve's knee, capped by the configured size.
+/// There is no NodeObject cache: store reads are served by the OS page cache.
+/// `QUAXAR_MRC_CACHE=0` keeps the configured sizes (curves are still logged).
+fn size_tree_cache_from_mrc(root: &ApplicationRoot) {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    static SWEEPS: AtomicU64 = AtomicU64::new(0);
+    static CONFIGURED: AtomicUsize = AtomicUsize::new(0);
+    let full = root.network_ops_operating_mode() == crate::NetworkOpsOperatingMode::Full;
+    shamap::access_mrc::set_enabled(full);
+    let enabled = !std::env::var("QUAXAR_MRC_CACHE").is_ok_and(|value| value == "0");
+
+    if let Some(cache) = root.shared_tree_cache() {
+        let _ = CONFIGURED.compare_exchange(
+            0,
+            cache.target_size(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        let configured = CONFIGURED.load(Ordering::Relaxed);
+        let (curve, samples, knee) = shamap::access_mrc::snapshot(MRC_TOLERANCE);
+        let target = match knee {
+            Some(knee) if enabled && full && samples >= MRC_MIN_SAMPLES => {
+                (knee as usize).clamp(TREE_CACHE_MRC_MIN, configured.max(TREE_CACHE_MRC_MIN))
+            }
+            _ => configured,
+        };
+        if target != cache.target_size() {
+            cache.set_target_size(target);
+        }
+        tracing::info!(
+            target: "app",
+            event = "tree_cache_mrc",
+            samples,
+            knee = knee.unwrap_or(0),
+            target,
+            configured,
+            cache_size = cache.size(),
+            curve = %basics::sync::shards::format_curve(&curve),
+            "TreeNodeCache miss-ratio curve"
+        );
+    }
+
+    if SWEEPS.fetch_add(1, Ordering::Relaxed) % 10 == 9 {
+        shamap::access_mrc::decay();
+    }
+}
+
 /// Sweep rippled's application-owned NodeCache as part of `Application::doSweep`.
 fn sweep_temp_node_cache<C>(cache: &TaggedCache<Uint256, Blob, C>)
 where
@@ -121,6 +182,7 @@ impl ApplicationSweepActions for ProductionApplicationSweep<'_> {
     }
 
     fn sweep_node_family(&self) {
+        size_tree_cache_from_mrc(self.root);
         let before_size = self
             .root
             .shared_tree_cache()
@@ -940,6 +1002,11 @@ pub fn build_bootstrap_root(
     root.set_status_rpc_node_size(configured_node_size.clone());
     attach_bootstrap_node_family(&mut root, configured_node_size.as_deref());
     attach_production_shamap_store_runtime(&mut root, pending_shamap_store)?;
+    // LedgerHistory falls back to the store for uncached ledgers, as rippled's
+    // getLedgerByHash/getLedgerBySeq do via loadByHash/loadByIndex.
+    if crate::ledger::loaded_ledger_runtime::AppLedgerStoreLoader::install(&root) {
+        tracing::info!(target: "bootstrap", "ledger history store loader installed");
+    }
     initialize_startup_ledger_state(&root, options, config)?;
     root.bind_default_component_runtimes();
 
@@ -1596,6 +1663,7 @@ fn run_start_mode_consensus_loop(
     // ownership while matching rippled's essential boundary:
     // gotLedgerData/TimeoutCounter only enqueue work and jtLEDGER_DATA performs
     // reconstruction away from NetworkOPs and consensus.
+    install_trusted_restart_baseline(runtime.root());
     shared_inbound.set_phase_mode_owner(runtime.root().network_ops_mode_owner());
     if shared_inbound.install_coordinator() {
         shared_inbound.coordinator_startup(startup_coordinator_phase(runtime.root()));
@@ -4246,6 +4314,71 @@ fn bootstrap_shamap_store_if_configured(
     )?;
     let _ = bootstrap.attach_node_store(root);
     Ok(Some(PendingProductionSHAMapStore { bootstrap }))
+}
+
+/// Install the pruned store's last claimed ledger as the trusted restart
+/// baseline (`docs/design/2026-10-11-trusted-baseline-restart.md`). Set
+/// `QUAXAR_TRUSTED_RESTART=0` to disable.
+fn install_trusted_restart_baseline(root: &ApplicationRoot) {
+    if std::env::var("QUAXAR_TRUSTED_RESTART").is_ok_and(|value| value == "0") {
+        tracing::info!(target: "acquisition_trace", "trusted restart baseline disabled by QUAXAR_TRUSTED_RESTART=0");
+        return;
+    }
+    let Some(driver) = root
+        .shamap_store_service()
+        .and_then(|service| service.component().pruned_driver())
+    else {
+        return;
+    };
+    let store = Arc::clone(driver.store());
+    let Some(seq) = store.metrics().claimed_seq else {
+        return;
+    };
+    let root_hash = match store.claimed_state_root() {
+        Ok(Some(hash)) => hash,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(target: "acquisition_trace", %error, "trusted restart baseline: claimed root unreadable");
+            return;
+        }
+    };
+    use crate::ledger::inbound_ledgers::trusted_baseline as baseline;
+    // Read through the index's key-value path, not the node-store fetch: a
+    // baseline lookup must not pin dead-pending nodes (restore watch), and
+    // baseline nodes are live by construction.
+    let fetch_store = Arc::clone(&store);
+    let fetch: baseline::BaselineFetch = Arc::new(move |hash| {
+        fetch_store
+            .fetch_unwatched(hash)
+            .map(|object| object.data().to_vec())
+    });
+    let max_age = baseline::max_age_for(driver.online_delete());
+    // Roll the baseline to every claimed ledger. Fork recovery and catch-up
+    // then skip every subtree shared with the newest committed tree, even
+    // though the FullBelowCache is cleared whenever a prune deletes nodes.
+    let roll_fetch = Arc::clone(&fetch);
+    driver.set_on_claimed(Box::new(move |seq, root_hash| {
+        baseline::advance(Arc::new(baseline::TrustedBaseline::with_max_age(
+            seq,
+            root_hash,
+            Arc::clone(&roll_fetch),
+            max_age,
+        )));
+    }));
+    if fetch(&root_hash).is_none() {
+        tracing::warn!(target: "acquisition_trace", seq, %root_hash, "trusted restart baseline: claimed root missing from store");
+        return;
+    }
+    baseline::install(Arc::new(baseline::TrustedBaseline::with_max_age(
+        seq, root_hash, fetch, max_age,
+    )));
+    tracing::info!(
+        target: "acquisition_trace",
+        event = "trusted_baseline_installed",
+        baseline_seq = seq,
+        baseline_root = %root_hash,
+        "trusted committed baseline installed for restart catch-up"
+    );
 }
 
 /// Build the pruned-store driver for a fjall single store, reading its window

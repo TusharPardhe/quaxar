@@ -665,6 +665,20 @@ fn strand_loop(
         // the whole tree for every later ledger and never converged. Keep the
         // graphs until the node tracks the network, then release them all.
         let caught_up = root.network_ops_operating_mode() >= NetworkOpsOperatingMode::Tracking;
+        // The committed baseline is only trusted well inside the prune window:
+        // its nodes die as newer ledgers are claimed and become prunable
+        // `online_delete` ledgers later.
+        if let Some(baseline) = crate::ledger::inbound_ledgers::trusted_baseline::active() {
+            let too_old = root
+                .validated_ledger_seq()
+                .is_some_and(|validated| baseline.is_too_old(validated));
+            // Kept past Full: history backfill of the restart gap and of the
+            // retained window also diverges little from the baseline. It is
+            // safe until its nodes could be pruned (section 3 of the design).
+            if too_old {
+                crate::ledger::inbound_ledgers::trusted_baseline::retire("too_old");
+            }
+        }
         if root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full {
             trim_resident_ledger_tree(&root, &mut last_resident_trim_seq);
         }
@@ -2889,6 +2903,7 @@ fn release_processed_durable_graphs(
             transaction_full_below = released.transaction_full_below,
             transaction_deep = released.transaction_deep,
             released_total = released.total(),
+            durable_release_count = crate::ledger::inbound_ledgers::durable_release_count(),
             "released durable acquired SHAMap child graphs after coordinator acknowledgement"
         );
     } else {

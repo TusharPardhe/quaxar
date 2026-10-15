@@ -227,6 +227,8 @@ pub struct LedgerTrie<L: TrieLedger> {
     nodes: Vec<Node<L>>,
     /// Count of tip support for each sequence number. `seqSupport_`.
     seq_support: BTreeMap<L::Seq, u32>,
+    /// Freed arena slots available for reuse.
+    free: Vec<usize>,
 }
 
 impl<L: TrieLedger> LedgerTrie<L> {
@@ -234,17 +236,42 @@ impl<L: TrieLedger> LedgerTrie<L> {
         Self {
             nodes: vec![Node::root()],
             seq_support: BTreeMap::new(),
+            free: Vec::new(),
         }
     }
 
     fn alloc(&mut self, node: Node<L>) -> usize {
+        if let Some(idx) = self.free.pop() {
+            self.nodes[idx] = node;
+            return idx;
+        }
         self.nodes.push(node);
         self.nodes.len() - 1
     }
 
+    /// rippled `parent->erase(child)` destroys the child `unique_ptr`, freeing
+    /// its span and ledger. Do the same: drop the slot's contents (each
+    /// RCLValidatedLedger owns a 256-hash ancestor array) and recycle the
+    /// index. `erase_child` is the only way a node leaves the trie, and it
+    /// removes the index from the parent's child list, so no live node refers
+    /// to a freed slot.
     fn erase_child(&mut self, parent: usize, child: usize) {
         self.nodes[parent].children.retain(|&c| c != child);
-        self.nodes[child].live = false;
+        let mut freed = Node::from_span(Span::genesis());
+        freed.live = false;
+        self.nodes[child] = freed;
+        self.free.push(child);
+    }
+
+    /// Allocated node slots (live plus free). Bounded by the peak number of
+    /// live nodes, not by the number of ledgers ever inserted.
+    pub fn allocated_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Live (non-root) nodes.
+    pub fn live_nodes(&self) -> usize {
+        self.nodes.len() - 1 - self.free.len()
     }
 
     /// Find the node with the longest common ancestry with `ledger`.
@@ -635,6 +662,35 @@ mod tests {
 
         let preferred = trie.get_preferred(0).expect("trie is non-empty");
         assert_eq!(preferred.id, 2);
+    }
+
+    #[test]
+    fn arena_stays_bounded_as_validators_advance_a_long_chain() {
+        // Six validators move their support one ledger at a time, as on
+        // testnet. rippled frees erased nodes, so memory is bounded by the
+        // live trie; quaxar used to tombstone them and keep every span (and
+        // its 256-hash ancestor array) forever.
+        let mut trie = LedgerTrie::new();
+        let mut tip = TestLedger::genesis();
+        let validators = 6;
+        let mut last: Vec<Option<TestLedger>> = vec![None; validators];
+        for step in 0..3000u32 {
+            tip = tip.child((step % 250) as u8 + 1);
+            for v in 0..validators {
+                trie.insert(&tip, 1);
+                if let Some(prior) = last[v].replace(tip.clone()) {
+                    assert!(trie.remove(prior.ancestor(prior.seq()), prior.seq(), 1));
+                }
+            }
+            assert!(trie.check_invariants(), "invariants at step {step}");
+        }
+        assert_eq!(trie.get_preferred(0).map(|t| t.seq), Some(tip.seq()));
+        assert!(
+            trie.allocated_nodes() < 16,
+            "arena grew to {} slots for {} live nodes",
+            trie.allocated_nodes(),
+            trie.live_nodes()
+        );
     }
 
     #[test]

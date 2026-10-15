@@ -101,18 +101,72 @@ pub type Strand = Vec<StepKind>;
 #[derive(Debug, Clone, Default)]
 pub struct SelfCrossCancellation {
     offer_keys: Rc<RefCell<BTreeSet<Uint256>>>,
-    /// FlowOfferStream only puts an unfunded or tiny reduced offer in its
-    /// permanent-removal set when the pristine cancellation view has exactly
-    /// the same funding as the working payment view. Recheck these candidates
-    /// against the parent transaction view after tentative flow finishes so
-    /// an offer changed by an earlier liquidity pass is not deleted by a
-    /// failed FillOrKill crossing.
+    /// FlowOfferStream puts an unfunded or tiny reduced offer in its
+    /// permanent-removal set only when the owner's funds in the "all funds"
+    /// view equal the funds the working view observed. In rippled that view
+    /// (StrandFlow `afView`) is the flow sandbox at the START OF THE CURRENT
+    /// STRAND, which already includes earlier liquidity passes, not the
+    /// transaction's pristine view. Each strand resolves these candidates
+    /// against its own parent with `resolve_funding_against`.
     funding_sensitive_offer_keys: Rc<RefCell<BTreeMap<Uint256, STAmount>>>,
+    /// Offers recorded during the current liquidity pass. rippled deletes
+    /// `ofrsToRm` from the flow sandbox after every pass, so later passes do
+    /// not see them.
+    iteration_keys: Rc<RefCell<BTreeSet<Uint256>>>,
 }
 
 impl SelfCrossCancellation {
     pub fn record(&self, offer_key: Uint256) {
         self.offer_keys.borrow_mut().insert(offer_key);
+        self.iteration_keys.borrow_mut().insert(offer_key);
+    }
+
+    /// Decide funding-sensitive candidates against `view`, the flow sandbox
+    /// as it was when the strand started (rippled `afView`): equal funds
+    /// make the removal permanent, otherwise the offer only "became
+    /// unfunded" during this strand and is kept.
+    pub fn resolve_funding_against<V: crate::ApplyView>(&self, view: &mut V) -> Ter {
+        let pending = std::mem::take(&mut *self.funding_sensitive_offer_keys.borrow_mut());
+        for (offer_key, observed) in pending {
+            let offer = match view.read(Keylet::new(LedgerEntryType::Offer, offer_key)) {
+                Ok(Some(offer)) => offer,
+                Ok(None) => continue,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            };
+            let owner = offer.get_account_id(protocol::get_field_by_symbol("sfAccount"));
+            let owner_gives = offer.get_field_amount(protocol::get_field_by_symbol("sfTakerGets"));
+            match crate::domain::ripple_calc::book_step::get_owner_funds(view, &owner, &owner_gives)
+            {
+                Ok(funds) if funds == observed => self.record(offer_key),
+                Ok(_) => {}
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            }
+        }
+        Ter::TES_SUCCESS
+    }
+
+    /// Discard funding-sensitive candidates observed by a replay that was
+    /// already resolved from its probe.
+    pub fn clear_funding_sensitive(&self) {
+        self.funding_sensitive_offer_keys.borrow_mut().clear();
+    }
+
+    /// rippled StrandFlow: after each liquidity pass, `offerDelete(sb, ...)`
+    /// every offer in `ofrsToRm`.
+    pub fn delete_iteration_offers<V: crate::ApplyView>(&self, view: &mut V) -> Ter {
+        let keys = std::mem::take(&mut *self.iteration_keys.borrow_mut());
+        for offer_key in keys {
+            match view.peek(Keylet::new(LedgerEntryType::Offer, offer_key)) {
+                Ok(Some(offer)) => match crate::offer_helpers::offer_delete(view, offer) {
+                    Ok(Ter::TES_SUCCESS) => {}
+                    Ok(ter) => return ter,
+                    Err(_) => return Ter::TEF_BAD_LEDGER,
+                },
+                Ok(None) => {}
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            }
+        }
+        Ter::TES_SUCCESS
     }
 
     pub fn record_if_funding_unchanged(&self, offer_key: Uint256, observed_funds: STAmount) {

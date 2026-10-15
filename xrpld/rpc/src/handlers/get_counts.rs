@@ -220,6 +220,15 @@ pub fn get_counts_json<S: GetCountsSource>(source: &S, min_count: u32) -> JsonVa
             "jemalloc_retained_bytes".to_owned(),
             JsonValue::Unsigned(stats.retained_bytes as u64),
         );
+        for (name, value) in [
+            ("jemalloc_dirty_bytes", stats.dirty_bytes),
+            ("jemalloc_muzzy_bytes", stats.muzzy_bytes),
+            ("jemalloc_small_slab_bytes", stats.small_slab_bytes),
+            ("jemalloc_small_allocated_bytes", stats.small_allocated_bytes),
+            ("jemalloc_large_allocated_bytes", stats.large_allocated_bytes),
+        ] {
+            result.insert(name.to_owned(), JsonValue::Unsigned(value as u64));
+        }
         result.insert(
             "jemalloc_arenas".to_owned(),
             JsonValue::Unsigned(u64::from(stats.arenas)),

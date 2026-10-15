@@ -476,9 +476,16 @@ mod leaf_lock_test_hooks {
     pub(super) static PAUSE_AFTER_ACQUIRE: AtomicBool = AtomicBool::new(false);
     pub(super) static ACQUIRED: AtomicUsize = AtomicUsize::new(0);
     pub(super) static UNSHARE_ENTERED: AtomicUsize = AtomicUsize::new(0);
+    /// Address of the only leaf the hooks act on, so concurrently running
+    /// tests that lock other leaves cannot trip them.
+    pub(super) static TARGET: AtomicUsize = AtomicUsize::new(0);
 
-    pub(super) fn after_acquire() {
-        if PAUSE_AFTER_ACQUIRE.load(Ordering::SeqCst) {
+    pub(super) fn is_target(address: usize) -> bool {
+        address != 0 && TARGET.load(Ordering::SeqCst) == address
+    }
+
+    pub(super) fn after_acquire(address: usize) {
+        if is_target(address) && PAUSE_AFTER_ACQUIRE.load(Ordering::SeqCst) {
             ACQUIRED.fetch_add(1, Ordering::SeqCst);
             while PAUSE_AFTER_ACQUIRE.load(Ordering::SeqCst) {
                 std::thread::yield_now();
@@ -490,6 +497,7 @@ mod leaf_lock_test_hooks {
         PAUSE_AFTER_ACQUIRE.store(false, Ordering::SeqCst);
         ACQUIRED.store(0, Ordering::SeqCst);
         UNSHARE_ENTERED.store(0, Ordering::SeqCst);
+        TARGET.store(0, Ordering::SeqCst);
     }
 }
 
@@ -563,7 +571,7 @@ impl SHAMapLeafNode {
     fn lock(&self) -> LeafLock {
         let guard = LeafLock::acquire(self.item_lock());
         #[cfg(test)]
-        leaf_lock_test_hooks::after_acquire();
+        leaf_lock_test_hooks::after_acquire(self as *const Self as usize);
         guard
     }
     fn item(&self) -> &Option<SHAMapItem> {
@@ -659,7 +667,9 @@ impl SHAMapTreeNode {
             // UnsafeCell access mutually exclusive: a writer either mutates
             // while still owned or observes zero and rejects the operation.
             #[cfg(test)]
-            leaf_lock_test_hooks::UNSHARE_ENTERED.fetch_add(1, Ordering::SeqCst);
+            if leaf_lock_test_hooks::is_target(self.leaf() as *const SHAMapLeafNode as usize) {
+                leaf_lock_test_hooks::UNSHARE_ENTERED.fetch_add(1, Ordering::SeqCst);
+            }
             let _guard = self.leaf().lock();
             self.cowid.store(0, Ordering::Release);
         } else {
@@ -1777,7 +1787,9 @@ mod tests {
 
     #[test]
     fn leaf_unshare_waits_for_item_lock_and_rejects_post_unshare_mutation() {
-        use super::leaf_lock_test_hooks::{ACQUIRED, PAUSE_AFTER_ACQUIRE, UNSHARE_ENTERED, reset};
+        use super::leaf_lock_test_hooks::{
+            ACQUIRED, PAUSE_AFTER_ACQUIRE, TARGET, UNSHARE_ENTERED, reset,
+        };
 
         reset();
         let key = sample_uint256(0xAB);
@@ -1789,6 +1801,7 @@ mod tests {
         let updated = SHAMapItem::new(key, vec![2; 12]);
         let expected = updated.clone();
 
+        TARGET.store(leaf.leaf() as *const SHAMapLeafNode as usize, Ordering::SeqCst);
         PAUSE_AFTER_ACQUIRE.store(true, Ordering::SeqCst);
         let writer = {
             let leaf = leaf.clone();

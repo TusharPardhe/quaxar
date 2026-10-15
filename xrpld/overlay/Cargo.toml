@@ -27,6 +27,11 @@ tokio-openssl = "0.6"
 tokio-rustls = "0.26"
 rustls = "0.23"
 
+[features]
+# Test-only: record every resource charge on PeerImp for inspection.
+# rippled keeps no such history; production builds leave this off.
+charge-capture = []
+
 [dev-dependencies]
 rcgen = "0.13"
 

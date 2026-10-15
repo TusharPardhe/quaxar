@@ -5,19 +5,22 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use shamap::nodes::tree_node::{BRANCH_FACTOR, SHAMapNodeType, SHAMapTreeNode};
+use shamap::nodes::tree_node::SHAMapNodeType;
 
+use super::builder::{BuiltNode, SortedLeafBuilder, prepare_leaf};
 use super::{SnapshotError, manifest::*};
 use crate::{Backend, Batch, NodeObject, NodeObjectType};
 use basics::base_uint::Uint256;
 use basics::sha_map_hash::SHAMapHash;
 use protocol::{LedgerHeader, calculate_ledger_hash};
 
-const MAX_SHAMAP_DEPTH: usize = 64;
+/// Number of rebuilt nodes per backend batch write.
+const WRITE_BATCH_NODES: usize = 65_536;
 
 /// Keeps a failed import fail-closed even if a backend must finalize on-disk
-/// indexes before the footer and SHAMap graph can be verified.
+/// indexes before the footer and roots can be verified.
 struct BulkImportGuard<'a> {
     backend: &'a dyn Backend,
     completed: bool,
@@ -48,19 +51,32 @@ impl Drop for BulkImportGuard<'_> {
 pub struct SnapshotLoadOutcome {
     /// The verified manifest (header fields and chunk table).
     pub manifest: SnapshotManifest,
-    /// Every node hash reachable from the two verified SHAMap roots: the exact
+    /// Every node rebuilt from the two verified SHAMap roots: the exact
     /// retained set for this snapshot. A pruned store uses it to reconcile the
-    /// imported `nodes` keyspace down to the snapshot and to stamp the anchor
-    /// (design Case 7). Empty roots contribute nothing.
+    /// imported `nodes` keyspace down to the snapshot (design Case 7).
+    ///
+    /// Left empty when `store_was_empty` is true: the store then holds exactly
+    /// the rebuilt nodes, so there is nothing to reconcile and collecting the
+    /// set (tens of millions of hashes) would only cost memory and time.
     pub required_nodes: HashSet<Uint256>,
+    /// The backend's `nodes` keyspace was empty before the import.
+    pub store_was_empty: bool,
+    /// Nodes written (leaves plus rebuilt inner nodes).
+    pub nodes_written: u64,
 }
 
 /// Load a snapshot file from `input_path` into `backend`.
 ///
-/// Returns the verified manifest and the set of node hashes reachable from the
-/// two SHAMap roots. A successful result proves that the manifest header is
-/// self-consistent and that both advertised SHAMap roots are complete,
-/// correctly typed, and content-addressed by their encoded bytes.
+/// A successful result proves that the manifest header is self-consistent and
+/// that the leaves in the file rebuild exactly the advertised account-state
+/// and transaction roots; every stored node is keyed by its own recomputed
+/// content hash.
+///
+/// Leaves of each chunk are serialized and hashed in parallel; the bottom-up
+/// rebuild runs sequentially (it depends on key order) and commits node
+/// batches to the store as it goes. Writes stay on this thread: a dedicated,
+/// back-to-back writer thread drove fjall into a write halt with no flush
+/// scheduled (writer parked in `local_backpressure`, all workers idle).
 pub fn load_snapshot(
     backend: &dyn Backend,
     input_path: &Path,
@@ -74,7 +90,7 @@ pub fn load_snapshot(
 
     let file = File::open(input_path)
         .map_err(|e| SnapshotError::io_path("opening snapshot file", input_path, e))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(1 << 20, file);
     let mut file_hasher = Sha256::new();
 
     let mut header_buf = [0u8; SNAPSHOT_HEADER_SIZE];
@@ -106,15 +122,6 @@ pub fn load_snapshot(
             actual: chunk_count as u64,
             limit: SNAPSHOT_MAX_CHUNKS as u64,
         })?;
-
-    tracing::info!(
-        target: "snapshot",
-        ledger_seq = manifest.ledger_seq,
-        version = manifest.version,
-        chunk_count,
-        "Snapshot header parsed"
-    );
-
     for _ in 0..chunk_count {
         let mut entry_buf = [0u8; CHUNK_META_SIZE];
         reader
@@ -125,102 +132,38 @@ pub fn load_snapshot(
             .chunks
             .push(SnapshotManifest::deserialize_chunk_meta(&entry_buf));
     }
+    tracing::info!(
+        target: "snapshot",
+        ledger_seq = manifest.ledger_seq,
+        version = manifest.version,
+        chunk_count,
+        "Snapshot header parsed"
+    );
 
-    let estimated_nodes = (chunk_count as u64).saturating_mul(30_000);
+    // Only a store that already holds nodes needs the retained set (to sweep
+    // what the snapshot does not cover). A backend that cannot tell is treated
+    // as non-empty, which is the conservative choice.
+    let store_was_empty = backend.nodes_is_empty().unwrap_or(false);
+
     backend
-        .bulk_import_start(estimated_nodes)
+        .bulk_import_start((chunk_count as u64).saturating_mul(80_000))
         .map_err(|e| SnapshotError::BackendWriteFailed {
             reason: format!("bulk_import_start: {e}"),
         })?;
     let mut import_guard = BulkImportGuard::new(backend);
 
-    let mut total_nodes = 0u64;
-    for (i, meta) in manifest.chunks.iter().enumerate() {
-        let compressed_len = meta.compressed_len as usize;
-        if compressed_len > SNAPSHOT_MAX_COMPRESSED_CHUNK_BYTES {
-            return Err(SnapshotError::ResourceLimitExceeded {
-                resource: "compressed chunk bytes",
-                actual: compressed_len as u64,
-                limit: SNAPSHOT_MAX_COMPRESSED_CHUNK_BYTES as u64,
-            });
-        }
+    let rebuilt = rebuild_from_leaves(
+        &manifest,
+        &mut reader,
+        &mut file_hasher,
+        NodeSink::new(backend, !store_was_empty),
+        start,
+    )?;
+    let nodes_written = rebuilt.nodes_written;
 
-        let mut compressed = vec![0u8; compressed_len];
-        reader
-            .read_exact(&mut compressed)
-            .map_err(|e| SnapshotError::io("reading chunk data", e))?;
-        file_hasher.update(&compressed);
-
-        let computed_hash: [u8; 32] = Sha256::digest(&compressed).into();
-        if computed_hash != meta.sha256 {
-            return Err(SnapshotError::ChunkHashMismatch {
-                chunk_index: i,
-                expected: meta.sha256,
-                computed: computed_hash,
-            });
-        }
-
-        let (declared_uncompressed_len, _) = lz4_flex::block::uncompressed_size(&compressed)
-            .map_err(|e| SnapshotError::DecompressionFailed {
-                chunk_index: i,
-                reason: e.to_string(),
-            })?;
-        if declared_uncompressed_len > SNAPSHOT_MAX_UNCOMPRESSED_CHUNK_BYTES {
-            return Err(SnapshotError::ResourceLimitExceeded {
-                resource: "uncompressed chunk bytes",
-                actual: declared_uncompressed_len as u64,
-                limit: SNAPSHOT_MAX_UNCOMPRESSED_CHUNK_BYTES as u64,
-            });
-        }
-        let decompressed =
-            lz4_flex::block::decompress_size_prepended(&compressed).map_err(|e| {
-                SnapshotError::DecompressionFailed {
-                    chunk_index: i,
-                    reason: e.to_string(),
-                }
-            })?;
-
-        let mut batch: Batch = Vec::new();
-        let mut offset = 0;
-        while offset < decompressed.len() {
-            let (node_type_byte, hash, data_range, consumed) =
-                decode_node_record(&decompressed, offset, i)?;
-            let object_type = NodeObjectType::try_from(node_type_byte).map_err(|_| {
-                SnapshotError::MalformedNodeRecord {
-                    chunk_index: i,
-                    offset,
-                    reason: format!("unsupported node type {node_type_byte}"),
-                }
-            })?;
-            batch.push(Arc::new(NodeObject::new(
-                object_type,
-                decompressed[data_range].to_vec(),
-                Uint256::from_array(hash),
-            )));
-            offset += consumed;
-        }
-
-        backend
-            .store_batch_result(&batch)
-            .map_err(|reason| SnapshotError::BackendWriteFailed {
-                reason: format!("chunk {i}: {reason}"),
-            })?;
-        total_nodes += batch.len() as u64;
-        if (i + 1) % 10 == 0 || i + 1 == manifest.chunks.len() {
-            tracing::info!(
-                target: "snapshot",
-                chunk = i + 1,
-                total_chunks = manifest.chunks.len(),
-                nodes_loaded = total_nodes,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "Loading snapshot chunks"
-            );
-        }
-    }
-
-    // Finalize any backend bulk-import indexes before the footer and SHAMap
-    // graph are verified. The guard restores the incomplete-import marker if a
-    // later verification fails, so finalization is not publication.
+    // Finalize any backend bulk-import indexes before the footer and roots are
+    // checked. The guard restores the incomplete-import marker if a later
+    // check fails, so finalization is not publication.
     backend
         .bulk_import_finish()
         .map_err(|e| SnapshotError::BackendWriteFailed {
@@ -247,21 +190,11 @@ pub fn load_snapshot(
         return Err(SnapshotError::TrailingData);
     }
 
-    // Verify both roots, accumulating every reachable node hash into one set so
-    // a pruned store can reconcile and anchor to exactly this snapshot.
-    let mut required_nodes = HashSet::new();
-    verify_shamap_root(
-        backend,
-        "account-state",
-        manifest.account_hash,
-        &mut required_nodes,
-    )?;
-    verify_shamap_root(
-        backend,
-        "transaction",
-        manifest.tx_hash,
-        &mut required_nodes,
-    )?;
+    // The rebuilt roots must equal the ledger header's roots. This is the
+    // verification of every node written above.
+    check_root("account-state", rebuilt.state_root, manifest.account_hash)?;
+    check_root("transaction", rebuilt.tx_root, manifest.tx_hash)?;
+
     backend
         .sync_result()
         .map_err(|e| SnapshotError::BackendWriteFailed {
@@ -272,16 +205,234 @@ pub fn load_snapshot(
     tracing::info!(
         target: "snapshot",
         ledger_seq = manifest.ledger_seq,
-        total_nodes,
-        chunks = manifest.chunks.len(),
-        required_nodes = required_nodes.len(),
+        nodes_written,
+        state_leaves = rebuilt.state_leaves,
+        tx_leaves = rebuilt.tx_leaves,
+        store_was_empty,
         elapsed_ms = start.elapsed().as_millis() as u64,
-        "Snapshot load complete, ledger and SHAMap roots verified"
+        "Snapshot load complete, rebuilt roots match the ledger header"
     );
 
     Ok(SnapshotLoadOutcome {
         manifest,
-        required_nodes,
+        required_nodes: rebuilt.required,
+        store_was_empty,
+        nodes_written,
+    })
+}
+
+struct Rebuilt {
+    state_root: Uint256,
+    tx_root: Uint256,
+    state_leaves: u64,
+    tx_leaves: u64,
+    nodes_written: u64,
+    required: HashSet<Uint256>,
+}
+
+/// Read, verify and decompress each chunk; hash its leaves in parallel; feed
+/// them in key order to the two bottom-up builders; write every node.
+fn rebuild_from_leaves(
+    manifest: &SnapshotManifest,
+    reader: &mut impl Read,
+    file_hasher: &mut Sha256,
+    mut sink: NodeSink<'_>,
+    start: Instant,
+) -> Result<Rebuilt, SnapshotError> {
+    let mut state = SortedLeafBuilder::new();
+    let mut tx = SortedLeafBuilder::new();
+    let mut seen_tx = false;
+
+    for (i, meta) in manifest.chunks.iter().enumerate() {
+        let compressed_len = meta.compressed_len as usize;
+        if compressed_len > SNAPSHOT_MAX_COMPRESSED_CHUNK_BYTES {
+            return Err(SnapshotError::ResourceLimitExceeded {
+                resource: "compressed chunk bytes",
+                actual: compressed_len as u64,
+                limit: SNAPSHOT_MAX_COMPRESSED_CHUNK_BYTES as u64,
+            });
+        }
+        let mut compressed = vec![0u8; compressed_len];
+        reader
+            .read_exact(&mut compressed)
+            .map_err(|e| SnapshotError::io("reading chunk data", e))?;
+        file_hasher.update(&compressed);
+        let computed_hash: [u8; 32] = Sha256::digest(&compressed).into();
+        if computed_hash != meta.sha256 {
+            return Err(SnapshotError::ChunkHashMismatch {
+                chunk_index: i,
+                expected: meta.sha256,
+                computed: computed_hash,
+            });
+        }
+        let decompressed = decompress_chunk(i, &compressed)?;
+
+        // Decode record boundaries and check map order (cheap, sequential).
+        let mut records: Vec<(SHAMapNodeType, Uint256, std::ops::Range<usize>, usize)> =
+            Vec::new();
+        let mut offset = 0;
+        while offset < decompressed.len() {
+            let (tag, key, data_range, consumed) = decode_node_record(&decompressed, offset, i)?;
+            let leaf_type = match tag {
+                LEAF_TAG_ACCOUNT_STATE if seen_tx => {
+                    return Err(malformed(i, offset, "account-state leaf after transaction leaves"));
+                }
+                LEAF_TAG_ACCOUNT_STATE => SHAMapNodeType::AccountState,
+                LEAF_TAG_TRANSACTION => {
+                    seen_tx = true;
+                    SHAMapNodeType::TransactionMd
+                }
+                other => return Err(malformed(i, offset, &format!("unknown leaf record tag {other}"))),
+            };
+            records.push((leaf_type, Uint256::from_array(key), data_range, offset));
+            offset += consumed;
+        }
+
+        // Serialize and hash every leaf in parallel; order is preserved.
+        let leaves: Vec<Result<BuiltNode, String>> = records
+            .par_iter()
+            .map(|(leaf_type, key, range, _)| prepare_leaf(*leaf_type, key, &decompressed[range.clone()]))
+            .collect();
+
+        // Rebuild sequentially in key order.
+        for ((leaf_type, key, _, record_offset), leaf) in records.iter().zip(leaves) {
+            let leaf = leaf.map_err(|reason| malformed(i, *record_offset, &reason))?;
+            let (builder, object_type) = match leaf_type {
+                SHAMapNodeType::AccountState => (&mut state, NodeObjectType::AccountNode),
+                _ => (&mut tx, NodeObjectType::TransactionNode),
+            };
+            let leaf_hash = leaf.hash;
+            sink.push(leaf, object_type).map_err(write_failed)?;
+            let mut write_error = None;
+            let pushed = builder.push(*key, leaf_hash, &mut |node| {
+                sink.push(node, object_type).inspect_err(|e| write_error = Some(e.clone()))
+            });
+            if let Err(reason) = pushed {
+                return Err(match write_error {
+                    Some(reason) => write_failed(reason),
+                    None => malformed(i, *record_offset, &reason),
+                });
+            }
+        }
+
+        if (i + 1) % 50 == 0 || i + 1 == manifest.chunks.len() {
+            tracing::info!(
+                target: "snapshot",
+                chunk = i + 1,
+                total_chunks = manifest.chunks.len(),
+                leaves = state.leaves() + tx.leaves(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Loading snapshot chunks"
+            );
+        }
+    }
+
+    let state_leaves = state.leaves();
+    let tx_leaves = tx.leaves();
+    let state_root = state
+        .finish(&mut |node| sink.push(node, NodeObjectType::AccountNode))
+        .map_err(write_failed)?;
+    let tx_root = tx
+        .finish(&mut |node| sink.push(node, NodeObjectType::TransactionNode))
+        .map_err(write_failed)?;
+    sink.flush().map_err(write_failed)?;
+    Ok(Rebuilt {
+        state_root,
+        tx_root,
+        state_leaves,
+        tx_leaves,
+        nodes_written: sink.written,
+        required: sink.required.unwrap_or_default(),
+    })
+}
+
+fn write_failed(reason: String) -> SnapshotError {
+    SnapshotError::BackendWriteFailed { reason }
+}
+
+fn malformed(chunk_index: usize, offset: usize, reason: &str) -> SnapshotError {
+    SnapshotError::MalformedNodeRecord {
+        chunk_index,
+        offset,
+        reason: reason.to_owned(),
+    }
+}
+
+/// Check the declared size of one compressed chunk and decompress it.
+fn decompress_chunk(chunk_index: usize, compressed: &[u8]) -> Result<Vec<u8>, SnapshotError> {
+    let (declared_uncompressed_len, _) =
+        lz4_flex::block::uncompressed_size(compressed).map_err(|e| {
+            SnapshotError::DecompressionFailed {
+                chunk_index,
+                reason: e.to_string(),
+            }
+        })?;
+    if declared_uncompressed_len > SNAPSHOT_MAX_UNCOMPRESSED_CHUNK_BYTES {
+        return Err(SnapshotError::ResourceLimitExceeded {
+            resource: "uncompressed chunk bytes",
+            actual: declared_uncompressed_len as u64,
+            limit: SNAPSHOT_MAX_UNCOMPRESSED_CHUNK_BYTES as u64,
+        });
+    }
+    lz4_flex::block::decompress_size_prepended(compressed).map_err(|e| {
+        SnapshotError::DecompressionFailed {
+            chunk_index,
+            reason: e.to_string(),
+        }
+    })
+}
+
+/// Batches rebuilt nodes into backend writes and, if requested, records
+/// every hash as part of the snapshot's retained set.
+struct NodeSink<'a> {
+    backend: &'a dyn Backend,
+    pending: Batch,
+    written: u64,
+    required: Option<HashSet<Uint256>>,
+}
+
+impl<'a> NodeSink<'a> {
+    fn new(backend: &'a dyn Backend, collect_required: bool) -> Self {
+        Self {
+            backend,
+            pending: Vec::with_capacity(WRITE_BATCH_NODES),
+            written: 0,
+            required: collect_required.then(HashSet::new),
+        }
+    }
+
+    fn push(&mut self, node: BuiltNode, object_type: NodeObjectType) -> Result<(), String> {
+        if let Some(required) = self.required.as_mut() {
+            required.insert(node.hash);
+        }
+        self.pending
+            .push(Arc::new(NodeObject::new(object_type, node.data, node.hash)));
+        if self.pending.len() >= WRITE_BATCH_NODES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.backend.store_batch_result(&self.pending)?;
+        self.written += self.pending.len() as u64;
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+fn check_root(map: &'static str, rebuilt: Uint256, expected: [u8; 32]) -> Result<(), SnapshotError> {
+    let expected = Uint256::from_array(expected);
+    if rebuilt == expected {
+        return Ok(());
+    }
+    Err(SnapshotError::ShamapVerificationFailed {
+        map,
+        hash_hex: expected.to_string(),
+        reason: format!("rebuilt root {rebuilt} does not match the ledger header"),
     })
 }
 
@@ -306,131 +457,4 @@ fn verify_manifest_ledger_hash(manifest: &SnapshotManifest) -> Result<(), Snapsh
         expected_hex: Uint256::from_array(manifest.ledger_hash).to_string(),
         computed_hex: Uint256::from_array(computed).to_string(),
     })
-}
-
-fn verify_shamap_root(
-    backend: &dyn Backend,
-    map: &'static str,
-    root_bytes: [u8; 32],
-    required: &mut HashSet<Uint256>,
-) -> Result<(), SnapshotError> {
-    let root = Uint256::from_array(root_bytes);
-    if root.is_zero() {
-        return Ok(());
-    }
-
-    let mut visiting = HashSet::new();
-    verify_shamap_node(backend, map, root, 0, &mut visiting, required)
-}
-
-fn verify_shamap_node(
-    backend: &dyn Backend,
-    map: &'static str,
-    hash: Uint256,
-    depth: usize,
-    visiting: &mut HashSet<Uint256>,
-    verified: &mut HashSet<Uint256>,
-) -> Result<(), SnapshotError> {
-    if verified.contains(&hash) {
-        return Ok(());
-    }
-    if depth > MAX_SHAMAP_DEPTH {
-        return Err(shamap_error(map, hash, "tree exceeds maximum SHAMap depth"));
-    }
-    if !visiting.insert(hash) {
-        return Err(shamap_error(map, hash, "cycle in reachable SHAMap graph"));
-    }
-
-    let (object, status) = backend.fetch(&hash);
-    let object = object.ok_or_else(|| {
-        shamap_error(
-            map,
-            hash,
-            format!("node is missing from imported store ({status:?})"),
-        )
-    })?;
-    if object.hash() != &hash {
-        return Err(shamap_error(
-            map,
-            hash,
-            "backend returned a NodeObject with a mismatched key",
-        ));
-    }
-
-    let expected_object_type = match map {
-        "account-state" => NodeObjectType::AccountNode,
-        "transaction" => NodeObjectType::TransactionNode,
-        _ => unreachable!("only known snapshot maps are verified"),
-    };
-    let node = SHAMapTreeNode::make_from_prefix(object.data(), SHAMapHash::new(hash))
-        .map_err(|error| shamap_error(map, hash, format!("invalid encoded node: {error:?}")))?;
-    // Some backend codecs discard the account-vs-transaction NodeObject
-    // wrapper tag and restore inner nodes as `Unknown`. The serialized SHAMap
-    // body still carries the node kind, so permit the `Unknown` wrapper for
-    // inner nodes only; leaves must retain their map-specific wrapper as well
-    // as their serialized leaf kind.
-    let wrapper_type_matches = if node.is_leaf() {
-        object.object_type() == expected_object_type
-    } else {
-        object.object_type() == expected_object_type
-            || object.object_type() == NodeObjectType::Unknown
-    };
-    if !wrapper_type_matches {
-        return Err(shamap_error(
-            map,
-            hash,
-            "reachable node has an incompatible NodeObject type",
-        ));
-    }
-    // `make_from_prefix` deliberately accepts a known hash for normal trusted
-    // fetch paths. Snapshot input is untrusted, so force recomputation before
-    // trusting the decoded graph.
-    node.update_hash();
-    if node.get_hash().as_uint256() != &hash {
-        return Err(shamap_error(
-            map,
-            hash,
-            "encoded node body does not match its content-addressed hash",
-        ));
-    }
-
-    if node.is_leaf() {
-        let expected_leaf_type = match map {
-            "account-state" => SHAMapNodeType::AccountState,
-            "transaction" => SHAMapNodeType::TransactionMd,
-            _ => unreachable!("only known snapshot maps are verified"),
-        };
-        if node.get_type() != expected_leaf_type {
-            return Err(shamap_error(
-                map,
-                hash,
-                "leaf type belongs to the other SHAMap",
-            ));
-        }
-    } else {
-        for branch in 0..BRANCH_FACTOR {
-            if !node.is_empty_branch(branch) {
-                verify_shamap_node(
-                    backend,
-                    map,
-                    *node.get_child_hash(branch).as_uint256(),
-                    depth + 1,
-                    visiting,
-                    verified,
-                )?;
-            }
-        }
-    }
-
-    visiting.remove(&hash);
-    verified.insert(hash);
-    Ok(())
-}
-
-fn shamap_error(map: &'static str, hash: Uint256, reason: impl Into<String>) -> SnapshotError {
-    SnapshotError::ShamapVerificationFailed {
-        map,
-        hash_hex: hash.to_string(),
-        reason: reason.into(),
-    }
 }

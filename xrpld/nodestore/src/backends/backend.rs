@@ -72,6 +72,12 @@ pub trait Backend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether the node table holds no objects. `None` means the backend
+    /// cannot tell cheaply; callers must then assume it is not empty.
+    fn nodes_is_empty(&self) -> Option<bool> {
+        None
+    }
+
     /// Mark an import as failed after it has started. Backends with an
     /// incomplete-import marker must keep or restore that marker so an invalid
     /// post-finalization snapshot cannot be reopened as a successful import.
@@ -150,6 +156,20 @@ pub trait Backend: Send + Sync + 'static {
     /// first watched. Prune must not delete such a node.
     fn was_restored(&self, _hash: &Uint256) -> bool {
         false
+    }
+
+    /// Prune is about to delete `hashes` (see `restore_watch`). Returns, per
+    /// hash, whether the node must be kept because it was read or written
+    /// while watched.
+    fn begin_delete(&self, hashes: &[Uint256]) -> Vec<bool> {
+        hashes.iter().map(|hash| self.was_restored(hash)).collect()
+    }
+
+    /// The delete batch for `hashes` committed. Returns the bytes of nodes
+    /// read or written during the delete, which prune writes back.
+    fn finish_delete(&self, hashes: &[Uint256]) -> Vec<(Uint256, Vec<u8>)> {
+        self.unwatch_restores(hashes);
+        Vec::new()
     }
 
     #[doc(hidden)]

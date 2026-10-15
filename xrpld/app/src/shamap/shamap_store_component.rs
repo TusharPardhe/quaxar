@@ -93,6 +93,11 @@ impl SHAMapStoreComponent {
         self.inner.pruned.as_ref().map(|driver| driver.metrics())
     }
 
+    /// The attached pruned-store driver (fjall path only).
+    pub fn pruned_driver(&self) -> Option<Arc<crate::shamap::pruned_driver::PrunedDriver>> {
+        self.inner.pruned.clone()
+    }
+
     pub fn snapshot(&self) -> SHAMapStore {
         self.store()
             .lock()

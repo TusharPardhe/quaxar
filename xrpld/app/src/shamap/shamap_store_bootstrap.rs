@@ -43,36 +43,9 @@ pub fn bootstrap_shamap_store(
     // RocksDB tuning defaults were dropped with the RocksDB backend; the
     // node_db section is used as configured.
     let _ = (hash_node_db_cache_mb, node_size);
-    let mut node_db = node_db_section(config)?.clone();
-    let configured_node_size = config
-        .exists("node_size")
-        .then(|| config.section("node_size").values().first().cloned())
-        .flatten();
-    let profile = crate::NodeSizeResourceProfile::for_node_size(configured_node_size.as_deref());
-    if !node_db.exists("node_object_cache_target_nodes")
-        && !node_db.exists("cache_size")
-        && !node_db.exists("cache_capacity_mb")
-        && !node_db.exists("node_object_cache_capacity_bytes")
-    {
-        node_db.set(
-            "node_object_cache_target_nodes",
-            profile.tree_cache_size.to_string(),
-        );
-    }
-    if !node_db.exists("cache_idle_seconds") && !node_db.exists("cache_age") {
-        // rippled injects TreeCacheAge into NodeStore, whose cache interprets
-        // the value in minutes (decoded TreeNodeCache uses seconds).
-        node_db.set(
-            "cache_idle_seconds",
-            profile
-                .tree_cache_age_seconds
-                .saturating_mul(60)
-                .to_string(),
-        );
-    }
-    if !node_db.exists("cache_ttl_seconds") {
-        node_db.set("cache_ttl_seconds", "0");
-    }
+    let node_db = node_db_section(config)?.clone();
+    // There is no NodeObject cache: store reads go to the backend and the OS
+    // page cache (rippled with online_delete has none either).
     let mut store = SHAMapStore::from_config(config, standalone, ledger_history, 0)?;
 
     // online_delete no longer selects a rotating store: the node store is always

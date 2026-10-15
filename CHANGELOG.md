@@ -7,6 +7,63 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-15
+
+### Fixed
+
+- Fixed five testnet consensus forks, each with a byte-exact sparse replay of
+  the network ledger as a regression test:
+  - 21534114: a FillOrKill OfferCreate now removes an offer unfunded by an
+    earlier liquidity pass, comparing funds against the strand's `afView`.
+  - 21540882: IOU transfers record PaymentSandbox deferred credits and
+    `accountHolds` applies `balanceHookIOU` across nested sandboxes; AMM pool
+    balances stay hook-free (`ammAccountHolds`).
+  - 21558891: CheckCash by the issuer waives the writer's line limit before
+    `fixCleanup3_4_0`, so flow may issue up to `SendMax`.
+  - 21511422: an over-range unchecked `Number` mantissa is truncated when
+    converted to amount parts.
+  - 21485530: flow engine exceptions are contained as `tecINTERNAL` with
+    rippled's exception classes at every catch site.
+- Fork recovery no longer cancels the network ledger acquisition when the
+  local LCL forks, and the pruned store rebuilds its dead-pending set on
+  restart.
+- Fixed a timer service lost wakeup on stop.
+- History ledgers no longer in the cache are loaded from the store, so the
+  `ledger` RPC no longer reports `lgrNotFound` inside `complete_ledgers`.
+- A dead node read by an acquisition is kept by the pruned store instead of
+  being deleted under the ledger being acquired; a read or write racing a
+  delete batch is written back.
+
+### Changed
+
+- Fork recovery and restart catch-up skip every subtree shared with the
+  newest claimed ledger (a rolling trusted baseline). Measured on testnet:
+  catch-up to an out-of-window ledger takes 10-16 s instead of not finishing,
+  with RSS under 1 GB instead of 3-5.6 GB.
+- Bounded memory: `LedgerHistory` bookkeeping, the validation trie and the
+  validations ledger map are swept like rippled; the journal and peer charge
+  history are not kept in memory; acquisitions release durable subtrees.
+- The TreeNodeCache is sized from a sampled miss-ratio curve. Set
+  `QUAXAR_MRC_CACHE=0` to keep the configured size.
+- Removed the NodeObject cache; node-store reads go to fjall and the OS page
+  cache, as in rippled with `online_delete`.
+- Snapshot format v2 stores only leaves and rebuilds inner nodes on load, with
+  bulk ingestion and parallel export. **v1 snapshots are no longer loadable;
+  re-export them.**
+- Mismatched built and validated ledgers are logged with rippled's
+  `handleMismatch` detail, including per-transaction metadata.
+- Since 0.9.0 (#83-#90): rippled 3.4.1 and Oct 2026 develop sync, confidential
+  MPT key rotation, the `mpt_issuances` stream, a faster RPC/WS path, hot
+  restart convergence, a bounded resident ledger tree, and `account_tx`
+  `ledger_index_min` from the full validated range.
+
+### Added
+
+- `heap-profiling` build feature (jemalloc profiling), off by default.
+- `scripts/capture_sparse_replay.py` captures a network ledger as a replay
+  fixture for fork investigation.
+- jemalloc and miss-ratio-curve fields in `get_counts`.
+
 ## [0.9.0] - 2026-10-08
 
 ### Added

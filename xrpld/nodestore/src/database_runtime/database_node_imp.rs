@@ -132,10 +132,8 @@ impl DatabaseNodeImp {
             tracing::error!(target: "nodestore", %error, hash = %object.hash(), "NodeStore backend write failed");
             error
         })?;
-        // Match rippled's post-store canonicalization ordering: neither
-        // counters nor cache state can imply a write that the backend rejected.
+        // Counters never imply a write that the backend rejected.
         self.database.store_stats(1, object.data().len() as u64);
-        self.database.promote_node_object(object);
         Ok(())
     }
 
@@ -165,7 +163,6 @@ impl DatabaseNodeImp {
         })?;
         for object in batch {
             self.database.store_stats(1, object.data().len() as u64);
-            self.database.promote_node_object(object);
         }
         Ok(())
     }
@@ -389,6 +386,8 @@ impl DatabaseTrait for DatabaseNodeImp {
     fn add_counts_json(&self, obj: &mut BTreeMap<String, JsonValue>) {
         DatabaseNodeImp::add_counts_json(self, obj);
     }
+
+
 
     fn get_counts_json(&self) -> JsonValue {
         DatabaseNodeImp::get_counts_json(self)

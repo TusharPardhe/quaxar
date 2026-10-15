@@ -1790,8 +1790,6 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
                 .flatten()
                 .unwrap_or_else(|| "fjall".to_owned());
             if db_type.eq_ignore_ascii_case("fjall") {
-                let required: std::collections::BTreeSet<_> =
-                    outcome.required_nodes.iter().copied().collect();
                 let state_root = basics::base_uint::Uint256::from_array(manifest.account_hash);
                 let anchor_seq = manifest.ledger_seq;
                 let arc_backend: Arc<dyn nodestore::Backend> = Arc::from(backend);
@@ -1799,7 +1797,17 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
                     Arc::clone(&arc_backend),
                     nodestore::PrunedConfig::default(),
                 ) {
-                    Ok(store) => match store.adopt_snapshot(&required, anchor_seq, state_root) {
+                    // An empty store now holds exactly the snapshot: nothing to
+                    // reconcile, so only stamp the anchor.
+                    Ok(store) => match if outcome.store_was_empty {
+                        store
+                            .adopt_snapshot_into_empty_store(anchor_seq, state_root)
+                            .map(|()| 0)
+                    } else {
+                        let required: std::collections::BTreeSet<_> =
+                            outcome.required_nodes.iter().copied().collect();
+                        store.adopt_snapshot(&required, anchor_seq, state_root)
+                    } {
                         Ok(swept) => {
                             arc_backend.sync();
                             let _ = arc_backend.close();
@@ -1810,7 +1818,7 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
                                 "  → Ledger seq: {}, chunks: {}, nodes: {}, leftovers reclaimed: {}",
                                 manifest.ledger_seq,
                                 manifest.chunks.len(),
-                                required.len(),
+                                outcome.nodes_written,
                                 swept
                             );
                             true

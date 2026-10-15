@@ -113,6 +113,132 @@ pub fn logic_error(message: impl Into<String>) -> ! {
     panic_any(violation);
 }
 
+/// Payload mirroring C++ `std::overflow_error`.
+///
+/// rippled distinguishes overflow from other runtime failures at several
+/// consensus-relevant catch sites (OfferStream, BookStep::forEachOffer,
+/// AMMLiquidity, Vault transactors). Arithmetic that throws
+/// `std::overflow_error` in rippled must panic with this payload in quaxar so
+/// those sites can select the same branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverflowError(pub String);
+
+/// Payload mirroring C++ `std::runtime_error` when a site needs an explicit
+/// type. Untyped Rust panics (`panic!("...")`) are also classified as runtime
+/// errors; see [`exception_kind`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeError(pub String);
+
+impl fmt::Display for OverflowError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl Error for OverflowError {}
+
+impl fmt::Display for RuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl Error for RuntimeError {}
+
+/// `Throw<std::overflow_error>(message)`.
+pub fn throw_overflow(message: impl Into<String>) -> ! {
+    throw(OverflowError(message.into()))
+}
+
+/// `Throw<std::runtime_error>(message)`.
+pub fn throw_runtime(message: impl Into<String>) -> ! {
+    throw(RuntimeError(message.into()))
+}
+
+/// The C++ exception class a caught panic payload corresponds to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceptionKind {
+    /// `std::overflow_error` (a `std::runtime_error`).
+    Overflow,
+    /// `std::runtime_error` and its other subclasses (including
+    /// `FlowException`). Untyped string panics land here: quaxar's
+    /// string panics port rippled `Throw<std::runtime_error>` sites.
+    Runtime,
+    /// `std::logic_error` / `LogicError` contract violations.
+    Logic,
+}
+
+impl ExceptionKind {
+    /// `catch (std::overflow_error const&)`.
+    pub fn is_overflow(self) -> bool {
+        self == Self::Overflow
+    }
+
+    /// `catch (std::runtime_error const&)`: overflow_error derives from
+    /// runtime_error, so it matches too.
+    pub fn is_runtime(self) -> bool {
+        matches!(self, Self::Overflow | Self::Runtime)
+    }
+}
+
+/// Classify a caught panic payload by its C++ exception class.
+pub fn exception_kind(payload: &(dyn Any + Send)) -> ExceptionKind {
+    if payload.is::<OverflowError>() {
+        ExceptionKind::Overflow
+    } else if payload.is::<ContractViolation>() {
+        ExceptionKind::Logic
+    } else {
+        ExceptionKind::Runtime
+    }
+}
+
+/// `e.what()` for a caught panic payload.
+pub fn exception_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(error) = payload.downcast_ref::<OverflowError>() {
+        error.0.clone()
+    } else if let Some(error) = payload.downcast_ref::<RuntimeError>() {
+        error.0.clone()
+    } else if let Some(error) = payload.downcast_ref::<ContractViolation>() {
+        error.message().to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else {
+        "unknown exception".to_string()
+    }
+}
+
+/// Run `f`, returning the panic payload if it unwinds (`try { f() } catch (...)`).
+pub fn try_catch<T>(f: impl FnOnce() -> T) -> Result<T, Box<dyn Any + Send>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+}
+
+#[cfg(test)]
+mod exception_kind_tests {
+    use super::*;
+
+    #[test]
+    fn kinds_follow_the_cpp_exception_hierarchy() {
+        let overflow = try_catch(|| throw_overflow("Number::normalize 1")).unwrap_err();
+        let runtime = try_catch(|| throw_runtime("division by zero")).unwrap_err();
+        let untyped = try_catch(|| panic!("Native currency amount out of range")).unwrap_err();
+        let logic = try_catch(|| logic_error("broken")).unwrap_err();
+
+        assert_eq!(exception_kind(overflow.as_ref()), ExceptionKind::Overflow);
+        assert!(exception_kind(overflow.as_ref()).is_runtime());
+        assert_eq!(exception_kind(runtime.as_ref()), ExceptionKind::Runtime);
+        assert!(!exception_kind(runtime.as_ref()).is_overflow());
+        assert_eq!(exception_kind(untyped.as_ref()), ExceptionKind::Runtime);
+        assert_eq!(exception_kind(logic.as_ref()), ExceptionKind::Logic);
+        assert!(!exception_kind(logic.as_ref()).is_runtime());
+
+        assert_eq!(exception_message(overflow.as_ref()), "Number::normalize 1");
+        assert_eq!(
+            exception_message(untyped.as_ref()),
+            "Native currency amount out of range"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

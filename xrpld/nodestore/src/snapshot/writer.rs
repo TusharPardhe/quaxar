@@ -3,8 +3,9 @@
 //! The export uses a streaming two-pass approach that keeps peak memory at ~16 MB
 //! regardless of backend size:
 //!
-//! 1. First pass: iterate all nodes, compress into chunks, write chunk data to a
-//!    temporary file while accumulating only the per-chunk metadata (36 bytes each).
+//! 1. First pass: walk the ledger's two SHAMaps from their roots and write only
+//!    their leaves, in ascending key order, as compressed chunks to a temporary
+//!    file, accumulating only the per-chunk metadata (36 bytes each).
 //! 2. Second pass: write the final snapshot file (header + chunk table + chunk data
 //!    copied from temp file + footer), then atomically rename into place.
 //!
@@ -20,14 +21,11 @@ use std::sync::{
 };
 use std::time::Instant;
 
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use super::{SnapshotError, manifest::*};
-use crate::{Backend, NodeObject};
-
-/// Maximum `NodeObjectType` discriminant value that fits in a u8.
-/// The snapshot format stores node type as a single byte.
-const MAX_NODE_TYPE_U8: u32 = 255;
+use crate::Backend;
 
 /// Owned cooperative cancellation signal for a snapshot export task.
 ///
@@ -94,6 +92,187 @@ impl Drop for SnapshotTempFiles {
 ///
 /// The final file is written to a `.tmp` sibling path, then atomically renamed
 /// into place so a crash never leaves a partial file at `output_path`.
+/// Hash prefixes of stored SHAMap nodes (big-endian), as in `xrpl/shamap`.
+const HASH_PREFIX_INNER_NODE: u32 = 0x4D49_4E00;
+const HASH_PREFIX_LEAF_NODE: u32 = 0x4D4C_4E00;
+const HASH_PREFIX_TX_NODE: u32 = 0x534E_4400;
+const INNER_NODE_BYTES: usize = 4 + 16 * 32;
+
+/// A stored SHAMap node, parsed in place without allocation.
+enum StoredNode<'a> {
+    /// The 16 child hashes (all-zero = empty branch).
+    Inner(&'a [u8]),
+    /// Item key and payload.
+    Leaf { key: &'a [u8; 32], data: &'a [u8] },
+}
+
+/// Parse a prefix-serialized node as quaxar stores it: an inner node is
+/// `prefix || 16 child hashes`; a ledger leaf is `prefix || data || key`.
+fn parse_stored_node(bytes: &[u8]) -> Result<StoredNode<'_>, String> {
+    if bytes.len() < 4 {
+        return Err("node shorter than its hash prefix".to_owned());
+    }
+    let prefix = u32::from_be_bytes(bytes[..4].try_into().expect("4 bytes"));
+    match prefix {
+        HASH_PREFIX_INNER_NODE if bytes.len() == INNER_NODE_BYTES => Ok(StoredNode::Inner(&bytes[4..])),
+        HASH_PREFIX_INNER_NODE => Err(format!("inner node has {} bytes", bytes.len())),
+        HASH_PREFIX_LEAF_NODE | HASH_PREFIX_TX_NODE if bytes.len() >= 4 + 32 => {
+            let split = bytes.len() - 32;
+            Ok(StoredNode::Leaf {
+                key: bytes[split..].try_into().expect("32 bytes"),
+                data: &bytes[4..split],
+            })
+        }
+        other => Err(format!("unexpected node prefix {other:#010x}")),
+    }
+}
+
+fn fetch_node(backend: &dyn Backend, hash: &[u8; 32]) -> Result<std::sync::Arc<crate::NodeObject>, SnapshotError> {
+    let key = basics::base_uint::Uint256::from_array(*hash);
+    let (object, status) = backend.fetch(&key);
+    object.ok_or_else(|| SnapshotError::BackendTraversalFailed {
+        reason: format!("SHAMap node {key} missing from store ({status:?})"),
+    })
+}
+
+/// Visit the leaves of the subtree rooted at `root` in ascending key order.
+///
+/// Depth-first, children visited in branch order 0..15, which is ascending key
+/// order for a radix tree. The explicit stack holds at most 15 pending siblings
+/// per level, so memory is O(depth). A missing node fails the export (the
+/// anchor ledger must be fully present in the store).
+fn walk_leaves(
+    backend: &dyn Backend,
+    root: [u8; 32],
+    cancellation: Option<&SnapshotExportCancellation>,
+    visit: &mut dyn FnMut(&[u8; 32], &[u8]) -> Result<(), SnapshotError>,
+) -> Result<(), SnapshotError> {
+    if root == [0u8; 32] {
+        return Ok(());
+    }
+    let mut stack = vec![root];
+    let mut visited: u64 = 0;
+    while let Some(hash) = stack.pop() {
+        visited += 1;
+        if visited % 16_384 == 0 {
+            check_cancelled(cancellation)?;
+        }
+        let object = fetch_node(backend, &hash)?;
+        let parsed = parse_stored_node(object.data()).map_err(|reason| {
+            SnapshotError::BackendTraversalFailed {
+                reason: format!("SHAMap node {}: {reason}", basics::base_uint::Uint256::from_array(hash)),
+            }
+        })?;
+        match parsed {
+            StoredNode::Inner(children) => {
+                // Push in reverse so branch 0 is visited first.
+                for child in children.chunks_exact(32).rev() {
+                    if child.iter().any(|b| *b != 0) {
+                        stack.push(child.try_into().expect("32 bytes"));
+                    }
+                }
+            }
+            StoredNode::Leaf { key, data } => visit(key, data)?,
+        }
+    }
+    Ok(())
+}
+
+/// Split the export into independent segments, in output order: the state
+/// map's subtrees two levels below the root (up to 256, disjoint and in
+/// ascending key order), then the whole transaction map.
+fn plan_segments(
+    backend: &dyn Backend,
+    manifest: &SnapshotManifest,
+) -> Result<Vec<(u8, [u8; 32])>, SnapshotError> {
+    let mut segments = Vec::new();
+    if manifest.account_hash != [0u8; 32] {
+        split_subtree(backend, manifest.account_hash, 2, &mut segments)?;
+    }
+    if manifest.tx_hash != [0u8; 32] {
+        segments.push((LEAF_TAG_TRANSACTION, manifest.tx_hash));
+    }
+    Ok(segments)
+}
+
+/// Push the state-map subtrees `depth` levels below `hash`, in branch order.
+fn split_subtree(
+    backend: &dyn Backend,
+    hash: [u8; 32],
+    depth: usize,
+    segments: &mut Vec<(u8, [u8; 32])>,
+) -> Result<(), SnapshotError> {
+    if depth == 0 {
+        segments.push((LEAF_TAG_ACCOUNT_STATE, hash));
+        return Ok(());
+    }
+    let object = fetch_node(backend, &hash)?;
+    match parse_stored_node(object.data()) {
+        Ok(StoredNode::Inner(children)) => {
+            for child in children.chunks_exact(32) {
+                if child.iter().any(|b| *b != 0) {
+                    split_subtree(backend, child.try_into().expect("32 bytes"), depth - 1, segments)?;
+                }
+            }
+            Ok(())
+        }
+        // A leaf above the split depth is its own segment.
+        Ok(StoredNode::Leaf { .. }) => {
+            segments.push((LEAF_TAG_ACCOUNT_STATE, hash));
+            Ok(())
+        }
+        Err(reason) => Err(SnapshotError::BackendTraversalFailed {
+            reason: format!(
+                "SHAMap node {}: {reason}",
+                basics::base_uint::Uint256::from_array(hash)
+            ),
+        }),
+    }
+}
+
+/// One exported segment: its compressed chunks and their metadata, in order.
+struct SegmentOutput {
+    chunks: Vec<(Vec<u8>, ChunkMeta)>,
+    leaves: u64,
+}
+
+fn compress_chunk(raw: &[u8]) -> (Vec<u8>, ChunkMeta) {
+    let compressed = lz4_flex::block::compress_prepend_size(raw);
+    let sha256: [u8; 32] = Sha256::digest(&compressed).into();
+    let meta = ChunkMeta {
+        compressed_len: compressed.len() as u32,
+        sha256,
+    };
+    (compressed, meta)
+}
+
+/// Walk one segment and encode its leaves into compressed chunks.
+fn export_segment(
+    backend: &dyn Backend,
+    tag: u8,
+    root: [u8; 32],
+    cancellation: Option<&SnapshotExportCancellation>,
+) -> Result<SegmentOutput, SnapshotError> {
+    let mut out = SegmentOutput {
+        chunks: Vec::new(),
+        leaves: 0,
+    };
+    let mut buf: Vec<u8> = Vec::with_capacity(SNAPSHOT_CHUNK_UNCOMPRESSED_TARGET + 4096);
+    walk_leaves(backend, root, cancellation, &mut |key, data| {
+        encode_node_record(tag, key, data, &mut buf);
+        out.leaves += 1;
+        if buf.len() >= SNAPSHOT_CHUNK_UNCOMPRESSED_TARGET {
+            out.chunks.push(compress_chunk(&buf));
+            buf.clear();
+        }
+        Ok(())
+    })?;
+    if !buf.is_empty() {
+        out.chunks.push(compress_chunk(&buf));
+    }
+    Ok(out)
+}
+
 /// Export all nodes without a cancellation signal.
 ///
 /// This retains the historical behavior used by automatic exports.
@@ -146,106 +325,39 @@ fn export_snapshot_inner(
 
     // ─── Pass 1: stream nodes into compressed chunks on disk ─────────────────
 
+    // v2: write only the leaves of the ledger's two SHAMaps, in ascending key
+    // order (state map first, then the transaction map). Inner nodes are not
+    // exported; the loader rebuilds them and verifies the rebuilt roots.
+    //
+    // The walk is one random store lookup per node, so it is split into
+    // disjoint subtrees processed in parallel. Segments are handled in
+    // windows and written in segment order, so the file is deterministic and
+    // keys stay globally ascending; memory is bounded by one window of
+    // compressed segment output.
+    let segments = plan_segments(backend, manifest)?;
+    let window = (rayon::current_num_threads() * 2).max(1);
     let mut chunk_metas: Vec<ChunkMeta> = Vec::new();
-    let mut current_buf: Vec<u8> = Vec::with_capacity(SNAPSHOT_CHUNK_UNCOMPRESSED_TARGET + 4096);
     let mut node_count: u64 = 0;
     let mut total_compressed: u64 = 0;
-
-    // Closure to flush one chunk to the temp file
-    let flush_chunk = |buf: &mut Vec<u8>,
-                       metas: &mut Vec<ChunkMeta>,
-                       writer: &mut BufWriter<File>,
-                       total: &mut u64|
-     -> Result<(), SnapshotError> {
+    for batch in segments.chunks(window) {
         check_cancelled(cancellation)?;
-        if buf.is_empty() {
-            return Ok(());
-        }
-        let compressed = lz4_flex::block::compress_prepend_size(buf);
-        let hash: [u8; 32] = Sha256::digest(&compressed).into();
-        let compressed_len = compressed.len() as u32;
-        metas.push(ChunkMeta {
-            compressed_len,
-            sha256: hash,
-        });
-        writer
-            .write_all(&compressed)
-            .map_err(|e| SnapshotError::io("writing chunk to temp file", e))?;
-        check_cancelled(cancellation)?;
-        *total += compressed.len() as u64;
-        buf.clear();
-        Ok(())
-    };
-
-    // The callback itself cannot return a result, so capture serialization
-    // errors while the backend reports its own traversal failures directly.
-    let mut export_error: Option<SnapshotError> = None;
-
-    let traversal_result = backend.for_each_result(&mut |node: Arc<NodeObject>| {
-        if export_error.is_some() {
-            return; // Skip remaining nodes after an error
-        }
-        if let Err(error) = check_cancelled(cancellation) {
-            export_error = Some(error);
-            return;
-        }
-
-        let obj_type_u32 = node.object_type() as u32;
-        if obj_type_u32 > MAX_NODE_TYPE_U8 {
-            export_error = Some(SnapshotError::MalformedNodeRecord {
-                chunk_index: chunk_metas.len(),
-                offset: current_buf.len(),
-                reason: format!(
-                    "NodeObjectType discriminant {} exceeds u8 range; cannot encode in snapshot",
-                    obj_type_u32
-                ),
-            });
-            return;
-        }
-
-        encode_node_record(
-            obj_type_u32 as u8,
-            node.hash().data(),
-            node.data(),
-            &mut current_buf,
-        );
-        node_count += 1;
-
-        if current_buf.len() >= SNAPSHOT_CHUNK_UNCOMPRESSED_TARGET {
-            if let Err(e) = flush_chunk(
-                &mut current_buf,
-                &mut chunk_metas,
-                &mut chunks_writer,
-                &mut total_compressed,
-            ) {
-                export_error = Some(e);
-                return;
+        let outputs: Vec<Result<SegmentOutput, SnapshotError>> = batch
+            .par_iter()
+            .map(|(tag, root)| export_segment(backend, *tag, *root, cancellation))
+            .collect();
+        for output in outputs {
+            let output = output?;
+            node_count += output.leaves;
+            for (compressed, meta) in output.chunks {
+                chunks_writer
+                    .write_all(&compressed)
+                    .map_err(|e| SnapshotError::io("writing chunk to temp file", e))?;
+                total_compressed += compressed.len() as u64;
+                chunk_metas.push(meta);
             }
-            tracing::debug!(
-                target: "snapshot",
-                chunks_written = chunk_metas.len(),
-                nodes_so_far = node_count,
-                "Chunk flushed during export"
-            );
         }
-    });
-
-    // Check for errors captured during iteration
-    if let Some(e) = export_error {
-        let _ = fs::remove_file(&tmp_chunks_path);
-        return Err(e);
     }
-
-    traversal_result.map_err(|reason| SnapshotError::BackendTraversalFailed { reason })?;
     check_cancelled(cancellation)?;
-
-    // Flush remaining buffer
-    flush_chunk(
-        &mut current_buf,
-        &mut chunk_metas,
-        &mut chunks_writer,
-        &mut total_compressed,
-    )?;
 
     chunks_writer
         .flush()

@@ -277,7 +277,15 @@ impl TimerService {
     }
 
     fn stop(&self) {
-        self.stopped.store(true, Ordering::Release);
+        {
+            // Publish `stopped` while holding the timer mutex. The timer
+            // thread checks the flag under this mutex and then waits on the
+            // condvar, so setting it unlocked could land between that check
+            // and the wait: the notify would be lost and `join` below would
+            // hang forever (seen as intermittently hanging app tests).
+            let _state = self.state.0.lock().expect("acquisition timer lock");
+            self.stopped.store(true, Ordering::Release);
+        }
         self.state.1.notify_all();
         if let Some(thread) = self.thread.lock().expect("timer thread lock").take() {
             let _ = thread.join();

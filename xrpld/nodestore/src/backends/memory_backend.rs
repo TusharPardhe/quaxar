@@ -197,6 +197,18 @@ impl Backend for MemoryBackend {
         (results, Status::Ok)
     }
 
+    fn nodes_is_empty(&self) -> Option<bool> {
+        let database = self.database.lock().ok()?.clone()?;
+        let table_empty = database.table.lock().ok()?.is_empty();
+        let kv_nodes_empty = !database
+            .kv
+            .lock()
+            .ok()?
+            .keys()
+            .any(|(keyspace, _)| *keyspace == Keyspace::Nodes);
+        Some(table_empty && kv_nodes_empty)
+    }
+
     fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
         let database = self
             .database

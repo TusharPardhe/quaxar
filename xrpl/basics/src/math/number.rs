@@ -287,7 +287,9 @@ impl NumberParts {
             mantissa_range_max(scale),
             scale,
         )
-        .expect("NumberParts integer construction should not overflow")
+        .unwrap_or_else(|error| {
+            crate::core::contract::throw_overflow(format!("Number::normalize {error:?}"))
+        })
     }
 
     pub const fn isnormal(self, scale: MantissaScale) -> bool {
@@ -398,10 +400,14 @@ impl NumberParts {
         let mut mantissa = self.mantissa;
         let mut exponent = self.exponent;
 
+        // rippled Number::mantissa()/exponent(): an internal mantissa above
+        // kMaxRep is shown as m / 10 with exponent + 1. The XRPL_ASSERT that
+        // the dropped digit is zero only applies to normalized values (and is
+        // compiled out of release builds), so an unchecked value, such as the
+        // one STAmount::canonicalize builds from `divide`'s muldiv result,
+        // silently truncates its last digit. Testnet ledger 21511422 depends
+        // on this: an MPT partial payment delivered 122351071203038999.
         if mantissa > NUMBER_MAX_REP as u64 {
-            if !mantissa.is_multiple_of(10) {
-                return Err(NumberNormalizeError::RequiresRounding);
-            }
             mantissa /= 10;
             exponent = exponent
                 .checked_add(1)
@@ -1206,9 +1212,10 @@ impl Neg for NumberParts {
 
 impl AddAssign for NumberParts {
     fn add_assign(&mut self, rhs: Self) {
-        self.try_add_assign(rhs).expect(
-            "NumberParts addition should preserve the reference implementation overflow behavior",
-        );
+        // rippled Number arithmetic throws std::overflow_error.
+        if let Err(error) = self.try_add_assign(rhs) {
+            crate::core::contract::throw_overflow(format!("Number::operator+= {error:?}"));
+        }
     }
 }
 
@@ -1223,8 +1230,9 @@ impl Add for NumberParts {
 
 impl SubAssign for NumberParts {
     fn sub_assign(&mut self, rhs: Self) {
-        self.try_sub_assign(rhs)
-            .expect("NumberParts subtraction should preserve the reference implementation overflow behavior");
+        if let Err(error) = self.try_sub_assign(rhs) {
+            crate::core::contract::throw_overflow(format!("Number::operator-= {error:?}"));
+        }
     }
 }
 
@@ -1239,8 +1247,9 @@ impl Sub for NumberParts {
 
 impl MulAssign for NumberParts {
     fn mul_assign(&mut self, rhs: Self) {
-        self.try_mul_assign(rhs)
-            .expect("NumberParts multiplication should preserve the reference implementation overflow behavior");
+        if let Err(error) = self.try_mul_assign(rhs) {
+            crate::core::contract::throw_overflow(format!("Number::operator*= {error:?}"));
+        }
     }
 }
 
@@ -1255,9 +1264,9 @@ impl Mul for NumberParts {
 
 impl DivAssign for NumberParts {
     fn div_assign(&mut self, rhs: Self) {
-        self.try_div_assign(rhs).expect(
-            "NumberParts division should preserve the reference implementation overflow behavior",
-        );
+        if let Err(error) = self.try_div_assign(rhs) {
+            crate::core::contract::throw_overflow(format!("Number::operator/= {error:?}"));
+        }
     }
 }
 
@@ -2155,9 +2164,15 @@ mod tests {
                 .expect("large internal mantissa with trailing zero is exact"),
             (990_000_000_000_012_345, 1)
         );
+        // Unchecked over-range mantissa with a nonzero last digit: rippled
+        // truncates (m / 10, exponent + 1) rather than failing.
         assert_eq!(
             NumberParts::unchecked(true, 9_223_372_036_854_775_808, 0).external_parts(),
-            Err(NumberNormalizeError::RequiresRounding)
+            Ok((-922_337_203_685_477_580, 1))
+        );
+        assert_eq!(
+            NumberParts::unchecked(false, 12_235_107_120_303_899_955, -2).external_parts(),
+            Ok((1_223_510_712_030_389_995, -1))
         );
     }
 

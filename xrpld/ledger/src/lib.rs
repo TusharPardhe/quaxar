@@ -54,6 +54,7 @@ pub use domain::transaction_state_sf;
 pub use domain::trustline;
 pub use flow_sandbox::FlowSandbox;
 pub use history_runtime::history;
+pub use history_runtime::history::LedgerStoreLoader;
 pub use history_runtime::history_fetch;
 pub use history_runtime::history_fill;
 pub use history_runtime::history_sync;

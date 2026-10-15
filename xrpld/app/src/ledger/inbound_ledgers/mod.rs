@@ -21,6 +21,7 @@ mod coordinator_ports;
 mod read_broker;
 mod registry;
 mod scheduler;
+pub(crate) mod trusted_baseline;
 pub(crate) mod wire_ledger_node;
 mod worker_pool;
 
@@ -124,4 +125,10 @@ impl<C> InboundLedgersLocal<C> {
             .map(|(k, _)| *k)?;
         self.ledgers.remove(&key)
     }
+}
+
+/// Inner nodes whose loaded children were released once their subtree was
+/// durable (children-first release during acquisition).
+pub fn durable_release_count() -> u64 {
+    coordinator_engine::durable_release_count()
 }

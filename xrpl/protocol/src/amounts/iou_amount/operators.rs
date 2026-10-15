@@ -6,9 +6,7 @@ use super::{IOUAmount, mul_ratio};
 
 impl AddAssign for IOUAmount {
     fn add_assign(&mut self, rhs: Self) {
-        self.checked_add_assign(rhs).expect(
-            "IOUAmount addition should preserve the reference implementation overflow behavior",
-        );
+        self.checked_add_assign(rhs).unwrap_or_else(|_| basics::contract::throw_overflow("IOUAmount addition should preserve the reference implementation overflow behavior"));
     }
 }
 
@@ -23,9 +21,7 @@ impl Add for IOUAmount {
 
 impl SubAssign for IOUAmount {
     fn sub_assign(&mut self, rhs: Self) {
-        self.checked_sub_assign(rhs).expect(
-            "IOUAmount subtraction should preserve the reference implementation overflow behavior",
-        );
+        self.checked_sub_assign(rhs).unwrap_or_else(|_| basics::contract::throw_overflow("IOUAmount subtraction should preserve the reference implementation overflow behavior"));
     }
 }
 
@@ -48,7 +44,7 @@ impl Mul<i64> for IOUAmount {
             1,
             get_rounding_mode() == RoundingMode::Upward,
         )
-        .expect("IOUAmount multiplication overflow");
+        .unwrap_or_else(|_| basics::contract::throw_overflow("IOUAmount multiplication overflow"));
         if rhs < 0 {
             result = -result;
         }
@@ -72,7 +68,7 @@ impl Div<i64> for IOUAmount {
             rhs.unsigned_abs() as u32,
             get_rounding_mode() == RoundingMode::Upward,
         )
-        .expect("IOUAmount division overflow");
+        .unwrap_or_else(|_| basics::contract::throw_overflow("IOUAmount division overflow"));
         if rhs < 0 {
             result = -result;
         }

@@ -127,6 +127,10 @@ pub struct PeerImp {
     endpoint_accept_after: Mutex<Option<Instant>>,
     recent_endpoints: Mutex<HashMap<SocketAddr, RecentEndpoint>>,
     listener_check: Mutex<ListenerCheckState>,
+    /// Charges applied to this peer, recorded for tests only. rippled's
+    /// `PeerImp::charge` keeps nothing: the resource manager holds one
+    /// decaying balance per peer. Production builds compile this out.
+    #[cfg(any(test, feature = "charge-capture"))]
     charges: Mutex<Vec<(Charge, String)>>,
     squelch: Mutex<Squelch>,
     /// Set when a non-droppable message cannot enter the bounded send queue.
@@ -273,6 +277,7 @@ impl PeerImp {
                 can_accept: true,
                 in_progress: false,
             }),
+            #[cfg(any(test, feature = "charge-capture"))]
             charges: Mutex::new(Vec::new()),
             squelch: Mutex::new(Squelch::new(Arc::new(SystemClock))),
             disconnect_requested: AtomicBool::new(false),
@@ -670,6 +675,7 @@ impl PeerImp {
     }
 
     /// Returns a snapshot of resource charges applied through `Peer::charge`.
+    #[cfg(any(test, feature = "charge-capture"))]
     pub fn charges(&self) -> Vec<(Charge, String)> {
         self.charges.lock().expect("peer charges lock").clone()
     }
@@ -1057,6 +1063,7 @@ impl Peer for PeerImp {
     fn charge(&self, fee: Charge, context: String) {
         // Retain the local diagnostic snapshot used by existing callers and
         // tests, but make the Resource Manager disposition authoritative.
+        #[cfg(any(test, feature = "charge-capture"))]
         self.charges
             .lock()
             .expect("peer charges lock")

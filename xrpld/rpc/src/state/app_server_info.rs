@@ -2164,6 +2164,16 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
         let Some(app) = self.view.app() else {
             return;
         };
+        let (curve, samples, knee) = shamap::access_mrc::snapshot(0.03);
+        json.insert(
+            "treenode_mrc".to_owned(),
+            JsonValue::String(basics::sync::shards::format_curve(&curve)),
+        );
+        json.insert("treenode_mrc_samples".to_owned(), JsonValue::Unsigned(samples));
+        json.insert(
+            "treenode_mrc_knee_entries".to_owned(),
+            JsonValue::Unsigned(knee.unwrap_or(0)),
+        );
         let memory = shamap::tree_node::shamap_memory_stats();
         for (name, value) in [
             ("shamap_allocated_inner_nodes", memory.allocated_inner_nodes),
@@ -2183,6 +2193,14 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
             app::NodeSizeResourceProfile::for_node_size(app.status_rpc_node_size().as_deref());
         json.insert(
             "treenode_cache_target_size".to_owned(),
+            JsonValue::Unsigned(
+                app.shared_tree_cache()
+                    .map_or(profile.tree_cache_size, |cache| cache.target_size())
+                    as u64,
+            ),
+        );
+        json.insert(
+            "treenode_cache_configured_size".to_owned(),
             JsonValue::Unsigned(profile.tree_cache_size as u64),
         );
         json.insert(

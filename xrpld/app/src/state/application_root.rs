@@ -10425,6 +10425,7 @@ impl ApplicationRoot {
 
     /// State and transaction tree roots of every ledger this node holds:
     /// closed, validated and the ledger history cache (diagnostics).
+
     pub fn held_ledger_tree_roots(
         &self,
     ) -> Vec<basics::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>> {

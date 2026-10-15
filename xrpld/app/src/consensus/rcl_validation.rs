@@ -216,6 +216,10 @@ impl ValidationsLedger for RclValidatedLedger {
     }
 }
 
+/// Sequences kept in the adaptor's recent-ledger map: the skip-list span,
+/// well beyond the validation freshness windows.
+pub const REGISTERED_LEDGER_WINDOW: u32 = 256;
+
 pub struct RclValidationsAdaptor {
     ledgers: parking_lot::Mutex<std::collections::HashMap<Uint256, RclValidatedLedger>>,
     now: Arc<dyn Fn() -> NetClockTimePoint + Send + Sync>,
@@ -250,8 +254,29 @@ impl RclValidationsAdaptor {
     }
 
     pub fn register_ledger(&self, ledger: &Ledger) {
-        let wrapped = RclValidatedLedger::from_ledger(ledger);
-        self.ledgers.lock().insert(wrapped.id(), wrapped);
+        self.register_validated_ledger(RclValidatedLedger::from_ledger(ledger));
+    }
+
+    fn register_validated_ledger(&self, wrapped: RclValidatedLedger) {
+        let mut ledgers = self.ledgers.lock();
+        let newest = ledgers
+            .values()
+            .map(|known| known.ledger_seq)
+            .max()
+            .unwrap_or(0)
+            .max(wrapped.ledger_seq);
+        ledgers.insert(wrapped.id(), wrapped);
+        // rippled's RCLValidationsAdaptor keeps no ledger map: `acquire`
+        // asks LedgerMaster, which reloads from the store. This map is only a
+        // fast path for recently built/acquired ledgers. Each entry owns a
+        // 256-hash ancestor array (8 KB); unbounded it grew by every ledger.
+        ledgers.retain(|_, known| {
+            known.ledger_seq.saturating_add(REGISTERED_LEDGER_WINDOW) >= newest
+        });
+    }
+
+    pub fn registered_ledger_count(&self) -> usize {
+        self.ledgers.lock().len()
     }
 
     pub fn unregister_ledger(&self, hash: Uint256) -> bool {
@@ -525,6 +550,26 @@ mod tests {
         assert_eq!(ledger.ancestor(8), Uint256::from_u64(8));
         assert_eq!(ledger.ancestor(9), Uint256::from_u64(9));
         assert_eq!(ledger.ancestor(10), Uint256::from_u64(10));
+    }
+
+    #[test]
+    fn registered_ledger_map_keeps_only_the_recent_window() {
+        let adaptor = RclValidationsAdaptor::new(|| NetClockTimePoint::new(1000));
+        for seq in 1..=2_000u32 {
+            adaptor.register_validated_ledger(RclValidatedLedger {
+                ledger_id: Uint256::from_u64(u64::from(seq)),
+                ledger_seq: seq,
+                ancestors: Arc::new(vec![Uint256::from_u64(u64::from(seq) - 1)]),
+            });
+        }
+        assert_eq!(
+            adaptor.registered_ledger_count(),
+            REGISTERED_LEDGER_WINDOW as usize + 1
+        );
+        let newest = Uint256::from_u64(2_000);
+        let oldest_kept = Uint256::from_u64(u64::from(2_000 - REGISTERED_LEDGER_WINDOW));
+        assert!(consensus::rcl_support::ValidationsAdaptor::acquire(&adaptor, &newest).is_some());
+        assert!(consensus::rcl_support::ValidationsAdaptor::acquire(&adaptor, &oldest_kept).is_some());
     }
 
     #[test]

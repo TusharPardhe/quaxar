@@ -27,12 +27,14 @@
 //! │
 //! ├── Chunk Data (chunk_count variable-length blobs)
 //! │   For each chunk (compressed bytes, in order):
-//! │   └── <compressed_len bytes of lz4-compressed node records>
-//! │       Each record:
-//! │       ├── node_type:    u8   (NodeObjectType discriminant)
-//! │       ├── hash:         [u8; 32]
+//! │   └── <compressed_len bytes of lz4-compressed leaf records>
+//! │       Each record (v2): all account-state leaves in ascending key
+//! │       order, then all transaction leaves in ascending key order.
+//! │       ├── map_tag:      u8   (3 = account state, 4 = transaction)
+//! │       ├── key:          [u8; 32]  (SHAMap item key)
 //! │       ├── data_len:     varint (base-127 little-endian)
-//! │       └── data:         [u8; data_len]
+//! │       └── data:         [u8; data_len]  (SHAMap item payload)
+//! │       Inner nodes are not stored; the loader rebuilds them.
 //! │
 //! └── Footer (SNAPSHOT_FOOTER_SIZE bytes)
 //!     └── file_sha256:      [u8; 32]  (sha256 of all bytes before the footer)
@@ -43,10 +45,23 @@
 pub const SNAPSHOT_MAGIC: &[u8; 8] = b"xrpls\x00\x01\x00";
 
 /// Highest snapshot format version this binary can read.
-pub const SNAPSHOT_MAX_VERSION: u16 = 1;
+pub const SNAPSHOT_MAX_VERSION: u16 = 2;
 
 /// Current format version written by this binary.
-pub const SNAPSHOT_VERSION: u16 = 1;
+///
+/// v2 stores only the leaves of the ledger's two SHAMaps, sorted by key; the
+/// loader rebuilds every inner node and verifies the rebuilt roots against
+/// `account_hash` / `tx_hash`. v1 (every stored node) is no longer readable.
+pub const SNAPSHOT_VERSION: u16 = 2;
+
+/// Record tag for an account-state leaf (the `NodeObjectType::AccountNode`
+/// discriminant). In v2 the record's 32-byte field is the leaf key and its data
+/// is the item payload.
+pub const LEAF_TAG_ACCOUNT_STATE: u8 = 3;
+
+/// Record tag for a transaction-with-metadata leaf
+/// (`NodeObjectType::TransactionNode`).
+pub const LEAF_TAG_TRANSACTION: u8 = 4;
 
 /// Target uncompressed size of each data chunk (8 MiB).
 /// The last chunk may be smaller.

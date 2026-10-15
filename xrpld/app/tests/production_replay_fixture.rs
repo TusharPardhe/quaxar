@@ -166,6 +166,51 @@ fn testnet_21427256_batch_account_delete_matches_network() {
     );
 }
 
+/// Testnet fork at 21534114 (2026-10-14): a FillOrKill OfferCreate (tx index
+/// 44, tecKILLED) consumed a partially funded XRP offer to zero in its first
+/// liquidity pass. On the next pass rippled's OfferStream compares the owner's
+/// funds with the strand's `afView` (the flow sandbox including the first
+/// pass), finds them equal, and permanently removes the offer; the killed
+/// transaction then deletes it. quaxar compared against the transaction's
+/// pristine view, kept the offer, and forked.
+#[test]
+fn testnet_21534114_fill_or_kill_removes_offer_unfunded_by_earlier_pass() {
+    run_sparse_replay(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21534114_fok_unfunded_offer.jsonl"),
+    );
+}
+
+/// Testnet fork at 21540882 (2026-10-14): a tfSell|tfImmediateOrCancel
+/// OfferCreate (tx index 8) sold RLUSD across nine liquidity passes. rippled
+/// records every trust-line transfer in the PaymentSandbox deferred-credit
+/// table and `accountHolds` bounds the taker's spendable balance by
+/// `origBalance - sum(debits)`; on the last pass that is 446.436933219075,
+/// 5e-13 below the line balance. quaxar recorded no IOU deferred credits,
+/// spent the full line balance, and left the issuer-owned offer one ulp
+/// smaller.
+#[test]
+fn testnet_21540882_spendable_balance_uses_deferred_debits() {
+    run_sparse_replay(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21540882_deferred_credit_balance.jsonl"),
+    );
+}
+
+/// Testnet fork at 21558891 (2026-10-15): a CheckCash with DeliverMin where
+/// the casher is the PCH issuer (tx index 9). Before fixCleanup3_4_0 rippled
+/// waives the high limit of the check writer's line to the issuer, so flow
+/// redeems the writer's 1 PCH and then issues 5 more of the writer's own IOU,
+/// delivering the full 6 PCH SendMax. quaxar applied no waiver for an issuer
+/// casher, delivered 1 PCH and forked.
+#[test]
+fn testnet_21558891_issuer_cashing_check_waives_limit_before_fix_cleanup_3_4_0() {
+    run_sparse_replay(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21558891_issuer_cashes_check.jsonl"),
+    );
+}
+
 fn run_sparse_replay(path: PathBuf) {
     let rendered = path.to_string_lossy();
     assert!(

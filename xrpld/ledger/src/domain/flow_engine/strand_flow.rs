@@ -279,6 +279,20 @@ pub fn execute_strands<V: ApplyView>(
 
         active_order = next_order;
 
+        // rippled StrandFlow: once the pass is applied, delete every offer
+        // the pass marked for removal (`ofrsToRm`) from the flow sandbox,
+        // even when the strand that found it was dry.
+        if let Some(cancellation) = self_cross_cancellation.as_ref() {
+            let ter = cancellation.delete_iteration_offers(&mut aggregate);
+            if ter != Ter::TES_SUCCESS {
+                return FlowResult {
+                    ter,
+                    actual_in: total_in.zeroed(),
+                    actual_out: total_out.zeroed(),
+                };
+            }
+        }
+
         if !applied || offers_considered >= MAX_OFFERS_TO_CONSIDER {
             break;
         }
@@ -416,6 +430,24 @@ fn execute_single_strand<V: ApplyView>(
         });
     };
     // `dry_sandbox` was deliberately dropped without `apply`.
+
+    // rippled compares owner funds against `afView`, this strand's parent.
+    if let Some(cancellation) = context.self_cross_cancellation.as_ref() {
+        let ter = cancellation.resolve_funding_against(parent);
+        if ter != Ter::TES_SUCCESS {
+            return Err(ter);
+        }
+    }
+    // The replay steps the same offers; its observations were resolved above.
+    struct ClearOnExit(Option<SelfCrossCancellation>);
+    impl Drop for ClearOnExit {
+        fn drop(&mut self) {
+            if let Some(cancellation) = self.0.as_ref() {
+                cancellation.clear_funding_sensitive();
+            }
+        }
+    }
+    let _clear_replay_observations = ClearOnExit(context.self_cross_cancellation.clone());
 
     offer_usage.set(0);
     let mut final_sandbox = FlowSandbox::new(parent);

@@ -486,3 +486,26 @@ fn ledger_history_fix_gaps_backfills_ranges_and_clears_fill_flag() {
     assert!(state.complete_ledgers.contains(12));
     assert_eq!(state.fetch_state.fill_in_progress, 0);
 }
+
+#[test]
+fn sweep_bounds_built_and_validated_bookkeeping_like_rippled() {
+    // rippled's consensusValidated_ is a 64-entry, 5-minute TaggedCache.
+    // quaxar's map grew by one entry per ledger forever (found by heap
+    // profiling a testnet node: LedgerHistory::built_ledger rose steadily).
+    let history = LedgerHistory::new(32, Duration::seconds(60), ManualClock::new(0));
+    for seq in 1..=1_000u32 {
+        history.built_ledger(
+            immutable_ledger(seq, (seq % 250) as u8 + 1),
+            basics::base_uint::Uint256::zero(),
+            protocol::JsonValue::Null,
+        );
+        history.sweep();
+    }
+    assert!(
+        history.consensus_validated_len() <= ledger::history::CONSENSUS_VALIDATED_RETAINED as usize,
+        "{} entries retained",
+        history.consensus_validated_len()
+    );
+    assert!(history.consensus_entry(1_000).is_some());
+    assert!(history.consensus_entry(1).is_none());
+}

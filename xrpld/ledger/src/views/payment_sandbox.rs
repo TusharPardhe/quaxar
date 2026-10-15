@@ -164,11 +164,18 @@ impl DeferredCredits {
     }
 
     pub(crate) fn apply(&self, to: &mut DeferredCredits) {
+        // rippled DeferredCredits::apply: emplace, and only when the key already
+        // exists add this level's debits (the original balance stays).
         for (key, value) in &self.credits_iou {
-            let to_entry = to.credits_iou.entry(*key).or_insert_with(|| value.clone());
-            if to_entry != value {
-                to_entry.low_acct_credits += value.low_acct_credits.clone();
-                to_entry.high_acct_credits += value.high_acct_credits.clone();
+            match to.credits_iou.entry(*key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(value.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let to_entry = slot.get_mut();
+                    to_entry.low_acct_credits += value.low_acct_credits.clone();
+                    to_entry.high_acct_credits += value.high_acct_credits.clone();
+                }
             }
         }
         for (mpt_id, value) in &self.credits_mpt {
@@ -195,32 +202,51 @@ impl DeferredCredits {
         }
     }
 
-    pub(crate) fn balance_iou(
+    /// rippled `DeferredCredits::adjustmentsIOU(main, other, currency)`.
+    pub(crate) fn adjustment_iou(
         &self,
-        account: AccountID,
-        issuer: AccountID,
-        mut amount: STAmount,
-    ) -> STAmount {
-        let key = Self::make_key_iou(account, issuer, amount.issue().currency);
-        if let Some(entry) = self.credits_iou.get(&key) {
-            let (debits, original_balance) = if account < issuer {
-                (
-                    entry.low_acct_credits.clone(),
-                    entry.low_acct_orig_balance.clone(),
-                )
-            } else {
-                let mut original_balance = entry.low_acct_orig_balance.clone();
-                original_balance.negate();
-                (entry.high_acct_credits.clone(), original_balance)
-            };
-            amount = amount
-                .min(original_balance.clone() - debits)
-                .min(original_balance);
-            if issuer == protocol::xrp_account() && amount.signum() < 0 {
-                amount = amount.zeroed();
+        main: AccountID,
+        other: AccountID,
+        currency: Currency,
+    ) -> Option<crate::read_view::DeferredIouAdjustment> {
+        let entry = self
+            .credits_iou
+            .get(&Self::make_key_iou(main, other, currency))?;
+        Some(if main < other {
+            crate::read_view::DeferredIouAdjustment {
+                debits: entry.low_acct_credits.clone(),
+                orig_balance: entry.low_acct_orig_balance.clone(),
             }
+        } else {
+            let mut orig_balance = entry.low_acct_orig_balance.clone();
+            orig_balance.negate();
+            crate::read_view::DeferredIouAdjustment {
+                debits: entry.high_acct_credits.clone(),
+                orig_balance,
+            }
+        })
+    }
+
+    /// Replays this table into a parent through the public credit hook with
+    /// rippled `DeferredCredits::apply` semantics: one low-side call (which
+    /// creates a missing parent entry with this level's original balance)
+    /// followed by one high-side call, each carrying this level's summed
+    /// debits rather than the individual credits.
+    pub(crate) fn merge_iou_into<F>(&self, mut credit: F)
+    where
+        F: FnMut(AccountID, AccountID, STAmount, STAmount),
+    {
+        for ((low, high, _currency), value) in &self.credits_iou {
+            credit(
+                *low,
+                *high,
+                value.low_acct_credits.clone(),
+                value.low_acct_orig_balance.clone(),
+            );
+            let mut high_orig = value.low_acct_orig_balance.clone();
+            high_orig.negate();
+            credit(*high, *low, value.high_acct_credits.clone(), high_orig);
         }
-        amount
     }
 
     pub(crate) fn balance_mpt(&self, account: AccountID, issue: MPTIssue, amount: i64) -> i64 {
@@ -248,6 +274,42 @@ impl DeferredCredits {
             .min(entry.orig_balance.wrapping_sub(entry.self_debit as i64))
             .max(0)
     }
+}
+
+/// rippled `PaymentSandbox::balanceHookIOU`: fold the deferred adjustments of
+/// every nested payment-sandbox level (innermost first) and bound the
+/// spendable balance once by `min(amount, lastBal - delta, minBal)`.
+pub(crate) fn deferred_iou_balance(
+    issuer: AccountID,
+    amount: STAmount,
+    adjustments: &[crate::read_view::DeferredIouAdjustment],
+) -> STAmount {
+    let mut delta = amount.zeroed();
+    let mut last_bal = amount.clone();
+    let mut min_bal = amount.clone();
+    for adjustment in adjustments {
+        delta += adjustment.debits.clone();
+        last_bal = adjustment.orig_balance.clone();
+        if last_bal < min_bal {
+            min_bal = last_bal.clone();
+        }
+    }
+    // std::min({amount, lastBal - delta, minBal}) keeps the first smallest.
+    let bounded = last_bal - delta;
+    let mut adjusted = amount.clone();
+    if bounded < adjusted {
+        adjusted = bounded;
+    }
+    if min_bal < adjusted {
+        adjusted = min_bal;
+    }
+    if !adjusted.native() {
+        adjusted.set_issuer(amount.issue().account);
+    }
+    if issuer == protocol::xrp_account() && adjusted.signum() < 0 {
+        adjusted = adjusted.zeroed();
+    }
+    adjusted
 }
 
 #[derive(Debug)]
@@ -334,10 +396,30 @@ where
         &self,
         account: AccountID,
         issuer: AccountID,
-        mut amount: STAmount,
+        amount: STAmount,
     ) -> STAmount {
-        amount = self.tab.balance_iou(account, issuer, amount);
-        self.base.balance_hook_iou(account, issuer, amount)
+        let mut adjustments = Vec::new();
+        self.collect_deferred_iou_adjustments(
+            account,
+            issuer,
+            amount.issue().currency,
+            &mut adjustments,
+        );
+        deferred_iou_balance(issuer, amount, &adjustments)
+    }
+
+    fn collect_deferred_iou_adjustments(
+        &self,
+        account: AccountID,
+        issuer: AccountID,
+        currency: Currency,
+        out: &mut Vec<crate::read_view::DeferredIouAdjustment>,
+    ) {
+        if let Some(adjustment) = self.tab.adjustment_iou(account, issuer, currency) {
+            out.push(adjustment);
+        }
+        self.base
+            .collect_deferred_iou_adjustments(account, issuer, currency, out);
     }
 
     fn balance_hook_mpt(&self, account: AccountID, issue: MPTIssue, mut amount: i64) -> STAmount {
