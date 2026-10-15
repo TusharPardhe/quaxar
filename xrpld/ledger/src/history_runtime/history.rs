@@ -37,6 +37,12 @@ use time::Duration;
 pub trait LedgerStoreLoader: Send + Sync + std::fmt::Debug {
     fn load_by_hash(&self, hash: SHAMapHash) -> Option<Ledger>;
     fn load_by_index(&self, seq: u32) -> Option<Ledger>;
+    /// Read a ledger's transactions and metadata, fetching tx-tree nodes that
+    /// are not resident from the node store. rippled's handleMismatch reads
+    /// both maps through the backed family the same way.
+    fn tx_snapshot(&self, _ledger: &Ledger) -> Option<Vec<crate::LedgerTxRead>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -71,6 +77,8 @@ pub struct LedgerHistory<C = MonotonicClock, S = HardenedHashBuilder> {
     consensus_validated: Mutex<BTreeMap<u32, ConsensusValidatedEntry>>,
     mismatch_count: AtomicU64,
     mismatches: Mutex<Vec<LedgerHistoryMismatch>>,
+    /// Store-backed reader for mismatch analysis of non-resident ledgers.
+    store_loader: std::sync::OnceLock<std::sync::Arc<dyn LedgerStoreLoader>>,
 }
 
 impl<C> LedgerHistory<C, HardenedHashBuilder>
@@ -94,6 +102,7 @@ where
             consensus_validated: Mutex::new(BTreeMap::new()),
             mismatch_count: AtomicU64::new(0),
             mismatches: Mutex::new(Vec::new()),
+            store_loader: std::sync::OnceLock::new(),
         }
     }
 
@@ -538,6 +547,18 @@ where
     /// the network-validated ledger for the same sequence differ, log why.
     /// This is the record that pinpoints a fork: the first transaction whose
     /// result or metadata differs.
+    /// Install the store-backed reader used by mismatch analysis.
+    pub fn set_store_loader(&self, loader: std::sync::Arc<dyn LedgerStoreLoader>) -> bool {
+        self.store_loader.set(loader).is_ok()
+    }
+
+    fn tx_snapshot_for_mismatch(&self, ledger: &Ledger) -> Option<Vec<crate::LedgerTxRead>> {
+        ledger
+            .tx_snapshot()
+            .ok()
+            .or_else(|| self.store_loader.get()?.tx_snapshot(ledger))
+    }
+
     fn handle_mismatch(&self, m: &LedgerHistoryMismatch) {
         let built = self.ledgers_by_hash.fetch(&m.built);
         let valid = self.ledgers_by_hash.fetch(&m.validated);
@@ -570,8 +591,13 @@ where
                 seq = m.seq, tx_set = %b, "MISMATCH with same consensus transaction set"),
             _ => {}
         }
-        let (Ok(built_txs), Ok(valid_txs)) = (built.tx_snapshot(), valid.tx_snapshot()) else {
+        let built_txs = self.tx_snapshot_for_mismatch(&built);
+        let valid_txs = self.tx_snapshot_for_mismatch(&valid);
+        let (Some(built_txs), Some(valid_txs)) = (built_txs, valid_txs) else {
             tracing::error!(target: "ledger_history", seq = m.seq,
+                built_readable = built.tx_snapshot().is_ok(),
+                valid_readable = valid.tx_snapshot().is_ok(),
+                loader = self.store_loader.get().is_some(),
                 "MISMATCH transaction maps unreadable");
             return;
         };

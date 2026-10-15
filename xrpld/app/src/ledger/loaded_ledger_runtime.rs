@@ -210,6 +210,10 @@ impl AppLedgerStoreLoader {
 }
 
 impl ledger::LedgerStoreLoader for AppLedgerStoreLoader {
+    fn tx_snapshot(&self, ledger: &Ledger) -> Option<Vec<ledger::LedgerTxRead>> {
+        ledger.tx_snapshot_with_family(&self.family).ok()
+    }
+
     fn load_by_hash(&self, hash: SHAMapHash) -> Option<Ledger> {
         Ledger::load_by_hash_with_provider_and_config_or_none(
             hash,

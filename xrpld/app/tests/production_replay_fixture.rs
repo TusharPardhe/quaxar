@@ -197,6 +197,20 @@ fn testnet_21540882_spendable_balance_uses_deferred_debits() {
     );
 }
 
+/// Testnet fork at 21558891 (2026-10-15): a CheckCash with DeliverMin where
+/// the casher is the PCH issuer (tx index 9). Before fixCleanup3_4_0 rippled
+/// waives the high limit of the check writer's line to the issuer, so flow
+/// redeems the writer's 1 PCH and then issues 5 more of the writer's own IOU,
+/// delivering the full 6 PCH SendMax. quaxar applied no waiver for an issuer
+/// casher, delivered 1 PCH and forked.
+#[test]
+fn testnet_21558891_issuer_cashing_check_waives_limit_before_fix_cleanup_3_4_0() {
+    run_sparse_replay(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21558891_issuer_cashes_check.jsonl"),
+    );
+}
+
 fn run_sparse_replay(path: PathBuf) {
     let rendered = path.to_string_lossy();
     assert!(

@@ -300,6 +300,8 @@ where
     /// Install the store fallback used when a ledger is not cached. The
     /// first installation wins.
     pub fn set_store_loader(&self, loader: Arc<dyn crate::LedgerStoreLoader>) -> bool {
+        self.ledger_history
+            .set_store_loader(std::sync::Arc::clone(&loader));
         self.store_loader.set(loader).is_ok()
     }
 
