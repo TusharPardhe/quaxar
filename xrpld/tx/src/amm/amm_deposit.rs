@@ -425,7 +425,7 @@ pub fn run_amm_deposit_apply_math_facts(
                 None,
                 false,
             );
-        
+
         })
         .unwrap_or_else(|payload| {
             tracing::error!(

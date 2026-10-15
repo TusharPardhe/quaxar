@@ -408,7 +408,7 @@ pub fn run_amm_withdraw_apply_math_facts(
                 return Err(Ter::TEC_AMM_FAILED);
             }
             return finalize_withdraw_math(facts, amount1, Some(amount2), tokens, is_withdraw_all);
-        
+
         })
         .unwrap_or_else(|payload| {
             tracing::error!(
