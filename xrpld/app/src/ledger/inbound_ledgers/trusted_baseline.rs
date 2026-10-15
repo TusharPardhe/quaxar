@@ -268,10 +268,6 @@ pub(crate) fn retire(reason: &'static str) -> Option<TrustedBaselineStats> {
     Some(stats)
 }
 
-/// Current baseline counters (also after retirement is not retained).
-pub fn stats() -> Option<TrustedBaselineStats> {
-    slot().read().ok().and_then(|guard| guard.as_ref().map(|b| b.stats()))
-}
 
 #[cfg(test)]
 pub(crate) fn clear_for_test() {

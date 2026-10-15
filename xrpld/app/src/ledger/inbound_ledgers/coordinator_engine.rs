@@ -67,7 +67,7 @@ type AppFamily = SHAMapFamily<
 /// TreeNodeCache or NodeStore through the parent's child hashes. This bounds
 /// acquisition memory by the in-flight frontier instead of the whole tree.
 fn release_durable_complete_subtree(node: &SharedIntrusive<SHAMapTreeNode>) {
-    if node.is_inner() && node.cowid() == 0 && durable_release_enabled() {
+    if node.is_inner() && node.cowid() == 0 {
         node.release_loaded_children();
         DURABLE_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -80,11 +80,6 @@ pub(crate) fn durable_release_count() -> u64 {
     DURABLE_RELEASES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `QUAXAR_DURABLE_RELEASE=0` disables the release (A/B measurement).
-fn durable_release_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("QUAXAR_DURABLE_RELEASE").map_or(true, |v| v != "0"))
-}
 
 /// Resident lookup over the shared caches and the fetch-pack, matching the
 /// actor's `ActorResident` semantics plus rippled `checkLocal`'s by-hash

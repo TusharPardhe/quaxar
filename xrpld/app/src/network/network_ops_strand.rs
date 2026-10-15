@@ -2818,18 +2818,8 @@ fn trace_completed_inbound_handoff(
     );
 }
 
-/// Ledgers between trims of the resident state tree
-/// (`QUAXAR_RESIDENT_TRIM_INTERVAL`, default 64).
-fn resident_trim_interval() -> u32 {
-    static INTERVAL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *INTERVAL.get_or_init(|| {
-        std::env::var("QUAXAR_RESIDENT_TRIM_INTERVAL")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(64)
-    })
-}
+/// Ledgers between trims of the resident state tree.
+const RESIDENT_TRIM_INTERVAL: u32 = 64;
 /// How far behind the validated ledger the trimmed ledger is. Every node of a
 /// ledger this old was flushed to the NodeStore when it was built or acquired,
 /// and an old node's children are themselves old, so dropping them can only
@@ -2850,7 +2840,7 @@ fn trim_resident_ledger_tree(root: &ApplicationRoot, last_trim_seq: &mut u32) {
     let Some(validated) = root.validated_ledger_seq() else {
         return;
     };
-    if validated < last_trim_seq.saturating_add(resident_trim_interval()) {
+    if validated < last_trim_seq.saturating_add(RESIDENT_TRIM_INTERVAL) {
         return;
     }
     let Some(lm_rt) = root.ledger_master_runtime() else {

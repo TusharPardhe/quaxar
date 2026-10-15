@@ -334,7 +334,6 @@ where
         // logged and answered with rpcINTERNAL. Contain handler panics the
         // same way so one bad request cannot unwind the blocking RPC task.
         let method_for_log = request.method.to_owned();
-        rpc::handlers::get_counts::record_rpc_method(request.method);
         // Results produced here are only serialized (sonic-rs), so ledger
         // objects can be rendered straight to JSON text without trees.
         let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -2160,27 +2160,6 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
         let roots = self.view.app()?.held_ledger_tree_roots();
         Some(shamap::tree_node::count_resident_reachable(roots.iter()))
     }
-    fn resident_by_owner(&self) -> Vec<(&'static str, u64, u64)> {
-        let Some(app) = self.view.app() else {
-            return Vec::new();
-        };
-        let (mut groups, history_len) = app.ledger_tree_roots_by_owner();
-        // Strong entries in the decoded-node cache, counted after the ledgers.
-        let cached: Vec<_> = app
-            .shared_tree_cache()
-            .map(|cache| cache.strong_values())
-            .unwrap_or_default();
-        groups.push(cached);
-        let counts = shamap::tree_node::count_resident_by_owner(&groups);
-        let names = ["closed", "validated", "history", "treecache"];
-        let mut out: Vec<(&'static str, u64, u64)> = names
-            .iter()
-            .zip(counts)
-            .map(|(name, (inner, leaf))| (*name, inner, leaf))
-            .collect();
-        out.push(("history_ledgers", history_len as u64, 0));
-        out
-    }
     fn add_node_store_counts(&self, json: &mut BTreeMap<String, JsonValue>) {
         let Some(app) = self.view.app() else {
             return;
