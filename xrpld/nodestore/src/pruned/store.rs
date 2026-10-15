@@ -201,6 +201,16 @@ impl PrunedStore {
                 metrics.last_dry_run_would_delete = would;
                 0
             }
+            // rippled SHAMapStoreImp deletes only at rotation, once
+            // `validatedSeq >= lastRotated + deleteInterval`, and then clears
+            // the caches (including the FullBelowCache). Deleting on every
+            // validated ledger forced the FullBelowCache to be cleared every
+            // ~4 s, discarding the progress of any acquisition whose tree walk
+            // lasts longer than one ledger (fork recovery on a multi-million
+            // node state tree never converged). Batch deletions at the same
+            // cadence: the retained window grows from `online_delete` to
+            // `2 * online_delete` ledgers between bursts, exactly like rippled.
+            PruneMode::On if k < writer.pruned_to().saturating_add(self.config.online_delete) => 0,
             PruneMode::On => {
                 let pruned = writer.prune(k, self.config.prune_batch)?;
                 writer.orphan_sweep(validated_seq, self.config.online_delete)?;
@@ -633,6 +643,49 @@ mod tests {
                 .expect("claim");
             store.maintain(seq, can_delete).expect("maintain");
         }
+    }
+
+    /// rippled SHAMapStoreImp deletes only when `validated >= lastRotated +
+    /// deleteInterval`, so the FullBelowCache (cleared after each deletion)
+    /// survives between rotations and long acquisition walks can converge.
+    #[test]
+    fn deletions_follow_rippled_rotation_cadence() {
+        let config = PrunedConfig {
+            online_delete: 4,
+            prune_mode: PruneMode::On,
+            ..PrunedConfig::default()
+        };
+        let store = PrunedStore::open(open_memory(), config).expect("open");
+        let mut deleted_at = Vec::new();
+        for seq in 1..=16u32 {
+            store
+                .store(&node(hid(300 + seq as u64)), seq)
+                .expect("store");
+            let dead = if seq == 1 {
+                vec![]
+            } else {
+                vec![hid(300 + seq as u64 - 1)]
+            };
+            store
+                .claim(&ClaimDelta {
+                    seq,
+                    state_root: hid(seq as u64),
+                    new_state: vec![hid(300 + seq as u64)],
+                    dead_state: dead,
+                    owned: vec![],
+                })
+                .expect("claim");
+            if store.maintain(seq, u32::MAX).expect("maintain") > 0 {
+                deleted_at.push(seq);
+            }
+        }
+        // Bursts every `online_delete` ledgers, not on every ledger.
+        assert_eq!(deleted_at, vec![8, 12, 16]);
+        // The burst at 16 deletes through 12; node 312 died at 13 and stays
+        // until the next rotation.
+        assert_eq!(store.fetch(&hid(311)).1, Status::NotFound);
+        assert_eq!(store.fetch(&hid(312)).1, Status::Ok);
+        assert_eq!(store.metrics().retained_floor, 13);
     }
 
     #[test]
