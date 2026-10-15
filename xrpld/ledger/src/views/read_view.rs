@@ -70,6 +70,15 @@ impl From<MutationError> for ViewError {
     }
 }
 
+/// One payment-sandbox level's deferred IOU adjustment for an account and
+/// counterparty: rippled `DeferredCredits::AdjustmentIOU` (debits made by the
+/// account and its balance before the first deferred credit at that level).
+#[derive(Debug, Clone)]
+pub struct DeferredIouAdjustment {
+    pub debits: STAmount,
+    pub orig_balance: STAmount,
+}
+
 pub trait ReadView: Send + Sync + std::fmt::Debug {
     fn open(&self) -> bool;
     fn header(&self) -> LedgerHeader;
@@ -98,6 +107,20 @@ pub trait ReadView: Send + Sync + std::fmt::Debug {
         amount: STAmount,
     ) -> STAmount {
         amount
+    }
+
+    /// rippled `PaymentSandbox::balanceHookIOU` walks the chain of nested
+    /// payment sandboxes (`ps_`) and folds every level's deferred IOU
+    /// adjustment into a single computation. Payment sandboxes append their
+    /// own adjustment (innermost first) and continue to their parent; views
+    /// that merely wrap another view forward; every other view ends the chain.
+    fn collect_deferred_iou_adjustments(
+        &self,
+        _account: AccountID,
+        _issuer: AccountID,
+        _currency: protocol::Currency,
+        _out: &mut Vec<DeferredIouAdjustment>,
+    ) {
     }
 
     fn balance_hook_mpt(&self, _account: AccountID, issue: MPTIssue, amount: i64) -> STAmount {

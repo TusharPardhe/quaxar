@@ -2463,7 +2463,8 @@ fn amm_account_holds<V: ApplyView>(
                     false,
                 )));
             }
-            let balance = ripple_state_helpers::try_account_holds(
+            // rippled ammAccountHolds reads the pool without the balance hook.
+            let balance = ripple_state_helpers::try_trust_line_balance_raw(
                 view,
                 amm_account,
                 &issue.account,

@@ -38,12 +38,6 @@ struct TxMetaPlan {
 }
 
 enum DeferredCreditEvent {
-    Iou {
-        from: AccountID,
-        to: AccountID,
-        amount: STAmount,
-        pre_credit_balance: STAmount,
-    },
     Mpt {
         from: AccountID,
         to: AccountID,
@@ -545,16 +539,16 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
             }
         }
         if propagate_deferred {
+            // IOU (and XRP) deferred credits merge with rippled
+            // DeferredCredits::apply semantics: per-key summed debits, the
+            // parent's original balance preserved when it already has one.
+            let parent = &mut *self.parent;
+            self.deferred_credits
+                .merge_iou_into(|from, to, amount, pre_credit_balance| {
+                    parent.credit_hook_iou(from, to, amount, pre_credit_balance)
+                });
             for event in self.deferred_credit_events {
                 match event {
-                    DeferredCreditEvent::Iou {
-                        from,
-                        to,
-                        amount,
-                        pre_credit_balance,
-                    } => self
-                        .parent
-                        .credit_hook_iou(from, to, amount, pre_credit_balance),
                     DeferredCreditEvent::Mpt {
                         from,
                         to,
@@ -798,8 +792,31 @@ impl<'a, V: ApplyView + ?Sized> ReadView for FlowSandbox<'a, V> {
         issuer: AccountID,
         amount: STAmount,
     ) -> STAmount {
-        let amount = self.deferred_credits.balance_iou(account, issuer, amount);
-        self.parent.balance_hook_iou(account, issuer, amount)
+        let mut adjustments = Vec::new();
+        self.collect_deferred_iou_adjustments(
+            account,
+            issuer,
+            amount.issue().currency,
+            &mut adjustments,
+        );
+        super::payment_sandbox::deferred_iou_balance(issuer, amount, &adjustments)
+    }
+
+    fn collect_deferred_iou_adjustments(
+        &self,
+        account: AccountID,
+        issuer: AccountID,
+        currency: protocol::Currency,
+        out: &mut Vec<crate::read_view::DeferredIouAdjustment>,
+    ) {
+        if let Some(adjustment) = self
+            .deferred_credits
+            .adjustment_iou(account, issuer, currency)
+        {
+            out.push(adjustment);
+        }
+        self.parent
+            .collect_deferred_iou_adjustments(account, issuer, currency, out);
     }
 
     fn balance_hook_mpt(&self, account: AccountID, issue: MPTIssue, amount: i64) -> STAmount {
@@ -926,13 +943,7 @@ impl<'a, V: ApplyView + ?Sized> ApplyView for FlowSandbox<'a, V> {
         pre_credit_balance: STAmount,
     ) {
         self.deferred_credits
-            .credit_iou(from, to, amount.clone(), pre_credit_balance.clone());
-        self.deferred_credit_events.push(DeferredCreditEvent::Iou {
-            from,
-            to,
-            amount,
-            pre_credit_balance,
-        });
+            .credit_iou(from, to, amount, pre_credit_balance);
     }
 
     fn credit_hook_mpt(
@@ -988,6 +999,59 @@ mod tests {
     use basics::base_uint::Uint256;
     use protocol::{ApplyFlags, LedgerEntryType, StBase};
     use std::sync::Arc;
+
+    fn usd(issuer: AccountID, mantissa: i64, exponent: i32) -> STAmount {
+        STAmount::from_iou_amount(
+            protocol::get_field_by_symbol("sfAmount"),
+            protocol::IOUAmount::from_parts(mantissa, exponent).expect("valid amount"),
+            protocol::Issue::new(protocol::currency_from_string("USD"), issuer),
+        )
+    }
+
+    /// rippled PaymentSandbox::balanceHookIOU sums the debits of every nested
+    /// payment-sandbox level and subtracts once from the outermost original
+    /// balance. Testnet 21540882 depends on it: 4239.787237248943 minus the
+    /// eight earlier debits is 446.436933219075, 5e-13 below the line balance
+    /// that the level-by-level bound would allow.
+    #[test]
+    fn nested_payment_sandboxes_fold_deferred_debits_like_rippled() {
+        let issuer = AccountID::from_array([0x11; 20]);
+        let holder = AccountID::from_array([0x22; 20]);
+        let line_balance = usd(issuer, 4_464_369_332_190_755, -13);
+        let mut parent = Sandbox::new(
+            Arc::new(Ledger::new(LedgerHeader::default(), false)),
+            ApplyFlags::NONE,
+        );
+        let mut aggregate = FlowSandbox::new(&mut parent);
+        aggregate.credit_hook_iou(
+            holder,
+            issuer,
+            usd(issuer, 3_791_986_009_364_741, -12),
+            usd(issuer, 4_239_787_237_248_943, -12),
+        );
+        let mut pass = FlowSandbox::new(&mut aggregate);
+        pass.credit_hook_iou(
+            holder,
+            issuer,
+            usd(issuer, 1_364_294_665_126_513, -15),
+            usd(issuer, 4_478_012_278_842_020, -13),
+        );
+
+        let expected = usd(issuer, 4_464_369_332_190_750, -13);
+        assert_eq!(
+            pass.balance_hook_iou(holder, issuer, line_balance.clone()),
+            expected,
+            "delta = 3791.986009364741 + 1.364294665126513 rounds to 3793.350304029868"
+        );
+
+        // Committing the pass merges its summed debits into the aggregate
+        // (rippled DeferredCredits::apply), giving the same spendable balance.
+        pass.apply().expect("commit pass");
+        assert_eq!(
+            aggregate.balance_hook_iou(holder, issuer, line_balance),
+            expected
+        );
+    }
 
     #[test]
     fn selected_nested_flow_defers_credited_liquidity_and_owner_count() {

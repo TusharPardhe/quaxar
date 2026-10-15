@@ -222,6 +222,17 @@ where
         self.base.balance_hook_iou(account, issuer, amount)
     }
 
+    fn collect_deferred_iou_adjustments(
+        &self,
+        account: protocol::AccountID,
+        issuer: protocol::AccountID,
+        currency: protocol::Currency,
+        out: &mut Vec<crate::read_view::DeferredIouAdjustment>,
+    ) {
+        self.base
+            .collect_deferred_iou_adjustments(account, issuer, currency, out)
+    }
+
     fn balance_hook_mpt(
         &self,
         account: protocol::AccountID,

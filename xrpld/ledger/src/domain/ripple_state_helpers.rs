@@ -225,6 +225,9 @@ pub fn issue_iou<V: ApplyView>(
             Err(ter) => return ter,
         };
 
+        // rippled issueIOU: creditHookIOU(issuer, account, amount, startBalance).
+        view.credit_hook_iou(issue.account, *account, amount.clone(), start_balance.clone());
+
         if b_sender_high {
             final_balance.negate();
         }
@@ -276,6 +279,9 @@ pub fn issue_iou<V: ApplyView>(
         // issueIOU explicitly replaces the issuer embedded in STAmount with
         // noAccount before trustCreate serializes the line.
         balance.set_issuer(protocol::no_account());
+        // rippled trustCreate: creditHookIOU(src, dst, saBalance, zero), where
+        // saBalance is the positive received amount with a noAccount issuer.
+        view.credit_hook_iou(issue.account, *account, balance.clone(), balance.zeroed());
         if !b_sender_high {
             balance.negate();
         }
@@ -455,6 +461,9 @@ pub fn redeem_iou<V: ApplyView>(
         Ok(result) => result,
         Err(ter) => return ter,
     };
+
+    // rippled redeemIOU: creditHookIOU(account, issuer, amount, startBalance).
+    view.credit_hook_iou(*account, issue.account, amount.clone(), start_balance.clone());
 
     if b_sender_high {
         final_balance.negate();
@@ -990,6 +999,10 @@ fn direct_send_no_fee_iou<V: ApplyView>(
             balance.negate();
         }
 
+        // rippled directSendNoFeeIOU: record the deferred credit with the
+        // sender's pre-credit balance before mutating the line.
+        view.credit_hook_iou(*sender, *receiver, amount.clone(), balance.clone());
+
         let before = balance.clone();
         balance -= amount.clone();
 
@@ -1028,6 +1041,8 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         let b_high = *sender > *receiver;
         let mut balance = amount.clone();
         balance.set_issuer(protocol::no_account());
+        // rippled trustCreate: creditHookIOU(src, dst, saBalance, zero).
+        view.credit_hook_iou(*sender, *receiver, balance.clone(), balance.zeroed());
         if !b_high {
             // balance stored from low's perspective; sender is low, so negate
             // (sender loses, so low balance goes negative)
@@ -1233,6 +1248,30 @@ pub fn try_credit_balance<V: ApplyView>(
     Ok(balance)
 }
 
+/// Raw trust-line balance in the issued asset, in `account` terms, without
+/// the payment-sandbox balance hook. This is the trust-line half of rippled
+/// `ammAccountHolds` ("the actual AMM balance without factoring in the
+/// balance hook"); freeze handling stays with the caller.
+pub fn try_trust_line_balance_raw<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    issuer: &AccountID,
+    currency: Currency,
+) -> Result<STAmount, crate::ViewError> {
+    let issue = Issue::new(currency, *issuer);
+    let line_keylet = protocol::line(*account, *issuer, currency);
+    Ok(if let Some(state) = view.peek(line_keylet)? {
+        let mut balance = state.get_field_amount(sf("sfBalance"));
+        if *account > *issuer {
+            balance.negate();
+        }
+        balance.set_issuer(*issuer);
+        balance
+    } else {
+        STAmount::new_with_asset(sf("sfAmount"), Asset::Issue(issue), 0, 0, false)
+    })
+}
+
 /// Spendable trust-line balance in the issued asset, matching rippled
 /// `accountHolds`/`getTrustLineBalance` without the optional opposite limit.
 pub fn try_account_holds<V: ApplyView>(
@@ -1241,23 +1280,12 @@ pub fn try_account_holds<V: ApplyView>(
     issuer: &AccountID,
     currency: Currency,
 ) -> Result<STAmount, crate::ViewError> {
-    let issue = Issue::new(currency, *issuer);
-    let line_keylet = protocol::line(*account, *issuer, currency);
-    let Some(state) = view.peek(line_keylet)? else {
-        return Ok(STAmount::new_with_asset(
-            sf("sfAmount"),
-            Asset::Issue(issue),
-            0,
-            0,
-            false,
-        ));
-    };
-    let mut balance = state.get_field_amount(sf("sfBalance"));
-    if *account > *issuer {
-        balance.negate();
-    }
-    balance.set_issuer(*issuer);
-    Ok(balance)
+    let balance = try_trust_line_balance_raw(view, account, issuer, currency)?;
+    // rippled getTrustLineBalance ends with view.balanceHookIOU(...): inside
+    // a PaymentSandbox, credits received earlier in the same payment are not
+    // spendable, and the deferred-debit arithmetic determines the exact
+    // spendable amount.
+    Ok(view.balance_hook_iou(*account, *issuer, balance))
 }
 
 /// Returns the rate as u32 (1000000000 = no fee, 2000000000 = 100% fee).

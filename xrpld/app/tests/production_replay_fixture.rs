@@ -181,6 +181,22 @@ fn testnet_21534114_fill_or_kill_removes_offer_unfunded_by_earlier_pass() {
     );
 }
 
+/// Testnet fork at 21540882 (2026-10-14): a tfSell|tfImmediateOrCancel
+/// OfferCreate (tx index 8) sold RLUSD across nine liquidity passes. rippled
+/// records every trust-line transfer in the PaymentSandbox deferred-credit
+/// table and `accountHolds` bounds the taker's spendable balance by
+/// `origBalance - sum(debits)`; on the last pass that is 446.436933219075,
+/// 5e-13 below the line balance. quaxar recorded no IOU deferred credits,
+/// spent the full line balance, and left the issuer-owned offer one ulp
+/// smaller.
+#[test]
+fn testnet_21540882_spendable_balance_uses_deferred_debits() {
+    run_sparse_replay(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21540882_deferred_credit_balance.jsonl"),
+    );
+}
+
 fn run_sparse_replay(path: PathBuf) {
     let rendered = path.to_string_lossy();
     assert!(
