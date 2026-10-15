@@ -98,6 +98,69 @@ fn keyspace_options(keyspace: Keyspace, table_target_bytes: u64) -> KeyspaceCrea
     }
 }
 
+/// fjall starts `min(cores, 4)` workers and worker 0 only flushes, so on a
+/// 2-vCPU host a single worker does every compaction. One long merge into the
+/// bottom levels then lets L0 reach fjall's 30-run write halt (testnet cold
+/// sync, 2026-10-15). Keep at least three compaction workers.
+const MIN_FJALL_WORKERS: usize = 4;
+
+fn fjall_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(MIN_FJALL_WORKERS)
+}
+
+/// fjall's L0 write-stall threshold (`Keyspace::local_backpressure`): from 20
+/// runs writers are throttled, from 30 they are halted until compaction
+/// reduces L0.
+const L0_STALL_RUNS: usize = 20;
+/// How long L0 may stay at the stall threshold without shrinking before the
+/// watchdog forces a flush.
+const L0_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// fjall schedules compaction only after a flush. When writes are halted at
+/// the L0 limit nothing flushes, so if the queued compaction requests were
+/// consumed before L0 could be compacted the halt is permanent: writers sleep
+/// in `local_backpressure`, the workers wait for messages, and node-store
+/// writes never complete. Rotating the active memtable starts a flush, which
+/// queues a compaction request for every worker.
+fn spawn_compaction_watchdog(open: std::sync::Weak<OpenDb>) {
+    let spawned = std::thread::Builder::new()
+        .name("fjall-watchdog".to_owned())
+        .spawn(move || {
+            let mut stuck_since: Option<(std::time::Instant, usize)> = None;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let Some(open) = open.upgrade() else {
+                    return;
+                };
+                let l0 = open.nodes.l0_table_count();
+                stuck_since = match stuck_since {
+                    _ if l0 < L0_STALL_RUNS => None,
+                    Some((since, at)) if l0 >= at => Some((since, at)),
+                    _ => Some((std::time::Instant::now(), l0)),
+                };
+                if let Some((since, _)) = stuck_since
+                    && since.elapsed() >= L0_STALL_GRACE
+                {
+                    let rotated = open.nodes.rotate_memtable().unwrap_or(false);
+                    tracing::warn!(
+                        target: "nodestore",
+                        l0_tables = l0,
+                        sealed_memtables = open.nodes.sealed_memtable_count(),
+                        rotated,
+                        "fjall L0 at the write-stall limit without compaction progress; forced a flush to schedule compaction"
+                    );
+                    stuck_since = Some((std::time::Instant::now(), l0));
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::error!(target: "nodestore", %error, "could not start the fjall compaction watchdog");
+    }
+}
+
 /// The open fjall database and its four keyspace handles, resolved once at
 /// open so every operation is a direct handle call.
 struct OpenDb {
@@ -267,6 +330,7 @@ impl Backend for FjallBackend {
         }
         let db = Database::builder(&self.path)
             .cache_size(self.cache_bytes)
+            .worker_threads(fjall_worker_threads())
             .open()
             .map_err(|error| Self::fjall_err("open", error))?;
         // Each keyspace is its own LSM-tree with bloom filters and LZ4 on.
@@ -287,7 +351,9 @@ impl Backend for FjallBackend {
             meta: handles.next().expect("meta keyspace"),
             db,
         };
-        *guard = Some(Arc::new(open));
+        let open = Arc::new(open);
+        spawn_compaction_watchdog(Arc::downgrade(&open));
+        *guard = Some(open);
         drop(guard);
         // Reserve the disk-full ballast once the store is open (design Case 10).
         self.ensure_reserve();

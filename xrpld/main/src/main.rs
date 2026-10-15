@@ -679,6 +679,9 @@ fn main() -> ExitCode {
             .with_thread_ids(true),
     );
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber");
+    // Route `log` records (fjall, lsm-tree) into tracing so storage-engine
+    // warnings and worker failures reach the node log.
+    let _ = tracing_log::LogTracer::init();
 
     app::set_log_reload_fn(move |new_filter: &str| {
         let f = tracing_subscriber::EnvFilter::try_new(new_filter)
