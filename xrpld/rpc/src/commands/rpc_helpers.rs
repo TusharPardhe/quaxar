@@ -921,11 +921,8 @@ fn keypair_for_signature(
 
     let key_type = key_type.unwrap_or(KeyType::Secp256k1);
 
-    let secret_key =
-        generate_secret_key(key_type, &seed).map_err(|_| Status::new(RpcErrorCode::Internal))?;
-    let public_key = derive_public_key(key_type, &secret_key)
-        .map_err(|_| Status::new(RpcErrorCode::Internal))?;
-    Ok((public_key, secret_key))
+    // rippled RPCHelpers keypairForSignature: generateKeyPair.
+    protocol::generate_key_pair(key_type, &seed).map_err(|_| Status::new(RpcErrorCode::Internal))
 }
 
 fn signing_rules<Runtime: RpcRuntime, Source>(

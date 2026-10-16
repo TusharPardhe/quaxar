@@ -73,11 +73,28 @@ pub fn derive_public_key(
     }
 }
 
+/// rippled `generateSecretKey`: for secp256k1 this is the deterministic ROOT
+/// key (validator and node identities, `validation_create`), not the account
+/// key. Use [`generate_key_pair`] for account keys.
 pub fn generate_secret_key(key_type: KeyType, seed: &Seed) -> Result<SecretKey, SecretKeyError> {
     match key_type {
         KeyType::Ed25519 => SecretKey::from_slice(sha512_half_secure(seed.as_slice()).data()),
-        KeyType::Secp256k1 => derive_deterministic_account_key(seed),
+        KeyType::Secp256k1 => derive_deterministic_root_key(seed),
     }
+}
+
+/// rippled `generateKeyPair`: the account key pair (`wallet_propose`,
+/// signing). For secp256k1 this is the root key tweaked by the generator at
+/// ordinal 0; for ed25519 it equals `generateSecretKey`.
+pub fn generate_key_pair(
+    key_type: KeyType,
+    seed: &Seed,
+) -> Result<(PublicKey, SecretKey), SecretKeyError> {
+    let secret = match key_type {
+        KeyType::Ed25519 => generate_secret_key(key_type, seed)?,
+        KeyType::Secp256k1 => derive_deterministic_account_key(seed)?,
+    };
+    Ok((derive_public_key(key_type, &secret)?, secret))
 }
 
 /// Generate a ROOT secret key (no account tweak). Used for VALIDATOR keys
@@ -148,16 +165,30 @@ mod tests {
         sha512_half_secure,
     };
 
-    use super::generate_secret_key;
+    use super::{generate_key_pair, generate_secret_key};
 
+    /// rippled `generateSecretKey(secp256k1)` is the root key: the
+    /// masterpassphrase seed gives node public n94a1u4j... (rippled tests).
     #[test]
-    fn generate_secp256k1_secret_key_seed_vectors() {
+    fn generate_secp256k1_secret_key_is_the_root_key_like_rippled() {
         let seed = parse_base58_seed("snoPBrXtMeMyMHUVTgbuqAfg1SUTb")
             .expect("family seed vector should parse");
         let secret =
             generate_secret_key(KeyType::Secp256k1, &seed).expect("seed should derive secret");
         let public =
             derive_public_key(KeyType::Secp256k1, &secret).expect("public key should derive");
+        assert_eq!(
+            public.to_node_public_base58(),
+            "n94a1u4jAz288pZLtw6yFWVbi89YamiC6JBXPVUj5zmExe5fTVg9"
+        );
+    }
+
+    #[test]
+    fn generate_secp256k1_key_pair_seed_vectors() {
+        let seed = parse_base58_seed("snoPBrXtMeMyMHUVTgbuqAfg1SUTb")
+            .expect("family seed vector should parse");
+        let (public, _) =
+            generate_key_pair(KeyType::Secp256k1, &seed).expect("seed should derive key pair");
 
         // Verified against rippled wallet_propose for seed snoPBrXtMeMyMHUVTgbuqAfg1SUTb:
         // public_key_hex = 0330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD020

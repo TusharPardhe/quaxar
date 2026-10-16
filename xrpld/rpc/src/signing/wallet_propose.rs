@@ -89,10 +89,9 @@ pub fn wallet_propose(params: &JsonValue) -> Result<JsonValue, Status> {
 
     let kt = key_type.unwrap_or(KeyType::Secp256k1);
     let s = seed.unwrap();
-    let private_key =
-        generate_secret_key(kt, &s).map_err(|_| Status::new(RpcErrorCode::Internal))?;
-    let public_key =
-        derive_public_key(kt, &private_key).map_err(|_| Status::new(RpcErrorCode::Internal))?;
+    // rippled WalletPropose: generateKeyPair (account derivation).
+    let (public_key, _secret_key) = protocol::generate_key_pair(kt, &s)
+        .map_err(|_| Status::new(RpcErrorCode::Internal))?;
 
     let mut obj = BTreeMap::new();
     let seed_1751 = seed_as_1751(&s);
