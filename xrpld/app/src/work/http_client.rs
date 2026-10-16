@@ -61,7 +61,7 @@ pub async fn http_client_get(
     let mut sites: VecDeque<String> = sites.into();
     let scheme = if ssl { "https" } else { "http" };
 
-    let client = reqwest::Client::builder()
+    let client = crate::work::apply_outbound_tls(reqwest::Client::builder())
         .timeout(timeout)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());

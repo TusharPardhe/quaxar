@@ -156,7 +156,13 @@ where
         "version" => {
             let mut version_obj = BTreeMap::new();
             version_obj.insert("first".to_owned(), JsonValue::Unsigned(1));
-            version_obj.insert("last".to_owned(), JsonValue::Unsigned(2));
+            // rippled `setVersion`: beta version when `[beta_rpc_api]` is on.
+            let last = if protocol::beta_rpc_api() {
+                protocol::API_BETA_VERSION
+            } else {
+                protocol::API_MAXIMUM_SUPPORTED_VERSION
+            };
+            version_obj.insert("last".to_owned(), JsonValue::Unsigned(u64::from(last)));
             let mut result = BTreeMap::new();
             result.insert("version".to_owned(), JsonValue::Object(version_obj));
             JsonValue::Object(result)

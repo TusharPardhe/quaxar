@@ -111,6 +111,8 @@ pub(super) fn overlay_setup(network_id: Option<u32>) -> Setup {
         crawl_options: 0,
         network_id,
         vl_enabled: true,
+        compression_enabled: false,
+        ledger_replay_enabled: false,
         tx_reduce_relay_enabled: true,
         tx_reduce_relay_min_peers: 1,
         tx_relay_percentage: 0,

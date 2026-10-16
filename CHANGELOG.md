@@ -7,6 +7,39 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ## [Unreleased]
 
+### Fixed
+
+- Cold sync on 2 vCPU hosts no longer deadlocks when fjall reaches 30 L0
+  runs: at least 4 fjall workers, plus a watchdog that forces a flush when L0
+  stays high.
+- The disk-full ballast now allocates real blocks on every OS (it was a sparse
+  file) and is released and re-created as free space changes.
+- `online_delete = 0` or unset now disables online deletion like rippled; it
+  was silently pruning to 512 ledgers.
+
+### Changed
+
+- Config parsing matches rippled:
+  - `[ledger_history]` defaults to 256.
+  - `[fetch_depth]` is read and bounds the ledgers served to peers.
+  - `[compression]` and `[ledger_replay]` default off and are applied.
+  - `[beta_rpc_api]` gates API version 3; an invalid `api_version` is
+    rejected with `invalid_API_version`.
+  - `[ssl_verify]`, `[ssl_verify_file]` and `[ssl_verify_dir]` apply to
+    outbound HTTPS.
+  - Per-port `send_queue_limit` is applied.
+  - Numeric `[node_size]` is accepted.
+  - Unknown `[features]`, malformed values and setting both reduce-relay vp
+    keys fail startup.
+- The RPC command-line client uses the configured admin port.
+
+### Removed
+
+- The `[node_db]` keys `prune_mode`, `prune_batch` and `verify_interval` are
+  now fixed internals.
+- The `[rpc_ip]` and `[rpc_port]` config sections are gone; use
+  `--rpc_ip`/`--rpc_port`. `quaxar config` warns if either is still present.
+
 ## [0.10.0] - 2026-10-15
 
 ### Fixed

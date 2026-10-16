@@ -118,6 +118,8 @@ fn validate_config_content(content: &str) -> ConfigValidationReport {
     validate_vl(&config, &mut report);
     validate_reduce_relay(&config, &mut report);
     validate_ssl_verify(&config, &mut report);
+    validate_rippled_single_values(&config, &mut report);
+    validate_removed_keys(&config, &mut report);
 
     report
 }
@@ -216,14 +218,16 @@ fn validate_node_size(config: &BasicConfig, report: &mut ConfigValidationReport)
     let value = config
         .legacy("node_size")
         .unwrap_or_else(|_| "medium".to_owned());
+    // rippled accepts the names (any case) or a number, capped at 4 (huge).
     if matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "tiny" | "small" | "medium" | "large" | "huge"
-    ) {
+    ) || value.trim().parse::<usize>().is_ok()
+    {
         report.ok.push(format!("[node_size] {}", value.trim()));
     } else {
         report.errors.push(format!(
-            "[node_size] invalid value '{}'; allowed: tiny, small, medium, large, huge",
+            "[node_size] invalid value '{}'; allowed: tiny, small, medium, large, huge, or 0-4",
             value.trim()
         ));
     }
@@ -293,9 +297,12 @@ fn validate_node_db_and_history(config: &BasicConfig, report: &mut ConfigValidat
         ));
     }
 
+    // rippled Config.h: ledger_history defaults to 256.
     let ledger_history_raw = config
         .legacy("ledger_history")
-        .unwrap_or_else(|_| "0".to_owned());
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+        .unwrap_or_else(|| "256".to_owned());
     match parse_ledger_history(&ledger_history_raw) {
         Ok(LedgerHistory::Full) => {
             if online_delete.is_some_and(|value| value != 0) {
@@ -419,6 +426,11 @@ fn validate_vl(config: &BasicConfig, report: &mut ConfigValidationReport) {
 
 fn validate_reduce_relay(config: &BasicConfig, report: &mut ConfigValidationReport) {
     let section = config.section("reduce_relay");
+    if section.exists("vp_base_squelch_enable") && section.exists("vp_enable") {
+        report.errors.push(
+            "[reduce_relay] cannot specify both vp_base_squelch_enable and vp_enable".to_owned(),
+        );
+    }
     for field in ["vp_base_squelch_enable", "vp_enable", "tx_enable"] {
         if let Some(raw) = optional_string(section, field)
             && parse_bool_value(&raw).is_err()
@@ -453,10 +465,58 @@ fn validate_reduce_relay(config: &BasicConfig, report: &mut ConfigValidationRepo
 
 fn validate_ssl_verify(config: &BasicConfig, report: &mut ConfigValidationReport) {
     let value = config.legacy("ssl_verify").unwrap_or_default();
-    if !value.trim().is_empty() && parse_bool_value(&value).is_err() {
+    if !value.trim().is_empty() && !is_rippled_bool(&value) {
         report
             .errors
             .push(format!("[ssl_verify] invalid value: {value}"));
+    }
+}
+
+/// rippled `lexicalCastThrow<bool>`: 0/1/true/false only.
+fn is_rippled_bool(raw: &str) -> bool {
+    matches!(raw.trim().to_ascii_lowercase().as_str(), "0" | "1" | "true" | "false")
+}
+
+/// Single-value sections rippled parses strictly at startup.
+fn validate_rippled_single_values(config: &BasicConfig, report: &mut ConfigValidationReport) {
+    for section in ["compression", "ledger_replay", "beta_rpc_api"] {
+        if let Ok(raw) = config.legacy(section)
+            && !raw.trim().is_empty()
+            && !is_rippled_bool(&raw)
+        {
+            report
+                .errors
+                .push(format!("[{section}] invalid value '{}'; use 0 or 1", raw.trim()));
+        }
+    }
+    if let Ok(raw) = config.legacy("fetch_depth")
+        && !raw.trim().is_empty()
+        && !matches!(raw.trim().to_ascii_lowercase().as_str(), "none" | "full")
+        && raw.trim().parse::<u32>().is_err()
+    {
+        report.errors.push(format!(
+            "[fetch_depth] invalid value '{}'; use a number, none, or full",
+            raw.trim()
+        ));
+    }
+}
+
+/// Keys quaxar used to read that are no longer settings.
+fn validate_removed_keys(config: &BasicConfig, report: &mut ConfigValidationReport) {
+    let node_db = config.section("node_db");
+    for key in ["prune_mode", "prune_batch", "verify_interval"] {
+        if node_db.exists(key) {
+            report
+                .warnings
+                .push(format!("[node_db] {key} is no longer a setting and is ignored"));
+        }
+    }
+    for section in ["rpc_ip", "rpc_port"] {
+        if config.exists(section) {
+            report.warnings.push(format!(
+                "[{section}] is ignored; the CLI uses the admin port, or --rpc_ip/--rpc_port"
+            ));
+        }
     }
 }
 
@@ -563,6 +623,23 @@ fn parse_basic_config_text(text: &str) -> BasicConfig {
 #[cfg(test)]
 mod tests {
     use super::validate_config_content;
+
+    #[test]
+    fn rippled_strict_values_and_removed_keys_are_reported() {
+        let report = super::validate_config_content(
+            "[node_size]\n3\n[compression]\nyes\n[fetch_depth]\ndeep\n\
+             [reduce_relay]\nvp_enable = 1\nvp_base_squelch_enable = 1\n\
+             [node_db]\ntype = fjall\npath = /tmp/q\nprune_mode = dry_run\n[rpc_port]\n5005\n",
+        );
+        let errors = report.errors.join("\n");
+        assert!(!errors.contains("[node_size]"), "{errors}");
+        assert!(errors.contains("[compression] invalid"), "{errors}");
+        assert!(errors.contains("[fetch_depth] invalid"), "{errors}");
+        assert!(errors.contains("cannot specify both"), "{errors}");
+        let warnings = report.warnings.join("\n");
+        assert!(warnings.contains("prune_mode is no longer a setting"), "{warnings}");
+        assert!(warnings.contains("[rpc_port] is ignored"), "{warnings}");
+    }
 
     #[test]
     fn config_validation_rejects_installer_edge_cases() {

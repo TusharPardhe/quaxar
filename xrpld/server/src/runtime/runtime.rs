@@ -717,6 +717,7 @@ mod tests {
             allow_ws,
             auth: ServerAuthConfig::default(),
             tls_config: None,
+            ws_queue_limit: 100,
         }
     }
 
@@ -866,6 +867,7 @@ mod tests {
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
                 standalone_mode: false,
+                send_queue_limit: 100,
             }],
             client: Some(ServerPortClientSetup {
                 secure: false,
@@ -931,6 +933,7 @@ mod tests {
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
                 standalone_mode: false,
+                send_queue_limit: 100,
             }],
             client: None,
             overlay: None,
@@ -1021,6 +1024,7 @@ mod tests {
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
                 standalone_mode: false,
+                send_queue_limit: 100,
             }],
             client: None,
             overlay: None,
@@ -1114,6 +1118,7 @@ mod tests {
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
                 standalone_mode: false,
+                send_queue_limit: 100,
             }],
             client: Some(ServerPortClientSetup {
                 secure: false,

@@ -114,6 +114,7 @@ fn make_server(dispatcher: RecordingDispatcher) -> RpcServer<RecordingDispatcher
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         },
     )
     .expect("server port should build")
@@ -236,6 +237,7 @@ async fn http_post_rejects_ports_without_http_protocol() {
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         },
     )
     .expect("server port should build");
@@ -281,6 +283,7 @@ async fn http_post_preserves_trusted_headers_for_secure_gateway() {
             ],
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         },
     )
     .expect("server port should build");
@@ -404,6 +407,7 @@ async fn websocket_get_status_page_reports_server_health() {
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         },
         Arc::new(FixedStatusSource(Ok(()))),
     )
@@ -451,6 +455,7 @@ async fn websocket_upgrade_rejects_non_ws_ports_with_invalid_protocol_html() {
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         },
     )
     .expect("server port should build");

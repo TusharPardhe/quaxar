@@ -863,7 +863,15 @@ pub fn build_bootstrap_root(
         default_job_queue_threads(config, options.standalone)
     }
     .max(1);
-    let ledger_history = config_legacy_u32(config, "ledger_history").unwrap_or(0);
+    validate_rippled_config_values(config)?;
+    protocol::set_beta_rpc_api(
+        config_single_legacy(config, "beta_rpc_api")?
+            .and_then(|raw| config_bool(&raw))
+            .unwrap_or(false),
+    );
+    configure_outbound_tls_from_config(config)?;
+    let ledger_history = config_ledger_history(config, options.standalone)?;
+    let ledger_fetch_depth = config_fetch_depth(config)?;
     // Match rippled Config: [network_quorum] is an exact single unsigned
     // value and is checked against raw legacy [peers_max] (zero/absent = 21),
     // not the derived directional overlay limits.
@@ -895,7 +903,7 @@ pub fn build_bootstrap_root(
         import: options.import,
         quorum: options.quorum,
         network_quorum,
-        ledger_fetch_depth: ledger_history,
+        ledger_fetch_depth,
         ..ApplicationRootOptions::default()
     })
     .map_err(|error| error.to_string())?;
@@ -2389,7 +2397,10 @@ fn run_start_mode_consensus_loop(
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let router_root = runtime.root().clone();
         let router_overlay_rt = Arc::clone(&overlay_rt);
-        let get_ledger_fetch_depth = configured_ledger_history;
+        // rippled PeerImp/LedgerMaster::getEarliestFetch use fetchDepth (the
+        // configured [fetch_depth] clamped to online_delete), not
+        // ledger_history.
+        let get_ledger_fetch_depth = runtime.root().ledger_fetch_depth();
         overlay_rt
             .overlay()
             .queued_inbound()
@@ -2447,7 +2458,7 @@ fn run_start_mode_consensus_loop(
         // `LedgerMaster::getEarliestFetch` uses the configured history depth.
         // Keep that policy with the live overlay router rather than deriving a
         // separate retention range in a transport-only helper.
-        let fetch_pack_depth = configured_ledger_history;
+        let fetch_pack_depth = runtime.root().ledger_fetch_depth();
         overlay_rt
             .overlay()
             .queued_inbound()
@@ -4381,31 +4392,31 @@ fn install_trusted_restart_baseline(root: &ApplicationRoot) {
     );
 }
 
-/// Build the pruned-store driver for a fjall single store, reading its window
-/// (`online_delete`) and prune settings from the node_db section. Returns None
-/// if the store does not export a key-value-capable backend (should not happen
-/// for fjall, but keeps the path non-fatal).
+/// Build the pruned-store driver for a fjall single store. `online_delete` is
+/// the value validated by rippled's SHAMapStore rules: 0 means online deletion
+/// is off and every ledger is kept (no driver, nothing is ever deleted), as in
+/// rippled. Returns None if the store does not export a key-value-capable
+/// backend (should not happen for fjall, but keeps the path non-fatal).
 fn build_pruned_driver(
-    node_db: &basics::basic_config::Section,
     node_store: &crate::SHAMapStoreNodeStore,
+    online_delete: u32,
     can_delete: u32,
 ) -> Result<Option<Arc<crate::shamap::pruned_driver::PrunedDriver>>, String> {
-    use crate::shamap::pruned_driver::{PrunedDriver, pruned_config_from_section};
+    use crate::shamap::pruned_driver::{PrunedDriver, pruned_config};
+    if online_delete == 0 {
+        tracing::info!(
+            target: "nodestore",
+            "online_delete is 0 or unset: online deletion disabled, every ledger is kept"
+        );
+        return Ok(None);
+    }
     let Some(backend) = node_store.export_backend() else {
         return Ok(None);
     };
     if !backend.supports_kv() {
         return Ok(None);
     }
-    // online_delete is the retention window for the pruned store. Default to a
-    // conservative window when unset so pruning never runs unexpectedly tight.
-    let online_delete = node_db
-        .get::<u32>("online_delete")
-        .ok()
-        .flatten()
-        .filter(|&n| n > 0)
-        .unwrap_or(512);
-    let config = pruned_config_from_section(node_db, online_delete, can_delete);
+    let config = pruned_config(online_delete, can_delete);
     let driver = PrunedDriver::open(backend, config)?;
     Ok(Some(Arc::new(driver)))
 }
@@ -4435,8 +4446,8 @@ fn attach_production_shamap_store_runtime(
             .is_some_and(|t| t.eq_ignore_ascii_case("fjall"));
         let pruned_driver = if is_fjall {
             build_pruned_driver(
-                node_db,
                 &bootstrap.node_store,
+                bootstrap.online_delete,
                 bootstrap.store.get_can_delete(),
             )?
         } else {
@@ -4596,6 +4607,48 @@ fn node_db_fast_load(config: &BasicConfig) -> bool {
         .unwrap_or(false)
 }
 
+/// rippled `[node_size]`: tiny/small/medium/large/huge (case-insensitive) or a
+/// number, capped at 4 (huge).
+fn node_size_name(raw: &str) -> Option<&'static str> {
+    const NAMES: [&str; 5] = ["tiny", "small", "medium", "large", "huge"];
+    let raw = raw.trim();
+    NAMES
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(raw))
+        .copied()
+        .or_else(|| raw.parse::<usize>().ok().map(|n| NAMES[n.min(4)]))
+}
+
+/// Startup errors rippled raises from `Config::loadFromString` for values that
+/// quaxar otherwise reads leniently.
+fn validate_rippled_config_values(config: &BasicConfig) -> Result<(), String> {
+    if let Some(raw) = config_single_legacy(config, "node_size")?
+        && node_size_name(&raw).is_none()
+    {
+        return Err(format!("[node_size] is invalid: {raw}"));
+    }
+    for raw in config.section("features").values() {
+        let name = raw.trim();
+        match REGISTERED_FEATURES.iter().find(|feature| feature.name == name) {
+            None => return Err(format!("Unknown feature: {name}  in config file.")),
+            Some(feature) if !protocol::registered_feature_supported(feature) => {
+                return Err(format!(
+                    "Feature {name} in config file is not supported by this build."
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for section in ["compression", "ledger_replay", "beta_rpc_api"] {
+        if let Some(raw) = config_single_legacy(config, section)?
+            && config_bool(&raw).is_none()
+        {
+            return Err(format!("[{section}] is invalid: {raw}"));
+        }
+    }
+    Ok(())
+}
+
 fn configured_node_size_from_config(config: &BasicConfig) -> Option<String> {
     if !config.exists("node_size") {
         return None;
@@ -4604,11 +4657,7 @@ fn configured_node_size_from_config(config: &BasicConfig) -> Option<String> {
     let section = config.section("node_size");
     match section.values() {
         [node_size] => {
-            let node_size = node_size.trim().to_ascii_lowercase();
-            match node_size.as_str() {
-                "tiny" | "small" | "medium" | "large" | "huge" => Some(node_size),
-                _ => None,
-            }
+            node_size_name(node_size).map(str::to_owned)
         }
         values => {
             tracing::warn!(
@@ -5584,6 +5633,91 @@ fn amendments_from_config(config: &BasicConfig, start_type: StartUpType) -> Vec<
         .collect()
 }
 
+/// rippled `[ssl_verify_file]`, `[ssl_verify_dir]`, `[ssl_verify]`
+/// (`HTTPClient::initializeSSLContext`); invalid values fail startup.
+fn configure_outbound_tls_from_config(config: &BasicConfig) -> Result<(), String> {
+    let file = config_single_legacy(config, "ssl_verify_file")?.unwrap_or_default();
+    let dir = config_single_legacy(config, "ssl_verify_dir")?.unwrap_or_default();
+    let verify = match config_single_legacy(config, "ssl_verify")? {
+        None => true,
+        Some(raw) => config_bool(&raw).ok_or_else(|| format!("[ssl_verify] is invalid: {raw}"))?,
+    };
+    crate::work::configure_outbound_tls(crate::work::outbound_tls_from(&dir, &file, verify)?);
+    Ok(())
+}
+
+/// `beast::lexicalCastThrow<bool>`: 0/1 and true/false.
+fn config_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// rippled `Config::loadFromString` `[ledger_history]`: default 256, `full` is
+/// unlimited, `none` is 0, anything else must be an unsigned 32-bit integer
+/// (a malformed value is a startup error). Standalone forces 0.
+fn config_ledger_history(config: &BasicConfig, standalone: bool) -> Result<u32, String> {
+    let value = config_single_legacy(config, "ledger_history")?.map_or(Ok(256), |raw| {
+        match raw.to_ascii_lowercase().as_str() {
+            "full" => Ok(u32::MAX),
+            "none" => Ok(0),
+            _ => raw
+                .parse::<u32>()
+                .map_err(|_| format!("[ledger_history] is invalid: {raw}")),
+        }
+    })?;
+    Ok(if standalone { 0 } else { value })
+}
+
+/// rippled `[fetch_depth]`: default 1,000,000,000; `none` is 0, `full` is
+/// unlimited; a configured value is raised to at least 10. LedgerMaster then
+/// clamps it to `online_delete` (`SHAMapStoreImp::clampFetchDepth`).
+fn config_fetch_depth(config: &BasicConfig) -> Result<u32, String> {
+    let fetch_depth = match config_single_legacy(config, "fetch_depth")? {
+        None => 1_000_000_000,
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "none" => 0,
+            "full" => u32::MAX,
+            _ => raw
+                .parse::<u32>()
+                .map_err(|_| format!("[fetch_depth] is invalid: {raw}"))?,
+        }
+        .max(10),
+    };
+    let online_delete = config
+        .section("node_db")
+        .get::<u32>("online_delete")
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    Ok(if online_delete != 0 {
+        fetch_depth.min(online_delete)
+    } else {
+        fetch_depth
+    })
+}
+
+/// rippled `getSingleSection`: the section's single value, trimmed. More than
+/// one line is logged and treated as absent, so the default applies.
+fn config_single_legacy(config: &BasicConfig, section: &str) -> Result<Option<String>, String> {
+    match config.section(section).values() {
+        [] => Ok(None),
+        [value] => Ok(Some(value.trim().to_owned())),
+        values => {
+            tracing::warn!(
+                target: "config",
+                section,
+                lines = values.len(),
+                "Section '{section}': requires 1 line not {} lines.",
+                values.len()
+            );
+            Ok(None)
+        }
+    }
+}
+
 fn config_legacy_u32(config: &BasicConfig, section: &str) -> Option<u32> {
     let value = config.legacy(section).ok()?;
     let trimmed = value.trim();
@@ -5905,6 +6039,105 @@ const fn should_schedule_coordinator_fetch_pack_wake(
 
 #[cfg(test)]
 mod tests {
+    fn legacy_config(entries: &[(&str, &str)]) -> basics::basic_config::BasicConfig {
+        let mut config = basics::basic_config::BasicConfig::new();
+        for (section, value) in entries {
+            if let Some(key) = value.strip_prefix("node_db:") {
+                let (k, v) = key.split_once('=').expect("k=v");
+                config.section_mut("node_db").set(k, v);
+            } else {
+                config.section_mut(*section).append(*value);
+            }
+        }
+        config
+    }
+
+    /// rippled Config.h `ledgerHistory = 256`; full / none / number; a
+    /// malformed value throws; standalone forces 0.
+    /// rippled `[node_size]`: names (any case) or a number capped at 4; a bad
+    /// value fails startup. `[features]` rejects unknown names; boolean
+    /// sections reject non-booleans.
+    #[test]
+    fn rippled_config_values_are_validated_like_rippled() {
+        assert_eq!(super::node_size_name("Medium"), Some("medium"));
+        assert_eq!(super::node_size_name("0"), Some("tiny"));
+        assert_eq!(super::node_size_name("3"), Some("large"));
+        assert_eq!(super::node_size_name("9"), Some("huge"));
+        assert_eq!(super::node_size_name("enormous"), None);
+        let check = |entries: &[(&str, &str)]| super::validate_rippled_config_values(&legacy_config(entries));
+        assert!(check(&[("node_size", "2")]).is_ok());
+        assert!(check(&[("node_size", "enormous")]).is_err());
+        assert!(check(&[("features", "NotARealAmendment")]).is_err());
+        assert!(check(&[("features", "Flow")]).is_ok());
+        assert!(check(&[("compression", "1")]).is_ok());
+        assert!(check(&[("ledger_replay", "yes")]).is_err());
+        assert!(check(&[("beta_rpc_api", "maybe")]).is_err());
+    }
+
+    #[test]
+    fn ledger_history_matches_rippled() {
+        assert_eq!(super::config_ledger_history(&legacy_config(&[]), false), Ok(256));
+        let full = legacy_config(&[("ledger_history", "full")]);
+        assert_eq!(super::config_ledger_history(&full, false), Ok(u32::MAX));
+        let none = legacy_config(&[("ledger_history", "None")]);
+        assert_eq!(super::config_ledger_history(&none, false), Ok(0));
+        let n = legacy_config(&[("ledger_history", "2000")]);
+        assert_eq!(super::config_ledger_history(&n, false), Ok(2000));
+        assert_eq!(super::config_ledger_history(&n, true), Ok(0));
+        let bad = legacy_config(&[("ledger_history", "lots")]);
+        assert!(super::config_ledger_history(&bad, false).is_err());
+    }
+
+    /// rippled Config.h `fetchDepth = 1000000000`; none / full / number, then
+    /// at least 10; LedgerMaster clamps it to online_delete.
+    #[test]
+    fn fetch_depth_matches_rippled_and_is_clamped_to_online_delete() {
+        assert_eq!(super::config_fetch_depth(&legacy_config(&[])), Ok(1_000_000_000));
+        let none = legacy_config(&[("fetch_depth", "none")]);
+        assert_eq!(super::config_fetch_depth(&none), Ok(10));
+        let small = legacy_config(&[("fetch_depth", "3")]);
+        assert_eq!(super::config_fetch_depth(&small), Ok(10));
+        let full = legacy_config(&[("fetch_depth", "full")]);
+        assert_eq!(super::config_fetch_depth(&full), Ok(u32::MAX));
+        let clamped = legacy_config(&[("x", "node_db:online_delete=512")]);
+        assert_eq!(super::config_fetch_depth(&clamped), Ok(512));
+        let bad = legacy_config(&[("fetch_depth", "deep")]);
+        assert!(super::config_fetch_depth(&bad).is_err());
+    }
+
+    /// online_delete 0 keeps every ledger: no pruning driver is built, so the
+    /// store never deletes nodes (rippled SHAMapStoreImp with deleteInterval 0).
+    #[test]
+    fn online_delete_zero_builds_no_pruning_driver() {
+        use std::sync::Arc;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut config = basics::basic_config::BasicConfig::new();
+        config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+        let node_db = config.section_mut("node_db");
+        node_db.set("type", "Memory");
+        node_db.set("path", dir.path().join("node").to_string_lossy());
+        let bootstrap = crate::bootstrap_shamap_store(
+            &config,
+            false,
+            256,
+            1,
+            8,
+            64,
+            2,
+            &nodestore::ManagerImp::new(),
+            Arc::new(nodestore::DummyScheduler) as Arc<dyn nodestore::Scheduler>,
+            Arc::new(nodestore::NullJournal),
+        )
+        .expect("bootstrap");
+        let node_db = config.section("node_db").clone();
+        let none = super::build_pruned_driver(&bootstrap.node_store, 0, u32::MAX)
+            .expect("build");
+        assert!(none.is_none(), "online_delete 0 must not prune");
+        let some = super::build_pruned_driver(&bootstrap.node_store, 512, u32::MAX)
+            .expect("build");
+        assert_eq!(some.expect("pruning driver").online_delete(), 512);
+    }
+
     use super::{
         APPLICATION_SWEEP_MALLOC_TRIM_TAG, BootstrapLedgerDataRouting, ENDPOINT_HANDOUT_LIMIT,
         FetchPackAdmission, GenericGetObjectAdmission, LedgerDataIngressDisposition, MainRuntime,
@@ -6276,7 +6509,9 @@ mod tests {
                 max_trusted_count: 2,
             },
         );
-        assert_eq!(selected, vec![vec![1], vec![2], vec![4], vec![5]]);
+        // rippled 54cfdda00b: trusted manifests are never capped; only the
+        // untrusted suffix is bounded.
+        assert_eq!(selected, vec![vec![1], vec![2], vec![3], vec![4], vec![5]]);
     }
 
     #[test]

@@ -17,6 +17,7 @@ clap = { version = "4", features = ["derive"] }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-log = "=0.2.0"
 futures = "0.3"
 parking_lot = "0.12"
 app = { path = "../app" }

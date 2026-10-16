@@ -63,13 +63,15 @@ Configures one listening port.
 
 Port defaults may be placed in `[server]` and are inherited by each named port
 section. `admin` and `secure_gateway` accept IPv4 or IPv6 addresses and CIDR
-ranges. The runtime does not apply the parsed `send_queue_limit`; it has therefore
-been removed from the packaged examples rather than presented as an effective
-WebSocket control.
+ranges. `send_queue_limit` (default `100`, `1`–`65535`) bounds each WebSocket
+client's outbound queue; a client that falls behind it is disconnected as too
+slow, as in rippled.
 
 ### `[node_size]`
 
 Selects the resource profile. This is the recommended primary tuning knob.
+Accepts `tiny`, `small`, `medium`, `large`, `huge` (any case) or a number
+`0`–`4` (larger numbers mean `huge`), like rippled.
 
 ```ini
 [node_size]
@@ -126,15 +128,13 @@ Configures persistent ledger object storage.
 | `cache_mb` | Block-cache budget for the fjall store, in MB. Defaults from `node_size`. |
 | `reserve_mb` | Disk-full ballast reserved at open, in MB; default `1024`, `0` disables. Released under disk pressure so compaction and deletes have room. |
 | `compaction_base_mb` | Size of the first leveled-compaction level of the node keyspace, in MB (`16`–`4096`, default `256`). Levels grow ×10 from it. Pick it so the live node set sits just under a level target: `256` for mainnet-sized stores, `64` for testnet/devnet. Fixed when the store is created; changing it needs a fresh store. |
-| `prune_mode` | `on` (default) deletes dead nodes as the window advances; `dry_run` logs what it would delete without deleting. |
-| `prune_batch` | Notebook rows processed per prune batch; default `10000`. |
 | `delete_batch` | Relational cleanup batch size; default `100`. |
 | `back_off_milliseconds` | Delay between relational cleanup batches; default `100`. Legacy key `backOff` is also accepted. |
 
 When nonzero, `online_delete` must be at least the selected numeric
 `ledger_history`. The fjall store prunes continuously: as each validated
 ledger is claimed, nodes that no ledger within the last `online_delete`
-validated ledgers still needs are deleted, in bounded `prune_batch` steps. The
+validated ledgers still needs are deleted, in bounded batches. The
 retained floor advertised to peers tracks the prune cursor exactly, so there
 is no rotation interval or archive generation; retained coverage is the last
 `online_delete` ledgers rather than one-to-two rotation intervals. SQL ledger,
@@ -150,8 +150,27 @@ Directory for relational metadata databases.
 ### `[ledger_history]`
 
 Desired validated-ledger acquisition/history depth. Use a number, `none` (`0`),
-or `full` (`u32::MAX`). Full history requires `online_delete = 0`. When online
-deletion is enabled, a numeric history depth cannot exceed its interval.
+or `full` (`u32::MAX`); default `256` (`0` in standalone), and any other value
+fails startup. Full history requires `online_delete = 0`. When online deletion
+is enabled, a numeric history depth cannot exceed its interval.
+
+### `[fetch_depth]`
+
+How far back this node serves ledgers and fetch packs to peers. A number,
+`none` or `full`; default `1000000000`, minimum `10`, and never more than
+`online_delete` when online deletion is enabled.
+
+### `[compression]` and `[ledger_replay]`
+
+`1` advertises and uses lz4 peer-message compression or the ledger-replay peer
+feature. Both default to `0` and are used with a peer only when both sides
+enable them.
+
+### `[beta_rpc_api]`
+
+`1` accepts the beta RPC API version (`3`). Default `0`: requests may use
+`api_version` 1 or 2; any other value is rejected with `invalid_API_version`
+(HTTP 400 for single JSON-RPC requests).
 
 ### `[validation_seed]`
 
@@ -297,7 +316,7 @@ Controls validation and transaction relay reduction.
 
 | Key | Meaning |
 |-----|---------|
-| `vp_base_squelch_enable` | Enables validation relay base squelch. |
+| `vp_base_squelch_enable` | Enables validation relay base squelch. The deprecated `vp_enable` is accepted, but setting both is an error. |
 | `vp_base_squelch_max_selected_peers` | Max selected validation relay peers. Must be at least `3`. |
 | `tx_enable` | Enables transaction reduce relay. |
 | `tx_min_peers` | Minimum peers before transaction reduce relay is active. Must be at least `10`. |
@@ -367,17 +386,19 @@ not execute these commands. Set `RUST_LOG` in the service environment or use
 { "command": "log_level", "severity": "warning" }
 ```
 
-### `[ssl_verify]`
+### `[ssl_verify]`, `[ssl_verify_file]` and `[ssl_verify_dir]`
 
-Accepted by configuration validation for compatibility and omitted from
-packaged configs, but it is not wired to runtime HTTP clients. Do not rely on
-this setting to weaken or strengthen certificate verification.
+Certificate checks for outbound HTTPS (validator list sites and HTTP work
+clients). `ssl_verify` defaults to `1`; `0` disables verification.
+`ssl_verify_file` replaces the built-in roots with the certificates in that PEM
+file; `ssl_verify_dir` adds every PEM file in the directory. A missing file or
+directory fails startup.
 
 ### `[features]` and `[amendments]`
 
 Feature names or amendment IDs used when creating a fresh private network with
 `--start`. They do not override the amendment set of an existing public
-network.
+network. An unknown `[features]` name fails startup, like rippled.
 
 ## Recommended Examples
 

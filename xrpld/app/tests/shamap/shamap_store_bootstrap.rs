@@ -91,3 +91,47 @@ fn shamap_store_bootstrap_injects_no_node_object_cache_settings() {
         );
     }
 }
+
+fn bootstrap_online_delete(value: Option<&str>, ledger_history: u32) -> Result<u32, String> {
+    let dir = TempDir::new().expect("tempdir");
+    let mut config = BasicConfig::new();
+    config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+    let node_db = config.section_mut("node_db");
+    node_db.set("type", "Memory");
+    node_db.set("path", dir.path().join("node").to_string_lossy());
+    if let Some(value) = value {
+        node_db.set("online_delete", value);
+    }
+    bootstrap_shamap_store(
+        &config,
+        false,
+        ledger_history,
+        1,
+        8,
+        64,
+        2,
+        &ManagerImp::new(),
+        Arc::new(DummyScheduler) as Arc<dyn Scheduler>,
+        Arc::new(NullJournal),
+    )
+    .map(|bootstrap| bootstrap.online_delete)
+}
+
+/// rippled SHAMapStoreImp: online_delete unset or 0 disables online deletion
+/// (every ledger is kept); a non-zero value must be at least 256 and not less
+/// than ledger_history. The fjall pruned store used to replace 0/unset with a
+/// 512-ledger window, so a full-history configuration silently pruned.
+#[test]
+fn online_delete_zero_or_unset_disables_deletion_like_rippled() {
+    assert_eq!(bootstrap_online_delete(None, 256), Ok(0));
+    assert_eq!(bootstrap_online_delete(Some("0"), 256), Ok(0));
+    assert_eq!(bootstrap_online_delete(Some("512"), 256), Ok(512));
+    assert_eq!(
+        bootstrap_online_delete(Some("128"), 64),
+        Err("online_delete must be at least 256".to_owned())
+    );
+    assert_eq!(
+        bootstrap_online_delete(Some("256"), 300),
+        Err("online_delete must not be less than ledger_history (currently 300)".to_owned())
+    );
+}

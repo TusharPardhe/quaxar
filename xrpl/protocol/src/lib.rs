@@ -160,7 +160,8 @@ pub use amount_support::{
 pub use api_version::{
     API_BETA_VERSION, API_COMMAND_LINE_VERSION, API_INVALID_VERSION, API_MAXIMUM_SUPPORTED_VERSION,
     API_MAXIMUM_VALID_VERSION, API_MINIMUM_SUPPORTED_VERSION, API_VERSION_IF_UNSPECIFIED,
-    for_all_api_versions, for_api_versions, get_api_version_number, set_version,
+    beta_rpc_api, for_all_api_versions, for_api_versions, get_api_version_number,
+    set_beta_rpc_api, set_version,
 };
 pub use apply_flags::{ApplyFlags, any_apply_flags};
 pub use batch_sign::{
@@ -371,8 +372,8 @@ pub use rules::{
     make_rules_given_current, make_rules_given_ledger, set_current_transaction_rules,
 };
 pub use secret_key::{
-    SECRET_KEY_LENGTH, SecretKey, SecretKeyError, derive_public_key, generate_root_secret_key,
-    generate_secret_key,
+    SECRET_KEY_LENGTH, SecretKey, SecretKeyError, derive_public_key, generate_key_pair,
+    generate_root_secret_key, generate_secret_key,
 };
 pub use seed::{
     Seed, generate_seed, parse_base58_seed, parse_generic_seed, random_seed, seed_as_1751,

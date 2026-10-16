@@ -12,6 +12,10 @@ pub struct SHAMapStoreBootstrap {
     pub node_store: SHAMapStoreNodeStore,
     pub state_db: Option<SHAMapStoreSavedStateDb>,
     pub effective_node_db_config: Section,
+    /// `[node_db] online_delete` as validated by rippled's rules: 0 (or unset)
+    /// keeps every ledger; otherwise at least 256 (8 standalone) and not less
+    /// than `ledger_history`.
+    pub online_delete: u32,
 }
 
 impl SHAMapStoreBootstrap {
@@ -50,9 +54,10 @@ pub fn bootstrap_shamap_store(
 
     // online_delete no longer selects a rotating store: the node store is always
     // a single database, and the fjall path prunes continuously through the
-    // PrunedDriver using online_delete as its retention window. The interval is
-    // cleared here so the SHAMapStore never schedules the removed rotation; the
-    // validated value stays in the node_db section for the driver.
+    // PrunedDriver using the validated online_delete as its retention window
+    // (0 = keep every ledger, no driver). The interval is cleared here so the
+    // SHAMapStore never schedules the removed rotation.
+    let online_delete = store.delete_interval();
     store.set_delete_interval(0);
     // The saved-state DB persists the advisory can_delete boundary across
     // restarts, so it is still opened when advisory deletion is enabled.
@@ -78,6 +83,7 @@ pub fn bootstrap_shamap_store(
     store.set_saved_state(saved_state);
     store.set_fd_required(fd_required);
     Ok(SHAMapStoreBootstrap {
+        online_delete,
         store,
         node_store,
         state_db,

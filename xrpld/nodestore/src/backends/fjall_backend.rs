@@ -98,6 +98,160 @@ fn keyspace_options(keyspace: Keyspace, table_target_bytes: u64) -> KeyspaceCrea
     }
 }
 
+fn ensure_ballast(path: &std::path::Path, len: u64) {
+    if len == 0 || super::ballast::is_allocated(path, len) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    match super::ballast::create(path, len) {
+        Ok(method) => tracing::info!(
+            target: "nodestore",
+            path = %path.display(),
+            reserve_bytes = len,
+            method = ?method,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "fjall disk-full ballast reserved"
+        ),
+        Err(error) => {
+            let _ = std::fs::remove_file(path);
+            tracing::warn!(
+                target: "nodestore",
+                path = %path.display(),
+                %error,
+                "could not create fjall disk-full ballast (continuing without reserve)"
+            );
+        }
+    }
+}
+
+fn release_ballast(path: &std::path::Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            tracing::error!(
+                target: "nodestore",
+                path = %path.display(),
+                "disk nearly full: released the fjall disk-full ballast so compaction and pruning can run"
+            );
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Release the ballast when free space falls below its size, and re-create it
+/// once free space is back above three times its size (hysteresis, so it is
+/// not created and released in a loop).
+const BALLAST_RECREATE_FACTOR: u64 = 3;
+/// How often the watchdog checks free space.
+const DISK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn maintain_ballast(dir: &std::path::Path, ballast: &std::path::Path, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let Some(available) = super::ballast::available_bytes(dir) else {
+        return;
+    };
+    match ballast_action(ballast.exists(), available, len) {
+        BallastAction::Release => {
+            release_ballast(ballast);
+        }
+        BallastAction::Recreate => ensure_ballast(ballast, len),
+        BallastAction::Keep => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BallastAction {
+    Keep,
+    Release,
+    Recreate,
+}
+
+/// Release below `len` free; re-create at or above `3 * len` free.
+fn ballast_action(present: bool, available: u64, len: u64) -> BallastAction {
+    if present && available < len {
+        BallastAction::Release
+    } else if !present && available >= len.saturating_mul(BALLAST_RECREATE_FACTOR) {
+        BallastAction::Recreate
+    } else {
+        BallastAction::Keep
+    }
+}
+
+/// fjall starts `min(cores, 4)` workers and worker 0 only flushes, so on a
+/// 2-vCPU host a single worker does every compaction. One long merge into the
+/// bottom levels then lets L0 reach fjall's 30-run write halt (testnet cold
+/// sync, 2026-10-15). Keep at least three compaction workers.
+const MIN_FJALL_WORKERS: usize = 4;
+
+fn fjall_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(MIN_FJALL_WORKERS)
+}
+
+/// fjall's L0 write-stall threshold (`Keyspace::local_backpressure`): from 20
+/// runs writers are throttled, from 30 they are halted until compaction
+/// reduces L0.
+const L0_STALL_RUNS: usize = 20;
+/// How long L0 may stay at the stall threshold without shrinking before the
+/// watchdog forces a flush.
+const L0_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// fjall schedules compaction only after a flush. When writes are halted at
+/// the L0 limit nothing flushes, so if the queued compaction requests were
+/// consumed before L0 could be compacted the halt is permanent: writers sleep
+/// in `local_backpressure`, the workers wait for messages, and node-store
+/// writes never complete. Rotating the active memtable starts a flush, which
+/// queues a compaction request for every worker.
+fn spawn_compaction_watchdog(
+    open: std::sync::Weak<OpenDb>,
+    dir: std::path::PathBuf,
+    reserve_bytes: u64,
+) {
+    let ballast = dir.join(".reserve_ballast");
+    let spawned = std::thread::Builder::new()
+        .name("fjall-watchdog".to_owned())
+        .spawn(move || {
+            let mut stuck_since: Option<(std::time::Instant, usize)> = None;
+            let mut last_disk_check = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let Some(open) = open.upgrade() else {
+                    return;
+                };
+                if last_disk_check.elapsed() >= DISK_CHECK_INTERVAL {
+                    last_disk_check = std::time::Instant::now();
+                    maintain_ballast(&dir, &ballast, reserve_bytes);
+                }
+                let l0 = open.nodes.l0_table_count();
+                stuck_since = match stuck_since {
+                    _ if l0 < L0_STALL_RUNS => None,
+                    Some((since, at)) if l0 >= at => Some((since, at)),
+                    _ => Some((std::time::Instant::now(), l0)),
+                };
+                if let Some((since, _)) = stuck_since
+                    && since.elapsed() >= L0_STALL_GRACE
+                {
+                    let rotated = open.nodes.rotate_memtable().unwrap_or(false);
+                    tracing::warn!(
+                        target: "nodestore",
+                        l0_tables = l0,
+                        sealed_memtables = open.nodes.sealed_memtable_count(),
+                        rotated,
+                        "fjall L0 at the write-stall limit without compaction progress; forced a flush to schedule compaction"
+                    );
+                    stuck_since = Some((std::time::Instant::now(), l0));
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::error!(target: "nodestore", %error, "could not start the fjall compaction watchdog");
+    }
+}
+
 /// The open fjall database and its four keyspace handles, resolved once at
 /// open so every operation is a direct handle call.
 struct OpenDb {
@@ -168,65 +322,25 @@ impl FjallBackend {
         std::path::Path::new(&self.path).join(".reserve_ballast")
     }
 
-    /// Create the ballast file if a reserve is configured and it is absent.
-    /// Best effort: a filesystem that cannot allocate it (e.g. already full)
-    /// is logged, not fatal, so the node still opens and can prune.
+    /// Create the ballast if a reserve is configured and it is not already
+    /// fully allocated (an older sparse ballast is replaced). Best effort: a
+    /// filesystem that cannot allocate it (e.g. already full) is logged, not
+    /// fatal, so the node still opens and can prune.
     fn ensure_reserve(&self) {
-        if self.reserve_bytes == 0 {
-            return;
-        }
-        let path = self.reserve_path();
-        let present = std::fs::metadata(&path)
-            .map(|m| m.len() >= self.reserve_bytes)
-            .unwrap_or(false);
-        if present {
-            return;
-        }
-        match std::fs::File::create(&path).and_then(|file| {
-            file.set_len(self.reserve_bytes)?;
-            Ok(())
-        }) {
-            Ok(()) => tracing::info!(
-                target: "nodestore",
-                path = %path.display(),
-                reserve_bytes = self.reserve_bytes,
-                "fjall disk-full ballast reserved"
-            ),
-            Err(error) => tracing::warn!(
-                target: "nodestore",
-                path = %path.display(),
-                %error,
-                "could not create fjall disk-full ballast (continuing without reserve)"
-            ),
-        }
+        ensure_ballast(&self.reserve_path(), self.reserve_bytes);
     }
 
     /// Release the ballast so freed space is available for compaction and
     /// deletes under disk pressure (design Case 10). Returns true if a ballast
     /// file was removed. Idempotent.
     pub fn release_reserve(&self) -> bool {
-        let path = self.reserve_path();
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                tracing::warn!(
-                    target: "nodestore",
-                    path = %path.display(),
-                    "released fjall disk-full ballast under space pressure"
-                );
-                true
-            }
-            Err(_) => false,
-        }
+        release_ballast(&self.reserve_path())
     }
 
-    /// Whether the ballast file is currently present at its configured size.
+    /// Whether the ballast is present at its configured size and really
+    /// occupies disk.
     pub fn reserve_present(&self) -> bool {
-        if self.reserve_bytes == 0 {
-            return false;
-        }
-        std::fs::metadata(self.reserve_path())
-            .map(|m| m.len() >= self.reserve_bytes)
-            .unwrap_or(false)
+        self.reserve_bytes != 0 && super::ballast::is_allocated(&self.reserve_path(), self.reserve_bytes)
     }
 
     fn open_db(&self) -> Result<Arc<OpenDb>, String> {
@@ -267,6 +381,7 @@ impl Backend for FjallBackend {
         }
         let db = Database::builder(&self.path)
             .cache_size(self.cache_bytes)
+            .worker_threads(fjall_worker_threads())
             .open()
             .map_err(|error| Self::fjall_err("open", error))?;
         // Each keyspace is its own LSM-tree with bloom filters and LZ4 on.
@@ -287,7 +402,13 @@ impl Backend for FjallBackend {
             meta: handles.next().expect("meta keyspace"),
             db,
         };
-        *guard = Some(Arc::new(open));
+        let open = Arc::new(open);
+        spawn_compaction_watchdog(
+            Arc::downgrade(&open),
+            std::path::PathBuf::from(&self.path),
+            self.reserve_bytes,
+        );
+        *guard = Some(open);
         drop(guard);
         // Reserve the disk-full ballast once the store is open (design Case 10).
         self.ensure_reserve();
@@ -739,6 +860,43 @@ mod tests {
         assert!(!backend.reserve_present());
         assert!(!backend.release_reserve(), "second release is a no-op");
 
+        let _ = backend.close();
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn ballast_is_released_when_free_space_drops_and_recreated_with_hysteresis() {
+        use super::{BallastAction, ballast_action};
+        let gb = 1u64 << 30;
+        assert_eq!(ballast_action(true, 5 * gb, gb), BallastAction::Keep);
+        assert_eq!(ballast_action(true, gb - 1, gb), BallastAction::Release);
+        // Just released: 1-3 GB free is not enough to take it back.
+        assert_eq!(ballast_action(false, gb, gb), BallastAction::Keep);
+        assert_eq!(ballast_action(false, 3 * gb - 1, gb), BallastAction::Keep);
+        assert_eq!(ballast_action(false, 3 * gb, gb), BallastAction::Recreate);
+    }
+
+    /// A ballast left by an older build (a sparse `set_len` file) is replaced
+    /// by a really allocated one at open.
+    #[cfg(unix)]
+    #[test]
+    fn sparse_ballast_from_an_older_build_is_replaced_at_open() {
+        let path = temp_path("reserve-sparse");
+        std::fs::create_dir_all(&path).expect("dir");
+        let ballast = std::path::Path::new(&path).join(".reserve_ballast");
+        std::fs::File::create(&ballast)
+            .expect("create")
+            .set_len(1024 * 1024)
+            .expect("set_len");
+        let mut cfg = section(&path);
+        cfg.set("reserve_mb", "1");
+        let backend = FjallBackend::new(&cfg, Arc::new(NullJournal)).expect("construct");
+        backend.open(true).expect("open");
+        assert!(backend.reserve_present(), "allocated ballast after open");
+        assert!(
+            super::super::ballast::allocated_bytes(&ballast).is_some_and(|b| b >= 1024 * 1024),
+            "ballast blocks are really allocated"
+        );
         let _ = backend.close();
         let _ = std::fs::remove_dir_all(&path);
     }

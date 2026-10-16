@@ -314,8 +314,10 @@ fn transaction_sign_for_rejects_delegate_fee_payer_as_signer() {
 #[test]
 fn channel_authorize_returns_real_signature_hex() {
     let (seed, secret_text, _account) = seeded_account(0x66);
-    let secret = generate_secret_key(KeyType::Secp256k1, &seed).expect("secret");
-    let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public");
+    // rippled channel_authorize signs with keypairForSignature, i.e.
+    // generateKeyPair (account derivation).
+    let (public, secret) =
+        protocol::generate_key_pair(KeyType::Secp256k1, &seed).expect("key pair");
     let channel_id =
         Uint256::from_hex("0123456789ABCDEFFEDCBA98765432100123456789ABCDEFFEDCBA9876543210")
             .expect("channel id");
