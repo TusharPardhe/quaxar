@@ -4,8 +4,9 @@ use crate::commands::rpc_helpers::{
     autofill_tx, get_tx_json_from_params, parse_sttx_from_params, simulate_txn,
 };
 use crate::state::context::{RpcRequestContext, RpcRuntime};
-use crate::status::Status;
-use protocol::{JsonValue, TxType, get_field_by_symbol};
+use crate::state::role::Role;
+use crate::status::{RpcErrorCode, Status};
+use protocol::{JsonValue, STTx, TxType, get_field_by_symbol};
 
 pub struct SimulateSource;
 
@@ -45,6 +46,11 @@ pub fn do_simulate<Runtime: RpcRuntime>(
         return Err(Status::new(crate::status::RpcErrorCode::NotSupported));
     }
 
+    // These fields mean the transaction may run WASM, which simulate cannot
+    // charge for. Only admins may run it. Check the parsed transaction shape
+    // before the engine runs.
+    validate_wasm_simulation(&st_tx, ctx.role)?;
+
     let result = simulate_txn(ctx, &st_tx)?;
     if let JsonValue::Object(ref obj) = result {
         if let Some(JsonValue::String(engine_result)) = obj.get(protocol::jss::engine_result) {
@@ -52,4 +58,57 @@ pub fn do_simulate<Runtime: RpcRuntime>(
         }
     }
     Ok(result)
+}
+
+fn wasm_transaction_requires_admin(st_tx: &STTx) -> bool {
+    st_tx.is_field_present(get_field_by_symbol("sfBytecode"))
+        || st_tx.is_field_present(get_field_by_symbol("sfGas"))
+}
+
+fn validate_wasm_simulation(st_tx: &STTx, role: Role) -> Result<(), Status> {
+    if wasm_transaction_requires_admin(st_tx) && role != Role::Admin {
+        return Err(Status::with_message(
+            RpcErrorCode::NoPermission,
+            "WASM transactions are only supported in admin mode.",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_wasm_simulation, wasm_transaction_requires_admin};
+    use crate::state::role::Role;
+    use protocol::{JsonValue, STTx, TxType, get_field_by_symbol};
+
+    #[test]
+    fn wasm_shape_detects_bytecode_and_gas_fields() {
+        let bytecode = STTx::new(TxType::ESCROW_CREATE, |tx| {
+            tx.set_field_vl(get_field_by_symbol("sfBytecode"), &[0]);
+        });
+        let gas = STTx::new(TxType::ESCROW_FINISH, |tx| {
+            tx.set_field_u32(get_field_by_symbol("sfGas"), 1);
+        });
+        let ordinary = STTx::new(TxType::ESCROW_CREATE, |_| {});
+
+        assert!(wasm_transaction_requires_admin(&bytecode));
+        assert!(wasm_transaction_requires_admin(&gas));
+        assert!(!wasm_transaction_requires_admin(&ordinary));
+
+        let err = validate_wasm_simulation(&bytecode, Role::User).expect_err("user WASM blocked");
+        let mut json = JsonValue::Object(Default::default());
+        err.inject(&mut json);
+        let JsonValue::Object(json) = json else {
+            panic!("status must inject an object");
+        };
+        assert_eq!(json.get("error"), Some(&JsonValue::String("noPermission".to_owned())));
+        assert_eq!(
+            json.get("error_message"),
+            Some(&JsonValue::String(
+                "WASM transactions are only supported in admin mode.".to_owned()
+            ))
+        );
+        assert!(validate_wasm_simulation(&bytecode, Role::Admin).is_ok());
+        assert!(validate_wasm_simulation(&ordinary, Role::User).is_ok());
+    }
 }
