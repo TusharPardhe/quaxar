@@ -14227,8 +14227,16 @@ fn crafted_offer_payment_case(features: &[&str]) {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
+    // Production applies under the ledger's transaction rules
+    // (Transactor::operator() / CurrentTransactionRulesGuard). Without them,
+    // amount math takes its "no rules" default, which for fixCleanup3_5_0's
+    // ceilOut clamp is the fixed behaviour (rippled #8480, for pathfinding).
+    let rules = v.rules().clone();
+    let result = tx::with_transaction_apply_runtime(&rules, || {
+        handle_real_dispatch(&mut v, &payment, TxType::PAYMENT, None)
+    });
     assert_eq!(
-        handle_real_dispatch(&mut v, &payment, TxType::PAYMENT, None),
+        result,
         Ter::TEC_INTERNAL,
         "rippled records this payment as tecINTERNAL ({features:?})"
     );
