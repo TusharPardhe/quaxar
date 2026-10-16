@@ -304,7 +304,7 @@ fn account_offers_respects_marker_limit_and_offer_json() {
                 (
                     "marker",
                     JsonValue::String(format!(
-                        "{},{}",
+                        "{},+{},ignored",
                         offer2.key(),
                         offer2.get_field_u64(get_field_by_symbol("sfOwnerNode"))
                     )),
@@ -331,6 +331,56 @@ fn account_offers_respects_marker_limit_and_offer_json() {
         panic!("offers must be an array");
     };
     assert_eq!(marker_offers.len(), 1);
+}
+
+#[test]
+fn account_offers_validates_limit_and_marker_before_account_or_ledger_lookup() {
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    for account in ["foo".to_owned(), to_base58(sample_account(0xEE))] {
+        let result = do_account_offers(
+            &AccountOffersRequest {
+                params: &object([
+                    ("account", JsonValue::String(account)),
+                    ("limit", JsonValue::String("0".to_owned())),
+                ]),
+                api_version: 1,
+                role: Role::Admin,
+            },
+            &source,
+        );
+        let JsonValue::Object(result) = result else {
+            panic!("result must be an object");
+        };
+        assert_eq!(
+            result.get("error_message"),
+            Some(&JsonValue::String(
+                "Invalid field 'limit', not unsigned integer.".to_owned()
+            ))
+        );
+    }
+
+    let result = do_account_offers(
+        &AccountOffersRequest {
+            params: &object([
+                ("account", JsonValue::String(to_base58(sample_account(0xEF)))),
+                ("ledger_index", JsonValue::Unsigned(999)),
+                ("marker", JsonValue::String("NOT_A_MARKER".to_owned())),
+            ]),
+            api_version: 1,
+            role: Role::Admin,
+        },
+        &source,
+    );
+    let JsonValue::Object(result) = result else {
+        panic!("result must be an object");
+    };
+    assert_eq!(
+        result.get("error_message"),
+        Some(&JsonValue::String("Invalid field 'marker'.".to_owned()))
+    );
 }
 
 #[test]

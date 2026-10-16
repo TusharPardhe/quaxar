@@ -17,7 +17,7 @@ use crate::handlers::ledger_lookup::{
     lookup_ledger_with_result,
 };
 use crate::state::tuning::Tuning;
-use crate::status::RpcErrorCode;
+use crate::status::{RpcErrorCode, Status};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountOffersRequest<'a> {
@@ -349,6 +349,22 @@ fn has_more_items_after<S: AccountOffersSource>(
     ok && found
 }
 
+fn parse_account_marker(marker: &str) -> Option<(Uint256, u64)> {
+    let (index, hint) = marker.split_once(',')?;
+    let mut start_after = Uint256::zero();
+    if !start_after.parse_hex(index) {
+        return None;
+    }
+
+    let hint = hint.split(',').next()?;
+    let hint = hint.strip_prefix('+').unwrap_or(hint);
+    if hint.is_empty() || !hint.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let start_hint = hint.parse::<u64>().ok()?;
+    Some((start_after, start_hint))
+}
+
 pub fn do_account_offers<S: AccountOffersSource>(
     request: &AccountOffersRequest<'_>,
     source: &S,
@@ -361,6 +377,34 @@ pub fn do_account_offers<S: AccountOffersSource>(
             status.inject(&mut error);
             return error;
         }
+    };
+
+    let limit = match read_limit_field(request.params, request.role, Tuning::ACCOUNT_OFFERS) {
+        Ok(limit) => limit,
+        Err(status) => {
+            let mut error = JsonValue::Object(BTreeMap::new());
+            status.inject(&mut error);
+            return error;
+        }
+    };
+    let marker_set =
+        matches!(request.params, JsonValue::Object(object) if object.contains_key("marker"));
+    let parsed_marker = if marker_set {
+        let JsonValue::Object(object) = request.params else {
+            unreachable!("marker parsing requires an object");
+        };
+        let Some(marker_value) = object.get("marker") else {
+            return make_error(RpcErrorCode::InvalidParams);
+        };
+        let JsonValue::String(marker_text) = marker_value else {
+            return crate::commands::rpc_helpers::expected_field_error("marker", "string");
+        };
+        let Some(marker) = parse_account_marker(marker_text) else {
+            return crate::commands::rpc_helpers::invalid_field_error("marker");
+        };
+        Some(marker)
+    } else {
+        None
     };
 
     let context = LedgerLookupContext {
@@ -380,65 +424,26 @@ pub fn do_account_offers<S: AccountOffersSource>(
     };
 
     let Some(account_id) = parse_base58_account_id(&account_text) else {
-        return make_error(RpcErrorCode::ActMalformed);
+        Status::new(RpcErrorCode::ActMalformed).inject(&mut result);
+        return result;
     };
+
+    if source.read_account_root(&ledger, account_id).is_none() {
+        return make_error(RpcErrorCode::ActNotFound);
+    }
 
     ensure_object(&mut result).insert(
         "account".to_owned(),
         JsonValue::String(to_base58(account_id)),
     );
 
-    if source.read_account_root(&ledger, account_id).is_none() {
-        return make_error(RpcErrorCode::ActNotFound);
-    }
-
-    let limit = match read_limit_field(request.params, request.role, Tuning::ACCOUNT_OFFERS) {
-        Ok(limit) => limit,
-        Err(status) => {
-            let mut error = JsonValue::Object(BTreeMap::new());
-            status.inject(&mut error);
-            return error;
-        }
-    };
-
     let JsonValue::Object(result_object) = &mut result else {
         unreachable!("result should be an object");
     };
     result_object.insert("offers".to_owned(), JsonValue::Array(Vec::new()));
 
-    let mut start_after = Uint256::zero();
-    let mut start_hint = 0u64;
-    let marker_set =
-        matches!(request.params, JsonValue::Object(object) if object.contains_key("marker"));
+    let (start_after, start_hint) = parsed_marker.unwrap_or((Uint256::zero(), 0));
     if marker_set {
-        let JsonValue::Object(object) = request.params else {
-            unreachable!("marker parsing requires an object");
-        };
-
-        let Some(marker_value) = object.get("marker") else {
-            return make_error(RpcErrorCode::InvalidParams);
-        };
-
-        let JsonValue::String(marker_text) = marker_value else {
-            return crate::commands::rpc_helpers::expected_field_error("marker", "string");
-        };
-
-        let mut parts = marker_text.splitn(3, ',');
-        let Some(first) = parts.next() else {
-            return crate::commands::rpc_helpers::invalid_field_error("marker");
-        };
-        if !start_after.parse_hex(first) {
-            return crate::commands::rpc_helpers::invalid_field_error("marker");
-        }
-
-        let Some(second) = parts.next() else {
-            return crate::commands::rpc_helpers::invalid_field_error("marker");
-        };
-        match second.parse::<u64>() {
-            Ok(hint) => start_hint = hint,
-            Err(_) => return crate::commands::rpc_helpers::invalid_field_error("marker"),
-        }
-
         let Some(marker_sle) = source.read_child_entry(&ledger, start_after) else {
             return make_error(RpcErrorCode::InvalidParams);
         };

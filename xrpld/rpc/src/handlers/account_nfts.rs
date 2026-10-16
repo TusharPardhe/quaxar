@@ -257,6 +257,24 @@ pub fn do_account_nfts<S: AccountNFTsSource>(
         Err(error) => return error,
     };
 
+    let limit = match read_limit_field(request.params, request.role, Tuning::ACCOUNT_NFTOKENS) {
+        Ok(limit) => limit,
+        Err(status) => {
+            let mut error = JsonValue::Object(BTreeMap::new());
+            status.inject(&mut error);
+            return error;
+        }
+    };
+
+    let marker = match parse_marker(request.params) {
+        Ok(marker) => marker.unwrap_or_default(),
+        Err(status) => {
+            let mut error = JsonValue::Object(BTreeMap::new());
+            status.inject(&mut error);
+            return error;
+        }
+    };
+
     let context = LedgerLookupContext {
         params: request.params,
         source,
@@ -281,24 +299,6 @@ pub fn do_account_nfts<S: AccountNFTsSource>(
         return crate::commands::rpc_helpers::rpc_error(RpcErrorCode::ActNotFound);
     }
 
-    let limit = match read_limit_field(request.params, request.role, Tuning::ACCOUNT_NFTOKENS) {
-        Ok(limit) => limit,
-        Err(status) => {
-            let mut error = JsonValue::Object(BTreeMap::new());
-            status.inject(&mut error);
-            return error;
-        }
-    };
-
-    let marker = match parse_marker(request.params) {
-        Ok(marker) => marker.unwrap_or_default(),
-        Err(status) => {
-            let mut error = JsonValue::Object(BTreeMap::new());
-            status.inject(&mut error);
-            return error;
-        }
-    };
-
     let (nfts, next_marker) = match collect_nft_pages(source, &ledger, account_id, marker, limit) {
         Ok(result) => result,
         Err(error) => return error,
@@ -307,14 +307,14 @@ pub fn do_account_nfts<S: AccountNFTsSource>(
     let mut result = result;
     let object = ensure_object(&mut result);
     object.insert("account_nfts".to_owned(), JsonValue::Array(nfts));
-    object.insert(
-        "account".to_owned(),
-        JsonValue::String(to_base58(account_id)),
-    );
-
     if let Some(marker) = next_marker {
         object.insert("limit".to_owned(), JsonValue::Unsigned(u64::from(limit)));
         object.insert("marker".to_owned(), JsonValue::String(marker.to_string()));
+    } else {
+        object.insert(
+            "account".to_owned(),
+            JsonValue::String(to_base58(account_id)),
+        );
     }
 
     result

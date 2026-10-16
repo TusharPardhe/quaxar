@@ -12,7 +12,7 @@ use crate::commands::rpc_helpers::{invalid_field_error, missing_field_error, rpc
 use crate::handlers::ledger_lookup::{
     LedgerLookupContext, LedgerLookupLedger, LedgerLookupSource, RpcRole, lookup_ledger_with_result,
 };
-use crate::status::RpcErrorCode;
+use crate::status::{RpcErrorCode, Status};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountCurrenciesRequest<'a> {
@@ -182,10 +182,6 @@ pub fn do_account_currencies<S: AccountCurrenciesSource>(
         Err(error) => return error,
     };
 
-    let Some(account_id) = parse_base58_account_id(&account_text) else {
-        return rpc_error(RpcErrorCode::ActMalformed);
-    };
-
     let context = LedgerLookupContext {
         params: request.params,
         source,
@@ -199,6 +195,11 @@ pub fn do_account_currencies<S: AccountCurrenciesSource>(
             status.inject(&mut json);
             return json;
         }
+    };
+
+    let Some(account_id) = parse_base58_account_id(&account_text) else {
+        Status::new(RpcErrorCode::ActMalformed).inject(&mut result);
+        return result;
     };
 
     if source.read_account_root(&ledger, account_id).is_none() {
