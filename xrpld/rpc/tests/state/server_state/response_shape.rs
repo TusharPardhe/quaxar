@@ -89,6 +89,7 @@ fn server_state_reads_integer_load_fields_from_application_source() {
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         }],
         client: None,
         overlay: None,

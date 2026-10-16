@@ -549,7 +549,7 @@ limit = 64
 n94a1u4jAz288pZLtw6yFWVbi89YamiC6JBXPVUj5zmExe5fTVg9 alpha
 
 [node_db]
-type = RocksDB
+type = fjall
 path = {}
 online_delete = 256
 "#,
@@ -762,7 +762,7 @@ fn app_bootstrap_loads_latest_local_ledger_from_sqlite_and_nodestore() {
     let dir = TempDir::new().expect("tempdir");
     let ledger = persisted_bootstrap_ledger(7);
     let (database_path, node_db_path, config_path) =
-        persist_bootstrap_storage(&dir, &[Arc::clone(&ledger)], "RocksDB");
+        persist_bootstrap_storage(&dir, &[Arc::clone(&ledger)], "fjall");
 
     fs::write(
         &config_path,
@@ -780,7 +780,7 @@ port = 5005
 protocol = http
 
 [node_db]
-type = RocksDB
+type = fjall
 path = {}
 "#,
             database_path.display(),
@@ -813,7 +813,7 @@ fn app_bootstrap_loads_local_ledger_by_sequence_from_sqlite_and_nodestore() {
     let dir = TempDir::new().expect("tempdir");
     let ledger = persisted_bootstrap_ledger(9);
     let (database_path, node_db_path, config_path) =
-        persist_bootstrap_storage(&dir, &[Arc::clone(&ledger)], "RocksDB");
+        persist_bootstrap_storage(&dir, &[Arc::clone(&ledger)], "fjall");
 
     fs::write(
         &config_path,
@@ -831,7 +831,7 @@ port = 5005
 protocol = http
 
 [node_db]
-type = RocksDB
+type = fjall
 path = {}
 "#,
             database_path.display(),
@@ -865,7 +865,7 @@ fn app_bootstrap_loads_local_ledger_by_hash_from_sqlite_and_nodestore() {
     let ledger = persisted_bootstrap_ledger(11);
     let ledger_hash = ledger.header().hash.as_uint256().to_string();
     let (database_path, node_db_path, config_path) =
-        persist_bootstrap_storage(&dir, &[Arc::clone(&ledger)], "RocksDB");
+        persist_bootstrap_storage(&dir, &[Arc::clone(&ledger)], "fjall");
 
     fs::write(
         &config_path,
@@ -883,7 +883,7 @@ port = 5005
 protocol = http
 
 [node_db]
-type = RocksDB
+type = fjall
 path = {}
 "#,
             database_path.display(),
@@ -952,7 +952,7 @@ fn app_bootstrap_loads_replay_parent_and_injects_replay_transactions() {
         "serialized replay metadata must decode the exact MPT sfDeliveredAmount"
     );
     let (database_path, node_db_path, config_path) =
-        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "fjall");
 
     fs::write(
         &config_path,
@@ -970,7 +970,7 @@ port = 5005
 protocol = http
 
 [node_db]
-type = RocksDB
+type = fjall
 path = {}
 "#,
             database_path.display(),
@@ -1017,7 +1017,7 @@ fn app_bootstrap_replay_raw_inserts_historical_transactions_before_later_replay(
         &[(Arc::clone(&rejected), metadata(0, 0x92))],
     );
     let (database_path, node_db_path, config_path) =
-        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "fjall");
 
     fs::write(
         &config_path,
@@ -1035,7 +1035,7 @@ port = 5005
 protocol = http
 
 [node_db]
-type = RocksDB
+type = fjall
 path = {}
 "#,
             database_path.display(),
@@ -1079,7 +1079,7 @@ fn app_bootstrap_replay_raw_inserts_future_sequence_for_cumulative_build() {
         &[(Arc::clone(&rejected), metadata(0, 0x92))],
     );
     let (database_path, node_db_path, config_path) =
-        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "fjall");
 
     fs::write(
         &config_path,
@@ -1097,7 +1097,7 @@ port = 5005
 protocol = http
 
 [node_db]
-type = RocksDB
+type = fjall
 path = {}
 "#,
             database_path.display(),
@@ -1141,7 +1141,7 @@ fn app_bootstrap_replay_raw_inserts_stale_sequence_for_cumulative_build() {
         &[(Arc::clone(&stale), metadata(0, 0x93))],
     );
     let (database_path, node_db_path, config_path) =
-        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "fjall");
 
     fs::write(
         &config_path,
@@ -1159,7 +1159,7 @@ port = 5005
 protocol = http
 
 [node_db]
-type = RocksDB
+type = fjall
 path = {}
 "#,
             database_path.display(),
@@ -1196,7 +1196,7 @@ fn app_bootstrap_defers_replay_until_the_exact_incomplete_parent_is_acquired() {
         persist_bootstrap_storage_with_missing_state_children(
             &dir,
             &[Arc::clone(&parent), Arc::clone(&replay)],
-            "RocksDB",
+            "fjall",
             Some(parent.header().seq),
         );
 
@@ -1216,7 +1216,7 @@ port = 5005
 protocol = http
 
 [node_db]
-type = RocksDB
+type = fjall
 path = {}
 "#,
             database_path.display(),
@@ -1772,7 +1772,7 @@ fn app_bootstrap_normal_starts_genesis_next_lcl_even_with_durable_history() {
     let parent = persisted_bootstrap_state_only_ledger(20);
     let latest = persisted_bootstrap_replay_ledger(21, *parent.header().hash.as_uint256(), &[]);
     let (database_path, node_db_path, config_path) =
-        persist_bootstrap_storage(&dir, &[parent, latest], "RocksDB");
+        persist_bootstrap_storage(&dir, &[parent, latest], "fjall");
 
     fs::write(
         &config_path,
@@ -1790,7 +1790,7 @@ port = 5005
 protocol = http
 
 [node_db]
-type = RocksDB
+type = fjall
 path = {}
 "#,
             database_path.display(),
@@ -1831,7 +1831,7 @@ fn app_bootstrap_load_restores_latest_and_configured_history() {
     let parent = persisted_bootstrap_state_only_ledger(20);
     let latest = persisted_bootstrap_replay_ledger(21, *parent.header().hash.as_uint256(), &[]);
     let (database_path, node_db_path, config_path) =
-        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&latest)], "RocksDB");
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&latest)], "fjall");
 
     fs::write(
         &config_path,
@@ -1849,7 +1849,7 @@ port = 5005
 protocol = http
 
 [node_db]
-type = RocksDB
+type = fjall
 path = {}
 
 [ledger_history]

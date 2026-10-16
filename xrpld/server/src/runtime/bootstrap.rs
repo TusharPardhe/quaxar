@@ -180,6 +180,7 @@ fn build_server_ports_setup_from_bootstrap(
         secure_gateway_nets_v4: Vec::new(),
         secure_gateway_nets_v6: Vec::new(),
         standalone_mode: false,
+        send_queue_limit: 100,
     };
 
     Ok(Arc::new(ServerPortsSetup {

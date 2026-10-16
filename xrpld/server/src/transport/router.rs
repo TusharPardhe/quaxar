@@ -77,9 +77,8 @@ const INLINE_METHODS: &[&str] = &["ping", "random"];
 /// shared per-stream broadcast ring (`DEFAULT_STREAM_CAPACITY`). A client
 /// that falls a whole ring behind, or overflows a non-waiting `send_text`, is
 /// closed with rippled's policy_error "Policy error: client is too slow."
-/// (`BaseWSPeer::send`) instead of silently losing messages. rippled's
-/// per-port `send_queue_limit` (default 100) is not yet plumbed through
-/// `ServerPortSetup`; this matches its default.
+/// (`BaseWSPeer::send`) instead of silently losing messages. This is the
+/// default; each port uses its configured `send_queue_limit`.
 pub const WS_SEND_QUEUE_LIMIT: usize = 100;
 
 /// Upper bound on frames written per flush by the WebSocket writer.
@@ -123,6 +122,8 @@ pub struct RpcServerPortPolicy {
     pub allow_ws: bool,
     pub auth: ServerAuthConfig,
     pub tls_config: Option<Arc<ServerConfig>>,
+    /// rippled `Port::wsQueueLimit` (`send_queue_limit`).
+    pub ws_queue_limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +262,7 @@ impl RpcServerPortBuild {
                     standalone_mode: port.standalone_mode,
                 },
                 tls_config,
+                ws_queue_limit: usize::from(port.send_queue_limit),
             })
         } else {
             None
@@ -302,18 +304,11 @@ impl<D> RpcServer<D>
 where
     D: RpcDispatcher + 'static,
 {
+    /// rippled `rpc::getAPIVersionNumber(jv, config.betaRpcApi)`: 1 when
+    /// unspecified, `API_INVALID_VERSION` (0) when out of range or not a
+    /// non-negative integer.
     fn api_version_from_params(params: &JsonValue) -> u32 {
-        let JsonValue::Object(object) = params else {
-            return 1;
-        };
-        match object.get("api_version") {
-            Some(JsonValue::Unsigned(value)) => {
-                u32::try_from(*value).ok().filter(|value| *value > 0)
-            }
-            Some(JsonValue::Signed(value)) if *value > 0 => u32::try_from(*value as u64).ok(),
-            _ => None,
-        }
-        .unwrap_or(1)
+        protocol::get_api_version_number(params, protocol::beta_rpc_api())
     }
 
     pub fn new(dispatcher: D) -> Self {
@@ -587,6 +582,9 @@ where
         );
         let mut metadata = request_metadata;
         metadata.api_version = Self::api_version_from_params(&params);
+        if metadata.api_version == protocol::API_INVALID_VERSION {
+            return invalid_api_version_http_reply();
+        }
         metadata.role = request_role(
             RpcRole::User,
             &server.auth,
@@ -789,6 +787,7 @@ where
 
         let mut responses = Vec::with_capacity(requests.len());
         for payload in requests {
+            let payload_echo = payload.clone();
             let mut rpc_request = match JsonRpcEnvelope::try_from(RawRequest::from_value(payload)) {
                 Ok(value) => value,
                 Err(_) => {
@@ -805,6 +804,10 @@ where
             );
             let mut req_metadata = metadata.clone();
             req_metadata.api_version = Self::api_version_from_params(&params);
+            if req_metadata.api_version == protocol::API_INVALID_VERSION {
+                responses.push(invalid_api_version_batch_item(&payload_echo));
+                continue;
+            }
             req_metadata.role = request_role(
                 RpcRole::User,
                 &server.auth,
@@ -888,7 +891,12 @@ where
         tracing::debug!(target: "server", client_ip = %remote_addr.ip(), "New WebSocket connection");
         let (mut sink, mut stream) = socket.split();
         // Bounded per-connection egress queue (rippled send_queue_limit).
-        let (sender, mut receiver) = mpsc::channel(WS_SEND_QUEUE_LIMIT);
+        let queue_limit = self
+            .config
+            .port_policy
+            .as_ref()
+            .map_or(WS_SEND_QUEUE_LIMIT, |policy| policy.ws_queue_limit.max(1));
+        let (sender, mut receiver) = mpsc::channel(queue_limit);
         let mut metadata = RequestMetadata::from_headers(remote_addr, &headers);
         metadata.local_addr = self
             .config
@@ -1004,6 +1012,14 @@ where
                     );
                     let mut metadata = metadata.clone();
                     metadata.api_version = Self::api_version_from_params(&params);
+                    if metadata.api_version == protocol::API_INVALID_VERSION {
+                        let request = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+                        let response = invalid_api_version_ws_reply(&request);
+                        let _ = session
+                            .send_reply(sonic_rs::to_string(&response).unwrap_or_default())
+                            .await;
+                        continue;
+                    }
                     metadata.role = request_role(
                         RpcRole::User,
                         &self.auth,
@@ -1202,6 +1218,50 @@ fn result_with_default_status(mut value: Value) -> Value {
     };
     object.insert("status".to_owned(), Value::String(status.to_owned()));
     value
+}
+
+/// rippled `ServerHandler::processRequest`: `httpReply(400,
+/// "invalid_API_version")` (body plus CRLF, JSON content type).
+fn invalid_api_version_http_reply() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=UTF-8",
+        )],
+        "invalid_API_version\r\n",
+    )
+        .into_response()
+}
+
+/// rippled batch item: `{request, error: makeJsonError(-32606,
+/// "invalid_API_version")}`.
+fn invalid_api_version_batch_item(request: &Value) -> Value {
+    serde_json::json!({
+        "request": request,
+        "error": {"error": {"code": -32606, "message": "invalid_API_version"}},
+    })
+}
+
+/// rippled `ServerHandler::processSession` WebSocket error for an invalid
+/// `api_version`.
+fn invalid_api_version_ws_reply(request: &Value) -> Value {
+    let mut response = serde_json::Map::new();
+    response.insert("type".to_owned(), Value::String("response".to_owned()));
+    response.insert("status".to_owned(), Value::String("error".to_owned()));
+    response.insert(
+        "error".to_owned(),
+        Value::String("invalid_API_version".to_owned()),
+    );
+    response.insert("request".to_owned(), request.clone());
+    if let Value::Object(object) = request {
+        for key in ["id", "jsonrpc", "ripplerpc"] {
+            if let Some(value) = object.get(key) {
+                response.insert(key.to_owned(), value.clone());
+            }
+        }
+    }
+    Value::Object(response)
 }
 
 fn json_rpc_error_response(
@@ -1462,6 +1522,41 @@ mod tests {
         assert_eq!(values, (0..32).collect::<Vec<_>>());
     }
 
+    /// rippled `getAPIVersionNumber`: unspecified is 1; 0, negative,
+    /// non-integer and above the maximum are invalid (3 needs beta_rpc_api).
+    #[test]
+    fn api_version_is_validated_like_rippled() {
+        let version = |value: JsonValue| {
+            let mut object = BTreeMap::new();
+            object.insert("api_version".to_owned(), value);
+            RpcServer::<NoopDispatcher>::api_version_from_params(&JsonValue::Object(object))
+        };
+        assert_eq!(
+            RpcServer::<NoopDispatcher>::api_version_from_params(&JsonValue::Object(BTreeMap::new())),
+            1
+        );
+        assert_eq!(version(JsonValue::Unsigned(2)), 2);
+        for invalid in [
+            JsonValue::Unsigned(0),
+            JsonValue::Unsigned(3),
+            JsonValue::Unsigned(5),
+            JsonValue::Signed(-1),
+            JsonValue::String("2".to_owned()),
+        ] {
+            assert_eq!(version(invalid), protocol::API_INVALID_VERSION);
+        }
+        assert_eq!(
+            super::invalid_api_version_batch_item(&json!({"method": "ping"})),
+            json!({"request": {"method": "ping"},
+                   "error": {"error": {"code": -32606, "message": "invalid_API_version"}}})
+        );
+        assert_eq!(
+            super::invalid_api_version_ws_reply(&json!({"command": "ping", "id": 7, "api_version": 9})),
+            json!({"type": "response", "status": "error", "error": "invalid_API_version",
+                   "id": 7, "request": {"command": "ping", "id": 7, "api_version": 9}})
+        );
+    }
+
     #[test]
     fn server_port_policy_rejects_unsupported_transport_modes() {
         let secure_port = ServerPortSetup {
@@ -1483,6 +1578,7 @@ mod tests {
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         };
         // https is now treated as http+TLS, so it should succeed
         assert!(RpcServerPortPolicy::try_from(&secure_port).is_ok());
@@ -1506,6 +1602,7 @@ mod tests {
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         };
         assert!(RpcServerPortPolicy::try_from(&peer_port).is_err());
     }
@@ -1531,6 +1628,7 @@ mod tests {
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         };
 
         let build =

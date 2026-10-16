@@ -619,8 +619,9 @@ fn activate_enforces_peer_limit_for_unreserved_peers_only() {
 
     assert!(overlay.activate(Arc::clone(&reserved)));
     assert!(overlay.activate(Arc::clone(&clustered)));
-    // rippled: config.maxPeers = 0 when explicit in/out limits are set
-    assert_eq!(overlay.limit(), 0);
+    // rippled e302e4eeed: maxPeers is inPeers + outPeers when explicit
+    // directional limits are set (0 + 1 here).
+    assert_eq!(overlay.limit(), 1);
     assert_eq!(overlay.size(), 3);
     assert!(reserved.reserved());
     assert!(clustered.cluster());
@@ -692,8 +693,9 @@ fn activate_enforces_peer_limit_for_fixed_peers_slots() {
     assert!(overlay.activate(Arc::clone(&counted)));
     assert!(overlay.activate(Arc::clone(&fixed)));
     assert!(fixed.fixed());
-    // rippled: config.maxPeers = 0 when explicit in/out limits are set
-    assert_eq!(overlay.limit(), 0);
+    // rippled e302e4eeed: maxPeers is inPeers + outPeers when explicit
+    // directional limits are set (0 + 1 here).
+    assert_eq!(overlay.limit(), 1);
     assert_eq!(overlay.size(), 2);
     assert_eq!(overlay.active_outbound_peers_count(), 1);
 }
@@ -928,10 +930,37 @@ fn disabled_transaction_get_objects_query_is_charged_as_malformed_request() {
     assert_eq!(context, "tx reduce-relay disabled");
 }
 
+/// rippled Config.h: `compression` and `ledger_replay` default off, so they
+/// are neither advertised nor used even when the peer offers them.
+#[test]
+fn compression_and_ledger_replay_are_off_by_default_like_rippled() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let (compr, replay, _, _) = overlay.inbound_handshake_features();
+    assert!(!compr && !replay);
+    let peer = peer(14, 45);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "X-Protocol-Ctl",
+        "compr=lz4;ledgerreplay=1".parse().expect("header"),
+    );
+    let result = overlay
+        .finalize_connect_result(ConnectAttemptResult {
+            peer: Arc::clone(&peer),
+            response: Response::builder().status(101).body(()).expect("response"),
+            negotiated_features: headers,
+            session: None,
+        })
+        .expect("connect result should finalize");
+    assert!(!result.peer.compression_enabled());
+    assert!(!result.peer.supports_feature(ProtocolFeature::LedgerReplay));
+}
+
 #[test]
 fn inbound_feature_advertisement_honors_runtime_feature_switches() {
     let overlay = OverlayImpl::new(
         Setup {
+            compression_enabled: true,
+            ledger_replay_enabled: true,
             tx_reduce_relay_enabled: false,
             vp_reduce_relay_base_squelch_enabled: false,
             ..test_setup()
@@ -1263,7 +1292,15 @@ fn check_tracking_updates_active_peer_tracking_state() {
 
 #[test]
 fn finalize_connected_peer_activates_and_applies_negotiated_flags() {
-    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let overlay = OverlayImpl::new(
+        Setup {
+            compression_enabled: true,
+            ledger_replay_enabled: true,
+            ..test_setup()
+        },
+        Arc::new(TestHandoff),
+    )
+    .expect("overlay");
     let peer = peer(13, 44);
     let mut headers = HeaderMap::new();
     headers.insert(

@@ -111,7 +111,7 @@ pub trait RpcRuntime {
     }
 
     fn beta_rpc_api(&self) -> bool {
-        false
+        protocol::beta_rpc_api()
     }
 
     fn client_job_count(&self) -> u32 {

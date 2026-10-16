@@ -350,81 +350,35 @@ fn store_fetcher(backend: Arc<dyn Backend>) -> Arc<ClaimNodeFetcher> {
     })
 }
 
-/// Read the pruned-store configuration from a `[node_db]` section. Unknown or
-/// missing fields fall back to defaults; `prune_mode` accepts `on`/`dry_run`.
-pub fn pruned_config_from_section(
-    node_db: &basics::basic_config::Section,
-    online_delete: u32,
-    can_delete: u32,
-) -> PrunedConfig {
-    let prune_mode = node_db
-        .get::<String>("prune_mode")
-        .ok()
-        .flatten()
-        .map(|value| {
-            if value.eq_ignore_ascii_case("dry_run") {
-                PruneMode::DryRun
-            } else {
-                PruneMode::On
-            }
-        })
-        .unwrap_or(PruneMode::On);
-    let prune_batch = node_db
-        .get::<usize>("prune_batch")
-        .ok()
-        .flatten()
-        .filter(|&n| n > 0)
-        .unwrap_or(10_000);
-    let verify_interval_secs = node_db
-        .get::<u64>("verify_interval")
-        .ok()
-        .flatten()
-        .unwrap_or(3600);
+/// Node deletions per pruning batch.
+const PRUNE_BATCH: usize = 10_000;
+/// Seconds between pruned-store consistency checks.
+const VERIFY_INTERVAL_SECS: u64 = 3600;
+
+/// The pruned-store configuration. Only rippled's `online_delete` and the
+/// advisory `can_delete` floor are operator settings; batch size and the
+/// verification cadence are fixed internals.
+pub fn pruned_config(online_delete: u32, can_delete: u32) -> PrunedConfig {
     PrunedConfig {
         online_delete,
         can_delete,
-        prune_mode,
-        prune_batch,
-        verify_interval_secs,
+        prune_mode: PruneMode::On,
+        prune_batch: PRUNE_BATCH,
+        verify_interval_secs: VERIFY_INTERVAL_SECS,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use basics::basic_config::Section;
 
     #[test]
-    fn config_parses_prune_mode_and_batch() {
-        let mut section = Section::new("node_db");
-        section.set("prune_mode", "dry_run");
-        section.set("prune_batch", "500");
-        section.set("verify_interval", "900");
-        let config = pruned_config_from_section(&section, 512, u32::MAX);
-        assert_eq!(config.prune_mode, PruneMode::DryRun);
-        assert_eq!(config.prune_batch, 500);
-        assert_eq!(config.online_delete, 512);
-        assert_eq!(config.verify_interval_secs, 900);
-    }
-
-    #[test]
-    fn config_defaults_when_absent() {
-        let section = Section::new("node_db");
-        let config = pruned_config_from_section(&section, 256, 100);
+    fn pruned_config_uses_fixed_internals() {
+        let config = pruned_config(256, 100);
         assert_eq!(config.prune_mode, PruneMode::On);
         assert_eq!(config.prune_batch, 10_000);
+        assert_eq!(config.verify_interval_secs, 3600);
         assert_eq!(config.online_delete, 256);
         assert_eq!(config.can_delete, 100);
-    }
-
-    #[test]
-    fn config_rejects_zero_batch() {
-        let mut section = Section::new("node_db");
-        section.set("prune_batch", "0");
-        let config = pruned_config_from_section(&section, 512, u32::MAX);
-        assert_eq!(
-            config.prune_batch, 10_000,
-            "zero batch falls back to default"
-        );
     }
 }

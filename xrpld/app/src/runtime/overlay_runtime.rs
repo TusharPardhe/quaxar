@@ -1309,6 +1309,8 @@ pub fn build_overlay_setup(config: &BasicConfig) -> Result<Setup, String> {
         crawl_options: CRAWL_OPTION_OVERLAY | CRAWL_OPTION_SERVER_INFO | CRAWL_OPTION_UNL,
         network_id: None,
         vl_enabled: true,
+        compression_enabled: legacy_bool(config, "compression")?.unwrap_or(false),
+        ledger_replay_enabled: legacy_bool(config, "ledger_replay")?.unwrap_or(false),
         tx_reduce_relay_enabled: false,
         tx_reduce_relay_min_peers: 20,
         tx_relay_percentage: 25,
@@ -1327,6 +1329,19 @@ pub fn build_overlay_setup(config: &BasicConfig) -> Result<Setup, String> {
     setup.network_id = parse_network_id(config)?;
 
     Ok(setup)
+}
+
+/// rippled `getSingleSection` + `lexicalCastThrow<bool>` for a boolean
+/// section such as `[compression]` or `[ledger_replay]`.
+fn legacy_bool(config: &BasicConfig, section: &str) -> Result<Option<bool>, String> {
+    match config.section(section).values() {
+        [value] => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Ok(Some(true)),
+            "0" | "false" => Ok(Some(false)),
+            raw => Err(format!("[{section}] is invalid: {raw}")),
+        },
+        _ => Ok(None),
+    }
 }
 
 pub fn build_overlay_runtime(
@@ -1723,6 +1738,12 @@ fn parse_vl_section(section: &Section, setup: &mut Setup) -> Result<(), String> 
 }
 
 fn parse_reduce_relay_section(section: &Section, setup: &mut Setup) -> Result<(), String> {
+    if section.exists("vp_base_squelch_enable") && section.exists("vp_enable") {
+        return Err("Invalid reduce_relay cannot specify both vp_base_squelch_enable and \
+                    vp_enable options. vp_enable was deprecated and replaced by \
+                    vp_base_squelch_enable"
+            .to_owned());
+    }
     if section.exists("vp_base_squelch_enable") {
         setup.vp_reduce_relay_base_squelch_enabled =
             section_bool_required(section, "vp_base_squelch_enable")?;
@@ -1914,6 +1935,27 @@ mod tests {
         }
         config.build(&sections);
         config
+    }
+
+    /// rippled Config.h: `compression` and `ledger_replay` default off and
+    /// are only advertised when enabled; both vp keys together is an error.
+    #[test]
+    fn compression_ledger_replay_and_reduce_relay_match_rippled() {
+        let defaults = build_overlay_setup(&BasicConfig::new()).expect("defaults");
+        assert!(!defaults.compression_enabled);
+        assert!(!defaults.ledger_replay_enabled);
+        let mut on = BasicConfig::new();
+        on.section_mut("compression").append("1");
+        on.section_mut("ledger_replay").append("true");
+        let on = build_overlay_setup(&on).expect("enabled");
+        assert!(on.compression_enabled && on.ledger_replay_enabled);
+        let mut bad = BasicConfig::new();
+        bad.section_mut("compression").append("lz4");
+        assert!(build_overlay_setup(&bad).is_err());
+        let mut both = BasicConfig::new();
+        both.section_mut("reduce_relay").set("vp_enable", "1");
+        both.section_mut("reduce_relay").set("vp_base_squelch_enable", "1");
+        assert!(build_overlay_setup(&both).is_err());
     }
 
     #[test]
@@ -2200,8 +2242,8 @@ tx_min_peers = 9
 
         let explicit = build_overlay_setup(&config("[peers_in_max]\n7\n[peers_out_max]\n10\n"))
             .expect("explicit setup");
-        // rippled Config.cpp:112: config.maxPeers = 0 when explicit in/out set
-        assert_eq!(explicit.peer_limits().max_peers, 0);
+        // rippled e302e4eeed: maxPeers = inPeers + outPeers when explicit.
+        assert_eq!(explicit.peer_limits().max_peers, 17);
         assert_eq!(explicit.peer_limits().inbound_max, 7);
         assert_eq!(explicit.peer_limits().outbound_max, 10);
 

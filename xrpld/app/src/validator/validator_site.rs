@@ -91,8 +91,10 @@ impl ValidatorSiteTransport for ReqwestValidatorSiteTransport {
                 })
                 .map_err(|error| error.to_string()),
             "http" | "https" => {
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(timeout)
+                let client = crate::work::apply_outbound_tls_blocking(
+                    reqwest::blocking::Client::builder(),
+                )
+                .timeout(timeout)
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .map_err(|error| error.to_string())?;

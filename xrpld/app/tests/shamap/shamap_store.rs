@@ -97,7 +97,7 @@ fn wait_for(condition: impl Fn() -> bool) {
 fn shamap_store_config_and_owner_state_match_current_rust_boundary() {
     let mut config = BasicConfig::new();
     let node_db = config.section_mut("node_db");
-    node_db.set("type", "RocksDB");
+    node_db.set("type", "fjall");
     node_db.set("path", "/tmp/node_db");
     node_db.set("online_delete", "256");
     node_db.set("advisory_delete", "1");

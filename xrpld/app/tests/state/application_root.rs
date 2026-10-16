@@ -283,6 +283,8 @@ fn overlay_setup(network_id: Option<u32>) -> Setup {
         network_id,
         fixed_peer_ips: std::collections::HashSet::new(),
         vl_enabled: true,
+        compression_enabled: false,
+        ledger_replay_enabled: false,
         tx_reduce_relay_enabled: true,
         tx_reduce_relay_min_peers: 1,
         tx_relay_percentage: 0,
@@ -1492,6 +1494,7 @@ fn application_root_can_attach_server_ports_setup_for_server_info_reads() {
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         }],
         client: Some(ServerPortClientSetup {
             secure: false,
@@ -1534,6 +1537,7 @@ fn application_root_can_attach_server_ports_setup_for_server_info_reads() {
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         }],
         client: Some(ServerPortClientSetup {
             secure: true,

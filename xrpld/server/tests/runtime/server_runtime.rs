@@ -50,6 +50,7 @@ fn policy(name: &str, port: u16, allow_http: bool, allow_ws: bool) -> RpcServerP
         allow_ws,
         auth: ServerAuthConfig::default(),
         tls_config: None,
+        ws_queue_limit: 100,
     }
 }
 
@@ -74,6 +75,7 @@ fn server_ports_setup(protocols: Vec<String>) -> Arc<ServerPortsSetup> {
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         }],
         client: Some(ServerPortClientSetup {
             secure: false,

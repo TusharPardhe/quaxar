@@ -620,7 +620,7 @@ Deliverables:
 
 - Route `Database::store` through `IndexWriter` bookkeeping; hook `on_validated` (the published-ledger path that currently feeds `SHAMapStore`) to `claim`.
 - `PrunedStore` replaces `SHAMapStore` when `type = fjall`. NuDB keeps the old worker until Stage 7.
-- `[node_db] prune_mode = dry_run | on` (dry-run logs would-be deletes and verifies them against reachability), plus `prune_batch`, `verify_interval`, `reserve_mb`.
+- `[node_db] prune_mode = dry_run | on` (dry-run logs would-be deletes and verifies them against reachability), plus `prune_batch`, `verify_interval`, `reserve_mb`. (Later removed as settings: `prune_mode`, `prune_batch` and `verify_interval` are fixed internals; only `reserve_mb` remains.)
 - Observability: `get_counts` / `fetch-info` / `server_info` fields `claimed_seq`, `pruned_to`, `unclaimed`, `notebook_rows`, `count_rows`, `prune_lag`, `verify_last_ok`. CLI `db-stats` shows fjall keyspace sizes.
 - `can_delete` RPC semantics preserved.
 - FBC callback wired to `NodeFamily` (R4); acquisition reuse hook (R5).

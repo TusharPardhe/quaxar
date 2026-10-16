@@ -1517,21 +1517,24 @@ fn run_rpc_client(options: AppBootstrapOptions) -> ExitCode {
         }
     };
 
-    // Determine RPC endpoint
-    let rpc_ip = options.rpc_ip.unwrap_or_else(|| {
-        config
-            .legacy("rpc_ip")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "127.0.0.1".to_string())
+    // rippled RPCCall: the client endpoint is the configured admin client
+    // port (ServerHandler setup_Client), overridden by --rpc_ip/--rpc_port.
+    let client_setup = app::ServerPortsSetup::from_config(&config, false)
+        .ok()
+        .and_then(|setup| setup.client);
+    let rpc_ip = options.rpc_ip.clone().unwrap_or_else(|| {
+        client_setup
+            .as_ref()
+            .map_or_else(|| "127.0.0.1".to_owned(), |client| client.ip.clone())
     });
-    let rpc_port = options.rpc_port.unwrap_or_else(|| {
-        config
-            .legacy("rpc_port")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(5005)
-    });
+    let rpc_port = options
+        .rpc_port
+        .unwrap_or_else(|| client_setup.as_ref().map_or(5005, |client| client.port));
+    let scheme = if client_setup.as_ref().is_some_and(|client| client.secure) {
+        "https"
+    } else {
+        "http"
+    };
 
     let request_json = match rpc_cmd_to_json(&options.rpc_parameters, 1) {
         Ok(json) => json,
@@ -1541,16 +1544,48 @@ fn run_rpc_client(options: AppBootstrapOptions) -> ExitCode {
         }
     };
 
-    let client = reqwest::blocking::Client::new();
-    let url = format!("http://{}:{}/", rpc_ip, rpc_port);
+    let mut request_json = request_json;
+    if let Some(client) = client_setup.as_ref() {
+        // rippled adds the client port's admin credentials to the request.
+        use protocol::JsonValue;
+        if let JsonValue::Object(request) = &mut request_json
+            && let Some(JsonValue::Array(params)) = request.get_mut("params")
+            && let Some(JsonValue::Object(params)) = params.get_mut(0)
+        {
+            if !client.admin_user.is_empty() {
+                params.insert(
+                    "admin_user".to_owned(),
+                    JsonValue::String(client.admin_user.clone()),
+                );
+            }
+            if !client.admin_password.is_empty() {
+                params.insert(
+                    "admin_password".to_owned(),
+                    JsonValue::String(client.admin_password.clone()),
+                );
+            }
+        }
+    }
+    // A self-signed admin port certificate is the norm; the CLI talks to its
+    // own node.
+    let client = reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+    let url = format!("{scheme}://{rpc_ip}:{rpc_port}/");
 
     let body = serde_json::to_string(&request_json).unwrap();
 
-    match client
+    let mut request = client
         .post(&url)
         .header("Content-Type", "application/json")
-        .body(body)
-        .send()
+        .body(body);
+    if let Some(client) = client_setup.as_ref()
+        && !client.user.is_empty()
+    {
+        request = request.basic_auth(&client.user, Some(&client.password));
+    }
+    match request.send()
     {
         Ok(response) => {
             let status = response.status();

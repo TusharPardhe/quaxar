@@ -3314,8 +3314,8 @@ impl OverlayImpl {
     /// enabled whenever the transport supports them.
     fn inbound_handshake_features(&self) -> (bool, bool, bool, bool) {
         (
-            true,
-            true,
+            self.setup.compression_enabled,
+            self.setup.ledger_replay_enabled,
             self.setup.tx_reduce_relay_enabled,
             self.setup.vp_reduce_relay_base_squelch_enabled,
         )
@@ -3328,13 +3328,16 @@ impl OverlayImpl {
             .and_then(|value| negotiate_protocol_version(parse_protocol_versions(value)))
             .unwrap_or(ProtocolVersion::new(2, 2));
         peer.set_protocol_version(protocol);
-        peer.set_compression_enabled(is_feature_value(headers, FEATURE_COMPR, "lz4"));
+        // rippled PeerImp: a feature is on only when both sides enable it.
+        peer.set_compression_enabled(
+            self.setup.compression_enabled && is_feature_value(headers, FEATURE_COMPR, "lz4"),
+        );
         peer.set_tx_reduce_relay_enabled(
             self.setup.tx_reduce_relay_enabled && feature_enabled(headers, FEATURE_TXRR),
         );
         peer.set_feature(
             ProtocolFeature::LedgerReplay,
-            feature_enabled(headers, FEATURE_LEDGER_REPLAY),
+            self.setup.ledger_replay_enabled && feature_enabled(headers, FEATURE_LEDGER_REPLAY),
         );
         tracing::debug!(
             target: "overlay",
@@ -3589,8 +3592,8 @@ impl Overlay for OverlayImpl {
         let connector = self.connector.clone();
         let config = ConnectAttemptConfig {
             server_name: address.ip().to_string(),
-            compr_enabled: true,
-            ledger_replay_enabled: true,
+            compr_enabled: self.setup.compression_enabled,
+            ledger_replay_enabled: self.setup.ledger_replay_enabled,
             tx_reduce_relay_enabled: self.setup.tx_reduce_relay_enabled,
             vp_reduce_relay_enabled: self.setup.vp_reduce_relay_base_squelch_enabled,
             ..ConnectAttemptConfig::default()

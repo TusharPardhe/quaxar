@@ -95,6 +95,26 @@ pub struct ServerPortSetup {
     pub secure_gateway_nets_v4: Vec<IpNet>,
     pub secure_gateway_nets_v6: Vec<IpNet>,
     pub standalone_mode: bool,
+    /// rippled `Port::wsQueueLimit` (`send_queue_limit`, default 100).
+    pub send_queue_limit: u16,
+}
+
+/// rippled default WebSocket send queue limit (`Port.cpp`).
+pub const DEFAULT_SEND_QUEUE_LIMIT: u16 = 100;
+
+/// rippled `Port.cpp`: `send_queue_limit` must be a u16 greater than zero.
+fn parse_send_queue_limit(config: &BasicConfig, port: &str) -> Result<u16, String> {
+    match config.section(port).get::<String>("send_queue_limit").ok().flatten() {
+        None => Ok(DEFAULT_SEND_QUEUE_LIMIT),
+        Some(raw) => raw
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| {
+                format!("Invalid value '{raw}' for key 'send_queue_limit' in [{port}]")
+            }),
+    }
 }
 
 impl ServerPortSetup {
@@ -118,6 +138,7 @@ impl ServerPortSetup {
             secure_gateway_nets_v4: parsed.secure_gateway_nets_v4,
             secure_gateway_nets_v6: parsed.secure_gateway_nets_v6,
             standalone_mode: false,
+            send_queue_limit: DEFAULT_SEND_QUEUE_LIMIT,
         }
     }
 
@@ -185,7 +206,8 @@ impl ServerPortsSetup {
 
         let ports = parse_server_port_configs(config, stand_alone)?
             .into_iter()
-            .map(|parsed| {
+            .map(|parsed| -> Result<ServerPortSetup, String> {
+                let send_queue_limit = parse_send_queue_limit(config, parsed.name.as_str())?;
                 let limit = config
                     .section(parsed.name.as_str())
                     .get::<u32>("limit")
@@ -195,9 +217,10 @@ impl ServerPortsSetup {
                     .unwrap_or(0);
                 let mut port = ServerPortSetup::from_parsed_config(parsed, limit);
                 port.standalone_mode = stand_alone;
-                port
+                port.send_queue_limit = send_queue_limit;
+                Ok(port)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         let grpc = parse_grpc_port_config(config).map(|grpc| PublishedGrpcPort {
             ip: grpc.ip,
             port: grpc.port,
@@ -308,6 +331,20 @@ mod tests {
     };
     use basics::basic_config::BasicConfig;
 
+    /// rippled `Port.cpp`: `send_queue_limit` defaults to 100 and must be a
+    /// u16 above zero.
+    #[test]
+    fn send_queue_limit_matches_rippled_port_parsing() {
+        let mut config = BasicConfig::new();
+        config.section_mut("port_ws").set("send_queue_limit", "500");
+        config.section_mut("port_zero").set("send_queue_limit", "0");
+        config.section_mut("port_big").set("send_queue_limit", "70000");
+        assert_eq!(super::parse_send_queue_limit(&config, "port_none"), Ok(100));
+        assert_eq!(super::parse_send_queue_limit(&config, "port_ws"), Ok(500));
+        assert!(super::parse_send_queue_limit(&config, "port_zero").is_err());
+        assert!(super::parse_send_queue_limit(&config, "port_big").is_err());
+    }
+
     #[test]
     fn published_server_port_detects_admin_restrictions() {
         let unrestricted = PublishedServerPort {
@@ -353,6 +390,7 @@ mod tests {
                 ],
                 secure_gateway_nets_v6: Vec::new(),
                 standalone_mode: false,
+                send_queue_limit: 100,
             }],
             client: Some(ServerPortClientSetup {
                 secure: false,
@@ -459,6 +497,7 @@ mod tests {
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
             standalone_mode: false,
+            send_queue_limit: 100,
         };
 
         assert!(port.allows_http());

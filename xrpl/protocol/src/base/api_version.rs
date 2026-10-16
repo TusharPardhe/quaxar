@@ -48,6 +48,18 @@ pub fn set_version(parent: &mut JsonValue, api_version: u32, beta_enabled: bool)
     parent.insert("version".to_owned(), JsonValue::Object(version));
 }
 
+static BETA_RPC_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// rippled `Config::betaRpcApi` (`[beta_rpc_api]`, default off); set once at
+/// startup.
+pub fn set_beta_rpc_api(enabled: bool) {
+    BETA_RPC_API.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn beta_rpc_api() -> bool {
+    BETA_RPC_API.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn get_api_version_number(json: &JsonValue, beta_enabled: bool) -> u32 {
     let max_version = if beta_enabled {
         API_BETA_VERSION

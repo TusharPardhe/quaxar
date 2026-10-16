@@ -63,6 +63,10 @@ pub struct Setup {
     pub crawl_options: u32,
     pub network_id: Option<u32>,
     pub vl_enabled: bool,
+    /// rippled `[compression]` (default off): advertise and use lz4.
+    pub compression_enabled: bool,
+    /// rippled `[ledger_replay]` (default off): advertise ledger replay.
+    pub ledger_replay_enabled: bool,
     pub tx_reduce_relay_enabled: bool,
     pub tx_reduce_relay_min_peers: usize,
     pub tx_relay_percentage: usize,
@@ -92,6 +96,8 @@ impl Default for Setup {
             crawl_options: 0,
             network_id: None,
             vl_enabled: true,
+            compression_enabled: false,
+            ledger_replay_enabled: false,
             tx_reduce_relay_enabled: true,
             tx_reduce_relay_min_peers: 2,
             tx_relay_percentage: 25,

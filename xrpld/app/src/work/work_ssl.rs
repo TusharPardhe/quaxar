@@ -57,8 +57,7 @@ impl Work for WorkSSL {
             let result = tokio::select! {
                 _ = token.cancelled() => Err(WorkError::Cancelled),
                 res = async {
-                    let client = reqwest::Client::builder()
-                        .use_rustls_tls()
+                    let client = crate::work::apply_outbound_tls(reqwest::Client::builder())
                         .min_tls_version(reqwest::tls::Version::TLS_1_2)
                         .build()
                         .map_err(|e| WorkError::Tls(e.to_string()))?;
