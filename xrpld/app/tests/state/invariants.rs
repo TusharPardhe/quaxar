@@ -4412,3 +4412,115 @@ fn audit_mpt_valid_clawback_requires_exact_iou_line_and_debit() {
         Ter::TEC_INVARIANT_FAILED,
     );
 }
+
+#[test]
+fn cleanup_3_5_rejects_pseudo_account_directory_pins_but_keeps_legacy_behavior() {
+    let pseudo = acct(0xE1);
+    let owner = acct(0xE2);
+    let issuer = acct(0xE3);
+    let vault_id = Uint256::from_u64(90_001);
+    let child_key = Uint256::from_u64(90_002);
+
+    let run = |cleanup_enabled| {
+        let mut ledger = Ledger::new(LedgerHeader::default(), false);
+        if cleanup_enabled {
+            ledger.set_rules(Rules::new([protocol::fix_cleanup_3_5_0()]));
+        }
+        let mut parent = Sandbox::new(Arc::new(ledger), ApplyFlags::default());
+        parent
+            .insert(Arc::new(vault_pseudo_account_root(pseudo, vault_id)))
+            .expect("insert pseudo account");
+        parent
+            .insert(Arc::new(vault_entry_with_values(
+                vault_id,
+                owner,
+                pseudo,
+                Asset::Issue(protocol::xrp_issue()),
+                MPTIssue::new(mpt_id(pseudo, 1)),
+                0,
+                0,
+                0,
+            )))
+            .expect("insert vault");
+        let mut pinned = STLedgerEntry::from_type_and_key(LedgerEntryType::Check, child_key);
+        pinned.set_account_id(sf("sfAccount"), issuer);
+        pinned.set_account_id(sf("sfDestination"), pseudo);
+        parent.insert(Arc::new(pinned)).expect("insert pinned object");
+
+        let owner_dir = protocol::owner_dir_keylet(raw_id(pseudo));
+        let mut directory =
+            STLedgerEntry::from_type_and_key(LedgerEntryType::DirectoryNode, owner_dir.key);
+        directory.set_field_h256(sf("sfRootIndex"), owner_dir.key);
+        directory.set_account_id(sf("sfOwner"), pseudo);
+        directory.set_field_v256(
+            sf("sfIndexes"),
+            protocol::STVector256::from_values(sf("sfIndexes"), vec![child_key]),
+        );
+        let mut flow = FlowSandbox::new(&mut parent);
+        flow.insert(Arc::new(directory)).expect("insert owner directory");
+        check_invariants(
+            &flow,
+            TxType::ACCOUNT_SET,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10),
+        )
+    };
+
+    assert_eq!(run(false), Ter::TES_SUCCESS);
+    assert_eq!(run(true), Ter::TEC_INVARIANT_FAILED);
+}
+
+#[test]
+fn cleanup_3_5_allows_vault_pseudo_account_holding_its_vault_asset() {
+    let pseudo = acct(0xE4);
+    let owner = acct(0xE5);
+    let issuer = acct(0xE6);
+    let vault_id = Uint256::from_u64(90_010);
+    let issue = Issue {
+        currency: iou_currency(b"USD"),
+        account: issuer,
+    };
+    let holding = ripple_state_balance_entry(pseudo, issuer, 1);
+    let mut ledger = Ledger::new(LedgerHeader::default(), false);
+    ledger.set_rules(Rules::new([protocol::fix_cleanup_3_5_0()]));
+    let mut parent = Sandbox::new(Arc::new(ledger), ApplyFlags::default());
+    parent
+        .insert(Arc::new(vault_pseudo_account_root(pseudo, vault_id)))
+        .expect("insert pseudo account");
+    parent
+        .insert(Arc::new(vault_entry_with_values(
+            vault_id,
+            owner,
+            pseudo,
+            Asset::Issue(issue),
+            MPTIssue::new(mpt_id(pseudo, 1)),
+            0,
+            0,
+            0,
+        )))
+        .expect("insert vault");
+    parent
+        .insert(Arc::new(holding.clone()))
+        .expect("insert vault holding");
+
+    let owner_dir = protocol::owner_dir_keylet(raw_id(pseudo));
+    let mut directory = STLedgerEntry::from_type_and_key(LedgerEntryType::DirectoryNode, owner_dir.key);
+    directory.set_field_h256(sf("sfRootIndex"), owner_dir.key);
+    directory.set_account_id(sf("sfOwner"), pseudo);
+    directory.set_field_v256(
+        sf("sfIndexes"),
+        protocol::STVector256::from_values(sf("sfIndexes"), vec![*holding.key()]),
+    );
+    let mut flow = FlowSandbox::new(&mut parent);
+    flow.insert(Arc::new(directory)).expect("insert owner directory");
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::ACCOUNT_SET,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10),
+        ),
+        Ter::TES_SUCCESS
+    );
+}

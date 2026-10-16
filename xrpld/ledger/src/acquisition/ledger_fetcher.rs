@@ -1000,8 +1000,10 @@ impl InboundLedgerLocal {
         if ledger.state_map().is_synching() || ledger.tx_map().is_synching() {
             return false;
         }
-        if !ledger.is_immutable() {
-            ledger.set_immutable(false);
+        if !ledger.is_immutable() && !ledger.set_immutable(false) {
+            self.failed = true;
+            self.complete = false;
+            return false;
         }
         ledger.set_full();
         true
@@ -1253,9 +1255,8 @@ impl InboundLedgerLocal {
         };
 
         let mut reactivated = false;
-        let state_valid = ledger.header().account_hash.is_zero() || ledger.state_map().is_valid();
-        let state_complete =
-            ledger.header().account_hash.is_zero() || !ledger.state_map().is_synching();
+        let state_valid = ledger.state_map().is_valid();
+        let state_complete = !ledger.state_map().is_synching();
         let tx_valid = ledger.header().tx_hash.is_zero() || ledger.tx_map().is_valid();
         let tx_complete = ledger.header().tx_hash.is_zero() || !ledger.tx_map().is_synching();
 
@@ -1865,6 +1866,14 @@ impl InboundLedgerLocal {
             return false;
         }
 
+        if header.account_hash.is_zero() {
+            journal.warn("We are acquiring a ledger with a zero account hash");
+            self.failed = true;
+            self.complete = false;
+            self.ledger = None;
+            return true;
+        }
+
         if self.seq == 0 {
             self.seq = header.seq;
         }
@@ -1875,7 +1884,7 @@ impl InboundLedgerLocal {
 
         self.planner_state.have_header = true;
         self.planner_state.have_transactions = ledger.header().tx_hash.is_zero();
-        self.planner_state.have_state = self.skip_state || ledger.header().account_hash.is_zero();
+        self.planner_state.have_state = self.skip_state;
         if !self.planner_state.have_state {
             ledger.state_map_mut().set_synching();
         }
@@ -2333,6 +2342,8 @@ impl InboundLedgerLocal {
             if account_hash.is_zero() {
                 journal.fatal("We are acquiring a ledger with a zero account hash");
                 self.failed = true;
+                self.complete = false;
+                self.ledger = None;
                 return;
             }
 
@@ -2422,6 +2433,14 @@ impl InboundLedgerLocal {
             ));
             self.ledger = None;
             self.failed = true;
+            return;
+        }
+
+        if header.account_hash.is_zero() {
+            journal.warn("We are acquiring a ledger with a zero account hash");
+            self.ledger = None;
+            self.failed = true;
+            self.complete = false;
             return;
         }
 

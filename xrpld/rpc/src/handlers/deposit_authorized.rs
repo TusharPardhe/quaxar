@@ -127,7 +127,11 @@ fn validate_credentials<S: DepositAuthorizedSource>(
 
     for cred in credentials {
         let cred_hash = parse_credential_key(cred)?;
-        let Some(sle_cred) = source.read_ledger_entry(ledger, cred_hash) else {
+        // A zero key names an entry that cannot exist.
+        let Some(sle_cred) = (!cred_hash.is_zero())
+            .then(|| source.read_ledger_entry(ledger, cred_hash))
+            .flatten()
+        else {
             return Err(bad_credentials("credentials don't exist"));
         };
 

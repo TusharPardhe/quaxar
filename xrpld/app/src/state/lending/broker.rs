@@ -16,7 +16,30 @@ use tx::{
 use super::common::*;
 use super::helpers::*;
 
-pub fn apply_loan_broker_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
+fn holding_exists<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    asset: Asset,
+) -> Result<bool, Ter> {
+    match asset {
+        Asset::Issue(issue) if issue.native() || issue.account == *account => Ok(true),
+        Asset::Issue(issue) => view
+            .peek(protocol::line(*account, issue.account, issue.currency))
+            .map(|holding| holding.is_some())
+            .map_err(|_| Ter::TEF_BAD_LEDGER),
+        Asset::MPTIssue(issue) if issue.issuer() == *account => Ok(true),
+        Asset::MPTIssue(issue) => view
+            .peek(protocol::mptoken_keylet_from_mptid(issue.mpt_id(), to_160(account)))
+            .map(|holding| holding.is_some())
+            .map_err(|_| Ter::TEF_BAD_LEDGER),
+    }
+}
+
+pub fn apply_loan_broker_delete<V: ApplyView>(
+    view: &mut V,
+    sttx: &STTx,
+    pre_fee_balance_drops: i64,
+) -> Ter {
     if !view.rules().enabled(&feature_id("LendingProtocol")) {
         return Ter::TEM_DISABLED;
     }
@@ -116,9 +139,52 @@ pub fn apply_loan_broker_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter 
         return Ter::TEF_BAD_LEDGER;
     }
 
+    let Ok(Some(owner_sle)) = view.peek(account_keylet(to_160(&account))) else {
+        return Ter::TEF_BAD_LEDGER;
+    };
+    let fix_cleanup_3_5_0 = view.rules().enabled(&feature_id("fixCleanup3_5_0"));
+    // Pre-fixCleanup3_5_0 the owner count drops after the pseudo-account is
+    // erased. Post-fixCleanup3_5_0 it drops first so a newly created owner
+    // holding can use the reserve released by the broker and pseudo-account.
+    if fix_cleanup_3_5_0 && ledger::adjust_owner_count(view, &owner_sle, -2).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
+
     let Ok(cover_amount) = vault_asset.amount(cover_available) else {
         return Ter::TEF_BAD_LEDGER;
     };
+    let owner_holding_exists = match holding_exists(view, &account, vault_asset) {
+        Ok(exists) => exists,
+        Err(ter) => return ter,
+    };
+    if !fix_cleanup_3_5_0
+        && cover_available > RuntimeNumber::zero()
+        && matches!(vault_asset, Asset::MPTIssue(_))
+        && !owner_holding_exists
+    {
+        return Ter::TEC_NO_AUTH;
+    }
+    if fix_cleanup_3_5_0 && cover_available > RuntimeNumber::zero() && !owner_holding_exists {
+        if matches!(vault_asset, Asset::MPTIssue(_)) {
+            let Ok(Some(owner_sle)) = view.peek(account_keylet(to_160(&account))) else {
+                return Ter::TEF_BAD_LEDGER;
+            };
+            let reserve = ledger::effective_account_reserve(view.fees(), &owner_sle, 1, 0);
+            if pre_fee_balance_drops < reserve as i64 {
+                return Ter::TEC_INSUFFICIENT_RESERVE;
+            }
+        }
+        let holding = ledger::add_empty_holding_with_tx(
+            view,
+            sttx,
+            &account,
+            protocol::XRPAmount::from_drops(pre_fee_balance_drops),
+            &vault_asset,
+        );
+        if holding != Ter::TES_SUCCESS {
+            return holding;
+        }
+    }
     let payout = account_send_with_mpt_transfer_waiver(
         view,
         sttx,
@@ -153,13 +219,13 @@ pub fn apply_loan_broker_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter 
         return Ter::TEC_HAS_OBLIGATIONS;
     }
 
-    if view.erase(pseudo_sle).is_err() || view.erase(broker_sle.clone()).is_err() {
+    if view.erase(pseudo_sle).is_err() {
         return Ter::TEF_BAD_LEDGER;
     }
-    let Ok(Some(owner_sle)) = view.peek(account_keylet(to_160(&account))) else {
+    if !fix_cleanup_3_5_0 && ledger::adjust_owner_count(view, &owner_sle, -2).is_err() {
         return Ter::TEF_BAD_LEDGER;
-    };
-    if ledger::adjust_owner_count(view, &owner_sle, -2).is_err() {
+    }
+    if view.erase(broker_sle.clone()).is_err() {
         return Ter::TEF_BAD_LEDGER;
     }
     Ter::TES_SUCCESS

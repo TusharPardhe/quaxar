@@ -2432,6 +2432,24 @@ fn validate_escrow_finish_preflight(tx: &STTx, _rules: &Rules) -> NotTec {
     Ter::TES_SUCCESS
 }
 
+/// `EscrowFinish::preflightSigValidated`: after signature validation, a
+/// condition that failed the fulfillment comparison is DER-parsed under
+/// fixCleanup3_5_0. Pre-amendment keeps the cached-invalid behavior.
+pub fn validate_escrow_finish_condition_after_signature(tx: &STTx, rules: &Rules) -> NotTec {
+    // rippled checks only when both Condition and Fulfillment are present; a
+    // malformed condition always fails the fulfillment check, so it always
+    // carries the cached invalid flag.
+    let condition = get_field_by_symbol("sfCondition");
+    if rules.enabled(&protocol::fix_cleanup_3_5_0())
+        && tx.is_field_present(condition)
+        && tx.is_field_present(get_field_by_symbol("sfFulfillment"))
+        && protocol::crypto::conditions::deserialize_condition(&tx.get_field_vl(condition)).is_err()
+    {
+        return Ter::TEM_MALFORMED;
+    }
+    Ter::TES_SUCCESS
+}
+
 fn validate_nftoken_cancel_offer_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     if tx.get_flags() & !UNIVERSAL_TRANSACTION_FLAGS != 0 {
         return Ter::TEM_INVALID_FLAG;
@@ -4510,6 +4528,44 @@ mod tests {
         assert_eq!(
             validate_sttx_transaction_preflight_with_rules(&tx, &Rules::new(std::iter::empty())),
             Ter::TEM_BAD_SIGNATURE,
+        );
+    }
+}
+
+#[cfg(test)]
+mod escrow_finish_cleanup_3_5_tests {
+    use super::validate_escrow_finish_condition_after_signature;
+    use protocol::{Rules, STTx, Ter, TxType, get_field_by_symbol};
+
+    #[test]
+    fn malformed_escrow_finish_condition_is_rejected_only_after_cleanup_3_5() {
+        let tx = STTx::new(TxType::ESCROW_FINISH, |tx| {
+            tx.set_field_vl(get_field_by_symbol("sfCondition"), &[0x78, 0x78, 0x78]);
+            tx.set_field_vl(get_field_by_symbol("sfFulfillment"), &[0xA0, 0x00]);
+        });
+
+        assert_eq!(
+            validate_escrow_finish_condition_after_signature(&tx, &Rules::new([])),
+            Ter::TES_SUCCESS
+        );
+        assert_eq!(
+            validate_escrow_finish_condition_after_signature(
+                &tx,
+                &Rules::new([protocol::fix_cleanup_3_5_0()]),
+            ),
+            Ter::TEM_MALFORMED
+        );
+
+        let without_fulfillment = STTx::new(TxType::ESCROW_FINISH, |tx| {
+            tx.set_field_vl(get_field_by_symbol("sfCondition"), &[0x78, 0x78, 0x78]);
+        });
+        assert_eq!(
+            validate_escrow_finish_condition_after_signature(
+                &without_fulfillment,
+                &Rules::new([protocol::fix_cleanup_3_5_0()]),
+            ),
+            Ter::TES_SUCCESS,
+            "rippled checks the condition only alongside a fulfillment"
         );
     }
 }

@@ -22,6 +22,28 @@ pub trait VaultWithdrawDoApplyExchangeVault {
     fn share_mpt_id(&self) -> &Self::ShareId;
 }
 
+/// Facts selecting `VaultWithdraw.cpp`'s post-`fixCleanup3_5_0` transfer-fee
+/// path. A vault withdrawal charges the asset's transfer fee only when a
+/// non-issuer holder sends a non-native asset to another holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VaultWithdrawTransferFeeFacts {
+    pub fix_cleanup_3_5_0_enabled: bool,
+    pub vault_asset_is_native: bool,
+    pub destination_is_withdrawer: bool,
+    pub withdrawer_is_asset_issuer: bool,
+    pub destination_is_asset_issuer: bool,
+    pub transfer_rate_is_parity: bool,
+}
+
+pub const fn vault_withdrawal_charges_transfer_fee(facts: VaultWithdrawTransferFeeFacts) -> bool {
+    facts.fix_cleanup_3_5_0_enabled
+        && !facts.vault_asset_is_native
+        && !facts.destination_is_withdrawer
+        && !facts.withdrawer_is_asset_issuer
+        && !facts.destination_is_asset_issuer
+        && !facts.transfer_rate_is_parity
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultWithdrawDoApplyExchangeState<
     Vault,
@@ -150,7 +172,10 @@ mod tests {
 
     use protocol::{Ter, trans_token};
 
-    use super::{VaultWithdrawDoApplyExchangeVault, load_vault_withdraw_do_apply_exchange};
+    use super::{
+        VaultWithdrawDoApplyExchangeVault, VaultWithdrawTransferFeeFacts,
+        load_vault_withdraw_do_apply_exchange, vault_withdrawal_charges_transfer_fee,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestVault {
@@ -180,6 +205,33 @@ mod tests {
         fn share_mpt_id(&self) -> &Self::ShareId {
             &self.share_mpt_id
         }
+    }
+
+    #[test]
+    fn vault_withdrawal_charges_third_party_fee_only_after_cleanup_3_5_0() {
+        let charged = VaultWithdrawTransferFeeFacts {
+            fix_cleanup_3_5_0_enabled: true,
+            ..VaultWithdrawTransferFeeFacts::default()
+        };
+        assert!(vault_withdrawal_charges_transfer_fee(charged));
+        assert!(!vault_withdrawal_charges_transfer_fee(
+            VaultWithdrawTransferFeeFacts {
+                fix_cleanup_3_5_0_enabled: false,
+                ..charged
+            }
+        ));
+        assert!(!vault_withdrawal_charges_transfer_fee(
+            VaultWithdrawTransferFeeFacts {
+                destination_is_withdrawer: true,
+                ..charged
+            }
+        ));
+        assert!(!vault_withdrawal_charges_transfer_fee(
+            VaultWithdrawTransferFeeFacts {
+                destination_is_asset_issuer: true,
+                ..charged
+            }
+        ));
     }
 
     fn test_vault() -> TestVault {

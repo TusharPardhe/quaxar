@@ -2455,6 +2455,10 @@ fn transaction_preflight_ter_with_parent_batch_id_inner(
 
     // Concrete preflightSigValidated tails run after preflight2.
     if tx.get_txn_type() == TxType::ESCROW_FINISH {
+        let result = tx::validate_escrow_finish_condition_after_signature(tx, rules);
+        if !is_tes_success(result) {
+            return result;
+        }
         let credentials = get_field_by_symbol("sfCredentialIDs");
         if tx.is_field_present(credentials) {
             let ids = tx.get_field_v256(credentials);
@@ -6951,6 +6955,7 @@ impl ApplicationRoot {
     ) -> Result<Arc<AppOverlayRuntime>, String> {
         let runtime = build_overlay_runtime(
             config,
+            self.standalone(),
             self.server_ports_setup.as_deref(),
             handoff,
             Some(self.network_ops_mode_owner()),

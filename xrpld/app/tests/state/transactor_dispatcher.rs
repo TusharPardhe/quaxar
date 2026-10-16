@@ -11160,6 +11160,177 @@ fn loan_broker_delete_rejects_deep_frozen_owner_iou_cover() {
 }
 
 #[test]
+fn loan_broker_delete_iou_cover_holding_and_reserve_follow_cleanup_3_5_0() {
+    let owner = sample_account(0x91);
+    let issuer = sample_account(0x92);
+    let vault_pseudo = sample_account(0x93);
+    let broker_pseudo = sample_account(0x94);
+    let currency = Currency::from_array([0x95; 20]);
+    let asset = Asset::Issue(Issue::new(currency, issuer));
+    let vault_id = protocol::vault_keylet(raw_account_id(owner), 26).key;
+    let broker_id = sample_uint256(0x96);
+    let broker_keylet = protocol::loan_broker_keylet_from_key(broker_id);
+    let owner_line_key = line(owner, issuer, currency);
+
+    let run = |cleanup_3_5_0, owner_has_holding, balance| {
+        let broker = loan_broker_entry(
+            broker_id,
+            owner,
+            broker_pseudo,
+            vault_id,
+            asset,
+            0,
+            5_000,
+            0,
+            0,
+        );
+        let mut broker_cover = trust_line_entry(issuer, broker_pseudo, currency, -5_000);
+        broker_cover.set_field_u32(sf("sfFlags"), protocol::lsfHighReserve);
+        let mut entries = vec![
+            account_root_with_balance(
+                owner,
+                if owner_has_holding { 3 } else { 2 },
+                lsfDefaultRipple,
+                balance,
+            ),
+            account_root(issuer, 0, lsfDefaultRipple),
+            account_root(vault_pseudo, 1, 0),
+            account_root_with_balance(broker_pseudo, 1, 0, 0),
+            owner_dir_root(owner, broker_keylet.key),
+            owner_dir_root(vault_pseudo, broker_keylet.key),
+            owner_dir_root(issuer, line(issuer, broker_pseudo, currency).key),
+            owner_dir_root(
+                broker_pseudo,
+                line(issuer, broker_pseudo, currency).key,
+            ),
+            managed_vault_entry(owner, vault_pseudo, 26, asset, 0, 0, 0),
+            broker,
+            broker_cover,
+        ];
+        if owner_has_holding {
+            entries.push(trust_line_entry(owner, issuer, currency, 0));
+        }
+        let mut ledger = empty_ledger(entries);
+        ledger.set_fees(Fees {
+            base: 10,
+            reserve: 200,
+            increment: 50,
+        });
+        let mut features = vec![
+            protocol::feature_id("SingleAssetVault"),
+            protocol::feature_id("MPTokensV1"),
+            protocol::feature_id("LendingProtocol"),
+        ];
+        if cleanup_3_5_0 {
+            features.push(protocol::feature_id("fixCleanup3_5_0"));
+        }
+        ledger.set_rules(protocol::Rules::new(features));
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let result = handle_real_dispatch(
+            &mut view,
+            &loan_broker_delete_tx(owner, broker_id),
+            TxType::LOAN_BROKER_DELETE,
+            None,
+        );
+        (result, view)
+    };
+
+    assert_eq!(run(false, false, 250).0, Ter::TES_SUCCESS);
+    let (at_reserve, view) = run(true, false, 250);
+    assert_eq!(at_reserve, Ter::TES_SUCCESS);
+    assert!(
+        view.read(owner_line_key)
+            .expect("owner line read should succeed")
+            .is_some()
+    );
+    assert_eq!(owner_count(&view, owner), 1);
+    assert_eq!(run(true, false, 249).0, Ter::TEC_NO_LINE_INSUF_RESERVE);
+    assert_eq!(run(true, true, 249).0, Ter::TES_SUCCESS);
+}
+
+#[test]
+fn loan_broker_delete_mpt_cover_holding_and_reserve_follow_cleanup_3_5_0() {
+    let owner = sample_account(0xA1);
+    let issuer = sample_account(0xA2);
+    let vault_pseudo = sample_account(0xA3);
+    let broker_pseudo = sample_account(0xA4);
+    let mpt_id = share_id_for(issuer, 9);
+    let asset = Asset::MPTIssue(MPTIssue::new(mpt_id));
+    let vault_id = protocol::vault_keylet(raw_account_id(owner), 25).key;
+    let broker_id = sample_uint256(0xA5);
+    let broker_keylet = protocol::loan_broker_keylet_from_key(broker_id);
+    let broker_token_key = protocol::mptoken_keylet_from_mptid(mpt_id, raw_account_id(broker_pseudo));
+    let owner_token_key = protocol::mptoken_keylet_from_mptid(mpt_id, raw_account_id(owner));
+
+    let run = |cleanup_3_5_0, owner_has_holding, balance| {
+        let broker = loan_broker_entry(
+            broker_id,
+            owner,
+            broker_pseudo,
+            vault_id,
+            asset,
+            0,
+            5_000,
+            0,
+            0,
+        );
+        let mut entries = vec![
+            account_root_with_balance(owner, if owner_has_holding { 3 } else { 2 }, 0, balance),
+            account_root(issuer, 0, 0),
+            account_root(vault_pseudo, 1, 0),
+            account_root_with_balance(broker_pseudo, 1, 0, 0),
+            owner_dir_root(owner, broker_keylet.key),
+            owner_dir_root(vault_pseudo, broker_keylet.key),
+            owner_dir_root(broker_pseudo, broker_token_key.key),
+            managed_vault_entry(owner, vault_pseudo, 25, asset, 0, 0, 0),
+            broker,
+            mpt_issuance_entry(issuer, 9, 5_000, MPT_CAN_ESCROW_FLAG | MPT_CAN_TRADE_FLAG),
+            mptoken_entry(broker_pseudo, mpt_id, 5_000),
+        ];
+        if owner_has_holding {
+            entries.push(mptoken_entry(owner, mpt_id, 0));
+        }
+        let mut ledger = empty_ledger(entries);
+        ledger.set_fees(Fees {
+            base: 10,
+            reserve: 200,
+            increment: 50,
+        });
+        let mut features = vec![
+            protocol::feature_id("SingleAssetVault"),
+            protocol::feature_id("MPTokensV1"),
+            protocol::feature_id("LendingProtocol"),
+        ];
+        if cleanup_3_5_0 {
+            features.push(protocol::feature_id("fixCleanup3_5_0"));
+        }
+        ledger.set_rules(protocol::Rules::new(features));
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let result = handle_real_dispatch(
+            &mut view,
+            &loan_broker_delete_tx(owner, broker_id),
+            TxType::LOAN_BROKER_DELETE,
+            None,
+        );
+        (result, view)
+    };
+
+    assert_eq!(run(false, false, 250).0, Ter::TEC_NO_AUTH);
+    let (at_reserve, view) = run(true, false, 250);
+    assert_eq!(at_reserve, Ter::TES_SUCCESS);
+    assert_eq!(
+        view.read(owner_token_key)
+            .expect("owner token read should succeed")
+            .expect("cleanup-3.5 should create the owner MPToken")
+            .get_field_u64(sf("sfMPTAmount")),
+        5_000
+    );
+    assert_eq!(owner_count(&view, owner), 1);
+    assert_eq!(run(true, false, 249).0, Ter::TEC_INSUFFICIENT_RESERVE);
+    assert_eq!(run(true, true, 249).0, Ter::TES_SUCCESS);
+}
+
+#[test]
 fn loan_broker_delete_pays_unlocked_mpt_cover_and_cleans_pseudo_holding() {
     let owner = sample_account(0xB6);
     let issuer = sample_account(0xB7);
@@ -11206,6 +11377,7 @@ fn loan_broker_delete_pays_unlocked_mpt_cover_and_cleans_pseudo_holding() {
         protocol::feature_id("SingleAssetVault"),
         protocol::feature_id("MPTokensV1"),
         protocol::feature_id("fixCleanup3_2_0"),
+        protocol::feature_id("fixCleanup3_5_0"),
     ]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 

@@ -5,8 +5,63 @@ use basics::{
     number::{NumberParts as RuntimeNumber, RoundingMode, get_mantissa_scale},
 };
 use ledger::{ApplyView, FlowSandbox, ReadView};
-use protocol::{AccountID, Asset, Issue, LedgerEntryType, MPTID, STAmount, STLedgerEntry, Ter};
+use protocol::{
+    AccountID, Asset, Issue, LedgerEntryType, MPTID, PARITY_RATE, Rate, STAmount, STLedgerEntry,
+    Ter, QUALITY_ONE,
+};
 use std::collections::BTreeMap;
+
+/// rippled VaultInvariant `feeAdjustedWithdrawal` (#8267).
+fn is_fee_adjusted_withdrawal(
+    fix_cleanup_3_5_0: bool,
+    distinct_destination: bool,
+    native: bool,
+    submitter_is_issuer: bool,
+    rate: Rate,
+) -> bool {
+    fix_cleanup_3_5_0 && distinct_destination && !native && !submitter_is_issuer && rate != PARITY_RATE
+}
+
+fn vault_transfer_rate(view: &impl ReadView, asset: Asset) -> Result<Rate, ledger::ViewError> {
+    match asset {
+        Asset::Issue(issue) if issue.native() => Ok(PARITY_RATE),
+        Asset::Issue(issue) => {
+            let Some(account) = view.read(protocol::account_keylet(
+                basics::base_uint::Uint160::from_void(issue.account.data()),
+            ))?
+            else {
+                return Ok(PARITY_RATE);
+            };
+            Ok(if account.is_field_present(sf("sfTransferRate")) {
+                Rate::new(account.get_field_u32(sf("sfTransferRate")))
+            } else {
+                PARITY_RATE
+            })
+        }
+        Asset::MPTIssue(issue) => ledger::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id()),
+    }
+}
+
+fn subtract_vault_transfer_fee(amount: &STAmount, rate: Rate) -> Option<STAmount> {
+    if rate == PARITY_RATE {
+        return Some(amount.clone());
+    }
+    match amount.asset() {
+        Asset::Issue(issue) => Some(STAmount::from_iou_amount(
+            sf("sfAmount"),
+            ledger::mul_ratio::mul_ratio(amount.iou(), QUALITY_ONE, rate.value, false),
+            issue,
+        )),
+        Asset::MPTIssue(issue) => protocol::mpt_amount::mul_ratio(
+            amount.mpt(),
+            QUALITY_ONE,
+            rate.value,
+            false,
+        )
+        .ok()
+        .map(|value| STAmount::from_mpt_amount(sf("sfAmount"), value, issue)),
+    }
+}
 
 pub(super) struct VaultSnapshot {
     pub(super) key: Uint256,
@@ -913,7 +968,36 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                         local_scale,
                         RoundingMode::ToNearest,
                     );
-                    let destroyed_is_sub_ulp = tolerate_zero_delta
+                    // rippled VaultInvariant: `rate != kParityRate` is part of the
+                    // predicate, so a parity-rate withdrawal keeps the sub-ULP
+                    // tolerance below.
+                    let rate = match vault_transfer_rate(sandbox, after_vault.asset) {
+                        Ok(rate) => rate,
+                        Err(_) => return false,
+                    };
+                    let fee_adjusted_withdrawal = is_fee_adjusted_withdrawal(
+                        sandbox
+                            .rules()
+                            .enabled(&protocol::feature_id("fixCleanup3_5_0")),
+                        Some(destination) != tx_account,
+                        after_vault.asset.native(),
+                        tx_account == Some(asset_issuer(after_vault.asset)),
+                        rate,
+                    );
+                    let expected_destination = if fee_adjusted_withdrawal {
+                        let source = match after_vault.asset.amount(-local_pseudo_delta) {
+                            Ok(amount) => amount,
+                            Err(_) => return false,
+                        };
+                        let Some(net) = subtract_vault_transfer_fee(&source, rate) else {
+                            return false;
+                        };
+                        amount_to_number(&net)
+                    } else {
+                        -local_pseudo_delta
+                    };
+                    let destroyed_is_sub_ulp = !fee_adjusted_withdrawal
+                        && tolerate_zero_delta
                         && round_number_to_asset_with_scale(
                             after_vault.asset,
                             -pseudo_delta_assets.delta - delta.delta,
@@ -923,7 +1007,7 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                     valid_balance_change
                         && (destroyed_is_sub_ulp
                             || agrees_within_one_unit(
-                                -local_pseudo_delta,
+                                expected_destination,
                                 rounded_destination,
                                 after_vault.asset,
                                 local_scale,
@@ -1072,5 +1156,23 @@ mod tests {
         assert!(!valid_v1_1_vault_lifecycle(TxType::LOAN_SET, &vault, 100));
         assert!(valid_v1_1_vault_lifecycle(TxType::LOAN_SET, &vault, 101));
         assert!(!valid_v1_1_vault_lifecycle(TxType::LOAN_SET, &vault, 280));
+    }
+}
+
+#[cfg(test)]
+mod fee_adjusted_withdrawal_tests {
+    use super::{PARITY_RATE, is_fee_adjusted_withdrawal};
+
+    /// rippled 7237b3321c: a parity-rate asset charges no fee, so the
+    /// withdrawal is not fee-adjusted and keeps the sub-ULP tolerance.
+    #[test]
+    fn parity_rate_withdrawal_is_not_fee_adjusted_like_rippled() {
+        let fee = super::Rate::new(1_005_000_000);
+        assert!(is_fee_adjusted_withdrawal(true, true, false, false, fee));
+        assert!(!is_fee_adjusted_withdrawal(true, true, false, false, PARITY_RATE));
+        assert!(!is_fee_adjusted_withdrawal(false, true, false, false, fee));
+        assert!(!is_fee_adjusted_withdrawal(true, false, false, false, fee));
+        assert!(!is_fee_adjusted_withdrawal(true, true, true, false, fee));
+        assert!(!is_fee_adjusted_withdrawal(true, true, false, true, fee));
     }
 }

@@ -155,6 +155,11 @@ fn app_network_ops_runtime_process_async_stages_valid_transaction() {
 fn application_root_submit_transaction_queues_and_drains_async_batch() {
     let mut root = ApplicationRoot::new(0).expect("root shell should build");
     let runtime = root.attach_default_network_ops_runtime();
+    // rippled NetworkOPsImp::apply always has an open ledger built on the
+    // last closed ledger; without one the batch is retried, not drained.
+    root.on_closed_ledger(Arc::new(ledger::Ledger::from_ledger_seq_and_close_time(
+        10, 1_000, true,
+    )));
     let tx = payment_tx(
         account("3030303030303030303030303030303030303030"),
         account("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"),

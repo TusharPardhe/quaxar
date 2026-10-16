@@ -112,11 +112,10 @@ fn sum_sorted_amounts(amounts: &[STAmount], zero: &STAmount) -> Option<STAmount>
 fn amm_target_quality(
     clob: Option<Quality>,
     threshold: Option<Quality>,
-    fix_ammv1_1: bool,
     multi_path: bool,
 ) -> Option<Quality> {
     match (clob, threshold) {
-        (Some(tip), Some(limit)) if fix_ammv1_1 && !multi_path && limit > tip => None,
+        (Some(tip), Some(limit)) if !multi_path && limit > tip => None,
         (tip, _) => tip,
     }
 }
@@ -775,7 +774,6 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     let amm_generation_quality = amm_target_quality(
         clob_tip,
         quality_threshold,
-        view.rules().enabled(&protocol::fix_ammv1_1()),
         amm_context.multi_path(),
     );
     let mut stop_before_clob = false;
@@ -1463,7 +1461,7 @@ fn amm_swap_asset_in(
     pool_out: &STAmount,
     asset_in: &STAmount,
     trading_fee: u16,
-    amm_rounding_enabled: bool,
+    _amm_rounding_enabled: bool,
 ) -> Option<STAmount> {
     if pool_in.signum() <= 0 || pool_out.signum() <= 0 || asset_in.signum() <= 0 {
         return None;
@@ -1474,9 +1472,9 @@ fn amm_swap_asset_in(
     let pool_out = crate::domain::amm_helpers::stamount_as_number(pool_out);
     let asset_in = crate::domain::amm_helpers::stamount_as_number(asset_in);
 
-    let swap_out = if amm_rounding_enabled {
-        // fixAMMv1_1: stage the calculation with the same directions as
-        // rippled. The output is minimized, which preserves the pool product.
+    let swap_out = {
+        // Retired fixAMMv1_1 behavior: stage the calculation with the same
+        // directions as rippled. The output is minimized, which preserves the pool product.
         let numerator = {
             let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
             pool_in * pool_out
@@ -1500,8 +1498,6 @@ fn amm_swap_asset_in(
             let _rounding = NumberRoundModeGuard::new(RoundingMode::Downward);
             pool_out - ratio
         }
-    } else {
-        pool_out - (pool_in * pool_out) / (pool_in + asset_in * protocol::fee_mult(trading_fee))
     };
 
     if swap_out.signum() <= 0 {
@@ -1518,7 +1514,7 @@ fn amm_swap_asset_out(
     pool_out_amount: &STAmount,
     asset_out_amount: &STAmount,
     trading_fee: u16,
-    amm_rounding_enabled: bool,
+    _amm_rounding_enabled: bool,
 ) -> Option<STAmount> {
     if pool_in_amount.signum() <= 0
         || pool_out_amount.signum() <= 0
@@ -1532,9 +1528,9 @@ fn amm_swap_asset_out(
     let pool_out = crate::domain::amm_helpers::stamount_as_number(pool_out_amount);
     let asset_out = crate::domain::amm_helpers::stamount_as_number(asset_out_amount);
 
-    let swap_in = if amm_rounding_enabled {
-        // fixAMMv1_1: stage the calculation with the inverse directions of
-        // swapAssetIn. The required input is maximized, protecting the AMM.
+    let swap_in = {
+        // Retired fixAMMv1_1 behavior: stage the calculation with the inverse
+        // directions of swapAssetIn. The required input is maximized, protecting the AMM.
         let numerator = {
             let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
             pool_in * pool_out
@@ -1565,8 +1561,6 @@ fn amm_swap_asset_out(
             let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
             numerator2 / fee_mult
         }
-    } else {
-        ((pool_in * pool_out) / (pool_out - asset_out) - pool_in) / protocol::fee_mult(trading_fee)
     };
 
     if swap_in.signum() <= 0 {
@@ -1952,40 +1946,6 @@ fn amm_offer_for_clob_quality(
     trading_fee: u16,
     amm_rounding_enabled: bool,
 ) -> Option<(STAmount, STAmount)> {
-    // Legacy changeSpotPriceQuality calculates takerPays first and permits a
-    // 1e-7 quality-distance rounding tolerance.
-    if !amm_rounding_enabled {
-        let q = crate::domain::amm_helpers::stamount_as_number(&target.rate());
-        if q == RuntimeNumber::zero() {
-            return None;
-        }
-        let _rounding = NumberRoundModeGuard::new(RoundingMode::ToNearest);
-        let one = RuntimeNumber::from_i64_and_exponent(1, 0);
-        let pool_in_n = crate::domain::amm_helpers::stamount_as_number(pool_in);
-        let pool_out_n = crate::domain::amm_helpers::stamount_as_number(pool_out);
-        let fee_mult = protocol::fee_mult(trading_fee);
-        let b = pool_in_n * (one + fee_mult);
-        let c = pool_in_n * pool_in_n - pool_in_n * pool_out_n * q;
-        let mut proposed = crate::domain::amm_helpers::solve_quadratic_eq_smallest(fee_mult, b, c)?;
-        let constraint = pool_out_n * q - pool_in_n / fee_mult;
-        if proposed > constraint {
-            proposed = constraint;
-        }
-        if proposed <= RuntimeNumber::zero() {
-            return None;
-        }
-        let input = number_to_amount(pool_in.asset(), proposed, RoundingMode::Upward)?;
-        let out = amm_swap_asset_in(pool_in, pool_out, &input, trading_fee, false)?;
-        let quality = Quality::from_amounts(&Amounts::new(input.clone(), out.clone()));
-        return (quality >= target
-            || crate::domain::amm_helpers::within_relative_distance_quality(
-                quality,
-                target,
-                RuntimeNumber::from_i64_and_exponent(1, -7),
-            ))
-        .then_some((input, out));
-    }
-
     let result = if pool_out.asset().integral()
         && (!pool_in.asset().integral()
             || crate::domain::amm_helpers::stamount_as_number(&target.rate())
@@ -2107,7 +2067,7 @@ fn get_amm_offer<V: ApplyView>(
         return Ok(None);
     }
 
-    let amm_rounding_enabled = view.rules().enabled(&protocol::fix_ammv1_1());
+    let amm_rounding_enabled = true;
     let spot_quality = Quality::from_amounts(&Amounts::new(
         pool_in_amount.clone(),
         pool_out_amount.clone(),
@@ -2253,12 +2213,8 @@ pub(crate) fn book_quality_upper_bound<V: ApplyView>(
 ) -> Result<Option<Quality>, ViewError> {
     let clob_offers = get_book_offers(view, book, 1)?;
     let clob = clob_offers.first().map(TraversedBookEntry::quality);
-    let generation_quality = amm_target_quality(
-        clob,
-        quality_threshold,
-        view.rules().enabled(&protocol::fix_ammv1_1()),
-        amm_context.multi_path(),
-    );
+    let generation_quality =
+        amm_target_quality(clob, quality_threshold, amm_context.multi_path());
     let amm = if amm_quality_estimation_allowed(
         book.domain,
         view.rules().enabled(&protocol::fix_cleanup_3_3_0()),
@@ -2300,12 +2256,7 @@ pub(crate) fn book_quality_function<V: ApplyView>(
 ) -> Result<Option<QualityFunction>, ViewError> {
     let clob_offers = get_book_offers(view, book, 1)?;
     let clob = clob_offers.first().map(TraversedBookEntry::quality);
-    let target = amm_target_quality(
-        clob,
-        quality_threshold,
-        view.rules().enabled(&protocol::fix_ammv1_1()),
-        amm_context.multi_path(),
-    );
+    let target = amm_target_quality(clob, quality_threshold, amm_context.multi_path());
     let amm = if amm_quality_estimation_allowed(
         book.domain,
         view.rules().enabled(&protocol::fix_cleanup_3_3_0()),
@@ -2339,11 +2290,8 @@ pub(crate) fn book_quality_function<V: ApplyView>(
                 QualityFunctionClobLikeTag,
             )));
         }
-        let compose_input_rate = should_compose_single_path_input_rate(
-            previous_redeems,
-            owner_pays_transfer_fee,
-            view.rules().enabled(&protocol::fix_ammv1_1()),
-        );
+        let compose_input_rate =
+            should_compose_single_path_input_rate(previous_redeems, owner_pays_transfer_fee);
         let mut qf = if compose_input_rate {
             let tr = transfer_rate_for_asset(view, book.r#in, Some(strand_dst), strand_deliver)?;
             let input = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(i64::from(tr)));
@@ -2387,12 +2335,8 @@ pub(crate) fn book_quality_function<V: ApplyView>(
     }
 }
 
-fn should_compose_single_path_input_rate(
-    previous_redeems: bool,
-    offer_crossing: bool,
-    fix_ammv1_1: bool,
-) -> bool {
-    previous_redeems && (!offer_crossing || fix_ammv1_1)
+fn should_compose_single_path_input_rate(previous_redeems: bool, offer_crossing: bool) -> bool {
+    previous_redeems && !offer_crossing
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2408,10 +2352,9 @@ fn adjust_quality_with_fees<V: ApplyView>(
     strand_deliver: Asset,
 ) -> Result<Quality, ViewError> {
     // BookOfferCrossingStep deliberately returns the raw upper bound for CLOB
-    // and multipath AMM liquidity. For a single-path AMM, fixAMMv1_1 makes the
-    // incoming transfer rate part of the nonlinear quality upper bound.
-    if owner_pays_transfer_fee
-        && (!view.rules().enabled(&protocol::fix_ammv1_1()) || !is_amm || amm_multi_path)
+    // and multipath AMM liquidity. For a single-path AMM, the incoming
+    // transfer rate is part of the nonlinear quality upper bound.
+    if owner_pays_transfer_fee && (!is_amm || amm_multi_path)
     {
         return Ok(offer_quality);
     }
@@ -3191,7 +3134,7 @@ mod tests {
     }
 
     #[test]
-    fn amm_target_threshold_is_fix_and_single_path_conditional() {
+    fn amm_target_threshold_is_unconditional_for_single_path() {
         let input = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(2));
         let output = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1));
         let tip = Quality::from_amounts(&Amounts::new(input.clone(), output.clone()));
@@ -3199,15 +3142,16 @@ mod tests {
         assert!(limit > tip);
 
         assert_eq!(
-            amm_target_quality(Some(tip), Some(limit), true, false),
+            amm_target_quality(Some(tip), Some(limit), false),
             None
         );
         assert_eq!(
-            amm_target_quality(Some(tip), Some(limit), false, false),
-            Some(tip)
+            amm_target_quality(Some(tip), Some(limit), false),
+            None,
+            "retired fixAMMv1_1 behavior applies even without the amendment ID"
         );
         assert_eq!(
-            amm_target_quality(Some(tip), Some(limit), true, true),
+            amm_target_quality(Some(tip), Some(limit), true),
             Some(tip)
         );
     }
@@ -4203,11 +4147,11 @@ mod tests {
     }
 
     #[test]
-    fn single_path_amm_fee_function_honors_fix_gate_only_for_offer_crossing() {
-        assert!(should_compose_single_path_input_rate(true, false, false));
-        assert!(!should_compose_single_path_input_rate(true, true, false));
-        assert!(should_compose_single_path_input_rate(true, true, true));
-        assert!(!should_compose_single_path_input_rate(false, false, true));
+    fn single_path_amm_fee_function_is_unconditional_for_offer_crossing() {
+        assert!(should_compose_single_path_input_rate(true, false));
+        assert!(!should_compose_single_path_input_rate(true, true));
+        assert!(!should_compose_single_path_input_rate(true, true));
+        assert!(!should_compose_single_path_input_rate(false, false));
     }
     #[test]
     fn reverse_xrp_to_iou_output_cap_derives_only_required_3300_xrp_sendmax() {

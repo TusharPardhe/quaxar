@@ -437,10 +437,10 @@ fn round_mode(result_negative: bool, round_up: bool) -> RoundingMode {
     }
 }
 
-/// Materialize the MPTokensV2 Number result under the same directed mode used
-/// for the operation. `round_up` means away from zero, matching mulRound and
-/// divRound's legacy contracts.
-fn round_mpt_number_result(
+/// Materialize a Number result under the same directed mode used for the
+/// operation. `round_up` means away from zero, matching mulRound and divRound's
+/// legacy contracts.
+fn round_number_result(
     asset: Asset,
     result_negative: bool,
     round_up: bool,
@@ -448,7 +448,7 @@ fn round_mpt_number_result(
 ) -> STAmount {
     let mode = round_mode(result_negative, round_up);
     let result = crate::to_amount_from_number::<STAmount>(asset, number, mode)
-        .expect("MPTokensV2 Number result should materialize as an MPT amount");
+        .expect("Number result should materialize as the requested amount asset");
 
     if round_up && !result_negative && result.signum() == 0 {
         return STAmount::new_with_asset(sf_generic(), asset, 1, 0, false);
@@ -500,6 +500,27 @@ fn ceil_in_impl(
     amount.clone()
 }
 
+fn try_mul_round(
+    v1: &STAmount,
+    v2: &STAmount,
+    asset: Asset,
+    round_up: bool,
+    mul_round_fn: fn(&STAmount, &STAmount, Asset, bool) -> STAmount,
+) -> Option<STAmount> {
+    match catch_unwind(AssertUnwindSafe(|| mul_round_fn(v1, v2, asset, round_up))) {
+        Ok(result) => Some(result),
+        Err(payload) => {
+            if basics::contract::exception_kind(payload.as_ref()).is_overflow()
+                || !asset.native()
+                || !is_feature_enabled_or(&crate::fix_cleanup_3_5_0(), true)
+            {
+                basics::contract::rethrow(payload);
+            }
+            None
+        }
+    }
+}
+
 fn ceil_out_impl(
     amount: &Amounts,
     limit: &STAmount,
@@ -509,7 +530,8 @@ fn ceil_out_impl(
 ) -> Amounts {
     if amount.out > *limit {
         let mut result = Amounts::new(
-            mul_round_fn(limit, &quality.rate(), amount.r#in.asset(), round_up),
+            try_mul_round(limit, &quality.rate(), amount.r#in.asset(), round_up, mul_round_fn)
+                .unwrap_or_else(|| amount.r#in.clone()),
             limit.clone(),
         );
         if result.r#in > amount.r#in {
@@ -585,7 +607,7 @@ fn mul_round_impl(
             let _guard = NumberRoundModeGuard::new(round_mode(result_negative, round_up));
             stamount_as_number(v1) * stamount_as_number(v2)
         };
-        return round_mpt_number_result(asset, result_negative, round_up, product);
+        return round_number_result(asset, result_negative, round_up, product);
     }
 
     let mut value1 = v1.mantissa();
@@ -671,15 +693,16 @@ fn div_round_impl(
     // rippled #8302: the legacy path below overflows on large MPT amounts, so
     // the Number path is also taken under fixCleanup3_5_0. Both default to
     // enabled when no transaction rules are installed.
-    if matches!(asset, Asset::MPTIssue(_))
-        && (is_feature_enabled_or(&crate::feature_id("MPTokensV2"), true)
-            || is_feature_enabled_or(&crate::fix_cleanup_3_5_0(), true))
+    let number_path_enabled = is_feature_enabled_or(&crate::feature_id("MPTokensV2"), true)
+        || is_feature_enabled_or(&crate::fix_cleanup_3_5_0(), true);
+    if (matches!(asset, Asset::MPTIssue(_)) || num.holds_mpt_issue() || den.holds_mpt_issue())
+        && number_path_enabled
     {
         let quotient = {
             let _guard = NumberRoundModeGuard::new(round_mode(result_negative, round_up));
             stamount_as_number(num) / stamount_as_number(den)
         };
-        return round_mpt_number_result(asset, result_negative, round_up, quotient);
+        return round_number_result(asset, result_negative, round_up, quotient);
     }
 
     let mut num_val = num.mantissa();
@@ -886,6 +909,54 @@ fn canonicalize_round_strict(native: bool, value: &mut u64, offset: &mut i32, ro
 }
 
 #[cfg(test)]
+mod cleanup_3_5_ceil_out_tests {
+    use super::*;
+    use crate::{CurrentTransactionRulesGuard, IOUAmount, Issue, Rules, ST_AMOUNT_MAX_NATIVE_NETWORK};
+
+    fn fixture() -> (Amounts, STAmount, Quality) {
+        let issue = Issue::new(crate::currency_from_string("USD"), crate::AccountID::from_array([0x44; 20]));
+        let input = STAmount::new_native(ST_AMOUNT_MAX_NATIVE_NETWORK, false);
+        let output = STAmount::from_iou_amount(
+            sf_generic(),
+            IOUAmount::from_parts(9_999_999_999_999_995, -15).expect("output"),
+            issue,
+        );
+        let limit = STAmount::from_iou_amount(
+            sf_generic(),
+            IOUAmount::from_parts(9_999_999_999_999_994, -15).expect("limit"),
+            issue,
+        );
+        let amounts = Amounts::new(input, output);
+        let quality = Quality::from_amounts(&amounts);
+        (amounts, limit, quality)
+    }
+
+    #[test]
+    fn cleanup_3_5_ceil_out_clamps_unrepresentable_native_input() {
+        let (amounts, limit, quality) = fixture();
+        let legacy = Rules::new([]);
+        let payload = {
+            let _rules = CurrentTransactionRulesGuard::new(legacy);
+            basics::contract::try_catch(|| quality.ceil_out(&amounts, &limit))
+                .expect_err("legacy native materialization must throw")
+        };
+        assert!(basics::contract::exception_kind(payload.as_ref()).is_runtime());
+        assert!(!basics::contract::exception_kind(payload.as_ref()).is_overflow());
+
+        {
+            let _rules = CurrentTransactionRulesGuard::new(Rules::new([crate::fix_cleanup_3_5_0()]));
+            let result = quality.ceil_out(&amounts, &limit);
+            assert_eq!(result.r#in, amounts.r#in);
+            assert_eq!(result.out, limit);
+        }
+
+        let result = quality.ceil_out(&amounts, &limit);
+        assert_eq!(result.r#in, amounts.r#in);
+        assert_eq!(result.out, limit);
+    }
+}
+
+#[cfg(test)]
 mod int64_wrap_parity_tests {
     use super::*;
 
@@ -908,5 +979,47 @@ mod int64_wrap_parity_tests {
         let rounded = Quality::from_value(rate).round(6);
         let taker_gets = divide(&pays, &amount_from_quality(rounded.value()), book);
         assert_eq!((taker_gets.mantissa(), taker_gets.exponent()), (1_039_601_166_302_251, -15));
+    }
+}
+
+#[cfg(test)]
+mod cleanup_3_5_mpt_operand_div_round_tests {
+    use super::*;
+    use crate::{CurrentTransactionRulesGuard, Issue, MPTIssue, Rules};
+
+    #[test]
+    fn cleanup_3_5_div_round_uses_number_for_an_mpt_operand_and_iou_result() {
+        let mpt = MPTIssue::new(basics::base_uint::Uint192::from_array([0x41; 24]));
+        let usd = Issue::new(crate::currency_from_string("USD"), crate::AccountID::from_array([0x42; 20]));
+        let numerator = STAmount::from_mpt_amount(
+            sf_generic(),
+            crate::MPTAmount::from_value(5_000_000_000_000_000_000),
+            mpt,
+        );
+        let denominator = STAmount::new_with_asset(
+            sf_generic(),
+            crate::xrp_issue(),
+            1_000_000_000_000_000,
+            -12,
+            false,
+        );
+        let expected = STAmount::from_iou_amount(
+            sf_generic(),
+            crate::IOUAmount::from_parts(5_000_000_000_000_000, 0).expect("expected IOU"),
+            usd,
+        );
+
+        let legacy = Rules::new([]);
+        let _legacy_rules = CurrentTransactionRulesGuard::new(legacy);
+        assert!(basics::contract::try_catch(|| div_round(&numerator, &denominator, usd.into(), true)).is_err());
+        drop(_legacy_rules);
+
+        let _cleanup_rules =
+            CurrentTransactionRulesGuard::new(Rules::new([crate::fix_cleanup_3_5_0()]));
+        assert_eq!(div_round(&numerator, &denominator, usd.into(), true), expected);
+        assert_eq!(
+            div_round_strict(&numerator, &denominator, usd.into(), false),
+            expected
+        );
     }
 }

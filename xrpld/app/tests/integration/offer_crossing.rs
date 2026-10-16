@@ -4504,3 +4504,82 @@ fn testnet_21357186_book_ioc_crosses_like_network() {
     assert_eq!(xrp_balance(&view, taker) - taker_before, 172571166836, "network taker XRP gain");
     assert_eq!(gains, expected.to_vec(), "network per-maker XRP changes");
 }
+
+/// Port of rippled `Offer_test::testPartialCross` rows `deb`, `dan` and `syd`
+/// (CLOB liquidity). A taker selling XRP for an IOU it holds no trust line for
+/// may use one owner reserve more while crossing, because the trust line is
+/// created before the XRP leaves (XRPEndpointOfferCrossingStep
+/// `reserveReduction_`). Without that, `deb` was killed: the AMM form of the
+/// same bug forked testnet ledger 21568551.
+fn run_partial_cross_reserve(pre_trust: Option<bool>, extra_fees: i64) -> (Ter, i64, String, u32) {
+    const FEE: i64 = 10;
+    let taker = acct(0x22);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    // fixtures: reserve base 200_000 drops, increment 50_000 drops.
+    let reserve = |owners: i64| 200_000 + owners * 50_000;
+    let taker_owners = u32::from(pre_trust == Some(true));
+    let mut entries = vec![
+        account_root(
+            taker,
+            10 + reserve(i64::from(taker_owners)) + extra_fees * FEE,
+            taker_owners,
+            0,
+        ),
+        account_root(gw, 10_000_000_000, 0, protocol::lsfDefaultRipple),
+    ];
+    if pre_trust.is_some() {
+        // Some(true): the taker owns the line (AcctPreTrust); Some(false):
+        // the gateway owns it (GwPreTrust).
+        let (low_limit, high_limit) = if pre_trust == Some(true) { (1_000, 0) } else { (0, 1_000) };
+        entries.push(trust_line(taker, gw, usd, 0, low_limit, high_limit));
+    }
+    let mut view = new_view(build_ledger(entries));
+
+    // gw: 1 USD for 1 XRP on the book.
+    let book = offer_tx(gw, xrp(1_000_000), iou(gw, usd, 1), 1);
+    assert_eq!(full_apply(&mut view, &book, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+
+    let before = xrp_balance(&view, taker);
+    let take = offer_tx(taker, iou(gw, usd, 1_000), xrp(1_000_000_000), 1);
+    // The real transactor path: rippled's OfferCreate has no preclaim reserve
+    // check, unlike this harness's `full_apply`.
+    let ter = apply_submit_transactor_shell(&mut view, &take, TxType::OFFER_CREATE);
+    let usd_balance = view
+        .read(protocol::line(taker, gw, usd))
+        .expect("read line")
+        .map(|line| line.get_field_amount(sf("sfBalance")).iou().to_string())
+        .unwrap_or_else(|| "none".to_owned());
+    (ter, before - xrp_balance(&view, taker), usd_balance, get_owner_count(&view, taker))
+}
+
+#[test]
+fn partial_cross_deb_new_trust_line_uses_one_reserve_deeper_like_rippled() {
+    // deb: 10 drops + reserve(0) + 1 fee, no trust line.
+    let (ter, spent, usd, owners) = run_partial_cross_reserve(None, 1);
+    assert_eq!(ter, Ter::TES_SUCCESS);
+    assert_eq!(spent, 10 + 10, "10 drops crossed plus the fee");
+    assert_eq!(usd, "0.00001");
+    assert_eq!(owners, 1, "the crossing created the taker's trust line");
+}
+
+#[test]
+fn partial_cross_dan_gateway_owned_line_has_no_reduction_like_rippled() {
+    // dan: 10 drops + reserve(0) + 1 fee, gateway already holds the line.
+    let (ter, spent, usd, owners) = run_partial_cross_reserve(Some(false), 1);
+    assert_eq!(ter, Ter::TES_SUCCESS);
+    assert_eq!(spent, 10 + 10);
+    assert_eq!(usd, "0.00001");
+    assert_eq!(owners, 0);
+}
+
+#[test]
+fn partial_cross_syd_existing_line_has_no_reduction_like_rippled() {
+    // syd: 10 drops + reserve(1) + 1 fee here (rippled's second fee paid for
+    // the TrustSet that created the line), taker already owns the line.
+    let (ter, spent, usd, owners) = run_partial_cross_reserve(Some(true), 1);
+    assert_eq!(ter, Ter::TES_SUCCESS);
+    assert_eq!(spent, 10 + 10);
+    assert_eq!(usd, "0.00001");
+    assert_eq!(owners, 1);
+}

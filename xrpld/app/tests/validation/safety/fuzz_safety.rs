@@ -49,7 +49,8 @@ fn sttx_deserializer_no_panic() {
     for (i, input) in FUZZ_INPUTS.iter().enumerate() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut iter = SerialIter::new(input);
-            let _ = STTx::from_serial_iter(&mut iter);
+            // rippled throws; the fallible form returns the error.
+            let _ = STTx::try_from_serial_iter(&mut iter);
         }));
         assert!(result.is_ok(), "STTx panicked on fuzz input {i}");
     }
@@ -163,7 +164,8 @@ fn random_byte_sequences_no_panic() {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut iter = SerialIter::new(&data);
-            let _ = STTx::from_serial_iter(&mut iter);
+            // rippled throws; the fallible form returns the error.
+            let _ = STTx::try_from_serial_iter(&mut iter);
 
             let mut iter = SerialIter::new(&data);
             let _ = STObject::from_serial_iter(&mut iter, get_field_by_symbol("sfGeneric"), 0);

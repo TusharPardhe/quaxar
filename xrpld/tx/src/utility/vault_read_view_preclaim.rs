@@ -907,6 +907,8 @@ fn preclaim_clawback<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     Ok(run_vault_clawback_preclaim(VaultClawbackPreclaimFacts {
         vault_exists: true,
         share_issuance_exists: issuance.is_some(),
+        fix_cleanup_3_5_0_enabled: view.rules().enabled(&protocol::fix_cleanup_3_5_0()),
+        holder_account_exists: read_account(view, holder)?.is_some(),
         amount_present: tx.is_field_present(sf("sfAmount")),
         vault_asset_is_native: asset.native(),
         vault_asset_issuer_is_owner: !asset.native()

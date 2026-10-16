@@ -188,6 +188,29 @@ fn account_nfts_reports_account_errors() {
         Some(&JsonValue::String("invalidParams".to_owned()))
     );
 
+    let invalid_ledger_before_malformed_account = do_account_nfts(
+        &AccountNFTsRequest {
+            params: &object([
+                ("account", JsonValue::String("llIIOO".to_owned())),
+                ("ledger_hash", JsonValue::Unsigned(1)),
+            ]),
+            api_version: 1,
+            role: RpcRole::Admin,
+        },
+        &source,
+    );
+    let JsonValue::Object(invalid_ledger_before_malformed_account) =
+        invalid_ledger_before_malformed_account
+    else {
+        panic!("invalid ledger response must be an object");
+    };
+    assert_eq!(
+        invalid_ledger_before_malformed_account.get("error_message"),
+        Some(&JsonValue::String(
+            "Invalid field 'ledger_hash', not hex string.".to_owned()
+        ))
+    );
+
     let malformed = do_account_nfts(
         &AccountNFTsRequest {
             params: &object([("account", JsonValue::String("foo".to_owned()))]),
@@ -204,6 +227,26 @@ fn account_nfts_reports_account_errors() {
         Some(&JsonValue::String("actMalformed".to_owned()))
     );
     assert_eq!(malformed.get("error_code"), Some(&JsonValue::Signed(35)));
+
+    let bad_limit_before_missing_account = do_account_nfts(
+        &AccountNFTsRequest {
+            params: &object([
+                ("account", JsonValue::String(to_base58(sample_account(0x77)))),
+                ("limit", JsonValue::Unsigned(0)),
+            ]),
+            api_version: 1,
+            role: RpcRole::Admin,
+        },
+        &source,
+    );
+    let JsonValue::Object(bad_limit_before_missing_account) = bad_limit_before_missing_account
+    else {
+        panic!("bad limit response must be an object");
+    };
+    assert_eq!(
+        bad_limit_before_missing_account.get("error_message"),
+        Some(&JsonValue::String("Invalid field 'limit'.".to_owned()))
+    );
 
     let bad_limit = do_account_nfts(
         &AccountNFTsRequest {
@@ -282,10 +325,7 @@ fn account_nfts_shapes_pages_limits_and_markers() {
         panic!("account_nfts must be an array");
     };
     assert_eq!(nfts.len(), 2);
-    assert_eq!(
-        result.get("account"),
-        Some(&JsonValue::String(to_base58(account)))
-    );
+    assert!(!result.contains_key("account"));
     assert_eq!(result.get("limit"), Some(&JsonValue::Unsigned(2)));
     assert_eq!(
         result.get("marker"),

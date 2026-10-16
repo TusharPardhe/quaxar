@@ -26,6 +26,11 @@ pub struct LoanBrokerDeletePreclaimFacts {
     pub vault_exists: bool,
     pub rounded_debt_total_is_zero: bool,
     pub cover_available_is_positive: bool,
+    pub fix_cleanup_3_5_0_enabled: bool,
+    pub can_transfer_result: Ter,
+    pub require_auth_result: Ter,
+    pub owner_holding_exists: bool,
+    pub can_add_holding_result: Ter,
     pub deep_frozen_result: Ter,
 }
 
@@ -58,8 +63,25 @@ pub fn run_loan_broker_delete_preclaim(facts: LoanBrokerDeletePreclaimFacts) -> 
         return Ter::TEC_HAS_OBLIGATIONS;
     }
 
-    if facts.cover_available_is_positive && !is_tes_success(facts.deep_frozen_result) {
-        return facts.deep_frozen_result;
+    if facts.cover_available_is_positive {
+        // Post-fixCleanup3_5_0 a broker deletion follows the cover-withdraw
+        // transfer and weak-authorization checks. CanTransfer is waived for
+        // MPTs by the adapter before this fact is populated.
+        if facts.fix_cleanup_3_5_0_enabled {
+            if !is_tes_success(facts.can_transfer_result) {
+                return facts.can_transfer_result;
+            }
+            if !is_tes_success(facts.require_auth_result) {
+                return facts.require_auth_result;
+            }
+            if !facts.owner_holding_exists && !is_tes_success(facts.can_add_holding_result) {
+                return facts.can_add_holding_result;
+            }
+        }
+
+        if !is_tes_success(facts.deep_frozen_result) {
+            return facts.deep_frozen_result;
+        }
     }
 
     Ter::TES_SUCCESS
@@ -250,6 +272,11 @@ mod tests {
             vault_exists: true,
             rounded_debt_total_is_zero: true,
             cover_available_is_positive: false,
+            fix_cleanup_3_5_0_enabled: false,
+            can_transfer_result: Ter::TES_SUCCESS,
+            require_auth_result: Ter::TES_SUCCESS,
+            owner_holding_exists: true,
+            can_add_holding_result: Ter::TES_SUCCESS,
             deep_frozen_result: Ter::TES_SUCCESS,
         }
     }
@@ -305,6 +332,41 @@ mod tests {
         });
 
         assert_eq!(result, Ter::TEC_HAS_OBLIGATIONS);
+    }
+
+    #[test]
+    fn loan_broker_delete_checks_cover_payout_authorization_after_cleanup_3_5_0() {
+        let facts = LoanBrokerDeletePreclaimFacts {
+            cover_available_is_positive: true,
+            can_transfer_result: Ter::TER_NO_RIPPLE,
+            require_auth_result: Ter::TEC_NO_AUTH,
+            owner_holding_exists: false,
+            can_add_holding_result: Ter::TEC_INSUFFICIENT_RESERVE,
+            ..base()
+        };
+        // Before the amendment, only the deep-freeze check applies.
+        assert_eq!(run_loan_broker_delete_preclaim(facts), Ter::TES_SUCCESS);
+
+        let transfer = run_loan_broker_delete_preclaim(LoanBrokerDeletePreclaimFacts {
+            fix_cleanup_3_5_0_enabled: true,
+            ..facts
+        });
+        assert_eq!(transfer, Ter::TER_NO_RIPPLE);
+
+        let authorization = run_loan_broker_delete_preclaim(LoanBrokerDeletePreclaimFacts {
+            fix_cleanup_3_5_0_enabled: true,
+            can_transfer_result: Ter::TES_SUCCESS,
+            ..facts
+        });
+        assert_eq!(authorization, Ter::TEC_NO_AUTH);
+
+        let reserve = run_loan_broker_delete_preclaim(LoanBrokerDeletePreclaimFacts {
+            fix_cleanup_3_5_0_enabled: true,
+            can_transfer_result: Ter::TES_SUCCESS,
+            require_auth_result: Ter::TES_SUCCESS,
+            ..facts
+        });
+        assert_eq!(reserve, Ter::TEC_INSUFFICIENT_RESERVE);
     }
 
     #[test]

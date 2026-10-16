@@ -1,4 +1,41 @@
 //! `XRPAmount` port from `xrpl/protocol/XRPAmount.h`.
+#[cfg(test)]
+mod tests {
+    use super::XRPAmount;
+    use crate::{CurrentTransactionRulesGuard, Rules, fix_cleanup_3_5_0};
+
+    fn assert_overflow(operation: impl FnOnce()) {
+        let payload = basics::contract::try_catch(operation).expect_err("overflow must unwind");
+        assert!(basics::contract::exception_kind(payload.as_ref()).is_overflow());
+    }
+
+    #[test]
+    fn cleanup_3_5_xrp_amount_overflow_throws_and_preserves_lhs() {
+        let _rules = CurrentTransactionRulesGuard::new(Rules::new([fix_cleanup_3_5_0()]));
+
+        let mut max = XRPAmount::from_drops(i64::MAX);
+        assert_overflow(|| max += XRPAmount::from_drops(1));
+        assert_eq!(max, XRPAmount::from_drops(i64::MAX));
+
+        let mut min = XRPAmount::from_drops(i64::MIN);
+        assert_overflow(|| min -= XRPAmount::from_drops(1));
+        assert_eq!(min, XRPAmount::from_drops(i64::MIN));
+
+        let mut product = XRPAmount::from_drops(i64::MAX);
+        assert_overflow(|| product *= 2);
+        assert_eq!(product, XRPAmount::from_drops(i64::MAX));
+        assert_overflow(|| {
+            let _ = XRPAmount::from_drops(i64::MIN) * -1;
+        });
+    }
+
+    #[test]
+    fn xrp_amount_overflow_defaults_to_cleanup_behavior_without_rules() {
+        let mut amount = XRPAmount::from_drops(i64::MAX);
+        assert_overflow(|| amount += 1);
+        assert_eq!(amount, XRPAmount::from_drops(i64::MAX));
+    }
+}
 
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
@@ -110,14 +147,26 @@ impl From<XRPAmount> for bool {
     }
 }
 
-// rippled `XRPAmount::operator+=` / `operator-=` are unchecked `int64` adds
-// (`drops_ += other`), which wrap on every platform rippled ships. Keep
-// the same wrapping semantics so results stay identical to rippled; callers
-// that must reject overflow use explicit checked arithmetic, as rippled does
-// with `checkedAdd` (see `protocol::checked_step_add`).
+// rippled #8453: fixCleanup3_5_0 changes XRPAmount overflow from legacy
+// signed arithmetic to std::overflow_error. With no transaction rules (RPC
+// and pathfinding), rippled applies the fixed behavior.
+fn checked_or_legacy_overflow(result: Option<i64>, legacy: impl FnOnce() -> i64, operation: &str) -> i64 {
+    match result {
+        Some(value) => value,
+        None if crate::is_feature_enabled_or(&crate::fix_cleanup_3_5_0(), true) => {
+            basics::contract::throw_overflow(operation)
+        }
+        None => legacy(),
+    }
+}
+
 impl AddAssign for XRPAmount {
     fn add_assign(&mut self, rhs: Self) {
-        self.drops = self.drops.wrapping_add(rhs.drops);
+        self.drops = checked_or_legacy_overflow(
+            self.drops.checked_add(rhs.drops),
+            || self.drops.wrapping_add(rhs.drops),
+            "XRPAmount::operator+= overflow",
+        );
     }
 }
 
@@ -132,7 +181,11 @@ impl Add for XRPAmount {
 
 impl SubAssign for XRPAmount {
     fn sub_assign(&mut self, rhs: Self) {
-        self.drops = self.drops.wrapping_sub(rhs.drops);
+        self.drops = checked_or_legacy_overflow(
+            self.drops.checked_sub(rhs.drops),
+            || self.drops.wrapping_sub(rhs.drops),
+            "XRPAmount::operator-= overflow",
+        );
     }
 }
 
@@ -147,21 +200,30 @@ impl Sub for XRPAmount {
 
 impl AddAssign<i64> for XRPAmount {
     fn add_assign(&mut self, rhs: i64) {
-        self.drops = self.drops.wrapping_add(rhs);
+        self.drops = checked_or_legacy_overflow(
+            self.drops.checked_add(rhs),
+            || self.drops.wrapping_add(rhs),
+            "XRPAmount::operator+= overflow",
+        );
     }
 }
 
 impl SubAssign<i64> for XRPAmount {
     fn sub_assign(&mut self, rhs: i64) {
-        self.drops = self.drops.wrapping_sub(rhs);
+        self.drops = checked_or_legacy_overflow(
+            self.drops.checked_sub(rhs),
+            || self.drops.wrapping_sub(rhs),
+            "XRPAmount::operator-= overflow",
+        );
     }
 }
 
 impl Mul<i64> for XRPAmount {
     type Output = Self;
 
-    fn mul(self, rhs: i64) -> Self::Output {
-        Self::from_drops(self.drops.wrapping_mul(rhs))
+    fn mul(mut self, rhs: i64) -> Self::Output {
+        self *= rhs;
+        self
     }
 }
 
@@ -175,7 +237,11 @@ impl Mul<XRPAmount> for i64 {
 
 impl MulAssign<i64> for XRPAmount {
     fn mul_assign(&mut self, rhs: i64) {
-        self.drops = self.drops.wrapping_mul(rhs);
+        self.drops = checked_or_legacy_overflow(
+            self.drops.checked_mul(rhs),
+            || self.drops.wrapping_mul(rhs),
+            "XRPAmount::operator*= overflow",
+        );
     }
 }
 

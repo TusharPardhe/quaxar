@@ -2920,6 +2920,7 @@ fn requires_source_pre_fee_balance(txn_type: TxType) -> bool {
             | TxType::ESCROW_FINISH
             | TxType::ESCROW_CANCEL
             | TxType::LOAN_BROKER_SET
+            | TxType::LOAN_BROKER_DELETE
             | TxType::LOAN_BROKER_COVER_WITHDRAW
             | TxType::LOAN_SET
             | TxType::DEPOSIT_PREAUTH
@@ -3147,7 +3148,13 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             };
             crate::state::lending::apply_loan_broker_set(view, sttx, pre_fee_balance_drops)
         }
-        TxType::LOAN_BROKER_DELETE => crate::state::lending::apply_loan_broker_delete(view, sttx),
+        TxType::LOAN_BROKER_DELETE => {
+            let pre_fee_balance_drops = match require_pre_fee_balance(pre_fee_balance_drops) {
+                Ok(balance) => balance,
+                Err(error) => return error,
+            };
+            crate::state::lending::apply_loan_broker_delete(view, sttx, pre_fee_balance_drops)
+        }
         TxType::LOAN_BROKER_COVER_DEPOSIT => {
             crate::state::lending::apply_loan_broker_cover_deposit(view, sttx)
         }
@@ -6124,23 +6131,20 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 if mpt_result != Ter::TES_SUCCESS {
                     return mpt_result;
                 }
-                let mut lp_total = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
                 let account_lp_tokens = match amm_lp_holds_in_view(view, &amm_sle, account) {
                     Ok(Some(amount)) => amount,
                     Ok(None) => return Ter::TEC_AMM_BALANCE,
                     Err(_) => return Ter::TEF_BAD_LEDGER,
                 };
-                if view.rules().enabled(&protocol::feature_id("fixAMMv1_1")) {
-                    if let Err(ter) = ledger::verify_and_adjust_lp_token_balance(
-                        view,
-                        &account_lp_tokens,
-                        &mut amm_sle,
-                        account,
-                    ) {
-                        return ter;
-                    }
-                    lp_total = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
+                if let Err(ter) = ledger::verify_and_adjust_lp_token_balance(
+                    view,
+                    &account_lp_tokens,
+                    &mut amm_sle,
+                    account,
+                ) {
+                    return ter;
                 }
+                let lp_total = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
                 let lp_issue = lp_total.issue();
                 let trading_fee = ledger::get_trading_fee(view, &amm_sle, account);
                 let pool_asset1 = amount.as_ref().map(STAmount::asset).unwrap_or(asset1);

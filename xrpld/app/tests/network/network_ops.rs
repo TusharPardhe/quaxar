@@ -77,8 +77,10 @@ fn networkops_shared_owner_state_tracks_mode_and_blocking_flags() {
     state.set_amendment_blocked(true);
     state.set_unl_blocked(true);
 
-    assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Syncing);
-    assert_eq!(state.str_operating_mode(), "syncing");
+    // rippled setAmendmentBlocked / setUNLBlocked call setMode(CONNECTED),
+    // and a blocked server never rises above CONNECTED.
+    assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
+    assert_eq!(state.str_operating_mode(), "connected");
     assert!(state.need_network_ledger());
     assert!(state.amendment_blocked());
     assert!(state.unl_blocked());
@@ -100,9 +102,11 @@ fn networkops_app_mode_owner_applies_cpp_connected_and_blocked_transitions() {
     );
     assert_eq!(owner.operating_mode(), NetworkOpsOperatingMode::Syncing);
 
+    // rippled setUNLBlocked: setMode(CONNECTED) right away.
     state.set_unl_blocked(true);
+    assert_eq!(owner.operating_mode(), NetworkOpsOperatingMode::Connected);
     let previous = owner.set_operating_mode(NetworkOpsOperatingMode::Full);
-    assert_eq!(previous, NetworkOpsOperatingMode::Syncing);
+    assert_eq!(previous, NetworkOpsOperatingMode::Connected);
     assert_eq!(owner.operating_mode(), NetworkOpsOperatingMode::Connected);
 }
 

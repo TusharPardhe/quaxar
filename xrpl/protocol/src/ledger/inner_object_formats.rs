@@ -22,15 +22,6 @@ impl InnerObjectFormats {
 
         add(
             &mut inner,
-            "sfMemo",
-            &[
-                ("sfMemoType", SOEStyle::Optional),
-                ("sfMemoData", SOEStyle::Optional),
-                ("sfMemoFormat", SOEStyle::Optional),
-            ],
-        );
-        add(
-            &mut inner,
             "sfSignerEntry",
             &[
                 ("sfAccount", SOEStyle::Required),
@@ -174,19 +165,6 @@ impl InnerObjectFormats {
             &mut inner,
             "sfPermission",
             &[("sfPermissionValue", SOEStyle::Required)],
-        );
-        add(
-            &mut inner,
-            "sfRawTransaction",
-            &[
-                ("sfTransactionType", SOEStyle::Required),
-                ("sfAccount", SOEStyle::Required),
-                ("sfAmount", SOEStyle::Optional),
-                ("sfDestination", SOEStyle::Optional),
-                ("sfSequence", SOEStyle::Required),
-                ("sfSigningPubKey", SOEStyle::Optional),
-                ("sfTxnSignature", SOEStyle::Optional),
-            ],
         );
         add(
             &mut inner,

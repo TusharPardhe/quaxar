@@ -208,6 +208,9 @@ impl STTx {
         Self::finish_from_object(object, true)
     }
 
+    /// Infallible form kept for trusted inputs: an invalid length yields an
+    /// empty transaction as before; every other rippled `STTx(SerialIter&)`
+    /// exception is raised as a panic with rippled's message.
     pub fn from_serial_iter(sit: &mut SerialIter<'_>) -> Self {
         let length = sit.get_bytes_left();
         if !(TX_MIN_SIZE_BYTES..=TX_MAX_SIZE_BYTES).contains(&length) {
@@ -217,15 +220,48 @@ impl STTx {
                 transaction_id: Default::default(),
             };
         }
+        match Self::try_from_serial_iter(sit) {
+            Ok(tx) => tx,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// rippled `STTx(SerialIter&)`: returns the exception text rippled throws
+    /// ("Transaction length invalid", STObject/STArray parse errors,
+    /// "Transaction contains an object terminator", or applyTemplate's
+    /// FieldErr) instead of a transaction.
+    pub fn try_from_serial_iter(sit: &mut SerialIter<'_>) -> Result<Self, String> {
+        let length = sit.get_bytes_left();
+        if !(TX_MIN_SIZE_BYTES..=TX_MAX_SIZE_BYTES).contains(&length) {
+            return Err("Transaction length invalid".to_owned());
+        }
 
         let mut object = STObject::new(get_field_by_symbol("sfTransaction"));
-        let has_object_terminator = object.set_from_serial_iter(sit, 0);
-        assert!(
-            !has_object_terminator,
-            "Transaction contains an object terminator"
-        );
+        let (has_object_terminator, parse_error) =
+            crate::serialization::st_object::with_parse_errors(|| {
+                object.set_from_serial_iter(sit, 0)
+            });
+        if let Some(error) = parse_error {
+            return Err(error);
+        }
+        if has_object_terminator {
+            return Err("Transaction contains an object terminator".to_owned());
+        }
+        let tx_type_field = get_field_by_symbol("sfTransactionType");
+        if !object.is_field_present(tx_type_field) {
+            // rippled getFieldU16 → throwFieldNotFound.
+            return Err("Field not found: TransactionType".to_owned());
+        }
+        let tx_type = TxType::from_u16(object.get_field_u16(tx_type_field));
+        let Some(format) = TxFormats::get_instance().find_by_type(tx_type) else {
+            return Err(format!(
+                "Invalid transaction type {}",
+                object.get_field_u16(tx_type_field)
+            ));
+        };
+        object.check_template(format.so_template())?;
 
-        Self::finish_from_object(object, true)
+        Ok(Self::finish_from_object(object, true))
     }
 
     pub fn get_signature(sig_object: &STObject) -> Vec<u8> {

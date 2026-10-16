@@ -1085,6 +1085,10 @@ fn shamap_add_root_node_matches_narrow_cpp_sync_ingestion_roles() {
     assert!(!duplicate.is_useful());
     assert!(!duplicate.is_invalid());
 
+    let wrong_advertised_hash = tree.add_root_node(sample_hash(0x62), &wire, &mut no_filter);
+    assert!(wrong_advertised_hash.is_invalid());
+    assert_eq!(tree.root().get_hash(), leaf.get_hash());
+
     let mut empty_tree = SyncTree::new(false, 0);
     let invalid = empty_tree.add_root_node(sample_hash(0xFE), &wire, &mut no_filter);
     assert!(invalid.is_invalid());
@@ -1104,11 +1108,11 @@ fn shamap_sync_tree_state_and_root_wire_match_narrow_cpp_roles() {
     tree.clear_synching();
     assert_eq!(tree.state(), SyncState::Modifying);
 
-    tree.set_immutable();
+    assert!(tree.set_immutable());
     assert_eq!(tree.state(), SyncState::Immutable);
 
     tree.clear_synching();
-    assert_eq!(tree.state(), SyncState::Modifying);
+    assert_eq!(tree.state(), SyncState::Immutable);
 
     let leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
@@ -1126,11 +1130,87 @@ fn shamap_sync_tree_state_and_root_wire_match_narrow_cpp_roles() {
     let invalid_root = SHAMapTreeNode::new_inner(0);
     let mut invalid_tree = SyncTree::from_root(invalid_root, false, 0, SyncState::Invalid);
     assert!(!invalid_tree.is_valid());
+    assert!(!invalid_tree.set_immutable());
     invalid_tree.clear_synching();
-    assert_eq!(invalid_tree.state(), SyncState::Modifying);
+    assert_eq!(invalid_tree.state(), SyncState::Invalid);
+
+    let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
+    let mut full_below = NullFullBelowCache::new(14);
+    assert!(invalid_tree
+        .get_missing_nodes(8, &mut no_filter, &mut full_below, &mut |_| None, &mut || 0)
+        .is_empty());
 
     let typed_tree = SyncTree::new_with_type(SHAMapType::State, true, 13);
     assert_eq!(typed_tree.map_type(), SHAMapType::State);
+}
+
+#[test]
+fn shamap_add_known_node_rejects_an_inner_node_at_leaf_depth() {
+    let offending = SHAMapTreeNode::new_inner(1);
+    offending.set_child_hash(0, sample_hash(0xF1));
+    offending.update_hash();
+    let wire = offending
+        .serialize_for_wire()
+        .expect("inner node should serialize for wire");
+
+    // The root chain reaches the offered inner at depth 64, where only a leaf
+    // can exist. Keep the final edge unresolved so add_known_node judges the
+    // peer-provided wire node rather than treating it as a duplicate.
+    let final_parent = SHAMapTreeNode::new_inner(1);
+    final_parent.set_child_hash(0, offending.get_hash());
+    final_parent.update_hash();
+    let mut root = final_parent;
+    for _ in 0..63 {
+        let parent = SHAMapTreeNode::new_inner(1);
+        parent.set_child_hash(0, root.get_hash());
+        parent.share_child(0, &root);
+        parent.update_hash();
+        root = parent;
+    }
+
+    let mut node_id = SHAMapNodeId::default();
+    for _ in 0..64 {
+        node_id = node_id
+            .get_child_node_id(0)
+            .expect("leaf depth node id should be representable");
+    }
+
+    let mut tree = SyncTree::from_root(root, false, 99, SyncState::Synching);
+    let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
+    let mut full_below = NullFullBelowCache::new(15);
+    let result = tree.add_known_node(
+        node_id,
+        &wire,
+        &mut no_filter,
+        &mut full_below,
+        &mut |_| None,
+    );
+
+    assert!(result.is_invalid());
+    assert!(!tree.is_valid());
+    assert!(!tree.set_immutable());
+
+    // The same impossible shape can arrive through local storage rather than a
+    // peer packet. get_missing_nodes must invalidate and abandon it instead of
+    // clearing Synching and pretending the scan completed.
+    let loaded_final_parent = SHAMapTreeNode::new_inner(1);
+    loaded_final_parent.set_child_hash(0, offending.get_hash());
+    loaded_final_parent.share_child(0, &offending);
+    loaded_final_parent.update_hash();
+    let mut loaded_root = loaded_final_parent;
+    for _ in 0..63 {
+        let parent = SHAMapTreeNode::new_inner(1);
+        parent.set_child_hash(0, loaded_root.get_hash());
+        parent.share_child(0, &loaded_root);
+        parent.update_hash();
+        loaded_root = parent;
+    }
+    let mut local_tree = SyncTree::from_root(loaded_root, false, 99, SyncState::Synching);
+    assert!(local_tree
+        .get_missing_nodes(8, &mut no_filter, &mut full_below, &mut |_| None, &mut || 0)
+        .is_empty());
+    assert!(!local_tree.is_valid());
+    assert!(!local_tree.is_synching());
 }
 
 #[test]

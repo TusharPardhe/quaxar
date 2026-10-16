@@ -332,11 +332,12 @@ fn inbound_try_db_zero_account_hash_fails() {
 
     assert!(inbound.is_failed());
     assert!(!inbound.is_complete());
-    assert!(inbound.planner_state().have_header);
-    assert!(inbound.planner_state().have_transactions);
+    assert!(!inbound.planner_state().have_header);
+    assert!(!inbound.planner_state().have_transactions);
     assert!(!inbound.planner_state().have_state);
+    assert!(inbound.ledger().is_none());
     assert_eq!(
-        journal.fatals.borrow().as_slice(),
+        journal.warns.borrow().as_slice(),
         &["We are acquiring a ledger with a zero account hash"]
     );
 }

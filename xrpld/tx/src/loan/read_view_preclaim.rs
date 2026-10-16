@@ -243,12 +243,22 @@ fn transfer<V: ReadView>(
     to: AccountID,
     waive_mpt_can_transfer: bool,
 ) -> Result<Ter, Ter> {
+    if waive_mpt_can_transfer && matches!(asset, Asset::MPTIssue(_)) {
+        return Ok(Ter::TES_SUCCESS);
+    }
+    ledger::mptoken_helpers::can_transfer_asset(view, asset, &from, &to).map_err(|_| read_error())
+}
+
+fn holding_exists<V: ReadView>(view: &V, id: AccountID, asset: Asset) -> Result<bool, Ter> {
     match asset {
-        Asset::MPTIssue(issue) if !waive_mpt_can_transfer => {
-            ledger::mptoken_helpers::can_transfer_mpt(view, &issue, &from, &to)
-                .map_err(|_| read_error())
-        }
-        _ => Ok(Ter::TES_SUCCESS),
+        Asset::Issue(issue) if issue.native() || issue.account == id => Ok(true),
+        Asset::Issue(issue) => Ok(read(view, protocol::line(id, issue.account, issue.currency))?.is_some()),
+        Asset::MPTIssue(issue) if issue.issuer() == id => Ok(true),
+        Asset::MPTIssue(issue) => Ok(read(
+            view,
+            protocol::mptoken_keylet_from_mptid(issue.mpt_id(), Uint160::from_void(id.data())),
+        )?
+        .is_some()),
     }
 }
 
@@ -901,6 +911,30 @@ fn preclaim_broker_delete<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
                 b.get_field_number(sf("sfDebtTotal")).value() == basics::number::NumberParts::zero()
             }),
             cover_available_is_positive: cover > basics::number::NumberParts::zero(),
+            fix_cleanup_3_5_0_enabled: view.rules().enabled(&protocol::fix_cleanup_3_5_0()),
+            can_transfer_result: match (asset, broker_sle.as_ref()) {
+                (Some(a), Some(b)) => transfer(
+                    view,
+                    a,
+                    b.get_account_id(sf("sfAccount")),
+                    account_id,
+                    true,
+                )
+                .unwrap_or(Ter::TEF_BAD_LEDGER),
+                _ => Ter::TES_SUCCESS,
+            },
+            require_auth_result: match asset {
+                Some(a) => auth(view, account_id, a, false).unwrap_or(Ter::TEF_BAD_LEDGER),
+                None => Ter::TES_SUCCESS,
+            },
+            owner_holding_exists: match asset {
+                Some(a) => holding_exists(view, account_id, a).unwrap_or(false),
+                None => true,
+            },
+            can_add_holding_result: match asset {
+                Some(a) => ledger::can_add_holding(view, &a),
+                None => Ter::TES_SUCCESS,
+            },
             deep_frozen_result: match asset {
                 Some(a) => frozen(view, account_id, a, true).unwrap_or(Ter::TEF_BAD_LEDGER),
                 None => Ter::TES_SUCCESS,

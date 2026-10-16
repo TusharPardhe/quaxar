@@ -226,12 +226,21 @@ impl FlowStep for StepKind {
                 )?;
                 Ok(StepAmounts::direct(input, src_to_dst, output, *currency))
             }
-            StepKind::XrpEndpoint { account, is_last } => {
+            StepKind::XrpEndpoint {
+                account,
+                is_last,
+                reserve_reduction,
+            } => {
                 if !requested_out.amount().native() {
                     return Err(Ter::TEF_INTERNAL);
                 }
-                let (input, output) =
-                    execute_xrp_endpoint_fwd(view, account, *is_last, requested_out.amount())?;
+                let (input, output) = execute_xrp_endpoint_fwd(
+                    view,
+                    account,
+                    *is_last,
+                    *reserve_reduction,
+                    requested_out.amount(),
+                )?;
                 Ok(StepAmounts::new(input, output))
             }
             StepKind::MptEndpoint {
@@ -352,12 +361,21 @@ impl FlowStep for StepKind {
                 )?;
                 Ok(StepAmounts::direct(input, src_to_dst, output, *currency))
             }
-            StepKind::XrpEndpoint { account, is_last } => {
+            StepKind::XrpEndpoint {
+                account,
+                is_last,
+                reserve_reduction,
+            } => {
                 if !requested_in.amount().native() {
                     return Err(Ter::TEF_INTERNAL);
                 }
-                let (input, output) =
-                    execute_xrp_endpoint_fwd(view, account, *is_last, requested_in.amount())?;
+                let (input, output) = execute_xrp_endpoint_fwd(
+                    view,
+                    account,
+                    *is_last,
+                    *reserve_reduction,
+                    requested_in.amount(),
+                )?;
                 Ok(StepAmounts::new(input, output))
             }
             StepKind::MptEndpoint {
@@ -1071,6 +1089,7 @@ fn execute_xrp_endpoint_fwd<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
     is_last: bool,
+    reserve_reduction: i32,
     input: &STAmount,
 ) -> Result<(STAmount, STAmount), Ter> {
     let drops = input.xrp().drops();
@@ -1079,7 +1098,9 @@ fn execute_xrp_endpoint_fwd<V: ApplyView>(
         return Ok((zero.clone(), zero));
     }
     let actual_drops = if !is_last {
-        drops.min(xrp_liquid(view, account).map_err(|_| Ter::TEF_BAD_LEDGER)?)
+        drops.min(
+            xrp_liquid(view, account, reserve_reduction).map_err(|_| Ter::TEF_BAD_LEDGER)?,
+        )
     } else {
         drops
     };
@@ -1106,7 +1127,13 @@ fn execute_xrp_endpoint_fwd<V: ApplyView>(
     Ok((amount.clone(), amount))
 }
 
-fn xrp_liquid<V: ApplyView>(view: &mut V, account: &AccountID) -> Result<i64, ViewError> {
+/// rippled `xrpLiquid(view, id, ownerCountAdj)`: balance minus the reserve
+/// for `confineOwnerCount(ownerCount, ownerCountAdj)` owners.
+fn xrp_liquid<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    owner_count_adj: i32,
+) -> Result<i64, ViewError> {
     let acct_keylet =
         protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
     let Some(sle) = view.peek(acct_keylet)? else {
@@ -1126,8 +1153,13 @@ fn xrp_liquid<V: ApplyView>(view: &mut V, account: &AccountID) -> Result<i64, Vi
         let owner_count = view
             .owner_count_hook(*account, crate::OwnerCounts::from_sle(&sle))
             .count();
-        crate::effective_account_reserve_with_owner_count(view.fees(), &sle, owner_count, 0, 0)
-            as i64
+        crate::effective_account_reserve_with_owner_count(
+            view.fees(),
+            &sle,
+            owner_count,
+            owner_count_adj,
+            0,
+        ) as i64
     };
     Ok((balance - reserve).max(0))
 }

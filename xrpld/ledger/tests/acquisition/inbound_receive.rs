@@ -7,14 +7,14 @@ use ledger::ledger_fetcher::INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP;
 use ledger::{
     InboundLedgerCompletionDisposition, InboundLedgerDataType, InboundLedgerJournal,
     InboundLedgerLocal, InboundLedgerNodeData, InboundLedgerPacket, InboundLedgerPacketError,
-    InboundLedgerStore, LedgerConfig, LedgerHeader, XRP_LEDGER_EARLIEST_FEES,
+    InboundLedgerStore, Ledger, LedgerConfig, LedgerHeader, XRP_LEDGER_EARLIEST_FEES,
     calculate_ledger_hash,
 };
 use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
 use shamap::item::SHAMapItem;
 use shamap::node_id::SHAMapNodeId;
 use shamap::storage::{NodeObjectType, StoredNode};
-use shamap::sync::{SHAMapAddNode, SyncState};
+use shamap::sync::{SHAMapAddNode, SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::cell::RefCell;
@@ -167,6 +167,31 @@ fn inbound_take_header_sets_cpp_owner_flags_and_synching() {
 }
 
 #[test]
+fn inbound_take_header_rejects_zero_account_hash_without_publishing_header_state() {
+    let header = sample_header(601, SHAMapHash::default(), SHAMapHash::default());
+    let wanted_hash = calculate_ledger_hash(&header);
+    let mut inbound = InboundLedgerLocal::new(wanted_hash, 0);
+    let mut store = RecordingInboundStore::default();
+    let journal = RecordingJournal::default();
+
+    assert!(inbound.take_header_with_config_and_store(
+        &raw_header_bytes(&header),
+        &LedgerConfig::default(),
+        &mut store,
+        &journal,
+    ));
+    assert!(inbound.is_failed());
+    assert!(!inbound.is_complete());
+    assert!(!inbound.planner_state().have_header);
+    assert!(inbound.ledger().is_none());
+    assert!(store.stored_headers.borrow().is_empty());
+    assert_eq!(
+        journal.warns.borrow().as_slice(),
+        &["We are acquiring a ledger with a zero account hash"]
+    );
+}
+
+#[test]
 fn inbound_try_db_header_load_arms_cpp_owner_flags_and_synching() {
     let header = sample_header(600, sample_hash(0x35), SHAMapHash::default());
     let wanted_hash = calculate_ledger_hash(&header);
@@ -288,6 +313,29 @@ fn inbound_take_header_hash_mismatch_is_rejected_without_failing_owner() {
     assert!(!inbound.planner_state().have_header);
     assert!(inbound.ledger().is_none());
     assert_eq!(store.stored_headers.borrow().len(), 0);
+}
+
+#[test]
+fn inbound_ledger_refuses_to_finalize_an_invalid_shamap() {
+    let state_root = SHAMapTreeNode::new_inner(0);
+    state_root.update_hash();
+    let tx_root = SHAMapTreeNode::new_inner(0);
+    tx_root.update_hash();
+    let mut ledger = Ledger::from_maps(
+        sample_header(604, state_root.get_hash(), tx_root.get_hash()),
+        SyncTree::from_root_with_type(state_root, SHAMapType::State, false, 604, SyncState::Invalid),
+        SyncTree::from_root_with_type(
+            tx_root,
+            SHAMapType::Transaction,
+            false,
+            604,
+            SyncState::Modifying,
+        ),
+    );
+
+    assert!(!ledger.set_immutable(true));
+    assert!(!ledger.is_immutable());
+    assert!(!ledger.state_map().is_valid());
 }
 
 #[test]

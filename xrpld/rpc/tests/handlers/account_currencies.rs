@@ -268,6 +268,23 @@ fn account_currencies_reports_cpp_style_input_errors() {
         Some(&JsonValue::String("invalidParams".to_owned()))
     );
 
+    let invalid_ledger_before_account = do_account_currencies(
+        &request(
+            object([
+                ("account", JsonValue::String("llIIOO".to_owned())),
+                ("ledger_hash", JsonValue::Unsigned(1)),
+            ]),
+            2,
+        ),
+        &source,
+    );
+    assert_eq!(
+        json_object(&invalid_ledger_before_account).get("error_message"),
+        Some(&JsonValue::String(
+            "Invalid field 'ledger_hash', not hex string.".to_owned()
+        ))
+    );
+
     let malformed = do_account_currencies(
         &request(
             object([("account", JsonValue::String("llIIOO".to_owned()))]),
@@ -278,6 +295,11 @@ fn account_currencies_reports_cpp_style_input_errors() {
     assert_eq!(
         json_object(&malformed).get("error"),
         Some(&JsonValue::String("actMalformed".to_owned()))
+    );
+
+    assert_eq!(
+        json_object(&malformed).get("ledger_hash"),
+        Some(&JsonValue::String(closed_ledger().hash.to_string()))
     );
 
     let not_found = do_account_currencies(

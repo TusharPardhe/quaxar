@@ -227,9 +227,16 @@ fn listing_a_capped_manifest_releases_its_untrusted_capacity_slot() {
 
     let mut promoted = None;
     let mut promoted_manifest = None;
-    for fill in 1u8..=100 {
-        let master_secret = SecretKey::from_bytes([fill; 32]);
-        let signing_secret = SecretKey::from_bytes([fill.saturating_add(100); 32]);
+    // Fill rippled's untrusted cap (kMaxUntrustedCount = 300).
+    let distinct = |tag: u8, index: usize| {
+        let mut bytes = [0x01u8; 32];
+        bytes[0] = tag;
+        bytes[1..3].copy_from_slice(&u16::try_from(index).expect("index fits").to_be_bytes());
+        bytes
+    };
+    for fill in 1..=app::MAX_UNTRUSTED_MANIFESTS {
+        let master_secret = SecretKey::from_bytes(distinct(0x10, fill));
+        let signing_secret = SecretKey::from_bytes(distinct(0x20, fill));
         let (encoded, master, _) = manifest_blob(
             &master_secret,
             KeyType::Ed25519,

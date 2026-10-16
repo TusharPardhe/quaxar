@@ -6,8 +6,8 @@ use ledger::{
     flow_engine::strand_builder::to_strands_checked,
     mptoken_helpers::{
         MPTAuthType, can_trade, can_transfer_asset, can_transfer_mpt, check_mpt_tx_allowed,
-        is_any_frozen_mpt, is_frozen_mpt, lock_escrow_mpt, remove_empty_holding_mpt,
-        require_auth_mpt, require_auth_mpt_with_type, unlock_escrow_mpt,
+        is_any_frozen_mpt, is_frozen_mpt, lock_escrow_mpt, max_mpt_amount_by_id,
+        remove_empty_holding_mpt, require_auth_mpt, require_auth_mpt_with_type, unlock_escrow_mpt,
     },
     ripple_calc::book_step::{Book, execute_book_step},
     ripple_state_helpers::{account_send, account_send_allow_mpt_overflow},
@@ -73,6 +73,23 @@ fn mptokens_v2_book_send_allows_only_temporary_aggregate_overflow() {
         account_send_allow_mpt_overflow(&mut pre_v2, &issuer, &holder, &amount),
         protocol::Ter::TEC_PATH_DRY,
         "the temporary-overflow policy is gated by MPTokensV2",
+    );
+}
+
+#[test]
+fn max_mpt_amount_lookup_returns_cap_or_missing() {
+    let issuer = account(0xC0);
+    let mut issuance = issuance_entry(issuer, 11, 0, 0);
+    issuance.set_field_u64(sf("sfMaximumAmount"), 42);
+    let ledger = ledger_with([account_entry(issuer), issuance], &[]);
+
+    assert_eq!(
+        max_mpt_amount_by_id(&ledger, mpt_id(issuer, 11)).expect("issuance lookup"),
+        Some(42),
+    );
+    assert_eq!(
+        max_mpt_amount_by_id(&ledger, mpt_id(issuer, 12)).expect("missing issuance lookup"),
+        None,
     );
 }
 

@@ -37,6 +37,43 @@ impl PartialEq for STObject {
 
 impl Eq for STObject {}
 
+thread_local! {
+    /// First rippled `Throw` condition hit while deserializing on this
+    /// thread (rippled throws; these decoders log and degrade instead).
+    /// `STTx::from_serial_iter` clears it before parsing and raises it after.
+    static PARSE_ERROR: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+    static TEMPLATE_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn note_parse_error(message: &'static str) {
+    PARSE_ERROR.with(|error| {
+        if error.get().is_none() {
+            error.set(Some(message));
+        }
+    });
+}
+
+fn note_template_error(message: String) {
+    TEMPLATE_ERROR.with(|error| {
+        let mut error = error.borrow_mut();
+        if error.is_none() {
+            *error = Some(message);
+        }
+    });
+}
+
+/// Clear, run `parse`, and return the first rippled throw condition hit.
+pub(crate) fn with_parse_errors<T>(parse: impl FnOnce() -> T) -> (T, Option<String>) {
+    PARSE_ERROR.with(|error| error.set(None));
+    TEMPLATE_ERROR.with(|error| *error.borrow_mut() = None);
+    let value = parse();
+    let parse_error = PARSE_ERROR.with(|error| error.take()).map(str::to_owned);
+    let template_error = TEMPLATE_ERROR.with(|error| error.borrow_mut().take());
+    (value, parse_error.or(template_error))
+}
+
 impl STObject {
     pub fn new(field: &'static SField) -> Self {
         Self {
@@ -118,6 +155,49 @@ impl STObject {
         }
     }
 
+    /// rippled `STObject::applyTemplate` validity rules, checked without
+    /// modifying the object: a required field must be present, a
+    /// default-style field may not be explicitly set to its default, and any
+    /// field the template does not claim must be discardable. Returns
+    /// rippled's `FieldErr` text.
+    pub fn check_template(&self, template: &SOTemplate) -> Result<(), String> {
+        let mut claimed = vec![false; self.fields.len()];
+        for element in template.iter() {
+            let found = self
+                .fields
+                .iter()
+                .enumerate()
+                .find(|(index, field)| !claimed[*index] && field.get().fname() == element.sfield());
+            match found {
+                Some((index, field)) => {
+                    if element.style() == SOEStyle::Default && field.get().is_default() {
+                        return Err(format!(
+                            "Field '{}' may not be explicitly set to default.",
+                            element.sfield().name()
+                        ));
+                    }
+                    claimed[index] = true;
+                }
+                None if element.style() == SOEStyle::Required => {
+                    return Err(format!(
+                        "Field '{}' is required but missing.",
+                        element.sfield().name()
+                    ));
+                }
+                None => {}
+            }
+        }
+        for (index, field) in self.fields.iter().enumerate() {
+            if !claimed[index] && !field.get().fname().is_discardable() {
+                return Err(format!(
+                    "Field '{}' found in disallowed location.",
+                    field.get().fname().name()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn apply_template(&mut self, template: &SOTemplate) {
         // self.template must never be set to Some(template) unless
         // self.fields is replaced with the reordered vector in the same step
@@ -176,6 +256,10 @@ impl STObject {
     pub fn apply_template_from_sfield(&mut self, field: &'static SField) {
         if let Some(template) = InnerObjectFormats::get_instance().find_so_template_by_sfield(field)
         {
+            // rippled applyTemplateFromSField may throw FieldErr.
+            if let Err(error) = self.check_template(template) {
+                note_template_error(error);
+            }
             self.apply_template(template);
         }
     }
@@ -197,6 +281,7 @@ impl STObject {
 
             if type_id == SerializedTypeId::Array.as_i32() && field_id == 1 {
                 tracing::warn!(target: "protocol", "Illegal end-of-array marker in object");
+                note_parse_error("Illegal end-of-array marker in object");
                 error = true;
                 break;
             }
@@ -215,6 +300,7 @@ impl STObject {
                     depth,
                     "Unknown field in serialized object"
                 );
+                note_parse_error("Unknown field");
                 error = true;
                 break;
             }
@@ -230,6 +316,7 @@ impl STObject {
         for pair in sorted_fields.windows(2) {
             if pair[0].fname() == pair[1].fname() {
                 tracing::warn!(target: "protocol", "Duplicate field detected");
+                note_parse_error("Duplicate field detected");
                 error = true;
                 break;
             }
@@ -1077,14 +1164,17 @@ impl STArray {
             }
 
             if type_id == SerializedTypeId::Object.as_i32() && field_id == 1 {
+                note_parse_error("Illegal terminator in array");
                 break;
             }
 
             let field = crate::get_field(crate::field_code_raw(type_id, field_id));
             if field.is_invalid() {
+                note_parse_error("Unknown field");
                 break;
             }
             if field.field_type() != SerializedTypeId::Object {
+                note_parse_error("Non-object in array");
                 break;
             }
 

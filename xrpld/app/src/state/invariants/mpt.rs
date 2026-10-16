@@ -372,6 +372,8 @@ pub(super) fn record_mpt_transfer(
 pub(super) fn mpt_transfer_waives_can_transfer(
     txn_type: protocol::TxType,
     fix_cleanup_3_2_0: bool,
+    fix_cleanup_3_5_0: bool,
+    loan_default_asset: bool,
 ) -> bool {
     txn_type == protocol::TxType::AMM_WITHDRAW
         || (fix_cleanup_3_2_0
@@ -381,6 +383,8 @@ pub(super) fn mpt_transfer_waives_can_transfer(
                     | protocol::TxType::LOAN_BROKER_COVER_WITHDRAW
                     | protocol::TxType::LOAN_PAY
             ))
+        || (fix_cleanup_3_5_0
+            && (loan_default_asset || txn_type == protocol::TxType::LOAN_BROKER_DELETE))
 }
 
 pub(super) fn mpt_transfer_is_dex(
@@ -406,6 +410,7 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
     cross_currency_payment: bool,
     fix_cleanup_3_2_0: bool,
     fix_cleanup_3_4_0: bool,
+    fix_cleanup_3_5_0: bool,
     mptokens_v2_enabled: bool,
     loan_default_accounts: Option<&LoanDefaultFreezeExemptAccounts>,
     pseudo_accounts_before: &BTreeMap<AccountID, bool>,
@@ -436,14 +441,19 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
         }
         let issuance = issuance.expect("checked above");
 
-        let can_transfer = issuance.is_flag(protocol::lsfMPTCanTransfer)
-            || mpt_transfer_waives_can_transfer(txn_type, fix_cleanup_3_2_0);
-        let can_trade = issuance.is_flag(protocol::lsfMPTCanTrade);
-        let req_auth = issuance.is_flag(protocol::lsfMPTRequireAuth);
-        let issue = protocol::MPTIssue::new(*mpt_id);
         let loan_default_asset = loan_default_accounts.is_some_and(|accounts| {
             matches!(accounts.asset, protocol::Asset::MPTIssue(expected) if expected.mpt_id() == *mpt_id)
         });
+        let can_transfer = issuance.is_flag(protocol::lsfMPTCanTransfer)
+            || mpt_transfer_waives_can_transfer(
+                txn_type,
+                fix_cleanup_3_2_0,
+                fix_cleanup_3_5_0,
+                loan_default_asset,
+            );
+        let can_trade = issuance.is_flag(protocol::lsfMPTCanTrade);
+        let req_auth = issuance.is_flag(protocol::lsfMPTRequireAuth);
+        let issue = protocol::MPTIssue::new(*mpt_id);
 
         let mut senders = 0_u16;
         let mut receivers = 0_u16;
@@ -686,6 +696,7 @@ pub(super) fn validates_mpt_lifecycle_counts(
     lending_protocol_enabled: bool,
     mptokens_v2_enabled: bool,
     fix_cleanup_3_4_0: bool,
+    fix_cleanup_3_5_0: bool,
     lifecycle: &MptIssuanceLifecycle,
 ) -> bool {
     let applies =
@@ -741,24 +752,25 @@ pub(super) fn validates_mpt_lifecycle_counts(
             return lifecycle.tokens_created <= 2 && lifecycle.tokens_deleted <= 2;
         }
 
-        // rippled a18839d92d: fixCleanup3_4_0 relaxes the LendingProtocol
-        // MayAuthorizeMpt cap only for these two transaction shapes. LoanSet
-        // may create its borrower and origination-fee holdings; VaultWithdraw
-        // may create a destination asset holding while deleting emptied shares.
+        // rippled aa70b368b5: fixCleanup3_4_0 relaxes the LendingProtocol
+        // MayAuthorizeMpt cap for LoanSet and VaultWithdraw. Post-
+        // fixCleanup3_5_0 LoanBrokerDelete may likewise create the owner's
+        // missing cover holding while deleting the pseudo-account's holding.
         let mptokens_exceed_authorize_cap = if !lending_protocol_enabled {
             false
-        } else if fix_cleanup_3_4_0 {
+        } else {
             match txn_type {
-                protocol::TxType::LOAN_SET => {
+                protocol::TxType::LOAN_SET if fix_cleanup_3_4_0 => {
                     lifecycle.tokens_deleted != 0 || lifecycle.tokens_created > 2
                 }
-                protocol::TxType::VAULT_WITHDRAW => {
+                protocol::TxType::VAULT_WITHDRAW if fix_cleanup_3_4_0 => {
+                    lifecycle.tokens_created > 1 || lifecycle.tokens_deleted > 1
+                }
+                protocol::TxType::LOAN_BROKER_DELETE if fix_cleanup_3_5_0 => {
                     lifecycle.tokens_created > 1 || lifecycle.tokens_deleted > 1
                 }
                 _ => lifecycle.tokens_created + lifecycle.tokens_deleted > 1,
             }
-        } else {
-            lifecycle.tokens_created + lifecycle.tokens_deleted > 1
         };
         if mptokens_exceed_authorize_cap {
             return false;
@@ -821,7 +833,8 @@ pub(super) fn validates_mpt_lifecycle_counts(
 #[cfg(test)]
 mod tests {
     use super::{
-        MptIssuanceLifecycle, validates_mpt_issuance_lifecycle, validates_mpt_lifecycle_counts,
+        MptIssuanceLifecycle, mpt_transfer_waives_can_transfer,
+        validates_mpt_issuance_lifecycle, validates_mpt_lifecycle_counts,
     };
     use protocol::{Ter, TxType};
 
@@ -865,6 +878,7 @@ mod tests {
                 true,
                 true,
                 fix_cleanup_3_4_0,
+                false,
                 &lifecycle(tokens_created, tokens_deleted),
             )
         };
@@ -875,5 +889,55 @@ mod tests {
         assert!(validates(TxType::VAULT_WITHDRAW, true, 1, 1));
         assert!(!validates(TxType::VAULT_WITHDRAW, true, 2, 0));
         assert!(!validates(TxType::VAULT_WITHDRAW, true, 0, 2));
+    }
+
+    #[test]
+    fn cleanup_3_5_0_allows_broker_delete_one_mpt_create_and_delete() {
+        let validates = |fix_cleanup_3_5_0, tokens_created, tokens_deleted| {
+            validates_mpt_lifecycle_counts(
+                TxType::LOAN_BROKER_DELETE,
+                Ter::TES_SUCCESS,
+                false,
+                true,
+                true,
+                true,
+                false,
+                fix_cleanup_3_5_0,
+                &lifecycle(tokens_created, tokens_deleted),
+            )
+        };
+
+        assert!(!validates(false, 1, 1));
+        assert!(validates(true, 1, 1));
+        assert!(!validates(true, 2, 1));
+        assert!(!validates(true, 1, 2));
+    }
+
+    #[test]
+    fn cleanup_3_5_waives_only_broker_delete_or_matching_loan_default_asset() {
+        assert!(!mpt_transfer_waives_can_transfer(
+            TxType::LOAN_BROKER_DELETE,
+            false,
+            false,
+            false,
+        ));
+        assert!(mpt_transfer_waives_can_transfer(
+            TxType::LOAN_BROKER_DELETE,
+            false,
+            true,
+            false,
+        ));
+        assert!(mpt_transfer_waives_can_transfer(
+            TxType::LOAN_MANAGE,
+            false,
+            true,
+            true,
+        ));
+        assert!(!mpt_transfer_waives_can_transfer(
+            TxType::LOAN_MANAGE,
+            false,
+            true,
+            false,
+        ));
     }
 }

@@ -959,6 +959,7 @@ mod tests {
         let endpoint = super::super::StepKind::XrpEndpoint {
             account: issuer,
             is_last: true,
+            reserve_reduction: 0,
         };
         let make_book = |owner_pays_transfer_fee| super::super::StepKind::Book {
             book_in: Asset::Issue(issue),

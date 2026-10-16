@@ -238,6 +238,11 @@ pub enum StepKind {
     XrpEndpoint {
         account: AccountID,
         is_last: bool,
+        /// rippled `XRPEndpointOfferCrossingStep::reserveReduction_`: `-1`
+        /// when this is the first step of an offer-crossing strand and the
+        /// account does not yet hold the delivered asset's trust line /
+        /// MPToken, else `0`. Fixed when the strand is built.
+        reserve_reduction: i32,
     },
     /// An MPT may only ripple at a strand endpoint.  The issuer is therefore
     /// always one side of this step (holder->issuer or issuer->holder).

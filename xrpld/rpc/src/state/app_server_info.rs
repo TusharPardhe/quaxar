@@ -10,6 +10,7 @@ use basics::{
     base_uint::{Uint160, Uint256},
     chrono::NetClockTimePoint,
     hardened_hash::HardenedHashBuilder,
+    number::NumberParts as RuntimeNumber,
     sha_map_hash::SHAMapHash,
     tagged_cache::MonotonicClock,
 };
@@ -422,12 +423,40 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplicationServerInfo, RpcRuntime};
+    use super::{ApplicationServerInfo, RpcRuntime, funded_taker_pays};
     use app::{ApplicationRoot, ApplicationRootOptions};
     use ledger::Ledger;
+    use protocol::{
+        AccountID, Issue, ST_AMOUNT_MAX_NATIVE_NETWORK, STAmount, currency_from_string, sf_generic,
+    };
     use rpc::state::app_server_info_source::OwnedApplicationServerInfo;
     use rpc::status::RpcErrorCode;
     use std::sync::Arc;
+
+    #[test]
+    fn funded_book_taker_pays_clamps_before_native_overflow() {
+        let issue = Issue::new(currency_from_string("USD"), AccountID::from_array([0x22; 20]));
+        let taker_pays = STAmount::new_native(ST_AMOUNT_MAX_NATIVE_NETWORK, false);
+        let owner_funds = STAmount::new_with_asset(
+            sf_generic(),
+            issue,
+            9_999_999_999_999_994,
+            -15,
+            false,
+        );
+        let rate = STAmount::new_with_asset(
+            sf_generic(),
+            protocol::no_issue(),
+            1_000_000_000_000_001,
+            2,
+            false,
+        );
+
+        assert_eq!(
+            funded_taker_pays(&taker_pays, &owner_funds, &rate),
+            taker_pays
+        );
+    }
 
     #[test]
     fn owned_application_server_info_ledger_request_uses_live_runtime_path() {
@@ -2316,6 +2345,39 @@ impl<V: AppServerInfoView> crate::nft::nft_offers::NFTOffersSource for Applicati
     }
 }
 
+fn book_page_amount_as_number(amount: &protocol::STAmount) -> RuntimeNumber {
+    if amount.native() {
+        RuntimeNumber::from(amount.xrp())
+    } else if amount.holds_mpt_issue() {
+        RuntimeNumber::from(amount.mpt())
+    } else {
+        RuntimeNumber::from(amount.iou())
+    }
+}
+
+/// Same as `min(taker_pays, multiply(funded, rate, taker_pays.asset()))`,
+/// but compare the Number product before materializing it as an amount. This
+/// keeps a fully-funded native TakerPays from attempting an unrepresentable
+/// intermediate product.
+fn funded_taker_pays(
+    taker_pays: &protocol::STAmount,
+    taker_gets_funded: &protocol::STAmount,
+    rate: &protocol::STAmount,
+) -> protocol::STAmount {
+    let product =
+        book_page_amount_as_number(taker_gets_funded) * book_page_amount_as_number(rate);
+    if product >= book_page_amount_as_number(taker_pays) {
+        return taker_pays.clone();
+    }
+
+    protocol::to_amount_from_number::<protocol::STAmount>(
+        taker_pays.asset(),
+        product,
+        basics::number::get_rounding_mode(),
+    )
+    .expect("funded book amount below taker pays must be representable")
+}
+
 impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
     for ApplicationServerInfo<V>
 {
@@ -2501,9 +2563,10 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
                             "taker_gets_funded",
                             owner_funds_limit.json(JsonOptions::NONE),
                         ));
-                        let pays_funded = std::cmp::min(
-                            taker_pays.clone(),
-                            owner_funds_limit.multiply(&dir_rate, taker_pays.asset()),
+                        let pays_funded = funded_taker_pays(
+                            &taker_pays,
+                            &owner_funds_limit,
+                            &dir_rate,
                         );
                         offer_extras
                             .push(("taker_pays_funded", pays_funded.json(JsonOptions::NONE)));

@@ -15,6 +15,7 @@ mod mpt;
 mod object_deletion;
 mod permissioned_dex;
 mod permissioned_domain;
+mod pseudo_accounts;
 mod vault;
 
 use amm::*;
@@ -28,6 +29,7 @@ use mpt::*;
 use object_deletion::*;
 use permissioned_dex::*;
 use permissioned_domain::*;
+use pseudo_accounts::*;
 use vault::*;
 
 type InvariantEntry = (
@@ -287,6 +289,9 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     let fix_cleanup_3_2_0 = sandbox
         .rules()
         .enabled(&protocol::feature_id("fixCleanup3_2_0"));
+    let fix_cleanup_3_5_0 = sandbox
+        .rules()
+        .enabled(&protocol::fix_cleanup_3_5_0());
     let amm_invariant_enabled =
         fix_cleanup_3_2_0 || sandbox.rules().enabled(&protocol::fix_ammv1_3());
     let single_asset_vault_enabled = sandbox
@@ -304,7 +309,8 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         || mptokens_v2_enabled
         || sandbox
             .rules()
-            .enabled(&protocol::feature_id("fixCleanup3_4_0"));
+            .enabled(&protocol::feature_id("fixCleanup3_4_0"))
+        || fix_cleanup_3_5_0;
     let permissioned_dex_invariant_enabled = fix_cleanup_3_2_0
         || sandbox
             .rules()
@@ -325,6 +331,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     let mut lending = LendingState::default();
     let mut clawback = ClawbackState::default();
     let mut object_deletion = ObjectDeletionState::default();
+    let mut pseudo_account_directory = PseudoAccountDirectoryState::default();
     let fix_cleanup_3_3_0 = sandbox.rules().enabled(&protocol::fix_cleanup_3_3_0());
     let fix_cleanup_3_4_0 = sandbox
         .rules()
@@ -733,6 +740,12 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         if fix_cleanup_3_3_0 {
             record_object_deletion_state(&mut object_deletion, is_delete, before_sle);
         }
+        record_pseudo_account_directory_state(
+            &mut pseudo_account_directory,
+            is_delete,
+            before_sle,
+            after_sle,
+        );
 
         let deleted_sle = before_sle.unwrap_or(&entry.sle);
         if record_mpt_issuance_lifecycle(
@@ -1189,6 +1202,13 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     let fix_cleanup_3_5_0 = sandbox
         .rules()
         .enabled(&protocol::feature_id("fixCleanup3_5_0"));
+    if fix_cleanup_3_5_0 {
+        match validates_pseudo_account_directory_contents(sandbox, &pseudo_account_directory) {
+            Ok(true) => {}
+            Ok(false) => return Err(()),
+            Err(_) => return Ok(Ter::TEF_BAD_LEDGER),
+        }
+    }
     if !validates_mpt_issuance_lifecycle(&mpt_issuance_lifecycle, fix_cleanup_3_5_0) {
         return Err(());
     }
@@ -1200,6 +1220,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         lending_protocol_enabled,
         mptokens_v2_enabled,
         fix_cleanup_3_4_0,
+        fix_cleanup_3_5_0,
         &mpt_issuance_lifecycle,
     ) {
         return Err(());
@@ -1235,6 +1256,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
             cross_currency_payment,
             fix_cleanup_3_2_0,
             fix_cleanup_3_4_0,
+            fix_cleanup_3_5_0,
             mptokens_v2_enabled,
             loan_default_accounts.as_ref(),
             &pseudo_accounts_before,

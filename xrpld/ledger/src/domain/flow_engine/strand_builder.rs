@@ -169,6 +169,7 @@ fn to_strand_with_domain(
                     strand.push(StepKind::XrpEndpoint {
                         account: if is_first { *s } else { *d },
                         is_last: !is_first,
+                        reserve_reduction: 0,
                     });
                 } else if let Asset::MPTIssue(issue) = cur_asset {
                     strand.push(StepKind::MptEndpoint {
@@ -193,6 +194,7 @@ fn to_strand_with_domain(
                     strand.push(StepKind::XrpEndpoint {
                         account: *s,
                         is_last: false,
+                        reserve_reduction: 0,
                     });
                 }
                 // rippled `PaySteps.cpp::toStrand` normalizes `curAsset` after
@@ -215,6 +217,7 @@ fn to_strand_with_domain(
                         strand.push(StepKind::XrpEndpoint {
                             account: *d,
                             is_last: true,
+                            reserve_reduction: 0,
                         });
                     } else if let Asset::MPTIssue(issue) = cur_asset {
                         strand.push(StepKind::MptEndpoint {
@@ -319,6 +322,37 @@ pub fn to_strands_checked<V: ApplyView>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// rippled `XRPEndpointOfferCrossingStep::computeReserveReduction`, run at
+/// strand construction (before any step executes): an offer-crossing strand
+/// whose first step sends the taker's XRP may dig one owner reserve deeper
+/// when the trust line (or MPToken) for the delivered asset does not exist
+/// yet, because crossing itself is what creates it.
+fn apply_offer_crossing_reserve_reduction<V: ApplyView>(
+    view: &mut V,
+    strand: &mut Strand,
+    src: &AccountID,
+    deliver: Asset,
+) -> Result<(), crate::ViewError> {
+    let Some(StepKind::XrpEndpoint {
+        is_last: false,
+        reserve_reduction,
+        ..
+    }) = strand.first_mut()
+    else {
+        return Ok(());
+    };
+    let holder = basics::base_uint::Uint160::from_void(src.data());
+    let exists = match deliver {
+        Asset::Issue(issue) => view.exists(protocol::line(*src, issue.account, issue.currency))?,
+        Asset::MPTIssue(issue) => view.exists(protocol::mptoken_keylet_from_mptid(
+            issue.mpt_id(),
+            holder,
+        ))?,
+    };
+    *reserve_reduction = if exists { 0 } else { -1 };
+    Ok(())
+}
+
 pub fn to_strands_checked_with_domain<V: ApplyView>(
     view: &mut V,
     src: &AccountID,
@@ -351,6 +385,13 @@ pub fn to_strands_checked_with_domain<V: ApplyView>(
             return Ter::TEF_EXCEPTION;
         }
         let ter = validate_strand(view, &strand, src, dst, *deliver, offer_crossing);
+        let mut strand = strand;
+        if ter == Ter::TES_SUCCESS && offer_crossing {
+            match apply_offer_crossing_reserve_reduction(view, &mut strand, src, *deliver) {
+                Ok(()) => {}
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            }
+        }
         if ter == Ter::TES_SUCCESS && !result.contains(&strand) {
             result.push(strand);
         }
@@ -792,7 +833,7 @@ fn validate_strand<V: ApplyView>(
                     }
                 }
             }
-            StepKind::XrpEndpoint { account, is_last } => {
+            StepKind::XrpEndpoint { account, is_last, .. } => {
                 if account.is_zero() {
                     return Ter::TEM_BAD_PATH;
                 }
@@ -1103,6 +1144,41 @@ mod tests {
             ledger.raw_insert(Arc::new(entry)).expect("seed entry");
         }
         ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE)
+    }
+
+    /// rippled `XRPEndpointOfferCrossingStep::computeReserveReduction`: an
+    /// XRP-selling crossing may use one more owner reserve only while the
+    /// delivered asset's trust line does not exist (testnet 21568551).
+    #[test]
+    fn offer_crossing_xrp_endpoint_reserve_reduction_matches_rippled() {
+        let taker = make_account(1);
+        let issuer = make_account(3);
+        let issue = Issue::new(make_currency("TAR"), issuer);
+        let first_reduction = |strand: &Strand| match strand.first() {
+            Some(StepKind::XrpEndpoint {
+                is_last: false,
+                reserve_reduction,
+                ..
+            }) => *reserve_reduction,
+            other => panic!("unexpected first step {other:?}"),
+        };
+        let mut strand = vec![StepKind::XrpEndpoint {
+            account: taker,
+            is_last: false,
+            reserve_reduction: 0,
+        }];
+
+        let mut view = checked_view([account_root(taker), account_root(issuer)], []);
+        apply_offer_crossing_reserve_reduction(&mut view, &mut strand, &taker, Asset::Issue(issue))
+            .expect("view");
+        assert_eq!(first_reduction(&strand), -1, "no trust line yet");
+
+        let key = protocol::line(taker, issuer, issue.currency);
+        let line = STLedgerEntry::from_type_and_key(LedgerEntryType::RippleState, key.key);
+        let mut view = checked_view([account_root(taker), account_root(issuer), line], []);
+        apply_offer_crossing_reserve_reduction(&mut view, &mut strand, &taker, Asset::Issue(issue))
+            .expect("view");
+        assert_eq!(first_reduction(&strand), 0, "existing trust line");
     }
 
     #[test]

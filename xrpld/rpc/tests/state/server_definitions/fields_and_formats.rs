@@ -124,70 +124,29 @@ fn server_definitions_ledger_entry_formats_account_root_fields() {
     );
 }
 
+/// rippled ServerDefinitions emits exactly these top-level keys (checked
+/// against the public testnet rippled); there is no INNER_OBJECT_FORMATS.
 #[test]
-fn server_definitions_inner_object_formats_include_nested_object_templates() {
+fn server_definitions_top_level_keys_match_rippled() {
     let response = do_server_definitions(&JsonValue::Object(BTreeMap::new()));
     let root = get_object(&response);
-    let JsonValue::Object(inner_formats) = root.get("INNER_OBJECT_FORMATS").unwrap() else {
-        panic!("INNER_OBJECT_FORMATS must be an object");
-    };
-
-    let JsonValue::Array(memo) = inner_formats.get("Memo").unwrap() else {
-        panic!("Memo must be an array");
-    };
-    let memo_names: Vec<&str> = memo
-        .iter()
-        .filter_map(|f| {
-            let JsonValue::Object(obj) = f else {
-                return None;
-            };
-            match obj.get("name") {
-                Some(JsonValue::String(s)) => Some(s.as_str()),
-                _ => None,
-            }
-        })
-        .collect();
-    assert!(memo_names.contains(&"MemoType"));
-    assert!(memo_names.contains(&"MemoData"));
-    assert!(memo_names.contains(&"MemoFormat"));
-
-    let JsonValue::Array(signer_entry) = inner_formats.get("SignerEntry").unwrap() else {
-        panic!("SignerEntry must be an array");
-    };
-    let signer_entry_names: Vec<&str> = signer_entry
-        .iter()
-        .filter_map(|f| {
-            let JsonValue::Object(obj) = f else {
-                return None;
-            };
-            match obj.get("name") {
-                Some(JsonValue::String(s)) => Some(s.as_str()),
-                _ => None,
-            }
-        })
-        .collect();
-    assert!(signer_entry_names.contains(&"Account"));
-    assert!(signer_entry_names.contains(&"SignerWeight"));
-    assert!(signer_entry_names.contains(&"WalletLocator"));
-
-    let JsonValue::Array(raw_transaction) = inner_formats.get("RawTransaction").unwrap() else {
-        panic!("RawTransaction must be an array");
-    };
-    let raw_transaction_names: Vec<&str> = raw_transaction
-        .iter()
-        .filter_map(|f| {
-            let JsonValue::Object(obj) = f else {
-                return None;
-            };
-            match obj.get("name") {
-                Some(JsonValue::String(s)) => Some(s.as_str()),
-                _ => None,
-            }
-        })
-        .collect();
-    assert!(raw_transaction_names.contains(&"TransactionType"));
-    assert!(raw_transaction_names.contains(&"Account"));
-    assert!(raw_transaction_names.contains(&"Sequence"));
+    let keys: Vec<&str> = root.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "ACCOUNT_SET_FLAGS",
+            "FIELDS",
+            "LEDGER_ENTRY_FLAGS",
+            "LEDGER_ENTRY_FORMATS",
+            "LEDGER_ENTRY_TYPES",
+            "TRANSACTION_FLAGS",
+            "TRANSACTION_FORMATS",
+            "TRANSACTION_RESULTS",
+            "TRANSACTION_TYPES",
+            "TYPES",
+            "hash",
+        ]
+    );
 }
 
 #[test]

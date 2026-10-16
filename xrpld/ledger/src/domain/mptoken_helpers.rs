@@ -600,6 +600,17 @@ pub fn max_mpt_amount(sle_issuance: &STLedgerEntry) -> i64 {
     }
 }
 
+/// Get the maximum MPT amount for an issuance, or `None` if it does not exist.
+pub fn max_mpt_amount_by_id(
+    view: &dyn ReadView,
+    mpt_id: MPTID,
+) -> Result<Option<i64>, ViewError> {
+    Ok(view
+        .read(mpt_issuance_keylet_from_mptid(mpt_id))?
+        .as_deref()
+        .map(max_mpt_amount))
+}
+
 /// Get the available (remaining mintable) MPT amount.
 pub fn available_mpt_amount(sle_issuance: &STLedgerEntry) -> i64 {
     let max = max_mpt_amount(sle_issuance) as u64;

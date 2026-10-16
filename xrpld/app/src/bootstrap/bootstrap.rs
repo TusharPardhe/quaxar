@@ -4327,8 +4327,9 @@ fn bootstrap_shamap_store_if_configured(
     Ok(Some(PendingProductionSHAMapStore { bootstrap }))
 }
 
-/// Install the pruned store's last claimed ledger as the trusted restart
-/// baseline (`docs/design/2026-10-11-trusted-baseline-restart.md`). Set
+/// Wire the trusted committed baseline
+/// (`docs/design/2026-10-11-trusted-baseline-restart.md`,
+/// `docs/design/2026-10-15-continuous-prune-fast-recovery.md`). Set
 /// `QUAXAR_TRUSTED_RESTART=0` to disable.
 fn install_trusted_restart_baseline(root: &ApplicationRoot) {
     if std::env::var("QUAXAR_TRUSTED_RESTART").is_ok_and(|value| value == "0") {
@@ -4341,19 +4342,19 @@ fn install_trusted_restart_baseline(root: &ApplicationRoot) {
     else {
         return;
     };
-    let store = Arc::clone(driver.store());
-    let Some(seq) = store.metrics().claimed_seq else {
-        return;
-    };
-    let root_hash = match store.claimed_state_root() {
-        Ok(Some(hash)) => hash,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(target: "acquisition_trace", %error, "trusted restart baseline: claimed root unreadable");
-            return;
-        }
-    };
+    wire_trusted_baseline(&driver);
+}
+
+/// Register the rolling baseline on every claim, then install the store's
+/// last claimed ledger (if any) as the startup baseline.
+///
+/// The rolling registration must not depend on a claimed ledger existing at
+/// startup: a node that cold-syncs from an empty store has none, and without
+/// the callback fork recovery walked whole state trees for hours
+/// (testnet 2026-10-16, 02:25-04:27 UTC).
+fn wire_trusted_baseline(driver: &crate::shamap::pruned_driver::PrunedDriver) {
     use crate::ledger::inbound_ledgers::trusted_baseline as baseline;
+    let store = Arc::clone(driver.store());
     // Read through the index's key-value path, not the node-store fetch: a
     // baseline lookup must not pin dead-pending nodes (restore watch), and
     // baseline nodes are live by construction.
@@ -4376,6 +4377,24 @@ fn install_trusted_restart_baseline(root: &ApplicationRoot) {
             max_age,
         )));
     }));
+    tracing::info!(
+        target: "acquisition_trace",
+        event = "trusted_baseline_rolling_registered",
+        max_age,
+        "trusted committed baseline will roll with every claimed ledger"
+    );
+
+    let Some(seq) = store.metrics().claimed_seq else {
+        return;
+    };
+    let root_hash = match store.claimed_state_root() {
+        Ok(Some(hash)) => hash,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(target: "acquisition_trace", %error, "trusted restart baseline: claimed root unreadable");
+            return;
+        }
+    };
     if fetch(&root_hash).is_none() {
         tracing::warn!(target: "acquisition_trace", seq, %root_hash, "trusted restart baseline: claimed root missing from store");
         return;
@@ -6107,6 +6126,49 @@ mod tests {
 
     /// online_delete 0 keeps every ledger: no pruning driver is built, so the
     /// store never deletes nodes (rippled SHAMapStoreImp with deleteInterval 0).
+    /// Regression for the 2026-10-16 testnet stall: a node that cold-syncs
+    /// from an empty store has no claimed ledger at startup, but must still
+    /// roll the trusted baseline on its first claim.
+    #[test]
+    fn empty_store_still_rolls_the_trusted_baseline_on_first_claim() {
+        use crate::ledger::inbound_ledgers::trusted_baseline as baseline;
+        use std::sync::Arc;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut config = basics::basic_config::BasicConfig::new();
+        config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+        let node_db = config.section_mut("node_db");
+        node_db.set("type", "fjall");
+        node_db.set("path", dir.path().join("fjall").to_string_lossy());
+        node_db.set("reserve_mb", "0");
+        let bootstrap = crate::bootstrap_shamap_store(
+            &config,
+            false,
+            256,
+            1,
+            8,
+            64,
+            2,
+            &nodestore::ManagerImp::new(),
+            Arc::new(nodestore::DummyScheduler) as Arc<dyn nodestore::Scheduler>,
+            Arc::new(nodestore::NullJournal),
+        )
+        .expect("bootstrap");
+        let driver = super::build_pruned_driver(&bootstrap.node_store, 512, u32::MAX)
+            .expect("build")
+            .expect("fjall pruning driver");
+        assert_eq!(driver.store().metrics().claimed_seq, None, "empty store");
+
+        baseline::clear_for_test();
+        super::wire_trusted_baseline(&driver);
+        assert!(baseline::active().is_none(), "nothing claimed yet");
+
+        let root = basics::base_uint::Uint256::from_array([7; 32]);
+        driver.notify_claimed_for_test(10, root);
+        let active = baseline::active().expect("first claim installs a baseline");
+        assert_eq!(active.stats().seq, 10);
+        baseline::clear_for_test();
+    }
+
     #[test]
     fn online_delete_zero_builds_no_pruning_driver() {
         use std::sync::Arc;

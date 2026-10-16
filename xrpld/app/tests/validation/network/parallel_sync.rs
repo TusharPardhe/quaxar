@@ -121,11 +121,13 @@ fn hash_mismatch_node_rejected() {
     assert_ne!(actual_hash, wrong_hash);
 }
 
-/// Test: Empty payload node is handled gracefully.
+/// rippled `SHAMapLeafNode` asserts a minimum item size of 12 bytes
+/// (`kMinShaMapItemBytes`): an empty payload is rejected, 12 bytes is not.
 #[test]
-fn empty_payload_node_handled() {
-    let node = leaf_node(key(0x33), &[]);
-    // Should still produce a valid (non-zero) hash
+fn leaf_payload_minimum_size_matches_rippled() {
+    assert!(std::panic::catch_unwind(|| leaf_node(key(0x33), &[])).is_err());
+    assert!(std::panic::catch_unwind(|| leaf_node(key(0x33), &[0; 11])).is_err());
+    let node = leaf_node(key(0x33), &[0; 12]);
     assert_ne!(node.get_hash(), SHAMapHash::default());
 }
 

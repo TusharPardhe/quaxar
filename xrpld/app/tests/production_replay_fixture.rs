@@ -211,6 +211,17 @@ fn testnet_21558891_issuer_cashing_check_waives_limit_before_fix_cleanup_3_4_0()
     );
 }
 
+/// Testnet fork at 21568551 (2026-10-16 02:25 UTC): same 19 transactions
+/// and close time, different metadata hash. Captured with
+/// scripts/capture_sparse_replay.py.
+#[test]
+fn sparse_testnet_21568551_fork_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21568551_fork.jsonl"),
+    );
+}
+
 fn run_sparse_replay(path: PathBuf) {
     let rendered = path.to_string_lossy();
     assert!(

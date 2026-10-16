@@ -96,8 +96,6 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     // release-3.1: cleanup for expired NFT offers, MPToken locked amount,
     // credential deletion errors, PermissionedDEX hybrid validation.
-    // Enabled on public testnet, but retained as unsupported until the complete
-    // multi-domain consensus/replay parity matrix is certified.
     RegisteredFeature::new("fixCleanup3_1_3", true, RegisteredFeatureVote::DefaultYes),
     RegisteredFeature::new(
         FIX_CLEANUP_3_2_0_NAME,
@@ -231,7 +229,6 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     RegisteredFeature::new("fixReducedOffersV2", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("NFTokenMintOffer", true, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("fixAMMv1_1", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("fixPreviousTxnID", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixXChainRewardRounding",
@@ -286,6 +283,7 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     // semantics became unconditional.  Retired amendments remain registered
     // and supported because their IDs are still present in validated ledgers.
     RegisteredFeature::new("fixAMMOverflowOffer", true, RegisteredFeatureVote::Obsolete),
+    RegisteredFeature::new(FIX_AMMV1_1_NAME, true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("fixCheckThreading", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new(
         "fixMasterKeyAsRegularKey",
@@ -681,17 +679,16 @@ mod tests {
     }
 
     #[test]
-    fn retired_amm_overflow_offer_fix_remains_supported() {
-        let registered = REGISTERED_FEATURES
-            .iter()
-            .find(|registered| registered.name == "fixAMMOverflowOffer")
-            .expect("enabled retired amendments must remain registered");
-        assert!(registered.supported);
-        assert_eq!(registered.vote, RegisteredFeatureVote::Obsolete);
-        assert_eq!(
-            feature_name(&feature_id("fixAMMOverflowOffer")),
-            Some("fixAMMOverflowOffer")
-        );
+    fn retired_amm_fixes_remain_supported_and_obsolete() {
+        for name in ["fixAMMOverflowOffer", FIX_AMMV1_1_NAME] {
+            let registered = REGISTERED_FEATURES
+                .iter()
+                .find(|registered| registered.name == name)
+                .expect("enabled retired amendments must remain registered");
+            assert!(registered.supported);
+            assert_eq!(registered.vote, RegisteredFeatureVote::Obsolete);
+            assert_eq!(feature_name(&feature_id(name)), Some(name));
+        }
     }
 
     #[test]

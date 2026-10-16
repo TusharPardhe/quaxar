@@ -55,9 +55,17 @@ fn tx_submission_minimal_shell_refuses_false_positive_success() {
     let JsonValue::Object(result) = result else {
         panic!("submit result should be an object");
     };
+    // rippled doSubmit: STTx construction throws for a Payment without its
+    // required Destination, giving invalidTransaction with e.what().
     assert_eq!(
         result.get("error"),
-        Some(&JsonValue::String("internalSubmit".to_owned()))
+        Some(&JsonValue::String("invalidTransaction".to_owned()))
+    );
+    assert_eq!(
+        result.get("error_exception"),
+        Some(&JsonValue::String(
+            "Field 'Destination' is required but missing.".to_owned()
+        ))
     );
     assert!(!result.contains_key("engine_result"));
 
