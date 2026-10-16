@@ -8822,6 +8822,12 @@ impl ApplicationRoot {
     /// closed-ledger slot for standalone/legacy callers, but live consensus
     /// deliberately does not write that second slot. Retention and serving
     /// floors must therefore advance with this application's single LCL.
+    /// rippled `LedgerMaster::fetchDepth_`: `[fetch_depth]` clamped to
+    /// `online_delete`.
+    pub fn ledger_fetch_depth(&self) -> u32 {
+        self.ledger_fetch_depth
+    }
+
     pub fn earliest_ledger_fetch(&self, fetch_depth: u32) -> u32 {
         self.closed_ledger_seq()
             .map(|seq| seq.saturating_sub(fetch_depth))

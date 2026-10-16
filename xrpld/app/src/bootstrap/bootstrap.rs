@@ -863,7 +863,8 @@ pub fn build_bootstrap_root(
         default_job_queue_threads(config, options.standalone)
     }
     .max(1);
-    let ledger_history = config_legacy_u32(config, "ledger_history").unwrap_or(0);
+    let ledger_history = config_ledger_history(config, options.standalone)?;
+    let ledger_fetch_depth = config_fetch_depth(config)?;
     // Match rippled Config: [network_quorum] is an exact single unsigned
     // value and is checked against raw legacy [peers_max] (zero/absent = 21),
     // not the derived directional overlay limits.
@@ -895,7 +896,7 @@ pub fn build_bootstrap_root(
         import: options.import,
         quorum: options.quorum,
         network_quorum,
-        ledger_fetch_depth: ledger_history,
+        ledger_fetch_depth,
         ..ApplicationRootOptions::default()
     })
     .map_err(|error| error.to_string())?;
@@ -2389,7 +2390,10 @@ fn run_start_mode_consensus_loop(
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let router_root = runtime.root().clone();
         let router_overlay_rt = Arc::clone(&overlay_rt);
-        let get_ledger_fetch_depth = configured_ledger_history;
+        // rippled PeerImp/LedgerMaster::getEarliestFetch use fetchDepth (the
+        // configured [fetch_depth] clamped to online_delete), not
+        // ledger_history.
+        let get_ledger_fetch_depth = runtime.root().ledger_fetch_depth();
         overlay_rt
             .overlay()
             .queued_inbound()
@@ -2447,7 +2451,7 @@ fn run_start_mode_consensus_loop(
         // `LedgerMaster::getEarliestFetch` uses the configured history depth.
         // Keep that policy with the live overlay router rather than deriving a
         // separate retention range in a transport-only helper.
-        let fetch_pack_depth = configured_ledger_history;
+        let fetch_pack_depth = runtime.root().ledger_fetch_depth();
         overlay_rt
             .overlay()
             .queued_inbound()
@@ -5586,6 +5590,69 @@ fn amendments_from_config(config: &BasicConfig, start_type: StartUpType) -> Vec<
         .collect()
 }
 
+/// rippled `Config::loadFromString` `[ledger_history]`: default 256, `full` is
+/// unlimited, `none` is 0, anything else must be an unsigned 32-bit integer
+/// (a malformed value is a startup error). Standalone forces 0.
+fn config_ledger_history(config: &BasicConfig, standalone: bool) -> Result<u32, String> {
+    let value = config_single_legacy(config, "ledger_history")?.map_or(Ok(256), |raw| {
+        match raw.to_ascii_lowercase().as_str() {
+            "full" => Ok(u32::MAX),
+            "none" => Ok(0),
+            _ => raw
+                .parse::<u32>()
+                .map_err(|_| format!("[ledger_history] is invalid: {raw}")),
+        }
+    })?;
+    Ok(if standalone { 0 } else { value })
+}
+
+/// rippled `[fetch_depth]`: default 1,000,000,000; `none` is 0, `full` is
+/// unlimited; a configured value is raised to at least 10. LedgerMaster then
+/// clamps it to `online_delete` (`SHAMapStoreImp::clampFetchDepth`).
+fn config_fetch_depth(config: &BasicConfig) -> Result<u32, String> {
+    let fetch_depth = match config_single_legacy(config, "fetch_depth")? {
+        None => 1_000_000_000,
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "none" => 0,
+            "full" => u32::MAX,
+            _ => raw
+                .parse::<u32>()
+                .map_err(|_| format!("[fetch_depth] is invalid: {raw}"))?,
+        }
+        .max(10),
+    };
+    let online_delete = config
+        .section("node_db")
+        .get::<u32>("online_delete")
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    Ok(if online_delete != 0 {
+        fetch_depth.min(online_delete)
+    } else {
+        fetch_depth
+    })
+}
+
+/// rippled `getSingleSection`: the section's single value, trimmed. More than
+/// one line is logged and treated as absent, so the default applies.
+fn config_single_legacy(config: &BasicConfig, section: &str) -> Result<Option<String>, String> {
+    match config.section(section).values() {
+        [] => Ok(None),
+        [value] => Ok(Some(value.trim().to_owned())),
+        values => {
+            tracing::warn!(
+                target: "config",
+                section,
+                lines = values.len(),
+                "Section '{section}': requires 1 line not {} lines.",
+                values.len()
+            );
+            Ok(None)
+        }
+    }
+}
+
 fn config_legacy_u32(config: &BasicConfig, section: &str) -> Option<u32> {
     let value = config.legacy(section).ok()?;
     let trimmed = value.trim();
@@ -5907,6 +5974,52 @@ const fn should_schedule_coordinator_fetch_pack_wake(
 
 #[cfg(test)]
 mod tests {
+    fn legacy_config(entries: &[(&str, &str)]) -> basics::basic_config::BasicConfig {
+        let mut config = basics::basic_config::BasicConfig::new();
+        for (section, value) in entries {
+            if let Some(key) = value.strip_prefix("node_db:") {
+                let (k, v) = key.split_once('=').expect("k=v");
+                config.section_mut("node_db").set(k, v);
+            } else {
+                config.section_mut(*section).append(*value);
+            }
+        }
+        config
+    }
+
+    /// rippled Config.h `ledgerHistory = 256`; full / none / number; a
+    /// malformed value throws; standalone forces 0.
+    #[test]
+    fn ledger_history_matches_rippled() {
+        assert_eq!(super::config_ledger_history(&legacy_config(&[]), false), Ok(256));
+        let full = legacy_config(&[("ledger_history", "full")]);
+        assert_eq!(super::config_ledger_history(&full, false), Ok(u32::MAX));
+        let none = legacy_config(&[("ledger_history", "None")]);
+        assert_eq!(super::config_ledger_history(&none, false), Ok(0));
+        let n = legacy_config(&[("ledger_history", "2000")]);
+        assert_eq!(super::config_ledger_history(&n, false), Ok(2000));
+        assert_eq!(super::config_ledger_history(&n, true), Ok(0));
+        let bad = legacy_config(&[("ledger_history", "lots")]);
+        assert!(super::config_ledger_history(&bad, false).is_err());
+    }
+
+    /// rippled Config.h `fetchDepth = 1000000000`; none / full / number, then
+    /// at least 10; LedgerMaster clamps it to online_delete.
+    #[test]
+    fn fetch_depth_matches_rippled_and_is_clamped_to_online_delete() {
+        assert_eq!(super::config_fetch_depth(&legacy_config(&[])), Ok(1_000_000_000));
+        let none = legacy_config(&[("fetch_depth", "none")]);
+        assert_eq!(super::config_fetch_depth(&none), Ok(10));
+        let small = legacy_config(&[("fetch_depth", "3")]);
+        assert_eq!(super::config_fetch_depth(&small), Ok(10));
+        let full = legacy_config(&[("fetch_depth", "full")]);
+        assert_eq!(super::config_fetch_depth(&full), Ok(u32::MAX));
+        let clamped = legacy_config(&[("x", "node_db:online_delete=512")]);
+        assert_eq!(super::config_fetch_depth(&clamped), Ok(512));
+        let bad = legacy_config(&[("fetch_depth", "deep")]);
+        assert!(super::config_fetch_depth(&bad).is_err());
+    }
+
     /// online_delete 0 keeps every ledger: no pruning driver is built, so the
     /// store never deletes nodes (rippled SHAMapStoreImp with deleteInterval 0).
     #[test]
