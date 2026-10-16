@@ -500,6 +500,27 @@ fn ceil_in_impl(
     amount.clone()
 }
 
+fn try_mul_round(
+    v1: &STAmount,
+    v2: &STAmount,
+    asset: Asset,
+    round_up: bool,
+    mul_round_fn: fn(&STAmount, &STAmount, Asset, bool) -> STAmount,
+) -> Option<STAmount> {
+    match catch_unwind(AssertUnwindSafe(|| mul_round_fn(v1, v2, asset, round_up))) {
+        Ok(result) => Some(result),
+        Err(payload) => {
+            if basics::contract::exception_kind(payload.as_ref()).is_overflow()
+                || !asset.native()
+                || !is_feature_enabled_or(&crate::fix_cleanup_3_5_0(), true)
+            {
+                basics::contract::rethrow(payload);
+            }
+            None
+        }
+    }
+}
+
 fn ceil_out_impl(
     amount: &Amounts,
     limit: &STAmount,
@@ -509,7 +530,8 @@ fn ceil_out_impl(
 ) -> Amounts {
     if amount.out > *limit {
         let mut result = Amounts::new(
-            mul_round_fn(limit, &quality.rate(), amount.r#in.asset(), round_up),
+            try_mul_round(limit, &quality.rate(), amount.r#in.asset(), round_up, mul_round_fn)
+                .unwrap_or_else(|| amount.r#in.clone()),
             limit.clone(),
         );
         if result.r#in > amount.r#in {
@@ -882,6 +904,54 @@ fn canonicalize_round_strict(native: bool, value: &mut u64, offset: &mut i32, ro
         *value += 9;
         *value /= 10;
         *offset += 1;
+    }
+}
+
+#[cfg(test)]
+mod cleanup_3_5_ceil_out_tests {
+    use super::*;
+    use crate::{CurrentTransactionRulesGuard, IOUAmount, Issue, Rules, ST_AMOUNT_MAX_NATIVE_NETWORK};
+
+    fn fixture() -> (Amounts, STAmount, Quality) {
+        let issue = Issue::new(crate::currency_from_string("USD"), crate::AccountID::from_array([0x44; 20]));
+        let input = STAmount::new_native(ST_AMOUNT_MAX_NATIVE_NETWORK, false);
+        let output = STAmount::from_iou_amount(
+            sf_generic(),
+            IOUAmount::from_parts(9_999_999_999_999_995, -15).expect("output"),
+            issue,
+        );
+        let limit = STAmount::from_iou_amount(
+            sf_generic(),
+            IOUAmount::from_parts(9_999_999_999_999_994, -15).expect("limit"),
+            issue,
+        );
+        let amounts = Amounts::new(input, output);
+        let quality = Quality::from_amounts(&amounts);
+        (amounts, limit, quality)
+    }
+
+    #[test]
+    fn cleanup_3_5_ceil_out_clamps_unrepresentable_native_input() {
+        let (amounts, limit, quality) = fixture();
+        let legacy = Rules::new([]);
+        let payload = {
+            let _rules = CurrentTransactionRulesGuard::new(legacy);
+            basics::contract::try_catch(|| quality.ceil_out(&amounts, &limit))
+                .expect_err("legacy native materialization must throw")
+        };
+        assert!(basics::contract::exception_kind(payload.as_ref()).is_runtime());
+        assert!(!basics::contract::exception_kind(payload.as_ref()).is_overflow());
+
+        {
+            let _rules = CurrentTransactionRulesGuard::new(Rules::new([crate::fix_cleanup_3_5_0()]));
+            let result = quality.ceil_out(&amounts, &limit);
+            assert_eq!(result.r#in, amounts.r#in);
+            assert_eq!(result.out, limit);
+        }
+
+        let result = quality.ceil_out(&amounts, &limit);
+        assert_eq!(result.r#in, amounts.r#in);
+        assert_eq!(result.out, limit);
     }
 }
 
