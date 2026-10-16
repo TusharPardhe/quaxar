@@ -4381,30 +4381,31 @@ fn install_trusted_restart_baseline(root: &ApplicationRoot) {
     );
 }
 
-/// Build the pruned-store driver for a fjall single store, reading its window
-/// (`online_delete`) and prune settings from the node_db section. Returns None
-/// if the store does not export a key-value-capable backend (should not happen
-/// for fjall, but keeps the path non-fatal).
+/// Build the pruned-store driver for a fjall single store. `online_delete` is
+/// the value validated by rippled's SHAMapStore rules: 0 means online deletion
+/// is off and every ledger is kept (no driver, nothing is ever deleted), as in
+/// rippled. Returns None if the store does not export a key-value-capable
+/// backend (should not happen for fjall, but keeps the path non-fatal).
 fn build_pruned_driver(
     node_db: &basics::basic_config::Section,
     node_store: &crate::SHAMapStoreNodeStore,
+    online_delete: u32,
     can_delete: u32,
 ) -> Result<Option<Arc<crate::shamap::pruned_driver::PrunedDriver>>, String> {
     use crate::shamap::pruned_driver::{PrunedDriver, pruned_config_from_section};
+    if online_delete == 0 {
+        tracing::info!(
+            target: "nodestore",
+            "online_delete is 0 or unset: online deletion disabled, every ledger is kept"
+        );
+        return Ok(None);
+    }
     let Some(backend) = node_store.export_backend() else {
         return Ok(None);
     };
     if !backend.supports_kv() {
         return Ok(None);
     }
-    // online_delete is the retention window for the pruned store. Default to a
-    // conservative window when unset so pruning never runs unexpectedly tight.
-    let online_delete = node_db
-        .get::<u32>("online_delete")
-        .ok()
-        .flatten()
-        .filter(|&n| n > 0)
-        .unwrap_or(512);
     let config = pruned_config_from_section(node_db, online_delete, can_delete);
     let driver = PrunedDriver::open(backend, config)?;
     Ok(Some(Arc::new(driver)))
@@ -4437,6 +4438,7 @@ fn attach_production_shamap_store_runtime(
             build_pruned_driver(
                 node_db,
                 &bootstrap.node_store,
+                bootstrap.online_delete,
                 bootstrap.store.get_can_delete(),
             )?
         } else {
@@ -5905,6 +5907,39 @@ const fn should_schedule_coordinator_fetch_pack_wake(
 
 #[cfg(test)]
 mod tests {
+    /// online_delete 0 keeps every ledger: no pruning driver is built, so the
+    /// store never deletes nodes (rippled SHAMapStoreImp with deleteInterval 0).
+    #[test]
+    fn online_delete_zero_builds_no_pruning_driver() {
+        use std::sync::Arc;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut config = basics::basic_config::BasicConfig::new();
+        config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+        let node_db = config.section_mut("node_db");
+        node_db.set("type", "Memory");
+        node_db.set("path", dir.path().join("node").to_string_lossy());
+        let bootstrap = crate::bootstrap_shamap_store(
+            &config,
+            false,
+            256,
+            1,
+            8,
+            64,
+            2,
+            &nodestore::ManagerImp::new(),
+            Arc::new(nodestore::DummyScheduler) as Arc<dyn nodestore::Scheduler>,
+            Arc::new(nodestore::NullJournal),
+        )
+        .expect("bootstrap");
+        let node_db = config.section("node_db").clone();
+        let none = super::build_pruned_driver(&node_db, &bootstrap.node_store, 0, u32::MAX)
+            .expect("build");
+        assert!(none.is_none(), "online_delete 0 must not prune");
+        let some = super::build_pruned_driver(&node_db, &bootstrap.node_store, 512, u32::MAX)
+            .expect("build");
+        assert_eq!(some.expect("pruning driver").online_delete(), 512);
+    }
+
     use super::{
         APPLICATION_SWEEP_MALLOC_TRIM_TAG, BootstrapLedgerDataRouting, ENDPOINT_HANDOUT_LIMIT,
         FetchPackAdmission, GenericGetObjectAdmission, LedgerDataIngressDisposition, MainRuntime,
