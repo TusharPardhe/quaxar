@@ -15,7 +15,8 @@ use basics::{
 };
 use ledger::{ApplyView, ApplyViewImpl, Ledger, LedgerHeader, ReadView};
 use protocol::{
-    AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry,
+    AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, MPTAmount, MPTIssue,
+    STAmount, STLedgerEntry,
     STTx, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
 };
 use shamap::item::SHAMapItem;
@@ -734,6 +735,249 @@ fn static_vault(
     }
     entry.set_field_h192(sf("sfShareMPTID"), share_id);
     entry
+}
+
+fn vault_fee_rules(cleanup_3_5: bool) -> protocol::Rules {
+    let mut features = vec![
+        protocol::feature_id("SingleAssetVault"),
+        protocol::feature_id("MPTokensV1"),
+        protocol::fix_cleanup_3_1_3(),
+        protocol::fix_cleanup_3_2_0(),
+        protocol::fix_cleanup_3_4_0(),
+    ];
+    if cleanup_3_5 {
+        features.push(protocol::feature_id("fixCleanup3_5_0"));
+    }
+    protocol::Rules::new(features)
+}
+
+fn vault_with_assets(
+    owner: AccountID,
+    pseudo: AccountID,
+    sequence: u32,
+    asset: protocol::Asset,
+    share_id: Uint192,
+    assets: i64,
+) -> STLedgerEntry {
+    let mut vault = static_vault(owner, pseudo, sequence, asset, share_id);
+    let mut total = protocol::STNumber::from(RuntimeNumber::from_i64(assets));
+    total.associate_asset(asset);
+    vault.set_field_number(sf("sfAssetsTotal"), total.clone());
+    vault.set_field_number(sf("sfAssetsAvailable"), total);
+    vault
+}
+
+fn iou_holding_with_balance(
+    holder: AccountID,
+    issuer: AccountID,
+    currency: Currency,
+    balance: i64,
+) -> STLedgerEntry {
+    let mut holding = static_iou_holding(holder, issuer, currency);
+    holding.set_field_amount(sf("sfBalance"), iou(holder, "USD", balance));
+    holding
+}
+
+fn mpt_holding_amount(view: &impl ReadView, account: AccountID, id: Uint192) -> u64 {
+    view.read(protocol::mptoken_keylet_from_mptid(id, acct_id(account)))
+        .expect("MPT holding read")
+        .expect("MPT holding exists")
+        .get_field_u64(sf("sfMPTAmount"))
+}
+
+fn iou_holding_balance(view: &impl ReadView, holder: AccountID, issuer: AccountID) -> IOUAmount {
+    view.read(protocol::line(holder, issuer, protocol::currency_from_string("USD")))
+        .expect("IOU holding read")
+        .expect("IOU holding exists")
+        .get_field_amount(sf("sfBalance"))
+        .iou()
+}
+
+/// rippled #8267: only post-fixCleanup3_5_0 withdrawals from a non-issuer
+/// holder to another holder charge the vault's IOU transfer rate. The fixture
+/// invokes the production VaultWithdraw apply path over real trust-line, share,
+/// vault, and account-root entries.
+#[test]
+fn vault_withdraw_iou_transfer_fee_live_path_matches_cleanup_3_5_gate_and_exemptions() {
+    let holder = acct(0x21);
+    let destination = acct(0x31);
+    let pseudo = acct(0x41);
+    let issuer = acct(0x51);
+    let sequence = 7;
+    let currency = protocol::currency_from_string("USD");
+    let asset = protocol::Asset::Issue(Issue::new(currency, issuer));
+    let share_id = static_share_id(pseudo, 1);
+    let vault_id = protocol::vault_keylet(acct_id(holder), sequence).key;
+
+    for (cleanup_3_5, payout, destination_account, expected_pseudo, expected_destination, label) in [
+        (false, iou(issuer, "USD", 40), destination, 60, 40, "gate off"),
+        (true, iou(issuer, "USD", 40), destination, 50, 40, "fixed asset third party"),
+        (true, iou(issuer, "USD", 40), holder, 60, 40, "self exemption"),
+        (true, iou(issuer, "USD", 40), issuer, 60, 0, "issuer destination exemption"),
+        (
+            true,
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(25), MPTIssue::new(share_id)),
+            destination,
+            75,
+            20,
+            "fixed shares",
+        ),
+    ] {
+        let mut issuer_root = account_root(issuer, 10_000_000_000, 0, 0);
+        issuer_root.set_field_u32(sf("sfTransferRate"), 1_250_000_000);
+        let mut ledger = make_ledger(vec![
+            account_root(holder, 10_000_000_000, 0, 0),
+            account_root(destination, 10_000_000_000, 0, 0),
+            account_root(pseudo, 10_000_000_000, 0, 0),
+            issuer_root,
+            vault_with_assets(holder, pseudo, sequence, asset, share_id, 100),
+            static_mpt_issuance(pseudo, 1, 100),
+            static_mpt_holding(holder, share_id, 100),
+            iou_holding_with_balance(pseudo, issuer, currency, 100),
+            iou_holding_with_balance(holder, issuer, currency, 0),
+            iou_holding_with_balance(destination, issuer, currency, 0),
+        ]);
+        ledger.set_rules(vault_fee_rules(cleanup_3_5));
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let tx = vault_withdraw_to_tx(holder, vault_id, payout, destination_account, None);
+
+        assert_eq!(
+            app::state::vault::apply_vault_withdraw(&mut view, &tx),
+            Ter::TES_SUCCESS,
+            "{label}"
+        );
+        assert_eq!(
+            iou_holding_balance(&view, pseudo, issuer),
+            IOUAmount::from_parts(expected_pseudo, 0).expect("expected pseudo balance"),
+            "{label}"
+        );
+        if destination_account != issuer {
+            assert_eq!(
+                iou_holding_balance(&view, destination_account, issuer),
+                IOUAmount::from_parts(expected_destination, 0).expect("expected destination balance"),
+                "{label}"
+            );
+        }
+    }
+}
+
+/// The MPT path has the same gate and fee rules, but its integral subtraction
+/// can round a non-zero gross payout to zero. That must be tecPRECISION_LOSS
+/// before shares, vault totals, or token holdings mutate.
+#[test]
+fn vault_withdraw_mpt_transfer_fee_live_path_charges_net_and_rejects_zero_delivery() {
+    let holder = acct(0x22);
+    let destination = acct(0x32);
+    let pseudo = acct(0x42);
+    let issuer = acct(0x52);
+    let sequence = 8;
+    let underlying_id = static_share_id(issuer, 2);
+    let asset = protocol::Asset::MPTIssue(MPTIssue::new(underlying_id));
+    let share_id = static_share_id(pseudo, 1);
+    let vault_id = protocol::vault_keylet(acct_id(holder), sequence).key;
+
+    for (cleanup_3_5, payout, destination_account, expected_pseudo, expected_destination, label) in [
+        (
+            false,
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(40), MPTIssue::new(underlying_id)),
+            destination,
+            60,
+            40,
+            "gate off",
+        ),
+        (
+            true,
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(40), MPTIssue::new(underlying_id)),
+            destination,
+            50,
+            40,
+            "fixed asset",
+        ),
+        (
+            true,
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(25), MPTIssue::new(share_id)),
+            destination,
+            75,
+            20,
+            "fixed shares",
+        ),
+        (
+            true,
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(40), MPTIssue::new(underlying_id)),
+            holder,
+            60,
+            40,
+            "self exemption",
+        ),
+        (
+            true,
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(40), MPTIssue::new(underlying_id)),
+            issuer,
+            60,
+            0,
+            "issuer destination exemption",
+        ),
+    ] {
+        let mut underlying_issuance = static_mpt_issuance(issuer, 2, 100);
+        underlying_issuance.set_field_u16(sf("sfTransferFee"), 25_000);
+        let mut ledger = make_ledger(vec![
+            account_root(holder, 10_000_000_000, 0, 0),
+            account_root(destination, 10_000_000_000, 0, 0),
+            account_root(pseudo, 10_000_000_000, 0, 0),
+            account_root(issuer, 10_000_000_000, 0, 0),
+            vault_with_assets(holder, pseudo, sequence, asset, share_id, 100),
+            static_mpt_issuance(pseudo, 1, 100),
+            underlying_issuance,
+            static_mpt_holding(holder, share_id, 100),
+            static_mpt_holding(pseudo, underlying_id, 100),
+            static_mpt_holding(holder, underlying_id, 0),
+            static_mpt_holding(destination, underlying_id, 0),
+        ]);
+        ledger.set_rules(vault_fee_rules(cleanup_3_5));
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        let tx = vault_withdraw_to_tx(holder, vault_id, payout, destination_account, None);
+
+        assert_eq!(app::state::vault::apply_vault_withdraw(&mut view, &tx), Ter::TES_SUCCESS, "{label}");
+        assert_eq!(mpt_holding_amount(&view, pseudo, underlying_id), expected_pseudo, "{label}");
+        if destination_account != issuer {
+            assert_eq!(
+                mpt_holding_amount(&view, destination_account, underlying_id),
+                expected_destination,
+                "{label}"
+            );
+        }
+    }
+
+    let mut underlying_issuance = static_mpt_issuance(issuer, 2, 1);
+    underlying_issuance.set_field_u16(sf("sfTransferFee"), 25_000);
+    let mut ledger = make_ledger(vec![
+        account_root(holder, 10_000_000_000, 0, 0),
+        account_root(destination, 10_000_000_000, 0, 0),
+        account_root(pseudo, 10_000_000_000, 0, 0),
+        account_root(issuer, 10_000_000_000, 0, 0),
+        vault_with_assets(holder, pseudo, sequence, asset, share_id, 1),
+        static_mpt_issuance(pseudo, 1, 1),
+        underlying_issuance,
+        static_mpt_holding(holder, share_id, 1),
+        static_mpt_holding(pseudo, underlying_id, 1),
+        static_mpt_holding(destination, underlying_id, 0),
+    ]);
+    ledger.set_rules(vault_fee_rules(true));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = vault_withdraw_to_tx(
+        holder,
+        vault_id,
+        STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(1), MPTIssue::new(share_id)),
+        destination,
+        None,
+    );
+    assert_eq!(
+        app::state::vault::apply_vault_withdraw(&mut view, &tx),
+        Ter::TEC_PRECISION_LOSS,
+        "a one-unit MPT gross payout must not burn shares when it delivers zero"
+    );
+    assert_eq!(mpt_holding_amount(&view, pseudo, underlying_id), 1);
+    assert_eq!(mpt_holding_amount(&view, holder, share_id), 1);
 }
 
 fn vault_scale_overflow_view(

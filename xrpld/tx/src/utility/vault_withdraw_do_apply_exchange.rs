@@ -44,31 +44,6 @@ pub const fn vault_withdrawal_charges_transfer_fee(facts: VaultWithdrawTransferF
         && !facts.transfer_rate_is_parity
 }
 
-/// The source amount leaves the vault pseudo-account; the destination amount
-/// reaches the selected withdrawal destination. `VaultWithdraw.cpp` charges
-/// shares against the gross source amount and rejects a non-zero gross payout
-/// rounded down to zero by the transfer fee.
-pub fn vault_withdrawal_fee_amounts<Amount>(
-    facts: VaultWithdrawTransferFeeFacts,
-    requested_amount: Amount,
-    assets_withdrawn: Amount,
-    is_zero: impl Fn(&Amount) -> bool,
-    add_transfer_fee: impl FnOnce(&Amount) -> Amount,
-    subtract_transfer_fee: impl FnOnce(&Amount) -> Amount,
-) -> Result<(Amount, Amount), Ter> {
-    if !vault_withdrawal_charges_transfer_fee(facts) {
-        return Ok((requested_amount, assets_withdrawn));
-    }
-
-    let source_amount = add_transfer_fee(&requested_amount);
-    let destination_amount = subtract_transfer_fee(&assets_withdrawn);
-    if !is_zero(&assets_withdrawn) && is_zero(&destination_amount) {
-        return Err(Ter::TEC_PRECISION_LOSS);
-    }
-
-    Ok((source_amount, destination_amount))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultWithdrawDoApplyExchangeState<
     Vault,
@@ -200,7 +175,6 @@ mod tests {
     use super::{
         VaultWithdrawDoApplyExchangeVault, VaultWithdrawTransferFeeFacts,
         load_vault_withdraw_do_apply_exchange, vault_withdrawal_charges_transfer_fee,
-        vault_withdrawal_fee_amounts,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,41 +232,6 @@ mod tests {
                 ..charged
             }
         ));
-    }
-
-    #[test]
-    fn vault_withdrawal_fee_uses_gross_source_and_net_delivery() {
-        let result = vault_withdrawal_fee_amounts(
-            VaultWithdrawTransferFeeFacts {
-                fix_cleanup_3_5_0_enabled: true,
-                ..VaultWithdrawTransferFeeFacts::default()
-            },
-            40_i64,
-            25_i64,
-            |amount| *amount == 0,
-            |amount| amount * 5 / 4,
-            |amount| amount * 4 / 5,
-        );
-
-        assert_eq!(result, Ok((50, 20)));
-    }
-
-    #[test]
-    fn vault_withdrawal_fee_rejects_nonzero_payout_rounded_to_zero() {
-        let result = vault_withdrawal_fee_amounts(
-            VaultWithdrawTransferFeeFacts {
-                fix_cleanup_3_5_0_enabled: true,
-                ..VaultWithdrawTransferFeeFacts::default()
-            },
-            1_i64,
-            1_i64,
-            |amount| *amount == 0,
-            |amount| amount * 5 / 4,
-            |_| 0,
-        );
-
-        assert_eq!(result, Err(Ter::TEC_PRECISION_LOSS));
-        assert_eq!(trans_token(result.unwrap_err()), "tecPRECISION_LOSS");
     }
 
     fn test_vault() -> TestVault {

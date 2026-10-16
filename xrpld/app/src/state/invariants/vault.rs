@@ -5,8 +5,52 @@ use basics::{
     number::{NumberParts as RuntimeNumber, RoundingMode, get_mantissa_scale},
 };
 use ledger::{ApplyView, FlowSandbox, ReadView};
-use protocol::{AccountID, Asset, Issue, LedgerEntryType, MPTID, STAmount, STLedgerEntry, Ter};
+use protocol::{
+    AccountID, Asset, Issue, LedgerEntryType, MPTID, PARITY_RATE, Rate, STAmount, STLedgerEntry,
+    Ter, QUALITY_ONE,
+};
 use std::collections::BTreeMap;
+
+fn vault_transfer_rate(view: &impl ReadView, asset: Asset) -> Result<Rate, ledger::ViewError> {
+    match asset {
+        Asset::Issue(issue) if issue.native() => Ok(PARITY_RATE),
+        Asset::Issue(issue) => {
+            let Some(account) = view.read(protocol::account_keylet(
+                basics::base_uint::Uint160::from_void(issue.account.data()),
+            ))?
+            else {
+                return Ok(PARITY_RATE);
+            };
+            Ok(if account.is_field_present(sf("sfTransferRate")) {
+                Rate::new(account.get_field_u32(sf("sfTransferRate")))
+            } else {
+                PARITY_RATE
+            })
+        }
+        Asset::MPTIssue(issue) => ledger::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id()),
+    }
+}
+
+fn subtract_vault_transfer_fee(amount: &STAmount, rate: Rate) -> Option<STAmount> {
+    if rate == PARITY_RATE {
+        return Some(amount.clone());
+    }
+    match amount.asset() {
+        Asset::Issue(issue) => Some(STAmount::from_iou_amount(
+            sf("sfAmount"),
+            ledger::mul_ratio::mul_ratio(amount.iou(), QUALITY_ONE, rate.value, false),
+            issue,
+        )),
+        Asset::MPTIssue(issue) => protocol::mpt_amount::mul_ratio(
+            amount.mpt(),
+            QUALITY_ONE,
+            rate.value,
+            false,
+        )
+        .ok()
+        .map(|value| STAmount::from_mpt_amount(sf("sfAmount"), value, issue)),
+    }
+}
 
 pub(super) struct VaultSnapshot {
     pub(super) key: Uint256,
@@ -913,7 +957,34 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                         local_scale,
                         RoundingMode::ToNearest,
                     );
-                    let destroyed_is_sub_ulp = tolerate_zero_delta
+                    let fee_adjusted_withdrawal = sandbox
+                        .rules()
+                        .enabled(&protocol::feature_id("fixCleanup3_5_0"))
+                        && Some(destination) != tx_account
+                        && !after_vault.asset.native()
+                        && tx_account != Some(asset_issuer(after_vault.asset));
+                    let expected_destination = if fee_adjusted_withdrawal {
+                        let rate = match vault_transfer_rate(sandbox, after_vault.asset) {
+                            Ok(rate) => rate,
+                            Err(_) => return false,
+                        };
+                        if rate == PARITY_RATE {
+                            -local_pseudo_delta
+                        } else {
+                            let source = match after_vault.asset.amount(-local_pseudo_delta) {
+                                Ok(amount) => amount,
+                                Err(_) => return false,
+                            };
+                            let Some(net) = subtract_vault_transfer_fee(&source, rate) else {
+                                return false;
+                            };
+                            amount_to_number(&net)
+                        }
+                    } else {
+                        -local_pseudo_delta
+                    };
+                    let destroyed_is_sub_ulp = !fee_adjusted_withdrawal
+                        && tolerate_zero_delta
                         && round_number_to_asset_with_scale(
                             after_vault.asset,
                             -pseudo_delta_assets.delta - delta.delta,
@@ -923,7 +994,7 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                     valid_balance_change
                         && (destroyed_is_sub_ulp
                             || agrees_within_one_unit(
-                                -local_pseudo_delta,
+                                expected_destination,
                                 rounded_destination,
                                 after_vault.asset,
                                 local_scale,

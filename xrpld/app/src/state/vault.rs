@@ -13,7 +13,8 @@ use protocol::{
     AccountID, Asset, LedgerEntryType, MPTIssue, STAmount, STLedgerEntry, STNumber, STTx,
     SerializedTypeId, Ter, VAULT_DEFAULT_IOU_SCALE, XRPAmount, account_keylet, associate_asset,
     feature_id, get_field_by_symbol, mpt_issuance_keylet, mpt_issuance_keylet_from_mptid,
-    mptoken_keylet_from_mptid, owner_dir_keylet, to_amount_from_number,
+    mptoken_keylet_from_mptid, owner_dir_keylet, to_amount_from_number, PARITY_RATE,
+    QUALITY_ONE, Rate,
 };
 use tx::{
     MPT_CAN_ESCROW_FLAG, MPT_CAN_TRADE_FLAG, MPT_CAN_TRANSFER_FLAG, MPT_REQUIRE_AUTH_FLAG,
@@ -22,6 +23,7 @@ use tx::{
     VaultDepositPreflightFacts, VaultSetPreflightFacts, VaultWithdrawPreflightFacts,
     run_vault_clawback_preflight, run_vault_create_preflight, run_vault_delete_preflight,
     run_vault_deposit_preflight, run_vault_set_preflight, run_vault_withdraw_preflight,
+    vault_withdrawal_charges_transfer_fee, VaultWithdrawTransferFeeFacts,
 };
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -34,6 +36,70 @@ fn to_160(account: &AccountID) -> Uint160 {
 
 fn amount_number(amount: &STAmount) -> RuntimeNumber {
     stamount_as_number(amount)
+}
+
+/// `VaultWithdraw::withdrawalTransferRate`: retain the historical waiver until
+/// fixCleanup3_5_0, then charge only a non-issuer holder's third-party payout.
+fn withdrawal_transfer_rate<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    destination: &AccountID,
+    asset: Asset,
+) -> Result<Rate, Ter> {
+    let preliminary_facts = VaultWithdrawTransferFeeFacts {
+        fix_cleanup_3_5_0_enabled: view.rules().enabled(&feature_id("fixCleanup3_5_0")),
+        vault_asset_is_native: asset.native(),
+        destination_is_withdrawer: destination == account,
+        withdrawer_is_asset_issuer: account == &asset.issuer(),
+        destination_is_asset_issuer: destination == &asset.issuer(),
+        transfer_rate_is_parity: false,
+    };
+    if !vault_withdrawal_charges_transfer_fee(preliminary_facts) {
+        return Ok(PARITY_RATE);
+    }
+
+    let rate = match asset {
+        Asset::Issue(issue) => ledger::ripple_state_helpers::try_transfer_rate(view, &issue.account)
+            .map(Rate::new)
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?,
+        Asset::MPTIssue(issue) => ledger::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?,
+    };
+    Ok(vault_withdrawal_charges_transfer_fee(VaultWithdrawTransferFeeFacts {
+        transfer_rate_is_parity: rate == PARITY_RATE,
+        ..preliminary_facts
+    })
+    .then_some(rate)
+    .unwrap_or(PARITY_RATE))
+}
+
+/// `addTransferFee` / `subtractTransferFee` for a vault's non-native asset.
+/// IOUs retain STAmount's directed 16-digit rounding; MPTs use exact integral
+/// arithmetic, respectively rounding the vault debit up and delivery down.
+fn transfer_fee_amount(amount: &STAmount, rate: Rate, add_fee: bool) -> Result<STAmount, Ter> {
+    if rate == PARITY_RATE {
+        return Ok(amount.clone());
+    }
+    match amount.asset() {
+        Asset::Issue(issue) => Ok(STAmount::from_iou_amount(
+            sf("sfAmount"),
+            ledger::mul_ratio::mul_ratio(
+                amount.iou(),
+                if add_fee { rate.value } else { QUALITY_ONE },
+                if add_fee { QUALITY_ONE } else { rate.value },
+                add_fee,
+            ),
+            issue,
+        )),
+        Asset::MPTIssue(issue) => protocol::mpt_amount::mul_ratio(
+            amount.mpt(),
+            if add_fee { rate.value } else { QUALITY_ONE },
+            if add_fee { QUALITY_ONE } else { rate.value },
+            add_fee,
+        )
+        .map(|value| STAmount::from_mpt_amount(sf("sfAmount"), value, issue))
+        .map_err(|_| Ter::TEC_PATH_DRY),
+    }
 }
 
 fn asset_number(asset: Asset, value: RuntimeNumber) -> STNumber {
@@ -1427,20 +1493,33 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         Ok(waive) => waive,
         Err(ter) => return ter,
     };
+    let transfer_rate = match withdrawal_transfer_rate(view, &account, &destination, vault.asset) {
+        Ok(rate) => rate,
+        Err(ter) => return ter,
+    };
 
     // Matches VaultWithdraw.cpp:315-380. This is intentionally before any
     // transfer or holding mutation.
     let (shares_redeemed, assets_withdrawn) = match catch_vault_overflow(|| {
         if amount.asset() == vault.asset {
+            // A fixed-asset request specifies the net destination amount. The
+            // redeemed shares must cover its gross source amount once the
+            // third-party transfer fee applies.
+            let amount_for_shares = transfer_fee_amount(&amount, transfer_rate, true)?;
             let shares = if view.rules().enabled(&feature_id("fixCleanup3_4_0")) {
                 assets_to_shares_withdraw_truncated(
                     &vault,
                     &issuance,
-                    &amount,
+                    &amount_for_shares,
                     waive_unrealized_loss,
                 )
             } else {
-                assets_to_shares_withdraw(&vault, &issuance, &amount, waive_unrealized_loss)
+                assets_to_shares_withdraw(
+                    &vault,
+                    &issuance,
+                    &amount_for_shares,
+                    waive_unrealized_loss,
+                )
             };
             let Some(shares) = shares else {
                 return Err(Ter::TEC_INTERNAL);
@@ -1494,10 +1573,14 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         }
     }
 
+    let assets_received_for_limit = match transfer_fee_amount(&assets_withdrawn, transfer_rate, false) {
+        Ok(amount) => amount,
+        Err(ter) => return ter,
+    };
     let limit_check_amount = if view.rules().enabled(&protocol::fix_cleanup_3_1_3())
         && amount.asset() == share_asset(vault.share_id)
     {
-        &assets_withdrawn
+        &assets_received_for_limit
     } else {
         &amount
     };
@@ -1548,6 +1631,14 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         assets_withdrawn = clamped;
     }
 
+    let assets_delivered = match transfer_fee_amount(&assets_withdrawn, transfer_rate, false) {
+        Ok(amount) => amount,
+        Err(ter) => return ter,
+    };
+    if assets_withdrawn.signum() > 0 && assets_delivered.signum() == 0 {
+        return Ter::TEC_PRECISION_LOSS;
+    }
+
     let ter = transfer_mpt(
         view,
         sttx,
@@ -1582,7 +1673,20 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         }
     }
 
-    let ter = account_send(view, sttx, &vault.pseudo, &destination, &assets_withdrawn);
+    // `View::doWithdraw`: a fee-adjusted payout redeems the gross amount
+    // from the vault pseudo-account, then issues the net amount to the
+    // destination. The local account_send intentionally has no transfer fee,
+    // matching rippled's directSendNoFee legs.
+    let ter = if assets_withdrawn != assets_delivered {
+        let issuer = vault.asset.issuer();
+        let ter = account_send(view, sttx, &vault.pseudo, &issuer, &assets_withdrawn);
+        if ter != Ter::TES_SUCCESS {
+            return ter;
+        }
+        account_send(view, sttx, &issuer, &destination, &assets_delivered)
+    } else {
+        account_send(view, sttx, &vault.pseudo, &destination, &assets_delivered)
+    };
     if ter != Ter::TES_SUCCESS {
         return ter;
     }
