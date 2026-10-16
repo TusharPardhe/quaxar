@@ -222,6 +222,21 @@ fn sparse_testnet_21568551_fork_matches_network_metadata() {
     );
 }
 
+/// Testnet fork at 21588856 (2026-10-16 21:24 UTC). OfferCreate 7B25D6F0 (IOC,
+/// sells AUROOS, which carries a transfer fee, for XRP) crosses a CLOB offer,
+/// then a single-path AMM. Since fixAMMv1_1 was retired, rippled always
+/// composes the incoming transfer rate into the single-path AMM quality
+/// function, for offer crossing too, so limitOut sizes the second AMM pass
+/// to 59647682 drops. quaxar dropped the rate for offer crossing and took
+/// 62212738, failed the pass and forked.
+#[test]
+fn sparse_testnet_21588856_amm_transfer_rate_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21588856_amm_transfer_rate.jsonl"),
+    );
+}
+
 fn run_sparse_replay(path: PathBuf) {
     let rendered = path.to_string_lossy();
     assert!(
