@@ -32,6 +32,8 @@ pub enum VaultClawbackVaultAssetKind {
 pub struct VaultClawbackPreclaimFacts {
     pub vault_exists: bool,
     pub share_issuance_exists: bool,
+    pub fix_cleanup_3_5_0_enabled: bool,
+    pub holder_account_exists: bool,
     pub amount_present: bool,
     pub vault_asset_is_native: bool,
     pub vault_asset_issuer_is_owner: bool,
@@ -57,6 +59,8 @@ impl Default for VaultClawbackPreclaimFacts {
         Self {
             vault_exists: false,
             share_issuance_exists: false,
+            fix_cleanup_3_5_0_enabled: false,
+            holder_account_exists: true,
             amount_present: false,
             vault_asset_is_native: false,
             vault_asset_issuer_is_owner: false,
@@ -86,6 +90,12 @@ pub const fn run_vault_clawback_preclaim(facts: VaultClawbackPreclaimFacts) -> T
 
     if !facts.share_issuance_exists {
         return Ter::TEF_INTERNAL;
+    }
+
+    // Pre-fixCleanup3_5_0 this reaches doApply after charging the fee. Match
+    // the other clawback transactions by refusing a missing holder in preclaim.
+    if facts.fix_cleanup_3_5_0_enabled && !facts.holder_account_exists {
+        return Ter::TER_NO_ACCOUNT;
     }
 
     if !facts.amount_present && !facts.vault_asset_is_native && facts.vault_asset_issuer_is_owner {
@@ -179,6 +189,24 @@ mod tests {
 
         assert_eq!(result, Ter::TEF_INTERNAL);
         assert_eq!(trans_token(result), "tefINTERNAL");
+    }
+
+    #[test]
+    fn vault_clawback_rejects_nonexistent_holder_only_after_cleanup_3_5_0() {
+        let facts = VaultClawbackPreclaimFacts {
+            vault_exists: true,
+            share_issuance_exists: true,
+            holder_account_exists: false,
+            ..VaultClawbackPreclaimFacts::default()
+        };
+        assert_eq!(run_vault_clawback_preclaim(facts), Ter::TEC_WRONG_ASSET);
+        assert_eq!(
+            run_vault_clawback_preclaim(VaultClawbackPreclaimFacts {
+                fix_cleanup_3_5_0_enabled: true,
+                ..facts
+            }),
+            Ter::TER_NO_ACCOUNT
+        );
     }
 
     #[test]
