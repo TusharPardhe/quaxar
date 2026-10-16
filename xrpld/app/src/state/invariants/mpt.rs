@@ -696,6 +696,7 @@ pub(super) fn validates_mpt_lifecycle_counts(
     lending_protocol_enabled: bool,
     mptokens_v2_enabled: bool,
     fix_cleanup_3_4_0: bool,
+    fix_cleanup_3_5_0: bool,
     lifecycle: &MptIssuanceLifecycle,
 ) -> bool {
     let applies =
@@ -751,24 +752,25 @@ pub(super) fn validates_mpt_lifecycle_counts(
             return lifecycle.tokens_created <= 2 && lifecycle.tokens_deleted <= 2;
         }
 
-        // rippled a18839d92d: fixCleanup3_4_0 relaxes the LendingProtocol
-        // MayAuthorizeMpt cap only for these two transaction shapes. LoanSet
-        // may create its borrower and origination-fee holdings; VaultWithdraw
-        // may create a destination asset holding while deleting emptied shares.
+        // rippled aa70b368b5: fixCleanup3_4_0 relaxes the LendingProtocol
+        // MayAuthorizeMpt cap for LoanSet and VaultWithdraw. Post-
+        // fixCleanup3_5_0 LoanBrokerDelete may likewise create the owner's
+        // missing cover holding while deleting the pseudo-account's holding.
         let mptokens_exceed_authorize_cap = if !lending_protocol_enabled {
             false
-        } else if fix_cleanup_3_4_0 {
+        } else {
             match txn_type {
-                protocol::TxType::LOAN_SET => {
+                protocol::TxType::LOAN_SET if fix_cleanup_3_4_0 => {
                     lifecycle.tokens_deleted != 0 || lifecycle.tokens_created > 2
                 }
-                protocol::TxType::VAULT_WITHDRAW => {
+                protocol::TxType::VAULT_WITHDRAW if fix_cleanup_3_4_0 => {
+                    lifecycle.tokens_created > 1 || lifecycle.tokens_deleted > 1
+                }
+                protocol::TxType::LOAN_BROKER_DELETE if fix_cleanup_3_5_0 => {
                     lifecycle.tokens_created > 1 || lifecycle.tokens_deleted > 1
                 }
                 _ => lifecycle.tokens_created + lifecycle.tokens_deleted > 1,
             }
-        } else {
-            lifecycle.tokens_created + lifecycle.tokens_deleted > 1
         };
         if mptokens_exceed_authorize_cap {
             return false;
@@ -876,6 +878,7 @@ mod tests {
                 true,
                 true,
                 fix_cleanup_3_4_0,
+                false,
                 &lifecycle(tokens_created, tokens_deleted),
             )
         };
@@ -886,6 +889,28 @@ mod tests {
         assert!(validates(TxType::VAULT_WITHDRAW, true, 1, 1));
         assert!(!validates(TxType::VAULT_WITHDRAW, true, 2, 0));
         assert!(!validates(TxType::VAULT_WITHDRAW, true, 0, 2));
+    }
+
+    #[test]
+    fn cleanup_3_5_0_allows_broker_delete_one_mpt_create_and_delete() {
+        let validates = |fix_cleanup_3_5_0, tokens_created, tokens_deleted| {
+            validates_mpt_lifecycle_counts(
+                TxType::LOAN_BROKER_DELETE,
+                Ter::TES_SUCCESS,
+                false,
+                true,
+                true,
+                true,
+                false,
+                fix_cleanup_3_5_0,
+                &lifecycle(tokens_created, tokens_deleted),
+            )
+        };
+
+        assert!(!validates(false, 1, 1));
+        assert!(validates(true, 1, 1));
+        assert!(!validates(true, 2, 1));
+        assert!(!validates(true, 1, 2));
     }
 
     #[test]

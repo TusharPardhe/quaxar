@@ -1220,6 +1220,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         lending_protocol_enabled,
         mptokens_v2_enabled,
         fix_cleanup_3_4_0,
+        fix_cleanup_3_5_0,
         &mpt_issuance_lifecycle,
     ) {
         return Err(());

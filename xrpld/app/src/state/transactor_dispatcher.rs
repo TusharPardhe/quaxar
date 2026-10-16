@@ -2920,6 +2920,7 @@ fn requires_source_pre_fee_balance(txn_type: TxType) -> bool {
             | TxType::ESCROW_FINISH
             | TxType::ESCROW_CANCEL
             | TxType::LOAN_BROKER_SET
+            | TxType::LOAN_BROKER_DELETE
             | TxType::LOAN_BROKER_COVER_WITHDRAW
             | TxType::LOAN_SET
             | TxType::DEPOSIT_PREAUTH
@@ -3147,7 +3148,13 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             };
             crate::state::lending::apply_loan_broker_set(view, sttx, pre_fee_balance_drops)
         }
-        TxType::LOAN_BROKER_DELETE => crate::state::lending::apply_loan_broker_delete(view, sttx),
+        TxType::LOAN_BROKER_DELETE => {
+            let pre_fee_balance_drops = match require_pre_fee_balance(pre_fee_balance_drops) {
+                Ok(balance) => balance,
+                Err(error) => return error,
+            };
+            crate::state::lending::apply_loan_broker_delete(view, sttx, pre_fee_balance_drops)
+        }
         TxType::LOAN_BROKER_COVER_DEPOSIT => {
             crate::state::lending::apply_loan_broker_cover_deposit(view, sttx)
         }
