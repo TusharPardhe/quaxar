@@ -98,6 +98,19 @@ impl PrunedDriver {
         *self.on_claimed.lock().expect("pruned driver on_claimed mutex") = Some(callback);
     }
 
+    /// Invoke the registered claim callback as a real claim would.
+    #[cfg(test)]
+    pub(crate) fn notify_claimed_for_test(&self, seq: u32, root: Uint256) {
+        if let Some(callback) = self
+            .on_claimed
+            .lock()
+            .expect("pruned driver on_claimed mutex")
+            .as_ref()
+        {
+            callback(seq, root);
+        }
+    }
+
     /// The configured retention window (`online_delete`).
     pub fn online_delete(&self) -> u32 {
         self.store.online_delete()
