@@ -1104,11 +1104,11 @@ fn shamap_sync_tree_state_and_root_wire_match_narrow_cpp_roles() {
     tree.clear_synching();
     assert_eq!(tree.state(), SyncState::Modifying);
 
-    tree.set_immutable();
+    assert!(tree.set_immutable());
     assert_eq!(tree.state(), SyncState::Immutable);
 
     tree.clear_synching();
-    assert_eq!(tree.state(), SyncState::Modifying);
+    assert_eq!(tree.state(), SyncState::Immutable);
 
     let leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
@@ -1126,8 +1126,9 @@ fn shamap_sync_tree_state_and_root_wire_match_narrow_cpp_roles() {
     let invalid_root = SHAMapTreeNode::new_inner(0);
     let mut invalid_tree = SyncTree::from_root(invalid_root, false, 0, SyncState::Invalid);
     assert!(!invalid_tree.is_valid());
+    assert!(!invalid_tree.set_immutable());
     invalid_tree.clear_synching();
-    assert_eq!(invalid_tree.state(), SyncState::Modifying);
+    assert_eq!(invalid_tree.state(), SyncState::Invalid);
 
     let typed_tree = SyncTree::new_with_type(SHAMapType::Transaction, true, 13);
     assert_eq!(typed_tree.map_type(), SHAMapType::Transaction);

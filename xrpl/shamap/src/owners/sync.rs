@@ -36,7 +36,7 @@ use std::error::Error;
 use std::fmt;
 use std::hash::BuildHasher;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
 
 pub use crate::family::{FullBelowCache, NullFullBelowCache};
@@ -251,6 +251,7 @@ impl std::ops::AddAssign for SHAMapAddNode {
     }
 }
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncState {
     Modifying,
@@ -259,14 +260,39 @@ pub enum SyncState {
     Invalid,
 }
 
-#[derive(Debug, Clone)]
+impl SyncState {
+    fn from_atomic(value: u8) -> Self {
+        match value {
+            value if value == Self::Modifying as u8 => Self::Modifying,
+            value if value == Self::Immutable as u8 => Self::Immutable,
+            value if value == Self::Synching as u8 => Self::Synching,
+            value if value == Self::Invalid as u8 => Self::Invalid,
+            _ => unreachable!("sync state must be one of the declared values"),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct SyncTree {
     root: SharedIntrusive<SHAMapTreeNode>,
     map_type: SHAMapType,
     backed: bool,
     ledger_seq: u32,
-    state: SyncState,
+    state: AtomicU8,
     owner_fetch_state: OwnerBackedFetchState,
+}
+
+impl Clone for SyncTree {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            map_type: self.map_type,
+            backed: self.backed,
+            ledger_seq: self.ledger_seq,
+            state: AtomicU8::new(self.state.load(Ordering::Acquire)),
+            owner_fetch_state: self.owner_fetch_state.clone(),
+        }
+    }
 }
 
 impl SyncTree {
@@ -293,7 +319,7 @@ impl SyncTree {
             map_type,
             backed,
             ledger_seq,
-            state,
+            state: AtomicU8::new(state as u8),
             owner_fetch_state: OwnerBackedFetchState::default(),
         }
     }
@@ -319,7 +345,7 @@ impl SyncTree {
             map_type,
             backed,
             ledger_seq,
-            state,
+            state: AtomicU8::new(state as u8),
             owner_fetch_state: OwnerBackedFetchState::default(),
         }
     }
@@ -330,7 +356,7 @@ impl SyncTree {
             map_type: self.map_type,
             backed: self.backed,
             ledger_seq: self.ledger_seq,
-            state: SyncState::Modifying,
+            state: AtomicU8::new(SyncState::Modifying as u8),
             owner_fetch_state: OwnerBackedFetchState::default(),
         }
     }
@@ -354,7 +380,7 @@ impl SyncTree {
             map_type: self.map_type,
             backed: self.backed,
             ledger_seq: self.ledger_seq,
-            state: SyncState::Modifying,
+            state: AtomicU8::new(SyncState::Modifying as u8),
             owner_fetch_state: OwnerBackedFetchState::default(),
         }
     }
@@ -379,7 +405,7 @@ impl SyncTree {
     }
 
     pub fn state(&self) -> SyncState {
-        self.state
+        SyncState::from_atomic(self.state.load(Ordering::Acquire))
     }
 
     pub fn map_type(&self) -> SHAMapType {
@@ -415,19 +441,19 @@ impl SyncTree {
     }
 
     pub fn is_valid(&self) -> bool {
-        self.state != SyncState::Invalid
+        self.state() != SyncState::Invalid
     }
 
     pub fn is_synching(&self) -> bool {
-        self.state == SyncState::Synching
+        self.state() == SyncState::Synching
     }
 
     pub fn is_invalid(&self) -> bool {
-        self.state == SyncState::Invalid
+        self.state() == SyncState::Invalid
     }
 
     pub fn set_synching(&mut self) {
-        self.state = SyncState::Synching;
+        let _ = self.try_set_state(SyncState::Synching);
     }
 
     /// Release all loaded tree nodes from memory, leaving only the root hash
@@ -648,16 +674,40 @@ impl SyncTree {
         released
     }
 
-    pub fn set_immutable(&mut self) {
-        assert!(
-            self.state != SyncState::Invalid,
-            "invalid sync trees cannot become immutable"
-        );
-        self.state = SyncState::Immutable;
+    /// Invalid is terminal: it may win any concurrent settlement attempt, but
+    /// no later transition can reopen or finalize the map.
+    fn try_set_state(&self, desired: SyncState) -> bool {
+        if desired == SyncState::Invalid {
+            self.state.store(desired as u8, Ordering::Release);
+            return true;
+        }
+
+        let mut expected = self.state.load(Ordering::Acquire);
+        while SyncState::from_atomic(expected) != SyncState::Invalid {
+            match self.state.compare_exchange_weak(
+                expected,
+                desired as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => expected = actual,
+            }
+        }
+        false
+    }
+
+    pub fn set_immutable(&mut self) -> bool {
+        self.try_set_state(SyncState::Immutable)
     }
 
     pub fn clear_synching(&mut self) {
-        self.state = SyncState::Modifying;
+        let _ = self.state.compare_exchange(
+            SyncState::Synching as u8,
+            SyncState::Modifying as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     fn load_node_with_owner_family<CLOCK, S, FB, F, MR, NS>(
@@ -906,11 +956,9 @@ impl SyncTree {
     {
         if self.root.get_hash().is_non_zero() {
             report_event(AddRootNodeEvent::DuplicateRoot);
-            debug_assert_eq!(
-                self.root.get_hash(),
-                hash,
-                "existing non-empty sync root should match duplicate add_root_node hash"
-            );
+            if self.root.get_hash() != hash {
+                return SHAMapAddNode::invalid();
+            }
             return SHAMapAddNode::duplicate();
         }
 
@@ -1053,7 +1101,9 @@ impl SyncTree {
                 .expect("branch selection must stay within SHAMap depth bounds");
 
             let child_hash = curr_node_ref.get_child_hash(branch);
-            if full_below_cache.touch_if_exists(*child_hash.as_uint256()) {
+            if curr_node_id.get_depth() < crate::node_id::SHAMAP_LEAF_DEPTH
+                && full_below_cache.touch_if_exists(*child_hash.as_uint256())
+            {
                 return SHAMapAddNode::duplicate();
             }
 
@@ -1109,12 +1159,11 @@ impl SyncTree {
                 }
             }
 
-            if (curr_node_id.get_depth() > crate::node_id::SHAMAP_LEAF_DEPTH)
-                || (new_node.is_inner()
-                    && curr_node_id.get_depth() == crate::node_id::SHAMAP_LEAF_DEPTH)
+            if new_node.is_inner()
+                && curr_node_id.get_depth() >= crate::node_id::SHAMAP_LEAF_DEPTH
             {
-                self.state = SyncState::Invalid;
-                return SHAMapAddNode::useful();
+                let _ = self.try_set_state(SyncState::Invalid);
+                return SHAMapAddNode::invalid();
             }
 
             if curr_node_id != node_id {
@@ -1122,7 +1171,7 @@ impl SyncTree {
                     wanted: node_id,
                     stuck: curr_node_id,
                 });
-                return SHAMapAddNode::useful();
+                return SHAMapAddNode::invalid();
             }
 
             prepare_node(child_hash, &mut new_node);
@@ -1224,6 +1273,26 @@ impl SyncTree {
         })
     }
 
+    fn loaded_tree_has_invalid_shape(&self) -> bool {
+        let mut stack = vec![(self.root.clone(), 0usize)];
+        while let Some((node, depth)) = stack.pop() {
+            if !node.is_inner() {
+                continue;
+            }
+            if depth >= crate::node_id::SHAMAP_LEAF_DEPTH {
+                return true;
+            }
+            for branch in 0..BRANCH_FACTOR {
+                if !node.is_empty_branch(branch)
+                    && let Some(child) = node.get_child(branch)
+                {
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+        false
+    }
+
     pub fn get_missing_nodes<F, R, C>(
         &mut self,
         max: i32,
@@ -1237,6 +1306,9 @@ impl SyncTree {
         R: FnMut() -> u8,
         C: FullBelowCache,
     {
+        if !self.is_valid() {
+            return Vec::new();
+        }
         let missing = get_missing_nodes(
             &self.root,
             max,
@@ -1247,9 +1319,13 @@ impl SyncTree {
             full_below_cache,
             next_first_child,
         );
-        if missing.is_empty() {
+        if self.loaded_tree_has_invalid_shape() {
+            let _ = self.try_set_state(SyncState::Invalid);
+            return Vec::new();
+        }
+        if missing.is_empty() && self.is_valid() {
             self.clear_synching();
-        } else {
+        } else if !missing.is_empty() {
             let missing_count = missing.len();
             tracing::debug!(target: "shamap", missing_count, "Missing nodes identified");
         }
@@ -1271,6 +1347,9 @@ impl SyncTree {
         R: FnMut() -> u8,
         MR: MissingNodeReporter,
     {
+        if !self.is_valid() {
+            return Vec::new();
+        }
         let mut scan =
             self.start_deferred_missing_node_scan_with_family(max, family, next_first_child);
 
@@ -1307,7 +1386,11 @@ impl SyncTree {
         }
 
         let missing = scan.into_missing_nodes();
-        if missing.is_empty() {
+        if self.loaded_tree_has_invalid_shape() {
+            let _ = self.try_set_state(SyncState::Invalid);
+            return Vec::new();
+        }
+        if missing.is_empty() && self.is_valid() {
             self.clear_synching();
         }
         missing
@@ -1328,6 +1411,9 @@ impl SyncTree {
         R: FnMut() -> u8,
         MR: MissingNodeReporter,
     {
+        if !self.is_valid() {
+            return (Vec::new(), DeferredMissingNodeScanStats::default());
+        }
         let mut scan =
             self.start_deferred_missing_node_scan_with_family(max, family, next_first_child);
 
@@ -1364,7 +1450,11 @@ impl SyncTree {
         }
 
         let (missing, stats) = scan.into_missing_nodes_and_stats();
-        if missing.is_empty() {
+        if self.loaded_tree_has_invalid_shape() {
+            let _ = self.try_set_state(SyncState::Invalid);
+            return (Vec::new(), stats);
+        }
+        if missing.is_empty() && self.is_valid() {
             self.clear_synching();
         }
         (missing, stats)
@@ -1524,6 +1614,9 @@ impl SyncTree {
         COMPLETE:
             FnMut(Vec<DeferredFetchRequestInfo>) -> Vec<Option<SharedIntrusive<SHAMapTreeNode>>>,
     {
+        if !self.is_valid() {
+            return Vec::new();
+        }
         let mut scan =
             self.start_deferred_missing_node_scan_with_family(max, family, next_first_child);
 
@@ -1571,7 +1664,11 @@ impl SyncTree {
         }
 
         let missing = scan.into_missing_nodes();
-        if missing.is_empty() {
+        if self.loaded_tree_has_invalid_shape() {
+            let _ = self.try_set_state(SyncState::Invalid);
+            return Vec::new();
+        }
+        if missing.is_empty() && self.is_valid() {
             self.clear_synching();
         }
         missing
@@ -4210,12 +4307,17 @@ where
             continue;
         };
 
-        if child.is_inner() && !child.is_full_below(generation) {
-            let child_id = state
-                .node_id
-                .get_child_node_id(branch)
-                .expect("branch selection must stay within SHAMap depth bounds");
-            push_scan_state(&mut stack, child, child_id, next_first_child);
+        if child.is_inner() {
+            if state.node_id.get_depth() + 1 >= crate::node_id::SHAMAP_LEAF_DEPTH {
+                return Vec::new();
+            }
+            if !child.is_full_below(generation) {
+                let child_id = state
+                    .node_id
+                    .get_child_node_id(branch)
+                    .expect("branch selection must stay within SHAMap depth bounds");
+                push_scan_state(&mut stack, child, child_id, next_first_child);
+            }
         }
     }
 
@@ -4318,12 +4420,17 @@ where
             continue;
         };
 
-        if child.is_inner() && !child.is_full_below(generation) {
-            let child_id = state
-                .node_id
-                .get_child_node_id(branch)
-                .expect("branch selection must stay within SHAMap depth bounds");
-            push_scan_state(&mut stack, child, child_id, next_first_child);
+        if child.is_inner() {
+            if state.node_id.get_depth() + 1 >= crate::node_id::SHAMAP_LEAF_DEPTH {
+                return Vec::new();
+            }
+            if !child.is_full_below(generation) {
+                let child_id = state
+                    .node_id
+                    .get_child_node_id(branch)
+                    .expect("branch selection must stay within SHAMap depth bounds");
+                push_scan_state(&mut stack, child, child_id, next_first_child);
+            }
         }
     }
 

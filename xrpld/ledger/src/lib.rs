@@ -1982,7 +1982,9 @@ impl Ledger {
         rehash: bool,
         feature_xrp_fees: &Uint256,
     ) -> Result<bool, LedgerSetupError> {
-        self.finalize_immutable(rehash);
+        if !self.finalize_immutable(rehash) {
+            return Ok(false);
+        }
         self.setup_from_state_map(feature_xrp_fees)
     }
 
@@ -1991,7 +1993,9 @@ impl Ledger {
         rehash: bool,
         config: &LedgerConfig,
     ) -> Result<bool, LedgerSetupError> {
-        self.finalize_immutable(rehash);
+        if !self.finalize_immutable(rehash) {
+            return Ok(false);
+        }
         self.setup_from_state_map_with_config(config)
     }
 
@@ -2005,7 +2009,10 @@ impl Ledger {
         tracing::debug!(target: "ledger", seq, state_entries, "Ledger state size");
     }
 
-    fn finalize_immutable(&mut self, rehash: bool) {
+    fn finalize_immutable(&mut self, rehash: bool) -> bool {
+        if !self.tx_map.is_valid() || !self.state_map.is_valid() {
+            return false;
+        }
         if !self.immutable && rehash {
             // Only recompute tx_hash if the tx map has content
             let tx_hash = self.tx_map.hash();
@@ -2026,34 +2033,44 @@ impl Ledger {
             self.header.hash = calculate_ledger_hash(&self.header);
         }
 
+        if !self.tx_map.set_immutable() || !self.state_map.set_immutable() {
+            return false;
+        }
         self.immutable = true;
-        self.tx_map.set_immutable();
-        self.state_map.set_immutable();
 
         {
             let seq = self.header.seq;
             let hash = self.header.account_hash;
             tracing::debug!(target: "ledger", seq, account_hash = %hash, tx_hash = %self.header.tx_hash, "Ledger immutable — hashes computed");
         }
+        true
     }
 
     /// Mark the ledger as immutable without rehashing or running
     /// setup_from_state_map. Used during catchup when the state map
     /// may not be fully traversable.
-    pub fn finalize_immutable_no_setup(&mut self) {
+    pub fn finalize_immutable_no_setup(&mut self) -> bool {
+        if !self.tx_map.is_valid() || !self.state_map.is_valid() {
+            return false;
+        }
+        if !self.tx_map.set_immutable() || !self.state_map.set_immutable() {
+            return false;
+        }
         self.immutable = true;
-        self.tx_map.set_immutable();
-        self.state_map.set_immutable();
+        true
     }
 
-    pub fn set_immutable(&mut self, rehash: bool) {
-        self.finalize_immutable(rehash);
+    pub fn set_immutable(&mut self, rehash: bool) -> bool {
+        if !self.finalize_immutable(rehash) {
+            return false;
+        }
 
         if let Err(error) = self.setup_from_state_map(&feature_xrp_fees())
             && !matches!(error, LedgerSetupError::Traversal(_))
         {
             panic!("xrpl::Ledger::setImmutable : setup failed: {error:?}");
         }
+        true
     }
 
     /// Walks the loaded subtree bottom-up, computes hashes, marks nodes
@@ -2426,7 +2443,7 @@ impl Ledger {
         close_time: u32,
         close_resolution: u8,
         correct_close_time: bool,
-    ) {
+    ) -> bool {
         self.header.close_time = close_time;
         self.header.close_time_resolution = close_resolution;
         self.header.close_flags = if correct_close_time {
@@ -2434,7 +2451,7 @@ impl Ledger {
         } else {
             SLCF_NO_CONSENSUS_TIME
         };
-        self.set_immutable(true);
+        self.set_immutable(true)
     }
 
     pub fn set_accepted_and_setup_from_state_map(
@@ -2451,7 +2468,9 @@ impl Ledger {
         } else {
             SLCF_NO_CONSENSUS_TIME
         };
-        self.finalize_immutable(true);
+        if !self.finalize_immutable(true) {
+            return Ok(false);
+        }
         self.setup_from_state_map(feature_xrp_fees)
     }
 
@@ -2469,7 +2488,9 @@ impl Ledger {
         } else {
             SLCF_NO_CONSENSUS_TIME
         };
-        self.finalize_immutable(true);
+        if !self.finalize_immutable(true) {
+            return Ok(false);
+        }
         self.setup_from_state_map_with_config(config)
     }
 
