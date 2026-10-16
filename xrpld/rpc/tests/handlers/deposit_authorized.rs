@@ -397,6 +397,58 @@ fn deposit_authorized_accepts_direct_and_credential_preauth() {
 }
 
 #[test]
+fn deposit_authorized_rejects_zero_credential_ids() {
+    let src = sample_account(0x11);
+    let dst = sample_account(0x22);
+    let mut source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    source
+        .account_roots
+        .insert(src, make_account_root(src, false));
+    source
+        .account_roots
+        .insert(dst, make_account_root(dst, true));
+
+    // The zero key cannot name a Credential SLE, even if a source mistakenly
+    // exposes one at that key.
+    source.entries.insert(
+        Uint256::zero(),
+        make_credential(src, sample_account(0x31), b"zero", true, None),
+    );
+
+    for zero in ["0", &"0".repeat(64)] {
+        let result = do_deposit_authorized(
+            &DepositAuthorizedRequest {
+                params: &object([
+                    ("source_account", JsonValue::String(to_base58(src))),
+                    ("destination_account", JsonValue::String(to_base58(dst))),
+                    (
+                        "credentials",
+                        JsonValue::Array(vec![JsonValue::String(zero.to_owned())]),
+                    ),
+                ]),
+                api_version: 1,
+                role: RpcRole::Admin,
+            },
+            &source,
+        );
+        let JsonValue::Object(result) = result else {
+            panic!("zero credential response must be an object");
+        };
+        assert_eq!(
+            result.get("error"),
+            Some(&JsonValue::String("badCredentials".to_owned()))
+        );
+        assert_eq!(
+            result.get("error_message"),
+            Some(&JsonValue::String("credentials don't exist".to_owned()))
+        );
+    }
+}
+
+#[test]
 fn deposit_authorized_rejects_bad_credentials() {
     let src = sample_account(0x11);
     let dst = sample_account(0x22);
