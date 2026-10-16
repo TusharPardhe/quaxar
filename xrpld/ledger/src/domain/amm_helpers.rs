@@ -4,10 +4,7 @@ use basics::number::{
     NumberParts as RuntimeNumber, NumberRoundModeGuard, RoundingMode, SaveNumberRoundMode,
     get_rounding_mode, root2, set_rounding_mode,
 };
-use protocol::{
-    IOUAmount, Issue, Quality, STAmount, XRPAmount, fix_ammv1_1, fix_ammv1_3,
-    get_current_transaction_rules, get_fee, is_feature_enabled,
-};
+use protocol::{IOUAmount, Issue, Quality, STAmount, XRPAmount, fix_ammv1_3, get_fee, is_feature_enabled};
 
 fn number_from_i64(value: i64) -> RuntimeNumber {
     RuntimeNumber::try_from_external_parts(value, 0, basics::number::get_mantissa_scale())
@@ -36,10 +33,6 @@ pub fn to_st_amount(issue: Issue, amount: RuntimeNumber) -> STAmount {
             issue,
         )
     }
-}
-
-fn is_amm_rounding_enabled() -> bool {
-    get_current_transaction_rules().is_some_and(|rules| rules.enabled(&fix_ammv1_1()))
 }
 
 fn lp_token_rounding(is_deposit: IsDeposit) -> RoundingMode {
@@ -311,7 +304,6 @@ pub fn adjust_amounts_by_lp_tokens(
     }
 
     if lp_tokens_actual < *lp_tokens {
-        let amm_rounding_enabled = is_amm_rounding_enabled();
         if let Some(amount2) = amount2 {
             let fr = stamount_as_number(&lp_tokens_actual) / stamount_as_number(lp_tokens);
             let amount_actual = protocol::to_amount_from_number(
@@ -319,20 +311,13 @@ pub fn adjust_amounts_by_lp_tokens(
                 fr * stamount_as_number(amount),
                 get_rounding_mode(),
             )
-            .expect("legacy AMM asset amount should remain representable");
+            .expect("AMM asset amount should remain representable");
             let amount2_actual = protocol::to_amount_from_number(
                 amount2.asset(),
                 fr * stamount_as_number(amount2),
                 get_rounding_mode(),
             )
-            .expect("legacy AMM asset amount should remain representable");
-            if !amm_rounding_enabled {
-                return (
-                    std::cmp::min(amount_actual, amount.clone()),
-                    Some(std::cmp::min(amount2_actual, amount2.clone())),
-                    lp_tokens_actual,
-                );
-            }
+            .expect("AMM asset amount should remain representable");
             return (amount_actual, Some(amount2_actual), lp_tokens_actual);
         }
 
@@ -340,20 +325,10 @@ pub fn adjust_amounts_by_lp_tokens(
             IsDeposit::Yes => {
                 amm_asset_in(amount_balance, lpt_amm_balance, &lp_tokens_actual, tfee)
             }
-            IsDeposit::No if !amm_rounding_enabled => {
-                amm_asset_out(amount_balance, lpt_amm_balance, lp_tokens, tfee)
-            }
             IsDeposit::No => {
                 amm_asset_out(amount_balance, lpt_amm_balance, &lp_tokens_actual, tfee)
             }
         };
-        if !amm_rounding_enabled {
-            return (
-                std::cmp::min(amount_actual, amount.clone()),
-                None,
-                lp_tokens_actual,
-            );
-        }
         return (amount_actual, None, lp_tokens_actual);
     }
 

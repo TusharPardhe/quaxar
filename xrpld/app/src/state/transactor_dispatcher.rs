@@ -6124,23 +6124,20 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 if mpt_result != Ter::TES_SUCCESS {
                     return mpt_result;
                 }
-                let mut lp_total = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
                 let account_lp_tokens = match amm_lp_holds_in_view(view, &amm_sle, account) {
                     Ok(Some(amount)) => amount,
                     Ok(None) => return Ter::TEC_AMM_BALANCE,
                     Err(_) => return Ter::TEF_BAD_LEDGER,
                 };
-                if view.rules().enabled(&protocol::feature_id("fixAMMv1_1")) {
-                    if let Err(ter) = ledger::verify_and_adjust_lp_token_balance(
-                        view,
-                        &account_lp_tokens,
-                        &mut amm_sle,
-                        account,
-                    ) {
-                        return ter;
-                    }
-                    lp_total = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
+                if let Err(ter) = ledger::verify_and_adjust_lp_token_balance(
+                    view,
+                    &account_lp_tokens,
+                    &mut amm_sle,
+                    account,
+                ) {
+                    return ter;
                 }
+                let lp_total = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
                 let lp_issue = lp_total.issue();
                 let trading_fee = ledger::get_trading_fee(view, &amm_sle, account);
                 let pool_asset1 = amount.as_ref().map(STAmount::asset).unwrap_or(asset1);
