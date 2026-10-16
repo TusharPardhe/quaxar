@@ -6951,6 +6951,7 @@ impl ApplicationRoot {
     ) -> Result<Arc<AppOverlayRuntime>, String> {
         let runtime = build_overlay_runtime(
             config,
+            self.standalone(),
             self.server_ports_setup.as_deref(),
             handoff,
             Some(self.network_ops_mode_owner()),

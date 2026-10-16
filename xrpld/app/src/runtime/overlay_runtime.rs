@@ -543,6 +543,8 @@ pub struct AppOverlayRuntime {
     /// A mixed peer+HTTP/WS port is bound by the server runtime exactly once.
     /// The overlay retains its TLS/handshake configuration but must not bind it.
     server_owns_listener: bool,
+    /// `true` means standalone mode: no peerfinder bootstrap or DNS work.
+    standalone: bool,
     fixed_peer_endpoints: Vec<String>,
     bootstrap_peer_endpoints: Vec<String>,
     /// `false` for `[peer_private]`, matching rippled's `autoConnect`.
@@ -563,6 +565,7 @@ impl std::fmt::Debug for AppOverlayRuntime {
             .field("network_id", &self.network_id())
             .field("listener_setup", &self.listener_setup)
             .field("server_owns_listener", &self.server_owns_listener)
+            .field("standalone", &self.standalone)
             .field("fixed_peer_endpoints", &self.fixed_peer_endpoints)
             .field("bootstrap_peer_endpoints", &self.bootstrap_peer_endpoints)
             .field(
@@ -581,6 +584,7 @@ impl AppOverlayRuntime {
         overlay: Arc<OverlayImpl>,
         listener_setup: Option<ServerPortOverlaySetup>,
         server_owns_listener: bool,
+        standalone: bool,
         fixed_peer_endpoints: Vec<String>,
         bootstrap_peer_endpoints: Vec<String>,
         bootstrap_can_dial_bootcache: bool,
@@ -592,6 +596,7 @@ impl AppOverlayRuntime {
             overlay,
             listener_setup,
             server_owns_listener,
+            standalone,
             fixed_peer_endpoints,
             bootstrap_peer_endpoints,
             bootstrap_can_dial_bootcache,
@@ -654,47 +659,49 @@ impl ManagedComponent for AppOverlayRuntime {
             "overlay runtime requires an active tokio runtime before start".to_owned()
         })?;
 
-        let overlay = Arc::clone(&self.overlay);
-        let fixed_endpoints = self.fixed_peer_endpoints.clone();
-        let endpoints = self.bootstrap_peer_endpoints.clone();
-        let peerfinder_bootcache_path = self.peerfinder_bootcache_path.clone();
-        let network_ops_mode_owner = self.network_ops_mode_owner.clone();
-        let status_rpc_state = self.status_rpc_state.clone();
-        let target_outbound_peers = overlay.peer_limits().outbound_max;
-        let auto_connect = self.bootstrap_can_dial_bootcache;
-        let peerfinder_thread = std::thread::Builder::new()
-            .name("quaxar-peerfinder".to_owned())
-            .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        tracing::error!(target: "peerfinder", %error,
-                            "PeerFinder runtime failed to start");
-                        return;
-                    }
-                };
-                runtime.block_on(run_live_peerfinder(
-                    overlay,
-                    fixed_endpoints,
-                    endpoints,
-                    peerfinder_bootcache_path,
-                    auto_connect,
-                    target_outbound_peers,
-                    network_ops_mode_owner,
-                    status_rpc_state,
-                ));
-            })
-            .map_err(|error| {
-                self.rollback_started(format!("PeerFinder worker start failed: {error}"))
-            })?;
-        *self
-            .peerfinder_thread
-            .lock()
-            .expect("overlay PeerFinder worker mutex must not be poisoned") =
-            Some(peerfinder_thread);
+        if !self.standalone {
+            let overlay = Arc::clone(&self.overlay);
+            let fixed_endpoints = self.fixed_peer_endpoints.clone();
+            let endpoints = self.bootstrap_peer_endpoints.clone();
+            let peerfinder_bootcache_path = self.peerfinder_bootcache_path.clone();
+            let network_ops_mode_owner = self.network_ops_mode_owner.clone();
+            let status_rpc_state = self.status_rpc_state.clone();
+            let target_outbound_peers = overlay.peer_limits().outbound_max;
+            let auto_connect = self.bootstrap_can_dial_bootcache;
+            let peerfinder_thread = std::thread::Builder::new()
+                .name("quaxar-peerfinder".to_owned())
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            tracing::error!(target: "peerfinder", %error,
+                                "PeerFinder runtime failed to start");
+                            return;
+                        }
+                    };
+                    runtime.block_on(run_live_peerfinder(
+                        overlay,
+                        fixed_endpoints,
+                        endpoints,
+                        peerfinder_bootcache_path,
+                        auto_connect,
+                        target_outbound_peers,
+                        network_ops_mode_owner,
+                        status_rpc_state,
+                    ));
+                })
+                .map_err(|error| {
+                    self.rollback_started(format!("PeerFinder worker start failed: {error}"))
+                })?;
+            *self
+                .peerfinder_thread
+                .lock()
+                .expect("overlay PeerFinder worker mutex must not be poisoned") =
+                Some(peerfinder_thread);
+        }
 
         if let Some(listener_setup) = self.listener_setup.as_ref()
             && !self.server_owns_listener
@@ -1346,6 +1353,7 @@ fn legacy_bool(config: &BasicConfig, section: &str) -> Result<Option<bool>, Stri
 
 pub fn build_overlay_runtime(
     config: &BasicConfig,
+    standalone: bool,
     server_ports_setup: Option<&ServerPortsSetup>,
     handoff: Arc<dyn OverlayHandoff>,
     network_ops_mode_owner: Option<AppNetworkOpsModeOwner>,
@@ -1353,8 +1361,16 @@ pub fn build_overlay_runtime(
 ) -> Result<Arc<AppOverlayRuntime>, String> {
     let mut setup = build_overlay_setup(config)?;
     let peer_private = parse_peer_private(config)?;
-    let fixed_peer_endpoints = parse_peer_endpoints(config, "ips_fixed")?;
-    let bootstrap_peer_endpoints = parse_bootstrap_peer_endpoints(config, &fixed_peer_endpoints)?;
+    let fixed_peer_endpoints = if standalone {
+        Vec::new()
+    } else {
+        parse_peer_endpoints(config, "ips_fixed")?
+    };
+    let bootstrap_peer_endpoints = if standalone {
+        Vec::new()
+    } else {
+        parse_bootstrap_peer_endpoints(config, &fixed_peer_endpoints)?
+    };
     let peerfinder_bootcache_path = config
         .legacy("database_path")
         .ok()
@@ -1380,9 +1396,10 @@ pub fn build_overlay_runtime(
         overlay,
         listener_setup,
         server_owns_listener,
+        standalone,
         fixed_peer_endpoints,
         bootstrap_peer_endpoints,
-        !peer_private,
+        !standalone && !peer_private,
         peerfinder_bootcache_path,
         network_ops_mode_owner,
         status_rpc_state,
@@ -2165,6 +2182,7 @@ tx_min_peers = 9
     fn managed_overlay_runtime_reports_listener_budget_and_lifecycle() {
         let runtime = build_overlay_runtime(
             &config(""),
+            false,
             Some(&crate::ServerPortsSetup {
                 ports: Vec::new(),
                 client: None,
@@ -2325,12 +2343,47 @@ tx_min_peers = 9
     }
 
     #[test]
+    fn standalone_skips_bootstrap_and_fixed_peer_dns_work() {
+        let configured = config(
+            "[ips]\nbootstrap.example.com 51235\n[ips_fixed]\nfixed.example.com 51236\n",
+        );
+        let runtime = build_overlay_runtime(
+            &configured,
+            true,
+            None,
+            Arc::new(BootstrapOverlayHandoff),
+            None,
+            None,
+        )
+        .expect("standalone runtime");
+
+        assert!(runtime.fixed_peer_endpoints.is_empty());
+        assert!(runtime.bootstrap_peer_endpoints.is_empty());
+        assert!(!runtime.bootstrap_can_dial_bootcache());
+
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        tokio_runtime.block_on(async { runtime.start().expect("start") });
+        assert!(
+            runtime
+                .peerfinder_thread
+                .lock()
+                .expect("peerfinder worker lock")
+                .is_none()
+        );
+        runtime.stop();
+    }
+
+    #[test]
     fn peer_private_disables_automatic_bootcache_dials_but_keeps_fixed_peers() {
         let configured = config(
             "[peer_private]\n1\n[ips_fixed]\nfixed.example.com 51236\n[ips]\nbootstrap.example.com 51235\n",
         );
         let runtime = build_overlay_runtime(
             &configured,
+            false,
             None,
             Arc::new(BootstrapOverlayHandoff),
             None,
@@ -2354,6 +2407,7 @@ tx_min_peers = 9
         let ports = crate::ServerPortsSetup::from_config(&configured, false).expect("server ports");
         let runtime = build_overlay_runtime(
             &configured,
+            false,
             Some(&ports),
             Arc::new(BootstrapOverlayHandoff),
             None,

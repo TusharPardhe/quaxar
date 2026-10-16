@@ -120,6 +120,7 @@ fn build_overlay_runtime_keeps_server_port_budget_separate_from_overlay_peer_bud
 
     let runtime = build_overlay_runtime(
         &config,
+        false,
         root.server_ports_setup().as_deref(),
         Arc::new(BootstrapOverlayHandoff),
         None,
