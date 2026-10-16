@@ -111,7 +111,8 @@ fn truncated_blobs_dont_panic() {
             let mut iter = SerialIter::new(truncated);
             // This should not panic — it may produce a partial/invalid tx
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = STTx::from_serial_iter(&mut iter);
+                // rippled throws; the fallible form returns the error.
+            let _ = STTx::try_from_serial_iter(&mut iter);
             }));
         }
     }
@@ -132,7 +133,8 @@ fn garbage_bytes_dont_panic() {
     for (i, garbage) in garbage_inputs.iter().enumerate() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut iter = SerialIter::new(garbage);
-            let _ = STTx::from_serial_iter(&mut iter);
+            // rippled throws; the fallible form returns the error.
+            let _ = STTx::try_from_serial_iter(&mut iter);
         }));
         assert!(
             result.is_ok(),
