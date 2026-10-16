@@ -11,6 +11,17 @@ use protocol::{
 };
 use std::collections::BTreeMap;
 
+/// rippled VaultInvariant `feeAdjustedWithdrawal` (#8267).
+fn is_fee_adjusted_withdrawal(
+    fix_cleanup_3_5_0: bool,
+    distinct_destination: bool,
+    native: bool,
+    submitter_is_issuer: bool,
+    rate: Rate,
+) -> bool {
+    fix_cleanup_3_5_0 && distinct_destination && !native && !submitter_is_issuer && rate != PARITY_RATE
+}
+
 fn vault_transfer_rate(view: &impl ReadView, asset: Asset) -> Result<Rate, ledger::ViewError> {
     match asset {
         Asset::Issue(issue) if issue.native() => Ok(PARITY_RATE),
@@ -957,29 +968,31 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                         local_scale,
                         RoundingMode::ToNearest,
                     );
-                    let fee_adjusted_withdrawal = sandbox
-                        .rules()
-                        .enabled(&protocol::feature_id("fixCleanup3_5_0"))
-                        && Some(destination) != tx_account
-                        && !after_vault.asset.native()
-                        && tx_account != Some(asset_issuer(after_vault.asset));
+                    // rippled VaultInvariant: `rate != kParityRate` is part of the
+                    // predicate, so a parity-rate withdrawal keeps the sub-ULP
+                    // tolerance below.
+                    let rate = match vault_transfer_rate(sandbox, after_vault.asset) {
+                        Ok(rate) => rate,
+                        Err(_) => return false,
+                    };
+                    let fee_adjusted_withdrawal = is_fee_adjusted_withdrawal(
+                        sandbox
+                            .rules()
+                            .enabled(&protocol::feature_id("fixCleanup3_5_0")),
+                        Some(destination) != tx_account,
+                        after_vault.asset.native(),
+                        tx_account == Some(asset_issuer(after_vault.asset)),
+                        rate,
+                    );
                     let expected_destination = if fee_adjusted_withdrawal {
-                        let rate = match vault_transfer_rate(sandbox, after_vault.asset) {
-                            Ok(rate) => rate,
+                        let source = match after_vault.asset.amount(-local_pseudo_delta) {
+                            Ok(amount) => amount,
                             Err(_) => return false,
                         };
-                        if rate == PARITY_RATE {
-                            -local_pseudo_delta
-                        } else {
-                            let source = match after_vault.asset.amount(-local_pseudo_delta) {
-                                Ok(amount) => amount,
-                                Err(_) => return false,
-                            };
-                            let Some(net) = subtract_vault_transfer_fee(&source, rate) else {
-                                return false;
-                            };
-                            amount_to_number(&net)
-                        }
+                        let Some(net) = subtract_vault_transfer_fee(&source, rate) else {
+                            return false;
+                        };
+                        amount_to_number(&net)
                     } else {
                         -local_pseudo_delta
                     };
@@ -1143,5 +1156,23 @@ mod tests {
         assert!(!valid_v1_1_vault_lifecycle(TxType::LOAN_SET, &vault, 100));
         assert!(valid_v1_1_vault_lifecycle(TxType::LOAN_SET, &vault, 101));
         assert!(!valid_v1_1_vault_lifecycle(TxType::LOAN_SET, &vault, 280));
+    }
+}
+
+#[cfg(test)]
+mod fee_adjusted_withdrawal_tests {
+    use super::{PARITY_RATE, is_fee_adjusted_withdrawal};
+
+    /// rippled 7237b3321c: a parity-rate asset charges no fee, so the
+    /// withdrawal is not fee-adjusted and keeps the sub-ULP tolerance.
+    #[test]
+    fn parity_rate_withdrawal_is_not_fee_adjusted_like_rippled() {
+        let fee = super::Rate::new(1_005_000_000);
+        assert!(is_fee_adjusted_withdrawal(true, true, false, false, fee));
+        assert!(!is_fee_adjusted_withdrawal(true, true, false, false, PARITY_RATE));
+        assert!(!is_fee_adjusted_withdrawal(false, true, false, false, fee));
+        assert!(!is_fee_adjusted_withdrawal(true, false, false, false, fee));
+        assert!(!is_fee_adjusted_withdrawal(true, true, true, false, fee));
+        assert!(!is_fee_adjusted_withdrawal(true, true, false, true, fee));
     }
 }
