@@ -1,4 +1,34 @@
 //! `MPTAmount` port from `xrpl/protocol/MPTAmount.h`.
+#[cfg(test)]
+mod tests {
+    use super::MPTAmount;
+    use crate::{CurrentTransactionRulesGuard, Rules, fix_cleanup_3_5_0};
+
+    fn assert_overflow(operation: impl FnOnce()) {
+        let payload = basics::contract::try_catch(operation).expect_err("overflow must unwind");
+        assert!(basics::contract::exception_kind(payload.as_ref()).is_overflow());
+    }
+
+    #[test]
+    fn cleanup_3_5_mpt_amount_overflow_throws_and_preserves_lhs() {
+        let _rules = CurrentTransactionRulesGuard::new(Rules::new([fix_cleanup_3_5_0()]));
+
+        let mut max = MPTAmount::from_value(i64::MAX);
+        assert_overflow(|| max += MPTAmount::from_value(1));
+        assert_eq!(max, MPTAmount::from_value(i64::MAX));
+
+        let mut min = MPTAmount::from_value(i64::MIN);
+        assert_overflow(|| min -= MPTAmount::from_value(1));
+        assert_eq!(min, MPTAmount::from_value(i64::MIN));
+    }
+
+    #[test]
+    fn mpt_amount_overflow_defaults_to_cleanup_behavior_without_rules() {
+        let mut amount = MPTAmount::from_value(i64::MAX);
+        assert_overflow(|| amount += MPTAmount::from_value(1));
+        assert_eq!(amount, MPTAmount::from_value(i64::MAX));
+    }
+}
 
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
@@ -73,14 +103,26 @@ impl From<MPTAmount> for bool {
     }
 }
 
-// rippled `MPTAmount::operator+=` / `operator-=` are unchecked `int64` adds
-// (`value_ += other`), which wrap on every platform rippled ships. Keep
-// the same wrapping semantics so results stay identical to rippled; callers
-// that must reject overflow use explicit checked arithmetic, as rippled does
-// with `checkedAdd` (see `protocol::checked_step_add`).
+// rippled #8453: fixCleanup3_5_0 changes MPTAmount overflow from legacy
+// signed arithmetic to std::overflow_error. With no transaction rules (RPC
+// and pathfinding), rippled applies the fixed behavior.
+fn checked_or_legacy_overflow(result: Option<i64>, legacy: impl FnOnce() -> i64, operation: &str) -> i64 {
+    match result {
+        Some(value) => value,
+        None if crate::is_feature_enabled_or(&crate::fix_cleanup_3_5_0(), true) => {
+            basics::contract::throw_overflow(operation)
+        }
+        None => legacy(),
+    }
+}
+
 impl AddAssign for MPTAmount {
     fn add_assign(&mut self, rhs: Self) {
-        self.value = self.value.wrapping_add(rhs.value);
+        self.value = checked_or_legacy_overflow(
+            self.value.checked_add(rhs.value),
+            || self.value.wrapping_add(rhs.value),
+            "MPTAmount::operator+= overflow",
+        );
     }
 }
 
@@ -95,7 +137,11 @@ impl Add for MPTAmount {
 
 impl SubAssign for MPTAmount {
     fn sub_assign(&mut self, rhs: Self) {
-        self.value = self.value.wrapping_sub(rhs.value);
+        self.value = checked_or_legacy_overflow(
+            self.value.checked_sub(rhs.value),
+            || self.value.wrapping_sub(rhs.value),
+            "MPTAmount::operator-= overflow",
+        );
     }
 }
 
