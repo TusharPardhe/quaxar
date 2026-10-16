@@ -193,16 +193,21 @@ fn amendment_table_validated_ledger_tracks_first_unsupported_expected_time() {
     assert!(!table.has_unsupported_enabled());
 }
 
+/// rippled features.macro declares all of these `Supported::Yes`.
 #[test]
-fn default_amendment_registry_keeps_unproven_public_testnet_fixes_unsupported() {
+fn default_amendment_registry_supports_fixes_rippled_supports() {
     let table = AmendmentStatus::new();
 
-    assert!(!table.is_supported(feature_id("fixCleanup3_1_3")));
-    assert!(!table.is_supported(feature_id("fixIncludeKeyletFields")));
-    assert!(!table.is_supported(feature_id("fixTokenEscrowV1")));
-    assert!(!table.is_supported(feature_id("fixPriceOracleOrder")));
-    assert!(!table.is_supported(feature_id("fixMPTDeliveredAmount")));
-    assert!(!table.is_supported(feature_id("fixAMMClawbackRounding")));
+    for name in [
+        "fixCleanup3_1_3",
+        "fixIncludeKeyletFields",
+        "fixTokenEscrowV1",
+        "fixPriceOracleOrder",
+        "fixMPTDeliveredAmount",
+        "fixAMMClawbackRounding",
+    ] {
+        assert!(table.is_supported(feature_id(name)), "{name}");
+    }
 }
 
 #[test]

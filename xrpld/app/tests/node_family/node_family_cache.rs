@@ -107,7 +107,14 @@ fn node_family_exposes_tree_node_cache_keys_without_mutating_cache_state() {
     keys.clear();
     assert_eq!(node_family.tree_node_cache_keys().len(), 2);
 
+    // rippled TaggedCache::sweepHelper: an expired strong entry that is still
+    // referenced elsewhere stays weakly cached; once unreferenced, the next
+    // sweep removes it.
     clock.advance_seconds(2);
+    node_family.sweep();
+    assert_eq!(node_family.tree_node_cache_keys().len(), 2);
+    drop(first_node);
+    drop(second_node);
     node_family.sweep();
     assert!(node_family.tree_node_cache_keys().is_empty());
 
@@ -119,7 +126,7 @@ fn node_family_exposes_tree_node_cache_keys_without_mutating_cache_state() {
         .expect("full-below cache mutex must not be poisoned");
     assert_eq!(full_below.generation, 1);
     assert_eq!(full_below.inserted, Vec::<Uint256>::new());
-    assert_eq!(full_below.sweeps, 1);
+    assert_eq!(full_below.sweeps, 2);
     assert_eq!(full_below.clears, 1);
     assert_eq!(full_below.resets, 1);
 }

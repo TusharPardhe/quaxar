@@ -96,8 +96,6 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     // release-3.1: cleanup for expired NFT offers, MPToken locked amount,
     // credential deletion errors, PermissionedDEX hybrid validation.
-    // Enabled on public testnet, but retained as unsupported until the complete
-    // multi-domain consensus/replay parity matrix is certified.
     RegisteredFeature::new("fixCleanup3_1_3", true, RegisteredFeatureVote::DefaultYes),
     RegisteredFeature::new(
         FIX_CLEANUP_3_2_0_NAME,
