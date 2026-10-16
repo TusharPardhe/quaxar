@@ -289,6 +289,9 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
     let fix_cleanup_3_2_0 = sandbox
         .rules()
         .enabled(&protocol::feature_id("fixCleanup3_2_0"));
+    let fix_cleanup_3_5_0 = sandbox
+        .rules()
+        .enabled(&protocol::fix_cleanup_3_5_0());
     let amm_invariant_enabled =
         fix_cleanup_3_2_0 || sandbox.rules().enabled(&protocol::fix_ammv1_3());
     let single_asset_vault_enabled = sandbox
@@ -306,7 +309,8 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
         || mptokens_v2_enabled
         || sandbox
             .rules()
-            .enabled(&protocol::feature_id("fixCleanup3_4_0"));
+            .enabled(&protocol::feature_id("fixCleanup3_4_0"))
+        || fix_cleanup_3_5_0;
     let permissioned_dex_invariant_enabled = fix_cleanup_3_2_0
         || sandbox
             .rules()
@@ -1251,6 +1255,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
             cross_currency_payment,
             fix_cleanup_3_2_0,
             fix_cleanup_3_4_0,
+            fix_cleanup_3_5_0,
             mptokens_v2_enabled,
             loan_default_accounts.as_ref(),
             &pseudo_accounts_before,

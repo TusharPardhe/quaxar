@@ -372,6 +372,8 @@ pub(super) fn record_mpt_transfer(
 pub(super) fn mpt_transfer_waives_can_transfer(
     txn_type: protocol::TxType,
     fix_cleanup_3_2_0: bool,
+    fix_cleanup_3_5_0: bool,
+    loan_default_asset: bool,
 ) -> bool {
     txn_type == protocol::TxType::AMM_WITHDRAW
         || (fix_cleanup_3_2_0
@@ -381,6 +383,8 @@ pub(super) fn mpt_transfer_waives_can_transfer(
                     | protocol::TxType::LOAN_BROKER_COVER_WITHDRAW
                     | protocol::TxType::LOAN_PAY
             ))
+        || (fix_cleanup_3_5_0
+            && (loan_default_asset || txn_type == protocol::TxType::LOAN_BROKER_DELETE))
 }
 
 pub(super) fn mpt_transfer_is_dex(
@@ -406,6 +410,7 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
     cross_currency_payment: bool,
     fix_cleanup_3_2_0: bool,
     fix_cleanup_3_4_0: bool,
+    fix_cleanup_3_5_0: bool,
     mptokens_v2_enabled: bool,
     loan_default_accounts: Option<&LoanDefaultFreezeExemptAccounts>,
     pseudo_accounts_before: &BTreeMap<AccountID, bool>,
@@ -436,14 +441,19 @@ pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
         }
         let issuance = issuance.expect("checked above");
 
-        let can_transfer = issuance.is_flag(protocol::lsfMPTCanTransfer)
-            || mpt_transfer_waives_can_transfer(txn_type, fix_cleanup_3_2_0);
-        let can_trade = issuance.is_flag(protocol::lsfMPTCanTrade);
-        let req_auth = issuance.is_flag(protocol::lsfMPTRequireAuth);
-        let issue = protocol::MPTIssue::new(*mpt_id);
         let loan_default_asset = loan_default_accounts.is_some_and(|accounts| {
             matches!(accounts.asset, protocol::Asset::MPTIssue(expected) if expected.mpt_id() == *mpt_id)
         });
+        let can_transfer = issuance.is_flag(protocol::lsfMPTCanTransfer)
+            || mpt_transfer_waives_can_transfer(
+                txn_type,
+                fix_cleanup_3_2_0,
+                fix_cleanup_3_5_0,
+                loan_default_asset,
+            );
+        let can_trade = issuance.is_flag(protocol::lsfMPTCanTrade);
+        let req_auth = issuance.is_flag(protocol::lsfMPTRequireAuth);
+        let issue = protocol::MPTIssue::new(*mpt_id);
 
         let mut senders = 0_u16;
         let mut receivers = 0_u16;
@@ -821,7 +831,8 @@ pub(super) fn validates_mpt_lifecycle_counts(
 #[cfg(test)]
 mod tests {
     use super::{
-        MptIssuanceLifecycle, validates_mpt_issuance_lifecycle, validates_mpt_lifecycle_counts,
+        MptIssuanceLifecycle, mpt_transfer_waives_can_transfer,
+        validates_mpt_issuance_lifecycle, validates_mpt_lifecycle_counts,
     };
     use protocol::{Ter, TxType};
 
@@ -875,5 +886,33 @@ mod tests {
         assert!(validates(TxType::VAULT_WITHDRAW, true, 1, 1));
         assert!(!validates(TxType::VAULT_WITHDRAW, true, 2, 0));
         assert!(!validates(TxType::VAULT_WITHDRAW, true, 0, 2));
+    }
+
+    #[test]
+    fn cleanup_3_5_waives_only_broker_delete_or_matching_loan_default_asset() {
+        assert!(!mpt_transfer_waives_can_transfer(
+            TxType::LOAN_BROKER_DELETE,
+            false,
+            false,
+            false,
+        ));
+        assert!(mpt_transfer_waives_can_transfer(
+            TxType::LOAN_BROKER_DELETE,
+            false,
+            true,
+            false,
+        ));
+        assert!(mpt_transfer_waives_can_transfer(
+            TxType::LOAN_MANAGE,
+            false,
+            true,
+            true,
+        ));
+        assert!(!mpt_transfer_waives_can_transfer(
+            TxType::LOAN_MANAGE,
+            false,
+            true,
+            false,
+        ));
     }
 }
