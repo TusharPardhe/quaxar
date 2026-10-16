@@ -177,8 +177,21 @@ fn preserves_partial_flow_result(ter: Ter, actual_amount_out: &STAmount) -> bool
     ter == Ter::TEC_PATH_PARTIAL && actual_amount_out.signum() > 0
 }
 
-fn flow_send_max_asset(max_source_amount: &STAmount, input: &RippleCalcInput) -> Option<Asset> {
-    input.send_max_present.then(|| max_source_amount.asset())
+/// rippled `RippleCalc::rippleCalculate`: flow receives `sendMax =
+/// saMaxAmountReq` unless the max is negative ("no limit", as pathfinding
+/// passes), of the delivered token and issued by the source. A payment's max
+/// source is never negative, so flow always sees it: with no `SendMax` an
+/// IOU max is the source-issued delivered currency (no extra step), and an
+/// MPT max is the MPT itself, whose issuer becomes the implied second step.
+fn flow_send_max_asset(
+    max_source_amount: &STAmount,
+    dst_amount: &STAmount,
+    src_account: &AccountID,
+) -> Option<Asset> {
+    (max_source_amount.signum() >= 0
+        || !protocol::equal_tokens(max_source_amount.asset(), dst_amount.asset())
+        || max_source_amount.asset().issuer() != *src_account)
+        .then(|| max_source_amount.asset())
 }
 
 pub fn ripple_calculate<V: ApplyView>(
@@ -288,7 +301,7 @@ fn ripple_calculate_inner<V: ApplyView>(
 
     // This replaces the simplified try_default_path approach.
     let deliver_asset = dst_amount.asset();
-    let send_max_asset = flow_send_max_asset(max_source_amount, input);
+    let send_max_asset = flow_send_max_asset(max_source_amount, dst_amount, src_account);
 
     let (strand_ter, strands) =
         crate::domain::flow_engine::strand_builder::to_strands_checked_with_domain(
@@ -881,10 +894,10 @@ fn try_explicit_path<V: ApplyView>(
 }
 #[cfg(test)]
 mod tests {
-    use protocol::{AccountID, Asset, IOUAmount, Issue, STAmount, Ter, XRPAmount};
+    use protocol::{AccountID, IOUAmount, Issue, STAmount, Ter, XRPAmount};
 
     use super::{
-        RippleCalcInput, catch_flow_exception, flow_send_max_asset, preserves_partial_flow_result,
+        catch_flow_exception, flow_send_max_asset, preserves_partial_flow_result,
     };
 
     #[test]
@@ -897,34 +910,35 @@ mod tests {
     }
 
     #[test]
-    fn explicit_same_asset_send_max_remains_present_for_strand_building() {
+    fn flow_send_max_asset_matches_ripple_calc() {
+        let src = AccountID::from_array([0x11; 20]);
         let issuer = AccountID::from_array([0x44; 20]);
-        let asset = Asset::Issue(Issue::new(protocol::currency_from_string("USD"), issuer));
-        let amount = STAmount::from_iou_amount(
-            protocol::get_field_by_symbol("sfAmount"),
-            IOUAmount::from_parts(10, 0).expect("valid IOU"),
-            *asset.get::<Issue>(),
-        );
-        let input = RippleCalcInput {
-            partial_payment_allowed: false,
-            default_paths_allowed: true,
-            limit_quality: false,
-            is_ledger_open: false,
-            send_max_present: true,
-            domain_id: None,
+        let usd = protocol::currency_from_string("USD");
+        let amount = |issuer: AccountID, value: i64| {
+            STAmount::from_iou_amount(
+                protocol::get_field_by_symbol("sfAmount"),
+                IOUAmount::from_parts(value, 0).expect("valid IOU"),
+                Issue::new(usd, issuer),
+            )
         };
-
-        assert_eq!(flow_send_max_asset(&amount, &input), Some(asset));
+        let deliver = amount(issuer, 10);
+        // Payment without SendMax: the source-issued delivered currency.
+        let source_issued = amount(src, 10);
         assert_eq!(
-            flow_send_max_asset(
-                &amount,
-                &RippleCalcInput {
-                    send_max_present: false,
-                    ..input
-                }
-            ),
-            None
+            flow_send_max_asset(&source_issued, &deliver, &src),
+            Some(source_issued.asset())
         );
+        // Explicit SendMax.
+        assert_eq!(
+            flow_send_max_asset(&deliver, &deliver, &src),
+            Some(deliver.asset())
+        );
+        // Negative ("no limit"), same token, source issued: no sendMax.
+        let unlimited = amount(src, -1);
+        assert_eq!(flow_send_max_asset(&unlimited, &deliver, &src), None);
+        // Negative but issued by someone else: still a sendMax.
+        let other = amount(issuer, -1);
+        assert_eq!(flow_send_max_asset(&other, &deliver, &src), Some(other.asset()));
     }
 
     #[test]
