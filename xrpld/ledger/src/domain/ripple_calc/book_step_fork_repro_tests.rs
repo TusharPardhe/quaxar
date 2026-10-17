@@ -92,6 +92,7 @@ fn fork_21305409_offercreate_iou_crossing_matches_network() {
         &offer_pays_xrp,  // taker_pays == offer "in" (XRP)
         &offer_gets_war,  // taker_gets == offer "out" (WAR)
         &offer_gets_war,  // owner_funds: assume fully funded for this repro
+        false,
         offer_quality,
         QUALITY_ONE,
         QUALITY_ONE,
@@ -167,7 +168,7 @@ fn fork_21332266_tfsell_xrp_out_crossing_amounts() {
         &remaining_out_xrp,
         &offer_in_524,  // taker_pays == offer "in" (524C)
         &offer_out_xrp, // taker_gets == offer "out" (XRP)
-        &offer_out_xrp, // owner_funds: fully funded for this repro (XRP side)
+        &offer_out_xrp, false, // owner_funds: fully funded for this repro (XRP side)
         offer_quality,
         QUALITY_ONE,
         QUALITY_ONE,

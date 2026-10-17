@@ -260,6 +260,19 @@ fn sparse_testnet_21598425_checkcash_delivered_issuer_matches_network_metadata()
     );
 }
 
+/// Testnet forks 21603107, 21603465, 21603899, 21604683 (2026-10-17). IOC
+/// crossings of RLUSD offers owned by the RLUSD issuer, which charges a
+/// 0.39% transfer fee. rippled treats an issuer-owned IOU offer as funded at
+/// ownerGives (TOffer::isFunded), so the offer is consumed in full; quaxar
+/// limited it by its TakerGets and left the fee fraction behind.
+#[test]
+fn sparse_testnet_21604683_issuer_owned_offer_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21604683_issuer_owned_offer.jsonl"),
+    );
+}
+
 fn run_sparse_replay(path: PathBuf) {
     let rendered = path.to_string_lossy();
     assert!(
