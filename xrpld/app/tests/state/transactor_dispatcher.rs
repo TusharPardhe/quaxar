@@ -16767,19 +16767,45 @@ fn amm_withdraw_fix_v1_2_creates_missing_mpt_holding_only_after_amendment() {
         // current balance. With two existing objects this must fail reserve.
         (true, 2, 0, Ter::TEC_INSUFFICIENT_RESERVE, false),
     ] {
+        // fixAMMv1_1 is retired, so AMMWithdraw always runs
+        // verifyAndAdjustLPTokenBalance, which walks the AMM's owner
+        // directory (isOnlyLiquidityProvider).
+        let amm_mptoken = mptoken_entry(amm_account, mpt_id, 100);
+        let lp_line = trust_line_entry_iou(
+            account,
+            amm_account,
+            amm_mpt_xrp_lpt_issue(amm_account, mpt_issue).currency,
+            IOUAmount::from_parts(1, 0).expect("lp trustline balance"),
+        );
+        // A second LP holds the other 99 LP tokens, so the withdrawer is not
+        // the only provider and the LP balance needs no reconciliation.
+        let other_lp_line = trust_line_entry_iou(
+            sample_account(0x19),
+            amm_account,
+            amm_mpt_xrp_lpt_issue(amm_account, mpt_issue).currency,
+            IOUAmount::from_parts(99, 0).expect("other lp trustline balance"),
+        );
+        let amm = amm_mpt_xrp_entry(amm_account, mpt_issue, 100, 100);
+        let amm_dir = owner_dir_root_with_children(
+            amm_account,
+            vec![
+                *amm.key(),
+                *amm_mptoken.key(),
+                *lp_line.key(),
+                *other_lp_line.key(),
+            ],
+        );
         let mut ledger = empty_ledger(vec![
             account_root_with_balance(account, owner_count, 0, 1_000_000_000),
             account_root(issuer, 1, 0),
             account_root(amm_account, 0, 0),
             mpt_issuance_entry(issuer, 1, 100, protocol::lsfMPTCanTrade),
-            mptoken_entry(amm_account, mpt_id, 100),
-            trust_line_entry_iou(
-                account,
-                amm_account,
-                amm_mpt_xrp_lpt_issue(amm_account, mpt_issue).currency,
-                IOUAmount::from_parts(1, 0).expect("lp trustline balance"),
-            ),
-            amm_mpt_xrp_entry(amm_account, mpt_issue, 100, 100),
+            amm_mptoken,
+            lp_line,
+            other_lp_line,
+            account_root(sample_account(0x19), 1, 0),
+            amm,
+            amm_dir,
         ]);
         ledger.set_fees(Fees {
             base: 10,

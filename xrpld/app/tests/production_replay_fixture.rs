@@ -222,6 +222,44 @@ fn sparse_testnet_21568551_fork_matches_network_metadata() {
     );
 }
 
+/// Testnet fork at 21588856 (2026-10-16 21:24 UTC). OfferCreate 7B25D6F0 (IOC,
+/// sells AUROOS, which carries a transfer fee, for XRP) crosses a CLOB offer,
+/// then a single-path AMM. Since fixAMMv1_1 was retired, rippled always
+/// composes the incoming transfer rate into the single-path AMM quality
+/// function, for offer crossing too, so limitOut sizes the second AMM pass
+/// to 59647682 drops. quaxar dropped the rate for offer crossing and took
+/// 62212738, failed the pass and forked.
+#[test]
+fn sparse_testnet_21588856_amm_transfer_rate_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21588856_amm_transfer_rate.jsonl"),
+    );
+}
+
+/// Testnet fork at 21592544 (2026-10-17 00:50 UTC): another IOC IOU-selling
+/// crossing through CLOB offers and a single-path AMM, fixed by the same
+/// transfer-rate rule as 21588856.
+#[test]
+fn sparse_testnet_21592544_amm_transfer_rate_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21592544_amm_transfer_rate.jsonl"),
+    );
+}
+
+/// Testnet fork at 21598425 (2026-10-17 06:18 UTC): CheckCash with
+/// DeliverMin by the IOU issuer. rippled's finishFlow re-tags the delivered
+/// total with the requested asset (DeliverMin names the casher as issuer);
+/// quaxar kept the last step's issuer (the check writer) in DeliveredAmount.
+#[test]
+fn sparse_testnet_21598425_checkcash_delivered_issuer_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21598425_checkcash_delivered_issuer.jsonl"),
+    );
+}
+
 fn run_sparse_replay(path: PathBuf) {
     let rendered = path.to_string_lossy();
     assert!(

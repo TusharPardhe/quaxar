@@ -326,6 +326,40 @@ pub fn execute_strands<V: ApplyView>(
             actual_out: deliver.zeroed(),
         };
     }
+    finish_flow_assets(result, deliver, send_max, strand_src)
+}
+
+/// rippled `finishFlow`: `actualAmountOut = toSTAmount(f.out, dstAsset)` and
+/// `actualAmountIn = toSTAmount(f.in, srcAsset)`. The step totals carry the
+/// assets of the strand's last and first steps; the result carries the
+/// requested ones: `dstAsset` is the deliver asset, and `srcAsset` is
+/// sendMax's asset or, without sendMax, the deliver currency issued by the
+/// source (XRP stays XRP; MPT stays the MPT). These differ when an issuer
+/// receives (CheckCash by the issuer: DeliverMin names the casher, the last
+/// step delivers the writer's IOU), which is consensus-visible through
+/// DeliveredAmount (testnet 21598425).
+fn finish_flow_assets(
+    mut result: FlowResult,
+    deliver: &STAmount,
+    send_max: Option<&STAmount>,
+    strand_src: &AccountID,
+) -> FlowResult {
+    let dst_asset = deliver.asset();
+    let src_asset = match send_max {
+        Some(send_max) => send_max.asset(),
+        None => match dst_asset {
+            protocol::Asset::Issue(issue) if !issue.native() => {
+                protocol::Asset::Issue(protocol::Issue::new(issue.currency, *strand_src))
+            }
+            asset => asset,
+        },
+    };
+    if result.actual_out.asset() != dst_asset {
+        result.actual_out.set_issue(dst_asset);
+    }
+    if result.actual_in.asset() != src_asset {
+        result.actual_in.set_issue(src_asset);
+    }
     result
 }
 

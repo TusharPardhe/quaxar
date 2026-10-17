@@ -109,13 +109,19 @@ fn sum_sorted_amounts(amounts: &[STAmount], zero: &STAmount) -> Option<STAmount>
         .try_fold(first.clone(), |sum, amount| protocol::checked_step_add(&sum, amount))
 }
 
+/// rippled `BookStep` `qualityThreshold(lobQuality)`. Only
+/// `BookOfferCrossingStep` drops the CLOB tip target (single path, limit
+/// above the tip) so the AMM is not blocked by a worse CLOB offer;
+/// `BookPaymentStep` always targets the tip. In quaxar the book step's
+/// `owner_pays_transfer_fee` is set exactly for offer crossing.
 fn amm_target_quality(
     clob: Option<Quality>,
     threshold: Option<Quality>,
     multi_path: bool,
+    offer_crossing: bool,
 ) -> Option<Quality> {
     match (clob, threshold) {
-        (Some(tip), Some(limit)) if !multi_path && limit > tip => None,
+        (Some(tip), Some(limit)) if offer_crossing && !multi_path && limit > tip => None,
         (tip, _) => tip,
     }
 }
@@ -775,6 +781,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
         clob_tip,
         quality_threshold,
         amm_context.multi_path(),
+        options.owner_pays_transfer_fee,
     );
     let mut stop_before_clob = false;
     let amm_offer = if book.domain.is_none() && remaining_in.signum() > 0 && total_out < *max_out {
@@ -2214,7 +2221,7 @@ pub(crate) fn book_quality_upper_bound<V: ApplyView>(
     let clob_offers = get_book_offers(view, book, 1)?;
     let clob = clob_offers.first().map(TraversedBookEntry::quality);
     let generation_quality =
-        amm_target_quality(clob, quality_threshold, amm_context.multi_path());
+        amm_target_quality(clob, quality_threshold, amm_context.multi_path(), owner_pays_transfer_fee);
     let amm = if amm_quality_estimation_allowed(
         book.domain,
         view.rules().enabled(&protocol::fix_cleanup_3_3_0()),
@@ -2256,7 +2263,12 @@ pub(crate) fn book_quality_function<V: ApplyView>(
 ) -> Result<Option<QualityFunction>, ViewError> {
     let clob_offers = get_book_offers(view, book, 1)?;
     let clob = clob_offers.first().map(TraversedBookEntry::quality);
-    let target = amm_target_quality(clob, quality_threshold, amm_context.multi_path());
+    let target = amm_target_quality(
+        clob,
+        quality_threshold,
+        amm_context.multi_path(),
+        owner_pays_transfer_fee,
+    );
     let amm = if amm_quality_estimation_allowed(
         book.domain,
         view.rules().enabled(&protocol::fix_cleanup_3_3_0()),
@@ -2335,8 +2347,13 @@ pub(crate) fn book_quality_function<V: ApplyView>(
     }
 }
 
-fn should_compose_single_path_input_rate(previous_redeems: bool, offer_crossing: bool) -> bool {
-    previous_redeems && !offer_crossing
+/// rippled `BookStep::getQualityFunc` (fixAMMv1_1 retired, #8226): a
+/// single-path AMM quality function always composes the incoming transfer
+/// rate when the previous step redeems, for payments and offer crossing
+/// alike. (Pre-retirement: `previous_redeems && (!offer_crossing ||
+/// fixAMMv1_1)`, and fixAMMv1_1 is permanently on.)
+fn should_compose_single_path_input_rate(previous_redeems: bool, _offer_crossing: bool) -> bool {
+    previous_redeems
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3134,26 +3151,19 @@ mod tests {
     }
 
     #[test]
-    fn amm_target_threshold_is_unconditional_for_single_path() {
+    fn amm_target_threshold_applies_only_to_single_path_offer_crossing() {
         let input = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(2));
         let output = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1));
         let tip = Quality::from_amounts(&Amounts::new(input.clone(), output.clone()));
         let limit = Quality::from_amounts(&Amounts::new(output, input));
         assert!(limit > tip);
 
-        assert_eq!(
-            amm_target_quality(Some(tip), Some(limit), false),
-            None
-        );
-        assert_eq!(
-            amm_target_quality(Some(tip), Some(limit), false),
-            None,
-            "retired fixAMMv1_1 behavior applies even without the amendment ID"
-        );
-        assert_eq!(
-            amm_target_quality(Some(tip), Some(limit), true),
-            Some(tip)
-        );
+        // BookOfferCrossingStep::qualityThreshold.
+        assert_eq!(amm_target_quality(Some(tip), Some(limit), false, true), None);
+        assert_eq!(amm_target_quality(Some(tip), Some(limit), true, true), Some(tip));
+        // BookPaymentStep::qualityThreshold always returns the tip.
+        assert_eq!(amm_target_quality(Some(tip), Some(limit), false, false), Some(tip));
+        assert_eq!(amm_target_quality(None, Some(limit), false, true), None);
     }
 
     fn amm_entry_with_auction_slot(
@@ -4148,10 +4158,12 @@ mod tests {
 
     #[test]
     fn single_path_amm_fee_function_is_unconditional_for_offer_crossing() {
+        // Testnet fork 21588856: an offer crossing redeeming a fee-charging
+        // IOU into a single-path AMM must include the transfer rate.
         assert!(should_compose_single_path_input_rate(true, false));
-        assert!(!should_compose_single_path_input_rate(true, true));
-        assert!(!should_compose_single_path_input_rate(true, true));
+        assert!(should_compose_single_path_input_rate(true, true));
         assert!(!should_compose_single_path_input_rate(false, false));
+        assert!(!should_compose_single_path_input_rate(false, true));
     }
     #[test]
     fn reverse_xrp_to_iou_output_cap_derives_only_required_3300_xrp_sendmax() {
