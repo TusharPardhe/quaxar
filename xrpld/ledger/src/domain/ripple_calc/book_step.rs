@@ -1245,6 +1245,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                     &taker_pays,
                     &taker_gets,
                     &owner_funds,
+                    offer_is_funded(&offer_owner, &taker_gets),
                     offer_quality,
                     tr_in,
                     tr_out,
@@ -1305,6 +1306,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                             &taker_pays,
                             &taker_gets,
                             &owner_funds,
+                            offer_is_funded(&offer_owner, &taker_gets),
                             offer_quality,
                             tr_in,
                             tr_out,
@@ -2797,6 +2799,11 @@ impl OfferConsumption {
 
 /// Compute how much of an offer to consume, applying transfer rates.
 ///   stpAmt.in = mulRatio(ofrAmt.in, ofrInRate, QUALITY_ONE, true)
+/// rippled `TOffer::isFunded`: the owner issues the IOU the offer sells.
+fn offer_is_funded(owner: &AccountID, taker_gets: &STAmount) -> bool {
+    matches!(taker_gets.asset(), Asset::Issue(issue) if !issue.native() && issue.issuer() == *owner)
+}
+
 ///   ownerGives = mulRatio(ofrAmt.out, ofrOutRate, QUALITY_ONE,
 ///                         isMptOutput)
 ///   If funds < ownerGives: recompute from available funds
@@ -2809,6 +2816,7 @@ fn compute_offer_consumption(
     taker_pays: &STAmount,
     taker_gets: &STAmount,
     owner_funds: &STAmount,
+    offer_is_funded: bool,
     offer_quality: Quality,
     transfer_rate_in: u32,
     transfer_rate_out: u32,
@@ -2829,8 +2837,14 @@ fn compute_offer_consumption(
     // subsequent limitIn/limitOut operation uses it even after owner funding
     // or an earlier crossing has reduced the working offer amounts.
 
+    // rippled BookStep::forEachOffer: `funds = offer.isFunded() ? ownerGives
+    // : offers.ownerFunds()`. An IOU issuer owning the offer has unlimited
+    // funds, so the grossed-up amount (offer output plus transfer fee) is
+    // never limited. OfferStream's ownerFunds for an issuer is only the
+    // offer's TakerGets, which is smaller than ownerGives when the issuer has
+    // a transfer rate (testnet forks 21603107..21604683, RLUSD).
     // reference: if (funds < ownerGives) — limit by owner funding
-    if *owner_funds < owner_gives {
+    if !offer_is_funded && *owner_funds < owner_gives {
         owner_gives = owner_funds.clone();
         stp_out = mul_ratio_amount(&owner_gives, QUALITY_ONE, transfer_rate_out, false);
         let limited = offer_quality.ceil_out_strict(
@@ -3124,6 +3138,29 @@ mod tests {
         fn txs(&self) -> Result<Vec<ReadViewTx>, ViewError> {
             ReadView::txs(&self.base)
         }
+    }
+
+    /// rippled TOffer::isFunded: an IOU issuer selling its own IOU has
+    /// unlimited funds, so ownerGives (output plus transfer fee) is not
+    /// limited by the offer's TakerGets.
+    #[test]
+    fn issuer_owned_offer_with_transfer_fee_is_consumed_in_full() {
+        let issuer = AccountID::from_array([0x51; 20]);
+        let issue = protocol::Issue::new(protocol::currency_from_string("USD"), issuer);
+        let usd = |v: i64| STAmount::from_iou_amount(sf("sfAmount"), protocol::IOUAmount::from_parts(v, 0).expect("usd"), issue);
+        let xrp = |d: i64| STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(d));
+        let quality = Quality::from_amounts(&Amounts::new(xrp(1_000_000), usd(10)));
+        let rate = 1_003_877_278; // RLUSD testnet transfer rate
+        let run = |funded| compute_offer_consumption(
+            BookStepPass::Reverse, &xrp(100_000_000), &usd(1_000), &xrp(1_000_000), &usd(10),
+            &usd(10), funded, quality, QUALITY_ONE, rate, true,
+        );
+        assert!(offer_is_funded(&issuer, &usd(10)));
+        assert!(!offer_is_funded(&AccountID::from_array([0x52; 20]), &usd(10)));
+        let funded = run(true);
+        assert_eq!(funded.step_out, usd(10), "issuer-owned offer is consumed in full");
+        let limited = run(false);
+        assert!(limited.step_out < usd(10), "a holder with only 10 USD pays the fee from it");
     }
 
     #[test]
@@ -4200,7 +4237,7 @@ mod tests {
                 sf("sfAmount"),
                 protocol::IOUAmount::from_parts(1_000, 0).expect("funded offer output"),
                 issue,
-            ),
+            ), false,
             offer_quality,
             QUALITY_ONE,
             QUALITY_ONE,
@@ -4237,7 +4274,7 @@ mod tests {
             &taker_gets,
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(50_000_000)),
             &taker_gets,
-            &taker_gets,
+            &taker_gets, false,
             offer_quality,
             QUALITY_ONE,
             QUALITY_ONE,
@@ -4281,7 +4318,7 @@ mod tests {
             &taker_gets,
             &taker_pays,
             &taker_gets,
-            &taker_gets,
+            &taker_gets, false,
             stored_quality,
             QUALITY_ONE,
             QUALITY_ONE,
