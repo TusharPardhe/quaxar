@@ -401,6 +401,30 @@ fn amm_withdraw_apply_math_withdraw_all_removes_entire_pool_for_last_lp() {
     assert_eq!(result.new_lp_token_balance, lp(0, lpt));
 }
 
+/// rippled AMMWithdraw::withdraw: withdrawing more LP tokens than the AMM's
+/// LPTokenBalance (the LP's line exceeds it by rounding and was not adjusted)
+/// is tecINTERNAL, checked before the pool-side balance checks.
+#[test]
+fn amm_withdraw_apply_math_withdraw_all_above_lp_token_balance_is_tec_internal() {
+    let asset1 = issue(1);
+    let asset2 = issue(2);
+    let lpt = issue(3);
+    let result = run_amm_withdraw_apply_math_facts(&AMMWithdrawApplyMathFacts {
+        amount1: None,
+        amount2: None,
+        e_price: None,
+        lp_token_in: None,
+        pool_amount1: iou(100, asset1),
+        pool_amount2: iou(400, asset2),
+        lp_token_balance: lp(200, lpt),
+        account_lp_tokens: lp(201, lpt),
+        trading_fee: 0,
+        rules: Rules::new(std::iter::empty()),
+        flags: AMM_WITHDRAW_ALL_FLAG,
+    });
+    assert_eq!(result, Err(protocol::Ter::TEC_INTERNAL));
+}
+
 #[test]
 fn amm_withdraw_apply_math_two_asset_mode_uses_limiting_side() {
     let asset1 = issue(1);

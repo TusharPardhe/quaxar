@@ -22,6 +22,11 @@ fn base() -> LoanBrokerDeletePreclaimFacts {
         vault_exists: true,
         rounded_debt_total_is_zero: true,
         cover_available_is_positive: false,
+        fix_cleanup_3_5_0_enabled: false,
+        can_transfer_result: Ter::TES_SUCCESS,
+        require_auth_result: Ter::TES_SUCCESS,
+        owner_holding_exists: true,
+        can_add_holding_result: Ter::TES_SUCCESS,
         deep_frozen_result: Ter::TES_SUCCESS,
     }
 }

@@ -1046,7 +1046,11 @@ fn preclaim_escrow_create<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> 
             if spendable.signum() <= 0 || amount > spendable {
                 return Ok(Ter::TEC_INSUFFICIENT_FUNDS);
             }
-            Ok(if spendable.iou().checked_add(amount.iou()).is_ok() {
+            // rippled `canAdd(spendableAmount, amount)`: a precision check
+            // (relative loss of (a-b)+b vs a), not just overflow. A balance of
+            // 1e16 cannot absorb 1 (testnet 21632948).
+            let rounding = basics::number::get_rounding_mode();
+            Ok(if protocol::can_add(&spendable, &amount, rounding) {
                 Ter::TES_SUCCESS
             } else {
                 Ter::TEC_PRECISION_LOSS
