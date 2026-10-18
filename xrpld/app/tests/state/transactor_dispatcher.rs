@@ -15523,6 +15523,9 @@ fn amm_deposit_clears_stale_auth_accounts_after_empty_pool_reinit() {
         account_root(eur_issuer, 0, 0),
         account_root(amm_account, 0, 0),
         amm,
+        // rippled AMMDeposit::deposit checks accountFunds before each send.
+        trust_line_entry(depositor, usd_issuer, usd.currency, 1_000),
+        trust_line_entry(depositor, eur_issuer, eur.currency, 1_000),
     ]);
     ledger.set_rules(protocol::Rules::new([
         protocol::feature_id("AMM"),
@@ -15597,6 +15600,8 @@ fn amm_deposit_submit_shell_preserves_pool_invariant() {
         amm_entry(amm_account, usd, eur, 1_000, vec![], 0),
         trust_line_entry(amm_account, usd_issuer, usd.currency, 1_000),
         trust_line_entry(amm_account, eur_issuer, eur.currency, 1_000),
+        // rippled AMMDeposit::deposit checks accountFunds before each send.
+        trust_line_entry(depositor, usd_issuer, usd.currency, 1_000),
     ]);
     ledger.set_rules(protocol::Rules::new([
         protocol::feature_id("AMM"),

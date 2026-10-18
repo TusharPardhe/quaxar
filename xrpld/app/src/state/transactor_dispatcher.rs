@@ -289,6 +289,41 @@ macro_rules! amm_holds_or_return {
     };
 }
 
+/// rippled `AMMDeposit::deposit` `checkBalance`: `temBAD_AMOUNT` for a
+/// non-positive amount; XRP must be covered by `xrpLiquid` (reserve adjusted
+/// when the LPToken line does not exist yet); IOU/MPT by
+/// `accountFunds(IgnoreFreeze, IgnoreAuth)`, where the issuer is always
+/// funded. `accountSend` itself does not check funds (testnet 21633206).
+fn amm_deposit_check_balance<V: ledger::ApplyView>(
+    view: &V,
+    account: &AccountID,
+    has_lp_line: bool,
+    deposit: &STAmount,
+) -> Ter {
+    if deposit.signum() <= 0 {
+        return Ter::TEM_BAD_AMOUNT;
+    }
+    if deposit.native() {
+        return match ledger::apply_view::xrp_liquid(view, account, i32::from(!has_lp_line)) {
+            Ok(liquid) if liquid >= deposit.xrp() => Ter::TES_SUCCESS,
+            Ok(_) => Ter::TEC_UNFUNDED_AMM,
+            Err(_) => Ter::TEF_BAD_LEDGER,
+        };
+    }
+    let issuer = match deposit.asset() {
+        Asset::Issue(issue) => issue.account,
+        Asset::MPTIssue(issue) => issue.issuer(),
+    };
+    if issuer == *account {
+        return Ter::TES_SUCCESS;
+    }
+    match account_holds_amm_asset(view, account, deposit.asset(), sf("sfAmount")) {
+        Ok(held) if held >= *deposit => Ter::TES_SUCCESS,
+        Ok(_) => Ter::TEC_UNFUNDED_AMM,
+        Err(ter) => ter,
+    }
+}
+
 fn amm_deposit_asset<V: ledger::ApplyView>(
     view: &mut V,
     from: &AccountID,
@@ -579,6 +614,13 @@ fn amm_clawback_math(
     let full_withdraw = |holder_lp: &STAmount| -> Result<tx::AMMWithdrawApplyMathResult, Ter> {
         if holder_lp.signum() == 0 {
             return Err(Ter::TEC_AMM_BALANCE);
+        }
+        // rippled routes this through AMMWithdraw::equalWithdrawTokens ->
+        // withdraw(), whose "unexpected LP tokens" guard rejects withdrawing
+        // more than the AMM's LPTokenBalance (same case as AMMWithdraw at
+        // testnet 21633429).
+        if holder_lp > lp_total {
+            return Err(Ter::TEC_INTERNAL);
         }
         let frac = ledger::amm_helpers::stamount_as_number(holder_lp)
             / ledger::amm_helpers::stamount_as_number(lp_total);
@@ -5942,26 +5984,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         Ok(line) => line.is_some(),
                         Err(_) => return Ter::TEF_BAD_LEDGER,
                     };
-                for deposit in [math.amount1.as_ref(), math.amount2.as_ref()]
-                    .into_iter()
-                    .flatten()
-                {
-                    if deposit.native() {
-                        let liquid = match ledger::apply_view::xrp_liquid(
-                            view,
-                            &account,
-                            i32::from(!has_lp_line),
-                        ) {
-                            Ok(liquid) => liquid,
-                            Err(_) => return Ter::TEF_BAD_LEDGER,
-                        };
-                        if liquid < deposit.xrp() {
-                            return Ter::TEC_UNFUNDED_AMM;
-                        }
-                    }
-                }
 
                 if let Some(amount) = &math.amount1 {
+                    let funded = amm_deposit_check_balance(view, &account, has_lp_line, amount);
+                    if funded != Ter::TES_SUCCESS {
+                        return funded;
+                    }
                     let mpt_result =
                         check_mpt_amm_pool_asset_unlocked(view, &amm_account, amount.asset());
                     if mpt_result != Ter::TES_SUCCESS {
@@ -5978,6 +6006,10 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     }
                 }
                 if let Some(amount2) = &math.amount2 {
+                    let funded = amm_deposit_check_balance(view, &account, has_lp_line, amount2);
+                    if funded != Ter::TES_SUCCESS {
+                        return funded;
+                    }
                     let mpt_result =
                         check_mpt_amm_pool_asset_unlocked(view, &amm_account, amount2.asset());
                     if mpt_result != Ter::TES_SUCCESS {
@@ -9209,6 +9241,26 @@ mod tests {
             IOUAmount::from_parts(value, 0).expect("canonical IOU fixture"),
             issue,
         )
+    }
+
+    #[test]
+    fn amm_clawback_full_withdraw_above_lp_token_balance_is_tec_internal() {
+        let issuer = AccountID::from_array([0x31; 20]);
+        let amm = AccountID::from_array([0x32; 20]);
+        let usd = protocol::Issue::new(protocol::currency_from_string("USD"), issuer);
+        let eur = protocol::Issue::new(protocol::currency_from_string("EUR"), issuer);
+        let lp = protocol::Issue::new(protocol::currency_from_string("LPT"), amm);
+        assert_eq!(
+            amm_clawback_math(
+                None,
+                &iou_amount(usd, 100),
+                &iou_amount(eur, 100),
+                &iou_amount(lp, 100),
+                &iou_amount(lp, 101),
+                protocol::Rules::new([protocol::feature_id("fixAMMClawbackRounding")]),
+            ),
+            Err(Ter::TEC_INTERNAL)
+        );
     }
 
     #[test]

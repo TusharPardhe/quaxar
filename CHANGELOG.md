@@ -9,6 +9,13 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- Testnet forks 21632948, 21633206, 21633429 and 21636525:
+  - AMMDeposit checks the depositor's IOU and MPT funds before each send
+    (`tecUNFUNDED_AMM`), not just XRP.
+  - AMMWithdraw and AMMClawback return `tecINTERNAL` when the withdrawn LP
+    tokens exceed the AMM's `LPTokenBalance`, like rippled.
+  - IOU EscrowCreate uses rippled's `canAdd` precision check
+    (`tecPRECISION_LOSS`), not just an overflow check.
 - Cold sync on 2 vCPU hosts no longer deadlocks when fjall reaches 30 L0
   runs: at least 4 fjall workers, plus a watchdog that forces a flush when L0
   stays high.

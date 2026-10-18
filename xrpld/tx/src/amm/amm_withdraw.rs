@@ -329,6 +329,16 @@ fn finalize_withdraw_math(
         return Err(Ter::TEC_AMM_INVALID_TOKENS);
     }
 
+    // rippled AMMWithdraw::withdraw: "Should not happen since the only LP on
+    // last withdraw has the balance set to the lp token trustline balance."
+    // It does happen when the withdrawer's LPToken line exceeds the AMM's
+    // LPTokenBalance by rounding and another LP's (empty) LPToken line keeps
+    // verifyAndAdjustLPTokenBalance from adjusting it (testnet 21633429,
+    // 21636525).
+    if lp_tokens_actual > facts.lp_token_balance {
+        return Err(Ter::TEC_INTERNAL);
+    }
+
     if (amount1_actual == facts.pool_amount1
         && amount2_actual.as_ref() != Some(&facts.pool_amount2))
         || (amount2_actual.as_ref() == Some(&facts.pool_amount2)

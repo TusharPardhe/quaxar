@@ -273,6 +273,52 @@ fn sparse_testnet_21604683_issuer_owned_offer_matches_network_metadata() {
     );
 }
 
+/// Testnet fork at 21632948 (2026-10-18): IOU EscrowCreate of 1 USD from a
+/// holder with a 1e16 balance. rippled's escrowLockPreclaimHelper rejects it
+/// with canAdd (precision) as tecPRECISION_LOSS; quaxar only checked
+/// overflow, passed preclaim and failed later with tecNO_PERMISSION.
+#[test]
+fn sparse_testnet_21632948_escrow_iou_precision_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21632948_escrow_iou_precision.jsonl"),
+    );
+}
+
+/// Testnet fork at 21633206 (2026-10-18): AMMDeposit by LPTokenOut far
+/// beyond the depositor's IOU balances. rippled's AMMDeposit::deposit checks
+/// accountFunds before each send (tecUNFUNDED_AMM); quaxar only checked XRP,
+/// so the IOU deposit succeeded with a negative balance.
+#[test]
+fn sparse_testnet_21633206_amm_deposit_unfunded_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21633206_amm_deposit_unfunded.jsonl"),
+    );
+}
+
+/// Testnet fork at 21633429 (2026-10-18): withdraw-all by the issuer LP whose
+/// LPToken line exceeds the AMM's LPTokenBalance by rounding while another
+/// LP's empty LPToken line remains. rippled returns tecINTERNAL ("unexpected
+/// LP tokens"); quaxar lacked that guard and returned tecAMM_BALANCE.
+#[test]
+fn sparse_testnet_21633429_amm_withdraw_lp_excess_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21633429_amm_withdraw_lp_excess.jsonl"),
+    );
+}
+
+/// Testnet fork at 21636525 (2026-10-18): same AMMWithdraw case as 21633429
+/// on a pool with a 0.5% trading fee.
+#[test]
+fn sparse_testnet_21636525_amm_withdraw_lp_excess_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21636525_amm_withdraw_lp_excess.jsonl"),
+    );
+}
+
 fn run_sparse_replay(path: PathBuf) {
     let rendered = path.to_string_lossy();
     assert!(
