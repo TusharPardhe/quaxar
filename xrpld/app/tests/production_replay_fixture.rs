@@ -319,6 +319,37 @@ fn sparse_testnet_21636525_amm_withdraw_lp_excess_matches_network_metadata() {
     );
 }
 
+/// Testnet fork at 21660851 (2026-10-19): AccountDelete by the delegatee of
+/// a Delegate entry. quaxar removed the entry from the deleted account's
+/// directory instead of the delegator's and returned tefBAD_LEDGER.
+#[test]
+fn sparse_testnet_21660851_account_delete_delegatee_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21660851_account_delete_delegatee.jsonl"),
+    );
+}
+
+/// Testnet fork at 21661277 (2026-10-19): equal AMMWithdraw from a pool with
+/// a 1e90 side. rippled computes the fraction as an STAmount quotient
+/// (16 digits); quaxar used a Number quotient and withdrew 1e-13 too much.
+#[test]
+fn sparse_testnet_21661277_amm_withdraw_frac_precision_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21661277_amm_withdraw_frac_precision.jsonl"),
+    );
+}
+
+/// Testnet fork at 21661304 (2026-10-19): same AMMWithdraw fraction case.
+#[test]
+fn sparse_testnet_21661304_amm_withdraw_frac_precision_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21661304_amm_withdraw_frac_precision.jsonl"),
+    );
+}
+
 fn run_sparse_replay(path: PathBuf) {
     let rendered = path.to_string_lossy();
     assert!(

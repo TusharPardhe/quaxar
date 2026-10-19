@@ -5045,6 +5045,63 @@ fn account_delete_releases_sponsored_deposit_preauth_reserve() {
     );
 }
 
+/// Testnet 21660851: the delegatee (sfAuthorize) deletes its account while a
+/// Delegate entry created by the delegator still lists it. rippled's
+/// DelegateSet::deleteDelegate removes the entry from the delegator's
+/// directory (sfOwnerNode) and the delegatee's (sfDestinationNode) and
+/// decrements only the delegator's OwnerCount.
+#[test]
+fn account_delete_by_delegatee_removes_delegator_owned_delegate() {
+    let delegatee = sample_account(0xE1);
+    let delegator = sample_account(0xE2);
+    let delegate_keylet =
+        protocol::delegate_keylet(raw_account_id(delegator), raw_account_id(delegatee));
+    let mut delegate = STLedgerEntry::from_type_and_key(LedgerEntryType::Delegate, delegate_keylet.key);
+    delegate.set_account_id(sf("sfAccount"), delegator);
+    delegate.set_account_id(sf("sfAuthorize"), delegatee);
+    delegate.set_field_u64(sf("sfOwnerNode"), 0);
+    delegate.set_field_u64(sf("sfDestinationNode"), 0);
+    let ledger = ledger_with_header(
+        LedgerHeader {
+            seq: 300,
+            ..LedgerHeader::default()
+        },
+        vec![
+            account_root_with_balance(delegatee, 0, 0, 1_000),
+            account_root_with_balance(delegator, 1, 0, 2_000),
+            owner_dir_root(delegatee, delegate_keylet.key),
+            owner_dir_root(delegator, delegate_keylet.key),
+            delegate,
+        ],
+    );
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::ACCOUNT_DELETE, |object| {
+        object.set_account_id(sf("sfAccount"), delegatee);
+        object.set_account_id(sf("sfDestination"), delegator);
+        object.set_field_amount(sf("sfFee"), test_xrp(10));
+        object.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::ACCOUNT_DELETE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(view.read(delegate_keylet).expect("delegate read").is_none());
+    assert!(
+        view.read(owner_dir_keylet(raw_account_id(delegator)))
+            .expect("delegator dir read")
+            .is_none(),
+        "the delegator's directory must lose the entry"
+    );
+    assert_eq!(
+        view.read(account_keylet(raw_account_id(delegator)))
+            .expect("delegator read")
+            .expect("delegator exists")
+            .get_field_u32(sf("sfOwnerCount")),
+        0
+    );
+}
+
 #[test]
 fn fix_mpt_delivered_amount_records_actual_partial_mpt_delivery_only_when_enabled() {
     let source = sample_account(0xDA);

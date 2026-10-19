@@ -408,8 +408,11 @@ pub fn run_amm_withdraw_apply_math_facts(
             if facts.rules.enabled(&protocol::fix_ammv1_3()) && tokens.signum() == 0 {
                 return Err(Ter::TEC_AMM_INVALID_TOKENS);
             }
-            let frac = amm_helpers::stamount_as_number(&tokens)
-                / amm_helpers::stamount_as_number(&facts.lp_token_balance);
+            // rippled: `divide(tokensAdj, lptAMMBalance, noIssue())`, an
+            // STAmount quotient (16 significant digits), not a Number one.
+            let frac = amm_helpers::stamount_as_number(
+                &tokens.divide(&facts.lp_token_balance, protocol::no_issue()),
+            );
             let amount1 =
                 amm_helpers::get_rounded_asset(&facts.rules, &facts.pool_amount1, frac, IsDeposit::No);
             let amount2 =
