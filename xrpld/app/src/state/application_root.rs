@@ -5245,6 +5245,14 @@ impl ApplicationRoot {
     /// peer transactions) to enqueue new work between iterations — matching
     /// rippled's `batchLock.unlock()` before `apply()` pattern.
     pub fn run_network_ops_transaction_batch(&self) {
+        // rippled transactionBatch: `if (dispatchState_ == Running) return;`
+        // The running owner keeps draining while transactions remain.
+        if self
+            .network_ops_runtime()
+            .is_some_and(|runtime| runtime.dispatch_state() == crate::network::network_ops::NetworkOpsDispatchState::Running)
+        {
+            return;
+        }
         while self.network_ops_pending_transaction_count().unwrap_or(0) != 0 {
             if self.apply_network_ops_pending_to_open_ledger().is_none() {
                 if let Some(runtime) = self.network_ops_runtime() {
@@ -7661,6 +7669,18 @@ impl ApplicationRoot {
                 current_ledger_state,
             )
         })
+    }
+
+    /// rippled `NetworkOPsImp::doTransactionSyncBatch` (single pass): apply
+    /// the pending batch on this thread, then hand any transactions that
+    /// arrived meanwhile to a fresh JtBatch job through the guarded
+    /// `None -> Scheduled` transition.
+    pub fn run_network_ops_sync_batch(&self) -> Option<AppNetworkOpsApplyReport> {
+        let report = self.apply_network_ops_pending_to_open_ledger();
+        if self.network_ops_pending_transaction_count().unwrap_or(0) != 0 {
+            let _ = self.schedule_network_ops_transaction_batch();
+        }
+        report
     }
 
     pub fn apply_network_ops_pending_to_open_ledger(&self) -> Option<AppNetworkOpsApplyReport> {
@@ -10488,7 +10508,7 @@ impl ApplicationRoot {
             run_sync_batch = true;
         });
         if run_sync_batch {
-            let _ = self.apply_network_ops_pending_to_open_ledger();
+            let _ = self.run_network_ops_sync_batch();
         }
 
         // Re-read open ledger txs after held transactions were applied.

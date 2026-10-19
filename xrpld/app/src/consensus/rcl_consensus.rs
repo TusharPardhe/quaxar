@@ -1090,7 +1090,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             // batch may also consume previously queued work; do the same, but
             // never unconditionally flush normal async peer ingress here.
             if run_sync_batch {
-                let _ = self.app_root.apply_network_ops_pending_to_open_ledger();
+                let _ = self.app_root.run_network_ops_sync_batch();
             }
             RclConsensusOpenLedgerSource::current_open_transactions(&self.open_ledger)
         };

@@ -9,6 +9,13 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- NetworkOps no longer stalls its transaction queue. A synchronous batch
+  (ledger close with held transactions, or a local submit) that saw new
+  arrivals left the dispatch state `Scheduled` with no job queued, so every
+  later transaction was only queued: relayed and submitted transactions were
+  never applied and memory grew by about 1 GB a day. Each batch now ends at
+  `None` like rippled, synchronous callers hand leftover work to a fresh
+  JtBatch job, and the batch job returns if another batch is running.
 - Testnet forks 21632948, 21633206, 21633429 and 21636525:
   - AMMDeposit checks the depositor's IOU and MPT funds before each send
     (`tecUNFUNDED_AMM`), not just XRP.

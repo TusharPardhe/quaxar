@@ -2669,7 +2669,7 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
                     .close_gate()
                     .lock()
                     .expect("close_gate mutex must not be poisoned");
-                let report = app.apply_network_ops_pending_to_open_ledger();
+                let report = app.run_network_ops_sync_batch();
                 tracing::debug!(
                     target: "rpc",
                     applied_report = ?report.is_some(),

@@ -1586,17 +1586,13 @@ pub fn run_networkops_apply_batch_tail<Tx, Held>(
     let pending_transactions = run_networkops_merge_submit_held(pending_transactions, submit_held);
     notify_all();
 
-    // Matches rippled's `while (!transactions_.empty()) { apply(lock); }`
-    // in NetworkOPsImp::transactionBatch: if more transactions arrived during
-    // this batch's processing (from concurrent JtTransaction jobs completing),
-    // immediately re-schedule rather than waiting for the next external trigger.
-    // Without this, relayed transactions accumulate in pending and miss the
-    // current consensus round's open-ledger capture.
-    let dispatch_state = if pending_transactions > 0 {
-        NetworkOpsDispatchState::Scheduled
-    } else {
-        NetworkOpsDispatchState::None
-    };
+    // rippled NetworkOPsImp::apply always ends with `dispatchState_ = None`.
+    // Remaining work is drained by the caller: `transactionBatch` loops while
+    // transactions remain, and `doTransactionSyncBatch` queues a fresh
+    // JtBatch job. Leaving `Scheduled` here without a queued job stalled the
+    // queue forever: every later arrival saw `Scheduled`, only enqueued, and
+    // no job ever ran (testnet 2026-10-19, ~117k transactions retained).
+    let dispatch_state = NetworkOpsDispatchState::None;
 
     NetworkOpsApplyBatchTail {
         cleared: transactions.len(),

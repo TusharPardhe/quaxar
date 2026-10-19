@@ -9101,6 +9101,9 @@ mod tests {
             TxType::ESCROW_FINISH,
             TxType::ESCROW_CANCEL,
             TxType::LOAN_BROKER_SET,
+            // LoanBrokerDelete::doApply creates the owner's holding with
+            // preFeeBalance_ (rippled #8233, fixCleanup3_5_0).
+            TxType::LOAN_BROKER_DELETE,
             TxType::LOAN_BROKER_COVER_WITHDRAW,
             TxType::LOAN_SET,
             TxType::DEPOSIT_PREAUTH,
