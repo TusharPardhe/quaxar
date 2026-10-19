@@ -622,12 +622,31 @@ fn amm_clawback_math(
         if holder_lp > lp_total {
             return Err(Ter::TEC_INTERNAL);
         }
-        let frac = ledger::amm_helpers::stamount_as_number(holder_lp)
-            / ledger::amm_helpers::stamount_as_number(lp_total);
-        let amount1 = amm_clawback_proportional_amount(pool1, frac, RoundingMode::Downward)
-            .ok_or(Ter::TEC_INTERNAL)?;
-        let amount2 = amm_clawback_proportional_amount(pool2, frac, RoundingMode::Downward)
-            .ok_or(Ter::TEC_INTERNAL)?;
+        // rippled AMMWithdraw::equalWithdrawTokens with WithdrawAll::Yes:
+        // the last LP takes the whole pool; otherwise the fraction is the
+        // STAmount quotient `divide(tokens, lptAMMBalance, noIssue())` and
+        // each side uses getRoundedAsset (IsDeposit::No).
+        let (amount1, amount2) = if holder_lp == lp_total {
+            (pool1.clone(), pool2.clone())
+        } else {
+            let frac = ledger::amm_helpers::stamount_as_number(
+                &holder_lp.divide(lp_total, protocol::no_issue()),
+            );
+            (
+                ledger::amm_helpers::get_rounded_asset(
+                    &rules,
+                    pool1,
+                    frac,
+                    ledger::amm_helpers::IsDeposit::No,
+                ),
+                ledger::amm_helpers::get_rounded_asset(
+                    &rules,
+                    pool2,
+                    frac,
+                    ledger::amm_helpers::IsDeposit::No,
+                ),
+            )
+        };
         if amount1.signum() == 0 || amount2.signum() == 0 {
             return Err(Ter::TEC_AMM_FAILED);
         }
@@ -2808,10 +2827,17 @@ fn remove_account_delete_ticket<V: ledger::ApplyView>(
 
 fn remove_account_delete_delegate<V: ledger::ApplyView>(
     view: &mut V,
-    account: AccountID,
+    _account: AccountID,
     entry: Arc<STLedgerEntry>,
 ) -> Ter {
-    let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
+    // rippled DelegateSet::deleteDelegate: the entry sits in both the
+    // delegator's (sfAccount, sfOwnerNode) and the delegatee's
+    // (sfAuthorize, sfDestinationNode) directories. AccountDelete reaches it
+    // from either side, so the directories and owner count come from the
+    // entry, never from the account being deleted (testnet 21660851: the
+    // delegatee deleted itself and quaxar returned tefBAD_LEDGER).
+    let delegator = entry.get_account_id(sf("sfAccount"));
+    let owner_dir = owner_dir_keylet(Uint160::from_void(delegator.data()));
     if !ledger::dir_remove(
         view,
         &owner_dir,
@@ -2838,12 +2864,13 @@ fn remove_account_delete_delegate<V: ledger::ApplyView>(
             return Ter::TEF_BAD_LEDGER;
         }
     }
-    let account_sle = match view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
-    {
-        Ok(Some(sle)) => sle,
-        _ => return Ter::TEF_BAD_LEDGER,
-    };
-    if ledger::decrease_owner_count_for_object(view, &account_sle, &entry, 1).is_err() {
+    // Only the delegating account's owner count was incremented on creation.
+    let owner_sle =
+        match view.peek(protocol::account_keylet(Uint160::from_void(delegator.data()))) {
+            Ok(Some(sle)) => sle,
+            _ => return Ter::TEC_INTERNAL,
+        };
+    if ledger::decrease_owner_count_for_object(view, &owner_sle, &entry, 1).is_err() {
         return Ter::TEF_BAD_LEDGER;
     }
     view.erase(entry)

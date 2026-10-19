@@ -409,8 +409,11 @@ pub fn run_amm_deposit_apply_math_facts(
             if facts.rules.enabled(&fix_ammv1_3()) && lp_tokens.signum() == 0 {
                 return Err(Ter::TEC_AMM_INVALID_TOKENS);
             }
-            let frac = amm_helpers::stamount_as_number(&lp_tokens)
-                / amm_helpers::stamount_as_number(&facts.lp_token_balance);
+            // rippled: `divide(tokensAdj, lptAMMBalance, lptAMMBalance.asset())`,
+            // an STAmount quotient (16 significant digits).
+            let frac = amm_helpers::stamount_as_number(
+                &lp_tokens.divide(&facts.lp_token_balance, facts.lp_token_balance.asset()),
+            );
             let amount1 =
                 amm_helpers::get_rounded_asset(&facts.rules, &facts.pool_amount1, frac, IsDeposit::Yes);
             let amount2 =

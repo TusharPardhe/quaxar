@@ -9,6 +9,14 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- Testnet forks 21660851, 21661277 and 21661304:
+  - AccountDelete by a Delegate's delegatee removes the entry from the
+    delegator's and delegatee's directories and decrements the delegator's
+    OwnerCount, like rippled `DelegateSet::deleteDelegate` (it returned
+    `tefBAD_LEDGER`, dropping the transaction).
+  - Equal AMMWithdraw, AMMDeposit and AMMClawback compute the LP fraction as
+    an STAmount quotient like rippled `divide(tokens, lptAMMBalance, ...)`,
+    not a higher-precision Number quotient.
 - NetworkOps no longer stalls its transaction queue. A synchronous batch
   (ledger close with held transactions, or a local submit) that saw new
   arrivals left the dispatch state `Scheduled` with no job queued, so every
