@@ -1212,6 +1212,69 @@ mod tests {
         )
     }
 
+    /// Testnet 2026-10-19: a synchronous batch (ledger close with held
+    /// transactions) ran while peer transactions arrived. Its tail left
+    /// dispatch at Scheduled with no job queued, so every later arrival only
+    /// enqueued and the pending queue grew forever (~117k transactions).
+    /// rippled's apply always ends at None, so the next arrival queues a job.
+    #[test]
+    fn batch_tail_with_late_arrivals_leaves_dispatch_schedulable() {
+        let runtime = runtime(
+            NetworkOpsOperatingMode::Full,
+            Arc::new(AppLedgerMasterRuntime::default()),
+        );
+        let source = account("7777777777777777777777777777777777777777");
+        let tx = |sequence| {
+            shared_transaction(payment_tx(
+                source,
+                account("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                sequence,
+                None,
+                10,
+            ))
+        };
+        let jobs = std::cell::Cell::new(0usize);
+        let add_job = || {
+            jobs.set(jobs.get() + 1);
+            true
+        };
+
+        // A synchronous owner takes the batch.
+        assert_eq!(
+            runtime.stage_transaction_sync(tx(1), false, true, false),
+            NetworkOpsSyncDispatch::Staged
+        );
+        let (running, start) = runtime.begin_apply_batch();
+        assert_eq!(start.dispatch_state, NetworkOpsDispatchState::Running);
+
+        // A peer transaction arrives while it runs: enqueued, no job.
+        let _ = runtime.stage_transaction_async(tx(2), false, false, false, add_job);
+        assert_eq!(jobs.get(), 0);
+
+        let tail = runtime.finish_apply_batch(&running);
+        assert_eq!(tail.pending_transactions, 1);
+        assert_eq!(tail.dispatch_state, NetworkOpsDispatchState::None);
+
+        // The leftover work can be handed to exactly one fresh job.
+        assert!(runtime.schedule_pending_transaction_batch(add_job));
+        assert_eq!(jobs.get(), 1);
+        assert_eq!(runtime.dispatch_state(), NetworkOpsDispatchState::Scheduled);
+
+        // Even without that hand-off, the next arrival queues a job instead
+        // of only enqueueing (the stall).
+        let runtime = self::runtime(
+            NetworkOpsOperatingMode::Full,
+            Arc::new(AppLedgerMasterRuntime::default()),
+        );
+        let _ = runtime.stage_transaction_sync(tx(1), false, true, false);
+        let (running, _) = runtime.begin_apply_batch();
+        let _ = runtime.stage_transaction_async(tx(2), false, false, false, add_job);
+        let _ = runtime.finish_apply_batch(&running);
+        let _ = runtime.stage_transaction_async(tx(3), false, false, false, add_job);
+        assert_eq!(jobs.get(), 2, "a late arrival after the tail must queue a JtBatch");
+        assert_eq!(runtime.dispatch_state(), NetworkOpsDispatchState::Scheduled);
+    }
+
     #[test]
     fn local_sync_staging_waits_for_running_batch_tail() {
         let runtime = Arc::new(runtime(
@@ -1555,7 +1618,9 @@ mod tests {
                 tail: NetworkOpsApplyBatchTail {
                     cleared: 1,
                     pending_transactions: 2,
-                    dispatch_state: NetworkOpsDispatchState::Scheduled,
+                    // rippled NetworkOPsImp::apply always ends at None; the
+                    // caller drains or schedules the remaining work.
+                    dispatch_state: NetworkOpsDispatchState::None,
                 },
             }
         );
@@ -1743,7 +1808,7 @@ mod tests {
             AppNetworkOpsRuntimeSnapshot {
                 pending_transactions: 2,
                 submit_held: 0,
-                dispatch_state: NetworkOpsDispatchState::Scheduled,
+                dispatch_state: NetworkOpsDispatchState::None,
             }
         );
         assert!(
@@ -1759,19 +1824,24 @@ mod tests {
             runtime.take_pending_batch_panic_recovery(),
             "a caught batch panic must request a fresh guarded recovery batch"
         );
+        // The abort leaves dispatch at None, so the recovery request can
+        // queue exactly one fresh guarded job.
         let scheduled = std::cell::Cell::new(0usize);
+        assert!(
+            runtime.schedule_pending_transaction_batch(|| {
+                scheduled.set(scheduled.get() + 1);
+                true
+            }),
+            "recovered work must be schedulable after the panic abort"
+        );
         assert!(
             !runtime.schedule_pending_transaction_batch(|| {
                 scheduled.set(scheduled.get() + 1);
                 true
             }),
-            "the panic abort already re-schedules the requeued batch, so a second job is rejected"
+            "a second job is rejected while the first is scheduled"
         );
-        assert_eq!(
-            scheduled.get(),
-            0,
-            "recovered work is already scheduled after the panic abort"
-        );
+        assert_eq!(scheduled.get(), 1);
         assert_eq!(runtime.dispatch_state(), NetworkOpsDispatchState::Scheduled);
         assert!(runtime.release_scheduled_transaction_batch_for_retry());
         assert!(

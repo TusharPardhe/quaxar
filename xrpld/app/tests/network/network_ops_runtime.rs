@@ -410,7 +410,7 @@ fn app_network_ops_runtime_apply_pending_keeps_cpp_owner_side_effect_order() {
             tail: NetworkOpsApplyBatchTail {
                 cleared: 1,
                 pending_transactions: 2,
-                dispatch_state: NetworkOpsDispatchState::Scheduled,
+                dispatch_state: NetworkOpsDispatchState::None,
             },
         }
     );

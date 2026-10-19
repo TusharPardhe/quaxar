@@ -891,7 +891,7 @@ fn finish_apply_batch_relocks_before_tail() {
         NetworkOpsApplyBatchTail {
             cleared: 2,
             pending_transactions: 2,
-            dispatch_state: NetworkOpsDispatchState::Scheduled,
+            dispatch_state: NetworkOpsDispatchState::None,
         }
     );
     assert_eq!(pending, vec![1, 2]);
@@ -1185,7 +1185,7 @@ fn apply_batch_tail_clears_then_merges_then_notifies() {
         NetworkOpsApplyBatchTail {
             cleared: 2,
             pending_transactions: 3,
-            dispatch_state: NetworkOpsDispatchState::Scheduled,
+            dispatch_state: NetworkOpsDispatchState::None,
         }
     );
     assert_eq!(pending, vec![1, 2, 3]);
@@ -1220,7 +1220,7 @@ fn apply_batch_tail_notifies_even_without_submit_held() {
         NetworkOpsApplyBatchTail {
             cleared: 1,
             pending_transactions: 1,
-            dispatch_state: NetworkOpsDispatchState::Scheduled,
+            dispatch_state: NetworkOpsDispatchState::None,
         }
     );
     assert_eq!(pending, vec![5]);
@@ -1665,12 +1665,12 @@ fn runtime_state_finish_apply_batch_clears_merges_and_resets_dispatch_owner() {
         NetworkOpsApplyBatchTail {
             cleared: 1,
             pending_transactions: 3,
-            dispatch_state: NetworkOpsDispatchState::Scheduled,
+            dispatch_state: NetworkOpsDispatchState::None,
         }
     );
     assert_eq!(owner.pending_transactions(), &[1, 2, 3]);
     assert!(owner.submit_held().is_empty());
-    assert_eq!(owner.dispatch_state(), NetworkOpsDispatchState::Scheduled);
+    assert_eq!(owner.dispatch_state(), NetworkOpsDispatchState::None);
     assert_eq!(
         calls.into_inner(),
         vec![

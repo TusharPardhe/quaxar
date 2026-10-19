@@ -1097,7 +1097,7 @@ fn networkops_finish_apply_batch_relocks_before_tail() {
         NetworkOpsApplyBatchTail {
             cleared: 2,
             pending_transactions: 2,
-            dispatch_state: NetworkOpsDispatchState::Scheduled,
+            dispatch_state: NetworkOpsDispatchState::None,
         }
     );
     assert_eq!(pending, vec![1, 2]);
@@ -1391,7 +1391,7 @@ fn networkops_apply_batch_tail_clears_then_merges_then_notifies() {
         NetworkOpsApplyBatchTail {
             cleared: 2,
             pending_transactions: 3,
-            dispatch_state: NetworkOpsDispatchState::Scheduled,
+            dispatch_state: NetworkOpsDispatchState::None,
         }
     );
     assert_eq!(pending, vec![1, 2, 3]);
@@ -1426,7 +1426,7 @@ fn networkops_apply_batch_tail_notifies_even_without_submit_held() {
         NetworkOpsApplyBatchTail {
             cleared: 1,
             pending_transactions: 1,
-            dispatch_state: NetworkOpsDispatchState::Scheduled,
+            dispatch_state: NetworkOpsDispatchState::None,
         }
     );
     assert_eq!(pending, vec![5]);
