@@ -4384,8 +4384,12 @@ fn wire_trusted_baseline(driver: &crate::shamap::pruned_driver::PrunedDriver) {
         max_age,
         "trusted committed baseline will roll with every claimed ledger"
     );
+    // Before the first claim, a completed durable acquisition seeds the
+    // baseline (cold sync); see `install_from_completed_acquisition`.
+    let claimed_seq = store.metrics().claimed_seq;
+    baseline::register_completion_source(Arc::clone(&fetch), max_age, claimed_seq.is_some());
 
-    let Some(seq) = store.metrics().claimed_seq else {
+    let Some(seq) = claimed_seq else {
         return;
     };
     let root_hash = match store.claimed_state_root() {
