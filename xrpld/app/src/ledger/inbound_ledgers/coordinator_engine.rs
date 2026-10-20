@@ -182,6 +182,8 @@ pub(crate) struct AppLedgerPlanEngine {
     active_kind: Option<TreeKind>,
     active_plan: Option<TreePlan>,
     pending_full_below: BTreeMap<Uint256, (SharedIntrusive<SHAMapTreeNode>, u32)>,
+    /// Keys of SHAMap nodes in drained write batches awaiting acceptance.
+    written_in_flight: Vec<Uint256>,
     cached_root_steps: u64,
     idle_ready_logged: bool,
 }
@@ -221,6 +223,7 @@ impl AppLedgerPlanEngine {
             active_kind: None,
             active_plan: None,
             pending_full_below: BTreeMap::new(),
+            written_in_flight: Vec::new(),
             cached_root_steps: 0,
             idle_ready_logged: false,
         }
@@ -410,12 +413,22 @@ impl AppLedgerPlanEngine {
         );
         let journal = WorkerJournal;
         let config = LedgerConfig::default();
+        // A NodeStore-durable cached root (read from the store, or written by
+        // an earlier session's accepted batch) attaches without another write,
+        // like rippled's cacheLookup; only a non-durable root is queued.
+        let durable = node.is_persisted();
+        let mut scratch = WorkerStore::default();
+        let store = if durable {
+            &mut scratch
+        } else {
+            &mut self.store
+        };
         self.inbound
             .process_packet_with_family_and_config(
                 &packet,
                 &journal,
                 &config,
-                &mut self.store,
+                store,
                 &mut self.fetch_pack,
                 &self.family,
             )
@@ -426,7 +439,35 @@ impl AppLedgerPlanEngine {
     /// store only collects commands; physical node-store I/O remains outside this
     /// engine through the coordinator write port.
     fn take_accepted_writes(&mut self) -> Vec<PersistNode> {
-        self.store.take_pending_write_nodes()
+        let writes = self.store.take_pending_write_nodes();
+        self.written_in_flight.extend(
+            writes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.object_kind(),
+                        acquisition::StoredObjectKind::AccountNode
+                            | acquisition::StoredObjectKind::TransactionNode
+                    )
+                })
+                .map(|node| *node.key().as_uint256()),
+        );
+        writes
+    }
+
+    /// rippled attaches TreeNodeCache hits without storing them again
+    /// (SHAMap::cacheLookup). Quaxar writes a network- or fetch-pack-origin
+    /// cache hit once for durability; once that batch is accepted the shared
+    /// cached node is durable, so later sessions must treat it as NodeStore
+    /// origin. Without this every acquisition re-wrote each network-origin
+    /// cached node it walked (mainnet catch-up 2026-10-20: ~12k duplicate
+    /// writes/s with a flat store size).
+    fn mark_accepted_writes_persisted(&mut self) {
+        for key in self.written_in_flight.drain(..) {
+            if let Some(node) = self.cache.fetch(&key) {
+                node.mark_persisted();
+            }
+        }
     }
 
     fn map_apply(apply: MissingNodeReadApply) -> PlanReadApply {
@@ -722,7 +763,7 @@ impl TreeEngine for AppLedgerPlanEngine {
             hash,
             canonical.clone(),
         ));
-        if matches!(applied, PlanReadApply::Applied { .. }) {
+        if matches!(applied, PlanReadApply::Applied { .. }) && !canonical.is_persisted() {
             let _ = self
                 .store
                 .store_resident_shamap_node(kind, &canonical, self.inbound.seq());
@@ -783,6 +824,7 @@ impl TreeEngine for AppLedgerPlanEngine {
     }
 
     fn on_persistence_accepted(&mut self) {
+        self.mark_accepted_writes_persisted();
         self.publish_persisted_full_below();
     }
 
@@ -1430,6 +1472,58 @@ mod tests {
             PlanStepOutcome::Complete => {}
             other => panic!("expected complete after read, got {other:?}"),
         }
+    }
+
+    /// Mainnet catch-up 2026-10-20: every new tip acquisition re-wrote each
+    /// network-origin node it found in the shared TreeNodeCache (~12k
+    /// duplicate writes/s, store size flat). After a node's write batch is
+    /// accepted it is durable; a later session must attach it like a
+    /// NodeStore-origin cache hit (rippled SHAMap::cacheLookup) and not queue
+    /// another write.
+    #[test]
+    fn accepted_network_node_is_not_rewritten_by_a_later_session() {
+        let (mut seed, _cache) = seed_with(SEQ);
+        let root = SHAMapTreeNode::new_inner(0);
+        let leaf = SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0xD7; 32]), vec![0u8; 32]),
+            0,
+        );
+        root.set_child_hash(3, leaf.get_hash());
+        root.update_hash();
+        let root_hash = root.get_hash();
+        let header = LedgerHeader {
+            seq: SEQ,
+            account_hash: root_hash,
+            ..LedgerHeader::default()
+        };
+        let session = session_for(&header);
+
+        let mut first = seed
+            .build(session, &base_packet(&header))
+            .expect("first engine");
+        expect_root_request(first.as_mut(), root_hash);
+        first.apply_network_node(TreeKind::State, &root_node_data(&root));
+        assert!(matches!(first.advance(10), PlanStepOutcome::NeedsReads(_)));
+        let written = first.take_persistable_nodes();
+        assert!(
+            written.iter().any(|node| node.key() == root_hash),
+            "the network root is written once"
+        );
+        first.on_persistence_accepted();
+        drop(first);
+
+        let mut second = seed
+            .build(session, &base_packet(&header))
+            .expect("second engine");
+        assert!(matches!(second.advance(10), PlanStepOutcome::NeedsReads(_)));
+        assert!(
+            !second
+                .take_persistable_nodes()
+                .iter()
+                .any(|node| node.key() == root_hash),
+            "a durable cached node must not be written again"
+        );
     }
 
     #[test]
