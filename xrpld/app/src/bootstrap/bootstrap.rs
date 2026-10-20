@@ -904,6 +904,7 @@ pub fn build_bootstrap_root(
         quorum: options.quorum,
         network_quorum,
         ledger_fetch_depth,
+        fee_setup: config_fee_setup(config),
         ..ApplicationRootOptions::default()
     })
     .map_err(|error| error.to_string())?;
@@ -5693,6 +5694,28 @@ fn config_ledger_history(config: &BasicConfig, standalone: bool) -> Result<u32, 
 /// rippled `[fetch_depth]`: default 1,000,000,000; `none` is 0, `full` is
 /// unlimited; a configured value is raised to at least 10. LedgerMaster then
 /// clamps it to `online_delete` (`SHAMapStoreImp::clampFetchDepth`).
+/// rippled `setupFeeVote(section(Sections::kVoting))`: each value overrides
+/// the built-in default only when present and parseable (`reference_fee` as
+/// u64 within the XRPAmount range, the reserves as u32). A validator without
+/// `[voting]` votes the 10/10 XRP/2 XRP defaults, so operators set the
+/// current network values here.
+fn config_fee_setup(config: &BasicConfig) -> crate::load::fee_vote::FeeSetup {
+    let mut setup = crate::load::fee_vote::FeeSetup::default();
+    let voting = config.section("voting");
+    if let Ok(Some(value)) = voting.get::<u64>("reference_fee")
+        && i64::try_from(value).is_ok()
+    {
+        setup.reference_fee = protocol::XRPAmount::from_drops(value as i64);
+    }
+    if let Ok(Some(value)) = voting.get::<u32>("account_reserve") {
+        setup.account_reserve = protocol::XRPAmount::from_drops(i64::from(value));
+    }
+    if let Ok(Some(value)) = voting.get::<u32>("owner_reserve") {
+        setup.owner_reserve = protocol::XRPAmount::from_drops(i64::from(value));
+    }
+    setup
+}
+
 fn config_fetch_depth(config: &BasicConfig) -> Result<u32, String> {
     let fetch_depth = match config_single_legacy(config, "fetch_depth")? {
         None => 1_000_000_000,
@@ -6122,6 +6145,35 @@ mod tests {
         assert_eq!(super::config_fetch_depth(&clamped), Ok(512));
         let bad = legacy_config(&[("fetch_depth", "deep")]);
         assert!(super::config_fetch_depth(&bad).is_err());
+    }
+
+    /// rippled `setupFeeVote`: [voting] overrides each default only when the
+    /// value is present and parseable; account/owner reserves are u32.
+    #[test]
+    fn voting_section_overrides_fee_vote_defaults_like_rippled() {
+        use protocol::XRPAmount;
+        let mut config = basics::basic_config::BasicConfig::new();
+        let defaults = super::config_fee_setup(&config);
+        assert_eq!(defaults.reference_fee, XRPAmount::from_drops(10));
+        assert_eq!(defaults.account_reserve, XRPAmount::from_drops(10_000_000));
+        assert_eq!(defaults.owner_reserve, XRPAmount::from_drops(2_000_000));
+
+        let voting = config.section_mut("voting");
+        voting.set("reference_fee", "10");
+        voting.set("account_reserve", "1000000");
+        voting.set("owner_reserve", "200000");
+        let set = super::config_fee_setup(&config);
+        assert_eq!(set.reference_fee, XRPAmount::from_drops(10));
+        assert_eq!(set.account_reserve, XRPAmount::from_drops(1_000_000));
+        assert_eq!(set.owner_reserve, XRPAmount::from_drops(200_000));
+
+        let mut bad = basics::basic_config::BasicConfig::new();
+        let voting = bad.section_mut("voting");
+        voting.set("account_reserve", "5000000000"); // over u32
+        voting.set("owner_reserve", "lots");
+        let kept = super::config_fee_setup(&bad);
+        assert_eq!(kept.account_reserve, XRPAmount::from_drops(10_000_000));
+        assert_eq!(kept.owner_reserve, XRPAmount::from_drops(2_000_000));
     }
 
     /// online_delete 0 keeps every ledger: no pruning driver is built, so the
