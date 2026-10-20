@@ -4387,9 +4387,34 @@ fn wire_trusted_baseline(driver: &crate::shamap::pruned_driver::PrunedDriver) {
     // Before the first claim, a completed durable acquisition seeds the
     // baseline (cold sync); see `install_from_completed_acquisition`.
     let claimed_seq = store.metrics().claimed_seq;
-    baseline::register_completion_source(Arc::clone(&fetch), max_age, claimed_seq.is_some());
+    let record_store = Arc::clone(&store);
+    let record: baseline::CompletionRecord = Arc::new(move |seq, root| {
+        if let Err(error) = record_store.record_completed(seq, root) {
+            tracing::warn!(target: "acquisition_trace", %error, seq, "trusted baseline: completed ledger not recorded");
+        }
+    });
+    baseline::register_completion_source(
+        Arc::clone(&fetch),
+        max_age,
+        claimed_seq.is_some(),
+        Some(record),
+    );
 
     let Some(seq) = claimed_seq else {
+        // No claim yet: reinstall the newest completed acquisition recorded
+        // before a restart (cold sync interrupted between the initial state
+        // download and the first validated claim).
+        if let Ok(Some((seq, root_hash))) = store.completed()
+            && baseline::install_from_completed_acquisition(seq, root_hash)
+        {
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "trusted_baseline_installed_from_recorded_completion",
+                baseline_seq = seq,
+                baseline_root = %root_hash,
+                "trusted baseline reinstalled from a recorded completed acquisition"
+            );
+        }
         return;
     };
     let root_hash = match store.claimed_state_root() {

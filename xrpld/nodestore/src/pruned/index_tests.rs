@@ -267,6 +267,34 @@ fn owned_tx_nodes_prune_with_their_ledger() {
     );
 }
 
+/// A completed acquisition recorded before the first claim survives a
+/// restart; after a claim, records are ignored (claims own the baseline).
+#[test]
+fn recorded_completion_survives_restart_until_first_claim() {
+    let backend = open_memory();
+    {
+        let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("writer");
+        assert_eq!(writer.completed().expect("read"), None);
+        writer.record_completed(7, hid(70)).expect("record");
+        writer.record_completed(8, hid(80)).expect("record newer");
+    }
+    let mut writer = IndexWriter::open(Arc::clone(&backend)).expect("reopen");
+    assert_eq!(writer.completed().expect("read"), Some((8, hid(80))));
+    store_node(backend.as_ref(), &hid(1));
+    writer.note_stored(hid(1), 1);
+    writer
+        .claim(&ClaimDelta {
+            seq: 10,
+            state_root: hid(10),
+            new_state: vec![hid(1)],
+            dead_state: vec![],
+            owned: vec![],
+        })
+        .expect("claim");
+    writer.record_completed(11, hid(110)).expect("ignored after claim");
+    assert_eq!(writer.completed().expect("read"), Some((8, hid(80))));
+}
+
 #[test]
 fn restart_resumes_from_meta_cursors() {
     let backend = open_memory();
