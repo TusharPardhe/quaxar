@@ -2993,6 +2993,19 @@ fn process_coordinator_completed_inbound_ledger(
     // publish a ledger: the next accepted-boundary reconciliation recomputes
     // current preference before applying switch policy.
     if persisted.acknowledged {
+        let header = durable_ledger.header();
+        if crate::ledger::inbound_ledgers::trusted_baseline::install_from_completed_acquisition(
+            header.seq,
+            *header.account_hash.as_uint256(),
+        ) {
+            tracing::info!(
+                target: "acquisition_trace",
+                event = "trusted_baseline_installed_from_completion",
+                baseline_seq = header.seq,
+                baseline_root = %header.account_hash,
+                "trusted baseline seeded from a completed durable acquisition before the first claim"
+            );
+        }
         // Retain the exact normalized Arc before enqueueing its acknowledgement.
         // Only a later receipt emitted by the coordinator after processing this
         // exact `(handoff, session)` may release either SHAMap graph.

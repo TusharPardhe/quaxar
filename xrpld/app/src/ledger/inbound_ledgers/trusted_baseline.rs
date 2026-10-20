@@ -226,10 +226,77 @@ pub(crate) fn install(baseline: Arc<TrustedBaseline>) {
     }
 }
 
+/// Source for completion-installed baselines: the store reader and age limit
+/// registered at startup, plus whether the store has ever claimed a ledger.
+struct CompletionSource {
+    fetch: BaselineFetch,
+    max_age: u32,
+}
+
+fn completion_source() -> &'static RwLock<Option<CompletionSource>> {
+    static SOURCE: OnceLock<RwLock<Option<CompletionSource>>> = OnceLock::new();
+    SOURCE.get_or_init(|| RwLock::new(None))
+}
+
+fn claimed_any() -> &'static AtomicBool {
+    static CLAIMED: AtomicBool = AtomicBool::new(false);
+    &CLAIMED
+}
+
+/// Register the reader used by [`install_from_completed_acquisition`].
+/// `claimed_at_start` is true when the store already holds a claimed ledger;
+/// claims then own the baseline exclusively.
+pub(crate) fn register_completion_source(fetch: BaselineFetch, max_age: u32, claimed_at_start: bool) {
+    claimed_any().store(claimed_at_start, Ordering::Relaxed);
+    if let Ok(mut guard) = completion_source().write() {
+        *guard = Some(CompletionSource { fetch, max_age });
+    }
+}
+
+/// Install a baseline from a completed, durable acquisition when the store
+/// has never claimed a ledger.
+///
+/// A node that cold-syncs has no claimed ledger, so without this the state
+/// tree it just downloaded is never used as a baseline: every later catch-up
+/// acquisition walks the whole tree again. On mainnet (2026-10-20) each tip
+/// acquisition needed far longer than its idle lifetime, so the node never
+/// reached the tip after a 90-minute initial sync. The completed ledger
+/// passed the durability fence (its whole tree is on disk) and nothing is
+/// deleted before the first claim, so the commit guarantee of a claimed root
+/// holds. The first claim replaces this baseline through [`advance`].
+pub(crate) fn install_from_completed_acquisition(seq: u32, root_hash: Uint256) -> bool {
+    if claimed_any().load(Ordering::Relaxed) || root_hash.is_zero() {
+        return false;
+    }
+    if active().is_some_and(|current| current.seq >= seq) {
+        return false;
+    }
+    let Some((fetch, max_age)) = completion_source()
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|source| (Arc::clone(&source.fetch), source.max_age)))
+    else {
+        return false;
+    };
+    if fetch(&root_hash).is_none() {
+        return false;
+    }
+    let baseline = Arc::new(TrustedBaseline::with_max_age(seq, root_hash, fetch, max_age));
+    let previous = slot()
+        .write()
+        .ok()
+        .and_then(|mut guard| guard.replace(baseline));
+    if let Some(previous) = previous {
+        previous.retire();
+    }
+    true
+}
+
 /// Roll the baseline forward to a newly claimed ledger. The claim is synced
 /// before this runs, so the new root's tree is complete on disk; the previous
 /// baseline is retired (its memo is released once in-flight users drop it).
 pub(crate) fn advance(baseline: Arc<TrustedBaseline>) {
+    claimed_any().store(true, Ordering::Relaxed);
     let previous = slot()
         .write()
         .ok()
@@ -309,6 +376,41 @@ mod tests {
             root.get_hash(),
             reads,
         )
+    }
+
+    /// Mainnet cold sync 2026-10-20: a node with no claimed ledger must seed
+    /// the baseline from its first completed durable acquisition; a newer
+    /// completion replaces it; once any claim exists claims own it.
+    #[test]
+    fn completed_acquisition_seeds_baseline_until_the_first_claim() {
+        clear_for_test();
+        let root = SHAMapTreeNode::new_inner(0);
+        root.set_child_hash(1, hash(0x11));
+        root.update_hash();
+        let root_hash = *root.get_hash().as_uint256();
+        let blob = root.serialize_with_prefix().unwrap();
+        let fetch: BaselineFetch =
+            Arc::new(move |key| (*key == root_hash).then(|| blob.clone()));
+
+        register_completion_source(Arc::clone(&fetch), 256, false);
+        assert!(!install_from_completed_acquisition(10, Uint256::from_array([0xEE; 32])),
+            "a root that is not on disk is never trusted");
+        assert!(install_from_completed_acquisition(10, root_hash));
+        assert_eq!(active().map(|b| b.seq()), Some(10));
+        assert!(!install_from_completed_acquisition(9, root_hash), "older completion ignored");
+        assert!(install_from_completed_acquisition(12, root_hash));
+        assert_eq!(active().map(|b| b.seq()), Some(12));
+
+        advance(Arc::new(TrustedBaseline::new(13, root_hash, Arc::clone(&fetch))));
+        assert!(!install_from_completed_acquisition(20, root_hash),
+            "claims own the baseline after the first claim");
+        assert_eq!(active().map(|b| b.seq()), Some(13));
+
+        register_completion_source(fetch, 256, true);
+        clear_for_test();
+        assert!(!install_from_completed_acquisition(30, root_hash),
+            "a store with a claimed ledger at startup never uses completions");
+        clear_for_test();
     }
 
     #[test]
