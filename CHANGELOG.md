@@ -9,6 +9,10 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- Validators read `[voting]` (`reference_fee`, `account_reserve`,
+  `owner_reserve`) like rippled `setupFeeVote`; the section was ignored, so a
+  validator always voted the 10 XRP / 2 XRP defaults.
+- `fixCleanup3_2_0` default vote is `DefaultNo`, matching rippled.
 - Testnet forks 21660851, 21661277 and 21661304:
   - AccountDelete by a Delegate's delegatee removes the entry from the
     delegator's and delegatee's directories and decrements the delegator's

@@ -97,10 +97,11 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     // release-3.1: cleanup for expired NFT offers, MPToken locked amount,
     // credential deletion errors, PermissionedDEX hybrid validation.
     RegisteredFeature::new("fixCleanup3_1_3", true, RegisteredFeatureVote::DefaultYes),
+    // rippled features.macro: Supported::Yes, VoteBehavior::DefaultNo.
     RegisteredFeature::new(
         FIX_CLEANUP_3_2_0_NAME,
         true,
-        RegisteredFeatureVote::DefaultYes,
+        RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new(
         FIX_CLEANUP_3_3_0_NAME,
