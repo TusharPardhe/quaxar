@@ -231,7 +231,13 @@ pub(crate) fn install(baseline: Arc<TrustedBaseline>) {
 struct CompletionSource {
     fetch: BaselineFetch,
     max_age: u32,
+    /// Durably records the installed completion so a restart before the
+    /// first claim can reinstall it.
+    record: Option<CompletionRecord>,
 }
+
+/// Persists `(seq, state_root)` of a completion-installed baseline.
+pub(crate) type CompletionRecord = Arc<dyn Fn(u32, Uint256) + Send + Sync>;
 
 fn completion_source() -> &'static RwLock<Option<CompletionSource>> {
     static SOURCE: OnceLock<RwLock<Option<CompletionSource>>> = OnceLock::new();
@@ -246,10 +252,19 @@ fn claimed_any() -> &'static AtomicBool {
 /// Register the reader used by [`install_from_completed_acquisition`].
 /// `claimed_at_start` is true when the store already holds a claimed ledger;
 /// claims then own the baseline exclusively.
-pub(crate) fn register_completion_source(fetch: BaselineFetch, max_age: u32, claimed_at_start: bool) {
+pub(crate) fn register_completion_source(
+    fetch: BaselineFetch,
+    max_age: u32,
+    claimed_at_start: bool,
+    record: Option<CompletionRecord>,
+) {
     claimed_any().store(claimed_at_start, Ordering::Relaxed);
     if let Ok(mut guard) = completion_source().write() {
-        *guard = Some(CompletionSource { fetch, max_age });
+        *guard = Some(CompletionSource {
+            fetch,
+            max_age,
+            record,
+        });
     }
 }
 
@@ -271,15 +286,22 @@ pub(crate) fn install_from_completed_acquisition(seq: u32, root_hash: Uint256) -
     if active().is_some_and(|current| current.seq >= seq) {
         return false;
     }
-    let Some((fetch, max_age)) = completion_source()
-        .read()
-        .ok()
-        .and_then(|guard| guard.as_ref().map(|source| (Arc::clone(&source.fetch), source.max_age)))
-    else {
+    let Some((fetch, max_age, record)) = completion_source().read().ok().and_then(|guard| {
+        guard.as_ref().map(|source| {
+            (
+                Arc::clone(&source.fetch),
+                source.max_age,
+                source.record.clone(),
+            )
+        })
+    }) else {
         return false;
     };
     if fetch(&root_hash).is_none() {
         return false;
+    }
+    if let Some(record) = record {
+        record(seq, root_hash);
     }
     let baseline = Arc::new(TrustedBaseline::with_max_age(seq, root_hash, fetch, max_age));
     let previous = slot()
@@ -392,7 +414,7 @@ mod tests {
         let fetch: BaselineFetch =
             Arc::new(move |key| (*key == root_hash).then(|| blob.clone()));
 
-        register_completion_source(Arc::clone(&fetch), 256, false);
+        register_completion_source(Arc::clone(&fetch), 256, false, None);
         assert!(!install_from_completed_acquisition(10, Uint256::from_array([0xEE; 32])),
             "a root that is not on disk is never trusted");
         assert!(install_from_completed_acquisition(10, root_hash));
@@ -406,7 +428,7 @@ mod tests {
             "claims own the baseline after the first claim");
         assert_eq!(active().map(|b| b.seq()), Some(13));
 
-        register_completion_source(fetch, 256, true);
+        register_completion_source(fetch, 256, true, None);
         clear_for_test();
         assert!(!install_from_completed_acquisition(30, root_hash),
             "a store with a claimed ledger at startup never uses completions");

@@ -49,6 +49,9 @@ mod meta_key {
     pub const CLAIMED_STATE_ROOT: &[u8] = b"claimed_state_root";
     pub const PRUNED_TO: &[u8] = b"pruned_to";
     pub const ANCHOR_SEQ: &[u8] = b"anchor_seq";
+    /// Newest fully stored (durably acquired) ledger before the first claim.
+    pub const COMPLETED_SEQ: &[u8] = b"completed_seq";
+    pub const COMPLETED_STATE_ROOT: &[u8] = b"completed_state_root";
 }
 
 /// On-disk schema version for the pruned index.
@@ -171,6 +174,36 @@ impl IndexWriter {
             .backend
             .kv_get(Keyspace::Meta, meta_key::CLAIMED_STATE_ROOT)?
             .and_then(|bytes| Uint256::from_slice(&bytes)))
+    }
+
+    /// Record a durably acquired ledger whose whole state tree is on disk, so a
+    /// restart before the first claim can still seed the trusted baseline.
+    /// Ignored once a ledger has been claimed (claims own the baseline).
+    pub fn record_completed(&mut self, seq: u32, state_root: Uint256) -> Result<(), String> {
+        if self.claimed_seq.is_some() {
+            return Ok(());
+        }
+        let mut batch = KvBatch::new();
+        batch.put(Keyspace::Meta, meta_key::COMPLETED_SEQ, seq.to_le_bytes().to_vec());
+        batch.put(
+            Keyspace::Meta,
+            meta_key::COMPLETED_STATE_ROOT,
+            state_root.as_slice().to_vec(),
+        );
+        self.backend.kv_write_batch(&batch)?;
+        self.backend.kv_persist(PersistMode::SyncAll)
+    }
+
+    /// The recorded completed ledger, if any (see [`Self::record_completed`]).
+    pub fn completed(&self) -> Result<Option<(u32, Uint256)>, String> {
+        let Some(seq) = read_u32(self.backend.as_ref(), meta_key::COMPLETED_SEQ)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .backend
+            .kv_get(Keyspace::Meta, meta_key::COMPLETED_STATE_ROOT)?
+            .and_then(|bytes| Uint256::from_slice(&bytes))
+            .map(|root| (seq, root)))
     }
 
     /// Whether `hash` has reached count 0 and awaits pruning.

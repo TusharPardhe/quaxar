@@ -334,6 +334,22 @@ impl PrunedStore {
             .claimed_state_root()
     }
 
+    /// See `IndexWriter::record_completed`.
+    pub fn record_completed(&self, seq: u32, state_root: Uint256) -> Result<(), String> {
+        self.writer
+            .lock()
+            .expect("pruned store writer mutex")
+            .record_completed(seq, state_root)
+    }
+
+    /// See `IndexWriter::completed`.
+    pub fn completed(&self) -> Result<Option<(u32, Uint256)>, String> {
+        self.writer
+            .lock()
+            .expect("pruned store writer mutex")
+            .completed()
+    }
+
     /// Adopt a freshly snapshot-imported store as the anchor ledger
     /// (design Case 7). The snapshot loader has already written the retained
     /// tree into `nodes` and verified both SHAMap roots. `required` is the
