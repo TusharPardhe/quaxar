@@ -3003,7 +3003,7 @@ fn process_coordinator_completed_inbound_ledger(
                 event = "trusted_baseline_installed_from_completion",
                 baseline_seq = header.seq,
                 baseline_root = %header.account_hash,
-                "trusted baseline seeded from a completed durable acquisition before the first claim"
+                "trusted baseline seeded from a completed durable acquisition (no claim, or the claim is too old)"
             );
         }
         // Retain the exact normalized Arc before enqueueing its acknowledgement.

@@ -279,12 +279,31 @@ pub(crate) fn register_completion_source(
 /// passed the durability fence (its whole tree is on disk) and nothing is
 /// deleted before the first claim, so the commit guarantee of a claimed root
 /// holds. The first claim replaces this baseline through [`advance`].
+///
+/// A claimed store also uses a completion when its claimed baseline cannot
+/// serve this ledger (absent, retired, or older than `max_age`). A validator
+/// restarted with a stale claim (claims stall while it is not validating)
+/// otherwise retires the claim on its first completion and has no baseline at
+/// all, so every later tip acquisition walks the whole tree and the node never
+/// returns to the tip (mainnet 2026-10-21, claim 107812115 vs tip 107813837).
+/// The completion's freshly stored nodes are in `UNCLAIMED` (prune rule R2),
+/// reused dead nodes are pinned (R5), and `max_age` keeps every use inside the
+/// prune window, so the commit guarantee holds until the next claim replaces
+/// it through [`advance`].
 pub(crate) fn install_from_completed_acquisition(seq: u32, root_hash: Uint256) -> bool {
-    if claimed_any().load(Ordering::Relaxed) || root_hash.is_zero() {
+    if root_hash.is_zero() {
         return false;
     }
-    if active().is_some_and(|current| current.seq >= seq) {
-        return false;
+    if let Some(current) = active() {
+        if current.seq >= seq {
+            return false;
+        }
+        if claimed_any().load(Ordering::Relaxed)
+            && !current.is_retired()
+            && !current.is_too_old(seq)
+        {
+            return false;
+        }
     }
     let Some((fetch, max_age, record)) = completion_source().read().ok().and_then(|guard| {
         guard.as_ref().map(|source| {
@@ -428,10 +447,40 @@ mod tests {
             "claims own the baseline after the first claim");
         assert_eq!(active().map(|b| b.seq()), Some(13));
 
-        register_completion_source(fetch, 256, true, None);
+        assert!(install_from_completed_acquisition(13 + 257, root_hash),
+            "a claimed baseline too old for the completion is replaced");
+        assert_eq!(active().map(|b| b.seq()), Some(270));
+
+        register_completion_source(Arc::clone(&fetch), 256, true, None);
         clear_for_test();
-        assert!(!install_from_completed_acquisition(30, root_hash),
-            "a store with a claimed ledger at startup never uses completions");
+        assert!(install_from_completed_acquisition(30, root_hash),
+            "a claimed store with no usable baseline seeds one from a completion");
+        advance(Arc::new(TrustedBaseline::new(40, root_hash, Arc::clone(&fetch))));
+        assert!(!install_from_completed_acquisition(41, root_hash),
+            "a fresh claimed baseline still owns catch-up");
+        clear_for_test();
+    }
+
+    /// Mainnet validator restart 2026-10-21: the claim (107812115) was 1700
+    /// ledgers behind the tip. Its first completion must become the baseline
+    /// instead of leaving the node with none once the claim is retired.
+    #[test]
+    fn stale_claim_is_replaced_by_the_first_completion() {
+        clear_for_test();
+        let root = SHAMapTreeNode::new_inner(0);
+        root.set_child_hash(2, hash(0x22));
+        root.update_hash();
+        let root_hash = *root.get_hash().as_uint256();
+        let blob = root.serialize_with_prefix().unwrap();
+        let fetch: BaselineFetch =
+            Arc::new(move |key| (*key == root_hash).then(|| blob.clone()));
+        register_completion_source(Arc::clone(&fetch), 256, true, None);
+        advance(Arc::new(TrustedBaseline::new(107_812_115, root_hash, Arc::clone(&fetch))));
+
+        assert!(install_from_completed_acquisition(107_813_837, root_hash));
+        assert_eq!(active().map(|b| b.seq()), Some(107_813_837));
+        // The usual too-old retirement now finds a baseline that is current.
+        assert!(!active().unwrap().is_too_old(107_813_840));
         clear_for_test();
     }
 
