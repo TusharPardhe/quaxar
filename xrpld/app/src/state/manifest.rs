@@ -342,14 +342,25 @@ impl ManifestCache {
         include: impl Fn(&PublicKey) -> bool,
     ) -> Result<(), String> {
         let table = manifest_wallet_table(table)?;
-        let rows = self
+        // Snapshot under the lock, then filter with it released. `include` is
+        // ValidatorList::listed, which re-reads this cache (get_master_key).
+        // rippled's ManifestCache::save holds a shared_lock across the same
+        // callback, which pthread's reader-preferring rwlock tolerates; Rust's
+        // std RwLock is writer-preferring, so a recursive read behind a queued
+        // writer (apply_manifest) deadlocked validation, overlay and consensus
+        // (mainnet 2026-10-21 05:14 UTC).
+        let snapshot = self
             .state
             .read()
             .expect("manifest cache read lock")
             .manifests
             .iter()
+            .map(|(public_key, manifest)| (*public_key, manifest.serialized.clone()))
+            .collect::<Vec<_>>();
+        let rows = snapshot
+            .into_iter()
             .filter(|(public_key, _)| include(public_key))
-            .map(|(_, manifest)| manifest.serialized.clone())
+            .map(|(_, serialized)| serialized)
             .collect::<Vec<_>>();
         let mut connection = wallet_db.get_session();
         let transaction = connection

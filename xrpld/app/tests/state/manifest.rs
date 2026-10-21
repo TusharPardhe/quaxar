@@ -283,6 +283,51 @@ fn deserialize_manifest_rejects_invalid_domain_and_revocation_shapes() {
     assert!(deserialize_manifest(&serialize(&bad_revocation_sig)).is_none());
 }
 
+/// Mainnet 2026-10-21 05:14 UTC: `save_to_wallet` held the read lock while
+/// its `include` callback (ValidatorList::listed) re-read the cache. With a
+/// writer (apply_manifest) queued in between, std's writer-preferring RwLock
+/// blocked the recursive read forever, freezing validation, overlay and
+/// consensus. The callback must run with the lock released.
+#[test]
+fn manifest_cache_save_include_may_reread_cache_while_a_writer_waits() {
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    let dir = TempDir::new().expect("wallet tempdir");
+    let wallet = DatabaseCon::new_at_path(dir.path(), WALLET_DB_NAME, &[], WALLET_DB_INIT)
+        .expect("wallet database");
+    let first = build_manifest(KeyType::Ed25519, 73, KeyType::Secp256k1, 83, 1, None);
+    let second = build_manifest(KeyType::Secp256k1, 74, KeyType::Ed25519, 84, 1, None);
+    let cache = Arc::new(ManifestCache::new());
+    assert_eq!(cache.apply_manifest(first.clone()), ManifestDisposition::Accepted);
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let saver_cache = Arc::clone(&cache);
+    let first_master = first.master_key;
+    std::thread::spawn(move || {
+        let writer_cache = Arc::clone(&saver_cache);
+        let writer = std::sync::Mutex::new(Some(second));
+        let result = saver_cache.save_to_wallet(&wallet, "ValidatorManifests", |public_key| {
+            if let Some(manifest) = writer.lock().expect("writer slot").take() {
+                // Queue a writer, give it time to block on the lock, then
+                // re-read the cache exactly as ValidatorList::listed does.
+                let writer_cache = Arc::clone(&writer_cache);
+                std::thread::spawn(move || {
+                    let _ = writer_cache.apply_manifest(manifest);
+                });
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            saver_cache.get_master_key(public_key) == first_master
+        });
+        let _ = done_tx.send(result);
+    });
+
+    let result = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("save_to_wallet must not deadlock on a recursive read behind a writer");
+    assert!(result.is_ok());
+}
+
 #[test]
 fn manifest_cache_wallet_round_trip_preserves_validator_and_publisher_entries() {
     let dir = TempDir::new().expect("wallet tempdir");
