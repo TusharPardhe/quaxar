@@ -5038,6 +5038,13 @@ mod tests {
             .peer_set
             .refresh_peers(vec![Arc::clone(&peer) as Arc<dyn Peer>]);
         state.peer_set.add_peers(1, &mut |_| true, &mut |_| {});
+        // Initialization now ends with a suppressed local probe whose timeout
+        // retry queues one more data turn. Drain setup work first so the
+        // routed packets observe an idle mailbox; otherwise they coalesce into
+        // that already-queued turn and no new worker is submitted.
+        while worker_pool.snapshot().queued_jobs > 0 {
+            assert!(worker_pool.run_next_job_for_test());
+        }
         let queued_before_routes = worker_pool.snapshot().queued_jobs;
 
         let routed_before = registry.lifecycle_snapshot();
