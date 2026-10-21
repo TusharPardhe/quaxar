@@ -6449,6 +6449,11 @@ impl ApplicationRoot {
         .should_relay()
     }
 
+    /// rippled `Config::maxTransactions` (`[max_transactions]`).
+    pub fn set_max_transactions(&mut self, max_transactions: usize) {
+        self.registry.config.max_transactions = max_transactions;
+    }
+
     pub fn set_relay_untrusted_proposals_policy(
         &mut self,
         relay_untrusted_proposals: RelayUntrustedPolicy,

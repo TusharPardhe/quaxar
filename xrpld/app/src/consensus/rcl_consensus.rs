@@ -352,6 +352,13 @@ fn disputed_relay_envelope(
     }
 }
 
+/// rippled `Adaptor::share(RCLCxTx)` relay gate: `HashRouter::shouldRelay`.
+fn disputed_tx_relay_gate(
+    router: Arc<xrpl_core::HashRouter>,
+) -> Arc<dyn Fn(Uint256) -> bool + Send + Sync> {
+    Arc::new(move |id| router.should_relay(id).is_some())
+}
+
 /// The concrete peer-relay implementation.
 pub struct AppRclConsensusRelay {
     overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
@@ -373,10 +380,7 @@ impl AppRclConsensusRelay {
     ) -> Self {
         Self {
             overlay: root.overlay_runtime().map(|rt| rt.overlay()),
-            should_relay: {
-                let router = root.shared_hash_router();
-                Arc::new(move |id| router.should_relay(id).is_some())
-            },
+            should_relay: disputed_tx_relay_gate(root.shared_hash_router()),
             inbound_transactions,
             time_keeper: root.shared_time_keeper(),
             validator_keys,
@@ -447,12 +451,6 @@ impl RclConsensusRelay for AppRclConsensusRelay {
     }
 
     fn relay_disputed_tx(&self, tx: &consensus::RclCxTxRef) {
-        let Some(overlay) = self.overlay.as_ref() else {
-            self.journal
-                .trace("relay_disputed_tx: no overlay attached, skipping broadcast");
-            return;
-        };
-
         // rippled: `if (app_.getHashRouter().shouldRelay(tx.id()))`. Without
         // this gate every consensus round re-sent every disputed tx to every
         // peer; on a cold sync (dozens of disputes per local round) that
@@ -461,6 +459,12 @@ impl RclConsensusRelay for AppRclConsensusRelay {
             self.journal.trace("relay_disputed_tx: suppressed by hash router");
             return;
         }
+        let Some(overlay) = self.overlay.as_ref() else {
+            self.journal
+                .trace("relay_disputed_tx: no overlay attached, skipping broadcast");
+            return;
+        };
+
         // Disputed transactions are a new local relay, not a replay of the
         // untrusted TMTransaction envelope that originally delivered them.
         let message = disputed_relay_envelope(
@@ -2558,6 +2562,18 @@ mod tests {
         let mut guard = inbound.lock().expect("inbound transactions mutex");
         assert!(guard.acquire(stale_set).is_none());
         assert!(guard.get_set(Uint256::zero(), false).is_some());
+    }
+
+    #[test]
+    fn disputed_tx_relay_is_gated_by_hash_router_should_relay() {
+        // rippled Adaptor::share(RCLCxTx): a dispute seen again in the next
+        // round (inside the relay hold time) must not be re-sent to peers.
+        let router = std::sync::Arc::new(xrpl_core::HashRouter::default());
+        let gate = super::disputed_tx_relay_gate(std::sync::Arc::clone(&router));
+        let id = Uint256::from_u64(0xD15B);
+        assert!(gate(id), "first dispute relay is sent");
+        assert!(!gate(id), "repeat within the hold time is suppressed");
+        assert!(gate(Uint256::from_u64(0xD15C)), "other disputes are independent");
     }
 
     #[test]

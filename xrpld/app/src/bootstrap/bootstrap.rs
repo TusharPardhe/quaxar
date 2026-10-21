@@ -911,6 +911,7 @@ pub fn build_bootstrap_root(
     root.configure_manifest_limits(manifest_limits);
 
     root.set_path_search_levels(path_search_old, path_search, path_search_fast);
+    root.set_max_transactions(config_max_transactions(config)?);
     let _ = root.set_path_search_max(path_search_max);
     for (section, is_validation) in [("relay_validations", true), ("relay_proposals", false)] {
         if config.exists(section) {
@@ -1810,12 +1811,37 @@ fn run_start_mode_consensus_loop(
                 let Some(network_ops_runtime) = router_root.network_ops_runtime() else {
                     return;
                 };
+                // rippled checks isNeedNetworkLedger before deserializing or
+                // touching the HashRouter.
+                if router_root.need_network_ledger() {
+                    return;
+                }
                 if !should_schedule_relayed_transaction(
                     network_ops_runtime.hash_router().as_ref(),
                     message.id,
                     peer_id,
                 ) {
                     return;
+                }
+                // A cold-syncing node used to apply and re-relay every peer
+                // transaction to every peer, filling send queues until all
+                // peers were disconnected (mainnet first sync, 2026-10-21).
+                match classify_relayed_transaction(
+                    false,
+                    router_root.validated_ledger_age(),
+                    job_queue.job_count(crate::job::job_types::JobType::JtTransaction),
+                    router_root.config().max_transactions,
+                ) {
+                    RelayedTransactionAdmission::Schedule => {}
+                    RelayedTransactionAdmission::QueueFull => {
+                        tracing::info!(target: "overlay", "Transaction queue is full");
+                        return;
+                    }
+                    RelayedTransactionAdmission::NeedNetworkLedger
+                    | RelayedTransactionAdmission::NotSynchronized => {
+                        tracing::trace!(target: "overlay", "No new transactions until synchronized");
+                        return;
+                    }
                 }
 
                 let root = router_root.clone();
@@ -5805,6 +5831,56 @@ fn config_legacy_usize(config: &BasicConfig, section: &str) -> Option<usize> {
 
 /// Strict legacy-section parser for Config values where malformed, signed, or
 /// multiple entries must fail bootstrap rather than silently choosing a default.
+/// rippled Config.cpp: `maxTransactions = std::clamp(lexicalCastThrow<int>(v),
+/// kMinJobQueueTx, kMaxJobQueueTx)` when `[max_transactions]` is present.
+fn config_max_transactions(config: &BasicConfig) -> Result<usize, String> {
+    use crate::state::app_registry::{DEFAULT_MAX_TRANSACTIONS, MAX_TRANSACTIONS_RANGE};
+    let values = config.section("max_transactions").values();
+    let Some(value) = values.first() else {
+        return Ok(DEFAULT_MAX_TRANSACTIONS);
+    };
+    let parsed = value
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| "invalid [max_transactions] configuration: expected an integer".to_owned())?;
+    let (min, max) = (
+        *MAX_TRANSACTIONS_RANGE.start() as i32,
+        *MAX_TRANSACTIONS_RANGE.end() as i32,
+    );
+    Ok(parsed.clamp(min, max) as usize)
+}
+
+/// rippled PeerImp::handleTransaction admission after `shouldProcess`:
+/// never-synced servers and servers whose validated ledger is older than four
+/// minutes drop relayed transactions ("No new transactions until
+/// synchronized"), and a full JtTransaction backlog drops them too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayedTransactionAdmission {
+    NeedNetworkLedger,
+    NotSynchronized,
+    QueueFull,
+    Schedule,
+}
+
+const RELAYED_TRANSACTION_MAX_VALIDATED_AGE: Duration = Duration::from_secs(4 * 60);
+
+fn classify_relayed_transaction(
+    need_network_ledger: bool,
+    validated_ledger_age: Duration,
+    queued_transaction_jobs: usize,
+    max_transactions: usize,
+) -> RelayedTransactionAdmission {
+    if need_network_ledger {
+        RelayedTransactionAdmission::NeedNetworkLedger
+    } else if validated_ledger_age > RELAYED_TRANSACTION_MAX_VALIDATED_AGE {
+        RelayedTransactionAdmission::NotSynchronized
+    } else if queued_transaction_jobs > max_transactions {
+        RelayedTransactionAdmission::QueueFull
+    } else {
+        RelayedTransactionAdmission::Schedule
+    }
+}
+
 fn config_single_unsigned(config: &BasicConfig, section: &str) -> Result<Option<usize>, String> {
     let values = config.section(section).values();
     match values {
@@ -6453,6 +6529,39 @@ mod tests {
             !should_schedule_coordinator_fetch_pack_wake(1, false),
             "legacy acquisition retains its existing fetch-pack wake path"
         );
+    }
+
+    #[test]
+    fn relayed_transaction_admission_matches_rippled_handle_transaction() {
+        use super::{RelayedTransactionAdmission as A, classify_relayed_transaction as c};
+        let fresh = Duration::from_secs(5);
+        let four_min = Duration::from_secs(240);
+        assert_eq!(c(true, fresh, 0, 250), A::NeedNetworkLedger);
+        // `getValidatedLedgerAge() > 4min`: exactly four minutes still admits.
+        assert_eq!(c(false, four_min, 0, 250), A::Schedule);
+        assert_eq!(c(false, four_min + Duration::from_secs(1), 0, 250), A::NotSynchronized);
+        // Never validated (two weeks) is a cold sync: drop, never re-relay.
+        assert_eq!(c(false, Duration::from_secs(14 * 24 * 3600), 0, 250), A::NotSynchronized);
+        // `getJobCount(jtTRANSACTION) > maxTransactions`.
+        assert_eq!(c(false, fresh, 250, 250), A::Schedule);
+        assert_eq!(c(false, fresh, 251, 250), A::QueueFull);
+    }
+
+    #[test]
+    fn max_transactions_config_is_clamped_like_rippled() {
+        let parse = |value: Option<&str>| {
+            let mut config = basics::basic_config::BasicConfig::new();
+            if let Some(value) = value {
+                config.section_mut("max_transactions").append(value);
+            }
+            super::config_max_transactions(&config)
+        };
+        assert_eq!(parse(None), Ok(250));
+        assert_eq!(parse(Some("500")), Ok(500));
+        assert_eq!(parse(Some("5")), Ok(100));
+        assert_eq!(parse(Some("-3")), Ok(100));
+        assert_eq!(parse(Some("5000")), Ok(1000));
+        assert!(parse(Some("many")).is_err());
     }
 
     #[test]

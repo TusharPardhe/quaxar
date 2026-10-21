@@ -1071,6 +1071,11 @@ impl RelayUntrustedPolicy {
     }
 }
 
+/// rippled `Config::maxTransactions` default.
+pub const DEFAULT_MAX_TRANSACTIONS: usize = 250;
+/// rippled `Config::kMinJobQueueTx..=kMaxJobQueueTx`.
+pub const MAX_TRANSACTIONS_RANGE: std::ops::RangeInclusive<usize> = 100..=1000;
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub wallet_db_path: PathBuf,
@@ -1091,6 +1096,9 @@ pub struct AppConfig {
     pub network_quorum: usize,
     pub validation_seed: Option<String>,
     pub validator_token: Option<Vec<String>>,
+    /// rippled `Config::maxTransactions`: `[max_transactions]` clamped to
+    /// `kMinJobQueueTx..=kMaxJobQueueTx` (100..=1000), default 250.
+    pub max_transactions: usize,
 }
 
 impl Default for AppConfig {
@@ -1110,6 +1118,7 @@ impl Default for AppConfig {
             do_import: false,
             validation_quorum: 1,
             network_quorum: 1,
+            max_transactions: DEFAULT_MAX_TRANSACTIONS,
             validation_seed: None,
             validator_token: None,
         }
@@ -1497,6 +1506,7 @@ impl ApplicationRegistryOwners {
                 do_import: false,
                 validation_quorum: 1,
                 network_quorum: 1,
+                max_transactions: DEFAULT_MAX_TRANSACTIONS,
                 validation_seed: None,
                 validator_token: None,
             },
