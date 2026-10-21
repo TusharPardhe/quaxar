@@ -136,6 +136,9 @@ fn amendments_entry_bytes(amendments: &[Uint256], include_majorities: bool) -> V
         bytes.extend_from_slice(&encode_field_id(14, 18));
         bytes.extend_from_slice(&encode_uint256_field(19, sample_uint256(0xA6)));
         bytes.extend_from_slice(&encode_u32_field(7, 999));
+        // Each sfMajority inner object ends with an object-end marker before
+        // the array end, as in rippled's serialized Amendments entry.
+        bytes.push(OBJECT_END);
         bytes.push(ARRAY_END);
     }
     bytes
@@ -244,13 +247,17 @@ fn build_state_map_with_items(
         .expect("state map item insertion should succeed");
     }
 
-    SyncTree::from_root_with_type(
+    let mut tree = SyncTree::from_root_with_type(
         tree.root(),
         SHAMapType::State,
         backed,
         ledger_seq,
         SyncState::Immutable,
-    )
+    );
+    // Mutations leave hashes dirty (dirtyUp); compute them so the root
+    // carries the real account hash callers put in the ledger header.
+    let _ = tree.hash();
+    tree
 }
 
 fn typed_amendments_entry_bytes(amendments: &[Uint256]) -> Vec<u8> {

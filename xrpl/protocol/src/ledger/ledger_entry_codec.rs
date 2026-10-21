@@ -383,6 +383,8 @@ pub fn encode_constructor_amendments_entry(entry: &ConstructorAmendmentsEntry) -
 pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry) -> Vec<u8> {
     let mut bytes = Vec::new();
     append_u16_field(&mut bytes, SF_LEDGER_ENTRY_TYPE, LT_FEE_SETTINGS);
+    // rippled `STLedgerEntry` always carries the required common `sfFlags`.
+    append_u32_field(&mut bytes, SF_FLAGS, 0);
 
     match entry {
         ConstructorFeeSettingsEntry::Legacy {
@@ -391,9 +393,9 @@ pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry)
             reserve_base,
             reserve_increment,
         } => {
-            // Canonical order: UINT64 fields (type 3) before UINT32 fields (type 2 with
-            // field codes >= 16 which use two-byte encoding sorted after single-byte ids)
-            append_u64_field(&mut bytes, SF_BASE_FEE, base_fee);
+            // Canonical STObject order sorts by (type, field): every UInt32
+            // (type 2) precedes the UInt64 sfBaseFee (type 3). rippled 3.2.0
+            // genesis bytes: 1100732200000000201E...201F...2020...35....
             append_u32_field(&mut bytes, SF_REFERENCE_FEE_UNITS, reference_fee_units);
             if let Some(reserve_base) = reserve_base {
                 append_u32_field(&mut bytes, SF_RESERVE_BASE, reserve_base);
@@ -401,6 +403,7 @@ pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry)
             if let Some(reserve_increment) = reserve_increment {
                 append_u32_field(&mut bytes, SF_RESERVE_INCREMENT, reserve_increment);
             }
+            append_u64_field(&mut bytes, SF_BASE_FEE, base_fee);
         }
         ConstructorFeeSettingsEntry::XrpDrops {
             base_fee_drops,
@@ -1547,9 +1550,11 @@ mod tests {
 
     #[test]
     fn legacy_fee_settings_entry_matches_current_field_layout() {
+        // rippled STLedgerEntry: required sfFlags, then canonical (type, field)
+        // order, so UInt32 fields precede the UInt64 sfBaseFee.
         assert_eq!(
             bytes_to_hex(&encode_fee_settings_entry(10, 20, 30, false)),
-            "11007335000000000000000A201E0000000A201F0000001420200000001E"
+            "1100732200000000201E0000000A201F0000001420200000001E35000000000000000A"
         );
     }
 
@@ -1557,7 +1562,7 @@ mod tests {
     fn xrp_fee_settings_entry_matches_current_field_layout() {
         assert_eq!(
             bytes_to_hex(&encode_fee_settings_entry(11, 22, 33, true)),
-            "1100736016400000000000000B6017400000000000001660184000000000000021"
+            "11007322000000006016400000000000000B6017400000000000001660184000000000000021"
         );
     }
 

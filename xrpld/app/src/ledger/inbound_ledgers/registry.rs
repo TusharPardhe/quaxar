@@ -4998,7 +4998,10 @@ mod tests {
 
     #[test]
     fn registry_ingress_coalesces_and_charges_selected_peer_malformed_packets() {
-        let worker_pool = Arc::new(WorkerPool::new(0));
+        // A real timer thread can fire the 3 s acquisition timeout and queue a
+        // data turn while the test is routing, which makes the coalescing
+        // counts racy. Timers here fire only when the test drives them.
+        let worker_pool = Arc::new(WorkerPool::new_with_manual_timer_for_test(0));
         let (_dir, registry) = registry_with_manual_worker_pool(Arc::clone(&worker_pool));
         let hash = Uint256::from_array([0xC7; 32]);
         let peer = PeerImp::new(
@@ -5038,6 +5041,18 @@ mod tests {
             .peer_set
             .refresh_peers(vec![Arc::clone(&peer) as Arc<dyn Peer>]);
         state.peer_set.add_peers(1, &mut |_| true, &mut |_| {});
+        // Initialization issues a local NodeStore probe on the real read
+        // thread; its completion can queue another turn after the pool looks
+        // empty. Drive setup until the actor is quiescent so the routed
+        // packets observe an idle mailbox instead of coalescing into a late
+        // setup turn.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !state.mailbox_quiescent_for_test() || worker_pool.snapshot().queued_jobs > 0 {
+            assert!(std::time::Instant::now() < deadline, "setup never became quiescent");
+            if !worker_pool.run_next_job_for_test() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
         let queued_before_routes = worker_pool.snapshot().queued_jobs;
 
         let routed_before = registry.lifecycle_snapshot();

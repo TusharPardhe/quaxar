@@ -2383,7 +2383,7 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
 {
     fn get_book_page(
         &self,
-        _ledger: &LedgerLookupLedger,
+        ledger: &LedgerLookupLedger,
         book: protocol::Book,
         _taker: AccountID,
         _proof: bool,
@@ -2405,11 +2405,10 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
             return;
         };
 
-        let Some(ledger) = self
-            .view
-            .validated_ledger()
-            .or_else(|| self.view.closed_ledger())
-        else {
+        // rippled RPC::getBookPage walks the ledger selected by lookupLedger,
+        // not the validated ledger: historical `ledger_index` requests must
+        // see that ledger's book.
+        let Some(ledger) = resolve_lookup_ledger(&self.view, ledger) else {
             obj.insert("offers".to_owned(), offers_array);
             return;
         };

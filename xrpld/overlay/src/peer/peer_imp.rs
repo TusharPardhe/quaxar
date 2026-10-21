@@ -133,7 +133,8 @@ pub struct PeerImp {
     #[cfg(any(test, feature = "charge-capture"))]
     charges: Mutex<Vec<(Charge, String)>>,
     squelch: Mutex<Squelch>,
-    /// Set when a non-droppable message cannot enter the bounded send queue.
+    /// Set when a non-droppable message cannot enter the send queue (byte
+    /// memory guard or a closed session channel).
     /// The session stop signal then tears down the non-reading peer.
     disconnect_requested: AtomicBool,
     /// Installed by OverlayImpl for outbound peers. Mirrors
@@ -183,7 +184,7 @@ struct ListenerCheckState {
 struct PeerOutboundState {
     queued_messages: Vec<Message>,
     queued_bytes: usize,
-    session_tx: Option<mpsc::Sender<Message>>,
+    session_tx: Option<mpsc::UnboundedSender<Message>>,
     /// Shared with the session writer, which decrements it only after each
     /// async socket write completes. This restores the active-session depth
     /// used by PeerImp's lifecycle admission timer.
@@ -682,7 +683,7 @@ impl PeerImp {
 
     pub fn attach_session(
         &self,
-        session_tx: mpsc::Sender<Message>,
+        session_tx: mpsc::UnboundedSender<Message>,
         session_stop: watch::Sender<bool>,
     ) -> (Vec<Message>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let mut outbound_state = self.outbound_state.lock().expect("peer outbound lock");
@@ -910,14 +911,23 @@ impl PeerImp {
     }
 }
 
+/// Reserve one active-session queue slot.
+///
+/// rippled `PeerImp::send` pushes onto an unbounded `sendQueue_`; a peer that
+/// stops reading is disconnected only by `onTimer` after `kSendqIntervals`
+/// consecutive ticks with the queue at or above `kTargetSendQueue`. Only
+/// reply-like traffic is shed at `kDropSendQueue` (rippled skips serving
+/// TMGetLedger/TMGetObjectByHash when `sendQueue_.size() >= kDropSendQueue`).
+/// The byte envelope is a Rust memory guard, not a rippled boundary.
 fn reserve_active_send(
     depth: &AtomicUsize,
     bytes: &AtomicUsize,
     message_bytes: usize,
+    droppable: bool,
 ) -> Option<usize> {
     let depth_before = loop {
         let current = depth.load(Ordering::Acquire);
-        if current >= SEND_QUEUE_CAPACITY {
+        if droppable && current >= SEND_QUEUE_CAPACITY {
             return None;
         }
         if depth
@@ -1002,16 +1012,16 @@ impl Peer for PeerImp {
         };
 
         let Some(queue_depth_before_push) =
-            reserve_active_send(session.1.as_ref(), session.2.as_ref(), message_bytes)
+            reserve_active_send(session.1.as_ref(), session.2.as_ref(), message_bytes, droppable)
         else {
-            // Quaxar's finite queue policy drops reply-like traffic but
-            // disconnects when control/request traffic cannot be retained.
+            // Reply-like traffic is shed at kDropSendQueue. Non-droppable
+            // traffic only reaches here when the byte memory guard is hit.
             if !droppable {
                 self.request_disconnect();
             }
             return;
         };
-        match session.0.try_send(message) {
+        match session.0.send(message) {
             Ok(()) => {
                 // The reset decision is based on the queue depth before this
                 // message was pushed, exactly as in rippled.
@@ -1364,7 +1374,7 @@ mod tests {
             public,
             "queue-depth",
         );
-        let (sender, _receiver) = tokio::sync::mpsc::channel(SEND_QUEUE_CAPACITY);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let (stop, _stop_rx) = tokio::sync::watch::channel(false);
         let (_pending, _depth, _bytes) = peer.attach_session(sender, stop);
 
@@ -1393,7 +1403,7 @@ mod tests {
             public,
             "sendq-reset",
         );
-        let (sender, _receiver) = tokio::sync::mpsc::channel(SEND_QUEUE_CAPACITY);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let (stop, _stop_rx) = tokio::sync::watch::channel(false);
         let (_pending, _depth, _bytes) = peer.attach_session(sender, stop);
 

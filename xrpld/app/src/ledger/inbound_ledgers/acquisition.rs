@@ -1885,6 +1885,16 @@ impl AcquisitionState {
         }
     }
 
+    /// Test-only: the actor has no queued/running turn and no outstanding
+    /// local probe whose NodeStore completion could still queue one.
+    #[cfg(test)]
+    pub(crate) fn mailbox_quiescent_for_test(&self) -> bool {
+        let mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        mailbox.token == AcquisitionWorkToken::Idle
+            && mailbox.local_probes.is_empty()
+            && mailbox.events.is_empty()
+    }
+
     fn begin_acquisition_turn(&self) -> bool {
         let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
         if mailbox.token != AcquisitionWorkToken::Queued {
