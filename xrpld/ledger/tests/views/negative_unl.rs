@@ -23,13 +23,17 @@ fn build_state_map_with_items(items: &[(Uint256, Vec<u8>)], ledger_seq: u32) -> 
         .expect("state map item insertion should succeed");
     }
 
-    SyncTree::from_root_with_type(
+    let mut tree = SyncTree::from_root_with_type(
         tree.root(),
         SHAMapType::State,
         false,
         ledger_seq,
         SyncState::Immutable,
-    )
+    );
+    // Mutations leave hashes dirty (dirtyUp); compute them so the root
+    // carries the real account hash callers put in the ledger header.
+    let _ = tree.hash();
+    tree
 }
 
 fn negative_unl_entry_bytes(
