@@ -1050,7 +1050,17 @@ impl InboundLedgers {
             self.coordinator_budget,
             Box::new(seed),
         );
-        let adapter = build_coordinator_adapter(CoordinatorPortResources {
+        // Off-owner NodeStore presence lookup for reply nodes (rippled
+        // `fetchNodeNT` parity). `QUAXAR_REPLY_PRESENCE=0` disables it.
+        let reply_presence = (!std::env::var("QUAXAR_REPLY_PRESENCE").is_ok_and(|v| v == "0"))
+            .then(|| {
+                super::reply_presence::ReplyPresenceWarmer::start(
+                    Arc::clone(&self.tree_cache),
+                    node_store.clone(),
+                    2,
+                )
+            });
+        let mut adapter = build_coordinator_adapter(CoordinatorPortResources {
             runner,
             peers: overlay::SimplePeerSet::new(self.coordinator_peer_snapshot()),
             broker: self.read_broker.clone(),
@@ -1061,6 +1071,9 @@ impl InboundLedgers {
             timer_pool: Arc::clone(&self.worker_pool),
             phase_mode_owner,
         });
+        if let Some(warmer) = reply_presence {
+            adapter.set_reply_presence(warmer);
+        }
         let ingress = adapter.ingress();
         let wake = adapter.owner_wake();
         let mut guard = self.coordinator.lock().expect("coordinator lock");
