@@ -1526,6 +1526,62 @@ mod tests {
         );
     }
 
+    /// rippled `addKnownNode` → `fetchNodeNT`: a reply node already in the
+    /// NodeStore attaches as a duplicate and is not written. With the
+    /// off-owner presence stage the owner sees it resident and durable.
+    #[test]
+    fn reply_node_already_on_disk_is_not_written_after_presence_lookup() {
+        assert!(!reply_child_written(true), "on-disk fat-reply child must not be written again");
+        assert!(reply_child_written(false), "without the lookup the child is (re)written");
+    }
+
+    /// root (network) -(4)-> inner X (on disk) -(2)-> leaf. A fat reply also
+    /// carries X; returns whether the engine queued a write for X.
+    fn reply_child_written(presence_lookup: bool) -> bool {
+        use super::super::reply_presence::{ReplyPresenceStats, tests as rp, warm_nodes};
+        let (mut seed, cache) = seed_with(SEQ);
+        let leaf = SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0xD8; 32]), vec![0u8; 32]),
+            0,
+        );
+        let x = SHAMapTreeNode::new_inner(0);
+        x.set_child_hash(2, leaf.get_hash());
+        x.update_hash();
+        let root = SHAMapTreeNode::new_inner(0);
+        root.set_child_hash(4, x.get_hash());
+        root.update_hash();
+        let root_hash = root.get_hash();
+        let store = rp::memory_store(if presence_lookup { "engine-rp-on" } else { "engine-rp-off" });
+        rp::store_node(&store, &x);
+        let header = LedgerHeader {
+            seq: SEQ,
+            account_hash: root_hash,
+            ..LedgerHeader::default()
+        };
+        let mut engine = seed
+            .build(session_for(&header), &base_packet(&header))
+            .expect("engine");
+        expect_root_request(engine.as_mut(), root_hash);
+        engine.apply_network_node(TreeKind::State, &root_node_data(&root));
+        let _ = engine.take_persistable_nodes();
+        engine.on_persistence_accepted();
+
+        let x_id = SHAMapNodeId::default().get_child_node_id(4).expect("child id");
+        let reply = InboundLedgerNodeData::new(
+            Some(x_id.get_raw_string()),
+            x.serialize_for_wire().expect("wire"),
+        );
+        if presence_lookup {
+            warm_nodes(&cache, &store, &ReplyPresenceStats::default(), &[reply.node_data.clone()], SEQ);
+        }
+        engine.apply_network_node(TreeKind::State, &reply);
+        engine
+            .take_persistable_nodes()
+            .iter()
+            .any(|node| node.key() == x.get_hash())
+    }
+
     #[test]
     fn durable_read_full_below_survives_engine_replacement_and_cache_sweep() {
         let (mut seed, cache) = seed_with(SEQ);

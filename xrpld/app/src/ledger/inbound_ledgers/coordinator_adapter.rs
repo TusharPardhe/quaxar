@@ -321,6 +321,9 @@ pub(crate) struct CoordinatorIngress {
     control_tx: EventSender,
     stats: Arc<Mutex<AdapterStats>>,
     wake: Arc<CoordinatorOwnerWake>,
+    /// Off-owner NodeStore presence lookup for reply nodes (rippled
+    /// `fetchNodeNT` parity); see `reply_presence`.
+    reply_presence: Option<Arc<super::reply_presence::ReplyPresenceWarmer>>,
 }
 
 impl CoordinatorIngress {
@@ -345,7 +348,25 @@ impl CoordinatorIngress {
             };
             nodes.push(data);
         }
-        self.admit(hash, InboundLedgerPacket::new(packet_type, nodes), peer_id)
+        let warm = self.reply_presence.as_ref().and_then(|warmer| {
+            matches!(
+                packet_type,
+                InboundLedgerDataType::StateNode | InboundLedgerDataType::TransactionNode
+            )
+            .then(|| {
+                (
+                    Arc::clone(warmer),
+                    nodes.iter().map(|node| node.node_data.clone()).collect::<Vec<_>>(),
+                )
+            })
+        });
+        let disposition = self.admit(hash, InboundLedgerPacket::new(packet_type, nodes), peer_id);
+        if disposition == LedgerDataIngressDisposition::Delivered
+            && let Some((warmer, raw)) = warm
+        {
+            warmer.submit(raw, 0);
+        }
+        disposition
     }
 
     fn admit(
@@ -606,6 +627,7 @@ where
             control_tx: tx.clone(),
             stats: Arc::new(Mutex::new(AdapterStats::default())),
             wake: Arc::clone(&owner_wake),
+            reply_presence: None,
         };
         let mut adapter = Self {
             runner,
@@ -660,6 +682,15 @@ where
 
     /// Clone the immutable overlay-ingress capability. It remains usable while
     /// the owner is dispatching effects under its mutable adapter lock.
+    /// Install the off-owner reply presence stage before publishing the
+    /// ingress (see `reply_presence`).
+    pub(crate) fn set_reply_presence(
+        &mut self,
+        warmer: Arc<super::reply_presence::ReplyPresenceWarmer>,
+    ) {
+        self.ingress.reply_presence = Some(warmer);
+    }
+
     pub(crate) fn ingress(&self) -> CoordinatorIngress {
         self.ingress.clone()
     }

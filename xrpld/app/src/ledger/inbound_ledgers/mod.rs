@@ -21,6 +21,7 @@ mod coordinator_ports;
 mod read_broker;
 mod registry;
 mod scheduler;
+pub(crate) mod reply_presence;
 pub(crate) mod trusted_baseline;
 pub(crate) mod wire_ledger_node;
 mod worker_pool;
