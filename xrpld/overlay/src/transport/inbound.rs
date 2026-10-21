@@ -560,7 +560,7 @@ impl QueuedOverlayInboundHandler {
             // This matching reply cannot be retained without exceeding the
             // finite configured active-session envelope. It was not admitted
             // to Worker 2, so disconnect is the terminal transport owner.
-            peer.request_disconnect();
+            peer.request_disconnect_because("deferred ledger data over byte limit");
             return LedgerDataIngressDisposition::Delivered;
         }
         bytes.current += reserved_bytes;
@@ -1245,7 +1245,7 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
                         queued_bytes,
                         "ledger_data",
                     ) {
-                        peer.request_disconnect();
+                        peer.request_disconnect_because("fallback ledger_data queue full");
                     }
                 }
                 None

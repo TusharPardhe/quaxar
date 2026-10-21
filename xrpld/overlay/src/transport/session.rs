@@ -256,7 +256,7 @@ impl PeerSession {
             Arc::clone(&self.on_close),
         );
         if self.initial_buffer_rejected {
-            self.peer.request_disconnect();
+            self.peer.request_disconnect_because("initial read-ahead too large");
             return Err(OverlayError::InvalidRequest(
                 "initial read-ahead exceeded session raw frame capacity".to_owned(),
             ));
