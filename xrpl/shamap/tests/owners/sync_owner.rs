@@ -1042,15 +1042,17 @@ fn shamap_sync_tree_add_known_node_with_family_logs_unable_to_hook_sequence() {
 
     let result = tree.add_known_node_with_family(target, &raw_wire, &mut no_filter, &family);
 
-    assert!(result.is_useful());
+    // rippled addKnownNode: data that hashes to the child at `stuck` but is
+    // labelled for a deeper position is not the node that was asked for, so it
+    // is reported invalid and nothing is hooked.
+    assert!(result.is_invalid());
     assert!(root.get_child(1).is_none());
     assert_eq!(
         journal.entries(),
-        vec![
-            (JournalLevel::Warn, format!("unable to hook node {target}"),),
-            (JournalLevel::Info, format!(" stuck at {stuck}"),),
-            (JournalLevel::Info, "got depth=2, walked to= 1".to_owned(),),
-        ]
+        vec![(
+            JournalLevel::Warn,
+            format!("Unable to hook node {target}, stuck at {stuck}"),
+        )]
     );
 }
 
