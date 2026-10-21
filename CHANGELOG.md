@@ -9,6 +9,12 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- A restart whose last pruned-store claim is older than the baseline age limit
+  now seeds the restart baseline from its first completed acquisition. The
+  stale claim used to be retired with no replacement, so every later tip
+  acquisition walked the whole state tree and the validator stayed
+  `connected` (mainnet 2026-10-21).
+
 - Cold sync no longer drops every peer. Like rippled, a full send queue never
   disconnects a peer (only the large-sendq timer does; reply traffic is shed
   at `kDropSendQueue`), peer transactions are ignored until synchronized or
