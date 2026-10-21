@@ -1985,12 +1985,13 @@ fn generate_fibonacci_amm_offer(
     if iteration as usize >= AMM_FIBONACCI.len() {
         return None;
     }
-    let initial_input_number = {
-        let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
-        crate::domain::amm_helpers::stamount_as_number(initial_in)
-            * RuntimeNumber::from_i64_and_exponent(5, 0)
-            / RuntimeNumber::from_i64_and_exponent(20_000, 0)
-    };
+    // rippled AMMLiquidity: `kInitialFibSeqPct = Number(5) / 20000` is the
+    // exact constant 25e-5, and `kInitialFibSeqPct * initialBalances_.in` is
+    // one multiplication in the caller's rounding mode before toAmount rounds
+    // Upward. Multiplying by 5 and then dividing rounds twice and can land one
+    // ULP high (mainnet 107805957: 9893.872922797040 vs ...038).
+    let initial_input_number = crate::domain::amm_helpers::stamount_as_number(initial_in)
+        * RuntimeNumber::from_i64_and_exponent(25, -5);
     let initial_input = number_to_amount(
         initial_in.asset(),
         initial_input_number,
@@ -4073,6 +4074,31 @@ mod tests {
             crate::domain::amm_helpers::stamount_as_number(&first.1)
                 * RuntimeNumber::from_i64_and_exponent(2, 0)
         );
+    }
+
+    /// rippled 3.4 oracle trace for mainnet 107805957 (AMMLiquidity::getOffer):
+    /// pool 39575491.69118815 Xmen / 79918630.99338506 FUZZY, fee 1000, gives
+    /// the initial Fibonacci offer 9893.872922797038 / 19774.96686652.
+    /// `kInitialFibSeqPct * balance` is ONE multiplication by 25e-5; quaxar's
+    /// multiply-by-5-then-divide rounded twice and produced ...040.
+    #[test]
+    fn initial_fibonacci_offer_matches_rippled_single_multiply() {
+        // Mainnet at 107805957: no SingleAssetVault/LendingProtocol/MPTokensV2,
+        // so rippled's createGuards selects the Small mantissa scale.
+        let _scale = basics::number::NumberMantissaScaleGuard::new(basics::number::MantissaScale::Small);
+        let issuer = AccountID::from_array([0x31; 20]);
+        let xmen = Asset::Issue(protocol::Issue::new(protocol::currency_from_string("XMN"), issuer));
+        let fuzzy = Asset::Issue(protocol::Issue::new(protocol::currency_from_string("FZY"), issuer));
+        let amount = |asset, mantissa, exponent| {
+            STAmount::new_with_asset(sf("sfAmount"), asset, mantissa, exponent, false)
+        };
+        let pool_in = amount(xmen, 3_957_549_169_118_815, -8);
+        let pool_out = amount(fuzzy, 7_991_863_099_338_506, -8);
+        let (offer_in, offer_out) =
+            generate_fibonacci_amm_offer(&pool_in, &pool_out, &pool_in, &pool_out, 1000, true, 0)
+                .expect("initial Fibonacci AMM offer");
+        assert_eq!(offer_in, amount(xmen, 9_893_872_922_797_038, -12));
+        assert_eq!(offer_out, amount(fuzzy, 1_977_496_686_652_000, -11));
     }
 
     #[test]
