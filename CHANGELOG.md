@@ -9,6 +9,13 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- Cold sync no longer drops every peer. Like rippled, a full send queue never
+  disconnects a peer (only the large-sendq timer does; reply traffic is shed
+  at `kDropSendQueue`), peer transactions are ignored until synchronized or
+  when `max_transactions` jobs are waiting (`[max_transactions]` is now read),
+  and disputed transactions are relayed only when `HashRouter::shouldRelay`
+  allows it.
+
 - Validators read `[voting]` (`reference_fee`, `account_reserve`,
   `owner_reserve`) like rippled `setupFeeVote`; the section was ignored, so a
   validator always voted the 10 XRP / 2 XRP defaults.
