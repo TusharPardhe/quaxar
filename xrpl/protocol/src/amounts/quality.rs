@@ -228,15 +228,20 @@ impl QualityFunction {
     }
 }
 
+/// rippled `composedQuality`. Its input/exponent checks are `XRPL_ASSERT`,
+/// a plain `assert` compiled out in release builds, so a zero step rate
+/// composes to a zero quality instead of aborting. A release `assert!` here
+/// panicked mainnet payment flows (2026-10-21 07:38 UTC, "nonzero right
+/// input") where rippled continues.
 pub fn composed_quality(lhs: Quality, rhs: Quality) -> Quality {
     let lhs_rate = lhs.rate();
-    assert!(
+    debug_assert!(
         lhs_rate.signum() != 0,
         "xrpl::composed_quality : nonzero left input"
     );
 
     let rhs_rate = rhs.rate();
-    assert!(
+    debug_assert!(
         rhs_rate.signum() != 0,
         "xrpl::composed_quality : nonzero right input"
     );
@@ -245,7 +250,7 @@ pub fn composed_quality(lhs: Quality, rhs: Quality) -> Quality {
     let stored_exponent = (rate.exponent() + 100) as u64;
     let stored_mantissa = rate.mantissa();
 
-    assert!(
+    debug_assert!(
         (1..=255).contains(&stored_exponent),
         "xrpl::composed_quality : valid exponent"
     );
@@ -984,6 +989,18 @@ mod int64_wrap_parity_tests {
 
 #[cfg(test)]
 mod cleanup_3_5_mpt_operand_div_round_tests {
+    /// rippled release `composedQuality` with a zero step rate: mulRound of a
+    /// zero rate is the canonical zero (exponent -100, mantissa 0), so the
+    /// composed quality encodes as 0 instead of aborting.
+    #[test]
+    fn zero_rate_product_encodes_as_zero_quality() {
+        let zero = Quality::from_value(0).rate();
+        let one = Quality::from_value((100u64 << 56) | 1_000_000_000_000_000).rate();
+        let rate = mul_round(&zero, &one, zero.asset(), true);
+        assert_eq!(rate.signum(), 0);
+        assert_eq!(((rate.exponent() + 100) as u64) << 56 | rate.mantissa(), 0);
+    }
+
     use super::*;
     use crate::{CurrentTransactionRulesGuard, Issue, MPTIssue, Rules};
 
