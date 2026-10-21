@@ -4076,6 +4076,31 @@ mod tests {
         );
     }
 
+    /// rippled 3.4 oracle trace for mainnet 107805957 (AMMLiquidity::getOffer):
+    /// pool 39575491.69118815 Xmen / 79918630.99338506 FUZZY, fee 1000, gives
+    /// the initial Fibonacci offer 9893.872922797038 / 19774.96686652.
+    /// `kInitialFibSeqPct * balance` is ONE multiplication by 25e-5; quaxar's
+    /// multiply-by-5-then-divide rounded twice and produced ...040.
+    #[test]
+    fn initial_fibonacci_offer_matches_rippled_single_multiply() {
+        // Mainnet at 107805957: no SingleAssetVault/LendingProtocol/MPTokensV2,
+        // so rippled's createGuards selects the Small mantissa scale.
+        let _scale = basics::number::NumberMantissaScaleGuard::new(basics::number::MantissaScale::Small);
+        let issuer = AccountID::from_array([0x31; 20]);
+        let xmen = Asset::Issue(protocol::Issue::new(protocol::currency_from_string("XMN"), issuer));
+        let fuzzy = Asset::Issue(protocol::Issue::new(protocol::currency_from_string("FZY"), issuer));
+        let amount = |asset, mantissa, exponent| {
+            STAmount::new_with_asset(sf("sfAmount"), asset, mantissa, exponent, false)
+        };
+        let pool_in = amount(xmen, 3_957_549_169_118_815, -8);
+        let pool_out = amount(fuzzy, 7_991_863_099_338_506, -8);
+        let (offer_in, offer_out) =
+            generate_fibonacci_amm_offer(&pool_in, &pool_out, &pool_in, &pool_out, 1000, true, 0)
+                .expect("initial Fibonacci AMM offer");
+        assert_eq!(offer_in, amount(xmen, 9_893_872_922_797_038, -12));
+        assert_eq!(offer_out, amount(fuzzy, 1_977_496_686_652_000, -11));
+    }
+
     #[test]
     fn shared_amm_context_counts_only_selected_used_iterations() {
         let account = AccountID::from_array([0x44; 20]);
