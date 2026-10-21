@@ -646,7 +646,10 @@ fn inbound_receive_known_tx_node_attaches_child() {
     root.set_child_hash(3, child.get_hash());
     root.update_hash();
 
-    let header = sample_header(603, SHAMapHash::default(), root.get_hash());
+    // rippled `failOnZeroAccountHash`: a zero account hash fails the
+    // acquisition at takeHeader, so the header needs a real state root even
+    // though only the transaction tree is exercised here.
+    let header = sample_header(603, sample_hash(0x63), root.get_hash());
     let wanted_hash = calculate_ledger_hash(&header);
     let family = family("inbound-receive-known-tx");
     let journal = RecordingJournal::default();

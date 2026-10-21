@@ -449,7 +449,11 @@ fn last_valid_ledger_rejects_conflicting_cached_and_acquired_lcl_candidates() {
 
     let compatible = linked_ledger(&quorum_backed, 141);
     let cached_conflict = immutable_ledger(41, 0x99, 0x41);
-    let acquired_conflict = immutable_ledger(42, 0x98, 0x42);
+    // rippled areCompatible only rejects a later ledger whose `hashOfSeq` for
+    // the anchor sequence is known and differs. A seq-42 ledger without a skip
+    // list has no hash for seq 40 and is compatible, so the conflicting
+    // acquired candidate is a direct child (seq 41) with a different parent.
+    let acquired_conflict = immutable_ledger(41, 0x98, 0x42);
     master
         .ledger_history()
         .insert(Arc::clone(&cached_conflict), false);
