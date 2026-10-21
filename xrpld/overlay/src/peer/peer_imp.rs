@@ -1019,6 +1019,10 @@ impl Peer for PeerImp {
             // Quaxar's finite queue policy drops reply-like traffic but
             // disconnects when control/request traffic cannot be retained.
             if !droppable {
+                let kind = format!("{:?}", message.protocol().payload);
+                let kind = kind.split(['(', ' ', '{']).next().unwrap_or("?").to_owned();
+                tracing::warn!(target: "overlay", peer_id = %self.id, kind = %kind,
+                    bytes = message_bytes, "send queue full on non-droppable message");
                 self.request_disconnect_because("send: session queue full");
             }
             return;
