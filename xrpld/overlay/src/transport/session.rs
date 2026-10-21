@@ -127,10 +127,10 @@ impl PeerSessionStarter {
         let initial_buffer_rejected = self.initial_buffer_rejected;
         let stop_requested = self.stop_requested.clone();
         let (session_stop_tx, session_stop_rx) = watch::channel(false);
-        // The bounded sender preserves one owner per accepted message. Sustained
-        // large queues still use PeerImp's timer; immediate saturation follows
-        // the peer's explicit drop/disconnect policy.
-        let (sender, receiver) = mpsc::channel(crate::peer_imp::SEND_QUEUE_CAPACITY);
+        // rippled's sendQueue_ is unbounded; PeerImp's timer disconnects a
+        // peer whose queue stays large (kSendqIntervals ticks), and reply-like
+        // traffic is shed at kDropSendQueue inside PeerImp::send.
+        let (sender, receiver) = mpsc::unbounded_channel();
         let (pending, outbound_queue_depth, outbound_queue_bytes) =
             peer.attach_session(sender.clone(), session_stop_tx);
         tracing::debug!(
@@ -164,7 +164,7 @@ struct PeerSession {
     stream: Option<BoxPeerSessionStream>,
     initial_buffer: Vec<u8>,
     initial_buffer_rejected: bool,
-    outbound: mpsc::Receiver<Message>,
+    outbound: mpsc::UnboundedReceiver<Message>,
     pending_outbound: Vec<Message>,
     outbound_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
     outbound_queue_bytes: Arc<std::sync::atomic::AtomicUsize>,
@@ -224,7 +224,7 @@ impl PeerSession {
         stream: BoxPeerSessionStream,
         initial_buffer: Vec<u8>,
         initial_buffer_rejected: bool,
-        outbound: mpsc::Receiver<Message>,
+        outbound: mpsc::UnboundedReceiver<Message>,
         pending_outbound: Vec<Message>,
         outbound_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
         outbound_queue_bytes: Arc<std::sync::atomic::AtomicUsize>,
@@ -328,7 +328,7 @@ impl PeerSession {
         // messages, both running concurrently on the tokio runtime.
         let mut outbound_rx = std::mem::replace(
             &mut self.outbound,
-            mpsc::channel(1).1, // placeholder — won't be used
+            mpsc::unbounded_channel().1, // placeholder — won't be used
         );
         let mut writer_stop = self.stop_requested.clone();
         let mut writer_session_stop = self.session_stop.clone();

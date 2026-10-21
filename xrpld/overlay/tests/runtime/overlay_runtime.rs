@@ -751,9 +751,40 @@ fn duplicate_deferred_ledger_data_is_dropped_without_replacing_the_retained_fram
 }
 
 #[test]
-fn active_send_item_and_byte_pressure_use_191_192_193_session_boundary() {
+fn reply_traffic_is_shed_at_drop_send_queue_without_disconnect() {
+    // rippled does not serve TMGetLedger/TMGetObjectByHash once
+    // sendQueue_.size() >= kDropSendQueue (192); the peer stays connected.
+    let peer = peer(126, 126);
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (stop, _stop_rx) = tokio::sync::watch::channel(false);
+    let (_pending, depth, _bytes) = peer.attach_session(sender, stop);
+    let reply = || {
+        Message::new(
+            ProtocolMessage::new(ProtocolPayload::LedgerData(TmLedgerData {
+                ledger_hash: Uint256::from_u64(7).data().to_vec(),
+                ledger_seq: 7,
+                ..TmLedgerData::default()
+            })),
+            None,
+        )
+    };
+    for _ in 0..192 {
+        peer.send(reply());
+    }
+    assert_eq!(depth.load(Ordering::Acquire), 192);
+    peer.send(reply());
+    assert_eq!(depth.load(Ordering::Acquire), 192, "reply at kDropSendQueue is shed");
+    assert!(!peer.disconnect_requested());
+}
+
+#[test]
+fn active_send_queue_is_unbounded_for_control_traffic_like_rippled_send_queue() {
+    // rippled PeerImp::send pushes every message onto an unbounded sendQueue_;
+    // only onTimer disconnects a peer whose queue stays >= kTargetSendQueue
+    // for kSendqIntervals ticks. Disconnecting on a momentary burst dropped
+    // every peer during a mainnet cold sync (2026-10-21).
     let peer = peer(125, 125);
-    let (sender, _receiver) = tokio::sync::mpsc::channel(192);
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     let (stop, _stop_rx) = tokio::sync::watch::channel(false);
     let (_pending, depth, bytes) = peer.attach_session(sender, stop);
     let large = Message::new(
@@ -770,8 +801,8 @@ fn active_send_item_and_byte_pressure_use_191_192_193_session_boundary() {
     assert_eq!(depth.load(Ordering::Acquire), 1);
     assert_eq!(bytes.load(Ordering::Acquire), large_bytes);
 
-    for sequence in 1..=190 {
-        peer.send(Message::new(
+    let ping = |sequence: u32| {
+        Message::new(
             ProtocolMessage::new(ProtocolPayload::Ping(TmPing {
                 r#type: 0,
                 seq: Some(sequence),
@@ -779,35 +810,19 @@ fn active_send_item_and_byte_pressure_use_191_192_193_session_boundary() {
                 net_time: None,
             })),
             None,
-        ));
+        )
+    };
+    for sequence in 1..=400 {
+        peer.send(ping(sequence));
     }
-    assert_eq!(depth.load(Ordering::Acquire), 191);
+    assert_eq!(
+        depth.load(Ordering::Acquire),
+        401,
+        "control traffic past kDropSendQueue (192) is still queued"
+    );
     assert!(bytes.load(Ordering::Acquire) > large_bytes);
-    assert!(!peer.disconnect_requested());
-
-    peer.send(Message::new(
-        ProtocolMessage::new(ProtocolPayload::Ping(TmPing {
-            r#type: 0,
-            seq: Some(191),
-            ping_time: None,
-            net_time: None,
-        })),
-        None,
-    ));
-    assert_eq!(depth.load(Ordering::Acquire), 192);
-    assert!(!peer.disconnect_requested());
-
-    peer.send(Message::new(
-        ProtocolMessage::new(ProtocolPayload::Ping(TmPing {
-            r#type: 0,
-            seq: Some(192),
-            ping_time: None,
-            net_time: None,
-        })),
-        None,
-    ));
     assert!(
-        peer.disconnect_requested(),
-        "non-droppable traffic has the explicit terminal disposition at 193"
+        !peer.disconnect_requested(),
+        "a send burst never disconnects; only the large-sendq timer does"
     );
 }
