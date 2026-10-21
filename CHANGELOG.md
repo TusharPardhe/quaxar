@@ -15,6 +15,9 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
   when `max_transactions` jobs are waiting (`[max_transactions]` is now read),
   and disputed transactions are relayed only when `HashRouter::shouldRelay`
   allows it.
+- `book_offers` reads the ledger selected by `ledger_index`/`ledger_hash`
+  like rippled `getBookPage`; it always walked the validated ledger, so
+  historical requests returned the wrong book.
 
 - Validators read `[voting]` (`reference_fee`, `account_reserve`,
   `owner_reserve`) like rippled `setupFeeVote`; the section was ignored, so a

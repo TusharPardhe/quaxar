@@ -1,5 +1,6 @@
 //! Tests for state.
 
+mod book_offers_ledger;
 mod context;
 mod feature;
 mod server_definitions;
