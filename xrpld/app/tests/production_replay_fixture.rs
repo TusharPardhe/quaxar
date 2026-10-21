@@ -525,3 +525,24 @@ fn run_sparse_replay(path: PathBuf) {
         );
     }
 }
+
+/// Testnet fork at 21714828 (2026-10-21): an auto-bridged OfferCreate crosses
+/// the taker's own offer reached straight from its DirectStepI. rippled's
+/// BookOfferCrossingStep::getOfrInRate waives the issuer transfer fee for
+/// that offer; quaxar charged it and moved the taker's LNK line.
+#[test]
+fn sparse_testnet_21714828_own_offer_transfer_rate_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21714828_own_offer_transfer_rate.jsonl"),
+    );
+}
+
+/// Testnet fork at 21710926 (2026-10-21): same own-offer transfer-rate waiver.
+#[test]
+fn sparse_testnet_21710926_own_offer_transfer_rate_matches_network_metadata() {
+    run_sparse_replay(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sparse_replay/testnet_21710926_own_offer_transfer_rate.jsonl"),
+    );
+}

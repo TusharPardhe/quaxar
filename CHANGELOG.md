@@ -9,6 +9,12 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- Offer crossing waives the issuer transfer fee on the taker's own offer
+  reached from its DirectStepI, and on an offer owned by the strand
+  destination after a BookStep, like rippled `BookOfferCrossingStep`
+  `getOfrInRate`/`getOfrOutRate`. Testnet forked five times on 2026-10-21
+  (21710926, 21713046, 21714093, 21714828, 21715843).
+
 - A restart whose last pruned-store claim is older than the baseline age limit
   now seeds the restart baseline from its first completed acquisition. The
   stale claim used to be retired with no replacement, so every later tip
