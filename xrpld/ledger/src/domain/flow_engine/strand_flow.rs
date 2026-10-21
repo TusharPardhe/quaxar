@@ -43,6 +43,13 @@ pub fn execute_strands<V: ApplyView>(
     quality_threshold: Option<Quality>,
     self_cross_cancellation: Option<SelfCrossCancellation>,
 ) -> FlowResult {
+    // rippled StrandFlow keeps `ofrsToRm` for every flow, not only offer
+    // crossing: expired, unfunded or malformed offers found by any strand in a
+    // pass (including a reverse pass whose sandbox is later reset, or a dry
+    // strand) are deleted from the flow sandbox after the pass. Payments
+    // previously passed no collector, so such offers stayed on the book
+    // (mainnet 107803763, 107806372).
+    let self_cross_cancellation = Some(self_cross_cancellation.unwrap_or_default());
     let fill_or_kill_enabled = view.rules().enabled(&protocol::feature_id("fixFillOrKill"));
     if strands.is_empty() {
         return FlowResult {
