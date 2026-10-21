@@ -9,6 +9,10 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- `book_offers` reads the ledger selected by `ledger_index`/`ledger_hash`
+  like rippled `getBookPage`; it always walked the validated ledger, so
+  historical requests returned the wrong book.
+
 - Validators read `[voting]` (`reference_fee`, `account_reserve`,
   `owner_reserve`) like rippled `setupFeeVote`; the section was ignored, so a
   validator always voted the 10 XRP / 2 XRP defaults.
