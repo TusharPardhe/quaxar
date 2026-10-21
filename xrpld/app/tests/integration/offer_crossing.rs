@@ -4583,3 +4583,74 @@ fn partial_cross_syd_existing_line_has_no_reduction_like_rippled() {
     assert_eq!(usd, "0.00001");
     assert_eq!(owners, 1);
 }
+
+/// Mainnet 107806372 (tx 0D5229DA) / 107803763: a SendMax-limited payment.
+/// The reverse pass consumes the best offer completely and steps past it to an
+/// expired offer, recording it in rippled's `ofrsToRm`. The SendMax limit then
+/// resets the sandbox and the forward pass only partially consumes the best
+/// offer, never reaching the expired one. rippled still deletes the expired
+/// offer after the pass; quaxar used to collect removals only for OfferCreate.
+#[test]
+fn send_max_limited_payment_removes_expired_offer_seen_in_reverse_pass() {
+    let issuer = acct(0x8F);
+    let payer = acct(0x8E);
+    let maker_best = acct(0x81);
+    let maker_expired = acct(0x82);
+    let blk = protocol::currency_from_string("BLK");
+
+    let entries = vec![
+        account_root(payer, 100_000_000_000, 1, 0),
+        account_root(issuer, 100_000_000_000, 0, protocol::lsfDefaultRipple),
+        account_root(maker_best, 100_000_000, 1, 0),
+        account_root(maker_expired, 100_000_000, 1, 0),
+        trust_line_frac(maker_best, issuer, blk, 100_000_000_000_000_000, -15, 1_000_000),
+        trust_line_frac(maker_expired, issuer, blk, 100_000_000_000_000_000, -15, 1_000_000),
+        trust_line_frac(payer, issuer, blk, 0, 0, 1_000_000_000),
+    ];
+    let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // Best: 10 BLK for 10 XRP. Expired (worse): 10 BLK for 12 XRP.
+    let best = offer_tx(maker_best, xrp(10_000_000), iou_frac(issuer, blk, 10_000_000_000_000_000, -15), 1);
+    assert_eq!(full_apply(&mut view, &best, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    let expired = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), maker_expired);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(12_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou_frac(issuer, blk, 10_000_000_000_000_000, -15));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_u32(sf("sfExpiration"), 999_999_999);
+    });
+    assert_eq!(full_apply(&mut view, &expired, TxType::OFFER_CREATE), Ter::TES_SUCCESS);
+    let expired_key = protocol::offer_keylet(acct_id(maker_expired), 1);
+    {
+        let sle = view.read(expired_key).expect("read").expect("expired offer exists");
+        let mut obj = sle.clone_as_object();
+        obj.set_field_u32(sf("sfExpiration"), 500); // <= parent_close_time 1000
+        view.update(Arc::new(STLedgerEntry::from_stobject(obj, expired_key.key)))
+            .expect("expire offer");
+    }
+
+    // Ask for 100 BLK with SendMax 5 XRP: the reverse pass walks the whole
+    // book, the forward pass only half-consumes the best offer.
+    let pay = STTx::new(TxType::PAYMENT, |t| {
+        t.set_account_id(sf("sfAccount"), payer);
+        t.set_account_id(sf("sfDestination"), payer);
+        t.set_field_amount(sf("sfAmount"), iou_frac(issuer, blk, 100_000_000_000_000_000, -15));
+        t.set_field_amount(sf("sfSendMax"), xrp(5_000_000));
+        t.set_field_u32(sf("sfFlags"), 0x0002_0000); // tfPartialPayment
+        t.set_field_amount(sf("sfFee"), xrp(10));
+        t.set_field_u32(sf("sfSequence"), 2);
+    });
+    assert_eq!(full_apply(&mut view, &pay, TxType::PAYMENT), Ter::TES_SUCCESS);
+
+    assert!(
+        view.read(expired_key).expect("read").is_none(),
+        "the expired offer found by the reverse pass must be deleted like rippled ofrsToRm"
+    );
+    let best_offer = view
+        .read(protocol::offer_keylet(acct_id(maker_best), 1))
+        .expect("read")
+        .expect("best offer is only partially consumed");
+    assert_eq!(best_offer.get_field_amount(sf("sfTakerPays")), xrp(5_000_000));
+}
