@@ -1257,13 +1257,9 @@ impl SyncTree {
                                 stuck.get_depth()
                             );
                         }
-                        family.log_warn(&format!("unable to hook node {wanted}"));
-                        family.log_info(&format!(" stuck at {stuck}"));
-                        family.log_info(&format!(
-                            "got depth={}, walked to= {}",
-                            wanted.get_depth(),
-                            stuck.get_depth()
-                        ));
+                        // rippled SHAMapSync.cpp: one warning naming both
+                        // positions before returning invalid.
+                        family.log_warn(&format!("Unable to hook node {wanted}, stuck at {stuck}"));
                     }
                     AddKnownNodeEvent::LateDuplicate => {
                         family.log_trace("got node, already had it (late)");
