@@ -415,7 +415,7 @@ impl PeerImp {
                 peer_id = %self.id,
                 "send queue remained large; disconnecting peer"
             );
-            self.request_disconnect();
+            self.request_disconnect_because("large send queue");
             return;
         }
 
@@ -440,7 +440,7 @@ impl PeerImp {
                 // rippled calls peerFinder().onFailure(slot_) before fail()
                 // to lower bootcache valence for this endpoint.
                 self.notify_outbound_failure();
-                self.request_disconnect();
+                self.request_disconnect_because("not useful");
                 return;
             }
         }
@@ -451,7 +451,7 @@ impl PeerImp {
             if outstanding.is_some() {
                 tracing::warn!(target: "overlay", peer_id = %self.id, "Ping Timeout");
                 drop(outstanding);
-                self.request_disconnect();
+                self.request_disconnect_because("ping timeout");
                 return;
             }
             *outstanding = Some(OutstandingPing {
@@ -895,9 +895,21 @@ impl PeerImp {
     }
 
     pub fn request_disconnect(&self) {
+        self.request_disconnect_because("unspecified");
+    }
+
+    pub fn request_disconnect_because(&self, reason: &'static str) {
         if self.disconnect_requested.swap(true, Ordering::AcqRel) {
             return;
         }
+        tracing::warn!(
+            target: "overlay",
+            peer_id = %self.id,
+            ip = %self.remote_address,
+            reason,
+            send_queue = self.send_queue_size(),
+            "Peer disconnect requested"
+        );
         let session_stop = self
             .outbound_state
             .lock()
@@ -960,7 +972,7 @@ impl Peer for PeerImp {
             // decoder's existing wire-frame maximum before it can invalidate
             // the derived queue byte envelope.
             if !droppable {
-                self.request_disconnect();
+                self.request_disconnect_because("send: frame too large");
             }
             return;
         }
@@ -985,7 +997,7 @@ impl Peer for PeerImp {
                     return;
                 }
                 drop(outbound_state);
-                self.request_disconnect();
+                self.request_disconnect_because("send: pre-session queue full");
                 return;
             };
             let queue_depth = outbound_state
@@ -1007,7 +1019,7 @@ impl Peer for PeerImp {
             // Quaxar's finite queue policy drops reply-like traffic but
             // disconnects when control/request traffic cannot be retained.
             if !droppable {
-                self.request_disconnect();
+                self.request_disconnect_because("send: session queue full");
             }
             return;
         };
@@ -1023,7 +1035,7 @@ impl Peer for PeerImp {
                 session.1.fetch_sub(1, Ordering::AcqRel);
                 session.2.fetch_sub(message_bytes, Ordering::AcqRel);
                 if !droppable {
-                    self.request_disconnect();
+                    self.request_disconnect_because("send: session channel closed");
                 }
             }
         }
