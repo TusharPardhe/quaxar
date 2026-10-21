@@ -1985,12 +1985,13 @@ fn generate_fibonacci_amm_offer(
     if iteration as usize >= AMM_FIBONACCI.len() {
         return None;
     }
-    let initial_input_number = {
-        let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
-        crate::domain::amm_helpers::stamount_as_number(initial_in)
-            * RuntimeNumber::from_i64_and_exponent(5, 0)
-            / RuntimeNumber::from_i64_and_exponent(20_000, 0)
-    };
+    // rippled AMMLiquidity: `kInitialFibSeqPct = Number(5) / 20000` is the
+    // exact constant 25e-5, and `kInitialFibSeqPct * initialBalances_.in` is
+    // one multiplication in the caller's rounding mode before toAmount rounds
+    // Upward. Multiplying by 5 and then dividing rounds twice and can land one
+    // ULP high (mainnet 107805957: 9893.872922797040 vs ...038).
+    let initial_input_number = crate::domain::amm_helpers::stamount_as_number(initial_in)
+        * RuntimeNumber::from_i64_and_exponent(25, -5);
     let initial_input = number_to_amount(
         initial_in.asset(),
         initial_input_number,
