@@ -176,6 +176,10 @@ pub struct StepContext<'a> {
     /// direction alone cannot recover that consensus-significant shape.
     pub has_previous_step: Rc<Cell<bool>>,
     pub previous_step_is_book: Rc<Cell<bool>>,
+    /// rippled `prevStep->directStepSrcAcct()`: the source of a preceding
+    /// DirectStepI / MPTEndpointStep, used by BookOfferCrossingStep's
+    /// `getOfrInRate` to waive the transfer fee on the taker's own offer.
+    pub previous_direct_src: Rc<Cell<Option<AccountID>>>,
     pub is_last_step: Rc<Cell<bool>>,
 }
 
@@ -309,6 +313,7 @@ impl FlowStep for StepKind {
                         previous_redeems: context.previous_redeems.get(),
                         has_previous_step: context.has_previous_step.get(),
                         previous_step_is_book: context.previous_step_is_book.get(),
+                        previous_direct_src: context.previous_direct_src.get(),
                         strand_dst: Some(context.strand_dst),
                         strand_deliver: Some(context.strand_deliver),
                         enforce_quality_threshold: *remove_self_crossing,
@@ -447,6 +452,7 @@ impl FlowStep for StepKind {
                         previous_redeems: context.previous_redeems.get(),
                         has_previous_step: context.has_previous_step.get(),
                         previous_step_is_book: context.previous_step_is_book.get(),
+                        previous_direct_src: context.previous_direct_src.get(),
                         strand_dst: Some(context.strand_dst),
                         strand_deliver: Some(context.strand_deliver),
                         enforce_quality_threshold: *remove_self_crossing,
@@ -1432,6 +1438,7 @@ mod tests {
             previous_line_quality_in: Rc::new(Cell::new(protocol::QUALITY_ONE)),
             has_previous_step: Rc::new(Cell::new(false)),
             previous_step_is_book: Rc::new(Cell::new(false)),
+            previous_direct_src: Rc::new(Cell::new(None)),
             is_last_step: Rc::new(Cell::new(true)),
         };
 

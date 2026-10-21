@@ -411,6 +411,8 @@ pub struct BookStepOptions<'a> {
     pub previous_redeems: bool,
     pub has_previous_step: bool,
     pub previous_step_is_book: bool,
+    /// `prevStep->directStepSrcAcct()` (DirectStepI / MPTEndpointStep source).
+    pub previous_direct_src: Option<AccountID>,
     /// Actual strand endpoint used by BookStep::rate. This is distinct from
     /// the transaction/taker account used for AMM auction fees and self-cross.
     pub strand_dst: Option<&'a AccountID>,
@@ -450,6 +452,7 @@ pub fn execute_book_step<V: ApplyView>(
             previous_redeems: false,
             has_previous_step: false,
             previous_step_is_book: false,
+            previous_direct_src: None,
             strand_dst: taker,
             strand_deliver: Some(max_out.asset()),
             enforce_quality_threshold: true,
@@ -1233,6 +1236,26 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             if nothing_left {
                 break;
             }
+            // rippled BookOfferCrossingStep::getOfrInRate / getOfrOutRate:
+            // when crossing, the taker's own offer reached directly from its
+            // DirectStepI pays no input transfer fee, and an offer owned by
+            // the strand destination after another BookStep pays no output
+            // fee. Payments (BookPaymentStep) always use trIn/trOut.
+            let ofr_in_rate = if owner_pays_transfer_fee
+                && options.previous_direct_src.as_ref() == Some(&offer_owner)
+            {
+                QUALITY_ONE
+            } else {
+                tr_in
+            };
+            let ofr_out_rate = if owner_pays_transfer_fee
+                && options.previous_step_is_book
+                && strand_dst == Some(&offer_owner)
+            {
+                QUALITY_ONE
+            } else {
+                tr_out
+            };
             // Transfer-rate, owner-funds and limit arithmetic: the start of
             // rippled's forEachOffer try block, before `offerAttempted = true`.
             let mut consumption = catch_crossing_overflow!(
@@ -1247,8 +1270,8 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                     &owner_funds,
                     offer_is_funded(&offer_owner, &taker_gets),
                     offer_quality,
-                    tr_in,
-                    tr_out,
+                    ofr_in_rate,
+                    ofr_out_rate,
                     fix_reduced_offers_v2,
                 )
             );
@@ -1308,8 +1331,8 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                             &owner_funds,
                             offer_is_funded(&offer_owner, &taker_gets),
                             offer_quality,
-                            tr_in,
-                            tr_out,
+                            ofr_in_rate,
+                            ofr_out_rate,
                             fix_reduced_offers_v2,
                         )
                     );

@@ -166,6 +166,7 @@ fn reverse_book_step_usdc_to_xrp_consumes_amm_liquidity() {
             previous_redeems: false,
             has_previous_step: false,
             previous_step_is_book: false,
+            previous_direct_src: None,
             strand_dst: Some(&taker),
             strand_deliver: Some(xrp_asset),
             enforce_quality_threshold: false,

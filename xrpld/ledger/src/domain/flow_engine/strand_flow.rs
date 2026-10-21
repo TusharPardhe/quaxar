@@ -132,6 +132,7 @@ pub fn execute_strands<V: ApplyView>(
             previous_line_quality_in: Rc::new(Cell::new(protocol::QUALITY_ONE)),
             has_previous_step: Rc::new(Cell::new(false)),
             previous_step_is_book: Rc::new(Cell::new(false)),
+            previous_direct_src: Rc::new(Cell::new(None)),
             is_last_step: Rc::new(Cell::new(false)),
         };
         let mut candidates = match activate_candidates(active_indices, |index| {
@@ -451,6 +452,7 @@ fn execute_single_strand<V: ApplyView>(
         previous_line_quality_in: Rc::new(Cell::new(protocol::QUALITY_ONE)),
         has_previous_step: Rc::new(Cell::new(false)),
         previous_step_is_book: Rc::new(Cell::new(false)),
+        previous_direct_src: Rc::new(Cell::new(None)),
         is_last_step: Rc::new(Cell::new(false)),
     };
 
@@ -930,6 +932,17 @@ fn set_preceding_step_context(
             .checked_sub(1)
             .and_then(|previous| strand.get(previous))
             .is_some_and(|step| matches!(step, super::StepKind::Book { .. })),
+    );
+    context.previous_direct_src.set(
+        index
+            .checked_sub(1)
+            .and_then(|previous| strand.get(previous))
+            .and_then(|step| match step {
+                super::StepKind::Direct { src, .. } | super::StepKind::MptEndpoint { src, .. } => {
+                    Some(*src)
+                }
+                _ => None,
+            }),
     );
     context.is_last_step.set(index + 1 == strand.len());
 }
