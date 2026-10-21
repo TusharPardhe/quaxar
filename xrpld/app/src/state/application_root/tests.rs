@@ -6306,3 +6306,66 @@ fn transaction_step_panic_is_contained_as_tef_exception() {
         Ter::TEF_EXCEPTION
     );
 }
+
+/// rippled buildLedgerImpl runs `updateNegativeUNL()` on a flag ledger before
+/// `applyTxs`, so a UNLModify in that ledger sees the promoted NegativeUNL.
+/// Mainnet 107805952 forked because quaxar applied the transactions to the raw
+/// parent, where the pending ToDisable made UNLModify fail with tefFAILURE.
+#[test]
+fn flag_ledger_unl_modify_sees_negative_unl_promoted_before_transactions() {
+    use ledger::RawView;
+    let sf = protocol::get_field_by_symbol;
+    let mut pending = [0x55; protocol::PUBLIC_KEY_LENGTH];
+    pending[0] = 0xED;
+    let mut next = [0x66; protocol::PUBLIC_KEY_LENGTH];
+    next[0] = 0xED;
+
+    let mut parent = Ledger::from_ledger_seq_and_close_time(255, 1_000, false);
+    let mut negative_unl = protocol::STLedgerEntry::new(protocol::negative_unl_keylet());
+    negative_unl.set_field_vl(sf("sfValidatorToDisable"), &pending);
+    parent
+        .raw_insert(Arc::new(negative_unl))
+        .expect("parent NegativeUNL");
+    parent.set_accepted(1_000, LEDGER_DEFAULT_TIME_RESOLUTION, true);
+    let parent = Arc::new(parent);
+    let unl_modify = Arc::new(protocol::STTx::new(protocol::TxType::UNL_MODIFY, |tx| {
+        tx.set_field_u32(sf("sfLedgerSequence"), 256);
+        tx.set_field_u8(sf("sfUNLModifyDisabling"), 1);
+        tx.set_field_vl(sf("sfUNLModifyValidator"), &next);
+    }));
+    let unl_modify_id = unl_modify.get_transaction_id();
+    let app = ApplicationRoot::new(0).expect("application root should build");
+
+    let outcome = app
+        .accept_ledger_with_txns_outcome_from_consensus_parent(
+            Arc::clone(&parent),
+            256,
+            1_010,
+            LEDGER_DEFAULT_TIME_RESOLUTION,
+            true,
+            parent.fees().base,
+            vec![unl_modify],
+        )
+        .expect("flag ledger should build");
+
+    assert!(
+        outcome
+            .closed
+            .tx_read(unl_modify_id)
+            .expect("tx map read")
+            .is_some(),
+        "UNLModify must apply after the flag-ledger NegativeUNL promotion"
+    );
+    let sle = outcome
+        .closed
+        .read(protocol::negative_unl_keylet())
+        .expect("NegativeUNL read")
+        .expect("NegativeUNL present");
+    assert_eq!(sle.get_field_vl(sf("sfValidatorToDisable")), next.to_vec());
+    let disabled = sle.get_field_array(sf("sfDisabledValidators"));
+    let keys: Vec<Vec<u8>> = disabled
+        .iter()
+        .map(|entry| entry.get_field_vl(sf("sfPublicKey")))
+        .collect();
+    assert_eq!(keys, vec![pending.to_vec()], "pending ToDisable was promoted");
+}

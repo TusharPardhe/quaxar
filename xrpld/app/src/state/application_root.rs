@@ -11011,10 +11011,24 @@ impl ApplicationRoot {
         let mut completed_transaction_ids = std::collections::HashSet::new();
         let mut failed_txns: Vec<(Uint256, protocol::Ter)> = Vec::new();
 
-        // Create a mutable view on the parent ledger to accumulate state changes
-        let state_view_base = parent_ledger
-            .clone()
-            .unwrap_or_else(|| Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false)));
+        // Create a mutable view on the parent ledger to accumulate state changes.
+        // rippled buildLedgerImpl calls `built->updateNegativeUNL()` on a flag
+        // ledger BEFORE applyTxs, so the transactions (notably UNLModify) see
+        // the promoted NegativeUNL. Applying them to the raw parent made
+        // UNLModify fail "already has ToDisable" (mainnet 107805952).
+        let state_view_base = match parent_ledger.as_ref() {
+            Some(parent) if ledger::is_flag_ledger(parent.header().seq.saturating_add(1)) => {
+                let mut base = Ledger::from_previous(parent, close_time);
+                base.update_negative_unl().map_err(|error| {
+                    crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
+                        "flag ledger negative UNL update failed: {error:?}"
+                    ))
+                })?;
+                Arc::new(base)
+            }
+            Some(parent) => Arc::clone(parent),
+            None => Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false)),
+        };
         let application_header = parent_ledger
             .as_ref()
             .map(|parent| Ledger::from_previous(parent, close_time).header())
