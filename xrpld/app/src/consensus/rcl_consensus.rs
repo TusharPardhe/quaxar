@@ -355,6 +355,9 @@ fn disputed_relay_envelope(
 /// The concrete peer-relay implementation.
 pub struct AppRclConsensusRelay {
     overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
+    /// rippled `Adaptor::share(RCLCxTx)` relays a disputed tx only when
+    /// `HashRouter::shouldRelay` allows it (once per relay hold time).
+    should_relay: Arc<dyn Fn(Uint256) -> bool + Send + Sync>,
     inbound_transactions: AppInboundTransactions,
     time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
     validator_keys: ValidatorKeys,
@@ -370,6 +373,10 @@ impl AppRclConsensusRelay {
     ) -> Self {
         Self {
             overlay: root.overlay_runtime().map(|rt| rt.overlay()),
+            should_relay: {
+                let router = root.shared_hash_router();
+                Arc::new(move |id| router.should_relay(id).is_some())
+            },
             inbound_transactions,
             time_keeper: root.shared_time_keeper(),
             validator_keys,
@@ -446,6 +453,14 @@ impl RclConsensusRelay for AppRclConsensusRelay {
             return;
         };
 
+        // rippled: `if (app_.getHashRouter().shouldRelay(tx.id()))`. Without
+        // this gate every consensus round re-sent every disputed tx to every
+        // peer; on a cold sync (dozens of disputes per local round) that
+        // filled peer send queues and disconnected all peers (2026-10-21).
+        if !(self.should_relay)(tx.id()) {
+            self.journal.trace("relay_disputed_tx: suppressed by hash router");
+            return;
+        }
         // Disputed transactions are a new local relay, not a replay of the
         // untrusted TMTransaction envelope that originally delivered them.
         let message = disputed_relay_envelope(

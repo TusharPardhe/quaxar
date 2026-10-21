@@ -8097,6 +8097,10 @@ impl ApplicationRoot {
         self.apply_validator_lists(manifest, version, blobs, site_uri, hash)
     }
 
+    pub(crate) fn shared_hash_router(&self) -> Arc<xrpl_core::HashRouter> {
+        Arc::clone(&self.registry.hash_router)
+    }
+
     pub(crate) fn validator_list_relay_skip(
         &self,
         hash: Uint256,
