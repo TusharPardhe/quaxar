@@ -3751,6 +3751,91 @@ mod tests {
         )
     }
 
+    /// Backend whose fetches block until the test opens the gate, so a real
+    /// NodeStore read thread cannot complete a physical read before the test
+    /// has observed the in-flight state.
+    struct GatedMissBackend {
+        open: Mutex<bool>,
+        opened: std::sync::Condvar,
+    }
+
+    impl GatedMissBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                open: Mutex::new(false),
+                opened: std::sync::Condvar::new(),
+            })
+        }
+
+        fn release(&self) {
+            *self.open.lock().expect("gate lock") = true;
+            self.opened.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut open = self.open.lock().expect("gate lock");
+            while !*open {
+                open = self.opened.wait(open).expect("gate wait");
+            }
+        }
+    }
+
+    impl nodestore::Backend for GatedMissBackend {
+        fn get_name(&self) -> String {
+            "gated-miss".to_owned()
+        }
+        fn open(&self, _create_if_missing: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn close(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn fetch(
+            &self,
+            _hash: &Uint256,
+        ) -> (Option<Arc<nodestore::node_object::NodeObject>>, nodestore::Status) {
+            self.wait();
+            (None, nodestore::Status::NotFound)
+        }
+        fn fetch_batch(
+            &self,
+            hashes: &[Uint256],
+        ) -> (Vec<Option<Arc<nodestore::node_object::NodeObject>>>, nodestore::Status) {
+            self.wait();
+            (vec![None; hashes.len()], nodestore::Status::Ok)
+        }
+        fn store(&self, _object: Arc<nodestore::node_object::NodeObject>) -> Result<(), String> {
+            Ok(())
+        }
+        fn store_batch(&self, _batch: &nodestore::Batch) {}
+        fn sync(&self) {}
+        fn for_each(&self, _callback: &mut dyn FnMut(Arc<nodestore::node_object::NodeObject>)) {}
+        fn get_write_load(&self) -> i32 {
+            0
+        }
+        fn set_delete_path(&self) {}
+        fn fd_required(&self) -> i32 {
+            0
+        }
+    }
+
+    fn broker_test_gated_node_store(gate: Arc<GatedMissBackend>) -> SHAMapStoreNodeStore {
+        use basics::basic_config::Section;
+        SHAMapStoreNodeStore::Single(
+            nodestore::database_node_imp::DatabaseNodeImp::new(
+                Arc::new(nodestore::DummyScheduler),
+                1,
+                gate,
+                &Section::new("node_db"),
+                Arc::new(nodestore::NullJournal),
+            )
+            .expect("gated node store"),
+        )
+    }
+
     fn broker_test_node_store(path: &str) -> SHAMapStoreNodeStore {
         broker_test_node_store_with(path, Arc::new(nodestore::DummyScheduler))
     }
@@ -4204,11 +4289,14 @@ mod tests {
         .expect("broker");
         let tickets = BrokerTicketState::default();
         let (tx, _rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
-        let scheduler = Arc::new(BrokerCaptureScheduler::default());
+        // The first physical read must stay outstanding while the test
+        // cancels its session; a real read thread would otherwise complete
+        // the miss first and admit the successor (flaky ~2/3 of runs).
+        let gate = GatedMissBackend::new();
         let mut port = BrokerReadPort::new(
             broker.clone(),
             tickets.clone(),
-            broker_test_node_store_with("broker-cancel-submit", scheduler.clone()),
+            broker_test_gated_node_store(Arc::clone(&gate)),
             tx,
         );
         let mut counter = IdCounter::new();
@@ -4253,6 +4341,7 @@ mod tests {
         ));
         assert_eq!(broker.ready_dispatch_count(), 1);
         port.flush_completions();
+        gate.release();
         assert_eq!(
             broker.ready_dispatch_count(),
             0,
