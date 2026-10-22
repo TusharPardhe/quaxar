@@ -409,8 +409,14 @@ fn byte_permit_rejects_exactly_at_capacity_and_releases_after_terminal_settlemen
     );
 
     release_tx.send(()).expect("release read");
+    // The worker runs `complete()` and then drops the work's permit and
+    // callback guard, so wait for the settlement, not just the callback.
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while first.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+    while (first.load(Ordering::Acquire) == 0
+        || database.read_queue_snapshot().outstanding_bytes != 0
+        || database.read_queue_snapshot().outstanding_callbacks != 0)
+        && std::time::Instant::now() < deadline
+    {
         std::thread::yield_now();
     }
     assert_eq!(first.load(Ordering::Acquire), 1);

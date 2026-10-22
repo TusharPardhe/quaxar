@@ -199,6 +199,30 @@ const L0_STALL_RUNS: usize = 20;
 /// How long L0 may stay at the stall threshold without shrinking before the
 /// watchdog forces a flush.
 const L0_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long writes may stay halted with nothing to rotate before the watchdog
+/// runs a compaction itself.
+const L0_FORCE_COMPACT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the watchdog does after `halted_for` at the L0 stall limit, given
+/// whether its memtable rotation actually sealed anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallAction {
+    Wait,
+    Compact,
+}
+
+/// lsm-tree's `rotate_memtable` is a no-op on an empty active memtable. Once
+/// the only writer is parked in fjall's L0 halt, the memtable stays empty,
+/// rotation schedules no flush, and therefore no compaction: the halt is
+/// permanent (mainnet snapshot import, 2026-10-22, stuck at 8 GB). Compact
+/// directly in that case.
+fn stall_action(halted_for: std::time::Duration, rotated: bool) -> StallAction {
+    if !rotated && halted_for >= L0_FORCE_COMPACT_GRACE {
+        StallAction::Compact
+    } else {
+        StallAction::Wait
+    }
+}
 
 /// fjall schedules compaction only after a flush. When writes are halted at
 /// the L0 limit nothing flushes, so if the queued compaction requests were
@@ -216,6 +240,7 @@ fn spawn_compaction_watchdog(
         .name("fjall-watchdog".to_owned())
         .spawn(move || {
             let mut stuck_since: Option<(std::time::Instant, usize)> = None;
+            let mut halted_since: Option<std::time::Instant> = None;
             let mut last_disk_check = std::time::Instant::now();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -227,6 +252,11 @@ fn spawn_compaction_watchdog(
                     maintain_ballast(&dir, &ballast, reserve_bytes);
                 }
                 let l0 = open.nodes.l0_table_count();
+                halted_since = if l0 < L0_STALL_RUNS {
+                    None
+                } else {
+                    halted_since.or_else(|| Some(std::time::Instant::now()))
+                };
                 stuck_since = match stuck_since {
                     _ if l0 < L0_STALL_RUNS => None,
                     Some((since, at)) if l0 >= at => Some((since, at)),
@@ -244,6 +274,20 @@ fn spawn_compaction_watchdog(
                         "fjall L0 at the write-stall limit without compaction progress; forced a flush to schedule compaction"
                     );
                     stuck_since = Some((std::time::Instant::now(), l0));
+                    let halted_for = halted_since.map_or(std::time::Duration::ZERO, |at| at.elapsed());
+                    if stall_action(halted_for, rotated) == StallAction::Compact {
+                        let started = std::time::Instant::now();
+                        let result = open.nodes.major_compact();
+                        tracing::warn!(
+                            target: "nodestore",
+                            l0_before = l0,
+                            l0_after = open.nodes.l0_table_count(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            ok = result.is_ok(),
+                            "fjall writes halted with nothing to rotate; ran a compaction to release them"
+                        );
+                        halted_since = Some(std::time::Instant::now());
+                    }
                 }
             }
         });
@@ -740,6 +784,16 @@ mod tests {
             Ok(_) => panic!("backend should require a path"),
             Err(error) => assert_eq!(error, "Missing path in fjall backend"),
         }
+    }
+
+    #[test]
+    fn watchdog_compacts_only_when_rotation_is_impossible_for_the_grace() {
+        use super::{L0_FORCE_COMPACT_GRACE, StallAction, stall_action};
+        use std::time::Duration;
+        assert_eq!(stall_action(Duration::from_secs(5), false), StallAction::Wait);
+        assert_eq!(stall_action(L0_FORCE_COMPACT_GRACE, true), StallAction::Wait);
+        assert_eq!(stall_action(L0_FORCE_COMPACT_GRACE, false), StallAction::Compact);
+        assert_eq!(stall_action(Duration::from_secs(600), false), StallAction::Compact);
     }
 
     #[test]
