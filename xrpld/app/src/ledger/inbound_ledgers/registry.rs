@@ -774,7 +774,7 @@ pub struct InboundLedgers {
     /// Mutable owner for coordinator lifecycle transitions and effect dispatch.
     /// Overlay ingress intentionally does not use this lock; it holds the
     /// separately published immutable [`CoordinatorIngress`] capability.
-    coordinator: Mutex<Option<ProductionAdapter>>,
+    coordinator: parking_lot::Mutex<Option<ProductionAdapter>>,
     /// Lock-free published mirror of the coordinator's latest `RunnerSnapshot`
     /// and installed flag. Consensus/NetworkOps read coordinator phase/status
     /// every round via `coordinator_snapshot`/`coordinator_installed`; reading
@@ -915,7 +915,7 @@ impl InboundLedgers {
             next_acquisition_id: AtomicU64::new(1),
             recovery_lcl_decision: Mutex::new(None),
             lifecycle: Arc::new(AcquisitionLifecycleCounters::default()),
-            coordinator: Mutex::new(None),
+            coordinator: parking_lot::Mutex::new(None),
             coordinator_installed_flag: std::sync::atomic::AtomicBool::new(false),
             coordinator_snapshot_cell: arc_swap::ArcSwapOption::empty(),
             coordinator_recovery_latch_cell: arc_swap::ArcSwapOption::empty(),
@@ -1076,7 +1076,7 @@ impl InboundLedgers {
         }
         let ingress = adapter.ingress();
         let wake = adapter.owner_wake();
-        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let mut guard = self.coordinator.lock();
         if guard.is_none() {
             // Publish before the adapter can dispatch any future peer request.
             // A local/loopback overlay may reply inline from that dispatch.
@@ -1124,7 +1124,7 @@ impl InboundLedgers {
     /// its idle wait; NetworkOps never calls this production loop.
     pub fn coordinator_drain_with_status(&self) -> (usize, bool) {
         let (handled, failures) = {
-            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let mut guard = self.coordinator.lock();
             let Some(coordinator) = guard.as_mut() else {
                 return (0, false);
             };
@@ -1144,6 +1144,12 @@ impl InboundLedgers {
             // Republish the lock-free status mirror while the guard is held so
             // consensus/NetworkOps status reads never block on this owner.
             self.publish_coordinator_mirror(&guard);
+            // The owner re-enters this drain immediately while work remains.
+            // An ordinary unlock lets it re-acquire before a woken waiter runs,
+            // so acquire calls from validation/JobQueue threads (and anything
+            // queued behind them) starved for whole bursts. Hand the lock to
+            // the longest waiter instead.
+            parking_lot::MutexGuard::unlock_fair(guard);
             ((handled, has_more), failures)
         };
         self.record_coordinator_failures(failures);
@@ -1217,7 +1223,7 @@ impl InboundLedgers {
     /// remains authoritative).
     pub fn coordinator_report_peer_availability(&self, peers: &[overlay::PeerId]) -> bool {
         let failures = {
-            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let mut guard = self.coordinator.lock();
             let Some(coordinator) = guard.as_mut() else {
                 return false;
             };
@@ -1236,7 +1242,7 @@ impl InboundLedgers {
     /// operating phase (rippled start-valid zero-threshold behavior).
     pub fn coordinator_report_transport_availability(&self, peers: &[overlay::PeerId]) -> bool {
         let failures = {
-            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let mut guard = self.coordinator.lock();
             let Some(coordinator) = guard.as_mut() else {
                 return false;
             };
@@ -1255,7 +1261,7 @@ impl InboundLedgers {
     /// acquisition transport availability.
     pub fn coordinator_report_consensus_quorum(&self, available: bool) -> bool {
         let failures = {
-            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let mut guard = self.coordinator.lock();
             let Some(coordinator) = guard.as_mut() else {
                 return false;
             };
@@ -1313,7 +1319,7 @@ impl InboundLedgers {
     /// on its next turn, so processing is identical either way.
     fn submit_coordinator_fact(&self, event: acquisition::AcquisitionEvent) -> bool {
         match self.coordinator.try_lock() {
-            Ok(mut guard) => {
+            Some(mut guard) => {
                 let Some(coordinator) = guard.as_mut() else {
                     return false;
                 };
@@ -1327,7 +1333,7 @@ impl InboundLedgers {
                 self.record_coordinator_failures(failures);
                 true
             }
-            Err(std::sync::TryLockError::WouldBlock) => {
+            None => {
                 // Owner is draining: route to the non-blocking control lane.
                 // Terminal failures from this fact are collected by the owner
                 // on its next drain turn.
@@ -1341,9 +1347,6 @@ impl InboundLedgers {
                 };
                 ingress.submit_control_fact(event)
             }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                panic!("coordinator lock poisoned")
-            }
         }
     }
 
@@ -1356,7 +1359,7 @@ impl InboundLedgers {
             return false;
         }
         let failures = {
-            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let mut guard = self.coordinator.lock();
             let Some(coordinator) = guard.as_mut() else {
                 return false;
             };
@@ -1409,7 +1412,7 @@ impl InboundLedgers {
             return false;
         }
         let failures = {
-            let mut guard = self.coordinator.lock().expect("coordinator lock");
+            let mut guard = self.coordinator.lock();
             let Some(coordinator) = guard.as_mut() else {
                 return false;
             };
@@ -1550,7 +1553,7 @@ impl InboundLedgers {
         handoff: DurableHandoffId,
         session: SessionRef,
     ) -> bool {
-        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let mut guard = self.coordinator.lock();
         let Some(coordinator) = guard.as_mut() else {
             return false;
         };
@@ -1569,9 +1572,7 @@ impl InboundLedgers {
         handoff: DurableHandoffId,
         session: SessionRef,
     ) -> bool {
-        self.coordinator
-            .lock()
-            .expect("coordinator lock")
+        self.coordinator.lock()
             .as_ref()
             .is_some_and(|coordinator| coordinator.durable_handoff_is_pending(handoff, session))
     }
@@ -1582,9 +1583,7 @@ impl InboundLedgers {
     pub(crate) fn take_processed_coordinator_durable_acks(
         &self,
     ) -> Vec<(DurableHandoffId, SessionRef)> {
-        self.coordinator
-            .lock()
-            .expect("coordinator lock")
+        self.coordinator.lock()
             .as_mut()
             .map(|coordinator| coordinator.take_processed_durable_acks())
             .unwrap_or_default()
@@ -1598,7 +1597,7 @@ impl InboundLedgers {
         handoff: DurableHandoffId,
         session: SessionRef,
     ) -> bool {
-        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let mut guard = self.coordinator.lock();
         let Some(coordinator) = guard.as_mut() else {
             return false;
         };
@@ -1660,9 +1659,7 @@ impl InboundLedgers {
 
     #[cfg(test)]
     fn coordinator_validation_target(&self) -> Option<acquisition::LedgerTarget> {
-        self.coordinator
-            .lock()
-            .expect("coordinator lock")
+        self.coordinator.lock()
             .as_ref()
             .and_then(ProductionAdapter::current_validation_target)
     }
@@ -1726,7 +1723,7 @@ impl InboundLedgers {
             );
             return None;
         }
-        let mut coordinator_guard = self.coordinator.lock().expect("coordinator lock");
+        let mut coordinator_guard = self.coordinator.lock();
         let coordinator = coordinator_guard.as_mut()?;
 
         let acquisition_id = self.next_acquisition_id.fetch_add(1, Ordering::Relaxed);
@@ -1838,7 +1835,7 @@ impl InboundLedgers {
     /// and remove published routes before any dependent broker, timer, worker,
     /// or NodeStore resource is stopped. Late completions are then stale.
     pub fn coordinator_shutdown(&self) {
-        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let mut guard = self.coordinator.lock();
         let Some(coordinator) = guard.as_mut() else {
             return;
         };
@@ -2764,8 +2761,7 @@ impl InboundLedgers {
         let failures = {
             let mut guard = self
                 .coordinator
-                .lock()
-                .expect("acquisition coordinator lock");
+                .lock();
             match guard.as_mut() {
                 Some(coordinator) => {
                     coordinator.handle_fact(acquisition::AcquisitionEvent::RegistrySweep);
@@ -3395,7 +3391,7 @@ impl InboundLedgers {
                 }
             }
         }
-        if let Some(coordinator) = self.coordinator.lock().expect("coordinator lock").as_ref() {
+        if let Some(coordinator) = self.coordinator.lock().as_ref() {
             // Fetch-pack availability is a coalescible wake: cached objects
             // remain queryable and a later wake/turn rechecks them. Never wait
             // on the bounded owner queue while holding its adapter mutex.
@@ -4320,6 +4316,42 @@ mod tests {
         assert!(
             state.fetch_pack_ready.load(Ordering::Acquire),
             "every fetch-pack completion, including an empty one, wakes checkLocal"
+        );
+        registry.stop();
+    }
+
+    #[test]
+    fn coordinator_waiters_are_not_starved_by_back_to_back_owner_drains() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(Arc::clone(&worker_pool));
+        registry.set_phase_state(Arc::new(SharedNetworkOpsState::new(
+            NetworkOpsOperatingMode::Disconnected,
+        )));
+        assert!(registry.install_coordinator());
+        let registry = Arc::new(registry);
+        let stop = Arc::new(AtomicBool::new(false));
+        let owner = {
+            let registry = Arc::clone(&registry);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let _ = registry.coordinator_drain_with_status();
+                }
+            })
+        };
+        let mut worst = std::time::Duration::ZERO;
+        for _ in 0..50 {
+            let started = std::time::Instant::now();
+            drop(registry.coordinator.lock());
+            worst = worst.max(started.elapsed());
+        }
+        stop.store(true, Ordering::Release);
+        owner.join().expect("owner thread");
+        assert!(
+            worst < std::time::Duration::from_millis(250),
+            "an external acquire waited {worst:?} behind owner drains"
         );
         registry.stop();
     }
