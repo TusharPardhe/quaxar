@@ -807,6 +807,15 @@ fn clone_loaded_subtree_as_shareable(
     node: &SharedIntrusive<SHAMapTreeNode>,
     cowid: u32,
 ) -> SharedIntrusive<SHAMapTreeNode> {
+    // A shared node (cowid 0) is immutable under copy-on-write and only has
+    // shared, already hashed descendants, so both trees can keep it, as
+    // rippled `SHAMap::snapShot` shares `root_`. Only nodes the source still
+    // owns (and may mutate in place) are copied and rehashed. Deep-copying
+    // and rehashing every loaded node made each consensus tx-set
+    // insert/erase cost O(set size) hashes.
+    if node.cowid() == 0 {
+        return node.clone();
+    }
     let cloned = node.clone_with_cowid(cowid);
 
     if cloned.is_inner() {
@@ -1513,6 +1522,51 @@ mod tests {
         assert!(!same_node(&original_leaf_after, &snapshot_leaf_after));
         assert_eq!(snapshot.root().cowid(), 2);
         assert_eq!(original.root().cowid(), 1);
+    }
+
+    #[test]
+    fn mutable_snapshot_shares_already_shared_subtrees() {
+        let first = Uint256::from_array([0x11; 32]);
+        let second = Uint256::from_array([0xC2; 32]);
+        let mut original = MutableTree::new(1);
+        for (key, byte) in [(first, 1u8), (second, 2u8)] {
+            original
+                .add_item(
+                    SHAMapNodeType::AccountState,
+                    SHAMapItem::new(key, vec![byte; 12]),
+                )
+                .expect("insert should succeed");
+        }
+        original.unshare();
+        let shared_root = original.root();
+        assert_eq!(shared_root.cowid(), 0);
+        let root_hash = shared_root.get_hash();
+
+        let mut snapshot = original.mutable_snapshot(2);
+        assert!(
+            same_node(&snapshot.root(), &shared_root),
+            "a fully shared tree must be reused, not deep-copied"
+        );
+
+        snapshot
+            .update_item(
+                SHAMapNodeType::AccountState,
+                SHAMapItem::new(first, vec![9; 12]),
+            )
+            .expect("snapshot update should succeed");
+        snapshot.unshare();
+        assert_ne!(snapshot.root().get_hash(), root_hash);
+        assert_eq!(original.root().get_hash(), root_hash);
+        assert!(same_node(&original.root(), &shared_root));
+        let untouched = |tree: &MutableTree| {
+            tree.find_key(second)
+                .expect("lookup should succeed")
+                .expect("leaf should exist")
+        };
+        assert!(
+            same_node(&untouched(&original), &untouched(&snapshot)),
+            "the unmodified branch stays shared after the copy-on-write update"
+        );
     }
 
     #[test]
