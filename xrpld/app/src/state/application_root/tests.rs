@@ -1347,19 +1347,37 @@ fn retry_outcome_distinguishes_ordinary_and_persistent_cleanup_tec() {
     );
     assert!(!ordinary_parent.tx_exists(tx.get_transaction_id()).unwrap());
 
-    // Persistent cleanup results are the exception to TapRetry's ordinary
-    // tec rule. Even when supplied by preclaim they run reset, commit exactly
-    // once, and must be accepted/threaded rather than retried.
+    // A persistent-cleanup code supplied by *preclaim* is still a preclaim
+    // tec: rippled doApply returns early unless likelyToClaimFee, so under
+    // TapRetry it is retried exactly like an ordinary tec (mainnet
+    // 107827814, OfferCreate tecEXPIRED).
+    let mut retried_parent =
+        Sandbox::new(Arc::new(ledger_view(10, source, 1, &[])), ApplyFlags::NONE);
+    let mut retried_attempt = FlowSandbox::new_with_flags(&mut retried_parent, ApplyFlags::RETRY);
+    let retried = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
+        &mut retried_attempt,
+        &tx,
+        TxType::PAYMENT,
+        ApplyFlags::RETRY,
+        Ter::TEC_KILLED,
+    );
+    assert_eq!(retried.result, Ter::TEC_KILLED);
+    assert!(!retried.applied);
+    assert_eq!(retried_attempt.item_count(), 0);
+    drop(retried_attempt);
+
+    // In the final (non-retry) pass it runs reset, commits exactly once and
+    // is accepted/threaded.
     let mut persistent_parent =
         Sandbox::new(Arc::new(ledger_view(10, source, 1, &[])), ApplyFlags::NONE);
     let persistent_rules = persistent_parent.rules();
     let mut persistent_attempt =
-        FlowSandbox::new_with_flags(&mut persistent_parent, ApplyFlags::RETRY);
+        FlowSandbox::new_with_flags(&mut persistent_parent, ApplyFlags::NONE);
     let persistent = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim(
         &mut persistent_attempt,
         &tx,
         TxType::PAYMENT,
-        ApplyFlags::RETRY,
+        ApplyFlags::NONE,
         Ter::TEC_KILLED,
     );
     assert_eq!(persistent.result, Ter::TEC_KILLED);
@@ -6376,4 +6394,54 @@ fn flag_ledger_unl_modify_sees_negative_unl_promoted_before_transactions() {
         .map(|entry| entry.get_field_vl(sf("sfPublicKey")))
         .collect();
     assert_eq!(keys, vec![pending.to_vec()], "pending ToDisable was promoted");
+}
+
+#[test]
+fn preclaim_tec_expired_is_not_applied_during_a_retry_pass() {
+    // Mainnet 107827814: OfferCreate A65552805D... expired in preclaim. rippled
+    // doApply rejects a preclaim tec while TapRetry is set (likelyToClaimFee),
+    // so it lands in the final pass (TransactionIndex 82); quaxar committed it
+    // in the first pass (index 60) through the tecEXPIRED cleanup branch.
+    let source = AccountID::from_array([0xD7; 20]);
+    let issuer = AccountID::from_array([0xD8; 20]);
+    let ledger = Arc::new(ledger_view(10, source, 1, &[]));
+    let offer = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+        tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(12, false));
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        tx.set_field_u32(get_field_by_symbol("sfExpiration"), 1);
+        tx.set_field_amount(get_field_by_symbol("sfTakerGets"), STAmount::new_native(4_373_335, false));
+        tx.set_field_amount(
+            get_field_by_symbol("sfTakerPays"),
+            STAmount::from_iou_amount(
+                get_field_by_symbol("sfTakerPays"),
+                protocol::IOUAmount::from_parts(5_796_698_111_000_000, -15).expect("iou"),
+                protocol::Issue::new(protocol::Currency::from([0x52; 20]), issuer),
+            ),
+        );
+    });
+
+    let mut retry_view = ledger::ApplyViewImpl::new(Arc::clone(&ledger), ApplyFlags::RETRY);
+    let retry = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id(
+        &mut retry_view,
+        &offer,
+        TxType::OFFER_CREATE,
+        ApplyFlags::RETRY,
+        Ter::TEC_EXPIRED,
+        0,
+    );
+    assert_eq!(retry.result, Ter::TEC_EXPIRED);
+    assert!(!retry.applied, "a preclaim tec must be retried under TapRetry");
+
+    let mut final_view = ledger::ApplyViewImpl::new(ledger, ApplyFlags::NONE);
+    let last = apply_submit_transactor_shell_with_flags_batch_outcome_and_preclaim_and_network_id(
+        &mut final_view,
+        &offer,
+        TxType::OFFER_CREATE,
+        ApplyFlags::NONE,
+        Ter::TEC_EXPIRED,
+        0,
+    );
+    assert_eq!(last.result, Ter::TEC_EXPIRED);
+    assert!(last.applied, "the final pass claims the fee");
 }
