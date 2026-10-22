@@ -775,6 +775,7 @@ pub struct InboundLedgers {
     /// Overlay ingress intentionally does not use this lock; it holds the
     /// separately published immutable [`CoordinatorIngress`] capability.
     coordinator: parking_lot::Mutex<Option<ProductionAdapter>>,
+    deferred_coordinator_acquires: Mutex<Vec<(Uint256, u32, AcquireReason, bool)>>,
     /// Lock-free published mirror of the coordinator's latest `RunnerSnapshot`
     /// and installed flag. Consensus/NetworkOps read coordinator phase/status
     /// every round via `coordinator_snapshot`/`coordinator_installed`; reading
@@ -916,6 +917,7 @@ impl InboundLedgers {
             recovery_lcl_decision: Mutex::new(None),
             lifecycle: Arc::new(AcquisitionLifecycleCounters::default()),
             coordinator: parking_lot::Mutex::new(None),
+            deferred_coordinator_acquires: Mutex::new(Vec::new()),
             coordinator_installed_flag: std::sync::atomic::AtomicBool::new(false),
             coordinator_snapshot_cell: arc_swap::ArcSwapOption::empty(),
             coordinator_recovery_latch_cell: arc_swap::ArcSwapOption::empty(),
@@ -1125,19 +1127,24 @@ impl InboundLedgers {
     pub fn coordinator_drain_with_status(&self) -> (usize, bool) {
         let (handled, failures) = {
             let mut guard = self.coordinator.lock();
-            let Some(coordinator) = guard.as_mut() else {
+            if guard.is_none() {
                 return (0, false);
-            };
+            }
             // Apply rotation before queued completions or acquires can observe
             // a generation which the rotating backend has already retired.
             let generation = self.pending_store_generation.swap(0, Ordering::AcqRel);
             let mut handled = 0;
             if generation != 0 {
-                coordinator.handle_fact(acquisition::AcquisitionEvent::StoreRotated(
-                    acquisition::StoreGeneration::new(generation),
-                ));
+                guard
+                    .as_mut()
+                    .expect("coordinator checked above")
+                    .handle_fact(acquisition::AcquisitionEvent::StoreRotated(
+                        acquisition::StoreGeneration::new(generation),
+                    ));
                 handled += 1;
             }
+            handled += self.apply_deferred_coordinator_acquires(&mut guard);
+            let coordinator = guard.as_mut().expect("coordinator checked above");
             handled += coordinator.drain();
             let has_more = coordinator.drain_has_more();
             let failures = coordinator.take_terminal_failures();
@@ -1676,6 +1683,7 @@ impl InboundLedgers {
     /// id, and the effects the coordinator emitted so the caller can trace
     /// peer request, timer, and phase transitions without reading coordinator
     /// internals.
+    #[cfg(test)]
     pub(crate) fn coordinator_acquire(
         &self,
         hash: Uint256,
@@ -1685,6 +1693,7 @@ impl InboundLedgers {
         self.coordinator_acquire_inner(hash, seq, reason, false)
     }
 
+    #[cfg(test)]
     fn coordinator_acquire_inner(
         &self,
         hash: Uint256,
@@ -1724,6 +1733,80 @@ impl InboundLedgers {
             return None;
         }
         let mut coordinator_guard = self.coordinator.lock();
+        self.coordinator_acquire_locked(&mut coordinator_guard, hash, seq, reason, validation_target)
+    }
+
+    /// Admission checks shared by the blocking and deferrable acquire paths.
+    fn coordinator_acquire_admitted(&self, hash: Uint256, seq: u32, reason: AcquireReason) -> bool {
+        if hash.is_zero() || self.stopping.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.need_network_ledger.load(Ordering::Acquire)
+            && reason != AcquireReason::Generic
+            && reason != AcquireReason::Consensus
+        {
+            tracing::info!(target: "inbound_ledger", %hash, seq, "coordinator_acquire: REJECTED need_network_ledger");
+            return false;
+        }
+        !self.should_defer_coordinator_acquire(&hash, reason)
+    }
+
+    /// Fire-and-forget acquire used by validation, check-accept, publication
+    /// and timer paths. These callers discard the outcome, so they must never
+    /// park behind the owner's drain: when the coordinator is busy the demand
+    /// is queued and the owner applies it, in order, at the start of its next
+    /// drain turn (rippled's `InboundLedgers::acquire` is likewise only a
+    /// brief registry insert followed by asynchronous work).
+    fn coordinator_acquire_deferrable(
+        &self,
+        hash: Uint256,
+        seq: u32,
+        reason: AcquireReason,
+        validation_target: bool,
+    ) {
+        if !self.coordinator_acquire_admitted(hash, seq, reason) {
+            return;
+        }
+        if let Some(mut guard) = self.coordinator.try_lock() {
+            let _ = self.coordinator_acquire_locked(&mut guard, hash, seq, reason, validation_target);
+            return;
+        }
+        self.deferred_coordinator_acquires
+            .lock()
+            .expect("deferred acquires lock")
+            .push((hash, seq, reason, validation_target));
+        if let Some(wake) = self.coordinator_wake.read().expect("coordinator wake read").as_ref() {
+            wake.notify();
+        }
+    }
+
+    fn apply_deferred_coordinator_acquires(
+        &self,
+        guard: &mut parking_lot::MutexGuard<'_, Option<ProductionAdapter>>,
+    ) -> usize {
+        let deferred = std::mem::take(
+            &mut *self
+                .deferred_coordinator_acquires
+                .lock()
+                .expect("deferred acquires lock"),
+        );
+        let count = deferred.len();
+        for (hash, seq, reason, validation_target) in deferred {
+            if self.coordinator_acquire_admitted(hash, seq, reason) {
+                let _ = self.coordinator_acquire_locked(guard, hash, seq, reason, validation_target);
+            }
+        }
+        count
+    }
+
+    fn coordinator_acquire_locked(
+        &self,
+        coordinator_guard: &mut parking_lot::MutexGuard<'_, Option<ProductionAdapter>>,
+        hash: Uint256,
+        seq: u32,
+        reason: AcquireReason,
+        validation_target: bool,
+    ) -> Option<CoordinatorAcquireOutcome> {
         let coordinator = coordinator_guard.as_mut()?;
 
         let acquisition_id = self.next_acquisition_id.fetch_add(1, Ordering::Relaxed);
@@ -1789,12 +1872,11 @@ impl InboundLedgers {
                 ?reason,
                 "coordinator_acquire: request emitted no new session effect (coalesced or rejected)"
             );
-            self.publish_coordinator_mirror(&coordinator_guard);
+            self.publish_coordinator_mirror(coordinator_guard);
             return None;
         };
         coordinator.owner_wake().notify();
-        self.publish_coordinator_mirror(&coordinator_guard);
-        drop(coordinator_guard);
+        self.publish_coordinator_mirror(coordinator_guard);
         tracing::info!(
             target: "inbound_ledger",
             %hash,
@@ -1988,7 +2070,7 @@ impl InboundLedgers {
                 );
                 return Some(ledger);
             }
-            self.coordinator_acquire(hash, seq, reason);
+            self.coordinator_acquire_deferrable(hash, seq, reason, false);
             return None;
         }
 
@@ -2394,7 +2476,7 @@ impl InboundLedgers {
     /// trusted-validation ledger (`RCLValidationsAdaptor::GetConsL2`).
     pub fn acquire_validation_ledger_async(&self, hash: Uint256) {
         if self.coordinator_installed() {
-            let _ = self.coordinator_acquire_inner(hash, 0, AcquireReason::Consensus, true);
+            self.coordinator_acquire_deferrable(hash, 0, AcquireReason::Consensus, true);
         } else {
             self.acquire_async(hash, 0, AcquireReason::Consensus);
         }
@@ -2406,7 +2488,7 @@ impl InboundLedgers {
     /// only `RCLValidationsAdaptor::GetConsL2` uses `ValidationTarget`.
     pub fn acquire_check_accept_ledger_async(&self, hash: Uint256, seq: u32) {
         if self.coordinator_installed() {
-            let _ = self.coordinator_acquire_inner(hash, seq, AcquireReason::Generic, false);
+            self.coordinator_acquire_deferrable(hash, seq, AcquireReason::Generic, false);
         } else {
             self.acquire_async(hash, seq, AcquireReason::Generic);
         }
@@ -4764,6 +4846,68 @@ mod tests {
                 .get(),
             5
         );
+        registry.stop();
+    }
+
+    #[test]
+    fn async_acquire_queues_instead_of_waiting_for_a_busy_owner_drain() {
+        use crate::network::network_ops::{NetworkOpsOperatingMode, SharedNetworkOpsState};
+        let state = Arc::new(SharedNetworkOpsState::new(NetworkOpsOperatingMode::Disconnected));
+        let (_dir, node_store) = test_node_store();
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let registry = InboundLedgers::with_worker_pool(
+            Arc::new(TreeNodeCache::new(
+                "registry-deferred-acquire-test",
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            Arc::new(FullBelowCacheImpl::new(
+                1,
+                MonotonicClock::default(),
+                HardenedHashBuilder::default(),
+                8,
+            )),
+            Arc::new(FetchPackCache::new(8, time::Duration::seconds(60), MonotonicClock::default())),
+            completed_tx,
+            state.need_network_ledger_arc(),
+            Arc::new(WorkerPool::new(0)),
+        );
+        registry.set_node_store(node_store);
+        registry.set_phase_state(Arc::clone(&state));
+        assert!(registry.install_coordinator());
+        assert!(registry.coordinator_startup(acquisition::SyncPhase::Connected));
+        assert!(registry.coordinator_report_peer_availability(&[1u32]));
+        let phase = |registry: &InboundLedgers| {
+            registry.coordinator_snapshot().expect("coordinator snapshot").phase().clone()
+        };
+        assert_eq!(phase(&registry), acquisition::SyncPhase::Connected);
+
+        let registry = Arc::new(registry);
+        let hash = Uint256::from_array([0x47; 32]);
+        // Simulate the owner in the middle of a drain.
+        let owner_guard = registry.coordinator.lock();
+        let caller = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                registry.acquire_check_accept_ledger_async(hash, 9);
+                started.elapsed()
+            })
+        };
+        let waited = caller.join().expect("caller thread");
+        assert!(
+            waited < std::time::Duration::from_millis(200),
+            "a fire-and-forget acquire waited {waited:?} for the owner"
+        );
+        assert_eq!(registry.deferred_coordinator_acquires.lock().unwrap().len(), 1);
+        drop(owner_guard);
+
+        // The owner applies the queued demand on its next drain: the Generic
+        // acquire reaches the coordinator and feeds Connectivity(empty).
+        let _ = registry.coordinator_drain_with_status();
+        assert!(registry.deferred_coordinator_acquires.lock().unwrap().is_empty());
+        assert_eq!(phase(&registry), acquisition::SyncPhase::Disconnected);
         registry.stop();
     }
 
