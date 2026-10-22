@@ -583,3 +583,47 @@ fn on_claimed_publishes_a_tree_that_is_complete_on_disk() {
     drop(driver);
     let _ = std::fs::remove_dir_all(&path);
 }
+
+// Mainnet 2026-10-22: an online snapshot export pinned ledger N and walked it
+// from the backend for 35 minutes while the 256-ledger window advanced past
+// N, and failed with "SHAMap node ... missing from store". A prune hold keeps
+// the held ledger (and newer) on disk until the guard drops.
+#[test]
+fn prune_hold_keeps_a_pinned_ledger_until_released() {
+    let (backend, path) = open_fjall_backend("hold");
+    let config = PrunedConfig {
+        online_delete: 3,
+        can_delete: u32::MAX,
+        prune_mode: PruneMode::On,
+        prune_batch: 64,
+        verify_interval_secs: 0,
+    };
+    let driver = PrunedDriver::open(Arc::clone(&backend), config).expect("driver opens");
+    for seq in 1..=4u32 {
+        let ledger = example_ledger(seq);
+        flush_ledger_nodes(&driver, &ledger);
+        driver.on_validated_ledger(Arc::new(ledger)).expect("claim");
+    }
+    let hold = driver.hold_pruning_at(2);
+    for seq in 5..=10u32 {
+        let ledger = example_ledger(seq);
+        flush_ledger_nodes(&driver, &ledger);
+        driver.on_validated_ledger(Arc::new(ledger)).expect("claim");
+    }
+    assert!(
+        driver.metrics().retained_floor <= 2,
+        "held ledger 2 must stay retained: {:?}",
+        driver.metrics()
+    );
+    drop(hold);
+    let ledger = example_ledger(11);
+    flush_ledger_nodes(&driver, &ledger);
+    driver.on_validated_ledger(Arc::new(ledger)).expect("claim");
+    assert!(
+        driver.metrics().retained_floor >= 8,
+        "pruning resumes after the hold is released: {:?}",
+        driver.metrics()
+    );
+    drop(driver);
+    let _ = std::fs::remove_dir_all(&path);
+}

@@ -595,6 +595,11 @@ impl RpcRuntime for ApplicationRoot {
         let ledger_hash = header.hash.to_string();
         let account_hash = header.account_hash.to_string();
         let output_owned = output_path.to_owned();
+        // The export walks this ledger from the live backend; keep the
+        // pruner from dropping it until the export thread finishes.
+        let prune_hold = self
+            .shamap_store_service()
+            .and_then(|service| service.component().hold_pruning_at(ledger_seq));
         self.start_snapshot_export(
             output_owned.clone(),
             ledger_seq,
@@ -602,6 +607,7 @@ impl RpcRuntime for ApplicationRoot {
                 std::thread::Builder::new()
                     .name(format!("snapshot-export-{ledger_seq}"))
                     .spawn(move || {
+                        let _prune_hold = prune_hold;
                         let path = Path::new(&output_owned);
                         tracing::info!(
                             target: "snapshot",

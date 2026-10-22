@@ -93,6 +93,19 @@ impl SHAMapStoreComponent {
         self.inner.pruned.as_ref().map(|driver| driver.metrics())
     }
 
+    /// Hold pruning at `ledger_seq` for a backend reader such as snapshot
+    /// export. `None` when this store is not the fjall pruned path (nothing
+    /// is pruned online there).
+    pub fn hold_pruning_at(
+        &self,
+        ledger_seq: u32,
+    ) -> Option<crate::shamap::pruned_driver::PruneHold> {
+        self.inner
+            .pruned
+            .as_ref()
+            .map(|driver| driver.hold_pruning_at(ledger_seq))
+    }
+
     /// The attached pruned-store driver (fjall path only).
     pub fn pruned_driver(&self) -> Option<Arc<crate::shamap::pruned_driver::PrunedDriver>> {
         self.inner.pruned.clone()
