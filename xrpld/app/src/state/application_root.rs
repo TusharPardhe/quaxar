@@ -10870,6 +10870,7 @@ impl ApplicationRoot {
             correct_close_time,
             base_fee_drops,
             txns,
+            false,
         )
         .map_err(|error| format!("accepted ledger build failed: {error:?}"))
     }
@@ -10891,6 +10892,7 @@ impl ApplicationRoot {
         correct_close_time: bool,
         base_fee_drops: u64,
         txns: Vec<Arc<protocol::STTx>>,
+        txq_time_leap: bool,
     ) -> Result<AcceptedLedgerOutcome, crate::bootstrap::build_ledger::BuildLedgerError> {
         self.accept_ledger_with_txns_outcome_on_parent(
             Some(parent_ledger),
@@ -10901,6 +10903,7 @@ impl ApplicationRoot {
             correct_close_time,
             base_fee_drops,
             txns,
+            txq_time_leap,
         )
     }
 
@@ -10961,6 +10964,7 @@ impl ApplicationRoot {
         correct_close_time: bool,
         _base_fee_drops: u64,
         txns: Vec<Arc<protocol::STTx>>,
+        txq_time_leap: bool,
     ) -> Result<AcceptedLedgerOutcome, crate::bootstrap::build_ledger::BuildLedgerError> {
         // Ensure the parent ledger has a node_fetcher attached. The
         // closed_ledger slot may hold a ledger whose fetcher was not set
@@ -11518,7 +11522,12 @@ impl ApplicationRoot {
         let tx_count = accepted_entries.len();
         tracing::info!(target: "app", seq = closed_seq, tx_count, close_time, "Ledger closed");
 
-        let _ = self.process_closed_ledger_txq(closed.as_ref(), false);
+        // rippled RCLConsensus::Adaptor::doAccept:
+        // `processClosedLedger(app_, *built, roundTime > 5s)`. A slow round
+        // cuts the expected ledger size; always passing false let the open
+        // ledger grow to ~1800 txs on mainnet while peers proposed ~400,
+        // so rounds ended MovedOn and the validator dropped out of full.
+        let _ = self.process_closed_ledger_txq(closed.as_ref(), txq_time_leap);
 
         // Register the built ledger in ledger_history so that
         // get_cached_ledger_by_hash / get_cached_ledger_by_seq can find it.

@@ -4048,6 +4048,7 @@ fn switched_ledger_consensus_child_can_replace_older_global_lcl() {
             true,
             switched_parent.fees().base,
             Vec::new(),
+            false,
         )
         .expect("switched parent must be accepted for build");
     app.install_consensus_child(Arc::clone(&outcome.closed));
@@ -4075,6 +4076,7 @@ fn consensus_child_payment_creates_account_at_child_sequence() {
             true,
             parent.fees().base,
             vec![payment],
+            false,
         )
         .expect("consensus child should build");
 
@@ -4200,6 +4202,7 @@ fn live_consensus_accept_runs_consensus_built_lifecycle_before_next_round() {
             true,
             parent.fees().base,
             Vec::new(),
+            false,
         )
         .expect("live consensus build should complete");
     let built = app.store_consensus_ledger(Arc::clone(&outcome.closed));
@@ -4299,6 +4302,7 @@ fn consensus_build_discards_transaction_with_consumed_parent_sequence() {
             true,
             parent.fees().base,
             vec![stale_tx],
+            false,
         )
         .expect("stale consensus transaction must not abort the candidate ledger build");
 
@@ -4327,6 +4331,7 @@ fn consensus_build_rejects_invalid_signature_before_mutation() {
             true,
             parent.fees().base,
             vec![unsigned_tx],
+            false,
         )
         .expect("invalid transaction must not abort the candidate ledger build");
 
@@ -5603,6 +5608,7 @@ fn batch_inner_transactions_retain_parent_context_and_metadata() {
             true,
             parent.fees().base,
             vec![Arc::clone(&batch)],
+            false,
         )
         .expect("Batch candidate construction should complete");
     let transactions = outcome
@@ -5876,6 +5882,7 @@ fn batch_all_or_nothing_discards_inner_metadata_with_the_whole_batch_view() {
             true,
             parent.fees().base,
             vec![Arc::new(batch)],
+            false,
         )
         .expect("Batch candidate construction should complete");
     let transactions = outcome
@@ -6345,6 +6352,7 @@ fn flag_ledger_unl_modify_sees_negative_unl_promoted_before_transactions() {
             true,
             parent.fees().base,
             vec![unl_modify],
+            false,
         )
         .expect("flag ledger should build");
 
