@@ -329,9 +329,15 @@ fn minimum_positive_for(asset: Asset) -> STAmount {
     }
 }
 
+/// rippled `TOfferStreamBase::shouldRmSmallIncreasedQOffer`. `offer_quality`
+/// is the book-directory (tip) quality the `TOffer` was built with, not the
+/// ratio of the offer's current amounts: after a partial fill the remaining
+/// amounts can round to a worse ratio than the directory quality, and that
+/// difference is exactly what marks a tiny offer for removal.
 fn small_increased_quality_offer_disposition(
     taker_pays: &STAmount,
     taker_gets: &STAmount,
+    offer_quality: Quality,
     owner_funds: &STAmount,
     owner: &AccountID,
     mptokens_v2: bool,
@@ -352,7 +358,7 @@ fn small_increased_quality_offer_disposition(
     let effective = if !issuer_has_unlimited_funds && owner_funds < taker_gets {
         let amounts = Amounts::new(taker_pays.clone(), taker_gets.clone());
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Quality::from_amounts(&amounts).ceil_out_strict(&amounts, owner_funds, false)
+            offer_quality.ceil_out_strict(&amounts, owner_funds, false)
         })) {
             Ok(amounts) => amounts,
             Err(payload) => return small_offer_exception_disposition(payload, mptokens_v2),
@@ -367,8 +373,7 @@ fn small_increased_quality_offer_disposition(
     if effective.r#in > minimum_positive_for(taker_pays.asset()) {
         return SmallOfferDisposition::Keep;
     }
-    (Quality::from_amounts(&effective)
-        < Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone())))
+    (Quality::from_amounts(&effective) < offer_quality)
     .then_some(SmallOfferDisposition::RemoveIfFundingUnchanged)
     .unwrap_or(SmallOfferDisposition::Keep)
 }
@@ -739,6 +744,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
         match small_increased_quality_offer_disposition(
             &taker_pays,
             &taker_gets,
+            offer_quality,
             &owner_funds,
             &offer_owner,
             view.rules().enabled(&protocol::feature_id("MPTokensV2")),
@@ -3915,8 +3921,44 @@ mod tests {
         );
         let gets = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(10));
         assert_eq!(
-            small_increased_quality_offer_disposition(&pays, &gets, &gets, &owner, true),
+            small_increased_quality_offer_disposition(&pays, &gets, Quality::from_amounts(&Amounts::new(pays.clone(), gets.clone())), &gets, &owner, true),
             SmallOfferDisposition::Keep
+        );
+    }
+
+    #[test]
+    fn small_offer_removal_compares_against_directory_quality_mainnet_107827095() {
+        // Mainnet 107827095, offer DDFA5687...: a partially filled offer left
+        // with TakerPays 1 drop / TakerGets 0.01501501526 FUZZY in book
+        // directory ...5617A93C0E013416. The remaining amounts imply a worse
+        // quality than the directory, so rippled removes it untouched (and
+        // OfferCreate D2C015E6 crossed the next offer instead).
+        let issuer = AccountID::from_array([0x91; 20]);
+        let owner = AccountID::from_array([0x92; 20]);
+        let issue = protocol::Issue::new(Currency::from([0x93; 20]), issuer);
+        let pays = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(1));
+        let gets = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            IOUAmount::from_parts(1_501_501_526_000_000, -17).expect("0.01501501526"),
+            issue,
+        );
+        let owner_funds = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            IOUAmount::from_parts(5_473_088_260_017_802, -11).expect("54730.88"),
+            issue,
+        );
+        let directory_quality = Quality::from_value(0x5617_A93C_0E01_3416);
+        assert!(Quality::from_amounts(&Amounts::new(pays.clone(), gets.clone())) < directory_quality);
+        assert_eq!(
+            small_increased_quality_offer_disposition(
+                &pays,
+                &gets,
+                directory_quality,
+                &owner_funds,
+                &owner,
+                true,
+            ),
+            SmallOfferDisposition::RemoveIfFundingUnchanged
         );
     }
 
@@ -3938,7 +3980,7 @@ mod tests {
         );
 
         assert_eq!(
-            small_increased_quality_offer_disposition(&pays, &gets, &owner_funds, &owner, true,),
+            small_increased_quality_offer_disposition(&pays, &gets, Quality::from_amounts(&Amounts::new(pays.clone(), gets.clone())), &owner_funds, &owner, true,),
             SmallOfferDisposition::RemoveIfFundingUnchanged,
             "pinned OfferStream removes the underfunded one-drop offer only when parent funding is unchanged"
         );
@@ -3986,7 +4028,7 @@ mod tests {
             STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(funded), mpt_issue);
 
         assert_eq!(
-            small_increased_quality_offer_disposition(&pays, &gets, &owner_funds, &owner, true,),
+            small_increased_quality_offer_disposition(&pays, &gets, Quality::from_amounts(&Amounts::new(pays.clone(), gets.clone())), &owner_funds, &owner, true,),
             SmallOfferDisposition::RemovePermanently
         );
     }
