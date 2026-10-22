@@ -6703,8 +6703,7 @@ impl ApplicationRoot {
                 // later fails must retract its complete-ledger claim and
                 // reacquire the exact hash, never a sequence-selected fork.
                 ledger_master.clear_ledger(seq);
-                if let Ok(guard) = inbound_ledgers.lock()
-                    && let Some(inbound) = guard.as_ref()
+                if let Some(inbound) = crate::ledger::inbound_ledgers::shared_inbound_ledgers(&inbound_ledgers)
                 {
                     inbound.acquire_async(
                         *hash.as_uint256(),
@@ -9362,8 +9361,8 @@ impl ApplicationRoot {
                 .ledger_fetch_size
                 .saturating_sub(1);
                 if generic_fetch_limit != 0 {
-                    if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
-                        if let Some(shared) = guard.as_ref() {
+                    if let Some(shared) = crate::ledger::inbound_ledgers::shared_inbound_ledgers(&lm_rt.inbound_ledgers) {
+                        {
                             for missing in report
                                 .generic_acquire_candidates
                                 .iter()
@@ -9400,8 +9399,7 @@ impl ApplicationRoot {
                             1,
                             move |hash| root.resolve_ledger_by_hash(SHAMapHash::new(hash)),
                             move |hash, seq, _reason| {
-                                if let Ok(guard) = inbound_ledgers.lock()
-                                    && let Some(shared) = guard.as_ref()
+                                if let Some(shared) = crate::ledger::inbound_ledgers::shared_inbound_ledgers(&inbound_ledgers)
                                 {
                                     shared.acquire_async(
                                         hash,
@@ -9470,8 +9468,7 @@ impl ApplicationRoot {
                         )
                     },
                     &mut |hash, seq, _reason| {
-                        if let Ok(guard) = inbound_ledgers.lock()
-                            && let Some(shared) = guard.as_ref()
+                        if let Some(shared) = crate::ledger::inbound_ledgers::shared_inbound_ledgers(&inbound_ledgers)
                         {
                             shared.acquire_async(
                                 hash,
@@ -10054,8 +10051,8 @@ impl ApplicationRoot {
                 // seq, InboundLedger::Reason::GENERIC)`: actively fetch the
                 // ledger we don't have from peers rather than waiting.
                 let mut acquisition_dispatched = false;
-                if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
-                    if let Some(shared) = guard.as_ref() {
+                if let Some(shared) = crate::ledger::inbound_ledgers::shared_inbound_ledgers(&lm_rt.inbound_ledgers) {
+                    {
                         shared.acquire_check_accept_ledger_async(hash, seq);
                         acquisition_dispatched = true;
                     }

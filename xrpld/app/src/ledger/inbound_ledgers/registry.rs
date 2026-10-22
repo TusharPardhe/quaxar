@@ -3873,6 +3873,17 @@ impl std::fmt::Debug for InboundLedgers {
     }
 }
 
+/// Clone the registry handle out of a runtime slot and release the slot lock
+/// before the caller touches the registry. Calls such as `acquire_async` can
+/// wait on the coordinator owner (which holds its lock for a whole drain);
+/// holding the slot guard across them blocked consensus accept, which reads
+/// the same slot in `inbound_ledger_is_provisional`.
+pub fn shared_inbound_ledgers(
+    slot: &std::sync::Mutex<Option<Arc<InboundLedgers>>>,
+) -> Option<Arc<InboundLedgers>> {
+    slot.lock().ok().and_then(|guard| guard.as_ref().cloned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::acquisition::{
@@ -3975,6 +3986,24 @@ mod tests {
     ) -> Arc<super::super::acquisition::AcquisitionState> {
         let inner = registry.inner.lock().expect("registry lock");
         Arc::clone(&inner.entries.get(hash).expect("active acquisition").state)
+    }
+
+    #[test]
+    fn shared_inbound_ledgers_releases_the_runtime_slot_while_the_handle_is_used() {
+        // Validator 2026-10-22: a JobQueue thread held the runtime slot guard
+        // inside `acquire_check_accept_ledger_async` while it waited for the
+        // coordinator owner's drain, and consensus accept blocked on the same
+        // slot in `inbound_ledger_is_provisional`.
+        let (_dir, registry) =
+            registry_with_manual_worker_pool(Arc::new(WorkerPool::new(1)));
+        let slot = std::sync::Mutex::new(Some(Arc::new(registry)));
+        let handle = super::shared_inbound_ledgers(&slot).expect("installed registry");
+        assert!(
+            slot.try_lock().is_ok(),
+            "the slot must be free while a caller is inside the registry"
+        );
+        assert!(!handle.is_provisional(&Uint256::from_u64(7)));
+        assert!(super::shared_inbound_ledgers(&std::sync::Mutex::new(None)).is_none());
     }
 
     #[test]

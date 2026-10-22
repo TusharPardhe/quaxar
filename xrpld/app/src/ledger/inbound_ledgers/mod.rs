@@ -39,7 +39,7 @@ pub use self::read_broker::{
 };
 pub use self::registry::{
     AcquireReason, CompletedInboundLedger, InboundLedgers, LedgerDataAdmission,
-    LedgerDataRouteDisposition,
+    LedgerDataRouteDisposition, shared_inbound_ledgers,
 };
 pub use self::worker_pool::WorkerPool;
 
