@@ -266,8 +266,7 @@ impl ApplicationRoot {
             1,
             move |hash| root.resolve_ledger_by_hash(SHAMapHash::new(hash)),
             move |hash, seq, _reason| {
-                if let Ok(guard) = inbound_ledgers.lock()
-                    && let Some(shared) = guard.as_ref()
+                if let Some(shared) = crate::ledger::inbound_ledgers::shared_inbound_ledgers(&inbound_ledgers)
                 {
                     shared.acquire_async(
                         hash,
@@ -312,8 +311,7 @@ impl ApplicationRoot {
                     },
                     &mut |hash, seq, _reason| {
                         if let Some(runtime) = self.ledger_master_runtime()
-                            && let Ok(guard) = runtime.inbound_ledgers.lock()
-                            && let Some(shared) = guard.as_ref()
+                            && let Some(shared) = crate::ledger::inbound_ledgers::shared_inbound_ledgers(&runtime.inbound_ledgers)
                         {
                             shared.acquire_async(
                                 hash,

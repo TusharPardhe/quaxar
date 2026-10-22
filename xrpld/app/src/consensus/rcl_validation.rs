@@ -370,8 +370,7 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
 
         let requested_hash = *ledger_id;
         let acquire = move || {
-            if let Some(guard) = runtime.inbound_ledgers.lock().ok()
-                && let Some(shared) = guard.as_ref()
+            if let Some(shared) = crate::ledger::inbound_ledgers::shared_inbound_ledgers(&runtime.inbound_ledgers)
             {
                 // This path has only a ledger hash. A peer's history range is
                 // not an authoritative hash-to-sequence binding, so acquire by
