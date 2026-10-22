@@ -2551,3 +2551,65 @@ fn queued_inbound_snapshot_can_be_cleared() {
     overlay.clear_queued_inbound();
     assert!(overlay.queued_inbound_snapshot().transactions.is_empty());
 }
+
+mod relay_history_expiry {
+    use super::super::{
+        RELAY_HISTORY_EXPIRY_INTERVAL, RELAY_HISTORY_HOLD_TIME, RelayHistoryEntry, RelayKey,
+        RelayKind, relay_history_entry,
+    };
+    use basics::base_uint::Uint256;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    fn key(byte: u8) -> RelayKey {
+        RelayKey {
+            kind: RelayKind::Proposal,
+            uid: Uint256::from([byte; 32]),
+        }
+    }
+
+    fn aged(now: Instant, peer: u32) -> RelayHistoryEntry {
+        let mut entry = RelayHistoryEntry {
+            last_touched: Some(now - RELAY_HISTORY_HOLD_TIME - Duration::from_secs(1)),
+            relayed_at: Some(now - RELAY_HISTORY_HOLD_TIME - Duration::from_secs(1)),
+            ..RelayHistoryEntry::default()
+        };
+        entry.peers.insert(peer);
+        entry
+    }
+
+    #[test]
+    fn aged_entry_is_treated_as_absent_without_a_full_walk() {
+        let now = Instant::now() + RELAY_HISTORY_HOLD_TIME * 2;
+        let mut history = HashMap::new();
+        history.insert(key(1), aged(now, 7));
+        history.insert(key(2), aged(now, 8));
+        // A walk ran just now, so this access must not walk again.
+        let mut last_expiry = Some(now);
+        let (entry, inserted) = relay_history_entry(&mut history, &mut last_expiry, key(1), now);
+        assert!(inserted, "an aged entry must behave like a new HashRouter entry");
+        assert!(entry.peers.is_empty());
+        assert!(entry.relayed_at.is_none());
+        // The other aged key is still resident until the amortized walk.
+        assert!(history.contains_key(&key(2)));
+    }
+
+    #[test]
+    fn live_entry_is_kept_and_walk_runs_once_per_interval() {
+        let now = Instant::now() + RELAY_HISTORY_HOLD_TIME * 2;
+        let mut history = HashMap::new();
+        let mut live = RelayHistoryEntry {
+            last_touched: Some(now - Duration::from_secs(10)),
+            ..RelayHistoryEntry::default()
+        };
+        live.peers.insert(3);
+        history.insert(key(1), live);
+        history.insert(key(2), aged(now, 8));
+        let mut last_expiry = Some(now - RELAY_HISTORY_EXPIRY_INTERVAL);
+        let (entry, inserted) = relay_history_entry(&mut history, &mut last_expiry, key(1), now);
+        assert!(!inserted);
+        assert_eq!(entry.peers.len(), 1);
+        assert!(!history.contains_key(&key(2)), "interval elapsed: aged keys are expired");
+        assert_eq!(last_expiry, Some(now));
+    }
+}

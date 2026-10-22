@@ -380,6 +380,46 @@ struct RelayHistoryEntry {
     last_touched: Option<Instant>,
 }
 
+impl RelayHistoryEntry {
+    fn is_live(&self, now: Instant) -> bool {
+        self.last_touched
+            .is_some_and(|touched| now.duration_since(touched) < RELAY_HISTORY_HOLD_TIME)
+    }
+}
+
+/// How often the per-message path walks the whole relay history to drop
+/// aged entries. rippled's `aged_unordered_map::expire` only visits expired
+/// entries; a full `retain` on every proposal and validation is O(history)
+/// per message and was a top CPU consumer on 2-vCPU mainnet hosts.
+const RELAY_HISTORY_EXPIRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Return the live entry for `key`, treating an aged entry exactly as an
+/// absent one (as if `HashRouter` had already expired it), and run the
+/// full expiry walk at most once per [`RELAY_HISTORY_EXPIRY_INTERVAL`].
+fn relay_history_entry<'a>(
+    history: &'a mut HashMap<RelayKey, RelayHistoryEntry>,
+    last_expiry: &mut Option<Instant>,
+    key: RelayKey,
+    now: Instant,
+) -> (&'a mut RelayHistoryEntry, bool) {
+    if last_expiry.is_none_or(|at| now.duration_since(at) >= RELAY_HISTORY_EXPIRY_INTERVAL) {
+        history.retain(|_, entry| entry.is_live(now));
+        *last_expiry = Some(now);
+    }
+    match history.entry(key) {
+        std::collections::hash_map::Entry::Vacant(vacant) => (vacant.insert(RelayHistoryEntry::default()), true),
+        std::collections::hash_map::Entry::Occupied(occupied) => {
+            let entry = occupied.into_mut();
+            if entry.is_live(now) {
+                (entry, false)
+            } else {
+                *entry = RelayHistoryEntry::default();
+                (entry, true)
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct OverlayRuntimeSquelchHandler {
     active_peers: Arc<RwLock<HashMap<PeerId, Arc<PeerImp>>>>,
@@ -1511,6 +1551,7 @@ pub struct OverlayImpl {
     traffic: Arc<TrafficCount>,
     tx_metrics: Arc<TxMetrics>,
     relay_history: Arc<Mutex<HashMap<RelayKey, RelayHistoryEntry>>>,
+    relay_history_last_expiry: Arc<Mutex<Option<Instant>>>,
     local_reservations: Arc<PeerReservationTable>,
     reservation_source: Arc<RwLock<Arc<dyn PeerReservationSource>>>,
     local_cluster: Arc<Cluster>,
@@ -1634,6 +1675,7 @@ impl OverlayImpl {
             traffic,
             tx_metrics: Arc::new(TxMetrics::new(clock)),
             relay_history: Arc::new(Mutex::new(HashMap::new())),
+            relay_history_last_expiry: Arc::new(Mutex::new(None)),
             local_reservations: Arc::clone(&local_reservations),
             reservation_source: Arc::new(RwLock::new(local_reservations)),
             local_cluster: Arc::clone(&local_cluster),
@@ -2315,6 +2357,7 @@ impl OverlayImpl {
             traffic: Arc::clone(&self.traffic),
             tx_metrics: Arc::clone(&self.tx_metrics),
             relay_history: Arc::clone(&self.relay_history),
+            relay_history_last_expiry: Arc::clone(&self.relay_history_last_expiry),
             local_reservations: Arc::clone(&self.local_reservations),
             reservation_source: Arc::clone(&self.reservation_source),
             local_cluster: Arc::clone(&self.local_cluster),
@@ -2766,18 +2809,12 @@ impl OverlayImpl {
     pub fn suppress_validation(&self, uid: Uint256) {
         let now = Instant::now();
         let mut history = self.relay_history.lock().expect("relay history lock");
-        history.retain(|_, entry| {
-            entry
-                .last_touched
-                .is_some_and(|touched| now.duration_since(touched) < RELAY_HISTORY_HOLD_TIME)
-        });
-        history
-            .entry(RelayKey {
-                kind: RelayKind::Validation,
-                uid,
-            })
-            .or_default()
-            .last_touched = Some(now);
+        let mut last_expiry = self.relay_history_last_expiry.lock().expect("relay expiry lock");
+        let key = RelayKey {
+            kind: RelayKind::Validation,
+            uid,
+        };
+        relay_history_entry(&mut history, &mut last_expiry, key, now).0.last_touched = Some(now);
     }
 
     pub fn relay_proposal(
@@ -2940,28 +2977,12 @@ impl OverlayImpl {
     fn register_relay_source(&self, kind: RelayKind, uid: Uint256, peer_id: PeerId) -> bool {
         let now = Instant::now();
         let mut history = self.relay_history.lock().expect("relay history lock");
-        history.retain(|_, entry| {
-            entry
-                .last_touched
-                .is_some_and(|touched| now.duration_since(touched) < RELAY_HISTORY_HOLD_TIME)
-        });
-        match history.entry(RelayKey { kind, uid }) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let mut state = RelayHistoryEntry {
-                    last_touched: Some(now),
-                    ..RelayHistoryEntry::default()
-                };
-                state.peers.insert(peer_id);
-                entry.insert(state);
-                true
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let state = entry.get_mut();
-                state.last_touched = Some(now);
-                state.peers.insert(peer_id);
-                false
-            }
-        }
+        let mut last_expiry = self.relay_history_last_expiry.lock().expect("relay expiry lock");
+        let (state, inserted) =
+            relay_history_entry(&mut history, &mut last_expiry, RelayKey { kind, uid }, now);
+        state.last_touched = Some(now);
+        state.peers.insert(peer_id);
+        inserted
     }
 
     fn update_slot_for_recent_duplicate(
@@ -3004,14 +3025,12 @@ impl OverlayImpl {
         let mut relayed = BTreeSet::new();
         let now = Instant::now();
         let mut history = self.relay_history.lock().expect("relay history lock");
+        let mut last_expiry = self.relay_history_last_expiry.lock().expect("relay expiry lock");
         // `HashRouter::emplace` expires aged entries before admitting a new
-        // key. This is time-based retention, not arbitrary eviction.
-        history.retain(|_, entry| {
-            entry
-                .last_touched
-                .is_some_and(|touched| now.duration_since(touched) < RELAY_HISTORY_HOLD_TIME)
-        });
-        let entry = history.entry(relay_key).or_default();
+        // key. This is time-based retention, not arbitrary eviction; an aged
+        // entry is treated as absent and the full walk is amortized.
+        let (entry, _) = relay_history_entry(&mut history, &mut last_expiry, relay_key, now);
+        drop(last_expiry);
         entry.last_touched = Some(now);
         let relay_due = entry
             .relayed_at
