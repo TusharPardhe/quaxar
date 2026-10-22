@@ -9,6 +9,12 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Fixed
 
+- The consensus accept passes `roundTime > 5s` to the TxQ as `timeLeap`, like
+  rippled `doAccept`. It always passed `false`, so slow rounds never cut the
+  expected ledger size; the open ledger grew to ~1800 transactions while
+  peers proposed ~400, rounds ended `MovedOn`, and the validator dropped out
+  of `full` (mainnet 107815330).
+
 - Offer crossing waives the issuer transfer fee on the taker's own offer
   reached from its DirectStepI, and on an offer owned by the strand
   destination after a BookStep, like rippled `BookOfferCrossingStep`

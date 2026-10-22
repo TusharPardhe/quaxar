@@ -338,6 +338,12 @@ pub trait RclConsensusRelay: Send + Sync {
     fn relay_disputed_tx(&self, tx: &consensus::RclCxTxRef);
 }
 
+/// rippled RCLConsensus::Adaptor::doAccept passes `roundTime > 5s` to
+/// `TxQ::processClosedLedger` as `timeLeap`.
+fn txq_time_leap(round_time: StdDuration) -> bool {
+    round_time > StdDuration::from_secs(5)
+}
+
 fn disputed_relay_envelope(
     raw_transaction: Vec<u8>,
     local_timestamp: u64,
@@ -486,6 +492,9 @@ pub struct PendingAcceptWork {
     pub close_time: u32,
     pub close_resolution: u8,
     pub correct_close_time: bool,
+    /// rippled doAccept: `processClosedLedger(app, *built, roundTime > 5s)`.
+    /// Slow rounds shrink the TxQ's expected ledger size.
+    pub txq_time_leap: bool,
     /// Offset computed from close-time votes. Rippled applies it only after
     /// switchLCL, so Quaxar carries it through the handoff instead of
     /// adjusting during on_accept.
@@ -1450,6 +1459,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 close_time,
                 close_resolution: close_resolution_secs,
                 correct_close_time: close_time_correct,
+                txq_time_leap: txq_time_leap(result.round_time.read()),
                 close_time_adjustment_seconds,
                 consensus_hash: result.txns.id(),
                 have_correct_lcl: mode != ConsensusMode::WrongLedger,
@@ -1891,6 +1901,7 @@ impl AppConsensus {
                 work.correct_close_time,
                 work.base_fee_drops,
                 work.txns.clone(),
+                work.txq_time_leap,
             )
         }));
         match build_result {
@@ -2293,6 +2304,7 @@ mod tests {
             close_time: 1_010,
             close_resolution: 30,
             correct_close_time: true,
+            txq_time_leap: false,
             close_time_adjustment_seconds: None,
             consensus_hash: Uint256::from_u64(0xBAD),
             have_correct_lcl: true,
@@ -2562,6 +2574,13 @@ mod tests {
         let mut guard = inbound.lock().expect("inbound transactions mutex");
         assert!(guard.acquire(stale_set).is_none());
         assert!(guard.get_set(Uint256::zero(), false).is_some());
+    }
+
+    #[test]
+    fn txq_time_leap_is_round_time_over_five_seconds() {
+        assert!(!super::txq_time_leap(std::time::Duration::from_secs(5)));
+        assert!(super::txq_time_leap(std::time::Duration::from_millis(5_001)));
+        assert!(!super::txq_time_leap(std::time::Duration::from_secs(2)));
     }
 
     #[test]
