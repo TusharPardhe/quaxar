@@ -12219,3 +12219,76 @@ fn pf20_ofr_zero() {
         Ter::TEM_BAD_OFFER
     );
 }
+
+/// Mainnet 107829916 (OfferCreate 3726CD2A...): a tfSell crossing whose
+/// sendMax runs out inside the best quality. The reverse pass (deliver =
+/// max) consumes that quality's last offer fully, and FlowOfferStream::step
+/// then looks ahead: a tiny offer at the next quality (effective TakerPays
+/// rounds to zero against its owner's funds) is removed before BookStep's
+/// one-quality check stops. quaxar stopped at the quality boundary and left
+/// the tiny offer in the book.
+#[test]
+fn oe_sell_crossing_removes_tiny_offer_past_the_consumed_quality() {
+    let a = acct(0x11);
+    let b = acct(0x22);
+    let gw = acct(0x33);
+    let t = acct(0x44);
+    let u = usd_currency();
+    let l = build_ledger(vec![
+        account_root(a, 10_000_000_000, 1, 0),
+        account_root(b, 10_000_000_000, 1, 0),
+        account_root(gw, 10_000_000_000, 0, 0),
+        account_root(t, 10_000_000_000, 1, 0),
+        trust_line(a, gw, u, 1000, 10000, 0),
+        trust_line(b, gw, u, 1000, 10000, 0),
+        trust_line(gw, t, u, 0, 0, 10000),
+    ]);
+    let mut v = new_view(l);
+    // A: 1000 USD for 1000 XRP (1 XRP/USD).
+    let offer_a = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), a);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1_000_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(gw, u, 1000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(handle_real_dispatch(&mut v, &offer_a, TxType::OFFER_CREATE, None), Ter::TES_SUCCESS);
+    // B: a worse quality (2 XRP/USD).
+    let offer_b = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), b);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(2_000_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(gw, u, 1000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(handle_real_dispatch(&mut v, &offer_b, TxType::OFFER_CREATE, None), Ter::TES_SUCCESS);
+    // B's funds drop to 1e-7 USD: clipped TakerPays is 0.2 drop -> 0.
+    let b_line = protocol::line(b, gw, u);
+    let mut sle = (*v.peek(b_line).ok().flatten().expect("B line")).clone();
+    sle.set_field_amount(
+        sf("sfBalance"),
+        STAmount::from_iou_amount(
+            sf("sfBalance"),
+            protocol::IOUAmount::from_parts(1_000_000_000_000_000, -22).expect("1e-7"),
+            protocol::Issue::new(u, b),
+        ),
+    );
+    v.update(std::sync::Arc::new(sle)).expect("update B line");
+
+    // T sells 500 XRP (less than A offers): tfSell | tfImmediateOrCancel.
+    let taker = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), t);
+        tx.set_field_u32(sf("sfFlags"), 0x0008_0000 | 0x0002_0000);
+        tx.set_field_amount(sf("sfTakerPays"), iou(gw, u, 100));
+        tx.set_field_amount(sf("sfTakerGets"), xrp(500_000_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(handle_real_dispatch(&mut v, &taker, TxType::OFFER_CREATE, None), Ter::TES_SUCCESS);
+    let a_offer = v.peek(protocol::offer_keylet(acct_id(a), 1)).ok().flatten();
+    assert!(a_offer.is_some(), "A is only partially consumed");
+    assert!(
+        v.peek(protocol::offer_keylet(acct_id(b), 1)).ok().flatten().is_none(),
+        "the tiny offer at the next quality must be removed by the stream look-ahead"
+    );
+}

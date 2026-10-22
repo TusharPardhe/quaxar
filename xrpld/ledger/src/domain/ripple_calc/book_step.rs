@@ -1117,6 +1117,43 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 offers_consumed += 1;
                 continue;
             }
+            // TOfferStreamBase::step runs shouldRmSmallIncreasedQOffer on every
+            // stepped offer, before BookStep's same-quality check. After the
+            // last offer of a quality is consumed the stream therefore removes
+            // tiny offers at the following qualities while looking for the next
+            // tip (mainnet 107829916: 2E53153E... after 67FE1C4D...).
+            match small_increased_quality_offer_disposition(
+                &taker_pays,
+                &taker_gets,
+                offer_quality,
+                &owner_funds,
+                &offer_owner,
+                view.rules().enabled(&protocol::feature_id("MPTokensV2")),
+            ) {
+                SmallOfferDisposition::Keep => {}
+                SmallOfferDisposition::RemoveIfFundingUnchanged => {
+                    if let Some(removable) = &self_cross_cancellation {
+                        removable.record_if_funding_unchanged(*offer_sle.key(), owner_funds.clone());
+                    }
+                    remove_offer_or_return!(&offer_sle);
+                    if !offer_attempted {
+                        first_quality = None;
+                    }
+                    offers_consumed += 1;
+                    continue;
+                }
+                SmallOfferDisposition::RemovePermanently => {
+                    if let Some(removable) = &self_cross_cancellation {
+                        removable.record(*offer_sle.key());
+                    }
+                    remove_offer_or_return!(&offer_sle);
+                    if !offer_attempted {
+                        first_quality = None;
+                    }
+                    offers_consumed += 1;
+                    continue;
+                }
+            }
 
             // TOffer::quality() comes from the traversed BookTip directory
             // root. A partial consumption changes TakerPays/TakerGets, and a
