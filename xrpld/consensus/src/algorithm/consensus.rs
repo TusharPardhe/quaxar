@@ -352,6 +352,9 @@ pub struct Consensus<A: ConsensusAdaptor, C: ConsensusClock = SystemConsensusClo
 
     curr_peer_positions: HashMap<A::NodeId, A::PeerPos>,
     recent_peer_positions: HashMap<A::NodeId, std::collections::VecDeque<A::PeerPos>>,
+    diag_wrong_prev: u32,
+    diag_stale_seq: u32,
+    diag_accepted: u32,
 
     prev_proposers: usize,
     dead_nodes: HashSet<A::NodeId>,
@@ -397,6 +400,9 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             establish_counter: 0,
             curr_peer_positions: HashMap::default(),
             recent_peer_positions: HashMap::default(),
+            diag_wrong_prev: 0,
+            diag_stale_seq: 0,
+            diag_accepted: 0,
             prev_proposers: 0,
             dead_nodes: HashSet::default(),
         }
@@ -470,6 +476,9 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         prev_ledger: &A::Ledger,
         mode: ConsensusMode,
     ) {
+        self.diag_wrong_prev = 0;
+        self.diag_stale_seq = 0;
+        self.diag_accepted = 0;
         self.phase = ConsensusPhase::Open;
         self.mode.set(mode, adaptor);
         self.now = now;
@@ -537,6 +546,7 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         let new_peer_prop = new_peer_pos.proposal();
 
         if *new_peer_prop.prev_ledger() != self.prev_ledger_id {
+            self.diag_wrong_prev += 1;
             return false;
         }
 
@@ -550,6 +560,7 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             if let Some(existing) = self.curr_peer_positions.get(&peer_id)
                 && new_peer_prop.propose_seq() <= existing.proposal().propose_seq()
             {
+                self.diag_stale_seq += 1;
                 return false;
             }
 
@@ -566,6 +577,7 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
 
             self.curr_peer_positions
                 .insert(peer_id.clone(), new_peer_pos.clone());
+            self.diag_accepted += 1;
         }
 
         if new_peer_prop.is_initial() {
@@ -1148,6 +1160,7 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
                     .all(|dispute| dispute.stalled(&parms, proposing, self.peer_unchanged_counter))
         };
 
+
         let state = check_consensus(
             self.prev_proposers,
             agree + disagree,
@@ -1159,6 +1172,12 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             &parms,
             proposing,
         );
+        if state != ConsensusState::No {
+            tracing::info!(target: "consensus_diag", prev_proposers = self.prev_proposers, agree, disagree,
+            finished = current_finished, round_ms = self.result.as_ref().map(|r| r.round_time.read().as_millis() as u64).unwrap_or(0),
+            wrong_prev = self.diag_wrong_prev, stale_seq = self.diag_stale_seq, accepted = self.diag_accepted,
+            recent = self.recent_peer_positions.len(), "have_consensus inputs");
+        }
 
         self.result.as_mut().expect("result set").state = state;
 
