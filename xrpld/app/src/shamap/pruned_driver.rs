@@ -22,6 +22,22 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+/// RAII hold returned by [`PrunedDriver::hold_pruning_at`].
+#[derive(Debug)]
+pub struct PruneHold {
+    holds: Arc<Mutex<Vec<u32>>>,
+    ledger_seq: u32,
+}
+
+impl Drop for PruneHold {
+    fn drop(&mut self) {
+        let mut holds = self.holds.lock().expect("pruned driver holds mutex");
+        if let Some(index) = holds.iter().position(|seq| *seq == self.ledger_seq) {
+            holds.swap_remove(index);
+        }
+    }
+}
+
 /// Owns the pruned store and the bookkeeping the claim path needs across
 /// ledgers. All claim/prune work is serialized on one worker (design R1).
 pub struct PrunedDriver {
@@ -46,6 +62,10 @@ pub struct PrunedDriver {
     last_verify: Mutex<Option<Instant>>,
     /// Live advisory prune cap (`can_delete`), updated by the RPC.
     can_delete: Arc<AtomicU32>,
+    /// Ledger floors held by in-flight readers (snapshot export) that walk a
+    /// pinned ledger's tree straight from the backend. Pruning never drops a
+    /// held ledger; `u32::MAX` entries are absent.
+    holds: Arc<Mutex<Vec<u32>>>,
     /// Newest validated ledger waiting for the worker (latest wins).
     pending: Mutex<Option<Arc<Ledger>>>,
     wake: Condvar,
@@ -65,6 +85,7 @@ impl PrunedDriver {
             on_claimed: Mutex::new(None),
             last_verify: Mutex::new(None),
             can_delete: Arc::new(AtomicU32::new(u32::MAX)),
+            holds: Arc::new(Mutex::new(Vec::new())),
             pending: Mutex::new(None),
             wake: Condvar::new(),
             stopping: AtomicBool::new(false),
@@ -120,6 +141,36 @@ impl PrunedDriver {
     /// component stores the effective `can_delete` here on every update.
     pub fn can_delete_handle(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.can_delete)
+    }
+
+    /// Keep `ledger_seq` (and everything newer) from being pruned until the
+    /// returned guard is dropped. A snapshot export walks its pinned ledger
+    /// from the live backend for longer than the `online_delete` window; on
+    /// mainnet (256 ledgers, ~17 minutes) an unheld 35-minute export lost
+    /// nodes mid-walk ("missing from store").
+    pub fn hold_pruning_at(&self, ledger_seq: u32) -> PruneHold {
+        self.holds
+            .lock()
+            .expect("pruned driver holds mutex")
+            .push(ledger_seq);
+        PruneHold {
+            holds: Arc::clone(&self.holds),
+            ledger_seq,
+        }
+    }
+
+    /// `maintain` drops ledgers `<= cap`: the operator cap, lowered to just
+    /// below the oldest held ledger.
+    fn effective_prune_cap(&self) -> u32 {
+        let can_delete = self.can_delete.load(Ordering::Acquire);
+        let held = self
+            .holds
+            .lock()
+            .expect("pruned driver holds mutex")
+            .iter()
+            .min()
+            .map(|seq| seq.saturating_sub(1));
+        held.map_or(can_delete, |held| held.min(can_delete))
     }
 
     /// Start the worker thread. Idempotent.
@@ -258,9 +309,7 @@ impl PrunedDriver {
             callback(seq, state_root);
         }
 
-        let pruned = self
-            .store
-            .maintain(seq, self.can_delete.load(Ordering::Acquire))?;
+        let pruned = self.store.maintain(seq, self.effective_prune_cap())?;
         if pruned > 0
             && let Some(callback) = self
                 .on_prune
