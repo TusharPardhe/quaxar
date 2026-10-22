@@ -3265,6 +3265,22 @@ pub(crate) fn apply_submit_transactor_shell_with_flags_batch_outcome_and_preclai
         }
     }
 
+    // applySteps.cpp::doApply: `if (!preclaimResult.likelyToClaimFee) return
+    // {preclaimResult.ter, false};` with likelyToClaimFee = tes ||
+    // isTecClaimHardFail(ter, flags). A preclaim `tec` (for example
+    // OfferCreate's tecEXPIRED) is therefore never applied during a TapRetry
+    // pass, even though the same code from doApply would be persisted by
+    // processPersistentChanges. It is retried and lands in the final pass.
+    if !is_tes_success(preclaim_result) && !likely_to_claim_fee(preclaim_result, flags) {
+        return SubmitApplyOutcome {
+            result: preclaim_result,
+            applied: false,
+            delivered_amount: None,
+            prebuilt_outer_metadata: None,
+            applied_batch_inner_transactions: Vec::new(),
+        };
+    }
+
     // applySteps.cpp::invokeApply enters withTxnType before constructing the
     // concrete Transactor; Transactor::operator() then installs its legacy
     // apply-time rules guard inside that scope.  The ordering matters on
@@ -11142,9 +11158,9 @@ impl ApplicationRoot {
                         self.load_fee_track.as_ref(),
                     )
                 });
-                // `doApply` admits every tes/tec PreclaimResult. Ordinary tec
-                // remains unapplied under TapRetry, while persistent cleanup
-                // tec values may still commit their reset/deletion state.
+                // `doApply` admits tes/tec PreclaimResults; the shell rejects a
+                // preclaim tec under TapRetry (likelyToClaimFee) before any
+                // persistent-cleanup handling can commit it.
                 let preclaim_admitted =
                     preclaim.is_some_and(|ter| is_tes_success(ter) || is_tec_claim(ter));
                 let (
