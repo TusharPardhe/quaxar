@@ -2364,6 +2364,14 @@ fn transaction_preflight_ter_with_parent_batch_id(
     })
 }
 
+/// rippled `LedgerMaster::checkAccept`: `if (!pubLedger_)
+/// pendSaveValidated(app_, ledger, true, true)`. Once a ledger has been
+/// published, validated ledgers are saved by publication (`doAdvance` ->
+/// `setFullLedger`), never synchronously on the consensus/validation path.
+pub(crate) fn check_accept_saves_synchronously(has_published_ledger: bool) -> bool {
+    !has_published_ledger
+}
+
 /// The application HashRouter used by `Transactor::preflight2`'s
 /// `checkValidity` (rippled reaches it through `ctx.registry`). Registered once
 /// by the running node; without it (unit tests, offline tools) preflight
@@ -10318,19 +10326,18 @@ impl ApplicationRoot {
         self.ledger_master_state
             .set_validated_close_time(validated_sign_time);
 
-        // Matches rippled's `LedgerMaster::checkAccept`: visibility is
-        // promoted first (above: `setValidLedger` equivalent), then
-        // persistence is dispatched via `pendSaveValidated(app_, ledger,
-        // true, true)` (LedgerMaster.cpp:976). `is_synchronous=true` here
-        // matches that call exactly -- rippled's `pendSaveValidated` still
-        // prefers `should_work`/dedup short-circuits over inline execution,
-        // and never gates visibility on the save regardless of the flag.
-        let persistence_rt = self.build_ledger_persistence_runtime();
-        ledger::LedgerPersistence::new(persistence_rt).pend_save_validated(
-            Arc::clone(&validated),
-            true,
-            true,
-        );
+        // Visibility is promoted first (above: `setValidLedger` equivalent).
+        // rippled LedgerMaster::checkAccept saves synchronously only while
+        // nothing has been published (`if (!pubLedger_)`); afterwards the
+        // save happens once in doAdvance's setFullLedger at publication.
+        if check_accept_saves_synchronously(self.published_ledger().is_some()) {
+            let persistence_rt = self.build_ledger_persistence_runtime();
+            ledger::LedgerPersistence::new(persistence_rt).pend_save_validated(
+                Arc::clone(&validated),
+                true,
+                true,
+            );
+        }
 
         // Persistence is dispatched above, after this ledger became visible
         // as validated (matching rippled's setValidLedger-then-

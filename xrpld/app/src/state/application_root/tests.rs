@@ -6490,3 +6490,9 @@ fn preflight_signature_check_uses_the_hash_router_cache_like_check_validity() {
         "a cached SigGood verdict is reused without re-verifying"
     );
 }
+
+#[test]
+fn check_accept_saves_synchronously_only_before_the_first_publication() {
+    assert!(super::check_accept_saves_synchronously(false));
+    assert!(!super::check_accept_saves_synchronously(true));
+}
