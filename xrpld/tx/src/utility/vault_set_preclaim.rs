@@ -16,6 +16,9 @@ use protocol::Ter;
 pub struct VaultSetPreclaimFacts {
     pub vault_exists: bool,
     pub submitter_is_owner: bool,
+    /// rippled #8527: under fixCleanup3_5_0, an AssetsMaximum that cannot be
+    /// represented as the vault asset.
+    pub assets_maximum_out_of_range: bool,
     pub issuance_exists: bool,
     pub domain_id_present: bool,
     pub domain_id_is_zero: bool,
@@ -31,6 +34,10 @@ pub const fn run_vault_set_preclaim(facts: VaultSetPreclaimFacts) -> Ter {
 
     if !facts.submitter_is_owner {
         return Ter::TEC_NO_PERMISSION;
+    }
+
+    if facts.assets_maximum_out_of_range {
+        return Ter::TEC_PRECISION_LOSS;
     }
 
     if !facts.issuance_exists {

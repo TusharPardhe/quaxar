@@ -171,6 +171,9 @@ fn vault_create_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
         is_private: sttx.get_field_u32(sf("sfFlags")) & VAULT_PRIVATE_FLAG != 0,
         assets_maximum_is_negative: tx_number_value_field(sttx, sf("sfAssetsMaximum"))
             .is_some_and(|value| value < RuntimeNumber::zero()),
+        assets_maximum_out_of_range: feature_enabled(view, "fixCleanup3_5_0")
+            && tx_number_value_field(sttx, sf("sfAssetsMaximum"))
+                .is_some_and(|value| !asset.is_representable(value)),
         mptoken_metadata_len: data_len(sttx, sf("sfMPTokenMetadata")),
         scale: sttx
             .is_field_present(sf("sfScale"))

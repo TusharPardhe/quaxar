@@ -10,7 +10,8 @@ use tx::loan_broker_set::{
     run_loan_broker_set_do_apply,
 };
 use tx::{
-    LoanBrokerSetPreclaimFacts, LoanBrokerSetPreflightFacts, run_loan_broker_set_preclaim,
+    DebtMaximumRepresentability, LoanBrokerSetPreclaimFacts, LoanBrokerSetPreflightFacts,
+    run_loan_broker_set_preclaim,
     run_loan_broker_set_preflight,
 };
 
@@ -48,7 +49,7 @@ fn preclaim_base() -> LoanBrokerSetPreclaimFacts {
         submitter_is_broker_owner: true,
         debt_maximum_is_zero_or_not_below_current_debt: true,
         debt_maximum_is_present: false,
-        debt_maximum_is_representable: true,
+        debt_maximum_representability: DebtMaximumRepresentability::Exact,
         can_add_holding_result: Ter::TES_SUCCESS,
         check_frozen_result: Ter::TES_SUCCESS,
         existing_broker_is_private: false,
@@ -291,7 +292,7 @@ fn tx_loan_broker_set_preclaim_rejects_debt_maximum_below_current_debt() {
 fn tx_loan_broker_set_preclaim_rejects_unrepresentable_debt_maximum() {
     let result = run_loan_broker_set_preclaim(LoanBrokerSetPreclaimFacts {
         debt_maximum_is_present: true,
-        debt_maximum_is_representable: false,
+        debt_maximum_representability: DebtMaximumRepresentability::PrecisionLoss,
         ..preclaim_base()
     });
 

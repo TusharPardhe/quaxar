@@ -2315,6 +2315,10 @@ fn submit_semantic_preflight_with_ledger(
                 is_private: st_tx.is_flag(protocol::tfVaultPrivate),
                 assets_maximum_is_negative: st_tx.is_field_present(assets_maximum_field)
                     && st_tx.get_field_amount(assets_maximum_field).negative(),
+                assets_maximum_out_of_range: rules
+                    .enabled(&protocol::feature_id("fixCleanup3_5_0"))
+                    && st_tx.is_field_present(assets_maximum_field)
+                    && !asset.is_representable(st_tx.get_field_number(assets_maximum_field).value()),
                 mptoken_metadata_len: st_tx
                     .is_field_present(mptoken_metadata_field)
                     .then(|| st_tx.get_field_vl(mptoken_metadata_field).len()),

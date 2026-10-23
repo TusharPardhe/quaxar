@@ -19,7 +19,8 @@ use protocol::{
 
 use crate::{
     LoanBrokerCoverClawbackAmountKind, LoanBrokerCoverClawbackPreclaimFacts,
-    LoanBrokerCoverDepositPreclaimFacts, LoanBrokerDeletePreclaimFacts, LoanBrokerSetPreclaimFacts,
+    DebtMaximumRepresentability, LoanBrokerCoverDepositPreclaimFacts, LoanBrokerDeletePreclaimFacts,
+    LoanBrokerSetPreclaimFacts,
     LoanManagePreclaimFacts, LoanPayPreclaimFacts, LoanSetScheduleGuardInputs,
     check_loan_set_schedule_guard, run_loan_broker_cover_clawback_preclaim,
     run_loan_broker_cover_deposit_preclaim, run_loan_broker_cover_withdraw_preflight,
@@ -415,6 +416,27 @@ fn preclaim_loan_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
         return Ok(Ter::TEC_LIMIT_EXCEEDED);
     }
     let asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
+    // rippled LoanSet::preclaim: every value field must convert to the vault
+    // asset unchanged. Without fixCleanup3_5_0 an out-of-range value throws
+    // (tefEXCEPTION); with it (#8527) that is tecPRECISION_LOSS too.
+    let fix_cleanup_3_5_0 = view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_5_0"));
+    for field in [
+        "sfPrincipalRequested",
+        "sfLoanOriginationFee",
+        "sfLoanServiceFee",
+        "sfLatePaymentFee",
+        "sfClosePaymentFee",
+    ] {
+        if !tx.is_field_present(sf(field)) {
+            continue;
+        }
+        let value = tx.get_field_number(sf(field)).value();
+        if (fix_cleanup_3_5_0 && !asset.is_representable(value)) || !asset.round_trips(value) {
+            return Ok(Ter::TEC_PRECISION_LOSS);
+        }
+    }
     let can_add = ledger::can_add_holding(view, &asset);
     if can_add != Ter::TES_SUCCESS {
         return Ok(can_add);
@@ -582,7 +604,15 @@ fn preclaim_broker_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
                     .is_some_and(|b| d >= b.get_field_number(sf("sfDebtTotal")).value())
         }),
         debt_maximum_is_present: debt_max.is_some(),
-        debt_maximum_is_representable: debt_max.is_none_or(|d| asset.amount(d).is_ok()),
+        debt_maximum_representability: debt_max
+            .map(|d| {
+                DebtMaximumRepresentability::classify(
+                    asset,
+                    d,
+                    view.rules().enabled(&protocol::feature_id("fixCleanup3_5_0")),
+                )
+            })
+            .unwrap_or_default(),
         can_add_holding_result: ledger::can_add_holding(view, &asset),
         check_frozen_result: frozen(
             view,
@@ -1253,5 +1283,102 @@ mod tests {
 
         assert_eq!(preclaim(10), Some(Ter::TES_SUCCESS));
         assert_eq!(preclaim(11), Some(Ter::TES_SUCCESS));
+    }
+
+    fn number(mantissa: i64, exponent: i32) -> basics::number::NumberParts {
+        basics::number::NumberParts::try_from_external_parts(
+            mantissa,
+            exponent,
+            basics::number::get_mantissa_scale(),
+        )
+        .expect("test number")
+    }
+
+    /// rippled LoanSet::preclaim value-field loop, plus #8527: a value that
+    /// rounds on conversion to the vault asset is tecPRECISION_LOSS; an
+    /// out-of-range one is tecPRECISION_LOSS under fixCleanup3_5_0 and throws
+    /// (tefEXCEPTION) before it.
+    #[test]
+    fn loan_set_value_fields_must_convert_to_the_vault_asset() {
+        let owner = AccountID::from_array([0x81; 20]);
+        let borrower = AccountID::from_array([0x82; 20]);
+        let vault_id = Uint256::from_u64(81);
+        let broker_id = Uint256::from_u64(82);
+        let preclaim = |rules: Rules, field: &'static str, value| {
+            let mut view = View {
+                rules,
+                ..View::default()
+            };
+            let mut vault = closed_vault(vault_id, owner, owner, 300);
+            vault.make_field_absent(sf("sfVaultKind"));
+            view.entries.insert(vault_id, Arc::new(vault));
+            view.entries.insert(broker_id, Arc::new(broker(broker_id, owner, owner, vault_id)));
+            let account = account_root(borrower);
+            view.entries.insert(*account.key(), Arc::new(account));
+            let tx = STTx::new(TxType::LOAN_SET, |tx| {
+                tx.set_account_id(sf("sfAccount"), borrower);
+                tx.set_field_h256(sf("sfLoanBrokerID"), broker_id);
+                tx.set_field_number(sf(field), protocol::STNumber::from(value));
+            });
+            run_loan_read_view_preclaim(&view, &tx, TxType::LOAN_SET)
+        };
+        let legacy = || Rules::new([]);
+        let fixed = || Rules::new([protocol::feature_id("fixCleanup3_5_0")]);
+
+        assert_eq!(preclaim(legacy(), "sfPrincipalRequested", number(100, 0)), Some(Ter::TES_SUCCESS));
+        for field in [
+            "sfPrincipalRequested",
+            "sfLoanOriginationFee",
+            "sfLoanServiceFee",
+            "sfLatePaymentFee",
+            "sfClosePaymentFee",
+        ] {
+            assert_eq!(
+                preclaim(legacy(), field, number(65, -1)),
+                Some(Ter::TEC_PRECISION_LOSS),
+                "{field}: 6.5 drops"
+            );
+        }
+        assert_eq!(
+            preclaim(fixed(), "sfPrincipalRequested", number(1, 18)),
+            Some(Ter::TEC_PRECISION_LOSS)
+        );
+        assert!(
+            std::panic::catch_unwind(|| preclaim(legacy(), "sfPrincipalRequested", number(1, 18)))
+                .is_err(),
+            "before fixCleanup3_5_0 rippled's STAmount throws"
+        );
+    }
+
+    /// rippled LoanBrokerSet::preclaim DebtMaximum check, plus #8527.
+    #[test]
+    fn loan_broker_set_debt_maximum_must_convert_to_the_vault_asset() {
+        let owner = AccountID::from_array([0x91; 20]);
+        let pseudo = AccountID::from_array([0x92; 20]);
+        let vault_id = Uint256::from_u64(91);
+        let preclaim = |rules: Rules, value| {
+            let mut vault = closed_vault(vault_id, owner, pseudo, 280);
+            vault.make_field_absent(sf("sfVaultKind"));
+            vault.make_field_absent(sf("sfSubscriptionDate"));
+            vault.make_field_absent(sf("sfRedemptionDate"));
+            let mut view = View {
+                rules,
+                ..View::default()
+            };
+            view.entries.insert(vault_id, Arc::new(vault));
+            let tx = STTx::new(TxType::LOAN_BROKER_SET, |tx| {
+                tx.set_account_id(sf("sfAccount"), owner);
+                tx.set_field_h256(sf("sfVaultID"), vault_id);
+                tx.set_field_number(sf("sfDebtMaximum"), protocol::STNumber::from(value));
+            });
+            run_loan_read_view_preclaim(&view, &tx, TxType::LOAN_BROKER_SET)
+        };
+        let legacy = || Rules::new([]);
+        let fixed = || Rules::new([protocol::feature_id("fixCleanup3_5_0")]);
+
+        assert_eq!(preclaim(legacy(), number(100, 0)), Some(Ter::TES_SUCCESS));
+        assert_eq!(preclaim(legacy(), number(65, -1)), Some(Ter::TEC_PRECISION_LOSS));
+        assert_eq!(preclaim(fixed(), number(1, 18)), Some(Ter::TEC_PRECISION_LOSS));
+        assert!(std::panic::catch_unwind(|| preclaim(legacy(), number(1, 18))).is_err());
     }
 }

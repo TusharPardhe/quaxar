@@ -28,6 +28,9 @@ pub struct VaultCreatePreflightFacts {
     pub domain_id_is_zero: bool,
     pub is_private: bool,
     pub assets_maximum_is_negative: bool,
+    /// rippled #8527: under fixCleanup3_5_0, an AssetsMaximum that cannot be
+    /// represented as the vault asset (e.g. XRP above kMaxNativeN).
+    pub assets_maximum_out_of_range: bool,
     pub mptoken_metadata_len: Option<usize>,
     pub scale: Option<u8>,
     pub asset_is_mpt: bool,
@@ -59,6 +62,10 @@ pub const fn run_vault_create_preflight(facts: VaultCreatePreflightFacts) -> Not
     }
 
     if facts.assets_maximum_is_negative {
+        return Ter::TEM_MALFORMED;
+    }
+
+    if facts.assets_maximum_out_of_range {
         return Ter::TEM_MALFORMED;
     }
 
@@ -270,5 +277,18 @@ mod tests {
         });
 
         assert_eq!(result, Ter::TES_SUCCESS);
+    }
+
+    /// rippled #8527 VaultCreate::preflight: an out-of-range AssetsMaximum
+    /// is temMALFORMED, after the negative check.
+    #[test]
+    fn vault_create_rejects_out_of_range_assets_maximum() {
+        assert_eq!(
+            run_vault_create_preflight(VaultCreatePreflightFacts {
+                assets_maximum_out_of_range: true,
+                ..VaultCreatePreflightFacts::default()
+            }),
+            Ter::TEM_MALFORMED
+        );
     }
 }

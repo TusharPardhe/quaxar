@@ -1636,6 +1636,12 @@ fn validate_vault_preflight(tx: &STTx, rules: &Rules, txn_type: TxType) -> NotTe
                         .is_zero(),
                 is_private: tx.get_flags() & crate::VAULT_PRIVATE_FLAG != 0,
                 assets_maximum_is_negative: optional_number_is_negative(tx, "sfAssetsMaximum"),
+                // rippled #8527 VaultCreate::preflight.
+                assets_maximum_out_of_range: rules.enabled(&protocol::feature_id("fixCleanup3_5_0"))
+                    && present("sfAssetsMaximum")
+                    && !asset.is_representable(
+                        tx.get_field_number(get_field_by_symbol("sfAssetsMaximum")).value(),
+                    ),
                 mptoken_metadata_len: optional_data_len(tx, "sfMPTokenMetadata"),
                 scale: present("sfScale").then(|| tx.get_field_u8(get_field_by_symbol("sfScale"))),
                 asset_is_mpt: matches!(asset, Asset::MPTIssue(_)),
