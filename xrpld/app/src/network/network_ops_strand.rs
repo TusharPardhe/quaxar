@@ -2823,22 +2823,38 @@ fn trace_completed_inbound_handoff(
 
 /// Ledgers between trims of the resident state tree.
 const RESIDENT_TRIM_INTERVAL: u32 = 64;
-/// How far behind the validated ledger the trimmed ledger is. Every node of a
-/// ledger this old was flushed to the NodeStore when it was built or acquired,
-/// and an old node's children are themselves old, so dropping them can only
-/// release persisted nodes.
-const RESIDENT_TRIM_LAG: u32 = 8;
+/// SHAMap levels kept loaded on every trimmed ledger (16 + 256 inner nodes).
+const RESIDENT_TRIM_KEEP_DEPTH: usize = 2;
 
-/// Bound the SHAMap nodes kept resident by the ledger lineage.
+/// Bound the SHAMap nodes kept resident by the ledgers this node holds.
 ///
 /// Every node read through a ledger (consensus apply, RPC, serving peers) is
-/// attached to its parent and, because unchanged inner nodes are shared by
-/// every later ledger, stays attached for the life of the lineage. rippled
-/// keeps them all, so its resident tree grows towards the whole state (about
-/// 24M nodes / 10 GiB on testnet). Quaxar already releases acquired ledgers'
-/// deep graphs for the same reason; this applies the same release to the
-/// validated lineage. Released nodes are reloaded on demand from the
-/// TreeNodeCache or the NodeStore.
+/// attached to its parent, and unchanged nodes are shared by every later
+/// ledger. rippled keeps them all, so its resident tree grows towards the
+/// whole state (about 24M nodes / 10 GiB on testnet).
+///
+/// Releasing only an older ledger is not enough: each newer ledger has its
+/// own copies of the top levels (they change every ledger) and those copies
+/// still point at the same deep subtrees. So the release is applied to every
+/// held ledger whose nodes are durable: the closed and validated ledgers and
+/// every ledger in the history cache, skipping provisional (pre-fence)
+/// acquisitions. Released nodes are reloaded on demand from the TreeNodeCache
+/// or the NodeStore, so ledger contents and hashes are unaffected.
+/// Every held ledger once, oldest first.
+fn resident_trim_ledgers(
+    closed: Option<Arc<ledger::Ledger>>,
+    validated: Option<Arc<ledger::Ledger>>,
+    cached: Vec<Arc<ledger::Ledger>>,
+) -> Vec<Arc<ledger::Ledger>> {
+    let mut ledgers: Vec<Arc<ledger::Ledger>> = Vec::with_capacity(cached.len() + 2);
+    ledgers.extend(closed);
+    ledgers.extend(validated);
+    ledgers.extend(cached);
+    ledgers.sort_by_key(|ledger| (ledger.header().seq, *ledger.header().hash.as_uint256()));
+    ledgers.dedup_by_key(|ledger| (ledger.header().seq, *ledger.header().hash.as_uint256()));
+    ledgers
+}
+
 fn trim_resident_ledger_tree(root: &ApplicationRoot, last_trim_seq: &mut u32) {
     let Some(validated) = root.validated_ledger_seq() else {
         return;
@@ -2849,36 +2865,40 @@ fn trim_resident_ledger_tree(root: &ApplicationRoot, last_trim_seq: &mut u32) {
     let Some(lm_rt) = root.ledger_master_runtime() else {
         return;
     };
-    let target_seq = validated.saturating_sub(RESIDENT_TRIM_LAG);
-    let Some(ledger) = lm_rt
-        .ledger_master()
-        .ledger_history()
-        .get_cached_ledger_by_seq(target_seq)
-    else {
-        return;
-    };
     *last_trim_seq = validated;
     let generation = root
         .node_family_full_below_cache()
         .map(|cache| cache.generation());
-    match ledger.release_durable_map_graphs(generation, 2) {
-        Some(released) => tracing::info!(
-            target: "ledger",
-            event = "resident_tree_trimmed",
-            ledger_seq = target_seq,
-            validated_seq = validated,
-            state_full_below = released.state_full_below,
-            state_deep = released.state_deep,
-            transaction_deep = released.transaction_deep,
-            "released deep SHAMap children of the validated lineage"
-        ),
-        None => tracing::debug!(
-            target: "ledger",
-            event = "resident_tree_trim_skipped",
-            ledger_seq = target_seq,
-            "validated ledger did not satisfy graph-release guards"
-        ),
+    let ledgers = resident_trim_ledgers(
+        root.closed_ledger(),
+        root.validated_ledger(),
+        lm_rt.ledger_master().ledger_history().cached_ledgers(),
+    );
+    let (mut trimmed, mut skipped, mut state_deep, mut transaction_deep) = (0u32, 0u32, 0usize, 0usize);
+    for ledger in ledgers {
+        if root.inbound_ledger_is_provisional(*ledger.header().hash.as_uint256()) {
+            skipped += 1;
+            continue;
+        }
+        match ledger.release_durable_map_graphs(generation, RESIDENT_TRIM_KEEP_DEPTH) {
+            Some(released) => {
+                trimmed += 1;
+                state_deep += released.state_deep;
+                transaction_deep += released.transaction_deep;
+            }
+            None => skipped += 1,
+        }
     }
+    tracing::info!(
+        target: "ledger",
+        event = "resident_tree_trimmed",
+        validated_seq = validated,
+        ledgers_trimmed = trimmed,
+        ledgers_skipped = skipped,
+        state_deep,
+        transaction_deep,
+        "released deep SHAMap children of every durable held ledger"
+    );
 }
 
 /// Release a durable ledger's deep SHAMap ownership only after the coordinator
@@ -3475,6 +3495,23 @@ fn should_acquire_history(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resident_trim_covers_every_held_ledger_once_not_only_an_old_one() {
+        // A trim limited to validated-8 released nothing: newer ledgers hold
+        // their own top-level copies that still point at the deep subtrees.
+        let make = |seq: u32| Arc::new(ledger::Ledger::from_ledger_seq_and_close_time(seq, 800 + seq, false));
+        let (l10, l11, l12) = (make(10), make(11), make(12));
+        let held = super::resident_trim_ledgers(
+            Some(Arc::clone(&l12)),
+            Some(Arc::clone(&l11)),
+            vec![Arc::clone(&l11), Arc::clone(&l10), Arc::clone(&l12)],
+        );
+        assert_eq!(
+            held.iter().map(|ledger| ledger.header().seq).collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+    }
+
     use super::{
         ConsensusJobScheduler, CoordinatorHandoffDedup, LclAuditSampler, MAX_COMMANDS_PER_TURN,
         MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, PendingDurableAckGate,
