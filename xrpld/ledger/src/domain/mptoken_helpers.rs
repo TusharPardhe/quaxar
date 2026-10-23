@@ -79,7 +79,7 @@ fn is_frozen_mpt_with_depth(
 ) -> Result<bool, ViewError> {
     Ok(is_global_frozen_mpt(view, mpt_issue)?
         || is_individual_frozen_mpt(view, account, mpt_issue)?
-        || is_vault_share_underlying_frozen(view, account, mpt_issue, depth)?)
+        || is_vault_pseudo_account_frozen(view, account, mpt_issue, depth)?)
 }
 
 fn is_frozen_issue_for_account(
@@ -131,7 +131,7 @@ fn is_frozen_asset_for_accounts(
                 }
             }
             for account in accounts {
-                if is_vault_share_underlying_frozen(view, account, &issue, depth)? {
+                if is_vault_pseudo_account_frozen(view, account, &issue, depth)? {
                     return Ok(true);
                 }
             }
@@ -140,7 +140,10 @@ fn is_frozen_asset_for_accounts(
     }
 }
 
-fn is_vault_share_underlying_frozen(
+/// rippled `isVaultPseudoAccountFrozen` (View.cpp): a vault share inherits
+/// the freeze of the vault's underlying asset, checked for the share issuer
+/// (the vault pseudo-account) and `account`.
+pub fn is_vault_pseudo_account_frozen(
     view: &dyn ReadView,
     account: &AccountID,
     mpt_issue: &MPTIssue,
@@ -148,7 +151,7 @@ fn is_vault_share_underlying_frozen(
 ) -> Result<bool, ViewError> {
     if !view
         .rules()
-        .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+        .enabled(&protocol::feature_id("SingleAssetVault"))
     {
         return Ok(false);
     }
@@ -160,20 +163,38 @@ fn is_vault_share_underlying_frozen(
     else {
         return Ok(false);
     };
-    if !share_issuance.is_field_present(sf("sfReferenceHolding")) {
-        return Ok(false);
+    let issuer = share_issuance.get_account_id(sf("sfIssuer"));
+
+    // Shares created after fixCleanup3_2_0 point at the vault pseudo's
+    // holding of the underlying asset.
+    if share_issuance.is_field_present(sf("sfReferenceHolding")) {
+        let Some(holding) = view.read(unchecked_keylet(
+            share_issuance.get_field_h256(sf("sfReferenceHolding")),
+        ))?
+        else {
+            return Ok(false);
+        };
+        let Some(asset) = asset_of_holding(&share_issuance, &holding) else {
+            return Ok(false);
+        };
+        return is_frozen_asset_for_accounts(view, &[issuer, *account], asset, depth + 1);
     }
 
-    let Some(holding) = view.read(unchecked_keylet(
-        share_issuance.get_field_h256(sf("sfReferenceHolding")),
+    // Older shares: the issuer is a vault pseudo-account iff it carries
+    // sfVaultID, and the vault names the underlying asset.
+    let Some(issuer_root) = view.read(account_keylet(to_uint160(issuer)))? else {
+        return Ok(false);
+    };
+    if !issuer_root.is_field_present(sf("sfVaultID")) {
+        return Ok(false);
+    }
+    let Some(vault) = view.read(protocol::vault_keylet_from_key(
+        issuer_root.get_field_h256(sf("sfVaultID")),
     ))?
     else {
         return Ok(false);
     };
-    let Some(asset) = asset_of_holding(&share_issuance, &holding) else {
-        return Ok(false);
-    };
-    let issuer = share_issuance.get_account_id(sf("sfIssuer"));
+    let asset = vault.get_field_issue(sf("sfAsset")).asset();
     is_frozen_asset_for_accounts(view, &[issuer, *account], asset, depth + 1)
 }
 

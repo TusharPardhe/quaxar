@@ -692,16 +692,17 @@ fn execute_mpt_endpoint<V: ApplyView>(
     // A one-step pure issue/redeem is allowed through a global lock.  On a
     // multi-step path the source endpoint observes global+individual lock,
     // while the destination endpoint observes only its individual lock.
+    // rippled #8478: on both endpoints a vault share also inherits the freeze
+    // of the vault's underlying asset.
     if !(is_first && is_last) {
-        let locked = if is_first {
-            crate::mptoken_helpers::is_global_frozen_mpt(view, issue)
+        let account = if is_first { src } else { dst };
+        let locked = (is_first
+            && crate::mptoken_helpers::is_global_frozen_mpt(view, issue)
+                .map_err(|_| Ter::TEF_BAD_LEDGER)?)
+            || crate::mptoken_helpers::is_individual_frozen_mpt(view, account, issue)
                 .map_err(|_| Ter::TEF_BAD_LEDGER)?
-                || crate::mptoken_helpers::is_individual_frozen_mpt(view, src, issue)
-                    .map_err(|_| Ter::TEF_BAD_LEDGER)?
-        } else {
-            crate::mptoken_helpers::is_individual_frozen_mpt(view, dst, issue)
-                .map_err(|_| Ter::TEF_BAD_LEDGER)?
-        };
+            || crate::mptoken_helpers::is_vault_pseudo_account_frozen(view, account, issue, 0)
+                .map_err(|_| Ter::TEF_BAD_LEDGER)?;
         if locked {
             return Err(Ter::TEC_LOCKED);
         }
