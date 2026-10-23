@@ -1,5 +1,6 @@
 //! Read-only `account_lines` RPC slice.
 
+use crate::handlers::owner_dir_marker::is_related_to_account;
 use std::collections::BTreeMap;
 
 use basics::base_uint::{Uint160, Uint256};
@@ -293,38 +294,6 @@ fn get_start_hint(sle: &STLedgerEntry, account_id: AccountID) -> u64 {
     sle.get_field_u64(get_field_by_symbol("sfOwnerNode"))
 }
 
-fn is_related_to_account(sle: &STLedgerEntry, account_id: AccountID) -> bool {
-    if sle.get_type() == LedgerEntryType::RippleState {
-        return sle
-            .get_field_amount(get_field_by_symbol("sfLowLimit"))
-            .issue()
-            .account
-            == account_id
-            || sle
-                .get_field_amount(get_field_by_symbol("sfHighLimit"))
-                .issue()
-                .account
-                == account_id;
-    }
-
-    if sle.is_field_present(get_field_by_symbol("sfAccount")) {
-        return sle.get_account_id(get_field_by_symbol("sfAccount")) == account_id
-            || (sle.is_field_present(get_field_by_symbol("sfDestination"))
-                && sle.get_account_id(get_field_by_symbol("sfDestination")) == account_id);
-    }
-
-    if sle.get_type() == LedgerEntryType::SignerList {
-        return *sle.key()
-            == signers_keylet(Uint160::from_slice(account_id.data()).expect("account width")).key;
-    }
-
-    if sle.get_type() == LedgerEntryType::NFTokenOffer {
-        return sle.get_account_id(get_field_by_symbol("sfOwner")) == account_id;
-    }
-
-    false
-}
-
 fn directory_contains_after<S: AccountLinesSource>(
     source: &S,
     ledger: &LedgerLookupLedger,
@@ -604,7 +573,9 @@ pub fn do_account_lines<S: AccountLinesSource>(
         let Some(marker_sle) = source.read_child_entry(&ledger, start_after) else {
             return rpc_error(RpcErrorCode::InvalidParams);
         };
-        if !is_related_to_account(&marker_sle, account_id) {
+        if !is_related_to_account(&marker_sle, |page| {
+        source.read_owner_dir_page(&ledger, account_id, page)
+    }) {
             return rpc_error(RpcErrorCode::InvalidParams);
         }
     }

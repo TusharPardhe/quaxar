@@ -30,6 +30,7 @@ pub mod ledger_data;
 pub mod ledger_diff;
 pub mod ledger_entry;
 pub mod ledger_entry_helpers;
+pub mod owner_dir_marker;
 pub mod ledger_header;
 pub mod ledger_lookup;
 pub mod ledger_request;

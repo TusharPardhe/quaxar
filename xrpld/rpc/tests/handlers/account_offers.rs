@@ -199,7 +199,7 @@ fn account_offers_reports_missing_invalid_and_malformed() {
 #[test]
 fn account_offers_respects_marker_limit_and_offer_json() {
     let account = sample_account(0x11);
-    let offer1 = make_offer(
+    let mut offer1 = make_offer(
         account,
         1,
         sample_hash(0x01),
@@ -207,7 +207,7 @@ fn account_offers_respects_marker_limit_and_offer_json() {
         protocol::STAmount::new_native(500, false),
         Some(7),
     );
-    let offer2 = make_offer(
+    let mut offer2 = make_offer(
         account,
         2,
         sample_hash(0x02),
@@ -215,7 +215,7 @@ fn account_offers_respects_marker_limit_and_offer_json() {
         protocol::STAmount::new_native(1_000, false),
         None,
     );
-    let offer3 = make_offer(
+    let mut offer3 = make_offer(
         account,
         3,
         sample_hash(0x03),
@@ -223,6 +223,11 @@ fn account_offers_respects_marker_limit_and_offer_json() {
         protocol::STAmount::new_native(1_500, false),
         None,
     );
+    // OwnerNode is the owner-directory page listing the offer: 1 and 2 are on
+    // page 0, 3 on page 1. rippled #8274 validates markers against it.
+    for (offer, page) in [(&mut offer1, 0), (&mut offer2, 0), (&mut offer3, 1)] {
+        offer.set_field_u64(get_field_by_symbol("sfOwnerNode"), page);
+    }
 
     let root = owner_dir_keylet(Uint160::from_slice(account.data()).expect("account width"));
     let mut page0 = STLedgerEntry::new(root);

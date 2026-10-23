@@ -2,6 +2,7 @@
 
 #![allow(clippy::manual_contains)]
 
+use crate::handlers::owner_dir_marker::is_related_to_account;
 use std::{collections::BTreeMap, sync::Arc};
 
 use basics::base_uint::Uint256;
@@ -174,46 +175,6 @@ fn get_start_hint(sle: &STLedgerEntry, account_id: AccountID) -> u64 {
 
             sle.get_field_u64(get_field_by_symbol("sfOwnerNode"))
         }
-    }
-}
-
-fn is_related_to_account(sle: &STLedgerEntry, account_id: AccountID) -> bool {
-    match sle.get_type() {
-        LedgerEntryType::RippleState => {
-            let ripple = RippleState::new(Arc::new(sle.clone()))
-                .expect("RippleState ownership markers should wrap cleanly");
-            ripple.get_low_limit().issue().account == account_id
-                || ripple.get_high_limit().issue().account == account_id
-        }
-        LedgerEntryType::Offer => {
-            let offer = Offer::new(Arc::new(sle.clone()))
-                .expect("Offer ownership markers should wrap cleanly");
-            offer.get_account() == account_id
-        }
-        LedgerEntryType::PayChannel => {
-            let channel = PayChannel::new(Arc::new(sle.clone()))
-                .expect("PayChannel ownership markers should wrap cleanly");
-            channel.get_account() == account_id || channel.get_destination() == account_id
-        }
-        LedgerEntryType::NFTokenOffer => {
-            let nft_offer = NFTokenOffer::new(Arc::new(sle.clone()))
-                .expect("NFTokenOffer ownership markers should wrap cleanly");
-            nft_offer.get_owner() == account_id
-        }
-        LedgerEntryType::SignerList => {
-            *sle.key()
-                == signers_keylet(
-                    basics::base_uint::Uint160::from_slice(account_id.data())
-                        .expect("account width"),
-                )
-                .key
-        }
-        _ if sle.is_field_present(get_field_by_symbol("sfAccount")) => {
-            sle.get_account_id(get_field_by_symbol("sfAccount")) == account_id
-                || (sle.is_field_present(get_field_by_symbol("sfDestination"))
-                    && sle.get_account_id(get_field_by_symbol("sfDestination")) == account_id)
-        }
-        _ => false,
     }
 }
 
@@ -447,7 +408,9 @@ pub fn do_account_offers<S: AccountOffersSource>(
         let Some(marker_sle) = source.read_child_entry(&ledger, start_after) else {
             return make_error(RpcErrorCode::InvalidParams);
         };
-        if !is_related_to_account(&marker_sle, account_id) {
+        if !is_related_to_account(&marker_sle, |page| {
+        source.read_owner_dir_page(&ledger, account_id, page)
+    }) {
             return make_error(RpcErrorCode::InvalidParams);
         }
     }
