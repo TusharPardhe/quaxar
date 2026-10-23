@@ -545,7 +545,6 @@ impl<C, S, FB, F, MR, NS> SHAMapFamily<C, S, FB, F, MR, NS> {
         C: CacheClock,
         S: BuildHasher + Clone,
     {
-        crate::access_mrc::record(hash);
         self.tree_node_cache.fetch(hash.as_uint256())
     }
 
