@@ -12292,3 +12292,56 @@ fn oe_sell_crossing_removes_tiny_offer_past_the_consumed_quality() {
         "the tiny offer at the next quality must be removed by the stream look-ahead"
     );
 }
+
+/// Mainnet 107854167/107854248/107854836/107855265: tfSell|tfFillOrKill
+/// crossings whose last sliver of TakerGets buys less than one drop from the
+/// next offer. rippled's fwdImp has no zero-output exit: it consumes that
+/// input (the offer's TakerPays shrinks, its TakerGets does not), so the whole
+/// TakerGets is spent and the FillOrKill succeeds. quaxar broke out of the
+/// book step on the zero output and returned tecKILLED.
+#[test]
+fn oe_sell_fill_or_kill_spends_a_sub_drop_remainder_on_the_next_offer() {
+    let t = acct(0x11);
+    let b = acct(0x22);
+    let gw = acct(0x33);
+    let c = acct(0x44);
+    let u = usd_currency();
+    let l = build_ledger_with_features(vec![
+        account_root(t, 10_000_000_000, 1, 0),
+        account_root(b, 10_000_000_000, 1, 0),
+        account_root(gw, 10_000_000_000, 0, 0),
+        account_root(c, 10_000_000_000, 1, 0),
+        trust_line(t, gw, u, 10, 10000, 0),
+        trust_line(b, gw, u, 0, 10000, 0),
+        trust_line(gw, c, u, 0, 0, 10000),
+    ], vec!["fixReducedOffersV1", "fixReducedOffersV2", "fixFillOrKill", "Flow", "FlowCross", "fix1578"]);
+    let mut v = new_view(l);
+    for (owner, seq) in [(b, 1u32), (c, 1u32)] {
+        let offer = STTx::new(TxType::OFFER_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), owner);
+            tx.set_field_amount(sf("sfTakerPays"), iou(gw, u, 1));
+            tx.set_field_amount(sf("sfTakerGets"), xrp(1_000_000));
+            tx.set_field_amount(sf("sfFee"), xrp(10));
+            tx.set_field_u32(sf("sfSequence"), seq);
+        });
+        assert_eq!(handle_real_dispatch(&mut v, &offer, TxType::OFFER_CREATE, None), Ter::TES_SUCCESS);
+    }
+    let sliver_over_one = STAmount::from_iou_amount(
+        sf("sfTakerGets"),
+        protocol::IOUAmount::from_parts(10_000_000_001, -10).expect("1.0000000001"),
+        protocol::Issue::new(u, gw),
+    );
+    let taker = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), t);
+        tx.set_field_u32(sf("sfFlags"), 0x0008_0000 | 0x0004_0000);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(1_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), sliver_over_one);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut v, &taker, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS,
+        "the sub-drop remainder is consumed, so FillOrKill is satisfied"
+    );
+}

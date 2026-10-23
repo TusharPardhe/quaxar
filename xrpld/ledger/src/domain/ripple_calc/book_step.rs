@@ -1335,9 +1335,11 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 )
             );
 
-            if consumption.step_in.signum() <= 0 || consumption.step_out.signum() <= 0 {
-                break;
-            }
+            // rippled's revImp/fwdImp callbacks have no zero-amount exit. In
+            // the forward pass the last sliver of input can buy 0 of the
+            // output (an IOU remainder worth under one drop): rippled still
+            // consumes that input from the offer, so a tfSell|tfFillOrKill
+            // crossing spends its whole TakerGets (mainnet 107855265).
 
             // rippled's callback return value decides whether FlowOfferStream
             // steps past this tip, and `BookTip::step` DELETES the current tip
