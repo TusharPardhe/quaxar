@@ -6496,3 +6496,33 @@ fn check_accept_saves_synchronously_only_before_the_first_publication() {
     assert!(super::check_accept_saves_synchronously(false));
     assert!(!super::check_accept_saves_synchronously(true));
 }
+
+#[test]
+fn try_advance_runs_publication_on_the_advance_worker_not_the_caller() {
+    let root = ApplicationRoot::with_options(Default::default()).expect("app");
+    // Without a worker, rippled's job is unavailable and the pass runs inline.
+    root.try_advance();
+    assert_eq!(root.ledger_advance_passes(), 0);
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = root
+        .start_ledger_advance_worker(Arc::clone(&stop))
+        .expect("worker");
+    // Hold the validation/publication gate: an inline pass would block here.
+    let gate = root.validation_advance_gate.lock();
+    let started = std::time::Instant::now();
+    root.try_advance();
+    root.try_advance();
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(100),
+        "try_advance must only post work"
+    );
+    drop(gate);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while root.ledger_advance_passes() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(root.ledger_advance_passes() >= 1, "the worker ran the pass");
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    handle.join().expect("worker exits on stop");
+}

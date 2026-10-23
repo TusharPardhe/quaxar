@@ -1613,6 +1613,15 @@ fn run_start_mode_consensus_loop(
     // gotLedgerData/TimeoutCounter only enqueue work and jtLEDGER_DATA performs
     // reconstruction away from NetworkOPs and consensus.
     install_trusted_restart_baseline(runtime.root());
+    // rippled JtAdvance: publication never runs on the consensus strand.
+    match runtime.root().start_ledger_advance_worker(Arc::clone(&stop)) {
+        Ok(handle) => worker_handles.push(handle),
+        Err(error) => tracing::error!(
+            target: "app",
+            %error,
+            "could not start the ledger-advance worker; publication stays inline"
+        ),
+    }
     shared_inbound.set_phase_mode_owner(runtime.root().network_ops_mode_owner());
     if shared_inbound.install_coordinator() {
         shared_inbound.coordinator_startup(startup_coordinator_phase(runtime.root()));

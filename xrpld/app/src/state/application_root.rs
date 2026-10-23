@@ -550,6 +550,24 @@ impl Default for PublicationAdvanceState {
     }
 }
 
+/// State of rippled's `advanceThread_` / `advanceWork_` pair.
+#[derive(Debug, Default)]
+struct LedgerAdvanceState {
+    /// `advanceWork_`: another pass was requested while one may be running.
+    work: bool,
+    /// The worker thread exists; until then `try_advance` runs inline (tests,
+    /// offline tools, and early bootstrap before the worker starts).
+    started: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LedgerAdvanceWorker {
+    state: Mutex<LedgerAdvanceState>,
+    wake: std::sync::Condvar,
+    /// Completed worker passes (diagnostic).
+    passes: std::sync::atomic::AtomicU64,
+}
+
 #[derive(Clone)]
 pub struct ApplicationRoot {
     registry: ApplicationRegistryOwners,
@@ -662,6 +680,10 @@ pub struct ApplicationRoot {
     /// advancement. Lifecycle callbacks may request work, but only the
     /// validation/NetworkOps serialized paths execute it.
     publication_advance: Arc<Mutex<PublicationAdvanceState>>,
+    /// rippled `LedgerMaster::tryAdvance`/`doAdvance`: publication (including
+    /// `setFullLedger`'s synchronous save and `pubLedger`) runs on one
+    /// dedicated job, never on the consensus thread.
+    ledger_advance: Arc<LedgerAdvanceWorker>,
     /// Condvar to wake the consensus strand loop immediately when proposals
     /// arrive from the overlay, removing the 50ms poll latency. Matches
     /// rippled's strand-based immediate dispatch of proposals.
@@ -5190,6 +5212,7 @@ impl ApplicationRoot {
             lcl_transition_gate: Arc::new(parking_lot::ReentrantMutex::new(())),
             validation_advance_gate: Arc::new(parking_lot::Mutex::new(())),
             publication_advance: Arc::new(Mutex::new(PublicationAdvanceState::default())),
+            ledger_advance: Arc::new(LedgerAdvanceWorker::default()),
             consensus_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             shared_tree_cache: std::sync::OnceLock::new(),
             max_disallowed_ledger: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -9280,6 +9303,74 @@ impl ApplicationRoot {
     pub fn try_advance_publication(&self) {
         let _advance_guard = self.validation_advance_gate.lock();
         self.try_advance_publication_serialized();
+    }
+
+    /// rippled `LedgerMaster::tryAdvance`: request a publication pass without
+    /// running it on the caller's thread. Repeated requests while a pass is
+    /// running coalesce into one more pass (`advanceWork_`).
+    pub fn try_advance(&self) {
+        {
+            let mut state = self
+                .ledger_advance
+                .state
+                .lock()
+                .expect("ledger advance state lock");
+            if state.started {
+                state.work = true;
+                self.ledger_advance.wake.notify_one();
+                return;
+            }
+        }
+        self.try_advance_publication();
+    }
+
+    pub(crate) fn ledger_advance_passes(&self) -> u64 {
+        self.ledger_advance
+            .passes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Start the single `JtAdvance` equivalent. It runs `doAdvance`'s loop:
+    /// one publication pass per request, repeating while more work arrived.
+    pub fn start_ledger_advance_worker(
+        &self,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        let root = self.clone();
+        let worker = Arc::clone(&self.ledger_advance);
+        let handle = std::thread::Builder::new()
+            .name("ledger-advance".to_owned())
+            .spawn(move || {
+                loop {
+                    {
+                        let mut state = worker.state.lock().expect("ledger advance state lock");
+                        while !state.work && !stop.load(std::sync::atomic::Ordering::Acquire) {
+                            state = worker
+                                .wake
+                                .wait_timeout(state, std::time::Duration::from_millis(250))
+                                .expect("ledger advance state lock")
+                                .0;
+                        }
+                        if stop.load(std::sync::atomic::Ordering::Acquire) {
+                            state.started = false;
+                            return;
+                        }
+                        state.work = false;
+                    }
+                    root.try_advance_publication();
+                    worker
+                        .passes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })?;
+        let mut state = self
+            .ledger_advance
+            .state
+            .lock()
+            .expect("ledger advance state lock");
+        state.started = true;
+        // A request made before the worker existed already ran inline.
+        Ok(handle)
     }
 
     /// Request one coalesced publication planning pass. This function is safe

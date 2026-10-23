@@ -342,7 +342,7 @@ impl ApplicationRoot {
         // A verified replay response can advance its owned task before a
         // validated/published head changes; request one serialized replan.
         self.request_publication_advance();
-        self.try_advance_publication();
+        self.try_advance();
         true
     }
 }
