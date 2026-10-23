@@ -6445,3 +6445,48 @@ fn preclaim_tec_expired_is_not_applied_during_a_retry_pass() {
     assert_eq!(last.result, Ter::TEC_EXPIRED);
     assert!(last.applied, "the final pass claims the fee");
 }
+
+#[test]
+fn preflight_signature_check_uses_the_hash_router_cache_like_check_validity() {
+    use xrpl_core::{HashRouter, HashRouterSetup};
+    let router = HashRouter::new(HashRouterSetup::default());
+    let rules = protocol::Rules::default();
+    let (_, tx) = signed_payment_tx(0x61, AccountID::from_array([0x62; 20]), 1, 10);
+    let txid = tx.get_transaction_id();
+    assert!(!super::preflight_signature_is_bad_with(Some(&router), &tx, &rules));
+    let cached = router.get_flags(txid);
+    assert!(xrpl_core::any(cached), "a verified signature must be cached");
+
+    // A transaction whose signature does not match its SigningPubKey.
+    let secret = SecretKey::from_bytes([0x63; 32]);
+    let other = derive_public_key(KeyType::Secp256k1, &SecretKey::from_bytes([0x64; 32]))
+        .expect("public key");
+    let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+    let mut bad = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), calc_account_id(other.as_bytes()));
+        tx.set_account_id(get_field_by_symbol("sfDestination"), AccountID::from_array([0x62; 20]));
+        tx.set_field_amount(get_field_by_symbol("sfAmount"), STAmount::new_native(1, false));
+        tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(10, false));
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        tx.set_field_vl(get_field_by_symbol("sfSigningPubKey"), other.as_bytes());
+    });
+    bad.sign(&public, &secret, None).expect("sign");
+    // sign() refreshes SigningPubKey; put the mismatching key back and
+    // re-parse so the transaction ID covers the final bytes.
+    bad.set_field_vl(get_field_by_symbol("sfSigningPubKey"), other.as_bytes());
+    let bad = STTx::from_stobject(bad.clone_as_object());
+    let bad_id = bad.get_transaction_id();
+    assert!(super::preflight_signature_is_bad_with(None, &bad, &rules));
+    assert!(super::preflight_signature_is_bad_with(Some(&router), &bad, &rules));
+    assert!(xrpl_core::any(router.get_flags(bad_id)), "a bad verdict is cached too");
+
+    // rippled checkValidity trusts a cached verdict and does not verify
+    // again. Overwrite a fresh router's flags for the bad ID with the good
+    // verdict: preflight now reads only the router.
+    let fresh = HashRouter::new(HashRouterSetup::default());
+    let _ = fresh.set_flags(bad_id, cached);
+    assert!(
+        !super::preflight_signature_is_bad_with(Some(&fresh), &bad, &rules),
+        "a cached SigGood verdict is reused without re-verifying"
+    );
+}

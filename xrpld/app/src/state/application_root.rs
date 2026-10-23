@@ -2364,6 +2364,40 @@ fn transaction_preflight_ter_with_parent_batch_id(
     })
 }
 
+/// The application HashRouter used by `Transactor::preflight2`'s
+/// `checkValidity` (rippled reaches it through `ctx.registry`). Registered once
+/// by the running node; without it (unit tests, offline tools) preflight
+/// verifies the signature directly, exactly as an empty router would.
+static PREFLIGHT_HASH_ROUTER: std::sync::OnceLock<Arc<HashRouter>> = std::sync::OnceLock::new();
+
+pub(crate) fn register_preflight_hash_router(router: Arc<HashRouter>) {
+    let _ = PREFLIGHT_HASH_ROUTER.set(router);
+}
+
+/// `Transactor::preflight2`: `checkValidity(...).first == Validity::SigBad`.
+fn preflight_signature_is_bad(tx: &STTx, rules: &Rules) -> bool {
+    preflight_signature_is_bad_with(PREFLIGHT_HASH_ROUTER.get().map(Arc::as_ref), tx, rules)
+}
+
+pub(crate) fn preflight_signature_is_bad_with(
+    router: Option<&HashRouter>,
+    tx: &STTx,
+    rules: &Rules,
+) -> bool {
+    match router {
+        Some(router) => {
+            crate::network::network_ops_runtime::check_validity_with_router(router, tx, rules)
+                .validity
+                == tx::Validity::SigBad
+        }
+        None => {
+            let bad = tx.check_sign(rules).is_err();
+            let _ = protocol::passes_local_checks(tx);
+            bad
+        }
+    }
+}
+
 fn transaction_preflight_ter_with_parent_batch_id_inner(
     tx: &STTx,
     rules: &Rules,
@@ -2448,10 +2482,9 @@ fn transaction_preflight_ter_with_parent_batch_id_inner(
     // rejects only SigBad; SigGoodOnly (a locally non-canonical transaction)
     // remains a successful consensus preflight result and is filtered at the
     // outer admission boundary, exactly as in rippled.
-    if tx.check_sign(rules).is_err() {
+    if preflight_signature_is_bad(tx, rules) {
         return Ter::TEM_INVALID;
     }
-    let _ = protocol::passes_local_checks(tx);
 
     // Concrete preflightSigValidated tails run after preflight2.
     if tx.get_txn_type() == TxType::ESCROW_FINISH {

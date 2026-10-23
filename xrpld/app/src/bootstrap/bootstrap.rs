@@ -846,6 +846,7 @@ pub fn build_bootstrap_root(
         ..ApplicationRootOptions::default()
     })
     .map_err(|error| error.to_string())?;
+    crate::state::application_root::register_preflight_hash_router(root.shared_hash_router());
     root.configure_manifest_limits(manifest_limits);
 
     root.set_path_search_levels(path_search_old, path_search, path_search_fast);
