@@ -66,9 +66,12 @@ fn to_strand_with_domain(
     // 1. Source element
     norm.push(NormElem::Acct(*src));
 
-    // 2. SendMax issuer if != src
+    // 2. SendMax issuer if != src. PaySteps.cpp::toStrand does this for XRP
+    //    too: the issuer is `xrpAccount()` (zero). With an empty path or a
+    //    following offer the zero account is harmless; followed by an
+    //    explicit account it forms a DirectStepI with a zero source, which
+    //    `check` rejects as temBAD_PATH (mainnet 107838783, Batch B5AC8E67).
     if let Some(sma) = send_max_asset
-        && !sma.native()
         && sma.issuer() != *src
     {
         let first_is_issuer = path
@@ -164,13 +167,29 @@ fn to_strand_with_domain(
         match (cur, next) {
             (NormElem::Acct(s), NormElem::Acct(d)) => {
                 if cur_asset.native() {
-                    // XRP endpoint
-                    let is_first = i == 0;
-                    strand.push(StepKind::XrpEndpoint {
-                        account: if is_first { *s } else { *d },
-                        is_last: !is_first,
-                        reserve_reduction: 0,
-                    });
+                    // PaySteps.cpp::toStep: an XRP endpoint only for the
+                    // first element, or for the last pair leaving the XRP
+                    // account. Any other XRP account pair is a DirectStepI in
+                    // the XRP currency, which DirectStepI::check rejects.
+                    if strand.is_empty() && i == 0 {
+                        strand.push(StepKind::XrpEndpoint {
+                            account: *s,
+                            is_last: false,
+                            reserve_reduction: 0,
+                        });
+                    } else if i == norm.len() - 2 && s.is_zero() {
+                        strand.push(StepKind::XrpEndpoint {
+                            account: *d,
+                            is_last: true,
+                            reserve_reduction: 0,
+                        });
+                    } else {
+                        strand.push(StepKind::Direct {
+                            src: *s,
+                            dst: *d,
+                            currency: protocol::xrp_currency(),
+                        });
+                    }
                 } else if let Asset::MPTIssue(issue) = cur_asset {
                     strand.push(StepKind::MptEndpoint {
                         src: *s,
@@ -1345,6 +1364,50 @@ mod tests {
             StepKind::Book { book_out: Asset::Issue(issue), .. }
                 if issue.currency == eur && issue.account == path_issuer
         )));
+    }
+
+    #[test]
+    fn xrp_send_max_with_explicit_account_path_builds_a_zero_source_direct_step() {
+        // Mainnet 107838783 (Batch B5AC8E67, inner Payment XRP -> BEAR with
+        // Paths [[{account}]]): rippled inserts the XRP SendMax issuer
+        // (xrpAccount) after the source, so the explicit account forms a
+        // DirectStepI from the zero account, which check() rejects with
+        // temBAD_PATH ("DirectStepI: specified bad account").
+        let src = make_account(1);
+        let hop = make_account(4);
+        let issuer = make_account(3);
+        let deliver = Asset::Issue(Issue::new(make_currency("USD"), issuer));
+        let send_max = Asset::Issue(xrp_issue());
+        let mut path = protocol::STPath::new();
+        path.push_back(protocol::STPathElement::raw(
+            protocol::STPathElement::TYPE_ACCOUNT,
+            hop,
+            Currency::default(),
+            AccountID::zero(),
+        ));
+        let (ter, strand) = to_strand(&src, &src, &deliver, Some(&send_max), &path, false, false);
+        assert_eq!(ter, Ter::TES_SUCCESS);
+        assert!(matches!(strand.first(), Some(StepKind::XrpEndpoint { account, is_last: false, .. }) if *account == src));
+        assert!(
+            strand.iter().any(|step| matches!(step, StepKind::Direct { src, dst, .. } if src.is_zero() && *dst == hop)),
+            "expected a DirectStepI from xrpAccount to the path account: {strand:?}"
+        );
+
+        // The ordinary XRP SendMax default path still starts with the XRP
+        // endpoint and goes straight into the book.
+        let (ter, strand) = to_strand(
+            &src,
+            &src,
+            &deliver,
+            Some(&send_max),
+            &protocol::STPath::new(),
+            false,
+            false,
+        );
+        assert_eq!(ter, Ter::TES_SUCCESS);
+        assert!(matches!(strand.first(), Some(StepKind::XrpEndpoint { .. })));
+        assert!(matches!(strand.get(1), Some(StepKind::Book { .. })));
+        assert!(!strand.iter().any(|step| matches!(step, StepKind::Direct { src, .. } if src.is_zero())));
     }
 
     #[test]
