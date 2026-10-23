@@ -2425,7 +2425,10 @@ fn check_accept_and_advance(
     }
 
     // ── tryAdvance publication ────────────────────────────────────────────
-    root.try_advance_publication();
+    // rippled checkAccept/endConsensus only poke tryAdvance(); doAdvance runs
+    // on its own job. The facts below read whatever is published so far; a
+    // publication completed by the worker is reported on the next pass.
+    root.try_advance();
     let published_ledger_after = root.published_ledger();
 
     // Coordinator mode: report the current publication as a typed fact on
